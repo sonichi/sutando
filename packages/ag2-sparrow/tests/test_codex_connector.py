@@ -721,6 +721,51 @@ class EdgePathTest(unittest.TestCase):
             c.run_turn("hello")
         self.assertEqual(c.rpc.calls, ["turn/start", "turn/interrupt"])
 
+    def test_a_turn_without_a_message_says_what_it_did_instead(self):
+        # An owner asked for something, Codex ran commands, was refused one, and ended with no text:
+        # the room got only "[no reply] Codex completed the turn without a message."
+        class Scripted(FakeRpc):
+            def __init__(self):
+                super().__init__()
+                self.answers = []
+
+            def respond(self, rid, result):
+                self.answers.append((rid, result))
+
+        args = cc.build_parser().parse_args(["--work", "w"])
+        c = cc.Connector(Scripted, args, note="n")
+        c.thread_id = "th1"
+        c.declined, c.turn_items = ["item/fileChange/requestApproval"], {"commandExecution": 9}   # an earlier turn's
+
+        def item(kind, turn="t1"):
+            return {"method": "item/completed", "params": {"threadId": "th1", "turnId": turn, "item": {"type": kind}}}
+
+        for m in (item("reasoning"), item("commandExecution"), item("commandExecution"), item("webSearch"),
+                  item("commandExecution", turn="another-turn"),
+                  {"id": 7, "method": "item/commandExecution/requestApproval", "params": {}},
+                  {"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "completed"}}}):
+            c.rpc.events.put(m)
+        status, text, err = c.run_turn("do it")
+        self.assertEqual((status, text), ("completed", ""))
+        self.assertEqual(c.rpc.answers, [(7, {"decision": "decline"})])
+        self.assertEqual(c.result_body(status, text, err),
+                         "[no reply] Codex completed the turn without a message: 1 command was not approved; "
+                         "it ran 2 commands, ran 1 web search.")
+        self.assertEqual(c.turn_items, {"reasoning": 1, "commandExecution": 2, "webSearch": 1})
+        self.assertEqual(c.declined, ["item/fileChange/requestApproval", "item/commandExecution/requestApproval"],
+                         "the task's metrics row still lists every decline")
+
+    def test_the_line_for_a_turn_without_a_message_is_fixed_words_and_counts(self):
+        why = cc.no_message_why
+        self.assertEqual(why([], {}), "")
+        self.assertEqual(why([], {"reasoning": 3, "agentMessage": 1, "userMessage": 1}), "", "nothing countable")
+        self.assertEqual(why(["applyPatchApproval", "item/fileChange/requestApproval", "execCommandApproval"], {}),
+                         "1 command was not approved; 2 file changes were not approved")
+        self.assertEqual(why(["item/permissions/requestApproval"], {"fileChange": 1, "mcpToolCall": 2, "webSearch": 2}),
+                         "1 permission request was not approved; it made 1 file change, made 2 tool calls, "
+                         "ran 2 web searches")
+        self.assertEqual(why(["some/new/requestApproval"], {"<script>": 4}), "", "an unknown name is never echoed")
+
     def test_result_bodies_are_plain_text(self):
         args = cc.build_parser().parse_args(["--work", "w"])
         c = cc.Connector(FakeRpc, args, note="n")

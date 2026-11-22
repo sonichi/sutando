@@ -42,6 +42,32 @@ APPROVAL_REQUESTS = ("item/commandExecution/requestApproval", "item/fileChange/r
                      "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval")
 NON_OWNER_SANDBOX = "read-only"
 NO_REPLY = "[no reply] Codex completed the turn without a message."
+# What a turn with no message did instead, for the line posted in its place: fixed words and counts only.
+DECLINED_WORDS = {"item/commandExecution/requestApproval": "command", "execCommandApproval": "command",
+                  "item/fileChange/requestApproval": "file change", "applyPatchApproval": "file change",
+                  "item/permissions/requestApproval": "permission request"}
+DECLINED_ORDER = ("command", "file change", "permission request")
+ITEM_WORDS = (("commandExecution", "ran %d command%s"), ("fileChange", "made %d file change%s"),
+              ("mcpToolCall", "made %d tool call%s"), ("webSearch", "ran %d web search%s"))
+
+
+def no_message_why(declined, items):
+    """'' when the turn did nothing countable; else e.g. '1 command was not approved; it ran 2 commands'.
+    `declined` is the approval methods refused during the turn, `items` its completed items by type."""
+    why = []
+    for word in DECLINED_ORDER:
+        n = sum(1 for method in declined if DECLINED_WORDS.get(method) == word)
+        if n:
+            why.append("%d %s%s %s not approved" % (n, word, "" if n == 1 else "s", "was" if n == 1 else "were"))
+    did = []
+    for kind, words in ITEM_WORDS:
+        n = items.get(kind, 0)
+        if n:
+            plural = "" if n == 1 else ("es" if words.endswith("search%s") else "s")
+            did.append(words % (n, plural))
+    if did:
+        why.append("it " + ", ".join(did))
+    return "; ".join(why)
 # --held: the launcher that spawned this process holds the work root and attaches it as the consumer
 # whose liveness fences the root; the connector waits this long for that record, then refuses.
 HELD_WAIT_S = held_start.WAIT_S
@@ -195,6 +221,8 @@ class Connector:
         self.owner_only_keys = set()
         self.scratch_cwd = None
         self.declined = []
+        self.turn_declined = []   # approvals declined during the turn now running
+        self.turn_items = {}      # that turn's completed items, counted by type
 
     def handle_server_request(self, m):
         """No human is attached, so approvals are declined (the turn continues)."""
@@ -202,6 +230,7 @@ class Connector:
         log("server request", method)
         if method in APPROVAL_REQUESTS:
             self.declined.append(method)
+            self.turn_declined.append(method)
             self.rpc.respond(rid, {"decision": "decline"})
         elif method == "item/tool/requestUserInput":
             self.rpc.respond(rid, {"answers": {}})
@@ -366,7 +395,10 @@ class Connector:
                 deltas.append(p.get("delta", ""))
             elif meth == "item/completed" and p.get("turnId") == turn_id:
                 item = p.get("item", {})
-                if item.get("type") == "agentMessage":
+                kind = item.get("type")
+                if isinstance(kind, str):
+                    self.turn_items[kind] = self.turn_items.get(kind, 0) + 1
+                if kind == "agentMessage":
                     text = item.get("text")       # last agentMessage of the turn wins
             elif meth == "turn/completed" and p.get("turn", {}).get("id") == turn_id:
                 turn = p["turn"]
@@ -385,6 +417,7 @@ class Connector:
             params["model"] = model
         if cwd:
             params["cwd"] = cwd
+        self.turn_declined, self.turn_items = [], {}
         res = self.rpc.request("turn/start", params)
         turn_id = res["turn"]["id"]
         done = self.wait_turn(turn_id, self.args.turn_timeout)
@@ -428,7 +461,11 @@ class Connector:
 
     def result_body(self, status, text, err):
         if status == "completed":
-            return (text or "").strip() or NO_REPLY
+            said = (text or "").strip()
+            if said:
+                return said
+            why = no_message_why(self.turn_declined, self.turn_items)
+            return NO_REPLY[:-1] + ": " + why + "." if why else NO_REPLY
         if status == "timeout":
             head = "Codex did not finish this task in time (%s)." % err
         elif status == "server-exited":
@@ -492,7 +529,7 @@ class Connector:
             rec = {"task": task_id, "status": status, "chars": len(out), "tier": headers["access_tier"],
                    "detect_s": round(t_seen - t_mtime, 3), "turn_s": round(t_done - t_sent, 3),
                    "file_to_file_s": round(t_result - t_mtime, 3), "thread": self.last_thread,
-                   "declined": list(self.declined)}
+                   "declined": list(self.declined), "items": dict(self.turn_items)}
             self.declined = []
             if policy.capabilities.session != "durable":
                 self.thread_id = None         # the ephemeral thread is never reused
