@@ -15,6 +15,12 @@ cd "$REPO"
 . "$REPO/src/agent/restart-guard.sh"
 . "$REPO/src/agent/core-runtime-record.sh"
 . "$REPO/src/agent/core-window.sh"
+# Shared with the claude launcher: one owner for the core-CLI compatibility gate.
+if [ -r "$REPO/src/agent/runtime-compat-gate.sh" ]; then
+  . "$REPO/src/agent/runtime-compat-gate.sh"
+else
+  sutando_runtime_compat_gate() { SUTANDO_CORE_CLI_BIN="$2"; }
+fi
 
 # This entry point only launches the canonical core. A Codex pool worker uses
 # the pool's runtime launcher instead.
@@ -140,11 +146,9 @@ CODEX_INSTALL_BIN="${CODEX_INSTALL_BIN:-$HOME/.npm-global/bin}"
 . "$REPO/src/agent/launch-path.sh"
 sutando_append_launch_path "$REPO" "${CODEX_NODE_BIN:-$(sutando_bundled_node_dir "$REPO")}" "$CODEX_INSTALL_BIN"
 
-# The core can be launched while the app is still installing Codex (observed:
-# engine unpacked at :25, codex landed at :32 of the following minute). Exiting
-# on the first miss leaves a dead window that never recovers even once the
-# install finishes, so wait briefly for it to appear before giving up.
-CODEX_WAIT_TIMEOUT="${SUTANDO_CODEX_WAIT_TIMEOUT:-120}"
+# A launch can race the app's Codex install; the compat gate below waits for it,
+# bounded by SUTANDO_CODEX_WAIT_TIMEOUT.
+
 # Seconds a freshly created core session may take to answer has-session; a stub
 # tmux that never reports one (tests) sets this to 0. Polls run every 0.2 s.
 SESSION_UP_WAIT_S="${SUTANDO_CORE_SESSION_WAIT_S:-5}"
@@ -170,23 +174,6 @@ else
 fi
 SESSION_UP_LABEL="$(( SESSION_UP_TRIES * 2 / 10 )).$(( SESSION_UP_TRIES * 2 % 10 ))s"
 echo "  · session-up wait: at most ${SESSION_UP_TRIES} poll(s), ${SESSION_UP_LABEL}" >&2
-if ! command -v codex >/dev/null 2>&1; then
-  echo "  … waiting for the Codex CLI to finish installing (up to ${CODEX_WAIT_TIMEOUT}s)" >&2
-  _codex_waited=0
-  while [ "$_codex_waited" -lt "$CODEX_WAIT_TIMEOUT" ]; do
-    sleep 2
-    _codex_waited=$((_codex_waited + 2))
-    command -v codex >/dev/null 2>&1 && break
-  done
-  if command -v codex >/dev/null 2>&1; then
-    echo "  ✓ Codex CLI appeared after ${_codex_waited}s" >&2
-  else
-    echo "Codex CLI is not installed. Install it, run 'codex login', then retry." >&2
-    echo "  (looked on PATH and in $CODEX_INSTALL_BIN)" >&2
-    exit 127
-  fi
-fi
-
 # One interpreter for the heartbeat, start and stop alike: the repository resolver, never a bare
 # `python3` (on a clean macOS host PATH can hand that name to Apple's developer-tools stub).
 # Resolved ONCE, in this shell, never inside $(...): a subshell's assignment cannot reach the
@@ -212,20 +199,19 @@ CODEX_HOME_DIR="$SUTANDO_CODEX_HOME"
 CODEX_HOME_REFUSED="$SUTANDO_CODEX_HOME_REFUSED"
 [ -n "${CODEX_HOME:-}" ] && echo "  ✓ CODEX_HOME=$CODEX_HOME"
 
-# `|| _codex_auth_rc=$?` keeps set -e from killing the script on a non-zero
-# probe — the exit code IS the signal here, not a failure.
-_codex_auth_rc=0
-codex login status >/dev/null 2>&1 || _codex_auth_rc=$?
-if [ "$_codex_auth_rc" -eq 127 ]; then
-  # 127 is "could not execute", not "not logged in" — almost always a missing
-  # node on PATH. Saying "run codex login" here sends people the wrong way.
-  echo "Codex CLI could not run (exit 127) — its node runtime was not found." >&2
-  echo "  PATH lacked a usable node: PATH=$PATH" >&2
-  exit 127
+# Presence, version, capabilities and login, before anything below can replace a core.
+# It finds a managed or known install off PATH, and waits for a fix, a reply or an install.
+_codex_gate_rc=0
+SUTANDO_RUNTIME_WAIT_S="${SUTANDO_RUNTIME_WAIT_S:-${SUTANDO_CODEX_WAIT_TIMEOUT:-}}" \
+  sutando_runtime_compat_gate "$REPO" codex --enforce-auth || _codex_gate_rc=$?
+if [ "$_codex_gate_rc" -ne 0 ]; then
+  exit "$_codex_gate_rc"
 fi
-if [ "$_codex_auth_rc" -ne 0 ]; then
-  echo "Codex CLI is not authenticated for ${CODEX_HOME:-~/.codex}. Run 'codex login' and retry." >&2
-  exit 1
+# Reached without a verdict only when the gate could not run (no Python, or skipped).
+if ! command -v "$SUTANDO_CORE_CLI_BIN" >/dev/null 2>&1; then
+  echo "Codex CLI is not installed. Install it, run 'codex login', then retry." >&2
+  echo "  (looked on PATH and in $CODEX_INSTALL_BIN)" >&2
+  exit 127
 fi
 
 # The Codex adapter depends on tmux for a persistent pane and fswatch for
@@ -688,7 +674,7 @@ if ! tmux_available; then
     exit 1
   fi
   echo "  ⚠ tmux not found — Codex will run, but file-bridge task wakeups are unavailable" >&2
-  if ! command -v codex >/dev/null 2>&1; then
+  if ! command -v "$SUTANDO_CORE_CLI_BIN" >/dev/null 2>&1; then
     echo "  ⚠ codex not found — not clearing the shutdown sentinel, no core can start." >&2
     exit 127
   fi
@@ -699,7 +685,7 @@ if ! tmux_available; then
   # errexit would exit on the failed exec before the restore below is reached;
   # drop it just around the exec and re-raise the exec's own status.
   set +e
-  exec codex "${CODEX_ARGS[@]}"
+  exec "$SUTANDO_CORE_CLI_BIN" "${CODEX_ARGS[@]}"
   _exec_rc=$?
   set -e
   restore_shutdown_sentinel
@@ -754,7 +740,7 @@ heal_core_window() {
     tmux -S "$TMUX_SOCKET" kill-window -t "$_win" 2>/dev/null || true
   done
   prepare_codex_home
-  if ! idx="$(sutando_new_core_window "$TMUX_SOCKET" "$SESSION" "${CORE_ENV_ARGS[@]}" -c "$REPO" codex "${CODEX_ARGS[@]}")" \
+  if ! idx="$(sutando_new_core_window "$TMUX_SOCKET" "$SESSION" "${CORE_ENV_ARGS[@]}" -c "$REPO" "$SUTANDO_CORE_CLI_BIN" "${CODEX_ARGS[@]}")" \
      || [ -z "$idx" ]; then
     echo "  ⚠ could not create a core window in $SESSION — sentinel NOT cleared, no core is serving." >&2
     return 1
@@ -792,7 +778,7 @@ start_core_session_and_helpers() {
   # <<< codex-app-server-seat
   prepare_codex_bootstrap || return 1
   prepare_codex_home
-  tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
+  tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" "$SUTANDO_CORE_CLI_BIN" "${CODEX_ARGS[@]}"
   wait_core_up "$SESSION" session_exists "$SESSION" || return 1
   log_session_start
   record_confirmed_core_runtime codex "$(heartbeat_python)"

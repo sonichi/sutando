@@ -59,7 +59,11 @@ exit 0
 """)
         tmux.chmod(0o755)
         for name, body in {
-            "codex": '\n'.join(['#!/bin/bash', 'if [ "${1:-}" = login ]; then',
+            "codex": '\n'.join(['#!/bin/bash',
+                                '[ "${1:-}" = --version ] && { echo "codex-cli 0.160.1"; exit 0; }',
+                                '[ "${1:-}" = --help ] && { echo "--cd --add-dir --sandbox --ask-for-approval'
+                                ' --search --no-alt-screen --config --model"; exit 0; }',
+                                'if [ "${1:-}" = login ]; then',
                                 '  if [ -n "${TEST_DIE_DURING_AUTH:-}" ]; then',
                                 '    kill -KILL "$TEST_DIE_DURING_AUTH"; sleep 0.1',
                                 '  fi', '  exit 0', 'fi', 'exit 99', '']),
@@ -70,7 +74,8 @@ exit 0
             f.write_text(body)
             f.chmod(0o755)
         cls.env = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "LANG") if k in os.environ}
-        cls.env.update({"PATH": str(cls.bin) + os.pathsep + cls.env["PATH"],
+        cls.env.update({"SUTANDO_RUNTIME_SYSTEM_DIRS": "", "SUTANDO_RUNTIME_WAIT_S": "0",
+                        "SUTANDO_RUNTIMES_DIR": str(cls.base / "runtimes"), "PATH": str(cls.bin) + os.pathsep + cls.env["PATH"],
                         "SUTANDO_PY": sys.executable, "DO_NOT_TRACK": "1",
                         "SUTANDO_TMUX_SOCKET": str(cls.socket), "SUTANDO_TMUX_SESSION": cls.session,
                         "SUTANDO_HOST_LABEL": "receipt-fixture", "TEST_TMUX_LOG": str(cls.tmux_log),
