@@ -97,6 +97,15 @@ def generation(path) -> Optional[tuple]:
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
 
 
+def fd_generation(fd: int) -> Optional[tuple]:
+    """generation() of a file already open: what the bytes read from this descriptor belong to."""
+    try:
+        st = os.fstat(fd)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
 def parse_generation(text: str) -> Optional[tuple]:
     """The four numbers of a TASK_GENERATION line; None for `-` or anything else."""
     parts = text.split()
@@ -677,7 +686,41 @@ class Seat:
                 context_file = str(path)
         return task_prompt(filename, payload, self.host.results, self.worker, context_file)
 
+    def snapshot(self, filename: str, payload: Path, picked: Optional[tuple]) -> Optional[Path]:
+        """The admitted bytes of a task, in a file only this seat writes; None when the inbox file
+        is not the admitted generation. The turn is given this copy, never the inbox path, so what
+        it reads is what was admitted however late it reads it."""
+        if picked is None:
+            return None
+        try:
+            with open(payload, "rb") as fh:
+                if fd_generation(fh.fileno()) != picked:
+                    return None
+                data = fh.read()
+                if fd_generation(fh.fileno()) != picked:
+                    return None
+        except OSError:
+            return None
+        path = Path(self.host.state) / "payloads" / filename
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+        os.replace(tmp, path)
+        return path
+
     def run_task(self, filename: str, payload: Path) -> str:
+        """One task end to end, on a private copy of its admitted bytes that is removed afterwards."""
+        try:
+            return self.run_admitted(filename, payload)
+        finally:
+            try:
+                (Path(self.host.state) / "payloads" / filename).unlink()
+            except OSError:
+                pass
+
+    def run_admitted(self, filename: str, payload: Path) -> str:
         """One task end to end; returns done | no-result | failed | stopped | deferred | ..."""
         results = self.host.results
         if has_ready_result(results, filename):
@@ -694,7 +737,11 @@ class Seat:
             return "deferred"
         log(f"task {filename}: picked")
         picked = self.admitted(filename, payload)
-        prompt = self.prompt_for(filename, payload)
+        copy = self.snapshot(filename, payload, picked)
+        if copy is None:
+            log(f"task {filename}: its file is not the one that was admitted; not started")
+            return WITHDRAWN
+        prompt = self.prompt_for(filename, copy)
         started = time.monotonic()
         status, detail = "server-exited", ""
         for attempt in (1, 2):
@@ -716,6 +763,11 @@ class Seat:
         if status == "completed":
             self.failures = 0
         if has_ready_result(results, filename):
+            there = generation(payload)
+            if there is not None and there != picked:
+                log(f"task {filename}: turn {status} in {took}; result written, but another file is under "
+                    "the task's name now, and nothing is settled for that one")
+                return WITHDRAWN
             log(f"task {filename}: turn {status} in {took}; result written")
             self.settle(filename, "done")
             self.clear_record(filename)

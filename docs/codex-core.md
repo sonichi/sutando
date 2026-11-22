@@ -519,6 +519,12 @@ one). The core runs a pending task only while the file in its inbox is that gene
 put under the name at any later point, and a task announced without a generation, are held and
 logged once, until the watcher dispatches what is there and announces it. The admitted
 generation is carried to the dispatch and read once more, last, before every `turn/start`.
+The turn itself never reads the inbox: when a task is picked the seat opens its file once,
+checks that open file's generation before and after reading it, and writes those bytes to
+`state/codex-seat/<seat>/payloads/<task file>` (mode 0600, removed when the task ends). The
+prompt names that copy where the notifier's names the inbox path, so a turn that reads late
+still reads what was admitted. A result is settled for the task only while the inbox file is
+still that generation or has left the inbox; with another file under the name, nothing is.
 A file whose generation the watcher cannot read, or that changes while it is being identified,
 is not announced and not recorded as dispatched: the watcher holds it and decides again on its
 next event, with no restart. Without the switch the watcher's output is unchanged, so no other

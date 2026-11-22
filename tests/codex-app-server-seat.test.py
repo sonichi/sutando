@@ -245,6 +245,10 @@ class SeatCase(unittest.TestCase):
         self.addCleanup(s.close_server)
         return s
 
+    def copy_of(self, s, name: str) -> Path:
+        """Where the seat keeps its own copy of a task's admitted bytes while the task runs."""
+        return Path(s.host.state) / "payloads" / name
+
     def task(self, name: str, body: str = "task: do it\n", folder=None) -> Path:
         path = (folder or self.tasks) / name
         path.write_text(body, encoding="utf-8")
@@ -510,9 +514,12 @@ class PromptParity(SeatCase):
         s = self.make(context=lambda name: "")
         s.ensure_server()
         self.assertEqual(s.step(), "done")
-        self.assertEqual(self.prompts(), [self.notifier_prompt("task-1.txt", self.tasks / "task-1.txt", self.results)])
+        # The notifier's wording, with the seat's copy of the admitted bytes where the inbox path was.
+        self.assertEqual(self.prompts(),
+                         [self.notifier_prompt("task-1.txt", self.copy_of(s, "task-1.txt"), self.results)])
         turn = self.sent("turn/start")[0]["params"]
         self.assertEqual(turn["cwd"], str(self.ws))
+        self.assertFalse(self.copy_of(s, "task-1.txt").exists(), "the copy is removed once the task is done")
 
     def test_prior_workstream_context_is_handed_over_as_the_notifier_does(self):
         self.task("task-1.txt")
@@ -520,7 +527,7 @@ class PromptParity(SeatCase):
         s.ensure_server()
         self.assertEqual(s.step(), "done")
         ctx = Path(s.host.state) / "context" / "task-1.txt"
-        self.assertEqual(self.prompts(), [self.notifier_prompt("task-1.txt", self.tasks / "task-1.txt",
+        self.assertEqual(self.prompts(), [self.notifier_prompt("task-1.txt", self.copy_of(s, "task-1.txt"),
                                                                self.results, context=str(ctx))])
         self.assertFalse(ctx.exists(), "removed once the task has its result")
 
@@ -772,6 +779,61 @@ class Crash(SeatCase):
             self.assertEqual(self.sent("turn/start"), [], name)
             s.close_server()
 
+    def test_a_turn_that_reads_late_reads_the_admitted_bytes_and_settles_nothing_for_a_replacement(self):
+        first = self.task("task-1.txt", "task: the admitted one\n")
+        s = self.make()
+        s.ensure_server()
+        turn = s.run_turn
+        read_late = []
+
+        def reads_after_a_replacement(filename, prompt):
+            other = self.task("task-1.txt.new", "task: something else entirely\n", folder=self.ws)
+            os.replace(other, first)
+            named = prompt.split("Read ", 1)[1].split(",", 1)[0]
+            self.assertNotEqual(named, str(first), "the turn is never pointed at the inbox path")
+            self.assertEqual(os.stat(named).st_mode & 0o777, 0o600)
+            read_late.append(Path(named).read_text(encoding="utf-8"))
+            return turn(filename, prompt)
+
+        s.run_turn = reads_after_a_replacement
+        self.assertEqual(s.step(), seat_mod.WITHDRAWN)
+        self.assertEqual(read_late, ["task: the admitted one\n"])
+        self.assertEqual(len(self.sent("turn/start")), 1)
+        self.assertIn("another file is under the task's name now", self.out.getvalue())
+        self.assertFalse(self.copy_of(s, "task-1.txt").exists())
+
+    def test_a_file_that_changes_while_it_is_being_copied_is_not_started(self):
+        self.task("task-1.txt")
+        s = self.make()
+        s.ensure_server()
+        real, calls = seat_mod.fd_generation, []
+
+        def changes_under_the_read(fd):
+            calls.append(fd)
+            g = real(fd)
+            return g if len(calls) == 1 else g[:3] + (g[3] + 1,)
+
+        with mock.patch.object(seat_mod, "fd_generation", changes_under_the_read):
+            self.assertEqual(s.step(), seat_mod.WITHDRAWN)
+        self.assertEqual(len(calls), 2, "read before and after the bytes")
+        self.assertEqual(self.sent("turn/start"), [])
+        self.assertFalse(self.copy_of(s, "task-1.txt").exists())
+        self.assertEqual(s.step(), "done", "the file as it is now is a task like any other")
+
+    def test_a_task_whose_file_left_the_inbox_after_its_result_is_still_settled(self):
+        first = self.task("task-1.txt")
+        s = self.make()
+        s.ensure_server()
+        turn = s.run_turn
+
+        def archived_with_its_result(filename, prompt):
+            out = turn(filename, prompt)
+            first.unlink()
+            return out
+
+        s.run_turn = archived_with_its_result
+        self.assertEqual(s.step(), "done")
+
     def test_a_child_that_dies_twice_stops_the_seat_and_the_task_is_not_lost(self):
         self.task("task-1.txt")
         self.plan("die", "die")
@@ -854,7 +916,7 @@ class Worker(SeatCase):
         self.assertTrue(pool_delivery.is_done_flag(done))
         self.assertFalse(pend.exists())
         self.assertEqual(self.prompts(), [
-            f"Sutando task ready: task-1.txt. Worker w1: read {self.tasks / 'task-1.txt'}, complete only this "
+            f"Sutando task ready: task-1.txt. Worker w1: read {self.copy_of(s, 'task-1.txt')}, complete only this "
             "delivered task, use AGENTS.md for code conventions but skip core operations, do not create task "
             f"files, and write the result to {self.results}/task-1.txt."])
         self.assertFalse((self.inbox / "task-1.txt").exists(), "the spent sentinel was pruned, as the notifier does")
@@ -1077,7 +1139,7 @@ class Worker(SeatCase):
         self.assertEqual(s.stage("task-1.txt", "abandon"), "", "no stage hook declared")
         s.ensure_server()
         self.assertEqual(s.step(), "done")
-        self.assertIn(f"Worker w1: read {own / 'task-1.txt'}", self.prompts()[0])
+        self.assertIn(f"Worker w1: read {self.copy_of(s, 'task-1.txt')}", self.prompts()[0])
 
 
 class PanelLines(SeatCase):
@@ -1305,7 +1367,7 @@ class WatcherChild(SeatCase):
         os.replace(other, first)
         self.assertEqual(s.run_task(*chosen[0]), seat_mod.WITHDRAWN)
         self.assertEqual(self.sent("turn/start"), [])
-        self.assertIn("not the file that was admitted", self.out.getvalue())
+        self.assertIn("its file is not the one that was admitted; not started", self.out.getvalue())
 
     def test_an_announcement_naming_a_path_is_kept_by_its_file_name(self):
         s = self.make()
