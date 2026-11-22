@@ -949,6 +949,11 @@ class GatewayMediaMarkerTest(unittest.TestCase):
         class Relay(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 seen.append((self.path, self.headers.get("Authorization")))
+                if self.path.startswith("/relay/bounce"):
+                    self.send_response(302)
+                    self.send_header("Location", "http://169.254.169.254/latest/meta-data/")
+                    self.end_headers()
+                    return
                 if not self.path.startswith("/relay/v1/media/s.space/AbCdEf123?"):
                     self.send_response(404)
                     self.end_headers()
@@ -1010,10 +1015,29 @@ class GatewayMediaMarkerTest(unittest.TestCase):
         self.assertIn("[ag2space-media:", out["body"])
         self.assertEqual(self.seen, [])
 
-    def test_a_media_url_off_the_relay_path_gets_no_bearer(self):
+    def test_a_media_url_off_the_relay_path_is_never_fetched(self):
         out = self.fetch(LIVE_MARKER.format(base=self.base.replace("/relay", "/relay-evil"), size=1))
-        self.assertEqual([auth for _, auth in self.seen], [None])
-        self.assertIn("[ag2space-media:", out["body"], "the 404 leaves the marker as it was")
+        self.assertEqual(self.seen, [])
+        self.assertIn("[ag2space-media:", out["body"])
+
+    def test_a_guest_marker_off_the_gateway_origin_is_refused(self):
+        # A sender's marker must never make the bridge fetch loopback, metadata, LAN or another host.
+        port = self.server.server_address[1]
+        for url in ("http://127.0.0.1:%d/admin" % (port + 1), "http://localhost:%d/relay/x" % port,
+                    "http://169.254.169.254/latest/meta-data/", "http://10.0.0.5/x", "https://example.org/a.txt"):
+            with self.subTest(url):
+                body = "[ag2space-media: %s mime=text/plain name=a.txt] hi" % url
+                out = self.fetch(body)
+                self.assertEqual(out["body"], body, "the marker is left as it was")
+                self.assertEqual(out["attachments"], "", "nothing attached")
+        self.assertEqual(self.seen, [])
+
+    def test_a_relay_redirect_off_origin_is_not_followed(self):
+        body = "[ag2space-media: %s/bounce mime=text/plain name=a.txt] hi" % self.base
+        out = self.fetch(body)
+        self.assertEqual(out["body"], body)
+        self.assertEqual(out["attachments"], "")
+        self.assertEqual([p for p, _ in self.seen], ["/relay/bounce"], "one GET, the redirect not followed")
 
 
 def stat_mode(path):
