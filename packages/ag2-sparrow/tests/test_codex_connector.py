@@ -1049,6 +1049,26 @@ class ModelCardTest(unittest.TestCase):
         self.assertEqual((self.posted(), metrics(self.work)[-1]["card"]), ([], "card-refused"))
 
 
+    def test_a_collaborators_turn_neither_applies_nor_settles_the_owners_pick(self):
+        self.pick("Stub Large")
+        self.posted("$card2")
+        # A collaborator writes first: their turn runs on Codex's own model, and nothing is told.
+        (self.work / "tasks" / "task-c.txt").write_text(gateway_mid_task("task-c", "from a collaborator", "team", True))
+        self.assertEqual(run_connector(self.work, once=1), 0)
+        self.assertNotIn("model=", result(self.work, "task-c"))
+        self.assertEqual((self.posted(), "model_switch" in metrics(self.work)[-1]), ([], False))
+        self.assertEqual((self.state()["wanted"], self.state().get("told")), ("gpt-6-sol", ""), "the pick still waits")
+        # The owner's next message is the one that switches, and the one that is told.
+        self.assertIn("model=gpt-6-sol", self.serve("task-o", "the owner again"))
+        ((_, told),) = self.posted("$card3")
+        self.assertEqual((told["text"], metrics(self.work)[-1]["model_switch"]),
+                         ("Switched. I'm now using Stub Large.", "switched"))
+        # After the switch a collaborator's turn still runs on Codex's own model, never the owner's pick.
+        (self.work / "tasks" / "task-c2.txt").write_text(gateway_mid_task("task-c2", "again", "team", True))
+        self.assertEqual(run_connector(self.work, once=1), 0)
+        self.assertNotIn("model=", result(self.work, "task-c2"))
+
+
 class FakeRpc:
     """A server that accepts turn/start and then says nothing: the proxy branch cannot
     restart a shared daemon, so a stuck turn there must raise."""

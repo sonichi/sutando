@@ -259,6 +259,32 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         self.assertEqual((self.post_queued(), self.w.metrics()[-1]["card"]), ([], "card-refused"))
 
+    def test_a_collaborators_turn_neither_applies_nor_settles_the_owners_pick(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        self.dm_task("task-2", "/model")
+        self.w.serve()
+        (sent,) = self.post_queued()
+        said = sent["extra_content"]["space.ag2.card"]["buttons"][1]["reply"]
+        self.dm_task("task-3", said, reply_to="$card1", click=said)
+        self.w.serve()
+        self.post_queued("$card2")
+        # A collaborator writes first, in a room: their turn runs on what agy had, and nothing is told.
+        self.dm_task("task-4", "STUB:TEXT from a collaborator", tier="team", collaborator=True, kind="room",
+                     channel="!room:s.space")
+        self.w.serve()
+        self.assertEqual((self.set_model_calls(), self.post_queued(), "model_switch" in self.w.metrics()[-1]),
+                         ([], [], False))
+        state = json.loads((self.w.root / "state" / "model.json").read_text())
+        self.assertEqual((state["wanted"], state.get("told")), ("claude-opus-4-6-thinking", ""), "the pick still waits")
+        # The owner's next message is the one that switches, and the one that is told.
+        self.w.task("task-5", "STUB:TEXT the owner again")
+        self.w.serve()
+        self.assertEqual([c["modelId"] for c in self.set_model_calls()], ["claude-opus-4-6-thinking"])
+        (told,) = self.post_queued("$card3")
+        self.assertEqual(told["extra_content"]["space.ag2.card"]["text"], "Switched. I'm now using Claude Opus 4.6.")
+
     def test_picking_the_model_already_in_use_says_so_at_once_and_nothing_is_switched_or_confirmed(self):
         (self.w.home / "models").write_text("")
         self.w.task("task-1", "STUB:TEXT hi")

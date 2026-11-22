@@ -34,7 +34,7 @@ from ... import connector_cards, held_start, model_switch
 from ...acp_host import quoted
 from ...collaborator_turn import stage_own_attachments, with_staged_paths
 from ...relay_loop import count_arg
-from ...task_io import (AUDIENCE_RULE, DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER_CAPABILITIES,  # noqa: F401
+from ...task_io import (AUDIENCE_RULE, DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, OWNER_CAPABILITIES,  # noqa: F401
                         LockRefused, acquire_lock, attested_headers, exit_on_sigterm, holder_consumer, load_done,
                         make_dirs, non_owner_note, parse_task, pid_alive, exit_code, record_done, release_lock,
                         root_path, start_time, stop_requested, turn_policy, write_atomic)
@@ -334,10 +334,10 @@ class Connector:
                          self.models.state().get("current") or self.args.model or default)
         return True
 
-    def turn_model(self, caps):
-        """The model a turn runs on: on the kept threads the owner's pick, or the last pick of theirs that took;
-        else --model (None: Codex's own)."""
-        if not (caps.session == "durable" and getattr(self.args, "state", None)):
+    def turn_model(self, caps, kind=None):
+        """The model a turn runs on: on the owner's own kept turns the owner's pick, or the last pick of theirs
+        that took; else --model (None: Codex's own). A collaborator's turn never uses up the owner's pick."""
+        if not (kind == OWNER and caps.session == "durable" and getattr(self.args, "state", None)):
             return self.args.model
         kept = str(self.models.state().get("confirmed") or "")
         return self.models.wanted() or (kept if self.models.ok(kept) else None) or self.args.model
@@ -350,11 +350,11 @@ class Connector:
         log("card ->", task_id, outcome)
         return {"task": task_id, "status": "completed", "tier": headers["access_tier"], "card": outcome}
 
-    def tell_model(self, status, caps, room=None) -> str:
+    def tell_model(self, status, caps, room=None, kind=None) -> str:
         """After a turn on a kept thread: tell the owner once whether their pick took. Codex names no model
         per turn, so a completed turn ran on the pick unless Codex said it moved the turn; a failed one did not.
         A moved turn's model is Codex's choice, not the owner's: the model in use stays the one before."""
-        if caps.session != "durable" or status not in ("completed", "failed"):
+        if kind != OWNER or caps.session != "durable" or status not in ("completed", "failed"):
             return ""
         wanted = self.models.wanted()
         before = str(self.models.state().get("current") or "")
@@ -622,10 +622,12 @@ class Connector:
         self.restart_server()
         return "timeout", "", "Codex was restarted after %ss" % self.args.turn_timeout
 
-    def run_task(self, headers, prompt, caps=None):
+    def run_task(self, headers, prompt, caps=None, kind=None):
         """One task end to end: pick its thread, run the turn, recover from a dead server
         (durable: retry once on the resumed thread; ephemeral: fail plainly), retry an empty reply once."""
-        caps = caps or capabilities(headers)    # the gate's decision, when the caller has it
+        if caps is None:                        # else the gate's decision, which the caller has
+            policy = turn_policy(headers, allow_non_owner=True)
+            caps, kind = policy.capabilities, policy.kind
         durable = caps.session == "durable"
         for attempt in (1, 2):
             try:
@@ -640,7 +642,7 @@ class Connector:
                 # The turn reads its own folder only: this task's own attachments are copied into it.
                 staged = stage_own_attachments(headers, self.scratch_cwd, getattr(self.args, "media_root", None))
                 turn_prompt = with_staged_paths(prompt, staged)
-            status, text, err = self.run_turn(turn_prompt, self.turn_model(caps), self.turn_cwd(caps))
+            status, text, err = self.run_turn(turn_prompt, self.turn_model(caps, kind), self.turn_cwd(caps))
             if status == "server-exited":
                 self.restart_server()
                 if durable and attempt == 1:
@@ -729,11 +731,11 @@ class Connector:
                 prompt += "\n\n" + model_switch.HINT
             log("turn ->", task_id, headers["access_tier"], repr(message[:60]))
             t_sent = time.time()
-            status, text, err = self.run_task(headers, prompt, policy.capabilities)
+            status, text, err = self.run_task(headers, prompt, policy.capabilities, policy.kind)
             t_done = time.time()
             out = self.result_body(status, text, err)
             # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
-            told = self.tell_model(status, policy.capabilities, headers.get("channel_id"))
+            told = self.tell_model(status, policy.capabilities, headers.get("channel_id"), policy.kind)
             asked = self.models.asked(headers["access_tier"], path, status, text, result_path)
             out = "\n\n".join(x for x in (out.rstrip("\n"), quoted(self.models.unsaid()).strip()) if x)
             t_result = os.stat(result_path).st_mtime if asked else write_atomic(result_path, out.rstrip("\n") + "\n")
