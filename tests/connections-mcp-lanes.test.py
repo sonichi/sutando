@@ -4,7 +4,8 @@
 Each enabled core connection the main descriptor does not serve gets `ag2-mcp.d/conn-<instance>.json`
 (the proxy's lane descriptor shape) and a 0600 `conn-<instance>.env` holding its bearer under the
 row's `token_ref`; anything else under `conn-*` is removed. A disabled, parked or removed connection
-loses its lane. Without a readable main descriptor nothing is touched. No secret reaches a result,
+loses its lane. Without a readable main descriptor nothing is touched. With the proxy's lane resolver configured, a
+vault-held secret gets a `(vault)` descriptor and no env file, and `lane-mcp-credential` answers it. No secret reaches a result,
 stdout, stderr or the log. The record, the vault, the resolver and the descriptor are fixtures.
 
 Run: python3 tests/connections-mcp-lanes.test.py
@@ -604,6 +605,317 @@ class NoSecretLeaks(Base):
         blobs = [json.dumps(result), *text[1:], *js[1:], *missing[1:], "\n".join(logs.output)]
         blobs += [p.read_text() for p in self.lanes.glob("conn-*.json")]
         for secret in ("secret-legacy", "secret-s", "secret-dev", "secret-nomcp"):
+            for blob in blobs:
+                self.assertNotIn(secret, blob)
+
+
+RESOLVER = '["/py", "/e/scripts/connections.py", "--workspace", "/ws", "lane-mcp-credential"]'
+PROXY_REFUSES = {"unknown_lane", "not_owner", "disabled", "parked", "not_engine_descriptor", "no_token", "descriptor_stale"}
+
+
+class VaultLanes(Base):
+    """With the proxy's lane resolver configured, a vault-held secret stays in the vault: the descriptor
+    names `(vault)` and `lane-mcp-credential` hands the proxy `{lane, bearer, relay}` on stdout."""
+
+    def config(self, env=None, descriptor=None):
+        env = {"AG2_MCP_DESCRIPTOR": str(descriptor or self.main), **({} if env is None else env)}
+        path = self.ws / "claude.json"
+        path.write_text(json.dumps({"mcpServers": {"s-space": {"env": env}}}))
+        return path
+
+    def vault_sync(self, **kw):
+        kw.setdefault("mcp_config", self.config({C.MCP_LANE_CREDENTIAL_ENV: RESOLVER}))
+        return self.sync(**kw)
+
+    def resolve(self, lane, **kw):
+        kw.setdefault("environ", {"AG2_MCP_DESCRIPTOR": str(self.main)})
+        kw.setdefault("vault", self.vault)
+        return C.lane_mcp_credential(lane, workspace=self.ws, **kw)
+
+    def run_cli(self, lane):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("connections_cli", ROOT / "scripts" / "connections.py")
+        cli = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli)
+        out, err = io.StringIO(), io.StringIO()
+        real = C.lane_mcp_credential
+
+        def resolve(lane, **kw):
+            return real(lane, workspace=kw.get("workspace"), environ={"AG2_MCP_DESCRIPTOR": str(self.main)},
+                        vault=self.vault)
+        with unittest.mock.patch.object(cli.connections, "lane_mcp_credential", resolve), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli.main(["--workspace", str(self.ws), "lane-mcp-credential", "--lane", lane])
+        return rc, out.getvalue(), err.getvalue()
+
+    def refused(self, lane, reason):
+        with self.assertRaises(C.NoLaneCredential) as cm:
+            self.resolve(lane)
+        self.assertEqual(cm.exception.reason, reason)
+        rc, out, err = self.run_cli(lane)
+        self.assertEqual((rc, out), (3, ""))
+        self.assertTrue(err.startswith(f"lane-mcp-credential: refused, {reason}: "), err)
+        for secret in SECRETS.values():
+            self.assertNotIn(secret.partition("|")[2], err)
+
+    def test_with_the_resolver_configured_a_vault_secret_gets_a_vault_descriptor_and_no_env_copy(self):
+        self.record([LEGACY, S_SPACE, DEV_S])
+        out = self.vault_sync()
+        self.assertEqual((out["ok"], sorted(out["written"]), out["skipped"]), (True, ["dev-s-space", "legacy"], {}))
+        self.assertEqual(self.names(), ["conn-dev-s-space.json", "conn-legacy.json"])
+        d = self.lane("dev-s-space")
+        self.assertEqual((d["env_file"], d["env_key"], d["relay"], d["bearer_digest"]),
+                         (C.MCP_VAULT_ENV_FILE, "AG2_REMOTE_TOKEN_DEV_S_SPACE", "https://dev-chat.s.space/relay",
+                          hashlib.sha256(b"secret-dev").hexdigest()))
+        self.assertEqual(sorted(self.vault_sync()["unchanged"]), ["dev-s-space", "legacy"])
+
+    def test_switching_the_resolver_on_removes_the_env_copy_and_off_writes_it_back(self):
+        self.record([S_SPACE, DEV_S])
+        self.sync()
+        self.assertEqual(self.names(), ["conn-dev-s-space.env", "conn-dev-s-space.json"])
+        self.assertEqual(self.vault_sync()["written"], ["dev-s-space"])
+        self.assertEqual(self.names(), ["conn-dev-s-space.json"])
+        self.assertEqual(self.sync()["written"], ["dev-s-space"])
+        self.assertEqual(self.names(), ["conn-dev-s-space.env", "conn-dev-s-space.json"])
+
+    def test_the_env_file_stays_the_default_without_a_valid_resolver_for_this_descriptor(self):
+        self.record([S_SPACE, DEV_S])
+        other = self.ws / "other" / "ag2-mcp.json"
+        # Each config is written just before its sync: they share one file.
+        for make in (lambda: self.ws / "no-config.json", self.config,
+                     lambda: self.config({C.MCP_LANE_CREDENTIAL_ENV: "[]"}),
+                     lambda: self.config({C.MCP_LANE_CREDENTIAL_ENV: '["", "x"]'}),
+                     lambda: self.config({C.MCP_LANE_CREDENTIAL_ENV: "nope"}),
+                     lambda: self.config({C.MCP_LANE_CREDENTIAL_ENV: RESOLVER}, descriptor=other)):
+            config = make()
+            self.sync(mcp_config=config)
+            self.assertEqual(self.lane("dev-s-space")["env_file"], str(self.lanes / "conn-dev-s-space.env"),
+                             config.read_text() if config.exists() else config)
+
+    def test_the_resolver_in_the_environment_or_a_codex_entry_counts_too(self):
+        self.record([S_SPACE, DEV_S])
+        self.sync(environ={C.MCP_LANE_CREDENTIAL_ENV: RESOLVER})
+        self.assertEqual(self.lane("dev-s-space")["env_file"], C.MCP_VAULT_ENV_FILE)
+        self.sync()
+        toml = self.ws / "codex-home" / "config.toml"
+        toml.parent.mkdir()
+        toml.write_text(f"[mcp_servers.s-space.env]\nAG2_MCP_DESCRIPTOR = \"{self.main}\"\n"
+                        f"{C.MCP_LANE_CREDENTIAL_ENV} = '{RESOLVER}'\n")
+        self.sync(descriptor=None, codex_config=toml)
+        self.assertEqual(self.lane("dev-s-space")["env_file"], C.MCP_VAULT_ENV_FILE)
+
+    def test_a_token_the_resolver_cannot_find_without_the_environment_keeps_its_env_copy(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault.store.pop("AG2_REMOTE_TOKEN_DEV_S_SPACE")
+        self.vault_sync(environ={"AG2_REMOTE_TOKEN_DEV_S_SPACE": SECRETS["AG2_REMOTE_TOKEN_DEV_S_SPACE"]})
+        self.assertEqual(self.names(), ["conn-dev-s-space.env", "conn-dev-s-space.json"])
+
+    def test_a_token_read_ahead_of_the_vault_keeps_its_env_copy_even_when_the_vault_matches_too(self):
+        self.record([S_SPACE, DEV_S])
+        channel = SECRETS["AG2_REMOTE_TOKEN_DEV_S_SPACE"]
+        with unittest.mock.patch.object(C, "_channel_dir_tokens", return_value=["https://dev-chat.s.space/relay|other"]):
+            self.vault_sync()
+        self.assertEqual(self.names(), ["conn-dev-s-space.env", "conn-dev-s-space.json"])
+        self.vault.store["AG2_REMOTE_TOKEN_DEV_S_SPACE"] = "https://dev-chat.s.space/relay|vault-only"
+        with unittest.mock.patch.object(C, "_channel_dir_tokens", return_value=[channel]):
+            self.vault_sync()
+        self.assertEqual(self.names(), ["conn-dev-s-space.env", "conn-dev-s-space.json"])
+
+    def test_the_resolver_answers_the_lane_bearer_and_relay_the_proxy_checks(self):
+        self.record([LEGACY, S_SPACE, DEV_S])
+        self.vault_sync()
+        self.assertEqual(self.resolve("dev-s-space"),
+                         {"lane": "dev-s-space", "bearer": "secret-dev", "relay": "https://dev-chat.s.space/relay"})
+        self.assertEqual(self.resolve("legacy"),
+                         {"lane": "legacy", "bearer": "secret-legacy", "relay": "https://chat.ag2.space/relay"})
+        rc, out, err = self.run_cli("dev-s-space")
+        self.assertEqual((rc, out, err), (0, '{"bearer": "secret-dev", "lane": "dev-s-space", '
+                                             '"relay": "https://dev-chat.s.space/relay"}\n', ""))
+        # The proxy's acceptance (laneVaultSource): last stdout line, same lane, same relay, the digest.
+        answer, desc = json.loads(out.strip().split("\n")[-1]), self.lane("dev-s-space")
+        self.assertEqual(answer["lane"], desc["lane"])
+        self.assertEqual(answer["relay"].rstrip("/"), desc["relay"].rstrip("/"))
+        self.assertEqual(hashlib.sha256(answer["bearer"].strip().encode()).hexdigest(), desc["bearer_digest"])
+
+    def test_an_unknown_lane_the_main_lane_and_a_worker_identity_are_refused(self):
+        worker = row("dev.s.space", "w-bee", "https://dev-chat.s.space/relay", worker="bee")
+        self.record([S_SPACE, DEV_S, worker])
+        self.vault_sync()
+        for lane in ("nope", "primary", "", "w-bee", "s-space"):
+            self.refused(lane, "unknown_lane")
+
+    def test_a_disabled_or_parked_lane_is_refused_even_with_its_descriptor_left_behind(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        for flag, reason in (("disabled", "disabled"), ("parked", "parked")):
+            self.record([S_SPACE, {**DEV_S, flag: True}])
+            self.refused("dev-s-space", reason)
+
+    def test_a_descriptor_this_engine_did_not_write_is_refused(self):
+        self.record([S_SPACE, DEV_S])
+        self.sync()
+        self.refused("dev-s-space", "not_engine_descriptor")  # an env-file lane is not a vault lane
+        self.vault_sync()
+        path = self.lanes / "conn-dev-s-space.json"
+        good = path.read_text()
+        for edit in ({"lane": "other"}, {"env_key": "AG2_REMOTE_TOKEN_S_SPACE"}, {"version": 2}):
+            path.write_text(json.dumps({**json.loads(good), **edit}))
+            self.refused("dev-s-space", "not_engine_descriptor")
+        path.write_text(good)
+        path.chmod(0o620)
+        self.refused("dev-s-space", "not_engine_descriptor")
+        path.chmod(0o600)
+        real = self.ws / "planted.json"
+        real.write_text(good)
+        path.unlink()
+        path.symlink_to(real)
+        self.refused("dev-s-space", "not_engine_descriptor")
+        path.unlink()
+        self.refused("dev-s-space", "not_engine_descriptor")
+
+    def test_a_rotated_or_missing_secret_and_another_user_are_refused(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        self.vault.store["AG2_REMOTE_TOKEN_DEV_S_SPACE"] = "https://dev-chat.s.space/relay|rotated"
+        self.refused("dev-s-space", "descriptor_stale")
+        self.vault.store.pop("AG2_REMOTE_TOKEN_DEV_S_SPACE")
+        self.refused("dev-s-space", "no_token")
+        self.vault.store["AG2_REMOTE_TOKEN_DEV_S_SPACE"] = SECRETS["AG2_REMOTE_TOKEN_DEV_S_SPACE"]
+        with unittest.mock.patch.object(C.os, "geteuid", return_value=C.os.geteuid() + 1):
+            self.refused("dev-s-space", "not_owner")
+
+    def test_the_refusal_is_the_first_stderr_line_in_the_proxys_stripped_environment(self):
+        import importlib.util
+        import util_paths
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        spec = importlib.util.spec_from_file_location("connections_cli", ROOT / "scripts" / "connections.py")
+        cli = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli)
+        stripped = {k: v for k, v in C.os.environ.items()
+                    if k not in ("CLAUDE_CONFIG_DIR", "CLAUDE_HOME", "SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER")}
+        stripped["AG2_MCP_DESCRIPTOR"] = str(self.main)
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.dict(C.os.environ, stripped, clear=True), \
+                unittest.mock.patch.object(util_paths, "_CLAUDE_HOME_FALLBACK_BANNER_FIRED", False), \
+                unittest.mock.patch.object(C, "_vault", lambda v: FakeVault({})), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli.main(["--workspace", str(self.ws), "lane-mcp-credential", "--lane", "dev-s-space"])
+        self.assertEqual((rc, out.getvalue()), (3, ""))
+        self.assertTrue(err.getvalue().startswith("lane-mcp-credential: refused, no_token: "), err.getvalue())
+
+    def test_a_symlink_swapped_in_after_the_open_is_never_followed(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        path = self.lanes / "conn-dev-s-space.json"
+        good = path.read_text()
+        planted = self.ws / "planted.json"
+        planted.write_text(good)
+        path.write_text(json.dumps({**json.loads(good), "env_key": "AG2_REMOTE_TOKEN_S_SPACE"}))
+        path.chmod(0o600)
+        swapped = []
+
+        def swap_after(real):
+            def stat_then_swap(target, *a, **kw):
+                out = real(target, *a, **kw)
+                if not swapped:
+                    swapped.append(1)
+                    path.unlink()
+                    path.symlink_to(planted)
+                return out
+            return stat_then_swap
+        with unittest.mock.patch.object(C.os, "fstat", swap_after(C.os.fstat)), \
+                unittest.mock.patch.object(C.os, "lstat", swap_after(C.os.lstat)):
+            with self.assertRaises(C.NoLaneCredential) as cm:
+                self.resolve("dev-s-space")
+        self.assertEqual((swapped, cm.exception.reason), ([1], "not_engine_descriptor"))
+
+    def test_an_oversized_descriptor_is_refused(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        path = self.lanes / "conn-dev-s-space.json"
+        path.write_text(path.read_text() + " " * C.LANE_DESCRIPTOR_MAX_BYTES)
+        self.refused("dev-s-space", "not_engine_descriptor")
+
+    def test_a_descriptor_that_grows_past_the_cap_after_its_fstat_is_refused(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        path = self.lanes / "conn-dev-s-space.json"
+        path.write_text(path.read_text() + " " * C.LANE_DESCRIPTOR_MAX_BYTES)
+        real = C.os.fstat
+
+        def small_at_fstat(fd):
+            st = real(fd)
+            return C.os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid, st.st_gid,
+                                     100, st.st_atime, st.st_mtime, st.st_ctime))
+        with unittest.mock.patch.object(C.os, "fstat", small_at_fstat):
+            self.refused("dev-s-space", "not_engine_descriptor")
+
+    def test_an_unparsable_or_undecodable_descriptor_is_refused(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        path = self.lanes / "conn-dev-s-space.json"
+        for body in (b"{not json", b'{"version": 1, "lane": "\xff\xfe"}', b"\xff\xfe\xfd"):
+            path.write_bytes(body)
+            self.refused("dev-s-space", "not_engine_descriptor")
+
+    def test_an_unreachable_vault_is_no_token(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        with unittest.mock.patch.object(C, "_vault", side_effect=C.VaultUnavailable("no vault")):
+            self.refused("dev-s-space", "no_token")
+
+    def test_a_workspace_that_cannot_be_read_is_not_owner(self):
+        with self.assertRaises(C.NoLaneCredential) as cm:
+            C.lane_mcp_credential("dev-s-space", workspace=self.ws / "missing", environ={}, vault=self.vault)
+        self.assertEqual(cm.exception.reason, "not_owner")
+        self.assertFalse((self.ws / "missing").exists())
+
+    def test_a_descriptor_another_user_owns_is_refused(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        real = C.os.fstat
+
+        def other_owner(fd):
+            st = real(fd)
+            return C.os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid + 1, st.st_gid,
+                                     st.st_size, st.st_atime, st.st_mtime, st.st_ctime))
+        with unittest.mock.patch.object(C.os, "fstat", other_owner):
+            self.refused("dev-s-space", "not_engine_descriptor")
+
+    def test_a_descriptor_naming_another_relay_is_stale_even_with_the_right_digest(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        path = self.lanes / "conn-dev-s-space.json"
+        path.write_text(json.dumps({**self.lane("dev-s-space"), "relay": "https://evil.example/relay"}))
+        self.refused("dev-s-space", "descriptor_stale")
+
+    def test_the_resolver_reads_only_the_vault_never_the_environment_or_a_channel_file(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        environ = {"AG2_MCP_DESCRIPTOR": str(self.main),
+                   "AG2_REMOTE_TOKEN_DEV_S_SPACE": "https://dev-chat.s.space/relay|from-env"}
+        with unittest.mock.patch.object(C, "_channel_dir_tokens", side_effect=AssertionError("channel read")):
+            self.assertEqual(self.resolve("dev-s-space", environ=environ)["bearer"], "secret-dev")
+
+    def test_without_a_main_descriptor_no_lane_is_answered(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        with self.assertRaises(C.NoLaneCredential) as cm:
+            self.resolve("dev-s-space", environ={}, mcp_config=self.ws / "none.json",
+                         codex_config=self.ws / "none.toml")
+        self.assertEqual(cm.exception.reason, "unknown_lane")
+
+    def test_every_refusal_reason_is_declared(self):
+        self.assertEqual(set(C.LANE_CREDENTIAL_REASONS), PROXY_REFUSES)
+
+    def test_no_secret_in_sync_results_logs_or_vault_descriptors(self):
+        self.record([LEGACY, S_SPACE, DEV_S])
+        with self.assertLogs("connections", "DEBUG") as logs:
+            C.logging.getLogger("connections").debug("start")
+            result = self.vault_sync()
+        blobs = [json.dumps(result), "\n".join(logs.output), *(p.read_text() for p in self.lanes.iterdir())]
+        for secret in ("secret-legacy", "secret-dev"):
             for blob in blobs:
                 self.assertNotIn(secret, blob)
 

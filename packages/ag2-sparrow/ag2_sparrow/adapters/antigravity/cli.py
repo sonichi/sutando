@@ -33,7 +33,7 @@ COMMAND = "ag2-sparrow-antigravity-local"
 ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "TMPDIR", "SHELL")
 REQUIRED_KEYS = ("ACP_COMMAND", "CWD", "INBOX_DIR", "RESULTS_DIR")
 CONFIG_KEYS = ("ACP_COMMAND", "CWD", "SESSION_STORE", "INBOX_DIR", "RESULTS_DIR",
-               "ALLOW_NON_OWNER") + cb.CONFIG_KEYS
+               "ALLOW_NON_OWNER", "ALLOW_OWNER_SHELL_WEB") + cb.CONFIG_KEYS
 LOCAL = Shape(name=SHAPE, command=COMMAND, description="Antigravity CLI on Sparrow",
               cli="Antigravity CLI", min_version=(0, 0, 0), version_anchor=r"^\d",
               version_note="the ACP wake and the sign-in are checked by verify, not by a version",
@@ -83,6 +83,8 @@ def connector_argv(cfg: dict, root: str, root_fd: int) -> list:
         argv += ["--session-store", cfg["SESSION_STORE"]]
     if cfg.get("ALLOW_NON_OWNER") == "1":
         argv.append("--allow-non-owner")
+    if cfg.get("ALLOW_OWNER_SHELL_WEB") == "1":
+        argv.append("--allow-owner-shell-web")
     return argv
 
 
@@ -144,7 +146,8 @@ def resolve_root(args) -> "tuple[dict, str]":
 
 
 RECORDED = (("ACP_COMMAND", "acp_command", str), ("CWD", "cwd", str),
-            ("SESSION_STORE", "session_store", str), ("ALLOW_NON_OWNER", "allow_non_owner", lambda v: v == "1"))
+            ("SESSION_STORE", "session_store", str), ("ALLOW_NON_OWNER", "allow_non_owner", lambda v: v == "1"),
+            ("ALLOW_OWNER_SHELL_WEB", "allow_owner_shell_web", lambda v: v == "1"))
 
 
 def signed_in_problem(args, acp: str) -> str:
@@ -187,7 +190,8 @@ def install(args) -> int:
     values = {"ACP_COMMAND": acp, "CWD": cwd or str(Path(root) / DEFAULT_CWD),
               "SESSION_STORE": str(Path(args.session_store).expanduser().resolve()) if args.session_store else "",
               "INBOX_DIR": str(Path(root) / "tasks"), "RESULTS_DIR": str(Path(root) / "results"),
-              "ALLOW_NON_OWNER": "1" if args.allow_non_owner else "", "AGENT_ID": where["agent_id"],
+              "ALLOW_NON_OWNER": "1" if args.allow_non_owner else "",
+              "ALLOW_OWNER_SHELL_WEB": "1" if getattr(args, "allow_owner_shell_web", False) else "", "AGENT_ID": where["agent_id"],
               "BRIDGE": mode if mode != EXTERNAL else "", "TOKEN_ENV_FILE": where["token_file"], "TOKEN_VAULT_KEY": "",
               "BRIDGE_STATE_DIR": str(cb.bridge_home(root) / "state") if mode != EXTERNAL else ""}
 
@@ -297,11 +301,17 @@ def verify(args, factory=gc.AcpClient) -> int:
     for key in ("INBOX_DIR", "RESULTS_DIR"):
         cm.check(results, Path(cfg[key]).is_dir(), key.lower().replace("_dir", ""), cfg[key])
     store = cfg.get("SESSION_STORE") or str(Path(cm.work_root(cfg)) / "state" / gc.SESSIONS_NAME)
-    print(f"INFO sessions: {store} (the owner's resumed per room, never retired; a non-owner's turn is a "
-          "throwaway session)")
-    print(f"INFO non-owner: {'served (--allow-non-owner)' if cfg.get('ALLOW_NON_OWNER') == '1' else 'refused, collaborators included (owner only)'}; "
-          "each turn in its own temporary directory and agy home, deny-all rules, read-only (plan) mode, "
-          "no file operations")
+    print(f"INFO sessions: {store} (the owner's and each collaborator's resumed per room, never retired; a "
+          "guest's turn is a throwaway session)")
+    print("INFO team (attested collaborator): served as the owner is, on the owner's agy account: the working "
+          "directory, agy's own home, the owner's permission policy (read or edit under the working directory, "
+          "no command)")
+    print(f"INFO guest: {'served (--allow-non-owner)' if cfg.get('ALLOW_NON_OWNER') == '1' else 'refused'}; "
+          "each turn served on the owner's agy account, in its own temporary directory and agy home, deny-all "
+          "rules, read-only (plan) mode, no file operations")
+    print("INFO owner shell and web: " + ("on (--allow-owner-shell-web): the owner's turns may run commands and "
+                                          "fetch or search the web" if cfg.get("ALLOW_OWNER_SHELL_WEB") == "1"
+                                          else "off (read and edit under the session cwd only)"))
     if cb.bridge_mode(cfg) != EXTERNAL:
         print(f"INFO agent: {cfg.get('AGENT_ID')}")
         problem = cb.bridge_problem(cfg, COMMAND, bridge)
@@ -336,8 +346,11 @@ def session_options(p) -> None:
     p.add_argument("--session-store", help="the sessions.json to resume from and record to (default: the work "
                    "root's state/sessions.json)")
     p.add_argument("--allow-non-owner", action="store_true",
-                   help="serve non-owner senders, attested collaborators included, on the owner's agy sign-in "
-                   "(no file operations granted; default: the owner only)")
+                   help="serve senders without collaborator access (guests) too, on the owner's agy sign-in, "
+                   "isolated and read-only (default: refused; an attested collaborator is always served)")
+    p.add_argument("--allow-owner-shell-web", action="store_true",
+                   help="let the owner's turns run shell commands and fetch or search the web, as a local Claude "
+                   "Code agent may (never a collaborator's or a guest's; default: off)")
 
 
 def main(argv=None) -> int:
