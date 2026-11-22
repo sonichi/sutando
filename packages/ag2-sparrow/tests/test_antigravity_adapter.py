@@ -484,6 +484,29 @@ class ConnectorTest(unittest.TestCase):
             self.assertEqual((len(list(outbox.iterdir())), json.loads(state.read_text())["untold"]),
                              (len(saved), []), "told again after the restart: each notice is one card")
 
+    def test_a_full_backlog_and_a_new_outcome_are_all_told_on_the_first_turn_the_bridge_is_back(self):
+        state = self.w.root / "state" / "model.json"
+        models = [{"id": "claude-opus-4-6-thinking", "name": "Claude Opus 4.6"},
+                  {"id": "gemini-3.8-flash-medium", "name": "Gemini 3.8 Flash"}]
+        backlog = [{"picked": "claude-opus-4-6-thinking", "ran": "gemini-3.8-flash-medium", "room": self.DM,
+                    "key": "old-%d" % n, "at": n + 1} for n in range(gc.UNTOLD_KEEP)]
+        state.write_text(json.dumps({"wanted": "gemini-3.8-flash-medium", "asked_in": self.DM, "available": models,
+                                     "untold": backlog}))
+        args = self.w.args()
+        args.bridge_state = str(self.bridge_state())
+        turn = acp_host.Turn()
+        turn.live, turn.model = True, "gemini-3.8-flash-medium"
+        self.assertEqual(gc.Connector(args).tell_model_outcome(turn), "switched")
+        self.assertEqual(len(self.post_queued()), gc.UNTOLD_KEEP + 1, "the oldest was told too, not capped away")
+        self.assertEqual(json.loads(state.read_text())["untold"], [])
+        # With the bridge still down the cap holds: the newest UNTOLD_KEEP stay owed.
+        state.write_text(json.dumps({"wanted": "gemini-3.8-flash-medium", "asked_in": self.DM, "available": models,
+                                     "untold": backlog}))
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("bridge down")):
+            self.assertEqual(gc.Connector(args).tell_model_outcome(turn), "untold")
+        kept = json.loads(state.read_text())["untold"]
+        self.assertEqual((len(kept), kept[0]["key"], kept[-1]["picked"]), (gc.UNTOLD_KEEP, "old-1", "gemini-3.8-flash-medium"))
+
     def test_two_picks_across_one_outage_are_each_settled_once_and_told_in_order_afterwards(self):
         (self.w.home / "models").write_text("")
         state = self.w.root / "state" / "model.json"

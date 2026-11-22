@@ -383,7 +383,7 @@ class Connector:
             outcome = "switched" if ran == wanted else "not-switched"
             owed.append({"picked": wanted, "ran": ran, "room": state.get("asked_in"),
                          "key": uuid.uuid4().hex, "at": time.time_ns()})
-            owed = owed[-UNTOLD_KEEP:]
+            # Saved whole: the cap is for what is still undeliverable after this turn's drain, below.
             # The model the turn ran on is the one in use, whatever a resumed Session reports of itself.
             self.save_model_state(untold=owed, told=wanted, current=ran or state.get("current") or "",
                                   **({} if outcome == "switched" else {"wanted": ""}))
