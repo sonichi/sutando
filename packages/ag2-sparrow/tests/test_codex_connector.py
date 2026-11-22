@@ -836,14 +836,18 @@ class ModelCardTest(unittest.TestCase):
         self.assertEqual((result(self.work, "task-3").strip(), "card" in metrics(self.work)[-1]), ("[model-card]", False))
         self.assertEqual(self.posted(), [])
 
-    def test_a_guests_turn_never_runs_on_the_owners_pick(self):
+    def test_a_guests_turn_runs_on_the_owners_pick_and_its_outcome_goes_to_the_dm(self):
         self.pick("Stub Large")
         self.posted("$card2")
         guest = self.serve("task-3", "hi", extra=["--allow-non-owner"], tier="guest", channel="!room:s.space", kind="room")
-        self.assertNotIn("model=", guest)
-        self.assertEqual((self.posted(), "model_switch" in metrics(self.work)[-1]), ([], False), "nothing is told for it")
+        self.assertIn("model=gpt-6-sol", guest)
+        self.assertNotIn("Switched", guest, "never in the room's answer")
+        ((room, told),) = self.posted("$card3")
+        self.assertEqual((room, told["text"], metrics(self.work)[-1]["model_switch"]),
+                         (self.DM, "Switched. I'm now using Stub Large.", "switched"))
+        self.assertEqual((self.state()["wanted"], self.state()["confirmed"]), ("gpt-6-sol", "gpt-6-sol"), "the pick is kept")
         self.assertIn("model=gpt-6-sol", self.serve("task-4", "hello"))
-        self.assertEqual(metrics(self.work)[-1]["model_switch"], "switched")
+        self.assertEqual(self.posted(), [], "told once")
 
     def test_without_the_agents_own_bridge_there_is_no_card_and_model_is_an_ordinary_message(self):
         shutil.rmtree(self.bridge.parent)
@@ -1049,24 +1053,22 @@ class ModelCardTest(unittest.TestCase):
         self.assertEqual((self.posted(), metrics(self.work)[-1]["card"]), ([], "card-refused"))
 
 
-    def test_a_collaborators_turn_neither_applies_nor_settles_the_owners_pick(self):
+    def test_the_owners_pick_runs_on_a_collaborators_turn_and_is_told_only_in_the_dm(self):
         self.pick("Stub Large")
         self.posted("$card2")
-        # A collaborator writes first: their turn runs on Codex's own model, and nothing is told.
+        # A collaborator writes first, in a room: their turn runs on the pick, and the outcome goes to the DM.
         (self.work / "tasks" / "task-c.txt").write_text(gateway_mid_task("task-c", "from a collaborator", "team", True))
         self.assertEqual(run_connector(self.work, once=1), 0)
-        self.assertNotIn("model=", result(self.work, "task-c"))
-        self.assertEqual((self.posted(), "model_switch" in metrics(self.work)[-1]), ([], False))
-        self.assertEqual((self.state()["wanted"], self.state().get("told")), ("gpt-6-sol", ""), "the pick still waits")
-        # The owner's next message is the one that switches, and the one that is told.
+        self.assertIn("model=gpt-6-sol", result(self.work, "task-c"))
+        self.assertNotIn("Switched", result(self.work, "task-c"), "never in the room's answer")
+        ((room, told),) = self.posted("$card3")
+        self.assertEqual((room, told["text"], metrics(self.work)[-1]["model_switch"]),
+                         (self.DM, "Switched. I'm now using Stub Large.", "switched"))
+        # A guest's turn and the owner's next turn are on it as well, and nothing more is told.
+        self.assertIn("model=gpt-6-sol", self.serve("task-g", "hi", extra=["--allow-non-owner"], tier="guest",
+                                                    channel="!room:s.space", kind="room"))
         self.assertIn("model=gpt-6-sol", self.serve("task-o", "the owner again"))
-        ((_, told),) = self.posted("$card3")
-        self.assertEqual((told["text"], metrics(self.work)[-1]["model_switch"]),
-                         ("Switched. I'm now using Stub Large.", "switched"))
-        # After the switch a collaborator's turn still runs on Codex's own model, never the owner's pick.
-        (self.work / "tasks" / "task-c2.txt").write_text(gateway_mid_task("task-c2", "again", "team", True))
-        self.assertEqual(run_connector(self.work, once=1), 0)
-        self.assertNotIn("model=", result(self.work, "task-c2"))
+        self.assertEqual(self.posted(), [])
 
 
 class FakeRpc:
