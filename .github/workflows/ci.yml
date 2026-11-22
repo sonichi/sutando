@@ -76,8 +76,8 @@ jobs:
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "code=$code"
 
-      # The ag2-sparrow publish gate runs on a push, or when the PR touches the package, a src/ file
-      # synced into it, a shared test helper or fixture its suites load, or the gate's own machinery.
+      # The ag2-sparrow publish gate runs on a push, or when a changed path reaches it: gate_reach.py owns
+      # that answer (synced src/ files plus gate_inputs.txt, which a test keeps covering what suites load).
       - name: Does the diff reach the ag2-sparrow publish gate?
         id: sparrow
         env:
@@ -88,19 +88,9 @@ jobs:
           sparrow=true
           if [ "$EVENT" = "pull_request" ] && [ -n "$BASE_REF" ]; then
             git fetch -q origin "$BASE_REF"
-            synced="$(cd packages/ag2-sparrow/tools && python3 -c 'import sync_from_src; print("\n".join(sync_from_src.MAP))')"
             # Both sides of a rename count: deleting a synced or package file reaches the gate too.
             changed="$(git diff --name-only --no-renames "origin/$BASE_REF...HEAD")"
-            sparrow=false
-            while IFS= read -r f; do
-              [ -n "$f" ] || continue
-              case "$f" in
-                packages/ag2-sparrow/*|tests/_helpers/*|tests/fixtures/*|tests/sparrow-suite-costs.txt \
-                  |scripts/parallel-suite-lane.sh|scripts/shard-by-cost.sh|.github/workflows/ci.yml)
-                  sparrow=true; break ;;
-              esac
-              if printf '%s\n' "$synced" | grep -qxF -- "$f"; then sparrow=true; break; fi
-            done <<< "$changed"
+            sparrow="$(printf '%s\n' "$changed" | python3 packages/ag2-sparrow/tools/gate_reach.py)"
           fi
           echo "sparrow=$sparrow" >> "$GITHUB_OUTPUT"
           echo "sparrow=$sparrow"
