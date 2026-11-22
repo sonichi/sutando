@@ -74,6 +74,7 @@ import hashlib
 import http.client
 import ipaddress
 import socket
+import stat
 import ssl
 import tempfile
 import threading
@@ -4162,28 +4163,37 @@ def mcp_descriptor_path(workspace: Optional[Path], mcp_config: Optional[Path] = 
     return ws / "state" / MCP_DESCRIPTOR_NAME
 
 
-def _named_descriptors(servers) -> "list[Path]":
-    """The `AG2_MCP_DESCRIPTOR` each MCP server entry's `env` names, in entry order; an entry or `env`
-    that is not a table names nothing."""
+def _named_entries(servers) -> "list[tuple[Path, Mapping]]":
+    """(descriptor, env) for each MCP server entry whose `env` names an `AG2_MCP_DESCRIPTOR`, in entry
+    order; an entry or `env` that is not a table names nothing."""
     out = []
     for entry in servers.values() if isinstance(servers, Mapping) else []:
         env = entry.get("env") if isinstance(entry, Mapping) else None
         named = env.get("AG2_MCP_DESCRIPTOR") if isinstance(env, Mapping) else None
         if isinstance(named, str) and named:
-            out.append(Path(named))
+            out.append((Path(named), env))
     return out
+
+
+def _named_descriptors(servers) -> "list[Path]":
+    """The `AG2_MCP_DESCRIPTOR` each MCP server entry's `env` names, in entry order."""
+    return [path for path, _ in _named_entries(servers)]
 
 
 def _claude_config_descriptors(mcp_config: Optional[Path]) -> "list[Path]":
     """Descriptors the Claude Code MCP config (`mcp_config`, default `<claude home>/.claude.json`) names."""
+    return _named_descriptors(_claude_config_servers(mcp_config))
+
+
+def _claude_config_servers(mcp_config: Optional[Path]):
+    """The Claude Code MCP config's `mcpServers` table; {} when unreadable."""
     if mcp_config is None:
         from util_paths import claude_home_path
         mcp_config = claude_home_path(".claude.json")
     try:
-        servers = json.loads(Path(mcp_config).read_text(encoding="utf-8")).get("mcpServers") or {}
+        return json.loads(Path(mcp_config).read_text(encoding="utf-8")).get("mcpServers") or {}
     except (OSError, ValueError, AttributeError):
-        servers = {}
-    return _named_descriptors(servers)
+        return {}
 
 
 def _codex_config_path(environ: Mapping[str, str]) -> Optional[Path]:
@@ -4200,8 +4210,13 @@ def _codex_config_path(environ: Mapping[str, str]) -> Optional[Path]:
 
 def _codex_config_descriptors(codex_config: Optional[Path]) -> "list[Path]":
     """Descriptors Codex's `config.toml` names under `[mcp_servers.<name>.env]`."""
+    return _named_descriptors(_codex_config_servers(codex_config))
+
+
+def _codex_config_servers(codex_config: Optional[Path]):
+    """Codex's `config.toml` `mcp_servers` table; {} when there is none or it is unreadable."""
     if codex_config is None:
-        return []
+        return {}
     try:
         import tomllib
     except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
@@ -4210,10 +4225,9 @@ def _codex_config_descriptors(codex_config: Optional[Path]) -> "list[Path]":
         except ModuleNotFoundError:
             import toml_fallback as tomllib
     try:
-        servers = tomllib.loads(Path(codex_config).read_text(encoding="utf-8")).get("mcp_servers") or {}
+        return tomllib.loads(Path(codex_config).read_text(encoding="utf-8")).get("mcp_servers") or {}
     except (OSError, ValueError, AttributeError):
-        servers = {}
-    return _named_descriptors(servers)
+        return {}
 
 
 def repoint_mcp_descriptor(path: Path, *, legacy: str, code: str, agent_mxid: str,
@@ -4266,6 +4280,10 @@ def repoint_mcp_descriptor(path: Path, *, legacy: str, code: str, agent_mxid: st
 MCP_LANES_DIR_NAME = "ag2-mcp.d"
 MCP_LANES_DIR_ENV = "AG2_MCP_LANES_DIR"
 MCP_LANE_PREFIX = "conn-"
+# A lane descriptor naming this env_file has no env copy: the proxy asks `lane_mcp_credential` for its
+# bearer through the argv `MCP_LANE_CREDENTIAL_ENV` carries, which the desktop host sets.
+MCP_VAULT_ENV_FILE = "(vault)"
+MCP_LANE_CREDENTIAL_ENV = "AG2_MCP_LANE_CREDENTIAL"
 
 
 def mcp_lanes_dir(workspace: Optional[Path] = None, environ: Optional[Mapping[str, str]] = None) -> Path:
@@ -4276,8 +4294,8 @@ def mcp_lanes_dir(workspace: Optional[Path] = None, environ: Optional[Mapping[st
 
 
 def _main_mcp_descriptor(workspace: Optional[Path], environ: Mapping[str, str], mcp_config: Optional[Path],
-                         descriptor: Optional[Path], codex_config: Optional[Path] = None) -> Optional[dict]:
-    """The primary lane's descriptor, read only: `descriptor`, else `AG2_MCP_DESCRIPTOR`, else any
+                         descriptor: Optional[Path], codex_config: Optional[Path] = None) -> "Optional[tuple[dict, Path]]":
+    """(descriptor, its path) of the primary lane, read only: `descriptor`, else `AG2_MCP_DESCRIPTOR`, else any
     descriptor the Claude Code MCP config names, else any the Codex `config.toml` names (the desktop's
     lives outside the workspace), else `state/ag2-mcp.json`. None when none is a readable version-1
     descriptor."""
@@ -4295,8 +4313,29 @@ def _main_mcp_descriptor(workspace: Optional[Path], environ: Mapping[str, str], 
         except (OSError, ValueError):
             continue
         if isinstance(desc, dict) and desc.get("version") == 1 and isinstance(desc.get("mint_url"), str):
-            return desc
+            return desc, Path(path)
     return None
+
+
+def _resolver_argv(raw) -> Optional[list]:
+    """`raw` as the proxy reads `MCP_LANE_CREDENTIAL_ENV`: a JSON array of non-empty strings, else None."""
+    try:
+        argv = json.loads(raw) if isinstance(raw, str) and raw else None
+    except ValueError:
+        return None
+    return argv if isinstance(argv, list) and argv and all(isinstance(a, str) and a for a in argv) else None
+
+
+def _proxy_reads_vault_lanes(main_path: Path, environ: Mapping[str, str], mcp_config: Optional[Path],
+                             codex_config: Optional[Path]) -> bool:
+    """Whether the proxy serving `main_path` resolves `(vault)` lanes: `MCP_LANE_CREDENTIAL_ENV` holds a
+    resolver argv in this environment or in the env of an MCP config entry naming that descriptor."""
+    if _resolver_argv(environ.get(MCP_LANE_CREDENTIAL_ENV)):
+        return True
+    codex_config = _codex_config_path(environ) if codex_config is None else codex_config
+    entries = _named_entries(_claude_config_servers(mcp_config)) + _named_entries(_codex_config_servers(codex_config))
+    target = main_path.resolve()
+    return any(path.resolve() == target and _resolver_argv(env.get(MCP_LANE_CREDENTIAL_ENV)) for path, env in entries)
 
 
 def mcp_lane_slug(instance: str) -> str:
@@ -4377,15 +4416,19 @@ def sync_mcp_lanes(workspace: Optional[Path] = None, *, environ: Optional[Mappin
                    codex_config: Optional[Path] = None) -> dict:
     """Write `conn-<instance>.json` (and a 0600 `conn-<instance>.env` holding the row's bearer under its
     `token_ref`) in `mcp_lanes_dir` for each enabled core row the main descriptor does not already
-    serve, and remove every other `conn-*` file there. Without a readable main descriptor nothing is
+    serve, and remove every other `conn-*` file there. When that proxy resolves vault lanes
+    (`_proxy_reads_vault_lanes`) and the token is found with no environment, the descriptor names
+    `MCP_VAULT_ENV_FILE` and no env file is kept. Without a readable main descriptor nothing is
     touched (`skipped: no_main_descriptor`). Returns slugs only, never a secret."""
     environ = os.environ if environ is None else environ
     lanes = mcp_lanes_dir(workspace, environ)
     out = {"ok": True, "lanes_dir": str(lanes), "written": [], "unchanged": [], "removed": [], "skipped": {}}
-    main = _main_mcp_descriptor(workspace, environ, mcp_config, descriptor, codex_config)
-    if main is None:
+    found = _main_mcp_descriptor(workspace, environ, mcp_config, descriptor, codex_config)
+    if found is None:
         out.update(ok=False, reason="no_main_descriptor")
         return out
+    main, main_path = found
+    vault_lanes = _proxy_reads_vault_lanes(main_path, environ, mcp_config, codex_config)
     served = {s for s in (str(main.get("server") or "").lower(), server_of_mxid(str(main.get("agent_id") or ""))) if s}
     main_relay = _lane_relay(str(main.get("relay") or ""))
     want = set()
@@ -4402,9 +4445,20 @@ def sync_mcp_lanes(workspace: Optional[Path] = None, *, environ: Optional[Mappin
                 out["skipped"][slug] = "no_token"
                 continue
             env_file = lanes / f"{MCP_LANE_PREFIX}{slug}.env"
-            desc, reason = _mcp_lane(row, token, main, env_file, space_of)
+            from_vault = vault_lanes and _resolvable_offline(row, token, vault)
+            desc, reason = _mcp_lane(row, token, main, MCP_VAULT_ENV_FILE if from_vault else env_file, space_of)
             if desc is None:
                 out["skipped"][slug] = reason
+                continue
+            if from_vault:
+                want.add(slug)
+                body = json.dumps(desc, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+                changed = _write_if_changed(lanes / f"{MCP_LANE_PREFIX}{slug}.json", body)
+                # The descriptor no longer names the copy, so it goes after the descriptor is rewritten.
+                with contextlib.suppress(FileNotFoundError):
+                    env_file.unlink()
+                    changed = True
+                out["written" if changed else "unchanged"].append(slug)
                 continue
             value = token.strip() if gateway_url_of(token) else f"{desc['relay']}|{token.strip()}"
             try:
@@ -4433,6 +4487,76 @@ def sync_mcp_lanes(workspace: Optional[Path] = None, *, environ: Optional[Mappin
             if slug not in want and _unlink_lane(lanes, slug):
                 out["removed"].append(slug)
     return out
+
+
+def _resolvable_offline(row: Mapping[str, object], token: str, vault) -> bool:
+    """Whether `lane_mcp_credential`, run by the proxy with a stripped environment, finds this token:
+    the vault holds it and nothing the resolver reads first holds another."""
+    try:
+        held = row_token(row, _vault_get(_vault(vault), str(row["token_ref"])))
+        return held == token and connection_credential(row, {}, vault=vault)[1] == token
+    except ConnectionsError:
+        return False
+
+
+class NoLaneCredential(ConnectionsError):
+    """`lane_mcp_credential` refused; `reason` is one of LANE_CREDENTIAL_REASONS. Never carries a secret."""
+
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason, self.detail = reason, detail
+
+
+LANE_CREDENTIAL_REASONS = ("not_owner", "unknown_lane", "disabled", "parked", "not_engine_descriptor",
+                           "no_token", "descriptor_stale")
+
+
+def _engine_lane_descriptor(path: Path) -> Optional[dict]:
+    """The lane descriptor at `path` when it is a regular file of this user that no other user may write."""
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022:
+            return None
+        desc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return desc if isinstance(desc, dict) and desc.get("version") == 1 else None
+
+
+def lane_mcp_credential(lane: str, *, workspace: Optional[Path] = None,
+                        environ: Optional[Mapping[str, str]] = None, vault=None) -> dict:
+    """`{lane, bearer, relay}` for the MCP proxy's `(vault)` lane `lane` (a `mcp_lane_slug`), `bearer` the
+    secret half of the row's token (`connection_credential`), `relay` its gateway. Refused with
+    NoLaneCredential unless this user owns the workspace, `lane` is an enabled core row, and its
+    `conn-<lane>.json` is a `(vault)` descriptor this user wrote for that row, its relay and its secret."""
+    ws = _workspace(workspace)
+    try:
+        owner = ws.stat().st_uid
+    except OSError:
+        owner = None
+    if owner != os.geteuid():
+        raise NoLaneCredential("not_owner", "this user does not own the workspace")
+    row = next((r for r in _core_rows(read_rows(ws)) if mcp_lane_slug(str(r["instance"])) == lane), None) \
+        if isinstance(lane, str) and lane else None
+    if row is None:
+        raise NoLaneCredential("unknown_lane", "no core connection has this lane")
+    if row.get("disabled") or row.get("parked"):
+        reason = "disabled" if row.get("disabled") else "parked"
+        raise NoLaneCredential(reason, f"connection {lane} is {reason}")
+    desc = _engine_lane_descriptor(mcp_lanes_dir(ws, environ) / f"{MCP_LANE_PREFIX}{lane}.json")
+    if desc is None or desc.get("lane") != lane or desc.get("env_file") != MCP_VAULT_ENV_FILE \
+            or desc.get("env_key") != str(row["token_ref"]):
+        raise NoLaneCredential("not_engine_descriptor", f"lane {lane} has no vault descriptor of this engine")
+    try:
+        gateway_url, token = connection_credential(row, environ, vault=vault)
+    except ConnectionsError:
+        raise NoLaneCredential("no_token", f"connection {lane} has no token") from None
+    relay = _lane_relay(gateway_url_of(token) or gateway_url)
+    secret = secret_of(token) if gateway_url_of(token) else token.strip()
+    if not secret or _lane_relay(str(desc.get("relay") or "")) != relay \
+            or desc.get("bearer_digest") != hashlib.sha256(secret.encode()).hexdigest():
+        raise NoLaneCredential("descriptor_stale", f"lane {lane}'s descriptor was written for another credential")
+    return {"lane": lane, "bearer": secret, "relay": relay}
 
 
 def _refresh_mcp_lanes(workspace: Optional[Path], environ: Optional[Mapping[str, str]], vault) -> None:

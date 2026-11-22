@@ -72,6 +72,9 @@
                                connection the main descriptor does not serve, and remove stale ones;
                                a successful launch and park/disconnect/remove keep them current.
                                Exit 1 with no readable main descriptor (nothing touched)
+  lane-mcp-credential --lane SLUG
+                               one JSON line {lane, bearer, relay} for the MCP proxy's '(vault)' lane
+                               SLUG, from the vault (stdout only; exit 3 refused, the reason on stderr)
   bridge-pid [INSTANCE]        the pid proven to hold that bridge's lease ('' = the legacy bridge);
                                nothing when none runs; exit 3 when the lease proves neither
 
@@ -361,6 +364,20 @@ def cmd_worker_mcp_credential(args) -> int:
     return 0
 
 
+def cmd_lane_mcp_credential(args) -> int:
+    """One JSON line with a `(vault)` lane's bearer for the MCP proxy (`connections.lane_mcp_credential`),
+    to stdout alone; a refusal names its reason, never the secret, on stderr and exits 3."""
+    # The proxy logs only the first stderr line, and runs this with no CLAUDE_CONFIG_DIR.
+    os.environ.setdefault("SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER", "1")
+    try:
+        cred = connections.lane_mcp_credential(args.lane, workspace=args.workspace)
+    except connections.NoLaneCredential as e:
+        print(f"lane-mcp-credential: refused, {e.reason}: {e.detail}", file=sys.stderr)
+        return 3
+    print(json.dumps(cred, sort_keys=True))
+    return 0
+
+
 def cmd_worker_mcp_credential_argv(args) -> int:
     """The JSON argv a worker seat exports as AG2_MCP_WORKER_CREDENTIAL (no secret, no vault read)."""
     print(json.dumps(connections.mcp_worker_credential_argv(args.worker, args.repo, args.python, args.workspace)))
@@ -451,6 +468,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("worker-mcp-credential-argv"); s.add_argument("--worker", required=True)
     s.add_argument("--repo", type=Path, required=True); s.add_argument("--python", default="")
     s.set_defaults(fn=cmd_worker_mcp_credential_argv)
+    s = sub.add_parser("lane-mcp-credential"); s.add_argument("--lane", required=True)
+    s.set_defaults(fn=cmd_lane_mcp_credential)
     sub.add_parser("primary").set_defaults(fn=cmd_primary)
     sub.add_parser("enabled").set_defaults(fn=cmd_enabled)
     s = sub.add_parser("sync-mcp-lanes"); s.add_argument("--json", action="store_true")
