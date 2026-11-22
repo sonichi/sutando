@@ -470,11 +470,12 @@ and started a second core beside the desktop's, both reading one task inbox. A
 switch aimed at any other socket is not the desktop's core, so it leaves the
 desktop's `coreRuntime` unchanged.
 
-## Running on `codex app-server` (experimental, off by default)
+## Running on `codex app-server` (the default)
 
-By default the Codex core and each Codex pool worker are a Codex TUI in tmux, and a notifier
-types every task into it. With `SUTANDO_CODEX_APP_SERVER=1` in the launcher's environment the
-same tmux session holds a seat process instead (`src/agent/codex/app-server/seat.py`). The seat:
+By default the Codex core and each Codex pool worker are a seat process on `codex app-server`
+(`src/agent/codex/app-server/seat.py`) in their tmux session. With the choice turned off (below)
+each is a Codex TUI in tmux instead, and a notifier types every task into it. A host without
+tmux, or a launch that cannot read the choice, runs the TUI. The seat:
 
 - owns one `codex -c … app-server --listen stdio://` child and one durable thread. The thread id is
   kept in `<workspace>/state/codex-seat/<tmux session>/thread`, and a restart resumes it.
@@ -556,15 +557,27 @@ included. `--search` becomes `-c web_search="live"`. `--add-dir` and the bootstr
 prompt have no counterpart; a worker's boot prompt becomes the thread's developer
 instructions. None of this has been run against a real Codex login yet.
 
-To turn it on, set `SUTANDO_CODEX_APP_SERVER=1` and restart from outside the core:
+It is on unless turned off. To change it for every later launch, record the choice and restart
+from outside the core:
 
 ```bash
-SUTANDO_CODEX_APP_SERVER=1 bash src/agent/start-cli.sh --restart
+bash scripts/sutando-config.sh codex-app-server-select off   # the interactive TUI; `on` to go back
+bash src/agent/start-cli.sh --restart
 ```
 
-To turn it off, run the same restart without the variable; the seat's window is replaced by
-the TUI and the notifier and observer sessions come back. A pool worker picks the flag up
-when it is spawned, from the environment of the process that spawns it.
+In the AG2 Space app the same choice is the "Run Codex as a background service (app-server)"
+toggle on the Sutando core's settings row, which restarts the core for you. The choice lives in
+the desktop's `runtime.json` (`codexAppServer`) on a desktop install, else in
+`core.codex_app_server` of `<workspace>/sutando.config.local.json`;
+`bash scripts/sutando-config.sh codex-app-server` prints the resolved `1` or `0`.
+Nothing recorded means on. `SUTANDO_CODEX_APP_SERVER` set non-empty overrides the choice for one
+launch (`1` on, anything else off): `SUTANDO_CODEX_APP_SERVER=0 bash src/agent/start-cli.sh --restart`
+starts the TUI once.
+
+Turned off, the next restart replaces the seat's window with the TUI and brings the notifier
+and observer sessions back. A pool worker reads the same choice, through the same resolver, when
+it is spawned, unless the environment of the process that spawns it sets the variable (a seat
+core passes `1` to what it spawns, so its workers are seats too).
 
 ## Rollback
 

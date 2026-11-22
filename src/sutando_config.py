@@ -773,6 +773,117 @@ def resolve_core_runtime(repo_root: Optional[Path] = None) -> str:
     return runtime
 
 
+def _strict_bool(val: Any) -> Optional[bool]:
+    return val if isinstance(val, bool) else None
+
+
+def _desktop_codex_app_server(repo_root: Optional[Path]) -> Optional[bool]:
+    path = desktop_runtime_selection_path(repo_root)
+    if path is None:
+        return None
+    try:
+        return _strict_bool(json.loads(path.read_text()).get("codexAppServer"))
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def resolve_codex_app_server(repo_root: Optional[Path] = None) -> bool:
+    """Whether a Codex core or Codex pool worker runs as a seat on ``codex app-server``.
+
+    On by default (owner decision 2026-11-22). ``SUTANDO_CODEX_APP_SERVER`` set non-empty is
+    an invocation-scoped override (``1`` on, anything else off). Next is the desktop's
+    durable choice, ``codexAppServer`` in its ``runtime.json`` (the app's toggle), then
+    ``core.codex_app_server`` from merged config (the workspace layer included). Only a
+    JSON ``true``/``false`` counts; a missing, unreadable or non-boolean value keeps the default.
+    """
+    env = os.environ.get("SUTANDO_CODEX_APP_SERVER", "").strip()
+    if env:
+        return env == "1"
+    desktop = _desktop_codex_app_server(repo_root)
+    if desktop is not None:
+        return desktop
+    try:
+        val = (load_config(repo_root).get("core") or {}).get("codex_app_server")
+    except (RuntimeError, AttributeError) as exc:
+        print(f"sutando config: cannot read core.codex_app_server ({exc}); keeping the default (on)",
+              file=sys.stderr)
+        return True
+    if val is not None and not isinstance(val, bool):
+        print(f"sutando config: core.codex_app_server must be a JSON boolean, got {val!r}; "
+              f"keeping the default (on)", file=sys.stderr)
+        return True
+    return val is not False
+
+
+def _replace_json_atomically(path: Path, body: Dict[str, Any]) -> None:
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        with open(tmp, "w") as f:
+            f.write(json.dumps(body, indent=2) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _read_json_object(path: Path) -> Dict[str, Any]:
+    """A file this module updates in place: missing is empty; anything but an object is refused."""
+    try:
+        body = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(body, dict):
+        raise ValueError(f"{path} is not a JSON object")
+    return body
+
+
+def persist_codex_app_server(enabled: bool, repo_root: Optional[Path] = None) -> "tuple[str, Path]":
+    """Record the app-server choice where ``resolve_codex_app_server`` reads it first.
+
+    On a desktop install that is ``codexAppServer`` in the desktop's ``runtime.json`` (the
+    app's toggle writes the same key), else ``core.codex_app_server`` in
+    ``<workspace>/sutando.config.local.json``. Every other key survives and the file is
+    replaced atomically. Returns (``"updated"``|``"unchanged"``, the file). It takes effect
+    on the next launch; a running core keeps its mode until restarted.
+    """
+    if not isinstance(enabled, bool):
+        raise ValueError(f"codex app-server choice must be a boolean, got {enabled!r}")
+    desktop = desktop_runtime_selection_path(repo_root)
+    if desktop is not None and desktop.parent.is_dir():
+        body = _read_json_object(desktop)
+        if body.get("codexAppServer") is enabled:
+            return "unchanged", desktop
+        body["codexAppServer"] = enabled
+        _replace_json_atomically(desktop, body)
+        return "updated", desktop
+    root = repo_root or _find_repo_root()
+    if root is None:
+        raise ValueError("no Sutando checkout found to resolve the workspace")
+    root = Path(root)
+    repo_cfg = _expand_vars(_deep_merge(_load_json(root / _CONFIG_FILENAME),
+                                        _load_json(root / _LOCAL_FILENAME)), root)
+    path = _workspace_layer_path(repo_cfg, root)
+    if not path.parent.is_dir():
+        raise ValueError(f"workspace {path.parent} does not exist")
+    body = _read_json_object(path)
+    core = body.get("core")
+    if core is None:
+        core = body["core"] = {}
+    if not isinstance(core, dict):
+        raise ValueError(f"{path} key 'core' is not a JSON object")
+    if core.get("codex_app_server") is enabled:
+        return "unchanged", path
+    core["codex_app_server"] = enabled
+    _replace_json_atomically(path, body)
+    global _CACHE
+    _CACHE = None
+    return "updated", path
+
+
 _DEFAULT_CLAUDE_SUTANDO_SUBDIR = ".claude-sutando"
 
 

@@ -15,7 +15,7 @@ delivery sentinels naming `<payloads>/<task file>`), `results`, `state`, `stage_
                     [--stage-command ARG...]
     seat.py run --host FILE --workspace DIR --seat NAME [--worker ID] [--model M] [-c key=value]...
 
-Off unless a launcher starts it (`SUTANDO_CODEX_APP_SERVER=1`). Stdlib only.
+Started by the launchers unless the app-server choice is off (`sutando-config.sh codex-app-server`). Stdlib only.
 """
 from __future__ import annotations
 
