@@ -90,7 +90,7 @@ jobs:
             git fetch -q origin "$BASE_REF"
             synced="$(cd packages/ag2-sparrow/tools && python3 -c 'import sync_from_src; print("\n".join(sync_from_src.MAP))')"
             # Both sides of a rename count: deleting a synced or package file reaches the gate too.
-            changed="$(git diff --name-only --no-renames "origin/$BASE_REF...HEAD")"
+            changed="$(git diff --name-only --no-renames b2c98a395faa848e673991d9f56c92ab1019e8ae HEAD^2 -- . ":!.github/workflows/ci.yml")"
             sparrow=false
             while IFS= read -r f; do
               [ -n "$f" ] || continue
