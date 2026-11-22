@@ -244,19 +244,24 @@ resumed (resuming a sign-in Session still bills the Google account's quota), a n
 
 ## The account card
 
-In their DM with the agent the owner sends `/account` (or asks in words; the turn answers with the card's
-mark) and gets a card saying "Google sign-in" or "Gemini API key" (whether this agent's Keychain item
-exists; the key itself is never read for it). Only the owner's tap in their DM acts; anyone else's is refused.
+All in the owner's DM (Commons "切换账号 / API key 需求", part A). The owner says 换账号 / switch account /
+用 API key (or `/account`, or the turn answers with the card's mark) and gets a card with 「切换账号」 and
+「用 API key」 (plus 「停用 API key」 while a key is saved). Only the owner's tap or reply in their DM acts.
 
-- **Sign in with Google again** opens a Terminal window on this Mac running `agy acp --login` (from a 0700
-  `state/agy-google-sign-in.command`); the owner follows the link and pastes the code into that Terminal,
-  never into the room. agy keeps one Google sign-in for the Mac, so this moves every Antigravity agent here,
-  and the card says so. Where no Terminal can be opened the card points to the app's Connections card.
-- **Use a Gemini API key** points to the agent's Antigravity card in the app's Connections, which saves the
-  key. Keys are never taken in chat: a message carrying a Google-API-key-shaped string (`AIza` + 35) is not
-  passed to agy, and the owner is asked to delete it.
-- **Stop using the key** (shown when one is saved) deletes this agent's own Keychain item; the next turn opens
-  a fresh Session on the Google sign-in. See `agy_account.py`.
+- **切换账号** runs `agy acp --login` ("log in with Google interactively, then exit") in the background
+  under a pseudo-terminal (no window) and posts the sign-in link on the card ("打开登录页"; also opened in
+  this computer's browser when it can be). The owner signs in and sends the authorization code, or the
+  landing page's whole address, back in the DM: that one message goes to the waiting process only, never to
+  agy's turn, a log, metrics or state, and is scrubbed from the task file. Exit 0 → 已切到 <account>. agy
+  keeps one Google sign-in per Mac, so this moves every Antigravity agent here; the card says so. A sign-in
+  not finished in 10 minutes is stopped. No platform op lets a connector delete the message; the card asks
+  the owner to.
+- **用 API key** points to the agent's Antigravity settings (Connections). A key pasted in chat is redacted
+  by the bridge's chat secret filter before it reaches the connector (Google API keys are on its list), so
+  it cannot be taken from chat; a key or its redaction marker that arrives is answered and never passed on.
+- **停用 API key** deletes this agent's own Keychain item; the next turn opens a fresh Session on the sign-in.
+- **Quota.** A turn that fails with `RESOURCE_EXHAUSTED` / "Individual quota reached" shows the card in the
+  owner's DM (at most every 30 minutes), or, elsewhere, says to ask for it in the DM. See `agy_account.py`.
 
 ## S.space tools (Room Commons pages and room actions)
 
