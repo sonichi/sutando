@@ -792,13 +792,14 @@ def _name_seat(req, session, seat):
     name its own, and its terminal jump must name that pane's session."""
     from hitl.schema import Action
     req.title = f"{seat} · {req.title}"
-    req.message = f"{seat} (tmux session {session})\n\n{req.message}"
-    req.device = {"id": session, "name": seat}
-    req.subject = {**(req.subject or {}), "seat": seat}
     if (req.subject or {}).get("recovery"):
         from hitl.recovery import SEAT_MODEL_LOCKED
         from hitl.tui_gate import RETRY_LINE, RETRY_SEAT_LINE
         req.message = f"{req.message.replace(RETRY_LINE, RETRY_SEAT_LINE)} {SEAT_MODEL_LOCKED}"
+    # The question leads; the seat line closes it, and the card's device names the seat too.
+    req.message = f"{req.message}\n\n{seat} (tmux session {session})"
+    req.device = {"id": session, "name": seat}
+    req.subject = {**(req.subject or {}), "seat": seat}
     req.actions = [Action(id=a.id, kind=a.kind, label=f"Open terminal ({session})")
                    if a.kind == "open_terminal" else a for a in req.actions]
     return req

@@ -22,6 +22,16 @@ NOTICE_FIELD = "space.ag2.hitl_notice"
 WIRE_SUBJECT_FIELDS = ("tool", "input", "options", "choices")
 # A recovery card also shows its tap's receipt outcome (hitl.recovery), so a client knows the answer.
 WIRE_RECEIPT_OUTCOMES = ("done", "refused", "stale", "failed")
+# What came of the owner's answer (the card's `outcome`): applied now, then done or failed.
+OUTCOME_RUNNING, OUTCOME_DONE, OUTCOME_FAILED = "running", "done", "failed"
+OUTCOME_STATES = (OUTCOME_RUNNING, OUTCOME_DONE, OUTCOME_FAILED)
+OUTCOME_TEXT_MAX = 200
+RECEIPT_FAILED_TEXT = {
+    "refused": "It was refused, so nothing was done.",
+    "stale": "The card changed before your answer arrived, so nothing was done.",
+    "failed": "It could not be done.",
+}
+SUPERSEDED_TEXT = "It is still blocked. A new card follows."
 
 
 # Canonical JSON's integer range; a number outside it is refused like a float.
@@ -128,6 +138,8 @@ class HumanRequirement:
     updated_at: float = field(default_factory=time.time)
     # The room the card is for; when set, a reply from any other room is stale.
     room: str = ""
+    # The producer's own word on what came of the answer ({state, text}); see wire_outcome.
+    outcome: Optional[Dict[str, str]] = None
 
     def __post_init__(self) -> None:
         if self.kind not in KINDS:
@@ -158,6 +170,34 @@ class HumanRequirement:
         self.guard = guard
         self.revision += 1
         self.updated_at = time.time()
+
+    def set_outcome(self, state: str, text: str = "") -> None:
+        """Record what came of the owner's answer; it outranks what the status alone would say."""
+        if state not in OUTCOME_STATES:
+            raise ValueError(f"unknown outcome state: {state!r}")
+        self.outcome = outcome_wire(state, text)
+
+    def wire_outcome(self) -> Optional[Dict[str, str]]:
+        """The card's `outcome`, or None while it still asks or nobody answered it. The producer's
+        own outcome wins, then a recovery receipt, then the status (in_progress runs, resolved is done)."""
+        if self.status == STATUS_PENDING or not self.chosen_action:
+            return None
+        own = self.outcome
+        if isinstance(own, dict) and own.get("state") in OUTCOME_STATES:
+            return outcome_wire(own["state"], own.get("text"))
+        subject = self.subject or {}
+        receipt = subject.get("receipt")
+        if isinstance(receipt, dict) and receipt.get("outcome") in WIRE_RECEIPT_OUTCOMES:
+            text = receipt.get("text")
+            if receipt["outcome"] == "done" and subject.get("superseded") is not True:
+                return outcome_wire(OUTCOME_DONE, text)
+            fallback = SUPERSEDED_TEXT if receipt["outcome"] == "done" else RECEIPT_FAILED_TEXT[receipt["outcome"]]
+            return outcome_wire(OUTCOME_FAILED, text or fallback)
+        if self.status == STATUS_IN_PROGRESS:
+            return outcome_wire(OUTCOME_RUNNING)
+        if self.status == STATUS_RESOLVED:
+            return outcome_wire(OUTCOME_DONE)
+        return None  # cancelled or expired: the status says it
 
     def wire_device(self) -> Optional[Dict[str, str]]:
         """The device as a reader sees it: the producer's dict plus `host` (this
@@ -208,9 +248,20 @@ class HumanRequirement:
             wire["expires_at"] = self.expires_at
         if self.turn_on_action:
             wire["turn_on_action"] = True
+        outcome = self.wire_outcome()
+        if outcome:
+            wire["outcome"] = outcome
         # `answer` is inbound-only (what the human typed back); a card never
         # renders it, so it is persisted but deliberately not on the wire.
         return wire_safe(wire)
+
+
+def outcome_wire(state: str, text: Optional[str] = None) -> Dict[str, str]:
+    """{state, text?}: the text as one line, cut at a word to OUTCOME_TEXT_MAX."""
+    line = " ".join(str(text or "").split())
+    if len(line) > OUTCOME_TEXT_MAX:
+        line = line[:OUTCOME_TEXT_MAX - 1].rsplit(" ", 1)[0].rstrip(" ,;:") + "…"
+    return {"state": state, **({"text": line} if line else {})}
 
 
 class StaleRequirementError(Exception):

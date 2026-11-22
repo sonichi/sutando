@@ -42,6 +42,8 @@ HANDED_LEASE_SEC = 600
 # where it runs real and credited time agree, and no single clock jump spends the whole lease.
 LEASE_MAX_STEP_SEC = 300
 MAX_REOFFERS = 1
+# What a stale click's card says: the question was settled another way first.
+STALE_TEXT = "This question was already settled, so your answer was not used."
 
 
 def manager_for(workspace):
@@ -163,7 +165,7 @@ def clicks(workspace: Path, closer, manager=None, now: Optional[float] = None) -
                 else:
                     entry.update(_retired(manager, c), closed=True)
             elif outcome == STALE:
-                manager.cancel(c["hitl_id"])
+                manager.cancel(c["hitl_id"], "failed", STALE_TEXT)
                 entry["stale"] = True
             else:
                 entry["deferred"] = True  # the claim stays `claiming`, to be retried
@@ -190,9 +192,11 @@ def due_clicks(workspace: Path, manager=None, now: Optional[float] = None) -> li
     return out
 
 
-def ack_click(workspace: Path, ask_id: str, token: str, manager=None) -> tuple:
+def ack_click(workspace: Path, ask_id: str, token: str, manager=None, outcome: Optional[str] = None,
+              text: str = "") -> tuple:
     """(done, message): the consumer that holds this question's handed choice acted on it. The
-    token must be the claim's current one: after a re-offer, the earlier consumer's ack is stale."""
+    token must be the claim's current one: after a re-offer, the earlier consumer's ack is stale.
+    `outcome` (done | failed) and `text` are what the card then says came of it."""
     manager = manager or manager_for(workspace)
     with clicks_lock(manager):
         for c in answered_cards(manager):
@@ -202,6 +206,6 @@ def ack_click(workspace: Path, ask_id: str, token: str, manager=None) -> tuple:
             if claim.get("token") != token:
                 return False, (f"stale ack for {ask_id}: that choice was re-offered to another consumer "
                                "after its lease ran out; nothing changed")
-            manager.resolve(c["hitl_id"])
+            manager.resolve(c["hitl_id"], outcome or "done", text)
             return True, f"acknowledged {ask_id} ({c['hitl_id']})"
     return False, f"no handed-out click for {ask_id} to acknowledge"

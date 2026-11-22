@@ -436,7 +436,7 @@ def _answer_card(manager, req, line: str, outcome: str, now: float, check: Optio
         if not (outcome == "done" and (check or {}).get("detached")):
             # A detached restart's card carries no receipt until its outcome is known (verify_step):
             # a client reading the card never sees "done" for a restart that then failed.
-            subject["receipt"] = {"outcome": outcome, "at": int(now)}
+            subject["receipt"] = _card_receipt(outcome, now, line)
         cur.subject = subject
         cur.revision += 1
         cur.updated_at = time.time()
@@ -454,7 +454,12 @@ def _final_receipt(workspace: Path, req_id: str, check: Dict, outcome: str, reas
                 str(prior.get("hitl_id") or req_id), str(prior.get("incident") or ""),
                 str(prior.get("action_id") or ""), outcome, reason, now,
                 {k: v for k, v in (prior.get("recovery") or {}).items() if k != "state"}))
-    return {"outcome": outcome, "at": int(now)}
+    return _card_receipt(outcome, now, reason)
+
+
+def _card_receipt(outcome: str, now: float, line: Optional[str] = None) -> Dict:
+    """The card's receipt; `line` is the card's outcome text (hitl.schema wire_outcome)."""
+    return {"outcome": outcome, "at": int(now), **({"text": line} if line else {})}
 
 
 #: How long a session may stay blocked after a done action before its card says so.
@@ -581,6 +586,8 @@ def verify_step(manager, workspace: Path, session: str, blocked: bool, now: Opti
                 continue
             cur.message = f"{cur.message}\n\n{line}"
             cur.subject = {**(cur.subject or {}), "verify": {**check, "seen": seen}}
+            if isinstance(cur.subject.get("receipt"), dict):
+                cur.subject["receipt"] = {**cur.subject["receipt"], "text": line}  # what was seen after
             cur.revision += 1
             cur.updated_at = time.time()
             manager.store.save(cur)
@@ -632,7 +639,7 @@ def _fallback_restart(manager, workspace: Path, req, check: Dict, target: Target
             return
         cur.message = f"{cur.message}\n\n{line}"
         cur.subject = {**(cur.subject or {}), "verify": {**(cur.subject or {}).get("verify", {}), "seen": "failed"},
-                       "receipt": {"outcome": "failed", "at": int(now)}}
+                       "receipt": _card_receipt("failed", now, line)}
         cur.revision += 1
         cur.updated_at = time.time()
         manager.store.save(cur)

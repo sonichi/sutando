@@ -357,8 +357,9 @@ def due_clicks(workspace: Path, manager=None, now=None) -> list:
     return cards.due_clicks(Path(workspace), manager, now)
 
 
-def ack_click(workspace: Path, ask_id: str, token: str, manager=None) -> tuple:
-    return cards.ack_click(Path(workspace), ask_id, token, manager)
+def ack_click(workspace: Path, ask_id: str, token: str, manager=None, outcome: Optional[str] = None,
+              text: str = "") -> tuple:
+    return cards.ack_click(Path(workspace), ask_id, token, manager, outcome, text)
 
 
 # ---- the ask ----------------------------------------------------------------------

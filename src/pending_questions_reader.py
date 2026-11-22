@@ -37,13 +37,15 @@ writes a core caller makes through the same contract: `resolve <ask-id> [--answe
 `hitl_click: true` task (`--due` is the probe, exit 0 when a pass is owed; its only write is the
 lease credit each pass earns, that
 health-check's `decision-card-clicks` warn uses so a deferred or expired click is retried); and
-`ack <ask-id> --token <token>` once the core has acted on a choice `clicks` handed it. `--store-adapter <path>`
+`ack <ask-id> --token <token> [--failed] [--note <line>]` once the core has acted on a choice
+`clicks` handed it (the card then says done or failed, with that line). `--store-adapter <path>`
 injects an adapter file in place of the declared one.
 """
 from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import json
 import sys
 import threading
@@ -286,15 +288,24 @@ def due_clicks(workspace, adapter=None) -> tuple:
         return None, f"adapter failed ({type(e).__name__}: {e})"
 
 
-def ack(workspace, ask_id: str, token: str, adapter=None) -> tuple:
-    """(done, message): the core acted on that question's choice; the adapter's `ack_click`."""
+def ack(workspace, ask_id: str, token: str, adapter=None, outcome: Optional[str] = None,
+        text: str = "") -> tuple:
+    """(done, message): the core acted on that question's choice; the adapter's `ack_click`.
+    `outcome` (done | failed) and `text` say on the card how it went, when the adapter takes them."""
     mod, why = _adapter(adapter)
     if mod is None or not hasattr(mod, "ack_click"):
         return False, f"not acknowledged: {why if mod is None else f'adapter {why} takes no acks'}"
+    extra, note = {}, ""
+    if outcome is not None or text:
+        if "outcome" in inspect.signature(mod.ack_click).parameters:
+            extra = {"outcome": outcome or "done", "text": text}
+        else:
+            note = " (the card shows no outcome: the adapter takes none)"
     try:
-        return mod.ack_click(Path(workspace), ask_id, token)
+        ok, msg = mod.ack_click(Path(workspace), ask_id, token, **extra)
     except Exception as e:  # noqa: BLE001
         return False, f"not acknowledged: adapter failed ({type(e).__name__}: {e})"
+    return ok, msg + (note if ok else "")
 
 
 def click_line(c: dict) -> str:
@@ -362,6 +373,8 @@ def main(argv=None) -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--answered", action="store_true", help="resolve: mark it Answered, not Resolved")
     ap.add_argument("--token", default=None, help="ack: the token `clicks` printed with the choice")
+    ap.add_argument("--failed", action="store_true", help="ack: the choice could not be carried out")
+    ap.add_argument("--note", default="", help="ack: one short line for the card on how it went")
     ap.add_argument("--due", action="store_true",
                     help="clicks: only say whether a pass is owed (exit 0 when it is, 1 when not); "
                          "its only write is crediting this pass to each handed lease")
@@ -378,7 +391,8 @@ def main(argv=None) -> int:
     if args.command == "ack":
         if not args.token:
             ap.error("ack needs the --token `clicks` printed with the choice")
-        ok, msg = ack(args.workspace, args.ask_id, args.token, store)
+        outcome = "failed" if args.failed else ("done" if args.note else None)
+        ok, msg = ack(args.workspace, args.ask_id, args.token, store, outcome, args.note)
         print(msg)
         return 0 if ok else 1
     if args.command == "clicks" and args.due:

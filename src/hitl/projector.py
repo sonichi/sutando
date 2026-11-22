@@ -32,6 +32,9 @@ from .schema import (
     STATUS_EXPIRED,
     STATUS_RESOLVED,
     NOTICE_FIELD,
+    OUTCOME_DONE,
+    OUTCOME_RUNNING,
+    RECEIPT_FAILED_TEXT,
     WIRE_FIELD,
     category_of,
     wire_safe,
@@ -92,7 +95,13 @@ def fallback_body(req: HumanRequirement) -> str:
                                _CATEGORY_HEADS[CATEGORY_BLOCKED])
     head = f"{lead} — {req.message}{where}"
     receipt = (req.subject or {}).get("receipt")
-    if req.terminal and isinstance(receipt, dict):
+    own = req.wire_outcome() if isinstance(req.outcome, dict) else None
+    if req.terminal and own and own["state"] != OUTCOME_RUNNING:
+        # The producer said what came of the answer: that line, not the status's general one.
+        done = own["state"] == OUTCOME_DONE
+        text = own.get("text") or ("Sutando has continued its work." if done else RECEIPT_FAILED_TEXT["failed"])
+        closer = f"{'✓' if done else '✕'} {text}"
+    elif req.terminal and isinstance(receipt, dict):
         closer = _RECEIPT_LINES.get(receipt.get("outcome"), _RECEIPT_NOT_DONE)
         if receipt.get("outcome") == "done" and (req.subject or {}).get("superseded"):
             closer = _RECEIPT_STILL_BLOCKED
