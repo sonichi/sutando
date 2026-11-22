@@ -117,7 +117,8 @@ the room (keyed by their user id), so no one resumes another's conversation.
 agy's `session/request_permission` is answered by `acp_host`'s policy, default deny:
 
 - the owner's turn only (the owner and Team), and only on an install with `--allow-owner-shell-web`
-  (recorded as `ALLOW_OWNER_SHELL_WEB=1`; off by default, so an existing install does not change on update):
+  (recorded as `ALLOW_OWNER_SHELL_WEB=1`; off by default, so an install that never turned it on does not
+  change on update; one that did changes, see "Upgrading with the switch on" below):
   any shell command and any `execute`, `fetch` or `search` call, as a local Claude Code agent runs commands
   and uses the web for its owner, and as claude-local and codex-local give an attested collaborator the
   owner's tools. Plain team never gets it. `verify` prints `INFO owner shell and web: on|off`;
@@ -141,6 +142,12 @@ That holds for an attested collaborator's turn too: once a collaborator has shel
 them from reading the agent's relay token file directly (mode 600 only keeps out other accounts, not
 the owner's), the owner's other credentials, or any file the owner can read. Turn the switch on
 only if you trust every attested collaborator of this agent with the owner's account and its secrets.
+
+**Upgrading with the switch on.** Before this release the switch was for the owner's turns only. An install
+that already has `ALLOW_OWNER_SHELL_WEB=1` gives the same shell commands and web to every attested
+collaborator of the agent as soon as it is upgraded, without asking the owner again. If that is not what you
+want, turn the switch off before upgrading (reinstall without `--allow-owner-shell-web`), or review who is an
+attested collaborator of this agent first and remove anyone you would not hand the owner's account to.
 
 For the owner's turns (Team's included), agy applies its own permission rules first (an action they already allow runs
 without asking), and `--dangerously-skip-permissions` makes it run tools without asking; never add that
