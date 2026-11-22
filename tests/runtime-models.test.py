@@ -113,6 +113,39 @@ class Probe(unittest.TestCase):
                 self.assertEqual(self.sent, [])
 
 
+class Edges(unittest.TestCase):
+    def test_a_row_that_names_no_model_has_nothing_to_send(self):
+        rows = RM.parse_picker(" Select model\n   1. Custom thing\n", "claude")
+        self.assertEqual([(r["label"], r["arg"]) for r in rows], [("Custom thing", None)])
+
+    def test_an_unreadable_or_foreign_record_is_no_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            (ws / "state").mkdir()
+            path = ws / "state" / "runtime-models.claude.json"
+            for body in ("{", json.dumps({"v": 2, "entries": []}), json.dumps([1])):
+                path.write_text(body)
+                self.assertIsNone(RM.read(ws, "claude"), body)
+            self.assertIsNone(RM.read(ws, "agy"))
+
+    def test_a_row_without_a_model_matches_only_its_own_key(self):
+        self.assertTrue(RM._same({"key": "custom", "model": None}, "custom"))
+        self.assertFalse(RM._same({"key": "custom", "model": None}, "opus"))
+
+    def test_a_broken_request_file_is_no_request_and_a_failed_send_records_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            probe = RM._probe_path(ws, CORE)
+            probe.parent.mkdir(parents=True)
+            probe.write_text("{")
+            self.assertEqual(RM.probe_step(ws, CORE, "claude", False, "blocked-human", True, LIMIT,
+                                           lambda k: True), "")
+            RM.request_probe(ws, CORE)
+            self.assertEqual(RM.probe_step(ws, CORE, "claude", False, "blocked-human", True, LIMIT,
+                                           lambda k: False), "")
+            self.assertNotIn("sent_at", json.loads(probe.read_text()))
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

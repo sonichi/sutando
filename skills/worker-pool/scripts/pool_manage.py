@@ -22,7 +22,10 @@ already owns its fact, so the remedy, the sweep and the router honour it:
     reseat  restart a running seat that owes nothing, so its tools pick up an
             agent identity added after it started; one that owes work is left.
     retry   restart a seat stopped at a provider limit now, on the owner's "retry now" to its
-            pause (its input watcher runs it): owed work is kept and delivered again.
+            pause (its input watcher runs it): owed work is kept and delivered again. The verb
+            hands the restart to a detached child (`--in-place`) and returns: the take-down
+            closes the input watcher's own session, which would end a child of it mid-run. The
+            child never leaves the seat paused; a restart that fails is told to the owner.
     bind    bind a room to a worker on the shared folders (pool_roster.bind_room), so the
             router delivers that room's tasks to it; a worker on its own folders is refused,
             since the router never delivers to one.
@@ -38,7 +41,7 @@ already owns its fact, so the remedy, the sweep and the router honour it:
     python3 pool_manage.py [--workspace WS] [--repo REPO] enable <worker> [--no-start]
     python3 pool_manage.py [--workspace WS] remove <worker> [--hand-off]
     python3 pool_manage.py [--workspace WS] [--repo REPO] reseat <worker>
-    python3 pool_manage.py [--workspace WS] [--repo REPO] retry <worker id>
+    python3 pool_manage.py [--workspace WS] [--repo REPO] retry <worker id> [--in-place]
     python3 pool_manage.py [--workspace WS] plugins <worker> add|remove <dir>
     python3 pool_manage.py [--workspace WS] plugins <worker> list
     python3 pool_manage.py [--workspace WS] bind <room id> <worker id or label>
@@ -71,6 +74,11 @@ pr = sw.pr
 # Killed first to last: the inbox supervisor, then the input watcher, then the seat.
 COMPANION_SUFFIXES = ("-watcher", rem.INPUT_WATCH_SUFFIX)
 STOP_LOCK_WAIT_S = rem.RESTART_LOCK_WAIT_S
+#: What the detached retry child runs: this script.
+RETRY_ENTRY = Path(__file__).resolve()
+#: The detached retry waits this long first, so the watcher that asked records its answer before
+#: the take-down closes it.
+RETRY_HANDOFF_S = 2.0
 
 
 class Refused(Exception):
@@ -377,21 +385,64 @@ def unbind(workspace, room: str) -> dict:
 
 def retry(workspace, repo, target, *, runner=subprocess.run, spawn=None) -> dict:
     """Restart `target`'s seat at once, owed work kept: the owner's "retry now" to its limit pause.
-    A stopped or retired worker is left alone; a seat that is already gone is just started."""
+    A stopped or retired worker is left alone; a seat that is already gone is just started.
+    Run in place (the detached child of `dispatch_retry`): whatever happens, the pause this sets
+    for the take-down is lifted again, and a restart that did not happen is told to the owner."""
     wid, row = _worker(workspace, target)
     base = {"worker_id": wid, "action": "retry"}
     if row.get("state") == "retired" or sup.is_paused(workspace, wid):
         return {**base, "result": "failed", "why": "the worker is stopped or retired; enable it first"}
-    socket = sup.run_socket(workspace, wid)
-    if socket is not None and sw.session_state(wi.tmux_session_name(wid), socket, runner=runner) == "exists":
-        t = _take_down(workspace, wid, runner)
-        sup.set_paused(workspace, wid, False)
-        if not t["down"]:
-            return {**base, "result": "failed", "sessions": t["sessions"],
-                    "why": "tmux could not confirm the seat gone"}
-    restarted = rem.restart(workspace, repo, wid, runner=None if runner is subprocess.run else runner, spawn=spawn)
-    return {**base, "result": "restarted" if restarted["result"] in ("restarted", "already-running") else "failed",
-            "start": {"result": restarted["result"], "detail": restarted["detail"]}}
+    out = None
+    try:
+        socket = sup.run_socket(workspace, wid)
+        if socket is not None and sw.session_state(wi.tmux_session_name(wid), socket, runner=runner) == "exists":
+            t = _take_down(workspace, wid, runner)
+            sup.set_paused(workspace, wid, False)
+            if not t["down"]:
+                out = {**base, "result": "failed", "sessions": t["sessions"],
+                       "why": "tmux could not confirm the seat gone"}
+        if out is None:
+            restarted = rem.restart(workspace, repo, wid, runner=None if runner is subprocess.run else runner,
+                                    spawn=spawn)
+            ok = restarted["result"] in ("restarted", "already-running")
+            out = {**base, "result": "restarted" if ok else "failed",
+                   "start": {"result": restarted["result"], "detail": restarted["detail"]}}
+            if not ok:
+                out["why"] = "the seat did not start again"
+    finally:
+        sup.set_paused(workspace, wid, False)  # never left stopped: the pool supervises it again
+    if out["result"] == "failed":
+        _tell_owner_retry_failed(workspace, row.get("name") or wid, out.get("why") or "")
+    return out
+
+
+def dispatch_retry(workspace, repo, target, *, popen=subprocess.Popen) -> dict:
+    """Start `retry --in-place` detached in its own session, and return at once: the caller (the
+    seat's input watcher) lives in a tmux session the take-down closes."""
+    wid, row = _worker(workspace, target)
+    base = {"worker_id": wid, "action": "retry"}
+    if row.get("state") == "retired" or sup.is_paused(workspace, wid):
+        return {**base, "result": "failed", "why": "the worker is stopped or retired; enable it first"}
+    log = Path(workspace) / "logs" / f"pool-retry-{wid}.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    argv = [sys.executable, str(RETRY_ENTRY), "--workspace", str(workspace), "--repo", str(repo),
+            "retry", wid, "--in-place", "--after", str(RETRY_HANDOFF_S)]
+    with open(log, "ab") as out:
+        popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True, close_fds=True)
+    return {**base, "result": "dispatched", "log": str(log)}
+
+
+def _tell_owner_retry_failed(workspace, name: str, why: str) -> None:
+    """One DM line: the retry did not restart the worker; the pool keeps supervising it."""
+    from local_record import write_text_whole
+    from proactive_routing import proactive_filename
+    import time as _time
+    try:
+        write_text_whole(Path(workspace) / "results" / proactive_filename(f"pool-retry-{int(_time.time() * 1000)}"),
+                         f"[dm-only]\nI could not restart {name}{': ' + why if why else ''}. It is not left stopped: "
+                         "the pool keeps supervising it and starts it again by itself.\n")
+    except OSError:
+        pass
 
 
 def main(argv=None, *, runner=subprocess.run) -> int:
@@ -414,6 +465,10 @@ def main(argv=None, *, runner=subprocess.run) -> int:
         if name in ("retire", "remove"):
             sp.add_argument("--hand-off", action="store_true",
                             help="give the tasks it still owes to the core instead of refusing")
+        if name == "retry":
+            sp.add_argument("--in-place", action="store_true",
+                            help="run the restart in this process (the detached child of a retry)")
+            sp.add_argument("--after", type=float, default=0.0, help="seconds to wait before the take-down")
         if name == "enable":
             sp.add_argument("--no-start", action="store_true",
                             help="lift the stop/retire without starting a session now")
@@ -448,7 +503,11 @@ def main(argv=None, *, runner=subprocess.run) -> int:
         elif a.cmd == "reseat":
             out = reseat(ws, a.repo, a.worker, runner=runner)
         elif a.cmd == "retry":
-            out = retry(ws, a.repo, a.worker, runner=runner)
+            if a.in_place and a.after > 0:
+                import time as _time
+                _time.sleep(min(a.after, 30.0))
+            out = (retry(ws, a.repo, a.worker, runner=runner) if a.in_place
+                   else dispatch_retry(ws, a.repo, a.worker))
         elif a.cmd == "plugins":
             out = plugins(ws, a.worker, a.op, a.dir)
         elif a.cmd == "bind":

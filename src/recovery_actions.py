@@ -245,7 +245,8 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
                 core_limit_hold.reinstate(ws, now, by=RETRY_BY, mirror=False, seat=target.hold_key())
                 why = 'The worker did not restart, so it is still paused; reply "retry now" here to try again.'
                 return "failed", why, why, {"state": "paused_limit"}
-            return "done", None, f"Retrying now: I restarted {target.seat}.", {"state": "starting"}
+            return ("done", None, f"Restarting {target.seat}; checking that it is working again.",
+                    {"state": "starting"})
         if hold is not None:
             live = hold.get("source") == core_limit_hold.PANE_SOURCE
             core_limit_hold.clear(ws, now, by=RETRY_BY, mirror=not live)
@@ -389,6 +390,8 @@ VERIFY_S = 60.0
 STILL_BLOCKED = ('It is still blocked. You can wait for the limit to reset, or reply "retry now" here '
                  "to try again.")
 WORKING_AGAIN = "It is working again."
+#: Unblocked after an action that did not report done: true, and it claims nothing for that action.
+CLEARED = "The block has cleared."
 
 
 def verify_step(manager, workspace: Path, session: str, blocked: bool, now: Optional[float] = None) -> List[str]:
@@ -405,7 +408,7 @@ def verify_step(manager, workspace: Path, session: str, blocked: bool, now: Opti
             continue
         if blocked and not (check.get("outcome") == "done" and at - float(check.get("at") or at) >= VERIFY_S):
             continue
-        line = WORKING_AGAIN if not blocked else STILL_BLOCKED
+        line = STILL_BLOCKED if blocked else WORKING_AGAIN if check.get("outcome") == "done" else CLEARED
         with manager.store.locked():
             cur = manager.get(r.id)
             if cur is None or cur.terminal:
@@ -542,6 +545,7 @@ def _orphans(manager, target: Target, now: float) -> List[Dict]:
         why = "The tap did not reach this Mac; use the card that replaces this one."
         data = {"hitl_id": req.id, "action_id": str(req.chosen_action)}
         out.append(_settle(manager, target, data, req, "failed", why, why, {}, now))
+        manager.expire(req.id)  # nothing ran: the next tick raises the card that replaces it
     return out
 
 

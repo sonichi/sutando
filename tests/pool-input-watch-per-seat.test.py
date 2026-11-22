@@ -167,7 +167,7 @@ class RetryVerb(unittest.TestCase):
         with mock.patch.object(self.pm.sup, "is_paused", lambda ws, w: False):
             out = self.pm.retry("ws", REPO, WID)
         self.assertEqual(out["result"], "restarted")
-        self.assertEqual(self.calls, ["down", ("paused", False), "restart"])
+        self.assertEqual(self.calls, ["down", ("paused", False), "restart", ("paused", False)])
 
     def test_a_stopped_worker_is_not_restarted(self):
         from unittest import mock
@@ -175,6 +175,53 @@ class RetryVerb(unittest.TestCase):
             out = self.pm.retry("ws", REPO, WID)
         self.assertEqual(out["result"], "failed")
         self.assertEqual(self.calls, [])
+
+
+class RetryIsDetachedAndTransactional(unittest.TestCase):
+    def setUp(self):
+        from unittest import mock
+        self.pm = _load("pool_manage", SCRIPTS / "pool_manage.py")
+        self.ws = Path(tempfile.mkdtemp(prefix="pool-retry-tx-"))
+        (self.ws / "results").mkdir()
+        self.paused = []
+        for p in (mock.patch.object(self.pm, "_worker", lambda ws, t: (WID, {"state": "active", "name": "Mira"})),
+                  mock.patch.object(self.pm.sup, "is_paused", lambda ws, w: False),
+                  mock.patch.object(self.pm.sup, "run_socket", lambda ws, w: SOCK),
+                  mock.patch.object(self.pm.sup, "set_paused", lambda ws, w, v: self.paused.append(v)),
+                  mock.patch.object(self.pm.sw, "session_state", lambda *a, **k: "exists")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_the_verb_hands_the_restart_to_a_detached_child_and_returns(self):
+        seen = []
+        out = self.pm.dispatch_retry(self.ws, REPO, WID, popen=lambda argv, **kw: seen.append((argv, kw)))
+        self.assertEqual(out["result"], "dispatched")
+        [(argv, kw)] = seen
+        self.assertTrue(kw["start_new_session"], "the child must outlive the session that asked")
+        self.assertEqual(argv[-5:-2], ["retry", WID, "--in-place"])
+        self.assertEqual(self.paused, [], "nothing is taken down by the asking process")
+
+    def test_a_restart_that_fails_or_raises_never_leaves_the_seat_paused_and_is_told(self):
+        from unittest import mock
+        down = lambda ws, w, r: (self.paused.append(True), {"down": True, "sessions": {}, "closed_runs": []})[1]  # noqa: E731
+        with mock.patch.object(self.pm, "_take_down", down), \
+                mock.patch.object(self.pm.rem, "restart", lambda *a, **k: {"result": "failed", "detail": {}}):
+            out = self.pm.retry(self.ws, REPO, WID)
+        self.assertEqual((out["result"], self.paused[-1]), ("failed", False))
+        [note] = list((self.ws / "results").glob("proactive-*.txt"))
+        self.assertIn("could not restart Mira", note.read_text())
+        self.paused.clear()
+        with mock.patch.object(self.pm, "_take_down", down), \
+                mock.patch.object(self.pm.rem, "restart", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self.pm.retry(self.ws, REPO, WID)
+        self.assertEqual(self.paused[-1], False)
+
+    def test_a_stopped_worker_is_not_dispatched(self):
+        from unittest import mock
+        with mock.patch.object(self.pm.sup, "is_paused", lambda ws, w: True):
+            self.assertEqual(self.pm.dispatch_retry(self.ws, REPO, WID, popen=lambda *a, **k: None)["result"],
+                             "failed")
 
 
 class SeatOnTheCard(unittest.TestCase):

@@ -574,6 +574,238 @@ class PausedCardTime(Base):
         self.assertNotIn(core_limit_hold._when(now + 300), second.message, "the old retry time stayed")
 
 
+class ExecutorEdges(Base):
+    """Each way an action can fail or be refused says so on the same card, and runs nothing it must not."""
+
+    def execute(self, verb, arg=None, req=None, seat=None, runner=None, retry_cmd=None):
+        target = RA.Target(self.ws, SOCK, SEAT_SESSION if seat else CORE, seat=seat,
+                           send_key=lambda k: self.keys.append(k) or True, retry_cmd=retry_cmd)
+        return RA._execute(verb, arg, req, target, runner or Run(), time.time(), [])
+
+    def test_a_seat_retry_without_its_pools_restart_is_refused(self):
+        core_limit_hold._write_hold(self.ws, {"status": "held", "until": time.time() + 600, "started_at": 1},
+                                    SEAT_SESSION)
+        self.assertEqual(self.execute("retry_now", seat=SEAT)[0], "refused")
+
+    def test_a_retry_with_nothing_paused_or_refused_is_refused(self):
+        self.assertEqual(self.execute("retry_now", req=self.card(kind="unknown", prompt=UNKNOWN))[0], "refused")
+
+    def test_a_switch_that_fails_or_never_finishes_keeps_the_model(self):
+        req = self.card()
+        self.assertEqual(self.execute("switch_model", "haiku", req, runner=Run(rc=6))[0], "failed")
+        self.assertEqual(self.execute("switch_model", "haiku", req, runner=Hang())[0], "failed")
+
+    def test_a_switch_on_a_refused_turn_resends_it_once_idle(self):
+        req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED)
+        owed = []
+        target = RA.Target(self.ws, SOCK, CORE)
+        out = RA._execute("switch_model", "haiku", req, target, Run(), time.time(), owed)
+        self.assertEqual((out[0], owed), ("done", [RA.CONTINUE]))
+
+    def test_restart_and_runtime_switch_never_act_on_a_seat(self):
+        for verb, arg in (("restart_core", None), ("switch_runtime", "codex")):
+            run = Run()
+            self.assertEqual(self.execute(verb, arg, seat=SEAT, runner=run)[0], "refused")
+            self.assertEqual(run.calls, [])
+
+    def test_a_restart_that_never_finishes_or_is_held_or_fails_says_which(self):
+        self.assertEqual(self.execute("restart_core", runner=Hang())[0], "failed")
+        self.assertEqual(self.execute("restart_core", runner=Run(rc=core_limit_hold.HOLD_EXIT))[0], "refused")
+        self.assertEqual(self.execute("switch_runtime", "codex", runner=Run(rc=3))[0], "failed")
+        self.assertEqual(self.execute("switch_runtime", "codex", runner=Run())[3]["runtime"], "codex")
+
+    def test_escape_and_an_unknown_verb(self):
+        self.assertEqual(self.execute("escape_prompt")[0], "done")
+        self.assertEqual(self.keys, ["Escape"])
+        target = RA.Target(self.ws, SOCK, CORE, send_key=lambda k: False)
+        self.assertEqual(RA._execute("escape_prompt", None, None, target, Run(), time.time(), [])[0], "failed")
+        self.assertEqual(self.execute("no_such_verb")[0], "refused")
+
+    def test_refresh_on_a_seat_reads_its_pane_and_types_nothing(self):
+        out = self.execute("refresh_options", seat=SEAT)
+        self.assertEqual(out[0], "done")
+        self.assertFalse(runtime_models._probe_path(self.ws, SEAT_SESSION).exists())
+
+    def test_a_runner_that_cannot_start_reads_as_no_exit_code(self):
+        def boom(*a, **k):
+            raise OSError("no such file")
+        self.assertIsNone(RA._rc(boom, ["x"], {}, 1))
+
+    def test_a_click_on_a_card_that_offers_no_recovery_is_refused(self):
+        req = self.mgr.create(tui_gate.requirement_for("blocked-human", "selection", "❯ 1. A\n  2. B", CORE, "d",
+                                                       "m", runtime="claude"))
+        data = {"hitl_id": req.id, "action_id": "restart_core", "at": time.time()}
+        self.assertEqual(RA._check(self.mgr, data, RA.Target(self.ws, SOCK, CORE), time.time())[1][0], "refused")
+        self.assertEqual(RA._check(self.mgr, {"hitl_id": "hitl_gone", "action_id": "restart_core"},
+                                   RA.Target(self.ws, SOCK, CORE), time.time())[1][0], "stale")
+
+    def test_the_state_dir_of_a_seat_is_its_own(self):
+        self.assertEqual(RA.Target(self.ws, SOCK, SEAT_SESSION, seat=SEAT).state_dir(),
+                         self.ws / "state" / "seats" / SEAT_SESSION)
+        self.assertEqual(RA.Target(self.ws, SOCK, CORE).state_dir(), self.ws / "state")
+
+    def test_an_unreadable_card_is_kept_open(self):
+        with mock.patch.object(RA, "_awaiting", side_effect=OSError("gone")):
+            self.assertTrue(RA.awaiting_executor(self.ws, object()))
+
+    def test_the_audit_keeps_its_bound(self):
+        with mock.patch.object(RA, "AUDIT_KEEP", 3):
+            for i in range(10):
+                RA.audit(self.ws, {"at": i})
+        lines = (recovery.recovery_dir(self.ws) / RA.AUDIT_FILE).read_text().splitlines()
+        self.assertLessEqual(len(lines), 6)
+        self.assertEqual(json.loads(lines[-1])["at"], 9)
+
+    def test_an_audit_that_cannot_be_written_never_fails_the_action(self):
+        (self.ws / "state" / "recovery").write_text("not a dir")
+        RA.audit(self.ws, {"at": 1})
+
+    def test_no_manager_runs_nothing(self):
+        self.assertEqual(RA.run_pending(None, RA.Target(self.ws, SOCK, CORE)), [])
+
+    def test_unreadable_replayed_and_other_sessions_hand_offs(self):
+        d = recovery.actions_dir(self.ws)
+        d.mkdir(parents=True)
+        (d / "hitl_bad.json").write_text("{not json")
+        req = self.card()
+        self.click(req, "restart_core")
+        [path] = [p for p in d.glob("*.json") if p.name != "hitl_bad.json"]
+        recovery.write_receipt(self.ws, recovery.receipt(req.id, "i", "restart_core", "done", None, 1))
+        run = Run()
+        self.assertEqual(RA.run_pending(self.mgr, RA.Target(self.ws, SOCK, CORE), runner=run), [])
+        self.assertEqual(run.calls, [], "a hand-off that already has a receipt is never run again")
+        self.assertFalse(path.exists())
+
+    def test_a_crash_leftover_with_its_receipt_is_only_cleared(self):
+        d = recovery.actions_dir(self.ws)
+        req = self.card()
+        self.click(req, "restart_core")
+        [path] = list(d.glob("*.json"))
+        claimed = path.with_name(path.stem + RA.CLAIM_SUFFIX)
+        path.rename(claimed)
+        recovery.write_receipt(self.ws, recovery.receipt(req.id, "i", "restart_core", "done", None, 1))
+        self.assertEqual(RA._interrupted(self.mgr, RA.Target(self.ws, SOCK, CORE), claimed, time.time()), [])
+        self.assertFalse(claimed.exists())
+        junk = d / ("hitl_junk" + RA.CLAIM_SUFFIX)
+        junk.write_text("{")
+        self.assertEqual(RA._interrupted(self.mgr, RA.Target(self.ws, SOCK, CORE), junk, time.time()), [])
+
+    def test_a_tap_whose_hand_off_never_landed_closes_its_card_for_a_fresh_one(self):
+        req = self.card()
+        self.click(req, "restart_core")
+        for p in recovery.actions_dir(self.ws).glob("*.json"):
+            p.unlink()
+        later = time.time() + RA.ORPHAN_CLICK_S + 5
+        [receipt] = RA.run_pending(self.mgr, RA.Target(self.ws, SOCK, CORE), runner=Run(), now=later)
+        self.assertEqual(receipt["outcome"], "failed")
+        self.assertEqual(self.mgr.get(req.id).status, STATUS_EXPIRED, "the next tick raises its replacement")
+
+    def test_unlink_of_a_missing_file_is_quiet(self):
+        RA._unlink(self.ws / "nope")
+
+    def test_session_env_reads_one_variable(self):
+        ok = lambda *a, **k: subprocess.CompletedProcess(a, 0, "CLAUDE_CONFIG_DIR=/cfg\n", "")  # noqa: E731
+        self.assertEqual(RA.session_env(SOCK, CORE, "CLAUDE_CONFIG_DIR", runner=ok), "/cfg")
+        unset = lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "unknown variable")  # noqa: E731
+        self.assertIsNone(RA.session_env(SOCK, CORE, "CLAUDE_CONFIG_DIR", runner=unset))
+
+        def boom(*a, **k):
+            raise subprocess.TimeoutExpired("tmux", 5)
+        self.assertIsNone(RA.session_env(SOCK, CORE, "CLAUDE_CONFIG_DIR", runner=boom))
+
+    def test_the_paused_card_names_the_waiting_messages(self):
+        core_limit_hold._write_hold(self.ws, {"status": "held", "kind": "usage-limit", "model": "opus",
+                                              "until": time.time() + 600, "started_at": 5.0, "set_at": 5.0})
+        req = RA.hold_card_step(self.mgr, self.ws, CORE, "claude", queued=2)
+        self.assertIn("2", req.message.rsplit("\n\n", 1)[-1])
+
+    def test_no_manager_raises_no_paused_card(self):
+        self.assertIsNone(RA.hold_card_step(None, self.ws, CORE, "claude"))
+
+    def test_an_unknown_model_in_use_is_none(self):
+        with mock.patch.object(core_limit_hold, "launch_identity", side_effect=OSError("no config")):
+            self.assertIsNone(RA.current_model(self.ws))
+
+    def test_refresh_leaves_a_tapped_card_and_a_card_that_already_has_the_list(self):
+        req = self.card()
+        self.assertEqual(RA.refresh_limit_card(self.mgr, self.ws, CORE, "claude"), [], "already the list")
+        self.click(req, "add_account")
+        (self.ws / "state" / "runtime-models.claude.json").unlink()
+        runtime_models.record(self.ws, "claude", runtime_models.parse_picker(PICKER, "claude")[:3])
+        self.assertEqual(RA.refresh_limit_card(self.mgr, self.ws, CORE, "claude"), [], "a tapped card is not edited")
+        self.assertEqual(RA.refresh_limit_card(self.mgr, self.ws, CORE, "codex"), [], "no Codex switch")
+
+    def test_verify_skips_a_card_whose_state_was_already_said(self):
+        req = self.card()
+        self.click(req, "switch_model:haiku")
+        self.run_pending(Run())
+        self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=False), [req.id])
+        self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=False), [])
+
+
+class SeatRetryCopy(Base):
+    def test_a_held_workers_card_says_retry_restarts_it(self):
+        req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED, seat=SEAT)
+        self.assertIn(tui_gate.RETRY_SEAT_LINE, req.message)
+        self.assertNotIn(tui_gate.RETRY_LINE, req.message)
+        self.assertIn(tui_gate.RETRY_LINE, self.card(kind="turn-rejected", prompt=FABLE_REFUSED).message)
+
+    def test_a_seat_retry_says_checking_until_the_seat_is_seen_working(self):
+        core_limit_hold._write_hold(self.ws, {"status": "held", "until": time.time() + 600, "started_at": 1,
+                                              "source": core_limit_hold.PANE_SOURCE}, SEAT_SESSION)
+        req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED, seat=SEAT)
+        self.click(req, "retry_now")
+        target = RA.Target(self.ws, SOCK, SEAT_SESSION, seat=SEAT, retry_cmd=["python3", "pool_manage.py", "retry", "w"])
+        [receipt] = RA.run_pending(self.mgr, target, runner=Run())
+        self.assertEqual(receipt["outcome"], "done")
+        card = self.mgr.get(req.id)
+        self.assertIn(f"Restarting {SEAT}; checking that it is working again.", card.message)
+        self.assertNotIn(RA.WORKING_AGAIN, card.message)
+
+    def test_an_interrupted_action_is_never_followed_by_working_again(self):
+        req = self.card()
+        self.click(req, "restart_core")
+        [path] = list(recovery.actions_dir(self.ws).glob("*.json"))
+        path.rename(path.with_name(path.stem + RA.CLAIM_SUFFIX))
+        [receipt] = self.run_pending(Run())
+        self.assertEqual(receipt["outcome"], "failed")
+        RA.verify_step(self.mgr, self.ws, CORE, blocked=False)
+        msg = self.mgr.get(req.id).message
+        self.assertIn(RA.CLEARED, msg)
+        self.assertNotIn(RA.WORKING_AGAIN, msg, "it claimed the interrupted action worked")
+
+
+class MonitorStepsNeverFail(Base):
+    """Each recovery step the monitor tick calls fails open: the monitor keeps ticking."""
+
+    def test_every_step_survives_its_module_raising(self):
+        with mock.patch("sys.stderr"):
+            with mock.patch.object(RA, "run_pending", side_effect=RuntimeError("x")):
+                self.assertIsNone(M.recovery_step(self.mgr, self.ws, SOCK, CORE, "claude", None))
+            with mock.patch.object(runtime_models, "probe_step", side_effect=RuntimeError("x")):
+                self.assertEqual(M.models_step(self.mgr, self.ws, SOCK, CORE, "claude", None, "running", None,
+                                               None, ""), "")
+            with mock.patch.object(RA, "verify_step", side_effect=RuntimeError("x")):
+                self.assertEqual(M.verify_step(self.mgr, self.ws, CORE, True), [])
+            import core_crash_loop
+            with mock.patch.object(core_crash_loop, "step", side_effect=RuntimeError("x")):
+                self.assertEqual(M.crash_loop_step(self.mgr, self.ws, CORE, "claude", "", time.time()), [])
+            with mock.patch.object(core_limit_hold, "hold_while_wedged", side_effect=RuntimeError("x")):
+                settled = ("blocked-human", "turn-rejected", "You've hit your usage limit")
+                self.assertEqual(M.limit_reply_step(self.ws, settled, settled, LIMIT, "claude"), [])
+
+    def test_no_manager_means_no_step(self):
+        self.assertIsNone(M.recovery_step(None, self.ws, SOCK, CORE, "claude", None))
+        self.assertEqual(M.verify_step(None, self.ws, CORE, True), [])
+
+    def test_a_refused_turn_owed_after_an_action_is_returned_to_the_tick(self):
+        req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED)
+        self.click(req, "switch_model:haiku")
+        with mock.patch.object(M, "send_keys", lambda *a: True), \
+                mock.patch.object(RA.subprocess, "run", Run()):
+            self.assertEqual(M.recovery_step(self.mgr, self.ws, SOCK, CORE, "claude", None), RA.CONTINUE)
+
+
 class Contract(Base):
     def test_action_fixture_is_a_recovery_click_and_its_hand_off_keeps_every_field(self):
         wire = json.loads((CONTRACTS / "action.json").read_text())[REPLY_FIELD]

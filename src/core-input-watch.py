@@ -794,7 +794,8 @@ def _name_seat(req, session, seat):
     req.subject = {**(req.subject or {}), "seat": seat}
     if (req.subject or {}).get("recovery"):
         from hitl.recovery import SEAT_MODEL_LOCKED
-        req.message = f"{req.message} {SEAT_MODEL_LOCKED}"
+        from hitl.tui_gate import RETRY_LINE, RETRY_SEAT_LINE
+        req.message = f"{req.message.replace(RETRY_LINE, RETRY_SEAT_LINE)} {SEAT_MODEL_LOCKED}"
     req.actions = [Action(id=a.id, kind=a.kind, label=f"Open terminal ({session})")
                    if a.kind == "open_terminal" else a for a in req.actions]
     return req

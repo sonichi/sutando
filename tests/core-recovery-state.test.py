@@ -297,6 +297,41 @@ class Fields(unittest.TestCase):
             self.assertNotEqual(rec["incident"], old["incident"])
 
 
+class Edges(unittest.TestCase):
+    def test_a_model_key_of_another_shape_is_refused(self):
+        self.assertIsNone(crs.parse_action_id("switch_model:Opus", "claude"))
+        self.assertIsNone(crs.parse_action_id("switch_model:haiku", "codex"))
+
+    def test_a_non_string_label_is_dropped(self):
+        self.assertEqual(crs.coerce({"v": 1, "state": "running", "menu": [3, None, "Wait"]})["menu"], ["Wait"])
+
+    def test_a_junk_proxy_rejection_is_skipped(self):
+        self.assertFalse(crs._quota_says_credits({"recent_rejections": ["junk", 3]}, NOW))
+
+    def test_an_unreadable_identity_or_host_label_is_an_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(crs.core_limit_hold, "launch_identity", side_effect=OSError("no config")):
+            self.assertNotIn("model", crs.gather(Path(tmp), {"state": "running"}, now=NOW, runtime="claude"))
+        with mock.patch.object(crs, "_HOST_LABELS", None), \
+                mock.patch.dict(sys.modules, {"util_paths": None}):
+            self.assertTrue(crs._host_labels())
+
+    def test_an_unreadable_session_log_is_no_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "state" / "session-starts.log"
+            log.mkdir(parents=True)  # a directory where the log should be: unreadable
+            self.assertIsNone(crs.restarts_in_window(Path(tmp), NOW, hosts=frozenset({"me"})))
+
+    def test_show_prints_the_record_it_would_write(self):
+        import io
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(crs, "resolve_workspace", lambda: Path(tmp)):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                self.assertEqual(crs.main(["show"]), 0)
+            self.assertEqual(json.loads(buf.getvalue())["v"], 1)
+
+
 class Writer(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()

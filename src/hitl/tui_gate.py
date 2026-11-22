@@ -84,6 +84,11 @@ def limit_card_holds(req: HumanRequirement, pane: Optional[str], runtime: Option
     return limit_standing(pane, runtime, outrun)
 
 
+#: What Retry now does: the core's sends the refused message again; a worker's restarts it.
+RETRY_LINE = "Retry now sends the refused message again."
+RETRY_SEAT_LINE = "Retry now restarts the worker."
+
+
 def limit_unblock(session: Optional[str] = None, runtime: Optional[str] = None,
                   controls: Optional[Sequence[str]] = None, menu: bool = False) -> str:
     """How the owner lifts a usage limit, for the card body; the steps are the runtime's own.
@@ -99,7 +104,7 @@ def limit_unblock(session: Optional[str] = None, runtime: Optional[str] = None,
         if what:
             parts.append(f"To keep working now, tap a {what} below that has usage left.")
         if recovery.RETRY_NOW in verbs:
-            parts.append("Retry now sends the refused message again.")
+            parts.append(RETRY_LINE)
         if recovery.ADD_ACCOUNT in verbs:
             parts.append("Another account with usage left also lifts it.")
         if recovery.RESTART_CORE in verbs:
