@@ -68,6 +68,7 @@ class Work:
         self.root = Path(d) / "work"
         for sub in ("tasks", "results", "state"):
             (self.root / sub).mkdir(parents=True)
+        (Path(str(self.root) + ".bridge") / "state").mkdir(parents=True)    # the agent's own bridge, as installed
         self.cwd = Path(d) / "cwd"
         self.cwd.mkdir()
         self.home = Path(d) / "home"

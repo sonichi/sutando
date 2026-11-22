@@ -37,7 +37,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from ... import acp_host, connector_cards, held_start, result_labels, result_publish
+from ... import acp_host, connector_cards, held_start, model_switch, result_labels, result_publish
 from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore, quoted, trigger_of  # noqa: F401
 from ...acp_client import AcpClient as _SharedClient
 from ...relay_loop import count_arg
@@ -183,18 +183,6 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
     return "\n\n".join(out)
 
 
-MODEL_FILE, MODEL_CARD, MODEL_ASK = "model.json", "model-switch", "/model"
-MODEL_BUTTONS = 6          # the card's button limit
-# How the owner asks in their own words: agy answers with the mark alone, and the connector shows the card.
-MODEL_MARK = "[model-card]"
-MODEL_HINT = ("If the person asks to change, switch or choose the model you run on, or which models you have, "
-              "reply with exactly %s and nothing else: they are then shown a card with the choices. Do not "
-              "list or switch models yourself." % MODEL_MARK)
-MODEL_IN_DM = "I can switch models from our direct message. Ask me there."
-MODEL_UNKNOWN = ("I don't know my models yet: I learn them when a turn starts. Send me any message, then "
-                 "send /model again.")
-
-
 class Connector:
     def __init__(self, args, client_factory=AcpClient, note=None):
         self.args = args
@@ -204,141 +192,21 @@ class Connector:
         self.store = SessionStore(args.session_store)
         self.name = NAME
         self.retry_at = {}
-
-    # ── the model: what agy offers, what the owner picked, and the card that picks ──
-
-    def model_state(self) -> dict:
-        try:
-            with open(os.path.join(self.args.state, MODEL_FILE), encoding="utf-8") as f:
-                state = json.load(f)
-        except (OSError, ValueError):
-            return {}
-        return state if isinstance(state, dict) else {}
-
-    def save_model_state(self, **changes):
-        state = dict(self.model_state(), **changes)
-        path = os.path.join(self.args.state, MODEL_FILE)
-        with open(path + ".tmp", "w", encoding="utf-8") as f:
-            json.dump(state, f, sort_keys=True)
-        os.replace(path + ".tmp", path)
+        self.models = model_switch.ModelSwitch(args.state, self.root, getattr(args, "bridge_state", None), NAME,
+                                               publish, quoted, log)
 
     def models_seen(self, models: dict):
-        """Remember what a Session offered (ACP `models`), for the card; only ids and names are kept."""
-        offered = [{"id": str(m.get("modelId") or "")[:200], "name": str(m.get("name") or m.get("modelId") or "")[:80]}
-                   for m in (models.get("availableModels") or []) if isinstance(m, dict) and m.get("modelId")]
-        seen = {"available": offered, "current": str(models.get("currentModelId") or "")[:200]}
-        if {k: self.model_state().get(k) for k in seen} != seen:
-            self.save_model_state(**seen)
-
-    def model_card(self, state: dict, picked: str = "", ran: "str | None" = None, same: bool = False):
-        """(body, card): one reply button per model agy offered. After a pick (`picked`) the card has no
-        buttons: it says the switch is coming, then, with `ran` (the model the next turn ran on), that
-        it happened or that it did not; with `same`, that the pick is the model already in use."""
-        agent_card, _ = connector_cards._core()
-        names = {m["id"]: m["name"] for m in state.get("available") or []}
-        now = state.get("current") or ""
-        if picked:
-            name = names.get(picked, picked)
-            if same:
-                return agent_card.build(MODEL_CARD, "done", title="Model", body="Model: already %s" % name,
-                                        text="I'm already using %s. Nothing changed." % name)
-            if ran is None:
-                return agent_card.build(MODEL_CARD, "info", title="Model", body="Model: switching to %s" % name,
-                                        text="Switching to %s on your next message. I'll confirm here once it has "
-                                             "switched." % name)
-            if ran == picked:
-                return agent_card.build(MODEL_CARD, "done", title="Model", body="Model: now %s" % name,
-                                        status="Switched", text="Switched. I'm now using %s." % name)
-            return agent_card.build(MODEL_CARD, "error", title="Model", body="Model: could not switch to %s" % name,
-                                    text="I could not switch to %s. I'm still using %s. Send /model to try again."
-                                         % (name, names.get(ran, ran or "my default model")))
-        buttons = [agent_card.button(name, "reply", reply="Use %s" % name,
-                                     command=agent_card.reply("model", "agent", mid))
-                   for mid, name in list(names.items())[:MODEL_BUTTONS]]
-        return agent_card.build(MODEL_CARD, "pending", title="Model", body="Pick a model for %s" % self.name,
-                                text="Now using %s." % names.get(now, now or "the default model"), buttons=buttons)
-
-    def post_card(self, room, built) -> bool:
-        try:
-            connector_cards.queue(self.args.bridge_state, str(room or ""), *built)
-            return True
-        except (OSError, ValueError) as e:
-            log("model card not queued:", "%s: %s" % (type(e).__name__, e))
-            return False
+        """Remember what a Session offered (ACP `models`), for the card."""
+        self.models.seen([(m.get("modelId"), m.get("name")) for m in (models.get("availableModels") or [])
+                          if isinstance(m, dict)], models.get("currentModelId"))
 
     def card_task(self, task_id, headers, path, result_file):
-        """The record of a task that was a card matter (a tap, or the owner's /model in their DM), else
-        None: a tap never reaches the model, and a tap this agent cannot match gets the fixed line."""
-        agent_card, _ = connector_cards._core()
-        # The card rules read the task as the core does (the trusted header parse), not this connector's.
-        with open(path, encoding="utf-8") as f:
-            sent, said = agent_card.reply_words(f.read())
-        verdict = connector_cards.click(sent, said, self.root)
-        state, outcome = self.model_state(), ""
-        if verdict.verdict == agent_card.COMMAND and verdict.command.kind == "model":
-            picked = verdict.command.verb
-            if picked not in [m["id"] for m in state.get("available") or []]:
-                publish(result_file, quoted("That model is not one I can use now. Send /model for the current list.") + "\n")
-                outcome = "model-unknown"
-            elif picked == str(state.get("wanted") or state.get("current") or ""):
-                # Nothing to switch: say so now, and leave no pick for the next turn to "confirm".
-                room, card = str(sent.get("channel_id") or ""), self.model_card(state, picked=picked, same=True)
-                publish(result_file, "[no-send] the model card answers\n" if self.post_card(room, card)
-                        else quoted(card[1]["text"]) + "\n")
-                outcome = "model-same"
-            else:
-                room = str(sent.get("channel_id") or "")
-                self.save_model_state(wanted=picked, asked_in=room, told="")
-                coming = self.model_card(state, picked=picked)
-                publish(result_file, "[no-send] the model card answers\n" if self.post_card(room, coming)
-                        else quoted(coming[1]["text"]) + "\n")
-                outcome = "model-picked"
-        elif verdict.verdict in (agent_card.COMMAND, agent_card.FORGED):
-            publish(result_file, quoted(verdict.say) + "\n")
-            outcome = "card-refused"
-        elif said.lower() == MODEL_ASK and agent_card.owner_may_act(sent) is None:
-            outcome = self.offer_models(sent, result_file)
+        """The record of a task that was a card matter (a tap, or the owner's /model in their DM), else None."""
+        outcome = self.models.card_task(path, result_file)
         if not outcome:
             return None
         log("card ->", task_id, outcome)
         return {"task": task_id, "status": "completed", "detail": outcome, "tier": headers["access_tier"], "card": outcome}
-
-    def offer_models(self, sent, result_file) -> str:
-        """Answer the owner's ask with the model card (or the line saying why there is none)."""
-        state = self.model_state()
-        if not state.get("available"):
-            publish(result_file, quoted(MODEL_UNKNOWN) + "\n")
-        elif self.post_card(sent.get("channel_id"), self.model_card(state)):
-            publish(result_file, "[no-send] the model card answers\n")
-        else:
-            publish(result_file, quoted("I could not post the model card. Try again in a moment.") + "\n")
-        return "model-card"
-
-    def asked_for_models(self, headers, path, status, text, result_file) -> str:
-        """agy answered the owner with the mark alone: show the card in their DM, or say where to ask.
-        '' for any other answer, and for any sender but the owner, whose mark is then ordinary text."""
-        if status != "completed" or (text or "").strip() != MODEL_MARK or headers.get("access_tier") != "owner":
-            return ""
-        agent_card, _ = connector_cards._core()
-        with open(path, encoding="utf-8") as f:
-            sent, _ = agent_card.reply_words(f.read())
-        if agent_card.owner_may_act(sent) is None:
-            return self.offer_models(sent, result_file)
-        publish(result_file, quoted(MODEL_IN_DM) + "\n")
-        return "model-card-elsewhere"
-
-    def tell_model_outcome(self, turn) -> str:
-        """Once per pick, after the first owner turn that opened a Session: say in the DM the pick was
-        made in whether the switch happened. A switch agy refused is dropped, so it is not retried on
-        every turn; '' when there was nothing to tell."""
-        state = self.model_state()
-        wanted = str(state.get("wanted") or "")
-        if not wanted or state.get("told") == wanted or not turn.live:
-            return ""
-        switched = turn.model == wanted
-        self.post_card(state.get("asked_in"), self.model_card(state, picked=wanted, ran=turn.model))
-        self.save_model_state(told=wanted, **({} if switched else {"wanted": ""}))
-        return "switched" if switched else "not-switched"
 
     def run_turn(self, task_id, headers, prompt, owner):
         """(status, text, detail, turn): status is completed | cancelled | timeout | gone | failed | refused.
@@ -351,7 +219,7 @@ class Connector:
                                                                                   extra_keys=AGY_KEYS),
                                        self.store,
                                        STDERR_NAME, NOT_SIGNED_IN, log,
-                                       model=str(self.model_state().get("wanted") or "") or None,
+                                       model=self.models.wanted(),
                                        on_models=self.models_seen)
         with guest_turn(self.args) as isolated:
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
@@ -403,16 +271,16 @@ class Connector:
             return carded
         prompt = wake_prompt(task_id, headers, message, operator_lines, self.args.cwd if tier == "owner" else None,
                              self.note, shell_web=tier == "owner" and shell_web_on(self.args, headers))
-        if headers.get("access_tier") == "owner":
-            prompt += "\n\n" + MODEL_HINT
+        if headers.get("access_tier") == "owner" and self.models.usable():
+            prompt += "\n\n" + model_switch.HINT
         event, _ = trigger_of(headers)
         log("wake ->", task_id, headers["access_tier"], event or "message")
         t0 = time.time()
         status, text, detail, turn = self.run_turn(task_id, headers, prompt, tier == "owner")
-        asked = self.asked_for_models(headers, path, status, text, result_file)
+        asked = self.models.asked(headers.get("access_tier"), path, status, text, result_file)
         if not asked:
             publish(result_file, self.answer_body(headers, status, text, detail, turn))
-        told = self.tell_model_outcome(turn) if tier == "owner" else ""
+        told = self.models.tell(turn.live, turn.model) if tier == "owner" else ""
         return {"task": task_id, "status": status, "detail": detail[:200], "event_type": event,
                 "tier": headers["access_tier"], "isolated": tier != "owner", "turn_s": round(time.time() - t0, 3),
                 "permissions": turn.decisions, "updates": dict(turn.updates), "answer_chars": len(text or ""),

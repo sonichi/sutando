@@ -11,6 +11,7 @@ import os
 import queue
 import re
 import subprocess
+import shutil
 import sys
 import tempfile
 import time
@@ -20,7 +21,7 @@ from unittest import mock
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import local_task_protocol, task_io, team_guardrail  # noqa: E402
+from ag2_sparrow import connector_cards, local_task_protocol, model_switch, task_io, team_guardrail  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
 
 # The note as it was pinned before it moved to the shared owner: proves the move changed no byte.
@@ -631,6 +632,150 @@ class EndToEndStubTest(unittest.TestCase):
             self.assertEqual(result(d, "task-chat-o").strip(), "STUB second try", "owner retry on the same thread")
             self.assertEqual(result(d, "task-chat-g").strip(), cc.NO_REPLY, "a fresh ephemeral thread is empty again")
             self.assertEqual([m["status"] for m in metrics(d)], ["completed", "completed"])
+
+
+class ModelCardTest(unittest.TestCase):
+    """The owner's model card (model_switch): asked for in their DM, tapped, and confirmed there."""
+
+    DM = "!dm:s.space"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.work = Path(self.tmp.name) / "work"
+        self.bridge = Path(str(self.work) + ".bridge") / "state"
+        self.bridge.mkdir(parents=True)        # the agent's own bridge, as `install` makes it
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def dm(self, tid, body, reply_to="", click="", tier="owner", kind="dm", channel=None):
+        lines = ["id: " + tid, "timestamp: 2026-11-14T00:00:00Z", "source: ag2space",
+                 "channel_id: " + (channel or self.DM), "channel_kind: " + kind, "source_message_id: $m-" + tid,
+                 "user_id: @alice:s.space", "access_tier: " + tier]
+        if reply_to:
+            lines.append("reply_to_event: " + reply_to)
+        if click:
+            lines.append("card_click: " + json.dumps({"card_id": "model-switch", "action": click}))
+        write_text(self.work, tid, "\n".join(lines + ["task: " + body]) + "\n")
+
+    def serve(self, tid, body, extra=(), **kw):
+        self.dm(tid, body, **kw)
+        self.assertEqual(run_connector(self.work, once=1, extra=extra), 0)
+        return result(self.work, tid)
+
+    def posted(self, event="$card1"):
+        """What the bridge does: post each queued card, and say which event it became."""
+        sent = []
+        connector_cards.Poster(self.bridge, lambda p: sent.append(p) or {"ok": True, "event_id": event},
+                               log=lambda line: None).sweep()
+        return [(p["room_id"], p["extra_content"]["space.ag2.card"]) for p in sent]
+
+    def state(self):
+        return json.loads((self.work / "state" / "model.json").read_text())
+
+    def pick(self, name, event="$card1"):
+        """Ask for the card, have the bridge post it, and tap the button named `name`."""
+        self.assertEqual(self.serve("task-ask-" + name.replace(" ", ""), "/model"), "[no-send] the model card answers\n")
+        ((_, card),) = self.posted(event)
+        said = next(b["reply"] for b in card["buttons"] if b["label"] == name)
+        return self.serve("task-tap-" + name.replace(" ", ""), said, reply_to=event, click=said)
+
+    def test_the_owners_tap_runs_the_next_turn_on_the_pick_and_a_card_says_it_switched(self):
+        self.assertEqual(self.serve("task-1", "/model"), "[no-send] the model card answers\n")
+        self.assertEqual((metrics(self.work)[0]["card"], "thread" in metrics(self.work)[0]), ("model-card", False),
+                         "/model never reaches Codex")
+        ((room, card),) = self.posted()
+        self.assertEqual((room, card["state"], [b["label"] for b in card["buttons"]]),
+                         (self.DM, "pending", ["Stub Model", "Stub Large", "Stub Broken", "Stub Moved", "Stub 5", "Stub 6"]))
+        self.assertEqual(card["text"], "Now using Stub Model. Also: Stub 7, Stub 8 (send /model and the name).")
+        said = card["buttons"][1]["reply"]
+        self.assertEqual(self.serve("task-2", said, reply_to="$card1", click=said), "[no-send] the model card answers\n")
+        self.assertEqual((self.state()["wanted"], metrics(self.work)[-1]["card"]), ("stub-large", "model-picked"))
+        ((_, coming),) = self.posted("$card2")
+        self.assertEqual((coming["state"], "buttons" in coming), ("info", False))
+        self.assertIn("Switching to Stub Large on your next message", coming["text"])
+        # The next turn on a kept thread, in any room, carries the pick; the owner is told in the DM.
+        self.assertIn("model=stub-large", self.serve("task-3", "hello", channel="!room:s.space", kind="room"))
+        self.assertEqual((metrics(self.work)[-1]["model"], metrics(self.work)[-1]["model_switch"]), ("stub-large", "switched"))
+        ((room, done),) = self.posted("$card3")
+        self.assertEqual((room, done["state"], done["text"]), (self.DM, "done", "Switched. I'm now using Stub Large."))
+        self.assertIn("model=stub-large", self.serve("task-4", "again"), "the pick stays")
+        self.assertEqual(self.posted(), [], "told once")
+        self.assertNotIn("model_switch", metrics(self.work)[-1])
+        # Asked again, the card names the pick as the model in use; tapping it changes and confirms nothing.
+        self.assertEqual(self.pick("Stub Large", "$card4"), "[no-send] the model card answers\n")
+        ((_, same),) = self.posted("$card5")
+        self.assertEqual((same["text"], metrics(self.work)[-1]["card"]),
+                         ("I'm already using Stub Large. Nothing changed.", "model-same"))
+
+    def test_a_model_past_the_buttons_is_picked_by_name_and_an_unknown_name_is_refused(self):
+        self.assertEqual(self.serve("task-1", "/model stub 7"), "[no-send] the model card answers\n")
+        self.assertEqual((self.state()["wanted"], metrics(self.work)[-1]["card"]), ("stub-7", "model-picked"))
+        self.assertIn("not one I can use now", self.serve("task-2", "/model stub-hidden"))
+        self.assertIn("not one I can use now", self.serve("task-3", "/model no such model"))
+        self.assertEqual(self.state()["wanted"], "stub-7")
+
+    def test_a_turn_that_fails_on_the_pick_says_so_and_the_pick_is_dropped(self):
+        self.pick("Stub Broken")
+        self.posted("$card2")
+        text = self.serve("task-3", "hello")
+        self.assertIn("Codex ended this task with status failed", text)
+        self.assertEqual(metrics(self.work)[-1]["model_switch"], "not-switched")
+        ((room, card),) = self.posted("$card3")
+        self.assertEqual((room, card["state"], card["text"]),
+                         (self.DM, "error", "I could not switch to Stub Broken. I'm still using Stub Model. Send /model "
+                                            "to try again."))
+        self.assertEqual(self.state()["wanted"], "")
+        self.assertNotIn("model=", self.serve("task-4", "again"), "the next turn is on Codex's own model")
+
+    def test_a_turn_codex_moved_to_another_model_is_not_called_switched(self):
+        self.pick("Stub Moved")
+        self.posted("$card2")
+        self.assertIn("model=stub-moved", self.serve("task-3", "hello"))
+        ((_, card),) = self.posted("$card3")
+        self.assertEqual(card["text"], "I could not switch to Stub Moved. I'm still using Stub Model. Send /model to try again.")
+        self.assertEqual((self.state()["wanted"], metrics(self.work)[-1]["model_switch"]), ("", "not-switched"))
+
+    def test_asking_in_ones_own_words_shows_the_card_and_only_the_owners_ask_in_their_dm_does(self):
+        self.assertEqual(self.serve("task-1", "[[askmodel]] can you change model"), "[no-send] the model card answers\n")
+        self.assertEqual((metrics(self.work)[-1]["card"], len(self.posted())), ("model-card", 1))
+        self.assertEqual(self.serve("task-2", "[[askmodel]] change model", channel="!room:s.space", kind="room").strip(),
+                         model_switch.IN_DM)
+        self.assertEqual(metrics(self.work)[-1]["card"], "model-card-elsewhere")
+        # A team sender's turn is not told about the mark; if Codex says it anyway, it is ordinary text.
+        self.dm("task-3", "[[askmodel]] change model", tier="team", channel="!room:s.space", kind="room")
+        (self.work / "tasks" / "task-3.txt").write_text(gateway_mid_task("task-3", "[[askmodel]] change model", "team", True))
+        self.assertEqual(run_connector(self.work, once=1), 0)
+        self.assertEqual((result(self.work, "task-3").strip(), "card" in metrics(self.work)[-1]), ("[model-card]", False))
+        self.assertEqual(self.posted(), [])
+
+    def test_a_guests_turn_never_runs_on_the_owners_pick(self):
+        self.pick("Stub Large")
+        self.posted("$card2")
+        guest = self.serve("task-3", "hi", extra=["--allow-non-owner"], tier="guest", channel="!room:s.space", kind="room")
+        self.assertNotIn("model=", guest)
+        self.assertEqual((self.posted(), "model_switch" in metrics(self.work)[-1]), ([], False), "nothing is told for it")
+        self.assertIn("model=stub-large", self.serve("task-4", "hello"))
+        self.assertEqual(metrics(self.work)[-1]["model_switch"], "switched")
+
+    def test_without_the_agents_own_bridge_there_is_no_card_and_model_is_an_ordinary_message(self):
+        shutil.rmtree(self.bridge.parent)
+        self.assertTrue(self.serve("task-1", "/model").startswith("STUB echo:"))
+        self.assertFalse((self.work / "state" / "model.json").exists())
+        self.assertEqual(self.serve("task-2", "[[askmodel]] change model").strip(),
+                         "I could not post the model card. Try again in a moment.")
+
+    def test_a_model_list_codex_refuses_and_a_ledger_that_cannot_be_read_stop_nothing(self):
+        args = cc.build_parser().parse_args(["--work", str(self.work)])
+        args.state, args.bridge_state = str(self.work / "state"), str(self.bridge)
+        (self.work / "state").mkdir(parents=True)
+        c = cc.Connector(FakeRpc, args, note="n")
+        c.models.seen([("m1", "One")], "m1")
+        with mock.patch.object(c.rpc, "request", side_effect=RuntimeError("model/list: refused"), create=True):
+            c.list_models()
+        self.assertEqual(c.models.state()["available"], [{"id": "m1", "name": "One"}], "the last list is kept")
+        with mock.patch.object(cc.connector_cards, "absorb", side_effect=ValueError("bad ledger")):
+            self.assertTrue(self.serve("task-1", "hello").startswith("STUB echo: Sutando task task-1 (source=ag2space"))
 
 
 class FakeRpc:

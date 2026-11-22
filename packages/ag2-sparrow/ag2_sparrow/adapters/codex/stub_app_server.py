@@ -27,7 +27,15 @@ def thread_obj(tid):
             "name": None, "canAcceptDirectInput": True, "cliVersion": "stub"}
 
 
-def finish_turn(tid, turn_id, item_id, reply):
+# What `model/list` answers when asked with a limit (the model card's call): more than a card's six
+# buttons, one hidden, one whose turns fail and one Codex moves turns away from.
+MODELS = ([{"id": "stub-model", "displayName": "Stub Model", "isDefault": True},
+           {"id": "stub-large", "displayName": "Stub Large"}, {"id": "stub-hidden", "displayName": "Hidden", "hidden": True},
+           {"id": "stub-broken", "displayName": "Stub Broken"}, {"id": "stub-moved", "displayName": "Stub Moved"}]
+          + [{"id": "stub-%d" % n, "displayName": "Stub %d" % n} for n in (5, 6, 7, 8)])
+
+
+def finish_turn(tid, turn_id, item_id, reply, status="completed", error=None):
     # Noise a real server also emits: another thread's event and a non-message item.
     send({"jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": "other-thread", "turn": {"id": "x"}}})
     send({"jsonrpc": "2.0", "method": "item/completed",
@@ -40,7 +48,7 @@ def finish_turn(tid, turn_id, item_id, reply):
           "params": {"threadId": tid, "turnId": turn_id, "completedAtMs": int(time.time() * 1000),
                      "item": {"type": "agentMessage", "id": item_id, "text": reply, "phase": "final"}}})
     send({"jsonrpc": "2.0", "method": "turn/completed",
-          "params": {"threadId": tid, "turn": {"id": turn_id, "status": "completed", "items": [], "error": None}}})
+          "params": {"threadId": tid, "turn": {"id": turn_id, "status": status, "items": [], "error": error}}})
 
 
 for line in sys.stdin:
@@ -59,7 +67,7 @@ for line in sys.stdin:
     elif meth == "initialized":
         pass
     elif meth == "model/list":
-        send({"jsonrpc": "2.0", "id": rid, "result": {"data": [{"id": "stub-model", "isDefault": True}], "nextCursor": None}})
+        send({"jsonrpc": "2.0", "id": rid, "result": {"data": MODELS if p.get("limit") else MODELS[:1], "nextCursor": None}})
     elif meth in ("thread/start", "thread/resume"):
         tid = p.get("threadId") or str(uuid.uuid4())
         if meth == "thread/resume" and tid.startswith("stale-"):
@@ -85,6 +93,10 @@ for line in sys.stdin:
         # turn's own when the turn carries one (the turn/start override), else the thread's.
         reply = "STUB echo: " + (text.strip().split("\n")[0][:80]) + " [sandbox=%s ephemeral=%s cwd=%s]" % (
             tp.get("sandbox"), tp.get("ephemeral"), p.get("cwd", tp.get("cwd")))
+        if p.get("model"):
+            reply += " model=%s" % p["model"]
+        if "[[askmodel]]" in text:
+            reply = "[model-card]"
         if "[[empty]]" in text:
             reply = "" if not THREADS[tid].get("emptied") else "STUB second try"
             THREADS[tid]["emptied"] = True
@@ -106,7 +118,13 @@ for line in sys.stdin:
             PENDING[REQ_ID] = (tid, turn_id, item_id, reply)
             send({"jsonrpc": "2.0", "id": REQ_ID, "method": "item/commandExecution/requestApproval",
                   "params": {"threadId": tid, "turnId": turn_id, "itemId": item_id, "command": ["rm", "-rf", "x"]}})
+        elif p.get("model") == "stub-broken":
+            finish_turn(tid, turn_id, item_id, "", "failed", {"message": "the model is not available"})
         else:
+            if p.get("model") == "stub-moved":
+                send({"jsonrpc": "2.0", "method": "model/rerouted",
+                      "params": {"threadId": tid, "turnId": turn_id, "fromModel": "stub-moved", "toModel": "stub-model",
+                                 "reason": "highRiskCyberActivity"}})
             finish_turn(tid, turn_id, item_id, reply)
     elif meth == "turn/interrupt":
         late = STALLED.get(p.get("turnId"), (None, None))[1] == "late"
