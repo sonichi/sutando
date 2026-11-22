@@ -13,7 +13,9 @@ esac; shift; done
 [ -n "$MODEL" ] || { echo "usage: switch-model.sh <model> [--dry-run]" >&2; exit 2; }
 REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
 PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin)"
-if ! "$PY" "$REPO/src/claude_model_name.py" "$MODEL"; then
+# The names /model may be given are src/claude_model_switch.py's, shared with ag2-sparrow's claude-local.
+NAMES="$("$PY" "$REPO/src/claude_model_switch.py" model-pattern)" || { echo "switch-model: the model rules could not be read" >&2; exit 2; }
+if ! printf '%s' "$MODEL" | grep -Eq -- "$NAMES"; then
   echo "switch-model: refused '$MODEL' — not a model alias or claude-* id" >&2; exit 2
 fi
 # Defaults come from the configured core's runtime descriptor (brain, socket,

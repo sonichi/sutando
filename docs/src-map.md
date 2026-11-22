@@ -59,6 +59,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`claude_config_dir.sh`** — Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
 - **`claude_hooks_settings.py`** — Sutando-owned hook entries in a project-level Claude Code settings.json: install one idempotently, prune dead copies of the same hook, and re-point hooks a moved install left on its old path.
 - **`claude_model_name.py`** — Model names the Claude CLI's `--model` and `/model` accept: an alias or a `claude-*` id.
+- **`claude_model_switch.py`** — What switching Claude Code's model by typing `/model` relies on: which model names may be typed, the two texts Claude Code answers with, and whether its input box is empty (read by the core's own parser, src/pane_composer.py).
 - **`cli_wedge.py`** — CLI progress detector for the core's tmux pane — advisory only.
 - **`cli_wedge_patterns.py`** — The abnormal-banner table of the CLI progress detector: text on a pane that says the CLI is parked (a login prompt, a provider limit, a compaction, an error it sits on), as data.
 - **`client-frame-hub.ts`** — Client-frame hub: optional voice plugins register handlers; the host offers them every client JSON frame it does not own.
@@ -181,6 +182,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`owner_activity.py`** — Atomic publication of the owner's most recent messaging activity.
 - **`owner_channel.py`** — May the core speak in this channel?
 - **`owner_room_access.py`** — How a room-database adapter reaches the owner's room: capability lookup, owner DM, agent identity and credentials.
+- **`pane_composer.py`** — The one reader of a CLI's input box (its composer) from a captured tmux pane: the prompt row, the text typed in it, and whether the box's frame is on screen.
 - **`peer-watch.py`** — Read a peer host's restart-watch signal WITHOUT confusing a stale view for a dead peer.
 - **`pending_questions_reader.py`** — The one way core reads owner pending questions: through the store adapter an installed skill declares in its manifest (`pending_questions_store`), loaded by the path an edge injects — core names no skill, scans no root and carries no question schema.
 - **`pending_questions_triage.py`** — Triage-queue policy for owner pending questions: ranking, re-check verdict, dismissal.

@@ -34,7 +34,8 @@ case " $* " in *" capture-pane "*)
   acc=""; i=0
   while [ "$i" -lt "$k" ]; do
     i=$((i+1)); sent="$(grep -- "-l /model" "$TMUX_LOG" | sed -n "${i}p" | sed 's/.*-l \/model //')"
-    name="$(disp "${TMUX_ACCEPT_AS:-$sent}")"; acc="$acc  ⎿  Set model to $name and saved as your default\n"
+    name="${TMUX_ACCEPT_NAME:-$(disp "${TMUX_ACCEPT_AS:-$sent}")}"; case "${TMUX_ACCEPT_AS:-$sent}" in *'[1m]') name="$name (1M context)";; esac
+    acc="$acc  ⎿  Set model to $name and saved as your default\n"
     [ -n "${TMUX_PERSIST_SETTINGS:-}" ] && printf '{"model":"%s"}\n' "${TMUX_ACCEPT_AS:-$sent}" > "$TMUX_PERSIST_SETTINGS"
   done
   printf '%b' "$acc$dlg${TMUX_PANE_TEXT:-────\n❯ \n────\n}";; esac
@@ -86,7 +87,8 @@ rm -f "$T/state/model-switch.json"; : > "$T/tmux.log"
 rc=$(SUTANDO_CORE_RUNTIME=bogus run opus); [ "$rc" = 4 ] && [ ! -e "$T/state/model-switch.json" ] && ! grep -q send-keys "$T/tmux.log" && grep -q "unrecognized\|could not be resolved" "$T/err" \
   && ok "20 unrecognized runtime: exit 4, no record, nothing sent" || fail "20 bogus runtime" "rc=$rc $(cat "$T/err")"
 mkdir -p "$T/fakerepo/scripts"; printf '#!/bin/sh\ncase "$1" in core-runtime) exit 1;; *) exec bash "%s/scripts/sutando-config.sh" "$@";; esac\n' "$HERE" > "$T/fakerepo/scripts/sutando-config.sh"; chmod +x "$T/fakerepo/scripts/sutando-config.sh"
-ln -sfn "$HERE/skills" "$T/fakerepo/skills"; ln -sfn "$HERE/src" "$T/fakerepo/src"
+ln -sfn "$HERE/skills" "$T/fakerepo/skills"
+ln -sfn "$HERE/src" "$T/fakerepo/src"
 rc=$(bash "$T/fakerepo/skills/model-switch/scripts/switch-model.sh" opus --state-dir "$T/state" --brain "$T/cfg" > "$T/out" 2> "$T/err"; echo $?)
 [ "$rc" = 4 ] && [ ! -e "$T/state/model-switch.json" ] && grep -q "could not be resolved" "$T/err" && ok "21 resolver exits nonzero: exit 4, no record" || fail "21 resolver failure" "rc=$rc $(cat "$T/err")"
 
@@ -166,6 +168,8 @@ rc=$(run 'sonnet[1m]'); R=$(python3 -c "import json;print(json.load(open('$T/sta
 rc=$(run 'fable[1m]'); [ "$rc" = 0 ] && ok "45 fable[1m] is matched against the CLI's display name (Fable 5.1)" || fail "45" "rc=$rc $(cat "$T/err")"
 bad=""; for m in 'sonnet[2m]' 'default[1m]' 'opusx' 'sonnet[1m]; rm -rf /' 'gpt[1m]'; do rc=$(run "$m"); [ "$rc" = 2 ] && ! grep -q send-keys "$TMUX_LOG" || bad="$bad $m:$rc"; done
 [ -z "$bad" ] && ok "46 garbage around an alias (sonnet[2m], default[1m], opusx, injected suffix, gpt[1m]) is refused (rc=2), nothing sent" || fail "46" "$bad"
+rc=$(TMUX_ACCEPT_NAME='Default (Opus 5 with 1M context)' run default); [ "$rc" = 0 ] && ok "63 default is confirmed by its own line even when that line names a 1M default" || fail "63" "rc=$rc $(cat "$T/err")"
+rc=$(TMUX_ACCEPT_NAME='Opus 5 (1M context)' run opus); [ "$rc" != 0 ] && ok "64 an explicit non-1M alias is still not confirmed by a 1M line" || fail "64" "rc=$rc"
 # --- the confirming Enter's own send verdict
 rm -f "$GREC" "$T/state/model-switch.json"; rc=$(SUTANDO_TMUX_SOCKET="$T/confirm125.sock" TMUX_DIALOG=1 TMUX_HANG_CLAIMED_ENTER_N=2 run opus --confirm --accept-timeout 3)
 [ "$rc" = 8 ] && [ -e "$GREC" ] && closed 5 && grep -q 'confirming Enter may have applied (rc=125)' "$T/err" && ! grep -q 'confirmed the dialog' "$T/err" && [ ! -e "$T/state/model-switch.json" ] \
@@ -259,4 +263,4 @@ else
   ok "59-62 skipped: no cc to build a process named claude"
 fi
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 62 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+echo; [ $fails -eq 0 ] && echo "switch-model: all 64 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }

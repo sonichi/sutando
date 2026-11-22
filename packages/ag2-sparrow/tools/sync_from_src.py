@@ -2,7 +2,7 @@
 """Regenerate the package modules from the canonical sutando src/ (single source).
 
 Everything in MAP below is bundled verbatim from sonichi/sutando `src/`, which is
-canonical for those modules — currently 44 of them, including outbox.py and its
+canonical for those modules — currently 46 of them, including outbox.py and its
 transport seam outbox_adapter.py. Only the modules NOT in MAP are package-canonical
 and intentionally diverge from src (remote_gateway_bridge, _dirs, send_allowlist:
 dir-interface, no workspace-resolution).
@@ -89,6 +89,10 @@ MAP = {
     # the tmux tri-state probe and the guarded pane-key send with its two shell scripts
     "src/tmux_probe.py": "tmux_probe.py",
     "src/tmux_pane_keys.py": "tmux_pane_keys.py",
+    # what typing /model into Claude Code relies on, shared with the core's model-switch skill
+    "src/claude_model_switch.py": "claude_model_switch.py",
+    # the one reader of a CLI's input box (the core's pane gate re-exports it); claude_model_switch imports it
+    "src/pane_composer.py": "pane_composer.py",
     "src/tmux-pane-keys.sh": "tmux-pane-keys.sh",
     "src/bounded-wait.sh": "bounded-wait.sh",
     # the HITL decision domain and store (the claude-local card's CAS), imports relative-first
