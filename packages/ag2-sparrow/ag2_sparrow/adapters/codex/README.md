@@ -223,7 +223,11 @@ Reply with the answer only. Your reply is written verbatim to results/<id>.txt.
 The tag is random per task, so a body cannot close it. Result bodies are plain text: the
 reply; `[no reply] …` when a turn completes without a message (after one retry), followed by what
 the turn did instead when that can be counted (approvals not given, commands run, file changes, tool
-calls, web searches; fixed words and counts only, never the agent's own text); a one-line
+calls, web searches; fixed words and counts only, never the agent's own text). Only what ended
+`completed` is said to have happened: an item that ended `failed` is counted as failed ("1 command
+failed"), one that ended `declined` is not counted as done, and an approval is counted as not given
+only when its request names this thread and this turn (the older approval methods name neither: they
+are declined all the same and left out of the line). A one-line
 reason on timeout or server loss, with any partial reply below it — never raw error JSON.
 `state/done` records finished task ids (bounded), so a restart after the drain has claimed a
 result does not run that task again.
