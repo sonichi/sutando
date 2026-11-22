@@ -269,9 +269,32 @@ def invokes_publish_gate(workflow_text: str) -> bool:
     return re.search(r"(^|[\s;&|])bash\s+" + re.escape(PUBLISH_GATE) + r"(\s|$)", body, re.M) is not None
 
 
+def _jobs(workflow_text: str) -> dict:
+    """Job id -> that job's text, cut at the two-space job keys under `jobs:`."""
+    body = workflow_text.split("\njobs:\n", 1)
+    if len(body) != 2:
+        return {}
+    parts = re.split(r"^  ([A-Za-z0-9_-]+):[ \t]*$", body[1], flags=re.M)
+    return dict(zip(parts[1::2], parts[2::2]))
+
+
+def gate_runs_in_required_ci(ci_text: str) -> bool:
+    """A job of the PR/main workflow calls the gate, and required-tests needs that job.
+
+    A tag-only release call does not count: it never runs before a merge."""
+    head = ci_text.split("\njobs:\n", 1)[0]
+    on = re.search(r"^on:\n((?:[ \t]+.*\n|\n)*)", head, re.M)
+    if not on or not re.search(r"^  pull_request:", on.group(1), re.M) or not re.search(r"^  push:", on.group(1), re.M):
+        return False
+    jobs = _jobs(ci_text)
+    needs = re.search(r"^    needs:\s*\[([^\]]*)\]", jobs.get("required-tests", ""), re.M)
+    required = {n.strip() for n in needs.group(1).split(",")} if needs else set()
+    return any(job in required and invokes_publish_gate(text) for job, text in jobs.items())
+
+
 def run_by_publish_gate() -> set:
-    """The suites the publish gate runs, asked of the gate itself, credited only while a workflow calls it."""
-    if not any(invokes_publish_gate(wf.read_text()) for wf in (REPO / ".github" / "workflows").glob("*.yml")):
+    """The suites the publish gate runs, asked of the gate itself, credited only while required PR/main CI runs it."""
+    if not gate_runs_in_required_ci(CI.read_text()):
         return set()
     out = subprocess.run(["bash", str(REPO / PUBLISH_GATE), "--list"], cwd=str(REPO),
                          capture_output=True, text=True)
@@ -395,6 +418,20 @@ class TestCICoversEveryPythonTest(unittest.TestCase):
         self.assertFalse(invokes_publish_gate(f"steps:\n  - run: |\n      # bash {PUBLISH_GATE}\n      true\n"))
         self.assertFalse(invokes_publish_gate(f"steps:\n  - run: echo bash-{PUBLISH_GATE}\n"))
         self.assertIn("packages/ag2-sparrow/tests/test_hatch_adapter.py", run_by_publish_gate())
+
+    def test_only_a_required_pr_gate_job_credits_the_gate(self):
+        gate = f"bash {PUBLISH_GATE}"
+        ci = ("on:\n  pull_request:\n  push:\n    branches: [main]\n\njobs:\n"
+              f"  gate:\n    steps:\n      - run: {gate}\n"
+              "  required-tests:\n    needs: [changes, gate]\n    steps:\n      - run: true\n")
+        self.assertTrue(gate_runs_in_required_ci(ci))
+        self.assertFalse(gate_runs_in_required_ci(ci.replace("needs: [changes, gate]", "needs: [changes]")),
+                         "a gate job required-tests does not need gates nothing")
+        tag_only = ('on:\n  push:\n    tags: ["sparrow-v*"]\n\njobs:\n'
+                    f"  publish:\n    steps:\n      - run: {gate}\n"
+                    "  required-tests:\n    needs: [publish]\n")
+        self.assertFalse(gate_runs_in_required_ci(tag_only), "a tag-only release call runs after merge, not before")
+        self.assertTrue(gate_runs_in_required_ci(CI.read_text()), "ci.yml's required gate job must keep calling the gate")
 
     def test_a_workflow_named_file_is_not_an_orphan(self):
         self.assertEqual(orphans_in({"scripts/y.py"}, set(), {"scripts/y.py"}), [])
