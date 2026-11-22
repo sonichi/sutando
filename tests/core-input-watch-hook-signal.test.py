@@ -150,6 +150,31 @@ class TestScreenEvidenceOutranksAHeldDialog(unittest.TestCase):
             self.assertEqual(state(pane, base=base, hook=self.HELD), state(pane, base=base), pane[:30])
 
 
+class TestAnOwnerQuestionReachesTheOwner(unittest.TestCase):
+    """AskUserQuestion's own PreToolUse is a blocked record, so the screen's question stands."""
+
+    QUESTION = ("⏺ AskUserQuestion\n\n  Ship the release now?\n  ❯ 1. Yes\n    2. Not yet\n"
+                "  Enter to select · Esc to cancel")
+
+    def test_positive_control_the_question_is_a_selection_without_hooks(self):
+        self.assertEqual(state(self.QUESTION)[::3], ("blocked-human", "selection"))
+
+    def test_the_question_tools_record_keeps_it_blocked(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        payload = {"hook_event_name": "PreToolUse", "tool_use_id": "q1", "tool_name": "AskUserQuestion",
+                   "tool_input": {"questions": [{"question": "Ship the release now?"}]}}
+        cbs.record_event(tmp.name, "/tmp/s.sock", "%1", 9, {"hook_event_name": "Stop"}, "claude", "s")
+        cbs.record_event(tmp.name, "/tmp/s.sock", "%1", 9, payload, "claude", "s")
+        hook = cbs.verdict(cbs.read(tmp.name, "/tmp/s.sock", "%1"), 9, cbs.read(tmp.name, "/tmp/s.sock", "%1")["ts"])
+        self.assertEqual(hook, ("blocked", "question"))
+        self.assertEqual(state(self.QUESTION, hook=hook)[::3], ("blocked-human", "selection"))
+
+    def test_a_clear_would_have_hidden_it(self):
+        # What the finding saw: a fresh clear voids the screen's selection reading.
+        self.assertNotEqual(state(self.QUESTION, hook=CLEAR)[0], "blocked-human")
+
+
 class TestNoRecordIsTheOldBehaviour(unittest.TestCase):
     def test_every_pane_reads_as_without_the_parameter(self):
         for pane in (SLASH_MENU, SAUTEED, QUOTED_DIALOG, LOGIN_MENU, IDLE_LOGGED_OUT, SESSION_LIMIT, STILL_PANE):

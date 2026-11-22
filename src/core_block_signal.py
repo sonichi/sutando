@@ -15,7 +15,8 @@ Writer contract (one writer: `record_event`; `write` is its replace step):
            "pane_id": "%N", "pane_pid": <int>, "ts": <unix seconds>, "source": "hook"}
   writes  read-decide-replace under an flock on <path>.lock; the replace is a temp file +
           os.replace. A blocked record clears only on a turn boundary (UserPromptSubmit, Stop)
-          or a tool event of the interaction that blocked; other tool events leave it.
+          or a tool event of the interaction that blocked; other tool events leave it. A
+          PreToolUse of a tool that itself asks the owner (INTERACTIVE_TOOLS) blocks, never clears.
   failure every hook path fails open and silent: no record is a fallback, never a verdict.
 
 Keyed by tmux pane, and bound to the pane's process: a relaunched CLI is a new pane process,
@@ -53,6 +54,10 @@ _CLEAR_EVENTS = _TOOL_EVENTS | _TURN_EVENTS
 # Claude's Notification types that mean a dialog waits on a person. idle_prompt is not one:
 # it is the empty composer at rest, the state the task notifier delivers into.
 _BLOCKING_NOTIFICATIONS = {"permission_prompt": "permission", "elicitation_dialog": "question"}
+#: Tools whose own call is a dialog waiting on a person: their PreToolUse opens it, and their
+#: PostToolUse (same tool_use_id) or a turn boundary closes it.
+INTERACTIVE_TOOLS = {"AskUserQuestion": "question", "ExitPlanMode": "question",
+                     "request_user_input": "question"}
 #: The events each runtime's hook registration subscribes; Codex has no Notification event.
 CLAUDE_EVENTS = ("Notification", "PermissionRequest", "PreToolUse", "PostToolUse",
                  "PostToolUseFailure", "UserPromptSubmit", "Stop")
@@ -67,6 +72,8 @@ def event_state(payload: dict) -> "Optional[tuple[str, Optional[str]]]":
     if name == "Notification":
         reason = _BLOCKING_NOTIFICATIONS.get(payload.get("notification_type"))
         return (BLOCKED, reason) if reason else None
+    if name == "PreToolUse" and payload.get("tool_name") in INTERACTIVE_TOOLS:
+        return BLOCKED, INTERACTIVE_TOOLS[payload["tool_name"]]
     if name in _CLEAR_EVENTS:
         return CLEAR, None
     return None

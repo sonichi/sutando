@@ -43,6 +43,13 @@ class TestEventState(unittest.TestCase):
         for ntype in ("idle_prompt", "auth_success", None):
             self.assertIsNone(cbs.event_state({"hook_event_name": "Notification", "notification_type": ntype}))
 
+    def test_a_tool_that_asks_the_owner_blocks_on_its_pre_tool_use(self):
+        for tool in ("AskUserQuestion", "ExitPlanMode", "request_user_input"):
+            self.assertEqual(cbs.event_state({"hook_event_name": "PreToolUse", "tool_name": tool}),
+                             ("blocked", "question"), tool)
+            self.assertEqual(cbs.event_state({"hook_event_name": "PostToolUse", "tool_name": tool}), ("clear", None))
+        self.assertEqual(cbs.event_state({"hook_event_name": "PreToolUse", "tool_name": "Bash"}), ("clear", None))
+
     def test_turn_progress_is_clear(self):
         for ev in ("PreToolUse", "PostToolUse", "PostToolUseFailure", "UserPromptSubmit", "Stop"):
             self.assertEqual(cbs.event_state({"hook_event_name": ev}), ("clear", None))
@@ -233,6 +240,34 @@ class TestClearIsScopedToTheInteraction(unittest.TestCase):
         rec = self.ev({"hook_event_name": "PreToolUse", "tool_use_id": "t2", "tool_name": "Read",
                        "tool_input": {}}, pid=8)
         self.assertEqual((rec["state"], rec["pane_pid"]), ("clear", 8))
+
+    ASK = {"tool_name": "AskUserQuestion", "tool_input": {"questions": [{"question": "Ship it?"}]}}
+
+    def test_an_owner_question_blocks_until_its_own_post_tool_use(self):
+        rec = self.ev({"hook_event_name": "PreToolUse", "tool_use_id": "q1", **self.ASK})
+        self.assertEqual((rec["state"], rec["reason"], rec["interaction"]["tool_use_id"]),
+                         ("blocked", "question", "q1"))
+        other = {"hook_event_name": "PreToolUse", "tool_use_id": "t2", "tool_name": "Read", "tool_input": {}}
+        self.assertEqual(self.ev(other)["state"], "blocked")
+        self.assertEqual(self.ev({"hook_event_name": "PostToolUse", "tool_use_id": "q1", **self.ASK})["state"],
+                         "clear")
+
+    def test_an_owner_question_after_a_clear_is_blocked_not_cleared(self):
+        # The finding: its PreToolUse wrote a fresh clear that voided the screen's selection.
+        self.ev({"hook_event_name": "Stop"})
+        rec = self.ev({"hook_event_name": "PreToolUse", "tool_use_id": "q1", **self.ASK})
+        self.assertEqual(rec["state"], "blocked")
+        self.assertEqual(cbs.verdict(rec, 7, rec["ts"]), ("blocked", "question"))
+
+    def test_an_owner_question_clears_at_a_turn_boundary(self):
+        for ev in ("UserPromptSubmit", "Stop"):
+            self.ev({"hook_event_name": "PreToolUse", "tool_use_id": "q1", **self.ASK})
+            self.assertEqual(self.ev({"hook_event_name": ev})["state"], "clear", ev)
+
+    def test_an_ordinary_tool_still_clears(self):
+        self.ev({"hook_event_name": "Stop"})
+        self.assertEqual(self.ev({"hook_event_name": "PreToolUse", "tool_use_id": "b1", "tool_name": "Bash",
+                                  "tool_input": {"command": "ls"}})["state"], "clear")
 
     def test_tool_progress_with_nothing_held_writes_clear(self):
         self.assertEqual(self.ev({"hook_event_name": "PreToolUse", "tool_use_id": "t1", "tool_name": "Read",
