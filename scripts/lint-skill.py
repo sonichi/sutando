@@ -71,7 +71,7 @@ KNOWN_TOP = {
     "provenance", "enabled", "access_tier", "tools", "server", "startup", "config",
     "hooks", "documented_for_core", "core_description", "supervised_worker",
     "pending_questions_store", "claude_plugin", "orphan_reaper", "audience", "on_launch",
-    "on_stop_requested", "playbook",
+    "on_stop_requested", "playbook", "playbook_line", "last_run",
 }
 AUDIENCES = {"user", "developer"}
 # Fields a runtime scan activates straight from <repo>/skills, past the installers'
@@ -115,6 +115,16 @@ def _lint_manifest(skill_dir: Path) -> tuple[list[str], list[str]]:
     # playbook: opts the skill into AgentTrigger dispatch (src/agent_triggers.py).
     if "playbook" in m and not isinstance(m["playbook"], bool):
         err("playbook must be a boolean")
+    line = m.get("playbook_line")
+    if line is not None:
+        if not (isinstance(line, str) and re.fullmatch(r"/[a-z][a-z0-9-]{0,63}", line)):
+            err("playbook_line must be '/' and one lowercase word, e.g. /tutorial")
+        elif m.get("playbook") is not True:
+            err("playbook_line needs \"playbook\": true")
+    rec = m.get("last_run")
+    if rec is not None and not (isinstance(rec, str) and rec.endswith(".json") and not rec.startswith("/")
+                                and ".." not in Path(rec).parts and not re.search(r"\s", rec)):
+        err("last_run must be a relative .json path under <workspace>/state/, with no '..'")
 
     # supervised_worker: sparrowd reads this to decide what to keep running, and
     # it names no skill, so a malformed block is a silently unsupervised daemon.

@@ -8,5 +8,7 @@
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   },
-  "playbook": true
+  "playbook": true,
+  "playbook_line": "/tutorial",
+  "last_run": "tutorial/last-run.json"
 }

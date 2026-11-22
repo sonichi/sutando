@@ -280,6 +280,33 @@ def test_tutorial_tag_needs_the_owner_a_dm_and_a_line_of_its_own():
         print("PASS test_tutorial_tag_needs_the_owner_a_dm_and_a_line_of_its_own")
 
 
+def test_the_bridge_injects_the_monorepo_skills_tree():
+    # The line is the tutorial skill's own manifest declaration; the bridge supplies only the tree.
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        root = m._playbook_skills_root()
+        assert root is not None and (root / "tutorial" / "manifest.json").is_file(), root
+        seen = []
+        real = m.agent_triggers.owner_dm_playbook
+        m.agent_triggers.owner_dm_playbook = lambda *a: seen.append(a) or real(*a)
+        try:
+            _written(m, _dm_task("task-1786000000840"))
+        finally:
+            m.agent_triggers.owner_dm_playbook = real
+        assert seen and seen[0][3] == root, seen
+        print("PASS test_the_bridge_injects_the_monorepo_skills_tree")
+
+
+def test_a_standalone_bridge_tags_nothing():
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        m._monorepo_src = lambda marker: ""
+        assert m._playbook_skills_root() is None
+        text = _written(m, _dm_task("task-1786000000850"))
+        assert not any(ln.startswith("playbook:") for ln in text.splitlines()), text
+        print("PASS test_a_standalone_bridge_tags_nothing")
+
+
 def test_a_broker_named_playbook_is_not_replaced():
     with tempfile.TemporaryDirectory() as d:
         m = _load(pathlib.Path(d))
@@ -310,6 +337,8 @@ if __name__ == "__main__":
     test_result_with_no_source_message_posts_top_level()
     test_owner_dm_tutorial_line_is_tagged_above_task()
     test_tutorial_tag_needs_the_owner_a_dm_and_a_line_of_its_own()
+    test_the_bridge_injects_the_monorepo_skills_tree()
+    test_a_standalone_bridge_tags_nothing()
     test_a_broker_named_playbook_is_not_replaced()
     test_the_tagged_task_keeps_its_body()
     print("ALL PASS test_agent_trigger")

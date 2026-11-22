@@ -1686,30 +1686,39 @@ def check_decision_card_clicks(workspace_dir: Optional[Path] = None) -> "dict | 
                        "`hitl_click: true` task (CLAUDE.md, Pending decisions)")}
 
 
-def check_tutorial_last_run(workspace_dir: Optional[Path] = None) -> "dict | None":
-    """The tutorial playbook's last Getting started page run (skills/tutorial/scripts/tutorial_run.py
-    writes state/tutorial/last-run.json): WARN naming the failed step, ok when it published, None
-    before any run. A missing page is never silent."""
+SKILL_LAST_RUN_FIELD = "last_run"
+SKILL_LAST_RUN_DETAIL_CAP = 300
+
+
+def check_skill_last_runs(workspace_dir: Optional[Path] = None, roots=None) -> list:
+    """One `skill:<name>` row per installed skill whose manifest declares `last_run`: the record
+    it rewrites under <workspace>/state/ ({"status": "ok"|"warn", "detail", "at"}). No record, or one
+    that is not an object, is no row; an object with no valid status is a warn naming it."""
     ws = Path(workspace_dir) if workspace_dir else WORKSPACE_DIR
-    try:
-        rec = json.loads((ws / "state" / "tutorial" / "last-run.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(rec, dict):
-        return None
-    outcome = str(rec.get("outcome") or "unknown")
-    when = str(rec.get("at") or "?")
-    if outcome == "page-made-card-not-sent":
-        return {"name": "tutorial-page", "status": "warn",
-                "detail": f"the Getting started page was made at {when} but its card did not reach the owner"}
-    if outcome == "ok":
-        return {"name": "tutorial-page", "status": "ok",
-                "detail": f"last Getting started page run published it ({rec.get('action') or 'ok'}) at {when}"}
-    reason = str(rec.get("reason") or "")[:200]
-    return {"name": "tutorial-page", "status": "warn",
-            "detail": (f"the last Getting started page run failed at {when}: {outcome}"
-                       + (f" ({reason})" if reason else "")
-                       + " — the owner was told to send /tutorial to retry; see skills/tutorial/SKILL.md")}
+    state = (ws / "state").resolve()
+    rows = []
+    for name, rel in skill_roots.declared_values(SKILL_LAST_RUN_FIELD,
+                                                 skill_roots.skill_roots(ws) if roots is None else roots):
+        path = (state / rel).resolve()
+        if not rel.endswith(".json") or not path.is_relative_to(state):
+            continue
+        try:
+            rec = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        status = rec.get("status")
+        if status in ("ok", "warn"):
+            detail = str(rec.get("detail") or status)
+            when = rec.get("at")
+            if isinstance(when, str) and when:
+                detail = f"{detail} (at {when})"
+        else:
+            status, detail = "warn", f"state/{rel} has no ok/warn status"
+        rows.append({"name": f"skill:{name}", "status": status,
+                     "detail": detail[:SKILL_LAST_RUN_DETAIL_CAP]})
+    return rows
 
 
 def check_connections_primary(workspace_dir: Optional[Path] = None) -> "dict | None":
@@ -13570,9 +13579,7 @@ def run_all_checks() -> list[dict]:
     if _no_primary:
         checks.append(_no_primary)
 
-    _tutorial = check_tutorial_last_run()
-    if _tutorial:
-        checks.append(_tutorial)
+    checks.extend(check_skill_last_runs())
 
     _mem_index = check_memory_index_integrity()
     if _mem_index:

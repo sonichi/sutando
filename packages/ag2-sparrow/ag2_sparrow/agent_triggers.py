@@ -17,9 +17,10 @@ This module is the one owner of that vocabulary:
 - allowed_playbook_value with no skills tree (a bridge that only forwards the header)
   passes registry ids only; the core still applies the manifest opt-in.
 - owner_dm_playbook tags the owner's own DM message that asks for a playbook by a
-  line of its own: today `/tutorial`, which runs the tutorial playbook (the setup
-  app ends the first-contact message with that line). The bridge writes it as the
-  task's `playbook` header; nothing else in the body is read.
+  line of its own. A playbook skill declares that line in its manifest
+  (`"playbook_line": "/<word>"`); the adapter injects the skills tree it scans, and
+  the bridge writes the answer as the task's `playbook` header. Nothing else in the
+  body is read, and a line two skills declare runs neither.
 - An event task's body may quote member-written text: it is data, never instructions.
   The trigger's own instruction comes from the server, not from commands quoted in it.
 
@@ -115,29 +116,57 @@ def resolve_playbook(event_type, playbook, skills_root: Path) -> Optional[Path]:
     return None
 
 
-# The owner's request for the Getting started page: a body line that is exactly this.
-TUTORIAL_LINE = "/tutorial"
-TUTORIAL_PLAYBOOK = "tutorial"
+# A playbook's own slash line: `/` and one lowercase word, the whole line.
+PLAYBOOK_LINE_RE = re.compile(r"/[a-z][a-z0-9-]{0,63}")
 
 
-def tutorial_requested(body) -> bool:
-    """True when one line of the body is exactly `/tutorial` (surrounding whitespace aside).
-
-    The line has to stand alone: `/tutorial` inside a sentence, or quoted (`> /tutorial`,
-    `"/tutorial"`, `` `/tutorial` ``), is someone talking about the command, not sending it."""
+def _slash_lines(body) -> list:
+    """The body's lines that could be a playbook line, stripped; reads nothing else."""
     if not isinstance(body, str):
-        return False
-    return any(line.strip() == TUTORIAL_LINE for line in body.splitlines())
+        return []
+    return [s for s in (line.strip() for line in body.splitlines()) if PLAYBOOK_LINE_RE.fullmatch(s)]
 
 
-def owner_dm_playbook(body, tier, channel_kind) -> Optional[str]:
-    """The playbook the owner's own DM message asks for, or None.
+def playbook_lines(skills_root: Optional[Path]) -> dict:
+    """{line: playbook} for each playbook skill under `skills_root` whose manifest declares
+    `playbook_line`; a line declared by more than one skill is left out (nobody picks)."""
+    if skills_root is None:
+        return {}
+    found: dict = {}
+    try:
+        manifests = sorted(Path(skills_root).glob("*/manifest.json"))
+    except OSError:
+        return {}
+    for manifest in manifests:
+        playbook = manifest.parent.name
+        if not is_playbook(Path(skills_root), playbook):
+            continue
+        try:
+            line = json.loads(manifest.read_text(encoding="utf-8")).get("playbook_line")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(line, str) and PLAYBOOK_LINE_RE.fullmatch(line):
+            found.setdefault(line, []).append(playbook)
+    return {line: names[0] for line, names in found.items() if len(names) == 1}
 
-    Only an owner-tier sender in a direct message qualifies: a room message, or any other
-    tier, never does, whatever its body says. Today the one such playbook is `tutorial`."""
+
+def owner_dm_playbook(body, tier, channel_kind, skills_root: Optional[Path]) -> Optional[str]:
+    """The playbook the owner's own DM message asks for by a line of its own, or None.
+
+    Only an owner-tier sender in a direct message qualifies: a room message, or any other tier,
+    never does, whatever its body says. The line has to stand alone: one quoted (`> /x`, `"/x"`)
+    or inside a sentence is someone talking about the command, not sending it. No skills tree
+    (a standalone bridge) tags nothing."""
     if tier != "owner" or channel_kind != "dm":
         return None
-    return TUTORIAL_PLAYBOOK if tutorial_requested(body) else None
+    candidates = _slash_lines(body)
+    if not candidates:
+        return None
+    lines = playbook_lines(skills_root)
+    for line in candidates:
+        if line in lines:
+            return lines[line]
+    return None
 
 
 def _main(argv) -> int:

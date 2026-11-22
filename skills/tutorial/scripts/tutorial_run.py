@@ -12,7 +12,8 @@ is made never rests on anything else. The page it publishes is generic: no roles
 and never the owner's name (publish uses the agent's own, `--name auto`). A room's Commons page cannot
 yet be limited to its owner, so nothing the owner said about themselves is put on it.
 
-Every run records its outcome in <workspace>/state/tutorial/last-run.json (health-check reads it) and
+Every run records its outcome in <workspace>/state/tutorial/last-run.json, the record this skill's
+manifest declares as `last_run`, so health-check shows it as the `skill:tutorial` row; it
 prints one JSON line. Whenever the owner would otherwise hear nothing (a failed publish, or a page whose
 card did not reach them) that line carries `owner_line`, the one plain sentence the agent sends. Recording
 is best-effort: a status file that cannot be written never hides that line. Exit 0 when a page exists.
@@ -69,6 +70,18 @@ def _last_json(text: str) -> Dict[str, object]:
     return {}
 
 
+def health(outcome: str, reason: str, action: object) -> Dict[str, str]:
+    """The record's `status` and `detail`: what health-check's `skill:tutorial` row shows."""
+    if outcome == "ok":
+        return {"status": "ok", "detail": f"last Getting started page run published it ({action or 'ok'})"}
+    if outcome == "page-made-card-not-sent":
+        return {"status": "warn", "detail": "the Getting started page was made but its card did not reach the owner"}
+    return {"status": "warn",
+            "detail": (f"the last Getting started page run failed: {outcome}"
+                       + (f" ({reason[:200]})" if reason else "")
+                       + " — the owner was told to send /tutorial to retry; see skills/tutorial/SKILL.md")}
+
+
 def write_record(workspace: Path, record: Dict[str, object]) -> None:
     """Replace last-run.json atomically: a reader never sees half a record."""
     path = record_path(workspace)
@@ -122,6 +135,7 @@ def run(room: str, owner: str, body: str, workspace: Path,
     for key in ("action", "kind"):
         if isinstance(result.get(key), str):
             record[key] = result[key]
+    record.update(health(outcome, reason, record.get("action")))
     shown: Dict[str, object] = {"ok": code == 0, **record}
     try:
         write_record(workspace, record)

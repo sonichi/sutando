@@ -43,6 +43,12 @@ def _health_check():
 HC = _health_check()
 
 
+def tutorial_row(ws):
+    """The `skill:tutorial` row health-check makes from the manifest's declared `last_run`."""
+    rows = [r for r in HC.check_skill_last_runs(ws, roots=[REPO / "skills"]) if r["name"] == "skill:tutorial"]
+    return rows[0] if rows else None
+
+
 class _Run(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -256,7 +262,7 @@ class CardNotSent(_Run):
         rec = self.record()
         self.assertEqual((rec["outcome"], rec["reason"], rec["kind"]),
                          ("page-made-card-not-sent", "summon refused: 502", "html-3"))
-        row = HC.check_tutorial_last_run(self.ws)
+        row = tutorial_row(self.ws)
         self.assertEqual(row["status"], "warn")
         self.assertIn("card did not reach the owner", row["detail"])
 
@@ -285,17 +291,17 @@ class CardNotSent(_Run):
 
 class HealthRow(_Run):
     def test_no_run_yet_is_no_row(self):
-        self.assertIsNone(HC.check_tutorial_last_run(self.ws))
+        self.assertIsNone(tutorial_row(self.ws))
 
     def test_a_published_page_is_an_ok_row(self):
         tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.fake_publish(0, {"action": "created"}))
-        row = HC.check_tutorial_last_run(self.ws)
-        self.assertEqual((row["name"], row["status"]), ("tutorial-page", "ok"))
+        row = tutorial_row(self.ws)
+        self.assertEqual((row["name"], row["status"]), ("skill:tutorial", "ok"))
 
     def test_a_failed_run_is_a_warn_naming_the_step(self):
         tr.run(ROOM, OWNER, SETUP_BODY, self.ws,
                script=self.fake_publish(3, {"ok": False, "reason": "room-commons not installed"}))
-        row = HC.check_tutorial_last_run(self.ws)
+        row = tutorial_row(self.ws)
         self.assertEqual(row["status"], "warn")
         self.assertIn("room-commons-not-installed", row["detail"])
 
@@ -303,10 +309,23 @@ class HealthRow(_Run):
         path = tr.record_path(self.ws)
         path.parent.mkdir(parents=True)
         path.write_text("[1, 2]")
-        self.assertIsNone(HC.check_tutorial_last_run(self.ws))
+        self.assertIsNone(tutorial_row(self.ws))
 
     def test_the_row_is_wired_into_the_report(self):
-        self.assertIn("check_tutorial_last_run()", (REPO / "src" / "health-check.py").read_text())
+        self.assertIn("checks.extend(check_skill_last_runs())", (REPO / "src" / "health-check.py").read_text())
+
+    def test_the_manifest_declares_the_record_this_script_writes(self):
+        manifest = json.loads((REPO / "skills" / "tutorial" / "manifest.json").read_text())
+        self.assertEqual(self.ws / "state" / manifest["last_run"], tr.record_path(self.ws))
+
+    def test_without_the_declaration_there_is_no_row(self):
+        tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.fake_publish(0, {"action": "created"}))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bare = Path(tmp.name) / "skills"
+        (bare / "tutorial").mkdir(parents=True)
+        (bare / "tutorial" / "manifest.json").write_text('{"name": "tutorial", "playbook": true}')
+        self.assertEqual(HC.check_skill_last_runs(self.ws, roots=[bare]), [])
 
 
 if __name__ == "__main__":

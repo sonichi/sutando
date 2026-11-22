@@ -15,7 +15,6 @@ except ImportError:
 HEALTH_CAUSES = frozenset("""
 voice-agent voice-watchers voice-transport bodhi-dist cli-wedge pane-key-fence proactive-undelivered secret-scanner
 node-runtime cron-runner session-crons memory-dir-override workspace-wiring decision-card-clicks connections-primary
-tutorial-page
 context-read-budget workspace-root-tidy memory-dir-siblings carrier-set memory-index git-index-lock
 memory-sync onboarding-status hitl-archive host-subtrees per-host-config-backup sync-conflicts-unmerged
 skills-driver-code-drift live-checkout-branch engine-revision-drift migrate-reader-contract
@@ -37,7 +36,8 @@ def _health_cause(check):
     name = check['name']
     if name not in HEALTH_CAUSES:
         name = 'custom-check' if name.startswith('extra:') else (
-            'dynamic-loop' if name.startswith('dynamic-loop:') else 'other-check')
+            'dynamic-loop' if name.startswith('dynamic-loop:') else (
+                'skill-check' if name.startswith('skill:') else 'other-check'))
     status = check['status'] if check['status'] in ('warn', 'down') else 'non-ok'
     return 'health:' + name + ':' + status
 

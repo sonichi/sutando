@@ -1869,6 +1869,12 @@ def _monorepo_src(marker: str) -> str:
     return gateway_credential_io.monorepo_src(marker, __file__)
 
 
+def _playbook_skills_root() -> "Path | None":
+    """The monorepo's `skills/`, whose manifests declare playbook lines; None standalone."""
+    src = _monorepo_src("agent_triggers.py")
+    return Path(src).parent / "skills" if src else None
+
+
 # `project()` assigns retry cadence to its caller and the worker drives this
 # every ~1s. Skip-until-deadline, not sleep: other drains share this thread.
 _HITL_BACKOFF = {"until": 0.0, "delay": 0.0}
@@ -6504,7 +6510,8 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
     # Tagged from the raw body, before it is folded to one line; the field loop writes it above task:.
     # A playbook the broker already named is kept.
     if not task.get("playbook"):
-        _asked = agent_triggers.owner_dm_playbook(task.get("task"), sender_tier, task.get("channel_kind"))
+        _asked = agent_triggers.owner_dm_playbook(task.get("task"), sender_tier, task.get("channel_kind"),
+                                                  _playbook_skills_root())
         if _asked:
             task = {**task, "playbook": _asked}
     lines = []
