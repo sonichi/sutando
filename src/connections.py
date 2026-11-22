@@ -70,6 +70,7 @@ import subprocess
 import sys
 import contextlib
 import datetime
+import glob
 import hashlib
 import http.client
 import ipaddress
@@ -2483,6 +2484,9 @@ def task_reply_agent(task_file, room_id: Optional[str], worker: str, rows: list,
     tid = task_archive.task_id_for(path, accept=local_task_protocol.valid_archive_lookup_id)
     if not tid or not _same_file(task_archive.find_task_file(path.parent, tid), path):
         refuse("it is not the live file of the task it names")
+    # archive_file parks a task it could not archive as `<id>.txt.archive-failed`: out of the queue, not a claim.
+    if not path.name.endswith(".txt") or any(path.parent.glob(f"{glob.escape(tid)}.txt.archive-failed*")):
+        refuse("it is quarantined (its archive failed), not a live task")
     headers = attested_task_headers(text, ws).headers
     said = str(headers.get("receiving_instance") or "").strip()
     lane = task_agent_mxid(tid, ws)

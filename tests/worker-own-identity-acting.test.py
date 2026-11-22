@@ -262,6 +262,21 @@ class IdentityComesFromTheTask(TaskCase):
         (parked / "task-abc123-1700000000000000000.txt").write_text("the reply that did not go\n")
         self.assertIn("quarantined", self.refused(ROOM, core))
 
+    def test_a_quarantined_core_task_file_is_refused(self):
+        moved = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT, folder="tasks/quarantine")
+        self.deliver("task-abc123")
+        self.assertIn("does not hold", self.refused(ROOM, moved))
+        live = write_task(self.ws, "task-abc124", ROOM, CORE_AGENT)
+        self.deliver("task-abc124")
+        parked = live.rename(live.with_name(live.name + ".archive-failed"))
+        self.assertIn("quarantined", self.refused(ROOM, parked))
+
+    def test_a_live_claim_left_beside_an_archive_failed_payload_is_refused(self):
+        core = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+        self.deliver("task-abc123")
+        core.with_name(core.name + ".archive-failed").write_text(core.read_text())
+        self.assertIn("quarantined", self.refused(ROOM, core))
+
     def test_a_missing_unreadable_or_inconsistent_task_file_is_refused(self):
         self.assertIn("unreadable", self.refused(ROOM, self.ws / "tasks" / "task-gone.txt"))
         self.assertIn("no task file", self.refused(ROOM, ""))
