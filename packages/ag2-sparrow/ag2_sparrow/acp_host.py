@@ -276,14 +276,14 @@ def _same_tool(a, b):
 def mcp_tool_identity(tool_call):
     """(server, tool) when the request names an MCP server and tool: agy's `name` (`mcp_<server>_<tool>`), else
     a structured pair (`MCP_IDENTITY_KEYS`) on the toolCall or its `_meta`, both plain identifiers; CONFLICT when
-    any other server or tool field (toolCall, `_meta`, `rawInput`, `args`) disagrees; None otherwise. The title
-    is the agent's free text and never read here."""
-    holders = [h for h in (tool_call, tool_call.get("_meta"), tool_call.get("rawInput"), tool_call.get("args"))
-               if isinstance(h, dict)]
+    any other server or tool field of those two transport holders disagrees; None otherwise. The tool's own input
+    (`rawInput`, `args`) and the title are the agent's free text and never read here."""
+    meta = tool_call.get("_meta")
+    holders = [tool_call] + ([meta] if isinstance(meta, dict) else [])
     name = tool_call.get("name")
     agy = AGY_MCP_NAME_RE.fullmatch(name) if isinstance(name, str) else None
     found = (agy.group(1), agy.group(2)) if agy else None
-    for holder in holders[:2] if found is None else ():
+    for holder in holders if found is None else ():
         for skey, tkey in MCP_IDENTITY_KEYS:
             server, tool = holder.get(skey), holder.get(tkey)
             if isinstance(server, str) and isinstance(tool, str) and _IDENT_RE.fullmatch(server) \

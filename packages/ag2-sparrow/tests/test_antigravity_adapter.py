@@ -911,15 +911,21 @@ class SspaceToolsTest(unittest.TestCase):
                  {"rawInput": {"server": "ag2-space"}}]
         for fields in agree:
             self.assertTrue(call(**fields)[0], fields)
+        # The tool's own input is the agent's data, never its identity: a valid call is not refused over it.
+        for fields in ({"rawInput": {"server": "evil"}}, {"args": {"tool": "relay.token.issue"}},
+                       {"rawInput": {"ServerName": "x"}}, {"args": {"server": "other", "toolName": "agent.unlink"}}):
+            self.assertEqual(call(**fields), (True, "MCP tool ag2-space/room_actions_search"), fields)
         disagree = [{"_meta": {"serverName": "other", "toolName": "room.actions.search"}},
                     {"_meta": {"serverName": "ag2-space", "toolName": "room.action.execute"}},
-                    {"top": {"toolName": "agent.unlink"}}, {"rawInput": {"server": "evil"}},
-                    {"args": {"tool": "relay.token.issue"}}, {"rawInput": {"ServerName": "x"}},
+                    {"top": {"toolName": "agent.unlink"}}, {"top": {"server": "evil"}},
                     {"_meta": {"toolName": ["room.actions.search"]}}]
         for fields in disagree:
             self.assertEqual(call(**fields), (False, "the request names two different MCP tools"), fields)
         self.assertIsNone(acp_host.mcp_tool_identity({"name": "read_file", "rawInput": {"server": "x"}}),
                           "a field alone names no MCP tool")
+        self.assertIsNone(acp_host.mcp_tool_identity(
+            {"name": "x", "rawInput": {"serverName": "ag2-space", "toolName": "room.action.execute"}}),
+            "an identity pair in the tool's input is not the request's identity, with or without _meta")
 
     def test_the_policy_maps_mcp_calls_by_server_and_tool_never_by_title(self):
         def decide(tool_call, owner=True):
