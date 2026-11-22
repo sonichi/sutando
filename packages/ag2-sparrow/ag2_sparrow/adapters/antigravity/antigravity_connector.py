@@ -104,7 +104,7 @@ def publish(result_file, body):
 
 # The bridge's label for a file fetched from the sender's own message; a replied-to one says "(from replied-to …)".
 OWN_MEDIA_RE = re.compile(r"\[(?:Photo|File) attached: ([^\]\n]+)\]")
-REPLY_BLOCK_RE = re.compile(r"\[(?:AG2 Space|s\.space) reply context;")
+REPLY_BLOCK_RE = re.compile(r"\[[^\]\n]* reply context;")   # any product's opener: broader fails closed
 
 
 def own_media_paths(message):
