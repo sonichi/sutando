@@ -1057,7 +1057,8 @@ class SspaceStdioTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual([t["name"] for t in json.loads(r.stdout)["result"]["tools"]], ["room_action_execute", "ui_request"])
         text = log.read_text()
-        self.assertIn("mcp_name_shim: start, running %s\n" % shlex.join([sys.executable, str(server)]), text)
+        self.assertIn("mcp_name_shim: start, running %s\n" % os.path.basename(sys.executable), text)
+        self.assertNotIn(str(server), text, "the proxy's arguments never reach the log")
         self.assertIn("mcp_name_shim: exit, the server exited 0", text)
 
     def test_a_proxy_command_under_a_path_with_a_space_round_trips_to_the_connector(self):
