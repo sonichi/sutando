@@ -466,7 +466,7 @@ class Install(Base):
         self.assertEqual((cfg["CODEX"], cfg["ROOT"], cfg["INBOX_DIR"], cfg["RESULTS_DIR"]),
                          (str(self.codex), str(self.work), str(self.work / "tasks"), str(self.work / "results")))
         self.assertEqual((cfg["CODEX_HOME"], cfg["SANDBOX"], cfg["ALLOW_NON_OWNER"], cfg["MODEL"]),
-                         (str(self.codex_home), "read-only", "", ""))
+                         (str(self.codex_home), "read-only", "1", ""))
         self.assertTrue((self.work / "tasks").is_dir() and (self.work / "results").is_dir())
         self.assertTrue(cm.service_path(L).read_text().startswith(cli.MARKER))
         self.assertNotIn(TOKEN, cfg_path.read_text())
@@ -477,13 +477,23 @@ class Install(Base):
         self.assertIsNone(self.server(), "install starts no connector itself; the manager does")
 
     def test_sandbox_and_non_owner_choices(self):
-        rc, out, _ = self.install_with(self.runner(), False, "--sandbox", "workspace-write", "--allow-non-owner", "--model", "m1")
+        rc, out, _ = self.install_with(self.runner(), False, "--sandbox", "workspace-write", "--no-allow-non-owner", "--model", "m1")
         self.assertEqual(rc, 0)
         self.assertIn("NOTE sandbox: workspace-write", out)
         cfg = cm.read_config(cli.config_path())
-        self.assertEqual((cfg["SANDBOX"], cfg["ALLOW_NON_OWNER"], cfg["MODEL"]), ("workspace-write", "1", "m1"))
+        self.assertEqual((cfg["SANDBOX"], cfg["ALLOW_NON_OWNER"], cfg["MODEL"]), ("workspace-write", "0", "m1"))
         self.assertEqual(cli.connector_argv(cfg, str(self.work), 7)[-5:],
-                         ["--sandbox", "workspace-write", "--allow-non-owner", "--model", "m1"])
+                         ["--sandbox", "workspace-write", "--no-allow-non-owner", "--model", "m1"])
+        for recorded in ("1", "", None):     # served by default, the older flag, and an older install's empty value
+            c = dict(cfg, ALLOW_NON_OWNER=recorded) if recorded is not None else \
+                {k: v for k, v in cfg.items() if k != "ALLOW_NON_OWNER"}
+            argv = cli.connector_argv(c, str(self.work), 7)
+            self.assertNotIn("--no-allow-non-owner", argv, recorded)
+            self.assertIs(cc.build_parser().parse_args(argv[3:]).allow_non_owner, True, recorded)
+        self.assertIs(cc.build_parser().parse_args(
+            cli.connector_argv(cfg, str(self.work), 7)[3:]).allow_non_owner, False)
+        self.assertIs(cc.build_parser().parse_args(["--work", str(self.work), "--allow-non-owner"]).allow_non_owner, True,
+                      "the older flag still works")
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             cli.main(["install", "--work", str(self.work), "--sandbox", "danger-full-access"])
 
@@ -985,7 +995,7 @@ class VerifyUninstall(Base):
         self.assertEqual(set(self.checks(out)), {"config", "codex", "login", "inbox", "results", "relay token", "supervisor"})
         self.assertEqual(set(self.checks(out).values()), {"PASS"})
         self.assertIn("INFO sandbox: read-only", out)
-        self.assertIn("INFO non-owner: refused unless", out)
+        self.assertIn("INFO non-owner: served read-only, ephemeral, in an empty temp dir (the default", out)
         self.assertIn(f"INFO job: {L.service_name} active", out)
         self.assertIn(f"INFO session: {self.work} held by launcher pid {runner.pid()}, no live connector attached "
                       "(manager active/running)", out)

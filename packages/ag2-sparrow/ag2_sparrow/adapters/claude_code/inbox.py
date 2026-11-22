@@ -122,24 +122,22 @@ def _installed_config(environ=None) -> Path:
     return Path(config_dir) / cm.config_path(LOCAL).name if config_dir else cm.config_path(LOCAL)
 
 
-def _installed_flag(key, environ=None) -> bool:
+def _installed_on(key, environ=None) -> bool:
+    """On unless the config the pane names (else the CLI's own) records the opt-out ("0"); unreadable reads as off."""
     try:
-        return cm.read_config(_installed_config(environ)).get(key) == "1"
+        return cm.read_config(_installed_config(environ)).get(key, "") != "0"
     except (OSError, ValueError):
         return False
 
 
 def allow_non_owner(environ=None) -> bool:
-    """The installed --allow-non-owner, read from the config the pane names; unreadable reads as off."""
-    return _installed_flag(ALLOW_NON_OWNER, environ)
+    """The installed non-owner setting: on unless install recorded --no-allow-non-owner."""
+    return _installed_on(ALLOW_NON_OWNER, environ)
 
 
 def allow_collaborator(environ=None) -> bool:
-    """On unless the install recorded --no-allow-collaborator ("0"); an unreadable config reads as off."""
-    try:
-        return cm.read_config(_installed_config(environ)).get(ALLOW_COLLABORATOR, "") != "0"
-    except (OSError, ValueError):
-        return False
+    """The installed collaborator setting: on unless install recorded --no-allow-collaborator."""
+    return _installed_on(ALLOW_COLLABORATOR, environ)
 
 
 def envelope(verdict: str, environ=None, key_seen=None) -> dict:
@@ -158,7 +156,7 @@ def admit(root, task_id, allow: bool, allow_collab: bool = False) -> "tuple[str 
     """(admission, headers, why refused) for tasks/<task_id>.txt through the shared task_io.turn_policy. A
     file with no access_tier header is malformed (Sparrow's bridge always writes one). An attested
     collaborator is served unless --no-allow-collaborator, in the owner's session; a restricted sender only
-    under --allow-non-owner, on the isolated read-only turn (claim runs it), never in the owner's session."""
+    unless --no-allow-non-owner, on the isolated read-only turn (claim runs it), never in the owner's session."""
     path = os.path.join(root, "tasks", task_id + ".txt")
     with open(path, encoding="utf-8", errors="replace") as f:
         raw = task_io.attested_headers(f.read()).headers

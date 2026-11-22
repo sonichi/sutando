@@ -23,7 +23,7 @@ occupancy and the holder record attribution, never readiness.
 ```bash
 ag2-sparrow-codex-local install --agent <@agent:server> --token-stdin   # paste the relay token when asked
 ag2-sparrow-codex-local install --work <dir> [--codex-home <dir>] [--sandbox read-only|workspace-write] \
-    [--allow-non-owner] [--model <m>] [--codex <path>] [--resume-thread <uuid>]
+    [--no-allow-non-owner] [--model <m>] [--codex <path>] [--resume-thread <uuid>]
 ag2-sparrow-codex-local install --token-env-file <the agent's .env> [the same options]   # the alternative to --token-stdin
 ag2-sparrow-codex-local verify [--agent <@agent:server>]
 ag2-sparrow-codex-local uninstall [--agent <@agent:server>]
@@ -108,7 +108,7 @@ launcher-side shape shares: take the work root's lock for the launcher's own lif
 `codex-local`; a root another session holds is exit 75, which the manager does not relaunch over),
 make `tasks`, `results`, `state` and `state/threads` under the held root inode, start the connector
 as the direct child, `python -m …codex_connector --work <dir> --held --root-fd <the held root's
-descriptor> --codex <the configured executable> --server stdio --sandbox <s> [--allow-non-owner]
+descriptor> --codex <the configured executable> --server stdio --sandbox <s> [--no-allow-non-owner]
 [--model <m>]`, with an environment of
 only `PATH` (the configured `codex` first), `HOME`, `USER`, `PYTHONPATH` (this package) and
 `CODEX_HOME` when one was recorded (the connector passes it on to its app-server), and attach it as
@@ -159,13 +159,15 @@ conversation (`--resume-thread`, `--push`). Each thread file records its class o
 `owner-only` for the owner's own conversation (carried over by `--resume-thread`, or bound by
 `--thread-id`), `shared` for a thread this version started. A collaborator joins a channel's kept thread
 only when it is `shared`; otherwise, including a file written by an older version (no third line, origin
-unknown), it gets the channel's separate shared thread (`<key>.shared`), across restarts too. A non-owner without collaborator access (Guest, and any
-collaborator claim the broker did not attest) gets "This agent only answers its owner here." as its
-result — no thread started, no turn, the log says `refused (non-owner, --allow-non-owner not set)` —
-unless `--allow-non-owner` is passed, which gives them a restricted turn: the ephemeral read-only
-thread in the right-hand column.
+unknown), it gets the channel's separate shared thread (`<key>.shared`), across restarts too. A non-owner without collaborator access (Guest, plain
+Team, an unknown tier, and any collaborator claim the broker did not attest) gets a restricted turn by
+default, as Sutando answers guests read-only: the ephemeral read-only thread in the right-hand column.
+`install --no-allow-non-owner` (recorded as `ALLOW_NON_OWNER=0`, shown by `verify`) refuses them instead
+with "This agent only answers its owner here." as their result — no thread started, no turn, the log says
+`refused (non-owner, --allow-non-owner not set)`. `--allow-non-owner` is still accepted and is the default;
+an older install that recorded the key empty serves them too.
 
-| | owner, and an attested collaborator | restricted: any other non-owner under `--allow-non-owner` |
+| | owner, and an attested collaborator | restricted: any other non-owner, unless `--no-allow-non-owner` |
 |---|---|---|
 | thread | durable, one per `channel_id` (`state/threads/<sha256 of the id>`, the readable id inside the file), resumed across restarts; owner tasks with no `channel_id` share the one `default` thread; `--thread-id CHANNEL_ID=THREAD` seeds exactly that channel; `install --resume-thread <uuid>` (a conversation saved under `--codex-home`'s `sessions/`, as `codex resume <id>` takes it) is resumed in the owner's DM (`channel_kind: dm`) the first time, recorded in `state/resume-thread-taken`, and every other room starts a new thread; everything in that conversation becomes the agent's context there, and if the agent has more than one DM-kind room with the owner, the first to send takes it | a fresh **ephemeral** thread per task, never reused, never saved |
 | cwd | `--cwd` (default `--work`) | an empty temp dir, removed after the turn, so no room's `tasks/` or `results/` is in reach |

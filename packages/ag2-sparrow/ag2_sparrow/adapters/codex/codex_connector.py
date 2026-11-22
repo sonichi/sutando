@@ -11,7 +11,7 @@ which delivers into a thread owned by a running interactive TUI. Stdlib only.
 Tier policy is task_io.turn_policy's, from the attested headers only; this module maps its
 capabilities. A durable turn (the owner, and an attested collaborator) runs on the thread kept
 per channel_id (state/threads/<key>) in the configured cwd and sandbox; a restricted turn (any
-other non-owner, under --allow-non-owner) runs on its own ephemeral thread, read-only, in an
+other non-owner, unless --no-allow-non-owner) runs on its own ephemeral thread, read-only, in an
 empty temp dir. Every non-owner turn carries the shared NON_OWNER_NOTE; only the owner continues
 the owner's own conversation (--resume-thread, --push); a collaborator joins a channel's kept thread only
 when its file says it is shared, else it gets the channel's separate shared thread. A refused turn gets
@@ -547,12 +547,15 @@ def build_parser():
     ap.add_argument("--model", default=None)
     ap.add_argument("--sandbox", default=NON_OWNER_SANDBOX, choices=["read-only", "workspace-write", "danger-full-access"],
                     help="sandbox for owner and attested-collaborator threads; a restricted turn is always read-only")
-    ap.add_argument("--allow-non-owner", action="store_true",
-                    help="serve tasks from non-owner senders without collaborator access too (guests, and any "
-                         "collaborator claim the broker did not attest), each on its own ephemeral read-only "
-                         "thread in an empty temp dir. Off by default: they are refused with a plain line. An "
-                         "attested collaborator never needs it: it is served like the owner, on the room's kept "
-                         "thread with --cwd and --sandbox, framed by the non-owner note.")
+    no = ap.add_mutually_exclusive_group()
+    no.add_argument("--allow-non-owner", dest="allow_non_owner", action="store_true", default=True,
+                    help="serve tasks from non-owner senders without collaborator access too (guests, plain team, "
+                         "and any collaborator claim the broker did not attest), each on its own ephemeral "
+                         "read-only thread in an empty temp dir. The default; kept so older command lines still "
+                         "work. An attested collaborator never needs it: it is served like the owner, on the "
+                         "room's kept thread with --cwd and --sandbox, framed by the non-owner note.")
+    no.add_argument("--no-allow-non-owner", dest="allow_non_owner", action="store_false",
+                    help="refuse those senders with a plain line instead")
     ap.add_argument("--thread-id", default=None, metavar="CHANNEL_ID=THREAD",
                     help="resume THREAD for exactly this owner channel when it has no saved thread yet")
     ap.add_argument("--resume-thread", default=None, metavar="THREAD",

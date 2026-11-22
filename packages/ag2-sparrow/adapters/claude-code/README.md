@@ -203,8 +203,10 @@ gateway's delivery guard. The session holds the owner's history, tools and
 credentials with permission prompts off. A team or guest task without
 collaborator access (a guest, plain team, a wire `team` without the stamp, an
 unknown tier) gets a restricted turn under the shared policy, which must be
-isolated and read-only. Under `install --allow-non-owner` (persisted, shown by
-`verify`, off by default) `claim` runs it itself, as the routine and
+isolated and read-only. By default (`install --no-allow-non-owner` refuses it
+with the owner-only line instead, recorded as `ALLOW_NON_OWNER=0` and shown by
+`verify`; `--allow-non-owner` is still accepted and is the default, and an older
+install that recorded the key empty serves them too) `claim` runs it itself, as the routine and
 cloud-session adapters do (`collaborator_turn.py`), and never submits it to the
 session: one `claude -p --safe-mode --restricted --strict-mcp-config
 --no-session-persistence --tools Read,Grep,Glob` in a fresh empty directory

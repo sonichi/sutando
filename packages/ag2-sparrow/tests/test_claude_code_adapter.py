@@ -250,11 +250,12 @@ class FakeClaudeWrapper(unittest.TestCase):
 
 class InboxCli(ConnectBase):
     """The Mod's lifecycle verbs, each one CLI call under claims.lock, bound to the live consumer
-    generation, mirrored into the progress record under progress.lock."""
+    generation, mirrored into the progress record under progress.lock. Installed with --no-allow-non-owner,
+    so a restricted task takes the refusal path these verbs settle; IsolatedRestrictedTurn covers the default."""
 
     def setUp(self):
         super().setUp()
-        self.configure()
+        self.configure(ALLOW_NON_OWNER="0")
         self.assertEqual(inbox.prepare_root(str(self.work)), "")
         self.holder, self.consumer = hold_consumer(self.work)
         self.addCleanup(unhold, self.holder)
@@ -288,7 +289,7 @@ class InboxCli(ConnectBase):
         self.assertIn("malformed: no access_tier header", self.verb("claim", self.task("task-n2", None))[1]["refused"])
 
     def test_claim_takes_its_tier_from_the_shared_turn_policy(self):
-        self.configure(ALLOW_COLLABORATOR="1")
+        self.configure(ALLOW_COLLABORATOR="1", ALLOW_NON_OWNER="0")
         with mock.patch.object(task_io, "turn_policy", wraps=task_io.turn_policy) as gate:
             rc, out = self.verb("claim", self.task("task-c", "team", "collaborator: true\n"))
         self.assertEqual((rc, out["admission"]), (0, "collaborator"))
@@ -1815,7 +1816,7 @@ class IsolatedRestrictedTurn(ConnectBase):
     def setUp(self):
         super().setUp()
         self.stub = write_isolated_stub(self.home)
-        self.configure(ALLOW_NON_OWNER="1", CLAUDE=str(self.stub))
+        self.configure(CLAUDE=str(self.stub))      # no ALLOW_NON_OWNER recorded: served by default
         self.assertEqual(inbox.prepare_root(str(self.work)), "")
         self.holder, self.consumer = hold_consumer(self.work)
         self.addCleanup(unhold, self.holder)
@@ -1905,7 +1906,7 @@ class IsolatedRestrictedTurn(ConnectBase):
         self.assertEqual(len(isolated_runs(self.home)), 1)
 
     def test_the_owner_and_an_attested_collaborator_are_claimed_for_the_session_and_never_run_isolated(self):
-        self.configure(ALLOW_NON_OWNER="1", ALLOW_COLLABORATOR="1", CLAUDE=str(self.stub))
+        self.configure(ALLOW_COLLABORATOR="1", CLAUDE=str(self.stub))
         rc, out = self.verb("claim", self.task("task-o", "access_tier: owner\n"))
         self.assertEqual((rc, json.loads(out)["admission"]), (0, "owner"))
         rc, out = self.verb("claim", self.envelope("team-collaborator.txt", "task-c"))
@@ -1913,12 +1914,17 @@ class IsolatedRestrictedTurn(ConnectBase):
         self.assertEqual(isolated_runs(self.home), [], "neither reaches the isolated turn")
         self.assertFalse((self.results / "task-o.txt").exists()); self.assertFalse((self.results / "task-c.txt").exists())
 
-    def test_without_allow_non_owner_a_restricted_task_is_refused_and_nothing_runs(self):
-        self.configure(CLAUDE=str(self.stub))
+    def test_served_by_default_and_under_the_older_flag_refused_under_no_allow_non_owner(self):
+        for i, recorded in enumerate(("1", "")):        # --allow-non-owner, and an older install's empty value
+            self.configure(ALLOW_NON_OWNER=recorded, CLAUDE=str(self.stub))
+            t = self.task("task-on%d" % i, "access_tier: guest\n")
+            raw = self.verb("claim", t)
+            self.assert_isolated(t, isolated_runs(self.home)[-1], raw)
+        self.configure(ALLOW_NON_OWNER="0", CLAUDE=str(self.stub))
         rc, out = self.verb("claim", self.task("task-g", "access_tier: guest\n"))
         self.assertEqual((rc, "--allow-non-owner is off" in json.loads(out)["refused"]), (1, True), out)
         self.assertEqual((self.results / "task-g.txt").read_text(), task_io.NON_OWNER_REFUSED)
-        self.assertEqual(isolated_runs(self.home), [])
+        self.assertEqual(len(isolated_runs(self.home)), 2, "the opt-out runs no turn")
 
     def test_a_failed_turn_a_skip_a_marker_and_the_hourly_cap(self):
         reply = self.home / "isolated-reply"
@@ -1941,10 +1947,10 @@ class IsolatedRestrictedTurn(ConnectBase):
         self.assertIn("hourly cap", json.loads(out)["refused"])
 
     def test_a_missing_cli_answers_the_failure_line_and_a_recovery_that_answered_first_wins(self):
-        self.configure(ALLOW_NON_OWNER="1", CLAUDE=str(self.home / "no-such-claude"))
+        self.configure(CLAUDE=str(self.home / "no-such-claude"))
         rc, out = self.verb("claim", self.task("task-nc", "access_tier: guest\n"))
         self.assertEqual((rc, (self.results / "task-nc.txt").read_text()), (1, inbox.ISOLATED_FAILED), out)
-        self.configure(ALLOW_NON_OWNER="1", CLAUDE=str(self.stub))
+        self.configure(CLAUDE=str(self.stub))
         t = self.task("task-r", "access_tier: guest\n")
         real = inbox.isolated_answer
 
