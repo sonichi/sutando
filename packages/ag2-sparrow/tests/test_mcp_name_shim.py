@@ -272,7 +272,7 @@ class ShimTest(unittest.TestCase):
                 Path(server).write_text(FAKE_SERVER)
                 shim.main([sys.executable, server, json.dumps(["room.list", "ui_request"])], stdout=io.StringIO(),
                           stdin=io.StringIO(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n"))
-                self.assertEqual(json.loads(Path(status).read_text()), {"state": "listed", "tools": 2, "turn": "t1"})
+                self.assertEqual(json.loads(Path(status).read_text()), {"state": "listed", "tools": 2, "granted": 2, "turn": "t1"})
         shim.Status({}).write(state="started")   # no status path: nothing written, nothing raised
 
     def test_no_command_is_a_usage_error_and_the_module_runs_as_a_script(self):

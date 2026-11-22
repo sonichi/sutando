@@ -65,9 +65,9 @@ class Status:
                 json.dump(dict(fields, turn=self.turn), f)
             os.replace(tmp, self.path)
 
-    def tools(self, count):
+    def tools(self, count, granted=None):
         self.listed = True
-        self.write(state="listed", tools=count)
+        self.write(state="listed", tools=count, **({} if granted is None else {"granted": granted}))
 
     def exited(self, code):
         if not self.listed:
@@ -210,7 +210,7 @@ def to_client(line, names, pending, status=None):
                 names.rename_tools(tools)
                 changed = True
                 if status is not None:
-                    status.tools(len(tools))
+                    status.tools(len(tools), len(names.allowed))
     return json.dumps(msg) + "\n" if changed else line
 
 
@@ -233,6 +233,9 @@ def main(argv=None, stdin=None, stdout=None, popen=subprocess.Popen):
         status.exited(127)
         return 127
     names, pending, out_lock = Names(granted()), set(), threading.Lock()
+    if TOOLS_ENV not in os.environ:
+        note("no tool grant (%s unset), so no tool is listed: the launcher predates this shim; restart the agent"
+             % TOOLS_ENV)
 
     def pump_out():
         for line in child.stdout:

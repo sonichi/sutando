@@ -1153,6 +1153,11 @@ class SspaceToolsTest(unittest.TestCase):
 PROXY = "/app/node /app/ag2-mcp-proxy.mjs"
 
 
+def shim_alias(name):
+    from ag2_sparrow import mcp_name_shim
+    return mcp_name_shim.alias(name)
+
+
 class SspaceStdioTest(unittest.TestCase):
     """agy 1.5.13 declares no HTTP MCP: the tools then go over stdio, through the desktop's ag2-mcp-proxy."""
 
@@ -1300,6 +1305,43 @@ class SspaceStdioTest(unittest.TestCase):
         self.assertEqual([r["tools"] for r in self.w.records() if "mcp_launch" in r], [["room_action_execute"]],
                          "the shim lists only the granted tools")
         self.assertEqual(self.w.metrics()[0]["sspace_tools_down"], "")
+
+    def test_an_owner_turn_through_the_real_launch_path_sees_every_owner_tool_of_the_real_list(self):
+        # The 23 tools AG2 Space's MCP server lists through the desktop proxy (read live, 2026-11-22), dotted as served.
+        served = ["ag2.whoami", "agent.link", "agent.setup.steps", "agent.unlink", "approval.inspect",
+                  "events.subscriptions.list", "operation.inspect", "relay.token.issue", "room.action.execute",
+                  "room.action.execute_safe", "room.action.read", "room.actions.describe", "room.actions.search",
+                  "room.inspect", "room.list", "room.task.create", "room.task.list", "room.task.update",
+                  "space.action.execute", "space.action.read", "ui_describe", "ui_request", "ui_result"]
+        (self.w.home / "launch-mcp").write_text("")
+        server = Path(self.tmp.name) / "real-list-proxy.py"
+        schema = {"type": "object", "properties": {"x" * 40: {"type": "string", "description": "y" * 4000}}}
+        server.write_text("import json, sys\nfor line in sys.stdin:\n    m = json.loads(line)\n"
+                          "    print(json.dumps({'jsonrpc': '2.0', 'id': m['id'], 'result': {'tools': ["
+                          "{'name': n, 'inputSchema': %r} for n in %r]}}), flush=True)\n" % (schema, served))
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.serve(proxy=shlex.join([sys.executable, str(server)]))
+        [seen] = [r["tools"] for r in self.w.records() if "mcp_launch" in r]
+        self.assertEqual(sorted(seen), sorted(shim_alias(n) for n in gc.mcp_auth.OWNER_TOOLS))
+        self.assertEqual(json.loads(self.status_file().read_text())["granted"], len(gc.mcp_auth.OWNER_TOOLS))
+        self.assertEqual(self.w.result("task-1"), "hello from agy-stub\n")
+
+    def test_a_launcher_without_a_grant_lists_nothing_and_says_why_in_the_log(self):
+        state = Path(self.tmp.name) / "old"
+        state.mkdir()
+        launcher = state / "ag2-mcp-shim"   # as a connector older than the shim writes it: no AG2_MCP_SHIM_TOOLS
+        launcher.write_text(gc.Path(gc.write_launcher(str(state))).read_text().replace("AG2_MCP_SHIM_TOOLS='' ", ""))
+        server = Path(self.tmp.name) / "server.py"
+        server.write_text("import json, sys\nfor line in sys.stdin:\n    m = json.loads(line)\n"
+                          "    print(json.dumps({'jsonrpc': '2.0', 'id': m['id'], 'result': {'tools': ["
+                          "{'name': 'room.list'}]}}), flush=True)\n")
+        log = state / "proxy.log"
+        r = gc.subprocess.run([str(launcher), sys.executable, str(server)], capture_output=True, text=True, timeout=60,
+                              input=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n",
+                              env={"AG2_MCP_LOG": str(log)}, cwd="/")
+        self.assertEqual(json.loads(r.stdout)["result"]["tools"], [])
+        self.assertIn("no tool grant (AG2_MCP_SHIM_TOOLS unset)", log.read_text())
+        self.assertEqual(json.loads((state / gc.STATUS_NAME).read_text())["granted"], 0)
 
     def test_a_launch_that_failed_says_so_in_fixed_words_even_after_a_stale_success(self):
         self.launched()
