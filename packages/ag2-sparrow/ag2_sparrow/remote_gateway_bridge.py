@@ -3145,6 +3145,8 @@ diagnostics.register_secret(HS_MEDIA_TOKEN)
 HS_MEDIA_ORIGIN = (os.environ.get("REMOTE_MEDIA_HS_ORIGIN") or "").rstrip("/")
 MEDIA_DIR = Path(os.environ.get("REMOTE_MEDIA_DIR") or str(_STATE / "remote-media"))
 MAX_MEDIA_BYTES = int(os.environ.get("REMOTE_MEDIA_MAX_BYTES") or str(25 * 1024 * 1024))
+# How many markers one task may make us download (its own and the replied-to message's together).
+MAX_MEDIA_PER_TASK = 10
 _EXT_BY_MIME = {
     "image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
     "image/gif": ".gif", "image/webp": ".webp", "image/svg+xml": ".svg",
@@ -6075,21 +6077,12 @@ def _download_bytes(url: str, headers: dict, cap: int) -> bytes:
     return data
 
 
-def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
-    """If `body` carries a media marker, download the attachment to a local
-    file and rewrite the marker to `[File attached: <path>]`. Returns the body
-    unchanged on any failure (drop-in safe).
-
-    When `_refs_out` is provided and a fetch succeeds, the corresponding
-    `AttachmentRef` (interaction-model 4D, step 1.5) is appended to it — so
-    _write_task can stamp structured `attachments:` headers alongside the legacy
-    body line, without disturbing any of the drop-in-safe early returns."""
-    m = MEDIA_MARKER_RE.search(body or "")
-    if not m:
-        return body
-    inner = m.group(1).strip()
+def _fetch_media_marker(inner: str) -> "tuple[str, Path, object] | None":
+    """Download the attachment one marker's inner text names; (label, local path,
+    AttachmentRef) on success, None on any failure (the caller leaves the marker)."""
+    inner = inner.strip()
     if not inner:
-        return body
+        return None
     parts = inner.split(None, 1)
     url = parts[0]
     attrs = parts[1] if len(parts) > 1 else ""
@@ -6098,7 +6091,7 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
     kind = _marker_attr(attrs, "kind")
 
     if not url.startswith(("https://", "http://")):
-        return body
+        return None
     headers = {"User-Agent": "sutando-gateway-client/1.0"}
     # Credential routing is by PARSED exact origin, never string prefix or
     # substring — `https://relay.example.evil/...` must not receive the
@@ -6107,12 +6100,12 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
         _ = _split.port                    # raises ValueError on a malformed port
         url_path = _split.path
     except ValueError:
-        return body                        # unparseable URL — leave marker untouched
+        return None                        # unparseable URL — leave marker untouched
     if _under_gateway(url):
         headers["Authorization"] = f"Bearer {TOKEN}"            # gateway media-proxy
     elif url_path.startswith("/_matrix/"):
         if not HS_MEDIA_TOKEN or not HS_MEDIA_ORIGIN or not _same_origin(url, HS_MEDIA_ORIGIN):
-            return body                    # can't auth safely — leave marker
+            return None                    # can't auth safely — leave marker
         url = _to_authed_media_url(url)
         headers["Authorization"] = f"Bearer {HS_MEDIA_TOKEN}"
     # else: a plain public URL — fetched with no credentials.
@@ -6121,7 +6114,7 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
         data = _download_bytes(url, headers, MAX_MEDIA_BYTES)
     except Exception as e:  # noqa: BLE001 — drop-in safe
         _log(f"media fetch failed ({diagnostics.describe(e)}) — leaving marker as-is")
-        return body
+        return None
     try:
         MEDIA_DIR.mkdir(parents=True, exist_ok=True)
         ext = _EXT_BY_MIME.get(mime.lower(), "")
@@ -6138,15 +6131,63 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
         path = Path(path_str)
     except Exception as e:  # noqa: BLE001
         _log(f"media save failed ({diagnostics.describe(e)}) — leaving marker as-is")
-        return body
+        return None
     _log(f"fetched media → {path} ({len(data)} bytes)")
+    ref = local_task_protocol.AttachmentRef(
+        locator=str(path), mime=mime, filename=(name or path.name), size=len(data))
+    return ("Photo attached" if str(kind) == "m.image" else "File attached"), path, ref
+
+
+def _json_string_text(raw: str) -> str:
+    """The text a run of JSON string content encodes (`\\/` → `/`); raw when it is not one."""
+    try:
+        return json.loads(f'"{raw}"')
+    except ValueError:
+        return raw
+
+
+def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
+    """Download every media marker in `body` (up to MAX_MEDIA_PER_TASK) to a local
+    file and rewrite each to `[File attached: <path>]` (`[Photo attached: …]` for an
+    image). A marker inside the broker's quoted reply-context record is the replied-to
+    message's: it is fetched the same way, rewritten in place to
+    `[… attached (from replied-to message): <path>]` (JSON-escaped, so the record stays
+    well-formed quoted data) and listed after the message's own. A marker that cannot
+    be fetched is left as it was (drop-in safe).
+
+    When `_refs_out` is provided, each fetched file's `AttachmentRef`
+    (interaction-model 4D, step 1.5) is appended to it — so _write_task can stamp
+    structured `attachments:` headers alongside the legacy body lines."""
+    if not body or not MEDIA_MARKER_RE.search(body):
+        return body
+    reply, rest = local_task_protocol.split_reply_context(body)
+    split = len(body) - len(rest) if reply is not None else 0
+    budget = [MAX_MEDIA_PER_TASK]
+
+    def resolve(segment: str, quoted: bool, refs: list) -> str:
+        def one(m: "re.Match") -> str:
+            if budget[0] <= 0:
+                return m.group(0)
+            got = _fetch_media_marker(_json_string_text(m.group(1)) if quoted else m.group(1))
+            if got is None:
+                return m.group(0)
+            budget[0] -= 1
+            label, path, ref = got
+            refs.append(ref)
+            if quoted:
+                return json.dumps(f"[{label} (from replied-to message): {path}]")[1:-1]
+            return f"[{label}: {path}]"
+        # Replacement as a FUNCTION so backslashes/`\g<>` in the path can never be
+        # interpreted as re.sub group references.
+        return MEDIA_MARKER_RE.sub(one, segment)
+
+    own_refs: list = []
+    replied_refs: list = []
+    tail = resolve(body[split:], False, own_refs)      # the message's own first
+    head = resolve(body[:split], True, replied_refs)
     if _refs_out is not None:
-        _refs_out.append(local_task_protocol.AttachmentRef(
-            locator=str(path), mime=mime, filename=(name or path.name), size=len(data)))
-    label = "Photo attached" if str(kind) == "m.image" else "File attached"
-    # Replacement as a FUNCTION so backslashes/`\g<>` in the path can never be
-    # interpreted as re.sub group references.
-    return MEDIA_MARKER_RE.sub(lambda _m: f"[{label}: {path}]", body, count=1)
+        _refs_out.extend(own_refs + replied_refs)
+    return head + tail
 
 
 # Fleet-agent directory cache — peer agents (in the broker's /v1/agents) are
