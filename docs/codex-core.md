@@ -501,6 +501,14 @@ No notifier session (`<session>-watcher`) and no observer session (`<session>-ob
 started for a seat; the seat runs the standby task watcher as its own child
 (`SUTANDO_SEAT_WATCHER=0` leaves it out, and the seat then only polls).
 
+The core seat runs a task only once that watcher has announced it. The watcher gives each task
+to the core's task-event handler first (the pool's router, a required Team handler), and its
+`TASK_FILE:` line is what says the task is the core's; a task file that has only just landed is
+not, since its worker sentinel can be written a moment later. With no watcher running, a
+workspace that declares a handler (`state/task-event-handler.json`) gives the core nothing and
+the seat says so once; one that declares none has nothing to route, and the core polls as before.
+A worker seat's inbox is already the routing decision and is read directly.
+
 The terminal panel shows the seat's log: one line per task, turn, command and tool call. The
 same lines go to `<workspace>/logs/codex-seat.log` (a worker: `codex-seat-<session>.log`).
 
