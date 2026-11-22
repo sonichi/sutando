@@ -92,6 +92,34 @@ class TestHookClearVoidsAPaneGuess(unittest.TestCase):
         self.assertEqual(state(SLASH_MENU, base="unknown", hook=CLEAR)[0], "idle-ready")
 
 
+class TestMenuGateUnderAClear(unittest.TestCase):
+    """Gate text under a completion-menu row is sent to a human on purpose; a recent unrelated
+    clear must not void it, and nothing may type at it."""
+
+    ROW = "plus optional rule tweaks\n"
+
+    def panes(self):
+        for hint in ("Press Enter to continue", "Do you want to proceed? Enter to confirm"):
+            yield hint, SLASH_MENU.replace(self.ROW, self.ROW + " " * 41 + hint + "\n", 1)
+        block = " " * 41 + "Do you want to proceed?\n" + " " * 41 + "Enter to confirm · Esc to cancel\n"
+        yield "split", SLASH_MENU.replace(self.ROW, self.ROW + block, 1)
+
+    def test_it_alerts_under_an_unrelated_clear_and_no_key_is_sent(self):
+        for label, pane in self.panes():
+            with self.subTest(label):
+                self.assertNotEqual(pane, SLASH_MENU)
+                self.assertEqual(_mod.classify(pane)[0], "unknown")
+                self.assertTrue(_mod.slash_menu_gate_rows(*_mod._live_tails(pane, pane), _mod.CLAUDE))
+                st, _d, prompt, kind = _mod.compose_state(pane, "idle", True, styled_pane=pane, hook=CLEAR)
+                self.assertEqual(st, "blocked-human")
+                self.assertIsNone(_mod.answer_step(st, kind, prompt, None))
+                self.assertIsNone(_mod.auto_answer(kind))
+
+    def test_the_menu_alone_stays_quiet_under_a_clear(self):
+        self.assertFalse(_mod.slash_menu_gate_rows(*_mod._live_tails(SLASH_MENU, SLASH_MENU), _mod.CLAUDE))
+        self.assertNotEqual(state(SLASH_MENU, hook=CLEAR, styled_pane=SLASH_MENU)[0], "blocked-human")
+
+
 class TestScreensHooksNeverReport(unittest.TestCase):
     def test_a_login_menu_stands_under_a_clear(self):
         self.assertEqual(state(LOGIN_MENU, hook=CLEAR)[3], "login")

@@ -247,13 +247,9 @@ def auto_answer(kind):
     return _AUTO_ANSWER.get(kind)
 
 
-def classify(pane: str, styled_pane: "str | None" = None):
-    """Return (kind, excerpt) if the pane is awaiting user input, else None.
-
-    `styled_pane` supplies placeholder evidence to the shared filter. It must be
-    the SAME capture as `pane` (e.g. `pane = _ANSI_SGR.sub("", styled_pane)`),
-    so stripping never shifts a line out of the window the two share.
-    Only rows below the last turn spinner / completion line are read (pane_gate.live_tail)."""
+def _live_tails(pane: str, styled_pane: "str | None" = None):
+    """(plain, styled) text of the rows `classify()` reads: the last 14 non-empty rows below
+    the last turn spinner or completion line, the styled one from the same capture."""
     plain_lines = pane.splitlines()
     kept = [i for i, ln in enumerate(plain_lines) if ln.strip()][-14:]
     kept = kept[len(kept) - len(live_tail([plain_lines[i] for i in kept])):]
@@ -262,6 +258,17 @@ def classify(pane: str, styled_pane: "str | None" = None):
     styled_tail = ("\n".join(styled_lines[i] for i in kept)
                    if styled_lines is not None and kept and max(kept) < len(styled_lines)
                    else tail)
+    return tail, styled_tail
+
+
+def classify(pane: str, styled_pane: "str | None" = None):
+    """Return (kind, excerpt) if the pane is awaiting user input, else None.
+
+    `styled_pane` supplies placeholder evidence to the shared filter. It must be
+    the SAME capture as `pane` (e.g. `pane = _ANSI_SGR.sub("", styled_pane)`),
+    so stripping never shifts a line out of the window the two share.
+    Only rows below the last turn spinner / completion line are read (pane_gate.live_tail)."""
+    tail, styled_tail = _live_tails(pane, styled_pane)
     menu_gates = slash_menu_gate_rows(tail, styled_tail, CLAUDE)
     tail = gate_evidence(tail, styled_tail, CLAUDE)
     if not _AWAIT_HINT.search(tail):
@@ -296,9 +303,11 @@ def _ambiguous_gate(kind: str, excerpt: str) -> bool:
 
 def _live_gate(pane: str, styled_pane: "str | None" = None, hook=None):
     """`classify()`, less a guess the CLI's hooks have just said is not a dialog. A gate the
-    screen names (signature and key hint) stands whatever the hooks say."""
+    screen names (signature and key hint) stands whatever the hooks say, and so does gate text
+    under a completion-menu row, which classify() sends to a human on purpose."""
     hit = classify(pane, styled_pane)
-    if hit and hook and hook[0] == core_block_signal.CLEAR and _ambiguous_gate(*hit):
+    if hit and hook and hook[0] == core_block_signal.CLEAR and _ambiguous_gate(*hit) \
+            and not slash_menu_gate_rows(*_live_tails(pane, styled_pane), CLAUDE):
         return None
     return hit
 
