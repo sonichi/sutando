@@ -727,7 +727,7 @@ class ModelCardTest(unittest.TestCase):
                          (self.DM, "error", "I could not switch to Stub Broken. I'm still using Stub Model. Send /model "
                                             "to try again."))
         self.assertEqual(self.state()["wanted"], "")
-        self.assertIn("model=gpt-5.6-sol", self.serve("task-4", "again"), "the next turn is on the model in use before")
+        self.assertNotIn("model=", self.serve("task-4", "again"), "no pick of the owner's took: Codex's own model")
 
     def test_a_turn_codex_moved_to_another_model_is_not_called_switched(self):
         self.pick("Stub Moved")
@@ -849,12 +849,62 @@ class ModelCardTest(unittest.TestCase):
             c, _ = self.connector()
             self.assertEqual(c.models.tell(True, "gpt-5.6-sol"), "untold")
         self.assertEqual((self.state()["wanted"], self.state()["current"]), ("", "gpt-5.6-sol"), "the refused pick is dropped")
-        self.assertIn("model=gpt-5.6-sol", self.serve("task-3", "hello"), "the refused switch is not asked for again")
+        self.assertNotIn("model=", self.serve("task-3", "hello"), "the refused switch is not asked for again")
         ((_, card),) = self.posted("$card3")
         self.assertEqual((card["state"], metrics(self.work)[-1]["model_switch"]), ("error", "not-switched"))
         self.assertIn("I could not switch to Stub Broken. I'm still using Stub Model.", card["text"])
         self.serve("task-4", "again")
         self.assertEqual((self.posted(), self.state().get("untold")), ([], None), "told once")
+
+
+    def test_a_model_codex_moved_the_turn_to_is_never_taken_for_the_owners_pick(self):
+        self.pick("Stub Moved")
+        self.posted("$card2")
+        self.serve("task-3", "hello")                   # Codex moves it to its default
+        self.posted("$card3")
+        self.assertEqual((self.state()["current"], self.state().get("confirmed")), ("gpt-5.6-sol", None))
+        self.assertNotIn("model=", self.serve("task-4", "again"), "the model Codex moved to is not pinned")
+        # After a pick that took, a moved one leaves that pick in use, not where Codex moved the turn.
+        self.pick("Stub Large", "$card5")
+        self.posted("$card6")
+        self.serve("task-on-large", "hello")
+        self.posted("$card7")
+        self.pick("Stub Moved", "$card8")
+        self.posted("$card9")
+        self.serve("task-moved", "hello")
+        ((_, card),) = self.posted("$card10")
+        self.assertIn("I'm still using Stub Large.", card["text"])
+        self.assertEqual(self.state()["current"], "gpt-6-sol")
+        self.assertIn("model=gpt-6-sol", self.serve("task-after", "again"))
+
+    def test_a_name_with_a_newline_is_one_line_and_a_card_that_cannot_be_built_is_said_in_words_once(self):
+        c, _ = self.connector()
+        c.models.seen([("gpt-5.5", "Five\nPoint  Five"), ("gpt-5.2", " \n ")], "gpt-5.5")
+        self.assertEqual([m["name"] for m in c.models.state()["available"]], ["Five Point Five", "gpt-5.2"])
+        # A ledger written before that (or a name the card rules refuse) never raises out of a turn.
+        (self.work / "state" / "model.json").write_text(json.dumps({
+            "available": [{"id": "gpt-5.6-sol", "name": "Stub Model"}, {"id": "gpt-6-sol", "name": "Stub\nLarge"}],
+            "current": "gpt-5.6-sol", "wanted": "gpt-6-sol", "asked_in": self.DM, "told": ""}))
+        text = self.serve("task-1", "hello")
+        self.assertIn("model=gpt-6-sol", text)
+        self.assertIn("Switched. I'm now using Stub", text, "the outcome, in words")
+        self.assertEqual((self.posted(), metrics(self.work)[-1]["model_switch"]), ([], "switched"))
+        self.assertIn("task-1", (self.work / "state" / "done").read_text(), "answered, so the turn is not run again")
+        self.assertNotIn("Switched", self.serve("task-2", "again"), "said once")
+        # A pick whose card cannot be built is answered in words.
+        self.dm("task-3", "/model stub 5")
+        with mock.patch.object(model_switch.ModelSwitch, "card", side_effect=ValueError("bad name")):
+            c, listed = self.connector([{"id": "gpt-5.6-terra", "displayName": "Stub 5"}])
+            with listed:
+                self.assertEqual(c.models.card_task(str(self.work / "tasks" / "task-3.txt"), str(self.work / "o.txt")),
+                                 "model-picked")
+        self.assertIn("Switching to Stub 5 on your next message", (self.work / "o.txt").read_text())
+        # An owed outcome that cannot be built is said in words once, then dropped.
+        c.models.save(untold={"picked": "gpt-5.6-terra", "ran": "", "room": self.DM})
+        with mock.patch.object(model_switch.ModelSwitch, "card", side_effect=ValueError("bad name")):
+            self.assertEqual(c.models.tell(True, ""), "not-switched")
+        self.assertIn("I could not switch to Stub 5", c.models.unsaid())
+        self.assertEqual((c.models.state().get("untold"), c.models.unsaid()), (None, ""))
 
 
 class FakeRpc:

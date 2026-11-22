@@ -54,6 +54,12 @@ class ModelSwitch:
         self.state_dir, self.root, self.bridge_state, self.name = state_dir, root, bridge_state, name
         self.publish, self.quoted, self.log, self.refresh = publish, quoted, log, refresh
         self.allowed = None if allowed is None else frozenset(allowed)
+        self._unsaid = ""
+
+    def unsaid(self) -> str:
+        """An outcome whose card could not be built, in words, for the connector to add to its answer."""
+        words, self._unsaid = self._unsaid, ""
+        return words
 
     def ok(self, mid) -> bool:
         return bool(mid) and (self.allowed is None or mid in self.allowed)
@@ -88,34 +94,34 @@ class ModelSwitch:
 
     def seen(self, offered, current):
         """Remember what the runtime offers: `offered` is (id, name) pairs, `current` the id in use."""
-        seen = {"available": [{"id": str(mid)[:200], "name": str(name or mid)[:80]} for mid, name in offered
-                              if self.ok(mid)],
+        # A name is one line: a newline or other run of whitespace would make the card refuse it.
+        seen = {"available": [{"id": str(mid)[:200], "name": " ".join(str(name or mid).split())[:80] or str(mid)[:80]}
+                              for mid, name in offered if self.ok(mid)],
                 "current": str(current or "")[:200]}
         if {k: self.state().get(k) for k in seen} != seen:
             self.save(**seen)
+
+    def words(self, state: dict, picked: str = "", ran: "str | None" = None, same: bool = False) -> str:
+        return self.parts(state, picked, ran, same)[2]
+
+    def built(self, state: dict, picked: str = "", ran: "str | None" = None, same: bool = False):
+        """The card, or None when the card rules refuse it: the outcome is then said in words."""
+        try:
+            return self.card(state, picked, ran, same)
+        except ValueError as e:
+            self.log("model card not built:", str(e)[:200])
+            return None
 
     def card(self, state: dict, picked: str = "", ran: "str | None" = None, same: bool = False):
         """(body, card): one reply button per model offered. After a pick (`picked`) the card has no
         buttons: it says the switch is coming, then, with `ran` (the model the next turn ran on), that
         it happened or that it did not; with `same`, that the pick is the model already in use."""
         agent_card, _ = connector_cards._core()
+        if picked:
+            kind, body, text, status = self.parts(state, picked, ran, same)
+            return agent_card.build(CARD, kind, title="Model", body=body, text=text, **({"status": status} if status else {}))
         names = {m["id"]: m["name"] for m in self.offered(state)}
         now, coming = state.get("current") or "", self.pending(state)
-        if picked:
-            name = names.get(picked, picked)
-            if same:
-                return agent_card.build(CARD, "done", title="Model", body="Model: already %s" % name,
-                                        text="I'm already using %s. Nothing changed." % name)
-            if ran is None:
-                return agent_card.build(CARD, "info", title="Model", body="Model: switching to %s" % name,
-                                        text="Switching to %s on your next message. I'll confirm here once it has "
-                                             "switched." % name)
-            if ran == picked:
-                return agent_card.build(CARD, "done", title="Model", body="Model: now %s" % name,
-                                        status="Switched", text="Switched. I'm now using %s." % name)
-            return agent_card.build(CARD, "error", title="Model", body="Model: could not switch to %s" % name,
-                                    text="I could not switch to %s. I'm still using %s. Send /model to try again."
-                                         % (name, names.get(ran, ran or "my default model")))
         buttons = [agent_card.button(name, "reply", reply="Use %s" % name,
                                      command=agent_card.reply("model", "agent", model_verb(mid)))
                    for mid, name in list(names.items())[:BUTTONS]]
@@ -128,6 +134,21 @@ class ModelSwitch:
         return agent_card.build(CARD, "pending", title="Model", body="Pick a model for %s" % self.name,
                                 text=text, buttons=buttons)
 
+    def parts(self, state, picked, ran, same):
+        """(kind, body, text, status) of the card after a pick."""
+        names = {m["id"]: m["name"] for m in self.offered(state)}
+        name = names.get(picked, picked)
+        if same:
+            return "done", "Model: already %s" % name, "I'm already using %s. Nothing changed." % name, ""
+        if ran is None:
+            return ("info", "Model: switching to %s" % name,
+                    "Switching to %s on your next message. I'll confirm here once it has switched." % name, "")
+        if ran == picked:
+            return "done", "Model: now %s" % name, "Switched. I'm now using %s." % name, "Switched"
+        return ("error", "Model: could not switch to %s" % name,
+                "I could not switch to %s. I'm still using %s. Send /model to try again."
+                % (name, names.get(ran, ran or "my default model")), "")
+
     def usable(self) -> bool:
         """Whether a card can reach the room: the agent's own bridge keeps a state dir (made at install).
         Without one (a bridge run elsewhere, a bare connector) nothing would post what is queued."""
@@ -138,7 +159,7 @@ class ModelSwitch:
         the ask is then answered in words, never left to raise and be retried."""
         try:
             return self.card(state)
-        except ValueError as e:
+        except ValueError as e:  # a name the card rules refuse
             self.log("model card not built:", str(e)[:200])
             return None
 
@@ -198,8 +219,10 @@ class ModelSwitch:
             outcome = "model-pending" if self.pending(state) == picked else "model-same"
         else:
             self.save(wanted=picked, asked_in=room, told="")
-        card = self.card(state, picked=picked, same=outcome == "model-same")
-        self.publish(result_file, ANSWERED if self.post(room, card) else self.quoted(card[1]["text"]) + "\n")
+        same = outcome == "model-same"
+        card = self.built(state, picked=picked, same=same)
+        self.publish(result_file, ANSWERED if self.post(room, card)
+                     else self.quoted(self.words(state, picked=picked, same=same)) + "\n")
         return outcome
 
     def offer(self, sent, result_file) -> str:
@@ -236,8 +259,11 @@ class ModelSwitch:
         state = self.state()
         owed = state.get("untold") if isinstance(state.get("untold"), dict) else None
         if owed:
-            card = self.card(state, picked=str(owed.get("picked") or ""), ran=str(owed.get("ran") or ""))
-            if not self.post(owed.get("room"), card):
+            told = {"picked": str(owed.get("picked") or ""), "ran": str(owed.get("ran") or "")}
+            card = self.built(state, **told)
+            if card is None:        # never buildable: said in words once, not retried
+                self._unsaid = self.words(state, **told)
+            elif not self.post(owed.get("room"), card):
                 return "untold"
             self.save(untold=None)
             return "switched" if owed.get("picked") == owed.get("ran") else "not-switched"
@@ -245,11 +271,14 @@ class ModelSwitch:
         if not wanted or state.get("told") == wanted or not live:
             return ""
         switched, ran = ran == wanted, ran or ""
-        queued = self.post(state.get("asked_in"), self.card(state, picked=wanted, ran=ran))
-        # The state is settled at once; only an outcome whose card could not be queued is kept, to tell later.
-        self.save(told=wanted, current=ran or state.get("current") or "",
-                  untold=None if queued else {"picked": wanted, "ran": ran, "room": state.get("asked_in")},
-                  **({} if switched else {"wanted": ""}))
+        card = self.built(state, picked=wanted, ran=ran)
+        if card is None:
+            self._unsaid = self.words(state, picked=wanted, ran=ran)
+        queued = card is None or self.post(state.get("asked_in"), card)
+        # Settled at once. Only a confirmed pick becomes the model in use: a model the runtime moved the turn
+        # to was never picked. An outcome whose card could not be queued is kept, to tell later.
+        self.save(told=wanted, **({"current": wanted, "confirmed": wanted} if switched else {"wanted": ""}),
+                  untold=None if queued else {"picked": wanted, "ran": ran, "room": state.get("asked_in")})
         if not queued:
             return "untold"
         return "switched" if switched else "not-switched"

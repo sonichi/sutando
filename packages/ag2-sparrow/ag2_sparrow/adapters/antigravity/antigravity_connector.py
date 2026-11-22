@@ -281,7 +281,8 @@ class Connector:
         told = self.models.tell(turn.live, turn.model) if tier == "owner" else ""
         asked = self.models.asked(headers.get("access_tier"), path, status, text, result_file)
         if not asked:
-            publish(result_file, self.answer_body(headers, status, text, detail, turn))
+            unsaid = quoted(self.models.unsaid()).strip()
+            publish(result_file, self.answer_body(headers, status, text, detail, turn) + (unsaid and unsaid + "\n"))
         return {"task": task_id, "status": status, "detail": detail[:200], "event_type": event,
                 "tier": headers["access_tier"], "isolated": tier != "owner", "turn_s": round(time.time() - t0, 3),
                 "permissions": turn.decisions, "updates": dict(turn.updates), "answer_chars": len(text or ""),
