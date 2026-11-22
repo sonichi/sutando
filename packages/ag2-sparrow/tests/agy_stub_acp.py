@@ -8,7 +8,7 @@ has been measured yet. Its sign-in, session
 and log files live under $HOME (the one variable the launcher's allowlist always passes): `signed-in` marks it
 signed in, `stub-sessions.json` keeps its sessions, `stub.log` records each request and permission outcome.
 A prompt marker picks the turn: STUB:TEXT, STUB:NOREPLY, STUB:MARKER, STUB:EDIT, STUB:SHELL, STUB:WEB,
-STUB:AGYWRITE, STUB:ODD, STUB:HANG, STUB:MEDIA (asks to read every attachment it is told of, and to change one),
+STUB:AGYWRITE, STUB:READ, STUB:ODD, STUB:HANG, STUB:MEDIA (asks to read every attachment it is told of, and to change one),
 STUB:CHANNEL, STUB:ATTACH. STUB:AGYWRITE's rawInput carries agy's own argument names (Path, Content,
 Overwrite; Target, Replacement, Edits) as its file tools declare them; the key order (Content first) is the one
 a real owner turn's refusal named ("unrecognised key Content").
@@ -175,6 +175,14 @@ def prompt(rid, params):
         ask(sid, {"title": "File notes.txt (unknown key)", "kind": "edit",
                   "rawInput": {"Content": "x", "Path": inside, "Mystery": "?"}})
         chunk(sid, "wrote")
+    elif "STUB:READ" in text:
+        # Asks to read each copy the prompt lists ("- /path" lines), then each path written after the marker.
+        paths = re.findall(r"^- (/\S+)$", text, re.M) + re.search(r"STUB:READ((?: /\S+)*)", text).group(1).split()
+        for path in paths:
+            if ask(sid, {"title": "Read " + path, "kind": "read", "locations": [{"path": path}]}):
+                with open(path, encoding="utf-8") as f:
+                    chunk(sid, "read %s: %s\n" % (os.path.basename(path), f.read()))
+        chunk(sid, "done reading")
     elif "STUB:ODD" in text:
         for kind in ("delete", "move", "other", "think", None):
             ask(sid, {"title": "odd %s" % kind, "kind": kind, "locations": [{"path": os.path.join(cwd, "a")}]})
