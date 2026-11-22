@@ -7,8 +7,10 @@ were not offered). This shim sits between agy and that proxy and changes nothing
 answer's tool names become `room_action_execute` and so on (`alias`), and a `tools/call` for an alias is sent
 on under the server's own name. It also enforces the turn's grant (TOOLS_ENV, the server names the connector
 grants): a `tools/list` answer keeps only granted tools, and a `tools/call` for any other name, or a malformed
-one, is answered with a JSON-RPC error and never forwarded. No grant named means none granted. Every other
-message passes through as it came, and the child's environment is this process's (the proxy scrubs its own).
+one, is answered with a JSON-RPC error and never forwarded. No grant named means none granted. Only METHODS and
+`notifications/*` reach the server, plus the client's answers to the server's own requests; any other request,
+and a line that is not a JSON-RPC object, is answered with an error, any other notification dropped. Server
+lines pass through as they came, and the child's environment is this process's (the proxy scrubs its own).
 
     python -m ag2_sparrow.mcp_name_shim <command> [args...]
 
@@ -33,6 +35,9 @@ LOG_ENV = "AG2_MCP_LOG"
 STATUS_ENV, TURN_ENV = "AG2_MCP_SHIM_STATUS", "AG2_MCP_SHIM_TURN"
 TOOLS_ENV = "AG2_MCP_SHIM_TOOLS"
 NOT_GRANTED = -32601
+PARSE_ERROR, INVALID_REQUEST = -32700, -32600
+# The client methods forwarded; any other request is answered with an error, any other notification dropped.
+METHODS = frozenset({"initialize", "ping", "tools/list", "tools/call"})
 
 
 def granted(environ=None):
@@ -129,39 +134,62 @@ def _each(msg):
     return msg if isinstance(msg, list) else [msg]
 
 
-def _refusal(m):
-    return {"jsonrpc": "2.0", "id": m["id"], "error": {"code": NOT_GRANTED, "message": "tool not granted on this turn"}}
+def _error(id_, code, message):
+    return {"jsonrpc": "2.0", "id": id_, "error": {"code": code, "message": message}}
+
+
+def _method_ok(method):
+    return method in METHODS or (isinstance(method, str) and method.startswith("notifications/"))
+
+
+def _refused(m, names):
+    """The error code and message for a client message the server must not get, or None to forward it."""
+    if not isinstance(m, dict):
+        return INVALID_REQUEST, "invalid request"
+    method = m.get("method")
+    if "method" not in m:   # an answer to one of the server's own requests
+        return None if "id" in m and ("result" in m or "error" in m) else (INVALID_REQUEST, "invalid request")
+    if not _method_ok(method):
+        return NOT_GRANTED, "method not allowed"
+    if method == "tools/call":
+        params = m.get("params")
+        if not names.call_ok(params.get("name") if isinstance(params, dict) else None):
+            return NOT_GRANTED, "tool not granted on this turn"
+    return None
 
 
 def to_server(line, names, pending):
-    """(the line for the server or None, the line for the client or None) for a client line: a granted
-    `tools/call` goes on under the server's name, any other `tools/call` is answered here with a JSON-RPC error
-    (a notification is dropped); the id of each `tools/list` request is remembered so its answer is filtered."""
-    msg = _messages(line)
-    if msg is None:
-        return line, None
+    """(the line for the server or None, the line for the client or None) for a client line. A message `_refused`
+    names is never forwarded: a request (or a line that is not a JSON-RPC message) is answered with its error, a
+    notification dropped. A granted `tools/call` goes on under the server's name; each `tools/list` id is
+    remembered so its answer is filtered."""
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        return None, json.dumps(_error(None, PARSE_ERROR, "parse error")) + "\n"
+    batch = isinstance(msg, list)
+    if batch and not msg:
+        return None, json.dumps(_error(None, INVALID_REQUEST, "invalid request")) + "\n"
     changed, kept, refused = False, [], []
     for m in _each(msg):
-        if isinstance(m, dict) and m.get("method") == "tools/call":
-            params = m.get("params")
-            name = params.get("name") if isinstance(params, dict) else None
-            if not names.call_ok(name):
-                changed = True
-                if "id" in m:
-                    refused.append(_refusal(m))
-                continue
+        why = _refused(m, names)
+        if why is not None:
+            changed = True
+            if not isinstance(m, dict) or "id" in m or "method" not in m:
+                refused.append(_error(m.get("id") if isinstance(m, dict) else None, *why))
+            continue
+        if m.get("method") == "tools/call":
+            name = m["params"]["name"]
             if names.server_name(name) != name:
-                params["name"] = names.server_name(name)
-                changed = True
-        elif isinstance(m, dict) and m.get("method") == "tools/list" and "id" in m:
+                m["params"]["name"] = names.server_name(name)
+        elif m.get("method") == "tools/list" and "id" in m:
             pending.add(json.dumps(m["id"]))
         kept.append(m)
-    batch = isinstance(msg, list)
     reply = (json.dumps(refused if batch else refused[0]) + "\n") if refused else None
-    if not changed:
-        return line, None
     if not kept:
         return None, reply
+    if not changed and all(m.get("method") != "tools/call" for m in kept):
+        return line, None
     return json.dumps(kept if batch else kept[0]) + "\n", reply
 
 

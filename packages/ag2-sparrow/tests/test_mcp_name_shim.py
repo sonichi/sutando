@@ -204,11 +204,52 @@ class ShimTest(unittest.TestCase):
             self.assertRegex("mcp_ag2-space_" + shim.alias(name), r"^[a-zA-Z0-9_-]{1,64}$", name)
         self.assertEqual(shim.alias("a" * 50), "a" * 50)
 
-    def test_lines_it_does_not_understand_pass_through(self):
+    def test_client_lines_that_are_not_json_rpc_messages_are_answered_and_never_forwarded(self):
         names, pending = shim.Names({"room.list"}), set()
-        for line in ("not json\n", "[1, 2]\n", '"x"\n', '{"jsonrpc": "2.0", "method": "notifications/initialized"}\n'):
-            self.assertEqual(shim.to_server(line, names, pending), (line, None))
-            self.assertEqual(shim.to_client(line, names, pending), line)
+        for line, code in (("not json\n", shim.PARSE_ERROR), ('"x"\n', shim.INVALID_REQUEST), ("[]\n", shim.INVALID_REQUEST),
+                           ('{"jsonrpc": "2.0", "id": 4}\n', shim.INVALID_REQUEST)):
+            forward, reply = shim.to_server(line, names, pending)
+            self.assertIsNone(forward, line)
+            self.assertEqual(json.loads(reply)["error"]["code"], code, line)
+        forward, reply = shim.to_server("[1, 2]\n", names, pending)
+        self.assertEqual((forward, [e["error"]["code"] for e in json.loads(reply)]), (None, [shim.INVALID_REQUEST] * 2))
+        for line in ("not json\n", "[1, 2]\n", '"x"\n'):
+            self.assertEqual(shim.to_client(line, names, pending), line, "server lines pass through")
+
+    def test_only_the_allowed_methods_reach_the_server(self):
+        names, pending = shim.Names({"room.list"}), set()
+        for line in ('{"jsonrpc": "2.0", "method": "notifications/initialized"}\n',
+                     '{"jsonrpc": "2.0", "id": 1, "method": "ping"}\n',
+                     '{"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {}}\n',
+                     '{"jsonrpc": "2.0", "id": "s1", "result": {}}\n'):
+            self.assertEqual(shim.to_server(line, names, pending), (line, None), line)
+        for method in ("events/subscribe", "resources/read", "sampling/createMessage", 7):
+            forward, reply = shim.to_server(json.dumps({"jsonrpc": "2.0", "id": 3, "method": method}) + "\n", names, pending)
+            self.assertEqual((forward, json.loads(reply)["error"]["code"]), (None, shim.NOT_GRANTED), method)
+            self.assertEqual(shim.to_server(json.dumps({"jsonrpc": "2.0", "method": method}) + "\n", names, pending),
+                             (None, None), "a notification of another method is dropped")
+
+    def test_events_subscribe_and_a_garbage_line_never_reach_the_server_and_allowed_methods_still_work(self):
+        sess = Session()
+        init = sess.ask({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        sub = sess.ask({"jsonrpc": "2.0", "id": 2, "method": "events/subscribe", "params": {"name": "agent.trigger"}})
+        sess.p.stdin.write("{not json\n")
+        sess.p.stdin.flush()
+        garbage = json.loads(sess.p.stdout.readline())
+        sess.p.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+        ping = sess.ask({"jsonrpc": "2.0", "id": 3, "method": "ping"})
+        listed = sess.ask({"jsonrpc": "2.0", "id": 4, "method": "tools/list"})["result"]["tools"]
+        call = sess.ask({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "room_list"}})
+        self.assertEqual(sess.close(), 0)
+        self.assertEqual((init["id"], ping["id"], call["result"]["content"][0]["text"]), (1, 3, "room.list"))
+        self.assertIn("room_list", [t["name"] for t in listed])
+        self.assertEqual((sub["id"], sub["error"]["code"]), (2, shim.NOT_GRANTED))
+        self.assertEqual((garbage["id"], garbage["error"]["code"]), (None, shim.PARSE_ERROR))
+        self.assertEqual([m for m, _ in sess.got], ["initialize", "notifications/initialized", "ping", "tools/list",
+                                                    "tools/call"], "nothing else reached the server")
+
+    def test_a_listed_batch_is_remembered_and_renamed(self):
+        names, pending = shim.Names({"room.list"}), set()
         batch, _ = shim.to_server(json.dumps([{"jsonrpc": "2.0", "id": 9, "method": "tools/list"}]) + "\n", names, pending)
         self.assertEqual(pending, {"9"})
         answer = json.dumps([{"jsonrpc": "2.0", "id": 9, "result": {"tools": [{"name": "room.list"}]}}]) + "\n"
