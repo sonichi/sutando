@@ -132,27 +132,36 @@ class SwitchModel(unittest.TestCase):
         self.assertEqual(again.sent, [["/model", "Space", "sonnet", "Enter"], ["Enter"]])
 
     def test_a_draft_in_the_input_box_or_a_box_that_cannot_be_read_gets_no_keys(self):
-        dim = "\x1b[2m"
-        # After the drafts: no frame around the prompt, a frame cut off, a menu left open, no prompt.
+        dim, footer = "\x1b[2m", "  \u23f5\u23f5 bypass permissions on"
+        # After the drafts: no frame around the prompt, a frame cut off below or above, a dialog or a
+        # menu left open, no prompt. An empty reading outside the frame is not evidence of an empty box.
         for shown, why in ((box("half a message"), "holds unsent text"),
                            (box("", "  a second line under a blank first one"), "holds unsent text"),
                            (box("first", "second"), "holds unsent text"),
                            ("old\n" + box() + "\nlater\n" + box("fix the bug"), "holds unsent text"),
+                           (box("/mod") + "\n  /model   Set the AI model", "holds unsent text"),
                            ("\u276f ", "cannot be read"),
+                           ("\u276f \n" + footer, "cannot be read"),
                            (RULE + "\n\u276f ", "cannot be read"),
+                           ("\u276f \n" + RULE + "\n" + footer, "cannot be read"),
                            ("Select model\n\u276f 1. Default\n  2. Opus", "cannot be read"),
+                           (RULE + "\n Select model\n\u276f 1. Default\n  2. Opus\n" + RULE, "cannot be read"),
                            ("no prompt on this screen", "cannot be read"), ("", "cannot be read")):
             pane = Pane(says)
             pane.text = shown
             switched, line = lc_for(pane, self.root).switch_model(REC, "opus")
             self.assertEqual((switched, why in line, pane.sent), (False, True, []), shown)
-        # A placeholder or a suggestion is styled, never typed: the box is empty.
-        for shown in (box('%sTry "fix lint errors"\x1b[0m' % dim), box("\x1b[38;5;240mrun the tests\x1b[39m")):
+        # A placeholder or a suggestion is styled, never typed: the box is empty. So is a box whose
+        # rules and footer arrive coloured, as a styled capture of the real screen has them.
+        coloured = "\n".join("\x1b[38;5;244m%s\x1b[39m" % row if n != 1 else row for n, row in enumerate(box().splitlines()))
+        for shown in (box('%sTry "fix lint errors"\x1b[0m' % dim), box("\x1b[38;5;240mrun the tests\x1b[39m"), coloured):
             pane = Pane(says)
             pane.text = shown
             self.assertEqual(lc_for(pane, self.root).switch_model(REC, "opus"), (True, "switched to opus"), shown)
         self.assertEqual([launcher.composer_text(t) for t in (None, box(), box("hi "), box("a", " b "))],
-                         [None, "", "hi", "a\nb"])
+                         [None, "", "hi", "a b "])
+        self.assertEqual([launcher.composer_boxed(t) for t in (None, box(), "\u276f ", coloured)], [False, True, False, True])
+        self.assertIs(launcher.claude_model_switch.pane_composer.composer_text.__module__ == "ag2_sparrow.pane_composer", True)
 
     def test_only_a_line_naming_the_model_asked_for_is_the_switch(self):
         def other(keys, pane):
@@ -165,6 +174,8 @@ class SwitchModel(unittest.TestCase):
                                                    "different model; nothing recorded"))
         self.assertEqual(launcher.switched_model(self.root), "", "a switch that was not this one is not recorded")
         for model, line, ok in (("opus", "Set model to Opus 4.6 and saved", True), ("opus[1m]", "Set model to opus[1m]", True),
+                                # `default` names no variant: a default that is a 1M model still confirms it.
+                                ("default", "Set model to Default (Opus 4.6 with 1M context)", True),
                                 ("claude-opus-4-6", "Set model to Opus 4.6", True), ("claude-opus-4-6", "Set model to Opus 4.61", False),
                                 ("claude-opus-4", "Set model to Opus 4.6", False), ("opus", "Set model to Opusplan", False),
                                 ("default", "Set model to Default (recommended)", True), ("haiku", "Set model to Sonnet 4.6", False),

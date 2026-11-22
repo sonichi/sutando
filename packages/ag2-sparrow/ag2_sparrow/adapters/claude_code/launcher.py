@@ -45,6 +45,7 @@ MODEL_ACCEPT_S = 20.0
 # (src/claude_model_switch.py, bundled verbatim): one source for the skill and for this adapter.
 MODEL_RE, MODEL_SET, MODEL_CONFIRM = claude_model_switch.MODEL_RE, claude_model_switch.MODEL_SET, claude_model_switch.MODEL_CONFIRM
 composer_text, accepted_count = claude_model_switch.composer_text, claude_model_switch.accepted_count
+composer_boxed = claude_model_switch.composer_boxed
 MODEL_RECORD = ("state", "model-switch.json")
 
 
@@ -631,9 +632,12 @@ class Launcher:
         gen, title = rec.get("generation"), rec.get("title_token") or ""
         if not gen or self.tm.has_session() is not True:
             return False, "no running session to switch; nothing sent"
-        draft = composer_text(self.tm.capture(gen["pane_id"], styled=True))
-        if draft is None:
-            return False, "refused: the session shows no input prompt, so its input box cannot be read; nothing sent"
+        styled = self.tm.capture(gen["pane_id"], styled=True)
+        draft = composer_text(styled)
+        # An empty reading counts only inside the box's frame: a bare prompt row may be a cut box.
+        if draft is None or not composer_boxed(styled):
+            return False, ("refused: the session does not show its whole input box, so the box cannot be read; "
+                           "nothing sent")
         if draft:
             return False, "refused: the session's input box holds unsent text; nothing sent"
         shown = self.tm.capture(gen["pane_id"]) or ""

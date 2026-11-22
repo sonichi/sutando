@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """What switching Claude Code's model by typing `/model` relies on: which model names may be typed,
-the two texts Claude Code answers with, and whether its input box is empty.
+the two texts Claude Code answers with, and whether its input box is empty (read by the core's
+own parser, src/pane_composer.py).
 
 One source for the core's model-switch skill (its shell scripts ask this file for the patterns)
 and for ag2-sparrow's claude-local adapter (bundled verbatim; the package drift test pins the copy).
@@ -15,33 +16,29 @@ from __future__ import annotations
 import re
 import sys
 
+try:
+    from . import pane_composer       # the vendored package layout
+except ImportError:                   # a flat src/ load: the skill's scripts, the tests
+    import pane_composer
+
 # Aliases Claude Code's /model takes, or a full id; a family alias or an id may carry a context tag.
 MODEL_PATTERN = r"^(default|(opus|sonnet|haiku|fable)(\[1m\])?|claude-[a-z0-9.-]+(\[1m\])?)$"
 MODEL_RE = re.compile(MODEL_PATTERN)
 MODEL_SET, MODEL_CONFIRM = "Set model to", "Yes, switch"
-PROMPT_GLYPH = "❯"
-# Styling, and the dim or grey runs that are a placeholder or a suggestion, never text someone typed
-# (the same two patterns as src/delivery/pane_gate.py).
-_SGR = re.compile(r"\x1b\[[0-9:;]*m|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
-_GHOST = re.compile(r"\x1b\[(?:2|38;5;(?:23[2-9]|24[0-9]|25[0-5]))m.*?(?=\x1b\[(?:0|22|39)m|$)")
-
-
-_RULE = re.compile(r"^[\u2500\u2501\u256d\u256e\u2570\u256f\u2502 ]*[\u2500\u2501][\u2500\u2501\u256d\u256e\u2570\u256f\u2502 ]*$")
 
 
 def composer_text(shown) -> "str | None":
-    """What sits unsent in Claude Code's input box, from a styled capture: '' when the box is empty,
-    None when the box is not on screen whole (unknown, never empty). The box is the rows between the
-    last two rule lines, the first starting with the prompt glyph; every row of it counts, so a draft
-    of several lines is text even when its first line is blank. A menu or a dialog is not a box."""
-    rows = [(raw, _SGR.sub("", raw)) for raw in (shown or "").splitlines()]
-    rules = [n for n, (_, plain) in enumerate(rows) if _RULE.match(plain)]
-    if len(rules) < 2 or not rows[rules[-2] + 1][1].lstrip(" \t").startswith(PROMPT_GLYPH) or rules[-1] <= rules[-2] + 1:
-        return None
-    box = rows[rules[-2] + 1:rules[-1]]
-    first = box[0][0]
-    typed = [_SGR.sub("", _GHOST.sub("", raw)) for raw in [first[first.find(PROMPT_GLYPH) + 1:]] + [r for r, _ in box[1:]]]
-    return "\n".join(line.strip(" \t\u00a0") for line in typed if line.strip(" \t\u00a0"))
+    """What sits unsent in Claude Code's input box, from a styled or plain capture: '' when it is
+    empty, None when the screen shows no prompt row. The core's own reading (src/pane_composer.py,
+    which pane_gate re-exports), not a second parser: every row of the box counts, so a draft of
+    several lines is text even when its first line is blank, as is a dialog's caret row."""
+    return pane_composer.composer_text(pane_composer.frame_plain(shown), pane_composer.CLAUDE_COMPOSER)
+
+
+def composer_boxed(shown) -> bool:
+    """The prompt row sits inside its frame (a rule right above it, a rule below). An empty reading
+    of a prompt with no frame around it is not evidence the box is empty: ask this before typing."""
+    return pane_composer.composer_boxed(shown, pane_composer.CLAUDE_COMPOSER)
 
 
 def accept_pattern(model: str) -> str:
@@ -63,10 +60,11 @@ def model_accepted(model: str) -> "re.Pattern":
 def accepted_count(model: str, shown) -> int:
     """How many of Claude Code's lines on screen are a switch to exactly `model`: its family, its
     version and its context variant. A line for the ordinary model is not one for its [1m] variant, nor
-    the other way round; a [1m] switch whose line does not say so stays unconfirmed."""
+    the other way round; a [1m] switch whose line does not say so stays unconfirmed. `default` names
+    no variant (the default may itself be a 1M model), so its line counts either way."""
     wants_1m, pattern = model.endswith("[1m]"), model_accepted(model)
     return sum(1 for line in (shown or "").splitlines()
-               if pattern.search(line) and bool(re.search(r"1m", line, re.I)) == wants_1m)
+               if pattern.search(line) and (model == "default" or bool(re.search(r"1m", line, re.I)) == wants_1m))
 
 
 def main(argv) -> int:

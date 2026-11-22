@@ -61,6 +61,7 @@ omit =
     packages/ag2-sparrow/ag2_sparrow/tmux_probe.py
     packages/ag2-sparrow/ag2_sparrow/tmux_pane_keys.py
     packages/ag2-sparrow/ag2_sparrow/claude_model_switch.py
+    packages/ag2-sparrow/ag2_sparrow/pane_composer.py
     packages/ag2-sparrow/ag2_sparrow/hitl/__init__.py
     packages/ag2-sparrow/ag2_sparrow/hitl/schema.py
     packages/ag2-sparrow/ag2_sparrow/hitl/host.py
