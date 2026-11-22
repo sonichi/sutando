@@ -11,6 +11,7 @@ line, a file of its own), and an adapter may switch on, per turn, command execut
 """
 from __future__ import annotations
 
+import collections
 import contextlib
 import dataclasses
 import json
@@ -175,6 +176,22 @@ def under(root, raw):
     return p is not None and (p == r or p.startswith(r.rstrip(os.sep) + os.sep))
 
 
+ACTION_CATEGORIES = {"read": "file read", "edit": "file change", "delete": "file change", "move": "file change",
+                     "fetch": "web fetch"}
+
+
+def action_category(params):
+    """A fixed name for what a permission request asks to do ("command", "file read", "file change", "web fetch"
+    or "other"), from the request's kind and whether it carries a command. Never any text the agent wrote, so it
+    may be shown in a room."""
+    tool_call = params.get("toolCall") if isinstance(params.get("toolCall"), dict) else {}
+    raw = tool_call.get("rawInput")
+    if tool_call.get("kind") == "execute" or (isinstance(raw, dict) and "command" in raw):
+        return "command"
+    kind = tool_call.get("kind")
+    return ACTION_CATEGORIES.get(kind, "other") if isinstance(kind, str) else "other"
+
+
 def decide_permission(params, owner, cwd, command_ok=None, own_file=None, command_refused="no command is granted",
                       command_granted="", own_file_reason="", tools=False, extra_keys=None):
     """(allowed, reason, result). Default deny. Granted: with `tools`, any command and any execute, fetch or
@@ -302,18 +319,24 @@ def task_framing(task_id, headers, message, operator_lines, post_with, note=NON_
 # ── one turn ─────────────────────────────────────────────────────────────────
 
 class Turn:
-    """Collects the agent's message text and the permission decisions of one prompt."""
+    """Collects the agent's message text and the permission decisions of one prompt, and counts its
+    `session/update`s by type (`updates`), so a turn that ends with no text shows what it did instead."""
 
     def __init__(self):
         self.live = False
         self.chunks = []
         self.decisions = []
+        self.updates = collections.Counter()
         self.lock = threading.Lock()
 
     def on_update(self, params):
         update = params.get("update") if isinstance(params.get("update"), dict) else {}
-        if not self.live or update.get("sessionUpdate") != "agent_message_chunk":
+        if not self.live:
             return  # before the prompt, a session/load replays history: never this turn's answer
+        with self.lock:
+            self.updates[str(update.get("sessionUpdate"))[:60]] += 1
+        if update.get("sessionUpdate") != "agent_message_chunk":
+            return
         content = update.get("content")
         if isinstance(content, dict) and content.get("type") == "text":
             with self.lock:
@@ -362,7 +385,8 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
     def on_permission(params):
         ok, why, result = decide(params)
         title = (params.get("toolCall") or {}).get("title") if isinstance(params.get("toolCall"), dict) else None
-        turn.decisions.append({"title": str(title or "")[:120], "allowed": ok, "reason": why})
+        turn.decisions.append({"title": str(title or "")[:120], "allowed": ok, "reason": why,
+                               "category": action_category(params)})
         return result
 
     try:

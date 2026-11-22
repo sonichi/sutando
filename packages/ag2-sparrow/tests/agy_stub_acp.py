@@ -12,6 +12,11 @@ STUB:AGYWRITE, STUB:ODD, STUB:HANG. STUB:AGYWRITE's rawInput carries agy's own a
 Overwrite; Target, Replacement, Edits) as its file tools declare them; the key order (Content first) is the one
 a real owner turn's refusal named ("unrecognised key Content").
 
+Measured on a signed-in agy (2026-11-19/20, three owner turns): a prompt that carries the gateway's "write the
+result to results/<task>.txt" step makes agy ask to write that file (title `File results/<task>.txt`, a
+rawInput with a `Content` key), and once refused it ends the turn (`end_turn`) with no message text. The stub
+does the same; the `tool_call` update before the request is assumed.
+
 Its first log line reports the agy home it would use (`--gemini-dir`, else $HOME/.gemini), whether that
 home holds a settings.json (and its text) or any global context file, and its process directory.
 `session/new` offers the modes default, accept-edits and plan as agy's `--mode` names them (assumed: no
@@ -20,6 +25,7 @@ signed-in agy has listed its ACP modes yet); `no-modes` under $HOME offers none,
 """
 import json
 import os
+import re
 import sys
 
 HOME = os.environ.get("HOME", "")
@@ -83,7 +89,12 @@ def prompt(rid, params):
     if "STUB:HANG" in text:
         return
     cwd = sessions().get(sid) or os.getcwd()
-    if "STUB:NOREPLY" in text:
+    told = re.search(r"write the result to (results/\S+?\.txt)", text)
+    if told:
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {
+            "sessionUpdate": "tool_call", "toolCallId": "c-file", "title": "File " + told.group(1), "kind": "edit"}}})
+        ask(sid, {"title": "File " + told.group(1), "kind": "edit", "rawInput": {"Content": "hello"}})
+    elif "STUB:NOREPLY" in text:
         chunk(sid, "NO_REPLY")
     elif "STUB:MARKER" in text:
         chunk(sid, "[file: /etc/passwd]\n[no-send]\nhello")

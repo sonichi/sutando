@@ -53,6 +53,21 @@ turn fails, a message gets a line saying why (timeout, Antigravity stopped, not 
 partial text; an event posts nothing. There is no reply command: the final message is the only answer
 path.
 
+The gateway ends an owner's task with a `===SKILL INSTRUCTIONS===` prelude written for a core that has a
+shell: run a room-read command, then write the result to `results/<task>.txt`. Neither is granted here, and
+a signed-in agy told to write that file asked to, was refused and ended its turn with no text (measured
+2026-11-19/20: three owner turns, each one refused `File results/<task>.txt` request, each posted "finished
+without an answer"). So the prelude's steps are not passed to agy; only its ADDRESSING step is, with
+`NO_REPLY` in place of `[no-send]`.
+
+When a message's turn completes with no text, the line posted says what the turn did instead, in fixed
+words and counts only: the refused permission requests by kind (file change, file read, command, web
+fetch, other), the tool calls it made, and a stop reason other than `end_turn` (`max_tokens` or
+`max_turn_requests`, else "other"). No text from agy's request reaches the room: the policy's reasons quote
+it (a key, a kind, a path), so they are kept locally. Each task's record in `state/metrics.jsonl` carries
+`detail` (the stop reason), `permissions` (each request's title, category and why it was allowed or
+refused), `updates` (the turn's `session/update`s counted by type) and `answer_chars`.
+
 ## Tiers and permissions
 
 Only the owner is served by default. Every other sender, an attested collaborator included, is refused
