@@ -170,6 +170,32 @@ def admit(root, task_id, allow: bool, allow_collab: bool = False) -> "tuple[str 
     return policy.kind, headers, ""
 
 
+def open_turns(root) -> list:
+    """[(access_tier, collaborator)] of every task this root holds a claim on that is not answered yet,
+    read under claims.lock through the lifecycle and the attested task headers. A claim past its
+    answer (PUBLISHED, SETTLED) or whose task already has a result is closed, so one left by a crash
+    does not count; a claim or task that cannot be read counts as ("unknown", True), never as the owner's."""
+    lc, out = _lifecycle(root), []
+    with records.flocked(records.claims_lock_path(root)):
+        for task_id in lc.claims.ids():
+            try:
+                rec = lc.claims.load(task_id)
+                if not rec or rec.get("phase") in (lifecycle.PUBLISHED, lifecycle.SETTLED):
+                    continue
+                if lc.classify(task_id) in lifecycle.TERMINAL:
+                    continue
+                path = os.path.join(root, "tasks", task_id + ".txt")
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    raw = task_io.attested_headers(f.read()).headers
+                if "access_tier" not in raw:
+                    raise ValueError("no access_tier header")
+                headers = task_io.parse_task(path)[0]
+                out.append((str(headers["access_tier"]), headers.get("collaborator") == "true"))
+            except Exception:       # whatever cannot be read is not the owner's
+                out.append(("unknown", True))
+    return out
+
+
 def isolated_prompt(root, task_id) -> "tuple[str, dict]":
     """(text, attested headers) of the isolated turn: the routine and cloud-session adapters' payload (attested
     routing fields, the non-owner note, the untrusted body between nonce markers), with the gateway's tier

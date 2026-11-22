@@ -34,7 +34,7 @@ from ...connect_bridge import (DECLARATION, EXTERNAL, SEAT_ENV_KEEP, STATUS_MAX_
                                vault_key, worker_name)
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, Shape, _v  # noqa: F401
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
-from . import detector, hmac_policy, hold, inbox, launcher, trust
+from . import account as accounts, detector, hmac_policy, hold, inbox, launcher, trust
 from .shape import AUTOARM_VAR, BRIDGE, HITL_ROOT_NAME, LOCAL, PLUGIN, SESSION_NAME, resolve_plugin_dir  # noqa: F401
 
 SHAPE, COMMAND, MIN_CLI = LOCAL.name, LOCAL.command, LOCAL.min_version
@@ -669,6 +669,110 @@ def model(args) -> int:
     return 0 if switched else 1
 
 
+ROUTE_UNKNOWN = "AG2_ACCOUNT_ROUTE_UNKNOWN"      # set by account_env, never passed on: the session could not be asked
+NO_ROUTE = ("could not ask this agent's session whether its requests go through the credential proxy, so a sign-in "
+            "here might not be the one it uses; nothing was done")
+NOT_OWNERS_TURN = ("a sign-in is started only by the agent's owner: from a terminal, from the app's settings, or by "
+                   "the agent while every message it is working on is its owner's. Nothing was done")
+APP_NONCE = "account-app.nonce"
+
+
+def account_env(cfg: dict, local) -> dict:
+    """What `claude auth` runs under for this agent, with the credential proxy's address as the agent's
+    running session has it (its tmux server's environment), which this command's own caller may lack.
+    ROUTE_UNKNOWN is set when tmux could not be asked at all."""
+    env = child_env(cfg)
+    tmux, problem = launcher.configured_tmux(cfg, job=local)
+    r = None if problem else launcher.Tmux(str(launcher.socket_path(config_dir(local))), tmux).run(
+        "show-environment", "-g", accounts.PROXY_VAR)
+    if r is None:
+        return env if env.get(accounts.PROXY_VAR) else dict(env, **{ROUTE_UNKNOWN: "1"})
+    name, eq, value = (r.stdout or "").strip().partition("=")
+    if r.returncode == 0 and name == accounts.PROXY_VAR and eq and value:
+        env[accounts.PROXY_VAR] = value
+    return env
+
+
+def other_agents_dirs(local) -> list:
+    """The Claude config dirs of every other installed job, for the "is this dir this agent's alone" check."""
+    mine, found = config_path(local), []
+    try:
+        paths = sorted(cm.config_root().rglob("*.conf"))
+    except OSError:
+        return found
+    for path in paths:
+        if path != mine:
+            found.append(cm.read_config_lenient(path).get("CLAUDE_CONFIG_DIR") or "")
+    return [d for d in found if d]
+
+
+def sign_in_refused(cfg: dict, local, args) -> str:
+    """'' when this run may start or finish a sign-in, else why not. A person at a terminal may; the
+    app may once per nonce (--from-app); the agent may only while every task its session holds is its
+    owner's own, so a collaborator's or a guest's message cannot have it sign in to their account."""
+    if sys.stdin.isatty():
+        return ""
+    if args.from_app:
+        return "" if accounts.take_app_nonce(config_dir(local) / APP_NONCE) else NOT_OWNERS_TURN
+    try:
+        turns = inbox.open_turns(cm.work_root(cfg))
+    except Exception:
+        return NOT_OWNERS_TURN
+    return "" if turns and all(tier == "owner" and not collab for tier, collab in turns) else NOT_OWNERS_TURN
+
+
+START_SAY = ("Open this link and sign in, then give me the code the page shows: in our DM only, never in a room "
+             "with other people (the link works for 10 minutes, the code once): %s")
+
+
+def account(args) -> int:
+    """Print the Anthropic account of the agent's Claude config dir, or sign it in again in the browser
+    of this computer. A new sign-in applies when the session next starts."""
+    local = selected(args)
+    if local is None:
+        return EXIT_UNUSABLE
+    cfg, problem = load_config(local)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    env, changed = account_env(cfg, local), ""
+    unknown_route = bool(env.pop(ROUTE_UNKNOWN, ""))
+    waiting = config_dir(local) / "account-sign-in"
+    if args.cancel:
+        print(json.dumps({"changed": "", "cancelled": accounts.cancel(waiting)}))
+        return 0
+    if args.start or args.switch or args.code:
+        refused = sign_in_refused(cfg, local, args) or (NO_ROUTE if unknown_route and not args.code else "")
+        if refused:
+            print(json.dumps({"changed": "", "detail": refused, **accounts.status(cfg, env)}))
+            return 1
+    others = other_agents_dirs(local) if args.start or args.switch else ()
+    if args.start:
+        try:
+            link = accounts.start(cfg, env, waiting, console=args.console, others=others)
+        except accounts.Refused as e:
+            print(json.dumps({"changed": "", "detail": str(e), **accounts.status(cfg, env)}))
+            return 1
+        print(json.dumps({"changed": "", "link": link, "say": START_SAY % link}))
+        return 0
+    if args.switch or args.code:
+        try:
+            ok, detail = (accounts.give_code(waiting, sys.stdin.readline()) if args.code else
+                          accounts.sign_in(cfg, env, console=args.console, others=others))
+        except accounts.Refused as e:
+            ok, detail = False, str(e)
+        if not ok:
+            print(json.dumps({"changed": "", "detail": detail, **accounts.status(cfg, env)}))
+            return 1
+        changed = "account"
+    state = accounts.status(cfg, env)
+    out = {"changed": changed, **state, "say": accounts.words(state)}
+    if changed:
+        out["restart"] = "the running session keeps the sign-in it started with; the new one applies when it next starts"
+    print(json.dumps(out))
+    return 0
+
+
 def stop(args) -> int:
     """The local confirmation of an open stall card, through the one accepter; the launcher applies it."""
     if not args.confirm:
@@ -802,6 +906,24 @@ def main(argv=None) -> int:
     m.add_argument("--confirm", action="store_true", help="answer Claude Code's confirm dialog (a switch inside a "
                                                            "running conversation)")
     m.set_defaults(func=model)
+    a = agent_option(sub.add_parser("account", help="print the Anthropic account of the agent's Claude config dir, or "
+                                    "sign it in again; a new sign-in applies when the session next starts"))
+    a.add_argument("--switch", action="store_true", help="sign in again: Claude Code's sign-in page opens in the browser "
+                   "of this computer, and the command waits until it is finished there. Refused for an agent behind "
+                   "the credential proxy, whose own sign-in decides the account")
+    a.add_argument("--start", action="store_true", help="sign in again from anywhere, step 1: print the link of the "
+                   "sign-in page and leave the sign-in waiting 10 minutes for its code")
+    a.add_argument("--code", action="store_true", help="step 2: read the code the sign-in page showed from standard "
+                   "input (never an argument) and finish the waiting sign-in")
+    a.add_argument("--cancel", action="store_true", help="end a waiting sign-in")
+    a.add_argument("--from-app", action="store_true", help="for the desktop app's settings: allow a sign-in with no "
+                   "terminal, once, by taking the file account-app.nonce (mode 0600, under a minute old) the app wrote "
+                   "in the agent's config dir just before. Without it or a terminal, a sign-in runs only while every "
+                   "message the agent is working on is its owner's. This keeps a collaborator's message from having "
+                   "the agent sign in elsewhere; it does not stop someone who already has this user's shell")
+    a.add_argument("--console", action="store_true", help="with --switch or --start: sign in with an Anthropic Console "
+                   "account in place of a Claude subscription")
+    a.set_defaults(func=account)
     agent_option(sub.add_parser("uninstall", help="stop the job and the session, then remove what install wrote "
                                 "(config last)")).set_defaults(func=uninstall)
     sub.add_parser("list", help="each job installed here: its agent, the manager's state, its work root and the "
