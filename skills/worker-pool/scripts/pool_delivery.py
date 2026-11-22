@@ -235,8 +235,8 @@ def hand_off_to_core(workspace: Path, recipient: str) -> dict:
 
 def hand_off_own_inbox(workspace: Path, recipient: str, owed) -> dict:
     """The owner's hand-off for a worker on its own folders: each (task id, file) it still owes there
-    (`pool_supervise.own_inbox_owed`) moves to the shared tasks/, attribution revoked first, and is
-    touched so the core's watcher picks it up. A name the shared folder already holds is kept, never
+    (`pool_supervise.own_inbox_owed`) moves to the shared tasks/, attribution revoked once it has moved, and
+    is touched so the core's watcher picks it up. A name the shared folder already holds is kept, never
     replaced. Returns {"handed_off": [...], "kept": {task_id: why}}."""
     import pool_attribution
     import undelivered_quarantine
@@ -245,7 +245,6 @@ def hand_off_own_inbox(workspace: Path, recipient: str, owed) -> dict:
     out = {"handed_off": [], "kept": {}}
     (ws / "tasks").mkdir(parents=True, exist_ok=True)
     for task_id, path in owed:
-        pool_attribution.revoke(ws, task_id, recipient)
         dest = ws / "tasks" / f"{task_id}.txt"
         try:
             undelivered_quarantine.rename_noreplace(Path(path), dest)
@@ -254,6 +253,8 @@ def hand_off_own_inbox(workspace: Path, recipient: str, owed) -> dict:
                 raise
             out["kept"][task_id] = "shared-folder-holds-the-name"
             continue
+        # Only a task that moved loses its owner record; a kept or failed one still needs it.
+        pool_attribution.revoke(ws, task_id, recipient)
         with contextlib.suppress(FileNotFoundError):
             os.utime(dest)
         out["handed_off"].append(task_id)

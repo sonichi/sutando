@@ -720,6 +720,27 @@ class SupervisedSwitch(Seated):
                 pd.hand_off_own_inbox(self.ws, W, sup.own_inbox_owed(self.ws, W))
         self.assertTrue((self.own / "tasks" / f"{self.mine}.txt").is_file())
 
+    def test_an_own_inbox_hand_off_whose_move_fails_keeps_the_attribution(self):
+        import errno
+        import pool_supervise as sup
+        import undelivered_quarantine
+        self.own_worker_with_an_unanswered_task()
+        for err in (FileExistsError(errno.ENOTSUP, "no primitive"), PermissionError(errno.EACCES, "denied")):
+            with mock.patch.object(undelivered_quarantine, "rename_noreplace", side_effect=err):
+                with self.assertRaises(OSError):
+                    pd.hand_off_own_inbox(self.ws, W, sup.own_inbox_owed(self.ws, W))
+            self.assertEqual(pat.worker_for_task(self.ws, self.mine), W, type(err).__name__)
+            self.assertTrue((self.own / "tasks" / f"{self.mine}.txt").is_file())
+        (self.ws / "tasks").mkdir(parents=True, exist_ok=True)
+        (self.ws / "tasks" / f"{self.mine}.txt").write_text("already here")
+        out = pd.hand_off_own_inbox(self.ws, W, sup.own_inbox_owed(self.ws, W))
+        self.assertEqual(out["kept"], {self.mine: "shared-folder-holds-the-name"})
+        self.assertEqual(pat.worker_for_task(self.ws, self.mine), W, "a kept task keeps its owner record")
+        (self.ws / "tasks" / f"{self.mine}.txt").unlink()
+        out = pd.hand_off_own_inbox(self.ws, W, sup.own_inbox_owed(self.ws, W))
+        self.assertEqual(out["handed_off"], [self.mine])
+        self.assertIsNone(pat.worker_for_task(self.ws, self.mine))
+
     def test_an_answered_task_in_its_own_inbox_is_not_owed(self):
         import pool_supervise as sup
         self.own_worker_with_an_unanswered_task()
@@ -903,6 +924,20 @@ class RoundThree(Seated):
         self.assertFalse(any(t.is_alive() for t in threads), "the two paths deadlocked")
         self.assertEqual(errors, [])
 
+    def test_a_retiring_worker_on_the_shared_folders_is_refused_before_anything_is_written(self):
+        self.deliver(self.mine)
+        C.begin_worker_retirement(W, workspace=self.ws)
+        run = mock.Mock(side_effect=AssertionError("the handler must not run"))
+        with mock.patch.object(C, "set_worker_dirs", side_effect=AssertionError("no field write")), \
+                mock.patch.object(C, "ensure_worker_dirs", side_effect=AssertionError("no folders made")):
+            out, why = self.migrate(handler=self.handler, run=run)
+        self.assertEqual(why, f"worker {W} is being retired: its folders are not switched")
+        self.assertEqual(out["state"], "shared")
+        run.assert_not_called()
+        self.assertFalse(C.worker_dirs_state(W, self.ws))
+        self.assertFalse(self.own.exists(), "no own folders were created")
+        self.assertIsNotNone(pd.find(self.ws, W, self.mine), "its delivery stays where it was")
+
     def test_a_retiring_worker_is_never_switched_and_its_deliveries_are_not_moved(self):
         self.deliver(self.mine)
         C.set_worker_dirs(W, C.WORKER_DIRS_MIGRATING, workspace=self.ws)
@@ -929,6 +964,44 @@ class RoundThree(Seated):
         self.assertFalse(C.worker_retiring(W, self.ws))
         self.assertFalse(C.worker_identity(W, self.ws).get("disabled"))
         self.assertEqual(C.worker_dirs_state(W, self.ws), "own")
+
+    def test_an_enable_during_a_retire_is_refused_and_the_hand_off_completes(self):
+        import pool_manage as pm
+        import pool_roster as pr
+        self.own_worker_with_an_unanswered_task()
+        refused, real = [], pd.hand_off_own_inbox
+
+        def enable_mid_hand_off(*a, **kw):
+            with self.assertRaises(pm.Refused) as e:
+                pm.enable(self.ws, ROOT, W, start=False)
+            refused.append(str(e.exception))
+            return real(*a, **kw)
+        with mock.patch.object(pd, "hand_off_own_inbox", enable_mid_hand_off):
+            out = pm.retire(self.ws, W, hand_off=True, runner=self.tmux, tell=lambda text: True)
+        self.assertIn("in progress", refused[0])
+        self.assertEqual((out["result"], out["handed_off"]), ("retired", [self.mine]), out)
+        self.assertEqual(pr.load_roster(self.ws)["workers"][W]["state"], "retired")
+        self.assertIsNone(C.worker_identity(W, self.ws))
+        self.assertTrue((self.ws / "tasks" / f"{self.mine}.txt").is_file())
+
+    def test_a_retire_during_an_enable_is_refused(self):
+        import pool_manage as pm
+        import pool_roster as pr
+        self.own_worker_with_an_unanswered_task()
+        pr.set_worker_state(self.ws, W, "retired", keep_bindings=True)
+        refused, real = [], pm.sup.set_paused
+
+        def retire_mid_enable(*a, **kw):
+            with self.assertRaises(pm.Refused) as e:
+                pm.retire(self.ws, W, hand_off=True, runner=self.tmux, tell=lambda text: True)
+            refused.append(str(e.exception))
+            return real(*a, **kw)
+        with mock.patch.object(pm.sup, "set_paused", retire_mid_enable):
+            out = pm.enable(self.ws, ROOT, W, start=False)
+        self.assertIn("in progress", refused[0])
+        self.assertEqual(out["result"], "enabled")
+        self.assertEqual(pr.load_roster(self.ws)["workers"][W]["state"], "live")
+        self.assertIsNotNone(C.worker_identity(W, self.ws))
 
     def test_a_declared_bridge_is_replaced_when_its_lane_moves_not_again_at_own(self):
         rev = {}

@@ -87,6 +87,8 @@ python3 skills/worker-pool/scripts/pool_manage.py unbind <room id>
   owner restart (`pool_remedy --restart`), which resumes its conversation.
   With `--no-start` it only lifts them; the sweep's death ladder then restarts
   the dead session like any other, after its sustained ticks.
+  `retire` and `enable` on the same worker never overlap: whichever starts second
+  is refused while the other runs; run it again once that one ends.
 - `remove` drops a retired worker's roster row (same `--hand-off` rule), leaving
   its id in the roster's `removed` list so late deliveries stay fenced. Its
   records under `state/workers/<id>/` and its `deliveries/<id>/` folder stay as

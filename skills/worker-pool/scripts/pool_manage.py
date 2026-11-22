@@ -52,6 +52,8 @@ Every verb prints one JSON line. Exit 0 done, 1 failed, 2 refused.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import subprocess
@@ -97,6 +99,19 @@ def _worker(workspace, target: str) -> tuple[str, dict]:
     if wid == pr.CORE or not isinstance(row, dict):
         raise Refused(f"{target!r} is not a worker id or label")
     return wid, row
+
+
+@contextlib.contextmanager
+def _lifecycle_lock(workspace, wid: str, action: str):
+    """Retire and enable each run whole under one worker's lock; either refuses while the other holds it."""
+    path = Path(workspace) / "state" / "locks" / f"worker-lifecycle-{wid}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+b") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Refused(f"worker {wid} has a retire or enable in progress; {action} it again once that ends") from None
+        yield
 
 
 def _not_self(wid: str, force: bool) -> None:
@@ -185,6 +200,11 @@ def retire(workspace, target, *, unbind=False, hand_off=False, runner=subprocess
     `retired`, which the router re-checks under the delivery lock) comes first, so no
     new or replayed task can commit to the worker once the owed set is read."""
     wid, _ = _worker(workspace, target)
+    with _lifecycle_lock(workspace, wid, "retire"):
+        return _retire(workspace, wid, unbind=unbind, hand_off=hand_off, runner=runner, tell=tell)
+
+
+def _retire(workspace, wid, *, unbind, hand_off, runner, tell) -> dict:
     _not_self(wid, False)
     rooms = pr.rooms_bound_to(pr.load_bindings(workspace), wid)
     if rooms and not unbind:
@@ -299,8 +319,14 @@ def _retire_identity(workspace, wid: str, hand_off: bool = False, tell=None) -> 
 
 
 def enable(workspace, repo, target, *, start=True, runner=None, spawn=None) -> dict:
+    wid, _ = _worker(workspace, target)
+    with _lifecycle_lock(workspace, wid, "enable"):
+        return _enable(workspace, repo, wid, start=start, runner=runner, spawn=spawn)
+
+
+def _enable(workspace, repo, wid, *, start, runner, spawn) -> dict:
     import connections
-    wid, row = _worker(workspace, target)
+    wid, row = _worker(workspace, wid)
     old = row.get("state")
     if old == "retired":
         pr.set_worker_state(workspace, wid, "live")
