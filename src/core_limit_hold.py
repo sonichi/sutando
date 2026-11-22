@@ -670,6 +670,23 @@ def clear(workspace: Path, now: Optional[float] = None, by: Optional[str] = None
     return hold
 
 
+def reinstate(workspace: Path, now: Optional[float] = None, by: Optional[str] = None,
+              mirror: bool = True, seat: Optional[str] = None) -> Optional[dict]:
+    """Put back the hold `clear(by=by)` lifted for a restart that did not happen, in force long
+    enough for the owner's next "retry now" to count. Any other record is left as it is."""
+    at = time.time() if now is None else now
+    hold = read_hold(workspace, seat)
+    if not hold or hold.get("status") != "cleared" or hold.get("cleared_by") != by:
+        return hold
+    back = {k: v for k, v in hold.items() if k not in ("released_at", "cleared_by")}
+    until = hold.get("until") if isinstance(hold.get("until"), (int, float)) else 0.0
+    back.update(status="held", until=max(float(until), at + BACKOFF_BASE_S), reinstated_at=at)
+    _write_hold(workspace, back, seat)
+    if mirror and not seat:
+        _mirror_core_status(workspace, "paused", back.get("reason") or status_line(back), at)
+    return back
+
+
 def hold_while_wedged(workspace: Path, text: Optional[str], now: Optional[float] = None,
                       seat: Optional[str] = None, seat_label: Optional[str] = None) -> Optional[dict]:
     """The hold in force for a live core (or worker `seat`) stuck at a provider-limit screen,
@@ -832,17 +849,22 @@ def _recorded_actions(hold: Optional[dict]) -> list:
 _STEPS = ("answered", "lifted", "archived")
 
 
-def _steps(entry: dict) -> tuple:
-    return _STEPS + (("relaunched",) if "relaunch" in entry else ())
+#: A dispatched restart whose child has not said it started by then never started.
+DISPATCH_GRACE_S = 60.0
 
 
-def _mark(workspace: Path, task: str, step: str, seat: Optional[str] = None) -> None:
+def _done(entry: dict) -> bool:
+    """Every step of a recorded action has landed; a relaunch is done once its outcome is recorded."""
+    return all(entry.get(step) for step in _STEPS) and ("relaunch" not in entry or "relaunched" in entry)
+
+
+def _mark(workspace: Path, task: str, step: str, seat: Optional[str] = None, value=True) -> None:
     """Persist one finished step of a recorded action; the record, not a file, says it is done."""
     hold = read_hold(workspace, seat)
     acts = _recorded_actions(hold)
     for act in acts:
         if act["task"] == task:
-            act[step] = True
+            act[step] = value
     if hold is not None:
         _write_hold(workspace, dict(hold, actions=acts), seat)
 
@@ -862,8 +884,9 @@ def _finish(workspace: Path, entry: dict, now: float, relaunch: Optional[dict] =
         _mark(workspace, task, "answered", seat)
     if not entry.get("lifted"):
         hold = read_hold(workspace, seat)
-        # A relaunch onto another model needs the hold: it keeps the old model's restart down.
-        keep = bool((entry.get("relaunch") or {}).get("model"))
+        # A relaunch keeps the hold: a switch's restart stays held, and a retry's child lifts it
+        # itself, so a restart that never happens leaves the pause in force.
+        keep = "relaunch" in entry
         if entry.get("ok") and not keep and hold and hold.get("status") == "held":
             clear(workspace, now, by=task, seat=seat)
         _mark(workspace, task, "lifted", seat)
@@ -872,18 +895,34 @@ def _finish(workspace: Path, entry: dict, now: float, relaunch: Optional[dict] =
         if live.exists():
             _archive_task(workspace, live)
         _mark(workspace, task, "archived", seat)
-    if "relaunch" in entry and not entry.get("relaunched"):
-        # Marked first: a monitor killed by the restart it started must not start a second one.
-        _mark(workspace, task, "relaunched", seat)
-        if relaunch and not _spawn_relaunch(workspace, relaunch, entry["relaunch"].get("model")):
-            _tell_owner(workspace, 'I could not start the restart, so it is still paused. Send "retry now" '
-                        "to try again.")
+    if "relaunch" in entry and "relaunched" not in entry:
+        model = entry["relaunch"].get("model")
+        if not relaunch:
+            # The launcher's gate: the core is starting anyway, so a retry only lifts the hold.
+            if entry.get("ok") and not model:
+                clear(workspace, now, by=task, seat=seat)
+            _mark(workspace, task, "relaunched", seat)
+        elif entry.get("dispatched_at") is None:
+            # The intent is recorded before the child exists; only the child records the outcome.
+            _mark(workspace, task, "dispatched_at", seat, value=now)
+            if not _spawn_relaunch(workspace, relaunch, model, task, seat):
+                _relaunch_not_started(workspace, task, seat)
+        elif not entry.get("launch_started") and now - float(entry["dispatched_at"]) > DISPATCH_GRACE_S:
+            _relaunch_not_started(workspace, task, seat)
 
 
-def _spawn_relaunch(workspace: Path, relaunch: dict, model: Optional[str]) -> bool:
+def _relaunch_not_started(workspace: Path, task: str, seat: Optional[str]) -> None:
+    _mark(workspace, task, "relaunched", seat, value=False)
+    _tell_owner(workspace, 'I could not start the restart, so it is still paused. Send "retry now" to try again.')
+
+
+def _spawn_relaunch(workspace: Path, relaunch: dict, model: Optional[str], task: Optional[str] = None,
+                    seat: Optional[str] = None) -> bool:
     """Start `relaunch` detached, so it outlives the monitor whose core it restarts."""
     import subprocess
     cmd = [sys.executable, str(Path(__file__).resolve()), "relaunch", "--workspace", str(workspace)]
+    if task:
+        cmd += ["--task", task] + (["--seat", seat] if seat else [])
     if relaunch.get("command"):
         cmd += ["--", *relaunch["command"]]
     else:
@@ -901,12 +940,34 @@ def _spawn_relaunch(workspace: Path, relaunch: dict, model: Optional[str]) -> bo
 
 
 def relaunch_core(workspace: Path, launcher: Optional[str], model: Optional[str] = None,
-                  switch_entry: Optional[str] = None, run=None, command: Optional[list] = None) -> bool:
+                  switch_entry: Optional[str] = None, run=None, command: Optional[list] = None,
+                  task: Optional[str] = None, seat: Optional[str] = None) -> bool:
     """Restart a live core from outside it; with `model`, the restart is held by the hold still in
     force and the switch then writes the model and starts the core. A worker seat's restart is the
-    `command` its pool injected. The owner hears of a failure."""
+    `command` its pool injected. For a recorded action (`task`), a retry lifts the hold just before
+    its restart and puts it back when the restart fails, and the outcome is recorded on the action.
+    The owner hears of a failure."""
     import subprocess
     run = run or subprocess.run
+    workspace = Path(workspace)
+    lifted = False
+    if task:
+        _mark(workspace, task, "launch_started", seat, value=time.time())
+        hold = read_hold(workspace, seat)
+        if not model and hold and hold.get("status") == "held":
+            clear(workspace, by=task, seat=seat)
+            lifted = True
+    ok = _relaunch(workspace, launcher, model, switch_entry, run, command)
+    if task:
+        if not ok and lifted:
+            reinstate(workspace, by=task, seat=seat)
+        _mark(workspace, task, "relaunched", seat, value=ok)
+    return ok
+
+
+def _relaunch(workspace: Path, launcher: Optional[str], model: Optional[str], switch_entry: Optional[str],
+              run, command: Optional[list]) -> bool:
+    import subprocess
 
     def rc(cmd):
         try:
@@ -952,7 +1013,7 @@ def handle_owner_actions(workspace: Path, now: Optional[float] = None, *,
     now = time.time() if now is None else now
     workspace = Path(workspace)
     for entry in _recorded_actions(read_hold(workspace, seat)):
-        if not all(entry.get(step) for step in _steps(entry)):
+        if not _done(entry):
             _finish(workspace, entry, now, relaunch, seat)
     done = []
     for path in sorted((workspace / "tasks").glob("task-*.txt")):
@@ -1064,6 +1125,8 @@ def main(argv=None) -> int:
     rel.add_argument("--launcher", default="", help="the core launcher (start-cli.sh)")
     rel.add_argument("--model", default="", help="restart on this model")
     rel.add_argument("--switch-entry", default="", help="the model-switch entry")
+    rel.add_argument("--task", default="", help="the recorded action this restart carries out")
+    rel.add_argument("--seat", default="", help="the worker seat whose hold that action is on")
     rel.add_argument("command", nargs=argparse.REMAINDER, help="after --: a worker seat's injected restart")
     args = ap.parse_args(argv)
     if args.cmd == "relaunch":
@@ -1071,7 +1134,8 @@ def main(argv=None) -> int:
         if not command and not args.launcher:
             ap.error("relaunch needs --launcher or a command after --")
         return 0 if relaunch_core(Path(args.workspace), args.launcher or None, args.model or None,
-                                  args.switch_entry or None, command=command) else 1
+                                  args.switch_entry or None, command=command, task=args.task or None,
+                                  seat=args.seat or None) else 1
     if args.cmd == "held":
         hold = active_hold(Path(args.workspace) if args.workspace else resolve_workspace())
         if hold:

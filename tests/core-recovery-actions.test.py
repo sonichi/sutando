@@ -69,6 +69,14 @@ class Run:
         return subprocess.CompletedProcess(argv, self.rc, self.out, self.out)
 
 
+class Hang(Run):
+    """A restart that never finishes in time."""
+
+    def __call__(self, argv, **kw):
+        self.calls.append((argv, kw))
+        raise subprocess.TimeoutExpired(argv, kw.get("timeout") or 0)
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -385,6 +393,32 @@ class Executor(Base):
         [receipt] = RA.run_pending(self.mgr, target, runner=run, now=now)
         self.assertEqual((receipt["outcome"], run.calls[0][0]), ("done", ["python3", "pool_manage.py", "retry", "w1"]))
         self.assertEqual(core_limit_hold.read_hold(self.ws, SEAT_SESSION)["status"], "cleared")
+
+    def test_a_live_cores_failed_restart_keeps_it_paused(self):
+        for rc in (1, None):
+            with self.subTest(rc=rc):
+                self.tearDown()
+                self.setUp()
+                now = self._hold(source=core_limit_hold.PANE_SOURCE)
+                req = self.card()
+                self.click(req, "retry_now")
+                [receipt] = self.run_pending(Run(rc=1) if rc else Hang(), now=now)
+                self.assertEqual(receipt["outcome"], "failed")
+                self.assertIsNotNone(core_limit_hold.active_hold(self.ws, now), "a failed restart left no pause")
+                self.assertIn("still paused", self.mgr.get(req.id).message)
+
+    def test_a_seats_failed_restart_keeps_it_paused(self):
+        now = self._hold(seat=SEAT_SESSION, source=core_limit_hold.PANE_SOURCE)
+        req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED, seat=SEAT)
+        self.click(req, "retry_now")
+        target = RA.Target(self.ws, SOCK, SEAT_SESSION, seat=SEAT, retry_cmd=["python3", "pool_manage.py", "retry", "w1"])
+        [receipt] = RA.run_pending(self.mgr, target, runner=Run(rc=1), now=now)
+        self.assertEqual(receipt["outcome"], "failed")
+        self.assertIsNotNone(core_limit_hold.active_hold(self.ws, now, SEAT_SESSION))
+        outcome_line = self.mgr.get(req.id).message.rsplit("\n\n", 1)[-1]
+        self.assertIn("still paused", outcome_line)
+        self.assertNotIn("continues when the limit resets", outcome_line)
+        self.assertIsNone(core_limit_hold.read_hold(self.ws), "the seat's failure touched the core's hold")
 
     def test_the_keystroke_driver_and_a_recovered_core_leave_an_owed_click_alone(self):
         req = self.card(kind="unknown", prompt=UNKNOWN)

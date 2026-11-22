@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
 import shutil
 import socket
@@ -68,7 +69,6 @@ RUNTIME_ACTIONS = {"claude": frozenset(CLICK_VERBS),
 NEUTRAL_ACTIONS = frozenset({"restart_core", "escape_prompt"})
 RECEIPT_OUTCOMES = ("done", "refused", "stale", "failed")
 
-MAX_STR = 64
 MAX_ACTIONS = 8
 MAX_SWITCH_MODELS = 6
 #: The record on disk is a few hundred bytes; a reader refuses anything past this.
@@ -98,6 +98,11 @@ _LOGIN_KINDS = frozenset({"login"})
 _CREDIT_TEXT = re.compile(r"\bout of (?:usage )?credits?\b|\bcredit balance\b|\binsufficient[_ ](?:credits?|quota)\b"
                           r"|\bbilling\b", re.I)
 _HEX = re.compile(r"^[0-9a-f]{6,64}$")
+#: The documented shape of each identifier the record carries; a value of any other shape is dropped.
+MODEL_NAMES = ("opus", "sonnet", "haiku", "fable", "default")
+_SHAPES = {"incident": re.compile(r"inc_[0-9a-f]{8}"), "account": re.compile(r"acct_[0-9a-f]{6}"),
+           "model": re.compile("|".join(MODEL_NAMES))}
+MAX_INT = 2 ** 53
 _ALL_ALIASES = tuple(a for r in RUNTIMES for a in MODEL_ALIASES[r])
 
 
@@ -126,13 +131,10 @@ def parse_action_id(action_id: Any, runtime: Optional[str] = None, accounts: tup
 
 
 def _int(value: Any) -> Optional[int]:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    """A finite, non-negative number as an int, else None (NaN, infinities and bools included)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         return None
-    return int(value)
-
-
-def _str(value: Any) -> Optional[str]:
-    return value[:MAX_STR] if isinstance(value, str) and value else None
+    return int(value) if 0 <= value <= MAX_INT else None
 
 
 def coerce(record: Any) -> Optional[dict]:
@@ -140,15 +142,15 @@ def coerce(record: Any) -> Optional[dict]:
     if not isinstance(record, dict) or record.get("v") != VERSION or record.get("state") not in STATES:
         return None
     out: dict = {"v": VERSION, "state": record["state"]}
-    for key in ("incident", "model", "account"):
-        value = _str(record.get(key))
-        if value is not None:
+    for key, shape in _SHAPES.items():
+        value = record.get(key)
+        if isinstance(value, str) and shape.fullmatch(value):
             out[key] = value
     if record.get("runtime") in RUNTIMES:
         out["runtime"] = record["runtime"]
     for key in ("since", "reset_at", "waiting_tasks", "restarts_10m"):
         value = _int(record.get(key))
-        if value is not None and value >= 0:
+        if value is not None:
             out[key] = value
     acts = record.get("actions")
     if isinstance(acts, list):
@@ -274,12 +276,14 @@ def derive(supervisor: Optional[dict], hold: Optional[dict], supervisor_status: 
     hold_active = _hold_active(hold, now)
     state = _state(supervisor, hold_active, supervisor_status, quota, wedge, restarts_10m, now, runtime)
     limited = state in ("paused_limit", "out_of_credits")
-    if isinstance(prev, dict) and prev.get("state") == state and _int(prev.get("since")) is not None:
-        since, incident = int(prev["since"]), _str(prev.get("incident"))
+    prev = coerce(prev)
+    started = _int(hold.get("started_at")) if hold_active else None
+    if prev and prev["state"] == state and prev.get("since") is not None and prev["since"] <= now:
+        since = prev["since"]
     else:
-        started = _int(hold.get("started_at")) if hold_active else None
-        since, incident = (started if started is not None else int(now)), None
-    record: dict = {"v": VERSION, "incident": incident or _incident(state, since, hold, hold_active),
+        since = started if started is not None else int(now)
+    # Always derived, never carried: a stored incident names whatever incident wrote it.
+    record: dict = {"v": VERSION, "incident": _incident(state, since, hold, hold_active),
                     "state": state, "since": since}
     if limited and hold_active:
         reset = _int(hold.get("reset_at"))
@@ -442,7 +446,7 @@ def gather(workspace: Path, supervisor: Optional[dict], *, now: float, runtime: 
         _read_json(status_read_path("supervisor-status.json", workspace)),
         _read_json(status_read_path("quota-state.json", workspace)),
         cli_wedge.frame_abnormal(pane) if pane else None,
-        now=now, prev=read(workspace, now, max_age_s=None), runtime=runtime, model=model,
+        now=now, prev=read(workspace, now), runtime=runtime, model=model,
         waiting_tasks=core_gate_notice.queued_count(workspace),
         restarts_10m=restarts_in_window(workspace, now), runtimes_available=runtimes_on_host())
 

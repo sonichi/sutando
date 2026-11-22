@@ -112,6 +112,11 @@ class _Base(unittest.TestCase):
     def notices(self):
         return sorted((self.ws / "results").glob("proactive-*.txt"))
 
+    def run_child(self, cmd, rc):
+        """Run the detached restart the monitor spawned, its launcher exiting `rc`."""
+        with mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], rc)):
+            return clh.main(cmd[cmd.index("relaunch"):])
+
 
 class MonitorActsOnTheReply(_Base):
     def test_a_stuck_core_switches_once_on_the_owners_reply(self):
@@ -151,7 +156,10 @@ class MonitorActsOnTheReply(_Base):
         self.assertIn("restarting", (self.ws / "results" / "task-21.txt").read_text())
         [(cmd, _kw)] = self.spawned
         self.assertNotIn("--model", cmd)
+        self.assertIsNotNone(clh.active_hold(self.ws), "the hold lifts only when the restart runs")
+        self.assertEqual(self.run_child(cmd, 0), 0)
         self.assertIsNone(clh.active_hold(self.ws))
+        self.assertIs(clh.read_hold(self.ws)["actions"][0]["relaunched"], True)
         # The old screen is still up while the restart runs: it must not re-arm the hold.
         self.tick(USAGE_LIMIT)
         self.assertIsNone(clh.active_hold(self.ws))
@@ -204,6 +212,36 @@ class MonitorActsOnTheReply(_Base):
             self.tick(USAGE_LIMIT, health=self.health())
         told = [p.read_text() for p in self.notices()]
         self.assertTrue(any("could not start the restart" in t for t in told), told)
+        self.assertIsNotNone(clh.active_hold(self.ws), "no restart happened, so the pause stays in force")
+        self.assertIs(clh.read_hold(self.ws)["actions"][0]["relaunched"], False)
+
+    def test_a_failed_restart_puts_the_pause_back_and_a_new_retry_counts(self):
+        self.tick(USAGE_LIMIT)
+        owner_task(self.ws / "tasks", "task-26", "retry now")
+        self.tick(USAGE_LIMIT, health=self.health())
+        [(cmd, _kw)] = self.spawned
+        self.assertEqual(self.run_child(cmd, 1), 1)
+        hold = clh.active_hold(self.ws)
+        self.assertIsNotNone(hold, "a restart that failed left the core with no pause to retry")
+        self.assertIs(hold["actions"][0]["relaunched"], False)
+        self.assertTrue(any("could not restart the core" in p.read_text() for p in self.notices()))
+        owner_task(self.ws / "tasks", "task-27", "retry now")
+        self.tick(USAGE_LIMIT, health=self.health())
+        self.assertEqual(len(self.spawned), 2, "the owner's next retry was not acted on")
+
+    def test_a_dispatched_restart_whose_child_never_started_is_reported_once(self):
+        self.tick(USAGE_LIMIT)
+        owner_task(self.ws / "tasks", "task-28", "retry now")
+        self.tick(USAGE_LIMIT, health=self.health())
+        self.tick(USAGE_LIMIT, health=self.health())
+        self.assertNotIn("relaunched", clh.read_hold(self.ws)["actions"][0], "decided inside the grace")
+        later = time.time() + clh.DISPATCH_GRACE_S + 5
+        clh.handle_owner_actions(self.ws, later, relaunch={"launcher": "L", "switch": "S"})
+        clh.handle_owner_actions(self.ws, later + 1, relaunch={"launcher": "L", "switch": "S"})
+        self.assertEqual(len(self.spawned), 1, "a dispatch whose outcome is unknown was spawned again")
+        self.assertIsNotNone(clh.active_hold(self.ws, later))
+        self.assertIs(clh.read_hold(self.ws)["actions"][0]["relaunched"], False)
+        self.assertEqual(sum("could not start the restart" in p.read_text() for p in self.notices()), 1)
 
 
     def test_a_codex_core_is_left_to_its_own_launcher(self):
@@ -292,13 +330,28 @@ class WorkerSeat(_Base):
         self.wtick(FABLE_REFUSED)
         [(cmd, _kw)] = self.spawned
         self.assertEqual(cmd[cmd.index("--") + 1:], RETRY_CMD)
+        self.assertEqual(cmd[cmd.index("--seat") + 1], WORKER)
         self.assertIn("Mira-the-designer", (self.ws / "results" / "task-40.txt").read_text())
+        self.assertIsNotNone(clh.active_hold(self.ws, seat=WORKER), "the hold lifts only when the restart runs")
+        self.assertEqual(self.run_child(cmd, 0), 0)
         self.assertIsNone(clh.active_hold(self.ws, seat=WORKER))
         [rec] = self.audit()
         self.assertEqual((rec["seat"], rec["action"], rec["result"], rec["who"]),
                          (WORKER, "retry", "done", "@owner:example.test"))
         self.wtick(FABLE_REFUSED)
         self.assertEqual(len(self.spawned), 1)
+
+    def test_a_failed_worker_restart_puts_the_seats_pause_back(self):
+        self.wtick(FABLE_REFUSED)
+        line = clh.read_hold(self.ws, WORKER)["notice_line"]
+        gateway_reply(self.ws, "task-45", "retry now", quoted=line)
+        self.wtick(FABLE_REFUSED)
+        [(cmd, _kw)] = self.spawned
+        self.assertEqual(self.run_child(cmd, 1), 1)
+        self.assertIsNotNone(clh.active_hold(self.ws, seat=WORKER))
+        self.assertIs(clh.read_hold(self.ws, WORKER)["actions"][0]["relaunched"], False)
+        self.assertIsNone(clh.read_hold(self.ws), "the seat's failure touched the core's hold")
+        self.assertTrue(any("could not restart the worker" in p.read_text() for p in self.notices()))
 
     def test_a_card_reply_naming_the_seat_reaches_it(self):
         self.wtick(RATE_LIMIT_OPTIONS)

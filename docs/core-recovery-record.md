@@ -46,8 +46,13 @@ older than 5 minutes, larger than 4 KiB or outside the schema as absent.
 
 `offline` is never written: the server derives it from missing heartbeats.
 
-- `since` and `incident` stand while the state does; a limit pause takes both from its hold, so it
-  stays one incident across monitor restarts.
+- `since` stands while the state does and the last record is fresh (at most 5 minutes old);
+  `incident` is always derived from the state and `since` (a limit pause: from its hold), never
+  copied from a stored record, so a pause stays one incident across monitor restarts.
+- Every identifier has one shape, enforced on write and on read: `incident` is `inc_` + 8 hex,
+  `account` is `acct_` + 6 hex, `model` is one of `opus`, `sonnet`, `haiku`, `fable`, `default`.
+  A value of any other shape is dropped, not cut. Numbers are finite, non-negative and at most
+  2^53; anything else (NaN, infinities, booleans) is dropped.
 - A field the inputs cannot supply is left out, never defaulted (`reset_at` only when the provider
   gave one).
 - `actions` come from a fixed set (`retry_now`, `switch_model`, `switch_runtime`, `restart_core`,
@@ -116,6 +121,13 @@ runtime carries out, with fixed argv, never what a subprocess printed. It writes
 session, outcome) and edits the card in place. `buy_credits`, `add_account` and `switch_account`
 are refused until the confirmed, re-authenticated sign-in flow exists; a worker seat's card never
 runs `restart_core` or `switch_runtime`.
+
+Retry now on a live core or worker seat lifts its hold only for the restart and puts it back
+(`core_limit_hold.reinstate`) when the restart fails, so the card says it is still paused and a
+second tap counts. The owner's bare "retry now" records the restart's dispatch before the
+detached child starts; the child lifts the hold, runs the restart, records the outcome on the
+action and puts the hold back on failure. A dispatch whose child never said it started within 60
+seconds is reported once, and the hold stays in force.
 
 ## Contract fixtures
 

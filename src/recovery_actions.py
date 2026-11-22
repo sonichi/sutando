@@ -42,7 +42,7 @@ from typing import Callable, Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hitl import recovery  # noqa: E402
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 HOLD_SOURCE = "core-hold"
 SWITCH_TIMEOUT_S = 90
 RESTART_TIMEOUT_S = 180
@@ -162,6 +162,10 @@ class Target:
         return base / "seats" / self.session if self.seat else base
 
 
+#: Who lifted a hold for a card's retry, so only that retry's failure puts it back.
+RETRY_BY = "recovery-card"
+
+
 def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner, now: float,
              follow_ups: List[tuple]):
     """(outcome, reason for the receipt, line for the card, recovery fields)."""
@@ -181,16 +185,23 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
             if not target.retry_cmd:
                 why = "This worker's restart is not available here; it continues when the limit resets."
                 return "refused", why, why, {}
-            core_limit_hold.clear(ws, now, by="recovery-card", mirror=False, seat=target.hold_key())
+            core_limit_hold.clear(ws, now, by=RETRY_BY, mirror=False, seat=target.hold_key())
             if _rc(runner, target.retry_cmd, env, RESTART_TIMEOUT_S) != 0:
-                why = "The worker did not restart; it continues when the limit resets."
-                return "failed", why, why, {}
+                core_limit_hold.reinstate(ws, now, by=RETRY_BY, mirror=False, seat=target.hold_key())
+                why = "The worker did not restart, so it is still paused; tap Retry now to try again."
+                return "failed", why, why, {"state": "paused_limit"}
             return "done", None, f"Retrying now: I restarted {target.seat}.", {"state": "starting"}
         if hold is not None:
             live = hold.get("source") == core_limit_hold.PANE_SOURCE
-            core_limit_hold.clear(ws, now, by="recovery-card", mirror=not live)
+            core_limit_hold.clear(ws, now, by=RETRY_BY, mirror=not live)
             if live:
-                verb = recovery.RESTART_CORE  # a live core at its limit screen retries by a restart
+                # A live core at its limit screen retries by a restart; the hold returns if it fails.
+                outcome = _execute(recovery.RESTART_CORE, None, req, target, runner, now, follow_ups)
+                if outcome[0] != "done":
+                    core_limit_hold.reinstate(ws, now, by=RETRY_BY, mirror=False)
+                    why = "The core did not restart, so it is still paused; tap Retry now to try again."
+                    return outcome[0], why, why, {"state": "paused_limit"}
+                return outcome
             else:
                 return ("done", None, "Retrying now: the core is starting. If the limit is still in force it "
                         "pauses again and a new card says so.", {"state": "starting"})

@@ -222,8 +222,8 @@ class Fields(unittest.TestCase):
                           "reset_at": True, "model": "x" * 99, "waiting_tasks": 3.0,
                           "actions": ["retry_now", "rm -rf /", "restart_core"] + ["retry_now"] * 20,
                           "switch_models": ["sonnet", "gpt-9", "haiku"], "prompt": "pane text"})
-        self.assertEqual(len(rec["incident"]), crs.MAX_STR)
-        self.assertEqual(len(rec["model"]), crs.MAX_STR)
+        self.assertNotIn("incident", rec, "an incident of any other shape is dropped, not cut")
+        self.assertNotIn("model", rec)
         self.assertNotIn("since", rec)
         self.assertNotIn("reset_at", rec)
         self.assertNotIn("prompt", rec)
@@ -233,6 +233,55 @@ class Fields(unittest.TestCase):
         self.assertEqual(rec["switch_models"], ["sonnet", "haiku"])
         for bad in (None, [], {"v": 2, "state": "running"}, {"v": 1, "state": "offline"}):
             self.assertIsNone(crs.coerce(bad), bad)
+
+
+    def test_identifiers_keep_their_documented_shape_on_read_and_write(self):
+        good = {"v": 1, "state": "running", "incident": "inc_0123abcd", "model": "sonnet", "account": "acct_3f9a2b"}
+        self.assertEqual(crs.coerce(good), good)
+        for key, bad in (("incident", "inc_0123abcd\n"), ("incident", "INC_0123ABCD"), ("incident", "inc_x"),
+                         ("model", "sonnet; rm"), ("model", "claude-opus-4-5"), ("model", "Sonnet"),
+                         ("account", "acct_3f9a2b0c"), ("account", "me@example.com"), ("account", 7)):
+            with self.subTest(key=key, bad=bad):
+                self.assertNotIn(key, crs.coerce(dict(good, **{key: bad})))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state" / crs.RECORD_FILE
+            path.parent.mkdir()
+            path.write_text(json.dumps(dict(good, incident="inc_forged!!", account="someone@example.com")))
+            self.assertEqual(crs.read(Path(tmp)), {"v": 1, "state": "running", "model": "sonnet"})
+
+    def test_non_finite_and_out_of_range_numbers_are_dropped(self):
+        for bad in (float("nan"), float("inf"), float("-inf"), -1, 2 ** 60, True):
+            with self.subTest(bad=bad):
+                rec = crs.coerce({"v": 1, "state": "running", "since": bad, "reset_at": bad,
+                                  "waiting_tasks": bad, "restarts_10m": bad})
+                self.assertEqual(rec, {"v": 1, "state": "running"})
+        hold = dict(HOLD, started_at=float("nan"), reset_at=float("inf"))
+        rec = derive({"state": "crashed"}, hold)
+        self.assertEqual(rec["since"], int(NOW))
+        self.assertNotIn("reset_at", rec)
+        json.dumps(rec, allow_nan=False)
+
+    def test_an_old_incident_is_never_reused(self):
+        prev = {"v": 1, "state": "blocked_prompt", "since": int(NOW) - 30, "incident": "inc_00000000"}
+        rec = derive({"state": "blocked-human", "kind": "selection"}, prev=prev)
+        self.assertEqual(rec["since"], prev["since"], "the same incident keeps its start")
+        self.assertNotEqual(rec["incident"], "inc_00000000", "the stored incident string was carried")
+        self.assertEqual(rec["incident"], derive({"state": "blocked-human", "kind": "selection"},
+                                                 prev=dict(prev, incident="inc_11111111"))["incident"])
+        ahead = dict(prev, since=int(NOW) + 3600)
+        self.assertEqual(derive({"state": "blocked-human", "kind": "selection"}, prev=ahead)["since"], int(NOW))
+
+    def test_a_record_the_monitor_stopped_refreshing_starts_a_new_incident(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            now = time.time()
+            old = derive({"state": "blocked-human", "kind": "selection"}, now=now - 7200)
+            crs.publish(ws, old, now=now)
+            stale = now - crs.MAX_AGE_S - 10
+            os.utime(ws / "state" / crs.RECORD_FILE, (stale, stale))
+            rec = crs.gather(ws, {"state": "blocked-human", "kind": "selection"}, now=now)
+            self.assertEqual(rec["since"], int(now))
+            self.assertNotEqual(rec["incident"], old["incident"])
 
 
 class Writer(unittest.TestCase):

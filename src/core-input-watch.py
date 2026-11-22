@@ -1018,7 +1018,7 @@ def drive_escalations(manager, session, prompt, state, send):
     return acted
 
 
-_REPO = _Path(__file__).resolve().parent.parent
+_REPO = _Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 
 
 def limit_reply_step(workspace, settled, seen, pane, runtime, now=None, repo=_REPO,
