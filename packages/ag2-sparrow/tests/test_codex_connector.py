@@ -908,7 +908,7 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         with mock.patch.object(model_switch.ModelSwitch, "card", side_effect=ValueError("bad name")):
             c, listed = self.connector([{"id": "gpt-5.6-terra", "displayName": "Stub 5"}])
             with listed:
-                self.assertEqual(c.models.card_task(str(self.work / "tasks" / "task-3.txt"), str(self.work / "o.txt")),
+                self.assertEqual(c.desk.task(str(self.work / "tasks" / "task-3.txt"), str(self.work / "o.txt")),
                                  "model-picked")
         self.assertIn("Switching to Stub 5 on your next message", (self.work / "o.txt").read_text())
         # An owed outcome that cannot be built is said in words once, then dropped.
@@ -1092,6 +1092,15 @@ class AccountCardTest(CardWorld, unittest.TestCase):
                              "account-started")
         kept = json.loads((self.work / "state" / "account.json").read_text())
         self.assertEqual((kept["id"], [o["state"] for o in kept["owed"]]), ("login-1", ["done"]))
+        # A stop after the final card is queued and before it leaves the saved list: telling it
+        # again after the restart is not a second card.
+        stopped = mock.patch.object(account_switch.AccountSwitch, "keep", side_effect=OSError("the connector stopped here"))
+        with stopped, self.assertRaises(OSError):
+            c.accounts.tell()
+        outbox = self.bridge / "agent-cards" / "outbox"
+        self.assertEqual(len(list(outbox.iterdir())), 1, "the final card was queued once")
+        self.assertEqual([o["state"] for o in c.accounts.owed()], ["done"], "and is still on the saved list")
+        self.assertEqual((c.accounts.tell(), len(list(outbox.iterdir()))), ([], 1), "told again: no second card")
         # A report that names no sign-in, or another one, does not end the one in progress.
         self.assertEqual((c.accounts.finished(None, True), c.accounts.finished("login-other", True)), ("", ""))
         self.assertEqual(c.accounts.pending()["id"], "login-1")

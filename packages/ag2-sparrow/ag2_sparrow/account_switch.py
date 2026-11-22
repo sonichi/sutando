@@ -12,6 +12,7 @@ import json
 import os
 import time
 import urllib.parse
+import uuid
 
 from . import card_desk, connector_cards
 
@@ -79,8 +80,8 @@ class AccountSwitch:
     def usable(self) -> bool:
         return card_desk.usable(self.bridge_state)
 
-    def post(self, room, built) -> bool:
-        return card_desk.post(self.bridge_state, room, built, self.log)
+    def post(self, room, built, key: str = "", at_ns: int = 0) -> bool:
+        return card_desk.post(self.bridge_state, room, built, self.log, key, at_ns)
 
     def using(self) -> str:
         """The account in use, in words; a runtime that cannot say reads as unknown, never as signed out."""
@@ -162,14 +163,17 @@ class AccountSwitch:
     def last_word(self, waiting, state, text) -> bool:
         """A sign-in is over: it is no longer the one in progress, and its final card joins the results
         to be told, which are then posted oldest first. A new tap never removes one of them."""
-        self.keep({}, self.owed() + [{"room": waiting.get("room"), "state": state, "text": text}])
+        self.keep({}, self.owed() + [{"room": waiting.get("room"), "state": state, "text": text,
+                                      "key": uuid.uuid4().hex, "at": time.time_ns()}])
         return not self.tell()
 
     def tell(self) -> list:
         """Post the results still to be told, oldest first, stopping at the first that cannot be queued;
-        what is left."""
+        what is left. Each is queued under the key saved with it, so one queued just before a stop,
+        and still on the saved list after the restart, is not a second card."""
         owed = self.owed()
-        while owed and self.post(owed[0].get("room"), self.card(str(owed[0].get("state")), str(owed[0].get("text")))):
+        while owed and self.post(owed[0].get("room"), self.card(str(owed[0].get("state")), str(owed[0].get("text"))),
+                                 str(owed[0].get("key") or ""), int(owed[0].get("at") or 0)):
             owed.pop(0)
             self.keep(self.pending(), owed)
         return owed

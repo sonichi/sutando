@@ -80,12 +80,13 @@ def usable(bridge_state) -> bool:
     return bool(bridge_state) and os.path.isdir(bridge_state)
 
 
-def post(bridge_state, room, built, log) -> bool:
-    """Queue a built card for the bridge to post in `room`; False when it cannot be."""
+def post(bridge_state, room, built, log, key: str = "", at_ns: int = 0) -> bool:
+    """Queue a built card for the bridge to post in `room`; False when it cannot be. With `key` the
+    call may be repeated after a restart without a second card (connector_cards.queue)."""
     if not usable(bridge_state):
         return False
     try:
-        connector_cards.queue(bridge_state, str(room or ""), *built)
+        connector_cards.queue(bridge_state, str(room or ""), *built, key=key, at_ns=at_ns)
         return True
     except (OSError, ValueError) as e:
         log("card not queued:", "%s: %s" % (type(e).__name__, e))
