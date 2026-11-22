@@ -116,6 +116,10 @@ agy's `session/request_permission` is answered by `acp_host`'s policy, default d
 
 With `--allow-owner-shell-web`, the working-directory bound on `read` and `edit` is no longer a security
 boundary for the owner's turns: a command can read or write anything the owner's account can.
+That holds for an attested collaborator's turn too: once a collaborator has shell commands, nothing stops
+them from reading the agent's relay token file directly (mode 600 only keeps out other accounts, not
+the owner's), the owner's other credentials, or any file the owner can read. Turn the switch on
+only if you trust every attested collaborator of this agent with the owner's account and its secrets.
 
 For the owner's turns, agy applies its own permission rules first (an action they already allow runs
 without asking), and `--dangerously-skip-permissions` makes it run tools without asking; never add that
