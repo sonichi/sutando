@@ -182,17 +182,32 @@ class Records(unittest.TestCase):
         self.assertEqual(D._run(self.ws, "expired", ["x"], runner=runner), 1)
         self.assertEqual(ran, [], "a child whose action already ended ran its command")
 
-    def test_the_wrapper_waits_for_its_callers_record_then_acts(self):
-        waited = []
+    def test_the_wrapper_acts_only_once_its_caller_confirmed_the_hand_off(self):
+        ran = []
+        runner = lambda a, **k: ran.append(a) or subprocess.CompletedProcess(a, 0)  # noqa: E731
+        D.begin(self.ws, "ok")
+        self.assertEqual(D._run(self.ws, "ok", ["x"], runner=runner, after_gate="g", wait=lambda ws, g: True), 0)
+        self.assertEqual((ran, D.status(self.ws, "ok").state), ([["x"]], D.DONE))
+
+    def test_an_unconfirmed_hand_off_runs_nothing_and_reports_why(self):
+        # The parent was interrupted before it recorded the tap: the restart must not run.
+        ran = []
+        runner = lambda a, **k: ran.append(a) or subprocess.CompletedProcess(a, 0)  # noqa: E731
         D.begin(self.ws, "k")
-        D._run(self.ws, "k", ["x"], runner=lambda a, **k: subprocess.CompletedProcess(a, 0), after_gate="g",
-               wait=lambda ws, gate: waited.append(gate))
-        self.assertEqual(waited, ["g"])
+        self.assertEqual(D._run(self.ws, "k", ["x"], runner=runner, after_gate="g", wait=lambda ws, g: False), 1)
+        self.assertEqual(ran, [], "ran a restart whose hand-off was never confirmed")
+        self.assertEqual(D.status(self.ws, "k"), (D.FAILED, D.HANDOFF, None))
+
+    def test_the_wait_answers_whether_the_claim_was_finished(self):
+        self.assertFalse(D.wait_for_handoff(self.ws, "never", wait_s=0, sleep=lambda s: None),
+                         "no claim at all is not a confirmation")
         recovery_gate.admit(self.ws, "g", 10, now=10)
         clock = iter([0.0, 0.1, 0.2, 99.0])
-        D._wait_for_gate(self.ws, "g", wait_s=5, sleep=lambda s: None, clock=lambda: next(clock))
+        self.assertFalse(D.wait_for_handoff(self.ws, "g", wait_s=5, sleep=lambda s: None,
+                                            clock=lambda: next(clock)), "an accepted claim never finished")
         recovery_gate.finish(self.ws, "g", "done", now=11)
-        D._wait_for_gate(self.ws, "g", wait_s=5, sleep=lambda s: self.fail("waited on a finished claim"))
+        self.assertTrue(D.wait_for_handoff(self.ws, "g", wait_s=5,
+                                           sleep=lambda s: self.fail("waited on a finished claim")))
 
     def test_main_runs_the_command_after_the_separator(self):
         D.begin(self.ws, "m")

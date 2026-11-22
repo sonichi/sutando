@@ -259,7 +259,8 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
             # The pool's command hands the restart to its own detached child, which reports by key.
             key = _detached_key(req)
             detached_action.begin(ws, key, now)
-            if _rc(runner, target.retry_cmd, dict(env, **{detached_action.KEY_ENV: key}), RESTART_TIMEOUT_S) != 0:
+            child_env = dict(env, **{detached_action.KEY_ENV: key, detached_action.GATE_ENV: gate or ""})
+            if _rc(runner, target.retry_cmd, child_env, RESTART_TIMEOUT_S) != 0:
                 detached_action.report(ws, key, detached_action.FAILED, now=now)
                 core_limit_hold.reinstate(ws, now, by=RETRY_BY, mirror=False, seat=target.hold_key())
                 why = "The worker did not restart, so it is still paused. " + NEW_CARD
@@ -562,6 +563,8 @@ def _restart_failed(manager, workspace: Path, req_id: str, check: Dict, done, no
     what = check.get("what") or "it"
     if done.state == detached_action.EXPIRED:
         line = f"I couldn't confirm {what} came back within {int(detached_action.DEADLINE_S // 60)} minutes. " + NEW_CARD
+    elif done.reason == detached_action.HANDOFF:
+        line = "The tap was not recorded in time, so nothing was restarted. " + NEW_CARD
     elif done.reason and done.reason not in ("exit", "could not start"):
         line = done.reason  # the action's own sentence (the pool's, for a worker)
     elif done.rc == core_limit_hold.HOLD_EXIT:

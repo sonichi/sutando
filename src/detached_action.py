@@ -8,8 +8,9 @@ the caller's tmux session never takes it down; the action, or the `run` wrapper 
 command, writes the one terminal outcome with `report` (first report wins). `status` is what the
 caller's successor reads: running until reported, and `expired` once the deadline passes with no
 report, so nothing waits on an action that never answered. The `run` wrapper first waits until
-its caller has recorded the hand-off (the recovery gate's claim is finished), and acts only while
-the action is still running and unexpired, so a late or orphaned child never acts.
+its caller has recorded the hand-off (the recovery gate's claim is finished); unconfirmed by
+HANDOFF_WAIT_S, it reports failed (reason HANDOFF) and runs nothing. It acts only while the action
+is still running and unexpired, so a late or orphaned child never acts.
 
 Records: state/recovery/detached/<key digest>.json
   {"key", "state": "running"|"done"|"failed", "started_at", "deadline_at", "reason"?, "rc"?}
@@ -34,8 +35,12 @@ from workspace_default import status_path  # noqa: E402
 DEADLINE_S = 5 * 60
 #: The environment variable that hands the action's key to the process it starts.
 KEY_ENV = "SUTANDO_DETACHED_KEY"
-#: Longest the `run` wrapper waits for its caller to finish recording before it acts anyway.
+#: Longest the `run` wrapper waits for its caller to confirm it recorded the hand-off.
 HANDOFF_WAIT_S = 15.0
+#: The reported reason when that confirmation never came: nothing was run.
+HANDOFF = "handoff"
+#: Names the recovery-gate claim a child must see finished before it acts (a worker's retry).
+GATE_ENV = "SUTANDO_RECOVERY_GATE"
 RUNNING, DONE, FAILED, EXPIRED = "running", "done", "failed", "expired"
 
 
@@ -129,20 +134,25 @@ def spawn(workspace: Path, key: str, argv: List[str], *, env: Optional[dict] = N
     return False
 
 
-def _wait_for_gate(workspace: Path, gate: str, wait_s: float = HANDOFF_WAIT_S, sleep=time.sleep,
-                   clock=time.monotonic) -> None:
+def wait_for_handoff(workspace: Path, gate: str, wait_s: float = HANDOFF_WAIT_S, sleep=time.sleep,
+                     clock=time.monotonic) -> bool:
+    """True once the caller's recovery-gate claim `gate` is finished (it recorded the hand-off);
+    False when that is not confirmed within `wait_s`."""
     import recovery_gate
     end = clock() + wait_s
-    while clock() < end:
+    while True:
         if (recovery_gate.state(workspace, gate) or {}).get("state") == recovery_gate.FINISHED:
-            return
+            return True
+        if clock() >= end:
+            return False
         sleep(0.2)
 
 
 def _run(workspace: Path, key: str, argv: List[str], runner=subprocess.run, after_gate: Optional[str] = None,
-         wait=_wait_for_gate) -> int:
-    if after_gate:
-        wait(workspace, after_gate)
+         wait=wait_for_handoff) -> int:
+    if after_gate and not wait(workspace, after_gate):
+        report(workspace, key, FAILED, HANDOFF)  # an unconfirmed hand-off never runs
+        return 1
     if status(workspace, key).state != RUNNING:
         return 1  # reported or expired meanwhile: this child is no longer the action, so it never acts
     try:

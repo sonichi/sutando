@@ -257,6 +257,33 @@ class RetryIsDetachedAndTransactional(unittest.TestCase):
                     self.assertIn("could not restart Mira", got.reason)
                 self.assertEqual(list((self.ws / "results").glob("proactive-*.txt")), [], "no second surface")
 
+    def test_a_cards_retry_waits_for_its_watcher_to_confirm_the_tap_before_any_take_down(self):
+        from unittest import mock
+        sys.path.insert(0, str(REPO / "src"))
+        import detached_action
+        import recovery_gate
+        key, gate = "restart:hitl_h:1", "card:hitl_h:retry_now:1"
+        detached_action.begin(self.ws, key)
+        recovery_gate.admit(self.ws, gate, 10, now=10)  # accepted, never finished: the watcher died
+        env = {detached_action.KEY_ENV: key, detached_action.GATE_ENV: gate}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(detached_action, "HANDOFF_WAIT_S", 0.0), \
+                mock.patch.object(self.pm, "_handoff_confirmed",
+                                  lambda ws, g: detached_action.wait_for_handoff(ws, g, wait_s=0)), \
+                mock.patch.object(self.pm, "_take_down", lambda *a: self.fail("took the seat down")):
+            self.assertEqual(self.pm.retry(self.ws, REPO, WID)["result"], "failed")
+        self.assertEqual(detached_action.status(self.ws, key), (detached_action.FAILED, detached_action.HANDOFF, None))
+        self.assertEqual(self.paused, [])
+        self.assertEqual(list((self.ws / "results").glob("proactive-*.txt")), [], "the card says it, not a DM")
+        recovery_gate.finish(self.ws, gate, "done", now=11)
+        key2 = "restart:hitl_h:2"
+        detached_action.begin(self.ws, key2)
+        down = lambda ws, w, r: {"down": True, "sessions": {}, "closed_runs": []}  # noqa: E731
+        with mock.patch.dict(os.environ, {detached_action.KEY_ENV: key2, detached_action.GATE_ENV: gate}), \
+                mock.patch.object(self.pm, "_take_down", down), \
+                mock.patch.object(self.pm.rem, "restart", lambda *a, **k: {"result": "restarted", "detail": {}}):
+            self.assertEqual(self.pm.retry(self.ws, REPO, WID)["result"], "restarted", "confirmed: it runs")
+
     def test_a_child_whose_tap_already_ended_takes_nothing_down(self):
         from unittest import mock
         sys.path.insert(0, str(REPO / "src"))

@@ -454,6 +454,28 @@ class Executor(Base):
         self.assertEqual(self.spawned.command()[2:], ["--runtime", "claude", "--restart"])
         self.assertEqual(receipt["recovery"]["runtime"], "claude")
 
+    def test_a_restart_whose_hand_off_was_not_confirmed_says_nothing_ran(self):
+        now = self._hold(source=core_limit_hold.PANE_SOURCE)
+        req = self.card()
+        self.click(req, "retry_now")
+        self.run_pending(Run(), now=now)
+        self.answer(detached_action.FAILED, reason=detached_action.HANDOFF)
+        self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=True, now=now + 1), [req.id])
+        card = self.mgr.get(req.id)
+        self.assertIn("not recorded in time, so nothing was restarted", card.message)
+        self.assertEqual(card.subject["receipt"]["outcome"], "failed")
+        self.assertIsNotNone(core_limit_hold.active_hold(self.ws, now + 2), "the lifted hold is back")
+
+    def test_a_seats_retry_hands_its_gate_claim_to_the_pool(self):
+        now = self._hold(seat=SEAT_SESSION, source=core_limit_hold.PANE_SOURCE)
+        req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED, seat=SEAT)
+        self.click(req, "retry_now")
+        run = Run()
+        target = RA.Target(self.ws, SOCK, SEAT_SESSION, seat=SEAT, retry_cmd=["python3", "pool_manage.py", "retry", "w1"])
+        RA.run_pending(self.mgr, target, runner=run, now=now)
+        env = run.calls[0][1]["env"]
+        self.assertTrue(env[detached_action.GATE_ENV].startswith(f"card:{req.id}:retry_now:"))
+
     def test_a_restart_held_by_a_limit_says_so_once_it_answers(self):
         req = self.card(kind="unknown", prompt=UNKNOWN)
         self.click(req, "restart_core")

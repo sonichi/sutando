@@ -393,6 +393,12 @@ def retry(workspace, repo, target, *, runner=subprocess.run, spawn=None) -> dict
     wid, row = _worker(workspace, target)
     base = {"worker_id": wid, "action": "retry"}
     key = os.environ.get(_DETACHED_KEY_ENV) or None
+    gate = os.environ.get(_GATE_ENV) or None
+    if key and gate and not _handoff_confirmed(workspace, gate):
+        # The watcher that asked never confirmed it recorded the tap: nothing is taken down.
+        out = {**base, "result": "failed", "why": "the tap was not recorded in time"}
+        _retry_ended(workspace, row.get("name") or wid, out, key, tell=False, reason=_HANDOFF)
+        return out
     if key and not _still_current(workspace, key):
         # The tap this child was started for already ended (reported or past its deadline).
         return {**base, "result": "failed", "why": "the retry it was started for already ended"}
@@ -430,8 +436,16 @@ def retry(workspace, repo, target, *, runner=subprocess.run, spawn=None) -> dict
     return out
 
 
-#: The key a recovery card's tap hands its retry (detached_action.KEY_ENV in src).
+#: The key and gate claim a recovery card's tap hands its retry (detached_action.KEY_ENV and
+#: GATE_ENV in src), and the reason reported when that claim was never confirmed (HANDOFF).
 _DETACHED_KEY_ENV = "SUTANDO_DETACHED_KEY"
+_GATE_ENV = "SUTANDO_RECOVERY_GATE"
+_HANDOFF = "handoff"
+
+
+def _handoff_confirmed(workspace, gate: str) -> bool:
+    import detached_action
+    return detached_action.wait_for_handoff(Path(workspace), gate)
 
 
 def _still_current(workspace, key: str) -> bool:
@@ -439,7 +453,7 @@ def _still_current(workspace, key: str) -> bool:
     return detached_action.status(Path(workspace), key).state == detached_action.RUNNING
 
 
-def _retry_ended(workspace, name: str, out: dict, key, tell: bool = True) -> None:
+def _retry_ended(workspace, name: str, out: dict, key, tell: bool = True, reason=None) -> None:
     """The retry's one terminal result. A card's tap reads it from its detached key, so the card
     is the one surface; a bare reply's owner gets one DM line when a restart it started failed."""
     failed = out.get("result") == "failed"
@@ -448,7 +462,7 @@ def _retry_ended(workspace, name: str, out: dict, key, tell: bool = True) -> Non
     if key:
         import detached_action
         detached_action.report(Path(workspace), key, detached_action.FAILED if failed else detached_action.DONE,
-                               reason=line)
+                               reason=reason or line)
     elif failed and tell:
         _tell_owner_retry_failed(workspace, line)
 
