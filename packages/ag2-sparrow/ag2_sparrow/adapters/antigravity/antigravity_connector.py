@@ -224,24 +224,34 @@ class Connector:
         if {k: self.model_state().get(k) for k in seen} != seen:
             self.save_model_state(**seen)
 
-    def model_card(self, state: dict, done: str = ""):
-        """(body, card): one reply button per model agy offered; after a pick, the settled card."""
+    def model_card(self, state: dict, picked: str = "", ran: "str | None" = None):
+        """(body, card): one reply button per model agy offered. After a pick (`picked`) the card has no
+        buttons: it says the switch is coming, then, with `ran` (the model the next turn ran on), that
+        it happened or that it did not."""
         agent_card, _ = connector_cards._core()
         names = {m["id"]: m["name"] for m in state.get("available") or []}
-        now = state.get("wanted") or state.get("current") or ""
-        if done:
-            line = "Model: %s" % names.get(done, done)
-            return agent_card.build(MODEL_CARD, "done", title="Model", body=line, status="Switched",
-                                    text="Now using %s. It applies from your next message." % names.get(done, done))
+        now = state.get("current") or ""
+        if picked:
+            name = names.get(picked, picked)
+            if ran is None:
+                return agent_card.build(MODEL_CARD, "info", title="Model", body="Model: switching to %s" % name,
+                                        text="Switching to %s on your next message. I'll confirm here once it has "
+                                             "switched." % name)
+            if ran == picked:
+                return agent_card.build(MODEL_CARD, "done", title="Model", body="Model: now %s" % name,
+                                        status="Switched", text="Switched. I'm now using %s." % name)
+            return agent_card.build(MODEL_CARD, "error", title="Model", body="Model: could not switch to %s" % name,
+                                    text="I could not switch to %s. I'm still using %s. Send /model to try again."
+                                         % (name, names.get(ran, ran or "my default model")))
         buttons = [agent_card.button(name, "reply", reply="Use %s" % name,
                                      command=agent_card.reply("model", "agent", mid))
                    for mid, name in list(names.items())[:MODEL_BUTTONS]]
         return agent_card.build(MODEL_CARD, "pending", title="Model", body="Pick a model for %s" % self.name,
                                 text="Now using %s." % names.get(now, now or "the default model"), buttons=buttons)
 
-    def post_card(self, headers, built) -> bool:
+    def post_card(self, room, built) -> bool:
         try:
-            connector_cards.queue(self.args.bridge_state, str(headers.get("channel_id") or ""), *built)
+            connector_cards.queue(self.args.bridge_state, str(room or ""), *built)
             return True
         except (OSError, ValueError) as e:
             log("model card not queued:", "%s: %s" % (type(e).__name__, e))
@@ -262,18 +272,19 @@ class Connector:
                 publish(result_file, quoted("That model is not one I can use now. Send /model for the current list.") + "\n")
                 outcome = "model-unknown"
             else:
-                self.save_model_state(wanted=picked)
-                done = self.model_card(dict(state, wanted=picked), done=picked)
-                publish(result_file, "[no-send] the model card answers\n" if self.post_card(headers, done)
-                        else quoted(done[0] + ". It applies from your next message.") + "\n")
-                outcome = "model-set"
+                room = str(sent.get("channel_id") or "")
+                self.save_model_state(wanted=picked, asked_in=room, told="")
+                coming = self.model_card(state, picked=picked)
+                publish(result_file, "[no-send] the model card answers\n" if self.post_card(room, coming)
+                        else quoted(coming[1]["text"]) + "\n")
+                outcome = "model-picked"
         elif verdict.verdict in (agent_card.COMMAND, agent_card.FORGED):
             publish(result_file, quoted(verdict.say) + "\n")
             outcome = "card-refused"
         elif said.lower() == MODEL_ASK and agent_card.owner_may_act(sent) is None:
             if not state.get("available"):
                 publish(result_file, quoted(MODEL_UNKNOWN) + "\n")
-            elif self.post_card(headers, self.model_card(state)):
+            elif self.post_card(sent.get("channel_id"), self.model_card(state)):
                 publish(result_file, "[no-send] the model card answers\n")
             else:
                 publish(result_file, quoted("I could not post the model card. Try again in a moment.") + "\n")
@@ -282,6 +293,19 @@ class Connector:
             return None
         log("card ->", task_id, outcome)
         return {"task": task_id, "status": "completed", "detail": outcome, "tier": headers["access_tier"], "card": outcome}
+
+    def tell_model_outcome(self, turn) -> str:
+        """Once per pick, after the first owner turn that opened a Session: say in the DM the pick was
+        made in whether the switch happened. A switch agy refused is dropped, so it is not retried on
+        every turn; '' when there was nothing to tell."""
+        state = self.model_state()
+        wanted = str(state.get("wanted") or "")
+        if not wanted or state.get("told") == wanted or not turn.live:
+            return ""
+        switched = turn.model == wanted
+        self.post_card(state.get("asked_in"), self.model_card(state, picked=wanted, ran=turn.model))
+        self.save_model_state(told=wanted, **({} if switched else {"wanted": ""}))
+        return "switched" if switched else "not-switched"
 
     def run_turn(self, task_id, headers, prompt, owner):
         """(status, text, detail, turn): status is completed | cancelled | timeout | gone | failed | refused.
@@ -351,10 +375,11 @@ class Connector:
         t0 = time.time()
         status, text, detail, turn = self.run_turn(task_id, headers, prompt, tier == "owner")
         publish(result_file, self.answer_body(headers, status, text, detail, turn))
+        told = self.tell_model_outcome(turn) if tier == "owner" else ""
         return {"task": task_id, "status": status, "detail": detail[:200], "event_type": event,
                 "tier": headers["access_tier"], "isolated": tier != "owner", "turn_s": round(time.time() - t0, 3),
                 "permissions": turn.decisions, "updates": dict(turn.updates), "answer_chars": len(text or ""),
-                "model": turn.model}
+                "model": turn.model, **({"model_switch": told} if told else {})}
 
     def pending_tasks(self, seen):
         now = time.time()

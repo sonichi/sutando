@@ -181,16 +181,26 @@ class ConnectorTest(unittest.TestCase):
         self.assertEqual(self.w.result("task-3"), "[no-send] the model card answers\n")
         self.assertEqual(json.loads((self.w.root / "state" / "model.json").read_text())["wanted"],
                          "claude-opus-4-6-thinking")
-        (done,) = self.post_queued("$card2")
-        settled = done["extra_content"]["space.ag2.card"]
-        self.assertEqual((settled["state"], settled["text"], "buttons" in settled),
-                         ("done", "Now using Claude Opus 4.6. It applies from your next message.", False))
+        (coming,) = self.post_queued("$card2")
+        waiting = coming["extra_content"]["space.ag2.card"]
+        self.assertEqual((waiting["state"], "buttons" in waiting), ("info", False))
+        self.assertIn("Switching to Claude Opus 4.6 on your next message", waiting["text"])
         self.assertEqual(self.w.methods().count("session/prompt"), 1, "the tap never reaches agy either")
-        self.dm_task("task-4", "STUB:TEXT again")
+        # The next turn, in any room, switches; the owner is then told in the DM the pick was made in.
+        self.w.task("task-4", "STUB:TEXT again")
         self.w.serve()
         (call,) = self.set_model_calls()
         self.assertEqual(call["modelId"], "claude-opus-4-6-thinking")
-        self.assertEqual(self.w.metrics()[-1]["model"], "claude-opus-4-6-thinking")
+        self.assertEqual((self.w.metrics()[-1]["model"], self.w.metrics()[-1]["model_switch"]),
+                         ("claude-opus-4-6-thinking", "switched"))
+        (told,) = self.post_queued("$card3")
+        done = told["extra_content"]["space.ag2.card"]
+        self.assertEqual((told["room_id"], done["state"], done["text"]),
+                         (self.DM, "done", "Switched. I'm now using Claude Opus 4.6."))
+        self.w.task("task-4b", "STUB:TEXT once more")
+        self.w.serve()
+        self.assertEqual(self.post_queued(), [], "told once")
+        self.assertNotIn("model_switch", self.w.metrics()[-1])
         # The settled card replaced the first one: its buttons no longer act.
         self.dm_task("task-5", said, reply_to="$card1", click=said)
         self.w.serve()
@@ -231,14 +241,33 @@ class ConnectorTest(unittest.TestCase):
         self.assertEqual(self.post_queued(), [], "in a shared room /model is ordinary words for agy")
         self.assertEqual(self.w.methods().count("session/prompt"), 2)
 
-    def test_a_refused_switch_leaves_the_turn_on_agys_own_model(self):
+    def test_a_refused_switch_is_said_in_the_dm_and_the_turn_runs_on_agys_own_model(self):
         (self.w.home / "models").write_text("")
         (self.w.home / "set-model-fails").write_text("")
-        (self.w.root / "state" / "model.json").write_text(json.dumps({"wanted": "claude-opus-4-6-thinking"}))
+        (self.w.root / "state" / "model.json").write_text(json.dumps(
+            {"wanted": "claude-opus-4-6-thinking", "asked_in": self.DM,
+             "available": [{"id": "claude-opus-4-6-thinking", "name": "Claude Opus 4.6"},
+                           {"id": "gemini-3.8-flash-medium", "name": "Gemini 3.8 Flash"}]}))
         self.w.task("task-1", "STUB:TEXT hi")
         self.w.serve()
         self.assertEqual(self.w.result("task-1"), "hello from agy-stub\n")
-        self.assertEqual((len(self.set_model_calls()), self.w.metrics()[0]["model"]), (1, "gemini-3.8-flash-medium"))
+        self.assertEqual((len(self.set_model_calls()), self.w.metrics()[0]["model"], self.w.metrics()[0]["model_switch"]),
+                         (1, "gemini-3.8-flash-medium", "not-switched"))
+        (told,) = self.post_queued()
+        failed = told["extra_content"]["space.ag2.card"]
+        self.assertEqual((told["room_id"], failed["state"], failed["text"]), (self.DM, "error",
+                         "I could not switch to Claude Opus 4.6. I'm still using Gemini 3.8 Flash. Send /model to try again."))
+        self.w.task("task-2", "STUB:TEXT again")
+        self.w.serve()
+        self.assertEqual((len(self.set_model_calls()), self.post_queued()), (1, []), "not retried, not repeated")
+
+    def test_a_turn_that_never_opened_a_session_tells_nothing_and_the_pick_waits(self):
+        (self.w.root / "state" / "model.json").write_text(json.dumps({"wanted": "x", "asked_in": self.DM}))
+        (self.w.home / "signed-in").unlink()
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        self.assertEqual(self.post_queued(), [])
+        self.assertEqual(json.loads((self.w.root / "state" / "model.json").read_text())["wanted"], "x")
 
     def test_signed_in_while_sign_in_methods_are_listed_needs_no_authenticate(self):
         self.w.task("task-1", "STUB:TEXT hi")
