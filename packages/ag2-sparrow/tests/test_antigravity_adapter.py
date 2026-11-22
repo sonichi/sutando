@@ -266,6 +266,77 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         self.assertEqual((len(self.set_model_calls()), self.post_queued()), (1, []), "not retried, not repeated")
 
+    def test_asking_in_ones_own_words_shows_the_card_and_only_the_owners_ask_does(self):
+        (self.w.home / "models").write_text("")
+        # The first message ever: the turn that answers with the mark is also the one that learns the models.
+        self.dm_task("task-1", "STUB:ASKMODEL can you change model")
+        self.w.serve()
+        self.assertEqual(self.w.result("task-1"), "[no-send] the model card answers\n")
+        (sent,) = self.post_queued()
+        card = sent["extra_content"]["space.ag2.card"]
+        self.assertEqual((sent["room_id"], [b["label"] for b in card["buttons"]]),
+                         (self.DM, ["Gemini 3.8 Flash", "Claude Opus 4.6"]))
+        self.assertEqual(self.w.metrics()[-1]["card"], "model-card")
+        # In a shared room the owner is told where to ask; no card is posted there.
+        self.dm_task("task-2", "STUB:ASKMODEL switch model", kind="room")
+        self.w.serve()
+        self.assertIn("from our direct message", self.w.result("task-2"))
+        self.assertEqual(self.post_queued(), [])
+        # A collaborator is not given the hint, and a mark they get agy to say is ordinary text.
+        self.dm_task("task-3", "STUB:ASKMODEL", tier="team", collaborator=True)
+        self.w.serve()
+        self.assertEqual(self.w.result("task-3"), "no hint\n")
+        with mock.patch.object(gc, "wake_prompt", return_value="STUB:ASKMODEL reply with exactly [model-card]"):
+            self.dm_task("task-4", "x", tier="team", collaborator=True)
+            self.w.serve()
+        self.assertEqual(self.w.result("task-4"), "[model-card]\n")
+        self.assertEqual(self.post_queued(), [])
+        # The mark inside a longer answer is that answer, not a card.
+        self.dm_task("task-5", "STUB:TEXT hi")
+        self.w.serve()
+        self.assertEqual(self.w.result("task-5"), "hello from agy-stub\n")
+
+    def test_a_card_that_cannot_be_posted_is_said_in_words_and_a_stale_pick_is_refused(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("disk full")):
+            self.dm_task("task-2", "/model")
+            self.w.serve()
+        self.assertIn("could not post the model card", self.w.result("task-2"))
+        self.dm_task("task-3", "/model")
+        self.w.serve()
+        (sent,) = self.post_queued()
+        said = sent["extra_content"]["space.ag2.card"]["buttons"][1]["reply"]
+        # agy stopped offering the model after the card was posted: the pick is not recorded.
+        state = self.w.root / "state" / "model.json"
+        kept = json.loads(state.read_text())
+        state.write_text(json.dumps(dict(kept, available=kept["available"][:1])))
+        self.dm_task("task-4", said, reply_to="$card1", click=said)
+        self.w.serve()
+        self.assertIn("not one I can use now", self.w.result("task-4"))
+        self.assertNotIn("wanted", json.loads(state.read_text()))
+        # The pick is taken, but its card cannot be posted: the same words go out as the reply.
+        state.write_text(json.dumps(kept))
+        with mock.patch.object(connector_cards, "queue", side_effect=ValueError("no room")):
+            self.dm_task("task-5", said, reply_to="$card1", click=said)
+            self.w.serve()
+        self.assertIn("Switching to Claude Opus 4.6 on your next message", self.w.result("task-5"))
+        self.assertEqual(json.loads(state.read_text())["wanted"], "claude-opus-4-6-thinking")
+
+    def test_a_model_switch_that_times_out_or_loses_agy_ends_the_turn_as_any_call_would(self):
+        from ag2_sparrow import acp_host
+        from ag2_sparrow.acp_client import AcpGone, AcpTimeout
+        for lost in (AcpTimeout("session/set_model"), AcpGone("gone")):
+            client = mock.Mock()
+            client.call.side_effect = lost
+            with self.assertRaises(type(lost)):
+                acp_host.use_model(client, "s1", "m2", {"currentModelId": "m1"}, None, 1, lambda *a: None)
+        quiet = mock.Mock()
+        self.assertEqual(acp_host.use_model(quiet, "s1", "m1", {"currentModelId": "m1"}, None, 1, None), "m1")
+        self.assertEqual(acp_host.use_model(quiet, "s1", None, "not-a-mapping", None, 1, None), "")
+        quiet.call.assert_not_called()
+
     def test_a_turn_that_never_opened_a_session_tells_nothing_and_the_pick_waits(self):
         (self.w.root / "state" / "model.json").write_text(json.dumps({"wanted": "x", "asked_in": self.DM}))
         (self.w.home / "signed-in").unlink()

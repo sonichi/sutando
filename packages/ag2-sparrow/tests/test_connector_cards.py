@@ -180,6 +180,12 @@ class BridgeWiring(unittest.TestCase):
                 m._start_agent_cards()
                 threads[-1][0]()
             self.assertEqual(len([line for line in logs if "sweep error" in line]), 2)
+            # A sweep that cannot even be set up is logged, and no thread is started.
+            before, logs = len(threads), []
+            with mock.patch.object(m.threading, "Thread", Thread), mock.patch.object(m, "_log", logs.append), \
+                    mock.patch.object(cc, "Poster", side_effect=RuntimeError("boom")):
+                m._start_agent_cards()
+            self.assertEqual((len(threads), ["sweep not started" in line for line in logs]), (before, [True]))
 
 
 if __name__ == "__main__":

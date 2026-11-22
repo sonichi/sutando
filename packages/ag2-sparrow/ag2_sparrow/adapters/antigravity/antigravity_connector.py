@@ -330,6 +330,12 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
 
 MODEL_FILE, MODEL_CARD, MODEL_ASK = "model.json", "model-switch", "/model"
 MODEL_BUTTONS = 6          # the card's button limit
+# How the owner asks in their own words: agy answers with the mark alone, and the connector shows the card.
+MODEL_MARK = "[model-card]"
+MODEL_HINT = ("If the person asks to change, switch or choose the model you run on, or which models you have, "
+              "reply with exactly %s and nothing else: they are then shown a card with the choices. Do not "
+              "list or switch models yourself." % MODEL_MARK)
+MODEL_IN_DM = "I can switch models from our direct message. Ask me there."
 MODEL_UNKNOWN = ("I don't know my models yet: I learn them when a turn starts. Send me any message, then "
                  "send /model again.")
 
@@ -427,17 +433,35 @@ class Connector:
             publish(result_file, quoted(verdict.say) + "\n")
             outcome = "card-refused"
         elif said.lower() == MODEL_ASK and agent_card.owner_may_act(sent) is None:
-            if not state.get("available"):
-                publish(result_file, quoted(MODEL_UNKNOWN) + "\n")
-            elif self.post_card(sent.get("channel_id"), self.model_card(state)):
-                publish(result_file, "[no-send] the model card answers\n")
-            else:
-                publish(result_file, quoted("I could not post the model card. Try again in a moment.") + "\n")
-            outcome = "model-card"
+            outcome = self.offer_models(sent, result_file)
         if not outcome:
             return None
         log("card ->", task_id, outcome)
         return {"task": task_id, "status": "completed", "detail": outcome, "tier": headers["access_tier"], "card": outcome}
+
+    def offer_models(self, sent, result_file) -> str:
+        """Answer the owner's ask with the model card (or the line saying why there is none)."""
+        state = self.model_state()
+        if not state.get("available"):
+            publish(result_file, quoted(MODEL_UNKNOWN) + "\n")
+        elif self.post_card(sent.get("channel_id"), self.model_card(state)):
+            publish(result_file, "[no-send] the model card answers\n")
+        else:
+            publish(result_file, quoted("I could not post the model card. Try again in a moment.") + "\n")
+        return "model-card"
+
+    def asked_for_models(self, headers, path, status, text, result_file) -> str:
+        """agy answered the owner with the mark alone: show the card in their DM, or say where to ask.
+        '' for any other answer, and for any sender but the owner, whose mark is then ordinary text."""
+        if status != "completed" or (text or "").strip() != MODEL_MARK or headers.get("access_tier") != "owner":
+            return ""
+        agent_card, _ = connector_cards._core()
+        with open(path, encoding="utf-8") as f:
+            sent, _ = agent_card.reply_words(f.read())
+        if agent_card.owner_may_act(sent) is None:
+            return self.offer_models(sent, result_file)
+        publish(result_file, quoted(MODEL_IN_DM) + "\n")
+        return "model-card-elsewhere"
 
     def tell_model_outcome(self, turn) -> str:
         """Once per pick, after the first owner turn that opened a Session: say in the DM the pick was
@@ -527,17 +551,21 @@ class Connector:
             # shell_web_on reads the sender's tier itself, so a collaborator on the owner's turn stays off.
             prompt = wake_prompt(task_id, headers, message, operator_lines, self.args.cwd, self.note,
                                  shell_web=shell_web_on(self.args, headers))
+            if headers.get("access_tier") == "owner":
+                prompt += "\n\n" + MODEL_HINT
             status, text, detail, turn = self.run_turn(task_id, headers, prompt, True)
         else:
             with guest_turn(self.args, headers, message) as pair:
                 prompt = wake_prompt(task_id, headers, message, operator_lines, None, self.note, readable=pair[1])
                 status, text, detail, turn = self.run_turn(task_id, headers, prompt, False, pair)
-        publish(result_file, self.answer_body(headers, status, text, detail, turn))
+        asked = self.asked_for_models(headers, path, status, text, result_file) if owner_turn else ""
+        if not asked:
+            publish(result_file, self.answer_body(headers, status, text, detail, turn))
         told = self.tell_model_outcome(turn) if owner_turn else ""
         return {"task": task_id, "status": status, "detail": detail[:200], "event_type": event,
                 "tier": headers["access_tier"], "policy": kind, "isolated": not owner_turn, "turn_s": round(time.time() - t0, 3),
                 "permissions": turn.decisions, "updates": dict(turn.updates), "answer_chars": len(text or ""),
-                "model": turn.model, **({"model_switch": told} if told else {})}
+                "model": turn.model, **({"model_switch": told} if told else {}), **({"card": asked} if asked else {})}
 
     def pending_tasks(self, seen):
         now = time.time()
