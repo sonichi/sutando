@@ -377,6 +377,22 @@ and is not persisted: pass it again on each invocation, including `--restart`.
 Authentication, helper checks, the notifier and core startup remain active.
 The flag does not isolate the Codex home or change helper ownership by itself.
 
+## Blocked-dialog hooks (opt-in, off by default)
+
+The core supervisor (`src/core-input-watch.py`) decides whether the core is blocked on its
+owner. On Claude it reads the CLI's own hook events (`src/core_block_signal.py`) and uses the
+screen only for screens no hook reports (sign-in, usage limits, startup trust). Codex can
+send the same events, but Codex runs a session's hooks only once they are trusted in `/hooks`,
+and an untrusted hook is skipped or asks for review at startup, which a headless core never
+answers.
+
+Set `SUTANDO_CODEX_BLOCK_HOOKS=1` in the launcher's environment to register them: the launcher
+passes `PermissionRequest`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit` and `Stop` hooks as
+`-c hooks.<Event>=…` overrides for that run only (nothing is written to `config.toml`) and adds
+`--dangerously-bypass-hook-trust`. That flag runs every enabled hook for the run without trust,
+including hooks in the user's own Codex home and in the checkout's `.codex/`, so it is off
+unless you set it. Without it, the supervisor reads the Codex screen exactly as before.
+
 ## Automatic earned resets
 
 On macOS, launching a Codex core or Codex worker installs a five-minute

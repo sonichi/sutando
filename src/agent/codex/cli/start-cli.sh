@@ -286,6 +286,12 @@ CODEX_ARGS=(
 if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   CODEX_ARGS+=(-m "$SUTANDO_CORE_MODEL")
 fi
+# Opt-in (docs/codex-core.md): hooks that tell the core supervisor when Codex is blocked on a
+# dialog. Session hooks need persisted trust, so this run also bypasses hook trust.
+if [ "${SUTANDO_CODEX_BLOCK_HOOKS:-0}" = 1 ] && [ -n "$_HB_PY" ]; then
+  while IFS= read -r -d '' _bs_arg; do CODEX_ARGS+=("$_bs_arg"); done \
+    < <("$_HB_PY" "$REPO/src/core_block_signal.py" codex-args "$REPO" 2>/dev/null || true)
+fi
 # A git checkout's first Codex launch stops on "Trust this folder?", which a headless core
 # never answers; see src/codex_project_trust.py. Best effort: a failure leaves the prompt.
 ensure_codex_project_trust() {

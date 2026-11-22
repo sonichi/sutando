@@ -127,6 +127,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/local_services.sh",
             "src/core_runtime_record.py",
             "src/codex_project_trust.py",
+            "src/core_block_signal.py",
             "src/codex_host_instructions.py",
             "src/codex_home.py",
             "src/agent/codex/codex-home.sh",
@@ -750,6 +751,22 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         invocation = scheduler_log.read_text()
         self.assertIn("install --workspace", invocation)
         self.assertIn("--host-label test-host", invocation)
+    def test_block_signal_hooks_are_off_unless_opted_in(self):
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._tmux_calls()
+        self.assertNotIn("--dangerously-bypass-hook-trust", calls)
+        self.assertNotIn("hooks.PermissionRequest=", calls)
+
+    def test_opted_in_block_signal_hooks_reach_the_core_with_the_trust_bypass(self):
+        result = self.run_launcher(env_extra={"SUTANDO_CODEX_BLOCK_HOOKS": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._tmux_calls()
+        self.assertIn("--dangerously-bypass-hook-trust", calls)
+        for ev in ("PermissionRequest", "PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop"):
+            self.assertIn(f"hooks.{ev}=", calls)
+        self.assertIn("core-block-hook.sh", calls)
+
     def test_a_worker_instance_launch_is_refused_before_any_core_write(self):
         """The core entry point refuses a pool instance. Through the dispatcher's
         --runtime and directly, an instance launch touches none of the core's durable
