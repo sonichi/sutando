@@ -72,8 +72,8 @@ class ConnectorCards(unittest.TestCase):
     def test_cards_queued_between_two_sweeps_are_posted_in_the_order_they_were_queued(self):
         ac, _ = cc._core()
         for n in range(12):
-            cc.queue(self.state, ROOM, "card %d" % n, ac.build("account-switch", "info", title="Account", body="b",
-                                                               text="step %d" % n))
+            cc.queue(self.state, ROOM, "card %d" % n,
+                     ac.build("account-switch", "info", title="Account", body="b", text="step %d" % n)[1])
         self.assertEqual(self.poster().sweep(), 12)
         self.assertEqual([sent["body"] for sent in self.sent], ["card %d" % n for n in range(12)])
 
