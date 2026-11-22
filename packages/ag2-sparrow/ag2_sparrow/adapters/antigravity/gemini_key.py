@@ -113,3 +113,31 @@ def authenticate_with_app_key(client, init, timeout, argv, agent_id="", log=lamb
         key = None
     log("using the Gemini API key saved in the app for this agent")
     return True
+
+
+def key_saved(agent_id: str = "", run=None, platform: str = None, environ=None,
+              timeout: float = READ_TIMEOUT_S) -> bool:
+    """Whether this agent has a Gemini API key saved in the app, without reading the key: `security` is asked
+    for the item's attributes only (no `-w`/`-g`), and what it prints is dropped. False off macOS, without the
+    agent id, when opted out, and on any failure."""
+    if not agent_id or (platform or sys.platform) != "darwin" or opted_out(environ):
+        return False
+    try:
+        done = (run or subprocess.run)([SECURITY, "find-generic-password", "-a", ACCOUNT, "-s", agent_service(agent_id)],
+                                       capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return getattr(done, "returncode", 1) == 0
+
+
+def clear_key(agent_id: str, run=None, platform: str = None, timeout: float = READ_TIMEOUT_S) -> bool:
+    """Delete this agent's saved key ("Stop using the key"); True when no item is left. Only this agent's own
+    item is named, so no other agent's key, and not the app's voice key, can be removed by it."""
+    if not agent_id or (platform or sys.platform) != "darwin":
+        return False
+    try:
+        (run or subprocess.run)([SECURITY, "delete-generic-password", "-a", ACCOUNT, "-s", agent_service(agent_id)],
+                                capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return not key_saved(agent_id, run=run, platform=platform, environ={}, timeout=timeout)

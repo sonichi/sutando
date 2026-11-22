@@ -242,6 +242,22 @@ into that request on agy's stdin: never argv, environment or logs. Each saved Se
 resumed (resuming a sign-in Session still bills the Google account's quota), a new one is opened.
 `AG2_AGY_GEMINI_KEY=0` in the connector's environment turns this off. See `gemini_key.py`.
 
+## The account card
+
+In their DM with the agent the owner sends `/account` (or asks in words; the turn answers with the card's
+mark) and gets a card saying "Google sign-in" or "Gemini API key" (whether this agent's Keychain item
+exists; the key itself is never read for it). Only the owner's tap in their DM acts; anyone else's is refused.
+
+- **Sign in with Google again** opens a Terminal window on this Mac running `agy acp --login` (from a 0700
+  `state/agy-google-sign-in.command`); the owner follows the link and pastes the code into that Terminal,
+  never into the room. agy keeps one Google sign-in for the Mac, so this moves every Antigravity agent here,
+  and the card says so. Where no Terminal can be opened the card points to the app's Connections card.
+- **Use a Gemini API key** points to the agent's Antigravity card in the app's Connections, which saves the
+  key. Keys are never taken in chat: a message carrying a Google-API-key-shaped string (`AIza` + 35) is not
+  passed to agy, and the owner is asked to delete it.
+- **Stop using the key** (shown when one is saved) deletes this agent's own Keychain item; the next turn opens
+  a fresh Session on the Google sign-in. See `agy_account.py`.
+
 ## S.space tools (Room Commons pages and room actions)
 
 The owner's turns and Team's (an attested collaborator: `access_tier: team` with `collaborator: true`, as

@@ -55,6 +55,7 @@ from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore
 from ...acp_client import AcpClient as _SharedClient
 from ...relay_loop import count_arg
 from .gemini_key import API_KEY_AUTH, authenticate_with_app_key
+from . import agy_account
 from ...team_guardrail import SANDBOXED_DELEGATION_CODEX
 from ...task_io import (COLLABORATOR, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, RESTRICTED, LockRefused,
                         acquire_lock, exit_code, exit_on_sigterm, holder_consumer, load_done, make_dirs, parse_task,
@@ -582,7 +583,12 @@ class Connector:
         self.retry_at = {}
         self.models = model_switch.ModelSwitch(args.state, self.root, getattr(args, "bridge_state", None), NAME,
                                                publish, quoted, log)
-        self.desk = card_desk.Desk(self.root, card_desk.led(publish, self.models.unsaid, quoted), quoted, [self.models])
+        self.accounts = agy_account.AgyAccount(
+            getattr(args, "bridge_state", None), NAME, getattr(args, "agent_id", None) or "", publish, quoted, log,
+            sign_in=lambda: agy_account.open_terminal(list(args.acp_argv) + ["--login"], args.state,
+                                                      getattr(args, "child_env", None)))
+        self.desk = card_desk.Desk(self.root, card_desk.led(publish, self.models.unsaid, quoted), quoted,
+                                   [self.models, self.accounts])
 
     def models_seen(self, models: dict):
         """Remember what a Session offered (ACP `models`), for the card."""
@@ -721,6 +727,12 @@ class Connector:
         carded = self.card_task(task_id, headers, path, result_file)
         if carded:
             return carded
+        if agy_account.looks_like_key(message):
+            # A key is never taken in chat: not passed to agy, not logged, and the owner is asked to remove it.
+            log("not passed on ->", task_id, "(it carries what looks like an API key)")
+            publish(result_file, quoted(agy_account.KEY_IN_CHAT % self.accounts.where()) + "\n")
+            return {"task": task_id, "status": "refused", "detail": "api-key-in-chat", "tier": headers["access_tier"],
+                    "policy": kind}
         event, _ = trigger_of(headers)
         log("wake ->", task_id, headers["access_tier"], event or "message")
         t0 = time.time()
@@ -730,6 +742,8 @@ class Connector:
                                  shell_web=shell_web_on(self.args, headers, kind), kind=kind)
             if headers.get("access_tier") == "owner" and self.models.usable():
                 prompt += "\n\n" + model_switch.HINT
+            if headers.get("access_tier") == "owner" and self.accounts.usable():
+                prompt += "\n\n" + self.accounts.HINT
             status, text, detail, turn = self.run_turn(task_id, headers, prompt, True, kind=kind)
         else:
             with guest_turn(self.args, headers, message) as pair:
