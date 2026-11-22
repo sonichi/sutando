@@ -6,11 +6,17 @@ the command, `initialize`, resume the task's Session with `session/load` (else `
 `session/prompt` and wait for it to stop.
 
 `<dir>/tasks/task-*.txt` in, `<dir>/results/<task>.txt` out. The turn's final message is the answer (there is
-no reply command), and the agent's own text is posted
-with every delivery marker neutralised. A final message of exactly NO_REPLY posts nothing. A message whose
-turn failed gets a line saying so; an event that failed posts nothing. The gateway's SKILL INSTRUCTIONS
-prelude (run a room-read command, write results/<task>.txt) is for a core with a shell: its steps are not
-passed on (`session_lines`). A turn that ends with no text says what it did instead (`no_answer_why`).
+no reply command). The owner's text keeps its delivery markers, as a Claude Code or Codex result does
+([channel:], [thread], [file:] for a file under the working directory only); anyone else's is posted with
+every delivery marker neutralised. A final message of exactly NO_REPLY posts nothing. A message whose turn
+failed gets a line saying so; an event that failed posts nothing. The gateway's SKILL INSTRUCTIONS prelude
+(run a room-read command, write results/<task>.txt) is for a core with a shell: its steps are not passed on
+(`session_lines`). A turn that ends with no text says what it did instead (`no_answer_why`).
+
+The task's own attachments (acp_host.task_media) go with the turn: images as prompt image blocks, for every
+served tier; on the owner's turn (an attested collaborator's included) also a read-only copy of each file in a
+folder of the turn's own, which the policy lets agy read and never change. An isolated turn gets no folder,
+and only the sender's own attachments (`own_attachment_headers`): never a replied-to member's.
 
 Sessions, the permission policy and the framing are acp_host's: the owner may read or edit under the working
 directory, no command is granted; with --allow-owner-shell-web the owner's turns may also run commands
@@ -75,6 +81,10 @@ AGY_KEYS = (frozenset({"Path", "TargetFile", "AbsolutePath"}),
 # attested collaborator gets the owner's turn.
 OWNER_TURN, ISOLATED_TURN = "owner", "isolated"
 TURNS = {OWNER: OWNER_TURN, COLLABORATOR: OWNER_TURN, RESTRICTED: ISOLATED_TURN}
+
+OWNER_MARKERS = ("Your final message may use Sparrow's delivery markers: [file: /absolute/path] on a line of its "
+                 "own attaches that file (only a file under %s is sent); a first line [channel: !room:server] posts "
+                 "the message in that room instead; a first line [thread] answers in a thread of its own.")
 READ_ONLY_MODES = frozenset({"plan", "read-only", "readonly", "read_only"})
 GUEST_PREFIX = "ag2-sparrow-antigravity-guest-"
 GUEST_REFUSED = "it answers non-owners only in a read-only session mode, and %s"
@@ -325,6 +335,17 @@ def own_media_paths(message):
     return frozenset(m.group(1).strip() for m in OWN_MEDIA_RE.finditer(rest))
 
 
+def own_attachment_headers(headers, message):
+    """`headers` with its `attachments:` list cut to the entries `own_media_paths(message)` shows are the
+    sender's own, for a restricted turn's media; none when origin cannot be shown."""
+    own = own_media_paths(message)
+    refs = [r.as_dict() for r in local_task_protocol.parse_attachments(headers) if r.locator in own]
+    out = {k: v for k, v in (headers or {}).items() if k != "attachments"}
+    if refs:
+        out["attachments"] = json.dumps(refs)
+    return out
+
+
 def stage_own_attachments(headers, dest, max_bytes=None, log=lambda *a: None, message=""):
     """Copy the files this task's sender attached into `dest` as read-only copies; return their real paths. A
     file is the sender's only when it is in the attested `attachments:` header AND the bridge labelled it as the
@@ -539,6 +560,8 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
         out.append("Except: the sender's own attachments to this task are copied here, and you may read these "
                    "files and no other (change none; an attachment path in the message is not readable, its "
                    "copy is):\n" + "\n".join("- " + p for p in readable))
+    if headers.get("access_tier") == "owner":
+        out.append(OWNER_MARKERS % cwd)
     return "\n\n".join(out)
 
 
@@ -579,22 +602,25 @@ class Connector:
         self.launch = (status, turn)
         return [entry]
 
-    def run_turn(self, task_id, headers, prompt, owner, isolated=None, kind=None):
+    def run_turn(self, task_id, headers, prompt, owner, isolated=None, kind=None, message=""):
         """(status, text, detail, turn): status is completed | cancelled | timeout | gone | failed | refused.
         With `owner` (TURNS' owner turn: the owner's or a collaborator's) it resumes the sender's Session for the
         room in the working directory, under the owner's policy; any other runs `isolated` (guest_turn's pair),
         opening one when not given, where only reads of the staged attachments are granted."""
         if owner:
             cwd, tools = self.args.cwd, shell_web_on(self.args, headers)
-            return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
-                                       lambda params: acp_host.decide_permission(params, True, cwd, tools=tools,
-                                                                                  extra_keys=AGY_KEYS,
-                                                                                  **self.mcp_grant(headers, kind)),
-                                       self.store, STDERR_NAME, NOT_SIGNED_IN, log,
-                                       mcp_servers=self.mcp_servers_for(headers, kind))
+            with acp_host.task_media(headers, readable=True, log=log) as media:
+                read_only = (media.folder,) if media.folder else ()
+                return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
+                                           lambda params: acp_host.decide_permission(params, True, cwd, tools=tools,
+                                                                                      extra_keys=AGY_KEYS,
+                                                                                      read_only=read_only,
+                                                                                      **self.mcp_grant(headers, kind)),
+                                           self.store, STDERR_NAME, NOT_SIGNED_IN, log, media=media,
+                                           mcp_servers=self.mcp_servers_for(headers, kind))
         if isolated is None:
-            with guest_turn(self.args, headers) as pair:
-                return self.run_turn(task_id, headers, prompt, False, pair)
+            with guest_turn(self.args, headers, message) as pair:
+                return self.run_turn(task_id, headers, prompt, False, pair, message=message)
         turn, readable = isolated
         own = readable_only(readable, turn.cwd)
 
@@ -603,8 +629,11 @@ class Connector:
             return acp_host.decide_permission(params, False, turn.cwd, extra_keys=AGY_KEYS,
                                               own_file=own if tc.get("kind") == "read" else None,
                                               own_file_reason="the sender's own attachment")
-        return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt, decide,
-                                   self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=turn)
+        # Images only: the prompt already lists the staged copies this turn may read.
+        with acp_host.task_media(own_attachment_headers(headers, message), readable=False) as media:
+            return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt, decide,
+                                       self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=turn,
+                                       media=acp_host.Media(images=media.images))
 
     @staticmethod
     def mcp_grant(headers, kind=None):
@@ -616,7 +645,8 @@ class Connector:
         return (lambda init: self.sspace_servers(init, tools)) if tools else None
 
     def answer_body(self, headers, status, text, detail, turn=None):
-        """What Sparrow posts: the turn's own text, quoted so no delivery marker in it acts; NO_REPLY or a
+        """What Sparrow posts: the turn's own text, the owner's with its markers acting (`acp_host.owner_text`),
+        anyone else's quoted so no delivery marker in it acts; NO_REPLY or a
         failed event posts nothing; a failed message gets a line saying why, quoted too (the detail is the
         agent's own error text). A message whose turn completed with no text gets a line saying so and, with
         `turn`, what the turn did instead."""
@@ -626,6 +656,8 @@ class Connector:
             if said == NO_REPLY:
                 return "[no-send] %s chose not to post\n" % self.name
             if said:
+                if headers.get("access_tier") == "owner":
+                    return acp_host.owner_text(said, self.args.cwd) + "\n"
                 return quoted(said) + "\n"
             if not message:
                 return "[no-send] %s handled the event without posting\n" % self.name
@@ -664,7 +696,7 @@ class Connector:
             with guest_turn(self.args, headers, message) as pair:
                 prompt = wake_prompt(task_id, headers, message, operator_lines, None, self.note, readable=pair[1],
                                      kind=kind)
-                status, text, detail, turn = self.run_turn(task_id, headers, prompt, False, pair)
+                status, text, detail, turn = self.run_turn(task_id, headers, prompt, False, pair, message=message)
         body = self.answer_body(headers, status, text, detail, turn)
         reason = ""
         if self.launch is not None:
