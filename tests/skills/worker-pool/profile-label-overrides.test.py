@@ -83,7 +83,7 @@ class ProfileLabelOverrides(unittest.TestCase):
         self.assertIn("alias=base-one", shown.getvalue())
         with mock.patch.object(pool_wedge_cards.sup, "supervised_workers",
                                return_value={W1: roster["workers"][W1]}):
-            self.assertEqual(pool_wedge_cards.seat_label(self.ws, W1), f"worker Ryan ({W1})")
+            self.assertEqual(pool_wedge_cards.seat_label(self.ws, W1), "Ryan")
 
     def test_unique_display_name_can_bind_a_room(self):
         self.apply({W1: "Ryan"}, 7)

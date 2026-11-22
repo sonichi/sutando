@@ -16,6 +16,7 @@ import shlex
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -99,7 +100,7 @@ class EnsurePerSeat(unittest.TestCase):
         self.assertIn(f"--socket={SOCK}", words)
         self.assertIn(f"--session={NAME}", words)
         self.assertIn(f"--out={self.ws}/state/core-supervisor.{NAME}.json", words)
-        self.assertIn(f"--seat=worker comm ({WID})", words)
+        self.assertIn("--seat=comm", words)
 
     def test_idempotent_by_its_tmux_session(self):
         t = Tmux({NAME, NAME + "-input"})
@@ -139,14 +140,26 @@ class SeatOnTheCard(unittest.TestCase):
                            "Pick one:\n❯ 1. Stop and wait\n  2. Switch\n", NAME, seat="worker comm")
         self.assertEqual(req.device, {"id": NAME, "name": "worker comm"})
         self.assertTrue(req.title.startswith("worker comm · "), req.title)
-        self.assertIn(NAME, req.message)
+        self.assertNotIn(NAME, req.title + req.message.splitlines()[0])
         self.assertEqual((req.subject or {}).get("seat"), "worker comm")
+        self.assertEqual((req.subject or {}).get("session"), NAME)
         jump = [a for a in req.actions if a.kind == "open_terminal"]
-        self.assertEqual([a.label for a in jump], [f"Open terminal ({NAME})"])
+        self.assertEqual([a.label for a in jump], ["Open terminal"])
+
+    def test_a_seat_label_from_an_older_watcher_loses_its_id(self):
+        req = ciw.escalate(self.manager(), "blocked-human", "d", "unknown", "Proceed?", NAME,
+                           seat=f"worker comm ({NAME[-32:]})")
+        self.assertEqual(req.device, {"id": NAME, "name": "worker comm"})
+        self.assertEqual(req.title, "worker comm is waiting for you")
+        self.assertTrue(req.message.startswith("worker comm is waiting on a question"), req.message)
+        self.assertEqual(req.subject["seat"], f"worker comm ({NAME[-32:]})")
 
     def test_without_a_seat_the_core_card_is_unchanged(self):
-        req = ciw.escalate(self.manager(), "blocked-human", "d", "selection", "Pick one:", "sutando-core")
-        self.assertEqual(req.device, {"id": "sutando-core", "name": "sutando-core"})
+        with patch.object(ciw.agent_local_name, "local_name", return_value="Blue Fox"):
+            req = ciw.escalate(self.manager(), "blocked-human", "d", "selection", "Pick one:", "sutando-core")
+        self.assertEqual(req.device, {"id": "sutando-core", "name": "Blue Fox"})
+        self.assertEqual(req.title, "Blue Fox is waiting for you")
+        self.assertNotIn("sutando-core", req.title + req.message.splitlines()[0])
         self.assertNotIn("seat", req.subject or {})
         self.assertEqual([a.label for a in req.actions if a.kind == "open_terminal"], ["Open terminal"])
 

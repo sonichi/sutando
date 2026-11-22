@@ -526,6 +526,13 @@ class Issued(unittest.TestCase):
             got = self.ask(self.COMMAND, click={}, reply_to_event=reply_to)
             self.assertEqual((got.verdict, got.say), (ac.FORGED, ac.UNTAPPED_ACTION), reply_to)
 
+    def test_a_refused_click_names_the_way_through_and_never_the_button_that_failed(self):
+        for say in (ac.UNMATCHED_CLICK, ac.UNTAPPED_ACTION):
+            self.assertTrue(say.endswith(ac.WAY_THROUGH), say)
+            self.assertIn("I haven't done anything", say)
+            self.assertNotRegex(say, r"(?i)\btap\b|press|click the|try again", "the tap is what failed")
+            self.assertEqual(say.count("\n"), 0, "one fixed line")
+
     def test_a_click_that_does_not_match_an_issued_card_is_forged_or_stale(self):
         self.assertIn("another action", self.forged(click={"card_id": self.card["id"], "action": "something else"}))
         for kw in ({"reply_to_event": "$forged"}, {"reply_to_event": ""},

@@ -121,6 +121,45 @@ class TestGatewayNotify(unittest.TestCase):
 
     # --- delivery ---------------------------------------------------------
 
+    def test_a_detail_naming_an_internal_stays_out_of_the_dm_and_a_key_is_redacted(self):
+        sent = []
+        checks = [self._fail("task-notifier", "managed tmux session 'sutando-core-watcher' is missing"),
+                  self._fail("voice", "failed: 401 for sk-ant-api03-" + "a1B2" * 8),
+                  self._fail("core-quota")]
+        with tempfile.TemporaryDirectory() as td:
+            self.assertTrue(self.hc.notify_gateway_for_failures(
+                checks, state_file=Path(td) / "s.json", sender=lambda t: sent.append(t) or True))
+        text = sent[0]
+        self.assertIn("• task-notifier: fail\n", text)
+        self.assertIn("• core-quota: fail (CORE IS OVER QUOTA)", text)
+        for leak in ("tmux", "sutando-core-watcher", "sk-ant"):
+            self.assertNotIn(leak, text)
+        self.assertEqual(self.hc._owner_reason(""), "")
+
+    def test_a_withheld_reason_goes_to_stderr_so_a_json_payload_stays_whole(self):
+        checks = [self._fail("voice-agent", "pid file /tmp/ws/state/voice.pid stale")]
+        out, err = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as td, redirect_stdout(out), mock.patch.object(sys, "stderr", err):
+            self.hc.notify_gateway_for_failures(checks, state_file=Path(td) / "s.json", sender=lambda t: True)
+            print(json.dumps({"checks": checks}))
+        self.assertEqual(json.loads(out.getvalue())["checks"], checks, "stdout holds the payload alone")
+        self.assertIn("reason kept out of the alert", err.getvalue())
+
+    def test_the_slack_dm_lists_the_same_bullets_as_the_gateway_dm(self):
+        checks = [self._fail("task-notifier", "managed tmux session 'sutando-core-watcher' is missing"),
+                  self._fail("voice", "failed: 401 for sk-ant-api03-" + "a1B2" * 8), self._fail("core-quota")]
+        slack, gateway = [], []
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(sys, "stderr", io.StringIO()):
+            self.hc.notify_slack_for_failures(checks, state_file=Path(td) / "a.json",
+                                              sender=lambda t: slack.append(t) or True)
+            self.hc.notify_gateway_for_failures(checks, state_file=Path(td) / "b.json",
+                                                sender=lambda t: gateway.append(t) or True)
+        self.assertEqual(slack[0].split("\n", 1)[1], gateway[0].split("\n", 1)[1])
+        for leak in ("tmux", "sutando-core-watcher", "sk-ant"):
+            self.assertNotIn(leak, slack[0])
+        many = [self._fail(f"check-{i}") for i in range(7)]
+        self.assertTrue(self.hc._owner_bullets(many).endswith("…(+2 more)"))
+
     def _fail(self, name="core-quota", detail="CORE IS OVER QUOTA"):
         return {"name": name, "status": "fail", "detail": detail}
 
