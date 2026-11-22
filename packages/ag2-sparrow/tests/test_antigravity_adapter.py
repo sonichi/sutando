@@ -499,6 +499,13 @@ class ConnectorTest(unittest.TestCase):
         self.assertEqual(gc.Connector(args).tell_model_outcome(turn), "switched")
         self.assertEqual(len(self.post_queued()), gc.UNTOLD_KEEP + 1, "the oldest was told too, not capped away")
         self.assertEqual(json.loads(state.read_text())["untold"], [])
+        # A new outcome is ordered after old notices that only now get their keys, whatever the clock reads.
+        state.write_text(json.dumps({"wanted": "gemini-3.8-flash-medium", "asked_in": self.DM, "available": models,
+                                     "untold": [{k: v for k, v in o.items() if k not in ("key", "at")} for o in backlog[:2]]}))
+        with mock.patch.object(gc.time, "time_ns", return_value=7), \
+                mock.patch.object(connector_cards, "queue", side_effect=OSError("bridge down")):
+            gc.Connector(args).tell_model_outcome(turn)
+        self.assertEqual([o["at"] for o in json.loads(state.read_text())["untold"]], [7, 8, 9])
         # With the bridge still down the cap holds: the newest UNTOLD_KEEP stay owed.
         state.write_text(json.dumps({"wanted": "gemini-3.8-flash-medium", "asked_in": self.DM, "available": models,
                                      "untold": backlog}))

@@ -381,8 +381,9 @@ class Connector:
         if wanted and state.get("told") != wanted and turn.live:
             ran = turn.model or ""
             outcome = "switched" if ran == wanted else "not-switched"
-            owed.append({"picked": wanted, "ran": ran, "room": state.get("asked_in"),
-                         "key": uuid.uuid4().hex, "at": time.time_ns()})
+            # Later than every notice already owed: the bridge posts in the order of this moment.
+            at = max([time.time_ns()] + [int(o.get("at") or 0) + 1 for o in owed])
+            owed.append({"picked": wanted, "ran": ran, "room": state.get("asked_in"), "key": uuid.uuid4().hex, "at": at})
             # Saved whole: the cap is for what is still undeliverable after this turn's drain, below.
             # The model the turn ran on is the one in use, whatever a resumed Session reports of itself.
             self.save_model_state(untold=owed, told=wanted, current=ran or state.get("current") or "",
