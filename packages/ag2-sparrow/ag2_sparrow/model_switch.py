@@ -244,9 +244,9 @@ class ModelSwitch:
         model that turn ran on), then say in the DM each outcome not yet told, oldest first. The state is
         settled, and SAVED with the notice it owes, before any notice is queued, and each notice is queued
         under its own key: a connector that stops in between neither asks again for a refused model nor
-        queues a notice twice. A
-        notice whose card cannot be queued stays owed, the newest UNTOLD_KEEP of them, and one that cannot
-        be drawn is said in words once, in the answer of a turn in its own room (`room`), never another's.
+        queues a notice twice. A notice whose card cannot be queued stays owed, the newest UNTOLD_KEEP of
+        them; one that cannot be drawn is said in words once, in the answer of a turn in its own room
+        (`room`), never another's.
         '' when there was nothing to settle or tell."""
         state = self.state()
         kept = state.get("untold")
