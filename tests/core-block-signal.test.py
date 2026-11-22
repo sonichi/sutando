@@ -14,6 +14,7 @@ import io
 import json
 import os
 import sys
+import shutil
 import tempfile
 import tomllib
 import unittest
@@ -238,32 +239,104 @@ class TestClearIsScopedToTheInteraction(unittest.TestCase):
                                   "tool_input": {}})["state"], "clear")
 
 
+FAKE_APP_SERVER = os.path.join(_HERE, "fixtures", "fake-codex-app-server.py")
+
+
 class TestCodexArgs(unittest.TestCase):
-    def test_each_event_is_a_valid_toml_override_and_trust_is_bypassed(self):
+    def test_each_event_is_a_valid_toml_override_and_trust_is_never_bypassed(self):
         repo = "/tmp/a repo/with 'quote\" and \\slash"
         args = cbs.codex_args(repo)
-        self.assertEqual(args[-1], "--dangerously-bypass-hook-trust")
-        pairs = args[:-1]
-        self.assertEqual(pairs[0::2], ["-c"] * len(cbs.CODEX_EVENTS))
+        self.assertNotIn("--dangerously-bypass-hook-trust", args)
+        self.assertEqual(args[0::2], ["-c"] * len(cbs.CODEX_EVENTS))
         seen = []
-        for value in pairs[1::2]:
+        for value in args[1::2]:
             key, _, toml_value = value.partition("=")
-            ev = key.split(".", 1)[1]
-            seen.append(ev)
-            groups = tomllib.loads(f"v = {toml_value}")["v"]
-            handler = groups[0]["hooks"][0]
+            seen.append(key.split(".", 1)[1])
+            handler = tomllib.loads(f"v = {toml_value}")["v"][0]["hooks"][0]
             self.assertEqual(handler["type"], "command")
-            self.assertTrue(handler["command"].startswith("bash "))
-            self.assertTrue(handler["command"].endswith(" codex"))
-            self.assertIn("core-block-hook.sh", handler["command"])
+            self.assertEqual(handler["command"], cbs.codex_hook_command(repo))
             self.assertIn("with 'quote\" and \\slash", handler["command"].replace("'\"'\"'", "'"))
         self.assertEqual(tuple(seen), cbs.CODEX_EVENTS)
 
-    def test_the_cli_prints_nul_separated_args(self):
+
+class TestSeedCodexTrust(unittest.TestCase):
+    """Trust is recorded through Codex's own app-server, for exactly our hooks."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = os.path.join(self.tmp.name, "home")
+        os.mkdir(self.home)
+        self.codex = os.path.join(self.tmp.name, "codex")
+        with open(self.codex, "w") as f:
+            f.write(f"#!/bin/sh\nexec {sys.executable} {FAKE_APP_SERVER} \"$@\"\n")
+        os.chmod(self.codex, 0o755)
+        self.env = mock.patch.dict(os.environ, {}, clear=False)
+        self.env.start()
+        for k in ("FAKE_MODE", "FAKE_FOREIGN"):
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def seed(self):
+        return cbs.seed_codex_trust("/tmp/r", self.home, self.tmp.name, codex_bin=self.codex, timeout=10)
+
+    def writes(self):
+        try:
+            return [json.loads(x) for x in Path(self.home, "writes.jsonl").read_text().splitlines()]
+        except OSError:
+            return []
+
+    def test_first_seed_trusts_all_five_then_is_idempotent(self):
+        self.assertEqual(self.seed(), "trusted")
+        w = self.writes()
+        self.assertEqual(len(w), 1)
+        self.assertEqual((w[0]["keyPath"], w[0]["mergeStrategy"]), ("hooks.state", "upsert"))
+        self.assertEqual(len(w[0]["value"]), len(cbs.CODEX_EVENTS))
+        self.assertEqual(self.seed(), "already-trusted")
+        self.assertEqual(len(self.writes()), 1)
+
+    def test_a_foreign_hook_is_never_trusted(self):
+        os.environ["FAKE_FOREIGN"] = "1"
+        self.assertEqual(self.seed(), "trusted")
+        self.assertNotIn("/u/hooks.json:stop:0:0", self.writes()[0]["value"])
+
+    def test_a_changed_command_is_trusted_again(self):
+        self.seed()
+        trust = json.loads(Path(self.home, "fake-trust.json").read_text())
+        for v in trust.values():
+            v["trusted_hash"] = "sha256:old"
+        Path(self.home, "fake-trust.json").write_text(json.dumps(trust))
+        self.assertEqual(self.seed(), "trusted")
+
+    def test_failures_raise(self):
+        os.environ["FAKE_MODE"] = "exit"
+        with self.assertRaises(RuntimeError):
+            self.seed()
+        os.environ["FAKE_MODE"] = "stuck"
+        with self.assertRaises(RuntimeError):
+            self.seed()
+
+    def test_the_cli_prints_args_only_once_trusted(self):
         out = io.StringIO()
-        with redirect_stdout(out):
-            cbs.main(["codex-args", "/tmp/r"])
+        with redirect_stdout(out), mock.patch.object(cbs, "seed_codex_trust", return_value="trusted"):
+            self.assertEqual(cbs.main(["codex-args", "/tmp/r", "--codex-home", self.home, "--cwd", "/"]), 0)
         self.assertEqual(out.getvalue().split("\0")[:-1], cbs.codex_args("/tmp/r"))
+        out = io.StringIO()
+        with redirect_stdout(out), mock.patch.object(cbs, "seed_codex_trust", side_effect=RuntimeError("no")):
+            self.assertEqual(cbs.main(["codex-args", "/tmp/r", "--codex-home", self.home, "--cwd", "/"]), 1)
+        self.assertEqual(out.getvalue(), "")
+
+    @unittest.skipUnless(shutil.which("codex"), "no codex CLI on PATH")
+    def test_against_the_real_codex_in_a_scratch_home(self):
+        # Codex's own hooks/list and config writer, never the user's Codex home.
+        first = cbs.seed_codex_trust("/tmp/r", self.home, self.tmp.name, timeout=30)
+        self.assertEqual(first, "trusted")
+        self.assertEqual(cbs.seed_codex_trust("/tmp/r", self.home, self.tmp.name, timeout=30), "already-trusted")
+        text = Path(self.home, "config.toml").read_text()
+        self.assertEqual(text.count("trusted_hash"), len(cbs.CODEX_EVENTS))
+        self.assertIn('"/<session-flags>/config.toml:stop:0:0"', text)
 
 
 if __name__ == "__main__":

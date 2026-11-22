@@ -751,23 +751,48 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         invocation = scheduler_log.read_text()
         self.assertIn("install --workspace", invocation)
         self.assertIn("--host-label test-host", invocation)
-    def test_block_signal_hooks_reach_the_core_by_default_with_the_trust_bypass(self):
+    def _codex_with_app_server(self):
+        fake = REAL_REPO / "tests" / "fixtures" / "fake-codex-app-server.py"
+        self._write_exe("codex", '#!/bin/bash\n[ "${1:-}" = login ] && exit 0\n'
+                        f'[ "${{1:-}}" = app-server ] && exec "{sys.executable}" "{fake}" "$@"\nexit 0\n')
+
+    def _trust_writes(self):
+        log = self.root / "codex-home" / "writes.jsonl"
+        return [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
+
+    def test_block_signal_hooks_are_trusted_for_themselves_and_trust_is_never_bypassed(self):
+        self._codex_with_app_server()
         result = self.run_launcher()
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self._tmux_calls()
-        self.assertIn("--dangerously-bypass-hook-trust", calls)
+        self.assertNotIn("--dangerously-bypass-hook-trust", calls)
         for ev in ("PermissionRequest", "PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop"):
             self.assertIn(f"hooks.{ev}=", calls)
-        self.assertIn("core-block-hook.sh", calls)
+        writes = self._trust_writes()
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(sorted(writes[0]["value"]), sorted(
+            f"/<session-flags>/config.toml:{ev}:0:0"
+            for ev in ("permission_request", "pre_tool_use", "post_tool_use", "user_prompt_submit", "stop")))
         self.assertIn("SUTANDO_CODEX_BLOCK_HOOKS=0 to turn them off", result.stderr)
 
-    def test_block_signal_hooks_opt_out_passes_neither_hooks_nor_bypass(self):
+    def test_block_signal_hooks_stay_off_when_codex_cannot_record_their_trust(self):
+        # The stock fake answers no app-server: untrusted hooks would wait at a review screen.
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._tmux_calls()
+        self.assertNotIn("--dangerously-bypass-hook-trust", calls)
+        self.assertNotIn("hooks.", calls)
+        self.assertIn("block-signal hooks off", result.stderr)
+
+    def test_block_signal_opt_out_keeps_codex_trust_untouched(self):
+        self._codex_with_app_server()
         result = self.run_launcher(env_extra={"SUTANDO_CODEX_BLOCK_HOOKS": "0"})
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self._tmux_calls()
         self.assertNotIn("--dangerously-bypass-hook-trust", calls)
         self.assertNotIn("hooks.", calls)
-        self.assertNotIn("block-signal hooks on", result.stderr)
+        self.assertEqual(self._trust_writes(), [])
+        self.assertNotIn("block-signal hooks", result.stderr)
 
     def test_a_worker_instance_launch_is_refused_before_any_core_write(self):
         """The core entry point refuses a pool instance. Through the dispatcher's

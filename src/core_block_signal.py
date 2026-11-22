@@ -23,7 +23,7 @@ so a record from the previous one can never speak for it.
 
 Usage:
   core_block_signal.py hook --runtime claude|codex [--state-dir DIR]   (hook stdin = event JSON)
-  core_block_signal.py codex-args <repo>                                (NUL-separated codex argv)
+  core_block_signal.py codex-args <repo> --codex-home DIR --cwd DIR      (seed trust, then argv)
 """
 from __future__ import annotations
 
@@ -232,14 +232,94 @@ def _toml_str(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def codex_hook_command(repo: str) -> str:
+    return f"bash {shlex.quote(str(Path(repo).resolve() / 'src' / 'core-block-hook.sh'))} codex"
+
+
 def codex_args(repo: str) -> list:
-    """The codex argv that registers the block-signal hooks for one invocation. Session hooks
-    need persisted trust, so the list ends with the flag that runs them without it."""
-    cmd = f"bash {shlex.quote(str(Path(repo).resolve() / 'src' / 'core-block-hook.sh'))} codex"
+    """The codex argv that registers the block-signal hooks for one invocation."""
+    cmd = codex_hook_command(repo)
     out = []
     for ev in CODEX_EVENTS:
         out += ["-c", f"hooks.{ev}=[{{hooks=[{{type=\"command\",command={_toml_str(cmd)},timeout=10}}]}}]"]
-    return out + ["--dangerously-bypass-hook-trust"]
+    return out
+
+
+class _AppServer:
+    """A `codex app-server` over stdio, for the two requests trust seeding needs."""
+
+    def __init__(self, argv, env, cwd, timeout):
+        import selectors
+        self.deadline = time.monotonic() + timeout
+        self.p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, text=True, env=env, cwd=cwd)
+        self.sel = selectors.DefaultSelector()
+        self.sel.register(self.p.stdout, selectors.EVENT_READ)
+        self.next_id = 0
+
+    def call(self, method, params):
+        self.next_id += 1
+        rid = self.next_id
+        self.p.stdin.write(json.dumps({"id": rid, "method": method, "params": params}) + "\n")
+        self.p.stdin.flush()
+        while True:
+            left = self.deadline - time.monotonic()
+            if left <= 0 or not self.sel.select(left):
+                raise TimeoutError(f"codex app-server did not answer {method}")
+            line = self.p.stdout.readline()
+            if not line:
+                raise RuntimeError(f"codex app-server exited before answering {method}")
+            msg = json.loads(line)
+            if msg.get("id") == rid:
+                if "error" in msg:
+                    raise RuntimeError(f"{method}: {msg['error']}")
+                return msg.get("result") or {}
+
+    def notify(self, method):
+        self.p.stdin.write(json.dumps({"method": method}) + "\n")
+        self.p.stdin.flush()
+
+    def close(self):
+        self.sel.close()
+        for step in (self.p.kill, lambda: self.p.wait(timeout=5), self.p.stdin.close, self.p.stdout.close):
+            try:
+                step()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _our_hooks(result: dict, cmd: str) -> list:
+    return [h for entry in result.get("data", []) for h in entry.get("hooks", [])
+            if h.get("source") == "sessionFlags" and h.get("command") == cmd]
+
+
+def seed_codex_trust(repo: str, codex_home: str, cwd: str, codex_bin: str = "codex",
+                     timeout: float = 20.0) -> str:
+    """Record Codex's own trust for exactly our block-signal hooks: "trusted" or "already-trusted".
+
+    Codex computes each hook's key and hash (`hooks/list`) and writes the trust record itself
+    (`config/value/write`, upsert under `hooks.state`), as its /hooks approval does. Only
+    entries whose command is ours are written; any other hook keeps its own trust state.
+    Raises when Codex cannot list or trust all of them."""
+    cmd = codex_hook_command(repo)
+    env = {**os.environ, "CODEX_HOME": codex_home}
+    srv = _AppServer([codex_bin, "app-server", *codex_args(repo)], env, cwd, timeout)
+    try:
+        srv.call("initialize", {"clientInfo": {"name": "sutando-core-block-signal", "version": "1"}})
+        srv.notify("initialized")
+        hooks = _our_hooks(srv.call("hooks/list", {"cwds": [cwd]}), cmd)
+        if len(hooks) != len(CODEX_EVENTS):
+            raise RuntimeError(f"codex listed {len(hooks)} of {len(CODEX_EVENTS)} block-signal hooks")
+        todo = {h["key"]: {"trusted_hash": h["currentHash"]} for h in hooks if h.get("trustStatus") != "trusted"}
+        if not todo:
+            return "already-trusted"
+        srv.call("config/value/write", {"keyPath": "hooks.state", "mergeStrategy": "upsert", "value": todo})
+        after = _our_hooks(srv.call("hooks/list", {"cwds": [cwd]}), cmd)
+        if len(after) != len(CODEX_EVENTS) or any(h.get("trustStatus") != "trusted" for h in after):
+            raise RuntimeError("codex did not report the block-signal hooks trusted after the write")
+        return "trusted"
+    finally:
+        srv.close()
 
 
 def main(argv=None) -> int:
@@ -248,10 +328,18 @@ def main(argv=None) -> int:
     h = sub.add_parser("hook")
     h.add_argument("--runtime", required=True, choices=("claude", "codex"))
     h.add_argument("--state-dir")
-    c = sub.add_parser("codex-args")
+    c = sub.add_parser("codex-args", help="seed trust for our hooks, then print their argv (NUL-separated)")
     c.add_argument("repo")
+    c.add_argument("--codex-home", required=True)
+    c.add_argument("--cwd", required=True)
     a = ap.parse_args(argv)
     if a.cmd == "codex-args":
+        try:
+            status = seed_codex_trust(a.repo, a.codex_home, a.cwd)
+        except Exception as exc:  # noqa: BLE001 — untrusted hooks would stop at a review screen
+            print(f"block-signal hooks not trusted: {exc}", file=sys.stderr)
+            return 1
+        print(status, file=sys.stderr)
         sys.stdout.write("".join(arg + "\0" for arg in codex_args(a.repo)))
         return 0
     try:

@@ -389,14 +389,21 @@ answers.
 The launcher registers them on every Codex CLI core launch (not on an app-server seat, below,
 which draws no TUI dialog for the supervisor to read): it passes `PermissionRequest`,
 `PreToolUse`, `PostToolUse`, `UserPromptSubmit` and `Stop` hooks as `-c hooks.<Event>=…`
-overrides for that run only (nothing is written to `config.toml`) and adds
-`--dangerously-bypass-hook-trust`, and says so in one line of the launch output.
+overrides for that run only.
 
-The trade-off: `--dangerously-bypass-hook-trust` runs every enabled hook for that launch without
-the `/hooks` approval, not only Sutando's. That includes hooks in the user's own Codex home and
-any in the checkout's `.codex/`. Set `SUTANDO_CODEX_BLOCK_HOOKS=0` in the launcher's environment
-to turn this off: the launch then passes neither the hooks nor the flag, and the supervisor reads
-the Codex screen exactly as before.
+Before that it records trust for exactly those five hooks, the way an approval in `/hooks`
+does: it starts `codex app-server` against the core's Codex home, asks Codex for each hook's
+key and hash (`hooks/list`), and has Codex write the record itself (`config/value/write`,
+upserting `hooks.state."/<session-flags>/config.toml:<event>:0:0".trusted_hash` in that home's
+`config.toml`). A record holds one hash, so it trusts only a hook with exactly that command;
+every other hook, the user's own included, keeps its own trust state, and no trust check is
+bypassed. A later launch finds them trusted and writes nothing; a changed command (a moved
+checkout) is trusted again. If Codex cannot list or trust all five, the launch passes none of
+them and says so, and the supervisor reads the Codex screen as before. The launch output says
+which happened in one line.
+
+Set `SUTANDO_CODEX_BLOCK_HOOKS=0` in the launcher's environment to turn them off: the launch
+then passes no hooks and records no trust.
 
 ## Automatic earned resets
 
