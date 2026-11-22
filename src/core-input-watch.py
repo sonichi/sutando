@@ -814,8 +814,8 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
     if manager is None:
         return None
     try:
-        from hitl import tui_gate
-        limit = is_usage_limit(kind, prompt)
+        from hitl import core_card, tui_gate
+        limit = core_card.is_limit_episode(kind, prompt)
         controls = None
         if workspace is not None:
             import recovery_actions
@@ -826,6 +826,7 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
                                                           controls=controls),
                                        runtime=runtime,
                                        episode=tui_gate.LIMIT_EPISODE if limit else None,
+                                       guard=core_card.episode_guard(session, state, kind, prompt),
                                        controls=controls,
                                        model_names=recovery_actions.model_names(workspace, runtime) if controls else None)
         if controls and limit and not seat:

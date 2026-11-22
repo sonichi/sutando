@@ -13,12 +13,16 @@ SOURCE = "tui"
 SHOWN, PENDING, FAILED, NONE = "shown", "pending", "failed", "none"
 
 
-def episode_guard(session: str, state: str, kind: Optional[str], prompt: Optional[str]) -> str:
-    """The guard the monitor's card for this block carries: a usage limit is one episode per
-    session, any other block is keyed on its dialog (tui_gate.requirement_for)."""
+def is_limit_episode(kind: Optional[str], prompt: Optional[str]) -> bool:
+    """A usage limit is one episode per session, whatever its screen shows."""
     from delivery.pane_gate import is_usage_limit
+    return is_usage_limit(kind, prompt)
+
+
+def episode_guard(session: str, state: str, kind: Optional[str], prompt: Optional[str]) -> str:
+    """The episode key of a block: the guard the monitor's card for it carries."""
     from .tui_gate import guard_for, limit_guard
-    return limit_guard(session) if is_usage_limit(kind, prompt) else guard_for(session, prompt, state)
+    return limit_guard(session) if is_limit_episode(kind, prompt) else guard_for(session, prompt, state)
 
 
 def card_status(store_root: Union[str, Path], session: str, state: str,

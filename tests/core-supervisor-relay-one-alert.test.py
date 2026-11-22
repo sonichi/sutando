@@ -128,6 +128,17 @@ class TestSharedPredicate(unittest.TestCase):
                 self.assertEqual(req.guard, core_card.episode_guard(SESSION, sig["state"], sig["kind"],
                                                                     sig["prompt"]), sig["kind"])
 
+    def test_the_monitor_takes_its_episode_key_from_core_card(self):
+        # Mutation check: whatever episode_guard answers is the key the monitor's card carries.
+        with tempfile.TemporaryDirectory() as td:
+            ws = _Workspace(td)
+            with patch.object(core_card, "episode_guard", lambda *a: "episode-sentinel"):
+                req = ws.raise_card(UNKNOWN, projected=False)
+            self.assertEqual(req.guard, "episode-sentinel")
+            with patch.object(core_card, "is_limit_episode", lambda *a: True):
+                req = ws.raise_card(NEXT, projected=False)
+            self.assertEqual((req.subject or {}).get("episode"), "usage-limit")
+
     def test_a_limit_card_stays_this_blocks_however_its_screen_repaints(self):
         with tempfile.TemporaryDirectory() as td:
             ws = _Workspace(td)
