@@ -29,6 +29,9 @@ another before the next launch was pinned on the new account.
 
 While a hold is in force the gate also acts on the owner's bare replies to the notice,
 "switch to <model>" and "retry now", since nothing else reads the inbox with the core down.
+A core that stays alive at a limit screen never reaches the gate, so the supervisor monitor
+records the hold from that screen (`hold_while_wedged`) and acts on the same replies by
+restarting the core from outside it (`relaunch_core`); the hold lifts once the screen is gone.
 Tasks that arrive during a hold are listed in its record (`held_tasks`), so the orphan check
 on the next boot leaves them for the core; each hold incident sends its own notice. Given the
 desktop's card presenter (`gate --card-entry`), that notice also presents the core-model card.
@@ -74,6 +77,10 @@ LONG_RESET_RECHECK_S = 6 * 3600
 TRANSCRIPT_TAIL_BYTES = 256 * 1024
 # The 429's own headers land a moment after it; only a later response says the provider served.
 SERVED_SLACK_S = 5
+PANE_SOURCE = "cli-pane"
+# The old limit screen outlives an owner's action by a restart's length; it must not re-arm.
+REARM_GRACE_S = 180
+RELAUNCH_TIMEOUT_S = 300
 
 _CLI_LIMIT = tuple(rx for name, rx in cli_wedge.ABNORMAL_PATTERNS
                    if name in cli_wedge.PROVIDER_LIMIT_PATTERNS)
@@ -521,8 +528,10 @@ class Decision:
 
 def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
            projects_dir: Optional[Path] = None, launch_model: Optional[str] = None,
-           launch_account: Optional[str] = None, card_entry: Optional[str] = None) -> Decision:
-    """Launch, or hold and say why. The one writer of the hold record."""
+           launch_account: Optional[str] = None, card_entry: Optional[str] = None,
+           evidence: tuple = ()) -> Decision:
+    """Launch, or hold and say why. The one writer of the hold record.
+    `evidence` adds limits the caller observed itself, such as a live core's limit screen."""
     now = time.time() if now is None else now
     workspace = Path(workspace)
     hold = read_hold(workspace)
@@ -542,7 +551,7 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
     if quota is None:
         rec = qa.read_quota_record(workspace, now)
         quota = rec.payload if rec else None
-    found = [lim for lim in (record_evidence(quota, now), transcript_evidence(projects_dir, now))
+    found = [lim for lim in (record_evidence(quota, now), transcript_evidence(projects_dir, now), *evidence)
              if _relevant(lim, launch_model, since)]
     limit = max(found, key=lambda lim: lim.at) if found else None
     seen = hold.get("evidence_at") if hold else None
@@ -600,8 +609,10 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
     return Decision(True, hold, "")
 
 
-def clear(workspace: Path, now: Optional[float] = None, by: Optional[str] = None) -> Optional[dict]:
-    """Lift the hold. Its evidence stays recorded, so only a new refusal re-arms it."""
+def clear(workspace: Path, now: Optional[float] = None, by: Optional[str] = None,
+          mirror: bool = True) -> Optional[dict]:
+    """Lift the hold. Its evidence stays recorded, so only a new refusal re-arms it.
+    `mirror` False leaves core-status alone, for a core that is running and writes its own."""
     hold = read_hold(workspace)
     if not hold or hold.get("status") != "held":
         return hold
@@ -609,8 +620,33 @@ def clear(workspace: Path, now: Optional[float] = None, by: Optional[str] = None
     if by:
         hold["cleared_by"] = by
     _write_hold(workspace, hold)
-    _mirror_core_status(workspace, "starting", "resuming after a provider limit", hold["released_at"])
+    if mirror:
+        _mirror_core_status(workspace, "starting", "resuming after a provider limit", hold["released_at"])
     return hold
+
+
+def hold_while_wedged(workspace: Path, text: Optional[str], now: Optional[float] = None) -> Optional[dict]:
+    """The hold in force for a live core stuck at a provider-limit screen, recorded from that
+    screen's text when none is, so the owner gets the notice and a bare reply counts. Else None."""
+    now = time.time() if now is None else now
+    workspace = Path(workspace)
+    hold = read_hold(workspace) or {}
+    released = hold.get("released_at")
+    if hold.get("status") != "held" and isinstance(released, (int, float)) and 0 <= now - released < REARM_GRACE_S:
+        return None
+    model, account = launch_identity(workspace)
+    # The caller has judged the screen a limit; text that names none is still this core's limit.
+    limit = classify_text(text or "", now, model, PANE_SOURCE) or Limit("usage-limit", now, None, model, PANE_SOURCE)
+    decide(workspace, now, evidence=(limit,), launch_model=limit.model or model, launch_account=account)
+    return active_hold(workspace, now)
+
+
+def release_pane_hold(workspace: Path, now: Optional[float] = None) -> Optional[dict]:
+    """Lift a hold a live core's limit screen caused, once that core is idle or working again."""
+    hold = read_hold(workspace)
+    if not hold or hold.get("status") != "held" or hold.get("source") != PANE_SOURCE:
+        return None
+    return clear(workspace, now, by=PANE_SOURCE, mirror=False)
 
 
 # ---- the owner's way out while the core is down -----------------------------
@@ -667,6 +703,10 @@ def _recorded_actions(hold: Optional[dict]) -> list:
 _STEPS = ("answered", "lifted", "archived")
 
 
+def _steps(entry: dict) -> tuple:
+    return _STEPS + (("relaunched",) if "relaunch" in entry else ())
+
+
 def _mark(workspace: Path, task: str, step: str) -> None:
     """Persist one finished step of a recorded action; the record, not a file, says it is done."""
     hold = read_hold(workspace)
@@ -678,9 +718,10 @@ def _mark(workspace: Path, task: str, step: str) -> None:
         _write_hold(workspace, dict(hold, actions=acts))
 
 
-def _finish(workspace: Path, entry: dict, now: float) -> None:
-    """Complete a recorded action from its record alone: answer, lift, archive, each marked
-    done in the record as it lands, so a replay skips it and never answers a second time."""
+def _finish(workspace: Path, entry: dict, now: float, relaunch: Optional[dict] = None) -> None:
+    """Complete a recorded action from its record alone: answer, lift, archive, relaunch, each
+    marked done in the record as it lands, so a replay skips it and never answers a second time.
+    Without `relaunch` (the launcher's gate) the core is starting anyway, so none is spawned."""
     import local_record
     from local_task_protocol import find_result
     task = entry["task"]
@@ -691,7 +732,9 @@ def _finish(workspace: Path, entry: dict, now: float) -> None:
         _mark(workspace, task, "answered")
     if not entry.get("lifted"):
         hold = read_hold(workspace)
-        if entry.get("ok") and hold and hold.get("status") == "held":
+        # A relaunch onto another model needs the hold: it keeps the old model's restart down.
+        keep = bool((entry.get("relaunch") or {}).get("model"))
+        if entry.get("ok") and not keep and hold and hold.get("status") == "held":
             clear(workspace, now, by=task)
         _mark(workspace, task, "lifted")
     if not entry.get("archived"):
@@ -699,18 +742,76 @@ def _finish(workspace: Path, entry: dict, now: float) -> None:
         if live.exists():
             _archive_task(workspace, live)
         _mark(workspace, task, "archived")
+    if "relaunch" in entry and not entry.get("relaunched"):
+        # Marked first: a monitor killed by the restart it started must not start a second one.
+        _mark(workspace, task, "relaunched")
+        if relaunch and not _spawn_relaunch(workspace, relaunch, entry["relaunch"].get("model")):
+            _tell_owner(workspace, 'I could not start the core\'s restart, so it is still paused. Send "retry now" '
+                        "to try again, or pick a model in the core-model card under Agent Settings.")
+
+
+def _spawn_relaunch(workspace: Path, relaunch: dict, model: Optional[str]) -> bool:
+    """Start `relaunch` detached, so it outlives the monitor whose core it restarts."""
+    import subprocess
+    cmd = [sys.executable, str(Path(__file__).resolve()), "relaunch", "--workspace", str(workspace),
+           "--launcher", relaunch["launcher"]]
+    if model:
+        cmd += ["--model", model, "--switch-entry", relaunch["switch"]]
+    # The monitor inherits the launcher's in-session marker, but it runs outside the core session.
+    env = {k: v for k, v in os.environ.items() if k != "SUTANDO_CORE_SESSION"}
+    try:
+        subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return False
+    return True
+
+
+def relaunch_core(workspace: Path, launcher: str, model: Optional[str] = None,
+                  switch_entry: Optional[str] = None, run=None) -> bool:
+    """Restart a live core from outside it; with `model`, the restart is held by the hold still in
+    force and the switch then writes the model and starts the core. The owner hears of a failure."""
+    import subprocess
+    run = run or subprocess.run
+
+    def rc(cmd):
+        try:
+            return run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                       timeout=RELAUNCH_TIMEOUT_S).returncode
+        except (OSError, subprocess.SubprocessError):
+            return None
+    first = rc(["bash", launcher, "--restart"])
+    ok = first == 0 if not model else first in (0, HOLD_EXIT)
+    if ok and model:
+        ok = bool(switch_entry) and rc(["bash", switch_entry, model]) == 0
+    if not ok:
+        _tell_owner(workspace, f"I could not restart the core{' on ' + model if model else ''}, so it is "
+                    "still paused. Pick a model in the core-model card under Agent Settings, Runtime, "
+                    'Model, or send "retry now" to try again.')
+    return ok
+
+
+def _tell_owner(workspace: Path, text: str) -> None:
+    from local_record import write_text_whole
+    from proactive_routing import proactive_filename
+    try:
+        write_text_whole(Path(workspace) / "results" / proactive_filename(f"core-limit-relaunch-{int(time.time() * 1000)}"),
+                         "[dm-only]\n" + text + "\n")
+    except OSError:
+        pass
 
 
 def handle_owner_actions(workspace: Path, now: Optional[float] = None, *,
-                         switch_cmd: Optional[str] = None) -> list:
+                         switch_cmd: Optional[str] = None, relaunch: Optional[dict] = None) -> list:
     """Act on the owner's "switch to <model>" / "retry now" replies while a hold is in force.
-    Each reply is answered in its own conversation and acted on once; returns their ids."""
+    Each reply is answered in its own conversation and acted on once; returns their ids.
+    `relaunch` ({"launcher", "switch"} entries) is given for a live core: each action restarts it."""
     import subprocess
     now = time.time() if now is None else now
     workspace = Path(workspace)
     for entry in _recorded_actions(read_hold(workspace)):
-        if not all(entry.get(step) for step in _STEPS):
-            _finish(workspace, entry, now)
+        if not all(entry.get(step) for step in _steps(entry)):
+            _finish(workspace, entry, now, relaunch)
     done = []
     for path in sorted((workspace / "tasks").glob("task-*.txt")):
         hold = active_hold(workspace, now)
@@ -726,7 +827,14 @@ def handle_owner_actions(workspace: Path, now: Optional[float] = None, *,
             _archive_task(workspace, path)
             continue
         kind, model = action
-        if kind == "retry":
+        if relaunch:
+            ok = kind == "retry" or bool(relaunch.get("switch"))
+            reply = ("Retrying now: I am restarting the core. If the limit is still in force it pauses again and I will tell you."
+                     if kind == "retry" else
+                     f"Switching the core to {model}: I am restarting it on {model} now, and it answers your waiting "
+                     "messages once it is up. If that fails I will tell you here."
+                     if ok else "I could not switch the model from here; use the core-model card under Agent Settings.")
+        elif kind == "retry":
             ok, reply = True, "Retrying now: the core is starting. If the limit is still in force it pauses again and I will tell you."
         elif not switch_cmd:
             ok, reply = False, "I could not switch the model from here; use the core-model card under Agent Settings."
@@ -737,8 +845,10 @@ def handle_owner_actions(workspace: Path, now: Optional[float] = None, *,
             reply = (f"Switched the core to {model}. It is starting now and will answer your waiting messages."
                      if ok else f"I could not switch the core to {model}; it stays paused. Try the core-model card under Agent Settings.")
         entry = {"task": path.stem, "kind": kind, "model": model, "ok": ok, "reply": reply, "at": now}
+        if relaunch and ok:
+            entry["relaunch"] = {"model": model}
         _write_hold(workspace, dict(hold, actions=_recorded_actions(hold) + [entry]))
-        _finish(workspace, entry, now)
+        _finish(workspace, entry, now, relaunch)
         done.append(path.stem)
     return done
 
@@ -769,7 +879,14 @@ def main(argv=None) -> int:
     held = sub.add_parser("held", help="exit 0 and print the reason while a hold is in force")
     held.add_argument("--workspace", default="", help="the workspace to read (default: the resolved one)")
     sub.add_parser("clear", help="lift the hold now")
+    rel = sub.add_parser("relaunch", help="restart a live core from outside it (the monitor's action)")
+    rel.add_argument("--workspace", required=True)
+    rel.add_argument("--launcher", required=True, help="the core launcher (start-cli.sh)")
+    rel.add_argument("--model", default="", help="restart on this model")
+    rel.add_argument("--switch-entry", default="", help="the model-switch entry")
     args = ap.parse_args(argv)
+    if args.cmd == "relaunch":
+        return 0 if relaunch_core(Path(args.workspace), args.launcher, args.model or None, args.switch_entry or None) else 1
     if args.cmd == "held":
         hold = active_hold(Path(args.workspace) if args.workspace else resolve_workspace())
         if hold:

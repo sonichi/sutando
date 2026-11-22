@@ -70,6 +70,7 @@ from gateway_serving import read_verdict as read_gateway_verdict, status_path as
 from worker_auth_state import authenticated_turn, idle_since_sign_in, login_expired, refusal_answered  # noqa: E402
 import cli_wedge  # noqa: E402
 import core_gate_notice  # noqa: E402
+import core_limit_hold  # noqa: E402
 import self_opened_gate  # noqa: E402
 import tmux_probe  # noqa: E402
 
@@ -444,8 +445,6 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
         pane = strip_limit_banners(pane)
     if base_health == "offline":
         return "crashed", _BASE_TO_STATE["offline"][1], None, None
-    if base_health == "paused":
-        return "blocked-known", _BASE_TO_STATE["paused"][1], None, None
     # An ACTIVE interactive gate in the pane is the finest signal — it distinguishes
     # "sitting at a prompt waiting for input" from the coarse health (e.g. the live
     # /login MENU, which runtime-health's needs_login markers don't match). Check it
@@ -473,6 +472,9 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
     if refused:
         kind, line = refused
         return "blocked-human", f"awaiting user: {kind}", line, kind
+    # After the pane: a live core held at its limit screen still shows that screen.
+    if base_health == "paused":
+        return "blocked-known", _BASE_TO_STATE["paused"][1], None, None
     if not gateway_alive:
         return "gateway-down", "core up but relay gateway not running", None, None
     state, detail = _BASE_TO_STATE.get(base_health, _BASE_TO_STATE["unknown"])
@@ -956,6 +958,33 @@ def drive_escalations(manager, session, prompt, state, send):
     return acted
 
 
+_REPO = _Path(__file__).resolve().parent.parent
+
+
+def limit_reply_step(workspace, settled, seen, pane, runtime, now=None, repo=_REPO):
+    """While the live core stands at a provider-limit screen, hold it and act on the owner's bare
+    "switch to <model>" / "retry now" replies (core_limit_hold). Once its pane shows the core idle
+    or working again, a hold that screen caused is lifted. `settled` and `seen` are (state, kind,
+    prompt) after and before the debounce. Returns the ids of the replies acted on."""
+    if runtime not in (None, "claude"):
+        return []  # the hold, its replies and the model aliases are Claude Code's
+    try:
+        state, kind, prompt = settled
+        if state == "blocked-human" and is_usage_limit(kind, prompt):
+            if core_limit_hold.hold_while_wedged(workspace, prompt, now) is None:
+                return []
+            return core_limit_hold.handle_owner_actions(workspace, now, relaunch={
+                "launcher": str(repo / "src" / "agent" / "start-cli.sh"),
+                "switch": str(repo / "scripts" / "switch-model.sh")})
+        seen_state, seen_kind, seen_prompt = seen
+        if pane and pane.strip() and not (seen_state == "blocked-human" and is_usage_limit(seen_kind, seen_prompt)) \
+                and ((_is_idle_ready(pane, runtime) and refused_turn(pane) is None) or cli_wedge.frame_working(pane)):
+            core_limit_hold.release_pane_hold(workspace, now)
+    except Exception as exc:  # noqa: BLE001 — never let the hold take down the monitor
+        print(f"limit reply step failed: {exc}", file=_sys.stderr)
+    return []
+
+
 def notice_queued(manager, req, workspace, state, kind):
     """Tell each queued task why it is on hold (core_gate_notice); never fatal to the monitor."""
     try:
@@ -1048,7 +1077,7 @@ def main():
             runtime=runtime, styled_pane=styled_pane, limit_stale=limit_stale, still_s=still_s)
         prev_pane = pane
         clock = gate_clock(clock, state, prompt, time.time())
-        seen_state, seen_prompt = state, prompt  # before the debounce masks a new dialog
+        seen_state, seen_prompt, seen_kind = state, prompt, kind  # before the debounce masks a new dialog
 
         # Debounce prompt escalation: only surface once the SAME prompt persists
         # (not a menu the core is actively navigating through).
@@ -1071,6 +1100,10 @@ def main():
             state, detail, prompt, kind = "running", "processing (sign-in check settling)", None, None
         if state != "blocked-known":
             answered_prompt = None
+        # Only the core's own seat reads its inbox; a passive monitor acts on nothing.
+        if not a.seat and a.auto_answer:
+            limit_reply_step(workspace, (state, kind, prompt), (seen_state, seen_kind, seen_prompt),
+                             pane, runtime)
 
         # The actor: only a settled, allowlisted gate is typed at, once per instance.
         key = answer_step(state, kind, prompt, answered_prompt, a.auto_answer)
