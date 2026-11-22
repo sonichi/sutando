@@ -8,7 +8,9 @@ session (core-input-watch.py, a process outside the session it watches) calls `r
 each tick. It runs each click at most once, within ACTION_TTL_S, from a fixed allowlist; argv
 is fixed here and the only argument a click supplies is an id the card itself offered:
 
-    retry_now           core: core_limit_hold.clear; a refused turn: types `continue` once idle
+    retry_now           what the owner's bare "retry now" does (core_limit_hold): lift the hold, and
+                        restart a live core (or a seat, by its pool's --retry-cmd) held at its
+                        limit screen; else a refused turn gets `continue` once idle
     switch_model:<m>    scripts/switch-model.sh <m> --confirm on that session (alias from the list)
     switch_runtime:<r>  core only: src/agent/start-cli.sh --runtime <r> --restart
     restart_core        core only: src/agent/start-cli.sh --restart, from outside the session
@@ -103,7 +105,7 @@ def card_controls(workspace: Path, runtime: Optional[str], *, seat: bool, kind: 
                 for m in switch_offer(workspace, runtime, cap.group(1) if cap else None, seat=seat)]
         if not seat:
             ids += [recovery.action_id(recovery.SWITCH_RUNTIME, r) for r in runtime_offer(runtime)]
-    if kind == "turn-rejected":
+    if kind == "turn-rejected" or (limit and not seat):
         ids.append(recovery.RETRY_NOW)
     if limit:
         ids += [recovery.ADD_ACCOUNT, recovery.BUY_CREDITS]
@@ -143,10 +145,16 @@ class Target:
     """The session a monitor watches: the core (seat None) or one worker seat."""
 
     def __init__(self, workspace: Path, socket: str, session: str, seat: Optional[str] = None,
-                 send_key: Optional[Callable[[object], bool]] = None, brain: Optional[str] = None):
+                 send_key: Optional[Callable[[object], bool]] = None, brain: Optional[str] = None,
+                 retry_cmd: Optional[List[str]] = None):
         self.workspace, self.socket, self.session, self.seat = Path(workspace), socket, session, seat
         self.send_key = send_key or (lambda k: False)
         self.brain = brain
+        self.retry_cmd = list(retry_cmd or [])
+
+    def hold_key(self) -> Optional[str]:
+        """The seat key core_limit_hold files a seat's hold under (its tmux session)."""
+        return self.session if self.seat else None
 
     def state_dir(self) -> Path:
         """A seat's model record lives apart from the core's, which the core's card reads."""
@@ -164,20 +172,37 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
         why = ("This changes billing or the signed-in account, so it needs a confirmed sign-in step "
                "that is not available from here yet; nothing was changed.")
         return "refused", why, why, {}
-    if verb == recovery.RETRY_NOW:
-        if not target.seat and core_limit_hold.active_hold(ws, now) is not None:
-            core_limit_hold.clear(ws, now, by="recovery-card")
-            return ("done", None, "Retrying now: the core is starting. If the limit is still in force it "
-                    "pauses again and a new card says so.", {"state": "starting"})
-        if refused_turn:
-            follow_ups.append(CONTINUE)
-            return "done", None, "Retrying: the refused message is sent again once its terminal is idle.", {}
-        why = "Nothing is paused or refused right now, so there is nothing to retry."
-        return "refused", why, why, {}
     env = dict(os.environ, SUTANDO_TMUX_SOCKET=target.socket, SUTANDO_TMUX_SESSION=target.session)
     env.pop("SUTANDO_CORE_RUNTIME", None)  # the configured runtime, or --runtime, decides
+    env.pop("SUTANDO_CORE_SESSION", None)  # the monitor runs outside the core session
+    if verb == recovery.RETRY_NOW:
+        hold = core_limit_hold.active_hold(ws, now, target.hold_key())
+        if hold is not None and target.seat:
+            if not target.retry_cmd:
+                why = "This worker's restart is not available here; it continues when the limit resets."
+                return "refused", why, why, {}
+            core_limit_hold.clear(ws, now, by="recovery-card", mirror=False, seat=target.hold_key())
+            if _rc(runner, target.retry_cmd, env, RESTART_TIMEOUT_S) != 0:
+                why = "The worker did not restart; it continues when the limit resets."
+                return "failed", why, why, {}
+            return "done", None, f"Retrying now: I restarted {target.seat}.", {"state": "starting"}
+        if hold is not None:
+            live = hold.get("source") == core_limit_hold.PANE_SOURCE
+            core_limit_hold.clear(ws, now, by="recovery-card", mirror=not live)
+            if live:
+                verb = recovery.RESTART_CORE  # a live core at its limit screen retries by a restart
+            else:
+                return ("done", None, "Retrying now: the core is starting. If the limit is still in force it "
+                        "pauses again and a new card says so.", {"state": "starting"})
+        elif refused_turn:
+            follow_ups.append(CONTINUE)
+            return "done", None, "Retrying: the refused message is sent again once its terminal is idle.", {}
+        else:
+            why = "Nothing is paused or refused right now, so there is nothing to retry."
+            return "refused", why, why, {}
     if verb == recovery.SWITCH_MODEL:
-        held = not target.seat and core_limit_hold.active_hold(ws, now) is not None
+        hold = None if target.seat else core_limit_hold.active_hold(ws, now)
+        held = hold is not None and hold.get("source") != core_limit_hold.PANE_SOURCE
         argv = ["bash", str(REPO / "scripts" / "switch-model.sh"), arg, "--confirm",
                 "--socket", target.socket, "--session", target.session]
         if target.seat:
@@ -227,6 +252,14 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
         return "done", None, "Pressed Escape on the prompt.", {}
     why = "That button is not one this Mac runs."
     return "refused", why, why, {}
+
+
+def _rc(runner: Runner, argv: List[str], env: Dict, timeout: float) -> Optional[int]:
+    try:
+        return runner(argv, capture_output=True, text=True, timeout=timeout, env=env,
+                      stdin=subprocess.DEVNULL).returncode
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def _check(manager, data: Dict, target: Target, now: float):
@@ -413,6 +446,8 @@ def hold_card_step(manager, workspace: Path, session: str, runtime: Optional[str
     from hitl.tui_gate import limit_unblock, recovery_action
     workspace = Path(workspace)
     hold = core_limit_hold.active_hold(workspace, now)
+    if hold and hold.get("source") == core_limit_hold.PANE_SOURCE:
+        hold = None  # a live core at its limit screen already has that screen's card
     guard = f"limit-hold:{session}:{_hold_ref(hold)}" if hold else ""
     for r in manager.active():
         subject = r.subject or {}

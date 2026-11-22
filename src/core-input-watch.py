@@ -897,7 +897,7 @@ def _awaiting_recovery(workspace, req):
     return recovery_actions.awaiting_executor(workspace, req)
 
 
-def recovery_step(manager, workspace, socket, session, runtime, seat, enabled=True):
+def recovery_step(manager, workspace, socket, session, runtime, seat, enabled=True, retry_cmd=None):
     """Run each accepted recovery tap on this session's cards; the core's monitor also keeps the
     paused card. Returns the keys owed once the pane is idle, or None. Never fatal."""
     if manager is None or not enabled:
@@ -907,7 +907,8 @@ def recovery_step(manager, workspace, socket, session, runtime, seat, enabled=Tr
         pending = recovery_actions.has_pending(workspace)
         brain = recovery_actions.session_env(socket, session, "CLAUDE_CONFIG_DIR") if seat and pending else None
         target = recovery_actions.Target(workspace, socket, session, seat=seat or None,
-                                         send_key=lambda k: send_keys(socket, session, k), brain=brain)
+                                         send_key=lambda k: send_keys(socket, session, k), brain=brain,
+                                         retry_cmd=retry_cmd)
         owed = []
         recovery_actions.run_pending(manager, target, follow_ups=owed)
         if not seat:
@@ -1130,7 +1131,8 @@ def main():
     while True:
         # Before the capture, so this tick reads the pane a recovery action left.
         if a.chat_escalation:
-            owed = recovery_step(hitl, workspace, a.socket, a.session, last_runtime, a.seat)
+            owed = recovery_step(hitl, workspace, a.socket, a.session, last_runtime, a.seat,
+                                 retry_cmd=shlex.split(a.retry_cmd) if a.retry_cmd else None)
             if owed:
                 follow_up = {"key": owed, "at": time.time()}
         # One capture, not two: deriving `pane` from `styled_pane` guarantees

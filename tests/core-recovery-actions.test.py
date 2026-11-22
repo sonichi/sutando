@@ -118,7 +118,7 @@ class CardButtons(Base):
     def test_core_limit_card_offers_runtime_neutral_buttons_and_names_them(self):
         req = self.card()
         self.assertEqual([a.id for a in req.actions],
-                         ["switch_model:opus", "switch_model:sonnet", "switch_model:haiku",
+                         ["switch_model:opus", "switch_model:sonnet", "switch_model:haiku", "retry_now",
                           "add_account", "buy_credits", "restart_core", "open_terminal"])
         kinds = {a.id: a.kind for a in req.actions}
         self.assertEqual(kinds["buy_credits"], recovery.PURCHASE_KIND)
@@ -358,6 +358,33 @@ class Executor(Base):
         [receipt] = self.run_pending(Run(), now=now)
         self.assertEqual(receipt["outcome"], "done")
         self.assertEqual(core_limit_hold.read_hold(self.ws)["status"], "cleared")
+
+    def _hold(self, seat=None, source="provider-record"):
+        now = time.time()
+        core_limit_hold._write_hold(self.ws, {"status": "held", "kind": "usage-limit", "model": "opus",
+                                              "until": now + 3600, "started_at": now - 60, "set_at": now - 60,
+                                              "source": source}, seat)
+        return now
+
+    def test_retry_on_a_live_core_at_its_limit_screen_restarts_it_as_the_bare_reply_does(self):
+        now = self._hold(source=core_limit_hold.PANE_SOURCE)
+        self.assertIsNone(RA.hold_card_step(self.mgr, self.ws, CORE, "claude"), "the screen's card is the one")
+        req = self.card()
+        self.click(req, "retry_now")
+        run = Run()
+        [receipt] = self.run_pending(run, now=now)
+        self.assertEqual((receipt["outcome"], run.calls[0][0][-1]), ("done", "--restart"))
+        self.assertEqual(core_limit_hold.read_hold(self.ws)["status"], "cleared")
+
+    def test_a_seats_retry_restarts_it_by_its_pools_command(self):
+        now = self._hold(seat=SEAT_SESSION, source=core_limit_hold.PANE_SOURCE)
+        req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED, seat=SEAT)
+        self.click(req, "retry_now")
+        run = Run()
+        target = RA.Target(self.ws, SOCK, SEAT_SESSION, seat=SEAT, retry_cmd=["python3", "pool_manage.py", "retry", "w1"])
+        [receipt] = RA.run_pending(self.mgr, target, runner=run, now=now)
+        self.assertEqual((receipt["outcome"], run.calls[0][0]), ("done", ["python3", "pool_manage.py", "retry", "w1"]))
+        self.assertEqual(core_limit_hold.read_hold(self.ws, SEAT_SESSION)["status"], "cleared")
 
     def test_the_keystroke_driver_and_a_recovered_core_leave_an_owed_click_alone(self):
         req = self.card(kind="unknown", prompt=UNKNOWN)
