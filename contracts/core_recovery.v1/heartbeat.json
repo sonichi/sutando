@@ -1,0 +1,32 @@
+{
+  "client": "sutando-gateway-client",
+  "protocol_version": 1,
+  "provider": "remote-gateway",
+  "tier": "owner",
+  "inflight": 0,
+  "status": "blocked",
+  "step": "Paused: usage limit until 15:00",
+  "capabilities": ["task-ack", "heartbeat", "core-status", "worker_health.v1", "core_recovery.v1"],
+  "health": {
+    "alive": true,
+    "motion": "idle",
+    "condition": "abnormal",
+    "reason": "usage-limit",
+    "since": 1763730000,
+    "recovery": {
+      "v": 1,
+      "incident": "inc_1026786a",
+      "state": "paused_limit",
+      "since": 1763730000,
+      "reset_at": 1763737200,
+      "runtime": "claude",
+      "model": "opus",
+      "account": "acct_3f9a2b",
+      "waiting_tasks": 2,
+      "restarts_10m": 0,
+      "actions": ["retry_now", "switch_model", "switch_runtime", "restart_core"],
+      "switch_models": ["sonnet", "haiku"],
+      "switch_runtimes": ["codex"]
+    }
+  }
+}

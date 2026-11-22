@@ -70,6 +70,7 @@ from gateway_serving import read_verdict as read_gateway_verdict, status_path as
 from worker_auth_state import authenticated_turn, idle_since_sign_in, login_expired, refusal_answered  # noqa: E402
 import cli_wedge  # noqa: E402
 import core_gate_notice  # noqa: E402
+import core_recovery_state  # noqa: E402
 import self_opened_gate  # noqa: E402
 import tmux_probe  # noqa: E402
 
@@ -1186,6 +1187,10 @@ def main():
                 payload["auto_answered"] = last_answered
             _atomic_write(a.out, payload)
             last_sig = sig
+        # The core's own recovery record; a worker seat's state is the pool's to report.
+        if not a.seat:
+            core_recovery_state.update(workspace, {"state": state, "kind": kind, "prompt": prompt},
+                                       runtime=runtime, pane=pane)
 
         # The Manager owns per-episode dedup; leaving the blocked set resolves
         # the card, so the owner sees it close without clicking anything.
