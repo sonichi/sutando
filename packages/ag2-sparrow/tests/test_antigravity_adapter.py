@@ -259,7 +259,7 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         self.assertEqual((self.post_queued(), self.w.metrics()[-1]["card"]), ([], "card-refused"))
 
-    def test_a_collaborators_turn_neither_applies_nor_settles_the_owners_pick(self):
+    def test_the_owners_pick_runs_on_a_collaborators_and_a_guests_turn_and_is_told_only_in_the_dm(self):
         (self.w.home / "models").write_text("")
         self.w.task("task-1", "STUB:TEXT hi")
         self.w.serve()
@@ -270,20 +270,46 @@ class ConnectorTest(unittest.TestCase):
         self.dm_task("task-3", said, reply_to="$card1", click=said)
         self.w.serve()
         self.post_queued("$card2")
-        # A collaborator writes first, in a room: their turn runs on what agy had, and nothing is told.
+        # A collaborator writes first, in a room: their turn runs on the pick, and the outcome goes to the DM.
         self.dm_task("task-4", "STUB:TEXT from a collaborator", tier="team", collaborator=True, kind="room",
                      channel="!room:s.space")
         self.w.serve()
-        self.assertEqual((self.set_model_calls(), self.post_queued(), "model_switch" in self.w.metrics()[-1]),
-                         ([], [], False))
-        state = json.loads((self.w.root / "state" / "model.json").read_text())
-        self.assertEqual((state["wanted"], state.get("told")), ("claude-opus-4-6-thinking", ""), "the pick still waits")
-        # The owner's next message is the one that switches, and the one that is told.
-        self.w.task("task-5", "STUB:TEXT the owner again")
-        self.w.serve()
         self.assertEqual([c["modelId"] for c in self.set_model_calls()], ["claude-opus-4-6-thinking"])
         (told,) = self.post_queued("$card3")
-        self.assertEqual(told["extra_content"]["space.ag2.card"]["text"], "Switched. I'm now using Claude Opus 4.6.")
+        self.assertEqual((told["room_id"], told["extra_content"]["space.ag2.card"]["text"]),
+                         (self.DM, "Switched. I'm now using Claude Opus 4.6."))
+        self.assertNotIn("Switched", self.w.result("task-4"), "never in the room's answer")
+        self.assertEqual(self.w.metrics()[-1]["model_switch"], "switched")
+        # A guest's isolated turn runs on it too; nothing more is told.
+        self.dm_task("task-5", "STUB:TEXT from a guest", tier="guest", kind="room", channel="!room:s.space")
+        self.w.serve(1, "--allow-non-owner")
+        self.assertEqual([c["modelId"] for c in self.set_model_calls()], ["claude-opus-4-6-thinking"] * 2)
+        self.assertEqual((self.post_queued(), "model_switch" in self.w.metrics()[-1]), ([], False))
+        # And the owner's own next turn: on it, nothing more told.
+        self.w.task("task-6", "STUB:TEXT the owner")
+        self.w.serve()
+        self.assertEqual((self.w.metrics()[-1]["model"], self.post_queued()), ("claude-opus-4-6-thinking", []))
+
+    def test_a_guests_turn_first_settles_the_owners_pick_as_switched_and_keeps_it(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        self.dm_task("task-2", "/model")
+        self.w.serve()
+        (sent,) = self.post_queued()
+        said = sent["extra_content"]["space.ag2.card"]["buttons"][1]["reply"]
+        self.dm_task("task-3", said, reply_to="$card1", click=said)
+        self.w.serve()
+        self.post_queued("$card2")
+        self.dm_task("task-4", "STUB:TEXT from a guest", tier="guest", kind="room", channel="!room:s.space")
+        self.w.serve(1, "--allow-non-owner")
+        self.assertEqual((self.w.metrics()[-1]["model_switch"], self.w.metrics()[-1]["model"]),
+                         ("switched", "claude-opus-4-6-thinking"))
+        (told,) = self.post_queued("$card3")
+        self.assertEqual(told["room_id"], self.DM)
+        state = json.loads((self.w.root / "state" / "model.json").read_text())
+        self.assertEqual((state["wanted"], state["confirmed"]), ("claude-opus-4-6-thinking",) * 2)
+        self.assertNotIn("Switched", self.w.result("task-4"))
 
     def test_picking_the_model_already_in_use_says_so_at_once_and_nothing_is_switched_or_confirmed(self):
         (self.w.home / "models").write_text("")
