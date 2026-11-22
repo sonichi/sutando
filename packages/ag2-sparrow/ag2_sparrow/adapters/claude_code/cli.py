@@ -634,7 +634,8 @@ def list_cmd(_args) -> int:
 
 def attach(args) -> int:
     """tmux attach on the job's socket: the same session, under the same lock; /exit ends it and
-    the launcher starts the next one by id."""
+    the launcher starts the next one by id. With --view the client is read-only: tmux itself takes
+    no key from it but detach, so a window that only shows the session cannot type into it."""
     local = selected(args)
     if local is None:
         return EXIT_UNUSABLE
@@ -647,7 +648,8 @@ def attach(args) -> int:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
     sock = str(launcher.socket_path(config_dir(local)))
-    os.execv(tmux, [tmux, "-u", "-S", sock, "attach", "-t", "=%s" % SESSION_NAME])
+    view = ["-f", "read-only,ignore-size"] if getattr(args, "view", False) else []
+    os.execv(tmux, [tmux, "-u", "-S", sock, "attach"] + view + ["-t", "=%s" % SESSION_NAME])
 
 
 def stop(args) -> int:
@@ -768,7 +770,10 @@ def main(argv=None) -> int:
                    "what you type is the session's (a /exit ends it and the launcher resumes it by id); /clear and "
                    "an in-pane /resume are not supported (the Mod stops intake on a session-id change: use "
                    "/compact or install --new-session); detach with the tmux prefix + d, never kill the server")
-    agent_option(sub.add_parser("attach", help=attach_help, description=attach_help)).set_defaults(func=attach)
+    at = agent_option(sub.add_parser("attach", help=attach_help, description=attach_help))
+    at.add_argument("--view", action="store_true", help="look without typing: a read-only tmux client, which takes "
+                    "no key but detach. Limit: while it is the only client the pane still takes its size")
+    at.set_defaults(func=attach)
     s = agent_option(sub.add_parser("stop", help="confirm the open stall card's Stop on this machine (requires --confirm)"))
     s.add_argument("--confirm", action="store_true")
     s.set_defaults(func=stop)
