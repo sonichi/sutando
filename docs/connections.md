@@ -687,7 +687,11 @@ record write, since no launch follows them. `disconnect`, `park`, `park-legacy` 
 that row's lane at once.
 
 The env file is a copy of the row's token wherever `connection_credential` found it, the Keychain
-included: a row whose secret lives only in the vault still gets a lane, through this copy. The proxy
+included. **A secret that lives only in the vault is written to disk with no command run and no
+opt-in:** on every successful `launch`, and on `promote` and `unpark`, the sync copies it into a 0600
+`state/ag2-mcp.d/conn-<instance>.env` (rewritten only when its content changed). The file is created
+0600 before any byte is written (`mkstemp`, `fchmod`, fsync, `os.replace`), and no result, log line
+or descriptor carries the secret. The proxy
 reads a lane's bearer only from the `env_file` its descriptor names; its vault path
 (`env_file: '(vault)'`) is built in memory for a pool worker's own seat and switches extra lanes off,
 so a lane descriptor cannot point at the vault yet. The copy is kept in `state/` (never in the

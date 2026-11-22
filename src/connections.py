@@ -4163,10 +4163,12 @@ def mcp_descriptor_path(workspace: Optional[Path], mcp_config: Optional[Path] = 
 
 
 def _named_descriptors(servers) -> "list[Path]":
-    """The `AG2_MCP_DESCRIPTOR` each MCP server entry's `env` names, in entry order."""
+    """The `AG2_MCP_DESCRIPTOR` each MCP server entry's `env` names, in entry order; an entry or `env`
+    that is not a table names nothing."""
     out = []
-    for entry in servers.values() if isinstance(servers, dict) else []:
-        named = (entry.get("env") or {}).get("AG2_MCP_DESCRIPTOR") if isinstance(entry, dict) else None
+    for entry in servers.values() if isinstance(servers, Mapping) else []:
+        env = entry.get("env") if isinstance(entry, Mapping) else None
+        named = env.get("AG2_MCP_DESCRIPTOR") if isinstance(env, Mapping) else None
         if isinstance(named, str) and named:
             out.append(Path(named))
     return out
@@ -4279,13 +4281,15 @@ def _main_mcp_descriptor(workspace: Optional[Path], environ: Mapping[str, str], 
     descriptor the Claude Code MCP config names, else any the Codex `config.toml` names (the desktop's
     lives outside the workspace), else `state/ag2-mcp.json`. None when none is a readable version-1
     descriptor."""
-    paths = [descriptor] if descriptor is not None else []
-    if (environ.get("AG2_MCP_DESCRIPTOR") or "").strip():
-        paths.append(Path(environ["AG2_MCP_DESCRIPTOR"].strip()))
-    paths += _claude_config_descriptors(mcp_config)
-    paths += _codex_config_descriptors(_codex_config_path(environ) if codex_config is None else codex_config)
-    paths.append(_workspace(workspace) / "state" / MCP_DESCRIPTOR_NAME)
-    for path in paths:
+    def candidates():  # lazily, in precedence order: a later source is read only if every earlier one fails
+        if descriptor is not None:
+            yield descriptor
+        if (environ.get("AG2_MCP_DESCRIPTOR") or "").strip():
+            yield Path(environ["AG2_MCP_DESCRIPTOR"].strip())
+        yield from _claude_config_descriptors(mcp_config)
+        yield from _codex_config_descriptors(_codex_config_path(environ) if codex_config is None else codex_config)
+        yield _workspace(workspace) / "state" / MCP_DESCRIPTOR_NAME
+    for path in candidates():
         try:
             desc = json.loads(Path(path).read_text(encoding="utf-8"))
         except (OSError, ValueError):

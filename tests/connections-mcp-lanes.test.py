@@ -526,8 +526,52 @@ class LifecycleReconcile(Base):
         self.assertIn("MCP lane sync failed (OSError)", "".join(logs.output))
 
 
+class MalformedMcpConfig(Base):
+    """A hand-edited MCP config whose entry or `env` is not a table names nothing; it never stops the sync."""
+
+    def codex(self, body):
+        path = self.ws / "codex-home" / "config.toml"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(body)
+        return path
+
+    def test_a_codex_env_that_is_a_string_beside_a_valid_explicit_descriptor(self):
+        self.record([S_SPACE, DEV_S])
+        out = self.sync(codex_config=self.codex('[mcp_servers.s-space]\nenv = "oops"\n'))
+        self.assertEqual((out["ok"], out["written"]), (True, ["dev-s-space"]))
+
+    def test_a_codex_env_that_is_a_list_falls_through_to_the_workspace_descriptor(self):
+        self.record([S_SPACE, DEV_S])
+        (self.ws / "state").mkdir(exist_ok=True)
+        (self.ws / "state" / C.MCP_DESCRIPTOR_NAME).write_text(self.main.read_text())
+        out = self.sync(descriptor=None, codex_config=self.codex('[mcp_servers]\nweird = 3\n\n'
+                                                                 '[mcp_servers.s-space]\nenv = ["a", "b"]\n'))
+        self.assertEqual((out["ok"], out["written"]), (True, ["dev-s-space"]))
+
+    def test_a_malformed_earlier_location_never_hides_a_valid_later_one(self):
+        self.record([S_SPACE, DEV_S])
+        claude = self.ws / "claude.json"
+        claude.write_text(json.dumps({"mcpServers": {"a": {"env": "oops"}, "b": {"env": [1]}, "c": None}}))
+        codex = self.codex(f'[mcp_servers.s-space.env]\nAG2_MCP_DESCRIPTOR = "{self.main}"\n')
+        out = self.sync(descriptor=None, mcp_config=claude, codex_config=codex)
+        self.assertEqual((out["ok"], out["written"]), (True, ["dev-s-space"]))
+        self.assertEqual(C.mcp_descriptor_path(self.ws, claude), self.ws.resolve() / "state" / C.MCP_DESCRIPTOR_NAME)
+
+    def test_a_later_location_is_not_read_once_an_earlier_one_is_valid(self):
+        self.record([S_SPACE, DEV_S])
+        with unittest.mock.patch.object(C, "_codex_config_descriptors", side_effect=AssertionError("read")) as later:
+            self.assertTrue(self.sync()["ok"])
+        later.assert_not_called()
+
+    def test_the_cli_syncs_beside_a_malformed_codex_config(self):
+        self.record([S_SPACE, DEV_S])
+        bad = self.codex('[mcp_servers.s-space]\nenv = "oops"\n')
+        rc, out, err = NoSecretLeaks.run_cli(self, "sync-mcp-lanes", "--descriptor", str(self.main), codex_config=bad)
+        self.assertEqual((rc, out, err), (0, "written\tdev-s-space\n", ""))
+
+
 class NoSecretLeaks(Base):
-    def run_cli(self, *argv):
+    def run_cli(self, *argv, codex_config=None):
         import importlib.util
         spec = importlib.util.spec_from_file_location("connections_cli", ROOT / "scripts" / "connections.py")
         cli = importlib.util.module_from_spec(spec)
@@ -537,7 +581,7 @@ class NoSecretLeaks(Base):
 
         def sync(ws, **kw):
             return real(ws, environ={}, vault=self.vault, mcp_config=self.ws / "no-config.json", space_of=space_of,
-                        descriptor=kw.get("descriptor"), codex_config=self.ws / "no-codex.toml")
+                        descriptor=kw.get("descriptor"), codex_config=codex_config or self.ws / "no-codex.toml")
         with unittest.mock.patch.object(cli.connections, "sync_mcp_lanes", sync), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = cli.main(["--workspace", str(self.ws), *argv])
