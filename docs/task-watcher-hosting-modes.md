@@ -94,7 +94,9 @@ same session watcher can instead be run by a Claude Code Mod, `src/agent/claude/
   `tool.call` (never a subagent's), `src/task_watch_owner.py` reads each held task through
   `task_envelope.attested_task_headers` (headers below `task:` count only in a signed gateway task) and
   answers `owner` only for `access_tier: owner` from a person's channel (`ag2space`, `discord`,
-  `telegram`, `slack`, `voice`, `phone`, `chat`) whose sender is not an agent; cron, health-check,
+  `telegram`, `slack`, `voice`, `phone`, `chat`) whose sender is not an agent and that is not the
+  bridge's own event (`interaction_type: system_event`: the end-of-call task a voice session or a
+  phone call leaves); cron, health-check,
   API, connector and other machine tasks keep the turn-end submit. Those still `pending` by
   `task_disposition.py` are named in one line attached to that tool's result as `context`
   (`delivered mid-turn via tool result: <names>` in the trail) and leave the buffer. When the turn

@@ -523,6 +523,11 @@ roster becomes invalid after preflight, creation reports the newly created
 worker's id and explains that it will receive nothing until the roster names
 it; the live worker and its records are retained.
 
+Once registered, creation starts the worker's own s.space identity by default
+(`pool_identity_request.py`, the device-connect flow run in the background; opt out with
+`--no-identity` or `WORKER_POOL_IDENTITY_ON_CREATE=0`). That step is reported, never fatal:
+a worker whose identity step cannot start is created and answers through the core.
+
 The broker's complete `display.worker_labels` map is applied atomically under
 the roster lock. `worker_label_config_version` tracks the last fully applied
 label snapshot independently of the general `config_version`, and
