@@ -13,6 +13,8 @@
   saved before it is posted, a failed post is tried again, an outcome still untold is posted first by
   the next `post` or `reply`, an outcome is told once, and no retry starts the switch again.
 - An untold outcome with a newer attempt after it is marked superseded and never posted.
+- A tap is resolved through the ids its own card was built with and acts only while the list still has
+  that id; slugs are unique on a card; an id that is not a model name or a title too long is left out.
 
 The Action call, the core's row and the process launch are fakes; no network, no tmux, no real switch.
 
@@ -638,8 +640,9 @@ class Manifest(Base):
         self.run_(["post", "--room", DM])
         self.choose("default=Default;opus=Opus")
         rc, out = self.tap("fable[1m]")
-        self.assertEqual((rc, out), (2, {"status": "refused", "why": "the list of models has no 'fable-1m', so nothing was switched"}))
+        self.assertEqual((rc, out), (2, {"status": "refused", "why": mc.GONE}))
         self.assertEqual((self.launch.calls, len(self.fake.calls)), ([], 1))
+        self.assertEqual(mc.GONE, "That choice is no longer on my list. Ask me for the model card again.")
 
     def test_an_unreadable_or_empty_list_posts_no_menu_and_says_so(self):
         for text in ("not json", "[]", json.dumps({"config": {}}), json.dumps({"config": {mc.CHOICES_KEY: 3}}),
@@ -653,9 +656,75 @@ class Manifest(Base):
         self.assertEqual(self.fake.calls, [])
         self.assertIn("can't read the list of models", mc.NO_CHOICES)
 
-    def test_two_ids_with_one_slug_keep_the_first(self):
-        self.choose("sonnet[1m]=Sonnet (1M context);sonnet-1m=Other;opus = Opus ")
-        self.assertEqual(mc.choices(), [("sonnet[1m]", "Sonnet (1M context)", "sonnet-1m"), ("opus", "Opus", "opus")])
+    def test_a_list_edited_between_the_card_and_the_tap_never_switches_to_another_id(self):
+        self.choose("claude-opus-4.5=Opus;default=Default")
+        self.run_(["post", "--room", DM])
+        self.assertEqual(mc.issued_choices(self.ws)["$card1"]["ids"], {"claude-opus-4-5": "claude-opus-4.5", "default": "default"})
+        self.choose("claude-opus-4-5=Opus;default=Default")
+        self.assertEqual(mc.choices()[0], ("claude-opus-4-5", "Opus", "claude-opus-4-5"), "the same slug, another id")
+        rc, out = self.tap("opus")
+        self.assertEqual((rc, out), (2, {"status": "refused", "why": mc.GONE}))
+        self.assertEqual((self.launch.calls, len(self.fake.calls), mc.outcomes(self.ws)), ([], 1, []))
+        self.run_(["post", "--room", DM])
+        rc, out = self.tap("opus", event="$card2")
+        self.assertEqual((rc, out["status"], self.launch.calls[0][0][6]), (0, "started", "claude-opus-4-5"))
+
+    def test_two_ids_with_one_slug_each_get_a_button_and_switch_to_their_own_id(self):
+        self.choose("Opus[1m]=Opus big;opus[1m]=Opus small;opus-1m-2=Third;opus = Opus ;opus=Again")
+        self.assertEqual(mc.choices(), [("Opus[1m]", "Opus big", "opus-1m"), ("opus[1m]", "Opus small", "opus-1m-2"),
+                                        ("opus-1m-2", "Third", "opus-1m-2-2"), ("opus", "Opus", "opus")])
+        self.run_(["post", "--room", DM])
+        commands = [b["command"] for b in self.fake.cards()[0]["buttons"]]
+        self.assertEqual(len(set(commands)), 4)
+        for n, (said, model) in enumerate((("Switch the core to Opus big", "Opus[1m]"),
+                                           ("Switch the core to Opus small", "opus[1m]"))):
+            rc, out = self.tap("opus", said=said, event=f"$card{len(self.fake.calls)}")
+            self.assertEqual((rc, out["status"], self.launch.calls[n][0][6]), (0, "started", model))
+            self.run_(["post", "--room", DM])
+
+    def test_a_title_no_button_can_carry_is_skipped_and_the_rest_is_posted(self):
+        self.choose(f"opus=Opus;sonnet={'S' * 81};haiku={'H' * 80};fable=;default=Default")
+        rc, out = self.run_(["post", "--room", DM])
+        self.assertEqual((rc, out["status"]), (0, "posted"))
+        self.assertEqual([b["label"] for b in self.fake.cards()[0]["buttons"]], ["Opus", "H" * 80, "Default"])
+        self.assertNotIn("sonnet", mc.issued_choices(self.ws)["$card1"]["ids"])
+
+    def test_an_id_that_is_not_a_model_name_is_never_offered_or_started(self):
+        self.choose("--offline=Offline;-x=Dash;opus --offline=Spaced;$(id)=Shell;" + "a" * 81 + "=Long;opus=Opus")
+        self.assertEqual(mc.choices(), [("opus", "Opus", "opus")])
+        self.run_(["post", "--room", DM])
+        self.assertEqual([b["label"] for b in self.fake.cards()[0]["buttons"]], ["Opus"])
+        _, card = ac.build(mc.CARD_ID, "info", title="t", body="b", buttons=[
+            ac.button("Offline", "reply", reply="Do offline", command="card:model:core:offline")])
+        mc.issued_cards.record(self.ws, "$card1", card, room=DM, lane="s_dspace", handler=mc.HANDLER)
+        mc.remember_choices(self.ws, "$card1", [("--offline", "Offline", "offline")], 1.0)
+        rc, out = self.tap("opus", said="Do offline")
+        self.assertEqual((rc, out), (2, {"status": "refused", "why": mc.GONE}))
+        self.assertEqual(self.launch.calls, [])
+
+    def test_a_tap_on_a_card_with_no_ids_kept_is_refused(self):
+        self.run_(["post", "--room", DM])
+        path = self.ws.joinpath(*mc.ISSUED)
+        for text in (None, "not json", "[]", '{"cards": 3}', '{"cards": {"$card1": {"ids": 3}}}',
+                     '{"cards": {"$card1": {"ids": {"opus": 3}}}}', '{"cards": {"$other": {"ids": {"opus": "opus"}}}}'):
+            path.unlink() if text is None else path.write_text(text)
+            rc, out = self.tap("opus")
+            self.assertEqual((rc, out), (2, {"status": "refused", "why": mc.GONE}), text)
+        self.assertEqual((self.launch.calls, len(self.fake.calls)), ([], 1))
+
+    def test_a_menu_whose_ids_cannot_be_kept_says_its_buttons_will_not_act(self):
+        with mock.patch.object(mc, "remember_choices", side_effect=PermissionError("read-only")):
+            rc, out = self.run_(["post", "--room", DM])
+        self.assertEqual((rc, out), (0, {"status": "posted", "event_id": "$card1",
+                                         "why": "its buttons will not act (PermissionError)"}))
+        self.assertEqual(self.tap("opus")[1], {"status": "refused", "why": mc.GONE})
+
+    def test_only_the_newest_menus_ids_are_kept(self):
+        for n in range(mc.ISSUED_KEPT + 2):
+            mc.remember_choices(self.ws, f"$m{n}", [("opus", "Opus", "opus")], float(n))
+        kept = mc.issued_choices(self.ws)
+        self.assertEqual((len(kept), "$m0" in kept, "$m1" in kept, f"$m{mc.ISSUED_KEPT + 1}" in kept),
+                         (mc.ISSUED_KEPT, False, False, True))
 
     def test_more_choices_than_a_card_holds_shows_the_first_six_and_says_to_ask(self):
         self.choose(";".join(f"m{c}=Model {c.upper()}" for c in "abcdefgh"))

@@ -8,9 +8,13 @@
 
 `post` sends the menu to the owner's checked DM and records it (src/issued_cards.py), so only a tap on
 it acts. Its buttons are the skill manifest's MODEL_SWITCH_CHOICES (`id=Title;…`, what the menu-bar
-app offers), in that order and under those titles; a button carries a slug of its id ("sonnet-1m") and
-a tap maps it back to the exact id ("sonnet[1m]"), the one marked as in use by exact id. No list is
-built in: with no readable choices the menu is not posted. `reply` handles that tap
+app offers), in that order and under those titles; a button carries a slug of its id ("sonnet-1m"),
+unique on the card, and the exact ids the card was built with are kept beside it
+(`<workspace>/state/model-card-choices.json`, by the card's event id). A tap is resolved through that
+card's own ids and acts only when the id is still on the list, so an edit to the list between the card
+and the tap never switches to another id. An entry whose id is not a model name (one starting with "-",
+say) or whose title is too long for a button is left out. The model in use is marked by exact id. No
+list is built in: with no readable choices the menu is not posted. `reply` handles that tap
 (agent_card.click_verdict decides): it starts `switch-model.sh <id> --confirm` detached, because the
 core's CLI takes /model only after the current turn ends. Each tap is one attempt with its own id: the
 "switching" card is posted first, then the switch is started, so its outcome can only come after.
@@ -57,7 +61,11 @@ MANIFEST = _HERE.parent / "manifest.json"
 CHOICES_KEY = "MODEL_SWITCH_CHOICES"
 NO_CHOICES = "I can't read the list of models (skills/model-switch/manifest.json), so I have no menu to show."
 DEFAULT_NAME = "the default model"
-_PLAIN = re.compile(r"[A-Za-z0-9._\[\]-]{1,80}")
+GONE = "That choice is no longer on my list. Ask me for the model card again."
+_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\[\]-]{0,79}")
+ISSUED = ("state", "model-card-choices.json")
+ISSUED_KEPT = 20
+MENU_BUTTONS = ac.LIMITS["buttons"]
 ACCEPT_TIMEOUT_S = 180
 OUTCOMES = ("state", "model-card-outcome.json")
 OUTCOME_TTL_S, OUTCOMES_KEPT = 86400, 20
@@ -86,18 +94,51 @@ def _emit(payload: dict, code: int = 0) -> int:
 
 def choices(manifest: Optional[Path] = None) -> list:
     """[(id, title, slug)] from the skill manifest's MODEL_SWITCH_CHOICES, in its order; [] when it
-    cannot be read. The slug is the id as a card reply may carry it; an entry without an id or title,
-    or whose slug an earlier entry has, is left out."""
+    cannot be read. The slug is the id as a card reply may carry it, numbered when another id has it.
+    Left out: an id that is not a model name or is listed twice, and a title no button can carry."""
     from skill_config import manifest_config
     raw = manifest_config(manifest or MANIFEST).get(CHOICES_KEY)
     out: list = []
     for entry in raw.split(";") if isinstance(raw, str) else []:
         model, _, title = entry.partition("=")
         model, title = model.strip(), " ".join(title.split())
-        slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
-        if model and title and slug and slug not in [s for _, _, s in out]:
-            out.append((model, title, slug))
+        if not _MODEL_ID.fullmatch(model) or not 0 < len(title) <= ac.LIMITS["label"] or model in [m for m, _, _ in out]:
+            continue
+        base = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
+        taken = [s for _, _, s in out]
+        slug = next(s for s in [base] + [f"{base}-{n}" for n in range(2, len(out) + 3)] if s not in taken)
+        out.append((model, title, slug))
     return out
+
+
+def remember_choices(ws: Path, event_id: str, picks: list, now: float) -> None:
+    """Keep the exact id behind each slug of the menu posted as `event_id`."""
+    from file_lock import locked_file
+    from local_record import write_whole
+    path = ws.joinpath(*ISSUED)
+    with locked_file(path.with_name(path.name + ".lock")):
+        cards = issued_choices(ws)
+        cards[event_id] = {"ids": {slug: model for model, _, slug in picks}, "ts": now}
+        newest = sorted(cards.items(), key=lambda kv: float(kv[1].get("ts") or 0))[-ISSUED_KEPT:]
+        write_whole(path, {"cards": dict(newest)})
+
+
+def issued_choices(ws: Path) -> dict:
+    """{event id: {"ids": {slug: exact id}, "ts"}} for the menus this agent posted."""
+    try:
+        data = json.loads(ws.joinpath(*ISSUED).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    cards = data.get("cards") if isinstance(data, dict) else None
+    return {k: v for k, v in cards.items() if isinstance(v, dict) and isinstance(v.get("ids"), dict)} \
+        if isinstance(cards, dict) else {}
+
+
+def tapped_model(ws: Path, event_id: str, slug: str) -> str:
+    """The exact id `slug` stood for on the menu posted as `event_id`, when the list still has that id;
+    "" for a menu with no ids kept, a slug it did not carry, or an id since taken off the list."""
+    model = issued_choices(ws).get(event_id, {}).get("ids", {}).get(slug)
+    return model if isinstance(model, str) and model in [m for m, _, _ in choices()] else ""
 
 
 def name_of(model: Optional[str], picks: Optional[list] = None) -> str:
@@ -106,7 +147,7 @@ def name_of(model: Optional[str], picks: Optional[list] = None) -> str:
     if not model:
         return DEFAULT_NAME
     title = next((t for m, t, _ in (choices() if picks is None else picks) if m == model), "")
-    return model if not title and _PLAIN.fullmatch(model) else ac.md_escape(title or model)
+    return model if not title and _MODEL_ID.fullmatch(model) else ac.md_escape(title or model)
 
 
 def record(ws: Path) -> dict:
@@ -138,7 +179,7 @@ def still_using(ws: Path, alias: str) -> str:
 def menu_card(model: Optional[str], picks: list) -> tuple:
     """(body, card): one reply button per choice in `picks`, the one in use (by exact id) marked. A
     card holds six buttons; with more choices the first six are shown and the text says to ask."""
-    limit = ac.LIMITS["buttons"]
+    limit = MENU_BUTTONS
     buttons = [ac.button(title, "reply", style="primary" if choice == model else "secondary",
                          reply=f"Switch the core to {title}", command=ac.reply(KIND, TARGET, slug))
                for choice, title, slug in picks[:limit]]
@@ -321,6 +362,11 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time) -> int:
         body, card = menu_card(current_model(ws)["model"], picks)
     out = _post(ws, args.room, body, card, f"model-card:menu:{int(now())}", reply_to=args.reply_to or "",
                 core=core, execute=execute)
+    if out.get("event_id"):
+        try:
+            remember_choices(ws, out["event_id"], picks[:MENU_BUTTONS], now())
+        except OSError as e:
+            out["why"] = f"its buttons will not act ({type(e).__name__})"
     return _emit({**out, **({"delivered": delivered} if delivered else {})}, 0 if out["status"] == "posted" else 1)
 
 
@@ -350,9 +396,9 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     verdict = ac.click_verdict(headers, words, ws, ac.lane_owner(ws, str(core.get("owner_mxid") or "")))
     other, code = ac.click_answer(verdict, words, (KIND,)), 1
     slug = verdict.command.verb if other is None else ""
-    alias = next((m for m, _, s in choices() if s == slug), "")
+    alias = tapped_model(ws, str(headers.get("reply_to_event") or ""), slug) if other is None else ""
     if other is None and (verdict.command.target != TARGET or not alias):
-        other, code = {"status": "refused", "why": f"the list of models has no {slug!r}, so nothing was switched"}, 2
+        other, code = {"status": "refused", "why": GONE}, 2
     elif other is None and current_model(ws)["model"] == alias:
         other, code = {"status": "say", "say": f"I'm already using {name_of(alias)}. Nothing changed."}, 0
     room, attempt = str(headers.get("channel_id") or ""), new_attempt(now())

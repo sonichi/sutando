@@ -71,8 +71,11 @@ When the owner asks in their DM which model the core is on, or asks to change it
 post the menu: `python3 skills/model-switch/scripts/model_card.py post --room <the DM's room id>
 [--reply-to <their message's event id>]` (`--print` shows it without posting). Its buttons are this
 skill's `MODEL_SWITCH_CHOICES` (`manifest.json`, the list the menu-bar app offers), in that order and
-under those titles; each carries a slug of its id (`sonnet-1m`) that a tap maps back to the exact id
-(`sonnet[1m]`), so a tap never changes the context size the list names. The card names the model in
+under those titles; each carries a slug of its id (`sonnet-1m`), unique on the card, and the exact ids
+the card was built with are kept by its event id (`<workspace>/state/model-card-choices.json`). A tap
+is resolved through its own card's ids (`sonnet[1m]`), so it never changes the context size the list
+names, and it acts only while the list still has that id. An entry whose id is not a model name (one
+starting with `-`, say) or whose title is too long for a button is left out. The card names the model in
 use, read only from `<workspace>/state/model-switch.json` and matched by exact id (an id the list
 lacks is named as recorded and no button is marked); with no record it says "the default model". A
 card holds six buttons: with a longer list the first six are shown and the text says to ask for the
@@ -89,6 +92,9 @@ skills/model-switch/scripts/model_card.py reply`, run that with `--task-file <ta
 - `{"status": "failed", "say": …}`: the switch could not be started; the card already says so.
 - `{"status": "say", "say": …}`: the tapped model is the one in use ("I'm already using X. Nothing
   changed."); say that line.
+- `{"status": "refused", "why": "That choice is no longer on my list. Ask me for the model card
+  again."}`: the list changed since the card was posted, or the card's ids were not kept; nothing was
+  started. Say the `why`.
 - `forged_or_stale_click`, `owner_words`, `other_card`, `not_a_card`, `refused`, `failed`: as in
   `skills/agent-cards/SKILL.md`.
 
