@@ -680,7 +680,10 @@ def session_runtime(socket, session):
 
 
 def hook_verdict(socket, session, state_dir, now):
-    """`core_block_signal.verdict()` for the core pane, or None when no record speaks for it."""
+    """`core_block_signal.verdict()` for the core pane, or None when no record speaks for it.
+    With no record for this tmux server (no hooks installed) it makes no tmux call at all."""
+    if not core_block_signal.has_records(state_dir, socket):
+        return None
     target = cli_wedge.core_target(socket, session)
     ident = core_block_signal.pane_identity(socket, target) if target else None
     if ident is None:

@@ -16,6 +16,7 @@ import os
 import sys
 import shutil
 import tempfile
+import time
 import tomllib
 import unittest
 from contextlib import redirect_stdout
@@ -96,6 +97,12 @@ class TestRecord(unittest.TestCase):
     def test_panes_of_two_servers_do_not_share_a_record(self):
         cbs.write(self.state, SOCK, "%0", 1, "blocked", "permission", "PermissionRequest", "claude", "s")
         self.assertIsNone(cbs.read(self.state, "/tmp/other.sock", "%0"))
+
+    def test_has_records_is_per_tmux_server(self):
+        self.assertFalse(cbs.has_records(self.state, SOCK))
+        cbs.write(self.state, SOCK, "%3", 1, "clear", None, "Stop", "claude", "s")
+        self.assertTrue(cbs.has_records(self.state, SOCK))
+        self.assertFalse(cbs.has_records(self.state, "/tmp/other.sock"))
 
     def test_garbage_reads_as_no_record(self):
         p = cbs.record_path(self.state, SOCK, "%3")
@@ -344,6 +351,15 @@ class TestSeedCodexTrust(unittest.TestCase):
             v["trusted_hash"] = "sha256:old"
         Path(self.home, "fake-trust.json").write_text(json.dumps(trust))
         self.assertEqual(self.seed(), "trusted")
+
+    def test_a_codex_that_never_answers_is_given_up_on_quickly(self):
+        with open(self.codex, "w") as f:
+            f.write("#!/bin/sh\nexec sleep 60\n")
+        t0 = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            cbs.seed_codex_trust("/tmp/r", self.home, self.tmp.name, codex_bin=self.codex, timeout=0.5)
+        self.assertLess(time.monotonic() - t0, 5)
+        self.assertLessEqual(cbs.SEED_TIMEOUT_S, 5)
 
     def test_failures_raise(self):
         os.environ["FAKE_MODE"] = "exit"

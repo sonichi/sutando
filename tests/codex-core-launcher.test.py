@@ -3108,9 +3108,11 @@ class CoreWindowRestartTests(unittest.TestCase):
         self.addCleanup(subprocess.run, [REAL_TMUX, "-S", self.sock, "kill-server"], capture_output=True)
         (self.case.bin / "tmux").unlink()
         (self.case.bin / "tmux").symlink_to(REAL_TMUX)
-        # A core that stays up like the real CLI; `login status` still succeeds.
+        # A core that stays up like the real CLI; `login status` still succeeds. It serves no
+        # app-server, so the launcher's hook-trust step fails at once instead of waiting it out.
         codex = self.case.bin / "codex"
-        codex.write_text('#!/bin/bash\n[ "${1:-}" = login ] && exit 0\nexec sleep 300\n')
+        codex.write_text('#!/bin/bash\n[ "${1:-}" = login ] && exit 0\n[ "${1:-}" = app-server ] && exit 1\n'
+                         'exec sleep 300\n')
         codex.chmod(0o755)
 
     def tmux(self, *args):

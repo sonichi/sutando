@@ -170,6 +170,12 @@ def record_event(state_dir, socket: str, pane_id: str, pane_pid: int, payload: d
                      payload.get("hook_event_name", ""), runtime, session, now, inter)
 
 
+def has_records(state_dir, socket: str) -> bool:
+    """Whether any pane of this tmux server has a record: a cheap test before asking tmux."""
+    d = Path(state_dir) / SUBDIR
+    return d.is_dir() and any(d.glob(f"{socket_key(socket)}.*.json"))
+
+
 def read(state_dir, socket: str, pane_id: str) -> Optional[dict]:
     """The pane's record, or None when absent or unreadable."""
     try:
@@ -300,8 +306,12 @@ def _our_hooks(result: dict, cmd: str) -> list:
             if h.get("source") == "sessionFlags" and h.get("command") == cmd]
 
 
+#: Codex answers the whole exchange in well under a second; a launch never waits longer on it.
+SEED_TIMEOUT_S = 5.0
+
+
 def seed_codex_trust(repo: str, codex_home: str, cwd: str, codex_bin: str = "codex",
-                     timeout: float = 20.0) -> str:
+                     timeout: float = SEED_TIMEOUT_S) -> str:
     """Record Codex's own trust for exactly our block-signal hooks: "trusted" or "already-trusted".
 
     Codex computes each hook's key and hash (`hooks/list`) and writes the trust record itself

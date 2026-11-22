@@ -245,6 +245,15 @@ class TestHookVerdictFromDisk(unittest.TestCase):
     def verdict(self, now):
         return _mod.hook_verdict(self.SOCK, "sutando-core", self.state, now)
 
+    def test_no_record_makes_no_tmux_call(self):
+        # The loop's harnesses count time.sleep; a real tmux call polls it and spends their ticks.
+        with mock.patch.object(_mod.cli_wedge, "core_target", side_effect=AssertionError("tmux called")), \
+                mock.patch.object(cbs, "pane_identity", side_effect=AssertionError("tmux called")), \
+                mock.patch("subprocess.run", side_effect=AssertionError("subprocess called")):
+            self.assertIsNone(self.verdict(1000.0))
+            cbs.write(self.state, "/tmp/another.sock", "%4", 321, "clear", None, "Stop", "claude", "s")
+            self.assertIsNone(self.verdict(1000.0))
+
     def test_no_record_falls_back(self):
         self.assertIsNone(self.verdict(1000.0))
         self.assertEqual(state(QUOTED_DIALOG, hook=self.verdict(1000.0))[0], "blocked-human")
