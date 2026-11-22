@@ -56,7 +56,8 @@ from file_lock import locked_file  # noqa: E402  (cross-platform; never fcntl di
 from quota_availability import provider_allows_now  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 # The completed-turn grammar (TURN_DONE) is the sign-in reading's: one copy for both.
-from worker_auth_state import TURN_DONE, VERB_START, signed_in_since  # noqa: E402,F401
+from worker_auth_state import (TURN_DONE, VERB_MARKS, VERB_START, TurnPattern,  # noqa: E402,F401
+                               signed_in_since)
 
 REPO = _SRC.parent
 SEND_LINE = REPO / "scripts" / "tmux-send-line.sh"
@@ -195,8 +196,8 @@ AWAIT_HINT = re.compile(
     r"|Continuing automatically|❯\s*\d+\.", re.I)
 # A turn's spinner ("✳ Moonwalking… (15s · …)") or completion line: transcript above, live dialog
 # below. Not "esc to interrupt": the busy footer carries it, under any live dialog.
-_SPINNER_ROW = re.compile(rf"^\s*[·✢✳✶✻✽*]\s+{VERB_START}[\w-]*(?:…|\.\.\.)\s*\(")
-_TURN_ROW = re.compile(rf"{_SPINNER_ROW.pattern}|{TURN_DONE.pattern}")
+_SPINNER_ROW = TurnPattern(rf"^\s*[·✢✳✶✻✽*]\s+{VERB_START}(?:[\w-]|[{VERB_MARKS}])*(?:…|\.\.\.)\s*\(")
+_TURN_ROW = TurnPattern(rf"{_SPINNER_ROW.pattern}|{TURN_DONE.pattern}")
 
 
 def turn_status(lines: List[str]) -> Optional[List[str]]:

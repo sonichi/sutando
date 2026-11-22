@@ -589,6 +589,24 @@ class TestNonAsciiTurnVerb(unittest.TestCase):
         self.assertFalse(_mod.TURN_DONE.search(row))
         self.assertIsNotNone(pg.turn_status([row, "  ⏵⏵ bypass permissions on"]))
 
+    def test_decomposed_accents_and_combining_marks_read_as_letters(self):
+        # "Saute\u0301ed" composes under NFC; Cyrillic stress (U+0301) has no precomposed form.
+        for verb in ("Saute\u0301ed", "Ва\u0301рил"):
+            with self.subTest(verb=verb):
+                done = f"  ✻ {verb} for 1m 4s · done 9:32 AM · 1 shell still running"
+                pane = (_QUOTED_HINT_TAIL.replace(_ACCENTED_DONE, done) + _IDLE_FOOTER
+                        + "\n  Sutando: idle                                                     [-]")
+                self.assertIsNone(classify(pane))
+                self.assertEqual(_mod.TURN_DONE.match(done).group("dur"), "1m 4s")
+
+    def test_a_decomposed_spinner_is_still_the_live_turn(self):
+        pg = sys.modules["delivery.pane_gate"]
+        for verb in ("E\u0301lucidating", "Ва\u0301рю"):
+            row = f"✳ {verb}… (5s · ↓ 237 tokens)"
+            with self.subTest(verb=verb):
+                self.assertFalse(_mod.TURN_DONE.search(row))
+                self.assertIsNotNone(pg.turn_status(["✻ Worked for 2s", row, "  ⏵⏵ bypass permissions on"]))
+
 
 class TestUnobservedProbeIsNotHung(unittest.TestCase):
     """An unobserved process probe (tmux refused the client, binary missing) must
