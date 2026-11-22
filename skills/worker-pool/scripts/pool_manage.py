@@ -14,7 +14,9 @@ already owns its fact, so the remedy, the sweep and the router honour it:
             to it to the core. Work it still owes must be handed to the core
             (`--hand-off`, pool_delivery.hand_off_to_core) or the retire is refused.
             A worker with its own agent loses it too: its connection row, lane
-            and vault secret (connections.retire_worker_identity).
+            and vault secret (connections.retire_worker_identity). Deleting the
+            agent on s.space is left to the owner (no server Action retires a live
+            agent yet), and the owner is told in their DM which agent to delete.
     enable  lift both, then the owner restart (pool_remedy.restart).
     remove  drop a retired worker's roster row; its records stay on disk.
     reseat  restart a running seat that owes nothing, so what a seat decides at start
@@ -201,7 +203,7 @@ def _hand_off(workspace, wid, owed, hand_off) -> dict:
     return pd.hand_off_to_core(Path(workspace), wid)
 
 
-def retire(workspace, target, *, unbind=False, hand_off=False, runner=subprocess.run) -> dict:
+def retire(workspace, target, *, unbind=False, hand_off=False, runner=subprocess.run, tell=None) -> dict:
     """Fence, then take down, then hand off, then drop bindings. The fence (roster state
     `retired`, which the router re-checks under the delivery lock) comes first, so no
     new or replayed task can commit to the worker once the owed set is read."""
@@ -237,10 +239,43 @@ def retire(workspace, target, *, unbind=False, hand_off=False, runner=subprocess
     _, _, _, unbound = pr.set_worker_state(workspace, wid, "retired", unbind=unbind)
     return {**base, "result": "retired", "unbound": unbound,
             "handed_off": moved["handed_off"], "kept": moved["kept"],
-            "identity": _retire_identity(workspace, wid)}
+            "identity": _retire_identity(workspace, wid, tell=tell),
+            "pending_approval": _withdraw_approval(workspace, wid, tell=tell)}
 
 
-def _retire_identity(workspace, wid: str) -> dict:
+# s.space's account.agents.retire refuses a live identity (identity_retire_unavailable), so
+# deleting the agent itself is the owner's step in the app.
+AGENT_REMOVAL_OWNER_STEP = ("the server cannot delete a live agent for us yet: delete it in the app "
+                            "(your agents list), or it stays there with no worker behind it")
+
+
+def agent_removal_note(worker_label: str, agent: str) -> str:
+    """The owner's DM once a retired worker's agent is cut loose here but still exists on s.space."""
+    return (f"[dm-only]\n**Delete agent `{agent}` in the app**\n\nYour worker {worker_label} was retired: "
+            "it no longer uses that agent, and its token is gone from this computer. The server cannot delete "
+            "a live agent for me yet, so it stays in your agents list until you delete it there.")
+
+
+def _tell_owner(workspace, text: str) -> bool:
+    try:
+        import pool_device_connect
+        pool_device_connect.send_to_owner(Path(workspace), text)
+        return True
+    except Exception:  # noqa: BLE001 — the retirement is done; the note is reported as not sent
+        return False
+
+
+def _withdraw_approval(workspace, wid: str, tell=None) -> dict:
+    """A device-flow approval still open for the retired worker: withdrawn here (pool_device_connect.withdraw).
+    The server has no cancel, so the flow keeps asking; an approval that lands later is reported by name."""
+    try:
+        import pool_device_connect
+        return pool_device_connect.withdraw(Path(workspace), wid, deliver=tell)
+    except Exception as e:  # noqa: BLE001 — the retirement is done; the approval is reported, never raised
+        return {"result": "failed", "why": f"{type(e).__name__}: {e}"}
+
+
+def _retire_identity(workspace, wid: str, tell=None) -> dict:
     """The worker's own agent, if it has one, goes with it: its lane, row and vault secret
     (connections.retire_worker_identity). Retired, the router hands its tasks to the core, and
     a lane still running as the worker would post the core's answers in the worker's name."""
@@ -251,8 +286,12 @@ def _retire_identity(workspace, wid: str) -> dict:
         return {"result": "failed", "why": f"{type(e).__name__}: {e}"}
     if row is None:
         return {"result": "none"}
-    return {"result": "removed", "instance": row["instance"], "agent": row.get("agent_mxid") or "",
-            "note": "the agent stays on its server until the owner deletes it there"}
+    agent = row.get("agent_mxid") or ""
+    label = str(((pr.load_roster(workspace) or {}).get("workers") or {}).get(wid, {}).get("label") or wid)
+    told = (tell or (lambda text: _tell_owner(workspace, text)))(agent_removal_note(label, agent or "?"))
+    return {"result": "removed", "instance": row["instance"], "agent": agent,
+            "agent_removal": "owner_step", "owner_told": bool(told),
+            "note": AGENT_REMOVAL_OWNER_STEP}
 
 
 def enable(workspace, repo, target, *, start=True, runner=None, spawn=None) -> dict:

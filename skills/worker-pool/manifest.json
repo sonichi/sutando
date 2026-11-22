@@ -6,11 +6,12 @@
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "experimental",
-  "description": "Pool workers the core delegates to. No tools; manifest present to DECLARE config per this convention: WORKER_POOL_SSPACE_HANDOFF (off by default) sends pool_ask from the core to a worker that has its own enabled agent identity as one message in a room both agents are in instead of through deliveries/<worker>/; the worker's threaded reply arrives as a new task. WORKER_POOL_DEFAULT_MODEL (opus) is the --model a Claude worker launches with when its roster row records none (pool_manage.py set-model records one); it is read from this manifest only, never the env, so every start of a worker, recovery included, resolves the same default.",
+  "description": "Pool workers the core delegates to. No tools; manifest present to DECLARE config per this convention: WORKER_POOL_IDENTITY_ON_CREATE (on by default) makes create_worker start the new worker's own agent identity (the owner approves a link in their DM; set 0 or pass --no-identity to skip). WORKER_POOL_SSPACE_HANDOFF (off by default) sends pool_ask from the core to a worker that has its own enabled agent identity as one message in a room both agents are in instead of through deliveries/<worker>/; the worker's threaded reply arrives as a new task. WORKER_POOL_DEFAULT_MODEL (opus) is the --model a Claude worker launches with when its roster row records none (pool_manage.py set-model records one); it is read from this manifest only, never the env, so every start of a worker, recovery included, resolves the same default.",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   },
   "config": {
+    "WORKER_POOL_IDENTITY_ON_CREATE": "1",
     "WORKER_POOL_SSPACE_HANDOFF": "0",
     "WORKER_POOL_HANDOFF_ROOM": "",
     "WORKER_POOL_HANDOFF_ROOM_CLI": "",

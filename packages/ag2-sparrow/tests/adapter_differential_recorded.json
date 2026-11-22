@@ -165,9 +165,9 @@
       "turn_s": "<n>"
      }
     ],
-    "threads/399018430ff5719137a663e0cda47dc121bbf5daac5a6922e327159d694a11b8": "<id>\n!other:ag2.space\n",
-    "threads/default": "<id>\n\n",
-    "threads/f6d979d233f2529d143247a7476fdd48553e7e5f9180511c2ff6b1265dc0a2b9": "<id>\n!room:ag2.space\n"
+    "threads/399018430ff5719137a663e0cda47dc121bbf5daac5a6922e327159d694a11b8": "<id>\n!other:ag2.space\nshared\n",
+    "threads/default": "<id>\n\nshared\n",
+    "threads/f6d979d233f2529d143247a7476fdd48553e7e5f9180511c2ff6b1265dc0a2b9": "<id>\n!room:ag2.space\nshared\n"
    }
   },
   "pre-existing result": {
@@ -234,7 +234,7 @@
       "turn_s": "<n>"
      }
     ],
-    "threads/399018430ff5719137a663e0cda47dc121bbf5daac5a6922e327159d694a11b8": "<id>\n!other:ag2.space\n"
+    "threads/399018430ff5719137a663e0cda47dc121bbf5daac5a6922e327159d694a11b8": "<id>\n!other:ag2.space\nshared\n"
    }
   },
   "restart": {
@@ -351,7 +351,7 @@
       "turn_s": "<n>"
      }
     ],
-    "threads/f6d979d233f2529d143247a7476fdd48553e7e5f9180511c2ff6b1265dc0a2b9": "<id>\n!room:ag2.space\n"
+    "threads/f6d979d233f2529d143247a7476fdd48553e7e5f9180511c2ff6b1265dc0a2b9": "<id>\n!room:ag2.space\nshared\n"
    }
   },
   "turn timeout": {
@@ -424,7 +424,7 @@
       "turn_s": "<n>"
      }
     ],
-    "threads/f6d979d233f2529d143247a7476fdd48553e7e5f9180511c2ff6b1265dc0a2b9": "<id>\n!room:ag2.space\n"
+    "threads/f6d979d233f2529d143247a7476fdd48553e7e5f9180511c2ff6b1265dc0a2b9": "<id>\n!room:ag2.space\nshared\n"
    }
   }
  },
