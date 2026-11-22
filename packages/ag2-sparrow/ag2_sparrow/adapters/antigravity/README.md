@@ -153,8 +153,9 @@ flag to an agent others can reach.
 ACP (`session/request_permission`). Native operations agy runs without such a request are decided by the
 owner's own agy settings in `~/.gemini`, not by this adapter. Its built-in web search is one of them: in a
 signed-in check it ran with no ACP request. So the owner and Team turns may use built-in search whatever
-`--allow-owner-shell-web` says (Chi OK'd this scope). The guest turn is different: its own agy home's
-deny-all rules apply to native tools too.
+`--allow-owner-shell-web` says (Chi OK'd this scope). The guest turn runs with its own agy home, whose
+deny-all rules are agy's own settings rather than this adapter's ACP policy; whether they also stop built-in
+search has not been verified on a signed-in agy.
 
 Measured against a real agy 1.5.9 (signed out): with `--gemini-dir` an absolute path, agy keeps its app
 data, `settings.json`, logs, conversations and `config/` under that directory, reads the settings file
