@@ -206,8 +206,9 @@ see `docs/connections.md`, "In a pool worker's session".
 
 A worker that gets its first own agent (a new worker's identity step, or `pool_identity.py add`, pasted or
 `--device-flow`) starts on its own task and result folders: the switch runs as soon as the agent is saved,
-before its lane starts, and moves anything already delivered to it. `add --shared-dirs` opts out, only while
-something still reads that worker's work from the shared folders. A rotate keeps the worker's folders. A
+before its lane starts, and moves anything already delivered to it. While it still owes a task it accepted, or
+if the move fails, it stays `dirs: "migrating"` on the shared folders until `migrate-dirs --apply` finishes it.
+`add --shared-dirs` opts out, only while something still reads that worker's work from the shared folders. A rotate keeps the worker's folders. A
 worker that already had its agent, or got it through `provision-*`, is switched by hand
 (`python3 src/worker_lane.py migrate-dirs --worker <id>` previews, `--apply` does it, `--undo --apply` switches back; then respawn it): its lane
 queues straight into `<workspace>/agents/<segment>/tasks`, nothing is routed through `deliveries/<id>/`, and

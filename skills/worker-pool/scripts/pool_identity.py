@@ -123,11 +123,11 @@ def reseat_after_add(ws: Path, repo, wid: str) -> dict:
 
 
 def dirs_said(wid: str, dirs: dict) -> str:
-    """"own" or "shared" for a first agent's folder switch; a switch that stopped says how to finish it."""
+    """A first agent's folder state ("own", "migrating", "shared"); one that stopped says how to finish it."""
     if dirs.get("why"):
         print(f"worker {wid}'s folders: {dirs['why']}; finish with: worker_lane.py migrate-dirs "
               f"--worker {wid} --apply", file=sys.stderr)
-    return "own" if dirs.get("own") else "shared"
+    return str(dirs.get("state") or ("own" if dirs.get("own") else "shared"))
 
 
 def cmd_device_flow(args, ws: Path, *, rotate: bool) -> int:
@@ -198,13 +198,18 @@ def cmd_add(args, ws: Path) -> int:
             print("not saved")
             return 1
         expected = str(preview.get("server") or "")
-    row, created = connections.add_worker_identity(wid, token, expected_server=expected, preview=preview,
-                                                   workspace=ws)
-    print(f"{'added' if created else 'already present:'} {row['instance']}: worker {wid} runs as "
-          f"{row.get('agent_mxid') or '?'} (token in the vault as {row['token_ref']})")
-    if created and not args.shared_dirs:
-        print(f"dirs: {dirs_said(wid, pool_device_connect.switch_to_own_dirs(wid, ws))}")
-    launch = connections.start_added(row, repo=args.repo, logs_dir=args.logs_dir, workspace=ws)
+    try:
+        with pool_device_connect.fenced(wid, ws):
+            row, created = connections.add_worker_identity(wid, token, expected_server=expected, preview=preview,
+                                                           workspace=ws)
+            print(f"{'added' if created else 'already present:'} {row['instance']}: worker {wid} runs as "
+                  f"{row.get('agent_mxid') or '?'} (token in the vault as {row['token_ref']})")
+            if created and not args.shared_dirs:
+                print(f"dirs: {dirs_said(wid, pool_device_connect.switch_to_own_dirs(wid, ws))}")
+            launch = connections.start_added(row, repo=args.repo, logs_dir=args.logs_dir, workspace=ws)
+    except pool_device_connect.DeviceConnectError:
+        print(f"pool_identity: worker {wid} was retired; nothing was saved and no lane started", file=sys.stderr)
+        return 1
     if created:
         print(f"seat: {reseat_after_add(ws, args.repo, wid).get('result')}")
     if launch is not None and not launch.get("ok"):

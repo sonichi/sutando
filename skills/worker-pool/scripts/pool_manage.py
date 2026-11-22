@@ -358,8 +358,8 @@ def bind(workspace, room: str, target: str) -> dict:
     import connections
     roster = pr.load_roster(workspace) or {}
     wid = pr.resolve_label(roster, target) if roster else target
-    if connections.worker_dirs(wid, Path(workspace)) is not None:
-        raise Refused(f"worker {wid} keeps its own folders: the router never delivers to it, so a room "
+    if connections.worker_target_dirs(wid, Path(workspace)) is not None:
+        raise Refused(f"worker {wid} keeps (or is switching to) its own folders: the router never delivers to it, so a room "
                       "is not bound to it (the core asks it with pool_ask)")
     # The checked id, not the label: a rename in between must not bind another worker.
     out = pr.bind_room(workspace, room, wid)

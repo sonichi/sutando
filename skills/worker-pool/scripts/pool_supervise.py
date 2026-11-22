@@ -158,12 +158,15 @@ def sentinel_ids(workspace, worker_id) -> tuple[list[str], set[str]]:
 
 def owed_task_ids(workspace, worker_id) -> list[str]:
     """What this worker owes: its own inbox's unanswered tasks (`task_dispatch.unanswered_in_inbox`) when it
-    has its own folders (`connections.worker_dirs`), else its owed sentinels."""
+    has its own folders (`connections.worker_dirs`), else its owed sentinels. Sentinels still owed in its
+    deliveries folder count either way: a folder switch never strands work there out of sight."""
     import connections
+    sentinels = sentinel_ids(workspace, worker_id)[0]
     own = connections.worker_dirs(worker_id, Path(workspace))
     if own is None:
-        return sentinel_ids(workspace, worker_id)[0]
-    return [task_id for task_id, _f in td.unanswered_in_inbox(*own, workspace=Path(workspace))]
+        return sentinels
+    inbox = [task_id for task_id, _f in td.unanswered_in_inbox(*own, workspace=Path(workspace))]
+    return inbox + [t for t in sentinels if t not in inbox]
 
 
 def work_outstanding(workspace, worker_id) -> bool | None:

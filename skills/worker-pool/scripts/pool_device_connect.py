@@ -474,7 +474,8 @@ def resend(worker: str, *, workspace: Optional[Path] = None, spawn=None, clock=t
             argv += ["--display-name", str(rec["display_name"])]
         if rec.get("lane") is not None:
             argv += ["--lane", str(rec["lane"])]
-        if rec.get("own_dirs") is False and not rec.get("rotate"):
+        # A record from before the folder switch has no `own_dirs`: it keeps the shared folders it asked for.
+        if rec.get("own_dirs") is not True and not rec.get("rotate"):
             argv += ["--shared-dirs"]
         claimed = {**rec, "state": "resending", "resend_id": resend_id, "resend_at": now}
         claimed.pop("resend_pid", None)
@@ -643,16 +644,17 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
 
 
 def switch_to_own_dirs(worker: str, workspace: Optional[Path]) -> dict:
-    """Switch a worker that just got its first agent onto its own folders: {"own": bool, "why"?}. Its
-    delivered work moves as `migrate-dirs --apply` moves it. Never raises; the
-    identity stays saved, and a switch that stopped part-way is finished by `worker_lane.py migrate-dirs`."""
+    """Switch a worker that just got its first agent onto its own folders, as `migrate-dirs --apply` does:
+    {"state": "own" | "migrating" | "shared", "own": bool, "why"?}. Only "own" moves its lane and seat;
+    "migrating" keeps both on the shared folders until a re-run finishes. Never raises."""
     import worker_lane
     ws = Path(connections._workspace(workspace))
     try:
         _done, why = worker_lane.migrate_dirs(worker, ws)
     except Exception as e:  # noqa: BLE001 - the identity is saved; the folders are reported, never raised
         why = f"{type(e).__name__}: {e}"
-    out = {"own": connections.worker_dirs(worker, ws) is not None}
+    state = connections.worker_dirs_state(worker, ws) or "shared"
+    out = {"state": state, "own": state == connections.WORKER_DIRS_OWN}
     return {**out, "why": why[:300]} if why else out
 
 

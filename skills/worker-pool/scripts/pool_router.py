@@ -241,6 +241,11 @@ def deliver_one(workspace, recipient: str, task_id: str,
         # before a retirement must not commit new work to the retiring worker.
         if recipient != pr.CORE and not _admits(workspace, recipient):
             return "fenced"
+        # Re-read under the lock a folder switch scans under: a pass that chose this worker before the
+        # switch began must not drop work into a folder the switch has already emptied.
+        state = _dirs_state(workspace, recipient) if recipient != pr.CORE else ""
+        if state == "own" or (state == "migrating" and not _own_lane_task(workspace, recipient, task_id)):
+            return "fenced"
         try:
             os.close(os.open(task_id + pd.PENDING_SUFFIX, os.O_CREAT | os.O_EXCL, 0o644, dir_fd=dfd))
         except FileExistsError:
@@ -252,6 +257,12 @@ def deliver_one(workspace, recipient: str, task_id: str,
         # fact. Recording earlier attributed refusals that never delivered.
         _attribute(workspace, recipient, task_id)
     return "delivered"
+
+
+def _dirs_state(workspace, recipient: str) -> str:
+    """`connections.worker_dirs_state`: "own", "migrating" or "" (shared)."""
+    import connections
+    return connections.worker_dirs_state(recipient, Path(workspace))
 
 
 def _renew_sentinel(dfd: int, task_id: str) -> None:
@@ -274,11 +285,16 @@ def _attribute(workspace, recipient: str, task_id: str) -> None:
         pa.record(workspace, task_id, recipient)
 
 
+def _own_lane_task(workspace, recipient: str, task_id: str) -> bool:
+    import connections
+    return connections.task_home(task_id, Path(workspace))["worker"] == recipient
+
+
 def own_dir_workers(workspace, targets) -> list:
     """The targets that keep their own task folders (`connections.worker_dirs`): their inbox is their
     own lane's, so the router never delivers to them."""
     import connections
-    return [t for t in targets if t != pr.CORE and connections.worker_dirs(t, Path(workspace)) is not None]
+    return [t for t in targets if t != pr.CORE and connections.worker_target_dirs(t, Path(workspace)) is not None]
 
 
 def without_own_dir_workers(workspace, targets) -> list:

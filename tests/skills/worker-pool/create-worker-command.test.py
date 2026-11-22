@@ -8,6 +8,14 @@ Run: python3 tests/skills/worker-pool/create-worker-command.test.py
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
+
 import contextlib
 import io
 import json
@@ -37,8 +45,9 @@ class Base(unittest.TestCase):
         self._t = tempfile.TemporaryDirectory()
         self.addCleanup(self._t.cleanup)
         self.ws = Path(self._t.name)
-        self._env = dict(os.environ)
-        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(self._env)))
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
         os.environ.pop("SUTANDO_INSTANCE_ID", None)
         # A bound worker is only usable if the core can route to it, so the
         # default fixture is a routable core; the gate itself is pinned below.

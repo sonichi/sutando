@@ -157,10 +157,11 @@ def attribute_only(workspace, task_id: str, worker: str) -> int:
 
 def migrate_dirs(workspace, worker: str) -> int:
     """0 once `worker` (switched to its own folders) holds no owed sentinel but answered ones; prints
-    the outcome as one JSON line. 1 when it has no own folders or the folder cannot be read."""
+    the outcome as one JSON line. 1 when it is not switching to (or on) its own folders, or the folder
+    cannot be read."""
     import connections
     import pool_delivery
-    own = connections.worker_dirs(worker, Path(workspace)) if workspace and worker else None
+    own = connections.worker_target_dirs(worker, Path(workspace)) if workspace and worker else None
     if own is None:
         print(f"pool_route_handler: --migrate-dirs: worker {worker!r} has no own folders", file=sys.stderr)
         return 1

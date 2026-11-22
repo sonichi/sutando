@@ -276,21 +276,28 @@ def migrate_to_own_dirs(workspace, recipient: str, own_tasks, own_origin) -> dic
     accepted) is handed back as `hand_off_to_core` does: attribution revoked first, then sentinel and `.pending`
     record withdrawn, payload touched so the core's watcher picks it up. One the worker accepted, or answered,
     stays the worker's: its session may still be running it, so only a hand-off after that session is gone
-    (`pool_manage.py retire --hand-off`) gives it to the core. Idempotent: an interrupted pass leaves the
-    sentinel, so a re-run revisits the task. Returns {"moved", "returned", "kept": {id: why}}."""
+    (`pool_manage.py retire --hand-off`) gives it to the core. While any task the worker accepted is still
+    unanswered (`died-mid-work`, its own lane's included) nothing moves at all, so the switch waits and that
+    work stays where supervision reads it. Idempotent: an interrupted pass leaves the sentinel, so a re-run
+    revisits the task. Returns {"moved", "returned", "kept": {id: why}, "owed": [ids accepted, unanswered]}."""
     import pool_attribution
     import pool_router
     import undelivered_quarantine
 
     ws, own_tasks = Path(workspace), Path(own_tasks)
     require_recipient(recipient)
-    out = {"moved": [], "returned": [], "kept": {}}
+    out = {"moved": [], "returned": [], "kept": {}, "owed": []}
     task_ids = sorted({parse_sentinel(p.name)[0] for p in accepted(ws, recipient) + pending(ws, recipient)
                        if is_regular_file(p)})
     with contextlib.ExitStack() as locks:
         for task_id in task_ids:
             locks.enter_context(pool_router.task_arbitration(ws, task_id))
         with arbitration(ws, recipient) as dfd:
+            out["owed"] = [t for t in task_ids if find_in(dfd, t) is not None
+                           and _residue_state(ws, recipient, t, find_in(dfd, t)) == "died-mid-work"]
+            if out["owed"]:
+                out["kept"] = {t: "accepted" for t in out["owed"]}
+                return out
             for task_id in task_ids:
                 if find_in(dfd, task_id) is None:
                     continue

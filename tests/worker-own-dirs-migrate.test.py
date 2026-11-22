@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """`worker_lane.py migrate-dirs`: switching a pool worker onto its own folders, and back.
 
-- Forward: creates `<ws>/agents/<segment>/{tasks,results}` (+ archive), sets `dirs: "own"`, has the declared
-  handler empty the worker's deliveries folder (`pool_route_handler --migrate-dirs`), then moves the worker's
-  unclaimed live results (its own lane's task results, its stamped proactive files) into its own results.
+- Forward: creates `<ws>/agents/<segment>/{tasks,results}` (+ archive), sets `dirs: "migrating"`, has the
+  declared handler empty the worker's deliveries folder (`pool_route_handler --migrate-dirs`), and only then
+  sets `dirs: "own"`, relaunches the lane, empties what the old lane left and moves the worker's unclaimed
+  live results (its own lane's task results, its stamped proactive files) into its own results. A handler
+  that fails, or work the worker accepted and still owes, leaves it "migrating" on the shared folders.
 - The handler step: a task its own lane queued moves into its tasks folder and its sentinel is archived; a
   core-origin task is withdrawn (sentinel, attribution) and touched so the core picks it up; an answered
-  core-origin task and a name its folder already holds are kept. Never replaces a file.
+  core-origin task and a name its folder already holds are kept. While any task it accepted is unanswered,
+  nothing moves (`owed`). Never replaces a file.
 - `--undo`: clears the field and returns live tasks (touched) and results to the shared folders.
 - Every step is idempotent; a refusal says why and a re-run finishes.
 
@@ -111,19 +114,26 @@ class Forward(Base):
 
         def run(argv, **kw):
             seen.append(argv)
-            return subprocess.CompletedProcess(argv, 0, '{"moved": ["t"]}\n', "")
+            return subprocess.CompletedProcess(argv, 0, '{"moved": ["t"], "owed": []}\n', "")
         out, why = self.migrate(handler="/h", run=run)
-        self.assertEqual((why, out["deliveries"]), ("", {"moved": ["t"]}))
-        self.assertEqual(seen, [["/h", "--workspace", str(self.ws), "--migrate-dirs", "--worker", W]])
-        out, _ = self.migrate(handler="/h", run=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "plain", ""))
-        self.assertEqual(out["deliveries"], "plain")
+        self.assertEqual((why, out["deliveries"], out["state"]), ("", {"moved": ["t"], "owed": []}, "own"))
+        # Once before the switch, once after the lane is relaunched for what the old lane left.
+        self.assertEqual(seen, [["/h", "--workspace", str(self.ws), "--migrate-dirs", "--worker", W]] * 2)
+        C.set_worker_dirs(W, False, workspace=self.ws)
+        out, why = self.migrate(handler="/h", run=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "plain", ""))
+        self.assertEqual((out["deliveries"], out["state"]), ("plain", "migrating"))
+        self.assertIn("did not say what", why)
+        self.assertIsNone(C.worker_dirs(W, self.ws))
 
     def test_a_handler_refusal_or_failure_says_rerun(self):
         _, why = self.migrate(handler="/h", run=lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "nope"))
-        self.assertIn("refused (exit 1: nope); re-run", why)
+        self.assertIn("refused (exit 1: nope); it stays on the shared folders; re-run", why)
         _, why = self.migrate(handler="/h", run=mock.Mock(side_effect=OSError("gone")))
         self.assertIn("did not run", why)
-        self.assertIsNotNone(C.worker_dirs(W, self.ws), "the field stays set: a re-run finishes")
+        self.assertIsNone(C.worker_dirs(W, self.ws), "not switched: it stays on the shared folders")
+        self.assertEqual(C.worker_dirs_state(W, self.ws), "migrating", "a re-run finishes")
+        out, why = self.migrate(handler="/h", run=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, '{"owed": []}', ""))
+        self.assertEqual((why, out["state"]), ("", "own"))
 
     def test_a_failed_handler_lookup_switches_nothing(self):
         with mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("bash", 10)):
@@ -163,7 +173,7 @@ class Forward(Base):
         self.deliver(self.core)
         out, why = self.migrate(handler=str(SCRIPTS / "pool_route_handler.py"))
         self.assertEqual(why, "")
-        self.assertEqual(out["deliveries"], {"kept": {}, "moved": [self.mine], "returned": [self.core]})
+        self.assertEqual(out["deliveries"], {"kept": {}, "moved": [self.mine], "owed": [], "returned": [self.core]})
         self.assertTrue((self.own / "tasks" / f"{self.mine}.txt").is_file())
 
 
@@ -179,25 +189,35 @@ class TheHandlerStep(Base):
         return rc, json.loads(out.getvalue()) if rc == 0 else None
 
     def test_own_lane_work_moves_and_core_work_is_handed_back(self):
-        self.deliver(self.mine, ".accepted")
+        self.deliver(self.mine)
         self.deliver(self.core)
         os.utime(self.ws / "tasks" / f"{self.core}.txt", (1, 1))
         rc, out = self.handle()
-        self.assertEqual((rc, out), (0, {"kept": {}, "moved": [self.mine], "returned": [self.core]}))
+        self.assertEqual((rc, out), (0, {"kept": {}, "moved": [self.mine], "owed": [], "returned": [self.core]}))
         d = pd.deliveries_dir(self.ws, W)
         self.assertEqual(sorted(p.name for p in d.iterdir() if p.is_file() and not p.name.startswith(".")), [])
-        self.assertTrue((d / "archive" / f"{self.mine}.accepted").is_file())
+        self.assertTrue((d / "archive" / f"{self.mine}.txt").is_file())
         self.assertTrue((self.own / "tasks" / f"{self.mine}.txt").is_file())
         self.assertFalse((self.ws / "tasks" / f"{self.mine}.txt").exists())
         self.assertEqual(pat.worker_for_task(self.ws, self.mine), W)
         self.assertIsNone(pat.worker_for_task(self.ws, self.core))
         self.assertGreater((self.ws / "tasks" / f"{self.core}.txt").stat().st_mtime, 1)
-        self.assertEqual(self.handle(), (0, {"kept": {}, "moved": [], "returned": []}))
+        self.assertEqual(self.handle(), (0, {"kept": {}, "moved": [], "owed": [], "returned": []}))
+
+    def test_while_it_owes_accepted_work_nothing_moves(self):
+        self.deliver(self.mine, ".accepted")
+        self.deliver(self.core)
+        rc, out = self.handle()
+        self.assertEqual((rc, out), (0, {"kept": {self.mine: "accepted"}, "moved": [], "owed": [self.mine],
+                                         "returned": []}))
+        d = pd.deliveries_dir(self.ws, W)
+        self.assertTrue((d / f"{self.mine}.accepted").is_file() and (d / f"{self.core}.txt").is_file())
+        self.assertTrue((self.ws / "tasks" / f"{self.mine}.txt").is_file())
 
     def test_a_core_task_the_worker_accepted_stays_its_own(self):
         self.deliver(self.core, ".accepted")
         rc, out = self.handle()
-        self.assertEqual(out["kept"], {self.core: "accepted"})
+        self.assertEqual((out["kept"], out["owed"]), ({self.core: "accepted"}, [self.core]))
         self.assertTrue((pd.deliveries_dir(self.ws, W) / f"{self.core}.accepted").is_file())
         self.assertEqual(pat.worker_for_task(self.ws, self.core), W)
 
@@ -207,7 +227,7 @@ class TheHandlerStep(Base):
             self.assertEqual(self.handle()[0], 1)
         self.assertIsNone(pat.worker_for_task(self.ws, self.core), "attribution went first")
         self.assertTrue((pd.deliveries_dir(self.ws, W) / f"{self.core}.txt").is_file(), "the sentinel stays")
-        self.assertEqual(self.handle(), (0, {"kept": {}, "moved": [], "returned": [self.core]}))
+        self.assertEqual(self.handle(), (0, {"kept": {}, "moved": [], "owed": [], "returned": [self.core]}))
 
     def test_an_answered_core_task_and_a_taken_name_are_kept(self):
         self.deliver(self.mine)
@@ -230,7 +250,7 @@ class TheHandlerStep(Base):
             self.assertEqual(self.handle()[0], 1)
         self.assertTrue((self.ws / "tasks" / f"{self.mine}.txt").is_file())
         self.assertTrue((pd.deliveries_dir(self.ws, W) / f"{self.mine}.txt").is_file(), "the sentinel stays")
-        self.assertEqual(self.handle(), (0, {"kept": {}, "moved": [self.mine], "returned": []}))
+        self.assertEqual(self.handle(), (0, {"kept": {}, "moved": [self.mine], "owed": [], "returned": []}))
 
     def test_an_own_lane_task_already_answered_and_archived_only_archives_its_sentinel(self):
         self.deliver(self.mine)
@@ -590,6 +610,91 @@ class TheCli(Base):
     def test_the_live_txt_listing_survives_an_unreadable_folder(self):
         with mock.patch.object(Path, "glob", side_effect=OSError):
             self.assertEqual(worker_lane._live_txt(self.ws), [])
+
+
+
+class SupervisedSwitch(Base):
+    """A switch with the worker's seat running, read back through production supervision and routing."""
+
+    def setUp(self):
+        super().setUp()
+        import pool_roster as pr
+        import worker_identity as wi
+        self.sock = str(self.ws / "tmux.sock")
+        wi.create_worker(self.ws, runtime="claude", tmux_socket=self.sock, worker_id=W, cwd=str(ROOT))
+        pr.register_worker(self.ws, W, "reviewer", runtime="claude")
+        seat = wi.tmux_session_name(W)
+        self.tmux = FakeTmux({seat, seat + "-watcher", seat + "-input"})
+        self.handler = str(SCRIPTS / "pool_route_handler.py")
+
+    def test_accepted_legacy_work_keeps_the_worker_on_its_old_inbox_for_reseat_and_retire(self):
+        import pool_manage as pm
+        import pool_supervise as sup
+        self.deliver(self.core, ".accepted")
+        out, why = self.migrate(handler=self.handler)
+        spawned = []
+        reseat = pm.reseat(self.ws, ROOT, W, runner=self.tmux, spawn=lambda *a, **kw: spawned.append(kw) or {"runtime_session_id": None})
+        self.assertEqual((reseat["result"], reseat.get("owed"), spawned), ("deferred", [self.core], []))
+        with self.assertRaises(pm.Refused):
+            pm.retire(self.ws, W, runner=self.tmux)
+        self.assertEqual(sup.owed_task_ids(self.ws, W), [self.core])
+        self.assertTrue((pd.deliveries_dir(self.ws, W) / f"{self.core}.accepted").is_file())
+        self.assertIsNone(C.worker_dirs(W, self.ws), "its seat and lane stay on the shared folders")
+        self.assertIn("accepted are still in its deliveries folder", why)
+        self.assertEqual(out["state"], "migrating")
+        # Once answered, a re-run finishes the switch.
+        (self.ws / "results").mkdir(parents=True, exist_ok=True)
+        (self.ws / "results" / f"{self.core}.txt").write_text("answer")
+        out, why = self.migrate(handler=self.handler)
+        self.assertEqual((why, out["state"]), ("", "own"))
+
+    def test_owed_work_left_in_deliveries_after_a_switch_stays_visible(self):
+        import pool_supervise as sup
+        self.deliver(self.core, ".accepted")
+        C.set_worker_dirs(W, True, workspace=self.ws)
+        self.assertEqual(sup.owed_task_ids(self.ws, W), [self.core])
+
+    def test_a_route_that_chose_the_worker_before_the_switch_does_not_deliver_into_its_old_folder(self):
+        import pool_router as rt
+        task = {"id": self.core, "requested_worker": W}
+        (self.ws / "tasks").mkdir(parents=True, exist_ok=True)
+        (self.ws / "tasks" / f"{self.core}.txt").write_text(f"id: {self.core}\ntask: x\n")
+        real, switched = rt.own_dir_workers, []
+
+        def decided_then_switched(workspace, targets):
+            chosen = real(workspace, targets)
+            if not switched:
+                switched.append(self.migrate(handler=self.handler))
+            return chosen
+        with mock.patch.object(rt, "own_dir_workers", decided_then_switched):
+            out = rt.route(self.ws, task)
+        self.assertEqual(switched[0][1], "")
+        self.assertIsNotNone(C.worker_dirs(W, self.ws))
+        self.assertIsNone(pd.find(self.ws, W, self.core), "nothing lands in the folder the switch emptied")
+        self.assertIsNone(pat.worker_for_task(self.ws, self.core))
+        self.assertEqual((out["delivered"], out["fenced"]), ([], [W]))
+
+    def test_while_migrating_a_core_task_is_fenced_and_its_own_lane_task_is_delivered(self):
+        import pool_router as rt
+        C.set_worker_dirs(W, C.WORKER_DIRS_MIGRATING, workspace=self.ws)
+        (self.ws / "tasks").mkdir(parents=True, exist_ok=True)
+        for t in (self.core, self.mine):
+            (self.ws / "tasks" / f"{t}.txt").write_text(f"id: {t}\ntask: x\n")
+        self.assertEqual(rt.deliver_one(self.ws, W, self.core), "fenced")
+        self.assertEqual(rt.deliver_one(self.ws, W, self.mine), "delivered")
+
+
+class FakeTmux:
+    def __init__(self, alive=()):
+        self.alive = set(alive)
+
+    def __call__(self, argv, **kw):
+        if argv[:1] == ["tmux"] and "has-session" in argv:
+            name = argv[argv.index("-t") + 1].lstrip("=")
+            return subprocess.CompletedProcess(argv, 0 if name in self.alive else 1, "", "")
+        if argv[:1] == ["tmux"] and "kill-session" in argv:
+            self.alive.discard(argv[argv.index("-t") + 1].lstrip("="))
+        return subprocess.CompletedProcess(argv, 0, "", "")
 
 
 if __name__ == "__main__":

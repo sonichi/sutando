@@ -1032,8 +1032,9 @@ def _validate_row(row: object, index: int) -> dict:
             raise SchemaError(f"connections.json: row {index} worker is not a pool worker id")
         if row["primary"] or not row["instance"]:
             raise SchemaError(f"connections.json: row {index} is a worker's identity, so it is a named, non-primary row")
-    if WORKER_DIRS_KEY in row and (row[WORKER_DIRS_KEY] != WORKER_DIRS_OWN or "worker" not in row):
-        raise SchemaError(f"connections.json: row {index} {WORKER_DIRS_KEY} is {WORKER_DIRS_OWN!r} on a worker's row only")
+    if WORKER_DIRS_KEY in row and (row[WORKER_DIRS_KEY] not in WORKER_DIRS_STATES or "worker" not in row):
+        raise SchemaError(f"connections.json: row {index} {WORKER_DIRS_KEY} is one of "
+                          f"{', '.join(map(repr, WORKER_DIRS_STATES))} on a worker's row only")
     return row
 
 
@@ -2252,8 +2253,11 @@ def worker_identity(worker: str, workspace: Optional[Path] = None) -> Optional[d
 
 
 # A worker row's `dirs: "own"`: its tasks and results live in its agent's own folder, not the shared ones.
+# `"migrating"`: a switch has started but not committed; the worker still runs on the shared ones.
 WORKER_DIRS_KEY = "dirs"
 WORKER_DIRS_OWN = "own"
+WORKER_DIRS_MIGRATING = "migrating"
+WORKER_DIRS_STATES = (WORKER_DIRS_OWN, WORKER_DIRS_MIGRATING)
 WORKER_AGENTS_DIR = "agents"
 
 
@@ -2267,9 +2271,10 @@ def worker_root(agent_mxid: str, workspace: Optional[Path] = None) -> Path:
     return worker_agents_dir(workspace) / _agent_identity().root_segment(agent_mxid)
 
 
-def _row_dirs(row: Optional[Mapping[str, object]], workspace: Optional[Path]) -> "Optional[tuple[Path, Path]]":
+def _row_dirs(row: Optional[Mapping[str, object]], workspace: Optional[Path],
+              states: tuple = (WORKER_DIRS_OWN,)) -> "Optional[tuple[Path, Path]]":
     mxid = str((row or {}).get("agent_mxid") or "").strip()
-    if not row or not row.get("worker") or row.get(WORKER_DIRS_KEY) != WORKER_DIRS_OWN or not mxid:
+    if not row or not row.get("worker") or row.get(WORKER_DIRS_KEY) not in states or not mxid:
         return None
     root = worker_root(mxid, workspace)
     return root / "tasks", root / "results"
@@ -2281,10 +2286,24 @@ def worker_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tupl
     return _row_dirs(worker_identity(worker, workspace), workspace) if worker else None
 
 
-def ensure_worker_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tuple[Path, Path]]":
-    """`worker_dirs`, created: the agent root 0o700 (another local account reads none of its tasks), then
-    tasks/ and results/ with their archive/ beneath it. None for a worker without own folders."""
-    dirs = worker_dirs(worker, workspace)
+def worker_dirs_state(worker: str, workspace: Optional[Path] = None) -> str:
+    """`worker`'s folder state: "own" (`worker_dirs` names them), "migrating" (a switch not yet committed:
+    it still runs on the shared folders, and nothing new is routed to it) or "" (shared, or unreadable)."""
+    row = worker_identity(worker, workspace) if worker else None
+    return str(row[WORKER_DIRS_KEY]) if row and _row_dirs(row, workspace, WORKER_DIRS_STATES) else ""
+
+
+def worker_target_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tuple[Path, Path]]":
+    """The folders `worker` is switching to or is on (`dirs` "migrating" or "own"); None otherwise."""
+    return _row_dirs(worker_identity(worker, workspace), workspace, WORKER_DIRS_STATES) if worker else None
+
+
+def ensure_worker_dirs(worker: str, workspace: Optional[Path] = None, *,
+                       target: bool = False) -> "Optional[tuple[Path, Path]]":
+    """`worker_dirs` (with `target`, `worker_target_dirs`), created: the agent root 0o700 (another local
+    account reads none of its tasks), then tasks/ and results/ with their archive/ beneath it. None for a
+    worker without own folders."""
+    dirs = (worker_target_dirs if target else worker_dirs)(worker, workspace)
     if dirs is None:
         return None
     root = dirs[0].parent
@@ -2363,9 +2382,12 @@ def own_worker_homes(workspace: Optional[Path] = None) -> list:
     return homes
 
 
-def set_worker_dirs(worker: str, own: bool, *, workspace: Optional[Path] = None) -> dict:
-    """Set (`own`) or clear `worker`'s `dirs: "own"` under the record lock; returns the row. Refused
-    (`ConnectionsError`) when the worker has no identity row or its row names no agent."""
+def set_worker_dirs(worker: str, own, *, workspace: Optional[Path] = None) -> dict:
+    """Set `worker`'s `dirs` under the record lock: True "own", WORKER_DIRS_MIGRATING "migrating", False
+    clears it; returns the row. Refused (`ConnectionsError`) when the worker has no identity row or its row
+    names no agent."""
+    if own not in (True, False, WORKER_DIRS_MIGRATING):
+        raise ConnectionsError(f"dirs state must be True, False or {WORKER_DIRS_MIGRATING!r}, not {own!r}")
     with _transaction(workspace) as record:
         row = next((r for r in record["rows"] if r.get("worker") == worker), None)
         mxid = str((row or {}).get("agent_mxid") or "").strip()
@@ -2377,7 +2399,7 @@ def set_worker_dirs(worker: str, own: bool, *, workspace: Optional[Path] = None)
         if own and twins:
             raise ConnectionsError(f"worker {twins[0]}'s row also names agent {mxid}: its own folder would be shared")
         if own:
-            row[WORKER_DIRS_KEY] = WORKER_DIRS_OWN
+            row[WORKER_DIRS_KEY] = WORKER_DIRS_OWN if own is True else WORKER_DIRS_MIGRATING
         else:
             row.pop(WORKER_DIRS_KEY, None)
         return dict(row)

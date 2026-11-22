@@ -814,15 +814,28 @@ records the task as the worker's (`--attribute-only`), and the worker's stamped 
 in the shared `results/` are moved into its own. Its session reads a plain inbox of task files and answers in
 its own results (`spawn_worker.inbox_env`, `result_publish`). A worker without the field is unchanged.
 
+`dirs: "migrating"` marks a switch that has started but not committed (`connections.worker_dirs_state`).
+The worker still runs on the shared folders: `worker_dirs` is None, so its lane, its seat's inbox and
+supervision read `deliveries/<id>/` as before. The router delivers it no new core task: `deliver_one`
+re-reads the state under the deliveries folder's lock, the lock the switch empties that folder under, so a
+pass that chose the worker before the switch began is `fenced` and the core takes the task. Tasks its own
+lane queued are still delivered there, and the switch takes them before it commits. Supervision
+(`pool_supervise.owed_task_ids`) also counts any owed sentinel still in `deliveries/<id>/` once the worker is
+on its own folders, so reseat, stop and retire never lose sight of work a switch left behind.
+
 A worker that gets its first own agent moves to its own folders. That covers a new worker whose agent
 `create_worker.py` requests (the default; `--no-identity` opts out) and an existing worker given one by
-`pool_identity.py add`, pasted or `--device-flow`. The switch runs as soon as the agent is saved, before its
-lane first starts and before the seat restarts as that agent, through the same `worker_lane.migrate_dirs` as
-`--apply` below, so work already in `deliveries/<id>/` moves or is handed back as described there. The add
-reports `dirs` as `own`, or as `shared` with the reason and the command that finishes it on stderr; the
-identity and lane go ahead either way. `add --shared-dirs` keeps the worker on the shared folders: use it only
+`pool_identity.py add`, pasted or `--device-flow`. Both run under the roster fence retirement takes, so a
+worker retired meanwhile gets no identity, no folders and no lane. The switch runs as soon as the agent is
+saved, before its lane first starts and before the seat restarts as that agent, through the same
+`worker_lane.migrate_dirs` as `--apply` below, so work already in `deliveries/<id>/` moves or is handed back
+as described there. The add reports `dirs` as `own`; as `migrating` when the switch could not finish (a
+handler that failed, or work the worker accepted and still owes), in which case its lane and seat stay on the
+shared folders; or as `shared` when nothing was switched. A reason and the command that finishes it go to
+stderr; the identity and lane go ahead either way. `add --shared-dirs` keeps the worker on the shared folders: use it only
 while something still reads that worker's work from the shared `tasks/` and `results/`, and switch it later
-with `migrate-dirs --apply`. A resend of an expired link keeps that choice. A rotate never changes a worker's
+with `migrate-dirs --apply`. A resend of an expired link keeps that choice; a link started before this
+default existed keeps the shared folders. A rotate never changes a worker's
 folders, and neither do the `provision-*` verbs (run `migrate-dirs --apply` after one). A worker without its
 own agent stays on the shared folders.
 
@@ -831,8 +844,11 @@ folders, who holds its lane, what is delivered to it, and which tasks and result
 nothing. With `--apply` it switches the worker over:
 1. It finds the declared task-event handler first. A failed lookup, or work delivered with no handler to
    move it, refuses before anything changes.
-2. It writes the field and creates the folders (a private agent root), and relaunches the worker's lane
-   under the record lock. A wrapper lane is stopped and started again on the new folders in that same
+2. It writes `dirs: "migrating"`, creates the folders (a private agent root) and has the handler empty the
+   worker's `deliveries/<id>/` as in step 4. While the worker still owes a task it accepted, nothing moves;
+   that, or a handler that fails, ends the run there with the worker still on the shared folders, and a
+   re-run picks it up.
+3. It writes `dirs: "own"` and relaunches the worker's lane under the record lock. A wrapper lane is stopped and started again on the new folders in that same
    hold, through `connections.start`, because not every install runs a lane keeper (the desktop app starts
    lanes once). A start that finds the lane already held spawns nothing. One that fails ends the run not
    ok (exit 1, the reason in `lane` and `why` with the command that starts it) and keeps the switch. The
@@ -840,11 +856,11 @@ nothing. With `--apply` it switches the worker over:
    start leaves it too: a re-run starts that lane, if it is still down, before finishing the rest. The
    record goes once the lane runs again, or when the lane is disabled or parked. A declared bridge is
    waited for until sparrowd has replaced it.
-3. It has the handler empty the worker's `deliveries/<id>/` under the router's locks. A task its own lane
-   queued moves into its tasks folder and its sentinel is archived. A core task the worker never accepted is
-   handed back (attribution first, then the sentinel) and touched so the core's watcher picks it up. One it
-   accepted or answered stays the worker's until `pool_manage.py retire --hand-off` once its session is gone.
-4. It moves into the worker's folders any task its own lane queued that is still in the shared `tasks/`,
+4. It has the handler empty the worker's `deliveries/<id>/` again under the router's locks, for anything its
+   old lane queued before it stopped. A task its own lane queued moves into its tasks folder and its sentinel
+   is archived. A core task the worker never accepted is handed back (attribution first, then the sentinel)
+   and touched so the core's watcher picks it up. One it answered stays as residue.
+5. It moves into the worker's folders any task its own lane queued that is still in the shared `tasks/`,
    and the worker's unclaimed live results.
 
 It prints one JSON line and is idempotent: a refusal, or a file that could not be moved, says why, and a
