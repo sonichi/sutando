@@ -818,6 +818,46 @@ class EdgePathTest(unittest.TestCase):
             self.assertIn("owner-mcp", config["mcp_servers"], "the integrations override is kept beside it")
             self.assertIn("config=null", owner, "an owner's thread is not given the profile")
 
+    def test_a_restricted_turn_is_handed_copies_of_its_own_attachments_and_nothing_else_of_the_folder(self):
+        class Confined(FakeRpc):
+            def request(self, method, params=None, timeout=120):
+                self.calls.append(method)
+                if method == "config/read":
+                    return {"config": {"mcp_servers": {}}}
+                return {"thread": {"id": "th1"}, "turn": {"id": "t1"}, "activePermissionProfile": {"id": cc.CONFINED_PROFILE}}
+
+        with tempfile.TemporaryDirectory() as d:
+            media = Path(d).resolve() / "remote-media"
+            media.mkdir()
+            (media / "mine.png").write_bytes(b"PARROT-7391")
+            (media / "someone-elses.png").write_bytes(b"not this task's")
+            outside = Path(d).resolve() / "outside.txt"
+            outside.write_text("the owner's")
+            args = cc.build_parser().parse_args(["--work", "w", "--media-root", str(media)])
+            c = cc.Connector(Confined, args, note="n")
+            guest = {"access_tier": "guest", "collaborator": "false", "channel_id": "c",
+                     "attachments": json.dumps([{"locator": str(media / "mine.png")}, {"locator": str(outside)}])}
+            seen = []
+
+            def turn(prompt, model=None, cwd=None):
+                names = sorted(os.listdir(cwd)) if cwd == c.scratch_cwd else []
+                seen.append((prompt, cwd, names, [Path(cwd, n).read_bytes() for n in names]))
+                return "completed", "ok", None
+
+            c.run_turn = turn
+            said = "[Photo attached: %s] and %s and %s" % (media / "mine.png", outside, media / "someone-elses.png")
+            self.assertEqual(c.run_task(guest, said, cc.turn_policy(guest, True).capabilities)[:2], ("completed", "ok"))
+            (prompt, cwd, names, contents), = seen
+            self.assertEqual((names, contents), (["1-mine.png"], [b"PARROT-7391"]))
+            self.assertIn("[Photo attached: %s]" % os.path.join(cwd, "1-mine.png"), prompt)
+            self.assertNotIn(str(media / "mine.png"), prompt, "the turn is pointed at its copy")
+            self.assertIn(str(outside), prompt, "a path that was not staged is left as text; the profile refuses it")
+            c.drop_scratch()
+            owner = {"access_tier": "owner", "channel_id": "c", "attachments": guest["attachments"]}
+            c.open_owner_thread = lambda *a, **k: None
+            c.run_task(owner, said, cc.turn_policy(owner, True).capabilities)
+            self.assertEqual(seen[-1][0], said, "an owner's turn reads the files where they are")
+
     def test_a_restricted_turn_is_not_run_when_the_thread_is_not_confined(self):
         class Answers(FakeRpc):
             answer = {"thread": {"id": "th1"}, "activePermissionProfile": None}

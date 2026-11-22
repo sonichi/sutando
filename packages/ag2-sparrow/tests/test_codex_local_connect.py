@@ -483,8 +483,9 @@ class Install(Base):
         self.assertIn("NOTE sandbox: workspace-write", out)
         cfg = cm.read_config(cli.config_path())
         self.assertEqual((cfg["SANDBOX"], cfg["ALLOW_NON_OWNER"], cfg["MODEL"]), ("workspace-write", "0", "m1"))
-        self.assertEqual(cli.connector_argv(cfg, str(self.work), 7)[-5:],
-                         ["--sandbox", "workspace-write", "--no-allow-non-owner", "--model", "m1"])
+        media = str(cli.cb.bridge_state(cfg) / "remote-media")
+        self.assertEqual(cli.connector_argv(cfg, str(self.work), 7)[-7:],
+                         ["--sandbox", "workspace-write", "--media-root", media, "--no-allow-non-owner", "--model", "m1"])
         for recorded in ("1", "", None):     # served by default, the older flag, and an older install's empty value
             c = dict(cfg, ALLOW_NON_OWNER=recorded) if recorded is not None else \
                 {k: v for k, v in cfg.items() if k != "ALLOW_NON_OWNER"}
@@ -630,7 +631,8 @@ class Run(Base):
         self.assertEqual(code, 0, err)
         self.assertEqual(seen["argv"], [sys.executable, "-m", "ag2_sparrow.adapters.codex.codex_connector", "--work",
                                         str(self.work), "--held", "--root-fd", str(seen["pass_fds"][0]), "--codex",
-                                        str(self.codex), "--server", "stdio", "--sandbox", "read-only"])
+                                        str(self.codex), "--server", "stdio", "--sandbox", "read-only", "--media-root",
+                                        str(cli.cb.bridge_state(cm.read_config(cli.config_path())) / "remote-media")])
         self.assertEqual(len(seen["pass_fds"]), 1, "the held root's descriptor, and only it, reaches the connector")
         for arg in FORBIDDEN_ARGS:
             self.assertNotIn(arg, seen["argv"], arg)

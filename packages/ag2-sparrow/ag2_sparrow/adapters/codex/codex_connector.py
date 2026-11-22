@@ -31,6 +31,7 @@ import time
 import uuid
 
 from ... import held_start
+from ...collaborator_turn import stage_own_attachments, with_staged_paths
 from ...relay_loop import count_arg
 from ...task_io import (AUDIENCE_RULE, DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER_CAPABILITIES,  # noqa: F401
                         LockRefused, acquire_lock, attested_headers, exit_on_sigterm, holder_consumer, load_done,
@@ -502,7 +503,12 @@ class Connector:
             except Unconfined as e:
                 return "failed", "", "the turn could not be confined to its own folder (%s)" % e
             self.last_thread = self.thread_id
-            status, text, err = self.run_turn(prompt, self.args.model, self.turn_cwd(caps))
+            turn_prompt = prompt
+            if caps.workspace == "isolated":
+                # The turn reads its own folder only: this task's own attachments are copied into it.
+                staged = stage_own_attachments(headers, self.scratch_cwd, getattr(self.args, "media_root", None))
+                turn_prompt = with_staged_paths(prompt, staged)
+            status, text, err = self.run_turn(turn_prompt, self.args.model, self.turn_cwd(caps))
             if status == "server-exited":
                 self.restart_server()
                 if durable and attempt == 1:
@@ -622,6 +628,9 @@ def build_parser():
     ap.add_argument("--server", choices=["stdio", "proxy", "stub"], default="stdio",
                     help="stdio: own codex app-server; proxy: shared daemon via `codex app-server proxy`; stub: local fake")
     ap.add_argument("--work", help="dir holding tasks/ results/ state/ (required unless --push)")
+    ap.add_argument("--media-root", help="the bridge's remote-media folder (default: <work>.bridge/state/remote-media). "
+                                         "A restricted turn is given copies of its own task's attachments from it, "
+                                         "and can read nothing else there")
     ap.add_argument("--held", action="store_true",
                     help="the work root's lock is held by the launcher that spawned this process and attaches it as "
                          "the consumer; take no lock, refuse unless that record names this process (needs --root-fd)")
@@ -687,6 +696,7 @@ def main(argv=None):
         args.inbox = os.path.join(args.work, "tasks")
         args.results = os.path.join(args.work, "results")
         args.state = os.path.join(args.work, "state")
+        args.media_root = os.path.abspath(args.media_root or os.path.join(args.work + ".bridge", "state", "remote-media"))
         args.cwd = os.path.abspath(cwd_given or args.work)
         return exit_code(serve_locked(args))
     except LockRefused as e:
