@@ -333,6 +333,8 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
             why = "The restart could not be started; nothing was changed. " + NEW_CARD
             return "failed", why, why, {}
         check = {"detached": key, "what": f"the core under {arg}" if arg else "the core"}
+        if via:
+            check[VIA_FIELD] = via
         if verb == recovery.SWITCH_RUNTIME:
             return ("done", None, f"Switching the core to {arg}; checking that it is working again.",
                     {"state": "starting", "runtime": arg, VERIFY_FIELD: check})
@@ -370,6 +372,10 @@ VIA_FIELD = "via"
 VIA_CTL, VIA_START_CLI, VIA_FALLBACK = "ctl", "start-cli", "start-cli-fallback"
 #: The desktop app's control script, installed beside the engine checkout it drives.
 DESKTOP_CTL = "sutando-ctl.sh"
+#: Its restart-core exit when another launcher run held the launch lock: nothing was killed or started.
+CTL_LAUNCH_LOCK_BUSY = 12
+BUSY_LINE = ("The core is already being restarted, so nothing was done this time. "
+             "Try again in a minute if it is still blocked.")
 
 
 def _restart_core_argv(env: Dict):
@@ -675,6 +681,8 @@ def _restart_failed(manager, workspace: Path, req_id: str, check: Dict, done, no
         line = "The tap was not recorded in time, so nothing was restarted. " + NEW_CARD
     elif done.reason and done.reason not in ("exit", "could not start"):
         line = done.reason  # the action's own sentence (the pool's, for a worker)
+    elif check.get(VIA_FIELD) == VIA_CTL and done.rc == CTL_LAUNCH_LOCK_BUSY:
+        line = BUSY_LINE + " " + NEW_CARD
     elif done.rc == core_limit_hold.HOLD_EXIT:
         line = "The core is paused for a provider limit, so it was not restarted. " + NEW_CARD
     else:

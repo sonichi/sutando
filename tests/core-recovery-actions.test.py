@@ -1558,6 +1558,38 @@ class DesktopRestart(Base):
         self.assertEqual(receipt["outcome"], "done")
         self.assertEqual(self.audit()[-1]["via"], RA.VIA_FALLBACK)
 
+    def test_a_busy_launch_lock_says_a_restart_is_already_running_keeps_the_hold_and_retries_nothing(self):
+        # sutando-ctl.sh restart-core exits 12 when another launcher run holds the launch lock.
+        self._desktop()
+        now = time.time()
+        core_limit_hold._write_hold(self.ws, {"status": "held", "kind": "usage-limit", "model": "opus",
+                                              "until": now + 3600, "started_at": now - 60, "set_at": now - 60,
+                                              "source": core_limit_hold.PANE_SOURCE})
+        req = self.card()
+        self.click(req, "retry_now")
+        [receipt] = self.run_pending(Run(), now=now)
+        self.assertEqual((receipt["outcome"], self.spawned.command()[-1]), ("done", "restart-core"))
+        self.answer(detached_action.FAILED, rc=RA.CTL_LAUNCH_LOCK_BUSY, reason="exit")
+        self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=True, now=now + 5), [req.id])
+        card = self.mgr.get(req.id)
+        self.assertIn("already being restarted", card.message)
+        self.assertIn("Try again", card.message)
+        self.assertNotIn("did not complete", card.message)
+        self.assertEqual((card.subject["receipt"]["outcome"], card.status), ("failed", STATUS_RESOLVED))
+        self.assertEqual(recovery.read_receipt(self.ws, req.id)["outcome"], "failed", "the receipt on disk too")
+        self.assertIsNotNone(core_limit_hold.active_hold(self.ws, now + 6), "the hold stays")
+        self.assertEqual(len(self.spawned.calls), 1, "no automatic retry")
+        RA.verify_step(self.mgr, self.ws, CORE, blocked=True, now=now + 10)
+        self.assertEqual(len(self.spawned.calls), 1, "no automatic retry on a later tick either")
+
+    def test_exit_12_from_start_cli_is_an_ordinary_failure(self):
+        req = self.card(kind="unknown", prompt=UNKNOWN)
+        self.click(req, "restart_core")
+        self.run_pending(Run())
+        self.answer(detached_action.FAILED, rc=RA.CTL_LAUNCH_LOCK_BUSY, reason="exit")
+        RA.verify_step(self.mgr, self.ws, CORE, blocked=True)
+        self.assertIn("did not complete (exit 12)", self.mgr.get(req.id).message)
+
     def test_a_runtime_switch_on_a_desktop_install_stays_start_cli(self):
         _, repo = self._desktop()
         req = self.card(runtime="codex")
