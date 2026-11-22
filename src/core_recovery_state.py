@@ -97,8 +97,6 @@ _LOGIN_KINDS = frozenset({"login"})
 # The provider's own words for an exhausted prepaid balance, as opposed to a plan's usage window.
 _CREDIT_TEXT = re.compile(r"\bout of (?:usage )?credits?\b|\bcredit balance\b|\binsufficient[_ ](?:credits?|quota)\b"
                           r"|\bbilling\b", re.I)
-_ACTION_ID = re.compile(r"^(?:(retry_now|restart_core|escape_prompt)|(switch_model|switch_runtime):([a-z]{1,16})"
-                        r"|(switch_account):(acct_[0-9a-f]{6}))$")
 _HEX = re.compile(r"^[0-9a-f]{6,64}$")
 _ALL_ALIASES = tuple(a for r in RUNTIMES for a in MODEL_ALIASES[r])
 
@@ -111,16 +109,11 @@ def parse_action_id(action_id: Any, runtime: Optional[str] = None, accounts: tup
     alias of its own, `switch_runtime:<runtime>` another runtime. `switch_account:<id>` takes only
     an id in `accounts`, the host's own stored list. Anything else is refused; no part of the id is
     ever passed on but a value from one of those lists."""
-    if not isinstance(action_id, str):
+    from hitl import recovery
+    parsed = recovery.parse(action_id)  # the one click-id grammar, shared with the reply handler
+    if parsed is None or parsed[0] not in CLICK_VERBS:
         return None
-    m = _ACTION_ID.fullmatch(action_id)
-    if not m:
-        return None
-    simple, verb, arg, acct_verb, acct = m.groups()
-    if simple:
-        verb, arg = simple, None
-    elif acct_verb:
-        verb, arg = acct_verb, acct
+    verb, arg = parsed
     if verb == "switch_account" and arg not in accounts:
         return None
     if runtime is not None and verb not in RUNTIME_ACTIONS.get(runtime, NEUTRAL_ACTIONS):

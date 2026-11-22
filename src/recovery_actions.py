@@ -245,6 +245,9 @@ def _check(manager, data: Dict, target: Target, now: float):
     if (recovery.parse(aid)[0] in recovery.CORE_ONLY and target.seat) or \
             aid not in {a.id for a in req.actions if a.kind == recovery.kind_of(a.id) and recovery.is_recovery(a.id)}:
         return req, ("refused", "That button is not one this card offers.")
+    import core_recovery_state
+    if recovery.parse(aid)[0] not in STEP_UP and core_recovery_state.parse_action_id(aid, req.runtime) is None:
+        return req, ("refused", "That button is not one this core's runtime carries out.")
     if (req.status != STATUS_IN_PROGRESS or req.chosen_action != aid
             or str(data.get("guard") or "") != req.guard):
         return req, ("stale", "This card changed before the tap reached the Mac; nothing was done.")

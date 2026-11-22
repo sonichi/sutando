@@ -118,7 +118,7 @@ class CardButtons(Base):
     def test_core_limit_card_offers_runtime_neutral_buttons_and_names_them(self):
         req = self.card()
         self.assertEqual([a.id for a in req.actions],
-                         ["switch_model:opus", "switch_model:sonnet", "switch_model:haiku", "switch_model:fable",
+                         ["switch_model:opus", "switch_model:sonnet", "switch_model:haiku",
                           "add_account", "buy_credits", "restart_core", "open_terminal"])
         kinds = {a.id: a.kind for a in req.actions}
         self.assertEqual(kinds["buy_credits"], recovery.PURCHASE_KIND)
@@ -267,6 +267,17 @@ class Executor(Base):
         [receipt] = self.run_pending(run, seat=SEAT)
         self.assertEqual((receipt["outcome"], run.calls), ("refused", []))
 
+    def test_an_id_outside_the_runtimes_own_list_never_runs(self):
+        req = self.card(runtime="codex")
+        with self.mgr.store.locked():
+            cur = self.mgr.get(req.id)
+            cur.actions = [tui_gate.recovery_action("switch_model:sonnet")] + cur.actions
+            self.mgr.store.save(cur)
+        self.click(self.mgr.get(req.id), "switch_model:sonnet")
+        run = Run()
+        [receipt] = self.run_pending(run)
+        self.assertEqual((receipt["outcome"], run.calls), ("refused", []), "Codex has no model switch")
+
     def test_step_up_actions_never_run(self):
         for aid in ("buy_credits", "add_account"):
             with self.subTest(aid=aid):
@@ -370,7 +381,7 @@ class PausedCard(Base):
         b = RA.hold_card_step(self.mgr, self.ws, CORE, "claude")
         self.assertEqual(a.id, b.id)
         self.assertEqual([x.id for x in a.actions],
-                         ["retry_now", "switch_model:sonnet", "switch_model:haiku", "switch_model:fable",
+                         ["retry_now", "switch_model:sonnet", "switch_model:haiku",
                           "add_account", "buy_credits"])
         self.assertIs(a.subject.get("remind"), False)
         for word in COMMANDS + PURCHASE_WORDS:

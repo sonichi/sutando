@@ -3,9 +3,10 @@
 
 Before: the backend supervisor's spent recovery budget (`terminal` in supervisor-status.json)
 and a core that keeps dying never left the host. Now the core's monitor raises one core-blocked
-card per incident: the service and its last error, or, for the core itself (Claude Code or
-Codex), the crash count and Restart core. A stale status file, another app session's terminal,
-or a loop that has calmed down raises nothing and closes what is open.
+card per incident: the service and its last error, or, when the recovery record says
+`crash_loop` for the core (Claude Code or Codex), the restart count and Restart core. A stale
+status file, another app session's terminal, or a core that is up again raises nothing and
+closes what is open.
 """
 import importlib.util as u
 import json
@@ -27,6 +28,7 @@ M = u.module_from_spec(spec)
 spec.loader.exec_module(M)
 
 import core_crash_loop as C
+import core_recovery_state as crs
 from hitl.manager import HitlManager, HitlStore
 from hitl.schema import STATUS_RESOLVED
 
@@ -49,7 +51,6 @@ class Base(unittest.TestCase):
         self.ws = Path(self.tmp.name)
         (self.ws / "state").mkdir()
         self.mgr = HitlManager(HitlStore(self.ws / "state" / "hitl" / "requirements"))
-        self.counter = C.CrashCounter()
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -57,9 +58,8 @@ class Base(unittest.TestCase):
     def write(self, doc):
         (self.ws / "state" / C.STATUS_FILE).write_text(json.dumps(doc))
 
-    def tick(self, state="running", now=None, runtime="claude", pane=None):
-        return M.crash_loop_step(self.mgr, self.ws, CORE, runtime, self.counter, state, pane,
-                                 time.time() if now is None else now)
+    def tick(self, now=None, runtime="claude", pane=None):
+        return M.crash_loop_step(self.mgr, self.ws, CORE, runtime, pane, time.time() if now is None else now)
 
 
 class SupervisorTerminal(Base):
@@ -95,40 +95,44 @@ class SupervisorTerminal(Base):
 
 
 class CoreCrashes(Base):
-    def crash_loop(self, n, start, runtime="claude", pane=None):
-        out = []
-        for i in range(n):
-            out = self.tick("crashed", now=start + i * 60, runtime=runtime, pane=pane)
-            out = self.tick("running", now=start + i * 60 + 30, runtime=runtime, pane=pane)
-        return out
+    def record(self, runtime="claude", restarts=5, sup="crashed", now=None):
+        now = time.time() if now is None else now
+        rec = crs.derive({"state": sup}, None, None, None, None, now=now, runtime=runtime,
+                         restarts_10m=restarts, prev=crs.read(self.ws, now, max_age_s=None))
+        crs.publish(self.ws, rec, now)
+        return rec
 
-    def test_three_crashes_raise_nothing_the_fourth_raises_restart_core(self):
-        t0 = time.time()
-        self.assertEqual(self.crash_loop(C.CRASH_LIMIT - 1, t0), [])
-        [card] = self.tick("crashed", now=t0 + 300)
+    def test_the_recovery_records_crash_loop_raises_one_card_with_restart_core(self):
+        self.assertEqual(self.record(restarts=crs.CRASH_LOOP_RESTARTS - 1)["state"], "starting")
+        self.assertEqual(self.tick(), [], "a few restarts are the supervisor's job, not the owner's")
+        rec = self.record()
+        [card] = self.tick()
         self.assertEqual([a.id for a in card.actions], ["restart_core"])
-        self.assertTrue(card.subject["recovery"])
-        self.assertIn(f"crashed {C.CRASH_LIMIT} times", card.message)
-        [again] = self.tick("crashed", now=t0 + 303)
-        self.assertEqual(again.id, card.id, "a crash that lasts is one entry, the incident one card")
+        self.assertEqual(card.subject["incident"], rec["incident"], "one incident, the record's")
+        self.assertIn("started 5 times in the last 10 minutes", card.message)
+        self.record(restarts=6)
+        [again] = self.tick()
+        self.assertEqual(again.id, card.id, "the loop going on is the same card")
 
     def test_a_codex_core_crash_loop_is_carded_the_same_way(self):
-        [card] = self.crash_loop(C.CRASH_LIMIT, time.time(), runtime="codex")
+        self.record(runtime="codex")
+        [card] = self.tick(runtime="codex")
         self.assertEqual((card.runtime, [a.id for a in card.actions]), ("codex", ["restart_core"]))
 
     def test_the_last_error_is_named_never_quoted(self):
-        pane = "API Error: 500 {\"error\":\"overloaded\"} token=sk-ant-oat01-SECRET"
-        [card] = self.crash_loop(C.CRASH_LIMIT, time.time(), pane=pane)
+        self.record()
+        [card] = self.tick(pane="API Error: 500 {\"error\":\"overloaded\"} token=sk-ant-oat01-SECRET")
         self.assertIn("Last error: api error", card.message)
         self.assertNotIn("sk-ant", card.message)
 
-    def test_the_card_closes_once_the_loop_calms(self):
-        t0 = time.time()
-        [card] = self.crash_loop(C.CRASH_LIMIT, t0)
-        self.assertEqual(self.tick("running", now=t0 + C.CRASH_WINDOW_S + 400), [])
+    def test_the_card_closes_once_the_core_is_up(self):
+        self.record()
+        [card] = self.tick()
+        self.record(sup="running", restarts=0)
+        self.assertEqual(self.tick(), [])
         self.assertEqual(self.mgr.get(card.id).status, STATUS_RESOLVED)
 
-    def test_a_seat_monitor_never_counts(self):
+    def test_a_seat_monitor_never_raises_it(self):
         # The monitor calls the step only for the core; a seat's watcher ends with its seat.
         src = (SRC / "core-input-watch.py").read_text()
         self.assertIn("if a.chat_escalation and not a.seat:\n            crash_loop_step(", src)

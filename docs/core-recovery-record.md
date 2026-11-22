@@ -87,6 +87,35 @@ not in the host's own list (aliases, runtimes, stored accounts), or any unknown 
 `switch_account` is in `STEP_UP_ACTIONS`: never offered in the record, and confirmed by the owner
 before it runs.
 `RECEIPT_OUTCOMES` (`done`, `refused`, `stale`, `failed`) is the receipt's (`receipt.json`).
+The grammar itself lives in `src/hitl/recovery.py` (vendored into ag2-sparrow, since the bridge's
+reply handler parses the click); `parse_action_id` adds the runtime's and the host's lists to it.
+
+## The buttons and who runs them
+
+A blocked core's or worker seat's card (`hitl.tui_gate`, built by `core-input-watch.py`) carries
+the recovery actions for its state, picked by `recovery_actions.card_controls`:
+
+| Card | Buttons |
+|---|---|
+| Limit, refused turn | Switch to <model> (the runtime's list, minus the model in use and the capped one), Retry now, Add another account, Add usage credits; the core also gets Switch runtime and Restart core |
+| Limit menu (`/rate-limit-options`) | Wait for reset, Continue automatically at <time> (keystrokes), Add another account, Add usage credits; the core also gets Restart core |
+| Paused by the relaunch hold | Retry now, Switch to <model>, Switch runtime, Add another account, Add usage credits |
+| Other blocked prompt (core) | Restart core |
+| Crash loop (`core_crash_loop`) | the core: Restart core; a stopped service: none (only an app restart clears it) |
+
+`Add usage credits` (`buy_credits`) has its own action kind, `purchase`, and is the only text on
+the card that names a purchase, so a client that must not show one drops exactly that button. The
+relay's `space.ag2.agent_alert` carries `has_non_purchase_actions: true` for a hard block.
+`Open terminal` stays last, as the client-local action.
+
+A tap goes through the HITL reply handler (owner only, the card's own room, revision and guard)
+to `state/recovery/actions/<hitl_id>.json`. The monitor watching that card's session runs it
+(`src/recovery_actions.py`): once, within 10 minutes, only an id the card offered and the
+runtime carries out, with fixed argv, never what a subprocess printed. It writes the receipt to
+`state/recovery/receipts/<hitl_id>.json`, one line to `state/recovery/audit.jsonl` (who, what,
+session, outcome) and edits the card in place. `buy_credits`, `add_account` and `switch_account`
+are refused until the confirmed, re-authenticated sign-in flow exists; a worker seat's card never
+runs `restart_core` or `switch_runtime`.
 
 ## Contract fixtures
 

@@ -28,14 +28,14 @@ SWITCH_MODEL = "switch_model"
 SWITCH_RUNTIME = "switch_runtime"
 RESTART_CORE = "restart_core"
 ESCAPE_PROMPT = "escape_prompt"
-# The model aliases scripts/switch-model.sh accepts that a card may offer.
-SWITCH_ALIASES = ("opus", "sonnet", "haiku", "fable")
+# The model aliases scripts/switch-model.sh accepts that a card may offer; Fable is a spend decision.
+SWITCH_ALIASES = ("opus", "sonnet", "haiku")
 # The core runtimes src/agent/start-cli.sh --runtime launches.
 RUNTIMES = ("claude", "codex")
 _RUNTIME_NAMES = {"claude": "Claude Code", "codex": "Codex"}
 _BARE = frozenset({RETRY_NOW, RESTART_CORE, ESCAPE_PROMPT, BUY_CREDITS, ADD_ACCOUNT})
-# An account is named by its opaque id (a config entry id or digest), never an address or token.
-_ACCOUNT_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
+# An account is named by its opaque digest (core_recovery_state's), never an address or token.
+_ACCOUNT_ID = re.compile(r"^acct_[0-9a-f]{6}$")
 # Act on the core itself, so a worker seat's card never carries them.
 CORE_ONLY = frozenset({RESTART_CORE, SWITCH_RUNTIME})
 OUTCOMES = ("done", "refused", "stale", "failed")

@@ -7,8 +7,8 @@ Two sources, both read by the core's monitor (core-input-watch.py) each tick:
   recovery budget is spent carries `terminal: {state: failed, reason, appSessionId}`, cleared
   only by a fresh app session. The card says which service, its last error, and that it stays
   stopped until the s.space app restarts; no button, since nothing on the card can clear it.
-- the core itself, whatever its runtime: CRASH_LIMIT entries into `crashed` within
-  CRASH_WINDOW_S. The card carries Restart core (hitl.recovery).
+- the core itself, whatever its runtime: the recovery record (core_recovery_state, the one
+  derivation of the core's state) says `crash_loop`. The card carries Restart core.
 
 The card is the push: its own Matrix notification reaches the owner's devices. The macOS
 notification, where on, stays an extra (core-supervisor-relay.py).
@@ -24,8 +24,6 @@ SOURCE = "crash-loop"
 STATUS_FILE = "supervisor-status.json"
 #: The supervisor rewrites its heartbeat every <=5 s; an older one is no supervisor (its schema).
 STATUS_FRESH_S = 60.0
-CRASH_WINDOW_S = 600.0
-CRASH_LIMIT = 4
 _ERROR_MAX = 160
 
 
@@ -53,27 +51,6 @@ def terminal_services(workspace: Path, now: float) -> List[Dict]:
     return out
 
 
-class CrashCounter:
-    """Entries into `crashed` within the window: one entry per crash, however long it lasts.
-    `incident_at` is when the count first reached CRASH_LIMIT; it holds while the loop does."""
-
-    def __init__(self):
-        self.entries: List[float] = []
-        self.last = None
-        self.incident_at: Optional[float] = None
-
-    def observe(self, state: str, now: float) -> int:
-        if state == "crashed" and self.last != "crashed":
-            self.entries.append(now)
-        self.last = state
-        self.entries = [t for t in self.entries if now - t <= CRASH_WINDOW_S]
-        if len(self.entries) >= CRASH_LIMIT:
-            self.incident_at = self.incident_at or now
-        else:
-            self.incident_at = None
-        return len(self.entries)
-
-
 def _abnormal(pane: Optional[str]) -> str:
     """The kind of trouble the pane showed before the crash, named, never quoted: a pane can
     hold anything, a card must not."""
@@ -86,7 +63,7 @@ def _abnormal(pane: Optional[str]) -> str:
     return ""
 
 
-def step(manager, workspace: Path, session: str, runtime: Optional[str], counter: CrashCounter,
+def step(manager, workspace: Path, session: str, runtime: Optional[str],
          last_pane: Optional[str], now: float) -> List:
     """Raise one card per crash-loop incident and close each once its cause is gone.
     Returns the open crash-loop requirements."""
@@ -106,18 +83,23 @@ def step(manager, workspace: Path, session: str, runtime: Optional[str], counter
             title=f"Crashing: {svc['service']}", guard=guard, device={"id": session, "name": session},
             subject={"session": session, "source": SOURCE, "crash_loop": svc["service"], "remind": False,
                      "incident": f"inc_{_digest(guard)}"})
-    crashes = len(counter.entries)
-    if counter.incident_at is not None:
-        guard = f"{SOURCE}:core:{_digest(str(int(counter.incident_at)))}"
+    import core_recovery_state
+    record = core_recovery_state.read(workspace, now) or {}
+    if record.get("state") == "crash_loop":
+        incident = str(record.get("incident") or "")
+        guard = f"{SOURCE}:core:{incident}"
         error = _abnormal(last_pane)
-        lines = [f"My core has crashed {crashes} times in the last {int(CRASH_WINDOW_S // 60)} minutes.",
+        window = int(core_recovery_state.RESTART_WINDOW_S // 60)
+        count = record.get("restarts_10m")
+        lines = [f"My core has started {count} times in the last {window} minutes and is still not up."
+                 if isinstance(count, int) else "My core keeps crashing.",
                  "", f"Last error: {error or 'not recorded'}", "", "Tap Restart core to start it fresh."]
         want[guard] = HumanRequirement(
             kind="core-blocked", runtime=runtime or "claude", message="\n".join(lines),
             title="Crashing: core", guard=guard, device={"id": session, "name": session},
             actions=[recovery_action(recovery.RESTART_CORE)],
             subject={"session": session, "source": SOURCE, "crash_loop": "core", "recovery": True,
-                     "remind": False, "incident": f"inc_{_digest(guard)}"})
+                     "remind": False, "incident": incident})
     import recovery_actions
     for r in manager.active():
         subject = r.subject or {}
