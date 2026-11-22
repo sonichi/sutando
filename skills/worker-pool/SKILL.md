@@ -204,9 +204,11 @@ The lane routes each task it queues itself (`pool_route_handler.py --from-lane -
 the task is its worker's when it reaches `tasks/` and the core's watcher, which never routes a held task, leaves it;
 see `docs/connections.md`, "In a pool worker's session".
 
-A new worker created with its own agent starts on its own task and result folders: the identity step
-(`pool_identity.py add --device-flow --own-dirs`) switches it as soon as the agent is saved, before its lane
-starts. An existing worker with its own agent is switched by hand
+A worker that gets its first own agent (a new worker's identity step, or `pool_identity.py add`, pasted or
+`--device-flow`) starts on its own task and result folders: the switch runs as soon as the agent is saved,
+before its lane starts, and moves anything already delivered to it. `add --shared-dirs` opts out, only while
+something still reads that worker's work from the shared folders. A rotate keeps the worker's folders. A
+worker that already had its agent, or got it through `provision-*`, is switched by hand
 (`python3 src/worker_lane.py migrate-dirs --worker <id>` previews, `--apply` does it, `--undo --apply` switches back; then respawn it): its lane
 queues straight into `<workspace>/agents/<segment>/tasks`, nothing is routed through `deliveries/<id>/`, and
 its session answers in that folder's `results/`; see `docs/connections.md`, "A worker on its own folders".

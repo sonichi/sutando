@@ -814,15 +814,19 @@ records the task as the worker's (`--attribute-only`), and the worker's stamped 
 in the shared `results/` are moved into its own. Its session reads a plain inbox of task files and answers in
 its own results (`spawn_worker.inbox_env`, `result_publish`). A worker without the field is unchanged.
 
-A new worker starts on its own folders. When `create_worker.py` requests the worker's own agent (the
-default; `--no-identity` opts out), the background `pool_identity.py add --device-flow --own-dirs` switches it
-over as soon as the approved agent is saved, before that agent's lane first starts and before the seat
-restarts as that agent, through the same `worker_lane.migrate_dirs` as `--apply` below. It prints
-`"dirs": "own"` (or `"shared"`, with the reason and the command that finishes it on stderr). A worker created
-without its own agent stays on the shared folders. A rotate, a resend of a rotate, and an `add` without
-`--own-dirs` on an existing worker never change its folders.
+A worker that gets its first own agent moves to its own folders. That covers a new worker whose agent
+`create_worker.py` requests (the default; `--no-identity` opts out) and an existing worker given one by
+`pool_identity.py add`, pasted or `--device-flow`. The switch runs as soon as the agent is saved, before its
+lane first starts and before the seat restarts as that agent, through the same `worker_lane.migrate_dirs` as
+`--apply` below, so work already in `deliveries/<id>/` moves or is handed back as described there. The add
+reports `dirs` as `own`, or as `shared` with the reason and the command that finishes it on stderr; the
+identity and lane go ahead either way. `add --shared-dirs` keeps the worker on the shared folders: use it only
+while something still reads that worker's work from the shared `tasks/` and `results/`, and switch it later
+with `migrate-dirs --apply`. A resend of an expired link keeps that choice. A rotate never changes a worker's
+folders, and neither do the `provision-*` verbs (run `migrate-dirs --apply` after one). A worker without its
+own agent stays on the shared folders.
 
-For an existing worker, `python3 src/worker_lane.py migrate-dirs --worker <id>` shows what switching the worker would do (its
+For a worker that already has its own agent, `python3 src/worker_lane.py migrate-dirs --worker <id>` shows what switching the worker would do (its
 folders, who holds its lane, what is delivered to it, and which tasks and results would move) and writes
 nothing. With `--apply` it switches the worker over:
 1. It finds the declared task-event handler first. A failed lookup, or work delivered with no handler to

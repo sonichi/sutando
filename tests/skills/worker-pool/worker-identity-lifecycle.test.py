@@ -2,8 +2,8 @@
 """A worker's own s.space identity across its life: create, stop/start, retire.
 
 - `create_worker.py` starts the identity step by default, as `pool_identity.py add <worker>
-  --device-flow --label <label> --own-dirs` in the background, and returns once the owner was sent the
-  link. Once approved, the worker is on its agent's own folders before its lane starts.
+  --device-flow --label <label>` in the background, and returns once the owner was sent the link.
+  Once approved, the worker is on its agent's own folders before its lane starts.
   `--no-identity` (or WORKER_POOL_IDENTITY_ON_CREATE=0) skips it, and a step that cannot start
   still creates the worker, which answers through the core.
 - The label is the worker's name as a device-connect label, made unique against the agents this
@@ -143,7 +143,7 @@ class ByDefault(Base):
                                      str(self.ws), "add", wid, "--device-flow", "--label"])
         self.assertEqual(argv[8], "code-reviewer")
         self.assertIn("--display-name", argv)
-        self.assertIn("--own-dirs", argv)
+        self.assertNotIn("--shared-dirs", argv)
         rec = dc.read_record(self.ws, wid)
         self.assertEqual(rec["state"], "pending", "creation returned while the approval was still open")
         until = time.strftime("%H:%M", time.localtime(rec["expires_at"]))

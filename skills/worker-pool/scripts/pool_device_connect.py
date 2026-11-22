@@ -7,8 +7,8 @@ text note when no card can be posted), and asks again (`POST /api/connect/poll`)
 until the owner has approved it in a browser or the code expires. The answered bearer goes straight into
 the vault as the worker's connection, and only after the gateway confirms it is the agent the poll
 named, a new agent owned by the core's owner. `rotate=True` asks the same way for a new token of the
-worker's existing agent and replaces its secret in place. `own_dirs=True` (a worker being created) also
-puts the worker on its own task and result folders (`worker_lane.migrate_dirs`) before its lane starts.
+worker's existing agent and replaces its secret in place. A worker's first agent also puts it on that
+agent's own task and result folders (`switch_to_own_dirs`) before its lane starts, unless `own_dirs=False`.
 
 The device code and the bearer stay in this process and the vault: nothing here returns, prints, logs,
 writes or raises either; callers get the agent id and a status.
@@ -474,8 +474,8 @@ def resend(worker: str, *, workspace: Optional[Path] = None, spawn=None, clock=t
             argv += ["--display-name", str(rec["display_name"])]
         if rec.get("lane") is not None:
             argv += ["--lane", str(rec["lane"])]
-        if rec.get("own_dirs") and not rec.get("rotate"):
-            argv += ["--own-dirs"]
+        if rec.get("own_dirs") is False and not rec.get("rotate"):
+            argv += ["--shared-dirs"]
         claimed = {**rec, "state": "resending", "resend_id": resend_id, "resend_at": now}
         claimed.pop("resend_pid", None)
         write_record(workspace, worker, claimed)
@@ -548,10 +548,10 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
             request=pp.http_json, preview=None, deliver: Optional[Callable[[str], object]] = None,
             cards: Optional[CardSink] = None, say: Callable[[str], None] = lambda text: None, sleep=time.sleep,
             clock=time.time, repo: Optional[Path] = None, logs_dir: Optional[Path] = None,
-            start_lane: Optional[Callable[[dict], Optional[dict]]] = None, own_dirs: bool = False) -> dict:
+            start_lane: Optional[Callable[[dict], Optional[dict]]] = None, own_dirs: bool = True) -> dict:
     """Give `worker` its own agent, or with `rotate` a new token for the one it has: {agent_id, status, row}.
-    With `own_dirs` and not `rotate`, the new agent's worker is switched onto its own folders once the token
-    is saved and before `start_lane` (`dirs`: {"own", "why"?}); an existing worker's folders never change.
+    Unless `own_dirs` is False, a first agent's worker is switched onto its own folders once the token is
+    saved and before `start_lane` (`dirs`: {"own", "why"?}); a rotate never changes the worker's folders.
     The owner gets an approval card in their DM (`cards`; by default the core's own, unless `deliver` is
     given), and `deliver(text)` the text note when no card was posted. The token is saved only when
     the gateway confirms the agent the poll named, on the core's server and owned by the core's owner, and
@@ -579,7 +579,7 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
     op = f"{CARD_KIND}:{worker}:{secrets.token_hex(6)}"
     record = {"label": label, "display_name": display_name, "worker_label": who, "rotate": rotate,
               "lane": core.get("instance"), "server": server, "expires_at": pending["expires_at"],
-              "state": "pending", **({"own_dirs": True} if own_dirs and not rotate else {})}
+              "state": "pending", **({} if rotate else {"own_dirs": bool(own_dirs)})}
     shown = ""
     if cards is not None:
         shown = cards.show(*approval_card(worker, who, label, pending["verify_url"], pending["expires_at"],
@@ -622,7 +622,7 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
             out = _save(worker, token, got["agent_id"], core, current, workspace=workspace, vault=vault,
                         preview=preview, repo=repo, logs_dir=logs_dir)
             if own_dirs and not rotate:
-                out["dirs"] = _own_dirs(worker, workspace)
+                out["dirs"] = switch_to_own_dirs(worker, workspace)
             if start_lane is not None and not rotate:
                 out["launch"] = start_lane(out["row"])
     except DeviceConnectError as e:
@@ -642,8 +642,9 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
     return out
 
 
-def _own_dirs(worker: str, workspace: Optional[Path]) -> dict:
-    """Switch a just-identified worker onto its own folders: {"own": bool, "why"?}. Never raises; the
+def switch_to_own_dirs(worker: str, workspace: Optional[Path]) -> dict:
+    """Switch a worker that just got its first agent onto its own folders: {"own": bool, "why"?}. Its
+    delivered work moves as `migrate-dirs --apply` moves it. Never raises; the
     identity stays saved, and a switch that stopped part-way is finished by `worker_lane.py migrate-dirs`."""
     import worker_lane
     ws = Path(connections._workspace(workspace))

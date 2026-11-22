@@ -6,8 +6,8 @@ connection row naming the worker (src/connections.py, "a pool worker's own ident
 of its own that answers only what is addressed to that agent, hands every task it queues to the
 worker, and posts nothing proactively. Retiring the worker (pool_manage retire) takes it away.
 
-    python3 pool_identity.py [--workspace WS] add <worker> --repo REPO --logs-dir DIR [TOKEN|-] [--yes --expected-server NAME]
-    python3 pool_identity.py [--workspace WS] add <worker> --device-flow --label LABEL [--display-name TEXT] [--lane INSTANCE] [--own-dirs]
+    python3 pool_identity.py [--workspace WS] add <worker> --repo REPO --logs-dir DIR [TOKEN|-] [--yes --expected-server NAME] [--shared-dirs]
+    python3 pool_identity.py [--workspace WS] add <worker> --device-flow --label LABEL [--display-name TEXT] [--lane INSTANCE] [--shared-dirs]
     python3 pool_identity.py [--workspace WS] show <worker>
     python3 pool_identity.py [--workspace WS] rotate <worker> --repo REPO --logs-dir DIR [TOKEN|-]
     python3 pool_identity.py [--workspace WS] rotate <worker> --device-flow --label LABEL [--lane INSTANCE]
@@ -29,12 +29,17 @@ TOKEN is the agent's access token from its settings page in AG2 Space. Leave it 
 at a hidden prompt, or pass '-' to read it from stdin; it is stored in the secret vault, never in
 a file, and never printed. `add` shows what the token's gateway says before anything is saved.
 
+A worker's first agent (`add`, pasted or `--device-flow`) also moves the worker onto that agent's own task
+and result folders before its lane starts, as `worker_lane.py migrate-dirs --apply` does: work already
+delivered to it moves or is handed back, and the output says `dirs`. `--shared-dirs` keeps it on the shared
+folders: use it only when something still reads this worker's work from the shared `tasks/` and `results/`
+(`migrate-dirs --apply` switches it later). `rotate` never changes a worker's folders. `provision-*` does
+not switch them either; run `migrate-dirs --apply` after it.
+
 `--device-flow` needs no pasted token either (pool_device_connect.py): the core starts s.space's
 device-connect flow for agent LABEL, sends the owner the approval link in their DM, waits until they
 approve it in a browser (or the link expires, which it reports), checks the agent and its owner, and
-saves the token in the vault. It prints one JSON line with the agent id and a status. `--own-dirs` (what
-create_worker.py asks for a new worker) also switches the worker onto its own task and result folders before
-its lane starts, as `worker_lane.py migrate-dirs --apply` does, and the line says `dirs`. The owner sees an
+saves the token in the vault. It prints one JSON line with the agent id and a status. The owner sees an
 approval card (the text note when no card can be posted); once the link expires, the card's "Get a new
 link" button replies "Get a new link for <worker>", and `card-reply` on that task starts the same flow again
 in the background, for the owner only; a click that matches no card this agent posted prints
@@ -117,6 +122,14 @@ def reseat_after_add(ws: Path, repo, wid: str) -> dict:
     return out
 
 
+def dirs_said(wid: str, dirs: dict) -> str:
+    """"own" or "shared" for a first agent's folder switch; a switch that stopped says how to finish it."""
+    if dirs.get("why"):
+        print(f"worker {wid}'s folders: {dirs['why']}; finish with: worker_lane.py migrate-dirs "
+              f"--worker {wid} --apply", file=sys.stderr)
+    return "own" if dirs.get("own") else "shared"
+
+
 def cmd_device_flow(args, ws: Path, *, rotate: bool) -> int:
     """The device flow; a resend attempt (--resend-id) that ends without a new card says why and frees its button."""
     resend_id = getattr(args, "resend_id", None) or ""
@@ -149,7 +162,7 @@ def _device_flow(args, ws: Path, *, rotate: bool) -> tuple:
             wid, label=args.label, display_name=args.display_name or "", worker_label=label, rotate=rotate,
             workspace=ws, lane=args.lane, base=args.base or "", repo=args.repo, logs_dir=args.logs_dir,
             start_lane=start_lane, say=lambda text: print(text, file=sys.stderr, flush=True),
-            own_dirs=bool(getattr(args, "own_dirs", False)) and not rotate)
+            own_dirs=not getattr(args, "shared_dirs", False) and not rotate)
     except pool_device_connect.DeviceConnectError as e:
         print(f"pool_identity: {e}", file=sys.stderr)
         print(json.dumps({"status": e.status}, sort_keys=True))
@@ -161,10 +174,7 @@ def _device_flow(args, ws: Path, *, rotate: bool) -> tuple:
     status = out["status"] if started else "stored_lane_not_started"
     line = {"agent_id": out["agent_id"], "status": status}
     if "dirs" in out:
-        line["dirs"] = "own" if out["dirs"]["own"] else "shared"
-        if out["dirs"].get("why"):
-            print(f"worker {wid}'s folders: {out['dirs']['why']}; finish with: worker_lane.py migrate-dirs "
-                  f"--worker {wid} --apply", file=sys.stderr)
+        line["dirs"] = dirs_said(wid, out["dirs"])
     if not rotate and not args.no_start:
         line["seat"] = reseat_after_add(ws, args.repo, wid).get("result")
     print(json.dumps(line, sort_keys=True))
@@ -192,6 +202,8 @@ def cmd_add(args, ws: Path) -> int:
                                                    workspace=ws)
     print(f"{'added' if created else 'already present:'} {row['instance']}: worker {wid} runs as "
           f"{row.get('agent_mxid') or '?'} (token in the vault as {row['token_ref']})")
+    if created and not args.shared_dirs:
+        print(f"dirs: {dirs_said(wid, pool_device_connect.switch_to_own_dirs(wid, ws))}")
     launch = connections.start_added(row, repo=args.repo, logs_dir=args.logs_dir, workspace=ws)
     if created:
         print(f"seat: {reseat_after_add(ws, args.repo, wid).get('result')}")
@@ -371,7 +383,9 @@ def build_parser() -> argparse.ArgumentParser:
         s.add_argument("--display-name", default=None); s.add_argument("--lane", default=None)
         s.add_argument("--base", default=None, help=argparse.SUPPRESS); s.add_argument("--no-start", action="store_true")
         s.add_argument("--resend-id", default=None, help=argparse.SUPPRESS)
-    a.add_argument("--own-dirs", action="store_true")
+    a.add_argument("--shared-dirs", action="store_true",
+                   help="keep the worker on the shared tasks/ and results/ (only while something still reads "
+                        "its work there; worker_lane.py migrate-dirs --apply switches it later)")
     s = sub.add_parser("remove"); s.add_argument("worker"); s.set_defaults(fn=cmd_remove)
     s = sub.add_parser("provision-begin"); s.add_argument("worker"); s.add_argument("--role", default=None)
     s.add_argument("--lane", default=None); s.set_defaults(fn=cmd_provision_begin)

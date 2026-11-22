@@ -2,7 +2,7 @@
 """Start a new worker's own s.space identity without waiting for the owner's approval.
 
 `create_worker.py` calls `request` once the worker is registered. It runs the same
-device-connect flow as `pool_identity.py add <worker> --device-flow --label <label> --own-dirs`, as that
+device-connect flow as `pool_identity.py add <worker> --device-flow --label <label>`, as that
 command in a background process, and returns once the owner has been sent the approval link
 (or the start failed, or `wait_s` passed). The background process waits for the approval,
 saves the token, puts the worker on its agent's own task and result folders and restarts it as its own
@@ -137,7 +137,7 @@ def _request(ws: Path, wid: str, worker_label: str, *, repo, lane, wait_s, spawn
     logs.mkdir(parents=True, exist_ok=True)
     log = logs / f"worker-identity-{wid}.log"
     argv = [sys.executable, str(_HERE / "pool_identity.py"), "--workspace", str(ws), "add", wid,
-            "--device-flow", "--label", label, "--own-dirs", "--repo", str(repo or _REPO), "--logs-dir", str(logs)]
+            "--device-flow", "--label", label, "--repo", str(repo or _REPO), "--logs-dir", str(logs)]
     if worker_label and worker_label != wid:
         argv += ["--display-name", worker_label[:64]]
     if lane is not None:
