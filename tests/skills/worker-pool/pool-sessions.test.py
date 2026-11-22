@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "skills/worker-pool/scripts"))
@@ -78,6 +79,16 @@ class PoolSessions(unittest.TestCase):
             # `=` or tmux prefix-matches and a short id lands on another worker.
             self.assertEqual(row["attach_argv"][-1], f"=sutando-worker-{W1}")
             self.assertEqual(row["attach_argv"][:3], ["tmux", "-S", SOCK])
+
+    def test_a_live_worker_delegates_attach_argv(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = workspace_with(Path(d), {W1: {"state": "live"}},
+                                {}, {W1: [open_run(W1)]})
+            with mock.patch.object(pool_sessions.spawn_worker, "attach_argv",
+                                   return_value=["shared attach"]) as argv:
+                (row,) = pool_sessions.sessions(ws, probe=EXISTS)
+            argv.assert_called_once_with(SOCK, f"sutando-worker-{W1}")
+            self.assertEqual(row["attach_argv"], ["shared attach"])
 
     def test_a_worker_between_incarnations_is_reported_not_dropped(self):
         """`live: false` and no argv — "exists, no session now" must stay

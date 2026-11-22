@@ -46,6 +46,8 @@ rgb.MEDIA_DIR = tmp / "media"
 # Mock the network fetch — any successful download yields bytes so the fetch
 # path builds a ref + rewrites the marker.
 rgb._download_bytes = lambda url, headers, cap: b"x" * 100
+# The markers below use example.com: make it the gateway, the only origin (with the homeserver) fetched.
+rgb.URL = "https://example.com"
 
 failures = []
 
@@ -69,7 +71,7 @@ def _write_and_parse(task):
 
 # ── 1. _maybe_fetch_media appends a ref + rewrites the marker ──
 refs = []
-body = f"[AG2Space @qingyun] look [{TAG}:https://example.com/pic.png mime=image/png name=pic.png kind=m.image]"
+body = f"[AG2Space @qingyun] look [{TAG}:https://example.com/v1/media/s.space/pic mime=image/png name=pic.png kind=m.image]"
 out = rgb._maybe_fetch_media(body, refs)
 check("marker rewritten to [Photo attached:]", "[Photo attached: " in out and f"[{TAG}:" not in out, out)
 check("one ref appended", len(refs) == 1, str(refs))
@@ -83,7 +85,7 @@ check("_refs_out optional (back-compat)", "[Photo attached: " in rgb._maybe_fetc
 # ── 2. _write_task with a media marker + caption → structured headers ──
 text, h = _write_and_parse({
     "id": "task-gw-1",
-    "task": f"[AG2Space @qingyun] look at this [{TAG}:https://example.com/pic.png mime=image/png name=pic.png kind=m.image]",
+    "task": f"[AG2Space @qingyun] look at this [{TAG}:https://example.com/v1/media/s.space/pic mime=image/png name=pic.png kind=m.image]",
 })
 check("dual-write: legacy [Photo attached:] in the task body", "[Photo attached: " in text)
 atts = ltp.parse_attachments(h.headers)
@@ -96,7 +98,7 @@ check("media_form attachment", ltp.parse_media_form(h.headers) == "attachment")
 # ── 3. media marker, NO caption → image only, no text modality ──
 text, h = _write_and_parse({
     "id": "task-gw-2",
-    "task": f"[AG2Space @qingyun] [{TAG}:https://example.com/doc.pdf mime=application/pdf name=doc.pdf kind=m.file]",
+    "task": f"[AG2Space @qingyun] [{TAG}:https://example.com/v1/media/s.space/doc mime=application/pdf name=doc.pdf kind=m.file]",
 })
 check("no caption → file modality only",
       ltp.parse_content_modalities(h.headers) == frozenset({"file"}), h.get("content_modalities"))

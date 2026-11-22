@@ -992,3 +992,37 @@ READY_PANE = """ ▐▛███▛█   Claude Code
 def cm_dict(req):
     from ag2_sparrow.hitl.manager import _req_to_dict
     return _req_to_dict(req)
+
+
+ISOLATED_REPLY = "an isolated answer"
+# A stand-in for the isolated turn's `claude -p`: records what it was given, prints the CLI's JSON result.
+ISOLATED_STUB = r"""import json, os, sys
+rec = os.path.join(%(dir)r, "isolated-runs.jsonl")
+text = sys.stdin.read()
+with open(rec, "a") as f:
+    f.write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(), "listing": sorted(os.listdir(".")),
+                        "files": {n: open(n, "rb").read().decode("latin-1") for n in os.listdir(".")},
+                        "env": dict(os.environ), "stdin": text}) + "\n")
+try:
+    reply = open(os.path.join(%(dir)r, "isolated-reply")).read()
+except OSError:
+    reply = %(reply)r
+if reply == "EXIT1":
+    sys.exit(1)
+print(json.dumps({"type": "result", "is_error": False, "result": reply}))
+"""
+
+
+def write_isolated_stub(d):
+    d = Path(d)
+    py = d / "claude-isolated.py"
+    py.write_text(ISOLATED_STUB % {"dir": str(d), "reply": ISOLATED_REPLY})
+    sh = d / "claude-isolated"
+    sh.write_text('#!/bin/sh\nexec "%s" "%s" "$@"\n' % (sys.executable, py))
+    sh.chmod(0o755)
+    return sh
+
+
+def isolated_runs(d):
+    p = Path(d) / "isolated-runs.jsonl"
+    return [json.loads(line) for line in p.read_text().splitlines()] if p.exists() else []

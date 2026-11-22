@@ -557,6 +557,54 @@ def token_file_pairs(text: str) -> "list[tuple[str, str]]":
     return pairs
 
 
+def plain_token_key(text: str) -> str:
+    """The token key a reader that takes only plain `KEY=value` lines (no `export `, as the desktop's stdio MCP
+    proxy) finds in a token file's text: the first of TOKEN_KEYS assigned a value that way, else ""."""
+    for key in TOKEN_KEYS:
+        if any(line.strip().startswith(key + "=") and line.strip()[len(key) + 1:].strip(" '\"")
+               for line in text.splitlines()):
+            return key
+    return ""
+
+
+def plain_token(text: str) -> "tuple[str, str, str]":
+    """(key, relay URL, secret) of the token that plain_token_key's reader takes from a token file's text (its
+    REMOTE_TASK_URL line, else the token's URL half, as the desktop's stdio MCP proxy reads it); ('', '', '')
+    when it finds none."""
+    key = plain_token_key(text)
+    if not key:
+        return "", "", ""
+    url_from_token, secret = contract.parse_onboarding_token(first(_assignments(text, (key,)), (key,))[0])
+    return key, (token_file_url(text) or url_from_token).rstrip("/"), secret
+
+
+def raw_token_line(text: str) -> "tuple[str, str]":
+    """(relay, secret) of a seat's raw token file as the desktop's stdio MCP proxy reads one (token_format "raw"):
+    its first nonempty line, split at the first `|` (relay trailing `/` stripped; no `|` is a bare secret).
+    ('', '') when that line is a `KEY=` assignment or there is none."""
+    line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    if not line or "=" in line.split("|", 1)[0]:
+        return "", ""
+    relay, sep, secret = line.partition("|")
+    return (relay.rstrip("/"), secret) if sep else ("", line)
+
+
+def seat_token_pointer(env_path: str, env_text: str) -> str:
+    """The raw token file a seat .env (its text `env_text`, at `env_path`) names, as named (absolute, symlinks
+    not resolved, so a no-follow read checks the link itself); '' when it names none or assigns a token itself."""
+    values = parse_env_text(env_text)
+    named = named_token_file(values)
+    if not named or first(values, TOKEN_KEYS)[0]:
+        return ""
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(env_path)), os.path.expanduser(named)))
+
+
+def seat_token_path(env_path: str, env_text: str) -> str:
+    """The realpath of `seat_token_pointer`, '' when there is none."""
+    pointer = seat_token_pointer(env_path, env_text)
+    return os.path.realpath(pointer) if pointer else ""
+
+
 def token_file_url(text: str) -> str:
     """The REMOTE_TASK_URL (legacy AG2_REMOTE_URL) of a split-layout token file's text, or ""."""
     return first(_assignments(text, URL_KEYS), URL_KEYS)[0]

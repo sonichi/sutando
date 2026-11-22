@@ -197,9 +197,13 @@ signed in on; the other lanes keep running.
 
 ### Two lanes, one answer
 
-A message in a room where two of the install's agents are members (a federated room, during the
-move from one homeserver to another) can reach both lanes with the same `event_id`. The cross-lane
-guard (`src/lane_dedupe.py`, the bridge's `TASK_INTAKE_GATE`) makes it one task, and
+A message in a room where two of one agent's lanes are members (a federated room, during the
+core's move from one homeserver to another) can reach both lanes with the same `event_id`. The
+cross-lane guard (`src/lane_dedupe.py`, the bridge's `TASK_INTAKE_GATE`) makes it one task for that
+agent. The guard is per agent (`connections.lane_agent_group`: a pool worker's id, or the core's
+rows together): a message that reaches the core and a pool worker is a task for each, and each
+decides whether the message is for it. A lane whose agent cannot be read claims for itself alone,
+so the worst case is a duplicate, never a drop. Among one agent's lanes,
 `connections.event_owner_lanes` picks the lane that answers it from facts every lane reads alike:
 the one lane whose agent the message names by full mxid or replies to (`reply_to_sender`), else
 the primary. Any other lane waits up to `OWNER_WAIT_S` (6 s) for that lane's claim and settles as
@@ -816,8 +820,14 @@ nothing. With `--apply` it switches the worker over:
 1. It finds the declared task-event handler first. A failed lookup, or work delivered with no handler to
    move it, refuses before anything changes.
 2. It writes the field and creates the folders (a private agent root), and relaunches the worker's lane
-   under the record lock (a wrapper lane is stopped so the lane keeper starts it on the new folders; a
-   declared bridge is waited for until sparrowd has replaced it).
+   under the record lock. A wrapper lane is stopped and started again on the new folders in that same
+   hold, through `connections.start`, because not every install runs a lane keeper (the desktop app starts
+   lanes once). A start that finds the lane already held spawns nothing. One that fails ends the run not
+   ok (exit 1, the reason in `lane` and `why` with the command that starts it) and keeps the switch. The
+   restart is recorded as owed before the lane is stopped, so a run that dies between the stop and the
+   start leaves it too: a re-run starts that lane, if it is still down, before finishing the rest. The
+   record goes once the lane runs again, or when the lane is disabled or parked. A declared bridge is
+   waited for until sparrowd has replaced it.
 3. It has the handler empty the worker's `deliveries/<id>/` under the router's locks. A task its own lane
    queued moves into its tasks folder and its sentinel is archived. A core task the worker never accepted is
    handed back (attribution first, then the sentinel) and touched so the core's watcher picks it up. One it

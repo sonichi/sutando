@@ -168,7 +168,7 @@ class OtherServerRoomTest(Fixture):
 class GreetingPathsTest(Fixture):
     """Each introduction path takes the name from the one resolver."""
 
-    def test_tutorial_page_name_is_the_display_name(self):
+    def test_local_tutorial_preview_name_is_the_display_name(self):
         gs = _load_getting_started()
         with self.rows():
             self.assertEqual(gs.resolve_name("auto", MXID, profile(DISPLAY)), DISPLAY)
@@ -186,7 +186,7 @@ class GreetingPathsTest(Fixture):
         self.assertEqual(plain.stdout.strip(), DISPLAY)
 
     def test_every_greeting_instruction_names_the_resolver(self):
-        for rel in ("CLAUDE.md", "AGENTS.md", "skills/room-onboard/SKILL.md", "skills/tutorial/SKILL.md"):
+        for rel in ("CLAUDE.md", "AGENTS.md", "skills/room-onboard/SKILL.md"):
             text = (REPO / rel).read_text(encoding="utf-8")
             self.assertIn("agent_display_name.py", text, rel)
         onboard = (REPO / "skills/room-onboard/SKILL.md").read_text(encoding="utf-8")
