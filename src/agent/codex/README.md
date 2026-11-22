@@ -17,6 +17,11 @@ process holds open, and writes the core's runtime observation record. It is read
 when its script changes (`SUTANDO_OBSERVER_VERSION`, like the notifier's), and exits once the core
 session is gone.
 
+`app-server/seat.py` is the experimental alternative to the typed-into TUI: with
+`SUTANDO_CODEX_APP_SERVER=1` the launchers start it in the core's (or a Codex worker's) tmux
+session, where it runs one turn per task over `codex app-server` and no notifier or observer
+session is started. Off by default; see `docs/codex-core.md`, "Running on `codex app-server`".
+
 Watcher events are wake signals rather than queue order. The notifier waits for
 the core's positive `idle` status and a pane without Codex's live working marker
 before touching the interactive input, then selects the highest-priority pending
