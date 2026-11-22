@@ -156,17 +156,21 @@ def sentinel_ids(workspace, worker_id) -> tuple[list[str], set[str]]:
     return owed, spent
 
 
-def owed_task_ids(workspace, worker_id) -> list[str]:
-    """What this worker owes: its own inbox's unanswered tasks (`task_dispatch.unanswered_in_inbox`) when it
-    has its own folders (`connections.worker_dirs`), else its owed sentinels. Sentinels still owed in its
-    deliveries folder count either way: a folder switch never strands work there out of sight."""
+def own_inbox_owed(workspace, worker_id, dirs=None) -> list:
+    """(task id, task file) for each unanswered task in the worker's own tasks folder
+    (`task_dispatch.unanswered_in_inbox`) while it is on, or switching to, its own folders
+    (`connections.worker_target_dirs`; `dirs` names them for a row already gone); [] otherwise."""
     import connections
-    sentinels = sentinel_ids(workspace, worker_id)[0]
-    own = connections.worker_dirs(worker_id, Path(workspace))
-    if own is None:
-        return sentinels
-    inbox = [task_id for task_id, _f in td.unanswered_in_inbox(*own, workspace=Path(workspace))]
-    return inbox + [t for t in sentinels if t not in inbox]
+    dirs = dirs or connections.worker_target_dirs(worker_id, Path(workspace))
+    return td.unanswered_in_inbox(*dirs, workspace=Path(workspace)) if dirs else []
+
+
+def owed_task_ids(workspace, worker_id) -> list[str]:
+    """What this worker owes: its own inbox's unanswered tasks (`own_inbox_owed`), then the sentinels it
+    still owes in its deliveries folder (`sentinel_ids`). Both count whichever folders it is on, so a folder
+    switch never puts work out of sight."""
+    inbox = [task_id for task_id, _f in own_inbox_owed(workspace, worker_id)]
+    return inbox + [t for t in sentinel_ids(workspace, worker_id)[0] if t not in inbox]
 
 
 def work_outstanding(workspace, worker_id) -> bool | None:

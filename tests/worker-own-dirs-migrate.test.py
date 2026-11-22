@@ -667,6 +667,61 @@ class SupervisedSwitch(Base):
         out, why = self.migrate(handler=self.handler)
         self.assertEqual((why, out["state"]), ("", "own"))
 
+    def own_worker_with_an_unanswered_task(self):
+        C.set_worker_dirs(W, True, workspace=self.ws)
+        C.ensure_worker_dirs(W, self.ws)
+        (self.own / "tasks" / f"{self.mine}.txt").write_text(f"id: {self.mine}\ntask: x\n")
+        pat.record(self.ws, self.mine, W)
+        real = C.retire_worker_identity
+        for p in (mock.patch.object(C, "retire_worker_identity",
+                                    lambda wid, **kw: real(wid, **{**kw, "vault": self.vault})),
+                  mock.patch.object(C, "_stop_row", lambda row, ws, kill: 0)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_retiring_an_own_folders_worker_that_owes_its_own_inbox_is_refused(self):
+        import pool_manage as pm
+        import pool_roster as pr
+        self.own_worker_with_an_unanswered_task()
+        with self.assertRaises(pm.Refused) as e:
+            pm.retire(self.ws, W, runner=self.tmux, tell=lambda text: True)
+        self.assertIn(self.mine, str(e.exception))
+        self.assertEqual(pr.load_roster(self.ws)["workers"][W]["state"], "live")
+        self.assertTrue((self.own / "tasks" / f"{self.mine}.txt").is_file())
+
+    def test_retire_hand_off_gives_an_own_folders_worker_s_unanswered_task_to_the_core(self):
+        import pool_manage as pm
+        self.own_worker_with_an_unanswered_task()
+        out = pm.retire(self.ws, W, hand_off=True, runner=self.tmux, tell=lambda text: True)
+        self.assertEqual((out["result"], out.get("handed_off")), ("retired", [self.mine]), out)
+        self.assertTrue((self.ws / "tasks" / f"{self.mine}.txt").is_file())
+        self.assertFalse((self.own / "tasks" / f"{self.mine}.txt").exists())
+        self.assertIsNone(pat.worker_for_task(self.ws, self.mine))
+
+    def test_an_own_inbox_hand_off_never_replaces_a_shared_task_and_fails_without_a_no_replace_rename(self):
+        import errno
+        import pool_supervise as sup
+        import undelivered_quarantine
+        self.own_worker_with_an_unanswered_task()
+        (self.ws / "tasks").mkdir(parents=True, exist_ok=True)
+        (self.ws / "tasks" / f"{self.mine}.txt").write_text("already here")
+        out = pd.hand_off_own_inbox(self.ws, W, sup.own_inbox_owed(self.ws, W))
+        self.assertEqual(out, {"handed_off": [], "kept": {self.mine: "shared-folder-holds-the-name"}})
+        self.assertEqual((self.ws / "tasks" / f"{self.mine}.txt").read_text(), "already here")
+        (self.ws / "tasks" / f"{self.mine}.txt").unlink()
+        with mock.patch.object(undelivered_quarantine, "rename_noreplace",
+                               side_effect=FileExistsError(errno.ENOTSUP, "no primitive")):
+            with self.assertRaises(FileExistsError):
+                pd.hand_off_own_inbox(self.ws, W, sup.own_inbox_owed(self.ws, W))
+        self.assertTrue((self.own / "tasks" / f"{self.mine}.txt").is_file())
+
+    def test_an_answered_task_in_its_own_inbox_is_not_owed(self):
+        import pool_supervise as sup
+        self.own_worker_with_an_unanswered_task()
+        self.assertEqual(sup.owed_task_ids(self.ws, W), [self.mine])
+        (self.own / "results" / f"{self.mine}.txt").write_text("answer")
+        self.assertEqual(sup.owed_task_ids(self.ws, W), [])
+
     def test_owed_work_left_in_deliveries_after_a_switch_stays_visible(self):
         import pool_supervise as sup
         self.deliver(self.core, ".accepted")
@@ -710,7 +765,9 @@ class FakeTmux:
     def __call__(self, argv, **kw):
         if argv[:1] == ["tmux"] and "has-session" in argv:
             name = argv[argv.index("-t") + 1].lstrip("=")
-            return subprocess.CompletedProcess(argv, 0 if name in self.alive else 1, "", "")
+            if name in self.alive:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return subprocess.CompletedProcess(argv, 1, "", f"can't find session: {name}\n")
         if argv[:1] == ["tmux"] and "kill-session" in argv:
             self.alive.discard(argv[argv.index("-t") + 1].lstrip("="))
         return subprocess.CompletedProcess(argv, 0, "", "")

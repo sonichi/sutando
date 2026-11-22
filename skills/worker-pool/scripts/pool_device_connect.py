@@ -556,7 +556,8 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
     The owner gets an approval card in their DM (`cards`; by default the core's own, unless `deliver` is
     given), and `deliver(text)` the text note when no card was posted. The token is saved only when
     the gateway confirms the agent the poll named, on the core's server and owned by the core's owner, and
-    the save and `start_lane(row)` run under `fenced`, so a worker retired during the wait gets neither."""
+    the save and `start_lane(row)` each run under `fenced`, so a worker retired during the wait gets neither;
+    the folder switch between them runs outside it."""
     current = connections.worker_identity(worker, workspace)
     if rotate and current is None:
         raise DeviceConnectError(f"worker {worker} has no agent of its own to rotate")
@@ -622,9 +623,11 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
                                          "pending; nothing was saved", status="identity_changed")
             out = _save(worker, token, got["agent_id"], core, current, workspace=workspace, vault=vault,
                         preview=preview, repo=repo, logs_dir=logs_dir)
-            if own_dirs and not rotate:
-                out["dirs"] = switch_to_own_dirs(worker, workspace)
-            if start_lane is not None and not rotate:
+        # Outside the fence: its handler passes can take minutes. A retire meanwhile only finds less to move.
+        if own_dirs and not rotate:
+            out["dirs"] = switch_to_own_dirs(worker, workspace)
+        if start_lane is not None and not rotate:
+            with fenced(worker, workspace):
                 out["launch"] = start_lane(out["row"])
     except DeviceConnectError as e:
         if e.status == "worker_retired":

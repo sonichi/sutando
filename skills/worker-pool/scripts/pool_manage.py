@@ -106,13 +106,15 @@ def _not_self(wid: str, force: bool) -> None:
 
 
 def _outstanding(workspace, wid) -> list:
-    """Owed task ids, via the supervisor's own reading of what a worker owes."""
+    """Owed task ids, via the supervisor's own reading of what a worker owes: its owed sentinels and,
+    on (or switching to) its own folders, the unanswered tasks in its own inbox (`sup.own_inbox_owed`)."""
     owed = sup.work_outstanding(workspace, wid)
     if owed is None:
         raise Refused(f"cannot tell what {wid} still owes (deliveries or results unreadable)")
     if not owed:
         return []
-    return sorted(t for t, _ in _owed_residue(workspace, wid))
+    own = [t for t, _f in sup.own_inbox_owed(workspace, wid)]
+    return sorted(set(t for t, _ in _owed_residue(workspace, wid)) | set(own))
 
 
 def _owed_residue(workspace, wid):
@@ -182,8 +184,11 @@ def retire(workspace, target, *, unbind=False, hand_off=False, runner=subprocess
     """Fence, then take down, then hand off, then drop bindings. The fence (roster state
     `retired`, which the router re-checks under the delivery lock) comes first, so no
     new or replayed task can commit to the worker once the owed set is read."""
+    import connections
     wid, _ = _worker(workspace, target)
     _not_self(wid, False)
+    # Read before the identity goes: the row names the worker's own folders.
+    own_dirs = connections.worker_target_dirs(wid, Path(workspace))
     rooms = pr.rooms_bound_to(pr.load_bindings(workspace), wid)
     if rooms and not unbind:
         raise Refused(str(pr.WorkerBound(wid, rooms)) + " (or pass --unbind)")
@@ -212,9 +217,13 @@ def retire(workspace, target, *, unbind=False, hand_off=False, runner=subprocess
                            "paused, owning it: re-run retire --hand-off, or enable"}
         moved = {"handed_off": [], "kept": {}}
     _, _, _, unbound = pr.set_worker_state(workspace, wid, "retired", unbind=unbind)
+    identity = _retire_identity(workspace, wid, tell=tell)
+    if hand_off and own_dirs:
+        # After its lane is gone, so nothing lands in its own inbox once this has read it.
+        own = pd.hand_off_own_inbox(Path(workspace), wid, sup.own_inbox_owed(workspace, wid, own_dirs))
+        moved = {"handed_off": moved["handed_off"] + own["handed_off"], "kept": {**moved["kept"], **own["kept"]}}
     return {**base, "result": "retired", "unbound": unbound,
-            "handed_off": moved["handed_off"], "kept": moved["kept"],
-            "identity": _retire_identity(workspace, wid, tell=tell),
+            "handed_off": moved["handed_off"], "kept": moved["kept"], "identity": identity,
             "pending_approval": _withdraw_approval(workspace, wid, tell=tell)}
 
 

@@ -820,13 +820,18 @@ supervision read `deliveries/<id>/` as before. The router delivers it no new cor
 re-reads the state under the deliveries folder's lock, the lock the switch empties that folder under, so a
 pass that chose the worker before the switch began is `fenced` and the core takes the task. Tasks its own
 lane queued are still delivered there, and the switch takes them before it commits. Supervision
-(`pool_supervise.owed_task_ids`) also counts any owed sentinel still in `deliveries/<id>/` once the worker is
-on its own folders, so reseat, stop and retire never lose sight of work a switch left behind.
+(`pool_supervise.owed_task_ids`) counts both the unanswered tasks in the worker's own tasks folder
+(`pool_supervise.own_inbox_owed`, while it is "migrating" or "own") and any owed sentinel still in
+`deliveries/<id>/`, so reseat, stop and retire never lose sight of work on either side. `pool_manage.py
+retire` refuses a worker owing either, and `retire --hand-off` gives both back to the core: the
+sentinels through `pool_delivery.hand_off_to_core`, and the own-folder tasks, once its lane is gone,
+through `pool_delivery.hand_off_own_inbox` (moved to the shared `tasks/` and touched).
 
 A worker that gets its first own agent moves to its own folders. That covers a new worker whose agent
 `create_worker.py` requests (the default; `--no-identity` opts out) and an existing worker given one by
-`pool_identity.py add`, pasted or `--device-flow`. Both run under the roster fence retirement takes, so a
-worker retired meanwhile gets no identity, no folders and no lane. The switch runs as soon as the agent is
+`pool_identity.py add`, pasted or `--device-flow`. The identity save and the lane start each run under the
+roster fence retirement takes, so a worker retired meanwhile gets neither; the folder switch between them
+runs outside it, since its handler passes can take minutes. The switch runs as soon as the agent is
 saved, before its lane first starts and before the seat restarts as that agent, through the same
 `worker_lane.migrate_dirs` as `--apply` below, so work already in `deliveries/<id>/` moves or is handed back
 as described there. The add reports `dirs` as `own`; as `migrating` when the switch could not finish (a

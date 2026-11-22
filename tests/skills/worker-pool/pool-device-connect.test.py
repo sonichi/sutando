@@ -532,6 +532,43 @@ class OwnDirs(Base):
         self.assertIsNone(C.worker_dirs(W, self.ws))
         self.assertEqual(len(starts), 1)
 
+    def test_the_folder_switch_runs_without_holding_the_roster_fence(self):
+        import fcntl
+        import pool_roster as pr
+        import worker_lane
+        real, free = worker_lane.migrate_dirs, []
+
+        def switch(worker, ws, **kw):
+            with open(pr._lock_path(ws), "a+") as fh:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    free.append(True)
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except BlockingIOError:
+                    free.append(False)
+            return real(worker, ws, **kw)
+        with unittest.mock.patch.object(worker_lane, "migrate_dirs", switch):
+            out = self.connect(ConnectFake(self.backend), start_lane=lambda row: {"ok": True})
+        self.assertEqual((free, out["dirs"]["state"]), ([True], "own"))
+
+    def test_a_worker_retired_during_the_folder_switch_gets_no_lane(self):
+        import pool_roster as pr
+        import worker_lane
+        real, starts = worker_lane.migrate_dirs, []
+
+        def switch_then_retire(worker, ws, **kw):
+            got = real(worker, ws, **kw)
+            # A retire waits on the fence: a thread, so a fence still held here cannot hang the test.
+            retire = threading.Thread(target=pr.set_worker_state, args=(ws, W, "retired"),
+                                      kwargs={"keep_bindings": True}, daemon=True)
+            retire.start()
+            retire.join(5)
+            return got
+        with unittest.mock.patch.object(worker_lane, "migrate_dirs", switch_then_retire), \
+                self.assertRaises(dc.DeviceConnectError) as e:
+            self.connect(ConnectFake(self.backend), start_lane=lambda row: starts.append(row) or {"ok": True})
+        self.assertEqual((e.exception.status, starts), ("worker_retired", []))
+
     def test_a_switch_that_raises_is_reported_and_never_raised(self):
         import worker_lane
         with unittest.mock.patch.object(worker_lane, "migrate_dirs", side_effect=RuntimeError("boom")):
