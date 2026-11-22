@@ -48,7 +48,12 @@ but only `agy acp` is supported here.
 The turn's final message is what Sparrow posts: as the reply in the message's thread for a message
 (`event_type` `room.mention` or absent), or as the post an event's body asks for (`room.joined`,
 `commons.summon`, any other well-formed type). A final message of exactly `NO_REPLY` posts nothing.
-The text is posted with every delivery marker (attachment, redirect, skip, thread) neutralised. When a
+The owner's text keeps its delivery markers, as a Claude Code or Codex result does: a first line
+`[channel: !room:server]` posts in that room, `[thread]` answers in a thread of its own, and
+`[file: <path>]` attaches a file, but only a regular file under the working directory (rewritten to its
+absolute path; any other is neutralised and said not attached). Anyone else's text is posted with every
+delivery marker (attachment, redirect, skip, thread) neutralised, so a non-owner cannot make the agent post
+in another room or attach a file. When a
 turn fails, a message gets a line saying why (timeout, Antigravity stopped, not signed in) with any
 partial text; an event posts nothing. There is no reply command: the final message is the only answer
 path.
@@ -68,19 +73,29 @@ it (a key, a kind, a path), so they are kept locally. Each task's record in `sta
 `detail` (the stop reason), `permissions` (each request's title, category and why it was allowed or
 refused), `updates` (the turn's `session/update`s counted by type) and `answer_chars`.
 
+## What people send
+
+The files the bridge downloaded for the message (its attested `attachments:` header) go with the turn:
+each PNG, JPEG, GIF or WebP of at most 5 MB (known by its first bytes) as an ACP image block in the
+prompt, when agy declares `promptCapabilities.image` (agy 1.5.13 does). On the owner's turn (Team's too) each file is
+also copied, read-only (0400 in a 0500 folder of the turn's own, removed after it), and the folder is
+passed as `additionalDirectories` when agy declares it; the policy grants reads there and refuses every
+change. Only that task's files are copied, never the bridge's media folder. A non-owner's isolated turn gets
+the images only: no folder, and its deny-all rules stay.
+
 ## Tiers and permissions
 
-The tier is read only from the task's parsed headers, which the gateway stamps, never from the message
-text: a `collaborator: true` or `access_tier: owner` line in the body changes nothing.
+The tier is the shared `task_io.turn_policy`'s, from the attested headers only (a tier claimed in the
+message body changes nothing); the adapter only maps its verdict to a turn (`TURNS`):
 
-| Sender | Served | Turn |
+| `turn_policy` verdict | Who | Turn |
 | --- | --- | --- |
-| owner | always | the owner's turn |
-| Team (an attested collaborator: the team tier with the broker's `collaborator: true`) | always | the owner's turn |
-| guest (any other sender, the team tier without that stamp and an unknown tier included) | always, as Sutando answers them | isolated and read-only |
+| owner | the owner | the owner's turn |
+| collaborator | an attested collaborator (Team: `team` + the broker's `collaborator: true`) | the owner's turn, with a Session of their own per room |
+| restricted | a guest, plain team (no collaborator stamp), any unknown tier | the isolated read-only turn below |
+| refused | (not reached here: every non-owner who is not a collaborator is served restricted, as Sutando answers them) | one refusal line, agy not started |
 
-`--allow-non-owner` is a no-op kept so existing configs parse. `verify` prints `INFO team (attested
-collaborator): served as the owner is …` and `INFO guest and plain team: always served …`.
+No flag is needed for any of them; `--allow-non-owner` still parses and changes nothing.
 
 Every turn runs on the owner's agy sign-in (the Google account and quota in the Keychain): giving someone
 Collaborator access to this agent lets them spend that quota, and their turns may read and edit the
@@ -96,15 +111,22 @@ hand-off to the owner verbatim (`tier_block_lines`). The final reply is scanned 
 **The owner's turn** (the owner and Team, decided by the owner on 2026-11-21) runs in the working
 directory with agy's own home (`~/.gemini`: its settings, rules and context) under the owner's permission
 policy below. The owner resumes the room's Session; each collaborator resumes a Session of their own for
-the room (keyed by their user id), so no one resumes another's conversation.
+the room (keyed by their user id), so no one resumes another's conversation. A collaborator is still framed
+as not the owner.
 
-**A guest's turn** (a guest, plain team or an unknown tier) runs isolated:
+**A restricted turn** (a guest, plain team, an unknown tier) runs isolated:
 
 - a fresh temporary directory per task holds the Session's working directory and a separate agy home,
   passed as `agy acp --gemini-dir <dir>`; that home has only a `settings.json` whose permission rules deny
   every tool (`read_file(*)`, `write_file(*)`, `read_url(*)`, `execute_url(*)`, `download_url(*)`,
   `command(*)`, `mcp(*)`) and no global rules or context; the directory is removed after the turn. `HOME`
   and the rest of the environment are unchanged, so agy finds the sign-in in the Keychain as for the owner;
+- the sender's own attachments to this task (the attested `attachments:` header only, never a path in the
+  message) are copied read-only into `attachments/` in that working directory, and the prompt lists the
+  copies. Only then are file reads moved from deny to ask in that home's rules, and the adapter grants a
+  `read` of exactly those copies, nothing else: not the original under the bridge's media directory, not
+  another task's file, not any other path, and never an edit. A locator that is a symlink, not a regular
+  file, over 25 MB, not the size the header says, or not a local absolute path is not copied;
 - a new Session for every task, never resumed and never recorded in the session store;
 - the Session is put in a read-only mode with `session/set_mode` (`plan`, or a mode named `read-only`),
   picked from the `modes` that `session/new` returns. If agy offers no such mode, or refuses it, the turn
@@ -143,6 +165,14 @@ boundary for the owner's turns: a command can read or write anything the owner's
 For the owner's turns (Team's included), agy applies its own permission rules first (an action they already allow runs
 without asking), and `--dangerously-skip-permissions` makes it run tools without asking; never add that
 flag to an agent others can reach.
+
+**What the policy above covers, and what it does not.** The table governs only the requests agy sends over
+ACP (`session/request_permission`). Native operations agy runs without such a request are decided by the
+owner's own agy settings in `~/.gemini`, not by this adapter. Its built-in web search is one of them: in a
+signed-in check it ran with no ACP request. So the owner and Team turns may use built-in search whatever
+`--allow-owner-shell-web` says (Chi OK'd this scope). The guest turn runs with its own agy home, whose
+deny-all rules are agy's own settings rather than this adapter's ACP policy; whether they also stop built-in
+search has not been verified on a signed-in agy.
 
 Measured against a real agy 1.5.9 (signed out): with `--gemini-dir` an absolute path, agy keeps its app
 data, `settings.json`, logs, conversations and `config/` under that directory, reads the settings file

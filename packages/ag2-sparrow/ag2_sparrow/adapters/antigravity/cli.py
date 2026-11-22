@@ -326,13 +326,12 @@ def verify(args, factory=gc.AcpClient) -> int:
     for key in ("INBOX_DIR", "RESULTS_DIR"):
         cm.check(results, Path(cfg[key]).is_dir(), key.lower().replace("_dir", ""), cfg[key])
     store = cfg.get("SESSION_STORE") or str(Path(cm.work_root(cfg)) / "state" / gc.SESSIONS_NAME)
-    print(f"INFO sessions: {store} (the owner's and each collaborator's resumed per room, never retired; a "
-          "non-owner's turn is a throwaway session)")
-    print("INFO team (attested collaborator): served as the owner is, on the owner's agy account: the working "
-          "directory, agy's own home, the owner's permission policy (read or edit under the working directory, "
-          "no command)")
-    print("INFO guest and plain team: always served, on the owner's agy account, each turn in its own temporary "
-          "directory and agy home, deny-all rules, read-only (plan) mode, no file operations")
+    print(f"INFO sessions: {store} (the owner's and each collaborator's resumed per room, never retired; any "
+          "other non-owner's turn is a throwaway session)")
+    print("INFO team (attested collaborator): the owner's turn, on the owner's agy account: the working directory, "
+          "agy's own home, the owner's permission policy")
+    print("INFO guests, plain team and unknown tiers: served, each turn in its own temporary directory and agy "
+          "home, deny-all rules, read-only (plan) mode, no file operations")
     print("INFO owner shell and web: " + ("on (--allow-owner-shell-web): the owner's turns may run commands and "
                                           "fetch or search the web" if cfg.get("ALLOW_OWNER_SHELL_WEB") == "1"
                                           else "off (read and edit under the session cwd only)"))
@@ -372,8 +371,8 @@ def session_options(p) -> None:
     p.add_argument("--mcp-proxy-command", help="the stdio ag2-mcp-proxy command line ('<node> <the desktop app's "
                    "engine/ag2-mcp-proxy.mjs>'): AG2 Space tools for an agy that declares no HTTP MCP")
     p.add_argument("--allow-non-owner", action="store_true",
-                   help="a no-op kept so existing configs parse: guests and plain team are always served, "
-                   "isolated and read-only; an attested collaborator gets the owner's turn")
+                   help="no effect, kept so existing configs parse: an attested collaborator always gets the "
+                   "owner's turn, any other non-owner an isolated read-only one (all on the owner's agy sign-in)")
     p.add_argument("--allow-owner-shell-web", action="store_true",
                    help="let the owner's turns run shell commands and fetch or search the web, as a local Claude "
                    "Code agent may (never a collaborator's or a guest's; default: off)")
