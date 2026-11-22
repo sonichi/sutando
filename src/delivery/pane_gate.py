@@ -507,14 +507,25 @@ def _slash_menu(tail: str, styled_tail: Optional[str], adapter: RuntimeAdapter):
 
 def slash_menu_gate_rows(tail: str, styled_tail: Optional[str] = None,
                          adapter: RuntimeAdapter = CLAUDE) -> List[str]:
-    """Wrapped description lines of a completion list that carry a gate signature and an await
-    hint. Indentation cannot tell such a line from a dialog's, so it is never an answerable
-    gate: callers surface it to a human, and never send a key for it."""
+    """Wrapped description lines of a completion list, per contiguous run, whose run holds a
+    gate signature and an await hint (on one line or split). Indentation cannot tell such a
+    run from a dialog's, so it is never an answerable gate: callers surface it to a human,
+    and never send a key for it."""
     rows, _, _, menu = _slash_menu(tail, styled_tail, adapter)
-    return [rows[i] for i in sorted(menu)
-            if not _SLASH_MENU_ROW.match(_SGR.sub("", rows[i]))
-            and adapter.await_hint.search(rows[i])
-            and any(rx.search(rows[i]) for _, rx in adapter.gate_signatures)]
+    runs: List[List[int]] = []
+    for i in sorted(menu):
+        if _SLASH_MENU_ROW.match(_SGR.sub("", rows[i])):
+            continue
+        if runs and runs[-1][-1] == i - 1:
+            runs[-1].append(i)
+        else:
+            runs.append([i])
+    out: List[str] = []
+    for run in runs:
+        text = "\n".join(rows[i] for i in run)
+        if adapter.await_hint.search(text) and any(rx.search(text) for _, rx in adapter.gate_signatures):
+            out.extend(rows[i] for i in run)
+    return out
 
 
 def gate_evidence(tail: str, styled_tail: Optional[str] = None,

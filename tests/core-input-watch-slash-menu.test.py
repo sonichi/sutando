@@ -92,6 +92,25 @@ class TestWhatStillCounts(unittest.TestCase):
                 self.assertEqual(state, "blocked-human")
                 self.assertIsNone(_mod.answer_step(state, kind, prompt, None))
 
+    def test_a_split_line_dialog_under_a_menu_row_escalates_to_a_human(self):
+        # Title and key line apart: the run holds both, so a human sees it and no key is sent.
+        row = "plus optional rule tweaks\n"
+        for title, keys in (("Do you want to proceed?", "Enter to confirm · Esc to cancel"),
+                            ("Do you want to allow this action?", "↑/↓ to navigate")):
+            with self.subTest(title):
+                block = " " * 41 + title + "\n" + " " * 41 + keys + "\n"
+                pane = MENU.replace(row, row + block, 1)
+                self.assertIn(block, pane)
+                kind, excerpt = _mod.classify(pane)
+                self.assertEqual(kind, "unknown")
+                self.assertIn(title, excerpt)
+                self.assertIn(keys, excerpt)
+                state, _detail, prompt, kind = _mod.compose_state(pane, "idle", True, styled_pane=pane)
+                self.assertEqual(state, "blocked-human")
+                self.assertIsNone(_mod.answer_step(state, kind, prompt, None))
+                verdict = _mod._pg_classify_pane(pane, _mod.CLAUDE)
+                self.assertEqual((verdict.state, verdict.reason), ("busy", "unlisted"))
+
     def test_known_gap_accept_hint_indented_under_menu_row_is_not_flagged(self):
         # A real dialog drawn this way would be missed; this pins it so a change is noticed.
         row = "plus optional rule tweaks\n"
