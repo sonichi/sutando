@@ -926,6 +926,36 @@ def main() -> int:
     check(hb2.get("status") == "idle" and "step" not in hb2,
           "idle status sends no step (avoids stale 'what it was doing')")
 
+    # core_recovery.v1: the adapter injects the reader of state/core-recovery.json (its one owner,
+    # src/core_recovery_state.py); the beat carries the record as health.recovery, absent -> omitted.
+    import core_recovery_state as _crs
+    _rec = json.loads((Path(__file__).resolve().parent.parent / "contracts" / "core_recovery.v1"
+                       / "heartbeat.json").read_text())["health"]["recovery"]
+    _crs.publish(rtc.WS, _rec)
+    STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
+    rtc._post_heartbeat(set(), force=True)
+    hbr = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    check((hbr.get("health") or {}).get("recovery") == _rec
+          and "core_recovery.v1" in hbr.get("capabilities", []),
+          "the adapter's reader puts state/core-recovery.json on the heartbeat as health.recovery")
+    (rtc.WS / "state" / "core-recovery.json").unlink()
+    STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
+    rtc._post_heartbeat(set(), force=True)
+    hbr = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    check("recovery" not in (hbr.get("health") or {}) and "core_recovery.v1" not in hbr.get("capabilities", []),
+          "no record file -> no recovery field and no capability")
+    import worker_lane as _wl
+    _lane_dirs = _wl.lane_dirs
+    _wl.lane_dirs = lambda ws, inst: (Path(tmp, "wtasks"), Path(tmp, "wresults"), True)
+    try:
+        _wspec = importlib.util.spec_from_file_location("rtc_worker_lane", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _wrtc = importlib.util.module_from_spec(_wspec)
+        _wspec.loader.exec_module(_wrtc)
+    finally:
+        _wl.lane_dirs = _lane_dirs
+    check(_wrtc._CORE_RECOVERY_READER is None and rtc._CORE_RECOVERY_READER is not None,
+          "a pool worker's lane carries no core recovery record; the core's lane does")
+
     # SECURITY / robustness: core-status.json is written by another process and
     # may be malformed. _read_core_status runs in the main loop BEFORE the poll,
     # so it MUST NOT raise (else it stalls task delivery). Regression for the

@@ -15,26 +15,28 @@ failed gets a line saying so; an event that failed posts nothing. The gateway's 
 
 The task's own attachments (acp_host.task_media) go with the turn: images as prompt image blocks, for every
 served tier; on the owner's turn (an attested collaborator's included) also a read-only copy of each file in a
-folder of the turn's own, which the policy lets agy read and never change. An isolated turn gets no folder.
+folder of the turn's own, which the policy lets agy read and never change. An isolated turn gets no folder,
+and only the sender's own attachments (`own_attachment_headers`): never a replied-to member's.
 
 Sessions, the permission policy and the framing are acp_host's: the owner may read or edit under the working
-directory; with --allow-owner-shell-web the owner's own turns may also run commands and fetch or search the
-web (SHELL_AND_WEB_TIERS, read from the sender's tier: the owner only; never a collaborator or a guest).
-task_io.admission decides the tier. The owner and an attested collaborator (Team in s.space) are served, both
-in the same turn: the working directory, agy's own home, the owner's read/edit permission policy, a Session of
-their own resumed per room. As Sutando answers every other sender in a read-only sandbox, a guest, plain team
-and any unknown tier are always served, isolated: a fresh temporary directory per task holds its working
-directory and its own agy home (`--gemini-dir`, with deny-all permission rules and no global context), its
-Session is new and never stored, and it is refused unless agy offers a read-only (plan) session mode and
-accepts it. --allow-non-owner is a no-op kept so existing configs parse. Every turn runs on the owner's agy
-sign-in. The gateway's Sutando tier block is written for a core that writes results/<task>.txt and can run
-`codex exec`; `tier_block_lines` says those steps as this Session can follow them and keeps every rule.
-Stdlib only.
+directory, no command is granted; with --allow-owner-shell-web the owner's turns, and an attested collaborator's,
+may also run commands and fetch or search the web (SHELL_AND_WEB_KINDS; never plain team or a guest).
+The tier is task_io.turn_policy's alone, mapped by TURNS: the owner and an attested collaborator (Team) get
+the owner's turn (the working directory, agy's own home, the owner's permission policy, a Session of their
+own per room); a restricted sender (a guest, plain team, any unknown tier) is always served, as Sutando
+answers every non-owner in a read-only sandbox, in an isolated turn: a fresh temporary directory per task
+holds its working directory and its own agy home (`--gemini-dir`, with deny-all permission rules and no
+global context), its Session is new and never stored, and it is refused unless agy offers a read-only (plan)
+session mode and accepts it; a refused verdict is refused. --allow-non-owner still parses and changes
+nothing. The gateway's Sutando tier
+block is written for a core that writes results/<task>.txt and can run `codex exec`; `tier_block_lines` says
+those steps as this Session can follow them and keeps every rule. Stdlib only.
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -47,14 +49,16 @@ import time
 import uuid
 from pathlib import Path
 
-from ... import acp_host, held_start, mcp_auth, result_labels, result_publish
+from ... import (acp_host, connector_cards, held_start, local_task_protocol, mcp_auth, result_labels,
+                 result_publish)
+from ...bounded_file_read import read_regular_bytes
 from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore, quoted, trigger_of  # noqa: F401
 from ...acp_client import AcpClient as _SharedClient
 from ...relay_loop import count_arg
 from ...team_guardrail import SANDBOXED_DELEGATION_CODEX
-from ...task_io import (NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock, admission, exit_code,
-                        exit_on_sigterm, holder_consumer, load_done, make_dirs, parse_task, record_done,
-                        release_lock, root_path, stop_requested)
+from ...task_io import (COLLABORATOR, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, RESTRICTED, LockRefused,
+                        acquire_lock, exit_code, exit_on_sigterm, holder_consumer, load_done, make_dirs, parse_task,
+                        record_done, release_lock, root_path, stop_requested, turn_policy)
 
 NAME = "Antigravity"
 DEFAULT_ACP_COMMAND = "agy acp"
@@ -66,15 +70,16 @@ NOT_SIGNED_IN = ("Antigravity is not signed in on this computer (%s): run `agy` 
                  "or run `agy acp --login`")
 
 
-# Sender tiers (headers["access_tier"]) whose turns may run commands and use the web, under --allow-owner-shell-web.
-# Team is left out on purpose, even on the owner's turn: adding it is the owner's decision.
-SHELL_AND_WEB_TIERS = frozenset({"owner"})
 # agy's own file-tool argument names (path, plain data, nested edits), as its tool schemas declare them.
 AGY_KEYS = (frozenset({"Path", "TargetFile", "AbsolutePath"}),
             frozenset({"Content", "Overwrite", "Append", "Target", "Replacement", "AllowMultiple", "StartLine",
                        "EndLine", "CodeContent", "TargetContent", "ReplacementContent", "Instruction",
                        "Description", "toolAction", "toolSummary"}),
             frozenset({"Edits", "ReplacementChunks"}))
+# turn_policy's verdict -> the turn this adapter runs; a verdict not here (refused) is refused. Chi's rule: an
+# attested collaborator gets the owner's turn.
+OWNER_TURN, ISOLATED_TURN = "owner", "isolated"
+TURNS = {OWNER: OWNER_TURN, COLLABORATOR: OWNER_TURN, RESTRICTED: ISOLATED_TURN}
 
 OWNER_MARKERS = ("Your final message may use Sparrow's delivery markers: [file: /absolute/path] on a line of its "
                  "own attaches that file (only a file under %s is sent); a first line [channel: !room:server] posts "
@@ -85,18 +90,27 @@ GUEST_REFUSED = "it answers non-owners only in a read-only session mode, and %s"
 # agy evaluates Deny > Ask > Allow, and deny rules apply in every mode.
 GUEST_SETTINGS = {"agentMode": "plan", "permissions": {"allow": [], "ask": [], "deny": [
     "read_file(*)", "write_file(*)", "read_url(*)", "execute_url(*)", "download_url(*)", "command(*)", "mcp(*)"]}}
-# Who gets the AG2 Space MCP server as this agent (owners' rule, 2026-11-21): the owner and Team, an attested
-# collaborator (`task_io.admission`, as #6645 serves them). Anyone else gets none and `mcp(*)` stays denied.
-SSPACE_ADMISSIONS = frozenset({"owner", "collaborator"})
+READ_ASK = "read_file(*)"
+ATTACHMENTS_DIR = "attachments"
+MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+MAX_ATTACHMENTS = 16
+_UNSAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
+# Who gets the AG2 Space MCP server as this agent (owners' rule, 2026-11-21): turn_policy's owner and attested
+# collaborator (Team) verdicts. Anyone else gets none and `mcp(*)` stays denied.
+SSPACE_KINDS = frozenset({OWNER, COLLABORATOR})
+# turn_policy verdicts whose turns may run commands and use the web, under --allow-owner-shell-web: the owner and
+# an attested collaborator, as claude-local and codex-local give a collaborator the owner's tools.
+SHELL_AND_WEB_KINDS = frozenset({OWNER, COLLABORATOR})
 
 
-def sspace_tools_for(headers):
-    return admission(headers, True) in SSPACE_ADMISSIONS
+def sspace_tools_for(headers, kind=None):
+    """`kind`, the task's one turn_policy verdict, when the caller already has it (else it is decided here)."""
+    return (turn_policy(headers, allow_non_owner=True).kind if kind is None else kind) in SSPACE_KINDS
 
 
-def sspace_grant(headers):
+def sspace_grant(headers, kind=None):
     """The server tool names this sender's shim may list and call: what `mcp_grant` lets the policy allow."""
-    return mcp_auth.OWNER_TOOLS if sspace_tools_for(headers) else frozenset()
+    return mcp_auth.OWNER_TOOLS if sspace_tools_for(headers, kind) else frozenset()
 
 
 MINT_TIMEOUT_S = 30.0
@@ -309,30 +323,116 @@ def publish(result_file, body):
     result_publish.publish_text(result_file, body)
 
 
+# The bridge's label for a file fetched from the sender's own message; a replied-to one says "(from replied-to …)".
+OWN_MEDIA_RE = re.compile(r"\[(?:Photo|File) attached: ([^\]\n]+)\]")
+REPLY_BLOCK_RE = re.compile(r"\[[^\]\n]* reply context;")   # any product's opener: broader fails closed
+
+
+def own_media_paths(message):
+    """The local paths the bridge labelled as the sender's own media in `message`: outside the broker's quoted
+    reply-context block only. A reply block that does not parse gives none (fail closed)."""
+    reply, rest = local_task_protocol.split_reply_context(message or "")
+    if reply is None and REPLY_BLOCK_RE.search(message or ""):
+        return frozenset()
+    return frozenset(m.group(1).strip() for m in OWN_MEDIA_RE.finditer(rest))
+
+
+def own_attachment_headers(headers, message):
+    """`headers` with its `attachments:` list cut to the entries `own_media_paths(message)` shows are the
+    sender's own, for a restricted turn's media; none when origin cannot be shown."""
+    own = own_media_paths(message)
+    refs = [r.as_dict() for r in local_task_protocol.parse_attachments(headers) if r.locator in own]
+    out = {k: v for k, v in (headers or {}).items() if k != "attachments"}
+    if refs:
+        out["attachments"] = json.dumps(refs)
+    return out
+
+
+def stage_own_attachments(headers, dest, max_bytes=None, log=lambda *a: None, message=""):
+    """Copy the files this task's sender attached into `dest` as read-only copies; return their real paths. A
+    file is the sender's only when it is in the attested `attachments:` header AND the bridge labelled it as the
+    sender's own media in `message` (`own_media_paths`); quoted reply media, or any entry whose origin cannot be
+    shown so, is skipped. So is a locator that is not a local absolute path, a symlink, not a regular file, over
+    `max_bytes`, or not the size the header says. TODO(#6670): dedupe with the shared stage_own_attachments."""
+    limit = MAX_ATTACHMENT_BYTES if max_bytes is None else max_bytes
+    own = own_media_paths(message)
+    staged = []
+    for i, ref in enumerate(local_task_protocol.parse_attachments(headers)[:MAX_ATTACHMENTS]):
+        src = ref.locator
+        if src not in own:
+            log("attachment skipped (not shown to be the sender's own)")
+            continue
+        if not os.path.isabs(src):
+            log("attachment skipped (not a local path)")
+            continue
+        data, why = read_regular_bytes(src, limit, follow=False)
+        if data is None or (ref.size and ref.size != len(data)):
+            log("attachment skipped (%s)" % (why or ("missing" if data is None else "size differs")))
+            continue
+        if not staged:
+            os.mkdir(dest, 0o700)
+        name = "%d-%s" % (i, _UNSAFE_NAME.sub("_", os.path.basename(ref.filename or src))[:80] or "attachment")
+        path = os.path.join(dest, name)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o400)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        staged.append(os.path.realpath(path))
+    return staged
+
+
+def guest_settings(readable):
+    """GUEST_SETTINGS, with file reads moved from deny to ask when there are attachments to read: agy then asks
+    for every read, and the adapter grants only the staged copies (`readable_only`)."""
+    if not readable:
+        return GUEST_SETTINGS
+    perms = GUEST_SETTINGS["permissions"]
+    deny = [r for r in perms["deny"] if r != READ_ASK]
+    return dict(GUEST_SETTINGS, permissions=dict(perms, ask=[READ_ASK], deny=deny))
+
+
+def readable_only(readable, cwd):
+    """decide_permission's own_file hook for an isolated turn: exactly the staged copies (a relative path is
+    resolved against the turn's working directory)."""
+    allowed = frozenset(readable)
+    return lambda raw: acp_host.resolved(cwd, raw) in allowed
+
+
 @contextlib.contextmanager
-def guest_turn(args):
-    """An `acp_host.Isolated` for one non-owner task: a new 0700 temporary directory holding the Session's
-    working directory and agy's home (`--gemini-dir`, GUEST_SETTINGS only), removed after the turn."""
+def guest_turn(args, headers=None, message=""):
+    """(an `acp_host.Isolated` for one restricted task, the paths it may read): a new 0700 temporary directory
+    holding the Session's working directory, the sender's own attachments copied into it, and agy's home
+    (`--gemini-dir`, deny-all settings but asked reads when there is an attachment), removed after the turn."""
     base = os.path.realpath(tempfile.mkdtemp(prefix=GUEST_PREFIX))
     try:
         home, cwd = os.path.join(base, "agy"), os.path.join(base, "cwd")
         os.makedirs(os.path.join(home, "antigravity-cli"), mode=0o700)
         os.mkdir(cwd, 0o700)
+        readable = stage_own_attachments(headers or {}, os.path.join(cwd, ATTACHMENTS_DIR), log=log,
+                                         message=message)
         settings = os.path.join(home, "antigravity-cli", "settings.json")
         fd = os.open(settings, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(GUEST_SETTINGS, f)
+            json.dump(guest_settings(readable), f)
         yield acp_host.Isolated(argv=list(args.acp_argv) + ["--gemini-dir", home], cwd=cwd,
                                 env=dict(args.child_env),
                                 choose_mode=lambda modes: acp_host.pick_mode(modes, READ_ONLY_MODES),
-                                refused=GUEST_REFUSED)
+                                refused=GUEST_REFUSED), readable
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
 
-def shell_web_on(args, headers):
-    """This turn may run commands and fetch or search the web: the install opted in, and the sender is the owner."""
-    return bool(getattr(args, "allow_owner_shell_web", False)) and headers.get("access_tier") in SHELL_AND_WEB_TIERS
+def turn_for(headers):
+    """(turn_policy's kind, the turn to run: OWNER_TURN, ISOLATED_TURN or None for refused), from the attested
+    headers only. Every non-owner who is not a collaborator is served restricted (allow_non_owner=True)."""
+    kind = turn_policy(headers, allow_non_owner=True).kind
+    return kind, TURNS.get(kind)
+
+
+def shell_web_on(args, headers, kind=None):
+    """This turn may run commands and fetch or search the web: the install opted in, and turn_policy's verdict
+    (`kind` when the caller has it) is the owner or an attested collaborator, from the attested headers only."""
+    return bool(getattr(args, "allow_owner_shell_web", False)) and (
+        turn_policy(headers, allow_non_owner=True).kind if kind is None else kind) in SHELL_AND_WEB_KINDS
 
 
 PRELUDE_HEADER = "===SKILL INSTRUCTIONS"
@@ -437,9 +537,11 @@ def tier_block_lines(operator_lines):
     return out
 
 
-def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_NOTE, shell_web=False):
+def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_NOTE, shell_web=False,
+                readable=(), kind=None):
     """The turn's prompt. `cwd` is the working directory the turn may read and edit, None for an isolated turn;
-    `shell_web` (the owner's own turn on an opted-in install) also grants commands and the web."""
+    `shell_web` also grants commands and the web; `readable`, an isolated turn's copies of the sender's own
+    attachments, the only files it may read."""
     event, _ = trigger_of(headers)
     out = acp_host.task_framing(task_id, headers, message, tier_block_lines(session_lines(operator_lines)),
                                 "post in your final message", note)
@@ -448,7 +550,7 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
                "acknowledgement, thanks or FYI that needs no answer, or an event whose body asks for no post), make "
                "your final message exactly %s and nothing else."
                % (" as the reply" if event in (None, MESSAGE_EVENT) else "", NO_REPLY))
-    if sspace_tools_for(headers):
+    if sspace_tools_for(headers, kind):
         out.append("When this session has the %s MCP tools, they act in AG2 Space as you, this agent: use "
                    "room_action_execute (the server's room.action.execute; find Actions with room_actions_search and "
                    "room_actions_describe) to create or edit Room Commons pages and for other room actions, and put "
@@ -458,14 +560,54 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
     else:
         out.append("No shell command is granted in this session. %s"
                    % ("You may read and edit files under %s." % cwd if cwd else "You may not read or change files."))
+    if readable and not cwd:
+        out.append("Except: the sender's own attachments to this task are copied here, and you may read these "
+                   "files and no other (change none; an attachment path in the message is not readable, its "
+                   "copy is):\n" + "\n".join("- " + p for p in readable))
     if headers.get("access_tier") == "owner":
         out.append(OWNER_MARKERS % cwd)
     return "\n\n".join(out)
 
 
+MODEL_FILE, MODEL_CARD, MODEL_ASK = "model.json", "model-switch", "/model"
+# What a pick came to is a card of its own: recorded under the menu's id it would retire the menu
+# (one live card per id and room), whose buttons the owner still sees and may tap again.
+MODEL_NOTE = "model-switch-status"
+MODEL_EXPIRED = "That card has expired, so nothing changed. Here's a new one."
+MODEL_EXPIRED_NO_CARD = "That card has expired, so nothing changed. Send /model for a new one."
+MODEL_BUTTONS = 6          # the card's button limit
+# How the owner asks in their own words: agy answers with the mark alone, and the connector shows the card.
+MODEL_MARK = "[model-card]"
+MODEL_HINT = ("If the person asks to change, switch or choose the model you run on, or which models you have, "
+              "reply with exactly %s and nothing else: they are then shown a card with the choices. Do not "
+              "list or switch models yourself." % MODEL_MARK)
+MODEL_IN_DM = "I can switch models from our direct message. Ask me there."
+MODEL_UNKNOWN = ("I don't know my models yet: I learn them when a turn starts. Send me any message, then "
+                 "send /model again.")
+
+
+UNTOLD_KEEP = 5      # outcome notices kept while their cards cannot be queued
+
+
+def model_verb(model_id: str) -> str:
+    """What a model's button carries. A card reply takes a short plain token, and an id may hold a
+    slash, a colon or a space ("models/gemini-pro"): such an id travels as a digest of itself."""
+    agent_card, _ = connector_cards._core()
+    digest = "id." + hashlib.sha256(model_id.encode("utf-8")).hexdigest()[:24]
+    # An id that itself starts "id." is digested too, so no id can be another id's digest.
+    if model_id.startswith("id."):
+        return digest
+    try:
+        agent_card.reply("model", "agent", model_id)
+        return model_id
+    except ValueError:
+        return digest
+
+
 class Connector:
     def __init__(self, args, client_factory=AcpClient, note=None, proxy_entry=stdio_entry):
         self.args = args
+        self.root = os.path.dirname(args.state) or "."
         self.client_factory = client_factory
         self.proxy_entry = proxy_entry
         self.launch = None   # (status file, turn id) of this turn's stdio launcher, when one was offered
@@ -474,6 +616,191 @@ class Connector:
         self.name = NAME
         self.retry_at = {}
 
+    # ── the model: what agy offers, what the owner picked, and the card that picks ──
+
+    def model_state(self) -> dict:
+        try:
+            with open(os.path.join(self.args.state, MODEL_FILE), encoding="utf-8") as f:
+                state = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        return state if isinstance(state, dict) else {}
+
+    def save_model_state(self, **changes):
+        state = dict(self.model_state(), **changes)
+        path = os.path.join(self.args.state, MODEL_FILE)
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(state, f, sort_keys=True)
+        os.replace(path + ".tmp", path)
+
+    def models_seen(self, models: dict):
+        """Remember what a Session offered (ACP `models`), for the card; only ids and names are kept."""
+        offered = [{"id": str(m.get("modelId") or "")[:200], "name": str(m.get("name") or m.get("modelId") or "")[:80]}
+                   for m in (models.get("availableModels") or []) if isinstance(m, dict) and m.get("modelId")]
+        seen = {"available": offered, "current": str(models.get("currentModelId") or "")[:200]}
+        if {k: self.model_state().get(k) for k in seen} != seen:
+            self.save_model_state(**seen)
+
+    def model_card(self, state: dict, picked: str = "", ran: "str | None" = None, same: bool = False):
+        """(body, card): one reply button per model agy offered. After a pick (`picked`) the card has no
+        buttons: it says the switch is coming, then, with `ran` (the model the next turn ran on), that
+        it happened or that it did not; with `same`, that the pick is the model already in use."""
+        agent_card, issued_cards = connector_cards._core()
+        names = {m["id"]: m["name"] for m in state.get("available") or []}
+        now = state.get("current") or ""
+        if picked:
+            name = names.get(picked, picked)
+            if same:
+                return agent_card.build(MODEL_NOTE, "done", title="Model", body="Model: already %s" % name,
+                                        text="I'm already using %s. Nothing changed." % name)
+            if ran is None:
+                return agent_card.build(MODEL_NOTE, "info", title="Model", body="Model: switching to %s" % name,
+                                        text="Switching to %s on your next message. I'll confirm here once it has "
+                                             "switched." % name)
+            if ran == picked:
+                return agent_card.build(MODEL_NOTE, "done", title="Model", body="Model: now %s" % name,
+                                        status="Switched", text="Switched. I'm now using %s." % name)
+            return agent_card.build(MODEL_NOTE, "error", title="Model", body="Model: could not switch to %s" % name,
+                                    text="I could not switch to %s. I'm still using %s. Send /model to try again."
+                                         % (name, names.get(ran, ran or "my default model")))
+        buttons = [agent_card.button(name, "reply", reply="Use %s" % name,
+                                     command=agent_card.reply("model", "agent", model_verb(mid)))
+                   for mid, name in list(names.items())[:MODEL_BUTTONS]]
+        # The menu says when it stops acting (the time its record is kept), so the app can show it expired.
+        return agent_card.build(MODEL_CARD, "pending", title="Model", body="Pick a model for %s" % self.name,
+                                text="Now using %s." % names.get(now, now or "the default model"), buttons=buttons,
+                                expires_at_ms=int((time.time() + issued_cards.TTL_S) * 1000))
+
+    def post_card(self, room, built) -> bool:
+        if built is None:
+            return False
+        try:
+            connector_cards.queue(self.args.bridge_state, str(room or ""), *built)
+            return True
+        except (OSError, ValueError) as e:
+            log("model card not queued:", "%s: %s" % (type(e).__name__, e))
+            return False
+
+    def card_task(self, task_id, headers, path, result_file):
+        """The record of a task that was a card matter (a tap, or the owner's /model in their DM), else
+        None: a tap never reaches the model, and a tap this agent cannot match gets the fixed line."""
+        agent_card, _ = connector_cards._core()
+        # The card rules read the task as the core does (the trusted header parse), not this connector's.
+        with open(path, encoding="utf-8") as f:
+            sent, said = agent_card.reply_words(f.read())
+        verdict = connector_cards.click(sent, said, self.root)
+        state, outcome = self.model_state(), ""
+        if verdict.verdict == agent_card.COMMAND and verdict.command.kind == "model":
+            verb = verdict.command.verb
+            named = {m["id"] for m in state.get("available") or [] if model_verb(m["id"]) == verb}
+            # One model per button: a verb that names none, or more than one, picks nothing.
+            picked = named.pop() if len(named) == 1 else ""
+            if picked not in [m["id"] for m in state.get("available") or []]:
+                publish(result_file, quoted("That model is not one I can use now. Send /model for the current list.") + "\n")
+                outcome = "model-unknown"
+            elif picked == str(state.get("wanted") or state.get("current") or ""):
+                # Nothing new to switch. Only a model a turn has run on is "in use": a pick no turn has
+                # applied yet is still coming, and may yet be refused.
+                applied = not state.get("wanted") or state.get("told") == picked
+                room, card = str(sent.get("channel_id") or ""), self.model_card(state, picked=picked, same=applied)
+                publish(result_file, "[no-send] the model card answers\n" if self.post_card(room, card)
+                        else quoted(card[1]["text"]) + "\n")
+                outcome = "model-same" if applied else "model-pending"
+            else:
+                room = str(sent.get("channel_id") or "")
+                self.save_model_state(wanted=picked, asked_in=room, told="")
+                coming = self.model_card(state, picked=picked)
+                publish(result_file, "[no-send] the model card answers\n" if self.post_card(room, coming)
+                        else quoted(coming[1]["text"]) + "\n")
+                outcome = "model-picked"
+        elif (verdict.verdict == agent_card.FORGED and agent_card.owner_may_act(sent) is None
+              and (agent_card.card_click(sent) or {}).get("card_id") == MODEL_CARD):
+            # The owner tapped a model card this agent no longer keeps (a newer one replaced it, it is
+            # past its time, or an earlier install posted it): say so and show the current one.
+            outcome = self.expired_card(sent, state, result_file)
+        elif verdict.verdict in (agent_card.COMMAND, agent_card.FORGED):
+            publish(result_file, quoted(verdict.say) + "\n")
+            outcome = "card-refused"
+        elif said.lower() == MODEL_ASK and agent_card.owner_may_act(sent) is None:
+            outcome = self.offer_models(sent, result_file)
+        if not outcome:
+            return None
+        log("card ->", task_id, outcome)
+        return {"task": task_id, "status": "completed", "detail": outcome, "tier": headers["access_tier"], "card": outcome}
+
+    def menu(self, state):
+        """The card with the buttons, or None when it cannot be built (a name the card rules refuse):
+        the ask is then answered in words, never left to raise and be retried."""
+        try:
+            return self.model_card(state)
+        except ValueError as e:
+            log("model card not built:", str(e)[:200])
+            return None
+
+    def expired_card(self, sent, state, result_file) -> str:
+        """Answer a tap on a model card that no longer acts: the words, and a fresh card when one can be shown."""
+        try:
+            fresh = bool(state.get("available")) and self.post_card(sent.get("channel_id"), self.menu(state))
+        except ValueError:
+            fresh = False
+        publish(result_file, quoted(MODEL_EXPIRED if fresh else MODEL_EXPIRED_NO_CARD) + "\n")
+        return "model-card-expired"
+
+    def offer_models(self, sent, result_file) -> str:
+        """Answer the owner's ask with the model card (or the line saying why there is none)."""
+        state = self.model_state()
+        if not state.get("available"):
+            publish(result_file, quoted(MODEL_UNKNOWN) + "\n")
+        elif self.post_card(sent.get("channel_id"), self.menu(state)):
+            publish(result_file, "[no-send] the model card answers\n")
+        else:
+            publish(result_file, quoted("I could not post the model card. Try again in a moment.") + "\n")
+        return "model-card"
+
+    def asked_for_models(self, headers, path, status, text, result_file) -> str:
+        """agy answered the owner with the mark alone: show the card in their DM, or say where to ask.
+        '' for any other answer, and for any sender but the owner, whose mark is then ordinary text."""
+        if status != "completed" or (text or "").strip() != MODEL_MARK or headers.get("access_tier") != "owner":
+            return ""
+        agent_card, _ = connector_cards._core()
+        with open(path, encoding="utf-8") as f:
+            sent, _ = agent_card.reply_words(f.read())
+        if agent_card.owner_may_act(sent) is None:
+            return self.offer_models(sent, result_file)
+        publish(result_file, quoted(MODEL_IN_DM) + "\n")
+        return "model-card-elsewhere"
+
+    def tell_model_outcome(self, turn) -> str:
+        """After an owner turn that opened a Session: settle the pick it ran with, then say in the DM each
+        outcome not yet told, oldest first. The model state is settled whatever happens to the telling
+        (a switch agy refused is dropped, never asked for again); a notice whose card cannot be queued
+        stays owed, the newest UNTOLD_KEEP of them. '' when there was nothing to settle or tell."""
+        state = self.model_state()
+        kept = state.get("untold")
+        owed = [o for o in (kept if isinstance(kept, list) else [kept]) if isinstance(o, dict)]
+        wanted, outcome, changes = str(state.get("wanted") or ""), "", {}
+        if wanted and state.get("told") != wanted and turn.live:
+            ran = turn.model or ""
+            outcome = "switched" if ran == wanted else "not-switched"
+            owed.append({"picked": wanted, "ran": ran, "room": state.get("asked_in")})
+            # The model the turn ran on is the one in use, whatever a resumed Session reports of itself.
+            changes = dict(told=wanted, current=ran or state.get("current") or "",
+                           **({} if outcome == "switched" else {"wanted": ""}))
+        told = ""
+        while owed:
+            first = owed[0]
+            try:
+                card = self.model_card(state, picked=str(first.get("picked") or ""), ran=str(first.get("ran") or ""))
+            except ValueError:
+                card = None         # a notice that cannot be drawn is dropped, not kept in the way
+            if card is not None and not self.post_card(first.get("room"), card):
+                break
+            owed.pop(0)
+            told = "switched" if first.get("picked") == first.get("ran") else "not-switched"
+        owed = owed[-UNTOLD_KEEP:]
+        if changes or owed != ([] if kept is None else kept):
+            self.save_model_state(untold=owed, **changes)
+        return "untold" if owed else (outcome or told)
     def sspace_servers(self, init, tools=frozenset()):
         """An owner's or team turn's MCP servers: AG2 Space as this agent, over stdio through --mcp-proxy-command
         under the shim, which lists and forwards only `tools`. Never over HTTP, where nothing filters the
@@ -500,34 +827,51 @@ class Connector:
         self.launch = (status, turn)
         return [entry]
 
-    def run_turn(self, task_id, headers, prompt, owner):
+    def run_turn(self, task_id, headers, prompt, owner, isolated=None, kind=None, message=""):
         """(status, text, detail, turn): status is completed | cancelled | timeout | gone | failed | refused.
-        With `owner` (the owner's or an attested collaborator's turn) it resumes the sender's Session for the room
-        in the working directory, under the owner's policy; any other runs `guest_turn`."""
+        With `owner` (TURNS' owner turn: the owner's or a collaborator's) it resumes the sender's Session for the
+        room in the working directory, under the owner's policy; any other runs `isolated` (guest_turn's pair),
+        opening one when not given, where only reads of the staged attachments are granted."""
         if owner:
-            cwd, tools = self.args.cwd, shell_web_on(self.args, headers)
+            cwd, tools = self.args.cwd, shell_web_on(self.args, headers, kind)
+            # The owner's pick is applied on the owner's own turn, never on a collaborator's, which
+            # shares this turn mode: "on your next message" is the owner's next message.
+            picked = self.model_state().get("wanted") if (kind or turn_for(headers)[0]) == OWNER else ""
             with acp_host.task_media(headers, readable=True, log=log) as media:
                 read_only = (media.folder,) if media.folder else ()
                 return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
                                            lambda params: acp_host.decide_permission(params, True, cwd, tools=tools,
                                                                                       extra_keys=AGY_KEYS,
                                                                                       read_only=read_only,
-                                                                                      **self.mcp_grant(headers)),
+                                                                                      **self.mcp_grant(headers, kind)),
                                            self.store, STDERR_NAME, NOT_SIGNED_IN, log, media=media,
-                                           mcp_servers=self.mcp_servers_for(headers))
-        with guest_turn(self.args) as isolated, acp_host.task_media(headers, readable=False) as media:
-            return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
-                                       lambda params: acp_host.decide_permission(params, False, isolated.cwd,
-                                                                                  extra_keys=AGY_KEYS),
-                                       self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=isolated, media=media)
+                                           model=str(picked or "") or None,
+                                           on_models=self.models_seen,
+                                           mcp_servers=self.mcp_servers_for(headers, kind))
+        if isolated is None:
+            with guest_turn(self.args, headers, message) as pair:
+                return self.run_turn(task_id, headers, prompt, False, pair, message=message)
+        turn, readable = isolated
+        own = readable_only(readable, turn.cwd)
+
+        def decide(params):
+            tc = params.get("toolCall") if isinstance(params.get("toolCall"), dict) else {}
+            return acp_host.decide_permission(params, False, turn.cwd, extra_keys=AGY_KEYS,
+                                              own_file=own if tc.get("kind") == "read" else None,
+                                              own_file_reason="the sender's own attachment")
+        # Images only: the prompt already lists the staged copies this turn may read.
+        with acp_host.task_media(own_attachment_headers(headers, message), readable=False) as media:
+            return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt, decide,
+                                       self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=turn,
+                                       media=acp_host.Media(images=media.images))
 
     @staticmethod
-    def mcp_grant(headers):
+    def mcp_grant(headers, kind=None):
         """The policy's MCP grant for this sender: the AG2 Space tools for the owner and Team, else none."""
-        return {"mcp_tool_ok": mcp_auth.owner_tool_ok} if sspace_tools_for(headers) else {}
+        return {"mcp_tool_ok": mcp_auth.owner_tool_ok} if sspace_tools_for(headers, kind) else {}
 
-    def mcp_servers_for(self, headers):
-        tools = sspace_grant(headers)
+    def mcp_servers_for(self, headers, kind=None):
+        tools = sspace_grant(headers, kind)
         return (lambda init: self.sspace_servers(init, tools)) if tools else None
 
     def answer_body(self, headers, status, text, detail, turn=None):
@@ -563,24 +907,33 @@ class Connector:
         path = os.path.join(self.args.inbox, name)
         result_file = os.path.join(self.args.results, name)
         headers, message, operator_lines = parse_task(path)
-        # As Sutando, a guest, plain team or unknown tier is served read-only (guest_turn) with no opt-in; a wire
-        # `team` without the collaborator stamp is a guest too (fail closed).
-        tier = admission(headers, allow_non_owner=True)
-        if tier is None:
+        kind, turn_kind = turn_for(headers)
+        if turn_kind is None:
             log("refused (non-owner) ->", task_id, headers["access_tier"])
             publish(result_file, NON_OWNER_REFUSED)
-            return {"task": task_id, "status": "refused", "tier": headers["access_tier"]}
-        # Team (an attested collaborator) gets the owner's turn; `tier` now names the turn, headers["access_tier"]
-        # the sender (so shell_web_on stays off for Team). Any other admitted sender gets `guest_turn`.
-        if tier == "collaborator":
-            tier = "owner"
-        prompt = wake_prompt(task_id, headers, message, operator_lines, self.args.cwd if tier == "owner" else None,
-                             self.note, shell_web=tier == "owner" and shell_web_on(self.args, headers))
+            return {"task": task_id, "status": "refused", "tier": headers["access_tier"], "policy": kind}
+        owner_turn = turn_kind == OWNER_TURN
+        carded = self.card_task(task_id, headers, path, result_file)
+        if carded:
+            return carded
         event, _ = trigger_of(headers)
         log("wake ->", task_id, headers["access_tier"], event or "message")
         t0 = time.time()
         self.launch = None
-        status, text, detail, turn = self.run_turn(task_id, headers, prompt, tier == "owner")
+        if owner_turn:
+            prompt = wake_prompt(task_id, headers, message, operator_lines, self.args.cwd, self.note,
+                                 shell_web=shell_web_on(self.args, headers, kind), kind=kind)
+            if headers.get("access_tier") == "owner":
+                prompt += "\n\n" + MODEL_HINT
+            status, text, detail, turn = self.run_turn(task_id, headers, prompt, True, kind=kind)
+        else:
+            with guest_turn(self.args, headers, message) as pair:
+                prompt = wake_prompt(task_id, headers, message, operator_lines, None, self.note, readable=pair[1],
+                                     kind=kind)
+                status, text, detail, turn = self.run_turn(task_id, headers, prompt, False, pair, message=message)
+        # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
+        told = self.tell_model_outcome(turn) if kind == OWNER else ""
+        asked = self.asked_for_models(headers, path, status, text, result_file)
         body = self.answer_body(headers, status, text, detail, turn)
         reason = ""
         if self.launch is not None:
@@ -594,11 +947,13 @@ class Connector:
             log("ag2-space MCP tools:", seen)
         if reason and acp_host.is_message(headers) and not body.startswith("[no-send]"):
             body = body.rstrip("\n") + "\n\n" + TOOLS_DOWN % reason + "\n"
-        publish(result_file, body)
+        if not asked:
+            publish(result_file, body)
         return {"task": task_id, "status": status, "detail": detail[:200], "event_type": event,
-                "tier": headers["access_tier"], "isolated": tier != "owner", "turn_s": round(time.time() - t0, 3),
+                "tier": headers["access_tier"], "policy": kind, "isolated": not owner_turn, "turn_s": round(time.time() - t0, 3),
                 "permissions": turn.decisions, "updates": dict(turn.updates), "answer_chars": len(text or ""),
-                "sspace_tools_down": reason}
+                "sspace_tools_down": reason,
+                "model": turn.model, **({"model_switch": told} if told else {}), **({"card": asked} if asked else {})}
 
     def pending_tasks(self, seen):
         now = time.time()
@@ -615,6 +970,8 @@ class Connector:
         done = 0
         idle_since = time.time()
         while not stop_requested():
+            with contextlib.suppress(Exception):   # a card's ledger entry never stops task service
+                connector_cards.absorb(self.args.bridge_state, self.root)
             names = self.pending_tasks(seen)
             if not names:
                 if self.args.once and done >= self.args.once:
@@ -650,6 +1007,8 @@ def build_parser():
     ap.add_argument("--root-fd", type=int, default=None, help="with --held: the held root's directory descriptor")
     ap.add_argument("--acp-command", default=None, help="the ACP agent's command line (default: agy acp)")
     ap.add_argument("--cwd", default=None, help="the Session working directory (default: the current directory)")
+    ap.add_argument("--bridge-state", default=None, help="the bridge's state dir, where the model card is queued for "
+                    "posting (default: <work>.bridge/state)")
     ap.add_argument("--token-env-file", default=None,
                     help="the agent's own token .env (its bridge's): owner and team turns get the ag2-space MCP "
                          "tools as this agent, minted from it per turn (default: no MCP tools)")
@@ -660,11 +1019,11 @@ def build_parser():
     ap.add_argument("--session-store", default=None,
                     help="the sessions.json to resume from and record to (default: <work>/state/sessions.json)")
     ap.add_argument("--allow-non-owner", action="store_true",
-                    help="a no-op kept so existing configs parse: guests and plain team are always served, "
-                         "isolated and read-only; an attested collaborator gets the owner's turn")
+                    help="no effect, kept so existing configs parse: an attested collaborator always gets the "
+                         "owner's turn, any other non-owner an isolated read-only one (all on the owner's agy sign-in)")
     ap.add_argument("--allow-owner-shell-web", action="store_true",
-                    help="let the owner's turns run shell commands and fetch or search the web (never a "
-                         "collaborator's or a guest's; default: off)")
+                    help="let the owner's turns, and an attested collaborator's, run shell commands and fetch or "
+                         "search the web (never plain Team's or a guest's; default: off)")
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=0.2)
@@ -679,6 +1038,8 @@ def _prepare(args):
     if not args.acp_argv:
         raise SystemExit("--acp-command is empty")
     args.cwd = os.path.abspath(os.path.expanduser(args.cwd or os.getcwd()))
+    args.bridge_state = os.path.abspath(os.path.expanduser(
+        getattr(args, "bridge_state", None) or os.path.join(args.work.rstrip(os.sep) + ".bridge", "state")))
     args.child_env = dict(os.environ)
 
 

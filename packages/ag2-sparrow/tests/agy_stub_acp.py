@@ -8,8 +8,8 @@ has been measured yet. Its sign-in, session
 and log files live under $HOME (the one variable the launcher's allowlist always passes): `signed-in` marks it
 signed in, `stub-sessions.json` keeps its sessions, `stub.log` records each request and permission outcome.
 A prompt marker picks the turn: STUB:TEXT, STUB:NOREPLY, STUB:MARKER, STUB:EDIT, STUB:SHELL, STUB:WEB,
-STUB:AGYWRITE, STUB:ODD, STUB:HANG, STUB:MEDIA (asks to read every attachment it is told of, and to change one),
-STUB:CHANNEL, STUB:ATTACH. STUB:AGYWRITE's rawInput carries agy's own argument names (Path, Content,
+STUB:AGYWRITE, STUB:READ, STUB:ODD, STUB:HANG, STUB:ASKMODEL, STUB:MEDIA (asks to read every attachment it is told
+of, and to change one), STUB:CHANNEL, STUB:ATTACH. STUB:AGYWRITE's rawInput carries agy's own argument names (Path, Content,
 Overwrite; Target, Replacement, Edits) as its file tools declare them; the key order (Content first) is the one
 a real owner turn's refusal named ("unrecognised key Content").
 `initialize` declares agy 1.5.13's captured `promptCapabilities` (image) and `sessionCapabilities`
@@ -36,6 +36,13 @@ HOME = os.environ.get("HOME", "")
 STATE = os.path.join(HOME, "stub-sessions.json")
 LOG = os.path.join(HOME, "stub.log")
 _next = [1000]
+
+
+# ACP's `models` on session/new, with ids as `agy models` prints them (assumed shape: the ACP schema's
+# SessionModelState; no signed-in agy has been asked yet).
+MODELS = {"currentModelId": "gemini-3.8-flash-medium",
+          "availableModels": [{"modelId": "gemini-3.8-flash-medium", "name": "Gemini 3.8 Flash"},
+                              {"modelId": "claude-opus-4-6-thinking", "name": "Claude Opus 4.6"}]}
 
 
 def log(rec):
@@ -133,6 +140,9 @@ def prompt(rid, params):
         send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {
             "sessionUpdate": "tool_call", "toolCallId": "c-file", "title": "File " + told.group(1), "kind": "edit"}}})
         ask(sid, {"title": "File " + told.group(1), "kind": "edit", "rawInput": {"Content": "hello"}})
+    elif "STUB:ASKMODEL" in text:
+        # What agy is told to answer when asked about its model, provided the hint reached it.
+        chunk(sid, "[model-card]" if "reply with exactly [model-card]" in text else "no hint")
     elif "STUB:NOREPLY" in text:
         chunk(sid, "NO_REPLY")
     elif "STUB:MEDIA" in text:
@@ -175,6 +185,14 @@ def prompt(rid, params):
         ask(sid, {"title": "File notes.txt (unknown key)", "kind": "edit",
                   "rawInput": {"Content": "x", "Path": inside, "Mystery": "?"}})
         chunk(sid, "wrote")
+    elif "STUB:READ" in text:
+        # Asks to read each copy the prompt lists ("- /path" lines), then each path written after the marker.
+        paths = re.findall(r"^- (/\S+)$", text, re.M) + re.search(r"STUB:READ((?: /\S+)*)", text).group(1).split()
+        for path in paths:
+            if ask(sid, {"title": "Read " + path, "kind": "read", "locations": [{"path": path}]}):
+                with open(path, encoding="utf-8") as f:
+                    chunk(sid, "read %s: %s\n" % (os.path.basename(path), f.read()))
+        chunk(sid, "done reading")
     elif "STUB:ODD" in text:
         for kind in ("delete", "move", "other", "think", None):
             ask(sid, {"title": "odd %s" % kind, "kind": kind, "locations": [{"path": os.path.join(cwd, "a")}]})
@@ -296,7 +314,14 @@ def main():
             result = {"sessionId": sid}
             if not os.path.exists(os.path.join(HOME, "no-modes")):
                 result["modes"] = MODES
+            if os.path.exists(os.path.join(HOME, "models")):
+                result["models"] = MODELS
             send({"jsonrpc": "2.0", "id": rid, "result": result})
+        elif method == "session/set_model":
+            if os.path.exists(os.path.join(HOME, "set-model-fails")):
+                send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "unknown model"}})
+            else:
+                send({"jsonrpc": "2.0", "id": rid, "result": {}})
         elif method == "session/set_mode":
             if os.path.exists(os.path.join(HOME, "set-mode-fails")):
                 send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "mode not allowed"}})

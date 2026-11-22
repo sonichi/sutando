@@ -578,6 +578,7 @@ class Turn:
 
     def __init__(self):
         self.live = False
+        self.model = ""
         self.chunks = []
         self.decisions = []
         self.updates = collections.Counter()
@@ -626,8 +627,27 @@ def pick_mode(modes, wanted):
     return None
 
 
+def use_model(client, session_id, wanted, models, on_models, timeout, log):
+    """Hand the Session's model list (ACP `models`: availableModels, currentModelId) to `on_models` and
+    switch the Session to `wanted` with `session/set_model`; the model id now set, '' when the agent
+    names none. A refused switch is logged and the turn runs on the Session's own model."""
+    state = models if isinstance(models, dict) else {}
+    current = str(state.get("currentModelId") or "")
+    if on_models and state:
+        on_models(state)
+    if wanted and wanted != current:
+        try:
+            client.call("session/set_model", {"sessionId": session_id, "modelId": wanted}, timeout)
+            return wanted
+        except (AcpTimeout, AcpGone):
+            raise
+        except AcpError as e:
+            log("session/set_model refused; the turn runs on", current or "the agent's own model", "-", str(e)[:200])
+    return current
+
+
 def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, stderr_name, not_signed_in, log,
-               isolated=None, media=None, mcp_servers=None):
+               isolated=None, model=None, on_models=None, media=None, mcp_servers=None):
     """One task's turn: spawn `args.acp_argv`, `initialize`, resume the task's Session (else open one), send one
     `session/prompt` and wait for it to stop. `decide(params) -> (allowed, reason, result)` answers each
     permission request. (status, text, detail, turn): status is completed | cancelled | timeout | gone | failed
@@ -667,11 +687,11 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
         key = session_key(headers, task_id)
         rec = None if isolated else store.get(key)
         servers = list(mcp_servers(init) or []) if mcp_servers is not None else []
-        session_id, turns = None, 0
+        session_id, turns, opened = None, 0, None
         if rec and rec.get("cwd") == cwd and loadable:
             try:
-                client.call("session/load", dict({"sessionId": rec["session_id"], "cwd": cwd, "mcpServers": servers},
-                                                 **extra), args.turn_timeout)
+                opened = client.call("session/load", dict({"sessionId": rec["session_id"], "cwd": cwd,
+                                                           "mcpServers": servers}, **extra), args.turn_timeout)
                 session_id, turns = rec["session_id"], int(rec.get("turns") or 0)
                 turn.resumed, turn.session_id = True, session_id
                 log("resumed session", session_id, "for", key)
@@ -693,6 +713,8 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
                     return "refused", "", isolated.refused % refused, turn
         if not isolated:
             store.remember(key, session_id, cwd, turns + 1)
+            turn.model = use_model(client, session_id, model, (opened or {}).get("models"), on_models,
+                                   args.rpc_timeout, log)
         turn.live = True
         note = media.note(bool(images)) if media else ""
         params = {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt}] + images
