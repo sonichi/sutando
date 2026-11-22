@@ -64,3 +64,31 @@ overrides.
 Python comes from `sutando-config.sh python-bin`, never bare `python3`. The core-side entry
 `scripts/switch-model.sh` only execs this script. An owner message like "switch model to opus" is
 handled by running it; the dashboard's Quota tile shows the model the proxy then sees.
+
+## The model card (`scripts/model_card.py`)
+
+When the owner asks in their DM which model the core is on, or asks to change it without naming one,
+post the menu: `python3 skills/model-switch/scripts/model_card.py post --room <the DM's room id>
+[--reply-to <their message's event id>]` (`--print` shows it without posting). It has one button per
+model (Opus, Sonnet, Fable, Default) and names the model in use, read only from
+`<workspace>/state/model-switch.json`; with no record it says "the default model". It goes only to the
+owner's checked DM. `status` prints the same reading as JSON.
+
+A tap is matched by the core's one command (CLAUDE.md, "Card clicks"); when it prints `run:
+skills/model-switch/scripts/model_card.py reply`, run that with `--task-file <task file>`:
+
+- `{"status": "started", "event_id": …}`: the switch was started detached (`switch-model.sh <alias>
+  --confirm --accept-timeout 180`; the CLI takes `/model` once this turn ends) and a card already says
+  "Switching the core to X; it takes effect after this turn. I'll confirm here once it has switched.".
+  Write `[no-send]` and end the turn. Without `event_id` the card could not be posted: send `say`.
+- `{"status": "say", "say": …}`: the tapped model is the one in use ("I'm already using X. Nothing
+  changed."); say that line.
+- `forged_or_stale_click`, `owner_words`, `other_card`, `not_a_card`, `refused`, `failed`: as in
+  `skills/agent-cards/SKILL.md`.
+
+The detached line always ends in `model_card.py settle --room <DM> --model <alias> --rc <the switch's
+exit code>`, which posts the outcome in the same DM: "Switched. I'm now using X." on exit 0, else "I
+could not switch to X. I'm still using Y." and one short reason for the exit code (5 unsent text in the
+input box, 8 not accepted in time, 3 the core is not running, and so on; an unknown code is "the switch
+did not finish"). The menu, the "switching" answer and the outcome carry one card id, and each newer
+one retires the older one's buttons. Output of the detached line: `<workspace>/logs/model-card.log`.
