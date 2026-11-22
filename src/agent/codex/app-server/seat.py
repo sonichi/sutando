@@ -88,6 +88,15 @@ def present(path: Path) -> bool:
     return True
 
 
+def generation(path) -> Optional[tuple]:
+    """What tells one file from another written under the same name; None when it is not there."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
 def log(*parts) -> None:
     """One line to stdout (the terminal panel) and, when the launcher names one, the seat's log file."""
     line = " ".join([time.strftime("%H:%M:%S"), *[str(p) for p in parts]])
@@ -215,7 +224,7 @@ class Watcher:
         self.inbox, self.wake, self.script, self.restart_s = inbox, wake, script, restart_s
         self.p: Optional[subprocess.Popen] = None
         self.started_at = 0.0
-        self.announced: set = set()
+        self.announced: dict = {}
 
     def alive(self) -> bool:
         return self.p is not None and self.p.poll() is None
@@ -241,8 +250,9 @@ class Watcher:
     def _reader(self, p: subprocess.Popen) -> None:
         for line in p.stdout:
             if line.startswith("TASK_FILE: "):
-                # A basename, or an absolute path when the inbox is resolved.
-                self.announced.add(os.path.basename(line[len("TASK_FILE: "):].strip()))
+                # A basename, or an absolute path when the inbox is resolved; kept with its generation.
+                name = os.path.basename(line[len("TASK_FILE: "):].strip())
+                self.announced[name] = generation(os.path.join(self.inbox, name))
                 self.wake.set()
 
     def stop(self) -> None:
@@ -282,6 +292,7 @@ class Seat:
         self.wake = threading.Event()
         self.watcher: Optional["Watcher"] = None
         self.held_logged = False
+        self.changed_logged: set = set()
         self.deferred: dict = {}
         self.staged: set = set()
         self.unsettled: dict = {}
@@ -336,16 +347,20 @@ class Seat:
             self.rpc.close()
         self.rpc, self.thread_id = None, None
 
-    def ensure_server(self) -> None:
-        """A live child with the seat's thread open. One failure is retried after a backoff; a second
-        in a row, with no completed turn between them, is fatal."""
+    def ensure_server(self) -> bool:
+        """A live child with the seat's thread open; True when this call had to start one. One
+        failure is retried after a backoff; a second in a row, with no completed turn between
+        them, is fatal."""
+        started = False
         while self.rpc is None or not self.rpc.alive() or not self.thread_id:
             self.close_server()
+            started = True
             try:
                 self.start_server()
             except (RuntimeError, OSError, KeyError, TypeError) as e:
                 self.close_server()
                 self.server_failed(f"app-server did not start: {one_line(e, 200)}")
+        return started
 
     def server_failed(self, why: str) -> None:
         self.failures += 1
@@ -447,8 +462,22 @@ class Seat:
         """
         watcher = self.watcher
         if watcher is not None and watcher.alive():
-            watcher.announced.intersection_update({p.name for p in Path(self.host.inbox).glob("*.txt")})
-            return [n for n in names if n in watcher.announced]
+            current = {p.name: generation(p) for p in Path(self.host.inbox).glob("*.txt")}
+            for name in [n for n in list(watcher.announced) if n not in current]:
+                watcher.announced.pop(name, None)
+            mine = []
+            for name in names:
+                if name not in watcher.announced:
+                    continue
+                if watcher.announced[name] is None:
+                    watcher.announced[name] = current.get(name)
+                if watcher.announced[name] == current.get(name):
+                    mine.append(name)
+                elif name not in self.changed_logged:
+                    self.changed_logged.add(name)
+                    log(f"task {name}: held, the file changed after the watcher announced it; it is the "
+                        "core's again once the watcher announces what is there now")
+            return mine
         state = self.workspace / "state"
         if present(state / "shutdown.sentinel"):
             why = "a shutdown is in progress"
@@ -461,9 +490,9 @@ class Seat:
             log(f"{len(names)} pending task(s) held: {why}")
         return []
 
-    def still_owed(self, filename: str) -> bool:
-        """Whether a task picked before a reconnect is still this seat's and still unanswered."""
-        return any(name == filename for name, _ in self.pending())
+    def still_owed(self, filename: str, picked: Optional[tuple]) -> bool:
+        """Whether the task this seat picked is still its own, unanswered, and the same file."""
+        return any(name == filename and generation(path) == picked for name, path in self.pending())
 
     # ---- per-task records: what happened to a turn that ended without a result ----
 
@@ -641,15 +670,17 @@ class Seat:
             self.deferred[filename] = self.clock() + self.retry_s
             return "deferred"
         log(f"task {filename}: picked")
+        picked = generation(payload)
         prompt = self.prompt_for(filename, payload)
         started = time.monotonic()
         status, detail = "server-exited", ""
         for attempt in (1, 2):
-            self.ensure_server()
+            started_server = self.ensure_server()
             if self.stop_requested(filename):
                 status, detail = STOPPED, "a Stop opened before the turn was dispatched"
                 break
-            if attempt > 1 and not self.still_owed(filename):
+            # Starting a server takes long enough for the task to be answered, taken or replaced.
+            if (attempt > 1 or started_server) and not self.still_owed(filename, picked):
                 status, detail = WITHDRAWN, "answered or no longer this seat's when the server came back"
                 break
             status, detail = self.run_turn(filename, prompt)

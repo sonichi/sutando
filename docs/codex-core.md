@@ -511,9 +511,13 @@ holds what the watcher would hold, and says so once: everything while a shutdown
 a workspace known to declare none has nothing to route, and there the core polls as before.
 A worker seat's inbox is already the routing decision and is read directly.
 
+An announcement is for the file that was there, not for its name: a task file replaced under
+the same name is held until the watcher announces what is there now.
+
 When the app-server child exits mid-turn the seat restarts it and retries the task once, on the
-same thread. Before that second `turn/start` it reads the queue again: a task that has been
-answered meanwhile is settled as done, and one that is no longer this seat's is left alone.
+same thread. Whenever a server had to be started before a `turn/start`, on the first attempt
+or the retry, the seat reads the queue again first: a task answered meanwhile is settled as
+done, and one that is no longer this seat's, or no longer the same file, is left alone.
 
 The terminal panel shows the seat's log: one line per task, turn, command and tool call. The
 same lines go to `<workspace>/logs/codex-seat.log` (a worker: `codex-seat-<session>.log`).

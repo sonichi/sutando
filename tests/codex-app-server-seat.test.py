@@ -720,6 +720,39 @@ class Crash(SeatCase):
         self.assertIn("not started again", self.out.getvalue())
         self.assertFalse(task_dispatch.has_ready_result(self.results, "task-1.txt"))
 
+    def test_a_file_put_under_the_tasks_name_while_the_server_is_restarted_is_not_run_as_that_task(self):
+        self.task("task-1.txt")
+        self.plan("die", "result")
+        s = self.make()
+        s.ensure_server()
+        failed = s.server_failed
+
+        def replaced_meanwhile(why):
+            failed(why)
+            other = self.task("task-1.txt.new", "task: something else entirely\n", folder=self.ws)
+            os.replace(other, self.tasks / "task-1.txt")
+
+        s.server_failed = replaced_meanwhile
+        self.assertEqual(s.step(), seat_mod.WITHDRAWN)
+        self.assertEqual(len(self.sent("turn/start")), 1, "the prompt built for the first file is not sent again")
+
+    def test_a_task_answered_or_taken_while_the_server_first_starts_is_not_dispatched(self):
+        for name, meanwhile in (
+                ("task-1.txt", lambda: (self.results / "task-1.txt").write_text("answered\n", encoding="utf-8")),
+                ("task-2.txt", lambda: (self.tasks / "task-2.txt").unlink())):
+            self.task(name)
+            s = self.make()
+            start = s.start_server
+
+            def started_slowly(start=start, meanwhile=meanwhile):
+                start()
+                meanwhile()
+
+            s.start_server = started_slowly
+            self.assertEqual(s.step(), "done" if name == "task-1.txt" else seat_mod.WITHDRAWN)
+            self.assertEqual(self.sent("turn/start"), [], name)
+            s.close_server()
+
     def test_a_child_that_dies_twice_stops_the_seat_and_the_task_is_not_lost(self):
         self.task("task-1.txt")
         self.plan("die", "die")
@@ -1121,6 +1154,10 @@ class WatcherChild(SeatCase):
             time.sleep(0.02)
         self.assertIn(name, s.watcher.announced)
 
+    def announce_again(self, s, name: str):
+        s.watcher.announced.pop(name, None)
+        self.announce(s, name)
+
     def test_the_core_runs_a_task_only_once_the_watcher_announces_it(self):
         # The task file lands a moment before the pool's router gives it to a worker. Read straight
         # from the inbox, the core ran it and so did the worker: two answers to one message.
@@ -1144,6 +1181,24 @@ class WatcherChild(SeatCase):
         self.assertTrue(task_dispatch.has_ready_result(self.results, "task-core.txt"))
         self.assertFalse(task_dispatch.has_ready_result(self.results, "task-bound.txt"))
 
+    def test_an_announcement_is_for_the_file_that_was_there_not_for_its_name(self):
+        s = self.make()
+        s.ensure_server()
+        s.watcher = self.announcing(s.wake)
+        s.watcher.ensure()
+        self.addCleanup(s.watcher.stop)
+        self.task("task-1.txt")
+        self.announce(s, "task-1.txt")
+        # Another file takes the name before the core gets to it: nothing has routed that one.
+        other = self.task("task-1.txt.new", "task: something else entirely\n", folder=self.ws)
+        os.replace(other, self.tasks / "task-1.txt")
+        self.assertIsNone(s.step())
+        self.assertIsNone(s.step())
+        self.assertEqual(self.out.getvalue().count("the file changed after the watcher announced it"), 1)
+        self.assertEqual(self.sent("turn/start"), [])
+        self.announce_again(s, "task-1.txt")
+        self.assertEqual(s.step(), "done")
+
     def test_an_announcement_naming_a_path_is_kept_by_its_file_name(self):
         s = self.make()
         s.watcher = self.announcing(s.wake)
@@ -1156,13 +1211,13 @@ class WatcherChild(SeatCase):
         # A task that has left the inbox is forgotten with it.
         (self.tasks / "task-1.txt").unlink()
         self.assertEqual(s.pending(), [])
-        self.assertEqual(s.watcher.announced, set())
+        self.assertEqual(s.watcher.announced, {})
         w = seat_mod.Watcher(str(self.tasks), threading.Event(), script=self.script(
             'echo "TASK_FILE: /some/where/task-9.txt"\nexec sleep 300\n'))
         w.ensure()
         self.addCleanup(w.stop)
         self.assertTrue(w.wake.wait(10))
-        self.assertEqual(w.announced, {"task-9.txt"})
+        self.assertEqual(set(w.announced), {"task-9.txt"})
 
     def test_with_no_watcher_a_declared_handler_holds_the_cores_tasks_and_none_declared_does_not(self):
         s = self.make()
