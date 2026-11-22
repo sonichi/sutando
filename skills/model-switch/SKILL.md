@@ -101,7 +101,8 @@ skills/model-switch/scripts/model_card.py reply`, run that with `--task-file <ta
 Each tap is one attempt with its own id (`attempt` in the output): the "switching" card is posted
 before the switch is started, so the outcome can only follow it. The detached line runs the switch
 through `model_card.py turn --attempt <id> -- <the switch>`: switches run one at a time, and only the
-newest accepted attempt's switch runs, so two quick taps end on the model tapped last. It always ends in
+newest accepted attempt's switch runs, so two quick taps end on the model tapped last (an attempt the
+record no longer names is not run, and `settle` then posts nothing for it). It always ends in
 `model_card.py settle --room <DM> --model <model id> --attempt <id> --rc <the switch's exit code>`, which
 saves the outcome in `<workspace>/state/model-card-outcome.json` and then posts it in the same DM: "Switched. I'm now using X." on exit 0, else "I
 could not switch to X. I'm still using Y." and one short reason for the exit code (5 unsent text in the

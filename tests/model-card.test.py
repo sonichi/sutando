@@ -263,16 +263,28 @@ class Tap(Base):
 
         self.assertEqual(settle("17-ab", mc.SKIPPED_RC, "fable")["status"], "superseded")
         self.assertEqual((settle("18-cd", 0, "sonnet")["status"], len(self.fake.calls)), ("posted", sent + 1))
-        # An attempt with no record (too old to be kept) still runs: there is nothing newer to defer to.
+        # An attempt the record does not name is not run: nothing shows it is the newest. Settling it
+        # adds no record and posts no card, so it cannot become "the newest" by being settled.
+        kept, sent = mc.outcomes(self.ws), len(self.fake.calls)
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            self.assertEqual(turn("01-zz", "haiku"), mc.UNKNOWN_RC)
+        self.assertIn("01-zz is not in the record", said.getvalue())
+        rc, out = self.run_(["settle", "--room", DM, "--model", "haiku", "--rc", str(mc.UNKNOWN_RC), "--attempt", "01-zz"])
+        self.assertEqual((rc, out["status"], mc.outcomes(self.ws), len(self.fake.calls)), (1, "skipped", kept, sent))
+        # The same when the record cannot be read at all, even for the attempt that was the newest.
+        path = self.ws.joinpath(*mc.OUTCOMES)
+        good = path.read_text()
+        path.write_text("not json")
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(turn("01-zz", "haiku"), 0)
-        self.assertEqual(ran.read_text().split(), ["sonnet", "haiku"])
+            self.assertEqual(turn("18-cd", "sonnet"), mc.UNKNOWN_RC)
+        path.write_text(good)
+        self.assertEqual(ran.read_text().split(), ["sonnet"])
         # While one switch holds its turn, the next one waits for it.
         slow = self.ws / "slow.sh"
         slow.write_text(f'echo "start $1" >> "{ran}"; sleep 1; echo "end $1" >> "{ran}"\n')
         ran.write_text("")
-        procs = [subprocess.Popen([sys.executable, str(SCRIPT), "--workspace", str(self.ws), "turn", "--attempt", a,
-                                   "--", "bash", str(slow), a], stdout=subprocess.DEVNULL) for a in ("01-xx", "01-yy")]
+        procs = [subprocess.Popen([sys.executable, str(SCRIPT), "--workspace", str(self.ws), "turn", "--attempt", "18-cd",
+                                   "--", "bash", str(slow), name], stdout=subprocess.DEVNULL) for name in ("a", "b")]
         self.assertEqual([p.wait(timeout=30) for p in procs], [0, 0])
         lines = ran.read_text().splitlines()
         self.assertEqual([ln.split()[0] for ln in lines], ["start", "end", "start", "end"], lines)

@@ -96,6 +96,7 @@ DETACHED = ('"$5" "$6" --workspace "$7" turn --attempt "$9" -- '
             '"$5" "$6" --workspace "$7" settle --room "$8" --model "$2" --attempt "$9" --rc $?')
 TURN_LOCK = ("state", "model-card-turn.lock")
 SKIPPED_RC = 75      # `turn` did not run the switch: a newer attempt had been accepted
+UNKNOWN_RC = 76      # `turn` did not run the switch: the record does not name the attempt
 
 
 def _emit(payload: dict, code: int = 0) -> int:
@@ -459,19 +460,28 @@ def cmd_turn(ws: Path, args, *, call=subprocess.call) -> int:
     """Run an attempt's switch in its turn, one at a time, and only while it is the newest accepted
     attempt. Two taps start two detached lines in no fixed order: without this the older switch could
     run last, leaving the core on a model the card does not show (its outcome is superseded and
-    never posted). The command's exit code, or SKIPPED_RC when it was not run."""
+    never posted). The command's exit code; SKIPPED_RC when a newer attempt was accepted; UNKNOWN_RC
+    when the record does not name this attempt (trimmed, or unreadable): nothing then shows it is
+    the newest, so its switch is not run either."""
     from file_lock import locked_file
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     with locked_file(ws.joinpath(*TURN_LOCK)):
         rows = outcomes(ws)
         at = next((i for i, r in enumerate(rows) if r["attempt"] == args.attempt), None)
-        if at is not None and at + 1 < len(rows):
+        if at is None:
+            print(f"model-card: attempt {args.attempt} is not in the record; its switch is not run", flush=True)
+            return UNKNOWN_RC
+        if at + 1 < len(rows):
             print(f"model-card: attempt {args.attempt} is not the newest; its switch is not run", flush=True)
             return SKIPPED_RC
         return int(call(command))
 
 
 def cmd_settle(ws: Path, args, *, core=None, execute=None, now=time.time, sleep=time.sleep) -> int:
+    if args.rc == UNKNOWN_RC:
+        # Settling would add the attempt to the record as the newest one, and post over a newer card.
+        return _emit({"status": "skipped", "attempt": args.attempt, "why": "the attempt is not in the record, so its "
+                      "switch was not run and no card is posted"}, 1)
     out = settle_attempt(ws, args.attempt or new_attempt(now()), args.room, args.model, args.rc, core=core,
                          execute=execute, now=now, sleep=sleep, tries=SETTLE_TRIES, pause=SETTLE_PAUSE_S)
     return _emit(out, 1 if out["status"] == "failed" else 0)
