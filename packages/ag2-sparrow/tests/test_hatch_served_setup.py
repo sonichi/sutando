@@ -805,7 +805,7 @@ print(json.dumps({"lines": lines, "channel": channel}))
         for ch in ("\n", "\t", "\x7f"):
             with self.subTest(ch=repr(ch)):
                 url = f"https://gw.example/relay?enrollment=SECRET{ch}BAD"
-                media = "https://gw.example/relay/media/abc?sig=MEDIASECRET"
+                media = "https://gw.example/relay/v1/media/s.space/abc?room_id=MEDIASECRET"
                 secret_text = " ".join((url, media, "SECRET%0aBAD", "secret%0Abad", repr("SECRET\nBAD")))
                 r = subprocess.run([sys.executable, "-c", PRELUDE + self.PATHS], capture_output=True,
                                    text=True, cwd=str(self.home), timeout=60,
@@ -818,7 +818,7 @@ print(json.dumps({"lines": lines, "channel": channel}))
                                  "the real InvalidURL, driven through run()")
                 logged = "\n".join(out["lines"])
                 self.assertRegex(logged, r"media fetch failed \(URLError contacting "
-                                         r"https://gw\.example/relay/media/abc at <string>:\d+\)")
+                                         r"https://gw\.example/relay/v1/media/s\.space/abc at <string>:\d+\)")
                 self.assertRegex(logged, r"reenroll: claim failed: URLError contacting https://gw\.example/relay at <string>:\d+")
                 self.assertRegex(logged, r"human-action: card post failed \(will retry\): URLError "
                                          r"contacting https://gw\.example/relay at <string>:\d+",

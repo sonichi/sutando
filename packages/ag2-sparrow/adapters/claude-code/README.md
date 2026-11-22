@@ -201,10 +201,34 @@ the key empty or not at all serves collaborators too). The shared policy gives a
 collaborator the owner's capabilities, bounded by the non-owner note and the
 gateway's delivery guard. The session holds the owner's history, tools and
 credentials with permission prompts off. A team or guest task without
-collaborator access gets a restricted turn under the shared policy, which must
-be isolated and read-only; this adapter runs no such turn, so it is refused
-whatever `--allow-non-owner` says (the flag is still persisted, and `verify`
-says it is not honoured). Each submitted non-owner task carries the shared
+collaborator access (a guest, plain team, a wire `team` without the stamp, an
+unknown tier) gets a restricted turn under the shared policy, which must be
+isolated and read-only. By default (`install --no-allow-non-owner` refuses it
+with the owner-only line instead, recorded as `ALLOW_NON_OWNER=0` and shown by
+`verify`; `--allow-non-owner` is still accepted and is the default, and an older
+install that recorded the key empty serves them too) `claim` runs it itself, as the routine and
+cloud-session adapters do (`collaborator_turn.py`), and never submits it to the
+session: one `claude -p --safe-mode --restricted --strict-mcp-config
+--no-session-persistence --tools Read,Grep,Glob` in a fresh empty directory
+removed afterwards, on the agent's own login (the recorded `CLAUDE_CONFIG_DIR`,
+else the session's) with only `PATH`, `HOME`, `USER`, `LANG` and
+`CLAUDE_CONFIG_DIR` in its environment, 120 s at most, at most 10 an hour. It
+loads none of the owner's MCP servers, plugins, hooks, `CLAUDE.md` or settings
+files, and nothing of the session's history. The only files it can read are
+the ones the sender attached to this task: each `attachments:` locator that is
+a regular file (not a symlink) under the bridge's `state/remote-media`, at most
+25 MB, is copied into its directory and the prompt names the copy
+(`collaborator_turn.stage_own_attachments`); the folder itself is never given
+to it. Its prompt is the routine
+adapters' payload (the non-owner note, the body between untrusted markers), with
+the gateway's Sutando tier block said as that turn can follow it (its reply
+text is the result, not `results/<task>.txt`; it is the read-only sandbox, so
+no `codex exec` step; every other rule verbatim). Its reply, made inert, is
+published as the task's result through the lifecycle, so the gateway's
+delivery guard scans it as any non-owner result; a failed or capped turn
+publishes one plain line instead. `claim` answers the Mod with a final
+refusal, so the Mod retires the task: neither the sender's text nor the answer
+ever reaches the owner's session. Each submitted non-owner task carries the shared
 `ag2_sparrow.task_io.NON_OWNER_NOTE`, the one policy text every adapter renders
 (pinned in `register.ts`; a CI test holds it byte-identical to the shared owner):
 
