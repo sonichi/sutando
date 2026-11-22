@@ -146,8 +146,10 @@ only if you trust every attested collaborator of this agent with the owner's acc
 **Upgrading with the switch on.** Before this release the switch was for the owner's turns only. An install
 that already has `ALLOW_OWNER_SHELL_WEB=1` gives the same shell commands and web to every attested
 collaborator of the agent as soon as it is upgraded, without asking the owner again. If that is not what you
-want, turn the switch off before upgrading (reinstall without `--allow-owner-shell-web`), or review who is an
-attested collaborator of this agent first and remove anyone you would not hand the owner's account to.
+want, turn the switch off before upgrading: `uninstall`, then `install` again without
+`--allow-owner-shell-web` (a plain `install --agent <id>` reuses the recorded switch and keeps it on). Or
+review who is an attested collaborator of this agent first and remove anyone you would not hand the owner's
+account to.
 
 For the owner's turns (Team's included), agy applies its own permission rules first (an action they already allow runs
 without asking), and `--dangerously-skip-permissions` makes it run tools without asking; never add that
