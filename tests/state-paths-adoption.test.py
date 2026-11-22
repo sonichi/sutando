@@ -150,6 +150,9 @@ ALLOWLIST = {
     "src/core_lineage.py",
     # roster_membership's "state" is a roster row's field name, not a path; it reads no file.
     "src/roster_membership.py",
+    # the seat's host declaration: "results" and "state" are its JSON keys, and every
+    # directory is the absolute path the launcher wrote there; it resolves no workspace.
+    "src/agent/codex/app-server/supervised_host.py",
     # task_lookup never resolves the workspace: it takes it from its caller and the
     # folders from connections.task_home ("tasks"/"results" are that dict's keys).
     "src/task_lookup.py",

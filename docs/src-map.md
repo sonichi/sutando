@@ -144,7 +144,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`install-health-check-launchd.sh`** — Install / uninstall the launchd-supervised health-check FALLBACK job.
 - **`install-sutando-app-launchd.sh`** — Install / uninstall / check the launchd-supervised Sutando.app job.
 - **`issued_cards.py`** — The agent panel cards this agent itself posted, so a card click counts only as an answer to one of them.
-- **`lane_dedupe.py`** — Cross-lane duplicate guard: one room message becomes one task, answered by its owner lane when known.
+- **`lane_dedupe.py`** — Cross-lane duplicate guard: one room message becomes one task per agent, answered by its owner lane when known.
 - **`launch_hooks.py`** — Launch hooks: the scripts installed skills declare with the manifest field `on_launch`, each started once per core launch, detached, so no launch waits on or fails because of one.
 - **`live-agent-runtime.ts`** — LiveAgentRuntime — step 5a-2 of the interaction-planes refactor.
 - **`local_api_gate.py`** — The one gate for the loopback HTTP services' privileged routes.
@@ -392,6 +392,12 @@ One entry per agent-facing module. 5 without a usable header comment.
 ## `src/agent/codex/`
 
 - **`codex-home.sh`** — Shell adapter for src/codex_home.py, the one owner of the Codex core's home: resolve it, check it, create it only when permitted.
+
+## `src/agent/codex/app-server/`
+
+- **`seat-launch.sh`** — Launcher half of the Codex app-server seat (SUTANDO_CODEX_APP_SERVER=1).
+- **`seat.py`** — One Codex seat (the core, or a pool worker) served over `codex app-server` instead of a TUI.
+- **`supervised_host.py`** — The host declaration a Codex app-server seat is started with: its folders and its stage hook.
 
 ## `src/agent/codex/cli/`
 
