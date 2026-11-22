@@ -13,8 +13,9 @@ prelude (run a room-read command, write results/<task>.txt) is for a core with a
 passed on (`session_lines`). A turn that ends with no text says what it did instead (`no_answer_why`).
 
 Sessions, the permission policy and the framing are acp_host's: the owner may read or edit under the working
-directory; with --allow-owner-shell-web the owner's turns may also run commands and fetch or search the web
-(SHELL_AND_WEB_TIERS: the owner only; never a collaborator or a guest). Only the owner is served unless --allow-non-owner, which admits
+directory; with --allow-owner-shell-web the owner's turns, and an attested collaborator's turn run as the owner's,
+may also run commands and fetch or search the web (shell_web_on; never plain Team or a guest). Only the owner is
+served unless --allow-non-owner, which admits
 attested collaborators and other non-owners alike (task_io.admission decides the tier). A non-owner turn runs
 isolated: a fresh temporary directory per task holds its working directory and its own agy home
 (`--gemini-dir`, with deny-all permission rules and no global context), its Session is new and never stored,
@@ -39,8 +40,8 @@ from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore
 from ...acp_client import AcpClient as _SharedClient
 from ...relay_loop import count_arg
 from ...task_io import (NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock, admission, exit_code,
-                        exit_on_sigterm, holder_consumer, load_done, make_dirs, parse_task, record_done,
-                        release_lock, root_path, stop_requested)
+                        exit_on_sigterm, holder_consumer, is_collaborator, load_done, make_dirs, parse_task,
+                        record_done, release_lock, root_path, stop_requested)
 
 NAME = "Antigravity"
 DEFAULT_ACP_COMMAND = "agy acp"
@@ -53,7 +54,8 @@ NOT_SIGNED_IN = ("Antigravity is not signed in on this computer (%s): run `agy` 
 
 
 # Sender tiers (headers["access_tier"]) whose turns may run commands and use the web, under --allow-owner-shell-web.
-# Team is left out on purpose, even on the owner's turn: adding it is the owner's decision.
+# An attested collaborator (task_io.is_collaborator) is added in shell_web_on, as claude-local and codex-local give
+# a collaborator the owner's tools; plain Team and guests never are.
 SHELL_AND_WEB_TIERS = frozenset({"owner"})
 # agy's own file-tool argument names (path, plain data, nested edits), as its tool schemas declare them.
 AGY_KEYS = (frozenset({"Path", "TargetFile", "AbsolutePath"}),
@@ -107,8 +109,10 @@ def guest_turn(args):
 
 
 def shell_web_on(args, headers):
-    """This turn may run commands and fetch or search the web: the install opted in, and the sender is the owner."""
-    return bool(getattr(args, "allow_owner_shell_web", False)) and headers.get("access_tier") in SHELL_AND_WEB_TIERS
+    """This turn may run commands and fetch or search the web: the install opted in, and the sender is the owner or
+    a collaborator the broker attested (the parsed headers only, never message text)."""
+    return bool(getattr(args, "allow_owner_shell_web", False)) and (
+        headers.get("access_tier") in SHELL_AND_WEB_TIERS or is_collaborator(headers))
 
 
 PRELUDE_HEADER = "===SKILL INSTRUCTIONS"
@@ -307,8 +311,8 @@ def build_parser():
                     help="serve non-owner senders, attested collaborators included, on the owner's agy sign-in "
                          "(no file operations granted; default: the owner only)")
     ap.add_argument("--allow-owner-shell-web", action="store_true",
-                    help="let the owner's turns run shell commands and fetch or search the web (never a "
-                         "collaborator's or a guest's; default: off)")
+                    help="let the owner's turns, and an attested collaborator's, run shell commands and fetch or "
+                         "search the web (never plain Team's or a guest's; default: off)")
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=0.2)

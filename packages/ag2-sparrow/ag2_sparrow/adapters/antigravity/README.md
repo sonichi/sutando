@@ -97,19 +97,21 @@ agy's `session/request_permission` is answered by `acp_host`'s policy, default d
 - the owner's turns only, and only on an install with `--allow-owner-shell-web` (recorded as
   `ALLOW_OWNER_SHELL_WEB=1`; off by default, so an existing install does not change on update): any shell
   command and any `execute`, `fetch` or `search` call, as a local Claude Code agent runs commands and uses
-  the web for its owner. `verify` prints `INFO owner shell and web: on|off`;
+  the web for its owner. An attested collaborator's turn gets the same when it runs as the owner's turn,
+  as claude-local and codex-local give a collaborator the owner's tools. `verify` prints `INFO owner shell and web: on|off`;
 - the owner only: a `read` or `edit` whose every path resolves (after `..`, `~` and symlinks) under the
   working directory; never when the working directory is the home directory or above it. agy's own
   argument names (`Path`, `Content`, `Overwrite`, `Append`, `Target`, `Replacement`, `AllowMultiple`,
   `Edits`, `StartLine`, `EndLine`, and the older `TargetFile`, `CodeContent`, `AbsolutePath`, ...) are
   recognised; any other key refuses the request;
-- nothing else: no command or web call for a collaborator or a guest, and no `delete`, `move` or
+- nothing else: no command or web call for plain Team or a guest, and no `delete`, `move` or
   unclassified call for anyone.
 
 | Turn | Commands, fetch, search | Read or edit under the working directory | Anything else |
 | --- | --- | --- | --- |
 | owner | granted with `--allow-owner-shell-web`, else refused | granted | refused |
-| Team (an attested collaborator) | refused (granting it is the owner's decision) | as the turn it runs in | refused |
+| Team (an attested collaborator) | as the owner, with `--allow-owner-shell-web`, on the owner's turn | as the turn it runs in | refused |
+| plain Team (no attested collaborator) | refused | as the turn it runs in | refused |
 | guest (isolated) | refused | refused | refused |
 
 With `--allow-owner-shell-web`, the working-directory bound on `read` and `edit` is no longer a security
