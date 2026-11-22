@@ -85,13 +85,9 @@ def sspace_tools_for(headers):
     return admission(headers, True) in SSPACE_ADMISSIONS
 
 
-def isolated_settings(sspace):
-    """A non-owner turn's agy settings: GUEST_SETTINGS, without the `mcp(*)` deny when the turn has the AG2
-    Space tools (agy applies deny rules before asking, so the policy would never see the request)."""
-    if not sspace:
-        return GUEST_SETTINGS
-    deny = [r for r in GUEST_SETTINGS["permissions"]["deny"] if r != "mcp(*)"]
-    return dict(GUEST_SETTINGS, permissions=dict(GUEST_SETTINGS["permissions"], deny=deny))
+def sspace_grant(headers):
+    """The server tool names this sender's shim may list and call: what `mcp_grant` lets the policy allow."""
+    return mcp_auth.OWNER_TOOLS if sspace_tools_for(headers) else frozenset()
 
 
 MINT_TIMEOUT_S = 30.0
@@ -141,23 +137,6 @@ def _exchange(command, token_env_file, agent_id, run, extra=()):
     return (out, "") if isinstance(out, dict) else (None, "the token exchange printed no JSON object")
 
 
-def sspace_entry(token_env_file, agent_id, run=subprocess.run):
-    """(the ACP HTTP `McpServer` for AG2 Space as this agent, '') or (None, why). The relay token stays in the
-    child; only the short-lived access token it mints comes back, in the entry's Authorization header."""
-    entry, why = _exchange("acp", token_env_file, agent_id, run)
-    if entry is None:
-        return None, why
-    try:
-        mcp_auth._safe_url("mcp_url", entry.get("url"))
-        ok = (entry.get("type") == "http" and entry.get("name") == mcp_auth.SERVER_NAME
-              and isinstance(entry.get("headers"), list)
-              and all(isinstance(h, dict) and set(h) == {"name", "value"} and all(isinstance(v, str) for v in h.values())
-                      for h in entry["headers"]))
-    except (ValueError, AttributeError, mcp_auth.McpAuthError):
-        ok = False
-    return (entry, "") if ok else (None, "the token exchange printed no MCP server entry")
-
-
 DESCRIPTOR_NAME = "ag2-mcp-descriptor.json"
 PROXY_LOG_NAME = "ag2-mcp-proxy.log"
 
@@ -180,12 +159,14 @@ LAUNCHES_NAME = "ag2-mcp-launches.json"
 TOOLS_DOWN = "S.space tools didn't start this turn (%s), so I couldn't use Room Commons."
 
 
-def write_launcher(state, turn=""):
+def write_launcher(state, turn="", tools=frozenset()):
     """`<state>/ag2-mcp-shim` (0700): a plain executable that runs the shim, so agy's stdio entry is a file and
     its args are only the proxy's command line (agy started no process for a `python -I -c <code>` entry). It
-    hands the shim this turn's id and `<state>/ag2-mcp-status.json`, where the shim says how far it got."""
+    hands the shim this turn's id, `<state>/ag2-mcp-status.json`, where the shim says how far it got, and the
+    server tools it may list and call (`tools`; none by default)."""
     path = os.path.join(state, SHIM_NAME)
-    env = {"AG2_MCP_SHIM_TURN": turn, "AG2_MCP_SHIM_STATUS": os.path.join(state, STATUS_NAME)}
+    env = {"AG2_MCP_SHIM_TURN": turn, "AG2_MCP_SHIM_STATUS": os.path.join(state, STATUS_NAME),
+           "AG2_MCP_SHIM_TOOLS": ",".join(sorted(tools))}
     text = "#!/bin/sh\n%s exec %s \"$@\"\n" % (" ".join("%s=%s" % (k, shlex.quote(v)) for k, v in env.items()),
                                               " ".join(shlex.quote(a) for a in [sys.executable] + shim_args([])))
     tmp = "%s.%d.tmp" % (path, os.getpid())
@@ -263,7 +244,7 @@ class LaunchLog:
                 os.unlink(tmp)
 
 
-def stdio_entry(proxy_command, token_env_file, agent_id, state_dir, run=subprocess.run, turn=""):
+def stdio_entry(proxy_command, token_env_file, agent_id, state_dir, run=subprocess.run, turn="", tools=frozenset()):
     """(the ACP stdio `McpServer` running the desktop's `ag2-mcp-proxy` as this agent, '') or (None, why). The
     proxy gets only the path of a non-secret descriptor (written 0600 in `state_dir`) naming the agent's own
     token file, as Claude Code's `ag2-space` stdio entry does; the relay token never enters agy's environment."""
@@ -291,7 +272,7 @@ def stdio_entry(proxy_command, token_env_file, agent_id, state_dir, run=subproce
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(desc, f)
     os.replace(tmp, path)
-    return {"name": mcp_auth.SERVER_NAME, "command": write_launcher(state, turn), "args": list(argv),
+    return {"name": mcp_auth.SERVER_NAME, "command": write_launcher(state, turn, tools), "args": list(argv),
             "env": [{"name": "AG2_MCP_DESCRIPTOR", "value": path},
                     {"name": "AG2_MCP_LOG", "value": os.path.join(state, PROXY_LOG_NAME)}]}, ""
 
@@ -320,9 +301,9 @@ def publish(result_file, body):
 
 
 @contextlib.contextmanager
-def guest_turn(args, sspace=False):
+def guest_turn(args):
     """An `acp_host.Isolated` for one non-owner task: a new 0700 temporary directory holding the Session's
-    working directory and agy's home (`--gemini-dir`, `isolated_settings` only), removed after the turn."""
+    working directory and agy's home (`--gemini-dir`, GUEST_SETTINGS only), removed after the turn."""
     base = os.path.realpath(tempfile.mkdtemp(prefix=GUEST_PREFIX))
     try:
         home, cwd = os.path.join(base, "agy"), os.path.join(base, "cwd")
@@ -331,7 +312,7 @@ def guest_turn(args, sspace=False):
         settings = os.path.join(home, "antigravity-cli", "settings.json")
         fd = os.open(settings, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(isolated_settings(sspace), f)
+            json.dump(GUEST_SETTINGS, f)
         yield acp_host.Isolated(argv=list(args.acp_argv) + ["--gemini-dir", home], cwd=cwd,
                                 env=dict(args.child_env),
                                 choose_mode=lambda modes: acp_host.pick_mode(modes, READ_ONLY_MODES),
@@ -472,10 +453,9 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
 
 
 class Connector:
-    def __init__(self, args, client_factory=AcpClient, note=None, mcp_entry=sspace_entry, proxy_entry=stdio_entry):
+    def __init__(self, args, client_factory=AcpClient, note=None, proxy_entry=stdio_entry):
         self.args = args
         self.client_factory = client_factory
-        self.mcp_entry = mcp_entry
         self.proxy_entry = proxy_entry
         self.launch = None   # (status file, turn id) of this turn's stdio launcher, when one was offered
         self.note = note if note is not None else NON_OWNER_NOTE
@@ -483,32 +463,30 @@ class Connector:
         self.name = NAME
         self.retry_at = {}
 
-    def sspace_servers(self, init):
-        """An owner's or team turn's MCP servers: AG2 Space as this agent, over HTTP when agy declares it, else
-        over stdio through --mcp-proxy-command; none without the agent's token file, with the reason logged."""
+    def sspace_servers(self, init, tools=frozenset()):
+        """An owner's or team turn's MCP servers: AG2 Space as this agent, over stdio through --mcp-proxy-command
+        under the shim, which lists and forwards only `tools`. Never over HTTP, where nothing filters the
+        server's tools. None without the agent's token file or a proxy command, with the reason logged."""
         token_file = getattr(self.args, "token_env_file", None)
         agent_id = getattr(self.args, "agent_id", None) or ""
         if not token_file:
             log("ag2-space MCP tools not offered: no --token-env-file (the agent's own token file)")
             return []
-        if declares_http_mcp(init):
-            entry, why = self.mcp_entry(token_file, agent_id)
-        elif getattr(self.args, "mcp_proxy_command", None):
-            turn = uuid.uuid4().hex
-            status = os.path.join(os.path.abspath(self.args.state), STATUS_NAME)
-            with contextlib.suppress(OSError):
-                os.unlink(status)
-            entry, why = self.proxy_entry(self.args.mcp_proxy_command, token_file, agent_id, self.args.state,
-                                          turn=turn)
-            if entry is not None:
-                self.launch = (status, turn)
-        else:
-            log("ag2-space MCP tools not offered: agy declares no HTTP MCP transport and no --mcp-proxy-command "
-                "is set")
+        if not getattr(self.args, "mcp_proxy_command", None):
+            log("ag2-space MCP tools not offered: no --mcp-proxy-command is set%s"
+                % (" (agy's HTTP MCP is not used: nothing would filter the server's tools)"
+                   if declares_http_mcp(init) else ""))
             return []
+        turn = uuid.uuid4().hex
+        status = os.path.join(os.path.abspath(self.args.state), STATUS_NAME)
+        with contextlib.suppress(OSError):
+            os.unlink(status)
+        entry, why = self.proxy_entry(self.args.mcp_proxy_command, token_file, agent_id, self.args.state,
+                                      turn=turn, tools=tools)
         if entry is None:
             log("ag2-space MCP tools not offered:", why)
             return []
+        self.launch = (status, turn)
         return [entry]
 
     def run_turn(self, task_id, headers, prompt, owner):
@@ -523,14 +501,11 @@ class Connector:
                                                                                   **self.mcp_grant(headers)),
                                        self.store, STDERR_NAME, NOT_SIGNED_IN, log,
                                        mcp_servers=self.mcp_servers_for(headers))
-        sspace = sspace_tools_for(headers) and bool(getattr(self.args, "token_env_file", None))
-        with guest_turn(self.args, sspace) as isolated:
+        with guest_turn(self.args) as isolated:
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
                                        lambda params: acp_host.decide_permission(params, False, isolated.cwd,
-                                                                                  extra_keys=AGY_KEYS,
-                                                                                  **self.mcp_grant(headers)),
-                                       self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=isolated,
-                                       mcp_servers=self.mcp_servers_for(headers))
+                                                                                  extra_keys=AGY_KEYS),
+                                       self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=isolated)
 
     @staticmethod
     def mcp_grant(headers):
@@ -538,7 +513,8 @@ class Connector:
         return {"mcp_tool_ok": mcp_auth.owner_tool_ok} if sspace_tools_for(headers) else {}
 
     def mcp_servers_for(self, headers):
-        return self.sspace_servers if sspace_tools_for(headers) else None
+        tools = sspace_grant(headers)
+        return (lambda init: self.sspace_servers(init, tools)) if tools else None
 
     def answer_body(self, headers, status, text, detail, turn=None):
         """What Sparrow posts: the turn's own text, quoted so no delivery marker in it acts; NO_REPLY or a

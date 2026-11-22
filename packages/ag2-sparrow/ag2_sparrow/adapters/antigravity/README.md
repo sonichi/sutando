@@ -167,8 +167,9 @@ and the policy decides:
   connector as `--token-env-file`) and a seat's own keys; the relay token stays in that child, and agy receives
   only the short-lived access token, as the server's `Authorization` header. agy's own environment is
   unchanged (the install's allowlist): no relay token, no token file path.
-- **Transport.** HTTP when agy's `initialize` declares it (`agentCapabilities.mcpCapabilities.http`). agy
-  1.5.9 and 1.5.13 declare no `mcpCapabilities` at all, so for them the server is **stdio**: the desktop app's
+- **Transport.** Always **stdio**, never HTTP, even when agy's `initialize` declares HTTP MCP: over HTTP
+  agy would reach the server directly and nothing would filter its tools (agy 1.5.9 and 1.5.13 declare no
+  `mcpCapabilities` at all). The server is the desktop app's
   `ag2-mcp-proxy` (`engine/ag2-mcp-proxy.mjs`, the same stdio proxy Claude Code and Codex cores run as their
   `s-space` server), named at install with `--mcp-proxy-command "'<node>' '<path>/ag2-mcp-proxy.mjs'"`: quote each path, since the desktop's engine sits under `Application Support`. `install` refuses a command whose first word is not an executable, and records the line with every word quoted. Each turn
   the connector runs `ag2-sparrow-mcp descriptor --env-file <TOKEN_ENV_FILE>` (that file only, whatever
@@ -182,7 +183,7 @@ and the policy decides:
   Space's tools it offered only `ui_describe`, `ui_request` and `ui_result`, so `ag2.whoami` (empty schema)
   and every `room.*` tool were missing. The proxy therefore runs under `ag2_sparrow.mcp_name_shim`, which
   only renames: `tools/list` answers `room_action_execute` for `room.action.execute` (any character outside
-  `[A-Za-z0-9_-]` becomes `_`, cut to 64), and a `tools/call` for that name reaches the server as
+  `[A-Za-z0-9_-]` becomes `_`, cut to 50), and a `tools/call` for that name reaches the server as
   `room.action.execute`. The policy matches both spellings. agy checks the prefixed name
   (`mcp_ag2-space_<tool>`, at most 64), so aliases stop at 50 characters. The entry's `command` is
   `state/ag2-mcp-shim` (0700, written each turn), a two-line `sh` launcher, and its `args` are just the
@@ -203,7 +204,7 @@ and the policy decides:
   `relay` the file's own relay half (never a `REMOTE_TASK_URL` override) and no `env_key`. That needs the
   desktop proxy from ag2space-cinny-desktop#1246; an older proxy refuses it at start ("descriptor missing
   env_key") and agy reports the tools unavailable.
-- **When none.** No token file (`--work` with a bridge you run), no HTTP and no `--mcp-proxy-command`, or a
+- **When none.** No token file (`--work` with a bridge you run), no `--mcp-proxy-command`, or a
   failed exchange: the turn runs without the tools and the log says why.
 - **Which tools.** agy asks before each MCP call; the policy grants, to owner and team turns only, the
   `ag2-space` server's `ag2.whoami`, `room.list`, `room.inspect`, `room.actions.search`,
@@ -212,6 +213,11 @@ and the policy decides:
   `space.action.read` (`mcp_auth.OWNER_TOOLS`; a name reported with `_` for `.` matches too). Never granted:
   `agent.link`, `agent.unlink`, `agent.setup.steps`, `relay.token.issue`, event subscriptions,
   `space.action.execute` and `ui.*`, any other server's tool, and any request that carries a command.
+- **Enforced in the shim too.** The policy only sees what agy asks about, and an agy that auto-allows MCP
+  (an `mcp(*)` allow, an earlier "always allow") asks nothing. So the launcher hands the shim the same grant
+  (`AG2_MCP_SHIM_TOOLS`, from `mcp_auth.OWNER_TOOLS`, for owner and team turns only): its `tools/list` answer
+  keeps only those tools, and a `tools/call` for any other name (by alias or server name, or malformed) gets
+  a JSON-RPC error and never reaches the server. A launcher without a grant lists and forwards nothing.
 - **By identity, never by text.** The request is matched by the MCP server and tool name it carries in
   structured fields (`serverName`/`toolName` or `mcpServer`/`mcpTool`, on the tool call or in its `_meta`;
   `acp_host.MCP_IDENTITY_KEYS`), compared exactly; the title is never read. Which fields agy uses has not been

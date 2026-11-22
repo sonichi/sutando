@@ -950,8 +950,8 @@ class InstallVerifyTest(unittest.TestCase):
         self.assertEqual(seen["unwired"], cli.COMMAND)
 
 
-ENTRY = {"type": "http", "name": "ag2-space", "url": "https://mcp.s.space/mcp",
-         "headers": [{"name": "Authorization", "value": "Bearer access-abc"}]}
+ENTRY = {"name": "ag2-space", "command": "/state/ag2-mcp-shim", "args": ["/app/node", "/app/ag2-mcp-proxy.mjs"],
+         "env": [{"name": "AG2_MCP_DESCRIPTOR", "value": "/state/ag2-mcp-descriptor.json"}]}
 OPTS = [{"optionId": "a", "kind": "allow_once"}, {"optionId": "r", "kind": "reject_once"}]
 
 
@@ -961,23 +961,23 @@ class SspaceToolsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.w = Work(self.tmp.name)
-        (self.w.home / "mcp-http").write_text("")
         self.token_file = os.path.join(self.tmp.name, "agent.env")
         self.minted = []
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def mint(self, token_file, agent_id):
-        self.minted.append((token_file, agent_id))
+    def mint(self, proxy, token_file, agent_id, state, turn="", tools=frozenset()):
+        self.minted.append((token_file, agent_id, tools))
         return dict(ENTRY), ""
 
-    def serve(self, n=1, *extra, token=True):
+    def serve(self, n=1, *extra, token=True, proxy=True):
         a = self.w.args(*((["--token-env-file", self.token_file, "--agent-id", "@agy:s.space"] if token else [])
+                          + (["--mcp-proxy-command", "/app/node /app/ag2-mcp-proxy.mjs"] if proxy else [])
                           + list(extra)))
         a.once = n
         with contextlib.redirect_stderr(io.StringIO()) as err:
-            gc.Connector(a, mcp_entry=self.mint).serve()
+            gc.Connector(a, proxy_entry=lambda *x, **kw: self.mint(*x, **kw)).serve()
         return err.getvalue()
 
     def sent(self, method):
@@ -993,23 +993,26 @@ class SspaceToolsTest(unittest.TestCase):
         self.serve()
         self.assertEqual(self.sent("session/new"), [[ENTRY]])
         self.assertEqual(self.sent("session/load"), [[ENTRY]])
-        self.assertEqual(self.minted, [(self.token_file, "@agy:s.space")] * 2, "a fresh token each turn")
-        self.assertEqual(self.w.result("task-2"), "hello from agy-stub\n")
+        self.assertEqual(self.minted, [(self.token_file, "@agy:s.space", gc.mcp_auth.OWNER_TOOLS)] * 2,
+                         "a fresh launch each turn, granted the owner's tools")
+        self.assertTrue(self.w.result("task-2").startswith("hello from agy-stub\n"), "the stub launches nothing")
 
-    def test_no_server_when_agy_declares_no_http_mcp_or_no_token_file_is_named(self):
-        (self.w.home / "mcp-http").unlink()
+    def test_no_server_without_a_proxy_command_even_over_http_or_without_a_token_file(self):
         self.w.task("task-1", "STUB:TEXT hi")
-        err = self.serve()
-        self.assertIn("declares no HTTP MCP transport", err)
+        err = self.serve(proxy=False)
+        self.assertIn("no --mcp-proxy-command is set\n", err)
         (self.w.home / "mcp-http").write_text("")
         self.w.task("task-2", "STUB:TEXT hi", channel="!b:s.space")
+        err = self.serve(proxy=False)
+        self.assertIn("agy's HTTP MCP is not used: nothing would filter the server's tools", err)
+        self.w.task("task-3", "STUB:TEXT hi", channel="!c:s.space")
         err = self.serve(token=False)
         self.assertIn("no --token-env-file", err)
-        self.assertEqual(self.sent("session/new"), [[], []])
+        self.assertEqual(self.sent("session/new"), [[], [], []])
         self.assertEqual(self.minted, [], "nothing is minted for a Session that cannot use it")
 
     def test_a_failed_exchange_runs_the_turn_without_the_tools(self):
-        self.mint = lambda token_file, agent_id: (None, "ag2-sparrow-mcp: the MCP access-token exchange answered 401")
+        self.mint = lambda *a, **kw: (None, "ag2-sparrow-mcp: the MCP access-token exchange answered 401")
         self.w.task("task-1", "STUB:TEXT hi")
         err = self.serve()
         self.assertIn("ag2-space MCP tools not offered: ag2-sparrow-mcp: the MCP access-token exchange answered 401", err)
@@ -1033,7 +1036,7 @@ class SspaceToolsTest(unittest.TestCase):
         self.w.task("task-1", "STUB:MCP make a page", tier="team", collaborator=True)
         self.serve(1, "--allow-non-owner")
         self.assertEqual(self.sent("session/new"), [[ENTRY]])
-        self.assertEqual(self.minted, [(self.token_file, "@agy:s.space")])
+        self.assertEqual(self.minted, [(self.token_file, "@agy:s.space", gc.mcp_auth.OWNER_TOOLS)])
         self.assertEqual([ok for _, ok in self.decisions()], [True, True, False, False, False, False],
                          "a team member may create a page; no other tool, no command")
         self.assertFalse(self.w.metrics()[0]["isolated"], "Team gets the owner's turn")
@@ -1140,29 +1143,6 @@ class SspaceToolsTest(unittest.TestCase):
         guest = gc.wake_prompt("task-1", {"access_tier": "guest"}, "hi", [], "/w")
         self.assertNotIn("MCP", guest)
 
-    def test_the_exchange_runs_as_the_agent_from_its_own_token_file_only(self):
-        with open(self.token_file, "w") as f:
-            f.write("AGENT_MXID=@agy:s.space\n")
-        os.chmod(self.token_file, 0o600)
-        seen = {}
-
-        def run(argv, **kw):
-            seen.update(argv=argv, **kw)
-            return mock.Mock(returncode=0, stdout=json.dumps(ENTRY), stderr="")
-        environ = {"PATH": "/usr/bin", "HOME": "/h", "REMOTE_TASK_TOKEN": "leak", "GEMINI_API_KEY": "x"}
-        with mock.patch.dict(os.environ, environ, clear=True):
-            entry, why = gc.sspace_entry(self.token_file, "@agy:s.space", run=run)
-        self.assertEqual((entry, why), (ENTRY, ""))
-        self.assertEqual(seen["env"], {"PATH": "/usr/bin", "HOME": "/h", "AG2_DEVICE_ENV": self.token_file})
-        self.assertEqual(seen["argv"][:2], [sys.executable, "-I"])
-        self.assertIn("main(['acp'])", seen["argv"][-1])
-        for out, rc, err in (("not json", 0, ""), (json.dumps(dict(ENTRY, url="http://evil.example/mcp")), 0, ""),
-                             (json.dumps(dict(ENTRY, name="other")), 0, ""), ("", 1, "x\nag2-sparrow-mcp: 401")):
-            got = gc.sspace_entry(self.token_file, "@agy:s.space",
-                                  run=lambda argv, **kw: mock.Mock(returncode=rc, stdout=out, stderr=err))
-            self.assertIsNone(got[0], out)
-        self.assertEqual(got[1], "ag2-sparrow-mcp: 401")
-
     def test_install_hands_the_connector_the_agents_token_file(self):
         cfg = {"ACP_COMMAND": "agy acp", "CWD": "/c", "TOKEN_ENV_FILE": "/a/agent.env", "AGENT_ID": "@agy:s.space"}
         argv = " ".join(cli.connector_argv(cfg, "/w", 7))
@@ -1200,8 +1180,7 @@ class SspaceStdioTest(unittest.TestCase):
                         *(["--mcp-proxy-command", proxy] if proxy else []), *extra)
         a.once = n
         with contextlib.redirect_stderr(io.StringIO()) as err:
-            gc.Connector(a, mcp_entry=lambda *x: (dict(ENTRY), ""),
-                         proxy_entry=lambda cmd, tf, aid, st, **kw: gc.stdio_entry(cmd, tf, aid, st, run=self.run_child, **kw)
+            gc.Connector(a, proxy_entry=lambda cmd, tf, aid, st, **kw: gc.stdio_entry(cmd, tf, aid, st, run=self.run_child, **kw)
                          ).serve()
         return err.getvalue()
 
@@ -1228,12 +1207,13 @@ class SspaceStdioTest(unittest.TestCase):
         perms = [(r["permission"], r["allowed"]) for r in self.w.records() if "permission" in r]
         self.assertEqual([ok for _, ok in perms], [True, True, False, False, False, False])
 
-    def test_http_is_used_when_agy_declares_it_and_stdio_is_not_started(self):
+    def test_stdio_is_used_even_when_agy_declares_http(self):
         (self.w.home / "mcp-http").write_text("")
         self.w.task("task-1", "STUB:TEXT hi")
         self.serve()
-        self.assertEqual(self.sent(), [[ENTRY]])
-        self.assertEqual(self.runs, [])
+        self.assertEqual([e["command"] for e in self.sent()[0]], [os.path.join(os.path.abspath(str(self.w.root / "state")),
+                                                                               gc.SHIM_NAME)])
+        self.assertEqual(len(self.runs), 1)
 
     def test_a_team_turn_gets_the_proxy_and_a_guest_turn_gets_nothing(self):
         self.w.task("task-1", "STUB:MCP page", tier="team", collaborator=True)
@@ -1250,7 +1230,7 @@ class SspaceStdioTest(unittest.TestCase):
     def test_no_proxy_command_and_no_http_offers_nothing_and_says_why(self):
         self.w.task("task-1", "STUB:TEXT hi")
         err = self.serve(proxy=None)
-        self.assertIn("declares no HTTP MCP transport and no --mcp-proxy-command", err)
+        self.assertIn("no --mcp-proxy-command is set", err)
         self.assertEqual(self.sent(), [[]])
 
     def test_a_descriptor_that_is_not_the_agents_own_token_file_is_refused(self):
@@ -1293,7 +1273,6 @@ class SspaceStdioTest(unittest.TestCase):
         self.assertEqual(gc.stdio_entry("", self.token_file, "@agy:s.space", state), (None, "no --mcp-proxy-command"))
         with mock.patch("ag2_sparrow.connect_bridge.seat_env", lambda tf, aid: ({}, "the seat .env names @b")):
             self.assertEqual(gc.stdio_entry(PROXY, self.token_file, "@agy:s.space", state), (None, "the seat .env names @b"))
-            self.assertEqual(gc.sspace_entry(self.token_file, "@agy:s.space"), (None, "the seat .env names @b"))
         self.assertEqual(gc.mint_env("", "@agy:s.space"), ({}, "no token file"))
         for exc in (OSError("no python"), gc.subprocess.TimeoutExpired("x", 1)):
             def boom(argv, exc=exc, **kw):
@@ -1318,7 +1297,8 @@ class SspaceStdioTest(unittest.TestCase):
         self.w.task("task-1", "STUB:TEXT hi")
         self.serve(proxy=proxy)
         self.assertEqual(self.w.result("task-1"), "hello from agy-stub\n")
-        self.assertEqual([r["tools"] for r in self.w.records() if "mcp_launch" in r], [["room_action_execute", "ui_request"]])
+        self.assertEqual([r["tools"] for r in self.w.records() if "mcp_launch" in r], [["room_action_execute"]],
+                         "the shim lists only the granted tools")
         self.assertEqual(self.w.metrics()[0]["sspace_tools_down"], "")
 
     def test_a_launch_that_failed_says_so_in_fixed_words_even_after_a_stale_success(self):
@@ -1395,13 +1375,13 @@ class SspaceStdioTest(unittest.TestCase):
         server.write_text("import json, sys\nfor line in sys.stdin:\n    m = json.loads(line)\n"
                           "    print(json.dumps({'jsonrpc': '2.0', 'id': m['id'], 'result': {'tools': ["
                           "{'name': 'room.action.execute'}, {'name': 'ui_request'}]}}), flush=True)\n")
-        launcher = gc.write_launcher(str(state))
+        launcher = gc.write_launcher(str(state), tools=gc.mcp_auth.OWNER_TOOLS)
         log = state / "proxy.log"
         r = gc.subprocess.run([launcher, sys.executable, str(server)], capture_output=True, text=True, timeout=60,
                            input=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n",
                            env={"AG2_MCP_DESCRIPTOR": "/d.json", "AG2_MCP_LOG": str(log)}, cwd="/")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual([t["name"] for t in json.loads(r.stdout)["result"]["tools"]], ["room_action_execute", "ui_request"])
+        self.assertEqual([t["name"] for t in json.loads(r.stdout)["result"]["tools"]], ["room_action_execute"])
         text = log.read_text()
         self.assertIn("mcp_name_shim: start, running %s\n" % os.path.basename(sys.executable), text)
         self.assertNotIn(str(server), text, "the proxy's arguments never reach the log")

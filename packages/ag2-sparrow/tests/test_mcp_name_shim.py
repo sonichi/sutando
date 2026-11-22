@@ -28,19 +28,27 @@ isolate_os_environ()
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
 from ag2_sparrow import mcp_auth, mcp_name_shim as shim  # noqa: E402
+from ag2_sparrow.adapters.antigravity import antigravity_connector as gc  # noqa: E402
 
 AGY_KEEPS = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # AG2 Space's tool names as the MCP server lists them (the proxy forwards them unchanged).
 SERVER_TOOLS = ["ag2.whoami", "room.list", "room.inspect", "room.actions.search", "room.actions.describe",
                 "room.action.read", "room.action.execute", "room.action.execute_safe", "room.task.list",
                 "room.task.create", "room.task.update", "operation.inspect", "approval.inspect", "space.action.read",
-                "agent.link", "relay.token.issue", "ui_describe", "ui_request", "ui_result"]
+                "agent.link", "agent.unlink", "relay.token.issue", "space.action.execute", "ui_describe", "ui_request",
+                "ui_result"]
+NEVER = ["relay.token.issue", "agent.link", "agent.unlink", "space.action.execute"]
+OWNER_GRANT = {shim.TOOLS_ENV: ",".join(sorted(mcp_auth.OWNER_TOOLS))}
 
 FAKE_SERVER = textwrap.dedent("""
     import json, sys
     names = json.loads(sys.argv[1])
+    seen = open(sys.argv[2], "a") if len(sys.argv) > 2 else None
     for line in sys.stdin:
         m = json.loads(line)
+        if seen:
+            seen.write(line)
+            seen.flush()
         if m.get("method") == "tools/list":
             tools = [{"name": n, "inputSchema": {"type": "object"}} for n in names]
             out = {"jsonrpc": "2.0", "id": m["id"], "result": {"tools": tools}}
@@ -57,13 +65,22 @@ FAKE_SERVER = textwrap.dedent("""
 class Session:
     """The shim over the fake server, driven as a client does: one request, then its answer."""
 
-    def __init__(self, names=SERVER_TOOLS):
+    def __init__(self, names=SERVER_TOOLS, grant=OWNER_GRANT, launcher=None):
         self.dir = tempfile.TemporaryDirectory()
         server = os.path.join(self.dir.name, "server.py")
+        self.seen = os.path.join(self.dir.name, "seen.jsonl")
         Path(server).write_text(FAKE_SERVER)
-        self.p = subprocess.Popen([sys.executable, "-m", "ag2_sparrow.mcp_name_shim", "--", sys.executable, server,
-                                   json.dumps(names)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
-                                  bufsize=1, cwd=str(PKG_ROOT), env=hermetic_env())
+        head = [launcher] if launcher else [sys.executable, "-m", "ag2_sparrow.mcp_name_shim", "--"]
+        self.p = subprocess.Popen(head + [sys.executable, server, json.dumps(names), self.seen],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                                  bufsize=1, cwd=str(PKG_ROOT), env=hermetic_env(**grant))
+
+    def received(self):
+        """The methods and tool names the server got."""
+        if not os.path.exists(self.seen):
+            return []
+        msgs = [json.loads(line) for line in Path(self.seen).read_text().splitlines()]
+        return [(m.get("method"), (m.get("params") or {}).get("name")) for m in msgs]
 
     def ask(self, msg):
         self.p.stdin.write(json.dumps(msg) + "\n")
@@ -74,6 +91,7 @@ class Session:
         self.p.stdin.close()
         rc = self.p.wait(30)
         self.p.stdout.close()
+        self.got = self.received()
         self.dir.cleanup()
         return rc
 
@@ -82,28 +100,76 @@ class ShimTest(unittest.TestCase):
     def test_without_the_shim_agy_keeps_only_the_ui_tools(self):
         self.assertEqual([n for n in SERVER_TOOLS if AGY_KEEPS.fullmatch(n)], ["ui_describe", "ui_request", "ui_result"])
 
-    def test_through_the_shim_agy_keeps_every_tool_and_calls_reach_the_server_by_its_name(self):
+    def test_through_the_shim_agy_keeps_every_granted_tool_and_calls_reach_the_server_by_its_name(self):
         sess = Session()
         self.assertEqual(sess.ask({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})["id"], 1)
         listed = [t["name"] for t in sess.ask({"jsonrpc": "2.0", "id": "l", "method": "tools/list"})["result"]["tools"]]
         called = [sess.ask({"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": n}})
-                  ["result"]["content"][0]["text"] for i, n in enumerate(["room_action_execute", "ui_request", "ag2.whoami"])]
+                  ["result"]["content"][0]["text"] for i, n in enumerate(["room_action_execute", "ag2.whoami"])]
         self.assertEqual(sess.close(), 0)
         self.assertEqual(listed[:3], ["ag2_whoami", "room_list", "room_inspect"])
         self.assertEqual(listed, [n for n in listed if AGY_KEEPS.fullmatch(n)], "agy keeps them all")
-        self.assertEqual(len(set(listed)), len(SERVER_TOOLS))
-        self.assertEqual(called, ["room.action.execute", "ui_request", "ag2.whoami"])
+        self.assertEqual(sorted(listed), sorted(shim.alias(n) for n in mcp_auth.OWNER_TOOLS))
+        self.assertEqual(called, ["room.action.execute", "ag2.whoami"])
+
+    def test_a_team_turns_shim_never_lists_or_forwards_an_owner_only_tool(self):
+        # Regression: agy auto-allowing MCP never asks the policy, so the shim must refuse these itself.
+        team = gc.sspace_grant({"access_tier": "team", "collaborator": "true"})
+        self.assertEqual(team, gc.sspace_grant({"access_tier": "owner"}), "owner and team share one grant")
+        with tempfile.TemporaryDirectory() as state:
+            sess = Session(launcher=gc.write_launcher(state, "t", team))
+            listed = [t["name"] for t in sess.ask({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})["result"]["tools"]]
+            asks = [shim.alias(n) for n in NEVER] + NEVER + ["ui_request", "room_action_execute_2"]
+            answers = [sess.ask({"jsonrpc": "2.0", "id": n, "method": "tools/call", "params": {"name": n}}) for n in asks]
+            bad = sess.ask({"jsonrpc": "2.0", "id": "m", "method": "tools/call", "params": ["relay_token_issue"]})
+            ok = sess.ask({"jsonrpc": "2.0", "id": "ok", "method": "tools/call", "params": {"name": "room_action_execute"}})
+            self.assertEqual(sess.close(), 0)
+        for n in NEVER:
+            self.assertNotIn(shim.alias(n), listed)
+            self.assertNotIn(n, listed)
+        self.assertNotIn("ui_request", listed)
+        self.assertIn("room_action_execute", listed)
+        for ask, answer in zip(asks, answers):
+            self.assertEqual((answer["id"], answer["error"]["code"]), (ask, shim.NOT_GRANTED), ask)
+        self.assertEqual(bad["error"]["code"], shim.NOT_GRANTED, "a malformed call is refused")
+        self.assertEqual(ok["result"]["content"][0]["text"], "room.action.execute")
+        self.assertEqual([c for c in sess.got if c[0] == "tools/call"], [("tools/call", "room.action.execute")],
+                         "no refused call reached the server")
+
+    def test_without_a_grant_the_shim_lists_and_forwards_nothing(self):
+        self.assertEqual(gc.sspace_grant({"access_tier": "guest"}), frozenset())
+        sess = Session(grant={})
+        listed = sess.ask({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})["result"]["tools"]
+        answer = sess.ask({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "ag2_whoami"}})
+        self.assertEqual(sess.close(), 0)
+        self.assertEqual((listed, answer["error"]["code"]), ([], shim.NOT_GRANTED))
+        self.assertNotIn("tools/call", [m for m, _ in sess.got])
+
+    def test_a_batch_forwards_its_granted_calls_and_answers_the_rest(self):
+        names, pending = shim.Names({"room.list"}), set()
+        names.rename_tools([{"name": "room.list"}])
+        batch = [{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "room_list"}},
+                 {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "relay_token_issue"}},
+                 {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "agent_link"}}]
+        forward, reply = shim.to_server(json.dumps(batch) + "\n", names, pending)
+        self.assertEqual([m["params"]["name"] for m in json.loads(forward)], ["room.list"])
+        self.assertEqual([m["id"] for m in json.loads(reply)], [2], "a refused notification gets no answer")
+        self.assertEqual(shim.to_server(json.dumps(batch[2]) + "\n", names, pending), (None, None))
 
     def test_main_in_process_relays_until_the_client_closes(self):
         with tempfile.TemporaryDirectory() as d:
             server = os.path.join(d, "server.py")
             Path(server).write_text(FAKE_SERVER)
             out = io.StringIO()
-            rc = shim.main(["--", sys.executable, server, json.dumps(["room.list"])],
-                           stdin=io.StringIO(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n"),
-                           stdout=out)
+            calls = "".join(json.dumps({"jsonrpc": "2.0", "id": i, "method": m, "params": {"name": "agent_link"}}) + "\n"
+                            for i, m in ((1, "tools/list"), (2, "tools/call")))
+            with unittest.mock.patch.dict(os.environ, {shim.TOOLS_ENV: "room.list"}):
+                rc = shim.main(["--", sys.executable, server, json.dumps(["room.list"])], stdin=io.StringIO(calls),
+                               stdout=out)
         self.assertEqual(rc, 0)
-        self.assertEqual(json.loads(out.getvalue())["result"]["tools"][0]["name"], "room_list")
+        lines = sorted((json.loads(line) for line in out.getvalue().splitlines()), key=lambda m: m["id"])
+        self.assertEqual(lines[0]["result"]["tools"][0]["name"], "room_list")
+        self.assertEqual(lines[1]["error"]["code"], shim.NOT_GRANTED)
 
     def test_the_policy_grants_the_aliases_it_granted_by_server_name(self):
         for name in SERVER_TOOLS:
@@ -111,17 +177,17 @@ class ShimTest(unittest.TestCase):
                              name)
 
     def test_colliding_and_overlong_names_get_distinct_safe_aliases(self):
-        names = shim.Names()
-        tools = [{"name": "a.b"}, {"name": "a_b"}, {"name": "x" * 70 + ".y"}, {"name": 3}, {}]
+        names = shim.Names({"a.b", "a_b", "x" * 70 + ".y"})
+        tools = [{"name": "a.b"}, {"name": "a_b"}, {"name": "x" * 70 + ".y"}, {"name": 3}, {}, "z", {"name": "c.d"}]
         names.rename_tools(tools)
         got = [t.get("name") for t in tools]
         self.assertEqual(got[:2], ["a_b_2", "a_b"] if got[0] != "a_b" else ["a_b", "a_b_2"])
         self.assertTrue(AGY_KEEPS.fullmatch(got[2]))
-        self.assertEqual(got[3:], [3, None], "a malformed entry is left as it came")
+        self.assertEqual(len(got), 3, "a malformed or ungranted entry is dropped")
         self.assertEqual({names.server_name(got[0]), names.server_name(got[1])}, {"a.b", "a_b"})
 
     def test_an_alias_keeps_its_server_tool_across_pages_and_later_lists(self):
-        names = shim.Names()
+        names = shim.Names({"a.b", "a_b"})
         first = [{"name": "a.b"}]
         names.rename_tools(first)
         later = [{"name": "a_b"}]   # another page, or a refresh, lists a tool with the same alias
@@ -139,11 +205,11 @@ class ShimTest(unittest.TestCase):
         self.assertEqual(shim.alias("a" * 50), "a" * 50)
 
     def test_lines_it_does_not_understand_pass_through(self):
-        names, pending = shim.Names(), set()
+        names, pending = shim.Names({"room.list"}), set()
         for line in ("not json\n", "[1, 2]\n", '"x"\n', '{"jsonrpc": "2.0", "method": "notifications/initialized"}\n'):
-            self.assertEqual(shim.to_server(line, names, pending), line)
+            self.assertEqual(shim.to_server(line, names, pending), (line, None))
             self.assertEqual(shim.to_client(line, names, pending), line)
-        batch = shim.to_server(json.dumps([{"jsonrpc": "2.0", "id": 9, "method": "tools/list"}]) + "\n", names, pending)
+        batch, _ = shim.to_server(json.dumps([{"jsonrpc": "2.0", "id": 9, "method": "tools/list"}]) + "\n", names, pending)
         self.assertEqual(pending, {"9"})
         answer = json.dumps([{"jsonrpc": "2.0", "id": 9, "result": {"tools": [{"name": "room.list"}]}}]) + "\n"
         self.assertEqual(json.loads(shim.to_client(answer, names, pending))[0]["result"]["tools"][0]["name"], "room_list")
@@ -158,7 +224,7 @@ class ShimTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             status = os.path.join(d, "status.json")
             env = {shim.STATUS_ENV: status, shim.TURN_ENV: "t1"}
-            with unittest.mock.patch.dict(os.environ, env):
+            with unittest.mock.patch.dict(os.environ, dict(env, **{shim.TOOLS_ENV: "room.list,ui_request"})):
                 self.assertEqual(shim.main(["/no/such/program"], stdin=io.StringIO(""), stdout=io.StringIO()), 127)
                 self.assertEqual(json.loads(Path(status).read_text()), {"state": "exited", "code": 127, "turn": "t1"})
                 server = os.path.join(d, "server.py")

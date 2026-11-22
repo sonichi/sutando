@@ -252,7 +252,7 @@ the environment, Claude Code needs `REMOTE_TASK_TOKEN` in its environment too.
 
 `ag2-sparrow-mcp acp` makes the same exchange and prints the ACP `McpServer` (`type: http`, the MCP URL,
 an `Authorization` header with the access token) for an ACP client that takes headers rather than a
-helper; the Antigravity adapter runs it for each owner or team turn. `ag2-sparrow-mcp descriptor --env-file <the
+helper (the Antigravity adapter does not use it: over HTTP nothing would filter the server's tools). `ag2-sparrow-mcp descriptor --env-file <the
 agent's .env>` prints, without minting, the non-secret descriptor the desktop's stdio `ag2-mcp-proxy` reads
 (`AG2_MCP_DESCRIPTOR`) for that file: for a seat `.env`, the `token_format: "raw"` form naming the raw
 token file it points at. It reads only that file (and that token file), never a token from the environment

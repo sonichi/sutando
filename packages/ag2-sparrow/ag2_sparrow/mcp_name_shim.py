@@ -5,8 +5,10 @@ Antigravity CLI (agy) drops every MCP tool whose name has a dot: through the des
 only `ui_describe`, `ui_request` and `ui_result` of AG2 Space's tools (`room.action.execute`, `ag2.whoami`, ...
 were not offered). This shim sits between agy and that proxy and changes nothing but names: a `tools/list`
 answer's tool names become `room_action_execute` and so on (`alias`), and a `tools/call` for an alias is sent
-on under the server's own name. Every other message passes through as it came, and the child's environment is
-this process's (the proxy scrubs its own).
+on under the server's own name. It also enforces the turn's grant (TOOLS_ENV, the server names the connector
+grants): a `tools/list` answer keeps only granted tools, and a `tools/call` for any other name, or a malformed
+one, is answered with a JSON-RPC error and never forwarded. No grant named means none granted. Every other
+message passes through as it came, and the child's environment is this process's (the proxy scrubs its own).
 
     python -m ag2_sparrow.mcp_name_shim <command> [args...]
 
@@ -29,6 +31,14 @@ NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,%d}" % ALIAS_MAX)
 _BAD = re.compile(r"[^A-Za-z0-9_-]")
 LOG_ENV = "AG2_MCP_LOG"
 STATUS_ENV, TURN_ENV = "AG2_MCP_SHIM_STATUS", "AG2_MCP_SHIM_TURN"
+TOOLS_ENV = "AG2_MCP_SHIM_TOOLS"
+NOT_GRANTED = -32601
+
+
+def granted(environ=None):
+    """The server tool names this turn may list and call (TOOLS_ENV, comma-separated); none when unset."""
+    value = (os.environ if environ is None else environ).get(TOOLS_ENV) or ""
+    return frozenset(n for n in value.split(",") if n)
 
 
 class Status:
@@ -74,20 +84,22 @@ def note(line, environ=None):
 
 
 class Names:
-    """The aliases handed out so far: alias -> server name (a later tools/list may add or change them)."""
+    """The aliases handed out so far: alias -> server name (a later tools/list may add or change them), and the
+    server names this turn grants (`allowed`)."""
 
-    def __init__(self):
+    def __init__(self, allowed=frozenset()):
         self.to_server = {}
+        self.allowed = frozenset(allowed)
         self.lock = threading.Lock()
 
     def rename_tools(self, tools):
-        """Rename in place; an alias once handed out keeps its server tool across pages and later lists."""
+        """Keep only granted tools, renamed in place; an alias once handed out keeps its server tool across pages
+        and later lists."""
         with self.lock:
+            tools[:] = [t for t in tools if isinstance(t, dict) and t.get("name") in self.allowed]
             taken = dict(self.to_server)
             for tool in tools:
-                name = tool.get("name") if isinstance(tool, dict) else None
-                if not isinstance(name, str) or not name:
-                    continue
+                name = tool["name"]
                 safe, n = alias(name), 2
                 while safe in taken and taken[safe] != name:
                     suffix = "_%d" % n
@@ -99,6 +111,10 @@ class Names:
     def server_name(self, name):
         with self.lock:
             return self.to_server.get(name, name)
+
+    def call_ok(self, name):
+        """A `tools/call` name (an alias or a server name) that resolves to a granted tool."""
+        return isinstance(name, str) and self.server_name(name) in self.allowed
 
 
 def _messages(line):
@@ -113,24 +129,40 @@ def _each(msg):
     return msg if isinstance(msg, list) else [msg]
 
 
+def _refusal(m):
+    return {"jsonrpc": "2.0", "id": m["id"], "error": {"code": NOT_GRANTED, "message": "tool not granted on this turn"}}
+
+
 def to_server(line, names, pending):
-    """A client line as the server should get it: a `tools/call` for an alias under the server's name; the id of
-    each `tools/list` request remembered so its answer is renamed."""
+    """(the line for the server or None, the line for the client or None) for a client line: a granted
+    `tools/call` goes on under the server's name, any other `tools/call` is answered here with a JSON-RPC error
+    (a notification is dropped); the id of each `tools/list` request is remembered so its answer is filtered."""
     msg = _messages(line)
     if msg is None:
-        return line
-    changed = False
+        return line, None
+    changed, kept, refused = False, [], []
     for m in _each(msg):
-        if not isinstance(m, dict):
-            continue
-        if m.get("method") == "tools/list" and "id" in m:
-            pending.add(json.dumps(m["id"]))
-        elif m.get("method") == "tools/call" and isinstance(m.get("params"), dict):
-            name = m["params"].get("name")
-            if isinstance(name, str) and names.server_name(name) != name:
-                m["params"]["name"] = names.server_name(name)
+        if isinstance(m, dict) and m.get("method") == "tools/call":
+            params = m.get("params")
+            name = params.get("name") if isinstance(params, dict) else None
+            if not names.call_ok(name):
                 changed = True
-    return json.dumps(msg) + "\n" if changed else line
+                if "id" in m:
+                    refused.append(_refusal(m))
+                continue
+            if names.server_name(name) != name:
+                params["name"] = names.server_name(name)
+                changed = True
+        elif isinstance(m, dict) and m.get("method") == "tools/list" and "id" in m:
+            pending.add(json.dumps(m["id"]))
+        kept.append(m)
+    batch = isinstance(msg, list)
+    reply = (json.dumps(refused if batch else refused[0]) + "\n") if refused else None
+    if not changed:
+        return line, None
+    if not kept:
+        return None, reply
+    return json.dumps(kept if batch else kept[0]) + "\n", reply
 
 
 def to_client(line, names, pending, status=None):
@@ -172,7 +204,7 @@ def main(argv=None, stdin=None, stdout=None, popen=subprocess.Popen):
         note("the server did not start (%s)" % type(e).__name__)
         status.exited(127)
         return 127
-    names, pending, out_lock = Names(), set(), threading.Lock()
+    names, pending, out_lock = Names(granted()), set(), threading.Lock()
 
     def pump_out():
         for line in child.stdout:
@@ -184,8 +216,15 @@ def main(argv=None, stdin=None, stdout=None, popen=subprocess.Popen):
     reader.start()
     try:
         for line in stdin:
+            forward, reply = to_server(line, names, pending)
+            if reply is not None:
+                with out_lock:
+                    stdout.write(reply)
+                    stdout.flush()
+            if forward is None:
+                continue
             try:
-                child.stdin.write(to_server(line, names, pending))
+                child.stdin.write(forward)
                 child.stdin.flush()
             except (BrokenPipeError, OSError):
                 break
