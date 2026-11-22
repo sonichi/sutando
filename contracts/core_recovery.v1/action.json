@@ -2,7 +2,7 @@
   "space.ag2.hitl.action": {
     "hitl_id": "hr_01J9Z8K2",
     "expected_revision": 3,
-    "action_id": "switch_model:sonnet",
+    "action_id": "switch_model:sonnet-5-1m-context",
     "guard": "limit:sutando-core"
   }
 }

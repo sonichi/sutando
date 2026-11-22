@@ -6,7 +6,13 @@
   "inflight": 0,
   "status": "blocked",
   "step": "Paused: usage limit until 15:00",
-  "capabilities": ["task-ack", "heartbeat", "core-status", "worker_health.v1", "core_recovery.v1"],
+  "capabilities": [
+    "task-ack",
+    "heartbeat",
+    "core-status",
+    "worker_health.v1",
+    "core_recovery.v1"
+  ],
   "health": {
     "alive": true,
     "motion": "idle",
@@ -24,9 +30,26 @@
       "account": "acct_3f9a2b",
       "waiting_tasks": 2,
       "restarts_10m": 0,
-      "actions": ["retry_now", "switch_model", "switch_runtime", "restart_core"],
-      "switch_models": ["sonnet", "haiku"],
-      "switch_runtimes": ["codex"]
+      "actions": [
+        "retry_now",
+        "switch_model",
+        "switch_runtime",
+        "refresh_options",
+        "restart_core"
+      ],
+      "switch_models": [
+        "sonnet-5-1m-context",
+        "fable-5-1",
+        "haiku"
+      ],
+      "model_labels": [
+        "Sonnet 5 (1M context)",
+        "Fable 5.1",
+        "Haiku 4.5"
+      ],
+      "switch_runtimes": [
+        "codex"
+      ]
     }
   }
 }

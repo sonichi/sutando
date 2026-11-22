@@ -41,7 +41,8 @@ from typing import Callable, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hitl import recovery  # noqa: E402
-from workspace_default import status_read_path  # noqa: E402
+from workspace_default import status_read_path
+import runtime_models
 
 REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 HOLD_SOURCE = "core-hold"
@@ -60,55 +61,80 @@ CONTINUE = ("continue", "Enter")
 _NAMED_CAP = re.compile(r"\breached your ([A-Za-z][\w.-]{0,24}) limit\b", re.I)
 
 
-def model_family(model: Optional[str]) -> Optional[str]:
-    low = str(model or "").lower()
-    return next((a for a in recovery.SWITCH_ALIASES if a in low), None)
-
-
 def current_model(workspace: Path) -> Optional[str]:
-    """The family the core was last switched to (state/model-switch.json), else None."""
+    """The model the core was last switched to (state/model-switch.json), else the launch's."""
     try:
         data = json.loads(status_read_path("model-switch.json", Path(workspace)).read_text())
+        if isinstance(data, dict) and data.get("model"):
+            return str(data["model"])
     except (OSError, ValueError):
+        pass
+    try:
+        import core_limit_hold
+        return core_limit_hold.launch_identity(Path(workspace))[0]
+    except Exception:  # noqa: BLE001 -- unknown is no model marked in use
         return None
-    return model_family(data.get("model")) if isinstance(data, dict) else None
 
 
-_MODEL_TABLE: Optional[Dict[str, Dict[str, str]]] = None
-
-
-def model_table() -> Dict[str, Dict[str, str]]:
-    """{alias: {id, display}} from the model-switch table (`switch-model.sh --names`), read once per
-    process; {} when it cannot be read, and then no switch is offered at all."""
-    global _MODEL_TABLE
-    if _MODEL_TABLE is None:
-        try:
-            run = subprocess.run(["bash", str(REPO / "scripts" / "switch-model.sh"), "--names"],
-                                 capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
-            table = json.loads(run.stdout) if run.returncode == 0 else {}
-        except (OSError, ValueError, subprocess.SubprocessError):
-            table = {}
-        _MODEL_TABLE = {a: e for a, e in table.items() if isinstance(e, dict) and e.get("id") and e.get("display")} \
-            if isinstance(table, dict) else {}
-    return _MODEL_TABLE
-
-
-def model_names() -> Dict[str, str]:
-    """alias -> the exact model's display name, the text a switch button carries."""
-    return {a: e["display"] for a, e in model_table().items()}
+def model_names(workspace: Path, runtime: Optional[str]) -> Dict[str, str]:
+    """key -> the runtime's own label for that model, the text a switch button carries."""
+    return {e["key"]: e["label"] for e in runtime_models.entries(workspace, runtime)}
 
 
 def switch_offer(workspace: Path, runtime: Optional[str], avoid: Optional[str] = None,
                  seat: bool = False) -> List[str]:
-    """The model aliases a card may offer: none for Codex (its model is a launch argument) and
-    none for a worker seat (it shares the core's config dir, where /model saves the default for
-    every session), else every alias the model table names an exact model for, but the one in
-    use and `avoid`."""
+    """The rows of the runtime's own model list a card may offer (runtime_models.offer): none for
+    Codex (its model is a launch argument) and none for a worker seat (it shares the core's config
+    dir, where /model saves the default for every session)."""
     if runtime == "codex" or seat:
         return []
-    skip = {current_model(workspace), model_family(avoid)} - {None}
-    known = model_table()
-    return [m for m in recovery.SWITCH_ALIASES if m not in skip and m in known]
+    return [e["key"] for e in runtime_models.offer(workspace, runtime, current_model(workspace), avoid)]
+
+
+def models_line(workspace: Path, runtime: Optional[str], prompt: Optional[str] = None,
+                limited: Optional[str] = None) -> Optional[str]:
+    """The card line naming every model the runtime offers, the one in use and the capped one marked."""
+    cap = _NAMED_CAP.search(prompt or "")
+    line = runtime_models.summary(workspace, runtime, current_model(workspace),
+                                  limited or (cap.group(1) if cap else None))
+    if line is None and runtime != "codex":
+        return "Tap Refresh options to read the models this runtime offers and switch to one."
+    return line
+
+
+def refresh_limit_card(manager, workspace: Path, session: str, runtime: Optional[str]) -> List[str]:
+    """Once the runtime's model list is read, a still-untapped limit card of the core gains its
+    model buttons and the line naming them; the same card, never a new one."""
+    from hitl import tui_gate
+    from hitl.schema import STATUS_PENDING
+    keys = switch_offer(workspace, runtime)
+    if not keys:
+        return []
+    done = []
+    for r in manager.active():
+        subject = r.subject or {}
+        if (subject.get("session") != session or subject.get("seat") or not tui_gate.limit_card(r)
+                or not subject.get("recovery") or r.status != STATUS_PENDING):
+            continue
+        have = [a.id for a in r.actions if a.id.startswith(recovery.SWITCH_MODEL + ":")]
+        want = [recovery.action_id(recovery.SWITCH_MODEL, k) for k in keys]
+        if have == want:
+            continue
+        names = model_names(workspace, runtime)
+        with manager.store.locked():
+            cur = manager.get(r.id)
+            if cur is None or cur.status != STATUS_PENDING:
+                continue
+            rest = [a for a in cur.actions if not a.id.startswith(recovery.SWITCH_MODEL + ":")]
+            cur.actions = [tui_gate.recovery_action(a, names) for a in want] + rest
+            line = models_line(workspace, runtime)
+            if line and line not in cur.message:
+                cur.message = f"{cur.message}\n\n{line} Tap one below to switch to it."
+            cur.revision += 1
+            cur.updated_at = time.time()
+            manager.store.save(cur)
+        done.append(r.id)
+    return done
 
 
 def runtime_offer(runtime: Optional[str]) -> List[str]:
@@ -137,6 +163,7 @@ def card_controls(workspace: Path, runtime: Optional[str], *, seat: bool, kind: 
         ids.append(recovery.RETRY_NOW)
     if limit:
         ids.append(recovery.ADD_ACCOUNT)  # no purchase is ever offered on a card
+    ids.append(recovery.REFRESH_OPTIONS)
     if not seat:
         ids.append(recovery.RESTART_CORE)
     return ids
@@ -243,11 +270,11 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
         if target.seat:
             why = f"{recovery.SEAT_MODEL_LOCKED} Nothing was changed."
             return "refused", why, why, {}
-        entry = model_table().get(arg)
-        if entry is None:
-            why = f"This Mac has no exact model for {arg}; nothing was changed."
+        entry = runtime_models.entry(ws, req.runtime if req is not None else None, arg)
+        if entry is None or not entry.get("arg") or arg not in switch_offer(ws, req.runtime if req else None):
+            why = "That model is not one the runtime offers now; nothing was changed."
             return "refused", why, why, {}
-        arg_id, name = entry["id"], entry["display"]
+        arg_id, name = entry["arg"], entry["label"]
         hold = core_limit_hold.active_hold(ws, now)
         held = hold is not None and hold.get("source") != core_limit_hold.PANE_SOURCE
         argv = ["bash", str(REPO / "scripts" / "switch-model.sh"), arg_id, "--confirm",
@@ -289,6 +316,13 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
         if verb == recovery.SWITCH_RUNTIME:
             return "done", None, f"Switched the core to {arg}; it is starting.", {"state": "starting", "runtime": arg}
         return "done", None, "Restarted the core; it is starting.", {"state": "starting"}
+    if verb == recovery.REFRESH_OPTIONS:
+        # The owner asked: the pane's own menu is read again, and a core idle at its limit has its
+        # model picker opened, read and closed once; the card is replaced with what the screen shows.
+        if not target.seat:
+            runtime_models.request_probe(ws, target.session, now)
+        return ("done", None, "Reading the current options again; a new card shows what the screen offers now.",
+                {})
     if verb == recovery.ESCAPE_PROMPT:
         if not target.send_key("Escape"):
             why = "The terminal did not take the key."
@@ -412,6 +446,8 @@ def _settle(manager, target: Target, data: Dict, req, outcome: str, reason, line
                              "seat": target.seat or ""})
     if req is not None and outcome != "stale":
         _answer_card(manager, req, line, outcome, now)
+        if outcome == "done" and aid == recovery.REFRESH_OPTIONS:
+            manager.resolve(req.id)  # the owner asked for a fresh read: the next tick posts the new card
     return body
 
 
@@ -543,11 +579,14 @@ def hold_card_step(manager, workspace: Path, session: str, runtime: Optional[str
     ids += [recovery.action_id(recovery.SWITCH_MODEL, m)
             for m in switch_offer(workspace, runtime, avoid=hold.get("model"))]
     ids += [recovery.action_id(recovery.SWITCH_RUNTIME, r) for r in runtime_offer(runtime)]
-    ids.append(recovery.ADD_ACCOUNT)
+    ids += [recovery.ADD_ACCOUNT, recovery.REFRESH_OPTIONS]
     what = core_limit_hold.status_line(hold).split(": ", 1)[-1]
+    models = models_line(workspace, runtime, limited=hold.get("model"))
     lines = [f"I am paused: {what}. I start again by myself after that, and messages you send "
              "meanwhile wait and are answered then.", "",
              limit_unblock(session, runtime, controls=ids) + " Retry now tries the current model again."]
+    if models:
+        lines += ["", models]
     if queued:
         import core_gate_notice
         lines += ["", core_gate_notice.card_line(queued)]
@@ -555,7 +594,7 @@ def hold_card_step(manager, workspace: Path, session: str, runtime: Optional[str
         kind="core-blocked", runtime=runtime or "claude", message="\n".join(lines),
         title="Paused: provider limit", guard=guard,
         device={"id": session, "name": session},
-        actions=[recovery_action(aid, model_names()) for aid in ids],
+        actions=[recovery_action(aid, model_names(workspace, runtime)) for aid in ids],
         subject={"session": session, "source": HOLD_SOURCE, "recovery": True, "remind": False,
                  "incident": f"inc_{_hold_ref(hold)}"})
     got = manager.create(req)

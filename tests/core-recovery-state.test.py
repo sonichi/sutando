@@ -28,6 +28,8 @@ from hitl.schema import ActionReply
 
 FIXTURES = REPO / "contracts" / "core_recovery.v1"
 NOW = 1763730120.0
+OFFERED = ["sonnet-5-1m-context", "fable-5-1", "haiku"]
+OFFERED_LABELS = ["Sonnet 5 (1M context)", "Fable 5.1", "Haiku 4.5"]
 HOLD = {"status": "held", "kind": "usage-limit", "model": "opus", "reset_at": 1763737200,
         "until": 1763737260, "started_at": 1763730000, "account": "3f9a2b0c1d2e4f56"}
 
@@ -51,9 +53,10 @@ class States(unittest.TestCase):
     def test_a_usage_limit_on_the_pane_is_paused(self):
         rec = derive({"state": "blocked-human", "kind": "usage-limit",
                       "prompt": "You've hit your usage limit · resets 3pm"}, runtime="claude",
-                     runtimes_available=("claude", "codex"))
+                     runtimes_available=("claude", "codex"), models_offered=OFFERED, model_labels=OFFERED_LABELS)
         self.assertEqual(rec["state"], "paused_limit")
-        self.assertEqual(rec["actions"], ["retry_now", "switch_model", "switch_runtime", "restart_core"])
+        self.assertEqual(rec["actions"], ["retry_now", "switch_model", "switch_runtime", "refresh_options", "restart_core"])
+        self.assertEqual((rec["switch_models"], rec["model_labels"]), (OFFERED, OFFERED_LABELS))
         self.assertEqual(rec["switch_runtimes"], ["codex"])
 
     def test_a_turn_refused_for_a_limit_is_paused(self):
@@ -139,7 +142,7 @@ class Codex(unittest.TestCase):
         rec = derive({"state": "idle-ready"}, wedge=cli_wedge.frame_abnormal(CODEX_LIMIT), runtime="codex",
                      runtimes_available=("claude", "codex"))
         self.assertEqual((rec["state"], rec["actions"], rec["switch_runtimes"]),
-                         ("paused_limit", ["switch_runtime", "restart_core"], ["claude"]))
+                         ("paused_limit", ["switch_runtime", "refresh_options", "restart_core"], ["claude"]))
         self.assertEqual(derive({"state": "idle-ready"}, wedge=cli_wedge.frame_abnormal(CODEX_LIMIT),
                                 runtime="claude")["state"], "idle",
                          "a Claude refusal is the monitor's to read; its idle prompt stands")
@@ -158,7 +161,7 @@ class Codex(unittest.TestCase):
             self.assertEqual(derive(sup, runtime="codex")["state"], want, sup)
         self.assertEqual(derive({"state": "crashed"}, runtime="codex", restarts_10m=5)["state"], "crash_loop")
         self.assertEqual(derive({"state": "blocked-human", "kind": "selection"}, runtime="codex")["actions"],
-                         ["escape_prompt", "restart_core"])
+                         ["escape_prompt", "refresh_options", "restart_core"])
 
     def test_a_banner_above_the_last_codex_answer_is_outrun(self):
         pane = CODEX_LIMIT + "\n\n\u2022 Done: the PR is open.\n" + CODEX_IDLE
@@ -173,7 +176,7 @@ class Codex(unittest.TestCase):
             with mock.patch.object(crs, "runtimes_on_host", lambda: ("codex",)):
                 rec = crs.gather(ws, {"state": "idle-ready"}, now=NOW, runtime=None,
                                  pane="\u2022 Earlier answer\n" + CODEX_LIMIT + CODEX_IDLE)
-            self.assertEqual((rec["runtime"], rec["state"], rec["actions"]), ("codex", "paused_limit", ["restart_core"]))
+            self.assertEqual((rec["runtime"], rec["state"], rec["actions"]), ("codex", "paused_limit", ["refresh_options", "restart_core"]))
 
     def test_an_unknown_runtime_offers_only_the_neutral_actions(self):
         rec = derive({"state": "blocked-human", "kind": "usage-limit", "prompt": "hit your usage limit"},
@@ -187,13 +190,21 @@ class Fields(unittest.TestCase):
                      runtime="claude")
         for key in ("reset_at", "model", "account", "waiting_tasks", "restarts_10m", "switch_runtimes"):
             self.assertNotIn(key, rec)
-        self.assertEqual(rec["switch_models"], ["opus", "sonnet", "haiku"])
+        self.assertNotIn("switch_models", rec, "no runtime model list read: no model switch offered")
+        self.assertNotIn("switch_model", rec["actions"])
         self.assertNotIn("switch_runtime", rec["actions"], "no other runtime on this host, no switch offered")
 
-    def test_the_switch_list_leaves_out_the_running_and_the_limited_family(self):
-        self.assertEqual(derive({"state": "crashed"}, HOLD, model="sonnet[1m]", runtime="claude")["switch_models"],
-                         ["haiku"])
-        self.assertNotIn("switch_models", derive({"state": "logged-out"}, model="opus", runtime="claude"))
+    def test_the_switch_list_is_the_offered_rows_and_only_where_a_switch_applies(self):
+        self.assertEqual(derive({"state": "crashed"}, HOLD, runtime="claude", models_offered=["haiku"],
+                                model_labels=["Haiku 4.5"])["model_labels"], ["Haiku 4.5"])
+        self.assertNotIn("switch_models", derive({"state": "logged-out"}, runtime="claude", models_offered=["haiku"]))
+
+    def test_the_record_carries_the_menu_the_pane_shows_minus_purchases(self):
+        menu = (REPO / "tests" / "fixtures" / "core_recovery" / "seat-rate-limit-options.txt").read_text()
+        rec = derive({"state": "blocked-human", "kind": "selection", "prompt": menu}, runtime="claude")
+        self.assertEqual(rec["menu"], ["Stop and wait for limit to reset",
+                                       "Wait here, then continue automatically at Nov 15 at 6am"])
+        self.assertNotIn("menu", derive({"state": "running", "prompt": menu}, runtime="claude"))
 
     def test_since_and_incident_stand_while_the_state_does(self):
         first = derive({"state": "blocked-human", "kind": "selection"}, now=NOW)
@@ -221,7 +232,8 @@ class Fields(unittest.TestCase):
         rec = crs.coerce({"v": 1, "state": "paused_limit", "incident": "i" * 500, "since": -5,
                           "reset_at": True, "model": "x" * 99, "waiting_tasks": 3.0,
                           "actions": ["retry_now", "rm -rf /", "restart_core"] + ["retry_now"] * 20,
-                          "switch_models": ["sonnet", "gpt-9", "haiku"], "prompt": "pane text"})
+                          "switch_models": ["sonnet-5", "Sonnet; rm", "haiku"], "prompt": "pane text",
+                          "menu": ["Wait", "Add funds to continue", "x" * 200, "bad\x07"]})
         self.assertNotIn("incident", rec, "an incident of any other shape is dropped, not cut")
         self.assertNotIn("model", rec)
         self.assertNotIn("since", rec)
@@ -230,7 +242,8 @@ class Fields(unittest.TestCase):
         self.assertEqual(rec["waiting_tasks"], 3)
         self.assertEqual(rec["actions"][:2], ["retry_now", "restart_core"])
         self.assertEqual(len(rec["actions"]), crs.MAX_ACTIONS)
-        self.assertEqual(rec["switch_models"], ["sonnet", "haiku"])
+        self.assertEqual(rec["switch_models"], ["sonnet-5", "haiku"])
+        self.assertEqual(rec["menu"], ["Wait", "x" * 80], "no purchase, bounded, printable")
         for bad in (None, [], {"v": 2, "state": "running"}, {"v": 1, "state": "offline"}):
             self.assertIsNone(crs.coerce(bad), bad)
 
@@ -428,7 +441,7 @@ class Contract(unittest.TestCase):
     def test_the_writer_produces_the_heartbeat_fixtures_recovery_block(self):
         want = fixture("heartbeat.json")["health"]["recovery"]
         got = derive({"state": "crashed"}, HOLD, runtime="claude", model="opus", waiting_tasks=2, restarts_10m=0,
-                     runtimes_available=("claude", "codex"))
+                     runtimes_available=("claude", "codex"), models_offered=OFFERED, model_labels=OFFERED_LABELS)
         self.assertEqual(got, want)
         with tempfile.TemporaryDirectory() as tmp:
             crs.publish(Path(tmp), got, now=time.time())
@@ -450,10 +463,11 @@ class Contract(unittest.TestCase):
     def test_the_action_fixture_is_a_click_the_hitl_wire_parses_and_the_allowlist_admits(self):
         body = fixture("action.json")
         reply = ActionReply.from_wire(body[REPLY_FIELD])
-        self.assertEqual(crs.parse_action_id(reply.action_id), ("switch_model", "sonnet"))
-        for ok in ("retry_now", "restart_core", "escape_prompt", "switch_model:haiku", "switch_runtime:codex"):
+        self.assertEqual(crs.parse_action_id(reply.action_id), ("switch_model", "sonnet-5-1m-context"))
+        for ok in ("retry_now", "restart_core", "escape_prompt", "refresh_options", "switch_model:haiku",
+                   "switch_runtime:codex"):
             self.assertIsNotNone(crs.parse_action_id(ok), ok)
-        for bad in ("switch_model:fable", "switch_model:", "switch_model:sonnet; rm", "switch_runtime:agy",
+        for bad in ("switch_model:", "switch_model:sonnet; rm", "switch_model:Opus", "switch_runtime:agy",
                     "restart", "", None, 3):
             self.assertIsNone(crs.parse_action_id(bad), bad)
 

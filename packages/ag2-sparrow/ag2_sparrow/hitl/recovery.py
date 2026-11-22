@@ -28,12 +28,14 @@ SWITCH_MODEL = "switch_model"
 SWITCH_RUNTIME = "switch_runtime"
 RESTART_CORE = "restart_core"
 ESCAPE_PROMPT = "escape_prompt"
-# The model aliases scripts/switch-model.sh accepts that a card may offer; Fable is a spend decision.
-SWITCH_ALIASES = ("opus", "sonnet", "haiku")
+REFRESH_OPTIONS = "refresh_options"
+# A model is named by the key of the runtime's own list (runtime_models); which keys exist is that
+# list's, checked before anything runs.
+_MODEL_KEY = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
 # A runtime is named by a slug here; which runtimes exist is the engine's list
 # (core_recovery_state.RUNTIMES), checked before anything runs.
 _RUNTIME_ID = re.compile(r"^[a-z][a-z0-9-]{0,15}$")
-_BARE = frozenset({RETRY_NOW, RESTART_CORE, ESCAPE_PROMPT, BUY_CREDITS, ADD_ACCOUNT})
+_BARE = frozenset({RETRY_NOW, RESTART_CORE, ESCAPE_PROMPT, BUY_CREDITS, ADD_ACCOUNT, REFRESH_OPTIONS})
 # An account is named by its opaque digest (core_recovery_state's), never an address or token.
 _ACCOUNT_ID = re.compile(r"^acct_[0-9a-f]{6}$")
 # Act on the core itself, so a worker seat's card never carries them.
@@ -44,7 +46,7 @@ RECEIPT_VERSION = 1
 # The one sentence every surface uses about a worker's model (card, notice, reply, refusal).
 SEAT_MODEL_LOCKED = "Its model can't be switched yet: workers share the core's model setting."
 
-_LABELS = {RETRY_NOW: "Retry now", RESTART_CORE: "Restart core", ESCAPE_PROMPT: "Escape and retry",
+_LABELS = {REFRESH_OPTIONS: "Refresh options", RETRY_NOW: "Retry now", RESTART_CORE: "Restart core", ESCAPE_PROMPT: "Escape and retry",
            BUY_CREDITS: "Add usage credits", ADD_ACCOUNT: "Add another account"}
 
 
@@ -55,7 +57,7 @@ def parse(action_id: Any) -> Optional[Tuple[str, Optional[str]]]:
     if action_id in _BARE:
         return action_id, None
     verb, sep, arg = action_id.partition(":")
-    if verb == SWITCH_MODEL and sep and arg in SWITCH_ALIASES:
+    if verb == SWITCH_MODEL and sep and _MODEL_KEY.match(arg):
         return verb, arg
     if verb == SWITCH_RUNTIME and sep and _RUNTIME_ID.match(arg):
         return verb, arg
@@ -81,14 +83,13 @@ def action_id(verb: str, arg: Optional[str] = None) -> str:
 
 
 def label(aid: str, runtime_names: Optional[dict] = None, model_names: Optional[dict] = None) -> str:
-    """The button text. `model_names` maps an alias to the exact model the switch sets (the
-    model-switch table), so the button names the model the switch sends."""
+    """The button text. `model_names` maps a model key to the runtime's own label for it."""
     parsed = parse(aid)
     if parsed is None:
         raise ValueError(f"not a recovery action: {aid!r}")
     verb, arg = parsed
     if verb == SWITCH_MODEL:
-        return f"Switch to {(model_names or {}).get(arg) or arg.capitalize()}"
+        return f"Switch to {(model_names or {}).get(arg) or arg}"
     if verb == SWITCH_RUNTIME:
         return f"Switch to {(runtime_names or {}).get(arg, arg)}"
     if verb == SWITCH_ACCOUNT:

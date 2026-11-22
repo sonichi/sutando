@@ -826,7 +826,11 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
                                        runtime=runtime,
                                        episode=tui_gate.LIMIT_EPISODE if limit else None,
                                        controls=controls,
-                                       model_names=recovery_actions.model_names() if controls else None)
+                                       model_names=recovery_actions.model_names(workspace, runtime) if controls else None)
+        if controls and limit and not seat:
+            line = recovery_actions.models_line(workspace, runtime, prompt)
+            if line:
+                req.message = f"{req.message}\n\n{line}"
         if queued:
             req.message = f"{req.message}\n\n{core_gate_notice.card_line(queued)}"
         if seat:
@@ -922,6 +926,23 @@ def recovery_step(manager, workspace, socket, session, runtime, seat, enabled=Tr
     except Exception as exc:  # noqa: BLE001
         print(f"recovery actions failed: {exc}", file=_sys.stderr)
         return None
+
+
+def models_step(manager, workspace, socket, session, runtime, seat, state, kind, prompt, pane):
+    """Read the runtime's own model list off its picker (runtime_models), opening it once on a
+    core a limit refused, and give the open limit card its model buttons. Never fatal."""
+    try:
+        import recovery_actions
+        import runtime_models
+        got = runtime_models.probe_step(workspace, session, runtime, bool(seat), state,
+                                        is_usage_limit(kind, prompt) and kind == "turn-rejected", pane,
+                                        lambda k: send_keys(socket, session, k))
+        if got in ("ours", "read") and not seat and manager is not None:
+            recovery_actions.refresh_limit_card(manager, workspace, session, runtime)
+        return got
+    except Exception as exc:  # noqa: BLE001
+        print(f"runtime model list failed: {exc}", file=_sys.stderr)
+        return ""
 
 
 #: A session in one of these still needs the owner; anything else is the block having lifted.
@@ -1175,6 +1196,13 @@ def main():
         prev_pane = pane
         if pane and pane.strip():
             last_live_pane = pane
+        if a.chat_escalation and a.auto_answer and models_step(hitl, workspace, a.socket, a.session, runtime,
+                                                               a.seat, state, kind, prompt, pane) == "ours":
+            # The model picker on screen is the one read for the card's model list; it is no gate.
+            if a.once:
+                return
+            time.sleep(a.interval)  # pragma: no cover - daemon heartbeat (tests use --once)
+            continue
         if a.chat_escalation and not a.seat:
             crash_loop_step(hitl, workspace, a.session, runtime, last_live_pane, time.time())
         clock = gate_clock(clock, state, prompt, time.time())

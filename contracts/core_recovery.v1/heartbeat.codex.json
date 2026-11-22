@@ -5,7 +5,13 @@
   "tier": "owner",
   "inflight": 0,
   "status": "idle",
-  "capabilities": ["task-ack", "heartbeat", "core-status", "worker_health.v1", "core_recovery.v1"],
+  "capabilities": [
+    "task-ack",
+    "heartbeat",
+    "core-status",
+    "worker_health.v1",
+    "core_recovery.v1"
+  ],
   "health": {
     "alive": true,
     "motion": "idle",
@@ -20,8 +26,14 @@
       "runtime": "codex",
       "waiting_tasks": 2,
       "restarts_10m": 0,
-      "actions": ["switch_runtime", "restart_core"],
-      "switch_runtimes": ["claude"]
+      "actions": [
+        "switch_runtime",
+        "refresh_options",
+        "restart_core"
+      ],
+      "switch_runtimes": [
+        "claude"
+      ]
     }
   }
 }

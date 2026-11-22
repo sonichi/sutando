@@ -1,12 +1,7 @@
 #!/usr/bin/env bash
-# switch-model.sh --names   prints the alias -> exact model table (model_names.py) as JSON, and exits
 # switch-model.sh <model> [--dry-run] [--confirm] [--offline] [--accept-timeout S] [--picker-dismiss-after S] [--state-dir DIR] [--brain DIR] [--session NAME] [--socket PATH] [--launcher PATH]
 # Sends /model through the shared sender and records only after the CLI accepts THAT model; settings.json is the CLI's to write.
 set -u
-if [ "${1:-}" = "--names" ]; then
-  _REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
-  exec "$(bash "$_REPO/scripts/sutando-config.sh" python-bin)" "$_REPO/skills/model-switch/scripts/model_names.py" table
-fi
 MODEL=""; DRY=""; OFFLINE=""; STATE_DIR=""; BRAIN=""; DESCF=""; SESSION="${SUTANDO_TMUX_SESSION:-}"; SOCK="${SUTANDO_TMUX_SOCKET:-}"; CONFIRM=""; ACCEPT_TIMEOUT=20; DISMISS_AFTER=""; LAUNCHER=""; RELAUNCH=""
 while [ $# -gt 0 ]; do case "$1" in
   --dry-run) DRY=1;; --offline) OFFLINE=1;; --state-dir) STATE_DIR="${2:?}"; shift;; --confirm) CONFIRM=1;; --accept-timeout) ACCEPT_TIMEOUT="${2:?}"; shift;;

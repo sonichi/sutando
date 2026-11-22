@@ -2,9 +2,9 @@
   "v": 1,
   "hitl_id": "hr_01J9Z8K2",
   "incident": "inc_1026786a",
-  "action_id": "switch_model:sonnet",
+  "action_id": "switch_model:sonnet-5-1m-context",
   "outcome": "done",
   "reason": null,
   "at": 1763730420,
-  "recovery": {"state": "running", "model": "claude-sonnet-5-5"}
+  "recovery": {"state": "running", "model": "claude-sonnet-5[1m]"}
 }

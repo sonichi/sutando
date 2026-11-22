@@ -195,24 +195,17 @@ def recovery_action(aid: str, model_names: Optional[Dict[str, str]] = None) -> A
 
 
 # The limit menu's choices that only wait: one tap never spends, switches or signs anything in.
-_SAFE_WAITS = ((re.compile(r"^\s*stop and wait for (?:the )?limit to reset\b", re.I), lambda m: "Wait for reset"),
-               (re.compile(r"\bcontinue automatically at (.+?)\s*$", re.I),
-                lambda m: f"Continue automatically at {m.group(1)}"))
-_SPEND = re.compile(r"fund|credit|pay|purchase|upgrade|buy|plan", re.I)
+_SPEND = re.compile(r"fund|credit|pay|purchase|upgrade|buy|plan|billing|extra usage", re.I)
+# A model switch typed into this menu would save the default for every session sharing the
+# config dir; switches go through the card's model buttons, which the executor validates.
+_MENU_SWITCH = re.compile(r"\bswitch\b.*\bmodel\b|/model\b", re.I)
 
 
 def safe_limit_options(options: Sequence[str]) -> List[Tuple[int, str]]:
-    """(index, button label) for each limit-menu option that only waits."""
-    out = []
-    for i, option in enumerate(options):
-        if _SPEND.search(option):
-            continue
-        for rx, name in _SAFE_WAITS:
-            m = rx.search(option)
-            if m:
-                out.append((i, name(m)))
-                break
-    return out
+    """(index, the runtime's own wording) for each limit-menu option a tap may choose: every
+    one but a purchase and a model switch, so tapping it is choosing it in the terminal."""
+    return [(i, " ".join(o.split())) for i, o in enumerate(options)
+            if not _SPEND.search(o) and not _MENU_SWITCH.search(o)]
 
 
 def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],

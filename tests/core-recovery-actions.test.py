@@ -35,6 +35,7 @@ spec.loader.exec_module(M)
 
 import core_limit_hold
 import recovery_actions as RA
+import runtime_models
 from hitl import recovery, tui_gate
 from hitl.manager import HitlManager, HitlStore
 from hitl.projector import fallback_body
@@ -57,6 +58,9 @@ UNKNOWN = "  Something unexpected\n  ❯ do the thing?\n  Esc to cancel"
 COMMANDS = ("/login", "/usage-credits", "/model", "codex login", "tmux -S", "attach")
 PURCHASE_WORDS = ("credit", "Plan & usage", "funds")
 SECRET = "sk-ant-oat01-SECRETSECRETSECRET"
+
+
+PICKER = (REPO / "tests" / "fixtures" / "pane-claude-model-picker.txt").read_text()
 
 
 class Run:
@@ -88,9 +92,14 @@ class Base(unittest.TestCase):
         self.keys = []
         self.which = mock.patch.object(RA.shutil, "which", return_value=None)  # PATH never decides
         self.which.start()
+        # The runtime's own model list, as its /model picker showed it on a live host.
+        runtime_models.record(self.ws, "claude", runtime_models.parse_picker(PICKER, "claude"))
+        self.launch = mock.patch.object(core_limit_hold, "launch_identity", lambda ws, config_dir=None: ("claude-opus-5-5", None))
+        self.launch.start()
 
     def tearDown(self):
         self.which.stop()
+        self.launch.stop()
         self.tmp.cleanup()
 
     def card(self, kind="usage-limit", prompt=LIMIT, seat=None, runtime="claude", fresh=True):
@@ -126,43 +135,69 @@ class CardButtons(Base):
     def test_core_limit_card_offers_runtime_neutral_buttons_and_names_them(self):
         req = self.card()
         self.assertEqual([a.id for a in req.actions],
-                         ["switch_model:opus", "switch_model:sonnet", "switch_model:haiku", "retry_now",
-                          "add_account", "restart_core", "open_terminal"], "no purchase is offered")
+                         ["switch_model:sonnet-5-1m-context", "switch_model:fable-5-1", "switch_model:haiku",
+                          "retry_now", "add_account", "refresh_options", "restart_core", "open_terminal"],
+                         "the runtime's own list, minus the model in use; no purchase")
         kinds = {a.id: a.kind for a in req.actions}
         self.assertEqual({k for i, k in kinds.items() if i != "open_terminal"}, {recovery.ACTION_KIND})
         self.assertEqual(req.actions[-1].kind, "open_terminal", "the terminal stays last and host-only")
         self.assertIn("tap a model below", req.message, "no runtime button here (no codex CLI), so none named")
 
     def test_switch_buttons_skip_the_model_in_use_and_codex_offers_the_runtime_instead(self):
-        (self.ws / "state" / "model-switch.json").write_text(json.dumps({"model": "sonnet"}))
-        self.assertNotIn("switch_model:sonnet", [a.id for a in self.card().actions])
+        (self.ws / "state" / "model-switch.json").write_text(json.dumps({"model": "claude-sonnet-5[1m]"}))
+        ids = [a.id for a in self.card().actions]
+        self.assertNotIn("switch_model:sonnet-5-1m-context", ids)
+        self.assertIn("switch_model:opus-5-5", ids)
         ids = [a.id for a in self.card(runtime="codex").actions]
         self.assertFalse([i for i in ids if i.startswith("switch_model:")])
         self.assertIn("switch_runtime:claude", ids)
         with mock.patch.object(RA.shutil, "which", return_value="/usr/local/bin/codex"):
             self.assertIn("switch_runtime:codex", [a.id for a in self.card().actions])
 
-    def test_switch_buttons_name_the_exact_model_the_switch_sets(self):
-        table = RA.model_table()
-        self.assertTrue(table, "the model-switch table must name an exact model per alias")
+    def test_the_card_shows_exactly_the_runtimes_own_model_list(self):
+        """Displayed options == the runtime's option list fixture (its /model picker), by exact name,
+        minus the model in use; the line names every one with the in-use and capped ones marked."""
+        rows = runtime_models.parse_picker(PICKER, "claude")
+        self.assertEqual([r["label"] for r in rows],
+                         ["Default (Opus 5.5)", "Opus 5.5", "Sonnet 5 (1M context)", "Fable 5.1", "Haiku 4.5"])
         req = self.card()
-        for a in req.actions:
-            if a.id.startswith("switch_model:"):
-                alias = a.id.split(":", 1)[1]
-                self.assertEqual(a.label, f"Switch to {table[alias]['display']}")
-                self.assertRegex(a.label, r"^Switch to [A-Z][a-z]+ \d+(\.\d+)*$")
-        self.click(req, "switch_model:opus")
+        shown = [a.label for a in req.actions if a.id.startswith("switch_model:")]
+        self.assertEqual(shown, ["Switch to Sonnet 5 (1M context)", "Switch to Fable 5.1", "Switch to Haiku 4.5"])
+        self.assertIn("This runtime offers: Default (Opus 5.5) · Opus 5.5 (in use) · Sonnet 5 (1M context) · "
+                      "Fable 5.1 · Haiku 4.5.", req.message)
+        capped = self.card(kind="turn-rejected", prompt=FABLE_REFUSED)
+        self.assertNotIn("switch_model:fable-5-1", [a.id for a in capped.actions], "the capped model is not offered")
+        self.assertIn("Fable 5.1 (hit its limit)", capped.message)
+
+    def test_a_tap_sets_exactly_the_model_its_button_names(self):
+        req = self.card()
+        self.click(req, "switch_model:haiku")
         run = Run()
         [receipt] = self.run_pending(run)
         argv = run.calls[0][0]
-        self.assertEqual(argv[2], table["opus"]["id"], "the switch sends the model the button names")
-        self.assertEqual(receipt["recovery"]["model"], table["opus"]["id"])
-        self.assertIn(f"Switched the core to {table['opus']['display']}", self.mgr.get(req.id).message)
+        self.assertEqual(argv[2], "claude-haiku-4-5", "Haiku 4.5, the model the button names")
+        self.assertEqual(receipt["recovery"]["model"], "claude-haiku-4-5")
+        self.assertIn("Switched the core to Haiku 4.5", self.mgr.get(req.id).message)
+
+    def test_the_allowlist_is_the_list_shown(self):
+        req = self.card()
+        for key in ("opus-5-5", "default-recommended", "gpt-6-sol", "sonnet"):
+            with self.subTest(key=key):
+                with self.mgr.store.locked():
+                    cur = self.mgr.get(req.id)
+                    cur.actions = [tui_gate.recovery_action(f"switch_model:{key}")] + cur.actions
+                    self.mgr.store.save(cur)
+                self.assertEqual(RA._execute("switch_model", key, self.mgr.get(req.id), self.target(), Run(),
+                                             time.time(), [])[0], "refused", key)
+
+    def test_without_the_runtimes_list_no_model_is_offered(self):
+        (self.ws / "state" / "runtime-models.claude.json").unlink()
+        self.assertFalse([a for a in self.card().actions if a.id.startswith("switch_model:")])
 
     def test_live_seat_fable_refusal_card(self):
         req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED, seat=SEAT)
         ids = [a.id for a in req.actions]
-        self.assertEqual(ids, ["retry_now", "add_account", "open_terminal"],
+        self.assertEqual(ids, ["retry_now", "add_account", "refresh_options", "open_terminal"],
                          "a seat shares the core's config dir: no model switch, no core action, no purchase")
         self.assertIn(SEAT, req.title)
         self.assertIn(recovery.SEAT_MODEL_LOCKED, req.message, "the card says what the notice says")
@@ -170,8 +205,9 @@ class CardButtons(Base):
     def test_live_seat_rate_limit_menu_card_offers_only_the_wait_choices(self):
         req = self.card(kind="selection", prompt=LIMIT_MENU, seat=SEAT)
         labels = {a.id: a.label for a in req.actions}
-        self.assertEqual(labels["opt1"], "Wait for reset")
-        self.assertEqual(labels["opt2"], "Continue automatically at Nov 15 at 6am")
+        # The menu's own choices in the runtime's own wording, minus the purchase.
+        self.assertEqual(labels["opt1"], "Stop and wait for limit to reset")
+        self.assertEqual(labels["opt2"], "Wait here, then continue automatically at Nov 15 at 6am")
         self.assertNotIn("opt3", labels, "Add funds is never a one-tap keystroke")
         self.assertEqual(req.subject["option_for_action"], {"opt1": 0, "opt2": 1})
         self.assertNotIn("buy_credits", labels)
@@ -199,7 +235,7 @@ class CardButtons(Base):
 
     def test_core_unparsed_prompt_offers_restart_and_a_seat_card_without_controls_is_unchanged(self):
         req = self.card(kind="unknown", prompt=UNKNOWN)
-        self.assertEqual([a.id for a in req.actions], ["restart_core", "open_terminal"])
+        self.assertEqual([a.id for a in req.actions], ["refresh_options", "restart_core", "open_terminal"])
         self.assertIn("Tap Restart core", req.message)
         legacy = M.escalate(self.mgr, "blocked-human", "awaiting user: usage-limit", "usage-limit", LIMIT,
                             SEAT_SESSION, seat=SEAT, runtime="claude")
@@ -239,9 +275,9 @@ class Routing(Base):
 
 class Executor(Base):
     def test_switch_runs_once_writes_receipt_and_audit_and_closes_the_card_once_verified(self):
-        sonnet = RA.model_table()["sonnet"]
+        sonnet = {"id": "claude-sonnet-5[1m]", "display": "Sonnet 5 (1M context)"}
         req = self.card()
-        self.click(req, "switch_model:sonnet")
+        self.click(req, "switch_model:sonnet-5-1m-context")
         run = Run()
         [receipt] = self.run_pending(run)
         self.assertEqual(run.calls[0][0][1:4], [str(REPO / "scripts" / "switch-model.sh"), sonnet["id"], "--confirm"])
@@ -260,7 +296,7 @@ class Executor(Base):
         self.assertEqual(len(run.calls), 1, "once per id")
         [line] = self.audit()
         self.assertEqual((line["action_id"], line["outcome"], line["sender"], line["session"]),
-                         ("switch_model:sonnet", "done", OWNER, CORE))
+                         ("switch_model:sonnet-5-1m-context", "done", OWNER, CORE))
 
     def test_a_seat_switch_is_never_run(self):
         # /model in a seat saves the default in the config dir it shares with the core and every seat.
@@ -458,7 +494,7 @@ class OneCardPerIncident(Base):
 
     def test_a_done_switch_that_does_not_unblock_keeps_the_same_card_and_says_so_once(self):
         req = self.card()
-        self.click(req, "switch_model:sonnet")
+        self.click(req, "switch_model:sonnet-5-1m-context")
         [receipt] = self.run_pending(Run())
         self.assertEqual(receipt["outcome"], "done")
         for _ in range(4):  # later ticks still see the limit screen and escalate as they would
@@ -513,7 +549,8 @@ class PausedCard(Base):
         b = RA.hold_card_step(self.mgr, self.ws, CORE, "claude")
         self.assertEqual(a.id, b.id)
         self.assertEqual([x.id for x in a.actions],
-                         ["retry_now", "switch_model:sonnet", "switch_model:haiku", "add_account"])
+                         ["retry_now", "switch_model:sonnet-5-1m-context", "switch_model:fable-5-1",
+                          "switch_model:haiku", "add_account", "refresh_options"])
         self.assertIs(a.subject.get("remind"), False)
         for word in COMMANDS + PURCHASE_WORDS:
             self.assertNotIn(word, a.message)
@@ -541,7 +578,7 @@ class Contract(Base):
     def test_action_fixture_is_a_recovery_click_and_its_hand_off_keeps_every_field(self):
         wire = json.loads((CONTRACTS / "action.json").read_text())[REPLY_FIELD]
         reply = ActionReply.from_wire(wire)
-        self.assertEqual(recovery.parse(reply.action_id), ("switch_model", "sonnet"))
+        self.assertEqual(recovery.parse(reply.action_id), ("switch_model", "sonnet-5-1m-context"))
         body = json.loads(recovery.write_action(self.ws, reply, OWNER, DM, now=1).read_text())
         self.assertEqual({k: body[k] for k in wire}, wire)
 

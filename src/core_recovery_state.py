@@ -55,16 +55,13 @@ STATES = ("running", "idle", "paused_limit", "out_of_credits", "signed_out",
           "blocked_prompt", "crash_loop", "starting", "unknown")
 #: The core runtimes the launcher runs (src/agent/start-cli.sh), each with the CLI it is named for.
 RUNTIMES = ("claude", "codex")
-ACTIONS = ("retry_now", "switch_model", "switch_runtime", "restart_core", "escape_prompt")
-#: Per runtime, the aliases a switch may offer (switch-model.sh's, Fable being a spend decision)
-#: and the actions its host side carries out; Codex has no model switch or relaunch hold yet.
-MODEL_ALIASES = {"claude": ("opus", "sonnet", "haiku"), "codex": ()}
-#: A click may also name a stored account; it is never offered in the record before such a store
-#: exists, and it is high impact: the executor asks for the owner's confirmation first.
+ACTIONS = ("retry_now", "switch_model", "switch_runtime", "restart_core", "escape_prompt", "refresh_options")
+#: A stored-account switch: never offered before such a store exists, and confirmed by the owner.
 STEP_UP_ACTIONS = frozenset({"switch_account"})
 CLICK_VERBS = ACTIONS + tuple(sorted(STEP_UP_ACTIONS))
+#: Per runtime, what its host side carries out; Codex has no model switch or relaunch hold yet.
 RUNTIME_ACTIONS = {"claude": frozenset(CLICK_VERBS),
-                   "codex": frozenset({"switch_runtime", "restart_core", "escape_prompt"})}
+                   "codex": frozenset({"switch_runtime", "restart_core", "escape_prompt", "refresh_options"})}
 #: An unknown runtime gets only what works on any pane.
 NEUTRAL_ACTIONS = frozenset({"restart_core", "escape_prompt"})
 RECEIPT_OUTCOMES = ("done", "refused", "stale", "failed")
@@ -85,10 +82,10 @@ SESSION_STARTS_TAIL_BYTES = 64 * 1024
 QUOTA_EVIDENCE_WINDOW_S = 15 * 60
 
 _ACTIONS_FOR = {
-    "paused_limit": ("retry_now", "switch_model", "switch_runtime", "restart_core"),
-    "out_of_credits": ("retry_now", "switch_model", "switch_runtime", "restart_core"),
+    "paused_limit": ("retry_now", "switch_model", "switch_runtime", "refresh_options", "restart_core"),
+    "out_of_credits": ("retry_now", "switch_model", "switch_runtime", "refresh_options", "restart_core"),
     "signed_out": ("switch_runtime", "restart_core"),
-    "blocked_prompt": ("escape_prompt", "restart_core"),
+    "blocked_prompt": ("escape_prompt", "refresh_options", "restart_core"),
     "crash_loop": ("restart_core",),
     "unknown": ("restart_core",),
 }
@@ -103,15 +100,16 @@ MODEL_NAMES = ("opus", "sonnet", "haiku", "fable", "default")
 _SHAPES = {"incident": re.compile(r"inc_[0-9a-f]{8}"), "account": re.compile(r"acct_[0-9a-f]{6}"),
            "model": re.compile("|".join(MODEL_NAMES))}
 MAX_INT = 2 ** 53
-_ALL_ALIASES = tuple(a for r in RUNTIMES for a in MODEL_ALIASES[r])
+_MODEL_KEY = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
 
 
 # ---- the vocabulary other modules share -------------------------------------------------
 
 def parse_action_id(action_id: Any, runtime: Optional[str] = None, accounts: tuple = ()) -> Optional[tuple]:
     """(verb, arg) for an allowlisted click id (`contracts/core_recovery.v1/action.json`), else
-    None. With `runtime`, the id must be one that runtime carries out: `switch_model:<alias>` an
-    alias of its own, `switch_runtime:<runtime>` another runtime. `switch_account:<id>` takes only
+    None. With `runtime`, the id must be one that runtime carries out: `switch_model:<key>` a key of
+    the runtime's model list (shape only here; the executor checks the list itself),
+    `switch_runtime:<runtime>` another runtime. `switch_account:<id>` takes only
     an id in `accounts`, the host's own stored list. Anything else is refused; no part of the id is
     ever passed on but a value from one of those lists."""
     from hitl import recovery
@@ -123,7 +121,7 @@ def parse_action_id(action_id: Any, runtime: Optional[str] = None, accounts: tup
         return None
     if runtime is not None and verb not in RUNTIME_ACTIONS.get(runtime, NEUTRAL_ACTIONS):
         return None
-    if verb == "switch_model" and arg not in (MODEL_ALIASES.get(runtime, ()) if runtime else _ALL_ALIASES):
+    if verb == "switch_model" and not _MODEL_KEY.match(arg or ""):
         return None
     if verb == "switch_runtime" and (arg not in RUNTIMES or arg == runtime):
         return None
@@ -157,8 +155,11 @@ def coerce(record: Any) -> Optional[dict]:
         out["actions"] = [a for a in acts if a in ACTIONS][:MAX_ACTIONS]
     models = record.get("switch_models")
     if isinstance(models, list):
-        allowed = MODEL_ALIASES.get(out.get("runtime"), _ALL_ALIASES)
-        out["switch_models"] = [m for m in models if m in allowed][:MAX_SWITCH_MODELS]
+        out["switch_models"] = [m for m in models if isinstance(m, str) and _MODEL_KEY.match(m)][:MAX_SWITCH_MODELS]
+    for key in ("model_labels", "menu"):
+        labels = record.get(key)
+        if isinstance(labels, list):
+            out[key] = [_label(x) for x in labels if _label(x)][:MAX_ACTIONS]
     runtimes = record.get("switch_runtimes")
     if isinstance(runtimes, list):
         out["switch_runtimes"] = [r for r in runtimes if r in RUNTIMES and r != out.get("runtime")]
@@ -166,7 +167,19 @@ def coerce(record: Any) -> Optional[dict]:
 
 
 _ORDER = ("v", "incident", "state", "since", "reset_at", "runtime", "model", "account",
-          "waiting_tasks", "restarts_10m", "actions", "switch_models", "switch_runtimes")
+          "waiting_tasks", "restarts_10m", "actions", "switch_models", "model_labels", "switch_runtimes", "menu")
+#: A label is the runtime's own words for a choice: printable, bounded, never a purchase.
+_LABEL_MAX = 80
+_PURCHASE = re.compile(r"fund|credit|pay|purchase|upgrade|buy|billing|extra usage", re.I)
+
+
+def _label(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())[:_LABEL_MAX]
+    if not text or any(ord(c) < 32 for c in text) or _PURCHASE.search(text):
+        return None
+    return text
 
 
 # ---- derivation ---------------------------------------------------------------------------
@@ -260,8 +273,11 @@ def derive(supervisor: Optional[dict], hold: Optional[dict], supervisor_status: 
            quota: Optional[dict], wedge: Any, *, now: float, prev: Optional[dict] = None,
            runtime: Optional[str] = None, model: Optional[str] = None,
            waiting_tasks: Optional[int] = None, restarts_10m: Optional[int] = None,
-           runtimes_available: tuple = ()) -> dict:
+           runtimes_available: tuple = (), models_offered: Optional[list] = None,
+           model_labels: Optional[list] = None) -> dict:
     """The C1 recovery block for this moment. Pure: every input is passed in.
+    `models_offered` is the keys of the runtime's own model list a switch may name
+    (runtime_models.offer); without it no model switch is offered.
 
     `supervisor` is core-supervisor.json's payload, `hold` core-limit-hold.json's, `quota`
     quota-state.json's, `wedge` cli_wedge.frame_abnormal(pane). `prev` is the last record, so
@@ -304,18 +320,31 @@ def derive(supervisor: Optional[dict], hold: Optional[dict], supervisor_status: 
     can = RUNTIME_ACTIONS.get(runtime, NEUTRAL_ACTIONS)
     actions = [a for a in _ACTIONS_FOR.get(state, ()) if a in can]
     if "switch_model" in actions:
-        held = _family(hold.get("model")) if hold_active else None
-        record["switch_models"] = [a for a in MODEL_ALIASES[runtime] if a not in (family, held)]
+        record["switch_models"] = list(models_offered or [])
+        if model_labels and len(model_labels) == len(record["switch_models"]):
+            record["model_labels"] = list(model_labels)
         if not record["switch_models"]:
             actions.remove("switch_model")
             del record["switch_models"]
+            record.pop("model_labels", None)
     if "switch_runtime" in actions:
         record["switch_runtimes"] = [r for r in RUNTIMES if r in runtimes_available and r != runtime]
         if not record["switch_runtimes"]:
             actions.remove("switch_runtime")
             del record["switch_runtimes"]
     record["actions"] = actions
+    menu = _menu(supervisor) if state in ("paused_limit", "out_of_credits", "blocked_prompt") else []
+    if menu:
+        record["menu"] = menu
     return coerce(record)
+
+
+def _menu(supervisor: dict) -> list:
+    """The choices the runtime's on-screen menu offers now, in its own words, minus purchases (the
+    same list the card's option buttons are, tui_gate.safe_limit_options)."""
+    from hitl import tui_gate
+    options, caret = tui_gate.parse_options(supervisor.get("prompt"))
+    return [label for _i, label in tui_gate.safe_limit_options(options)] if caret is not None else []
 
 
 # ---- the one writer, and its readers -------------------------------------------------------
@@ -441,14 +470,23 @@ def gather(workspace: Path, supervisor: Optional[dict], *, now: float, runtime: 
             model = None
     if pane and runtime == "codex":
         pane = codex_tail(pane)
+    hold = core_limit_hold.read_hold(workspace)
+    offered = _offered(workspace, runtime, model, hold)
     return derive(
-        supervisor, core_limit_hold.read_hold(workspace),
+        supervisor, hold,
         _read_json(status_read_path("supervisor-status.json", workspace)),
         _read_json(status_read_path("quota-state.json", workspace)),
         cli_wedge.frame_abnormal(pane) if pane else None,
         now=now, prev=read(workspace, now), runtime=runtime, model=model,
         waiting_tasks=core_gate_notice.queued_count(workspace),
-        restarts_10m=restarts_in_window(workspace, now), runtimes_available=runtimes_on_host())
+        restarts_10m=restarts_in_window(workspace, now), runtimes_available=runtimes_on_host(),
+        models_offered=[e["key"] for e in offered], model_labels=[e["label"] for e in offered])
+
+
+def _offered(workspace: Path, runtime: Optional[str], model: Optional[str], hold: Optional[dict]) -> list:
+    import runtime_models
+    limited = hold.get("model") if isinstance(hold, dict) and hold.get("status") == "held" else None
+    return runtime_models.offer(workspace, runtime, model, limited)
 
 
 def update(workspace: Path, supervisor: Optional[dict], *, runtime: Optional[str] = None,

@@ -222,6 +222,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`result_router.py`** — Alias of `delivery.router` (phase-1a restructure); one transition window.
 - **`roster_membership.py`** — Which workers a pool roster counts as members: each key of its `workers` mapping whose row is not `state: "retired"` (a row that is not a mapping is a member).
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
+- **`runtime_models.py`** — The models the core's runtime itself offers, read from its own model picker, by exact name.
 - **`runtime_observation.py`** — Runtime observations: one leased record per seat, written by whatever observes that seat's CLI.
 - **`safe_number.py`** — One reader for a number from untrusted JSON (a ledger, a record, a payload).
 - **`scan-call-logs.py`** — Proactive call log scanner — detects issues and classifies by actionability.

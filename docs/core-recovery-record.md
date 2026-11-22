@@ -56,9 +56,10 @@ older than 5 minutes, larger than 4 KiB or outside the schema as absent.
 - A field the inputs cannot supply is left out, never defaulted (`reset_at` only when the provider
   gave one).
 - `actions` come from a fixed set (`retry_now`, `switch_model`, `switch_runtime`, `restart_core`,
-  `escape_prompt`), filtered to what the core's runtime can carry out (below).
-  `switch_models` lists the runtime's own aliases without the running and the limited family;
-  `switch_runtimes` the other runtimes whose CLI is on this host.
+  `escape_prompt`, `refresh_options`), filtered to what the core's runtime can carry out (below).
+  `switch_models` are keys of the runtime's own model list (with `model_labels`, its words), the
+  one in use and the capped one left out; `switch_runtimes` the other runtimes whose CLI is on
+  this host; `menu` the on-screen menu's choices.
 - No prompt text, path, token, model output or account identity: `account` is a 6-hex prefix of
   the hold's account digest.
 
@@ -102,21 +103,34 @@ the recovery actions for its state, picked by `recovery_actions.card_controls`:
 
 | Card | Buttons |
 |---|---|
-| Limit, refused turn (core) | Switch to <exact model> (the model-switch table, minus the model in use and the capped one), Switch runtime, Retry now, Add another account, Restart core |
-| Limit, refused turn (worker seat) | Retry now, Add another account; no model switch (below) |
-| Limit menu (`/rate-limit-options`) | Wait for reset, Continue automatically at <time> (keystrokes), Add another account; the core also gets Restart core |
-| Paused by the relaunch hold | Retry now, Switch to <exact model>, Switch runtime, Add another account |
-| Other blocked prompt (core) | Restart core |
+| Limit, refused turn (core) | Switch to <model> for each row of the runtime's own model list but the one in use and the capped one, Switch runtime, Retry now, Add another account, Refresh options, Restart core |
+| Limit, refused turn (worker seat) | Retry now, Add another account, Refresh options; no model switch (below) |
+| Limit menu (`/rate-limit-options`) | every choice the menu shows, in its own words, but a purchase or a model switch (keystrokes), Add another account, Refresh options; the core also gets Restart core |
+| Paused by the relaunch hold | Retry now, Switch to <model>, Switch runtime, Add another account, Refresh options |
+| Other blocked prompt (core) | Refresh options, Restart core |
 | Crash loop (`core_crash_loop`) | the core: Restart core; a stopped service: none (only an app restart clears it) |
 
 No card offers a purchase. `Open terminal` stays last, as the client-local action.
 
-A switch button names the exact model it sets: `skills/model-switch`'s `MODEL_SWITCH_MODELS`
-table (read through `scripts/switch-model.sh --names`) maps the alias to a model id and its
-display name ("Switch to Opus 5.5"), the executor sends that id, and the confirmation and the
-receipt name it. A worker seat is never offered or run a switch: it shares the core's config dir,
-where the CLI's `/model` saves the default for every session. The card, the notice and the reply
-say so in one sentence (`hitl.recovery.SEAT_MODEL_LOCKED`).
+**The runtime's own options.** The model buttons are the rows of the runtime's own model picker
+(`src/runtime_models.py`): Claude Code's `/model` menu or Codex's model list, read whenever it is
+on the core's pane, recorded in `state/runtime-models.<runtime>.json`, and labelled as the runtime
+labels them with the model and version each runs ("Sonnet 5 (1M context)", "Haiku 4.5"). The card
+also names every row, marking the one in use and the one that hit its limit. The executor accepts
+`switch_model:<key>` only for a row of that same list and sends the model that row runs through
+`scripts/switch-model.sh`, so the button, the switch and the receipt name one model. No list read
+yet means no model button; the card says to tap Refresh options. Refresh options (owner-initiated)
+closes the card; the next tick reads the pane again and posts a new card, and on a core idle at a
+limit refusal it types `/model` once, reads the picker on the next tick and dismisses it with
+Escape (nothing chosen, no card for that picker). The monitor never types into the pane to read
+options unless the owner asked. A menu choice is delivered by the keystroke driver into that same
+menu: if the screen changed since the tap, nothing is typed. The record publishes the same lists:
+`switch_models` (keys), `model_labels` and `menu` (the runtime's words, at most 8, never a
+purchase).
+
+A worker seat is never offered or run a switch: it shares the core's config dir, where the CLI's
+`/model` saves the default for every session. The card, the notice and the reply say so in one
+sentence (`hitl.recovery.SEAT_MODEL_LOCKED`). Codex rows are shown but not switchable yet.
 
 A tap goes through the HITL reply handler (owner only, the card's own room, revision and guard)
 to `state/recovery/actions/<hitl_id>.json`. The monitor watching that card's session runs it
