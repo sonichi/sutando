@@ -60,8 +60,11 @@ class AccountCardTest(unittest.TestCase):
 
     def fake_clear(self, agent_id, **kw):
         self.cleared.append(agent_id)
+        if self.keychain.get("broken"):
+            return gk.FAILED
+        was = self.keychain["saved"]
         self.keychain["saved"] = False
-        return True
+        return gk.REMOVED if was else gk.ABSENT
 
     def serve(self):
         """One task on one long-lived connector, its log kept."""
@@ -203,6 +206,43 @@ class AccountCardTest(unittest.TestCase):
         (done,) = self.posted("$card2")
         self.assertEqual(done["state"], "done")
 
+    def test_a_keychain_failure_is_said_as_one_never_as_removed(self):
+        self.keychain.update(saved=True, broken=True)
+        card = self.menu()
+        self.tap("task-stop", card, "停用 API key")
+        (said,) = self.posted("$card2")
+        self.assertEqual(said["state"], "error")
+        self.assertIn("没能删掉", said["text"])
+        self.assertNotIn("已停用", said["text"])
+        self.assertEqual(self.w.metrics()[-1]["card"], "account-key-not-cleared")
+
+    def test_stop_on_an_older_card_after_the_key_is_gone_changes_nothing_and_says_so(self):
+        self.keychain["saved"] = True
+        card = self.menu()
+        self.tap("task-stop1", card, "停用 API key")
+        self.posted("$card2")
+        self.tap("task-stop2", card, "停用 API key")
+        (said,) = self.posted("$card3")
+        self.assertIn("已经没有保存 API key", said["text"])
+        self.assertNotIn("已停用", said["text"])
+        self.assertEqual(self.w.metrics()[-1]["card"], "account-key-absent")
+
+    def test_the_switch_notice_is_said_only_in_the_owners_dm(self):
+        (self.w.home / "account").write_text("alice@example.com")
+        self.dm("task-1", "STUB:TEXT hi")
+        self.serve()
+        (self.w.home / "account").write_text("bob@example.com")
+        self.dm("task-room", "STUB:TEXT hi", kind="room")
+        self.serve()
+        self.assertEqual(self.w.result("task-room"), "hello from agy-stub\n", "never in a room with other people")
+        self.dm("task-collab", "STUB:TEXT hi", tier="team", collaborator=True)
+        self.serve()
+        self.assertNotIn("已切到", self.w.result("task-collab"))
+        self.dm("task-dm", "STUB:TEXT hi")
+        self.serve()
+        self.assertIn("已切到 b…@example.com 账号", self.w.result("task-dm"), "the DM is told once it is back there")
+        self.assertEqual(self.posted("$x"), [], "and no card goes anywhere")
+
     # ── A4 ──
     def test_a_quota_error_shows_the_card_in_the_dm_once(self):
         self.dm("task-q1", "STUB:QUOTA hi")
@@ -250,10 +290,23 @@ class PartsTest(unittest.TestCase):
             calls.append(argv)
             return subprocess.CompletedProcess(argv, 0 if argv[1] == "delete-generic-password" else 44, "", "")
         self.assertFalse(gk.key_saved(AGENT, run=run, platform="darwin", environ={}))
-        self.assertTrue(gk.clear_key(AGENT, run=run, platform="darwin"))
+        self.assertEqual(gk.clear_key(AGENT, run=run, platform="darwin"), gk.REMOVED)
         for argv in calls:
             self.assertNotIn("-w", argv)
             self.assertEqual(argv[argv.index("-s") + 1], gk.agent_service(AGENT))
+
+    def test_clear_key_reports_each_failure_as_a_failure(self):
+        def answers(delete, find=44):
+            return lambda argv, **kw: subprocess.CompletedProcess(argv, delete if argv[1].startswith("delete") else find, "", "")
+
+        def boom(argv, **kw):
+            raise OSError("no security")
+        self.assertEqual(gk.clear_key(AGENT, run=answers(44), platform="darwin"), gk.ABSENT)
+        self.assertEqual(gk.clear_key(AGENT, run=answers(1), platform="darwin"), gk.FAILED)
+        self.assertEqual(gk.clear_key(AGENT, run=answers(0, find=0), platform="darwin"), gk.FAILED, "still there")
+        self.assertEqual(gk.clear_key(AGENT, run=boom, platform="darwin"), gk.FAILED)
+        self.assertEqual(gk.clear_key(AGENT, run=answers(0), platform="linux"), gk.FAILED)
+        self.assertEqual(gk.clear_key("", run=answers(0), platform="darwin"), gk.FAILED)
 
 
 if __name__ == "__main__":

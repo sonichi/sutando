@@ -183,15 +183,21 @@ class AgyAccount:
             return "account-key-where"
         if verb == UNKEY:
             try:
-                gone = bool(self.clear())
-            except Exception as e:  # noqa: BLE001 - said, never raised into the task
+                outcome = self.clear()
+            except Exception as e:  # noqa: BLE001 - said as a failure, never raised into the task
                 self.log("Gemini API key not removed:", type(e).__name__)
-                gone = False
-            if gone:
+                outcome = gemini_key.FAILED
+            if outcome == gemini_key.REMOVED:
                 self.say(room, self.card("done", "已停用 API key，已从钥匙串删除。下一条消息起用 Google 登录（新开一个会话）。"),
                          result_file)
                 return "account-key-cleared"
-            self.say(room, self.card("error", "没能删掉 API key，请在 设置 → Connections 里删除。" + self.using()), result_file)
+            if outcome == gemini_key.ABSENT:
+                # A tap on an older card, after the key was already removed: nothing to do, and said so.
+                self.say(room, self.card("info", "这个 agent 已经没有保存 API key 了，没有改动。" + self.using(False)), result_file)
+                return "account-key-absent"
+            self.log("Gemini API key not removed (security failed)")
+            self.say(room, self.card("error", "没能删掉 API key（钥匙串操作失败），key 还在用。请在 设置 → Connections 里删除。"),
+                     result_file)
             return "account-key-not-cleared"
         self.publish(result_file, self.quoted("I couldn't match that button. Send /account for a new card.") + "\n")
         return "account-unknown"

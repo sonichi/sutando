@@ -130,14 +130,30 @@ def key_saved(agent_id: str = "", run=None, platform: str = None, environ=None,
     return getattr(done, "returncode", 1) == 0
 
 
-def clear_key(agent_id: str, run=None, platform: str = None, timeout: float = READ_TIMEOUT_S) -> bool:
-    """Delete this agent's saved key ("Stop using the key"); True when no item is left. Only this agent's own
-    item is named, so no other agent's key, and not the app's voice key, can be removed by it."""
+REMOVED, ABSENT, FAILED = "removed", "absent", "failed"
+NOT_FOUND = 44   # `security`'s exit when the item does not exist
+
+
+def clear_key(agent_id: str, run=None, platform: str = None, timeout: float = READ_TIMEOUT_S) -> str:
+    """Delete this agent's saved key ("Stop using the key"): REMOVED when `security` deleted it and it is gone,
+    ABSENT when there was none to delete, FAILED otherwise (off macOS, no agent id, `security` did not run,
+    failed, or the item is still there). Only this agent's own item is named, so no other agent's key, and not
+    the app's voice key, can be removed by it."""
     if not agent_id or (platform or sys.platform) != "darwin":
-        return False
+        return FAILED
     try:
-        (run or subprocess.run)([SECURITY, "delete-generic-password", "-a", ACCOUNT, "-s", agent_service(agent_id)],
-                                capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        done = (run or subprocess.run)([SECURITY, "delete-generic-password", "-a", ACCOUNT, "-s", agent_service(agent_id)],
+                                       capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
-        return False
-    return not key_saved(agent_id, run=run, platform=platform, environ={}, timeout=timeout)
+        return FAILED
+    code = getattr(done, "returncode", 1)
+    if code == NOT_FOUND:
+        return ABSENT
+    if code != 0:
+        return FAILED
+    try:
+        still = (run or subprocess.run)([SECURITY, "find-generic-password", "-a", ACCOUNT, "-s", agent_service(agent_id)],
+                                        capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return FAILED
+    return REMOVED if getattr(still, "returncode", 0) == NOT_FOUND else FAILED

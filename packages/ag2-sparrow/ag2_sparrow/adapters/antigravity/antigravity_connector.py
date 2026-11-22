@@ -677,6 +677,18 @@ class Connector:
                                   agent_id=getattr(self.args, "agent_id", None) or "", log=log)
         return API_KEY_AUTH if keyed else acp_host.SIGNED_IN_AUTH
 
+    @staticmethod
+    def in_owner_dm(path) -> bool:
+        """Whether the task is the owner's own, in their DM (the card rules' owner_may_act): the only place an
+        account notice is said. Elsewhere it is not said, and not marked seen, so the DM is told later."""
+        agent_card, _ = connector_cards._core()
+        try:
+            with open(path, encoding="utf-8") as f:
+                sent, _ = agent_card.reply_words(f.read())
+        except (OSError, ValueError):
+            return False
+        return agent_card.owner_may_act(sent) is None
+
     def account_seen(self) -> str:
         """Which account this owner turn's agy authenticated as (its own log's applyAuthResult): the line
         saying so when it changed since the last turn (agy_account.saw), else ''. Best effort."""
@@ -786,7 +798,7 @@ class Connector:
                 prompt += "\n\n" + self.accounts.HINT
             self.agy_pid = None
             status, text, detail, turn = self.run_turn(task_id, headers, prompt, True, kind=kind)
-            switched = self.account_seen() if kind == OWNER else ""
+            switched = self.account_seen() if kind == OWNER and self.in_owner_dm(path) else ""
         else:
             with guest_turn(self.args, headers, message) as pair:
                 prompt = wake_prompt(task_id, headers, message, operator_lines, None, self.note, readable=pair[1],
