@@ -529,7 +529,7 @@ class Connector:
         """(body, card): one reply button per model agy offered. After a pick (`picked`) the card has no
         buttons: it says the switch is coming, then, with `ran` (the model the next turn ran on), that
         it happened or that it did not; with `same`, that the pick is the model already in use."""
-        agent_card, _ = connector_cards._core()
+        agent_card, issued_cards = connector_cards._core()
         names = {m["id"]: m["name"] for m in state.get("available") or []}
         now = state.get("current") or ""
         if picked:
@@ -550,8 +550,10 @@ class Connector:
         buttons = [agent_card.button(name, "reply", reply="Use %s" % name,
                                      command=agent_card.reply("model", "agent", model_verb(mid)))
                    for mid, name in list(names.items())[:MODEL_BUTTONS]]
+        # The menu says when it stops acting (the time its record is kept), so the app can show it expired.
         return agent_card.build(MODEL_CARD, "pending", title="Model", body="Pick a model for %s" % self.name,
-                                text="Now using %s." % names.get(now, now or "the default model"), buttons=buttons)
+                                text="Now using %s." % names.get(now, now or "the default model"), buttons=buttons,
+                                expires_at_ms=int((time.time() + issued_cards.TTL_S) * 1000))
 
     def post_card(self, room, built) -> bool:
         if built is None:

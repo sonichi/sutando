@@ -177,6 +177,9 @@ class ConnectorTest(unittest.TestCase):
         card = sent["extra_content"]["space.ag2.card"]
         self.assertEqual((sent["room_id"], card["text"], [b["label"] for b in card["buttons"]]),
                          (self.DM, "Now using Gemini 3.8 Flash.", ["Gemini 3.8 Flash", "Claude Opus 4.6"]))
+        # The menu carries the time it stops acting: three days, as long as its record is kept.
+        left_s = card["expires_at"] / 1000 - gc.time.time()
+        self.assertTrue(3 * 86400 - 60 < left_s <= 3 * 86400, left_s)
         said = card["buttons"][1]["reply"]
         self.dm_task("task-3", said, reply_to="$card1", click=said)
         self.w.serve()
