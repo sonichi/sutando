@@ -147,6 +147,14 @@ class WhoAgentIds(Base):
         self.assertEqual({r["id"] for r in rows}, {pr.CORE, self.alpha, self.beta})
         self.assertTrue(all(r["agent_mxid"] == pa.IDS_UNAVAILABLE for r in rows))
 
+    def test_a_failing_identity_read_still_lists_everyone(self):
+        import connections
+        from unittest import mock
+        with mock.patch.object(connections, "agent_ids", side_effect=RuntimeError("boom")):
+            rows = pa.who(self.ws, runner=Tmux())
+        self.assertEqual({r["id"] for r in rows}, {pr.CORE, self.alpha, self.beta})
+        self.assertTrue(all(r["agent_mxid"] == pa.IDS_UNAVAILABLE for r in rows))
+
     def test_no_record_means_no_ids(self):
         rows = pa.who(self.ws, runner=Tmux())
         self.assertTrue(all(r["agent_mxid"] is None for r in rows))
