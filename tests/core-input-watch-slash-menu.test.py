@@ -78,6 +78,20 @@ class TestWhatStillCounts(unittest.TestCase):
         self.assertIn("Overwrite the existing config file?", tail)
         self.assertNotIn("/model-switch", tail)
 
+    def test_a_gate_line_indented_under_a_menu_row_still_flags(self):
+        # Indented at/past the description column it is shaped like a wrapped description;
+        # its gate signature ends the run, so it stays evidence.
+        row = "plus optional rule tweaks\n"
+        for hint, kind in (("Press Enter to continue", "press-enter"),
+                           ("Do you want to proceed? Enter to confirm", "permission")):
+            with self.subTest(hint):
+                pane = MENU.replace(row, row + " " * 41 + hint + "\n", 1)
+                self.assertIn(" " * 41 + hint, pane)
+                got = _mod.classify(pane)
+                self.assertIsNotNone(got)
+                self.assertEqual(got[0], kind)
+                self.assertIn(hint, got[1])
+
     def test_a_novel_prompt_with_no_menu_still_classifies_unknown(self):
         pane = ("⏺ Done.\n"
                 "Overwrite the existing config file?\n"

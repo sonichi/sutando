@@ -476,7 +476,7 @@ def _tail_lines(capture: str) -> List[str]:
 _SLASH_MENU_ROW = re.compile(r"^\s*(?:[❯›]\s*)?/[\w:@.-]+\s{2,}(?=\S)")
 
 
-def _slash_menu_rows(rows: List[str]) -> set:
+def _slash_menu_rows(rows: List[str], adapter: RuntimeAdapter = CLAUDE) -> set:
     """Indexes of slash-command completion rows and their wrapped description lines: command
     descriptions, never a dialog's words, though they may quote one ("…to accept it")."""
     out, col = set(), None
@@ -486,7 +486,9 @@ def _slash_menu_rows(rows: List[str]) -> set:
         if m:
             out.add(i)
             col = m.end()
-        elif col is not None and plain.strip() and len(plain) - len(plain.lstrip(" ")) >= col:
+        # A gate signature ends the run: a dialog line indented under a row is no description.
+        elif (col is not None and plain.strip() and len(plain) - len(plain.lstrip(" ")) >= col
+              and not any(rx.search(plain) for _, rx in adapter.gate_signatures)):
             out.add(i)
         else:
             col = None
@@ -501,7 +503,7 @@ def gate_evidence(tail: str, styled_tail: Optional[str] = None,
     line = prompt_line(styled_tail if styled_tail is not None else tail, adapter)
     composer_i = next((i for i in range(len(rows) - 1, -1, -1)
                        if _prompt_glyph(rows[i], adapter) is not None), None)
-    menu = (_slash_menu_rows(rows[:composer_i])
+    menu = (_slash_menu_rows(rows[:composer_i], adapter)
             if composer_i is not None and line is not None and line.text.lstrip().startswith("/")
             else set())
     completed = (composer_i is not None and line is not None and not line.text.strip()
