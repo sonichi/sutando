@@ -11149,13 +11149,15 @@ def _start_agent_cards() -> None:
         _log(f"agent-card: sweep not started: {diagnostics.describe(e)}")
         return
 
+    # Its own timer, never time.sleep: the poll loop's stall accounting counts every sleep it sees.
+    idle = threading.Event()
+
     def _loop():
-        while True:
+        while not idle.wait(AGENT_CARD_SWEEP_S):
             try:
                 poster.sweep()
             except Exception as e:  # noqa: BLE001 - one bad sweep is not the last
                 _log(f"agent-card: sweep error (isolated): {diagnostics.describe(e)}")
-            time.sleep(AGENT_CARD_SWEEP_S)
     threading.Thread(target=_loop, name="sparrow-agent-cards", daemon=True).start()
 
 

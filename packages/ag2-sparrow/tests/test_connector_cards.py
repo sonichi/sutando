@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """connector_cards: a connector queues a card, the bridge posts it, and only the owner's tap on that
 posted card, in the DM it was posted in, comes back as a command."""
+import importlib
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before the bridge is loaded below: no outer credential selector survives.
+isolate_os_environ()
 
 from ag2_sparrow import connector_cards as cc  # noqa: E402
 
@@ -121,12 +129,10 @@ class ConnectorCards(unittest.TestCase):
 
 class BridgeWiring(unittest.TestCase):
     def test_the_bridge_posts_queued_cards_through_its_own_room_call_on_a_thread_of_its_own(self):
-        import importlib
-        import os
-        from unittest import mock
-        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {
-                "AGENT_CONNECT_STATE_DIR": d, "REMOTE_TASK_URL": "https://gw.example/relay",
-                "REMOTE_TASK_TOKEN": "dummy-secret"}):
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["AGENT_CONNECT_STATE_DIR"] = d
+            os.environ.setdefault("REMOTE_TASK_URL", "https://gw.example/relay")
+            os.environ.setdefault("REMOTE_TASK_TOKEN", "dummy-secret")
             m = importlib.reload(importlib.import_module("ag2_sparrow.remote_gateway_bridge"))
             body, card = model_card()
             cc.queue(m._STATE, ROOM, body, card)
@@ -139,27 +145,40 @@ class BridgeWiring(unittest.TestCase):
                 def start(self):
                     pass
 
+            class Timer:
+                """The loop's own wait: two sweeps, then stop. The waits it was asked for are kept."""
+                waits = []
+
+                def __init__(self):
+                    self.left = 2
+
+                def wait(self, seconds):
+                    Timer.waits.append(seconds)
+                    self.left -= 1
+                    return self.left < 0
+
             def req(method, path, payload, timeout=None):
                 calls.append((method, path, payload["extra_content"], timeout))
                 return {"ok": True, "event_id": "$e1"}
 
-            with mock.patch.object(m.threading, "Thread", Thread), mock.patch.object(m, "_req", req), \
-                    mock.patch.object(m.time, "sleep", side_effect=[None, KeyboardInterrupt]):
+            slept = []
+            with mock.patch.object(m.threading, "Thread", Thread), mock.patch.object(m.threading, "Event", Timer), \
+                    mock.patch.object(m, "_req", req), mock.patch.object(m.time, "sleep", slept.append):
                 m._start_agent_cards()
                 (target, name, daemon), = threads
                 self.assertEqual((name, daemon), ("sparrow-agent-cards", True))
-                with self.assertRaises(KeyboardInterrupt):
-                    target()
+                target()
             self.assertEqual(calls, [("POST", "/v1/room", {"space.ag2.card": card}, m._ROOM_POST_TIMEOUT_S)])
+            self.assertEqual((slept, Timer.waits), ([], [m.AGENT_CARD_SWEEP_S] * 3),
+                             "the sweep never calls time.sleep, which the poll loop's stall accounting counts")
             self.assertEqual(cc.absorb(m._STATE, Path(d) / "work"), 1)
             # A sweep that raises is logged and the loop goes on.
             logs = []
-            with mock.patch.object(m.threading, "Thread", Thread), mock.patch.object(m, "_log", logs.append), \
-                    mock.patch.object(cc.Poster, "sweep", side_effect=RuntimeError("x")), \
-                    mock.patch.object(m.time, "sleep", side_effect=[None, KeyboardInterrupt]):
+            with mock.patch.object(m.threading, "Thread", Thread), mock.patch.object(m.threading, "Event", Timer), \
+                    mock.patch.object(m, "_log", logs.append), \
+                    mock.patch.object(cc.Poster, "sweep", side_effect=RuntimeError("x")):
                 m._start_agent_cards()
-                with self.assertRaises(KeyboardInterrupt):
-                    threads[-1][0]()
+                threads[-1][0]()
             self.assertEqual(len([line for line in logs if "sweep error" in line]), 2)
 
 
