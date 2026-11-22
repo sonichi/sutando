@@ -661,6 +661,78 @@ the reseat to run once it is done.
 lane that queued it (`task-<instance>~…`). Each row of `state/agent-activity.jsonl` for such a
 task carries it as `agent`.
 
+### MCP lanes for the s-space proxy
+
+The bundled MCP proxy serves its main descriptor and one extra lane per `*.json` in its lanes
+directory (`AG2_MCP_LANES_DIR`, else `<workspace>/state/ag2-mcp.d/`), routing each Action to the
+lane of its room's homeserver. `connections.sync_mcp_lanes` (`scripts/connections.py
+sync-mcp-lanes`) writes, for each enabled core row the main descriptor does not already serve
+(matched by server or relay), `conn-<instance>.json` (`conn-legacy.json` for the legacy row) and a
+0600 `conn-<instance>.env` holding the row's token under its `token_ref`. The descriptor carries
+`lane`, `server`, `env_file`, `env_key`, `relay` (the token's gateway), `agent_id`, `bearer_digest`,
+`mint_url` (the main descriptor's mint path on the row's own relay origin) and `mcp_url` (the row
+server's DotSpace); a row with no token or no such endpoints is skipped by reason, and so is a
+token holding `'` or a line break (`unquotable_token`), since the env readers only strip the outer
+quotes. Every other `conn-*` file is removed, and so is any `.conn-*.tmp` a crashed write left.
+The main descriptor is found from an explicit path, then `AG2_MCP_DESCRIPTOR`, then any descriptor
+the Claude Code MCP config names, then any the Codex `config.toml` names under
+`[mcp_servers.<name>.env]` (`CODEX_HOME`, else the codex `core_config_dirs` entry), then
+`state/ag2-mcp.json`. Without a readable main descriptor nothing is touched. `drop_mcp_lane` takes
+the same lanes lock as the sync, so a sync that read a row before it was disabled cannot write its
+lane back.
+
+A successful `launch` (startup, add, reconnect, a named row's unpark, update-token) runs the sync;
+`promote` (and its rollbacks), the legacy promotion and `unpark` also sync after their committed
+record write, since no launch follows them. `disconnect`, `park`, `park-legacy` and `remove` drop
+that row's lane at once.
+
+The env file is a copy of the row's token wherever `connection_credential` found it, the Keychain
+included. **Unless the proxy resolves vault lanes (below), a secret that lives only in the vault is
+written to disk with no command run and no opt-in:** on every successful `launch`, and on `promote` and `unpark`, the sync copies it into a 0600
+`state/ag2-mcp.d/conn-<instance>.env` (rewritten only when its content changed). The file is created
+0600 before any byte is written (`mkstemp`, `fchmod`, fsync, `os.replace`), and no result, log line
+or descriptor carries the secret. The copy is kept in `state/` (never in the
+channel dir, where `connection_credential` would read it ahead of the vault). The vault sync carries
+nothing under `state/` unless `vault.sync.include` names it, and the shipped `vault.sync.exclude`
+carves `state/ag2-mcp.d/` out even then.
+
+#### Vault lanes: `lane-mcp-credential`
+
+A proxy that resolves vault lanes needs no copy. The desktop host says so by setting
+`AG2_MCP_LANE_CREDENTIAL` (a JSON argv ending in `lane-mcp-credential`) in the env of the MCP
+client entry that names the main descriptor, in the Claude Code MCP config or the Codex
+`config.toml` (or in the sync's own environment). With it, a row whose token, as
+`connection_credential` resolves it, is the one the vault holds gets a descriptor whose `env_file`
+is `(vault)`, and its `conn-<instance>.env` is removed after the descriptor is rewritten. Without
+it, or when the environment or a channel file holds a token the vault does not, the env file stays
+the default. The setting says the desktop shipped a proxy that reads `(vault)`; a proxy process
+started before that update keeps the old reader until its client restarts it. An entry whose value is not a JSON array of non-empty strings
+counts as unset, as it does for the proxy.
+
+The proxy runs that argv plus `--lane <lane>` (`scripts/connections.py --workspace <ws>
+lane-mcp-credential --lane <lane>`, `connections.lane_mcp_credential`). On success it exits 0 and
+prints one line to stdout, nothing on stderr. It reads the token from the vault alone (by the row's
+`token_ref`, on the row's own gateway host), never the environment or a channel file, so the
+proxy's stripped environment cannot make it answer differently from what the sync checked:
+
+```json
+{"bearer": "<secret half of the row's token>", "lane": "<lane>", "relay": "<the token's gateway, no trailing slash>"}
+```
+
+The proxy accepts it only for the lane it asked about, a relay equal to the descriptor's and a
+bearer whose sha256 is the descriptor's `bearer_digest`. Anything else exits 3 with one line on
+stderr, `lane-mcp-credential: refused, <reason>: <detail>`, which never holds the secret (the
+proxy logs that first line): `not_owner` (this user does not own the workspace), `unknown_lane`
+(no core row has that lane, or the main descriptor serves it: a pool worker's identity and the
+primary lane are never one, and with no readable main descriptor, found as the sync finds it,
+no lane is answered), `disabled`, `parked`, `not_engine_descriptor` (no `conn-<lane>.json` in the
+lanes dir that, opened once without following a symlink, is a regular file of this user, writable
+by no one else, at most 64 KiB, version 1, naming this lane, `(vault)` and the row's
+`token_ref`), `no_token` (the vault holds none), and `descriptor_stale` (the row's current token is not the relay
+and digest the descriptor was written for, until the next sync rewrites it). Argument errors exit
+2. The primary lane never reads the vault: the resolver refuses it as `unknown_lane`, and the proxy
+refuses a primary descriptor naming `(vault)`.
+
 ### A worker's agent as a declared Sparrow bridge
 
 A worker's own agent can run as a Sparrow agent bridge that sparrowd supervises
@@ -744,8 +816,14 @@ nothing. With `--apply` it switches the worker over:
 1. It finds the declared task-event handler first. A failed lookup, or work delivered with no handler to
    move it, refuses before anything changes.
 2. It writes the field and creates the folders (a private agent root), and relaunches the worker's lane
-   under the record lock (a wrapper lane is stopped so the lane keeper starts it on the new folders; a
-   declared bridge is waited for until sparrowd has replaced it).
+   under the record lock. A wrapper lane is stopped and started again on the new folders in that same
+   hold, through `connections.start`, because not every install runs a lane keeper (the desktop app starts
+   lanes once). A start that finds the lane already held spawns nothing. One that fails ends the run not
+   ok (exit 1, the reason in `lane` and `why` with the command that starts it) and keeps the switch. The
+   restart is recorded as owed before the lane is stopped, so a run that dies between the stop and the
+   start leaves it too: a re-run starts that lane, if it is still down, before finishing the rest. The
+   record goes once the lane runs again, or when the lane is disabled or parked. A declared bridge is
+   waited for until sparrowd has replaced it.
 3. It has the handler empty the worker's `deliveries/<id>/` under the router's locks. A task its own lane
    queued moves into its tasks folder and its sentinel is archived. A core task the worker never accepted is
    handed back (attribution first, then the sentinel) and touched so the core's watcher picks it up. One it

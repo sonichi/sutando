@@ -5,7 +5,7 @@ Runs Google's Antigravity CLI (`agy`) on this computer as an s.space agent, the 
 agent in a room and Antigravity answers there. For each task file Sparrow queues, the connector wakes
 Antigravity over the Agent Client Protocol: it spawns `agy acp`, sends `initialize`, resumes the room's
 Session with `session/load` (or opens one with `session/new`) and sends one `session/prompt`; a
-non-owner's turn runs isolated instead (see Tiers and permissions). Stdlib only;
+guest's turn runs isolated instead (see Tiers and permissions). Stdlib only;
 opt-in; the core never imports it.
 
 Status: the handshake and the sign-in check were run against a real `agy` 1.5.9 (signed out); a full turn
@@ -15,7 +15,7 @@ Status: the handshake and the sign-in check were run against a real `agy` 1.5.9 
 curl -fsSL https://antigravity.google/cli/install.sh | bash      # Google's installer: ~/.local/bin/agy
 agy                                                               # once: sign in with Google
 ag2-sparrow-antigravity-local install --agent <@agent:server> --token-stdin [--cwd <dir>]
-ag2-sparrow-antigravity-local install --work <dir> [--acp-command '<cmd>'] [--allow-non-owner]
+ag2-sparrow-antigravity-local install --work <dir> [--acp-command '<cmd>'] [--allow-non-owner] [--allow-owner-shell-web]
 ag2-sparrow-antigravity-local verify [--agent <@agent:server>] [--no-probe]
 ag2-sparrow-antigravity-local uninstall [--agent <@agent:server>]
 ag2-sparrow-antigravity-local list
@@ -50,8 +50,8 @@ The turn's final message is what Sparrow posts: as the reply in the message's th
 `commons.summon`, any other well-formed type). A final message of exactly `NO_REPLY` posts nothing.
 The text is posted with every delivery marker (attachment, redirect, skip, thread) neutralised. When a
 turn fails, a message gets a line saying why (timeout, Antigravity stopped, not signed in) with any
-partial text; an event posts nothing. No shell command is granted, so no reply command is either: the
-final message is the only answer path.
+partial text; an event posts nothing. There is no reply command: the final message is the only answer
+path.
 
 The gateway ends an owner's task with a `===SKILL INSTRUCTIONS===` prelude written for a core that has a
 shell: run a room-read command, then write the result to `results/<task>.txt`. Neither is granted here, and
@@ -70,15 +70,29 @@ refused), `updates` (the turn's `session/update`s counted by type) and `answer_c
 
 ## Tiers and permissions
 
-Only the owner is served by default. Every other sender, an attested collaborator included, is refused
-with one line unless `--allow-non-owner`, which admits them all. A non-owner's turn runs on the owner's agy
-sign-in (the Google account and quota in the Keychain), and a turn whose tool call is denied can end with
-no reply.
+The tier is read only from the task's parsed headers, which the gateway stamps, never from the message
+text: a `collaborator: true` or `access_tier: owner` line in the body changes nothing.
 
-**The owner's turns** resume the room's Session in the working directory, with agy's own home
-(`~/.gemini`: its settings, rules and context).
+| Sender | Served | Turn |
+| --- | --- | --- |
+| owner | always | the owner's turn |
+| Team (an attested collaborator: the team tier with the broker's `collaborator: true`) | always | the owner's turn |
+| guest (any other sender, the team tier without that stamp and an unknown tier included) | only under `--allow-non-owner` | isolated and read-only |
 
-**A non-owner's turn** (anyone `--allow-non-owner` admits, collaborators included) runs isolated:
+A sender who is not served gets one line, "This agent only answers its owner here.", and agy is not
+started. `verify` prints `INFO team (attested collaborator): served as the owner is …` and `INFO guest:
+refused` or `served (--allow-non-owner)`.
+
+Every turn runs on the owner's agy sign-in (the Google account and quota in the Keychain): giving someone
+Collaborator access to this agent lets them spend that quota, and their turns may read and edit the
+working directory as the owner's do. A turn whose tool call is denied can end with no reply.
+
+**The owner's turn** (the owner and Team, decided by the owner on 2026-11-21) runs in the working
+directory with agy's own home (`~/.gemini`: its settings, rules and context) under the owner's permission
+policy below. The owner resumes the room's Session; each collaborator resumes a Session of their own for
+the room (keyed by their user id), so no one resumes another's conversation.
+
+**A guest's turn** (anyone `--allow-non-owner` admits who is not owner or Team) runs isolated:
 
 - a fresh temporary directory per task holds the Session's working directory and a separate agy home,
   passed as `agy acp --gemini-dir <dir>`; that home has only a `settings.json` whose permission rules deny
@@ -88,17 +102,37 @@ no reply.
 - a new Session for every task, never resumed and never recorded in the session store;
 - the Session is put in a read-only mode with `session/set_mode` (`plan`, or a mode named `read-only`),
   picked from the `modes` that `session/new` returns. If agy offers no such mode, or refuses it, the turn
-  is not run: a message gets a line saying so, an event posts nothing.
+  is not run: a message gets a line saying so ("Antigravity did not take this: it answers non-owners only
+  in a read-only session mode, and no read-only session mode is offered (offered: …)."), an event posts
+  nothing.
 
-`--gemini-dir` is agy's flag: a custom `--acp-command` must accept it, or non-owner turns fail.
+`--gemini-dir` is agy's flag: a custom `--acp-command` must accept it, or guest turns fail.
 
 agy's `session/request_permission` is answered by `acp_host`'s policy, default deny:
 
-- the owner only: a `read` or `edit` whose every path resolves (after `..`, `~` and symlinks) under the
-  working directory; never when the working directory is the home directory or above it;
-- nothing else: no shell command, and no `execute`, `fetch`, `delete`, `move` or unclassified call.
+- the owner's own turns only, and only on an install with `--allow-owner-shell-web` (recorded as
+  `ALLOW_OWNER_SHELL_WEB=1`; off by default, so an existing install does not change on update): any shell
+  command and any `execute`, `fetch` or `search` call, as a local Claude Code agent runs commands and uses
+  the web for its owner. Team runs in the owner's turn but never gets this: it is decided by the sender's
+  tier. `verify` prints `INFO owner shell and web: on|off`;
+- the owner's turn only (the owner and Team): a `read` or `edit` whose every path resolves (after `..`, `~`
+  and symlinks) under the working directory; never when the working directory is the home directory or above
+  it. agy's own argument names (`Path`, `Content`, `Overwrite`, `Append`, `Target`, `Replacement`,
+  `AllowMultiple`, `Edits`, `StartLine`, `EndLine`, and the older `TargetFile`, `CodeContent`,
+  `AbsolutePath`, ...) are recognised; any other key refuses the request;
+- nothing else: no command or web call for a collaborator or a guest, and no `delete`, `move` or
+  unclassified call for anyone.
 
-For the owner's turns, agy applies its own permission rules first (an action they already allow runs
+| Turn | Commands, fetch, search | Read or edit under the working directory | Anything else |
+| --- | --- | --- | --- |
+| owner | granted with `--allow-owner-shell-web`, else refused | granted | refused |
+| Team (an attested collaborator, in the owner's turn) | refused (granting it is the owner's decision) | granted | refused |
+| guest (isolated) | refused | refused | refused |
+
+With `--allow-owner-shell-web`, the working-directory bound on `read` and `edit` is no longer a security
+boundary for the owner's turns: a command can read or write anything the owner's account can.
+
+For the owner's turns (Team's included), agy applies its own permission rules first (an action they already allow runs
 without asking), and `--dangerously-skip-permissions` makes it run tools without asking; never add that
 flag to an agent others can reach.
 

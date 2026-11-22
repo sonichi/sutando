@@ -355,7 +355,7 @@ class RetireWhileTheApprovalIsPending(D.Base):
         self.runner = Lifecycle.runner.__get__(self)
         self.alive = set()
 
-    def start_flow(self, *, approve: bool):
+    def start_flow(self, *, approve: bool, cards=None):
         """dc.connect in a thread, held on its first poll until `self.go` is set."""
         self.go, self.fake = threading.Event(), D.ConnectFake(self.backend, expires_in=60)
         self.raised = []
@@ -369,7 +369,8 @@ class RetireWhileTheApprovalIsPending(D.Base):
         def run():
             try:
                 dc.connect(W, label="reviewer", worker_label="Reviewer", workspace=self.ws, vault=self.vault, request=self.fake.request,
-                           preview=self.preview, deliver=self.sent.append, sleep=sleep, clock=self.backend.clock)
+                           preview=self.preview, deliver=self.sent.append, sleep=sleep, clock=self.backend.clock,
+                           cards=cards)
             except dc.DeviceConnectError as e:
                 self.raised.append(e.status)
         self.thread = threading.Thread(target=run, daemon=True)
@@ -380,9 +381,10 @@ class RetireWhileTheApprovalIsPending(D.Base):
             time.sleep(0.01)
         self.fail("the flow never sent its link")
 
-    def retire(self):
+    def retire(self, tell="sent"):
         with unittest.mock.patch.object(C, "_vault", lambda v=None: self.vault):
-            out = pool_manage.retire(self.ws, W, runner=self.runner, tell=self.sent.append)
+            out = pool_manage.retire(self.ws, W, runner=self.runner,
+                                     tell=self.sent.append if tell == "sent" else tell)
         self.assertEqual(out["result"], "retired", out)
         return out
 
@@ -417,6 +419,187 @@ class RetireWhileTheApprovalIsPending(D.Base):
 
     def test_a_worker_with_no_open_approval_reports_none(self):
         self.assertEqual(self.retire()["pending_approval"], {"result": "none"})
+
+    def owner_notes(self):
+        return [p.read_text() for p in sorted((self.ws / "results").glob("proactive-*.txt"))]
+
+    def pending_record(self):
+        """An open approval whose card the owner was shown as $card1."""
+        dc.write_record(self.ws, W, {"label": "reviewer", "worker_label": "Reviewer", "state": "pending",
+                                     "event_id": "$card1", "server": "alpha", "expires_at": time.time() + 900})
+
+    def test_retire_swaps_the_approval_card_for_a_withdrawn_card(self):
+        actions = D.FakeActions()
+        sink = dc.CardSink(actions.execute, DM, self.ws)
+        asked = []
+        self.start_flow(approve=False, cards=sink)
+        self.assertEqual([c["state"] for c in actions.cards()], ["pending"])
+        with unittest.mock.patch.object(dc, "default_cards", lambda ws, core: asked.append(core) or sink):
+            out = self.retire(tell=None)
+        self.assertEqual(out["pending_approval"], {"result": "withdrawn", "label": "reviewer", "owner_told": True})
+        self.assertEqual(asked, [dc.pp.core_lane(self.ws, None)], "the sink is the core lane's")
+        approval, withdrawn = actions.cards()[:2]
+        self.assertEqual(actions.calls[1]["arguments"]["reply_to"], "$card1", "it replaces the approval card")
+        self.assertEqual((withdrawn["id"], withdrawn["state"], withdrawn["header"]["status"]),
+                         (approval["id"], "expired", {"label": "Withdrawn"}))
+        self.assertEqual(withdrawn["header"]["title"], "Reviewer")
+        self.assertNotIn("buttons", withdrawn, "nothing left to approve on it")
+        self.assertIn("Do not approve reviewer", json.dumps(withdrawn))
+        self.assertIn('agent \\"reviewer\\" (pool worker Reviewer) is withdrawn',
+                      json.dumps(actions.calls[1]["arguments"]["body"]))
+        self.assertTrue(actions.calls[1]["operation_id"].startswith(f"worker-approval:{W}:"))
+        self.assertTrue(actions.calls[1]["operation_id"].endswith(":withdrawn"))
+        self.assertEqual((self.sent, self.owner_notes()), ([], []), "the card told the owner; no text as well")
+        self.go.set()
+        self.thread.join(10)
+        self.assertEqual(self.raised, ["expired"])
+        self.assertEqual([c["state"] for c in actions.cards()], ["pending", "expired"],
+                         "the lapsed flow posts no 'link expired' card over the withdrawn one")
+        self.assertEqual(dc.read_record(self.ws, W)["state"], "withdrawn")
+
+    def test_a_withdrawn_card_the_server_refuses_falls_back_to_the_text_note(self):
+        self.pending_record()
+        refusing = D.FakeActions(refuse=True)
+        with unittest.mock.patch.object(dc, "default_cards", lambda ws, core: dc.CardSink(refusing.execute, DM)):
+            out = self.retire(tell=None)
+        self.assertEqual(out["pending_approval"]["owner_told"], True)
+        self.assertEqual(len(refusing.calls), 1, "the card was tried first")
+        notes = self.owner_notes()
+        self.assertEqual(len(notes), 1, notes)
+        self.assertEqual(notes[0], dc.withdrawn_note("Reviewer", "reviewer"))
+        self.assertEqual(dc.read_record(self.ws, W)["state"], "withdrawn")
+
+    def test_a_card_sink_that_raises_falls_back_to_the_text_note(self):
+        for error in (dc.ac.CardError("bad card"), OSError("disk")):
+            with self.subTest(error=type(error).__name__):
+                self.pending_record()
+                sent, shown = [], []
+
+                class Raising:
+                    def show(self, body, card, operation_id, previous=""):
+                        shown.append(previous)
+                        raise error
+                out = dc.withdraw(self.ws, W, cards=Raising(), deliver=sent.append)
+                self.assertEqual(out, {"result": "withdrawn", "label": "reviewer", "owner_told": True})
+                self.assertEqual(shown, ["$card1"])
+                self.assertEqual(sent, [dc.withdrawn_note("Reviewer", "reviewer")])
+
+    def test_an_owner_note_that_cannot_be_delivered_is_reported_as_not_told(self):
+        self.pending_record()
+
+        class Shown:
+            def show(self, *a, **kw):
+                return ""
+        out = dc.withdraw(self.ws, W, cards=Shown(), deliver=lambda text: False)
+        self.assertEqual(out, {"result": "withdrawn", "label": "reviewer", "owner_told": False})
+
+    def test_no_card_sink_to_be_had_falls_back_to_the_text_note(self):
+        for error in (dc.pp.ProvisionError("no single core"), C.ConnectionsError("no rows"), OSError("disk")):
+            with self.subTest(error=type(error).__name__):
+                for p in (self.ws / "results").glob("proactive-*.txt"):
+                    p.unlink()
+                self.pending_record()
+                with unittest.mock.patch.object(dc, "default_cards", side_effect=error):
+                    out = dc.withdraw(self.ws, W)
+                self.assertEqual(out["owner_told"], True)
+                self.assertEqual(self.owner_notes(), [dc.withdrawn_note("Reviewer", "reviewer")])
+
+    def test_a_record_without_a_card_sends_only_the_text(self):
+        self.pending_record()
+        dc.write_record(self.ws, W, {**dc.read_record(self.ws, W), "event_id": ""})
+        actions, sent = D.FakeActions(), []
+        out = dc.withdraw(self.ws, W, cards=dc.CardSink(actions.execute, DM, self.ws), deliver=sent.append)
+        self.assertEqual((out["owner_told"], actions.calls), (True, []))
+        self.assertEqual(sent, [dc.withdrawn_note("Reviewer", "reviewer")])
+
+    def test_a_withdrawal_that_raises_is_reported_and_the_worker_is_still_retired(self):
+        self.pending_record()
+        with unittest.mock.patch.object(dc, "withdraw", side_effect=RuntimeError("boom")):
+            out = self.retire()
+        self.assertEqual(out["pending_approval"], {"result": "failed", "why": "RuntimeError: boom"})
+        self.assertEqual(pr.load_roster(self.ws)["workers"][W]["state"], "retired")
+
+
+class RetireNoteNotDelivered(Lifecycle):
+    def test_an_agent_removal_note_that_cannot_be_queued_is_reported_as_not_told(self):
+        with unittest.mock.patch.object(C, "_vault", lambda v=None: self.vault), \
+                unittest.mock.patch.object(dc, "send_to_owner", side_effect=OSError("read-only results")):
+            out = pool_manage.retire(self.ws, W, runner=self.runner)
+        self.assertEqual(out["result"], "retired", out)
+        self.assertEqual((out["identity"]["result"], out["identity"]["owner_told"]), ("removed", False))
+        self.assertIsNone(C.worker_identity(W, self.ws), "the identity is gone even though the note was not")
+        self.assertEqual(list((self.ws / "results").glob("proactive-*.txt")), [])
+
+
+class IdentityRequest(Base):
+    """pool_identity_request.request's other outcomes, driven with a scripted child."""
+
+    def request(self, child, **kw):
+        argvs = []
+
+        def spawn(argv, log):
+            argvs.append(argv)
+            return child(argv, log)
+        out = pir.request(self.ws, "1" * 32, "Triage", repo=ROOT, spawn=spawn, **kw)
+        return out, argvs
+
+    def test_a_link_the_owner_already_approved_reports_approved(self):
+        def child(argv, log):
+            dc._keep(self.ws, argv[5], {"label": argv[8], "state": "done", "expires_at": time.time() + 900})
+            return FakeChild()
+        out, _ = self.request(child)
+        self.assertEqual((out["status"], out["label"]), ("approved", "triage"))
+        self.assertEqual(pir.describe(out), 'approved (agent "triage")')
+
+    def test_a_link_not_confirmed_in_time_reports_starting(self):
+        ticks = iter(range(1000))
+        out, _ = self.request(lambda argv, log: FakeChild(rc=None), wait_s=2, clock=lambda: next(ticks),
+                              sleep=lambda s: None)
+        self.assertEqual((out["status"], out["label"]), ("starting", "triage"))
+        self.assertIn("not confirmed within 2s", out["why"])
+        self.assertEqual(pir.describe(out),
+                         f'starting (agent "triage"; {out["why"]})')
+        self.assertIn(f"worker-identity-{'1' * 32}.log", out["why"])
+
+    def test_a_named_lane_is_passed_to_the_child(self):
+        lane = dc.pp.core_lane(self.ws, None)["instance"]
+        out, argvs = self.request(lambda argv, log: FakeChild(rc=1), lane=lane)
+        self.assertEqual(argvs[0][-2:], ["--lane", lane])
+        self.assertEqual(out["status"], "skipped")
+
+    def test_a_worker_that_already_has_an_agent_is_not_asked_again(self):
+        with unittest.mock.patch.object(C, "worker_identity", lambda wid, ws: {"agent_mxid": NEW_AGENT}):
+            out, argvs = self.request(lambda argv, log: FakeChild(rc=0))
+        self.assertEqual(out, {"status": "skipped", "why": "the worker already has an agent of its own"})
+        self.assertEqual(argvs, [])
+
+    def test_no_free_label_is_an_error(self):
+        taken = {"triage"} | {f"triage-{n}" for n in range(2, 100)}
+        with self.assertRaisesRegex(ValueError, "no free label near 'triage'"):
+            pir.free_label("triage", taken)
+        with unittest.mock.patch.object(pir, "taken_labels", lambda ws, wid: (taken, [])):
+            out, argvs = self.request(lambda argv, log: FakeChild(rc=0))
+        self.assertEqual(out["status"], "skipped")
+        self.assertIn("no free label near 'triage'", out["why"])
+        self.assertEqual(argvs, [])
+
+
+class Spawn(unittest.TestCase):
+    def test_the_child_runs_detached_in_the_repo_and_writes_to_its_log(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "identity.log"
+            log.write_text("earlier\n")
+            proc = pir._spawn([sys.executable, "-c", "import os, sys; print(os.getcwd(), flush=True); "
+                               "print(os.getsid(0) == os.getpid(), flush=True); "
+                               "print(sys.stdin.read() == '', flush=True); print('err', file=sys.stderr)"], log)
+            self.assertEqual(proc.wait(30), 0)
+            lines = log.read_text().splitlines()
+        self.assertEqual(lines[0], "earlier", "the log is appended to")
+        self.assertEqual(Path(lines[1]).resolve(), ROOT.resolve())
+        self.assertEqual(lines[2:], ["True", "True", "err"],
+                         "its own session (it outlives the creator), an empty stdin, and stderr in the log too")
+
 
 if __name__ == "__main__":
     unittest.main()
