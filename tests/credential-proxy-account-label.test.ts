@@ -1,7 +1,7 @@
 /**
- * A quota reading names the account whose credential made its request, sampled when the request
- * is sent: a response that lands after an account switch must not read as the new account's.
- * runtime_profile.gather() trusts a reading only when this label is the signed-in account's.
+ * A quota reading and a rejection name the account of the credential their request was sent with:
+ * a token the proxy took from this config dir's own keychain item, with that dir's account unchanged
+ * across the pick. A passed-through or otherwise unbound credential names none (usage unknown).
  */
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert';
@@ -9,7 +9,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createServer as createHttpServer, request as httpRequest, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { request as httpsRequest } from 'node:https';
-import { accountLabel, createProxyServer, quotaStateFromHeaders, type ProxyDeps } from '../skills/quota-tracker/scripts/credential-proxy.ts';
+import { accountLabel, boundAccount, createProxyServer, quotaStateFromHeaders, recordWithRejection, type ProxyDeps, type RejectionRecord, type StoredClaudeOAuth } from '../skills/quota-tracker/scripts/credential-proxy.ts';
 
 const NOW = 1_700_000_000_000;
 let upstreamHandler: (req: IncomingMessage, res: ServerResponse) => void = () => {};
@@ -25,17 +25,24 @@ function listen(s: Server): Promise<number> {
 
 type Seen = Array<{ model?: string; account?: string | null }>;
 
-async function startProxy(seen: Seen, current: { account: string | null }): Promise<number> {
+interface Setup {
+	account: string | null;
+	creds?: StoredClaudeOAuth[];
+	rejections?: RejectionRecord[];
+}
+
+async function startProxy(seen: Seen, current: Setup): Promise<number> {
 	const upstreamPort = await listen(createHttpServer((req, res) => upstreamHandler(req, res)));
 	const deps: Partial<ProxyDeps> = {
-		readCredCandidates: () => [{ service: 'svc', oauth: { accessToken: 'tok', expiresAt: NOW + 3600_000 } }],
+		readCredCandidates: () => current.creds ?? [{ service: 'scoped', oauth: { accessToken: 'tok', expiresAt: NOW + 3600_000 } }],
 		writeCred: () => true,
 		refreshAccessToken: async () => null,
 		request: httpRequest as unknown as typeof httpsRequest,
 		upstreamUrl: new URL(`http://127.0.0.1:${upstreamPort}`),
 		updateQuotaState: (_headers, model, account) => { seen.push({ model, account }); },
 		readAccount: () => current.account,
-		recordRejection: () => {},
+		scopedService: () => 'scoped',
+		recordRejection: (rej) => { current.rejections?.push(rej); },
 		recordCredentialState: () => {},
 		now: () => NOW,
 		idleTimeoutMs: 5000,
@@ -54,12 +61,16 @@ function call(port: number): Promise<number> {
 	});
 }
 
+const headersOnly = (_req: IncomingMessage, res: ServerResponse) => {
+	res.writeHead(200, { 'anthropic-ratelimit-unified-7d-utilization': '0.9' });
+	res.end('{}');
+};
+
 test('a response that lands after an account switch keeps the account its request was sent with', async () => {
-	const current = { account: 'acct_aaaaaa' as string | null };
-	upstreamHandler = (_req, res) => {
+	const current: Setup = { account: 'acct_aaaaaa' };
+	upstreamHandler = (req, res) => {
 		current.account = 'acct_bbbbbb'; // the seat switches while A's request is in flight
-		res.writeHead(200, { 'anthropic-ratelimit-unified-7d-utilization': '0.9' });
-		res.end('{}');
+		headersOnly(req, res);
 	};
 	const seen: Seen = [];
 	const port = await startProxy(seen, current);
@@ -67,6 +78,52 @@ test('a response that lands after an account switch keeps the account its reques
 	assert.deepStrictEqual(seen, [{ model: 'claude-opus-5-5', account: 'acct_aaaaaa' }]);
 	assert.strictEqual(await call(port), 200);
 	assert.strictEqual(seen[1].account, 'acct_bbbbbb', 'a request sent after the switch is B\'s');
+});
+
+test('a credential the proxy did not take from its own config dir\'s item names no account', async () => {
+	upstreamHandler = headersOnly;
+	const seen: Seen = [];
+	// Pass-through: no keychain credential, the request's own auth goes out unchanged.
+	let port = await startProxy(seen, { account: 'acct_aaaaaa', creds: [] });
+	assert.strictEqual(await call(port), 200);
+	// The vanilla item belongs to no config dir.
+	port = await startProxy(seen, { account: 'acct_aaaaaa', creds: [{ service: 'vanilla', oauth: { accessToken: 't', expiresAt: NOW + 3600_000 } }] });
+	assert.strictEqual(await call(port), 200);
+	// A dead stored token over a client credential: passed through.
+	port = await startProxy(seen, { account: 'acct_aaaaaa', creds: [{ service: 'scoped', oauth: { accessToken: 't', expiresAt: NOW - 1 } }] });
+	assert.strictEqual(await call(port), 200);
+	assert.deepStrictEqual(seen.map((x) => x.account), [null, null, null]);
+});
+
+test('a late rejection carries its request\'s account and cannot end another account\'s overage', async () => {
+	const current: Setup = { account: 'acct_aaaaaa', rejections: [] };
+	upstreamHandler = (_req, res) => {
+		current.account = 'acct_bbbbbb';
+		res.writeHead(429, {});
+		res.end('{"type":"error"}');
+	};
+	const port = await startProxy([], current);
+	assert.strictEqual(await call(port), 429);
+	await new Promise((r) => setTimeout(r, 20));
+	assert.strictEqual(current.rejections?.[0]?.account, 'acct_aaaaaa');
+	const overage = {
+		account: 'acct_bbbbbb', last_checked: '2026-10-09T12:00:00.000Z', available: true, limit_state: 'overage',
+		headers: { 'anthropic-ratelimit-unified-status': 'rejected', 'anthropic-ratelimit-unified-7d-status': 'rejected',
+			'anthropic-ratelimit-unified-overage-status': 'allowed' },
+	};
+	const late = { ...(current.rejections as RejectionRecord[])[0], ts: '2026-10-09T12:00:05.000Z' };
+	const next = recordWithRejection(overage, late);
+	assert.deepStrictEqual([next.limit_state, next.available], ['overage', true], 'A\'s 429 is not B\'s limit');
+	const own = recordWithRejection({ ...overage, account: 'acct_aaaaaa' }, late);
+	assert.deepStrictEqual([own.limit_state, own.available], ['rejected', false], 'the record\'s own account');
+});
+
+test('boundAccount: the scoped item, and the same account on both sides of the pick', () => {
+	assert.strictEqual(boundAccount('scoped', 'scoped', 'acct_aaaaaa', 'acct_aaaaaa'), 'acct_aaaaaa');
+	assert.strictEqual(boundAccount('scoped', 'scoped', 'acct_aaaaaa', 'acct_bbbbbb'), null, 'switched during the pick');
+	assert.strictEqual(boundAccount('vanilla', 'scoped', 'acct_aaaaaa', 'acct_aaaaaa'), null);
+	assert.strictEqual(boundAccount('scoped', null, 'acct_aaaaaa', 'acct_aaaaaa'), null, 'no config dir');
+	assert.strictEqual(boundAccount('scoped', 'scoped', null, null), null);
 });
 
 test('the record carries the label; a write without one names no account, even over a labeled one', () => {

@@ -14,8 +14,9 @@ with the `runtime_profile.v1` capability, through the reader the sutando adapter
     state/core-limit-hold.json             core_limit_hold (only a hold that binds this seat)
     the CLI's signed-in account            core_limit_hold.oauth_account (digest and plan name)
 
-The proxy stamps a reading with the `acct_` label of the credential its request was sent with, so
-a reading counts only when that label is the signed-in account's; an unlabeled one has no usage.
+The proxy stamps a reading with the `acct_` label of the credential its request was sent with (none
+when unbound), so its usage and last request model count only when that label is the signed-in
+account's; an unlabeled reading names neither.
 
 Unknown is null, never guessed: a Codex core reports no plan, an unknown core model sends no
 block at all (the schema requires one), and `workers` stays [] until a worker reports its own
@@ -348,14 +349,15 @@ def gather(workspace: Path, now: Optional[float] = None) -> Optional[dict]:
     record = qa.read_quota_record(workspace, at)
     label = core_recovery_state.account_label(digest)
     ours = record is not None and label is not None and record.payload.get("account") == label
+    quota = record.payload if ours else None
     hold = core_limit_hold.binding_hold(workspace, at, identity=(value, digest))
     by_key = {r["key"]: r for r in rows}
     keys = recovery_actions.switch_offer(workspace, runtime, avoid=hold.get("model") if hold else None,
                                          launch_model=value)
-    return derive(runtime=runtime, model=claude_model(value, rows, qa.record_model(record.payload if record else None)),
+    return derive(runtime=runtime, model=claude_model(value, rows, qa.record_model(quota)),
                   offered=[by_key[k] for k in keys if k in by_key],
                   plan_name=acct.get("planDisplayName") if acct else None, account_digest=digest,
-                  quota=record.payload if ours else None, quota_age_s=record.age_s if ours else None,
+                  quota=quota, quota_age_s=record.age_s if ours else None,
                   hold_until=hold.get("until") if hold else None, now=at)
 
 

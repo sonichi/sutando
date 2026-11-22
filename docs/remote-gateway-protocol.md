@@ -424,9 +424,12 @@ reader, so a standalone Sparrow and a pool worker's lane send none. Unknown is n
 reports no plan, a reading from a window that has since reset reports no usage, `workers` is `[]`
 until workers report their own model, and a core whose model is unknown sends no block at all. A
 Codex core's model counts only when its picker was read during the launch `core-runtime.json`
-records. The proxy stamps each reading with the `acct_` label of the credential its request was
-sent with, and a reading counts only when that is the signed-in account (an unlabeled reading, or
-one from a request sent before an account switch, reports no usage); `limited_until` comes only from a
+records. The proxy stamps each reading and each rejection with the `acct_` label of the credential
+its request was sent with, and only when it took that credential from its config dir's own keychain
+item with the dir's account unchanged across the pick; a passed-through credential is unbound. A
+reading's usage and last request model count only when its label is the signed-in account (an
+unlabeled reading, or one from a request sent before an account switch, reports no usage), and a
+rejection counts only for a record of its own account; `limited_until` comes only from a
 hold that binds this seat's model family and account. A switch option is a row the recovery card
 itself offers (`recovery_actions.switch_offer`, the held model avoided), its `token` the runtime
 list's opaque row key that the card's `switch_model:<token>` click names; its name comes from the

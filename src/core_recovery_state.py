@@ -94,7 +94,6 @@ _LOGIN_KINDS = frozenset({"login"})
 # The provider's own words for an exhausted prepaid balance, as opposed to a plan's usage window.
 _CREDIT_TEXT = re.compile(r"\bout of (?:usage )?credits?\b|\bcredit balance\b|\binsufficient[_ ](?:credits?|quota)\b"
                           r"|\bbilling\b", re.I)
-_HEX = re.compile(r"^[0-9a-f]{6,64}$")
 #: The documented shape of each identifier the record carries; a value of any other shape is dropped.
 MODEL_NAMES = ("opus", "sonnet", "haiku", "fable", "default")
 _SHAPES = {"incident": re.compile(r"inc_[0-9a-f]{8}"), "account": re.compile(r"acct_[0-9a-f]{6}"),
@@ -201,7 +200,7 @@ def _account(hold: Optional[dict]) -> Optional[str]:
 
 def account_label(digest: Any) -> Optional[str]:
     """The `acct_` label a client may see for an account digest, else None."""
-    return f"acct_{digest[:6]}" if isinstance(digest, str) and _HEX.fullmatch(digest) else None
+    return qa.account_label(digest)
 
 
 def _wedge_names(wedge: Any) -> tuple:
@@ -210,10 +209,7 @@ def _wedge_names(wedge: Any) -> tuple:
 
 
 def _quota_says_credits(quota: Any, now: float) -> bool:
-    ledger = quota.get("recent_rejections") if isinstance(quota, dict) else None
-    for rej in ledger if isinstance(ledger, list) else []:
-        if not isinstance(rej, dict):
-            continue
+    for rej in qa.record_rejections(quota):
         at = qa._parse_when(rej.get("ts"))
         if isinstance(at, (int, float)) and 0 <= now - at <= QUOTA_EVIDENCE_WINDOW_S \
                 and _CREDIT_TEXT.search(str(rej.get("snippet") or "")):

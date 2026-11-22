@@ -130,7 +130,7 @@ interface ClaudeOAuth {
 	[k: string]: unknown;
 }
 
-interface StoredClaudeOAuth {
+export interface StoredClaudeOAuth {
 	service: string;
 	oauth: ClaudeOAuth;
 }
@@ -369,6 +369,8 @@ export interface RejectionRecord {
 	// This response's own rate-limit headers ({} when it carried none): the record's
 	// top-level headers may belong to another request.
 	limit_headers?: Record<string, string>;
+	// The acct_ label of the credential the request was sent with; absent when unbound.
+	account?: string;
 }
 
 /** The `model` field of a JSON request body, or "" when absent or unparsable. */
@@ -408,6 +410,15 @@ export function appendRejection(prev: unknown, rej: RejectionRecord, max: number
 
 export type LimitState = 'allowed' | 'overage' | 'rejected';
 
+/** The ledger rejections sent with the record's own account; unlabeled matches only unlabeled.
+ *  Same rule as `record_rejections` in src/quota_availability.py. */
+export function boundRejections(record: Record<string, unknown>): RejectionRecord[] {
+	const ledger = Array.isArray(record.recent_rejections) ? record.recent_rejections : [];
+	const own = (typeof record.account === 'string' && record.account) || null;
+	return ledger.filter((r): r is RejectionRecord => !!r && typeof r === 'object' && !Array.isArray(r)
+		&& ((typeof r.account === 'string' && r.account) || null) === own);
+}
+
 /** Same rule as `classify_limit_state` in src/quota_availability.py; both run
  *  tests/fixtures/quota-limit-state.parity.json. `overage` is served, not paused. */
 export function limitState(record: unknown): LimitState {
@@ -423,9 +434,8 @@ export function limitState(record: unknown): LimitState {
 	const overage = h[`${prefix}overage-status`];
 	if (overage !== 'allowed' && overage !== 'allowed_warning') return 'rejected';
 	const checked = typeof rec.last_checked === 'string' ? Date.parse(rec.last_checked) : NaN;
-	const ledger = Array.isArray(rec.recent_rejections) ? rec.recent_rejections : [];
-	for (const r of ledger) {
-		if (!r || typeof r !== 'object' || (r as RejectionRecord).status !== 429) continue;
+	for (const r of boundRejections(rec)) {
+		if (r.status !== 429) continue;
 		const at = typeof (r as RejectionRecord).ts === 'string' ? Date.parse((r as RejectionRecord).ts) : NaN;
 		// An unordered 429 (either stamp unreadable) is not known to be older.
 		if (Number.isNaN(checked) || Number.isNaN(at) || at >= checked) return 'rejected';
@@ -442,8 +452,9 @@ export interface ProxyDeps {
 	request: typeof httpsRequest;
 	upstreamUrl: URL;
 	updateQuotaState: (headers: Record<string, string>, model?: string, account?: string | null) => void;
-	// The account label of the credential a request is sent with, sampled when it is sent.
+	// The acct_ label of the CLI account in CLAUDE_CONFIG_DIR, and that dir's own keychain item.
 	readAccount: () => string | null;
+	scopedService: () => string | null;
 	recordRejection: (rej: RejectionRecord) => void;
 	recordCredentialState: (state: CredentialState, detail?: string) => void;
 	now: () => number;
@@ -465,6 +476,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		upstreamUrl: new URL(UPSTREAM),
 		updateQuotaState,
 		readAccount: () => accountLabel(),
+		scopedService: () => scopedKeychainService(process.env.CLAUDE_CONFIG_DIR),
 		recordRejection,
 		recordCredentialState,
 		now: Date.now,
@@ -540,7 +552,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 
 	// Owner's 401 state machine: reload (keychain re-read) → refresh (if the
 	// backoff window allows) → rebuild → retry once. Null = give up loud.
-	async function recoverAfter401(failedToken: string): Promise<string | null> {
+	async function recoverAfter401(failedToken: string): Promise<StoredClaudeOAuth | null> {
 		rejectedToken = failedToken;
 		const stored = selectCred(deps.readCredCandidates(), deps.now(), rejectedToken);
 		console.log(`${ts()} [Proxy] keychain re-read after 401: ${stored ? 'credential present' : 'no credential'}`);
@@ -549,7 +561,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 			stored.oauth.accessToken !== failedToken &&
 			classifyCredential(stored.oauth, deps.now(), rejectedToken) === 'ok'
 		) {
-			return stored.oauth.accessToken; // a fresh /login already landed
+			return stored; // a fresh /login already landed
 		}
 		if (stored.oauth.refreshToken && shouldAttemptRefresh(true, deps.now(), nextRefreshAllowedAt)) {
 			await runSingleFlightRefresh(stored.service, stored.oauth);
@@ -559,7 +571,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 				after.oauth.accessToken !== failedToken &&
 				classifyCredential(after.oauth, deps.now(), rejectedToken) === 'ok'
 			) {
-				return after.oauth.accessToken;
+				return after;
 			}
 		}
 		return null;
@@ -586,6 +598,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 
 			// Read token fresh from keychain each request, refreshing it first if it
 			// is at/near expiry (self-refresh covers headless nodes).
+			const accountBefore = deps.readAccount();
 			const stored = await resolveCredential();
 			// The token this proxy injected, if any — non-null means WE authored the
 			// request's auth and own the 401-recovery duty for it.
@@ -619,7 +632,8 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 				}
 			}
 
-			let account = deps.readAccount();
+			let account = injectedToken && stored
+				? boundAccount(stored.service, deps.scopedService(), accountBefore, deps.readAccount()) : null;
 			const forward = (attempt: number): void => {
 				let timedOut = false;
 
@@ -652,12 +666,13 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 							const buf: Buffer[] = [];
 							upRes.on('data', (c) => buf.push(c));
 							upRes.on('end', async () => {
+								const before = deps.readAccount();
 								const recovered = await recoverAfter401(injectedToken as string);
 								if (recovered) {
 									console.log(`${ts()} [Proxy] retrying once with reloaded credential`);
-									headers['authorization'] = `Bearer ${recovered}`;
-									injectedToken = recovered;
-									account = deps.readAccount();
+									headers['authorization'] = `Bearer ${recovered.oauth.accessToken}`;
+									injectedToken = recovered.oauth.accessToken;
+									account = boundAccount(recovered.service, deps.scopedService(), before, deps.readAccount());
 									forward(1);
 									return;
 								}
@@ -695,6 +710,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 										ts: new Date(deps.now()).toISOString(), status: code, path: req.url ?? '', snippet,
 										model, user_agent: String(req.headers['user-agent'] ?? ''), peer_port: req.socket.remotePort,
 										limit_headers: quotaHeaders,
+										...(account ? { account } : {}),
 									});
 								} catch { /* best effort */ }
 							});
@@ -791,6 +807,14 @@ function recordCredentialState(state: CredentialState, detail = ''): void {
 			credential_state_at: new Date().toISOString(),
 		});
 	} catch { /* best effort */ }
+}
+
+/** The account a request's credential belongs to: only a token the proxy took from this config
+ *  dir's own keychain item, with that dir's account unchanged across the pick; else unbound (null). */
+export function boundAccount(
+	service: string, scoped: string | null, before: string | null, after: string | null,
+): string | null {
+	return scoped && service === scoped && before && before === after ? before : null;
 }
 
 /** The `acct_` label of the account the CLI in `configDir` is signed in to, else null.

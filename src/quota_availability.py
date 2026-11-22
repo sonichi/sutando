@@ -88,6 +88,24 @@ def limit_windows(headers: dict) -> dict:
 
 OVERAGE_STATUS = "anthropic-ratelimit-unified-overage-status"
 OVERAGE_OK = ("allowed", "allowed_warning")
+_DIGEST = re.compile(r"^[0-9a-f]{6,64}$")
+
+
+def account_label(digest: Any) -> Optional[str]:
+    """The `acct_` label of an account digest, as the proxy stamps a reading's account; else None."""
+    return f"acct_{digest[:6]}" if isinstance(digest, str) and _DIGEST.fullmatch(digest) else None
+
+
+def record_rejections(payload: Any) -> list:
+    """The ledger rejections sent with the record's own account; unlabeled matches only unlabeled.
+    The proxy's `boundRejections` implements the same rule."""
+    def acct(x: Any) -> Optional[str]:
+        value = x.get("account")
+        return value if isinstance(value, str) and value else None
+    payload = payload if isinstance(payload, dict) else {}
+    ledger = payload.get("recent_rejections")
+    own = acct(payload)
+    return [r for r in ledger if isinstance(r, dict) and acct(r) == own] if isinstance(ledger, list) else []
 
 
 def classify_limit_state(record: Any) -> str:
@@ -105,9 +123,8 @@ def classify_limit_state(record: Any) -> str:
     if headers.get(OVERAGE_STATUS) not in OVERAGE_OK:
         return "rejected"
     checked = _parse_when(payload.get("last_checked"))
-    ledger = payload.get("recent_rejections")
-    for rej in ledger if isinstance(ledger, list) else []:
-        if not isinstance(rej, dict) or rej.get("status") != 429:
+    for rej in record_rejections(payload):
+        if rej.get("status") != 429:
             continue
         at = _parse_when(rej.get("ts"))
         # An unordered 429 (either stamp unreadable) is not known to be older.

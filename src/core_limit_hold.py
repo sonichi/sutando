@@ -200,14 +200,17 @@ def _record_reset(headers: dict, now: float) -> Optional[float]:
     return max(ahead) if ahead else None
 
 
-def record_evidence(payload, now: float) -> Optional[Limit]:
-    """A recent 429 in the proxy's record, unless the provider served since then."""
+def record_evidence(payload, now: float, account: Optional[str] = None) -> Optional[Limit]:
+    """A recent 429 in the proxy's record, unless the provider served since then.
+    A record labeled with another account than the `account` digest is not this seat's."""
     if not isinstance(payload, dict):
         return None
-    ledger = payload.get("recent_rejections")
+    label, own = qa.account_label(account), payload.get("account")
+    if label and own and own != label:
+        return None
     newest = None
-    for rej in ledger if isinstance(ledger, list) else []:
-        if not isinstance(rej, dict) or rej.get("status") != 429:
+    for rej in qa.record_rejections(payload):
+        if rej.get("status") != 429:
             continue
         at = qa._parse_when(rej.get("ts"))
         if at is None or not (0 <= now - at <= EVIDENCE_WINDOW_S):
@@ -616,7 +619,7 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
     if quota is None and not seat:
         rec = qa.read_quota_record(workspace, now)
         quota = rec.payload if rec else None
-    own = () if seat else (record_evidence(quota, now), transcript_evidence(projects_dir, now))
+    own = () if seat else (record_evidence(quota, now, launch_account), transcript_evidence(projects_dir, now))
     found = [lim for lim in (*own, *evidence) if _relevant(lim, launch_model, since)]
     limit = max(found, key=lambda lim: lim.at) if found else None
     seen = hold.get("evidence_at") if hold else None

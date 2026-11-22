@@ -334,6 +334,13 @@ class Edges(unittest.TestCase):
     def test_a_non_string_label_is_dropped(self):
         self.assertEqual(crs.coerce({"v": 1, "state": "running", "menu": [3, None, "Wait"]})["menu"], ["Wait"])
 
+    def test_a_credit_refusal_sent_with_another_account_is_not_this_records(self):
+        rej = {"status": 429, "ts": "2025-11-21T13:00:00Z", "account": "acct_aaaaaa",
+               "snippet": "Your credit balance is too low to access the API"}
+        now = 1763730000.0 + 60
+        self.assertTrue(crs._quota_says_credits({"account": "acct_aaaaaa", "recent_rejections": [rej]}, now))
+        self.assertFalse(crs._quota_says_credits({"account": "acct_bbbbbb", "recent_rejections": [rej]}, now))
+
     def test_a_junk_proxy_rejection_is_skipped(self):
         self.assertFalse(crs._quota_says_credits({"recent_rejections": ["junk", 3]}, NOW))
 

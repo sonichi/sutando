@@ -327,6 +327,10 @@ class Gather(unittest.TestCase):
             rec["account"] = self.label() if account is True else account
         self.write("quota-state.json", rec)
 
+    def model_list(self):
+        """The runtime's own list names the model, so it does not hang on the proxy's reading."""
+        runtime_models.record(self.ws, "claude", runtime_models.parse_picker(PICKER, "claude"))
+
     def label(self):
         return core_recovery_state.account_label(core_limit_hold.account_fingerprint(str(self.cfg)))
 
@@ -340,6 +344,7 @@ class Gather(unittest.TestCase):
 
     def test_a_response_that_lands_after_an_account_switch_is_not_the_new_accounts(self):
         """A's request is in flight when the seat switches to B; its response is written after."""
+        self.model_list()
         a = self.label()
         self.assertEqual(rp.read(self.ws, self.now + 1)["plan"]["usage_pct"], 14)
         self.sign_in("u-2")
@@ -355,12 +360,24 @@ class Gather(unittest.TestCase):
         self.sign_in("u-1")
         self.assertIsNone(rp.read(self.ws, self.now + 9)["plan"]["usage_pct"], "B's reading is not A's")
 
+    def test_another_accounts_last_request_does_not_name_the_model(self):
+        """No model list: only the proxy's last request turns the `opus` alias into a version."""
+        self.assertEqual(rp.read(self.ws, self.now + 1)["model"]["id"], "claude-opus-5-5")
+        a = self.label()
+        self.sign_in("u-2")
+        self.quota(self.now + 2, 0.5, account=a)
+        self.assertIsNone(rp.read(self.ws, self.now + 3), "A's request names no model for B")
+        self.quota(self.now + 4, 0.5)
+        self.assertEqual(rp.read(self.ws, self.now + 5)["model"]["id"], "claude-opus-5-5", "B's own request does")
+
     def test_an_unlabeled_reading_has_no_usage(self):
+        self.model_list()
         self.quota(self.now, 0.14, account=False)
         plan = rp.read(self.ws, self.now + 1)["plan"]
         self.assertEqual((plan["name"], plan["usage_pct"]), ("Claude Max", None))
 
     def test_an_unknown_account_has_no_usage(self):
+        self.model_list()
         (self.cfg / ".claude.json").write_text(json.dumps({"oauthAccount": {"planDisplayName": "Claude Max"}}))
         plan = rp.read(self.ws, self.now + 1)["plan"]
         self.assertEqual((plan["name"], plan["usage_pct"]), ("Claude Max", None))

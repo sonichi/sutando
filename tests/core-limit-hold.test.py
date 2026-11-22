@@ -505,6 +505,16 @@ class EdgePaths(unittest.TestCase):
         lim = clh.record_evidence(rec, now)
         self.assertEqual((lim.kind, lim.reset_at), ("rate-limit", now - 1 + 90))
 
+    def test_a_late_429_from_another_account_is_not_this_seats_limit(self):
+        now, a, b = 1_800_000_000.0, "a" * 16, "b" * 16
+        rec = dict(limited_record(now), account=f"acct_{a[:6]}")
+        rec["recent_rejections"][0]["account"] = f"acct_{a[:6]}"
+        self.assertIsNotNone(clh.record_evidence(rec, now, a), "the record's own account")
+        self.assertIsNone(clh.record_evidence(rec, now, b), "A's 429 landed after the seat switched to B")
+        rec["account"] = f"acct_{b[:6]}"
+        self.assertIsNone(clh.record_evidence(rec, now), "B's record: A's late 429 is not in its ledger")
+        self.assertIsNotNone(clh.record_evidence(limited_record(now), now, b), "an unlabeled record stays evidence")
+
     def test_transcript_unreadable_and_odd_lines(self):
         now = time.time()
         proj = self.ws / "projects"
