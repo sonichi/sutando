@@ -32,6 +32,7 @@ from .schema import (
     STATUS_EXPIRED,
     STATUS_RESOLVED,
     NOTICE_FIELD,
+    OUTCOME_CLOSED,
     OUTCOME_DONE,
     OUTCOME_RUNNING,
     RECEIPT_FAILED_TEXT,
@@ -95,8 +96,12 @@ def fallback_body(req: HumanRequirement) -> str:
                                _CATEGORY_HEADS[CATEGORY_BLOCKED])
     head = f"{lead} — {req.message}{where}"
     receipt = (req.subject or {}).get("receipt")
-    own = req.wire_outcome() if isinstance(req.outcome, dict) else None
-    if req.terminal and own and own["state"] != OUTCOME_RUNNING:
+    out = req.wire_outcome() if req.terminal else None
+    own = out if isinstance(req.outcome, dict) else None
+    if out and out["state"] == OUTCOME_CLOSED:
+        # Closed before anything was verified: neither a tick nor a cross.
+        closer = f"— {out.get('text') or 'Closed.'}"
+    elif own and own["state"] != OUTCOME_RUNNING:
         # The producer said what came of the answer: that line, not the status's general one.
         done = own["state"] == OUTCOME_DONE
         text = own.get("text") or ("Sutando has continued its work." if done else RECEIPT_FAILED_TEXT["failed"])
@@ -105,6 +110,8 @@ def fallback_body(req: HumanRequirement) -> str:
         closer = _RECEIPT_LINES.get(receipt.get("outcome"), _RECEIPT_NOT_DONE)
         if receipt.get("outcome") == "done" and (req.subject or {}).get("superseded"):
             closer = _RECEIPT_STILL_BLOCKED
+        elif out and out["state"] != OUTCOME_DONE:
+            closer = _RECEIPT_NOT_DONE  # dispatched, but verification saw it fail
     else:
         closer = _KIND_STATUS_LINES.get((req.kind, req.status)) or _STATUS_LINES.get(req.status)
     if closer:

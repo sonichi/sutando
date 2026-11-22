@@ -468,7 +468,8 @@ STILL_BLOCKED = "It is still blocked. A new card follows with what you can do no
 WORKING_AGAIN = "It is working again."
 #: The core is up again and has taken up the work that was waiting when the owner tapped.
 RESUMED = "It is working again and has picked up the work that was waiting."
-#: Up again, but none of that work was seen starting within RESUME_S: said plainly, not as success.
+#: Up again, but none of that work was seen starting within RESUME_S: said plainly, neither success
+#: nor failure (the card's outcome is neutral, `closed`).
 NOT_RESUMED = ("It is up again, but I have not seen the waiting work start yet. If it does not, "
                "send the message again.")
 #: How long after a done action an unblocked core may take to start the waiting work.
@@ -671,7 +672,9 @@ def _restart_failed(manager, workspace: Path, req_id: str, check: Dict, done, no
         if cur is None or cur.terminal:
             return
         cur.message = f"{cur.message}\n\n{line}"
-        cur.subject = {**(cur.subject or {}), "verify": {**check, "seen": "failed"},
+        # A deadline that passed unanswered is no evidence of failure: the card closes neutral.
+        seen = "unknown" if done.state == detached_action.EXPIRED else "failed"
+        cur.subject = {**(cur.subject or {}), "verify": {**check, "seen": seen},
                        "receipt": _final_receipt(workspace, req_id, check, "failed", line, now)}
         cur.revision += 1
         cur.updated_at = time.time()

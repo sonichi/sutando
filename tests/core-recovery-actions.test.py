@@ -594,6 +594,8 @@ class Executor(Base):
                     self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=True, now=later), [req.id])
                     self.assertIn("did not complete" if how == "failed" else "couldn't confirm",
                                   self.mgr.get(req.id).message)
+                    # A restart seen failing is failed; one that never answered is unknown, so neutral.
+                    self.assertEqual(self.outcome(req)["state"], "failed" if how == "failed" else "closed")
                 self.assertIsNotNone(core_limit_hold.active_hold(self.ws, now + 6), "a failed restart left no pause")
 
     def test_a_seats_failed_restart_keeps_it_paused(self):
@@ -1433,7 +1435,8 @@ class ResumeReported(Base):
         card = self.mgr.get(req.id)
         self.assertIn(RA.NOT_RESUMED, card.message)
         self.assertNotIn(RA.WORKING_AGAIN, card.message)
-        self.assertEqual(self.outcome(req), {"state": "failed", "text": RA.NOT_RESUMED}, "never said as success")
+        self.assertEqual(self.outcome(req), {"state": "closed", "text": RA.NOT_RESUMED},
+                         "not seen either way: never said as success, nor as failure")
 
     def test_the_waiting_task_leaving_the_queue_is_the_resume(self):
         self.waiting()

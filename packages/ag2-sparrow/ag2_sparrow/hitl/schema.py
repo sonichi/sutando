@@ -22,9 +22,10 @@ NOTICE_FIELD = "space.ag2.hitl_notice"
 WIRE_SUBJECT_FIELDS = ("tool", "input", "options", "choices")
 # A recovery card also shows its tap's receipt outcome (hitl.recovery), so a client knows the answer.
 WIRE_RECEIPT_OUTCOMES = ("done", "refused", "stale", "failed")
-# What came of the owner's answer (the card's `outcome`): applied now, then done or failed.
-OUTCOME_RUNNING, OUTCOME_DONE, OUTCOME_FAILED = "running", "done", "failed"
-OUTCOME_STATES = (OUTCOME_RUNNING, OUTCOME_DONE, OUTCOME_FAILED)
+# What came of the owner's answer (the card's `outcome`): applied now, then done or failed. `closed`
+# is neutral: the card closed before verification saw a result, so it is neither success nor failure.
+OUTCOME_RUNNING, OUTCOME_DONE, OUTCOME_FAILED, OUTCOME_CLOSED = "running", "done", "failed", "closed"
+OUTCOME_STATES = (OUTCOME_RUNNING, OUTCOME_DONE, OUTCOME_FAILED, OUTCOME_CLOSED)
 OUTCOME_TEXT_MAX = 200
 RECEIPT_FAILED_TEXT = {
     "refused": "It was refused, so nothing was done.",
@@ -32,9 +33,13 @@ RECEIPT_FAILED_TEXT = {
     "failed": "It could not be done.",
 }
 SUPERSEDED_TEXT = "It is still blocked. A new card follows."
+CLOSED_UNVERIFIED_TEXT = "Closed without verification."
 # What verification saw after a done recovery action that counts as done: the session working again.
 # Still blocked, a failed restart, or up with its waiting work not seen starting is not success.
 VERIFY_SEEN_DONE = ("working",)
+# What verification saw that is no evidence either way (a check window or a restart's deadline ran
+# out unseen): the card closes neutral, never as failed. Failed is only a failure seen.
+VERIFY_SEEN_UNKNOWN = ("up", "unknown")
 
 
 # Canonical JSON's integer range; a number outside it is refused like a float.
@@ -183,7 +188,8 @@ class HumanRequirement:
     def wire_outcome(self) -> Optional[Dict[str, str]]:
         """The card's `outcome`, or None while it still asks or nobody answered it. The producer's
         own outcome wins, then a recovery receipt, then the status (in_progress runs, resolved is done).
-        A done receipt is only dispatched: it runs until verification has seen what came of it."""
+        A done receipt is only dispatched: it runs until verification has seen what came of it, and
+        a card closed before then is `closed`, never done; failed is only what verification saw."""
         if self.status == STATUS_PENDING or not self.chosen_action:
             return None
         own = self.outcome
@@ -193,15 +199,19 @@ class HumanRequirement:
         receipt = subject.get("receipt")
         if isinstance(receipt, dict) and receipt.get("outcome") in WIRE_RECEIPT_OUTCOMES:
             text = receipt.get("text")
+            check = subject.get("verify")
+            seen = check.get("seen") if isinstance(check, dict) else None
+            if seen in VERIFY_SEEN_UNKNOWN:
+                return outcome_wire(OUTCOME_CLOSED, text or CLOSED_UNVERIFIED_TEXT)
             if receipt["outcome"] != "done":
                 return outcome_wire(OUTCOME_FAILED, text or RECEIPT_FAILED_TEXT[receipt["outcome"]])
             if subject.get("superseded") is True:
                 return outcome_wire(OUTCOME_FAILED, text or SUPERSEDED_TEXT)
-            check = subject.get("verify")
-            seen = check.get("seen") if isinstance(check, dict) else None
             if isinstance(check, dict) and not seen:
-                # Still verifying (or a fallback restart runs); a card closed unverified moved on.
-                return outcome_wire(OUTCOME_DONE if self.terminal else OUTCOME_RUNNING)
+                # Still verifying (or a fallback restart runs), with no deadline; closed first is unknown.
+                if self.terminal:
+                    return outcome_wire(OUTCOME_CLOSED, CLOSED_UNVERIFIED_TEXT)
+                return outcome_wire(OUTCOME_RUNNING)
             if seen in VERIFY_SEEN_DONE or not isinstance(check, dict):
                 return outcome_wire(OUTCOME_DONE, text)
             return outcome_wire(OUTCOME_FAILED, text or SUPERSEDED_TEXT)

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """A clicked decision card says what came of the answer: `outcome` on the space.ag2.hitl wire is
-`running` while the click is applied, then `done` or `failed` with one short line. The producer's
+`running` while the click is applied, then `done` or `failed` with one short line, or the neutral
+`closed` when the card closed before verification saw either. The producer's
 own word wins, then a recovery receipt, then the status; a card still asking carries none. A
 worker's card leads with the question, its seat line last."""
 import importlib.util
@@ -9,6 +10,7 @@ import tempfile
 import time
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -23,7 +25,7 @@ import pending_questions_reader as reader
 from hitl import projector
 from hitl.manager import HitlManager, HitlStore
 from hitl.schema import (
-    OUTCOME_TEXT_MAX, RECEIPT_FAILED_TEXT, SUPERSEDED_TEXT, Action, ActionReply, HumanRequirement,
+    CLOSED_UNVERIFIED_TEXT, OUTCOME_TEXT_MAX, RECEIPT_FAILED_TEXT, SUPERSEDED_TEXT, Action, ActionReply, HumanRequirement,
     outcome_wire,
 )
 
@@ -135,13 +137,27 @@ class ReceiptOutcome(_Store):
         rid = self.receipted("done", "Sent Escape.", verify={"outcome": "done", "at": 1})
         self.assertEqual(self.wire(rid)["outcome"], {"state": "running"})
 
-    def test_a_done_receipt_closed_unverified_has_moved_on(self):
+    def test_a_done_receipt_closed_unverified_is_neutral(self):
+        for close in ("resolve", "cancel"):
+            with self.subTest(close=close):
+                rid = self.receipted("done", "Sent Escape.", verify={"outcome": "done", "at": 1})
+                getattr(self.m, close)(rid)
+                self.assertEqual(self.wire(rid)["outcome"], {"state": "closed", "text": CLOSED_UNVERIFIED_TEXT},
+                                 "closed before verification: never done, never failed")
+
+    def test_a_stalled_verification_keeps_running(self):
         rid = self.receipted("done", "Sent Escape.", verify={"outcome": "done", "at": 1})
+        with mock.patch("time.time", return_value=time.time() + 7 * 86400):
+            self.assertEqual(self.wire(rid)["outcome"], {"state": "running"}, "no timeout turns it into a verdict")
+
+    def test_an_unanswered_restart_is_neutral_not_failed(self):
+        rid = self.receipted("failed", "I couldn't confirm it came back.",
+                             verify={"outcome": "done", "seen": "unknown"})
         self.m.resolve(rid)
-        self.assertEqual(self.wire(rid)["outcome"], {"state": "done"})
+        self.assertEqual(self.wire(rid)["outcome"], {"state": "closed", "text": "I couldn't confirm it came back."})
 
     def test_what_verification_saw_decides_a_done_receipt(self):
-        for seen, state in (("working", "done"), ("up", "failed"), ("blocked", "failed"), ("failed", "failed")):
+        for seen, state in (("working", "done"), ("up", "closed"), ("blocked", "failed"), ("failed", "failed")):
             with self.subTest(seen=seen):
                 rid = self.receipted("done", "what was seen", verify={"outcome": "done", "seen": seen})
                 self.assertEqual(self.wire(rid)["outcome"], {"state": state, "text": "what was seen"})
@@ -181,6 +197,25 @@ class Projection(_Store):
                          {"state": "failed", "text": "The branch is protected."})
         self.assertTrue(edit["body"].endswith("✕ The branch is protected."), edit["body"])
         self.assertNotIn("Resolved", edit["body"])
+
+    def test_the_plain_body_of_a_card_closed_unverified_is_neither_tick_nor_cross(self):
+        rid = self.card(subject={"recovery": True})
+        sent = []
+        send = lambda payload: (sent.append(payload), {"ok": True, "event_id": f"$e{len(sent)}"})[1]  # noqa: E731
+        projector.project(self.m, send, "!dm:x")
+        self.click(rid)
+        with self.m.store.locked():
+            req = self.m.get(rid)
+            req.subject = {**req.subject, "receipt": {"outcome": "done", "at": 1},
+                           "verify": {"outcome": "done", "at": 1}}
+            req.revision += 1
+            self.m.store.save(req)
+        self.m.resolve(rid)
+        projector.project(self.m, send, "!dm:x")
+        edit = sent[-1]
+        self.assertEqual(edit["extra_content"]["space.ag2.hitl"]["outcome"]["state"], "closed")
+        self.assertTrue(edit["body"].endswith(f"— {CLOSED_UNVERIFIED_TEXT}"), edit["body"])
+        self.assertNotIn("✓", edit["body"])
 
 
 class PendingQuestionAck(_Store):
