@@ -259,5 +259,43 @@ class FlagOn(unittest.TestCase):
         self.assertTrue(f.declaration().exists())
 
 
+
+class PersistedChoice(unittest.TestCase):
+    """`core.codex_app_server` (what `sutando-config.sh codex-app-server-select` writes without a
+    desktop) decides every launch that does not set the variable; a set variable overrides it."""
+
+    def choose(self, f: Fixture, on: bool) -> None:
+        (f.workspace / "sutando.config.local.json").write_text(json.dumps({"core": {"codex_app_server": on}}))
+
+    def test_a_launch_without_the_variable_follows_the_persisted_choice(self):
+        f = Fixture(self, seat_tmux=True)
+        self.choose(f, True)
+        result = f.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(f.calls(), r"new-session -d -s sutando-core .*-e SUTANDO_CODEX_APP_SERVER=1 .*codex-seat --host ")
+        self.assertTrue(f.declaration().exists())
+
+    def test_a_set_variable_overrides_the_persisted_choice(self):
+        f = Fixture(self, seat_tmux=True)
+        self.choose(f, True)
+        result = f.run(SUTANDO_CODEX_APP_SERVER="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("codex-seat", f.calls())
+        self.assertIn("new-session -d -s sutando-core-watcher", f.calls())
+
+    def test_restart_after_turning_it_off_replaces_the_seat_with_the_tui(self):
+        f = Fixture(self, seat_tmux=True)
+        self.choose(f, True)
+        self.assertEqual(f.run().returncode, 0)
+        self.assertTrue(f.declaration().exists())
+        self.choose(f, False)
+        f.h.log.unlink()
+        result = f.run("--restart")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        launch = re.findall(r"new-session -d -s sutando-core .*", f.calls())
+        self.assertEqual(len(launch), 1)
+        self.assertNotIn("codex-seat", launch[0])
+        self.assertFalse(f.declaration().exists())
+
 if __name__ == "__main__":
     unittest.main()

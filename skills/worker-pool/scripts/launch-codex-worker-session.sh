@@ -119,6 +119,11 @@ else
   exit 1
 fi
 # >>> codex-app-server-seat
+# Unset for this launch, the persisted choice decides (scripts/sutando-config.sh codex-app-server).
+if [ -z "${SUTANDO_CODEX_APP_SERVER:-}" ] \
+   && [ "$(bash "$REPO/scripts/sutando-config.sh" codex-app-server 2>/dev/null)" = 1 ]; then
+  export SUTANDO_CODEX_APP_SERVER=1
+fi
 # SUTANDO_CODEX_APP_SERVER=1: the worker is a seat on `codex app-server` in the same session name,
 # with no observer and no notifier session; it takes its deliveries itself. Unset: as before.
 if [ "${SUTANDO_CODEX_APP_SERVER:-}" = 1 ]; then

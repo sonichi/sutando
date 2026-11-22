@@ -260,6 +260,37 @@ print(resolve_core_runtime(), end='')
 "
     ;;
 
+  codex-app-server)
+    # 1 when the Codex core and Codex workers run as app-server seats, else 0:
+    # SUTANDO_CODEX_APP_SERVER (non-empty), the desktop's runtime.json, core.codex_app_server.
+    py -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import resolve_codex_app_server
+print('1' if resolve_codex_app_server() else '0', end='')
+"
+    ;;
+
+  codex-app-server-select)
+    # Persist the app-server choice for every later launch. Prints updated|unchanged and the
+    # file written; nonzero when unwritable. A running core keeps its mode until --restart.
+    case "${2:-}" in
+      on) _cas=True ;;
+      off) _cas=False ;;
+      *) echo "sutando-config: codex-app-server-select needs on or off" >&2; exit 2 ;;
+    esac
+    py -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import persist_codex_app_server
+try:
+    outcome, path = persist_codex_app_server($_cas)
+except (OSError, ValueError, RuntimeError) as exc:
+    sys.exit(f'sutando-config: codex app-server choice not written: {exc}')
+print(f'{outcome} {path}', end='')
+"
+    ;;
+
   desktop-runtime-select)
     # Persist an explicit --runtime switch as the desktop's coreRuntime. Prints
     # updated|unchanged|no-desktop (--check: would-update, writing nothing); nonzero when unwritable.
@@ -841,7 +872,7 @@ print(json.dumps({
     ;;
 
   *)
-    echo "usage: $0 {workspace|core-runtime|vault-enabled|macos-notifications|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|tmux-socket|run-dir|runtime-socket|runtime|dump|subdirs|bootstrap}" >&2
+    echo "usage: $0 {workspace|core-runtime|codex-app-server|codex-app-server-select <on|off>|vault-enabled|macos-notifications|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|tmux-socket|run-dir|runtime-socket|runtime|dump|subdirs|bootstrap}" >&2
     exit 2
     ;;
 esac

@@ -19,6 +19,11 @@
           ],
           "default": "claude"
         },
+        "codex_app_server": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run a Codex core and Codex pool workers as a seat on `codex app-server` instead of the Codex TUI (docs/codex-core.md). A desktop install keeps the choice as `codexAppServer` in its runtime.json, which wins over this key; a non-empty SUTANDO_CODEX_APP_SERVER overrides both for one launch. Set with `bash scripts/sutando-config.sh codex-app-server-select on|off`."
+        },
         "expected_branch": {
           "type": "string",
           "minLength": 1,
