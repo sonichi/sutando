@@ -373,6 +373,10 @@ class Connector:
         state = self.model_state()
         kept = state.get("untold")
         owed = [o for o in (kept if isinstance(kept, list) else [kept]) if isinstance(o, dict)]
+        # A notice saved before notices had keys gets one now, and is saved with it before it is queued.
+        unkeyed = [o for o in owed if not o.get("key")]
+        for n, o in enumerate(unkeyed):
+            o.update(key=uuid.uuid4().hex, at=time.time_ns() + n)
         wanted, outcome = str(state.get("wanted") or ""), ""
         if wanted and state.get("told") != wanted and turn.live:
             ran = turn.model or ""
@@ -383,6 +387,8 @@ class Connector:
             # The model the turn ran on is the one in use, whatever a resumed Session reports of itself.
             self.save_model_state(untold=owed, told=wanted, current=ran or state.get("current") or "",
                                   **({} if outcome == "switched" else {"wanted": ""}))
+        elif unkeyed:
+            self.save_model_state(untold=owed)
         told = ""
         while owed:
             first = owed[0]

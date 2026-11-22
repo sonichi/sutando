@@ -452,6 +452,38 @@ class ConnectorTest(unittest.TestCase):
         self.assertEqual((self.post_queued(), json.loads(state.read_text())["untold"]), ([], []))
         self.assertEqual(json.loads(state.read_text())["wanted"], "", "nothing is left to ask agy for")
 
+    def test_a_notice_saved_before_notices_had_keys_gets_one_before_it_is_queued_and_is_not_queued_twice(self):
+        state = self.w.root / "state" / "model.json"
+        old = {"picked": "claude-opus-4-6-thinking", "ran": "gemini-3.8-flash-medium", "room": self.DM}
+        # Both shapes #6680 wrote: one notice as a dict, then a list of them.
+        for kept in (old, [old, dict(old, picked="no-such-model")]):
+            for marker in (self.bridge_state() / "agent-cards").glob("*/*"):
+                marker.unlink()
+            state.write_text(json.dumps({"untold": kept, "available": [
+                {"id": "claude-opus-4-6-thinking", "name": "Claude Opus 4.6"}, {"id": "no-such-model", "name": "Ghost"},
+                {"id": "gemini-3.8-flash-medium", "name": "Gemini 3.8 Flash"}]}))
+            args = self.w.args()
+            args.bridge_state = str(self.bridge_state())
+            real, saves = gc.Connector.save_model_state, []
+
+            def stops_after_the_first_queue(connector, **changes):
+                saves.append(changes)
+                if len(saves) == 2:
+                    raise OSError("the connector stopped here")
+                return real(connector, **changes)
+
+            with mock.patch.object(gc.Connector, "save_model_state", stops_after_the_first_queue):
+                with self.assertRaises(OSError):
+                    gc.Connector(args).tell_model_outcome(acp_host.Turn())
+            saved = json.loads(state.read_text())["untold"]
+            self.assertTrue(all(o.get("key") and o.get("at") for o in saved), "keys were saved before the queue")
+            self.assertEqual([o["at"] for o in saved], sorted(o["at"] for o in saved), "in their old order")
+            outbox = self.bridge_state() / "agent-cards" / "outbox"
+            self.assertEqual(len(list(outbox.iterdir())), 1, "the first notice was queued once")
+            gc.Connector(args).tell_model_outcome(acp_host.Turn())
+            self.assertEqual((len(list(outbox.iterdir())), json.loads(state.read_text())["untold"]),
+                             (len(saved), []), "told again after the restart: each notice is one card")
+
     def test_two_picks_across_one_outage_are_each_settled_once_and_told_in_order_afterwards(self):
         (self.w.home / "models").write_text("")
         state = self.w.root / "state" / "model.json"
