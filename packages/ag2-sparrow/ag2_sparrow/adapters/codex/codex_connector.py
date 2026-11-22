@@ -11,7 +11,7 @@ which delivers into a thread owned by a running interactive TUI. Stdlib only.
 Tier policy is task_io.turn_policy's, from the attested headers only; this module maps its
 capabilities. A durable turn (the owner, and an attested collaborator) runs on the thread kept
 per channel_id (state/threads/<key>) in the configured cwd and sandbox; a restricted turn (any
-other non-owner, under --allow-non-owner) runs on its own ephemeral thread, read-only, in an
+other non-owner, unless --no-allow-non-owner) runs on its own ephemeral thread, read-only, in an
 empty temp dir. Every non-owner turn carries the shared NON_OWNER_NOTE; only the owner continues
 the owner's own conversation (--resume-thread, --push); a collaborator joins a channel's kept thread only
 when its file says it is shared, else it gets the channel's separate shared thread. A refused turn gets
@@ -31,6 +31,7 @@ import time
 import uuid
 
 from ... import held_start
+from ...collaborator_turn import stage_own_attachments, with_staged_paths
 from ...relay_loop import count_arg
 from ...task_io import (AUDIENCE_RULE, DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER_CAPABILITIES,  # noqa: F401
                         LockRefused, acquire_lock, attested_headers, exit_on_sigterm, holder_consumer, load_done,
@@ -41,6 +42,61 @@ CLIENT = {"name": "ag2-sparrow-codex", "version": "0.1.0"}
 APPROVAL_REQUESTS = ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
                      "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval")
 NON_OWNER_SANDBOX = "read-only"
+# A turn without integrations (turn_policy's restricted kind): Codex's own web search and the owner's
+# connectors, plugins, hooks and memories off; each configured MCP server is disabled by name in start_thread.
+NO_INTEGRATIONS = {"web_search": "disabled",
+                   "features": dict.fromkeys(("apps", "plugins", "hooks", "memories", "browser_use",
+                                              "browser_use_external", "computer_use", "in_app_browser"), False)}
+
+
+class IntegrationsUnknown(RuntimeError):
+    """The effective config could not be read, so a turn without integrations is not started."""
+
+
+# Codex's read-only sandbox stops writes and the network, not reads: a command in such a turn read a file
+# under the owner's home, another turn's temp folder and CODEX_HOME (measured, codex-cli 0.167.0).
+CONFINED_PROFILE = "sparrow_restricted"
+
+
+class Unconfined(RuntimeError):
+    """The isolated turn's thread did not start under CONFINED_PROFILE, so the turn is not run."""
+
+
+def link_folders(path, limit=40):
+    """The folder of every symlink met while resolving `path`, then the folder of the file it ends at.
+    Codex starts its own executable as a sandboxed helper by the path it was launched with, so a
+    profile that cannot read these cannot start a thread."""
+    out, todo = [], os.path.abspath(path)
+    for _ in range(limit):
+        parts, cur, moved = todo.split(os.sep), os.sep, False
+        for i, part in enumerate(parts[1:], 1):
+            nxt = os.path.join(cur, part)
+            if os.path.islink(nxt):
+                if cur not in out:
+                    out.append(cur)
+                todo = os.path.join(os.path.normpath(os.path.join(cur, os.readlink(nxt))), *parts[i + 1:])
+                moved = True
+                break
+            cur = nxt
+        if not moved:
+            break
+    end = os.path.dirname(todo)
+    return out if end in out else out + [end]
+
+
+def confined_permissions(codex, platform=None):
+    """The thread config that confines an isolated turn's reads to its own working directory: the
+    platform's minimal runtime set, the project root (the turn's empty scratch dir), and the folders
+    Codex needs to start itself. On macOS /tmp is named, since the minimal set leaves it readable."""
+    rules = {":minimal": "read", ":project_roots": {".": "read"}}
+    if (platform or sys.platform) == "darwin":
+        # /tmp and the folder it is a link to there: the minimal read set leaves both readable.
+        rules.update({folder: "deny" for folder in ("/tmp", os.path.realpath("/tmp"))})
+    # Only an executable that is found: an unresolved name would resolve against the connector's own cwd.
+    exe = shutil.which(codex) if codex else None
+    for folder in link_folders(exe) if exe else ():
+        rules[folder] = "read"
+    return {"default_permissions": CONFINED_PROFILE, "permissions": {CONFINED_PROFILE: {"filesystem": rules}}}
 NO_REPLY = "[no reply] Codex completed the turn without a message."
 # What a turn with no message did instead, for the line posted in its place: fixed words and counts only.
 DECLINED_WORDS = {"item/commandExecution/requestApproval": "command", "execCommandApproval": "command",
@@ -276,11 +332,50 @@ class Connector:
             p["model"] = self.args.model
         return p
 
+    def no_integrations(self, cwd):
+        """The thread config override for a turn without integrations: NO_INTEGRATIONS plus every MCP server
+        the effective config (seen from the turn's cwd) names, disabled. An empty `mcp_servers` override
+        merges into the owner's and removes nothing, so each is named. A refused answer, or one that does
+        not carry `config.mcp_servers` as a mapping (Codex sends `{}` when there are none), raises
+        IntegrationsUnknown: a list that cannot be read is never taken as empty. A dead or silent server
+        raises as thread/start would."""
+        try:
+            res = self.rpc.request("config/read", {"cwd": cwd})
+        except RuntimeError as e:
+            if "server pipe closed" in str(e):
+                raise
+            raise IntegrationsUnknown(str(e)[:200])
+        config = res.get("config") if isinstance(res, dict) else None
+        servers = config.get("mcp_servers") if isinstance(config, dict) else None
+        if not isinstance(servers, dict):
+            raise IntegrationsUnknown("config/read did not give config.mcp_servers as a mapping (%s)"
+                                      % ("config is %s" % type(config).__name__ if not isinstance(config, dict)
+                                         else "missing" if "mcp_servers" not in config else type(servers).__name__))
+        return dict(NO_INTEGRATIONS, mcp_servers={name: {"enabled": False} for name in servers})
+
     def start_thread(self, caps, ephemeral):
         params = dict(self.thread_params(caps), ephemeral=ephemeral)
+        if not caps.integrations:
+            params["config"] = self.no_integrations(params["cwd"])
         if self.args.developer_instructions:
             params["developerInstructions"] = self.args.developer_instructions
-        res = self.rpc.request("thread/start", params)
+        confined = caps.workspace == "isolated"
+        if confined:
+            # A `sandbox` beside the profile wins and the profile is dropped (measured): it is not sent.
+            del params["sandbox"]
+            # The connector knows the server's executable only when it starts it (--server stdio).
+            started_here = getattr(self.args, "server", "stdio") == "stdio"
+            params["config"] = dict(params.get("config") or {},
+                                    **confined_permissions(self.args.codex if started_here else None))
+        try:
+            res = self.rpc.request("thread/start", params)
+        except RuntimeError as e:
+            if not confined or "server pipe closed" in str(e):
+                raise
+            raise Unconfined(str(e)[:200])
+        active = (res.get("activePermissionProfile") or {}).get("id")
+        if confined and active != CONFINED_PROFILE:
+            raise Unconfined("thread/start answered with permission profile %r" % (active,))
         self.thread_id = res["thread"]["id"]
         log("started thread", self.thread_id, caps.workspace, "ephemeral" if ephemeral else "durable")
 
@@ -469,9 +564,19 @@ class Connector:
         caps = caps or capabilities(headers)    # the gate's decision, when the caller has it
         durable = caps.session == "durable"
         for attempt in (1, 2):
-            self.open_for(headers, caps)
+            try:
+                self.open_for(headers, caps)
+            except IntegrationsUnknown as e:
+                return "failed", "", "the configured integrations could not be read to switch them off (%s)" % e
+            except Unconfined as e:
+                return "failed", "", "the turn could not be confined to its own folder (%s)" % e
             self.last_thread = self.thread_id
-            status, text, err = self.run_turn(prompt, self.args.model, self.turn_cwd(caps))
+            turn_prompt = prompt
+            if caps.workspace == "isolated":
+                # The turn reads its own folder only: this task's own attachments are copied into it.
+                staged = stage_own_attachments(headers, self.scratch_cwd, getattr(self.args, "media_root", None))
+                turn_prompt = with_staged_paths(prompt, staged)
+            status, text, err = self.run_turn(turn_prompt, self.args.model, self.turn_cwd(caps))
             if status == "server-exited":
                 self.restart_server()
                 if durable and attempt == 1:
@@ -595,6 +700,9 @@ def build_parser():
     ap.add_argument("--server", choices=["stdio", "proxy", "stub"], default="stdio",
                     help="stdio: own codex app-server; proxy: shared daemon via `codex app-server proxy`; stub: local fake")
     ap.add_argument("--work", help="dir holding tasks/ results/ state/ (required unless --push)")
+    ap.add_argument("--media-root", help="the bridge's remote-media folder (default: <work>.bridge/state/remote-media). "
+                                         "A restricted turn is given copies of its own task's attachments from it, "
+                                         "and can read nothing else there")
     ap.add_argument("--held", action="store_true",
                     help="the work root's lock is held by the launcher that spawned this process and attaches it as "
                          "the consumer; take no lock, refuse unless that record names this process (needs --root-fd)")
@@ -608,12 +716,15 @@ def build_parser():
     ap.add_argument("--model", default=None)
     ap.add_argument("--sandbox", default=NON_OWNER_SANDBOX, choices=["read-only", "workspace-write", "danger-full-access"],
                     help="sandbox for owner and attested-collaborator threads; a restricted turn is always read-only")
-    ap.add_argument("--allow-non-owner", action="store_true",
-                    help="serve tasks from non-owner senders without collaborator access too (guests, and any "
-                         "collaborator claim the broker did not attest), each on its own ephemeral read-only "
-                         "thread in an empty temp dir. Off by default: they are refused with a plain line. An "
-                         "attested collaborator never needs it: it is served like the owner, on the room's kept "
-                         "thread with --cwd and --sandbox, framed by the non-owner note.")
+    no = ap.add_mutually_exclusive_group()
+    no.add_argument("--allow-non-owner", dest="allow_non_owner", action="store_true", default=True,
+                    help="serve tasks from non-owner senders without collaborator access too (guests, plain team, "
+                         "and any collaborator claim the broker did not attest), each on its own ephemeral "
+                         "read-only thread in an empty temp dir. The default; kept so older command lines still "
+                         "work. An attested collaborator never needs it: it is served like the owner, on the "
+                         "room's kept thread with --cwd and --sandbox, framed by the non-owner note.")
+    no.add_argument("--no-allow-non-owner", dest="allow_non_owner", action="store_false",
+                    help="refuse those senders with a plain line instead")
     ap.add_argument("--thread-id", default=None, metavar="CHANNEL_ID=THREAD",
                     help="resume THREAD for exactly this owner channel when it has no saved thread yet")
     ap.add_argument("--resume-thread", default=None, metavar="THREAD",
@@ -657,6 +768,7 @@ def main(argv=None):
         args.inbox = os.path.join(args.work, "tasks")
         args.results = os.path.join(args.work, "results")
         args.state = os.path.join(args.work, "state")
+        args.media_root = os.path.abspath(args.media_root or os.path.join(args.work + ".bridge", "state", "remote-media"))
         args.cwd = os.path.abspath(cwd_given or args.work)
         return exit_code(serve_locked(args))
     except LockRefused as e:

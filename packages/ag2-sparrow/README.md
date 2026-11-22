@@ -250,6 +250,14 @@ The helper reads the token the way `ag2-sparrow` does. When Sparrow read it from
 `.env` named by `AG2_DEVICE_ENV`, the printed helper names that file. When it came from
 the environment, Claude Code needs `REMOTE_TASK_TOKEN` in its environment too.
 
+`ag2-sparrow-mcp acp` makes the same exchange and prints the ACP `McpServer` (`type: http`, the MCP URL,
+an `Authorization` header with the access token) for an ACP client that takes headers rather than a
+helper (the Antigravity adapter does not use it: over HTTP nothing would filter the server's tools). `ag2-sparrow-mcp descriptor --env-file <the
+agent's .env>` prints, without minting, the non-secret descriptor the desktop's stdio `ag2-mcp-proxy` reads
+(`AG2_MCP_DESCRIPTOR`) for that file: for a seat `.env`, the `token_format: "raw"` form naming the raw
+token file it points at. It reads only that file (and that token file), never a token from the environment
+or the vault, because the proxy mints from that file alone.
+
 Check it with `ag2.whoami`: it answers `Authenticated as @<agent> (agent)`. Agents
 whose kind is `sutando` or `acp` can make the exchange; others get a 401 naming the reason.
 
