@@ -16,6 +16,11 @@ import uuid
 from . import connector_cards
 
 FILE, CARD, ASK = "model.json", "model-switch", "/model"
+# What a pick came to is a card of its own: recorded under the menu's id it would retire the menu
+# (one live card per id and room), whose buttons the owner still sees and may tap again.
+NOTE = "model-switch-status"
+EXPIRED = "That card has expired, so nothing changed. Here's a new one."
+EXPIRED_NO_CARD = "That card has expired, so nothing changed. Send /model for a new one."
 BUTTONS = 6          # the card's button limit
 UNTOLD_KEEP = 5      # outcome notices kept while their cards cannot be queued
 
@@ -123,7 +128,7 @@ class ModelSwitch:
         agent_card, _ = connector_cards._core()
         if picked:
             kind, body, text, status = self.parts(state, picked, ran, same)
-            return agent_card.build(CARD, kind, title="Model", body=body, text=text, **({"status": status} if status else {}))
+            return agent_card.build(NOTE, kind, title="Model", body=body, text=text, **({"status": status} if status else {}))
         names = {m["id"]: m["name"] for m in self.offered(state)}
         now, coming = state.get("current") or "", self.pending(state)
         buttons = [agent_card.button(name, "reply", reply="Use %s" % name,
@@ -187,6 +192,11 @@ class ModelSwitch:
         verdict = connector_cards.click(sent, said, self.root)
         if verdict.verdict == agent_card.COMMAND and verdict.command.kind == "model":
             return self.pick(verdict.command.verb, sent, result_file, by_verb=True)
+        if (verdict.verdict == agent_card.FORGED and agent_card.owner_may_act(sent) is None
+                and (agent_card.card_click(sent) or {}).get("card_id") == CARD):
+            # The owner tapped a model card this agent no longer keeps (a newer one replaced it, it is
+            # past its time, or an earlier install posted it): say so and show the current one.
+            return self.expired_card(sent, self.state(), result_file)
         if verdict.verdict in (agent_card.COMMAND, agent_card.FORGED):
             self.publish(result_file, self.quoted(verdict.say) + "\n")
             return "card-refused"
@@ -197,6 +207,12 @@ class ModelSwitch:
             return self.offer(sent, result_file)
         # "/model <name>": the way to a model the card has no button for.
         return self.pick(named.strip().lower(), sent, result_file, by_name=True)
+
+    def expired_card(self, sent, state, result_file) -> str:
+        """Answer a tap on a model card that no longer acts: the words, and a fresh card when one can be shown."""
+        fresh = bool(self.offered(state)) and self.post(sent.get("channel_id"), self.menu(state))
+        self.publish(result_file, self.quoted(EXPIRED if fresh else EXPIRED_NO_CARD) + "\n")
+        return "model-card-expired"
 
     def listed(self, result_file) -> "dict | None":
         """The state with a fresh list from the runtime; None (and the owner told) when it would not list."""

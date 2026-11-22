@@ -213,10 +213,43 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         self.assertEqual(self.post_queued(), [], "told once")
         self.assertNotIn("model_switch", self.w.metrics()[-1])
-        # The settled card replaced the first one: its buttons no longer act.
-        self.dm_task("task-5", said, reply_to="$card1", click=said)
+        # The menu is still on the owner's screen after the cards that answered it, and its buttons
+        # still act: the cards saying what a pick came to are not the menu, and do not retire it.
+        self.assertEqual((waiting["id"], done["id"], card["id"]), (model_switch.NOTE, model_switch.NOTE, model_switch.CARD))
+        again = card["buttons"][0]["reply"]
+        self.dm_task("task-5", again, reply_to="$card1", click=again)
         self.w.serve()
-        self.assertIn("couldn't match that button", self.w.result("task-5"))
+        self.assertEqual((self.w.result("task-5"), self.w.metrics()[-1]["card"]),
+                         ("[no-send] the model card answers\n", "model-picked"))
+        self.assertEqual(json.loads((self.w.root / "state" / "model.json").read_text())["wanted"], "gemini-3.8-flash-medium")
+        (back,) = self.post_queued("$card4")
+        self.assertIn("Switching to Gemini 3.8 Flash on your next message", back["extra_content"]["space.ag2.card"]["text"])
+        # A newer menu does retire the older one.
+        self.dm_task("task-6", "/model")
+        self.w.serve()
+        self.post_queued("$card5")
+        self.dm_task("task-7", again, reply_to="$card1", click=again)
+        self.w.serve()
+        # A tap on a card that no longer acts says so and shows the current one; nothing is switched.
+        self.assertEqual((self.w.result("task-7").strip(), self.w.metrics()[-1]["card"]),
+                         (gc.quoted(model_switch.EXPIRED).strip(), "model-card-expired"))
+        (fresh,) = self.post_queued("$card6")
+        self.assertEqual((fresh["extra_content"]["space.ag2.card"]["id"], len(fresh["extra_content"]["space.ag2.card"]["buttons"])),
+                         (model_switch.CARD, 2))
+        self.assertEqual(json.loads((self.w.root / "state" / "model.json").read_text())["wanted"], "gemini-3.8-flash-medium")
+        # The fresh card acts; with the bridge down the words say how to get one; another sender's tap
+        # on an old card is refused as before and gets no card.
+        self.dm_task("task-8", said, reply_to="$card6", click=said)
+        self.w.serve()
+        self.assertEqual(self.w.metrics()[-1]["card"], "model-picked")
+        self.post_queued("$card7")
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("bridge down")):
+            self.dm_task("task-9", again, reply_to="$card1", click=again)
+            self.w.serve()
+        self.assertEqual(self.w.result("task-9").strip(), gc.quoted(model_switch.EXPIRED_NO_CARD).strip())
+        self.dm_task("task-10", again, reply_to="$card1", click=again, tier="team", collaborator=True)
+        self.w.serve()
+        self.assertEqual((self.post_queued(), self.w.metrics()[-1]["card"]), ([], "card-refused"))
 
     def test_picking_the_model_already_in_use_says_so_at_once_and_nothing_is_switched_or_confirmed(self):
         (self.w.home / "models").write_text("")
@@ -374,17 +407,28 @@ class ConnectorTest(unittest.TestCase):
         said = "Use Claude Opus 4.6"
         self.dm_task("task-2", said, reply_to="$never-posted", click=said)
         self.w.serve()
-        self.assertIn("couldn't match that button", self.w.result("task-2"))
+        # The owner's own tap on a card this agent does not keep (an earlier install's, say) is told it
+        # expired and shown the current card; it still picks nothing.
+        self.assertEqual(self.w.result("task-2").strip(), gc.quoted(model_switch.EXPIRED).strip())
+        self.post_queued("$fresh")
         self.dm_task("task-3", "/model")
         self.w.serve()
         self.post_queued()
-        cases = {"task-4": dict(kind="room"), "task-5": dict(channel="!other:s.space"),
-                 "task-6": dict(reply_to="$other"), "task-8": dict(tier="team", collaborator=True)}
-        for tid, over in cases.items():
+        # Outside the owner's DM, or from anyone else, a tap is refused and no card is shown.
+        for tid, over in {"task-4": dict(kind="room"), "task-8": dict(tier="team", collaborator=True)}.items():
             self.dm_task(tid, said, **dict(dict(reply_to="$card1", click=said), **over))
             self.w.serve()
             self.assertIn("couldn't match that button", self.w.result(tid), tid)
-        self.dm_task("task-7", said, reply_to="$card1")
+            self.assertEqual(self.post_queued(), [], tid)
+        # The owner's tap in another DM, or in reply to another event: expired, with a fresh card there.
+        for tid, over, room in (("task-5", dict(channel="!other:s.space"), "!other:s.space"),
+                                ("task-6", dict(reply_to="$other"), self.DM)):
+            self.dm_task(tid, said, **dict(dict(reply_to="$card1", click=said), **over))
+            self.w.serve()
+            self.assertEqual(self.w.result(tid).strip(), gc.quoted(model_switch.EXPIRED).strip(), tid)
+            (fresh,) = self.post_queued("$f-" + tid)
+            self.assertEqual(fresh["room_id"], room, tid)
+        self.dm_task("task-7", said, reply_to="$f-task-6")
         self.w.serve()
         self.assertIn("didn't arrive as a tap", self.w.result("task-7"))
         self.assertNotIn("wanted", json.loads((self.w.root / "state" / "model.json").read_text()))

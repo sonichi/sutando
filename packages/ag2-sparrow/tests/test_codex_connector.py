@@ -1013,6 +1013,42 @@ class ModelCardTest(unittest.TestCase):
         self.assertNotIn("Switched", self.serve("task-2", "again"), "told once")
 
 
+    def test_the_menu_still_acts_after_a_pick_and_a_tap_on_an_expired_card_gets_a_new_one(self):
+        self.assertEqual(self.serve("task-1", "/model"), "[no-send] the model card answers\n")
+        ((_, menu),) = self.posted("$card1")
+        large = next(b["reply"] for b in menu["buttons"] if b["label"] == "Stub Large")
+        self.serve("task-2", large, reply_to="$card1", click=large)
+        ((_, coming),) = self.posted("$card2")
+        self.serve("task-3", "hello")
+        ((_, done),) = self.posted("$card3")
+        # The cards saying what a pick came to are not the menu, and do not retire it.
+        self.assertEqual((menu["id"], coming["id"], done["id"]), (model_switch.CARD, model_switch.NOTE, model_switch.NOTE))
+        five = next(b["reply"] for b in menu["buttons"] if b["label"] == "Stub 5")
+        self.assertEqual(self.serve("task-4", five, reply_to="$card1", click=five), "[no-send] the model card answers\n")
+        self.assertEqual((metrics(self.work)[-1]["card"], self.state()["wanted"]), ("model-picked", "gpt-5.6-terra"))
+        self.posted("$card4")
+        # A newer menu retires the older one: a tap on it says so, shows the current one, and switches nothing.
+        self.serve("task-5", "/model")
+        self.posted("$card5")
+        text = self.serve("task-6", large, reply_to="$card1", click=large)
+        self.assertEqual((text.strip(), metrics(self.work)[-1]["card"]), (model_switch.EXPIRED, "model-card-expired"))
+        ((room, fresh),) = self.posted("$card6")
+        self.assertEqual((room, fresh["id"], self.state()["wanted"]), (self.DM, model_switch.CARD, "gpt-5.6-terra"))
+        # With the bridge gone the words say how to get one; anyone else's tap is refused as before.
+        self.dm("task-7", large, reply_to="$card1", click=large)
+        c, _ = self.connector()
+        shutil.rmtree(self.bridge)
+        self.assertEqual(c.models.card_task(str(self.work / "tasks" / "task-7.txt"), str(self.work / "o.txt")),
+                         "model-card-expired")
+        self.assertEqual((self.work / "o.txt").read_text().strip(), model_switch.EXPIRED_NO_CARD)
+        (self.work / "tasks" / "task-7.txt").unlink()      # answered here, not by the served connector
+        self.bridge.mkdir(parents=True)
+        self.assertIn("couldn't match that button",
+                      self.serve("task-8", large, reply_to="$card1", click=large, tier="team", channel="!room:s.space",
+                                 kind="room"))
+        self.assertEqual((self.posted(), metrics(self.work)[-1]["card"]), ([], "card-refused"))
+
+
 class FakeRpc:
     """A server that accepts turn/start and then says nothing: the proxy branch cannot
     restart a shared daemon, so a stuck turn there must raise."""
