@@ -125,7 +125,7 @@ class CardButtons(Base):
         self.assertEqual({k for i, k in kinds.items() if i not in ("buy_credits", "open_terminal")},
                          {recovery.ACTION_KIND})
         self.assertEqual(req.actions[-1].kind, "open_terminal", "the terminal stays last and host-only")
-        self.assertIn("tap a model or runtime below", req.message)
+        self.assertIn("tap a model below", req.message, "no runtime button here (no codex CLI), so none named")
 
     def test_switch_buttons_skip_the_model_in_use_and_codex_offers_the_runtime_instead(self):
         (self.ws / "state" / "model-switch.json").write_text(json.dumps({"model": "sonnet"}))

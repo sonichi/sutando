@@ -94,8 +94,10 @@ def limit_unblock(session: Optional[str] = None, runtime: Optional[str] = None,
         parts = ["It continues when the limit resets."]
         if menu:
             parts.append("Pick how to wait below.")
-        if recovery.SWITCH_MODEL in verbs or recovery.SWITCH_RUNTIME in verbs:
-            parts.append("To keep working now, tap a model or runtime below that has usage left.")
+        what = " or ".join(w for v, w in ((recovery.SWITCH_MODEL, "model"), (recovery.SWITCH_RUNTIME, "runtime"))
+                           if v in verbs)
+        if what:
+            parts.append(f"To keep working now, tap a {what} below that has usage left.")
         if recovery.RETRY_NOW in verbs:
             parts.append("Retry now sends the refused message again.")
         if recovery.ADD_ACCOUNT in verbs:
