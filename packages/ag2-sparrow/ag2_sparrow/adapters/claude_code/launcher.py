@@ -37,6 +37,10 @@ SERVER_EXIT_S = 20.0
 CONSUMER_WAIT_S = 30.0
 INNER_STOP_S = 120.0
 TITLE_CHANGED = "title changed"
+MODEL_ACCEPT_S = 20.0
+# What Claude Code's own /model takes: an alias or a claude-* id, either with an optional [1m] tag.
+MODEL_RE = re.compile(r"^(default|(opus|sonnet|haiku|fable)(\[1m\])?|claude-[a-z0-9.-]+(\[1m\])?)$")
+MODEL_SET, MODEL_CONFIRM = "Set model to", "Yes, switch"
 FIELD_SEP = "|:ag2:|"
 START_COMMAND_RE = re.compile(r'^"?ag2-sparrow-claude-local hold --generation=[0-9a-f]{32} --"?$')
 TMUX_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
@@ -595,6 +599,45 @@ class Launcher:
         if self.tm.has_session() is True:
             return "kill-session sent but the session still answers after %d s" % SERVER_EXIT_S
         return self.stopped(started)
+
+    def switch_model(self, rec: dict, model: str, confirm=False, wait_s=MODEL_ACCEPT_S) -> "tuple[bool, str]":
+        """`/model <model>` through the fence, then (switched, one line): switched only when the pane
+        shows a NEW "Set model to" line. A warm session asks first; that dialog is answered once with
+        `confirm`, else cancelled. Nothing is sent to a session whose tuple changed."""
+        gen, title = rec.get("generation"), rec.get("title_token") or ""
+        if not MODEL_RE.match(model or ""):
+            return False, "refused: %r is not a model alias or a claude-* id; nothing sent" % model
+        if not gen or self.tm.has_session() is not True:
+            return False, "no running session to switch; nothing sent"
+        shown = self.tm.capture(gen["pane_id"]) or ""
+        before, asked = shown.count(MODEL_SET), shown.count(MODEL_CONFIRM)
+
+        def keys(*names):
+            pred = tmux_pane_keys.predicate(gen["nonce"], gen["pane_pid"], gen["session_id"], gen["session_created"],
+                                            title_token=title or None)
+            argv = tmux_pane_keys.fence_keys_argv(self.tm.sock, gen["pane_id"], pred, *names, tmux=self.tm.tmux)
+            try:
+                return self.run(argv, capture_output=True, text=True, timeout=tmux_pane_keys.TIMEOUT_S + 5).returncode
+            except (OSError, subprocess.SubprocessError):
+                return tmux_pane_keys.UNCERTAIN
+
+        rc = keys("/model", "Space", model, "Enter")
+        if rc != 0:
+            return False, self.unsent(gen, title, rc, "/model") or "the session ended before /model; nothing switched"
+        answered, deadline = False, time.monotonic() + wait_s
+        while time.monotonic() < deadline:
+            text = self.tm.capture(gen["pane_id"]) or ""
+            if text.count(MODEL_SET) > before:
+                self.log("model: switched to %s" % model)
+                return True, "switched to %s" % model
+            if text.count(MODEL_CONFIRM) > asked and not answered:
+                if not confirm:
+                    keys("Escape")
+                    return False, ("not switched: Claude Code asks to confirm a switch in a running conversation; "
+                                   "repeat with --confirm")
+                answered = keys("Enter") == 0
+            self.sleep(0.5)
+        return False, "unconfirmed: /model %s was sent but Claude Code did not report the switch in %d s" % (model, wait_s)
 
     def stopped(self, started) -> str:
         self.log("stopped in %.1f s" % (self.clock() - started))

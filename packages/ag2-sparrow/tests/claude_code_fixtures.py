@@ -128,8 +128,16 @@ if read("claude-signal-parent", ""):
     os.kill(os.getppid(), getattr(signal, "SIG" + read("claude-signal-parent", "")))
 if read("claude-exit-on-exit", ""):
     for line in sys.stdin:
+        line = line.lstrip("\x1b")
         if line.strip() == "/exit":
             break
+        if line.startswith("/model ") and read("claude-model-asks", "") and not read("claude-model-asked", ""):
+            open(os.path.join(home, "claude-model-asked"), "w").write(line.strip())
+            print("Switch model?  Yes, switch / No, go back", flush=True)
+        elif line.startswith("/model ") and not read("claude-model-deaf", ""):
+            print("Set model to " + line.split(None, 1)[1].strip(), flush=True)
+        elif line.strip() == "" and read("claude-model-asked", ""):
+            print("Set model to " + read("claude-model-asked", "").split(None, 1)[1], flush=True)
     sys.exit(0)
 time.sleep(float(read("claude-linger", "0")))
 sys.exit(int(read("claude-exit", "0")))

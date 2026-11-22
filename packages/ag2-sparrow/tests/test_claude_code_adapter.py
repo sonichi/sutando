@@ -1968,6 +1968,40 @@ class LauncherTmux(ConnectBase):
         self.assertEqual(launcher.classify(lc.tm, lc.record(), self.cfg, str(self.work))[0], "create",
                          "the next start creates and resumes by id")
 
+    def test_the_model_is_switched_by_typing_claude_codes_own_command_and_only_a_reported_switch_counts(self):
+        (self.home / "claude-exit-on-exit").write_text("1")
+        lc, rec = self.created()
+        pane = rec["generation"]["pane_id"]
+        self.assertEqual(lc.switch_model(rec, "opus"), (True, "switched to opus"))
+        self.assertIn("Set model to opus", self.tmux("capture-pane", "-p", "-t", pane).stdout)
+        self.assertEqual(lc.switch_model(rec, "claude-fable-5-2[1m]")[0], True, "an id with a context tag")
+        for bad in ("", "gpt-5", "opus; rm -rf x", "Enter", "opus fable"):
+            switched, line = lc.switch_model(rec, bad)
+            self.assertEqual((switched, "nothing sent" in line), (False, True), bad)
+        self.assertEqual(self.tmux("capture-pane", "-p", "-t", pane).stdout.count("Set model to"), 2, "nothing more typed")
+        # A session that never reports the switch is not a switch.
+        (self.home / "claude-model-deaf").write_text("1")
+        switched, line = lc.switch_model(rec, "haiku", wait_s=2)
+        self.assertEqual((switched, line.startswith("unconfirmed")), (False, True), line)
+        (self.home / "claude-model-deaf").unlink()
+        # The pane was replaced since the record: the fence withholds the keys.
+        stale = dict(rec, generation=dict(rec["generation"], nonce="0" * 32))
+        switched, line = lc.switch_model(stale, "sonnet")
+        self.assertEqual((switched, "nothing sent" in line), (False, True), line)
+        self.assertNotIn("sonnet", self.tmux("capture-pane", "-p", "-t", pane).stdout)
+        self.assertEqual(lc.switch_model({}, "opus"), (False, "no running session to switch; nothing sent"))
+
+    def test_a_switch_inside_a_running_conversation_needs_confirm_and_is_cancelled_without_it(self):
+        (self.home / "claude-exit-on-exit").write_text("1")
+        (self.home / "claude-model-asks").write_text("1")
+        lc, rec = self.created()
+        pane = rec["generation"]["pane_id"]
+        switched, line = lc.switch_model(rec, "opus")
+        self.assertEqual((switched, "--confirm" in line), (False, True), line)
+        self.assertNotIn("Set model to", self.tmux("capture-pane", "-p", "-t", pane).stdout)
+        (self.home / "claude-model-asked").unlink()
+        self.assertEqual(lc.switch_model(rec, "sonnet", confirm=True), (True, "switched to sonnet"))
+
     def test_a_claude_that_exits_on_exit_is_stopped_for_the_manager_uninstall_and_the_card(self):
         """The real stop path: /exit ends claude, hold and the server, so the fenced kill-session finds no
         server; the session is gone, which is stopped, not cancelled."""
@@ -2593,6 +2627,22 @@ class LocalCommands(ConnectBase):
                                    capture_output=True, text=True).stdout
         for phrase in ("same session", "/clear", "/compact", "never kill the server"):
             self.assertIn(phrase, " ".join(help_text.split()))
+
+    def test_model_prints_what_claude_code_recorded_and_refuses_a_switch_it_cannot_make(self):
+        self.configure()
+        settings = Path(cli.load_config()[0]["CLAUDE_CONFIG_DIR"]) / "settings.json"
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.unlink(missing_ok=True)
+        self.assertEqual(json.loads(self.main("model")[1]), {"model": "default"})
+        settings.write_text(json.dumps({"model": "opus"}))
+        self.addCleanup(settings.unlink, True)
+        self.assertEqual(json.loads(self.main("model")[1]), {"model": "opus"})
+        settings.write_text("[")
+        self.assertEqual(json.loads(self.main("model")[1]), {"model": "default"}, "an unreadable file is not a model")
+        rc, out, _ = self.main("model", "gpt-5")
+        self.assertEqual((rc, json.loads(out)["switched"], "nothing sent" in json.loads(out)["detail"]), (1, False, True))
+        rc, out, _ = self.main("model", "opus")
+        self.assertEqual((rc, json.loads(out)["detail"]), (1, "no running session to switch; nothing sent"))
 
     def test_stop_refuses_without_confirm_and_without_an_open_card(self):
         self.configure()
