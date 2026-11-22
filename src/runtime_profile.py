@@ -11,8 +11,12 @@ with the `runtime_profile.v1` capability, through the reader the sutando adapter
     the seat's model (settings, switch)    core_limit_hold.launch_identity
     state/runtime-models.<runtime>.json    runtime_models (the runtime's own model list)
     state/quota-state.json                 the credential proxy
-    state/core-limit-hold.json             core_limit_hold
-    the CLI's signed-in account            core_limit_hold.account_fingerprint (digest only)
+    state/core-limit-hold.json             core_limit_hold (only a hold that binds this seat)
+    the CLI's signed-in account            core_limit_hold.oauth_account (digest and plan name)
+    state/runtime-profile-account.json     this module: when the current account was first seen
+
+The proxy's quota record names no account, so a reading counts only when it was taken after the
+current account was first seen; until then usage is null.
 
 Unknown is null, never guessed: a Codex core reports no plan, an unknown core model sends no
 block at all (the schema requires one), and `workers` stays [] until a worker reports its own
@@ -20,7 +24,7 @@ model. A switch option's `token` is the runtime list's opaque row key, the id a 
 `switch_model:<token>` click names, so a client's switch reaches the executor's own allowlist.
 The literal wire examples are `contracts/runtime_profile.v1/heartbeat.*.json`.
 
-    runtime_profile.py show     the block as the next heartbeat would send it (read-only)
+    runtime_profile.py show     the block as the next heartbeat would send it
 """
 from __future__ import annotations
 
@@ -31,6 +35,8 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from workspace_default import status_read_path, write_status
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -55,6 +61,10 @@ _TAG = re.compile(r"\[[^\]]*\]$")
 _HEADER = "anthropic-ratelimit-unified-"
 #: The proxy's representative claim, named as its window header.
 _CLAIM_WINDOW = {"five_hour": "5h", "seven_day": "7d"}
+#: A plan name is a few plain words ("Claude Max", "Ultra"); an id, email or path never fits.
+_PLAN_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9+]*(?: [A-Za-z0-9+]+){0,3}$")
+_ID_RUN = re.compile(r"[0-9A-Fa-f]{8,}|\d{5,}")
+ACCOUNT_RECORD = "runtime-profile-account.json"
 
 
 # ---- shapes ---------------------------------------------------------------------------------
@@ -67,6 +77,12 @@ def _epoch(value: Any) -> Optional[int]:
 
 def _label(value: Any) -> Optional[str]:
     if isinstance(value, str) and 1 <= len(value) <= 64 and value == value.strip() and value.isprintable():
+        return value
+    return None
+
+
+def _plan_label(value: Any) -> Optional[str]:
+    if isinstance(value, str) and len(value) <= 32 and _PLAN_NAME.fullmatch(value) and not _ID_RUN.search(value):
         return value
     return None
 
@@ -140,11 +156,6 @@ def coerce(block: Any) -> Optional[dict]:
 
 # ---- derivation -----------------------------------------------------------------------------
 
-def _claude_name(label: str) -> str:
-    """The runtime's label as a product name: "Opus 5.5" reads "Claude Opus 5.5"."""
-    return f"Claude {label}" if label.split(" ", 1)[0].lower() in _FAMILIES else label
-
-
 def _claude_model_from_id(model_id: str) -> Optional[dict]:
     hit = _CLAUDE_ID.fullmatch(model_id)
     if not hit:
@@ -175,7 +186,14 @@ def _family_of(row_or_id: Any) -> Optional[str]:
 def claude_model(value: Optional[str], rows: List[dict], quota_model: Optional[str]) -> Optional[dict]:
     """The Claude model `value` (the seat's alias or id) names, by the runtime's own list or the
     proxy's last request of the same family; None when neither says which version it is."""
-    value = _TAG.sub("", value.strip()) if isinstance(value, str) and value.strip() else None
+    raw = value.strip() if isinstance(value, str) and value.strip() else ""
+    tag = _TAG.search(raw)
+    model = _claude_untagged(_TAG.sub("", raw) or None, rows, quota_model)
+    tagged = _model_id(model["id"] + tag.group(0)) if model and tag else None
+    return dict(model, id=tagged) if tagged else model
+
+
+def _claude_untagged(value: Optional[str], rows: List[dict], quota_model: Optional[str]) -> Optional[dict]:
     if value and _CLAUDE_ID.fullmatch(value):
         return _claude_model_from_id(value)
     if value in _FAMILIES:
@@ -193,20 +211,30 @@ def claude_model(value: Optional[str], rows: List[dict], quota_model: Optional[s
 
 
 def codex_model(rows: List[dict]) -> Optional[dict]:
+    """The picker's current row, named by its validated model id ("gpt-5.5" reads "GPT-5.5")."""
     row = next((r for r in rows if r.get("current")), None)
-    model_id, name = (_model_id(row.get("model")), _label(row.get("label"))) if row else (None, None)
-    return {"id": model_id, "display_name": name, "runtime": "codex"} if model_id and name else None
+    model_id = _model_id(row.get("model")) if row else None
+    return {"id": model_id, "display_name": re.sub(r"^gpt-", "GPT-", model_id), "runtime": "codex"} \
+        if model_id else None
+
+
+def _switch_name(row: dict) -> Optional[str]:
+    """A row's name from the model it runs, never the picker's own text."""
+    model = _claude_model_from_row(row)
+    if not model:
+        return None
+    return model["display_name"] + (" (1M context)" if str(row.get("arg") or "").endswith("[1m]") else "")
 
 
 def switch_options(runtime: str, offered: List[dict]) -> List[dict]:
-    """The rows a recovery card may offer as switches (runtime_models.offer), by row key."""
+    """The rows a recovery card offers as switches (recovery_actions.switch_offer), by row key."""
     if runtime != "claude":
         return []  # a Codex core's model is a launch argument: no switch runs on it
     out, seen = [], set()
     for row in offered:
-        token, name = _model_id(row.get("key")), _label(row.get("label"))
+        token, name = _model_id(row.get("key")), _switch_name(row)
         if token and name and token not in seen:
-            out.append({"token": token, "display_name": _label(_claude_name(name)) or name})
+            out.append({"token": token, "display_name": name})
             seen.add(token)
         if len(out) == MAX_OPTIONS:
             break
@@ -265,27 +293,47 @@ def derive(*, runtime: Optional[str], model: Optional[dict], offered: List[dict]
     """The block for one heartbeat, or None when the core's runtime or model is unknown."""
     if runtime not in RUNTIMES or _model(model) is None or model["runtime"] != runtime:
         return None
+    import core_recovery_state
     plan = None
-    name = _label(plan_name)
+    name = _plan_label(plan_name)
     if runtime == "claude" and name:
         plan = {"name": name, **usage(quota, quota_age_s, hold_until, now)}
-        if isinstance(account_digest, str) and _HEX.fullmatch(account_digest):
-            plan = {"account": f"acct_{account_digest[:6]}", **plan}
+        account = core_recovery_state.account_label(account_digest)
+        if account:
+            plan = {"account": account, **plan}
     return coerce({"v": VERSION, "reported_at": int(now), "model": dict(model),
                    "switch_options": switch_options(runtime, offered), "plan": plan, "workers": []})
 
 
 # ---- gathering ------------------------------------------------------------------------------
 
-def _plan_name(config_dir: Optional[str]) -> Optional[str]:
-    """The plan's display name the CLI keeps for its signed-in account; no other field is read."""
-    if not config_dir:
+def _account_since(workspace: Path, digest: Optional[str], now: float) -> Optional[float]:
+    """When `digest` was first seen signed in, recording it on a change; None when unknown."""
+    if not (isinstance(digest, str) and _HEX.fullmatch(digest)):
         return None
     try:
-        acct = json.loads((Path(config_dir) / ".claude.json").read_text(encoding="utf-8")).get("oauthAccount")
+        rec = json.loads(status_read_path(ACCOUNT_RECORD, workspace).read_text(encoding="utf-8"))
+        if rec.get("account") == digest and _epoch(rec.get("since")) is not None:
+            return float(rec["since"])
     except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        write_status(ACCOUNT_RECORD, {"account": digest, "since": now}, workspace=workspace)
+    except OSError:
         return None
-    return _label(acct.get("planDisplayName")) if isinstance(acct, dict) else None
+    return now
+
+
+def _codex_rows(workspace: Path) -> List[dict]:
+    """The Codex picker's rows only when read during the launch core-runtime.json records."""
+    import core_recovery_state
+    import runtime_models
+    data = runtime_models.read(workspace, "codex") or {}
+    launch = core_recovery_state.recorded_launch(workspace) or {}
+    at, started = data.get("at"), launch.get("started_at")
+    if launch.get("runtime") != "codex" or _epoch(at) is None or _epoch(started) is None or at < started:
+        return []
+    return runtime_models.entries(workspace, "codex")
 
 
 def _runtime(workspace: Path) -> Optional[str]:
@@ -302,26 +350,33 @@ def _runtime(workspace: Path) -> Optional[str]:
 
 
 def gather(workspace: Path, now: Optional[float] = None) -> Optional[dict]:
-    """The block as the next heartbeat would send it. Read-only."""
+    """The block as the next heartbeat would send it; writes only ACCOUNT_RECORD."""
     import core_limit_hold
     import quota_availability as qa
+    import recovery_actions
     import runtime_models
     workspace = Path(workspace)
     at = time.time() if now is None else now
     runtime = _runtime(workspace)
-    rows = runtime_models.entries(workspace, runtime) if runtime else []
     if runtime == "codex":
-        return derive(runtime=runtime, model=codex_model(rows), offered=[], plan_name=None, account_digest=None,
-                      quota=None, quota_age_s=None, hold_until=None, now=at)
+        return derive(runtime=runtime, model=codex_model(_codex_rows(workspace)), offered=[], plan_name=None,
+                      account_digest=None, quota=None, quota_age_s=None, hold_until=None, now=at)
+    rows = runtime_models.entries(workspace, runtime) if runtime else []
     config_dir = core_limit_hold._launch_config_dir()
-    value, digest = core_limit_hold.launch_identity(workspace, config_dir)
+    acct = core_limit_hold.oauth_account(config_dir)
+    digest = core_limit_hold.account_digest(acct)
+    value = core_limit_hold.launch_model(workspace, config_dir)
     record = qa.read_quota_record(workspace, at)
-    quota = record.payload if record else None
-    hold = core_limit_hold.active_hold(workspace, at)
-    return derive(runtime=runtime, model=claude_model(value, rows, qa.record_model(quota)),
-                  offered=runtime_models.offer(workspace, runtime, value, None),
-                  plan_name=_plan_name(config_dir), account_digest=digest, quota=quota,
-                  quota_age_s=record.age_s if record else None,
+    since = _account_since(workspace, digest, at)
+    ours = record is not None and record.age_s is not None and since is not None and at - record.age_s >= since
+    hold = core_limit_hold.binding_hold(workspace, at, identity=(value, digest))
+    by_key = {r["key"]: r for r in rows}
+    keys = recovery_actions.switch_offer(workspace, runtime, avoid=hold.get("model") if hold else None,
+                                         launch_model=value)
+    return derive(runtime=runtime, model=claude_model(value, rows, qa.record_model(record.payload if record else None)),
+                  offered=[by_key[k] for k in keys if k in by_key],
+                  plan_name=acct.get("planDisplayName") if acct else None, account_digest=digest,
+                  quota=record.payload if ours else None, quota_age_s=record.age_s if ours else None,
                   hold_until=hold.get("until") if hold else None, now=at)
 
 

@@ -25,6 +25,7 @@ isolate_os_environ()
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
+import core_limit_hold
 import core_recovery_state
 import recovery_actions
 import runtime_models
@@ -128,7 +129,8 @@ class Shapes(unittest.TestCase):
                          "claude-opus-5-5")
 
     def test_at_most_six_switches_and_only_named_rows(self):
-        rows = [{"key": f"o{i:012x}", "label": "Sonnet 5"} for i in range(8)] + [{"key": "bad key", "label": "x"}]
+        rows = [{"key": f"o{i:012x}", "label": "Sonnet 5", "model": "Sonnet 5"} for i in range(8)] \
+            + [{"key": "bad key", "label": "x", "model": "Sonnet 5"}]
         got = rp.switch_options("claude", rows)
         self.assertEqual(len(got), rp.MAX_OPTIONS)
         self.assertEqual(got[0]["display_name"], "Claude Sonnet 5")
@@ -203,7 +205,7 @@ class ClaudeCore(unittest.TestCase):
 
     def test_the_model_is_named_by_version_never_by_alias(self):
         self.assertEqual(rp.claude_model("claude-sonnet-5[1m]", [], None),
-                         {"id": "claude-sonnet-5", "display_name": "Claude Sonnet 5", "runtime": "claude"})
+                         {"id": "claude-sonnet-5[1m]", "display_name": "Claude Sonnet 5", "runtime": "claude"})
         self.assertEqual(rp.claude_model("claude-haiku-4-5-20251001", [], None)["display_name"], "Claude Haiku 4.5")
         self.assertIsNone(rp.claude_model("opus", [], None), "an alias with no version source is unknown")
         self.assertIsNone(rp.claude_model("opus", [], "claude-sonnet-5"), "another family's request says nothing")
@@ -211,6 +213,34 @@ class ClaudeCore(unittest.TestCase):
         self.assertIsNone(rp.derive(runtime="claude", model=None, offered=[], plan_name="Claude Max",
                                     account_digest=DIGEST, quota=None, quota_age_s=None, hold_until=None, now=1),
                           "an unknown core model sends no block: the schema requires one")
+
+
+class Labels(unittest.TestCase):
+    """Names a client shows come from validated ids or a plain plan name, never copied free text."""
+
+    def test_a_plan_name_that_is_not_a_plain_name_is_dropped(self):
+        for name in ("Claude Max", "Ultra", "Claude Max 20x", "Pro+"):
+            self.assertEqual(claude(1789999995, None, plan_name=name)["plan"]["name"], name)
+        for name in ("someone@example.com", "sk-ant-api03-AbCdEf0123456789", "/Users/someone/.claude",
+                     "Max 0123456789abcdef", "Claude Max (team: acme)", "a b c d e"):
+            self.assertIsNone(claude(1789999995, None, plan_name=name)["plan"], name)
+
+    def test_a_switch_is_named_by_the_model_it_runs_not_the_pickers_text(self):
+        rows = [{"key": "o0123456789ab", "label": "Opus 5.5 sk-ant-api03-secret", "model": "Opus 5.5",
+                 "arg": "claude-opus-5-5"},
+                {"key": "o0123456789ac", "label": "Sonnet 5 (1M context)", "model": "Sonnet 5",
+                 "arg": "claude-sonnet-5[1m]"},
+                {"key": "o0123456789ad", "label": "Mystery", "model": None, "arg": "x"}]
+        self.assertEqual(rp.switch_options("claude", rows),
+                         [{"token": "o0123456789ab", "display_name": "Claude Opus 5.5"},
+                          {"token": "o0123456789ac", "display_name": "Claude Sonnet 5 (1M context)"}])
+
+    def test_a_codex_model_is_named_from_its_id(self):
+        row = {"key": "o1", "label": "gpt-5.5 sk-secret", "model": "gpt-5.5", "current": True}
+        self.assertEqual(rp.codex_model([row]), {"id": "gpt-5.5", "display_name": "GPT-5.5", "runtime": "codex"})
+
+    def test_the_account_label_is_the_recovery_records_own(self):
+        self.assertEqual(claude(1789999995, None)["plan"]["account"], core_recovery_state.account_label(DIGEST))
 
 
 class Switches(unittest.TestCase):
@@ -272,6 +302,9 @@ class Gather(unittest.TestCase):
         (self.cfg / ".claude.json").write_text(json.dumps({"oauthAccount": {
             "accountUuid": "u-1", "emailAddress": "someone@example.com", "planDisplayName": "Claude Max"}}))
         now = time.time()
+        self.now = now
+        self.digest = core_limit_hold.account_fingerprint(str(self.cfg))
+        self.write("runtime-profile-account.json", {"account": self.digest, "since": now - 3600})
         self.write("quota-state.json", {"last_checked": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
                                         "last_request": {"model": "claude-opus-5-5"},
                                         "headers": headers(**{"7d": (0.14, "allowed", int(now) + 86400)})})
@@ -287,6 +320,79 @@ class Gather(unittest.TestCase):
         text = json.dumps(got)
         for private in ("someone@example.com", "u-1", str(self.cfg), str(self.ws)):
             self.assertNotIn(private, text)
+
+    def quota(self, at, util):
+        self.write("quota-state.json", {"last_checked": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at)),
+                                        "last_request": {"model": "claude-opus-5-5"},
+                                        "headers": headers(**{"7d": (util, "allowed", int(at) + 86400)})})
+
+    def sign_in(self, uuid):
+        (self.cfg / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "accountUuid": uuid, "emailAddress": "someone@example.com", "planDisplayName": "Claude Max"}}))
+
+    def hold(self, **kw):
+        self.write("core-limit-hold.json", dict({"status": "held", "until": self.now + 3600,
+                                                 "account": self.digest, "model": "claude-opus-5-5"}, **kw))
+
+    def test_a_reading_taken_before_an_account_switch_is_not_the_new_accounts(self):
+        self.assertEqual(rp.read(self.ws, self.now + 1)["plan"]["usage_pct"], 14)
+        self.sign_in("u-2")
+        plan = rp.read(self.ws, self.now + 2)["plan"]
+        self.assertNotEqual(plan["account"], f"acct_{self.digest[:6]}")
+        self.assertEqual([plan[k] for k in ("usage_pct", "window", "resets_at")], [None] * 3)
+        self.quota(self.now + 5, 0.5)
+        self.assertEqual(rp.read(self.ws, self.now + 6)["plan"]["usage_pct"], 50, "a reading after the switch counts")
+        self.sign_in("u-1")
+        self.assertIsNone(rp.read(self.ws, self.now + 7)["plan"]["usage_pct"], "switching back starts over")
+
+    def test_an_unknown_account_has_no_usage(self):
+        (self.cfg / ".claude.json").write_text(json.dumps({"oauthAccount": {"planDisplayName": "Claude Max"}}))
+        plan = rp.read(self.ws, self.now + 1)["plan"]
+        self.assertEqual((plan["name"], plan["usage_pct"]), ("Claude Max", None))
+        self.assertNotIn("account", plan)
+
+    def test_only_a_hold_that_binds_this_seat_is_its_limit(self):
+        self.hold()
+        self.assertEqual(rp.read(self.ws, self.now + 1)["plan"]["limited_until"], int(self.now + 3600))
+        self.hold(account="f" * 16)
+        self.assertIsNone(rp.read(self.ws, self.now + 1)["plan"]["limited_until"], "another account's hold")
+        self.hold(model="claude-sonnet-5")
+        self.assertIsNone(rp.read(self.ws, self.now + 1)["plan"]["limited_until"], "another family's hold")
+
+    def offered(self, **kw):
+        return recovery_actions.switch_offer(self.ws, "claude", **kw)[:rp.MAX_OPTIONS]
+
+    def test_the_switches_are_the_cards_own_while_held(self):
+        runtime_models.record(self.ws, "claude", runtime_models.parse_picker(PICKER, "claude"))
+        self.write("model-switch.json", {"model": "sonnet"})
+        got = [o["token"] for o in rp.read(self.ws, self.now + 1)["switch_options"]]
+        self.assertEqual(got, self.offered(), "the executor's allowlist, current read as the card reads it")
+        self.hold()
+        got = rp.read(self.ws, self.now + 1)["switch_options"]
+        self.assertEqual([o["token"] for o in got], self.offered(avoid="claude-opus-5-5"))
+        self.assertNotIn("Claude Opus 5.5", [o["display_name"] for o in got], "the held model is not offered")
+
+    def test_the_cli_account_file_is_read_once_per_beat(self):
+        real, reads = Path.read_text, []
+
+        def counting(path, *a, **kw):
+            if path.name == ".claude.json":
+                reads.append(path)
+            return real(path, *a, **kw)
+        runtime_models.record(self.ws, "claude", runtime_models.parse_picker(PICKER, "claude"))
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=counting):
+            self.assertIsNotNone(rp.read(self.ws, self.now + 1))
+        self.assertEqual(len(reads), 1)
+
+    def test_a_codex_picker_read_before_this_launch_names_no_model(self):
+        rows = [{"key": "gpt-5.5", "label": "gpt-5.5", "model": "gpt-5.5", "arg": None, "current": True}]
+        self.write("core-runtime.json", {"runtime": "codex", "session": "s", "started_at": self.now - 60})
+        runtime_models.record(self.ws, "codex", rows, now=self.now - 120)
+        self.assertIsNone(rp.read(self.ws, self.now), "a picker from the previous launch")
+        runtime_models.record(self.ws, "codex", rows, now=self.now - 30)
+        self.assertEqual(rp.read(self.ws, self.now)["model"]["id"], "gpt-5.5")
+        self.write("core-runtime.json", {"runtime": "codex", "session": "s"})
+        self.assertIsNone(rp.read(self.ws, self.now), "no launch time: nothing binds the picker to it")
 
     def test_missing_or_malformed_inputs_never_raise(self):
         cases = [("quota-state.json", "{ not json"), ("quota-state.json", "[1, 2]"),

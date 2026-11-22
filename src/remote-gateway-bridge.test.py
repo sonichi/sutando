@@ -968,7 +968,7 @@ def main() -> int:
     rtc._post_heartbeat(set(), force=True)
     hbp = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
     _prof = hbp.get("runtime_profile") or {}
-    check(_prof.get("model") == {"id": "gpt-5.5", "display_name": "gpt-5.5", "runtime": "codex"}
+    check(_prof.get("model") == {"id": "gpt-5.5", "display_name": "GPT-5.5", "runtime": "codex"}
           and _prof.get("plan") is None and _prof.get("workers") == []
           and "runtime_profile.v1" in hbp.get("capabilities", []),
           "the adapter's reader puts the core's runtime profile on the heartbeat with its capability")

@@ -196,8 +196,12 @@ def _family(model: Optional[str]) -> Optional[str]:
 
 
 def _account(hold: Optional[dict]) -> Optional[str]:
-    acct = hold.get("account") if isinstance(hold, dict) else None
-    return f"acct_{acct[:6]}" if isinstance(acct, str) and _HEX.fullmatch(acct) else None
+    return account_label(hold.get("account") if isinstance(hold, dict) else None)
+
+
+def account_label(digest: Any) -> Optional[str]:
+    """The `acct_` label a client may see for an account digest, else None."""
+    return f"acct_{digest[:6]}" if isinstance(digest, str) and _HEX.fullmatch(digest) else None
 
 
 def _wedge_names(wedge: Any) -> tuple:
@@ -476,9 +480,14 @@ def codex_tail(pane: str) -> str:
 
 def recorded_runtime(workspace: Path) -> Optional[str]:
     """The runtime the launcher last confirmed (state/core-runtime.json), for a session that is gone."""
+    rec = recorded_launch(workspace)
+    return rec["runtime"] if rec else None
+
+
+def recorded_launch(workspace: Path) -> Optional[dict]:
+    """state/core-runtime.json when it names a runtime, else None."""
     rec = _read_json(status_read_path("core-runtime.json", Path(workspace)))
-    value = rec.get("runtime") if rec else None
-    return value if value in RUNTIMES else None
+    return rec if rec and rec.get("runtime") in RUNTIMES else None
 
 
 def runtimes_on_host() -> tuple:

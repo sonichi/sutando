@@ -409,15 +409,24 @@ def _same_family(limited_model: Optional[str], launch_model: Optional[str]) -> b
     return not (mine and theirs and mine != theirs)
 
 
-def account_fingerprint(config_dir: Optional[str]) -> Optional[str]:
-    """A non-reversible digest of the account the CLI is signed in to, else None.
-    Only non-secret identity fields of `.claude.json` are read; tokens never are."""
+def oauth_account(config_dir: Optional[str]) -> Optional[dict]:
+    """The `oauthAccount` object of the CLI's `.claude.json`, else None; tokens are not in it."""
     if not config_dir:
         return None
     try:
         acct = json.loads((Path(config_dir) / ".claude.json").read_text(encoding="utf-8")).get("oauthAccount")
     except (OSError, ValueError, AttributeError):
         return None
+    return acct if isinstance(acct, dict) else None
+
+
+def account_fingerprint(config_dir: Optional[str]) -> Optional[str]:
+    """A non-reversible digest of the account the CLI is signed in to, else None."""
+    return account_digest(oauth_account(config_dir))
+
+
+def account_digest(acct: Optional[dict]) -> Optional[str]:
+    """The digest of an `oauthAccount` object; only its non-secret identity fields are read."""
     if not isinstance(acct, dict):
         return None
     ident = [str(acct.get(k) or "") for k in ("accountUuid", "organizationUuid", "emailAddress")]
@@ -450,17 +459,22 @@ def _launch_config_dir() -> Optional[str]:
 def launch_identity(workspace: Path, config_dir: Optional[str] = None) -> tuple:
     """(model, account) the next launch would run as, read the way the gate reads them."""
     config_dir = _launch_config_dir() if config_dir is None else config_dir
-    model = qa.seat_model(qa.SeatEnv(True, None, config_dir), Path(workspace))
-    return model, account_fingerprint(config_dir)
+    return launch_model(workspace, config_dir), account_fingerprint(config_dir)
 
 
-def binding_hold(workspace: Path, now: Optional[float] = None) -> Optional[dict]:
+def launch_model(workspace: Path, config_dir: Optional[str]) -> Optional[str]:
+    return qa.seat_model(qa.SeatEnv(True, None, config_dir), Path(workspace))
+
+
+def binding_hold(workspace: Path, now: Optional[float] = None,
+                 identity: Optional[tuple] = None) -> Optional[dict]:
     """The hold in force that would stop the next launch, else None. Read-only.
-    A hold the owner switched away from (another model family or account) does not bind."""
+    A hold the owner switched away from (another model family or account) does not bind.
+    `identity` is a (model, account) the caller already read, as launch_identity returns it."""
     hold = active_hold(workspace, now)
     if hold is None:
         return None
-    model, account = launch_identity(workspace)
+    model, account = launch_identity(workspace) if identity is None else identity
     return hold if _binds(hold, model, account) else None
 
 
