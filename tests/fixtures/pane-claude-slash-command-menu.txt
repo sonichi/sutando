@@ -1,0 +1,13 @@
+ ▐▛███▛█   Claude Code v2.1.322
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /…/projects/demo
+
+  ❯ /model                      Set the AI model for Claude Code (currently Opus 5.5)
+    /model-switch               Change the core's model without the CLI: send /model to the live core's pane through
+                                the shared sender, wait for the CLI to accept it (answering its confirm dialog only u…
+    /auto-mode-setup            Teach auto mode about your environment, plus optional rule tweaks
+    /code-review                Review the current diff or a PR for bugs and cleanups
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /mod
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
