@@ -19,6 +19,11 @@ import textwrap
 import unittest
 from pathlib import Path
 
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+isolate_os_environ()
+
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
 from ag2_sparrow import mcp_auth, mcp_name_shim as shim  # noqa: E402
@@ -57,7 +62,7 @@ class Session:
         Path(server).write_text(FAKE_SERVER)
         self.p = subprocess.Popen([sys.executable, "-m", "ag2_sparrow.mcp_name_shim", "--", sys.executable, server,
                                    json.dumps(names)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
-                                  bufsize=1, cwd=str(PKG_ROOT))
+                                  bufsize=1, cwd=str(PKG_ROOT), env=hermetic_env())
 
     def ask(self, msg):
         self.p.stdin.write(json.dumps(msg) + "\n")
@@ -133,7 +138,8 @@ class ShimTest(unittest.TestCase):
     def test_no_command_is_a_usage_error_and_the_module_runs_as_a_script(self):
         self.assertEqual(shim.main([], stdin=io.StringIO(""), stdout=io.StringIO()), 2)
         r = subprocess.run([sys.executable, "-m", "ag2_sparrow.mcp_name_shim", sys.executable, "-c", "pass"],
-                           capture_output=True, text=True, timeout=60, cwd=str(PKG_ROOT), input="")
+                           capture_output=True, text=True, timeout=60, cwd=str(PKG_ROOT), input="",
+                           env=hermetic_env())
         self.assertEqual(r.returncode, 0, r.stderr)
 
 
