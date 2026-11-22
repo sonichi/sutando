@@ -25,7 +25,7 @@
 #   bash scripts/lint-workspace-resolution.sh         # scan whole tree
 #   bash scripts/lint-workspace-resolution.sh --diff  # scan only added/modified lines vs base
 #
-# The CI workflow `.github/workflows/lint.yml` calls
+# The CI workflow `.github/workflows/lint-workspace-resolution.yml` calls
 # this script with --diff so existing offenders stay un-flagged until
 # explicit migration. Local scan (no flag) shows everything so authors
 # can spot legacy debt voluntarily.

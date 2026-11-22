@@ -23,7 +23,7 @@
 #   bash scripts/lint-host-label.sh          # scan whole tree (local: see all debt)
 #   bash scripts/lint-host-label.sh --diff   # scan only added lines vs base (CI)
 #
-# The CI workflow `.github/workflows/lint.yml` calls this with
+# The CI workflow `.github/workflows/lint-host-label.yml` calls this with
 # --diff so pre-existing lines stay un-flagged; only NEW reintroductions fail.
 
 set -euo pipefail

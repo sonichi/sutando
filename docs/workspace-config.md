@@ -137,13 +137,13 @@ The workspace must never end up in commits. Three layers enforce this:
 
 1. **`.gitignore`** — `workspace/*` with a `!workspace/.gitkeep` exception. Prevents `git add .` from picking up runtime files.
 2. **Local pre-commit hook** — `.githooks/pre-commit` refuses any commit whose staged files include `workspace/`-prefixed paths (except `.gitkeep`). Auto-installed by `src/startup.sh`; one-time manual install via `bash scripts/install-git-hooks.sh`.
-3. **CI workspace-leak check** — the `refuse workspace/ contents in commits` step of `.github/workflows/lint.yml` mirrors the hook on every PR + push to main. Catches anyone who bypassed the local hook.
+3. **CI workspace-leak check** — `.github/workflows/workspace-leak-check.yml` mirrors the hook on every PR + push to main. Catches anyone who bypassed the local hook.
 
 Escape hatch for the rare legitimate case (updating `.gitkeep` itself): `git commit --no-verify`.
 
 ## CI lint: forbid new direct resolution
 
-The `refuse new direct workspace-path resolution` step of `.github/workflows/lint.yml` refuses PRs that introduce new code outside the loader reading `$SUTANDO_WORKSPACE` directly, hardcoding `~/.sutando/workspace`, or using the historic `Path(__file__).resolve().parent.parent` walk-up. Existing legacy offenders are not flagged (the CI uses `--diff` mode); they're migrated separately.
+`.github/workflows/lint-workspace-resolution.yml` refuses PRs that introduce new code outside the loader reading `$SUTANDO_WORKSPACE` directly, hardcoding `~/.sutando/workspace`, or using the historic `Path(__file__).resolve().parent.parent` walk-up. Existing legacy offenders are not flagged (the CI uses `--diff` mode); they're migrated separately.
 
 ## Migrating from the old default
 
