@@ -141,8 +141,10 @@ agy's `session/request_permission` is answered by `acp_host`'s policy, default d
   it. agy's own argument names (`Path`, `Content`, `Overwrite`, `Append`, `Target`, `Replacement`,
   `AllowMultiple`, `Edits`, `StartLine`, `EndLine`, and the older `TargetFile`, `CodeContent`,
   `AbsolutePath`, ...) are recognised; any other key refuses the request;
-- nothing else: no command or web call for a collaborator or a guest, and no `delete`, `move` or
-  unclassified call for anyone.
+- the owner's turn only (the owner and Team): one of the S.space MCP tools below, named by the server
+  and tool the request carries;
+- nothing else: no command or web call for a collaborator or a guest, no other MCP tool, and no
+  `delete`, `move` or unclassified call for anyone.
 
 | Turn | Commands, fetch, search | Read or edit under the working directory | Anything else |
 | --- | --- | --- | --- |
@@ -163,3 +165,82 @@ there, and nothing is written to `~/.gemini`; `initialize` and the -32000 "Authe
 to `session/new` are the same as without it. Not yet measured, because no signed-in agy was available:
 that a signed-in agy finds its sign-in with `--gemini-dir`, which modes `session/new` lists, and that
 global rules are read only from the `--gemini-dir` home.
+
+## S.space tools (Room Commons pages and room actions)
+
+The owner's turns and Team's (an attested collaborator: `access_tier: team` with `collaborator: true`, as
+#6645 serves them; the owners' rule of 2026-11-21) can create and edit Room Commons pages and run room
+actions, as the agent itself. Their Session gets one MCP server, `ag2-space`, in `session/new` and
+`session/load`. Team runs in the owner's turn (no command or fetch grant); agy asks before each MCP call
+and the policy decides:
+
+- **Identity.** The server is AG2 Space MCP, authorized as this agent by `ag2-sparrow-mcp acp` (see the
+  package README, "Acting in AG2 Space"): the relay token in the agent's own token file is exchanged for a
+  15-minute MCP access token for this agent, and every Action runs under the agent's own room membership and
+  grants. Never the owner's sign-in and never another agent's. The exchange runs in a child process per
+  turn, with only `AG2_DEVICE_ENV` (the token file `install` recorded as `TOKEN_ENV_FILE`, passed to the
+  connector as `--token-env-file`) and a seat's own keys; the relay token stays in that child, and agy receives
+  only the short-lived access token, as the server's `Authorization` header. agy's own environment is
+  unchanged (the install's allowlist): no relay token, no token file path.
+- **Transport.** Always **stdio**, never HTTP, even when agy's `initialize` declares HTTP MCP: over HTTP
+  agy would reach the server directly and nothing would filter its tools (agy 1.5.9 and 1.5.13 declare no
+  `mcpCapabilities` at all). The server is the desktop app's
+  `ag2-mcp-proxy` (`engine/ag2-mcp-proxy.mjs`, the same stdio proxy Claude Code and Codex cores run as their
+  `s-space` server), named at install with `--mcp-proxy-command "'<node>' '<path>/ag2-mcp-proxy.mjs'"`: quote each path, since the desktop's engine sits under `Application Support`. `install` refuses a command whose first word is not an executable, and records the line with every word quoted. Each turn
+  the connector runs `ag2-sparrow-mcp descriptor --env-file <TOKEN_ENV_FILE>` (that file only, whatever
+  else holds a token) in the same isolated child and writes the proxy's
+  non-secret descriptor (0600, `state/ag2-mcp-descriptor.json`: mint and MCP URLs, the agent's token file and
+  key, the secret's sha256 and the agent id). agy gets `{name: ag2-space, command, args, env:
+  [AG2_MCP_DESCRIPTOR, AG2_MCP_LOG]}`: paths only, exactly what Claude Code's stdio entry carries. The proxy,
+  agy's child, reads the relay token from the token file, mints as the agent, sends the relay token only to
+  the mint and the access token only to the MCP endpoint, and scrubs its own environment.
+- **Tool names (stdio).** agy drops every MCP tool whose name has a dot. Measured on 2026-11-21: of AG2
+  Space's tools it offered only `ui_describe`, `ui_request` and `ui_result`, so `ag2.whoami` (empty schema)
+  and every `room.*` tool were missing. The proxy therefore runs under `ag2_sparrow.mcp_name_shim`, which
+  only renames: `tools/list` answers `room_action_execute` for `room.action.execute` (any character outside
+  `[A-Za-z0-9_-]` becomes `_`, cut to 50), and a `tools/call` for that name reaches the server as
+  `room.action.execute`. The policy matches both spellings. agy checks the prefixed name
+  (`mcp_ag2-space_<tool>`, at most 64), so aliases stop at 50 characters. The entry's `command` is
+  `state/ag2-mcp-shim` (0700, written each turn), a two-line `sh` launcher, and its `args` are just the
+  proxy's command line; the shim writes `start` and `exit` lines to `state/ag2-mcp-proxy.log`.
+- **A launch that failed is said.** Each turn the connector deletes `state/ag2-mcp-status.json` and writes a
+  fresh turn id into the launcher; the shim records that id and how far it got (`started`, `listed` with a
+  tool count, or `exited` with a code). At turn end, a message whose turn offered the stdio entry gets one
+  line when the tools did not come up: "S.space tools didn't start this turn (the helper did not start | the
+  helper exited | no tool list), so I couldn't use Room Commons." Only those fixed words reach the room; the
+  code, argv and paths stay in the log and `state/metrics.jsonl` (`sspace_tools_down`). A resumed Session
+  (`session/load`) with no launch reports its own last launch, kept per Session id in
+  `ag2-mcp-launches.json` beside the session store (on the 18:44 live run agy launched no server on resume and
+  kept the tools it had when the Session started): a line when that launch failed, nothing when it worked.
+- **Token file shape (stdio).** An agent `.env` with a `REMOTE_TASK_TOKEN=<relay>|<secret>` line gets the
+  plain descriptor (`env_file` that `.env`, `env_key` its key). A seat made by `--token-stdin` or `connect` has
+  an `.env` (`channels/ag2space/.env`) holding only `REMOTE_TASK_TOKEN_FILE`, and its token as a raw line in
+  `channels/ag2space/token`: it gets `token_format: "raw"` with `env_file` that token file's realpath,
+  `relay` the file's own relay half (never a `REMOTE_TASK_URL` override) and no `env_key`. That needs the
+  desktop proxy from ag2space-cinny-desktop#1246; an older proxy refuses it at start ("descriptor missing
+  env_key") and agy reports the tools unavailable.
+- **When none.** No token file (`--work` with a bridge you run), no `--mcp-proxy-command`, or a
+  failed exchange: the turn runs without the tools and the log says why.
+- **Which tools.** agy asks before each MCP call; the policy grants, to owner and team turns only, the
+  `ag2-space` server's `ag2.whoami`, `room.list`, `room.inspect`, `room.actions.search`,
+  `room.actions.describe`, `room.action.read`, `room.action.execute`, `room.action.execute_safe`,
+  `room.task.list`, `room.task.create`, `room.task.update`, `operation.inspect`, `approval.inspect` and
+  `space.action.read` (`mcp_auth.OWNER_TOOLS`; a name reported with `_` for `.` matches too). Never granted:
+  `agent.link`, `agent.unlink`, `agent.setup.steps`, `relay.token.issue`, event subscriptions,
+  `space.action.execute` and `ui.*`, any other server's tool, and any request that carries a command.
+- **Enforced in the shim too.** The policy only sees what agy asks about, and an agy that auto-allows MCP
+  (an `mcp(*)` allow, an earlier "always allow") asks nothing. So the launcher hands the shim the same grant
+  (`AG2_MCP_SHIM_TOOLS`, from `mcp_auth.OWNER_TOOLS`, for owner and team turns only): its `tools/list` answer
+  keeps only those tools, and a `tools/call` for any other name (by alias or server name, or malformed) gets
+  a JSON-RPC error and never reaches the server. A launcher without a grant lists and forwards nothing.
+- **By identity, never by text.** The request is matched by the MCP server and tool name it carries in
+  structured fields (`serverName`/`toolName` or `mcpServer`/`mcpTool`, on the tool call or in its `_meta`;
+  `acp_host.MCP_IDENTITY_KEYS`), compared exactly; the title is never read. Which fields agy uses has not been
+  measured: a request in another shape is denied, and its reason in `state/metrics.jsonl` lists its key names
+  (never values), so it can be mapped.
+
+**Guest turns get no S.space tools** (a guest, or a team-tier sender without the attested collaborator flag):
+no MCP server in their Session, `mcp(*)` denied in their agy home, and
+every MCP request refused. Read-only Actions are not offered to guests either: a read can still return another
+room's Commons or tasks to someone the agent's owner never shared them with, so "no mutations" is kept by
+giving no tools at all. A sender with no admitted tier is refused before agy starts, as before.
