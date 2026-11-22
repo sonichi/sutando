@@ -48,6 +48,7 @@ sys.modules["vault_intercept"] = _FAKE_VI
 
 import _gateway
 import activity_rows
+import task_envelope
 import channel_env_resolve
 import connections as C
 
@@ -129,8 +130,11 @@ class TheWorkersSession(Base):
         self.assertEqual(self.instance(ROOM, SEAT), OWN)
         self.assertIsNone(self.instance(ROOM, CORE_ENV))
 
-    def test_a_room_on_another_server_is_the_core_rows(self):
-        self.assertEqual(self.instance(BETA_ROOM, SEAT), "beta")
+    def test_an_unprompted_post_on_a_server_it_has_no_identity_on_is_refused_never_the_cores(self):
+        with self.assertRaises(C.NoConnectionForRoom) as cm:
+            C.connection_for_room(BETA_ROOM, self.ws, SEAT)
+        self.assertIn("no identity of its own", str(cm.exception))
+        self.assertEqual(self.instance(BETA_ROOM, CORE_ENV), "beta")
 
     def test_a_disconnected_identity_answers_through_the_cores(self):
         self.record(rows(disabled=True))
@@ -157,11 +161,13 @@ class NeverSomeoneElses(Base):
             self.assertIn(SEAT_VAR, (scripts / launcher).read_text(), launcher)
 
 
-def write_task(ws, tid, room, agent="", folder="tasks"):
+def write_task(ws, tid, room, agent="", folder="tasks", stamped=True):
+    """A task file as the gateway writes it: HMAC-stamped with the workspace's key unless `stamped` is False."""
     path = ws / folder / f"{tid}.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
     recv = f"receiving_instance: {agent}\n" if agent else ""
-    path.write_text(f"id: {tid}\n{recv}channel_id: {room}\nsource: ag2space\ntask: hi\n")
+    text = f"id: {tid}\n{recv}channel_id: {room}\nsource: ag2space\ntask: hi\n"
+    path.write_text(task_envelope.stamp_text(text, ws) if stamped else text)
     return path
 
 
@@ -215,6 +221,19 @@ class IdentityComesFromTheTask(Base):
         scratch = write_task(self.ws, "task-abc999", ROOM, CORE_AGENT, folder="scratch")
         self.deliver("task-abc999")
         self.assertIn("does not hold", self.refused(ROOM, scratch))
+
+    def test_an_unsigned_or_tampered_core_task_is_refused(self):
+        unsigned = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT, stamped=False)
+        self.deliver("task-abc123")
+        self.assertIn("it is unsigned", self.refused(ROOM, unsigned))
+        tampered = write_task(self.ws, "task-abc124", ROOM, CORE_AGENT)
+        self.deliver("task-abc124")
+        tampered.write_text(tampered.read_text().replace("task: hi", "task: something else"))
+        self.assertIn("it is invalid", self.refused(ROOM, tampered))
+
+    def test_its_own_task_needs_no_envelope(self):
+        own = write_task(self.ws, f"task-{OWN}~abc123", ROOM, OWN_AGENT, stamped=False)
+        self.assertEqual(self.via(ROOM, SEAT, own), OWN)
 
     def test_a_held_core_task_posted_to_another_room_is_refused(self):
         core = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)

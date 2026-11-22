@@ -2405,8 +2405,8 @@ def acting_identity(rows: list, room_id: Optional[str], worker: str,
     - answering a task (`task_agent`, as `task_reply_agent` bound it): exactly that agent's row, the
       worker's own or a core one, serving the room; any other row is refused, never substituted;
     - no task: its own row on the room's server (with no room or a domainless one, its only row),
-      except a core lane's own owner DM, which stays the core's; a server it has no row on, the core's.
-    NoConnectionForRoom when nothing serves the room: never the shared token in its place."""
+      except a core lane's own owner DM, which stays the core's.
+    NoConnectionForRoom when nothing serves the room: never the core or the shared token in its place."""
     own = _enabled_own(rows, worker)
     if not own:
         return None
@@ -2421,9 +2421,13 @@ def acting_identity(rows: list, room_id: Optional[str], worker: str,
             raise NoConnectionForRoom(f"the task is addressed to {agent}, which does not serve this room")
         return _core_row_for(rows, server, agent)
     core = [r for r in _core_rows(rows) if not server or server in _row_servers(r)]
-    if mine is not None and not (room_id and any(room_id in _lane_owner_dms(r, workspace) for r in core)):
+    if room_id and any(room_id in _lane_owner_dms(r, workspace) for r in core):
+        return _core_row_for(rows, server, "")
+    if mine is not None:
         return mine
-    return _core_row_for(rows, server, "")
+    raise NoConnectionForRoom(f"worker {worker} has no identity of its own for this room"
+                              f"{' (server ' + server + ')' if server else ''}; an unprompted post is "
+                              "never sent as the core or with the shared token")
 
 
 def _core_row_for(rows: list, server: str, agent: str) -> dict:
@@ -2459,11 +2463,12 @@ def task_reply_agent(task_file, room_id: Optional[str], worker: str, rows: list,
     """The agent `worker`'s reply to `task_file` in `room_id` posts as. The file must be readable and
     the live file of the id it declares; its receiving agent and queuing lane must agree; the room
     must be the task's own. Addressed to the worker's own agent, that is all. Addressed to a core
-    agent, the worker must also hold the task (its own tasks folder, or the pool's delivery sentinel)
-    and it must be neither answered nor archived. NoConnectionForRoom names any failed check."""
+    agent, its envelope must verify (`task_envelope`), the worker must hold the task (its own tasks
+    folder, or the pool's delivery sentinel) and it must be neither answered nor archived.
+    NoConnectionForRoom names any failed check."""
     import local_task_protocol
     import task_archive
-    from task_envelope import attested_task_headers
+    from task_envelope import attested_task_headers, verify_text
     ws = _workspace(workspace)
     path = Path(task_file) if task_file else None
 
@@ -2495,6 +2500,9 @@ def task_reply_agent(task_file, room_id: Optional[str], worker: str, rows: list,
         return agent
     if not any(agent == _agent_of(r) for r in _core_rows(rows)):
         refuse(f"it is addressed to {agent}, neither this worker's agent nor the core's")
+    verdict = verify_text(text, ws).get("verdict")
+    if verdict != "verified":
+        refuse(f"a core agent's reply needs a verified task envelope; it is {verdict}")
     home = task_home(tid, ws)
     held = home["own"] and home["worker"] == worker and _same_file(path.parent, home["tasks"])
     if not held and _same_file(path.parent, ws / "tasks"):
