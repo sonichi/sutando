@@ -3598,6 +3598,16 @@ class EventOwner(Base):
     def test_both_named_falls_back_to_the_primary(self):
         self.assertEqual(self.owner(f"{self.LEGACY_MXID} and {self.NEW_MXID}"), [self.NEW])
 
+    def test_a_body_mention_outranks_the_reply_it_is_written_in(self):
+        self.assertEqual(self.owner(f"{self.LEGACY_MXID} check with them", reply_to_sender=self.NEW_MXID), [""],
+                         "a reply to one agent that mentions another is the mentioned agent's")
+        self.assertEqual(self.owner(f"{self.NEW_MXID} check", reply_to_sender=self.LEGACY_MXID), [self.NEW])
+
+    def test_a_reply_decides_only_when_the_body_names_no_agent(self):
+        self.assertEqual(self.owner("thanks", reply_to_sender=self.NEW_MXID), [self.NEW])
+        self.assertEqual(self.owner(f"{self.LEGACY_MXID} and {self.NEW_MXID}", reply_to_sender=self.LEGACY_MXID),
+                         [self.NEW], "two agents named: the primary, whatever the reply")
+
     def test_a_longer_id_sharing_the_prefix_is_not_a_mention(self):
         self.assertEqual(self.owner(f"{self.LEGACY_MXID}x hello"), [self.NEW])
 
