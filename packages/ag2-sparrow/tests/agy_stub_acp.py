@@ -8,9 +8,13 @@ has been measured yet. Its sign-in, session
 and log files live under $HOME (the one variable the launcher's allowlist always passes): `signed-in` marks it
 signed in, `stub-sessions.json` keeps its sessions, `stub.log` records each request and permission outcome.
 A prompt marker picks the turn: STUB:TEXT, STUB:NOREPLY, STUB:MARKER, STUB:EDIT, STUB:SHELL, STUB:WEB,
-STUB:AGYWRITE, STUB:ODD, STUB:HANG, STUB:ASKMODEL. STUB:AGYWRITE's rawInput carries agy's own argument names (Path, Content,
+STUB:AGYWRITE, STUB:READ, STUB:ODD, STUB:HANG, STUB:ASKMODEL, STUB:MEDIA (asks to read every attachment it is told
+of, and to change one), STUB:CHANNEL, STUB:ATTACH. STUB:AGYWRITE's rawInput carries agy's own argument names (Path, Content,
 Overwrite; Target, Replacement, Edits) as its file tools declare them; the key order (Content first) is the one
 a real owner turn's refusal named ("unrecognised key Content").
+`initialize` declares agy 1.5.13's captured `promptCapabilities` (image) and `sessionCapabilities`
+(additionalDirectories); `no-media-caps` under $HOME leaves both out. Each prompt's content block types are
+logged (`blocks`).
 
 Measured on a signed-in agy (2026-11-19/20, three owner turns): a prompt that carries the gateway's "write the
 result to results/<task>.txt" step makes agy ask to write that file (title `File results/<task>.txt`, a
@@ -89,10 +93,45 @@ def chunk(session_id, text):
                      "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}}})
 
 
+DIRS = os.path.join(HOME, "stub-dirs.json")
+
+
+def media_turn(sid, text):
+    """Ask to read each attachment it was told of (copies in its additional directories, the paths the prompt
+    names, the bridge's original path in the body), read the copies itself, then ask to change one."""
+    try:
+        with open(DIRS, encoding="utf-8") as f:
+            dirs = json.load(f).get(sid) or []
+    except (OSError, ValueError):
+        dirs = []
+    paths = [os.path.join(d, n) for d in dirs if os.path.isdir(d) for n in sorted(os.listdir(d))]
+    paths += [p for p in re.findall(r"read-only copy at (\S+?)(?::|;|$)", text, re.M) if p not in paths]
+    paths += re.findall(r"\[(?:File|Photo) attached: ([^\]]+)\]", text)
+    for p in paths:
+        ok = ask(sid, {"title": "ReadFile " + p, "kind": "read", "locations": [{"path": p}]})
+        try:
+            with open(p, "rb") as f:
+                got = len(f.read()) if ok else None
+        except OSError:
+            got = None
+        log({"read": p, "bytes": got})
+    if paths:
+        ask(sid, {"title": "WriteFile " + paths[0], "kind": "edit", "locations": [{"path": paths[0]}]})
+        try:
+            with open(paths[0], "ab"):
+                wrote = True
+        except OSError:
+            wrote = False
+        log({"os_write": paths[0], "ok": wrote})
+    chunk(sid, "saw %d attachment(s)" % len(paths))
+
+
 def prompt(rid, params):
     sid = params["sessionId"]
     text = "".join(b.get("text", "") for b in params.get("prompt") or [])
-    log({"method": "session/prompt", "sessionId": sid, "text": text})
+    log({"method": "session/prompt", "sessionId": sid, "text": text,
+         "blocks": [{k: (v if k != "data" else len(v)) for k, v in b.items() if k != "text"}
+                    for b in params.get("prompt") or []]})
     if "STUB:HANG" in text:
         return
     cwd = sessions().get(sid) or os.getcwd()
@@ -106,6 +145,12 @@ def prompt(rid, params):
         chunk(sid, "[model-card]" if "reply with exactly [model-card]" in text else "no hint")
     elif "STUB:NOREPLY" in text:
         chunk(sid, "NO_REPLY")
+    elif "STUB:MEDIA" in text:
+        media_turn(sid, text)
+    elif "STUB:CHANNEL" in text:
+        chunk(sid, "[channel: !other:s.space]\nposted elsewhere")
+    elif "STUB:ATTACH" in text:
+        chunk(sid, "[file: out.txt]\n[file: /etc/passwd]\nhere you go")
     elif "STUB:MARKER" in text:
         chunk(sid, "[file: /etc/passwd]\n[no-send]\nhello")
     elif "STUB:EDIT" in text:
@@ -140,6 +185,14 @@ def prompt(rid, params):
         ask(sid, {"title": "File notes.txt (unknown key)", "kind": "edit",
                   "rawInput": {"Content": "x", "Path": inside, "Mystery": "?"}})
         chunk(sid, "wrote")
+    elif "STUB:READ" in text:
+        # Asks to read each copy the prompt lists ("- /path" lines), then each path written after the marker.
+        paths = re.findall(r"^- (/\S+)$", text, re.M) + re.search(r"STUB:READ((?: /\S+)*)", text).group(1).split()
+        for path in paths:
+            if ask(sid, {"title": "Read " + path, "kind": "read", "locations": [{"path": path}]}):
+                with open(path, encoding="utf-8") as f:
+                    chunk(sid, "read %s: %s\n" % (os.path.basename(path), f.read()))
+        chunk(sid, "done reading")
     elif "STUB:ODD" in text:
         for kind in ("delete", "move", "other", "think", None):
             ask(sid, {"title": "odd %s" % kind, "kind": kind, "locations": [{"path": os.path.join(cwd, "a")}]})
@@ -147,6 +200,17 @@ def prompt(rid, params):
     else:
         chunk(sid, "hello from agy-stub")
     send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+
+
+def remember_dirs(sid, params):
+    try:
+        with open(DIRS, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = {}
+    d[sid] = params.get("additionalDirectories") or []
+    with open(DIRS, "w", encoding="utf-8") as f:
+        json.dump(d, f)
 
 
 PAGE = {"room_id": "!room:s.space", "action": "commons.page.create", "input": {"title": "Notes"}}
@@ -224,10 +288,14 @@ def main():
         if method == "initialize":
             send({"jsonrpc": "2.0", "id": rid, "result": {
                 "protocolVersion": 1, "agentInfo": {"name": "Antigravity ACP Server", "version": "1.5.9"},
-                "agentCapabilities": dict({"loadSession": True, "sessionCapabilities": {"load": {}, "resume": {}}},
-                                          # `mcp-http` under $HOME declares HTTP MCP (assumed: 1.5.9 declared none)
-                                          **({"mcpCapabilities": {"http": True, "sse": False}}
-                                             if os.path.exists(os.path.join(HOME, "mcp-http")) else {})),
+                "agentCapabilities": dict(
+                    {"loadSession": True, "sessionCapabilities": {"load": {}, "resume": {}}},
+                    **({} if os.path.exists(os.path.join(HOME, "no-media-caps")) else {
+                        "promptCapabilities": {"image": True, "audio": False, "embeddedContext": True},
+                        "sessionCapabilities": {"load": {}, "resume": {}, "additionalDirectories": {}}}),
+                    # `mcp-http` under $HOME declares HTTP MCP (assumed: 1.5.9 declared none)
+                    **({"mcpCapabilities": {"http": True, "sse": False}}
+                       if os.path.exists(os.path.join(HOME, "mcp-http")) else {})),
                 "authMethods": [{"id": "oauth-personal", "name": "Log in with Google"},
                                 {"id": "oauth-business", "name": "Log in with Gemini Enterprise"},
                                 {"id": "gemini-api-key", "name": "Gemini API key"},
@@ -242,6 +310,7 @@ def main():
             sid = "s-%d" % (len(s) + 1)
             s[sid] = params.get("cwd")
             save(s)
+            remember_dirs(sid, params)
             result = {"sessionId": sid}
             if not os.path.exists(os.path.join(HOME, "no-modes")):
                 result["modes"] = MODES
@@ -260,6 +329,7 @@ def main():
                 send({"jsonrpc": "2.0", "id": rid, "result": {}})
         elif method == "session/load":
             if params.get("sessionId") in sessions():
+                remember_dirs(params["sessionId"], params)
                 launch(params.get("mcpServers"), loading=True)
                 chunk(params["sessionId"], "replayed history")
                 send({"jsonrpc": "2.0", "id": rid, "result": {}})
