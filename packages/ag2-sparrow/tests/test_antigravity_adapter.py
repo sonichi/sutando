@@ -16,6 +16,7 @@ import json
 import os
 import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -603,6 +604,106 @@ class MediaAndMarkersTest(unittest.TestCase):
         shown = "`[file: /etc/passwd]` and\n```\n[file: /etc/passwd]\n```"
         self.assertEqual(acp_host.owner_text(shown, cwd), shown)
         self.assertEqual(acp_host.owner_text("[no-send]", cwd), "[no-send]")
+
+
+# The task text a live antigravity-local turn received on 2026-11-21 (room id and file name replaced): the
+# gateway's own media marker, which a seat bridge with no REMOTE_MEDIA_MARKER used to leave unresolved.
+LIVE_MARKER = ("[ag2space-media: {base}/v1/media/s.space/AbCdEf123?room_id=%21room%3As.space mime=image/png "
+               "name=Screenshot 2026-11-21 at 12.00.00.png size={size} kind=m.image] what is in this screenshot?")
+LIVE_PNG = PNG + b"\0" * (2525809 - len(PNG))
+RELAY_TOKEN = "fake-relay-token-0123456789abcdef"
+BRIDGE_FETCH = """
+import json, os
+from ag2_sparrow import holder_lock as _hl
+_hl._home = lambda: os.environ["HOME"]
+from ag2_sparrow import local_task_protocol, remote_gateway_bridge as m
+refs = []
+body = m._maybe_fetch_media(os.environ["BODY"], refs)
+print(json.dumps({"body": body, "tags": list(m.MEDIA_MARKER_TAGS),
+                  "attachments": local_task_protocol.media_attachment_headers(refs, True)}))
+"""
+
+
+class GatewayMediaMarkerTest(unittest.TestCase):
+    """The live failure: `[ag2space-media: <relay URL> …]` reached agy as text. The bridge resolves it now
+    through its own gateway-bearer download, and the resolved task reaches agy as an image block."""
+
+    def setUp(self):
+        import http.server
+        import threading
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.seen = []
+        seen = self.seen
+
+        class Relay(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append((self.path, self.headers.get("Authorization")))
+                if not self.path.startswith("/relay/v1/media/s.space/AbCdEf123?"):
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(LIVE_PNG)))
+                self.end_headers()
+                self.wfile.write(LIVE_PNG)
+
+            def log_message(self, *a):
+                pass
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Relay)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = "http://127.0.0.1:%d/relay" % self.server.server_address[1]
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.tmp.cleanup()
+
+    def fetch(self, body=None, **extra):
+        """Run the bridge's `_maybe_fetch_media` on `body` (default: the live marker on this relay) in a
+        process of its own, with no REMOTE_MEDIA_MARKER unless `extra` sets one, as a seat bridge runs."""
+        env = isolated_child_env(HOME=str(self.home), PYTHONPATH=str(PKG_ROOT),
+                                 AGENT_CONNECT_TASK_DIR=str(self.home / "t"),
+                                 AGENT_CONNECT_RESULT_DIR=str(self.home / "r"),
+                                 AGENT_CONNECT_STATE_DIR=str(self.home / "s"),
+                                 REMOTE_MEDIA_DIR=str(self.home / "remote-media"),
+                                 REMOTE_TASK_URL=self.base, REMOTE_TASK_TOKEN=RELAY_TOKEN,
+                                 BODY=body or LIVE_MARKER.format(base=self.base, size=len(LIVE_PNG)))
+        env.pop("REMOTE_MEDIA_MARKER", None)
+        env.update(extra)
+        r = subprocess.run([sys.executable, "-c", BRIDGE_FETCH], env=env, capture_output=True, text=True,
+                           cwd=str(self.home), timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_a_seat_bridge_resolves_the_gateways_marker_with_its_own_bearer(self):
+        out = self.fetch()
+        self.assertIn("ag2space-media", out["tags"])
+        self.assertNotIn("[ag2space-media:", out["body"])
+        self.assertRegex(out["body"], r"^\[Photo attached: .*remote-media/Screenshot-.*\.png\] what is in")
+        self.assertEqual(self.seen, [(self.seen[0][0], "Bearer " + RELAY_TOKEN)], "one GET, the relay's bearer")
+        self.assertIn("media_form: attachment", out["attachments"])
+        # ...and the task the bridge writes reaches agy as an image block and a read-only copy
+        w = Work(self.tmp.name + "/agy")
+        header = dict(line.split(": ", 1) for line in out["attachments"].strip().splitlines())
+        w.task("task-1", "STUB:MEDIA " + out["body"], attachments=json.loads(header["attachments"]))
+        w.serve()
+        prompt = next(r for r in w.records() if r.get("method") == "session/prompt")
+        self.assertEqual([b["type"] for b in prompt["blocks"]], ["text", "image", "text"])
+        self.assertEqual(prompt["blocks"][1]["mimeType"], "image/png")
+        self.assertTrue([r for r in w.records() if r.get("read", "").endswith("/Screenshot") and r["bytes"]])
+
+    def test_an_explicit_marker_tag_is_the_only_one(self):
+        out = self.fetch(REMOTE_MEDIA_MARKER="custom-tag")
+        self.assertEqual(out["tags"], ["custom-tag"])
+        self.assertIn("[ag2space-media:", out["body"])
+        self.assertEqual(self.seen, [])
+
+    def test_a_media_url_off_the_relay_path_gets_no_bearer(self):
+        out = self.fetch(LIVE_MARKER.format(base=self.base.replace("/relay", "/relay-evil"), size=1))
+        self.assertEqual([auth for _, auth in self.seen], [None])
+        self.assertIn("[ag2space-media:", out["body"], "the 404 leaves the marker as it was")
 
 
 def stat_mode(path):

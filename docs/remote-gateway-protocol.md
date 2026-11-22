@@ -731,7 +731,7 @@ rewrites the marker to `[File attached: <local path>]` (`[Photo attached: …]`
 for `kind=m.image`) — the same inbound convention the other bridges use. Any
 failure leaves the marker untouched.
 
-Config: `REMOTE_MEDIA_MARKER` (tag, default `remote-media`),
+Config: `REMOTE_MEDIA_MARKER` (tag; unset, both `remote-media` and AG2 Space's `ag2space-media` are resolved),
 `REMOTE_MEDIA_HS_TOKEN` + `REMOTE_MEDIA_HS_ORIGIN` (homeserver bearer and the
 exact origin it may be sent to), `REMOTE_MEDIA_DIR`, `REMOTE_MEDIA_MAX_BYTES`.
 

@@ -3136,7 +3136,14 @@ def _tier_for(user_id, attested_tier=None):
 # A gateway can hand the task body a media MARKER instead of raw bytes:
 MEDIA_MARKER_TAG = re.sub(r"[^A-Za-z0-9_-]", "",
                           os.environ.get("REMOTE_MEDIA_MARKER") or "remote-media")
-MEDIA_MARKER_RE = re.compile(r"\[" + re.escape(MEDIA_MARKER_TAG) + r":([^\]]*)\]")
+# AG2 Space's gateway tags its media `ag2space-media` (its media proxy under the relay URL). Sutando's
+# launcher sets REMOTE_MEDIA_MARKER to it (src/startup-runtime.sh); a seat bridge the desktop or connect
+# launches sets nothing, so with no REMOTE_MEDIA_MARKER that tag is resolved too, or the URL reaches the
+# agent unread (2026-11-21, a live Antigravity turn). An explicit REMOTE_MEDIA_MARKER is the only tag.
+AG2_MEDIA_MARKER_TAG = "ag2space-media"
+MEDIA_MARKER_TAGS = ((MEDIA_MARKER_TAG,) if os.environ.get("REMOTE_MEDIA_MARKER")
+                     else (MEDIA_MARKER_TAG, AG2_MEDIA_MARKER_TAG))
+MEDIA_MARKER_RE = re.compile(r"\[(?:" + "|".join(map(re.escape, MEDIA_MARKER_TAGS)) + r"):([^\]]*)\]")
 
 HS_MEDIA_TOKEN = _FOUND.media_token
 diagnostics.register_secret(HS_MEDIA_TOKEN)
