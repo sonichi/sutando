@@ -304,10 +304,7 @@ class Gather(unittest.TestCase):
         now = time.time()
         self.now = now
         self.digest = core_limit_hold.account_fingerprint(str(self.cfg))
-        self.write("runtime-profile-account.json", {"account": self.digest, "since": now - 3600})
-        self.write("quota-state.json", {"last_checked": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
-                                        "last_request": {"model": "claude-opus-5-5"},
-                                        "headers": headers(**{"7d": (0.14, "allowed", int(now) + 86400)})})
+        self.quota(now, 0.14)
 
     def write(self, name, data):
         (self.ws / "state" / name).write_text(data if isinstance(data, str) else json.dumps(data))
@@ -321,10 +318,17 @@ class Gather(unittest.TestCase):
         for private in ("someone@example.com", "u-1", str(self.cfg), str(self.ws)):
             self.assertNotIn(private, text)
 
-    def quota(self, at, util):
-        self.write("quota-state.json", {"last_checked": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at)),
-                                        "last_request": {"model": "claude-opus-5-5"},
-                                        "headers": headers(**{"7d": (util, "allowed", int(at) + 86400)})})
+    def quota(self, at, util, account=True):
+        """The proxy's write; `account` True stamps the signed-in account's label, a str another's."""
+        rec = {"last_checked": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at)),
+               "last_request": {"model": "claude-opus-5-5"},
+               "headers": headers(**{"7d": (util, "allowed", int(at) + 86400)})}
+        if account:
+            rec["account"] = self.label() if account is True else account
+        self.write("quota-state.json", rec)
+
+    def label(self):
+        return core_recovery_state.account_label(core_limit_hold.account_fingerprint(str(self.cfg)))
 
     def sign_in(self, uuid):
         (self.cfg / ".claude.json").write_text(json.dumps({"oauthAccount": {
@@ -334,24 +338,27 @@ class Gather(unittest.TestCase):
         self.write("core-limit-hold.json", dict({"status": "held", "until": self.now + 3600,
                                                  "account": self.digest, "model": "claude-opus-5-5"}, **kw))
 
-    def test_a_reading_taken_before_an_account_switch_is_not_the_new_accounts(self):
+    def test_a_response_that_lands_after_an_account_switch_is_not_the_new_accounts(self):
+        """A's request is in flight when the seat switches to B; its response is written after."""
+        a = self.label()
         self.assertEqual(rp.read(self.ws, self.now + 1)["plan"]["usage_pct"], 14)
         self.sign_in("u-2")
         plan = rp.read(self.ws, self.now + 2)["plan"]
-        self.assertNotEqual(plan["account"], f"acct_{self.digest[:6]}")
-        self.assertEqual([plan[k] for k in ("usage_pct", "window", "resets_at")], [None] * 3)
-        self.quota(self.now + 5, 0.5)
-        self.assertEqual(rp.read(self.ws, self.now + 6)["plan"]["usage_pct"], 50, "a reading after the switch counts")
+        self.assertNotEqual(plan["account"], a)
+        self.assertIsNone(plan["usage_pct"])
+        self.quota(self.now + 5, 0.9, account=a)
+        plan = rp.read(self.ws, self.now + 6)["plan"]
+        self.assertEqual([plan[k] for k in ("usage_pct", "window", "resets_at")], [None] * 3,
+                         "A's reading landed after the switch: B's usage is unknown")
+        self.quota(self.now + 7, 0.5)
+        self.assertEqual(rp.read(self.ws, self.now + 8)["plan"]["usage_pct"], 50, "B's own reading counts")
         self.sign_in("u-1")
-        self.assertIsNone(rp.read(self.ws, self.now + 7)["plan"]["usage_pct"], "switching back starts over")
+        self.assertIsNone(rp.read(self.ws, self.now + 9)["plan"]["usage_pct"], "B's reading is not A's")
 
-    def test_an_unreadable_or_unwritable_account_record_starts_over(self):
-        self.write("runtime-profile-account.json", "{ not json")
-        self.assertIsNone(rp.read(self.ws, self.now + 1)["plan"]["usage_pct"])
-        self.assertEqual(json.loads((self.ws / "state" / rp.ACCOUNT_RECORD).read_text())["account"], self.digest)
-        (self.ws / "state" / rp.ACCOUNT_RECORD).unlink()
-        with mock.patch.object(rp, "write_status", side_effect=OSError("read-only")):
-            self.assertIsNone(rp.read(self.ws, self.now + 1)["plan"]["usage_pct"])
+    def test_an_unlabeled_reading_has_no_usage(self):
+        self.quota(self.now, 0.14, account=False)
+        plan = rp.read(self.ws, self.now + 1)["plan"]
+        self.assertEqual((plan["name"], plan["usage_pct"]), ("Claude Max", None))
 
     def test_an_unknown_account_has_no_usage(self):
         (self.cfg / ".claude.json").write_text(json.dumps({"oauthAccount": {"planDisplayName": "Claude Max"}}))

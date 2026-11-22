@@ -16,7 +16,7 @@ import { createServer, type RequestOptions } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { statusPath } from '../../../src/workspace_default.js';
 
@@ -441,7 +441,9 @@ export interface ProxyDeps {
 	refreshAccessToken: (oauth: ClaudeOAuth) => Promise<ClaudeOAuth | null>;
 	request: typeof httpsRequest;
 	upstreamUrl: URL;
-	updateQuotaState: (headers: Record<string, string>, model?: string) => void;
+	updateQuotaState: (headers: Record<string, string>, model?: string, account?: string | null) => void;
+	// The account label of the credential a request is sent with, sampled when it is sent.
+	readAccount: () => string | null;
 	recordRejection: (rej: RejectionRecord) => void;
 	recordCredentialState: (state: CredentialState, detail?: string) => void;
 	now: () => number;
@@ -462,6 +464,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		request: httpsRequest,
 		upstreamUrl: new URL(UPSTREAM),
 		updateQuotaState,
+		readAccount: () => accountLabel(),
 		recordRejection,
 		recordCredentialState,
 		now: Date.now,
@@ -616,6 +619,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 				}
 			}
 
+			let account = deps.readAccount();
 			const forward = (attempt: number): void => {
 				let timedOut = false;
 
@@ -638,7 +642,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 						}
 						if (Object.keys(quotaHeaders).length > 0) {
 							console.log(`${ts()} [Quota]`, quotaHeaders);
-							deps.updateQuotaState(quotaHeaders, requestModel(body));
+							deps.updateQuotaState(quotaHeaders, requestModel(body), account);
 						}
 
 						if (upRes.statusCode === 401 && injectedToken && attempt === 0) {
@@ -653,6 +657,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 									console.log(`${ts()} [Proxy] retrying once with reloaded credential`);
 									headers['authorization'] = `Bearer ${recovered}`;
 									injectedToken = recovered;
+									account = deps.readAccount();
 									forward(1);
 									return;
 								}
@@ -788,9 +793,31 @@ function recordCredentialState(state: CredentialState, detail = ''): void {
 	} catch { /* best effort */ }
 }
 
-/** The record one header-bearing response writes; it replaces the file. */
+/** The `acct_` label of the account the CLI in `configDir` is signed in to, else null.
+ *  Same digest as core_limit_hold.account_digest; only non-secret identity fields are read. */
+export function accountLabel(
+	configDir = process.env.CLAUDE_CONFIG_DIR,
+	read: (path: string) => string = (path) => readFileSync(path, 'utf8'),
+): string | null {
+	if (!configDir) return null;
+	let acct: unknown;
+	try {
+		acct = JSON.parse(read(join(configDir, '.claude.json')))?.oauthAccount;
+	} catch {
+		return null;
+	}
+	if (!acct || typeof acct !== 'object' || Array.isArray(acct)) return null;
+	const a = acct as Record<string, unknown>;
+	const ident = ['accountUuid', 'organizationUuid', 'emailAddress'].map((k) => (a[k] ? String(a[k]) : ''));
+	if (!ident.some(Boolean)) return null;
+	return `acct_${createHash('sha256').update(ident.join('\0')).digest('hex').slice(0, 6)}`;
+}
+
+/** The record one header-bearing response writes; it replaces the file. `account` is the
+ *  label of the credential that request was sent with; a write without one names no account. */
 export function quotaStateFromHeaders(
 	prev: Record<string, unknown>, headers: Record<string, string>, model: string, nowIso: string,
+	account: string | null = null,
 ): Record<string, unknown> {
 	// The header write replaces the file, so carry the rejection ledger across it.
 	const prevLedger = prev.recent_rejections;
@@ -799,6 +826,7 @@ export function quotaStateFromHeaders(
 		available: true,
 		last_checked: nowIso,
 		headers,
+		...(account ? { account } : {}),
 		recent_rejections: Array.isArray(prevLedger) ? prevLedger.filter(isRejectionRecord) : [],
 		...(lastRequest ? { last_request: lastRequest } : {}),
 		// The header write replaces the file — carry credential health across it
@@ -831,9 +859,9 @@ export function quotaStateFromHeaders(
 	return state;
 }
 
-function updateQuotaState(headers: Record<string, string>, model = ''): void {
+function updateQuotaState(headers: Record<string, string>, model = '', account: string | null = null): void {
 	try {
-		writeQuotaFile(quotaStateFromHeaders(readQuotaFile(), headers, model, new Date().toISOString()));
+		writeQuotaFile(quotaStateFromHeaders(readQuotaFile(), headers, model, new Date().toISOString(), account));
 	} catch { /* best effort */ }
 }
 

@@ -10,13 +10,12 @@ with the `runtime_profile.v1` capability, through the reader the sutando adapter
     state/core-runtime.json                the core launchers (which runtime)
     the seat's model (settings, switch)    core_limit_hold.launch_identity
     state/runtime-models.<runtime>.json    runtime_models (the runtime's own model list)
-    state/quota-state.json                 the credential proxy
+    state/quota-state.json                 the credential proxy (its reading names its account)
     state/core-limit-hold.json             core_limit_hold (only a hold that binds this seat)
     the CLI's signed-in account            core_limit_hold.oauth_account (digest and plan name)
-    state/runtime-profile-account.json     this module: when the current account was first seen
 
-The proxy's quota record names no account, so a reading counts only when it was taken after the
-current account was first seen; until then usage is null.
+The proxy stamps a reading with the `acct_` label of the credential its request was sent with, so
+a reading counts only when that label is the signed-in account's; an unlabeled one has no usage.
 
 Unknown is null, never guessed: a Codex core reports no plan, an unknown core model sends no
 block at all (the schema requires one), and `workers` stays [] until a worker reports its own
@@ -36,8 +35,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from workspace_default import status_read_path, write_status
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 VERSION = 1
@@ -53,7 +50,6 @@ QUOTA_STALE_S = 30 * 60
 _MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*(\[[A-Za-z0-9._-]+\])?$")
 _WORKER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _ACCOUNT = re.compile(r"^acct_[A-Za-z0-9_-]{1,48}$")
-_HEX = re.compile(r"[0-9a-f]{6,64}")
 _FAMILIES = ("opus", "sonnet", "haiku", "fable")
 _CLAUDE_ID = re.compile(r"^claude-(opus|sonnet|haiku|fable)-(\d+(?:-\d+)*)$")
 _ROW_MODEL = re.compile(r"^(Opus|Sonnet|Haiku|Fable) (\d+(?:\.\d+)*)$")
@@ -64,7 +60,6 @@ _CLAIM_WINDOW = {"five_hour": "5h", "seven_day": "7d"}
 #: A plan name is a few plain words ("Claude Max", "Ultra"); an id, email or path never fits.
 _PLAN_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9+]*(?: [A-Za-z0-9+]+){0,3}$")
 _ID_RUN = re.compile(r"[0-9A-Fa-f]{8,}|\d{5,}")
-ACCOUNT_RECORD = "runtime-profile-account.json"
 
 
 # ---- shapes ---------------------------------------------------------------------------------
@@ -307,23 +302,6 @@ def derive(*, runtime: Optional[str], model: Optional[dict], offered: List[dict]
 
 # ---- gathering ------------------------------------------------------------------------------
 
-def _account_since(workspace: Path, digest: Optional[str], now: float) -> Optional[float]:
-    """When `digest` was first seen signed in, recording it on a change; None when unknown."""
-    if not (isinstance(digest, str) and _HEX.fullmatch(digest)):
-        return None
-    try:
-        rec = json.loads(status_read_path(ACCOUNT_RECORD, workspace).read_text(encoding="utf-8"))
-        if rec.get("account") == digest and _epoch(rec.get("since")) is not None:
-            return float(rec["since"])
-    except (OSError, ValueError, AttributeError):
-        pass
-    try:
-        write_status(ACCOUNT_RECORD, {"account": digest, "since": now}, workspace=workspace)
-    except OSError:
-        return None
-    return now
-
-
 def _codex_rows(workspace: Path) -> List[dict]:
     """The Codex picker's rows only when read during the launch core-runtime.json records."""
     import core_recovery_state
@@ -350,8 +328,9 @@ def _runtime(workspace: Path) -> Optional[str]:
 
 
 def gather(workspace: Path, now: Optional[float] = None) -> Optional[dict]:
-    """The block as the next heartbeat would send it; writes only ACCOUNT_RECORD."""
+    """The block as the next heartbeat would send it. Read-only."""
     import core_limit_hold
+    import core_recovery_state
     import quota_availability as qa
     import recovery_actions
     import runtime_models
@@ -367,8 +346,8 @@ def gather(workspace: Path, now: Optional[float] = None) -> Optional[dict]:
     digest = core_limit_hold.account_digest(acct)
     value = core_limit_hold.launch_model(workspace, config_dir)
     record = qa.read_quota_record(workspace, at)
-    since = _account_since(workspace, digest, at)
-    ours = record is not None and record.age_s is not None and since is not None and at - record.age_s >= since
+    label = core_recovery_state.account_label(digest)
+    ours = record is not None and label is not None and record.payload.get("account") == label
     hold = core_limit_hold.binding_hold(workspace, at, identity=(value, digest))
     by_key = {r["key"]: r for r in rows}
     keys = recovery_actions.switch_offer(workspace, runtime, avoid=hold.get("model") if hold else None,
