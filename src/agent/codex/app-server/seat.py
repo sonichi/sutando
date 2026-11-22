@@ -55,6 +55,7 @@ CLAIMS_DIR = ("state", "task-event-handler-claims")
 WATCHER = REPO / "src" / "watch-tasks-stream.sh"
 WORKSTREAMS = REPO / "skills" / "task-workstream-grouping" / "scripts" / "workstreams.py"
 STOPPED = "stopped"
+WITHDRAWN = "withdrawn"
 SETTLE_ATTEMPTS = 5
 EXIT_FATAL, EXIT_USAGE, EXIT_LOCKED = 1, 2, 3
 DECLINES = {
@@ -74,6 +75,17 @@ class SeatFatal(RuntimeError):
 
 
 LOG_FILE = ""
+
+
+def present(path: Path) -> bool:
+    """Whether a file is there; one that cannot be examined counts as there."""
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return True
+    return True
 
 
 def log(*parts) -> None:
@@ -428,20 +440,30 @@ class Seat:
         sentinel yet is therefore not the core's until the watcher announces it. Read straight from
         the inbox, such a task was run by the core and by its worker both (seen live, 2026-11-21).
 
-        With no watcher running, a workspace that declares a handler gives the core nothing; one
-        that declares none has nothing to route, and every pending task is the core's.
+        With no watcher running the core holds what the watcher would hold: everything while a
+        shutdown is in progress, and everything while a handler is declared, pinned, or cannot be
+        ruled out (a declaration that cannot be read is a declaration). Only a workspace known to
+        declare none has nothing to route, and there every pending task is the core's.
         """
         watcher = self.watcher
         if watcher is not None and watcher.alive():
             watcher.announced.intersection_update({p.name for p in Path(self.host.inbox).glob("*.txt")})
             return [n for n in names if n in watcher.announced]
-        if not task_event_handler_config_path(self.workspace / "state").exists():
+        state = self.workspace / "state"
+        if present(state / "shutdown.sentinel"):
+            why = "a shutdown is in progress"
+        elif os.environ.get("SUTANDO_TASK_EVENT_HANDLER") or present(task_event_handler_config_path(state)):
+            why = "a task-event handler is declared and no watcher is running to route them first"
+        else:
             return names
         if names and not self.held_logged:
             self.held_logged = True
-            log(f"{len(names)} pending task(s) held: a task-event handler is declared and no watcher is "
-                "running to route them first")
+            log(f"{len(names)} pending task(s) held: {why}")
         return []
+
+    def still_owed(self, filename: str) -> bool:
+        """Whether a task picked before a reconnect is still this seat's and still unanswered."""
+        return any(name == filename for name, _ in self.pending())
 
     # ---- per-task records: what happened to a turn that ended without a result ----
 
@@ -627,6 +649,9 @@ class Seat:
             if self.stop_requested(filename):
                 status, detail = STOPPED, "a Stop opened before the turn was dispatched"
                 break
+            if attempt > 1 and not self.still_owed(filename):
+                status, detail = WITHDRAWN, "answered or no longer this seat's when the server came back"
+                break
             status, detail = self.run_turn(filename, prompt)
             if status != "server-exited" or has_ready_result(results, filename):
                 break
@@ -643,6 +668,9 @@ class Seat:
             return "done"
         if status == "seat-stopping":
             log(f"task {filename}: the seat is stopping mid-turn; the task stays pending")
+            return status
+        if status == WITHDRAWN:
+            log(f"task {filename}: {detail}; not started again")
             return status
         if status == STOPPED:
             self.write_record(filename, payload, STOPPED, detail)

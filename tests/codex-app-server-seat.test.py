@@ -687,6 +687,39 @@ class Crash(SeatCase):
         self.assertEqual(s.failures, 0, "a completed turn clears the failure count")
         self.assertIn("app-server exited mid-turn", self.out.getvalue())
 
+    def test_a_result_that_lands_while_the_server_is_restarted_means_one_turn_not_two(self):
+        self.task("task-1.txt")
+        self.plan("die", "result")
+        s = self.make()
+        s.ensure_server()
+        failed = s.server_failed
+
+        def answered_meanwhile(why):
+            failed(why)
+            (self.results / "task-1.txt").write_text("answered by the turn that died\n", encoding="utf-8")
+
+        s.server_failed = answered_meanwhile
+        self.assertEqual(s.step(), "done")
+        self.assertEqual(len(self.sent("turn/start")), 1, "the reconnect found the answer and asked nothing")
+        self.assertIsNone(s.step())
+
+    def test_a_task_taken_away_while_the_server_is_restarted_is_not_started_again(self):
+        self.task("task-1.txt")
+        self.plan("die", "result")
+        s = self.make()
+        s.ensure_server()
+        failed = s.server_failed
+
+        def taken_meanwhile(why):
+            failed(why)
+            (self.tasks / "task-1.txt").unlink()
+
+        s.server_failed = taken_meanwhile
+        self.assertEqual(s.step(), seat_mod.WITHDRAWN)
+        self.assertEqual(len(self.sent("turn/start")), 1)
+        self.assertIn("not started again", self.out.getvalue())
+        self.assertFalse(task_dispatch.has_ready_result(self.results, "task-1.txt"))
+
     def test_a_child_that_dies_twice_stops_the_seat_and_the_task_is_not_lost(self):
         self.task("task-1.txt")
         self.plan("die", "die")
@@ -1149,6 +1182,35 @@ class WatcherChild(SeatCase):
         self.assertIsNone(s.step())
         declared.unlink()
         self.assertEqual(s.step(), "done", "nothing to route: every pending task is the core's")
+
+    def test_with_no_watcher_a_shutdown_in_progress_holds_the_cores_tasks(self):
+        s = self.make()
+        s.ensure_server()
+        self.task("task-1.txt")
+        mark = self.ws / "state" / "shutdown.sentinel"
+        mark.parent.mkdir(parents=True, exist_ok=True)
+        mark.write_text("{}")
+        self.assertIsNone(s.step())
+        self.assertIn("pending task(s) held: a shutdown is in progress", self.out.getvalue())
+        self.assertEqual(self.sent("turn/start"), [])
+        mark.unlink()
+        self.assertEqual(s.step(), "done")
+
+    def test_with_no_watcher_a_declaration_that_cannot_be_read_or_a_pinned_handler_holds_them(self):
+        s = self.make()
+        s.ensure_server()
+        self.task("task-1.txt")
+        declared = self.ws / "state" / "task-event-handler.json"
+        declared.parent.mkdir(parents=True, exist_ok=True)
+        declared.write_text("{ not json")
+        self.assertIsNone(s.step(), "unparseable is still a declaration")
+        declared.unlink()
+        with mock.patch.object(seat_mod.os, "lstat", side_effect=PermissionError("denied")):
+            self.assertIsNone(s.step(), "a declaration that cannot be examined is not ruled out")
+        with mock.patch.dict(os.environ, {"SUTANDO_TASK_EVENT_HANDLER": "/abs/pinned-handler"}):
+            self.assertIsNone(s.step(), "a pinned handler is a handler")
+        self.assertEqual(self.sent("turn/start"), [])
+        self.assertEqual(s.step(), "done")
 
     def test_serve_keeps_the_watcher_running_and_picks_up_a_task_it_announces(self):
         s = self.make(poll_s=30)

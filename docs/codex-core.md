@@ -504,10 +504,16 @@ started for a seat; the seat runs the standby task watcher as its own child
 The core seat runs a task only once that watcher has announced it. The watcher gives each task
 to the core's task-event handler first (the pool's router, a required Team handler), and its
 `TASK_FILE:` line is what says the task is the core's; a task file that has only just landed is
-not, since its worker sentinel can be written a moment later. With no watcher running, a
-workspace that declares a handler (`state/task-event-handler.json`) gives the core nothing and
-the seat says so once; one that declares none has nothing to route, and the core polls as before.
+not, since its worker sentinel can be written a moment later. With no watcher running the core
+holds what the watcher would hold, and says so once: everything while a shutdown is in progress
+(`state/shutdown.sentinel`), and everything while a handler is declared
+(`state/task-event-handler.json`, readable or not) or pinned (`SUTANDO_TASK_EVENT_HANDLER`). Only
+a workspace known to declare none has nothing to route, and there the core polls as before.
 A worker seat's inbox is already the routing decision and is read directly.
+
+When the app-server child exits mid-turn the seat restarts it and retries the task once, on the
+same thread. Before that second `turn/start` it reads the queue again: a task that has been
+answered meanwhile is settled as done, and one that is no longer this seat's is left alone.
 
 The terminal panel shows the seat's log: one line per task, turn, command and tool call. The
 same lines go to `<workspace>/logs/codex-seat.log` (a worker: `codex-seat-<session>.log`).
