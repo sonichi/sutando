@@ -467,7 +467,9 @@ python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --to <label|id|
 
 - `--who` lists `core` and each worker as `name (full worker_id)`, with bound
   rooms and session liveness; `(you)` marks the caller. It shows the base routing
-  alias separately when an s.space display override differs.
+  alias separately when an s.space display override differs. `agent=` is each one's
+  s.space agent id from the connections record (`(none)` without an identity row,
+  `unavailable` when the record cannot be read; `agent_mxid` in `--json`).
 - `--to X --ask "..."` writes `tasks/<task id>.txt` with `source: pool-ask`,
   `requested_worker: <id>` (never for the core, which is the default recipient) and
   `reply_to_instance: <asker>`, then routes it. A worker finds it in its inbox like
