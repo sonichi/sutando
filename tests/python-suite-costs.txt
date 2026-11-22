@@ -19,7 +19,6 @@
 11 tests/ag2-sparrow-adapter-differential.test.py
 1 tests/ag2-sparrow-agent-identity.test.py
 16 tests/ag2-sparrow-claude-cloud-session.test.py
-60 tests/ag2-sparrow-claude-code-adapter.test.py
 75 tests/ag2-sparrow-claude-code-connect.test.py
 60 tests/ag2-sparrow-claude-code-install.test.py
 1 tests/ag2-sparrow-claude-local-bridge.test.py
@@ -27,11 +26,9 @@
 26 tests/ag2-sparrow-claude-routine.test.py
 0 tests/ag2-sparrow-cli-wedge-patterns.test.py
 6 tests/ag2-sparrow-cloud-session-contract.test.py
-10 tests/ag2-sparrow-cloud-session-interlock.test.py
 16 tests/ag2-sparrow-codex-connector.test.py
 20 tests/ag2-sparrow-codex-local-connect.test.py
 0 tests/ag2-sparrow-drift.test.py
-42 tests/ag2-sparrow-hatch-adapter.test.py
 45 tests/ag2-sparrow-hatch-served-setup.test.py
 0 tests/ag2-sparrow-hitl-vendored.test.py
 0 tests/ag2-sparrow-human-action.test.py
