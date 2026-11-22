@@ -50,6 +50,49 @@ NO_INTEGRATIONS = {"web_search": "disabled",
 
 class IntegrationsUnknown(RuntimeError):
     """The effective config could not be read, so a turn without integrations is not started."""
+
+
+# Codex's read-only sandbox stops writes and the network, not reads: a command in such a turn read a file
+# under the owner's home, another turn's temp folder and CODEX_HOME (measured, codex-cli 0.167.0).
+CONFINED_PROFILE = "sparrow_restricted"
+
+
+class Unconfined(RuntimeError):
+    """The isolated turn's thread did not start under CONFINED_PROFILE, so the turn is not run."""
+
+
+def link_folders(path, limit=40):
+    """The folder of every symlink met while resolving `path`, then the folder of the file it ends at.
+    Codex starts its own executable as a sandboxed helper by the path it was launched with, so a
+    profile that cannot read these cannot start a thread."""
+    out, todo = [], os.path.abspath(path)
+    for _ in range(limit):
+        parts, cur, moved = todo.split(os.sep), os.sep, False
+        for i, part in enumerate(parts[1:], 1):
+            nxt = os.path.join(cur, part)
+            if os.path.islink(nxt):
+                if cur not in out:
+                    out.append(cur)
+                todo = os.path.join(os.path.normpath(os.path.join(cur, os.readlink(nxt))), *parts[i + 1:])
+                moved = True
+                break
+            cur = nxt
+        if not moved:
+            break
+    end = os.path.dirname(todo)
+    return out if end in out else out + [end]
+
+
+def confined_permissions(codex, platform=None):
+    """The thread config that confines an isolated turn's reads to its own working directory: the
+    platform's minimal runtime set, the project root (the turn's empty scratch dir), and the folders
+    Codex needs to start itself. On macOS /tmp is named, since the minimal set leaves it readable."""
+    rules = {":minimal": "read", ":project_roots": {".": "read"}}
+    if (platform or sys.platform) == "darwin":
+        rules.update({"/private/tmp": "deny", "/tmp": "deny"})
+    for folder in link_folders(shutil.which(codex) or codex):
+        rules[folder] = "read"
+    return {"default_permissions": CONFINED_PROFILE, "permissions": {CONFINED_PROFILE: {"filesystem": rules}}}
 NO_REPLY = "[no reply] Codex completed the turn without a message."
 # --held: the launcher that spawned this process holds the work root and attaches it as the consumer
 # whose liveness fences the root; the connector waits this long for that record, then refuses.
@@ -254,7 +297,20 @@ class Connector:
             params["config"] = self.no_integrations(params["cwd"])
         if self.args.developer_instructions:
             params["developerInstructions"] = self.args.developer_instructions
-        res = self.rpc.request("thread/start", params)
+        confined = caps.workspace == "isolated"
+        if confined:
+            # A `sandbox` beside the profile wins and the profile is dropped (measured): it is not sent.
+            del params["sandbox"]
+            params["config"] = dict(params.get("config") or {}, **confined_permissions(self.args.codex))
+        try:
+            res = self.rpc.request("thread/start", params)
+        except RuntimeError as e:
+            if not confined or "server pipe closed" in str(e):
+                raise
+            raise Unconfined(str(e)[:200])
+        active = (res.get("activePermissionProfile") or {}).get("id")
+        if confined and active != CONFINED_PROFILE:
+            raise Unconfined("thread/start answered with permission profile %r" % (active,))
         self.thread_id = res["thread"]["id"]
         log("started thread", self.thread_id, caps.workspace, "ephemeral" if ephemeral else "durable")
 
@@ -443,6 +499,8 @@ class Connector:
                 self.open_for(headers, caps)
             except IntegrationsUnknown as e:
                 return "failed", "", "the configured integrations could not be read to switch them off (%s)" % e
+            except Unconfined as e:
+                return "failed", "", "the turn could not be confined to its own folder (%s)" % e
             self.last_thread = self.thread_id
             status, text, err = self.run_turn(prompt, self.args.model, self.turn_cwd(caps))
             if status == "server-exited":

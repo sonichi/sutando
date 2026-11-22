@@ -74,7 +74,12 @@ for line in sys.stdin:
         THREADS[tid] = {"cwd": p.get("cwd", "/"), "params": p, "emptied": THREADS.get(tid, {}).get("emptied")}
         send({"jsonrpc": "2.0", "id": rid, "result": {"thread": thread_obj(tid), "model": p.get("model") or "stub-model",
                                                       "modelProvider": "stub", "cwd": THREADS[tid]["cwd"],
-                                                      "approvalPolicy": "never", "sandbox": "read-only", "approvalsReviewer": None}})
+                                                      "approvalPolicy": "never", "sandbox": "read-only", "approvalsReviewer": None,
+                                                      # As 0.167.0: the profile is active only with no `sandbox` param.
+                                                      "activePermissionProfile": (
+                                                          {"id": (p.get("config") or {}).get("default_permissions"), "extends": None}
+                                                          if (p.get("config") or {}).get("default_permissions")
+                                                          and "sandbox" not in p else None)}})
         send({"jsonrpc": "2.0", "method": "thread/started", "params": {"thread": thread_obj(tid)}})
     elif meth == "thread/loaded/list":
         send({"jsonrpc": "2.0", "id": rid, "result": {"data": list(THREADS), "nextCursor": None}})

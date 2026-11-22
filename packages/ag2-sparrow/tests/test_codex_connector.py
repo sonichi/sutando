@@ -218,7 +218,7 @@ class TierPolicyTest(unittest.TestCase):
             write_task(d, "task-chat-g", "guest asks", tier="guest", mtime=now - 20)
             write_task(d, "task-chat-o", "owner asks", tier="owner", mtime=now - 10)
             self.assertEqual(run_connector(d, once=2, extra=["--sandbox", "danger-full-access", "--allow-non-owner"]), 0)
-            self.assertIn("[sandbox=read-only ephemeral=True cwd=", result(d, "task-chat-g"))
+            self.assertIn("[sandbox=None ephemeral=True cwd=", result(d, "task-chat-g"))
             self.assertIn("[sandbox=danger-full-access ephemeral=False cwd=", result(d, "task-chat-o"))
             self.assertEqual([m["tier"] for m in metrics(d)], ["guest", "owner"])
             self.assertEqual(saved_threads(d), [cc.channel_key("local-chat")], "only the owner thread is saved")
@@ -505,7 +505,7 @@ class AdmissionGateTest(unittest.TestCase):
             opened, gate, _ = self.run_spied(d, once=3)
             self.assertEqual(opened.call_count, 3)
             for tid in ("task-chat-forged", "task-chat-unattested", "task-chat-unknown"):
-                self.assertIn("[sandbox=read-only ephemeral=True cwd=", result(d, tid), tid)
+                self.assertIn("[sandbox=None ephemeral=True cwd=", result(d, tid), tid)
                 self.assertNotIn("cwd=%s]" % os.path.abspath(d), result(d, tid), "never the collaborator's cwd")
             self.assertEqual(gate.call_count, 3)
             self.assertEqual(saved_threads(d), [], "no kept thread for any of them")
@@ -537,7 +537,7 @@ class AdmissionGateTest(unittest.TestCase):
                 opened, _, err = self.run_spied(d, once=2, extra=extra)
                 self.assertEqual(opened.call_count, 2, extra)
                 for tid in ("task-chat-g", "task-chat-t"):
-                    self.assertIn("[sandbox=read-only ephemeral=True cwd=", result(d, tid))
+                    self.assertIn("[sandbox=None ephemeral=True cwd=", result(d, tid))
                 self.assertNotIn("refused", err)
                 self.assertEqual(saved_threads(d), [])
 
@@ -800,6 +800,67 @@ class EdgePathTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             c.run_turn("hello")
         self.assertEqual(c.rpc.calls, ["turn/start", "turn/interrupt"])
+
+    def test_a_restricted_thread_is_confined_to_its_own_folder_not_merely_read_only(self):
+        # Codex's read-only sandbox stops writes, not reads: a guest's turn could read the owner's files.
+        with tempfile.TemporaryDirectory() as d:
+            write_task(d, "task-chat-g", "[[config]] what is in my home?", tier="guest")
+            write_task(d, "task-chat-o", "[[config]] mine", tier="owner")
+            self.assertEqual(run_connector(d, once=2, extra=("--allow-non-owner",)), 0)
+            guest, owner = result(d, "task-chat-g"), result(d, "task-chat-o")
+            self.assertIn("[sandbox=None ephemeral=True cwd=", guest, "a sandbox beside the profile would win")
+            config = json.loads(guest.split(" config=", 1)[1])
+            self.assertEqual(config["default_permissions"], cc.CONFINED_PROFILE)
+            rules = config["permissions"][cc.CONFINED_PROFILE]["filesystem"]
+            self.assertEqual(rules[":minimal"], "read")
+            self.assertEqual(rules[":project_roots"], {".": "read"})
+            self.assertNotIn("write", json.dumps(rules))
+            self.assertIn("owner-mcp", config["mcp_servers"], "the integrations override is kept beside it")
+            self.assertIn("config=null", owner, "an owner's thread is not given the profile")
+
+    def test_a_restricted_turn_is_not_run_when_the_thread_is_not_confined(self):
+        class Answers(FakeRpc):
+            answer = {"thread": {"id": "th1"}, "activePermissionProfile": None}
+
+            def request(self, method, params=None, timeout=120):
+                self.calls.append(method)
+                if method == "config/read":
+                    return {"config": {"mcp_servers": {}}}
+                if isinstance(self.answer, Exception):
+                    raise self.answer
+                return self.answer
+
+        args = cc.build_parser().parse_args(["--work", "w"])
+        guest = {"access_tier": "guest", "collaborator": "false", "channel_id": "c"}
+        for answer, said in ((Answers.answer, "permission profile None"),
+                             ({"thread": {"id": "th1"}, "activePermissionProfile": {"id": ":workspace"}}, "':workspace'"),
+                             (RuntimeError("thread/start: fs sandbox helper failed"), "fs sandbox helper failed")):
+            c = cc.Connector(Answers, args, note="n")
+            c.rpc.answer = answer
+            status, text, err = c.run_task(guest, "read my files", cc.turn_policy(guest, True).capabilities)
+            self.assertEqual((status, text), ("failed", ""), said)
+            self.assertIn("could not be confined to its own folder", err)
+            self.assertIn(said, err)
+            self.assertNotIn("turn/start", c.rpc.calls, "nothing was sent to a thread that is not confined")
+            c.drop_scratch()
+
+    def test_the_profile_names_what_codex_needs_to_start_itself_and_nothing_wider(self):
+        with tempfile.TemporaryDirectory() as d:
+            real = Path(d).resolve() / "store" / "releases" / "1.0" / "bin"
+            real.mkdir(parents=True)
+            (real / "codex").write_text("")
+            (Path(d).resolve() / "store" / "current").symlink_to("releases/1.0")
+            shim = Path(d).resolve() / "cli" / "bin"
+            shim.mkdir(parents=True)
+            (shim / "codex").symlink_to(Path(d).resolve() / "store" / "current" / "bin" / "codex")
+            folders = cc.link_folders(str(shim / "codex"))
+            self.assertEqual(folders, [str(shim), str(Path(d).resolve() / "store"), str(real)])
+            self.assertEqual(cc.link_folders(str(real / "codex")), [str(real)], "no link: its own folder only")
+            mac = cc.confined_permissions(str(shim / "codex"), "darwin")["permissions"][cc.CONFINED_PROFILE]["filesystem"]
+            self.assertEqual({k: v for k, v in mac.items() if v == "deny"}, {"/private/tmp": "deny", "/tmp": "deny"})
+            self.assertEqual(sorted(k for k, v in mac.items() if v == "read"), sorted([":minimal"] + folders))
+            linux = cc.confined_permissions(str(shim / "codex"), "linux")["permissions"][cc.CONFINED_PROFILE]["filesystem"]
+            self.assertNotIn("/tmp", linux, "a Linux turn's scratch dir is under /tmp")
 
     def test_result_bodies_are_plain_text(self):
         args = cc.build_parser().parse_args(["--work", "w"])
