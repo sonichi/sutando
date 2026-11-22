@@ -7,12 +7,15 @@ that say it directly: a permission request or a question dialog opens (blocked),
 turn moves on (clear). This module owns the one record those hooks write and the
 supervisor reads.
 
-Writer contract (one writer: `write`):
+Writer contract (one writer: `record_event`; `write` is its replace step):
   path    <state_dir>/core-block-signal/<socket-key>.<pane-id>.json
   record  {"schema": 1, "state": "blocked"|"clear", "reason": "permission"|"question"|null,
+           "interaction": {"tool_use_id", "tool", "input_sha"} | null,
            "event": <hook event>, "runtime": "claude"|"codex", "session": <tmux session>,
            "pane_id": "%N", "pane_pid": <int>, "ts": <unix seconds>, "source": "hook"}
-  writes  whole-record replace via temp file + os.replace; last writer wins, never a merge.
+  writes  read-decide-replace under an flock on <path>.lock; the replace is a temp file +
+          os.replace. A blocked record clears only on a turn boundary (UserPromptSubmit, Stop)
+          or a tool event of the interaction that blocked; other tool events leave it.
   failure every hook path fails open and silent: no record is a fallback, never a verdict.
 
 Keyed by tmux pane, and bound to the pane's process: a relaunched CLI is a new pane process,
@@ -25,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -43,7 +47,9 @@ SUBDIR = "core-block-signal"
 CLEAR_TTL_S = 900.0
 
 BLOCKED, CLEAR = "blocked", "clear"
-_CLEAR_EVENTS = {"PreToolUse", "PostToolUse", "PostToolUseFailure", "UserPromptSubmit", "Stop"}
+_TOOL_EVENTS = {"PreToolUse", "PostToolUse", "PostToolUseFailure"}
+_TURN_EVENTS = {"UserPromptSubmit", "Stop"}
+_CLEAR_EVENTS = _TOOL_EVENTS | _TURN_EVENTS
 # Claude's Notification types that mean a dialog waits on a person. idle_prompt is not one:
 # it is the empty composer at rest, the state the task notifier delivers into.
 _BLOCKING_NOTIFICATIONS = {"permission_prompt": "permission", "elicitation_dialog": "question"}
@@ -66,6 +72,46 @@ def event_state(payload: dict) -> "Optional[tuple[str, Optional[str]]]":
     return None
 
 
+def interaction(payload: dict) -> Optional[dict]:
+    """Which tool call an event is about, or None when it names none."""
+    if not isinstance(payload, dict):
+        return None
+    tid, tool = payload.get("tool_use_id"), payload.get("tool_name")
+    if not tid and not tool:
+        return None
+    sha = None
+    if "tool_input" in payload:
+        sha = hashlib.sha1(json.dumps(payload["tool_input"], sort_keys=True, default=str).encode()).hexdigest()
+    return {"tool_use_id": tid or None, "tool": tool or None, "input_sha": sha}
+
+
+def same_interaction(blocked: Optional[dict], event: Optional[dict]) -> bool:
+    """True when a tool event is the very call a blocked record is waiting on."""
+    if not blocked or not event:
+        return False
+    if blocked.get("tool_use_id") and event.get("tool_use_id"):
+        return blocked["tool_use_id"] == event["tool_use_id"]
+    return bool(blocked.get("tool") and blocked.get("input_sha")) and \
+        (blocked.get("tool"), blocked.get("input_sha")) == (event.get("tool"), event.get("input_sha"))
+
+
+def decide(current: Optional[dict], payload: dict, pane_pid: int):
+    """(state, reason, interaction) to write for this event over `current`, or None to leave it."""
+    implied = event_state(payload)
+    if implied is None:
+        return None
+    state, reason = implied
+    held = current if current and current.get("pane_pid") == pane_pid \
+        and current.get("state") == BLOCKED else None
+    ev = interaction(payload)
+    if state == BLOCKED:
+        return BLOCKED, reason, ev or (held or {}).get("interaction")
+    if held and payload.get("hook_event_name") in _TOOL_EVENTS \
+            and not same_interaction(held.get("interaction"), ev):
+        return None
+    return CLEAR, None, None
+
+
 def socket_key(socket: str) -> str:
     """A short stable name for a tmux server: pane ids are only unique within one."""
     return hashlib.sha1(os.path.realpath(socket).encode()).hexdigest()[:10]
@@ -77,13 +123,14 @@ def record_path(state_dir, socket: str, pane_id: str) -> Path:
 
 def write(state_dir, socket: str, pane_id: str, pane_pid: int, state: str,
           reason: Optional[str], event: str, runtime: str, session: str,
-          now: Optional[float] = None) -> Path:
+          now: Optional[float] = None, interaction: Optional[dict] = None) -> Path:
     """Replace the pane's record atomically. Raises on an invalid state or an I/O failure."""
     if state not in (BLOCKED, CLEAR):
         raise ValueError(f"state must be blocked or clear, not {state!r}")
     path = record_path(state_dir, socket, pane_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     rec = {"schema": SCHEMA, "state": state, "reason": reason if state == BLOCKED else None,
+           "interaction": interaction if state == BLOCKED else None,
            "event": str(event)[:64], "runtime": str(runtime)[:32], "session": str(session)[:128],
            "pane_id": pane_id, "pane_pid": int(pane_pid),
            "ts": time.time() if now is None else float(now), "source": "hook"}
@@ -99,6 +146,21 @@ def write(state_dir, socket: str, pane_id: str, pane_pid: int, state: str,
             pass
         raise
     return path
+
+
+def record_event(state_dir, socket: str, pane_id: str, pane_pid: int, payload: dict,
+                 runtime: str, session: str, now: Optional[float] = None) -> Optional[Path]:
+    """Apply one hook event to the pane's record under its lock; None when nothing changed."""
+    path = record_path(state_dir, socket, pane_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(f"{path}.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        step = decide(read(state_dir, socket, pane_id), payload, pane_pid)
+        if step is None:
+            return None
+        state, reason, inter = step
+        return write(state_dir, socket, pane_id, pane_pid, state, reason,
+                     payload.get("hook_event_name", ""), runtime, session, now, inter)
 
 
 def read(state_dir, socket: str, pane_id: str) -> Optional[dict]:
@@ -150,9 +212,8 @@ def _hook(runtime: str, state_dir: Optional[str]) -> None:
         payload = json.loads(sys.stdin.read() or "{}")
     except ValueError:
         return
-    implied = event_state(payload)
     tmux_env, pane = os.environ.get("TMUX", ""), os.environ.get("TMUX_PANE", "")
-    if implied is None or not tmux_env or not pane:
+    if event_state(payload) is None or not tmux_env or not pane:
         return
     socket = tmux_env.split(",", 1)[0]
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -164,8 +225,7 @@ def _hook(runtime: str, state_dir: Optional[str]) -> None:
         from workspace_default import resolve_workspace
         state_dir = str(Path(resolve_workspace(migrate=False)) / "state")
     session, pane_id, pane_pid = ident
-    write(state_dir, socket, pane_id, pane_pid, implied[0], implied[1],
-          payload.get("hook_event_name", ""), runtime, session)
+    record_event(state_dir, socket, pane_id, pane_pid, payload, runtime, session)
 
 
 def _toml_str(s: str) -> str:

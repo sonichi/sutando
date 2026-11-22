@@ -476,11 +476,6 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
         if kind in _HUMAN_GATES:
             return "blocked-human", f"awaiting user: {kind}", excerpt, kind
         return "blocked-known", f"at known gate: {kind}", excerpt, kind
-    if (hook and hook[0] == core_block_signal.BLOCKED and pane
-            and not _is_idle_ready(pane, runtime) and not _turn_moving(pane, prev_pane, still_s)):
-        kind = _HOOK_KIND.get(hook[1], "permission")
-        tail = "\n".join([ln for ln in pane.splitlines() if ln.strip()][-14:])
-        return "blocked-human", f"awaiting user: {kind} (hook)", tail or None, kind
     # A refused login leaves no gate and the idle footer, and the shared health can read a
     # seat off the CORE's status file: the pane's own refusal stands until it shows a turn ran.
     expired = login_expired(pane, runtime) if pane else None
@@ -501,6 +496,12 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
     # After the pane: a live core held at its limit screen still shows that screen.
     if base_health == "paused":
         return "blocked-known", _BASE_TO_STATE["paused"][1], None, None
+    # A sign-in, refusal or limit (on screen, or a paused queue) outranks a held dialog.
+    if (hook and hook[0] == core_block_signal.BLOCKED and pane
+            and not _is_idle_ready(pane, runtime) and not _turn_moving(pane, prev_pane, still_s)):
+        kind = _HOOK_KIND.get(hook[1], "permission")
+        tail = "\n".join([ln for ln in pane.splitlines() if ln.strip()][-14:])
+        return "blocked-human", f"awaiting user: {kind} (hook)", tail or None, kind
     if not gateway_alive:
         return "gateway-down", "core up but relay gateway not running", None, None
     state, detail = _BASE_TO_STATE.get(base_health, _BASE_TO_STATE["unknown"])

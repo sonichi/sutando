@@ -167,6 +167,77 @@ class TestHookEntry(unittest.TestCase):
             self.assertIsNone(self.run_hook({"hook_event_name": "Stop"}))
 
 
+class TestClearIsScopedToTheInteraction(unittest.TestCase):
+    """Only the call that blocked, or a turn boundary, clears a held dialog."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def ev(self, payload, pid=7):
+        cbs.record_event(self.state, SOCK, "%1", pid, payload, "claude", "sutando-core")
+        return cbs.read(self.state, SOCK, "%1")
+
+    BASH_RM = {"tool_name": "Bash", "tool_input": {"command": "rm -rf build"}}
+
+    def block(self, **extra):
+        return self.ev({"hook_event_name": "PermissionRequest", **self.BASH_RM, **extra})
+
+    def test_an_unrelated_tool_call_leaves_it_blocked(self):
+        self.block(tool_use_id="t1")
+        for ev in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
+            rec = self.ev({"hook_event_name": ev, "tool_use_id": "t2", "tool_name": "Read",
+                           "tool_input": {"file_path": "x"}})
+            self.assertEqual(rec["state"], "blocked", ev)
+
+    def test_another_call_of_the_same_tool_leaves_it_blocked(self):
+        self.block(tool_use_id="t1")
+        rec = self.ev({"hook_event_name": "PostToolUse", "tool_use_id": "t2", **self.BASH_RM})
+        self.assertEqual(rec["state"], "blocked")
+
+    def test_the_blocking_call_finishing_clears_it(self):
+        self.block(tool_use_id="t1")
+        self.assertEqual(self.ev({"hook_event_name": "PostToolUse", "tool_use_id": "t1", **self.BASH_RM})["state"],
+                         "clear")
+
+    def test_without_ids_the_same_tool_and_input_clears_it_and_another_input_does_not(self):
+        self.block()
+        other = {"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}}
+        self.assertEqual(self.ev(other)["state"], "blocked")
+        self.assertEqual(self.ev({"hook_event_name": "PostToolUse", **self.BASH_RM})["state"], "clear")
+
+    def test_turn_boundaries_clear_it(self):
+        for ev in ("UserPromptSubmit", "Stop"):
+            self.block(tool_use_id="t1")
+            self.assertEqual(self.ev({"hook_event_name": ev})["state"], "clear", ev)
+
+    def test_a_dialog_with_no_tool_is_cleared_only_by_a_turn_boundary(self):
+        self.ev({"hook_event_name": "Notification", "notification_type": "elicitation_dialog"})
+        self.assertEqual(self.ev({"hook_event_name": "PreToolUse", "tool_use_id": "t9", "tool_name": "Read",
+                                  "tool_input": {}})["state"], "blocked")
+        self.assertEqual(self.ev({"hook_event_name": "Stop"})["state"], "clear")
+
+    def test_a_notification_after_the_request_keeps_its_interaction(self):
+        self.block(tool_use_id="t1")
+        rec = self.ev({"hook_event_name": "Notification", "notification_type": "permission_prompt"})
+        self.assertEqual(rec["interaction"]["tool_use_id"], "t1")
+        self.assertEqual(self.ev({"hook_event_name": "PostToolUse", "tool_use_id": "t1", **self.BASH_RM})["state"],
+                         "clear")
+
+    def test_a_record_from_the_previous_cli_does_not_hold(self):
+        self.block(tool_use_id="t1")
+        rec = self.ev({"hook_event_name": "PreToolUse", "tool_use_id": "t2", "tool_name": "Read",
+                       "tool_input": {}}, pid=8)
+        self.assertEqual((rec["state"], rec["pane_pid"]), ("clear", 8))
+
+    def test_tool_progress_with_nothing_held_writes_clear(self):
+        self.assertEqual(self.ev({"hook_event_name": "PreToolUse", "tool_use_id": "t1", "tool_name": "Read",
+                                  "tool_input": {}})["state"], "clear")
+
+
 class TestCodexArgs(unittest.TestCase):
     def test_each_event_is_a_valid_toml_override_and_trust_is_bypassed(self):
         repo = "/tmp/a repo/with 'quote\" and \\slash"

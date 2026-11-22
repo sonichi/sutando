@@ -751,21 +751,23 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         invocation = scheduler_log.read_text()
         self.assertIn("install --workspace", invocation)
         self.assertIn("--host-label test-host", invocation)
-    def test_block_signal_hooks_are_off_unless_opted_in(self):
+    def test_block_signal_hooks_reach_the_core_by_default_with_the_trust_bypass(self):
         result = self.run_launcher()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self._tmux_calls()
-        self.assertNotIn("--dangerously-bypass-hook-trust", calls)
-        self.assertNotIn("hooks.PermissionRequest=", calls)
-
-    def test_opted_in_block_signal_hooks_reach_the_core_with_the_trust_bypass(self):
-        result = self.run_launcher(env_extra={"SUTANDO_CODEX_BLOCK_HOOKS": "1"})
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self._tmux_calls()
         self.assertIn("--dangerously-bypass-hook-trust", calls)
         for ev in ("PermissionRequest", "PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop"):
             self.assertIn(f"hooks.{ev}=", calls)
         self.assertIn("core-block-hook.sh", calls)
+        self.assertIn("SUTANDO_CODEX_BLOCK_HOOKS=0 to turn them off", result.stderr)
+
+    def test_block_signal_hooks_opt_out_passes_neither_hooks_nor_bypass(self):
+        result = self.run_launcher(env_extra={"SUTANDO_CODEX_BLOCK_HOOKS": "0"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._tmux_calls()
+        self.assertNotIn("--dangerously-bypass-hook-trust", calls)
+        self.assertNotIn("hooks.", calls)
+        self.assertNotIn("block-signal hooks on", result.stderr)
 
     def test_a_worker_instance_launch_is_refused_before_any_core_write(self):
         """The core entry point refuses a pool instance. Through the dispatcher's

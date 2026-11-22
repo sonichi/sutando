@@ -377,7 +377,7 @@ and is not persisted: pass it again on each invocation, including `--restart`.
 Authentication, helper checks, the notifier and core startup remain active.
 The flag does not isolate the Codex home or change helper ownership by itself.
 
-## Blocked-dialog hooks (opt-in, off by default)
+## Blocked-dialog hooks (on by default)
 
 The core supervisor (`src/core-input-watch.py`) decides whether the core is blocked on its
 owner. On Claude it reads the CLI's own hook events (`src/core_block_signal.py`) and uses the
@@ -386,12 +386,17 @@ send the same events, but Codex runs a session's hooks only once they are truste
 and an untrusted hook is skipped or asks for review at startup, which a headless core never
 answers.
 
-Set `SUTANDO_CODEX_BLOCK_HOOKS=1` in the launcher's environment to register them: the launcher
-passes `PermissionRequest`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit` and `Stop` hooks as
-`-c hooks.<Event>=…` overrides for that run only (nothing is written to `config.toml`) and adds
-`--dangerously-bypass-hook-trust`. That flag runs every enabled hook for the run without trust,
-including hooks in the user's own Codex home and in the checkout's `.codex/`, so it is off
-unless you set it. Without it, the supervisor reads the Codex screen exactly as before.
+The launcher registers them on every Codex CLI core launch (not on an app-server seat, below,
+which draws no TUI dialog for the supervisor to read): it passes `PermissionRequest`,
+`PreToolUse`, `PostToolUse`, `UserPromptSubmit` and `Stop` hooks as `-c hooks.<Event>=…`
+overrides for that run only (nothing is written to `config.toml`) and adds
+`--dangerously-bypass-hook-trust`, and says so in one line of the launch output.
+
+The trade-off: `--dangerously-bypass-hook-trust` runs every enabled hook for that launch without
+the `/hooks` approval, not only Sutando's. That includes hooks in the user's own Codex home and
+any in the checkout's `.codex/`. Set `SUTANDO_CODEX_BLOCK_HOOKS=0` in the launcher's environment
+to turn this off: the launch then passes neither the hooks nor the flag, and the supervisor reads
+the Codex screen exactly as before.
 
 ## Automatic earned resets
 

@@ -286,12 +286,17 @@ CODEX_ARGS=(
 if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   CODEX_ARGS+=(-m "$SUTANDO_CORE_MODEL")
 fi
-# Opt-in (docs/codex-core.md): hooks that tell the core supervisor when Codex is blocked on a
-# dialog. Session hooks need persisted trust, so this run also bypasses hook trust.
-if [ "${SUTANDO_CODEX_BLOCK_HOOKS:-0}" = 1 ] && [ -n "$_HB_PY" ]; then
-  while IFS= read -r -d '' _bs_arg; do CODEX_ARGS+=("$_bs_arg"); done \
+# On unless =0 (docs/codex-core.md): hooks that tell the core supervisor when Codex is blocked
+# on a dialog. Session hooks need persisted trust, so the run also bypasses hook trust.
+add_codex_block_hooks() {
+  [ "${SUTANDO_CODEX_BLOCK_HOOKS:-1}" != 0 ] && [ -n "$_HB_PY" ] || return 0
+  local n=${#CODEX_ARGS[@]} arg
+  while IFS= read -r -d '' arg; do CODEX_ARGS+=("$arg"); done \
     < <("$_HB_PY" "$REPO/src/core_block_signal.py" codex-args "$REPO" 2>/dev/null || true)
-fi
+  if [ "${#CODEX_ARGS[@]}" -gt "$n" ]; then
+    echo "  · Codex block-signal hooks on (with --dangerously-bypass-hook-trust); set SUTANDO_CODEX_BLOCK_HOOKS=0 to turn them off" >&2
+  fi
+}
 # A git checkout's first Codex launch stops on "Trust this folder?", which a headless core
 # never answers; see src/codex_project_trust.py. Best effort: a failure leaves the prompt.
 ensure_codex_project_trust() {
@@ -645,6 +650,7 @@ if session_exists "$SESSION" && ! codex_core_missing; then
   exit 0
 fi
 
+add_codex_block_hooks
 # Past the attach/reuse exit above, so this is a genuine Codex core boot. The
 # sentinel is cleared at each launch site below, never before one can fail.
 if [ -r "$REPO/scripts/python-binary.sh" ]; then

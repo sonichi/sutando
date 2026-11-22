@@ -45,6 +45,15 @@ IDLE_LOGGED_OUT = ("──────── sutando-core ──\n❯ \n──�
 SESSION_LIMIT = ("⏺ Working on it.\n\n  You've hit your session limit · resets 3pm\n"
                  "  ❯ 1. Stop and wait for limit to reset\n    2. Add funds to continue with extra usage\n"
                  "  Enter to confirm · Esc to cancel")
+_IDLE_FOOTER = ("────────\n❯ \n────────\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+_REFUSAL = "You're out of usage credits. Run /usage-credits to keep using Fable 5.1 or /model to switch models."
+REFUSED_TURNS = (f"❯ /startup\n  ⎿  {_REFUSAL}\n✻ Cooked for 1s · done 12:32 PM\n"
+                 f"❯ /startup\n  ⎿  {_REFUSAL}\n✻ Cogitated for 0s · done 12:42 PM\n" + _IDLE_FOOTER)
+LOGIN_EXPIRED = ("⏺ Bash(ls)\n  ⎿  done\n\n❯ /startup\n  ⎿  Login expired · Please run /login\n"
+                 "✻ Worked for 0s\n" + _IDLE_FOOTER)
+# The same screens before the CLI repaints its idle footer: nothing reads them as idle-ready.
+LOGIN_EXPIRED_BARE = LOGIN_EXPIRED.replace(_IDLE_FOOTER, "")
 # No gate, no idle footer, no motion: what a live permission dialog the pane cannot parse looks like.
 STILL_PANE = "⏺ Bash(rm -rf build/)\n  ⎿  Running…\n"
 
@@ -107,6 +116,38 @@ class TestHookBlocked(unittest.TestCase):
 
     def test_the_pane_kind_wins_when_the_pane_names_the_gate(self):
         self.assertEqual(state(LOGIN_MENU, hook=("blocked", "permission"))[3], "login")
+
+
+class TestScreenEvidenceOutranksAHeldDialog(unittest.TestCase):
+    """A blocked record is sticky; a screen that proves a sign-in, refusal or limit now wins."""
+
+    HELD = ("blocked", "permission")
+
+    def test_positive_controls_each_screen_reads_without_a_record(self):
+        self.assertEqual(state(IDLE_LOGGED_OUT, base="needs_login")[0], "logged-out")
+        self.assertEqual(state(LOGIN_EXPIRED)[0], "logged-out")
+        self.assertEqual(state(REFUSED_TURNS)[3], "turn-rejected")
+
+    def test_signed_out_outranks_a_held_dialog(self):
+        self.assertEqual(state(IDLE_LOGGED_OUT, base="needs_login", hook=self.HELD)[0], "logged-out")
+        self.assertEqual(state(STILL_PANE, base="needs_login", hook=self.HELD)[0], "logged-out")
+        for pane in (LOGIN_EXPIRED, LOGIN_EXPIRED_BARE):
+            self.assertEqual(state(pane)[0], "logged-out")
+            self.assertEqual(state(pane, hook=self.HELD)[0], "logged-out")
+
+    def test_a_refused_turn_outranks_a_held_dialog(self):
+        # A refused turn is only read under the idle footer, so the footer case is the one to hold.
+        self.assertEqual(state(REFUSED_TURNS, hook=self.HELD)[3], "turn-rejected")
+
+    def test_a_limit_screen_and_a_paused_queue_outrank_a_held_dialog(self):
+        self.assertEqual(state(SESSION_LIMIT, hook=self.HELD), state(SESSION_LIMIT))
+        self.assertEqual(state(STILL_PANE, base="paused", hook=self.HELD), state(STILL_PANE, base="paused"))
+        self.assertEqual(state(STILL_PANE, base="paused")[0], "blocked-known")
+
+    def test_each_screen_is_the_same_with_or_without_the_record(self):
+        for pane, base in ((IDLE_LOGGED_OUT, "needs_login"), (LOGIN_EXPIRED, "idle"),
+                           (REFUSED_TURNS, "idle"), (SESSION_LIMIT, "idle"), (LOGIN_MENU, "idle")):
+            self.assertEqual(state(pane, base=base, hook=self.HELD), state(pane, base=base), pane[:30])
 
 
 class TestNoRecordIsTheOldBehaviour(unittest.TestCase):
