@@ -568,8 +568,8 @@ class Connector:
             out = self.result_body(status, text, err)
             # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
             told = self.tell_model(status, policy.capabilities, headers.get("channel_id"))
-            out = "\n\n".join(x for x in (out.rstrip("\n"), quoted(self.models.unsaid()).strip()) if x)
             asked = self.models.asked(headers["access_tier"], path, status, text, result_path)
+            out = "\n\n".join(x for x in (out.rstrip("\n"), quoted(self.models.unsaid()).strip()) if x)
             t_result = os.stat(result_path).st_mtime if asked else write_atomic(result_path, out.rstrip("\n") + "\n")
             record_done(done_path, task_id)
             rec = {"task": task_id, "status": status, "chars": len(out), "tier": headers["access_tier"],
