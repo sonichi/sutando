@@ -61,6 +61,14 @@ def reminds(req: HumanRequirement) -> bool:
     return (req.subject or {}).get("remind") is not False
 
 
+def said_on_card(req: HumanRequirement) -> bool:
+    """A recovery card whose own message already says how its incident ended (an action's outcome
+    and the seat seen again); a separate "Cleared" message would only repeat it."""
+    subject = req.subject or {}
+    check = subject.get("verify")
+    return bool(subject.get("recovery")) and isinstance(check, dict) and bool(check.get("seen"))
+
+
 def interval(reminders: int) -> float:
     return REMIND_INTERVALS_S[min(max(reminders, 0), len(REMIND_INTERVALS_S) - 1)]
 
@@ -72,6 +80,8 @@ def due(req: HumanRequirement, projection: Dict, now: float) -> Optional[str]:
     if projection.get("revision", 0) < req.revision:
         return None  # the edit goes first
     if req.status == STATUS_RESOLVED:
+        if said_on_card(req):
+            return None  # the recovery card itself says how it ended: one surface per incident
         # Only a card this module scheduled owes a recovery; a pre-upgrade ledger has no notified_at.
         owed = projection.get("notified_at") and not projection.get("recovered")
         return RECOVERY if owed else None

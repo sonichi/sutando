@@ -806,6 +806,32 @@ class MonitorStepsNeverFail(Base):
             self.assertEqual(M.recovery_step(self.mgr, self.ws, SOCK, CORE, "claude", None), RA.CONTINUE)
 
 
+class OneSurfaceAtTheClose(Base):
+    """The card's own last edit says how the incident ended; no separate "Cleared" message repeats it."""
+
+    def projection(self, req):
+        return {"event_id": "$card", "revision": req.revision, "notified_at": time.time() - 60}
+
+    def test_a_card_that_said_it_is_working_again_owes_no_cleared_message(self):
+        from hitl import renotify
+        req = self.card()
+        self.click(req, "switch_model:haiku")
+        self.run_pending(Run())
+        RA.verify_step(self.mgr, self.ws, CORE, blocked=False)
+        M.resolve_escalations(self.mgr, CORE, "❯ \n", "claude", workspace=self.ws)
+        card = self.mgr.get(req.id)
+        self.assertEqual(card.status, STATUS_RESOLVED)
+        self.assertIsNone(renotify.due(card, self.projection(card), time.time()))
+        self.assertEqual(renotify.plan([(card, self.projection(card))], time.time()), [])
+
+    def test_a_block_that_cleared_with_no_action_still_gets_its_one_notice(self):
+        from hitl import renotify
+        req = self.card()
+        M.resolve_escalations(self.mgr, CORE, "❯ \n", "claude", workspace=self.ws)
+        card = self.mgr.get(req.id)
+        self.assertEqual(renotify.due(card, self.projection(card), time.time()), renotify.RECOVERY)
+
+
 class Contract(Base):
     def test_action_fixture_is_a_recovery_click_and_its_hand_off_keeps_every_field(self):
         wire = json.loads((CONTRACTS / "action.json").read_text())[REPLY_FIELD]
