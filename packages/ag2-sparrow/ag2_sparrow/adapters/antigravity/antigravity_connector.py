@@ -102,15 +102,34 @@ def publish(result_file, body):
     result_publish.publish_text(result_file, body)
 
 
-def stage_own_attachments(headers, dest, max_bytes=None, log=lambda *a: None):
-    """Copy the files this task's sender attached (the attested `attachments:` header, nothing from the body)
-    into `dest` as read-only copies; return their real paths. A locator that is not a local absolute path, a
-    symlink, not a regular file, over `max_bytes`, or not the size the header says is skipped, never followed.
-    TODO(#6670): dedupe with the shared stage_own_attachments once it lands."""
+# The bridge's label for a file fetched from the sender's own message; a replied-to one says "(from replied-to …)".
+OWN_MEDIA_RE = re.compile(r"\[(?:Photo|File) attached: ([^\]\n]+)\]")
+REPLY_BLOCK_RE = re.compile(r"\[(?:AG2 Space|s\.space) reply context;")
+
+
+def own_media_paths(message):
+    """The local paths the bridge labelled as the sender's own media in `message`: outside the broker's quoted
+    reply-context block only. A reply block that does not parse gives none (fail closed)."""
+    reply, rest = local_task_protocol.split_reply_context(message or "")
+    if reply is None and REPLY_BLOCK_RE.search(message or ""):
+        return frozenset()
+    return frozenset(m.group(1).strip() for m in OWN_MEDIA_RE.finditer(rest))
+
+
+def stage_own_attachments(headers, dest, max_bytes=None, log=lambda *a: None, message=""):
+    """Copy the files this task's sender attached into `dest` as read-only copies; return their real paths. A
+    file is the sender's only when it is in the attested `attachments:` header AND the bridge labelled it as the
+    sender's own media in `message` (`own_media_paths`); quoted reply media, or any entry whose origin cannot be
+    shown so, is skipped. So is a locator that is not a local absolute path, a symlink, not a regular file, over
+    `max_bytes`, or not the size the header says. TODO(#6670): dedupe with the shared stage_own_attachments."""
     limit = MAX_ATTACHMENT_BYTES if max_bytes is None else max_bytes
+    own = own_media_paths(message)
     staged = []
     for i, ref in enumerate(local_task_protocol.parse_attachments(headers)[:MAX_ATTACHMENTS]):
         src = ref.locator
+        if src not in own:
+            log("attachment skipped (not shown to be the sender's own)")
+            continue
         if not os.path.isabs(src):
             log("attachment skipped (not a local path)")
             continue
@@ -147,7 +166,7 @@ def readable_only(readable, cwd):
 
 
 @contextlib.contextmanager
-def guest_turn(args, headers=None):
+def guest_turn(args, headers=None, message=""):
     """(an `acp_host.Isolated` for one restricted task, the paths it may read): a new 0700 temporary directory
     holding the Session's working directory, the sender's own attachments copied into it, and agy's home
     (`--gemini-dir`, deny-all settings but asked reads when there is an attachment), removed after the turn."""
@@ -156,7 +175,8 @@ def guest_turn(args, headers=None):
         home, cwd = os.path.join(base, "agy"), os.path.join(base, "cwd")
         os.makedirs(os.path.join(home, "antigravity-cli"), mode=0o700)
         os.mkdir(cwd, 0o700)
-        readable = stage_own_attachments(headers or {}, os.path.join(cwd, ATTACHMENTS_DIR), log=log)
+        readable = stage_own_attachments(headers or {}, os.path.join(cwd, ATTACHMENTS_DIR), log=log,
+                                         message=message)
         settings = os.path.join(home, "antigravity-cli", "settings.json")
         fd = os.open(settings, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -388,7 +408,7 @@ class Connector:
                                  shell_web=shell_web_on(self.args, headers))
             status, text, detail, turn = self.run_turn(task_id, headers, prompt, True)
         else:
-            with guest_turn(self.args, headers) as pair:
+            with guest_turn(self.args, headers, message) as pair:
                 prompt = wake_prompt(task_id, headers, message, operator_lines, None, self.note, readable=pair[1])
                 status, text, detail, turn = self.run_turn(task_id, headers, prompt, False, pair)
         publish(result_file, self.answer_body(headers, status, text, detail, turn))
