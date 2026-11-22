@@ -2,9 +2,9 @@
 """skills/tutorial/scripts/tutorial_run.py — the tutorial playbook's publish step and its outcome record.
 
 A task tagged `playbook: tutorial` always runs the Getting started page publish with the task's own
-room and owner; the setup inputs file only supplies roles, and only for its own room; the roles
-sentence is read in either form; every run, ok or failed, is recorded for health-check, and a failed
-run hands the agent one owner line in place of silence.
+room and owner and publishes a generic page (no roles, prompts or owner name, whatever the setup
+inputs or the message say); every run, ok or failed, is recorded for health-check, and a failed run
+hands the agent one owner line in place of silence.
 
 Run: python3 tests/tutorial-run.test.py
 """
@@ -25,11 +25,9 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "skills" / "tutorial" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-import tour_page  # noqa: E402
 import tutorial_run as tr  # noqa: E402
 
 ROOM = "!dm:example.org"
-OTHER_ROOM = "!other:example.org"
 OWNER = "@o:example.org"
 SETUP_BODY = ("Hi, I am Dana Reyes. I am all set up and saying hello. I want to use s.space for "
               "Founder, Product Manager. Give me a quick tour. /tutorial")
@@ -74,12 +72,6 @@ class _Run(unittest.TestCase):
     def record(self) -> dict:
         return json.loads(tr.record_path(self.ws).read_text())
 
-    def save_inputs(self, room: str, roles) -> None:
-        path = tr.inputs_path(self.ws)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"room": room, "owner": OWNER, "roles": roles}))
-
-
 class Publish(_Run):
     def test_always_publishes_with_the_tasks_room_and_owner(self):
         script = self.fake_publish(0, {"action": "created", "kind": "html-1"})
@@ -94,51 +86,27 @@ class Publish(_Run):
 
     def test_no_inputs_file_is_no_gate(self):
         script = self.fake_publish(0, {"action": "created", "kind": "html-1"})
-        self.assertFalse(tr.inputs_path(self.ws).exists())
+        self.assertFalse((self.ws / "state" / "onboarding" / "tutorial-inputs.json").exists())
         self.assertTrue(tr.run(ROOM, OWNER, "/tutorial", self.ws, script=script)["ok"])
         self.assertTrue(self.argv_file.exists(), "publish ran without the setup inputs file")
 
 
-class Roles(_Run):
-    def test_the_inputs_file_wins_for_its_own_room(self):
-        self.save_inputs(ROOM, ["Designer", "Researcher"])
-        tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.fake_publish(0, {"action": "created"}))
-        argv = self.argv()
-        self.assertEqual(argv[argv.index("--roles") + 1], "Designer, Researcher")
-        self.assertEqual(self.record()["roles_from"], "inputs")
+class Generic(_Run):
+    """A room's Commons page cannot yet be limited to its owner: the automatic run never puts what the
+    owner said about themselves on it."""
 
-    def test_another_rooms_inputs_are_ignored_and_the_message_is_read(self):
-        self.save_inputs(OTHER_ROOM, ["Designer"])
-        tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.fake_publish(0, {"action": "created"}))
-        argv = self.argv()
-        self.assertEqual(argv[argv.index("--roles") + 1], "I want to use s.space for Founder, Product Manager.")
-        self.assertEqual(self.record()["roles_from"], "message")
-
-    def test_both_sentence_forms_are_read(self):
-        for body, want in (
-                (SETUP_BODY, "I want to use s.space for Founder, Product Manager."),
-                ("Hi. I picked: Founder, Designer. /tutorial", "I picked: Founder, Designer."),
-                ("Hi.\nI picked: Founder, Designer.\n/tutorial", "I picked: Founder, Designer."),
-                ("I want to use s.space for founder", "I want to use s.space for founder")):
-            self.assertEqual(tr.roles_from_body(body), want, body)
-            self.assertEqual(tour_page.role_labels(want)[0], "Founder", want)
-
-    def test_ordinary_words_are_not_roles(self):
-        for body in ("I want to use it for nothing here, honestly", "I want to use Slack for chat. /tutorial",
-                     "Hi, I am all set up and saying hello. Give me a quick tour. /tutorial"):
-            self.assertEqual(tr.roles_from_body(body), "", body)
-
-    def test_role_labels_reads_both_forms_the_same(self):
-        self.assertEqual(tour_page.role_labels("I want to use s.space for Founder, Product Manager."),
-                         ["Founder", "Product Manager"])
-        self.assertEqual(tour_page.role_labels("I picked: Founder, Product Manager."),
-                         ["Founder", "Product Manager"])
-
-    def test_no_roles_means_no_roles_flag(self):
-        tr.run(ROOM, OWNER, "Hi, I am all set up and saying hello. Give me a quick tour. /tutorial",
-               self.ws, script=self.fake_publish(0, {"action": "created"}))
-        self.assertNotIn("--roles", self.argv())
-        self.assertEqual(self.record()["roles_from"], "none")
+    def test_neither_the_setup_inputs_nor_the_message_put_roles_on_the_page(self):
+        inputs = self.ws / "state" / "onboarding" / "tutorial-inputs.json"
+        inputs.parent.mkdir(parents=True, exist_ok=True)
+        inputs.write_text(json.dumps({"room": ROOM, "owner": OWNER, "roles": ["Designer", "Researcher"]}))
+        for body in (SETUP_BODY, "Hi.\nI picked: Founder, Designer.\n/tutorial", "/tutorial"):
+            tr.run(ROOM, OWNER, body, self.ws, script=self.fake_publish(0, {"action": "created"}))
+            argv = self.argv()
+            for flag in ("--roles", "--prompts"):
+                self.assertNotIn(flag, argv, f"{flag} for {body!r}")
+            self.assertNotIn("Founder", json.dumps(argv), body)
+            self.assertNotIn("Designer", json.dumps(argv), body)
+            self.assertNotIn("roles_from", self.record(), body)
 
 
 class Summon(_Run):
@@ -264,11 +232,11 @@ class EdgePaths(_Run):
         real = tr._workspace
         tr._workspace = lambda: self.ws
         try:
-            for path, want in ((body, "message"), (self.base / "absent.txt", "none")):
+            for path in (body, self.base / "absent.txt"):
                 with contextlib.redirect_stdout(io.StringIO()):
                     tr.main(["--room", ROOM, "--owner", OWNER, "--body-file", str(path),
                              "--publish-script", str(self.fake_publish(0, {"action": "created"}))])
-                self.assertEqual(self.record()["roles_from"], want, path)
+                self.assertEqual(self.record()["outcome"], "ok", path)
         finally:
             tr._workspace = real
 

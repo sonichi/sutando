@@ -8,10 +8,9 @@ src/agent_triggers.py) runs this once, after the greeting has gone out:
         --body-file <file holding the task's body>
 
 It always runs `getting_started.py publish` with the task's own room and owner, so whether the page
-is made never rests on anything else. The setup app's tutorial inputs file is not a gate: it is only
-a source of roles, used when it names this same room. Otherwise the roles come from the body's own
-sentence, in either form ("I want to use <product> for A, B." or the older "I picked: A, B."), else
-none. The owner's name never appears on the page: publish uses the agent's own (`--name auto`).
+is made never rests on anything else. The page it publishes is generic: no roles, no tailored prompts
+and never the owner's name (publish uses the agent's own, `--name auto`). A room's Commons page cannot
+yet be limited to its owner, so nothing the owner said about themselves is put on it.
 
 Every run records its outcome in <workspace>/state/tutorial/last-run.json (health-check reads it) and
 prints one JSON line. Whenever the owner would otherwise hear nothing (a failed publish, or a page whose
@@ -23,7 +22,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -34,7 +32,6 @@ from typing import Dict, Optional
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 sys.path.insert(0, str(REPO / "src"))
-import dotspace  # noqa: E402  (the product's name, as the setup app writes it)
 
 PUBLISH_SCRIPT = HERE / "getting_started.py"
 OWNER_LINE = "I couldn't make your Getting started page just now. Send /tutorial to try again."
@@ -51,12 +48,6 @@ OUTCOMES = {
 }
 REASON_MAX = 300
 
-# The roles sentence in either form, anywhere: the bridge folds the body to one line. The product word
-# is exact, so the owner's own "I want to use it for ..." is not roles.
-ROLES_SENTENCE = re.compile(
-    r"(?:I\s+want\s+to\s+use\s+" + re.escape(dotspace.SUCCESSOR_SERVER) + r"\s+for\b|I\s+picked\s*:)"
-    r"\s*[^\r\n]*?\S(?:\.(?=\s|$)|(?=\s*[\r\n])|$)", re.I)
-
 
 def _workspace() -> Path:
     from workspace_default import resolve_workspace
@@ -65,39 +56,6 @@ def _workspace() -> Path:
 
 def record_path(workspace: Path) -> Path:
     return workspace / "state" / "tutorial" / "last-run.json"
-
-
-def inputs_path(workspace: Path) -> Path:
-    return workspace / "state" / "onboarding" / "tutorial-inputs.json"
-
-
-def roles_from_body(body: str) -> str:
-    """The body's roles sentence, as written, or "" when it has none."""
-    found = ROLES_SENTENCE.search(body or "")
-    return found.group(0).strip() if found else ""
-
-
-def saved_roles(workspace: Path, room: str) -> str:
-    """The setup app's saved roles, only when its file names this room; "" otherwise."""
-    try:
-        data = json.loads(inputs_path(workspace).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return ""
-    if not isinstance(data, dict) or data.get("room") != room:
-        return ""
-    roles = data.get("roles")
-    if isinstance(roles, list):
-        roles = ", ".join(r.strip() for r in roles if isinstance(r, str) and r.strip())
-    return roles.strip() if isinstance(roles, str) and "\n" not in roles else ""
-
-
-def choose_roles(workspace: Path, room: str, body: str) -> tuple[str, str]:
-    """(roles, where they came from): the inputs file for this room, else the body, else none."""
-    saved = saved_roles(workspace, room)
-    if saved:
-        return saved, "inputs"
-    said = roles_from_body(body)
-    return (said, "message") if said else ("", "none")
 
 
 def _last_json(text: str) -> Dict[str, object]:
@@ -129,12 +87,9 @@ def write_record(workspace: Path, record: Dict[str, object]) -> None:
 def run(room: str, owner: str, body: str, workspace: Path,
         script: Path = PUBLISH_SCRIPT, now: Optional[float] = None) -> Dict[str, object]:
     """Publish once and record the outcome. Never raises for a failed publish: it is recorded."""
-    roles, roles_from = choose_roles(workspace, room, body)
     cmd = [sys.executable, str(script), "publish", "--room", room, "--name", "auto"]
     if owner:
         cmd += ["--owner", owner]
-    if roles:
-        cmd += ["--roles", roles]
     # Sent on its own, `/tutorial` asks for the page again: summon the owner to it even on a refresh.
     if (body or "").strip() == "/tutorial":
         cmd.append("--summon")
@@ -161,7 +116,6 @@ def run(room: str, owner: str, body: str, workspace: Path,
         "owner": owner,
         "exit": code,
         "outcome": outcome,
-        "roles_from": roles_from,
     }
     if reason:
         record["reason"] = reason[:REASON_MAX]

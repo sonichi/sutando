@@ -47,9 +47,9 @@ For a tagged task, do exactly this, in order:
      --room '<channel_id>' --owner '<user_id>' --body-file <file holding the task body>
    ```
 
-   It runs `getting_started.py publish` (step 3 below) with that room and owner. The setup app's
-   `tutorial-inputs.json` is not a gate: its `roles` are used only when it names this room, else the
-   body's own line (`I want to use s.space for A, B.`, or the older `I picked: A, B.`), else none.
+   It runs `getting_started.py publish` (step 3 below) with that room and owner, and nothing else:
+   the page it publishes is generic, with no roles and no tailored prompts, because a room's Commons
+   page cannot yet be limited to its owner. The setup app's `tutorial-inputs.json` is not a gate.
    It records the outcome in `<workspace>/state/tutorial/last-run.json`, which health-check shows,
    and prints one JSON line.
 3. **The line has an `owner_line`** (the publish failed, or the page was made but its card did not
@@ -58,7 +58,7 @@ For a tagged task, do exactly this, in order:
    failure in chat and do not retry in the same turn; the owner retries with `/tutorial`.
    **No `owner_line`:** the page's card in the DM is the one line about it; post nothing more.
 
-Tailored prompts (step 2 below) are optional here: without them the page keeps its generic prompts.
+Do not add roles or tailored prompts (step 2 below) to this run.
 
 **The greeting comes first.** Send the first-contact reply in the DM before anything here. The page
 is extra: if any step below fails, the greeting stands. Do not edit, retract or repeat it, and do
@@ -77,10 +77,9 @@ not retry the page in the same turn.
    launcher-named device file first). `publish` refuses to run without one: a page without the
    ownership tag could never be found again.
 2. Tailor the prompts when you know the owner's work. You know it when either:
-   - the first-contact message has a line `I want to use s.space for <labels>.` (older clients:
-     `I picked: <labels>.`), for example `I want to use s.space for Founder, Product Manager.`.
-     These are the persona labels the owner chose at onboarding, or their slugs when the client had
-     no labels; or
+   - the first-contact message has a line `I picked: <labels>.`, for example
+     `I picked: Founder, Product Manager.`. These are the persona labels the owner chose at
+     onboarding, or their slugs when the client had no labels; or
    - `user_profile.md` already says what they do.
 
    In that case write your own prompts for this owner into a temporary JSON file, one per slot:
@@ -89,8 +88,8 @@ not retry the page in the same turn.
    - Each must run on a fresh install: only the `apps` slot may assume a connected app.
    - The slot decides where the prompt is pasted (your DM or a room), not the wording.
 
-   Pass the file as `--prompts <file>`, and pass the labels verbatim as
-   `--roles "Founder, Product Manager."` (the whole line, in either form, works too). Do not
+   Pass the file as `--prompts <file>`, and pass the `I picked:` payload verbatim as
+   `--roles "Founder, Product Manager."` (the whole line, `I picked:` included, works too). Do not
    map it to slugs: the script takes labels or slugs and adds a "Picked for: Founder, Product
    Manager" line under the heading. Without `--roles`, the saved inputs' `roles` are used (step 3).
    Otherwise leave both out. A missing, bad or partly bad file never fails the run: each slot without a usable prompt
