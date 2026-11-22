@@ -135,6 +135,25 @@ class Forward(Base):
         out, why = self.migrate(handler="/h", run=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, '{"owed": []}', ""))
         self.assertEqual((why, out["state"]), ("", "own"))
 
+    def test_a_state_that_is_not_a_folder_state_is_refused(self):
+        with self.assertRaises(C.ConnectionsError):
+            C.set_worker_dirs(W, "elsewhere", workspace=self.ws)
+        self.assertEqual(C.worker_dirs_state(W, self.ws), "")
+
+    def test_a_relaunch_that_raises_after_the_drain_says_why_and_keeps_the_record(self):
+        with mock.patch.object(worker_lane, "relaunch_lane", side_effect=OSError("lane gone")):
+            out, why = self.migrate()
+        self.assertEqual((why, out["state"]), ("lane gone", "migrating"))
+        self.assertIsNone(C.worker_dirs(W, self.ws))
+
+    def test_without_a_handler_a_deliveries_folder_unreadable_mid_switch_keeps_it_migrating(self):
+        from delivery import task_dispatch
+        with mock.patch.object(task_dispatch, "owned_task_ids",
+                               side_effect=[[], task_dispatch.WorkerHoldUnreadable("io")]):
+            out, why = self.migrate()
+        self.assertEqual(why, "io; it stays on the shared folders; re-run to finish")
+        self.assertEqual((out["state"], C.worker_dirs(W, self.ws)), ("migrating", None))
+
     def test_a_failed_handler_lookup_switches_nothing(self):
         with mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("bash", 10)):
             out, why = worker_lane.migrate_dirs(W, self.ws)

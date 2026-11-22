@@ -532,6 +532,22 @@ class OwnDirs(Base):
         self.assertIsNone(C.worker_dirs(W, self.ws))
         self.assertEqual(len(starts), 1)
 
+    def test_a_switch_that_raises_is_reported_and_never_raised(self):
+        import worker_lane
+        with unittest.mock.patch.object(worker_lane, "migrate_dirs", side_effect=RuntimeError("boom")):
+            out = self.connect(ConnectFake(self.backend))
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["dirs"], {"state": "shared", "own": False, "why": "RuntimeError: boom"})
+
+    def test_the_cli_names_the_command_that_finishes_a_switch_that_stopped(self):
+        import worker_lane
+        with unittest.mock.patch.object(worker_lane, "handler_lookup", lambda ws: ("", "lookup failed")):
+            rc, out = self.run_flow(["--workspace", str(self.ws), "add", "Reviewer", "--device-flow", "--label",
+                                     "reviewer"], ConnectFake(self.backend), [True])
+        self.assertEqual((rc, json.loads(out[-1])["dirs"]), (0, "shared"), out)
+        self.assertTrue(any("lookup failed" in line and f"migrate-dirs --worker {W} --apply" in line
+                            for line in out), out)
+
     def run_flow(self, argv, fake, approve):
         real, out = dc.connect, []
 
