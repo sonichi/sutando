@@ -42,7 +42,8 @@ NOT_WAITING = "no sign-in is waiting for a code; start one first"
 PROXY_VAR = "ANTHROPIC_BASE_URL"
 SHARED = ("this agent has no Claude config dir of its own (install --claude-config-dir): signing in here would "
           "change your own Claude Code login, so nothing was done")
-PERSONAL = ("this agent's Claude config dir is your own Claude Code login (~/.claude): signing in here would change "
+PERSONAL = ("this agent's Claude config dir is your own Claude Code login (the default one in your home folder): "
+            "signing in here would change "
             "what you run by hand, so nothing was done; give the agent a dir of its own (install --claude-config-dir)")
 ANOTHER_AGENTS = ("this agent shares its Claude config dir with another agent: signing in here would change that "
                   "agent's account too, so nothing was done")
