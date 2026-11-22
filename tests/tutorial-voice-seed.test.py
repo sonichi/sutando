@@ -62,6 +62,31 @@ class Seed(unittest.TestCase):
         self.assertEqual(dest.read_text(), "written meanwhile\n")
         self.assertEqual(sorted(p.name for p in dest.parent.iterdir()), ["first-time-tutorial.md"])
 
+    def test_a_filesystem_without_hard_links_still_seeds_but_never_replaces(self):
+        def no_links(src, dst):
+            raise PermissionError("hard links not supported")
+        with mock.patch.object(svt.os, "link", no_links):
+            self.assertEqual(svt.seed(self.ws), "seeded")
+        self.assertEqual(svt.target(self.ws).read_bytes(), svt.SOURCE.read_bytes())
+        self.assertEqual([p.name for p in svt.target(self.ws).parent.iterdir()], ["first-time-tutorial.md"])
+
+        other = self.ws / "other"
+        dest = svt.target(other)
+
+        def no_links_and_a_file_appears(src, dst):
+            Path(dst).write_text("written meanwhile\n")
+            raise PermissionError("hard links not supported")
+        with mock.patch.object(svt.os, "link", no_links_and_a_file_appears):
+            self.assertEqual(svt.seed(other), "present")
+        self.assertEqual(dest.read_text(), "written meanwhile\n")
+        self.assertEqual([p.name for p in dest.parent.iterdir()], ["first-time-tutorial.md"])
+
+    def test_the_workspace_comes_from_the_shared_resolver(self):
+        import workspace_default
+        with mock.patch.object(workspace_default, "resolve_workspace", return_value=self.ws) as rw:
+            self.assertEqual(svt._workspace(), self.ws)
+        rw.assert_called_once_with(migrate=False)
+
     def test_an_unreadable_or_oversized_source_seeds_nothing(self):
         self.assertTrue(svt.seed(self.ws, self.ws / "missing.md").startswith("skipped"))
         big = self.ws / "big.md"
