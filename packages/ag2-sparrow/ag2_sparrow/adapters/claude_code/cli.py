@@ -541,9 +541,9 @@ def verify(args) -> int:
     if hmac_policy.legacy_opt_out(cfg):
         print("WARN hmac mode: legacy opt-out (HMAC_STRICT recorded empty by an older install --no-hmac-strict): not "
               "strict; unsigned and unverifiable envelopes are submitted. Reinstall without --no-hmac-strict for strict")
-    print("INFO non-owner tasks: " + ("refused: a restricted turn must be isolated and read-only, and this adapter "
-                                      "runs every turn in the owner's session (--allow-non-owner is recorded, not "
-                                      "honoured)" if cfg.get(inbox.ALLOW_NON_OWNER) == "1" else "refused (owner only)"))
+    print("INFO non-owner tasks: " + ("answered on an isolated read-only `claude -p` turn, never this session "
+                                      "(--allow-non-owner)" if cfg.get(inbox.ALLOW_NON_OWNER) == "1"
+                                      else "refused (owner only)"))
     print("INFO collaborator tasks: " + ("refused (--no-allow-collaborator)" if cfg.get(inbox.ALLOW_COLLABORATOR) == "0"
                                          else "submitted into this session with the non-owner note (the default; "
                                               "--no-allow-collaborator opts out)"))
@@ -687,11 +687,12 @@ def session_options(p) -> None:
                     "--hmac-key-file)")
     hm.add_argument("--no-hmac-strict", action="store_true", help="with --hmac-key-file, also submit unsigned and "
                     "unverifiable envelopes")
-    p.add_argument("--allow-non-owner", action="store_true", help="recorded but not honoured here: senders "
-                   "without collaborator access (guests, and any collaborator claim the broker did not attest) get "
-                   "a restricted turn, which must be isolated and read-only, and this adapter only runs turns in the "
-                   "owner's session, so they always get the owner-only refusal. An attested collaborator is not "
-                   "covered by it: see --no-allow-collaborator")
+    p.add_argument("--allow-non-owner", action="store_true", help="answer senders without collaborator access "
+                   "(guests, plain team, and any collaborator claim the broker did not attest) on an isolated "
+                   "read-only turn, never this session: a fresh `claude -p` on the agent's login with the three read "
+                   "tools in an empty directory, no connector, MCP server, plugin, hook or history, never saved; off: "
+                   "they get the owner-only refusal. An attested collaborator is not covered by it: see "
+                   "--no-allow-collaborator")
     co = p.add_mutually_exclusive_group()
     co.add_argument("--allow-collaborator", dest="collaborator", action="store_const", const="1", help="submit attested collaborators' (Team) tasks "
                     "into this session with the non-owner note (the default; kept so older install lines still work). "
