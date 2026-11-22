@@ -60,6 +60,7 @@ NEEDED = (
     "src/file_lock.py",
     "src/cli_wedge.py",
     "src/cli_wedge_patterns.py",
+    "src/pane_composer.py",
     "src/sutando_platform.py",
     "src/quota_availability.py",
     "src/worker_auth_state.py",
