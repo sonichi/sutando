@@ -915,6 +915,17 @@ def recovery_step(manager, workspace, socket, session, runtime, seat, enabled=Tr
         return None
 
 
+def crash_loop_step(manager, workspace, session, runtime, counter, state, last_pane, now):
+    """The core's crash-loop card (core_crash_loop); never fatal to the monitor."""
+    try:
+        import core_crash_loop
+        counter.observe(state, now)
+        return core_crash_loop.step(manager, workspace, session, runtime, counter, last_pane, now)
+    except Exception as exc:  # noqa: BLE001
+        print(f"crash-loop card failed: {exc}", file=_sys.stderr)
+        return []
+
+
 def settle_driven(manager, session, prompt, state):
     """Resolve each driven card whose dialog has left the screen: its keys took, so a later
     prompt, even an identical one, mints a new card instead of deduping onto the answered one."""
@@ -1075,6 +1086,9 @@ def main():
     banner_baseline = None
     clock = (None, None, None)
     last_runtime = None  # a failed tmux read keeps the last runtime, not "claude"
+    import core_crash_loop
+    crashes = core_crash_loop.CrashCounter()
+    last_live_pane = None
     state_dir = os.path.dirname(os.path.abspath(a.out))
     workspace = _Path(os.path.dirname(state_dir))
     while True:
@@ -1099,6 +1113,10 @@ def main():
             process=(base.get("signals") or {}).get("process", True), prev_pane=prev_pane,
             runtime=runtime, styled_pane=styled_pane, limit_stale=limit_stale, still_s=still_s)
         prev_pane = pane
+        if pane and pane.strip():
+            last_live_pane = pane
+        if a.chat_escalation and not a.seat:
+            crash_loop_step(hitl, workspace, a.session, runtime, crashes, state, last_live_pane, time.time())
         clock = gate_clock(clock, state, prompt, time.time())
         seen_state, seen_prompt = state, prompt  # before the debounce masks a new dialog
 
