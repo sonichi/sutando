@@ -669,33 +669,21 @@ def model(args) -> int:
     return 0 if switched else 1
 
 
-ROUTE_UNKNOWN = "AG2_ACCOUNT_ROUTE_UNKNOWN"      # set by account_env, never passed on: the session could not be asked
-NO_ROUTE = ("could not ask this agent's session whether its requests go through the credential proxy, so a sign-in "
-            "here might not be the one it uses; nothing was done")
+ROUTE_NOTE = ("from here I cannot tell whether this agent's session goes through the credential proxy; if it does, "
+              "the proxy's sign-in decides its account and this one changes nothing. Ask the agent which account it is "
+              "on to check")
 NOT_OWNERS_TURN = ("a sign-in is started only for the agent's owner: at a terminal, or by the agent while every "
                    "message it is working on is its owner's. Nothing was done")
 NOT_IN_THE_DM = ("a sign-in is started only from the owner's DM with the agent, since its link must not be posted "
                  "in a room with other people: ask me in our DM. Nothing was done")
-NO_SUCH_VARIABLE = "unknown variable"       # tmux's words for a variable its server does not have
 
 
 def account_env(cfg: dict, local) -> dict:
-    """What `claude auth` runs under for this agent, with the credential proxy's address as the agent's
-    running session has it (its tmux server's environment), which this command's own caller may lack.
-    ROUTE_UNKNOWN is set unless the session answered: with the variable, or that it has none. A session
-    that cannot be reached, or any other failure, is not an answer."""
-    env = child_env(cfg)
-    tmux, problem = launcher.configured_tmux(cfg, job=local)
-    r = None if problem else launcher.Tmux(str(launcher.socket_path(config_dir(local))), tmux).run(
-        "show-environment", "-g", accounts.PROXY_VAR)
-    name, eq, value = ((r.stdout if r else "") or "").strip().partition("=")
-    if r is not None and r.returncode == 0 and name == accounts.PROXY_VAR and eq and value:
-        env[accounts.PROXY_VAR] = value
-        return env
-    unset = r is not None and (
-        (r.returncode == 0 and name == "-" + accounts.PROXY_VAR) or
-        (r.returncode != 0 and NO_SUCH_VARIABLE in (getattr(r, "stderr", "") or "")))
-    return env if unset or env.get(accounts.PROXY_VAR) else dict(env, **{ROUTE_UNKNOWN: "1"})
+    """What `claude auth` runs under for this agent: the allowlist of this command's own environment
+    and the agent's config dir. Run by the agent, that is its session's environment, proxy address
+    included. Run at a terminal it is the person's, which says nothing of the session's: the session's
+    environment is not read from outside it."""
+    return child_env(cfg)
 
 
 def other_agents_dirs(local) -> list:
@@ -742,13 +730,14 @@ def account(args) -> int:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
     env, changed = account_env(cfg, local), ""
-    unknown_route = bool(env.pop(ROUTE_UNKNOWN, ""))
+    # At a terminal a missing proxy address is not an answer: the session may still have one.
+    unknown_route = sys.stdin.isatty() and not env.get(accounts.PROXY_VAR)
     waiting = config_dir(local) / "account-sign-in"
     if args.cancel:
         print(json.dumps({"changed": "", "cancelled": accounts.cancel(waiting)}))
         return 0
     if args.start or args.switch or args.code:
-        refused = sign_in_refused(cfg, local, args) or (NO_ROUTE if unknown_route and not args.code else "")
+        refused = sign_in_refused(cfg, local, args)
         if refused:
             print(json.dumps({"changed": "", "detail": refused, **accounts.status(cfg, env)}))
             return 1
@@ -773,6 +762,8 @@ def account(args) -> int:
         changed = "account"
     state = accounts.status(cfg, env)
     out = {"changed": changed, **state, "say": accounts.words(state)}
+    if unknown_route:
+        out.update(proxy=None, **({"note": ROUTE_NOTE} if changed else {}))
     if changed:
         out["restart"] = "the running session keeps the sign-in it started with; the new one applies when it next starts"
     print(json.dumps(out))

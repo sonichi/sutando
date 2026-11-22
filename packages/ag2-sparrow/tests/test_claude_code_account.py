@@ -376,11 +376,6 @@ class OwnerOnly(Base):
             self.assertFalse((self.dir / "stub-logins").exists())
             self.assertEqual(cmd.run_(gate=cli.NOT_OWNERS_TURN)[0], 0)
             self.assertEqual(cmd.run_("--cancel", gate=cli.NOT_OWNERS_TURN), (0, {"changed": "", "cancelled": False}))
-            # A session that could not be asked about the proxy: reading still answers, a sign-in does not start.
-            unknown = dict(self.env, **{cli.ROUTE_UNKNOWN: "1"})
-            rc, out = cmd.run_("--start", env=unknown)
-            self.assertEqual((rc, out["detail"]), (1, cli.NO_ROUTE))
-            self.assertEqual(cmd.run_(env=unknown)[0], 0)
         self.assertIn("here in our DM", cli.START_SAY)
         self.assertNotIn("from-app", cli.NOT_OWNERS_TURN)
 
@@ -428,36 +423,23 @@ class Command(Base):
         with mock.patch.object(cli, "selected", return_value=None):
             self.assertEqual(cli.main(["account"]), cli.EXIT_UNUSABLE)
 
-    def test_the_proxy_address_is_read_from_the_agents_running_session(self):
-        """The command's caller (the app, a terminal) may not have the variable the session was started with."""
-        answers = iter([types.SimpleNamespace(returncode=0, stdout="ANTHROPIC_BASE_URL=http://localhost:7846\n"),
-                        types.SimpleNamespace(returncode=0, stdout="-ANTHROPIC_BASE_URL\n"),
-                        types.SimpleNamespace(returncode=1, stdout="", stderr="unknown variable: ANTHROPIC_BASE_URL\n"),
-                        types.SimpleNamespace(returncode=1, stdout="", stderr="no server running on /x\n")])
-        with mock.patch.object(cli, "child_env", side_effect=lambda cfg: dict(self.env)), \
-                mock.patch.object(cli.launcher, "configured_tmux", return_value=("/tmux", "")), \
-                mock.patch.object(cli.launcher.Tmux, "run", side_effect=lambda *a, **k: next(answers)) as asked:
-            got = [cli.account_env(self.cfg, cli.LOCAL).get("ANTHROPIC_BASE_URL") for _ in range(4)]
-        self.assertEqual(got, ["http://localhost:7846", None, None, None])
-        # Only an answer counts as "no proxy": a session that cannot be reached, a failure tmux does not
-        # explain and a tmux that did not run are all unknown.
-        for answer, unknown in ((types.SimpleNamespace(returncode=1, stdout="", stderr="unknown variable: X\n"), False),
-                                (types.SimpleNamespace(returncode=0, stdout="-ANTHROPIC_BASE_URL\n", stderr=""), False),
-                                (types.SimpleNamespace(returncode=1, stdout="", stderr="no server running on /x\n"), True),
-                                (types.SimpleNamespace(returncode=1, stdout="", stderr=""), True),
-                                (types.SimpleNamespace(returncode=0, stdout="", stderr=""), True), (None, True)):
-            with mock.patch.object(cli, "child_env", side_effect=lambda cfg: dict(self.env)), \
-                    mock.patch.object(cli.launcher, "configured_tmux", return_value=("/tmux", "")), \
-                    mock.patch.object(cli.launcher.Tmux, "run", return_value=answer):
-                self.assertEqual(cli.ROUTE_UNKNOWN in cli.account_env(self.cfg, cli.LOCAL), unknown, answer)
-        self.assertEqual(asked.call_args.args, ("show-environment", "-g", "ANTHROPIC_BASE_URL"))
-        with mock.patch.object(cli, "child_env", return_value={"ANTHROPIC_BASE_URL": "http://own"}), \
-                mock.patch.object(cli.launcher, "configured_tmux", return_value=("", "no tmux")):
+    def test_the_sessions_environment_is_never_read_from_outside_and_a_terminal_says_what_it_cannot_tell(self):
+        with mock.patch.object(cli, "child_env", return_value={"ANTHROPIC_BASE_URL": "http://own"}):
             self.assertEqual(cli.account_env(self.cfg, cli.LOCAL), {"ANTHROPIC_BASE_URL": "http://own"})
-        # A session that cannot be asked at all is marked, never read as "not behind the proxy".
-        with mock.patch.object(cli, "child_env", return_value={}), \
-                mock.patch.object(cli.launcher, "configured_tmux", return_value=("", "no tmux")):
-            self.assertEqual(cli.account_env(self.cfg, cli.LOCAL), {cli.ROUTE_UNKNOWN: "1"})
+        self.assertNotIn("show-environment", Path(cli.__file__).read_text())
+        self.signed_in()
+        # The agent's own run: its environment is the session's, so no proxy address means no proxy.
+        rc, out = self.run_("--switch")
+        self.assertEqual((rc, out["proxy"], "note" in out), (0, False, False))
+        # At a terminal the same absence says nothing of the session: reading and signing in still work,
+        # the answer says it does not know, and a sign-in says what that may mean.
+        with mock.patch.object(cli.sys, "stdin", mock.Mock(isatty=lambda: True)):
+            rc, out = self.run_()
+            self.assertEqual((rc, out["proxy"], "note" in out), (0, None, False))
+            rc, out = self.run_("--switch")
+            self.assertEqual((rc, out["changed"], out["proxy"], out["note"]), (0, "account", None, cli.ROUTE_NOTE))
+            rc, out = self.run_("--switch", env=dict(self.env, ANTHROPIC_BASE_URL="http://localhost:7846"))
+            self.assertEqual((rc, out["detail"], out["proxy"]), (1, account.PROXIED, True))
 
     def test_the_dirs_of_the_other_installed_agents_are_found_from_their_configs(self):
         root = self.tmp / "config-root"
