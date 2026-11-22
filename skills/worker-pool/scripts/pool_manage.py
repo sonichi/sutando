@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manage the pool's workers: list, stop, retire, enable, remove, reseat, plugins, bind, unbind.
+"""Manage the pool's workers: list, stop, retire, enable, remove, reseat, retry, plugins, bind, unbind.
 
 The owner's (or the agent's, on the owner's behalf) one supported way to take a
 worker out of service and bring it back. Each verb goes through the writer that
@@ -21,6 +21,8 @@ already owns its fact, so the remedy, the sweep and the router honour it:
     remove  drop a retired worker's roster row; its records stay on disk.
     reseat  restart a running seat that owes nothing, so its tools pick up an
             agent identity added after it started; one that owes work is left.
+    retry   restart a seat stopped at a provider limit now, on the owner's "retry now" to its
+            pause (its input watcher runs it): owed work is kept and delivered again.
     bind    bind a room to a worker on the shared folders (pool_roster.bind_room), so the
             router delivers that room's tasks to it; a worker on its own folders is refused,
             since the router never delivers to one.
@@ -36,6 +38,7 @@ already owns its fact, so the remedy, the sweep and the router honour it:
     python3 pool_manage.py [--workspace WS] [--repo REPO] enable <worker> [--no-start]
     python3 pool_manage.py [--workspace WS] remove <worker> [--hand-off]
     python3 pool_manage.py [--workspace WS] [--repo REPO] reseat <worker>
+    python3 pool_manage.py [--workspace WS] [--repo REPO] retry <worker id>
     python3 pool_manage.py [--workspace WS] plugins <worker> add|remove <dir>
     python3 pool_manage.py [--workspace WS] plugins <worker> list
     python3 pool_manage.py [--workspace WS] bind <room id> <worker id or label>
@@ -372,6 +375,25 @@ def unbind(workspace, room: str) -> dict:
     return {"action": "unbind", "room": room, "result": "unbound", "roster_version": out.get("version")}
 
 
+def retry(workspace, repo, target, *, runner=subprocess.run, spawn=None) -> dict:
+    """Restart `target`'s seat at once, owed work kept: the owner's "retry now" to its limit pause.
+    A stopped or retired worker is left alone; a seat that is already gone is just started."""
+    wid, row = _worker(workspace, target)
+    base = {"worker_id": wid, "action": "retry"}
+    if row.get("state") == "retired" or sup.is_paused(workspace, wid):
+        return {**base, "result": "failed", "why": "the worker is stopped or retired; enable it first"}
+    socket = sup.run_socket(workspace, wid)
+    if socket is not None and sw.session_state(wi.tmux_session_name(wid), socket, runner=runner) == "exists":
+        t = _take_down(workspace, wid, runner)
+        sup.set_paused(workspace, wid, False)
+        if not t["down"]:
+            return {**base, "result": "failed", "sessions": t["sessions"],
+                    "why": "tmux could not confirm the seat gone"}
+    restarted = rem.restart(workspace, repo, wid, runner=None if runner is subprocess.run else runner, spawn=spawn)
+    return {**base, "result": "restarted" if restarted["result"] in ("restarted", "already-running") else "failed",
+            "start": {"result": restarted["result"], "detail": restarted["detail"]}}
+
+
 def main(argv=None, *, runner=subprocess.run) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--workspace", default=None)
@@ -379,7 +401,7 @@ def main(argv=None, *, runner=subprocess.run) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     ls = sub.add_parser("list")
     ls.add_argument("--json", action="store_true")
-    for name in ("stop", "retire", "enable", "remove", "reseat"):
+    for name in ("stop", "retire", "enable", "remove", "reseat", "retry"):
         sp = sub.add_parser(name)
         sp.add_argument("worker")
         if name == "stop":
@@ -425,6 +447,8 @@ def main(argv=None, *, runner=subprocess.run) -> int:
                          runner=None if runner is subprocess.run else runner)
         elif a.cmd == "reseat":
             out = reseat(ws, a.repo, a.worker, runner=runner)
+        elif a.cmd == "retry":
+            out = retry(ws, a.repo, a.worker, runner=runner)
         elif a.cmd == "plugins":
             out = plugins(ws, a.worker, a.op, a.dir)
         elif a.cmd == "bind":
