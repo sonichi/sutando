@@ -69,6 +69,9 @@ omit =
     packages/ag2-sparrow/ag2_sparrow/hitl/projector.py
     packages/ag2-sparrow/ag2_sparrow/hitl/renotify.py
     packages/ag2-sparrow/ag2_sparrow/hitl/replies.py
+    packages/ag2-sparrow/ag2_sparrow/agent_card.py
+    packages/ag2-sparrow/ag2_sparrow/issued_cards.py
+    packages/ag2-sparrow/ag2_sparrow/local_record.py
     */node_modules/*
     */.venv/*
     */venv/*
