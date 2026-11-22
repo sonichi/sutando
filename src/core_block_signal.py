@@ -29,6 +29,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -147,10 +148,8 @@ def write(state_dir, socket: str, pane_id: str, pane_pid: int, state: str,
             json.dump(rec, f)
         os.replace(tmp, path)
     except BaseException:
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(tmp)
-        except OSError:
-            pass
         raise
     return path
 

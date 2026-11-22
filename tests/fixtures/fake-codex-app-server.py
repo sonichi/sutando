@@ -2,7 +2,7 @@
 """A stand-in for `codex app-server` (stdio JSON-RPC): just initialize, hooks/list and
 config/value/write, with trust kept in $CODEX_HOME/fake-trust.json and every write logged to
 $CODEX_HOME/writes.jsonl. FAKE_FOREIGN=1 adds a hook that is not ours; FAKE_MODE=exit quits at
-once, FAKE_MODE=stuck never trusts anything."""
+once, =stuck never trusts anything, =error refuses hooks/list, =partial lists two hooks."""
 import hashlib
 import json
 import os
@@ -57,8 +57,13 @@ for line in sys.stdin:
         continue
     if method == "initialize":
         result = {}
+    elif method == "hooks/list" and os.environ.get("FAKE_MODE") == "error":
+        print(json.dumps({"id": rid, "error": {"message": "hooks unavailable"}}), flush=True)
+        continue
     elif method == "hooks/list":
         result = listed()
+        if os.environ.get("FAKE_MODE") == "partial":
+            result["data"][0]["hooks"] = result["data"][0]["hooks"][:2]
     elif method == "config/value/write":
         with open(os.path.join(home, "writes.jsonl"), "a") as f:
             f.write(json.dumps(params) + "\n")

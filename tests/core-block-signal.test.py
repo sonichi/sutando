@@ -113,6 +113,39 @@ class TestRecord(unittest.TestCase):
         self.assertIsNone(cbs.read(self.state, SOCK, "%3"))
 
 
+class TestEdges(unittest.TestCase):
+    def test_interaction_and_decide_ignore_what_says_nothing(self):
+        self.assertIsNone(cbs.interaction("not a dict"))
+        self.assertIsNone(cbs.interaction({"hook_event_name": "Stop"}))
+        self.assertIsNone(cbs.decide(None, {"hook_event_name": "SessionStart"}, 1))
+
+    def test_a_failed_replace_leaves_no_temp_file(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(cbs.os, "replace", side_effect=OSError("ro")):
+            with self.assertRaises(OSError):
+                cbs.write(d, SOCK, "%1", 1, "clear", None, "Stop", "claude", "s")
+            self.assertEqual(list((Path(d) / cbs.SUBDIR).iterdir()), [])
+
+    def test_pane_identity_parses_tmux_and_fails_soft(self):
+        def run(out, rc=0):
+            return lambda *a, **k: mock.Mock(stdout=out, returncode=rc)
+        self.assertEqual(cbs.pane_identity(SOCK, "%1", runner=run("core\t%1\t42\n")), ("core", "%1", 42))
+        for out, rc in (("core\t%1\tx\n", 0), ("core\t%1\n", 0), ("core\t%1\t42\n", 1), ("", 0)):
+            self.assertIsNone(cbs.pane_identity(SOCK, "%1", runner=run(out, rc)), (out, rc))
+
+        def boom(*a, **k):
+            raise OSError("no tmux")
+        self.assertIsNone(cbs.pane_identity(SOCK, "%1", runner=boom))
+
+    def test_the_hook_resolves_the_workspace_state_dir_when_none_is_given(self):
+        with tempfile.TemporaryDirectory() as ws, \
+                mock.patch.dict(os.environ, {"TMUX": f"{SOCK},1,0", "TMUX_PANE": "%9"}), \
+                mock.patch.object(cbs, "pane_identity", return_value=("s", "%9", 5)), \
+                mock.patch("workspace_default.resolve_workspace", return_value=Path(ws)), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"hook_event_name": "Stop"}))):
+            cbs.main(["hook", "--runtime", "claude"])
+            self.assertEqual(cbs.read(Path(ws) / "state", SOCK, "%9")["state"], "clear")
+
+
 class TestVerdict(unittest.TestCase):
     def rec(self, state, ts, pid=7, reason=None):
         return {"schema": 1, "state": state, "reason": reason, "pane_pid": pid, "ts": ts}
@@ -133,6 +166,10 @@ class TestVerdict(unittest.TestCase):
 
     def test_a_clear_from_the_future_does_not(self):
         self.assertIsNone(cbs.verdict(self.rec("clear", 2000.0), 7, 1000.0))
+
+    def test_a_record_without_a_usable_ts_is_no_verdict(self):
+        for ts in (None, "soon"):
+            self.assertIsNone(cbs.verdict(self.rec("clear", ts), 7, 1000.0), ts)
 
     def test_a_blocked_record_stands_while_its_process_does(self):
         self.assertEqual(cbs.verdict(self.rec("blocked", 0.0, reason="question"), 7, 10 ** 6),
@@ -368,6 +405,23 @@ class TestSeedCodexTrust(unittest.TestCase):
         os.environ["FAKE_MODE"] = "stuck"
         with self.assertRaises(RuntimeError):
             self.seed()
+
+    def test_an_rpc_error_or_a_short_list_raises(self):
+        for mode, needle in (("error", "hooks unavailable"), ("partial", "listed 2 of")):
+            os.environ["FAKE_MODE"] = mode
+            with self.assertRaises(RuntimeError) as cm:
+                self.seed()
+            self.assertIn(needle, str(cm.exception))
+        self.assertEqual(self.writes(), [])
+
+    def test_close_survives_a_process_that_will_not_die(self):
+        srv = cbs._AppServer([self.codex, "app-server"], dict(os.environ, CODEX_HOME=self.home), self.tmp.name, 5)
+        real_kill = srv.p.kill
+        with mock.patch.object(srv.p, "kill", side_effect=OSError("gone")), \
+                mock.patch.object(srv.p, "wait", side_effect=OSError("gone")):
+            srv.close()
+        real_kill()
+        srv.p.wait(timeout=5)
 
     def test_the_cli_prints_args_only_once_trusted(self):
         out = io.StringIO()
