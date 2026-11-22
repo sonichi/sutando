@@ -4,6 +4,8 @@
  * monotonic id, socket reuse and durations, and never a query string or header.
  */
 import { test, afterEach } from 'node:test';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import assert from 'node:assert';
 import { createServer as createHttpServer, request as httpRequest, Agent, type Server, type IncomingMessage, type ServerResponse, type RequestOptions } from 'node:http';
 import type { request as httpsRequest } from 'node:https';
@@ -48,7 +50,7 @@ async function startProxy(upstreamPort: number, lines: string[], extra: Partial<
 		recordRejection: () => {},
 		recordCredentialState: () => {},
 		idleTimeoutMs: 5000,
-		logTiming: (line) => { lines.push(line); },
+		logDiag: (line) => { if (line.includes(' timing ')) lines.push(line); },
 		...extra,
 	}));
 }
@@ -110,6 +112,12 @@ test('a completed request logs one ok line: method, path without query, status, 
 	}
 	assert.equal(field(first, 'reused'), 'false');
 	assert.equal(field(second, 'reused'), 'true');
+	// A new socket stamps its TCP connect; plain HTTP has no TLS step; a reused socket has neither.
+	assert.match(field(first, 'connect_ms'), /^\d+$/);
+	assert.equal(field(first, 'tls_ms'), '-');
+	assert.equal(field(second, 'connect_ms'), '-');
+	assert.equal(field(second, 'tls_ms'), '-');
+	assert.equal(field(first, 'inflight'), '0');
 	assert.equal(Number(field(second, 'id')), Number(field(first, 'id')) + 1);
 });
 
@@ -192,5 +200,54 @@ test('client closing mid-stream logs client_closed_during_response with the upst
 
 test('formatTimingLine drops the query string and renders missing durations as -', () => {
 	const l = formatTimingLine({ id: 7, method: 'GET', path: '/v1/models?key=secret', attempt: 0, totalMs: 12.6, status: 0, outcome: 'client_closed_before_response' });
-	assert.equal(l, '[Proxy] id=7 timing method=GET path=/v1/models attempt=0 dispatch_ms=- socket_ms=- reused=- ttfb_ms=- total_ms=13 status=- outcome=client_closed_before_response');
+	assert.equal(l, '[Proxy] id=7 timing method=GET path=/v1/models attempt=0 dispatch_ms=- socket_ms=- reused=- connect_ms=- tls_ms=- inflight=- ttfb_ms=- total_ms=13 status=- outcome=client_closed_before_response');
+});
+
+test('inflight counts the other proxied requests open when a request was dispatched', async () => {
+	const lines: string[] = [];
+	let arrived = 0;
+	const up = await startUpstream((_req, res) => { arrived += 1; held.push(res); });
+	const agent = new Agent({ keepAlive: true, maxSockets: 10 });
+	agents.push(agent);
+	const request = ((opts: RequestOptions, cb: (r: IncomingMessage) => void) =>
+		httpRequest({ ...opts, agent }, cb)) as unknown as typeof httpsRequest;
+	const port = await startProxy(up, lines, { request });
+	const pending = [call(port), call(port)];
+	await waitFor(() => arrived === 2);
+	const third = call(port);
+	await waitFor(() => arrived === 3);
+	for (const r of held) { r.writeHead(200); r.end('{}'); }
+	await Promise.all([...pending, third]);
+	await waitFor(() => lines.length === 3);
+	const last = lines.find((l) => field(l, 'id') === String(Math.max(...lines.map((x) => Number(field(x, 'id'))))));
+	assert.equal(field(last as string, 'inflight'), '2');
+});
+
+function blockLoop(ms: number): void {
+	const end = performance.now() + ms;
+	while (performance.now() < end) { /* busy */ }
+}
+
+test('the loop-lag monitor logs only a late tick, and stops once the server closes', async () => {
+	const lag: string[] = [];
+	const s = createProxyServer({ logDiag: (l) => { if (l.includes('loop_lag_ms')) lag.push(l); }, loopLagIntervalMs: 50, loopLagThresholdMs: 100 });
+	await new Promise((r) => setTimeout(r, 200));
+	assert.equal(lag.length, 0, 'an on-time tick logs nothing');
+	blockLoop(300);
+	await waitFor(() => lag.length === 1);
+	assert.match(lag[0], /^\[Proxy\] loop_lag_ms=\d+$/);
+	assert.ok(Number(lag[0].split('=')[1]) > 100);
+	s.close();
+	blockLoop(300);
+	await new Promise((r) => setTimeout(r, 150));
+	assert.equal(lag.length, 1, 'no tick after close');
+});
+
+test('the loop-lag timer does not keep the process alive', () => {
+	const mod = fileURLToPath(new URL('../skills/quota-tracker/scripts/credential-proxy.ts', import.meta.url));
+	const script = `import(${JSON.stringify(mod)}).then((m) => { m.createProxyServer(); console.log('created'); });`;
+	const r = spawnSync(process.execPath, [...process.execArgv.filter((a) => !a.startsWith('--test')), '--input-type=module', '-e', script], { timeout: 10_000, encoding: 'utf8' });
+	assert.equal(r.error, undefined, `child did not exit on its own: ${r.error}`);
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(r.stdout, /created/);
 });

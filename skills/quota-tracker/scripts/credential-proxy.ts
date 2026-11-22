@@ -448,6 +448,10 @@ export interface RequestTiming {
 	dispatchMs?: number;
 	socketMs?: number;
 	reused?: boolean;
+	connectMs?: number;
+	tlsMs?: number;
+	// Other proxied requests open when this one was dispatched.
+	inflight?: number;
 	ttfbMs?: number;
 	totalMs: number;
 	status: number;
@@ -460,6 +464,7 @@ export function formatTimingLine(t: RequestTiming): string {
 	const path = t.path.split('?')[0].slice(0, 200);
 	return `[Proxy] id=${t.id} timing method=${t.method} path=${path} attempt=${t.attempt}`
 		+ ` dispatch_ms=${ms(t.dispatchMs)} socket_ms=${ms(t.socketMs)} reused=${t.reused === undefined ? '-' : t.reused}`
+		+ ` connect_ms=${ms(t.connectMs)} tls_ms=${ms(t.tlsMs)} inflight=${t.inflight ?? '-'}`
 		+ ` ttfb_ms=${ms(t.ttfbMs)} total_ms=${ms(t.totalMs)} status=${t.status || '-'} outcome=${t.outcome}`;
 }
 
@@ -480,7 +485,9 @@ export interface ProxyDeps {
 	// supervised/unsupervised default without process-env/import-order
 	// tricks; production always gets the env-derived value below.
 	giveUpAfter: number;
-	logTiming: (line: string) => void;
+	logDiag: (line: string) => void;
+	loopLagIntervalMs: number;
+	loopLagThresholdMs: number;
 }
 
 export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
@@ -497,7 +504,9 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		idleTimeoutMs: UPSTREAM_IDLE_TIMEOUT_MS,
 		exitProcess: (code) => process.exit(code),
 		giveUpAfter: REFRESH_GIVE_UP_AFTER,
-		logTiming: (line) => console.log(`${ts()} ${line}`),
+		logDiag: (line) => console.log(`${ts()} ${line}`),
+		loopLagIntervalMs: 500,
+		loopLagThresholdMs: 200,
 		...overrides,
 	};
 	const upstreamPort = deps.upstreamUrl.port ? Number(deps.upstreamUrl.port) : 443;
@@ -517,6 +526,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 
 	// Monotonic per-request id, so a client-close line can be matched to its retry.
 	let lastRequestId = 0;
+	let openRequests = 0;
 
 	function runSingleFlightRefresh(service: string, cred: ClaudeOAuth): Promise<void> {
 		if (!refreshInFlight) {
@@ -595,18 +605,24 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		return null;
 	}
 
-	return createServer((req, res) => {
+	const server = createServer((req, res) => {
 		const id = ++lastRequestId;
 		const t0 = performance.now();
-		const timing = { attempt: 0, dispatchAt: NaN, socketAt: NaN, reused: undefined as boolean | undefined, ttfbAt: NaN, status: 0, logged: false };
+		openRequests += 1;
+		const timing = {
+			attempt: 0, dispatchAt: NaN, socketAt: NaN, reused: undefined as boolean | undefined,
+			connectAt: NaN, tlsAt: NaN, inflight: undefined as number | undefined, ttfbAt: NaN, status: 0, logged: false,
+		};
 		const since = (t: number) => (Number.isNaN(t) ? undefined : t - t0);
 		const logTiming = (outcome: TimingOutcome, status: number): void => {
 			if (timing.logged) return;
 			timing.logged = true;
+			openRequests -= 1;
 			try {
-				deps.logTiming(formatTimingLine({
+				deps.logDiag(formatTimingLine({
 					id, method: req.method ?? '-', path: req.url ?? '', attempt: timing.attempt,
 					dispatchMs: since(timing.dispatchAt), socketMs: since(timing.socketAt), reused: timing.reused,
+					connectMs: since(timing.connectAt), tlsMs: since(timing.tlsAt), inflight: timing.inflight,
 					ttfbMs: since(timing.ttfbAt), totalMs: performance.now() - t0, status, outcome,
 				}));
 			} catch { /* logging must never affect the request */ }
@@ -675,6 +691,9 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 				timing.dispatchAt = performance.now();
 				timing.socketAt = NaN;
 				timing.reused = undefined;
+				timing.connectAt = NaN;
+				timing.tlsAt = NaN;
+				timing.inflight = openRequests - 1;
 				timing.ttfbAt = NaN;
 				timing.status = 0;
 
@@ -760,9 +779,12 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 					},
 				);
 
-				upstream.on('socket', () => {
+				upstream.on('socket', (sock) => {
 					timing.socketAt = performance.now();
 					timing.reused = upstream.reusedSocket;
+					if (upstream.reusedSocket) return;
+					sock.once('connect', () => { if (timing.attempt === attempt) timing.connectAt = performance.now(); });
+					sock.once('secureConnect', () => { if (timing.attempt === attempt) timing.tlsAt = performance.now(); });
 				});
 
 				// 'timeout' fires on socket inactivity but does NOT auto-abort — destroy the
@@ -800,6 +822,20 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 			forward(0);
 		});
 	});
+
+	// Event-loop lag: a late tick means every request in flight stalled with it.
+	let lastTick = performance.now();
+	const lagTimer = setInterval(() => {
+		const now = performance.now();
+		const lag = now - lastTick - deps.loopLagIntervalMs;
+		lastTick = now;
+		if (lag > deps.loopLagThresholdMs) {
+			try { deps.logDiag(`[Proxy] loop_lag_ms=${Math.round(lag)}`); } catch { /* best effort */ }
+		}
+	}, deps.loopLagIntervalMs);
+	lagTimer.unref();
+	server.on('close', () => clearInterval(lagTimer));
+	return server;
 }
 
 // Back-compat sync reader (startup probe only — does not refresh).
