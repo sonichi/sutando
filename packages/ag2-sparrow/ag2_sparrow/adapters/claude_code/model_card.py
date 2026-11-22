@@ -20,7 +20,7 @@ import sys
 import time
 from pathlib import Path
 
-from ... import connect_bridge as cb, connect_common as cm, connector_cards, model_switch
+from ... import card_desk, connect_bridge as cb, connect_common as cm, connector_cards, model_switch
 from ... import claude_local_records as records
 from ...acp_host import quoted
 from .shape import LOCAL
@@ -79,8 +79,13 @@ def card_matter(root, task_id: str, cfg: dict, popen=subprocess.Popen, environ=N
     except Exception as e:  # noqa: BLE001 - a ledger that cannot take them leaves their taps refused, not a crash
         log("absorb failed:", "%s: %s" % (type(e).__name__, e))
     said: dict = {}
-    ms = switcher(root, cfg, publish=lambda result_file, body: said.update(body=body))
-    outcome = ms.card_task(path, os.path.join(root, "results", task_id + ".txt"))
+
+    def publish(result_file, body):
+        said.update(body=body)
+
+    ms = switcher(root, cfg, publish=publish)
+    # The desk routes a tap, a stale tap or the owner's /model to the card it names (card_desk, #6685).
+    outcome = card_desk.Desk(root, publish, quoted, [ms]).task(path, os.path.join(root, "results", task_id + ".txt"))
     if not outcome:
         return "", ""
     if outcome == "model-picked":
