@@ -33,50 +33,21 @@ this page and nothing else.
 is extra: if any step below fails, the greeting stands. Do not edit, retract or repeat it, and do
 not retry the page in the same turn.
 
-1. Your name, never the owner's, and never a reason to stop. Use `ag2.whoami`'s `display_name`
-   when it has one. When it is null, pass `--name auto`: the same name the greeting uses
-   (`src/agent_display_name.py`), which falls back in this order:
-   - your Matrix profile displayname from your homeserver (your s.space display name);
-   - the display name your connection recorded for you;
-   - `SUTANDO_DISPLAY_NAME`, else `AGENT_DISPLAY_NAME`;
-   - a name made from your mxid's localpart (`@blue-fox.agent:…` gives `Blue Fox`);
-   - `Sutando`.
-
-   Your mxid is `--agent-mxid`, else `$AGENT_MXID`, else the s.space channel env file's (the
-   launcher-named device file first). `publish` refuses to run without one: a page without the
-   ownership tag could never be found again.
-2. Tailor the prompts when you know the owner's work. You know it when either:
-   - the first-contact message has a line `I picked: <labels>.`, for example
-     `I picked: Founder, Product Manager.`. These are the persona labels the owner chose at
-     onboarding, or their slugs when the client had no labels; or
-   - `user_profile.md` already says what they do.
-
-   In that case write your own prompts for this owner into a temporary JSON file, one per slot:
-   `dm`, `commons`, `teamwork`, `apps`, `finale`. Write 4–5 of them.
-   - Each is first person, practical, one line, at most 200 characters, with no links or markup.
-   - Each must run on a fresh install: only the `apps` slot may assume a connected app.
-   - The onboarding guide opens each prompt as an editable private agent draft. A prompt about
-     a room should ask which room to use and leave sharing to a later confirmation.
-
-   Pass the file as `--prompts <file>`, and pass the `I picked:` payload verbatim as
-   `--roles "Founder, Product Manager."` (the whole line, `I picked:` included, works too). Do not
-   map it to slugs: the script takes labels or slugs and adds a "Picked for: Founder, Product
-   Manager" line under the heading. Without `--roles`, the saved inputs' `roles` are used (step 3).
-   Otherwise leave both out. A missing, bad or partly bad file never fails the run: each slot without a usable prompt
-   keeps the generic one.
-3. Create or refresh the page and summon the owner to it:
+1. Publish the generic editable-draft guide. Do not use the owner's profile, chosen roles,
+   the agent display name, or personalized prompts in Room Commons. The current Commons write
+   and read interfaces do not enforce an owner-only audience for this persistent HTML.
+2. Create or refresh the page and summon the owner to it:
 
    ```bash
    python3 skills/tutorial/scripts/getting_started.py publish \
-     --room '<owner DM room id>' --name '<your name or auto>' --owner '<owner mxid>'
+     --room '<owner DM room id>' --owner '<owner mxid>'
    ```
 
-   Every flag is optional when the setup app saved the inputs:
-   `<workspace>/state/onboarding/tutorial-inputs.json` holds `room` (the owner's DM), `owner`,
-   `agent_mxid` and `roles` (the picked personas), and `publish` fills whatever the command line
-   leaves out from it; `--name` defaults to `auto`. The file's `owner` and `roles` apply only when
-   publishing in its own `room`. A missing or malformed file, or a field of the wrong shape, is
-   ignored; with no `--room` and no usable saved room, the script exits 2.
+   The setup app's saved `tutorial-inputs.json` supplies routing defaults only. The agent mxid
+   is required for the ownership marker (`--agent-mxid`, saved same-room routing, or the s.space
+   connection); the publisher refuses to run without one. Legacy `--name`, `--prompts` and `--roles` options are ignored by `publish`;
+   the offline renderer is for local previews. If an interrupted write predates the privacy
+   guard, it is not replayed. The publisher does not remove old room pages or versions.
 
    Before it writes the page, `publish` uploads the screenshots' full-resolution captures to the
    room's media (see "Screenshots are Commons asset references" below) and reports it in the result's
@@ -96,7 +67,7 @@ not retry the page in the same turn.
    It prints one JSON line:
    - `action`: `created`, `updated` or `unchanged`;
    - `kind`: the page's `html-<id>`;
-   - `name`: the name it used.
+   - `name`: the generic display label.
 
    On `created` it summons the owner, so the card in the DM is the one line that
    carries the page: post no other message about it. On `updated` / `unchanged` it summons no one,
@@ -128,9 +99,8 @@ each room's entry.
   (`data-revision="tutorial.2026-10-23.1"`). **Rebuild rule:** a page is rebuilt in place when the
   engine's list revision is newer than the page's. `publish --if-newer` applies exactly that rule
   and nothing else: a complete page whose revision is current is left alone even when a rebuild
-  would differ (another name or core), a stale page is rewritten with the prompts and roles it was
-  last built with (recorded in the entry), a page from before lists had a revision counts as stale,
-  and a `pending` page is finished whatever its revision. A page someone edited since it was last
+  would differ, and a stale page is rewritten with generic content. A page from before lists had a
+  revision counts as stale; only a `pending` journal written by the generic publisher can be resumed. A page someone edited since it was last
   written (its text no longer hashes to the entry) is kept, with or without `--if-newer`, and
   whatever the revision: the result says `"action": "kept"`, stderr names the page, and the entry
   stands (a gated `unchanged` or `kept` run records nothing; a page equal to the run's own render
@@ -156,10 +126,11 @@ each room's entry.
   when it equals this run's render less the digest, or failing that when it is the room's only
   tutorial page and shaped exactly as one is written (our head, one tag, our tail); any other such
   page is kept as found. The shape rule cannot tell an edit inside the body of such a page from an
-  older render, so a pre-digest page the owner edited inside is upgraded with the rest. A write that landed on a page someone edited meanwhile is taken back the
-  way it was made, in place (the replaced page replaced back, an appended piece removed); when that
-  call cannot fit, nothing more is written and the result names the page's hash as left. Creation goes through the same journal, and a run settles any journal
-  before it reads its own name, list, prompts or media. It summons no one. `--all-rooms` refreshes every room with an entry, so an owner's page gains
+  older render, so a pre-digest page the owner edited inside is upgraded with the rest. Where safe,
+  a concurrent edit is preserved by taking back the publisher's write. A rollback must not restore
+  unverified previous HTML. If it cannot be taken back, the result names the page's hash as left.
+  A run checks its journal before reading its list or media and skips pre-guard journals.
+  `--all-rooms` refreshes every room with an entry, so an owner's page gains
   the steps a release added: one `--if-newer` run per room the marker records;
   a room whose record is already current makes no room call, a room that fails (an unexpected error
   included) leaves the others refreshed, and the result lists each room's outcome. Each page is rebuilt in the audience recorded
@@ -181,31 +152,16 @@ each room's entry.
 `getting_started.py plan --room <room>` shows what `publish` would do; `render --name <name>`
 prints the HTML. Both `render` and `publish` take `--list <path-or-url>` (below).
 
-**What the page says.** The owner DM opens on five explorable topics: Ecosystem, Multiplayer,
-Calls & Local Tools, Commons & Tasks, and Sutando Guides. In the saved setup DM only, when the
-room, owner and agent identities all match, the banner uses the agent's name and recognized role
-choices select preset examples. The renderer does not read account data or infer enabled capabilities.
-The standalone guide and room-audience overview remain generic; its examples are demonstrations,
-not live controls. **Try it step by step** opens
-the personalized checklist, a short interactive s.space tour (`scripts/tour_page.py`) rendered
-from the skill's feature list, `feature-list.json`. Each step is one line on what it is and one
-thing to try, in the list's order:
-1. Your DM: what the owner asks for themselves comes back in the DM, never in a room.
-2. Rooms.
-3. Commons.
-4. Connect other agents: Claude Duet, Dot, Grok Bot, Hermes, Muse and OpenClaw, plus Other.
-   Claude Code and Codex have separate local-agent setup paths; they are also Sutando core options.
-   Antigravity is a local option on supported desktop hosts.
-5. Teamwork.
-6. Calls & voice: the headphone icon in the room header only.
-7. Connect your apps: Settings → Apps → Connected apps.
-8. Activity & notices.
-9. Get the mobile app.
-10. Mobile: pair the phone from the account menu.
+**What the page says.** The compact DM guide opens on five explorable topics: Ecosystem,
+Multiplayer, Calls & Local Tools, Commons & Tasks, and Sutando Guides. Its nine-step checklist
+combines phone sign-in and pairing. Each suggestion opens an editable draft. A compatible Commons
+host lists the reader's own agents and asks for confirmation before sending. The published guide is
+generic even if the saved record's room, owner and agent match; the synthetic personalized variant
+is a local renderer preview only, not an authorized publication route.
 
-Every step applies to every core (a step may name a `runtime` to show on one core only; none
-does today). Every prompt says where to paste it (your DM or a room). When every step is done,
-a closing card offers one more prompt.
+The separate room/reference tour retains its feature-list checklist and demonstration prompts.
+Its ten steps cover the DM, rooms, Commons, agents, teamwork, voice, connected apps, activity,
+installation and pairing. A step with a runtime restriction is shown only on the matching core.
 
 **The feature list.** `feature-list.json` is the per-release list the tour is generated from, in
 the shape s.space's backend serves for owner setup copy (ag2space-backend#2898's `owner` block),
@@ -343,6 +299,6 @@ never argv, so Linux's 131,072-byte cap on one argument does not apply. A refres
 text fit one call; else one `replace` of the whole old page by the new page's first piece, then
 appends; a page no call can hold is left as is (exit 4).
 
-**The prompts.** Each card's Copy button puts its prompt on the clipboard; where the page's sandbox
+**Reference tour prompts.** Each reference card's Copy button puts its prompt on the clipboard; where the page's sandbox
 refuses the clipboard, the prompt is selected instead and the button says to press ⌘C. The page
-cannot type into the composer: the HTML surface has no such hook.
+does not type into the composer. The compact DM guide uses the separate host-confirmed draft flow above.

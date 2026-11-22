@@ -173,7 +173,7 @@ class AllRoomsTest(_Rooms):
         rooms = gs.load_marker(marker)
         rooms[ROOMS[0]] = {"state": "creating", "operation_id": "op-2", "target": page, "before": "",
                            "source": gs.content_hash(""), "hash": gs.content_hash(page), "done": 0, "mode": "fill",
-                           "kind": None}
+                           "kind": None, "privacy": gs.PUBLISH_PRIVACY}
         gs.save_marker(marker, rooms)
         code, out, _ = self.refresh()
         got = json.loads(out)["rooms"][ROOMS[0]]
@@ -212,6 +212,23 @@ class AllRoomsTest(_Rooms):
                          {r: ("unchanged", "marker") for r in ROOMS})
         self.assertEqual([json.loads(store(self.rooms_dir, r).read_text())["calls"] for r in ROOMS], [[], [], []])
 
+    def test_same_revision_legacy_page_is_not_rewritten_or_read_by_bulk_refresh(self):
+        self.seed(ROOMS[:1])
+        self.refresh()
+        marker = gs.marker_path(self.ws)
+        rooms = gs.load_marker(marker)
+        rooms[ROOMS[0]].pop("privacy", None)
+        rooms[ROOMS[0]]["prompts"] = {"dm": "A fictional private draft."}
+        gs.save_marker(marker, rooms)
+        path = store(self.rooms_dir, ROOMS[0])
+        db = json.loads(path.read_text())
+        db["calls"] = []
+        path.write_text(json.dumps(db))
+        code, out, _ = self.refresh()
+        self.assertEqual((code, json.loads(out)["rooms"][ROOMS[0]]["checked"]), (0, "marker"))
+        self.assertEqual(json.loads(path.read_text()), db)
+        self.assertEqual(gs.load_marker(marker), rooms)
+
     def test_each_page_is_rebuilt_in_the_audience_it_was_written_for(self):
         self.seed(ROOMS[:1], "--audience", "room")
         self.seed(ROOMS[1:2])
@@ -221,7 +238,7 @@ class AllRoomsTest(_Rooms):
                          {ROOMS[0]: "updated", ROOMS[1]: "updated"})
         self.assertEqual(self.page(ROOMS[0]), tp.render_page("Blue", "codex", "room", ME))
         self.assertIn("your agent", self.page(ROOMS[0]))
-        self.assertEqual(self.page(ROOMS[1]), tp.render_page("Blue", "codex", "dm", ME))
+        self.assertEqual(self.page(ROOMS[1]), tp.render_page(gs.GENERIC_NAME, "codex", "dm", ME))
         self.assertEqual([self.entries()[r]["audience"] for r in ROOMS[:2]], ["room", "dm"])
 
     def test_a_legacy_entry_without_an_audience_is_rewritten_only_in_the_setup_dm(self):
@@ -243,7 +260,7 @@ class AllRoomsTest(_Rooms):
         self.assertNotIn("audience", self.entries()[ROOMS[0]])
         self.assertEqual(got[ROOMS[1]]["action"], "updated")
         self.assertEqual((self.page(ROOMS[1]), self.entries()[ROOMS[1]]["audience"]),
-                         (tp.render_page("Blue", "codex", "dm", ME, native_dm=True), "dm"))
+                         (tp.render_page(gs.GENERIC_NAME, "codex", "dm", ME, native_dm=True), "dm"))
 
 
 if __name__ == "__main__":

@@ -934,16 +934,16 @@ class MainTest(unittest.TestCase):
                                  "--agent-mxid", "@kai.agent:example.test")
         self.assertEqual(code, 0)
         got = json.loads(out)
-        self.assertEqual(got.pop("upload"), NO_MEDIA_SUPPORT)
+        self.assertEqual(got.pop("upload")["reason"], "compact owner guide")
         self.assertEqual(got, {"ok": True, "action": "created", "kind": "html-p1",
-                               "summoned": True, "name": "Blue", "list": "file",
+                               "summoned": True, "name": gs.GENERIC_NAME, "list": "file",
                                "revision": gs.tour_page.FEATURES.revision, "media": []})
         with mock.patch.object(gs, "detect_core", return_value="codex"):
             code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue",
                                      "--room-commons", str(self.stub), "--agent-mxid", "@kai.agent:example.test")
         self.assertEqual((code, json.loads(out)["action"]), (0, "unchanged"))
 
-    def test_publish_with_tailored_prompts_and_roles(self):
+    def test_publish_ignores_tailored_prompts_and_roles_without_setup(self):
         f = self.tmp / "p.json"
         f.write_text(json.dumps({"dm": "Draft my weekly update."}))
         code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
@@ -951,8 +951,23 @@ class MainTest(unittest.TestCase):
                                  "--prompts", str(f), "--roles", "founder")
         self.assertEqual(code, 0)
         page = json.loads((self.tmp / "room.json").read_text())["pages"][json.loads(out)["kind"]]
-        self.assertIn("Draft my weekly update.", page)
-        self.assertIn("Picked for: Founder", page)
+        self.assertNotIn("Draft my weekly update.", page)
+        self.assertNotIn("Picked for: Founder", page)
+
+    def test_explicit_dm_without_setup_uses_generic_editable_drafts(self):
+        prompts = self.tmp / "prompts.json"
+        prompts.write_text(json.dumps({"dm": "A fictional private example."}))
+        code, out, _ = self.main("publish", "--room", self.ROOM, "--audience", "dm",
+                                 "--name", "Fictional Private Name", "--roles", "Designer",
+                                 "--prompts", str(prompts), "--room-commons", str(self.stub),
+                                 "--agent-mxid", "@kai.agent:example.test")
+        self.assertEqual(code, 0)
+        page = self.room_state()["pages"][json.loads(out)["kind"]]
+        self.assertIn('id="guide-draft"', page)
+        self.assertIn("Review &amp; send", page)
+        self.assertNotIn("Fictional Private Name", page)
+        self.assertNotIn("A fictional private example.", page)
+        self.assertNotIn("Picked for:", page)
 
     def test_publish_reason_never_carries_a_credential(self):
         def leak(*a, **k):
@@ -999,15 +1014,16 @@ class MainTest(unittest.TestCase):
         (channels / ".env").write_text("AGENT_MXID=@file.agent:example.test\n")
         self.assertEqual(gs.agent_mxid(), "@file.agent:example.test")
 
-    def test_the_identity_is_resolved_once_for_the_name_and_the_tag(self):
+    def test_the_identity_is_resolved_once_for_the_tag_without_a_profile_read(self):
         with mock.patch.object(gs, "agent_mxid", side_effect=["@alpha.agent:example.test", "@beta.agent:example.test"]) \
                 as resolver, mock.patch.object(gs, "_https_get", side_effect=OSError("offline")):
             code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "auto", "--core", "codex",
                                      "--room-commons", str(self.stub))
-        self.assertEqual((code, json.loads(out)["action"], json.loads(out)["name"]), (0, "created", "Alpha"))
+        self.assertEqual((code, json.loads(out)["action"], json.loads(out)["name"]), (0, "created", gs.GENERIC_NAME))
         self.assertEqual(resolver.call_count, 1)
         page = self.room_state()["pages"]["html-p1"]
-        self.assertIn("Your DM with Alpha", page)
+        self.assertNotIn("Your DM with Alpha", page)
+        self.assertIn("Your DM with your agent", page)
         self.assertEqual(gs.read_marker(page)[0], "@alpha.agent:example.test")
 
     def test_a_malformed_identity_is_refused_before_any_commons_call(self):
@@ -1040,7 +1056,7 @@ class MainTest(unittest.TestCase):
     def room_state(self):
         return json.loads((self.tmp / "room.json").read_text())
 
-    def test_publish_alone_takes_room_owner_and_roles_from_the_inputs_file(self):
+    def test_matching_saved_setup_cannot_authorize_personal_html(self):
         self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test",
                           "agent_mxid": "@kai.agent:example.test", "roles": "I picked: Founder, Sales."})
         with mock.patch.object(gs, "detect_core", return_value="codex"), \
@@ -1048,12 +1064,12 @@ class MainTest(unittest.TestCase):
             code, out, _ = self.main("publish", "--room-commons", str(self.stub))
         self.assertEqual(code, 0)
         result = json.loads(out)
-        self.assertEqual((result["action"], result["summoned"], result["name"]), ("created", True, "Kai"))
+        self.assertEqual((result["action"], result["summoned"], result["name"]), ("created", True, gs.GENERIC_NAME))
         self.assertIn(["summon", result["kind"], "@owner:example.test"], self.room_state()["calls"])
         page = self.room_state()["pages"][result["kind"]]
-        self.assertIn("Picked for: Founder, Sales", page)
-        self.assertIn("Get started with <span>Kai</span> in s.space", page)
-        self.assertIn("Examples for team project.", page)
+        self.assertNotIn("Picked for:", page)
+        self.assertIn("Get started with <span>your agent</span> in s.space", page)
+        self.assertNotIn("Examples for team project.", page)
 
     def test_command_line_overrides_the_inputs_file(self):
         self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test", "roles": "Founder",
@@ -1063,8 +1079,8 @@ class MainTest(unittest.TestCase):
                                  "--agent-mxid", "@kai.agent:example.test")
         self.assertEqual(code, 0)
         page = self.room_state()["pages"][json.loads(out)["kind"]]
-        self.assertIn("Picked for: Sales", page)
-        self.assertNotIn("Founder", page.split("Picked for:", 1)[1][:80])
+        self.assertNotIn("Picked for:", page)
+        self.assertNotIn("<span>Blue</span>", page)
 
     def test_mismatched_setup_identity_does_not_use_implicit_roles(self):
         self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test",
@@ -1080,20 +1096,25 @@ class MainTest(unittest.TestCase):
     def test_refresh_on_owner_mismatch_does_not_reuse_private_content(self):
         self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test",
                           "agent_mxid": "@kai.agent:example.test", "roles": "Founder"})
-        previous = self.tmp / "previous.json"
-        feature_data = json.loads(gs.LIST_PATH.read_text())
-        previous.write_text(json.dumps({**feature_data, "revision": "tutorial.2026-11-20.3"}))
-        prompts = self.tmp / "prompts.json"
-        prompts.write_text(json.dumps({"dm": "Write my fictional private agenda."}))
+        agent = "@kai.agent:example.test"
+        previous = gs.render_page("Example Test Agent", "codex", agent=agent, roles="Founder",
+                                  prompts={"dm": "Write my fictional private agenda."}, private_setup=True)
         common = ("publish", "--name", "Example Test Agent", "--core", "codex",
                   "--room-commons", str(self.stub))
-        code, out, _ = self.main(*common, "--list", str(previous), "--prompts", str(prompts))
+        code, out, _ = self.main(*common)
         self.assertEqual(code, 0)
         kind = json.loads(out)["kind"]
-        page = self.room_state()["pages"][kind]
-        self.assertIn("Example Test Agent", page)
-        self.assertIn("Picked for: Founder", page)
-        self.assertIn("Write my fictional private agenda.", page)
+        db = self.room_state()
+        db["pages"][kind] = previous
+        (self.tmp / "room.json").write_text(json.dumps(db))
+        marker = gs.marker_path(self.tmp / "ws")
+        entries = gs.load_marker(marker)
+        entry = entries[self.ROOM]
+        entry.pop("privacy", None)
+        entry.update(hash=gs.content_hash(previous), roles="Founder",
+                     prompts={"dm": "Write my fictional private agenda."})
+        gs.save_marker(marker, entries)
+        feature_data = json.loads(gs.LIST_PATH.read_text())
         newer_list = self.tmp / "newer.json"
         newer_list.write_text(json.dumps({**feature_data, "revision": "tutorial.2026-12-01.1"}))
         code, out, _ = self.main(*common, "--owner", "@other:example.test", "--if-newer",
@@ -1421,8 +1442,13 @@ class PublishTest(unittest.TestCase):
         kw.setdefault("agent", self.ME)
         return gs.publish(gs.Commons(self.stub, self.ROOM, actions=lambda: self.door), self.marker, name, **kw)
 
-    def page(self, name="Sutando", core="codex", audience="dm"):
-        return gs.render_page(name, core, audience, self.ME)
+    def page(self, core="codex", audience="dm", features=None):
+        return gs.render_page(gs.GENERIC_NAME, core, audience, self.ME, features=features)
+
+    def changed_features(self):
+        base = gs.tour_page.FEATURES
+        first = base.steps[0]._replace(what="A revised synthetic feature description.")
+        return base._replace(steps=(first, *base.steps[1:]))
 
     def ops(self):
         return [c for c in self.room()["calls"] if c[0] == "create"]
@@ -1457,17 +1483,43 @@ class PublishTest(unittest.TestCase):
 
     def test_changed_content_rewrites_the_same_page(self):
         self.publish()
-        out = self.publish(name="Kai")
+        changed = self.changed_features()
+        out = self.publish(features=changed)
         self.assertEqual(out["action"], "updated")
-        self.assertEqual(self.room()["pages"], {"html-p1": self.page("Kai")})
+        self.assertEqual(self.room()["pages"], {"html-p1": self.page(features=changed)})
+
+    def test_generic_migration_preserves_concurrent_edit_without_restoring_private_html(self):
+        self.publish()
+        before = gs.render_page("Fictional Private Name", "codex", agent=self.ME,
+                                private_setup=True, roles="Designer",
+                                prompts={"dm": "A fictional private example."})
+        db = self.room()
+        db["pages"]["html-p1"] = before
+        self.state.write_text(json.dumps(db))
+        rooms = gs.load_marker(self.marker)
+        entry = rooms[self.ROOM]
+        entry.pop("privacy")
+        entry.update(hash=gs.content_hash(before), roles="Designer",
+                     prompts={"dm": "A fictional private example."})
+        gs.save_marker(self.marker, rooms)
+        with mock.patch.dict(os.environ, {"STUB_EDIT_AFTER": "replace:1:append"}):
+            result = self.publish()
+        self.assertEqual(result["action"], "kept")
+        page = self.room()["pages"]["html-p1"]
+        self.assertTrue(page.endswith("<p>OWNER NOTES</p>"))
+        self.assertNotIn("Fictional Private Name", page)
+        self.assertNotIn("A fictional private example.", page)
+        self.assertEqual([c[0] for c in self.room()["calls"]].count("replace"), 1)
+        self.assertFalse({"prompts", "roles"} & gs.load_marker(self.marker)[self.ROOM].keys())
 
     def test_a_large_change_replaces_the_whole_page_by_its_first_piece_then_appends(self):
         self.publish()
         before = len(self.room()["calls"])
-        old, new = self.page(), self.page(name="Kai")
+        changed = self.changed_features()
+        old, new = self.page(), self.page(features=changed)
         self.assertGreater(len(old.encode()), gs.CHUNK_BYTES)
         with mock.patch.object(gs, "one_call", return_value=False):  # above the one-call budget
-            out = self.publish(name="Kai")
+            out = self.publish(features=changed)
         self.assertEqual(out["action"], "updated")
         calls = self.room()["calls"][before:]
         replaces = [c for c in calls if c[0] == "replace"]
@@ -1499,8 +1551,9 @@ class PublishTest(unittest.TestCase):
             out = self.publish(owner="@chi:ag2.space")
             self.assertEqual((out["action"], out["summoned"]), ("created", True))
             self.assertEqual(self.room()["pages"], {"html-p1": self.page()})
-            self.assertEqual(self.publish(name="Kai")["action"], "updated")  # a whole-page replace, re-run too
-            self.assertEqual(self.room()["pages"], {"html-p1": self.page("Kai")})
+            changed = self.changed_features()
+            self.assertEqual(self.publish(features=changed)["action"], "updated")
+            self.assertEqual(self.room()["pages"], {"html-p1": self.page(features=changed)})
         finally:
             os.environ.pop("STUB_REEXEC")
 
@@ -1556,12 +1609,13 @@ class PublishTest(unittest.TestCase):
         self.door.fail = "after"
         with self.assertRaises(gs.PublishError):
             self.publish(name="Old")
-        out = self.publish(name="New")  # finishes the journalled "Old" page first; "New" waits
-        self.assertEqual((out["action"], out["kind"], out["name"]), ("resumed", "html-p1", "Old"))
-        self.assertEqual(self.room()["pages"], {"html-p1": self.page("Old")})
-        out = self.publish(name="New")
+        changed = self.changed_features()
+        out = self.publish(name="New", features=changed)  # the saved generic write finishes first
+        self.assertEqual((out["action"], out["kind"], out["name"]), ("resumed", "html-p1", gs.GENERIC_NAME))
+        self.assertEqual(self.room()["pages"], {"html-p1": self.page()})
+        out = self.publish(name="New", features=changed)
         self.assertEqual((out["action"], out["kind"]), ("updated", "html-p1"))
-        self.assertEqual(self.room()["pages"], {"html-p1": self.page("New")})
+        self.assertEqual(self.room()["pages"], {"html-p1": self.page(features=changed)})
         self.assertEqual(len(self.door.ops), 1)
 
     def test_resume_without_a_listed_tagged_page_reissues_the_same_operation_id(self):
@@ -1572,10 +1626,11 @@ class PublishTest(unittest.TestCase):
         db = self.room()
         db["titles"] = {"html-p1": "Untitled page"}  # not yet listed as "Getting started"
         self.state.write_text(json.dumps(db))
-        out = self.publish(name="Other")  # content changed since the first attempt
+        changed = self.changed_features()
+        out = self.publish(features=changed)  # content changed since the first attempt
         self.assertEqual(self.door.ops, [op, op])  # the server answers the same operation id
         self.assertEqual((out["action"], out["kind"]), ("created", "html-p1"))
-        self.assertEqual(self.room()["pages"], {"html-p1": self.page("Other")})
+        self.assertEqual(self.room()["pages"], {"html-p1": self.page(features=changed)})
 
     def test_actions_client_errors_are_redacted(self):
         commons = gs.Commons(self.stub, self.ROOM, env={"AG2_REMOTE_TOKEN": "https://relay.x.test/r|abcdefghijkl"},

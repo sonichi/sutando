@@ -19,11 +19,18 @@ confirmation. Only confirming in the host sends the message. The guide never con
 starts calls, schedules work, or submits drafts by itself. The App Store link and QR are real
 install affordances. Phone sign-in and pairing are one checklist step.
 
-The banner and examples use the agent display name and recognized onboarding roles only when the
-published room, owner and agent match the saved setup record. Validated explicit draft overrides
-stay in that destination; a mismatch renders a generic guide without recalled roles or prompts.
-No account connection, room-history or file lookup is added. A client without the supported
-bridge can read the guide, but does not show inoperative messaging buttons.
+Commons publication is always generic: it does not embed a display name, onboarding roles or
+tailored prompts, even when all saved setup fields match. A room roster read alone cannot bind
+Commons creation or edits to a private audience, or prevent someone who joins later from reading
+persistent HTML. Keep synthetic personalization previews local until there is a server-enforced
+owner-only surface that also covers later reads. A client without the draft bridge can read the
+guide, but does not show inoperative messaging buttons.
+
+The publisher never replays an in-flight journal written before this privacy guard, and never
+rolls a page back to unverified previous HTML. The skipped journal and any remote page are left
+in place for authorized review. A normal publish can replace an unedited publisher-owned completed
+page with the generic guide; it cannot revoke content already seen, copied, cached or kept in
+history. Owner-edited or otherwise unverified pages are not purged.
 
 The onboarding checklist uses per-viewer Commons progress when the runtime provides it, otherwise
 local storage or memory. Completion from the former install or pairing row counts for the
@@ -50,8 +57,8 @@ wraps on narrow screens, and reduced-motion and dark-mode preferences are respec
 - **Revisions and `--if-newer`.** The list carries a revision (`tutorial.YYYY-MM-DD.N`), which the
   page records in its ownership tag. `publish --all-rooms --if-newer` runs once per room with an entry, in the
   audience recorded for it, never creates a page (a deleted one stays deleted), and rebuilds a
-  page only when the list's revision is newer than the page's, with the prompts and roles the page
-  was last built with; a current page is left alone even when a rebuild would differ.
+  page only when the list's revision is newer than the page's. A same-revision skip writes nothing:
+  it neither replays a journal nor retroactively removes older content.
 - **Owner edits are kept.** Before any rewrite the page's text is compared with the hash recorded
   when the skill last wrote it. A page edited since is kept, with or without `--if-newer` and
   whatever the revision (`"action": "kept"`, one stderr line), and its entry is not touched, so a
@@ -62,7 +69,7 @@ wraps on narrow screens, and reduced-motion and dark-mode preferences are respec
   the entry before. The next run settles the journal before rendering anything of its own. A page
   in a state the rewrite itself leaves is finished to the target byte for byte, checked against the
   recorded hash, and the run stops there (`"action": "resumed"`, reporting the journalled name and
-  revision; its own request, `--summon` and new prompts or media included, waits for the next
+  revision; its own request, `--summon` and new media included, waits for the next
   run). A page still as before means the rewrite never ran and the run proceeds as usual. Any other
   page is someone's edit: it is kept, and the entry from before the rewrite stands whole, so the
   next run keeps it too. A rewrite that fits one room-commons call (1 MiB a text; arguments travel
@@ -82,9 +89,8 @@ wraps on narrow screens, and reduced-motion and dark-mode preferences are respec
   exactly as one is written; otherwise it is kept. Creation runs through the same journal as a
   rewrite. A write taken back is undone in place, the way it was made; an undo that cannot fit a
   call writes nothing, and the result names the page as left.
-- **Recovery comes first.** A run settles any journal in the room before it resolves its name,
-  fetches or opens a list, or opens prompts or media; the identity is resolved and checked once and
-  used for the name, the tag and the journal alike.
+- **Recovery comes first.** A run checks the journal before it loads
+  a list or media; the identity is resolved and checked once for the tag and journal.
 - **Identity.** `publish` needs the agent's mxid (`--agent-mxid`, `$AGENT_MXID` or the s.space
   channel env file), resolved and checked once (`@localpart:server`, whitespace trimmed) before any
   Room Commons call, and refuses to run without one: the page's ownership tag is how a later run

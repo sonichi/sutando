@@ -25,6 +25,7 @@ import os
 import re
 import stat
 import string
+import unicodedata
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -165,10 +166,12 @@ HERO = (
 
 
 def clean_name(name: str) -> str:
-    """The agent's display name, single-spaced; refuses an empty or over-long one."""
-    cleaned = " ".join((name or "").split())
+    """The preview display name, single-spaced and stripped of invisible format controls."""
+    visible = "".join(c for c in (name or "") if c.isspace() or (
+        unicodedata.category(c) not in {"Cc", "Cf", "Cs"} and c not in "\u034f\u115f\u1160\u3164\uffa0"))
+    cleaned = " ".join(visible.split())
     if not cleaned or len(cleaned) > NAME_MAX:
-        raise ValueError(f"the agent's name must be 1-{NAME_MAX} characters, got {name!r}")
+        raise ValueError(f"the agent's name must be 1-{NAME_MAX} characters after removing format controls")
     return cleaned
 
 
@@ -874,7 +877,7 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
     prompts (`clean_prompts`), the owner's onboarding roles, the feature list (the skill's own by
     default) and the room's media map (`clean_media`; an asset it does not map is inlined). In a
     room other than the owner's DM the agent is "your agent". The overview uses saved setup
-    context only when the publisher verified the setup room, owner and agent."""
+    context only in a local preview; Commons publication uses generic content."""
     features = features or FEATURES
     prompts = clean_prompts(prompts, prompt_slots(features))
     media = clean_media(media, features)

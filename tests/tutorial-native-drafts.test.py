@@ -8,10 +8,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent.parent / "skills" / "tutorial" / "scripts"
 sys.path.insert(0, str(SCRIPT))
+import getting_started as gs
 import tour_page as tour
 
 
@@ -21,7 +23,7 @@ class NativeGuideTest(unittest.TestCase):
                                      agent="@example.agent:example.test", private_setup=True,
                                      prompts={"dm": "Plan my next review & reserve discussion time."})
 
-    def test_verified_private_setup_and_safe_fallbacks(self):
+    def test_fictional_local_preview_and_safe_fallbacks(self):
         self.assertIn("<span>Example &amp; Co</span>", self.page)
         self.assertIn("Picked for: Designer", self.page)
         self.assertIn("Plan my next review &amp; reserve discussion time.", self.page)
@@ -39,6 +41,28 @@ class NativeGuideTest(unittest.TestCase):
             self.assertNotIn("Example &amp; Co", page)
             self.assertNotIn("Designer", page)
             self.assertNotIn("Private example.", page)
+
+    def test_local_preview_strips_invisible_controls_but_keeps_visible_unicode(self):
+        page = tour.render_page("Zoë\u202e\u200b 大\u2066地 & Co", private_setup=True)
+        self.assertIn("<span>Zoë 大地 &amp; Co</span>", page)
+        for invisible in ("\u202e", "\u200b", "\u2066"):
+            self.assertNotIn(invisible, page)
+
+    def test_pre_fix_journals_cannot_replay_or_summon(self):
+        with tempfile.TemporaryDirectory() as work:
+            marker = gs.marker_path(Path(work))
+            room = "!example:example.test"
+            commons = mock.Mock(spec=gs.Commons, room=room)
+            for state in ("creating", "pending", "updating"):
+                with self.subTest(state=state):
+                    old = {"state": state, "kind": "html-example", "operation_id": "example-op",
+                           "target": self.page, "before": "", "hash": gs.content_hash(self.page)}
+                    gs.save_marker(marker, {room: old})
+                    for result in (gs.recover(commons, marker), gs.publish(commons, marker, "Example Agent")):
+                        self.assertEqual((result["action"], result["summoned"]), ("skipped", False))
+                        self.assertIn("not replayed", result["reason"])
+                    self.assertEqual(commons.mock_calls, [])
+                    self.assertEqual(gs.load_marker(marker)[room], old)
 
     def test_keeps_one_mobile_step_and_original_app_store_qr(self):
         self.assertEqual(re.findall(r'type="checkbox" value="([a-z]+)"', self.page),
