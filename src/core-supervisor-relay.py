@@ -126,14 +126,18 @@ def _is_refused_limit(signal: dict) -> bool:
 _RESET_AT = re.compile(r"resets?\s+(?:at\s+)?((?:[A-Z][a-z]{2}\s+\d{1,2}\s+at\s+)?\d{1,2}(?::\d{2})?\s*[ap]m)", re.I)
 
 
+# The core's own card carries these buttons (hitl.recovery); the notice names them, not commands.
+_CARD_WHERE = "on its card in your s.space DM"
+
+
 def _limit_remedy(signal: dict) -> str:
-    """A usage-limit screen resumes by itself; /login cannot clear it."""
+    """A usage-limit screen resumes by itself; a sign-in cannot clear it."""
     m = _RESET_AT.search(signal.get("prompt") or "")
     when = f"at {m.group(1)}" if m else "when the limit window resets"
-    return (f" — the core hit its Claude usage limit, not a login problem; it resumes"
-            f" on its own {when}. Nothing to do unless you want it sooner: at the"
-            " core's terminal, /usage-credits spends credits now, signing in under a"
-            " different subscription starts a fresh allowance, and Esc stops the wait.")
+    return (f" — the core hit its usage limit, not a login problem; it resumes"
+            f" on its own {when}. Nothing to do unless you want it sooner: the buttons"
+            f" {_CARD_WHERE} switch it to another model or runtime, or restart it; signing"
+            " in under a different subscription for a fresh allowance also lifts it.")
 
 
 #: A record older than this is a core that stopped beating; the socket it names
@@ -212,13 +216,13 @@ def compose_message(signal: dict, surface: str = "") -> str:
         return (f"ℹ️ Fable weekly limit reached — {who} had a turn refused, so its monitor typed"
                 " `/model opus`, and types `continue` once the pane is idle with an empty composer."
                 " Whether the switch took is not checked: if its terminal still shows the Fable"
-                " refusal, it did not. /model there picks a model; /usage-credits keeps Fable on credits.")
+                " refusal, it did not. Agent Settings, Runtime, Model in the s.space app picks a model.")
     if aa and signal.get("state") not in HARD_ESCALATE:
         return ("ℹ️ Fable weekly limit reached — the core pressed Enter on the focused"
                 " \"Switch to <fallback> and continue\" of Claude Code's limit dialog, which"
                 " should leave it on the fallback model (Opus unless your model policy says"
                 " otherwise) for this session. Nothing to do unless the terminal shows"
-                " otherwise; /model there changes it, /usage-credits keeps Fable on credits.")
+                " otherwise; Agent Settings, Runtime, Model in the s.space app changes it.")
     detail = signal.get("detail") or signal.get("state") or "core needs attention"
     kind = signal.get("kind")
     prompt = (signal.get("prompt") or "").strip()
@@ -236,35 +240,30 @@ def compose_message(signal: dict, surface: str = "") -> str:
     if kind and kind not in detail:
         parts.append(f"({kind})")
     msg = " ".join(parts)
-    if excerpt:
+    limited = kind in ("session-limit", "usage-limit") or _is_refused_limit(signal)
+    if excerpt and not limited:
         # The remedy is the actionable half, so it keeps its length; the prompt
-        # echo is what gives way to stay inside the message-length bound.
+        # echo is what gives way to stay inside the message-length bound. A limit's
+        # screen is not echoed: the CLI's own words there name a purchase.
         msg += f": {excerpt[:110]}"
     if kind == "turn-rejected":
         msg += (" — the core sits at its idle prompt but refuses every turn it is sent; each"
                 " ends in that line, so nothing queued for it runs")
-    if kind in ("session-limit", "usage-limit") or _is_refused_limit(signal):
+    if limited:
         msg += _limit_remedy(signal)
     elif signal.get("kind") == "fable-limit-unfocused":
         msg += (" — Claude Code's Fable weekly-limit dialog is up but the focused option is"
                 " not \"Switch to <fallback> and continue\", so the core will not press Enter"
-                " (that could spend credits). Pick the switch at the core's terminal, or"
-                " /usage-credits to stay on Fable.")
+                f" (that could spend credits). Tap Restart core {_CARD_WHERE}, or pick the"
+                " switch in the Runtime panel.")
     elif signal.get("state") == "signal-unreadable":
         host = _core_host_label() or "the host"
         msg += (f" — check the core on {host}; restarting the engine rewrites the file."
                 " If the core looks fine, no action is needed.")
     elif _is_login_class(signal):
         host = _core_host_label() or "the host"
-        try:
-            be = _derive_backend()
-        except Exception:
-            be = None
-        where = (f"`tmux -S {be['socket']} attach -t {be.get('session') or _DEFAULT_TMUX_SESSION}`"
-                 if be else "the Runtime panel")
-        msg += (f" — needs GUI /login on {host}: run /login in the core terminal ({where})."
-                " If the credential proxy still refuses, see sonichi#4326."
-                " A chat reply can't resolve this.")
+        msg += (f" — the core needs to sign in again: tap Sign in {_CARD_WHERE}; the sign-in"
+                f" finishes in the s.space app on {host}. A chat reply can't resolve this.")
     else:
         host = _core_host_label() or "the host"
         # Guard at the CALL SITE too: this message is the owner's only channel
@@ -283,6 +282,9 @@ def compose_message(signal: dict, surface: str = "") -> str:
             # and the terminal the second; a card is named only when one is really there.
             msg += (f" — tap an option on the choice card in our DM (it answers for you), or answer it"
                     f" {where}. A typed chat reply can't answer it.")
+        elif _CARD_SURFACE.search(surface or ""):
+            msg += (f" — tap Restart core {_CARD_WHERE} to start it fresh, or answer it {where}."
+                    " A chat reply can't answer it.")
         else:
             msg += f" — answer it {where}. A chat reply can't answer it."
     return msg
@@ -317,10 +319,13 @@ ALERT_FIELD = "space.ag2.agent_alert"
 
 def alert_content(signal: dict) -> dict:
     """The structured tag a client groups this agent's alerts by; the relay never announces
-    a clear, so the tag names only the agent and what it is stuck on."""
-    return {ALERT_FIELD: {"agent": f"core@{_core_host_label()}",
-                          "state": str(signal.get("state") or ""),
-                          "kind": str(signal.get("kind") or "")}}
+    a clear, so the tag names only the agent and what it is stuck on. `has_non_purchase_actions`:
+    the core's card for a hard block carries a way out that is not a purchase (Restart core,
+    Sign in, a model switch), so a client that must hide purchases can still show the card."""
+    state = str(signal.get("state") or "")
+    return {ALERT_FIELD: {"agent": f"core@{_core_host_label()}", "state": state,
+                          "kind": str(signal.get("kind") or ""),
+                          "has_non_purchase_actions": state in ("blocked-human", "logged-out")}}
 
 
 def _channel_notify(message: str, source: str, channel: str,

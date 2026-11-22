@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
+from . import recovery
 from .schema import Action, HumanRequirement
 
 SOURCE = "tui"
@@ -83,8 +84,25 @@ def limit_card_holds(req: HumanRequirement, pane: Optional[str], runtime: Option
     return limit_standing(pane, runtime, outrun)
 
 
-def limit_unblock(session: Optional[str] = None, runtime: Optional[str] = None) -> str:
-    """How the owner lifts a usage limit, for the card body; the steps are the runtime's own."""
+def limit_unblock(session: Optional[str] = None, runtime: Optional[str] = None,
+                  controls: Optional[Sequence[str]] = None, menu: bool = False) -> str:
+    """How the owner lifts a usage limit, for the card body; the steps are the runtime's own.
+    `controls`: the recovery ids the card carries, so the copy names those buttons and never a
+    command or a purchase (the purchase is its own tagged button). `menu`: wait choices shown."""
+    if controls:
+        verbs = {(recovery.parse(a) or ("", None))[0] for a in controls}
+        parts = ["It continues when the limit resets."]
+        if menu:
+            parts.append("Pick how to wait below.")
+        if recovery.SWITCH_MODEL in verbs or recovery.SWITCH_RUNTIME in verbs:
+            parts.append("To keep working now, tap a model or runtime below that has usage left.")
+        if recovery.RETRY_NOW in verbs:
+            parts.append("Retry now sends the refused message again.")
+        if recovery.ADD_ACCOUNT in verbs:
+            parts.append("Another account with usage left also lifts it.")
+        if recovery.RESTART_CORE in verbs:
+            parts.append("Restart core starts it fresh.")
+        return " ".join(parts)
     where = f"open its terminal (tmux session {session})" if session else "open its terminal"
     if runtime == "codex":
         return (f"It continues when the limit resets. To unblock it sooner, {where} and run "
@@ -94,11 +112,15 @@ def limit_unblock(session: Optional[str] = None, runtime: Optional[str] = None) 
             "or /model to switch to a model with usage left.")
 
 
-def sign_in_copy(runtime: Optional[str] = None) -> Tuple[str, str, str]:
-    """(title, message, button label) for a signed-out seat, in its own runtime's words."""
+def sign_in_copy(runtime: Optional[str] = None, core: bool = False) -> Tuple[str, str, str]:
+    """(title, message, button label) for a signed-out seat, in its own runtime's words.
+    `core`: the core's own card, whose copy names its button, never a terminal command."""
     if runtime in (None, "claude"):
         return ("Claude needs you to sign in again",
                 "Your Claude session has expired. Sign in again to continue.", "Sign in to Claude")
+    if runtime == "codex" and core:
+        return ("Codex needs you to sign in again",
+                "Your Codex session has expired. Tap Sign in to Codex to continue.", "Sign in to Codex")
     if runtime == "codex":
         return ("Codex needs you to sign in again",
                 "Your Codex session has expired. Run `codex login` in its terminal to continue.",
@@ -162,14 +184,43 @@ def _open_terminal() -> Action:
     return Action(id="open_terminal", kind="open_terminal", label="Open terminal")
 
 
+def recovery_action(aid: str) -> Action:
+    return Action(id=aid, kind=recovery.kind_of(aid), label=recovery.label(aid))
+
+
+# The limit menu's choices that only wait: one tap never spends, switches or signs anything in.
+_SAFE_WAITS = ((re.compile(r"^\s*stop and wait for (?:the )?limit to reset\b", re.I), lambda m: "Wait for reset"),
+               (re.compile(r"\bcontinue automatically at (.+?)\s*$", re.I),
+                lambda m: f"Continue automatically at {m.group(1)}"))
+_SPEND = re.compile(r"fund|credit|pay|purchase|upgrade|buy|plan", re.I)
+
+
+def safe_limit_options(options: Sequence[str]) -> List[Tuple[int, str]]:
+    """(index, button label) for each limit-menu option that only waits."""
+    out = []
+    for i, option in enumerate(options):
+        if _SPEND.search(option):
+            continue
+        for rx, name in _SAFE_WAITS:
+            m = rx.search(option)
+            if m:
+                out.append((i, name(m)))
+                break
+    return out
+
+
 def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
                     session: str, detail: str, fallback_message: str,
                     runtime: Optional[str] = None,
-                    episode: Optional[str] = None) -> HumanRequirement:
+                    episode: Optional[str] = None,
+                    controls: Optional[Sequence[str]] = None) -> HumanRequirement:
     """The requirement a gate deserves; unparseable or non-semantic gates keep the
-    blocked card with no button, so a key is never guessed. A session with no stamped
+    blocked card with no keystroke button, so a key is never guessed. A session with no stamped
     runtime predates the stamp and ran Claude, so `runtime` falls back to "claude".
-    `episode` LIMIT_EPISODE keys the card on the seat, not the screen, and announces it once."""
+    `episode` LIMIT_EPISODE keys the card on the seat, not the screen, and announces it once.
+    `controls`: recovery action ids (hitl.recovery) a blocked card offers instead of a guessed
+    keystroke; the caller picks them for the core or the seat. None keeps the card as it was.
+    A limit menu also offers its wait-only choices as keystrokes (safe_limit_options)."""
     options, caret = parse_options(prompt)
     subject: Dict[str, object] = {
         "session": session,
@@ -188,7 +239,7 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
         pass  # keeps the blocked card: never a one-click answer on a trust/spend gate or a limit
     elif gate == "login" or state == "logged-out":
         kind = "auth"
-        title, message, label = sign_in_copy(runtime)
+        title, message, label = sign_in_copy(runtime, core=controls is not None)
         actions = [Action(id="authenticate", kind="authenticate", label=label)]
     elif gate == "press-enter":
         kind, title = "confirmation", "Agent needs your confirmation"
@@ -210,6 +261,13 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
             option_for_action = {f"opt{i + 1}": i for i in range(len(options))}
             actions = [Action(id=f"opt{i + 1}", kind="select", label=o) for i, o in enumerate(options)]
 
+    if episode == LIMIT_EPISODE and controls is not None and options and caret is not None:
+        for i, label in safe_limit_options(options):
+            option_for_action[f"opt{i + 1}"] = i
+            actions.append(Action(id=f"opt{i + 1}", kind="select", label=label))
+    if kind == FALLBACK_KIND and controls:
+        actions += [recovery_action(aid) for aid in controls]
+        subject["recovery"] = True
     subject["option_for_action"] = option_for_action
     guard = guard_for(session, prompt, state)
     if episode == LIMIT_EPISODE:
@@ -229,7 +287,11 @@ def keys_for(req: HumanRequirement, current_prompt: Optional[str],
     """The keystrokes that realise `req.chosen_action` against the dialog on screen
     NOW, or None when the screen no longer shows the dialog the human clicked on."""
     subject = req.subject or {}
-    if guard_for(str(subject.get("session") or ""), current_prompt, current_state) != req.guard:
+    if limit_card(req):
+        # A limit card is keyed on its seat, not its screen: the same menu must still be up.
+        if parse_options(current_prompt)[0] != list(subject.get("options") or []):
+            return None
+    elif guard_for(str(subject.get("session") or ""), current_prompt, current_state) != req.guard:
         return None
     action = req.chosen_action
     if action == "continue":

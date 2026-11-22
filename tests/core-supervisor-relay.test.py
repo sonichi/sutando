@@ -51,7 +51,7 @@ _LIMIT = {"state": "blocked-human", "detail": "awaiting user: session-limit",
                     "/usage-credits to finish what you're working on.\n"
                     "Continuing automatically at 12:10pm · esc to cancel",
           "kind": "session-limit"}
-_LOGGED_OUT = {"state": "logged-out", "detail": "core not authenticated (needs /login)",
+_LOGGED_OUT = {"state": "logged-out", "detail": "core not authenticated (needs a sign-in)",
                "prompt": None, "kind": None}
 # The monitor's refused-turn signal (#4015): the core sits at its idle prompt and every turn
 # it is sent ends in this line. The prompt IS the line, so the remedy is chosen from it.
@@ -250,16 +250,18 @@ class TestComposeMessage(unittest.TestCase):
         self.assertIn("not authenticated", m)
         self.assertTrue(m.endswith("resolve this."))
 
-    # Login-class states (sonichi#2397): the remedy is a GUI /login on the host —
-    # "reply here or open the app" prescribes actions that cannot clear them.
-    def test_logged_out_names_gui_login_remedy(self):
+    # Login-class states (sonichi#2397): the remedy is a sign-in on the host, started from the
+    # card's Sign in button — never a terminal command, never "reply here or open the app".
+    def test_logged_out_names_the_sign_in_button(self):
         m = compose_message(_LOGGED_OUT)
-        self.assertIn("GUI /login", m)
+        self.assertIn("tap Sign in on its card", m)
+        self.assertNotIn("/login", m)
         self.assertNotIn("reply here or open the app", m)
 
-    def test_login_prompt_names_gui_login_remedy(self):
+    def test_login_prompt_names_the_sign_in_button(self):
         m = compose_message(_LOGIN)
-        self.assertIn("GUI /login", m)
+        self.assertIn("tap Sign in on its card", m)
+        self.assertNotIn("run /login", m)
         self.assertNotIn("reply here or open the app", m)
 
     def test_session_limit_escalates(self):
@@ -268,7 +270,8 @@ class TestComposeMessage(unittest.TestCase):
     def test_session_limit_names_the_reset_time_not_login(self):
         m = compose_message(_LIMIT)
         self.assertIn("resumes on its own at 12:10pm", m)
-        self.assertIn("/usage-credits", m)
+        self.assertIn("switch it to another model or runtime", m)
+        self.assertNotIn("/usage-credits", m)
         # The owner named this third route (2026-09-02): the limit is per
         # subscription, so signing in under another one is often the fastest.
         self.assertIn("different subscription", m)
@@ -296,11 +299,11 @@ class TestComposeMessage(unittest.TestCase):
     def test_turn_rejected_says_every_turn_is_refused_and_names_the_line(self):
         m = compose_message(_REFUSED)
         self.assertIn("refuses every turn", m)
-        self.assertIn("out of usage credits", m)
-        # A credit line gets the limit remedy, never the login one.
-        self.assertIn("/usage-credits", m)
+        # A credit line gets the limit remedy, never the login one, and its own words, which
+        # name a purchase, are not echoed (a client that must hide purchases shows the rest).
+        self.assertNotIn("credit", m)
         self.assertIn("not a login problem", m)
-        self.assertNotIn("GUI /login", m)
+        self.assertNotIn("tap Sign in", m)
         self.assertNotIn("restart.sh", m)
 
     def test_turn_rejected_login_line_names_gui_login_remedy(self):
@@ -308,7 +311,7 @@ class TestComposeMessage(unittest.TestCase):
         m = compose_message(sig)
         self.assertIn("refuses every turn", m)
         self.assertIn("OAuth access token has expired", m)
-        self.assertIn("GUI /login", m)
+        self.assertIn("tap Sign in on its card", m)
         self.assertNotIn("usage limit", m)
 
     def test_turn_rejected_unknown_line_falls_back_to_the_terminal(self):
@@ -563,6 +566,8 @@ class TestRunCycleAndCli(unittest.TestCase):
         tag = calls[0][3]["extra"][_mod.ALERT_FIELD]
         self.assertEqual(tag["agent"], f"core@{_mod._core_host_label()}")
         self.assertEqual(tag["state"], _LOGIN.get("state"))
+        # A client that hides purchases (iOS) still shows a card that has another way out.
+        self.assertIs(tag["has_non_purchase_actions"], True)
 
     def test_a_failed_channel_send_falls_back_to_macos(self):
         self.assertEqual([c[0] for c in self._dispatch(channel_ok=False)], ["chan", "macos"])

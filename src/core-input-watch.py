@@ -399,7 +399,7 @@ def refused_turn(pane: str):
 # runtime-health health string → supervisor state, for the non-gate branches.
 _BASE_TO_STATE = {
     "offline": ("crashed", "core process/session not found"),
-    "needs_login": ("logged-out", "core not authenticated (needs /login)"),
+    "needs_login": ("logged-out", "core not authenticated (needs a sign-in)"),
     "idle": ("idle-ready", "ready for a task"),
     "working": ("running", "actively processing"),
     # Queued tasks held by the pane (a draft, an abnormal frame): visible, never a restart.
@@ -732,23 +732,31 @@ DRIVE_SETTLE_S = 15.0
 from prompt_excerpt import prompt_excerpt  # noqa: E402  (shared with core-supervisor-relay)
 
 
-def escalation_message(state, detail, kind, prompt, session=None, runtime=None):
+def escalation_message(state, detail, kind, prompt, session=None, runtime=None, controls=None):
     """The card body. The core is blocked, so this is the only thing that will
-    reach the owner until they act."""
+    reach the owner until they act. `controls`: the recovery ids the card carries, so the
+    copy names those buttons instead of a terminal; a limit's screen is then not quoted, since
+    the CLI's own text there names commands and a purchase the card offers as its own button."""
     head = ("I am blocked and cannot continue without you."
             if state == "blocked-human" else
             "I am signed out and cannot continue without you.")
     lines = [head, "", f"State: {state} — {detail}"]
     if kind and kind != "unknown":
         lines.append(f"Gate: {kind}")
-    excerpt = prompt_excerpt(prompt) if prompt else []
+    limit = is_usage_limit(kind, prompt)
+    excerpt = prompt_excerpt(prompt) if prompt and not (limit and controls) else []
     if excerpt:
         # Plain lines, not a code fence: the card renders text, and the prompt is what the owner
         # needs to read, not the pane's chrome around it.
         lines += ["", "What the terminal is showing:"] + [f"  {ln}" for ln in excerpt]
-    if is_usage_limit(kind, prompt):
-        from hitl.tui_gate import limit_unblock
-        lines += ["", limit_unblock(session, runtime)]
+    if limit:
+        from hitl.tui_gate import limit_unblock, parse_options, safe_limit_options
+        options, caret = parse_options(prompt)
+        menu = bool(controls is not None and caret is not None and safe_limit_options(options))
+        lines += ["", limit_unblock(session, runtime, controls=controls, menu=menu)]
+    elif controls and "restart_core" in controls:
+        lines += ["", "Tap Restart core to start it fresh. To answer the prompt itself, use the "
+                      "Runtime panel in the s.space app on the Mac it runs on."]
     else:
         lines += ["", "Open the Runtime panel (or the core's terminal) and answer it. "
                       "Nothing else I do can clear this one."]
@@ -785,11 +793,13 @@ def _name_seat(req, session, seat):
     return req
 
 
-def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0, runtime=None):
+def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0, runtime=None,
+             workspace=None):
     """Raise ONE requirement per episode. The Manager dedups on
     (runtime, kind, device) + guard, so the prompt IS the episode key: the same
     prompt returns the same record, a different one mints a new card. A usage
     limit is keyed on the session instead, whatever its screen shows.
+    With `workspace`, the card carries recovery buttons for its session (core or seat).
 
     Returns the requirement, or None when nothing could be raised.
     """
@@ -798,10 +808,17 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
     try:
         from hitl import tui_gate
         limit = is_usage_limit(kind, prompt)
+        controls = None
+        if workspace is not None:
+            import recovery_actions
+            controls = recovery_actions.card_controls(workspace, runtime, seat=bool(seat), kind=kind,
+                                                      prompt=prompt, limit=limit)
         req = tui_gate.requirement_for(state, kind, prompt, session, detail,
-                                       escalation_message(state, detail, kind, prompt, session, runtime),
+                                       escalation_message(state, detail, kind, prompt, session, runtime,
+                                                          controls=controls),
                                        runtime=runtime,
-                                       episode=tui_gate.LIMIT_EPISODE if limit else None)
+                                       episode=tui_gate.LIMIT_EPISODE if limit else None,
+                                       controls=controls)
         if queued:
             req.message = f"{req.message}\n\n{core_gate_notice.card_line(queued)}"
         if seat:
@@ -834,7 +851,7 @@ def card_step(pane_present, state, idle_ticks, stable, settling=False):
     return ("resolve" if idle_ticks >= max(1, int(stable)) else "hold"), idle_ticks
 
 
-def resolve_escalations(manager, session, pane=None, runtime=None):
+def resolve_escalations(manager, session, pane=None, runtime=None, workspace=None):
     """Clear THIS session's requirements once its core is no longer blocked —
     the card says answered because the core moved, not because anyone clicked.
 
@@ -843,7 +860,8 @@ def resolve_escalations(manager, session, pane=None, runtime=None):
     a turn that ran, or output after the refusal (worker_auth_state). A newer prompt, a
     spinner, an empty capture or a health verdict read off another session's status
     file is not "Sutando has continued its work". A usage-limit card clears only once
-    `tui_gate.limit_card_holds` says the limit no longer holds the pane.
+    `tui_gate.limit_card_holds` says the limit no longer holds the pane. A recovery click
+    still owed its receipt is the executor's to close (recovery_actions).
     """
     if manager is None:
         return []
@@ -860,12 +878,41 @@ def resolve_escalations(manager, session, pane=None, runtime=None):
                 continue
             if limit_card_holds(r, pane, runtime):
                 continue
+            if workspace is not None and _awaiting_recovery(workspace, r):
+                continue
             manager.resolve(r.id)   # returns blocked task ids, not a verdict
             done.append(r.id)
         return done
     except Exception as exc:  # noqa: BLE001
         print(f"hitl resolve failed: {exc}", file=_sys.stderr)
         return []
+
+
+def _awaiting_recovery(workspace, req):
+    import recovery_actions
+    return recovery_actions.awaiting_executor(workspace, req)
+
+
+def recovery_step(manager, workspace, socket, session, runtime, seat, enabled=True):
+    """Run each accepted recovery tap on this session's cards; the core's monitor also keeps the
+    paused card. Returns the keys owed once the pane is idle, or None. Never fatal."""
+    if manager is None or not enabled:
+        return None
+    try:
+        import recovery_actions
+        pending = recovery_actions.has_pending(workspace)
+        brain = recovery_actions.session_env(socket, session, "CLAUDE_CONFIG_DIR") if seat and pending else None
+        target = recovery_actions.Target(workspace, socket, session, seat=seat or None,
+                                         send_key=lambda k: send_keys(socket, session, k), brain=brain)
+        owed = []
+        recovery_actions.run_pending(manager, target, follow_ups=owed)
+        if not seat:
+            recovery_actions.hold_card_step(manager, workspace, session, runtime,
+                                            queued=core_gate_notice.queued_count(workspace) or 0)
+        return owed[-1] if owed else None
+    except Exception as exc:  # noqa: BLE001
+        print(f"recovery actions failed: {exc}", file=_sys.stderr)
+        return None
 
 
 def settle_driven(manager, session, prompt, state):
@@ -899,7 +946,7 @@ def drive_escalations(manager, session, prompt, state, send):
         return []
     acted = []
     try:
-        from hitl import tui_gate
+        from hitl import recovery, tui_gate
         from hitl.manager import POLICY_DECIDER
         from hitl.schema import STATUS_IN_PROGRESS
 
@@ -915,8 +962,8 @@ def drive_escalations(manager, session, prompt, state, send):
             subj = r.subject or {}
             if (subj.get("source") != _TUI_SOURCE or subj.get("session") != session
                     or r.status != STATUS_IN_PROGRESS or not r.chosen_action
-                    or r.decided_by == POLICY_DECIDER):
-                continue
+                    or r.decided_by == POLICY_DECIDER or recovery.is_recovery(r.chosen_action)):
+                continue  # a recovery click is no keystroke: recovery_step runs it
             keys = tui_gate.keys_for(r, prompt, state)
             if subj.get("driven_at"):
                 # Still the same dialog after the settle window: the keys did not take.
@@ -1031,6 +1078,11 @@ def main():
     state_dir = os.path.dirname(os.path.abspath(a.out))
     workspace = _Path(os.path.dirname(state_dir))
     while True:
+        # Before the capture, so this tick reads the pane a recovery action left.
+        if a.chat_escalation:
+            owed = recovery_step(hitl, workspace, a.socket, a.session, last_runtime, a.seat)
+            if owed:
+                follow_up = {"key": owed, "at": time.time()}
         # One capture, not two: deriving `pane` from `styled_pane` guarantees
         # both views describe the exact same frame (no plain/styled race).
         styled_pane = capture_styled(a.socket, a.session)
@@ -1131,13 +1183,14 @@ def main():
                 # Only the core's own seat owns tasks/; a worker's queue lives elsewhere.
                 queued = 0 if a.seat else (core_gate_notice.queued_count(workspace) or 0)
                 req = escalate(hitl, state, detail, kind, prompt, a.session, seat=a.seat or None,
-                               queued=queued, runtime=runtime)
+                               queued=queued, runtime=runtime, workspace=workspace)
                 if not a.seat:
                     notice_queued(hitl, req, workspace, state, kind)
             elif verdict == "resolve":
                 # A banner judged outrun is not standing evidence, for the card as for the state.
                 resolve_escalations(hitl, a.session,
-                                    strip_limit_banners(pane) if limit_stale and pane else pane, runtime)
+                                    strip_limit_banners(pane) if limit_stale and pane else pane, runtime,
+                                    workspace=workspace)
                 if not a.seat:
                     core_gate_notice.end_outage(workspace)
         if a.once:

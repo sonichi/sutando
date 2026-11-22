@@ -6,7 +6,9 @@ action_id, guard}. This handler runs it through the Manager's two-layer stale
 gate and, when the chosen action is a TUI keystroke, hands the request to the
 runtime driver through <workspace>/state/hitl/actions/<hitl_id>.json — the
 desktop watchdog re-validates the guard against the live screen before it
-types anything. EventConsumer handler contract (claims / offer / last_path),
+types anything. A recovery action (hitl.recovery: retry, switch model, restart)
+goes to <workspace>/state/recovery/actions/<hitl_id>.json for the host monitor
+instead. EventConsumer handler contract (claims / offer / last_path),
 chain-compatible with the bridge's HandlerChain: it claims only what it
 recognises, only the configured owner resolves, and a rejected reply changes
 nothing. No owner configured => inert, fail-closed.
@@ -26,6 +28,7 @@ try:
 except ImportError:
     from local_task_protocol import reply_action_text     # the repo's src/ on sys.path
 
+from . import recovery
 from .manager import HitlManager
 from .schema import Action, ActionReply, HumanRequirement, MalformedActionError, StaleRequirementError, STATUS_IN_PROGRESS
 
@@ -170,8 +173,14 @@ class HitlReplyHandler:
         if req is not None and getattr(req, "turn_on_action", False):
             self.last_turn = True
             note = "; a turn follows"
+        # A recovery id the card maps to a dialog option is a keystroke the monitor drives.
+        keyed = ((req.subject or {}).get("option_for_action") or {}) if req is not None else {}
         if action.kind == TUI_ACTION_KIND and self._workspace is not None and req is not None:
             note = f"; driver action {write_driver_action(self._workspace, req, action).name}"
+        elif (recovery.is_recovery(action.id) and action.kind == recovery.kind_of(action.id)
+              and action.id not in keyed and self._workspace is not None):
+            path = recovery.write_action(self._workspace, reply, actor, reply.room)
+            note = f"; recovery action {path.name}"
         self._log(f"hitl: {reply.hitl_id} -> {action.id} by {actor} (in_progress{note})")
         return claimed
 

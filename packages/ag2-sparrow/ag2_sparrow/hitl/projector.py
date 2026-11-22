@@ -76,6 +76,9 @@ _STATUS_LINES = {
 }
 # A cleared Claude login is a sign-in; "reconnect" names restoring an AG2 Space agent token.
 _KIND_STATUS_LINES = {("auth", STATUS_RESOLVED): "✓ Signed in — Sutando has continued its work."}
+# A recovery button's card closes on its receipt (hitl.recovery); the message carries the outcome.
+_RECEIPT_LINES = {"done": "✓ Done."}
+_RECEIPT_NOT_DONE = "— Not done."
 
 
 def fallback_body(req: HumanRequirement) -> str:
@@ -86,7 +89,11 @@ def fallback_body(req: HumanRequirement) -> str:
     lead = _CATEGORY_HEADS.get(category_of(req.kind),
                                _CATEGORY_HEADS[CATEGORY_BLOCKED])
     head = f"{lead} — {req.message}{where}"
-    closer = _KIND_STATUS_LINES.get((req.kind, req.status)) or _STATUS_LINES.get(req.status)
+    receipt = (req.subject or {}).get("receipt")
+    if req.terminal and isinstance(receipt, dict):
+        closer = _RECEIPT_LINES.get(receipt.get("outcome"), _RECEIPT_NOT_DONE)
+    else:
+        closer = _KIND_STATUS_LINES.get((req.kind, req.status)) or _STATUS_LINES.get(req.status)
     if closer:
         return f"{head}\n\n{closer}"
     return head
