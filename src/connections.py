@@ -1631,7 +1631,10 @@ def event_owner_lanes(task: Mapping[str, object], workspace: Optional[Path] = No
         return []
     if len(rows) < 2:
         return []
+    import local_task_protocol
     body, replied = str(task.get("task") or ""), str(task.get("reply_to_sender") or "")
+    # Only the new message's own words count: the broker's quote of the parent names its sender.
+    body = local_task_protocol.reply_action_text(body)
     # A body mention is addressed on purpose; a reply only says whose message it answers.
     named = [r for r in rows if r.get("agent_mxid") and _names_mxid(body, str(r["agent_mxid"]))]
     if not named:
