@@ -51,7 +51,7 @@ _LIMIT = {"state": "blocked-human", "detail": "awaiting user: session-limit",
                     "/usage-credits to finish what you're working on.\n"
                     "Continuing automatically at 12:10pm · esc to cancel",
           "kind": "session-limit"}
-_LOGGED_OUT = {"state": "logged-out", "detail": "core not authenticated (needs /login)",
+_LOGGED_OUT = {"state": "logged-out", "detail": "core not authenticated (needs a sign-in)",
                "prompt": None, "kind": None}
 # The monitor's refused-turn signal (#4015): the core sits at its idle prompt and every turn
 # it is sent ends in this line. The prompt IS the line, so the remedy is chosen from it.
@@ -252,17 +252,60 @@ class TestComposeMessage(unittest.TestCase):
         self.assertIn("not authenticated", m)
         self.assertTrue(m.endswith("resolve this."))
 
-    # Login-class states (sonichi#2397): the remedy is a GUI /login on the host —
-    # "reply here or open the app" prescribes actions that cannot clear them.
-    def test_logged_out_names_gui_login_remedy(self):
-        m = compose_message(_LOGGED_OUT)
-        self.assertIn("GUI /login", m)
+    # Login-class states (sonichi#2397): on s.space the remedy is the card's Sign in button, never a
+    # terminal command; a surface no card reaches names the sign-in on the host.
+    def test_logged_out_names_the_sign_in_button(self):
+        m = compose_message(_LOGGED_OUT, surface="ag2space")
+        self.assertIn("tap Sign in on its card", m)
+        self.assertNotIn("/login", m)
         self.assertNotIn("reply here or open the app", m)
 
-    def test_login_prompt_names_gui_login_remedy(self):
-        m = compose_message(_LOGIN)
-        self.assertIn("GUI /login", m)
+    def test_login_prompt_names_the_sign_in_button(self):
+        m = compose_message(_LOGIN, surface="ag2space")
+        self.assertIn("tap Sign in on its card", m)
+        self.assertNotIn("run /login", m)
         self.assertNotIn("reply here or open the app", m)
+
+    def test_a_surface_no_card_reaches_names_the_sign_in_on_the_host(self):
+        for surface in ("", "telegram", "discord", "macos"):
+            with self.subTest(surface=surface), _no_backend():
+                m = compose_message(_LOGGED_OUT, surface=surface)
+                self.assertNotIn("tap Sign in", m, "a card this surface never shows was named")
+                self.assertIn("run /login in the core terminal (the Runtime panel)", m)
+
+    # The card is named only on the surface it reaches; elsewhere the notice names the host.
+    _NO_CARD = ("", "telegram", "discord", "macos")
+    _UNFOCUSED = {"state": "blocked-human", "detail": "awaiting user: fable-limit-unfocused",
+                  "prompt": "You've reached your Fable limit\n❯ Continue with Fable 5.1",
+                  "kind": "fable-limit-unfocused"}
+    _UNKNOWN_GATE = {"state": "blocked-human", "detail": "awaiting user: unknown",
+                     "prompt": "Something the CLI asks that no classifier knows", "kind": "unknown"}
+
+    def test_the_limit_notice_names_the_card_only_on_s_space(self):
+        self.assertIn("buttons on its card in your s.space DM", compose_message(_LIMIT, surface="ag2space"))
+        for surface in self._NO_CARD:
+            with self.subTest(surface=surface):
+                m = compose_message(_LIMIT, surface=surface)
+                self.assertNotIn("its card", m)
+                self.assertIn("from the Runtime panel", m)
+                self.assertIn("switch it to another model or runtime", m)
+
+    def test_the_fable_notice_names_the_card_only_on_s_space(self):
+        self.assertIn("Tap Restart core on its card", compose_message(self._UNFOCUSED, surface="ag2space"))
+        for surface in self._NO_CARD:
+            with self.subTest(surface=surface):
+                m = compose_message(self._UNFOCUSED, surface=surface)
+                self.assertNotIn("its card", m)
+                self.assertIn("in the Runtime panel", m)
+
+    def test_the_restart_notice_names_the_card_only_on_s_space(self):
+        with _no_backend():
+            self.assertIn("tap Restart core on its card", compose_message(self._UNKNOWN_GATE, surface="ag2space"))
+            for surface in self._NO_CARD:
+                with self.subTest(surface=surface):
+                    m = compose_message(self._UNKNOWN_GATE, surface=surface)
+                    self.assertNotIn("its card", m)
+                    self.assertIn("answer it", m)
 
     def test_session_limit_escalates(self):
         self.assertTrue(should_escalate(_LIMIT, None)[0])
@@ -270,7 +313,8 @@ class TestComposeMessage(unittest.TestCase):
     def test_session_limit_names_the_reset_time_not_login(self):
         m = compose_message(_LIMIT)
         self.assertIn("resumes on its own at 12:10pm", m)
-        self.assertIn("/usage-credits", m)
+        self.assertIn("switch it to another model or runtime", m)
+        self.assertNotIn("/usage-credits", m)
         # The owner named this third route (2026-09-02): the limit is per
         # subscription, so signing in under another one is often the fastest.
         self.assertIn("different subscription", m)
@@ -298,19 +342,19 @@ class TestComposeMessage(unittest.TestCase):
     def test_turn_rejected_says_every_turn_is_refused_and_names_the_line(self):
         m = compose_message(_REFUSED)
         self.assertIn("refuses every turn", m)
-        self.assertIn("out of usage credits", m)
-        # A credit line gets the limit remedy, never the login one.
-        self.assertIn("/usage-credits", m)
+        # A credit line gets the limit remedy, never the login one, and its own words, which
+        # name a purchase, are not echoed (a client that must hide purchases shows the rest).
+        self.assertNotIn("credit", m)
         self.assertIn("not a login problem", m)
-        self.assertNotIn("GUI /login", m)
+        self.assertNotIn("tap Sign in", m)
         self.assertNotIn("restart.sh", m)
 
     def test_turn_rejected_login_line_names_gui_login_remedy(self):
         sig = dict(_REFUSED, prompt="OAuth access token has expired · Please run /login")
-        m = compose_message(sig)
+        m = compose_message(sig, surface="ag2space")
         self.assertIn("refuses every turn", m)
         self.assertIn("OAuth access token has expired", m)
-        self.assertIn("GUI /login", m)
+        self.assertIn("tap Sign in on its card", m)
         self.assertNotIn("usage limit", m)
 
     def test_turn_rejected_unknown_line_falls_back_to_the_terminal(self):
@@ -514,6 +558,8 @@ class TestRunCycleAndCli(unittest.TestCase):
         tag = calls[0][3]["extra"][_mod.ALERT_FIELD]
         self.assertEqual(tag["agent"], f"core@{_mod._core_host_label()}")
         self.assertEqual(tag["state"], _LOGIN.get("state"))
+        # A client that hides purchases (iOS) still shows a card that has another way out.
+        self.assertIs(tag["has_non_purchase_actions"], True)
 
     def test_a_failed_channel_send_falls_back_to_macos(self):
         self.assertEqual([c[0] for c in self._dispatch(channel_ok=False)], ["chan", "macos"])
