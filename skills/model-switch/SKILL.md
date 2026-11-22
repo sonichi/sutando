@@ -94,6 +94,8 @@ saves the outcome in `<workspace>/state/model-card-outcome.json` and then posts 
 could not switch to X. I'm still using Y." and one short reason for the exit code (5 unsent text in the
 input box, 8 not accepted in time, 3 the core is not running, and so on; an unknown code is "the switch
 did not finish"). A post that fails is tried again a few times inside the detached step; an outcome
-still untold is posted by the next `post` or `reply` before its own work, oldest first (`delivered` in
-their output). An outcome is told once, and no retry runs the switch again. The menu, the "switching" answer and the outcome carry one card id, and each newer
+still untold is posted by the next `post` or `reply` before its own work (`delivered` in their
+output). An outcome is told once, and no retry runs the switch again. `reply` records an attempt
+before its "switching" card; an untold outcome with a newer attempt after it is marked `superseded`
+in the record and never posted, so only the newest attempt's outcome stands for the card. The menu, the "switching" answer and the outcome carry one card id, and each newer
 one retires the older one's buttons. Output of the detached line: `<workspace>/logs/model-card.log`.

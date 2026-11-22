@@ -11,6 +11,7 @@
 - One tap is one attempt: its "switching" card is posted before its switch is started, its outcome is
   saved before it is posted, a failed post is tried again, an outcome still untold is posted first by
   the next `post` or `reply`, an outcome is told once, and no retry starts the switch again.
+- An untold outcome with a newer attempt after it is marked superseded and never posted.
 
 The Action call, the core's row and the process launch are fakes; no network, no tmux, no real switch.
 
@@ -82,6 +83,7 @@ class Base(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.ws = Path(tmp.name)
         self.fake, self.launch, self.sleeps = Fake(), Launch(), []
+        self.nap = self.sleeps.append
         for target, name, value in ((mc, "_owner_dm", lambda ws, core: DM),
                                     (connections, "read_rows", lambda ws=None: [CORE])):
             patch = mock.patch.object(target, name, value)
@@ -97,11 +99,15 @@ class Base(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             rc = mc.main(["--workspace", str(self.ws)] + argv, core=CORE, popen=self.launch,
-                         execute=lambda *a, **k: self.fake.execute(*a, **k), sleep=self.sleeps.append)
+                         execute=lambda *a, **k: self.fake.execute(*a, **k), sleep=lambda s: self.nap(s))
         return rc, json.loads(out.getvalue())
 
     def owed(self):
-        return [r["attempt"] for r in mc.outcomes(self.ws) if not r["told"]]
+        return [r["attempt"] for r in mc.outcomes(self.ws)
+                if not r["told"] and not r.get("superseded") and r["state"] != "started"]
+
+    def superseded(self):
+        return [r["attempt"] for r in mc.outcomes(self.ws) if r.get("superseded")]
 
     def tap(self, alias, *, said=None, event="$card1", card_id=mc.CARD_ID, **kw):
         said = SAID[alias] if said is None else said
@@ -422,29 +428,76 @@ class Attempts(Base):
         self.assertEqual((rc, out["status"], out["outcome"]), (1, "failed", "error"))
         self.assertIn("M_UNAVAILABLE", out["why"])
         self.assertEqual((self.owed(), len(self.sleeps), len(self.fake.calls)), (["17-ab"], mc.SETTLE_TRIES - 1, 1))
-        self.failing(mc.SETTLE_TRIES)
-        self.assertEqual(self.settle("18-cd", 3)[0], 1)
-        self.assertEqual(self.owed(), ["17-ab", "18-cd"])
         rc, out = self.run_(["post", "--room", DM])
-        self.assertEqual((rc, out), (0, {"status": "posted", "event_id": "$card4", "delivered": ["17-ab", "18-cd"]}))
-        self.assertEqual([c[2].split(":", 1)[1] for c in self.fake.calls[1:3]], ["17-ab:outcome", "18-cd:outcome"])
+        self.assertEqual((rc, out), (0, {"status": "posted", "event_id": "$card3", "delivered": ["17-ab"]}))
+        self.assertEqual(self.fake.calls[1][2], "model-card:17-ab:outcome")
         self.assertIn("did not accept the switch in time", self.fake.cards()[1]["text"])
-        self.assertIn("The core is not running.", self.fake.cards()[2]["text"])
-        self.assertEqual(self.fake.cards()[3]["state"], "info", "then the menu it was asked for")
-        self.assertIsNotNone(mc.issued_cards.live(self.ws, "$card4"))
-        self.assertEqual(self.owed(), [])
-        self.assertEqual(self.run_(["post", "--room", DM])[1], {"status": "posted", "event_id": "$card5"})
+        self.assertEqual(self.fake.cards()[2]["state"], "info", "then the menu it was asked for")
+        self.assertIsNotNone(mc.issued_cards.live(self.ws, "$card3"))
+        self.assertEqual((self.owed(), self.superseded()), ([], []))
+        self.assertEqual(self.run_(["post", "--room", DM])[1], {"status": "posted", "event_id": "$card4"})
         self.assertEqual(self.launch.calls, [], "no retry runs the switch")
 
-    def test_the_next_reply_sends_an_owed_outcome_before_its_own_switch(self):
+    def test_an_owed_outcome_is_never_posted_once_a_newer_attempt_has_started(self):
         self.failing(mc.SETTLE_TRIES)
         self.assertEqual(self.settle("17-ab")[0], 1)
+        self.assertEqual(self.owed(), ["17-ab"])
         rc, out = self.tap("sonnet")
-        self.assertEqual((rc, out["status"], out["delivered"]), (0, "started", ["17-ab"]))
-        self.assertEqual([c[2] for c in self.fake.calls[1:]],
-                         ["model-card:17-ab:outcome", f"model-card:{out['attempt']}:switching"])
-        self.assertEqual((self.owed(), len(self.launch.calls)), ([], 1))
-        self.assertEqual(self.launch.calls[0][0][6], "sonnet", "only the tapped switch is started")
+        newer = out["attempt"]
+        self.assertEqual((rc, out["status"]), (0, "started"))
+        self.assertNotIn("delivered", out)
+        self.assertEqual([c[2] for c in self.fake.calls[1:]], [f"model-card:{newer}:switching"])
+        self.assertEqual((self.owed(), self.superseded()), ([], ["17-ab"]))
+        self.assertEqual([(r["attempt"], r["state"]) for r in mc.outcomes(self.ws)], [("17-ab", "error"), (newer, "started")])
+        rc, out = self.run_(["post", "--room", DM])
+        self.assertEqual((rc, out), (0, {"status": "posted", "event_id": "$card3"}))
+        rc, out = self.settle("17-ab")
+        self.assertEqual((rc, out["status"], self.sleeps[mc.SETTLE_TRIES - 1:]), (0, "superseded", []))
+        self.using("sonnet")
+        rc, out = self.settle(newer, 0, "sonnet")
+        self.assertEqual((rc, out["status"], out["say"]), (0, "posted", "Switched. I'm now using Sonnet."))
+        self.assertEqual([c[2].split(":")[1] for c in self.fake.calls[1:]], [newer, "menu", newer])
+        self.assertFalse(any("17-ab" in c[2] for c in self.fake.calls))
+        self.assertEqual(len(self.launch.calls), 1)
+
+    def test_settles_own_retries_stop_when_a_newer_attempt_appears(self):
+        sends = []
+        self.fake.execute = lambda *a, **k: sends.append(k["operation_id"]) or self.DOWN
+
+        def nap(seconds):
+            """While the older outcome waits to try again, the owner taps another model."""
+            self.sleeps.append(seconds)
+            mc.save_outcome(self.ws, "18-cd", DM, "sonnet", None, mc.time.time())
+        self.nap = nap
+        rc, out = self.settle("17-ab")
+        self.assertEqual((rc, out["status"], out["outcome"]), (0, "superseded", "error"))
+        self.assertEqual((sends, self.sleeps), (["model-card:17-ab:outcome"], [mc.SETTLE_PAUSE_S]))
+        self.assertEqual(self.superseded(), ["17-ab"])
+
+    def test_a_newer_outcome_supersedes_an_older_one_still_owed(self):
+        for attempt in ("17-ab", "18-cd"):
+            self.failing(mc.SETTLE_TRIES)
+            self.assertEqual(self.settle(attempt, 3 if attempt == "18-cd" else 8)[0], 1)
+        self.assertEqual(self.owed(), ["17-ab", "18-cd"])
+        rc, out = self.run_(["post", "--room", DM])
+        self.assertEqual((rc, out["delivered"]), (0, ["18-cd"]))
+        self.assertEqual([c[2] for c in self.fake.calls[1:2]], ["model-card:18-cd:outcome"])
+        self.assertIn("The core is not running.", self.fake.cards()[1]["text"])
+        self.assertEqual((self.owed(), self.superseded(), len(self.fake.calls)), ([], ["17-ab"], 3))
+
+    def test_an_attempt_that_never_settled_owes_nothing(self):
+        rc, out = self.tap("sonnet")
+        self.assertEqual(mc.tell(self.ws, out["attempt"], core=CORE, execute=self.fake.execute, now=mc.time.time()),
+                         {"status": "failed", "why": "that attempt has no outcome yet"})
+        self.assertEqual(self.run_(["post", "--room", DM])[1], {"status": "posted", "event_id": "$card3"})
+        self.assertEqual([c["state"] for c in self.fake.cards()], ["info", "pending", "info"])
+
+    def test_a_tap_still_switches_when_the_attempt_cannot_be_recorded(self):
+        import file_lock
+        with mock.patch.object(file_lock, "locked_file", side_effect=PermissionError("read-only")):
+            rc, out = self.tap("sonnet")
+        self.assertEqual((rc, out["status"], out["event_id"], len(self.launch.calls)), (0, "started", "$card2", 1))
+        self.assertEqual(mc.outcomes(self.ws), [])
 
     def test_a_tap_that_starts_nothing_still_sends_an_owed_outcome(self):
         self.failing(mc.SETTLE_TRIES)

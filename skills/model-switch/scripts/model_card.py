@@ -15,8 +15,10 @@ The detached line always ends in `settle` with the switch's exit code and the at
 saves the outcome in `<workspace>/state/model-card-outcome.json`, then posts it in the same DM:
 "Switched. I'm now using X." or "I could not switch to X. I'm still using Y. <reason>". A post that
 fails is tried again a few times; an outcome still untold is posted by the next `post` or `reply`
-before its own work, oldest first. An attempt's posts carry its id as their operation id, an outcome is
-told once, and no retry runs the switch again.
+before its own work. An attempt's posts carry its id as their operation id, an outcome is told once,
+and no retry runs the switch again. `reply` records an attempt before its "switching" card, and an
+untold outcome with a newer attempt after it is marked `superseded` and never posted: only the newest
+attempt's outcome may stand for the card.
 The menu, the "switching" answer and the outcome share one card id, so the newest stands for the card.
 
 The model in use is read only from `<workspace>/state/model-switch.json`, the record switch-model.sh
@@ -181,7 +183,8 @@ def new_attempt(now: float) -> str:
 
 
 def outcomes(ws: Path) -> list:
-    """The saved outcomes, oldest first: {attempt, room, model, state, words, told, ts}."""
+    """The attempts, oldest first: {attempt, room, model, state, words, told, superseded, ts}; `state`
+    is "started" until the switch ended."""
     try:
         data = json.loads(ws.joinpath(*OUTCOMES).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -202,15 +205,18 @@ def _outcome_book(ws: Path, now: float):
         write_whole(path, {"outcomes": rows[-OUTCOMES_KEPT:]})
 
 
-def save_outcome(ws: Path, attempt: str, room: str, alias: str, rc: int, now: float) -> dict:
-    """The outcome of `attempt` as saved; written from `rc` only when the attempt has none yet."""
+def save_outcome(ws: Path, attempt: str, room: str, alias: str, rc: Optional[int], now: float) -> dict:
+    """The record of `attempt`, added as started when it is new; its outcome is written from `rc` once,
+    and not at all for `rc` None (the attempt has only begun)."""
     with _outcome_book(ws, now) as rows:
         row = next((r for r in rows if r["attempt"] == attempt), None)
         if row is None:
-            state, words = outcome(ws, alias, rc)
-            row = {"attempt": attempt, "room": room, "model": alias, "state": state, "words": words,
+            row = {"attempt": attempt, "room": room, "model": alias, "state": "started", "words": "",
                    "told": False, "ts": now}
             rows.append(row)
+        if rc is not None and row.get("state") == "started":
+            state, words = outcome(ws, alias, rc)
+            row.update(state=state, words=words)
         return dict(row)
 
 
@@ -221,15 +227,22 @@ def _outcome_post(ws: Path, attempt: str, room: str, state: str, words: str, cor
 
 def tell(ws: Path, attempt: str, *, core=None, execute=None, now: float) -> dict:
     """Post the saved outcome of `attempt` unless it was told, under the outcomes' lock, so the detached
-    step and a later `post` or `reply` never tell one outcome twice."""
+    step and a later `post` or `reply` never tell one outcome twice. An attempt with a newer one after
+    it is marked superseded instead: its outcome would replace the newer attempt's card."""
     try:
         with _outcome_book(ws, now) as rows:
-            row = next((r for r in rows if r["attempt"] == attempt), None)
-            if row is None:
+            at = next((i for i, r in enumerate(rows) if r["attempt"] == attempt), None)
+            if at is None:
                 return {"status": "failed", "why": "no outcome is saved for that attempt"}
+            row = rows[at]
             if row.get("told"):
                 return {"status": "already_told", "event_id": row.get("event_id")}
-            out = _outcome_post(ws, attempt, str(row.get("room") or ""), str(row.get("state") or "error"),
+            if row.get("superseded") or at + 1 < len(rows):
+                row["superseded"] = True
+                return {"status": "superseded"}
+            if row.get("state") not in ("done", "error"):
+                return {"status": "failed", "why": "that attempt has no outcome yet"}
+            out = _outcome_post(ws, attempt, str(row.get("room") or ""), row["state"],
                                 str(row.get("words") or UNFINISHED), core, execute)
             if out["status"] == "posted":
                 row.update(told=True, event_id=out["event_id"])
@@ -239,15 +252,17 @@ def tell(ws: Path, attempt: str, *, core=None, execute=None, now: float) -> dict
 
 
 def deliver_owed(ws: Path, *, core=None, execute=None, now: float) -> list:
-    """Post every saved outcome not yet told, oldest first, one try each; the attempts now told."""
-    owed = [str(r["attempt"]) for r in outcomes(ws) if not r.get("told")]
+    """Post the outcome not yet told, one try; the attempts now told. Older untold ones are marked
+    superseded on the way and never posted."""
+    owed = [str(r["attempt"]) for r in outcomes(ws)
+            if not r.get("told") and not r.get("superseded") and r.get("state") in ("done", "error")]
     return [a for a in owed if tell(ws, a, core=core, execute=execute, now=now)["status"] == "posted"]
 
 
 def settle_attempt(ws: Path, attempt: str, room: str, alias: str, rc: int, *, core=None, execute=None,
                    now=time.time, sleep=time.sleep, tries: int = 1, pause: float = 0) -> dict:
     """Save the outcome of `attempt`, then post it, trying again after `pause` up to `tries` times. An
-    outcome that cannot be saved is posted once all the same."""
+    outcome that cannot be saved is posted once all the same; one superseded meanwhile is not posted."""
     try:
         row = save_outcome(ws, attempt, room, alias, rc, now())
     except OSError:
@@ -302,17 +317,23 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     except Exception:  # noqa: BLE001 — a card records its own lane; only one without it needs the core's owner
         core = {}
     verdict = ac.click_verdict(headers, words, ws, ac.lane_owner(ws, str(core.get("owner_mxid") or "")))
+    other, code = ac.click_answer(verdict, words, (KIND,)), 1
+    alias = verdict.command.verb if other is None else ""
+    if other is None and (verdict.command.target != TARGET or alias not in [a for _, a in MODELS]):
+        other, code = {"status": "refused", "why": f"the model card has no {alias!r} action"}, 2
+    elif other is None and current_model(ws)["model"] == alias:
+        other, code = {"status": "say", "say": f"I'm already using {name_of(alias)}. Nothing changed."}, 0
+    room, attempt = str(headers.get("channel_id") or ""), new_attempt(now())
+    if other is None:
+        try:
+            save_outcome(ws, attempt, room, alias, None, now())
+        except OSError:
+            pass
     delivered = deliver_owed(ws, core=core or None, execute=execute, now=now())
     extra = {"delivered": delivered} if delivered else {}
-    other = ac.click_answer(verdict, words, (KIND,))
     if other is not None:
-        return _emit({**other, **extra}, 1)
-    alias = verdict.command.verb
-    if verdict.command.target != TARGET or alias not in [a for _, a in MODELS]:
-        return _emit({"status": "refused", "why": f"the model card has no {alias!r} action", **extra}, 2)
-    if current_model(ws)["model"] == alias:
-        return _emit({"status": "say", "say": f"I'm already using {name_of(alias)}. Nothing changed.", **extra})
-    room, attempt, say = str(headers.get("channel_id") or ""), new_attempt(now()), switching_words(alias)
+        return _emit({**other, **extra}, code)
+    say = switching_words(alias)
     body, card = notice_card("pending", "Switching", say)
     posted = _post(ws, room, body, card, f"model-card:{attempt}:switching",
                    reply_to=str(headers.get("reply_to_event") or ""), core=core or None, execute=execute)
