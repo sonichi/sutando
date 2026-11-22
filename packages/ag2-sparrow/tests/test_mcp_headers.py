@@ -221,6 +221,14 @@ class HeadersTest(unittest.TestCase):
             self.assertEqual((rc, out), (1, ""), line)
         self.assertEqual(self.stub.seen, [])
 
+    def test_descriptor_refuses_a_plain_token_with_no_relay_and_a_missing_seat_is_no_seat(self):
+        bare = self._env("REMOTE_TASK_TOKEN=bare-secret\n")
+        rc, out, err = _run_main(["descriptor", "--env-file", bare], None)
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("names no relay URL", err)
+        self.assertEqual(mcp_auth.seat_token_file("/no/such/.env"), "")
+        self.assertEqual(self.stub.seen, [])
+
     def test_descriptor_refuses_a_file_the_proxy_cannot_read(self):
         seat_env = self._env("AGENT_MXID=@a:s.space\nREMOTE_TASK_TOKEN_FILE=/seat/channels/ag2space/token\n")
         raw = self._env(f"{self.stub.relay}|{SECRET}\n", "token")   # a seat's raw token file

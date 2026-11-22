@@ -937,6 +937,19 @@ class SspaceStdioTest(unittest.TestCase):
             plain = gc.stdio_entry(PROXY, self.token_file, "@agy:s.space", state, run=reply(raw))
             self.assertIsNone(plain[0], "a plain .env names no raw token file")
 
+    def test_an_exchange_that_cannot_run_offers_nothing(self):
+        state = str(self.w.root / "state")
+        self.assertEqual(gc.stdio_entry("", self.token_file, "@agy:s.space", state), (None, "no --mcp-proxy-command"))
+        with mock.patch("ag2_sparrow.connect_bridge.seat_env", lambda tf, aid: ({}, "the seat .env names @b")):
+            self.assertEqual(gc.stdio_entry(PROXY, self.token_file, "@agy:s.space", state), (None, "the seat .env names @b"))
+            self.assertEqual(gc.sspace_entry(self.token_file, "@agy:s.space"), (None, "the seat .env names @b"))
+        self.assertEqual(gc.mint_env("", "@agy:s.space"), ({}, "no token file"))
+        for exc in (OSError("no python"), gc.subprocess.TimeoutExpired("x", 1)):
+            def boom(argv, exc=exc, **kw):
+                raise exc
+            got = gc.stdio_entry(PROXY, self.token_file, "@agy:s.space", state, run=boom)
+            self.assertEqual(got, (None, "the token exchange did not run (%s)" % type(exc).__name__))
+
     def test_install_records_and_hands_on_the_proxy_command(self):
         cfg = {"ACP_COMMAND": "agy acp", "CWD": "/c", "TOKEN_ENV_FILE": "/a/agent.env", "AGENT_ID": "@agy:s.space",
                "MCP_PROXY_COMMAND": PROXY}
