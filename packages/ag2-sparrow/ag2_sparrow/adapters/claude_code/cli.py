@@ -34,7 +34,7 @@ from ...connect_bridge import (DECLARATION, EXTERNAL, SEAT_ENV_KEEP, STATUS_MAX_
                                vault_key, worker_name)
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, Shape, _v  # noqa: F401
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
-from . import detector, hmac_policy, hold, inbox, launcher, trust
+from . import account as accounts, detector, hmac_policy, hold, inbox, launcher, trust
 from .shape import AUTOARM_VAR, BRIDGE, HITL_ROOT_NAME, LOCAL, PLUGIN, SESSION_NAME, resolve_plugin_dir  # noqa: F401
 
 SHAPE, COMMAND, MIN_CLI = LOCAL.name, LOCAL.command, LOCAL.min_version
@@ -669,6 +669,48 @@ def model(args) -> int:
     return 0 if switched else 1
 
 
+def account_env(cfg: dict, local) -> dict:
+    """What `claude auth` runs under for this agent, with the credential proxy's address as the agent's
+    running session has it (its tmux server's environment), which this command's own caller may lack."""
+    env = child_env(cfg)
+    tmux, problem = launcher.configured_tmux(cfg, job=local)
+    if problem:
+        return env
+    r = launcher.Tmux(str(launcher.socket_path(config_dir(local))), tmux).run("show-environment", "-g", accounts.PROXY_VAR)
+    name, eq, value = ((r.stdout if r else "") or "").strip().partition("=")
+    if r is not None and r.returncode == 0 and name == accounts.PROXY_VAR and eq and value:
+        env[accounts.PROXY_VAR] = value
+    return env
+
+
+def account(args) -> int:
+    """Print the Anthropic account of the agent's Claude config dir, or sign it in again in the browser
+    of this computer. A new sign-in applies when the session next starts."""
+    local = selected(args)
+    if local is None:
+        return EXIT_UNUSABLE
+    cfg, problem = load_config(local)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    env, changed = account_env(cfg, local), ""
+    if args.switch:
+        try:
+            ok, detail = accounts.sign_in(cfg, env, console=args.console)
+        except accounts.Refused as e:
+            ok, detail = False, str(e)
+        if not ok:
+            print(json.dumps({"changed": "", "detail": detail, **accounts.status(cfg, env)}))
+            return 1
+        changed = "account"
+    state = accounts.status(cfg, env)
+    out = {"changed": changed, **state, "say": accounts.words(state)}
+    if changed:
+        out["restart"] = "the running session keeps the sign-in it started with; the new one applies when it next starts"
+    print(json.dumps(out))
+    return 0
+
+
 def stop(args) -> int:
     """The local confirmation of an open stall card, through the one accepter; the launcher applies it."""
     if not args.confirm:
@@ -802,6 +844,14 @@ def main(argv=None) -> int:
     m.add_argument("--confirm", action="store_true", help="answer Claude Code's confirm dialog (a switch inside a "
                                                            "running conversation)")
     m.set_defaults(func=model)
+    a = agent_option(sub.add_parser("account", help="print the Anthropic account of the agent's Claude config dir, or "
+                                    "sign it in again; a new sign-in applies when the session next starts"))
+    a.add_argument("--switch", action="store_true", help="sign in again: Claude Code's sign-in page opens in the browser "
+                   "of this computer, and the command waits until it is finished there. Refused for an agent behind "
+                   "the credential proxy, whose own sign-in decides the account")
+    a.add_argument("--console", action="store_true", help="with --switch: sign in with an Anthropic Console account "
+                   "in place of a Claude subscription")
+    a.set_defaults(func=account)
     agent_option(sub.add_parser("uninstall", help="stop the job and the session, then remove what install wrote "
                                 "(config last)")).set_defaults(func=uninstall)
     sub.add_parser("list", help="each job installed here: its agent, the manager's state, its work root and the "
