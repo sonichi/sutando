@@ -13,6 +13,7 @@ plain http to loopback) is refused before the bearer is sent.
 
 Run: python3 packages/ag2-sparrow/tests/test_mcp_headers.py
 """
+import hashlib
 import http.server
 import io
 import json
@@ -128,8 +129,154 @@ class HeadersTest(unittest.TestCase):
                           ("POST", "/api/v1/mcp/agent-access-tokens")])
         self.assertTrue(all(a == f"Bearer {SECRET}" for _, _, a, _ in self.stub.seen))
         # Cloudflare answers a request with no User-Agent with a 403 that reads as an auth failure.
+
         self.assertTrue(all(ua for _, _, _, ua in self.stub.seen))
         self.assertNotIn(SECRET, out + err)
+
+    def test_acp_prints_the_agents_http_mcp_server_for_an_acp_session(self):
+        rc, out, err = _run_main(["acp"], (self.stub.relay, SECRET, ""))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out), {"type": "http", "name": "ag2-space", "url": f"{self.stub.base}/mcp",
+                                           "headers": [{"name": "Authorization", "value": f"Bearer {ACCESS}"}]})
+        self.assertNotIn(SECRET, out + err)
+        self.assertEqual([p for _, p, _, _ in self.stub.seen],
+                         ["/relay/v1/mcp/discovery", "/api/v1/mcp/agent-access-tokens"])
+
+    def _env(self, text, name=".env"):
+        path = os.path.join(tempfile.mkdtemp(prefix="mcp-desc-"), name)
+        with open(path, "w") as fh:
+            fh.write(text)
+        os.chmod(path, 0o600)
+        return path
+
+    def _descriptor(self, env_file):
+        return {"version": 1, "lane": "primary", "env_file": env_file, "env_key": "REMOTE_TASK_TOKEN",
+                "mint_url": f"{self.stub.base}/api/v1/mcp/agent-access-tokens", "mcp_url": f"{self.stub.base}/mcp",
+                "relay": self.stub.relay, "bearer_digest": hashlib.sha256(SECRET.encode()).hexdigest()}
+
+    def test_descriptor_names_the_agents_token_file_for_the_stdio_proxy_and_no_secret(self):
+        env_file = self._env(f"AGENT_MXID=@a:s.space\nREMOTE_TASK_TOKEN='{self.stub.relay}|{SECRET}'\n")
+        rc, out, err = _run_main(["descriptor", "--env-file", env_file], None)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out), self._descriptor(env_file))
+        self.assertNotIn(SECRET, out + err)
+        self.assertEqual([(p, a) for _, p, a, _ in self.stub.seen], [("/relay/v1/mcp/discovery", f"Bearer {SECRET}")],
+                         "nothing is minted; discovery runs with the file's own token")
+
+    def test_descriptor_uses_the_named_file_even_when_the_environment_carries_another_token(self):
+        # The live failure (2026-11-21): the bridge's resolution won from elsewhere and the file was never named.
+        env_file = self._env(f"REMOTE_TASK_TOKEN={self.stub.relay}|{SECRET}\n")
+        r = subprocess.run([sys.executable, "-m", "ag2_sparrow.mcp_auth", "descriptor", "--env-file", env_file],
+                           capture_output=True, text=True, timeout=60,
+                           env=hermetic_env(PYTHONPATH=str(PKG_ROOT),
+                                            REMOTE_TASK_TOKEN=f"{self.stub.relay}|env-secret-other"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout), self._descriptor(env_file))
+        self.assertTrue(all(a == f"Bearer {SECRET}" for _, _, a, _ in self.stub.seen), "never the env's token")
+        self.assertNotIn("env-secret-other", r.stdout + r.stderr)
+
+    def _seat(self, token_line, extra=""):
+        d = tempfile.mkdtemp(prefix="mcp-seat-")
+        chan = os.path.join(d, "channels", "ag2space")
+        os.makedirs(chan)
+        token = os.path.join(chan, "token")
+        with open(token, "w") as fh:
+            fh.write(token_line)
+        os.chmod(token, 0o600)
+        env = os.path.join(chan, ".env")
+        with open(env, "w") as fh:
+            fh.write(f"AGENT_MXID=@a:s.space\nREMOTE_TASK_TOKEN_FILE={token}\nREMOTE_TASK_TIER=owner\n{extra}")
+        os.chmod(env, 0o600)
+        return env, os.path.realpath(token)
+
+    def test_a_seat_env_gives_the_raw_descriptor_of_its_token_file(self):
+        seat_env, token = self._seat(f"\n{self.stub.relay}/|{SECRET}\n",
+                                     extra="REMOTE_TASK_URL=https://override.example/relay\n")
+        rc, out, err = _run_main(["descriptor", "--env-file", seat_env], None)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out), {"version": 1, "lane": "primary", "token_format": "raw", "env_file": token,
+                                           "mint_url": f"{self.stub.base}/api/v1/mcp/agent-access-tokens",
+                                           "mcp_url": f"{self.stub.base}/mcp", "relay": self.stub.relay,
+                                           "bearer_digest": hashlib.sha256(SECRET.encode()).hexdigest()})
+        self.assertNotIn("env_key", json.loads(out), "an older proxy fails loudly on a raw descriptor")
+        self.assertNotIn(SECRET, out + err)
+        self.assertEqual([(p, a) for _, p, a, _ in self.stub.seen], [("/relay/v1/mcp/discovery", f"Bearer {SECRET}")],
+                         "the token file's own relay, never the REMOTE_TASK_URL override; nothing minted")
+
+    def test_a_seat_descriptor_ignores_a_token_in_the_environment(self):
+        seat_env, token = self._seat(f"{self.stub.relay}|{SECRET}\n")
+        r = subprocess.run([sys.executable, "-m", "ag2_sparrow.mcp_auth", "descriptor", "--env-file", seat_env],
+                           capture_output=True, text=True, timeout=60,
+                           env=hermetic_env(PYTHONPATH=str(PKG_ROOT),
+                                            REMOTE_TASK_TOKEN=f"{self.stub.relay}|env-secret-other"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = json.loads(r.stdout)
+        self.assertEqual((got["env_file"], got["bearer_digest"]), (token, hashlib.sha256(SECRET.encode()).hexdigest()))
+        self.assertTrue(all(a == f"Bearer {SECRET}" for _, _, a, _ in self.stub.seen))
+
+    def test_a_seat_token_file_without_a_relay_or_secret_is_refused(self):
+        for line in ("", "bare-secret-only\n", f"{self.stub.relay}|  \n", "REMOTE_TASK_TOKEN=x|y\n"):
+            seat_env, _ = self._seat(line)
+            rc, out, err = _run_main(["descriptor", "--env-file", seat_env], None)
+            self.assertEqual((rc, out), (1, ""), line)
+        self.assertEqual(self.stub.seen, [])
+
+    def test_descriptor_refuses_a_plain_token_with_no_relay_and_a_missing_seat_is_no_seat(self):
+        bare = self._env("REMOTE_TASK_TOKEN=bare-secret\n")
+        rc, out, err = _run_main(["descriptor", "--env-file", bare], None)
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("names no relay URL", err)
+        self.assertEqual(mcp_auth.seat_token_file("/no/such/.env"), "")
+        self.assertEqual(self.stub.seen, [])
+
+    def test_descriptor_refuses_a_file_the_proxy_cannot_read(self):
+        seat_env = self._env("AGENT_MXID=@a:s.space\nREMOTE_TASK_TOKEN_FILE=/seat/channels/ag2space/token\n")
+        raw = self._env(f"{self.stub.relay}|{SECRET}\n", "token")   # a seat's raw token file
+        exported = self._env(f"export REMOTE_TASK_TOKEN={self.stub.relay}|{SECRET}\n")
+        for path in (seat_env, raw, exported, "", "/no/such/.env"):
+            rc, out, err = _run_main(["descriptor", "--env-file", path], (self.stub.relay, SECRET, path))
+            self.assertEqual((rc, out), (1, ""), path)
+            self.assertNotIn(SECRET, err)
+        self.assertIn("was refused (missing)", _run_main(["descriptor", "--env-file", seat_env], None)[2])
+
+    def test_descriptor_reads_only_private_files(self):
+        # The shared private-file reader: this user's, 0600, no symlink (read_private, as the seat bridge's own).
+        seat_env, token = self._seat(f"{self.stub.relay}|{SECRET}\n")
+        plain = self._env(f"REMOTE_TASK_TOKEN={self.stub.relay}|{SECRET}\n")
+        for path, mode in ((token, 0o640), (token, 0o604), (plain, 0o644), (seat_env, 0o660)):
+            os.chmod(path, mode)
+            target = seat_env if path in (token, seat_env) else plain
+            rc, out, err = _run_main(["descriptor", "--env-file", target], None)
+            self.assertEqual((rc, out), (1, ""), (path, oct(mode)))
+            self.assertIn("a private credential file must be 0600", err)
+            os.chmod(path, 0o600)
+        link = os.path.join(os.path.dirname(plain), "link.env")
+        os.symlink(plain, link)
+        rc, out, err = _run_main(["descriptor", "--env-file", link], None)
+        self.assertEqual((rc, out), (1, ""))
+        self.assertNotIn(SECRET, err)
+        real = os.path.join(os.path.dirname(token), "real-token")   # the seat names a link to a private file
+        os.replace(token, real)
+        os.symlink(real, token)
+        rc, out, err = _run_main(["descriptor", "--env-file", seat_env], None)
+        self.assertEqual((rc, out), (1, ""), "a symlinked raw token file is refused, as a symlinked .env is")
+        self.assertRegex(err, r"the seat.s token file \S*/token was refused")
+        self.assertEqual(mcp_auth.seat_token_file(seat_env), real, "the descriptor's own file stays the realpath")
+        with mock.patch("ag2_sparrow.bounded_file_read.os.geteuid", return_value=os.geteuid() + 1):
+            rc, out, err = _run_main(["descriptor", "--env-file", plain], None)
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("not this user", err)
+        self.assertEqual(self.stub.seen, [], "nothing is sent for a file that was refused")
+        self.assertEqual(self.stub.seen, [], "the bearer is not sent for a descriptor that cannot work")
+
+    def test_owner_tools_are_the_ag2_space_servers_room_tools_only(self):
+        ok = mcp_auth.owner_tool_ok
+        for tool in ("room.action.execute", "room_action_execute", "room.action.execute_safe", "ag2.whoami"):
+            self.assertTrue(ok("ag2-space", tool), tool)
+        for server, tool in (("ag2-space", "agent.link"), ("ag2-space", "agent.unlink"),
+                             ("ag2-space", "relay.token.issue"), ("ag2-space", "space.action.execute"),
+                             ("ag2-space", "ui.request"), ("other", "room.action.execute")):
+            self.assertFalse(ok(server, tool), (server, tool))
 
     def test_mint_url_that_is_not_tls_is_refused_before_the_bearer_is_sent(self):
         self.stub.discovery = (200, {"mint_url": "http://mint.example/api/v1/mcp/agent-access-tokens",
@@ -333,6 +480,30 @@ def _fresh_bridge():
     # `from . import` reads the package attribute, so popping sys.modules alone reuses the old import.
     sys.modules.pop("ag2_sparrow.remote_gateway_bridge", None)
     sys.modules["ag2_sparrow"].__dict__.pop("remote_gateway_bridge", None)
+
+
+class BridgeCopiesTest(unittest.TestCase):
+    """mcp_auth keeps the bridge's mint path and origin rule without importing it (its import resolves a token)."""
+
+    def test_the_copies_match_the_bridge(self):
+        _fresh_bridge()
+        from ag2_sparrow import remote_gateway_bridge as bridge
+        self.assertEqual(mcp_auth.MINT_PATH, bridge.AGENT_ACCESS_MINT_PATH)
+        for url, base in (("https://r.example/a", "https://r.example/b"), ("https://r.example.evil/a", "https://r.example"),
+                          ("http://r.example/a", "https://r.example"), ("https://R.example:443/a", "https://r.example"),
+                          ("https://r.example:bad/", "https://r.example"), ("relative", "https://r.example"),
+                          ("http://127.0.0.1:81/x", "http://127.0.0.1:80/")):
+            self.assertEqual(mcp_auth.same_origin(url, base), bridge._same_origin(url, base), (url, base))
+
+    def test_descriptor_never_imports_the_bridge(self):
+        env_file = os.path.join(tempfile.mkdtemp(prefix="mcp-desc-"), ".env")
+        with open(env_file, "w") as fh:
+            fh.write("REMOTE_TASK_TOKEN=http://127.0.0.1:9/relay|s\n")
+        code = ("import sys; from ag2_sparrow import mcp_auth; rc = mcp_auth.main(['descriptor', '--env-file', %r]); "
+                "print('bridge' if 'ag2_sparrow.remote_gateway_bridge' in sys.modules else 'no-bridge')" % env_file)
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60,
+                           env=hermetic_env(PYTHONPATH=str(PKG_ROOT)))
+        self.assertEqual(r.stdout.strip().splitlines()[-1], "no-bridge", r.stderr)
 
 
 class ResolveTest(unittest.TestCase):
