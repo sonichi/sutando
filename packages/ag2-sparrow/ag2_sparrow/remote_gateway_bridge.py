@@ -6057,20 +6057,16 @@ def _download_bytes(url: str, headers: dict, cap: int) -> bytes:
     Authorization header is present, redirects are NOT followed — a
     gateway-controlled URL must not bounce our bearer to another host — and a
     3xx is treated as a FAILURE (raise) so the redirect page's body is never
-    saved as if it were the media."""
+    saved as if it were the media. Redirects are never followed, credentials or not."""
     with gateway_instance.gateway_call(url):  # a gateway-supplied URL, maybe under the gateway's
         req = urllib.request.Request(url, method="GET")
         for k, v in headers.items():
             req.add_header(k, v)
-        if "Authorization" in headers:
-            class _NoRedirect(urllib.request.HTTPRedirectHandler):
-                def redirect_request(self, *a, **kw):  # noqa: D401
-                    return None
-            opener = urllib.request.build_opener(_NoRedirect)
-            resp_ctx = opener.open(req, timeout=30)
-        else:
-            resp_ctx = urllib.request.urlopen(req, timeout=30)
-        with resp_ctx as resp:
+
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **kw):  # noqa: D401
+                return None
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=30) as resp:
             status = getattr(resp, "status", 200)
             if 300 <= status < 400:
                 raise ValueError(f"authenticated media fetch got a redirect ({status})")
@@ -6120,7 +6116,10 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
             return body                    # can't auth safely — leave marker
         url = _to_authed_media_url(url)
         headers["Authorization"] = f"Bearer {HS_MEDIA_TOKEN}"
-    # else: a plain public URL — fetched with no credentials.
+    else:
+        # Only the configured gateway or homeserver origin is fetched (a sender's marker must not reach loopback or LAN).
+        _log("media URL is not on the gateway or homeserver origin — leaving marker as-is")
+        return body
 
     try:
         data = _download_bytes(url, headers, MAX_MEDIA_BYTES)

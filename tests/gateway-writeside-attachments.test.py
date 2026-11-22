@@ -46,6 +46,8 @@ rgb.MEDIA_DIR = tmp / "media"
 # Mock the network fetch — any successful download yields bytes so the fetch
 # path builds a ref + rewrites the marker.
 rgb._download_bytes = lambda url, headers, cap: b"x" * 100
+# The markers below use example.com: make it the gateway, the only origin (with the homeserver) fetched.
+rgb.URL = "https://example.com"
 
 failures = []
 
