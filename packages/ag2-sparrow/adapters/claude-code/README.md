@@ -386,6 +386,7 @@ ag2-sparrow-claude-local install \
   [--token-env-file <the agent's .env>] [--work <work>]
 ag2-sparrow-claude-local verify [<selector>]
 ag2-sparrow-claude-local attach [<selector>]   # the live pane; detach with the tmux prefix + d
+ag2-sparrow-claude-local model [<model>] [--confirm] [<selector>]  # print the model, or switch it live
 ag2-sparrow-claude-local stop --confirm [<selector>]  # confirm an open stall card's Stop here
 ag2-sparrow-claude-local uninstall [<selector>]
 ag2-sparrow-claude-local list            # each job installed here, its agent, state and selector
@@ -747,6 +748,20 @@ key in one save). The launcher executes the effect once, under the same
 locks, and records its evidence. Keep waiting is a successor requirement
 whose id and guard derive from the saga key, reconciled to exactly one at
 every start.
+
+**`model`.** Without an argument it prints `{"model": …}`: the model the last switch made here landed on
+(`state/model-switch.json` in the work root), `null` when there has been none. It does not read Claude
+Code's own settings, which live in the config dir beside the login. With one it switches the running
+session, no restart:
+`/model <model>` is typed into the pane through the same fenced sender `stop` uses, so nothing is typed
+into a pane that is not the recorded one. The switch counts only when the pane then shows a new
+"Set model to" line (20 s); otherwise the answer is `switched: false` with one line why, exit 1. Inside a
+running conversation Claude Code asks first ("Yes, switch / No, go back"): `--confirm` answers it once,
+without it the dialog is cancelled. The model is Claude Code's to remember; this command writes no
+settings. Not measured against a real Claude Code here (the tests drive a stand-in on a real tmux
+server); the two screen texts are the ones `skills/model-switch` waits for on the core. A `/model`
+typed while a turn is running is queued by Claude Code and applies when the turn ends, so the 20 s
+wait can report `unconfirmed` for a switch that lands later.
 
 `attach` is `tmux attach` on the adapter's own socket: the same session under the same lock, so a
 `/exit` typed there ends it and the launcher resumes it by id; `--help` states the limits.
