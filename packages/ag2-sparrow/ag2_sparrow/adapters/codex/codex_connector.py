@@ -243,7 +243,7 @@ class Connector:
         self.declined = []
         self.turn_id = None       # the turn now running, once turn/start has named it
         self.turn_declined = []   # approvals declined for that turn (requests that name it)
-        self.turn_items = {}      # that turn's completed items, counted by type
+        self.turn_items = {}
 
     def handle_server_request(self, m):
         """No human is attached, so approvals are declined (the turn continues)."""
