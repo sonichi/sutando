@@ -42,6 +42,52 @@ APPROVAL_REQUESTS = ("item/commandExecution/requestApproval", "item/fileChange/r
                      "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval")
 NON_OWNER_SANDBOX = "read-only"
 NO_REPLY = "[no reply] Codex completed the turn without a message."
+# What a turn with no message did instead, for the line posted in its place: fixed words and counts only.
+DECLINED_WORDS = {"item/commandExecution/requestApproval": "command", "execCommandApproval": "command",
+                  "item/fileChange/requestApproval": "file change", "applyPatchApproval": "file change",
+                  "item/permissions/requestApproval": "permission request"}
+DECLINED_ORDER = ("command", "file change", "permission request")
+ITEM_WORDS = (("commandExecution", "ran %d command%s"), ("fileChange", "made %d file change%s"),
+              ("mcpToolCall", "made %d tool call%s"), ("webSearch", "ran %d web search%s"))
+FAILED_WORDS = (("commandExecution", "%d command%s failed"), ("fileChange", "%d file change%s failed"),
+                ("mcpToolCall", "%d tool call%s failed"))
+FAILED = ":failed"      # the key suffix of an item type's failed count
+
+
+def item_outcome(item) -> str:
+    """Under which key a completed item counts: its type when it has no status (a web search, a
+    reasoning item) or ended `completed`, type + FAILED when it ended `failed`, '' otherwise (an item
+    that was declined did not happen, and the approval that declined it is counted on its own)."""
+    kind, status = item.get("type"), item.get("status")
+    if not isinstance(kind, str):
+        return ""
+    if status in (None, "completed"):
+        return kind
+    return kind + FAILED if status == "failed" else ""
+
+
+def no_message_why(declined, items):
+    """'' when the turn did nothing countable; else e.g. '1 command was not approved; it ran 2 commands;
+    1 command failed'. `declined` is the approval methods refused for this turn, `items` the turn's
+    items that ended, counted by `item_outcome`."""
+    why = []
+    for word in DECLINED_ORDER:
+        n = sum(1 for method in declined if DECLINED_WORDS.get(method) == word)
+        if n:
+            why.append("%d %s%s %s not approved" % (n, word, "" if n == 1 else "s", "was" if n == 1 else "were"))
+    did = []
+    for kind, words in ITEM_WORDS:
+        n = items.get(kind, 0)
+        if n:
+            plural = "" if n == 1 else ("es" if words.endswith("search%s") else "s")
+            did.append(words % (n, plural))
+    if did:
+        why.append("it " + ", ".join(did))
+    for kind, words in FAILED_WORDS:
+        n = items.get(kind + FAILED, 0)
+        if n:
+            why.append(words % (n, "" if n == 1 else "s"))
+    return "; ".join(why)
 # --held: the launcher that spawned this process holds the work root and attaches it as the consumer
 # whose liveness fences the root; the connector waits this long for that record, then refuses.
 HELD_WAIT_S = held_start.WAIT_S
@@ -195,6 +241,9 @@ class Connector:
         self.owner_only_keys = set()
         self.scratch_cwd = None
         self.declined = []
+        self.turn_id = None       # the turn now running, once turn/start has named it
+        self.turn_declined = []   # approvals declined for that turn (requests that name it)
+        self.turn_items = {}
 
     def handle_server_request(self, m):
         """No human is attached, so approvals are declined (the turn continues)."""
@@ -202,6 +251,10 @@ class Connector:
         log("server request", method)
         if method in APPROVAL_REQUESTS:
             self.declined.append(method)
+            # Counted for the no-message line only when the request names this thread and turn.
+            asked = m.get("params") if isinstance(m.get("params"), dict) else {}
+            if self.turn_id and (asked.get("threadId"), asked.get("turnId")) == (self.thread_id, self.turn_id):
+                self.turn_declined.append(method)
             self.rpc.respond(rid, {"decision": "decline"})
         elif method == "item/tool/requestUserInput":
             self.rpc.respond(rid, {"answers": {}})
@@ -366,7 +419,10 @@ class Connector:
                 deltas.append(p.get("delta", ""))
             elif meth == "item/completed" and p.get("turnId") == turn_id:
                 item = p.get("item", {})
-                if item.get("type") == "agentMessage":
+                kind, counted = item.get("type"), item_outcome(item)
+                if counted:
+                    self.turn_items[counted] = self.turn_items.get(counted, 0) + 1
+                if kind == "agentMessage":
                     text = item.get("text")       # last agentMessage of the turn wins
             elif meth == "turn/completed" and p.get("turn", {}).get("id") == turn_id:
                 turn = p["turn"]
@@ -385,8 +441,9 @@ class Connector:
             params["model"] = model
         if cwd:
             params["cwd"] = cwd
+        self.turn_id, self.turn_declined, self.turn_items = None, [], {}
         res = self.rpc.request("turn/start", params)
-        turn_id = res["turn"]["id"]
+        turn_id = self.turn_id = res["turn"]["id"]
         done = self.wait_turn(turn_id, self.args.turn_timeout)
         if done is not None:
             return done
@@ -428,7 +485,11 @@ class Connector:
 
     def result_body(self, status, text, err):
         if status == "completed":
-            return (text or "").strip() or NO_REPLY
+            said = (text or "").strip()
+            if said:
+                return said
+            why = no_message_why(self.turn_declined, self.turn_items)
+            return NO_REPLY[:-1] + ": " + why + "." if why else NO_REPLY
         if status == "timeout":
             head = "Codex did not finish this task in time (%s)." % err
         elif status == "server-exited":
