@@ -1,5 +1,5 @@
-"""One isolated local Claude Code turn for an attested collaborator: no owner session, no
-connector, no history, nothing to read. The CLI's login (CLAUDE_CONFIG_DIR) is all it inherits.
+"""One isolated local Claude Code turn for a restricted sender (task_io.turn_policy's restricted kind): no
+owner session, no connector, no history, nothing to read. The CLI's login (CLAUDE_CONFIG_DIR) is all it inherits.
 
 Package level so both Claude adapters share it without importing one another. Stdlib only.
 """
@@ -19,7 +19,7 @@ ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "CLAUDE_CONFIG_DIR")
 TURN_ARGV = ("-p", "--safe-mode", "--restricted", "--strict-mcp-config", "--no-session-persistence",
              "--tools", "Read,Grep,Glob", "--output-format", "json")
 # The turn has no standing instructions: this line is all it knows about where its text goes.
-REMINDER = ("[sparrow collaborator task] One message from a collaborator of your owner follows; answer it "
+REMINDER = ("[sparrow restricted task] One message from a sender who is not your owner follows; answer it "
             "on your owner's behalf. This turn is isolated: no connectors, no files, no memory of earlier "
             "messages. Write only the reply text; the bridge delivers it to the sender's room for you.")
 _BRACKET_RE = re.compile(r"\[(?=\S)")

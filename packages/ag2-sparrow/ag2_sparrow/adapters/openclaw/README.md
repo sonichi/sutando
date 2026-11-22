@@ -61,12 +61,14 @@ resume it, or the working directory changed, since ACP fixes a Session's directo
 
 ## Tiers and permissions
 
-The owner and an attested collaborator are served; any other non-owner is refused with one line unless
-`--allow-non-owner`. OpenClaw's `session/request_permission` is answered by the connector, default deny:
+The owner and an attested collaborator are served; any other non-owner is refused with one line.
+`--allow-non-owner` is recorded but not honoured here: the shared policy gives such a sender a restricted
+turn, which must be isolated, connector-free and ephemeral, and this adapter runs every turn in the owner's
+OpenClaw profile, working directory and kept Sessions. OpenClaw's `session/request_permission` is answered by the connector, default deny:
 
 - any tier: this task's own reply or no-reply line, exactly, and a read or edit of this task's draft file
   (named as written, never through a link placed at its path);
-- the owner only: a `read` or `edit` whose every path, nested ones (`edits[].path`) included, resolves (after
+- the owner and an attested collaborator (the shared `task_io.turn_policy` gives both writes): a `read` or `edit` whose every path, nested ones (`edits[].path`) included, resolves (after
   `..`, `~` and symlinks) under the working directory, with no key the policy does not know; never when the
   working directory is the home directory or above it, such as `/` (install with `--cwd` set to a project
   directory);
