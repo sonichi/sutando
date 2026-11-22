@@ -21,6 +21,7 @@ isolate_os_environ()
 import importlib.util
 import json
 import os
+import sys
 import unittest
 from pathlib import Path as _Path
 
@@ -553,6 +554,40 @@ class TestTheBusyFooterIsNotTheTurnRow(unittest.TestCase):
     def test_quoted_dialog_above_the_live_spinner_is_running(self):
         pane = _TOOL_OUTPUT_DIALOG + _LIVE_SPINNER + _BUSY_FOOTER
         self.assertEqual(self.verdicts(pane), (None, "running", "busy:working"))
+
+
+# A finished turn whose verb is not ASCII, under the agent's own reply quoting a key hint.
+_ACCENTED_DONE = "  ✻ Sautéed for 1m 4s · done 9:32 AM · 1 shell still running"
+_QUOTED_HINT_TAIL = (
+    '  Enter to accept the change", indented under a menu row. It checks that this line still raises'
+    " no alert today, so a\n"
+    "  later change in that behaviour will show up as a test failure.\n"
+    "  The fix itself is unchanged. All 10 tests in that file pass and the repo's review checks pass.\n"
+    + _ACCENTED_DONE + "\n")
+
+
+class TestNonAsciiTurnVerb(unittest.TestCase):
+    """The CLI's turn verb may carry any letter ("Sautéed", "Élucidating"): its row still
+    cuts the transcript above it off from the live region."""
+
+    def test_finished_turn_with_an_accented_verb_quoting_a_hint_is_idle(self):
+        pane = (_QUOTED_HINT_TAIL + _IDLE_FOOTER
+                + "\n  Sutando: idle                                                     [-]")
+        self.assertIsNone(classify(pane))
+
+    def test_accented_completion_row_is_a_finished_turn(self):
+        for row in (_ACCENTED_DONE, _ACCENTED_DONE.split(" · 1 shell")[0]):
+            with self.subTest(row=row):
+                m = _mod.TURN_DONE.search(row)
+                self.assertIsNotNone(m)
+                self.assertEqual(m.group("dur"), "1m 4s")
+
+    def test_accented_spinner_is_a_spinner_not_a_finished_turn(self):
+        pg = sys.modules["delivery.pane_gate"]
+        row = "✳ Élucidating… (5s · ↓ 237 tokens)"
+        self.assertTrue(pg._SPINNER_ROW.search(row))
+        self.assertFalse(_mod.TURN_DONE.search(row))
+        self.assertIsNotNone(pg.turn_status([row, "  ⏵⏵ bypass permissions on"]))
 
 
 class TestUnobservedProbeIsNotHung(unittest.TestCase):

@@ -57,10 +57,12 @@ from cli_wedge import needs_login_line  # noqa: E402 — the one banner grammar
 # frame has scrolled. Indented text without the glyph is prose or a quoted prompt.
 LOGGED_IN_AGAIN = re.compile(r"login successful\.?", re.I)
 _RESULT_ROW = re.compile(r"^(?:\s*⎿|\S)")
+# The CLI's turn verb ("Cooked", "Sautéed"): any script's letters, so never [A-Za-z].
+VERB_START = r"[^\W\d_]"
 # The completed-turn line ("✻ Worked for 0s", "✻ Cooked for 1m 3s · done 12:32 PM"); the
 # spinner reuses the glyph ("✻ Perambulating… (1m 46s · …)") and must not match.
 TURN_DONE = re.compile(
-    r"^✻\s+[A-Za-z]+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?$")
+    rf"^\s*✻\s+{VERB_START}+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?\s*$")
 _SHORT = re.compile(r"[01]s")
 _PROMPT = re.compile(r"^❯")
 _COMMAND_PROMPT = re.compile(r"^[❯›»]\s*/")

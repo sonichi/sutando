@@ -88,7 +88,7 @@ class TheRefusalIsCleared(unittest.TestCase):
 
     def test_a_completed_turn_that_outran_a_refusal(self):
         for done in ("✻ Worked for 12s · done 1:00 PM", "✻ Worked for 2m 3s · done 1:00 PM",
-                     "✻ Cooked for 10s"):
+                     "✻ Cooked for 10s", "✻ Sautéed for 1m 4s · done 9:32 AM · 1 shell still running"):
             pane = REFUSED + f"❯ hi\n{done}\n" + FOOTER
             self.assertIsNone(login_expired(pane), done)
             self.assertTrue(authenticated_turn(pane), done)

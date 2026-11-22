@@ -55,7 +55,8 @@ from cli_wedge import (PROVIDER_LIMIT_PATTERNS, FrameAbnormal, capture_pane,  # 
 from file_lock import locked_file  # noqa: E402  (cross-platform; never fcntl directly)
 from quota_availability import provider_allows_now  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
-from worker_auth_state import signed_in_since  # noqa: E402
+# The completed-turn grammar (TURN_DONE) is the sign-in reading's: one copy for both.
+from worker_auth_state import TURN_DONE, VERB_START, signed_in_since  # noqa: E402,F401
 
 REPO = _SRC.parent
 SEND_LINE = REPO / "scripts" / "tmux-send-line.sh"
@@ -94,9 +95,6 @@ CLAUDE_IDLE = re.compile(r"⏵⏵\s*bypass permissions on|←\s*for agents\b", r
 # the reset its second row reads "Continuing shortly · Esc to cancel", often captured without the first.
 LIMIT_WAIT = re.compile(r"Continuing automatically (?:at\b|shortly\b)|Continuing shortly\s*·\s*Esc to cancel"
                         r"|\b(?:session|usage|weekly) limit reached\b", re.I)
-# A completed turn ("✻ Cooked for 1s · done 12:32 PM"); the spinner reuses the glyph and must not match.
-TURN_DONE = re.compile(
-    r"^\s*✻\s+[A-Za-z]+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?\s*$")
 #: A turn this short (or with no duration) may be the CLI refusing it, not running it.
 TURN_SHORT = re.compile(r"[01]s")
 # A turn the CLI refuses outright is a FINISHED turn: the reason is its `⎿` result and the
@@ -197,7 +195,7 @@ AWAIT_HINT = re.compile(
     r"|Continuing automatically|❯\s*\d+\.", re.I)
 # A turn's spinner ("✳ Moonwalking… (15s · …)") or completion line: transcript above, live dialog
 # below. Not "esc to interrupt": the busy footer carries it, under any live dialog.
-_SPINNER_ROW = re.compile(r"^\s*[·✢✳✶✻✽*]\s+[A-Za-z][\w-]*(?:…|\.\.\.)\s*\(")
+_SPINNER_ROW = re.compile(rf"^\s*[·✢✳✶✻✽*]\s+{VERB_START}[\w-]*(?:…|\.\.\.)\s*\(")
 _TURN_ROW = re.compile(rf"{_SPINNER_ROW.pattern}|{TURN_DONE.pattern}")
 
 
