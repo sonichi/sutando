@@ -37,6 +37,7 @@ from _helpers.subprocess_coverage import covered_code  # noqa: E402
 isolate_os_environ()
 
 import fcntl  # noqa: E402  (outside the scanner's Python 3.9 stdlib list)
+import gc  # noqa: E402  (likewise)
 PKG = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG))
 from ag2_sparrow import _dirs, connect_bridge as cb, connect_common as cm, holder_lock, service_manager as sm, task_io  # noqa: E402
@@ -475,7 +476,7 @@ class Install(Base):
         self.assertEqual((cfg["CODEX"], cfg["ROOT"], cfg["INBOX_DIR"], cfg["RESULTS_DIR"]),
                          (str(self.codex), str(self.work), str(self.work / "tasks"), str(self.work / "results")))
         self.assertEqual((cfg["CODEX_HOME"], cfg["SANDBOX"], cfg["ALLOW_NON_OWNER"], cfg["MODEL"]),
-                         (str(self.codex_home), "read-only", "", ""))
+                         (str(self.codex_home), "read-only", "1", ""))
         self.assertTrue((self.work / "tasks").is_dir() and (self.work / "results").is_dir())
         self.assertTrue(cm.service_path(L).read_text().startswith(cli.MARKER))
         self.assertNotIn(TOKEN, cfg_path.read_text())
@@ -486,13 +487,22 @@ class Install(Base):
         self.assertIsNone(self.server(), "install starts no connector itself; the manager does")
 
     def test_sandbox_and_non_owner_choices(self):
-        rc, out, _ = self.install_with(self.runner(), False, "--sandbox", "workspace-write", "--allow-non-owner", "--model", "m1")
+        rc, out, _ = self.install_with(self.runner(), False, "--sandbox", "workspace-write", "--no-allow-non-owner", "--model", "m1")
         self.assertEqual(rc, 0)
         self.assertIn("NOTE sandbox: workspace-write", out)
         cfg = cm.read_config(cli.config_path())
-        self.assertEqual((cfg["SANDBOX"], cfg["ALLOW_NON_OWNER"], cfg["MODEL"]), ("workspace-write", "1", "m1"))
-        self.assertEqual(cli.connector_argv(cfg, str(self.work), 7)[-5:],
-                         ["--sandbox", "workspace-write", "--allow-non-owner", "--model", "m1"])
+        self.assertEqual((cfg["SANDBOX"], cfg["ALLOW_NON_OWNER"], cfg["MODEL"]), ("workspace-write", "0", "m1"))
+        media = str(cli.cb.bridge_state(cfg) / "remote-media")
+        self.assertEqual(cli.connector_argv(cfg, str(self.work), 7)[-7:],
+                         ["--sandbox", "workspace-write", "--media-root", media, "--no-allow-non-owner", "--model", "m1"])
+        for recorded in ("1", "", None):     # served by default, the older flag, and an older install's empty value
+            c = dict(cfg, ALLOW_NON_OWNER=recorded) if recorded is not None else \
+                {k: v for k, v in cfg.items() if k != "ALLOW_NON_OWNER"}
+            self.assertNotIn("--no-allow-non-owner", cli.connector_argv(c, str(self.work), 7), recorded)
+        # Only the non-owner flag is parsed: the full argv's --root-fd would open a descriptor.
+        parsed = lambda *flags: cc.build_parser().parse_args(["--work", str(self.work), *flags]).allow_non_owner  # noqa: E731
+        self.assertEqual((parsed(), parsed("--no-allow-non-owner")), (True, False))
+        self.assertIs(parsed("--allow-non-owner"), True, "the older flag still works")
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             cli.main(["install", "--work", str(self.work), "--sandbox", "danger-full-access"])
 
@@ -630,7 +640,8 @@ class Run(Base):
         self.assertEqual(code, 0, err)
         self.assertEqual(seen["argv"], [sys.executable, "-m", "ag2_sparrow.adapters.codex.codex_connector", "--work",
                                         str(self.work), "--held", "--root-fd", str(seen["pass_fds"][0]), "--codex",
-                                        str(self.codex), "--server", "stdio", "--sandbox", "read-only"])
+                                        str(self.codex), "--server", "stdio", "--sandbox", "read-only", "--media-root",
+                                        str(cli.cb.bridge_state(cm.read_config(cli.config_path())) / "remote-media")])
         self.assertEqual(len(seen["pass_fds"]), 1, "the held root's descriptor, and only it, reaches the connector")
         for arg in FORBIDDEN_ARGS:
             self.assertNotIn(arg, seen["argv"], arg)
@@ -994,7 +1005,7 @@ class VerifyUninstall(Base):
         self.assertEqual(set(self.checks(out)), {"config", "codex", "login", "inbox", "results", "relay token", "supervisor"})
         self.assertEqual(set(self.checks(out).values()), {"PASS"})
         self.assertIn("INFO sandbox: read-only", out)
-        self.assertIn("INFO non-owner: refused unless", out)
+        self.assertIn("INFO non-owner: served read-only, ephemeral, in an empty temp dir (the default", out)
         self.assertIn(f"INFO job: {L.service_name} active", out)
         self.assertIn(f"INFO session: {self.work} held by launcher pid {runner.pid()}, no live connector attached "
                       "(manager active/running)", out)
@@ -1221,6 +1232,7 @@ class ConnectCode(UndoSeams, Base):
         spies = {name: mock.patch.object(mod, name, wraps=getattr(mod, name)) for mod, name in
                  ((cm, "_post_json"), (cm, "redeem_code"), (cm, "operation_lock"), (cm, "agent_lock"),
                   (cb, "redeem_into_seat"), (cli, "connect_preflight"))}
+        gc.collect()    # an earlier test's leaked pipes warn when collected: not into the stderr asserted below
         with mock.patch.object(sm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=False), \
                 mock.patch.object(urllib.request, "urlopen", side_effect=backend), \
                 contextlib.ExitStack() as stack, \

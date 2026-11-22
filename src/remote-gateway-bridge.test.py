@@ -2288,7 +2288,7 @@ def main() -> int:
     real_download = rtc._download_bytes
     rtc._download_bytes = lambda url, headers, cap: (fetched.append((url, dict(headers))) or b"PNGBYTES")
     body = rtc._maybe_fetch_media(
-        f"[{rtc.MEDIA_MARKER_TAG}: {os.environ['REMOTE_TASK_URL']}/media/abc "
+        f"[{rtc.MEDIA_MARKER_TAG}: {os.environ['REMOTE_TASK_URL']}/v1/media/s.space/abc "
         "mime=image/png name=shot.png kind=m.image] look at this")
     check("[Photo attached: " in body and body.endswith("look at this"),
           "media marker rewritten to local Photo-attached path")
@@ -2309,7 +2309,7 @@ def main() -> int:
     # download failure → drop-in safe (marker untouched)
     rtc._download_bytes = lambda *a, **kw: (_ for _ in ()).throw(ValueError("boom"))
     body4 = rtc._maybe_fetch_media(
-        f"[{rtc.MEDIA_MARKER_TAG}: {os.environ['REMOTE_TASK_URL']}/media/dead name=d.bin]")
+        f"[{rtc.MEDIA_MARKER_TAG}: {os.environ['REMOTE_TASK_URL']}/v1/media/s.space/dead name=d.bin]")
     check(f"[{rtc.MEDIA_MARKER_TAG}:" in body4, "failed media fetch leaves marker untouched")
     rtc._download_bytes = real_download
 
@@ -2318,16 +2318,43 @@ def main() -> int:
     fetched.clear()
     rtc._download_bytes = lambda url, headers, cap: (fetched.append((url, dict(headers))) or b"X")
     gw = os.environ["REMOTE_TASK_URL"]  # http://127.0.0.1:<port>
-    rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1.evil.example/media/p name=a.bin]")
-    check(bool(fetched) and "Authorization" not in fetched[-1][1],
-          "lookalike gateway host gets NO credentials")
+    out = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1.evil.example/v1/media/s.space/p name=a.bin]")
+    check(not fetched and f"[{rtc.MEDIA_MARKER_TAG}:" in out, "lookalike gateway host is never fetched")
+    # Only the gateway or homeserver origin is fetched: loopback, metadata, LAN and public hosts are not.
+    for off in ("http://127.0.0.1:8080/admin", "http://169.254.169.254/latest/meta-data/",
+                "http://10.0.0.5/media/p", "http://192.168.1.1/p", "http://[::1]/p", "https://example.org/p.png",
+                "http://0.0.0.0/p", "http://224.0.0.1/p"):
+        refs = []
+        out = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {off} mime=text/plain name=a.txt]", refs)
+        check(not fetched and not refs and f"[{rtc.MEDIA_MARKER_TAG}:" in out,
+              f"off-origin media URL never fetched or attached: {off}")
     rtc.URL = "http://127.0.0.1:9/relay"
-    rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1:9/relay-evil/p name=a.bin]")
-    check("Authorization" not in fetched[-1][1],
-          "gateway base-path boundary enforced (/relay-evil gets no bearer)")
-    rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1:9/relay/media/p name=a.bin]")
+    rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1:9/relay-evil/v1/media/s.space/p name=a.bin]")
+    check(not fetched, "gateway base-path boundary enforced (/relay-evil is never fetched)")
+    rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1:9/relay/v1/media/s.space/p name=a.bin]")
     check(fetched[-1][1].get("Authorization") == "Bearer testtoken",
           "true gateway-hosted path still gets the gateway bearer")
+    n_ok = len(fetched)
+    # Only the gateway's media route is fetched with its bearer: every other gateway path, a dot segment
+    # (raw, percent- or double-encoded), an encoded slash, userinfo, a fragment or another query key is not.
+    for off in ("/v1/tasks", "/v1/agents", "/v1/media/../tasks", "/v1/media/s.space/../../v1/tasks",
+                "/v1/media/%2e%2e/tasks", "/v1/media/%252e%252e/tasks", "/v1/media/s.space/a%2fb",
+                "/v1/media/s.space/a%5cb", "/v1/media/./s.space/id", "/v1/media/s.space/id/extra",
+                "/v1/media/s.space/id?room_id=!r:s&sig=x", "/v1/media/s.space/id?room_id=a&room_id=b",
+                "/v1/media/s.space/id#frag", "/v1/media/S PACE/id", "/v1/media/s.space/id?room_id",
+                "/v1/media/s.space/id?room_id=", "/v1/media/s.space/a\\b", "/v1/media/s.space/i\x7fd"):
+        refs = []
+        out = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1:9/relay{off} name=a.bin]", refs)
+        check(len(fetched) == n_ok and not refs and f"[{rtc.MEDIA_MARKER_TAG}:" in out,
+              f"gateway path off the media route never fetched: {off}")
+    for off in ("http://user@127.0.0.1:9/relay/v1/media/s.space/id", "http://127.0.0.1:10/relay/v1/media/s.space/id",
+                "https://127.0.0.1:9/relay/v1/media/s.space/id"):
+        rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {off} name=a.bin]")
+        check(len(fetched) == n_ok, f"userinfo, another port or scheme never fetched: {off}")
+    rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1:9/relay/v1/media/s.space/id?room_id=%21r%3As.space "
+                           "name=a.bin]")
+    check(len(fetched) == n_ok + 1 and fetched[-1][1].get("Authorization") == "Bearer testtoken",
+          "the gateway media route with its room_id is fetched with the bearer")
     rtc.URL = gw
     rtc.HS_MEDIA_TOKEN = "syt_hs"
     rtc.HS_MEDIA_ORIGIN = "https://hs.good.example"
@@ -2343,6 +2370,20 @@ def main() -> int:
           and fetched[-1][1].get("Authorization") == "Bearer syt_hs"
           and "[File attached: " in b,
           "matrix happy path: MSC3916 upgrade + HS bearer on the exact origin")
+    for ok_path in ("/_matrix/client/v1/media/download/hs/id", "/_matrix/client/v1/media/thumbnail/hs/id?width=32&height=32",
+                    "/_matrix/media/r0/download/hs/id"):
+        n = len(fetched)
+        rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: https://hs.good.example{ok_path} name=ok.png]")
+        check(len(fetched) == n + 1 and fetched[-1][1].get("Authorization") == "Bearer syt_hs",
+              f"homeserver media path fetched with the HS bearer: {ok_path}")
+    n = len(fetched)
+    for off in ("/_matrix/client/v3/sync", "/_matrix/client/v3/rooms/x/messages", "/_matrix/client/v1/media/config",
+                "/_matrix/media/v3/thumbnail/hs/id", "/_matrix/client/v1/media/download/hs/../id",
+                "/_matrix/client/v1/media/download/hs/%2e%2e", "/_matrix/client/v1/media/download/hs/id?access_token=x",
+                "/_matrix/client/v1/media/thumbnail/hs/id?width=1&from=x", "/other/path"):
+        b = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: https://hs.good.example{off} name=a.bin]")
+        check(len(fetched) == n and f"[{rtc.MEDIA_MARKER_TAG}:" in b,
+              f"homeserver path off the media routes never fetched: {off}")
     rtc.HS_MEDIA_TOKEN = ""
     rtc.HS_MEDIA_ORIGIN = ""
     rtc._download_bytes = real_download
@@ -2368,12 +2409,33 @@ def main() -> int:
         check(False, "authed fetch raises on a real 302")
     except Exception:
         check(True, "authed fetch raises on a real 302")
+    import http.server as _hs
+    import threading as _th
+
+    class _Bounce(_hs.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/ok":
+                self.send_response(200); self.end_headers(); self.wfile.write(b"OK"); return
+            self.send_response(302); self.send_header("Location", "/ok"); self.end_headers()
+
+        def log_message(self, *a):
+            pass
+    _srv = _hs.ThreadingHTTPServer(("127.0.0.1", 0), _Bounce)
+    _th.Thread(target=_srv.serve_forever, daemon=True).start()
+    _base = "http://127.0.0.1:%d" % _srv.server_address[1]
+    check(rtc._download_bytes(_base + "/ok", {"User-Agent": "t"}, 100) == b"OK", "the bounce server serves /ok")
+    try:
+        rtc._download_bytes(_base + "/bounce", {"User-Agent": "t"}, 100)
+        check(False, "a fetch with no credentials does not follow a 302 either")
+    except Exception:
+        check(True, "a fetch with no credentials does not follow a 302 either")
+    _srv.shutdown(); _srv.server_close()
     STATE["force_media_redirect"] = False
 
     # 6d. same-name saves in the same instant get distinct files (mkstemp)
     rtc._download_bytes = lambda url, headers, cap: b"A"
-    b1 = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {gw}/m name=dup.bin]")
-    b2 = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {gw}/m name=dup.bin]")
+    b1 = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {gw}/v1/media/s.space/m name=dup.bin]")
+    b2 = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {gw}/v1/media/s.space/m name=dup.bin]")
     p1 = re.search(r"\[File attached: ([^\]]+)\]", b1).group(1)
     p2 = re.search(r"\[File attached: ([^\]]+)\]", b2).group(1)
     check(p1 != p2 and Path(p1).exists() and Path(p2).exists(),

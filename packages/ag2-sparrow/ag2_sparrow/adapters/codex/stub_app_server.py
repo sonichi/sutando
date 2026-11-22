@@ -106,6 +106,10 @@ for line in sys.stdin:
     elif meth == "account/login/cancel":
         home_file("stub-cancelled", p.get("loginId", "") + "\n")
         send({"jsonrpc": "2.0", "id": rid, "result": {}})
+    elif meth == "config/read":
+        # The owner's config as the real server reports it: one MCP server a restricted thread must disable.
+        send({"jsonrpc": "2.0", "id": rid, "result": {"config": {"mcp_servers": {"owner-mcp": {"command": "x"}},
+                                                                 "web_search": None}, "origins": {}}})
     elif meth == "model/list":
         listed = MODELS if p.get("limit") else [{"id": "stub-model", "isDefault": True}]
         send({"jsonrpc": "2.0", "id": rid, "result": {"data": listed, "nextCursor": None}})
@@ -119,7 +123,12 @@ for line in sys.stdin:
         THREADS[tid] = {"cwd": p.get("cwd", "/"), "params": p, "emptied": THREADS.get(tid, {}).get("emptied")}
         send({"jsonrpc": "2.0", "id": rid, "result": {"thread": thread_obj(tid), "model": p.get("model") or "stub-model",
                                                       "modelProvider": "stub", "cwd": THREADS[tid]["cwd"],
-                                                      "approvalPolicy": "never", "sandbox": "read-only", "approvalsReviewer": None}})
+                                                      "approvalPolicy": "never", "sandbox": "read-only", "approvalsReviewer": None,
+                                                      # As 0.167.0: the profile is active only with no `sandbox` param.
+                                                      "activePermissionProfile": (
+                                                          {"id": (p.get("config") or {}).get("default_permissions"), "extends": None}
+                                                          if (p.get("config") or {}).get("default_permissions")
+                                                          and "sandbox" not in p else None)}})
         send({"jsonrpc": "2.0", "method": "thread/started", "params": {"thread": thread_obj(tid)}})
     elif meth == "thread/loaded/list":
         send({"jsonrpc": "2.0", "id": rid, "result": {"data": list(THREADS), "nextCursor": None}})
@@ -140,6 +149,8 @@ for line in sys.stdin:
             reply = "[model-card]"
         if "[[askaccount]]" in text:
             reply = "[account-card]"
+        if "[[config]]" in text:      # what the thread was started with, for a test to pin its overrides
+            reply += " config=" + json.dumps(tp.get("config"), sort_keys=True)
         if "[[empty]]" in text:
             reply = "" if not THREADS[tid].get("emptied") else "STUB second try"
             THREADS[tid]["emptied"] = True

@@ -93,7 +93,7 @@ class ConnectInstall(ConnectBase):
         self.assertEqual((cfg["CLAUDE"], cfg["PLUGIN_DIR"], cfg["INBOX_DIR"], cfg["RESULTS_DIR"], cfg["ROOT"]),
                          (str(self.claude), str(self.plugin), str(self.inbox), str(self.results), str(self.work)))
         self.assertEqual((cfg["PERMISSION_MODE"], cfg["HMAC_STRICT"], cfg["ALLOW_NON_OWNER"], cfg["ALLOW_COLLABORATOR"]),
-                         ("bypassPermissions", "1", "", "1"), "a key file alone is strict; collaborators on, other non-owners off")
+                         ("bypassPermissions", "1", "1", "1"), "a key file alone is strict; collaborators and other non-owners on")
         self.assertTrue(cli.SESSION_ID_RE.match(cfg["SESSION_ID"]), "install mints the session id")
         self.assertEqual(cfg["HITL_STORE"], str(cli.hitl_store_root()), "the bridge's claude-local root is persisted")
         self.assertTrue(self.inbox.is_dir() and self.results.is_dir())
@@ -1193,7 +1193,7 @@ class ConnectStrict(ConnectBase):
         runner = self.runner()
         self.assertEqual(self.install_with(runner)[0], 0)
         cfg = cli.read_config(cli.config_path())
-        self.assertEqual((cfg["ALLOW_COLLABORATOR"], cfg["ALLOW_NON_OWNER"]), ("1", ""))
+        self.assertEqual((cfg["ALLOW_COLLABORATOR"], cfg["ALLOW_NON_OWNER"]), ("1", "1"))
         self.assertIn("INFO collaborator tasks: submitted into this session with the non-owner note (the default; "
                       "--no-allow-collaborator opts out)", self.main("verify")[1])
         self.assertTrue(inbox.allow_collaborator())
@@ -1212,18 +1212,28 @@ class ConnectStrict(ConnectBase):
             path.write_text("".join(lines + ([] if written is None else ["ALLOW_COLLABORATOR=\n"])))
             self.assertTrue(inbox.allow_collaborator(), "an older install's empty or absent value serves them now")
 
-    def test_allow_non_owner_is_persisted_off_by_default_and_shown_by_verify(self):
+    def test_non_owners_are_on_by_default_opted_out_by_no_allow_non_owner_and_shown_by_verify(self):
         runner = self.runner()
         self.assertEqual(self.install_with(runner)[0], 0)
-        self.assertEqual(cli.read_config(cli.config_path())["ALLOW_NON_OWNER"], "")
-        self.assertIn("INFO non-owner tasks: refused (owner only)", self.main("verify")[1])
-        self.assertFalse(inbox.allow_non_owner())
-        self.assertEqual(self.install_with(runner, False, "--allow-non-owner")[0], 0)
         self.assertEqual(cli.read_config(cli.config_path())["ALLOW_NON_OWNER"], "1")
-        self.assertIn("INFO non-owner tasks: refused: a restricted turn must be isolated and read-only", self.main("verify")[1])
+        self.assertIn("INFO non-owner tasks: answered on an isolated read-only `claude -p` turn, never this session "
+                      "(the default; --no-allow-non-owner opts out)", self.main("verify")[1])
         self.assertTrue(inbox.allow_non_owner())
         self.assertTrue(inbox.allow_non_owner({inbox.CONFIG_DIR_VAR: str(cli.config_dir())}), "the pane's config dir")
         self.assertFalse(inbox.allow_non_owner({inbox.CONFIG_DIR_VAR: str(self.home / "none")}), "unreadable reads as off")
+        self.assertEqual(self.install_with(runner, False, "--no-allow-non-owner")[0], 0)
+        self.assertEqual(cli.read_config(cli.config_path())["ALLOW_NON_OWNER"], "0")
+        self.assertIn("INFO non-owner tasks: refused (--no-allow-non-owner)", self.main("verify")[1])
+        self.assertFalse(inbox.allow_non_owner())
+        self.assertEqual(self.install_with(runner, False, "--allow-non-owner")[0], 0)
+        self.assertEqual(cli.read_config(cli.config_path())["ALLOW_NON_OWNER"], "1", "the older flag still works")
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self.install("--allow-non-owner", "--no-allow-non-owner")
+        path = cli.config_path()
+        for written in ("", None):
+            lines = [l for l in path.read_text().splitlines(True) if not l.startswith("ALLOW_NON_OWNER=")]
+            path.write_text("".join(lines + ([] if written is None else ["ALLOW_NON_OWNER=\n"])))
+            self.assertTrue(inbox.allow_non_owner(), "an older install's empty or absent value serves them now")
         self.assertEqual(inbox.CONFIG_DIR_VAR, hold_mod.ENV_CONFIG_DIR)
 
 
@@ -1677,7 +1687,7 @@ class CollaboratorAdmission(ConnectBase):
         self.assertEqual((rc, out.get("answered"), out.get("interrupted")), (0, True, False), out)
         self.assertEqual((self.results / "task-ci.txt").read_text(), task_io.NON_OWNER_REFUSED, "interrupt refuses it too")
 
-    def test_by_default_a_collaborator_is_claimed_with_its_admission_and_team_and_guest_are_refused(self):
+    def test_by_default_a_collaborator_is_claimed_and_team_and_guest_are_never_submitted(self):
         self.configure()
         t = self.task("task-c", "team", "collaborator: true\n")
         rc, out = self.verb("claim", t)
@@ -1685,6 +1695,11 @@ class CollaboratorAdmission(ConnectBase):
                          (0, "collaborator", "team", True), out)
         self.assertFalse((self.results / (t + ".txt")).exists(), "submitted to the session, never refused")
         for t, tier, extra in (("task-t", "team", ""), ("task-g", "guest", ""), ("task-gc", "guest", "collaborator: true\n")):
+            rc, out = self.verb("claim", self.task(t, tier, extra))
+            self.assertEqual((rc, "admission" in out, "isolated read-only turn" in out.get("refused", "")),
+                             (1, False, True), (t, out))
+        self.configure(ALLOW_NON_OWNER="0")
+        for t, tier, extra in (("task-t0", "team", ""), ("task-g0", "guest", ""), ("task-gc0", "guest", "collaborator: true\n")):
             rc, out = self.verb("claim", self.task(t, tier, extra))
             self.assertEqual((rc, (self.results / (t + ".txt")).read_text()), (1, task_io.NON_OWNER_REFUSED), t)
         rc, out = self.verb("interrupt", self.task("task-ci", "team", "collaborator: true\n"))
