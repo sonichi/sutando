@@ -41,9 +41,33 @@
      }
     },
     {
+     "method": "config/read",
+     "params": {
+      "cwd": "<tmp>"
+     }
+    },
+    {
      "method": "thread/start",
      "params": {
       "approvalPolicy": "never",
+      "config": {
+       "features": {
+        "apps": false,
+        "browser_use": false,
+        "browser_use_external": false,
+        "computer_use": false,
+        "hooks": false,
+        "in_app_browser": false,
+        "memories": false,
+        "plugins": false
+       },
+       "mcp_servers": {
+        "owner-mcp": {
+         "enabled": false
+        }
+       },
+       "web_search": "disabled"
+      },
       "cwd": "<tmp>",
       "ephemeral": true,
       "sandbox": "read-only"
@@ -626,5 +650,8 @@
  },
  "audience_rerecorded": {
   "why": "the codex prompt and the routine payload carry task_io.AUDIENCE_RULE (an audience: line before the routine body; a sentence after the Codex sender stance); with that text removed both recordings equal the previous ones"
+ },
+ "no_integrations_rerecorded": {
+  "why": "a restricted codex thread first reads the effective config (config/read) and starts with every MCP server it names disabled, web search off and the connector features off (thread/start config); with that call and key removed the recording equals the previous one"
  }
 }

@@ -72,6 +72,10 @@ class IsolatedRestrictedTurn(ConnectBase):
         for flag in ("-p", "--safe-mode", "--restricted", "--strict-mcp-config", "--no-session-persistence"):
             self.assertIn(flag, run["argv"])
         self.assertEqual(run["argv"][run["argv"].index("--tools") + 1], "Read,Grep,Glob", "read tools only")
+        # No MCP server: --strict-mcp-config with no --mcp-config loads none of the login's or a project's
+        # (measured on claude 2.1.322 against a stub MCP server: no mcp__ tool and no WebFetch/WebSearch).
+        self.assertNotIn("--mcp-config", run["argv"])
+        self.assertFalse({"WebFetch", "WebSearch", "Bash"} & set(run["argv"][run["argv"].index("--tools") + 1].split(",")))
         self.assertNotIn("bypassPermissions", run["argv"])
         self.assertNotIn("--plugin-dir", run["argv"], "not the owner's plugin")
         self.assertNotIn("--resume", run["argv"]); self.assertNotIn("--session-id", run["argv"])

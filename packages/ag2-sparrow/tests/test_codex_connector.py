@@ -542,6 +542,67 @@ class AdmissionGateTest(unittest.TestCase):
                 self.assertEqual(saved_threads(d), [])
 
 
+
+class NoIntegrationsTest(unittest.TestCase):
+    """A restricted thread starts with every configured MCP server disabled by name, Codex's web search off and
+    the owner's connectors, plugins, hooks and memories off; the owner's and a collaborator's threads get no
+    override. (Measured on a real codex 0.167 app-server: an empty `mcp_servers` override removes nothing.)"""
+
+    def config_of(self, text):
+        return json.loads(text.split(" config=", 1)[1])
+
+    def test_a_restricted_thread_disables_mcp_web_search_and_connectors(self):
+        with tempfile.TemporaryDirectory() as d:
+            now = time.time()
+            write_task(d, "task-chat-g", "[[config]] guest", tier="guest", mtime=now - 30)
+            write_task(d, "task-chat-t", "[[config]] plain team", tier="team", mtime=now - 20)
+            write_task(d, "task-chat-x", "[[config]] unknown", tier="admin", mtime=now - 10)
+            self.assertEqual(run_connector(d, once=3), 0)
+            for tid in ("task-chat-g", "task-chat-t", "task-chat-x"):
+                cfg = self.config_of(result(d, tid))
+                self.assertEqual(cfg["mcp_servers"], {"owner-mcp": {"enabled": False}}, tid)
+                self.assertEqual(cfg["web_search"], "disabled", tid)
+                self.assertEqual({k for k, on in cfg["features"].items() if on is not False}, set(), tid)
+                for feature in ("apps", "plugins", "hooks", "memories"):
+                    self.assertIs(cfg["features"][feature], False, (tid, feature))
+
+    def test_the_owner_and_a_collaborator_keep_their_integrations(self):
+        tid = "task-1792100000009"
+        with tempfile.TemporaryDirectory() as d:
+            now = time.time()
+            write_task(d, "task-chat-o", "[[config]] owner", mtime=now - 20)
+            write_text(d, tid, gateway_mid_task(tid, "[[config]] collab", tier="team", collaborator=True),
+                       mtime=now - 10)
+            self.assertEqual(run_connector(d, once=2), 0)
+            for t in ("task-chat-o", tid):
+                self.assertTrue(result(d, t).rstrip().endswith(" config=null"), result(d, t))
+
+    def connector(self, answer):
+        class Rpc:
+            def request(self, method, params=None, timeout=120):
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+        c = cc.Connector(FakeRpc, cc.build_parser().parse_args(["--work", "w"]), note="n")
+        c.rpc = Rpc()
+        return c
+
+    def test_an_unreadable_config_fails_the_turn_closed_and_a_dead_server_raises(self):
+        for answer in (RuntimeError('config/read: {"code": -32601}'), {"config": {"mcp_servers": ["x"]}}):
+            with self.assertRaises(cc.IntegrationsUnknown):
+                self.connector(answer).no_integrations("/tmp")
+        with self.assertRaises(RuntimeError) as raised:
+            self.connector(RuntimeError("config/read: server pipe closed (x)")).no_integrations("/tmp")
+        self.assertNotIsInstance(raised.exception, cc.IntegrationsUnknown)
+        self.assertEqual(self.connector({"config": {}}).no_integrations("/tmp")["mcp_servers"], {})
+        c = self.connector({})
+        with mock.patch.object(c, "open_for", side_effect=cc.IntegrationsUnknown("refused")), \
+                mock.patch.object(c, "run_turn") as turn:
+            status, text, err = c.run_task({"access_tier": "guest"}, "p", task_io.turn_policy({}, True).capabilities)
+        self.assertEqual((status, text), ("failed", ""))
+        self.assertIn("could not be read to switch them off (refused)", err)
+        turn.assert_not_called()
+
 class EndToEndStubTest(unittest.TestCase):
     def test_tasks_run_in_mtime_order_not_name_order(self):
         with tempfile.TemporaryDirectory() as d:

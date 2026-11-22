@@ -41,6 +41,15 @@ CLIENT = {"name": "ag2-sparrow-codex", "version": "0.1.0"}
 APPROVAL_REQUESTS = ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
                      "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval")
 NON_OWNER_SANDBOX = "read-only"
+# A turn without integrations (turn_policy's restricted kind): Codex's own web search and the owner's
+# connectors, plugins, hooks and memories off; each configured MCP server is disabled by name in start_thread.
+NO_INTEGRATIONS = {"web_search": "disabled",
+                   "features": dict.fromkeys(("apps", "plugins", "hooks", "memories", "browser_use",
+                                              "browser_use_external", "computer_use", "in_app_browser"), False)}
+
+
+class IntegrationsUnknown(RuntimeError):
+    """The effective config could not be read, so a turn without integrations is not started."""
 NO_REPLY = "[no reply] Codex completed the turn without a message."
 # --held: the launcher that spawned this process holds the work root and attaches it as the consumer
 # whose liveness fences the root; the connector waits this long for that record, then refuses.
@@ -223,8 +232,26 @@ class Connector:
             p["model"] = self.args.model
         return p
 
+    def no_integrations(self, cwd):
+        """The thread config override for a turn without integrations: NO_INTEGRATIONS plus every MCP server
+        the effective config (seen from the turn's cwd) names, disabled. An empty `mcp_servers` override
+        merges into the owner's and removes nothing, so each is named. A refused or malformed answer raises
+        IntegrationsUnknown; a dead or silent server raises as thread/start would."""
+        try:
+            res = self.rpc.request("config/read", {"cwd": cwd})
+        except RuntimeError as e:
+            if "server pipe closed" in str(e):
+                raise
+            raise IntegrationsUnknown(str(e)[:200])
+        servers = (res.get("config") or {}).get("mcp_servers") or {}
+        if not isinstance(servers, dict):
+            raise IntegrationsUnknown("config/read gave mcp_servers as %s" % type(servers).__name__)
+        return dict(NO_INTEGRATIONS, mcp_servers={name: {"enabled": False} for name in servers})
+
     def start_thread(self, caps, ephemeral):
         params = dict(self.thread_params(caps), ephemeral=ephemeral)
+        if not caps.integrations:
+            params["config"] = self.no_integrations(params["cwd"])
         if self.args.developer_instructions:
             params["developerInstructions"] = self.args.developer_instructions
         res = self.rpc.request("thread/start", params)
@@ -412,7 +439,10 @@ class Connector:
         caps = caps or capabilities(headers)    # the gate's decision, when the caller has it
         durable = caps.session == "durable"
         for attempt in (1, 2):
-            self.open_for(headers, caps)
+            try:
+                self.open_for(headers, caps)
+            except IntegrationsUnknown as e:
+                return "failed", "", "the configured integrations could not be read to switch them off (%s)" % e
             self.last_thread = self.thread_id
             status, text, err = self.run_turn(prompt, self.args.model, self.turn_cwd(caps))
             if status == "server-exited":
