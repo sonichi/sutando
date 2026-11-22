@@ -923,5 +923,30 @@ class CodexCore(Base):
         self.assertIn("uses it from its next start", words)
 
 
+class Runtime(unittest.TestCase):
+    """Which core the card is for: `sutando-config.sh core-runtime`, read once; 'claude' when unreadable."""
+
+    def setUp(self):
+        mc.core_runtime.cache_clear()
+        self.addCleanup(mc.core_runtime.cache_clear)
+
+    def test_the_configured_runtime_else_claude(self):
+        for result, want in ((subprocess.CompletedProcess([], 0, "codex\n", ""), "codex"),
+                             (subprocess.CompletedProcess([], 1, "codex\n", ""), "claude"),
+                             (subprocess.CompletedProcess([], 0, "", ""), "claude"),
+                             (OSError("no bash"), "claude"),
+                             (subprocess.TimeoutExpired("bash", 20), "claude")):
+            mc.core_runtime.cache_clear()
+            kw = {"side_effect": result} if isinstance(result, BaseException) else {"return_value": result}
+            with mock.patch.object(mc.subprocess, "run", **kw) as run:
+                self.assertEqual(mc.core_runtime(), want, result)
+            self.assertEqual(run.call_args[0][0][-1], "core-runtime")
+
+    def test_the_codex_home_is_codex_core_models(self):
+        with mock.patch.object(mc.codex_core_model, "home", return_value=Path("/x")) as home:
+            self.assertEqual(mc.codex_home(), Path("/x"))
+        home.assert_called_once_with(mc._REPO)
+
+
 if __name__ == "__main__":
     unittest.main()
