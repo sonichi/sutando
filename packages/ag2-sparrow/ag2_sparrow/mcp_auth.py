@@ -197,25 +197,47 @@ def stdio_descriptor(env_path: str) -> dict:
     """The non-secret descriptor the desktop's stdio `ag2-mcp-proxy` reads (AG2_MCP_DESCRIPTOR) for the agent's
     own `.env` at `env_path`: that file and the key its token line has, the mint and MCP URLs discovered with that
     very token, and `bearer_digest`, the sha256 of its secret the proxy checks a plain mint against (as the
-    desktop writes it). Only that file is read: a token in the environment, a vault or another file is never
-    the descriptor's, since the proxy mints from the file alone."""
+    desktop writes it). A seat .env (only a token-file pointer) gives the `token_format: "raw"` form instead:
+    `env_file` is the raw token file it names, `relay` that file's own relay half, and no `env_key`, so a proxy
+    without raw support fails loudly. Nothing else is read: a token in the environment, a vault or another file
+    is never the descriptor's, since the proxy mints from the file alone."""
     if not env_path:
         raise McpAuthError("descriptor needs --env-file, the agent's own .env")
     try:
         text = Path(env_path).read_text(encoding="utf-8")
     except OSError as exc:
         raise McpAuthError(f"{env_path} is unreadable ({type(exc).__name__})")
-    from .gateway_credential_sources import plain_token
+    from .gateway_credential_sources import plain_token, raw_token_line, seat_token_path
     key, url, bearer = plain_token(text)
     if not key:
-        raise McpAuthError(f"{env_path} has no REMOTE_TASK_TOKEN= line, which is all the stdio proxy reads: a seat "
-                           ".env (connect, --token-stdin) keeps its token in a separate raw file the proxy cannot read")
+        raw_path = seat_token_path(env_path, text)
+        if not raw_path:
+            raise McpAuthError(f"{env_path} has neither a REMOTE_TASK_TOKEN= line nor a seat's token-file pointer")
+        try:
+            relay, secret = raw_token_line(Path(raw_path).read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise McpAuthError(f"the seat's token file {raw_path} is unreadable ({type(exc).__name__})")
+        if not relay or not secret.strip():
+            raise McpAuthError(f"the seat's token file {raw_path} holds no <relay_url>|<secret> line")
+        mint_url, mcp_url = discover(relay, secret)
+        return {"version": 1, "lane": "primary", "token_format": "raw", "env_file": raw_path, "mint_url": mint_url,
+                "mcp_url": mcp_url, "relay": relay,
+                "bearer_digest": hashlib.sha256(secret.strip().encode("utf-8")).hexdigest()}
     if not url or not bearer:
         raise McpAuthError(f"{env_path}'s token names no relay URL (<relay_url>|<secret>)")
     mint_url, mcp_url = discover(url, bearer)
     return {"version": 1, "lane": "primary", "env_file": env_path, "env_key": key, "mint_url": mint_url,
             "mcp_url": mcp_url, "relay": url.rstrip("/"),
             "bearer_digest": hashlib.sha256(bearer.strip().encode("utf-8")).hexdigest()}
+
+
+def seat_token_file(env_path: str) -> str:
+    """The realpath of the raw token file the seat .env at `env_path` names, '' when it names none."""
+    from .gateway_credential_sources import seat_token_path
+    try:
+        return seat_token_path(env_path, Path(env_path).read_text(encoding="utf-8"))
+    except OSError:
+        return ""
 
 
 def setup_lines(gateway: Gateway) -> list:

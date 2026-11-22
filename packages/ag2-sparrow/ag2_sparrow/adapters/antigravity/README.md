@@ -140,11 +140,13 @@ and the policy decides:
   [AG2_MCP_DESCRIPTOR, AG2_MCP_LOG]}`: paths only, exactly what Claude Code's stdio entry carries. The proxy,
   agy's child, reads the relay token from the token file, mints as the agent, sends the relay token only to
   the mint and the access token only to the MCP endpoint, and scrubs its own environment.
-- **Token file shape (stdio).** The proxy reads a `REMOTE_TASK_TOKEN=<relay>|<secret>` line, so the stdio
-  path works with an agent `.env` passed as `--token-env-file`. A seat made by `--token-stdin` or `connect`
-  has an `.env` (`channels/ag2space/.env`) with only `REMOTE_TASK_TOKEN_FILE` and its token as a raw line in
-  `channels/ag2space/token`, which the proxy cannot read: `descriptor` refuses it ("a seat .env …") and the
-  turn runs without the tools (logged). Such an agent needs the proxy to read a raw token file first.
+- **Token file shape (stdio).** An agent `.env` with a `REMOTE_TASK_TOKEN=<relay>|<secret>` line gets the
+  plain descriptor (`env_file` that `.env`, `env_key` its key). A seat made by `--token-stdin` or `connect` has
+  an `.env` (`channels/ag2space/.env`) holding only `REMOTE_TASK_TOKEN_FILE`, and its token as a raw line in
+  `channels/ag2space/token`: it gets `token_format: "raw"` with `env_file` that token file's realpath,
+  `relay` the file's own relay half (never a `REMOTE_TASK_URL` override) and no `env_key`. That needs the
+  desktop proxy from ag2space-cinny-desktop#1246; an older proxy refuses it at start ("descriptor missing
+  env_key") and agy reports the tools unavailable.
 - **When none.** No token file (`--work` with a bridge you run), no HTTP and no `--mcp-proxy-command`, or a
   failed exchange: the turn runs without the tools and the log says why.
 - **Which tools.** agy asks before each MCP call; the policy grants, to owner and team turns only, the

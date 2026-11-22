@@ -144,6 +144,16 @@ DESCRIPTOR_NAME = "ag2-mcp-descriptor.json"
 PROXY_LOG_NAME = "ag2-mcp-proxy.log"
 
 
+def _descriptor_file(desc, token_env_file):
+    """The file a descriptor must name: the .env itself, or for `token_format: "raw"` (no env_key) the raw
+    token file that seat .env points at; None for any other shape."""
+    if desc.get("token_format") == "raw" and "env_key" not in desc:
+        return mcp_auth.seat_token_file(token_env_file) or None
+    if "token_format" not in desc and isinstance(desc.get("env_key"), str):
+        return os.path.realpath(token_env_file)
+    return None
+
+
 def stdio_entry(proxy_command, token_env_file, agent_id, state_dir, run=subprocess.run):
     """(the ACP stdio `McpServer` running the desktop's `ag2-mcp-proxy` as this agent, '') or (None, why). The
     proxy gets only the path of a non-secret descriptor (written 0600 in `state_dir`) naming the agent's own
@@ -157,8 +167,8 @@ def stdio_entry(proxy_command, token_env_file, agent_id, state_dir, run=subproce
     try:
         for k in ("mint_url", "mcp_url"):
             mcp_auth._safe_url(k, desc.get(k))
-        ok = desc.get("version") == 1 and isinstance(desc.get("env_key"), str) and isinstance(desc.get("env_file"), str) \
-            and os.path.realpath(desc["env_file"]) == os.path.realpath(token_env_file)
+        ok = desc.get("version") == 1 and isinstance(desc.get("env_file"), str) \
+            and os.path.realpath(desc["env_file"]) == _descriptor_file(desc, token_env_file)
     except mcp_auth.McpAuthError:
         ok = False
     if not ok:

@@ -254,8 +254,9 @@ the environment, Claude Code needs `REMOTE_TASK_TOKEN` in its environment too.
 an `Authorization` header with the access token) for an ACP client that takes headers rather than a
 helper; the Antigravity adapter runs it for each owner or team turn. `ag2-sparrow-mcp descriptor --env-file <the
 agent's .env>` prints, without minting, the non-secret descriptor the desktop's stdio `ag2-mcp-proxy` reads
-(`AG2_MCP_DESCRIPTOR`) for that file. It reads only that file, never a token from the environment or the
-vault, because the proxy mints from that file alone.
+(`AG2_MCP_DESCRIPTOR`) for that file: for a seat `.env`, the `token_format: "raw"` form naming the raw
+token file it points at. It reads only that file (and that token file), never a token from the environment
+or the vault, because the proxy mints from that file alone.
 
 Check it with `ag2.whoami`: it answers `Authenticated as @<agent> (agent)`. Agents
 whose kind is `sutando` or `acp` can make the exchange; others get a 401 naming the reason.

@@ -175,6 +175,52 @@ class HeadersTest(unittest.TestCase):
         self.assertTrue(all(a == f"Bearer {SECRET}" for _, _, a, _ in self.stub.seen), "never the env's token")
         self.assertNotIn("env-secret-other", r.stdout + r.stderr)
 
+    def _seat(self, token_line, extra=""):
+        d = tempfile.mkdtemp(prefix="mcp-seat-")
+        chan = os.path.join(d, "channels", "ag2space")
+        os.makedirs(chan)
+        token = os.path.join(chan, "token")
+        with open(token, "w") as fh:
+            fh.write(token_line)
+        os.chmod(token, 0o600)
+        env = os.path.join(chan, ".env")
+        with open(env, "w") as fh:
+            fh.write(f"AGENT_MXID=@a:s.space\nREMOTE_TASK_TOKEN_FILE={token}\nREMOTE_TASK_TIER=owner\n{extra}")
+        os.chmod(env, 0o600)
+        return env, os.path.realpath(token)
+
+    def test_a_seat_env_gives_the_raw_descriptor_of_its_token_file(self):
+        seat_env, token = self._seat(f"\n{self.stub.relay}/|{SECRET}\n",
+                                     extra="REMOTE_TASK_URL=https://override.example/relay\n")
+        rc, out, err = _run_main(["descriptor", "--env-file", seat_env], None)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out), {"version": 1, "lane": "primary", "token_format": "raw", "env_file": token,
+                                           "mint_url": f"{self.stub.base}/api/v1/mcp/agent-access-tokens",
+                                           "mcp_url": f"{self.stub.base}/mcp", "relay": self.stub.relay,
+                                           "bearer_digest": hashlib.sha256(SECRET.encode()).hexdigest()})
+        self.assertNotIn("env_key", json.loads(out), "an older proxy fails loudly on a raw descriptor")
+        self.assertNotIn(SECRET, out + err)
+        self.assertEqual([(p, a) for _, p, a, _ in self.stub.seen], [("/relay/v1/mcp/discovery", f"Bearer {SECRET}")],
+                         "the token file's own relay, never the REMOTE_TASK_URL override; nothing minted")
+
+    def test_a_seat_descriptor_ignores_a_token_in_the_environment(self):
+        seat_env, token = self._seat(f"{self.stub.relay}|{SECRET}\n")
+        r = subprocess.run([sys.executable, "-m", "ag2_sparrow.mcp_auth", "descriptor", "--env-file", seat_env],
+                           capture_output=True, text=True, timeout=60,
+                           env=hermetic_env(PYTHONPATH=str(PKG_ROOT),
+                                            REMOTE_TASK_TOKEN=f"{self.stub.relay}|env-secret-other"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = json.loads(r.stdout)
+        self.assertEqual((got["env_file"], got["bearer_digest"]), (token, hashlib.sha256(SECRET.encode()).hexdigest()))
+        self.assertTrue(all(a == f"Bearer {SECRET}" for _, _, a, _ in self.stub.seen))
+
+    def test_a_seat_token_file_without_a_relay_or_secret_is_refused(self):
+        for line in ("", "bare-secret-only\n", f"{self.stub.relay}|  \n", "REMOTE_TASK_TOKEN=x|y\n"):
+            seat_env, _ = self._seat(line)
+            rc, out, err = _run_main(["descriptor", "--env-file", seat_env], None)
+            self.assertEqual((rc, out), (1, ""), line)
+        self.assertEqual(self.stub.seen, [])
+
     def test_descriptor_refuses_a_file_the_proxy_cannot_read(self):
         seat_env = self._env("AGENT_MXID=@a:s.space\nREMOTE_TASK_TOKEN_FILE=/seat/channels/ag2space/token\n")
         raw = self._env(f"{self.stub.relay}|{SECRET}\n", "token")   # a seat's raw token file
@@ -183,7 +229,7 @@ class HeadersTest(unittest.TestCase):
             rc, out, err = _run_main(["descriptor", "--env-file", path], (self.stub.relay, SECRET, path))
             self.assertEqual((rc, out), (1, ""), path)
             self.assertNotIn(SECRET, err)
-        self.assertIn("a seat .env", _run_main(["descriptor", "--env-file", seat_env], None)[2])
+        self.assertIn("is unreadable", _run_main(["descriptor", "--env-file", seat_env], None)[2])
         self.assertEqual(self.stub.seen, [], "the bearer is not sent for a descriptor that cannot work")
 
     def test_owner_tools_are_the_ag2_space_servers_room_tools_only(self):

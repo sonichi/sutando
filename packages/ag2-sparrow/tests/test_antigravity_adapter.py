@@ -916,6 +916,27 @@ class SspaceStdioTest(unittest.TestCase):
         self.assertIn("no REMOTE_TASK_TOKEN= line", got[1])
         self.assertFalse(os.path.exists(os.path.join(state, gc.DESCRIPTOR_NAME)))
 
+    def test_a_seat_gets_the_raw_descriptor_of_the_token_file_it_names(self):
+        chan = Path(self.tmp.name) / "seat" / "channels" / "ag2space"
+        chan.mkdir(parents=True)
+        (chan / "token").write_text("https://relay.s.space|seat-secret\n")
+        seat_env = chan / ".env"
+        seat_env.write_text("AGENT_MXID=@agy:s.space\nREMOTE_TASK_TOKEN_FILE=%s\n" % (chan / "token"))
+        token = os.path.realpath(chan / "token")
+        raw = {k: v for k, v in self.desc.items() if k != "env_key"}
+        raw.update(token_format="raw", env_file=token)
+        state = str(self.w.root / "state")
+        reply = lambda d: (lambda argv, **kw: mock.Mock(returncode=0, stdout=json.dumps(d), stderr=""))  # noqa: E731
+        with mock.patch("ag2_sparrow.connect_bridge.credential_env", lambda tf, aid: ({"AG2_DEVICE_ENV": tf}, "")):
+            entry, why = gc.stdio_entry(PROXY, str(seat_env), "@agy:s.space", state, run=reply(raw))
+            self.assertEqual(why, "")
+            self.assertEqual(json.loads(Path(entry["env"][0]["value"]).read_text()), dict(raw, agent_id="@agy:s.space"))
+            for bad in (dict(raw, env_key="REMOTE_TASK_TOKEN"), dict(raw, env_file=str(seat_env)),
+                        dict(raw, env_file="/other/token"), dict(raw, token_format="pem")):
+                self.assertIsNone(gc.stdio_entry(PROXY, str(seat_env), "@agy:s.space", state, run=reply(bad))[0], bad)
+            plain = gc.stdio_entry(PROXY, self.token_file, "@agy:s.space", state, run=reply(raw))
+            self.assertIsNone(plain[0], "a plain .env names no raw token file")
+
     def test_install_records_and_hands_on_the_proxy_command(self):
         cfg = {"ACP_COMMAND": "agy acp", "CWD": "/c", "TOKEN_ENV_FILE": "/a/agent.env", "AGENT_ID": "@agy:s.space",
                "MCP_PROXY_COMMAND": PROXY}

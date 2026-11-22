@@ -578,6 +578,27 @@ def plain_token(text: str) -> "tuple[str, str, str]":
     return key, (token_file_url(text) or url_from_token).rstrip("/"), secret
 
 
+def raw_token_line(text: str) -> "tuple[str, str]":
+    """(relay, secret) of a seat's raw token file as the desktop's stdio MCP proxy reads one (token_format "raw"):
+    its first nonempty line, split at the first `|` (relay trailing `/` stripped; no `|` is a bare secret).
+    ('', '') when that line is a `KEY=` assignment or there is none."""
+    line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    if not line or "=" in line.split("|", 1)[0]:
+        return "", ""
+    relay, sep, secret = line.partition("|")
+    return (relay.rstrip("/"), secret) if sep else ("", line)
+
+
+def seat_token_path(env_path: str, env_text: str) -> str:
+    """The realpath of the raw token file a seat .env (its text `env_text`, at `env_path`) names, '' when it
+    names none or also assigns a token itself."""
+    values = parse_env_text(env_text)
+    named = named_token_file(values)
+    if not named or first(values, TOKEN_KEYS)[0]:
+        return ""
+    return os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(env_path)), os.path.expanduser(named)))
+
+
 def token_file_url(text: str) -> str:
     """The REMOTE_TASK_URL (legacy AG2_REMOTE_URL) of a split-layout token file's text, or ""."""
     return first(_assignments(text, URL_KEYS), URL_KEYS)[0]
