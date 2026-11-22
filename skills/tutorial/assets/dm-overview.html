@@ -1,0 +1,123 @@
+<style>/* Unified guide header and optional checklist */
+#overview { padding-bottom:18px; }
+#overview .container { max-width:992px; }
+#overview .overview-hero { padding:clamp(22px, 4vw, 42px); margin-bottom:16px; }
+#overview .hero-copy { max-width:710px; }
+#overview .guide-label { display:flex; align-items:center; gap:9px; margin:0 0 20px; font-size:13px; font-weight:700; letter-spacing:.025em; }
+#overview .brand-mark { width:30px; height:30px; display:grid; place-items:center; border-radius:9px; background:#ff9a4b; color:#241912; font-size:18px; font-weight:800; }
+#overview h1 { max-width:690px; font-size:clamp(31px, 5.3vw, 59px); letter-spacing:-.055em; line-height:1.03; margin-bottom:12px; overflow-wrap:anywhere; }
+#overview h1 span { color:var(--acc); }
+#overview .hero-copy .subtitle { max-width:56ch; margin-bottom:9px; }
+#overview .preview-note { color:var(--mute); font-size:12px; line-height:1.45; }
+#overview .guide-nav { margin-top:24px; }
+#overview .steps-tabs { grid-template-columns:repeat(5,minmax(0,1fr)); }
+#overview .tab-btn { min-height:58px; flex-direction:column; align-items:flex-start; justify-content:center; gap:5px; padding:9px 11px; line-height:1.15; hyphens:none; }
+#overview .tab-num { width:auto; height:auto; padding:0; border-radius:0; background:transparent; color:var(--mute); font-size:10px; letter-spacing:.09em; }
+#overview .tab-btn.active .tab-num { background:transparent; color:var(--acc); }
+#overview .tab-btn.active { background:var(--accbg); box-shadow:none; }
+#overview .checklist-jump { display:inline-flex; align-items:center; gap:7px; min-height:44px; color:var(--acc); font-size:13px; font-weight:700; text-underline-offset:.23em; }
+#overview .guide-nav > .checklist-jump { margin-top:7px; }
+#overview .tour-card { margin-top:0; }
+#overview h2 { scroll-margin-top:16px; }
+#overview .guide-links { display:flex; flex-wrap:wrap; gap:4px 18px; margin:0 0 14px; }
+#overview .guide-links a { color:var(--acc); font-size:13px; font-weight:600; min-height:44px; display:inline-flex; align-items:center; text-underline-offset:.23em; }
+#overview .guide-example { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; }
+#overview .guide-example :is(p,span) { flex:1 1 190px; overflow-wrap:anywhere; margin:0; }
+
+#overview :is(a,summary,input):focus-visible { outline:3px solid var(--acc); outline-offset:3px; border-radius:4px; }
+@media(max-width:680px) {
+  #overview .steps-tabs { grid-template-columns:repeat(3,minmax(0,1fr)); }
+}
+@media(max-width:390px) {
+  #overview .steps-tabs { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  #overview .overview-hero { padding:19px 15px; }
+}
+</style>
+<!-- calls -->
+<section class="tour-card" id="step-2">
+    <div class="card-num">Topic · Calls and local tools</div>
+    <h2>Talk through ideas and work live</h2>
+    <p class="card-desc">Talk with teammates in an s.space call and bring in an allowed, voice-enabled agent to listen and respond. For hands-on screen coaching or editing, see the supported local Sutando workflow.</p>
+
+    <div class="callout">
+      <div class="callout-title">🎙️ Bring an agent into the conversation</div>
+      <p>Use the headphone control (Start call) in the room header. In a room, choose an agent under “Bring an agent?” and select “Bring into call”. Ask aloud: <em>"Read the bug report in this room and help us decide what to try next."</em></p>
+    </div>
+
+    <div class="feature-grid">
+      <div class="feature-box">
+        <h4>Voice in the room</h4>
+        <p>In your DM, the agent can answer directly. In a room, explicitly bring it into the call. Voice must be enabled for that agent and allowed in that room.</p>
+      </div>
+      <div class="feature-box">
+        <h4>🖥️ Share context for the conversation</h4>
+        <p>Put relevant text or an artifact in the room for the agent to review. Bringing an agent into the call doesn’t give it access to your screen. Room-call screen sharing is work in progress.</p>
+      </div>
+      <div class="feature-box">
+        <h4>Give the agent a question to answer</h4>
+        <p>Ask the agent to listen for a specific decision or question, then invite it to weigh in. Share relevant room context it can already access.</p>
+      </div>
+    </div>
+
+    <div class="interactive-panel">
+      <div class="panel-title">Explore voice workflows</div>
+      <div class="interactive-tabs">
+        <button class="sub-tab active" onclick="setCallScenario('debug', this)">Discuss a bug report</button>
+        <button class="sub-tab" onclick="setCallScenario('design', this)">UI / Spec Review</button>
+        <button class="sub-tab" onclick="setCallScenario('triage', this)">Issue Triage</button>
+      </div>
+      <div class="panel-content" id="callInfo">
+        <strong>Debug Scenario:</strong> Post the relevant error text in the room. Ask aloud: <em>"Read that error and suggest a way to reproduce it."</em> The agent can help diagnose the shared evidence.
+      </div>
+    </div>
+
+    <!-- calls-example -->
+
+    <div class="card-nav">
+      <button class="btn-nav" onclick="showStep(1)">← Previous topic</button>
+      <button class="btn-nav primary" onclick="showStep(3)">Explore Commons &amp; Tasks →</button>
+    </div>
+  </section>
+<!-- sutando -->
+<section class="tour-card" id="step-4">
+    <div class="card-num">Topic · Sutando guides</div>
+    <h2>Work with your Sutando agent</h2>
+    <p class="card-desc">Sutando is a Mac-local agent powered by Claude Code or Codex. Start with work on your Mac, then add the screen, apps, or tools you want it to use.</p>
+    <div class="feature-grid">
+      <div class="feature-box"><h4>Start with a folder</h4><p>Ask your agent to summarize a folder you choose. Start read-only, then decide whether to allow changes. macOS may ask you to grant access.</p></div>
+      <div class="feature-box"><h4>Use tools on your Mac</h4><p>Depending on setup and permission, Sutando can use Mac apps or a configured Chrome connection, not every signed-in tab. Watch commands in the desktop app’s Terminal.</p></div>
+      <div class="feature-box"><h4>Share a screen for coaching</h4><p>Start voice in your Sutando DM or from This device → Live. Choose Share your screen where available, share only the view you intend and stop anytime. This is separate from room-call screen sharing.</p></div>
+    </div>
+    <div class="interactive-panel">
+      <p class="panel-title">Pick something to try</p>
+      <div class="interactive-tabs" role="group" aria-label="Sutando walkthroughs">
+        <button type="button" class="sub-tab active" aria-pressed="true" onclick="setGuide(0, this)">First task</button>
+        <button type="button" class="sub-tab" aria-pressed="false" onclick="setGuide(1, this)">Local review</button>
+        <button type="button" class="sub-tab" aria-pressed="false" onclick="setGuide(2, this)">Screen coaching</button>
+        <button type="button" class="sub-tab" aria-pressed="false" onclick="setGuide(3, this)">Voice editing</button>
+      </div>
+      <div class="panel-content guide-example"><p id="sutando-example">Summarize the files in this folder. Don’t change anything.</p><button type="button" class="btn-copy" onclick="copyText('sutando-example', this)">Copy</button></div>
+    </div>
+    <p class="card-desc">Connected apps and recurring jobs are optional. A job that needs local files or tools needs the Mac engine to be available.</p>
+    <nav class="guide-links" aria-label="More on Sutando">
+      <a href="https://s.space/docs/how-it-works">How Sutando works</a>
+      <a href="https://s.space/docs/terminal">Watch commands in Terminal</a>
+      <a href="https://s.space/docs/tour#6-calls-and-voice">Calls and voice</a>
+      <a href="https://s.space/docs/other-agents#how-they-differ-from-sutando">Compare agent setups</a>
+    </nav>
+    <div class="card-nav"><button type="button" class="btn-nav" onclick="showStep(3)">← Previous topic</button><a class="checklist-jump" href="#tutorial-checklist" onclick="document.getElementById('tutorial-checklist').open=true">Try it step by step ↓</a></div>
+  </section>
+<!-- script -->
+function setGuide(index, button) {
+  const options = [
+    "Help me pick one useful thing to try in my DM today.",
+    "Review this file and summarize what it does. Don’t make changes.",
+    "Look at the view I approved and coach me through the next step. Let me do the clicking.",
+    "In a supported editor or local session, confirm you have my selection, then rewrite only that passage once I approve. If you can’t see the selection, I’ll paste it."
+  ];
+  button.closest('[role=group]').querySelectorAll('button').forEach(item => {
+    item.classList.toggle('active', item === button);
+    item.setAttribute('aria-pressed', String(item === button));
+  });
+  document.getElementById('sutando-example').textContent = options[index];
+}
