@@ -735,17 +735,17 @@ Config: `REMOTE_MEDIA_MARKER` (tag; unset, both `remote-media` and AG2 Space's `
 `REMOTE_MEDIA_HS_TOKEN` + `REMOTE_MEDIA_HS_ORIGIN` (homeserver bearer and the
 exact origin it may be sent to), `REMOTE_MEDIA_DIR`, `REMOTE_MEDIA_MAX_BYTES`.
 
-Credential routing is by parsed exact origin, never string matching:
+Only two kinds of URL are fetched, matched on the raw URL (no `.`/`..` segment or
+percent-encoding passes, no userinfo or fragment), each with its own bearer:
 
-- gateway bearer → only when the URL's scheme/host/port equal the gateway's
-  AND the path sits at/under the gateway base path with a `/` boundary;
-- homeserver bearer → only for `/_matrix/` paths on exactly
-  `REMOTE_MEDIA_HS_ORIGIN` (legacy media routes are upgraded to the MSC3916
-  authenticated route first); unset origin ⇒ Matrix media is never credentialed;
-- anything else → fetched with no credentials.
+- gateway bearer → `<gateway base>/v1/media/<server>/<id>` on exactly the
+  gateway's scheme/host/port, with at most a `room_id` query parameter;
+- homeserver bearer → `/_matrix/client/v1/media/(download|thumbnail)/<server>/<id>`
+  (or the legacy `/_matrix/media/(r0|v3)/download/…`, upgraded to the MSC3916
+  route) on exactly `REMOTE_MEDIA_HS_ORIGIN`; unset ⇒ never fetched;
+- anything else → never fetched; the marker is left untouched.
 
-Authenticated fetches refuse redirects (a 3xx is a failure), so a
-gateway-controlled URL can never bounce a bearer to another host.
+No media fetch follows a redirect (a 3xx is a failure).
 
 The local `room_ops.py fetch` fallback accepts `mxc://server/id` with an
 explicit `--room`, or a media link under the selected gateway's
