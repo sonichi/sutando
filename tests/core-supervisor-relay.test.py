@@ -271,6 +271,40 @@ class TestComposeMessage(unittest.TestCase):
                 self.assertNotIn("tap Sign in", m, "a card this surface never shows was named")
                 self.assertIn("run /login in the core terminal (the Runtime panel)", m)
 
+    # The card is named only on the surface it reaches; elsewhere the notice names the host.
+    _NO_CARD = ("", "telegram", "discord", "macos")
+    _UNFOCUSED = {"state": "blocked-human", "detail": "awaiting user: fable-limit-unfocused",
+                  "prompt": "You've reached your Fable limit\n❯ Continue with Fable 5.1",
+                  "kind": "fable-limit-unfocused"}
+    _UNKNOWN_GATE = {"state": "blocked-human", "detail": "awaiting user: unknown",
+                     "prompt": "Something the CLI asks that no classifier knows", "kind": "unknown"}
+
+    def test_the_limit_notice_names_the_card_only_on_s_space(self):
+        self.assertIn("buttons on its card in your s.space DM", compose_message(_LIMIT, surface="ag2space"))
+        for surface in self._NO_CARD:
+            with self.subTest(surface=surface):
+                m = compose_message(_LIMIT, surface=surface)
+                self.assertNotIn("its card", m)
+                self.assertIn("from the Runtime panel", m)
+                self.assertIn("switch it to another model or runtime", m)
+
+    def test_the_fable_notice_names_the_card_only_on_s_space(self):
+        self.assertIn("Tap Restart core on its card", compose_message(self._UNFOCUSED, surface="ag2space"))
+        for surface in self._NO_CARD:
+            with self.subTest(surface=surface):
+                m = compose_message(self._UNFOCUSED, surface=surface)
+                self.assertNotIn("its card", m)
+                self.assertIn("in the Runtime panel", m)
+
+    def test_the_restart_notice_names_the_card_only_on_s_space(self):
+        with _no_backend():
+            self.assertIn("tap Restart core on its card", compose_message(self._UNKNOWN_GATE, surface="ag2space"))
+            for surface in self._NO_CARD:
+                with self.subTest(surface=surface):
+                    m = compose_message(self._UNKNOWN_GATE, surface=surface)
+                    self.assertNotIn("its card", m)
+                    self.assertIn("answer it", m)
+
     def test_session_limit_escalates(self):
         self.assertTrue(should_escalate(_LIMIT, None)[0])
 

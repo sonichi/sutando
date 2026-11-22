@@ -130,13 +130,17 @@ _RESET_AT = re.compile(r"resets?\s+(?:at\s+)?((?:[A-Z][a-z]{2}\s+\d{1,2}\s+at\s+
 _CARD_WHERE = "on its card in your s.space DM"
 
 
-def _limit_remedy(signal: dict) -> str:
-    """A usage-limit screen resumes by itself; a sign-in cannot clear it."""
+def _limit_remedy(signal: dict, surface: str = "") -> str:
+    """A usage-limit screen resumes by itself; a sign-in cannot clear it. The card is named
+    only on the surface it reaches."""
     m = _RESET_AT.search(signal.get("prompt") or "")
     when = f"at {m.group(1)}" if m else "when the limit window resets"
+    how = (f"the buttons {_CARD_WHERE} switch it to another model or runtime, or restart it"
+           if _CARD_SURFACE.search(surface or "") else
+           "switch it to another model or runtime, or restart it, from the Runtime panel"
+           f" on {_core_host_label() or 'the host'}")
     return (f" — the core hit its usage limit, not a login problem; it resumes"
-            f" on its own {when}. Nothing to do unless you want it sooner: the buttons"
-            f" {_CARD_WHERE} switch it to another model or runtime, or restart it; signing"
+            f" on its own {when}. Nothing to do unless you want it sooner: {how}; signing"
             " in under a different subscription for a fresh allowance also lifts it.")
 
 
@@ -250,12 +254,14 @@ def compose_message(signal: dict, surface: str = "") -> str:
         msg += (" — the core sits at its idle prompt but refuses every turn it is sent; each"
                 " ends in that line, so nothing queued for it runs")
     if limited:
-        msg += _limit_remedy(signal)
+        msg += _limit_remedy(signal, surface)
     elif signal.get("kind") == "fable-limit-unfocused":
         msg += (" — Claude Code's Fable weekly-limit dialog is up but the focused option is"
                 " not \"Switch to <fallback> and continue\", so the core will not press Enter"
-                f" (that could spend credits). Tap Restart core {_CARD_WHERE}, or pick the"
-                " switch in the Runtime panel.")
+                " (that could spend credits)."
+                + (f" Tap Restart core {_CARD_WHERE}, or pick the switch in the Runtime panel."
+                   if _CARD_SURFACE.search(surface or "") else
+                   " Pick the switch, or restart the core, in the Runtime panel."))
     elif signal.get("state") == "signal-unreadable":
         host = _core_host_label() or "the host"
         msg += (f" — check the core on {host}; restarting the engine rewrites the file."
