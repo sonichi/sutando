@@ -133,18 +133,16 @@ def playbook_lines(skills_root: Optional[Path]) -> dict:
     if skills_root is None:
         return {}
     found: dict = {}
-    try:
-        manifests = sorted(Path(skills_root).glob("*/manifest.json"))
-    except OSError:
-        return {}
-    for manifest in manifests:
+    for manifest in sorted(Path(skills_root).glob("*/manifest.json")):
         playbook = manifest.parent.name
-        if not is_playbook(Path(skills_root), playbook):
-            continue
         try:
-            line = json.loads(manifest.read_text(encoding="utf-8")).get("playbook_line")
-        except (OSError, ValueError, AttributeError):
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
             continue
+        # The same opt-in is_playbook reads, from this one read of the manifest.
+        if not (playbook_value(playbook) and isinstance(data, dict) and data.get("playbook") is True):
+            continue
+        line = data.get("playbook_line")
         if isinstance(line, str) and PLAYBOOK_LINE_RE.fullmatch(line):
             found.setdefault(line, []).append(playbook)
     return {line: names[0] for line, names in found.items() if len(names) == 1}

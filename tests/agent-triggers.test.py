@@ -414,6 +414,40 @@ class PlaybookLines(unittest.TestCase):
             (root / "junk" / "manifest.json").write_text("{not json")
             self.assertEqual(at.playbook_lines(root), {"/good": "good"})
 
+    def test_a_manifest_that_is_not_an_object_or_has_a_bad_id_is_ignored(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = _skills(d, good="/good")
+            (root / "list").mkdir()
+            (root / "list" / "manifest.json").write_text('["/list"]')
+            (root / "Bad_Id").mkdir()
+            (root / "Bad_Id" / "manifest.json").write_text('{"playbook": true, "playbook_line": "/bad"}')
+            self.assertEqual(at.playbook_lines(root), {"/good": "good"})
+
+    def test_lint_checks_playbook_line_and_last_run(self):
+        base = {"version": "0.1.0", "owner": "github:x/y", "stability": "experimental"}
+        cases = (
+            ({"playbook": True, "playbook_line": "/go"}, None),
+            ({"playbook": True, "playbook_line": "go"}, "playbook_line must be"),
+            ({"playbook": True, "playbook_line": 7}, "playbook_line must be"),
+            ({"playbook_line": "/go"}, 'playbook_line needs "playbook": true'),
+            ({"last_run": "x/last.json"}, None),
+            ({"last_run": "../x.json"}, "last_run must be"),
+            ({"last_run": "/abs.json"}, "last_run must be"),
+            ({"last_run": "x.txt"}, "last_run must be"),
+            ({"last_run": "a b.json"}, "last_run must be"),
+        )
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for i, (fields, want) in enumerate(cases):
+            d = Path(tmp.name) / f"lint-pl-{i}"
+            d.mkdir()
+            (d / "manifest.json").write_text(json.dumps({"name": d.name, **base, **fields}))
+            errors, _warnings = lint._lint_manifest(d)
+            if want is None:
+                self.assertEqual(errors, [], fields)
+            else:
+                self.assertTrue(any(want in e for e in errors), (fields, errors))
+
     def test_no_skills_tree_tags_nothing(self):
         self.assertEqual(at.playbook_lines(None), {})
         self.assertIsNone(at.owner_dm_playbook("/tutorial", "owner", "dm", None))

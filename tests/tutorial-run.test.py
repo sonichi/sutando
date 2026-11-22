@@ -179,6 +179,10 @@ class EdgePaths(_Run):
                           encoding="utf-8")
         self.assertEqual(tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=script)["action"], "updated")
 
+    def test_a_non_json_last_line_is_skipped_for_the_one_before_it(self):
+        self.assertEqual(tr._last_json('{"action": "created"}\nnot json\n[1]'), {"action": "created"})
+        self.assertEqual(tr._last_json(""), {})
+
     def test_a_publish_that_raises_is_recorded(self):
         real = tr.subprocess.run
 
