@@ -318,16 +318,12 @@ def compose_message(signal: dict, surface: str = "") -> str:
         why = f"{detail}, {kind}" if kind and kind not in detail else detail
         msg = f"⚠️ Sutando is waiting on you at its terminal on {host} ({why})" + msg[len(" ".join(parts)):]
         msg += "" if msg.endswith((".", "?", "!", "…")) else "."
-        restart = (f" Or tap Restart core {_CARD_WHERE} to start it fresh."
-                   if _CARD_SURFACE.search(surface or "") else "")
         if be:
             # On its own line so it pastes as-is; it must name the session, or a shared
             # socket attaches to the wrong one.
-            last = (restart + " A chat reply can't answer it.").strip()
-            msg += f"\nOpen it with:\n```\n{_attach_command(be)}\n```\n{last}"
+            msg += f"\nOpen it with:\n```\n{_attach_command(be)}\n```\nA chat reply can't answer it."
         else:
-            msg += (" Open the core's terminal or the Runtime panel to answer it." + restart
-                    + " A chat reply can't answer it.")
+            msg += " Open the core's terminal or the Runtime panel to answer it. A chat reply can't answer it."
     return msg
 
 

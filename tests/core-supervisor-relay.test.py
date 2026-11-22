@@ -298,10 +298,10 @@ class TestComposeMessage(unittest.TestCase):
                 self.assertNotIn("its card", m)
                 self.assertIn("in the Runtime panel", m)
 
-    def test_the_restart_notice_names_the_card_only_on_s_space(self):
+    def test_the_terminal_notice_names_no_card_on_any_surface(self):
+        # The relay sends this on s.space only when the core's card is not shown there.
         with _no_backend():
-            self.assertIn("tap Restart core on its card", compose_message(self._UNKNOWN_GATE, surface="ag2space"))
-            for surface in self._NO_CARD:
+            for surface in ("ag2space",) + self._NO_CARD:
                 with self.subTest(surface=surface):
                     m = compose_message(self._UNKNOWN_GATE, surface=surface)
                     self.assertNotIn("its card", m)

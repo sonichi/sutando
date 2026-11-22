@@ -255,6 +255,16 @@ class TestPlainMessage(unittest.TestCase):
         self.assertEqual(lines[fence - 1], "Open it with:")
         self.assertEqual(lines[-1], "A chat reply can't answer it.")
 
+    def test_the_s_space_fallback_names_no_card(self):
+        """On s.space the relay sends only when no card shows the block, so its text points
+        at the terminal alone."""
+        for backend in ({"socket": SOCKET, "session": SESSION}, None):
+            with patch.object(relay, "_derive_backend", lambda: backend):
+                msg = relay.compose_message(UNKNOWN, surface="ag2space")
+            self.assertNotIn("card", msg.lower(), backend)
+            self.assertNotIn("Restart core", msg, backend)
+            self.assertTrue(msg.endswith("A chat reply can't answer it."), backend)
+
     def test_no_recorded_terminal_names_the_places_in_plain_words(self):
         msg = self._message(None)
         self.assertNotIn("tmux", msg)
