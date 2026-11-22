@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CI gate: catch local-time timestamps mislabeled as UTC.
+CI gate: catch local-time timestamps mislabeled as UTC (probe edit).
 
 The bug (issue #908 / PR #909): `time.strftime('%Y-%m-%dT%H:%M:%S')` with no
 time-tuple argument formats *local time*, but callers append a literal `Z`
