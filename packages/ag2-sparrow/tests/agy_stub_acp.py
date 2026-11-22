@@ -134,6 +134,11 @@ def prompt(rid, params):
                     for b in params.get("prompt") or []]})
     if "STUB:HANG" in text:
         return
+    if "STUB:QUOTA" in text:
+        # What agy answered on a real host once the account's quota ran out.
+        send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message":
+              "RESOURCE_EXHAUSTED: Individual quota reached. Try again later."}})
+        return
     cwd = sessions().get(sid) or os.getcwd()
     told = re.search(r"write the result to (results/\S+?\.txt)", text)
     if told:
