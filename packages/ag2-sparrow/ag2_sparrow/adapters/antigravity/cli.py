@@ -66,6 +66,23 @@ def acp_command(acp: "str | None") -> "tuple[str, str]":
     return shlex.join([os.path.abspath(exe)] + argv[1:]), ""
 
 
+def mcp_proxy_command(value: "str | None") -> "tuple[str, str]":
+    """(the stdio proxy's command line, each word quoted, '') or ('', why). Its first word must be an executable
+    file: an unquoted path with a space (the desktop's engine sits under Application Support) splits there, so
+    it is refused with the quoting to use rather than recorded broken."""
+    if not value:
+        return "", ""
+    try:
+        argv = shlex.split(value)
+    except ValueError as e:
+        return "", f"--mcp-proxy-command does not parse ({e})"
+    exe = shutil.which(argv[0]) if argv else None
+    if not exe or len(argv) < 2:
+        return "", ("--mcp-proxy-command must name an executable and its arguments, each path quoted when it has "
+                    "a space: --mcp-proxy-command \"'<node>' '<path>/ag2-mcp-proxy.mjs'\"")
+    return shlex.join([os.path.abspath(exe)] + argv[1:]), ""
+
+
 def child_env(cfg: dict, environ=None) -> dict:
     """The allowlist, the ACP command's own directory first on PATH, and the package root for `-m`."""
     env = cm.child_env_from(ENV_KEEP, environ)
@@ -176,6 +193,8 @@ def install(args) -> int:
     where, why = ({}, why) if why else resolve_root(args)
     if not why:
         why = cb.agent_arg_problem(getattr(args, "agent", None), where["agent_id"])
+    proxy, proxy_why = mcp_proxy_command(getattr(args, "mcp_proxy_command", None))
+    why = why or proxy_why
     cwd = str(Path(args.cwd).expanduser().resolve()) if args.cwd else ""
     if not why and cwd and not os.path.isdir(cwd):
         why = f"--cwd {cwd} is not a directory"
@@ -193,7 +212,7 @@ def install(args) -> int:
               "SESSION_STORE": str(Path(args.session_store).expanduser().resolve()) if args.session_store else "",
               "INBOX_DIR": str(Path(root) / "tasks"), "RESULTS_DIR": str(Path(root) / "results"),
               "ALLOW_NON_OWNER": "1" if args.allow_non_owner else "", "AGENT_ID": where["agent_id"],
-              "MCP_PROXY_COMMAND": getattr(args, "mcp_proxy_command", None) or "",
+              "MCP_PROXY_COMMAND": proxy,
               "BRIDGE": mode if mode != EXTERNAL else "", "TOKEN_ENV_FILE": where["token_file"], "TOKEN_VAULT_KEY": "",
               "BRIDGE_STATE_DIR": str(cb.bridge_home(root) / "state") if mode != EXTERNAL else ""}
 

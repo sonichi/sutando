@@ -18,6 +18,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -131,7 +132,7 @@ def main(argv=None, stdin=None, stdout=None, popen=subprocess.Popen):
         return 2
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
-    note("start, running %s" % os.path.basename(argv[0]))
+    note("start, running %s" % shlex.join(argv))
     child = popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
     names, pending, out_lock = Names(), set(), threading.Lock()
 

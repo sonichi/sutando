@@ -132,7 +132,7 @@ and the policy decides:
 - **Transport.** HTTP when agy's `initialize` declares it (`agentCapabilities.mcpCapabilities.http`). agy
   1.5.9 and 1.5.13 declare no `mcpCapabilities` at all, so for them the server is **stdio**: the desktop app's
   `ag2-mcp-proxy` (`engine/ag2-mcp-proxy.mjs`, the same stdio proxy Claude Code and Codex cores run as their
-  `s-space` server), named at install with `--mcp-proxy-command '<node> <path>/ag2-mcp-proxy.mjs'`. Each turn
+  `s-space` server), named at install with `--mcp-proxy-command "'<node>' '<path>/ag2-mcp-proxy.mjs'"`: quote each path, since the desktop's engine sits under `Application Support`. `install` refuses a command whose first word is not an executable, and records the line with every word quoted. Each turn
   the connector runs `ag2-sparrow-mcp descriptor --env-file <TOKEN_ENV_FILE>` (that file only, whatever
   else holds a token) in the same isolated child and writes the proxy's
   non-secret descriptor (0600, `state/ag2-mcp-descriptor.json`: mint and MCP URLs, the agent's token file and

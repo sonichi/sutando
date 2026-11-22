@@ -967,7 +967,31 @@ class SspaceStdioTest(unittest.TestCase):
                            env={"AG2_MCP_DESCRIPTOR": "/d.json", "AG2_MCP_LOG": str(log)}, cwd="/")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual([t["name"] for t in json.loads(r.stdout)["result"]["tools"]], ["room_action_execute", "ui_request"])
-        self.assertRegex(log.read_text(), r"mcp_name_shim: start, running python[0-9.]*\n.*mcp_name_shim: exit, the server exited 0")
+        text = log.read_text()
+        self.assertIn("mcp_name_shim: start, running %s\n" % shlex.join([sys.executable, str(server)]), text)
+        self.assertIn("mcp_name_shim: exit, the server exited 0", text)
+
+    def test_a_proxy_command_under_a_path_with_a_space_round_trips_to_the_connector(self):
+        engine = Path(self.tmp.name) / "Application Support" / "engine"
+        (engine / "runtime").mkdir(parents=True)
+        node = engine / "runtime" / "node"
+        node.write_text("#!/bin/sh\n")
+        node.chmod(0o755)
+        proxy = engine / "ag2-mcp-proxy.mjs"
+        recorded, why = cli.mcp_proxy_command(shlex.join([str(node), str(proxy)]))
+        self.assertEqual(why, "")
+        conf = Path(self.tmp.name) / "antigravity-local.conf"
+        conf.write_text(cm.render_config(cli.LOCAL, {"MCP_PROXY_COMMAND": recorded}))
+        cfg = dict(cm.read_config(conf), ACP_COMMAND="agy acp", CWD="/c", TOKEN_ENV_FILE="/a/agent.env")
+        argv = cli.connector_argv(cfg, "/w", 7)
+        got = gc.build_parser().parse_args(argv[argv.index("--work"):])
+        self.assertEqual(shlex.split(got.mcp_proxy_command), [str(node), str(proxy)])
+        unquoted, why = cli.mcp_proxy_command("%s %s" % (node, proxy))
+        self.assertEqual(unquoted, "")
+        self.assertIn("each path quoted when it has a space", why)
+        for bad in (str(node), "'unterminated", "/no/such/node x.mjs"):
+            self.assertEqual(cli.mcp_proxy_command(bad)[0], "", bad)
+        self.assertEqual(cli.mcp_proxy_command(None), ("", ""))
 
     def test_install_records_and_hands_on_the_proxy_command(self):
         cfg = {"ACP_COMMAND": "agy acp", "CWD": "/c", "TOKEN_ENV_FILE": "/a/agent.env", "AGENT_ID": "@agy:s.space",
