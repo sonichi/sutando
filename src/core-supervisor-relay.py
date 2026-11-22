@@ -612,8 +612,10 @@ def main(argv=None):
               f"path; {fallback}", file=sys.stderr)
         source = channel = ""
 
+    signal_age = None
     try:
         with open(a.signal) as f:
+            signal_age = time.time() - os.fstat(f.fileno()).st_mtime
             signal = json.load(f)
     except FileNotFoundError:
         return 0  # no signal yet → nothing to escalate (degrade quietly)
@@ -626,10 +628,6 @@ def main(argv=None):
         for line in relay_seat_notices(a.signal, a.state_file, macos=macos,
                                        source=source, channel=channel, dry_run=a.dry_run):
             print(line)
-    try:
-        signal_age = time.time() - os.path.getmtime(a.signal)
-    except OSError:
-        signal_age = None
     outcome = {}
     msg = run_cycle(signal, a.state_file, macos=macos, card_store=card_store_for(a.signal), signal_age=signal_age,
                     source=source, channel=channel, dry_run=a.dry_run, outcome=outcome)

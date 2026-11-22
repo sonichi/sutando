@@ -115,6 +115,14 @@ class TestSharedPredicate(unittest.TestCase):
             ws.manager.resolve(req.id)
             self.assertEqual(core_card.card_status(ws.store, SESSION, "blocked-human"), core_card.NONE)
 
+    def test_an_unreadable_store_reads_none(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = _Workspace(td)
+            ws.raise_card(UNKNOWN)
+            with patch.object(HitlManager, "active", side_effect=OSError("store unreadable")):
+                self.assertEqual(core_card.card_status(ws.store, SESSION, "blocked-human"),
+                                 core_card.NONE)
+
     def test_a_missing_store_reads_none(self):
         self.assertEqual(core_card.card_status("/nonexistent/hitl", SESSION, "blocked-human"),
                          core_card.NONE)
@@ -149,6 +157,25 @@ class TestOneAlertPerSurface(unittest.TestCase):
                             "--state-file", os.path.join(td, "relay.state")])
             self.assertEqual(sent, [])
             self.assertIn("HITL card", out.getvalue())
+
+    def test_main_hands_the_relay_the_signals_age(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = _Workspace(td)
+            ws.write_signal(UNKNOWN, age=300)
+            seen = {}
+            with patch.object(relay, "run_cycle", lambda *a, **k: seen.update(k)), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                relay.main(["--signal", ws.signal, "--no-macos", "--no-seats"])
+            self.assertAlmostEqual(seen["signal_age"], 300, delta=5)
+            self.assertEqual(seen["card_store"], ws.store)
+
+    def test_a_card_check_that_cannot_load_sends_the_alert(self):
+        with tempfile.TemporaryDirectory() as td, _sends() as (sent, _):
+            ws = _Workspace(td)
+            ws.raise_card(UNKNOWN)
+            with patch.dict(sys.modules, {"hitl": None, "hitl.core_card": None}):
+                self.assertIsNotNone(_cycle(ws, UNKNOWN)[0])
+            self.assertEqual(len(sent), 1)
 
     def test_a_card_on_its_way_holds_the_message_then_gives_up(self):
         with tempfile.TemporaryDirectory() as td, _sends() as (sent, _):
