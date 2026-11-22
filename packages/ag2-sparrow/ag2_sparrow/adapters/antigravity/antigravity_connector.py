@@ -281,11 +281,13 @@ class Connector:
                 publish(result_file, quoted("That model is not one I can use now. Send /model for the current list.") + "\n")
                 outcome = "model-unknown"
             elif picked == str(state.get("wanted") or state.get("current") or ""):
-                # Nothing to switch: say so now, and leave no pick for the next turn to "confirm".
-                room, card = str(sent.get("channel_id") or ""), self.model_card(state, picked=picked, same=True)
+                # Nothing new to switch. Only a model a turn has run on is "in use": a pick no turn has
+                # applied yet is still coming, and may yet be refused.
+                applied = not state.get("wanted") or state.get("told") == picked
+                room, card = str(sent.get("channel_id") or ""), self.model_card(state, picked=picked, same=applied)
                 publish(result_file, "[no-send] the model card answers\n" if self.post_card(room, card)
                         else quoted(card[1]["text"]) + "\n")
-                outcome = "model-same"
+                outcome = "model-same" if applied else "model-pending"
             else:
                 room = str(sent.get("channel_id") or "")
                 self.save_model_state(wanted=picked, asked_in=room, told="")
@@ -336,8 +338,12 @@ class Connector:
         if not wanted or state.get("told") == wanted or not turn.live:
             return ""
         switched = turn.model == wanted
-        self.post_card(state.get("asked_in"), self.model_card(state, picked=wanted, ran=turn.model))
-        self.save_model_state(told=wanted, **({} if switched else {"wanted": ""}))
+        # Told only once the card is queued: one that could not be is tried again after the next turn.
+        if not self.post_card(state.get("asked_in"), self.model_card(state, picked=wanted, ran=turn.model)):
+            return "untold"
+        # The model the turn ran on is the one in use, whatever a resumed Session reports of itself.
+        self.save_model_state(told=wanted, current=turn.model or state.get("current") or "",
+                              **({} if switched else {"wanted": ""}))
         return "switched" if switched else "not-switched"
 
     def run_turn(self, task_id, headers, prompt, owner):
@@ -409,10 +415,11 @@ class Connector:
         log("wake ->", task_id, headers["access_tier"], event or "message")
         t0 = time.time()
         status, text, detail, turn = self.run_turn(task_id, headers, prompt, tier == "owner")
+        # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
+        told = self.tell_model_outcome(turn) if tier == "owner" else ""
         asked = self.asked_for_models(headers, path, status, text, result_file)
         if not asked:
             publish(result_file, self.answer_body(headers, status, text, detail, turn))
-        told = self.tell_model_outcome(turn) if tier == "owner" else ""
         return {"task": task_id, "status": status, "detail": detail[:200], "event_type": event,
                 "tier": headers["access_tier"], "isolated": tier != "owner", "turn_s": round(time.time() - t0, 3),
                 "permissions": turn.decisions, "updates": dict(turn.updates), "answer_chars": len(text or ""),

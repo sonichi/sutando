@@ -69,6 +69,14 @@ class ConnectorCards(unittest.TestCase):
         self.assertEqual(self.poster().sweep(), 0, "nothing is posted twice")
         self.assertEqual(len(self.sent), 1)
 
+    def test_cards_queued_between_two_sweeps_are_posted_in_the_order_they_were_queued(self):
+        ac, _ = cc._core()
+        for n in range(12):
+            cc.queue(self.state, ROOM, "card %d" % n,
+                     ac.build("model-switch", "info", title="Model", body="b", text="step %d" % n)[1])
+        self.assertEqual(self.poster().sweep(), 12)
+        self.assertEqual([sent["body"] for sent in self.sent], ["card %d" % n for n in range(12)])
+
     def test_a_card_that_would_not_render_or_has_no_room_is_refused_at_the_queue(self):
         body, card = model_card()
         for room, line, bad in (("", body, card), ("not-a-room", body, card), (ROOM, "", card),
@@ -76,6 +84,12 @@ class ConnectorCards(unittest.TestCase):
             with self.assertRaises(ValueError):
                 cc.queue(self.state, room, line, bad)
         self.assertEqual(self.poster().sweep(), 0)
+
+    def test_a_room_id_without_a_server_is_a_room_at_the_queue_and_at_the_post(self):
+        body, card = model_card()
+        cc.queue(self.state, "!31hneApxJ_1o-63DmFrpeqnkFfWppnzWso1JvH3ogLM", body, card)
+        self.assertEqual(self.poster().sweep(), 1)
+        self.assertEqual(self.sent[0]["room_id"], "!31hneApxJ_1o-63DmFrpeqnkFfWppnzWso1JvH3ogLM")
 
     def test_a_failed_post_stays_queued_and_an_old_one_is_dropped(self):
         body, card = model_card()

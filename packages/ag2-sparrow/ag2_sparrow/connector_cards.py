@@ -24,7 +24,8 @@ OUTBOX, POSTED = ("agent-cards", "outbox"), ("agent-cards", "posted")
 CARD_KEY = "space.ag2.card"
 MAX_QUEUED_S = 600.0
 _NAME_RE = re.compile(r"^[0-9a-f]{32}\.json$")
-_ROOM_RE = re.compile(r"^![^\s:]+:\S+$")
+# A room id with its server, or the newer kind that has none (room version 12).
+_ROOM_RE = re.compile(r"^![^\s:]+(:\S+)?$")
 
 
 def _core():
@@ -67,7 +68,8 @@ def queue(bridge_state, room: str, body: str, card: dict, *, now=None) -> str:
         raise ValueError("the card would not render: %s" % found)
     if not _ROOM_RE.match(room or "") or not body or "\n" in body:
         raise ValueError("a card needs a room id and a one-line body")
-    qid = uuid.uuid4().hex
+    # The clock leads the id, so two cards queued between sweeps are posted in the order they were queued.
+    qid = "%016x%s" % (time.time_ns(), uuid.uuid4().hex[:16])
     _write(Path(bridge_state).joinpath(*OUTBOX) / (qid + ".json"),
            {"room": room, "body": body, "card": card, "queued_at": time.time() if now is None else now})
     return qid
