@@ -34,7 +34,7 @@ from ... import connector_cards, held_start, model_switch
 from ...acp_host import quoted
 from ...collaborator_turn import stage_own_attachments, with_staged_paths
 from ...relay_loop import count_arg
-from ...task_io import (AUDIENCE_RULE, DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER_CAPABILITIES,  # noqa: F401
+from ...task_io import (AUDIENCE_RULE, DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, OWNER_CAPABILITIES,  # noqa: F401
                         LockRefused, acquire_lock, attested_headers, exit_on_sigterm, holder_consumer, load_done,
                         make_dirs, non_owner_note, parse_task, pid_alive, exit_code, record_done, release_lock,
                         root_path, start_time, stop_requested, turn_policy, write_atomic)
@@ -350,7 +350,7 @@ class Connector:
         log("card ->", task_id, outcome)
         return {"task": task_id, "status": "completed", "tier": headers["access_tier"], "card": outcome}
 
-    def tell_model(self, status, caps, room=None) -> str:
+    def tell_model(self, status, caps, room=None, owner=True) -> str:
         """After any turn: tell the owner once, in their DM, whether their pick took. Codex names no model
         per turn, so a completed turn ran on the pick unless Codex said it moved the turn; a failed one did not.
         A moved turn's model is Codex's choice, not the owner's: the model in use stays the one before."""
@@ -360,7 +360,7 @@ class Connector:
         before = str(self.models.state().get("current") or "")
         took = status == "completed" and not (self.rerouted and self.rerouted != wanted)
         ran = wanted if took else (before if before != wanted else "")
-        return self.models.tell(True, ran, room)
+        return self.models.tell(True, ran, room, may_fail=owner)
 
     def handle_server_request(self, m):
         """No human is attached, so approvals are declined (the turn continues)."""
@@ -733,7 +733,7 @@ class Connector:
             t_done = time.time()
             out = self.result_body(status, text, err)
             # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
-            told = self.tell_model(status, policy.capabilities, headers.get("channel_id"))
+            told = self.tell_model(status, policy.capabilities, headers.get("channel_id"), policy.kind == OWNER)
             asked = self.models.asked(headers["access_tier"], path, status, text, result_path)
             out = "\n\n".join(x for x in (out.rstrip("\n"), quoted(self.models.unsaid()).strip()) if x)
             t_result = os.stat(result_path).st_mtime if asked else write_atomic(result_path, out.rstrip("\n") + "\n")

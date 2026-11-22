@@ -290,6 +290,47 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         self.assertEqual((self.w.metrics()[-1]["model"], self.post_queued()), ("claude-opus-4-6-thinking", []))
 
+    def pick_second_model(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        self.dm_task("task-2", "/model")
+        self.w.serve()
+        (sent,) = self.post_queued()
+        said = sent["extra_content"]["space.ag2.card"]["buttons"][1]["reply"]
+        self.dm_task("task-3", said, reply_to="$card1", click=said)
+        self.w.serve()
+        self.post_queued("$card2")
+
+    def test_a_refusal_on_a_guests_or_a_collaborators_turn_keeps_the_owners_pick_for_the_owners_turn(self):
+        self.pick_second_model()
+        state = self.w.root / "state" / "model.json"
+        (self.w.home / "set-model-fails").write_text("")
+        for tid, over, extra in (("task-g", dict(tier="guest"), ("--allow-non-owner",)),
+                                 ("task-c", dict(tier="team", collaborator=True), ())):
+            self.dm_task(tid, "STUB:TEXT hi", kind="room", channel="!room:s.space", **over)
+            self.w.serve(1, *extra)
+            # Another runtime's refusal is not the owner's: the pick stays pending, and nothing is told.
+            kept = json.loads(state.read_text())
+            self.assertEqual((kept["wanted"], kept.get("told"), self.post_queued(), "model_switch" in self.w.metrics()[-1]),
+                             ("claude-opus-4-6-thinking", "", [], False), tid)
+        (self.w.home / "set-model-fails").unlink()
+        self.w.task("task-o", "STUB:TEXT the owner")
+        self.w.serve()
+        (told,) = self.post_queued("$card3")
+        self.assertEqual((told["room_id"], told["extra_content"]["space.ag2.card"]["text"], self.w.metrics()[-1]["model_switch"]),
+                         (self.DM, "Switched. I'm now using Claude Opus 4.6.", "switched"))
+
+    def test_a_refusal_on_the_owners_own_turn_is_told_and_drops_the_pick(self):
+        self.pick_second_model()
+        (self.w.home / "set-model-fails").write_text("")
+        self.w.task("task-o", "STUB:TEXT the owner")
+        self.w.serve()
+        self.assertEqual((self.w.metrics()[-1]["model_switch"], json.loads((self.w.root / "state" / "model.json").read_text())["wanted"]),
+                         ("not-switched", ""))
+        (told,) = self.post_queued("$card3")
+        self.assertEqual(told["extra_content"]["space.ag2.card"]["state"], "error")
+
     def test_a_guests_turn_first_settles_the_owners_pick_as_switched_and_keeps_it(self):
         (self.w.home / "models").write_text("")
         self.w.task("task-1", "STUB:TEXT hi")
