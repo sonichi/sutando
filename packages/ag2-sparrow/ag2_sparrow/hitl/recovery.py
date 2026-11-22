@@ -10,6 +10,8 @@ show a purchase (iOS) can drop exactly it; no other action or card text names a 
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import math
 import os
@@ -45,8 +47,12 @@ OUTCOMES = ("done", "refused", "stale", "failed")
 RECEIPT_VERSION = 1
 AUDIT_FILE = "audit.jsonl"
 AUDIT_KEEP = 500
+#: Every audit writer (bridge and executor, src and vendored) holds this sidecar's flock.
+AUDIT_LOCK = "audit.lock"
 #: A non-owner's tap: recorded once per (card, actor), never run.
 NOT_OWNER = "not_owner"
+#: What audit_not_owner did: wrote the row, found it already there, or could not write.
+RECORDED, DUPLICATE, NOT_RECORDED = "recorded", "duplicate", "not_recorded"
 
 # The one sentence every surface uses about a worker's model (card, notice, reply, refusal).
 SEAT_MODEL_LOCKED = "Its model can't be switched yet: workers share the core's model setting."
@@ -177,43 +183,66 @@ def read_receipt(workspace: Path, hitl_id: str) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
-def audit(workspace: Path, entry: Dict[str, Any]) -> None:
-    """One line per action or refusal, bounded; ids and outcomes only, never message text."""
+@contextlib.contextmanager
+def _audit_locked(path: Path):
+    with open(path.with_name(AUDIT_LOCK), "a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _append(path: Path, entry: Dict[str, Any]) -> None:
+    """Append one row and trim to the newest AUDIT_KEEP past twice that; the caller holds the lock."""
+    with open(path, "a") as f:
+        f.write(json.dumps(entry, sort_keys=True) + "\n")
+    lines = path.read_text().splitlines()
+    if len(lines) > 2 * AUDIT_KEEP:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text("\n".join(lines[-AUDIT_KEEP:]) + "\n")
+        os.replace(tmp, path)
+
+
+def audit(workspace: Path, entry: Dict[str, Any]) -> bool:
+    """One line per action or refusal, bounded; ids and outcomes only, never message text.
+    True when the line was written; a failure is swallowed (the receipt and card are the record)."""
     path = recovery_dir(workspace) / AUDIT_FILE
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a") as f:
-            f.write(json.dumps(entry, sort_keys=True) + "\n")
-        lines = path.read_text().splitlines()
-        if len(lines) > 2 * AUDIT_KEEP:
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text("\n".join(lines[-AUDIT_KEEP:]) + "\n")
-            os.replace(tmp, path)
-    except OSError:
-        pass  # the receipt and the card are the record of the outcome
+        with _audit_locked(path):
+            _append(path, entry)
+        return True
+    except (OSError, ValueError):
+        return False
 
 
-def audit_not_owner(workspace: Path, hitl_id: str, action_id: str, sender: str,
-                    at: Optional[float] = None) -> bool:
-    """Record a non-owner's tap on a card as `refused`/`not_owner`, once per (hitl_id, sender):
-    a repeated tap adds no line. True when a line was written."""
+def audit_not_owner(workspace: Path, hitl_id: str, action_id: str, sender: str, room: str,
+                    at: Optional[float] = None) -> str:
+    """Record a non-owner's tap on a card, in the card's room, as `refused`/`not_owner`, once per
+    (hitl_id, sender). -> RECORDED, DUPLICATE (a repeated tap adds no line) or NOT_RECORDED."""
     path = recovery_dir(workspace) / AUDIT_FILE
     try:
-        lines = path.read_text().splitlines()
-    except OSError:
-        lines = []
-    for line in lines:
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        if (isinstance(row, dict) and row.get("reason") == NOT_OWNER
-                and row.get("hitl_id") == hitl_id and row.get("sender") == sender):
-            return False
-    audit(workspace, {"at": int(time.time() if at is None else at), "hitl_id": hitl_id,
-                      "action_id": action_id, "outcome": "refused", "reason": NOT_OWNER,
-                      "sender": sender})
-    return True
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _audit_locked(path):
+            try:
+                lines = path.read_text().splitlines()
+            except FileNotFoundError:
+                lines = []
+            for line in lines:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(row, dict) and row.get("reason") == NOT_OWNER
+                        and row.get("hitl_id") == hitl_id and row.get("sender") == sender):
+                    return DUPLICATE
+            _append(path, {"at": int(time.time() if at is None else at), "hitl_id": hitl_id,
+                           "action_id": action_id, "outcome": "refused", "reason": NOT_OWNER,
+                           "sender": sender, "room": room})
+        return RECORDED
+    except (OSError, ValueError):
+        return NOT_RECORDED
 
 
 def _safe(hitl_id: str) -> str:

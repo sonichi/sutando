@@ -923,14 +923,16 @@ class NotOwnerAudit(unittest.TestCase):
                 self.assertEqual([r["at"] for r in self._rows(mod, ws)], [4, 5, 6])
                 self.assertFalse((mod.recovery_dir(ws) / "audit.tmp").exists())
 
-    def test_an_unwritable_audit_is_swallowed(self):
+    def test_an_unwritable_audit_reports_it_was_not_written(self):
         for name, mod in self.copies:
             with self.subTest(copy=name):
                 ws = self._ws(name)
                 (ws / "state").mkdir()
                 (ws / "state" / "recovery").write_text("not a dir")
-                mod.audit(ws, {"at": 1})
-                mod.audit_not_owner(ws, "h1", "retry", "@x:s")  # must not raise
+                self.assertIs(mod.audit(ws, {"at": 1}), False)
+                self.assertEqual(mod.audit_not_owner(ws, "h1", "retry", "@x:s", "!r"), mod.NOT_RECORDED)
+                ok = self._ws(name + "-ok")
+                self.assertIs(mod.audit(ok, {"at": 1}), True)
 
     def test_a_repeat_tap_is_not_recorded_and_a_corrupt_line_is_skipped(self):
         for name, mod in self.copies:
@@ -938,15 +940,71 @@ class NotOwnerAudit(unittest.TestCase):
                 ws = self._ws(name)
                 mod.recovery_dir(ws).mkdir(parents=True)
                 (mod.recovery_dir(ws) / mod.AUDIT_FILE).write_text("{not json\n[1, 2]\n")
-                self.assertTrue(mod.audit_not_owner(ws, "h1", "retry", "@x:s", at=5))
-                self.assertFalse(mod.audit_not_owner(ws, "h1", "other", "@x:s"))
-                self.assertTrue(mod.audit_not_owner(ws, "h1", "retry", "@y:s"))
-                self.assertTrue(mod.audit_not_owner(ws, "h2", "retry", "@x:s"))
+                self.assertEqual(mod.audit_not_owner(ws, "h1", "retry", "@x:s", "!r", at=5), mod.RECORDED)
+                self.assertEqual(mod.audit_not_owner(ws, "h1", "other", "@x:s", "!r"), mod.DUPLICATE)
+                self.assertEqual(mod.audit_not_owner(ws, "h1", "retry", "@y:s", "!r"), mod.RECORDED)
+                self.assertEqual(mod.audit_not_owner(ws, "h2", "retry", "@x:s", "!r"), mod.RECORDED)
                 rows = [l for l in (mod.recovery_dir(ws) / mod.AUDIT_FILE).read_text().splitlines()]
                 self.assertEqual(len(rows), 5, "two corrupt lines kept, three refusals added")
                 first = json.loads(rows[2])
-                self.assertEqual((first["at"], first["hitl_id"], first["sender"], first["reason"]),
-                                 (5, "h1", "@x:s", mod.NOT_OWNER))
+                self.assertEqual((first["at"], first["hitl_id"], first["sender"], first["reason"], first["room"]),
+                                 (5, "h1", "@x:s", mod.NOT_OWNER, "!r"))
+
+    def test_an_unreadable_audit_reports_not_recorded(self):
+        for name, mod in self.copies:
+            with self.subTest(copy=name):
+                ws = self._ws(name)
+                mod.recovery_dir(ws).mkdir(parents=True)
+                (mod.recovery_dir(ws) / mod.AUDIT_FILE).write_bytes(b"\xff\xfe\n")
+                self.assertEqual(mod.audit_not_owner(ws, "h1", "retry", "@x:s", "!r"), mod.NOT_RECORDED)
+
+    # Each writer process loads one copy, waits for `go`, then appends or dedupes in a tight loop.
+    _WRITER = """
+import json, sys, time
+from pathlib import Path
+src, pkg, which, ws, mode, n, keep = sys.argv[1:8]
+sys.path.insert(0, pkg if which == "vendored" else src)
+if which == "vendored":
+    from ag2_sparrow.hitl import recovery as mod
+else:
+    from hitl import recovery as mod
+mod.AUDIT_KEEP = int(keep)
+ws = Path(ws)
+while not (ws / "go").exists():
+    time.sleep(0.001)
+for i in range(int(n)):
+    if mode == "append":
+        mod.audit(ws, {"w": which, "i": i})
+    else:
+        mod.audit_not_owner(ws, "h%d" % i, "retry", "@x:s", "!r")
+"""
+
+    def _race(self, mode, n, keep):
+        ws = self._ws(f"race-{mode}")
+        procs = [subprocess.Popen([sys.executable, "-c", self._WRITER, str(REPO / "src"),
+                                   str(REPO / "packages" / "ag2-sparrow"), which, str(ws), mode,
+                                   str(n), str(keep)]) for which, _ in self.copies]
+        time.sleep(0.5)
+        (ws / "go").touch()
+        for p in procs:
+            self.assertEqual(p.wait(timeout=120), 0)
+        return [json.loads(l) for l in (recovery.recovery_dir(ws) / recovery.AUDIT_FILE).read_text().splitlines()]
+
+    def test_two_writers_rotating_lose_no_row_and_stay_bounded(self):
+        n, keep = 1500, 20
+        rows = self._race("append", n, keep)
+        length = 0
+        for _ in range(2 * n):  # a serialized history's length is fixed: grow, trim at 2*keep
+            length = keep if length + 1 > 2 * keep else length + 1
+        self.assertEqual(len(rows), length, "a row lost to the other writer's rotation shifts the length")
+        for which, _ in self.copies:
+            mine = [r["i"] for r in rows if r["w"] == which]
+            self.assertEqual(mine, list(range(n - len(mine), n)), f"{which}: a gap is a lost row")
+
+    def test_two_writers_deduping_record_each_card_once(self):
+        rows = self._race("dedupe", 300, 1000)
+        keys = [r["hitl_id"] for r in rows]
+        self.assertEqual(sorted(keys), sorted(f"h{i}" for i in range(300)), "each card exactly once")
 
 
 class SeatRetryCopy(Base):

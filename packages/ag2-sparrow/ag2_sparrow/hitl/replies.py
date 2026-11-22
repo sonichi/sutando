@@ -194,8 +194,8 @@ class HitlReplyHandler:
         return claimed
 
     def _audit_not_owner(self, event: Dict[str, Any], actor: str) -> None:
-        """The owner's recovery audit gets the refusal, for a card this store holds; the card and the
-        room are left alone. A typed label from a non-owner is a message, not a tap, and is not recorded."""
+        """The owner's recovery audit gets the refusal, for a card this store holds tapped in the room
+        it was posted in; the card and the room are left alone. A typed label is a message, not a tap."""
         if not self._owner or not actor or self._workspace is None or event.get("_typed"):
             return
         reply = parse_reply(event)
@@ -205,10 +205,18 @@ class HitlReplyHandler:
             req = self._manager.get(reply.hitl_id)
             if req is None:
                 return
+            posted = req.room or str(self._manager.store.projection(req.id).get("room_id") or "")
+            room = str(event.get("room_id") or "")
+            if not posted or room != posted:
+                self._log(f"hitl: non-owner tap on {req.id} outside its card's room not recorded")
+                return
             aid = reply.action_id if any(a.id == reply.action_id for a in req.actions) else ""
-            recovery.audit_not_owner(self._workspace, req.id, aid, actor[:255])
+            done = recovery.audit_not_owner(self._workspace, req.id, aid, actor[:255], room)
         except Exception as e:  # noqa: BLE001 — the refusal stands whether or not it is recorded
             self._log(f"hitl: non-owner audit not written — {e}")
+            return
+        if done == recovery.NOT_RECORDED:
+            self._log(f"hitl: non-owner audit not written for {req.id}")
 
     def _stamp_stale(self, hitl_id: str) -> None:
         """A rejected tap on a still-open recovery card gets an answer on that card: a fresh revision
