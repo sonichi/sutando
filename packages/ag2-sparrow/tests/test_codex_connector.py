@@ -588,13 +588,19 @@ class NoIntegrationsTest(unittest.TestCase):
         return c
 
     def test_an_unreadable_config_fails_the_turn_closed_and_a_dead_server_raises(self):
-        for answer in (RuntimeError('config/read: {"code": -32601}'), {"config": {"mcp_servers": ["x"]}}):
-            with self.assertRaises(cc.IntegrationsUnknown):
+        # A server list that cannot be read is never taken as "no servers": that would leave the owner's on.
+        for answer in (RuntimeError('config/read: {"code": -32601}'), {"config": {"mcp_servers": ["x"]}},
+                       {}, {"config": None}, {"config": {}}, {"config": {"mcp_servers": None}},
+                       {"config": {"mcp_servers": ""}}, {"config": ["mcp_servers"]}, None, []):
+            with self.assertRaises(cc.IntegrationsUnknown, msg=repr(answer)):
                 self.connector(answer).no_integrations("/tmp")
         with self.assertRaises(RuntimeError) as raised:
             self.connector(RuntimeError("config/read: server pipe closed (x)")).no_integrations("/tmp")
         self.assertNotIsInstance(raised.exception, cc.IntegrationsUnknown)
-        self.assertEqual(self.connector({"config": {}}).no_integrations("/tmp")["mcp_servers"], {})
+        self.assertEqual(self.connector({"config": {"mcp_servers": {}}}).no_integrations("/tmp")["mcp_servers"], {},
+                         "what Codex sends when there are none (measured, codex-cli 0.167.0)")
+        self.assertEqual(self.connector({"config": {"mcp_servers": {"a": {"enabled": True}}}}).no_integrations("/tmp")
+                         ["mcp_servers"], {"a": {"enabled": False}})
         c = self.connector({})
         with mock.patch.object(c, "open_for", side_effect=cc.IntegrationsUnknown("refused")), \
                 mock.patch.object(c, "run_turn") as turn:

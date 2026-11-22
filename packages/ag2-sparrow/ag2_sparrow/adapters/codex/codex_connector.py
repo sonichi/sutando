@@ -282,17 +282,22 @@ class Connector:
     def no_integrations(self, cwd):
         """The thread config override for a turn without integrations: NO_INTEGRATIONS plus every MCP server
         the effective config (seen from the turn's cwd) names, disabled. An empty `mcp_servers` override
-        merges into the owner's and removes nothing, so each is named. A refused or malformed answer raises
-        IntegrationsUnknown; a dead or silent server raises as thread/start would."""
+        merges into the owner's and removes nothing, so each is named. A refused answer, or one that does
+        not carry `config.mcp_servers` as a mapping (Codex sends `{}` when there are none), raises
+        IntegrationsUnknown: a list that cannot be read is never taken as empty. A dead or silent server
+        raises as thread/start would."""
         try:
             res = self.rpc.request("config/read", {"cwd": cwd})
         except RuntimeError as e:
             if "server pipe closed" in str(e):
                 raise
             raise IntegrationsUnknown(str(e)[:200])
-        servers = (res.get("config") or {}).get("mcp_servers") or {}
+        config = res.get("config") if isinstance(res, dict) else None
+        servers = config.get("mcp_servers") if isinstance(config, dict) else None
         if not isinstance(servers, dict):
-            raise IntegrationsUnknown("config/read gave mcp_servers as %s" % type(servers).__name__)
+            raise IntegrationsUnknown("config/read did not give config.mcp_servers as a mapping (%s)"
+                                      % ("config is %s" % type(config).__name__ if not isinstance(config, dict)
+                                         else "missing" if "mcp_servers" not in config else type(servers).__name__))
         return dict(NO_INTEGRATIONS, mcp_servers={name: {"enabled": False} for name in servers})
 
     def start_thread(self, caps, ephemeral):
