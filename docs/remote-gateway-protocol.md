@@ -728,8 +728,19 @@ Instead of raw bytes, a gateway may hand the task body a media marker:
 
 The client resolves it locally: downloads the bytes (default 25 MB cap) and
 rewrites the marker to `[File attached: <local path>]` (`[Photo attached: …]`
-for `kind=m.image`) — the same inbound convention the other bridges use. Any
-failure leaves the marker untouched.
+for `kind=m.image`) — the same inbound convention the other bridges use. Every
+marker in the body is resolved, up to 10 attempts per task (a failed fetch counts);
+any failure leaves that marker untouched.
+
+A marker inside the broker's quoted reply-context record is the replied-to
+message's media; only the record's `body` is scanned, never its other fields or the
+room-metadata block. It is fetched the same way (same cap, routing and directory) and
+rewritten in place, JSON-escaped so the record stays well-formed quoted data, to
+`[Photo attached (from replied-to message): <local path>]` (`[File attached (from
+replied-to message): …]` otherwise). Its file is listed in `attachments:` after the
+message's own, so every adapter and the core get the bytes, not just the file name.
+For that, the broker must quote a media message's marker in the reply-context
+`body`, not only its file name.
 
 Config: `REMOTE_MEDIA_MARKER` (tag; unset, both `remote-media` and AG2 Space's `ag2space-media` are resolved),
 `REMOTE_MEDIA_HS_TOKEN` + `REMOTE_MEDIA_HS_ORIGIN` (homeserver bearer and the
