@@ -35,7 +35,6 @@ import shutil
 import sys
 import tempfile
 import time
-import uuid
 from pathlib import Path
 
 from ... import acp_host, card_desk, connector_cards, held_start, model_switch, result_labels, result_publish
