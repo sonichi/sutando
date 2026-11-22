@@ -726,7 +726,7 @@ AUTO_ANSWER_CARRY_S = 120.0
 
 # ESCALATE (Layer 3): a blocked core IS a HumanRequirement, so it goes through
 # `src/hitl` — the Manager dedups, the projector renders the card.
-_CHAT_ESCALATE_STATES = {"blocked-human", "logged-out"}
+from hitl.core_card import CARD_STATES as _CHAT_ESCALATE_STATES  # noqa: E402  (read by the relay too)
 #: How long a signed-out reading must hold before it is carded. A refusal or 401 banner
 #: the CLI recovers from on its own (a token refresh, a boot race) clears well inside it.
 LOGIN_CONFIRM_S = 60.0
@@ -817,8 +817,8 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
     if manager is None:
         return None
     try:
-        from hitl import tui_gate
-        limit = is_usage_limit(kind, prompt)
+        from hitl import core_card, tui_gate
+        limit = core_card.is_limit_episode(kind, prompt)
         controls = None
         if workspace is not None:
             import recovery_actions
@@ -829,6 +829,7 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
                                                           controls=controls),
                                        runtime=runtime,
                                        episode=tui_gate.LIMIT_EPISODE if limit else None,
+                                       guard=core_card.episode_guard(session, state, kind, prompt),
                                        controls=controls,
                                        model_names=recovery_actions.model_names(workspace, runtime) if controls else None)
         if controls and limit and not seat:
