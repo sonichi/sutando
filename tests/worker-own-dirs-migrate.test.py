@@ -327,15 +327,82 @@ class MoveFailures(Base):
 
 
 class TheLane(Base):
-    def test_a_running_wrapper_lane_is_stopped_so_the_keeper_restarts_it_switched(self):
+    def started(self, record):
+        calls = []
+
+        def start(instance, ws):
+            calls.append((instance, Path(ws), C.worker_dirs(W, self.ws), C.bridge_pid(self.lane, self.ws)))
+            return record
+        return calls, start
+
+    def test_a_running_wrapper_lane_is_stopped_and_started_again_switched(self):
         from _helpers import bridge_lease
         proc = bridge_lease.start(self.ws, self.lane)
         self.addCleanup(bridge_lease.stop, proc)
-        out, why = self.migrate(procs={})
+        calls, start = self.started({"ok": True, "lease": "held", "pid": 5151})
+        out, why = self.migrate(procs={}, start=start)
         self.assertEqual(why, "")
-        self.assertEqual(out["lane"], f"stopped pid {proc.pid}; the lane keeper starts it again")
+        self.assertEqual(out["lane"], f"stopped pid {proc.pid}; started again (pid 5151)")
         self.assertIsNotNone(proc.wait(timeout=10))
-        self.assertEqual(C.bridge_pid(self.lane, self.ws), 0)
+        self.assertEqual(calls, [(self.lane, self.ws, (self.own / "tasks", self.own / "results"), 0)],
+                         "started once, after the old bridge is gone and with the field written")
+
+    def test_the_restart_runs_in_the_same_hold_of_the_record_lock(self):
+        from _helpers import bridge_lease
+        proc = bridge_lease.start(self.ws, self.lane)
+        self.addCleanup(bridge_lease.stop, proc)
+        held = []
+
+        def start(instance, ws):
+            key = os.path.abspath(str(C._lock_path(Path(ws))))
+            held.append((getattr(C._LOCK_DEPTH, "held", None) or {}).get(key, 0))
+            return {"ok": True, "lease": "held", "pid": 1}
+        self.migrate(procs={}, start=start)
+        self.assertEqual(len(held), 1)
+        self.assertGreater(held[0], 0, "no keeper can start the lane between the stop and this start")
+
+    def test_a_lane_a_keeper_already_restarted_is_not_started_twice(self):
+        from _helpers import bridge_lease
+        proc = bridge_lease.start(self.ws, self.lane)
+        self.addCleanup(bridge_lease.stop, proc)
+        calls, start = self.started({"ok": True, "lease": "already_running", "pid": 6262})
+        out, why = self.migrate(procs={}, start=start)
+        self.assertEqual((why, out["lane"]), ("", f"stopped pid {proc.pid}; already running again (pid 6262)"))
+        self.assertEqual(len(calls), 1)
+
+    def test_the_default_start_is_connections_start_which_spawns_nothing_for_a_held_lease(self):
+        from _helpers import bridge_lease
+        proc = bridge_lease.start(self.ws, self.lane)
+        self.addCleanup(bridge_lease.stop, proc)
+        spawned = []
+        rec = C.start(self.lane, repo=ROOT, logs_dir=self.ws / "logs", workspace=self.ws,
+                      spawn=lambda *a: spawned.append(a))
+        self.assertEqual((rec["lease"], rec["pid"], spawned), ("already_running", proc.pid, []))
+        with mock.patch.object(C, "start", return_value={"ok": True, "lease": "held", "pid": 7}) as st:
+            self.assertEqual(worker_lane._start_lane(self.lane, self.ws)["pid"], 7)
+        self.assertEqual((st.call_args.args, st.call_args.kwargs["repo"], st.call_args.kwargs["logs_dir"]),
+                         ((self.lane,), ROOT, self.ws / "logs"))
+
+    def test_a_lane_that_does_not_start_again_is_reported_and_the_switch_still_finishes(self):
+        from _helpers import bridge_lease
+        proc = bridge_lease.start(self.ws, self.lane)
+        self.addCleanup(bridge_lease.stop, proc)
+        _calls, start = self.started({"ok": False, "reason": "no_token"})
+        out, why = self.migrate(procs={}, start=start)
+        self.assertEqual(why, "")
+        self.assertEqual(out["lane"], f"stopped pid {proc.pid}; it did not start again (no_token): "
+                                      f"run connections.py start {self.lane}")
+        self.assertEqual(C.worker_dirs(W, self.ws), (self.own / "tasks", self.own / "results"))
+
+    def test_undo_starts_the_lane_again_too(self):
+        from _helpers import bridge_lease
+        self.migrate()
+        proc = bridge_lease.start(self.ws, self.lane)
+        self.addCleanup(bridge_lease.stop, proc)
+        calls, start = self.started({"ok": True, "lease": "held", "pid": 8})
+        out, why = self.migrate(undo=True, procs={}, start=start)
+        self.assertEqual((why, out["lane"]), ("", f"stopped pid {proc.pid}; started again (pid 8)"))
+        self.assertEqual(calls[0][2], None, "started after the field was cleared")
 
     def test_a_declared_bridge_is_waited_for_until_sparrowd_replaces_it(self):
         pids = iter([4242, 4242, C.BridgeLeaseIndeterminate(self.lane, "x"), 4343])

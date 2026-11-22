@@ -532,23 +532,32 @@ RELAUNCH_WAIT_S = 180.0
 
 
 def relaunch_lane(worker: str, workspace, kill=None, procs=None, wait_s: "float | None" = None,
-                  sleep=None, clock=None, switch=None) -> "tuple[str, str]":
+                  sleep=None, clock=None, switch=None, start=None) -> "tuple[str, str]":
     """Make the process serving `worker`'s lane pick up its folders anew; (what happens, '' or why not).
     A declared bridge is restarted by sparrowd (the field is in its revision): this waits until its old
-    process no longer holds the lease. Any other holder is stopped, and the lane keeper starts it again.
-    `switch` (the field change) runs first under the record lock, which the keeper's starts take, so a
-    stopped lane cannot be started again before the field it must start on is written."""
+    process no longer holds the lease. Any other holder is stopped and started again here, in the same
+    hold of the record lock, since not every install runs a lane keeper. `switch` (the field change) runs
+    first under that lock, so a stopped lane cannot be started again before the field it must start on is
+    written. `start(instance, workspace)` returns a `connections.start` record."""
     from connections import _records_lock
     with _records_lock(Path(workspace)):
         if switch is not None:
             switch()
-        kind, pid, why = _stop_unless_declared(worker, workspace, kill, procs)
+        kind, pid, why = _stop_unless_declared(worker, workspace, kill, procs, start or _start_lane)
     if why or kind != "declared":
         return kind, why
     return _await_replacement(worker, workspace, pid, wait_s, sleep or time.sleep, clock or time.monotonic)
 
 
-def _stop_unless_declared(worker: str, workspace, kill, procs) -> "tuple[str, int, str]":
+def _start_lane(instance: str, workspace) -> dict:
+    """`connections.py start <instance>`, as the keeper runs it: the token read fresh from the channel env."""
+    from connections import keeper_environ, start
+    ws = Path(workspace)
+    return start(instance, repo=Path(__file__).resolve().parents[1], logs_dir=ws / "logs",
+                 environ=keeper_environ(), workspace=ws)
+
+
+def _stop_unless_declared(worker: str, workspace, kill, procs, start=_start_lane) -> "tuple[str, int, str]":
     from connections import BridgeLeaseIndeterminate, BridgeStillRunning, _stop_row, bridge_pid, worker_identity
     ws = Path(workspace)
     row = worker_identity(worker, ws) or {}
@@ -566,7 +575,15 @@ def _stop_unless_declared(worker: str, workspace, kill, procs) -> "tuple[str, in
         _stop_row(row, ws, kill)
     except (BridgeStillRunning, BridgeLeaseIndeterminate) as e:
         return "", pid, f"lane {instance} did not stop ({e}); re-run"
-    return f"stopped pid {pid}; the lane keeper starts it again", pid, ""
+    try:
+        rec = start(instance, ws) or {}
+    except Exception as e:  # noqa: BLE001 - the switch is done; a lane that did not start is reported, not fatal
+        rec = {"ok": False, "reason": type(e).__name__}
+    if rec.get("ok"):
+        how = "already running" if rec.get("lease") == "already_running" else "started"
+        return f"stopped pid {pid}; {how} again (pid {rec.get('pid')})", pid, ""
+    return (f"stopped pid {pid}; it did not start again ({rec.get('reason') or 'launch_failed'}): "
+            f"run connections.py start {instance}"), pid, ""
 
 
 def _await_replacement(worker: str, workspace, pid: int, wait_s, sleep, clock) -> "tuple[str, str]":
@@ -588,7 +605,7 @@ def _await_replacement(worker: str, workspace, pid: int, wait_s, sleep, clock) -
 
 
 def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=subprocess.run,
-                 kill=None, procs=None) -> "tuple[dict, str]":
+                 kill=None, procs=None, start=None) -> "tuple[dict, str]":
     """Switch `worker` onto its own folders (or back, `undo`); (what was done, '' or why it stopped).
     Idempotent: a re-run picks up whatever an interrupted one left."""
     from connections import ConnectionsError, ensure_worker_dirs, set_worker_dirs, worker_identity, worker_root
@@ -600,7 +617,7 @@ def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=s
     tasks, results = root / "tasks", root / "results"
     out = {"worker": worker, "tasks": str(tasks), "results": str(results), "undo": undo, "respawn_needed": True}
     if undo:
-        out["lane"], why = relaunch_lane(worker, ws, kill, procs,
+        out["lane"], why = relaunch_lane(worker, ws, kill, procs, start=start,
                                          switch=lambda: set_worker_dirs(worker, False, workspace=ws))
         if why:
             return out, why
@@ -630,7 +647,7 @@ def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=s
         set_worker_dirs(worker, True, workspace=ws)
         ensure_worker_dirs(worker, ws)
     try:
-        out["lane"], why = relaunch_lane(worker, ws, kill, procs, switch=switch)
+        out["lane"], why = relaunch_lane(worker, ws, kill, procs, switch=switch, start=start)
     except (ConnectionsError, OSError) as e:
         return out, str(e)
     if why:

@@ -782,8 +782,11 @@ nothing. With `--apply` it switches the worker over:
 1. It finds the declared task-event handler first. A failed lookup, or work delivered with no handler to
    move it, refuses before anything changes.
 2. It writes the field and creates the folders (a private agent root), and relaunches the worker's lane
-   under the record lock (a wrapper lane is stopped so the lane keeper starts it on the new folders; a
-   declared bridge is waited for until sparrowd has replaced it).
+   under the record lock. A wrapper lane is stopped and started again on the new folders in that same
+   hold, through `connections.start`, because not every install runs a lane keeper (the desktop app starts
+   lanes once). A start that finds the lane already held spawns nothing; one that fails is named in the
+   output's `lane` field with the command that starts it. A declared bridge is waited for until sparrowd
+   has replaced it.
 3. It has the handler empty the worker's `deliveries/<id>/` under the router's locks. A task its own lane
    queued moves into its tasks folder and its sentinel is archived. A core task the worker never accepted is
    handed back (attribution first, then the sentinel) and touched so the core's watcher picks it up. One it
