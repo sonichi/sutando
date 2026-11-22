@@ -129,6 +129,7 @@ from delivery.pane_gate import (  # noqa: E402
     ADAPTERS, AWAIT_HINT, BORDER_LINE, CLAUDE, CLAUDE_GATE_SIGNATURES, CLAUDE_IDLE,
     COMPOSER_PLACEHOLDER, FABLE_TEXT, SGR_STRIP as _ANSI_SGR, TURN_DONE, TURN_SHORT,
     classify_pane as _pg_classify_pane, composer_text as _pg_composer_text, gate_evidence,
+    slash_menu_gate_rows,
     is_usage_limit, limit_baseline, limit_step, live_tail,
     prompt_line as _pg_prompt_line, refusal_line, strip_limit_banners,
 )
@@ -261,9 +262,11 @@ def classify(pane: str, styled_pane: "str | None" = None):
     styled_tail = ("\n".join(styled_lines[i] for i in kept)
                    if styled_lines is not None and kept and max(kept) < len(styled_lines)
                    else tail)
+    menu_gates = slash_menu_gate_rows(tail, styled_tail, CLAUDE)
     tail = gate_evidence(tail, styled_tail, CLAUDE)
     if not _AWAIT_HINT.search(tail):
-        return None
+        # Phrase text inside a completion list may be help text: a human looks, no key is sent.
+        return ("unknown", "\n".join(menu_gates)) if menu_gates else None
     # Two gates in one pane (one in scrollback): the live one is nearest the bottom.
     hits = [(m.start(), i, kind) for i, (kind, rx) in enumerate(_SIGNATURES)
             for m in [max(rx.finditer(tail), key=lambda m: m.start(), default=None)] if m]
@@ -764,7 +767,7 @@ AUTO_ANSWER_CARRY_S = 120.0
 
 # ESCALATE (Layer 3): a blocked core IS a HumanRequirement, so it goes through
 # `src/hitl` — the Manager dedups, the projector renders the card.
-_CHAT_ESCALATE_STATES = {"blocked-human", "logged-out"}
+from hitl.core_card import CARD_STATES as _CHAT_ESCALATE_STATES  # noqa: E402  (read by the relay too)
 #: How long a signed-out reading must hold before it is carded. A refusal or 401 banner
 #: the CLI recovers from on its own (a token refresh, a boot race) clears well inside it.
 LOGIN_CONFIRM_S = 60.0
@@ -855,8 +858,8 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
     if manager is None:
         return None
     try:
-        from hitl import tui_gate
-        limit = is_usage_limit(kind, prompt)
+        from hitl import core_card, tui_gate
+        limit = core_card.is_limit_episode(kind, prompt)
         controls = None
         if workspace is not None:
             import recovery_actions
@@ -867,6 +870,7 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
                                                           controls=controls),
                                        runtime=runtime,
                                        episode=tui_gate.LIMIT_EPISODE if limit else None,
+                                       guard=core_card.episode_guard(session, state, kind, prompt),
                                        controls=controls,
                                        model_names=recovery_actions.model_names(workspace, runtime) if controls else None)
         if controls and limit and not seat:

@@ -17,6 +17,7 @@ card. The relay token stays in Sparrow's env file, the Claude login in its confi
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -650,6 +651,24 @@ def attach(args) -> int:
     os.execv(tmux, [tmux, "-u", "-S", sock, "attach", "-t", "=%s" % SESSION_NAME])
 
 
+def model(args) -> int:
+    """Print the agent's model, or switch the running session's with Claude Code's own /model."""
+    local = selected(args)
+    if local is None:
+        return EXIT_UNUSABLE
+    cfg, problem = load_config(local)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    if not args.model:
+        print(json.dumps({"model": launcher.switched_model(cm.work_root(cfg)) or None}))
+        return 0
+    lc = launcher.Launcher(cfg, config_dir(local))
+    switched, line = lc.switch_model(records.load_supervisor(cm.work_root(cfg)), args.model, confirm=args.confirm)
+    print(json.dumps({"switched": switched, "model": args.model, "detail": line}))
+    return 0 if switched else 1
+
+
 def stop(args) -> int:
     """The local confirmation of an open stall card, through the one accepter; the launcher applies it."""
     if not args.confirm:
@@ -777,6 +796,12 @@ def main(argv=None) -> int:
     s.add_argument("--confirm", action="store_true")
     s.set_defaults(func=stop)
     agent_option(sub.add_parser("verify", help="check every part")).set_defaults(func=verify)
+    m = agent_option(sub.add_parser("model", help="print the agent's model, or switch the running session's without "
+                                                   "a restart (Claude Code's own /model, typed for you)"))
+    m.add_argument("model", nargs="?", help="default, opus, sonnet, haiku, fable or a claude-* id; omit to print")
+    m.add_argument("--confirm", action="store_true", help="answer Claude Code's confirm dialog (a switch inside a "
+                                                           "running conversation)")
+    m.set_defaults(func=model)
     agent_option(sub.add_parser("uninstall", help="stop the job and the session, then remove what install wrote "
                                 "(config last)")).set_defaults(func=uninstall)
     sub.add_parser("list", help="each job installed here: its agent, the manager's state, its work root and the "

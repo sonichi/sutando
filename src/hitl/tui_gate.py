@@ -221,14 +221,16 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
                     runtime: Optional[str] = None,
                     episode: Optional[str] = None,
                     controls: Optional[Sequence[str]] = None,
-                    model_names: Optional[Dict[str, str]] = None) -> HumanRequirement:
+                    model_names: Optional[Dict[str, str]] = None,
+                    guard: Optional[str] = None) -> HumanRequirement:
     """The requirement a gate deserves; unparseable or non-semantic gates keep the
     blocked card with no keystroke button, so a key is never guessed. A session with no stamped
     runtime predates the stamp and ran Claude, so `runtime` falls back to "claude".
     `episode` LIMIT_EPISODE keys the card on the seat, not the screen, and announces it once.
     `controls`: recovery action ids (hitl.recovery) a blocked card offers instead of a guessed
     keystroke; the caller picks them for the core or the seat. None keeps the card as it was.
-    A limit menu also offers its wait-only choices as keystrokes (safe_limit_options)."""
+    A limit menu also offers its wait-only choices as keystrokes (safe_limit_options).
+    `guard`, when given, is the episode key the caller owns (hitl.core_card.episode_guard)."""
     options, caret = parse_options(prompt)
     subject: Dict[str, object] = {
         "session": session,
@@ -277,9 +279,9 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
         actions += [recovery_action(aid, model_names) for aid in controls]
         subject["recovery"] = True
     subject["option_for_action"] = option_for_action
-    guard = guard_for(session, prompt, state)
+    if not guard:
+        guard = limit_guard(session) if episode == LIMIT_EPISODE else guard_for(session, prompt, state)
     if episode == LIMIT_EPISODE:
-        guard = limit_guard(session)
         subject.update(episode=episode, remind=False)
     return HumanRequirement(
         kind=kind, runtime=runtime or "claude", message=message, title=title,

@@ -139,6 +139,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             # dies on import and the gate reads every pane as unreadable.
             "src/cli_wedge.py",
             "src/cli_wedge_patterns.py",
+            "src/pane_composer.py",
             "src/sutando_platform.py",
             "src/delivery/__init__.py",
             "src/delivery/worker-stage.sh",
