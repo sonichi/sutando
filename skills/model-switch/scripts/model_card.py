@@ -63,6 +63,7 @@ CHOICES_KEY = "MODEL_SWITCH_CHOICES"
 NO_CHOICES = "I can't read the list of models (skills/model-switch/manifest.json), so I have no menu to show."
 DEFAULT_NAME = "the default model"
 GONE = "That choice is no longer on my list. Ask me for the model card again."
+UNRECORDED = "I couldn't start the switch: I can't write my record of it. Nothing changed."
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\[\]-]{0,79}")
 ISSUED = ("state", "model-card-choices.json")
 ISSUED_KEPT = 20
@@ -342,14 +343,15 @@ def deliver_owed(ws: Path, *, core=None, execute=None, now: float) -> list:
 
 def settle_attempt(ws: Path, attempt: str, room: str, alias: str, rc: int, *, core=None, execute=None,
                    now=time.time, sleep=time.sleep, tries: int = 1, pause: float = 0) -> dict:
-    """Save the outcome of `attempt`, then post it, trying again after `pause` up to `tries` times. An
-    outcome that cannot be saved is posted once all the same; one superseded meanwhile is not posted."""
+    """Save the outcome of `attempt`, then post it, trying again after `pause` up to `tries` times. One
+    superseded meanwhile is not posted. Nor is one that cannot be saved: without the record nothing
+    shows whether a newer attempt came after it, and its card would replace that attempt's."""
     try:
         row = save_outcome(ws, attempt, room, alias, rc, now())
-    except OSError:
+    except OSError as e:
         state, words = outcome(ws, alias, rc)
-        out = _outcome_post(ws, attempt, room, state, words, core, execute)
-        return {**out, "attempt": attempt, "outcome": state, "say": words, "saved": False}
+        return {"status": "failed", "attempt": attempt, "outcome": state, "say": words, "saved": False,
+                "why": f"the outcome could not be saved, so its card was not posted ({type(e).__name__})"}
     out = tell(ws, attempt, core=core, execute=execute, now=now())
     for _ in range(max(tries, 1) - 1):
         if out["status"] != "failed":
@@ -418,8 +420,10 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     if other is None:
         try:
             save_outcome(ws, attempt, room, alias, None, now())
-        except OSError:
-            pass
+        except OSError as e:
+            # Unrecorded, this attempt could not be told apart from an older one: nothing is started.
+            other, code = {"status": "failed", "say": UNRECORDED,
+                           "why": f"the attempt could not be recorded ({type(e).__name__})"}, 1
     delivered = deliver_owed(ws, core=core or None, execute=execute, now=now())
     extra = {"delivered": delivered} if delivered else {}
     if other is not None:

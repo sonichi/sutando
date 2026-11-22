@@ -504,12 +504,15 @@ class Attempts(Base):
         self.assertEqual(self.run_(["post", "--room", DM])[1], {"status": "posted", "event_id": "$card3"})
         self.assertEqual([c["state"] for c in self.fake.cards()], ["info", "pending", "info"])
 
-    def test_a_tap_still_switches_when_the_attempt_cannot_be_recorded(self):
+    def test_a_tap_whose_attempt_cannot_be_recorded_starts_nothing(self):
         import file_lock
+        sent = len(self.fake.calls)
         with mock.patch.object(file_lock, "locked_file", side_effect=PermissionError("read-only")):
             rc, out = self.tap("sonnet")
-        self.assertEqual((rc, out["status"], out["event_id"], len(self.launch.calls)), (0, "started", "$card2", 1))
-        self.assertEqual(mc.outcomes(self.ws), [])
+        self.assertEqual((rc, out), (1, {"status": "failed", "say": mc.UNRECORDED,
+                                         "why": "the attempt could not be recorded (PermissionError)"}))
+        self.assertEqual((self.launch.calls, len(self.fake.calls), mc.outcomes(self.ws)), ([], sent, []),
+                         "no switch, no card, no record")
 
     def test_a_tap_that_starts_nothing_still_sends_an_owed_outcome(self):
         self.failing(mc.SETTLE_TRIES)
@@ -542,15 +545,17 @@ class Attempts(Base):
             path.write_text(text)
             self.assertEqual(mc.outcomes(self.ws), [])
 
-    def test_an_outcome_that_cannot_be_saved_is_still_posted_once(self):
+    def test_an_outcome_that_cannot_be_saved_posts_no_card(self):
         import file_lock
+        sent = len(self.fake.calls)
         with mock.patch.object(file_lock, "locked_file", side_effect=PermissionError("read-only")):
             rc, out = self.settle("17-ab", 0)
-            self.assertEqual((rc, out["status"], out["saved"], out["say"]), (0, "posted", False, "Switched. I'm now using Fable."))
-            self.assertEqual(self.fake.calls[-1][2], "model-card:17-ab:outcome")
+            self.assertEqual((rc, out), (1, {
+                "status": "failed", "attempt": "17-ab", "outcome": "done", "say": "Switched. I'm now using Fable.",
+                "saved": False, "why": "the outcome could not be saved, so its card was not posted (PermissionError)"}))
             self.assertEqual(mc.tell(self.ws, "17-ab", core=CORE, execute=self.fake.execute, now=1.0),
                              {"status": "failed", "why": "the outcome record could not be used (PermissionError)"})
-        self.assertEqual((len(self.fake.calls), self.sleeps), (2, []))
+        self.assertEqual((len(self.fake.calls), self.sleeps), (sent, []), "the newer attempt's card is left as it is")
 
     def test_settle_without_an_attempt_id_makes_one(self):
         rc, out = self.run_(["settle", "--room", DM, "--model", "fable", "--rc", "0"])
