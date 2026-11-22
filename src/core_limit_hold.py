@@ -442,6 +442,9 @@ def _same_account(held_account: Optional[str], launch_account: Optional[str]) ->
 
 
 def _binds(hold: dict, launch_model: Optional[str], launch_account: Optional[str]) -> bool:
+    # A hold set while the account was unreadable says nothing about an account read since.
+    if hold.get("account_unread") and launch_account:
+        return False
     return _same_family(hold.get("model"), launch_model) and _same_account(hold.get("account"), launch_account)
 
 
@@ -635,6 +638,8 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
             "until": _hold_until(limit, strikes, now), "strikes": strikes,
             "account": launch_account, "account_at": since,
         }
+        if not launch_account:
+            new["account_unread"] = True
         if seat:
             new.update(seat=seat, seat_label=seat_label or seat)
         new["reason"] = status_line(new)

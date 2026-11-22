@@ -515,6 +515,8 @@ class EdgePaths(unittest.TestCase):
         self.assertIsNone(clh.record_evidence(rec, now), "B's record: A's late 429 is not in its ledger")
         self.assertIsNone(clh.record_evidence(limited_record(now), now, b), "unbound: not this known seat's")
         self.assertIsNotNone(clh.record_evidence(limited_record(now), now), "the seat's account unknown: as before")
+        rec["account"] = f"acct_{a[:6]}"
+        self.assertIsNone(clh.record_evidence(rec, now), "labeled, but the seat's account is unread: diagnostic only")
 
     def test_transcript_unreadable_and_odd_lines(self):
         now = time.time()
@@ -879,9 +881,17 @@ class AccountChange(unittest.TestCase):
         (self.cfg / ".claude.json").write_text(json.dumps({"oauthAccount": {}}))
         self.assertEqual(self.gate(), clh.HOLD_EXIT)
 
-    def test_a_hold_without_an_account_still_binds(self):
-        self.assertFalse(clh.decide(self.ws, self.now).launch)
-        self.assertFalse(clh.decide(self.ws, self.now + 1, launch_account="abc").launch)
+    def test_a_hold_set_while_the_account_was_unread_binds_no_account_read_since(self):
+        t = self.now
+        self.assertTrue(clh.decide(self.ws, t, quota=self.a_record(t)).launch,
+                        "a labeled refusal is diagnostic only while the core's account is unread")
+        self.assertFalse(clh.decide(self.ws, t + 1, quota=limited_record(t)).launch, "an unlabeled one: as before")
+        self.assertTrue(clh.read_hold(self.ws)["account_unread"])
+        self.assertFalse(clh.decide(self.ws, t + 2, quota=limited_record(t)).launch, "still unread: still held")
+        b = clh.account_digest({"accountUuid": "acct-b", "organizationUuid": "org-acct-b", "emailAddress": "b@example.com"})
+        self.assertTrue(clh.decide(self.ws, t + 3, quota=limited_record(t), launch_account=b).launch,
+                        "an account read since is not held by a hold that never knew whose limit it was")
+        self.assertIsNone(clh.active_hold(self.ws, t + 4))
 
     def decide(self, at: float, evidence_at: float, account: str) -> "clh.Decision":
         return clh.decide(self.ws, at, quota=limited_record(at, ago=at - evidence_at), launch_account=account)

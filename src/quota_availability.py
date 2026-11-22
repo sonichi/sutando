@@ -98,11 +98,11 @@ def account_label(digest: Any) -> Optional[str]:
 
 def record_for_account(payload: Any, digest: Any) -> Optional[dict]:
     """The proxy record when it may drive a decision for the core signed in as `digest`: labeled
-    with that account. With the account unknown, any record, as before labels existed."""
+    with that account. With the account unknown, only an unlabeled record, as before labels existed."""
+    if not isinstance(payload, dict):
+        return None
     label = account_label(digest)
-    if label is None:
-        return payload if isinstance(payload, dict) else None
-    return payload if isinstance(payload, dict) and payload.get("account") == label else None
+    return payload if payload.get("account") == label or (label is None and not payload.get("account")) else None
 
 
 def record_rejections(payload: Any) -> list:

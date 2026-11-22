@@ -349,7 +349,8 @@ class Edges(unittest.TestCase):
         rej = {"status": 429, "ts": "2025-11-21T13:01:00Z",
                "snippet": "Your credit balance is too low to access the API"}
         cases = [(mine, ("opus", digest), "out_of_credits"), (other, ("opus", digest), "paused_limit"),
-                 (None, ("opus", digest), "paused_limit"), (None, ("opus", None), "out_of_credits")]
+                 (None, ("opus", digest), "paused_limit"), (None, ("opus", None), "out_of_credits"),
+                 (mine, ("opus", None), "paused_limit")]
         for label, identity, want in cases:
             with tempfile.TemporaryDirectory() as tmp, \
                     mock.patch.object(crs.core_limit_hold, "launch_identity", return_value=identity):

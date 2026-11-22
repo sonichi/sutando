@@ -431,7 +431,8 @@ reading's usage and last request model count only when its label is the signed-i
 unlabeled reading, or one from a request sent before an account switch, reports no usage), and a
 rejection counts only for a record of its own account. The recovery state and the limit hold act
 on a proxy record only when it is labeled with the core's signed-in account (with that account
-unknown, any record, as before); `limited_until` comes only from a
+unknown, only an unlabeled record, as before), and a hold set while the account was unread does
+not bind an account read since; `limited_until` comes only from a
 hold that binds this seat's model family and account. A switch option is a row the recovery card
 itself offers (`recovery_actions.switch_offer`, the held model avoided), its `token` the runtime
 list's opaque row key that the card's `switch_model:<token>` click names; its name comes from the
