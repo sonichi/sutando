@@ -8,13 +8,14 @@ A sign-in can be done in two steps, for a person who is not at that computer: `s
 Code's sign-in waiting and returns its link, and `give_code` hands it the code the sign-in page showed
 them. The waiting sign-in belongs to a small detached process (`supervise`), which ends it after
 LOGIN_WAIT_S; the code goes to it through a FIFO only its owner can open, and this module writes it
-nowhere else (the message it arrived in is the room's to keep; the code is single-use). `start`,
+nowhere else (the message it arrived in is the room's to keep). Claude Code treats the code as
+single-use, by its own refusal text; that is not independently tested here. `start`,
 `give_code` and `cancel` take one lock, and a process is only ever ended when its pid AND its start
 time are the ones this sign-in recorded.
 
 Three agents are not signed in again by this. One with no config dir of its own, or whose dir is the
-person's own (~/.claude) or another agent's: a sign-in there would change a login that is not this
-agent's alone. And one whose requests go through the credential proxy (ANTHROPIC_BASE_URL): the proxy
+person's own (~/.claude), the Sutando core's or another agent's: a sign-in there would change a login
+that is not this agent's alone. And one whose requests go through the credential proxy (ANTHROPIC_BASE_URL): the proxy
 replaces the session's credential with its own, so its sign-in decides the account. Stdlib only.
 """
 from __future__ import annotations
@@ -47,7 +48,9 @@ PERSONAL = ("this agent's Claude config dir is your own Claude Code login (the d
             "what you run by hand, so nothing was done; give the agent a dir of its own (install --claude-config-dir)")
 ANOTHER_AGENTS = ("this agent shares its Claude config dir with another agent: signing in here would change that "
                   "agent's account too, so nothing was done")
-NONCE_MAX_AGE_S = 60.0
+CORES = ("this agent's Claude config dir is the Sutando core's: signing in here would change the core's account, so "
+         "nothing was done; give the agent a dir of its own (install --claude-config-dir)")
+CORE_DIR_NAME = ".claude-sutando"       # the core's Claude dir in its workspace, whichever workspace that is
 PROXIED = ("this agent's requests go through the credential proxy on this computer, which uses its own sign-in "
            "for every session behind it: switch the account there (the core's), not here; nothing was done")
 
@@ -74,24 +77,11 @@ def own_dir(cfg: dict, others=()) -> str:
     mine = _real(cfg["CLAUDE_CONFIG_DIR"])
     if mine == _real(Path.home() / ".claude"):
         raise Refused(PERSONAL)
+    if os.path.basename(mine) == CORE_DIR_NAME:
+        raise Refused(CORES)
     if any(mine == _real(o) for o in others if o):
         raise Refused(ANOTHER_AGENTS)
     return cfg["CLAUDE_CONFIG_DIR"]
-
-
-def take_app_nonce(path, now=time.time) -> bool:
-    """The desktop app's one-shot way in: a file it wrote just before running the command, taken (and
-    removed) once. True only for a regular file of this user that nobody else can read and that is at
-    most NONCE_MAX_AGE_S old. It shows the command was started by something able to write the agent's
-    own dir as this user, which the app is; it is no proof against someone who already has that shell."""
-    try:
-        st = os.lstat(str(path))
-        os.unlink(str(path))
-    except OSError:
-        return False
-    import stat as _stat
-    return (_stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077
-            and 0 <= now() - st.st_mtime <= NONCE_MAX_AGE_S)
 
 
 def status(cfg: dict, env: dict, run=subprocess.run) -> dict:
@@ -125,12 +115,17 @@ def words(state: dict) -> str:
 
 
 def sign_in(cfg: dict, env: dict, console: bool = False, run=subprocess.run, wait_s: float = LOGIN_WAIT_S,
-            others=()) -> "tuple[bool, str]":
+            others=(), state_dir=None) -> "tuple[bool, str]":
     """Run Claude Code's own sign-in for the agent's config dir. It opens the sign-in page in the browser
-    of this computer and returns when the person has finished there, or after `wait_s`. (ok, why not)."""
+    of this computer and returns when the person has finished there, or after `wait_s`. (ok, why not).
+    With `state_dir` it takes the two-step sign-in's lock and ends one that is waiting first."""
     own_dir(cfg, others)
     if env.get(PROXY_VAR):
         raise Refused(PROXIED)
+    if state_dir is not None:
+        with _locked(state_dir):
+            _end(Path(state_dir))
+            return sign_in(cfg, env, console, run, wait_s, others)
     argv = [cfg["CLAUDE"], "auth", "login"] + (["--console"] if console else [])
     try:
         r = run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=wait_s,
@@ -237,7 +232,8 @@ def _start(cfg, env, d, console, popen, wait_s, sleep) -> str:
     end = time.time() + wait_s
     while True:
         link = LINK_RE.search(ANSI_RE.sub("", (d / "out.log").read_text(encoding="utf-8", errors="replace")))
-        if link:
+        # Not before the sign-in's processes are on record: a cancel right after must find them to end them.
+        if link and _read_json(d / "pids.json"):
             return link.group(0)
         if (d / "result.json").exists() or time.time() >= end:
             _end(d)
