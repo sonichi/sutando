@@ -159,6 +159,19 @@ When the ctl exits 12 (another launcher run held the app's launch lock; nothing 
 started), the receipt is `failed`, the card says the core is already being restarted and to try
 again shortly, any hold it lifted returns, and nothing is retried automatically.
 
+A tap from anyone but the owner runs nothing, leaves the card as it was and posts nothing in the
+room. On a card this store holds, tapped in the room the card was posted in (its requirement's
+`room`, else its projection's), it adds one `state/recovery/audit.jsonl` line, `outcome: refused`
+and `reason: not_owner`, with the `hitl_id`, the `action_id` (only an id the card offered, else
+empty), the tapper's mxid as `sender` and that `room`. That line is written once per card and
+tapper, so repeated taps add nothing. A tap from any other room, or on a card with no known room,
+is not recorded; nor is a typed label from a non-owner, which is a message, not a tap. Every audit
+writer (the bridge and the recovery executor, in either copy of `hitl/recovery.py`) reads, dedupes,
+appends and trims under one lock on `state/recovery/audit.lock` (`file_lock.locked_file`: `flock`
+on POSIX, `msvcrt` on Windows), so concurrent writers neither lose nor duplicate a line. A failed
+trim keeps the appended line and is only logged. The audit feeds neither the card, the heartbeat nor `core_recovery.v1`: it is the local
+record the owner or Sutando reads on the host.
+
 **One card per incident.** After an action the card stays open with its outcome ("Switched the
 core to Opus 5.5; checking that it is working again."). It closes, with "It is working again."
 and "✓ Done.", only once the session is seen unblocked. Still blocked a minute after a done

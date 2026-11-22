@@ -65,8 +65,7 @@ ACTION_TTL_S = 600.0
 #: A recovery card accepted this long ago with no action file, claim or receipt lost its click.
 ORPHAN_CLICK_S = 120.0
 CLAIM_SUFFIX = ".claimed"
-AUDIT_FILE = "audit.jsonl"
-AUDIT_KEEP = 500
+AUDIT_FILE = recovery.AUDIT_FILE
 #: Change billing or the signed-in identity: refused until the confirmed, re-authenticated flow.
 STEP_UP = frozenset({recovery.BUY_CREDITS, recovery.ADD_ACCOUNT, recovery.SWITCH_ACCOUNT})
 CONTINUE = ("continue", "Enter")
@@ -736,20 +735,7 @@ def _restart_failed(manager, workspace: Path, req_id: str, check: Dict, done, no
     _supersede(manager, req_id)
 
 
-def audit(workspace: Path, entry: Dict) -> None:
-    """One line per action or refusal, bounded; ids and outcomes only, never message text."""
-    path = recovery.recovery_dir(workspace) / AUDIT_FILE
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a") as f:
-            f.write(json.dumps(entry, sort_keys=True) + "\n")
-        lines = path.read_text().splitlines()
-        if len(lines) > 2 * AUDIT_KEEP:
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text("\n".join(lines[-AUDIT_KEEP:]) + "\n")
-            os.replace(tmp, path)
-    except OSError:
-        pass  # the receipt and the card are the record of the outcome
+audit = recovery.audit
 
 
 def _settle(manager, target: Target, data: Dict, req, outcome: str, reason, line: str,
