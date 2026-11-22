@@ -30,9 +30,8 @@ SWITCH_RUNTIME = "switch_runtime"
 RESTART_CORE = "restart_core"
 ESCAPE_PROMPT = "escape_prompt"
 REFRESH_OPTIONS = "refresh_options"
-# A model is named by the key of the runtime's own list (runtime_models); which keys exist is that
-# list's, checked before anything runs.
-# A model switch names an opaque row token (runtime_models.record), never a model or a label.
+# A model switch names an opaque token of one read of the runtime's own list (runtime_models),
+# never a model or a label; which tokens exist is that list's, checked before anything runs.
 _MODEL_KEY = re.compile(r"o[0-9a-f]{12}")
 # A runtime is named by a slug here; which runtimes exist is the engine's list
 # (core_recovery_state.RUNTIMES), checked before anything runs.
