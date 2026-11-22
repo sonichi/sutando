@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -31,14 +32,25 @@ class Rules(unittest.TestCase):
                                 ("haiku", "Set model to Sonnet 4.6", False)):
             self.assertEqual(bool(rules.model_accepted(model).search(line)), ok, (model, line))
 
-    def test_the_input_box_is_empty_only_when_a_prompt_shows_nothing_typed(self):
-        dim, grey = "\x1b[2m", "\x1b[38;5;240m"
-        for shown, text in ((None, None), ("", None), ("no prompt here", None), ("\u276f ", ""), ("\u276f hi ", "hi"),
-                            ("old\n\u276f \n  \u276f fix the bug", "fix the bug"),
-                            ("\u276f %sTry \"fix lint errors\"\x1b[0m" % dim, ""),
-                            ("\u276f\u00a0%srun the tests\x1b[39m" % grey, ""),
-                            ("Select model\n\u276f 1. Default\n  2. Opus", "1. Default")):
+    def test_the_input_box_is_the_rows_between_its_two_rules_and_unknown_when_it_is_not_whole(self):
+        rule, dim, grey = "\u2500" * 30, "\x1b[2m", "\x1b[38;5;240m"
+
+        def box(*rows):
+            return "\n".join([rule, "\u276f " + rows[0], *rows[1:], rule, "  footer"])
+
+        for shown, text in ((None, None), ("", None), ("no prompt here", None), ("\u276f ", None),
+                            (rule + "\n\u276f ", None), (rule + "\n" + rule, None),
+                            ("Select model\n\u276f 1. Default\n  2. Opus", None),
+                            (box(""), ""), (box("hi "), "hi"), (box("", "  second"), "second"), (box("a", "b"), "a\nb"),
+                            ("old\n" + box("") + "\n" + box("fix the bug"), "fix the bug"),
+                            (box('%sTry "fix lint errors"\x1b[0m' % dim), ""),
+                            (rule + "\n\u276f\u00a0%srun the tests\x1b[39m\n" % grey + rule, "")):
             self.assertEqual(rules.composer_text(shown), text, shown)
+
+    def test_a_line_counts_for_a_context_variant_only_when_asked_to_tell_them_apart(self):
+        shown = "Set model to Opus 4.6\nSet model to Opus 4.6 (1M context)\nSet model to Sonnet 4.6"
+        self.assertEqual([rules.accepted_count("opus", shown), rules.accepted_count("opus", shown, True),
+                          rules.accepted_count("opus[1m]", shown, True), rules.accepted_count("haiku", shown)], [2, 1, 1, 0])
 
     def test_the_shell_scripts_get_the_same_patterns_from_the_command_line(self):
         def run(*argv):
@@ -47,6 +59,9 @@ class Rules(unittest.TestCase):
 
         self.assertEqual(run("model-pattern").stdout.strip(), rules.MODEL_PATTERN)
         self.assertEqual(run("accept", "claude-opus-4-6").stdout.strip(), rules.accept_pattern("claude-opus-4-6"))
+        counted = subprocess.run([sys.executable, str(REPO / "src" / "claude_model_switch.py"), "count", "opus"],
+                                 input="Set model to Opus 4.6\nSet model to Sonnet 4\n", capture_output=True, text=True)
+        self.assertEqual(counted.stdout.strip(), "1")
         for bad in (["accept"], ["accept", "gpt-5"], [], ["model-pattern", "x"]):
             self.assertEqual(run(*bad).returncode, 2, bad)
         # The patterns are plain EREs, so grep -E in the skill reads them as Python does.
@@ -54,6 +69,8 @@ class Rules(unittest.TestCase):
             self.assertNotIn("(?", pattern)
             re.compile(pattern)
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with unittest.mock.patch.object(sys, "stdin", io.StringIO("Set model to Opus 4.6\n")):
+                self.assertEqual(rules.main(["count", "opus"]), 0)
             self.assertEqual((rules.main(["model-pattern"]), rules.main(["accept", "opus"]), rules.main([])), (0, 0, 2))
 
 

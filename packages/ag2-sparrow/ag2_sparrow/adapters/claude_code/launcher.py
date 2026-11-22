@@ -44,7 +44,7 @@ MODEL_ACCEPT_S = 20.0
 # The names that may be typed, Claude Code's two texts and its input-box check are the core's
 # (src/claude_model_switch.py, bundled verbatim): one source for the skill and for this adapter.
 MODEL_RE, MODEL_SET, MODEL_CONFIRM = claude_model_switch.MODEL_RE, claude_model_switch.MODEL_SET, claude_model_switch.MODEL_CONFIRM
-composer_text, model_accepted = claude_model_switch.composer_text, claude_model_switch.model_accepted
+composer_text, accepted_count = claude_model_switch.composer_text, claude_model_switch.accepted_count
 MODEL_RECORD = ("state", "model-switch.json")
 
 
@@ -636,8 +636,8 @@ class Launcher:
             return False, "refused: the session shows no input prompt, so its input box cannot be read; nothing sent"
         if draft:
             return False, "refused: the session's input box holds unsent text; nothing sent"
-        shown, accepted = self.tm.capture(gen["pane_id"]) or "", model_accepted(model)
-        before, other, asked = len(accepted.findall(shown)), shown.count(MODEL_SET), shown.count(MODEL_CONFIRM)
+        shown = self.tm.capture(gen["pane_id"]) or ""
+        before, other, asked = accepted_count(model, shown, True), shown.count(MODEL_SET), shown.count(MODEL_CONFIRM)
 
         def keys(*names):
             pred = tmux_pane_keys.predicate(gen["nonce"], gen["pane_pid"], gen["session_id"], gen["session_created"],
@@ -654,7 +654,7 @@ class Launcher:
         answered, deadline = False, time.monotonic() + wait_s
         while time.monotonic() < deadline:
             text = self.tm.capture(gen["pane_id"]) or ""
-            if len(accepted.findall(text)) > before:
+            if accepted_count(model, text, True) > before:
                 self.log("model: switched to %s" % model)
                 with contextlib.suppress(OSError):   # the switch happened whether or not it is recorded
                     path = Path(self.root).joinpath(*MODEL_RECORD)

@@ -131,8 +131,13 @@ if read("claude-exit-on-exit", ""):
     def shown(model):
         # Claude Code echoes a display name for an id ("Fable 5.2"), and an alias as typed.
         m = _re.match(r"claude-([a-z]+)-([0-9]+(?:-[0-9]+)*)", model)
-        return "%s %s" % (m.group(1).capitalize(), m.group(2).replace("-", ".")) if m else model
-    print(read("claude-prompt", "\u276f "), flush=True)     # the input box: empty unless a test leaves a draft in it
+        tag = " (1M context)" if model.endswith("[1m]") else ""
+        return "%s %s%s" % (m.group(1).capitalize(), m.group(2).replace("-", "."), tag) if m else model
+    def box():
+        # The input box as Claude Code draws it: a rule, the prompt row, a rule, the footer.
+        print("\u2500" * 40 + "\n" + read("claude-prompt", "\u276f ") + "\n" + "\u2500" * 40 + "\n  \u23f5\u23f5 bypass permissions on",
+              flush=True)
+    box()
     for line in sys.stdin:
         line = line.lstrip("\x1b")
         if line.strip() == "/exit":
@@ -142,8 +147,10 @@ if read("claude-exit-on-exit", ""):
             print("Switch model?  Yes, switch / No, go back", flush=True)
         elif line.startswith("/model ") and not read("claude-model-deaf", ""):
             print("Set model to " + shown(line.split(None, 1)[1].strip()), flush=True)
+            box()
         elif line.strip() == "" and read("claude-model-asked", ""):
             print("Set model to " + shown(read("claude-model-asked", "").split(None, 1)[1]), flush=True)
+            box()
     sys.exit(0)
 time.sleep(float(read("claude-linger", "0")))
 sys.exit(int(read("claude-exit", "0")))

@@ -21,7 +21,7 @@ ACCEPT=""
 if [ "$MODE" != cancel ]; then ACCEPT="$("$PY" "$REPO_ROOT/src/claude_model_switch.py" accept "$REQ")" || { echo "pane-observe: '$REQ' is not a model" >&2; exit 2; }; fi
 # A failed capture is a failed observation, never a zero.
 cap() { tmux -S "$SOCK" capture-pane -p -t "$SESSION" 2>/dev/null || { echo "CAPTURE-FAILED"; return 12; }; }
-count() { out="$(cap)" || { echo "CAPTURE-FAILED"; return 12; }; printf '%s\n' "$out" | grep -Eci -- "$ACCEPT"; return 0; }
+count() { out="$(cap)" || { echo "CAPTURE-FAILED"; return 12; }; printf '%s\n' "$out" | "$PY" "$REPO_ROOT/src/claude_model_switch.py" count "$REQ"; return 0; }
 case "$MODE" in
   count) count; exit $?;;
   cancel) bash "$PANE_KEYS" --python "$PY" -S "$SOCK" -t "$SESSION" -- Escape || exit $?; echo CANCELLED; exit 0;;
@@ -37,7 +37,7 @@ while :; do
     # Unobservable pane: keep polling, but never let a blind poll count as acceptance.
     [ "$(date +%s)" -ge "$deadline" ] && { echo TIMEOUT; exit 11; }; sleep 0.5; continue
   fi
-  n=$(printf '%s\n' "$text" | grep -Eci -- "$ACCEPT")
+  n=$(printf '%s\n' "$text" | "$PY" "$REPO_ROOT/src/claude_model_switch.py" count "$REQ")
   if [ "$n" -gt "$BASE" ]; then echo ACCEPTED; exit 0; fi
   if [ -z "$ANSWER" ] && printf '%s' "$text" | grep -q -- "$DIALOG"; then echo DIALOG; exit 10; fi
   [ "$(date +%s)" -ge "$deadline" ] && { echo TIMEOUT; exit 11; }

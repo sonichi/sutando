@@ -21,11 +21,21 @@ GEN = {"nonce": "a" * 32, "pane_pid": 7, "session_id": "$1", "session_created": 
 REC = {"generation": GEN, "title_token": "tok"}
 
 
+RULE = "\u2500" * 40
+
+
+def box(*rows):
+    """Claude Code's input box as it is on screen: a rule, the prompt row and any further rows of a
+    draft, a rule, the footer."""
+    first, rest = (rows + ("",))[0], rows[1:]
+    return "\n".join([RULE, "\u276f " + first, *rest, RULE, "  \u23f5\u23f5 bypass permissions on"])
+
+
 class Pane:
     """What the pane shows, and the keys sent to it; `react(keys, pane)` is the stand-in Claude Code."""
 
     def __init__(self, react=None, session=True, rc=0):
-        self.text, self.sent, self.react, self.session, self.rc = "\u276f ", [], react, session, rc
+        self.text, self.sent, self.react, self.session, self.rc = box(), [], react, session, rc
         self.sock, self.tmux = "/s", "tmux"
 
     def has_session(self, name=None):
@@ -123,20 +133,26 @@ class SwitchModel(unittest.TestCase):
 
     def test_a_draft_in_the_input_box_or_a_box_that_cannot_be_read_gets_no_keys(self):
         dim = "\x1b[2m"
-        for shown, why in (("\u276f half a message", "holds unsent text"),
-                           ("Select model\n\u276f 1. Default\n  2. Opus", "holds unsent text"),   # a menu left open
-                           ("old\n\u276f \n  \u276f fix the bug", "holds unsent text"),
+        # After the drafts: no frame around the prompt, a frame cut off, a menu left open, no prompt.
+        for shown, why in ((box("half a message"), "holds unsent text"),
+                           (box("", "  a second line under a blank first one"), "holds unsent text"),
+                           (box("first", "second"), "holds unsent text"),
+                           ("old\n" + box() + "\nlater\n" + box("fix the bug"), "holds unsent text"),
+                           ("\u276f ", "cannot be read"),
+                           (RULE + "\n\u276f ", "cannot be read"),
+                           ("Select model\n\u276f 1. Default\n  2. Opus", "cannot be read"),
                            ("no prompt on this screen", "cannot be read"), ("", "cannot be read")):
             pane = Pane(says)
             pane.text = shown
             switched, line = lc_for(pane, self.root).switch_model(REC, "opus")
             self.assertEqual((switched, why in line, pane.sent), (False, True, []), shown)
         # A placeholder or a suggestion is styled, never typed: the box is empty.
-        for shown in ("\u276f %sTry \"fix lint errors\"\x1b[0m" % dim, "\u276f\u00a0\x1b[38;5;240mrun the tests\x1b[39m"):
+        for shown in (box('%sTry "fix lint errors"\x1b[0m' % dim), box("\x1b[38;5;240mrun the tests\x1b[39m")):
             pane = Pane(says)
             pane.text = shown
             self.assertEqual(lc_for(pane, self.root).switch_model(REC, "opus"), (True, "switched to opus"), shown)
-        self.assertEqual([launcher.composer_text(t) for t in (None, "\u276f ", "\u276f hi ")], [None, "", "hi"])
+        self.assertEqual([launcher.composer_text(t) for t in (None, box(), box("hi "), box("a", " b "))],
+                         [None, "", "hi", "a\nb"])
 
     def test_only_a_line_naming_the_model_asked_for_is_the_switch(self):
         def other(keys, pane):
@@ -151,8 +167,18 @@ class SwitchModel(unittest.TestCase):
         for model, line, ok in (("opus", "Set model to Opus 4.6 and saved", True), ("opus[1m]", "Set model to opus[1m]", True),
                                 ("claude-opus-4-6", "Set model to Opus 4.6", True), ("claude-opus-4-6", "Set model to Opus 4.61", False),
                                 ("claude-opus-4", "Set model to Opus 4.6", False), ("opus", "Set model to Opusplan", False),
-                                ("default", "Set model to Default (recommended)", True), ("haiku", "Set model to Sonnet 4.6", False)):
-            self.assertEqual(bool(launcher.model_accepted(model).search(line)), ok, (model, line))
+                                ("default", "Set model to Default (recommended)", True), ("haiku", "Set model to Sonnet 4.6", False),
+                                # The context variant is part of the model: neither line confirms the other.
+                                ("opus[1m]", "Set model to Opus 4.6", False), ("opus", "Set model to Opus 4.6 (1M context)", False),
+                                ("claude-opus-4-6[1m]", "Set model to Opus 4.6 (1M context)", True)):
+            self.assertEqual(launcher.accepted_count(model, "x\n" + line, True), int(ok), (model, line))
+
+        def plain(keys, pane):
+            pane.text += "\nSet model to Opus 4.6 and saved as your default"
+
+        with mock.patch.object(launcher.time, "monotonic", side_effect=[0.0, 0.0, 1.0, 5.0]):
+            switched, line = lc_for(Pane(plain), self.root).switch_model(REC, "opus[1m]", wait_s=2)
+        self.assertEqual((switched, line.startswith("unconfirmed"), launcher.switched_model(self.root)), (False, True, ""))
 
     def test_a_confirmation_that_may_not_have_been_sent_is_tried_once_and_is_not_a_switch(self):
         class Asks(Pane):
