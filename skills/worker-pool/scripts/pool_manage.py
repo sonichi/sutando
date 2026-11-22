@@ -203,20 +203,21 @@ def retire(workspace, target, *, unbind=False, hand_off=False, runner=subprocess
     _, _, _, unbound = pr.set_worker_state(workspace, wid, "retired", unbind=unbind)
     return {**base, "result": "retired", "unbound": unbound,
             "handed_off": moved["handed_off"], "kept": moved["kept"],
-            "identity": _retire_identity(workspace, wid, tell=tell)}
+            "identity": _retire_identity(workspace, wid, tell=tell),
+            "pending_approval": _withdraw_approval(workspace, wid, tell=tell)}
 
 
 # s.space's account.agents.retire refuses a live identity (identity_retire_unavailable), so
 # deleting the agent itself is the owner's step in the app.
-AGENT_REMOVAL_OWNER_STEP = ("s.space cannot delete a live agent for us yet: delete it in the app "
+AGENT_REMOVAL_OWNER_STEP = ("the server cannot delete a live agent for us yet: delete it in the app "
                             "(your agents list), or it stays there with no worker behind it")
 
 
 def agent_removal_note(worker_label: str, agent: str) -> str:
     """The owner's DM once a retired worker's agent is cut loose here but still exists on s.space."""
     return (f"[dm-only]\n**Delete agent `{agent}` in the app**\n\nYour worker {worker_label} was retired: "
-            "it no longer uses that agent, and its token is gone from this computer. s.space cannot delete a "
-            "live agent for me yet, so it stays in your agents list until you delete it there.")
+            "it no longer uses that agent, and its token is gone from this computer. The server cannot delete "
+            "a live agent for me yet, so it stays in your agents list until you delete it there.")
 
 
 def _tell_owner(workspace, text: str) -> bool:
@@ -226,6 +227,16 @@ def _tell_owner(workspace, text: str) -> bool:
         return True
     except Exception:  # noqa: BLE001 — the retirement is done; the note is reported as not sent
         return False
+
+
+def _withdraw_approval(workspace, wid: str, tell=None) -> dict:
+    """A device-flow approval still open for the retired worker: withdrawn here (pool_device_connect.withdraw).
+    The server has no cancel, so the flow keeps asking; an approval that lands later is reported by name."""
+    try:
+        import pool_device_connect
+        return pool_device_connect.withdraw(Path(workspace), wid, deliver=tell)
+    except Exception as e:  # noqa: BLE001 — the retirement is done; the approval is reported, never raised
+        return {"result": "failed", "why": f"{type(e).__name__}: {e}"}
 
 
 def _retire_identity(workspace, wid: str, tell=None) -> dict:

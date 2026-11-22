@@ -181,7 +181,7 @@ def main(argv=None) -> int:
     ap.add_argument("--socket", default="")
     ap.add_argument("--new", action="store_true", help="fresh session (the default)")
     ap.add_argument("--no-identity", action="store_true",
-                    help="do not start the worker's own s.space identity; it answers through the core")
+                    help="do not start the worker's own agent identity; it answers through the core")
     ap.add_argument("--identity-wait", type=float, default=pir.DEFAULT_WAIT_S,
                     help=argparse.SUPPRESS)
     ap.add_argument("--dry-run", action="store_true")

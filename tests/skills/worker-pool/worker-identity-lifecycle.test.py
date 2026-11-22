@@ -342,5 +342,81 @@ class Lifecycle(D.Base):
         self.assertTrue(any(NEW_AGENT in n and "Delete agent" in n for n in notes), notes)
 
 
+
+class RetireWhileTheApprovalIsPending(D.Base):
+    """Retiring a worker whose device-flow approval is still open: the approval is withdrawn, and an
+    approval the owner gives anyway is named to them, since nothing here saves or uses that agent."""
+
+    def setUp(self):
+        super().setUp()
+        sock = str(self.ws / "tmux.sock")
+        pool_manage.wi.create_worker(self.ws, runtime="claude", tmux_socket=sock, worker_id=W, cwd=str(ROOT))
+        pr.register_worker(self.ws, W, "Reviewer", runtime="claude")
+        self.runner = Lifecycle.runner.__get__(self)
+        self.alive = set()
+
+    def start_flow(self, *, approve: bool):
+        """dc.connect in a thread, held on its first poll until `self.go` is set."""
+        self.go, self.fake = threading.Event(), D.ConnectFake(self.backend, expires_in=60)
+        self.raised = []
+
+        def sleep(seconds):
+            self.go.wait(10)
+            self.backend.sleep(seconds if approve else 200)
+            if approve:
+                self.fake.approve()
+
+        def run():
+            try:
+                dc.connect(W, label="reviewer", worker_label="Reviewer", workspace=self.ws, vault=self.vault, request=self.fake.request,
+                           preview=self.preview, deliver=self.sent.append, sleep=sleep, clock=self.backend.clock)
+            except dc.DeviceConnectError as e:
+                self.raised.append(e.status)
+        self.thread = threading.Thread(target=run, daemon=True)
+        self.thread.start()
+        for _ in range(200):
+            if dc.read_record(self.ws, W).get("state") == "pending":
+                return
+            time.sleep(0.01)
+        self.fail("the flow never sent its link")
+
+    def retire(self):
+        with unittest.mock.patch.object(C, "_vault", lambda v=None: self.vault):
+            out = pool_manage.retire(self.ws, W, runner=self.runner, tell=self.sent.append)
+        self.assertEqual(out["result"], "retired", out)
+        return out
+
+    def test_an_unapproved_link_is_withdrawn_and_lapses_with_nothing_left(self):
+        self.start_flow(approve=False)
+        out = self.retire()
+        self.assertEqual((out["pending_approval"]["result"], out["pending_approval"]["label"]),
+                         ("withdrawn", "reviewer"))
+        self.go.set()
+        self.thread.join(10)
+        self.assertEqual(self.raised, ["expired"])
+        self.assertIsNone(C.worker_identity(W, self.ws))
+        self.assertEqual(dc.read_record(self.ws, W)["state"], "withdrawn")
+        self.assertEqual(len(self.sent), 2, self.sent)  # the link, then its withdrawal; no "expired, ask again"
+        self.assertIn("is withdrawn", self.sent[1])
+        self.assertIn('do not approve agent "reviewer"', self.sent[1])
+        self.assertNotIn("expired", " ".join(self.sent[1:]))
+        self.assertEqual(dc.resend(W, workspace=self.ws, spawn=lambda argv: 1)["status"], "refused")
+
+    def test_an_approval_given_after_the_retirement_is_named_to_the_owner(self):
+        self.start_flow(approve=True)
+        self.retire()
+        self.go.set()
+        self.thread.join(10)
+        self.assertEqual(self.raised, ["worker_retired"])
+        self.assertIsNone(C.worker_identity(W, self.ws))
+        rec = dc.read_record(self.ws, W)
+        self.assertEqual((rec["state"], rec["agent_id"]), ("retired_after_approval", NEW_AGENT))
+        self.assertIn(f"**Delete agent `{NEW_AGENT}` in the app**", self.sent[-1])
+        self.assertIn("approved after your worker Reviewer was retired", self.sent[-1])
+        self.assertNoSecret(self.fake, *self.sent, json.dumps(rec))
+
+    def test_a_worker_with_no_open_approval_reports_none(self):
+        self.assertEqual(self.retire()["pending_approval"], {"result": "none"})
+
 if __name__ == "__main__":
     unittest.main()

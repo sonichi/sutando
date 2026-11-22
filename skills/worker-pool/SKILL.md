@@ -115,7 +115,7 @@ python3 skills/worker-pool/scripts/pool_manage.py unbind <room id>
 | identity | approval link in the owner's DM; on approval the token is saved, the worker's lane starts and its seat restarts as its own agent | the request and the save | approve the link (15 minutes; "Get a new link" after) | `agent.create` (`provision-*`) is not offered on s.space |
 | work | tasks addressed to its agent go to it; it posts as its own agent | yes | no | |
 | stop / enable / reseat | `pool_manage.py stop`, `enable`, `reseat`: the identity row, lane and vault secret are kept, so the seat starts again as its own agent | yes | no | |
-| retire | `pool_manage.py retire`: routing closed, sessions down, work handed off, then its identity lane, row and vault secret removed here | yes | delete the agent in the app (the owner gets a DM note naming it) | deleting a live agent from here (`account.agents.retire` refuses it) |
+| retire | `pool_manage.py retire`: routing closed, sessions down, work handed off, then its identity lane, row and vault secret removed here, and an open approval withdrawn | yes | delete the agent in the app (the owner gets a DM note naming it, also when an approval lands after the retirement) | deleting a live agent from here (`account.agents.retire` refuses it) |
 | remove | `pool_manage.py remove`: the retired worker's roster row goes | yes | no | |
 
 ## Codex CLI workers
@@ -214,6 +214,14 @@ cannot delete a live agent for us yet (`account.agents.retire` refuses one with 
 the agent itself stays on its server until the owner deletes it in the app. Retire says so in its JSON line
 (`identity.agent_removal: "owner_step"`, `identity.owner_told`) and sends the owner a note in their DM naming the
 agent to delete.
+
+Retiring a worker whose device-flow approval is still open withdraws it (`pool_device_connect.withdraw`): the
+approval record turns `withdrawn`, the approval card turns to "Withdrawn" (or the owner gets a text note) telling the
+owner not to approve it, and "Get a new link" is refused. The server has no way to cancel a device code, so the
+background flow keeps asking until the link expires. If it expires, nothing is left and no "expired" card is
+posted. If the owner approves anyway, the retirement fence refuses the save, and the owner gets a DM note naming
+the approved agent to delete in the app (record state `retired_after_approval`, with `agent_id`). Retire's JSON
+line reports this as `pending_approval` (`withdrawn` with the label, or `none`).
 
 ### A new worker gets its own agent by default
 
