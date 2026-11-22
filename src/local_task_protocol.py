@@ -391,9 +391,9 @@ _QUOTED_BLOCK = re.compile(
 _JSON_DECODER = json.JSONDecoder()
 
 
-def quoted_block_spans(text: str) -> "tuple[int, tuple[int, int, dict, str] | None]":
+def quoted_block_spans(text: str) -> "tuple[int | None, tuple[int, int, dict, str] | None]":
     """(where the message after the broker's quoted blocks starts, the reply-context
-    record's (start, end, decoded record, label) or None); (0, None) when a block is malformed."""
+    record's (start, end, decoded record, label) or None); (None, None) when a block is malformed."""
     pos, reply = len(text) - len(text.lstrip()), None
     for kind in ("room metadata", "reply context"):
         m = _QUOTED_BLOCK.match(text, pos)
@@ -402,16 +402,16 @@ def quoted_block_spans(text: str) -> "tuple[int, tuple[int, int, dict, str] | No
         try:
             record, end = _JSON_DECODER.raw_decode(text, m.end())
         except ValueError:
-            return 0, None
+            return None, None
         tail = len(text) - len(text[end:].lstrip())
         closer = next((f"[End {p} {kind}]" for p in _MARKER_PRODUCTS
                        if text.startswith(f"[End {p} {kind}]", tail)), None)
         if not isinstance(record, dict) or closer is None:
-            return 0, None
+            return None, None
         pos = len(text) - len(text[tail + len(closer):].lstrip())
         if kind == "reply context":
             if not isinstance(record.get("sender"), str) or not isinstance(record.get("body"), str):
-                return 0, None
+                return None, None
             reply = (m.end(), end, record, m.group(2))
     return pos, reply
 

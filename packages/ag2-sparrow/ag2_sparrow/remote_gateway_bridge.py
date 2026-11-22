@@ -6107,7 +6107,7 @@ def _fetch_media_marker(inner: str) -> "tuple[str, Path, object] | None":
     else:
         # Only the configured gateway or homeserver origin is fetched (a sender's marker must not reach loopback or LAN).
         _log("media URL is not on the gateway or homeserver origin — leaving marker as-is")
-        return body
+        return None
 
     try:
         data = _download_bytes(url, headers, MAX_MEDIA_BYTES)
@@ -6154,6 +6154,10 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
     # Only the message itself and the quoted record's `body` are scanned; every other
     # quoted field stays inert. Each attempt, failed or not, spends one budget slot.
     tail_at, reply = local_task_protocol.quoted_block_spans(body)
+    if tail_at is None:
+        # A malformed quoted block: no part of it can be told from the sender's own text, so nothing is fetched.
+        _log("malformed reply-context block — no media fetched")
+        return body
     budget = [MAX_MEDIA_PER_TASK]
 
     def resolve(segment: str, quoted: bool, refs: list) -> str:
