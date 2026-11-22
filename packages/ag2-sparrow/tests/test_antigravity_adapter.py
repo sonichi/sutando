@@ -36,7 +36,7 @@ LOCK_HOME = tempfile.mkdtemp(prefix="agy-lock-home-")
 holder_lock._home = lambda: LOCK_HOME
 atexit.register(shutil.rmtree, LOCK_HOME, True)
 from ag2_sparrow.adapters.antigravity import cli, antigravity_connector as gc  # noqa: E402
-from ag2_sparrow import connector_cards  # noqa: E402
+from ag2_sparrow import connector_cards, model_switch  # noqa: E402
 from ag2_sparrow.result_markers import parse_markers, render_skill_prelude  # noqa: E402
 
 STUB = str(Path(__file__).resolve().parent / "agy_stub_acp.py")
@@ -226,6 +226,39 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         self.assertEqual((self.set_model_calls(), self.post_queued()), ([], []))
         self.assertNotIn("model_switch", self.w.metrics()[-1])
+
+    def test_a_model_id_a_card_reply_cannot_carry_still_has_a_button_that_picks_it(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        state = self.w.root / "state" / "model.json"
+        kept = json.loads(state.read_text())
+        odd = [{"id": "models/gemini-pro", "name": "Gemini Pro"}, {"id": "vendor:model [beta]", "name": "Beta"}]
+        state.write_text(json.dumps(dict(kept, available=kept["available"] + odd)))
+        self.dm_task("task-2", "/model")
+        self.w.serve()
+        self.assertEqual(self.w.result("task-2"), "[no-send] the model card answers\n")
+        (sent,) = self.post_queued()
+        buttons = sent["extra_content"]["space.ag2.card"]["buttons"]
+        self.assertEqual([b["label"] for b in buttons[-2:]], ["Gemini Pro", "Beta"])
+        self.assertTrue(all(b["command"].split(":")[-1].startswith("id.") for b in buttons[-2:]), buttons[-2:])
+        said = buttons[-2]["reply"]
+        self.dm_task("task-3", said, reply_to="$card1", click=said)
+        self.w.serve()
+        self.assertEqual((json.loads(state.read_text())["wanted"], self.w.metrics()[-1]["card"]),
+                         ("models/gemini-pro", "model-picked"))
+        self.assertEqual([model_switch.model_verb(m) for m in ("gemini-3.8-flash-high", "a b")][0], "gemini-3.8-flash-high")
+
+    def test_a_menu_that_cannot_be_built_is_answered_in_words_once_and_never_retried(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        with mock.patch.object(model_switch.ModelSwitch, "card", side_effect=connector_cards._core()[0].CardError("bad label")):
+            self.dm_task("task-2", "/model")
+            self.w.serve()
+        self.assertIn("could not post the model card", self.w.result("task-2"))
+        self.assertEqual((self.w.metrics()[-1]["card"], self.post_queued()), ("model-card", []))
+        self.assertIn("task-2", (self.w.root / "state" / "done").read_text(), "answered, so not served again")
 
     def test_an_outcome_that_could_not_be_queued_is_told_after_the_next_turn_and_the_model_in_use_is_kept(self):
         (self.w.home / "models").write_text("")

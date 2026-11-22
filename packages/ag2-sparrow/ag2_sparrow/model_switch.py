@@ -7,6 +7,7 @@ reports the model that turn ran on (`tell`). What is kept, in `state/model.json`
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 
@@ -25,6 +26,18 @@ UNKNOWN = ("I don't know my models yet: I learn them when a turn starts. Send me
 UNLISTED = "I could not get my list of models just now. Send /model again in a moment."
 NOT_USABLE = "That model is not one I can use now. Send /model for the current list."
 ANSWERED = "[no-send] the model card answers\n"
+NOT_POSTED = "I could not post the model card. Try again in a moment."
+
+
+def model_verb(model_id: str) -> str:
+    """What a model's button carries. A card reply takes a short plain token, and an id may hold a
+    slash, a colon or a space ("models/gemini-pro"): such an id travels as a digest of itself."""
+    agent_card, _ = connector_cards._core()
+    try:
+        agent_card.reply("model", "agent", model_id)
+        return model_id
+    except ValueError:
+        return "id." + hashlib.sha256(model_id.encode("utf-8")).hexdigest()[:24]
 
 
 class ModelSwitch:
@@ -100,7 +113,7 @@ class ModelSwitch:
                                     text="I could not switch to %s. I'm still using %s. Send /model to try again."
                                          % (name, names.get(ran, ran or "my default model")))
         buttons = [agent_card.button(name, "reply", reply="Use %s" % name,
-                                     command=agent_card.reply("model", "agent", mid))
+                                     command=agent_card.reply("model", "agent", model_verb(mid)))
                    for mid, name in list(names.items())[:BUTTONS]]
         more = list(names.values())[BUTTONS:]
         text = "Now using %s." % names.get(now, now or "the default model")
@@ -116,8 +129,17 @@ class ModelSwitch:
         Without one (a bridge run elsewhere, a bare connector) nothing would post what is queued."""
         return bool(self.bridge_state) and os.path.isdir(self.bridge_state)
 
+    def menu(self, state):
+        """The card with the buttons, or None when it cannot be built (a name the card rules refuse):
+        the ask is then answered in words, never left to raise and be retried."""
+        try:
+            return self.card(state)
+        except ValueError as e:
+            self.log("model card not built:", str(e)[:200])
+            return None
+
     def post(self, room, built) -> bool:
-        if not self.usable():
+        if built is None or not self.usable():
             return False
         try:
             connector_cards.queue(self.bridge_state, str(room or ""), *built)
@@ -135,7 +157,7 @@ class ModelSwitch:
             sent, said = agent_card.reply_words(f.read())
         verdict = connector_cards.click(sent, said, self.root)
         if verdict.verdict == agent_card.COMMAND and verdict.command.kind == "model":
-            return self.pick(verdict.command.verb, sent, result_file)
+            return self.pick(verdict.command.verb, sent, result_file, by_verb=True)
         if verdict.verdict in (agent_card.COMMAND, agent_card.FORGED):
             self.publish(result_file, self.quoted(verdict.say) + "\n")
             return "card-refused"
@@ -154,13 +176,14 @@ class ModelSwitch:
             return None
         return self.state()
 
-    def pick(self, picked, sent, result_file, by_name=False) -> str:
+    def pick(self, picked, sent, result_file, by_name=False, by_verb=False) -> str:
         """The owner chose `picked` (a tap or "/model <name>"): the next turn runs on it, and a card says so."""
         state, room = self.listed(result_file), str(sent.get("channel_id") or "")
         if state is None:
             return "model-unlisted"
-        ids = [m["id"] for m in self.offered(state) if picked in ((m["id"].lower(), m["name"].lower()) if by_name
-                                                                  else (m["id"],))]
+        keys = (lambda m: (m["id"].lower(), m["name"].lower())) if by_name else (
+            (lambda m: (model_verb(m["id"]),)) if by_verb else (lambda m: (m["id"],)))
+        ids = [m["id"] for m in self.offered(state) if picked in keys(m)]
         if not ids:
             self.publish(result_file, self.quoted(NOT_USABLE) + "\n")
             return "model-unknown"
@@ -181,10 +204,10 @@ class ModelSwitch:
             return "model-unlisted"
         if not self.offered(state):
             self.publish(result_file, self.quoted(UNKNOWN) + "\n")
-        elif self.post(sent.get("channel_id"), self.card(state)):
+        elif self.post(sent.get("channel_id"), self.menu(state)):
             self.publish(result_file, ANSWERED)
         else:
-            self.publish(result_file, self.quoted("I could not post the model card. Try again in a moment.") + "\n")
+            self.publish(result_file, self.quoted(NOT_POSTED) + "\n")
         return "model-card"
 
     def asked(self, tier, path, status, text, result_file) -> str:
