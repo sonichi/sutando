@@ -186,8 +186,12 @@ def _open_terminal() -> Action:
     return Action(id="open_terminal", kind="open_terminal", label="Open terminal")
 
 
+# How a card names each core runtime its Switch runtime button offers.
+RUNTIME_NAMES = {"claude": "Claude Code", "codex": "Codex"}
+
+
 def recovery_action(aid: str) -> Action:
-    return Action(id=aid, kind=recovery.kind_of(aid), label=recovery.label(aid))
+    return Action(id=aid, kind=recovery.kind_of(aid), label=recovery.label(aid, RUNTIME_NAMES))
 
 
 # The limit menu's choices that only wait: one tap never spends, switches or signs anything in.

@@ -30,9 +30,9 @@ RESTART_CORE = "restart_core"
 ESCAPE_PROMPT = "escape_prompt"
 # The model aliases scripts/switch-model.sh accepts that a card may offer; Fable is a spend decision.
 SWITCH_ALIASES = ("opus", "sonnet", "haiku")
-# The core runtimes src/agent/start-cli.sh --runtime launches.
-RUNTIMES = ("claude", "codex")
-_RUNTIME_NAMES = {"claude": "Claude Code", "codex": "Codex"}
+# A runtime is named by a slug here; which runtimes exist is the engine's list
+# (core_recovery_state.RUNTIMES), checked before anything runs.
+_RUNTIME_ID = re.compile(r"^[a-z][a-z0-9-]{0,15}$")
 _BARE = frozenset({RETRY_NOW, RESTART_CORE, ESCAPE_PROMPT, BUY_CREDITS, ADD_ACCOUNT})
 # An account is named by its opaque digest (core_recovery_state's), never an address or token.
 _ACCOUNT_ID = re.compile(r"^acct_[0-9a-f]{6}$")
@@ -54,7 +54,7 @@ def parse(action_id: Any) -> Optional[Tuple[str, Optional[str]]]:
     verb, sep, arg = action_id.partition(":")
     if verb == SWITCH_MODEL and sep and arg in SWITCH_ALIASES:
         return verb, arg
-    if verb == SWITCH_RUNTIME and sep and arg in RUNTIMES:
+    if verb == SWITCH_RUNTIME and sep and _RUNTIME_ID.match(arg):
         return verb, arg
     if verb == SWITCH_ACCOUNT and sep and _ACCOUNT_ID.match(arg):
         return verb, arg
@@ -77,7 +77,7 @@ def action_id(verb: str, arg: Optional[str] = None) -> str:
     return aid
 
 
-def label(aid: str) -> str:
+def label(aid: str, runtime_names: Optional[dict] = None) -> str:
     parsed = parse(aid)
     if parsed is None:
         raise ValueError(f"not a recovery action: {aid!r}")
@@ -85,7 +85,7 @@ def label(aid: str) -> str:
     if verb == SWITCH_MODEL:
         return f"Switch to {arg.capitalize()}"
     if verb == SWITCH_RUNTIME:
-        return f"Switch to {_RUNTIME_NAMES[arg]}"
+        return f"Switch to {(runtime_names or {}).get(arg, arg)}"
     if verb == SWITCH_ACCOUNT:
         return f"Switch to account {arg}"
     return _LABELS[verb]
