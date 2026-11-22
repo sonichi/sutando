@@ -228,6 +228,20 @@ to `session/new` are the same as without it. Not yet measured, because no signed
 that a signed-in agy finds its sign-in with `--gemini-dir`, which modes `session/new` lists, and that
 global rules are read only from the `--gemini-dir` home.
 
+## A Gemini API key instead of the Google sign-in
+
+agy ignores `GEMINI_API_KEY` in its environment while a Google sign-in exists. When the owner saves a Gemini
+API key for this agent in the app (its Antigravity connection, "Use a Gemini API key"), the app keeps it in
+the macOS Keychain (service `space.ag2.app.agy-gemini-key.<agent id>`, account `GEMINI_API_KEY`, the value
+as is or base64 JSON `{"tag", "value"}`). After `initialize`, when agy lists `gemini-api-key` in
+`authMethods`, the owner's and a collaborator's turns (and `verify`'s sign-in check) send ACP
+`authenticate {"methodId": "gemini-api-key", "_meta": {"apiKey": <key>}}`: that one agy process runs on the
+key, the Google sign-in is left untouched. Guest turns (`--gemini-dir`) never get the key. The key goes only
+into that request on agy's stdin: never argv, environment or logs. Each saved Session records its auth mode
+(`auth`: `sign-in` or `gemini-api-key`, none = `sign-in`); a Session opened under the other mode is not
+resumed (resuming a sign-in Session still bills the Google account's quota), a new one is opened.
+`AG2_AGY_GEMINI_KEY=0` in the connector's environment turns this off. See `gemini_key.py`.
+
 ## S.space tools (Room Commons pages and room actions)
 
 The owner's turns and Team's (an attested collaborator: `access_tier: team` with `collaborator: true`, as
