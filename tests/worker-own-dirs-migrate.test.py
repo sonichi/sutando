@@ -412,6 +412,39 @@ class TheLane(Base):
         self.assertEqual(out["lane"], f"stopped pid {proc.pid}; it did not start again (RuntimeError)")
         self.assertIn("re-run to retry", why)
 
+    def test_a_run_killed_between_the_stop_and_the_start_leaves_the_restart_owed(self):
+        from _helpers import bridge_lease
+        proc = bridge_lease.start(self.ws, self.lane)
+        self.addCleanup(bridge_lease.stop, proc)
+
+        def killed(instance, ws):
+            raise KeyboardInterrupt("the run dies here")
+        with self.assertRaises(KeyboardInterrupt):
+            self.migrate(procs={}, start=killed)
+        owed = worker_lane._restart_owed(W, self.ws)
+        self.assertTrue(owed.exists(), "owed before the stop, so it outlives the run")
+        calls, start = self.started({"ok": True, "lease": "held", "pid": 11})
+        out, why = self.migrate(procs={}, start=start)
+        self.assertEqual((why, out["lane"], len(calls)), ("", "the lane was down; started again (pid 11)", 1))
+        self.assertFalse(owed.exists(), "cleared once the lane is running again")
+
+    def test_a_verified_restart_clears_an_owed_restart(self):
+        from _helpers import bridge_lease
+        proc = bridge_lease.start(self.ws, self.lane)
+        self.addCleanup(bridge_lease.stop, proc)
+        worker_lane._owe_restart(W, self.ws, self.lane, "stopped_for_relaunch")
+        _calls, start = self.started({"ok": True, "lease": "held", "pid": 12})
+        self.assertEqual(self.migrate(procs={}, start=start)[1], "")
+        self.assertFalse(worker_lane._restart_owed(W, self.ws).exists())
+
+    def test_a_disabled_lane_clears_an_owed_restart_without_starting(self):
+        worker_lane._owe_restart(W, self.ws, self.lane, "stopped_for_relaunch")
+        self.edit_worker_row(disabled=True)
+        calls, start = self.started({"ok": True, "lease": "held", "pid": 13})
+        self.assertEqual(worker_lane._stop_unless_declared(W, self.ws, None, {}, start), ("not-running", 0, ""))
+        self.assertEqual(calls, [])
+        self.assertFalse(worker_lane._restart_owed(W, self.ws).exists())
+
     def test_the_cli_reports_a_lane_left_down_as_not_ok(self):
         from _helpers import bridge_lease
         proc = bridge_lease.start(self.ws, self.lane)

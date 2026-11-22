@@ -567,22 +567,37 @@ def _stop_unless_declared(worker: str, workspace, kill, procs, start=_start_lane
     except BridgeLeaseIndeterminate as e:
         return "", 0, f"whether the lane runs cannot be told ({e}); re-run"
     if not pid:
-        # A lane an earlier run stopped but could not start again is started on the re-run.
-        if _restart_owed(worker, ws).exists() and not row.get("disabled") and not row.get("parked"):
+        # A lane an earlier run stopped but did not see running again is started on the re-run.
+        owed = _restart_owed(worker, ws)
+        if owed.exists() and not row.get("disabled") and not row.get("parked"):
             return _start_again(worker, instance, ws, 0, start)
+        owed.unlink(missing_ok=True)
         return "not-running", 0, ""
     decl, _why = _declaration_for(worker, ws)
     if decl and held_by(pid, processes() if procs is None else procs, decl["path"]) == "declared-bridge":
         return "declared", pid, ""
+    # Owed before the stop: a run killed between the stop and the start leaves this for the re-run.
+    _owe_restart(worker, ws, instance, "stopped_for_relaunch")
     try:
         _stop_row(row, ws, kill)
-    except (BridgeStillRunning, BridgeLeaseIndeterminate) as e:
+    except BridgeStillRunning as e:
+        _restart_owed(worker, ws).unlink(missing_ok=True)
+        return "", pid, f"lane {instance} did not stop ({e}); re-run"
+    except BridgeLeaseIndeterminate as e:
         return "", pid, f"lane {instance} did not stop ({e}); re-run"
     return _start_again(worker, instance, ws, pid, start)
 
 
 def _restart_owed(worker: str, ws: Path) -> Path:
     return ws / "state" / "worker-lane-restart-owed" / f"{worker}.json"
+
+
+def _owe_restart(worker: str, ws: Path, instance: str, reason: str) -> None:
+    owed = _restart_owed(worker, ws)
+    owed.parent.mkdir(parents=True, exist_ok=True)
+    tmp = owed.with_name(f".{owed.name}.{os.getpid()}")
+    tmp.write_text(json.dumps({"instance": instance, "reason": reason}) + "\n", encoding="utf-8")
+    os.replace(tmp, owed)
 
 
 def _start_again(worker: str, instance: str, ws: Path, pid: int, start) -> "tuple[str, int, str]":
@@ -598,8 +613,7 @@ def _start_again(worker: str, instance: str, ws: Path, pid: int, start) -> "tupl
         how = "already running" if rec.get("lease") == "already_running" else "started"
         return f"{lead}{how} again (pid {rec.get('pid')})", pid, ""
     reason = rec.get("reason") or "launch_failed"
-    owed.parent.mkdir(parents=True, exist_ok=True)
-    owed.write_text(json.dumps({"instance": instance, "reason": reason}) + "\n", encoding="utf-8")
+    _owe_restart(worker, ws, instance, reason)
     return (f"{lead}it did not start again ({reason})", pid,
             f"lane {instance} did not start again ({reason}): run connections.py start {instance}, "
             "or re-run to retry and finish")
