@@ -70,12 +70,19 @@ refused), `updates` (the turn's `session/update`s counted by type) and `answer_c
 
 ## Tiers and permissions
 
-As Sutando does, a guest, a plain team sender (wire `guest` without the broker's `collaborator: true`)
-and any unknown tier are answered, in the isolated read-only turn below; no flag is needed. A wire `team`
-without the collaborator stamp is treated as a guest too, so it fails closed to that turn. An attested
-collaborator is refused with one line unless `--allow-non-owner`, and is then served the same isolated way.
-A non-owner's turn runs on the owner's agy sign-in (the Google account and quota in the Keychain), and a
-turn whose tool call is denied can end with no reply.
+The tier is the shared `task_io.turn_policy`'s, from the attested headers only (a tier claimed in the
+message body changes nothing); the adapter only maps its verdict to a turn (`TURNS`):
+
+| `turn_policy` verdict | Who | Turn |
+| --- | --- | --- |
+| owner | the owner | the owner's turn |
+| collaborator | an attested collaborator (Team: `team` + the broker's `collaborator: true`) | the owner's turn, with a Session of their own per room |
+| restricted | a guest, plain team (no collaborator stamp), any unknown tier | the isolated read-only turn below |
+| refused | (not reached here: every non-owner who is not a collaborator is served restricted, as Sutando answers them) | one refusal line, agy not started |
+
+No flag is needed for any of them; `--allow-non-owner` still parses and changes nothing. Every turn runs on
+the owner's agy sign-in (the Google account and quota in the Keychain), and a turn whose tool call is
+denied can end with no reply.
 
 The gateway writes a Sutando tier block into every non-owner task (`team_guardrail.py`). It tells a core to
 write `results/<task>.txt` and, for a guest, to delegate to `codex exec`; agy can do neither, and its final
@@ -84,11 +91,11 @@ already the read-only sandbox", and keeps the scope, the DO / DO NOT lists, the 
 hand-off to the owner verbatim (`tier_block_lines`). The final reply is scanned by the shared bridge
 (`_guarded_result_body`) for every tier but the owner, as for any adapter.
 
-**The owner's turns** resume the room's Session in the working directory, with agy's own home
-(`~/.gemini`: its settings, rules and context).
+**The owner's turn** (the owner, and an attested collaborator) resumes the sender's Session for the room in
+the working directory, with agy's own home (`~/.gemini`: its settings, rules and context) and the owner's
+permission policy. A collaborator is still framed as not the owner.
 
-**A non-owner's turn** (a guest, plain team, an unknown tier, or a collaborator under
-`--allow-non-owner`) runs isolated:
+**A restricted turn** (a guest, plain team, an unknown tier) runs isolated:
 
 - a fresh temporary directory per task holds the Session's working directory and a separate agy home,
   passed as `agy acp --gemini-dir <dir>`; that home has only a `settings.json` whose permission rules deny
@@ -108,7 +115,7 @@ agy's `session/request_permission` is answered by `acp_host`'s policy, default d
   `ALLOW_OWNER_SHELL_WEB=1`; off by default, so an existing install does not change on update): any shell
   command and any `execute`, `fetch` or `search` call, as a local Claude Code agent runs commands and uses
   the web for its owner. `verify` prints `INFO owner shell and web: on|off`;
-- the owner only: a `read` or `edit` whose every path resolves (after `..`, `~` and symlinks) under the
+- the owner's turn (the owner and a collaborator): a `read` or `edit` whose every path resolves (after `..`, `~` and symlinks) under the
   working directory; never when the working directory is the home directory or above it. agy's own
   argument names (`Path`, `Content`, `Overwrite`, `Append`, `Target`, `Replacement`, `AllowMultiple`,
   `Edits`, `StartLine`, `EndLine`, and the older `TargetFile`, `CodeContent`, `AbsolutePath`, ...) are
@@ -119,7 +126,7 @@ agy's `session/request_permission` is answered by `acp_host`'s policy, default d
 | Turn | Commands, fetch, search | Read or edit under the working directory | Anything else |
 | --- | --- | --- | --- |
 | owner | granted with `--allow-owner-shell-web`, else refused | granted | refused |
-| Team (an attested collaborator) | refused (granting it is the owner's decision) | as the turn it runs in | refused |
+| Team (an attested collaborator, on the owner's turn) | refused (granting it is the owner's decision) | granted | refused |
 | guest (isolated) | refused | refused | refused |
 
 With `--allow-owner-shell-web`, the working-directory bound on `read` and `edit` is no longer a security
