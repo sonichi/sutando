@@ -1140,15 +1140,24 @@ class WatcherChild(SeatCase):
         w.p.kill()
         w.p.wait()
 
+    def gen_sh(self) -> str:
+        """Shell: `gen <file>` prints the generation a watcher would announce for it, or `-`."""
+        return (f"gen() {{ '{sys.executable}' -c 'import os, sys; s = os.stat(sys.argv[1]); "
+                'print(s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)\' "$1" 2>/dev/null || echo -; }\n')
+
     def announcing(self, wake):
-        """A watcher that announces a task once `<tmp>/announce-<task file>` exists."""
+        """A watcher that announces a task once `<tmp>/announce-<task file>` exists: with the
+        generation written in that file, else the one the task file has at that moment."""
         box = Path(self.tmp.name)
         return seat_mod.Watcher(str(self.tasks), wake, script=self.script(
-            f'while :; do for f in "{box}"/announce-*; do [ -e "$f" ] || continue; '
-            'echo "TASK_FILE: ${f##*/announce-}"; rm -f "$f"; done; sleep 0.05; done\n'))
+            self.gen_sh() + f'while :; do for f in "{box}"/announce-*; do [ -e "$f" ] || continue; '
+            f'n="${{f##*/announce-}}"; g="$(cat "$f")"; [ -n "$g" ] || g="$(gen "{self.tasks}/$n")"; '
+            'echo "TASK_GENERATION: $n $g"; echo "TASK_FILE: $n"; rm -f "$f"; done; sleep 0.05; done\n'))
 
-    def announce(self, s, name: str):
-        (Path(self.tmp.name) / f"announce-{name}").touch()
+    def announce(self, s, name: str, generation: str = ""):
+        mark = Path(self.tmp.name) / f"announce-{name}"
+        mark.with_suffix(".tmp").write_text(generation, encoding="utf-8")
+        os.replace(mark.with_suffix(".tmp"), mark)
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline and name not in s.watcher.announced:
             time.sleep(0.02)
@@ -1194,10 +1203,73 @@ class WatcherChild(SeatCase):
         os.replace(other, self.tasks / "task-1.txt")
         self.assertIsNone(s.step())
         self.assertIsNone(s.step())
-        self.assertEqual(self.out.getvalue().count("the file changed after the watcher announced it"), 1)
+        self.assertEqual(self.out.getvalue().count("not the one the watcher read when it routed the task"), 1)
         self.assertEqual(self.sent("turn/start"), [])
         self.announce_again(s, "task-1.txt")
         self.assertEqual(s.step(), "done")
+
+    def test_a_file_replaced_before_the_seat_reads_the_announcement_is_not_taken_for_the_one_announced(self):
+        # The handoff itself: the watcher read one file, and another is there when its line arrives.
+        s = self.make()
+        s.ensure_server()
+        s.watcher = self.announcing(s.wake)
+        s.watcher.ensure()
+        self.addCleanup(s.watcher.stop)
+        first = self.task("task-1.txt")
+        read_by_the_watcher = " ".join(str(n) for n in seat_mod.generation(first))
+        other = self.task("task-1.txt.new", "task: something else entirely\n", folder=self.ws)
+        os.replace(other, first)
+        self.announce(s, "task-1.txt", read_by_the_watcher)
+        self.assertIsNone(s.step())
+        self.assertEqual(self.sent("turn/start"), [])
+        self.assertIn("not the one the watcher read when it routed the task", self.out.getvalue())
+        self.announce_again(s, "task-1.txt")
+        self.assertEqual(s.step(), "done")
+
+    def test_an_announcement_without_a_generation_is_held_and_never_filled_in_from_the_inbox(self):
+        s = self.make()
+        s.ensure_server()
+        s.watcher = self.announcing(s.wake)
+        s.watcher.ensure()
+        self.addCleanup(s.watcher.stop)
+        self.task("task-1.txt")
+        # The watcher could not read the file's metadata: it says so, and the seat does not guess.
+        self.announce(s, "task-1.txt", "-")
+        self.assertIsNone(s.step())
+        self.assertIsNone(s.step())
+        self.assertEqual(self.out.getvalue().count("announced it without the generation it read"), 1)
+        self.assertIsNone(s.watcher.announced["task-1.txt"])
+        # A line that is not four numbers, and a TASK_FILE line with nothing before it, are the same.
+        for line in ("TASK_GENERATION: task-1.txt 1 2 three 4", ""):
+            w = seat_mod.Watcher(str(self.tasks), threading.Event(), script=self.script(
+                f'echo "{line}"\necho "TASK_FILE: task-1.txt"\nexec sleep 300\n'))
+            w.ensure()
+            self.addCleanup(w.stop)
+            self.assertTrue(w.wake.wait(10))
+            self.assertEqual(w.announced, {"task-1.txt": None}, line)
+        self.assertEqual(self.sent("turn/start"), [])
+        self.announce_again(s, "task-1.txt")
+        self.assertEqual(s.step(), "done")
+
+    def test_the_real_watcher_hands_the_seat_the_generation_it_read_and_the_seat_runs_that_file(self):
+        # Producer and consumer together: src/watch-tasks-stream.sh itself, started as the seat starts it.
+        s = self.make()
+        s.ensure_server()
+        self.task("task-1.txt")
+        for folder in ("results", "state"):
+            (self.ws / folder).mkdir(exist_ok=True)
+        env = {"SUTANDO_WORKSPACE_DIR": str(self.ws), "SUTANDO_RESULTS_DIR": str(self.results)}
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("SUTANDO_ANNOUNCE_GENERATION", None)
+            s.watcher = seat_mod.Watcher(str(self.tasks), s.wake)
+            s.watcher.ensure()
+        self.addCleanup(s.watcher.stop)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and "task-1.txt" not in s.watcher.announced:
+            time.sleep(0.05)
+        self.assertEqual(s.watcher.announced.get("task-1.txt"), seat_mod.generation(self.tasks / "task-1.txt"))
+        self.assertEqual(s.step(), "done")
+        self.assertEqual(len(self.sent("turn/start")), 1)
 
     def test_an_announcement_naming_a_path_is_kept_by_its_file_name(self):
         s = self.make()
@@ -1272,7 +1344,8 @@ class WatcherChild(SeatCase):
         # The task arrives once the seat is idle and is announced once it is there: fixed delays
         # raced a slow app-server start.
         there = self.ws / "task-late.there"
-        stub = self.script(f'while [ ! -e "{there}" ]; do sleep 0.05; done\n'
+        stub = self.script(self.gen_sh() + f'while [ ! -e "{there}" ]; do sleep 0.05; done\n'
+                           f'echo "TASK_GENERATION: task-late.txt $(gen "{self.tasks}/task-late.txt")"\n'
                            'echo "TASK_FILE: task-late.txt"\nexec sleep 300\n')
         w = seat_mod.Watcher(str(self.tasks), s.wake, script=stub)
 

@@ -97,6 +97,14 @@ def generation(path) -> Optional[tuple]:
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
 
 
+def parse_generation(text: str) -> Optional[tuple]:
+    """The four numbers of a TASK_GENERATION line; None for `-` or anything else."""
+    parts = text.split()
+    if len(parts) != 4 or not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
 def log(*parts) -> None:
     """One line to stdout (the terminal panel) and, when the launcher names one, the seat's log file."""
     line = " ".join([time.strftime("%H:%M:%S"), *[str(p) for p in parts]])
@@ -225,6 +233,7 @@ class Watcher:
         self.p: Optional[subprocess.Popen] = None
         self.started_at = 0.0
         self.announced: dict = {}
+        self.verified: dict = {}
 
     def alive(self) -> bool:
         return self.p is not None and self.p.poll() is None
@@ -241,7 +250,8 @@ class Watcher:
         try:
             self.p = subprocess.Popen(
                 ["bash", str(self.script), self.inbox, "--role", "standby", "--inbox", self.inbox],
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, start_new_session=True)
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, start_new_session=True,
+                env={**os.environ, "SUTANDO_ANNOUNCE_GENERATION": "1"})
         except OSError as e:
             log(f"watcher did not start ({e}); tasks are still picked up by polling")
             return
@@ -249,10 +259,14 @@ class Watcher:
 
     def _reader(self, p: subprocess.Popen) -> None:
         for line in p.stdout:
-            if line.startswith("TASK_FILE: "):
-                # A basename, or an absolute path when the inbox is resolved; kept with its generation.
+            if line.startswith("TASK_GENERATION: "):
+                name, _, rest = line[len("TASK_GENERATION: "):].strip().partition(" ")
+                self.verified[name] = parse_generation(rest)
+            elif line.startswith("TASK_FILE: "):
+                # A basename, or an absolute path when the inbox is resolved. The generation is the
+                # one the watcher sent just before; without one the task is announced but not run.
                 name = os.path.basename(line[len("TASK_FILE: "):].strip())
-                self.announced[name] = generation(os.path.join(self.inbox, name))
+                self.announced[name] = self.verified.pop(name, None)
                 self.wake.set()
 
     def stop(self) -> None:
@@ -469,14 +483,15 @@ class Seat:
             for name in names:
                 if name not in watcher.announced:
                     continue
-                if watcher.announced[name] is None:
-                    watcher.announced[name] = current.get(name)
-                if watcher.announced[name] == current.get(name):
+                verified = watcher.announced[name]
+                if verified is not None and verified == current.get(name):
                     mine.append(name)
-                elif name not in self.changed_logged:
-                    self.changed_logged.add(name)
-                    log(f"task {name}: held, the file changed after the watcher announced it; it is the "
-                        "core's again once the watcher announces what is there now")
+                elif (name, verified) not in self.changed_logged:
+                    self.changed_logged.add((name, verified))
+                    why = ("the watcher announced it without the generation it read" if verified is None
+                           else "the file is not the one the watcher read when it routed the task")
+                    log(f"task {name}: held, {why}; it is the core's once the watcher announces what is "
+                        "there now")
             return mine
         state = self.workspace / "state"
         if present(state / "shutdown.sentinel"):

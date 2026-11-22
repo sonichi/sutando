@@ -511,8 +511,14 @@ holds what the watcher would hold, and says so once: everything while a shutdown
 a workspace known to declare none has nothing to route, and there the core polls as before.
 A worker seat's inbox is already the routing decision and is read directly.
 
-An announcement is for the file that was there, not for its name: a task file replaced under
-the same name is held until the watcher announces what is there now.
+An announcement is for one file, not for a name. The seat starts its watcher with
+`SUTANDO_ANNOUNCE_GENERATION=1`, and the watcher then prints, before each `TASK_FILE:` line,
+`TASK_GENERATION: <name> <dev> <inode> <size> <mtime_ns>`: the file it read before it routed the
+task, on every emit path, the handler's fallback included (`<name> -` when it could not read
+one). The core runs a pending task only while the file in its inbox is that generation. A file
+put under the name at any later point, and a task announced without a generation, are held and
+logged once, until the watcher dispatches what is there and announces it. Without the switch
+the watcher's output is unchanged, so no other reader of `TASK_FILE:` lines sees a difference.
 
 When the app-server child exits mid-turn the seat restarts it and retries the task once, on the
 same thread. Whenever a server had to be started before a `turn/start`, on the first attempt
