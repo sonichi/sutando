@@ -1973,6 +1973,9 @@ class LauncherTmux(ConnectBase):
         lc, rec = self.created()
         pane = rec["generation"]["pane_id"]
         self.assertEqual(launcher.switched_model(str(self.work)), "")
+        # Before Claude Code has drawn its prompt the input box cannot be read, and nothing is typed.
+        self.assertIn("cannot be read", lc.switch_model(dict(rec, generation=dict(rec["generation"], pane_id="%999")), "opus")[1])
+        wait_for(lambda: launcher.composer_text(lc.tm.capture(pane, styled=True)) == "")
         self.assertEqual(lc.switch_model(rec, "opus"), (True, "switched to opus"))
         self.assertIn("Set model to opus", self.tmux("capture-pane", "-p", "-t", pane).stdout)
         self.assertEqual(launcher.switched_model(str(self.work)), "opus", "only a reported switch is recorded")
@@ -1999,6 +2002,7 @@ class LauncherTmux(ConnectBase):
         (self.home / "claude-model-asks").write_text("1")
         lc, rec = self.created()
         pane = rec["generation"]["pane_id"]
+        wait_for(lambda: launcher.composer_text(lc.tm.capture(pane, styled=True)) == "")
         switched, line = lc.switch_model(rec, "opus")
         self.assertEqual((switched, "--confirm" in line), (False, True), line)
         self.assertNotIn("Set model to", self.tmux("capture-pane", "-p", "-t", pane).stdout)

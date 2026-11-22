@@ -43,6 +43,33 @@ MODEL_ACCEPT_S = 20.0
 # What Claude Code's own /model takes: an alias or a claude-* id, either with an optional [1m] tag.
 MODEL_RE = re.compile(r"^(default|(opus|sonnet|haiku|fable)(\[1m\])?|claude-[a-z0-9.-]+(\[1m\])?)$")
 MODEL_SET, MODEL_CONFIRM = "Set model to", "Yes, switch"
+PROMPT_GLYPH = "\u276f"
+# As the core reads a pane (src/delivery/pane_gate.py): styling, and the dim or grey runs that are
+# a placeholder or a suggestion, never text someone typed.
+_SGR = re.compile(r"\x1b\[[0-9:;]*m|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+_GHOST = re.compile(r"\x1b\[(?:2|38;5;(?:23[2-9]|24[0-9]|25[0-5]))m.*?(?=\x1b\[(?:0|22|39)m|$)")
+
+
+def composer_text(shown) -> "str | None":
+    """What sits unsent in Claude Code's input box, from a styled capture: the text after the last
+    prompt glyph, '' when the box is empty, None when no prompt is on screen (unknown, never empty)."""
+    found = None
+    for raw in (shown or "").splitlines():
+        if _SGR.sub("", raw).lstrip(" \t").startswith(PROMPT_GLYPH):
+            found = _SGR.sub("", _GHOST.sub("", raw[raw.find(PROMPT_GLYPH) + 1:])).strip(" \t\u00a0")
+    return found
+
+
+def model_accepted(model: str) -> "re.Pattern":
+    """Claude Code's line for a switch to `model`. It echoes display names ("Set model to Opus 4.6"),
+    so an alias accepts any version of its family and an id its own version, as the core's skill does."""
+    plain = re.sub(r"\[1m\]$", "", model)
+    family = re.sub(r"^claude-([a-z]+)-?.*", r"\1", plain)
+    version = re.match(r"^claude-[a-z]+-([0-9]+(?:-[0-9]+)*)", plain)
+    if version:
+        return re.compile(r"%s %s %s(?:[^0-9.]|$)" % (MODEL_SET, family, re.escape(version.group(1).replace("-", "."))),
+                          re.I | re.M)
+    return re.compile(r"%s %s(?: [0-9][0-9.]*)?(?:[^0-9.a-z]|$)" % (MODEL_SET, re.escape(family)), re.I | re.M)
 MODEL_RECORD = ("state", "model-switch.json")
 
 
@@ -241,8 +268,8 @@ class Tmux:
         except ValueError:
             return None
 
-    def capture(self, pane_id) -> "str | None":
-        r = self.run("capture-pane", "-p", "-t", pane_id, "-S", "-50")
+    def capture(self, pane_id, styled=False) -> "str | None":
+        r = self.run("capture-pane", "-p", *(("-e",) if styled else ()), "-t", pane_id, "-S", "-50")
         return r.stdout if r is not None and r.returncode == 0 else None
 
 
@@ -616,15 +643,21 @@ class Launcher:
 
     def switch_model(self, rec: dict, model: str, confirm=False, wait_s=MODEL_ACCEPT_S) -> "tuple[bool, str]":
         """`/model <model>` through the fence, then (switched, one line): switched only when the pane
-        shows a NEW "Set model to" line. A warm session asks first; that dialog is answered once with
-        `confirm`, else cancelled. Nothing is sent to a session whose tuple changed."""
+        shows a NEW "Set model to" line naming this model. A warm session asks first; that dialog is
+        answered once with `confirm`, else cancelled. Nothing is sent to a session whose tuple changed,
+        nor to one whose input box holds a draft or cannot be read: Enter would send the draft."""
         gen, title = rec.get("generation"), rec.get("title_token") or ""
         if not MODEL_RE.match(model or ""):
             return False, "refused: %r is not a model alias or a claude-* id; nothing sent" % model
         if not gen or self.tm.has_session() is not True:
             return False, "no running session to switch; nothing sent"
-        shown = self.tm.capture(gen["pane_id"]) or ""
-        before, asked = shown.count(MODEL_SET), shown.count(MODEL_CONFIRM)
+        draft = composer_text(self.tm.capture(gen["pane_id"], styled=True))
+        if draft is None:
+            return False, "refused: the session shows no input prompt, so its input box cannot be read; nothing sent"
+        if draft:
+            return False, "refused: the session's input box holds unsent text; nothing sent"
+        shown, accepted = self.tm.capture(gen["pane_id"]) or "", model_accepted(model)
+        before, other, asked = len(accepted.findall(shown)), shown.count(MODEL_SET), shown.count(MODEL_CONFIRM)
 
         def keys(*names):
             pred = tmux_pane_keys.predicate(gen["nonce"], gen["pane_pid"], gen["session_id"], gen["session_created"],
@@ -641,7 +674,7 @@ class Launcher:
         answered, deadline = False, time.monotonic() + wait_s
         while time.monotonic() < deadline:
             text = self.tm.capture(gen["pane_id"]) or ""
-            if text.count(MODEL_SET) > before:
+            if len(accepted.findall(text)) > before:
                 self.log("model: switched to %s" % model)
                 with contextlib.suppress(OSError):   # the switch happened whether or not it is recorded
                     path = Path(self.root).joinpath(*MODEL_RECORD)
@@ -654,8 +687,15 @@ class Launcher:
                     keys("Escape")
                     return False, ("not switched: Claude Code asks to confirm a switch in a running conversation; "
                                    "repeat with --confirm")
-                answered = keys("Enter") == 0
+                # One attempt only: a second Enter after an uncertain one could act on whatever came next.
+                answered, rc = True, keys("Enter")
+                if rc != 0:
+                    return False, (self.unsent(gen, title, rc, "the confirmation")
+                                   or "unconfirmed: the session ended at the confirmation; not known to have switched")
             self.sleep(0.5)
+        if text.count(MODEL_SET) > other:
+            return False, ("unconfirmed: /model %s was sent but Claude Code reported a different model; "
+                           "nothing recorded" % model)
         return False, "unconfirmed: /model %s was sent but Claude Code did not report the switch in %d s" % (model, wait_s)
 
     def stopped(self, started) -> str:

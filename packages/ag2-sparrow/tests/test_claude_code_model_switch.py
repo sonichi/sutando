@@ -25,13 +25,13 @@ class Pane:
     """What the pane shows, and the keys sent to it; `react(keys, pane)` is the stand-in Claude Code."""
 
     def __init__(self, react=None, session=True, rc=0):
-        self.text, self.sent, self.react, self.session, self.rc = "", [], react, session, rc
+        self.text, self.sent, self.react, self.session, self.rc = "\u276f ", [], react, session, rc
         self.sock, self.tmux = "/s", "tmux"
 
     def has_session(self, name=None):
         return self.session
 
-    def capture(self, pane_id):
+    def capture(self, pane_id, styled=False):
         return self.text
 
     def run(self, argv, **kw):
@@ -98,7 +98,7 @@ class SwitchModel(unittest.TestCase):
 
     def test_a_session_that_never_reports_the_switch_is_unconfirmed(self):
         pane = Pane()
-        pane.text = "Set model to sonnet"          # an earlier switch's line does not count
+        pane.text += "\nSet model to sonnet"      # an earlier switch's line does not count
         with mock.patch.object(launcher.time, "monotonic", side_effect=[0.0, 0.0, 1.0, 5.0]):
             switched, line = lc_for(pane, self.root).switch_model(REC, "haiku", wait_s=2)
         self.assertEqual((switched, line), (False, "unconfirmed: /model haiku was sent but Claude Code did not report "
@@ -120,6 +120,62 @@ class SwitchModel(unittest.TestCase):
         again.text = pane.text                         # the cancelled dialog is still on screen
         self.assertEqual(lc_for(again, self.root).switch_model(REC, "sonnet", confirm=True), (True, "switched to sonnet"))
         self.assertEqual(again.sent, [["/model", "Space", "sonnet", "Enter"], ["Enter"]])
+
+    def test_a_draft_in_the_input_box_or_a_box_that_cannot_be_read_gets_no_keys(self):
+        dim = "\x1b[2m"
+        for shown, why in (("\u276f half a message", "holds unsent text"),
+                           ("old\n\u276f \n  \u276f fix the bug", "holds unsent text"),
+                           ("no prompt on this screen", "cannot be read"), ("", "cannot be read")):
+            pane = Pane(says)
+            pane.text = shown
+            switched, line = lc_for(pane, self.root).switch_model(REC, "opus")
+            self.assertEqual((switched, why in line, pane.sent), (False, True, []), shown)
+        # A placeholder or a suggestion is styled, never typed: the box is empty.
+        for shown in ("\u276f %sTry \"fix lint errors\"\x1b[0m" % dim, "\u276f\u00a0\x1b[38;5;240mrun the tests\x1b[39m"):
+            pane = Pane(says)
+            pane.text = shown
+            self.assertEqual(lc_for(pane, self.root).switch_model(REC, "opus"), (True, "switched to opus"), shown)
+        self.assertEqual([launcher.composer_text(t) for t in (None, "\u276f ", "\u276f hi ")], [None, "", "hi"])
+
+    def test_only_a_line_naming_the_model_asked_for_is_the_switch(self):
+        def other(keys, pane):
+            pane.text += "\n  \u23bf  Set model to Sonnet 4.6 and saved as your default"
+
+        pane = Pane(other)
+        with mock.patch.object(launcher.time, "monotonic", side_effect=[0.0, 0.0, 1.0, 5.0]):
+            switched, line = lc_for(pane, self.root).switch_model(REC, "opus", wait_s=2)
+        self.assertEqual((switched, line), (False, "unconfirmed: /model opus was sent but Claude Code reported a "
+                                                   "different model; nothing recorded"))
+        self.assertEqual(launcher.switched_model(self.root), "", "a switch that was not this one is not recorded")
+        for model, line, ok in (("opus", "Set model to Opus 4.6 and saved", True), ("opus[1m]", "Set model to opus[1m]", True),
+                                ("claude-opus-4-6", "Set model to Opus 4.6", True), ("claude-opus-4-6", "Set model to Opus 4.61", False),
+                                ("claude-opus-4", "Set model to Opus 4.6", False), ("opus", "Set model to Opusplan", False),
+                                ("default", "Set model to Default (recommended)", True), ("haiku", "Set model to Sonnet 4.6", False)):
+            self.assertEqual(bool(launcher.model_accepted(model).search(line)), ok, (model, line))
+
+    def test_a_confirmation_that_may_not_have_been_sent_is_tried_once_and_is_not_a_switch(self):
+        class Asks(Pane):
+            def run(self, argv, **kw):
+                keys = argv[argv.index("--") + 1:]
+                self.sent.append(keys)
+                if keys[0] == "/model":
+                    self.text += "\nYes, switch / No, go back"
+                    return types.SimpleNamespace(returncode=0)
+                return types.SimpleNamespace(returncode=tmux_pane_keys.UNCERTAIN)
+
+        pane = Asks()
+        lc = lc_for(pane, self.root)
+        lc.unsent = lambda gen, title, rc, what: "uncertain: %s may have been sent" % what
+        self.assertEqual(lc.switch_model(REC, "opus", confirm=True),
+                         (False, "uncertain: the confirmation may have been sent"))
+        self.assertEqual(pane.sent, [["/model", "Space", "opus", "Enter"], ["Enter"]], "one Enter, never a second")
+        gone = Asks()
+        self.assertEqual(lc_for(gone, self.root).switch_model(REC, "opus", confirm=True)[1],
+                         "cancelled: the tuple changed before the confirmation; nothing sent")
+        ended = lc_for(Asks(), self.root)
+        ended.unsent = lambda gen, title, rc, what: ""
+        self.assertIn("the session ended at the confirmation", ended.switch_model(REC, "opus", confirm=True)[1])
+        self.assertEqual(launcher.switched_model(self.root), "")
 
     def test_a_switch_that_cannot_be_recorded_is_still_a_switch(self):
         pane = Pane(says)

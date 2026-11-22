@@ -127,6 +127,12 @@ if read("claude-ignore-hup", ""):
 if read("claude-signal-parent", ""):
     os.kill(os.getppid(), getattr(signal, "SIG" + read("claude-signal-parent", "")))
 if read("claude-exit-on-exit", ""):
+    import re as _re
+    def shown(model):
+        # Claude Code echoes a display name for an id ("Fable 5.2"), and an alias as typed.
+        m = _re.match(r"claude-([a-z]+)-([0-9]+(?:-[0-9]+)*)", model)
+        return "%s %s" % (m.group(1).capitalize(), m.group(2).replace("-", ".")) if m else model
+    print(read("claude-prompt", "\u276f "), flush=True)     # the input box: empty unless a test leaves a draft in it
     for line in sys.stdin:
         line = line.lstrip("\x1b")
         if line.strip() == "/exit":
@@ -135,9 +141,9 @@ if read("claude-exit-on-exit", ""):
             open(os.path.join(home, "claude-model-asked"), "w").write(line.strip())
             print("Switch model?  Yes, switch / No, go back", flush=True)
         elif line.startswith("/model ") and not read("claude-model-deaf", ""):
-            print("Set model to " + line.split(None, 1)[1].strip(), flush=True)
+            print("Set model to " + shown(line.split(None, 1)[1].strip()), flush=True)
         elif line.strip() == "" and read("claude-model-asked", ""):
-            print("Set model to " + read("claude-model-asked", "").split(None, 1)[1], flush=True)
+            print("Set model to " + shown(read("claude-model-asked", "").split(None, 1)[1]), flush=True)
     sys.exit(0)
 time.sleep(float(read("claude-linger", "0")))
 sys.exit(int(read("claude-exit", "0")))
