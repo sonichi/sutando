@@ -472,18 +472,45 @@ def _tail_lines(capture: str) -> List[str]:
     return [ln for ln in capture.splitlines() if _SGR.sub("", ln).strip()][-TAIL_LINES:]
 
 
+# One row of the composer's slash-command completion list ("❯ /model   Set the AI model…").
+_SLASH_MENU_ROW = re.compile(r"^\s*(?:[❯›]\s*)?/[\w:@.-]+\s{2,}(?=\S)")
+
+
+def _slash_menu_rows(rows: List[str]) -> set:
+    """Indexes of slash-command completion rows and their wrapped description lines: command
+    descriptions, never a dialog's words, though they may quote one ("…to accept it")."""
+    out, col = set(), None
+    for i, row in enumerate(rows):
+        plain = _SGR.sub("", row)
+        m = _SLASH_MENU_ROW.match(plain)
+        if m:
+            out.add(i)
+            col = m.end()
+        elif col is not None and plain.strip() and len(plain) - len(plain.lstrip(" ")) >= col:
+            out.add(i)
+        else:
+            col = None
+    return out
+
+
 def gate_evidence(tail: str, styled_tail: Optional[str] = None,
                   adapter: RuntimeAdapter = CLAUDE) -> str:
-    """Exclude idle chrome, verified ghost suggestions and completed conditional recaps."""
+    """Exclude idle chrome, verified ghost suggestions, completed conditional recaps and the
+    completion list a slash command in the composer opens."""
     rows = tail.splitlines()
     line = prompt_line(styled_tail if styled_tail is not None else tail, adapter)
     composer_i = next((i for i in range(len(rows) - 1, -1, -1)
                        if _prompt_glyph(rows[i], adapter) is not None), None)
+    menu = (_slash_menu_rows(rows[:composer_i])
+            if composer_i is not None and line is not None and line.text.lstrip().startswith("/")
+            else set())
     completed = (composer_i is not None and line is not None and not line.text.strip()
                  and any(row.strip() == "Nothing needs you this round."
                          for row in rows[:composer_i]))
     kept = []
     for i, row in enumerate(rows):
+        if i in menu:
+            continue
         signatures = any(rx.search(row) for _, rx in adapter.gate_signatures)
         if adapter.idle_ready.search(row) and not signatures:
             continue
