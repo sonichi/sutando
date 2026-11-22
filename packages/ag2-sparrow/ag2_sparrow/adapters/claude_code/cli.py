@@ -674,6 +674,8 @@ NO_ROUTE = ("could not ask this agent's session whether its requests go through 
             "here might not be the one it uses; nothing was done")
 NOT_OWNERS_TURN = ("a sign-in is started only for the agent's owner: at a terminal, or by the agent while every "
                    "message it is working on is its owner's. Nothing was done")
+NOT_IN_THE_DM = ("a sign-in is started only from the owner's DM with the agent, since its link must not be posted "
+                 "in a room with other people: ask me in our DM. Nothing was done")
 NO_SUCH_VARIABLE = "unknown variable"       # tmux's words for a variable its server does not have
 
 
@@ -712,19 +714,21 @@ def other_agents_dirs(local) -> list:
 def sign_in_refused(cfg: dict, local, args) -> str:
     """'' when this run may start or finish a sign-in, else why not. A person at a terminal may (the
     app's settings run the command under one); the agent may only while every task its session holds is
-    its owner's own, so it cannot be asked to sign in on someone else's turn."""
+    its owner's own and from their DM: it cannot be asked to sign in on someone else's turn, and the
+    link (whoever opens it chooses the account) is never the answer to a message in a shared room."""
     if sys.stdin.isatty():
         return ""
     try:
         turns = inbox.open_turns(cm.work_root(cfg))
     except Exception:
         return NOT_OWNERS_TURN
-    return "" if turns and all(tier == "owner" and not collab for tier, collab in turns) else NOT_OWNERS_TURN
+    if not turns or not all(tier == "owner" and not collab for tier, collab, _ in turns):
+        return NOT_OWNERS_TURN
+    return "" if all(kind == "dm" for _, _, kind in turns) else NOT_IN_THE_DM
 
 
-# For the agent's answer, as it stands: [dm-only] keeps the link out of a shared room, whoever opens it signs the agent in.
-START_SAY = ("[dm-only]\nOpen this link and sign in, then give me the code the page shows: in our DM only, never in a "
-             "room with other people (the link works for 10 minutes, the code once): %s")
+START_SAY = ("Open this link and sign in, then give me the code the page shows, here in our DM (the link works for "
+             "10 minutes, the code once): %s")
 
 
 def account(args) -> int:
@@ -916,7 +920,7 @@ def main(argv=None) -> int:
     a.add_argument("--start", action="store_true", help="sign in again from anywhere, step 1: print the link of the "
                    "sign-in page and leave the sign-in waiting 10 minutes for its code. A sign-in (--start, --code, "
                    "--switch) runs only at a terminal, or by the agent while every message it is working on is its "
-                   "owner's")
+                   "owner's and came from their DM")
     a.add_argument("--code", action="store_true", help="step 2: read the code the sign-in page showed from standard "
                    "input (never an argument) and finish the waiting sign-in")
     a.add_argument("--cancel", action="store_true", help="end a waiting sign-in")
