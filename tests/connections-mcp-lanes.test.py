@@ -681,11 +681,16 @@ class VaultLanes(Base):
     def test_the_env_file_stays_the_default_without_a_valid_resolver_for_this_descriptor(self):
         self.record([S_SPACE, DEV_S])
         other = self.ws / "other" / "ag2-mcp.json"
-        for config in (self.ws / "no-config.json", self.config(), self.config({C.MCP_LANE_CREDENTIAL_ENV: "[]"}),
-                       self.config({C.MCP_LANE_CREDENTIAL_ENV: '["", "x"]'}), self.config({C.MCP_LANE_CREDENTIAL_ENV: "nope"}),
-                       self.config({C.MCP_LANE_CREDENTIAL_ENV: RESOLVER}, descriptor=other)):
+        # Each config is written just before its sync: they share one file.
+        for make in (lambda: self.ws / "no-config.json", self.config,
+                     lambda: self.config({C.MCP_LANE_CREDENTIAL_ENV: "[]"}),
+                     lambda: self.config({C.MCP_LANE_CREDENTIAL_ENV: '["", "x"]'}),
+                     lambda: self.config({C.MCP_LANE_CREDENTIAL_ENV: "nope"}),
+                     lambda: self.config({C.MCP_LANE_CREDENTIAL_ENV: RESOLVER}, descriptor=other)):
+            config = make()
             self.sync(mcp_config=config)
-            self.assertEqual(self.lane("dev-s-space")["env_file"], str(self.lanes / "conn-dev-s-space.env"), config)
+            self.assertEqual(self.lane("dev-s-space")["env_file"], str(self.lanes / "conn-dev-s-space.env"),
+                             config.read_text() if config.exists() else config)
 
     def test_the_resolver_in_the_environment_or_a_codex_entry_counts_too(self):
         self.record([S_SPACE, DEV_S])
@@ -831,6 +836,40 @@ class VaultLanes(Base):
         path = self.lanes / "conn-dev-s-space.json"
         path.write_text(path.read_text() + " " * C.LANE_DESCRIPTOR_MAX_BYTES)
         self.refused("dev-s-space", "not_engine_descriptor")
+
+    def test_a_descriptor_that_grows_past_the_cap_after_its_fstat_is_refused(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        path = self.lanes / "conn-dev-s-space.json"
+        path.write_text(path.read_text() + " " * C.LANE_DESCRIPTOR_MAX_BYTES)
+        real = C.os.fstat
+
+        def small_at_fstat(fd):
+            st = real(fd)
+            return C.os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid, st.st_gid,
+                                     100, st.st_atime, st.st_mtime, st.st_ctime))
+        with unittest.mock.patch.object(C.os, "fstat", small_at_fstat):
+            self.refused("dev-s-space", "not_engine_descriptor")
+
+    def test_an_unparsable_or_undecodable_descriptor_is_refused(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        path = self.lanes / "conn-dev-s-space.json"
+        for body in (b"{not json", b'{"version": 1, "lane": "\xff\xfe"}', b"\xff\xfe\xfd"):
+            path.write_bytes(body)
+            self.refused("dev-s-space", "not_engine_descriptor")
+
+    def test_an_unreachable_vault_is_no_token(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        with unittest.mock.patch.object(C, "_vault", side_effect=C.VaultUnavailable("no vault")):
+            self.refused("dev-s-space", "no_token")
+
+    def test_a_workspace_that_cannot_be_read_is_not_owner(self):
+        with self.assertRaises(C.NoLaneCredential) as cm:
+            C.lane_mcp_credential("dev-s-space", workspace=self.ws / "missing", environ={}, vault=self.vault)
+        self.assertEqual(cm.exception.reason, "not_owner")
+        self.assertFalse((self.ws / "missing").exists())
 
     def test_a_descriptor_another_user_owns_is_refused(self):
         self.record([S_SPACE, DEV_S])
