@@ -16,7 +16,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ag2_sparrow.adapters.claude_code import account, cli  # noqa: E402
+from ag2_sparrow.adapters.claude_code import account, cli, inbox  # noqa: E402
 
 # Claude Code's `auth` as this adapter uses it: status prints what the config dir's `account.json` says
 # (else signed out), login records that it ran and with which flags, and signs the dir in as bob.
@@ -83,8 +83,8 @@ class Status(Base):
         self.assertIsNone(account.status(self.cfg, self.env)["signed_in"])
         missing = dict(self.cfg, CLAUDE=str(self.tmp / "no-such-claude"))
         self.assertIn("did not answer", account.status(missing, self.env)["detail"])
-        self.assertEqual([account.masked(a) for a in ("bob@example.org", "@x.org", "bob@", "bob", "", None)],
-                         ["b\u2026@example.org", "", "", "", "", ""])
+        self.assertEqual([account.masked(a) for a in ("bob@example.org", "b@example.org", "@x.org", "bob@", "bob", "", None)],
+                         ["b\u2026@example.org", "\u2026@example.org", "", "", "", "", ""])
 
     def test_an_agent_behind_the_credential_proxy_says_the_proxy_decides_its_account(self):
         self.signed_in()
@@ -122,6 +122,25 @@ class SignIn(Base):
                 account.sign_in(cfg, env)
             self.assertEqual(str(refused.exception), why)
         self.assertFalse((self.dir / "stub-logins").exists())
+
+    def test_a_dir_that_is_the_persons_own_or_another_agents_is_never_signed_in(self):
+        home = self.tmp / "home"
+        (home / ".claude").mkdir(parents=True)
+        link = self.tmp / "link-to-personal"
+        link.symlink_to(home / ".claude")
+        with mock.patch.object(account.Path, "home", return_value=home):
+            for own in (home / ".claude", link, str(home / ".claude") + "/"):
+                with self.assertRaises(account.Refused) as refused:
+                    account.sign_in(dict(self.cfg, CLAUDE_CONFIG_DIR=str(own)), self.env)
+                self.assertEqual(str(refused.exception), account.PERSONAL, own)
+            for call in (lambda: account.sign_in(self.cfg, self.env, others=["", str(self.dir) + "/"]),
+                         lambda: account.start(self.cfg, self.env, self.tmp / "w", others=[str(self.dir)])):
+                with self.assertRaises(account.Refused) as refused:
+                    call()
+                self.assertEqual(str(refused.exception), account.ANOTHER_AGENTS)
+            self.assertEqual(account.sign_in(self.cfg, self.env, others=[str(self.tmp / "someone-elses")]), (True, ""))
+        self.assertEqual((self.dir / "stub-logins").read_text().count("\n"), 1)
+        self.assertFalse((self.tmp / "w").exists())
 
 
 class TwoSteps(Base):
@@ -161,10 +180,10 @@ class TwoSteps(Base):
         second = json.loads((self.wait / "pids.json").read_text())
         self.assertNotEqual(first["supervisor"], second["supervisor"])
         for _ in range(50):
-            if not account._alive(first["claude"]):
+            if not account.born(first["claude"][0]):
                 break
             time.sleep(0.1)
-        self.assertFalse(account._alive(first["claude"]), "the first sign-in was ended")
+        self.assertEqual(account.born(first["claude"][0]), "", "the first sign-in was ended")
         self.assertEqual((account.cancel(self.wait), account.cancel(self.wait), account.waiting(self.wait)), (True, False, False))
 
     def test_a_sign_in_that_gives_no_link_or_is_not_allowed_leaves_nothing_waiting(self):
@@ -183,6 +202,52 @@ class TwoSteps(Base):
             account.start(self.cfg, self.env, self.wait, popen=gone)
         self.assertIn("could not be started", str(refused.exception))
         self.assertFalse(self.wait.exists())
+
+    def test_only_the_recorded_process_is_ever_ended(self):
+        """A pid left in the record may since belong to something else: it is ended only while its start
+        time is still the recorded one. A sign-in whose supervisor died is ended by the next cancel."""
+        other = subprocess.Popen(["/bin/sleep", "30"])
+        self.addCleanup(other.kill)
+        self.wait.mkdir()
+        (self.wait / "pids.json").write_text(json.dumps({"supervisor": [other.pid, "Mon Jan  1 00:00:00 2001"],
+                                                         "claude": other.pid, "x": [os.getpid(), account.born(os.getpid())]}))
+        self.assertFalse(account.waiting(self.wait))
+        self.assertTrue(account.cancel(self.wait))
+        time.sleep(0.2)
+        self.assertIsNone(other.poll(), "a process that is not this sign-in's was left alone")
+        account.start(self.cfg, self.env, self.wait)
+        pids = json.loads((self.wait / "pids.json").read_text())
+        os.kill(pids["supervisor"][0], 9)
+        for _ in range(50):
+            if not account.born(pids["supervisor"][0]):
+                break
+            time.sleep(0.1)
+        self.assertTrue(account.born(pids["claude"][0]), "the sign-in outlived its supervisor")
+        self.assertFalse(account.waiting(self.wait))
+        account.cancel(self.wait)
+        for _ in range(50):
+            if not account.born(pids["claude"][0]):
+                break
+            time.sleep(0.1)
+        self.assertEqual(account.born(pids["claude"][0]), "", "the orphaned sign-in was ended")
+
+    def test_two_starts_at_once_leave_one_whole_sign_in(self):
+        import threading
+        got = []
+
+        def go():
+            try:
+                got.append(account.start(self.cfg, self.env, self.wait))
+            except Exception as e:       # noqa: BLE001 - the test reports whatever a start raised
+                got.append(e)
+        threads = [threading.Thread(target=go) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        self.assertEqual(got, ["https://claude.ai/oauth/authorize?code=true&state=s1"] * 3)
+        self.assertTrue(account.waiting(self.wait))
+        self.assertEqual(account.give_code(self.wait, "good-code#s1"), (True, ""))
 
     def test_a_sign_in_nobody_finishes_is_ended_and_the_late_code_is_told_so(self):
         self.wait.mkdir()
@@ -212,14 +277,109 @@ class TwoSteps(Base):
             self.assertEqual((rc, out["detail"]), (1, account.PROXIED))
 
 
+class OwnerOnly(Base):
+    """Who may start or finish a sign-in: a terminal, the app once per nonce, or the agent while every
+    task its session holds is its owner's own."""
+
+    def refused(self, turns=None, tty=False, from_app=False, boom=False):
+        args = types.SimpleNamespace(from_app=from_app)
+        held = mock.Mock(side_effect=OSError("claims unreadable")) if boom else mock.Mock(return_value=turns or [])
+        with mock.patch.object(cli.sys, "stdin", mock.Mock(isatty=lambda: tty)), \
+                mock.patch.object(cli, "config_dir", return_value=self.tmp), \
+                mock.patch.object(cli.cm, "work_root", return_value=str(self.tmp)), \
+                mock.patch.object(cli.inbox, "open_turns", held):
+            return cli.sign_in_refused(self.cfg, cli.LOCAL, args)
+
+    def test_a_terminal_or_only_the_owners_own_open_tasks_may_sign_in(self):
+        self.assertEqual(self.refused(tty=True), "")
+        self.assertEqual(self.refused([("owner", False)]), "")
+        self.assertEqual(self.refused([("owner", False), ("owner", False)]), "")
+        for turns in ([], [("team", True)], [("guest", False)], [("owner", True)], [("unknown", True)],
+                      [("owner", False), ("team", True)], [("owner", False), ("guest", False)]):
+            self.assertEqual(self.refused(turns), cli.NOT_OWNERS_TURN, turns)
+        self.assertEqual(self.refused(boom=True), cli.NOT_OWNERS_TURN)
+
+    def test_the_apps_nonce_lets_one_run_through_and_only_a_fresh_private_one(self):
+        nonce = self.tmp / cli.APP_NONCE
+        self.assertEqual(self.refused(from_app=True), cli.NOT_OWNERS_TURN, "no nonce")
+
+        def write(mode=0o600, age=0.0):
+            nonce.write_text("x")
+            nonce.chmod(mode)
+            os.utime(nonce, (time.time() - age, time.time() - age))
+        write()
+        self.assertEqual((self.refused(from_app=True), nonce.exists()), ("", False))
+        self.assertEqual(self.refused(from_app=True), cli.NOT_OWNERS_TURN, "used once")
+        for kw in ({"mode": 0o644}, {"age": 120.0}):
+            write(**kw)
+            self.assertEqual((self.refused(from_app=True), nonce.exists()), (cli.NOT_OWNERS_TURN, False), kw)
+        nonce.symlink_to(self.dir)
+        self.assertEqual((self.refused(from_app=True), nonce.is_symlink(), self.dir.exists()), (cli.NOT_OWNERS_TURN, False, True))
+        # The nonce is the app's way in only: without the flag an owner's open task is still what counts.
+        write()
+        self.assertEqual((self.refused([("team", True)]), nonce.exists()), (cli.NOT_OWNERS_TURN, True))
+
+    def test_open_turns_are_read_from_the_claims_and_a_claim_past_its_answer_does_not_count(self):
+        root = self.tmp / "root"
+        (root / "tasks").mkdir(parents=True)
+
+        def task(tid, tier, collab="false", raw=None):
+            (root / "tasks" / (tid + ".txt")).write_text(raw if raw is not None else
+                                                          "access_tier: %s\ncollaborator: %s\ntask: hi\n" % (tier, collab))
+        task("t-owner", "owner")
+        task("t-collab", "team", "true")
+        task("t-guest", "guest")
+        task("t-done", "owner")
+        task("t-answered", "team", "true")
+        task("t-bad", "", raw="task: no headers\n")
+        phases = {"t-owner": "PREPARED", "t-collab": "CALLING", "t-guest": "CALLING", "t-done": "SETTLED",
+                  "t-answered": "PREPARED", "t-bad": "PREPARED", "t-gone": "PREPARED", "t-unreadable": None}
+
+        def load(tid):
+            if phases[tid] is None:
+                raise inbox.lifecycle.ClaimUnreadable(tid)
+            return {"task_id": tid, "phase": phases[tid]}
+        lc = types.SimpleNamespace(claims=types.SimpleNamespace(ids=lambda: sorted(phases), load=load),
+                                   classify=lambda tid: inbox.lifecycle.LIVE_READY if tid == "t-answered" else inbox.lifecycle.ABSENT)
+        with mock.patch.object(inbox, "_lifecycle", return_value=lc):
+            turns = inbox.open_turns(str(root))
+        self.assertEqual(sorted(turns), sorted([("owner", False), ("team", True), ("guest", False),
+                                                ("unknown", True), ("unknown", True), ("unknown", True)]))
+        self.assertTrue(inbox.records.claims_lock_path(str(root)).exists(), "read under claims.lock")
+
+    def test_the_command_refuses_a_sign_in_that_is_not_the_owners_and_still_reads_and_cancels(self):
+        cmd = Command("run_")
+        cmd.cfg, cmd.env, cmd.dir = self.cfg, self.env, self.dir
+        self.signed_in()
+        with mock.patch.object(cli, "config_dir", return_value=self.tmp):
+            for flag in ("--start", "--switch", "--code"):
+                with mock.patch.object(sys, "stdin", io.StringIO("good-code#s1\n")):
+                    rc, out = cmd.run_(flag, gate=cli.NOT_OWNERS_TURN)
+                self.assertEqual((rc, out["changed"], out["detail"], out["account"]),
+                                 (1, "", cli.NOT_OWNERS_TURN, "a\u2026@example.com"), flag)
+            self.assertFalse((self.dir / "stub-logins").exists())
+            self.assertEqual(cmd.run_(gate=cli.NOT_OWNERS_TURN)[0], 0)
+            self.assertEqual(cmd.run_("--cancel", gate=cli.NOT_OWNERS_TURN), (0, {"changed": "", "cancelled": False}))
+            # A session that could not be asked about the proxy: reading still answers, a sign-in does not start.
+            unknown = dict(self.env, **{cli.ROUTE_UNKNOWN: "1"})
+            rc, out = cmd.run_("--start", env=unknown)
+            self.assertEqual((rc, out["detail"]), (1, cli.NO_ROUTE))
+            self.assertEqual(cmd.run_(env=unknown)[0], 0)
+        self.assertNotIn("in this DM", cli.START_SAY)
+        self.assertIn("never in a room with other people", cli.START_SAY)
+
+
 class Command(Base):
     """`ag2-sparrow-claude-local account`, with the install's config stood in."""
 
-    def run_(self, *argv, cfg=None, problem="", env=None):
+    def run_(self, *argv, cfg=None, problem="", env=None, gate=""):
+        """`gate` stands in for the owner-only check ('' lets the run through); None leaves the real one."""
         out = io.StringIO()
-        with mock.patch.object(cli, "selected", return_value=cli.LOCAL), \
+        gated = mock.patch.object(cli, "sign_in_refused", return_value=gate) if gate is not None else contextlib.nullcontext()
+        with mock.patch.object(cli, "selected", return_value=cli.LOCAL), gated, \
+                mock.patch.object(cli, "other_agents_dirs", return_value=[]), \
                 mock.patch.object(cli, "load_config", return_value=(self.cfg if cfg is None else cfg, problem)), \
-                mock.patch.object(cli, "account_env", return_value=self.env if env is None else env), \
+                mock.patch.object(cli, "account_env", return_value=dict(self.env if env is None else env)), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             rc = cli.main(["account", *argv])
         return rc, (json.loads(out.getvalue()) if out.getvalue() else None)
@@ -256,7 +416,7 @@ class Command(Base):
         """The command's caller (the app, a terminal) may not have the variable the session was started with."""
         answers = iter([types.SimpleNamespace(returncode=0, stdout="ANTHROPIC_BASE_URL=http://localhost:7846\n"),
                         types.SimpleNamespace(returncode=0, stdout="-ANTHROPIC_BASE_URL\n"),
-                        types.SimpleNamespace(returncode=1, stdout=""), None])
+                        types.SimpleNamespace(returncode=1, stdout=""), types.SimpleNamespace(returncode=1, stdout="")])
         with mock.patch.object(cli, "child_env", side_effect=lambda cfg: dict(self.env)), \
                 mock.patch.object(cli.launcher, "configured_tmux", return_value=("/tmux", "")), \
                 mock.patch.object(cli.launcher.Tmux, "run", side_effect=lambda *a, **k: next(answers)) as asked:
@@ -266,6 +426,21 @@ class Command(Base):
         with mock.patch.object(cli, "child_env", return_value={"ANTHROPIC_BASE_URL": "http://own"}), \
                 mock.patch.object(cli.launcher, "configured_tmux", return_value=("", "no tmux")):
             self.assertEqual(cli.account_env(self.cfg, cli.LOCAL), {"ANTHROPIC_BASE_URL": "http://own"})
+        # A session that cannot be asked at all is marked, never read as "not behind the proxy".
+        with mock.patch.object(cli, "child_env", return_value={}), \
+                mock.patch.object(cli.launcher, "configured_tmux", return_value=("", "no tmux")):
+            self.assertEqual(cli.account_env(self.cfg, cli.LOCAL), {cli.ROUTE_UNKNOWN: "1"})
+
+    def test_the_dirs_of_the_other_installed_agents_are_found_from_their_configs(self):
+        root = self.tmp / "config-root"
+        (root / "agents" / "b").mkdir(parents=True)
+        mine, theirs = root / "claude-local.conf", root / "agents" / "b" / "claude-local.conf"
+        mine.write_text("CLAUDE_CONFIG_DIR=%s\n" % self.dir)
+        theirs.write_text("CLAUDE_CONFIG_DIR=/their/dir\n")
+        (root / "agents" / "empty.conf").write_text("OTHER=1\n")
+        with mock.patch.object(cli.cm, "config_root", return_value=root), \
+                mock.patch.object(cli, "config_path", return_value=mine):
+            self.assertEqual(cli.other_agents_dirs(cli.LOCAL), ["/their/dir"])
 
 
 if __name__ == "__main__":

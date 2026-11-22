@@ -669,22 +669,60 @@ def model(args) -> int:
     return 0 if switched else 1
 
 
+ROUTE_UNKNOWN = "AG2_ACCOUNT_ROUTE_UNKNOWN"      # set by account_env, never passed on: the session could not be asked
+NO_ROUTE = ("could not ask this agent's session whether its requests go through the credential proxy, so a sign-in "
+            "here might not be the one it uses; nothing was done")
+NOT_OWNERS_TURN = ("a sign-in is started only by the agent's owner: from a terminal, from the app's settings, or by "
+                   "the agent while every message it is working on is its owner's. Nothing was done")
+APP_NONCE = "account-app.nonce"
+
+
 def account_env(cfg: dict, local) -> dict:
     """What `claude auth` runs under for this agent, with the credential proxy's address as the agent's
-    running session has it (its tmux server's environment), which this command's own caller may lack."""
+    running session has it (its tmux server's environment), which this command's own caller may lack.
+    ROUTE_UNKNOWN is set when tmux could not be asked at all."""
     env = child_env(cfg)
     tmux, problem = launcher.configured_tmux(cfg, job=local)
-    if problem:
-        return env
-    r = launcher.Tmux(str(launcher.socket_path(config_dir(local))), tmux).run("show-environment", "-g", accounts.PROXY_VAR)
-    name, eq, value = ((r.stdout if r else "") or "").strip().partition("=")
-    if r is not None and r.returncode == 0 and name == accounts.PROXY_VAR and eq and value:
+    r = None if problem else launcher.Tmux(str(launcher.socket_path(config_dir(local))), tmux).run(
+        "show-environment", "-g", accounts.PROXY_VAR)
+    if r is None:
+        return env if env.get(accounts.PROXY_VAR) else dict(env, **{ROUTE_UNKNOWN: "1"})
+    name, eq, value = (r.stdout or "").strip().partition("=")
+    if r.returncode == 0 and name == accounts.PROXY_VAR and eq and value:
         env[accounts.PROXY_VAR] = value
     return env
 
 
-START_SAY = ("Open this link and sign in, then send me the code the page shows, in this DM (the link works for "
-             "10 minutes): %s")
+def other_agents_dirs(local) -> list:
+    """The Claude config dirs of every other installed job, for the "is this dir this agent's alone" check."""
+    mine, found = config_path(local), []
+    try:
+        paths = sorted(cm.config_root().rglob("*.conf"))
+    except OSError:
+        return found
+    for path in paths:
+        if path != mine:
+            found.append(cm.read_config_lenient(path).get("CLAUDE_CONFIG_DIR") or "")
+    return [d for d in found if d]
+
+
+def sign_in_refused(cfg: dict, local, args) -> str:
+    """'' when this run may start or finish a sign-in, else why not. A person at a terminal may; the
+    app may once per nonce (--from-app); the agent may only while every task its session holds is its
+    owner's own, so a collaborator's or a guest's message cannot have it sign in to their account."""
+    if sys.stdin.isatty():
+        return ""
+    if args.from_app:
+        return "" if accounts.take_app_nonce(config_dir(local) / APP_NONCE) else NOT_OWNERS_TURN
+    try:
+        turns = inbox.open_turns(cm.work_root(cfg))
+    except Exception:
+        return NOT_OWNERS_TURN
+    return "" if turns and all(tier == "owner" and not collab for tier, collab in turns) else NOT_OWNERS_TURN
+
+
+START_SAY = ("Open this link and sign in, then give me the code the page shows: in our DM only, never in a room "
+             "with other people (the link works for 10 minutes, the code once): %s")
 
 
 def account(args) -> int:
@@ -698,13 +736,20 @@ def account(args) -> int:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
     env, changed = account_env(cfg, local), ""
+    unknown_route = bool(env.pop(ROUTE_UNKNOWN, ""))
     waiting = config_dir(local) / "account-sign-in"
     if args.cancel:
         print(json.dumps({"changed": "", "cancelled": accounts.cancel(waiting)}))
         return 0
+    if args.start or args.switch or args.code:
+        refused = sign_in_refused(cfg, local, args) or (NO_ROUTE if unknown_route and not args.code else "")
+        if refused:
+            print(json.dumps({"changed": "", "detail": refused, **accounts.status(cfg, env)}))
+            return 1
+    others = other_agents_dirs(local) if args.start or args.switch else ()
     if args.start:
         try:
-            link = accounts.start(cfg, env, waiting, console=args.console)
+            link = accounts.start(cfg, env, waiting, console=args.console, others=others)
         except accounts.Refused as e:
             print(json.dumps({"changed": "", "detail": str(e), **accounts.status(cfg, env)}))
             return 1
@@ -713,7 +758,7 @@ def account(args) -> int:
     if args.switch or args.code:
         try:
             ok, detail = (accounts.give_code(waiting, sys.stdin.readline()) if args.code else
-                          accounts.sign_in(cfg, env, console=args.console))
+                          accounts.sign_in(cfg, env, console=args.console, others=others))
         except accounts.Refused as e:
             ok, detail = False, str(e)
         if not ok:
@@ -871,6 +916,11 @@ def main(argv=None) -> int:
     a.add_argument("--code", action="store_true", help="step 2: read the code the sign-in page showed from standard "
                    "input (never an argument) and finish the waiting sign-in")
     a.add_argument("--cancel", action="store_true", help="end a waiting sign-in")
+    a.add_argument("--from-app", action="store_true", help="for the desktop app's settings: allow a sign-in with no "
+                   "terminal, once, by taking the file account-app.nonce (mode 0600, under a minute old) the app wrote "
+                   "in the agent's config dir just before. Without it or a terminal, a sign-in runs only while every "
+                   "message the agent is working on is its owner's. This keeps a collaborator's message from having "
+                   "the agent sign in elsewhere; it does not stop someone who already has this user's shell")
     a.add_argument("--console", action="store_true", help="with --switch or --start: sign in with an Anthropic Console "
                    "account in place of a Claude subscription")
     a.set_defaults(func=account)
