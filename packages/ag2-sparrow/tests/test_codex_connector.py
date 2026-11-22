@@ -1028,6 +1028,16 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.assertEqual([account_switch.page_ok(u) for u in ("https://a.example/x?y=1", "https://", None, "https://a b")],
                          [True, False, False, False])
 
+    def connector(self):
+        """A connector on this work root with a stand-in server that starts sign-in login-1."""
+        args = cc.build_parser().parse_args(["--work", str(self.work)])
+        args.state, args.bridge_state = str(self.work / "state"), str(self.bridge)
+        c = cc.Connector(FakeRpc, args, note="n")
+        c.rpc.request = lambda method, params=None, timeout=0: (
+            {"loginId": "login-1", "authUrl": "https://stub.invalid/sign-in"} if method == "account/login/start"
+            else {"account": {"type": "chatgpt", "email": "alice@example.com", "planType": "pro"}})
+        return c
+
     def test_a_final_card_that_could_not_be_posted_is_kept_and_posted_later(self):
         (self.home / "stub-login").write_text("success bob@example.org")
         self.serve("task-ask", "/account")
@@ -1049,8 +1059,24 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         with mock.patch.object(connector_cards, "queue", side_effect=first_only):
             self.assertEqual(run_connector(self.work, once=2), 0)
         kept = json.loads((self.work / "state" / "account.json").read_text())
-        self.assertEqual((kept["id"], kept["final"]["state"]), ("login-1", "done"), "the outcome is still on record")
+        self.assertEqual(("id" in kept, [o["state"] for o in kept["owed"]]), (False, ["done"]),
+                         "the sign-in is over, and its outcome is still on record")
         self.posted("$card2")
+        # A new tap while that result waits starts its own sign-in and does not remove the result.
+        (self.home / "stub-login").unlink()
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("disk full")):
+            self.dm("task-tap-again", said, reply_to="$card1", click=said)
+            self.dm("task-ask-again", "/account")
+            run_connector(self.work, once=2)
+            c = self.connector()
+            self.assertEqual(c.accounts.tapped("switch", {"channel_id": self.DM}, str(self.work / "results" / "t.txt")),
+                             "account-started")
+        kept = json.loads((self.work / "state" / "account.json").read_text())
+        self.assertEqual((kept["id"], [o["state"] for o in kept["owed"]]), ("login-1", ["done"]))
+        # A report that names no sign-in, or another one, does not end the one in progress.
+        self.assertEqual((c.accounts.finished(None, True), c.accounts.finished("login-other", True)), ("", ""))
+        self.assertEqual(c.accounts.pending()["id"], "login-1")
+        c.accounts.keep({})
         self.assertTrue(self.serve("task-later", "hello again").startswith("STUB echo:"))
         ((room, done),) = self.posted("$card3")
         self.assertEqual((room, done["state"], done["text"]), (self.DM, "done", "Signed in. I'm signed in as b…@example.org (pro)."))
@@ -1081,7 +1107,7 @@ class AccountCardTest(CardWorld, unittest.TestCase):
             self.assertEqual(c.accounts.using(), "I could not read which account I'm signed in with.")
             # A cancel the server refuses still clears the pending sign-in; one this card did not start is ignored.
             c.accounts.keep({"id": "login-9", "room": self.DM, "at": time.time()})
-            self.assertEqual(c.accounts.finished("another-login", True), "")
+            self.assertEqual((c.accounts.finished("another-login", True), c.accounts.finished(None, True)), ("", ""))
             c.accounts.give_up(c.accounts.pending())
             self.assertEqual(c.accounts.pending(), {})
         out = self.work / "results" / "task-x.txt"

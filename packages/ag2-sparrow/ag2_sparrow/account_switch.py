@@ -17,6 +17,7 @@ from . import card_desk, connector_cards
 
 FILE, CARD = "account.json", "account-switch"
 WAIT_S = 600.0       # a sign-in the owner has not finished by then is given up
+OWED_KEEP = 5        # final cards kept while they cannot be queued
 MARK = "[account-card]"
 HINT = ("If the person asks to switch, change or sign in to another account for you, or which account you "
         "use, reply with exactly %s and nothing else: they are then shown a card for it. Do not start a "
@@ -48,15 +49,28 @@ class AccountSwitch:
         self.publish, self.quoted, self.log = publish, quoted, log
         self.read, self.begin, self.cancel, self.opener = read, begin, cancel, opener
 
-    def pending(self) -> dict:
+    def record(self) -> dict:
         try:
             with open(os.path.join(self.state_dir, FILE), encoding="utf-8") as f:
                 state = json.load(f)
         except (OSError, ValueError):
             return {}
-        return state if isinstance(state, dict) and state.get("id") else {}
+        return state if isinstance(state, dict) else {}
 
-    def keep(self, state: dict):
+    def pending(self) -> dict:
+        """The sign-in in progress ({} when there is none), apart from the results still to be told."""
+        state = self.record()
+        return {k: v for k, v in state.items() if k != "owed"} if state.get("id") else {}
+
+    def owed(self) -> list:
+        """The final cards of sign-ins that ended while their card could not be queued, oldest first."""
+        return [o for o in self.record().get("owed") or [] if isinstance(o, dict)]
+
+    def keep(self, attempt: dict, owed=None):
+        """Record the sign-in in progress (`{}` for none); the results still to be told are kept as they
+        are unless `owed` is given."""
+        owed = self.owed() if owed is None else owed
+        state = dict(attempt, **({"owed": owed[-OWED_KEEP:]} if owed else {}))
         path = os.path.join(self.state_dir, FILE)
         with open(path + ".tmp", "w", encoding="utf-8") as f:
             json.dump(state, f, sort_keys=True)
@@ -146,19 +160,26 @@ class AccountSwitch:
         self.keep({})
 
     def last_word(self, waiting, state, text) -> bool:
-        """Post a sign-in's final card. Until it is posted the sign-in stays on record with that card's
-        words, so a card that could not be queued is not lost: `expire` posts it later."""
-        if self.post(waiting.get("room"), self.card(state, text)):
-            self.keep({})
-            return True
-        self.keep(dict(waiting, final={"state": state, "text": text}))
-        return False
+        """A sign-in is over: it is no longer the one in progress, and its final card joins the results
+        to be told, which are then posted oldest first. A new tap never removes one of them."""
+        self.keep({}, self.owed() + [{"room": waiting.get("room"), "state": state, "text": text}])
+        return not self.tell()
+
+    def tell(self) -> list:
+        """Post the results still to be told, oldest first, stopping at the first that cannot be queued;
+        what is left."""
+        owed = self.owed()
+        while owed and self.post(owed[0].get("room"), self.card(str(owed[0].get("state")), str(owed[0].get("text")))):
+            owed.pop(0)
+            self.keep(self.pending(), owed)
+        return owed
 
     def finished(self, login, success, error="") -> str:
         """The runtime reported a sign-in over: tell the owner, in the DM it was asked in, how it ended
-        and which account is in use now. '' for a sign-in this card did not start."""
+        and which account is in use now. '' for any report that does not name the sign-in in progress:
+        one without an id could be another sign-in's, and must not end this one."""
         waiting = self.pending()
-        if not waiting or waiting.get("final") or (login and str(login) != waiting["id"]):
+        if not waiting or not login or str(login) != waiting["id"]:
             return ""
         if success:
             self.last_word(waiting, "done", "Signed in. %s" % self.using())
@@ -168,14 +189,12 @@ class AccountSwitch:
         return "account-not-switched"
 
     def expire(self, now=None) -> str:
-        """Give up a sign-in nobody finished within WAIT_S, and say so; and post a final card that could
-        not be posted when its sign-in ended."""
+        """Post any result still to be told; then give up a sign-in nobody finished within WAIT_S, and
+        say so."""
+        told = bool(self.owed()) and not self.tell()
         waiting = self.pending()
-        final = waiting.get("final") if waiting else None
-        if isinstance(final, dict):
-            return "account-told" if self.last_word(waiting, str(final.get("state")), str(final.get("text"))) else ""
         if not waiting or (now if now is not None else time.time()) - float(waiting.get("at") or 0) < WAIT_S:
-            return ""
+            return "account-told" if told else ""
         try:
             self.cancel(waiting["id"])
         except Exception as e:  # noqa: BLE001 - a sign-in already over cannot be cancelled
