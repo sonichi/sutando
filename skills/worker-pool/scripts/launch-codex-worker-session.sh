@@ -121,9 +121,10 @@ fi
 # >>> codex-app-server-seat
 # Unset for this launch, the core's persisted choice decides, through the same resolver
 # (scripts/sutando-config.sh codex-app-server): on by default, off when set off. When it cannot be
-# read the worker is a TUI, as before.
+# read, or the seat's files are missing, the worker is a TUI, as before.
 if [ -z "${SUTANDO_CODEX_APP_SERVER:-}" ]; then
-  if [ "$(bash "$REPO/scripts/sutando-config.sh" codex-app-server 2>/dev/null)" = 1 ]; then
+  if [ -f "$REPO/src/agent/codex/app-server/seat-launch.sh" ] \
+     && [ "$(bash "$REPO/scripts/sutando-config.sh" codex-app-server 2>/dev/null)" = 1 ]; then
     # Not exported: the seat gets it with -e, and a tmux server started here must not keep it.
     SUTANDO_CODEX_APP_SERVER=1
   fi
