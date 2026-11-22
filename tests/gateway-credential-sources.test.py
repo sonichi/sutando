@@ -1643,7 +1643,10 @@ IO_ALLOWED = {("remote_gateway_bridge.py", "_read_env_file"), ("remote_gateway_b
               ("remote_gateway_bridge.py", "_read_token_file_text"),
               ("remote_gateway_bridge.py", "_vault_lookup"), ("service_manager.py", "systemd_user_available"),
               ("gateway_credential_io.py", "read_file"), ("gateway_credential_io.py", "vault_lookup"),
-              ("gateway_credential_io.py", "_vault"), ("gateway_credential_io.py", "_vault_once")}
+              ("gateway_credential_io.py", "_vault"), ("gateway_credential_io.py", "_vault_once"),
+              # Antigravity's own Gemini API key, which the owner saved for that agent in the app (its
+              # Keychain item, never a gateway credential): read here and sent only in ACP authenticate.
+              ("adapters/antigravity/gemini_key.py", "_read_item")}
 # A command whose output is a credential store: the Keychain. The systemd user manager's environment
 # is SYSTEMD_PROBE's closed-world rule below, which evaluates no constant.
 STORE_READS = ("security", "find-generic-password")
