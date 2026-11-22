@@ -210,6 +210,16 @@ def resume_step(state, pane, runtime, seat, resumed_at, now, enabled=True):
     return RESUME_AFTER_SIGN_IN
 
 
+def pool_sweep_after_sign_in(workspace, resumed_at):
+    """The core resumed on a new login: the pool sweeps now, so its seats parked on the old
+    account's limit recover (pool_sweep_trigger; once per sign-in)."""
+    try:
+        import pool_sweep_trigger
+        return pool_sweep_trigger.request_sweep(workspace, "core-signed-in", f"signed-in:{int(resumed_at)}")
+    except Exception:  # noqa: BLE001 - a failed nudge leaves the pool's own timer to sweep
+        return False
+
+
 def typed_episode(prev_at, prev_episode, now):
     """The episode a typed answer at `now` belongs to: the previous one's when it was typed
     within TYPED_EPISODE_GAP_S, else a new episode named by `now`."""
@@ -1099,6 +1109,7 @@ def main():
         if rkey and send_keys(a.socket, a.session, rkey):
             resumed_at = time.time()
             last_answered = {"kind": "signed-in", "key": rkey, "at": resumed_at}
+            pool_sweep_after_sign_in(workspace, resumed_at)
         dkey = dismiss_step(state_dir, a.session, state, kind, prompt, clock, time.time(), a.auto_answer)
         if dkey and send_keys(a.socket, a.session, dkey):
             self_opened_gate.clear(state_dir, a.session)
