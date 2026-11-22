@@ -72,11 +72,20 @@ older than 5 minutes, larger than 4 KiB or outside the schema as absent.
 
 An unknown runtime gets `restart_core` and `escape_prompt` only.
 
+## On the heartbeat
+
+The gateway bridge sends the record as `health.recovery` with the `core_recovery.v1`
+capability, on the core's lanes only; the wire rules are in
+[the gateway protocol](remote-gateway-protocol.md).
+
 ## The shared vocabulary
 
 `parse_action_id(action_id, runtime)` is the allowlist for the owner's click (`action.json`:
-`retry_now`, `restart_core`, `escape_prompt`, `switch_model:<alias>`, `switch_runtime:<runtime>`);
-an id the runtime cannot carry out, or any unknown id, parses to None.
+`retry_now`, `restart_core`, `escape_prompt`, `switch_model:<alias>`, `switch_runtime:<runtime>`,
+`switch_account:<id>`); the id is matched whole, and an id the runtime cannot carry out, an argument
+not in the host's own list (aliases, runtimes, stored accounts), or any unknown id parses to None.
+`switch_account` is in `STEP_UP_ACTIONS`: never offered in the record, and confirmed by the owner
+before it runs.
 `RECEIPT_OUTCOMES` (`done`, `refused`, `stale`, `failed`) is the receipt's (`receipt.json`).
 
 ## Contract fixtures
