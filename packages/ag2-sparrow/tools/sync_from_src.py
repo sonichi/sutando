@@ -2,7 +2,7 @@
 """Regenerate the package modules from the canonical sutando src/ (single source).
 
 Everything in MAP below is bundled verbatim from sonichi/sutando `src/`, which is
-canonical for those modules — currently 45 of them, including outbox.py and its
+canonical for those modules — currently 46 of them, including outbox.py and its
 transport seam outbox_adapter.py. Only the modules NOT in MAP are package-canonical
 and intentionally diverge from src (remote_gateway_bridge, _dirs, send_allowlist:
 dir-interface, no workspace-resolution).
@@ -103,6 +103,7 @@ MAP = {
     "src/hitl/projector.py": "hitl/projector.py",
     "src/hitl/renotify.py": "hitl/renotify.py",
     "src/hitl/replies.py": "hitl/replies.py",
+    "src/hitl/recovery.py": "hitl/recovery.py",
 }
 PKG_DIR = Path(__file__).resolve().parent.parent / "ag2_sparrow"
 REPO_ROOT = Path(__file__).resolve().parents[3]
