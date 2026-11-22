@@ -263,6 +263,21 @@ Payload schema + locality/socket field semantics: [Core liveness payload schema]
 
 On each context compaction, `src/session-handoff.sh` saves a snapshot to `<workspace>/session-state.md` (system status, recent commits, open PRs, quota, tasks). Read this file at session start to understand what the previous session was doing. It lives under the workspace (per the workspace contract), not the repo root.
 
+The recent-conversation section comes from `src/context_resume.py`. Its `--turns`
+limit counts cleaned, nonempty user/assistant turns (including tool summaries),
+and its `--chars` limit counts the complete markdown payload, including headings
+and separators. Newest turns take priority and render in chronological order.
+A newest turn that exceeds the character limit is shortened with `[…truncated]`;
+a budget too small for its heading and marker produces only `…`. The CLI adds one
+final stdout newline outside the payload budget.
+
+Both limits must be nonnegative. Zero emits no context (the CLI exits 1 with its
+usual no-conversation diagnostic); a negative limit exits 1 with a limit error.
+The reader retains at most the requested number of cleaned turns while scanning
+the full transcript. This bounds retained turn count, not transcript scan time or
+the memory needed to parse an individual JSON line. Shared transcript-cleaning
+rules and session-state publication are unchanged.
+
 ## Voice session context
 
 Moved verbatim from CLAUDE.md "Task bridge" (2026-10-16 context-budget diet):
