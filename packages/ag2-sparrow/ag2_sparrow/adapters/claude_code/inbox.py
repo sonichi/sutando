@@ -170,6 +170,20 @@ def admit(root, task_id, allow: bool, allow_collab: bool = False) -> "tuple[str 
     return policy.kind, headers, ""
 
 
+def card_matter(root, task_id, environ=None) -> "tuple[str, str]":
+    """(outcome, answer) of a task that is a model-card matter (model_card.card_matter), ('', '') for any
+    other task and whenever the card cannot be consulted: a task is never held back by the card."""
+    try:
+        cfg, why = cm.load_config_at(LOCAL, _installed_config(environ))
+        if why:
+            return "", ""
+        from . import model_card
+        return model_card.card_matter(root, task_id, cfg, environ=environ)
+    except Exception as e:  # noqa: BLE001 - the session answers it as an ordinary message instead
+        print("model card not consulted for %s: %s: %s" % (task_id, type(e).__name__, e), file=sys.stderr)
+        return "", ""
+
+
 def isolated_prompt(root, task_id) -> "tuple[str, dict]":
     """(text, attested headers) of the isolated turn: the routine and cloud-session adapters' payload (attested
     routing fields, the non-owner note, the untrusted body between nonce markers), with the gateway's tier
@@ -197,6 +211,10 @@ def isolated_answer(root, task_id, environ=None, run=None) -> "tuple[str, str]":
         env = isolated.child_env(environ)
         if cfg.get("CLAUDE_CONFIG_DIR"):
             env["CLAUDE_CONFIG_DIR"] = cfg["CLAUDE_CONFIG_DIR"]
+        from . import model_card
+        picked = model_card.turn_model(root, cfg)
+        if picked:              # the owner's pick is every turn's, the isolated one's too
+            env["ANTHROPIC_MODEL"] = picked
         limiter = relay_loop.RateLimiter(str(records.state_dir(root) / ISOLATED_LIMITER_FILE), ISOLATED_PER_HOUR)
         if limiter.wait_seconds() > 0:
             return ISOLATED_FAILED, "isolated turns are at their hourly cap (%d)" % ISOLATED_PER_HOUR
@@ -372,6 +390,11 @@ def claim(root, task_id) -> dict:
             if kind is None:
                 outcome = lc.complete_without_call(task_id, task_io.NON_OWNER_REFUSED, why)
                 raise Refused("%s not admitted (%s); the owner-only refusal is %s" % (task_id, why, outcome))
+            carded, body = card_matter(root, task_id)
+            if carded:
+                # A tap on the model card, or the owner's /model: answered here, never submitted to the session.
+                outcome = lc.complete_without_call(task_id, body, "model card: %s" % carded)
+                raise Refused("%s answered by the model card (%s); its answer is %s" % (task_id, carded, outcome))
             try:
                 attempt = lc.prepare(task_id, INTERRUPTED_BODY, mode=lifecycle.LOCAL, generation=generation)
                 if kind == task_io.RESTRICTED:
