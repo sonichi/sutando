@@ -628,7 +628,7 @@ class VaultLanes(Base):
         return self.sync(**kw)
 
     def resolve(self, lane, **kw):
-        kw.setdefault("environ", {})
+        kw.setdefault("environ", {"AG2_MCP_DESCRIPTOR": str(self.main)})
         kw.setdefault("vault", self.vault)
         return C.lane_mcp_credential(lane, workspace=self.ws, **kw)
 
@@ -641,7 +641,8 @@ class VaultLanes(Base):
         real = C.lane_mcp_credential
 
         def resolve(lane, **kw):
-            return real(lane, workspace=kw.get("workspace"), environ={}, vault=self.vault)
+            return real(lane, workspace=kw.get("workspace"), environ={"AG2_MCP_DESCRIPTOR": str(self.main)},
+                        vault=self.vault)
         with unittest.mock.patch.object(cli.connections, "lane_mcp_credential", resolve), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = cli.main(["--workspace", str(self.ws), "lane-mcp-credential", "--lane", lane])
@@ -735,9 +736,8 @@ class VaultLanes(Base):
         worker = row("dev.s.space", "w-bee", "https://dev-chat.s.space/relay", worker="bee")
         self.record([S_SPACE, DEV_S, worker])
         self.vault_sync()
-        for lane in ("nope", "primary", "", "w-bee"):
+        for lane in ("nope", "primary", "", "w-bee", "s-space"):
             self.refused(lane, "unknown_lane")
-        self.refused("s-space", "not_engine_descriptor")
 
     def test_a_disabled_or_parked_lane_is_refused_even_with_its_descriptor_left_behind(self):
         self.record([S_SPACE, DEV_S])
@@ -789,6 +789,7 @@ class VaultLanes(Base):
         spec.loader.exec_module(cli)
         stripped = {k: v for k, v in C.os.environ.items()
                     if k not in ("CLAUDE_CONFIG_DIR", "CLAUDE_HOME", "SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER")}
+        stripped["AG2_MCP_DESCRIPTOR"] = str(self.main)
         out, err = io.StringIO(), io.StringIO()
         with unittest.mock.patch.dict(C.os.environ, stripped, clear=True), \
                 unittest.mock.patch.object(util_paths, "_CLAUDE_HOME_FALLBACK_BANNER_FIRED", False), \
@@ -797,6 +798,74 @@ class VaultLanes(Base):
             rc = cli.main(["--workspace", str(self.ws), "lane-mcp-credential", "--lane", "dev-s-space"])
         self.assertEqual((rc, out.getvalue()), (3, ""))
         self.assertTrue(err.getvalue().startswith("lane-mcp-credential: refused, no_token: "), err.getvalue())
+
+    def test_a_symlink_swapped_in_after_the_open_is_never_followed(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        path = self.lanes / "conn-dev-s-space.json"
+        good = path.read_text()
+        planted = self.ws / "planted.json"
+        planted.write_text(good)
+        path.write_text(json.dumps({**json.loads(good), "env_key": "AG2_REMOTE_TOKEN_S_SPACE"}))
+        path.chmod(0o600)
+        swapped = []
+
+        def swap_after(real):
+            def stat_then_swap(target, *a, **kw):
+                out = real(target, *a, **kw)
+                if not swapped:
+                    swapped.append(1)
+                    path.unlink()
+                    path.symlink_to(planted)
+                return out
+            return stat_then_swap
+        with unittest.mock.patch.object(C.os, "fstat", swap_after(C.os.fstat)), \
+                unittest.mock.patch.object(C.os, "lstat", swap_after(C.os.lstat)):
+            with self.assertRaises(C.NoLaneCredential) as cm:
+                self.resolve("dev-s-space")
+        self.assertEqual((swapped, cm.exception.reason), ([1], "not_engine_descriptor"))
+
+    def test_an_oversized_descriptor_is_refused(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        path = self.lanes / "conn-dev-s-space.json"
+        path.write_text(path.read_text() + " " * C.LANE_DESCRIPTOR_MAX_BYTES)
+        self.refused("dev-s-space", "not_engine_descriptor")
+
+    def test_a_descriptor_another_user_owns_is_refused(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        real = C.os.fstat
+
+        def other_owner(fd):
+            st = real(fd)
+            return C.os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid + 1, st.st_gid,
+                                     st.st_size, st.st_atime, st.st_mtime, st.st_ctime))
+        with unittest.mock.patch.object(C.os, "fstat", other_owner):
+            self.refused("dev-s-space", "not_engine_descriptor")
+
+    def test_a_descriptor_naming_another_relay_is_stale_even_with_the_right_digest(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        path = self.lanes / "conn-dev-s-space.json"
+        path.write_text(json.dumps({**self.lane("dev-s-space"), "relay": "https://evil.example/relay"}))
+        self.refused("dev-s-space", "descriptor_stale")
+
+    def test_the_resolver_reads_only_the_vault_never_the_environment_or_a_channel_file(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        environ = {"AG2_MCP_DESCRIPTOR": str(self.main),
+                   "AG2_REMOTE_TOKEN_DEV_S_SPACE": "https://dev-chat.s.space/relay|from-env"}
+        with unittest.mock.patch.object(C, "_channel_dir_tokens", side_effect=AssertionError("channel read")):
+            self.assertEqual(self.resolve("dev-s-space", environ=environ)["bearer"], "secret-dev")
+
+    def test_without_a_main_descriptor_no_lane_is_answered(self):
+        self.record([S_SPACE, DEV_S])
+        self.vault_sync()
+        with self.assertRaises(C.NoLaneCredential) as cm:
+            self.resolve("dev-s-space", environ={}, mcp_config=self.ws / "none.json",
+                         codex_config=self.ws / "none.toml")
+        self.assertEqual(cm.exception.reason, "unknown_lane")
 
     def test_every_refusal_reason_is_declared(self):
         self.assertEqual(set(C.LANE_CREDENTIAL_REASONS), PROXY_REFUSES)

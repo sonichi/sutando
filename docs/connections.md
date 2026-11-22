@@ -701,16 +701,19 @@ carves `state/ag2-mcp.d/` out even then.
 A proxy that resolves vault lanes needs no copy. The desktop host says so by setting
 `AG2_MCP_LANE_CREDENTIAL` (a JSON argv ending in `lane-mcp-credential`) in the env of the MCP
 client entry that names the main descriptor, in the Claude Code MCP config or the Codex
-`config.toml` (or in the sync's own environment). With it, a row whose token
-`connection_credential` finds with no environment (the vault, as the proxy runs the resolver with a
-stripped one) gets a descriptor whose `env_file` is `(vault)`, and its `conn-<instance>.env` is
-removed after the descriptor is rewritten. Without it, or for a token only the environment holds,
-the env file stays the default. An entry whose value is not a JSON array of non-empty strings
+`config.toml` (or in the sync's own environment). With it, a row whose token, as
+`connection_credential` resolves it, is the one the vault holds gets a descriptor whose `env_file`
+is `(vault)`, and its `conn-<instance>.env` is removed after the descriptor is rewritten. Without
+it, or when the environment or a channel file holds a token the vault does not, the env file stays
+the default. The setting says the desktop shipped a proxy that reads `(vault)`; a proxy process
+started before that update keeps the old reader until its client restarts it. An entry whose value is not a JSON array of non-empty strings
 counts as unset, as it does for the proxy.
 
 The proxy runs that argv plus `--lane <lane>` (`scripts/connections.py --workspace <ws>
 lane-mcp-credential --lane <lane>`, `connections.lane_mcp_credential`). On success it exits 0 and
-prints one line to stdout, nothing on stderr:
+prints one line to stdout, nothing on stderr. It reads the token from the vault alone (by the row's
+`token_ref`, on the row's own gateway host), never the environment or a channel file, so the
+proxy's stripped environment cannot make it answer differently from what the sync checked:
 
 ```json
 {"bearer": "<secret half of the row's token>", "lane": "<lane>", "relay": "<the token's gateway, no trailing slash>"}
@@ -720,12 +723,15 @@ The proxy accepts it only for the lane it asked about, a relay equal to the desc
 bearer whose sha256 is the descriptor's `bearer_digest`. Anything else exits 3 with one line on
 stderr, `lane-mcp-credential: refused, <reason>: <detail>`, which never holds the secret (the
 proxy logs that first line): `not_owner` (this user does not own the workspace), `unknown_lane`
-(no core row has that lane; a pool worker's identity and the primary are never one),
-`disabled`, `parked`, `not_engine_descriptor` (no `conn-<lane>.json` in the lanes dir that is a
-regular file of this user, writable by no one else, version 1, naming this lane, `(vault)` and the
-row's `token_ref`), `no_token`, and `descriptor_stale` (the row's current token is not the relay
+(no core row has that lane, or the main descriptor serves it: a pool worker's identity and the
+primary lane are never one, and with no readable main descriptor, found as the sync finds it,
+no lane is answered), `disabled`, `parked`, `not_engine_descriptor` (no `conn-<lane>.json` in the
+lanes dir that, opened once without following a symlink, is a regular file of this user, writable
+by no one else, at most 64 KiB, version 1, naming this lane, `(vault)` and the row's
+`token_ref`), `no_token` (the vault holds none), and `descriptor_stale` (the row's current token is not the relay
 and digest the descriptor was written for, until the next sync rewrites it). Argument errors exit
-2. The primary lane never reads the vault: the proxy refuses a primary descriptor naming `(vault)`.
+2. The primary lane never reads the vault: the resolver refuses it as `unknown_lane`, and the proxy
+refuses a primary descriptor naming `(vault)`.
 
 ### A worker's agent as a declared Sparrow bridge
 

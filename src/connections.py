@@ -4346,12 +4346,24 @@ def _lane_relay(url: str) -> str:
     return (url or "").strip().rstrip("/")
 
 
+def _lane_relay_secret(row: Mapping[str, object], token: str) -> "tuple[str, str]":
+    """(relay, secret) a lane descriptor and the lane resolver both state for `row`'s `token`."""
+    relay = _lane_relay(gateway_url_of(token) or str(row["gateway_url"]))
+    return relay, secret_of(token) if gateway_url_of(token) else token.strip()
+
+
+def _main_serves(row: Mapping[str, object], main: Mapping[str, object]) -> bool:
+    """Whether the main descriptor already serves `row` (by server or relay), so it gets no lane."""
+    served = {s for s in (str(main.get("server") or "").lower(), server_of_mxid(str(main.get("agent_id") or ""))) if s}
+    main_relay = _lane_relay(str(main.get("relay") or ""))
+    return bool(_row_servers(row) & served) or bool(main_relay and _lane_relay(str(row["gateway_url"])) == main_relay)
+
+
 def _mcp_lane(row: Mapping[str, object], token: str, main: Mapping[str, object], env_file: Path,
               space_of=None) -> "tuple[Optional[dict], str]":
     """(descriptor, '') for one row, or (None, reason). Endpoints are never invented: MCP from the
     row server's DotSpace, mint at the main descriptor's mint path on the row's own relay origin."""
-    relay = _lane_relay(gateway_url_of(token) or str(row["gateway_url"]))
-    secret = secret_of(token) if gateway_url_of(token) else token.strip()
+    relay, secret = _lane_relay_secret(row, token)
     mxid = str(row.get("agent_mxid") or "").strip()
     server = server_of_mxid(mxid) or str(row["server"]).lower()
     space = _space(server, space_of)
@@ -4429,15 +4441,13 @@ def sync_mcp_lanes(workspace: Optional[Path] = None, *, environ: Optional[Mappin
         return out
     main, main_path = found
     vault_lanes = _proxy_reads_vault_lanes(main_path, environ, mcp_config, codex_config)
-    served = {s for s in (str(main.get("server") or "").lower(), server_of_mxid(str(main.get("agent_id") or ""))) if s}
-    main_relay = _lane_relay(str(main.get("relay") or ""))
     want = set()
     lock = _workspace(workspace) / "state" / f"{MCP_LANES_DIR_NAME}.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
     with locked_file(lock, create_mode=0o600):
         for row in _core_rows(enabled_rows(workspace)):
             slug = mcp_lane_slug(str(row["instance"]))
-            if _row_servers(row) & served or (main_relay and _lane_relay(str(row["gateway_url"])) == main_relay):
+            if _main_serves(row, main):
                 continue
             try:
                 _, token = connection_credential(row, environ, vault=vault)
@@ -4489,14 +4499,20 @@ def sync_mcp_lanes(workspace: Optional[Path] = None, *, environ: Optional[Mappin
     return out
 
 
-def _resolvable_offline(row: Mapping[str, object], token: str, vault) -> bool:
-    """Whether `lane_mcp_credential`, run by the proxy with a stripped environment, finds this token:
-    the vault holds it and nothing the resolver reads first holds another."""
+def _vault_lane_token(row: Mapping[str, object], vault) -> str:
+    """The row's token from the vault alone, as `url|secret` on the row's own gateway host; '' if none.
+    The lane resolver reads nothing else, so no environment or channel file can make it disagree."""
     try:
-        held = row_token(row, _vault_get(_vault(vault), str(row["token_ref"])))
-        return held == token and connection_credential(row, {}, vault=vault)[1] == token
+        tok = row_token(row, _vault_get(_vault(vault), str(row["token_ref"])))
     except ConnectionsError:
-        return False
+        return ""
+    return tok if tok and host_of_url(gateway_url_of(tok)) == host_of_url(str(row["gateway_url"])) else ""
+
+
+def _resolvable_offline(row: Mapping[str, object], token: str, vault) -> bool:
+    """Whether the lane resolver answers the token the sync resolved (`connection_credential`, which reads
+    the environment and channel files ahead of the vault): only when the vault holds that same token."""
+    return bool(token) and _vault_lane_token(row, vault) == token
 
 
 class NoLaneCredential(ConnectionsError):
@@ -4511,24 +4527,47 @@ LANE_CREDENTIAL_REASONS = ("not_owner", "unknown_lane", "disabled", "parked", "n
                            "no_token", "descriptor_stale")
 
 
+LANE_DESCRIPTOR_MAX_BYTES = 64 * 1024
+
+
 def _engine_lane_descriptor(path: Path) -> Optional[dict]:
-    """The lane descriptor at `path` when it is a regular file of this user that no other user may write."""
+    """The lane descriptor at `path` when it is a regular file of this user that no other user may write,
+    at most LANE_DESCRIPTOR_MAX_BYTES. One no-follow open: the checks and the read are of the same file."""
     try:
-        st = os.lstat(path)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022 \
+                or st.st_size > LANE_DESCRIPTOR_MAX_BYTES:
             return None
-        desc = json.loads(path.read_text(encoding="utf-8"))
+        chunks, size = [], 0
+        while size <= LANE_DESCRIPTOR_MAX_BYTES:
+            chunk = os.read(fd, LANE_DESCRIPTOR_MAX_BYTES + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        if size > LANE_DESCRIPTOR_MAX_BYTES:
+            return None
+        desc = json.loads(b"".join(chunks).decode("utf-8"))
     except (OSError, ValueError):
         return None
+    finally:
+        os.close(fd)
     return desc if isinstance(desc, dict) and desc.get("version") == 1 else None
 
 
 def lane_mcp_credential(lane: str, *, workspace: Optional[Path] = None,
-                        environ: Optional[Mapping[str, str]] = None, vault=None) -> dict:
+                        environ: Optional[Mapping[str, str]] = None, vault=None,
+                        mcp_config: Optional[Path] = None, codex_config: Optional[Path] = None) -> dict:
     """`{lane, bearer, relay}` for the MCP proxy's `(vault)` lane `lane` (a `mcp_lane_slug`), `bearer` the
-    secret half of the row's token (`connection_credential`), `relay` its gateway. Refused with
-    NoLaneCredential unless this user owns the workspace, `lane` is an enabled core row, and its
-    `conn-<lane>.json` is a `(vault)` descriptor this user wrote for that row, its relay and its secret."""
+    secret half of the row's vault token (`_vault_lane_token`), `relay` its gateway. Refused with
+    NoLaneCredential unless this user owns the workspace, `lane` is an enabled core row the main
+    descriptor does not serve (the primary lane is `unknown_lane`), and its `conn-<lane>.json` is a
+    `(vault)` descriptor this user wrote for that row, its relay and its secret."""
+    environ = os.environ if environ is None else environ
     ws = _workspace(workspace)
     try:
         owner = ws.stat().st_uid
@@ -4538,8 +4577,9 @@ def lane_mcp_credential(lane: str, *, workspace: Optional[Path] = None,
         raise NoLaneCredential("not_owner", "this user does not own the workspace")
     row = next((r for r in _core_rows(read_rows(ws)) if mcp_lane_slug(str(r["instance"])) == lane), None) \
         if isinstance(lane, str) and lane else None
-    if row is None:
-        raise NoLaneCredential("unknown_lane", "no core connection has this lane")
+    found = _main_mcp_descriptor(ws, environ, mcp_config, None, codex_config) if row is not None else None
+    if row is None or found is None or _main_serves(row, found[0]):
+        raise NoLaneCredential("unknown_lane", "no extra core connection has this lane")
     if row.get("disabled") or row.get("parked"):
         reason = "disabled" if row.get("disabled") else "parked"
         raise NoLaneCredential(reason, f"connection {lane} is {reason}")
@@ -4547,12 +4587,10 @@ def lane_mcp_credential(lane: str, *, workspace: Optional[Path] = None,
     if desc is None or desc.get("lane") != lane or desc.get("env_file") != MCP_VAULT_ENV_FILE \
             or desc.get("env_key") != str(row["token_ref"]):
         raise NoLaneCredential("not_engine_descriptor", f"lane {lane} has no vault descriptor of this engine")
-    try:
-        gateway_url, token = connection_credential(row, environ, vault=vault)
-    except ConnectionsError:
-        raise NoLaneCredential("no_token", f"connection {lane} has no token") from None
-    relay = _lane_relay(gateway_url_of(token) or gateway_url)
-    secret = secret_of(token) if gateway_url_of(token) else token.strip()
+    token = _vault_lane_token(row, vault)
+    if not token:
+        raise NoLaneCredential("no_token", f"connection {lane} has no token in the vault")
+    relay, secret = _lane_relay_secret(row, token)
     if not secret or _lane_relay(str(desc.get("relay") or "")) != relay \
             or desc.get("bearer_digest") != hashlib.sha256(secret.encode()).hexdigest():
         raise NoLaneCredential("descriptor_stale", f"lane {lane}'s descriptor was written for another credential")
