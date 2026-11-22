@@ -13,6 +13,7 @@ content blocks, and a read-only copy of every file in a folder of its own.
 from __future__ import annotations
 
 import base64
+import collections
 import contextlib
 import dataclasses
 import json
@@ -175,6 +176,22 @@ def under(root, raw):
     return p is not None and (p == r or p.startswith(r.rstrip(os.sep) + os.sep))
 
 
+ACTION_CATEGORIES = {"read": "file read", "edit": "file change", "delete": "file change", "move": "file change",
+                     "fetch": "web fetch"}
+
+
+def action_category(params):
+    """A fixed name for what a permission request asks to do ("command", "file read", "file change", "web fetch"
+    or "other"), from the request's kind and whether it carries a command. Never any text the agent wrote, so it
+    may be shown in a room."""
+    tool_call = params.get("toolCall") if isinstance(params.get("toolCall"), dict) else {}
+    raw = tool_call.get("rawInput")
+    if tool_call.get("kind") == "execute" or (isinstance(raw, dict) and "command" in raw):
+        return "command"
+    kind = tool_call.get("kind")
+    return ACTION_CATEGORIES.get(kind, "other") if isinstance(kind, str) else "other"
+
+
 def decide_permission(params, owner, cwd, command_ok=None, own_file=None, command_refused="no command is granted",
                       command_granted="", own_file_reason="", read_only=()):
     """(allowed, reason, result). Default deny. Granted: a command `command_ok(command)` accepts (rawInput holding
@@ -332,34 +349,52 @@ def _read_attachment(path):
         os.close(fd)
 
 
+def _write_copy(path, data):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o400)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+
+
 @contextlib.contextmanager
 def task_media(headers, readable):
     """The task's own attachments (its attested `attachments:` header, as the bridge stamps the files it
     downloaded for this message) as a `Media`: each image of a known type and at most MAX_IMAGE_BYTES as an
     image block; with `readable`, a read-only copy of every file in a new 0500 folder of this turn's own,
-    removed after the turn. No other task's files are copied, and the originals are never named to the agent."""
+    removed after the turn. No other task's files are copied, and the originals are never named to the agent.
+    An attachment that cannot be used (unreadable, too large, not a regular file, its copy not written) is
+    left out on its own; the others still go with the turn."""
     files, images, folder = [], [], None
     refs = parse_attachments(headers)[:MAX_MEDIA_FILES]
     try:
         if refs and readable:
-            folder = os.path.realpath(tempfile.mkdtemp(prefix=MEDIA_PREFIX))
+            try:
+                folder = os.path.realpath(tempfile.mkdtemp(prefix=MEDIA_PREFIX))
+            except OSError:
+                folder = None   # no folder: the images still go, the files are said not readable
         used = set()
         for ref in refs:
             data = _read_attachment(ref.locator)
             if data is None:
                 continue
-            name = _SAFE_NAME_RE.sub("_", os.path.basename(ref.filename or ref.locator))[:120].lstrip(".") \
+            base = _SAFE_NAME_RE.sub("_", os.path.basename(ref.filename or ref.locator))[:120].lstrip(".") \
                 or "attachment"
-            if name in used:
-                name = "%d-%s" % (len(used) + 1, name)
-            used.add(name)
+            name, n = base, 1
+            while name in used:   # a sender's own names may already hold "2-a.png": take the first free one
+                n += 1
+                name = "%d-%s" % (n, base)
             sniffed = image_mime(data)
             copy = None
             if folder:
                 copy = os.path.join(folder, name)
-                fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o400)
-                with os.fdopen(fd, "wb") as f:
-                    f.write(data)
+                try:
+                    _write_copy(copy, data)
+                except FileExistsError:
+                    continue   # never ours to remove
+                except OSError:
+                    with contextlib.suppress(OSError):
+                        os.unlink(copy)
+                    continue   # this attachment is dropped; the others and the turn go on
+            used.add(name)
             files.append((name, sniffed or ref.mime, len(data), copy))
             if sniffed and len(data) <= MAX_IMAGE_BYTES:
                 images.append({"type": "image", "mimeType": sniffed, "data": base64.b64encode(data).decode("ascii"),
@@ -441,18 +476,24 @@ def task_framing(task_id, headers, message, operator_lines, post_with, note=NON_
 # ── one turn ─────────────────────────────────────────────────────────────────
 
 class Turn:
-    """Collects the agent's message text and the permission decisions of one prompt."""
+    """Collects the agent's message text and the permission decisions of one prompt, and counts its
+    `session/update`s by type (`updates`), so a turn that ends with no text shows what it did instead."""
 
     def __init__(self):
         self.live = False
         self.chunks = []
         self.decisions = []
+        self.updates = collections.Counter()
         self.lock = threading.Lock()
 
     def on_update(self, params):
         update = params.get("update") if isinstance(params.get("update"), dict) else {}
-        if not self.live or update.get("sessionUpdate") != "agent_message_chunk":
+        if not self.live:
             return  # before the prompt, a session/load replays history: never this turn's answer
+        with self.lock:
+            self.updates[str(update.get("sessionUpdate"))[:60]] += 1
+        if update.get("sessionUpdate") != "agent_message_chunk":
+            return
         content = update.get("content")
         if isinstance(content, dict) and content.get("type") == "text":
             with self.lock:
@@ -504,7 +545,8 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
     def on_permission(params):
         ok, why, result = decide(params)
         title = (params.get("toolCall") or {}).get("title") if isinstance(params.get("toolCall"), dict) else None
-        turn.decisions.append({"title": str(title or "")[:120], "allowed": ok, "reason": why})
+        turn.decisions.append({"title": str(title or "")[:120], "allowed": ok, "reason": why,
+                               "category": action_category(params)})
         return result
 
     try:
