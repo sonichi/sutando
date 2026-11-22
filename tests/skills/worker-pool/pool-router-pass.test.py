@@ -92,15 +92,6 @@ class TestResolution(Base):
         got = rt.route(self.ws, self.task(requested_worker=W2), r)
         self.assertEqual(got["delivered"], [W2])
 
-    @unittest.skip("fan-out bindings are refused by compile_roster on main; never exercised live")
-
-    def test_a_set_delivers_one_sentinel_per_member(self):
-        r = self.roster({W1: {"state": "live"}, W2: {"state": "live"}}, {SRC: [W1, W2]})
-        got = rt.route(self.ws, self.task(), r)
-        self.assertEqual(sorted(got["delivered"]), sorted([W1, W2]))
-        for w in (W1, W2):
-            self.assertTrue((self.ws / "deliveries" / w / "task-1.txt").exists())
-
 
 class TestNeverSubstitutes(Base):
     def test_an_unknown_target_goes_to_the_core_not_another_worker(self):
@@ -120,16 +111,6 @@ class TestNeverSubstitutes(Base):
         got = rt.route(self.ws, self.task(), r)
         self.assertEqual(got["delivered"], [W1])
         self.assertFalse((self.ws / "deliveries" / "core").exists())
-
-    @unittest.skip("fan-out bindings are refused by compile_roster on main; never exercised live")
-
-    def test_every_member_of_a_set_is_delivered_to(self):
-        r = self.roster({W1: {"state": "live"}, W2: {"state": "abandoned"}},
-                        {SRC: [W1, W2]})
-        got = rt.route(self.ws, self.task(), r)
-        self.assertEqual(sorted(got["delivered"]), sorted([W1, W2]))
-        for w in (W1, W2):
-            self.assertTrue((self.ws / "deliveries" / w / "task-1.txt").exists())
 
 
 class TestDoubleDelivery(Base):
@@ -249,17 +230,6 @@ class TestPayloadGuard(Base):
         out = rt.route(self.ws, t, r)
         self.assertEqual(out["skipped"], [W1])
         self.assertIsNone(pd.find(self.ws, W1, "task-done"))
-
-    @unittest.skip("fan-out bindings are refused by compile_roster on main; never exercised live")
-
-    def test_a_set_skips_only_the_missing_payload_not_the_members(self):
-        # One payload serves every member, so the guard is per-task: either all
-        # members are skipped or none are.
-        r = self.roster({W1: {"state": "live"}, W2: {"state": "live"}},
-                        {SRC: [W1, W2]})
-        out = rt.route(self.ws, self.task("task-ghost", payload=False), r)
-        self.assertEqual(sorted(out["skipped"]), sorted([W1, W2]))
-        self.assertEqual(out["delivered"], [])
 
     def test_the_ordinary_path_still_delivers(self):
         r = self.roster()
