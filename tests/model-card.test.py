@@ -432,7 +432,10 @@ class Attempts(Base):
         self.using("opus")
         self.assertEqual(self.run_(["post", "--room", DM])[0], 0)
 
-    def settle(self, attempt, rc=8, alias="fable"):
+    def settle(self, attempt, rc=8, alias="fable", accepted=True):
+        """The detached step's `settle` for `attempt`, which a tap accepted (recorded) before it."""
+        if accepted and not any(r["attempt"] == attempt for r in mc.outcomes(self.ws)):
+            mc.save_outcome(self.ws, attempt, DM, alias, None, mc.time.time())
         return self.run_(["settle", "--room", DM, "--model", alias, "--rc", str(rc), "--attempt", attempt])
 
     def failing(self, times):
@@ -610,13 +613,29 @@ class Attempts(Base):
         import file_lock
         sent = len(self.fake.calls)
         with mock.patch.object(file_lock, "locked_file", side_effect=PermissionError("read-only")):
-            rc, out = self.settle("17-ab", 0)
+            rc, out = self.settle("17-ab", 0, accepted=False)
             self.assertEqual((rc, out), (1, {
                 "status": "failed", "attempt": "17-ab", "outcome": "done", "say": "Switched. I'm now using Fable.",
                 "saved": False, "why": "the outcome could not be saved, so its card was not posted (PermissionError)"}))
             self.assertEqual(mc.tell(self.ws, "17-ab", core=CORE, execute=self.fake.execute, now=1.0),
                              {"status": "failed", "why": "the outcome record could not be used (PermissionError)"})
         self.assertEqual((len(self.fake.calls), self.sleeps), (sent, []), "the newer attempt's card is left as it is")
+
+    def test_an_attempt_the_record_dropped_before_settle_adds_no_row_and_posts_no_card(self):
+        """Only accepting a tap adds an attempt. One whose row is gone by the time its switch ends (the
+        record trimmed it, or `turn` skipped it and it was evicted) is not put back as the newest."""
+        mc.save_outcome(self.ws, "17-ab", DM, "fable", None, mc.time.time())
+        mc.save_outcome(self.ws, "18-cd", DM, "sonnet", None, mc.time.time())
+        path = self.ws.joinpath(*mc.OUTCOMES)
+        rows = [r for r in json.loads(path.read_text())["outcomes"] if r["attempt"] != "17-ab"]
+        path.write_text(json.dumps({"outcomes": rows}))
+        sent = len(self.fake.calls)
+        for code in (mc.SKIPPED_RC, 8, 0):
+            rc, out = self.settle("17-ab", code, accepted=False)
+            self.assertEqual((rc, out), (1, {"status": "skipped", "attempt": "17-ab", "why": mc.NOT_RECORDED}), code)
+        self.assertEqual(([r["attempt"] for r in mc.outcomes(self.ws)], len(self.fake.calls)), (["18-cd"], sent))
+        # The newer attempt, still in the record, is told as usual.
+        self.assertEqual((self.settle("18-cd", 0, alias="sonnet")[1]["status"], len(self.fake.calls)), ("posted", sent + 1))
 
     def test_settle_without_an_attempt_id_makes_one(self):
         rc, out = self.run_(["settle", "--room", DM, "--model", "fable", "--rc", "0"])

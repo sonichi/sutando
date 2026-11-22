@@ -97,6 +97,7 @@ DETACHED = ('"$5" "$6" --workspace "$7" turn --attempt "$9" -- '
 TURN_LOCK = ("state", "model-card-turn.lock")
 SKIPPED_RC = 75      # `turn` did not run the switch: a newer attempt had been accepted
 UNKNOWN_RC = 76      # `turn` did not run the switch: the record does not name the attempt
+NOT_RECORDED = "the attempt is not in the record, so no card is posted for it"
 
 
 def _emit(payload: dict, code: int = 0) -> int:
@@ -297,11 +298,15 @@ def _outcome_book(ws: Path, now: float):
         write_whole(path, {"outcomes": rows[-OUTCOMES_KEPT:]})
 
 
-def save_outcome(ws: Path, attempt: str, room: str, alias: str, rc: Optional[int], now: float) -> dict:
-    """The record of `attempt`, added as started when it is new; its outcome is written from `rc` once,
-    and not at all for `rc` None (the attempt has only begun)."""
+def save_outcome(ws: Path, attempt: str, room: str, alias: str, rc: Optional[int], now: float,
+                 add: bool = True) -> Optional[dict]:
+    """The record of `attempt`; its outcome is written from `rc` once, and not at all for `rc` None (the
+    attempt has only begun). A new attempt is added as started, which is what accepting a tap does;
+    with `add` False (finishing one) an attempt the record does not name stays out of it: None."""
     with _outcome_book(ws, now) as rows:
         row = next((r for r in rows if r["attempt"] == attempt), None)
+        if row is None and not add:
+            return None
         if row is None:
             row = {"attempt": attempt, "room": room, "model": alias, "state": "started", "words": "",
                    "told": False, "ts": now}
@@ -352,16 +357,19 @@ def deliver_owed(ws: Path, *, core=None, execute=None, now: float) -> list:
 
 
 def settle_attempt(ws: Path, attempt: str, room: str, alias: str, rc: int, *, core=None, execute=None,
-                   now=time.time, sleep=time.sleep, tries: int = 1, pause: float = 0) -> dict:
+                   now=time.time, sleep=time.sleep, tries: int = 1, pause: float = 0, add: bool = False) -> dict:
     """Save the outcome of `attempt`, then post it, trying again after `pause` up to `tries` times. One
-    superseded meanwhile is not posted. Nor is one that cannot be saved: without the record nothing
+    superseded meanwhile is not posted. Nor is one that cannot be saved, or that the record no longer
+    names (only accepting a tap adds an attempt, `add` aside): without its place in the record nothing
     shows whether a newer attempt came after it, and its card would replace that attempt's."""
     try:
-        row = save_outcome(ws, attempt, room, alias, rc, now())
+        row = save_outcome(ws, attempt, room, alias, rc, now(), add=add)
     except OSError as e:
         state, words = outcome(ws, alias, rc)
         return {"status": "failed", "attempt": attempt, "outcome": state, "say": words, "saved": False,
                 "why": f"the outcome could not be saved, so its card was not posted ({type(e).__name__})"}
+    if row is None:
+        return {"status": "skipped", "attempt": attempt, "why": NOT_RECORDED}
     out = tell(ws, attempt, core=core, execute=execute, now=now())
     for _ in range(max(tries, 1) - 1):
         if out["status"] != "failed":
@@ -446,6 +454,7 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
         pid = start_switch(ws, alias, room, attempt, popen)
     except OSError as e:
         told = settle_attempt(ws, attempt, room, alias, -1, core=core or None, execute=execute, now=now)
+        told.setdefault("say", outcome(ws, alias, -1)[1])
         return _emit({"status": "failed", "attempt": attempt, "say": told["say"], **extra,
                       "why": f"the switch could not be started ({type(e).__name__}: {e})"}, 1)
     out = {"status": "started", "model": alias, "attempt": attempt, "pid": pid, "say": say, **extra}
@@ -480,11 +489,13 @@ def cmd_turn(ws: Path, args, *, call=subprocess.call) -> int:
 def cmd_settle(ws: Path, args, *, core=None, execute=None, now=time.time, sleep=time.sleep) -> int:
     if args.rc == UNKNOWN_RC:
         # Settling would add the attempt to the record as the newest one, and post over a newer card.
-        return _emit({"status": "skipped", "attempt": args.attempt, "why": "the attempt is not in the record, so its "
-                      "switch was not run and no card is posted"}, 1)
+        return _emit({"status": "skipped", "attempt": args.attempt, "why": NOT_RECORDED}, 1)
+    # With no --attempt this is a settle by hand: a new attempt of its own. One that names an attempt
+    # only finishes it, and never adds it.
     out = settle_attempt(ws, args.attempt or new_attempt(now()), args.room, args.model, args.rc, core=core,
-                         execute=execute, now=now, sleep=sleep, tries=SETTLE_TRIES, pause=SETTLE_PAUSE_S)
-    return _emit(out, 1 if out["status"] == "failed" else 0)
+                         execute=execute, now=now, sleep=sleep, tries=SETTLE_TRIES, pause=SETTLE_PAUSE_S,
+                         add=not args.attempt)
+    return _emit(out, 1 if out["status"] in ("failed", "skipped") else 0)
 
 
 def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, sleep=time.sleep) -> int:
