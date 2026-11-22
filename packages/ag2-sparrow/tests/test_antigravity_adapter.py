@@ -949,7 +949,7 @@ class GatewayMediaMarkerTest(unittest.TestCase):
         class Relay(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 seen.append((self.path, self.headers.get("Authorization")))
-                if self.path.startswith("/relay/bounce"):
+                if self.path.startswith("/relay/v1/media/s.space/bounce"):
                     self.send_response(302)
                     self.send_header("Location", "http://169.254.169.254/latest/meta-data/")
                     self.end_headers()
@@ -1033,11 +1033,23 @@ class GatewayMediaMarkerTest(unittest.TestCase):
         self.assertEqual(self.seen, [])
 
     def test_a_relay_redirect_off_origin_is_not_followed(self):
-        body = "[ag2space-media: %s/bounce mime=text/plain name=a.txt] hi" % self.base
+        body = "[ag2space-media: %s/v1/media/s.space/bounce mime=text/plain name=a.txt] hi" % self.base
         out = self.fetch(body)
         self.assertEqual(out["body"], body)
         self.assertEqual(out["attachments"], "")
-        self.assertEqual([p for p, _ in self.seen], ["/relay/bounce"], "one GET, the redirect not followed")
+        self.assertEqual([p for p, _ in self.seen], ["/relay/v1/media/s.space/bounce"],
+                         "one GET, the redirect not followed")
+
+    def test_a_marker_off_the_gateway_media_route_is_never_fetched(self):
+        # The relay's bearer goes only to <base>/v1/media/<server>/<id>; the fake relay sees no request at all.
+        for path in ("/v1/tasks", "/v1/agents", "/v1/media/../tasks", "/v1/media/%2e%2e/tasks",
+                     "/v1/media/%252e%252e/tasks", "/v1/media/s.space/a%2fb", "/v1/media/s.space/id?room_id=x&sig=y"):
+            with self.subTest(path):
+                body = "[ag2space-media: %s%s mime=text/plain name=a.txt] hi" % (self.base, path)
+                out = self.fetch(body)
+                self.assertEqual(out["body"], body)
+                self.assertEqual(out["attachments"], "")
+        self.assertEqual(self.seen, [])
 
 
 def stat_mode(path):
