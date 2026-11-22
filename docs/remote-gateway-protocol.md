@@ -729,11 +729,12 @@ Instead of raw bytes, a gateway may hand the task body a media marker:
 The client resolves it locally: downloads the bytes (default 25 MB cap) and
 rewrites the marker to `[File attached: <local path>]` (`[Photo attached: …]`
 for `kind=m.image`) — the same inbound convention the other bridges use. Every
-marker in the body is resolved, up to 10 per task; any failure leaves that marker
-untouched.
+marker in the body is resolved, up to 10 attempts per task (a failed fetch counts);
+any failure leaves that marker untouched.
 
 A marker inside the broker's quoted reply-context record is the replied-to
-message's media. It is fetched the same way (same cap, routing and directory) and
+message's media; only the record's `body` is scanned, never its other fields or the
+room-metadata block. It is fetched the same way (same cap, routing and directory) and
 rewritten in place, JSON-escaped so the record stays well-formed quoted data, to
 `[Photo attached (from replied-to message): <local path>]` (`[File attached (from
 replied-to message): …]` otherwise). Its file is listed in `attachments:` after the

@@ -6138,20 +6138,12 @@ def _fetch_media_marker(inner: str) -> "tuple[str, Path, object] | None":
     return ("Photo attached" if str(kind) == "m.image" else "File attached"), path, ref
 
 
-def _json_string_text(raw: str) -> str:
-    """The text a run of JSON string content encodes (`\\/` → `/`); raw when it is not one."""
-    try:
-        return json.loads(f'"{raw}"')
-    except ValueError:
-        return raw
-
-
 def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
     """Download every media marker in `body` (up to MAX_MEDIA_PER_TASK) to a local
     file and rewrite each to `[File attached: <path>]` (`[Photo attached: …]` for an
     image). A marker inside the broker's quoted reply-context record is the replied-to
     message's: it is fetched the same way, rewritten in place to
-    `[… attached (from replied-to message): <path>]` (JSON-escaped, so the record stays
+    `[… attached (from replied-to message): <path>]` (the record re-encoded, so it stays
     well-formed quoted data) and listed after the message's own. A marker that cannot
     be fetched is left as it was (drop-in safe).
 
@@ -6160,31 +6152,36 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
     structured `attachments:` headers alongside the legacy body lines."""
     if not body or not MEDIA_MARKER_RE.search(body):
         return body
-    reply, rest = local_task_protocol.split_reply_context(body)
-    split = len(body) - len(rest) if reply is not None else 0
+    # Only the message itself and the quoted record's `body` are scanned; every other
+    # quoted field stays inert. Each attempt, failed or not, spends one budget slot.
+    tail_at, reply = local_task_protocol.quoted_block_spans(body)
     budget = [MAX_MEDIA_PER_TASK]
 
     def resolve(segment: str, quoted: bool, refs: list) -> str:
         def one(m: "re.Match") -> str:
             if budget[0] <= 0:
                 return m.group(0)
-            got = _fetch_media_marker(_json_string_text(m.group(1)) if quoted else m.group(1))
+            budget[0] -= 1
+            got = _fetch_media_marker(m.group(1))
             if got is None:
                 return m.group(0)
-            budget[0] -= 1
             label, path, ref = got
             refs.append(ref)
-            if quoted:
-                return json.dumps(f"[{label} (from replied-to message): {path}]")[1:-1]
-            return f"[{label}: {path}]"
+            return f"[{label} (from replied-to message): {path}]" if quoted else f"[{label}: {path}]"
         # Replacement as a FUNCTION so backslashes/`\g<>` in the path can never be
         # interpreted as re.sub group references.
         return MEDIA_MARKER_RE.sub(one, segment)
 
     own_refs: list = []
     replied_refs: list = []
-    tail = resolve(body[split:], False, own_refs)      # the message's own first
-    head = resolve(body[:split], True, replied_refs)
+    tail = resolve(body[tail_at:], False, own_refs)    # the message's own first
+    head = body[:tail_at]
+    if reply is not None:
+        start, end, record, _label = reply
+        quoted = resolve(record["body"], True, replied_refs)
+        if quoted != record["body"]:
+            record = {**record, "body": quoted}
+            head = body[:start] + json.dumps(record, ensure_ascii=False) + body[end:tail_at]
     if _refs_out is not None:
         _refs_out.extend(own_refs + replied_refs)
     return head + tail
