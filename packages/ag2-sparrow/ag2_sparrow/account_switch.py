@@ -71,7 +71,7 @@ class AccountSwitch:
         """Record the sign-in in progress (`{}` for none); the results still to be told are kept as they
         are unless `owed` is given."""
         owed = self.owed() if owed is None else owed
-        state = dict(attempt, **({"owed": owed[-OWED_KEEP:]} if owed else {}))
+        state = dict(attempt, **({"owed": owed} if owed else {}))
         path = os.path.join(self.state_dir, FILE)
         with open(path + ".tmp", "w", encoding="utf-8") as f:
             json.dump(state, f, sort_keys=True)
@@ -163,24 +163,37 @@ class AccountSwitch:
     def last_word(self, waiting, state, text) -> bool:
         """A sign-in is over: it is no longer the one in progress, and its final card joins the results
         to be told, which are then posted oldest first. A new tap never removes one of them."""
-        self.keep({}, self.owed() + [{"room": waiting.get("room"), "state": state, "text": text,
-                                      "key": uuid.uuid4().hex, "at": time.time_ns()}])
+        owed = self.keyed(self.owed())
+        # Later than every result already owed: the bridge posts in the order of this moment.
+        at = max([time.time_ns()] + [int(o.get("at") or 0) + 1 for o in owed])
+        self.keep({}, owed + [{"room": waiting.get("room"), "state": state, "text": text,
+                               "key": uuid.uuid4().hex, "at": at}])
         return not self.tell()
+
+    @staticmethod
+    def keyed(owed: list) -> list:
+        """`owed` with a key, and a moment that keeps the saved order, on each result saved before
+        results had them."""
+        for o in owed:
+            if not o.get("key"):
+                o.update(key=uuid.uuid4().hex, at=max([time.time_ns()] + [int(x.get("at") or 0) + 1 for x in owed]))
+        return owed
 
     def tell(self) -> list:
         """Post the results still to be told, oldest first, stopping at the first that cannot be queued;
         what is left. Each is queued under the key saved with it, so one queued just before a stop,
-        and still on the saved list after the restart, is not a second card."""
+        and still on the saved list after the restart, is not a second card. Only what is still
+        undeliverable afterwards is capped, at the newest OWED_KEEP."""
         owed = self.owed()
         # A result saved before results had keys gets one now, and is saved with it before it is queued.
-        unkeyed = [o for o in owed if not o.get("key")]
-        for n, o in enumerate(unkeyed):
-            o.update(key=uuid.uuid4().hex, at=time.time_ns() + n)
-        if unkeyed:
-            self.keep(self.pending(), owed)
+        if any(not o.get("key") for o in owed):
+            self.keep(self.pending(), self.keyed(owed))
         while owed and self.post(owed[0].get("room"), self.card(str(owed[0].get("state")), str(owed[0].get("text"))),
                                  str(owed[0].get("key") or ""), int(owed[0].get("at") or 0)):
             owed.pop(0)
+            self.keep(self.pending(), owed)
+        if len(owed) > OWED_KEEP:
+            owed = owed[-OWED_KEEP:]
             self.keep(self.pending(), owed)
         return owed
 

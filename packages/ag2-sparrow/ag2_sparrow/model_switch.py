@@ -259,9 +259,10 @@ class ModelSwitch:
         if wanted and state.get("told") != wanted and live:
             ran = ran or ""
             outcome = "switched" if ran == wanted else "not-switched"
-            owed.append({"picked": wanted, "ran": ran, "room": state.get("asked_in"),
-                         "key": uuid.uuid4().hex, "at": time.time_ns()})
-            owed = owed[-UNTOLD_KEEP:]
+            # Later than every notice already owed: the bridge posts in the order of this moment. Saved
+            # whole: the cap is for what is still undeliverable after this turn's drain, below.
+            at = max([time.time_ns()] + [int(o.get("at") or 0) + 1 for o in owed])
+            owed.append({"picked": wanted, "ran": ran, "room": state.get("asked_in"), "key": uuid.uuid4().hex, "at": at})
             # Only a confirmed pick becomes the model in use: a model the runtime moved the turn to was never picked.
             self.save(untold=owed, told=wanted, **({"current": wanted, "confirmed": wanted} if outcome == "switched"
                                                    else {"wanted": ""}))

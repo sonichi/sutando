@@ -1071,6 +1071,31 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         # With nothing owed in words, the card alone answers.
         self.assertTrue(self.serve("task-3", "[[askaccount]] switch account").startswith("[no-send]"))
 
+    def test_an_old_result_and_a_new_one_post_in_the_order_they_ended_and_only_the_undeliverable_are_capped(self):
+        (self.work / "state").mkdir(parents=True, exist_ok=True)
+        c = self.connector()
+        outbox = self.bridge / "agent-cards" / "outbox"
+
+        def queued():
+            return [json.loads(p.read_text())["card"]["text"] for p in sorted(outbox.iterdir())]
+
+        # A result saved before results had keys, then a sign-in that ends at the same clock reading.
+        c.accounts.keep({"id": "login-1", "room": self.DM, "at": time.time()},
+                        [{"room": self.DM, "state": "error", "text": "The older result."}])
+        with mock.patch.object(account_switch.time, "time_ns", return_value=7):
+            self.assertEqual(c.accounts.finished("login-1", True), "account-switched")
+        self.assertEqual([t[:10] for t in queued()], ["The older ", "Signed in."], "the older card first")
+        self.assertEqual(c.accounts.owed(), [])
+        # A full backlog and one more: with the bridge back all are told; with it down the newest are kept.
+        backlog = [{"room": self.DM, "state": "error", "text": "Result %d." % n, "key": "k%d" % n, "at": 100 + n}
+                   for n in range(account_switch.OWED_KEEP + 1)]
+        c.accounts.keep({}, list(backlog))
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("bridge down")):
+            left = c.accounts.tell()
+        self.assertEqual([o["key"] for o in left], ["k%d" % n for n in range(1, account_switch.OWED_KEEP + 1)])
+        c.accounts.keep({}, list(backlog))
+        self.assertEqual((c.accounts.tell(), len(queued())), ([], 2 + account_switch.OWED_KEEP + 1))
+
     def test_a_final_card_that_could_not_be_posted_is_kept_and_posted_later(self):
         (self.home / "stub-login").write_text("success bob@example.org")
         self.serve("task-ask", "/account")
