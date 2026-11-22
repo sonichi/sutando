@@ -256,14 +256,27 @@ class TestPlainMessage(unittest.TestCase):
         self.assertEqual(lines[-1], "A chat reply can't answer it.")
 
     def test_the_s_space_fallback_names_no_card(self):
-        """On s.space the relay sends only when no card shows the block, so its text points
-        at the terminal alone."""
+        """On s.space the relay sends only when no card shows the block, so no text it sends
+        there names one, while each keeps its own remedy."""
+        limit = {"state": "blocked-human", "detail": "awaiting user: session-limit", "kind": "session-limit",
+                 "prompt": "You've hit your session limit · resets 12:10pm", "session": SESSION}
+        fable = {"state": "blocked-human", "detail": "awaiting user: fable-limit-unfocused",
+                 "kind": "fable-limit-unfocused", "session": SESSION,
+                 "prompt": "You've reached your Fable limit\n❯ Continue with Fable 5.1"}
+        login = {"state": "logged-out", "detail": "core not authenticated", "prompt": None,
+                 "kind": None, "session": SESSION}
+        cases = ((UNKNOWN, "A chat reply can't answer it."), (limit, "resumes on its own at 12:10pm"),
+                 (fable, "Pick the switch, or restart the core, in the Runtime panel"),
+                 (login, "run /login in the core terminal"))
         for backend in ({"socket": SOCKET, "session": SESSION}, None):
-            with patch.object(relay, "_derive_backend", lambda: backend):
-                msg = relay.compose_message(UNKNOWN, surface="ag2space")
-            self.assertNotIn("card", msg.lower(), backend)
-            self.assertNotIn("Restart core", msg, backend)
-            self.assertTrue(msg.endswith("A chat reply can't answer it."), backend)
+            for sig, remedy in cases:
+                with self.subTest(kind=sig["kind"], backend=bool(backend)), \
+                        patch.object(relay, "_derive_backend", lambda: backend):
+                    msg = relay.compose_message(sig, surface="ag2space")
+                    self.assertNotIn("card", msg.lower())
+                    self.assertNotIn("Restart core", msg)
+                    self.assertNotIn("tap ", msg.lower())
+                    self.assertIn(remedy, msg)
 
     def test_no_recorded_terminal_names_the_places_in_plain_words(self):
         msg = self._message(None)

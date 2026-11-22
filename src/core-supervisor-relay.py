@@ -127,18 +127,12 @@ def _is_refused_limit(signal: dict) -> bool:
 _RESET_AT = re.compile(r"resets?\s+(?:at\s+)?((?:[A-Z][a-z]{2}\s+\d{1,2}\s+at\s+)?\d{1,2}(?::\d{2})?\s*[ap]m)", re.I)
 
 
-# The core's own card carries these buttons (hitl.recovery); the notice names them, not commands.
-_CARD_WHERE = "on its card in your s.space DM"
 
-
-def _limit_remedy(signal: dict, surface: str = "") -> str:
-    """A usage-limit screen resumes by itself; a sign-in cannot clear it. The card is named
-    only on the surface it reaches."""
+def _limit_remedy(signal: dict) -> str:
+    """A usage-limit screen resumes by itself; a sign-in cannot clear it."""
     m = _RESET_AT.search(signal.get("prompt") or "")
     when = f"at {m.group(1)}" if m else "when the limit window resets"
-    how = (f"the buttons {_CARD_WHERE} switch it to another model or runtime, or restart it"
-           if _CARD_SURFACE.search(surface or "") else
-           "switch it to another model or runtime, or restart it, from the Runtime panel"
+    how = ("switch it to another model or runtime, or restart it, from the Runtime panel"
            f" on {_core_host_label() or 'the host'}")
     return (f" — the core hit its usage limit, not a login problem; it resumes"
             f" on its own {when}. Nothing to do unless you want it sooner: {how}; signing"
@@ -239,7 +233,8 @@ def _card_verdict(signal: dict, surface: str, card_store, signal_age) -> str:
 
 def compose_message(signal: dict, surface: str = "") -> str:
     """The owner-facing 'action needed' line: what's stuck + a prompt excerpt. `surface` is
-    the channel it goes to, which decides whether the core's own card can be named."""
+    accepted for callers; on s.space the relay sends only when no card shows the block, so
+    the text names no card anywhere."""
     aa = _soft_notice(signal)
     if aa and signal.get("state") not in HARD_ESCALATE and aa.get("kind") == "fable-limit-refused":
         who = f"worker {signal['seat']}" if signal.get("seat") else "the core"
@@ -280,24 +275,17 @@ def compose_message(signal: dict, surface: str = "") -> str:
         msg += (" — the core sits at its idle prompt but refuses every turn it is sent; each"
                 " ends in that line, so nothing queued for it runs")
     if limited:
-        msg += _limit_remedy(signal, surface)
+        msg += _limit_remedy(signal)
     elif signal.get("kind") == "fable-limit-unfocused":
         msg += (" — Claude Code's Fable weekly-limit dialog is up but the focused option is"
                 " not \"Switch to <fallback> and continue\", so the core will not press Enter"
-                " (that could spend credits)."
-                + (f" Tap Restart core {_CARD_WHERE}, or pick the switch in the Runtime panel."
-                   if _CARD_SURFACE.search(surface or "") else
-                   " Pick the switch, or restart the core, in the Runtime panel."))
+                " (that could spend credits). Pick the switch, or restart the core, in the Runtime panel.")
     elif signal.get("state") == "signal-unreadable":
         host = _core_host_label() or "the host"
         msg += (f" — check the core on {host}; restarting the engine rewrites the file."
                 " If the core looks fine, no action is needed.")
-    elif _is_login_class(signal) and _CARD_SURFACE.search(surface or ""):
-        host = _core_host_label() or "the host"
-        msg += (f" — the core needs to sign in again: tap Sign in {_CARD_WHERE}; the sign-in"
-                f" finishes in the s.space app on {host}. A chat reply can't resolve this.")
     elif _is_login_class(signal):
-        # No card reaches this surface, so the one remedy left is the sign-in on the host.
+        # Sent only where no card shows the block, so the one remedy left is the sign-in on the host.
         host = _core_host_label() or "the host"
         try:
             be = _derive_backend()

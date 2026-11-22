@@ -252,56 +252,43 @@ class TestComposeMessage(unittest.TestCase):
         self.assertIn("not authenticated", m)
         self.assertTrue(m.endswith("resolve this."))
 
-    # Login-class states (sonichi#2397): on s.space the remedy is the card's Sign in button, never a
-    # terminal command; a surface no card reaches names the sign-in on the host.
-    def test_logged_out_names_the_sign_in_button(self):
-        m = compose_message(_LOGGED_OUT, surface="ag2space")
-        self.assertIn("tap Sign in on its card", m)
-        self.assertNotIn("/login", m)
-        self.assertNotIn("reply here or open the app", m)
-
-    def test_login_prompt_names_the_sign_in_button(self):
-        m = compose_message(_LOGIN, surface="ag2space")
-        self.assertIn("tap Sign in on its card", m)
-        self.assertNotIn("run /login", m)
-        self.assertNotIn("reply here or open the app", m)
-
-    def test_a_surface_no_card_reaches_names_the_sign_in_on_the_host(self):
-        for surface in ("", "telegram", "discord", "macos"):
-            with self.subTest(surface=surface), _no_backend():
-                m = compose_message(_LOGGED_OUT, surface=surface)
-                self.assertNotIn("tap Sign in", m, "a card this surface never shows was named")
-                self.assertIn("run /login in the core terminal (the Runtime panel)", m)
-
-    # The card is named only on the surface it reaches; elsewhere the notice names the host.
+    # Login-class states (sonichi#2397): the relay sends only where no card shows the block, so
+    # every surface, s.space included, names the sign-in on the host and no card.
     _NO_CARD = ("", "telegram", "discord", "macos")
+    _ALL = ("ag2space",) + _NO_CARD
     _UNFOCUSED = {"state": "blocked-human", "detail": "awaiting user: fable-limit-unfocused",
                   "prompt": "You've reached your Fable limit\n❯ Continue with Fable 5.1",
                   "kind": "fable-limit-unfocused"}
     _UNKNOWN_GATE = {"state": "blocked-human", "detail": "awaiting user: unknown",
                      "prompt": "Something the CLI asks that no classifier knows", "kind": "unknown"}
 
-    def test_the_limit_notice_names_the_card_only_on_s_space(self):
-        self.assertIn("buttons on its card in your s.space DM", compose_message(_LIMIT, surface="ag2space"))
-        for surface in self._NO_CARD:
+    def test_every_surface_names_the_sign_in_on_the_host(self):
+        for sig in (_LOGGED_OUT, _LOGIN):
+            for surface in self._ALL:
+                with self.subTest(sig=sig["state"], surface=surface), _no_backend():
+                    m = compose_message(sig, surface=surface)
+                    self.assertNotIn("its card", m)
+                    self.assertIn("run /login in the core terminal (the Runtime panel)", m)
+                    self.assertNotIn("reply here or open the app", m)
+
+    def test_the_limit_notice_names_no_card(self):
+        for surface in self._ALL:
             with self.subTest(surface=surface):
                 m = compose_message(_LIMIT, surface=surface)
                 self.assertNotIn("its card", m)
                 self.assertIn("from the Runtime panel", m)
                 self.assertIn("switch it to another model or runtime", m)
 
-    def test_the_fable_notice_names_the_card_only_on_s_space(self):
-        self.assertIn("Tap Restart core on its card", compose_message(self._UNFOCUSED, surface="ag2space"))
-        for surface in self._NO_CARD:
+    def test_the_fable_notice_names_no_card(self):
+        for surface in self._ALL:
             with self.subTest(surface=surface):
                 m = compose_message(self._UNFOCUSED, surface=surface)
                 self.assertNotIn("its card", m)
-                self.assertIn("in the Runtime panel", m)
+                self.assertIn("Pick the switch, or restart the core, in the Runtime panel", m)
 
     def test_the_terminal_notice_names_no_card_on_any_surface(self):
-        # The relay sends this on s.space only when the core's card is not shown there.
         with _no_backend():
-            for surface in ("ag2space",) + self._NO_CARD:
+            for surface in self._ALL:
                 with self.subTest(surface=surface):
                     m = compose_message(self._UNKNOWN_GATE, surface=surface)
                     self.assertNotIn("its card", m)
@@ -351,10 +338,12 @@ class TestComposeMessage(unittest.TestCase):
 
     def test_turn_rejected_login_line_names_gui_login_remedy(self):
         sig = dict(_REFUSED, prompt="OAuth access token has expired · Please run /login")
-        m = compose_message(sig, surface="ag2space")
+        with _no_backend():
+            m = compose_message(sig, surface="ag2space")
         self.assertIn("refuses every turn", m)
         self.assertIn("OAuth access token has expired", m)
-        self.assertIn("tap Sign in on its card", m)
+        self.assertIn("run /login in the core terminal", m)
+        self.assertNotIn("its card", m)
         self.assertNotIn("usage limit", m)
 
     def test_turn_rejected_unknown_line_falls_back_to_the_terminal(self):
