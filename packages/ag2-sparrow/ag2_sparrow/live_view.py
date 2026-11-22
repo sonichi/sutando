@@ -7,7 +7,9 @@ what a turn is doing, as plain lines, to `<work>/state/live-view.log` (`Writer`)
 
 What is written is what the person would see in a terminal: who the turn is for, the agent's words
 as they arrive, each command, file change and tool call with its outcome, and how the turn ended.
-No header, token or environment value is written; text is cut to LINE_MAX a line. Writing is
+No header, token or environment value is written by this module, but a command line or the agent's
+words can carry whatever the agent put in them, as its terminal would show. Control characters are
+replaced by spaces, so the log cannot drive the viewer's terminal; text is cut to LINE_MAX a line. Writing is
 best-effort: a view that cannot be written never fails a turn. Stdlib only.
 """
 from __future__ import annotations
@@ -29,8 +31,14 @@ def path_of(work) -> str:
     return os.path.join(str(work), "state", NAME)
 
 
+# Control characters (C0, DEL, C1) and the Unicode line and paragraph separators: what a terminal acts on.
+_CONTROL = dict.fromkeys(list(range(0x20)) + list(range(0x7f, 0xa0)) + [0x2028, 0x2029], " ")
+
+
 def _one_line(text, limit=LINE_MAX) -> str:
-    flat = " ".join(str(text if text is not None else "").split())
+    """One printable line: every control character becomes a space, so nothing the agent or a sender
+    wrote can move the viewer's cursor, recolour or retitle their terminal, or start a new line."""
+    flat = " ".join(str(text if text is not None else "").translate(_CONTROL).split())
     return flat if len(flat) <= limit else flat[:limit - 1] + "…"
 
 

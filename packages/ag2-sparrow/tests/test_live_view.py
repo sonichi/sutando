@@ -57,6 +57,22 @@ class Writing(Base):
         self.assertLess(size, live_view.KEPT_TAIL + 100)
         self.assertEqual((self.lines()[0], self.lines()[-1]), ("old line", "newest"))
 
+    def test_nothing_written_can_drive_the_viewers_terminal(self):
+        """An escape sequence, a carriage return or a bell in the agent's words, a command or a sender's
+        message reaches the log as spaces: the view shows text, it never acts on it."""
+        nasty = "\x1b]0;title\x07\x1b[2J\x1b[31mred\r\x08over\x9b31m\u2028next\x00\x7f"
+        self.w.turn("Bob" + nasty, "hi" + nasty)
+        self.w.say("words " + nasty + "\nmore\n")
+        self.w.step("ran", "echo " + nasty, "exit " + nasty)
+        self.w.done("completed" + nasty)
+        raw = self.path.read_bytes()
+        text = raw.decode("utf-8")
+        for ch in text:
+            self.assertTrue(ch == "\n" or (ord(ch) >= 0x20 and not 0x7f <= ord(ch) < 0xa0 and ch not in "\u2028\u2029"),
+                            repr(ch))
+        self.assertIn("words ]0;title [2J [31mred over 31m next", text)
+        self.assertEqual(text.count("\n"), 7, "and it starts no line of its own")
+
     def test_a_view_that_cannot_be_written_never_raises(self):
         blocked = live_view.Writer(self.work / "a-file" / "state" / live_view.NAME)
         (self.work / "a-file").write_text("")
