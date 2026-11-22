@@ -216,7 +216,8 @@ def _card_verdict(signal: dict, surface: str, card_store, signal_age) -> str:
             sys.path.insert(0, here)
         from hitl import core_card
         state = signal.get("state") or ""
-        status = core_card.card_status(card_store, signal.get("session") or "", state)
+        status = core_card.card_status(card_store, signal.get("session") or "", state,
+                                       signal.get("kind"), signal.get("prompt"))
     except Exception:  # noqa: BLE001 - no card known for sure: send the alert
         return "send"
     if status == core_card.SHOWN:

@@ -4,7 +4,7 @@ it would post a second alert for the same block."""
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 #: The core states its monitor raises a blocked card for.
 CARD_STATES = frozenset({"blocked-human", "logged-out"})
@@ -13,18 +13,29 @@ SOURCE = "tui"
 SHOWN, PENDING, FAILED, NONE = "shown", "pending", "failed", "none"
 
 
-def card_status(store_root: Union[str, Path], session: str, state: str) -> str:
-    """For the core session `session` blocked in `state`: SHOWN (its card is on the owner's
-    surface), PENDING (raised, first projection still to land), FAILED (projection given up
-    on) or NONE (no card raised).
+def episode_guard(session: str, state: str, kind: Optional[str], prompt: Optional[str]) -> str:
+    """The guard the monitor's card for this block carries: a usage limit is one episode per
+    session, any other block is keyed on its dialog (tui_gate.requirement_for)."""
+    from delivery.pane_gate import is_usage_limit
+    from .tui_gate import guard_for, limit_guard
+    return limit_guard(session) if is_usage_limit(kind, prompt) else guard_for(session, prompt, state)
 
-    A pool seat's card (subject `seat`) and a policy-answered record are not the core's.
-    Any failure reads NONE.
+
+def card_status(store_root: Union[str, Path], session: str, state: str,
+                kind: Optional[str] = None, prompt: Optional[str] = None) -> str:
+    """For the core session `session` blocked in `state` on `prompt`: SHOWN (this block's card
+    is on the owner's surface), PENDING (raised, first projection still to land), FAILED
+    (projection given up on) or NONE (no card raised for this block).
+
+    Only a card raised for this episode counts, so one left from an earlier block of the same
+    session never stands in for a new one. A pool seat's card (subject `seat`) and a
+    policy-answered record are not the core's. Any failure reads NONE.
     """
     if state not in CARD_STATES or not session:
         return NONE
     try:
         from .manager import POLICY_DECIDER, HitlManager, HitlStore
+        guard = episode_guard(session, state, kind, prompt)
         root = Path(store_root)
         if not root.is_dir():
             return NONE
@@ -33,7 +44,8 @@ def card_status(store_root: Union[str, Path], session: str, state: str) -> str:
         for r in manager.active():
             subj = r.subject or {}
             if (subj.get("source") != SOURCE or subj.get("session") != session or subj.get("seat")
-                    or subj.get("supervisor_state") != state or r.decided_by == POLICY_DECIDER):
+                    or subj.get("supervisor_state") != state or r.guard != guard
+                    or r.decided_by == POLICY_DECIDER):
                 continue
             if manager.store.projection(r.id).get("revision", 0) > 0:
                 return SHOWN

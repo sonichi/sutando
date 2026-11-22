@@ -47,6 +47,11 @@ from hitl.manager import HitlManager, HitlStore  # noqa: E402
 SESSION = "sutando-core"
 UNKNOWN = {"state": "blocked-human", "detail": "awaiting user: unknown", "kind": "unknown",
            "prompt": "Do you want to proceed with the migration?", "session": SESSION}
+_EP = (UNKNOWN["kind"], UNKNOWN["prompt"])
+# A later block of the same session and state, on another dialog.
+NEXT = dict(UNKNOWN, prompt="Overwrite the existing build directory?")
+LIMIT = {"state": "blocked-human", "detail": "awaiting user: session-limit", "kind": "session-limit",
+         "prompt": "You've hit your session limit · resets 12:10pm", "session": SESSION}
 DM = "!dm:example.org"
 # The default socket lives under a path with a space in it.
 SOCKET = "/Users/someone/Library/Application Support/app/engine/sutando-tmux.sock"
@@ -104,27 +109,43 @@ class TestSharedPredicate(unittest.TestCase):
     def test_status_follows_the_cards_projection(self):
         with tempfile.TemporaryDirectory() as td:
             ws = _Workspace(td)
-            self.assertEqual(core_card.card_status(ws.store, SESSION, "blocked-human"), core_card.NONE)
+            self.assertEqual(core_card.card_status(ws.store, SESSION, "blocked-human", *_EP), core_card.NONE)
             req = ws.raise_card(UNKNOWN, projected=False)
-            self.assertEqual(core_card.card_status(ws.store, SESSION, "blocked-human"), core_card.PENDING)
+            self.assertEqual(core_card.card_status(ws.store, SESSION, "blocked-human", *_EP), core_card.PENDING)
             ws.manager.record_projection(req.id, req.revision, "$card")
-            self.assertEqual(core_card.card_status(ws.store, SESSION, "blocked-human"), core_card.SHOWN)
+            self.assertEqual(core_card.card_status(ws.store, SESSION, "blocked-human", *_EP), core_card.SHOWN)
             # Another session's card, or one for another state, is not this block's.
-            self.assertEqual(core_card.card_status(ws.store, "other-core", "blocked-human"), core_card.NONE)
-            self.assertEqual(core_card.card_status(ws.store, SESSION, "logged-out"), core_card.NONE)
+            self.assertEqual(core_card.card_status(ws.store, "other-core", "blocked-human", *_EP), core_card.NONE)
+            self.assertEqual(core_card.card_status(ws.store, SESSION, "logged-out", *_EP), core_card.NONE)
             ws.manager.resolve(req.id)
-            self.assertEqual(core_card.card_status(ws.store, SESSION, "blocked-human"), core_card.NONE)
+            self.assertEqual(core_card.card_status(ws.store, SESSION, "blocked-human", *_EP), core_card.NONE)
+
+    def test_the_episode_key_is_the_one_the_monitors_card_carries(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = _Workspace(td)
+            for sig in (UNKNOWN, LIMIT):
+                req = ws.raise_card(sig, projected=False)
+                self.assertEqual(req.guard, core_card.episode_guard(SESSION, sig["state"], sig["kind"],
+                                                                    sig["prompt"]), sig["kind"])
+
+    def test_a_limit_card_stays_this_blocks_however_its_screen_repaints(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = _Workspace(td)
+            ws.raise_card(LIMIT)
+            repaint = "You've hit your session limit · resets 12:10pm\n❯ 1. Stop and wait for limit to reset"
+            self.assertEqual(core_card.card_status(ws.store, SESSION, "blocked-human", "selection", repaint),
+                             core_card.SHOWN)
 
     def test_an_unreadable_store_reads_none(self):
         with tempfile.TemporaryDirectory() as td:
             ws = _Workspace(td)
             ws.raise_card(UNKNOWN)
             with patch.object(HitlManager, "active", side_effect=OSError("store unreadable")):
-                self.assertEqual(core_card.card_status(ws.store, SESSION, "blocked-human"),
+                self.assertEqual(core_card.card_status(ws.store, SESSION, "blocked-human", *_EP),
                                  core_card.NONE)
 
     def test_a_missing_store_reads_none(self):
-        self.assertEqual(core_card.card_status("/nonexistent/hitl", SESSION, "blocked-human"),
+        self.assertEqual(core_card.card_status("/nonexistent/hitl", SESSION, "blocked-human", *_EP),
                          core_card.NONE)
 
 
@@ -143,6 +164,25 @@ class TestOneAlertPerSurface(unittest.TestCase):
             self.assertTrue(os.path.exists(sf))
             ws.manager.resolve(ws.last.id)
             self.assertIsNone(_cycle(ws, UNKNOWN, state_file=sf, age=600)[0])
+            self.assertEqual(sent, [])
+
+    def test_an_earlier_blocks_card_does_not_stand_in_for_a_new_one(self):
+        with tempfile.TemporaryDirectory() as td, _sends() as (sent, _):
+            ws = _Workspace(td)
+            ws.raise_card(UNKNOWN)  # shown, still open: the monitor never saw the old dialog clear
+            self.assertEqual(core_card.card_status(ws.store, SESSION, "blocked-human", NEXT["kind"],
+                                                   NEXT["prompt"]), core_card.NONE)
+            msg, outcome = _cycle(ws, NEXT, age=relay.CARD_RAISE_WAIT_S + 1)
+            self.assertIsNotNone(msg)
+            self.assertIsNone(outcome.get("card"))
+            self.assertEqual(len(sent), 1)
+
+    def test_the_new_blocks_own_card_still_carries_it(self):
+        with tempfile.TemporaryDirectory() as td, _sends() as (sent, _):
+            ws = _Workspace(td)
+            ws.raise_card(UNKNOWN)
+            ws.raise_card(NEXT)
+            self.assertIsNone(_cycle(ws, NEXT, age=600)[0])
             self.assertEqual(sent, [])
 
     def test_main_reads_the_store_beside_the_signal(self):
