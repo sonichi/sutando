@@ -6,5 +6,5 @@
   "outcome": "done",
   "reason": null,
   "at": 1763730420,
-  "recovery": {"state": "running", "model": "sonnet"}
+  "recovery": {"state": "running", "model": "claude-sonnet-5-5"}
 }

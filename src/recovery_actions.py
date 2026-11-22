@@ -74,14 +74,41 @@ def current_model(workspace: Path) -> Optional[str]:
     return model_family(data.get("model")) if isinstance(data, dict) else None
 
 
+_MODEL_TABLE: Optional[Dict[str, Dict[str, str]]] = None
+
+
+def model_table() -> Dict[str, Dict[str, str]]:
+    """{alias: {id, display}} from the model-switch table (`switch-model.sh --names`), read once per
+    process; {} when it cannot be read, and then no switch is offered at all."""
+    global _MODEL_TABLE
+    if _MODEL_TABLE is None:
+        try:
+            run = subprocess.run(["bash", str(REPO / "scripts" / "switch-model.sh"), "--names"],
+                                 capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+            table = json.loads(run.stdout) if run.returncode == 0 else {}
+        except (OSError, ValueError, subprocess.SubprocessError):
+            table = {}
+        _MODEL_TABLE = {a: e for a, e in table.items() if isinstance(e, dict) and e.get("id") and e.get("display")} \
+            if isinstance(table, dict) else {}
+    return _MODEL_TABLE
+
+
+def model_names() -> Dict[str, str]:
+    """alias -> the exact model's display name, the text a switch button carries."""
+    return {a: e["display"] for a, e in model_table().items()}
+
+
 def switch_offer(workspace: Path, runtime: Optional[str], avoid: Optional[str] = None,
                  seat: bool = False) -> List[str]:
-    """The model aliases a card may offer: none for Codex (its model is a launch argument),
-    else every alias but the one in use (the core's record; a seat's is unknown) and `avoid`."""
-    if runtime == "codex":
+    """The model aliases a card may offer: none for Codex (its model is a launch argument) and
+    none for a worker seat (it shares the core's config dir, where /model saves the default for
+    every session), else every alias the model table names an exact model for, but the one in
+    use and `avoid`."""
+    if runtime == "codex" or seat:
         return []
-    skip = {None if seat else current_model(workspace), model_family(avoid)} - {None}
-    return [m for m in recovery.SWITCH_ALIASES if m not in skip]
+    skip = {current_model(workspace), model_family(avoid)} - {None}
+    known = model_table()
+    return [m for m in recovery.SWITCH_ALIASES if m not in skip and m in known]
 
 
 def runtime_offer(runtime: Optional[str]) -> List[str]:
@@ -109,7 +136,7 @@ def card_controls(workspace: Path, runtime: Optional[str], *, seat: bool, kind: 
     if kind == "turn-rejected" or (limit and not seat):
         ids.append(recovery.RETRY_NOW)
     if limit:
-        ids += [recovery.ADD_ACCOUNT, recovery.BUY_CREDITS]
+        ids.append(recovery.ADD_ACCOUNT)  # no purchase is ever offered on a card
     if not seat:
         ids.append(recovery.RESTART_CORE)
     return ids
@@ -189,7 +216,7 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
             core_limit_hold.clear(ws, now, by=RETRY_BY, mirror=False, seat=target.hold_key())
             if _rc(runner, target.retry_cmd, env, RESTART_TIMEOUT_S) != 0:
                 core_limit_hold.reinstate(ws, now, by=RETRY_BY, mirror=False, seat=target.hold_key())
-                why = "The worker did not restart, so it is still paused; tap Retry now to try again."
+                why = 'The worker did not restart, so it is still paused; reply "retry now" here to try again.'
                 return "failed", why, why, {"state": "paused_limit"}
             return "done", None, f"Retrying now: I restarted {target.seat}.", {"state": "starting"}
         if hold is not None:
@@ -200,7 +227,7 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
                 outcome = _execute(recovery.RESTART_CORE, None, req, target, runner, now, follow_ups)
                 if outcome[0] != "done":
                     core_limit_hold.reinstate(ws, now, by=RETRY_BY, mirror=False)
-                    why = "The core did not restart, so it is still paused; tap Retry now to try again."
+                    why = 'The core did not restart, so it is still paused; reply "retry now" here to try again.'
                     return outcome[0], why, why, {"state": "paused_limit"}
                 return outcome
             else:
@@ -213,26 +240,31 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
             why = "Nothing is paused or refused right now, so there is nothing to retry."
             return "refused", why, why, {}
     if verb == recovery.SWITCH_MODEL:
-        hold = None if target.seat else core_limit_hold.active_hold(ws, now)
-        held = hold is not None and hold.get("source") != core_limit_hold.PANE_SOURCE
-        argv = ["bash", str(REPO / "scripts" / "switch-model.sh"), arg, "--confirm",
-                "--socket", target.socket, "--session", target.session]
         if target.seat:
-            argv += ["--state-dir", str(target.state_dir())] + (["--brain", target.brain] if target.brain else [])
+            why = f"{recovery.SEAT_MODEL_LOCKED} Nothing was changed."
+            return "refused", why, why, {}
+        entry = model_table().get(arg)
+        if entry is None:
+            why = f"This Mac has no exact model for {arg}; nothing was changed."
+            return "refused", why, why, {}
+        arg_id, name = entry["id"], entry["display"]
+        hold = core_limit_hold.active_hold(ws, now)
+        held = hold is not None and hold.get("source") != core_limit_hold.PANE_SOURCE
+        argv = ["bash", str(REPO / "scripts" / "switch-model.sh"), arg_id, "--confirm",
+                "--socket", target.socket, "--session", target.session]
         try:
             run = runner(argv, capture_output=True, text=True, timeout=SWITCH_TIMEOUT_S, env=env,
                          stdin=subprocess.DEVNULL)
         except (OSError, subprocess.SubprocessError):
-            why = f"The switch to {arg} did not finish; it stays on its current model."
+            why = f"The switch to {name} did not finish; it stays on its current model."
             return "failed", why, why, {}
         if run.returncode != 0:
-            why = f"It did not take {arg}; it stays on its current model."
+            why = f"It did not take {name}; it stays on its current model."
             return "failed", why, why, {}
         if refused_turn:
             follow_ups.append(CONTINUE)
-        who = target.seat or "the core"
-        return ("done", None, f"Switched {who} to {arg}.",
-                {"state": "starting" if held else "running", "model": arg})
+        return ("done", None, f"Switched the core to {name}; checking that it is working again.",
+                {"state": "starting" if held else "running", "model": arg_id})
     if verb in (recovery.RESTART_CORE, recovery.SWITCH_RUNTIME):
         if target.seat:
             why = "That acts on the core, not on this worker; nothing was done."
@@ -303,15 +335,54 @@ def _check(manager, data: Dict, target: Target, now: float):
 
 
 def _answer_card(manager, req, line: str, outcome: str, now: float) -> None:
-    """Show the outcome on the same card: its message gains the line, and it closes."""
+    """Show the outcome on the same card: its message gains the line. The card stays this
+    incident's one card: it closes only once the session is seen unblocked (resolve_escalations),
+    so a later tick that still sees the block finds it and posts no second card."""
     with manager.store.locked():
         cur = manager.get(req.id)
         if cur is None or cur.terminal:
             return
         cur.message = f"{cur.message}\n\n{line}"
-        cur.subject = {**(cur.subject or {}), "receipt": {"outcome": outcome, "at": int(now)}}
+        cur.subject = {**(cur.subject or {}), "receipt": {"outcome": outcome, "at": int(now)},
+                       "verify": {"at": now, "outcome": outcome}}
+        cur.revision += 1
+        cur.updated_at = time.time()
         manager.store.save(cur)
-    (manager.resolve if outcome == "done" else manager.expire)(req.id)
+
+
+#: How long a session may stay blocked after a done action before its card says so.
+VERIFY_S = 60.0
+STILL_BLOCKED = ('It is still blocked. You can wait for the limit to reset, or reply "retry now" here '
+                 "to try again.")
+WORKING_AGAIN = "It is working again."
+
+
+def verify_step(manager, workspace: Path, session: str, blocked: bool, now: Optional[float] = None) -> List[str]:
+    """For each of this session's cards an action answered: once the session is seen unblocked,
+    the card says so (and resolve_escalations closes it); still blocked VERIFY_S after a done
+    action, the same card says that, once. Never a new card. Returns the edited card ids."""
+    at = time.time() if now is None else now
+    edited = []
+    for r in manager.active():
+        subject = r.subject or {}
+        check = subject.get("verify")
+        if subject.get("session") != session or not subject.get("recovery") or not isinstance(check, dict) \
+                or check.get("seen"):
+            continue
+        if blocked and not (check.get("outcome") == "done" and at - float(check.get("at") or at) >= VERIFY_S):
+            continue
+        line = WORKING_AGAIN if not blocked else STILL_BLOCKED
+        with manager.store.locked():
+            cur = manager.get(r.id)
+            if cur is None or cur.terminal:
+                continue
+            cur.message = f"{cur.message}\n\n{line}"
+            cur.subject = {**(cur.subject or {}), "verify": {**check, "seen": "working" if not blocked else "blocked"}}
+            cur.revision += 1
+            cur.updated_at = time.time()
+            manager.store.save(cur)
+        edited.append(r.id)
+    return edited
 
 
 def audit(workspace: Path, entry: Dict) -> None:
@@ -472,7 +543,7 @@ def hold_card_step(manager, workspace: Path, session: str, runtime: Optional[str
     ids += [recovery.action_id(recovery.SWITCH_MODEL, m)
             for m in switch_offer(workspace, runtime, avoid=hold.get("model"))]
     ids += [recovery.action_id(recovery.SWITCH_RUNTIME, r) for r in runtime_offer(runtime)]
-    ids += [recovery.ADD_ACCOUNT, recovery.BUY_CREDITS]
+    ids.append(recovery.ADD_ACCOUNT)
     what = core_limit_hold.status_line(hold).split(": ", 1)[-1]
     lines = [f"I am paused: {what}. I start again by myself after that, and messages you send "
              "meanwhile wait and are answered then.", "",
@@ -484,10 +555,19 @@ def hold_card_step(manager, workspace: Path, session: str, runtime: Optional[str
         kind="core-blocked", runtime=runtime or "claude", message="\n".join(lines),
         title="Paused: provider limit", guard=guard,
         device={"id": session, "name": session},
-        actions=[recovery_action(aid) for aid in ids],
+        actions=[recovery_action(aid, model_names()) for aid in ids],
         subject={"session": session, "source": HOLD_SOURCE, "recovery": True, "remind": False,
                  "incident": f"inc_{_hold_ref(hold)}"})
-    return manager.create(req)
+    got = manager.create(req)
+    if got.id != req.id and got.message != req.message and not (got.subject or {}).get("verify"):
+        # The same pause moved on (a later retry time): the one card is edited, never sent again.
+        with manager.store.locked():
+            cur = manager.get(got.id)
+            if cur is not None and not cur.terminal:
+                cur.message, cur.revision, cur.updated_at = req.message, cur.revision + 1, time.time()
+                manager.store.save(cur)
+                got = cur
+    return got
 
 
 def _hold_ref(hold: Dict) -> str:

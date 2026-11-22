@@ -190,8 +190,8 @@ def _open_terminal() -> Action:
 RUNTIME_NAMES = {"claude": "Claude Code", "codex": "Codex"}
 
 
-def recovery_action(aid: str) -> Action:
-    return Action(id=aid, kind=recovery.kind_of(aid), label=recovery.label(aid, RUNTIME_NAMES))
+def recovery_action(aid: str, model_names: Optional[Dict[str, str]] = None) -> Action:
+    return Action(id=aid, kind=recovery.kind_of(aid), label=recovery.label(aid, RUNTIME_NAMES, model_names))
 
 
 # The limit menu's choices that only wait: one tap never spends, switches or signs anything in.
@@ -219,7 +219,8 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
                     session: str, detail: str, fallback_message: str,
                     runtime: Optional[str] = None,
                     episode: Optional[str] = None,
-                    controls: Optional[Sequence[str]] = None) -> HumanRequirement:
+                    controls: Optional[Sequence[str]] = None,
+                    model_names: Optional[Dict[str, str]] = None) -> HumanRequirement:
     """The requirement a gate deserves; unparseable or non-semantic gates keep the
     blocked card with no keystroke button, so a key is never guessed. A session with no stamped
     runtime predates the stamp and ran Claude, so `runtime` falls back to "claude".
@@ -272,7 +273,7 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
             option_for_action[f"opt{i + 1}"] = i
             actions.append(Action(id=f"opt{i + 1}", kind="select", label=label))
     if kind == FALLBACK_KIND and controls:
-        actions += [recovery_action(aid) for aid in controls]
+        actions += [recovery_action(aid, model_names) for aid in controls]
         subject["recovery"] = True
     subject["option_for_action"] = option_for_action
     guard = guard_for(session, prompt, state)

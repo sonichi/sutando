@@ -792,6 +792,9 @@ def _name_seat(req, session, seat):
     req.message = f"{seat} (tmux session {session})\n\n{req.message}"
     req.device = {"id": session, "name": seat}
     req.subject = {**(req.subject or {}), "seat": seat}
+    if (req.subject or {}).get("recovery"):
+        from hitl.recovery import SEAT_MODEL_LOCKED
+        req.message = f"{req.message} {SEAT_MODEL_LOCKED}"
     req.actions = [Action(id=a.id, kind=a.kind, label=f"Open terminal ({session})")
                    if a.kind == "open_terminal" else a for a in req.actions]
     return req
@@ -822,7 +825,8 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
                                                           controls=controls),
                                        runtime=runtime,
                                        episode=tui_gate.LIMIT_EPISODE if limit else None,
-                                       controls=controls)
+                                       controls=controls,
+                                       model_names=recovery_actions.model_names() if controls else None)
         if queued:
             req.message = f"{req.message}\n\n{core_gate_notice.card_line(queued)}"
         if seat:
@@ -918,6 +922,23 @@ def recovery_step(manager, workspace, socket, session, runtime, seat, enabled=Tr
     except Exception as exc:  # noqa: BLE001
         print(f"recovery actions failed: {exc}", file=_sys.stderr)
         return None
+
+
+#: A session in one of these still needs the owner; anything else is the block having lifted.
+_BLOCKED_STATES = ("blocked-human", "blocked-known", "logged-out", "hung")
+
+
+def verify_step(manager, workspace, session, blocked):
+    """After a recovery action, the same card says whether the session is working again or still
+    blocked (recovery_actions.verify_step); never a new card. Never fatal."""
+    if manager is None:
+        return []
+    try:
+        import recovery_actions
+        return recovery_actions.verify_step(manager, workspace, session, blocked)
+    except Exception as exc:  # noqa: BLE001
+        print(f"recovery verify failed: {exc}", file=_sys.stderr)
+        return []
 
 
 def crash_loop_step(manager, workspace, session, runtime, last_pane, now):
@@ -1022,7 +1043,7 @@ _REPO = _Path(__file__).resolve().parent.parent  # lint-workspace-resolution: al
 
 
 def limit_reply_step(workspace, settled, seen, pane, runtime, now=None, repo=_REPO,
-                     seat=None, label=None, retry_cmd=None):
+                     seat=None, label=None, retry_cmd=None, card_surface=False):
     """While a live seat stands at a provider-limit screen, hold it and act on the owner's bare
     "switch to <model>" / "retry now" replies (core_limit_hold). Once its pane shows it idle or
     working again, a hold that screen caused is lifted. `settled` and `seen` are (state, kind,
@@ -1038,7 +1059,8 @@ def limit_reply_step(workspace, settled, seen, pane, runtime, now=None, repo=_RE
     try:
         state, kind, prompt = settled
         if state == "blocked-human" and is_usage_limit(kind, prompt):
-            if core_limit_hold.hold_while_wedged(workspace, prompt, now, seat=seat, seat_label=label) is None:
+            if core_limit_hold.hold_while_wedged(workspace, prompt, now, seat=seat, seat_label=label,
+                                                 card_surface=card_surface) is None:
                 return []
             return core_limit_hold.handle_owner_actions(workspace, now, relaunch=relaunch, seat=seat)
         seen_state, seen_kind, seen_prompt = seen
@@ -1183,7 +1205,8 @@ def main():
         if a.auto_answer:
             limit_reply_step(workspace, (state, kind, prompt), (seen_state, seen_kind, seen_prompt),
                              pane, runtime, seat=a.session if a.seat else None, label=a.seat or None,
-                             retry_cmd=shlex.split(a.retry_cmd) if a.retry_cmd else None)
+                             retry_cmd=shlex.split(a.retry_cmd) if a.retry_cmd else None,
+                             card_surface=a.chat_escalation)
 
         # The actor: only a settled, allowlisted gate is typed at, once per instance.
         key = answer_step(state, kind, prompt, answered_prompt, a.auto_answer)
@@ -1241,6 +1264,7 @@ def main():
             # emptied pane returns, and it must not resolve a card nobody answered.
             if pane and pane.strip():
                 settle_driven(hitl, a.session, seen_prompt, seen_state)
+                verify_step(hitl, workspace, a.session, seen_state in _BLOCKED_STATES)
             verdict, idle_ticks = card_step(bool(pane and pane.strip()), state, idle_ticks, a.stable, settling)
             if verdict == "escalate":
                 drive_escalations(hitl, a.session, prompt, state,

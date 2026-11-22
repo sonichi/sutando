@@ -4556,6 +4556,18 @@ CORE_RECOVERY_MAX_BYTES = 4096
 # A broker that refuses the beat with the block gets beats without it for this long.
 CORE_RECOVERY_REFUSED_BACKOFF_S = 3600.0
 _core_recovery_refused_until = 0.0
+_core_recovery_logged = None
+
+
+def _log_recovery_sent(payload: dict) -> None:
+    """One log line per change of the record the broker accepted: its state and incident, the
+    proof a live run reads that health.recovery left the Mac. Nothing else of it is logged."""
+    global _core_recovery_logged
+    rec = (payload.get("health") or {}).get("recovery")
+    key = (rec.get("state"), rec.get("incident")) if isinstance(rec, dict) else None
+    if key is not None and key != _core_recovery_logged:
+        _log(f"heartbeat carried {CORE_RECOVERY_CAPABILITY}: state={key[0]} incident={key[1]}")
+    _core_recovery_logged = key
 
 
 def _core_recovery() -> "dict | None":
@@ -4636,6 +4648,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             if base is not None:
                 payload["health"] = base
             reply = _req("POST", "/v1/heartbeat", payload, timeout=10)
+        _log_recovery_sent(payload)
         _heartbeat_retry_at, _heartbeat_backoff = 0.0, 0.0
         _record_setup_hint(reply)
         _refresh_served_setup(reply)

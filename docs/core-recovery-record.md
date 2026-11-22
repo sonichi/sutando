@@ -102,32 +102,48 @@ the recovery actions for its state, picked by `recovery_actions.card_controls`:
 
 | Card | Buttons |
 |---|---|
-| Limit, refused turn | Switch to <model> (the runtime's list, minus the model in use and the capped one), Retry now, Add another account, Add usage credits; the core also gets Switch runtime and Restart core |
-| Limit menu (`/rate-limit-options`) | Wait for reset, Continue automatically at <time> (keystrokes), Add another account, Add usage credits; the core also gets Restart core |
-| Paused by the relaunch hold | Retry now, Switch to <model>, Switch runtime, Add another account, Add usage credits |
+| Limit, refused turn (core) | Switch to <exact model> (the model-switch table, minus the model in use and the capped one), Switch runtime, Retry now, Add another account, Restart core |
+| Limit, refused turn (worker seat) | Retry now, Add another account; no model switch (below) |
+| Limit menu (`/rate-limit-options`) | Wait for reset, Continue automatically at <time> (keystrokes), Add another account; the core also gets Restart core |
+| Paused by the relaunch hold | Retry now, Switch to <exact model>, Switch runtime, Add another account |
 | Other blocked prompt (core) | Restart core |
 | Crash loop (`core_crash_loop`) | the core: Restart core; a stopped service: none (only an app restart clears it) |
 
-`Add usage credits` (`buy_credits`) has its own action kind, `purchase`, and is the only text on
-the card that names a purchase, so a client that must not show one drops exactly that button. The
-relay's `space.ag2.agent_alert` carries `has_non_purchase_actions: true` for a hard block.
-`Open terminal` stays last, as the client-local action.
+No card offers a purchase. `Open terminal` stays last, as the client-local action.
+
+A switch button names the exact model it sets: `skills/model-switch`'s `MODEL_SWITCH_MODELS`
+table (read through `scripts/switch-model.sh --names`) maps the alias to a model id and its
+display name ("Switch to Opus 5.5"), the executor sends that id, and the confirmation and the
+receipt name it. A worker seat is never offered or run a switch: it shares the core's config dir,
+where the CLI's `/model` saves the default for every session. The card, the notice and the reply
+say so in one sentence (`hitl.recovery.SEAT_MODEL_LOCKED`).
 
 A tap goes through the HITL reply handler (owner only, the card's own room, revision and guard)
 to `state/recovery/actions/<hitl_id>.json`. The monitor watching that card's session runs it
 (`src/recovery_actions.py`): once, within 10 minutes, only an id the card offered and the
 runtime carries out, with fixed argv, never what a subprocess printed. It writes the receipt to
 `state/recovery/receipts/<hitl_id>.json`, one line to `state/recovery/audit.jsonl` (who, what,
-session, outcome) and edits the card in place. `buy_credits`, `add_account` and `switch_account`
-are refused until the confirmed, re-authenticated sign-in flow exists; a worker seat's card never
-runs `restart_core` or `switch_runtime`.
+session, outcome) and edits the card in place. `add_account` and `switch_account` are refused
+until the confirmed, re-authenticated sign-in flow exists; a worker seat's card never runs
+`switch_model`, `restart_core` or `switch_runtime`.
+
+**One card per incident.** After an action the card stays open with its outcome ("Switched the
+core to Opus 5.5; checking that it is working again."). It closes, with "It is working again."
+and "✓ Done.", only once the session is seen unblocked. Still blocked a minute after a done
+action, the same card says so once. A later tick that still sees the block finds that card and
+posts no other, and no action asks again until the state changes. While the monitor raises
+cards, a paused seat or live core gets no text notice too: the card is the incident's one
+surface. A relaunch-hold card whose retry time moves is edited in place.
 
 Retry now on a live core or worker seat lifts its hold only for the restart and puts it back
-(`core_limit_hold.reinstate`) when the restart fails, so the card says it is still paused and a
-second tap counts. The owner's bare "retry now" records the restart's dispatch before the
-detached child starts; the child lifts the hold, runs the restart, records the outcome on the
-action and puts the hold back on failure. A dispatch whose child never said it started within 60
-seconds is reported once, and the hold stays in force.
+(`core_limit_hold.reinstate`) when the restart fails, so the card says it is still paused. The
+owner's bare "retry now" records the restart's dispatch before the detached child starts; the
+child lifts the hold, runs the restart, records the outcome on the action and puts the hold back
+on failure. A dispatch whose child never said it started within 60 seconds is reported once, and
+the hold stays in force.
+
+The bridge logs `heartbeat carried core_recovery.v1: state=<state> incident=<id>` once per change
+of the record the broker accepted, so a live run can see the record leave the Mac.
 
 ## Contract fixtures
 

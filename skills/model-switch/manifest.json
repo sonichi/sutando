@@ -4,12 +4,13 @@
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "stable",
-  "description": "Switch the core CLI's model through its /model command, recording only after the CLI accepts. Contributes no tools; manifest present to DECLARE config per skills/MANIFEST.md: MODEL_SWITCH_CHOICES is the id=Title list the menu-bar app's Model submenu offers; MODEL_SWITCH_PICKER_DISMISS_AFTER_S is how long a picker a switch left on screen may wait before the supervisor dismisses it with Esc (0 = never).",
+  "description": "Switch the core CLI's model through its /model command, recording only after the CLI accepts. Contributes no tools; manifest present to DECLARE config per skills/MANIFEST.md: MODEL_SWITCH_CHOICES is the id=Title list the menu-bar app's Model submenu offers; MODEL_SWITCH_PICKER_DISMISS_AFTER_S is how long a picker a switch left on screen may wait before the supervisor dismisses it with Esc (0 = never); MODEL_SWITCH_MODELS is the alias=model-id table a bare alias switch sends and a recovery card's button names (scripts/model_names.py).",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   },
   "config": {
     "MODEL_SWITCH_CHOICES": "default=Default (auto-fallback);opus=Opus;sonnet[1m]=Sonnet (1M context);haiku=Haiku;fable[1m]=Fable (1M context)",
-    "MODEL_SWITCH_PICKER_DISMISS_AFTER_S": "300"
+    "MODEL_SWITCH_PICKER_DISMISS_AFTER_S": "300",
+    "MODEL_SWITCH_MODELS": "opus=claude-opus-5-5;sonnet=claude-sonnet-5-5;haiku=claude-haiku-5-5"
   }
 }

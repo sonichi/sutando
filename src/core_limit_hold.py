@@ -495,6 +495,11 @@ def _when_line(hold: dict) -> str:
             else f"It tries again {_when(hold['until'])}")
 
 
+def _seat_model_locked() -> str:
+    from hitl.recovery import SEAT_MODEL_LOCKED
+    return SEAT_MODEL_LOCKED
+
+
 def _notice_body(hold: dict, card: bool = False) -> str:
     from result_markers import neutralize_markers
     if hold.get("seat"):
@@ -502,8 +507,7 @@ def _notice_body(hold: dict, card: bool = False) -> str:
         return "[dm-only]\n" + neutralize_markers(
             f"Your worker {who} is paused: {hold['reason'].split(': ', 1)[-1]} (pause {_incident_ref(hold)}).\n\n"
             f"{_when_line(hold)}, and it continues by itself after that.\n\n"
-            'To restart it now, reply to this message with "retry now". Its model cannot be switched '
-            "from chat yet: workers share the core's model setting.\n")
+            f'To restart it now, reply to this message with "retry now". {_seat_model_locked()}\n')
     where = ('pick a model on the "Your agent\'s model" card I left you, or under Agent Settings, Runtime, Model'
              if card else "pick a model in the core-model card under Agent Settings, Runtime, Model")
     return "[dm-only]\n" + neutralize_markers(
@@ -532,12 +536,16 @@ def _present_card(hold: dict, card_entry: str, now: float) -> bool:
 
 
 def _ensure_notice(workspace: Path, hold: dict, card_entry: Optional[str] = None,
-                   now: Optional[float] = None) -> bool:
+                   now: Optional[float] = None, card_surface: bool = False) -> bool:
     """Queue the hold's owed DM under its stable name, once, and present the core-model card
     with it when the launcher provides one. True when it is queued.
-    A retry rewrites the same name, so it cannot become a second message."""
+    A retry rewrites the same name, so it cannot become a second message. With `card_surface`
+    the monitor's recovery card is this incident's one surface, so no text notice is sent."""
     if hold.get("notice_queued"):
         return False
+    if card_surface:
+        hold["notice_queued"], hold["notice_surface"] = True, "card"
+        return True
     from local_record import write_text_whole
     card = bool(card_entry) and Path(card_entry).is_file()
     body = _notice_body(hold, card)
@@ -570,7 +578,8 @@ class Decision:
 def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
            projects_dir: Optional[Path] = None, launch_model: Optional[str] = None,
            launch_account: Optional[str] = None, card_entry: Optional[str] = None,
-           evidence: tuple = (), seat: Optional[str] = None, seat_label: Optional[str] = None) -> Decision:
+           evidence: tuple = (), seat: Optional[str] = None, seat_label: Optional[str] = None,
+           card_surface: bool = False) -> Decision:
     """Launch, or hold and say why. The one writer of the hold record.
     `evidence` adds limits the caller observed itself, such as a live core's limit screen. A worker
     `seat` has its own record, and only that evidence: the provider record and status are the core's."""
@@ -583,7 +592,7 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
             hold = admitted
             _write_hold(workspace, hold, seat)
     if active_hold(workspace, now, seat) and _binds(hold, launch_model, launch_account):
-        if _ensure_notice(workspace, hold, card_entry, now):
+        if _ensure_notice(workspace, hold, card_entry, now, card_surface):
             _write_hold(workspace, hold, seat)
         return Decision(False, hold, status_line(hold))
     # Who ran last: the record's account, else the launcher a released legacy hold remembered.
@@ -629,7 +638,7 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
             new["notice_queued"] = False
             new["held_tasks"] = carried
             new["present_at_hold"] = [t for t in live if t not in carried][-HELD_TASKS_MAX:]
-        _ensure_notice(workspace, new, card_entry, now)
+        _ensure_notice(workspace, new, card_entry, now, card_surface)
         _write_hold(workspace, new, seat)
         if not seat:
             _mirror_core_status(workspace, "paused", new["reason"], now)
@@ -688,10 +697,11 @@ def reinstate(workspace: Path, now: Optional[float] = None, by: Optional[str] = 
 
 
 def hold_while_wedged(workspace: Path, text: Optional[str], now: Optional[float] = None,
-                      seat: Optional[str] = None, seat_label: Optional[str] = None) -> Optional[dict]:
+                      seat: Optional[str] = None, seat_label: Optional[str] = None,
+                      card_surface: bool = False) -> Optional[dict]:
     """The hold in force for a live core (or worker `seat`) stuck at a provider-limit screen,
-    recorded from that screen's text when none is, so the owner gets the notice and a bare reply
-    counts. Else None."""
+    recorded from that screen's text when none is, so the owner gets the notice (or, with
+    `card_surface`, the monitor's card alone) and a bare reply counts. Else None."""
     now = time.time() if now is None else now
     workspace = Path(workspace)
     hold = read_hold(workspace, seat) or {}
@@ -702,7 +712,7 @@ def hold_while_wedged(workspace: Path, text: Optional[str], now: Optional[float]
     # The caller has judged the screen a limit; text that names none is still this core's limit.
     limit = classify_text(text or "", now, model, PANE_SOURCE) or Limit("usage-limit", now, None, model, PANE_SOURCE)
     decide(workspace, now, evidence=(limit,), launch_model=limit.model or model, launch_account=account,
-           seat=seat, seat_label=seat_label)
+           seat=seat, seat_label=seat_label, card_surface=card_surface)
     return active_hold(workspace, now, seat)
 
 
@@ -1051,8 +1061,7 @@ def handle_owner_actions(workspace: Path, now: Optional[float] = None, *,
         if relaunch and seat:
             ok = kind == "retry" and bool(relaunch.get("command"))
             reply = (f"Retrying now: I am restarting {who}. If the limit is still in force it pauses again and I will tell you."
-                     if ok else f"I can't switch {who}'s model from chat yet: workers share the core's model setting. "
-                     'Send "retry now" to restart it.')
+                     if ok else f'{_seat_model_locked()} Send "retry now" to restart {who}.')
         elif relaunch:
             ok = kind == "retry" or bool(relaunch.get("switch"))
             reply = ("Retrying now: I am restarting the core. If the limit is still in force it pauses again and I will tell you."

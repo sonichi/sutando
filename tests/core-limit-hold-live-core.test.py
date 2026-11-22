@@ -353,6 +353,15 @@ class WorkerSeat(_Base):
         self.assertIsNone(clh.read_hold(self.ws), "the seat's failure touched the core's hold")
         self.assertTrue(any("could not restart the worker" in p.read_text() for p in self.notices()))
 
+    def test_with_the_card_as_its_surface_a_paused_seat_gets_no_text_notice(self):
+        state, _d, prompt, kind = M.compose_state(FABLE_REFUSED, "idle", gateway_alive=True, runtime="claude")
+        M.limit_reply_step(self.ws, (state, kind, prompt), (state, kind, prompt), FABLE_REFUSED, "claude",
+                           seat=WORKER, label=LABEL, retry_cmd=RETRY_CMD, card_surface=True)
+        hold = clh.active_hold(self.ws, seat=WORKER)
+        self.assertIsNotNone(hold)
+        self.assertEqual(self.notices(), [], "the card is this incident's one surface")
+        self.assertEqual(hold.get("notice_surface"), "card")
+
     def test_a_card_reply_naming_the_seat_reaches_it(self):
         self.wtick(RATE_LIMIT_OPTIONS)
         card = f"{LABEL} (tmux session {WORKER})\n\nI am blocked and cannot continue without you."
@@ -365,7 +374,9 @@ class WorkerSeat(_Base):
         gateway_reply(self.ws, "task-42", "switch to sonnet")
         self.wtick(FABLE_REFUSED)
         self.assertEqual(self.spawned, [])
-        self.assertIn("can't switch", (self.ws / "results" / "task-42.txt").read_text())
+        from hitl.recovery import SEAT_MODEL_LOCKED
+        self.assertIn(SEAT_MODEL_LOCKED, (self.ws / "results" / "task-42.txt").read_text(),
+                      "the reply says what the card and the notice say")
         self.assertIsNotNone(clh.active_hold(self.ws, seat=WORKER))
         self.assertEqual(self.audit()[-1]["result"], "refused: unsupported")
 

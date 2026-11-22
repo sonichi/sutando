@@ -41,6 +41,9 @@ CORE_ONLY = frozenset({RESTART_CORE, SWITCH_RUNTIME})
 OUTCOMES = ("done", "refused", "stale", "failed")
 RECEIPT_VERSION = 1
 
+# The one sentence every surface uses about a worker's model (card, notice, reply, refusal).
+SEAT_MODEL_LOCKED = "Its model can't be switched yet: workers share the core's model setting."
+
 _LABELS = {RETRY_NOW: "Retry now", RESTART_CORE: "Restart core", ESCAPE_PROMPT: "Escape and retry",
            BUY_CREDITS: "Add usage credits", ADD_ACCOUNT: "Add another account"}
 
@@ -77,13 +80,15 @@ def action_id(verb: str, arg: Optional[str] = None) -> str:
     return aid
 
 
-def label(aid: str, runtime_names: Optional[dict] = None) -> str:
+def label(aid: str, runtime_names: Optional[dict] = None, model_names: Optional[dict] = None) -> str:
+    """The button text. `model_names` maps an alias to the exact model the switch sets (the
+    model-switch table), so the button names the model the switch sends."""
     parsed = parse(aid)
     if parsed is None:
         raise ValueError(f"not a recovery action: {aid!r}")
     verb, arg = parsed
     if verb == SWITCH_MODEL:
-        return f"Switch to {arg.capitalize()}"
+        return f"Switch to {(model_names or {}).get(arg) or arg.capitalize()}"
     if verb == SWITCH_RUNTIME:
         return f"Switch to {(runtime_names or {}).get(arg, arg)}"
     if verb == SWITCH_ACCOUNT:

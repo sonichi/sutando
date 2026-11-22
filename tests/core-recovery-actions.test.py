@@ -127,11 +127,9 @@ class CardButtons(Base):
         req = self.card()
         self.assertEqual([a.id for a in req.actions],
                          ["switch_model:opus", "switch_model:sonnet", "switch_model:haiku", "retry_now",
-                          "add_account", "buy_credits", "restart_core", "open_terminal"])
+                          "add_account", "restart_core", "open_terminal"], "no purchase is offered")
         kinds = {a.id: a.kind for a in req.actions}
-        self.assertEqual(kinds["buy_credits"], recovery.PURCHASE_KIND)
-        self.assertEqual({k for i, k in kinds.items() if i not in ("buy_credits", "open_terminal")},
-                         {recovery.ACTION_KIND})
+        self.assertEqual({k for i, k in kinds.items() if i != "open_terminal"}, {recovery.ACTION_KIND})
         self.assertEqual(req.actions[-1].kind, "open_terminal", "the terminal stays last and host-only")
         self.assertIn("tap a model below", req.message, "no runtime button here (no codex CLI), so none named")
 
@@ -144,13 +142,30 @@ class CardButtons(Base):
         with mock.patch.object(RA.shutil, "which", return_value="/usr/local/bin/codex"):
             self.assertIn("switch_runtime:codex", [a.id for a in self.card().actions])
 
+    def test_switch_buttons_name_the_exact_model_the_switch_sets(self):
+        table = RA.model_table()
+        self.assertTrue(table, "the model-switch table must name an exact model per alias")
+        req = self.card()
+        for a in req.actions:
+            if a.id.startswith("switch_model:"):
+                alias = a.id.split(":", 1)[1]
+                self.assertEqual(a.label, f"Switch to {table[alias]['display']}")
+                self.assertRegex(a.label, r"^Switch to [A-Z][a-z]+ \d+(\.\d+)*$")
+        self.click(req, "switch_model:opus")
+        run = Run()
+        [receipt] = self.run_pending(run)
+        argv = run.calls[0][0]
+        self.assertEqual(argv[2], table["opus"]["id"], "the switch sends the model the button names")
+        self.assertEqual(receipt["recovery"]["model"], table["opus"]["id"])
+        self.assertIn(f"Switched the core to {table['opus']['display']}", self.mgr.get(req.id).message)
+
     def test_live_seat_fable_refusal_card(self):
         req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED, seat=SEAT)
         ids = [a.id for a in req.actions]
-        self.assertEqual(ids, ["switch_model:opus", "switch_model:sonnet", "switch_model:haiku",
-                               "retry_now", "add_account", "buy_credits", "open_terminal"],
-                         "the capped model is not offered; a seat gets no core action")
+        self.assertEqual(ids, ["retry_now", "add_account", "open_terminal"],
+                         "a seat shares the core's config dir: no model switch, no core action, no purchase")
         self.assertIn(SEAT, req.title)
+        self.assertIn(recovery.SEAT_MODEL_LOCKED, req.message, "the card says what the notice says")
 
     def test_live_seat_rate_limit_menu_card_offers_only_the_wait_choices(self):
         req = self.card(kind="selection", prompt=LIMIT_MENU, seat=SEAT)
@@ -159,7 +174,7 @@ class CardButtons(Base):
         self.assertEqual(labels["opt2"], "Continue automatically at Nov 15 at 6am")
         self.assertNotIn("opt3", labels, "Add funds is never a one-tap keystroke")
         self.assertEqual(req.subject["option_for_action"], {"opt1": 0, "opt2": 1})
-        self.assertIn("buy_credits", labels)
+        self.assertNotIn("buy_credits", labels)
         self.assertFalse([i for i in labels if i.startswith("switch_model:")], "no /model under an open menu")
 
     def test_owner_facing_text_names_no_command_and_no_purchase(self):
@@ -223,16 +238,23 @@ class Routing(Base):
 
 
 class Executor(Base):
-    def test_switch_runs_once_writes_receipt_and_audit_and_closes_the_card(self):
+    def test_switch_runs_once_writes_receipt_and_audit_and_closes_the_card_once_verified(self):
+        sonnet = RA.model_table()["sonnet"]
         req = self.card()
         self.click(req, "switch_model:sonnet")
         run = Run()
         [receipt] = self.run_pending(run)
-        self.assertEqual(run.calls[0][0][1:4], [str(REPO / "scripts" / "switch-model.sh"), "sonnet", "--confirm"])
-        self.assertEqual((receipt["outcome"], receipt["recovery"]), ("done", {"state": "running", "model": "sonnet"}))
+        self.assertEqual(run.calls[0][0][1:4], [str(REPO / "scripts" / "switch-model.sh"), sonnet["id"], "--confirm"])
+        self.assertEqual((receipt["outcome"], receipt["recovery"]), ("done", {"state": "running", "model": sonnet["id"]}))
+        card = self.mgr.get(req.id)
+        self.assertEqual(card.status, STATUS_IN_PROGRESS, "done is said only once the core is seen working")
+        self.assertIn(f"Switched the core to {sonnet['display']}; checking", card.message)
+        self.assertNotIn("✓ Done.", fallback_body(card))
+        RA.verify_step(self.mgr, self.ws, CORE, blocked=False)
+        M.resolve_escalations(self.mgr, CORE, "❯ \n", "claude", workspace=self.ws)
         card = self.mgr.get(req.id)
         self.assertEqual(card.status, STATUS_RESOLVED)
-        self.assertIn("Switched the core to sonnet.", card.message)
+        self.assertIn(RA.WORKING_AGAIN, card.message)
         self.assertTrue(fallback_body(card).endswith("✓ Done."))
         self.assertEqual(self.run_pending(run), [])
         self.assertEqual(len(run.calls), 1, "once per id")
@@ -240,15 +262,18 @@ class Executor(Base):
         self.assertEqual((line["action_id"], line["outcome"], line["sender"], line["session"]),
                          ("switch_model:sonnet", "done", OWNER, CORE))
 
-    def test_a_seat_switch_targets_the_seat_and_resumes_its_refused_turn(self):
+    def test_a_seat_switch_is_never_run(self):
+        # /model in a seat saves the default in the config dir it shares with the core and every seat.
         req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED, seat=SEAT)
-        self.click(req, "switch_model:opus")
+        with self.mgr.store.locked():
+            cur = self.mgr.get(req.id)
+            cur.actions = [tui_gate.recovery_action("switch_model:opus")] + cur.actions
+            self.mgr.store.save(cur)
+        self.click(self.mgr.get(req.id), "switch_model:opus")
         run, owed = Run(), []
         [receipt] = self.run_pending(run, seat=SEAT, owed=owed)
-        argv = run.calls[0][0]
-        self.assertEqual(argv[argv.index("--session") + 1], SEAT_SESSION)
-        self.assertEqual(argv[argv.index("--state-dir") + 1], str(self.ws / "state" / "seats" / SEAT_SESSION))
-        self.assertEqual((receipt["outcome"], owed), ("done", [RA.CONTINUE]))
+        self.assertEqual((receipt["outcome"], run.calls, owed), ("refused", [], []))
+        self.assertIn(recovery.SEAT_MODEL_LOCKED, self.mgr.get(req.id).message)
 
     def test_seat_retry_resends_the_refused_turn(self):
         req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED, seat=SEAT)
@@ -287,14 +312,13 @@ class Executor(Base):
         self.assertEqual((receipt["outcome"], run.calls), ("refused", []), "Codex has no model switch")
 
     def test_step_up_actions_never_run(self):
-        for aid in ("buy_credits", "add_account"):
-            with self.subTest(aid=aid):
-                req = self.card(prompt=LIMIT + aid)
-                self.click(req, aid)
-                run = Run()
-                [receipt] = self.run_pending(run)
-                self.assertEqual((receipt["outcome"], run.calls, self.keys), ("refused", [], []))
-                self.assertEqual(self.mgr.get(req.id).status, STATUS_EXPIRED)
+        self.assertNotIn("buy_credits", [a.id for a in self.card().actions], "a purchase is never offered")
+        req = self.card(prompt=LIMIT + "add_account")
+        self.click(req, "add_account")
+        run = Run()
+        [receipt] = self.run_pending(run)
+        self.assertEqual((receipt["outcome"], run.calls, self.keys), ("refused", [], []))
+        self.assertEqual(self.mgr.get(req.id).status, STATUS_IN_PROGRESS, "the same card says so; no new card")
 
     def test_restart_and_runtime_switch_run_the_launcher_from_outside_the_core(self):
         req = self.card(kind="unknown", prompt=UNKNOWN)
@@ -344,7 +368,7 @@ class Executor(Base):
         path.rename(path.with_name(path.stem + RA.CLAIM_SUFFIX))
         [receipt] = self.run_pending(run)
         self.assertEqual((receipt["outcome"], run.calls), ("failed", []))
-        self.assertEqual(self.mgr.get(crashed.id).status, STATUS_EXPIRED)
+        self.assertEqual(self.mgr.get(crashed.id).status, STATUS_IN_PROGRESS, "the card says so; no new card")
 
     def test_nothing_a_subprocess_prints_reaches_the_card_receipt_or_audit(self):
         req = self.card()
@@ -429,6 +453,53 @@ class Executor(Base):
         self.assertEqual((sent, self.mgr.get(req.id).status), ([], STATUS_IN_PROGRESS))
 
 
+class OneCardPerIncident(Base):
+    """One block, one card: an action that does not lift it edits that card, never a new one."""
+
+    def test_a_done_switch_that_does_not_unblock_keeps_the_same_card_and_says_so_once(self):
+        req = self.card()
+        self.click(req, "switch_model:sonnet")
+        [receipt] = self.run_pending(Run())
+        self.assertEqual(receipt["outcome"], "done")
+        for _ in range(4):  # later ticks still see the limit screen and escalate as they would
+            again = M.escalate(self.mgr, "blocked-human", "awaiting user: usage-limit", "usage-limit", LIMIT,
+                               CORE, runtime="claude", workspace=self.ws)
+            self.assertEqual(again.id, req.id, "a second card for the same incident")
+        self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=True), [], "too early to say")
+        later = time.time() + RA.VERIFY_S + 1
+        self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=True, now=later), [req.id])
+        self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=True, now=later + 60), [], "said once")
+        card = self.mgr.get(req.id)
+        self.assertEqual(card.message.count(RA.STILL_BLOCKED), 1)
+        self.assertNotIn("✓ Done.", fallback_body(card))
+        self.assertEqual(len([r for r in self.mgr.active() if (r.subject or {}).get("session") == CORE]), 1)
+
+    def test_a_failed_action_edits_the_same_card(self):
+        now = self._hold_live()
+        req = self.card()
+        self.click(req, "retry_now")
+        [receipt] = self.run_pending(Run(rc=1), now=now)
+        self.assertEqual(receipt["outcome"], "failed")
+        again = M.escalate(self.mgr, "blocked-human", "awaiting user: usage-limit", "usage-limit", LIMIT,
+                           CORE, runtime="claude", workspace=self.ws)
+        self.assertEqual(again.id, req.id)
+        self.assertIn("still paused", self.mgr.get(req.id).message)
+
+    def _hold_live(self):
+        now = time.time()
+        core_limit_hold._write_hold(self.ws, {"status": "held", "kind": "usage-limit", "model": "opus",
+                                              "until": now + 3600, "started_at": now - 60, "set_at": now - 60,
+                                              "source": core_limit_hold.PANE_SOURCE})
+        return now
+
+    def test_the_monitor_tick_runs_the_verification(self):
+        req = self.card()
+        self.click(req, "switch_model:haiku")
+        self.run_pending(Run())
+        with mock.patch.object(RA, "VERIFY_S", 0.0):
+            self.assertEqual(M.verify_step(self.mgr, self.ws, CORE, True), [req.id])
+
+
 class PausedCard(Base):
     def hold(self, started, model="opus"):
         now = time.time()
@@ -442,14 +513,28 @@ class PausedCard(Base):
         b = RA.hold_card_step(self.mgr, self.ws, CORE, "claude")
         self.assertEqual(a.id, b.id)
         self.assertEqual([x.id for x in a.actions],
-                         ["retry_now", "switch_model:sonnet", "switch_model:haiku",
-                          "add_account", "buy_credits"])
+                         ["retry_now", "switch_model:sonnet", "switch_model:haiku", "add_account"])
         self.assertIs(a.subject.get("remind"), False)
         for word in COMMANDS + PURCHASE_WORDS:
             self.assertNotIn(word, a.message)
         core_limit_hold.clear(self.ws)
         self.assertIsNone(RA.hold_card_step(self.mgr, self.ws, CORE, "claude"))
         self.assertEqual(self.mgr.get(a.id).status, STATUS_RESOLVED)
+
+
+class PausedCardTime(Base):
+    def test_a_later_retry_time_edits_the_one_card(self):
+        now = time.time()
+        hold = {"status": "held", "kind": "rate-limit", "model": "opus", "until": now + 300,
+                "started_at": 1000.0, "set_at": 1000.0}
+        core_limit_hold._write_hold(self.ws, hold)
+        first = RA.hold_card_step(self.mgr, self.ws, CORE, "claude")
+        core_limit_hold._write_hold(self.ws, dict(hold, until=now + 900, strikes=2))
+        second = RA.hold_card_step(self.mgr, self.ws, CORE, "claude")
+        self.assertEqual(second.id, first.id, "the same pause sent a second card")
+        self.assertGreater(second.revision, first.revision)
+        self.assertIn(core_limit_hold._when(now + 900), second.message)
+        self.assertNotIn(core_limit_hold._when(now + 300), second.message, "the old retry time stayed")
 
 
 class Contract(Base):

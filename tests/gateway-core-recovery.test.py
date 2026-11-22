@@ -56,6 +56,7 @@ class Base(unittest.TestCase):
         for name, value in (("_STATE", self.state), ("_heartbeat_retry_at", 0.0),
                             ("_last_heartbeat_at", 0.0), ("_last_core_health", None),
                             ("_core_recovery_refused_until", 0.0), ("_HEALTH_COMMAND", None),
+                            ("_core_recovery_logged", None),
                             ("_CORE_RECOVERY_READER", lambda: self.record)):
             p = mock.patch.object(rgb, name, value)
             p.start()
@@ -142,6 +143,37 @@ class Carriage(Base):
                 body = self.beat(core_row(), force=True)
             self.assertIsNotNone(body, reader)
             self.assertNotIn("recovery", body["health"])
+
+
+class LiveEvidence(Base):
+    """A live run reads in the bridge log that the record left the Mac: state and incident, once per change."""
+
+    def test_the_log_names_the_sent_record_once_per_change_and_nothing_else(self):
+        logs = []
+        self.record = {"v": 1, "state": "paused_limit", "incident": "inc_0123abcd", "account": "acct_3f9a2b"}
+        with mock.patch.object(rgb, "_health_snapshot", return_value=core_row()), \
+                mock.patch.object(rgb, "_req", lambda *a, **k: {}), mock.patch.object(rgb, "_log", logs.append):
+            rgb._post_heartbeat(set(), force=True)
+            rgb._post_heartbeat(set(), force=True)
+            self.record = dict(self.record, state="running")
+            rgb._post_heartbeat(set(), force=True)
+        lines = [l for l in logs if "core_recovery.v1" in l]
+        self.assertEqual(lines, ["heartbeat carried core_recovery.v1: state=paused_limit incident=inc_0123abcd",
+                                 "heartbeat carried core_recovery.v1: state=running incident=inc_0123abcd"])
+        self.assertFalse([l for l in logs if "acct_" in l])
+
+    def test_a_refused_beat_logs_no_carried_line(self):
+        logs = []
+        self.record = {"v": 1, "state": "running", "incident": "inc_0123abcd"}
+
+        def req(*a, **k):
+            if "recovery" in (a[2].get("health") or {}):
+                raise urllib.error.HTTPError("u", 422, "bad", {}, io.BytesIO(b""))
+            return {}
+        with mock.patch.object(rgb, "_health_snapshot", return_value=core_row()), \
+                mock.patch.object(rgb, "_req", req), mock.patch.object(rgb, "_log", logs.append):
+            rgb._post_heartbeat(set(), force=True)
+        self.assertFalse([l for l in logs if l.startswith("heartbeat carried")])
 
 
 class RefusingBroker(Base):
