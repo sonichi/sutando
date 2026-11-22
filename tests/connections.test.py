@@ -3616,6 +3616,11 @@ class EventOwner(Base):
         self.assertEqual(self.owner(body, reply_to_sender=self.NEW_MXID), [self.NEW],
                          "an agent named only inside the quoted parent is not addressed")
 
+    def test_a_mention_in_a_quoted_paragraph_of_a_non_reply_still_names_its_lane(self):
+        self.assertEqual(self.owner(f"> {self.LEGACY_MXID} can you check this?"), [""],
+                         "not a reply: its leading quote lines are its own words")
+        self.assertEqual(self.owner(f"> earlier\n{self.LEGACY_MXID} check"), [""])
+
     def test_a_reply_decides_only_when_the_body_names_no_agent(self):
         self.assertEqual(self.owner("thanks", reply_to_sender=self.NEW_MXID), [self.NEW])
         self.assertEqual(self.owner(f"{self.LEGACY_MXID} and {self.NEW_MXID}", reply_to_sender=self.LEGACY_MXID),
