@@ -8,7 +8,7 @@ agent's own room membership and grants.
     ag2-sparrow-mcp headers   # {"Authorization": "Bearer <access token>"}, for headersHelper
     ag2-sparrow-mcp setup     # the `claude mcp add-json` line that wires `headers` in
     ag2-sparrow-mcp acp       # one ACP `McpServer` (http, with that header), for an ACP client
-    ag2-sparrow-mcp descriptor  # the stdio `ag2-mcp-proxy` descriptor naming the agent's token file
+    ag2-sparrow-mcp descriptor --env-file <the agent's .env>  # the stdio `ag2-mcp-proxy` descriptor for it
 
 `headers` mints on every run and caches nothing: Claude Code runs it at connect and
 again after a 401, so an expired token is replaced without the bearer touching disk.
@@ -193,23 +193,27 @@ def acp_entry(gateway: Gateway) -> dict:
             "headers": [{"name": "Authorization", "value": f"Bearer {mint(mint_url, bearer)}"}]}
 
 
-def stdio_descriptor(gateway: Gateway) -> dict:
-    """The non-secret descriptor the desktop's stdio `ag2-mcp-proxy` reads (AG2_MCP_DESCRIPTOR): the discovered
-    mint and MCP URLs, the agent's own token file, whose `REMOTE_TASK_TOKEN=` line the proxy mints from, and
-    `bearer_digest`, the sha256 of that secret the proxy checks a plain mint against (as the desktop writes it)."""
-    url, bearer, env_file = _require(gateway)
-    if not env_file:
-        raise McpAuthError("the token came from the environment, not a file the stdio proxy can read")
+def stdio_descriptor(env_path: str) -> dict:
+    """The non-secret descriptor the desktop's stdio `ag2-mcp-proxy` reads (AG2_MCP_DESCRIPTOR) for the agent's
+    own `.env` at `env_path`: that file and the key its token line has, the mint and MCP URLs discovered with that
+    very token, and `bearer_digest`, the sha256 of its secret the proxy checks a plain mint against (as the
+    desktop writes it). Only that file is read: a token in the environment, a vault or another file is never
+    the descriptor's, since the proxy mints from the file alone."""
+    if not env_path:
+        raise McpAuthError("descriptor needs --env-file, the agent's own .env")
     try:
-        text = Path(env_file).read_text(encoding="utf-8")
+        text = Path(env_path).read_text(encoding="utf-8")
     except OSError as exc:
-        raise McpAuthError(f"the token file is unreadable ({type(exc).__name__})")
-    from .gateway_credential_sources import plain_token_key
-    key = plain_token_key(text)   # a seat's raw token file has none
+        raise McpAuthError(f"{env_path} is unreadable ({type(exc).__name__})")
+    from .gateway_credential_sources import plain_token
+    key, url, bearer = plain_token(text)
     if not key:
-        raise McpAuthError("the token file has no REMOTE_TASK_TOKEN= line the stdio proxy reads (a seat's raw token file?)")
+        raise McpAuthError(f"{env_path} has no REMOTE_TASK_TOKEN= line, which is all the stdio proxy reads: a seat "
+                           ".env (connect, --token-stdin) keeps its token in a separate raw file the proxy cannot read")
+    if not url or not bearer:
+        raise McpAuthError(f"{env_path}'s token names no relay URL (<relay_url>|<secret>)")
     mint_url, mcp_url = discover(url, bearer)
-    return {"version": 1, "lane": "primary", "env_file": env_file, "env_key": key, "mint_url": mint_url,
+    return {"version": 1, "lane": "primary", "env_file": env_path, "env_key": key, "mint_url": mint_url,
             "mcp_url": mcp_url, "relay": url.rstrip("/"),
             "bearer_digest": hashlib.sha256(bearer.strip().encode("utf-8")).hexdigest()}
 
@@ -228,15 +232,17 @@ def setup_lines(gateway: Gateway) -> list:
 def main(argv=None, resolve: Callable[[], Gateway] = resolve_gateway) -> int:
     parser = argparse.ArgumentParser(prog="ag2-sparrow-mcp", description=__doc__.splitlines()[0])
     parser.add_argument("command", choices=("headers", "setup", "acp", "descriptor"))
+    parser.add_argument("--env-file", default="", help="descriptor: the agent's own .env the stdio proxy reads")
     args = parser.parse_args(argv)
     try:
+        if args.command == "descriptor":
+            print(json.dumps(stdio_descriptor(args.env_file)))
+            return 0
         gateway = resolve()
         if args.command == "headers":
             print(json.dumps(headers(gateway)))
         elif args.command == "acp":
             print(json.dumps(acp_entry(gateway)))
-        elif args.command == "descriptor":
-            print(json.dumps(stdio_descriptor(gateway)))
         else:
             print("\n".join(setup_lines(gateway)))
     except McpAuthError as exc:

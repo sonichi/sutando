@@ -142,29 +142,48 @@ class HeadersTest(unittest.TestCase):
         self.assertEqual([p for _, p, _, _ in self.stub.seen],
                          ["/relay/v1/mcp/discovery", "/api/v1/mcp/agent-access-tokens"])
 
-    def test_descriptor_names_the_agents_token_file_for_the_stdio_proxy_and_no_secret(self):
-        d = tempfile.mkdtemp(prefix="mcp-desc-")
-        env_file = os.path.join(d, ".env")
-        with open(env_file, "w") as fh:
-            fh.write(f"AGENT_MXID=@a:s.space\nREMOTE_TASK_TOKEN='{self.stub.relay}|{SECRET}'\n")
-        rc, out, err = _run_main(["descriptor"], (self.stub.relay, SECRET, env_file))
-        self.assertEqual(rc, 0, err)
-        self.assertEqual(json.loads(out), {"version": 1, "lane": "primary", "env_file": env_file,
-                                           "env_key": "REMOTE_TASK_TOKEN",
-                                           "mint_url": f"{self.stub.base}/api/v1/mcp/agent-access-tokens",
-                                           "mcp_url": f"{self.stub.base}/mcp", "relay": self.stub.relay,
-                                           "bearer_digest": hashlib.sha256(SECRET.encode()).hexdigest()})
-        self.assertNotIn(SECRET, out + err)
-        self.assertEqual([p for _, p, _, _ in self.stub.seen], ["/relay/v1/mcp/discovery"], "nothing is minted")
+    def _env(self, text, name=".env"):
+        path = os.path.join(tempfile.mkdtemp(prefix="mcp-desc-"), name)
+        with open(path, "w") as fh:
+            fh.write(text)
+        os.chmod(path, 0o600)
+        return path
 
-    def test_descriptor_refuses_a_token_the_proxy_cannot_read(self):
-        raw = os.path.join(tempfile.mkdtemp(prefix="mcp-desc-"), "token")
-        with open(raw, "w") as fh:
-            fh.write(f"{self.stub.relay}|{SECRET}\n")   # a seat's raw token file
-        for gateway in ((self.stub.relay, SECRET, raw), (self.stub.relay, SECRET, "")):
-            rc, out, err = _run_main(["descriptor"], gateway)
-            self.assertEqual((rc, out), (1, ""), gateway[2])
+    def _descriptor(self, env_file):
+        return {"version": 1, "lane": "primary", "env_file": env_file, "env_key": "REMOTE_TASK_TOKEN",
+                "mint_url": f"{self.stub.base}/api/v1/mcp/agent-access-tokens", "mcp_url": f"{self.stub.base}/mcp",
+                "relay": self.stub.relay, "bearer_digest": hashlib.sha256(SECRET.encode()).hexdigest()}
+
+    def test_descriptor_names_the_agents_token_file_for_the_stdio_proxy_and_no_secret(self):
+        env_file = self._env(f"AGENT_MXID=@a:s.space\nREMOTE_TASK_TOKEN='{self.stub.relay}|{SECRET}'\n")
+        rc, out, err = _run_main(["descriptor", "--env-file", env_file], None)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out), self._descriptor(env_file))
+        self.assertNotIn(SECRET, out + err)
+        self.assertEqual([(p, a) for _, p, a, _ in self.stub.seen], [("/relay/v1/mcp/discovery", f"Bearer {SECRET}")],
+                         "nothing is minted; discovery runs with the file's own token")
+
+    def test_descriptor_uses_the_named_file_even_when_the_environment_carries_another_token(self):
+        # The live failure (2026-11-21): the bridge's resolution won from elsewhere and the file was never named.
+        env_file = self._env(f"REMOTE_TASK_TOKEN={self.stub.relay}|{SECRET}\n")
+        r = subprocess.run([sys.executable, "-m", "ag2_sparrow.mcp_auth", "descriptor", "--env-file", env_file],
+                           capture_output=True, text=True, timeout=60,
+                           env=hermetic_env(PYTHONPATH=str(PKG_ROOT),
+                                            REMOTE_TASK_TOKEN=f"{self.stub.relay}|env-secret-other"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout), self._descriptor(env_file))
+        self.assertTrue(all(a == f"Bearer {SECRET}" for _, _, a, _ in self.stub.seen), "never the env's token")
+        self.assertNotIn("env-secret-other", r.stdout + r.stderr)
+
+    def test_descriptor_refuses_a_file_the_proxy_cannot_read(self):
+        seat_env = self._env("AGENT_MXID=@a:s.space\nREMOTE_TASK_TOKEN_FILE=/seat/channels/ag2space/token\n")
+        raw = self._env(f"{self.stub.relay}|{SECRET}\n", "token")   # a seat's raw token file
+        exported = self._env(f"export REMOTE_TASK_TOKEN={self.stub.relay}|{SECRET}\n")
+        for path in (seat_env, raw, exported, "", "/no/such/.env"):
+            rc, out, err = _run_main(["descriptor", "--env-file", path], (self.stub.relay, SECRET, path))
+            self.assertEqual((rc, out), (1, ""), path)
             self.assertNotIn(SECRET, err)
+        self.assertIn("a seat .env", _run_main(["descriptor", "--env-file", seat_env], None)[2])
         self.assertEqual(self.stub.seen, [], "the bearer is not sent for a descriptor that cannot work")
 
     def test_owner_tools_are_the_ag2_space_servers_room_tools_only(self):

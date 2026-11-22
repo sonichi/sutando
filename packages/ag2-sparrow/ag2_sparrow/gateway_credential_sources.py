@@ -567,6 +567,17 @@ def plain_token_key(text: str) -> str:
     return ""
 
 
+def plain_token(text: str) -> "tuple[str, str, str]":
+    """(key, relay URL, secret) of the token that plain_token_key's reader takes from a token file's text (its
+    REMOTE_TASK_URL line, else the token's URL half, as the desktop's stdio MCP proxy reads it); ('', '', '')
+    when it finds none."""
+    key = plain_token_key(text)
+    if not key:
+        return "", "", ""
+    url_from_token, secret = contract.parse_onboarding_token(first(_assignments(text, (key,)), (key,))[0])
+    return key, (token_file_url(text) or url_from_token).rstrip("/"), secret
+
+
 def token_file_url(text: str) -> str:
     """The REMOTE_TASK_URL (legacy AG2_REMOTE_URL) of a split-layout token file's text, or ""."""
     return first(_assignments(text, URL_KEYS), URL_KEYS)[0]

@@ -81,12 +81,12 @@ MINT_TIMEOUT_S = 30.0
 MINT_ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "TMPDIR")
 
 
-def mint_argv(command="acp"):
-    """`ag2-sparrow-mcp <command>` from this very package (a source tree or the zipapp), isolated (-I) so neither
-    the child's directory nor PYTHONPATH can put another module first."""
+def mint_argv(*command):
+    """`ag2-sparrow-mcp <command...>` (default `acp`) from this very package (a source tree or the zipapp),
+    isolated (-I) so neither the child's directory nor PYTHONPATH can put another module first."""
     root = str(Path(mcp_auth.__file__).resolve().parents[1])
     code = ("import sys; sys.path.insert(0, %r); from ag2_sparrow.mcp_auth import main; "
-            "raise SystemExit(main([%r]))" % (root, command))
+            "raise SystemExit(main(%r))" % (root, list(command or ("acp",))))
     return [sys.executable, "-I", "-c", code]
 
 
@@ -103,13 +103,13 @@ def mint_env(token_env_file, agent_id, environ=None):
     return env, ""
 
 
-def _exchange(command, token_env_file, agent_id, run):
+def _exchange(command, token_env_file, agent_id, run, extra=()):
     """(the JSON object `ag2-sparrow-mcp <command>` printed, '') or (None, why), run as `mint_env` says."""
     env, problem = mint_env(token_env_file, agent_id)
     if problem:
         return None, problem
     try:
-        done = run(mint_argv(command), env=env, cwd=os.path.dirname(token_env_file) or "/", capture_output=True,
+        done = run(mint_argv(command, *extra), env=env, cwd=os.path.dirname(token_env_file) or "/", capture_output=True,
                    text=True, timeout=MINT_TIMEOUT_S, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as e:
         return None, "the token exchange did not run (%s)" % type(e).__name__
@@ -151,7 +151,7 @@ def stdio_entry(proxy_command, token_env_file, agent_id, state_dir, run=subproce
     argv = shlex.split(proxy_command or "")
     if not argv:
         return None, "no --mcp-proxy-command"
-    desc, why = _exchange("descriptor", token_env_file, agent_id, run)
+    desc, why = _exchange("descriptor", token_env_file, agent_id, run, ("--env-file", token_env_file))
     if desc is None:
         return None, why
     try:

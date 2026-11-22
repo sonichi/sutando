@@ -873,7 +873,7 @@ class SspaceStdioTest(unittest.TestCase):
         self.assertEqual(json.loads(Path(desc_path).read_text()), dict(self.desc, agent_id="@agy:s.space"))
         self.assertEqual(os.stat(desc_path).st_mode & 0o777, 0o600)
         argv, env = self.runs[0]
-        self.assertIn("main(['descriptor'])", argv[-1])
+        self.assertIn("main(['descriptor', '--env-file', %r])" % self.token_file, argv[-1])
         self.assertEqual(env["AG2_DEVICE_ENV"], self.token_file)
         perms = [(r["permission"], r["allowed"]) for r in self.w.records() if "permission" in r]
         self.assertEqual([ok for _, ok in perms], [True, True, False, False, False, False])
