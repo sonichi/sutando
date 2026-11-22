@@ -8,9 +8,10 @@ uses it. `connections.acting_identity` is the one rule, reached by every room cl
 - In the worker's session a room on its agent's server resolves to the worker's own row, its
   token (the vault's) and its agent. The core's session, another worker's session and a room on
   another server never do.
-- Identity comes from the task: a task addressed to the worker's agent is answered as it, one
-  addressed to the core's as the core; an unprompted post is the worker's own, except in a core
-  lane's own owner DM. A room nothing serves is refused, never sent with the shared token.
+- Identity comes from the task: a reply posts as the agent the task was addressed to, only in the
+  task's own room; a core agent only for a task this worker holds that is still open. A task file
+  that does not bind is refused. An unprompted post is the worker's own, except in a core lane's
+  own owner DM. A room nothing serves is refused, never sent with the shared token.
 - room_ops and task-progress send that worker's bearer, with no change of their own.
 - A task's rows in the local activity log name the agent the task is answered as, so a reader
   need not assume every row is the core's.
@@ -156,27 +157,92 @@ class NeverSomeoneElses(Base):
             self.assertIn(SEAT_VAR, (scripts / launcher).read_text(), launcher)
 
 
+def write_task(ws, tid, room, agent="", folder="tasks"):
+    path = ws / folder / f"{tid}.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    recv = f"receiving_instance: {agent}\n" if agent else ""
+    path.write_text(f"id: {tid}\n{recv}channel_id: {room}\nsource: ag2space\ntask: hi\n")
+    return path
+
+
 class IdentityComesFromTheTask(Base):
     """Which lane once handled a room never decides: its task ledger outlives every task in it."""
 
-    def instance_for(self, room, environ, task_agent):
-        r = C.connection_for_room(room, self.ws, environ, task_agent)
+    def deliver(self, tid, worker=W):
+        d = self.ws / "deliveries" / worker
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{tid}.txt").write_text("")
+
+    def via(self, room, environ, task_file):
+        r = C.connection_for_room(room, self.ws, environ, task_file)
         return None if r is None else r["instance"]
+
+    def refused(self, room, task_file, environ=SEAT):
+        with self.assertRaises(C.NoConnectionForRoom) as cm:
+            C.connection_for_room(room, self.ws, environ, task_file)
+        return str(cm.exception)
 
     def test_its_own_task_is_its_own_even_where_a_stale_core_entry_names_the_room(self):
         self.open_task("alpha", ROOM)
-        self.assertEqual(self.instance_for(ROOM, SEAT, OWN_AGENT), OWN)
+        own = write_task(self.ws, f"task-{OWN}~abc123", ROOM, OWN_AGENT)
+        self.assertEqual(self.via(ROOM, SEAT, own), OWN)
         self.assertEqual(self.instance(ROOM, SEAT), OWN)
 
-    def test_a_core_task_it_answers_is_answered_as_the_core(self):
-        self.assertEqual(self.instance_for(ROOM, SEAT, CORE_AGENT), "alpha")
-        self.assertEqual(self.instance_for(BETA_ROOM, SEAT, BETA_AGENT), "beta")
+    def test_its_own_task_in_another_room_is_refused(self):
+        own = write_task(self.ws, f"task-{OWN}~abc123", ROOM, OWN_AGENT)
+        self.assertIn("not the task's room", self.refused(CORE_DM, own))
+
+    def test_a_core_task_delivered_to_it_is_answered_as_the_core(self):
+        core = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+        self.deliver("task-abc123")
+        self.assertEqual(self.via(ROOM, SEAT, core), "alpha")
+        beta = write_task(self.ws, "task-beta~def456", BETA_ROOM, BETA_AGENT)
+        self.deliver("task-beta~def456")
+        self.assertEqual(self.via(BETA_ROOM, SEAT, beta), "beta")
 
     def test_a_core_task_is_the_cores_row_even_with_one_core_connection(self):
         self.record([r for r in rows() if r["instance"] != "beta"])
-        self.assertEqual(self.instance_for(ROOM, SEAT, CORE_AGENT), "alpha")
-        self.assertEqual(C.room_credential(ROOM, workspace=self.ws, environ=SEAT, task_agent=CORE_AGENT),
+        core = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+        self.deliver("task-abc123")
+        self.assertEqual(C.room_credential(ROOM, workspace=self.ws, environ=SEAT, task_file=core),
                          (ALPHA, ALPHA + "|core-secret"))
+
+    def test_a_forged_core_header_in_a_task_it_does_not_hold_is_refused(self):
+        forged = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+        self.assertIn("does not hold", self.refused(ROOM, forged))
+        self.deliver("task-abc123", worker=OTHER_W)
+        self.assertIn("does not hold", self.refused(ROOM, forged))
+        scratch = write_task(self.ws, "task-abc999", ROOM, CORE_AGENT, folder="scratch")
+        self.deliver("task-abc999")
+        self.assertIn("does not hold", self.refused(ROOM, scratch))
+
+    def test_a_held_core_task_posted_to_another_room_is_refused(self):
+        core = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+        self.deliver("task-abc123")
+        self.assertIn("not the task's room", self.refused(CORE_DM, core))
+
+    def test_an_answered_or_archived_core_task_is_refused(self):
+        core = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+        self.deliver("task-abc123")
+        (self.ws / "results").mkdir()
+        (self.ws / "results" / "task-abc123.txt").write_text("done\n")
+        self.assertIn("answered", self.refused(ROOM, core))
+        (self.ws / "results" / "task-abc123.txt").unlink()
+        archived = self.ws / "tasks" / "archive"
+        archived.mkdir()
+        core.rename(archived / core.name)
+        self.assertIn("unreadable", self.refused(ROOM, core))
+
+    def test_a_missing_unreadable_or_inconsistent_task_file_is_refused(self):
+        self.assertIn("unreadable", self.refused(ROOM, self.ws / "tasks" / "task-gone.txt"))
+        self.assertIn("no task file", self.refused(ROOM, ""))
+        lane_says_beta = write_task(self.ws, "task-beta~abc123", ROOM, CORE_AGENT)
+        self.assertIn("lane runs as", self.refused(ROOM, lane_says_beta))
+        nameless = write_task(self.ws, "task-abc777", ROOM)
+        self.assertIn("names no receiving agent", self.refused(ROOM, nameless))
+        stranger = write_task(self.ws, "task-abc888", ROOM, "@someone:alpha-fixture.net")
+        self.deliver("task-abc888")
+        self.assertIn("neither", self.refused(ROOM, stranger))
 
     def test_an_unprompted_post_is_its_own(self):
         self.open_task("alpha", ROOM)
@@ -188,27 +254,16 @@ class IdentityComesFromTheTask(Base):
         with self.assertRaises(C.NoConnectionForRoom):
             C.connection_for_room("!r:gamma-fixture.net", self.ws, SEAT)
         self.record([r for r in rows() if r["instance"] != "beta"])
-        for agent in ("", BETA_AGENT):
-            with self.subTest(task_agent=agent), self.assertRaises(C.NoConnectionForRoom):
-                C.connection_for_room(BETA_ROOM, self.ws, SEAT, agent)
+        with self.assertRaises(C.NoConnectionForRoom):
+            C.connection_for_room(BETA_ROOM, self.ws, SEAT)
 
-    def test_the_core_session_ignores_the_task_agent(self):
-        self.assertEqual(self.instance_for(ROOM, CORE_ENV, OWN_AGENT), "alpha")
+    def test_the_core_session_and_single_connection_installs_ignore_the_task_file(self):
+        missing = self.ws / "tasks" / "task-gone.txt"
+        self.assertEqual(self.via(ROOM, CORE_ENV, missing), "alpha")
         self.record([r for r in rows() if r["instance"] != "beta"])
-        self.assertIsNone(self.instance_for(ROOM, CORE_ENV, OWN_AGENT))
+        self.assertIsNone(self.via(ROOM, CORE_ENV, missing))
         C.record_path(self.ws).unlink()
-        self.assertIsNone(self.instance_for(ROOM, SEAT, OWN_AGENT))
-
-    def test_the_task_file_names_the_agent(self):
-        tasks = self.ws / "tasks"
-        tasks.mkdir()
-        addressed = tasks / "task-abc123.txt"
-        addressed.write_text(f"id: task-abc123\nreceiving_instance: {CORE_AGENT}\ntask: hi\n")
-        by_lane = tasks / f"task-{OWN}~abc123.txt"
-        by_lane.write_text(f"id: task-{OWN}~abc123\ntask: hi\n")
-        self.assertEqual(C.task_answer_agent(addressed, self.ws), CORE_AGENT)
-        self.assertEqual(C.task_answer_agent(by_lane, self.ws), OWN_AGENT)
-        self.assertEqual(C.task_answer_agent(tasks / "gone.txt", self.ws), "")
+        self.assertIsNone(self.via(ROOM, SEAT, missing))
 
 
 class TheCoresOwnerDM(Base):
@@ -259,9 +314,10 @@ class RoomClients(Base):
             _gateway.gateway(ROOM)
 
     def test_a_task_file_makes_room_ops_answer_as_the_agent_it_was_addressed_to(self):
-        task = self.ws / "tasks" / "task-abc123.txt"
-        task.parent.mkdir()
-        task.write_text(f"id: task-abc123\nreceiving_instance: {CORE_AGENT}\ntask: hi\n")
+        task = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+        d = self.ws / "deliveries" / W
+        d.mkdir(parents=True)
+        (d / "task-abc123.txt").write_text("")
         self.addCleanup(_gateway.set_task_file, None)
         _gateway.set_task_file(str(task))
         with mock.patch.dict("os.environ", SEAT):
@@ -269,6 +325,14 @@ class RoomClients(Base):
             self.assertEqual(notify._gateway_config("ag2space", ROOM, str(task)), (ALPHA, "core-secret"))
         _gateway.set_task_file(None)
         self.assertEqual(self.bearer(SEAT), "own-secret")
+
+    def test_a_task_file_that_does_not_bind_is_refused_by_both_clients(self):
+        self.addCleanup(_gateway.set_task_file, None)
+        _gateway.set_task_file(str(self.ws / "tasks" / "task-gone.txt"))
+        with mock.patch.dict("os.environ", SEAT), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(_gateway.RoomConnectionError):
+                _gateway.gateway(ROOM)
+            self.assertIsNone(notify._gateway_config("ag2space", ROOM, str(self.ws / "tasks" / "task-gone.txt")))
 
     def test_a_room_no_identity_serves_is_refused_by_both_clients(self):
         with mock.patch.dict("os.environ", SEAT), contextlib.redirect_stderr(io.StringIO()):

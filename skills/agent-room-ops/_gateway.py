@@ -209,13 +209,13 @@ class RoomConnectionError(RuntimeError):
     """The room's server has no usable connection on this install; never another server's token."""
 
 
-# The task this process's posts answer (room_ops `--task-file`); one CLI run answers at most one.
+# The task this process's posts answer (room_ops `--task-file`); None is no task, "" a missing one.
 _TASK_FILE = None
 
 
 def set_task_file(path):
     global _TASK_FILE
-    _TASK_FILE = path or None
+    _TASK_FILE = path
 
 
 def _room_credential(room_id):
@@ -228,8 +228,7 @@ def _room_credential(room_id):
     except Exception:
         return None
     try:
-        agent = connections.task_answer_agent(_TASK_FILE) if _TASK_FILE else ""
-        return connections.room_credential(room_id, task_agent=agent)
+        return connections.room_credential(room_id, task_file=_TASK_FILE)
     except connections.ConnectionsError as e:
         raise RoomConnectionError(str(e)) from None
 

@@ -1694,18 +1694,22 @@ def primary_row(workspace: Optional[Path] = None) -> Optional[dict]:
 
 
 def connection_for_room(room_id: Optional[str], workspace: Optional[Path] = None,
-                        environ: Optional[Mapping[str, str]] = None, task_agent: str = "") -> Optional[dict]:
+                        environ: Optional[Mapping[str, str]] = None, task_file=None) -> Optional[dict]:
     """The row a room operation acts through: the row whose server equals the room ID's domain
     exactly; for an ID naming no domain, or no room, the primary. None keeps the caller's own
     single-connection resolution: fewer than two rows, no primary, or an unreadable record.
     NoConnectionForRoom when the domain has no row, or its row is disconnected.
     In a pool worker's session (`session_worker`) with an identity of its own, `acting_identity`
-    decides, given the agent the task being answered was addressed to (`task_agent`, if any)."""
+    decides; a reply to `task_file` posts as the agent `task_reply_agent` binds it to, or is refused."""
     try:
         every = _read(record_path(workspace))
     except (SchemaError, OSError):
         return None
-    own = acting_identity(every, room_id, session_worker(environ), workspace, task_agent)
+    worker = session_worker(environ)
+    agent = ""
+    if task_file is not None and _enabled_own(every, worker):
+        agent = task_reply_agent(task_file, room_id, worker, every, workspace)
+    own = acting_identity(every, room_id, worker, workspace, agent)
     if own is not None:
         return dict(own)
     rows = _core_rows(every)
@@ -1732,11 +1736,11 @@ def _server_row(rows: list, server: str) -> dict:
 
 
 def room_agent_mxid(room_id: Optional[str], *, workspace: Optional[Path] = None,
-                    environ: Optional[Mapping[str, str]] = None, task_agent: str = "") -> Optional[str]:
+                    environ: Optional[Mapping[str, str]] = None, task_file=None) -> Optional[str]:
     """The agent identity a room operation acts as, from the row `connection_for_room` routes it to:
     the row's recorded `agent_mxid`, else AGENT_MXID in the row's channel env file, kept only when it
     names that row's server. None keeps the caller's own resolution; '' when the row names none."""
-    row = connection_for_room(room_id, workspace, environ, task_agent)
+    row = connection_for_room(room_id, workspace, environ, task_file)
     if row is None:
         return None
     environ = os.environ if environ is None else environ
@@ -1831,10 +1835,10 @@ def connection_credential(row: Mapping[str, object], environ: Optional[Mapping[s
 
 def room_credential(room_id: Optional[str], *, workspace: Optional[Path] = None,
                     environ: Optional[Mapping[str, str]] = None, vault=None,
-                    task_agent: str = "") -> "Optional[tuple[str, str]]":
+                    task_file=None) -> "Optional[tuple[str, str]]":
     """(gateway_url, token) a room operation must use, or None to keep the caller's own resolution
     (see `connection_for_room`). NoConnectionForRoom names what is missing."""
-    row = connection_for_room(room_id, workspace, environ, task_agent)
+    row = connection_for_room(room_id, workspace, environ, task_file)
     return None if row is None else connection_credential(row, environ, vault=vault)
 
 
@@ -2385,17 +2389,25 @@ def session_worker(environ: Optional[Mapping[str, str]] = None) -> str:
     return worker if WORKER_RE.match(worker) else ""
 
 
+def _enabled_own(rows: list, worker: str) -> list:
+    return [r for r in rows if worker and r.get("worker") == worker and not r.get("disabled")]
+
+
+def _agent_of(row: Mapping[str, object]) -> str:
+    return str(row.get("agent_mxid") or "").strip()
+
+
 def acting_identity(rows: list, room_id: Optional[str], worker: str,
                     workspace: Optional[Path] = None, task_agent: str = "") -> Optional[dict]:
     """The row `worker`'s session acts through in `room_id`; None when it has no enabled identity
     row of its own (or is the core's session), leaving the install's rule. Identity comes from the
     task, never from which lane once handled the room:
-    - answering a task addressed to the worker's agent (`task_agent`): its own row; addressed to any
-      other agent: the core's row for the room, that agent's where it serves the room's server;
+    - answering a task (`task_agent`, as `task_reply_agent` bound it): exactly that agent's row, the
+      worker's own or a core one, serving the room; any other row is refused, never substituted;
     - no task: its own row on the room's server (with no room or a domainless one, its only row),
       except a core lane's own owner DM, which stays the core's; a server it has no row on, the core's.
     NoConnectionForRoom when nothing serves the room: never the shared token in its place."""
-    own = [r for r in rows if worker and r.get("worker") == worker and not r.get("disabled")]
+    own = _enabled_own(rows, worker)
     if not own:
         return None
     server = server_of_room(room_id or "")
@@ -2403,8 +2415,10 @@ def acting_identity(rows: list, room_id: Optional[str], worker: str,
         own[0] if len(own) == 1 else None)
     agent = (task_agent or "").strip()
     if agent:
-        if mine is not None and agent == str(mine.get("agent_mxid") or "").strip():
+        if mine is not None and agent == _agent_of(mine):
             return mine
+        if any(agent == _agent_of(r) for r in own):
+            raise NoConnectionForRoom(f"the task is addressed to {agent}, which does not serve this room")
         return _core_row_for(rows, server, agent)
     core = [r for r in _core_rows(rows) if not server or server in _row_servers(r)]
     if mine is not None and not (room_id and any(room_id in _lane_owner_dms(r, workspace) for r in core)):
@@ -2413,14 +2427,17 @@ def acting_identity(rows: list, room_id: Optional[str], worker: str,
 
 
 def _core_row_for(rows: list, server: str, agent: str) -> dict:
-    """The core row a worker's session acts through: on `server` (any, with none named), `agent`'s
-    where one is, else the only or primary one. NoConnectionForRoom when no core row serves it."""
+    """The core row a worker's session acts through on `server` (any, with none named): `agent`'s
+    only, when one is named; else the only or primary one. NoConnectionForRoom when none serves it."""
     core = _core_rows(rows)
-    named = [r for r in core if agent and str(r.get("agent_mxid") or "").strip() == agent]
-    if server:
-        return next((r for r in named if server in _row_servers(r) and not r.get("disabled")), None) \
-            or _server_row(core, server)
-    row = (named or [None])[0] or (core[0] if len(core) == 1 else next((r for r in core if r["primary"]), None))
+    if agent:
+        row = next((r for r in core if _agent_of(r) == agent and (not server or server in _row_servers(r))), None)
+        if row is None:
+            raise NoConnectionForRoom(f"no core connection is agent {agent} on this room's server")
+    elif server:
+        return _server_row(core, server)
+    else:
+        row = core[0] if len(core) == 1 else next((r for r in core if r["primary"]), None)
     if row is None:
         raise NoConnectionForRoom("no connection serves this room or is primary; a worker's session "
                                   "never posts with the shared token")
@@ -2430,19 +2447,69 @@ def _core_row_for(rows: list, server: str, agent: str) -> dict:
     return row
 
 
-def task_answer_agent(task_file, workspace: Optional[Path] = None) -> str:
-    """The agent a task file is answered as: its `receiving_instance` header, else the agent of the
-    lane that queued it (`task_agent_mxid`); "" when neither names one or the file is unreadable."""
-    path = Path(task_file)
+def _same_file(a, b) -> bool:
     try:
-        from local_task_protocol import parse_task_headers
-        agent = str(parse_task_headers(path.read_text(encoding="utf-8", errors="replace"))
-                    .headers.get("receiving_instance") or "").strip()
-    except (OSError, ValueError, ImportError):
-        return ""
-    if _STRICT_MXID_RE.fullmatch(agent):
+        return a is not None and b is not None and os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def task_reply_agent(task_file, room_id: Optional[str], worker: str, rows: list,
+                     workspace: Optional[Path] = None) -> str:
+    """The agent `worker`'s reply to `task_file` in `room_id` posts as. The file must be readable and
+    the live file of the id it declares; its receiving agent and queuing lane must agree; the room
+    must be the task's own. Addressed to the worker's own agent, that is all. Addressed to a core
+    agent, the worker must also hold the task (its own tasks folder, or the pool's delivery sentinel)
+    and it must be neither answered nor archived. NoConnectionForRoom names any failed check."""
+    import local_task_protocol
+    import task_archive
+    from task_envelope import attested_task_headers
+    ws = _workspace(workspace)
+    path = Path(task_file) if task_file else None
+
+    def refuse(why: str):
+        raise NoConnectionForRoom(f"refusing to post for task file {task_file!r}: {why}")
+    try:
+        text = path.read_text(encoding="utf-8") if path is not None else None
+    except (OSError, UnicodeError) as e:
+        refuse(f"unreadable ({type(e).__name__})")
+    if text is None:
+        refuse("no task file named")
+    tid = task_archive.task_id_for(path, accept=local_task_protocol.valid_archive_lookup_id)
+    if not tid or not _same_file(task_archive.find_task_file(path.parent, tid), path):
+        refuse("it is not the live file of the task it names")
+    headers = attested_task_headers(text, ws).headers
+    said = str(headers.get("receiving_instance") or "").strip()
+    lane = task_agent_mxid(tid, ws)
+    if said and not _STRICT_MXID_RE.fullmatch(said):
+        refuse("its receiving agent is malformed")
+    if said and lane and said != lane:
+        refuse(f"it is addressed to {said} but its lane runs as {lane}")
+    agent = said or lane
+    if not agent:
+        refuse("it names no receiving agent")
+    task_room = str(headers.get("channel_id") or headers.get("source_room_id") or "").strip()
+    if not task_room or task_room != (room_id or ""):
+        refuse("the post's room is not the task's room")
+    if any(agent == _agent_of(r) for r in _enabled_own(rows, worker)):
         return agent
-    return task_agent_mxid(path.name[:-4] if path.name.endswith(".txt") else path.name, workspace)
+    if not any(agent == _agent_of(r) for r in _core_rows(rows)):
+        refuse(f"it is addressed to {agent}, neither this worker's agent nor the core's")
+    home = task_home(tid, ws)
+    held = home["own"] and home["worker"] == worker and _same_file(path.parent, home["tasks"])
+    if not held and _same_file(path.parent, ws / "tasks"):
+        try:
+            from pool_holder import pool_holder
+            held = pool_holder(ws, tid) == worker
+        except OSError:
+            refuse("who holds it cannot be read")
+    if not held:
+        refuse("this worker does not hold it")
+    from task_disposition import CLAIMED, PENDING, task_disposition
+    state = task_disposition(ws, tid)
+    if state not in (PENDING, CLAIMED):
+        refuse(f"it is {state}")
+    return agent
 
 
 class NoWorkerCredential(ConnectionsError):

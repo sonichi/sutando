@@ -179,8 +179,9 @@ creates that agent in AG2 Space, and its access token becomes a connection row n
 The core owns that identity's lifecycle and its lane; the worker's session uses it. From the worker's seat, room
 clients (`room_ops.py`, `notify.py`, the room-database adapters) act as the worker's own agent in rooms on its
 server, through the one resolver (`connections.acting_identity`, see `docs/connections.md`, "In a pool worker's
-session"). Identity comes from the task: pass `--task-file` when a post answers one, and a task a core lane
-routed to the worker is answered as the core's agent; a post with no task is the worker's own, and a room no
+session"). Identity comes from the task: pass `--task-file` when a post answers one. A task a core lane
+routed to the worker, which the worker holds and has not answered, is answered as the core's agent in that
+task's room; a task file that does not bind is refused. A post with no task is the worker's own, and a room no
 identity serves is refused, never sent with the shared token. The seat's
 `s-space` MCP tools mint as the worker's agent too: the launcher exports `AG2_MCP_WORKER_CREDENTIAL`, the
 argv of `scripts/connections.py worker-mcp-credential`, which hands the desktop's MCP proxy the worker's vault

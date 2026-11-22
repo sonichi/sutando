@@ -586,9 +586,14 @@ answers before the rule above:
 
 - identity comes from the task being answered, never from which lane once handled the room. A
   client answering a task passes it (`room_ops.py <verb> --task-file <task>`, `notify.py
-  --task-file`): a task addressed to the worker's agent (its `receiving_instance` header, else the
-  lane that queued it) is answered as the worker's row; one addressed to another agent is answered
-  as the core's row for the room, that agent's where it serves the room's server;
+  --task-file`), and the reply posts as exactly the agent the task was addressed to, or is refused
+  (`connections.task_reply_agent`). The file must be readable and the live file of the id it
+  declares; its `receiving_instance` header and the lane that queued it must agree; the post's room
+  must be the task's own (`channel_id`, else `source_room_id`). A task addressed to the worker's
+  agent then posts as the worker's row. One addressed to a core agent also needs the worker to hold
+  it (in its own tasks folder, or in `tasks/` with the pool's delivery sentinel naming it) and the
+  task to be neither answered nor archived (`task_disposition`); it posts as that agent's core row.
+  A mismatch is refused, never answered as another identity;
 - a post with no task is the worker's own: its row on the room's server, with the token its vault
   key holds and its `agent_mxid`; with no room or a domainless one, its only enabled row. A core
   lane's own owner DM (`state/owner-routing[.<instance>].json`, under the row's instance or a

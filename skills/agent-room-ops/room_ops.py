@@ -299,7 +299,7 @@ def _run(argv):
     ap.add_argument("--strict", action="store_true",
                     help="exit 1 on ok:false; must precede the subcommand (default: always 0)")
     a = ap.parse_args(argv)
-    if getattr(a, "task_file", None):
+    if getattr(a, "task_file", None) is not None:
         _gateway.set_task_file(a.task_file)
     if a.cmd == "capabilities":
         say_flags = sorted(o for act in sub.choices["say"]._actions for o in act.option_strings

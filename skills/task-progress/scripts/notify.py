@@ -277,7 +277,7 @@ def _load_channel_env_containment():
 _channel_env_is_contained = _load_channel_env_containment()
 
 
-def _room_credential(room_id: str, task_file: str = ""):
+def _room_credential(room_id: str, task_file: "str | None" = None):
     """`connections.room_credential` for the room, answering `task_file`'s task: (url, token),
     None to keep the source's own chain, or False when it refused (reason printed)."""
     try:
@@ -286,14 +286,13 @@ def _room_credential(room_id: str, task_file: str = ""):
     except Exception:
         return None
     try:
-        agent = connections.task_answer_agent(task_file) if task_file else ""
-        return connections.room_credential(room_id, task_agent=agent)
+        return connections.room_credential(room_id, task_file=task_file)
     except connections.ConnectionsError as e:
         print(f"[task-progress] {e}", file=sys.stderr)
         return False
 
 
-def _gateway_config(source: str, room_id: str = "", task_file: str = "") -> "tuple[str, str] | None":
+def _gateway_config(source: str, room_id: str = "", task_file: "str | None" = None) -> "tuple[str, str] | None":
     """(url, token) for a gateway-bridged source, or None (reason already
     printed). Shared by the text and media senders so the two cannot drift."""
     if not _SOURCE_SLUG_RE.match(source or ""):
@@ -375,7 +374,7 @@ def _event_id_or_empty(raw: str | None, field: str) -> "str | None":
 
 def send_remote_gateway(source: str, channel_id: str, message: str,
                         thread_root: str | None = None, reply_to: str | None = None,
-                        extra: dict | None = None, task_file: str = "") -> bool:
+                        extra: dict | None = None, task_file: "str | None" = None) -> bool:
     """Generic sender for gateway-bridged channels (any --source with a
     channels/<source>/.env carrying REMOTE_TASK_URL + REMOTE_TASK_TOKEN).
 
@@ -698,7 +697,7 @@ def main() -> int:
         ok = send_telegram(channel, message)
     else:
         ok = send_remote_gateway(source, channel, message, thread_root=thread_root,
-                                 reply_to=reply_to, extra=extra, task_file=str(payload or args.task_file or ""))
+                                 reply_to=reply_to, extra=extra, task_file=None if args.task_file is None else str(payload or args.task_file))
 
     if ok:
         _record_sent(args.task_file)
