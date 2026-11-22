@@ -779,6 +779,27 @@ class SspaceToolsTest(unittest.TestCase):
         prompt = next(r["text"] for r in self.w.records() if r.get("method") == "session/prompt")
         self.assertNotIn("ag2-space MCP tools", prompt)
 
+    def test_agys_own_mcp_call_shape_is_granted_by_its_prefixed_name(self):
+        # The toolCall agy sent on 2026-11-21 19:11 (keys: args, kind, name, rawInput, sessionUpdate, status, title,
+        # toolCallId), its name the shim's alias under agy's `mcp_<server>_` prefix.
+        def call(name, kind="other"):
+            raw = {"query": "page", "room_id": "!r:s.space", "toolSummary": "find the page action"}
+            return {"toolCall": {"args": raw, "kind": kind, "name": name, "rawInput": raw, "sessionUpdate": "tool_call",
+                                 "status": "pending", "title": "Run " + name, "toolCallId": "t1"}, "options": OPTS}
+
+        def decide(params, grant=True):
+            return acp_host.decide_permission(params, False, str(self.w.cwd),
+                                              **({"mcp_tool_ok": gc.mcp_auth.owner_tool_ok} if grant else {}))[:2]
+        self.assertEqual(decide(call("mcp_ag2-space_room_actions_search")),
+                         (True, "MCP tool ag2-space/room_actions_search"))
+        self.assertTrue(decide(call("mcp_ag2-space_room_action_execute"))[0])
+        for refused in ("mcp_ag2-space_agent_unlink", "mcp_ag2-space_relay_token_issue", "mcp_ag2-space_room_actions_search_2",
+                        "mcp_other_room_actions_search", "mcp_ag2_space_room_actions_search", "room_actions_search",
+                        "mcp_ag2-space_room.actions.search"):
+            self.assertFalse(decide(call(refused))[0], refused)
+        self.assertFalse(decide(call("mcp_ag2-space_room_actions_search"), grant=False)[0], "a guest turn grants no MCP tool")
+        self.assertFalse(decide(call("mcp_ag2-space_room_actions_search", kind="execute"))[0], "a command stays refused")
+
     def test_the_policy_maps_mcp_calls_by_server_and_tool_never_by_title(self):
         def decide(tool_call, owner=True):
             return acp_host.decide_permission({"toolCall": tool_call, "options": OPTS}, owner, str(self.w.cwd),

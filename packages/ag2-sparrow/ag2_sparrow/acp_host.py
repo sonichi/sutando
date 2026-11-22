@@ -250,11 +250,18 @@ def decide_permission(params, owner, cwd, command_ok=None, own_file=None, comman
 # defines none) until a real agy request is measured.
 MCP_IDENTITY_KEYS = (("serverName", "toolName"), ("mcpServer", "mcpTool"))
 _IDENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+# agy names an MCP call `mcp_<server>_<tool>` in the toolCall's `name` (live run, 2026-11-21); the server is
+# read up to the first `_`, so a server name holding one never matches its own grants.
+AGY_MCP_NAME_RE = re.compile(r"mcp_([A-Za-z0-9-]+)_([A-Za-z0-9_-]{1,64})")
 
 
 def mcp_tool_identity(tool_call):
     """(server, tool) when the request names an MCP server and tool in structured fields (`MCP_IDENTITY_KEYS`),
     both plain identifiers; None otherwise. The title is the agent's free text and never read here."""
+    name = tool_call.get("name")
+    agy = AGY_MCP_NAME_RE.fullmatch(name) if isinstance(name, str) else None
+    if agy:
+        return agy.group(1), agy.group(2)
     for holder in (tool_call, tool_call.get("_meta")):
         if not isinstance(holder, dict):
             continue
