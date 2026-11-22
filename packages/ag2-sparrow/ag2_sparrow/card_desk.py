@@ -15,9 +15,10 @@ ANSWERED = "[no-send] the card answers\n"
 
 
 class Desk:
-    """`cards` each carry KIND (the tap's kind), ASK (the slash command), MARK, HINT and IN_DM, and
-    answer `tapped(verb, sent, result_file)`, `asked_for(words, sent, result_file)`, `offer(sent,
-    result_file)` and `usable()`."""
+    """`cards` each carry KIND (the tap's kind), CARD_ID (the id of the card with its buttons), ASK (the
+    slash command), MARK, HINT and IN_DM, and answer `tapped(verb, sent, result_file)`,
+    `asked_for(words, sent, result_file)`, `offer(sent, result_file)`, `expired(sent, result_file)`
+    and `usable()`."""
 
     def __init__(self, root, publish, quoted, cards):
         self.root, self.publish, self.quoted, self.cards = root, publish, quoted, list(cards)
@@ -34,6 +35,13 @@ class Desk:
             for card in self.cards:
                 if card.KIND == verdict.command.kind:
                     return self.drawn(card, result_file, lambda: card.tapped(verdict.command.verb, sent, result_file))
+        if verdict.verdict == agent_card.FORGED and agent_card.owner_may_act(sent) is None:
+            # The owner tapped a card this agent no longer keeps (a newer one replaced it, it is past its
+            # time, or an earlier install posted it): its kind says so and shows the current one.
+            tapped = (agent_card.card_click(sent) or {}).get("card_id")
+            for card in self.cards:
+                if tapped == card.CARD_ID:
+                    return self.drawn(card, result_file, lambda: card.expired(sent, result_file))
         if verdict.verdict in (agent_card.COMMAND, agent_card.FORGED):
             self.publish(result_file, self.quoted(verdict.say) + "\n")
             return "card-refused"

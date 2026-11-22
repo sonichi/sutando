@@ -17,6 +17,11 @@ import uuid
 from . import card_desk, connector_cards
 
 FILE, CARD = "account.json", "account-switch"
+# A card with no "Switch account" button is not the account card: recorded under its id it would retire
+# that card (one live card per id and room) while the owner still sees its button.
+NOTE = "account-switch-status"
+EXPIRED = "That card has expired, so nothing changed. Here's a new one."
+EXPIRED_NO_CARD = "That card has expired, so nothing changed. Send /account for a new one."
 WAIT_S = 600.0       # a sign-in the owner has not finished by then is given up
 OWED_KEEP = 5        # final cards kept while they cannot be queued
 MARK = "[account-card]"
@@ -44,6 +49,7 @@ def masked(email: str) -> str:
 
 class AccountSwitch:
     KIND, ASK, MARK, HINT, IN_DM = "account", "/account", MARK, HINT, IN_DM
+    CARD_ID = CARD
 
     def __init__(self, state_dir, bridge_state, name, publish, quoted, log, read, begin, cancel, opener):
         self.state_dir, self.bridge_state, self.name = state_dir, bridge_state, name
@@ -100,7 +106,7 @@ class AccountSwitch:
                                              command=agent_card.reply("account", "agent", "switch")))
         if url:
             buttons.append(agent_card.button("Open sign-in page", "url", url=url))
-        return agent_card.build(CARD, state, title="Account", body="Account of %s" % self.name, text=text,
+        return agent_card.build(CARD if ask else NOTE, state, title="Account", body="Account of %s" % self.name, text=text,
                                 **({"buttons": buttons} if buttons else {}))
 
     def say(self, room, built, result_file=None) -> None:
@@ -115,6 +121,13 @@ class AccountSwitch:
 
     def asked_for(self, words, sent, result_file) -> str:
         return self.offer(sent, result_file)
+
+    def expired(self, sent, result_file) -> str:
+        """A tap on an account card that no longer acts: the words, and a fresh card when one can be shown.
+        No sign-in is started by it."""
+        fresh = self.post(sent.get("channel_id"), self.card("pending", self.using(), ask=True))
+        self.publish(result_file, self.quoted(EXPIRED if fresh else EXPIRED_NO_CARD) + "\n")
+        return "account-card-expired"
 
     def tapped(self, verb, sent, result_file) -> str:
         """The owner tapped "Switch account": start a sign-in, show its page here, and say so. The page

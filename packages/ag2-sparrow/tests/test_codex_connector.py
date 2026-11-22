@@ -1018,6 +1018,41 @@ class ModelCardTest(CardWorld, unittest.TestCase):
                          ("gpt-6-sol", [], "switched"))
         self.assertNotIn("Switched", self.serve("task-2", "again"), "told once")
 
+    def test_the_menu_still_acts_after_a_pick_and_a_tap_on_an_expired_card_gets_a_new_one(self):
+        self.assertEqual(self.serve("task-1", "/model"), "[no-send] the model card answers\n")
+        ((_, menu),) = self.posted("$card1")
+        large = next(b["reply"] for b in menu["buttons"] if b["label"] == "Stub Large")
+        self.serve("task-2", large, reply_to="$card1", click=large)
+        ((_, coming),) = self.posted("$card2")
+        self.serve("task-3", "hello")
+        ((_, done),) = self.posted("$card3")
+        # The cards saying what a pick came to are not the menu, and do not retire it.
+        self.assertEqual((menu["id"], coming["id"], done["id"]), (model_switch.CARD, model_switch.NOTE, model_switch.NOTE))
+        five = next(b["reply"] for b in menu["buttons"] if b["label"] == "Stub 5")
+        self.assertEqual(self.serve("task-4", five, reply_to="$card1", click=five), "[no-send] the model card answers\n")
+        self.assertEqual((metrics(self.work)[-1]["card"], self.state()["wanted"]), ("model-picked", "gpt-5.6-terra"))
+        self.posted("$card4")
+        # A newer menu retires the older one: a tap on it says so, shows the current one, and switches nothing.
+        self.serve("task-5", "/model")
+        self.posted("$card5")
+        text = self.serve("task-6", large, reply_to="$card1", click=large)
+        self.assertEqual((text.strip(), metrics(self.work)[-1]["card"]), (model_switch.EXPIRED, "model-card-expired"))
+        ((room, fresh),) = self.posted("$card6")
+        self.assertEqual((room, fresh["id"], self.state()["wanted"]), (self.DM, model_switch.CARD, "gpt-5.6-terra"))
+        # With the bridge gone the words say how to get one; anyone else's tap is refused as before.
+        self.dm("task-7", large, reply_to="$card1", click=large)
+        c, _ = self.connector()
+        shutil.rmtree(self.bridge)
+        self.assertEqual(c.desk.task(str(self.work / "tasks" / "task-7.txt"), str(self.work / "o.txt")),
+                         "model-card-expired")
+        self.assertEqual((self.work / "o.txt").read_text().strip(), model_switch.EXPIRED_NO_CARD)
+        (self.work / "tasks" / "task-7.txt").unlink()      # answered here, not by the served connector
+        self.bridge.mkdir(parents=True)
+        self.assertIn("couldn't match that button",
+                      self.serve("task-8", large, reply_to="$card1", click=large, tier="team", channel="!room:s.space",
+                                 kind="room"))
+        self.assertEqual((self.posted(), metrics(self.work)[-1]["card"]), ([], "card-refused"))
+
 
 class AccountCardTest(CardWorld, unittest.TestCase):
     """The owner's account card (account_switch): asked for in their DM, tapped, signed in in the browser
@@ -1181,6 +1216,36 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.assertEqual([o["key"] for o in left], ["k%d" % n for n in range(1, account_switch.OWED_KEEP + 1)])
         c.accounts.keep({}, list(backlog))
         self.assertEqual((c.accounts.tell(), len(queued())), ([], 2 + account_switch.OWED_KEEP + 1))
+
+    def test_the_account_card_still_acts_after_a_tap_and_a_tap_on_an_expired_one_gets_a_new_one(self):
+        self.serve("task-1", "/account")
+        ((_, card),) = self.posted("$card1")
+        said = card["buttons"][0]["reply"]
+        self.serve("task-2", said, reply_to="$card1", click=said)
+        ((_, link),) = self.posted("$card2")
+        # The card with the sign-in page is not the account card, and does not retire it.
+        self.assertEqual((card["id"], link["id"]), (account_switch.CARD, account_switch.NOTE))
+        self.serve("task-3", said, reply_to="$card1", click=said)
+        self.assertEqual(metrics(self.work)[-1]["card"], "account-started", "the first card still acts")
+        self.posted("$card3")
+        # A newer account card retires the older one: a tap on it says so, shows the current one, and
+        # starts no sign-in.
+        self.serve("task-4", "/account")
+        self.posted("$card4")
+        started = len(self.opened)
+        text = self.serve("task-5", said, reply_to="$card1", click=said)
+        self.assertEqual((text.strip(), metrics(self.work)[-1]["card"], len(self.opened)),
+                         (account_switch.EXPIRED, "account-card-expired", started))
+        ((room, fresh),) = self.posted("$card5")
+        self.assertEqual((room, fresh["id"], fresh["buttons"][0]["reply"]), (self.DM, account_switch.CARD, said))
+        # With the card queue down the words say how to get one; anyone else's tap is refused as before.
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("bridge down")):
+            text = self.serve("task-6", said, reply_to="$card1", click=said)
+        self.assertEqual(text.strip(), account_switch.EXPIRED_NO_CARD)
+        self.assertIn("couldn't match that button",
+                      self.serve("task-7", said, reply_to="$card1", click=said, tier="team", channel="!room:s.space",
+                                 kind="room"))
+        self.assertEqual((self.posted(), metrics(self.work)[-1]["card"]), ([], "card-refused"))
 
     def test_a_final_card_that_could_not_be_posted_is_kept_and_posted_later(self):
         (self.home / "stub-login").write_text("success bob@example.org")

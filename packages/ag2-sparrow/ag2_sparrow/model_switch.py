@@ -16,6 +16,11 @@ import uuid
 from . import connector_cards
 
 FILE, CARD, ASK = "model.json", "model-switch", "/model"
+# What a pick came to is a card of its own: recorded under the menu's id it would retire the menu
+# (one live card per id and room), whose buttons the owner still sees and may tap again.
+NOTE = "model-switch-status"
+EXPIRED = "That card has expired, so nothing changed. Here's a new one."
+EXPIRED_NO_CARD = "That card has expired, so nothing changed. Send /model for a new one."
 BUTTONS = 6          # the card's button limit
 UNTOLD_KEEP = 5      # outcome notices kept while their cards cannot be queued
 
@@ -55,6 +60,7 @@ class ModelSwitch:
     those ids are ever offered or accepted, and only while the runtime lists them."""
 
     KIND, ASK, MARK, HINT, IN_DM = "model", ASK, MARK, HINT, IN_DM      # what card_desk routes by
+    CARD_ID = CARD
 
     def __init__(self, state_dir, root, bridge_state, name, publish, quoted, log, refresh=None, allowed=None):
         self.state_dir, self.root, self.bridge_state, self.name = state_dir, root, bridge_state, name
@@ -125,7 +131,7 @@ class ModelSwitch:
         agent_card, _ = connector_cards._core()
         if picked:
             kind, body, text, status = self.parts(state, picked, ran, same)
-            return agent_card.build(CARD, kind, title="Model", body=body, text=text, **({"status": status} if status else {}))
+            return agent_card.build(NOTE, kind, title="Model", body=body, text=text, **({"status": status} if status else {}))
         names = {m["id"]: m["name"] for m in self.offered(state)}
         now, coming = state.get("current") or "", self.pending(state)
         buttons = [agent_card.button(name, "reply", reply="Use %s" % name,
@@ -186,6 +192,16 @@ class ModelSwitch:
     def asked_for(self, named, sent, result_file) -> str:
         """The owner's "/model" (the card) or "/model <name>" (the way to a model with no button)."""
         return self.pick(named.lower(), sent, result_file, by_name=True) if named else self.offer(sent, result_file)
+
+    def expired(self, sent, result_file) -> str:
+        """A tap on a card of this kind that no longer acts, as the desk hands it over."""
+        return self.expired_card(sent, self.state(), result_file)
+
+    def expired_card(self, sent, state, result_file) -> str:
+        """Answer a tap on a model card that no longer acts: the words, and a fresh card when one can be shown."""
+        fresh = bool(self.offered(state)) and self.post(sent.get("channel_id"), self.menu(state))
+        self.publish(result_file, self.quoted(EXPIRED if fresh else EXPIRED_NO_CARD) + "\n")
+        return "model-card-expired"
 
     def listed(self, result_file) -> "dict | None":
         """The state with a fresh list from the runtime; None (and the owner told) when it would not list."""
