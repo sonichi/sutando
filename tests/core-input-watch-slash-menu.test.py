@@ -78,19 +78,19 @@ class TestWhatStillCounts(unittest.TestCase):
         self.assertIn("Overwrite the existing config file?", tail)
         self.assertNotIn("/model-switch", tail)
 
-    def test_a_gate_line_indented_under_a_menu_row_still_flags(self):
-        # Indented at/past the description column it is shaped like a wrapped description;
-        # its gate signature ends the run, so it stays evidence.
+    def test_a_gate_line_indented_under_a_menu_row_escalates_to_a_human(self):
+        # Shaped like a wrapped description, so it surfaces as unknown: seen, never answered.
         row = "plus optional rule tweaks\n"
-        for hint, kind in (("Press Enter to continue", "press-enter"),
-                           ("Do you want to proceed? Enter to confirm", "permission")):
+        for hint in ("Press Enter to continue", "Do you want to proceed? Enter to confirm"):
             with self.subTest(hint):
                 pane = MENU.replace(row, row + " " * 41 + hint + "\n", 1)
                 self.assertIn(" " * 41 + hint, pane)
-                got = _mod.classify(pane)
-                self.assertIsNotNone(got)
-                self.assertEqual(got[0], kind)
-                self.assertIn(hint, got[1])
+                kind, excerpt = _mod.classify(pane)
+                self.assertEqual(kind, "unknown")
+                self.assertIn(hint, excerpt)
+                state, _detail, prompt, kind = _mod.compose_state(pane, "idle", True, styled_pane=pane)
+                self.assertEqual(state, "blocked-human")
+                self.assertIsNone(_mod.answer_step(state, kind, prompt, None))
 
     def test_known_gap_accept_hint_indented_under_menu_row_is_not_flagged(self):
         # A real dialog drawn this way would be missed; this pins it so a change is noticed.
@@ -107,6 +107,39 @@ class TestWhatStillCounts(unittest.TestCase):
                 "Enter to confirm · Esc to cancel\n"
                 "❯ \n")
         self.assertEqual(_mod.classify(pane)[0], "unknown")
+
+
+class TestWrappedHelpIsNeverAutoAnswered(unittest.TestCase):
+    """A description may name an auto-answerable dialog's words: no key may be sent for it,
+    or Enter would submit the half-typed slash command."""
+
+    WRAPPED = "the shared sender, wait for the CLI to accept it"
+
+    def _key(self, pane):
+        state, _detail, prompt, kind = _mod.compose_state(pane, "idle", True, styled_pane=pane)
+        return state, kind, _mod.answer_step(state, kind, prompt, None)
+
+    def test_press_enter_to_continue_in_wrapped_help(self):
+        self.assertIn(self.WRAPPED, MENU)
+        pane = MENU.replace(self.WRAPPED, "the shared sender; Press Enter to continue", 1)
+        # Positive control: the same words outside a completion list are auto-answerable.
+        self.assertEqual(_mod.auto_answer(_mod.classify("Press Enter to continue\n")[0]), "Enter")
+        state, kind, key = self._key(pane)
+        self.assertIsNone(key)
+        self.assertNotEqual(state, "blocked-known")
+        self.assertIsNone(_mod.auto_answer(kind))
+
+    def test_press_enter_to_continue_on_a_menu_row(self):
+        pane = MENU.replace("plus optional rule tweaks", "Press Enter to continue", 1)
+        state, _kind, key = self._key(pane)
+        self.assertIsNone(key)
+        self.assertEqual(state, "idle-ready")
+
+    def test_the_delivery_gate_holds_rather_than_naming_a_kind(self):
+        pane = MENU.replace(self.WRAPPED, "the shared sender; Press Enter to continue", 1)
+        # The delivery gate holds the pane as an unrecognised dialog: busy, never a named kind.
+        verdict = _mod._pg_classify_pane(pane, _mod.CLAUDE)
+        self.assertEqual((verdict.state, verdict.reason), ("busy", "unlisted"))
 
 
 class TestFinishedToolSummariesAreNotGates(unittest.TestCase):
