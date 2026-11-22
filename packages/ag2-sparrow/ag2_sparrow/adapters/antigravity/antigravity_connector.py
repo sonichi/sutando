@@ -13,7 +13,7 @@ prelude (run a room-read command, write results/<task>.txt) is for a core with a
 passed on (`session_lines`). A turn that ends with no text says what it did instead (`no_answer_why`).
 
 Sessions, the permission policy and the framing are acp_host's: the owner may read or edit under the working
-directory, no command is ever granted. task_io.turn_policy decides the tier. As Sutando answers every non-owner
+directory, no command is ever granted. task_io.admission decides the tier. As Sutando answers every non-owner
 in a read-only sandbox, a guest, plain team and any unknown tier are always served, isolated; an attested
 collaborator is served only under --allow-non-owner, isolated too. A non-owner turn runs isolated: a fresh
 temporary directory per task holds its working directory and its own agy home (`--gemini-dir`, with deny-all
@@ -41,9 +41,9 @@ from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore
 from ...acp_client import AcpClient as _SharedClient
 from ...relay_loop import count_arg
 from ...team_guardrail import SANDBOXED_DELEGATION_CODEX
-from ...task_io import (NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock, exit_code,
+from ...task_io import (NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock, admission, exit_code,
                         exit_on_sigterm, holder_consumer, load_done, make_dirs, parse_task, record_done,
-                        release_lock, root_path, stop_requested, OWNER, turn_policy)
+                        release_lock, root_path, stop_requested)
 
 NAME = "Antigravity"
 DEFAULT_ACP_COMMAND = "agy acp"
@@ -272,9 +272,8 @@ class Connector:
         headers, message, operator_lines = parse_task(path)
         # As Sutando, a guest, plain team or unknown tier is served read-only (guest_turn) with no opt-in; a wire
         # `team` without the collaborator stamp is a guest too (fail closed).
-        policy = turn_policy(headers, allow_non_owner=True, allow_collaborator=self.args.allow_non_owner)
-        owner = policy.kind == OWNER
-        if not policy.served:
+        tier = admission(headers, allow_non_owner=True)
+        if tier is None or (tier == "collaborator" and not self.args.allow_non_owner):
             log("refused (non-owner) ->", task_id, headers["access_tier"])
             publish(result_file, NON_OWNER_REFUSED)
             return {"task": task_id, "status": "refused", "tier": headers["access_tier"]}
@@ -282,10 +281,10 @@ class Connector:
         event, _ = trigger_of(headers)
         log("wake ->", task_id, headers["access_tier"], event or "message")
         t0 = time.time()
-        status, text, detail, turn = self.run_turn(task_id, headers, prompt, owner)
+        status, text, detail, turn = self.run_turn(task_id, headers, prompt, tier == "owner")
         publish(result_file, self.answer_body(headers, status, text, detail, turn))
         return {"task": task_id, "status": status, "detail": detail[:200], "event_type": event,
-                "tier": headers["access_tier"], "isolated": not owner, "turn_s": round(time.time() - t0, 3),
+                "tier": headers["access_tier"], "isolated": tier != "owner", "turn_s": round(time.time() - t0, 3),
                 "permissions": turn.decisions, "updates": dict(turn.updates), "answer_chars": len(text or "")}
 
     def pending_tasks(self, seen):
