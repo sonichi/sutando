@@ -116,6 +116,15 @@ def _sutando_apply_worker_label_overrides(labels: dict, config_version: int,
 _SUTANDO_WORKER_LABEL_APPLIER = (_sutando_apply_worker_label_overrides
                                  if _WORKER_LABEL_SCRIPT.is_file() else None)
 
+def _sutando_core_recovery():
+    """state/core-recovery.json through its one owner (src/core_recovery_state.py)."""
+    import core_recovery_state
+    return core_recovery_state.read(WS)
+
+
+# The core's record rides the core's lanes' heartbeats; a pool worker's lane is not the core.
+_SUTANDO_CORE_RECOVERY_READER = None if _OWN_DIRS else _sutando_core_recovery
+
 # Logged recovery commands name the workspace through its resolver, never its absolute path.
 _SUTANDO_WORKSPACE_RESOLVER = "bash scripts/sutando-config.sh workspace"
 

@@ -3136,7 +3136,12 @@ def _tier_for(user_id, attested_tier=None):
 # A gateway can hand the task body a media MARKER instead of raw bytes:
 MEDIA_MARKER_TAG = re.sub(r"[^A-Za-z0-9_-]", "",
                           os.environ.get("REMOTE_MEDIA_MARKER") or "remote-media")
-MEDIA_MARKER_RE = re.compile(r"\[" + re.escape(MEDIA_MARKER_TAG) + r":([^\]]*)\]")
+# AG2 Space's gateway tag: seat bridges set no REMOTE_MEDIA_MARKER, so unset it is resolved too (a live
+# Antigravity turn got the raw URL, 2026-11-21); an explicit REMOTE_MEDIA_MARKER is the only tag.
+AG2_MEDIA_MARKER_TAG = "ag2space-media"
+MEDIA_MARKER_TAGS = ((MEDIA_MARKER_TAG,) if os.environ.get("REMOTE_MEDIA_MARKER")
+                     else (MEDIA_MARKER_TAG, AG2_MEDIA_MARKER_TAG))
+MEDIA_MARKER_RE = re.compile(r"\[(?:" + "|".join(map(re.escape, MEDIA_MARKER_TAGS)) + r"):([^\]]*)\]")
 
 HS_MEDIA_TOKEN = _FOUND.media_token
 diagnostics.register_secret(HS_MEDIA_TOKEN)
@@ -3145,6 +3150,8 @@ diagnostics.register_secret(HS_MEDIA_TOKEN)
 HS_MEDIA_ORIGIN = (os.environ.get("REMOTE_MEDIA_HS_ORIGIN") or "").rstrip("/")
 MEDIA_DIR = Path(os.environ.get("REMOTE_MEDIA_DIR") or str(_STATE / "remote-media"))
 MAX_MEDIA_BYTES = int(os.environ.get("REMOTE_MEDIA_MAX_BYTES") or str(25 * 1024 * 1024))
+# How many markers one task may make us download (its own and the replied-to message's together).
+MAX_MEDIA_PER_TASK = 10
 _EXT_BY_MIME = {
     "image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
     "image/gif": ".gif", "image/webp": ".webp", "image/svg+xml": ".svg",
@@ -4548,10 +4555,53 @@ def _diagnostic_health(health: "dict | None") -> "dict | None":
     return {**row, "condition": "abnormal", "reason": "health-check", "since": ts}
 
 
+# The core's recovery record (core_recovery.v1), read by the adapter's injected reader; a
+# standalone sparrow and a pool worker's lane have none, and their beats carry no such block.
+_CORE_RECOVERY_READER = globals().get("_SUTANDO_CORE_RECOVERY_READER")
+CORE_RECOVERY_CAPABILITY = "core_recovery.v1"
+CORE_RECOVERY_MAX_BYTES = 4096
+# A broker that refuses the beat with the block gets beats without it for this long.
+CORE_RECOVERY_REFUSED_BACKOFF_S = 3600.0
+_core_recovery_refused_until = 0.0
+_core_recovery_logged = None
+
+
+def _log_recovery_sent(payload: dict) -> None:
+    """One log line per change of the record the broker accepted: its state and incident, the
+    proof a live run reads that health.recovery left the Mac. Nothing else of it is logged."""
+    global _core_recovery_logged
+    rec = (payload.get("health") or {}).get("recovery")
+    key = (rec.get("state"), rec.get("incident")) if isinstance(rec, dict) else None
+    if key is not None and key != _core_recovery_logged:
+        _log(f"heartbeat carried {CORE_RECOVERY_CAPABILITY}: state={key[0]} incident={key[1]}")
+    _core_recovery_logged = key
+
+
+def _core_recovery() -> "dict | None":
+    """The adapter's record when it has one and it fits the bound, else None. Never raises."""
+    if not callable(_CORE_RECOVERY_READER) or time.time() < _core_recovery_refused_until:
+        return None
+    try:
+        rec = _CORE_RECOVERY_READER()
+        if isinstance(rec, dict) and len(json.dumps(rec)) <= CORE_RECOVERY_MAX_BYTES:
+            return rec
+    except Exception:  # noqa: BLE001 -- the record is advisory; the beat goes out without it
+        pass
+    return None
+
+
+def _with_recovery(health: "dict | None") -> "dict | None":
+    rec = _core_recovery()
+    if rec is None:
+        return health
+    return {**(health or {"alive": None, "motion": "unknown"}), "recovery": rec}
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
     global _heartbeat_retry_at, _heartbeat_backoff, _last_heartbeat_at, _last_core_health
+    global _core_recovery_refused_until
     now = time.time()
     # Ahead of every early return: a Stop reaches a running task only through these beats.
     _post_task_beats(inflight, force=force)
@@ -4561,7 +4611,8 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     health = (health_command.with_motion(_HEALTH_COMMAND.row(), bool(inflight))
               if _HEALTH_COMMAND else _core_health(_health_snapshot()))
     core_health = health
-    health = _diagnostic_health(health)
+    base = _diagnostic_health(health)
+    health = _with_recovery(base)
     changed = health is not None and health != _last_core_health
     if not force and not changed and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
@@ -4589,7 +4640,22 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         if health is not None:
             payload["health"] = health
             payload["capabilities"].append("worker_health.v1")
-        reply = _req("POST", "/v1/heartbeat", payload, timeout=10)
+            if "recovery" in health:
+                payload["capabilities"].append(CORE_RECOVERY_CAPABILITY)
+        try:
+            reply = _req("POST", "/v1/heartbeat", payload, timeout=10)
+        except urllib.error.HTTPError as e:
+            if e.code not in (400, 422) or "recovery" not in (payload.get("health") or {}):
+                raise
+            _core_recovery_refused_until = time.time() + CORE_RECOVERY_REFUSED_BACKOFF_S
+            _log(f"heartbeat refused with the recovery block: HTTP {e.code} — sending without it")
+            drop = {CORE_RECOVERY_CAPABILITY} | (set() if base is not None else {"worker_health.v1"})
+            payload = {k: v for k, v in payload.items() if k != "health"}
+            payload["capabilities"] = [c for c in payload["capabilities"] if c not in drop]
+            if base is not None:
+                payload["health"] = base
+            reply = _req("POST", "/v1/heartbeat", payload, timeout=10)
+        _log_recovery_sent(payload)
         _heartbeat_retry_at, _heartbeat_backoff = 0.0, 0.0
         _record_setup_hint(reply)
         _refresh_served_setup(reply)
@@ -6101,21 +6167,12 @@ def _download_bytes(url: str, headers: dict, cap: int) -> bytes:
     return data
 
 
-def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
-    """If `body` carries a media marker, download the attachment to a local
-    file and rewrite the marker to `[File attached: <path>]`. Returns the body
-    unchanged on any failure (drop-in safe).
-
-    When `_refs_out` is provided and a fetch succeeds, the corresponding
-    `AttachmentRef` (interaction-model 4D, step 1.5) is appended to it — so
-    _write_task can stamp structured `attachments:` headers alongside the legacy
-    body line, without disturbing any of the drop-in-safe early returns."""
-    m = MEDIA_MARKER_RE.search(body or "")
-    if not m:
-        return body
-    inner = m.group(1).strip()
+def _fetch_media_marker(inner: str) -> "tuple[str, Path, object] | None":
+    """Download the attachment one marker's inner text names; (label, local path,
+    AttachmentRef) on success, None on any failure (the caller leaves the marker)."""
+    inner = inner.strip()
     if not inner:
-        return body
+        return None
     parts = inner.split(None, 1)
     url = parts[0]
     attrs = parts[1] if len(parts) > 1 else ""
@@ -6124,7 +6181,7 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
     kind = _marker_attr(attrs, "kind")
 
     if not url.startswith(("https://", "http://")):
-        return body
+        return None
     headers = {"User-Agent": "sutando-gateway-client/1.0"}
     # Credential routing is by PARSED exact origin and exact media path, never string prefix or substring.
     route = _media_route(url)
@@ -6136,13 +6193,13 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
     else:
         # Only a media path on the configured gateway or homeserver origin is fetched.
         _log("media URL is not a gateway or homeserver media path — leaving marker as-is")
-        return body
+        return None
 
     try:
         data = _download_bytes(url, headers, MAX_MEDIA_BYTES)
     except Exception as e:  # noqa: BLE001 — drop-in safe
         _log(f"media fetch failed ({diagnostics.describe(e)}) — leaving marker as-is")
-        return body
+        return None
     try:
         MEDIA_DIR.mkdir(parents=True, exist_ok=True)
         ext = _EXT_BY_MIME.get(mime.lower(), "")
@@ -6159,15 +6216,64 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
         path = Path(path_str)
     except Exception as e:  # noqa: BLE001
         _log(f"media save failed ({diagnostics.describe(e)}) — leaving marker as-is")
-        return body
+        return None
     _log(f"fetched media → {path} ({len(data)} bytes)")
+    ref = local_task_protocol.AttachmentRef(
+        locator=str(path), mime=mime, filename=(name or path.name), size=len(data))
+    return ("Photo attached" if str(kind) == "m.image" else "File attached"), path, ref
+
+
+def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
+    """Download every media marker in `body` (up to MAX_MEDIA_PER_TASK) to a local
+    file and rewrite each to `[File attached: <path>]` (`[Photo attached: …]` for an
+    image). A marker inside the broker's quoted reply-context record is the replied-to
+    message's: it is fetched the same way, rewritten in place to
+    `[… attached (from replied-to message): <path>]` (the record re-encoded, so it stays
+    well-formed quoted data) and listed after the message's own. A marker that cannot
+    be fetched is left as it was (drop-in safe).
+
+    When `_refs_out` is provided, each fetched file's `AttachmentRef`
+    (interaction-model 4D, step 1.5) is appended to it — so _write_task can stamp
+    structured `attachments:` headers alongside the legacy body lines."""
+    if not body or not MEDIA_MARKER_RE.search(body):
+        return body
+    # Only the message itself and the quoted record's `body` are scanned; every other
+    # quoted field stays inert. Each attempt, failed or not, spends one budget slot.
+    tail_at, reply = local_task_protocol.quoted_block_spans(body)
+    if tail_at is None:
+        # A malformed quoted block: no part of it can be told from the sender's own text, so nothing is fetched.
+        _log("malformed reply-context block — no media fetched")
+        return body
+    budget = [MAX_MEDIA_PER_TASK]
+
+    def resolve(segment: str, quoted: bool, refs: list) -> str:
+        def one(m: "re.Match") -> str:
+            if budget[0] <= 0:
+                return m.group(0)
+            budget[0] -= 1
+            got = _fetch_media_marker(m.group(1))
+            if got is None:
+                return m.group(0)
+            label, path, ref = got
+            refs.append(ref)
+            return f"[{label} (from replied-to message): {path}]" if quoted else f"[{label}: {path}]"
+        # Replacement as a FUNCTION so backslashes/`\g<>` in the path can never be
+        # interpreted as re.sub group references.
+        return MEDIA_MARKER_RE.sub(one, segment)
+
+    own_refs: list = []
+    replied_refs: list = []
+    tail = resolve(body[tail_at:], False, own_refs)    # the message's own first
+    head = body[:tail_at]
+    if reply is not None:
+        start, end, record, _label = reply
+        quoted = resolve(record["body"], True, replied_refs)
+        if quoted != record["body"]:
+            record = {**record, "body": quoted}
+            head = body[:start] + json.dumps(record, ensure_ascii=False) + body[end:tail_at]
     if _refs_out is not None:
-        _refs_out.append(local_task_protocol.AttachmentRef(
-            locator=str(path), mime=mime, filename=(name or path.name), size=len(data)))
-    label = "Photo attached" if str(kind) == "m.image" else "File attached"
-    # Replacement as a FUNCTION so backslashes/`\g<>` in the path can never be
-    # interpreted as re.sub group references.
-    return MEDIA_MARKER_RE.sub(lambda _m: f"[{label}: {path}]", body, count=1)
+        _refs_out.extend(own_refs + replied_refs)
+    return head + tail
 
 
 # Fleet-agent directory cache — peer agents (in the broker's /v1/agents) are
