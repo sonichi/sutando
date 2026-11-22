@@ -30,6 +30,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 
 ## Fixed
 
+- Cards: a tap on a card from a core on the env (legacy) connection, which records no lane (the model card, worker approval and others), was answered "I couldn't match that button to a card I sent" and nothing happened. `agent_card.py click` now takes such a card's owner from the legacy connection row instead of treating the owner as unknown.
 - ag2-sparrow (antigravity-local): images and files people send now reach Antigravity: images as ACP image blocks in the prompt (when agy declares `image`), and on the owner's turn a read-only copy of the task's own files in a folder agy may read (`additionalDirectories`) but never change; an isolated non-owner turn gets the images only. The owner's final message keeps its delivery markers (`[channel:]`, `[thread]`, `[file:]` for a file under the working directory only), as Claude Code and Codex results do; non-owners' markers stay neutralised. A bridge launched without `REMOTE_MEDIA_MARKER` (the desktop's and connect's seat bridges) now resolves the AG2 Space gateway's `[ag2space-media: …]` marker too, so its download reaches every local adapter.
 
 <!-- fix() PRs go here -->

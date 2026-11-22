@@ -546,13 +546,17 @@ class Click:
 
 
 def lane_owner(workspace, default: str = "") -> Callable[[str], str]:
-    """lane -> its owner's mxid, from this machine's core connections; `default` for a card with no lane."""
+    """lane -> its owner's mxid, from this machine's core connections. A card with no lane was posted on
+    the legacy connection (the core row whose `instance` is ""), so it is that row's owner; `default`
+    only when this machine has no such row."""
     def owner(lane: str) -> str:
-        if not lane:
-            return default
-        import connections
-        return next((str(r.get("owner_mxid") or "") for r in connections.read_rows(workspace)
-                     if r.get("instance") == lane and not r.get("worker")), "")
+        try:
+            import connections
+        except ImportError:  # a copy without the core's connection record (ag2-sparrow's bundle)
+            return "" if lane else default
+        found = next((str(r.get("owner_mxid") or "") for r in connections.read_rows(workspace)
+                      if r.get("instance") == lane and not r.get("worker")), "")
+        return found or ("" if lane else default)
     return owner
 
 
