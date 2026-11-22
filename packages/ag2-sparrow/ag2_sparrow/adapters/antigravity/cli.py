@@ -27,6 +27,7 @@ from ...acp_client import AUTH_REQUIRED, AcpError
 from ...connect_bridge import EXTERNAL, UNIT
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, Shape
 from . import antigravity_connector as gc
+from .gemini_key import authenticate_with_app_key
 
 SHAPE = "antigravity-local"
 COMMAND = "ag2-sparrow-antigravity-local"
@@ -120,6 +121,8 @@ def probe(cfg: dict, factory=gc.AcpClient, timeout: float = PROBE_TIMEOUT_S) -> 
             return "", f"{cfg['ACP_COMMAND']} did not start ({e})"
         try:
             init = client.initialize(timeout)
+            keyed = authenticate_with_app_key(client, init, timeout, shlex.split(cfg["ACP_COMMAND"]),
+                                              agent_id=cfg.get("AGENT_ID") or "")
             client.call("session/new", {"cwd": cwd, "mcpServers": []}, timeout)
         except AcpError as e:
             if e.code == AUTH_REQUIRED:
@@ -130,7 +133,8 @@ def probe(cfg: dict, factory=gc.AcpClient, timeout: float = PROBE_TIMEOUT_S) -> 
     info = init.get("agentInfo") or {}
     load = "yes" if (init.get("agentCapabilities") or {}).get("loadSession") else "no (each task opens a new session)"
     name = " ".join(str(info.get(k) or "") for k in ("name", "version")).strip() or "an ACP agent"
-    return f"{name}, signed in, protocol {init.get('protocolVersion')}, session resume {load}", ""
+    signed = "on the Gemini API key saved in the app" if keyed else "signed in"
+    return f"{name}, {signed}, protocol {init.get('protocolVersion')}, session resume {load}", ""
 
 
 def holder_words(root: str, _rec=None) -> str:

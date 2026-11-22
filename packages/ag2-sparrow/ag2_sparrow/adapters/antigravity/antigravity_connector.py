@@ -55,6 +55,7 @@ from ...bounded_file_read import read_regular_bytes
 from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore, quoted, trigger_of  # noqa: F401
 from ...acp_client import AcpClient as _SharedClient
 from ...relay_loop import count_arg
+from .gemini_key import API_KEY_AUTH, authenticate_with_app_key
 from ...team_guardrail import SANDBOXED_DELEGATION_CODEX
 from ...task_io import (COLLABORATOR, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, RESTRICTED, LockRefused,
                         acquire_lock, exit_code, exit_on_sigterm, holder_consumer, load_done, make_dirs, parse_task,
@@ -847,7 +848,8 @@ class Connector:
                                            self.store, STDERR_NAME, NOT_SIGNED_IN, log, media=media,
                                            model=str(picked or "") or None,
                                            on_models=self.models_seen,
-                                           mcp_servers=self.mcp_servers_for(headers, kind))
+                                           mcp_servers=self.mcp_servers_for(headers, kind),
+                                           on_initialized=self.use_app_gemini_key)
         if isolated is None:
             with guest_turn(self.args, headers, message) as pair:
                 return self.run_turn(task_id, headers, prompt, False, pair, message=message)
@@ -864,6 +866,14 @@ class Connector:
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt, decide,
                                        self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=turn,
                                        media=acp_host.Media(images=media.images))
+
+    def use_app_gemini_key(self, client, init, argv):
+        """Owner and collaborator turns only: agy on the Gemini API key saved in the app (gemini_key). The auth
+        mode is saved with the Session: a Session opened on the Google sign-in is not resumed on the key (its
+        session/load still bills that account's quota), nor the other way round."""
+        keyed = authenticate_with_app_key(client, init, self.args.rpc_timeout, argv,
+                                  agent_id=getattr(self.args, "agent_id", None) or "", log=log)
+        return API_KEY_AUTH if keyed else acp_host.SIGNED_IN_AUTH
 
     @staticmethod
     def mcp_grant(headers, kind=None):
