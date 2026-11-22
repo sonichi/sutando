@@ -389,8 +389,9 @@ class Connector:
                 break
             owed.pop(0)
             told = "switched" if first.get("picked") == first.get("ran") else "not-switched"
+        owed = owed[-UNTOLD_KEEP:]
         if changes or owed != ([] if kept is None else kept):
-            self.save_model_state(untold=owed[-UNTOLD_KEEP:], **changes)
+            self.save_model_state(untold=owed, **changes)
         return "untold" if owed else (outcome or told)
 
     def run_turn(self, task_id, headers, prompt, owner):
