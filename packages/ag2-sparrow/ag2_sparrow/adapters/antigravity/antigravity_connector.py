@@ -724,8 +724,9 @@ class Connector:
                                      kind=kind)
                 status, text, detail, turn = self.run_turn(task_id, headers, prompt, False, pair, message=message)
         # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
-        # The owner's pick runs on every turn, whoever sends it; the outcome is told in the owner's DM only.
-        told = self.models.tell(turn.live, turn.model, headers.get("channel_id"))
+        # The owner's pick runs on every turn, whoever sends it; the outcome is told in the owner's DM only,
+        # and only the owner's own turn may settle it as failed (another runtime's refusal is not theirs).
+        told = self.models.tell(turn.live, turn.model, headers.get("channel_id"), may_fail=kind == OWNER)
         asked = self.desk.marked(headers.get("access_tier"), path, status, text, result_file)
         unsaid = "" if asked else quoted(self.models.unsaid()).strip()
         body = self.answer_body(headers, status, text, detail, turn) + (unsaid and unsaid + "\n")
