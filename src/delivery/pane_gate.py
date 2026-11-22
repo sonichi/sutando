@@ -296,10 +296,8 @@ def _slash_menu_rows(rows: List[str]) -> set:
     return out
 
 
-def gate_evidence(tail: str, styled_tail: Optional[str] = None,
-                  adapter: RuntimeAdapter = CLAUDE) -> str:
-    """Exclude idle chrome, verified ghost suggestions, completed conditional recaps and the
-    completion list a slash command in the composer opens."""
+def _slash_menu(tail: str, styled_tail: Optional[str], adapter: RuntimeAdapter):
+    """(rows, prompt line, composer index, completion-list row indexes) of `tail`."""
     rows = tail.splitlines()
     line = prompt_line(styled_tail if styled_tail is not None else tail, adapter)
     composer_i = next((i for i in range(len(rows) - 1, -1, -1)
@@ -307,6 +305,37 @@ def gate_evidence(tail: str, styled_tail: Optional[str] = None,
     menu = (_slash_menu_rows(rows[:composer_i])
             if composer_i is not None and line is not None and line.text.lstrip().startswith("/")
             else set())
+    return rows, line, composer_i, menu
+
+
+def slash_menu_gate_rows(tail: str, styled_tail: Optional[str] = None,
+                         adapter: RuntimeAdapter = CLAUDE) -> List[str]:
+    """Wrapped description lines of a completion list, per contiguous run, whose run holds a
+    gate signature and an await hint (on one line or split). Indentation cannot tell such a
+    run from a dialog's, so it is never an answerable gate: callers surface it to a human,
+    and never send a key for it."""
+    rows, _, _, menu = _slash_menu(tail, styled_tail, adapter)
+    runs: List[List[int]] = []
+    for i in sorted(menu):
+        if _SLASH_MENU_ROW.match(_SGR.sub("", rows[i])):
+            continue
+        if runs and runs[-1][-1] == i - 1:
+            runs[-1].append(i)
+        else:
+            runs.append([i])
+    out: List[str] = []
+    for run in runs:
+        text = "\n".join(rows[i] for i in run)
+        if adapter.await_hint.search(text) and any(rx.search(text) for _, rx in adapter.gate_signatures):
+            out.extend(rows[i] for i in run)
+    return out
+
+
+def gate_evidence(tail: str, styled_tail: Optional[str] = None,
+                  adapter: RuntimeAdapter = CLAUDE) -> str:
+    """Exclude idle chrome, verified ghost suggestions, completed conditional recaps and the
+    completion list a slash command in the composer opens."""
+    rows, line, composer_i, menu = _slash_menu(tail, styled_tail, adapter)
     completed = (composer_i is not None and line is not None and not line.text.strip()
                  and any(row.strip() == "Nothing needs you this round."
                          for row in rows[:composer_i]))
@@ -343,22 +372,25 @@ def _gate(capture: str, tail: str, line: Optional[PromptLine], adapter: RuntimeA
         footer_hits = list(adapter.idle_ready.finditer(tail))
         beyond_footer = tail[footer_hits[-1].end():] if footer_hits else ""
         newer = "\n".join(part for part in (following, beyond_footer) if part.strip())
+        menu_gates = slash_menu_gate_rows(newer, adapter=adapter)
         newer = gate_evidence(newer, adapter=adapter)
         if not newer or not adapter.await_hint.search(newer):
-            return None
+            return "unlisted" if menu_gates else None
         for kind, rx in adapter.gate_signatures:
             if rx.search(newer):
                 return kind
         # An await hint we cannot name is an UNRECOGNISED dialog, not the absence of one.
         # Falling through to "no gate" let a stale empty composer vouch for a live dialog.
         return "unlisted"
-    tail = gate_evidence(tail, "\n".join(_tail_lines(capture)), adapter)
+    styled = "\n".join(_tail_lines(capture))
+    menu_gates = slash_menu_gate_rows(tail, styled, adapter)
+    tail = gate_evidence(tail, styled, adapter)
     if not adapter.await_hint.search(tail):
-        return None
+        return "unlisted" if menu_gates else None
     for kind, rx in adapter.gate_signatures:
         if rx.search(tail):
             return kind
-    return None
+    return "unlisted" if menu_gates else None
 
 
 def automation_leftover(capture: Optional[str], adapter: RuntimeAdapter, workspace=None,

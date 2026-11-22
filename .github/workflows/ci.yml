@@ -14,7 +14,8 @@ env:
 # branch could hold several full CI runs at once and starve the ones that
 # matter. Observed 2026-08-19: `fix/gateway-lane-restart-without-watcher-reap`
 # held two in-flight CI runs at different heads simultaneously.
-# `main` is deliberately NOT cancelled — every commit on it should be tested.
+# A running `main` run is never cancelled, but GitHub keeps one pending run per group: a newer
+# push replaces a queued main run, so not every commit gets its own run (the next run covers it).
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
