@@ -1,0 +1,61 @@
+---
+name: account-switch
+description: "The core's account card in the owner's DM: which account the core (Codex or Claude) is signed in to, a switch to an account saved on this Mac (Codex core; restarts the core and confirms), and a pointer to Settings to add another. Owner-only, DM-only; a sign-in code never travels as a chat message."
+user-invocable: true
+---
+
+# account-switch
+
+Use it when the **owner, in their DM**, asks to switch, change or add the core's account, or asks
+which account the core is on and wants to change it. Anyone else, or any other room: say the
+account is switched from the owner's DM and do nothing.
+
+```bash
+python3 skills/account-switch/scripts/account_card.py post --room <owner DM> [--reply-to <event>]
+python3 skills/account-switch/scripts/account_card.py post --room <owner DM> --print   # the card, not sent
+python3 skills/account-switch/scripts/account_card.py status                          # JSON: in use + saved
+```
+
+Never start a sign-in yourself, and never ask for, accept or repeat a sign-in code, link code or
+token in chat. If the owner pastes one, do not use it; tell them to paste it in Settings, in the
+app's own box.
+
+## The card
+
+- **In use.** A Codex core (TUI or app-server seat) is read by `src/codex_account.py`; a Claude core
+  by `claude auth status --json` under the core's config dir. Addresses are masked (first letter and
+  domain) on the card.
+- **Saved accounts (Codex core only).** The desktop keeps a copy of each ChatGPT sign-in the core has
+  had in `<app support>/accounts/codex/<key>.json` (ag2space-cinny-desktop#1264; `<app support>` is
+  `$SUTANDO_APP_SUPPORT`, else the folder of the desktop's `runtime.json`). `post` saves the
+  signed-in account there first, in the desktop's own format, so a later sign-in never loses it. Up to
+  five other saved accounts get a "Use <account>" button. The key on a button is 16 hex of a hash of
+  Codex's account id; it names no account and carries no credential.
+- **Add another account.** Answers with where to sign in: Settings → Connections → the Sutando (on this
+  computer) row → "Switch account". The app's sign-in terminal shows the link and takes the code in its
+  own box. Then the owner asks for the card again.
+
+A Claude core has no saved accounts (its sign-in lives in the Keychain), so its card offers only
+"Add another account".
+
+## A tap
+
+`src/agent_card.py click` routes a tap to `account_card.py reply` (the recorded handler). Only the
+owner's tap, in the DM the card was posted in, on a card this agent posted, acts
+(`agent_card.click_verdict`). A "Use" tap acts only for a key that card offered and the store still
+holds; a tap on the account already in use changes nothing; a second switch while one is under way is
+refused.
+
+A "Use" tap answers at once ("Switching the core to X. It restarts once this turn has finished…") and
+starts `account_card.py switch` detached, in its own session, because the core restarts. `switch`:
+
+1. keeps the current `auth.json` in memory and saves it in the store;
+2. writes the saved one as the core's `<CODEX_HOME>/auth.json` (0600);
+3. runs `src/agent/graceful-restart.sh` (it waits for the core's turn to end, then
+   `start-cli.sh --restart`; a seat core is replaced as a seat);
+4. reads the core's sign-in again and posts the outcome in the same DM: **"Switched. The core restarted
+   and is signed in as X."**, or **"I could not switch to X. I'm still signed in as Y. <reason>"**. When
+   the restart did not happen (exit 3 not ready, 4 put off), the previous `auth.json` is put back.
+
+Its log is `<workspace>/logs/account-card.log`; nothing in it, in the cards or in the JSON output is a
+token or a code.

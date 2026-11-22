@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+"""A card in the owner's DM that says which account the core is signed in to and switches it.
+
+    python3 account_card.py [--workspace WS] post --room ROOM [--reply-to EVENT] [--print]
+    python3 account_card.py [--workspace WS] reply --task-file PATH
+    python3 account_card.py [--workspace WS] switch --room ROOM --key KEY --attempt ID
+    python3 account_card.py [--workspace WS] status
+
+`post` sends the card to the owner's checked DM and records it (src/issued_cards.py), so only the
+owner's tap on it acts (agent_card.click_verdict). It names the account in use: on a Codex core
+(TUI or app-server seat) from src/codex_account.py, on a Claude core from `claude auth status --json`
+under the core's config dir. Addresses are shown masked (first letter and domain).
+
+Saved accounts are the desktop's store for the Sutando core on Codex
+(`<app support>/accounts/codex/<key>.json`, {label, auth}, folder 0700, files 0600; desktop
+ag2space-cinny-desktop#1264). The key is 16 hex of the SHA-256 of Codex's account id, so a key on a
+button names no account. `post` first saves the signed-in account there, as the desktop does, so a
+later sign-in never loses it. Each other saved account gets a "Use" button. A Claude core has no
+saved accounts (its sign-in is in the Keychain), so its card offers only "Add another account".
+
+"Add another account" never signs in from chat: it points the owner to Settings → Connections →
+the Sutando core's row → "Switch account", where the sign-in terminal takes the code in the app's
+own box. A sign-in code or token never goes in a message, a card or a log.
+
+A "Use" tap answers "switching" at once and starts `switch` detached, because the core restarts.
+`switch` keeps the current `auth.json` in memory and saves it to the store, puts the saved one in
+place (0600), and runs src/agent/graceful-restart.sh, which waits for the core to finish its turn.
+After the restart it reads the core's sign-in again and posts the outcome in the same DM:
+"Switched. The core restarted and is signed in as X." or "I could not switch to X. I'm still
+signed in as Y. <reason>". When the restart does not happen, the previous `auth.json` is put back.
+
+Every command prints one JSON object. Exit 0 done, 1 a negative answer, 2 refused. Stdlib only.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+_HERE = Path(__file__).resolve().parent
+_REPO = _HERE.parents[2]
+for _p in (str(_REPO / "src"), str(_REPO / "skills" / "worker-pool" / "scripts")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import agent_card as ac  # noqa: E402
+import issued_cards  # noqa: E402
+
+CARD_ID, KIND, TARGET = "core-account-switch", "account", "core"
+# The "switching" answer and the outcome have an id of their own: under the menu's id they would
+# retire the menu (one live card per id and room) while its buttons are still on screen.
+NOTE_ID = "core-account-switch-status"
+HANDLER = "skills/account-switch/scripts/account_card.py reply"
+ADD = "add"
+RESTART = _REPO / "src" / "agent" / "graceful-restart.sh"
+KEY_RE = re.compile(r"[0-9a-f]{16}")
+STORE_SUB = ("accounts", "codex")
+ISSUED = ("state", "account-card-keys.json")
+ISSUED_KEPT = 20
+RUNNING = ("state", "account-card-switch.json")
+RUNNING_STALE_S = 1800
+RESTART_TIMEOUT_S = 1500
+SETTLE_TRIES, SETTLE_PAUSE_S = 4, 15
+USE_BUTTONS = ac.LIMITS["buttons"] - 1          # one place is "Add another account"
+SETTINGS = ("Settings → Connections → the Sutando (on this computer) row → \"Switch account\". "
+            "A sign-in opens there; paste the code only into that box in the app, never in this chat.")
+NO_CODE = "Never send me a sign-in code or token here."
+GONE = "That account is no longer on my list. Ask me for the account card again."
+BUSY = "An account switch is already under way. I'll confirm here when it has finished."
+NOT_CODEX = "Saved accounts are kept only for a core on Codex. Add the account in Settings instead."
+# graceful-restart.sh's exit codes, as one short reason the owner reads.
+RESTART_REASONS = {3: "the core could not get ready to restart",
+                   4: "the core was busy, so the restart was put off",
+                   5: "the restart was only rehearsed"}
+
+
+def _emit(payload: dict, code: int = 0) -> int:
+    print(json.dumps(payload, sort_keys=True, ensure_ascii=False))
+    return code
+
+
+def masked(email: str) -> str:
+    """An address shortened to what tells two accounts apart: its first letter and its domain."""
+    name, at, domain = (email or "").partition("@")
+    return "%s…@%s" % (name[:1], domain) if name and at and domain else ""
+
+
+def masked_label(label: str) -> str:
+    """A desktop store label ("me@example.com (plus)") with its address masked."""
+    return re.sub(r"[^\s()@]+@[^\s()@]+", lambda m: masked(m.group(0)) or m.group(0), label or "")
+
+
+# ── the core and its sign-in ──────────────────────────────────────────────────────────────────────
+
+def runtime() -> str:
+    """"codex" or "claude": the core's runtime as its launcher resolves it; "claude" when unreadable."""
+    try:
+        from sutando_config import resolve_core_runtime
+        return "codex" if resolve_core_runtime() == "codex" else "claude"
+    except Exception:  # noqa: BLE001 - an unreadable config is the default runtime
+        return "claude"
+
+
+def codex_home() -> Path:
+    import codex_account
+    return codex_account.home()
+
+
+def store_dir() -> Optional[Path]:
+    """The desktop's saved-account store for the core on Codex; None when no desktop hosts this engine."""
+    app = os.environ.get("SUTANDO_APP_SUPPORT", "").strip()
+    if not app:
+        try:
+            from sutando_config import desktop_runtime_selection_path
+            path = desktop_runtime_selection_path()
+        except Exception:  # noqa: BLE001 - no config: no desktop
+            path = None
+        app = str(path.parent) if path else ""
+    return Path(app).joinpath(*STORE_SUB) if app else None
+
+
+def _claims(jwt: str) -> dict:
+    import codex_account
+    return codex_account._claims(jwt)
+
+
+def identity(auth_text: str) -> Optional[tuple]:
+    """(store key, label) of a ChatGPT sign-in in a Codex `auth.json`, the desktop's rule: the id is
+    Codex's `tokens.account_id`, else the token's account id claim, else its `sub`; the label is
+    "email (plan)". None for an API key or anything unreadable. No token is returned."""
+    try:
+        auth = json.loads(auth_text)
+    except (TypeError, ValueError):
+        return None
+    tokens = auth.get("tokens") if isinstance(auth, dict) else None
+    if not isinstance(tokens, dict):
+        return None
+    raw = tokens.get("id_token")
+    raw = raw.get("raw_jwt") if isinstance(raw, dict) else raw
+    claims = _claims(raw) if isinstance(raw, str) else {}
+    auth_claims = claims.get("https://api.openai.com/auth") if isinstance(claims.get("https://api.openai.com/auth"), dict) else {}
+    ident = next((v for v in (tokens.get("account_id"), auth_claims.get("chatgpt_account_id"), claims.get("sub"))
+                  if isinstance(v, str) and v), "")
+    if not ident:
+        return None
+    email = claims.get("email") if isinstance(claims.get("email"), str) else ""
+    plan = auth_claims.get("chatgpt_plan_type") if isinstance(auth_claims.get("chatgpt_plan_type"), str) else ""
+    label = f"{email} ({plan})" if email and plan else email or (f"ChatGPT account ({plan})" if plan else "ChatGPT account")
+    return hashlib.sha256(ident.encode("utf-8")).hexdigest()[:16], label
+
+
+def _live_auth(home: Path) -> Optional[str]:
+    try:
+        return (home / "auth.json").read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def save_current(store: Path, auth_text: Optional[str]) -> bool:
+    """Save a ChatGPT sign-in in the store when its copy is missing or different; True when it wrote."""
+    from local_record import write_text_whole
+    ident = identity(auth_text) if auth_text else None
+    if ident is None:
+        return False
+    key, label = ident
+    path = store / f"{key}.json"
+    body = json.dumps({"label": label, "auth": auth_text}, separators=(",", ":"))
+    try:
+        if path.read_text(encoding="utf-8") == body:
+            return False
+    except OSError:
+        pass
+    _private_dir(store)
+    write_text_whole(path, body)
+    return True
+
+
+def saved(store: Optional[Path], current_key: str = "") -> list:
+    """[{key, label, current}] of the store, by label; labels as the store keeps them (unmasked)."""
+    out = []
+    try:
+        entries = sorted(store.iterdir()) if store else []
+    except OSError:
+        entries = []
+    for entry in entries:
+        key = entry.name[:-5] if entry.name.endswith(".json") else ""
+        if not KEY_RE.fullmatch(key):
+            continue
+        try:
+            label = json.loads(entry.read_text(encoding="utf-8")).get("label")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(label, str) and label:
+            out.append({"key": key, "label": label, "current": key == current_key})
+    return sorted(out, key=lambda s: s["label"])
+
+
+def _saved_auth(store: Path, key: str) -> Optional[str]:
+    try:
+        auth = json.loads((store / f"{key}.json").read_text(encoding="utf-8")).get("auth")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return auth if isinstance(auth, str) and identity(auth) and identity(auth)[0] == key else None
+
+
+def claude_status(run=subprocess.run) -> dict:
+    """{signed_in, email, plan} of the Claude core's config dir, by `claude auth status --json`;
+    signed_in None when it could not be read."""
+    env = dict(os.environ)
+    try:
+        from sutando_config import resolve_claude_sutando_config_dir
+        env["CLAUDE_CONFIG_DIR"] = str(resolve_claude_sutando_config_dir())
+    except Exception:  # noqa: BLE001 - the core's own environment names it then
+        pass
+    try:
+        r = run(["claude", "auth", "status", "--json"], capture_output=True, text=True, timeout=30, env=env,
+                stdin=subprocess.DEVNULL)
+        data = json.loads(r.stdout or "")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {"signed_in": None, "email": "", "plan": ""}
+    if not isinstance(data, dict) or not isinstance(data.get("loggedIn"), bool):
+        return {"signed_in": None, "email": "", "plan": ""}
+    return {"signed_in": data["loggedIn"], "email": str(data.get("email") or ""),
+            "plan": str(data.get("subscriptionType") or "")}
+
+
+def current(rt: str, *, run=subprocess.run, codex_read=None) -> dict:
+    """{runtime, signed_in, shown, key}: the core's sign-in as the owner may read it (masked)."""
+    if rt == "codex":
+        home = codex_home()
+        ident = identity(_live_auth(home) or "")
+        if codex_read is None:
+            import codex_account
+            codex_read = codex_account.read
+        acct = codex_read(home) or {}
+        if acct.get("kind") == "apiKey":
+            return {"runtime": rt, "signed_in": True, "shown": "an OpenAI API key", "key": ""}
+        if not acct.get("kind") and ident is None:
+            return {"runtime": rt, "signed_in": False, "shown": "", "key": ""}
+        email = masked(str(acct.get("email") or "")) or (masked_label(ident[1]) if ident else "")
+        plan = f" ({acct['plan']})" if acct.get("plan") and acct.get("email") else ""
+        return {"runtime": rt, "signed_in": True, "shown": (email + plan) or "a ChatGPT account",
+                "key": ident[0] if ident else ""}
+    st = claude_status(run)
+    shown = (masked(st["email"]) or "an Anthropic account") + (f" ({st['plan']})" if st["plan"] else "")
+    return {"runtime": rt, "signed_in": st["signed_in"], "shown": shown if st["signed_in"] else "", "key": ""}
+
+
+def in_use_words(cur: dict) -> str:
+    cli = "Codex" if cur["runtime"] == "codex" else "Claude Code"
+    if cur["signed_in"] is None:
+        return f"I could not read which account the core ({cli}) is signed in to."
+    if not cur["signed_in"]:
+        return f"The core ({cli}) is not signed in."
+    return f"The core ({cli}) is signed in as {ac.md_escape(cur['shown'])}."
+
+
+# ── the card ──────────────────────────────────────────────────────────────────────────────────────
+
+def menu_card(cur: dict, others: list) -> tuple:
+    """(body, card): a "Use" button per other saved account (up to five), then "Add another account"."""
+    buttons = []
+    for s in others[:USE_BUTTONS]:
+        label = ("Use " + masked_label(s["label"]))[: ac.LIMITS["label"]]
+        buttons.append(ac.button(label, "reply", style="secondary", reply=label,
+                                 command=ac.reply(KIND, TARGET, s["key"])))
+    buttons.append(ac.button("Add another account", "reply", style="primary", reply="Add another account",
+                             command=ac.reply(KIND, TARGET, ADD)))
+    using = in_use_words(cur)
+    if cur["runtime"] == "codex":
+        more = (" Pick a saved account to switch to; the core restarts on it." if others else
+                " No other account is saved on this computer yet.")
+    else:
+        more = " To use another Anthropic account, add it in Settings."
+    note = f"{NO_CODE} Adding an account happens in Settings, where the app takes the code."
+    return ac.build(CARD_ID, "info", title="Core account", avatar_=ac.avatar(initial="A"), text=using + more,
+                    buttons=buttons, note=note, note_tone="dim", body=f"{using} Reply \"switch account\" for options.")
+
+
+def notice_card(state: str, status: str, words: str) -> tuple:
+    return ac.build(NOTE_ID, state, title="Core account", avatar_=ac.avatar(initial="A"), status=status,
+                    text=words, body=words)
+
+
+def _core(ws: Path) -> dict:
+    import pool_provision
+    return pool_provision.core_lane(ws, None)
+
+
+def _execute(ws: Path, lane: Optional[str]):
+    import pool_provision
+    return pool_provision.core_actions(ws, lane)[0].execute
+
+
+def _owner_dm(ws: Path, core: dict) -> str:
+    import connections
+    return connections.owner_dm(core, ws)
+
+
+def _post(ws: Path, room: str, body: str, card: dict, operation_id: str, *, reply_to: str = "", core=None,
+          execute=None) -> dict:
+    """Post `card` in `room`, which must be the owner's checked DM, and record it for its taps."""
+    try:
+        core = core if core is not None else _core(ws)
+        lane = str(core.get("instance") or "")
+        dm = _owner_dm(ws, core)
+        execute = execute if execute is not None else _execute(ws, lane or None)
+        eid = ac.send_card(execute, room, body, card, operation_id=operation_id, reply_to=reply_to, owner_dm=dm)
+    except ac.CardError as e:
+        return {"status": "failed", "why": str(e)}
+    except Exception as e:  # noqa: BLE001 - no core lane or no credential: named, nothing posted
+        return {"status": "failed", "why": f"{type(e).__name__}: {e}"}
+    try:
+        issued_cards.record(ws, eid, card, room=dm, lane=lane, handler=HANDLER)
+    except OSError as e:
+        return {"status": "posted", "event_id": eid, "why": f"its buttons will not act ({type(e).__name__})"}
+    return {"status": "posted", "event_id": eid}
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def remember_keys(ws: Path, event_id: str, keys: list, now: float) -> None:
+    """Keep which saved keys the card posted as `event_id` offered; fixed once kept."""
+    from file_lock import locked_file
+    from local_record import write_whole
+    path = ws.joinpath(*ISSUED)
+    with locked_file(path.with_name(path.name + ".lock")):
+        cards = _read_json(path).get("cards")
+        cards = cards if isinstance(cards, dict) else {}
+        if event_id not in cards:
+            cards[event_id] = {"keys": list(keys), "ts": now}
+        newest = sorted(cards.items(), key=lambda kv: float((kv[1] or {}).get("ts") or 0))[-ISSUED_KEPT:]
+        write_whole(path, {"cards": dict(newest)})
+
+
+def offered_keys(ws: Path, event_id: str) -> list:
+    entry = (_read_json(ws.joinpath(*ISSUED)).get("cards") or {}).get(event_id)
+    keys = entry.get("keys") if isinstance(entry, dict) else None
+    return [k for k in keys if isinstance(k, str)] if isinstance(keys, list) else []
+
+
+def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time, run=subprocess.run, codex_read=None) -> int:
+    rt = runtime()
+    cur = current(rt, run=run, codex_read=codex_read)
+    store = store_dir() if rt == "codex" else None
+    if store is not None:
+        try:
+            save_current(store, _live_auth(codex_home()))
+        except OSError:
+            pass  # the card still names the account; only the copy for switching back is missing
+    others = [s for s in saved(store, cur["key"]) if not s["current"]]
+    try:
+        body, card = menu_card(cur, others)
+    except ac.CardError as e:
+        return _emit({"status": "failed", "why": str(e)}, 1)
+    if args.print:
+        return _emit({"body": body, "card": card, "handler": HANDLER})
+    shown = [s["key"] for s in others[:USE_BUTTONS]]
+    tag = hashlib.sha256(",".join(shown).encode()).hexdigest()[:12]
+    out = _post(ws, args.room, body, card, f"account-card:menu:{int(now())}:{tag}", reply_to=args.reply_to or "",
+                core=core, execute=execute)
+    if out.get("event_id"):
+        try:
+            remember_keys(ws, out["event_id"], shown, now())
+        except OSError as e:
+            out["why"] = f"its buttons will not act ({type(e).__name__})"
+    return _emit(out, 0 if out["status"] == "posted" else 1)
+
+
+# ── a tap ─────────────────────────────────────────────────────────────────────────────────────────
+
+def running(ws: Path, now: float) -> dict:
+    rec = _read_json(ws.joinpath(*RUNNING))
+    return rec if rec.get("attempt") and now - float(rec.get("ts") or 0) < RUNNING_STALE_S else {}
+
+
+def start_switch(ws: Path, room: str, key: str, attempt: str, popen=subprocess.Popen) -> int:
+    """Start `switch` in a session of its own, so it outlives the core's restart; its pid."""
+    log = ws / "logs" / "account-card.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    argv = ["nohup", sys.executable, str(Path(__file__).resolve()), "--workspace", str(ws), "switch",
+            "--room", room, "--key", key, "--attempt", attempt]
+    with open(log, "ab") as fh:
+        fh.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} account switch ({attempt})\n".encode())
+        fh.flush()
+        proc = popen(argv, cwd=str(_REPO), stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
+                     start_new_session=True)
+    return int(proc.pid)
+
+
+def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, now=time.time,
+              run=subprocess.run, codex_read=None) -> int:
+    from local_record import write_whole
+    try:
+        headers, said = ac.reply_words(Path(args.task_file).read_text(encoding="utf-8"))
+    except OSError as e:
+        return _emit({"status": "refused", "why": f"the task file is unreadable ({type(e).__name__})"}, 2)
+    try:
+        core = core if core is not None else _core(ws)
+    except Exception:  # noqa: BLE001 - a card records its own lane; only one without it needs the core's owner
+        core = {}
+    verdict = ac.click_verdict(headers, said, ws, ac.lane_owner(ws, str(core.get("owner_mxid") or "")))
+    other = ac.click_answer(verdict, said, (KIND,))
+    if other is not None:
+        return _emit(other, 1)
+    verb, room = verdict.command.verb, str(headers.get("channel_id") or "")
+    event = str(headers.get("reply_to_event") or "")
+    if verdict.command.target != TARGET:
+        return _emit({"status": "refused", "say": GONE}, 2)
+    if verb == ADD:
+        words = f"To add an account, open {SETTINGS} Then ask me for the account card again."
+        body, card = notice_card("info", "In Settings", words)
+        posted = _post(ws, room, body, card, f"account-card:add:{int(now())}", reply_to=event, core=core or None,
+                       execute=execute)
+        return _emit({"status": "say", "say": words, **({"event_id": posted["event_id"]} if posted.get("event_id") else {})})
+    if runtime() != "codex":
+        return _emit({"status": "refused", "say": NOT_CODEX}, 2)
+    store = store_dir()
+    if not KEY_RE.fullmatch(verb) or verb not in offered_keys(ws, event) or store is None \
+            or _saved_auth(store, verb) is None:
+        return _emit({"status": "refused", "say": GONE}, 2)
+    cur = current("codex", run=run, codex_read=codex_read)
+    label = masked_label(next((s["label"] for s in saved(store) if s["key"] == verb), "that account"))
+    if cur["key"] == verb:
+        return _emit({"status": "say", "say": f"The core is already signed in as {label}. Nothing changed."})
+    t = now()
+    if running(ws, t):
+        return _emit({"status": "say", "say": BUSY})
+    attempt = f"{int(t)}-{secrets.token_hex(4)}"
+    try:
+        write_whole(ws.joinpath(*RUNNING), {"attempt": attempt, "key": verb, "room": room, "ts": t})
+    except OSError as e:
+        return _emit({"status": "failed", "say": "I couldn't start the switch. Nothing changed.",
+                      "why": type(e).__name__}, 1)
+    say = (f"Switching the core to {label}. It restarts once this turn has finished; "
+           "I'll confirm here when it is back.")
+    body, card = notice_card("pending", "Switching", say)
+    posted = _post(ws, room, body, card, f"account-card:{attempt}:switching", reply_to=event, core=core or None,
+                   execute=execute)
+    try:
+        pid = start_switch(ws, room, verb, attempt, popen)
+    except OSError as e:
+        ws.joinpath(*RUNNING).unlink(missing_ok=True)
+        return _emit({"status": "failed", "say": "I couldn't start the switch. Nothing changed.",
+                      "why": f"{type(e).__name__}: {e}"}, 1)
+    out = {"status": "started", "attempt": attempt, "pid": pid, "say": say}
+    out.update({"event_id": posted["event_id"]} if posted.get("event_id") else {"card_why": posted.get("why", "")})
+    return _emit(out)
+
+
+# ── the detached switch ───────────────────────────────────────────────────────────────────────────
+
+def restart_core(run=subprocess.run) -> int:
+    """The graceful restart's exit code; it waits for the core's turn to end. Launched outside the
+    core's own session (this process has a session of its own), which the in-session guard allows."""
+    env = dict(os.environ, SUTANDO_ALLOW_INSESSION_RESTART="1")
+    try:
+        return run(["bash", str(RESTART)], cwd=str(_REPO), env=env, stdin=subprocess.DEVNULL,
+                   timeout=RESTART_TIMEOUT_S).returncode
+    except subprocess.TimeoutExpired:
+        return 124
+    except OSError:
+        return 127
+
+
+def do_switch(ws: Path, key: str, *, restart=restart_core) -> tuple:
+    """(state, words). The previous `auth.json` is kept in memory, saved in the store, and put back
+    when the saved one could not be put in place or the core did not restart."""
+    from local_record import write_text_whole
+    store, home = store_dir(), codex_home()
+    want = _saved_auth(store, key) if store else None
+    if want is None:
+        return "error", "I could not switch: that account is no longer saved here. Nothing changed."
+    label = masked_label(identity(want)[1])
+    before = _live_auth(home)
+    was = masked_label(identity(before)[1]) if before and identity(before) else "the account it had"
+    try:
+        save_current(store, before)
+        write_text_whole(home / "auth.json", want)
+    except OSError as e:
+        return "error", f"I could not switch to {label}. I'm still signed in as {was}. The sign-in could not be written ({type(e).__name__})."
+    rc = restart()
+    if rc != 0:
+        try:
+            if before is not None:
+                write_text_whole(home / "auth.json", before)
+        except OSError:
+            return "error", (f"The core did not restart ({RESTART_REASONS.get(rc, 'the restart failed')}), and the "
+                             f"previous sign-in could not be put back: the core uses {label} from its next start.")
+        reason = RESTART_REASONS.get(rc, "the restart failed")
+        return "error", f"I could not switch to {label}. I'm still signed in as {was}. {reason[:1].upper()}{reason[1:]}."
+    now_ident = identity(_live_auth(home) or "")
+    if now_ident and now_ident[0] == key:
+        return "done", f"Switched. The core restarted and is signed in as {label}."
+    shown = masked_label(now_ident[1]) if now_ident else "no ChatGPT account"
+    return "error", f"The core restarted, but its sign-in is {shown}, not {label}. Ask me for the account card to try again."
+
+
+def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core, sleep=time.sleep) -> int:
+    rec = _read_json(ws.joinpath(*RUNNING))
+    if rec.get("attempt") != args.attempt:
+        return _emit({"status": "refused", "why": "that attempt is not the one under way"}, 2)
+    try:
+        state, words = do_switch(ws, args.key, restart=restart)
+    finally:
+        ws.joinpath(*RUNNING).unlink(missing_ok=True)
+    body, card = notice_card(state, "Switched" if state == "done" else "Not switched", words)
+    out = {"status": "failed"}
+    for i in range(SETTLE_TRIES):
+        out = _post(ws, args.room, body, card, f"account-card:{args.attempt}:outcome", core=core, execute=execute)
+        if out["status"] == "posted":
+            break
+        if i + 1 < SETTLE_TRIES:
+            sleep(SETTLE_PAUSE_S)
+    return _emit({**out, "outcome": state, "say": words}, 0 if state == "done" else 1)
+
+
+def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, run=subprocess.run, codex_read=None,
+         restart=restart_core, sleep=time.sleep) -> int:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--workspace", default=None)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("post")
+    s.add_argument("--room", required=True)
+    s.add_argument("--reply-to", default="")
+    s.add_argument("--print", action="store_true")
+    r = sub.add_parser("reply")
+    r.add_argument("--task-file", required=True)
+    w = sub.add_parser("switch")
+    w.add_argument("--room", required=True)
+    w.add_argument("--key", required=True)
+    w.add_argument("--attempt", required=True)
+    sub.add_parser("status")
+    args = p.parse_args(argv)
+    if args.workspace:
+        ws = Path(args.workspace)
+    else:
+        from workspace_default import resolve_workspace
+        ws = Path(resolve_workspace())
+    if args.cmd == "post":
+        return cmd_post(ws, args, core=core, execute=execute, run=run, codex_read=codex_read)
+    if args.cmd == "reply":
+        return cmd_reply(ws, args, core=core, execute=execute, popen=popen, run=run, codex_read=codex_read)
+    if args.cmd == "switch":
+        if not KEY_RE.fullmatch(args.key):
+            return _emit({"status": "refused", "why": "that is not a saved account's key"}, 2)
+        return cmd_switch(ws, args, core=core, execute=execute, restart=restart, sleep=sleep)
+    rt = runtime()
+    cur = current(rt, run=run, codex_read=codex_read)
+    store = store_dir() if rt == "codex" else None
+    return _emit({**cur, "words": in_use_words(cur),
+                  "saved": [{"key": s["key"], "label": masked_label(s["label"]), "current": s["current"]}
+                            for s in saved(store, cur["key"])]})
+
+
+if __name__ == "__main__":
+    sys.exit(main())

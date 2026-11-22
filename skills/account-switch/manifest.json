@@ -1,0 +1,11 @@
+{
+  "name": "account-switch",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "The core's account card in the owner's DM: names the account the core (Codex or Claude) is signed in to, switches a Codex core to an account the desktop saved on this Mac (restoring its sign-in and restarting the core), and points to Settings to add another account. Contributes no tools; never handles a sign-in code or token in chat.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}
