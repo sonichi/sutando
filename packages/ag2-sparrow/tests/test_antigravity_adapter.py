@@ -227,6 +227,80 @@ class ConnectorTest(unittest.TestCase):
         self.assertEqual((self.set_model_calls(), self.post_queued()), ([], []))
         self.assertNotIn("model_switch", self.w.metrics()[-1])
 
+    def test_an_outcome_that_could_not_be_queued_is_told_after_the_next_turn_and_the_model_in_use_is_kept(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        self.dm_task("task-2", "/model")
+        self.w.serve()
+        (sent,) = self.post_queued()
+        said = sent["extra_content"]["space.ag2.card"]["buttons"][1]["reply"]
+        self.dm_task("task-3", said, reply_to="$card1", click=said)
+        self.w.serve()
+        self.post_queued("$card2")
+        state = self.w.root / "state" / "model.json"
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("disk full")):
+            self.w.task("task-4", "STUB:TEXT again")
+            self.w.serve()
+        self.assertEqual((self.w.metrics()[-1]["model_switch"], json.loads(state.read_text())["told"]), ("untold", ""))
+        self.w.task("task-5", "STUB:TEXT once more")
+        self.w.serve()
+        (told,) = self.post_queued("$card3")
+        self.assertEqual(told["extra_content"]["space.ag2.card"]["text"], "Switched. I'm now using Claude Opus 4.6.")
+        kept = json.loads(state.read_text())
+        self.assertEqual((kept["told"], kept["current"]), ("claude-opus-4-6-thinking", "claude-opus-4-6-thinking"))
+
+    def test_a_menu_asked_for_in_the_turn_that_settles_a_pick_comes_after_the_outcome_and_still_acts(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        self.dm_task("task-2", "/model")
+        self.w.serve()
+        (sent,) = self.post_queued()
+        said = sent["extra_content"]["space.ag2.card"]["buttons"][1]["reply"]
+        self.dm_task("task-3", said, reply_to="$card1", click=said)
+        self.w.serve()
+        self.post_queued("$card2")
+        # The first turn after the pick is itself an ask for the menu.
+        self.dm_task("task-4", "STUB:ASKMODEL can you change model")
+        self.w.serve()
+        outcome, menu = [p["extra_content"]["space.ag2.card"] for p in self.post_queued("$card3")]
+        self.assertEqual((outcome["state"], menu["state"], "buttons" in menu), ("done", "pending", True))
+        self.assertEqual(menu["text"], "Now using Claude Opus 4.6.")
+        back = menu["buttons"][0]["reply"]
+        self.dm_task("task-5", back, reply_to="$card3", click=back)
+        self.w.serve()
+        self.assertEqual((self.w.result("task-5"), self.w.metrics()[-1]["card"]),
+                         ("[no-send] the model card answers\n", "model-picked"))
+
+    def test_a_pick_repeated_before_any_turn_applied_it_is_still_coming_and_in_use_only_once_a_turn_ran_on_it(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+
+        def tap_opus(n, event):
+            self.dm_task("task-ask%d" % n, "/model")
+            self.w.serve()
+            (sent,) = self.post_queued(event)
+            said = sent["extra_content"]["space.ag2.card"]["buttons"][1]["reply"]
+            self.dm_task("task-tap%d" % n, said, reply_to=event, click=said)
+            self.w.serve()
+            (answer,) = self.post_queued(event + "a")
+            return answer["extra_content"]["space.ag2.card"], self.w.metrics()[-1]["card"]
+
+        first, outcome = tap_opus(1, "$c1")
+        self.assertEqual((first["state"], outcome), ("info", "model-picked"))
+        again, outcome = tap_opus(2, "$c2")
+        self.assertEqual((again["state"], outcome), ("info", "model-pending"), "no turn has run on it yet")
+        self.assertIn("Switching to Claude Opus 4.6 on your next message", again["text"])
+        self.assertEqual(self.set_model_calls(), [])
+        self.w.task("task-5", "STUB:TEXT again")
+        self.w.serve()
+        (told,) = self.post_queued("$c3")
+        self.assertEqual(told["extra_content"]["space.ag2.card"]["text"], "Switched. I'm now using Claude Opus 4.6.")
+        used, outcome = tap_opus(3, "$c4")
+        self.assertEqual((used["text"], outcome), ("I'm already using Claude Opus 4.6. Nothing changed.", "model-same"))
+
     def test_a_tap_that_is_not_the_owners_on_a_card_this_agent_posted_in_its_dm_changes_nothing(self):
         (self.w.home / "models").write_text("")
         self.w.task("task-1", "STUB:TEXT hi")
