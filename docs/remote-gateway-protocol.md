@@ -406,6 +406,15 @@ the broker times freshness by when it received the heartbeat. A change in the ro
 sends the heartbeat at once, without waiting for the interval. A gateway with no
 Sutando checkout around it sends neither field.
 
+On the core's own lanes (not a pool worker's) the row also carries `recovery`, the core's
+recovery record, with the `core_recovery.v1` capability: what a remote client needs to show
+the state and offer the fix (see [Core recovery record](core-recovery-record.md); literal
+bodies in `contracts/core_recovery.v1/`). The adapter injects its reader, so a standalone
+Sparrow sends no such block. A missing, stale, malformed or oversized (over 4096 bytes)
+record is omitted, and the broker keeps its last value. A change in the record sends the
+heartbeat at once. A broker that answers `400` or `422` to a beat carrying the block gets the
+same beat again without it at once, and beats without it for the next hour.
+
 ### Task lifecycle *(opt-in: `REMOTE_TASK_LIFECYCLE_V2=1`)*
 
 - **Ack** adds `worker_id` (one lease-holder id per install, `state/relay-lease-worker-id`) and
