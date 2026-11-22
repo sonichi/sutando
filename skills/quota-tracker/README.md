@@ -18,8 +18,10 @@ ln -s /path/to/sutando/skills/quota-tracker "$CLAUDE_CONFIG_DIR/skills/quota-tra
 
 ## What's included
 
-2 scripts:
-- `credential-proxy.ts` — credential proxy
+4 scripts:
+- `credential-proxy.ts` — credential proxy (quota headers + quota-aware model fallback)
+- `quota-fallback-policy.ts` / `quota-fallback-config.ts` — the fallback policy and its config layers
+- `fallback-config.py` — show / set / unset the fallback thresholds
 - `read-quota.py` — read quota
 
 ## Usage

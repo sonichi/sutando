@@ -10,6 +10,7 @@ import assert from 'node:assert';
 import { createServer as createHttpServer, request as httpRequest, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { request as httpsRequest } from 'node:https';
 import { createProxyServer, withLastRequest, type ProxyDeps } from '../skills/quota-tracker/scripts/credential-proxy.ts';
+import { DEFAULT_FALLBACK_CONFIG } from '../skills/quota-tracker/scripts/quota-fallback-policy.ts';
 
 const NOW = 1_700_000_000_000;
 let upstreamHandler: (req: IncomingMessage, res: ServerResponse) => void = () => {};
@@ -27,6 +28,9 @@ async function startProxy(seen: Array<[Record<string, string>, string | undefine
 	const upstreamPort = await listen(createHttpServer((req, res) => upstreamHandler(req, res)));
 	const deps: Partial<ProxyDeps> = {
 		readCredCandidates: () => [{ service: 'svc', oauth: { accessToken: 'tok', expiresAt: NOW + 3600_000 } }],
+		// Model fallback is not under test here: neutral seams keep the proxy off this host's quota-state.json.
+		fallbackConfig: () => ({ ...DEFAULT_FALLBACK_CONFIG, enabled: false }),
+		readFallbackState: () => null, recordFallback: () => {}, notifyOwner: () => {}, readHistorySamples: () => [],
 		writeCred: () => true,
 		refreshAccessToken: async () => null,
 		request: httpRequest as unknown as typeof httpsRequest,

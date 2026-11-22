@@ -120,6 +120,16 @@ CLI arg  >  env override  >  manifest.json config[key]  >  another config file (
 
 Read the manifest directly when needed — e.g. `publish-wire-episode.py:manifest_config()` reads `skills/wire-newsroom/manifest.json` `config[key]`; `wire-monitor` uses `${ENV:-$(cat state/wire-report-channel)}`. Never wire a bare invented `os.environ[...]` as the *primary* source.
 
+### Quota fallback owner overrides
+
+The quota-tracker credential proxy has an explicit exception for its declared
+`SUTANDO_QUOTA_FALLBACK_*` keys: environment override > per-host
+`quota-fallback-config.json` > manifest defaults > built-in defaults. The owner
+CLI writes that per-host file so a running proxy can pick up changed thresholds
+without modifying shipped skill files. An explicit environment setting still
+wins. This exception belongs to the proxy's config reader; it does not change
+the generic manifest loader or pipeline-script order above.
+
 ## Supervised workers (`supervised_worker`)
 
 A skill whose feature needs a **long-running loop** declares it here, and `sparrowd` supervises it. The declaration is how the core learns the worker exists: `src/sparrowd.py` scans `skills/*/manifest.json` and **names no skill**, because a skill is optional and self-contained (`docs/architecture-boundaries.md` → "Optional adapter capabilities").
