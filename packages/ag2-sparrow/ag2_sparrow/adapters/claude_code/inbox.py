@@ -171,10 +171,10 @@ def admit(root, task_id, allow: bool, allow_collab: bool = False) -> "tuple[str 
 
 
 def open_turns(root) -> list:
-    """[(access_tier, collaborator)] of every task this root holds a claim on that is not answered yet,
-    read under claims.lock through the lifecycle and the attested task headers. A claim past its
-    answer (PUBLISHED, SETTLED) or whose task already has a result is closed, so one left by a crash
-    does not count; a claim or task that cannot be read counts as ("unknown", True), never as the owner's."""
+    """[(access_tier, collaborator, channel_kind)] of every task this root holds a claim on that is not
+    answered yet, read under claims.lock through the lifecycle and the attested task headers. A claim
+    past its answer (PUBLISHED, SETTLED) or whose task already has a result is closed, so one left by a
+    crash does not count; one that cannot be read counts as ("unknown", True, ""), never as the owner's."""
     lc, out = _lifecycle(root), []
     with records.flocked(records.claims_lock_path(root)):
         for task_id in lc.claims.ids():
@@ -190,9 +190,10 @@ def open_turns(root) -> list:
                 if "access_tier" not in raw:
                     raise ValueError("no access_tier header")
                 headers = task_io.parse_task(path)[0]
-                out.append((str(headers["access_tier"]), headers.get("collaborator") == "true"))
+                out.append((str(headers["access_tier"]), headers.get("collaborator") == "true",
+                            str(headers.get("channel_kind") or "").strip()))
             except Exception:       # whatever cannot be read is not the owner's
-                out.append(("unknown", True))
+                out.append(("unknown", True, ""))
     return out
 
 
