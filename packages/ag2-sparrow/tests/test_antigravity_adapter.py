@@ -967,6 +967,7 @@ class SspaceStdioTest(unittest.TestCase):
         (chan / "token").write_text("https://relay.s.space|seat-secret\n")
         seat_env = chan / ".env"
         seat_env.write_text("AGENT_MXID=@agy:s.space\nREMOTE_TASK_TOKEN_FILE=%s\n" % (chan / "token"))
+        seat_env.chmod(0o600)
         token = os.path.realpath(chan / "token")
         raw = {k: v for k, v in self.desc.items() if k != "env_key"}
         raw.update(token_format="raw", env_file=token)

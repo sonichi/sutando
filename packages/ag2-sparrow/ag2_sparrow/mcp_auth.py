@@ -219,20 +219,20 @@ def stdio_descriptor(env_path: str) -> dict:
     is never the descriptor's, since the proxy mints from the file alone."""
     if not env_path:
         raise McpAuthError("descriptor needs --env-file, the agent's own .env")
-    try:
-        text = Path(env_path).read_text(encoding="utf-8")
-    except OSError as exc:
-        raise McpAuthError(f"{env_path} is unreadable ({type(exc).__name__})")
+    from .bounded_file_read import read_private
     from .gateway_credential_sources import plain_token, raw_token_line, seat_token_path
+    text, why = read_private(env_path)   # this user's, 0600, no symlink: it holds or names the credential
+    if text is None:
+        raise McpAuthError(f"{env_path} was refused ({why or 'missing'})")
     key, url, bearer = plain_token(text)
     if not key:
         raw_path = seat_token_path(env_path, text)
         if not raw_path:
             raise McpAuthError(f"{env_path} has neither a REMOTE_TASK_TOKEN= line nor a seat's token-file pointer")
-        try:
-            relay, secret = raw_token_line(Path(raw_path).read_text(encoding="utf-8"))
-        except OSError as exc:
-            raise McpAuthError(f"the seat's token file {raw_path} is unreadable ({type(exc).__name__})")
+        raw, why = read_private(raw_path)
+        if raw is None:
+            raise McpAuthError(f"the seat's token file {raw_path} was refused ({why or 'missing'})")
+        relay, secret = raw_token_line(raw)
         if not relay or not secret.strip():
             raise McpAuthError(f"the seat's token file {raw_path} holds no <relay_url>|<secret> line")
         mint_url, mcp_url = discover(relay, secret)
@@ -249,11 +249,10 @@ def stdio_descriptor(env_path: str) -> dict:
 
 def seat_token_file(env_path: str) -> str:
     """The realpath of the raw token file the seat .env at `env_path` names, '' when it names none."""
+    from .bounded_file_read import read_private
     from .gateway_credential_sources import seat_token_path
-    try:
-        return seat_token_path(env_path, Path(env_path).read_text(encoding="utf-8"))
-    except OSError:
-        return ""
+    text, _why = read_private(env_path)
+    return seat_token_path(env_path, text) if text is not None else ""
 
 
 def setup_lines(gateway: Gateway) -> list:

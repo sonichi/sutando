@@ -237,7 +237,29 @@ class HeadersTest(unittest.TestCase):
             rc, out, err = _run_main(["descriptor", "--env-file", path], (self.stub.relay, SECRET, path))
             self.assertEqual((rc, out), (1, ""), path)
             self.assertNotIn(SECRET, err)
-        self.assertIn("is unreadable", _run_main(["descriptor", "--env-file", seat_env], None)[2])
+        self.assertIn("was refused (missing)", _run_main(["descriptor", "--env-file", seat_env], None)[2])
+
+    def test_descriptor_reads_only_private_files(self):
+        # The shared private-file reader: this user's, 0600, no symlink (read_private, as the seat bridge's own).
+        seat_env, token = self._seat(f"{self.stub.relay}|{SECRET}\n")
+        plain = self._env(f"REMOTE_TASK_TOKEN={self.stub.relay}|{SECRET}\n")
+        for path, mode in ((token, 0o640), (token, 0o604), (plain, 0o644), (seat_env, 0o660)):
+            os.chmod(path, mode)
+            target = seat_env if path in (token, seat_env) else plain
+            rc, out, err = _run_main(["descriptor", "--env-file", target], None)
+            self.assertEqual((rc, out), (1, ""), (path, oct(mode)))
+            self.assertIn("a private credential file must be 0600", err)
+            os.chmod(path, 0o600)
+        link = os.path.join(os.path.dirname(plain), "link.env")
+        os.symlink(plain, link)
+        rc, out, err = _run_main(["descriptor", "--env-file", link], None)
+        self.assertEqual((rc, out), (1, ""))
+        self.assertNotIn(SECRET, err)
+        with mock.patch("ag2_sparrow.bounded_file_read.os.geteuid", return_value=os.geteuid() + 1):
+            rc, out, err = _run_main(["descriptor", "--env-file", plain], None)
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("not this user", err)
+        self.assertEqual(self.stub.seen, [], "nothing is sent for a file that was refused")
         self.assertEqual(self.stub.seen, [], "the bearer is not sent for a descriptor that cannot work")
 
     def test_owner_tools_are_the_ag2_space_servers_room_tools_only(self):
