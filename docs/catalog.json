@@ -267,7 +267,7 @@
    ],
    "status": "canonical",
    "canonical_for": "remote gateway wire protocol",
-   "last_verified": "2026-11-16"
+   "last_verified": "2026-11-21"
   },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",
@@ -514,7 +514,7 @@
    ],
    "status": "draft",
    "canonical_for": "the v1 worker pool: durable worker identities and run history, zero-byte delivery sentinels under deliveries/<recipient>/ with the payload immutable in tasks/, the router as the core watcher's task-event handler over an owner-declared, core-compiled roster (unknown targets go to the core; liveness never routes), residue-based recovery, and the Phase 1 / Phase 2 split",
-   "last_verified": "2026-11-21"
+   "last_verified": "2026-11-22"
   },
   "docs/worker-pool-design-notes.md": {
    "title": "Worker pool — design notes",
@@ -608,6 +608,16 @@
    "status": "canonical",
    "canonical_for": "agent-native design rules: Action parity under the same authority, controls instead of prose for known actions, card and click trust rules, and the contributor and reviewer checklist",
    "last_verified": "2026-11-11"
+  },
+  "docs/core-recovery-record.md": {
+   "title": "Core recovery record (core_recovery.v1)",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "the core recovery record state/core-recovery.json: its states, fields, bounds, runtimes, single writer and the core_recovery.v1 contract fixtures",
+   "last_verified": "2026-11-21"
   }
  }
 }

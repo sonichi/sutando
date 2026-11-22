@@ -33,7 +33,7 @@ COMMAND = "ag2-sparrow-antigravity-local"
 ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "TMPDIR", "SHELL")
 REQUIRED_KEYS = ("ACP_COMMAND", "CWD", "INBOX_DIR", "RESULTS_DIR")
 CONFIG_KEYS = ("ACP_COMMAND", "CWD", "SESSION_STORE", "INBOX_DIR", "RESULTS_DIR",
-               "ALLOW_NON_OWNER", "ALLOW_OWNER_SHELL_WEB") + cb.CONFIG_KEYS
+               "ALLOW_NON_OWNER", "ALLOW_OWNER_SHELL_WEB", "MCP_PROXY_COMMAND") + cb.CONFIG_KEYS
 LOCAL = Shape(name=SHAPE, command=COMMAND, description="Antigravity CLI on Sparrow",
               cli="Antigravity CLI", min_version=(0, 0, 0), version_anchor=r"^\d",
               version_note="the ACP wake and the sign-in are checked by verify, not by a version",
@@ -66,6 +66,23 @@ def acp_command(acp: "str | None") -> "tuple[str, str]":
     return shlex.join([os.path.abspath(exe)] + argv[1:]), ""
 
 
+def mcp_proxy_command(value: "str | None") -> "tuple[str, str]":
+    """(the stdio proxy's command line, each word quoted, '') or ('', why). Its first word must be an executable
+    file: an unquoted path with a space (the desktop's engine sits under Application Support) splits there, so
+    it is refused with the quoting to use rather than recorded broken."""
+    if not value:
+        return "", ""
+    try:
+        argv = shlex.split(value)
+    except ValueError as e:
+        return "", f"--mcp-proxy-command does not parse ({e})"
+    exe = shutil.which(argv[0]) if argv else None
+    if not exe or len(argv) < 2:
+        return "", ("--mcp-proxy-command must name an executable and its arguments, each path quoted when it has "
+                    "a space: --mcp-proxy-command \"'<node>' '<path>/ag2-mcp-proxy.mjs'\"")
+    return shlex.join([os.path.abspath(exe)] + argv[1:]), ""
+
+
 def child_env(cfg: dict, environ=None) -> dict:
     """The allowlist, the ACP command's own directory first on PATH, and the package root for `-m`."""
     env = cm.child_env_from(ENV_KEEP, environ)
@@ -85,6 +102,10 @@ def connector_argv(cfg: dict, root: str, root_fd: int) -> list:
         argv.append("--allow-non-owner")
     if cfg.get("ALLOW_OWNER_SHELL_WEB") == "1":
         argv.append("--allow-owner-shell-web")
+    if cfg.get("TOKEN_ENV_FILE"):
+        argv += ["--token-env-file", cfg["TOKEN_ENV_FILE"], "--agent-id", cfg.get("AGENT_ID", "")]
+    if cfg.get("MCP_PROXY_COMMAND"):
+        argv += ["--mcp-proxy-command", cfg["MCP_PROXY_COMMAND"]]
     return argv
 
 
@@ -147,7 +168,8 @@ def resolve_root(args) -> "tuple[dict, str]":
 
 RECORDED = (("ACP_COMMAND", "acp_command", str), ("CWD", "cwd", str),
             ("SESSION_STORE", "session_store", str), ("ALLOW_NON_OWNER", "allow_non_owner", lambda v: v == "1"),
-            ("ALLOW_OWNER_SHELL_WEB", "allow_owner_shell_web", lambda v: v == "1"))
+            ("ALLOW_OWNER_SHELL_WEB", "allow_owner_shell_web", lambda v: v == "1"),
+            ("MCP_PROXY_COMMAND", "mcp_proxy_command", str))
 
 
 def signed_in_problem(args, acp: str) -> str:
@@ -174,6 +196,8 @@ def install(args) -> int:
     where, why = ({}, why) if why else resolve_root(args)
     if not why:
         why = cb.agent_arg_problem(getattr(args, "agent", None), where["agent_id"])
+    proxy, proxy_why = mcp_proxy_command(getattr(args, "mcp_proxy_command", None))
+    why = why or proxy_why
     cwd = str(Path(args.cwd).expanduser().resolve()) if args.cwd else ""
     if not why and cwd and not os.path.isdir(cwd):
         why = f"--cwd {cwd} is not a directory"
@@ -192,6 +216,7 @@ def install(args) -> int:
               "INBOX_DIR": str(Path(root) / "tasks"), "RESULTS_DIR": str(Path(root) / "results"),
               "ALLOW_NON_OWNER": "1" if args.allow_non_owner else "",
               "ALLOW_OWNER_SHELL_WEB": "1" if getattr(args, "allow_owner_shell_web", False) else "", "AGENT_ID": where["agent_id"],
+              "MCP_PROXY_COMMAND": proxy,
               "BRIDGE": mode if mode != EXTERNAL else "", "TOKEN_ENV_FILE": where["token_file"], "TOKEN_VAULT_KEY": "",
               "BRIDGE_STATE_DIR": str(cb.bridge_home(root) / "state") if mode != EXTERNAL else ""}
 
@@ -301,13 +326,12 @@ def verify(args, factory=gc.AcpClient) -> int:
     for key in ("INBOX_DIR", "RESULTS_DIR"):
         cm.check(results, Path(cfg[key]).is_dir(), key.lower().replace("_dir", ""), cfg[key])
     store = cfg.get("SESSION_STORE") or str(Path(cm.work_root(cfg)) / "state" / gc.SESSIONS_NAME)
-    print(f"INFO sessions: {store} (the owner's and each collaborator's resumed per room, never retired; a "
-          "non-owner's turn is a throwaway session)")
-    print("INFO team (attested collaborator): served as the owner is, on the owner's agy account: the working "
-          "directory, agy's own home, the owner's permission policy (read or edit under the working directory, "
-          "no command)")
-    print("INFO guest and plain team: always served, on the owner's agy account, each turn in its own temporary "
-          "directory and agy home, deny-all rules, read-only (plan) mode, no file operations")
+    print(f"INFO sessions: {store} (the owner's and each collaborator's resumed per room, never retired; any "
+          "other non-owner's turn is a throwaway session)")
+    print("INFO team (attested collaborator): the owner's turn, on the owner's agy account: the working directory, "
+          "agy's own home, the owner's permission policy")
+    print("INFO guests, plain team and unknown tiers: served, each turn in its own temporary directory and agy "
+          "home, deny-all rules, read-only (plan) mode, no file operations")
     print("INFO owner shell and web: " + ("on (--allow-owner-shell-web): the owner's turns may run commands and "
                                           "fetch or search the web" if cfg.get("ALLOW_OWNER_SHELL_WEB") == "1"
                                           else "off (read and edit under the session cwd only)"))
@@ -344,12 +368,15 @@ def session_options(p) -> None:
                    "(default: <work root>/workspace)")
     p.add_argument("--session-store", help="the sessions.json to resume from and record to (default: the work "
                    "root's state/sessions.json)")
+    p.add_argument("--mcp-proxy-command", help="the stdio ag2-mcp-proxy command line ('<node> <the desktop app's "
+                   "engine/ag2-mcp-proxy.mjs>'): AG2 Space tools for an agy that declares no HTTP MCP")
     p.add_argument("--allow-non-owner", action="store_true",
-                   help="a no-op kept so existing configs parse: guests and plain team are always served, "
-                   "isolated and read-only; an attested collaborator gets the owner's turn")
+                   help="no effect, kept so existing configs parse: an attested collaborator always gets the "
+                   "owner's turn, any other non-owner an isolated read-only one (all on the owner's agy sign-in)")
     p.add_argument("--allow-owner-shell-web", action="store_true",
                    help="let the owner's turns run shell commands and fetch or search the web, as a local Claude "
-                   "Code agent may (never a collaborator's or a guest's; default: off)")
+                   "Code agent may, and an attested collaborator's turn run as the owner's (never plain Team's or a "
+                   "guest's; default: off)")
 
 
 def main(argv=None) -> int:
