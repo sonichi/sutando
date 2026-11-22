@@ -291,6 +291,43 @@ class OwnAttachments(IsolatedRestrictedTurn.__base__):
         self.assertEqual(inbox.isolated.stage_own_attachments({}, str(dest), str(self.media)), [])
         self.assertEqual(inbox.isolated.with_staged_paths("see %s" % own, staged), "see %s" % (dest / "1-a_b.png"))
 
+    def test_the_file_is_opened_under_the_folder_through_no_link_whatever_the_path_says(self):
+        stage = inbox.isolated.stage_own_attachments
+        dest = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, dest, True)
+        outside_dir = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, outside_dir, True)
+        (outside_dir / "secret.png").write_bytes(b"OWNER SECRET")
+        (self.media / "sub").mkdir()
+        nested = self.file("deep.png", b"NESTED", self.media / "sub")
+        (self.media / "linkdir").symlink_to(outside_dir)          # a directory on the way that is a link
+        (self.media / "sub" / "back").symlink_to(self.media)       # a link that stays inside the folder
+        (self.media / "filelink.png").symlink_to(nested)
+        refused = [str(self.media / "linkdir" / "secret.png"), str(self.media / "filelink.png"),
+                   str(self.media / ".." / outside_dir.name / "secret.png"), str(self.media / "sub" / ".." / ".." / "x"),
+                   str(self.media), str(self.media) + os.sep, str(self.media / "sub"), str(self.media / "sub" / "none.png")]
+        own = self.file("mine.png", b"MINE")
+        heads = {"attachments": json.dumps([{"locator": r} for r in refused[:4]] + [{"locator": own}]
+                                           + [{"locator": r} for r in refused[4:]] + [{"locator": nested}])}
+        staged = stage(heads, str(dest), str(self.media))
+        self.assertEqual([loc for loc, _ in staged], [own, nested], "each refused one is skipped on its own")
+        self.assertEqual(sorted(p.read_bytes() for p in dest.iterdir()), [b"MINE", b"NESTED"])
+        # A directory link that stays inside the folder names a file that is under it: read from there.
+        inside = str(self.media / "sub" / "back" / "sub" / "deep.png")
+        dest1 = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, dest1, True)
+        self.assertEqual([loc for loc, _ in stage({"attachments": json.dumps([{"locator": inside}])}, str(dest1),
+                                                  str(self.media))], [inside])
+        # The folder may be named by a link: what is read is still under the folder it resolves to.
+        alias = Path(tempfile.mkdtemp()) / "media-link"; self.addCleanup(shutil.rmtree, alias.parent, True)
+        alias.symlink_to(self.media)
+        dest2 = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, dest2, True)
+        via = str(alias / "mine.png")
+        self.assertEqual([loc for loc, _ in stage({"attachments": json.dumps([{"locator": via}, {"locator": own}])},
+                                                  str(dest2), str(alias))], [via, own])
+        # A file swapped for a link after the path was written is not followed.
+        swapped = Path(self.file("later.png", b"OK"))
+        swapped.unlink(); swapped.symlink_to(outside_dir / "secret.png")
+        self.assertEqual(stage({"attachments": json.dumps([{"locator": str(swapped)}])}, str(dest2), str(self.media)), [])
+        self.assertNotIn(b"OWNER SECRET", [p.read_bytes() for d in (dest, dest2) for p in d.iterdir()])
+
     def test_a_staging_failure_fails_the_turn_without_running_it(self):
         ran = []
         turn = inbox.isolated.run_collaborator_turn("claude", "t", {}, run=lambda *a, **k: ran.append(a),

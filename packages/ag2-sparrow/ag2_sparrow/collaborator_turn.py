@@ -73,45 +73,81 @@ def _under(path, root):
         return False
 
 
+def _open_under(root_fd, parts):
+    """A descriptor for the file at `parts` below the directory `root_fd`, opened one component at a
+    time and never through a symlink, so the file read is under that directory whatever is swapped
+    meanwhile; None when any component is missing, a link or (but the last) not a directory."""
+    nofollow, fd = getattr(os, "O_NOFOLLOW", 0), os.dup(root_fd)
+    try:
+        for i, part in enumerate(parts):
+            last = i == len(parts) - 1
+            flags = os.O_RDONLY | nofollow | (os.O_NONBLOCK if last else getattr(os, "O_DIRECTORY", 0))
+            try:
+                nxt = os.open(part, flags | getattr(os, "O_CLOEXEC", 0), dir_fd=fd)
+            except OSError:
+                return None
+            os.close(fd)
+            fd = nxt
+        out, fd = fd, -1
+        return out
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def stage_own_attachments(headers, dest_dir, media_root, max_bytes=None):
     """Copy this task's own attachments into dest_dir, the isolated turn's empty cwd; return [(locator, copy)].
 
     `headers` are the task's attested headers (task_io.parse_task); only the files its `attachments:` header
     lists are candidates, so another task's file in the same folder is never one. A locator is copied only
-    when it is an absolute path to a regular file (not a symlink) whose real path lies under the real
-    `media_root` (the bridge's remote-media folder) and is at most `max_bytes` (MAX_MEDIA_BYTES); any other
-    is skipped, never raised. The folder itself is never handed to the turn: only these copies are."""
+    when its directory resolves to a place below the real `media_root` (the bridge's remote-media folder)
+    and it is a regular file, not a link, of at most `max_bytes` (MAX_MEDIA_BYTES). The file is opened
+    from a descriptor on that folder, one path component at a time and through no symlink
+    (`_open_under`), so what is read is under the folder even if a component is replaced meanwhile. Any other locator is skipped, never raised. The folder itself
+    is never handed to the turn: only these copies are."""
     limit = MAX_MEDIA_BYTES if max_bytes is None else max_bytes
     root = os.path.realpath(media_root) if media_root else ""
-    if not root or not os.path.isdir(root):
+    try:
+        root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)) if root else -1
+    except OSError:
+        root_fd = -1
+    if root_fd < 0:
         return []
     staged, seen = [], set()
-    for ref in parse_attachments(headers):
-        loc = ref.locator
-        if not os.path.isabs(loc) or loc in seen or not _under(os.path.realpath(loc), root):
-            continue
-        try:
-            fd = os.open(loc, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        except OSError:
-            continue        # a symlink (O_NOFOLLOW), a missing or unreadable file
-        try:
-            st, real = os.fstat(fd), os.stat(os.path.realpath(loc))
-            # The opened file must be the one the containment check resolved, regular, and within the cap.
-            if (st.st_dev, st.st_ino) != (real.st_dev, real.st_ino) or not stat.S_ISREG(st.st_mode) \
-                    or st.st_size > limit:
+    try:
+        for ref in parse_attachments(headers):
+            loc = ref.locator
+            if not os.path.isabs(loc) or loc in seen:
                 continue
-            with os.fdopen(os.dup(fd), "rb") as src:
-                data = src.read(limit + 1)
-        finally:
-            os.close(fd)
-        if len(data) > limit:
-            continue
-        name = "%d-%s" % (len(staged) + 1, _SAFE_NAME_RE.sub("_", os.path.basename(loc)) or "attachment")
-        copy = os.path.join(dest_dir, name)
-        with open(copy, "xb") as f:
-            f.write(data)
-        seen.add(loc)
-        staged.append((loc, copy))
+            # Only which path below the folder to try: its directory resolved, its last name as written
+            # (so a file that is a link stays one). The open below is what keeps the read in the folder.
+            where = os.path.join(os.path.realpath(os.path.dirname(loc)), os.path.basename(loc))
+            parts = [p for p in os.path.relpath(where, root).split(os.sep) if p] if _under(where, root) else []
+            if not parts or any(p in (os.curdir, os.pardir) for p in parts):
+                continue
+            fd = _open_under(root_fd, parts)
+            if fd is None:
+                continue        # missing, unreadable, or reached through a symlink
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+                    continue
+                with os.fdopen(os.dup(fd), "rb") as src:
+                    data = src.read(limit + 1)
+            except OSError:
+                continue
+            finally:
+                os.close(fd)
+            if len(data) > limit:
+                continue
+            name = "%d-%s" % (len(staged) + 1, _SAFE_NAME_RE.sub("_", os.path.basename(loc)) or "attachment")
+            copy = os.path.join(dest_dir, name)
+            with open(copy, "xb") as f:
+                f.write(data)
+            seen.add(loc)
+            staged.append((loc, copy))
+    finally:
+        os.close(root_fd)
     return staged
 
 
