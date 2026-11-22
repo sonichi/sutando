@@ -306,7 +306,9 @@ def migrate_to_own_dirs(workspace, recipient: str, own_tasks, own_origin) -> dic
     (`pool_manage.py retire --hand-off`) gives it to the core. While any task the worker accepted is still
     unanswered (`died-mid-work`, its own lane's included) nothing moves at all, so the switch waits and that
     work stays where supervision reads it. Idempotent: an interrupted pass leaves the sentinel, so a re-run
-    revisits the task. Returns {"moved", "returned", "kept": {id: why}, "owed": [ids accepted, unanswered]}."""
+    revisits the task. Returns {"moved", "returned", "kept": {id: why}, "owed": [ids accepted, unanswered]}.
+    Refused (ValueError) once the worker's retirement has begun (`connections.worker_retiring`)."""
+    import connections
     import pool_attribution
     import pool_router
     import undelivered_quarantine
@@ -320,6 +322,9 @@ def migrate_to_own_dirs(workspace, recipient: str, own_tasks, own_origin) -> dic
         for task_id in task_ids:
             locks.enter_context(pool_router.task_arbitration(ws, task_id))
         with arbitration(ws, recipient) as dfd:
+            locks.enter_context(connections.worker_switch_lock(recipient, ws))
+            if connections.worker_retiring(recipient, ws):
+                raise ValueError(f"worker {recipient} is being retired: nothing was moved")
             out["owed"] = [t for t in task_ids if find_in(dfd, t) is not None
                            and _residue_state(ws, recipient, t, find_in(dfd, t)) == "died-mid-work"]
             if out["owed"]:

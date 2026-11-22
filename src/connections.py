@@ -1035,6 +1035,8 @@ def _validate_row(row: object, index: int) -> dict:
     if WORKER_DIRS_KEY in row and (row[WORKER_DIRS_KEY] not in WORKER_DIRS_STATES or "worker" not in row):
         raise SchemaError(f"connections.json: row {index} {WORKER_DIRS_KEY} is one of "
                           f"{', '.join(map(repr, WORKER_DIRS_STATES))} on a worker's row only")
+    if WORKER_RETIRING_KEY in row and (row[WORKER_RETIRING_KEY] is not True or "worker" not in row):
+        raise SchemaError(f"connections.json: row {index} {WORKER_RETIRING_KEY} is true on a worker's row only")
     return row
 
 
@@ -2253,11 +2255,16 @@ def worker_identity(worker: str, workspace: Optional[Path] = None) -> Optional[d
 
 
 # A worker row's `dirs: "own"`: its tasks and results live in its agent's own folder, not the shared ones.
-# `"migrating"`: a switch has started but not committed; the worker still runs on the shared ones.
+# `"migrating"`: a switch has started; the worker still runs on the shared ones. `"committing"`: its
+# lane is being moved onto its own folders; the rest of it still reads the shared ones until "own".
 WORKER_DIRS_KEY = "dirs"
 WORKER_DIRS_OWN = "own"
 WORKER_DIRS_MIGRATING = "migrating"
-WORKER_DIRS_STATES = (WORKER_DIRS_OWN, WORKER_DIRS_MIGRATING)
+WORKER_DIRS_COMMITTING = "committing"
+WORKER_DIRS_STATES = (WORKER_DIRS_OWN, WORKER_DIRS_MIGRATING, WORKER_DIRS_COMMITTING)
+WORKER_LANE_DIRS_STATES = (WORKER_DIRS_OWN, WORKER_DIRS_COMMITTING)
+# `"retiring": true`: retirement has begun; no folder switch may move anything for the worker any more.
+WORKER_RETIRING_KEY = "retiring"
 WORKER_AGENTS_DIR = "agents"
 
 
@@ -2287,23 +2294,72 @@ def worker_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tupl
 
 
 def worker_dirs_state(worker: str, workspace: Optional[Path] = None) -> str:
-    """`worker`'s folder state: "own" (`worker_dirs` names them), "migrating" (a switch not yet committed:
-    it still runs on the shared folders, and nothing new is routed to it) or "" (shared, or unreadable)."""
+    """`worker`'s folder state: "own" (`worker_dirs` names them), "migrating" or "committing" (a switch not
+    yet committed: nothing new is routed to it, and only a "committing" worker's lane runs on its own
+    folders) or "" (shared, or unreadable)."""
     row = worker_identity(worker, workspace) if worker else None
     return str(row[WORKER_DIRS_KEY]) if row and _row_dirs(row, workspace, WORKER_DIRS_STATES) else ""
 
 
 def worker_target_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tuple[Path, Path]]":
-    """The folders `worker` is switching to or is on (`dirs` "migrating" or "own"); None otherwise."""
+    """The folders `worker` is switching to or is on (any `dirs` state); None otherwise."""
     return _row_dirs(worker_identity(worker, workspace), workspace, WORKER_DIRS_STATES) if worker else None
 
 
+def worker_lane_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tuple[Path, Path]]":
+    """The folders `worker`'s lane runs on: its own once its switch is "committing" or "own"; else None."""
+    return _row_dirs(worker_identity(worker, workspace), workspace, WORKER_LANE_DIRS_STATES) if worker else None
+
+
+def worker_retiring(worker: str, workspace: Optional[Path] = None) -> bool:
+    """Whether `worker`'s retirement has begun (`begin_worker_retirement`); False for an unreadable record."""
+    return bool((worker_identity(worker, workspace) or {}).get(WORKER_RETIRING_KEY)) if worker else False
+
+
+@contextlib.contextmanager
+def worker_switch_lock(worker: str, workspace: Optional[Path] = None) -> Iterator[None]:
+    """One worker's folder-switch lock: a switch's moves and its "own" write, and retirement's marker,
+    read and hand-off of its own inbox, each run whole under it, so neither lands inside the other."""
+    if not WORKER_RE.match(str(worker or "")):
+        raise ConnectionsError(f"{worker!r} is not a pool worker id")
+    # Lock order: task (pool_router) -> deliveries folder (pool_delivery) -> this -> the record lock.
+    with locked_file(_workspace(workspace) / "state" / "locks" / f"worker-switch-{worker}.lock", create_mode=0o600):
+        yield
+
+
+def begin_worker_retirement(worker: str, *, workspace: Optional[Path] = None, kill=None) -> Optional[dict]:
+    """Mark `worker`'s row retiring (under its switch lock, so a switch's moves are all before it or none
+    after it), then stop its lane and disable the row (`disconnect`); the row, its secret and its own
+    folders stay until `retire_worker_identity`. None when it has no row; ConnectionsError when it fails."""
+    with worker_switch_lock(worker, workspace):
+        with _transaction(workspace) as record:
+            row = next((r for r in record["rows"] if r.get("worker") == worker), None)
+            if row is None:
+                return None
+            row[WORKER_RETIRING_KEY] = True
+            instance = str(row["instance"])
+    disconnect(instance, workspace=workspace, kill=kill)
+    return worker_identity(worker, workspace)
+
+
+def end_worker_retirement(worker: str, *, workspace: Optional[Path] = None) -> Optional[dict]:
+    """Undo `begin_worker_retirement` (an `enable`): the marker cleared and the row enabled again; the caller
+    starts its lane. None when it has no row."""
+    with _transaction(workspace) as record:
+        row = next((r for r in record["rows"] if r.get("worker") == worker), None)
+        if row is None:
+            return None
+        row.pop(WORKER_RETIRING_KEY, None)
+        row["disabled"] = False
+        return dict(row)
+
+
 def ensure_worker_dirs(worker: str, workspace: Optional[Path] = None, *,
-                       target: bool = False) -> "Optional[tuple[Path, Path]]":
-    """`worker_dirs` (with `target`, `worker_target_dirs`), created: the agent root 0o700 (another local
-    account reads none of its tasks), then tasks/ and results/ with their archive/ beneath it. None for a
-    worker without own folders."""
-    dirs = (worker_target_dirs if target else worker_dirs)(worker, workspace)
+                       target: bool = False, lane: bool = False) -> "Optional[tuple[Path, Path]]":
+    """`worker_dirs` (with `target`, `worker_target_dirs`; with `lane`, `worker_lane_dirs`), created: the agent
+    root 0o700 (another local account reads none of its tasks), then tasks/ and results/ with their archive/
+    beneath it. None for a worker without own folders."""
+    dirs = (worker_target_dirs if target else worker_lane_dirs if lane else worker_dirs)(worker, workspace)
     if dirs is None:
         return None
     root = dirs[0].parent
@@ -2383,11 +2439,12 @@ def own_worker_homes(workspace: Optional[Path] = None) -> list:
 
 
 def set_worker_dirs(worker: str, own, *, workspace: Optional[Path] = None) -> dict:
-    """Set `worker`'s `dirs` under the record lock: True "own", WORKER_DIRS_MIGRATING "migrating", False
-    clears it; returns the row. Refused (`ConnectionsError`) when the worker has no identity row or its row
-    names no agent."""
-    if own not in (True, False, WORKER_DIRS_MIGRATING):
-        raise ConnectionsError(f"dirs state must be True, False or {WORKER_DIRS_MIGRATING!r}, not {own!r}")
+    """Set `worker`'s `dirs` under the record lock: True "own", WORKER_DIRS_MIGRATING or WORKER_DIRS_COMMITTING
+    that state, False clears it; returns the row. Refused (`ConnectionsError`) when the worker has no identity
+    row, its row names no agent, or (for any state but False) its retirement has begun."""
+    if own not in (True, False, WORKER_DIRS_MIGRATING, WORKER_DIRS_COMMITTING):
+        raise ConnectionsError(f"dirs state must be True, False, {WORKER_DIRS_MIGRATING!r} or "
+                               f"{WORKER_DIRS_COMMITTING!r}, not {own!r}")
     with _transaction(workspace) as record:
         row = next((r for r in record["rows"] if r.get("worker") == worker), None)
         mxid = str((row or {}).get("agent_mxid") or "").strip()
@@ -2398,8 +2455,10 @@ def set_worker_dirs(worker: str, own, *, workspace: Optional[Path] = None) -> di
                  and str(r.get("agent_mxid") or "").strip() == mxid]
         if own and twins:
             raise ConnectionsError(f"worker {twins[0]}'s row also names agent {mxid}: its own folder would be shared")
+        if own and row.get(WORKER_RETIRING_KEY):
+            raise ConnectionsError(f"worker {worker} is being retired: its folders are not switched")
         if own:
-            row[WORKER_DIRS_KEY] = WORKER_DIRS_OWN if own is True else WORKER_DIRS_MIGRATING
+            row[WORKER_DIRS_KEY] = WORKER_DIRS_OWN if own is True else own
         else:
             row.pop(WORKER_DIRS_KEY, None)
         return dict(row)

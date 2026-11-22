@@ -184,11 +184,8 @@ def retire(workspace, target, *, unbind=False, hand_off=False, runner=subprocess
     """Fence, then take down, then hand off, then drop bindings. The fence (roster state
     `retired`, which the router re-checks under the delivery lock) comes first, so no
     new or replayed task can commit to the worker once the owed set is read."""
-    import connections
     wid, _ = _worker(workspace, target)
     _not_self(wid, False)
-    # Read before the identity goes: the row names the worker's own folders.
-    own_dirs = connections.worker_target_dirs(wid, Path(workspace))
     rooms = pr.rooms_bound_to(pr.load_bindings(workspace), wid)
     if rooms and not unbind:
         raise Refused(str(pr.WorkerBound(wid, rooms)) + " (or pass --unbind)")
@@ -217,11 +214,13 @@ def retire(workspace, target, *, unbind=False, hand_off=False, runner=subprocess
                            "paused, owning it: re-run retire --hand-off, or enable"}
         moved = {"handed_off": [], "kept": {}}
     _, _, _, unbound = pr.set_worker_state(workspace, wid, "retired", unbind=unbind)
-    identity = _retire_identity(workspace, wid, tell=tell)
-    if hand_off and own_dirs:
-        # After its lane is gone, so nothing lands in its own inbox once this has read it.
-        own = pd.hand_off_own_inbox(Path(workspace), wid, sup.own_inbox_owed(workspace, wid, own_dirs))
-        moved = {"handed_off": moved["handed_off"] + own["handed_off"], "kept": {**moved["kept"], **own["kept"]}}
+    identity = _retire_identity(workspace, wid, hand_off=hand_off, tell=tell)
+    moved = {"handed_off": moved["handed_off"] + identity.pop("handed_off", []),
+             "kept": {**moved["kept"], **identity.pop("kept", {})}}
+    if identity["result"] == "failed":
+        return {**base, "result": "failed", "unbound": unbound, "handed_off": moved["handed_off"],
+                "kept": moved["kept"], "identity": identity,
+                "why": f"{identity['why']}; the worker stays retired with its agent's row kept: re-run retire"}
     return {**base, "result": "retired", "unbound": unbound,
             "handed_off": moved["handed_off"], "kept": moved["kept"], "identity": identity,
             "pending_approval": _withdraw_approval(workspace, wid, tell=tell)}
@@ -259,26 +258,48 @@ def _withdraw_approval(workspace, wid: str, tell=None) -> dict:
         return {"result": "failed", "why": f"{type(e).__name__}: {e}"}
 
 
-def _retire_identity(workspace, wid: str, tell=None) -> dict:
-    """The worker's own agent, if it has one, goes with it: its lane, row and vault secret
-    (connections.retire_worker_identity). Retired, the router hands its tasks to the core, and
-    a lane still running as the worker would post the core's answers in the worker's name."""
+def _retire_identity(workspace, wid: str, hand_off: bool = False, tell=None) -> dict:
+    """The worker's own agent, if it has one, goes with it: its lane is stopped and its row marked retiring
+    (`connections.begin_worker_retirement`), the tasks it owes in its own folder are handed to the core under
+    its switch lock (`hand_off`; else they refuse), and only then its row and vault secret go
+    (`connections.retire_worker_identity`). Anything short of that is "failed" with the row kept."""
     import connections
-    try:
-        row = connections.retire_worker_identity(wid, workspace=Path(workspace))
-    except connections.ConnectionsError as e:
-        return {"result": "failed", "why": f"{type(e).__name__}: {e}"}
-    if row is None:
+    ws = Path(workspace)
+    if connections.worker_identity(wid, ws) is None:
         return {"result": "none"}
+    try:
+        connections.begin_worker_retirement(wid, workspace=ws)
+    except connections.ConnectionsError as e:
+        return {"result": "failed", "why": f"its lane did not stop ({type(e).__name__}: {e})"}
+    got = {"handed_off": [], "kept": {}}
+    try:
+        with connections.worker_switch_lock(wid, ws):
+            owed = sup.own_inbox_owed(ws, wid)
+            if owed and not hand_off:
+                return {"result": "failed", "owed_kept": sorted(t for t, _f in owed),
+                        "why": f"it owes {len(owed)} task(s) in its own folder (pass --hand-off)"}
+            if owed:
+                got = pd.hand_off_own_inbox(ws, wid, owed)
+    except OSError as e:
+        return {"result": "failed", **got, "why": f"its own folder's tasks were not handed off ({type(e).__name__}: {e})"}
+    if got["kept"]:
+        return {"result": "failed", **got,
+                "why": f"{len(got['kept'])} task(s) in its own folder could not be handed off (a task of that name "
+                       "is already in the shared tasks/)"}
+    try:
+        row = connections.retire_worker_identity(wid, workspace=ws) or {}
+    except connections.ConnectionsError as e:
+        return {"result": "failed", **got, "why": f"{type(e).__name__}: {e}"}
     agent = row.get("agent_mxid") or ""
     label = str(((pr.load_roster(workspace) or {}).get("workers") or {}).get(wid, {}).get("label") or wid)
     told = (tell or (lambda text: _tell_owner(workspace, text)))(agent_removal_note(label, agent or "?"))
-    return {"result": "removed", "instance": row["instance"], "agent": agent,
+    return {"result": "removed", "instance": row.get("instance"), "agent": agent,
             "agent_removal": "owner_step", "owner_told": bool(told),
-            "note": AGENT_REMOVAL_OWNER_STEP}
+            "note": AGENT_REMOVAL_OWNER_STEP, **got}
 
 
 def enable(workspace, repo, target, *, start=True, runner=None, spawn=None) -> dict:
+    import connections
     wid, row = _worker(workspace, target)
     old = row.get("state")
     if old == "retired":
@@ -286,6 +307,14 @@ def enable(workspace, repo, target, *, start=True, runner=None, spawn=None) -> d
     sup.set_paused(workspace, wid, False)
     out = {"worker_id": wid, "action": "enable", "result": "enabled", "previous_state": old,
            "paused": False}
+    if connections.worker_retiring(wid, Path(workspace)):
+        # A retire that stopped part-way kept the agent's row: this takes it back, lane and all.
+        lane = connections.end_worker_retirement(wid, workspace=Path(workspace)) or {}
+        try:
+            out["lane"] = connections.start_added(lane, repo=Path(repo), logs_dir=Path(workspace) / "logs",
+                                                  workspace=Path(workspace))
+        except connections.ConnectionsError as e:
+            out["lane"] = {"ok": False, "reason": str(e)}
     if start:
         restarted = rem.restart(workspace, repo, wid, runner=runner, spawn=spawn)
         out["start"] = {"result": restarted["result"], "detail": restarted["detail"]}

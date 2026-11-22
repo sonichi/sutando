@@ -30,9 +30,11 @@ from (`<workspace>/agents/<segment>.bridge/worker.json`), `withdraw --worker <w>
 `migrate-dirs --worker <w>` shows what a switch would do; with `--apply` it switches the worker onto its
 own folders: it sets `dirs: "migrating"` (nothing new is routed to it; it still runs on the shared folders),
 has the declared handler empty the worker's deliveries folder (its own lane's tasks move into its tasks
-folder, the core's are handed back; nothing moves while it still owes accepted work), and only then sets
-`dirs: "own"`, relaunches its lane, empties what the old lane left and moves its unclaimed live results. A
-handler that fails or work still owed leaves it "migrating" on the shared folders. `--undo` switches it back
+folder, the core's are handed back; nothing moves while it still owes accepted work), then sets
+`dirs: "committing"` and relaunches its lane on its own folders (a declared bridge is waited for), empties
+what the old lane left, and only then, under the worker's switch lock, sets `dirs: "own"` and moves its
+queued tasks and unclaimed live results. A handler that fails or work still owed leaves it "migrating", a
+lane that did not stop "committing", and a worker being retired is never switched. `--undo` switches it back
 and returns its live tasks and results to the shared folders. Both are idempotent. Each takes `--workspace`.
 """
 from __future__ import annotations
@@ -274,12 +276,12 @@ def _install_own(ns: dict, worker: str, argv, *, workspace, results_dir, log, wh
 
 
 def lane_dirs(workspace, instance: str) -> "tuple[Path, Path, bool]":
-    """(tasks dir, results dir, own) a lane `instance` runs on: its worker's own folders when that worker
-    has them (`connections.worker_dirs`), else the workspace's shared tasks/ and results/. Paths are
+    """(tasks dir, results dir, own) a lane `instance` runs on: its worker's own folders once its switch is
+    "committing" or "own" (`connections.worker_lane_dirs`), else the workspace's shared tasks/ and results/. Paths are
     lexical under `workspace` as given; resolve both sides before comparing with a recorded realpath."""
     from connections import ensure_worker_dirs, lane_worker
     ws = Path(workspace)
-    own = ensure_worker_dirs(lane_worker(instance, ws), ws) if instance else None
+    own = ensure_worker_dirs(lane_worker(instance, ws), ws, lane=True) if instance else None
     return (own[0], own[1], True) if own else (ws / "tasks", ws / "results", False)
 
 
@@ -302,8 +304,8 @@ def runtime_identity(worker: str, instance: str, workspace) -> bytes:
     from connections import worker_identity
     row = worker_identity(worker, Path(workspace)) or {}
     fields = [worker, instance] + [str(row.get(k) or "") for k in ("token_ref", "gateway_url", "server")]
-    # Appended only when "own", so a shared-dir or still-migrating worker's revision is unchanged.
-    fields += [str(row[k]) for k in ("dirs",) if row.get(k) == "own"]
+    # "own" once its lane moves ("committing" or "own"), so sparrowd replaces the bridge exactly then.
+    fields += ["own" for k in ("dirs",) if row.get(k) in ("committing", "own")]
     return "\0".join(fields).encode("utf-8")
 
 
@@ -678,10 +680,14 @@ def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=s
         if owed:
             return out, (f"{len(owed)} task(s) delivered to {worker} but no task-event handler can move them; "
                          "nothing was switched")
-    from connections import WORKER_DIRS_MIGRATING, WORKER_DIRS_OWN, worker_dirs_state
+    from connections import (WORKER_DIRS_COMMITTING, WORKER_DIRS_MIGRATING, WORKER_DIRS_OWN, worker_dirs_state,
+                             worker_retiring, worker_switch_lock)
     state = worker_dirs_state(worker, ws)
+    if worker_retiring(worker, ws):
+        out["state"] = state or "shared"
+        return out, f"worker {worker} is being retired: its folders are not switched"
     try:
-        if state != WORKER_DIRS_OWN:
+        if state not in (WORKER_DIRS_COMMITTING, WORKER_DIRS_OWN):
             # Written before any scan of its deliveries: the router re-reads it under the folder lock.
             set_worker_dirs(worker, WORKER_DIRS_MIGRATING, workspace=ws)
         ensure_worker_dirs(worker, ws, target=True)
@@ -689,13 +695,15 @@ def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=s
         out["state"] = worker_dirs_state(worker, ws) or "shared"
         return out, str(e)
     out["state"] = state or WORKER_DIRS_MIGRATING
-    if state != WORKER_DIRS_OWN:
+    if state not in (WORKER_DIRS_COMMITTING, WORKER_DIRS_OWN):
         why = _drain_deliveries(worker, ws, handler, run, out, "deliveries", committed=False)
         if why:
             return out, why
     try:
-        out["lane"], why = relaunch_lane(worker, ws, kill, procs, start=start,
-                                         switch=lambda: set_worker_dirs(worker, True, workspace=ws))
+        if state != WORKER_DIRS_OWN:
+            # Only its lane moves now; "own", which its seat and supervision read, waits for that lane.
+            set_worker_dirs(worker, WORKER_DIRS_COMMITTING, workspace=ws)
+        out["lane"], why = relaunch_lane(worker, ws, kill, procs, start=start)
     except (ConnectionsError, OSError) as e:
         return out, str(e)
     finally:
@@ -707,9 +715,17 @@ def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=s
     if why:
         return out, why
     failed: "list[str]" = []
-    out["tasks_moved"] = _move_live(ws / "tasks", tasks, _queued_for(worker, ws), failed)
-    out["results_moved"] = adopt_stray_results(worker, ws, results, lease=False, failed=failed)
-    out["proactive_moved"] = adopt_stray_proactive(worker, ws / "results", results, lease=False, failed=failed)
+    try:
+        with worker_switch_lock(worker, ws):
+            # A retirement marked meanwhile refuses this write, so nothing below moves for it.
+            set_worker_dirs(worker, True, workspace=ws)
+            out["tasks_moved"] = _move_live(ws / "tasks", tasks, _queued_for(worker, ws), failed)
+            out["results_moved"] = adopt_stray_results(worker, ws, results, lease=False, failed=failed)
+            out["proactive_moved"] = adopt_stray_proactive(worker, ws / "results", results, lease=False, failed=failed)
+    except (ConnectionsError, OSError) as e:
+        return out, str(e)
+    finally:
+        out["state"] = worker_dirs_state(worker, ws) or "shared"
     return out, _failed(out, failed)
 
 

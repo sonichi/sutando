@@ -143,7 +143,7 @@ class Forward(Base):
     def test_a_relaunch_that_raises_after_the_drain_says_why_and_keeps_the_record(self):
         with mock.patch.object(worker_lane, "relaunch_lane", side_effect=OSError("lane gone")):
             out, why = self.migrate()
-        self.assertEqual((why, out["state"]), ("lane gone", "migrating"))
+        self.assertEqual((why, out["state"]), ("lane gone", "committing"))
         self.assertIsNone(C.worker_dirs(W, self.ws))
 
     def test_without_a_handler_a_deliveries_folder_unreadable_mid_switch_keeps_it_migrating(self):
@@ -370,7 +370,7 @@ class TheLane(Base):
         calls = []
 
         def start(instance, ws):
-            calls.append((instance, Path(ws), C.worker_dirs(W, self.ws), C.bridge_pid(self.lane, self.ws)))
+            calls.append((instance, Path(ws), C.worker_lane_dirs(W, self.ws), C.bridge_pid(self.lane, self.ws)))
             return record
         return calls, start
 
@@ -430,11 +430,11 @@ class TheLane(Base):
         out, why = self.migrate(procs={}, start=start)
         self.assertEqual(out["lane"], f"stopped pid {proc.pid}; it did not start again (no_token)")
         self.assertIn(f"run connections.py start {self.lane}", why)
-        self.assertEqual(C.worker_dirs(W, self.ws), (self.own / "tasks", self.own / "results"),
-                         "the switch itself is kept")
+        self.assertEqual((C.worker_dirs(W, self.ws), C.worker_dirs_state(W, self.ws)), (None, "committing"),
+                         "the switch is kept short of \"own\" until its lane runs")
         calls, start = self.started({"ok": True, "lease": "held", "pid": 9})
         out, why = self.migrate(procs={}, start=start)
-        self.assertEqual((why, out["lane"]), ("", "the lane was down; started again (pid 9)"))
+        self.assertEqual((why, out["lane"], out["state"]), ("", "the lane was down; started again (pid 9)", "own"))
         self.assertEqual(len(calls), 1)
         calls, start = self.started({"ok": True, "lease": "held", "pid": 10})
         out, why = self.migrate(procs={}, start=start)
@@ -632,8 +632,8 @@ class TheCli(Base):
 
 
 
-class SupervisedSwitch(Base):
-    """A switch with the worker's seat running, read back through production supervision and routing."""
+class Seated(Base):
+    """A worker with a running seat (fake tmux) on the roster; no tests of its own."""
 
     def setUp(self):
         super().setUp()
@@ -645,6 +645,23 @@ class SupervisedSwitch(Base):
         seat = wi.tmux_session_name(W)
         self.tmux = FakeTmux({seat, seat + "-watcher", seat + "-input"})
         self.handler = str(SCRIPTS / "pool_route_handler.py")
+
+    def own_worker_with_an_unanswered_task(self):
+        C.set_worker_dirs(W, True, workspace=self.ws)
+        C.ensure_worker_dirs(W, self.ws)
+        (self.own / "tasks" / f"{self.mine}.txt").write_text(f"id: {self.mine}\ntask: x\n")
+        pat.record(self.ws, self.mine, W)
+        real = C.retire_worker_identity
+        for p in (mock.patch.object(C, "retire_worker_identity",
+                                    lambda wid, **kw: real(wid, **{**kw, "vault": self.vault})),
+                  mock.patch.object(C, "_stop_row", lambda row, ws, kill: 0)):
+            p.start()
+            self.addCleanup(p.stop)
+
+
+
+class SupervisedSwitch(Seated):
+    """A switch with the worker's seat running, read back through production supervision and routing."""
 
     def test_accepted_legacy_work_keeps_the_worker_on_its_old_inbox_for_reseat_and_retire(self):
         import pool_manage as pm
@@ -666,18 +683,6 @@ class SupervisedSwitch(Base):
         (self.ws / "results" / f"{self.core}.txt").write_text("answer")
         out, why = self.migrate(handler=self.handler)
         self.assertEqual((why, out["state"]), ("", "own"))
-
-    def own_worker_with_an_unanswered_task(self):
-        C.set_worker_dirs(W, True, workspace=self.ws)
-        C.ensure_worker_dirs(W, self.ws)
-        (self.own / "tasks" / f"{self.mine}.txt").write_text(f"id: {self.mine}\ntask: x\n")
-        pat.record(self.ws, self.mine, W)
-        real = C.retire_worker_identity
-        for p in (mock.patch.object(C, "retire_worker_identity",
-                                    lambda wid, **kw: real(wid, **{**kw, "vault": self.vault})),
-                  mock.patch.object(C, "_stop_row", lambda row, ws, kill: 0)):
-            p.start()
-            self.addCleanup(p.stop)
 
     def test_retiring_an_own_folders_worker_that_owes_its_own_inbox_is_refused(self):
         import pool_manage as pm
@@ -756,6 +761,262 @@ class SupervisedSwitch(Base):
             (self.ws / "tasks" / f"{t}.txt").write_text(f"id: {t}\ntask: x\n")
         self.assertEqual(rt.deliver_one(self.ws, W, self.core), "fenced")
         self.assertEqual(rt.deliver_one(self.ws, W, self.mine), "delivered")
+
+
+
+class RoundThree(Seated):
+    """Switch, retire and routing interleavings, each through the production writers."""
+
+    def setUp(self):
+        super().setUp()
+        real = C.retire_worker_identity
+        for p in (mock.patch.object(C, "retire_worker_identity",
+                                    lambda wid, **kw: real(wid, **{**kw, "vault": self.vault})),
+                  mock.patch.object(C, "_stop_row", lambda row, ws, kill: 0)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def handle(self, path, *extra):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            return prh.main(["--workspace", str(self.ws), "--task-file", str(path), *extra])
+
+    def queue_shared(self, task_id, body="task: x\n", **headers):
+        (self.ws / "tasks").mkdir(parents=True, exist_ok=True)
+        head = "".join(f"{k}: {v}\n" for k, v in {"id": task_id, **headers}.items())
+        path = self.ws / "tasks" / f"{task_id}.txt"
+        path.write_text(head + body)
+        return path
+
+    def test_a_retire_during_the_switch_s_final_move_leaves_nothing_in_the_retired_inbox(self):
+        import threading
+        import pool_manage as pm
+        self.queue_shared(self.mine)
+        real_move, done = worker_lane._move_live, {}
+
+        def retire():
+            done["out"] = pm.retire(self.ws, W, hand_off=True, runner=self.tmux, tell=lambda text: True)
+
+        def move_after_a_retire(*a, **kw):
+            if "thread" not in done:
+                done["thread"] = threading.Thread(target=retire, daemon=True)
+                done["thread"].start()
+                done["thread"].join(3)
+            return real_move(*a, **kw)
+        with mock.patch.object(worker_lane, "_move_live", move_after_a_retire):
+            self.migrate(handler=self.handler)
+        done["thread"].join(30)
+        self.assertEqual(list((self.own / "tasks").glob("task-*.txt")), [],
+                         "no task is left in the inbox of an identity retirement removed")
+        self.assertTrue((self.ws / "tasks" / f"{self.mine}.txt").is_file())
+        self.assertEqual(done["out"]["result"], "retired")
+
+    def test_a_hand_off_that_cannot_move_a_task_keeps_the_identity_for_a_retry(self):
+        import errno
+        import pool_manage as pm
+        import undelivered_quarantine
+        self.own_worker_with_an_unanswered_task()
+        with mock.patch.object(undelivered_quarantine, "rename_noreplace",
+                               side_effect=FileExistsError(errno.ENOTSUP, "no primitive")):
+            out = pm.retire(self.ws, W, hand_off=True, runner=self.tmux, tell=lambda text: True)
+        self.assertEqual(out["result"], "failed", out)
+        self.assertIsNotNone(C.worker_identity(W, self.ws), "its row still locates its inbox")
+        self.assertTrue((self.own / "tasks" / f"{self.mine}.txt").is_file())
+        self.assertIn(self.mine, pm._outstanding(self.ws, W))
+        out = pm.retire(self.ws, W, hand_off=True, runner=self.tmux, tell=lambda text: True)
+        self.assertEqual((out["result"], out["handed_off"]), ("retired", [self.mine]), out)
+        self.assertIsNone(C.worker_identity(W, self.ws))
+
+    def test_a_hand_off_that_meets_a_taken_name_keeps_the_identity(self):
+        import pool_manage as pm
+        self.own_worker_with_an_unanswered_task()
+        self.queue_shared(self.mine, body="task: someone else's\n")
+        out = pm.retire(self.ws, W, hand_off=True, runner=self.tmux, tell=lambda text: True)
+        self.assertEqual(out["result"], "failed", out)
+        self.assertIsNotNone(C.worker_identity(W, self.ws))
+        self.assertTrue((self.own / "tasks" / f"{self.mine}.txt").is_file())
+
+    def test_own_is_not_published_while_the_old_lane_has_not_stopped(self):
+        with mock.patch.object(C, "bridge_pid", lambda instance, ws: 4242), \
+                mock.patch.object(worker_lane, "_declaration_for", lambda w, ws: (None, "")), \
+                mock.patch.object(C, "_stop_row", side_effect=C.BridgeStillRunning("lane", 4242)):
+            out, why = self.migrate(handler=self.handler)
+        self.assertIn("did not stop", why)
+        self.assertIsNone(C.worker_dirs(W, self.ws), "not own while the shared-folder lane still runs")
+        self.assertNotEqual(out["state"], "own")
+
+    def test_a_lane_task_of_a_worker_leaving_the_shared_folders_never_falls_to_the_core(self):
+        path = self.queue_shared(self.mine, requested_worker=W)
+        C.set_worker_dirs(W, C.WORKER_DIRS_MIGRATING, workspace=self.ws)
+        self.assertEqual(self.handle(path, "--from-lane", "--payload", str(path)), 0)
+        self.assertIsNotNone(pd.find(self.ws, W, self.mine), "while migrating it reaches the old inbox")
+        other = f"task-{self.lane}~a2"
+        path = self.queue_shared(other, requested_worker=W)
+        for state in (C.WORKER_DIRS_COMMITTING, True):
+            C.set_worker_dirs(W, state, workspace=self.ws)
+            self.assertEqual(self.handle(path, "--from-lane", "--payload", str(path)), prh.MUST_HANDLE, state)
+            self.assertEqual(self.handle(path), prh.MUST_HANDLE, "the core's watcher leaves it too")
+        self.assertIsNone(pd.find(self.ws, W, other))
+
+    def test_a_trusted_cancel_reaches_accepted_legacy_work_while_migrating(self):
+        self.deliver(self.core, ".accepted")
+        C.set_worker_dirs(W, C.WORKER_DIRS_MIGRATING, workspace=self.ws)
+        stop = "task-1700000000009"
+        path = self.queue_shared(stop, body=f"task: CANCEL_INSTRUCTION: stop processing {self.core}\n",
+                                 source="voice", access_tier="owner")
+        self.assertEqual(self.handle(path), 0)
+        self.assertIsNotNone(pd.find(self.ws, W, stop), "the stop reaches the worker holding the task")
+
+
+    def test_the_switch_and_retire_paths_take_their_locks_in_one_order(self):
+        import threading
+        import pool_supervise as sup
+        C.set_worker_dirs(W, C.WORKER_DIRS_MIGRATING, workspace=self.ws)
+        C.ensure_worker_dirs(W, self.ws, target=True)
+        errors, rounds = [], 40
+
+        def switch_path():  # task -> deliveries folder -> the worker's switch lock
+            try:
+                for i in range(rounds):
+                    self.deliver(f"task-{self.lane}~s{i}")
+                    # Its unlocked listing can lose a sentinel the hand-off withdrew; a re-run picks that up.
+                    with contextlib.suppress(FileNotFoundError):
+                        pd.migrate_to_own_dirs(self.ws, W, self.own / "tasks", lambda tid: True)
+            except Exception as e:  # noqa: BLE001
+                import traceback
+                errors.append(traceback.format_exc())
+
+        def retire_path():  # the switch lock alone (read and hand-off), then task -> deliveries folder
+            try:
+                for _ in range(rounds):
+                    with C.worker_switch_lock(W, self.ws):
+                        pd.hand_off_own_inbox(self.ws, W, sup.own_inbox_owed(self.ws, W))
+                    pd.hand_off_to_core(self.ws, W)
+            except Exception as e:  # noqa: BLE001
+                import traceback
+                errors.append(traceback.format_exc())
+        threads = [threading.Thread(target=f, daemon=True) for f in (switch_path, retire_path)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        self.assertFalse(any(t.is_alive() for t in threads), "the two paths deadlocked")
+        self.assertEqual(errors, [])
+
+    def test_a_retiring_worker_is_never_switched_and_its_deliveries_are_not_moved(self):
+        self.deliver(self.mine)
+        C.set_worker_dirs(W, C.WORKER_DIRS_MIGRATING, workspace=self.ws)
+        C.begin_worker_retirement(W, workspace=self.ws)
+        with self.assertRaises(ValueError):
+            pd.migrate_to_own_dirs(self.ws, W, self.own / "tasks", lambda tid: True)
+        self.assertIsNotNone(pd.find(self.ws, W, self.mine))
+        out, why = self.migrate(handler=self.handler)
+        self.assertIn("being retired", why)
+        with self.assertRaises(C.ConnectionsError):
+            C.set_worker_dirs(W, True, workspace=self.ws)
+        self.assertEqual(C.worker_dirs_state(W, self.ws), "migrating")
+
+    def test_enable_takes_back_a_retire_that_stopped_part_way(self):
+        import pool_manage as pm
+        self.own_worker_with_an_unanswered_task()
+        self.queue_shared(self.mine, body="task: someone else's\n")
+        self.assertEqual(pm.retire(self.ws, W, hand_off=True, runner=self.tmux, tell=lambda t: True)["result"], "failed")
+        self.assertTrue(C.worker_retiring(W, self.ws))
+        started = []
+        with mock.patch.object(C, "start_added", lambda row, **kw: started.append(row["instance"]) or {"ok": True}):
+            out = pm.enable(self.ws, ROOT, W, start=False)
+        self.assertEqual((out["result"], out["lane"], started), ("enabled", {"ok": True}, [self.lane]))
+        self.assertFalse(C.worker_retiring(W, self.ws))
+        self.assertFalse(C.worker_identity(W, self.ws).get("disabled"))
+        self.assertEqual(C.worker_dirs_state(W, self.ws), "own")
+
+    def test_a_declared_bridge_is_replaced_when_its_lane_moves_not_again_at_own(self):
+        rev = {}
+        for state in (C.WORKER_DIRS_MIGRATING, C.WORKER_DIRS_COMMITTING, True):
+            C.set_worker_dirs(W, state, workspace=self.ws)
+            rev[state] = worker_lane.runtime_identity(W, self.lane, self.ws)
+        self.assertNotEqual(rev[C.WORKER_DIRS_MIGRATING], rev[C.WORKER_DIRS_COMMITTING])
+        self.assertEqual(rev[C.WORKER_DIRS_COMMITTING], rev[True])
+        self.assertEqual(worker_lane.lane_dirs(self.ws, self.lane)[2], True)
+
+
+    def test_a_retire_marked_while_the_lane_moves_stops_the_switch_short_of_own(self):
+        real = worker_lane.relaunch_lane
+
+        def relaunch_then_retire(*a, **kw):
+            got = real(*a, **kw)
+            C.begin_worker_retirement(W, workspace=self.ws)
+            return got
+        with mock.patch.object(worker_lane, "relaunch_lane", relaunch_then_retire):
+            out, why = self.migrate(handler=self.handler)
+        self.assertIn("being retired", why)
+        self.assertEqual((out["state"], C.worker_dirs(W, self.ws)), ("committing", None))
+
+    def test_a_retire_marked_after_the_last_drain_refuses_own_and_moves_nothing(self):
+        self.queue_shared(self.mine)
+        real = worker_lane._drain_deliveries
+
+        def drain_then_retire(worker, ws, handler, run, out, key, committed):
+            why = real(worker, ws, handler, run, out, key, committed)
+            if key == "deliveries_after":
+                C.begin_worker_retirement(W, workspace=self.ws)
+            return why
+        with mock.patch.object(worker_lane, "_drain_deliveries", drain_then_retire):
+            out, why = self.migrate(handler=self.handler)
+        self.assertIn("being retired", why)
+        self.assertEqual(out["state"], "committing")
+        self.assertTrue((self.ws / "tasks" / f"{self.mine}.txt").is_file(), "its queued task was not moved")
+
+    def test_a_route_for_a_lane_task_of_a_worker_on_its_own_folders_is_refused_not_given_to_the_core(self):
+        import pool_router as rt
+        self.queue_shared(self.mine, requested_worker=W)
+        C.set_worker_dirs(W, C.WORKER_DIRS_COMMITTING, workspace=self.ws)
+        with self.assertRaises(rt.RouterRefused):
+            rt.route(self.ws, {"id": self.mine, "requested_worker": W})
+
+    def test_retire_failures_keep_the_identity(self):
+        import pool_manage as pm
+        with mock.patch.object(C, "begin_worker_retirement", side_effect=C.ConnectionsError("lane busy")):
+            out = pm.retire(self.ws, W, runner=self.tmux, tell=lambda t: True)
+        self.assertEqual(out["result"], "failed")
+        self.assertIn("lane busy", out["why"])
+        with mock.patch.object(C, "retire_worker_identity", side_effect=C.ConnectionsError("vault busy")):
+            out = pm.retire(self.ws, W, runner=self.tmux, tell=lambda t: True)
+        self.assertEqual(out["result"], "failed")
+        self.assertIsNotNone(C.worker_identity(W, self.ws))
+
+    def test_own_folder_work_that_arrives_during_a_retire_without_hand_off_keeps_the_identity(self):
+        import pool_manage as pm
+        C.set_worker_dirs(W, True, workspace=self.ws)
+        C.ensure_worker_dirs(W, self.ws)
+        real = C.begin_worker_retirement
+
+        def a_task_lands_before_the_lane_stops(worker, **kw):
+            (self.own / "tasks" / f"{self.mine}.txt").write_text(f"id: {self.mine}\ntask: x\n")
+            return real(worker, **kw)
+        with mock.patch.object(C, "begin_worker_retirement", a_task_lands_before_the_lane_stops):
+            out = pm.retire(self.ws, W, runner=self.tmux, tell=lambda t: True)
+        self.assertEqual((out["result"], out["identity"]["owed_kept"]), ("failed", [self.mine]))
+        self.assertIsNotNone(C.worker_identity(W, self.ws))
+
+    def test_enable_reports_a_lane_that_does_not_start(self):
+        import pool_manage as pm
+        C.begin_worker_retirement(W, workspace=self.ws)
+        with mock.patch.object(C, "start_added", side_effect=C.ConnectionsError("no token")):
+            out = pm.enable(self.ws, ROOT, W, start=False)
+        self.assertEqual(out["lane"], {"ok": False, "reason": "no token"})
+        self.assertFalse(C.worker_retiring(W, self.ws))
+
+    def test_the_retirement_helpers_and_lock_refuse_what_is_not_a_worker(self):
+        with self.assertRaises(C.ConnectionsError):
+            with C.worker_switch_lock("../Not A Worker", self.ws):
+                pass
+        other = "a" * 32
+        self.assertIsNone(C.begin_worker_retirement(other, workspace=self.ws))
+        self.assertIsNone(C.end_worker_retirement(other, workspace=self.ws))
+        self.edit_worker_row(retiring="yes")
+        with self.assertRaises(C.SchemaError):
+            C._read(C.record_path(self.ws))
 
 
 class FakeTmux:

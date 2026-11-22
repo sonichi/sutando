@@ -202,7 +202,7 @@ def stop_holder(workspace, task: dict, roster=FROM_DISK) -> "str | None":
 
 def deliver_one(workspace, recipient: str, task_id: str,
                 _between_sentinel_and_attribution=None, _arbitration_seams=None, payload=None,
-                renotify=False) -> str:
+                renotify=False, stop=False) -> str:
     """Create one sentinel. Returns 'delivered' | 'already' | 'no-payload'.
 
     Checks BOTH names: a sentinel already renamed to `.accepted` is work in
@@ -217,6 +217,9 @@ def deliver_one(workspace, recipient: str, task_id: str,
     staged copy before publishing it, so the core's watcher never finds that task unrouted.
     `renotify`: once that task is published, a pending sentinel found is replaced by a fresh one, so a
     watcher that gave up on it while the payload was not yet there sees it again.
+
+    `stop`: the task is a trusted stop for work `recipient` holds, which reaches it while its folder switch
+    has not committed ("migrating" or "committing"), as its own lane's tasks do.
 
     `_between_sentinel_and_attribution` is a test seam: the two writes are not
     crash-atomic, so an existing sentinel is re-attributed on 'already'.
@@ -244,7 +247,8 @@ def deliver_one(workspace, recipient: str, task_id: str,
         # Re-read under the lock a folder switch scans under: a pass that chose this worker before the
         # switch began must not drop work into a folder the switch has already emptied.
         state = _dirs_state(workspace, recipient) if recipient != pr.CORE else ""
-        if state == "own" or (state == "migrating" and not _own_lane_task(workspace, recipient, task_id)):
+        if state == "own" or (state in ("migrating", "committing") and not stop
+                              and not _own_lane_task(workspace, recipient, task_id)):
             return "fenced"
         try:
             os.close(os.open(task_id + pd.PENDING_SUFFIX, os.O_CREAT | os.O_EXCL, 0o644, dir_fd=dfd))
@@ -290,6 +294,15 @@ def _own_lane_task(workspace, recipient: str, task_id: str) -> bool:
     return connections.task_home(task_id, Path(workspace))["worker"] == recipient
 
 
+def lane_holder(workspace, task_id: str) -> "tuple[str, str]":
+    """(worker, its folder state) when `task_id` was queued by a pool worker's own lane; ("", "") otherwise.
+    A "migrating" worker's lane task goes to it; a "committing" or "own" one's is left for its own lane."""
+    import connections
+    home = connections.task_home(task_id, Path(workspace))
+    worker = home["worker"] if home["lane"] else ""
+    return (worker, connections.worker_dirs_state(worker, Path(workspace))) if worker else ("", "")
+
+
 def own_dir_workers(workspace, targets) -> list:
     """The targets that keep their own task folders (`connections.worker_dirs`): their inbox is their
     own lane's, so the router never delivers to them."""
@@ -324,8 +337,16 @@ def route(workspace, task: dict, roster=FROM_DISK, _between_suffix_checks=None, 
         snapshot = pr.load_roster(workspace) if roster is FROM_DISK else roster
         committed = committed_recipient(workspace, task_id, _between_suffix_checks, _arbitration_seams,
                                         roster=snapshot)
+        is_stop = False
         if committed is None:
             committed = stop_holder(workspace, task, roster=snapshot)   # a stop follows its task
+            is_stop = committed is not None
+        holder, holder_state = lane_holder(workspace, task_id) if committed is None else ("", "")
+        if holder_state in ("committing", "own"):
+            raise RouterRefused(f"{task_id} was queued by worker {holder}'s lane, which is moving or has "
+                                "moved onto its own folders: it is left for that lane, never the core")
+        if holder_state == "migrating":
+            committed = holder
         if committed is not None:
             # Not filtered for own folders: switching a worker to them empties its deliveries/ first.
             targets, unknown, r = [committed], [], (snapshot if isinstance(snapshot, dict) else {})
@@ -356,7 +377,7 @@ def route(workspace, task: dict, roster=FROM_DISK, _between_suffix_checks=None, 
         buckets = {"delivered": [], "already": [], "no-payload": [], "fenced": []}
         for t in targets:
             buckets[deliver_one(workspace, t, task_id, _arbitration_seams=_arbitration_seams,
-                                payload=payload, renotify=renotify)].append(t)
+                                payload=payload, renotify=renotify, stop=is_stop)].append(t)
     return {"task_id": task_id, "version": r.get("version"), "targets": targets,
             "delivered": buckets["delivered"], "already": buckets["already"],
             "skipped": buckets["no-payload"], "fenced": buckets["fenced"],

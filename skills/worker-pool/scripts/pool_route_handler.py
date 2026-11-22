@@ -109,6 +109,13 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
         return MUST_HANDLE, [], None
     if holder is not None:
         return 0, [holder], roster
+    lane_worker, lane_state = rt.lane_holder(workspace, task.get("id") or "") if task.get("id") else ("", "")
+    if lane_state in ("committing", "own"):
+        print(f"pool_route_handler: {task.get('id')} was queued by worker {lane_worker}'s lane, now on its own "
+              "folders; it is left for that lane, never the core", file=sys.stderr)
+        return MUST_HANDLE, [], roster
+    if lane_state == "migrating":
+        return 0, [lane_worker], roster
     if unreadable:
         # Absent means no pool; UNREADABLE means we cannot tell whose work this
         # is. Declining would hand every bound task to the unrestricted core.
