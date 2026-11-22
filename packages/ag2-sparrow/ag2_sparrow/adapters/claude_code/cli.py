@@ -710,9 +710,9 @@ def sign_in_refused(cfg: dict, local, args) -> str:
         turns = inbox.open_turns(cm.work_root(cfg))
     except Exception:
         return NOT_OWNERS_TURN
-    if not turns or not all(tier == "owner" and not collab for tier, collab, _ in turns):
+    if not turns or not all(kind == task_io.OWNER for kind, _ in turns):
         return NOT_OWNERS_TURN
-    return "" if all(kind == "dm" for _, _, kind in turns) else NOT_IN_THE_DM
+    return "" if all(where == "dm" for _, where in turns) else NOT_IN_THE_DM
 
 
 START_SAY = ("Open this link and sign in, then give me the code the page shows, here in our DM (the link works for "

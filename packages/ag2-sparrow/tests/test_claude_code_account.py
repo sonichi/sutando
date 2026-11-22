@@ -321,15 +321,15 @@ class OwnerOnly(Base):
 
     def test_a_terminal_or_only_the_owners_own_open_tasks_may_sign_in(self):
         self.assertEqual(self.refused(tty=True), "")
-        self.assertEqual(self.refused([("owner", False, "dm")]), "")
-        self.assertEqual(self.refused([("owner", False, "dm"), ("owner", False, "dm")]), "")
-        for turns in ([], [("team", True, "dm")], [("guest", False, "dm")], [("owner", True, "dm")], [("unknown", True, "")],
-                      [("owner", False, "dm"), ("team", True, "room")], [("owner", False, "dm"), ("guest", False, "dm")]):
+        self.assertEqual(self.refused([("owner", "dm")]), "")
+        self.assertEqual(self.refused([("owner", "dm"), ("owner", "dm")]), "")
+        for turns in ([], [("collaborator", "dm")], [("restricted", "dm")], [("refused", "dm")], [("unknown", "")],
+                      [("owner", "dm"), ("collaborator", "room")], [("owner", "dm"), ("restricted", "dm")]):
             self.assertEqual(self.refused(turns), cli.NOT_OWNERS_TURN, turns)
 
     def test_the_owners_message_in_a_shared_room_is_told_to_ask_in_the_dm(self):
         """Whoever opens the link chooses the account, and an answer goes to the room it was asked in."""
-        for turns in ([("owner", False, "room")], [("owner", False, "")], [("owner", False, "dm"), ("owner", False, "room")]):
+        for turns in ([("owner", "room")], [("owner", "")], [("owner", "dm"), ("owner", "room")]):
             self.assertEqual(self.refused(turns), cli.NOT_IN_THE_DM, turns)
         self.assertIn("ask me in our DM", cli.NOT_IN_THE_DM)
         self.assertEqual(self.refused(boom=True), cli.NOT_OWNERS_TURN)
@@ -359,8 +359,8 @@ class OwnerOnly(Base):
                                    classify=lambda tid: inbox.lifecycle.LIVE_READY if tid == "t-answered" else inbox.lifecycle.ABSENT)
         with mock.patch.object(inbox, "_lifecycle", return_value=lc):
             turns = inbox.open_turns(str(root))
-        self.assertEqual(sorted(turns), sorted([("owner", False, "dm"), ("team", True, "room"), ("guest", False, "room"),
-                                                ("unknown", True, ""), ("unknown", True, ""), ("unknown", True, "")]))
+        self.assertEqual(sorted(turns), sorted([("owner", "dm"), ("collaborator", "room"), ("restricted", "room"),
+                                                ("unknown", ""), ("unknown", ""), ("unknown", "")]))
         self.assertTrue(inbox.records.claims_lock_path(str(root)).exists(), "read under claims.lock")
 
     def test_the_command_refuses_a_sign_in_that_is_not_the_owners_and_still_reads_and_cancels(self):
