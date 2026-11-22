@@ -21,9 +21,14 @@ Record: state/runtime-models.<runtime>.json  {"v": 1, "runtime", "at", "entries"
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import os
 import re
+import secrets
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -78,33 +83,93 @@ def _codex_entry(text: str) -> Dict:
 
 
 def parse_picker(pane: Optional[str], runtime: Optional[str]) -> List[Dict]:
-    """The rows of the runtime's model picker on `pane`, in its order; [] when none is up."""
+    """The rows of the runtime's model picker live at the bottom of `pane`; [] when none is up.
+    Only the last picker heading counts, and only when nothing but its rows, blank lines and its
+    own footer follow it, so picker-shaped text in the scrollback (anything the core printed or
+    relayed) is never read. A row whose label names a purchase, or is not plain text, is dropped."""
     head = _PICKER_HEAD.get(runtime or "claude")
     if not pane or head is None:
         return []
-    m = head.search(pane)
-    if m is None:
+    heads = list(head.finditer(pane))
+    if not heads:
         return []
     rows: List[Dict] = []
-    for line in pane[m.end():].splitlines():
+    leading: List[str] = []  # the picker's own subtitle, above its rows
+    trailing: List[str] = []  # its footer, below them
+    for line in pane[heads[-1].end():].splitlines():
         hit = _ROW.match(line)
-        if hit:
-            rows.append((_codex_entry if runtime == "codex" else _claude_entry)(hit.group(2)))
-        elif rows and line.strip() and not line.startswith(" " * 6):
-            break
+        if hit and not trailing:
+            # A row whose own description says it is billed apart (extra usage, credits) is a
+            # purchase however its label reads: it never becomes a button.
+            row = (_codex_entry if runtime == "codex" else _claude_entry)(hit.group(2))
+            rows.append(dict(row, billed=bool(_BILLED.search(hit.group(2)))))
+        elif not line.strip() or (rows and not trailing and line.startswith(" " * 6)):
+            continue
+        else:
+            (trailing if rows else leading).append(line.strip())
+    footer = _FOOTER.get(runtime or "claude")
+    if (not rows or len(leading) > 2 or len(trailing) > 2
+            or (footer is not None and not any(footer.search(t) for t in trailing))):
+        return []
     seen, out = set(), []
     for row in rows[:MAX_ENTRIES]:
-        if row["key"] not in seen:
+        billed = row.pop("billed")
+        if row["key"] not in seen and _plain(row["label"]) and not billed:
             seen.add(row["key"])
             out.append(row)
     return out
 
 
+_FOOTER = {"claude": re.compile(r"Esc to cancel"), "codex": None}
+_PURCHASE = re.compile(r"fund|credit|pay|purchase|upgrade|buy|billing|usage|tap|click|http", re.I)
+# A description may say "uses your limits faster"; only billing apart from the plan drops the row.
+_BILLED = re.compile(r"extra usage|\bbilled\b|\bcredits?\b|\bpay|purchase|\bbuy\b|\$\s?\d", re.I)
+
+
+def _plain(label: str) -> bool:
+    return 0 < len(label) <= 40 and label.isprintable() and not _PURCHASE.search(label)
+
+
 def record(workspace: Path, runtime: str, entries: List[Dict], now: Optional[float] = None) -> None:
-    """The one writer of a runtime's list."""
+    """The one writer of a runtime's list. Each row's `key` (the id a card's button carries) is an
+    opaque token bound to this read of the list: a later read, even of the same list, issues new
+    ones, so a tap made against an older list finds no row and runs nothing. Labels are display only."""
+    at = time.time() if now is None else now
+    rows = [dict(e) for e in entries[:MAX_ENTRIES]]
+    read_id = hashlib.sha256(json.dumps([runtime, at, [(e.get("key"), e.get("arg"), e.get("label")) for e in rows]],
+                                        sort_keys=True).encode()).hexdigest()
+    secret = _secret(Path(workspace))
+    for i, e in enumerate(rows):
+        e["key"] = "o" + hmac.new(secret, f"{read_id}\n{i}".encode(), hashlib.sha256).hexdigest()[:TOKEN_HEX]
     write_status(f"runtime-models.{runtime}.json",
-                 {"v": VERSION, "runtime": runtime, "at": time.time() if now is None else now,
-                  "entries": entries[:MAX_ENTRIES]}, workspace=Path(workspace))
+                 {"v": VERSION, "runtime": runtime, "at": at, "entries": rows}, workspace=Path(workspace))
+
+
+#: Hex digits of a row's token after its "o": enough that a guess never names a live row.
+TOKEN_HEX = 12
+
+
+def _secret(workspace: Path) -> bytes:
+    """This host's key for row tokens (state/recovery/option-key, 0600), made on first use."""
+    path = status_path("recovery", workspace) / "option-key"
+    try:
+        got = path.read_bytes()
+        if len(got) >= 32:
+            return got
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".option-key-")
+    with os.fdopen(fd, "wb") as f:
+        f.write(secrets.token_bytes(32))
+    os.chmod(tmp, 0o600)
+    try:
+        os.link(tmp, path)  # first writer wins; a racing writer reads the winner's key
+    except FileExistsError:
+        pass
+    finally:
+        os.unlink(tmp)
+    return path.read_bytes()
 
 
 def read(workspace: Path, runtime: Optional[str]) -> Optional[Dict]:
@@ -168,6 +233,25 @@ def _probe_path(workspace: Path, session: str) -> Path:
     return status_path(f"runtime-models-probe.{re.sub(r'[^A-Za-z0-9._-]', '_', session)}.json", Path(workspace))
 
 
+#: A sent /model owns the next picker only this long; a request not acted on expires after REQUEST_TTL_S.
+PROBE_TTL_S = 20.0
+REQUEST_TTL_S = 120.0
+
+
+def _abandoned(pending: Dict, now: float) -> bool:
+    sent, asked = pending.get("sent_at"), pending.get("requested_at")
+    if isinstance(sent, (int, float)):
+        return not 0 <= now - sent <= PROBE_TTL_S
+    return not (isinstance(asked, (int, float)) and 0 <= now - asked <= REQUEST_TTL_S)
+
+
+def _drop(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
 def request_probe(workspace: Path, session: str, now: Optional[float] = None) -> None:
     """The owner asked for the current options: the next tick opens the picker to read them."""
     write_status(_probe_path(workspace, session).name,
@@ -182,17 +266,25 @@ def probe_step(workspace: Path, session: str, runtime: Optional[str], seat: bool
     "probing": `/model` was typed, on the owner's request only. "": nothing done."""
     at = time.time() if now is None else now
     rt = runtime or "claude"
+    if seat:
+        return ""  # a worker's pane never writes the core's model list
     rows = parse_picker(pane, rt)
     probe = _probe_path(workspace, session)
     try:
         pending = json.loads(probe.read_text()) if probe.exists() else None
     except (OSError, ValueError):
         pending = None
+    if pending is not None and _abandoned(pending, at):
+        # A request nobody acted on, or a /model whose picker never came up: it owns nothing now,
+        # so a picker the owner opens later is read as theirs, never dismissed by this monitor.
+        _drop(probe)
+        pending = None
     if rows:
         record(workspace, rt, rows, at)
-        if pending and pending.get("sent_at") and not pending.get("dismissed"):
-            send("Escape")
-            write_status(probe.name, dict(pending, dismissed=at), workspace=Path(workspace))
+        if pending and pending.get("sent_at"):
+            if send("Escape"):
+                _drop(probe)  # dismissed: the request is spent
+            # Else the key did not land: not dismissed; retried while the probe owns it (PROBE_TTL_S).
             return "ours"
         return "read"
     if not pending or pending.get("sent_at") or not pending.get("requested_at"):

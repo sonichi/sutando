@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -26,7 +27,18 @@ SOURCE = "crash-loop"
 STATUS_FILE = "supervisor-status.json"
 #: The supervisor rewrites its heartbeat every <=5 s; an older one is no supervisor (its schema).
 STATUS_FRESH_S = 60.0
-_ERROR_MAX = 160
+#: The kinds a service's last error is named by; its own text (paths, tokens, anything) never reaches a card.
+_ERROR_KINDS = (
+    ("out of memory", re.compile(r"out of memory|\bOOM\b|heap limit|ENOMEM|memory allocation", re.I)),
+    ("port already in use", re.compile(r"EADDRINUSE|address already in use|port .{0,20}in use", re.I)),
+    ("missing file or module", re.compile(r"ENOENT|no such file|cannot find module|module not found|"
+                                          r"ModuleNotFoundError", re.I)),
+    ("permission denied", re.compile(r"EACCES|EPERM|permission denied|operation not permitted", re.I)),
+    ("timed out", re.compile(r"timed? ?out|ETIMEDOUT", re.I)),
+    ("network error", re.compile(r"ECONNREFUSED|ECONNRESET|ENOTFOUND|network|socket hang up", re.I)),
+    ("killed by a signal", re.compile(r"\bsignal\b|SIGKILL|SIGTERM|SIGSEGV|killed", re.I)),
+    ("exited with an error", re.compile(r"\bexit(?:ed)?\b|code \d+|error", re.I)),
+)
 
 
 def terminal_services(workspace: Path, now: float) -> List[Dict]:
@@ -47,10 +59,28 @@ def terminal_services(workspace: Path, now: float) -> List[Dict]:
         if not isinstance(term, dict) or term.get("state") != "failed" or term.get("appSessionId") != session:
             continue
         life = svc.get("lifecycle") if isinstance(svc.get("lifecycle"), dict) else {}
-        error = str(life.get("reason") or term.get("reason") or "")
-        out.append({"service": str(name), "reason": str(term.get("reason") or "failed"),
-                    "error": " ".join(error.split())[:_ERROR_MAX], "session": str(session)})
+        out.append({"service": _name(name), "reason": _word(str(term.get("reason") or "")),
+                    "error": error_kind(str(life.get("reason") or term.get("reason") or "")),
+                    "session": str(session)})
     return out
+
+
+def error_kind(text: str) -> str:
+    """The kind of a supervisor error, named from a fixed list, never quoted; "" when none fits."""
+    return next((name for name, rx in _ERROR_KINDS if rx.search(text or "")), "")
+
+
+def _word(reason: str) -> str:
+    """The supervisor's verdict word ("crash-loop"), else its kind: a sentence never reaches a card."""
+    if re.fullmatch(r"[a-z][a-z0-9-]{0,30}", reason):
+        return reason
+    return error_kind(reason) or "failed"
+
+
+def _name(service) -> str:
+    """A service's name as the card shows it: the supervisor's own short id, else "a service"."""
+    text = str(service)
+    return text if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}", text) else "a service"
 
 
 def _abnormal(pane: Optional[str]) -> str:

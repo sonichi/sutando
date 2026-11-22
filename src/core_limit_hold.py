@@ -1049,13 +1049,15 @@ def handle_owner_actions(workspace: Path, now: Optional[float] = None, *,
             _audit(workspace, path, seat, action, "refused: replay", now)
             _archive_task(workspace, path)
             continue
-        if relaunch:
-            stamp = _task_time(path)
-            if stamp is None or now - stamp > REPLY_TTL_S:
-                _audit(workspace, path, seat, action, "refused: stale", now)
-                _answer_and_archive(workspace, path, "That reply is more than 10 minutes old, so I did not act on it. "
-                                    "Send it again if you still want it.")
-                continue
+        # Every path (the live monitor and the launcher's startup sweep) goes through the one gate:
+        # fresh, and claimed durably before anything runs.
+        import recovery_gate
+        key = f"reply:{seat or 'core'}:{path.stem}"
+        admitted = recovery_gate.admit(workspace, key, _task_time(path), now, REPLY_TTL_S)
+        if not admitted.ok:
+            _audit(workspace, path, seat, action, f"refused: {admitted.why}", now)
+            _answer_and_archive(workspace, path, _GATE_REFUSALS.get(admitted.why, _GATE_REFUSALS["replay"]))
+            continue
         kind, model = action
         who = (hold.get("seat_label") or seat) if seat else None
         if relaunch and seat:
@@ -1074,7 +1076,7 @@ def handle_owner_actions(workspace: Path, now: Optional[float] = None, *,
         elif not switch_cmd:
             ok, reply = False, "I could not switch the model from here; use the core-model card under Agent Settings."
         else:
-            # A crash before the record below re-runs this switch: the same model written twice.
+            # Admitted above: a crash from here on reports this reply interrupted, never runs it again.
             run = subprocess.run(["bash", switch_cmd, model, "--offline"], capture_output=True, text=True, timeout=60)
             ok = run.returncode == 0
             reply = (f"Switched the core to {model}. It is starting now and will answer your waiting messages."
@@ -1086,8 +1088,17 @@ def handle_owner_actions(workspace: Path, now: Optional[float] = None, *,
         _record_acted(workspace, path.stem)
         _audit(workspace, path, seat, action, "done" if ok else "refused: unsupported", now)
         _finish(workspace, entry, now, relaunch, seat)
+        recovery_gate.finish(workspace, key, "done" if ok else "refused", now)
         done.append(path.stem)
     return done
+
+
+_GATE_REFUSALS = {
+    "stale": "That reply is more than 10 minutes old, so I did not act on it. Send it again if you still want it.",
+    "interrupted": "I was interrupted while acting on that reply, so I did not do it again. Check the core's state, "
+                   "then send it again if you still want it.",
+    "replay": "I already acted on that reply.",
+}
 
 
 def _find_result_for(workspace: Path, task: str):

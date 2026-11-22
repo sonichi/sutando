@@ -62,11 +62,14 @@ def reminds(req: HumanRequirement) -> bool:
 
 
 def said_on_card(req: HumanRequirement) -> bool:
-    """A recovery card whose own message already says how its incident ended (an action's outcome
-    and the seat seen again); a separate "Cleared" message would only repeat it."""
+    """A recovery card that owes no "Cleared" message: its own message said the block lifted (working
+    again, or up but its waiting work not seen starting), or it was superseded by a fresh card (which
+    then carries the incident's notice). A "still blocked" line alone never counts."""
     subject = req.subject or {}
     check = subject.get("verify")
-    return bool(subject.get("recovery")) and isinstance(check, dict) and bool(check.get("seen"))
+    if not subject.get("recovery"):
+        return False
+    return bool(subject.get("superseded")) or (isinstance(check, dict) and check.get("seen") in ("working", "up"))
 
 
 def interval(reminders: int) -> float:

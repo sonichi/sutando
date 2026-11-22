@@ -38,9 +38,9 @@
         "restart_core"
       ],
       "switch_models": [
-        "sonnet-5-1m-context",
-        "fable-5-1",
-        "haiku"
+        "o4b876be2aaa6",
+        "o5029163bc176",
+        "o4a94f8c4f90b"
       ],
       "model_labels": [
         "Sonnet 5 (1M context)",

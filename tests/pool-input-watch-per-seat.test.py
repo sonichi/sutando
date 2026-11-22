@@ -12,6 +12,7 @@ without it the core's card is unchanged.
 import importlib.util
 import json
 import re
+import os
 import shlex
 import sys
 import tempfile
@@ -215,6 +216,69 @@ class RetryIsDetachedAndTransactional(unittest.TestCase):
                 mock.patch.object(self.pm.rem, "restart", side_effect=RuntimeError("boom")):
             with self.assertRaises(RuntimeError):
                 self.pm.retry(self.ws, REPO, WID)
+        self.assertEqual(self.paused[-1], False)
+
+    def test_a_busy_pool_lock_is_a_failed_retry_the_owner_is_told_about(self):
+        from unittest import mock
+
+        def busy(*a, **k):
+            raise self.pm.rem.PoolBusy("held by a sweep")
+        with mock.patch.object(self.pm.rem, "pool_lock", busy), \
+                mock.patch.object(self.pm.rem, "restart", lambda *a, **k: self.fail("restarted under a busy lock")):
+            out = self.pm.retry(self.ws, REPO, WID)
+        self.assertEqual((out["result"], self.paused[-1:]), ("failed", [False]))
+        [note] = list((self.ws / "results").glob("proactive-*.txt"))
+        self.assertIn("could not restart Mira: the pool was busy", note.read_text())
+
+    def test_a_take_down_that_cannot_run_is_a_failed_retry_with_a_fixed_reason(self):
+        from unittest import mock
+        with mock.patch.object(self.pm, "_take_down", side_effect=OSError("/some/private/path: denied")):
+            out = self.pm.retry(self.ws, REPO, WID)
+        self.assertEqual((out["result"], out["why"]), ("failed", "the seat could not be taken down or started"))
+        [note] = list((self.ws / "results").glob("proactive-*.txt"))
+        self.assertNotIn("/some/private/path", note.read_text(), "the error's own text never reaches the owner")
+
+    def test_a_cards_retry_reports_under_its_key_and_the_card_is_the_one_surface(self):
+        from unittest import mock
+        sys.path.insert(0, str(REPO / "src"))
+        import detached_action
+        down = lambda ws, w, r: {"down": True, "sessions": {}, "closed_runs": []}  # noqa: E731
+        for restarted, outcome in (("restarted", detached_action.DONE), ("failed", detached_action.FAILED)):
+            with self.subTest(restarted=restarted):
+                key = f"restart:hitl_x:{restarted}"
+                detached_action.begin(self.ws, key)
+                with mock.patch.dict(os.environ, {detached_action.KEY_ENV: key}), \
+                        mock.patch.object(self.pm, "_take_down", down), \
+                        mock.patch.object(self.pm.rem, "restart", lambda *a, **k: {"result": restarted, "detail": {}}):
+                    self.pm.retry(self.ws, REPO, WID)
+                got = detached_action.status(self.ws, key)
+                self.assertEqual(got.state, outcome)
+                if outcome == detached_action.FAILED:
+                    self.assertIn("could not restart Mira", got.reason)
+                self.assertEqual(list((self.ws / "results").glob("proactive-*.txt")), [], "no second surface")
+
+    def test_a_child_whose_tap_already_ended_takes_nothing_down(self):
+        from unittest import mock
+        sys.path.insert(0, str(REPO / "src"))
+        import detached_action
+        key = "restart:hitl_y:1"
+        detached_action.begin(self.ws, key, now=1.0, deadline_s=1)  # long past its deadline
+        with mock.patch.dict(os.environ, {detached_action.KEY_ENV: key}), \
+                mock.patch.object(self.pm, "_take_down", lambda *a: self.fail("took the seat down")):
+            self.assertEqual(self.pm.retry(self.ws, REPO, WID)["result"], "failed")
+        self.assertEqual(self.paused, [])
+
+    def test_an_unexpected_error_still_ends_the_cards_retry(self):
+        from unittest import mock
+        sys.path.insert(0, str(REPO / "src"))
+        import detached_action
+        key = "restart:hitl_z:1"
+        detached_action.begin(self.ws, key)
+        with mock.patch.dict(os.environ, {detached_action.KEY_ENV: key}), \
+                mock.patch.object(self.pm, "_take_down", side_effect=RuntimeError("boom")), \
+                self.assertRaises(RuntimeError):
+            self.pm.retry(self.ws, REPO, WID)
+        self.assertEqual(detached_action.status(self.ws, key).state, detached_action.FAILED)
         self.assertEqual(self.paused[-1], False)
 
     def test_a_stopped_worker_is_not_dispatched(self):

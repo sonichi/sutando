@@ -72,9 +72,32 @@ class SupervisorTerminal(Base):
         self.assertEqual(a.kind, "core-blocked")
         self.assertEqual(a.subject["crash_loop"], "voice-agent")
         self.assertIn("voice-agent keeps crashing", a.message)
-        self.assertIn("Last error: exited (code 1): TypeError: x is undefined", a.message)
+        self.assertIn("voice-agent keeps crashing, so the app stopped restarting it (crash-loop).", a.message)
+        self.assertIn("Last error: exited with an error", a.message, "named by its kind, never quoted")
+        self.assertNotIn("TypeError", a.message)
         self.assertIn("until the s.space app restarts", a.message)
         self.assertEqual(a.actions, [], "no button: nothing on the card can clear a terminal service")
+
+    def test_a_secret_or_a_path_in_the_supervisors_error_never_reaches_the_card(self):
+        now = time.time()
+        for error, kind in (("spawn /Users/someone/app/bin/node ENOENT token=sk-ant-oat01-SECRETSECRET",
+                             "missing file or module"),
+                            ("Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz0123456789", "not recorded"),
+                            ("JavaScript heap out of memory at /home/x/y.js", "out of memory")):
+            with self.subTest(kind=kind):
+                self.write(status(now, error=error))
+                [card] = self.tick(now=now)
+                self.assertIn(f"Last error: {kind}", card.message)
+                for leak in ("/Users/someone", "sk-ant", "ghp_", "/home/x", "Bearer"):
+                    self.assertNotIn(leak, card.message)
+                self.mgr.resolve(card.id)
+        doc = status(now)
+        doc["services"]["voice-agent"]["terminal"]["reason"] = "gave up: /Users/someone/x"
+        doc["services"]["../etc"] = doc["services"].pop("voice-agent")
+        self.write(doc)
+        [card] = self.tick(now=now + 1)
+        self.assertNotIn("/Users/someone", card.message)
+        self.assertIn("a service keeps crashing", card.message)
 
     def test_stale_status_or_another_session_raises_nothing(self):
         now = time.time()
@@ -133,10 +156,36 @@ class CoreCrashes(Base):
         self.assertEqual(self.mgr.get(card.id).status, STATUS_RESOLVED)
 
     def test_a_seat_monitor_never_raises_it(self):
-        # The monitor calls the step only for the core; a seat's watcher ends with its seat.
-        src = (SRC / "core-input-watch.py").read_text()
-        self.assertIn("if a.chat_escalation and not a.seat:\n            crash_loop_step(", src)
+        # Behaviour, not source text: one monitor tick (--once) of a seat on a host whose recovery
+        # record says crash_loop calls no crash-loop step; the core's tick does.
+        import os
+        from unittest import mock
+        self.record()
+        calls = []
 
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "ok"}
+
+        def tick(*extra):
+            argv = ["core-input-watch.py", "--socket", "/nonexistent.sock", "--once",
+                    "--out", str(self.ws / "state" / "core-supervisor.json"), *extra]
+            with mock.patch.object(M, "crash_loop_step", lambda *a, **k: calls.append(a[2]) or []), \
+                    mock.patch.object(M, "capture_styled", lambda *a: "❯ \n"), \
+                    mock.patch.object(M, "_load_runtime_health", lambda: _RH()), \
+                    mock.patch.object(M, "gateway_alive", lambda *a: True), \
+                    mock.patch.object(M, "session_runtime", lambda *a: "claude"), \
+                    mock.patch.object(M, "_ensure_tmux_on_path", lambda: None), \
+                    mock.patch.object(M, "send_keys", lambda *a: False), \
+                    mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.ws / "cfg")}), \
+                    mock.patch.object(sys, "argv", argv):
+                M.main()
+        tick("--session", "sutando-worker-b35461a4", "--seat", "worker Mira (b35461a4)")
+        self.assertEqual(calls, [], "a seat's monitor ran the crash-loop step")
+        tick("--session", CORE)
+        self.assertEqual(calls, [CORE], "the core's monitor runs it")
 
 if __name__ == "__main__":
     unittest.main()

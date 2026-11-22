@@ -100,7 +100,8 @@ MODEL_NAMES = ("opus", "sonnet", "haiku", "fable", "default")
 _SHAPES = {"incident": re.compile(r"inc_[0-9a-f]{8}"), "account": re.compile(r"acct_[0-9a-f]{6}"),
            "model": re.compile("|".join(MODEL_NAMES))}
 MAX_INT = 2 ** 53
-_MODEL_KEY = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
+# A model switch names an opaque row token (runtime_models.record), never a model or a label.
+_MODEL_KEY = re.compile(r"o[0-9a-f]{12}")
 
 
 # ---- the vocabulary other modules share -------------------------------------------------
@@ -121,7 +122,7 @@ def parse_action_id(action_id: Any, runtime: Optional[str] = None, accounts: tup
         return None
     if runtime is not None and verb not in RUNTIME_ACTIONS.get(runtime, NEUTRAL_ACTIONS):
         return None
-    if verb == "switch_model" and not _MODEL_KEY.match(arg or ""):
+    if verb == "switch_model" and not _MODEL_KEY.fullmatch(arg or ""):
         return None
     if verb == "switch_runtime" and (arg not in RUNTIMES or arg == runtime):
         return None
@@ -155,7 +156,7 @@ def coerce(record: Any) -> Optional[dict]:
         out["actions"] = [a for a in acts if a in ACTIONS][:MAX_ACTIONS]
     models = record.get("switch_models")
     if isinstance(models, list):
-        out["switch_models"] = [m for m in models if isinstance(m, str) and _MODEL_KEY.match(m)][:MAX_SWITCH_MODELS]
+        out["switch_models"] = [m for m in models if isinstance(m, str) and _MODEL_KEY.fullmatch(m)][:MAX_SWITCH_MODELS]
     for key in ("model_labels", "menu"):
         labels = record.get(key)
         if isinstance(labels, list):
@@ -196,7 +197,7 @@ def _family(model: Optional[str]) -> Optional[str]:
 
 def _account(hold: Optional[dict]) -> Optional[str]:
     acct = hold.get("account") if isinstance(hold, dict) else None
-    return f"acct_{acct[:6]}" if isinstance(acct, str) and _HEX.match(acct) else None
+    return f"acct_{acct[:6]}" if isinstance(acct, str) and _HEX.fullmatch(acct) else None
 
 
 def _wedge_names(wedge: Any) -> tuple:
@@ -274,7 +275,7 @@ def derive(supervisor: Optional[dict], hold: Optional[dict], supervisor_status: 
            runtime: Optional[str] = None, model: Optional[str] = None,
            waiting_tasks: Optional[int] = None, restarts_10m: Optional[int] = None,
            runtimes_available: tuple = (), models_offered: Optional[list] = None,
-           model_labels: Optional[list] = None) -> dict:
+           model_labels: Optional[list] = None, crash_since: Optional[float] = None) -> dict:
     """The C1 recovery block for this moment. Pure: every input is passed in.
     `models_offered` is the keys of the runtime's own model list a switch may name
     (runtime_models.offer); without it no model switch is offered.
@@ -294,7 +295,10 @@ def derive(supervisor: Optional[dict], hold: Optional[dict], supervisor_status: 
     limited = state in ("paused_limit", "out_of_credits")
     prev = coerce(prev)
     started = _int(hold.get("started_at")) if hold_active else None
-    if prev and prev["state"] == state and prev.get("since") is not None and prev["since"] <= now:
+    if state == "crash_loop" and _int(crash_since) is not None:
+        # One crash loop is one incident from its first launch in the window, whatever it read between.
+        since = _int(crash_since)
+    elif prev and prev["state"] == state and prev.get("since") is not None and prev["since"] <= now:
         since = prev["since"]
     else:
         since = started if started is not None else int(now)
@@ -333,7 +337,7 @@ def derive(supervisor: Optional[dict], hold: Optional[dict], supervisor_status: 
             actions.remove("switch_runtime")
             del record["switch_runtimes"]
     record["actions"] = actions
-    menu = _menu(supervisor) if state in ("paused_limit", "out_of_credits", "blocked_prompt") else []
+    menu = _menu(supervisor) if state in ("paused_limit", "out_of_credits") else []
     if menu:
         record["menu"] = menu
     return coerce(record)
@@ -411,6 +415,12 @@ def _host_labels() -> frozenset:
 
 def restarts_in_window(workspace: Path, now: float, window_s: float = RESTART_WINDOW_S,
                        hosts: Optional[frozenset] = None) -> Optional[int]:
+    got = launches_in_window(workspace, now, window_s, hosts)
+    return None if got is None else len(got)
+
+
+def launches_in_window(workspace: Path, now: float, window_s: float = RESTART_WINDOW_S,
+                       hosts: Optional[frozenset] = None) -> Optional[list]:
     """Core launches on this host within `window_s`, from state/session-starts.log; None when
     the log cannot be read. A line from another host, or one that does not parse, is skipped."""
     hosts = _host_labels() if hosts is None else hosts
@@ -421,10 +431,10 @@ def restarts_in_window(workspace: Path, now: float, window_s: float = RESTART_WI
             f.seek(max(0, f.tell() - SESSION_STARTS_TAIL_BYTES))
             lines = f.read().decode("utf-8", "replace").splitlines()
     except FileNotFoundError:
-        return 0
+        return []
     except OSError:
         return None
-    count = 0
+    found = []
     for line in lines:
         try:
             entry = json.loads(line)
@@ -432,8 +442,27 @@ def restarts_in_window(workspace: Path, now: float, window_s: float = RESTART_WI
         except (ValueError, TypeError, AttributeError):
             continue
         if entry.get("host") in hosts and 0 <= now - at <= window_s:
-            count += 1
-    return count
+            found.append(at)
+    return sorted(found)
+
+
+#: How far back a crash loop's first launch is looked for.
+CRASH_CHAIN_S = 24 * 3600
+
+
+def crash_loop_start(workspace: Path, now: float, hosts: Optional[frozenset] = None) -> Optional[int]:
+    """The first launch of the run of launches ending at the latest one, each within
+    RESTART_WINDOW_S of the next: one crash loop keeps this start however long it lasts and
+    whatever the core read between crashes, so it stays one incident (one card)."""
+    got = launches_in_window(workspace, now, CRASH_CHAIN_S, hosts)
+    if not got:
+        return None
+    start = got[-1]
+    for at in reversed(got[:-1]):
+        if start - at > RESTART_WINDOW_S:
+            break
+        start = at
+    return _int(start)
 
 
 def codex_tail(pane: str) -> str:
@@ -472,6 +501,7 @@ def gather(workspace: Path, supervisor: Optional[dict], *, now: float, runtime: 
         pane = codex_tail(pane)
     hold = core_limit_hold.read_hold(workspace)
     offered = _offered(workspace, runtime, model, hold)
+    launches = launches_in_window(workspace, now)
     return derive(
         supervisor, hold,
         _read_json(status_read_path("supervisor-status.json", workspace)),
@@ -479,7 +509,8 @@ def gather(workspace: Path, supervisor: Optional[dict], *, now: float, runtime: 
         cli_wedge.frame_abnormal(pane) if pane else None,
         now=now, prev=read(workspace, now), runtime=runtime, model=model,
         waiting_tasks=core_gate_notice.queued_count(workspace),
-        restarts_10m=restarts_in_window(workspace, now), runtimes_available=runtimes_on_host(),
+        restarts_10m=None if launches is None else len(launches), runtimes_available=runtimes_on_host(),
+        crash_since=crash_loop_start(workspace, now) if launches else None,
         models_offered=[e["key"] for e in offered], model_labels=[e["label"] for e in offered])
 
 

@@ -950,14 +950,14 @@ def models_step(manager, workspace, socket, session, runtime, seat, state, kind,
 _BLOCKED_STATES = ("blocked-human", "blocked-known", "logged-out", "hung")
 
 
-def verify_step(manager, workspace, session, blocked):
-    """After a recovery action, the same card says whether the session is working again or still
-    blocked (recovery_actions.verify_step); never a new card. Never fatal."""
+def verify_step(manager, workspace, session, blocked, state=None):
+    """After a recovery action, the same card says whether the session is working again (and the
+    waiting work resumed) or still blocked (recovery_actions.verify_step); never a new card. Never fatal."""
     if manager is None:
         return []
     try:
         import recovery_actions
-        return recovery_actions.verify_step(manager, workspace, session, blocked)
+        return recovery_actions.verify_step(manager, workspace, session, blocked, state=state)
     except Exception as exc:  # noqa: BLE001
         print(f"recovery verify failed: {exc}", file=_sys.stderr)
         return []
@@ -1293,7 +1293,7 @@ def main():
             # emptied pane returns, and it must not resolve a card nobody answered.
             if pane and pane.strip():
                 settle_driven(hitl, a.session, seen_prompt, seen_state)
-                verify_step(hitl, workspace, a.session, seen_state in _BLOCKED_STATES)
+                verify_step(hitl, workspace, a.session, seen_state in _BLOCKED_STATES, seen_state)
             verdict, idle_ticks = card_step(bool(pane and pane.strip()), state, idle_ticks, a.stable, settling)
             if verdict == "escalate":
                 drive_escalations(hitl, a.session, prompt, state,

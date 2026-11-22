@@ -28,7 +28,8 @@ from hitl.schema import ActionReply
 
 FIXTURES = REPO / "contracts" / "core_recovery.v1"
 NOW = 1763730120.0
-OFFERED = ["sonnet-5-1m-context", "fable-5-1", "haiku"]
+# Row tokens of the list core-recovery-actions records (fixed host key and read time).
+OFFERED = ["o4b876be2aaa6", "o5029163bc176", "o4a94f8c4f90b"]
 OFFERED_LABELS = ["Sonnet 5 (1M context)", "Fable 5.1", "Haiku 4.5"]
 HOLD = {"status": "held", "kind": "usage-limit", "model": "opus", "reset_at": 1763737200,
         "until": 1763737260, "started_at": 1763730000, "account": "3f9a2b0c1d2e4f56"}
@@ -195,9 +196,9 @@ class Fields(unittest.TestCase):
         self.assertNotIn("switch_runtime", rec["actions"], "no other runtime on this host, no switch offered")
 
     def test_the_switch_list_is_the_offered_rows_and_only_where_a_switch_applies(self):
-        self.assertEqual(derive({"state": "crashed"}, HOLD, runtime="claude", models_offered=["haiku"],
+        self.assertEqual(derive({"state": "crashed"}, HOLD, runtime="claude", models_offered=["o4a94f8c4f90b"],
                                 model_labels=["Haiku 4.5"])["model_labels"], ["Haiku 4.5"])
-        self.assertNotIn("switch_models", derive({"state": "logged-out"}, runtime="claude", models_offered=["haiku"]))
+        self.assertNotIn("switch_models", derive({"state": "logged-out"}, runtime="claude", models_offered=["o4a94f8c4f90b"]))
 
     def test_the_record_carries_the_menu_the_pane_shows_minus_purchases(self):
         menu = (REPO / "tests" / "fixtures" / "core_recovery" / "seat-rate-limit-options.txt").read_text()
@@ -205,6 +206,34 @@ class Fields(unittest.TestCase):
         self.assertEqual(rec["menu"], ["Stop and wait for limit to reset",
                                        "Wait here, then continue automatically at Nov 15 at 6am"])
         self.assertNotIn("menu", derive({"state": "running", "prompt": menu}, runtime="claude"))
+
+    def test_a_permission_prompt_puts_no_menu_text_in_the_record(self):
+        prompt = ("  Do you want to proceed?\n  ❯ 1. Yes\n    2. Yes, and don't ask again for cat commands in "
+                  "/Users/someone/private-project\n    3. No, and tell Claude what to do differently\n"
+                  "  Esc to cancel")
+        rec = derive({"state": "blocked-human", "kind": "selection", "prompt": prompt}, runtime="claude")
+        self.assertEqual(rec["state"], "blocked_prompt")
+        self.assertNotIn("menu", rec)
+        self.assertNotIn("/Users/someone", json.dumps(rec))
+
+    def test_a_crash_loop_that_flaps_through_running_or_idle_stays_one_incident(self):
+        prev, seen = None, []
+        for i, (sup, count) in enumerate((("crashed", 4), ("running", 4), ("crashed", 5), ("idle", 5),
+                                          ("crashed", 6))):
+            rec = derive({"state": sup}, now=NOW + 60 * i, prev=prev, restarts_10m=count, crash_since=NOW - 300)
+            prev = rec
+            if rec["state"] == "crash_loop":
+                seen.append(rec["incident"])
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(len(set(seen)), 1, "a flap between crashes is not a new incident (a new card)")
+
+    def test_a_crash_loops_start_is_the_first_launch_of_its_unbroken_run(self):
+        log = Path(tempfile.mkdtemp()) / "state" / "session-starts.log"
+        log.parent.mkdir(parents=True)
+        starts = [NOW - 5000, NOW - 1500, NOW - 1000, NOW - 500, NOW - 30]  # 5000->1500 is a gap
+        log.write_text("".join(json.dumps({"host": "me", "session_started_at": t}) + "\n" for t in starts))
+        self.assertEqual(crs.crash_loop_start(log.parent.parent, NOW, hosts=frozenset({"me"})), int(NOW - 1500))
+        self.assertIsNone(crs.crash_loop_start(log.parent.parent / "nowhere", NOW, hosts=frozenset({"me"})))
 
     def test_since_and_incident_stand_while_the_state_does(self):
         first = derive({"state": "blocked-human", "kind": "selection"}, now=NOW)
@@ -232,7 +261,7 @@ class Fields(unittest.TestCase):
         rec = crs.coerce({"v": 1, "state": "paused_limit", "incident": "i" * 500, "since": -5,
                           "reset_at": True, "model": "x" * 99, "waiting_tasks": 3.0,
                           "actions": ["retry_now", "rm -rf /", "restart_core"] + ["retry_now"] * 20,
-                          "switch_models": ["sonnet-5", "Sonnet; rm", "haiku"], "prompt": "pane text",
+                          "switch_models": ["o4b876be2aaa6", "Sonnet; rm", "haiku", "o4a94f8c4f90b"], "prompt": "pane text",
                           "menu": ["Wait", "Add funds to continue", "x" * 200, "bad\x07"]})
         self.assertNotIn("incident", rec, "an incident of any other shape is dropped, not cut")
         self.assertNotIn("model", rec)
@@ -242,7 +271,7 @@ class Fields(unittest.TestCase):
         self.assertEqual(rec["waiting_tasks"], 3)
         self.assertEqual(rec["actions"][:2], ["retry_now", "restart_core"])
         self.assertEqual(len(rec["actions"]), crs.MAX_ACTIONS)
-        self.assertEqual(rec["switch_models"], ["sonnet-5", "haiku"])
+        self.assertEqual(rec["switch_models"], ["o4b876be2aaa6", "o4a94f8c4f90b"])
         self.assertEqual(rec["menu"], ["Wait", "x" * 80], "no purchase, bounded, printable")
         for bad in (None, [], {"v": 2, "state": "running"}, {"v": 1, "state": "offline"}):
             self.assertIsNone(crs.coerce(bad), bad)
@@ -300,7 +329,7 @@ class Fields(unittest.TestCase):
 class Edges(unittest.TestCase):
     def test_a_model_key_of_another_shape_is_refused(self):
         self.assertIsNone(crs.parse_action_id("switch_model:Opus", "claude"))
-        self.assertIsNone(crs.parse_action_id("switch_model:haiku", "codex"))
+        self.assertIsNone(crs.parse_action_id("switch_model:o4a94f8c4f90b", "codex"))
 
     def test_a_non_string_label_is_dropped(self):
         self.assertEqual(crs.coerce({"v": 1, "state": "running", "menu": [3, None, "Wait"]})["menu"], ["Wait"])
@@ -498,11 +527,12 @@ class Contract(unittest.TestCase):
     def test_the_action_fixture_is_a_click_the_hitl_wire_parses_and_the_allowlist_admits(self):
         body = fixture("action.json")
         reply = ActionReply.from_wire(body[REPLY_FIELD])
-        self.assertEqual(crs.parse_action_id(reply.action_id), ("switch_model", "sonnet-5-1m-context"))
-        for ok in ("retry_now", "restart_core", "escape_prompt", "refresh_options", "switch_model:haiku",
+        self.assertEqual(crs.parse_action_id(reply.action_id), ("switch_model", "o4b876be2aaa6"))
+        for ok in ("retry_now", "restart_core", "escape_prompt", "refresh_options", "switch_model:o4a94f8c4f90b",
                    "switch_runtime:codex"):
             self.assertIsNotNone(crs.parse_action_id(ok), ok)
-        for bad in ("switch_model:", "switch_model:sonnet; rm", "switch_model:Opus", "switch_runtime:agy",
+        for bad in ("switch_model:", "switch_model:sonnet; rm", "switch_model:Opus", "switch_model:haiku", "switch_model:sonnet-5-1m-context",
+                    "switch_model:o4a94f8c4f90b\n", "switch_runtime:agy",
                     "restart", "", None, 3):
             self.assertIsNone(crs.parse_action_id(bad), bad)
 

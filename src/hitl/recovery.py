@@ -11,6 +11,7 @@ show a purchase (iOS) can drop exactly it; no other action or card text names a 
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import tempfile
@@ -31,7 +32,8 @@ ESCAPE_PROMPT = "escape_prompt"
 REFRESH_OPTIONS = "refresh_options"
 # A model is named by the key of the runtime's own list (runtime_models); which keys exist is that
 # list's, checked before anything runs.
-_MODEL_KEY = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
+# A model switch names an opaque row token (runtime_models.record), never a model or a label.
+_MODEL_KEY = re.compile(r"o[0-9a-f]{12}")
 # A runtime is named by a slug here; which runtimes exist is the engine's list
 # (core_recovery_state.RUNTIMES), checked before anything runs.
 _RUNTIME_ID = re.compile(r"^[a-z][a-z0-9-]{0,15}$")
@@ -57,11 +59,11 @@ def parse(action_id: Any) -> Optional[Tuple[str, Optional[str]]]:
     if action_id in _BARE:
         return action_id, None
     verb, sep, arg = action_id.partition(":")
-    if verb == SWITCH_MODEL and sep and _MODEL_KEY.match(arg):
+    if verb == SWITCH_MODEL and sep and _MODEL_KEY.fullmatch(arg):
         return verb, arg
-    if verb == SWITCH_RUNTIME and sep and _RUNTIME_ID.match(arg):
+    if verb == SWITCH_RUNTIME and sep and _RUNTIME_ID.fullmatch(arg):
         return verb, arg
-    if verb == SWITCH_ACCOUNT and sep and _ACCOUNT_ID.match(arg):
+    if verb == SWITCH_ACCOUNT and sep and _ACCOUNT_ID.fullmatch(arg):
         return verb, arg
     return None
 
@@ -89,7 +91,8 @@ def label(aid: str, runtime_names: Optional[dict] = None, model_names: Optional[
         raise ValueError(f"not a recovery action: {aid!r}")
     verb, arg = parsed
     if verb == SWITCH_MODEL:
-        return f"Switch to {(model_names or {}).get(arg) or arg}"
+        name = (model_names or {}).get(arg)  # the token itself is never shown
+        return f"Switch to {name}" if name else "Switch model"
     if verb == SWITCH_RUNTIME:
         return f"Switch to {(runtime_names or {}).get(arg, arg)}"
     if verb == SWITCH_ACCOUNT:
@@ -126,15 +129,26 @@ def _put(path: Path, body: Dict[str, Any]) -> Path:
 
 
 def write_action(workspace: Path, reply: Any, sender: str, room: str,
-                 now: Optional[float] = None) -> Path:
-    """Atomically hand an accepted click (an ActionReply) to the host executor."""
+                 now: Optional[float] = None, tapped_at: Optional[float] = None) -> Path:
+    """Atomically hand an accepted click (an ActionReply) to the host executor. `tapped_at` is the
+    event's own time, when it carries one; the executor's freshness counts from the earlier stamp."""
     if not is_recovery(reply.action_id):
         raise ValueError(f"not a recovery action: {reply.action_id!r}")
     body = {"v": RECEIPT_VERSION, "hitl_id": reply.hitl_id,
             "expected_revision": reply.expected_revision, "action_id": reply.action_id,
             "guard": reply.guard, "sender": sender, "room": room,
             "at": int(time.time() if now is None else now)}
+    if tapped_at is not None:
+        body["tapped_at"] = int(tapped_at)
     return _put(actions_dir(workspace) / f"{_safe(reply.hitl_id)}.json", body)
+
+
+def event_time(event: Dict[str, Any]) -> Optional[float]:
+    """The event's own send time (Matrix `origin_server_ts`, in ms), else None."""
+    ts = event.get("origin_server_ts") if isinstance(event, dict) else None
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not math.isfinite(ts) or ts <= 0:
+        return None
+    return ts / 1000.0
 
 
 def receipt(hitl_id: str, incident: str, aid: str, outcome: str, reason: Optional[str],
@@ -162,7 +176,7 @@ def read_receipt(workspace: Path, hitl_id: str) -> Optional[Dict[str, Any]]:
 
 def _safe(hitl_id: str) -> str:
     """A file stem from an id: one path component, never a traversal."""
-    stem = "".join(c for c in str(hitl_id) if c.isalnum() or c in "_-")
-    if not stem:
+    stem = str(hitl_id)
+    if not stem or not all(c.isascii() and (c.isalnum() or c in "_-") for c in stem):
         raise ValueError(f"unusable hitl id: {hitl_id!r}")
     return stem

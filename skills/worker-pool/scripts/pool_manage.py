@@ -387,11 +387,19 @@ def retry(workspace, repo, target, *, runner=subprocess.run, spawn=None) -> dict
     """Restart `target`'s seat at once, owed work kept: the owner's "retry now" to its limit pause.
     A stopped or retired worker is left alone; a seat that is already gone is just started.
     Run in place (the detached child of `dispatch_retry`): whatever happens, the pause this sets
-    for the take-down is lifted again, and a restart that did not happen is told to the owner."""
+    for the take-down is lifted again, and every ending (restarted, failed, or an error raised on
+    the way) has one terminal result: for a card's tap, reported under its detached key (the card
+    says it); for a bare reply, one DM line."""
     wid, row = _worker(workspace, target)
     base = {"worker_id": wid, "action": "retry"}
+    key = os.environ.get(_DETACHED_KEY_ENV) or None
+    if key and not _still_current(workspace, key):
+        # The tap this child was started for already ended (reported or past its deadline).
+        return {**base, "result": "failed", "why": "the retry it was started for already ended"}
     if row.get("state") == "retired" or sup.is_paused(workspace, wid):
-        return {**base, "result": "failed", "why": "the worker is stopped or retired; enable it first"}
+        out = {**base, "result": "failed", "why": "the worker is stopped or retired; enable it first"}
+        _retry_ended(workspace, row.get("name") or wid, out, key, tell=False)  # nothing was attempted
+        return out
     out = None
     try:
         socket = sup.run_socket(workspace, wid)
@@ -409,11 +417,40 @@ def retry(workspace, repo, target, *, runner=subprocess.run, spawn=None) -> dict
                    "start": {"result": restarted["result"], "detail": restarted["detail"]}}
             if not ok:
                 out["why"] = "the seat did not start again"
+    except rem.PoolBusy:
+        out = {**base, "result": "failed", "why": "the pool was busy with another change"}
+    except OSError:
+        out = {**base, "result": "failed", "why": "the seat could not be taken down or started"}
     finally:
         sup.set_paused(workspace, wid, False)  # never left stopped: the pool supervises it again
-    if out["result"] == "failed":
-        _tell_owner_retry_failed(workspace, row.get("name") or wid, out.get("why") or "")
+        if out is None:  # an unexpected error is on its way out: it still ends with one result
+            _retry_ended(workspace, row.get("name") or wid,
+                         {**base, "result": "failed", "why": "something went wrong while restarting it"}, key)
+    _retry_ended(workspace, row.get("name") or wid, out, key)
     return out
+
+
+#: The key a recovery card's tap hands its retry (detached_action.KEY_ENV in src).
+_DETACHED_KEY_ENV = "SUTANDO_DETACHED_KEY"
+
+
+def _still_current(workspace, key: str) -> bool:
+    import detached_action
+    return detached_action.status(Path(workspace), key).state == detached_action.RUNNING
+
+
+def _retry_ended(workspace, name: str, out: dict, key, tell: bool = True) -> None:
+    """The retry's one terminal result. A card's tap reads it from its detached key, so the card
+    is the one surface; a bare reply's owner gets one DM line when a restart it started failed."""
+    failed = out.get("result") == "failed"
+    line = (f"I could not restart {name}{': ' + out['why'] if out.get('why') else ''}. It is not left "
+            "stopped: the pool keeps supervising it and starts it again by itself.") if failed else None
+    if key:
+        import detached_action
+        detached_action.report(Path(workspace), key, detached_action.FAILED if failed else detached_action.DONE,
+                               reason=line)
+    elif failed and tell:
+        _tell_owner_retry_failed(workspace, line)
 
 
 def dispatch_retry(workspace, repo, target, *, popen=subprocess.Popen) -> dict:
@@ -432,15 +469,14 @@ def dispatch_retry(workspace, repo, target, *, popen=subprocess.Popen) -> dict:
     return {**base, "result": "dispatched", "log": str(log)}
 
 
-def _tell_owner_retry_failed(workspace, name: str, why: str) -> None:
+def _tell_owner_retry_failed(workspace, line: str) -> None:
     """One DM line: the retry did not restart the worker; the pool keeps supervising it."""
     from local_record import write_text_whole
     from proactive_routing import proactive_filename
     import time as _time
     try:
         write_text_whole(Path(workspace) / "results" / proactive_filename(f"pool-retry-{int(_time.time() * 1000)}"),
-                         f"[dm-only]\nI could not restart {name}{': ' + why if why else ''}. It is not left stopped: "
-                         "the pool keeps supervising it and starts it again by itself.\n")
+                         f"[dm-only]\n{line}\n")
     except OSError:
         pass
 

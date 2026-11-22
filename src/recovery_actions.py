@@ -5,22 +5,27 @@ The owner taps a recovery button on the card of a blocked core or worker seat; t
 reply handler checks the owner, the room and the card's revision and guard, then drops the click
 in `state/recovery/actions/<hitl_id>.json` (hitl.recovery). The monitor watching that card's
 session (core-input-watch.py, a process outside the session it watches) calls `run_pending`
-each tick. It runs each click at most once, within ACTION_TTL_S, from a fixed allowlist; argv
-is fixed here and the only argument a click supplies is an id the card itself offered:
+each tick. It runs each click at most once, within ACTION_TTL_S of the tap (recovery_gate, the
+check every entry path shares), from a fixed allowlist; argv is fixed here and the only argument
+a click supplies is an id the card itself offered:
 
     retry_now           what the owner's bare "retry now" does (core_limit_hold): lift the hold, and
                         restart a live core (or a seat, by its pool's --retry-cmd) held at its
                         limit screen; else a refused turn gets `continue` once idle
     switch_model:<m>    scripts/switch-model.sh <m> --confirm on that session (alias from the list)
-    switch_runtime:<r>  core only: src/agent/start-cli.sh --runtime <r> --restart
-    restart_core        core only: src/agent/start-cli.sh --restart, from outside the session
+    switch_runtime:<r>  core only: src/agent/start-cli.sh --runtime <r> --restart, detached
+    restart_core        core only: src/agent/start-cli.sh --restart, detached (detached_action): it
+                        closes the tmux session this monitor runs in, so it never runs as its child
     escape_prompt       one Escape key into the pane
     buy_credits, add_account, switch_account:<id>
                         never run here: each needs a confirmed, re-authenticated step (P1)
 
 then writes a C3 receipt to `state/recovery/receipts/<hitl_id>.json`, appends an audit line to
 `state/recovery/audit.jsonl`, and edits the same card with the outcome (the projector sends the
-edit to the owner's DM). A click is claimed by renaming its file before it runs, so a crash
+edit to the owner's DM). A card takes one tap: an action that did not take, or a block that
+held, closes it so the next tick posts a fresh card with live controls. A stale tap is answered on
+its card too (receipt `stale`). The card's last word says whether the work that was waiting
+resumed (verify_step). A click is claimed by renaming its file before it runs, so a crash
 mid-run is reported as interrupted, never re-run. Nothing a subprocess prints is copied out.
 
 It also raises the paused card: while `core_limit_hold` holds the core down for a provider
@@ -41,7 +46,10 @@ from typing import Callable, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hitl import recovery  # noqa: E402
+from hitl.schema import STATUS_IN_PROGRESS, STATUS_PENDING  # noqa: E402
 from workspace_default import status_read_path
+import detached_action
+import recovery_gate
 import runtime_models
 
 REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
@@ -106,7 +114,6 @@ def refresh_limit_card(manager, workspace: Path, session: str, runtime: Optional
     """Once the runtime's model list is read, a still-untapped limit card of the core gains its
     model buttons and the line naming them; the same card, never a new one."""
     from hitl import tui_gate
-    from hitl.schema import STATUS_PENDING
     keys = switch_offer(workspace, runtime)
     if not keys:
         return []
@@ -166,7 +173,15 @@ def card_controls(workspace: Path, runtime: Optional[str], *, seat: bool, kind: 
     ids.append(recovery.REFRESH_OPTIONS)
     if not seat:
         ids.append(recovery.RESTART_CORE)
-    return ids
+    return runtime_carries(ids, runtime)
+
+
+def runtime_carries(ids: List[str], runtime: Optional[str]) -> List[str]:
+    """The ids `runtime`'s host side carries out (core_recovery_state.RUNTIME_ACTIONS), so a card
+    never offers a button its executor refuses; a step-up id stays, since its refusal is the answer."""
+    import core_recovery_state
+    return [i for i in ids if recovery.parse(i) and (recovery.parse(i)[0] in STEP_UP
+            or core_recovery_state.parse_action_id(i, runtime or "claude") is not None)]
 
 
 def incident_for(req) -> str:
@@ -178,7 +193,6 @@ def incident_for(req) -> str:
 
 def _awaiting(workspace: Path, req) -> bool:
     """A recovery click accepted on `req` that has no receipt yet: only the executor closes it."""
-    from hitl.schema import STATUS_IN_PROGRESS
     keyed = (req.subject or {}).get("option_for_action") or {}
     return (req.status == STATUS_IN_PROGRESS and recovery.is_recovery(req.chosen_action)
             and req.chosen_action not in keyed and recovery.read_receipt(workspace, req.id) is None)
@@ -186,7 +200,7 @@ def _awaiting(workspace: Path, req) -> bool:
 
 def awaiting_executor(workspace: Path, req) -> bool:
     try:
-        return _awaiting(workspace, req)
+        return _awaiting(workspace, req) or verify_pending(req, time.time())
     except Exception:  # noqa: BLE001 — unreadable means unknown: keep the card open
         return True
 
@@ -222,8 +236,9 @@ RETRY_BY = "recovery-card"
 
 
 def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner, now: float,
-             follow_ups: List[tuple]):
-    """(outcome, reason for the receipt, line for the card, recovery fields)."""
+             follow_ups: List[tuple], gate: Optional[str] = None):
+    """(outcome, reason for the receipt, line for the card, recovery fields). `gate` is the tap's
+    recovery-gate key: a detached restart acts only once that claim is finished."""
     import core_limit_hold
     ws = target.workspace
     refused_turn = ((req.subject or {}).get("gate") == "turn-rejected") if req is not None else False
@@ -241,22 +256,27 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
                 why = "This worker's restart is not available here; it continues when the limit resets."
                 return "refused", why, why, {}
             core_limit_hold.clear(ws, now, by=RETRY_BY, mirror=False, seat=target.hold_key())
-            if _rc(runner, target.retry_cmd, env, RESTART_TIMEOUT_S) != 0:
+            # The pool's command hands the restart to its own detached child, which reports by key.
+            key = _detached_key(req)
+            detached_action.begin(ws, key, now)
+            if _rc(runner, target.retry_cmd, dict(env, **{detached_action.KEY_ENV: key}), RESTART_TIMEOUT_S) != 0:
+                detached_action.report(ws, key, detached_action.FAILED, now=now)
                 core_limit_hold.reinstate(ws, now, by=RETRY_BY, mirror=False, seat=target.hold_key())
-                why = 'The worker did not restart, so it is still paused; reply "retry now" here to try again.'
+                why = "The worker did not restart, so it is still paused. " + NEW_CARD
                 return "failed", why, why, {"state": "paused_limit"}
-            return ("done", None, f"Restarting {target.seat}; checking that it is working again.",
-                    {"state": "starting"})
+            return ("done", None, "Restarting this worker; checking that it is working again.",
+                    {"state": "starting", VERIFY_FIELD: {"detached": key, "reinstate": target.hold_key()}})
         if hold is not None:
             live = hold.get("source") == core_limit_hold.PANE_SOURCE
             core_limit_hold.clear(ws, now, by=RETRY_BY, mirror=not live)
             if live:
                 # A live core at its limit screen retries by a restart; the hold returns if it fails.
-                outcome = _execute(recovery.RESTART_CORE, None, req, target, runner, now, follow_ups)
+                outcome = _execute(recovery.RESTART_CORE, None, req, target, runner, now, follow_ups, gate)
                 if outcome[0] != "done":
                     core_limit_hold.reinstate(ws, now, by=RETRY_BY, mirror=False)
-                    why = 'The core did not restart, so it is still paused; reply "retry now" here to try again.'
+                    why = "The core did not restart, so it is still paused. " + NEW_CARD
                     return outcome[0], why, why, {"state": "paused_limit"}
+                outcome[3][VERIFY_FIELD]["reinstate"] = ""  # the core's own hold returns if it fails
                 return outcome
             else:
                 return ("done", None, "Retrying now: the core is starting. If the limit is still in force it "
@@ -300,23 +320,19 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
         argv = ["bash", str(REPO / "src" / "agent" / "start-cli.sh"), "--restart"]
         if verb == recovery.SWITCH_RUNTIME:
             argv[2:2] = ["--runtime", arg]
-        try:
-            run = runner(argv, capture_output=True, text=True, timeout=RESTART_TIMEOUT_S, env=env,
-                         stdin=subprocess.DEVNULL)
-        except (OSError, subprocess.SubprocessError):
-            why = "The restart did not finish in time; the core may still be coming up."
+        # The launcher's --restart closes the tmux session this monitor runs in: it runs detached,
+        # and the monitor that comes back with the core reads its outcome (verify_step).
+        key = _detached_key(req)
+        if not detached_action.spawn(ws, key, argv, env=env, now=now, popen=spawn_detached, after_gate=gate,
+                                     log=ws / "logs" / "core-recovery-restart.log"):
+            why = "The restart could not be started; nothing was changed. " + NEW_CARD
             return "failed", why, why, {}
-        if run.returncode == core_limit_hold.HOLD_EXIT:
-            why = "The core is paused for a provider limit, so it was not restarted; switch its model instead."
-            return "refused", why, why, {"state": "paused_limit"}
-        if run.returncode != 0:
-            why = (f"The core did not start under {arg}; it stays as it was (exit {run.returncode})."
-                   if verb == recovery.SWITCH_RUNTIME else
-                   f"The restart did not complete (exit {run.returncode}).")
-            return "failed", why, why, {}
+        check = {"detached": key, "what": f"the core under {arg}" if arg else "the core"}
         if verb == recovery.SWITCH_RUNTIME:
-            return "done", None, f"Switched the core to {arg}; it is starting.", {"state": "starting", "runtime": arg}
-        return "done", None, "Restarted the core; it is starting.", {"state": "starting"}
+            return ("done", None, f"Switching the core to {arg}; checking that it is working again.",
+                    {"state": "starting", "runtime": arg, VERIFY_FIELD: check})
+        return ("done", None, "Restarting the core; checking that it is working again.",
+                {"state": "starting", VERIFY_FIELD: check})
     if verb == recovery.REFRESH_OPTIONS:
         # The owner asked: the pane's own menu is read again, and a core idle at its limit has its
         # model picker opened, read and closed once; the card is replaced with what the screen shows.
@@ -333,6 +349,17 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
     return "refused", why, why, {}
 
 
+#: What a card's done action hands to verify_step (not part of the receipt).
+VERIFY_FIELD = "_verify"
+NEW_CARD = "If it is still blocked, a new card follows with what you can do now."
+#: How the detached restarts are started: replaced in tests, never run for real there.
+spawn_detached = subprocess.Popen
+
+
+def _detached_key(req) -> str:
+    return f"restart:{req.id if req is not None else '-'}:{req.revision if req is not None else 0}"
+
+
 def _rc(runner: Runner, argv: List[str], env: Dict, timeout: float) -> Optional[int]:
     try:
         return runner(argv, capture_output=True, text=True, timeout=timeout, env=env,
@@ -343,7 +370,6 @@ def _rc(runner: Runner, argv: List[str], env: Dict, timeout: float) -> Optional[
 
 def _check(manager, data: Dict, target: Target, now: float):
     """(requirement, None) when the click may run, else (requirement or None, (outcome, why))."""
-    from hitl.schema import STATUS_IN_PROGRESS
     aid = data.get("action_id")
     if not recovery.is_recovery(aid):
         return None, ("refused", "That button is not one this Mac runs.")
@@ -363,13 +389,10 @@ def _check(manager, data: Dict, target: Target, now: float):
     if (req.status != STATUS_IN_PROGRESS or req.chosen_action != aid
             or str(data.get("guard") or "") != req.guard):
         return req, ("stale", "This card changed before the tap reached the Mac; nothing was done.")
-    at = data.get("at")
-    if not isinstance(at, (int, float)) or now - at > ACTION_TTL_S:
-        return req, ("stale", "The tap reached the Mac too late to act on; nothing was done.")
     return req, None
 
 
-def _answer_card(manager, req, line: str, outcome: str, now: float) -> None:
+def _answer_card(manager, req, line: str, outcome: str, now: float, check: Optional[Dict] = None) -> None:
     """Show the outcome on the same card: its message gains the line. The card stays this
     incident's one card: it closes only once the session is seen unblocked (resolve_escalations),
     so a later tick that still sees the block finds it and posts no second card."""
@@ -378,26 +401,101 @@ def _answer_card(manager, req, line: str, outcome: str, now: float) -> None:
         if cur is None or cur.terminal:
             return
         cur.message = f"{cur.message}\n\n{line}"
-        cur.subject = {**(cur.subject or {}), "receipt": {"outcome": outcome, "at": int(now)},
-                       "verify": {"at": now, "outcome": outcome}}
+        subject = {k: v for k, v in (cur.subject or {}).items() if k != "receipt"}
+        subject["verify"] = {"at": now, "outcome": outcome, **(check or {})}
+        if not (outcome == "done" and (check or {}).get("detached")):
+            # A detached restart's card carries no receipt until its outcome is known (verify_step):
+            # a client reading the card never sees "done" for a restart that then failed.
+            subject["receipt"] = {"outcome": outcome, "at": int(now)}
+        cur.subject = subject
         cur.revision += 1
         cur.updated_at = time.time()
         manager.store.save(cur)
 
 
+def _final_receipt(workspace: Path, req_id: str, check: Dict, outcome: str, reason: Optional[str],
+                   now: float) -> Dict:
+    """A detached restart's observed outcome: the receipt on disk is corrected when it failed, and
+    the card's receipt (returned, for the caller's edit) is the observed one."""
+    if check.get("detached") and outcome != "done":
+        prior = recovery.read_receipt(workspace, req_id)
+        if prior is not None and prior.get("outcome") == "done":
+            recovery.write_receipt(workspace, recovery.receipt(
+                str(prior.get("hitl_id") or req_id), str(prior.get("incident") or ""),
+                str(prior.get("action_id") or ""), outcome, reason, now,
+                {k: v for k, v in (prior.get("recovery") or {}).items() if k != "state"}))
+    return {"outcome": outcome, "at": int(now)}
+
+
 #: How long a session may stay blocked after a done action before its card says so.
 VERIFY_S = 60.0
-STILL_BLOCKED = ('It is still blocked. You can wait for the limit to reset, or reply "retry now" here '
-                 "to try again.")
+STILL_BLOCKED = "It is still blocked. A new card follows with what you can do now."
 WORKING_AGAIN = "It is working again."
+#: The core is up again and has taken up the work that was waiting when the owner tapped.
+RESUMED = "It is working again and has picked up the work that was waiting."
+#: Up again, but none of that work was seen starting within RESUME_S: said plainly, not as success.
+NOT_RESUMED = ("It is up again, but I have not seen the waiting work start yet. If it does not, "
+               "send the message again.")
+#: How long after a done action an unblocked core may take to start the waiting work.
+RESUME_S = 120.0
 #: Unblocked after an action that did not report done: true, and it claims nothing for that action.
 CLEARED = "The block has cleared."
+#: Longest a card waits on its verification before resolve_escalations may close it anyway.
+VERIFY_DEADLINE_S = detached_action.DEADLINE_S + RESUME_S + VERIFY_S
+#: Waiting task ids kept on a card's check; the first that leaves the queue is the evidence.
+WAITING_MAX = 20
 
 
-def verify_step(manager, workspace: Path, session: str, blocked: bool, now: Optional[float] = None) -> List[str]:
+def _resume_check(workspace: Path, req) -> Dict:
+    """What a done core action must later see to say the pending work resumed: the tasks waiting
+    in the queue now, and, on a refused turn, that turn running again."""
+    import task_queue
+    try:
+        waiting = sorted(p.stem for p in task_queue.pending_files(Path(workspace)))[:WAITING_MAX]
+    except OSError:
+        waiting = []
+    out: Dict = {"waiting": waiting}
+    if (req.subject or {}).get("gate") == "turn-rejected":
+        out["turn"] = True
+    return out
+
+
+def _resumed(workspace: Path, check: Dict, state: Optional[str]) -> Optional[bool]:
+    """None when nothing was waiting; True once the core is seen running or one of the tasks that
+    waited has left the queue; False otherwise (so far)."""
+    waiting = [w for w in check.get("waiting") or [] if isinstance(w, str)]
+    if not waiting and not check.get("turn"):
+        return None
+    if state == "running":
+        return True
+    if not waiting:
+        return False
+    import task_queue
+    try:
+        still = {p.stem for p in task_queue.pending_files(Path(workspace))}
+    except OSError:
+        return False
+    return any(w not in still for w in waiting)
+
+
+def verify_pending(req, now: float) -> bool:
+    """A done action's card still verifying (a detached restart unanswered, or the waiting work not
+    yet seen starting), within its deadline: resolve_escalations leaves it open until it says how."""
+    check = (req.subject or {}).get("verify")
+    if not isinstance(check, dict) or check.get("seen") or check.get("outcome") != "done":
+        return False
+    try:
+        return now - float(check.get("at") or 0) < VERIFY_DEADLINE_S
+    except (TypeError, ValueError):
+        return False
+
+
+def verify_step(manager, workspace: Path, session: str, blocked: bool, now: Optional[float] = None,
+                state: Optional[str] = None) -> List[str]:
     """For each of this session's cards an action answered: once the session is seen unblocked,
-    the card says so (and resolve_escalations closes it); still blocked VERIFY_S after a done
-    action, the same card says that, once. Never a new card. Returns the edited card ids."""
+    the card says so, and for the core whether the work that was waiting resumed (then
+    resolve_escalations closes it); still blocked VERIFY_S after a done action, the same card says
+    that, once, and is closed for a fresh one. Never a new card. Returns the edited card ids."""
     at = time.time() if now is None else now
     edited = []
     for r in manager.active():
@@ -406,20 +504,82 @@ def verify_step(manager, workspace: Path, session: str, blocked: bool, now: Opti
         if subject.get("session") != session or not subject.get("recovery") or not isinstance(check, dict) \
                 or check.get("seen"):
             continue
+        if check.get("detached"):
+            done = detached_action.status(workspace, check["detached"], at)
+            if done.state == detached_action.RUNNING:
+                continue  # the card says "checking" until the restart answers or its deadline passes
+            if done.state != detached_action.DONE:
+                _restart_failed(manager, workspace, r.id, check, done, at)
+                edited.append(r.id)
+                continue
+            if "receipt" not in subject:
+                # The restart answered done: the card's receipt says so now, whatever is seen next.
+                with manager.store.locked():
+                    cur = manager.get(r.id)
+                    if cur is not None and not cur.terminal:
+                        cur.subject = {**(cur.subject or {}), "receipt": {"outcome": "done", "at": int(at)}}
+                        cur.revision += 1
+                        cur.updated_at = time.time()
+                        manager.store.save(cur)
         if blocked and not (check.get("outcome") == "done" and at - float(check.get("at") or at) >= VERIFY_S):
             continue
-        line = STILL_BLOCKED if blocked else WORKING_AGAIN if check.get("outcome") == "done" else CLEARED
+        seen = "blocked" if blocked else "working"
+        if blocked:
+            line = STILL_BLOCKED
+        elif check.get("outcome") != "done":
+            line = CLEARED
+        else:
+            resumed = _resumed(workspace, check, state)
+            if resumed is None:
+                line = WORKING_AGAIN
+            elif resumed:
+                line = RESUMED
+            elif at - float(check.get("at") or at) < RESUME_S:
+                continue  # up, and the card says "checking" until the waiting work starts or RESUME_S
+            else:
+                line, seen = NOT_RESUMED, "up"
         with manager.store.locked():
             cur = manager.get(r.id)
             if cur is None or cur.terminal:
                 continue
             cur.message = f"{cur.message}\n\n{line}"
-            cur.subject = {**(cur.subject or {}), "verify": {**check, "seen": "working" if not blocked else "blocked"}}
+            cur.subject = {**(cur.subject or {}), "verify": {**check, "seen": seen}}
             cur.revision += 1
             cur.updated_at = time.time()
             manager.store.save(cur)
+        if blocked:
+            _supersede(manager, r.id)
         edited.append(r.id)
     return edited
+
+
+def _restart_failed(manager, workspace: Path, req_id: str, check: Dict, done, now: float) -> None:
+    """A detached restart that failed or never answered by its deadline: the hold it lifted
+    returns, and the card ends on why, so it never stays on "checking"."""
+    import core_limit_hold
+    if check.get("reinstate") is not None:
+        core_limit_hold.reinstate(workspace, now, by=RETRY_BY, mirror=False, seat=check["reinstate"] or None)
+    what = check.get("what") or "it"
+    if done.state == detached_action.EXPIRED:
+        line = f"I couldn't confirm {what} came back within {int(detached_action.DEADLINE_S // 60)} minutes. " + NEW_CARD
+    elif done.reason and done.reason not in ("exit", "could not start"):
+        line = done.reason  # the action's own sentence (the pool's, for a worker)
+    elif done.rc == core_limit_hold.HOLD_EXIT:
+        line = "The core is paused for a provider limit, so it was not restarted. " + NEW_CARD
+    else:
+        line = (f"The restart did not complete (exit {done.rc}). " if done.rc is not None
+                else "The restart did not complete. ") + NEW_CARD
+    with manager.store.locked():
+        cur = manager.get(req_id)
+        if cur is None or cur.terminal:
+            return
+        cur.message = f"{cur.message}\n\n{line}"
+        cur.subject = {**(cur.subject or {}), "verify": {**check, "seen": "failed"},
+                       "receipt": _final_receipt(workspace, req_id, check, "failed", line, now)}
+        cur.revision += 1
+        cur.updated_at = time.time()
+        manager.store.save(cur)
+    _supersede(manager, req_id)
 
 
 def audit(workspace: Path, entry: Dict) -> None:
@@ -439,19 +599,49 @@ def audit(workspace: Path, entry: Dict) -> None:
 
 
 def _settle(manager, target: Target, data: Dict, req, outcome: str, reason, line: str,
-            fields: Dict, now: float) -> Dict:
+            fields: Dict, now: float, close: bool = False, card: bool = True) -> Dict:
     hitl_id, aid = str(data.get("hitl_id") or ""), str(data.get("action_id") or "")
     incident = incident_for(req) if req is not None else ""
+    fields = dict(fields)
+    check = fields.pop(VERIFY_FIELD, None)
     body = recovery.receipt(hitl_id, incident, aid, outcome, reason, now, fields)
     recovery.write_receipt(target.workspace, body)
     audit(target.workspace, {"at": int(now), "hitl_id": hitl_id, "action_id": aid, "outcome": outcome,
                              "sender": str(data.get("sender") or ""), "session": target.session,
                              "seat": target.seat or ""})
-    if req is not None and outcome != "stale":
-        _answer_card(manager, req, line, outcome, now)
+    if outcome == "done" and req is not None and not target.seat:
+        check = dict(check or {}, **_resume_check(target.workspace, req))
+    if req is None or not card:
+        pass
+    elif outcome == "stale":
+        # A stale tap is answered on its card (receipt `stale`, a fresh revision), never silently:
+        # closed when the card was waiting on exactly this tap; a card running another tap keeps its own.
+        took = req.status == STATUS_IN_PROGRESS and req.chosen_action == aid
+        if took or req.status == STATUS_PENDING:
+            _answer_card(manager, req, line, outcome, now, check)
+        if took or close:
+            _supersede(manager, req.id)
+    else:
+        _answer_card(manager, req, line, outcome, now, check)
         if outcome == "done" and aid == recovery.REFRESH_OPTIONS:
             manager.resolve(req.id)  # the owner asked for a fresh read: the next tick posts the new card
+        elif outcome != "done":
+            _supersede(manager, req.id)
     return body
+
+
+
+def _supersede(manager, req_id: str) -> None:
+    """Close a card whose action did not take, so the next tick posts a fresh one with live
+    controls: a card takes one tap, so text on it may not ask for a second. It owes no "Cleared"
+    notice (renotify.said_on_card): the block is not cleared, and the fresh card carries that notice."""
+    with manager.store.locked():
+        cur = manager.get(req_id)
+        if cur is None or cur.terminal:
+            return
+        cur.subject = {**(cur.subject or {}), "superseded": True}
+        manager.store.save(cur)
+    manager.resolve(req_id)
 
 
 def has_pending(workspace: Path) -> bool:
@@ -500,16 +690,44 @@ def run_pending(manager, target: Target, *, runner: Optional[Runner] = None,
             _unlink(claimed)
             continue
         req, refusal = _check(manager, data, target, clock())
+        key = _gate_key(data)
+        gated = None
+        if refusal is None:
+            # The one gate every entry path shares: fresh, and claimed durably before it runs.
+            admitted = recovery_gate.admit(target.workspace, key, issued_at(data), clock(), ACTION_TTL_S)
+            if not admitted.ok:
+                refusal, gated = ("stale", _GATE_REFUSALS[admitted.why]), admitted.why
         if refusal is not None:
             outcome, why = refusal
-            done.append(_settle(manager, target, data, req, outcome, why, why, {}, clock()))
+            # An expired tap the card took: the card says so and a fresh one follows. A replayed or
+            # interrupted one leaves the card to the tap that already ran.
+            done.append(_settle(manager, target, data, req, outcome, why, why, {}, clock(),
+                                close=gated == "stale", card=gated in (None, "stale")))
         else:
             verb, arg = recovery.parse(data["action_id"])
-            outcome, reason, line, fields = _execute(verb, arg, req, target, run, clock(), owed)
+            outcome, reason, line, fields = _execute(verb, arg, req, target, run, clock(), owed, key)
             done.append(_settle(manager, target, data, req, outcome, reason, line, fields, clock()))
+            recovery_gate.finish(target.workspace, key, outcome, clock())
         _unlink(claimed)
     done += _orphans(manager, target, clock())
     return done
+
+
+_GATE_REFUSALS = {"stale": "The tap reached the Mac too late to act on; nothing was done.",
+                  "replay": "That tap was already acted on; nothing was done again.",
+                  "interrupted": "I was interrupted while doing this; check its state before tapping again."}
+
+
+def _gate_key(data: Dict) -> str:
+    return f"card:{data.get('hitl_id')}:{data.get('action_id')}:{data.get('expected_revision')}"
+
+
+def issued_at(data: Dict):
+    """When the tap was made: the event's own time when the bridge recorded one, else when the
+    bridge received it, whichever is earlier (a tap held in a backlog is never fresher than it was)."""
+    ok = [t for t in (data.get("at"), data.get("tapped_at"))
+          if isinstance(t, (int, float)) and not isinstance(t, bool)]
+    return min(ok) if ok else None
 
 
 def _interrupted(manager, target: Target, claimed: Path, now: float) -> List[Dict]:
@@ -584,6 +802,7 @@ def hold_card_step(manager, workspace: Path, session: str, runtime: Optional[str
             for m in switch_offer(workspace, runtime, avoid=hold.get("model"))]
     ids += [recovery.action_id(recovery.SWITCH_RUNTIME, r) for r in runtime_offer(runtime)]
     ids += [recovery.ADD_ACCOUNT, recovery.REFRESH_OPTIONS]
+    ids = runtime_carries(ids, runtime)
     what = core_limit_hold.status_line(hold).split(": ", 1)[-1]
     models = models_line(workspace, runtime, limited=hold.get("model"))
     lines = [f"I am paused: {what}. I start again by myself after that, and messages you send "

@@ -72,8 +72,13 @@ def unattributed_429(now: float, ago: float = 1) -> dict:
     return rec
 
 
+# The clock a test class runs on: an owner's reply is stamped "now" on it, as the gateway stamps it.
+_STAMP = [None]
+
+
 def owner_task(tasks: Path, name: str, body: str, tier: str = "owner",
-               stamp: str = "2099-01-01T00:00:00Z") -> Path:
+               stamp: str = None) -> Path:
+    stamp = stamp or iso(_STAMP[0] if _STAMP[0] is not None else time.time())
     path = tasks / f"{name}.txt"
     path.write_text(f"id: {name}\nsource: ag2space\ntimestamp: {stamp}\naccess_tier: {tier}\ntask: {body}\n")
     return path
@@ -629,6 +634,8 @@ class OwnerRecovery(unittest.TestCase):
         self.switch.write_text(f'#!/bin/bash\necho "$@" >> {self.calls}\nexit 0\n')
         self.switch.chmod(0o755)
         self.now = 1_800_000_000.0
+        _STAMP[0] = self.now
+        self.addCleanup(_STAMP.__setitem__, 0, None)
         clh.decide(self.ws, self.now, quota=limited_record(self.now))
 
     def tearDown(self):
@@ -923,6 +930,8 @@ class OwnerActionCrash(unittest.TestCase):
         self.switch.write_text(f'#!/bin/bash\necho "$@" >> {self.calls}\nexit 0\n')
         self.switch.chmod(0o755)
         self.now = 1_800_000_000.0
+        _STAMP[0] = self.now
+        self.addCleanup(_STAMP.__setitem__, 0, None)
         self.rec = limited_record(self.now)
         clh.decide(self.ws, self.now, quota=self.rec)
 
@@ -1006,11 +1015,33 @@ class OwnerActionCrash(unittest.TestCase):
         self.assertFalse((self.ws / "tasks" / "task-9.txt").exists())
 
     def test_crash_after_the_switch_before_the_record(self):
-        # Nothing durable says the switch ran, so the next pass runs it again: the same model,
-        # written to the same settings key, which is harmless. The owner still gets one answer.
-        text = self._crash_then_revive("switch to sonnet", "record")
-        self.assertIn("sonnet", text)
-        self.assertEqual(self.calls.read_text().split(), ["sonnet", "--offline"] * 2)
+        # The reply was claimed durably before the switch ran (recovery_gate), so a crash before
+        # its record is an interruption: the next passes say so, and the switch never runs twice.
+        from unittest import mock
+        owner_task(self.ws / "tasks", "task-9", "switch to sonnet")
+        real_record = clh._write_hold
+
+        def record_crashing(ws, hold, seat=None):
+            if hold.get("actions"):
+                raise Crash()
+            return real_record(ws, hold, seat)
+        with mock.patch.object(clh, "_write_hold", side_effect=record_crashing), self.assertRaises(Crash):
+            clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=str(self.switch))
+        for minute in (2, 4):
+            clh.handle_owner_actions(self.ws, self.now + minute * 60, switch_cmd=str(self.switch))
+        self.assertEqual(self.calls.read_text().split(), ["sonnet", "--offline"], "at most one execution")
+        text = (self.ws / "results" / "task-9.txt").read_text()
+        self.assertIn("interrupted", text)
+        self.assertFalse((self.ws / "tasks" / "task-9.txt").exists(), "the core would act on it again")
+
+    def test_an_expired_reply_after_startup_runs_nothing(self):
+        # The launcher's startup sweep goes through the same gate as the live monitor.
+        owner_task(self.ws / "tasks", "task-12", "switch to sonnet", stamp=iso(self.now + 1))
+        later = self.now + 20 * 60
+        self.assertIsNotNone(clh.active_hold(self.ws, later), "the hold still stands when the core starts")
+        self.assertEqual(clh.handle_owner_actions(self.ws, later, switch_cmd=str(self.switch)), [])
+        self.assertFalse(self.calls.exists() and self.calls.read_text().strip(), "an expired reply ran")
+        self.assertIn("more than 10 minutes old", (self.ws / "results" / "task-12.txt").read_text())
 
 
 class NoticeRetry(unittest.TestCase):
@@ -1278,6 +1309,8 @@ class WitnessFindings(unittest.TestCase):
         self.switch.write_text(f'#!/bin/bash\necho "$@" >> {self.calls}\nexit 0\n')
         self.switch.chmod(0o755)
         self.now = 1_800_000_000.0
+        _STAMP[0] = self.now
+        self.addCleanup(_STAMP.__setitem__, 0, None)
         clh.decide(self.ws, self.now, quota=limited_record(self.now))
 
     def tearDown(self):
@@ -1518,6 +1551,8 @@ class QuotaAllowed(unittest.TestCase):
         self.ws = Path(self.td.name)
         (self.ws / "state").mkdir()
         self.now = 1_800_000_000.0
+        _STAMP[0] = self.now
+        self.addCleanup(_STAMP.__setitem__, 0, None)
 
     def tearDown(self):
         self.td.cleanup()

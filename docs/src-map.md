@@ -97,6 +97,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`dashboard_schedules.py`** — Cron parsing, schedule validation and atomic crons.json persistence.
 - **`dedup_recovery.py`** — Recovery for a `[deduped: <holder>]` result whose holder never answered.
 - **`dedup_soundness.py`** — Is a `[deduped: X]` sound?
+- **`detached_action.py`** — Run an action that can kill its caller (a restart of the session the caller lives in) in its own session, and know its outcome by a deadline.
 - **`discord-bridge.py`** — Discord bridge for Sutando — listens for DMs, writes to tasks/, sends replies from results/.
 - **`discord-read.py`** — Read recent messages from a Discord channel via REST API.
 - **`discord_access.py`** — Shared Discord collaborator policy and verified task admission.
@@ -204,6 +205,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`recording-state.ts`** — Shared recording state — used by both browser-tools.ts (describeScreenTool) and recording-tools.ts (scrollAndDescribeTool, screenRecordTool, etc.)
 - **`recording-tools.ts`** — Recording, video playback, and scroll-and-describe tools.
 - **`recovery_actions.py`** — recovery_actions.py — the host executor for recovery buttons on blocked cards (C2 -> C3).
+- **`recovery_gate.py`** — The one freshness and single-use gate for every way an owner's recovery command reaches the host.
 - **`recovery_issues.py`** — Durable issue identities for recovery telemetry, independent of retry counts.
 - **`relay-agent.ts`** — Sutando's relay agent: the voice side's task manager between the voice model and the core, run as the bodhi subagent behind the NON_BLOCKING `work` tool: each call stays open until its task's result returns as that call's own response (WHEN_IDLE).
 - **`remote-gateway-bridge.py`** — remote-gateway-bridge.py — sutando loader for the canonical ag2-sparrow client.

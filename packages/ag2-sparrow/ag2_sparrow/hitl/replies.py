@@ -152,6 +152,12 @@ class HitlReplyHandler:
             self.last_reason = str(reason)
             self._log(f"hitl: {reply.hitl_id} refused for {actor} — {reason}")
             return claimed
+        posted = self._recovery_room(reply.hitl_id)
+        if posted is not None and posted != reply.room:
+            self.last_outcome = "rejected"
+            self.last_reason = "a recovery card is answered only in the room it was posted in"
+            self._log(f"hitl: {reply.hitl_id} recovery tap from another room rejected")
+            return claimed
         try:
             action = self._manager.apply_action(reply)
         except (StaleRequirementError, MalformedActionError) as e:
@@ -160,6 +166,7 @@ class HitlReplyHandler:
                 self._log(f"hitl: reply for {reply.hitl_id} rejected — {e}")
                 self.last_outcome = "rejected"
                 self.last_reason = str(e)
+                self._stamp_stale(reply.hitl_id)
                 return claimed
             # The click was applied but the turn it asked for was never written (a death in
             # between): the redelivery is the same click, so the turn is still owed, not stale.
@@ -179,10 +186,37 @@ class HitlReplyHandler:
             note = f"; driver action {write_driver_action(self._workspace, req, action).name}"
         elif (recovery.is_recovery(action.id) and action.kind == recovery.kind_of(action.id)
               and action.id not in keyed and self._workspace is not None):
-            path = recovery.write_action(self._workspace, reply, actor, reply.room)
+            path = recovery.write_action(self._workspace, reply, actor, reply.room,
+                                         tapped_at=recovery.event_time(event))
             note = f"; recovery action {path.name}"
         self._log(f"hitl: {reply.hitl_id} -> {action.id} by {actor} (in_progress{note})")
         return claimed
+
+    def _stamp_stale(self, hitl_id: str) -> None:
+        """A rejected tap on a still-open recovery card gets an answer on that card: a fresh revision
+        whose receipt says `stale`, so the tapping client shows "not run" instead of waiting. Only a
+        pending card: one already running a tap keeps that tap's outcome as its receipt."""
+        import time
+        from .schema import STATUS_PENDING
+        try:
+            with self._manager.store.locked():
+                cur = self._manager.get(hitl_id)
+                if cur is None or cur.status != STATUS_PENDING or not (cur.subject or {}).get("recovery"):
+                    return
+                cur.subject = {**(cur.subject or {}), "receipt": {"outcome": "stale", "at": int(time.time())}}
+                cur.revision += 1
+                cur.updated_at = time.time()
+                self._manager.store.save(cur)
+        except Exception as e:  # noqa: BLE001 — the rejection stands whether or not the card is edited
+            self._log(f"hitl: {hitl_id} stale receipt not written — {e}")
+
+    def _recovery_room(self, hitl_id: str) -> Optional[str]:
+        """For a recovery card, the room it was posted in ("" when no post is recorded, which no
+        room matches); None for any other card, whose own room rule applies."""
+        req = self._manager.get(hitl_id)
+        if req is None or not (req.subject or {}).get("recovery"):
+            return None
+        return req.room or str(self._manager.store.projection(hitl_id).get("room_id") or "")
 
     def _same_click_redelivered(self, reply: ActionReply):
         """The Action when `reply` is the click already applied to a turn-requesting requirement

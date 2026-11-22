@@ -79,6 +79,8 @@ _KIND_STATUS_LINES = {("auth", STATUS_RESOLVED): "✓ Signed in — Sutando has 
 # A recovery button's card closes on its receipt (hitl.recovery); the message carries the outcome.
 _RECEIPT_LINES = {"done": "✓ Done."}
 _RECEIPT_NOT_DONE = "— Not done."
+# Done, but the block it was meant to lift held: the card was closed for a fresh one.
+_RECEIPT_STILL_BLOCKED = "— Still blocked."
 
 
 def fallback_body(req: HumanRequirement) -> str:
@@ -92,6 +94,8 @@ def fallback_body(req: HumanRequirement) -> str:
     receipt = (req.subject or {}).get("receipt")
     if req.terminal and isinstance(receipt, dict):
         closer = _RECEIPT_LINES.get(receipt.get("outcome"), _RECEIPT_NOT_DONE)
+        if receipt.get("outcome") == "done" and (req.subject or {}).get("superseded"):
+            closer = _RECEIPT_STILL_BLOCKED
     else:
         closer = _KIND_STATUS_LINES.get((req.kind, req.status)) or _STATUS_LINES.get(req.status)
     if closer:
@@ -266,6 +270,9 @@ def project_pass(manager: HitlManager, send: Sender, room_id: str, clock: Option
             continue
         event_id = str(answer.get("event_id") or "") or None
         extra = renotify.on_create(req, clock()) if created else None
+        if created:
+            # The room the card was posted in: a recovery card's tap is accepted from it alone.
+            extra = {**(extra or {}), "room_id": payload["room_id"]}
         manager.record_projection(req.id, req.revision, event_id if created else None, extra,
                                   replaces=target if created else None)
         _RETRY_DEADLINES.pop((str(manager.store.root), req.id, req.revision), None)

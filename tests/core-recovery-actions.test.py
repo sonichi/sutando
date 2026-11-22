@@ -14,6 +14,7 @@ Contract: contracts/core_recovery.v1/action.json and receipt.json, compared lite
 """
 import importlib.util as u
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -34,7 +35,9 @@ M = u.module_from_spec(spec)
 spec.loader.exec_module(M)
 
 import core_limit_hold
+import detached_action
 import recovery_actions as RA
+import recovery_gate
 import runtime_models
 from hitl import recovery, tui_gate
 from hitl.manager import HitlManager, HitlStore
@@ -81,6 +84,50 @@ class Hang(Run):
         raise subprocess.TimeoutExpired(argv, kw.get("timeout") or 0)
 
 
+class Spawned:
+    """Stands in for starting a detached process: records it, starts nothing."""
+
+    def __init__(self, fail=False):
+        self.calls, self.fail = [], fail
+
+    def __call__(self, argv, **kw):
+        if self.fail:
+            raise OSError("cannot start")
+        self.calls.append((argv, kw))
+        return mock.Mock()
+
+    def command(self, i=-1):
+        argv = self.calls[i][0]
+        return argv[argv.index("--") + 1:]
+
+    def key(self, i=-1):
+        argv = self.calls[i][0]
+        return argv[argv.index("--key") + 1]
+
+    def gate(self, i=-1):
+        argv = self.calls[i][0]
+        return argv[argv.index("--after-gate") + 1] if "--after-gate" in argv else None
+
+
+#: The list's read time and host key the fixtures were made with, so its row tokens are fixed.
+LIST_AT = 1763730000.0
+LIST_KEY = bytes(32)
+
+
+def record_list(ws, rows=None):
+    key = ws / "state" / "recovery" / "option-key"
+    key.parent.mkdir(parents=True, exist_ok=True)
+    key.write_bytes(LIST_KEY)
+    runtime_models.record(ws, "claude", runtime_models.parse_picker(PICKER, "claude") if rows is None else rows,
+                          now=LIST_AT)
+
+
+def sw(ws, slug):
+    """The id of the button for the row the picker shows as `slug` (its token in the recorded list)."""
+    slugs = [r["key"] for r in runtime_models.parse_picker(PICKER, "claude")]
+    return "switch_model:" + runtime_models.entries(ws, "claude")[slugs.index(slug)]["key"]
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -93,14 +140,22 @@ class Base(unittest.TestCase):
         self.which = mock.patch.object(RA.shutil, "which", return_value=None)  # PATH never decides
         self.which.start()
         # The runtime's own model list, as its /model picker showed it on a live host.
-        runtime_models.record(self.ws, "claude", runtime_models.parse_picker(PICKER, "claude"))
+        record_list(self.ws)
         self.launch = mock.patch.object(core_limit_hold, "launch_identity", lambda ws, config_dir=None: ("claude-opus-5-5", None))
         self.launch.start()
+        self.spawned = Spawned()  # a detached restart is recorded, never started, in tests
+        self.spawn = mock.patch.object(RA, "spawn_detached", self.spawned)
+        self.spawn.start()
 
     def tearDown(self):
         self.which.stop()
         self.launch.stop()
+        self.spawn.stop()
         self.tmp.cleanup()
+
+    def answer(self, outcome, rc=None, reason=None, i=-1):
+        """The detached restart's own terminal report, as its wrapper (or the pool) writes it."""
+        detached_action.report(self.ws, self.spawned.key(i), outcome, reason, rc)
 
     def card(self, kind="usage-limit", prompt=LIMIT, seat=None, runtime="claude", fresh=True):
         """A new card for this state: a limit card is one per session, so an open one is closed."""
@@ -114,7 +169,13 @@ class Base(unittest.TestCase):
     def payload(self, req, aid):
         return {"hitl_id": req.id, "expected_revision": req.revision, "action_id": aid, "guard": req.guard}
 
-    def click(self, req, aid, actor=OWNER, room=DM, payload=None):
+    def post(self, req, room=DM):
+        """What the projector records when it posts the card: the room it went to."""
+        if not self.mgr.store.projection(req.id).get("event_id"):
+            self.mgr.record_projection(req.id, self.mgr.get(req.id).revision, f"$card-{req.id}", {"room_id": room})
+
+    def click(self, req, aid, actor=OWNER, room=DM, payload=None, posted_in=DM):
+        self.post(req, posted_in)
         self.handler.offer({"type": "message.created", "event_id": "$c", "actor_id": actor, "room_id": room,
                             "content": {REPLY_FIELD: payload or self.payload(req, aid)}})
         return self.handler.last_outcome
@@ -135,7 +196,7 @@ class CardButtons(Base):
     def test_core_limit_card_offers_runtime_neutral_buttons_and_names_them(self):
         req = self.card()
         self.assertEqual([a.id for a in req.actions],
-                         ["switch_model:sonnet-5-1m-context", "switch_model:fable-5-1", "switch_model:haiku",
+                         [sw(self.ws, "sonnet-5-1m-context"), sw(self.ws, "fable-5-1"), sw(self.ws, "haiku"),
                           "retry_now", "add_account", "refresh_options", "restart_core", "open_terminal"],
                          "the runtime's own list, minus the model in use; no purchase")
         kinds = {a.id: a.kind for a in req.actions}
@@ -146,8 +207,8 @@ class CardButtons(Base):
     def test_switch_buttons_skip_the_model_in_use_and_codex_offers_the_runtime_instead(self):
         (self.ws / "state" / "model-switch.json").write_text(json.dumps({"model": "claude-sonnet-5[1m]"}))
         ids = [a.id for a in self.card().actions]
-        self.assertNotIn("switch_model:sonnet-5-1m-context", ids)
-        self.assertIn("switch_model:opus-5-5", ids)
+        self.assertNotIn(sw(self.ws, "sonnet-5-1m-context"), ids)
+        self.assertIn(sw(self.ws, "opus-5-5"), ids)
         ids = [a.id for a in self.card(runtime="codex").actions]
         self.assertFalse([i for i in ids if i.startswith("switch_model:")])
         self.assertIn("switch_runtime:claude", ids)
@@ -166,12 +227,12 @@ class CardButtons(Base):
         self.assertIn("This runtime offers: Default (Opus 5.5) · Opus 5.5 (in use) · Sonnet 5 (1M context) · "
                       "Fable 5.1 · Haiku 4.5.", req.message)
         capped = self.card(kind="turn-rejected", prompt=FABLE_REFUSED)
-        self.assertNotIn("switch_model:fable-5-1", [a.id for a in capped.actions], "the capped model is not offered")
+        self.assertNotIn(sw(self.ws, "fable-5-1"), [a.id for a in capped.actions], "the capped model is not offered")
         self.assertIn("Fable 5.1 (hit its limit)", capped.message)
 
     def test_a_tap_sets_exactly_the_model_its_button_names(self):
         req = self.card()
-        self.click(req, "switch_model:haiku")
+        self.click(req, sw(self.ws, "haiku"))
         run = Run()
         [receipt] = self.run_pending(run)
         argv = run.calls[0][0]
@@ -181,7 +242,12 @@ class CardButtons(Base):
 
     def test_the_allowlist_is_the_list_shown(self):
         req = self.card()
-        for key in ("opus-5-5", "default-recommended", "gpt-6-sol", "sonnet"):
+        # A label, a model id or a slug is never parsed back into an action.
+        for key in ("opus-5-5", "claude-opus-5-5", "Opus 5.5", "o4b876be2aaa6\n"):
+            with self.subTest(key=key):
+                self.assertIsNone(recovery.parse(f"switch_model:{key}"))
+        # A well-formed token that is not a row of the list as recorded runs nothing.
+        for key in ("o0123456789ab",):
             with self.subTest(key=key):
                 with self.mgr.store.locked():
                     cur = self.mgr.get(req.id)
@@ -250,11 +316,11 @@ class CardButtons(Base):
 class Routing(Base):
     def test_owner_tap_lands_as_a_recovery_action_file(self):
         req = self.card()
-        self.assertEqual(self.click(req, "switch_model:haiku"), "applied")
+        self.assertEqual(self.click(req, sw(self.ws, "haiku")), "applied")
         [path] = list(recovery.actions_dir(self.ws).glob("*.json"))
         body = json.loads(path.read_text())
         self.assertEqual((body["hitl_id"], body["action_id"], body["sender"], body["room"]),
-                         (req.id, "switch_model:haiku", OWNER, DM))
+                         (req.id, sw(self.ws, "haiku"), OWNER, DM))
         self.assertFalse(list(driver_dir(self.ws).glob("*.json")), "not a keystroke for the driver")
 
     def test_a_menu_choice_stays_a_keystroke(self):
@@ -270,14 +336,14 @@ class Routing(Base):
         self.assertEqual(self.click(req, "restart_core", payload=payload), "applied")
         self.assertEqual(self.click(req, "restart_core", payload=payload), "rejected", "a replay is stale")
         other = self.card(kind="unknown", prompt=UNKNOWN)
-        self.assertEqual(self.click(other, "switch_model:haiku"), "rejected", "an id the card did not offer")
+        self.assertEqual(self.click(other, sw(self.ws, "haiku")), "rejected", "an id the card did not offer")
 
 
 class Executor(Base):
     def test_switch_runs_once_writes_receipt_and_audit_and_closes_the_card_once_verified(self):
         sonnet = {"id": "claude-sonnet-5[1m]", "display": "Sonnet 5 (1M context)"}
         req = self.card()
-        self.click(req, "switch_model:sonnet-5-1m-context")
+        self.click(req, sw(self.ws, "sonnet-5-1m-context"))
         run = Run()
         [receipt] = self.run_pending(run)
         self.assertEqual(run.calls[0][0][1:4], [str(REPO / "scripts" / "switch-model.sh"), sonnet["id"], "--confirm"])
@@ -296,20 +362,23 @@ class Executor(Base):
         self.assertEqual(len(run.calls), 1, "once per id")
         [line] = self.audit()
         self.assertEqual((line["action_id"], line["outcome"], line["sender"], line["session"]),
-                         ("switch_model:sonnet-5-1m-context", "done", OWNER, CORE))
+                         (sw(self.ws, "sonnet-5-1m-context"), "done", OWNER, CORE))
 
     def test_a_seat_switch_is_never_run(self):
         # /model in a seat saves the default in the config dir it shares with the core and every seat.
         req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED, seat=SEAT)
         with self.mgr.store.locked():
             cur = self.mgr.get(req.id)
-            cur.actions = [tui_gate.recovery_action("switch_model:opus")] + cur.actions
+            cur.actions = [tui_gate.recovery_action(sw(self.ws, "haiku"))] + cur.actions
             self.mgr.store.save(cur)
-        self.click(self.mgr.get(req.id), "switch_model:opus")
+        listed = sw(self.ws, "haiku")
+        self.assertIsNotNone(runtime_models.entry(self.ws, "claude", listed[13:]), "a key of the recorded list")
+        self.assertIn(listed[13:], RA.switch_offer(self.ws, "claude"), "the core would run this very key")
+        self.click(self.mgr.get(req.id), listed)
         run, owed = Run(), []
         [receipt] = self.run_pending(run, seat=SEAT, owed=owed)
         self.assertEqual((receipt["outcome"], run.calls, owed), ("refused", [], []))
-        self.assertIn(recovery.SEAT_MODEL_LOCKED, self.mgr.get(req.id).message)
+        self.assertIn(recovery.SEAT_MODEL_LOCKED, receipt["reason"], "refused by the seat guard, not the list")
 
     def test_seat_retry_resends_the_refused_turn(self):
         req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED, seat=SEAT)
@@ -340,9 +409,9 @@ class Executor(Base):
         req = self.card(runtime="codex")
         with self.mgr.store.locked():
             cur = self.mgr.get(req.id)
-            cur.actions = [tui_gate.recovery_action("switch_model:sonnet")] + cur.actions
+            cur.actions = [tui_gate.recovery_action("switch_model:o0123456789ab")] + cur.actions
             self.mgr.store.save(cur)
-        self.click(self.mgr.get(req.id), "switch_model:sonnet")
+        self.click(self.mgr.get(req.id), "switch_model:o0123456789ab")
         run = Run()
         [receipt] = self.run_pending(run)
         self.assertEqual((receipt["outcome"], run.calls), ("refused", []), "Codex has no model switch")
@@ -354,30 +423,47 @@ class Executor(Base):
         run = Run()
         [receipt] = self.run_pending(run)
         self.assertEqual((receipt["outcome"], run.calls, self.keys), ("refused", [], []))
-        self.assertEqual(self.mgr.get(req.id).status, STATUS_IN_PROGRESS, "the same card says so; no new card")
+        card = self.mgr.get(req.id)
+        self.assertEqual((card.status, card.subject.get("superseded")), (STATUS_RESOLVED, True),
+                         "a card takes one tap: it says why and is closed for a fresh one")
 
-    def test_restart_and_runtime_switch_run_the_launcher_from_outside_the_core(self):
+    def test_restart_and_runtime_switch_run_detached_from_the_monitor_they_restart(self):
+        # The launcher's --restart closes the tmux session the monitor runs in: it is never the
+        # monitor's child, and it acts only once the monitor has recorded the tap (its gate claim).
         req = self.card(kind="unknown", prompt=UNKNOWN)
         self.click(req, "restart_core")
         run = Run()
         [receipt] = self.run_pending(run)
-        argv, kw = run.calls[0]
-        self.assertEqual(argv, ["bash", str(SRC / "agent" / "start-cli.sh"), "--restart"])
+        self.assertEqual(run.calls, [], "nothing runs inside the monitor's own process tree")
+        argv, kw = self.spawned.calls[0]
+        self.assertTrue(kw["start_new_session"])
+        self.assertEqual(argv[1:3], [str(SRC / "detached_action.py"), "run"])
+        self.assertEqual(self.spawned.command(), ["bash", str(SRC / "agent" / "start-cli.sh"), "--restart"])
+        gate = self.spawned.gate()
+        self.assertEqual((recovery_gate.state(self.ws, gate) or {}).get("state"), recovery_gate.FINISHED,
+                         "the tap was fully recorded before the child is allowed to act")
         self.assertEqual((kw["env"]["SUTANDO_TMUX_SOCKET"], kw["env"]["SUTANDO_TMUX_SESSION"]), (SOCK, CORE))
         self.assertNotIn("SUTANDO_CORE_RUNTIME", kw["env"])
         self.assertEqual(receipt["outcome"], "done")
+        card = self.mgr.get(req.id)
+        self.assertIn("Restarting the core; checking that it is working again.", card.message)
+        self.assertNotIn("receipt", card.subject, "no outcome on the card until the restart answers")
         req = self.card(runtime="codex")
         self.click(req, "switch_runtime:claude")
-        run = Run()
-        [receipt] = self.run_pending(run)
-        self.assertEqual(run.calls[0][0][2:], ["--runtime", "claude", "--restart"])
+        [receipt] = self.run_pending(Run())
+        self.assertEqual(self.spawned.command()[2:], ["--runtime", "claude", "--restart"])
         self.assertEqual(receipt["recovery"]["runtime"], "claude")
 
-    def test_restart_refused_while_held(self):
+    def test_a_restart_held_by_a_limit_says_so_once_it_answers(self):
         req = self.card(kind="unknown", prompt=UNKNOWN)
         self.click(req, "restart_core")
-        [receipt] = self.run_pending(Run(rc=core_limit_hold.HOLD_EXIT))
-        self.assertEqual(receipt["outcome"], "refused")
+        self.run_pending(Run())
+        self.answer(detached_action.FAILED, rc=core_limit_hold.HOLD_EXIT, reason="exit")
+        self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=True), [req.id])
+        card = self.mgr.get(req.id)
+        self.assertIn("paused for a provider limit", card.message)
+        self.assertEqual((card.subject["receipt"]["outcome"], card.status), ("failed", STATUS_RESOLVED))
+        self.assertEqual(recovery.read_receipt(self.ws, req.id)["outcome"], "failed", "the receipt on disk too")
 
     def test_unknown_id_stale_card_expired_tap_and_crash_leftover_never_run(self):
         d = recovery.actions_dir(self.ws)
@@ -395,20 +481,24 @@ class Executor(Base):
 
         late = self.card(kind="unknown", prompt=UNKNOWN + " ")
         self.click(late, "restart_core")
-        [receipt] = self.run_pending(run, now=time.time() + RA.ACTION_TTL_S + 5)
-        self.assertEqual((receipt["outcome"], run.calls), ("stale", []))
+        [handoff] = list(d.glob("*.json"))
+        tapped = json.loads(handoff.read_text())["at"]
+        [receipt] = self.run_pending(run, now=tapped + 601)  # the TTL is ten minutes, literally
+        self.assertEqual((receipt["outcome"], run.calls, self.spawned.calls), ("stale", [], []))
 
         crashed = self.card(kind="unknown", prompt=UNKNOWN + "  ")
         self.click(crashed, "restart_core")
         [path] = list(d.glob("*.json"))
         path.rename(path.with_name(path.stem + RA.CLAIM_SUFFIX))
         [receipt] = self.run_pending(run)
-        self.assertEqual((receipt["outcome"], run.calls), ("failed", []))
-        self.assertEqual(self.mgr.get(crashed.id).status, STATUS_IN_PROGRESS, "the card says so; no new card")
+        self.assertEqual((receipt["outcome"], run.calls, self.spawned.calls), ("failed", [], []))
+        card = self.mgr.get(crashed.id)
+        self.assertEqual((card.status, card.subject.get("superseded")), (STATUS_RESOLVED, True),
+                         "the card says so and a fresh one follows")
 
     def test_nothing_a_subprocess_prints_reaches_the_card_receipt_or_audit(self):
         req = self.card()
-        self.click(req, "switch_model:haiku")
+        self.click(req, sw(self.ws, "haiku"))
         [receipt] = self.run_pending(Run(rc=1, out=f"token={SECRET}"))
         stored = [json.dumps(receipt), self.mgr.get(req.id).message,
                   (recovery.recovery_dir(self.ws) / RA.AUDIT_FILE).read_text()]
@@ -441,7 +531,8 @@ class Executor(Base):
         self.click(req, "retry_now")
         run = Run()
         [receipt] = self.run_pending(run, now=now)
-        self.assertEqual((receipt["outcome"], run.calls[0][0][-1]), ("done", "--restart"))
+        self.assertEqual((receipt["outcome"], run.calls, self.spawned.command()[-1]), ("done", [], "--restart"))
+        self.assertTrue(self.spawned.calls[0][1]["start_new_session"], "a live core's Retry is detached too")
         self.assertEqual(core_limit_hold.read_hold(self.ws)["status"], "cleared")
 
     def test_a_seats_retry_restarts_it_by_its_pools_command(self):
@@ -455,17 +546,29 @@ class Executor(Base):
         self.assertEqual(core_limit_hold.read_hold(self.ws, SEAT_SESSION)["status"], "cleared")
 
     def test_a_live_cores_failed_restart_keeps_it_paused(self):
-        for rc in (1, None):
-            with self.subTest(rc=rc):
+        # Could not start: failed at once. Started, then failed or never answered: the monitor that
+        # comes back reads that, the pause returns and the card ends on why.
+        for how in ("no-start", "failed", "expired"):
+            with self.subTest(how=how):
                 self.tearDown()
                 self.setUp()
+                self.spawned.fail = how == "no-start"
                 now = self._hold(source=core_limit_hold.PANE_SOURCE)
                 req = self.card()
                 self.click(req, "retry_now")
-                [receipt] = self.run_pending(Run(rc=1) if rc else Hang(), now=now)
-                self.assertEqual(receipt["outcome"], "failed")
-                self.assertIsNotNone(core_limit_hold.active_hold(self.ws, now), "a failed restart left no pause")
-                self.assertIn("still paused", self.mgr.get(req.id).message)
+                [receipt] = self.run_pending(Run(), now=now)
+                if how == "no-start":
+                    self.assertEqual(receipt["outcome"], "failed")
+                    self.assertIn("still paused", self.mgr.get(req.id).message)
+                else:
+                    self.assertEqual(receipt["outcome"], "done")
+                    if how == "failed":
+                        self.answer(detached_action.FAILED, rc=1, reason="exit")
+                    later = now + (detached_action.DEADLINE_S + 1 if how == "expired" else 5)
+                    self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=True, now=later), [req.id])
+                    self.assertIn("did not complete" if how == "failed" else "couldn't confirm",
+                                  self.mgr.get(req.id).message)
+                self.assertIsNotNone(core_limit_hold.active_hold(self.ws, now + 6), "a failed restart left no pause")
 
     def test_a_seats_failed_restart_keeps_it_paused(self):
         now = self._hold(seat=SEAT_SESSION, source=core_limit_hold.PANE_SOURCE)
@@ -494,7 +597,7 @@ class OneCardPerIncident(Base):
 
     def test_a_done_switch_that_does_not_unblock_keeps_the_same_card_and_says_so_once(self):
         req = self.card()
-        self.click(req, "switch_model:sonnet-5-1m-context")
+        self.click(req, sw(self.ws, "sonnet-5-1m-context"))
         [receipt] = self.run_pending(Run())
         self.assertEqual(receipt["outcome"], "done")
         for _ in range(4):  # later ticks still see the limit screen and escalate as they would
@@ -508,18 +611,32 @@ class OneCardPerIncident(Base):
         card = self.mgr.get(req.id)
         self.assertEqual(card.message.count(RA.STILL_BLOCKED), 1)
         self.assertNotIn("✓ Done.", fallback_body(card))
-        self.assertEqual(len([r for r in self.mgr.active() if (r.subject or {}).get("session") == CORE]), 1)
+        self.assertIn("— Still blocked.", fallback_body(card))
+        fresh = M.escalate(self.mgr, "blocked-human", "awaiting user: usage-limit", "usage-limit", LIMIT,
+                           CORE, runtime="claude", workspace=self.ws)
+        self.assertNotEqual(fresh.id, req.id, "the still-blocked card is closed; its text points at this one")
+        self.assertEqual([r.id for r in self.mgr.active() if (r.subject or {}).get("session") == CORE], [fresh.id])
 
-    def test_a_failed_action_edits_the_same_card(self):
+    def test_after_a_failed_action_a_fresh_card_takes_the_next_tap(self):
+        # A card takes one tap (in_progress -> terminal only): a failed action closes it, and the
+        # next tick's card has live controls, so the owner can act again from their phone.
         now = self._hold_live()
+        self.spawned.fail = True
         req = self.card()
         self.click(req, "retry_now")
-        [receipt] = self.run_pending(Run(rc=1), now=now)
+        [receipt] = self.run_pending(Run(), now=now)
         self.assertEqual(receipt["outcome"], "failed")
+        msg = self.mgr.get(req.id).message
+        self.assertIn("still paused", msg)
+        self.assertNotIn('reply "retry now" here', msg, "never tells the owner to tap a card that takes no tap")
+        self.assertIn(RA.NEW_CARD, msg)
         again = M.escalate(self.mgr, "blocked-human", "awaiting user: usage-limit", "usage-limit", LIMIT,
                            CORE, runtime="claude", workspace=self.ws)
-        self.assertEqual(again.id, req.id)
-        self.assertIn("still paused", self.mgr.get(req.id).message)
+        self.assertNotEqual(again.id, req.id)
+        self.spawned.fail = False
+        self.assertEqual(self.click(again, "retry_now"), "applied", "the fresh card takes the tap")
+        [receipt] = self.run_pending(Run(), now=now)
+        self.assertEqual(receipt["outcome"], "done")
 
     def _hold_live(self):
         now = time.time()
@@ -530,7 +647,7 @@ class OneCardPerIncident(Base):
 
     def test_the_monitor_tick_runs_the_verification(self):
         req = self.card()
-        self.click(req, "switch_model:haiku")
+        self.click(req, sw(self.ws, "haiku"))
         self.run_pending(Run())
         with mock.patch.object(RA, "VERIFY_S", 0.0):
             self.assertEqual(M.verify_step(self.mgr, self.ws, CORE, True), [req.id])
@@ -549,8 +666,8 @@ class PausedCard(Base):
         b = RA.hold_card_step(self.mgr, self.ws, CORE, "claude")
         self.assertEqual(a.id, b.id)
         self.assertEqual([x.id for x in a.actions],
-                         ["retry_now", "switch_model:sonnet-5-1m-context", "switch_model:fable-5-1",
-                          "switch_model:haiku", "add_account", "refresh_options"])
+                         ["retry_now", sw(self.ws, "sonnet-5-1m-context"), sw(self.ws, "fable-5-1"),
+                          sw(self.ws, "haiku"), "add_account", "refresh_options"])
         self.assertIs(a.subject.get("remind"), False)
         for word in COMMANDS + PURCHASE_WORDS:
             self.assertNotIn(word, a.message)
@@ -592,14 +709,14 @@ class ExecutorEdges(Base):
 
     def test_a_switch_that_fails_or_never_finishes_keeps_the_model(self):
         req = self.card()
-        self.assertEqual(self.execute("switch_model", "haiku", req, runner=Run(rc=6))[0], "failed")
-        self.assertEqual(self.execute("switch_model", "haiku", req, runner=Hang())[0], "failed")
+        self.assertEqual(self.execute("switch_model", sw(self.ws, "haiku")[13:], req, runner=Run(rc=6))[0], "failed")
+        self.assertEqual(self.execute("switch_model", sw(self.ws, "haiku")[13:], req, runner=Hang())[0], "failed")
 
     def test_a_switch_on_a_refused_turn_resends_it_once_idle(self):
         req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED)
         owed = []
         target = RA.Target(self.ws, SOCK, CORE)
-        out = RA._execute("switch_model", "haiku", req, target, Run(), time.time(), owed)
+        out = RA._execute("switch_model", sw(self.ws, "haiku")[13:], req, target, Run(), time.time(), owed)
         self.assertEqual((out[0], owed), ("done", [RA.CONTINUE]))
 
     def test_restart_and_runtime_switch_never_act_on_a_seat(self):
@@ -608,11 +725,23 @@ class ExecutorEdges(Base):
             self.assertEqual(self.execute(verb, arg, seat=SEAT, runner=run)[0], "refused")
             self.assertEqual(run.calls, [])
 
-    def test_a_restart_that_never_finishes_or_is_held_or_fails_says_which(self):
-        self.assertEqual(self.execute("restart_core", runner=Hang())[0], "failed")
-        self.assertEqual(self.execute("restart_core", runner=Run(rc=core_limit_hold.HOLD_EXIT))[0], "refused")
-        self.assertEqual(self.execute("switch_runtime", "codex", runner=Run(rc=3))[0], "failed")
-        self.assertEqual(self.execute("switch_runtime", "codex", runner=Run())[3]["runtime"], "codex")
+    def test_a_restart_that_cannot_start_or_fails_or_never_answers_says_which(self):
+        self.spawned.fail = True
+        self.assertEqual(self.execute("restart_core")[0], "failed")
+        self.spawned.fail = False
+        out = self.execute("switch_runtime", "codex")
+        self.assertEqual((out[0], out[3]["runtime"]), ("done", "codex"))
+        for outcome, rc, reason, words in ((detached_action.FAILED, 3, "exit", "did not complete (exit 3)"),
+                                           (detached_action.FAILED, None, "could not start", "did not complete."),
+                                           (detached_action.FAILED, None, "The pool's own sentence.",
+                                            "The pool's own sentence.")):
+            with self.subTest(words=words):
+                req = self.card(kind="unknown", prompt=UNKNOWN + words)
+                self.click(req, "restart_core")
+                self.run_pending(Run())
+                self.answer(outcome, rc=rc, reason=reason)
+                RA.verify_step(self.mgr, self.ws, CORE, blocked=True)
+                self.assertIn(words, self.mgr.get(req.id).message)
 
     def test_escape_and_an_unknown_verb(self):
         self.assertEqual(self.execute("escape_prompt")[0], "done")
@@ -657,6 +786,7 @@ class ExecutorEdges(Base):
         self.assertEqual(json.loads(lines[-1])["at"], 9)
 
     def test_an_audit_that_cannot_be_written_never_fails_the_action(self):
+        shutil.rmtree(self.ws / "state" / "recovery")
         (self.ws / "state" / "recovery").write_text("not a dir")
         RA.audit(self.ws, {"at": 1})
 
@@ -698,7 +828,8 @@ class ExecutorEdges(Base):
         later = time.time() + RA.ORPHAN_CLICK_S + 5
         [receipt] = RA.run_pending(self.mgr, RA.Target(self.ws, SOCK, CORE), runner=Run(), now=later)
         self.assertEqual(receipt["outcome"], "failed")
-        self.assertEqual(self.mgr.get(req.id).status, STATUS_EXPIRED, "the next tick raises its replacement")
+        card = self.mgr.get(req.id)
+        self.assertTrue(card.terminal and card.subject.get("superseded"), "the next tick raises its replacement")
 
     def test_unlink_of_a_missing_file_is_quiet(self):
         RA._unlink(self.ws / "nope")
@@ -731,13 +862,13 @@ class ExecutorEdges(Base):
         self.assertEqual(RA.refresh_limit_card(self.mgr, self.ws, CORE, "claude"), [], "already the list")
         self.click(req, "add_account")
         (self.ws / "state" / "runtime-models.claude.json").unlink()
-        runtime_models.record(self.ws, "claude", runtime_models.parse_picker(PICKER, "claude")[:3])
+        record_list(self.ws, runtime_models.parse_picker(PICKER, "claude")[:3])
         self.assertEqual(RA.refresh_limit_card(self.mgr, self.ws, CORE, "claude"), [], "a tapped card is not edited")
         self.assertEqual(RA.refresh_limit_card(self.mgr, self.ws, CORE, "codex"), [], "no Codex switch")
 
     def test_verify_skips_a_card_whose_state_was_already_said(self):
         req = self.card()
-        self.click(req, "switch_model:haiku")
+        self.click(req, sw(self.ws, "haiku"))
         self.run_pending(Run())
         self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=False), [req.id])
         self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=False), [])
@@ -756,11 +887,19 @@ class SeatRetryCopy(Base):
         req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED, seat=SEAT)
         self.click(req, "retry_now")
         target = RA.Target(self.ws, SOCK, SEAT_SESSION, seat=SEAT, retry_cmd=["python3", "pool_manage.py", "retry", "w"])
-        [receipt] = RA.run_pending(self.mgr, target, runner=Run())
+        run = Run()
+        [receipt] = RA.run_pending(self.mgr, target, runner=run)
         self.assertEqual(receipt["outcome"], "done")
         card = self.mgr.get(req.id)
-        self.assertIn(f"Restarting {SEAT}; checking that it is working again.", card.message)
+        self.assertIn("Restarting this worker; checking that it is working again.", card.message)
+        self.assertNotIn("b35461a4", card.message.rsplit("\n\n", 1)[-1], "the done line shows no raw worker id")
         self.assertNotIn(RA.WORKING_AGAIN, card.message)
+        key = run.calls[0][1]["env"][detached_action.KEY_ENV]
+        self.assertEqual(RA.verify_step(self.mgr, self.ws, SEAT_SESSION, blocked=False), [],
+                         "checking until the pool's restart answers")
+        detached_action.report(self.ws, key, detached_action.DONE)
+        RA.verify_step(self.mgr, self.ws, SEAT_SESSION, blocked=False)
+        self.assertIn(RA.WORKING_AGAIN, self.mgr.get(req.id).message)
 
     def test_an_interrupted_action_is_never_followed_by_working_again(self):
         req = self.card()
@@ -770,9 +909,9 @@ class SeatRetryCopy(Base):
         [receipt] = self.run_pending(Run())
         self.assertEqual(receipt["outcome"], "failed")
         RA.verify_step(self.mgr, self.ws, CORE, blocked=False)
-        msg = self.mgr.get(req.id).message
-        self.assertIn(RA.CLEARED, msg)
-        self.assertNotIn(RA.WORKING_AGAIN, msg, "it claimed the interrupted action worked")
+        card = self.mgr.get(req.id)
+        self.assertNotIn(RA.WORKING_AGAIN, card.message, "it claimed the interrupted action worked")
+        self.assertIn("— Not done.", fallback_body(card))
 
 
 class MonitorStepsNeverFail(Base):
@@ -800,7 +939,7 @@ class MonitorStepsNeverFail(Base):
 
     def test_a_refused_turn_owed_after_an_action_is_returned_to_the_tick(self):
         req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED)
-        self.click(req, "switch_model:haiku")
+        self.click(req, sw(self.ws, "haiku"))
         with mock.patch.object(M, "send_keys", lambda *a: True), \
                 mock.patch.object(RA.subprocess, "run", Run()):
             self.assertEqual(M.recovery_step(self.mgr, self.ws, SOCK, CORE, "claude", None), RA.CONTINUE)
@@ -815,7 +954,7 @@ class OneSurfaceAtTheClose(Base):
     def test_a_card_that_said_it_is_working_again_owes_no_cleared_message(self):
         from hitl import renotify
         req = self.card()
-        self.click(req, "switch_model:haiku")
+        self.click(req, sw(self.ws, "haiku"))
         self.run_pending(Run())
         RA.verify_step(self.mgr, self.ws, CORE, blocked=False)
         M.resolve_escalations(self.mgr, CORE, "❯ \n", "claude", workspace=self.ws)
@@ -832,11 +971,353 @@ class OneSurfaceAtTheClose(Base):
         self.assertEqual(renotify.due(card, self.projection(card), time.time()), renotify.RECOVERY)
 
 
+class RoomBinding(Base):
+    def test_a_tap_from_another_room_runs_nothing(self):
+        req = self.card(kind="unknown", prompt=UNKNOWN)
+        self.assertEqual(self.click(req, "restart_core", room="!elsewhere:s.space"), "rejected")
+        run = Run()
+        self.assertEqual(self.run_pending(run), [])
+        self.assertEqual(run.calls, [], "the same card and id from another room executed")
+        self.assertEqual(self.click(req, "restart_core"), "applied", "from the room it was posted in it runs")
+
+    def test_a_card_never_posted_takes_no_tap(self):
+        req = self.card(kind="unknown", prompt=UNKNOWN)
+        self.handler.offer({"type": "message.created", "event_id": "$c", "actor_id": OWNER, "room_id": DM,
+                            "content": {REPLY_FIELD: self.payload(req, "restart_core")}})
+        self.assertEqual(self.handler.last_outcome, "rejected")
+
+
+class RuntimeAllowlist(Base):
+    """The executor's runtime check is the last word, and a card never offers what it refuses."""
+
+    def test_a_codex_card_offers_no_retry_and_a_forged_codex_retry_changes_nothing(self):
+        now = time.time()
+        core_limit_hold._write_hold(self.ws, {"status": "held", "kind": "usage-limit", "until": now + 3600,
+                                              "started_at": now - 60, "set_at": now - 60})
+        req = self.card(runtime="codex")
+        self.assertNotIn("retry_now", [a.id for a in req.actions], "Codex's host side has no retry")
+        with self.mgr.store.locked():
+            cur = self.mgr.get(req.id)
+            cur.actions = [tui_gate.recovery_action("retry_now")] + cur.actions
+            self.mgr.store.save(cur)
+        before = core_limit_hold.read_hold(self.ws)
+        self.click(self.mgr.get(req.id), "retry_now")
+        run = Run()
+        [receipt] = self.run_pending(run, now=now)
+        self.assertEqual((receipt["outcome"], run.calls, self.spawned.calls), ("refused", [], []))
+        self.assertIn("runtime carries out", receipt["reason"])
+        self.assertEqual(core_limit_hold.read_hold(self.ws), before, "the hold is untouched")
+
+    def test_a_codex_paused_card_offers_no_retry_or_model_switch(self):
+        now = time.time()
+        core_limit_hold._write_hold(self.ws, {"status": "held", "kind": "usage-limit", "until": now + 3600,
+                                              "started_at": now - 60, "set_at": now - 60})
+        ids = [a.id for a in RA.hold_card_step(self.mgr, self.ws, CORE, "codex").actions]
+        self.assertNotIn("retry_now", ids)
+        self.assertFalse([i for i in ids if i.startswith("switch_model:")])
+
+
+class NothingPrintedLeaks(Base):
+    """No subprocess output reaches the card, the receipt or the audit, on any path that runs one."""
+
+    AUDIT_KEYS = ["action_id", "at", "hitl_id", "outcome", "seat", "sender", "session"]
+
+    def stored(self, req, receipt):
+        return [json.dumps(receipt), self.mgr.get(req.id).message, json.dumps(self.mgr.get(req.id).subject),
+                (recovery.recovery_dir(self.ws) / RA.AUDIT_FILE).read_text()]
+
+    def test_restart_runtime_switch_and_a_seats_retry_copy_nothing_out(self):
+        cases = (("restart_core", None), ("switch_runtime:codex", None), ("retry_now", SEAT))
+        for aid, seat in cases:
+            with self.subTest(aid=aid):
+                self.tearDown()
+                self.setUp()
+                RA.shutil.which.return_value = "/usr/bin/codex"
+                now = time.time()
+                if seat:
+                    core_limit_hold._write_hold(self.ws, {"status": "held", "until": now + 600, "started_at": 1,
+                                                          "source": core_limit_hold.PANE_SOURCE}, SEAT_SESSION)
+                    req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED, seat=SEAT)
+                else:
+                    req = self.card(kind="unknown", prompt=UNKNOWN) if aid == "restart_core" else self.card()
+                self.assertIn(aid, [a.id for a in req.actions])
+                self.click(req, aid)
+                run = Run(rc=1, out=f"token={SECRET} /Users/someone/project")
+                target = RA.Target(self.ws, SOCK, SEAT_SESSION if seat else CORE, seat=seat,
+                                   retry_cmd=["python3", "pool_manage.py", "retry", "w"])
+                [receipt] = RA.run_pending(self.mgr, target, runner=run, now=now)
+                if not seat:  # the launcher's own output went to its log; its exit code is all that is kept
+                    self.answer(detached_action.FAILED, rc=1, reason="exit")
+                    RA.verify_step(self.mgr, self.ws, CORE, blocked=True, now=now + 1)
+                for text in self.stored(req, receipt):
+                    self.assertNotIn(SECRET, text)
+                    self.assertNotIn("/Users/someone", text)
+                [line] = self.audit()
+                self.assertEqual(sorted(line), self.AUDIT_KEYS, "the tap audit holds ids and outcomes only")
+
+
+class HandOffRechecks(Base):
+    """A hand-off file is re-checked against the card: its id, guard and chosen action must match."""
+
+    def test_a_rewritten_action_guard_or_unoffered_id_is_stale_or_refused_and_runs_nothing(self):
+        for field, value, outcome in (("guard", "limit:someone-else", "stale"),
+                                      ("action_id", "refresh_options", "stale"),
+                                      ("action_id", "switch_runtime:codex", "refused")):
+            with self.subTest(field=field, value=value):
+                self.tearDown()
+                self.setUp()
+                req = self.card(kind="unknown", prompt=UNKNOWN)
+                self.click(req, "restart_core")
+                [path] = list(recovery.actions_dir(self.ws).glob("*.json"))
+                path.write_text(json.dumps({**json.loads(path.read_text()), field: value}))
+                run = Run()
+                [receipt] = self.run_pending(run)
+                self.assertEqual((receipt["outcome"], run.calls, self.spawned.calls), (outcome, [], []))
+
+    def test_a_forged_hand_off_for_a_pending_card_runs_nothing(self):
+        req = self.card(kind="unknown", prompt=UNKNOWN)
+        recovery.write_action(self.ws, ActionReply(hitl_id=req.id, expected_revision=req.revision,
+                                                   action_id="restart_core", guard=req.guard), OWNER, DM)
+        run = Run()
+        [receipt] = self.run_pending(run)
+        self.assertEqual((receipt["outcome"], run.calls, self.spawned.calls), ("stale", [], []))
+
+
+class StaleTapAnswered(Base):
+    """A stale tap is answered on its card (receipt `stale`, a fresh revision); nothing runs."""
+
+    def project(self, sender):
+        from hitl.projector import project_pass
+        project_pass(self.mgr, sender, DM)
+
+    def sends(self, req, sender):
+        from hitl.projector import WIRE_FIELD
+        return [x for x in sender if x["extra_content"][WIRE_FIELD]["id"] == req.id]
+
+    def test_an_expired_tap_edits_its_card_once_with_a_stale_receipt_and_runs_nothing(self):
+        req = self.card(kind="unknown", prompt=UNKNOWN)
+        self.click(req, "restart_core")
+        sent = []
+        sender = lambda payload: sent.append(payload) or {"ok": True, "event_id": "$e"}  # noqa: E731
+        self.project(sender)
+        sent.clear()
+        [handoff] = list(recovery.actions_dir(self.ws).glob("*.json"))
+        run = Run()
+        [receipt] = self.run_pending(run, now=json.loads(handoff.read_text())["at"] + 601)
+        self.assertEqual((receipt["outcome"], run.calls, self.spawned.calls), ("stale", [], []))
+        self.project(sender)
+        from hitl.projector import WIRE_FIELD
+        [edit] = self.sends(req, sent)
+        self.assertEqual(edit["op"], "edit")
+        wire = edit["extra_content"][WIRE_FIELD]
+        self.assertEqual(wire["subject"]["receipt"]["outcome"], "stale")
+        self.assertGreater(wire["revision"], req.revision + 1, "a fresh revision past the tap's")
+
+    def test_a_replayed_hand_off_is_refused_by_the_gate(self):
+        req = self.card(kind="unknown", prompt=UNKNOWN)
+        self.click(req, "restart_core")
+        [path] = list(recovery.actions_dir(self.ws).glob("*.json"))
+        body = path.read_text()
+        self.run_pending(Run())
+        recovery.receipts_dir(self.ws).joinpath(f"{req.id}.json").unlink()  # even without its receipt
+        path.write_text(body)
+        before = self.mgr.get(req.id)
+        [receipt] = self.run_pending(Run())
+        self.assertEqual((receipt["outcome"], len(self.spawned.calls)), ("stale", 1), "run once, never twice")
+        self.assertIn("already acted on", receipt["reason"])
+        after = self.mgr.get(req.id)
+        self.assertEqual((after.revision, after.status, after.message), (before.revision, before.status, before.message),
+                         "the card stays the running tap's: a replay never answers over it")
+
+    def test_a_tap_on_an_old_revision_gets_a_stale_receipt_on_the_open_card(self):
+        req = self.card(kind="unknown", prompt=UNKNOWN)
+        old = self.payload(req, "restart_core")
+        with self.mgr.store.locked():
+            cur = self.mgr.get(req.id)
+            cur.refresh_guard(cur.guard)  # the screen moved on: a new revision of the same card
+            self.mgr.store.save(cur)
+        self.assertEqual(self.click(req, "restart_core", payload=old), "rejected")
+        card = self.mgr.get(req.id)
+        self.assertEqual((card.status, card.subject["receipt"]["outcome"]), ("pending", "stale"))
+        self.assertEqual(card.to_wire()["subject"]["receipt"]["outcome"], "stale")
+        self.assertFalse(list(recovery.actions_dir(self.ws).glob("*.json")) if recovery.actions_dir(self.ws).is_dir()
+                         else [], "nothing was handed to the executor")
+
+    def test_a_second_tap_while_the_first_runs_leaves_the_first_ones_outcome(self):
+        req = self.card(kind="unknown", prompt=UNKNOWN)
+        payload = self.payload(req, "restart_core")
+        self.click(req, "restart_core", payload=payload)
+        self.assertEqual(self.click(req, "restart_core", payload=payload), "rejected")
+        self.assertNotIn("receipt", self.mgr.get(req.id).subject, "the running tap's answer is not overwritten")
+
+    def test_a_forged_stale_hand_off_leaves_an_open_card_that_later_says_only_cleared(self):
+        req = self.card(kind="unknown", prompt=UNKNOWN)
+        recovery.write_action(self.ws, ActionReply(hitl_id=req.id, expected_revision=req.revision,
+                                                   action_id="restart_core", guard=req.guard), OWNER, DM)
+        [receipt] = self.run_pending(Run())
+        card = self.mgr.get(req.id)
+        self.assertEqual((receipt["outcome"], card.status, card.subject["receipt"]["outcome"]),
+                         ("stale", "pending", "stale"), "answered on the card, which stays usable")
+        self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=False), [req.id])
+        msg = self.mgr.get(req.id).message
+        self.assertIn(RA.CLEARED, msg)
+        self.assertNotIn(RA.WORKING_AGAIN, msg, "nothing ran, so nothing is claimed for it")
+
+    def test_a_stale_stamp_that_cannot_be_saved_never_breaks_the_rejection(self):
+        req = self.card(kind="unknown", prompt=UNKNOWN)
+        with mock.patch.object(self.mgr.store, "save", side_effect=OSError("disk")):
+            self.handler._stamp_stale(req.id)  # logged, never raised
+
+    def test_a_tap_held_in_a_backlog_counts_from_when_it_was_made(self):
+        req = self.card(kind="unknown", prompt=UNKNOWN)
+        self.post(req)
+        made = time.time() - 700
+        self.handler.offer({"type": "message.created", "event_id": "$c", "actor_id": OWNER, "room_id": DM,
+                            "origin_server_ts": int(made * 1000),
+                            "content": {REPLY_FIELD: self.payload(req, "restart_core")}})
+        [handoff] = list(recovery.actions_dir(self.ws).glob("*.json"))
+        self.assertEqual(json.loads(handoff.read_text())["tapped_at"], int(made))
+        [receipt] = self.run_pending(Run())
+        self.assertEqual((receipt["outcome"], self.spawned.calls), ("stale", []))
+
+    def test_the_event_time_is_read_only_from_a_sane_stamp(self):
+        for ev in ({}, {"origin_server_ts": "1"}, {"origin_server_ts": True}, {"origin_server_ts": -5},
+                   {"origin_server_ts": float("inf")}, None):
+            self.assertIsNone(recovery.event_time(ev))
+        self.assertEqual(RA.issued_at({"at": 10, "tapped_at": 4}), 4)
+        self.assertEqual(RA.issued_at({"at": 10}), 10)
+        self.assertIsNone(RA.issued_at({"at": True}))
+
+
+class ResumeReported(Base):
+    """The card's last word says whether the work that was waiting resumed, not only that the core is up."""
+
+    def waiting(self, name="task-1"):
+        (self.ws / "tasks" / f"{name}.txt").write_text("id: x\nsource: ag2space\ntask: hi\n")
+
+    def done_switch(self):
+        req = self.card()
+        self.click(req, sw(self.ws, "haiku"))
+        [receipt] = self.run_pending(Run())
+        self.assertEqual(receipt["outcome"], "done")
+        return req
+
+    def test_up_with_the_waiting_task_still_queued_stays_checking_then_says_it_did_not_start(self):
+        self.waiting()
+        req = self.done_switch()
+        self.assertEqual(self.mgr.get(req.id).subject["verify"]["waiting"], ["task-1"])
+        now = time.time()
+        self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=False, now=now + 5, state="idle"), [])
+        M.resolve_escalations(self.mgr, CORE, "❯ \n", "claude", workspace=self.ws)
+        self.assertFalse(self.mgr.get(req.id).terminal, "kept open while the resume is still being checked")
+        self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=False, now=now + RA.RESUME_S + 1,
+                                        state="idle"), [req.id])
+        card = self.mgr.get(req.id)
+        self.assertIn(RA.NOT_RESUMED, card.message)
+        self.assertNotIn(RA.WORKING_AGAIN, card.message)
+
+    def test_the_waiting_task_leaving_the_queue_is_the_resume(self):
+        self.waiting()
+        req = self.done_switch()
+        (self.ws / "tasks" / "task-1.txt").unlink()
+        self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=False, state="idle"), [req.id])
+        self.assertIn(RA.RESUMED, self.mgr.get(req.id).message)
+
+    def test_a_refused_turn_resumes_when_the_core_is_seen_running(self):
+        req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED)
+        self.click(req, sw(self.ws, "haiku"))
+        self.run_pending(Run())
+        self.assertTrue(self.mgr.get(req.id).subject["verify"]["turn"])
+        self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=False, state="idle"), [])
+        self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=False, state="running"), [req.id])
+        self.assertIn(RA.RESUMED, self.mgr.get(req.id).message)
+
+    def test_with_nothing_waiting_it_says_working_again(self):
+        req = self.done_switch()
+        self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=False, state="idle"), [req.id])
+        self.assertIn(RA.WORKING_AGAIN, self.mgr.get(req.id).message)
+
+    def test_a_detached_restart_stamps_done_when_it_answers_then_reports_the_resume(self):
+        self.waiting()
+        req = self.card(kind="unknown", prompt=UNKNOWN)
+        self.click(req, "restart_core")
+        self.run_pending(Run())
+        self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=False), [], "the restart has not answered")
+        self.answer(detached_action.DONE)
+        RA.verify_step(self.mgr, self.ws, CORE, blocked=False, state="idle")
+        card = self.mgr.get(req.id)
+        self.assertEqual(card.subject["receipt"]["outcome"], "done")
+        self.assertNotIn("seen", card.subject["verify"], "still checking that the waiting work starts")
+        RA.verify_step(self.mgr, self.ws, CORE, blocked=False, state="running")
+        self.assertIn(RA.RESUMED, self.mgr.get(req.id).message)
+
+    def test_an_unreadable_queue_is_no_evidence(self):
+        with mock.patch("task_queue.pending_files", side_effect=OSError("no")):
+            self.assertEqual(RA._resume_check(self.ws, self.card()), {"waiting": []})
+            self.assertFalse(RA._resumed(self.ws, {"waiting": ["t"]}, "idle"))
+        self.assertFalse(RA.verify_pending(mock.Mock(subject={"verify": {"outcome": "done", "at": "x"}}), 1.0))
+
+
+class StillBlockedThenRecovered(Base):
+    """A card that said "still blocked" is closed for a fresh one; when the block later lifts, the
+    fresh card carries the incident's one closing notice, so nothing is suppressed."""
+
+    def test_timeout_then_later_recovery_still_gets_its_notice(self):
+        from hitl import renotify
+        req = self.card()
+        self.click(req, sw(self.ws, "haiku"))
+        self.run_pending(Run())
+        RA.verify_step(self.mgr, self.ws, CORE, blocked=True, now=time.time() + RA.VERIFY_S + 1)
+        old = self.mgr.get(req.id)
+        self.assertTrue(old.terminal)
+        proj = {"event_id": "$card", "revision": old.revision, "notified_at": time.time() - 60}
+        self.assertIsNone(renotify.due(old, proj, time.time()), "the closed card owes nothing")
+        fresh = self.card(fresh=False)
+        self.assertNotEqual(fresh.id, req.id)
+        M.resolve_escalations(self.mgr, CORE, "❯ \n", "claude", workspace=self.ws)
+        closed = self.mgr.get(fresh.id)
+        self.assertEqual(closed.status, STATUS_RESOLVED)
+        proj = {"event_id": "$card2", "revision": closed.revision, "notified_at": time.time() - 60}
+        self.assertEqual(renotify.due(closed, proj, time.time()), renotify.RECOVERY,
+                         "the recovery after a still-blocked card is told once")
+
+
+class PausedCardWaitsForItsVerdict(Base):
+    def test_the_paused_card_stays_open_until_it_says_how_the_retry_ended(self):
+        now = time.time()
+        core_limit_hold._write_hold(self.ws, {"status": "held", "kind": "usage-limit", "model": "opus",
+                                              "until": now + 3600, "started_at": now - 60, "set_at": now - 60})
+        req = RA.hold_card_step(self.mgr, self.ws, CORE, "claude")
+        self.click(req, "retry_now")
+        [receipt] = self.run_pending(Run(), now=now)
+        self.assertEqual(receipt["outcome"], "done")
+        self.assertIsNone(RA.hold_card_step(self.mgr, self.ws, CORE, "claude"), "the hold was lifted")
+        self.assertFalse(self.mgr.get(req.id).terminal, "closed before the core was seen working")
+        RA.verify_step(self.mgr, self.ws, CORE, blocked=False, state="idle")
+        self.assertIn(RA.WORKING_AGAIN, self.mgr.get(req.id).message)
+        RA.hold_card_step(self.mgr, self.ws, CORE, "claude")
+        self.assertTrue(self.mgr.get(req.id).terminal)
+
+
+class WireReceipt(unittest.TestCase):
+    def test_only_a_known_outcome_and_its_time_leave_the_host(self):
+        from hitl.schema import HumanRequirement
+        base = dict(kind="core-blocked", runtime="claude", message="m", guard="g")
+        req = HumanRequirement(**base, subject={"receipt": {"outcome": "stale", "at": 5, "reason": "x"},
+                                                "verify": {"waiting": ["t"]}})
+        self.assertEqual(req.to_wire()["subject"], {"receipt": {"outcome": "stale", "at": 5}})
+        for receipt in ({"outcome": "maybe"}, "done", {"outcome": "done", "at": True}):
+            wire = HumanRequirement(**base, subject={"receipt": receipt}).to_wire()
+            self.assertEqual(wire.get("subject", {}).get("receipt", {}).get("at"), None)
+            if not (isinstance(receipt, dict) and receipt.get("outcome") == "done"):
+                self.assertNotIn("subject", wire)
+
+
 class Contract(Base):
     def test_action_fixture_is_a_recovery_click_and_its_hand_off_keeps_every_field(self):
         wire = json.loads((CONTRACTS / "action.json").read_text())[REPLY_FIELD]
         reply = ActionReply.from_wire(wire)
-        self.assertEqual(recovery.parse(reply.action_id), ("switch_model", "sonnet-5-1m-context"))
+        self.assertEqual(recovery.parse(reply.action_id), ("switch_model", "o4b876be2aaa6"))
         body = json.loads(recovery.write_action(self.ws, reply, OWNER, DM, now=1).read_text())
         self.assertEqual({k: body[k] for k in wire}, wire)
 
@@ -844,6 +1325,8 @@ class Contract(Base):
         fixture = json.loads((CONTRACTS / "receipt.json").read_text())
         req = self.card()
         self.click(req, fixture["action_id"])
+        [handoff] = list(recovery.actions_dir(self.ws).glob("*.json"))
+        handoff.write_text(json.dumps({**json.loads(handoff.read_text()), "at": fixture["at"] - 5}))  # tapped then
         [receipt] = self.run_pending(Run(), now=fixture["at"])
         self.assertEqual(receipt, {**fixture, "hitl_id": req.id, "incident": RA.incident_for(req)})
         self.assertEqual(recovery.read_receipt(self.ws, req.id), receipt)
