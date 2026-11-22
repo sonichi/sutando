@@ -26,11 +26,13 @@ persistent HTML. Keep synthetic personalization previews local until there is a 
 owner-only surface that also covers later reads. A client without the draft bridge can read the
 guide, but does not show inoperative messaging buttons.
 
-The publisher never replays an in-flight journal written before this privacy guard, and never
-rolls a page back to unverified previous HTML. The skipped journal and any remote page are left
-in place for authorized review. A normal publish can replace an unedited publisher-owned completed
-page with the generic guide; it cannot revoke content already seen, copied, cached or kept in
-history. Owner-edited or otherwise unverified pages are not purged.
+The publisher never replays a pre-fix target or rolls back to older HTML. A normal publish or refresh
+can migrate a listed legacy DM page at the same feature revision, or replace a legacy interrupted
+page from a state verified by its saved journal. It requires the acting agent’s ownership marker and
+an exact recorded content hash. The old page is only the match text for a single replacement; the
+new text is generic. Missing, edited, ambiguous, or oversized pages are reported and left as they
+are. Migration does not create or summon a page, upload media, or delete versions. It cannot
+revoke content already seen, copied, cached, or retained in history.
 
 The onboarding checklist uses per-viewer Commons progress when the runtime provides it, otherwise
 local storage or memory. Completion from the former install or pairing row counts for the
@@ -57,8 +59,8 @@ wraps on narrow screens, and reduced-motion and dark-mode preferences are respec
 - **Revisions and `--if-newer`.** The list carries a revision (`tutorial.YYYY-MM-DD.N`), which the
   page records in its ownership tag. `publish --all-rooms --if-newer` runs once per room with an entry, in the
   audience recorded for it, never creates a page (a deleted one stays deleted), and rebuilds a
-  page only when the list's revision is newer than the page's. A same-revision skip writes nothing:
-  it neither replays a journal nor retroactively removes older content.
+  page when the list's revision is newer or when a verified legacy page needs a privacy migration.
+  An up-to-date page already marked generic needs no room call.
 - **Owner edits are kept.** Before any rewrite the page's text is compared with the hash recorded
   when the skill last wrote it. A page edited since is kept, with or without `--if-newer` and
   whatever the revision (`"action": "kept"`, one stderr line), and its entry is not touched, so a

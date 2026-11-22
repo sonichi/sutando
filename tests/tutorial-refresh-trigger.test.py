@@ -212,22 +212,29 @@ class AllRoomsTest(_Rooms):
                          {r: ("unchanged", "marker") for r in ROOMS})
         self.assertEqual([json.loads(store(self.rooms_dir, r).read_text())["calls"] for r in ROOMS], [[], [], []])
 
-    def test_same_revision_legacy_page_is_not_rewritten_or_read_by_bulk_refresh(self):
+    def test_same_revision_legacy_page_migrates_once_by_bulk_refresh(self):
         self.seed(ROOMS[:1])
         self.refresh()
         marker = gs.marker_path(self.ws)
         rooms = gs.load_marker(marker)
-        rooms[ROOMS[0]].pop("privacy", None)
-        rooms[ROOMS[0]]["prompts"] = {"dm": "A fictional private draft."}
-        gs.save_marker(marker, rooms)
+        entry = rooms[ROOMS[0]]
+        entry.pop("privacy", None)
+        entry["prompts"] = {"dm": "A fictional private draft."}
         path = store(self.rooms_dir, ROOMS[0])
         db = json.loads(path.read_text())
+        old = tp.render_page("Fictional Agent", "codex", "dm", ME, private_setup=True)
+        entry["hash"] = gs.content_hash(old)
+        db["pages"][entry["kind"]] = old
         db["calls"] = []
         path.write_text(json.dumps(db))
+        gs.save_marker(marker, rooms)
+        code, out, _ = self.refresh()
+        self.assertEqual((code, json.loads(out)["rooms"][ROOMS[0]]["action"]), (0, "updated"))
+        self.assertNotIn("Fictional Agent", self.page(ROOMS[0]))
+        self.assertEqual(gs.load_marker(marker)[ROOMS[0]]["privacy"], gs.PUBLISH_PRIVACY)
         code, out, _ = self.refresh()
         self.assertEqual((code, json.loads(out)["rooms"][ROOMS[0]]["checked"]), (0, "marker"))
-        self.assertEqual(json.loads(path.read_text()), db)
-        self.assertEqual(gs.load_marker(marker), rooms)
+        self.assertEqual(sum(c[0] == "replace" for c in json.loads(path.read_text())["calls"]), 1)
 
     def test_each_page_is_rebuilt_in_the_audience_it_was_written_for(self):
         self.seed(ROOMS[:1], "--audience", "room")

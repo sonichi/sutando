@@ -47,7 +47,9 @@ not retry the page in the same turn.
    is required for the ownership marker (`--agent-mxid`, saved same-room routing, or the s.space
    connection); the publisher refuses to run without one. Legacy `--name`, `--prompts` and `--roles` options are ignored by `publish`;
    the offline renderer is for local previews. If an interrupted write predates the privacy
-   guard, it is not replayed. The publisher does not remove old room pages or versions.
+   guard, it is never replayed. When the current page matches a saved snapshot and its publisher
+   can be verified, publish replaces the current page with the generic guide. It does not remove
+   old room pages or versions.
 
    Before it writes the page, `publish` uploads the screenshots' full-resolution captures to the
    room's media (see "Screenshots are Commons asset references" below) and reports it in the result's
@@ -98,12 +100,12 @@ each room's entry.
 - The ownership tag also records the feature list's revision the page was built from
   (`data-revision="tutorial.2026-10-23.1"`). **Rebuild rule:** a page is rebuilt in place when the
   engine's list revision is newer than the page's. `publish --if-newer` applies exactly that rule
-  and nothing else: a complete page whose revision is current is left alone even when a rebuild
-  would differ, and a stale page is rewritten with generic content. A page from before lists had a
-  revision counts as stale; only a `pending` journal written by the generic publisher can be resumed. A page someone edited since it was last
-  written (its text no longer hashes to the entry) is kept, with or without `--if-newer`, and
-  whatever the revision: the result says `"action": "kept"`, stderr names the page, and the entry
-  stands (a gated `unchanged` or `kept` run records nothing; a page equal to the run's own render
+  plus privacy migration of verified legacy pages, even at the same list revision. A generic page
+  whose revision is current is left alone. A page from before lists had a revision counts as stale;
+  only a journal written by the generic publisher can be resumed as written. A page someone edited
+  since it was last written (its text no longer hashes to the entry) is kept, with or without `--if-newer`, and
+  whatever the revision: the result says `"action": "kept"` or reports a skipped migration, and
+  the entry stands (a gated `unchanged` or `kept` run records nothing; a page equal to the run's own render
   records its inputs, so a revision-only bump catches the entry up). A rewrite is journalled as
   `updating` before its first write: the target page, the page before it, the page after each
   call and the entry before it. The next run settles that journal before rendering anything: a page

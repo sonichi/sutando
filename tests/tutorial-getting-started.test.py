@@ -1504,13 +1504,84 @@ class PublishTest(unittest.TestCase):
         gs.save_marker(self.marker, rooms)
         with mock.patch.dict(os.environ, {"STUB_EDIT_AFTER": "replace:1:append"}):
             result = self.publish()
-        self.assertEqual(result["action"], "kept")
+        self.assertEqual((result["action"], result["reason"]), ("skipped", "owner edit detected during migration"))
         page = self.room()["pages"]["html-p1"]
         self.assertTrue(page.endswith("<p>OWNER NOTES</p>"))
         self.assertNotIn("Fictional Private Name", page)
         self.assertNotIn("A fictional private example.", page)
         self.assertEqual([c[0] for c in self.room()["calls"]].count("replace"), 1)
         self.assertFalse({"prompts", "roles"} & gs.load_marker(self.marker)[self.ROOM].keys())
+
+    def old_entry(self, live, **entry):
+        self.state.write_text(json.dumps({"pages": {"html-p1": live}, "calls": [], "next": 2}))
+        gs.save_marker(self.marker, {self.ROOM: {"kind": "html-p1", **entry}})
+
+    def legacy_dm(self):
+        return gs.render_page("Fictional Agent", "codex", agent=self.ME, roles="Designer",
+                              prompts={"dm": "A fictional private draft."}, private_setup=True)
+
+    def test_same_revision_legacy_page_migrates_without_upload_or_summon(self):
+        before = self.legacy_dm()
+        self.old_entry(before, state="complete", audience="dm", hash=gs.content_hash(before),
+                       revision=gs.tour_page.FEATURES.revision, roles="Designer")
+        result = self.publish(if_newer=True, owner="@chi:ag2.space", summon=True)
+        self.assertEqual((result["action"], result["migrated"], result["summoned"]), ("updated", True, False))
+        live = self.room()["pages"]["html-p1"]
+        self.assertNotIn("Fictional Agent", live)
+        self.assertNotIn("A fictional private draft.", live)
+        self.assertIn("sendToMyAgent", live)
+        self.assertEqual(sum(c[0] == "replace" for c in self.room()["calls"]), 1)
+        self.assertFalse(any(c[0] in ("append", "create", "summon") for c in self.room()["calls"]))
+        self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["privacy"], gs.PUBLISH_PRIVACY)
+        self.assertEqual(self.publish(if_newer=True)["action"], "unchanged")
+
+    def test_interrupted_pages_migrate_from_exact_known_snapshots_without_replaying(self):
+        target = self.legacy_dm()
+        for state in ("creating", "pending", "updating"):
+            with self.subTest(state=state):
+                before = gs.chunks(target, 900)[0]
+                journal = gs._journal({"state": state, "audience": "dm", "hash": gs.content_hash(target)},
+                                      before, target, None, "Fictional Agent", "codex", "dm", self.ME, mode="fill")
+                journal["state"] = state
+                if state == "creating":
+                    journal["operation_id"] = "fictional-old-create"
+                self.old_entry(before, **journal)
+                if state == "creating":
+                    saved = gs.load_marker(self.marker)
+                    saved[self.ROOM].pop("kind")
+                    gs.save_marker(self.marker, saved)
+                result = self.publish(if_newer=True)
+                self.assertEqual((result["action"], result["kind"]), ("updated", "html-p1"))
+                self.assertNotIn("Fictional Agent", self.room()["pages"]["html-p1"])
+                self.assertEqual(sum(c[0] == "replace" for c in self.room()["calls"]), 1)
+                self.assertFalse(any(c[0] in ("append", "create", "summon") for c in self.room()["calls"]))
+                self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["state"], "complete")
+
+    def test_legacy_page_with_owner_edit_or_wrong_publisher_is_not_changed(self):
+        before = self.legacy_dm()
+        for live, attributed in ((before + "\n<p>owner kept</p>", self.ME), (before, "@other:example.test")):
+            with self.subTest(attributed=attributed):
+                self.old_entry(live, state="complete", audience="dm", hash=gs.content_hash(before), agent=attributed)
+                marker = self.marker.read_bytes()
+                result = self.publish(if_newer=True)
+                self.assertEqual(result["action"], "skipped")
+                self.assertEqual(self.room()["pages"]["html-p1"], live)
+                self.assertEqual(self.marker.read_bytes(), marker)
+                self.assertFalse(any(c[0] in ("replace", "append", "create") for c in self.room()["calls"]))
+
+    def test_legacy_migration_resumes_its_generic_target_after_write_failure(self):
+        before = self.legacy_dm()
+        self.old_entry(before, state="complete", audience="dm", hash=gs.content_hash(before))
+        with mock.patch.dict(os.environ, {"STUB_FAIL": "replace"}):
+            with self.assertRaises(gs.PublishError):
+                self.publish(if_newer=True)
+        entry = gs.load_marker(self.marker)[self.ROOM]
+        self.assertTrue(entry["privacy_migration"])
+        self.assertNotIn("before", entry)
+        self.assertNotIn("Fictional Agent", json.dumps(entry))
+        result = self.publish(if_newer=True)
+        self.assertEqual((result["action"], result["summoned"]), ("resumed", False))
+        self.assertNotIn("Fictional Agent", self.room()["pages"]["html-p1"])
 
     def test_a_large_change_replaces_the_whole_page_by_its_first_piece_then_appends(self):
         self.publish()

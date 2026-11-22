@@ -58,9 +58,11 @@ class NativeGuideTest(unittest.TestCase):
                     old = {"state": state, "kind": "html-example", "operation_id": "example-op",
                            "target": self.page, "before": "", "hash": gs.content_hash(self.page)}
                     gs.save_marker(marker, {room: old})
-                    for result in (gs.recover(commons, marker), gs.publish(commons, marker, "Example Agent")):
+                    calls = ((gs.recover(commons, marker), "not replayed"),
+                             (gs.publish(commons, marker, "Example Agent"), "ownership not verified"))
+                    for result, reason in calls:
                         self.assertEqual((result["action"], result["summoned"]), ("skipped", False))
-                        self.assertIn("not replayed", result["reason"])
+                        self.assertIn(reason, result["reason"])
                     self.assertEqual(commons.mock_calls, [])
                     self.assertEqual(gs.load_marker(marker)[room], old)
 

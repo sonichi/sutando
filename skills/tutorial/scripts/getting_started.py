@@ -653,7 +653,7 @@ def _entry(kind: Optional[str], page: str, features: FeatureList,
 # What a journal (an `updating` rewrite, or a `creating`/`pending` create) carries beyond the
 # complete entry it becomes; `done` is the number of calls that ran, `mode` fill or rewrite.
 JOURNAL_KEYS = ("target", "before", "source", "steps", "done", "previous", "mode", "whole", "piece", "name", "core",
-                "agent", "rollback_safe")
+                "agent", "rollback_safe", "privacy_migration")
 
 
 def _steps(journal: dict) -> List[tuple]:
@@ -774,6 +774,8 @@ def _settle(commons: Commons, marker: Path, rooms: Dict[str, dict], room: str) -
     target (written here, call by call, when the page is where the journal left it), `untouched`
     when a rewrite never ran, `edited` when the page is in no state of the journal."""
     journal = rooms[room]
+    if journal.get("privacy_migration"):
+        return _advance_migration(commons, marker, rooms)
     kind, target, before = journal["kind"], journal.get("target"), journal.get("before")
     if not isinstance(target, str) or content_hash(target) != journal.get("hash") \
             or not isinstance(before, str) or content_hash(before) != journal.get("source"):
@@ -791,7 +793,8 @@ def _settle(commons: Commons, marker: Path, rooms: Dict[str, dict], room: str) -
     return _advance(commons, marker, rooms, room)
 
 
-def _recover(commons: Commons, marker: Path, rooms: Dict[str, dict], owner: Optional[str]) -> Optional[dict]:
+def _recover(commons: Commons, marker: Path, rooms: Dict[str, dict], owner: Optional[str],
+             *, defer_legacy: bool = False) -> Optional[dict]:
     """Settle this room's journal, if any, from the journal, the room and the identity alone, before
     anything of a run's own request is read or rendered. The result of a run that settled one, or
     None when there is nothing to settle (a journal whose page is gone is dropped)."""
@@ -799,6 +802,8 @@ def _recover(commons: Commons, marker: Path, rooms: Dict[str, dict], owner: Opti
     if journal.get("state") not in ("updating", "pending", "creating"):
         return None
     if journal.get("privacy") != PUBLISH_PRIVACY or "target" not in journal:
+        if defer_legacy and journal.get("privacy") != PUBLISH_PRIVACY:
+            return None
         return {"ok": True, "action": "skipped", "kind": journal.get("kind"), "summoned": False,
                 "reason": "saved tutorial write predates the privacy guard; not replayed"}
     pages = commons.listed_pages()
@@ -810,6 +815,9 @@ def _recover(commons: Commons, marker: Path, rooms: Dict[str, dict], owner: Opti
         journal = {**journal, "kind": found, "state": "pending"}
         _record(marker, rooms, commons.room, journal)
     elif journal["kind"] not in [p.get("kind") for p in pages]:
+        if journal.get("privacy_migration"):
+            return {"ok": True, "action": "skipped", "kind": journal["kind"], "summoned": False,
+                    "reason": "migration page no longer listed"}
         if journal.get("previous"):
             _restore(marker, rooms, commons.room, journal["previous"])
         else:
@@ -840,11 +848,109 @@ def _recover(commons: Commons, marker: Path, rooms: Dict[str, dict], owner: Opti
     return result
 
 
-def recover(commons: Commons, marker: Path, owner: Optional[str] = None) -> Optional[dict]:
+def recover(commons: Commons, marker: Path, owner: Optional[str] = None,
+            *, defer_legacy: bool = False) -> Optional[dict]:
     """`publish`'s first step on its own: finish or stand aside from a run cut short in this room.
     Needs nothing of a request but the room and the owner to summon."""
     with _locked(marker):
-        return _recover(commons, marker, load_marker(marker), owner)
+        return _recover(commons, marker, load_marker(marker), owner, defer_legacy=defer_legacy)
+
+
+def _needs_privacy_migration(entry: dict) -> bool:
+    if entry.get("privacy") == PUBLISH_PRIVACY:
+        return False
+    state = entry.get("state")
+    return state in ("creating", "pending", "updating") or (
+        bool(entry) and not entry.get("foreign") and state in (None, "complete")
+        and entry.get("audience") != "room")
+
+
+def _legacy_hashes(entry: dict) -> set:
+    if entry.get("state") not in ("creating", "pending", "updating"):
+        return {entry.get("hash")} if isinstance(entry.get("hash"), str) else set()
+    before, target, listed = entry.get("before"), entry.get("target"), entry.get("steps")
+    if (not isinstance(before, str) or content_hash(before) != entry.get("source")
+            or not isinstance(target, str) or content_hash(target) != entry.get("hash")
+            or not isinstance(listed, list) or not all(isinstance(h, str) for h in listed)):
+        return set()
+    try:
+        calculated = [content_hash(text) for _, _, text in _steps(entry)]
+    except (TypeError, ValueError):
+        return set()
+    return {entry["source"], *listed} if listed == calculated else set()
+
+
+def _advance_migration(commons: Commons, marker: Path, rooms: Dict[str, dict]) -> str:
+    room = commons.room
+    journal = rooms[room]
+    kind, target = journal["kind"], journal["target"]
+    if not isinstance(target, str) or content_hash(target) != journal.get("hash"):
+        raise PublishError("legacy migration target failed verification")
+    try:
+        current = commons.read(kind)
+        if current != target and content_hash(current) == journal["source"]:
+            if not one_call(current, target, commons.env):
+                raise PublishError("legacy migration no longer fits one call")
+            try:
+                commons.run("replace", room, current, target, kind=kind)
+            except PublishError:
+                current = commons.read(kind)
+                if content_hash(current) == journal["source"]:
+                    raise
+            else:
+                current = commons.read(kind)
+    except PublishError:
+        raise PublishError("legacy migration could not finish; its generic target stays recorded") from None
+    if current != target:
+        _stand_aside(marker, rooms, room, journal, content_hash(current))
+        return "edited"
+    _record(marker, rooms, room, _complete(journal))
+    return "finished"
+
+
+def _migrate_legacy(commons: Commons, marker: Path, rooms: Dict[str, dict], entry: dict,
+                    audience: Optional[str], core: str, agent: Optional[str], features: FeatureList) -> dict:
+    """Use old bytes only as an exact-match preimage, never a write target."""
+    room, kind = commons.room, entry.get("kind")
+
+    def skipped(reason: str) -> dict:
+        return {"ok": True, "action": "skipped", "kind": kind, "summoned": False, "reason": reason}
+
+    if not audience:
+        return skipped("audience unknown")
+    hashes = _legacy_hashes(entry)
+    if not agent or not hashes or entry.get("foreign") or (entry.get("agent") or agent) != agent:
+        return skipped("publisher ownership not verified")
+    found = []
+    for row in candidates(commons.listed_pages()):
+        if kind is not None and row["kind"] != kind:
+            continue
+        current = commons.read(row["kind"])
+        if content_hash(current) in hashes and owned(row, current, agent):
+            found.append((row["kind"], current))
+    if len(found) != 1:
+        return skipped("legacy page missing, edited or ambiguous")
+    kind, current = found[0]
+    tag = read_marker(current)
+    if tag and tag[1] and newer(tag[1], features.revision):
+        return skipped("legacy page uses a newer guide version")
+    native_dm = audience == "dm"
+    recorded = clean_media(entry.get("media"), features)
+    page = render_page(GENERIC_NAME, core, audience, agent, features=features, media=recorded, native_dm=native_dm)
+    complete = _entry(kind, page, features, recorded, audience, native_dm)
+    if current == page:
+        _record(marker, rooms, room, complete)
+        return {"ok": True, "action": "unchanged", "kind": kind, "summoned": False, "migrated": True}
+    if not one_call(current, page, commons.env):
+        return skipped("legacy page exceeds a single exact replacement")
+    journal = {**complete, "state": "updating", "privacy_migration": True,
+               "source": content_hash(current), "target": page, "name": GENERIC_NAME,
+               "core": core, "agent": agent}
+    _record(marker, rooms, room, journal)
+    if _advance_migration(commons, marker, rooms) != "finished":
+        return skipped("owner edit detected during migration")
+    return {"ok": True, "action": "updated", "kind": kind, "summoned": False, "migrated": True,
+            "revision": features.revision, "media": sorted(recorded)}
 
 
 def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = None,
@@ -861,10 +967,15 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
     name = GENERIC_NAME
     with _locked(marker):
         rooms = load_marker(marker)
-        settled = _recover(commons, marker, rooms, owner)
+        settled = _recover(commons, marker, rooms, owner, defer_legacy=True)
         if settled:
             return settled
         known = rooms.get(commons.room, {})
+        if _needs_privacy_migration(known):
+            saved_audience = known.get("audience")
+            migration_audience = (saved_audience if saved_audience in AUDIENCES else
+                                  "dm" if commons.room == dm_room else audience)
+            return _migrate_legacy(commons, marker, rooms, known, migration_audience, core, agent, features)
 
         def skipped(reason: str) -> dict:
             return {"ok": True, "action": "skipped", "reason": reason, "kind": known.get("kind"),
@@ -1105,8 +1216,8 @@ def publish_all_rooms(args: argparse.Namespace, raw: List[str]) -> int:
     features, _ = resolve_list(args.feature_list, lambda s: print(s, file=sys.stderr))
     results, worst = {}, 0
     for room, entry in sorted(load_marker(marker_path(_workspace())).items()):
-        if entry.get("state") == "complete" and entry.get("revision") and not newer(features.revision,
-                                                                                     entry["revision"]):
+        if (not _needs_privacy_migration(entry) and entry.get("state") == "complete"
+                and entry.get("revision") and not newer(features.revision, entry["revision"])):
             # Current by its record: nothing a run could write, so no room call is made.
             results[room] = {"code": 0, "ok": True, "action": "unchanged", "kind": entry.get("kind"),
                              "revision": features.revision, "checked": "marker"}
@@ -1233,7 +1344,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         # A run cut short in this room is settled first, before this run's name, list, prompts or
         # media are even looked at; settling it is then this run's whole work.
-        result = recover(commons, marker, args.owner)
+        result = recover(commons, marker, args.owner, defer_legacy=True)
     except (PublishError, ValueError) as exc:
         print(json.dumps({"ok": False, "reason": redact(str(exc), env)}))
         return 4
