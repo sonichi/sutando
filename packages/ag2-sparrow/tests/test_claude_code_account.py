@@ -133,6 +133,15 @@ class SignIn(Base):
                 with self.assertRaises(account.Refused) as refused:
                     account.sign_in(dict(self.cfg, CLAUDE_CONFIG_DIR=str(own)), self.env)
                 self.assertEqual(str(refused.exception), account.PERSONAL, own)
+            # The Sutando core's dir, in whichever workspace, reached directly or through a link.
+            core = self.tmp / "workspace" / ".claude-sutando"
+            core.mkdir(parents=True)
+            to_core = self.tmp / "agent-dir"
+            to_core.symlink_to(core)
+            for own in (core, to_core):
+                with self.assertRaises(account.Refused) as refused:
+                    account.start(dict(self.cfg, CLAUDE_CONFIG_DIR=str(own)), self.env, self.tmp / "w")
+                self.assertEqual(str(refused.exception), account.CORES, own)
             for call in (lambda: account.sign_in(self.cfg, self.env, others=["", str(self.dir) + "/"]),
                          lambda: account.start(self.cfg, self.env, self.tmp / "w", others=[str(self.dir)])):
                 with self.assertRaises(account.Refused) as refused:
@@ -231,6 +240,27 @@ class TwoSteps(Base):
             time.sleep(0.1)
         self.assertEqual(account.born(pids["claude"][0]), "", "the orphaned sign-in was ended")
 
+    def test_start_gives_no_link_before_the_sign_ins_processes_are_on_record(self):
+        """A cancel right after `start` must find the sign-in to end it, so a link alone is not enough."""
+        def link_only(argv, **kw):
+            (self.wait / "out.log").write_text("visit:\nhttps://claude.ai/oauth/authorize?abc\n")
+        with self.assertRaises(account.Refused) as refused:
+            account.start(self.cfg, self.env, self.wait, popen=link_only, wait_s=0.6)
+        self.assertIn("gave no link", str(refused.exception))
+        self.assertFalse(self.wait.exists())
+
+    def test_a_sign_in_at_this_computer_ends_one_that_was_waiting(self):
+        account.start(self.cfg, self.env, self.wait)
+        pids = json.loads((self.wait / "pids.json").read_text())
+        (self.dir / "stub-wants-code").unlink()
+        self.assertEqual(account.sign_in(self.cfg, self.env, state_dir=self.wait), (True, ""))
+        self.assertFalse(self.wait.exists())
+        for _ in range(50):
+            if not account.born(pids["claude"][0]):
+                break
+            time.sleep(0.1)
+        self.assertEqual(account.born(pids["claude"][0]), "")
+
     def test_two_starts_at_once_leave_one_whole_sign_in(self):
         import threading
         got = []
@@ -278,14 +308,13 @@ class TwoSteps(Base):
 
 
 class OwnerOnly(Base):
-    """Who may start or finish a sign-in: a terminal, the app once per nonce, or the agent while every
-    task its session holds is its owner's own."""
+    """Who may start or finish a sign-in: a person at a terminal, or the agent while every task its
+    session holds is its owner's own."""
 
-    def refused(self, turns=None, tty=False, from_app=False, boom=False):
-        args = types.SimpleNamespace(from_app=from_app)
+    def refused(self, turns=None, tty=False, boom=False):
+        args = types.SimpleNamespace()
         held = mock.Mock(side_effect=OSError("claims unreadable")) if boom else mock.Mock(return_value=turns or [])
         with mock.patch.object(cli.sys, "stdin", mock.Mock(isatty=lambda: tty)), \
-                mock.patch.object(cli, "config_dir", return_value=self.tmp), \
                 mock.patch.object(cli.cm, "work_root", return_value=str(self.tmp)), \
                 mock.patch.object(cli.inbox, "open_turns", held):
             return cli.sign_in_refused(self.cfg, cli.LOCAL, args)
@@ -298,26 +327,6 @@ class OwnerOnly(Base):
                       [("owner", False), ("team", True)], [("owner", False), ("guest", False)]):
             self.assertEqual(self.refused(turns), cli.NOT_OWNERS_TURN, turns)
         self.assertEqual(self.refused(boom=True), cli.NOT_OWNERS_TURN)
-
-    def test_the_apps_nonce_lets_one_run_through_and_only_a_fresh_private_one(self):
-        nonce = self.tmp / cli.APP_NONCE
-        self.assertEqual(self.refused(from_app=True), cli.NOT_OWNERS_TURN, "no nonce")
-
-        def write(mode=0o600, age=0.0):
-            nonce.write_text("x")
-            nonce.chmod(mode)
-            os.utime(nonce, (time.time() - age, time.time() - age))
-        write()
-        self.assertEqual((self.refused(from_app=True), nonce.exists()), ("", False))
-        self.assertEqual(self.refused(from_app=True), cli.NOT_OWNERS_TURN, "used once")
-        for kw in ({"mode": 0o644}, {"age": 120.0}):
-            write(**kw)
-            self.assertEqual((self.refused(from_app=True), nonce.exists()), (cli.NOT_OWNERS_TURN, False), kw)
-        nonce.symlink_to(self.dir)
-        self.assertEqual((self.refused(from_app=True), nonce.is_symlink(), self.dir.exists()), (cli.NOT_OWNERS_TURN, False, True))
-        # The nonce is the app's way in only: without the flag an owner's open task is still what counts.
-        write()
-        self.assertEqual((self.refused([("team", True)]), nonce.exists()), (cli.NOT_OWNERS_TURN, True))
 
     def test_open_turns_are_read_from_the_claims_and_a_claim_past_its_answer_does_not_count(self):
         root = self.tmp / "root"
@@ -365,8 +374,9 @@ class OwnerOnly(Base):
             rc, out = cmd.run_("--start", env=unknown)
             self.assertEqual((rc, out["detail"]), (1, cli.NO_ROUTE))
             self.assertEqual(cmd.run_(env=unknown)[0], 0)
-        self.assertNotIn("in this DM", cli.START_SAY)
+        self.assertTrue(cli.START_SAY.startswith("[dm-only]\n"), "the link is for the owner's DM alone")
         self.assertIn("never in a room with other people", cli.START_SAY)
+        self.assertNotIn("from-app", cli.NOT_OWNERS_TURN)
 
 
 class Command(Base):
@@ -416,12 +426,24 @@ class Command(Base):
         """The command's caller (the app, a terminal) may not have the variable the session was started with."""
         answers = iter([types.SimpleNamespace(returncode=0, stdout="ANTHROPIC_BASE_URL=http://localhost:7846\n"),
                         types.SimpleNamespace(returncode=0, stdout="-ANTHROPIC_BASE_URL\n"),
-                        types.SimpleNamespace(returncode=1, stdout=""), types.SimpleNamespace(returncode=1, stdout="")])
+                        types.SimpleNamespace(returncode=1, stdout="", stderr="unknown variable: ANTHROPIC_BASE_URL\n"),
+                        types.SimpleNamespace(returncode=1, stdout="", stderr="no server running on /x\n")])
         with mock.patch.object(cli, "child_env", side_effect=lambda cfg: dict(self.env)), \
                 mock.patch.object(cli.launcher, "configured_tmux", return_value=("/tmux", "")), \
                 mock.patch.object(cli.launcher.Tmux, "run", side_effect=lambda *a, **k: next(answers)) as asked:
             got = [cli.account_env(self.cfg, cli.LOCAL).get("ANTHROPIC_BASE_URL") for _ in range(4)]
         self.assertEqual(got, ["http://localhost:7846", None, None, None])
+        # Only an answer counts as "no proxy": a session that cannot be reached, a failure tmux does not
+        # explain and a tmux that did not run are all unknown.
+        for answer, unknown in ((types.SimpleNamespace(returncode=1, stdout="", stderr="unknown variable: X\n"), False),
+                                (types.SimpleNamespace(returncode=0, stdout="-ANTHROPIC_BASE_URL\n", stderr=""), False),
+                                (types.SimpleNamespace(returncode=1, stdout="", stderr="no server running on /x\n"), True),
+                                (types.SimpleNamespace(returncode=1, stdout="", stderr=""), True),
+                                (types.SimpleNamespace(returncode=0, stdout="", stderr=""), True), (None, True)):
+            with mock.patch.object(cli, "child_env", side_effect=lambda cfg: dict(self.env)), \
+                    mock.patch.object(cli.launcher, "configured_tmux", return_value=("/tmux", "")), \
+                    mock.patch.object(cli.launcher.Tmux, "run", return_value=answer):
+                self.assertEqual(cli.ROUTE_UNKNOWN in cli.account_env(self.cfg, cli.LOCAL), unknown, answer)
         self.assertEqual(asked.call_args.args, ("show-environment", "-g", "ANTHROPIC_BASE_URL"))
         with mock.patch.object(cli, "child_env", return_value={"ANTHROPIC_BASE_URL": "http://own"}), \
                 mock.patch.object(cli.launcher, "configured_tmux", return_value=("", "no tmux")):
