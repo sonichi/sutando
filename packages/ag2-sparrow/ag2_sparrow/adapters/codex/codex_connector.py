@@ -267,12 +267,11 @@ class Connector:
         return True
 
     def turn_model(self, caps):
-        """The model a turn runs on: on the kept threads the owner's pick, or the one a told pick left in use;
+        """The model a turn runs on: on the kept threads the owner's pick, or the last pick of theirs that took;
         else --model (None: Codex's own)."""
         if not (caps.session == "durable" and getattr(self.args, "state", None)):
             return self.args.model
-        state = self.models.state()
-        kept = str(state.get("current") or "") if state.get("told") else ""
+        kept = str(self.models.state().get("confirmed") or "")
         return self.models.wanted() or (kept if self.models.ok(kept) else None) or self.args.model
 
     def card_task(self, task_id, headers, path, result_path):
@@ -285,12 +284,14 @@ class Connector:
 
     def tell_model(self, status, caps) -> str:
         """After a turn on a kept thread: tell the owner once whether their pick took. Codex names no model
-        per turn, so a completed turn ran on the pick unless Codex said it moved the turn; a failed one did not."""
+        per turn, so a completed turn ran on the pick unless Codex said it moved the turn; a failed one did not.
+        A moved turn's model is Codex's choice, not the owner's: the model in use stays the one before."""
         if caps.session != "durable" or status not in ("completed", "failed"):
             return ""
         wanted = self.models.wanted()
         before = str(self.models.state().get("current") or "")
-        ran = (self.rerouted or wanted) if status == "completed" else (before if before != wanted else "")
+        took = status == "completed" and not (self.rerouted and self.rerouted != wanted)
+        ran = wanted if took else (before if before != wanted else "")
         return self.models.tell(True, ran)
 
     def handle_server_request(self, m):
@@ -609,6 +610,7 @@ class Connector:
             out = self.result_body(status, text, err)
             # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
             told = self.tell_model(status, policy.capabilities)
+            out = "\n\n".join(x for x in (out.rstrip("\n"), quoted(self.models.unsaid()).strip()) if x)
             asked = self.desk.marked(headers["access_tier"], path, status, text, result_path)
             t_result = os.stat(result_path).st_mtime if asked else write_atomic(result_path, out.rstrip("\n") + "\n")
             record_done(done_path, task_id)
