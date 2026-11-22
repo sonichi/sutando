@@ -1,7 +1,9 @@
 #!/bin/bash
-# The Codex worker launcher's SUTANDO_CODEX_APP_SERVER switch. Unset, the launcher issues the tmux
-# calls and creates the sessions of the launcher without the switch (its marked blocks removed).
-# Set, the worker's session holds the app-server seat: no observer session, no notifier supervisor.
+# The Codex worker launcher's SUTANDO_CODEX_APP_SERVER switch. Off (0, or unset with the core's
+# choice unreadable or off), the launcher issues the tmux calls and creates the sessions of the
+# launcher without the switch (its marked blocks removed). On (1, or unset with the choice on, the
+# default), the worker's session holds the app-server seat: no observer session, no notifier supervisor.
+# The choice comes from the stub `sutando-config.sh codex-app-server`, which prints $STUB_CHOICE.
 # tmux, codex, node and the helper scripts are stubs, as in launch-codex-worker-session-failopen.test.sh.
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -26,7 +28,7 @@ cp "$REPO/src/agent/codex/app-server/codex-seat" "$REPO/src/agent/codex/app-serv
 ln -s "$REPO/src/agent/codex/app-server/seat.py" "$SEAT/seat.py"
 touch "$FAKE/src/__init__.py"
 printf '{"workspace":{"path":"%s/ws"},"core_config_dirs":[{"id":"x","type":"codex","env_name":"CODEX_HOME","synced":false,"value":"%s/codex"}]}\n' "$TMP" "$TMP" > "$FAKE/sutando.config.json"
-printf '#!/bin/bash\necho ""\n' > "$FAKE/scripts/sutando-config.sh"
+printf '#!/bin/bash\n[ "$1" = codex-app-server ] && printf %%s "${STUB_CHOICE:-}"\nexit 0\n' > "$FAKE/scripts/sutando-config.sh"
 printf 'require_python() { printf "%%s\\n" "$SUTANDO_PY"; }\nresolve_python() { printf "%%s\\n" "$SUTANDO_PY"; }\n' > "$FAKE/scripts/python-binary.sh"
 printf '// stub observer\n' > "$FAKE/src/agent/codex/cli/codex-observer.mjs"
 # The per-seat MCP composer: two overrides, one per line pair, as the real one prints them.
@@ -91,8 +93,10 @@ calls_before="$(cat "$TMP/tmux.log")"; sessions_before="$(sessions)"
 check "$rc_before" "without the switch: the launcher exits 0"
 grep -q "new-session -d -s $SESSION .* codex -C .* --search .* -c mcp_servers.s-space.enabled=true You are Sutando worker" <<< "$calls_before"
 check $? "without the switch: the worker session is the Codex TUI"
-for setting in "" "SUTANDO_CODEX_APP_SERVER=" "SUTANDO_CODEX_APP_SERVER=0"; do
-  launch launch-codex-worker-session.sh ${setting:+"$setting"}; rc=$?
+for setting in "" "SUTANDO_CODEX_APP_SERVER=" "SUTANDO_CODEX_APP_SERVER=0" "STUB_CHOICE=0" \
+               "SUTANDO_CODEX_APP_SERVER=0 STUB_CHOICE=1"; do
+  # shellcheck disable=SC2086 # one or two NAME=value words
+  launch launch-codex-worker-session.sh $setting; rc=$?
   label="${setting:-unset}"
   [ "$rc" = "$rc_before" ]; check $? "$label: the same exit code"
   [ "$(cat "$TMP/tmux.log")" = "$calls_before" ]; check $? "$label: the same tmux calls, in the same order"
@@ -168,6 +172,17 @@ rm -f "$TMP/sessions/$SESSION-watcher"
 supervise supervisor-before.sh TMUX_STUB_SEAT_ENV=1
 [ "$real_calls" = "$(cat "$TMP/tmux.log")" ] && grep -q "new-session -d -s $SESSION-watcher " <<< "$real_calls"
 check $? "supervisor, no declaration: the same tmux calls as the supervisor without the switch"
+
+# --- the core's persisted choice, on (the default), with no variable: the worker is a seat too ---
+for setting in "STUB_CHOICE=1" "SUTANDO_CODEX_APP_SERVER= STUB_CHOICE=1"; do
+  # shellcheck disable=SC2086
+  launch launch-codex-worker-session.sh $setting; rc=$?
+  check "$rc" "$setting: the launcher exits 0"
+  [ "$(sessions)" = "$SESSION " ] && [ ! -f "$TMP/supervisor-ran" ] && [ -e "$DECL" ]
+  check $? "$setting: the worker is a seat (declaration written, no observer, no notifier)"
+  grep -q -- "new-session -d -s $SESSION .*-e SUTANDO_CODEX_APP_SERVER=1 .*$SEAT/codex-seat --host $DECL " "$TMP/tmux.log"
+  check $? "$setting: its session runs the seat"
+done
 
 echo "---"
 if [ "$fail" -gt 0 ]; then echo "FAILED — $fail of $((pass+fail)) checks"; exit 1; fi

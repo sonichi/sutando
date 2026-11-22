@@ -555,11 +555,14 @@ ensure_local_agent_api() {
 ensure_local_agent_api
 
 # >>> codex-app-server-seat
-# The persisted choice (the app's toggle, or `sutando-config.sh codex-app-server-select`) when
-# SUTANDO_CODEX_APP_SERVER is not set for this launch; a set value overrides it.
-if [ -z "${SUTANDO_CODEX_APP_SERVER:-}" ] \
-   && [ "$(bash "$REPO/scripts/sutando-config.sh" codex-app-server 2>/dev/null)" = 1 ]; then
-  export SUTANDO_CODEX_APP_SERVER=1
+# Unset for this launch, the persisted choice decides: on by default, off when the app's toggle,
+# `sutando-config.sh codex-app-server-select off` or core.codex_app_server=false says so. A set
+# value overrides it. Without tmux, or when the choice cannot be read, the TUI runs as before.
+if [ -z "${SUTANDO_CODEX_APP_SERVER:-}" ]; then
+  if tmux_available && [ "$(bash "$REPO/scripts/sutando-config.sh" codex-app-server 2>/dev/null)" = 1 ]; then
+    # Not exported: the seat gets it with -e, and a tmux server started here must not keep it.
+    SUTANDO_CODEX_APP_SERVER=1
+  fi
 fi
 # A core last started as an app-server seat (its declaration exists): --restart replaces that
 # window too, whichever way SUTANDO_CODEX_APP_SERVER is set now.

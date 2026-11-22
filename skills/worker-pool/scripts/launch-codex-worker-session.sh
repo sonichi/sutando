@@ -119,10 +119,14 @@ else
   exit 1
 fi
 # >>> codex-app-server-seat
-# Unset for this launch, the persisted choice decides (scripts/sutando-config.sh codex-app-server).
-if [ -z "${SUTANDO_CODEX_APP_SERVER:-}" ] \
-   && [ "$(bash "$REPO/scripts/sutando-config.sh" codex-app-server 2>/dev/null)" = 1 ]; then
-  export SUTANDO_CODEX_APP_SERVER=1
+# Unset for this launch, the core's persisted choice decides, through the same resolver
+# (scripts/sutando-config.sh codex-app-server): on by default, off when set off. When it cannot be
+# read the worker is a TUI, as before.
+if [ -z "${SUTANDO_CODEX_APP_SERVER:-}" ]; then
+  if [ "$(bash "$REPO/scripts/sutando-config.sh" codex-app-server 2>/dev/null)" = 1 ]; then
+    # Not exported: the seat gets it with -e, and a tmux server started here must not keep it.
+    SUTANDO_CODEX_APP_SERVER=1
+  fi
 fi
 # SUTANDO_CODEX_APP_SERVER=1: the worker is a seat on `codex app-server` in the same session name,
 # with no observer and no notifier session; it takes its deliveries itself. Unset: as before.

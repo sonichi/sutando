@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The persisted Codex app-server choice: resolve_codex_app_server's order (env, the desktop's
-runtime.json, core.codex_app_server), persist_codex_app_server's two homes, and the
+runtime.json, core.codex_app_server, then on by default), persist_codex_app_server's two homes, and the
 `sutando-config.sh codex-app-server[-select]` subcommands."""
 import json
 import os
@@ -47,10 +47,12 @@ class Base(unittest.TestCase):
 
 
 class Resolve(Base):
-    def test_off_by_default(self):
-        self.assertFalse(self.resolve())
+    def test_on_by_default(self):
+        self.assertTrue(self.resolve())
 
-    def test_the_workspace_layer_turns_it_on(self):
+    def test_the_workspace_layer_turns_it_off_and_on(self):
+        self.layer({"core": {"codex_app_server": False}})
+        self.assertFalse(self.resolve())
         self.layer({"core": {"codex_app_server": True}})
         self.assertTrue(self.resolve())
 
@@ -59,18 +61,19 @@ class Resolve(Base):
         self.runtime_json.write_text(json.dumps({"coreRuntime": "codex", "codexAppServer": False}))
         self.assertFalse(self.resolve())
         self.runtime_json.write_text(json.dumps({"codexAppServer": True}))
-        self.layer({})
+        self.layer({"core": {"codex_app_server": False}})
         self.assertTrue(self.resolve())
 
     def test_a_non_boolean_or_unreadable_desktop_value_is_skipped(self):
-        self.layer({"core": {"codex_app_server": True}})
-        for body in ('{"codexAppServer": "yes"}', '{"codexAppServer": 1}', "not json", "[]"):
+        self.layer({"core": {"codex_app_server": False}})
+        for body in ('{"codexAppServer": "yes"}', '{"codexAppServer": 0}', "not json", "[]"):
             self.runtime_json.write_text(body)
-            self.assertTrue(self.resolve(), body)
+            self.assertFalse(self.resolve(), body)
 
-    def test_a_non_boolean_config_value_is_off(self):
-        self.layer({"core": {"codex_app_server": "true"}})
-        self.assertFalse(self.resolve())
+    def test_a_non_boolean_config_value_keeps_the_default(self):
+        self.layer({"core": {"codex_app_server": "false"}})
+        with patch("sys.stderr"):
+            self.assertTrue(self.resolve())
 
     def test_a_set_env_overrides_both(self):
         self.runtime_json.write_text(json.dumps({"codexAppServer": True}))
@@ -81,9 +84,9 @@ class Resolve(Base):
         self.assertTrue(self.resolve())
 
     def test_an_empty_env_is_unset(self):
-        self.runtime_json.write_text(json.dumps({"codexAppServer": True}))
+        self.runtime_json.write_text(json.dumps({"codexAppServer": False}))
         os.environ["SUTANDO_CODEX_APP_SERVER"] = ""
-        self.assertTrue(self.resolve())
+        self.assertFalse(self.resolve())
 
 
 class Persist(Base):
@@ -133,10 +136,10 @@ class Edges(Base):
         (repo / "sutando.config.json").write_text("{}")
         return repo
 
-    def test_a_malformed_config_reads_as_off(self):
+    def test_a_malformed_config_keeps_the_default(self):
         (self.workspace / "sutando.config.local.json").write_text("{not json")
         with patch("sys.stderr"):
-            self.assertFalse(self.resolve())
+            self.assertTrue(self.resolve())
 
     def test_missing_files_are_created_with_only_the_choice(self):
         self.assertEqual(sutando_config.persist_codex_app_server(True, self.repo)[0], "updated")
@@ -208,15 +211,15 @@ class Cli(unittest.TestCase):
                               capture_output=True, text=True, env={**self.env, **env}, timeout=60)
 
     def test_get_select_get(self):
-        self.assertEqual(self.cli("codex-app-server").stdout, "0")
-        r = self.cli("codex-app-server-select", "on")
+        self.assertEqual(self.cli("codex-app-server").stdout, "1", "on by default")
+        r = self.cli("codex-app-server-select", "off")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(r.stdout.startswith("updated "), r.stdout)
-        self.assertEqual(self.cli("codex-app-server").stdout, "1")
-        self.assertEqual(self.cli("codex-app-server", SUTANDO_CODEX_APP_SERVER="0").stdout, "0")
-        self.assertTrue(self.cli("codex-app-server-select", "on").stdout.startswith("unchanged "))
-        self.assertEqual(self.cli("codex-app-server-select", "off").returncode, 0)
         self.assertEqual(self.cli("codex-app-server").stdout, "0")
+        self.assertEqual(self.cli("codex-app-server", SUTANDO_CODEX_APP_SERVER="1").stdout, "1")
+        self.assertTrue(self.cli("codex-app-server-select", "off").stdout.startswith("unchanged "))
+        self.assertEqual(self.cli("codex-app-server-select", "on").returncode, 0)
+        self.assertEqual(self.cli("codex-app-server").stdout, "1")
 
     def test_select_needs_on_or_off(self):
         for args in ((), ("yes",)):

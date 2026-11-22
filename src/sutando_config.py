@@ -790,11 +790,11 @@ def _desktop_codex_app_server(repo_root: Optional[Path]) -> Optional[bool]:
 def resolve_codex_app_server(repo_root: Optional[Path] = None) -> bool:
     """Whether a Codex core or Codex pool worker runs as a seat on ``codex app-server``.
 
-    ``SUTANDO_CODEX_APP_SERVER`` set non-empty is an invocation-scoped override (``1`` on,
-    anything else off). Next is the desktop's durable choice, ``codexAppServer`` in its
-    ``runtime.json`` (written by the app's toggle), then ``core.codex_app_server`` from
-    merged config (the workspace layer included). Only a JSON ``true``/``false`` counts;
-    an unreadable or non-boolean value is skipped. Off by default.
+    On by default (owner decision 2026-11-22). ``SUTANDO_CODEX_APP_SERVER`` set non-empty is
+    an invocation-scoped override (``1`` on, anything else off). Next is the desktop's
+    durable choice, ``codexAppServer`` in its ``runtime.json`` (the app's toggle), then
+    ``core.codex_app_server`` from merged config (the workspace layer included). Only a
+    JSON ``true``/``false`` counts; a missing, unreadable or non-boolean value keeps the default.
     """
     env = os.environ.get("SUTANDO_CODEX_APP_SERVER", "").strip()
     if env:
@@ -805,14 +805,14 @@ def resolve_codex_app_server(repo_root: Optional[Path] = None) -> bool:
     try:
         val = (load_config(repo_root).get("core") or {}).get("codex_app_server")
     except (RuntimeError, AttributeError) as exc:
-        print(f"sutando config: cannot read core.codex_app_server ({exc}); treated as false",
+        print(f"sutando config: cannot read core.codex_app_server ({exc}); keeping the default (on)",
               file=sys.stderr)
-        return False
+        return True
     if val is not None and not isinstance(val, bool):
         print(f"sutando config: core.codex_app_server must be a JSON boolean, got {val!r}; "
-              f"treated as false", file=sys.stderr)
-        return False
-    return val is True
+              f"keeping the default (on)", file=sys.stderr)
+        return True
+    return val is not False
 
 
 def _replace_json_atomically(path: Path, body: Dict[str, Any]) -> None:

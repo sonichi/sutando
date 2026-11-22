@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The Codex core launcher's SUTANDO_CODEX_APP_SERVER switch, in the fixture of
-tests/codex-core-launcher.test.py: with the flag unset the launcher issues the tmux calls it
-issued before the switch existed; with it set the core session holds the seat and no helper."""
+tests/codex-core-launcher.test.py (which runs with the switch at 0): turned off the launcher
+issues the tmux calls it issued before the switch existed; on (the default) the core session
+holds the seat and no helper."""
 from __future__ import annotations
 
 import importlib.util
@@ -113,7 +114,8 @@ class Fixture:
 
 
 class FlagOff(unittest.TestCase):
-    """Unset, empty or 0, the launcher's tmux calls are those of the launcher without the switch."""
+    """Off (0, or any value but 1), the launcher's tmux calls are those of the launcher without
+    the switch. The fixture runs with 0."""
 
     def compare(self, *args, **env):
         current = Fixture(self)
@@ -138,8 +140,8 @@ class FlagOff(unittest.TestCase):
         self.assertIn("new-session -d -s sutando-core-watcher", calls)
         self.assertNotIn("codex-seat", calls)
 
-    def test_empty_and_zero_are_off(self):
-        for value in ("", "0"):
+    def test_any_value_but_one_is_off(self):
+        for value in ("0", "false", "no"):
             with self.subTest(value=value):
                 self.assertNotIn("codex-seat", self.compare(SUTANDO_CODEX_APP_SERVER=value))
 
@@ -262,7 +264,26 @@ class FlagOn(unittest.TestCase):
 
 class PersistedChoice(unittest.TestCase):
     """`core.codex_app_server` (what `sutando-config.sh codex-app-server-select` writes without a
-    desktop) decides every launch that does not set the variable; a set variable overrides it."""
+    desktop) decides every launch that does not set the variable (on when nothing is chosen); a
+    set variable overrides it. An empty variable is unset."""
+
+    UNSET = {"SUTANDO_CODEX_APP_SERVER": ""}
+
+    def test_with_nothing_chosen_the_core_is_a_seat(self):
+        f = Fixture(self, seat_tmux=True)
+        result = f.run(**self.UNSET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(f.calls(), r"new-session -d -s sutando-core .*-e SUTANDO_CODEX_APP_SERVER=1 .*codex-seat --host ")
+        self.assertNotIn("new-session -d -s sutando-core-watcher", f.calls())
+
+    def test_chosen_off_the_core_is_the_tui(self):
+        f = Fixture(self, seat_tmux=True)
+        self.choose(f, False)
+        result = f.run(**self.UNSET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("codex-seat", f.calls())
+        self.assertIn("new-session -d -s sutando-core-watcher", f.calls())
+        self.assertFalse(f.declaration().exists())
 
     def choose(self, f: Fixture, on: bool) -> None:
         (f.workspace / "sutando.config.local.json").write_text(json.dumps({"core": {"codex_app_server": on}}))
@@ -270,7 +291,7 @@ class PersistedChoice(unittest.TestCase):
     def test_a_launch_without_the_variable_follows_the_persisted_choice(self):
         f = Fixture(self, seat_tmux=True)
         self.choose(f, True)
-        result = f.run()
+        result = f.run(**self.UNSET)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(f.calls(), r"new-session -d -s sutando-core .*-e SUTANDO_CODEX_APP_SERVER=1 .*codex-seat --host ")
         self.assertTrue(f.declaration().exists())
@@ -286,11 +307,11 @@ class PersistedChoice(unittest.TestCase):
     def test_restart_after_turning_it_off_replaces_the_seat_with_the_tui(self):
         f = Fixture(self, seat_tmux=True)
         self.choose(f, True)
-        self.assertEqual(f.run().returncode, 0)
+        self.assertEqual(f.run(**self.UNSET).returncode, 0)
         self.assertTrue(f.declaration().exists())
         self.choose(f, False)
         f.h.log.unlink()
-        result = f.run("--restart")
+        result = f.run("--restart", **self.UNSET)
         self.assertEqual(result.returncode, 0, result.stderr)
         launch = re.findall(r"new-session -d -s sutando-core .*", f.calls())
         self.assertEqual(len(launch), 1)
