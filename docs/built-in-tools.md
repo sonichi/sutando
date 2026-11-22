@@ -421,6 +421,25 @@ dialog is cancelled. Refuses when the input box carries text or on a Codex runti
 pane; 4 = Codex runtime; 5 = input box busy; 6 = confirm dialog not confirmed; 8 = no acceptance seen.
 The capability lives in `skills/model-switch/`.
 
+## Which account the core is on
+
+Triggers: "which account are you on", "what account is Codex signed in to", "whose login is this",
+and before saying an account switch took effect. `codex login status` only says "Logged in using
+ChatGPT"; do not answer from it. On a Codex core run:
+
+```bash
+python3 src/codex_account.py                       # the core's Codex home: "signed in as <email>, <plan> plan"
+python3 src/codex_account.py --json                # {codex_home, email, plan, workspace, kind, source}
+python3 src/codex_account.py --codex-home <dir>    # a worker's own Codex home, when it has one
+```
+
+It asks Codex itself (`account/read` on a short-lived `codex app-server` under that home) and falls
+back to the email and plan claims of the home's `auth.json` id_token; it prints only the email, plan,
+workspace and login kind, never a token, and never print or quote `auth.json` yourself. Pool Codex
+workers run under the core's home today, so the core's answer is theirs too. Exit 1 means that home
+is signed out (or its login cannot be read): say so. The answer is the owner's account data: give it
+to the owner only.
+
 ## Check quota
 
 Triggers: "how much quota do I have", "am I near the limit", "when does it reset", and any paused
