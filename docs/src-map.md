@@ -228,6 +228,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
 - **`runtime_models.py`** — The models the core's runtime itself offers, read from its own model picker, by exact name.
 - **`runtime_observation.py`** — Runtime observations: one leased record per seat, written by whatever observes that seat's CLI.
+- **`runtime_profile.py`** — The core's runtime profile (`runtime_profile.v1`): its model, the switches it offers, its plan.
 - **`safe_number.py`** — One reader for a number from untrusted JSON (a ledger, a record, a payload).
 - **`scan-call-logs.py`** — Proactive call log scanner — detects issues and classifies by actionability.
 - **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).

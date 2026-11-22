@@ -955,6 +955,31 @@ def main() -> int:
         _wl.lane_dirs = _lane_dirs
     check(_wrtc._CORE_RECOVERY_READER is None and rtc._CORE_RECOVERY_READER is not None,
           "a pool worker's lane carries no core recovery record; the core's lane does")
+    check(_wrtc._RUNTIME_PROFILE_READER is None and rtc._RUNTIME_PROFILE_READER is not None,
+          "a pool worker's lane carries no runtime profile; the core's lane does")
+
+    # runtime_profile.v1: the adapter injects src/runtime_profile.read; a Codex core whose model
+    # list marks the current row rides as runtime_profile, and with no readable runtime none does.
+    _st = rtc.WS / "state"
+    (_st / "core-runtime.json").write_text(json.dumps({"runtime": "codex", "session": "s", "started_at": 1}))
+    (_st / "runtime-models.codex.json").write_text(json.dumps({"v": 1, "runtime": "codex", "at": 1, "entries": [
+        {"key": "o0123456789ab", "label": "gpt-5.5", "model": "gpt-5.5", "arg": None, "current": True}]}))
+    STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
+    rtc._post_heartbeat(set(), force=True)
+    hbp = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    _prof = hbp.get("runtime_profile") or {}
+    check(_prof.get("model") == {"id": "gpt-5.5", "display_name": "gpt-5.5", "runtime": "codex"}
+          and _prof.get("plan") is None and _prof.get("workers") == []
+          and "runtime_profile.v1" in hbp.get("capabilities", []),
+          "the adapter's reader puts the core's runtime profile on the heartbeat with its capability")
+    (_st / "runtime-models.codex.json").write_text("{ not json")
+    STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
+    check(rtc._post_heartbeat(set(), force=True), "a malformed model list never costs the heartbeat")
+    hbp = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    check("runtime_profile" not in hbp and "runtime_profile.v1" not in hbp.get("capabilities", []),
+          "an unknown core model -> no runtime_profile and no capability")
+    for _f in ("core-runtime.json", "runtime-models.codex.json"):
+        (_st / _f).unlink()
 
     # SECURITY / robustness: core-status.json is written by another process and
     # may be malformed. _read_core_status runs in the main loop BEFORE the poll,

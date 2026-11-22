@@ -125,6 +125,16 @@ def _sutando_core_recovery():
 # The core's record rides the core's lanes' heartbeats; a pool worker's lane is not the core.
 _SUTANDO_CORE_RECOVERY_READER = None if _OWN_DIRS else _sutando_core_recovery
 
+
+def _sutando_runtime_profile():
+    """The core's runtime_profile.v1 block through its one owner (src/runtime_profile.py)."""
+    import runtime_profile
+    return runtime_profile.read(WS)
+
+
+# Like the recovery record: the core's lanes carry the core's profile, a pool worker's lane none.
+_SUTANDO_RUNTIME_PROFILE_READER = None if _OWN_DIRS else _sutando_runtime_profile
+
 # Logged recovery commands name the workspace through its resolver, never its absolute path.
 _SUTANDO_WORKSPACE_RESOLVER = "bash scripts/sutando-config.sh workspace"
 

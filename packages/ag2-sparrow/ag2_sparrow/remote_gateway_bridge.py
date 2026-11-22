@@ -4597,11 +4597,32 @@ def _with_recovery(health: "dict | None") -> "dict | None":
     return {**(health or {"alive": None, "motion": "unknown"}), "recovery": rec}
 
 
+# The core's runtime profile (runtime_profile.v1): model, switch options, plan. Read by the
+# adapter's injected reader; a standalone sparrow and a pool worker's lane send none.
+_RUNTIME_PROFILE_READER = globals().get("_SUTANDO_RUNTIME_PROFILE_READER")
+RUNTIME_PROFILE_CAPABILITY = "runtime_profile.v1"
+RUNTIME_PROFILE_MAX_BYTES = 8192
+_runtime_profile_refused_until = 0.0
+
+
+def _runtime_profile() -> "dict | None":
+    """The adapter's profile when it has one and it fits the bound, else None. Never raises."""
+    if not callable(_RUNTIME_PROFILE_READER) or time.time() < _runtime_profile_refused_until:
+        return None
+    try:
+        block = _RUNTIME_PROFILE_READER()
+        if isinstance(block, dict) and len(json.dumps(block)) <= RUNTIME_PROFILE_MAX_BYTES:
+            return block
+    except Exception:  # noqa: BLE001 -- the profile is advisory; the beat goes out without it
+        pass
+    return None
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
     global _heartbeat_retry_at, _heartbeat_backoff, _last_heartbeat_at, _last_core_health
-    global _core_recovery_refused_until
+    global _core_recovery_refused_until, _runtime_profile_refused_until
     now = time.time()
     # Ahead of every early return: a Stop reaches a running task only through these beats.
     _post_task_beats(inflight, force=force)
@@ -4642,15 +4663,25 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             payload["capabilities"].append("worker_health.v1")
             if "recovery" in health:
                 payload["capabilities"].append(CORE_RECOVERY_CAPABILITY)
+        profile = _runtime_profile()
+        if profile is not None:
+            payload["runtime_profile"] = profile
+            payload["capabilities"].append(RUNTIME_PROFILE_CAPABILITY)
         try:
             reply = _req("POST", "/v1/heartbeat", payload, timeout=10)
         except urllib.error.HTTPError as e:
-            if e.code not in (400, 422) or "recovery" not in (payload.get("health") or {}):
+            carried = "recovery" in (payload.get("health") or {})
+            if e.code not in (400, 422) or not (carried or "runtime_profile" in payload):
                 raise
-            _core_recovery_refused_until = time.time() + CORE_RECOVERY_REFUSED_BACKOFF_S
-            _log(f"heartbeat refused with the recovery block: HTTP {e.code} — sending without it")
-            drop = {CORE_RECOVERY_CAPABILITY} | (set() if base is not None else {"worker_health.v1"})
-            payload = {k: v for k, v in payload.items() if k != "health"}
+            # Either optional block may be the one refused: the retry carries neither, and each is held back.
+            if carried:
+                _core_recovery_refused_until = time.time() + CORE_RECOVERY_REFUSED_BACKOFF_S
+            if "runtime_profile" in payload:
+                _runtime_profile_refused_until = time.time() + CORE_RECOVERY_REFUSED_BACKOFF_S
+            _log(f"heartbeat refused with its optional blocks: HTTP {e.code} — sending without them")
+            drop = {CORE_RECOVERY_CAPABILITY, RUNTIME_PROFILE_CAPABILITY} | (
+                set() if base is not None else {"worker_health.v1"})
+            payload = {k: v for k, v in payload.items() if k not in ("health", "runtime_profile")}
             payload["capabilities"] = [c for c in payload["capabilities"] if c not in drop]
             if base is not None:
                 payload["health"] = base

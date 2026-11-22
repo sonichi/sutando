@@ -415,6 +415,21 @@ record is omitted, and the broker keeps its last value. A change in the record s
 heartbeat at once. A broker that answers `400` or `422` to a beat carrying the block gets the
 same beat again without it at once, and beats without it for the next hour.
 
+On the core's own lanes the heartbeat also carries a top-level `runtime_profile`, with the
+`runtime_profile.v1` capability: the core's model, the models it can switch to and its plan's
+usage (schema and literal bodies in `contracts/runtime_profile.v1/`, byte-identical in the
+backend and web client). `src/runtime_profile.py` builds it from the seat's model, the runtime's
+own model list, the credential proxy's quota reading and the limit hold; the adapter injects its
+reader, so a standalone Sparrow and a pool worker's lane send none. Unknown is null: a Codex core
+reports no plan, a reading from a window that has since reset reports no usage, `workers` is `[]`
+until workers report their own model, and a core whose model is unknown sends no block at all. A
+switch option's `token` is the runtime list's opaque row key, the id the recovery card's
+`switch_model:<token>` click names. `plan.account` is `acct_` and six hex digits of the signed-in
+account's digest, never a name or address. The block is read only when a beat goes out, never
+exceeds 8192 bytes, and is omitted when it cannot be built. A broker that answers `400` or `422`
+to a beat carrying either optional block (this or `health.recovery`) gets the same beat at once
+without both, and beats without each refused block for the next hour.
+
 ### Task lifecycle *(opt-in: `REMOTE_TASK_LIFECYCLE_V2=1`)*
 
 - **Ack** adds `worker_id` (one lease-holder id per install, `state/relay-lease-worker-id`) and
