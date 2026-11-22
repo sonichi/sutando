@@ -253,12 +253,13 @@ class ModelSwitch:
         self.publish(result_file, self.quoted(IN_DM) + "\n")
         return "model-card-elsewhere"
 
-    def tell(self, live, ran) -> str:
+    def tell(self, live, ran, room=None) -> str:
         """After an owner turn that reached the runtime (`live`): settle the pick it ran with (`ran` is the
         model that turn ran on), then say in the DM each outcome not yet told, oldest first. The state is
         settled whatever happens to the telling (a refused switch is dropped, never asked for again); a
         notice whose card cannot be queued stays owed, the newest UNTOLD_KEEP of them, and one that cannot
-        be drawn is said in words once. '' when there was nothing to settle or tell."""
+        be drawn is said in words once, in the answer of a turn in its own room (`room`), never another's.
+        '' when there was nothing to settle or tell."""
         state = self.state()
         kept = state.get("untold")
         owed = [o for o in (kept if isinstance(kept, list) else [kept]) if isinstance(o, dict)]
@@ -275,6 +276,8 @@ class ModelSwitch:
             first = {"picked": str(owed[0].get("picked") or ""), "ran": str(owed[0].get("ran") or "")}
             card = self.built(state, **first)
             if card is None:
+                if room is None or str(owed[0].get("room") or "") != str(room):
+                    break           # its words wait for a turn in the room the card was for
                 words.append(self.words(state, **first))
             elif not self.post(owed[0].get("room"), card):
                 break

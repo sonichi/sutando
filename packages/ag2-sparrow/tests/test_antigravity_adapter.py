@@ -453,7 +453,11 @@ class ConnectorTest(unittest.TestCase):
         with mock.patch.object(model_switch.ModelSwitch, "card", side_effect=ValueError("bad label")):
             self.w.task("task-5", "STUB:TEXT fifth")
             self.w.serve()
+            self.assertEqual(len(json.loads(state.read_text())["untold"]), 3, "its words wait for the DM")
+            self.dm_task("task-5b", "STUB:TEXT fifth")
+            self.w.serve()
         self.assertEqual(json.loads(state.read_text())["untold"], [])
+        self.assertEqual(self.w.result("task-5b").count("I could not switch to a."), 3, "said in words, in the DM")
         with mock.patch.object(connector_cards, "queue", side_effect=OSError("disk full")):
             state.write_text(json.dumps(dict(json.loads(state.read_text()),
                                              untold=[{"picked": "a", "ran": "b", "room": self.DM}] * 9)))
