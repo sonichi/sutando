@@ -799,8 +799,12 @@ class Crash(SeatCase):
         self.assertEqual(s.step(), seat_mod.WITHDRAWN)
         self.assertEqual(read_late, ["task: the admitted one\n"])
         self.assertEqual(len(self.sent("turn/start")), 1)
-        self.assertIn("another file is under the task's name now", self.out.getvalue())
+        self.assertIn("neither in the inbox nor archived, so nothing is settled", self.out.getvalue())
         self.assertFalse(self.copy_of(s, "task-1.txt").exists())
+        # The replacement gets neither the old result nor a done marker: it is a pending task again.
+        self.assertFalse(task_dispatch.has_ready_result(self.results, "task-1.txt"))
+        self.assertEqual(len(list((Path(s.host.state) / "unsettled-results").iterdir())), 1)
+        self.assertEqual([name for name, _ in s.pending()], ["task-1.txt"])
 
     def test_a_file_that_changes_while_it_is_being_copied_is_not_started(self):
         self.task("task-1.txt")
@@ -820,19 +824,25 @@ class Crash(SeatCase):
         self.assertFalse(self.copy_of(s, "task-1.txt").exists())
         self.assertEqual(s.step(), "done", "the file as it is now is a task like any other")
 
-    def test_a_task_whose_file_left_the_inbox_after_its_result_is_still_settled(self):
-        first = self.task("task-1.txt")
-        s = self.make()
-        s.ensure_server()
-        turn = s.run_turn
+    def test_a_result_is_settled_for_an_archived_task_but_not_for_one_that_is_only_gone(self):
+        for name, leaves, outcome in (
+                ("task-1.txt", lambda f: os.replace(f, self.tasks / "archive" / f.name), "done"),
+                ("task-2.txt", lambda f: f.unlink(), seat_mod.WITHDRAWN)):
+            (self.tasks / "archive").mkdir(exist_ok=True)
+            first = self.task(name)
+            s = self.make()
+            s.ensure_server()
+            turn = s.run_turn
 
-        def archived_with_its_result(filename, prompt):
-            out = turn(filename, prompt)
-            first.unlink()
-            return out
+            def left_the_inbox(filename, prompt, turn=turn, first=first, leaves=leaves):
+                out = turn(filename, prompt)
+                leaves(first)
+                return out
 
-        s.run_turn = archived_with_its_result
-        self.assertEqual(s.step(), "done")
+            s.run_turn = left_the_inbox
+            self.assertEqual(s.step(), outcome, name)
+            self.assertEqual(task_dispatch.has_ready_result(self.results, name), outcome == "done", name)
+            s.close_server()
 
     def test_a_child_that_dies_twice_stops_the_seat_and_the_task_is_not_lost(self):
         self.task("task-1.txt")

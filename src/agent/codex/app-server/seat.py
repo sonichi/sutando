@@ -710,6 +710,25 @@ class Seat:
         os.replace(tmp, path)
         return path
 
+    def still_admitted(self, filename: str, payload: Path, picked: Optional[tuple]) -> bool:
+        """Whether the admitted file is still where a result may be settled for it: in the inbox,
+        or moved to the inbox's archive (a rename keeps the generation). Absence alone settles nothing."""
+        there = generation(payload)
+        if there is None:
+            there = generation(Path(payload).parent / "archive" / filename)
+        return there is not None and there == picked
+
+    def set_result_aside(self, filename: str) -> str:
+        """Move a result that cannot be settled out of the results folder, so that a file now
+        under the task's name is not taken as answered by it. '' when it could not be moved."""
+        kept = Path(self.host.state) / "unsettled-results" / f"{filename}.{int(time.time())}"
+        try:
+            kept.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.replace(Path(self.host.results) / filename, kept)
+        except OSError:
+            return ""
+        return str(kept)
+
     def run_task(self, filename: str, payload: Path) -> str:
         """One task end to end, on a private copy of its admitted bytes that is removed afterwards."""
         try:
@@ -763,10 +782,10 @@ class Seat:
         if status == "completed":
             self.failures = 0
         if has_ready_result(results, filename):
-            there = generation(payload)
-            if there is not None and there != picked:
-                log(f"task {filename}: turn {status} in {took}; result written, but another file is under "
-                    "the task's name now, and nothing is settled for that one")
+            if not self.still_admitted(filename, payload, picked):
+                aside = self.set_result_aside(filename)
+                log(f"task {filename}: turn {status} in {took}; result written, but the admitted file is "
+                    f"neither in the inbox nor archived, so nothing is settled; the result is kept at {aside}")
                 return WITHDRAWN
             log(f"task {filename}: turn {status} in {took}; result written")
             self.settle(filename, "done")

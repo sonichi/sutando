@@ -523,8 +523,11 @@ The turn itself never reads the inbox: when a task is picked the seat opens its 
 checks that open file's generation before and after reading it, and writes those bytes to
 `state/codex-seat/<seat>/payloads/<task file>` (mode 0600, removed when the task ends). The
 prompt names that copy where the notifier's names the inbox path, so a turn that reads late
-still reads what was admitted. A result is settled for the task only while the inbox file is
-still that generation or has left the inbox; with another file under the name, nothing is.
+still reads what was admitted. A result is settled for the task only while the admitted file
+is still in the inbox or has been renamed into the inbox's `archive/` (a rename keeps the
+generation); a file that is merely gone settles nothing. When it cannot be settled the result
+is moved to `state/codex-seat/<seat>/unsettled-results/`, so that a file now under the task's
+name is a pending task, not one answered by another task's result.
 A file whose generation the watcher cannot read, or that changes while it is being identified,
 is not announced and not recorded as dispatched: the watcher holds it and decides again on its
 next event, with no restart. Without the switch the watcher's output is unchanged, so no other
