@@ -5,7 +5,7 @@ Runs Google's Antigravity CLI (`agy`) on this computer as an s.space agent, the 
 agent in a room and Antigravity answers there. For each task file Sparrow queues, the connector wakes
 Antigravity over the Agent Client Protocol: it spawns `agy acp`, sends `initialize`, resumes the room's
 Session with `session/load` (or opens one with `session/new`) and sends one `session/prompt`; a
-non-owner's turn runs isolated instead (see Tiers and permissions). Stdlib only;
+guest's turn runs isolated instead (see Tiers and permissions). Stdlib only;
 opt-in; the core never imports it.
 
 Status: the handshake and the sign-in check were run against a real `agy` 1.5.9 (signed out); a full turn
@@ -70,15 +70,35 @@ refused), `updates` (the turn's `session/update`s counted by type) and `answer_c
 
 ## Tiers and permissions
 
-Only the owner is served by default. Every other sender, an attested collaborator included, is refused
-with one line unless `--allow-non-owner`, which admits them all. A non-owner's turn runs on the owner's agy
-sign-in (the Google account and quota in the Keychain), and a turn whose tool call is denied can end with
-no reply.
+The tier is read only from the task's parsed headers, which the gateway stamps, never from the message
+text: a `collaborator: true` or `access_tier: owner` line in the body changes nothing.
 
-**The owner's turns** resume the room's Session in the working directory, with agy's own home
-(`~/.gemini`: its settings, rules and context).
+| Sender | Served | Turn |
+| --- | --- | --- |
+| owner | always | the owner's turn |
+| Team (an attested collaborator: the team tier with the broker's `collaborator: true`) | always | the owner's turn |
+| guest (any other sender, the team tier without that stamp and an unknown tier included) | always, as Sutando answers them | isolated and read-only |
 
-**A non-owner's turn** (anyone `--allow-non-owner` admits, collaborators included) runs isolated:
+`--allow-non-owner` is a no-op kept so existing configs parse. `verify` prints `INFO team (attested
+collaborator): served as the owner is …` and `INFO guest and plain team: always served …`.
+
+Every turn runs on the owner's agy sign-in (the Google account and quota in the Keychain): giving someone
+Collaborator access to this agent lets them spend that quota, and their turns may read and edit the
+working directory as the owner's do. A turn whose tool call is denied can end with no reply.
+
+The gateway writes a Sutando tier block into every non-owner task (`team_guardrail.py`). It tells a core to
+write `results/<task>.txt` and, for a guest, to delegate to `codex exec`; agy can do neither, and its final
+message is what Sparrow posts. So the adapter says those steps as "your final message" and "this turn is
+already the read-only sandbox", and keeps the scope, the DO / DO NOT lists, the trust boundary and the
+hand-off to the owner verbatim (`tier_block_lines`). The final reply is scanned by the shared bridge
+(`_guarded_result_body`) for every tier but the owner, as for any adapter.
+
+**The owner's turn** (the owner and Team, decided by the owner on 2026-11-21) runs in the working
+directory with agy's own home (`~/.gemini`: its settings, rules and context) under the owner's permission
+policy below. The owner resumes the room's Session; each collaborator resumes a Session of their own for
+the room (keyed by their user id), so no one resumes another's conversation.
+
+**A guest's turn** (a guest, plain team or an unknown tier) runs isolated:
 
 - a fresh temporary directory per task holds the Session's working directory and a separate agy home,
   passed as `agy acp --gemini-dir <dir>`; that home has only a `settings.json` whose permission rules deny
@@ -88,36 +108,39 @@ no reply.
 - a new Session for every task, never resumed and never recorded in the session store;
 - the Session is put in a read-only mode with `session/set_mode` (`plan`, or a mode named `read-only`),
   picked from the `modes` that `session/new` returns. If agy offers no such mode, or refuses it, the turn
-  is not run: a message gets a line saying so, an event posts nothing.
+  is not run: a message gets a line saying so ("Antigravity did not take this: it answers non-owners only
+  in a read-only session mode, and no read-only session mode is offered (offered: …)."), an event posts
+  nothing.
 
-`--gemini-dir` is agy's flag: a custom `--acp-command` must accept it, or non-owner turns fail.
+`--gemini-dir` is agy's flag: a custom `--acp-command` must accept it, or guest turns fail.
 
 agy's `session/request_permission` is answered by `acp_host`'s policy, default deny:
 
-- the owner's turns only, and only on an install with `--allow-owner-shell-web` (recorded as
+- the owner's own turns only, and only on an install with `--allow-owner-shell-web` (recorded as
   `ALLOW_OWNER_SHELL_WEB=1`; off by default, so an existing install does not change on update): any shell
   command and any `execute`, `fetch` or `search` call, as a local Claude Code agent runs commands and uses
-  the web for its owner. `verify` prints `INFO owner shell and web: on|off`;
-- the owner only: a `read` or `edit` whose every path resolves (after `..`, `~` and symlinks) under the
-  working directory; never when the working directory is the home directory or above it. agy's own
-  argument names (`Path`, `Content`, `Overwrite`, `Append`, `Target`, `Replacement`, `AllowMultiple`,
-  `Edits`, `StartLine`, `EndLine`, and the older `TargetFile`, `CodeContent`, `AbsolutePath`, ...) are
-  recognised; any other key refuses the request;
-- the owner and Team only: one of the S.space MCP tools below, named by the server and tool the request
-  carries;
+  the web for its owner. Team runs in the owner's turn but never gets this: it is decided by the sender's
+  tier. `verify` prints `INFO owner shell and web: on|off`;
+- the owner's turn only (the owner and Team): a `read` or `edit` whose every path resolves (after `..`, `~`
+  and symlinks) under the working directory; never when the working directory is the home directory or above
+  it. agy's own argument names (`Path`, `Content`, `Overwrite`, `Append`, `Target`, `Replacement`,
+  `AllowMultiple`, `Edits`, `StartLine`, `EndLine`, and the older `TargetFile`, `CodeContent`,
+  `AbsolutePath`, ...) are recognised; any other key refuses the request;
+- the owner's turn only (the owner and Team): one of the S.space MCP tools below, named by the server
+  and tool the request carries;
 - nothing else: no command or web call for a collaborator or a guest, no other MCP tool, and no
   `delete`, `move` or unclassified call for anyone.
 
 | Turn | Commands, fetch, search | Read or edit under the working directory | Anything else |
 | --- | --- | --- | --- |
 | owner | granted with `--allow-owner-shell-web`, else refused | granted | refused |
-| Team (an attested collaborator) | refused (granting it is the owner's decision) | as the turn it runs in | refused |
+| Team (an attested collaborator, in the owner's turn) | refused (granting it is the owner's decision) | granted | refused |
 | guest (isolated) | refused | refused | refused |
 
 With `--allow-owner-shell-web`, the working-directory bound on `read` and `edit` is no longer a security
 boundary for the owner's turns: a command can read or write anything the owner's account can.
 
-For the owner's turns, agy applies its own permission rules first (an action they already allow runs
+For the owner's turns (Team's included), agy applies its own permission rules first (an action they already allow runs
 without asking), and `--dangerously-skip-permissions` makes it run tools without asking; never add that
 flag to an agent others can reach.
 
@@ -133,8 +156,7 @@ global rules are read only from the `--gemini-dir` home.
 The owner's turns and Team's (an attested collaborator: `access_tier: team` with `collaborator: true`, as
 #6645 serves them; the owners' rule of 2026-11-21) can create and edit Room Commons pages and run room
 actions, as the agent itself. Their Session gets one MCP server, `ag2-space`, in `session/new` and
-`session/load`. Until #6645 lands, a Team turn stays isolated as above (its own temporary agy home and
-directory, no file, command or fetch grant), and that home's deny rules leave out `mcp(*)` only, so agy asks
+`session/load`. Team runs in the owner's turn (no command or fetch grant); agy asks before each MCP call
 and the policy decides:
 
 - **Identity.** The server is AG2 Space MCP, authorized as this agent by `ag2-sparrow-mcp acp` (see the
