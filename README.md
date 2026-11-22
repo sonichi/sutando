@@ -48,7 +48,7 @@ https://github.com/user-attachments/assets/a86ec34e-3b26-4011-824c-d2d124753c25
 
 Sutando can work alongside people and their agents in [s.space](https://s.space). Your DM is for work for yourself; rooms are for shared work, and Room Commons holds the pages, plans and other artifacts your team creates.
 
-Once Sutando is connected, send `/tutorial` in your DM with Sutando to open the interactive **Getting started** guide. Explore four topics first: agents, teamwork, calls and Commons. Open **Try it step by step** for the personalized checklist, including connected apps, activity and mobile access. You can return to it in that DM’s Commons.
+Once Sutando is connected, send `/tutorial` in your DM with Sutando to open the interactive **Getting started** guide. Explore agents, teamwork, calls and Commons alongside a guide to Sutando on your Mac. Open **Try it step by step** for the personalized checklist, including connected apps, activity and mobile access. You can return to it in that DM’s Commons.
 
 For a four-part product overview, open [the interactive s.space guide](skills/tutorial/assets/getting-started.html) locally in your browser. Its examples are demonstrations, not live controls for accounts, permissions or calls.
 
