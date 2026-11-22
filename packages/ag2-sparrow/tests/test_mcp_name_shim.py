@@ -17,6 +17,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
@@ -139,6 +140,20 @@ class ShimTest(unittest.TestCase):
         many = "".join(json.dumps({"jsonrpc": "2.0", "id": i, "method": "ping"}) + "\n" for i in range(5000))
         rc = shim.main([sys.executable, "-c", "raise SystemExit(3)"], stdin=io.StringIO(many), stdout=io.StringIO())
         self.assertEqual(rc, 3)
+
+    def test_the_status_file_carries_this_turns_id_and_how_far_it_got(self):
+        with tempfile.TemporaryDirectory() as d:
+            status = os.path.join(d, "status.json")
+            env = {shim.STATUS_ENV: status, shim.TURN_ENV: "t1"}
+            with unittest.mock.patch.dict(os.environ, env):
+                self.assertEqual(shim.main(["/no/such/program"], stdin=io.StringIO(""), stdout=io.StringIO()), 127)
+                self.assertEqual(json.loads(Path(status).read_text()), {"state": "exited", "code": 127, "turn": "t1"})
+                server = os.path.join(d, "server.py")
+                Path(server).write_text(FAKE_SERVER)
+                shim.main([sys.executable, server, json.dumps(["room.list", "ui_request"])], stdout=io.StringIO(),
+                          stdin=io.StringIO(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n"))
+                self.assertEqual(json.loads(Path(status).read_text()), {"state": "listed", "tools": 2, "turn": "t1"})
+        shim.Status({}).write(state="started")   # no status path: nothing written, nothing raised
 
     def test_no_command_is_a_usage_error_and_the_module_runs_as_a_script(self):
         self.assertEqual(shim.main([], stdin=io.StringIO(""), stdout=io.StringIO()), 2)

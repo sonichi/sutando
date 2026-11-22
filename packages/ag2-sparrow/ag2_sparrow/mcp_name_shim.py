@@ -29,6 +29,35 @@ ALIAS_MAX = 50
 NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,%d}" % ALIAS_MAX)
 _BAD = re.compile(r"[^A-Za-z0-9_-]")
 LOG_ENV = "AG2_MCP_LOG"
+STATUS_ENV, TURN_ENV = "AG2_MCP_SHIM_STATUS", "AG2_MCP_SHIM_TURN"
+
+
+class Status:
+    """The status file the connector reads at turn end (STATUS_ENV): this turn's id (TURN_ENV) and `state`
+    started | listed (with `tools`, the count the server listed) | exited (with `code`, before any list)."""
+
+    def __init__(self, environ=None):
+        env = os.environ if environ is None else environ
+        self.path, self.turn = env.get(STATUS_ENV), env.get(TURN_ENV) or ""
+        self.listed = False
+        self.lock = threading.Lock()
+
+    def write(self, **fields):
+        if not self.path:
+            return
+        with self.lock, contextlib.suppress(OSError):
+            tmp = "%s.%d.tmp" % (self.path, os.getpid())
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(dict(fields, turn=self.turn), f)
+            os.replace(tmp, self.path)
+
+    def tools(self, count):
+        self.listed = True
+        self.write(state="listed", tools=count)
+
+    def exited(self, code):
+        if not self.listed:
+            self.write(state="exited", code=code)
 
 
 def alias(name):
@@ -104,7 +133,7 @@ def to_server(line, names, pending):
     return json.dumps(msg) + "\n" if changed else line
 
 
-def to_client(line, names, pending):
+def to_client(line, names, pending, status=None):
     """A server line as the client should get it: the tools of an answer to a remembered `tools/list` renamed."""
     msg = _messages(line)
     if msg is None:
@@ -120,6 +149,8 @@ def to_client(line, names, pending):
             if isinstance(tools, list):
                 names.rename_tools(tools)
                 changed = True
+                if status is not None:
+                    status.tools(len(tools))
     return json.dumps(msg) + "\n" if changed else line
 
 
@@ -133,13 +164,20 @@ def main(argv=None, stdin=None, stdout=None, popen=subprocess.Popen):
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
     note("start, running %s" % shlex.join(argv))
-    child = popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+    status = Status()
+    status.write(state="started")
+    try:
+        child = popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+    except OSError as e:
+        note("the server did not start (%s)" % e)
+        status.exited(127)
+        return 127
     names, pending, out_lock = Names(), set(), threading.Lock()
 
     def pump_out():
         for line in child.stdout:
             with out_lock:
-                stdout.write(to_client(line, names, pending))
+                stdout.write(to_client(line, names, pending, status))
                 stdout.flush()
 
     reader = threading.Thread(target=pump_out, daemon=True)
@@ -157,6 +195,7 @@ def main(argv=None, stdin=None, stdout=None, popen=subprocess.Popen):
     reader.join()
     rc = child.wait()
     note("exit, the server exited %s" % rc)
+    status.exited(rc)
     return rc
 
 

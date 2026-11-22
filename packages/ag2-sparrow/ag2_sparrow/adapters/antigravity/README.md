@@ -149,6 +149,14 @@ and the policy decides:
   (`mcp_ag2-space_<tool>`, at most 64), so aliases stop at 50 characters. The entry's `command` is
   `state/ag2-mcp-shim` (0700, written each turn), a two-line `sh` launcher, and its `args` are just the
   proxy's command line; the shim writes `start` and `exit` lines to `state/ag2-mcp-proxy.log`.
+- **A launch that failed is said.** Each turn the connector deletes `state/ag2-mcp-status.json` and writes a
+  fresh turn id into the launcher; the shim records that id and how far it got (`started`, `listed` with a
+  tool count, or `exited` with a code). At turn end, a message whose turn offered the stdio entry gets one
+  line when the tools did not come up: "S.space tools didn't start this turn (the helper did not start | the
+  helper exited | no tool list), so I couldn't use Room Commons." Only those fixed words reach the room; the
+  code, argv and paths stay in the log and `state/metrics.jsonl` (`sspace_tools_down`). A resumed Session
+  (`session/load`) with no launch says nothing: on the 18:44 live run agy launched no server on resume and
+  kept the tools it had when the Session started.
 - **Token file shape (stdio).** An agent `.env` with a `REMOTE_TASK_TOKEN=<relay>|<secret>` line gets the
   plain descriptor (`env_file` that `.env`, `env_key` its key). A seat made by `--token-stdin` or `connect` has
   an `.env` (`channels/ag2space/.env`) holding only `REMOTE_TASK_TOKEN_FILE`, and its token as a raw line in

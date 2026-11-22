@@ -896,7 +896,7 @@ class SspaceStdioTest(unittest.TestCase):
         a.once = n
         with contextlib.redirect_stderr(io.StringIO()) as err:
             gc.Connector(a, mcp_entry=lambda *x: (dict(ENTRY), ""),
-                         proxy_entry=lambda cmd, tf, aid, st: gc.stdio_entry(cmd, tf, aid, st, run=self.run_child)
+                         proxy_entry=lambda cmd, tf, aid, st, **kw: gc.stdio_entry(cmd, tf, aid, st, run=self.run_child, **kw)
                          ).serve()
         return err.getvalue()
 
@@ -994,6 +994,53 @@ class SspaceStdioTest(unittest.TestCase):
                 raise exc
             got = gc.stdio_entry(PROXY, self.token_file, "@agy:s.space", state, run=boom)
             self.assertEqual(got, (None, "the token exchange did not run (%s)" % type(exc).__name__))
+
+    def launched(self):
+        (self.w.home / "launch-mcp").write_text("")
+        server = Path(self.tmp.name) / "fake-proxy.py"
+        server.write_text("import json, sys\nfor line in sys.stdin:\n    m = json.loads(line)\n"
+                          "    print(json.dumps({'jsonrpc': '2.0', 'id': m['id'], 'result': {'tools': ["
+                          "{'name': 'room.action.execute'}, {'name': 'ui_request'}]}}), flush=True)\n")
+        return shlex.join([sys.executable, str(server)])
+
+    def status_file(self):
+        return self.w.root / "state" / gc.STATUS_NAME
+
+    def test_tools_that_came_up_add_nothing_to_the_reply_even_after_a_stale_failure(self):
+        proxy = self.launched()
+        self.status_file().write_text(json.dumps({"turn": "old", "state": "exited", "code": 1}))
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.serve(proxy=proxy)
+        self.assertEqual(self.w.result("task-1"), "hello from agy-stub\n")
+        self.assertEqual([r["tools"] for r in self.w.records() if "mcp_launch" in r], [["room_action_execute", "ui_request"]])
+        self.assertEqual(self.w.metrics()[0]["sspace_tools_down"], "")
+
+    def test_a_launch_that_failed_says_so_in_fixed_words_even_after_a_stale_success(self):
+        self.launched()
+        self.status_file().write_text(json.dumps({"turn": "old", "state": "listed", "tools": 23}))
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.serve(proxy="%s /no/such/ag2-mcp-proxy.mjs" % shlex.quote(sys.executable.replace("python", "no-such-node")))
+        said = self.w.result("task-1")
+        self.assertEqual(said, "hello from agy-stub\n\n" + gc.TOOLS_DOWN % "the helper exited" + "\n")
+        self.assertIn("127", (self.w.root / "state" / gc.PROXY_LOG_NAME).read_text() + json.dumps(
+            json.loads(self.status_file().read_text())), "the code stays local; the room gets fixed words only")
+        self.assertEqual(self.w.metrics()[0]["sspace_tools_down"], "the helper exited")
+
+    def test_no_launch_on_a_new_session_says_so_and_a_resumed_session_says_nothing(self):
+        self.launched()
+        (self.w.home / "launch-mcp").unlink()   # agy started nothing
+        self.status_file().write_text(json.dumps({"turn": "old", "state": "listed", "tools": 23}))
+        proxy = shlex.join([sys.executable, "/x.py"])
+        self.w.task("task-1", "STUB:TEXT one")
+        self.serve(proxy=proxy)
+        self.assertIn(gc.TOOLS_DOWN % "the helper did not start", self.w.result("task-1"))
+        self.w.task("task-2", "STUB:TEXT two")
+        self.serve(proxy=proxy)
+        self.assertIn("session/load", self.w.methods())
+        self.assertEqual(self.w.result("task-2"), "hello from agy-stub\n", "agy keeps a resumed Session's tools")
+        self.assertEqual(gc.tools_down(str(self.status_file()), "t", False)[0], "the helper did not start")
+        self.status_file().write_text(json.dumps({"turn": "t", "state": "started"}))
+        self.assertEqual(gc.tools_down(str(self.status_file()), "t", False)[0], "no tool list")
 
     def test_the_launcher_runs_the_proxy_under_the_shim_with_only_the_entrys_environment(self):
         state = Path(self.tmp.name) / "launch state"   # a space in the path, as under Application Support

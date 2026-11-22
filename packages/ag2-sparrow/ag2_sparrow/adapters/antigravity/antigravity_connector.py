@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 from ... import acp_host, held_start, mcp_auth, result_labels, result_publish
@@ -156,11 +157,19 @@ def shim_args(argv):
     return ["-I", "-c", code, "--"] + list(argv)
 
 
-def write_launcher(state):
+STATUS_NAME = "ag2-mcp-status.json"
+# What a room is told when the tools did not come up: fixed words only; codes, argv and paths stay local.
+TOOLS_DOWN = "S.space tools didn't start this turn (%s), so I couldn't use Room Commons."
+
+
+def write_launcher(state, turn=""):
     """`<state>/ag2-mcp-shim` (0700): a plain executable that runs the shim, so agy's stdio entry is a file and
-    its args are only the proxy's command line (agy started no process for a `python -I -c <code>` entry)."""
+    its args are only the proxy's command line (agy started no process for a `python -I -c <code>` entry). It
+    hands the shim this turn's id and `<state>/ag2-mcp-status.json`, where the shim says how far it got."""
     path = os.path.join(state, SHIM_NAME)
-    text = "#!/bin/sh\nexec %s \"$@\"\n" % " ".join(shlex.quote(a) for a in [sys.executable] + shim_args([]))
+    env = {"AG2_MCP_SHIM_TURN": turn, "AG2_MCP_SHIM_STATUS": os.path.join(state, STATUS_NAME)}
+    text = "#!/bin/sh\n%s exec %s \"$@\"\n" % (" ".join("%s=%s" % (k, shlex.quote(v)) for k, v in env.items()),
+                                              " ".join(shlex.quote(a) for a in [sys.executable] + shim_args([])))
     tmp = "%s.%d.tmp" % (path, os.getpid())
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o700)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -180,7 +189,26 @@ def _descriptor_file(desc, token_env_file):
     return None
 
 
-def stdio_entry(proxy_command, token_env_file, agent_id, state_dir, run=subprocess.run):
+def tools_down(status_path, turn_id, resumed):
+    """(the fixed reason for TOOLS_DOWN, what to log) for this turn's status file, or ('', what to log) when the
+    tools came up, or when a resumed Session started none: agy keeps a resumed Session's earlier tools."""
+    try:
+        with open(status_path, encoding="utf-8") as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = {}
+    if not isinstance(st, dict) or st.get("turn") != turn_id:
+        if resumed:
+            return "", "no shim launch this turn (resumed Session)"
+        return "the helper did not start", "no shim launch this turn"
+    if st.get("state") == "listed" and isinstance(st.get("tools"), int) and st["tools"] > 0:
+        return "", "%d tools listed" % st["tools"]
+    if st.get("state") == "exited":
+        return "the helper exited", "the proxy exited %s before listing tools" % st.get("code")
+    return "no tool list", "the proxy started but listed no tools (%s)" % st.get("state")
+
+
+def stdio_entry(proxy_command, token_env_file, agent_id, state_dir, run=subprocess.run, turn=""):
     """(the ACP stdio `McpServer` running the desktop's `ag2-mcp-proxy` as this agent, '') or (None, why). The
     proxy gets only the path of a non-secret descriptor (written 0600 in `state_dir`) naming the agent's own
     token file, as Claude Code's `ag2-space` stdio entry does; the relay token never enters agy's environment."""
@@ -208,7 +236,7 @@ def stdio_entry(proxy_command, token_env_file, agent_id, state_dir, run=subproce
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(desc, f)
     os.replace(tmp, path)
-    return {"name": mcp_auth.SERVER_NAME, "command": write_launcher(state), "args": list(argv),
+    return {"name": mcp_auth.SERVER_NAME, "command": write_launcher(state, turn), "args": list(argv),
             "env": [{"name": "AG2_MCP_DESCRIPTOR", "value": path},
                     {"name": "AG2_MCP_LOG", "value": os.path.join(state, PROXY_LOG_NAME)}]}, ""
 
@@ -333,6 +361,7 @@ class Connector:
         self.client_factory = client_factory
         self.mcp_entry = mcp_entry
         self.proxy_entry = proxy_entry
+        self.launch = None   # (status file, turn id) of this turn's stdio launcher, when one was offered
         self.note = note if note is not None else NON_OWNER_NOTE
         self.store = SessionStore(args.session_store)
         self.name = NAME
@@ -349,7 +378,14 @@ class Connector:
         if declares_http_mcp(init):
             entry, why = self.mcp_entry(token_file, agent_id)
         elif getattr(self.args, "mcp_proxy_command", None):
-            entry, why = self.proxy_entry(self.args.mcp_proxy_command, token_file, agent_id, self.args.state)
+            turn = uuid.uuid4().hex
+            status = os.path.join(os.path.abspath(self.args.state), STATUS_NAME)
+            with contextlib.suppress(OSError):
+                os.unlink(status)
+            entry, why = self.proxy_entry(self.args.mcp_proxy_command, token_file, agent_id, self.args.state,
+                                          turn=turn)
+            if entry is not None:
+                self.launch = (status, turn)
         else:
             log("ag2-space MCP tools not offered: agy declares no HTTP MCP transport and no --mcp-proxy-command "
                 "is set")
@@ -425,11 +461,20 @@ class Connector:
         event, _ = trigger_of(headers)
         log("wake ->", task_id, headers["access_tier"], event or "message")
         t0 = time.time()
+        self.launch = None
         status, text, detail, turn = self.run_turn(task_id, headers, prompt, tier == "owner")
-        publish(result_file, self.answer_body(headers, status, text, detail, turn))
+        body = self.answer_body(headers, status, text, detail, turn)
+        reason = ""
+        if self.launch is not None:
+            reason, seen = tools_down(self.launch[0], self.launch[1], turn.resumed)
+            log("ag2-space MCP tools:", seen)
+        if reason and acp_host.is_message(headers) and not body.startswith("[no-send]"):
+            body = body.rstrip("\n") + "\n\n" + TOOLS_DOWN % reason + "\n"
+        publish(result_file, body)
         return {"task": task_id, "status": status, "detail": detail[:200], "event_type": event,
                 "tier": headers["access_tier"], "isolated": tier != "owner", "turn_s": round(time.time() - t0, 3),
-                "permissions": turn.decisions, "updates": dict(turn.updates), "answer_chars": len(text or "")}
+                "permissions": turn.decisions, "updates": dict(turn.updates), "answer_chars": len(text or ""),
+                "sspace_tools_down": reason}
 
     def pending_tasks(self, seen):
         now = time.time()

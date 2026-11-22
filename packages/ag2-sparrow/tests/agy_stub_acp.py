@@ -126,6 +126,34 @@ MCP_CALLS = [
 ]
 
 
+def launch(servers, loading=False):
+    """With `launch-mcp` under $HOME, start each stdio MCP server as agy does (its command, args and only its env),
+    ask for its tools and log their names; on session/load only with `launch-on-load` (agy launched none then)."""
+    if not os.path.exists(os.path.join(HOME, "launch-mcp")) or (loading and not os.path.exists(os.path.join(HOME, "launch-on-load"))):
+        return
+    import subprocess
+    for s in servers or []:
+        if "command" not in s:
+            continue
+        env = {e["name"]: e["value"] for e in s.get("env") or []}
+        try:
+            p = subprocess.Popen([s["command"]] + list(s.get("args") or []), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, env=env, text=True)
+        except OSError as e:
+            log({"mcp_launch": s["name"], "error": type(e).__name__})
+            continue
+        try:
+            p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n")
+            p.stdin.flush()
+            line = p.stdout.readline()
+        except OSError:
+            line = ""
+        tools = [t.get("name") for t in ((json.loads(line).get("result") or {}).get("tools") or [])] if line else []
+        log({"mcp_launch": s["name"], "tools": tools})
+        p.stdin.close()
+        p.wait(30)
+
+
 GLOBAL_CONTEXT = ("GEMINI.md", "AGENTS.md", "config/GEMINI.md", "config/AGENTS.md")
 MODES = {"currentModeId": "default", "availableModes": [
     {"id": "default", "name": "Default"}, {"id": "accept-edits", "name": "Accept edits"},
@@ -175,6 +203,7 @@ def main():
                 send({"jsonrpc": "2.0", "id": rid,
                       "error": {"code": -32000, "message": "Authentication required"}})
                 continue
+            launch(params.get("mcpServers"))
             s = sessions()
             sid = "s-%d" % (len(s) + 1)
             s[sid] = params.get("cwd")
@@ -190,6 +219,7 @@ def main():
                 send({"jsonrpc": "2.0", "id": rid, "result": {}})
         elif method == "session/load":
             if params.get("sessionId") in sessions():
+                launch(params.get("mcpServers"), loading=True)
                 chunk(params["sessionId"], "replayed history")
                 send({"jsonrpc": "2.0", "id": rid, "result": {}})
             else:
