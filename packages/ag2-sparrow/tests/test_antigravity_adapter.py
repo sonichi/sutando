@@ -1180,6 +1180,19 @@ class SspaceStdioTest(unittest.TestCase):
         self.assertEqual(launches.get("s-1"), "the helper exited")
         self.assertEqual(os.stat(launches.path).st_mode & 0o777, 0o600)
 
+    def test_a_launch_outcome_that_cannot_be_written_still_delivers_the_reply_once(self):
+        self.launched()
+        bad = "%s /no/such/ag2-mcp-proxy.mjs" % shlex.quote(sys.executable.replace("python", "no-such-node"))
+        launches = gc.LaunchLog(self.w.root / "state" / gc.SESSIONS_NAME)
+        os.makedirs(launches.path)   # a directory where the file goes: the write fails
+        self.w.task("task-1", "STUB:TEXT one")
+        err = self.serve(proxy=bad)
+        self.assertEqual(self.w.result("task-1"), "hello from agy-stub\n\n" + gc.TOOLS_DOWN % "the helper exited" + "\n")
+        self.assertIn("launch outcome not recorded:", err)
+        self.assertNotIn("retrying", err)
+        self.assertEqual([m["task"] for m in self.w.metrics()], ["task-1"])
+        self.assertEqual([n for n in os.listdir(os.path.dirname(launches.path)) if n.endswith(".tmp")], [])
+
     def test_a_resumed_session_whose_own_launch_worked_says_nothing(self):
         proxy = self.launched()
         self.w.task("task-1", "STUB:TEXT one")

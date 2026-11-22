@@ -239,15 +239,21 @@ class LaunchLog:
         return row if isinstance(row, str) else ""
 
     def record(self, session_id, reason):
+        """Best effort: a diagnostics write that fails is logged, never raised into the task's delivery."""
         if not session_id:
             return
         rows = self._read()
         rows[session_id] = reason
         tmp = "%s.%d.tmp" % (self.path, os.getpid())
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(rows, f)
-        os.replace(tmp, self.path)
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(rows, f)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            log("launch outcome not recorded:", type(e).__name__)
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
 
 
 def stdio_entry(proxy_command, token_env_file, agent_id, state_dir, run=subprocess.run, turn=""):
