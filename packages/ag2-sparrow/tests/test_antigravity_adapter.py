@@ -170,6 +170,27 @@ class ConnectorTest(unittest.TestCase):
         self.assertEqual(reasons, ["under the working directory", "outside the working directory",
                                    "no command is granted"])
 
+    def test_agys_own_file_tool_keys_are_checked_against_the_working_directory(self):
+        # The keys agy's read_file / write_file / write_to_file send (Path, TargetFile, Content, ...), from its
+        # transcripts; the 19:06 live run refused an in-folder read as "unrecognised key Path".
+        opts = [{"optionId": "a", "kind": "allow_once"}, {"optionId": "r", "kind": "reject_once"}]
+        cwd = str(self.w.cwd)
+
+        def decide(kind, raw):
+            return acp_host.decide_permission({"toolCall": {"kind": kind, "rawInput": raw}, "options": opts}, True, cwd)[:2]
+        inside, outside = os.path.join(cwd, "agent.json"), os.path.join(os.path.dirname(cwd), "agent.json")
+        self.assertEqual(decide("read", {"Path": inside, "StartLine": 1, "EndLine": 9}), (True, "under the working directory"))
+        self.assertEqual(decide("read", {"Path": outside}), (False, "outside the working directory"))
+        self.assertEqual(decide("read", {"Path": "../agent.json"}), (False, "outside the working directory"))
+        self.assertTrue(decide("edit", {"Path": inside, "Content": "x", "Overwrite": True, "toolSummary": "s"})[0])
+        self.assertTrue(decide("edit", {"TargetFile": inside, "CodeContent": "x", "Description": "d"})[0])
+        self.assertTrue(decide("edit", {"TargetFile": inside, "Instruction": "i", "ReplacementChunks": [
+            {"TargetContent": "a", "ReplacementContent": "b", "StartLine": 1, "EndLine": 2, "AllowMultiple": False}]})[0])
+        self.assertEqual(decide("edit", {"Path": inside, "Content": {"nested": 1}}), (False, "Content carries a nested value"))
+        for extra in ({"OtherPath": outside}, {"ArtifactMetadata": {}}):
+            self.assertEqual(decide("read", dict({"Path": inside}, **extra)),
+                             (False, "unrecognised key %s" % next(iter(extra))), "an unknown key is still refused")
+
     def test_a_collaborator_may_not_touch_files(self):
         self.w.task("task-1", "STUB:EDIT go", tier="team", collaborator=True)
         self.w.serve(1, "--allow-non-owner")
@@ -339,7 +360,7 @@ class ConnectorTest(unittest.TestCase):
         rec = self.w.metrics()[0]
         self.assertEqual((rec["detail"], rec["updates"]), ("end_turn", {"tool_call": 1}))
         self.assertEqual([(d["reason"], d["category"]) for d in rec["permissions"]],
-                         [("unrecognised key Content", "file change")])
+                         [("cannot tell what this would touch", "file change")])
         c = gc.Connector(self.w.args())
         turn = acp_host.Turn()
         self.assertEqual(c.answer_body({"access_tier": "owner"}, "completed", "", "max_tokens", turn),
@@ -373,7 +394,7 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         said = self.w.result("task-1")
         self.assertNotIn("Content", said)
-        self.assertIn("unrecognised key Content", self.w.metrics()[0]["permissions"][0]["reason"])
+        self.assertIn("cannot tell what this would touch", self.w.metrics()[0]["permissions"][0]["reason"])
 
     def test_failures_are_said_for_a_message_and_quiet_for_an_event(self):
         c = gc.Connector(self.w.args())

@@ -37,11 +37,15 @@ ALLOW_KINDS, REJECT_KINDS = ("allow_once", "allow_always"), ("reject_once", "rej
 SAFE_KINDS = frozenset({"read", "edit"})
 PATH_KEYS = frozenset({"path", "file_path", "filePath", "abs_path", "absPath", "filename", "file", "dir",
                        "directory", "notebook_path", "notebookPath", "target_file", "target", "target_path",
-                       "old_path", "new_path", "source", "destination", "dest"})
+                       "old_path", "new_path", "source", "destination", "dest",
+                       # agy's file tools (read_file, write_file, write_to_file), as its transcripts carry them
+                       "Path", "TargetFile"})
 DATA_KEYS = frozenset({"content", "contents", "text", "old_string", "new_string", "oldText", "newText", "old_str",
                        "new_str", "replace_all", "replaceAll", "offset", "limit", "line", "start_line", "end_line",
-                       "encoding"})
-NESTED_KEYS = frozenset({"edits"})
+                       "encoding", "Content", "CodeContent", "Append", "Overwrite", "StartLine", "EndLine",
+                       "TargetContent", "ReplacementContent", "AllowMultiple", "Instruction", "Description",
+                       "toolAction", "toolSummary"})
+NESTED_KEYS = frozenset({"edits", "ReplacementChunks"})
 COMPLETED_STOPS = ("end_turn", "max_tokens", "max_turn_requests")
 
 
