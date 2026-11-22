@@ -2464,7 +2464,7 @@ def task_reply_agent(task_file, room_id: Optional[str], worker: str, rows: list,
     the live file of the id it declares; its receiving agent and queuing lane must agree; the room
     must be the task's own. Addressed to the worker's own agent, that is all. Addressed to a core
     agent, its envelope must verify (`task_envelope`), the worker must hold the task (its own tasks
-    folder, or the pool's delivery sentinel) and it must be neither answered nor archived.
+    folder, or the pool's delivery sentinel) and it must be neither answered, archived nor quarantined.
     NoConnectionForRoom names any failed check."""
     import local_task_protocol
     import task_archive
@@ -2517,6 +2517,9 @@ def task_reply_agent(task_file, room_id: Optional[str], worker: str, rows: list,
     state = task_disposition(ws, tid)
     if state not in (PENDING, CLAIMED):
         refuse(f"it is {state}")
+    from undelivered_quarantine import find_quarantined
+    if find_quarantined(home["results"], tid):
+        refuse("its result is quarantined as undelivered")
     return agent
 
 
