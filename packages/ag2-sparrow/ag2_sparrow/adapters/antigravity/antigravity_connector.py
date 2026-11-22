@@ -48,8 +48,8 @@ import time
 import uuid
 from pathlib import Path
 
-from ... import (acp_host, card_desk, connector_cards, held_start, local_task_protocol, mcp_auth, model_switch,
-                 result_labels, result_publish)
+from ... import (acp_host, card_desk, connector_cards, held_start, live_view, local_task_protocol, mcp_auth,
+                 model_switch, result_labels, result_publish)
 from ...bounded_file_read import read_regular_bytes
 from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore, quoted, trigger_of  # noqa: F401
 from ...acp_client import AcpClient as _SharedClient
@@ -589,6 +589,8 @@ class Connector:
         self.agy_pid = None   # the owner turn's agy process, whose own log names the account it used
         self.desk = card_desk.Desk(self.root, card_desk.led(publish, self.models.unsaid, quoted), quoted,
                                    [self.models, self.accounts])
+        # What a person opening this agent's terminal panel follows (`ag2-sparrow-antigravity-local view`).
+        self.view = live_view.Writer(live_view.path_of(self.root))
 
     def models_seen(self, models: dict):
         """Remember what a Session offered (ACP `models`), for the card."""
@@ -643,7 +645,7 @@ class Connector:
                                                                                       extra_keys=AGY_KEYS,
                                                                                       read_only=read_only,
                                                                                       **self.mcp_grant(headers, kind)),
-                                           self.store, STDERR_NAME, NOT_SIGNED_IN, log, media=media,
+                                           self.store, STDERR_NAME, NOT_SIGNED_IN, log, media=media, view=self.view,
                                            model=self.models.wanted(),
                                            on_models=self.models_seen,
                                            mcp_servers=self.mcp_servers_for(headers, kind),
@@ -662,7 +664,7 @@ class Connector:
         # Images only: the prompt already lists the staged copies this turn may read.
         with acp_host.task_media(own_attachment_headers(headers, message), readable=False) as media:
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt, decide,
-                                       self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=turn,
+                                       self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=turn, view=self.view,
                                        media=acp_host.Media(images=media.images), model=self.models.wanted())
 
     def use_app_gemini_key(self, client, init, argv):
@@ -783,6 +785,7 @@ class Connector:
             return carded
         event, _ = trigger_of(headers)
         log("wake ->", task_id, headers["access_tier"], event or "message")
+        self.view.turn("%s, %s" % (headers.get("sender_name") or headers["access_tier"], kind), message)
         t0 = time.time()
         self.launch = None
         switched = ""
@@ -801,6 +804,7 @@ class Connector:
                 prompt = wake_prompt(task_id, headers, message, operator_lines, None, self.note, readable=pair[1],
                                      kind=kind)
                 status, text, detail, turn = self.run_turn(task_id, headers, prompt, False, pair, message=message)
+        self.view.done(status)
         # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
         # The owner's pick runs on every turn, whoever sends it; the outcome is told in the owner's DM only.
         told = self.models.tell(turn.live, turn.model, headers.get("channel_id"))

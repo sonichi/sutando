@@ -577,6 +577,25 @@ def task_framing(task_id, headers, message, operator_lines, post_with, note=NON_
 
 # ── one turn ─────────────────────────────────────────────────────────────────
 
+# What the live view (`live_view`) calls a tool call, by its ACP kind; any other kind is "called".
+VIEW_WORDS = {"execute": "ran", "edit": "changed", "delete": "deleted", "move": "moved", "read": "read",
+              "fetch": "fetched", "search": "searched", "think": "thought"}
+
+
+def view_step(update):
+    """(what, on what) of an ACP `tool_call` update for the live view: the command it runs, else the paths it
+    touches, else its title."""
+    raw = update.get("rawInput") if isinstance(update.get("rawInput"), dict) else {}
+    kind = update.get("kind") if isinstance(update.get("kind"), str) else ""
+    command = raw.get("command") or raw.get("CommandLine")
+    if isinstance(command, list):
+        command = " ".join(str(c) for c in command)
+    paths = ", ".join(str(loc.get("path")) for loc in update.get("locations") or []
+                      if isinstance(loc, dict) and loc.get("path"))
+    detail = next((d for d in (command, paths, update.get("title")) if isinstance(d, str) and d), "")
+    return VIEW_WORDS.get(kind, "ran" if command else "called"), detail
+
+
 class Turn:
     """Collects the agent's message text and the permission decisions of one prompt, and counts its
     `session/update`s by type (`updates`), so a turn that ends with no text shows what it did instead."""
@@ -590,6 +609,7 @@ class Turn:
         self.resumed = False   # the Session came from session/load, not session/new
         self.session_id = None
         self.lock = threading.Lock()
+        self.view = None       # the agent's live view (`live_view.Writer`), when the adapter keeps one
 
     def on_update(self, params):
         update = params.get("update") if isinstance(params.get("update"), dict) else {}
@@ -597,12 +617,19 @@ class Turn:
             return  # before the prompt, a session/load replays history: never this turn's answer
         with self.lock:
             self.updates[str(update.get("sessionUpdate"))[:60]] += 1
-        if update.get("sessionUpdate") != "agent_message_chunk":
+        kind = update.get("sessionUpdate")
+        if self.view is not None and kind == "tool_call":
+            self.view.step(*view_step(update))
+        elif self.view is not None and kind == "tool_call_update" and update.get("status") == "failed":
+            self.view.step("failed", update.get("title") or update.get("toolCallId") or "a tool call")
+        if kind != "agent_message_chunk":
             return
         content = update.get("content")
         if isinstance(content, dict) and content.get("type") == "text":
             with self.lock:
                 self.chunks.append(content.get("text") or "")
+            if self.view is not None:
+                self.view.say(content.get("text") or "")
 
     @property
     def text(self):
@@ -652,7 +679,7 @@ def use_model(client, session_id, wanted, models, on_models, timeout, log):
 
 
 def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, stderr_name, not_signed_in, log,
-               isolated=None, model=None, on_models=None, media=None, mcp_servers=None, on_initialized=None):
+               isolated=None, model=None, on_models=None, media=None, mcp_servers=None, on_initialized=None, view=None):
     """One task's turn: spawn `args.acp_argv`, `initialize`, resume the task's Session (else open one), send one
     `session/prompt` and wait for it to stop. `decide(params) -> (allowed, reason, result)` answers each
     permission request. (status, text, detail, turn): status is completed | cancelled | timeout | gone | failed
@@ -664,8 +691,11 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
     the `initialize` result (none without it). `on_initialized(client, init, argv)` runs right after
     `initialize`, before any Session is opened (an adapter's own `authenticate` step); a str it returns names
     how this process is authenticated, is saved with the Session, and a saved Session opened under another one
-    (a missing `auth` counts as SIGNED_IN_AUTH) is not resumed: a new one is opened."""
+    (a missing `auth` counts as SIGNED_IN_AUTH) is not resumed: a new one is opened.
+    With `view` (a `live_view.Writer`), the turn's words, tool calls and permission decisions are written to
+    the agent's live view as they happen; never the prompt."""
     turn = Turn()
+    turn.view = view
     cwd = isolated.cwd if isolated else args.cwd
     argv = isolated.argv if isolated else args.acp_argv
     env = isolated.env if isolated else args.child_env
@@ -675,6 +705,9 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
         title = (params.get("toolCall") or {}).get("title") if isinstance(params.get("toolCall"), dict) else None
         turn.decisions.append({"title": str(title or "")[:120], "allowed": ok, "reason": why,
                                "category": action_category(params)})
+        if turn.view is not None:
+            turn.view.step("allowed" if ok else "refused",
+                           "%s%s" % (action_category(params), ": %s" % title if title else ""), why)
         return result
 
     try:
