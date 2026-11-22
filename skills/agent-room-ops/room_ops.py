@@ -22,6 +22,8 @@ graceful-degrade); this file is the unified CLI that dispatches to them.
     python3 room_ops.py events list
     python3 room_ops.py events pull [--cursor N] [--wait S]
     python3 room_ops.py events stream [--cursor-file PATH] [--once] [--max-events N]
+    python3 room_ops.py navigate to <room> [--event $e] [--reason r]  # point the owner's Navigator
+    python3 room_ops.py navigate mention --task-file <task>           # the owner-mention rule
     python3 room_ops.py capabilities                                 # supported commands + say flags
 
 Every subcommand prints a structured JSON result and **exits 0** for any
@@ -281,6 +283,10 @@ def _run(argv):
                    help="disable the grant (authoritative=false); leaves other policy fields intact")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
+    import navigate as _navigate
+    _navigate.add_arguments(sub.add_parser(
+        "navigate", help="point the owner's Navigator at a room (room.navigate Action); "
+                         "`navigate mention --task-file` applies the owner-mention rule"))
     p = sub.add_parser("history", help="read all joined rooms with window pagination and coverage receipts (primary connection)")
     p.add_argument("--since", required=True, help="ISO 8601 time with timezone")
     p.add_argument("--until", help="ISO 8601 time with timezone; default now")
@@ -361,6 +367,8 @@ def _run(argv):
             _kw["thread_root"] = a.thread_root
         res = _say.say(a.message, a.room_id, a.agent_mxid, **_kw)
         _record_say(res)
+    elif a.cmd == "navigate":
+        res = _navigate.run(a)
     elif a.cmd == "grant":
         import grant as _grant
         try:
