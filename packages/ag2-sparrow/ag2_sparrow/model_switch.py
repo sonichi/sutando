@@ -10,6 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
+import uuid
 
 from . import connector_cards
 
@@ -165,11 +167,11 @@ class ModelSwitch:
             self.log("model card not built:", str(e)[:200])
             return None
 
-    def post(self, room, built) -> bool:
+    def post(self, room, built, key: str = "", at_ns: int = 0) -> bool:
         if built is None or not self.usable():
             return False
         try:
-            connector_cards.queue(self.bridge_state, str(room or ""), *built)
+            connector_cards.queue(self.bridge_state, str(room or ""), *built, key=key, at_ns=at_ns)
             return True
         except (OSError, ValueError) as e:
             self.log("model card not queued:", "%s: %s" % (type(e).__name__, e))
@@ -264,21 +266,25 @@ class ModelSwitch:
     def tell(self, live, ran, room=None) -> str:
         """After an owner turn that reached the runtime (`live`): settle the pick it ran with (`ran` is the
         model that turn ran on), then say in the DM each outcome not yet told, oldest first. The state is
-        settled whatever happens to the telling (a refused switch is dropped, never asked for again); a
+        settled, and SAVED with the notice it owes, before any notice is queued, and each notice is queued
+        under its own key: a connector that stops in between neither asks again for a refused model nor
+        queues a notice twice. A
         notice whose card cannot be queued stays owed, the newest UNTOLD_KEEP of them, and one that cannot
         be drawn is said in words once, in the answer of a turn in its own room (`room`), never another's.
         '' when there was nothing to settle or tell."""
         state = self.state()
         kept = state.get("untold")
         owed = [o for o in (kept if isinstance(kept, list) else [kept]) if isinstance(o, dict)]
-        wanted, outcome, changes = str(state.get("wanted") or ""), "", {}
+        wanted, outcome = str(state.get("wanted") or ""), ""
         if wanted and state.get("told") != wanted and live:
             ran = ran or ""
             outcome = "switched" if ran == wanted else "not-switched"
-            owed.append({"picked": wanted, "ran": ran, "room": state.get("asked_in")})
+            owed.append({"picked": wanted, "ran": ran, "room": state.get("asked_in"),
+                         "key": uuid.uuid4().hex, "at": time.time_ns()})
+            owed = owed[-UNTOLD_KEEP:]
             # Only a confirmed pick becomes the model in use: a model the runtime moved the turn to was never picked.
-            changes = dict(told=wanted, **({"current": wanted, "confirmed": wanted} if outcome == "switched"
-                                           else {"wanted": ""}))
+            self.save(untold=owed, told=wanted, **({"current": wanted, "confirmed": wanted} if outcome == "switched"
+                                                   else {"wanted": ""}))
         told, words = "", []
         while owed:
             first = {"picked": str(owed[0].get("picked") or ""), "ran": str(owed[0].get("ran") or "")}
@@ -287,12 +293,13 @@ class ModelSwitch:
                 if room is None or str(owed[0].get("room") or "") != str(room):
                     break           # its words wait for a turn in the room the card was for
                 words.append(self.words(state, **first))
-            elif not self.post(owed[0].get("room"), card):
+            elif not self.post(owed[0].get("room"), card, str(owed[0].get("key") or ""), int(owed[0].get("at") or 0)):
                 break
             owed.pop(0)
+            self.save(untold=list(owed))
             told = "switched" if first["picked"] == first["ran"] else "not-switched"
         self._unsaid = " ".join(words)
-        owed = owed[-UNTOLD_KEEP:]
-        if changes or owed != ([] if kept is None else kept):
-            self.save(untold=owed, **changes)
+        if len(owed) > UNTOLD_KEEP:
+            owed = owed[-UNTOLD_KEEP:]
+            self.save(untold=owed)
         return "untold" if owed else (outcome or told)

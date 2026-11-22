@@ -427,6 +427,37 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         self.assertEqual((self.post_queued(), "model_switch" in self.w.metrics()[-1]), ([], False), "told once")
 
+    def test_a_connector_that_stops_between_queueing_a_notice_and_saving_it_neither_repeats_it_nor_re_asks(self):
+        state = self.w.root / "state" / "model.json"
+        state.write_text(json.dumps({"wanted": "claude-opus-4-6-thinking", "asked_in": self.DM,
+                                     "available": [{"id": "claude-opus-4-6-thinking", "name": "Claude Opus 4.6"},
+                                                   {"id": "gemini-3.8-flash-medium", "name": "Gemini 3.8 Flash"}]}))
+        args = self.w.args()
+        args.bridge_state = str(self.bridge_state())
+        c = gc.Connector(args)
+        ran = "gemini-3.8-flash-medium"         # agy refused the pick: the turn ran on its own model
+        real, saves = model_switch.ModelSwitch.save, []
+
+        def stops_after_the_queue(connector, **changes):
+            # The settlement is saved; the save that would note "notice queued" never happens.
+            saves.append(changes)
+            if len(saves) == 2:
+                raise OSError("the connector stopped here")
+            return real(connector, **changes)
+
+        with mock.patch.object(model_switch.ModelSwitch, "save", stops_after_the_queue):
+            with self.assertRaises(OSError):
+                c.models.tell(True, ran, self.DM)
+        settled = json.loads(state.read_text())
+        self.assertEqual((settled["wanted"], settled["told"], len(settled["untold"])), ("", "claude-opus-4-6-thinking", 1),
+                         "the refusal was settled, with its notice owed, before anything was queued")
+        self.assertEqual(len(self.post_queued()), 1, "the notice was queued once")
+        # After the restart the notice is still owed on record: telling it again is not a second card,
+        # and the next turn does not ask agy for the refused model.
+        self.assertEqual(gc.Connector(args).models.tell(True, ran, self.DM), "not-switched")
+        self.assertEqual((self.post_queued(), json.loads(state.read_text())["untold"]), ([], []))
+        self.assertEqual(json.loads(state.read_text())["wanted"], "", "nothing is left to ask agy for")
+
     def test_two_picks_across_one_outage_are_each_settled_once_and_told_in_order_afterwards(self):
         (self.w.home / "models").write_text("")
         state = self.w.root / "state" / "model.json"
