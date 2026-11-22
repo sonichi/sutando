@@ -918,6 +918,20 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         self.assertIn("I could not switch to Stub 5", c.models.unsaid())
         self.assertEqual((c.models.state().get("untold"), c.models.unsaid()), ([], ""))
 
+    def test_a_turn_that_settles_a_pick_and_asks_for_the_menu_says_the_outcome_once_and_shows_the_settled_model(self):
+        (self.work / "state").mkdir(parents=True)
+        (self.work / "state" / "model.json").write_text(json.dumps({
+            "available": [{"id": "gpt-5.6-sol", "name": "Stub Model"}, {"id": "gpt-6-sol", "name": "Stub\nLarge"}],
+            "current": "gpt-5.6-sol", "wanted": "gpt-6-sol", "asked_in": self.DM, "told": ""}))
+        text = self.serve("task-1", "[[askmodel]] which models do you have")
+        self.assertEqual(text.count("Switched. I'm now using Stub"), 1, "the outcome, in words, not swallowed by the menu")
+        self.assertNotIn("[no-send]", text)
+        ((_, menu),) = self.posted()
+        self.assertEqual((menu["state"], menu["text"].startswith("Now using Stub Large.")), ("pending", True))
+        self.assertEqual((self.state()["current"], self.state()["untold"], metrics(self.work)[-1]["model_switch"]),
+                         ("gpt-6-sol", [], "switched"))
+        self.assertNotIn("Switched", self.serve("task-2", "again"), "told once")
+
 
 class AccountCardTest(CardWorld, unittest.TestCase):
     """The owner's account card (account_switch): asked for in their DM, tapped, signed in in the browser

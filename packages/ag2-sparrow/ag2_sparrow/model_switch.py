@@ -209,7 +209,7 @@ class ModelSwitch:
     def listed(self, result_file) -> "dict | None":
         """The state with a fresh list from the runtime; None (and the owner told) when it would not list."""
         if self.refresh and self.refresh() is False:
-            self.publish(result_file, self.quoted(UNLISTED) + "\n")
+            self.answer(result_file, self.quoted(UNLISTED) + "\n")
             return None
         return self.state()
 
@@ -237,17 +237,25 @@ class ModelSwitch:
                      else self.quoted(self.words(state, picked=picked, same=same)) + "\n")
         return outcome
 
+    def answer(self, result_file, body):
+        """Publish a card matter's answer, led by any outcome this turn settled in words: a menu asked for in
+        the same turn must not swallow them."""
+        words = self.unsaid()
+        if words:
+            body = self.quoted(words) + "\n" + ("" if body == ANSWERED else body)
+        self.publish(result_file, body)
+
     def offer(self, sent, result_file) -> str:
         """Answer the owner's ask with the model card (or the line saying why there is none)."""
         state = self.listed(result_file)
         if state is None:
             return "model-unlisted"
         if not self.offered(state):
-            self.publish(result_file, self.quoted(UNKNOWN) + "\n")
+            self.answer(result_file, self.quoted(UNKNOWN) + "\n")
         elif self.post(sent.get("channel_id"), self.menu(state)):
-            self.publish(result_file, ANSWERED)
+            self.answer(result_file, ANSWERED)
         else:
-            self.publish(result_file, self.quoted(NOT_POSTED) + "\n")
+            self.answer(result_file, self.quoted(NOT_POSTED) + "\n")
         return "model-card"
 
     def asked(self, tier, path, status, text, result_file) -> str:
@@ -260,7 +268,7 @@ class ModelSwitch:
             sent, _ = agent_card.reply_words(f.read())
         if agent_card.owner_may_act(sent) is None:
             return self.offer(sent, result_file)
-        self.publish(result_file, self.quoted(IN_DM) + "\n")
+        self.answer(result_file, self.quoted(IN_DM) + "\n")
         return "model-card-elsewhere"
 
     def tell(self, live, ran, room=None) -> str:
