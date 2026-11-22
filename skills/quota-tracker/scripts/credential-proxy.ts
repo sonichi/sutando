@@ -435,6 +435,34 @@ export function limitState(record: unknown): LimitState {
 
 export type CredentialState = 'ok' | 'exhausted';
 
+export type TimingOutcome =
+	| 'ok' | 'upstream_error' | 'idle_abort'
+	| 'client_closed_before_response' | 'client_closed_during_response';
+
+export interface RequestTiming {
+	id: number;
+	method: string;
+	path: string;
+	attempt: number;
+	// Milliseconds since the request reached the proxy; undefined when never reached.
+	dispatchMs?: number;
+	socketMs?: number;
+	reused?: boolean;
+	ttfbMs?: number;
+	totalMs: number;
+	status: number;
+	outcome: TimingOutcome;
+}
+
+/** One timing line: method, path without query, status and durations only. */
+export function formatTimingLine(t: RequestTiming): string {
+	const ms = (v: number | undefined) => (v === undefined || !Number.isFinite(v) ? '-' : String(Math.round(v)));
+	const path = t.path.split('?')[0].slice(0, 200);
+	return `[Proxy] id=${t.id} timing method=${t.method} path=${path} attempt=${t.attempt}`
+		+ ` dispatch_ms=${ms(t.dispatchMs)} socket_ms=${ms(t.socketMs)} reused=${t.reused === undefined ? '-' : t.reused}`
+		+ ` ttfb_ms=${ms(t.ttfbMs)} total_ms=${ms(t.totalMs)} status=${t.status || '-'} outcome=${t.outcome}`;
+}
+
 export interface ProxyDeps {
 	readCredCandidates: () => StoredClaudeOAuth[];
 	writeCred: (service: string, oauth: ClaudeOAuth) => boolean;
@@ -452,6 +480,7 @@ export interface ProxyDeps {
 	// supervised/unsupervised default without process-env/import-order
 	// tricks; production always gets the env-derived value below.
 	giveUpAfter: number;
+	logTiming: (line: string) => void;
 }
 
 export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
@@ -468,6 +497,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		idleTimeoutMs: UPSTREAM_IDLE_TIMEOUT_MS,
 		exitProcess: (code) => process.exit(code),
 		giveUpAfter: REFRESH_GIVE_UP_AFTER,
+		logTiming: (line) => console.log(`${ts()} ${line}`),
 		...overrides,
 	};
 	const upstreamPort = deps.upstreamUrl.port ? Number(deps.upstreamUrl.port) : 443;
@@ -484,6 +514,9 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 	// Last token an upstream 401 proved dead — never injected again until a
 	// refresh or /login replaces it (cleared on refresh success).
 	let rejectedToken: string | null = null;
+
+	// Monotonic per-request id, so a client-close line can be matched to its retry.
+	let lastRequestId = 0;
 
 	function runSingleFlightRefresh(service: string, cred: ClaudeOAuth): Promise<void> {
 		if (!refreshInFlight) {
@@ -563,6 +596,26 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 	}
 
 	return createServer((req, res) => {
+		const id = ++lastRequestId;
+		const t0 = performance.now();
+		const timing = { attempt: 0, dispatchAt: NaN, socketAt: NaN, reused: undefined as boolean | undefined, ttfbAt: NaN, status: 0, logged: false };
+		const since = (t: number) => (Number.isNaN(t) ? undefined : t - t0);
+		const logTiming = (outcome: TimingOutcome, status: number): void => {
+			if (timing.logged) return;
+			timing.logged = true;
+			try {
+				deps.logTiming(formatTimingLine({
+					id, method: req.method ?? '-', path: req.url ?? '', attempt: timing.attempt,
+					dispatchMs: since(timing.dispatchAt), socketMs: since(timing.socketAt), reused: timing.reused,
+					ttfbMs: since(timing.ttfbAt), totalMs: performance.now() - t0, status, outcome,
+				}));
+			} catch { /* logging must never affect the request */ }
+		};
+		res.on('finish', () => logTiming('ok', res.statusCode));
+		res.on('close', () => {
+			if (res.writableEnded) return;
+			logTiming(res.headersSent ? 'client_closed_during_response' : 'client_closed_before_response', timing.status);
+		});
 		const chunks: Buffer[] = [];
 		req.on('data', (c) => chunks.push(c));
 		req.on('end', async () => {
@@ -618,6 +671,12 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 
 			const forward = (attempt: number): void => {
 				let timedOut = false;
+				timing.attempt = attempt;
+				timing.dispatchAt = performance.now();
+				timing.socketAt = NaN;
+				timing.reused = undefined;
+				timing.ttfbAt = NaN;
+				timing.status = 0;
 
 				const upstream = deps.request(
 					{
@@ -629,6 +688,8 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 						timeout: deps.idleTimeoutMs,
 					} as RequestOptions,
 					(upRes) => {
+						timing.ttfbAt = performance.now();
+						timing.status = upRes.statusCode ?? 0;
 						// Extract rate limit headers
 						const quotaHeaders: Record<string, string> = {};
 						for (const [key, val] of Object.entries(upRes.headers)) {
@@ -684,7 +745,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 							upRes.on('end', () => {
 								const snippet = redactForLog(Buffer.concat(rejChunks).toString('utf8').slice(0, REJECTION_SNIPPET_BYTES));
 								const model = requestModel(body);
-								console.error(`${ts()} [Proxy] rejected HTTP ${code} on ${req.url} model=${model || '?'} peer=${req.socket.remotePort ?? '?'}: ${snippet}`);
+								console.error(`${ts()} [Proxy] id=${id} rejected HTTP ${code} on ${req.url} model=${model || '?'} peer=${req.socket.remotePort ?? '?'}: ${snippet}`);
 								try {
 									deps.recordRejection({
 										ts: new Date(deps.now()).toISOString(), status: code, path: req.url ?? '', snippet,
@@ -699,17 +760,23 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 					},
 				);
 
+				upstream.on('socket', () => {
+					timing.socketAt = performance.now();
+					timing.reused = upstream.reusedSocket;
+				});
+
 				// 'timeout' fires on socket inactivity but does NOT auto-abort — destroy the
 				// request so it surfaces through the 'error' handler below as a clean failure
 				// (and Claude Code's own retry kicks in) instead of hanging indefinitely.
 				upstream.on('timeout', () => {
 					timedOut = true;
-					console.error(`${ts()} [Proxy] Upstream idle >${deps.idleTimeoutMs}ms — aborting`);
+					console.error(`${ts()} [Proxy] id=${id} Upstream idle >${deps.idleTimeoutMs}ms — aborting`);
 					upstream.destroy(new Error('upstream idle timeout'));
 				});
 
 				upstream.on('error', (err) => {
-					console.error(`${ts()} [Proxy] Upstream error:`, err.message);
+					console.error(`${ts()} [Proxy] id=${id} Upstream error:`, err.message);
+					logTiming(timedOut ? 'idle_abort' : 'upstream_error', res.headersSent ? timing.status : (timedOut ? 504 : 502));
 					if (!res.headersSent) {
 						res.writeHead(timedOut ? 504 : 502);
 						res.end(timedOut ? 'Gateway Timeout' : 'Bad Gateway');
