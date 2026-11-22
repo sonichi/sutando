@@ -149,8 +149,9 @@ empty), the tapper's mxid as `sender` and that `room`. That line is written once
 tapper, so repeated taps add nothing. A tap from any other room, or on a card with no known room,
 is not recorded; nor is a typed label from a non-owner, which is a message, not a tap. Every audit
 writer (the bridge and the recovery executor, in either copy of `hitl/recovery.py`) reads, dedupes,
-appends and trims under one `flock` on `state/recovery/audit.lock`, so concurrent writers neither
-lose nor duplicate a line. The audit feeds neither the card, the heartbeat nor `core_recovery.v1`: it is the local
+appends and trims under one lock on `state/recovery/audit.lock` (`file_lock.locked_file`: `flock`
+on POSIX, `msvcrt` on Windows), so concurrent writers neither lose nor duplicate a line. A failed
+trim keeps the appended line and is only logged. The audit feeds neither the card, the heartbeat nor `core_recovery.v1`: it is the local
 record the owner or Sutando reads on the host.
 
 **One card per incident.** After an action the card stays open with its outcome ("Switched the

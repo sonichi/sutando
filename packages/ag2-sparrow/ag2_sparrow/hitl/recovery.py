@@ -11,8 +11,8 @@ show a purchase (iOS) can drop exactly it; no other action or card text names a 
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
+import logging
 import math
 import os
 import re
@@ -183,25 +183,30 @@ def read_receipt(workspace: Path, hitl_id: str) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
-@contextlib.contextmanager
 def _audit_locked(path: Path):
-    with open(path.with_name(AUDIT_LOCK), "a") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    """The platform-aware lock, imported here so importing this module never needs it."""
+    try:
+        from ..file_lock import locked_file   # the vendored package layout
+    except ImportError:
+        from file_lock import locked_file     # the repo's src/ on sys.path
+    return locked_file(path.with_name(AUDIT_LOCK))
 
 
 def _append(path: Path, entry: Dict[str, Any]) -> None:
-    """Append one row and trim to the newest AUDIT_KEEP past twice that; the caller holds the lock."""
+    """Append one row, then trim to the newest AUDIT_KEEP past twice that; the caller holds the lock.
+    A failed trim leaves the appended row in place and is only logged."""
     with open(path, "a") as f:
         f.write(json.dumps(entry, sort_keys=True) + "\n")
-    lines = path.read_text().splitlines()
-    if len(lines) > 2 * AUDIT_KEEP:
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text("\n".join(lines[-AUDIT_KEEP:]) + "\n")
-        os.replace(tmp, path)
+    tmp = path.with_suffix(".tmp")
+    try:
+        lines = path.read_text().splitlines()
+        if len(lines) > 2 * AUDIT_KEEP:
+            tmp.write_text("\n".join(lines[-AUDIT_KEEP:]) + "\n")
+            os.replace(tmp, path)
+    except (OSError, ValueError) as e:
+        logging.getLogger(__name__).warning("recovery audit not trimmed: %s", e)
+        with contextlib.suppress(OSError):
+            tmp.unlink()
 
 
 def audit(workspace: Path, entry: Dict[str, Any]) -> bool:

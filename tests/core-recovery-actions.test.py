@@ -958,6 +958,49 @@ class NotOwnerAudit(unittest.TestCase):
                 (mod.recovery_dir(ws) / mod.AUDIT_FILE).write_bytes(b"\xff\xfe\n")
                 self.assertEqual(mod.audit_not_owner(ws, "h1", "retry", "@x:s", "!r"), mod.NOT_RECORDED)
 
+    def test_a_failed_trim_keeps_the_appended_row_recorded(self):
+        for name, mod in self.copies:
+            with self.subTest(copy=name), mock.patch.object(mod, "AUDIT_KEEP", 1):
+                ws = self._ws(name)
+                mod.recovery_dir(ws).mkdir(parents=True)
+                (mod.recovery_dir(ws) / mod.AUDIT_FILE).write_text('{"at": 1}\n{"at": 2}\n')
+                with mock.patch.object(mod.os, "replace", side_effect=OSError("disk full")), \
+                        self.assertLogs(level="WARNING"):
+                    self.assertEqual(mod.audit_not_owner(ws, "h1", "retry", "@x:s", "!r"), mod.RECORDED)
+                    self.assertEqual(mod.audit_not_owner(ws, "h1", "retry", "@x:s", "!r"), mod.DUPLICATE)
+                    self.assertIs(mod.audit(ws, {"at": 3}), True)
+                rows = self._rows(mod, ws)
+                self.assertEqual([r.get("hitl_id") for r in rows], [None, None, "h1", None])
+                self.assertFalse((mod.recovery_dir(ws) / "audit.tmp").exists())
+
+    _NO_FCNTL = """
+import sys, types
+from pathlib import Path
+src, pkg, which, ws = sys.argv[1:5]
+sys.modules["fcntl"] = None  # Windows: no fcntl; a stub msvcrt stands in for the real one
+calls = []
+sys.modules["msvcrt"] = types.SimpleNamespace(LK_NBLCK=2, LK_UNLCK=0,
+                                              locking=lambda fd, mode, n: calls.append(mode))
+sys.path.insert(0, pkg if which == "vendored" else src)
+if which == "vendored":
+    from ag2_sparrow.hitl import recovery as mod, replies
+else:
+    from hitl import recovery as mod, replies
+assert mod.audit(Path(ws), {"at": 1}) is True
+assert calls == [2, 0], calls
+print("ok")
+"""
+
+    def test_the_audit_imports_and_locks_without_fcntl(self):
+        for which, mod in self.copies:
+            with self.subTest(copy=which):
+                ws = self._ws(f"nofcntl-{which}")
+                r = subprocess.run([sys.executable, "-c", self._NO_FCNTL, str(REPO / "src"),
+                                    str(REPO / "packages" / "ag2-sparrow"), which, str(ws)],
+                                   capture_output=True, text=True, timeout=60)
+                self.assertEqual((r.returncode, r.stdout.strip()), (0, "ok"), r.stderr[-800:])
+                self.assertEqual(len(self._rows(mod, ws)), 1)
+
     # Each writer process loads one copy, waits for `go`, then appends or dedupes in a tight loop.
     _WRITER = """
 import json, sys, time
