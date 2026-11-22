@@ -90,7 +90,8 @@ def confined_permissions(codex, platform=None):
     Codex needs to start itself. On macOS /tmp is named, since the minimal set leaves it readable."""
     rules = {":minimal": "read", ":project_roots": {".": "read"}}
     if (platform or sys.platform) == "darwin":
-        rules.update({"/private/tmp": "deny", "/tmp": "deny"})
+        # /tmp and the folder it is a link to there: the minimal read set leaves both readable.
+        rules.update({folder: "deny" for folder in ("/tmp", os.path.realpath("/tmp"))})
     # Only an executable that is found: an unresolved name would resolve against the connector's own cwd.
     exe = shutil.which(codex) if codex else None
     for folder in link_folders(exe) if exe else ():

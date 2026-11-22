@@ -898,7 +898,7 @@ class EdgePathTest(unittest.TestCase):
             self.assertEqual(folders, [str(shim), str(Path(d).resolve() / "store"), str(real)])
             self.assertEqual(cc.link_folders(str(real / "codex")), [str(real)], "no link: its own folder only")
             mac = cc.confined_permissions(str(shim / "codex"), "darwin")["permissions"][cc.CONFINED_PROFILE]["filesystem"]
-            self.assertEqual({k: v for k, v in mac.items() if v == "deny"}, {"/private/tmp": "deny", "/tmp": "deny"})
+            self.assertEqual({k: v for k, v in mac.items() if v == "deny"}, {"/tmp": "deny", os.path.realpath("/tmp"): "deny"})
             self.assertEqual(sorted(k for k, v in mac.items() if v == "read"), sorted([":minimal"] + folders))
             linux = cc.confined_permissions(str(shim / "codex"), "linux")["permissions"][cc.CONFINED_PROFILE]["filesystem"]
             self.assertNotIn("/tmp", linux, "a Linux turn's scratch dir is under /tmp")
