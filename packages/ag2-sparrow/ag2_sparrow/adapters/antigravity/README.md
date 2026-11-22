@@ -70,17 +70,17 @@ refused), `updates` (the turn's `session/update`s counted by type) and `answer_c
 
 ## Tiers and permissions
 
-The tier is read only from the task's parsed headers, which the gateway stamps, never from the message
-text: a `collaborator: true` or `access_tier: owner` line in the body changes nothing.
+The tier is the shared `task_io.turn_policy`'s, from the attested headers only (a tier claimed in the
+message body changes nothing); the adapter only maps its verdict to a turn (`TURNS`):
 
-| Sender | Served | Turn |
+| `turn_policy` verdict | Who | Turn |
 | --- | --- | --- |
-| owner | always | the owner's turn |
-| Team (an attested collaborator: the team tier with the broker's `collaborator: true`) | always | the owner's turn |
-| guest (any other sender, the team tier without that stamp and an unknown tier included) | always, as Sutando answers them | isolated and read-only |
+| owner | the owner | the owner's turn |
+| collaborator | an attested collaborator (Team: `team` + the broker's `collaborator: true`) | the owner's turn, with a Session of their own per room |
+| restricted | a guest, plain team (no collaborator stamp), any unknown tier | the isolated read-only turn below |
+| refused | (not reached here: every non-owner who is not a collaborator is served restricted, as Sutando answers them) | one refusal line, agy not started |
 
-`--allow-non-owner` is a no-op kept so existing configs parse. `verify` prints `INFO team (attested
-collaborator): served as the owner is …` and `INFO guest and plain team: always served …`.
+No flag is needed for any of them; `--allow-non-owner` still parses and changes nothing.
 
 Every turn runs on the owner's agy sign-in (the Google account and quota in the Keychain): giving someone
 Collaborator access to this agent lets them spend that quota, and their turns may read and edit the
@@ -96,15 +96,22 @@ hand-off to the owner verbatim (`tier_block_lines`). The final reply is scanned 
 **The owner's turn** (the owner and Team, decided by the owner on 2026-11-21) runs in the working
 directory with agy's own home (`~/.gemini`: its settings, rules and context) under the owner's permission
 policy below. The owner resumes the room's Session; each collaborator resumes a Session of their own for
-the room (keyed by their user id), so no one resumes another's conversation.
+the room (keyed by their user id), so no one resumes another's conversation. A collaborator is still framed
+as not the owner.
 
-**A guest's turn** (a guest, plain team or an unknown tier) runs isolated:
+**A restricted turn** (a guest, plain team, an unknown tier) runs isolated:
 
 - a fresh temporary directory per task holds the Session's working directory and a separate agy home,
   passed as `agy acp --gemini-dir <dir>`; that home has only a `settings.json` whose permission rules deny
   every tool (`read_file(*)`, `write_file(*)`, `read_url(*)`, `execute_url(*)`, `download_url(*)`,
   `command(*)`, `mcp(*)`) and no global rules or context; the directory is removed after the turn. `HOME`
   and the rest of the environment are unchanged, so agy finds the sign-in in the Keychain as for the owner;
+- the sender's own attachments to this task (the attested `attachments:` header only, never a path in the
+  message) are copied read-only into `attachments/` in that working directory, and the prompt lists the
+  copies. Only then are file reads moved from deny to ask in that home's rules, and the adapter grants a
+  `read` of exactly those copies, nothing else: not the original under the bridge's media directory, not
+  another task's file, not any other path, and never an edit. A locator that is a symlink, not a regular
+  file, over 25 MB, not the size the header says, or not a local absolute path is not copied;
 - a new Session for every task, never resumed and never recorded in the session store;
 - the Session is put in a read-only mode with `session/set_mode` (`plan`, or a mode named `read-only`),
   picked from the `modes` that `session/new` returns. If agy offers no such mode, or refuses it, the turn
