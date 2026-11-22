@@ -103,8 +103,9 @@ button sends a fixed request, and the click path is collapsed under "Where is it
   route.
 
 The room/reference tour is generated from `feature-list.json`. Its 15 steps carry the same asks:
-- "Do it with your agent" sends a step's request through `artifact.sendToMyAgent`, with the fixed
-  key `tutorial-<step id>`, when the host offers it. Copy stays available.
+- "Do it with your agent" sends a step's request through `artifact.sendToMyAgent` when the host
+  offers it, keyed to the step, the agent and the text. Copy stays available. A room-only step is
+  copy-only on a page launched in the DM.
 - Each step's screenshots sit under its "Where is it?".
 - A step with a runtime restriction is shown only on the matching core.
 

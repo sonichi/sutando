@@ -212,9 +212,15 @@ appends; a page no call can hold is left as is (exit 4).
 
 **Reference tour prompts.** Each step with a `paste` has two buttons:
 - **Do it with your agent** appears only when the host offers `artifact.sendToMyAgent` and
-  `artifact.agent.list`. It sends the step's request to the reader's first listed agent, with the
-  fixed key `tutorial-<step id>`. The host confirms before anything is sent, and a retry with that
-  key is the same request.
+  `artifact.agent.list`. It sends the step's request to the reader's first listed agent.
+  - The key is `tutorial-<step id>-<hash of agent id and text>`, so a changed request or another
+    agent never gets an old receipt back.
+  - After a known decline (`declined`), the next tap is a new attempt (`-r<n>`). After any other
+    failure the same key is asked again, and the host's ledger keeps it from being sent twice.
+  - The host confirms before anything is sent.
+- A step tried in a room (`surface: room`, the Commons step) gets no send button when the page is
+  launched outside a room (`--audience dm`): its request acts on "this room". It keeps Copy and
+  its "Paste in: a room" hint.
 - **Copy** puts the request on the clipboard. Where the page's sandbox refuses the clipboard, the
   request is selected instead and the button says to press ⌘C.
 

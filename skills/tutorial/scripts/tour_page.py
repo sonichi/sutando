@@ -438,13 +438,16 @@ def _data_uri(filename: str) -> str:
     return f"data:{mime};base64," + base64.b64encode((ASSETS / filename).read_bytes()).decode("ascii")
 
 
-def _prompt(key: str, prompt: str, where: Optional[str]) -> str:
+def _prompt(key: str, prompt: str, where: Optional[str], ask: bool = True) -> str:
+    """The step's request with Copy, and with "Do it with your agent" when `ask`: a request that
+    acts in "this room" is copy-only on a page outside a room, which has no room to act in."""
     esc = html.escape(prompt, quote=True)
     hint = f'<p class="paste">Paste in: {WHERE[where]}</p>' if where else ""
     return (f'<div class="prompt"><code id="p-{key}">{html.escape(prompt)}</code>'
             f'<button type="button" class="copy" data-prompt="{esc}" aria-describedby="p-{key}">Copy</button>'
-            f'</div><p class="ask-row"><button type="button" class="ask" data-ask="{esc}" '
-            f'data-key="tutorial-{key}" hidden>Do it with your agent</button></p>{hint}')
+            + (f'</div><p class="ask-row"><button type="button" class="ask" data-ask="{esc}" '
+               f'data-key="tutorial-{key}" hidden>Do it with your agent</button></p>' if ask else '</div>')
+            + hint)
 
 
 def _shots(images: Tuple[Shot, ...], media: Dict[str, str]) -> str:
@@ -513,8 +516,10 @@ def _locate(sec: Section, who: str, media: Dict[str, str]) -> str:
             f'{_shots(sec.images, media)}</details>')
 
 
-def _section(sec: Section, index: int, who: str, prompts: Dict[str, str], media: Dict[str, str]) -> str:
-    prompt = _prompt(sec.id, prompts.get(sec.id, sec.prompt), sec.where) if sec.prompt else ""
+def _section(sec: Section, index: int, who: str, prompts: Dict[str, str], media: Dict[str, str],
+             in_room: bool = False) -> str:
+    ask = sec.where != "room" or in_room
+    prompt = _prompt(sec.id, prompts.get(sec.id, sec.prompt), sec.where, ask) if sec.prompt else ""
     icon = ICONS.get(sec.id, DEFAULT_ICON)
     tone = accent(index)
     return (
@@ -831,14 +836,17 @@ COPY_SCRIPT = """<script>
 })();
 </script>"""
 
-# One tap asks the viewer's own agent through the host (artifact.sendToMyAgent), which confirms first;
-# the fixed key per step makes a retry the same request. Without the host the button stays hidden.
+# One tap asks the viewer's own agent through the host (artifact.sendToMyAgent), which confirms first.
+# The key binds the step to its text and agent, so a changed request never reuses an old receipt; a
+# known decline moves to a new attempt key, any other failure keeps the key (the host replays it once).
 SEND_SCRIPT = """<script>
 (() => {
   const host = (() => { try { return window.artifact || null; } catch (e) { return null; } })();
   if (!host || typeof host.sendToMyAgent !== 'function' || !host.agent || typeof host.agent.list !== 'function') return;
   const status = document.getElementById('status');
   const say = (m) => { status.textContent = ''; setTimeout(() => { status.textContent = m; }, 60); };
+  const hash = (s) => { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return ('0000000' + h.toString(16)).slice(-8); };
+  const attempts = new Map();
   let agent = null;
   const pick = async () => {
     if (agent) return agent;
@@ -856,16 +864,25 @@ SEND_SCRIPT = """<script>
     try {
       const a = await pick();
       if (!a) { say('Allow this page to see your agents when asked, then tap again.'); btn.disabled = false; return; }
-      const r = await host.sendToMyAgent({ agentId: a.id, text: btn.getAttribute('data-ask'), key: btn.getAttribute('data-key') });
+      const text = btn.getAttribute('data-ask');
+      const base = btn.getAttribute('data-key') + '-' + hash(a.id + '\\n' + text);
+      const n = attempts.get(base) || 0;
+      const key = n ? base + '-r' + n : base;
+      const r = await host.sendToMyAgent({ agentId: a.id, text, key });
       if (r && r.ok) {
         btn.classList.add('sent');
         btn.textContent = 'Sent to ' + (a.name || 'your agent');
         say('Sent to ' + (a.name || 'your agent') + '. The reply comes in your DM.');
-      } else {
-        say('Not sent' + (r && r.reason ? ' (' + r.reason + ')' : '') + '. Tap to try again, or copy the line.');
-        btn.disabled = false;
+        return;
       }
-    } catch (e) { say('Not sent. Tap to try again, or copy the line.'); btn.disabled = false; }
+      if (r && r.reason === 'declined') {
+        attempts.set(base, n + 1);
+        say('Not sent. Tap to ask again, or copy the line.');
+      } else {
+        say('Not sure it was sent' + (r && r.reason ? ' (' + r.reason + ')' : '') + '. Tap to check; it is never sent twice.');
+      }
+      btn.disabled = false;
+    } catch (e) { say('Not sure it was sent. Tap to check; it is never sent twice.'); btn.disabled = false; }
   });
 })();
 </script>"""
@@ -968,7 +985,7 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
             + (f"A quick tour with your personal native agent, {who}. Try one thing in each part."
                if audience == "dm" else "A quick tour. Try one thing in each part."))
     secs = sections_for(core, features)
-    body = "".join(_section(s, i, who, prompts, media) for i, s in enumerate(secs))
+    body = "".join(_section(s, i, who, prompts, media, audience == "room") for i, s in enumerate(secs))
     overview_style, overview_body = overview_parts()
     checklist_header = (f'<header class="hero">{HERO}<div><h1>Getting started with {who}</h1>'
                         f'<p class="lead">{lead}</p>{picked}</div></header>')

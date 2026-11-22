@@ -90,6 +90,15 @@ TOUR = ["Your DM", "Rooms", "Commons", "Your workers", "Connect other agents", "
         "Schedule something", "Calls & voice", "Memory", "Morning check-in", "Activity & notices",
         "Get the mobile app", "Pair your phone", "Something not working?"]
 FINALE = "You\u2019re set. Ask Blue anything"
+ROOMS_PROMPT = [s for s in gs.tour_page.FEATURES.steps if s.id == "rooms"][0].prompt
+
+
+def send_key(step, agent_id, text):
+    """The page's send key: the step, then FNV-1a over agent id, newline and text (UTF-16 units)."""
+    h = 0x811C9DC5
+    for unit in (agent_id + "\n" + text).encode("utf-16-le")[::2]:
+        h = ((h ^ unit) * 0x01000193) & 0xFFFFFFFF
+    return f"tutorial-{step}-{h:08x}"
 # The stub room-commons has no room_media.py: every full-resolution capture stays inlined.
 NO_MEDIA_SUPPORT = {"uploaded": [], "skipped": [], "fallback": list(gs.tour_page.hd_files(gs.tour_page.FEATURES)),
                     "reason": "this room-commons has no room media support (room_media.py)"}
@@ -194,6 +203,23 @@ class RenderTest(unittest.TestCase):
         self.assertIn("stepPos.textContent = (cur + 1) + '/' + ids.length", gs.tour_page.SCRIPT)
         self.assertIn("stepTitle.textContent = titles[cur]", gs.tour_page.SCRIPT)
 
+    def test_a_room_only_step_is_copy_only_when_the_page_is_launched_outside_a_room(self):
+        # The Commons ask says "this room": from the owner's DM there is no room to act in, so it
+        # keeps Copy and its "Paste in: a room" hint, and only a room's page offers the send.
+        def commons(page):
+            return page.split('id="s-commons"', 1)[1].split("</section>", 1)[0]
+        dm = commons(gs.render_page("Blue", "claude", "dm"))
+        room = commons(gs.render_page("Blue", "claude", "room"))
+        self.assertNotIn('class="ask"', dm)
+        self.assertIn('class="copy"', dm)
+        self.assertIn("Paste in: a room", dm)
+        self.assertIn('class="ask"', room)
+        rooms = gs.render_page("Blue", "claude", "room")
+        self.assertEqual(rooms.count('<button type="button" class="ask"'), 15)
+        for sec in gs.sections_for("claude"):
+            if sec.prompt and sec.where == "room":
+                self.assertNotIn('data-key="tutorial-%s"' % sec.id, gs.render_page("Blue", "claude", "dm"))
+
     def test_reviewed_wording(self):
         by = {s.id: s for s in gs.sections_for("claude")}
         self.assertIn("Claude Duet, Dot, Grok Bot, Hermes, Muse or OpenClaw", by["agents"].what)
@@ -214,7 +240,8 @@ class RenderTest(unittest.TestCase):
             for click in ("Press ", "Click ", "Open Settings", "choose "):
                 self.assertNotIn(click, sec.how, (sec.id, click))
         page = gs.render_page("Blue", "claude")
-        self.assertEqual(page.count('<button type="button" class="ask"'), 15)  # 14 steps and the finale
+        # The page is launched in the DM here: the room-only Commons step is copy-only (below).
+        self.assertEqual(page.count('<button type="button" class="ask"'), 14)  # 13 steps and the finale
         self.assertEqual(page.count("<summary>Where is it?</summary>"),
                          len([s for s in gs.sections_for("claude") if s.locate]))
         for wrong in ("&rarr; Connected apps", "\u2192 Connected apps", "choose Room.", "Plan &amp; usage"):
@@ -460,6 +487,25 @@ const dom = new JSDOM(html, { url: 'https://page.test/', runScripts: 'dangerousl
         agent: { list: () => Promise.resolve(scenario === 'ask' ? [{ id: 'ag1', name: 'Ada' }] : []) },
         sendToMyAgent: (req) => { out.sent = (out.sent || []).concat([req]); return Promise.resolve({ ok: true, eventId: 'e1' }); } };
     }
+    if (scenario.startsWith('ledger-')) {
+      // The host's receipt ledger: a sent receipt or an explicit decline is kept for its key and
+      // returned for that key again; an unknown outcome records nothing.
+      const ledger = new Map(scenario === 'ledger-old' ? [['tutorial-rooms', { ok: true, eventId: 'old' }]] : []);
+      const outcomes = { 'ledger-declined': ['declined', 'ok'], 'ledger-unknown': ['unknown', 'ok'], 'ledger-old': ['ok'] }[scenario];
+      out.keys = []; out.fresh = [];
+      w.artifact = { ...runtime({ id: 'u10' }, () => []),
+        agent: { list: () => Promise.resolve([{ id: 'ag2', name: 'Bo' }]) },
+        sendToMyAgent: (req) => {
+          out.keys.push(req.key);
+          if (ledger.has(req.key)) return Promise.resolve(ledger.get(req.key));
+          out.fresh.push(req.key);
+          const o = outcomes.shift();
+          if (o === 'unknown') return Promise.resolve({ ok: false, reason: 'request outcome unknown' });
+          const r = o === 'declined' ? { ok: false, reason: 'declined' } : { ok: true, eventId: 'e' + out.fresh.length };
+          ledger.set(req.key, r);
+          return Promise.resolve(r);
+        } };
+    }
     if (scenario === 'copy-ok') Object.defineProperty(w.navigator, 'clipboard', { value: { writeText: () => Promise.resolve() } });
     if (scenario === 'copy-fail') {
       Object.defineProperty(w.navigator, 'clipboard', { value: { writeText: () => Promise.reject(new Error('denied')) } });
@@ -525,6 +571,14 @@ const mark = (i) => { const b = d.querySelectorAll('input[data-done]')[i]; b.che
     out.askLabel = b.textContent;
     out.askDisabled = b.disabled;
     out.status = d.getElementById('status').textContent;
+  }
+  if (scenario.startsWith('ledger-')) {
+    const b = d.querySelector('#s-rooms button.ask');
+    b.click();
+    await sleep(150);
+    out.after1 = { label: b.textContent, disabled: b.disabled, status: d.getElementById('status').textContent };
+    if (!b.disabled) { b.click(); await sleep(150); }
+    out.after2 = { label: b.textContent, disabled: b.disabled };
   }
   if (scenario.startsWith('copy')) {
     d.querySelector('button[data-prompt]').click();
@@ -622,11 +676,35 @@ class PageBehaviourTest(unittest.TestCase):
 
     def test_do_it_with_your_agent_sends_the_steps_fixed_ask_once(self):
         out = self.run_page("ask")
-        self.assertEqual(out["askHidden"], [False] * 15)
+        self.assertEqual(out["askHidden"], [False] * 14)  # a DM-launched page: Commons is copy-only
         rooms = [s for s in gs.sections_for("claude") if s.id == "rooms"][0]
-        self.assertEqual(out["sent"], [{"agentId": "ag1", "text": rooms.prompt, "key": "tutorial-rooms"}])
+        self.assertEqual(out["sent"], [{"agentId": "ag1", "text": rooms.prompt, "key": send_key("rooms", "ag1", rooms.prompt)}])
         self.assertEqual((out["askLabel"], out["askDisabled"]), ("Sent to Ada", True))
         self.assertIn("The reply comes in your DM.", out["status"])
+
+    def test_after_a_known_decline_the_next_tap_is_a_new_attempt(self):
+        out = self.run_page("ledger-declined")
+        base = send_key("rooms", "ag2", ROOMS_PROMPT)
+        self.assertEqual(out["keys"], [base, base + "-r1"])
+        self.assertEqual(out["fresh"], [base, base + "-r1"])
+        self.assertIn("Not sent. Tap to ask again", out["after1"]["status"])
+        self.assertEqual((out["after2"]["label"], out["after2"]["disabled"]), ("Sent to Bo", True))
+
+    def test_after_an_unknown_outcome_the_same_key_is_asked_again(self):
+        out = self.run_page("ledger-unknown")
+        base = send_key("rooms", "ag2", ROOMS_PROMPT)
+        self.assertEqual(out["keys"], [base, base])
+        self.assertIn("it is never sent twice", out["after1"]["status"])
+        self.assertEqual(out["after2"]["label"], "Sent to Bo")
+
+    def test_a_receipt_for_another_text_or_agent_is_never_reused(self):
+        out = self.run_page("ledger-old")
+        base = send_key("rooms", "ag2", ROOMS_PROMPT)
+        self.assertEqual(out["keys"], [base])
+        self.assertEqual(out["fresh"], [base])  # the old step key's receipt was not returned
+        self.assertNotEqual(send_key("rooms", "ag2", ROOMS_PROMPT + " Now."), base)
+        self.assertNotEqual(send_key("rooms", "ag1", ROOMS_PROMPT), base)
+        self.assertRegex(base, r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
     def test_no_agent_offered_sends_nothing_and_says_how_to_allow_it(self):
         out = self.run_page("ask-refused")
@@ -636,7 +714,7 @@ class PageBehaviourTest(unittest.TestCase):
 
     def test_without_the_host_bridge_the_ask_button_stays_hidden(self):
         out = self.run_page("me")
-        self.assertEqual(out["askHidden"], [True] * 15)
+        self.assertEqual(out["askHidden"], [True] * 14)
 
     def test_arrow_keys_only_inside_the_tour_and_not_on_controls(self):
         out = self.run_page("keys")

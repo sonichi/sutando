@@ -43,11 +43,25 @@ def seed(workspace: Path, source: Path = SOURCE) -> str:
     except FileExistsError:
         return "present"
     except OSError:
-        if os.path.lexists(dest):
-            return "present"
-        os.replace(tmp, dest)  # a filesystem without hard links
+        return _create_exclusive(dest, data)  # a filesystem without hard links
     finally:
         Path(tmp).unlink(missing_ok=True)
+    return "seeded"
+
+
+def _create_exclusive(dest: Path, data: bytes) -> str:
+    """Create `dest` only if absent (O_EXCL), so a file made at any moment before is kept;
+    a write that fails removes the file it created, leaving the next launch to try again."""
+    try:
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        return "present"
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+    except OSError as exc:
+        dest.unlink(missing_ok=True)
+        return f"skipped: {type(exc).__name__}"
     return "seeded"
 
 

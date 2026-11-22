@@ -81,6 +81,62 @@ class Seed(unittest.TestCase):
         self.assertEqual(dest.read_text(), "written meanwhile\n")
         self.assertEqual([p.name for p in dest.parent.iterdir()], ["first-time-tutorial.md"])
 
+    def test_a_note_created_after_every_check_is_never_replaced_without_hard_links(self):
+        # The owner's note appears after each existence check and before the copy lands: only an
+        # exclusive create keeps it.
+        dest = svt.target(self.ws)
+        real_lexists = os.path.lexists
+
+        def appears_after_the_check(path):
+            if Path(path) == dest and not real_lexists(path):
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text("my own note\n")
+            return False
+
+        def no_links(src, dst):
+            raise PermissionError("hard links not supported")
+        with mock.patch.object(svt.os, "link", no_links), \
+                mock.patch.object(svt.os.path, "lexists", appears_after_the_check):
+            self.assertEqual(svt.seed(self.ws), "present")
+        self.assertEqual(dest.read_text(), "my own note\n")
+        self.assertEqual([p.name for p in dest.parent.iterdir()], ["first-time-tutorial.md"])
+
+    def test_an_exclusive_create_whose_write_fails_leaves_nothing(self):
+        dest = svt.target(self.ws)
+        dest.parent.mkdir(parents=True)
+        real_open, real_fdopen, opened = os.open, os.fdopen, set()
+
+        def tracking_open(path, flags, *a):
+            fd = real_open(path, flags, *a)
+            if Path(path) == dest:
+                opened.add(fd)
+            return fd
+
+        class DiskFull:
+            def __init__(self, fh):
+                self.fh = fh
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.fh.close()
+
+            def write(self, _data):
+                raise OSError(28, "No space left on device")
+
+        def failing_on_dest(fd, *a, **k):
+            fh = real_fdopen(fd, *a, **k)
+            return DiskFull(fh) if fd in opened else fh
+
+        def no_links(src, dst):
+            raise PermissionError("hard links not supported")
+        with mock.patch.object(svt.os, "link", no_links), mock.patch.object(svt.os, "open", tracking_open), \
+                mock.patch.object(svt.os, "fdopen", failing_on_dest):
+            self.assertEqual(svt.seed(self.ws), "skipped: OSError")
+        self.assertFalse(os.path.lexists(dest))
+        self.assertEqual(svt.seed(self.ws), "seeded")  # the next launch tries again
+
     def test_the_workspace_comes_from_the_shared_resolver(self):
         import workspace_default
         with mock.patch.object(workspace_default, "resolve_workspace", return_value=self.ws) as rw:
