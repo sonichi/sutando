@@ -27,6 +27,8 @@ from task_archive import find_task_file  # noqa: E402
 
 PENDING, CLAIMED, ANSWERED, ARCHIVED, MISSING = "pending", "claimed", "answered", "archived", "missing"
 SETTLED = frozenset((ANSWERED, ARCHIVED))
+# A task still owed an answer: the only kind that holds its room for the lane that queued it.
+LIVE = frozenset((PENDING, CLAIMED))
 # A worker's delivery sentinel for a task in one of these owes no work.
 SPENT = frozenset((ANSWERED, ARCHIVED, MISSING))
 
@@ -55,6 +57,11 @@ def task_dispositions(workspace, task_ids) -> dict:
         out.update({t: _decide(root, tasks, t, f"{t}.txt" in ready
                                or task_lookup.find_other_archived_ready_result(root, t) is not None) for t in ids})
     return dict(sorted(out.items()))
+
+
+def live_tasks(workspace, task_ids) -> set:
+    """The ids among `task_ids` whose task is still unanswered (`LIVE`)."""
+    return {t for t, state in task_dispositions(workspace, task_ids).items() if state in LIVE}
 
 
 def _decide(workspace, tasks: Path, task_id: str, answered: bool) -> str:

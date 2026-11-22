@@ -249,6 +249,24 @@ class FileAttachTests(unittest.TestCase):
         self.mod.TASK_ROOMS_FILE.write_text("{not json")
         self.assertEqual(self.mod._load_task_rooms(), {})
 
+    def test_completed_tasks_are_pruned_from_the_rooms_map(self):
+        for tid in ("done", "flying", "queued", "claimed", "answered"):
+            self.mod._record_task_room(tid, "!x:s")
+        (self.mod.TASKS_DIR / "queued.txt").write_text("task: x\n")
+        (self.mod.TASKS_DIR / "claimed.claimed-core.txt").write_text("task: x\n")
+        (self.mod.RESULTS_DIR / "answered.txt").write_text("r\n")
+        suspects = self.mod._prune_task_rooms({"flying"}, set())
+        self.assertEqual(suspects, {"done"})                 # first sighting: nothing goes yet
+        self.assertIn("done", self.mod._load_task_rooms())
+        self.assertEqual(self.mod._prune_task_rooms({"flying"}, suspects), set())
+        self.assertEqual(list(self.mod._load_task_rooms()), ["flying", "queued", "claimed", "answered"])
+
+    def test_a_task_back_in_flight_before_its_second_sighting_is_kept(self):
+        self.mod._record_task_room("a", "!x:s")
+        suspects = self.mod._prune_task_rooms(set(), set())
+        self.assertEqual(self.mod._prune_task_rooms({"a"}, suspects), set())
+        self.assertEqual(self.mod._load_task_rooms(), {"a": "!x:s"})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

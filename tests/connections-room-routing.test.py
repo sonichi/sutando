@@ -66,6 +66,10 @@ class Base(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"schema_version": C.SCHEMA_VERSION, "connections": rows}))
 
+    def queue(self, tid):
+        (self.ws / "tasks").mkdir(exist_ok=True)
+        (self.ws / "tasks" / f"{tid}.txt").write_text("task: x\n")
+
     def instance(self, room):
         r = C.connection_for_room(room, self.ws)
         return None if r is None else r["instance"]
@@ -111,6 +115,8 @@ class TestSelection(Base):
         state = C.record_path(self.ws).parent
         (state / "remote-task-rooms.dev-s-space.json").write_text(json.dumps({"task-dev-s-space~1": "!opaqueid"}))
         (state / "remote-task-rooms.json").write_text("{broken")
+        self.assertEqual(self.instance("!opaqueid"), "s-space")  # the entry's task is not queued
+        self.queue("task-dev-s-space~1")
         self.assertEqual(self.instance("!opaqueid"), "dev-s-space")
         self.assertEqual(self.instance("!otherid"), "s-space")
 
@@ -119,6 +125,7 @@ class TestSelection(Base):
         state = C.record_path(self.ws).parent
         for name in ("remote-task-rooms.json", "remote-task-rooms.dev-s-space.json"):
             (state / name).write_text(json.dumps({"t": "!opaqueid"}))
+        self.queue("t")
         self.assertEqual(self.instance("!opaqueid"), "s-space")
 
     def test_unknown_server_is_refused_by_name(self):

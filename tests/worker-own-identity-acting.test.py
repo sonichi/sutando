@@ -100,8 +100,12 @@ class Base(unittest.TestCase):
     def record(self, rws):
         C.record_path(self.ws).write_text(json.dumps({"schema_version": C.SCHEMA_VERSION, "connections": rws}))
 
-    def open_task(self, instance, room):
-        (self.ws / "state" / f"remote-task-rooms.{instance}.json").write_text(json.dumps({"task-x": room}))
+    def open_task(self, instance, room, tid="task-x", live="{tid}.txt"):
+        """A task-room entry for `tid`, with the task still queued under `live` (None: no task file)."""
+        (self.ws / "state" / f"remote-task-rooms.{instance}.json").write_text(json.dumps({tid: room}))
+        if live:
+            (self.ws / "tasks").mkdir(exist_ok=True)
+            (self.ws / "tasks" / live.format(tid=tid)).write_text("task: x\n")
 
     def owner_dm(self, instance, agent, room):
         (self.ws / "state" / f"owner-routing.{instance}.json").write_text(json.dumps(
@@ -164,6 +168,32 @@ class TheCoresRooms(Base):
         self.open_task("alpha", ROOM)
         self.open_task(OWN, ROOM)
         self.assertEqual(self.instance(ROOM, SEAT), OWN)
+
+    def test_a_claimed_task_still_holds_its_room(self):
+        self.open_task("alpha", ROOM, live="{tid}.claimed-core.txt")
+        self.assertEqual(self.instance(ROOM, SEAT), "alpha")
+
+    def test_an_entry_left_by_an_archived_task_holds_no_room(self):
+        self.open_task("alpha", ROOM, live=None)
+        (self.ws / "tasks" / "archive").mkdir(parents=True)
+        (self.ws / "tasks" / "archive" / "task-x.txt").write_text("task: x\n")
+        self.assertEqual(self.instance(ROOM, SEAT), OWN)
+        self.assertEqual(C.room_credential(ROOM, workspace=self.ws, environ=SEAT), (ALPHA, ALPHA + "|own-secret"))
+
+    def test_an_entry_for_an_answered_or_vanished_task_holds_no_room(self):
+        self.open_task("alpha", ROOM, live=None)
+        self.assertEqual(self.instance(ROOM, SEAT), OWN)
+        self.open_task("alpha", ROOM)
+        (self.ws / "results").mkdir()
+        (self.ws / "results" / "task-x.txt").write_text("done\n")
+        self.assertEqual(self.instance(ROOM, SEAT), OWN)
+
+    def test_one_live_task_among_stale_entries_still_holds_the_room(self):
+        self.open_task("alpha", ROOM, tid="task-live")
+        path = self.ws / "state" / "remote-task-rooms.alpha.json"
+        path.write_text(json.dumps({"task-old-1": ROOM, "task-old-2": "!elsewhere:alpha-fixture.net",
+                                    **json.loads(path.read_text())}))
+        self.assertEqual(self.instance(ROOM, SEAT), "alpha")
 
     def test_the_cores_owner_dm_stays_the_cores(self):
         self.owner_dm("alpha", CORE_AGENT, CORE_DM)
