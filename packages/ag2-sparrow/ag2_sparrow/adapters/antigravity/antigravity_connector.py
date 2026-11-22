@@ -629,6 +629,9 @@ class Connector:
         opening one when not given, where only reads of the staged attachments are granted."""
         if owner:
             cwd, tools = self.args.cwd, shell_web_on(self.args, headers, kind)
+            # The owner's pick is applied on the owner's own turn, never on a collaborator's, which
+            # shares this turn mode: "on your next message" is the owner's next message.
+            picked = self.models.wanted() if (kind or turn_for(headers)[0]) == OWNER else ""
             with acp_host.task_media(headers, readable=True, log=log) as media:
                 read_only = (media.folder,) if media.folder else ()
                 return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
@@ -637,7 +640,7 @@ class Connector:
                                                                                       read_only=read_only,
                                                                                       **self.mcp_grant(headers, kind)),
                                            self.store, STDERR_NAME, NOT_SIGNED_IN, log, media=media,
-                                           model=self.models.wanted(),
+                                           model=str(picked or "") or None,
                                            on_models=self.models_seen,
                                            mcp_servers=self.mcp_servers_for(headers, kind))
         if isolated is None:
@@ -724,7 +727,7 @@ class Connector:
                                      kind=kind)
                 status, text, detail, turn = self.run_turn(task_id, headers, prompt, False, pair, message=message)
         # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
-        told = self.models.tell(turn.live, turn.model, headers.get("channel_id")) if owner_turn else ""
+        told = self.models.tell(turn.live, turn.model, headers.get("channel_id")) if kind == OWNER else ""
         asked = self.desk.marked(headers.get("access_tier"), path, status, text, result_file)
         unsaid = "" if asked else quoted(self.models.unsaid()).strip()
         body = self.answer_body(headers, status, text, detail, turn) + (unsaid and unsaid + "\n")
