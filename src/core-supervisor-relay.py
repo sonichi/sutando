@@ -44,6 +44,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -126,18 +127,12 @@ def _is_refused_limit(signal: dict) -> bool:
 _RESET_AT = re.compile(r"resets?\s+(?:at\s+)?((?:[A-Z][a-z]{2}\s+\d{1,2}\s+at\s+)?\d{1,2}(?::\d{2})?\s*[ap]m)", re.I)
 
 
-# The core's own card carries these buttons (hitl.recovery); the notice names them, not commands.
-_CARD_WHERE = "on its card in your s.space DM"
 
-
-def _limit_remedy(signal: dict, surface: str = "") -> str:
-    """A usage-limit screen resumes by itself; a sign-in cannot clear it. The card is named
-    only on the surface it reaches."""
+def _limit_remedy(signal: dict) -> str:
+    """A usage-limit screen resumes by itself; a sign-in cannot clear it."""
     m = _RESET_AT.search(signal.get("prompt") or "")
     when = f"at {m.group(1)}" if m else "when the limit window resets"
-    how = (f"the buttons {_CARD_WHERE} switch it to another model or runtime, or restart it"
-           if _CARD_SURFACE.search(surface or "") else
-           "switch it to another model or runtime, or restart it, from the Runtime panel"
+    how = ("switch it to another model or runtime, or restart it, from the Runtime panel"
            f" on {_core_host_label() or 'the host'}")
     return (f" — the core hit its usage limit, not a login problem; it resumes"
             f" on its own {when}. Nothing to do unless you want it sooner: {how}; signing"
@@ -192,28 +187,55 @@ def _derive_backend() -> "dict | None":
 
 # The HITL card is projected into AG2 Space rooms only (src/hitl/projector.py).
 _CARD_SURFACE = re.compile(r"ag2[.-]?space")
+#: How long a raised card may take to reach the owner before the relay sends its own alert.
+CARD_WAIT_S = 120.0
+#: The monitor raises the card in the tick it writes the signal; one relay pass (30 s) covers it.
+CARD_RAISE_WAIT_S = 45.0
 
 
-def _card_projected(signal: dict, surface: str) -> bool:
-    """True only when the owner's surface shows the HITL card AND tui_gate gives it option
-    buttons; a trust/bypass/limit dialog or an unparseable prompt keeps the button-less card."""
-    if not surface or not _CARD_SURFACE.search(surface):
-        return False
+def _attach_command(be: dict) -> str:
+    """The tmux attach line, shell-quoted: the default socket path holds a space."""
+    return shlex.join(["tmux", "-S", be["socket"], "attach", "-t",
+                       be.get("session") or _DEFAULT_TMUX_SESSION])
+
+
+def card_store_for(signal_path: str) -> str:
+    """The HITL store beside `signal_path`, found the way the monitor that wrote both finds it."""
+    ws = os.path.dirname(os.path.dirname(os.path.abspath(signal_path)))
+    return os.path.join(ws, "state", "hitl", "requirements")
+
+
+def _card_verdict(signal: dict, surface: str, card_store, signal_age) -> str:
+    """"carried" when the owner's s.space card already shows this block, "wait" while a raised
+    card is still on its way, else "send": the relay's own alert is the only one."""
+    if not card_store or not surface or not _CARD_SURFACE.search(surface):
+        return "send"
     try:
         here = os.path.dirname(os.path.abspath(__file__))
         if here not in sys.path:
             sys.path.insert(0, here)
-        from hitl import tui_gate
-        req = tui_gate.requirement_for(signal.get("state") or "", signal.get("kind"), signal.get("prompt"),
-                                       signal.get("session") or "", "", "")
-        return any(a.kind != "open_terminal" for a in req.actions)
-    except Exception:  # noqa: BLE001 - no card known for sure: name the terminal
-        return False
+        from hitl import core_card
+        state = signal.get("state") or ""
+        status = core_card.card_status(card_store, signal.get("session") or "", state,
+                                       signal.get("kind"), signal.get("prompt"))
+    except Exception:  # noqa: BLE001 - no card known for sure: send the alert
+        return "send"
+    if status == core_card.SHOWN:
+        return "carried"
+    age = CARD_WAIT_S if signal_age is None else signal_age
+    if status == core_card.PENDING and age < CARD_WAIT_S:
+        return "wait"
+    # A store means this host raises cards; with none there, no card is coming.
+    if (status == core_card.NONE and state in core_card.CARD_STATES and age < CARD_RAISE_WAIT_S
+            and os.path.isdir(card_store)):
+        return "wait"
+    return "send"
 
 
 def compose_message(signal: dict, surface: str = "") -> str:
     """The owner-facing 'action needed' line: what's stuck + a prompt excerpt. `surface` is
-    the channel it goes to, which decides whether a choice card can be named."""
+    accepted for callers; on s.space the relay sends only when no card shows the block, so
+    the text names no card anywhere."""
     aa = _soft_notice(signal)
     if aa and signal.get("state") not in HARD_ESCALATE and aa.get("kind") == "fable-limit-refused":
         who = f"worker {signal['seat']}" if signal.get("seat") else "the core"
@@ -254,31 +276,23 @@ def compose_message(signal: dict, surface: str = "") -> str:
         msg += (" — the core sits at its idle prompt but refuses every turn it is sent; each"
                 " ends in that line, so nothing queued for it runs")
     if limited:
-        msg += _limit_remedy(signal, surface)
+        msg += _limit_remedy(signal)
     elif signal.get("kind") == "fable-limit-unfocused":
         msg += (" — Claude Code's Fable weekly-limit dialog is up but the focused option is"
                 " not \"Switch to <fallback> and continue\", so the core will not press Enter"
-                " (that could spend credits)."
-                + (f" Tap Restart core {_CARD_WHERE}, or pick the switch in the Runtime panel."
-                   if _CARD_SURFACE.search(surface or "") else
-                   " Pick the switch, or restart the core, in the Runtime panel."))
+                " (that could spend credits). Pick the switch, or restart the core, in the Runtime panel.")
     elif signal.get("state") == "signal-unreadable":
         host = _core_host_label() or "the host"
         msg += (f" — check the core on {host}; restarting the engine rewrites the file."
                 " If the core looks fine, no action is needed.")
-    elif _is_login_class(signal) and _CARD_SURFACE.search(surface or ""):
-        host = _core_host_label() or "the host"
-        msg += (f" — the core needs to sign in again: tap Sign in {_CARD_WHERE}; the sign-in"
-                f" finishes in the s.space app on {host}. A chat reply can't resolve this.")
     elif _is_login_class(signal):
-        # No card reaches this surface, so the one remedy left is the sign-in on the host.
+        # Sent only where no card shows the block, so the one remedy left is the sign-in on the host.
         host = _core_host_label() or "the host"
         try:
             be = _derive_backend()
         except Exception:
             be = None
-        where = (f"`tmux -S {be['socket']} attach -t {be.get('session') or _DEFAULT_TMUX_SESSION}`"
-                 if be else "the Runtime panel")
+        where = f"`{_attach_command(be)}`" if be else "the Runtime panel"
         msg += (f" — needs a sign-in on {host}: run /login in the core terminal ({where})."
                 " A chat reply can't resolve this.")
     else:
@@ -289,21 +303,16 @@ def compose_message(signal: dict, surface: str = "") -> str:
             be = _derive_backend()
         except Exception:
             be = None
-        # A bare socket path is not actionable; the attach command is — and it must
-        # name the session, or a shared socket attaches to the wrong one.
-        where = (f"at the core's terminal on {host} — `tmux -S {be['socket']} "
-                 f"attach -t {be.get('session') or _DEFAULT_TMUX_SESSION}`"
-                 if be else f"where the core is running on {host}")
-        if kind in ("selection", "permission") and _card_projected(signal, surface):
-            # The card's buttons type the answer into the dialog, so it is the first option
-            # and the terminal the second; a card is named only when one is really there.
-            msg += (f" — tap an option on the choice card in our DM (it answers for you), or answer it"
-                    f" {where}. A typed chat reply can't answer it.")
-        elif _CARD_SURFACE.search(surface or ""):
-            msg += (f" — tap Restart core {_CARD_WHERE} to start it fresh, or answer it {where}."
-                    " A chat reply can't answer it.")
+        # Same kind, excerpt and refusal note, under a head that says where the owner answers.
+        why = f"{detail}, {kind}" if kind and kind not in detail else detail
+        msg = f"⚠️ Sutando is waiting on you at its terminal on {host} ({why})" + msg[len(" ".join(parts)):]
+        msg += "" if msg.endswith((".", "?", "!", "…")) else "."
+        if be:
+            # On its own line so it pastes as-is; it must name the session, or a shared
+            # socket attaches to the wrong one.
+            msg += f"\nOpen it with:\n```\n{_attach_command(be)}\n```\nA chat reply can't answer it."
         else:
-            msg += f" — answer it {where}. A chat reply can't answer it."
+            msg += " Open the core's terminal or the Runtime panel to answer it. A chat reply can't answer it."
     return msg
 
 
@@ -396,13 +405,22 @@ def _save_last_hash(state_file, h):
 
 
 def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=False,
-              outcome=None):
+              outcome=None, card_store=None, signal_age=None):
     """One escalation cycle. Returns the message emitted, or None if suppressed.
-    `outcome`, when given, receives "undelivered": the reason nothing landed, or None."""
+    `outcome`, when given, receives "undelivered": the reason nothing landed, or None, and
+    "card" when the owner's HITL card carries the block instead. `card_store` is the HITL
+    store the monitor raises cards in; `signal_age` the signal file's age in seconds."""
     escalate, new_hash = should_escalate(signal, _load_last_hash(state_file))
     if not escalate:
         return None
     msg = compose_message(signal, surface=source)
+    card = _card_verdict(signal, source, card_store, signal_age) if source and channel else "send"
+    if card != "send":
+        if outcome is not None:
+            outcome.update(card=card, hash=new_hash, undelivered=None)
+        if card == "carried" and not dry_run:
+            _save_last_hash(state_file, new_hash)
+        return None
     if dry_run:
         return msg
     # The app pops its own notification for a channel message the gateway accepted (2xx), so
@@ -602,8 +620,10 @@ def main(argv=None):
               f"path; {fallback}", file=sys.stderr)
         source = channel = ""
 
+    signal_age = None
     try:
         with open(a.signal) as f:
+            signal_age = time.time() - os.fstat(f.fileno()).st_mtime
             signal = json.load(f)
     except FileNotFoundError:
         return 0  # no signal yet → nothing to escalate (degrade quietly)
@@ -617,7 +637,7 @@ def main(argv=None):
                                        source=source, channel=channel, dry_run=a.dry_run):
             print(line)
     outcome = {}
-    msg = run_cycle(signal, a.state_file, macos=macos,
+    msg = run_cycle(signal, a.state_file, macos=macos, card_store=card_store_for(a.signal), signal_age=signal_age,
                     source=source, channel=channel, dry_run=a.dry_run, outcome=outcome)
     if msg and outcome.get("undelivered"):
         if _should_log_undelivered(a.state_file, outcome.get("hash")):
@@ -625,6 +645,10 @@ def main(argv=None):
         return 0
     if msg:
         print(("DRY-RUN " if a.dry_run else "escalated: ") + msg)
+        return 0
+    if outcome.get("card"):
+        print(f"no channel message: the owner's HITL card {'shows' if outcome['card'] == 'carried' else 'is on its way for'}"
+              f" this block (state={signal.get('state')})")
         return 0
     print(f"no escalation (state={signal.get('state')})")
     return 0
