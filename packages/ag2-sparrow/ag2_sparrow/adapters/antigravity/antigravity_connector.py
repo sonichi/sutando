@@ -49,7 +49,7 @@ import time
 import uuid
 from pathlib import Path
 
-from ... import (acp_host, connector_cards, held_start, local_task_protocol, mcp_auth, result_labels,
+from ... import (acp_host, connector_cards, held_start, live_view, local_task_protocol, mcp_auth, result_labels,
                  result_publish)
 from ...bounded_file_read import read_regular_bytes
 from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore, quoted, trigger_of  # noqa: F401
@@ -615,6 +615,8 @@ class Connector:
         self.store = SessionStore(args.session_store)
         self.name = NAME
         self.retry_at = {}
+        # What a person opening this agent's terminal panel follows (`ag2-sparrow-antigravity-local view`).
+        self.view = live_view.Writer(live_view.path_of(self.root))
 
     # ── the model: what agy offers, what the owner picked, and the card that picks ──
 
@@ -844,7 +846,7 @@ class Connector:
                                                                                       extra_keys=AGY_KEYS,
                                                                                       read_only=read_only,
                                                                                       **self.mcp_grant(headers, kind)),
-                                           self.store, STDERR_NAME, NOT_SIGNED_IN, log, media=media,
+                                           self.store, STDERR_NAME, NOT_SIGNED_IN, log, media=media, view=self.view,
                                            model=str(picked or "") or None,
                                            on_models=self.models_seen,
                                            mcp_servers=self.mcp_servers_for(headers, kind))
@@ -862,7 +864,7 @@ class Connector:
         # Images only: the prompt already lists the staged copies this turn may read.
         with acp_host.task_media(own_attachment_headers(headers, message), readable=False) as media:
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt, decide,
-                                       self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=turn,
+                                       self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=turn, view=self.view,
                                        media=acp_host.Media(images=media.images))
 
     @staticmethod
@@ -918,6 +920,7 @@ class Connector:
             return carded
         event, _ = trigger_of(headers)
         log("wake ->", task_id, headers["access_tier"], event or "message")
+        self.view.turn("%s, %s" % (headers.get("sender_name") or headers["access_tier"], kind), message)
         t0 = time.time()
         self.launch = None
         if owner_turn:
@@ -931,6 +934,7 @@ class Connector:
                 prompt = wake_prompt(task_id, headers, message, operator_lines, None, self.note, readable=pair[1],
                                      kind=kind)
                 status, text, detail, turn = self.run_turn(task_id, headers, prompt, False, pair, message=message)
+        self.view.done(status)
         # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
         told = self.tell_model_outcome(turn) if kind == OWNER else ""
         asked = self.asked_for_models(headers, path, status, text, result_file)
