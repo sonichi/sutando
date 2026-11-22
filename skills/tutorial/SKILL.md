@@ -81,11 +81,10 @@ not retry the page in the same turn.
    defect goes to `report-feedback`.
 
 Run it in the owner's own DM (the default, `--audience dm`). Only when the owner asks for the page
-in another room, publish it there with `--audience room`: the page then says "your agent" instead
-of your name. The room's entry records the audience, and a later run without `--audience` keeps
-it. Summon only whoever the owner asked for. Either way the page holds your name or "your
-agent" and fixed text, nothing from the owner's accounts, and the question about their work stays
-in chat.
+in another room, publish it there with `--audience room`. The room's entry records the audience, and a
+later run without `--audience` keeps it. Summon only whoever the owner asked for. In either audience,
+the published page says "your agent" and uses generic examples. The question about the owner's work
+stays in chat, not in Commons.
 
 **One page per room, created once.** `<workspace>/state/tutorial/getting-started.json` keeps
 each room's entry.
