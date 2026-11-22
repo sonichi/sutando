@@ -986,10 +986,10 @@ class InstallVerifyTest(unittest.TestCase):
         self.assertNotIn("GEMINI_API_KEY", env, "the unit passes no API key; agy uses its own sign-in")
         self.assertNotIn("--runtime", argv)
 
-    def write_config(self):
+    def write_config(self, **more):
         values = {"ACP_COMMAND": shlex.join([str(self.agy), "acp"]), "CWD": str(self.cwd),
                   "INBOX_DIR": str(self.work / "tasks"), "RESULTS_DIR": str(self.work / "results"),
-                  "ROOT": str(self.work)}
+                  "ROOT": str(self.work), **more}
         path = cli.config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(cm.render_config(cli.LOCAL, values))

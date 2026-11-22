@@ -5,7 +5,7 @@ Runs Google's Antigravity CLI (`agy`) on this computer as an s.space agent, the 
 agent in a room and Antigravity answers there. For each task file Sparrow queues, the connector wakes
 Antigravity over the Agent Client Protocol: it spawns `agy acp`, sends `initialize`, resumes the room's
 Session with `session/load` (or opens one with `session/new`) and sends one `session/prompt`; a
-non-owner's turn runs isolated instead (see Tiers and permissions). Stdlib only;
+guest's turn runs isolated instead (see Tiers and permissions). Stdlib only;
 opt-in; the core never imports it.
 
 Status: the handshake and the sign-in check were run against a real `agy` 1.5.9 (signed out); a full turn
@@ -80,9 +80,11 @@ message body changes nothing); the adapter only maps its verdict to a turn (`TUR
 | restricted | a guest, plain team (no collaborator stamp), any unknown tier | the isolated read-only turn below |
 | refused | (not reached here: every non-owner who is not a collaborator is served restricted, as Sutando answers them) | one refusal line, agy not started |
 
-No flag is needed for any of them; `--allow-non-owner` still parses and changes nothing. Every turn runs on
-the owner's agy sign-in (the Google account and quota in the Keychain), and a turn whose tool call is
-denied can end with no reply.
+No flag is needed for any of them; `--allow-non-owner` still parses and changes nothing.
+
+Every turn runs on the owner's agy sign-in (the Google account and quota in the Keychain): giving someone
+Collaborator access to this agent lets them spend that quota, and their turns may read and edit the
+working directory as the owner's do. A turn whose tool call is denied can end with no reply.
 
 The gateway writes a Sutando tier block into every non-owner task (`team_guardrail.py`). It tells a core to
 write `results/<task>.txt` and, for a guest, to delegate to `codex exec`; agy can do neither, and its final
@@ -91,9 +93,11 @@ already the read-only sandbox", and keeps the scope, the DO / DO NOT lists, the 
 hand-off to the owner verbatim (`tier_block_lines`). The final reply is scanned by the shared bridge
 (`_guarded_result_body`) for every tier but the owner, as for any adapter.
 
-**The owner's turn** (the owner, and an attested collaborator) resumes the sender's Session for the room in
-the working directory, with agy's own home (`~/.gemini`: its settings, rules and context) and the owner's
-permission policy. A collaborator is still framed as not the owner.
+**The owner's turn** (the owner and Team, decided by the owner on 2026-11-21) runs in the working
+directory with agy's own home (`~/.gemini`: its settings, rules and context) under the owner's permission
+policy below. The owner resumes the room's Session; each collaborator resumes a Session of their own for
+the room (keyed by their user id), so no one resumes another's conversation. A collaborator is still framed
+as not the owner.
 
 **A restricted turn** (a guest, plain team, an unknown tier) runs isolated:
 
@@ -111,34 +115,37 @@ permission policy. A collaborator is still framed as not the owner.
 - a new Session for every task, never resumed and never recorded in the session store;
 - the Session is put in a read-only mode with `session/set_mode` (`plan`, or a mode named `read-only`),
   picked from the `modes` that `session/new` returns. If agy offers no such mode, or refuses it, the turn
-  is not run: a message gets a line saying so, an event posts nothing.
+  is not run: a message gets a line saying so ("Antigravity did not take this: it answers non-owners only
+  in a read-only session mode, and no read-only session mode is offered (offered: …)."), an event posts
+  nothing.
 
-`--gemini-dir` is agy's flag: a custom `--acp-command` must accept it, or non-owner turns fail.
+`--gemini-dir` is agy's flag: a custom `--acp-command` must accept it, or guest turns fail.
 
 agy's `session/request_permission` is answered by `acp_host`'s policy, default deny:
 
-- the owner's turns only, and only on an install with `--allow-owner-shell-web` (recorded as
+- the owner's own turns only, and only on an install with `--allow-owner-shell-web` (recorded as
   `ALLOW_OWNER_SHELL_WEB=1`; off by default, so an existing install does not change on update): any shell
   command and any `execute`, `fetch` or `search` call, as a local Claude Code agent runs commands and uses
-  the web for its owner. `verify` prints `INFO owner shell and web: on|off`;
-- the owner's turn (the owner and a collaborator): a `read` or `edit` whose every path resolves (after `..`, `~` and symlinks) under the
-  working directory; never when the working directory is the home directory or above it. agy's own
-  argument names (`Path`, `Content`, `Overwrite`, `Append`, `Target`, `Replacement`, `AllowMultiple`,
-  `Edits`, `StartLine`, `EndLine`, and the older `TargetFile`, `CodeContent`, `AbsolutePath`, ...) are
-  recognised; any other key refuses the request;
+  the web for its owner. Team runs in the owner's turn but never gets this: it is decided by the sender's
+  tier. `verify` prints `INFO owner shell and web: on|off`;
+- the owner's turn only (the owner and Team): a `read` or `edit` whose every path resolves (after `..`, `~`
+  and symlinks) under the working directory; never when the working directory is the home directory or above
+  it. agy's own argument names (`Path`, `Content`, `Overwrite`, `Append`, `Target`, `Replacement`,
+  `AllowMultiple`, `Edits`, `StartLine`, `EndLine`, and the older `TargetFile`, `CodeContent`,
+  `AbsolutePath`, ...) are recognised; any other key refuses the request;
 - nothing else: no command or web call for a collaborator or a guest, and no `delete`, `move` or
   unclassified call for anyone.
 
 | Turn | Commands, fetch, search | Read or edit under the working directory | Anything else |
 | --- | --- | --- | --- |
 | owner | granted with `--allow-owner-shell-web`, else refused | granted | refused |
-| Team (an attested collaborator, on the owner's turn) | refused (granting it is the owner's decision) | granted | refused |
+| Team (an attested collaborator, in the owner's turn) | refused (granting it is the owner's decision) | granted | refused |
 | guest (isolated) | refused | refused | refused |
 
 With `--allow-owner-shell-web`, the working-directory bound on `read` and `edit` is no longer a security
 boundary for the owner's turns: a command can read or write anything the owner's account can.
 
-For the owner's turns, agy applies its own permission rules first (an action they already allow runs
+For the owner's turns (Team's included), agy applies its own permission rules first (an action they already allow runs
 without asking), and `--dangerously-skip-permissions` makes it run tools without asking; never add that
 flag to an agent others can reach.
 
