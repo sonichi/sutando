@@ -118,6 +118,47 @@ else
   echo "launch-codex-worker-session: could not compose the seat's s-space MCP server; not starting $SESSION rather than let its tools act as the core's agent" >&2
   exit 1
 fi
+# >>> codex-app-server-seat
+# SUTANDO_CODEX_APP_SERVER=1: the worker is a seat on `codex app-server` in the same session name,
+# with no observer and no notifier session; it takes its deliveries itself. Unset: as before.
+if [ "${SUTANDO_CODEX_APP_SERVER:-}" = 1 ]; then
+  . "$REPO/src/agent/codex/app-server/seat-launch.sh"
+  seat_translate_args "${CODEX_ARGS[@]}"
+  seat_state="$(seat_state_dir "$SUTANDO_WORKSPACE_DIR" "$SESSION")"
+  seat_declare=(--out "$seat_state/host.json" --inbox "$SUTANDO_TASKS_DIR" --results "$SUTANDO_RESULTS_DIR"
+                --state "$seat_state" --cwd "$WORKING_DIR")
+  # A resolver means the inbox holds delivery sentinels that name payloads in the task store.
+  [ -n "${SUTANDO_INBOX_RESOLVER:-}" ] && seat_declare+=(--payloads "$SUTANDO_WORKSPACE_DIR/tasks")
+  if ! "$WORKER_PY" "$SEAT_PY" declare "${seat_declare[@]}" --stage-command "$WORKER_PY" \
+      "$SUTANDO_POOL_DELIVERY_SCRIPT" --workspace "$SUTANDO_WORKSPACE_DIR" --recipient "$SUTANDO_INSTANCE_ID" mark-done; then
+    echo "launch-codex-worker-session: could not write the seat's host declaration; not starting $SESSION" >&2
+    exit 1
+  fi
+  tmux -S "$SOCKET" new-session -d -s "$SESSION" "${ENV_ARGS[@]}" -e SUTANDO_CODEX_APP_SERVER=1 \
+    -e SUTANDO_STANDBY_MODE=type -e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}" \
+    -e "SUTANDO_WATCHER_BEAT=$REPO/skills/worker-pool/scripts/pool_beat.py" \
+    "$SEAT_CLI" --host "$seat_state/host.json" --workspace "$SUTANDO_WORKSPACE_DIR" --seat "$SESSION" \
+    --worker "$SUTANDO_INSTANCE_ID" --codex "$(command -v codex)" --instructions "$BOOT_PROMPT" \
+    --log "$SUTANDO_WORKSPACE_DIR/logs/codex-seat-$SESSION.log" "${SEAT_ARGS[@]}"
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    tmux -S "$SOCKET" has-session -t "=$SESSION" 2>/dev/null && break
+    sleep 0.5
+  done
+  if ! tmux -S "$SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
+    echo "launch-codex-worker-session: $SESSION exited during startup" >&2
+    exit 1
+  fi
+  if [ "$(uname -s)" = "Darwin" ]; then
+    reset_timer="$REPO/skills/proactive-loop/scripts/codex-auto-reset-timer.py"
+    if [ -f "$reset_timer" ] && [ -n "$CODEX_HOME_DIR" ] && ! "$WORKER_PY" "$reset_timer" ensure \
+        --workspace "$SUTANDO_WORKSPACE_DIR" --codex-home "$CODEX_HOME_DIR" >/dev/null; then
+      echo "launch-codex-worker-session: could not reconcile the Codex earned-reset timer" >&2
+    fi
+  fi
+  echo "launch-codex-worker-session: $SESSION is a Codex app-server seat; no observer or notifier session was started" >&2
+  exit 0
+fi
+# <<< codex-app-server-seat
 tmux -S "$SOCKET" new-session -d -s "$SESSION" "${ENV_ARGS[@]}" \
   codex "${CODEX_ARGS[@]}" "$BOOT_PROMPT"
 for i in 1 2 3 4 5 6 7 8 9 10; do

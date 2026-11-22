@@ -1,5 +1,5 @@
 # seconds  path — measured on ubuntu-latest: per-file seconds publish_gate.sh printed in CI run 40894145940 (2026-10-29).
-# A missing file counts as 1s; the table only steers balance, never which files run.
+# A missing file counts as 1s; the table only orders the suites heaviest first, never which files run.
 3 packages/ag2-sparrow/tests/test_ack_retry.py
 1 packages/ag2-sparrow/tests/test_adapter_boundaries.py
 10 packages/ag2-sparrow/tests/test_adapter_differential.py

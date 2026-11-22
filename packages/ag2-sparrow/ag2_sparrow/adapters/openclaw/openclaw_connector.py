@@ -12,9 +12,10 @@ as agent-connect would post it; an event with neither posts nothing.
 
 Sessions are keyed like agent-connect's, (room, access tier; a collaborator's own per room), stored in
 agent-connect's `sessions.json` shape, and never retired: a Session is replaced only when the agent
-refuses to resume it or the working directory changed. Tier policy is task_io.admission's: the owner and
-an attested collaborator are served; any other non-owner is refused unless --allow-non-owner. Only an
-owner turn is granted file operations under the working directory; every turn may run its reply command.
+refuses to resume it or the working directory changed. Tier policy is task_io.turn_policy's: the owner and
+an attested collaborator are served, with file operations under the working directory; every turn may run
+its reply command. Any other non-owner is refused, --allow-non-owner or not: its restricted turn must be
+isolated, connector-free and ephemeral, and this adapter runs every turn in the owner's OpenClaw profile.
 Stdlib only.
 """
 from __future__ import annotations
@@ -32,7 +33,7 @@ from ... import acp_host, held_start, result_labels, result_publish
 from ...acp_host import (MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore, at_or_above_home,  # noqa: F401
                          delivery_markers, is_message, quoted, request_paths, resolved, session_key, trigger_of, under)
 from ...relay_loop import count_arg
-from ...task_io import (NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock, admission, exit_code,
+from ...task_io import (NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock, turn_policy, exit_code,
                         exit_on_sigterm, holder_consumer, load_done, make_dirs, parse_task, record_done,
                         release_lock, root_path, stop_requested)
 from .acp_client import AcpClient
@@ -168,13 +169,13 @@ def is_draft(root, raw, result_file):
     return not os.path.islink(draft)
 
 
-def decide_permission(params, owner, cwd, reply_command, result_file):
+def decide_permission(params, writes, cwd, reply_command, result_file):
     """(allowed, reason, result). Default deny (acp_host's policy). Granted: this task's own reply or no-reply
-    line, exactly; a read or edit of this task's reply draft; and, for the owner only, a read or edit whose every
+    line, exactly; a read or edit of this task's reply draft; and, for a turn with writes, a read or edit whose every
     path, nested ones included, resolves under the working directory. Every other command, execute, fetch,
     delete or move is refused, as the codex adapter declines every approval it is asked for."""
     return acp_host.decide_permission(
-        params, owner, cwd, command_ok=lambda command: is_reply_command(command, reply_command, result_file),
+        params, writes, cwd, command_ok=lambda command: is_reply_command(command, reply_command, result_file),
         own_file=lambda raw: is_draft(cwd, raw, result_file),
         command_refused="no command is granted but this task's reply line",
         command_granted="this task's reply command", own_file_reason="this task's reply draft")
@@ -209,12 +210,12 @@ class Connector:
         self.store = SessionStore(args.session_store)
         self.retry_at = {}
 
-    def run_turn(self, task_id, headers, prompt, result_file, owner):
+    def run_turn(self, task_id, headers, prompt, result_file, writes):
         """(status, text, detail, turn): status is completed | cancelled | timeout | gone | failed."""
         cwd = self.args.cwd
         return acp_host.run_prompt(
             self.client_factory, self.args, headers, task_id, prompt,
-            lambda params: decide_permission(params, owner, cwd, self.args.reply_command, result_file), self.store,
+            lambda params: decide_permission(params, writes, cwd, self.args.reply_command, result_file), self.store,
             "openclaw-acp.stderr", "OpenClaw is not signed in (%s); sign in to OpenClaw on this host", log)
 
     def fallback_body(self, headers, status, text, detail):
@@ -237,9 +238,11 @@ class Connector:
         path = os.path.join(self.args.inbox, name)
         result_file = os.path.join(self.args.results_abs, name)
         headers, message, operator_lines = parse_task(path)
-        tier = admission(headers, self.args.allow_non_owner)
-        if tier is None:
-            log("refused (non-owner) ->", task_id, headers["access_tier"])
+        policy = turn_policy(headers, self.args.allow_non_owner)
+        # A restricted turn must be isolated, connector-free and ephemeral; OpenClaw runs in the owner's profile.
+        if not policy.served or policy.capabilities.workspace != "owner":
+            log("refused (non-owner%s) ->" % ("" if policy.served else ", " + policy.unlock + " not set"),
+                task_id, headers["access_tier"])
             answer_once(self.args.state, task_id, os.path.join(self.args.results, name), NON_OWNER_REFUSED)
             return {"task": task_id, "status": "refused", "tier": headers["access_tier"]}
         prompt = wake_prompt(task_id, headers, message, operator_lines, result_file, self.args.reply_command,
@@ -247,7 +250,8 @@ class Connector:
         event, _ = trigger_of(headers)
         log("wake ->", task_id, headers["access_tier"], event or "message")
         t0 = time.time()
-        status, text, detail, turn = self.run_turn(task_id, headers, prompt, result_file, tier == "owner")
+        status, text, detail, turn = self.run_turn(task_id, headers, prompt, result_file,
+                                                   policy.capabilities.writes)
         results_file = os.path.join(self.args.results, name)
         if release_unpublished(self.args.state, task_id, results_file):
             log("a reply claimed and never published; answering with the fallback ->", task_id)
@@ -324,7 +328,8 @@ def build_parser():
                     help="the sessions.json to resume from and record to (default: <work>/state/sessions.json); "
                          "agent-connect's own file keeps its conversations")
     ap.add_argument("--allow-non-owner", action="store_true",
-                    help="serve non-owner senders without collaborator access too (no file operations granted)")
+                    help="recorded but not honoured here: a restricted turn must be isolated, and this adapter "
+                         "runs every turn in the owner's OpenClaw profile")
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=0.2)

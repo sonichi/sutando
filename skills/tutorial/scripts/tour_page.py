@@ -25,6 +25,7 @@ import os
 import re
 import stat
 import string
+import unicodedata
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -165,10 +166,12 @@ HERO = (
 
 
 def clean_name(name: str) -> str:
-    """The agent's display name, single-spaced; refuses an empty or over-long one."""
-    cleaned = " ".join((name or "").split())
+    """The preview display name, single-spaced and stripped of invisible format controls."""
+    visible = "".join(c for c in (name or "") if c.isspace() or (
+        unicodedata.category(c) not in {"Cc", "Cf", "Cs"} and c not in "\u034f\u115f\u1160\u3164\uffa0"))
+    cleaned = " ".join(visible.split())
     if not cleaned or len(cleaned) > NAME_MAX:
-        raise ValueError(f"the agent's name must be 1-{NAME_MAX} characters, got {name!r}")
+        raise ValueError(f"the agent's name must be 1-{NAME_MAX} characters after removing format controls")
     return cleaned
 
 
@@ -532,7 +535,11 @@ STYLE = """<style>
 :root[data-theme="light"] { color-scheme: light; }
 * { box-sizing:border-box; }
 body { margin:0; background:var(--bg); color:var(--fg); font:400 16px/1.55 var(--sans); -webkit-text-size-adjust:100%%; overflow-x:hidden; }
-main { max-width:780px; margin:0 auto; padding:28px 16px 56px; }
+main { max-width:920px; margin:0 auto; padding:28px 16px 56px; }
+#tutorial-checklist > summary { cursor:pointer; min-height:44px; padding:12px 16px; margin:0 0 14px;
+  border:1px solid var(--line); border-radius:14px; background:var(--card); font-weight:600; }
+#tutorial-checklist > summary:focus-visible { outline:2px solid var(--fg); outline-offset:2px; }
+#tour > #overview { padding:0 0 18px; }
 .hero { position:relative; isolation:isolate; overflow:hidden; display:flex; gap:20px; align-items:center; margin-bottom:20px;
   background:var(--card); border-radius:26px; padding:28px 24px; box-shadow:var(--shadow); }
 .hero::before, .hero::after { content:""; position:absolute; z-index:-1; border-radius:50%%; pointer-events:none; opacity:var(--orb-alpha);
@@ -558,10 +565,12 @@ p { margin:0 0 6px; }
   background:linear-gradient(90deg, var(--yellow-out), var(--orange-out)); }
 .controls { display:none; }
 .js .controls { display:flex; flex-wrap:wrap; gap:10px 8px; align-items:center; margin:0 0 14px; }
-.dots { display:flex; flex-wrap:wrap; gap:6px; flex-basis:100%%; }
+.dots { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:8px; flex-basis:100%%; }
 #all { margin-left:auto; }
 #all[aria-pressed="true"] { background:radial-gradient(closest-side, var(--orange-in) 70%%, var(--orange-out) 130%%); color:var(--ink); }
-.dot { width:30px; height:30px; padding:0; border-radius:50%%; font-size:12px; border:1px solid var(--line); color:var(--muted); background:var(--card); }
+.dot { min-height:52px; padding:8px 10px; border-radius:14px; font-size:12px; line-height:1.35; text-align:left; border:1px solid var(--line); color:var(--muted); background:var(--card); }
+.dot-number { display:block; font-size:11px; opacity:.7; margin-bottom:2px; }
+.dot-title { display:block; font-weight:500; }
 .dot:hover:not(:disabled) { background:var(--card); color:var(--fg); border-color:var(--fg); }
 .dot[aria-current="step"] { border:2px solid var(--fg); color:var(--fg); }
 .dot.is-done, .dot.is-done:hover:not(:disabled) { background:radial-gradient(closest-side, var(--orange-in) 70%%, var(--orange-out) 130%%); border-color:transparent; color:var(--ink); }
@@ -592,13 +601,13 @@ p { margin:0 0 6px; }
 .finale h2 { font-size:clamp(24px, 4vw, 32px); letter-spacing:-.03em; }
 .prompt { display:flex; gap:8px; align-items:center; margin-top:12px; }
 code { flex:1; min-width:0; background:var(--code); border:1px solid var(--line); border-radius:14px; padding:10px 14px; font-size:14px; overflow-wrap:anywhere; user-select:all; }
-button { flex:none; border:0; color:var(--pill-fg); background:var(--pill-bg); border-radius:999px; padding:9px 18px; font:inherit; font-size:14px; letter-spacing:.01em; cursor:pointer; transition:filter .2s ease; }
+button { min-height:44px; flex:none; border:0; color:var(--pill-fg); background:var(--pill-bg); border-radius:999px; padding:9px 18px; font:inherit; font-size:14px; letter-spacing:.01em; cursor:pointer; transition:filter .2s ease; }
 button:hover:not(:disabled) { filter:brightness(1.15); }
 button:disabled { opacity:.35; cursor:default; }
 button:focus-visible, input:focus-visible { outline:2px solid var(--fg); outline-offset:2px; }
 #next, .copy { color:var(--ink); background:radial-gradient(closest-side, var(--orange-in) 70%%, var(--orange-out) 130%%); }
 #next:hover:not(:disabled), .copy:hover:not(:disabled) { filter:brightness(1.05) saturate(1.1); }
-.js .done { display:inline-flex; gap:8px; align-items:center; margin-top:14px; font-size:14px; cursor:pointer; }
+.js .done { display:inline-flex; min-height:44px; gap:8px; align-items:center; margin-top:14px; font-size:14px; cursor:pointer; }
 .done input { width:18px; height:18px; accent-color:var(--orange-out); }
 .js main[data-mode="step"] .sec { display:none; }
 .js main[data-mode="step"] .sec.cur { display:flex; animation:enter .22s ease-out; }
@@ -612,6 +621,9 @@ button:focus-visible, input:focus-visible { outline:2px solid var(--fg); outline
   .hero::before, .hero::after { animation:none; }
 }
 @media (max-width: 520px) {
+  .dots { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .prompt { flex-wrap:wrap; }
+  .prompt code { flex-basis:100%%; }
   .hero { flex-direction:column; align-items:flex-start; padding:22px 18px; }
   .hero-art { width:88px; height:88px; }
   .card { flex-direction:column; gap:12px; padding:20px 18px; border-radius:22px; }
@@ -685,7 +697,10 @@ SCRIPT = """<script>
   };
   const dots = ids.map((id, i) => {
     const b = document.createElement('button');
-    b.type = 'button'; b.className = 'dot'; b.textContent = String(i + 1);
+    b.type = 'button'; b.className = 'dot';
+    const number = document.createElement('span'); number.className = 'dot-number'; number.textContent = String(i + 1).padStart(2, '0');
+    const title = document.createElement('span'); title.className = 'dot-title'; title.textContent = titles[i];
+    b.append(number, title);
     b.addEventListener('click', () => (main.dataset.mode === 'step' ? show(i, true) : (cur = i, paint(), reveal(i))));
     dotsBox.appendChild(b); return b;
   });
@@ -789,6 +804,16 @@ COPY_SCRIPT = """<script>
 # Set before the body paints, so a scripted page opens on one step instead of flashing all of them.
 HEAD_SCRIPT = "<script>document.documentElement.classList.add('js');</script>"
 
+OVERVIEW_PATH = Path(__file__).resolve().parent.parent / "assets" / "getting-started.html"  # lint-workspace-resolution: allow-repo-root
+
+
+def overview_parts() -> Tuple[str, str]:
+    source = OVERVIEW_PATH.read_text(encoding="utf-8")
+    style = source.split("<style>", 1)[1].split("</style>", 1)[0]
+    body = source.split('<body style="margin:0">', 1)[1].split("</body>", 1)[0]
+    return f"<style>{style}</style>", body
+
+
 FEATURES = load_list()
 # The bundled list's steps for every core, and the slots its paste prompts open.
 SECTIONS = [s for s in FEATURES.steps if s.runtime is None]
@@ -845,32 +870,54 @@ def read_marker(text: str) -> Optional[Tuple[str, Optional[str]]]:
 
 def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: Optional[str] = None,
                 prompts: object = None, roles: object = None,
-                features: Optional[FeatureList] = None, media: object = None) -> str:
+                features: Optional[FeatureList] = None, media: object = None,
+                *, private_setup: bool = False, native_dm: bool = False) -> str:
     """The whole page as one HTML string; depends on nothing but its arguments: the agent's name,
     core, audience, mxid (the ownership marker, which also records the list's revision), per-slot
     prompts (`clean_prompts`), the owner's onboarding roles, the feature list (the skill's own by
     default) and the room's media map (`clean_media`; an asset it does not map is inlined). In a
-    room other than the owner's DM the agent is "your agent"."""
+    room other than the owner's DM the agent is "your agent". The overview uses saved setup
+    context only in a local preview; Commons publication uses generic content."""
     features = features or FEATURES
     prompts = clean_prompts(prompts, prompt_slots(features))
     media = clean_media(media, features)
+    if audience != "dm":
+        prompts, roles = {}, None
     labels = role_labels(roles)
     picked = (f'<p class="roles">Picked for: {html.escape(", ".join(labels))}</p>' if labels else "")
     if audience not in AUDIENCES:
         raise ValueError(f"audience must be one of {', '.join(AUDIENCES)}, got {audience!r}")
     who = html.escape(clean_name(name)) if audience == "dm" else "your agent"
+    marker = owner_marker(agent, features.revision, DIGEST_SLOT) if agent else ""
+    if audience == "dm" and (native_dm or private_setup):
+        from personalized_overview import render_guide
+
+        page = render_guide(PAGE_HEAD, marker, who if private_setup else "your agent",
+                            labels if private_setup else (), prompts if private_setup else {})
+        return _finish_page(page, agent)
     lead = ("One room for people and their agents. "
             + (f"A quick tour with your personal native agent, {who}. Try one thing in each part."
                if audience == "dm" else "A quick tour. Try one thing in each part."))
     secs = sections_for(core, features)
     body = "".join(_section(s, i, who, prompts, media) for i, s in enumerate(secs))
+    overview_style, overview_body = overview_parts()
+    checklist_header = (f'<header class="hero">{HERO}<div><h1>Getting started with {who}</h1>'
+                        f'<p class="lead">{lead}</p>{picked}</div></header>')
+    if audience == "dm":
+        from personalized_overview import overview
+
+        display = who if private_setup else "your agent"
+        overview_style, overview_body = overview(overview_style, overview_body, display,
+                                                 labels if private_setup else ())
+        checklist_header = picked
     page = (
         f"{PAGE_HEAD}"
-        f"{owner_marker(agent, features.revision, DIGEST_SLOT) if agent else ''}"
-        f"<title>{PAGE_TITLE}</title>{HEAD_SCRIPT}{STYLE % {'darkvars': DARK}}</head><body>"
+        f"{marker}"
+        f"<title>{PAGE_TITLE}</title>{HEAD_SCRIPT}{STYLE % {'darkvars': DARK}}{overview_style}</head><body>"
         "<main id=\"tour\" data-mode=\"step\">"
-        f"<header class=\"hero\">{HERO}<div><h1>Getting started with {who}</h1>"
-        f"<p class=\"lead\">{lead}</p>{picked}</div></header>"
+        f"{overview_body}"
+        '<details id="tutorial-checklist"><summary>Try it step by step</summary>'
+        f"{checklist_header}"
         "<div class=\"progress\"><div class=\"progress-label\" id=\"progress-label\" aria-hidden=\"true\">"
         f"0 of {len(secs)} done</div>"
         f"<div class=\"bar\" id=\"progress-bar\" role=\"progressbar\" aria-label=\"Tour progress\" "
@@ -882,9 +929,13 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
         "<button type=\"button\" id=\"back\" aria-label=\"Previous step\">Back</button>"
         "<button type=\"button\" id=\"next\" aria-label=\"Next step\">Next</button>"
         "<button type=\"button\" id=\"all\" aria-pressed=\"false\">Show all</button></nav>"
-        f"{_finale(who, prompts)}{body}<div id=\"status\" class=\"sr-only\" role=\"status\" aria-live=\"polite\"></div>"
+        f"{_finale(who, prompts)}{body}<div id=\"status\" class=\"sr-only\" role=\"status\" aria-live=\"polite\"></div></details>"
         f"{PAGE_TAIL}"
     )
+    return _finish_page(page, agent)
+
+
+def _finish_page(page: str, agent: Optional[str]) -> str:
     if agent:  # the tag's digest covers the whole page with the digest itself blanked
         page = page.replace(f'data-digest="{DIGEST_SLOT}"',
                             f'data-digest="{hashlib.sha256(page.encode("utf-8")).hexdigest()}"', 1)

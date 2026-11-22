@@ -130,6 +130,8 @@ fi
 # A watcher on <ws>/deliveries/<id> must not infer the workspace from its
 # inbox; whoever named that inbox names the workspace too (tasks-dir-resolve.sh).
 WORKSPACE_DIR="$(workspace_dir_for_inbox "$TASKS_DIR")"
+# Each start is also on disk: stderr belongs to whoever hosts this watcher, and is gone with it.
+{ mkdir -p "$WORKSPACE_DIR/logs" && printf '%s watch-tasks-stream: started role=%s inbox=%s (watcher pid %s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$WATCHER_ROLE" "$TASKS_DIR_ABS" "$$" >> "$WORKSPACE_DIR/logs/watch-tasks-stream.log"; } 2>/dev/null || true
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 
 # An inherited worker identity (instance id + its routing vars) is cleared, not trusted,
@@ -395,6 +397,9 @@ HELD_RETRY_AT=0
 RETIRED_CLAIMS=""
 DISPATCHED_IDS=""
 DECISION_IDENTITY=""
+# What generation_line (task-emit.sh) announces: the file this decision read, and whose it is.
+DECISION_GENERATION=""
+DECISION_GENERATION_NAME=""
 ADMITTED_INBOX_NAMES=""
 DECISION_INBOX_NAME=""
 record_inbox_admission() {
@@ -966,6 +971,10 @@ dispatch_task() {
   # structurally too, not just by this early return.
   # One admission per file identity per watcher lifetime: a later event for the
   # same bytes in the same inode is not a new task; a replaced file is.
+  # Read first, before the identity and before any handler sees the file: a file put under this name
+  # after this line is not the one this decision is about, and the announcement says which one was.
+  DECISION_GENERATION_NAME="$filename"
+  DECISION_GENERATION="$(task_file_generation "$task_path")"
   identity="$filename|$(task_file_identity "$task_path")"
   # Without a checksum, inode plus mtime still names these bytes well enough to
   # dedupe a re-examination; no identity at all never dedupes (a duplicate is recoverable).
@@ -979,6 +988,15 @@ dispatch_task() {
       esac
       ;;
   esac
+  # For a reader that runs only the announced generation: one this decision could not read, or one that
+  # changed while the identity was being read, is not announced and not admitted. Held, so the same
+  # watcher decides again on its next event; an identity recorded now would suppress that decision.
+  if [ "${SUTANDO_ANNOUNCE_GENERATION:-}" = 1 ] \
+     && { [ -z "$DECISION_GENERATION" ] || [ "$(task_file_generation "$task_path")" != "$DECISION_GENERATION" ]; }; then
+    hold_task "$filename" now
+    echo "watch-tasks-stream: holding $filename: its generation could not be read, or changed while it was being identified; decided again on the next event" >&2
+    return 0
+  fi
   DECISION_INBOX_NAME="$(basename "$1")"
   if [ -n "$identity" ] && [ -n "$DISPATCHED_IDS" ] && printf '%s' "$DISPATCHED_IDS" | grep -qxF -- "$identity"; then
     record_inbox_admission

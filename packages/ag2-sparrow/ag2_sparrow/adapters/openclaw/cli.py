@@ -304,7 +304,9 @@ def verify(args, factory=AcpClient) -> int:
         cm.check(results, Path(cfg[key]).is_dir(), key.lower().replace("_dir", ""), cfg[key])
     store = cfg.get("SESSION_STORE") or str(Path(cm.work_root(cfg)) / "state" / oc.SESSIONS_NAME)
     print(f"INFO sessions: {store} (resumed per room; never retired)")
-    print(f"INFO non-owner: {'served, no file operations (--allow-non-owner)' if cfg.get('ALLOW_NON_OWNER') == '1' else 'refused unless attested collaborator'}")
+    print("INFO non-owner: refused unless attested collaborator" + (
+        " (--allow-non-owner is recorded, not honoured: a restricted turn must be isolated, and this adapter "
+        "runs every turn in the owner's OpenClaw profile)" if cfg.get("ALLOW_NON_OWNER") == "1" else ""))
     if cb.bridge_mode(cfg) != EXTERNAL:
         print(f"INFO agent: {cfg.get('AGENT_ID')}")
         problem = cb.bridge_problem(cfg, COMMAND, bridge)
@@ -422,7 +424,8 @@ def session_options(p) -> None:
     p.add_argument("--session-store", help="the sessions.json to resume from and record to (default: the work "
                    "root's state/sessions.json); agent-connect's own file keeps its conversations")
     p.add_argument("--allow-non-owner", action="store_true",
-                   help="serve non-owner senders without collaborator access too (no file operations granted)")
+                   help="recorded but not honoured here: a restricted turn must be isolated, and this adapter "
+                        "runs every turn in the owner's OpenClaw profile")
     p.add_argument("--reply-command", help=argparse.SUPPRESS)
 
 

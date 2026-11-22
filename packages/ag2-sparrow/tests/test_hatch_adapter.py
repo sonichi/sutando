@@ -4121,7 +4121,8 @@ class StartSparrow(Base):
     def test_a_zombie_lock_holder_is_not_live(self):
         record = {"pid": os.getpid(), "heartbeat_at": int(time.time()),
                   "host": hatch_cli.workspace_lock._host_label()}
-        for state, want in ((b"S", os.getpid()), (b"Z", None)):
+        # X: its parent is mid-reap and kill(0) still answers; x is older kernels' dead state.
+        for state, want in ((b"S", os.getpid()), (b"Z", None), (b"X", None), (b"x", None)):
             stat = b"%d (ag2-sparrow) %s 1 2 3" % (os.getpid(), state)
             with mock.patch.object(hatch_cli, "_proc_stat", return_value=stat):
                 self.assertEqual(hatch_cli.live_lock_holder(record), want, state)

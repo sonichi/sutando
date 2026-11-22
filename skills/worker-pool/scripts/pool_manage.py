@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manage the pool's workers: list, stop, retire, enable, remove, reseat, plugins, bind, unbind.
+"""Manage the pool's workers: list, stop, retire, enable, remove, reseat, retry, plugins, bind, unbind.
 
 The owner's (or the agent's, on the owner's behalf) one supported way to take a
 worker out of service and bring it back. Each verb goes through the writer that
@@ -14,11 +14,18 @@ already owns its fact, so the remedy, the sweep and the router honour it:
             to it to the core. Work it still owes must be handed to the core
             (`--hand-off`, pool_delivery.hand_off_to_core) or the retire is refused.
             A worker with its own agent loses it too: its connection row, lane
-            and vault secret (connections.retire_worker_identity).
+            and vault secret (connections.retire_worker_identity). Deleting the
+            agent on s.space is left to the owner (no server Action retires a live
+            agent yet), and the owner is told in their DM which agent to delete.
     enable  lift both, then the owner restart (pool_remedy.restart).
     remove  drop a retired worker's roster row; its records stay on disk.
     reseat  restart a running seat that owes nothing, so its tools pick up an
             agent identity added after it started; one that owes work is left.
+    retry   restart a seat stopped at a provider limit now, on the owner's "retry now" to its
+            pause (its input watcher runs it): owed work is kept and delivered again. The verb
+            hands the restart to a detached child (`--in-place`) and returns: the take-down
+            closes the input watcher's own session, which would end a child of it mid-run. The
+            child never leaves the seat paused; a restart that fails is told to the owner.
     bind    bind a room to a worker on the shared folders (pool_roster.bind_room), so the
             router delivers that room's tasks to it; a worker on its own folders is refused,
             since the router never delivers to one.
@@ -34,6 +41,7 @@ already owns its fact, so the remedy, the sweep and the router honour it:
     python3 pool_manage.py [--workspace WS] [--repo REPO] enable <worker> [--no-start]
     python3 pool_manage.py [--workspace WS] remove <worker> [--hand-off]
     python3 pool_manage.py [--workspace WS] [--repo REPO] reseat <worker>
+    python3 pool_manage.py [--workspace WS] [--repo REPO] retry <worker id> [--in-place]
     python3 pool_manage.py [--workspace WS] plugins <worker> add|remove <dir>
     python3 pool_manage.py [--workspace WS] plugins <worker> list
     python3 pool_manage.py [--workspace WS] bind <room id> <worker id or label>
@@ -66,6 +74,11 @@ pr = sw.pr
 # Killed first to last: the inbox supervisor, then the input watcher, then the seat.
 COMPANION_SUFFIXES = ("-watcher", rem.INPUT_WATCH_SUFFIX)
 STOP_LOCK_WAIT_S = rem.RESTART_LOCK_WAIT_S
+#: What the detached retry child runs: this script.
+RETRY_ENTRY = Path(__file__).resolve()
+#: The detached retry waits this long first, so the watcher that asked records its answer before
+#: the take-down closes it.
+RETRY_HANDOFF_S = 2.0
 
 
 class Refused(Exception):
@@ -165,7 +178,7 @@ def _hand_off(workspace, wid, owed, hand_off) -> dict:
     return pd.hand_off_to_core(Path(workspace), wid)
 
 
-def retire(workspace, target, *, unbind=False, hand_off=False, runner=subprocess.run) -> dict:
+def retire(workspace, target, *, unbind=False, hand_off=False, runner=subprocess.run, tell=None) -> dict:
     """Fence, then take down, then hand off, then drop bindings. The fence (roster state
     `retired`, which the router re-checks under the delivery lock) comes first, so no
     new or replayed task can commit to the worker once the owed set is read."""
@@ -201,10 +214,43 @@ def retire(workspace, target, *, unbind=False, hand_off=False, runner=subprocess
     _, _, _, unbound = pr.set_worker_state(workspace, wid, "retired", unbind=unbind)
     return {**base, "result": "retired", "unbound": unbound,
             "handed_off": moved["handed_off"], "kept": moved["kept"],
-            "identity": _retire_identity(workspace, wid)}
+            "identity": _retire_identity(workspace, wid, tell=tell),
+            "pending_approval": _withdraw_approval(workspace, wid, tell=tell)}
 
 
-def _retire_identity(workspace, wid: str) -> dict:
+# s.space's account.agents.retire refuses a live identity (identity_retire_unavailable), so
+# deleting the agent itself is the owner's step in the app.
+AGENT_REMOVAL_OWNER_STEP = ("the server cannot delete a live agent for us yet: delete it in the app "
+                            "(your agents list), or it stays there with no worker behind it")
+
+
+def agent_removal_note(worker_label: str, agent: str) -> str:
+    """The owner's DM once a retired worker's agent is cut loose here but still exists on s.space."""
+    return (f"[dm-only]\n**Delete agent `{agent}` in the app**\n\nYour worker {worker_label} was retired: "
+            "it no longer uses that agent, and its token is gone from this computer. The server cannot delete "
+            "a live agent for me yet, so it stays in your agents list until you delete it there.")
+
+
+def _tell_owner(workspace, text: str) -> bool:
+    try:
+        import pool_device_connect
+        pool_device_connect.send_to_owner(Path(workspace), text)
+        return True
+    except Exception:  # noqa: BLE001 — the retirement is done; the note is reported as not sent
+        return False
+
+
+def _withdraw_approval(workspace, wid: str, tell=None) -> dict:
+    """A device-flow approval still open for the retired worker: withdrawn here (pool_device_connect.withdraw).
+    The server has no cancel, so the flow keeps asking; an approval that lands later is reported by name."""
+    try:
+        import pool_device_connect
+        return pool_device_connect.withdraw(Path(workspace), wid, deliver=tell)
+    except Exception as e:  # noqa: BLE001 — the retirement is done; the approval is reported, never raised
+        return {"result": "failed", "why": f"{type(e).__name__}: {e}"}
+
+
+def _retire_identity(workspace, wid: str, tell=None) -> dict:
     """The worker's own agent, if it has one, goes with it: its lane, row and vault secret
     (connections.retire_worker_identity). Retired, the router hands its tasks to the core, and
     a lane still running as the worker would post the core's answers in the worker's name."""
@@ -215,8 +261,12 @@ def _retire_identity(workspace, wid: str) -> dict:
         return {"result": "failed", "why": f"{type(e).__name__}: {e}"}
     if row is None:
         return {"result": "none"}
-    return {"result": "removed", "instance": row["instance"], "agent": row.get("agent_mxid") or "",
-            "note": "the agent stays on its server until the owner deletes it there"}
+    agent = row.get("agent_mxid") or ""
+    label = str(((pr.load_roster(workspace) or {}).get("workers") or {}).get(wid, {}).get("label") or wid)
+    told = (tell or (lambda text: _tell_owner(workspace, text)))(agent_removal_note(label, agent or "?"))
+    return {"result": "removed", "instance": row["instance"], "agent": agent,
+            "agent_removal": "owner_step", "owner_told": bool(told),
+            "note": AGENT_REMOVAL_OWNER_STEP}
 
 
 def enable(workspace, repo, target, *, start=True, runner=None, spawn=None) -> dict:
@@ -333,6 +383,118 @@ def unbind(workspace, room: str) -> dict:
     return {"action": "unbind", "room": room, "result": "unbound", "roster_version": out.get("version")}
 
 
+def retry(workspace, repo, target, *, runner=subprocess.run, spawn=None) -> dict:
+    """Restart `target`'s seat at once, owed work kept: the owner's "retry now" to its limit pause.
+    A stopped or retired worker is left alone; a seat that is already gone is just started.
+    Run in place (the detached child of `dispatch_retry`): whatever happens, the pause this sets
+    for the take-down is lifted again, and every ending (restarted, failed, or an error raised on
+    the way) has one terminal result: for a card's tap, reported under its detached key (the card
+    says it); for a bare reply, one DM line."""
+    wid, row = _worker(workspace, target)
+    base = {"worker_id": wid, "action": "retry"}
+    key = os.environ.get(_DETACHED_KEY_ENV) or None
+    gate = os.environ.get(_GATE_ENV) or None
+    if key and gate and not _handoff_confirmed(workspace, gate):
+        # The watcher that asked never confirmed it recorded the tap: nothing is taken down.
+        out = {**base, "result": "failed", "why": "the tap was not recorded in time"}
+        _retry_ended(workspace, row.get("name") or wid, out, key, tell=False, reason=_HANDOFF)
+        return out
+    if key and not _still_current(workspace, key):
+        # The tap this child was started for already ended (reported or past its deadline).
+        return {**base, "result": "failed", "why": "the retry it was started for already ended"}
+    if row.get("state") == "retired" or sup.is_paused(workspace, wid):
+        out = {**base, "result": "failed", "why": "the worker is stopped or retired; enable it first"}
+        _retry_ended(workspace, row.get("name") or wid, out, key, tell=False)  # nothing was attempted
+        return out
+    out = None
+    try:
+        socket = sup.run_socket(workspace, wid)
+        if socket is not None and sw.session_state(wi.tmux_session_name(wid), socket, runner=runner) == "exists":
+            t = _take_down(workspace, wid, runner)
+            sup.set_paused(workspace, wid, False)
+            if not t["down"]:
+                out = {**base, "result": "failed", "sessions": t["sessions"],
+                       "why": "tmux could not confirm the seat gone"}
+        if out is None:
+            restarted = rem.restart(workspace, repo, wid, runner=None if runner is subprocess.run else runner,
+                                    spawn=spawn)
+            ok = restarted["result"] in ("restarted", "already-running")
+            out = {**base, "result": "restarted" if ok else "failed",
+                   "start": {"result": restarted["result"], "detail": restarted["detail"]}}
+            if not ok:
+                out["why"] = "the seat did not start again"
+    except rem.PoolBusy:
+        out = {**base, "result": "failed", "why": "the pool was busy with another change"}
+    except OSError:
+        out = {**base, "result": "failed", "why": "the seat could not be taken down or started"}
+    finally:
+        sup.set_paused(workspace, wid, False)  # never left stopped: the pool supervises it again
+        if out is None:  # an unexpected error is on its way out: it still ends with one result
+            _retry_ended(workspace, row.get("name") or wid,
+                         {**base, "result": "failed", "why": "something went wrong while restarting it"}, key)
+    _retry_ended(workspace, row.get("name") or wid, out, key)
+    return out
+
+
+#: The key and gate claim a recovery card's tap hands its retry (detached_action.KEY_ENV and
+#: GATE_ENV in src), and the reason reported when that claim was never confirmed (HANDOFF).
+_DETACHED_KEY_ENV = "SUTANDO_DETACHED_KEY"
+_GATE_ENV = "SUTANDO_RECOVERY_GATE"
+_HANDOFF = "handoff"
+
+
+def _handoff_confirmed(workspace, gate: str) -> bool:
+    import detached_action
+    return detached_action.wait_for_handoff(Path(workspace), gate)
+
+
+def _still_current(workspace, key: str) -> bool:
+    import detached_action
+    return detached_action.status(Path(workspace), key).state == detached_action.RUNNING
+
+
+def _retry_ended(workspace, name: str, out: dict, key, tell: bool = True, reason=None) -> None:
+    """The retry's one terminal result. A card's tap reads it from its detached key, so the card
+    is the one surface; a bare reply's owner gets one DM line when a restart it started failed."""
+    failed = out.get("result") == "failed"
+    line = (f"I could not restart {name}{': ' + out['why'] if out.get('why') else ''}. It is not left "
+            "stopped: the pool keeps supervising it and starts it again by itself.") if failed else None
+    if key:
+        import detached_action
+        detached_action.report(Path(workspace), key, detached_action.FAILED if failed else detached_action.DONE,
+                               reason=reason or line)
+    elif failed and tell:
+        _tell_owner_retry_failed(workspace, line)
+
+
+def dispatch_retry(workspace, repo, target, *, popen=subprocess.Popen) -> dict:
+    """Start `retry --in-place` detached in its own session, and return at once: the caller (the
+    seat's input watcher) lives in a tmux session the take-down closes."""
+    wid, row = _worker(workspace, target)
+    base = {"worker_id": wid, "action": "retry"}
+    if row.get("state") == "retired" or sup.is_paused(workspace, wid):
+        return {**base, "result": "failed", "why": "the worker is stopped or retired; enable it first"}
+    log = Path(workspace) / "logs" / f"pool-retry-{wid}.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    argv = [sys.executable, str(RETRY_ENTRY), "--workspace", str(workspace), "--repo", str(repo),
+            "retry", wid, "--in-place", "--after", str(RETRY_HANDOFF_S)]
+    with open(log, "ab") as out:
+        popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True, close_fds=True)
+    return {**base, "result": "dispatched", "log": str(log)}
+
+
+def _tell_owner_retry_failed(workspace, line: str) -> None:
+    """One DM line: the retry did not restart the worker; the pool keeps supervising it."""
+    from local_record import write_text_whole
+    from proactive_routing import proactive_filename
+    import time as _time
+    try:
+        write_text_whole(Path(workspace) / "results" / proactive_filename(f"pool-retry-{int(_time.time() * 1000)}"),
+                         f"[dm-only]\n{line}\n")
+    except OSError:
+        pass
+
+
 def main(argv=None, *, runner=subprocess.run) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--workspace", default=None)
@@ -340,7 +502,7 @@ def main(argv=None, *, runner=subprocess.run) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     ls = sub.add_parser("list")
     ls.add_argument("--json", action="store_true")
-    for name in ("stop", "retire", "enable", "remove", "reseat"):
+    for name in ("stop", "retire", "enable", "remove", "reseat", "retry"):
         sp = sub.add_parser(name)
         sp.add_argument("worker")
         if name == "stop":
@@ -353,6 +515,10 @@ def main(argv=None, *, runner=subprocess.run) -> int:
         if name in ("retire", "remove"):
             sp.add_argument("--hand-off", action="store_true",
                             help="give the tasks it still owes to the core instead of refusing")
+        if name == "retry":
+            sp.add_argument("--in-place", action="store_true",
+                            help="run the restart in this process (the detached child of a retry)")
+            sp.add_argument("--after", type=float, default=0.0, help="seconds to wait before the take-down")
         if name == "enable":
             sp.add_argument("--no-start", action="store_true",
                             help="lift the stop/retire without starting a session now")
@@ -386,6 +552,12 @@ def main(argv=None, *, runner=subprocess.run) -> int:
                          runner=None if runner is subprocess.run else runner)
         elif a.cmd == "reseat":
             out = reseat(ws, a.repo, a.worker, runner=runner)
+        elif a.cmd == "retry":
+            if a.in_place and a.after > 0:
+                import time as _time
+                _time.sleep(min(a.after, 30.0))
+            out = (retry(ws, a.repo, a.worker, runner=runner) if a.in_place
+                   else dispatch_retry(ws, a.repo, a.worker))
         elif a.cmd == "plugins":
             out = plugins(ws, a.worker, a.op, a.dir)
         elif a.cmd == "bind":

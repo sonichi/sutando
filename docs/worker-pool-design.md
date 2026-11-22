@@ -100,6 +100,28 @@ That last rule is the point: a surviving sentinel, `.alive` file, done-flag or
 archived header from the deleted worker can never be read as belonging to its
 namesake.
 
+### Attaching from a terminal
+
+`create_worker.py` prints a copyable `session` command. If a launcher reports
+failure while its session is alive or cannot be checked, the retained-worker
+diagnostic prints the same form of command. Both use `spawn_worker.attach_command`:
+
+```sh
+'tmux' '-S' '/path/with spaces/worker.sock' 'attach-session' '-t' '=sutando-worker-7c54b230a8d94ea9b86f52d70134ac68'
+```
+
+The `-S` server path remains one literal argument, including quotes and shell
+metacharacters. The quoted `=session` target requires an exact tmux session name
+and also prevents Zsh's leading-`=` expansion; the command works in Bash and Zsh.
+If that worker session is absent, it fails instead of attaching to its
+`-watcher` session or another session sharing the prefix. Once the exact target
+exists again, the same command can attach. It does not create or recover a
+session or establish conversation continuity.
+
+This formatting is only for human-readable guidance. JSON server/session
+coordinates, worker identities, roster and inboxes, exit statuses, and the
+decision to retain or roll back a failed launch keep their existing contracts.
+
 ## Task, delivery, attempt
 
 | level | what it is | cardinality |
@@ -522,6 +544,11 @@ Registration still performs its final checks under the roster lock. If the
 roster becomes invalid after preflight, creation reports the newly created
 worker's id and explains that it will receive nothing until the roster names
 it; the live worker and its records are retained.
+
+Once registered, creation starts the worker's own s.space identity by default
+(`pool_identity_request.py`, the device-connect flow run in the background; opt out with
+`--no-identity` or `WORKER_POOL_IDENTITY_ON_CREATE=0`). That step is reported, never fatal:
+a worker whose identity step cannot start is created and answers through the core.
 
 The broker's complete `display.worker_labels` map is applied atomically under
 the roster lock. `worker_label_config_version` tracks the last fully applied

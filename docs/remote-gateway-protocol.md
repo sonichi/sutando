@@ -406,6 +406,15 @@ the broker times freshness by when it received the heartbeat. A change in the ro
 sends the heartbeat at once, without waiting for the interval. A gateway with no
 Sutando checkout around it sends neither field.
 
+On the core's own lanes (not a pool worker's) the row also carries `recovery`, the core's
+recovery record, with the `core_recovery.v1` capability: what a remote client needs to show
+the state and offer the fix (see [Core recovery record](core-recovery-record.md); literal
+bodies in `contracts/core_recovery.v1/`). The adapter injects its reader, so a standalone
+Sparrow sends no such block. A missing, stale, malformed or oversized (over 4096 bytes)
+record is omitted, and the broker keeps its last value. A change in the record sends the
+heartbeat at once. A broker that answers `400` or `422` to a beat carrying the block gets the
+same beat again without it at once, and beats without it for the next hour.
+
 ### Task lifecycle *(opt-in: `REMOTE_TASK_LIFECYCLE_V2=1`)*
 
 - **Ack** adds `worker_id` (one lease-holder id per install, `state/relay-lease-worker-id`) and
@@ -432,7 +441,7 @@ Sutando checkout around it sends neither field.
   also stops the core. A stop names the local run it is for, so it never stops a later run. The other
   two, from a beat or an ack, withdraw the task file if the core has not
   taken it up (no turn row newer than the file), and otherwise stop the core; the log names the
-  broker's `reason` when it sends one. `task_cancelled` is a **cooperative Stop**: the core gets one
+  broker's `reason` when it sends one. A stop for a `task_already_terminal` close with no reason, or one naming an answer, is cooperative only: the stop interrupt sends no Escape for it; any other reason (an expiry) still gets one. `task_cancelled` is a **cooperative Stop**: the core gets one
   `CANCEL_INSTRUCTION` task (`source: relay-control`, whose result is retired locally and never
   posted), and nothing is fenced. Once the core has handled that control task, a result it wrote
   for the task is posted normally and no cancel-ack is sent; with no result, or one with nothing to
@@ -728,24 +737,35 @@ Instead of raw bytes, a gateway may hand the task body a media marker:
 
 The client resolves it locally: downloads the bytes (default 25 MB cap) and
 rewrites the marker to `[File attached: <local path>]` (`[Photo attached: …]`
-for `kind=m.image`) — the same inbound convention the other bridges use. Any
-failure leaves the marker untouched.
+for `kind=m.image`) — the same inbound convention the other bridges use. Every
+marker in the body is resolved, up to 10 attempts per task (a failed fetch counts);
+any failure leaves that marker untouched.
 
-Config: `REMOTE_MEDIA_MARKER` (tag, default `remote-media`),
+A marker inside the broker's quoted reply-context record is the replied-to
+message's media; only the record's `body` is scanned, never its other fields or the
+room-metadata block. It is fetched the same way (same cap, routing and directory) and
+rewritten in place, JSON-escaped so the record stays well-formed quoted data, to
+`[Photo attached (from replied-to message): <local path>]` (`[File attached (from
+replied-to message): …]` otherwise). Its file is listed in `attachments:` after the
+message's own, so every adapter and the core get the bytes, not just the file name.
+For that, the broker must quote a media message's marker in the reply-context
+`body`, not only its file name.
+
+Config: `REMOTE_MEDIA_MARKER` (tag; unset, both `remote-media` and AG2 Space's `ag2space-media` are resolved),
 `REMOTE_MEDIA_HS_TOKEN` + `REMOTE_MEDIA_HS_ORIGIN` (homeserver bearer and the
 exact origin it may be sent to), `REMOTE_MEDIA_DIR`, `REMOTE_MEDIA_MAX_BYTES`.
 
-Credential routing is by parsed exact origin, never string matching:
+Only two kinds of URL are fetched, matched on the raw URL (no `.`/`..` segment or
+percent-encoding passes, no userinfo or fragment), each with its own bearer:
 
-- gateway bearer → only when the URL's scheme/host/port equal the gateway's
-  AND the path sits at/under the gateway base path with a `/` boundary;
-- homeserver bearer → only for `/_matrix/` paths on exactly
-  `REMOTE_MEDIA_HS_ORIGIN` (legacy media routes are upgraded to the MSC3916
-  authenticated route first); unset origin ⇒ Matrix media is never credentialed;
-- anything else → fetched with no credentials.
+- gateway bearer → `<gateway base>/v1/media/<server>/<id>` on exactly the
+  gateway's scheme/host/port, with at most a `room_id` query parameter;
+- homeserver bearer → `/_matrix/client/v1/media/(download|thumbnail)/<server>/<id>`
+  (or the legacy `/_matrix/media/(r0|v3)/download/…`, upgraded to the MSC3916
+  route) on exactly `REMOTE_MEDIA_HS_ORIGIN`; unset ⇒ never fetched;
+- anything else → never fetched; the marker is left untouched.
 
-Authenticated fetches refuse redirects (a 3xx is a failure), so a
-gateway-controlled URL can never bounce a bearer to another host.
+No media fetch follows a redirect (a 3xx is a failure).
 
 The local `room_ops.py fetch` fallback accepts `mxc://server/id` with an
 explicit `--room`, or a media link under the selected gateway's
