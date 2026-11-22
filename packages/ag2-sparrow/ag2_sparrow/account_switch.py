@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import urllib.parse
 
 from . import card_desk, connector_cards
 
@@ -22,6 +23,15 @@ HINT = ("If the person asks to switch, change or sign in to another account for 
         "sign-in yourself." % MARK)
 IN_DM = "I can switch accounts from our direct message. Ask me there."
 ANSWERED = "[no-send] the account card answers\n"
+
+
+def page_ok(url) -> bool:
+    """Whether `url` is a plain https address with a host: the only thing handed to this computer's
+    opener, where anything else (a leading '-', a file or app scheme) could be read as something to run."""
+    if not isinstance(url, str) or any(c.isspace() for c in url):
+        return False
+    parts = urllib.parse.urlsplit(url)
+    return parts.scheme == "https" and bool(parts.hostname) and "@" not in parts.netloc
 
 
 def masked(email: str) -> str:
@@ -92,7 +102,9 @@ class AccountSwitch:
         return self.offer(sent, result_file)
 
     def tapped(self, verb, sent, result_file) -> str:
-        """The owner tapped "Switch account": start a sign-in, show its page here, and say so."""
+        """The owner tapped "Switch account": start a sign-in, show its page here, and say so. The page
+        is checked, and its card built, before anything is opened or kept: a page that is not a plain
+        https address is given up at once, so a retry cannot open a browser again and again."""
         room = str(sent.get("channel_id") or "")
         if verb != "switch":
             self.publish(result_file, self.quoted("I couldn't match that button. Send /account for a new card.") + "\n")
@@ -108,12 +120,22 @@ class AccountSwitch:
             self.log("sign-in not started:", "%s: %s" % (type(e).__name__, str(e)[:200]))
             self.say(room, self.card("error", "I could not start a sign-in. %s" % before), result_file)
             return "account-not-started"
+        try:
+            if not page_ok(url):
+                raise ValueError("the sign-in page is not an https address")
+            link = self.card("info", "Open the sign-in page on the computer I run on. Finish signing in there; I'll "
+                                     "confirm here. Until then: %s" % before, url=url)
+        except ValueError as e:
+            self.log("sign-in page refused:", str(e)[:200])
+            self.give_up({"id": login})
+            self.say(room, self.card("error", "I could not start a sign-in: the page I was given for it is not one "
+                                              "I can show. %s" % before), result_file)
+            return "account-not-started"
         self.keep({"id": login, "room": room, "at": time.time()})
-        shown = self.opener(url)
-        where = ("I opened the sign-in page in the browser on the computer I run on." if shown
-                 else "Open the sign-in page on the computer I run on.")
-        self.say(room, self.card("info", "%s Finish signing in there; I'll confirm here. Until then: %s"
-                                 % (where, before), url=url), result_file)
+        if self.opener(url):
+            link = self.card("info", "I opened the sign-in page in the browser on the computer I run on. Finish "
+                                     "signing in there; I'll confirm here. Until then: %s" % before, url=url)
+        self.say(room, link, result_file)
         return "account-started"
 
     def give_up(self, waiting) -> None:
@@ -123,27 +145,41 @@ class AccountSwitch:
             self.log("sign-in not cancelled:", "%s: %s" % (type(e).__name__, str(e)[:200]))
         self.keep({})
 
+    def last_word(self, waiting, state, text) -> bool:
+        """Post a sign-in's final card. Until it is posted the sign-in stays on record with that card's
+        words, so a card that could not be queued is not lost: `expire` posts it later."""
+        if self.post(waiting.get("room"), self.card(state, text)):
+            self.keep({})
+            return True
+        self.keep(dict(waiting, final={"state": state, "text": text}))
+        return False
+
     def finished(self, login, success, error="") -> str:
         """The runtime reported a sign-in over: tell the owner, in the DM it was asked in, how it ended
         and which account is in use now. '' for a sign-in this card did not start."""
         waiting = self.pending()
-        if not waiting or (login and str(login) != waiting["id"]):
+        if not waiting or waiting.get("final") or (login and str(login) != waiting["id"]):
             return ""
-        self.keep({})
         if success:
-            self.say(waiting.get("room"), self.card("done", "Signed in. %s" % self.using()))
+            self.last_word(waiting, "done", "Signed in. %s" % self.using())
             return "account-switched"
         why = " (%s)" % str(error)[:120] if error else ""
-        self.say(waiting.get("room"), self.card("error", "The sign-in did not finish%s. %s" % (why, self.using())))
+        self.last_word(waiting, "error", "The sign-in did not finish%s. %s" % (why, self.using()))
         return "account-not-switched"
 
     def expire(self, now=None) -> str:
-        """Give up a sign-in nobody finished within WAIT_S, and say so."""
+        """Give up a sign-in nobody finished within WAIT_S, and say so; and post a final card that could
+        not be posted when its sign-in ended."""
         waiting = self.pending()
+        final = waiting.get("final") if waiting else None
+        if isinstance(final, dict):
+            return "account-told" if self.last_word(waiting, str(final.get("state")), str(final.get("text"))) else ""
         if not waiting or (now if now is not None else time.time()) - float(waiting.get("at") or 0) < WAIT_S:
             return ""
-        self.give_up(waiting)
-        self.say(waiting.get("room"), self.card("error", "The sign-in was not finished in %d minutes, so I stopped "
-                                                         "waiting. %s Send /account to try again."
-                                                % (WAIT_S // 60, self.using())))
+        try:
+            self.cancel(waiting["id"])
+        except Exception as e:  # noqa: BLE001 - a sign-in already over cannot be cancelled
+            self.log("sign-in not cancelled:", "%s: %s" % (type(e).__name__, str(e)[:200]))
+        self.last_word(waiting, "error", "The sign-in was not finished in %d minutes, so I stopped waiting. %s Send "
+                                         "/account to try again." % (WAIT_S // 60, self.using()))
         return "account-timed-out"

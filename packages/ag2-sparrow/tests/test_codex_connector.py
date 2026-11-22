@@ -960,6 +960,61 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         ((_, card),) = self.posted()
         self.assertEqual(card["text"], "I'm not signed in.")
 
+    def test_a_sign_in_page_that_is_not_an_https_address_is_never_opened_and_the_sign_in_is_given_up(self):
+        for n, page in enumerate(("-a/Applications/Calculator.app", "file:///etc/hosts", "http://stub.invalid/x",
+                                  "https://user@stub.invalid/x")):
+            (self.home / "stub-login").write_text("page " + page)
+            self.serve("task-ask%d" % n, "/account")
+            ((_, card),) = self.posted("$a%d" % n)
+            said = card["buttons"][0]["reply"]
+            self.serve("task-tap%d" % n, said, reply_to="$a%d" % n, click=said)
+            ((_, refused),) = self.posted("$b%d" % n)
+            self.assertEqual((refused["state"], "buttons" in refused, metrics(self.work)[-1]["card"]),
+                             ("error", False, "account-not-started"), page)
+            self.assertIn("not one I can show", refused["text"])
+            self.assertEqual(json.loads((self.work / "state" / "account.json").read_text()), {}, "nothing is left pending")
+        self.assertEqual(self.opened, [], "no browser was opened for any of them")
+        self.assertEqual(len((self.home / "stub-cancelled").read_text().split()), 4, "each was cancelled once")
+        self.assertEqual([account_switch.page_ok(u) for u in ("https://a.example/x?y=1", "https://", None, "https://a b")],
+                         [True, False, False, False])
+
+    def test_a_final_card_that_could_not_be_posted_is_kept_and_posted_later(self):
+        (self.home / "stub-login").write_text("success bob@example.org")
+        self.serve("task-ask", "/account")
+        ((_, card),) = self.posted()
+        said = card["buttons"][0]["reply"]
+        self.dm("task-tap", said, reply_to="$card1", click=said)
+        self.dm("task-next", "hello")
+        os.utime(self.work / "tasks" / "task-next.txt", (time.time() + 5, time.time() + 5))
+        real = connector_cards.queue
+        queued = []
+
+        def first_only(*a, **kw):
+            # The "sign in here" card is queued; the outcome's queue is down.
+            queued.append(1)
+            if len(queued) > 1:
+                raise OSError("disk full")
+            return real(*a, **kw)
+
+        with mock.patch.object(connector_cards, "queue", side_effect=first_only):
+            self.assertEqual(run_connector(self.work, once=2), 0)
+        kept = json.loads((self.work / "state" / "account.json").read_text())
+        self.assertEqual((kept["id"], kept["final"]["state"]), ("login-1", "done"), "the outcome is still on record")
+        self.posted("$card2")
+        self.assertTrue(self.serve("task-later", "hello again").startswith("STUB echo:"))
+        ((room, done),) = self.posted("$card3")
+        self.assertEqual((room, done["state"], done["text"]), (self.DM, "done", "Signed in. I'm signed in as b…@example.org (pro)."))
+        self.assertEqual(json.loads((self.work / "state" / "account.json").read_text()), {})
+
+    def test_a_card_that_cannot_be_drawn_is_answered_in_words_and_the_task_is_done(self):
+        with mock.patch.object(account_switch.AccountSwitch, "card", side_effect=ValueError("bad label")):
+            said = self.serve("task-1", "/account")
+            asked = self.serve("task-2", "[[askaccount]] switch account")
+        self.assertEqual((said.strip(), asked.strip()), ("I could not show the account card. Tell me what you'd like in "
+                                                         "your own words.",) * 2)
+        self.assertEqual([m["card"] for m in metrics(self.work)], ["account-card-failed"] * 2)
+        self.assertEqual((self.work / "state" / "done").read_text().split(), ["task-1", "task-2"])
+
     def test_the_account_is_named_without_its_address_and_what_cannot_be_read_is_not_called_signed_out(self):
         self.assertEqual([account_switch.masked(e) for e in ("alice@example.com", "", "no-at-sign", "@x.org")],
                          ["a…@example.com", "", "", ""])

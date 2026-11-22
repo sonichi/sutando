@@ -41,7 +41,8 @@ BROKEN, MOVED = "gpt-6-astra", "gpt-6-luna"
 
 def home_file(name, text=None):
     """A sign-in stand-in under CODEX_HOME: `stub-account` holds the address signed in, `stub-login` says
-    how the next sign-in ends ("success <address>", "fail", "refuse"; absent: it never ends)."""
+    how the next sign-in ends ("success <address>", "fail", "refuse", "page <address of its page>";
+    absent: it never ends)."""
     path = os.path.join(os.environ.get("CODEX_HOME") or ".", name)
     if text is not None:
         with open(path, "a") as f:
@@ -94,11 +95,11 @@ for line in sys.stdin:
         if plan[:1] == ["refuse"]:
             send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": "login server could not start"}})
             continue
-        send({"jsonrpc": "2.0", "id": rid, "result": {"type": "chatgpt", "loginId": "login-1",
-                                                      "authUrl": "https://stub.invalid/sign-in?id=login-1"}})
+        page = plan[1] if plan[:1] == ["page"] else "https://stub.invalid/sign-in?id=login-1"
+        send({"jsonrpc": "2.0", "id": rid, "result": {"type": "chatgpt", "loginId": "login-1", "authUrl": page}})
         if plan[:1] == ["success"]:
             home_file("stub-account", "\n" + plan[1])
-        if plan:
+        if plan and plan[0] != "page":
             send({"jsonrpc": "2.0", "method": "account/login/completed",
                   "params": {"loginId": "login-1", "success": plan[0] == "success",
                              "error": None if plan[0] == "success" else "access_denied"}})

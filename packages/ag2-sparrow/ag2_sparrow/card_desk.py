@@ -33,7 +33,7 @@ class Desk:
         if verdict.verdict == agent_card.COMMAND:
             for card in self.cards:
                 if card.KIND == verdict.command.kind:
-                    return card.tapped(verdict.command.verb, sent, result_file)
+                    return self.drawn(card, result_file, lambda: card.tapped(verdict.command.verb, sent, result_file))
         if verdict.verdict in (agent_card.COMMAND, agent_card.FORGED):
             self.publish(result_file, self.quoted(verdict.say) + "\n")
             return "card-refused"
@@ -42,8 +42,18 @@ class Desk:
             return ""
         for card in self.cards:
             if ask.lower() == card.ASK and card.usable():
-                return card.asked_for(words.strip(), sent, result_file)
+                return self.drawn(card, result_file, lambda: card.asked_for(words.strip(), sent, result_file))
         return ""
+
+    def drawn(self, card, result_file, act) -> str:
+        """`act()`, with a card that cannot be drawn (a name or a link the card rules refuse) answered in
+        words once: nothing raises out of a card matter, so the task is never retried over it."""
+        try:
+            return act()
+        except ValueError:
+            self.publish(result_file, self.quoted("I could not show the %s card. Tell me what you'd like in your "
+                                                  "own words." % card.KIND) + "\n")
+            return "%s-card-failed" % card.KIND
 
     def marked(self, tier, path, status, text, result_file) -> str:
         """The runtime answered the owner with a card's mark alone: show that card in their DM, or say
@@ -55,7 +65,7 @@ class Desk:
         with open(path, encoding="utf-8") as f:
             sent, _ = agent_card.reply_words(f.read())
         if agent_card.owner_may_act(sent) is None:
-            return card.offer(sent, result_file)
+            return self.drawn(card, result_file, lambda: card.offer(sent, result_file))
         self.publish(result_file, self.quoted(card.IN_DM) + "\n")
         return "%s-card-elsewhere" % card.KIND
 
