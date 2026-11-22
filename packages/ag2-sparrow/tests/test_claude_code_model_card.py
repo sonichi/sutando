@@ -26,7 +26,7 @@ OWNER, DM = "@owner:s.space", "!dm:s.space"
 REAL_START_APPLY = model_card.start_apply
 
 
-class Card(ConnectBase):
+class Base(ConnectBase):
     def setUp(self):
         super().setUp()
         self.bridge = self.home / "bridge-state"
@@ -68,6 +68,8 @@ class Card(ConnectBase):
     def state(self):
         return json.loads((Path(self.root) / "state" / model_switch.FILE).read_text())
 
+
+class Claim(Base):
     def test_the_owners_model_in_their_dm_is_the_menu_and_never_reaches_the_session(self):
         rc, out = self.claim(self.task("task-m", "/model"))
         self.assertEqual(rc, 1)
@@ -116,9 +118,11 @@ class Card(ConnectBase):
         with mock.patch.object(model_card, "card_matter", side_effect=RuntimeError("broken")):
             rc, out = self.claim(self.task("task-b", "/model"))
         self.assertEqual((rc, out.get("admission")), (0, "owner"))
+        with mock.patch.object(inbox.cm, "load_config_at", return_value=({}, "unreadable")):
+            self.assertEqual(inbox.card_matter(self.root, "task-b"), ("", ""))
 
 
-class Apply(Card):
+class Apply(Base):
     class Launcher:
         def __init__(self, answers):
             self.answers, self.calls = list(answers), []
@@ -183,6 +187,24 @@ class Apply(Card):
         self.assertTrue(kw["start_new_session"])
         self.assertEqual(kw["env"], {"X": "1"})
         REAL_START_APPLY(self.root, popen=mock.Mock(side_effect=OSError("no exec")), environ={})  # logged, not raised
+
+    def test_the_apply_entry_reads_the_installed_config(self):
+        out = io.StringIO()
+        with mock.patch.object(model_card, "apply", return_value="switched") as run, contextlib.redirect_stdout(out):
+            self.assertEqual(model_card.main(["apply", "--root", self.root]), 0)
+        self.assertEqual((run.call_args[0][0], out.getvalue().strip()), (self.root, "switched"))
+        with mock.patch.object(model_card, "apply", return_value=""), contextlib.redirect_stdout(io.StringIO()) as quiet:
+            model_card.main(["apply", "--root", self.root])
+        self.assertEqual(quiet.getvalue().strip(), "nothing to switch")
+        with mock.patch.object(inbox, "_installed_config", return_value=self.home / "missing.env"):
+            self.assertEqual(model_card.main(["apply", "--root", self.root]), 1)
+
+    def test_a_broken_card_ledger_or_state_never_breaks_a_turn(self):
+        cfg = cli.read_config(cli.config_path())
+        with mock.patch.object(model_card, "switcher", side_effect=OSError("state unreadable")):
+            self.assertEqual(model_card.turn_model(self.root, cfg), "")
+        with mock.patch.object(connector_cards, "absorb", side_effect=OSError("ledger")):
+            self.assertEqual(model_card.card_matter(self.root, self.task("task-z", "hello"), cfg), ("", ""))
 
 if __name__ == "__main__":
     unittest.main()

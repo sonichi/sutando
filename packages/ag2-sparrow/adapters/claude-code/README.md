@@ -763,6 +763,8 @@ server); the two screen texts are the ones `skills/model-switch` waits for on th
 typed while a turn is running is queued by Claude Code and applies when the turn ends, so the 20 s
 wait can report `unconfirmed` for a switch that lands later.
 
+**The model card.** The owner can also switch from their DM, with the same card Antigravity and local Codex use (`ag2_sparrow/model_switch.py`). `inbox claim` answers these before the session sees them (`adapters/claude_code/model_card.py`): `/model` in the DM posts the menu (the core's list: Default, Opus, Sonnet 1M, Haiku, Fable 1M), and a tap on it, or `/model <name>`, saves the pick and posts "switching". It then starts `python -m ag2_sparrow.adapters.claude_code.model_card apply` detached: this `model` switch with `--confirm`, tried again on a busy box or an unseen switch, then "Switched" or "could not switch" in the DM (log: `state/model-apply.log`). Any tap but the owner's in their DM gets the fixed refusal. The isolated turn for a restricted sender runs on the same pick (`ANTHROPIC_MODEL`).
+
 `attach` is `tmux attach` on the adapter's own socket: the same session under the same lock, so a
 `/exit` typed there ends it and the launcher resumes it by id; `--help` states the limits.
 
