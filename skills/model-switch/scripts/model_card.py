@@ -35,6 +35,7 @@ Exit 0 done, 1 a negative answer, 2 refused.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import secrets
@@ -111,13 +112,24 @@ def choices(manifest: Optional[Path] = None) -> list:
     return out
 
 
+def issuance(picks: list) -> str:
+    """A short name for exactly this menu: its slugs and the exact id behind each. Two menus that look
+    the same but stand for different ids are different issuances, so a send repeated for one is never
+    answered with the other's event."""
+    exact = json.dumps([[slug, model] for model, _, slug in picks], ensure_ascii=True)
+    return hashlib.sha256(exact.encode("utf-8")).hexdigest()[:16]
+
+
 def remember_choices(ws: Path, event_id: str, picks: list, now: float) -> None:
-    """Keep the exact id behind each slug of the menu posted as `event_id`."""
+    """Keep the exact id behind each slug of the menu posted as `event_id`. What an event's buttons
+    stand for is fixed when it is first kept: a later call for the same event changes nothing."""
     from file_lock import locked_file
     from local_record import write_whole
     path = ws.joinpath(*ISSUED)
     with locked_file(path.with_name(path.name + ".lock")):
         cards = issued_choices(ws)
+        if event_id in cards:
+            return
         cards[event_id] = {"ids": {slug: model for model, _, slug in picks}, "ts": now}
         newest = sorted(cards.items(), key=lambda kv: float(kv[1].get("ts") or 0))[-ISSUED_KEPT:]
         write_whole(path, {"cards": dict(newest)})
@@ -360,11 +372,12 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time) -> int:
     delivered = deliver_owed(ws, core=core, execute=execute, now=now())
     if delivered:
         body, card = menu_card(current_model(ws)["model"], picks)
-    out = _post(ws, args.room, body, card, f"model-card:menu:{int(now())}", reply_to=args.reply_to or "",
-                core=core, execute=execute)
+    shown = picks[:MENU_BUTTONS]
+    out = _post(ws, args.room, body, card, f"model-card:menu:{int(now())}:{issuance(shown)}",
+                reply_to=args.reply_to or "", core=core, execute=execute)
     if out.get("event_id"):
         try:
-            remember_choices(ws, out["event_id"], picks[:MENU_BUTTONS], now())
+            remember_choices(ws, out["event_id"], shown, now())
         except OSError as e:
             out["why"] = f"its buttons will not act ({type(e).__name__})"
     return _emit({**out, **({"delivered": delivered} if delivered else {})}, 0 if out["status"] == "posted" else 1)

@@ -682,6 +682,25 @@ class Manifest(Base):
             self.assertEqual((rc, out["status"], self.launch.calls[n][0][6]), (0, "started", model))
             self.run_(["post", "--room", DM])
 
+    def test_what_an_issued_menus_buttons_stand_for_is_never_rebound(self):
+        # Two menus in one second that look the same and stand for different ids: the send is named
+        # for the exact mapping, so the second is not answered with the first's event.
+        self.choose("Opus[1m]=Opus")
+        self.run_(["post", "--room", DM])
+        self.choose("opus[1m]=Opus")
+        self.run_(["post", "--room", DM])
+        first, second = (c[2].rsplit(":", 1)[1] for c in self.fake.calls)
+        self.assertNotEqual(first, second, "whatever the second, the two sends are named apart")
+        self.assertEqual([mc.issued_choices(self.ws)[e]["ids"] for e in ("$card1", "$card2")],
+                         [{"opus-1m": "Opus[1m]"}, {"opus-1m": "opus[1m]"}])
+        # And if a send does come back with an event already kept, its binding stays the first one.
+        with mock.patch.object(mc, "_post", return_value={"status": "posted", "event_id": "$card1"}):
+            rc, _ = self.run_(["post", "--room", DM])
+        self.assertEqual((rc, mc.issued_choices(self.ws)["$card1"]["ids"]), (0, {"opus-1m": "Opus[1m]"}))
+        mc.remember_choices(self.ws, "$card1", [("sonnet", "Sonnet", "opus-1m")], 9.0)
+        self.assertEqual(mc.issued_choices(self.ws)["$card1"], {"ids": {"opus-1m": "Opus[1m]"}, "ts": mock.ANY})
+        self.assertEqual(mc.issuance([("a", "A", "s")]), mc.issuance([("a", "Other title", "s")]), "titles do not count")
+
     def test_a_title_no_button_can_carry_is_skipped_and_the_rest_is_posted(self):
         self.choose(f"opus=Opus;sonnet={'S' * 81};haiku={'H' * 80};fable=;default=Default")
         rc, out = self.run_(["post", "--room", DM])
