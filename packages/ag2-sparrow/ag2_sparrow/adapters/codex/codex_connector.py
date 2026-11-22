@@ -42,6 +42,9 @@ CLIENT = {"name": "ag2-sparrow-codex", "version": "0.1.0"}
 APPROVAL_REQUESTS = ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
                      "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval")
 NON_OWNER_SANDBOX = "read-only"
+# The only models the card offers or accepts, and only while `model/list` names them; anything else is refused.
+MODEL_ALLOWLIST = ("gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+                   "gpt-5.5", "gpt-5.2")
 NO_REPLY = "[no reply] Codex completed the turn without a message."
 # --held: the launcher that spawned this process holds the work root and attaches it as the consumer
 # whose liveness fences the root; the connector waits this long for that record, then refuses.
@@ -208,25 +211,32 @@ class Connector:
         """The model card's state and rules; made on first use, once main has named the state dir."""
         if self._models is None:
             self._models = model_switch.ModelSwitch(self.args.state, self.root, getattr(self.args, "bridge_state", None),
-                                                    "Codex", write_atomic, quoted, log, refresh=self.list_models)
+                                                    "Codex", write_atomic, quoted, log, refresh=self.list_models,
+                                                    allowed=MODEL_ALLOWLIST)
         return self._models
 
-    def list_models(self):
-        """Ask the server which models it offers (`model/list`), for the card; a refusal leaves the last list."""
+    def list_models(self) -> bool:
+        """Ask the server which models it offers (`model/list`), for the card; False when it would not say."""
         try:
             offered = [m for m in self.rpc.request("model/list", {"limit": 100}).get("data") or []
                        if isinstance(m, dict) and not m.get("hidden")]
         except (RuntimeError, TimeoutError) as e:
             log("model/list failed:", str(e)[:200])
-            return
+            return False
         default = next((m.get("id") for m in offered if m.get("isDefault")), "")
+        # The model in use is the one a turn last ran on; a pending pick is not it yet.
         self.models.seen([(m.get("id"), m.get("displayName")) for m in offered],
-                         self.models.wanted() or self.args.model or default)
+                         self.models.state().get("current") or self.args.model or default)
+        return True
 
     def turn_model(self, caps):
-        """The model a turn runs on: the owner's pick on the kept threads, else --model (None: Codex's own)."""
-        kept = caps.session == "durable" and getattr(self.args, "state", None)
-        return (self.models.wanted() if kept else None) or self.args.model
+        """The model a turn runs on: on the kept threads the owner's pick, or the one a told pick left in use;
+        else --model (None: Codex's own)."""
+        if not (caps.session == "durable" and getattr(self.args, "state", None)):
+            return self.args.model
+        state = self.models.state()
+        kept = str(state.get("current") or "") if state.get("told") else ""
+        return self.models.wanted() or (kept if self.models.ok(kept) else None) or self.args.model
 
     def card_task(self, task_id, headers, path, result_path):
         """The metrics row of a task that was a card matter (a tap, or the owner's /model), else None."""
@@ -555,9 +565,10 @@ class Connector:
             status, text, err = self.run_task(headers, prompt, policy.capabilities)
             t_done = time.time()
             out = self.result_body(status, text, err)
+            # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
+            told = self.tell_model(status, policy.capabilities)
             asked = self.models.asked(headers["access_tier"], path, status, text, result_path)
             t_result = os.stat(result_path).st_mtime if asked else write_atomic(result_path, out.rstrip("\n") + "\n")
-            told = self.tell_model(status, policy.capabilities)
             record_done(done_path, task_id)
             rec = {"task": task_id, "status": status, "chars": len(out), "tier": headers["access_tier"],
                    "detect_s": round(t_seen - t_mtime, 3), "turn_s": round(t_done - t_sent, 3),

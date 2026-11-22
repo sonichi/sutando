@@ -22,17 +22,33 @@ HINT = ("If the person asks to change, switch or choose the model you run on, or
 IN_DM = "I can switch models from our direct message. Ask me there."
 UNKNOWN = ("I don't know my models yet: I learn them when a turn starts. Send me any message, then "
            "send /model again.")
+UNLISTED = "I could not get my list of models just now. Send /model again in a moment."
+NOT_USABLE = "That model is not one I can use now. Send /model for the current list."
 ANSWERED = "[no-send] the model card answers\n"
 
 
 class ModelSwitch:
     """`publish(result_file, body)` writes a task's result; `quoted(text)` makes the connector's own
     words safe to publish; `refresh()`, when the runtime can list its models on request, is called
-    before the card is shown."""
+    before a card or a pick and returns False when the runtime would not list them. With `allowed`, only
+    those ids are ever offered or accepted, and only while the runtime lists them."""
 
-    def __init__(self, state_dir, root, bridge_state, name, publish, quoted, log, refresh=None):
+    def __init__(self, state_dir, root, bridge_state, name, publish, quoted, log, refresh=None, allowed=None):
         self.state_dir, self.root, self.bridge_state, self.name = state_dir, root, bridge_state, name
         self.publish, self.quoted, self.log, self.refresh = publish, quoted, log, refresh
+        self.allowed = None if allowed is None else frozenset(allowed)
+
+    def ok(self, mid) -> bool:
+        return bool(mid) and (self.allowed is None or mid in self.allowed)
+
+    def offered(self, state: dict) -> list:
+        """The models a card offers: what the runtime listed, within the allowlist."""
+        return [m for m in state.get("available") or [] if isinstance(m, dict) and self.ok(m.get("id"))]
+
+    def pending(self, state: dict) -> str:
+        """A pick no turn has applied yet ('' when none): it is coming, not in use, and may yet be refused."""
+        wanted = str(state.get("wanted") or "")
+        return wanted if wanted and state.get("told") != wanted else ""
 
     def state(self) -> dict:
         try:
@@ -50,11 +66,13 @@ class ModelSwitch:
         os.replace(path + ".tmp", path)
 
     def wanted(self) -> "str | None":
-        return str(self.state().get("wanted") or "") or None
+        wanted = str(self.state().get("wanted") or "")
+        return wanted if self.ok(wanted) else None
 
     def seen(self, offered, current):
         """Remember what the runtime offers: `offered` is (id, name) pairs, `current` the id in use."""
-        seen = {"available": [{"id": str(mid)[:200], "name": str(name or mid)[:80]} for mid, name in offered if mid],
+        seen = {"available": [{"id": str(mid)[:200], "name": str(name or mid)[:80]} for mid, name in offered
+                              if self.ok(mid)],
                 "current": str(current or "")[:200]}
         if {k: self.state().get(k) for k in seen} != seen:
             self.save(**seen)
@@ -64,8 +82,8 @@ class ModelSwitch:
         buttons: it says the switch is coming, then, with `ran` (the model the next turn ran on), that
         it happened or that it did not; with `same`, that the pick is the model already in use."""
         agent_card, _ = connector_cards._core()
-        names = {m["id"]: m["name"] for m in state.get("available") or []}
-        now = state.get("current") or ""
+        names = {m["id"]: m["name"] for m in self.offered(state)}
+        now, coming = state.get("current") or "", self.pending(state)
         if picked:
             name = names.get(picked, picked)
             if same:
@@ -85,10 +103,13 @@ class ModelSwitch:
                                      command=agent_card.reply("model", "agent", mid))
                    for mid, name in list(names.items())[:BUTTONS]]
         more = list(names.values())[BUTTONS:]
+        text = "Now using %s." % names.get(now, now or "the default model")
+        if coming:
+            text += " Pending: %s, on your next message." % names.get(coming, coming)
+        if more:
+            text += " Also: %s (send /model and the name)." % ", ".join(more)
         return agent_card.build(CARD, "pending", title="Model", body="Pick a model for %s" % self.name,
-                                text="Now using %s.%s" % (names.get(now, now or "the default model"),
-                                                          " Also: %s (send /model and the name)." % ", ".join(more)
-                                                          if more else ""), buttons=buttons)
+                                text=text, buttons=buttons)
 
     def usable(self) -> bool:
         """Whether a card can reach the room: the agent's own bridge keeps a state dir (made at install).
@@ -124,33 +145,41 @@ class ModelSwitch:
         if not named.strip():
             return self.offer(sent, result_file)
         # "/model <name>": the way to a model the card has no button for.
-        if self.refresh:
-            self.refresh()
-        wanted = named.strip().lower()
-        match = [m["id"] for m in self.state().get("available") or [] if wanted in (m["id"].lower(), m["name"].lower())]
-        return self.pick(match[0] if match else "", sent, result_file)
+        return self.pick(named.strip().lower(), sent, result_file, by_name=True)
 
-    def pick(self, picked, sent, result_file) -> str:
+    def listed(self, result_file) -> "dict | None":
+        """The state with a fresh list from the runtime; None (and the owner told) when it would not list."""
+        if self.refresh and self.refresh() is False:
+            self.publish(result_file, self.quoted(UNLISTED) + "\n")
+            return None
+        return self.state()
+
+    def pick(self, picked, sent, result_file, by_name=False) -> str:
         """The owner chose `picked` (a tap or "/model <name>"): the next turn runs on it, and a card says so."""
-        state, room = self.state(), str(sent.get("channel_id") or "")
-        if picked not in [m["id"] for m in state.get("available") or []]:
-            self.publish(result_file, self.quoted("That model is not one I can use now. Send /model for the "
-                                                  "current list.") + "\n")
+        state, room = self.listed(result_file), str(sent.get("channel_id") or "")
+        if state is None:
+            return "model-unlisted"
+        ids = [m["id"] for m in self.offered(state) if picked in ((m["id"].lower(), m["name"].lower()) if by_name
+                                                                  else (m["id"],))]
+        if not ids:
+            self.publish(result_file, self.quoted(NOT_USABLE) + "\n")
             return "model-unknown"
-        same = picked == str(state.get("wanted") or state.get("current") or "")
-        if not same:
+        picked, outcome = ids[0], "model-picked"
+        if picked == str(state.get("wanted") or state.get("current") or ""):
+            # Only a model a turn has run on is "in use": a repeated pending pick is still coming.
+            outcome = "model-pending" if self.pending(state) == picked else "model-same"
+        else:
             self.save(wanted=picked, asked_in=room, told="")
-        # A pick of the model in use leaves nothing for the next turn to "confirm".
-        card = self.card(state, picked=picked, same=same)
+        card = self.card(state, picked=picked, same=outcome == "model-same")
         self.publish(result_file, ANSWERED if self.post(room, card) else self.quoted(card[1]["text"]) + "\n")
-        return "model-same" if same else "model-picked"
+        return outcome
 
     def offer(self, sent, result_file) -> str:
         """Answer the owner's ask with the model card (or the line saying why there is none)."""
-        if self.refresh:
-            self.refresh()
-        state = self.state()
-        if not state.get("available"):
+        state = self.listed(result_file)
+        if state is None:
+            return "model-unlisted"
+        if not self.offered(state):
             self.publish(result_file, self.quoted(UNKNOWN) + "\n")
         elif self.post(sent.get("channel_id"), self.card(state)):
             self.publish(result_file, ANSWERED)
@@ -180,6 +209,8 @@ class ModelSwitch:
         if not wanted or state.get("told") == wanted or not live:
             return ""
         switched = ran == wanted
-        self.post(state.get("asked_in"), self.card(state, picked=wanted, ran=ran))
-        self.save(told=wanted, **({} if switched else {"wanted": ""}))
+        # Told only once the card is queued: one that could not be is tried again after the next turn.
+        if not self.post(state.get("asked_in"), self.card(state, picked=wanted, ran=ran)):
+            return "untold"
+        self.save(told=wanted, current=ran or state.get("current") or "", **({} if switched else {"wanted": ""}))
         return "switched" if switched else "not-switched"

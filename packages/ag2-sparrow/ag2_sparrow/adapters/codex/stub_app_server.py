@@ -28,11 +28,14 @@ def thread_obj(tid):
 
 
 # What `model/list` answers when asked with a limit (the model card's call): more than a card's six
-# buttons, one hidden, one whose turns fail and one Codex moves turns away from.
-MODELS = ([{"id": "stub-model", "displayName": "Stub Model", "isDefault": True},
-           {"id": "stub-large", "displayName": "Stub Large"}, {"id": "stub-hidden", "displayName": "Hidden", "hidden": True},
-           {"id": "stub-broken", "displayName": "Stub Broken"}, {"id": "stub-moved", "displayName": "Stub Moved"}]
-          + [{"id": "stub-%d" % n, "displayName": "Stub %d" % n} for n in (5, 6, 7, 8)])
+# buttons, one hidden, one off the connector's allowlist, one whose turns fail and one Codex moves turns from.
+MODELS = ([{"id": "gpt-5.6-sol", "displayName": "Stub Model", "isDefault": True},
+           {"id": "gpt-6-sol", "displayName": "Stub Large"}, {"id": "gpt-6-hidden", "displayName": "Hidden", "hidden": True},
+           {"id": "stub-unlisted", "displayName": "Stub Unlisted"},
+           {"id": "gpt-6-astra", "displayName": "Stub Broken"}, {"id": "gpt-6-luna", "displayName": "Stub Moved"}]
+          + [{"id": mid, "displayName": "Stub %d" % n} for n, mid in
+             ((5, "gpt-5.6-terra"), (6, "gpt-5.6-luna"), (7, "gpt-5.5"), (8, "gpt-5.2"))])
+BROKEN, MOVED = "gpt-6-astra", "gpt-6-luna"
 
 
 def finish_turn(tid, turn_id, item_id, reply, status="completed", error=None):
@@ -67,7 +70,8 @@ for line in sys.stdin:
     elif meth == "initialized":
         pass
     elif meth == "model/list":
-        send({"jsonrpc": "2.0", "id": rid, "result": {"data": MODELS if p.get("limit") else MODELS[:1], "nextCursor": None}})
+        listed = MODELS if p.get("limit") else [{"id": "stub-model", "isDefault": True}]
+        send({"jsonrpc": "2.0", "id": rid, "result": {"data": listed, "nextCursor": None}})
     elif meth in ("thread/start", "thread/resume"):
         tid = p.get("threadId") or str(uuid.uuid4())
         if meth == "thread/resume" and tid.startswith("stale-"):
@@ -118,12 +122,12 @@ for line in sys.stdin:
             PENDING[REQ_ID] = (tid, turn_id, item_id, reply)
             send({"jsonrpc": "2.0", "id": REQ_ID, "method": "item/commandExecution/requestApproval",
                   "params": {"threadId": tid, "turnId": turn_id, "itemId": item_id, "command": ["rm", "-rf", "x"]}})
-        elif p.get("model") == "stub-broken":
+        elif p.get("model") == BROKEN:
             finish_turn(tid, turn_id, item_id, "", "failed", {"message": "the model is not available"})
         else:
-            if p.get("model") == "stub-moved":
+            if p.get("model") == MOVED:
                 send({"jsonrpc": "2.0", "method": "model/rerouted",
-                      "params": {"threadId": tid, "turnId": turn_id, "fromModel": "stub-moved", "toModel": "stub-model",
+                      "params": {"threadId": tid, "turnId": turn_id, "fromModel": MOVED, "toModel": "gpt-5.6-sol",
                                  "reason": "highRiskCyberActivity"}})
             finish_turn(tid, turn_id, item_id, reply)
     elif meth == "turn/interrupt":
