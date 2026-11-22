@@ -137,6 +137,7 @@ class HitlReplyHandler:
         # AUTHORIZATION — the whole point: only the owner resolves.
         if not self._owner or actor != self._owner:
             self._log(f"hitl: action reply from non-owner {actor or '?'} ignored")
+            self._audit_not_owner(event, actor)
             return claimed
         reply = parse_reply(event)
         if reply is None:
@@ -191,6 +192,23 @@ class HitlReplyHandler:
             note = f"; recovery action {path.name}"
         self._log(f"hitl: {reply.hitl_id} -> {action.id} by {actor} (in_progress{note})")
         return claimed
+
+    def _audit_not_owner(self, event: Dict[str, Any], actor: str) -> None:
+        """The owner's recovery audit gets the refusal, for a card this store holds; the card and the
+        room are left alone. A typed label from a non-owner is a message, not a tap, and is not recorded."""
+        if not self._owner or not actor or self._workspace is None or event.get("_typed"):
+            return
+        reply = parse_reply(event)
+        if reply is None:
+            return
+        try:
+            req = self._manager.get(reply.hitl_id)
+            if req is None:
+                return
+            aid = reply.action_id if any(a.id == reply.action_id for a in req.actions) else ""
+            recovery.audit_not_owner(self._workspace, req.id, aid, actor[:255])
+        except Exception as e:  # noqa: BLE001 — the refusal stands whether or not it is recorded
+            self._log(f"hitl: non-owner audit not written — {e}")
 
     def _stamp_stale(self, hitl_id: str) -> None:
         """A rejected tap on a still-open recovery card gets an answer on that card: a fresh revision
@@ -271,6 +289,7 @@ class HitlReplyHandler:
         if action is None:
             return None  # a reply to the card that is not a click stays a message
         self.last_branch = "fallback"
+        base["_typed"] = True
         payload = {"hitl_id": req.id, "expected_revision": req.revision,
                    "action_id": action.id, "guard": req.guard}
         if note:

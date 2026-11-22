@@ -141,6 +141,14 @@ session, outcome) and edits the card in place. `add_account` and `switch_account
 until the confirmed, re-authenticated sign-in flow exists; a worker seat's card never runs
 `switch_model`, `restart_core` or `switch_runtime`.
 
+A tap from anyone but the owner runs nothing, leaves the card as it was and posts nothing in the
+room. On a card this store holds it adds one `state/recovery/audit.jsonl` line, `outcome: refused`
+and `reason: not_owner`, with the `hitl_id`, the `action_id` (only an id the card offered, else
+empty) and the tapper's mxid as `sender`. That line is written once per card and tapper, so
+repeated taps add nothing. A typed label from a non-owner is a message, not a tap, and is not
+recorded. The audit feeds neither the card, the heartbeat nor `core_recovery.v1`: it is the local
+record the owner or Sutando reads on the host.
+
 **One card per incident.** After an action the card stays open with its outcome ("Switched the
 core to Opus 5.5; checking that it is working again."). It closes, with "It is working again."
 and "✓ Done.", only once the session is seen unblocked. Still blocked a minute after a done

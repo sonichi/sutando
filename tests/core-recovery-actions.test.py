@@ -800,7 +800,7 @@ class ExecutorEdges(Base):
             self.assertTrue(RA.awaiting_executor(self.ws, object()))
 
     def test_the_audit_keeps_its_bound(self):
-        with mock.patch.object(RA, "AUDIT_KEEP", 3):
+        with mock.patch.object(recovery, "AUDIT_KEEP", 3):
             for i in range(10):
                 RA.audit(self.ws, {"at": i})
         lines = (recovery.recovery_dir(self.ws) / RA.AUDIT_FILE).read_text().splitlines()

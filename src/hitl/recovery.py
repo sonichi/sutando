@@ -43,6 +43,10 @@ _ACCOUNT_ID = re.compile(r"^acct_[0-9a-f]{6}$")
 CORE_ONLY = frozenset({RESTART_CORE, SWITCH_RUNTIME})
 OUTCOMES = ("done", "refused", "stale", "failed")
 RECEIPT_VERSION = 1
+AUDIT_FILE = "audit.jsonl"
+AUDIT_KEEP = 500
+#: A non-owner's tap: recorded once per (card, actor), never run.
+NOT_OWNER = "not_owner"
 
 # The one sentence every surface uses about a worker's model (card, notice, reply, refusal).
 SEAT_MODEL_LOCKED = "Its model can't be switched yet: workers share the core's model setting."
@@ -171,6 +175,45 @@ def read_receipt(workspace: Path, hitl_id: str) -> Optional[Dict[str, Any]]:
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def audit(workspace: Path, entry: Dict[str, Any]) -> None:
+    """One line per action or refusal, bounded; ids and outcomes only, never message text."""
+    path = recovery_dir(workspace) / AUDIT_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(entry, sort_keys=True) + "\n")
+        lines = path.read_text().splitlines()
+        if len(lines) > 2 * AUDIT_KEEP:
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text("\n".join(lines[-AUDIT_KEEP:]) + "\n")
+            os.replace(tmp, path)
+    except OSError:
+        pass  # the receipt and the card are the record of the outcome
+
+
+def audit_not_owner(workspace: Path, hitl_id: str, action_id: str, sender: str,
+                    at: Optional[float] = None) -> bool:
+    """Record a non-owner's tap on a card as `refused`/`not_owner`, once per (hitl_id, sender):
+    a repeated tap adds no line. True when a line was written."""
+    path = recovery_dir(workspace) / AUDIT_FILE
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(row, dict) and row.get("reason") == NOT_OWNER
+                and row.get("hitl_id") == hitl_id and row.get("sender") == sender):
+            return False
+    audit(workspace, {"at": int(time.time() if at is None else at), "hitl_id": hitl_id,
+                      "action_id": action_id, "outcome": "refused", "reason": NOT_OWNER,
+                      "sender": sender})
+    return True
 
 
 def _safe(hitl_id: str) -> str:
