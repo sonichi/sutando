@@ -1972,8 +1972,10 @@ class LauncherTmux(ConnectBase):
         (self.home / "claude-exit-on-exit").write_text("1")
         lc, rec = self.created()
         pane = rec["generation"]["pane_id"]
+        self.assertEqual(launcher.switched_model(str(self.work)), "")
         self.assertEqual(lc.switch_model(rec, "opus"), (True, "switched to opus"))
         self.assertIn("Set model to opus", self.tmux("capture-pane", "-p", "-t", pane).stdout)
+        self.assertEqual(launcher.switched_model(str(self.work)), "opus", "only a reported switch is recorded")
         self.assertEqual(lc.switch_model(rec, "claude-fable-5-2[1m]")[0], True, "an id with a context tag")
         for bad in ("", "gpt-5", "opus; rm -rf x", "Enter", "opus fable"):
             switched, line = lc.switch_model(rec, bad)
@@ -1983,6 +1985,7 @@ class LauncherTmux(ConnectBase):
         (self.home / "claude-model-deaf").write_text("1")
         switched, line = lc.switch_model(rec, "haiku", wait_s=2)
         self.assertEqual((switched, line.startswith("unconfirmed")), (False, True), line)
+        self.assertEqual(launcher.switched_model(str(self.work)), "claude-fable-5-2[1m]", "an unreported one is not")
         (self.home / "claude-model-deaf").unlink()
         # The pane was replaced since the record: the fence withholds the keys.
         stale = dict(rec, generation=dict(rec["generation"], nonce="0" * 32))
@@ -2630,15 +2633,15 @@ class LocalCommands(ConnectBase):
 
     def test_model_prints_what_claude_code_recorded_and_refuses_a_switch_it_cannot_make(self):
         self.configure()
-        settings = Path(cli.load_config()[0]["CLAUDE_CONFIG_DIR"]) / "settings.json"
-        settings.parent.mkdir(parents=True, exist_ok=True)
-        settings.unlink(missing_ok=True)
-        self.assertEqual(json.loads(self.main("model")[1]), {"model": "default"})
-        settings.write_text(json.dumps({"model": "opus"}))
-        self.addCleanup(settings.unlink, True)
+        record = Path(cm.work_root(cli.load_config()[0])).joinpath(*launcher.MODEL_RECORD)
+        record.unlink(missing_ok=True)
+        self.assertEqual(json.loads(self.main("model")[1]), {"model": None}, "no switch has been made here")
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(json.dumps({"model": "opus"}))
+        self.addCleanup(record.unlink, True)
         self.assertEqual(json.loads(self.main("model")[1]), {"model": "opus"})
-        settings.write_text("[")
-        self.assertEqual(json.loads(self.main("model")[1]), {"model": "default"}, "an unreadable file is not a model")
+        record.write_text("[")
+        self.assertEqual(json.loads(self.main("model")[1]), {"model": None}, "an unreadable record is not a model")
         rc, out, _ = self.main("model", "gpt-5")
         self.assertEqual((rc, json.loads(out)["switched"], "nothing sent" in json.loads(out)["detail"]), (1, False, True))
         rc, out, _ = self.main("model", "opus")

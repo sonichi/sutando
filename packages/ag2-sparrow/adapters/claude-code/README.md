@@ -725,8 +725,10 @@ locks, and records its evidence. Keep waiting is a successor requirement
 whose id and guard derive from the saga key, reconciled to exactly one at
 every start.
 
-**`model`.** Without an argument it prints `{"model": …}`: the `model` Claude Code recorded in the agent's
-own `settings.json`, `default` when there is none. With one it switches the running session, no restart:
+**`model`.** Without an argument it prints `{"model": …}`: the model the last switch made here landed on
+(`state/model-switch.json` in the work root), `null` when there has been none. It does not read Claude
+Code's own settings, which live in the config dir beside the login. With one it switches the running
+session, no restart:
 `/model <model>` is typed into the pane through the same fenced sender `stop` uses, so nothing is typed
 into a pane that is not the recorded one. The switch counts only when the pane then shows a new
 "Set model to" line (20 s); otherwise the answer is `switched: false` with one line why, exit 1. Inside a

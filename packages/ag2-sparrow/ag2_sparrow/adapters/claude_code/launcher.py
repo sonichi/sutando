@@ -12,6 +12,8 @@ same fence, then the server's own exit. Stdlib.
 """
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import re
 import shutil
@@ -41,6 +43,18 @@ MODEL_ACCEPT_S = 20.0
 # What Claude Code's own /model takes: an alias or a claude-* id, either with an optional [1m] tag.
 MODEL_RE = re.compile(r"^(default|(opus|sonnet|haiku|fable)(\[1m\])?|claude-[a-z0-9.-]+(\[1m\])?)$")
 MODEL_SET, MODEL_CONFIRM = "Set model to", "Yes, switch"
+MODEL_RECORD = ("state", "model-switch.json")
+
+
+def switched_model(root) -> str:
+    """The model the last switch through `switch_model` landed on, '' when there has been none. The
+    session's own settings live in Claude Code's config dir, which this adapter does not read."""
+    try:
+        with open(Path(root).joinpath(*MODEL_RECORD), encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    return str(record.get("model") or "") if isinstance(record, dict) else ""
 FIELD_SEP = "|:ag2:|"
 START_COMMAND_RE = re.compile(r'^"?ag2-sparrow-claude-local hold --generation=[0-9a-f]{32} --"?$')
 TMUX_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
@@ -629,6 +643,11 @@ class Launcher:
             text = self.tm.capture(gen["pane_id"]) or ""
             if text.count(MODEL_SET) > before:
                 self.log("model: switched to %s" % model)
+                with contextlib.suppress(OSError):   # the switch happened whether or not it is recorded
+                    path = Path(self.root).joinpath(*MODEL_RECORD)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.with_name(path.name + ".tmp").write_text(json.dumps({"model": model, "at": self.clock()}))
+                    os.replace(path.with_name(path.name + ".tmp"), path)
                 return True, "switched to %s" % model
             if text.count(MODEL_CONFIRM) > asked and not answered:
                 if not confirm:

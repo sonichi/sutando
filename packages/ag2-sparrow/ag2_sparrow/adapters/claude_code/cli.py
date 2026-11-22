@@ -651,15 +651,6 @@ def attach(args) -> int:
     os.execv(tmux, [tmux, "-u", "-S", sock, "attach", "-t", "=%s" % SESSION_NAME])
 
 
-def current_model(cfg: dict) -> str:
-    """The model Claude Code recorded for this agent (its own settings.json `model`), else ''."""
-    try:
-        data = json.loads((Path(cfg["CLAUDE_CONFIG_DIR"]) / "settings.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError, KeyError):
-        return ""
-    return str(data.get("model") or "") if isinstance(data, dict) else ""
-
-
 def model(args) -> int:
     """Print the agent's model, or switch the running session's with Claude Code's own /model."""
     local = selected(args)
@@ -670,7 +661,7 @@ def model(args) -> int:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
     if not args.model:
-        print(json.dumps({"model": current_model(cfg) or "default"}))
+        print(json.dumps({"model": launcher.switched_model(cm.work_root(cfg)) or None}))
         return 0
     lc = launcher.Launcher(cfg, config_dir(local))
     switched, line = lc.switch_model(records.load_supervisor(cm.work_root(cfg)), args.model, confirm=args.confirm)
