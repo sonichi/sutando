@@ -230,15 +230,18 @@ class Connector:
         if {k: self.model_state().get(k) for k in seen} != seen:
             self.save_model_state(**seen)
 
-    def model_card(self, state: dict, picked: str = "", ran: "str | None" = None):
+    def model_card(self, state: dict, picked: str = "", ran: "str | None" = None, same: bool = False):
         """(body, card): one reply button per model agy offered. After a pick (`picked`) the card has no
         buttons: it says the switch is coming, then, with `ran` (the model the next turn ran on), that
-        it happened or that it did not."""
+        it happened or that it did not; with `same`, that the pick is the model already in use."""
         agent_card, _ = connector_cards._core()
         names = {m["id"]: m["name"] for m in state.get("available") or []}
         now = state.get("current") or ""
         if picked:
             name = names.get(picked, picked)
+            if same:
+                return agent_card.build(MODEL_CARD, "done", title="Model", body="Model: already %s" % name,
+                                        text="I'm already using %s. Nothing changed." % name)
             if ran is None:
                 return agent_card.build(MODEL_CARD, "info", title="Model", body="Model: switching to %s" % name,
                                         text="Switching to %s on your next message. I'll confirm here once it has "
@@ -277,6 +280,12 @@ class Connector:
             if picked not in [m["id"] for m in state.get("available") or []]:
                 publish(result_file, quoted("That model is not one I can use now. Send /model for the current list.") + "\n")
                 outcome = "model-unknown"
+            elif picked == str(state.get("wanted") or state.get("current") or ""):
+                # Nothing to switch: say so now, and leave no pick for the next turn to "confirm".
+                room, card = str(sent.get("channel_id") or ""), self.model_card(state, picked=picked, same=True)
+                publish(result_file, "[no-send] the model card answers\n" if self.post_card(room, card)
+                        else quoted(card[1]["text"]) + "\n")
+                outcome = "model-same"
             else:
                 room = str(sent.get("channel_id") or "")
                 self.save_model_state(wanted=picked, asked_in=room, told="")

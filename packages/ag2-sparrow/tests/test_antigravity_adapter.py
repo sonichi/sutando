@@ -206,6 +206,26 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         self.assertIn("couldn't match that button", self.w.result("task-5"))
 
+    def test_picking_the_model_already_in_use_says_so_at_once_and_nothing_is_switched_or_confirmed(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        self.dm_task("task-2", "/model")
+        self.w.serve()
+        (sent,) = self.post_queued()
+        said = sent["extra_content"]["space.ag2.card"]["buttons"][0]["reply"]
+        self.dm_task("task-3", said, reply_to="$card1", click=said)
+        self.w.serve()
+        (same,) = self.post_queued("$card2")
+        card = same["extra_content"]["space.ag2.card"]
+        self.assertEqual((card["state"], card["text"], "buttons" in card, self.w.metrics()[-1]["card"]),
+                         ("done", "I'm already using Gemini 3.8 Flash. Nothing changed.", False, "model-same"))
+        self.assertFalse(json.loads((self.w.root / "state" / "model.json").read_text()).get("wanted"))
+        self.w.task("task-4", "STUB:TEXT again")
+        self.w.serve()
+        self.assertEqual((self.set_model_calls(), self.post_queued()), ([], []))
+        self.assertNotIn("model_switch", self.w.metrics()[-1])
+
     def test_a_tap_that_is_not_the_owners_on_a_card_this_agent_posted_in_its_dm_changes_nothing(self):
         (self.w.home / "models").write_text("")
         self.w.task("task-1", "STUB:TEXT hi")
