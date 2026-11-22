@@ -69,15 +69,20 @@ handled by running it; the dashboard's Quota tile shows the model the proxy then
 
 When the owner asks in their DM which model the core is on, or asks to change it without naming one,
 post the menu: `python3 skills/model-switch/scripts/model_card.py post --room <the DM's room id>
-[--reply-to <their message's event id>]` (`--print` shows it without posting). It has one button per
-model (Opus, Sonnet, Fable, Default) and names the model in use, read only from
-`<workspace>/state/model-switch.json`; with no record it says "the default model". It goes only to the
-owner's checked DM. `status` prints the same reading as JSON.
+[--reply-to <their message's event id>]` (`--print` shows it without posting). Its buttons are this
+skill's `MODEL_SWITCH_CHOICES` (`manifest.json`, the list the menu-bar app offers), in that order and
+under those titles; each carries a slug of its id (`sonnet-1m`) that a tap maps back to the exact id
+(`sonnet[1m]`), so a tap never changes the context size the list names. The card names the model in
+use, read only from `<workspace>/state/model-switch.json` and matched by exact id (an id the list
+lacks is named as recorded and no button is marked); with no record it says "the default model". A
+card holds six buttons: with a longer list the first six are shown and the text says to ask for the
+others by name. With no readable list the menu is not posted (`{"status": "failed", "why": …}`: say
+the `why`). It goes only to the owner's checked DM. `status` prints the same reading as JSON.
 
 A tap is matched by the core's one command (CLAUDE.md, "Card clicks"); when it prints `run:
 skills/model-switch/scripts/model_card.py reply`, run that with `--task-file <task file>`:
 
-- `{"status": "started", "event_id": …}`: the switch was started detached (`switch-model.sh <alias>
+- `{"status": "started", "event_id": …}`: the switch was started detached (`switch-model.sh <id>
   --confirm --accept-timeout 180`; the CLI takes `/model` once this turn ends) and a card already says
   "Switching the core to X; it takes effect after this turn. I'll confirm here once it has switched.".
   Write `[no-send]` and end the turn. Without `event_id` the card could not be posted: send `say`.
@@ -89,7 +94,7 @@ skills/model-switch/scripts/model_card.py reply`, run that with `--task-file <ta
 
 Each tap is one attempt with its own id (`attempt` in the output): the "switching" card is posted
 before the switch is started, so the outcome can only follow it. The detached line always ends in
-`model_card.py settle --room <DM> --model <alias> --attempt <id> --rc <the switch's exit code>`, which
+`model_card.py settle --room <DM> --model <model id> --attempt <id> --rc <the switch's exit code>`, which
 saves the outcome in `<workspace>/state/model-card-outcome.json` and then posts it in the same DM: "Switched. I'm now using X." on exit 0, else "I
 could not switch to X. I'm still using Y." and one short reason for the exit code (5 unsent text in the
 input box, 8 not accepted in time, 3 the core is not running, and so on; an unknown code is "the switch

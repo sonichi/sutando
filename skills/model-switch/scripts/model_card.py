@@ -6,9 +6,12 @@
     python3 model_card.py [--workspace WS] settle --room ROOM --model ALIAS --rc N [--attempt ID]
     python3 model_card.py [--workspace WS] status
 
-`post` sends the menu (one reply button per model, naming the model in use) to the owner's checked DM
-and records it (src/issued_cards.py), so only a tap on it acts. `reply` handles that tap
-(agent_card.click_verdict decides): it starts `switch-model.sh <alias> --confirm` detached, because the
+`post` sends the menu to the owner's checked DM and records it (src/issued_cards.py), so only a tap on
+it acts. Its buttons are the skill manifest's MODEL_SWITCH_CHOICES (`id=Title;…`, what the menu-bar
+app offers), in that order and under those titles; a button carries a slug of its id ("sonnet-1m") and
+a tap maps it back to the exact id ("sonnet[1m]"), the one marked as in use by exact id. No list is
+built in: with no readable choices the menu is not posted. `reply` handles that tap
+(agent_card.click_verdict decides): it starts `switch-model.sh <id> --confirm` detached, because the
 core's CLI takes /model only after the current turn ends. Each tap is one attempt with its own id: the
 "switching" card is posted first, then the switch is started, so its outcome can only come after.
 The detached line always ends in `settle` with the switch's exit code and the attempt's id. `settle`
@@ -29,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import secrets
 import subprocess
 import sys
@@ -49,8 +53,11 @@ import issued_cards  # noqa: E402
 CARD_ID, KIND, TARGET = "core-model-switch", "model", "core"
 HANDLER = "skills/model-switch/scripts/model_card.py reply"
 SWITCH = _HERE / "switch-model.sh"
-MODELS = (("Opus", "opus"), ("Sonnet", "sonnet"), ("Fable", "fable"), ("Default", "default"))
+MANIFEST = _HERE.parent / "manifest.json"
+CHOICES_KEY = "MODEL_SWITCH_CHOICES"
+NO_CHOICES = "I can't read the list of models (skills/model-switch/manifest.json), so I have no menu to show."
 DEFAULT_NAME = "the default model"
+_PLAIN = re.compile(r"[A-Za-z0-9._\[\]-]{1,80}")
 ACCEPT_TIMEOUT_S = 180
 OUTCOMES = ("state", "model-card-outcome.json")
 OUTCOME_TTL_S, OUTCOMES_KEPT = 86400, 20
@@ -77,11 +84,29 @@ def _emit(payload: dict, code: int = 0) -> int:
     return code
 
 
-def name_of(model: Optional[str]) -> str:
-    """How a model is named to the owner: a menu label, the id itself, or "the default model"."""
-    if not model or model == "default":
+def choices(manifest: Optional[Path] = None) -> list:
+    """[(id, title, slug)] from the skill manifest's MODEL_SWITCH_CHOICES, in its order; [] when it
+    cannot be read. The slug is the id as a card reply may carry it; an entry without an id or title,
+    or whose slug an earlier entry has, is left out."""
+    from skill_config import manifest_config
+    raw = manifest_config(manifest or MANIFEST).get(CHOICES_KEY)
+    out: list = []
+    for entry in raw.split(";") if isinstance(raw, str) else []:
+        model, _, title = entry.partition("=")
+        model, title = model.strip(), " ".join(title.split())
+        slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
+        if model and title and slug and slug not in [s for _, _, s in out]:
+            out.append((model, title, slug))
+    return out
+
+
+def name_of(model: Optional[str], picks: Optional[list] = None) -> str:
+    """How a model is named to the owner: its title in the manifest by exact id, else the id as
+    recorded, or "the default model" for none."""
+    if not model:
         return DEFAULT_NAME
-    return dict((alias, label) for label, alias in MODELS).get(model, model)
+    title = next((t for m, t, _ in (choices() if picks is None else picks) if m == model), "")
+    return model if not title and _PLAIN.fullmatch(model) else ac.md_escape(title or model)
 
 
 def record(ws: Path) -> dict:
@@ -110,16 +135,19 @@ def still_using(ws: Path, alias: str) -> str:
     return current_model(ws)["name"]
 
 
-def menu_card(model: Optional[str]) -> tuple:
-    """(body, card): one reply button per model, the one in use marked."""
-    buttons = [ac.button(label, "reply", style="primary" if alias == model else "secondary",
-                         reply=f"Switch the core to {label}", command=ac.reply(KIND, TARGET, alias))
-               for label, alias in MODELS]
-    name = name_of(model)
+def menu_card(model: Optional[str], picks: list) -> tuple:
+    """(body, card): one reply button per choice in `picks`, the one in use (by exact id) marked. A
+    card holds six buttons; with more choices the first six are shown and the text says to ask."""
+    limit = ac.LIMITS["buttons"]
+    buttons = [ac.button(title, "reply", style="primary" if choice == model else "secondary",
+                         reply=f"Switch the core to {title}", command=ac.reply(KIND, TARGET, slug))
+               for choice, title, slug in picks[:limit]]
+    using = f"I'm using {name_of(model, picks)}."
+    more = " For a model that is not on a button, tell me its name." if len(picks) > limit else ""
     return ac.build(CARD_ID, "info", title="Core model", avatar_=ac.avatar(initial="M"),
-                    text=f"I'm using {ac.md_escape(name)}. Pick a model to switch to.", buttons=buttons,
+                    text=f"{using} Pick a model to switch to.{more}", buttons=buttons,
                     note="A switch takes effect after the core finishes its current turn.", note_tone="dim",
-                    body=f"I'm using {ac.md_escape(name)}. Reply with a model to switch.")
+                    body=f"{using} Reply with a model to switch.")
 
 
 def switching_words(alias: str) -> str:
@@ -130,7 +158,7 @@ def switching_words(alias: str) -> str:
 def notice_card(state: str, status: str, words: str) -> tuple:
     """(body, card) with the menu's id and no buttons: the "switching" answer or the outcome."""
     return ac.build(CARD_ID, state, title="Core model", avatar_=ac.avatar(initial="M"), status=status,
-                    text=ac.md_escape(words), body=ac.md_escape(words))
+                    text=words, body=words)
 
 
 def outcome(ws: Path, alias: str, rc: int) -> tuple:
@@ -279,15 +307,18 @@ def settle_attempt(ws: Path, attempt: str, room: str, alias: str, rc: int, *, co
 
 
 def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time) -> int:
+    picks = choices()
+    if not picks:
+        return _emit({"status": "failed", "why": NO_CHOICES}, 1)
     try:
-        body, card = menu_card(current_model(ws)["model"])
+        body, card = menu_card(current_model(ws)["model"], picks)
     except ac.CardError as e:
         return _emit({"status": "failed", "why": str(e)}, 1)
     if args.print:
         return _emit({"body": body, "card": card, "handler": HANDLER})
     delivered = deliver_owed(ws, core=core, execute=execute, now=now())
     if delivered:
-        body, card = menu_card(current_model(ws)["model"])
+        body, card = menu_card(current_model(ws)["model"], picks)
     out = _post(ws, args.room, body, card, f"model-card:menu:{int(now())}", reply_to=args.reply_to or "",
                 core=core, execute=execute)
     return _emit({**out, **({"delivered": delivered} if delivered else {})}, 0 if out["status"] == "posted" else 1)
@@ -318,9 +349,10 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
         core = {}
     verdict = ac.click_verdict(headers, words, ws, ac.lane_owner(ws, str(core.get("owner_mxid") or "")))
     other, code = ac.click_answer(verdict, words, (KIND,)), 1
-    alias = verdict.command.verb if other is None else ""
-    if other is None and (verdict.command.target != TARGET or alias not in [a for _, a in MODELS]):
-        other, code = {"status": "refused", "why": f"the model card has no {alias!r} action"}, 2
+    slug = verdict.command.verb if other is None else ""
+    alias = next((m for m, _, s in choices() if s == slug), "")
+    if other is None and (verdict.command.target != TARGET or not alias):
+        other, code = {"status": "refused", "why": f"the list of models has no {slug!r}, so nothing was switched"}, 2
     elif other is None and current_model(ws)["model"] == alias:
         other, code = {"status": "say", "say": f"I'm already using {name_of(alias)}. Nothing changed."}, 0
     room, attempt = str(headers.get("channel_id") or ""), new_attempt(now())

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """The core's model card (skills/model-switch/scripts/model_card.py): menu, tap, and the outcome it owes.
 
-- The menu offers Opus, Sonnet, Fable and Default as reply buttons and names the model in use, read only
-  from <workspace>/state/model-switch.json; with no record it says "the default model".
+- The menu's buttons are the skill manifest's MODEL_SWITCH_CHOICES, in its order and under its titles;
+  a button carries a slug that maps back to the exact id ("sonnet[1m]"), nothing is built in, and the
+  model in use is read only from <workspace>/state/model-switch.json ("the default model" with no record).
 - `reply` starts a switch only for the owner's tap on a card this agent posted: the detached line runs
   switch-model.sh and then `settle` with its exit code, and the answer is the "switching" card.
 - `settle` always posts an outcome with the menu's card id: "Switched. I'm now using X." on exit 0, else
@@ -41,7 +42,9 @@ import connections  # noqa: E402
 
 DM, ROOM, OWNER = "!dm:s.space", "!team:s.space", "@owner:s.space"
 CORE = {"instance": "s_dspace", "owner_mxid": OWNER, "agent_mxid": "@owner-mini.agent:s.space"}
-SAID = {alias: f"Switch the core to {label}" for label, alias in mc.MODELS}
+SIMPLE = "opus=Opus;sonnet=Sonnet;fable=Fable;default=Default"
+SHIPPED = "default=Default (auto-fallback);opus=Opus;sonnet[1m]=Sonnet (1M context);haiku=Haiku;fable[1m]=Fable (1M context)"
+SAID = {entry.split("=")[0]: "Switch the core to " + entry.split("=")[1] for entry in (SIMPLE + ";" + SHIPPED).split(";")}
 
 
 def task(said, *, tier="owner", user=OWNER, kind="dm", room=DM, **extra):
@@ -78,17 +81,24 @@ class Launch:
 
 
 class Base(unittest.TestCase):
+    CHOICES = SIMPLE
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.ws = Path(tmp.name)
         self.fake, self.launch, self.sleeps = Fake(), Launch(), []
         self.nap = self.sleeps.append
-        for target, name, value in ((mc, "_owner_dm", lambda ws, core: DM),
+        self.manifest = self.ws / "manifest.json"
+        self.choose(self.CHOICES)
+        for target, name, value in ((mc, "_owner_dm", lambda ws, core: DM), (mc, "MANIFEST", self.manifest),
                                     (connections, "read_rows", lambda ws=None: [CORE])):
             patch = mock.patch.object(target, name, value)
             patch.start()
             self.addCleanup(patch.stop)
+
+    def choose(self, raw):
+        self.manifest.write_text(json.dumps({"name": "model-switch", "config": {mc.CHOICES_KEY: raw}}))
 
     def using(self, model, **more):
         path = self.ws / "state" / "model-switch.json"
@@ -121,7 +131,7 @@ class Base(unittest.TestCase):
 class Menu(Base):
     def test_one_reply_button_per_model_and_the_model_in_use(self):
         self.using("opus")
-        body, card = mc.menu_card("opus")
+        body, card = mc.menu_card("opus", mc.choices())
         self.assertIsNone(ac.problem(card))
         self.assertEqual((card["id"], card["state"]), (mc.CARD_ID, "info"))
         self.assertEqual([(b["label"], b["kind"], b["reply"], b["command"], b["style"]) for b in card["buttons"]],
@@ -134,7 +144,7 @@ class Menu(Base):
 
     def test_no_record_is_the_default_model(self):
         self.assertEqual(self.run_(["status"]), (0, {"model": None, "name": "the default model", "source": None, "ts": None}))
-        _, card = mc.menu_card(mc.current_model(self.ws)["model"])
+        _, card = mc.menu_card(mc.current_model(self.ws)["model"], mc.choices())
         self.assertEqual(card["text"], "I'm using the default model. Pick a model to switch to.")
         self.assertEqual({b["style"] for b in card["buttons"]}, {"secondary"})
         (self.ws / "state").mkdir()
@@ -305,7 +315,7 @@ class Settle(Base):
         card, = self.fake.cards()
         self.assertEqual((card["id"], card["state"], card["text"]), (mc.CARD_ID, "done", "Switched. I'm now using Fable."))
         self.assertEqual(self.fake.calls[0][3], DM)
-        self.assertEqual(self.settle("default", 0)[1]["say"], "Switched. I'm now using the default model.")
+        self.assertEqual(self.settle("default", 0)[1]["say"], "Switched. I'm now using Default.")
 
     def test_every_documented_failure_posts_the_error_card_with_its_reason(self):
         self.using("opus")
@@ -544,6 +554,118 @@ class Attempts(Base):
         rc, out = self.run_(["settle", "--room", DM, "--model", "fable", "--rc", "0"])
         self.assertEqual((rc, out["status"]), (0, "posted"))
         self.assertEqual(self.fake.calls[-1][2], f"model-card:{out['attempt']}:outcome")
+
+
+class Manifest(Base):
+    """The buttons are the manifest's choices; a tap's slug maps back to the manifest's exact id."""
+
+    CHOICES = SHIPPED
+
+    def test_the_buttons_are_the_manifest_choices_in_order(self):
+        self.assertEqual(mc.choices(), [("default", "Default (auto-fallback)", "default"), ("opus", "Opus", "opus"),
+                                        ("sonnet[1m]", "Sonnet (1M context)", "sonnet-1m"), ("haiku", "Haiku", "haiku"),
+                                        ("fable[1m]", "Fable (1M context)", "fable-1m")])
+        rc, out = self.run_(["post", "--room", DM, "--print"])
+        self.assertEqual([(b["label"], b["command"]) for b in out["card"]["buttons"]],
+                         [("Default (auto-fallback)", "card:model:core:default"), ("Opus", "card:model:core:opus"),
+                          ("Sonnet (1M context)", "card:model:core:sonnet-1m"), ("Haiku", "card:model:core:haiku"),
+                          ("Fable (1M context)", "card:model:core:fable-1m")])
+        self.assertEqual([b["reply"] for b in out["card"]["buttons"]], [SAID[m] for m, _, _ in mc.choices()])
+
+    def test_the_shipped_manifest_gives_a_card_the_client_draws(self):
+        real = mc.choices(SCRIPT.parents[1] / "manifest.json")
+        self.assertGreaterEqual(len(real), 2)
+        self.assertIn("default", [m for m, _, _ in real])
+        self.assertTrue(all(ac.parse_reply(ac.reply(mc.KIND, mc.TARGET, slug)) for _, _, slug in real))
+        _, card = mc.menu_card(real[-1][0], real)
+        self.assertIsNone(ac.problem(card))
+        self.assertEqual([b["style"] for b in card["buttons"]][-1], "primary")
+        self.assertNotIn("MODELS", SCRIPT.read_text(), "no list of models is built into the script")
+
+    def test_a_one_million_model_in_use_is_marked_named_and_not_switched_again(self):
+        self.using("fable[1m]")
+        rc, out = self.run_(["post", "--room", DM])
+        card = self.fake.cards()[0]
+        self.assertEqual([b["label"] for b in card["buttons"] if b["style"] == "primary"], ["Fable (1M context)"])
+        self.assertEqual(card["text"], "I'm using Fable (1M context). Pick a model to switch to.")
+        self.assertNotIn("\\", card["text"] + self.fake.calls[0][1]["body"])
+        self.assertEqual(self.run_(["status"])[1]["name"], "Fable (1M context)")
+        rc, out = self.tap("fable[1m]")
+        self.assertEqual((rc, out), (0, {"status": "say", "say": "I'm already using Fable (1M context). Nothing changed."}))
+        self.assertEqual(self.launch.calls, [])
+
+    def test_a_tap_switches_to_the_manifest_id_exactly(self):
+        self.using("fable[1m]")
+        self.run_(["post", "--room", DM])
+        rc, out = self.tap("sonnet[1m]")
+        say = ("Switching the core to Sonnet (1M context); it takes effect after this turn. "
+               "I'll confirm here once it has switched.")
+        self.assertEqual((rc, out["status"], out["model"], out["say"]), (0, "started", "sonnet[1m]", say))
+        argv = self.launch.calls[0][0]
+        self.assertEqual((argv[6], argv[13]), ("sonnet[1m]", out["attempt"]))
+        self.assertEqual(self.fake.cards()[1]["text"], say)
+        rc, told = self.run_(["settle", "--room", DM, "--model", argv[6], "--attempt", argv[13], "--rc", "8"])
+        self.assertEqual(told["say"], "I could not switch to Sonnet (1M context). I'm still using Fable (1M context). "
+                                      "The core did not accept the switch in time.")
+        self.assertEqual(self.fake.cards()[2]["text"], told["say"])
+        self.using("sonnet[1m]")
+        self.assertEqual(self.run_(["settle", "--room", DM, "--model", "sonnet[1m]", "--rc", "0"])[1]["say"],
+                         "Switched. I'm now using Sonnet (1M context).")
+
+    def test_the_detached_line_hands_a_bracketed_id_through_unchanged(self):
+        fake_switch = self.ws / "switch.sh"
+        fake_switch.write_text('echo "switch $1"; exit 0\n')
+        fake_py = self.ws / "py.sh"
+        fake_py.write_text('#!/bin/sh\necho "settle $8"\n')
+        fake_py.chmod(0o755)
+        got = subprocess.run(["bash", "-c", mc.DETACHED, "model-card", str(fake_switch), "fable[1m]", "180", "/st",
+                              str(fake_py), "card.py", str(self.ws), DM, "17-ab"], cwd=str(self.ws),
+                             capture_output=True, text=True, check=True)
+        self.assertEqual(got.stdout.splitlines(), ["switch fable[1m]", "settle fable[1m]"])
+
+    def test_a_recorded_id_the_manifest_lacks_marks_no_button_and_is_named_as_recorded(self):
+        self.using("fable")
+        self.run_(["post", "--room", DM])
+        card = self.fake.cards()[0]
+        self.assertEqual({b["style"] for b in card["buttons"]}, {"secondary"})
+        self.assertEqual(card["text"], "I'm using fable. Pick a model to switch to.")
+        self.assertEqual(mc.name_of("claude-fable-9[1m]"), "claude-fable-9[1m]")
+        self.assertEqual(mc.name_of("a*b"), "a\\*b", "anything else is shown as literal text")
+        rc, out = self.tap("fable[1m]")
+        self.assertEqual((rc, out["status"], self.launch.calls[0][0][6]), (0, "started", "fable[1m]"))
+
+    def test_a_slug_the_manifest_no_longer_has_starts_nothing(self):
+        self.run_(["post", "--room", DM])
+        self.choose("default=Default;opus=Opus")
+        rc, out = self.tap("fable[1m]")
+        self.assertEqual((rc, out), (2, {"status": "refused", "why": "the list of models has no 'fable-1m', so nothing was switched"}))
+        self.assertEqual((self.launch.calls, len(self.fake.calls)), ([], 1))
+
+    def test_an_unreadable_or_empty_list_posts_no_menu_and_says_so(self):
+        for text in ("not json", "[]", json.dumps({"config": {}}), json.dumps({"config": {mc.CHOICES_KEY: 3}}),
+                     json.dumps({"config": {mc.CHOICES_KEY: " ; =x ; y= ; []=Brackets"}})):
+            self.manifest.write_text(text)
+            self.assertEqual(mc.choices(), [], text)
+            for argv in (["post", "--room", DM], ["post", "--room", DM, "--print"]):
+                self.assertEqual(self.run_(argv), (1, {"status": "failed", "why": mc.NO_CHOICES}))
+        self.manifest.unlink()
+        self.assertEqual(self.run_(["post", "--room", DM]), (1, {"status": "failed", "why": mc.NO_CHOICES}))
+        self.assertEqual(self.fake.calls, [])
+        self.assertIn("can't read the list of models", mc.NO_CHOICES)
+
+    def test_two_ids_with_one_slug_keep_the_first(self):
+        self.choose("sonnet[1m]=Sonnet (1M context);sonnet-1m=Other;opus = Opus ")
+        self.assertEqual(mc.choices(), [("sonnet[1m]", "Sonnet (1M context)", "sonnet-1m"), ("opus", "Opus", "opus")])
+
+    def test_more_choices_than_a_card_holds_shows_the_first_six_and_says_to_ask(self):
+        self.choose(";".join(f"m{c}=Model {c.upper()}" for c in "abcdefgh"))
+        rc, out = self.run_(["post", "--room", DM])
+        card = self.fake.cards()[0]
+        self.assertEqual((rc, [b["label"] for b in card["buttons"]]), (0, [f"Model {c}" for c in "ABCDEF"]))
+        self.assertIsNone(ac.problem(card))
+        self.assertEqual(card["text"], "I'm using the default model. Pick a model to switch to. "
+                                       "For a model that is not on a button, tell me its name.")
+        self.assertNotIn("Switch the core to Model G", mc.issued_cards.live(self.ws, "$card1")["offers"])
 
 
 class Edges(Base):
