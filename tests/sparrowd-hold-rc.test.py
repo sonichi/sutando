@@ -10,6 +10,8 @@ from _helpers.hermetic_env import isolate_os_environ
 isolate_os_environ()
 
 import json
+import os
+import signal
 import socket
 import sys
 import tempfile
@@ -22,7 +24,7 @@ from unittest import mock
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
-from ag2_sparrow.sparrowd import LAST_RC_ENV, ControlServer, Supervisor, WorkerSpec
+from ag2_sparrow.sparrowd import LAST_RC_ENV, ControlServer, Supervisor, WorkerSpec, run
 
 # Appends the SPARROWD_LAST_RC it was given (or "-") to argv[1], then exits with argv[2].
 CHILD = ("import os, sys\n"
@@ -108,8 +110,29 @@ class HoldRc(unittest.TestCase):
             self.assertTrue(wait_for(lambda: sup.status()["workers"]["core"]["state"] == "held"))
         self.assertEqual(self.runs(), ["-"])
 
+    def test_a_worker_whose_hold_leaves_something_unserved_reads_as_unhealthy(self):
+        self.assert_health(False, held_healthy=False)
+
     def test_a_held_worker_reads_as_healthy(self):
-        sup = self.supervise([self.spec(75, hold_rc=frozenset({75}))])
+        self.assert_health(True)
+
+    def test_run_hands_the_rescan_the_supervisors_status_when_asked(self):
+        seen = []
+
+        def rescan(status):
+            seen.append(status)
+            os.kill(os.getpid(), signal.SIGTERM)
+            return [self.spec(75, hold_rc=frozenset({75}))]
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
+        self.addCleanup(signal.signal, signal.SIGINT, signal.getsignal(signal.SIGINT))
+        rc = run([self.spec(75, hold_rc=frozenset({75}))], self.dir / "state", rescan=rescan, rescan_s=0.3,
+                 grace_s=1, rescan_status=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(seen), 1)
+        self.assertIn("core", seen[0]["workers"])
+
+    def assert_health(self, want, **kw):
+        sup = self.supervise([self.spec(75, hold_rc=frozenset({75}), **kw)])
         self.assertTrue(wait_for(lambda: sup.status()["workers"]["core"]["state"] == "held"))
         sock = self.dir / "ctl.sock"
         ctl = ControlServer(sock, sup, threading.Event().set)
@@ -120,7 +143,7 @@ class HoldRc(unittest.TestCase):
         c.sendall(b'{"op": "health"}\n')
         resp = json.loads(c.makefile("r").readline())
         c.close()
-        self.assertEqual(resp, {"ok": True, "healthy": True})
+        self.assertEqual(resp, {"ok": True, "healthy": want})
 
 
 if __name__ == "__main__":

@@ -31,6 +31,12 @@ Roster: <workspace>/hosts/<host-label>/data/collaboration-intelligence/reviewer-
            "room": "!triage:ag2.space", "allowlisted": true, "gh": "john-the-dev"}}
 `allowlisted` is evidence, not hope: true (a mention has triggered this
 Stand), false (it bounced), null/absent (never observed — send, then record).
+
+In a pool worker's session whose worker has its own enabled agent, the ask is
+posted as that agent, in a room it and the reviewer's agent are both members of
+(--room if given, else the recorded room, else any room the worker's agent has
+joined). No such room refuses that reviewer (exit 5); it never falls back to the
+core's agent. Anywhere else the core's agent posts, as before.
 """
 from __future__ import annotations
 
@@ -429,6 +435,42 @@ def codeowner_gate(message: str, targets, roster) -> "tuple[bool, list[str]]":
     return ok, lines
 
 
+def _room_ops_json(*args: str) -> "tuple[dict | None, str]":
+    """(payload, '') from one room_ops call whose own verdict is ok, else (None, why unread)."""
+    argv = [_PY, str(_REPO / "skills" / "agent-room-ops" / "room_ops.py"), *args]
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    except Exception as exc:                     # noqa: BLE001 - probe must not raise
+        return None, f"unverified ({type(exc).__name__})"
+    if p.returncode != 0:
+        return None, f"unverified ({args[0]} rc={p.returncode})"
+    try:
+        payload = json.loads(p.stdout)
+    except ValueError:
+        return None, f"unverified (unparseable {args[0]})"
+    # A non-object payload has no .get — the same shape the refusal-reason fix
+    # guards downstream. An unusable roster is UNVERIFIED, never an absence.
+    if not isinstance(payload, dict):
+        return None, f"unverified (non-object {args[0]} payload)"
+    # `ok` is the instrument's own verdict. Only a true one licenses reading the
+    # list as fact; without it an empty list is a failure, not an empty room.
+    if payload.get("ok") is not True:
+        return None, f"unverified (room_ops ok={payload.get('ok')!r})"
+    return payload, ""
+
+
+def room_members(room: str) -> "tuple[set | None, str]":
+    """(member ids, reason) as this session's agent reads `room`; None when unread, never empty."""
+    payload, why = _room_ops_json("members", room)
+    if payload is None:
+        return None, why
+    members = payload.get("members")
+    if not isinstance(members, list):
+        return None, "unverified (members not a list)"
+    ids = {m.get("user_id") for m in members if isinstance(m, dict)}
+    return ids, f"{len(ids)} members"
+
+
 def stand_present_in_room(target: dict) -> "tuple[bool, str]":
     """Is this stand actually a member of the room we are about to mention it in?
 
@@ -438,31 +480,57 @@ def stand_present_in_room(target: dict) -> "tuple[bool, str]":
     from a delivered mention. Returns (present, reason); an UNVERIFIABLE roster is
     not treated as absent — we refuse to send only on a positive absence.
     """
-    argv = [_PY, str(_REPO / "skills" / "agent-room-ops" / "room_ops.py"),
-            "members", target["room"]]
+    ids, why = room_members(target["room"])
+    if ids is None:
+        return True, why
+    return target["stand"] in ids, why
+
+
+def acting_worker() -> "tuple[str, str]":
+    """(worker, its agent id) when this is a pool worker's session acting as its own agent, else ("", "").
+
+    Whether it does is `connections.worker_enabled_identity`'s answer; a copy with no src/ has no workers."""
     try:
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
-    except Exception as exc:                     # noqa: BLE001 - probe must not raise
-        return True, f"unverified ({type(exc).__name__})"
-    if p.returncode != 0:
-        return True, f"unverified (members rc={p.returncode})"
+        import connections
+    except ImportError:
+        return "", ""
+    worker = connections.session_worker()
+    row = connections.worker_enabled_identity(worker) if worker else None
+    return (worker, str(row.get("agent_mxid") or "").strip()) if row else ("", "")
+
+
+def routes_as_worker(room: str, worker: str) -> bool:
+    """Would room_ops, run from this session, act in `room` as `worker`'s own agent?"""
+    import connections
     try:
-        payload = json.loads(p.stdout)
-    except ValueError:
-        return True, "unverified (unparseable members)"
-    # A non-object payload has no .get — the same shape the refusal-reason fix
-    # guards downstream. An unusable roster is UNVERIFIED, never an absence.
-    if not isinstance(payload, dict):
-        return True, "unverified (non-object members payload)"
-    # `ok` is the instrument's own verdict. Only a true one licenses reading the
-    # list as fact; without it an empty list is a failure, not an empty room.
-    if payload.get("ok") is not True:
-        return True, f"unverified (room_ops ok={payload.get('ok')!r})"
-    members = payload.get("members")
-    if not isinstance(members, list):
-        return True, "unverified (members not a list)"
-    ids = {m.get("user_id") for m in members if isinstance(m, dict)}
-    return target["stand"] in ids, f"{len(ids)} members"
+        row = connections.connection_for_room(room)
+    except connections.ConnectionsError:
+        return False
+    return bool(row) and row.get("worker") == worker
+
+
+def worker_joined_rooms() -> "tuple[list, str]":
+    """(rooms, '') this session's agent has joined; ([], why) when the list cannot be read."""
+    payload, why = _room_ops_json("rooms")
+    if payload is None:
+        return [], why
+    rooms = payload.get("rooms")
+    return [r for r in rooms if isinstance(r, str) and r] if isinstance(rooms, list) else [], ""
+
+
+def worker_room_for(target: dict, worker: str, agent: str, candidates) -> "tuple[str | None, str]":
+    """(room, '') where both `worker`'s own agent and the target's agent are members and a post goes as
+    the worker; (None, why) when no candidate is one. Unread membership never counts as present."""
+    if not agent:
+        return None, "this worker's own agent has no recorded id, so no room can be confirmed to hold it"
+    for room in candidates:
+        if not routes_as_worker(room, worker):
+            continue
+        ids, _why = room_members(room)
+        if ids is not None and agent in ids and target["stand"] in ids:
+            return room, ""
+    return None, ("no room is shared by this worker's agent and the reviewer's agent; add one to a room "
+                  "the other is in, or pass --room for a room both are in")
 
 
 def command_for(target: dict, message: str) -> "list[str]":
@@ -472,8 +540,10 @@ def command_for(target: dict, message: str) -> "list[str]":
     human = target.get("human")
     if isinstance(human, str) and human and human not in body:
         body = f"{body} (cc {human})"
-    return [_PY, str(_REPO / "skills" / "agent-room-ops" / "room_ops.py"),
+    argv = [_PY, str(_REPO / "skills" / "agent-room-ops" / "room_ops.py"),
             "mention", target["stand"], body, target["room"]]
+    # Appended, so argv[4] stays the body the interaction id is added to.
+    return argv + ["--agent", target["agent"]] if target.get("agent") else argv
 
 
 _PR_URL = re.compile("github[.]com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pull/([0-9]+)")
@@ -792,7 +862,28 @@ def main() -> int:
     # could be the one code owner, leaving the rest asked without one.
     failures = unlogged = 0
     reachable = []
+    worker, worker_agent = acting_worker() if targets else ("", "")
+    joined = None
     for t in targets:
+        if worker:
+            if a.room:
+                candidates = [a.room]
+            else:
+                if joined is None:
+                    joined, why = worker_joined_rooms()
+                    if why:
+                        print("this worker's joined rooms could not be listed; "
+                              "checking the recorded room only", file=sys.stderr)
+                candidates = list(dict.fromkeys([t["room"], *joined]))
+            room, why = worker_room_for(t, worker, worker_agent, candidates)
+            if room is None:
+                print(f"{t['name']}: NO SHARED ROOM — {why}. Not sending: this session acts as "
+                      "its worker's own agent and never falls back to the core's.", file=sys.stderr)
+                refusal_rc = max(refusal_rc, 5)
+                continue
+            print(f"{t['name']}: asking as this worker's own agent", file=sys.stderr)
+            reachable.append({**t, "room": room, "agent": worker_agent})
+            continue
         if a.room and t["room"] != a.room:
             # Not an error: the pair is valid, but the Stand does not live in
             # THIS room, and sending would relocate the thread and report ok.

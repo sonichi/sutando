@@ -14,12 +14,13 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 
 - `pool_beat.py` — refresh liveness; worker writers watch the tmux CLI PID each second and check PID reuse before each refresh. Unreadable process metadata is nonfatal.
 - `spawn_worker.py` — mint a worker: identity records, delivery folder, tmux session, watcher, detached worker beat; refuses before any side effect, rolls back on a launcher failure.
-- `create_worker.py` — the one command that spawns and registers under the roster lock, so the roster cannot go stale.
+- `create_worker.py` — the one command that spawns and registers under the roster lock, so the roster cannot go stale. By default it then starts the worker's own s.space identity (below).
+- `pool_identity_request.py` — that default identity step: picks the agent's label and runs `pool_identity.py add --device-flow` in the background.
 - `rename_worker.py` — change a worker's base routing alias after creation: `python3 skills/worker-pool/scripts/rename_worker.py --worker <id-or-label> --label "<new alias>" [--workspace W]`. The id and its tmux session name stay.
 - `apply_profile_label_overrides.py` — apply an s.space profile's complete worker display-label map from JSON stdin with `--workspace W --profile-mxid M --config-version N`.
 - `worker_bootstrap.py` — a worker session's first-turn decision (worker vs core mode) from its env.
 - `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write. `set_worker_state` / `remove_worker` are its writers for a worker's lifecycle; `set_worker_plugin_dirs` writes a row's `plugin_dirs`.
-- `pool_manage.py` — stop, retire, re-enable, remove or reseat a worker, and record its extra Claude plugin dirs (below).
+- `pool_manage.py` — stop, retire, re-enable, remove or reseat a worker, record its extra Claude plugin dirs, and bind or unbind a room (below).
 - `pool_identity.py` — give a worker an s.space agent of its own, show it, rotate its token or remove it (below).
 - `pool_provision.py` — the local half of creating that agent without a pasted token: claim secret, redeem, retire (below).
 - `provision_e2e.py` — check that whole flow against one server, with a scan for leaked secrets (below).
@@ -56,6 +57,8 @@ python3 skills/worker-pool/scripts/pool_manage.py enable <worker> [--no-start]
 python3 skills/worker-pool/scripts/pool_manage.py remove <worker> [--hand-off]
 python3 skills/worker-pool/scripts/pool_manage.py plugins <worker> add|remove <dir>
 python3 skills/worker-pool/scripts/pool_manage.py plugins <worker> list
+python3 skills/worker-pool/scripts/pool_manage.py bind   <room id> <worker id or label>
+python3 skills/worker-pool/scripts/pool_manage.py unbind <room id>
 ```
 
 - `stop` writes the worker's pause (`pool_supervise.set_paused`) under the remedy
@@ -103,6 +106,17 @@ python3 skills/worker-pool/scripts/pool_manage.py plugins <worker> list
   worker, never on your own. The command does not check who calls it, like the
   other verbs here; the owner's word is the only gate. It applies at the
   worker's next start; `reseat` applies it now.
+
+## A worker's life
+
+| Step | What happens | Automatic | Needs the owner | Not on production yet |
+|---|---|---|---|---|
+| create | `create_worker.py`: records, folder, session, roster; then the identity step starts | yes | no | |
+| identity | approval link in the owner's DM; on approval the token is saved, the worker's lane starts and its seat restarts as its own agent | the request and the save | approve the link (15 minutes; "Get a new link" after) | `agent.create` (`provision-*`) is not offered on s.space |
+| work | tasks addressed to its agent go to it; it posts as its own agent | yes | no | |
+| stop / enable / reseat | `pool_manage.py stop`, `enable`, `reseat`: the identity row, lane and vault secret are kept, so the seat starts again as its own agent | yes | no | |
+| retire | `pool_manage.py retire`: routing closed, sessions down, work handed off, then its identity lane, row and vault secret removed here, and an open approval withdrawn | yes | delete the agent in the app (the owner gets a DM note naming it, also when an approval lands after the retirement) | deleting a live agent from here (`account.agents.retire` refuses it) |
+| remove | `pool_manage.py remove`: the retired worker's roster row goes | yes | no | |
 
 ## Codex CLI workers
 
@@ -190,8 +204,48 @@ The lane routes each task it queues itself (`pool_route_handler.py --from-lane -
 the task is its worker's when it reaches `tasks/` and the core's watcher, which never routes a held task, leaves it;
 see `docs/connections.md`, "In a pool worker's session".
 
-`pool_manage.py retire` also removes the worker's agent identity: its lane, its row and its vault secret. The agent
-itself stays on its server until the owner deletes it there.
+A worker with its own agent can be switched onto its own task and result folders
+(`python3 src/worker_lane.py migrate-dirs --worker <id>` previews, `--apply` does it, `--undo --apply` switches back; then respawn it): its lane
+queues straight into `<workspace>/agents/<segment>/tasks`, nothing is routed through `deliveries/<id>/`, and
+its session answers in that folder's `results/`; see `docs/connections.md`, "A worker on its own folders".
+
+`pool_manage.py retire` also removes the worker's agent identity: its lane, its row and its vault secret. s.space
+cannot delete a live agent for us yet (`account.agents.retire` refuses one with `identity_retire_unavailable`), so
+the agent itself stays on its server until the owner deletes it in the app. Retire says so in its JSON line
+(`identity.agent_removal: "owner_step"`, `identity.owner_told`) and sends the owner a note in their DM naming the
+agent to delete.
+
+Retiring a worker whose device-flow approval is still open withdraws it (`pool_device_connect.withdraw`): the
+approval record turns `withdrawn`, the approval card turns to "Withdrawn" (or the owner gets a text note) telling the
+owner not to approve it, and "Get a new link" is refused. The server has no way to cancel a device code, so the
+background flow keeps asking until the link expires. If it expires, nothing is left and no "expired" card is
+posted. If the owner approves anyway, the retirement fence refuses the save, and the owner gets a DM note naming
+the approved agent to delete in the app (record state `retired_after_approval`, with `agent_id`). Retire's JSON
+line reports this as `pending_approval` (`withdrawn` with the label, or `none`).
+
+### A new worker gets its own agent by default
+
+`create_worker.py` starts the identity step once the worker is created and registered. It runs the device-connect
+flow below (`pool_identity.py add <worker> --device-flow --label <label>`) in the background and returns as soon as
+the owner has been sent the approval link; the wait for the approval, the save and the restart as its own agent
+happen in that background process (log: `<workspace>/logs/worker-identity-<worker>.log`). The creation report adds:
+
+```
+  identity  requested (link expires 14:05; agent "code-reviewer")
+  identity  skipped (<reason>)
+```
+
+- The label is the worker's `--label` made into a device-connect label ("Code Reviewer" becomes `code-reviewer`;
+  no label gives `worker-<first 8 of the id>`). A label another worker's pending or approved link already uses,
+  or that a connection's agent id on this computer ends in, gets `-2`, `-3`, ... The owner's agents on other
+  computers are not checked. `--label` is also sent as the agent's display name.
+- `--no-identity` skips the step, and so does `WORKER_POOL_IDENTITY_ON_CREATE=0` (manifest default `1`).
+- The step never fails the creation. When it cannot start (no single core lane, the core lane has no owner DM,
+  the server refused the device connect, the process did not start) the report says `skipped (<why>)` and the
+  worker answers through the core, as before. Ask again later with `pool_identity.py add <worker> --device-flow
+  --label <name>`.
+- `--json` carries `identity` (`status`: requested, approved, starting, skipped or off; `label`, `until`, `why`)
+  and `identity_line`. Creation waits at most 20 seconds for the link to go out (`starting` when it had not).
 
 ### Giving a worker its own agent: the device-connect flow (the standard way)
 
@@ -243,6 +297,7 @@ python3 skills/worker-pool/scripts/pool_identity.py rooms <worker>
 python3 skills/worker-pool/scripts/pool_identity.py hand-room <worker> --room <room> [--wait SECONDS]
 python3 skills/worker-pool/scripts/pool_identity.py worked <worker>
 python3 skills/worker-pool/scripts/pool_identity.py join-room <worker> --room <room> [--wait SECONDS]
+python3 skills/worker-pool/scripts/pool_identity.py return-room <worker> --room <room> [--binding KEY ...] [--wait SECONDS]
 ```
 
 - `rooms` prints the rooms bound to the worker, one per room however many server names its bindings carry.
@@ -260,6 +315,13 @@ python3 skills/worker-pool/scripts/pool_identity.py join-room <worker> --room <r
   room of each review-ask interaction the correlation log records for those tasks.
 - `join-room` invites the worker's agent to one of them and waits for it: `joined`, `waiting`, `skipped` (with
   why) or `failed`. The core stays and no binding changes.
+- `return-room <worker> --room <room> [--binding KEY ...] [--wait SECONDS]` undoes a hand-off: the worker's
+  agent invites the core's agent back; once the core is joined, each binding (default: the room's id) is
+  restored unless another worker now holds it, and the worker's agent leaves. `returned` (with `worker_left`),
+  `waiting`, `skipped` (with why) or `failed`.
+  It is not a rollback: a binding restored before a later step fails stays restored, and the worker's agent
+  stays a member when its leave is refused or the core cannot be confirmed joined first. A rerun recognises a
+  finished return from the core's own read (core joined, worker's agent gone).
 
 ### Creating the agent without a pasted token
 
@@ -319,8 +381,9 @@ what a run creates on the server.
 ## Binding a room to an existing worker
 
 `pool_roster.py:bind_room(workspace, room, target)` pins one room to one
-already-registered worker (by id or unique label) — the picker's "pin" action
-and `pool_roster.py bind` both go through it. **It does not call
+already-registered worker (by id or unique label) — `pool_manage.py bind <room> <worker>`
+goes through it, and `pool_manage.py unbind <room>` through `unbind_room` (the picker's pin
+and unpin buttons are no longer applied; `bind` refuses a worker on its own folders). **It does not call
 `publish_task_event_handler()`.** `register_worker()` (and therefore
 `create_worker.py`) does, on every call, because a registration that leaves
 the core watcher without its route handler is a pool the launcher cannot

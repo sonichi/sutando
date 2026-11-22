@@ -151,6 +151,95 @@ class PublisherContract(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
 
 
+class RelativePathAnchoring(unittest.TestCase):
+    """A relative "results/..." is anchored to the workspace, never to the process's cwd — the
+    session's cwd is the repo, so a path resolved against it lands where no reader looks.
+    Run against src and the vendored ag2-sparrow copy: the bridge imports the latter."""
+
+    MODULES = (result_publish, _load_vendored())
+
+    def test_a_relative_path_resolves_against_the_given_workspace(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                ws = (Path(td) / "ws").resolve()
+                cwd = os.getcwd()
+                try:
+                    os.chdir(td)  # a repo-root-shaped cwd that is NOT the workspace
+                    self.assertEqual(
+                        mod.worker_published_path(Path("results") / "task-1.txt", {}, ws),
+                        ws / "results" / "task-1.txt")
+                finally:
+                    os.chdir(cwd)
+
+    def test_a_relative_path_with_no_workspace_given_resolves_the_real_one(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                ws = (Path(td) / "ws").resolve()
+                cwd = os.getcwd()
+                try:
+                    os.chdir(td)
+                    with mock.patch("workspace_default.resolve_workspace", return_value=ws):
+                        self.assertEqual(
+                            mod.worker_published_path(Path("results") / "task-1.txt"),
+                            ws / "results" / "task-1.txt")
+                finally:
+                    os.chdir(cwd)
+
+    def test_an_absolute_path_is_unaffected(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                target = Path(td) / "results" / "task-1.txt"
+                self.assertEqual(mod.worker_published_path(target, {}, Path(td) / "unused"), target)
+
+    def test_a_relative_path_raises_rather_than_falling_back_to_cwd(self):
+        # No silent "resolver failed, use the current directory" path: a caller that cannot learn
+        # the workspace must not guess at one by falling back to wherever the process happens to be.
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                cwd = os.getcwd()
+                try:
+                    os.chdir(td)
+                    with mock.patch("workspace_default.resolve_workspace",
+                                     side_effect=RuntimeError("no workspace")):
+                        with self.assertRaises(RuntimeError):
+                            mod.worker_published_path(Path("results") / "task-1.txt")
+                    self.assertEqual(list(Path(td).rglob("*.txt")), [], "nothing was written anywhere")
+                finally:
+                    os.chdir(cwd)
+
+    def test_a_resolver_failure_escapes_nowhere_even_without_connections(self):
+        # Without `connections`, nothing downstream can catch a fallback here; isolates the guard.
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                cwd = os.getcwd()
+                try:
+                    os.chdir(td)
+                    with mock.patch("workspace_default.resolve_workspace",
+                                     side_effect=RuntimeError("no workspace")), \
+                            mock.patch.dict(sys.modules, {"connections": None}):
+                        with self.assertRaises(RuntimeError):
+                            mod.worker_published_path(Path("results") / "proactive-note.txt")
+                    self.assertEqual(list(Path(td).rglob("*.txt")), [], "nothing was written anywhere")
+                finally:
+                    os.chdir(cwd)
+
+    def test_cli_with_a_relative_path_and_a_failed_resolver_writes_nothing_and_exits_nonzero(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                cwd = os.getcwd()
+                try:
+                    os.chdir(td)
+                    with mock.patch("workspace_default.resolve_workspace",
+                                     side_effect=RuntimeError("no workspace")), \
+                            mock.patch.object(mod.sys, "stdin", io.StringIO("x")), \
+                            mock.patch.object(mod.sys, "stderr", io.StringIO()):
+                        with self.assertRaises(RuntimeError):
+                            mod.main(["result_publish.py", "results/task-1.txt"])
+                    self.assertEqual(list(Path(td).rglob("*.txt")), [], "nothing was written anywhere")
+                finally:
+                    os.chdir(cwd)
+
+
 class PublisherFailurePaths(unittest.TestCase):
     """Run against src and the vendored ag2-sparrow copy: the bridge imports the latter."""
 
@@ -171,6 +260,78 @@ class PublisherFailurePaths(unittest.TestCase):
                     with self.assertRaises(OSError):
                         mod.publish_text(Path(td) / "task-1.txt", BODY)
                 self.assertEqual(list(Path(td).iterdir()), [])
+
+    def test_a_directory_sync_failure_after_the_rename_is_published_unconfirmed(self):
+        # The rename made the body visible; only the directory fsync failed. A caller must be able
+        # to tell this apart from "nothing written", or its retry duplicates the message.
+        import stat
+        real_fsync = os.fsync
+
+        def fsync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(5, "directory sync failed")
+            return real_fsync(fd)
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                target = Path(td) / "proactive-1.txt"
+                with mock.patch.object(mod.os, "fsync", side_effect=fsync):
+                    with self.assertRaises(mod.PublishedUnconfirmed):
+                        mod.publish_text(target, BODY)
+                self.assertEqual(target.read_text(encoding="utf-8"), BODY)
+                target.unlink()
+                err = io.StringIO()
+                with mock.patch.object(mod.os, "fsync", side_effect=fsync), \
+                        mock.patch.object(mod.sys, "stdin", io.StringIO(BODY)), mock.patch.object(mod.sys, "stderr", err):
+                    self.assertEqual(mod.main(["result_publish.py", str(target)]), 3)
+                self.assertEqual(target.read_text(encoding="utf-8"), BODY)
+                self.assertIn("syncing its directory failed", err.getvalue())
+
+    def test_a_failure_before_the_rename_is_not_reported_as_published(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                target = Path(td) / "proactive-1.txt"
+                with mock.patch.object(mod.os, "replace", side_effect=OSError("crash at publish")), \
+                        mock.patch.object(mod.sys, "stdin", io.StringIO(BODY)):
+                    with self.assertRaises(OSError) as caught:
+                        mod.main(["result_publish.py", str(target)])
+                self.assertNotIsInstance(caught.exception, mod.PublishedUnconfirmed)
+                self.assertEqual(list(Path(td).iterdir()), [])
+        # Through the CLI, as the standby supervisor calls it: nonzero and not 3, nothing written.
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "a-file").write_text("x")
+            missing = Path(td) / "a-file" / "proactive-1.txt"   # its parent is a file: staging fails
+            r = subprocess.run([sys.executable, str(REPO / "src" / "result_publish.py"), str(missing)],
+                               input=BODY, capture_output=True, text=True, timeout=60)
+            self.assertNotIn(r.returncode, (0, 3), r.stderr)
+            self.assertFalse(missing.exists())
+
+    def test_the_cli_entrypoint_exits_3_on_a_directory_sync_failure_after_the_rename(self):
+        # The script run as a process, as the standby supervisor runs it: only the directory fsync
+        # is made to fail, inside that process, so the exit code is the entrypoint's own.
+        inject = (
+            "import os, runpy, stat, sys\n"
+            "real = os.fsync\n"
+            "def fsync(fd):\n"
+            "    if stat.S_ISDIR(os.fstat(fd).st_mode):\n"
+            "        raise OSError(5, 'directory sync failed')\n"
+            "    return real(fd)\n"
+            "os.fsync = fsync\n"
+            "sys.argv = [sys.argv[1], sys.argv[2]]\n"
+            "runpy.run_path(sys.argv[0], run_name='__main__')\n")
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "results" / "proactive-1.txt"
+            target.parent.mkdir()
+            r = subprocess.run([sys.executable, "-c", inject, str(REPO / "src" / "result_publish.py"), str(target)],
+                               input=BODY, capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 3, r.stderr)
+            self.assertEqual(target.read_text(encoding="utf-8"), BODY, "the body was published")
+            self.assertIn("syncing its directory failed", r.stderr)
+            target.unlink()
+            # The same entrypoint without the fault exits 0: the 3 is the fault's, not the harness's.
+            r = subprocess.run([sys.executable, "-c", inject.replace("raise OSError(5, 'directory sync failed')", "pass"),
+                                str(REPO / "src" / "result_publish.py"), str(target)],
+                               input=BODY, capture_output=True, text=True, timeout=60)
+            self.assertEqual((r.returncode, target.read_text(encoding="utf-8")), (0, BODY), r.stderr)
 
     def test_main_publishes_stdin_and_refuses_a_flag_or_no_path(self):
         for mod in self.MODULES:
@@ -311,7 +472,7 @@ WRITERS = {
     "skills/schedule-crons/scripts/codex-scheduler.py": "from result_publish import publish_text",
     "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py": "from .result_publish import",
     "src/notify.sh": "result_publish.py",
-    "src/launchd/gateway-bridge-wrapper.sh": "result_publish.py",
+    "src/launchd/gateway-bridge-lib.sh": "result_publish.py",
     "src/launchd/channel-bridge-wrapper.sh": "result_publish.py",
     "src/voice-agent.ts": "publishResultFile(`proactive-voice-${c.category}-",
     "src/live-agent-runtime.ts": "publishResultFile(`proactive-voice-stuck-",

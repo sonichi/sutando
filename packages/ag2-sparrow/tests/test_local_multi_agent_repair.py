@@ -276,6 +276,18 @@ class Round7(MultiBase):
                 self.assertTrue((cb.bridge_home(self.root_of(BETA)) / cb.DECLARATION).exists())
                 self.assertEqual(self.run_cli(CL.name, "uninstall", "--agent", BETA)[0], 0)
 
+    def test_a_repair_that_asks_for_collaborators_wins_over_a_recorded_opt_out(self):
+        """The collaborator setting is one option with two spellings: a repair giving either wins, one giving
+        neither keeps the recorded value."""
+        b = job(CL.name, BETA)
+        self.installed(CL.name, BETA, "--no-allow-collaborator")
+        for given, want in (([], "0"), (["--allow-collaborator"], "1"), ([], "1"),
+                            (["--no-allow-collaborator"], "0"), (["--allow-coll"], "1")):
+            with self.subTest(given=given):
+                rc, out, err = self.run_cli(CL.name, "install", "--agent", BETA, *given)
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(cm.read_config(cm.config_path(b))[claude_cli.inbox.ALLOW_COLLABORATOR], want)
+
     def test_an_option_the_repair_line_gives_wins_over_the_recorded_one(self):
         """`install <selector>` takes each recorded option the command did not give: one given (even at its default,
         as `--opt=value`, or by argparse's unique prefix) wins; one not given keeps the recorded value."""

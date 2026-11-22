@@ -164,6 +164,100 @@ def test_write_task_drops_unsafe_and_idless():
         print("PASS test_write_task_drops_unsafe_and_idless")
 
 
+def _collaborator_task(tid):
+    return {
+        "id": tid,
+        "task": "[AG2Space collaborator] hello",
+        "source": "ag2space",
+        "channel_id": "!room:dev.ag2.space",
+        "user_id": "@collaborator:dev.ag2.space",
+        "access_tier": "guest",
+        "requested_access_tier": "team",
+        "collaborator": True,
+        "timestamp": "2026-11-13T08:42:00Z",
+    }
+
+
+def test_write_task_collaborator_routing_matches_the_shared_helper():
+    """sonichi/sutando#5878: _write_task must decide team+collaborator through the SAME
+    helper every other tier read uses (_sender_tier_and_collaborator) — no private copy
+    of the policy that could drift and silently stop promoting an attested collaborator.
+    Proven by forcing the helper to a value honest computation would NOT produce for this
+    input, and asserting the written file reflects the forced value: an inline duplicate
+    inside _write_task would compute its own answer and ignore the mock, failing this."""
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        m = _load(base)
+        t = _collaborator_task("task-1784500000020")
+        want_tier, want_collab = m._sender_tier_and_collaborator(t)
+        assert (want_tier, want_collab) == ("team", True), "fixture must honestly compute team+collaborator"
+        calls = []
+        real = m._sender_tier_and_collaborator
+
+        def forced(task):
+            calls.append(task.get("id"))
+            real(task)  # still runs for its side-effecting log line, result discarded
+            return ("team", False)  # forces collaborator OFF despite the honest answer being True
+
+        m._sender_tier_and_collaborator = forced
+        try:
+            tid, _ = m._write_task(t)
+        finally:
+            m._sender_tier_and_collaborator = real
+        assert calls == ["task-1784500000020"], "write_task must call the helper exactly once, with this task"
+        body = (m.TASKS_DIR / f"{tid}.txt").read_text()
+        assert "access_tier: team" in body
+        assert "\ncollaborator: true\n" not in body, "forced collaborator=False must suppress the line"
+        assert "designated COLLABORATOR" not in body, "forced collaborator=False must drop the engage rulebook"
+        print("PASS test_write_task_collaborator_routing_matches_the_shared_helper")
+
+
+def test_write_task_logs_a_pending_collaborator_attestation():
+    """sonichi/sutando#5878 repro: a sender asking for team (`requested_access_tier: team`)
+    whose broker attestation has not (yet) promoted them — `collaborator` missing/not True,
+    exactly what a not-yet-landed cross-homeserver attestation looks like on the wire — is
+    served as guest today (fail-closed, unchanged) but must say so in the log, so this
+    failure mode is diagnosable at the time it happens instead of only by diffing a task's
+    `timestamp:` header against its file mtime hours later. Exercised through _write_task
+    itself (not the helper directly), so an inline duplicate that skips the helper's log
+    line would fail this, not just the one above."""
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        m = _load(base)
+        logs = []
+        m._log = lambda msg, *a, **k: logs.append(str(msg))
+        t = dict(_collaborator_task("task-1784500000021"), collaborator=None)
+        tid, _ = m._write_task(t)
+        body = (m.TASKS_DIR / f"{tid}.txt").read_text()
+        assert "access_tier: guest" in body and "\ncollaborator: true\n" not in body
+        assert any("collaborator attestation was not True" in line for line in logs), logs
+        assert any("task-1784500000021" in line for line in logs), logs
+        assert any("dev.ag2.space" in line for line in logs), logs
+        print("PASS test_write_task_logs_a_pending_collaborator_attestation")
+
+
+def test_write_task_silent_for_plain_guest_and_for_a_landed_collaborator():
+    """The diagnostic line is specific to a team REQUEST that did not land as collaborator;
+    it must not fire for an ordinary guest message (no team request at all) nor for a
+    collaborator correctly attested on the first delivery — both are unremarkable."""
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        m = _load(base)
+        logs = []
+        m._log = lambda msg, *a, **k: logs.append(str(msg))
+
+        plain_guest = {"id": "task-1784500000022", "task": "hi", "source": "ag2space",
+                       "channel_id": "!room:ag2.space", "user_id": "@someone:ag2.space",
+                       "access_tier": "guest"}
+        m._sender_tier_and_collaborator(plain_guest)
+        assert not any("collaborator attestation" in line for line in logs), logs
+
+        landed = _collaborator_task("task-1784500000023")
+        m._sender_tier_and_collaborator(landed)
+        assert not any("collaborator attestation" in line for line in logs), logs
+        print("PASS test_write_task_silent_for_plain_guest_and_for_a_landed_collaborator")
+
+
 def test_write_task_shell_quotes_channel_id_in_skill_instructions():
     """A malicious channel_id must not break the shell commands embedded in
     the SKILL INSTRUCTIONS block; shlex must round-trip it as one argument."""
@@ -210,18 +304,6 @@ def test_a_present_but_unusable_picker_stamp_is_written_as_refused():
                 f"a present-{label} stamp must be written as the refused stamp, got: "
                 f"{[l for l in text.splitlines() if l.startswith('picker_command')]}")
 
-        # And the reader agrees: the refused stamp is not an action.
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "wpc", pathlib.Path(__file__).resolve().parents[3] / "skills/worker-pool/scripts/worker_picker_commands.py")
-        if spec and spec.loader and spec.origin and pathlib.Path(spec.origin).exists():
-            sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "src"))
-            wpc = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(wpc)
-            refused = wpc.parse({"source": "worker-picker", "channel_id": "!r:x",
-                                 "picker_command": ""}, sentence)
-            assert refused is None or refused.get("action") != "add", (
-                f"the refused stamp still produced an action: {refused}")
         print("PASS test_a_present_but_unusable_picker_stamp_is_written_as_refused")
 
 
@@ -232,7 +314,7 @@ def test_picker_args_present_but_invalid_is_preserved_as_a_refusing_stamp():
     docs/remote-gateway-protocol.md refuses: args that are not an object are
     refused by name, never resolved from the sentence.
 
-    The reader half is NOT asserted here: worker_picker_commands.py does not
+    The reader half is NOT asserted here: the host reader does not
     exist at this head or on main, so a reader assertion would be a block that
     silently skips and reads as proof. The writer is what this PR owns.
     """
@@ -284,4 +366,7 @@ if __name__ == "__main__":
     test_write_task_shell_quotes_channel_id_in_skill_instructions()
     test_a_present_but_unusable_picker_stamp_is_written_as_refused()
     test_picker_args_present_but_invalid_is_preserved_as_a_refusing_stamp()
+    test_write_task_collaborator_routing_matches_the_shared_helper()
+    test_write_task_logs_a_pending_collaborator_attestation()
+    test_write_task_silent_for_plain_guest_and_for_a_landed_collaborator()
     print("ALL PASS test_write_task_atomic")

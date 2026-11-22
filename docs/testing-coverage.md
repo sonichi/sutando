@@ -41,6 +41,18 @@ Every gate run posts a **sticky PR comment** (one comment, updated per push
 the whole-tree percentage, and the per-file uncovered-lines table on
 failure. The same content lands in the Actions job summary.
 
+The advisory **Not measured** section names changed Python files absent from
+coverage.py's JSON report. JSON retains repository-relative paths, so a reported
+`src/nested/shared.py` cannot hide an unmeasured `scripts/nested/shared.py` or
+`outside/nested/shared.py`. Discovered files with zero executed lines remain in
+the report and count as measured. XML is still used for the diff-coverage check.
+The job log and Markdown advisory preserve spaces and literal shell metacharacters
+in each emitted path; filenames are never expanded as shell patterns.
+If JSON generation fails, the gate reports that this diagnostic is unavailable
+and preserves the diff-coverage verdict without reading an older JSON report.
+To run the diagnostic directly, generate `python3 -m coverage json --quiet`, then
+run `python3 scripts/coverage_unmeasured.py origin/main coverage.json`.
+
 Mechanically this is one suite run and two jobs in `ci.yml`, then a second
 workflow. `python-standalone-tests` runs the suite once under `coverage run`,
 as fifteen matrix legs: legs 1-13 balanced by measured cost (`scripts/shard-by-cost.sh` over `tests/python-suite-costs.txt`, regenerated with `scripts/gen-suite-costs.sh` from job logs), heaviest suite first; leg 14 the load-sensitive suites, heaviest first, two at a time; leg 15 the ones tagged `serial`, alone. They

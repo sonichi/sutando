@@ -301,23 +301,17 @@ class TheRouterOnAStagedCopy(Base):
         self.assertEqual(self.sentinels(W), ["task-staged-1.txt"])
         self.assertIsNone(prr.read(self.ws))
 
-    def test_a_picker_command_is_declined_and_not_applied(self):
-        from unittest import mock
-        with mock.patch.object(handler, "apply_picker") as applied:
-            rc, _ = self.run_handler("task-staged-2", W, source="worker-picker")
+    def test_a_picker_command_is_declined(self):
+        rc, _ = self.run_handler("task-staged-2", W, source="worker-picker")
         self.assertEqual(rc, handler.DECLINE)
-        applied.assert_not_called()
         self.assertEqual(self.sentinels(W), [])
 
-    def test_a_lanes_re_raise_never_applies_a_picker_command(self):
-        from unittest import mock
+    def test_a_lanes_re_raise_declines_a_picker_command(self):
         staged, dest = self.stage("task-staged-5", W, "worker-picker")
         dest.write_text(staged.read_text())
-        with mock.patch.object(handler, "apply_picker") as applied:
-            rc = handler.guarded_main(["--task-file", str(dest), "--workspace", str(self.ws), "--from-lane",
-                                       "--renotify"])
+        rc = handler.guarded_main(["--task-file", str(dest), "--workspace", str(self.ws), "--from-lane",
+                                   "--renotify"])
         self.assertEqual(rc, handler.DECLINE)
-        applied.assert_not_called()
 
     def test_an_accepted_sentinel_is_never_re_raised(self):
         import pool_router

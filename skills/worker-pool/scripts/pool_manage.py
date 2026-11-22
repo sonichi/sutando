@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manage the pool's workers: list, stop, retire, enable, remove, reseat, plugins.
+"""Manage the pool's workers: list, stop, retire, enable, remove, reseat, plugins, bind, unbind.
 
 The owner's (or the agent's, on the owner's behalf) one supported way to take a
 worker out of service and bring it back. Each verb goes through the writer that
@@ -14,11 +14,17 @@ already owns its fact, so the remedy, the sweep and the router honour it:
             to it to the core. Work it still owes must be handed to the core
             (`--hand-off`, pool_delivery.hand_off_to_core) or the retire is refused.
             A worker with its own agent loses it too: its connection row, lane
-            and vault secret (connections.retire_worker_identity).
+            and vault secret (connections.retire_worker_identity). Deleting the
+            agent on s.space is left to the owner (no server Action retires a live
+            agent yet), and the owner is told in their DM which agent to delete.
     enable  lift both, then the owner restart (pool_remedy.restart).
     remove  drop a retired worker's roster row; its records stay on disk.
     reseat  restart a running seat that owes nothing, so its tools pick up an
             agent identity added after it started; one that owes work is left.
+    bind    bind a room to a worker on the shared folders (pool_roster.bind_room), so the
+            router delivers that room's tasks to it; a worker on its own folders is refused,
+            since the router never delivers to one.
+    unbind  drop a room's binding (pool_roster.unbind_room): its tasks go to the core.
     plugins record or drop an extra Claude Code plugin dir (a folder holding
             .claude-plugin/plugin.json) that every launch and reseat of this worker
             loads with --plugin-dir. The owner's opt-in: run it only on their word.
@@ -32,6 +38,8 @@ already owns its fact, so the remedy, the sweep and the router honour it:
     python3 pool_manage.py [--workspace WS] [--repo REPO] reseat <worker>
     python3 pool_manage.py [--workspace WS] plugins <worker> add|remove <dir>
     python3 pool_manage.py [--workspace WS] plugins <worker> list
+    python3 pool_manage.py [--workspace WS] bind <room id> <worker id or label>
+    python3 pool_manage.py [--workspace WS] unbind <room id>
 
 Every verb prints one JSON line. Exit 0 done, 1 failed, 2 refused.
 """
@@ -159,7 +167,7 @@ def _hand_off(workspace, wid, owed, hand_off) -> dict:
     return pd.hand_off_to_core(Path(workspace), wid)
 
 
-def retire(workspace, target, *, unbind=False, hand_off=False, runner=subprocess.run) -> dict:
+def retire(workspace, target, *, unbind=False, hand_off=False, runner=subprocess.run, tell=None) -> dict:
     """Fence, then take down, then hand off, then drop bindings. The fence (roster state
     `retired`, which the router re-checks under the delivery lock) comes first, so no
     new or replayed task can commit to the worker once the owed set is read."""
@@ -195,10 +203,43 @@ def retire(workspace, target, *, unbind=False, hand_off=False, runner=subprocess
     _, _, _, unbound = pr.set_worker_state(workspace, wid, "retired", unbind=unbind)
     return {**base, "result": "retired", "unbound": unbound,
             "handed_off": moved["handed_off"], "kept": moved["kept"],
-            "identity": _retire_identity(workspace, wid)}
+            "identity": _retire_identity(workspace, wid, tell=tell),
+            "pending_approval": _withdraw_approval(workspace, wid, tell=tell)}
 
 
-def _retire_identity(workspace, wid: str) -> dict:
+# s.space's account.agents.retire refuses a live identity (identity_retire_unavailable), so
+# deleting the agent itself is the owner's step in the app.
+AGENT_REMOVAL_OWNER_STEP = ("the server cannot delete a live agent for us yet: delete it in the app "
+                            "(your agents list), or it stays there with no worker behind it")
+
+
+def agent_removal_note(worker_label: str, agent: str) -> str:
+    """The owner's DM once a retired worker's agent is cut loose here but still exists on s.space."""
+    return (f"[dm-only]\n**Delete agent `{agent}` in the app**\n\nYour worker {worker_label} was retired: "
+            "it no longer uses that agent, and its token is gone from this computer. The server cannot delete "
+            "a live agent for me yet, so it stays in your agents list until you delete it there.")
+
+
+def _tell_owner(workspace, text: str) -> bool:
+    try:
+        import pool_device_connect
+        pool_device_connect.send_to_owner(Path(workspace), text)
+        return True
+    except Exception:  # noqa: BLE001 — the retirement is done; the note is reported as not sent
+        return False
+
+
+def _withdraw_approval(workspace, wid: str, tell=None) -> dict:
+    """A device-flow approval still open for the retired worker: withdrawn here (pool_device_connect.withdraw).
+    The server has no cancel, so the flow keeps asking; an approval that lands later is reported by name."""
+    try:
+        import pool_device_connect
+        return pool_device_connect.withdraw(Path(workspace), wid, deliver=tell)
+    except Exception as e:  # noqa: BLE001 — the retirement is done; the approval is reported, never raised
+        return {"result": "failed", "why": f"{type(e).__name__}: {e}"}
+
+
+def _retire_identity(workspace, wid: str, tell=None) -> dict:
     """The worker's own agent, if it has one, goes with it: its lane, row and vault secret
     (connections.retire_worker_identity). Retired, the router hands its tasks to the core, and
     a lane still running as the worker would post the core's answers in the worker's name."""
@@ -209,8 +250,12 @@ def _retire_identity(workspace, wid: str) -> dict:
         return {"result": "failed", "why": f"{type(e).__name__}: {e}"}
     if row is None:
         return {"result": "none"}
-    return {"result": "removed", "instance": row["instance"], "agent": row.get("agent_mxid") or "",
-            "note": "the agent stays on its server until the owner deletes it there"}
+    agent = row.get("agent_mxid") or ""
+    label = str(((pr.load_roster(workspace) or {}).get("workers") or {}).get(wid, {}).get("label") or wid)
+    told = (tell or (lambda text: _tell_owner(workspace, text)))(agent_removal_note(label, agent or "?"))
+    return {"result": "removed", "instance": row["instance"], "agent": agent,
+            "agent_removal": "owner_step", "owner_told": bool(told),
+            "note": AGENT_REMOVAL_OWNER_STEP}
 
 
 def enable(workspace, repo, target, *, start=True, runner=None, spawn=None) -> dict:
@@ -308,6 +353,25 @@ def listing(workspace, *, runner=subprocess.run) -> list:
     return rows
 
 
+def bind(workspace, room: str, target: str) -> dict:
+    """Bind `room` to the worker `target` names; refused for a worker on its own folders."""
+    import connections
+    roster = pr.load_roster(workspace) or {}
+    wid = pr.resolve_label(roster, target) if roster else target
+    if connections.worker_dirs(wid, Path(workspace)) is not None:
+        raise Refused(f"worker {wid} keeps its own folders: the router never delivers to it, so a room "
+                      "is not bound to it (the core asks it with pool_ask)")
+    # The checked id, not the label: a rename in between must not bind another worker.
+    out = pr.bind_room(workspace, room, wid)
+    return {"action": "bind", "room": room, "worker": wid, "result": "bound",
+            "roster_version": out.get("version")}
+
+
+def unbind(workspace, room: str) -> dict:
+    out = pr.unbind_room(workspace, room)
+    return {"action": "unbind", "room": room, "result": "unbound", "roster_version": out.get("version")}
+
+
 def main(argv=None, *, runner=subprocess.run) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--workspace", default=None)
@@ -331,6 +395,11 @@ def main(argv=None, *, runner=subprocess.run) -> int:
         if name == "enable":
             sp.add_argument("--no-start", action="store_true",
                             help="lift the stop/retire without starting a session now")
+    bd = sub.add_parser("bind")
+    bd.add_argument("room")
+    bd.add_argument("worker")
+    ub = sub.add_parser("unbind")
+    ub.add_argument("room")
     pl = sub.add_parser("plugins")
     pl.add_argument("worker")
     pl.add_argument("op", choices=("add", "remove", "list"))
@@ -358,6 +427,10 @@ def main(argv=None, *, runner=subprocess.run) -> int:
             out = reseat(ws, a.repo, a.worker, runner=runner)
         elif a.cmd == "plugins":
             out = plugins(ws, a.worker, a.op, a.dir)
+        elif a.cmd == "bind":
+            out = bind(ws, a.room, a.worker)
+        elif a.cmd == "unbind":
+            out = unbind(ws, a.room)
         else:
             out = remove(ws, a.worker, hand_off=a.hand_off, runner=runner)
     except (Refused, pr.RosterError, wi.IdentityError, ValueError) as e:
@@ -365,7 +438,7 @@ def main(argv=None, *, runner=subprocess.run) -> int:
                           "result": "refused", "why": str(e)}, sort_keys=True))
         return 2
     except (rem.PoolBusy, OSError) as e:
-        out = {"worker": a.worker, "action": a.cmd, "result": "failed", "why": str(e)}
+        out = {"worker": getattr(a, "worker", None), "action": a.cmd, "result": "failed", "why": str(e)}
     print(json.dumps(out, sort_keys=True))
     return 1 if out.get("result") == "failed" else 0
 

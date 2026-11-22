@@ -19,7 +19,6 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "skills/worker-pool/scripts"))
 
 import pool_route_handler as h
-import worker_picker_commands as wpc  # noqa: E402
 
 W = "a" * 32
 
@@ -45,117 +44,6 @@ class Base(unittest.TestCase):
         lines = [f"id: {name}"] + [f"{k}: {v}" for k, v in headers.items()]
         p.write_text("\n".join(lines) + "\ntask: body\n")
         return str(p)
-
-
-class TestPickerReplayAcrossRestart(Base):
-    """A completed picker command must not be reapplied by the startup sweep.
-
-    The sweep re-probes every RETAINED task, and the gateway archives a result
-    before its task (swallowing a task-archive failure), so a finished command
-    routinely survives as a live task with no live result. Without a gate the
-    older of two commands wins on the next restart.
-    """
-
-    ROOM = "!review:example.test"
-
-    def picker(self, name, sentence):
-        # The gateway writer shape: `task:` first, the picker mark and the tier
-        # below it, and the envelope stamp that attests the whole file.
-        import task_envelope as te
-        p = self.ws / "tasks" / f"{name}.txt"
-        raw = (f"id: {name}\nreceiving_instance: @me:ag2.space\n"
-               f"task_layout: mid\ntask: {sentence}\nsource: ag2space\n"
-               f"wire_source: worker-picker\nchannel_id: {self.ROOM}\n"
-               f"user_id: @q:b\naccess_tier: owner\n")
-        p.write_text(te.stamp_text(raw, self.ws))
-        return str(p)
-
-    def bindings(self):
-        return json.loads((self.ws / "state" / "roster.json").read_text()).get("bindings", {})
-
-    def probe(self, task_file):
-        return h.main(["--task-file", task_file, "--workspace", str(self.ws), "--probe"])
-
-    def setUp(self):
-        super().setUp()
-        (self.ws / "results" / "archive").mkdir(parents=True, exist_ok=True)
-        self.roster(bindings={})
-        self.pin = self.picker("task-old-pin", f"Pin room {self.ROOM} to {W} (worker picker)")
-        self.unpin = self.picker(
-            "task-new-unpin",
-            f"Unpin room {self.ROOM} (worker picker: back to auto routing)")
-
-    def test_a_completed_pin_is_not_reapplied_over_a_newer_unpin(self):
-        self.probe(self.pin)
-        self.assertEqual(self.bindings().get(self.ROOM), W, "the pin never applied")
-        self.probe(self.unpin)
-        # PRECONDITION: without it the assertion below passes for a handler that
-        # never binds anything, because the binding would already be absent.
-        self.assertIsNone(self.bindings().get(self.ROOM), "the unpin never cleared it")
-
-        for tid in ("task-old-pin", "task-new-unpin"):
-            (self.ws / "results" / "archive" / f"{tid}.txt").write_text("done\n")
-        Path(self.unpin).unlink()          # the newer task was archived away
-        self.probe(self.pin)               # the startup sweep re-probes what is left
-        self.assertIsNone(self.bindings().get(self.ROOM),
-                          "the completed pin was replayed over the owner's newer unpin")
-
-    def test_an_archived_result_alone_blocks_the_replay(self):
-        """The record and the archive are two independent gates, and only this
-        case exercises the second. A host that lost `picker-applied.json` — a
-        fresh checkout, cleared state — has the completion contract and nothing
-        else, which is the situation the gateway's archive-first ordering makes
-        ordinary rather than rare.
-        """
-        (self.ws / "results" / "archive" / "task-old-pin.txt").write_text("done\n")
-        self.assertFalse(wpc.applied_path(self.ws).exists(), "no record may exist here")
-        self.probe(self.pin)
-        self.assertIsNone(self.bindings().get(self.ROOM),
-                          "an archived result did not block the replay")
-
-    def test_a_live_result_alone_blocks_the_replay(self):
-        (self.ws / "results" / "task-old-pin.txt").write_text("done\n")
-        self.assertFalse(wpc.applied_path(self.ws).exists(), "no record may exist here")
-        self.probe(self.pin)
-        self.assertIsNone(self.bindings().get(self.ROOM),
-                          "a live result did not block the replay")
-
-    def test_the_replay_gate_reads_the_results_dir_the_watcher_passed(self):
-        """`--results-dir` was parsed and thrown away, so the gate consulted the
-        default directory while the watcher had resolved another one."""
-        alt = self.ws / "elsewhere"
-        (alt / "archive").mkdir(parents=True, exist_ok=True)
-        (alt / "task-old-pin.txt").write_text("done\n")
-        h.main(["--task-file", self.pin, "--workspace", str(self.ws),
-                "--results-dir", str(alt), "--probe"])
-        self.assertIsNone(self.bindings().get(self.ROOM),
-                          "a completed result in the supplied dir did not block the replay")
-
-    def test_a_placeholder_result_is_not_a_completion(self):
-        """Readiness is `delivery.readiness`'s contract: an empty or whitespace
-        body is NOT a delivered result, so treating it as one silently drops the
-        owner's routing choice."""
-        for body in ("", "   \n"):
-            with self.subTest(body=repr(body)):
-                self.setUp()
-                alt = self.ws / "elsewhere"
-                (alt / "archive").mkdir(parents=True, exist_ok=True)
-                (alt / "task-old-pin.txt").write_text(body)
-                h.main(["--task-file", self.pin, "--workspace", str(self.ws),
-                        "--results-dir", str(alt), "--probe"])
-                self.assertEqual(self.bindings().get(self.ROOM), W,
-                                 "a placeholder body blocked the pin as if it were a completion")
-
-    def test_control_a_pin_with_no_completed_result_still_applies(self):
-        # Without this, refusing every command would satisfy the case above.
-        self.probe(self.pin)
-        self.assertEqual(self.bindings().get(self.ROOM), W)
-
-    def test_control_an_archived_result_for_another_task_does_not_block(self):
-        # The gate must key on THIS task's id, not on any archived result.
-        (self.ws / "results" / "archive" / "task-unrelated.txt").write_text("done\n")
-        self.probe(self.pin)
-        self.assertEqual(self.bindings().get(self.ROOM), W)
 
 
 class TheReceipt(Base):
@@ -274,6 +162,19 @@ class TestPickerCommandsStayWithTheController(Base):
         p = self.ws / "tasks" / "worker-pin-2.txt"
         p.write_text("id: worker-pin-2\nchannel_id: !room:x\ntask: Pin room !room:x to w (worker picker)\nsource: worker-picker\n")
         self.assertEqual(h.main(["--task-file", str(p), "--workspace", str(self.ws), "--probe"]), h.DECLINE)
+
+    def test_an_owners_pin_binds_nothing_and_goes_to_the_core(self):
+        import task_envelope as te
+        self.roster(bindings={})
+        p = self.ws / "tasks" / "task-pin.txt"
+        p.write_text(te.stamp_text(
+            "id: task-pin\nreceiving_instance: @me:ag2.space\ntask_layout: mid\n"
+            f"task: Pin room !other:x to {W} (worker picker)\nsource: ag2space\nwire_source: worker-picker\n"
+            "channel_id: !other:x\naccess_tier: owner\n", self.ws))
+        for probe in (["--probe"], []):
+            self.assertEqual(h.main(["--task-file", str(p), "--workspace", str(self.ws)] + probe), h.DECLINE)
+        self.assertFalse((self.ws / "state" / "bindings.json").exists())
+        self.assertFalse((self.ws / "state" / "picker-applied.json").exists())
 
     def test_the_same_room_without_the_picker_mark_still_routes(self):
         self.roster()
@@ -479,135 +380,6 @@ class TestOneRosterSnapshot(Base):
         self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
         self.assertTrue((self.ws / "deliveries" / W / "task-stable.txt").exists())
         self.assertFalse((self.ws / "deliveries" / "core").exists())
-
-class TestPickerAppliedAtTheEdge(Base):
-    """An owner's pin is bound and advertised by the handler itself, before the
-    core sees the task; the task still goes to the core (DECLINE)."""
-
-    def picker_file(self, name, sentence, tier="owner", *, stamped=True, layout=True):
-        # The gateway writes the tier BELOW task:, so only a file that declares the
-        # task-mid layout AND is attested can show it; either missing fails closed.
-        import task_envelope as te
-        p = self.ws / "tasks" / f"{name}.txt"
-        marker = "task_layout: mid\n" if layout else ""
-        raw = (f"id: {name}\nreceiving_instance: @me:ag2.space\n{marker}task: {sentence}\n"
-               f"source: ag2space\nwire_source: worker-picker\n"
-               f"channel_id: !other:x\naccess_tier: {tier}\n")
-        p.write_text(te.stamp_text(raw, self.ws) if stamped else raw)
-        return str(p)
-
-    def bindings(self):
-        p = self.ws / "state" / "bindings.json"
-        return json.loads(p.read_text()).get("bindings") if p.exists() else None
-
-    def test_an_owner_pin_is_applied_and_advertised_then_declined(self):
-        self.roster(bindings={})
-        t = self.picker_file("task-1", f"Pin room !other:x to {W} (worker picker)")
-        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), h.DECLINE)
-        self.assertEqual(self.bindings(), {"!other:x": W})
-        ad = self.ws / "state" / "pool-advertisement.json"
-        self.assertTrue(ad.exists())
-        self.assertIn("!other:x", ad.read_text())
-
-    def test_an_unpin_is_applied_too(self):
-        self.roster(bindings={"!other:x": W})
-        (self.ws / "state" / "bindings.json").write_text(json.dumps({"bindings": {"!other:x": W}}))
-        t = self.picker_file("task-1", "Unpin room !other:x (worker picker: back to auto routing)")
-        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), h.DECLINE)
-        self.assertEqual(self.bindings(), {})
-
-    def test_the_probe_applies_it_because_a_declined_task_gets_no_second_call(self):
-        # watch-tasks-stream probes once; rc 3 goes straight to the core.
-        self.roster(bindings={})
-        t = self.picker_file("task-1", f"Pin room !other:x to {W} (worker picker)")
-        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]),
-                         h.DECLINE)
-        self.assertEqual(self.bindings(), {"!other:x": W})
-
-    def test_a_second_delivery_of_the_same_pin_is_harmless(self):
-        self.roster(bindings={})
-        t = self.picker_file("task-1", f"Pin room !other:x to {W} (worker picker)")
-        for _ in range(2):
-            self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]),
-                             h.DECLINE)
-        self.assertEqual(self.bindings(), {"!other:x": W})
-
-    def test_a_signed_file_without_the_declared_layout_is_not_applied(self):
-        # The envelope proves bytes, not shape: without the writer's marker the
-        # tier below task: is body text, so the pin is refused.
-        self.roster(bindings={})
-        t = self.picker_file("task-1", f"Pin room !other:x to {W} (worker picker)", layout=False)
-        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), h.DECLINE)
-        self.assertIsNone(self.bindings(), "a signed task-last file applied a pin")
-
-    def test_a_team_pin_is_not_applied(self):
-        self.roster(bindings={})
-        t = self.picker_file("task-1", f"Pin room !other:x to {W} (worker picker)", tier="team")
-        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), h.DECLINE)
-        self.assertIsNone(self.bindings())
-
-    def test_a_pin_to_an_unknown_worker_is_reported_not_fatal(self):
-        import contextlib
-        import io
-        self.roster(bindings={})
-        t = self.picker_file("task-1", "Pin room !other:x to nobody (worker picker)")
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), h.DECLINE)
-        self.assertIn("not applied", err.getvalue())
-        self.assertIsNone(self.bindings())
-
-
-class TestMalformedRosterRowAtTheEdge(Base):
-    """A malformed roster row reaching apply_picker must be reported, never
-    raised out of main() (where it would fall back to unrestricted routing),
-    and must leave no half-applied pin behind."""
-
-    ROOM = "!other:x"
-
-    def corrupt_roster(self):
-        self.roster(bindings={})
-        rp = self.ws / "state" / "roster.json"
-        d = json.loads(rp.read_text())
-        d["workers"][W] = "live"          # a string where an object belongs
-        rp.write_text(json.dumps(d))
-
-    def picker_file(self, name, sentence):
-        import task_envelope as te
-        p = self.ws / "tasks" / f"{name}.txt"
-        raw = (f"id: {name}\nreceiving_instance: @me:ag2.space\ntask_layout: mid\ntask: {sentence}\n"
-               f"source: ag2space\nwire_source: worker-picker\n"
-               f"channel_id: {self.ROOM}\naccess_tier: owner\n")
-        p.write_text(te.stamp_text(raw, self.ws))
-        return str(p)
-
-    def test_it_is_reported_not_raised(self):
-        self.corrupt_roster()
-        t = self.picker_file("task-m", f"Pin room {self.ROOM} to {W} (worker picker)")
-        self.assertIsNone(h.apply_picker(self.ws, t), "a malformed row escaped as a value")
-
-    def test_nothing_partial_is_written(self):
-        self.corrupt_roster()
-        t = self.picker_file("task-m", f"Pin room {self.ROOM} to {W} (worker picker)")
-        h.apply_picker(self.ws, t)
-        bindings = self.ws / "state" / "bindings.json"
-        bound = json.loads(bindings.read_text()).get("bindings", {}) if bindings.exists() else {}
-        self.assertNotIn(self.ROOM, bound, "a refused pin still wrote its binding")
-        self.assertFalse((self.ws / "state" / "pool-advertisement.json").exists(),
-                         "a refused pin published an advertisement")
-        led = self.ws / "state" / "picker-applied.json"
-        self.assertNotIn("task-m", led.read_text() if led.exists() else "",
-                         "a refused pin was recorded as applied, so the retry is suppressed")
-
-    def test_the_same_pin_succeeds_once_the_row_is_an_object(self):
-        """Control: the refusal above is the malformed row, not the pin."""
-        self.roster(bindings={})
-        t = self.picker_file("task-ok", f"Pin room {self.ROOM} to {W} (worker picker)")
-        out = h.apply_picker(self.ws, t)
-        self.assertEqual((out or {}).get("action"), "pin")
-        bound = json.loads((self.ws / "state" / "bindings.json").read_text())["bindings"]
-        self.assertEqual(bound.get(self.ROOM), W)
-
 
 class TestAddressedRoutingEndToEnd(Base):
     """Both routing paths, from a task FILE to the chosen recipient: the edge

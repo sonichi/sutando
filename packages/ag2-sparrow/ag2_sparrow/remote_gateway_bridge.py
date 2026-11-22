@@ -2261,9 +2261,7 @@ POLL_STALL_EXIT_S = float(os.environ.get("REMOTE_TASK_POLL_STALL_EXIT_S") or "60
 # Exiting only helps where something restarts us. startup-runtime.sh launches the
 # primary and every named lane as a bare `&`, so the owner must be declared here.
 POLL_STALL_RESTART_OWNER = (os.environ.get("SUTANDO_BRIDGE_RESTART_OWNER") or "").strip()
-# EX_UNAVAILABLE: the wrapper relaunches on it without an owner alert, so an outage
-# does not queue a "bridge restarted" message every stall period.
-POLL_STALL_EXIT_CODE = 69
+from .exit_codes import POLL_STALL_EXIT_CODE  # noqa: E402
 # Proactive-message drain: when REMOTE_PROACTIVE_ROOM names a room id, every
 # `results/proactive-*.txt` the agent writes is delivered to that room as a
 _PROACTIVE_ROOM_ENV = os.environ.get("REMOTE_PROACTIVE_ROOM")
@@ -2824,7 +2822,7 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # causes: the core answers [no-send] and lets its Stop hook do the work.
                 "hitl_click",
                 # Which worker-picker button was pressed. Above "task" for the same
-                # reason: worker_picker_commands reads it with the safe parser.
+                # reason: the host reads it with the safe parser.
                 "picker_command", "picker_args",
                 # Also above "task": these carry the picker's authorization, and a
                 # task-last reader cannot see a field written below the body.
@@ -5484,10 +5482,30 @@ def _vault_handled(text: str, sender_tier: str) -> str:
     return result.text
 
 
-def _sender_tier(task: dict) -> str:
-    attested, _ = local_task_protocol.broker_attested_tier(
+def _sender_tier_and_collaborator(task: dict) -> "tuple[str, bool]":
+    """(effective sender tier, whether the collaborator engage rulebook applies): the ONE
+    broker-attestation decision for a task, so task-write routing, vault handling and
+    owner-activity recording can never read it differently from each other. A sender asking
+    for team (`requested_access_tier: team`) whose broker attestation did not promote it is
+    logged here — distinct from a plain guest message — on every call this function gets for
+    that task (so a held-then-served task logs twice), since that gap (wire access_tier still
+    `guest`, collaborator not `True`) is exactly what a not-yet-landed cross-homeserver
+    collaborator attestation looks like, and this is the only place that otherwise swallows it."""
+    attested, broker_collaborator = local_task_protocol.broker_attested_tier(
         task.get("access_tier"), task.get("requested_access_tier"), task.get("collaborator"))
-    return _tier_for(task.get("user_id"), attested)
+    sender_tier = _tier_for(task.get("user_id"), attested)
+    collaborator_enabled = broker_collaborator and sender_tier == "team"
+    if (not collaborator_enabled and local_task_protocol.canonical_access_tier(
+            task.get("requested_access_tier")) == "team" and task.get("collaborator") is not True):
+        _log(f"task {task.get('id')}: requested team but the broker's collaborator attestation "
+             f"was not True on this delivery (sender {task.get('user_id')!r}, room "
+             f"{task.get('channel_id')!r}) — serving as {sender_tier}; a later redelivery with "
+             "collaborator: true would be the attestation catching up")
+    return sender_tier, collaborator_enabled
+
+
+def _sender_tier(task: dict) -> str:
+    return _sender_tier_and_collaborator(task)[0]
 
 
 def _redact_quoted(value, found: set):
@@ -6480,11 +6498,9 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     # Promote only the exact broker boolean plus Team request; the legacy Guest
     # wire tier keeps old nodes restricted and body text cannot opt itself in.
-    attested_tier, broker_collaborator = local_task_protocol.broker_attested_tier(
-        task.get("access_tier"), task.get("requested_access_tier"), task.get("collaborator"))
-    # Resolved once and reused below so routing and owner-activity cannot diverge.
-    sender_tier = _tier_for(task.get("user_id"), attested_tier)
-    collaborator_enabled = broker_collaborator and sender_tier == "team"
+    # One shared helper decides this — see _sender_tier_and_collaborator — so this
+    # write and every other tier read (vault, owner-activity) can never disagree.
+    sender_tier, collaborator_enabled = _sender_tier_and_collaborator(task)
     lines = []
     # Which instance took delivery (shared-room fan-out: each Sutando writes its own
     # task file). Emitted just after id: below; KNOWN_HEADER_KEYS defangs a forged body copy.
@@ -11280,6 +11296,8 @@ _STALL_REPORTED_FOR: float | None = None
 # Set once the stall exit has stopped the outbound worker: from then on the loop
 # only waits for that stop, because a resumed poll would run with no outbound worker.
 _STALL_EXIT_PENDING = False
+# Set when that exit may proceed: main() returns the code so run() exits through _exit_bounded.
+_STALL_EXIT_READY = False
 
 
 def _worker_stop_budget_s() -> float:
@@ -11309,8 +11327,9 @@ def _abort_if_poll_stalled(anchor: float,
     unsupervised lane that exits stays down; the status sidecar records it either way.
     `before_exit` stops the workers and reports whether they stopped; until they
     have, this returns True and the caller must skip the beat rather than poll.
+    True also once the exit is ready, which main() turns into the returned code.
     """
-    global _STALL_REPORTED_FOR, _STALL_EXIT_PENDING
+    global _STALL_REPORTED_FOR, _STALL_EXIT_PENDING, _STALL_EXIT_READY
     now = time.monotonic()
     # Pass the limit explicitly: the parameter default binds at def time,
     # so a reconfigured module global would otherwise never be read.
@@ -11342,7 +11361,8 @@ def _abort_if_poll_stalled(anchor: float,
         return True
     print(f"FATAL: no successful poll in {stalled_s}s (limit {POLL_STALL_EXIT_S:g}s) "
           f"-- exiting so {POLL_STALL_RESTART_OWNER} restarts the bridge.", file=sys.stderr)
-    sys.exit(POLL_STALL_EXIT_CODE)
+    _STALL_EXIT_READY = True
+    return True
 
 
 def main() -> int | None:
@@ -11428,6 +11448,10 @@ def main() -> int | None:
         _stamp_loop_progress()
         polled_ok = False  # a failure after this pass's good poll is not a lost connection
         try:
+            # Checked before the watchdog, which would otherwise repeat its exit body.
+            if _STALL_EXIT_READY:
+                _save_inflight(inflight)  # claimed tasks reload from it on start
+                return POLL_STALL_EXIT_CODE
             if _abort_if_poll_stalled(stall_anchor, stop_workers):
                 continue
             if _STUCK_EXIT_READY:

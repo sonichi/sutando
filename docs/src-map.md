@@ -217,6 +217,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`result_publish.py`** — One publisher for every `results/` body: staged beside the target, fsynced, renamed whole.
 - **`result_ready.py`** — Alias of `delivery.readiness` (phase-1a restructure); one transition window.
 - **`result_router.py`** — Alias of `delivery.router` (phase-1a restructure); one transition window.
+- **`roster_membership.py`** — Which workers a pool roster counts as members: each key of its `workers` mapping whose row is not `state: "retired"` (a row that is not a mapping is a member).
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
 - **`runtime_observation.py`** — Runtime observations: one leased record per seat, written by whatever observes that seat's CLI.
 - **`safe_number.py`** — One reader for a number from untrusted JSON (a ledger, a record, a payload).
@@ -224,6 +225,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).
 - **`screen-capture-server.py`** — Screen capture HTTP server — runs in a terminal (has Screen Recording permission on macOS; needs no special setup on Windows).
 - **`scroll-wheel.swift`** — scroll-wheel.swift — Send OS-level scroll wheel events to Chrome
+- **`seat_inbox.py`** — Which seat an inbox belongs to, judged from the inbox itself and the workspace's records.
 - **`secret_compare.py`** — Constant-time equality for a presented credential string against an expected one.
 - **`secret_scanner.py`** — Library-based secret detection for inbound bridge messages.
 - **`self_opened_gate.py`** — Attribution for a terminal dialog Sutando opened itself, and the one rule that may dismiss it.
@@ -252,6 +254,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`slack_result_delivery.py`** — Slack reply-leg delivery state, bound to the shared outbox (Slack strangler).
 - **`sparrow-claude-local.py`** — Sutando's entry for `ag2-sparrow-claude-local`: the package CLI with the workspace injected.
 - **`sparrow_agent_bridge.py`** — One agent's gateway bridge under sparrowd, from the declaration its claude-local or codex-local install wrote.
+- **`sparrow_core_bridge.py`** — The host's core gateway bridge as sparrowd runs it (`src/sparrowd.py --core`).
 - **`sparrowd.py`** — sparrowd launcher — the adapter edge that names concrete workers.
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.
 - **`startup.sh`** — Sutando startup — starts available services + the selected core CLI.
@@ -276,8 +279,10 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`task_envelope.ts`** — task_envelope.ts — TypeScript mirror of src/task_envelope.py's stamping half, for the TS task writers (voice delegation seam, context-drop, wearable).
 - **`task_envelope_census.py`** — Soak census for HMAC task envelopes: the read-only measurement behind the "writer census reaches zero" gate.
 - **`task_lifecycle.py`** — Task execution lifecycle for an adapter that serves one work dir and calls a provider per task.
+- **`task_lookup.py`** — Find a task's file or result by id wherever it lives: its current home first (`connections.task_home`), then only the ARCHIVES of the folders its worker used before switching between own and shared ones (`connections.task_other_home`).
 - **`task_priority.py`** — Task priority taxonomy + readers.
 - **`task_queue.py`** — The pending task queue, in one place: which task files are waiting, in the order the core will take them, and where a given task stands in that order.
+- **`task_watch_owner.py`** — Which tasks the task-watch Mod may name to a running turn: the human owner's, from a person's channel.
 - **`task_workstreams.py`** — Durable inferred-workstream index and archive-backed task history.
 - **`tasks-dir-resolve.sh`** — Shared TASKS_DIR resolution — sourceable so watch-tasks-stream.sh and task-notifier-supervisor.sh can never resolve a different inbox for the same instance.
 - **`team_guardrail.py`** — Alias of `policy.guardrail` (phase-1a restructure); one transition window.
@@ -380,7 +385,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 ## `src/agent/claude/task-watch-mod/hooks/`
 
-- **`register.ts`** — The task-watch Mod: runs the session's task watcher and starts a turn with each task it announces.
+- **`register.ts`** — The task-watch Mod: runs the session's task watcher, starts a turn with each task it announces, and names owner tasks that arrive mid-turn after the next tool result.
 - **`version.ts`** — The oldest Claude Code this Mod is verified on; the launchers read this line too.
 
 ## `src/agent/codex/`
@@ -443,6 +448,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`channel-bridge-wrapper.sh`** — launchd entry point shared by Slack, Discord, and Telegram bridges.
 - **`credential-proxy-wrapper.sh`** — Wrapper for launchd-managed credential-proxy.
 - **`evict-own-bridge.sh`** — Evict a pre-existing BARE channel bridge that belongs to THIS checkout, before the launchd wrapper starts its own supervised child.
+- **`gateway-bridge-lib.sh`** — The legacy gateway bridge's launch policy, one copy for both launchers: sourced by the launchd wrapper, run as `gateway-bridge-lib.sh env|alert|core-gate` by its other callers.
 - **`gateway-bridge-wrapper.sh`** — Wrapper for the launchd-managed gateway bridge (src/remote-gateway-bridge.py).
 
 ## `src/observability/`
