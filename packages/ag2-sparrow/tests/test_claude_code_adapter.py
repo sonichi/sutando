@@ -40,7 +40,7 @@ from claude_code_fixtures import (  # noqa: E402
     isolated_child_env, launcher, MOD, NONCE, OWNER_MXID, parse_task_headers, PKG, raises, ran, READY_PANE, real_ids,
     REAL_TMUX_VERSION, records, REGISTER, resolve_access_tier, ROOM, run_verifier, Runner, SESSION_ID, sm, SRC, STALL,
     stamp, STAMP, STUB_SH, StubTm, task_io, TMUX_DIR, tmux_pane_keys, tmux_probe, tree_bytes, trust, TRUST_PANE,
-    unhold, verify_py, wait_for, wait_gone, write_fake_claude,
+    unhold, verify_py, wait_for, wait_gone, write_fake_claude, write_isolated_stub, ISOLATED_REPLY,
 )
 
 
@@ -250,11 +250,12 @@ class FakeClaudeWrapper(unittest.TestCase):
 
 class InboxCli(ConnectBase):
     """The Mod's lifecycle verbs, each one CLI call under claims.lock, bound to the live consumer
-    generation, mirrored into the progress record under progress.lock."""
+    generation, mirrored into the progress record under progress.lock. Installed with --no-allow-non-owner,
+    so a restricted task takes the refusal path these verbs settle; IsolatedRestrictedTurn covers the default."""
 
     def setUp(self):
         super().setUp()
-        self.configure()
+        self.configure(ALLOW_NON_OWNER="0")
         self.assertEqual(inbox.prepare_root(str(self.work)), "")
         self.holder, self.consumer = hold_consumer(self.work)
         self.addCleanup(unhold, self.holder)
@@ -288,7 +289,7 @@ class InboxCli(ConnectBase):
         self.assertIn("malformed: no access_tier header", self.verb("claim", self.task("task-n2", None))[1]["refused"])
 
     def test_claim_takes_its_tier_from_the_shared_turn_policy(self):
-        self.configure(ALLOW_COLLABORATOR="1")
+        self.configure(ALLOW_COLLABORATOR="1", ALLOW_NON_OWNER="0")
         with mock.patch.object(task_io, "turn_policy", wraps=task_io.turn_policy) as gate:
             rc, out = self.verb("claim", self.task("task-c", "team", "collaborator: true\n"))
         self.assertEqual((rc, out["admission"]), (0, "collaborator"))
@@ -915,14 +916,14 @@ class InboxCli(ConnectBase):
         self.assertEqual(detector.stuck_answers({"stuck": {"a": {"since": "x"}, "b": 3}}), {})
         self.assertEqual(detector.stuck_answers({"stuck": ["a"]}), {})
 
-    def test_with_both_flags_a_collaborator_is_claimed_and_a_restricted_or_tierless_task_still_refused(self):
-        self.configure(ALLOW_NON_OWNER="1", ALLOW_COLLABORATOR="1")
+    def test_with_both_flags_a_collaborator_is_claimed_a_restricted_task_answered_isolated_and_a_tierless_refused(self):
+        self.configure(ALLOW_NON_OWNER="1", ALLOW_COLLABORATOR="1", CLAUDE=str(write_isolated_stub(self.home)))
         rc, out = self.verb("claim", self.task("task-c", "team", "collaborator: true\n"))
         self.assertEqual((rc, out["admission"], out["access_tier"]), (0, "collaborator", "team"))
         for t, tier in (("task-t", "team"), ("task-g", "guest")):
             rc, out = self.verb("claim", self.task(t, tier))
             self.assertEqual((rc, "isolated read-only turn" in out["refused"]), (1, True), t)
-            self.assertEqual((self.results / (t + ".txt")).read_text(), task_io.NON_OWNER_REFUSED, t)
+            self.assertEqual((self.results / (t + ".txt")).read_text(), ISOLATED_REPLY + "\n", t)
         rc, out = self.verb("claim", self.task("task-n", None))
         self.assertEqual((rc, "malformed" in out["refused"]), (1, True))
         self.assertEqual(self.verb("claim", self.task("task-o"))[1]["admission"], "owner", "owner tasks unchanged")
