@@ -1608,6 +1608,17 @@ def lane_server(instance: str, workspace: Optional[Path] = None) -> str:
     return str((row or {}).get("server") or "")
 
 
+def lane_agent_group(instance: str, workspace: Optional[Path] = None) -> Optional[str]:
+    """The agent the row running as `instance` speaks for: its pool worker id, or "" for the core,
+    whose rows on several homeservers are one agent. None when the record or the row is unreadable."""
+    try:
+        rows = _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return None
+    row = next((r for r in rows if instance in [r["instance"]] + alias_instances(r)), None)
+    return None if row is None else str(row.get("worker") or "")
+
+
 def _names_mxid(text: str, mxid: str) -> bool:
     """Whether `text` names `mxid` as a whole token; localparts alone repeat across homeservers."""
     return bool(re.search(r"(?<![\w./#=+\-@])" + re.escape(mxid) + r"(?![\w\-/+=@]|[.:][\w\-])", text or ""))
@@ -1619,17 +1630,21 @@ def _listed_members(field: object) -> set:
     return {str(m).strip() for m in items if str(m).strip()}
 
 
-def event_owner_lanes(task: Mapping[str, object], workspace: Optional[Path] = None) -> list:
+def event_owner_lanes(task: Mapping[str, object], workspace: Optional[Path] = None,
+                      group: Optional[str] = None) -> list:
     """The lane names (instance, then its aliases) whose bridge answers a room message more than one
-    running lane may receive: the one lane whose agent the body names, else (the body naming none) the
-    one it replies to, else the primary. Only facts every lane reads alike decide it (body,
-    `reply_to_sender`, `room_members`).
+    running lane of one agent may receive: the one lane whose agent the body names, else (the body
+    naming none) the one it replies to, else the primary. `group` (`lane_agent_group`) limits the
+    lanes to that agent's: another agent's lanes answer their own copy. Only facts every lane reads
+    alike decide it (body, `reply_to_sender`, `room_members`).
     [] (no preference: the first lane to see it answers) unless two lanes are enabled, the owner's
     bridge runs and its agent is a listed member of the room; an unreadable record is []."""
     try:
         rows = [r for r in _read(record_path(workspace)) if not r.get("disabled") and not r.get("parked")]
     except (SchemaError, OSError):
         return []
+    if group is not None:
+        rows = [r for r in rows if str(r.get("worker") or "") == group]
     if len(rows) < 2:
         return []
     import local_task_protocol

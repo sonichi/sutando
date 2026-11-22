@@ -385,9 +385,12 @@ def _lane_dedupe_gate(task: dict):
     """A message another of this install's lanes queued, or one the lane its owner names will answer;
     seats are other agents, never asked."""
     import lane_dedupe
+    group = ""
     try:
-        from connections import event_owner_lanes
-        owners = event_owner_lanes(task, WS)
+        from connections import event_owner_lanes, lane_agent_group
+        group = lane_agent_group(GATEWAY_INSTANCE, WS)  # noqa: F821
+        owners = event_owner_lanes(task, WS, group=group)
+        group = group or ""
     except Exception as e:  # noqa: BLE001 - no owner read keeps the first-come guard
         _log(f"lane dedupe: owner lanes unreadable ({type(e).__name__}); first lane answers")  # noqa: F821
         owners = []
@@ -396,7 +399,8 @@ def _lane_dedupe_gate(task: dict):
     wait_s = None if deadline is None else max(0.0, deadline - time.monotonic())
     try:
         return lane_dedupe.duplicate_reason(WS / "state", task, GATEWAY_INSTANCE, log=_log,  # noqa: F821
-                                            owner_lanes=owners, wait_s=wait_s, defer=mode["defer"])
+                                            owner_lanes=owners, wait_s=wait_s, defer=mode["defer"],
+                                            group=group)
     except lane_dedupe.OwnerPending:
         return INTAKE_DEFER  # noqa: F821
 

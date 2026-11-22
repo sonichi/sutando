@@ -1,4 +1,4 @@
-"""Cross-lane duplicate guard: one room message becomes one task, answered by its owner lane when known.
+"""Cross-lane duplicate guard: one room message becomes one task per agent, answered by its owner lane when known.
 
 An install may run several gateway bridges ("lanes"), one per homeserver connection, all
 writing into the same workspace inbox. A Matrix event keeps its `event_id` on every
@@ -8,10 +8,14 @@ SQLite store shared by every lane's bridge process; the same event at the same t
 held by ANOTHER lane, is a duplicate. Lanes that disagree on the tier both deliver. The same lane
 seeing its own claim again is not a duplicate, so its own redelivery and retry semantics are kept.
 
-Which lane answers is first-come unless the caller names the event's owner lanes (the lane whose
-agent the message addresses, else the primary): another lane then waits up to `OWNER_WAIT_S` for an
-owner's claim and settles as a duplicate once it appears; past the wait it claims as before, so a
-message the owner never receives is still answered once.
+A duplicate is one agent's copy: the core's lanes (one per homeserver it is on) fold into one
+task, and so do one pool worker's, but a message that reaches the core and a worker is a task for
+each (`scoped_key`, given the lane's `group`). Each agent then decides whether the message is for it.
+
+Within one agent, which lane answers is first-come unless the caller names the event's owner lanes
+(the lane whose agent the message addresses, else the primary): another lane then waits up to
+`OWNER_WAIT_S` for an owner's claim and settles as a duplicate once it appears; past the wait it
+claims as before, so a message the owner never receives is still answered once.
 
 Claims expire after `TTL_S` and expired rows are pruned on each claim. A task without a
 `source_message_id` is never deduped; a hook or Summon task dedupes on its own fire or Summon,
@@ -30,7 +34,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Optional
 
 STORE_NAME = "gateway-seen.sqlite3"
-# One agent's store, shared by its lanes only: keys leave the agent out, so two agents must never share one.
+# Shared by every lane in the workspace; `scoped_key` keeps each pool worker's claims apart from the core's.
 TTL_S = 24 * 3600
 BUSY_TIMEOUT_S = 2.0
 # Outlasts the owner lane's own poll of the same event; past it the message is answered, never dropped.
@@ -172,15 +176,22 @@ class OwnerPending(Exception):
     """The owner lane has not claimed yet and the caller asked not to wait."""
 
 
+def scoped_key(event: Optional[str], group: str = "") -> Optional[str]:
+    """`event` claimed for one agent's lanes only: `group` is a pool worker id, "" the core's."""
+    if event is None or not group:
+        return event
+    return hashlib.sha256(f"agent\n{group}\n{event}".encode("utf-8")).hexdigest()
+
+
 def duplicate_reason(state_dir: Path, task: Mapping[str, object], lane: str, *,
                      now: Optional[float] = None, log: Callable[[str], None] = print,
                      owner_lanes=(), wait_s: Optional[float] = None, sleep=None,
-                     defer: bool = False) -> Optional[str]:
+                     defer: bool = False, group: str = "") -> Optional[str]:
     """One log line naming both lanes when another lane already took this message at the same
     tier, else None; lanes that disagree on the tier both deliver, with one WARNING. With
     `owner_lanes` not naming `lane`, an owner's claim within `wait_s` (`OWNER_WAIT_S`) makes this one the duplicate; `defer` raises
     OwnerPending instead of waiting."""
-    event = key_of(task)
+    event = scoped_key(key_of(task), group)
     if event is None:
         return None
     tier = tier_of(task)

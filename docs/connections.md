@@ -197,9 +197,12 @@ signed in on; the other lanes keep running.
 
 ### Two lanes, one answer
 
-A message in a room where two of the install's agents are members (a federated room, during the
-move from one homeserver to another) can reach both lanes with the same `event_id`. The cross-lane
-guard (`src/lane_dedupe.py`, the bridge's `TASK_INTAKE_GATE`) makes it one task, and
+A message in a room where two of one agent's lanes are members (a federated room, during the
+core's move from one homeserver to another) can reach both lanes with the same `event_id`. The
+cross-lane guard (`src/lane_dedupe.py`, the bridge's `TASK_INTAKE_GATE`) makes it one task for that
+agent. The guard is per agent (`connections.lane_agent_group`: a pool worker's id, or the core's
+rows together): a message that reaches the core and a pool worker is a task for each, and each
+decides whether the message is for it. Among one agent's lanes,
 `connections.event_owner_lanes` picks the lane that answers it from facts every lane reads alike:
 the one lane whose agent the message names by full mxid or replies to (`reply_to_sender`), else
 the primary. Any other lane waits up to `OWNER_WAIT_S` (6 s) for that lane's claim and settles as

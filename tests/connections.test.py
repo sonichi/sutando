@@ -3645,6 +3645,24 @@ class EventOwner(Base):
     def test_members_beyond_the_cap_are_not_read_as_listed(self):
         self.assertEqual(C._listed_members(f"@a:x, {self.NEW_MXID} (+4 more)"), {"@a:x", self.NEW_MXID})
 
+    def test_lanes_of_another_agent_are_not_owner_candidates(self):
+        # The named row becomes a pool worker's identity; the legacy row is the core's primary.
+        with C._transaction(self.ws) as rec:
+            for r in rec["rows"]:
+                r["primary"] = not r["instance"]
+                if r["instance"] == self.NEW:
+                    r["worker"] = "w1"
+        self.assertEqual(C.lane_agent_group("", self.ws), "")
+        self.assertEqual(C.lane_agent_group(self.NEW, self.ws), "w1")
+        self.assertIsNone(C.lane_agent_group("no-such-lane", self.ws))
+        body = f"{self.NEW_MXID} check with them"
+        self.assertEqual(self.owner(body, reply_to_sender=self.LEGACY_MXID), [self.NEW],
+                         "unscoped: one owner across agents")
+        task = {"task": body, "reply_to_sender": self.LEGACY_MXID, "room_members": self.members}
+        self.assertEqual(C.event_owner_lanes(task, self.ws, group=""), [],
+                         "the core's lanes alone: one lane, nothing to prefer, the core answers its own copy")
+        self.assertEqual(C.event_owner_lanes(task, self.ws, group="w1"), [])
+
 
 class LegacyReadopt(Base):
     """A fresh code for the legacy row's server is adopted into a named, app-managed row and the
