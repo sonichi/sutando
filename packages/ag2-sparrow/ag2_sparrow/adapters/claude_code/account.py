@@ -8,7 +8,8 @@ A sign-in can be done in two steps, for a person who is not at that computer: `s
 Code's sign-in waiting and returns its link, and `give_code` hands it the code the sign-in page showed
 them. The waiting sign-in belongs to a small detached process (`supervise`), which ends it after
 LOGIN_WAIT_S; the code goes to it through a FIFO only its owner can open, and this module writes it
-nowhere else (the message it arrived in is the room's to keep; the code is single-use). `start`,
+nowhere else (the message it arrived in is the room's to keep). Claude Code treats the code as
+single-use, by its own refusal text; that is not independently tested here. `start`,
 `give_code` and `cancel` take one lock, and a process is only ever ended when its pid AND its start
 time are the ones this sign-in recorded.
 
