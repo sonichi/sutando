@@ -247,7 +247,26 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         self.assertEqual((json.loads(state.read_text())["wanted"], self.w.metrics()[-1]["card"]),
                          ("models/gemini-pro", "model-picked"))
-        self.assertEqual([model_switch.model_verb(m) for m in ("gemini-3.8-flash-high", "a b")][0], "gemini-3.8-flash-high")
+        self.assertEqual(model_switch.model_verb("gemini-3.8-flash-high"), "gemini-3.8-flash-high")
+        # An id shaped like a digest is digested itself, so it can never stand for another model.
+        forged = model_switch.model_verb("models/gemini-pro")
+        self.assertTrue(forged.startswith("id.") and model_switch.model_verb(forged) != forged)
+        state.write_text(json.dumps(dict(kept, wanted="", available=kept["available"] + odd[:1] + [{"id": forged, "name": "Twin"}])))
+        self.dm_task("task-4", "/model")
+        self.w.serve()
+        again = self.post_queued("$card2")[-1]
+        verbs = [b["command"].split(":")[-1] for b in again["extra_content"]["space.ag2.card"]["buttons"]]
+        self.assertEqual(len(set(verbs)), len(verbs), "every button names one model")
+        # Two models that did come to one verb pick nothing.
+        with mock.patch.object(model_switch, "model_verb", return_value="same"):
+            self.dm_task("task-5", "/model")
+            self.w.serve()
+            (twins,) = self.post_queued("$card3")
+            said = twins["extra_content"]["space.ag2.card"]["buttons"][0]["reply"]
+            self.dm_task("task-6", said, reply_to="$card3", click=said)
+            self.w.serve()
+        self.assertIn("not one I can use now", self.w.result("task-6"))
+        self.assertEqual(json.loads(state.read_text())["wanted"], "")
 
     def test_a_menu_that_cannot_be_built_is_answered_in_words_once_and_never_retried(self):
         (self.w.home / "models").write_text("")
@@ -275,13 +294,16 @@ class ConnectorTest(unittest.TestCase):
         with mock.patch.object(connector_cards, "queue", side_effect=OSError("disk full")):
             self.w.task("task-4", "STUB:TEXT again")
             self.w.serve()
-        self.assertEqual((self.w.metrics()[-1]["model_switch"], json.loads(state.read_text())["told"]), ("untold", ""))
+        owed = json.loads(state.read_text())
+        self.assertEqual((self.w.metrics()[-1]["model_switch"], owed["untold"]["picked"], owed["current"]),
+                         ("untold", "claude-opus-4-6-thinking", "claude-opus-4-6-thinking"))
         self.w.task("task-5", "STUB:TEXT once more")
         self.w.serve()
         (told,) = self.post_queued("$card3")
         self.assertEqual(told["extra_content"]["space.ag2.card"]["text"], "Switched. I'm now using Claude Opus 4.6.")
         kept = json.loads(state.read_text())
-        self.assertEqual((kept["told"], kept["current"]), ("claude-opus-4-6-thinking", "claude-opus-4-6-thinking"))
+        self.assertEqual((kept["told"], kept["current"], kept["untold"]),
+                         ("claude-opus-4-6-thinking", "claude-opus-4-6-thinking", None))
 
     def test_a_menu_asked_for_in_the_turn_that_settles_a_pick_comes_after_the_outcome_and_still_acts(self):
         (self.w.home / "models").write_text("")
@@ -368,6 +390,33 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         self.assertEqual(self.post_queued(), [], "in a shared room /model is ordinary words for agy")
         self.assertEqual(self.w.methods().count("session/prompt"), 2)
+
+    def test_a_refusal_whose_card_could_not_be_queued_is_delivered_later_and_the_switch_is_not_tried_again(self):
+        (self.w.home / "models").write_text("")
+        (self.w.home / "set-model-fails").write_text("")
+        state = self.w.root / "state" / "model.json"
+        state.write_text(json.dumps({"wanted": "claude-opus-4-6-thinking", "asked_in": self.DM,
+                                     "available": [{"id": "claude-opus-4-6-thinking", "name": "Claude Opus 4.6"},
+                                                   {"id": "gemini-3.8-flash-medium", "name": "Gemini 3.8 Flash"}]}))
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("disk full")):
+            self.w.task("task-1", "STUB:TEXT hi")
+            self.w.serve()
+            settled = json.loads(state.read_text())
+            self.assertEqual((self.w.metrics()[-1]["model_switch"], settled["wanted"], len(self.set_model_calls())),
+                             ("untold", "", 1), "the refused pick is dropped at once")
+            self.w.task("task-2", "STUB:TEXT again")
+            self.w.serve()
+            self.assertEqual((self.w.metrics()[-1]["model_switch"], len(self.set_model_calls())), ("untold", 1),
+                             "only the telling is owed: the model is not asked for again")
+        self.w.task("task-3", "STUB:TEXT once more")
+        self.w.serve()
+        (told,) = self.post_queued()
+        self.assertEqual((told["room_id"], told["extra_content"]["space.ag2.card"]["state"], self.w.metrics()[-1]["model_switch"]),
+                         (self.DM, "error", "not-switched"))
+        self.assertEqual((len(self.set_model_calls()), json.loads(state.read_text())["untold"]), (1, None))
+        self.w.task("task-4", "STUB:TEXT last")
+        self.w.serve()
+        self.assertEqual((self.post_queued(), "model_switch" in self.w.metrics()[-1]), ([], False), "told once")
 
     def test_a_refused_switch_is_said_in_the_dm_and_the_turn_runs_on_agys_own_model(self):
         (self.w.home / "models").write_text("")

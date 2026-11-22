@@ -33,11 +33,15 @@ def model_verb(model_id: str) -> str:
     """What a model's button carries. A card reply takes a short plain token, and an id may hold a
     slash, a colon or a space ("models/gemini-pro"): such an id travels as a digest of itself."""
     agent_card, _ = connector_cards._core()
+    digest = "id." + hashlib.sha256(model_id.encode("utf-8")).hexdigest()[:24]
+    # An id that itself starts "id." is digested too, so no id can be another id's digest.
+    if model_id.startswith("id."):
+        return digest
     try:
         agent_card.reply("model", "agent", model_id)
         return model_id
     except ValueError:
-        return "id." + hashlib.sha256(model_id.encode("utf-8")).hexdigest()[:24]
+        return digest
 
 
 class ModelSwitch:
@@ -184,7 +188,8 @@ class ModelSwitch:
         keys = (lambda m: (m["id"].lower(), m["name"].lower())) if by_name else (
             (lambda m: (model_verb(m["id"]),)) if by_verb else (lambda m: (m["id"],)))
         ids = [m["id"] for m in self.offered(state) if picked in keys(m)]
-        if not ids:
+        # One model per button: a verb that names none, or more than one, picks nothing.
+        if len(ids) != 1 and (by_verb or not ids):
             self.publish(result_file, self.quoted(NOT_USABLE) + "\n")
             return "model-unknown"
         picked, outcome = ids[0], "model-picked"
@@ -225,15 +230,26 @@ class ModelSwitch:
 
     def tell(self, live, ran) -> str:
         """Once per pick, after the first owner turn that reached the runtime (`live`): say in the DM the
-        pick was made in whether the switch happened (`ran` is the model that turn ran on). A switch the
-        runtime refused is dropped, so it is not retried on every turn; '' when there was nothing to tell."""
+        pick was made in whether the switch happened (`ran` is the model that turn ran on). The state is
+        settled at once (a refused switch is dropped, never asked for again); an outcome whose card could
+        not be queued is kept apart and told after a later turn. '' when there was nothing to tell."""
         state = self.state()
+        owed = state.get("untold") if isinstance(state.get("untold"), dict) else None
+        if owed:
+            card = self.card(state, picked=str(owed.get("picked") or ""), ran=str(owed.get("ran") or ""))
+            if not self.post(owed.get("room"), card):
+                return "untold"
+            self.save(untold=None)
+            return "switched" if owed.get("picked") == owed.get("ran") else "not-switched"
         wanted = str(state.get("wanted") or "")
         if not wanted or state.get("told") == wanted or not live:
             return ""
-        switched = ran == wanted
-        # Told only once the card is queued: one that could not be is tried again after the next turn.
-        if not self.post(state.get("asked_in"), self.card(state, picked=wanted, ran=ran)):
+        switched, ran = ran == wanted, ran or ""
+        queued = self.post(state.get("asked_in"), self.card(state, picked=wanted, ran=ran))
+        # The state is settled at once; only an outcome whose card could not be queued is kept, to tell later.
+        self.save(told=wanted, current=ran or state.get("current") or "",
+                  untold=None if queued else {"picked": wanted, "ran": ran, "room": state.get("asked_in")},
+                  **({} if switched else {"wanted": ""}))
+        if not queued:
             return "untold"
-        self.save(told=wanted, current=ran or state.get("current") or "", **({} if switched else {"wanted": ""}))
         return "switched" if switched else "not-switched"

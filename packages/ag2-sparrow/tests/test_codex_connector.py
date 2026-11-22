@@ -842,15 +842,19 @@ class ModelCardTest(unittest.TestCase):
         self.assertIn("I'm still using Stub Large.", failed["text"])
         self.assertIn("model=gpt-6-sol", self.serve("task-after", "again"), "the model that took is kept")
 
-    def test_an_outcome_that_could_not_be_queued_is_told_after_the_next_turn(self):
-        self.pick("Stub Large")
+    def test_an_outcome_that_could_not_be_queued_is_settled_at_once_and_told_after_the_next_turn(self):
+        self.pick("Stub Broken")
         self.posted("$card2")
         with mock.patch.object(model_switch.connector_cards, "queue", side_effect=OSError("disk full")):
             c, _ = self.connector()
-            self.assertEqual(c.models.tell(True, "gpt-6-sol"), "untold")
-        self.assertEqual((self.state()["told"], self.state()["current"]), ("", "gpt-5.6-sol"))
-        self.serve("task-3", "hello")
-        self.assertEqual((metrics(self.work)[-1]["model_switch"], self.state()["current"]), ("switched", "gpt-6-sol"))
+            self.assertEqual(c.models.tell(True, "gpt-5.6-sol"), "untold")
+        self.assertEqual((self.state()["wanted"], self.state()["current"]), ("", "gpt-5.6-sol"), "the refused pick is dropped")
+        self.assertIn("model=gpt-5.6-sol", self.serve("task-3", "hello"), "the refused switch is not asked for again")
+        ((_, card),) = self.posted("$card3")
+        self.assertEqual((card["state"], metrics(self.work)[-1]["model_switch"]), ("error", "not-switched"))
+        self.assertIn("I could not switch to Stub Broken. I'm still using Stub Model.", card["text"])
+        self.serve("task-4", "again")
+        self.assertEqual((self.posted(), self.state().get("untold")), ([], None), "told once")
 
 
 class FakeRpc:
