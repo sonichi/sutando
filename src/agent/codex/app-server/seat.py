@@ -784,8 +784,16 @@ class Seat:
         if has_ready_result(results, filename):
             if not self.still_admitted(filename, payload, picked):
                 aside = self.set_result_aside(filename)
-                log(f"task {filename}: turn {status} in {took}; result written, but the admitted file is "
-                    f"neither in the inbox nor archived, so nothing is settled; the result is kept at {aside}")
+                if aside:
+                    log(f"task {filename}: turn {status} in {took}; result written, but the admitted file is "
+                        f"neither in the inbox nor archived, so nothing is settled; the result is kept at {aside}")
+                elif not (Path(results) / filename).exists():
+                    # The bridge took the result between the two reads: it settles it, not this seat.
+                    log(f"task {filename}: turn {status} in {took}; result written and already taken by the "
+                        "bridge, which settles it; the admitted file had left the inbox")
+                else:
+                    log(f"task {filename}: turn {status} in {took}; result written, but the admitted file is "
+                        "neither in the inbox nor archived and the result could not be set aside")
                 return WITHDRAWN
             log(f"task {filename}: turn {status} in {took}; result written")
             self.settle(filename, "done")
