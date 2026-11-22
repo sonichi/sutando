@@ -20,6 +20,7 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "skills/worker-pool/scripts"))
 
 import pool_sessions  # noqa: E402
+import connections  # noqa: E402  (engine src, on the path pool_sessions sets)
 
 def EXISTS(name, socket=None):
     return ("exists", "")
@@ -320,6 +321,52 @@ class UnreadableRecordsDegradeToAbsent(unittest.TestCase):
                 (row,) = pool_sessions.sessions(ws, probe=EXISTS)
                 self.assertFalse(row["live"])
                 self.assertEqual(row["availability"], "absent")
+
+    def test_a_codex_seat_worker_is_listed_like_any_worker_and_marked_a_seat(self):
+        """The VM case (2026-11-22): a Codex app-server worker runs its seat in the same
+        `sutando-worker-<id>` session, so it is listed and attachable like a Claude worker.
+        Its pane is the seat's log, so the row says so and a viewer keeps it read-only."""
+        with tempfile.TemporaryDirectory() as d:
+            ws = workspace_with(Path(d), {W1: {"state": "live", "runtime": "codex"}},
+                                {}, {W1: [open_run(W1)]})
+            write(ws / "state" / "codex-seat" / f"sutando-worker-{W1}" / "host.json", {})
+            (row,) = pool_sessions.sessions(ws, probe=EXISTS)
+            self.assertTrue(row["live"])
+            self.assertEqual(row["runtime"], "codex")
+            self.assertTrue(row["seat"])
+
+    def test_a_leftover_seat_declaration_does_not_make_a_claude_worker_a_seat(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = workspace_with(Path(d), {W1: {"state": "live", "runtime": "claude"}},
+                                {}, {W1: [open_run(W1)]})
+            write(ws / "state" / "codex-seat" / f"sutando-worker-{W1}" / "host.json", {})
+            (row,) = pool_sessions.sessions(ws, probe=EXISTS)
+            self.assertFalse(row["seat"])
+            self.assertEqual(row["runtime"], "claude")
+
+    def test_a_worker_s_own_agent_id_rides_along_and_its_absence_is_empty(self):
+        """A worker's room offers its terminal by matching this id against the room's members,
+        before the broker profile has caught up with a just-created worker."""
+        mxid = "@owner-codex-test-worker.agent:s.space"
+        with tempfile.TemporaryDirectory() as d:
+            ws = workspace_with(Path(d), {W1: {"state": "live"}, W2: {"state": "live"}},
+                                {}, {W1: [open_run(W1)], W2: [open_run(W2)]})
+            ids = {W1: {"agent_mxid": mxid, "token_ref": "never-read"}}
+            with mock.patch.object(connections, "worker_enabled_identity",
+                                   side_effect=lambda wid, ws=None: ids.get(wid)):
+                rows = {r["worker_id"]: r for r in pool_sessions.sessions(ws, probe=EXISTS)}
+            self.assertEqual(rows[W1]["agent_mxid"], mxid)
+            self.assertEqual(rows[W2]["agent_mxid"], "")
+            self.assertNotIn("never-read", json.dumps(rows))
+
+    def test_an_identity_lookup_that_fails_leaves_the_row_whole(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = workspace_with(Path(d), {W1: {"state": "live"}}, {}, {W1: [open_run(W1)]})
+            with mock.patch.object(connections, "worker_enabled_identity",
+                                   side_effect=OSError("unreadable")):
+                (row,) = pool_sessions.sessions(ws, probe=EXISTS)
+            self.assertEqual(row["agent_mxid"], "")
+            self.assertTrue(row["live"])
 
 
 if __name__ == "__main__":
