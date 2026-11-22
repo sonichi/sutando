@@ -1610,7 +1610,10 @@ def lane_server(instance: str, workspace: Optional[Path] = None) -> str:
 
 def lane_agent_group(instance: str, workspace: Optional[Path] = None) -> Optional[str]:
     """The agent the row running as `instance` speaks for: its pool worker id, or "" for the core,
-    whose rows on several homeservers are one agent. None when the record or the row is unreadable."""
+    whose rows on several homeservers are one agent; "" with no record at all (no pool workers then).
+    None when the record or the row is unreadable."""
+    if not record_path(workspace).exists():
+        return ""
     try:
         rows = _read(record_path(workspace))
     except (SchemaError, OSError):

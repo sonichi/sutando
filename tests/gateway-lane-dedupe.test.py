@@ -19,7 +19,8 @@ Covers src/lane_dedupe.py and the gateway bridge's delegation to it:
      settles as its duplicate, the owner answers at once, and a claim that never comes is answered
      by the waiting lane after the wait; an unreadable owner read keeps the first-come guard;
  11. the guard is per agent: the core's lanes fold into one task, and so do one worker's, but a
-     message reaching the core and a worker is a task for each.
+     message reaching the core and a worker is a task for each; a lane whose agent is unknown keeps
+     its own copy (a duplicate at worst, never a drop).
 
 Run: python3 tests/gateway-lane-dedupe.test.py   (exit 0 pass / 1 fail)
 """
@@ -419,6 +420,11 @@ def main():
                     reply_to_sender="@core:example.org", room_members="@a:x, @b:x (+14 more)", **room)
         check("a reply to the core that mentions a worker reaches both, whatever the member list",
               (rgb.TASKS_DIR / "task-G6.txt").exists() and (rgb.TASKS_DIR / "task-wlane~task-G7.txt").exists())
+        # A lane whose agent cannot be read claims for itself alone: a duplicate at worst, never a drop.
+        on_lane("", "task-G8", source_message_id="$ag3", access_tier="owner", **room)
+        on_lane("unknownlane", "task-G9", source_message_id="$ag3", access_tier="owner", **room)
+        check("an unreadable agent on a lane keeps its copy rather than folding into the core's",
+              (rgb.TASKS_DIR / "task-G8.txt").exists() and (rgb.TASKS_DIR / "task-unknownlane~task-G9.txt").exists())
     finally:
         connections.lane_agent_group = real_group
 

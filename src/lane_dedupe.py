@@ -10,7 +10,9 @@ seeing its own claim again is not a duplicate, so its own redelivery and retry s
 
 A duplicate is one agent's copy: the core's lanes (one per homeserver it is on) fold into one
 task, and so do one pool worker's, but a message that reaches the core and a worker is a task for
-each (`scoped_key`, given the lane's `group`). Each agent then decides whether the message is for it.
+each (`scoped_key`, given the lane's `group`); a lane whose agent is unknown claims for itself alone
+(`lane_scope`), so the worst case is a duplicate, never a drop. Each agent then decides whether the
+message is for it.
 
 Within one agent, which lane answers is first-come unless the caller names the event's owner lanes
 (the lane whose agent the message addresses, else the primary): another lane then waits up to
@@ -174,6 +176,11 @@ def _await_owner(state_dir: Path, event: str, tier: str, owners, wait_s: float, 
 
 class OwnerPending(Exception):
     """The owner lane has not claimed yet and the caller asked not to wait."""
+
+
+def lane_scope(lane: str) -> str:
+    """The `scoped_key` group for a lane whose agent is unknown: its claims are its own alone."""
+    return f"lane:{lane}"
 
 
 def scoped_key(event: Optional[str], group: str = "") -> Optional[str]:

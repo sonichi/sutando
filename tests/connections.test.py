@@ -3662,6 +3662,10 @@ class EventOwner(Base):
         self.assertEqual(C.event_owner_lanes(task, self.ws, group=""), [],
                          "the core's lanes alone: one lane, nothing to prefer, the core answers its own copy")
         self.assertEqual(C.event_owner_lanes(task, self.ws, group="w1"), [])
+        C.record_path(self.ws).write_text("{broken")
+        self.assertIsNone(C.lane_agent_group(self.NEW, self.ws), "unreadable: the caller scopes to the lane")
+        C.record_path(self.ws).unlink()
+        self.assertEqual(C.lane_agent_group(self.NEW, self.ws), "", "no record: no pool workers, the core's")
 
 
 class LegacyReadopt(Base):
