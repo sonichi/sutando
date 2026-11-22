@@ -125,6 +125,7 @@ from delivery.pane_gate import (  # noqa: E402
     ADAPTERS, AWAIT_HINT, BORDER_LINE, CLAUDE, CLAUDE_GATE_SIGNATURES, CLAUDE_IDLE,
     COMPOSER_PLACEHOLDER, FABLE_TEXT, SGR_STRIP as _ANSI_SGR, TURN_DONE, TURN_SHORT,
     classify_pane as _pg_classify_pane, composer_text as _pg_composer_text, gate_evidence,
+    slash_menu_gate_rows,
     is_usage_limit, limit_baseline, limit_step, live_tail,
     prompt_line as _pg_prompt_line, refusal_line, strip_limit_banners,
 )
@@ -252,9 +253,11 @@ def classify(pane: str, styled_pane: "str | None" = None):
     styled_tail = ("\n".join(styled_lines[i] for i in kept)
                    if styled_lines is not None and kept and max(kept) < len(styled_lines)
                    else tail)
+    menu_gates = slash_menu_gate_rows(tail, styled_tail, CLAUDE)
     tail = gate_evidence(tail, styled_tail, CLAUDE)
     if not _AWAIT_HINT.search(tail):
-        return None
+        # Phrase text inside a completion list may be help text: a human looks, no key is sent.
+        return ("unknown", "\n".join(menu_gates)) if menu_gates else None
     # Two gates in one pane (one in scrollback): the live one is nearest the bottom.
     hits = [(m.start(), i, kind) for i, (kind, rx) in enumerate(_SIGNATURES)
             for m in [max(rx.finditer(tail), key=lambda m: m.start(), default=None)] if m]
