@@ -81,14 +81,19 @@ skills/model-switch/scripts/model_card.py reply`, run that with `--task-file <ta
   --confirm --accept-timeout 180`; the CLI takes `/model` once this turn ends) and a card already says
   "Switching the core to X; it takes effect after this turn. I'll confirm here once it has switched.".
   Write `[no-send]` and end the turn. Without `event_id` the card could not be posted: send `say`.
+- `{"status": "failed", "say": …}`: the switch could not be started; the card already says so.
 - `{"status": "say", "say": …}`: the tapped model is the one in use ("I'm already using X. Nothing
   changed."); say that line.
 - `forged_or_stale_click`, `owner_words`, `other_card`, `not_a_card`, `refused`, `failed`: as in
   `skills/agent-cards/SKILL.md`.
 
-The detached line always ends in `model_card.py settle --room <DM> --model <alias> --rc <the switch's
-exit code>`, which posts the outcome in the same DM: "Switched. I'm now using X." on exit 0, else "I
+Each tap is one attempt with its own id (`attempt` in the output): the "switching" card is posted
+before the switch is started, so the outcome can only follow it. The detached line always ends in
+`model_card.py settle --room <DM> --model <alias> --attempt <id> --rc <the switch's exit code>`, which
+saves the outcome in `<workspace>/state/model-card-outcome.json` and then posts it in the same DM: "Switched. I'm now using X." on exit 0, else "I
 could not switch to X. I'm still using Y." and one short reason for the exit code (5 unsent text in the
 input box, 8 not accepted in time, 3 the core is not running, and so on; an unknown code is "the switch
-did not finish"). The menu, the "switching" answer and the outcome carry one card id, and each newer
+did not finish"). A post that fails is tried again a few times inside the detached step; an outcome
+still untold is posted by the next `post` or `reply` before its own work, oldest first (`delivered` in
+their output). An outcome is told once, and no retry runs the switch again. The menu, the "switching" answer and the outcome carry one card id, and each newer
 one retires the older one's buttons. Output of the detached line: `<workspace>/logs/model-card.log`.

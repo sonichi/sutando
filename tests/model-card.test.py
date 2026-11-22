@@ -8,6 +8,9 @@
 - `settle` always posts an outcome with the menu's card id: "Switched. I'm now using X." on exit 0, else
   "I could not switch to X. I'm still using Y. <reason>" for every exit code the script documents.
 - A tap on the model already in use changes nothing.
+- One tap is one attempt: its "switching" card is posted before its switch is started, its outcome is
+  saved before it is posted, a failed post is tried again, an outcome still untold is posted first by
+  the next `post` or `reply`, an outcome is told once, and no retry starts the switch again.
 
 The Action call, the core's row and the process launch are fakes; no network, no tmux, no real switch.
 
@@ -78,7 +81,7 @@ class Base(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.ws = Path(tmp.name)
-        self.fake, self.launch = Fake(), Launch()
+        self.fake, self.launch, self.sleeps = Fake(), Launch(), []
         for target, name, value in ((mc, "_owner_dm", lambda ws, core: DM),
                                     (connections, "read_rows", lambda ws=None: [CORE])):
             patch = mock.patch.object(target, name, value)
@@ -93,9 +96,12 @@ class Base(unittest.TestCase):
     def run_(self, argv):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = mc.main(["--workspace", str(self.ws)] + argv, core=CORE, execute=self.fake.execute,
-                         popen=self.launch)
+            rc = mc.main(["--workspace", str(self.ws)] + argv, core=CORE, popen=self.launch,
+                         execute=lambda *a, **k: self.fake.execute(*a, **k), sleep=self.sleeps.append)
         return rc, json.loads(out.getvalue())
+
+    def owed(self):
+        return [r["attempt"] for r in mc.outcomes(self.ws) if not r["told"]]
 
     def tap(self, alias, *, said=None, event="$card1", card_id=mc.CARD_ID, **kw):
         said = SAID[alias] if said is None else said
@@ -173,15 +179,18 @@ class Tap(Base):
     def test_the_owner_tap_starts_the_detached_switch_and_answers_switching(self):
         rc, out = self.tap("fable")
         say = "Switching the core to Fable; it takes effect after this turn. I'll confirm here once it has switched."
+        attempt = out.pop("attempt")
+        self.assertRegex(attempt, r"^[0-9]+-[0-9a-f]{8}$")
         self.assertEqual((rc, out), (0, {"status": "started", "model": "fable", "pid": 4242, "say": say,
                                          "event_id": "$card2"}))
         (argv, kw), = self.launch.calls
         self.assertEqual(argv[:3], ["nohup", "bash", "-c"])
         self.assertEqual(argv[4:], ["model-card", str(mc.SWITCH), "fable", "180", str(self.ws / "state"),
-                                    sys.executable, str(SCRIPT), str(self.ws), DM])
+                                    sys.executable, str(SCRIPT), str(self.ws), DM, attempt])
+        self.assertEqual(self.fake.calls[1][2], f"model-card:{attempt}:switching")
         self.assertTrue(mc.SWITCH.is_file())
         self.assertIn('bash "$1" "$2" --confirm --accept-timeout "$3" --state-dir "$4"; ', argv[3])
-        self.assertTrue(argv[3].endswith('"$5" "$6" --workspace "$7" settle --room "$8" --model "$2" --rc $?'))
+        self.assertTrue(argv[3].endswith('"$5" "$6" --workspace "$7" settle --room "$8" --model "$2" --attempt "$9" --rc $?'))
         self.assertNotIn("&&", argv[3], "the outcome is posted whatever the switch's exit code")
         self.assertTrue(kw["start_new_session"])
         self.assertEqual(kw["stdin"], subprocess.DEVNULL)
@@ -202,10 +211,10 @@ class Tap(Base):
         fake_py.write_text('#!/bin/sh\necho "settle $*"\n')
         fake_py.chmod(0o755)
         got = subprocess.run(["bash", "-c", mc.DETACHED, "model-card", str(fake_switch), "fable", "180", "/st",
-                              str(fake_py), "card.py", "/w s", DM], capture_output=True, text=True, check=True)
+                              str(fake_py), "card.py", "/w s", DM, "17-ab"], capture_output=True, text=True, check=True)
         self.assertEqual(got.stdout.splitlines(),
                          ["switch fable --confirm --accept-timeout 180 --state-dir /st",
-                          f"settle card.py --workspace /w s settle --room {DM} --model fable --rc 8"])
+                          f"settle card.py --workspace /w s settle --room {DM} --model fable --attempt 17-ab --rc 8"])
 
     def test_a_tap_that_is_not_the_owners_on_this_card_starts_nothing(self):
         for kw in ({"user": "@x:s.space"}, {"tier": "team"}, {"room": ROOM, "kind": "room"}, {"event": "$other"},
@@ -250,12 +259,20 @@ class Tap(Base):
         got = json.loads(out.getvalue())
         self.assertEqual((rc, got["status"]), (1, "failed"))
         self.assertIn("no nohup", got["why"])
-        self.assertEqual(len(self.fake.calls), 1, "no switching card for a switch that never started")
+        self.assertEqual(got["say"], "I could not switch to Fable. I'm still using Opus. The switch did not finish.")
+        self.assertEqual([(c["state"], c["text"]) for c in self.fake.cards()[1:]],
+                         [("pending", mc.switching_words("fable")), ("error", got["say"])],
+                         "the switching card is followed at once by what happened")
+        self.assertEqual([c[2] for c in self.fake.calls[1:]],
+                         [f"model-card:{got['attempt']}:switching", f"model-card:{got['attempt']}:outcome"])
+        self.assertEqual(self.owed(), [])
+        self.assertEqual(self.run_(["post", "--room", DM])[0], 0)
         self.fake.execute = lambda *a, **k: {"is_error": True, "code": "M_LIMIT"}
-        rc, got = self.tap("fable")
+        rc, got = self.tap("fable", event="$card4")
         self.assertEqual((rc, got["status"], got["say"]), (0, "started", mc.switching_words("fable")))
         self.assertNotIn("event_id", got)
         self.assertIn("M_LIMIT", got["card_why"])
+        self.assertEqual(len(self.launch.calls), 1, "the switch still starts; its outcome will say how it ended")
 
     def task_file(self, alias):
         path = self.ws / "task.txt"
@@ -275,8 +292,10 @@ class Settle(Base):
     def test_success_posts_the_done_card(self):
         self.using("fable")
         rc, out = self.settle("fable", 0)
+        attempt = out.pop("attempt")
         self.assertEqual((rc, out), (0, {"status": "posted", "event_id": "$card1", "outcome": "done",
                                          "say": "Switched. I'm now using Fable."}))
+        self.assertEqual(self.fake.calls[0][2], f"model-card:{attempt}:outcome")
         card, = self.fake.cards()
         self.assertEqual((card["id"], card["state"], card["text"]), (mc.CARD_ID, "done", "Switched. I'm now using Fable."))
         self.assertEqual(self.fake.calls[0][3], DM)
@@ -321,6 +340,157 @@ class Settle(Base):
         rc, out = self.settle("fable", 0, room=ROOM)
         self.assertEqual((rc, out["status"], out["outcome"]), (1, "failed", "done"))
         self.assertEqual(len(self.fake.calls), 2)
+        self.assertEqual(self.sleeps, [mc.SETTLE_PAUSE_S] * (mc.SETTLE_TRIES - 1))
+
+
+class Attempts(Base):
+    """One tap is one attempt: switching card, then the switch, then one outcome that is never lost."""
+
+    DOWN = {"is_error": True, "code": "M_UNAVAILABLE"}
+
+    def setUp(self):
+        super().setUp()
+        self.using("opus")
+        self.assertEqual(self.run_(["post", "--room", DM])[0], 0)
+
+    def settle(self, attempt, rc=8, alias="fable"):
+        return self.run_(["settle", "--room", DM, "--model", alias, "--rc", str(rc), "--attempt", attempt])
+
+    def failing(self, times):
+        """The Action call refuses its next `times` sends, then works again."""
+        real, left = self.fake.execute, [times]
+
+        def execute(*a, **k):
+            if left[0] > 0:
+                left[0] -= 1
+                return self.DOWN
+            return real(*a, **k)
+        self.fake.execute = execute
+
+    def test_the_switching_card_is_posted_before_the_switch_is_started(self):
+        order = []
+        real = self.fake.execute
+        self.fake.execute = lambda *a, **k: order.append("card " + k["operation_id"].rsplit(":", 1)[-1]) or real(*a, **k)
+        self.launch = lambda argv, **kw: order.append("start") or mock.Mock(pid=7)
+        rc, out = self.tap("fable")
+        self.assertEqual((rc, out["status"], order), (0, "started", ["card switching", "start"]))
+
+    def test_a_quick_refusal_is_posted_after_the_switching_card_under_the_attempts_ids(self):
+        settled = []
+
+        def launch(argv, **kw):
+            """A switch that is refused at once: `settle` runs before `reply` has returned."""
+            with contextlib.redirect_stdout(io.StringIO()):
+                settled.append(mc.main(["--workspace", argv[11], "settle", "--room", argv[12], "--model", argv[6],
+                                        "--attempt", argv[13], "--rc", "5"], core=CORE, execute=self.fake.execute))
+            return mock.Mock(pid=7)
+        self.launch = launch
+        rc, out = self.tap("fable")
+        attempt = out["attempt"]
+        self.assertEqual((rc, out["status"], settled), (0, "started", [0]))
+        self.assertEqual([c[2] for c in self.fake.calls[1:]],
+                         [f"model-card:{attempt}:switching", f"model-card:{attempt}:outcome"])
+        self.assertEqual([c["state"] for c in self.fake.cards()[1:]], ["pending", "error"])
+        self.assertIn("unsent text in the core's input box", self.fake.cards()[-1]["text"])
+        self.assertEqual([(r["attempt"], r["told"], r["room"], r["model"], r["state"]) for r in mc.outcomes(self.ws)],
+                         [(attempt, True, DM, "fable", "error")])
+
+    def test_a_temporary_send_failure_is_retried_and_posts_once(self):
+        self.failing(2)
+        rc, out = self.settle("17-ab")
+        self.assertEqual((rc, out["status"], out["event_id"], out["attempt"]), (0, "posted", "$card2", "17-ab"))
+        self.assertEqual(self.sleeps, [mc.SETTLE_PAUSE_S, mc.SETTLE_PAUSE_S])
+        self.assertEqual([c[2] for c in self.fake.calls[1:]], ["model-card:17-ab:outcome"])
+        self.assertEqual((self.owed(), self.launch.calls), ([], []))
+
+    def test_the_outcome_is_saved_before_the_first_send(self):
+        seen = []
+        self.fake.execute = lambda *a, **k: seen.append(self.owed()) or self.DOWN
+        self.assertEqual(self.settle("17-ab")[0], 1)
+        self.assertEqual(seen, [["17-ab"]] * mc.SETTLE_TRIES)
+
+    def test_settle_twice_for_one_attempt_posts_once(self):
+        self.assertEqual(self.settle("17-ab", 8)[0], 0)
+        rc, out = self.settle("17-ab", 0)
+        self.assertEqual((rc, out["status"], out["event_id"], out["outcome"]), (0, "already_told", "$card2", "error"))
+        self.assertIn("did not accept the switch in time", out["say"])
+        self.assertEqual(len(self.fake.calls), 2)
+
+    def test_an_outcome_that_could_not_be_sent_is_kept_and_the_next_post_sends_it_first(self):
+        self.failing(mc.SETTLE_TRIES)
+        rc, out = self.settle("17-ab")
+        self.assertEqual((rc, out["status"], out["outcome"]), (1, "failed", "error"))
+        self.assertIn("M_UNAVAILABLE", out["why"])
+        self.assertEqual((self.owed(), len(self.sleeps), len(self.fake.calls)), (["17-ab"], mc.SETTLE_TRIES - 1, 1))
+        self.failing(mc.SETTLE_TRIES)
+        self.assertEqual(self.settle("18-cd", 3)[0], 1)
+        self.assertEqual(self.owed(), ["17-ab", "18-cd"])
+        rc, out = self.run_(["post", "--room", DM])
+        self.assertEqual((rc, out), (0, {"status": "posted", "event_id": "$card4", "delivered": ["17-ab", "18-cd"]}))
+        self.assertEqual([c[2].split(":", 1)[1] for c in self.fake.calls[1:3]], ["17-ab:outcome", "18-cd:outcome"])
+        self.assertIn("did not accept the switch in time", self.fake.cards()[1]["text"])
+        self.assertIn("The core is not running.", self.fake.cards()[2]["text"])
+        self.assertEqual(self.fake.cards()[3]["state"], "info", "then the menu it was asked for")
+        self.assertIsNotNone(mc.issued_cards.live(self.ws, "$card4"))
+        self.assertEqual(self.owed(), [])
+        self.assertEqual(self.run_(["post", "--room", DM])[1], {"status": "posted", "event_id": "$card5"})
+        self.assertEqual(self.launch.calls, [], "no retry runs the switch")
+
+    def test_the_next_reply_sends_an_owed_outcome_before_its_own_switch(self):
+        self.failing(mc.SETTLE_TRIES)
+        self.assertEqual(self.settle("17-ab")[0], 1)
+        rc, out = self.tap("sonnet")
+        self.assertEqual((rc, out["status"], out["delivered"]), (0, "started", ["17-ab"]))
+        self.assertEqual([c[2] for c in self.fake.calls[1:]],
+                         ["model-card:17-ab:outcome", f"model-card:{out['attempt']}:switching"])
+        self.assertEqual((self.owed(), len(self.launch.calls)), ([], 1))
+        self.assertEqual(self.launch.calls[0][0][6], "sonnet", "only the tapped switch is started")
+
+    def test_a_tap_that_starts_nothing_still_sends_an_owed_outcome(self):
+        self.failing(mc.SETTLE_TRIES)
+        self.assertEqual(self.settle("17-ab")[0], 1)
+        rc, out = self.tap("fable", user="@x:s.space")
+        self.assertEqual((rc, out["status"], out["delivered"]), (1, "forged_or_stale_click", ["17-ab"]))
+        self.failing(mc.SETTLE_TRIES)
+        self.assertEqual(self.settle("18-cd")[0], 1)
+        self.assertEqual(self.run_(["post", "--room", DM])[1]["delivered"], ["18-cd"])
+        self.failing(mc.SETTLE_TRIES)
+        self.assertEqual(self.settle("19-ef")[0], 1)
+        rc, out = self.tap("opus", event="$card4")
+        self.assertEqual((out["say"], out["delivered"]), ("I'm already using Opus. Nothing changed.", ["19-ef"]))
+        self.assertEqual(self.launch.calls, [])
+
+    def test_an_outcome_still_refused_stays_owed_and_a_day_old_one_is_dropped(self):
+        self.failing(mc.SETTLE_TRIES + 1)
+        self.assertEqual(self.settle("17-ab")[0], 1)
+        rc, out = self.run_(["post", "--room", DM])
+        self.assertEqual((rc, out), (0, {"status": "posted", "event_id": "$card2"}))
+        self.assertEqual(self.owed(), ["17-ab"])
+        path = self.ws.joinpath(*mc.OUTCOMES)
+        rows = json.loads(path.read_text())["outcomes"]
+        rows[0]["ts"] -= mc.OUTCOME_TTL_S + 1
+        path.write_text(json.dumps({"outcomes": rows}))
+        self.assertEqual(mc.tell(self.ws, "17-ab", core=CORE, execute=self.fake.execute, now=rows[0]["ts"] + mc.OUTCOME_TTL_S + 2),
+                         {"status": "failed", "why": "no outcome is saved for that attempt"})
+        self.assertEqual((mc.outcomes(self.ws), len(self.fake.calls)), ([], 2))
+        for text in ("not json", "[]", '{"outcomes": 3}'):
+            path.write_text(text)
+            self.assertEqual(mc.outcomes(self.ws), [])
+
+    def test_an_outcome_that_cannot_be_saved_is_still_posted_once(self):
+        import file_lock
+        with mock.patch.object(file_lock, "locked_file", side_effect=PermissionError("read-only")):
+            rc, out = self.settle("17-ab", 0)
+            self.assertEqual((rc, out["status"], out["saved"], out["say"]), (0, "posted", False, "Switched. I'm now using Fable."))
+            self.assertEqual(self.fake.calls[-1][2], "model-card:17-ab:outcome")
+            self.assertEqual(mc.tell(self.ws, "17-ab", core=CORE, execute=self.fake.execute, now=1.0),
+                             {"status": "failed", "why": "the outcome record could not be used (PermissionError)"})
+        self.assertEqual((len(self.fake.calls), self.sleeps), (2, []))
+
+    def test_settle_without_an_attempt_id_makes_one(self):
+        rc, out = self.run_(["settle", "--room", DM, "--model", "fable", "--rc", "0"])
+        self.assertEqual((rc, out["status"]), (0, "posted"))
+        self.assertEqual(self.fake.calls[-1][2], f"model-card:{out['attempt']}:outcome")
 
 
 class Edges(Base):
