@@ -40,7 +40,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from ... import acp_host, held_start, result_labels, result_publish
+from ... import acp_host, connector_cards, held_start, result_labels, result_publish
 from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore, quoted, trigger_of  # noqa: F401
 from ...acp_client import AcpClient as _SharedClient
 from ...relay_loop import count_arg
@@ -239,14 +239,129 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
     return "\n\n".join(out)
 
 
+MODEL_FILE, MODEL_CARD, MODEL_ASK = "model.json", "model-switch", "/model"
+MODEL_BUTTONS = 6          # the card's button limit
+MODEL_UNKNOWN = ("I don't know my models yet: I learn them when a turn starts. Send me any message, then "
+                 "send /model again.")
+
+
 class Connector:
     def __init__(self, args, client_factory=AcpClient, note=None):
         self.args = args
+        self.root = os.path.dirname(args.state) or "."
         self.client_factory = client_factory
         self.note = note if note is not None else NON_OWNER_NOTE
         self.store = SessionStore(args.session_store)
         self.name = NAME
         self.retry_at = {}
+
+    # ── the model: what agy offers, what the owner picked, and the card that picks ──
+
+    def model_state(self) -> dict:
+        try:
+            with open(os.path.join(self.args.state, MODEL_FILE), encoding="utf-8") as f:
+                state = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        return state if isinstance(state, dict) else {}
+
+    def save_model_state(self, **changes):
+        state = dict(self.model_state(), **changes)
+        path = os.path.join(self.args.state, MODEL_FILE)
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(state, f, sort_keys=True)
+        os.replace(path + ".tmp", path)
+
+    def models_seen(self, models: dict):
+        """Remember what a Session offered (ACP `models`), for the card; only ids and names are kept."""
+        offered = [{"id": str(m.get("modelId") or "")[:200], "name": str(m.get("name") or m.get("modelId") or "")[:80]}
+                   for m in (models.get("availableModels") or []) if isinstance(m, dict) and m.get("modelId")]
+        seen = {"available": offered, "current": str(models.get("currentModelId") or "")[:200]}
+        if {k: self.model_state().get(k) for k in seen} != seen:
+            self.save_model_state(**seen)
+
+    def model_card(self, state: dict, picked: str = "", ran: "str | None" = None):
+        """(body, card): one reply button per model agy offered. After a pick (`picked`) the card has no
+        buttons: it says the switch is coming, then, with `ran` (the model the next turn ran on), that
+        it happened or that it did not."""
+        agent_card, _ = connector_cards._core()
+        names = {m["id"]: m["name"] for m in state.get("available") or []}
+        now = state.get("current") or ""
+        if picked:
+            name = names.get(picked, picked)
+            if ran is None:
+                return agent_card.build(MODEL_CARD, "info", title="Model", body="Model: switching to %s" % name,
+                                        text="Switching to %s on your next message. I'll confirm here once it has "
+                                             "switched." % name)
+            if ran == picked:
+                return agent_card.build(MODEL_CARD, "done", title="Model", body="Model: now %s" % name,
+                                        status="Switched", text="Switched. I'm now using %s." % name)
+            return agent_card.build(MODEL_CARD, "error", title="Model", body="Model: could not switch to %s" % name,
+                                    text="I could not switch to %s. I'm still using %s. Send /model to try again."
+                                         % (name, names.get(ran, ran or "my default model")))
+        buttons = [agent_card.button(name, "reply", reply="Use %s" % name,
+                                     command=agent_card.reply("model", "agent", mid))
+                   for mid, name in list(names.items())[:MODEL_BUTTONS]]
+        return agent_card.build(MODEL_CARD, "pending", title="Model", body="Pick a model for %s" % self.name,
+                                text="Now using %s." % names.get(now, now or "the default model"), buttons=buttons)
+
+    def post_card(self, room, built) -> bool:
+        try:
+            connector_cards.queue(self.args.bridge_state, str(room or ""), *built)
+            return True
+        except (OSError, ValueError) as e:
+            log("model card not queued:", "%s: %s" % (type(e).__name__, e))
+            return False
+
+    def card_task(self, task_id, headers, path, result_file):
+        """The record of a task that was a card matter (a tap, or the owner's /model in their DM), else
+        None: a tap never reaches the model, and a tap this agent cannot match gets the fixed line."""
+        agent_card, _ = connector_cards._core()
+        # The card rules read the task as the core does (the trusted header parse), not this connector's.
+        with open(path, encoding="utf-8") as f:
+            sent, said = agent_card.reply_words(f.read())
+        verdict = connector_cards.click(sent, said, self.root)
+        state, outcome = self.model_state(), ""
+        if verdict.verdict == agent_card.COMMAND and verdict.command.kind == "model":
+            picked = verdict.command.verb
+            if picked not in [m["id"] for m in state.get("available") or []]:
+                publish(result_file, quoted("That model is not one I can use now. Send /model for the current list.") + "\n")
+                outcome = "model-unknown"
+            else:
+                room = str(sent.get("channel_id") or "")
+                self.save_model_state(wanted=picked, asked_in=room, told="")
+                coming = self.model_card(state, picked=picked)
+                publish(result_file, "[no-send] the model card answers\n" if self.post_card(room, coming)
+                        else quoted(coming[1]["text"]) + "\n")
+                outcome = "model-picked"
+        elif verdict.verdict in (agent_card.COMMAND, agent_card.FORGED):
+            publish(result_file, quoted(verdict.say) + "\n")
+            outcome = "card-refused"
+        elif said.lower() == MODEL_ASK and agent_card.owner_may_act(sent) is None:
+            if not state.get("available"):
+                publish(result_file, quoted(MODEL_UNKNOWN) + "\n")
+            elif self.post_card(sent.get("channel_id"), self.model_card(state)):
+                publish(result_file, "[no-send] the model card answers\n")
+            else:
+                publish(result_file, quoted("I could not post the model card. Try again in a moment.") + "\n")
+            outcome = "model-card"
+        if not outcome:
+            return None
+        log("card ->", task_id, outcome)
+        return {"task": task_id, "status": "completed", "detail": outcome, "tier": headers["access_tier"], "card": outcome}
+
+    def tell_model_outcome(self, turn) -> str:
+        """Once per pick, after the first owner turn that opened a Session: say in the DM the pick was
+        made in whether the switch happened. A switch agy refused is dropped, so it is not retried on
+        every turn; '' when there was nothing to tell."""
+        state = self.model_state()
+        wanted = str(state.get("wanted") or "")
+        if not wanted or state.get("told") == wanted or not turn.live:
+            return ""
+        switched = turn.model == wanted
+        self.post_card(state.get("asked_in"), self.model_card(state, picked=wanted, ran=turn.model))
+        self.save_model_state(told=wanted, **({} if switched else {"wanted": ""}))
+        return "switched" if switched else "not-switched"
 
     def run_turn(self, task_id, headers, prompt, owner):
         """(status, text, detail, turn): status is completed | cancelled | timeout | gone | failed | refused.
@@ -258,7 +373,9 @@ class Connector:
                                        lambda params: acp_host.decide_permission(params, True, cwd, tools=tools,
                                                                                   extra_keys=AGY_KEYS),
                                        self.store,
-                                       STDERR_NAME, NOT_SIGNED_IN, log)
+                                       STDERR_NAME, NOT_SIGNED_IN, log,
+                                       model=str(self.model_state().get("wanted") or "") or None,
+                                       on_models=self.models_seen)
         with guest_turn(self.args) as isolated:
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
                                        lambda params: acp_host.decide_permission(params, False, isolated.cwd,
@@ -306,6 +423,9 @@ class Connector:
         # the sender (so shell_web_on stays off for Team). Any other admitted sender gets `guest_turn`.
         if tier == "collaborator":
             tier = "owner"
+        carded = self.card_task(task_id, headers, path, result_file)
+        if carded:
+            return carded
         prompt = wake_prompt(task_id, headers, message, operator_lines, self.args.cwd if tier == "owner" else None,
                              self.note, shell_web=tier == "owner" and shell_web_on(self.args, headers))
         event, _ = trigger_of(headers)
@@ -313,9 +433,11 @@ class Connector:
         t0 = time.time()
         status, text, detail, turn = self.run_turn(task_id, headers, prompt, tier == "owner")
         publish(result_file, self.answer_body(headers, status, text, detail, turn))
+        told = self.tell_model_outcome(turn) if tier == "owner" else ""
         return {"task": task_id, "status": status, "detail": detail[:200], "event_type": event,
                 "tier": headers["access_tier"], "isolated": tier != "owner", "turn_s": round(time.time() - t0, 3),
-                "permissions": turn.decisions, "updates": dict(turn.updates), "answer_chars": len(text or "")}
+                "permissions": turn.decisions, "updates": dict(turn.updates), "answer_chars": len(text or ""),
+                "model": turn.model, **({"model_switch": told} if told else {})}
 
     def pending_tasks(self, seen):
         now = time.time()
@@ -332,6 +454,8 @@ class Connector:
         done = 0
         idle_since = time.time()
         while not stop_requested():
+            with contextlib.suppress(Exception):   # a card's ledger entry never stops task service
+                connector_cards.absorb(self.args.bridge_state, self.root)
             names = self.pending_tasks(seen)
             if not names:
                 if self.args.once and done >= self.args.once:
@@ -367,6 +491,8 @@ def build_parser():
     ap.add_argument("--root-fd", type=int, default=None, help="with --held: the held root's directory descriptor")
     ap.add_argument("--acp-command", default=None, help="the ACP agent's command line (default: agy acp)")
     ap.add_argument("--cwd", default=None, help="the Session working directory (default: the current directory)")
+    ap.add_argument("--bridge-state", default=None, help="the bridge's state dir, where the model card is queued for "
+                    "posting (default: <work>.bridge/state)")
     ap.add_argument("--session-store", default=None,
                     help="the sessions.json to resume from and record to (default: <work>/state/sessions.json)")
     ap.add_argument("--allow-non-owner", action="store_true",
@@ -389,6 +515,8 @@ def _prepare(args):
     if not args.acp_argv:
         raise SystemExit("--acp-command is empty")
     args.cwd = os.path.abspath(os.path.expanduser(args.cwd or os.getcwd()))
+    args.bridge_state = os.path.abspath(os.path.expanduser(
+        getattr(args, "bridge_state", None) or os.path.join(args.work.rstrip(os.sep) + ".bridge", "state")))
     args.child_env = dict(os.environ)
 
 

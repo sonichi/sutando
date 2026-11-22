@@ -78,7 +78,8 @@ def child_env(cfg: dict, environ=None) -> dict:
 
 def connector_argv(cfg: dict, root: str, root_fd: int) -> list:
     argv = [sys.executable, "-m", gc.__name__, "--work", root, "--held", "--root-fd", str(root_fd),
-            "--acp-command", cfg["ACP_COMMAND"], "--cwd", cfg["CWD"]]
+            "--acp-command", cfg["ACP_COMMAND"], "--cwd", cfg["CWD"],
+            "--bridge-state", cfg.get("BRIDGE_STATE_DIR") or str(cb.bridge_home(root) / "state")]
     if cfg.get("SESSION_STORE"):
         argv += ["--session-store", cfg["SESSION_STORE"]]
     if cfg.get("ALLOW_NON_OWNER") == "1":

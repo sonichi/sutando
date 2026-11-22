@@ -112,6 +112,35 @@ the room (keyed by their user id), so no one resumes another's conversation.
   in a read-only session mode, and no read-only session mode is offered (offered: …)."), an event posts
   nothing.
 
+## The model
+
+agy's ACP server has a model per Session. Each of the owner's turns (Team's included) hands the connector
+the Session's `models` (`availableModels`, `currentModelId`), which it keeps in `state/model.json`; when
+the owner has picked one (`wanted` there), the turn first calls `session/set_model`, so the pick applies
+from the next message with nothing restarted. A refused `session/set_model` is logged, told to the owner
+(below) and the turn runs on the Session's own model; the model a turn ran on is `model` in
+`metrics.jsonl`, and `model_switch` there is `switched` or `not-switched` on the turn that settled a
+pick. Guest turns are not switched.
+
+The owner picks from a card. In their DM with the agent, the message `/model` is not sent to agy: the
+connector queues an agent panel card (`connector_cards`; the bridge posts it) with one reply button per
+model, at most six. A tap comes back as a task with `card_click`; it is judged by the core's own
+`agent_card.click_verdict` against this agent's ledger of the cards it posted, so it acts only when the
+owner tapped a card this agent posted, in that DM. It then records the pick and posts a card with no
+buttons saying the switch comes with the next message, which retires the first card's buttons. After
+the next owner turn that opens a Session, one more card in that DM says what happened: "Switched. I'm
+now using X.", or that the switch was refused and which model is still in use (the refused pick is
+dropped, not retried). The owner is never left to infer a switch from silence. Any other tap
+gets the fixed "couldn't match that button" line and reaches neither agy nor the record. `/model` before
+any turn has run answers that the models are not known yet; in a shared room it is ordinary words.
+
+Not measured against a real agy: `models` on `session/new` and `session/set_model {sessionId, modelId}`
+are the Agent Client Protocol's shapes, and agy 1.5.14's ACP server carries handlers named for them
+(`handleSessionSetModel`, `currentModelID`, `SessionModelState`), read from the executable, not called.
+Whether `session/load` also returns `models` is not known; if it does not, a resumed Session is still
+switched, and the list refreshes on the next new Session. That the bridge's room call carries
+`space.ag2.card` to the client is likewise untested against a real gateway.
+
 `--gemini-dir` is agy's flag: a custom `--acp-command` must accept it, or guest turns fail.
 
 agy's `session/request_permission` is answered by `acp_host`'s policy, default deny:
