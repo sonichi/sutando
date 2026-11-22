@@ -1621,8 +1621,9 @@ def _listed_members(field: object) -> set:
 
 def event_owner_lanes(task: Mapping[str, object], workspace: Optional[Path] = None) -> list:
     """The lane names (instance, then its aliases) whose bridge answers a room message more than one
-    running lane may receive: the one lane whose agent the message names or replies to, else the
-    primary. Only facts every lane reads alike decide it (body, `reply_to_sender`, `room_members`).
+    running lane may receive: the one lane whose agent the body names, else (the body naming none) the
+    one it replies to, else the primary. Only facts every lane reads alike decide it (body,
+    `reply_to_sender`, `room_members`).
     [] (no preference: the first lane to see it answers) unless two lanes are enabled, the owner's
     bridge runs and its agent is a listed member of the room; an unreadable record is []."""
     try:
@@ -1631,9 +1632,16 @@ def event_owner_lanes(task: Mapping[str, object], workspace: Optional[Path] = No
         return []
     if len(rows) < 2:
         return []
+    import local_task_protocol
     body, replied = str(task.get("task") or ""), str(task.get("reply_to_sender") or "")
-    named = [r for r in rows if r.get("agent_mxid")
-             and (replied == r["agent_mxid"] or _names_mxid(body, str(r["agent_mxid"])))]
+    # Only a reply's own words count (its quote of the parent names that sender); a non-reply's
+    # leading "> " lines are its own text.
+    if replied or local_task_protocol.split_reply_context(body)[0] is not None:
+        body = local_task_protocol.reply_action_text(body)
+    # A body mention is addressed on purpose; a reply only says whose message it answers.
+    named = [r for r in rows if r.get("agent_mxid") and _names_mxid(body, str(r["agent_mxid"]))]
+    if not named:
+        named = [r for r in rows if r.get("agent_mxid") and replied == r["agent_mxid"]]
     owner = named[0] if len(named) == 1 else next((r for r in rows if r["primary"]), None)
     if owner is None or str(owner.get("agent_mxid") or "") not in _listed_members(task.get("room_members")):
         return []
