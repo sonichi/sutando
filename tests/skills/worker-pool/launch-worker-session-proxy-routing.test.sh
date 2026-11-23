@@ -14,6 +14,7 @@ mkdir -p "$TMP/bin"
 printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/lsof"
 printf '#!/bin/sh\nexit 1\n' > "$TMP/bin/launchctl"
 printf '#!/bin/sh\nexit 1\n' > "$TMP/bin/pgrep"
+printf '#!/bin/sh\necho '"'"'{"loggedIn": true}'"'"'\n' > "$TMP/bin/claude"  # signed in
 chmod +x "$TMP"/bin/*
 STUB_PATH="$TMP/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 

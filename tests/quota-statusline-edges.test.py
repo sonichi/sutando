@@ -272,6 +272,69 @@ class InstallHook(Tmp):
             self.assertIn("not installed", err.getvalue())
 
 
+class SignedIn(Tmp):
+    def _main(self, out=None, exc=None):
+        import claude_signed_in as csi
+
+        def runner(cmd):
+            self.assertEqual(cmd, ["claude", "auth", "status", "--json"])
+            if exc:
+                raise exc
+            return 0, out
+        return csi.main(["--config-dir", str(self.core)], runner=runner, workspace=self.ws)
+
+    def _recorded(self):
+        return json.loads((self.ws / "state" / "claude-direct-routing.json").read_text())[os.path.realpath(self.core)]
+
+    def test_signed_in_not_signed_in_and_unknown(self):
+        self.assertEqual(self._main('{"loggedIn": true, "email": "x"}'), 0)
+        self.assertIs(self._recorded()["signed_in"], True)
+        self.assertNotIn("email", json.dumps(self._recorded()))
+        self.assertEqual(self._main('{"loggedIn": false}'), 1)
+        self.assertIs(self._recorded()["signed_in"], False)
+        self.assertEqual(self._main(exc=subprocess.TimeoutExpired("claude", 8)), 2)
+        self.assertIsNone(self._recorded()["signed_in"])
+        self.assertEqual(self._main("not json"), 2)
+        self.assertEqual(self._main(exc=OSError("no claude")), 2)
+
+    def test_the_real_runner_scopes_the_config_dir_and_times_out(self):
+        import claude_signed_in as csi
+        stub = self.d / "claude"
+        stub.write_text('#!/bin/sh\nif [ "$CLAUDE_CONFIG_DIR" = "%s" ]; then echo \'{"loggedIn": true}\'; fi\n' % self.core)
+        stub.chmod(0o755)
+        with mock.patch.dict(os.environ, {"CLAUDE_BIN": str(stub)}):
+            self.assertIs(csi.signed_in(str(self.core)), True)
+        slow = self.d / "slow"
+        slow.write_text("#!/bin/sh\nsleep 5\n")
+        slow.chmod(0o755)
+        with mock.patch.dict(os.environ, {"CLAUDE_BIN": str(slow)}):
+            self.assertIsNone(csi.signed_in(str(self.core), timeout=0.3))
+        with mock.patch.object(csi, "signed_in", side_effect=RuntimeError), \
+                mock.patch("workspace_default.resolve_workspace", return_value=self.ws):
+            self.assertEqual(csi.main(["--config-dir", str(self.core)]), 2)
+        (self.ws / "state" / "claude-direct-routing.json").write_text("[]")
+        csi.record(self.ws, str(self.core), True)
+        with mock.patch("workspace_default.status_path", side_effect=OSError):
+            self.assertEqual(csi.main(["--config-dir", str(self.core)], runner=lambda c: (0, '{"loggedIn": true}'),
+                                      workspace=self.ws), 0)
+
+    def test_health_check_warns_for_a_dir_that_stayed_on_the_proxy(self):
+        import claude_signed_in as csi
+        spec = importlib.util.spec_from_file_location("hc_signed_in", ROOT / "src" / "health-check.py")
+        hc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hc)
+        hc.WORKSPACE_DIR = self.ws
+        self.assertEqual(hc.check_claude_direct_routing()["status"], "ok")
+        csi.record(self.ws, str(self.core), True)
+        self.assertEqual(hc.check_claude_direct_routing()["status"], "ok")
+        csi.record(self.ws, str(self.d), False)
+        c = hc.check_claude_direct_routing()
+        self.assertEqual(c["status"], "warn")
+        self.assertIn(os.path.realpath(self.d), c["detail"])
+        csi.record(self.ws, str(self.d), None, now=time.time() - 3 * 86400)
+        self.assertEqual(hc.check_claude_direct_routing()["status"], "ok")
+
+
 class HealthCheck(Tmp):
     def _hc(self):
         spec = importlib.util.spec_from_file_location("hc_edges", ROOT / "src" / "health-check.py")

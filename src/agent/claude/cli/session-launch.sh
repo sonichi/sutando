@@ -394,15 +394,29 @@ apply_claude_obs_metering() {
 # dead port. Exports ANTHROPIC_BASE_URL when applicable; caller decides
 # whether/how to forward it into a new session's env (same
 # `[ -n "${ANTHROPIC_BASE_URL:-}" ]` check as before this file existed).
+# 0 when the config dir this launch will run under is signed in on its own (src/claude_signed_in.py,
+# `claude auth status`); not signed in or unknown is 1. Sets CLAUDE_ROUTE_CONFIG_DIR.
+claude_session_signed_in() {
+  CLAUDE_ROUTE_CONFIG_DIR=""
+  [ -n "${PY:-}" ] && [ -f "$REPO/src/claude_signed_in.py" ] && [ -r "$REPO/src/claude_config_dir.sh" ] || return 1
+  . "$REPO/src/claude_config_dir.sh"
+  CLAUDE_ROUTE_CONFIG_DIR="$(resolve_claude_config_dir "$REPO" routing 2>/dev/null)"
+  [ -n "$CLAUDE_ROUTE_CONFIG_DIR" ] || return 1
+  "$PY" "$REPO/src/claude_signed_in.py" --config-dir "$CLAUDE_ROUTE_CONFIG_DIR" > /dev/null 2>&1
+}
+
 resolve_claude_credential_proxy() {
   CLAUDE_ROUTE_PREFIX=()
   [ -r "$REPO/src/claude_routing.sh" ] && . "$REPO/src/claude_routing.sh"
   if declare -F claude_direct_routing > /dev/null && claude_direct_routing; then
-    claude_unset_local_proxy
-    # tmux hands a new session its server's environment, which may still carry the proxy.
-    CLAUDE_ROUTE_PREFIX=(sh -c '. "$1"; shift; claude_unset_local_proxy; exec "$@"' sh "$REPO/src/claude_routing.sh")
-    echo "  ✓ Claude calls Anthropic directly (quota from the status line recorder)"
-    return 0
+    if claude_session_signed_in; then
+      claude_unset_local_proxy
+      # tmux hands a new session its server's environment, which may still carry the proxy.
+      CLAUDE_ROUTE_PREFIX=(sh -c '. "$1"; shift; claude_unset_local_proxy; exec "$@"' sh "$REPO/src/claude_routing.sh")
+      echo "  ✓ Claude calls Anthropic directly (quota from the status line recorder)"
+      return 0
+    fi
+    echo "  ⚠ Claude config dir ${CLAUDE_ROUTE_CONFIG_DIR:-<unresolved>}: not signed in; staying on the proxy" >&2
   fi
   _proxy_listener_up() {
     lsof -nP -iTCP:7846 -sTCP:LISTEN > /dev/null 2>&1

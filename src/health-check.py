@@ -5819,6 +5819,29 @@ def _statusline_quota_freshness(check: dict) -> dict:
     return check
 
 
+def check_claude_direct_routing(max_age_s: int = 24 * 3600) -> dict:
+    """Warn when a recent launch stayed on the proxy because its config dir is not signed in
+    on its own (state/claude-direct-routing.json, written by src/claude_signed_in.py)."""
+    check = {"name": "claude-direct-routing", "status": "ok"}
+    try:
+        data = json.loads(status_read_path("claude-direct-routing.json", WORKSPACE_DIR).read_text())
+    except (OSError, ValueError):
+        check["detail"] = "no direct-routing decision recorded"
+        return check
+    now = time.time()
+    stuck = sorted(d for d, v in (data.items() if isinstance(data, dict) else [])
+                   if isinstance(v, dict) and v.get("signed_in") is not True
+                   and isinstance(v.get("at"), (int, float)) and now - v["at"] <= max_age_s)
+    if stuck:
+        check["status"] = "warn"
+        check["detail"] = ("not signed in, so staying on the credential proxy: " + ", ".join(stuck)
+                           + " — sign that config dir in (`claude` then /login with CLAUDE_CONFIG_DIR set to it)"
+                           + " and relaunch to go direct")
+    else:
+        check["detail"] = "every recent launch's config dir is signed in"
+    return check
+
+
 def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
     """Warn when the credential proxy is up but producing no quota state.
 
@@ -13511,6 +13534,7 @@ def run_all_checks() -> list[dict]:
     # NOT carry_proxy_veto: this check's remedy relaunches the CORE, and a pin on
     # the proxy must not veto a different process's remedy.
     checks.append(check_quota_telemetry(proxy_live))
+    checks.append(check_claude_direct_routing())
     # ...and WHOSE account those numbers describe. The check above answers
     # "fresh?"; this one answers "ours?" — a fresh file for a foreign account
     # passes every branch above (observed 2026-08-03).

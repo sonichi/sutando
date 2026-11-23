@@ -61,6 +61,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`claude_hooks_settings.py`** — Sutando-owned hook entries in a project-level Claude Code settings.json: install one idempotently, prune dead copies of the same hook, and re-point hooks a moved install left on its old path.
 - **`claude_model_switch.py`** — What switching Claude Code's model by typing `/model` relies on: which model names may be typed, the two texts Claude Code answers with, and whether its input box is empty (read by the core's own parser, src/pane_composer.py).
 - **`claude_routing.sh`** — Whether Claude sessions are routed through the local credential proxy or call Anthropic directly.
+- **`claude_signed_in.py`** — Whether a Claude config dir is signed in on its own, for the launcher's direct-routing guard.
 - **`cli_wedge.py`** — CLI progress detector for the core's tmux pane — advisory only.
 - **`cli_wedge_patterns.py`** — The abnormal-banner table of the CLI progress detector: text on a pane that says the CLI is parked (a login prompt, a provider limit, a compaction, an error it sits on), as data.
 - **`client-frame-hub.ts`** — Client-frame hub: optional voice plugins register handlers; the host offers them every client JSON frame it does not own.

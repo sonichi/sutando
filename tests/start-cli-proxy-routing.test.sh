@@ -16,6 +16,16 @@ mkdir -p "$TMP/live-bin" "$TMP/dead-bin" "$TMP/exp-late-bin" "$TMP/exp-never-bin
 printf '#!/bin/sh\nexit 0\n' > "$TMP/live-bin/lsof"
 printf '#!/bin/sh\nexit 1\n' > "$TMP/dead-bin/lsof"
 printf '#!/bin/sh\nexit 1\n' > "$TMP/live-bin/launchctl"
+# `claude auth status --json` stand-ins: live-bin's config dir is signed in; the others are not.
+printf '#!/bin/sh\necho '"'"'{"loggedIn": true}'"'"'\n' > "$TMP/live-bin/claude"
+mkdir -p "$TMP/out-bin" "$TMP/broken-bin"
+printf '#!/bin/sh\nexit 0\n' > "$TMP/out-bin/lsof"
+printf '#!/bin/sh\nexit 1\n' > "$TMP/out-bin/launchctl"
+printf '#!/bin/sh\nexit 1\n' > "$TMP/out-bin/pgrep"
+printf '#!/bin/sh\necho '"'"'{"loggedIn": false}'"'"'\n' > "$TMP/out-bin/claude"
+cp "$TMP/out-bin/lsof" "$TMP/out-bin/launchctl" "$TMP/out-bin/pgrep" "$TMP/broken-bin/"
+printf '#!/bin/sh\necho "not json"\nexit 1\n' > "$TMP/broken-bin/claude"
+chmod +x "$TMP"/out-bin/* "$TMP"/broken-bin/*
 printf '#!/bin/sh\nexit 1\n' > "$TMP/dead-bin/launchctl"
 printf '#!/bin/sh\nexit 0\n' > "$TMP/exp-late-bin/launchctl"
 printf '#!/bin/sh\nexit 0\n' > "$TMP/exp-never-bin/launchctl"
@@ -176,6 +186,21 @@ echo "$out" | grep -qx "ANTHROPIC_BASE_URL=http://localhost:7846"
 check $? "first launch after opt-out: the proxy URL is set again"
 echo "$out" | grep -qx "QUOTA_STATUSLINE_ENABLED=false"
 check $? "first launch after opt-out: the session carries the switch as off"
+
+# 15. Direct only when the session's config dir is signed in on its own: a session the proxy
+#     authenticated may have no login of its own, and would start unauthenticated.
+out="$(run_direct "$TMP/out-bin")"
+echo "$out" | grep -qx "ANTHROPIC_BASE_URL=http://localhost:7846"
+check $? "recorder on, config dir not signed in: the launch stays on the proxy"
+grep -q "not signed in; staying on the proxy" "$TMP/stderr"
+check $? "recorder on, config dir not signed in: one line names it"
+out="$(run_direct "$TMP/broken-bin")"
+echo "$out" | grep -qx "ANTHROPIC_BASE_URL=http://localhost:7846"
+check $? "recorder on, sign-in status unreadable: the launch stays on the proxy"
+out="$(run_direct "$TMP/live-bin")"
+echo "$out" | grep -q "ANTHROPIC_BASE_URL"
+[ $? -ne 0 ]
+check $? "recorder on, config dir signed in: the launch goes direct"
 
 # 13. The session itself drops a proxy URL its tmux server environment carries.
 . "$REPO/src/claude_routing.sh"
