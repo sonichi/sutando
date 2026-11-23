@@ -4558,6 +4558,7 @@ def _diagnostic_health(health: "dict | None") -> "dict | None":
 # The core's recovery record (core_recovery.v1), read by the adapter's injected reader; a
 # standalone sparrow and a pool worker's lane have none, and their beats carry no such block.
 _CORE_RECOVERY_READER = globals().get("_SUTANDO_CORE_RECOVERY_READER")
+_CORE_RECOVERY_RECEIPTS_READER = globals().get("_SUTANDO_CORE_RECOVERY_RECEIPTS_READER")
 CORE_RECOVERY_CAPABILITY = "core_recovery.v1"
 CORE_RECOVERY_MAX_BYTES = 4096
 # A broker that refuses the beat with the block gets beats without it for this long.
@@ -4592,9 +4593,18 @@ def _core_recovery() -> "dict | None":
 
 def _with_recovery(health: "dict | None") -> "dict | None":
     rec = _core_recovery()
-    if rec is None:
+    try:
+        receipts = _CORE_RECOVERY_RECEIPTS_READER() if callable(_CORE_RECOVERY_RECEIPTS_READER) else []
+    except Exception:  # noqa: BLE001 -- receipts are advisory; the beat still leaves
+        receipts = []
+    if rec is None and not receipts:
         return health
-    return {**(health or {"alive": None, "motion": "unknown"}), "recovery": rec}
+    out = dict(health or {"alive": None, "motion": "unknown"})
+    if rec is not None:
+        out["recovery"] = rec
+    if receipts:
+        out["recovery_receipts"] = receipts
+    return out
 
 
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
@@ -4640,12 +4650,13 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         if health is not None:
             payload["health"] = health
             payload["capabilities"].append("worker_health.v1")
-            if "recovery" in health:
+            if "recovery" in health or "recovery_receipts" in health:
                 payload["capabilities"].append(CORE_RECOVERY_CAPABILITY)
         try:
             reply = _req("POST", "/v1/heartbeat", payload, timeout=10)
         except urllib.error.HTTPError as e:
-            if e.code not in (400, 422) or "recovery" not in (payload.get("health") or {}):
+            if e.code not in (400, 422) or not ({"recovery", "recovery_receipts"}
+                                                  & set((payload.get("health") or {}))):
                 raise
             _core_recovery_refused_until = time.time() + CORE_RECOVERY_REFUSED_BACKOFF_S
             _log(f"heartbeat refused with the recovery block: HTTP {e.code} — sending without it")

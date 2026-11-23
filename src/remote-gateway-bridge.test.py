@@ -938,7 +938,17 @@ def main() -> int:
     check((hbr.get("health") or {}).get("recovery") == _rec
           and "core_recovery.v1" in hbr.get("capabilities", []),
           "the adapter's reader puts state/core-recovery.json on the heartbeat as health.recovery")
+    from hitl import recovery as _recovery
+    _receipt = _recovery.receipt("hr_gateway", "inc_0123abcd", "restart_core",
+                                 "executing", None, time.time())
+    _recovery.write_receipt(rtc.WS, _receipt)
+    STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
+    rtc._post_heartbeat(set(), force=True)
+    hbr = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    check((hbr.get("health") or {}).get("recovery_receipts") == [_receipt],
+          "the adapter's receipt reader puts the latest HITL outcome beside health.recovery")
     (rtc.WS / "state" / "core-recovery.json").unlink()
+    (_recovery.receipts_dir(rtc.WS) / "hr_gateway.json").unlink()
     STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
     rtc._post_heartbeat(set(), force=True)
     hbr = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}

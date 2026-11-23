@@ -195,7 +195,8 @@ def _awaiting(workspace: Path, req) -> bool:
     """A recovery click accepted on `req` that has no receipt yet: only the executor closes it."""
     keyed = (req.subject or {}).get("option_for_action") or {}
     return (req.status == STATUS_IN_PROGRESS and recovery.is_recovery(req.chosen_action)
-            and req.chosen_action not in keyed and recovery.read_receipt(workspace, req.id) is None)
+            and req.chosen_action not in keyed
+            and not recovery.terminal_receipt(recovery.read_receipt(workspace, req.id)))
 
 
 def awaiting_executor(workspace: Path, req) -> bool:
@@ -762,7 +763,8 @@ def run_pending(manager, target: Target, *, runner: Optional[Runner] = None,
         if not isinstance(data, dict):
             _unlink(claimed)
             continue
-        if recovery.read_receipt(target.workspace, str(data.get("hitl_id") or "")) is not None:
+        if recovery.terminal_receipt(
+                recovery.read_receipt(target.workspace, str(data.get("hitl_id") or ""))):
             _unlink(claimed)
             continue
         req, refusal = _check(manager, data, target, clock())
@@ -781,6 +783,9 @@ def run_pending(manager, target: Target, *, runner: Optional[Runner] = None,
                                 close=gated == "stale", card=gated in (None, "stale")))
         else:
             verb, arg = recovery.parse(data["action_id"])
+            recovery.write_progress(target.workspace, recovery.receipt(
+                str(data.get("hitl_id") or ""), incident_for(req) if req is not None else "",
+                str(data.get("action_id") or ""), "executing", None, clock()))
             outcome, reason, line, fields = _execute(verb, arg, req, target, run, clock(), owed, key)
             done.append(_settle(manager, target, data, req, outcome, reason, line, fields, clock()))
             recovery_gate.finish(target.workspace, key, outcome, clock())
@@ -817,7 +822,7 @@ def _interrupted(manager, target: Target, claimed: Path, now: float) -> List[Dic
     out = []
     if isinstance(data, dict):
         hitl_id = str(data.get("hitl_id") or "")
-        if hitl_id and recovery.read_receipt(target.workspace, hitl_id) is None:
+        if hitl_id and not recovery.terminal_receipt(recovery.read_receipt(target.workspace, hitl_id)):
             why = "I was interrupted while doing this; check its state before tapping again."
             out.append(_settle(manager, target, data, manager.get(hitl_id), "failed", why, why, {}, now))
     _unlink(claimed)

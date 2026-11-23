@@ -43,8 +43,11 @@ _BARE = frozenset({RETRY_NOW, RESTART_CORE, ESCAPE_PROMPT, BUY_CREDITS, ADD_ACCO
 _ACCOUNT_ID = re.compile(r"^acct_[0-9a-f]{6}$")
 # Act on the core itself, so a worker seat's card never carries them.
 CORE_ONLY = frozenset({RESTART_CORE, SWITCH_RUNTIME})
-OUTCOMES = ("done", "refused", "stale", "failed")
+PROGRESS_OUTCOMES = ("accepted", "executing")
+TERMINAL_OUTCOMES = ("done", "refused", "stale", "failed")
+OUTCOMES = PROGRESS_OUTCOMES + TERMINAL_OUTCOMES
 RECEIPT_VERSION = 1
+UPSTREAM_RECEIPTS_MAX_BYTES = 4096
 AUDIT_FILE = "audit.jsonl"
 AUDIT_KEEP = 500
 #: Every audit writer (bridge and executor, src and vendored) holds this sidecar's flock.
@@ -149,7 +152,10 @@ def write_action(workspace: Path, reply: Any, sender: str, room: str,
             "at": int(time.time() if now is None else now)}
     if tapped_at is not None:
         body["tapped_at"] = int(tapped_at)
-    return _put(actions_dir(workspace) / f"{_safe(reply.hitl_id)}.json", body)
+    path = _put(actions_dir(workspace) / f"{_safe(reply.hitl_id)}.json", body)
+    write_progress(workspace, receipt(reply.hitl_id, "", reply.action_id,
+                                     "accepted", None, body["at"]))
+    return path
 
 
 def event_time(event: Dict[str, Any]) -> Optional[float]:
@@ -175,12 +181,81 @@ def write_receipt(workspace: Path, body: Dict[str, Any]) -> Path:
     return _put(receipts_dir(workspace) / f"{_safe(str(body['hitl_id']))}.json", body)
 
 
+def write_progress(workspace: Path, body: Dict[str, Any]) -> None:
+    """A progress receipt is advisory; losing it must not lose or delay the accepted action."""
+    try:
+        write_receipt(workspace, body)
+    except (OSError, ValueError, KeyError):
+        pass
+
+
 def read_receipt(workspace: Path, hitl_id: str) -> Optional[Dict[str, Any]]:
     try:
         data = json.loads((receipts_dir(workspace) / f"{_safe(hitl_id)}.json").read_text())
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def terminal_receipt(body: Optional[Dict[str, Any]]) -> bool:
+    return isinstance(body, dict) and body.get("outcome") in TERMINAL_OUTCOMES
+
+
+def _upstream_receipt(value: Any) -> Optional[Dict[str, Any]]:
+    """The receipt fields safe to leave the host; sender, room and unknown fields never ride."""
+    if not isinstance(value, dict) or value.get("v") != RECEIPT_VERSION:
+        return None
+    hitl_id, aid, outcome = value.get("hitl_id"), value.get("action_id"), value.get("outcome")
+    if not isinstance(hitl_id, str) or parse(aid) is None or outcome not in OUTCOMES:
+        return None
+    try:
+        _safe(hitl_id)
+    except ValueError:
+        return None
+    incident = value.get("incident")
+    if not isinstance(incident, str) or (incident and not re.fullmatch(r"inc_[0-9a-f]{8}", incident)):
+        return None
+    at = value.get("at")
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at) or at < 0:
+        return None
+    reason = value.get("reason")
+    if reason is not None and (not isinstance(reason, str) or not reason.isprintable() or len(reason) > 240):
+        reason = None
+    raw_recovery = value.get("recovery")
+    safe_recovery: Dict[str, Any] = {}
+    if isinstance(raw_recovery, dict):
+        for key in ("state", "runtime", "model", "path"):
+            field = raw_recovery.get(key)
+            if isinstance(field, str) and field.isprintable() and len(field) <= 64:
+                safe_recovery[key] = field
+    return {"v": RECEIPT_VERSION, "hitl_id": hitl_id, "incident": incident,
+            "action_id": aid, "outcome": outcome, "reason": reason, "at": int(at),
+            "recovery": safe_recovery}
+
+
+def latest_receipts(workspace: Path, limit: int = 16) -> list:
+    """Newest bounded receipt per card, already redacted for the authenticated heartbeat."""
+    out = []
+    directory = receipts_dir(workspace)
+    try:
+        paths = list(directory.glob("*.json"))
+    except OSError:
+        return []
+    for path in paths:
+        try:
+            clean = _upstream_receipt(json.loads(path.read_text()))
+        except (OSError, ValueError):
+            clean = None
+        if clean is not None:
+            out.append(clean)
+    out.sort(key=lambda row: (row["at"], row["hitl_id"]), reverse=True)
+    bounded = []
+    for row in out[:max(0, min(int(limit), 16))]:
+        candidate = [*bounded, row]
+        if len(json.dumps(candidate)) > UPSTREAM_RECEIPTS_MAX_BYTES:
+            break
+        bounded = candidate
+    return bounded
 
 
 def _audit_locked(path: Path):

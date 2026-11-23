@@ -101,6 +101,44 @@ class Files(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     rec.receipt("h", "i", "retry_now", "maybe", None, 1)
 
+    def test_receipts_report_accepted_and_executing_before_the_terminal_outcome(self):
+        for name, rec in COPIES:
+            with self.subTest(copy=name), tempfile.TemporaryDirectory() as tmp:
+                ws = Path(tmp)
+                reply = SimpleNamespace(hitl_id="hr_progress", expected_revision=3,
+                                        action_id="restart_core", guard="g")
+                rec.write_action(ws, reply, "@owner:s.space", "!dm:s.space", now=7)
+                accepted = rec.read_receipt(ws, reply.hitl_id)
+                self.assertEqual(accepted["outcome"], "accepted")
+                self.assertFalse(rec.terminal_receipt(accepted))
+                executing = rec.receipt(reply.hitl_id, "inc_0123abcd", reply.action_id,
+                                        "executing", None, 8)
+                rec.write_receipt(ws, executing)
+                self.assertEqual(rec.read_receipt(ws, reply.hitl_id), executing)
+                self.assertFalse(rec.terminal_receipt(executing))
+                done = rec.receipt(reply.hitl_id, "inc_0123abcd", reply.action_id,
+                                   "done", None, 9)
+                rec.write_receipt(ws, done)
+                self.assertTrue(rec.terminal_receipt(rec.read_receipt(ws, reply.hitl_id)))
+
+    def test_latest_receipts_are_bounded_redacted_and_newest_first(self):
+        for name, rec in COPIES:
+            with self.subTest(copy=name), tempfile.TemporaryDirectory() as tmp:
+                ws = Path(tmp)
+                first = rec.receipt("hr_first", "inc_0123abcd", "restart_core",
+                                    "done", None, 7, {"state": "running"})
+                second = {**rec.receipt("hr_second", "inc_89abcdef", "retry_now",
+                                        "failed", "owner-safe sentence", 9),
+                          "sender": "@owner:s.space", "room": "!private:s.space",
+                          "token": "secret"}
+                rec.write_receipt(ws, first)
+                rec.write_receipt(ws, second)
+                got = rec.latest_receipts(ws, limit=1)
+                self.assertEqual([r["hitl_id"] for r in got], ["hr_second"])
+                self.assertEqual(set(got[0]), {"v", "hitl_id", "incident", "action_id",
+                                               "outcome", "reason", "at", "recovery"})
+                self.assertNotIn("secret", json.dumps(got))
+
     def test_an_id_is_one_path_component(self):
         for name, rec in COPIES:
             with self.subTest(copy=name), tempfile.TemporaryDirectory() as tmp:
