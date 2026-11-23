@@ -28,6 +28,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -39,6 +40,7 @@ cm = importlib.util.module_from_spec(_spec)
 assert _spec and _spec.loader
 _spec.loader.exec_module(cm)
 ltp = cm.wait_store.ltp
+tmux_pane_keys = cm.tmux_pane_keys
 ac = cm.ac
 
 ROOM = "!dm:example.org"
@@ -55,37 +57,50 @@ CONNECTED = "luma:\n  Scope: User config\n  Status: ✔ Connected\n  Type: http\
 
 
 class FakeHost:
-    """`tmux` on the private server and `claude mcp get`, in memory. Any other call fails the test."""
+    """`tmux` on each login's own socket, the guarded key sender and `claude mcp get`, in memory.
+    Any other call, a bare send-keys included, fails the test."""
 
     def __init__(self, status=NEEDS_AUTH, prints=f"Open this URL to sign in:\n{LINK}\nPaste the redirect URL: "):
         self.calls: list[list] = []
         self.status = status
         self.prints = prints
         self.panes: dict[str, str] = {}
-        self.typed: list[tuple[str, str]] = []
+        self.sockets: dict[str, str] = {}
+        self.sends: list[tuple[str, str, tuple]] = []
+        self.send_code = 0
 
     def __call__(self, argv, timeout):
         argv = list(argv)
         self.calls.append(argv)
         if argv[:3] == ["claude", "mcp", "get"]:
             return (0, self.status) if self.status else (1, f'No MCP server found with name: "{argv[3]}"')
-        assert argv[:3] == ["tmux", "-L", cm.TMUX_SERVER], f"not the private tmux server: {argv[:4]}"
-        verb, rest = argv[3], argv[4:]
+        if argv[:2] == ["bash", str(tmux_pane_keys.SCRIPT)]:
+            socket, target = argv[argv.index("-S") + 1], argv[argv.index("-t") + 1]
+            session = target.lstrip("=").rstrip(":")
+            assert self.sockets.get(session) == socket, "the send goes to the login's own tmux server"
+            if self.send_code == 0:
+                self.sends.append((socket, session, tuple(argv[argv.index("--") + 1:])))
+            return self.send_code, "tmux-pane-keys: output the caller must not repeat"
+        assert argv[:2] == ["tmux", "-S"], f"not a tmux call on an explicit socket: {argv[:3]}"
+        socket, verb, rest = argv[2], argv[3], argv[4:]
+        assert cm.SOCKET_DIR_PREFIX in socket, f"not a login's own socket: {socket}"
         target = rest[rest.index("-t") + 1].lstrip("=").rstrip(":") if "-t" in rest else ""
         if verb == "new-session":
-            self.panes[rest[rest.index("-s") + 1]] = self.prints
+            session = rest[rest.index("-s") + 1]
+            self.panes[session], self.sockets[session] = self.prints, socket
             return 0, ""
+        if verb == "kill-server":
+            gone = [n for n, sock in self.sockets.items() if sock == socket]
+            for name in gone:
+                self.panes.pop(name, None)
+                self.sockets.pop(name)
+            return (0 if gone else 1), ""
+        if target and target in self.panes and self.sockets[target] != socket:
+            return 1, "no server running"
         if verb == "has-session":
             return (0 if target in self.panes else 1), ""
         if verb == "capture-pane":
             return (0, self.panes[target]) if target in self.panes else (1, "can't find session")
-        if verb == "kill-session":
-            return (0 if self.panes.pop(target, None) is not None else 1), ""
-        if verb == "send-keys":
-            if target not in self.panes:
-                return 1, ""
-            self.typed.append((target, rest[-1]))
-            return 0, ""
         raise AssertionError(f"unexpected tmux call: {argv}")
 
     def of(self, *head):
@@ -128,6 +143,11 @@ class Base(unittest.TestCase):
         self.clock = Clock()
         self.spawned: list[str] = []
         self.task()
+        sockets = mock.patch.object(cm, "socket_path", lambda wait_id: str(
+            self.ws.parent / f"{self.ws.name}-sock" / f"{cm.SOCKET_DIR_PREFIX}{wait_id}" / "s"))
+        sockets.start()
+        self.addCleanup(sockets.stop)
+        self.addCleanup(lambda: shutil.rmtree(self.ws.parent / f"{self.ws.name}-sock", ignore_errors=True))
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -167,6 +187,10 @@ class StartTests(Base):
         self.assertEqual(code, 0)
         [new] = self.host.tmux("new-session")
         self.assertEqual(new[-5:], ["claude", "mcp", "login", "luma", "--no-browser"])
+        marker = cm.store(self.ws).read_marker(out["wait_id"])
+        self.assertEqual(new[:3], ["tmux", "-S", marker["socket"]])
+        self.assertEqual(Path(marker["socket"]).parent.name, cm.SOCKET_DIR_PREFIX + out["wait_id"])
+        self.assertEqual(Path(marker["socket"]).parent.stat().st_mode & 0o777, 0o700)
         cwd = Path(new[new.index("-c") + 1]).resolve()
         self.assertNotIn(ROOT.resolve(), [cwd, *cwd.parents], "the login starts outside the checkout")
         card = out["message"]["extra_content"][ac.CARD_KEY]
@@ -236,7 +260,7 @@ class StartTests(Base):
     def test_a_bad_name_never_reaches_a_command(self):
         for name in ("lu ma", "-x", "a;b", "a/b", ""):
             with self.subTest(name):
-                code, out = self.cli(["start", f"--task=task-abc", "--", name])
+                code, out = self.cli(["start", "--task=task-abc", "--", name])
                 self.assertEqual((code, out["error"]), (2, "invalid_arguments"))
         self.assertEqual(self.host.calls, [])
 
@@ -244,7 +268,8 @@ class StartTests(Base):
         self.host.prints = "This server does not support OAuth.\n"
         code, out = self.start()
         self.assertEqual((code, out["error"]), (2, "no_link"))
-        self.assertEqual(len(self.host.tmux("kill-session")), 1)
+        [killed] = self.host.tmux("kill-server")
+        self.assertFalse(Path(killed[2]).parent.exists(), "the login's socket folder is removed")
         self.assertEqual(self.host.panes, {})
         self.assertEqual(cm.store(self.ws).list_markers(), [])
         self.assertEqual(self.spawned, [])
@@ -314,6 +339,7 @@ class WaiterTests(Base):
         self.assertIn(f"connect_mcp.py card {wait_id}", parsed.body)
         self.assertNotIn("auth.example.com", text)
         self.assertNotIn(session, self.host.panes)
+        self.assertFalse(Path(cm.socket_path(wait_id)).parent.exists())
         self.assertEqual(self.waiter(wait_id), "claimed_elsewhere")
         self.assertEqual(len(self.new_tasks()), 1)
 
@@ -401,12 +427,46 @@ class PasteTests(Base):
     def test_the_callback_is_typed_into_the_login_and_kept_nowhere(self):
         code, out = self.paste(CALLBACK + "\n")
         self.assertEqual((code, out["status"]), (0, "sent"))
-        self.assertEqual(self.host.typed, [(self.session, CALLBACK), (self.session, "Enter")])
-        [typed, _enter] = self.host.tmux("send-keys")
-        self.assertEqual(typed[-2:], ["-l", CALLBACK])
+        socket = cm.store(self.ws).read_marker(self.wait_id)["socket"]
+        self.assertEqual(self.host.sends, [(socket, self.session, (CALLBACK, "Enter"))])
+        [guarded] = self.host.of("bash")
+        self.assertEqual(guarded, tmux_pane_keys.argv(socket, f"={self.session}:", CALLBACK, "Enter"))
         self.assertNotIn(CODE, self.stdout)
         self.assertNotIn(CODE, self.everything_written())
         self.assertNotIn(STATE, self.everything_written())
+
+    def test_a_send_that_proved_nothing_was_typed_is_refused_not_sent(self):
+        for code, reason in ((1, "not_typed"), (124, "not_typed"), (tmux_pane_keys.BUSY, "busy")):
+            with self.subTest(code):
+                self.host.send_code = code
+                rc, out = self.paste(CALLBACK)
+                self.assertEqual((rc, out["status"], out["reason"]), (1, "refused", reason))
+                self.assertNotIn("tmux-pane-keys", self.stdout)
+
+    def test_an_uncertain_send_is_reported_as_uncertain_and_not_sent_again(self):
+        for code in (tmux_pane_keys.UNCERTAIN, 127, 2):
+            with self.subTest(code):
+                self.host.calls.clear()
+                self.host.send_code = code
+                rc, out = self.paste(CALLBACK)
+                self.assertEqual((rc, out["status"], out["reason"]), (1, "uncertain", "uncertain"))
+                self.assertEqual(len(self.host.of("bash")), 1, "one attempt, never a retry")
+                self.assertNotIn(CODE, self.stdout)
+        self.assertIsNotNone(cm.store(self.ws).read_marker(self.wait_id), "the wait stays for the waiter")
+
+    def test_an_unfinished_send_leaves_the_address_in_no_file(self):
+        socket = cm.store(self.ws).read_marker(self.wait_id)["socket"]
+        work = self.ws.parent / f"{self.ws.name}-sock" / "tmux-pane-keys.abc"
+        guard = tmux_pane_keys.guard_path(socket)
+        for folder in (work, guard):
+            folder.mkdir(parents=True)
+        (work / "cmd").write_text(f"send-keys -t 'x' '{CALLBACK}' 'Enter'\n")
+        (guard / "pending.json").write_text(json.dumps({"ticket": str(work / "ticket")}))
+        self.host.send_code = tmux_pane_keys.UNCERTAIN
+        self.paste(CALLBACK)
+        self.assertFalse((work / "cmd").exists())
+        left = "".join(p.read_text(errors="replace") for p in work.parent.rglob("*") if p.is_file())
+        self.assertNotIn(CODE, left + self.everything_written())
 
     def test_an_address_that_is_not_this_waits_callback_is_not_typed(self):
         cases = {
@@ -421,6 +481,7 @@ class PasteTests(Base):
             "no code": f"http://localhost:{PORT}/callback?state={STATE}",
             "two lines": CALLBACK + "\nrm -rf x",
             "a space": CALLBACK + " ; ls",
+            "a trailing semicolon": CALLBACK + ";",
             "a control character": CALLBACK + "\x1b[A",
             "not an address": "done",
             "empty": "",
@@ -431,8 +492,8 @@ class PasteTests(Base):
                 code, out = self.paste(text)
                 self.assertEqual((code, out["status"]), (1, "refused"))
                 self.assertNotIn(CODE, self.stdout)
-        self.assertEqual(self.host.tmux("send-keys"), [])
-        self.assertEqual(self.host.typed, [])
+        self.assertEqual(self.host.of("bash"), [])
+        self.assertEqual(self.host.sends, [])
 
     def test_the_loopback_address_is_the_same_listener(self):
         code, out = self.paste(CALLBACK.replace("localhost", "127.0.0.1"))
@@ -452,7 +513,7 @@ class PasteTests(Base):
         self.task("task-other-dm", channel_id="!other:example.org")
         code, out = self.paste(CALLBACK, task="task-other-dm")
         self.assertEqual((code, out["reason"]), (1, "no_pending_wait"))
-        self.assertEqual(self.host.typed, [])
+        self.assertEqual(self.host.sends, [])
         self.assertNotIn(CODE, self.everything_written())
 
     def test_a_wait_that_is_not_pending_takes_no_paste(self):
@@ -461,25 +522,47 @@ class PasteTests(Base):
         cm.store(self.ws).claim(self.wait_id, "connected", NOW)
         code, out = self.paste(CALLBACK)
         self.assertEqual((code, out["reason"]), (1, "no_pending_wait"))
-        self.assertEqual(self.host.typed, [])
+        self.assertEqual(self.host.sends, [])
 
     def test_a_paste_after_the_links_time_is_refused(self):
         self.clock.t += cm.LOGIN_S
         code, out = self.paste(CALLBACK)
         self.assertEqual((code, out["reason"]), (1, "expired"))
-        self.assertEqual(self.host.typed, [])
+        self.assertEqual(self.host.sends, [])
 
     def test_a_login_that_is_gone_takes_no_paste(self):
         self.host.panes.clear()
         code, out = self.paste(CALLBACK)
         self.assertEqual((code, out["reason"]), (1, "login_gone"))
-        self.assertEqual(self.host.tmux("send-keys"), [])
+        self.assertEqual(self.host.of("bash"), [])
 
     def test_the_address_is_never_an_argument(self):
         err = io.StringIO()
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
             self.cli(["paste", self.wait_id, "--task", "task-paste", CALLBACK])
-        self.assertEqual(self.host.typed, [])
+        self.assertEqual(self.host.sends, [])
+
+
+class SocketPathTests(unittest.TestCase):
+    def test_a_socket_sits_in_its_waits_own_folder_under_the_temporary_directory(self):
+        with mock.patch.object(cm.tempfile, "gettempdir", return_value="/short/tmp"):
+            path = cm.socket_path("1789000000000-0000abcd")
+        self.assertEqual(path, "/short/tmp/sutando-mcp-1789000000000-0000abcd/s")
+        self.assertTrue(cm.own_socket(path, "1789000000000-0000abcd"))
+        self.assertFalse(cm.own_socket(path, "1789000000001-0000abcd"))
+
+    def test_a_temporary_directory_too_long_for_a_socket_is_not_used(self):
+        with mock.patch.object(cm.tempfile, "gettempdir", return_value="/" + "x" * 90):
+            path = cm.socket_path("1789000000000-0000abcd")
+        self.assertLessEqual(len(path), cm.MAX_SOCKET_BYTES)
+        self.assertTrue(cm.own_socket(path, "1789000000000-0000abcd"))
+
+    def test_a_wait_naming_another_folder_as_its_socket_is_not_valid(self):
+        marker = {"wait_id": "1789000000000-0000abcd", "name": "luma", "room": ROOM, "reply_to": "$e",
+                  "task": "task-abc", "owner": OWNER, "session": "mcp-x", "port": PORT, "state_sha256": "ab",
+                  "attempt": 1, "deadline": NOW, "socket": "/short/tmp/sutando-mcp-1789000000000-0000abcd/s"}
+        self.assertTrue(cm._valid_marker(marker, marker["wait_id"]))
+        self.assertFalse(cm._valid_marker({**marker, "socket": "/some/other/tmux.sock"}, marker["wait_id"]))
 
 
 class CardAndRearmTests(Base):

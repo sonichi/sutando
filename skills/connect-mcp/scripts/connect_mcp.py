@@ -34,6 +34,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,8 @@ SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 import agent_card as ac  # noqa: E402
+import tmux_pane_keys  # noqa: E402
+
 import wait_store  # noqa: E402
 
 from task_body_guard import confine_user_content, header_safe_value  # noqa: E402
@@ -74,11 +77,14 @@ URL_RE = re.compile(r"https://[^\s\"'<>]+")
 STATUS_RE = re.compile(r"^\s*Status:\s*(.+?)\s*$", re.M)
 ORIGIN_SOURCE = "ag2space"
 RESUME_SOURCE = "connector-resume"
-# A private tmux server: the login never shares a server with the core's own session.
-TMUX_SERVER = "sutando-connect-mcp"
+# Each login gets a tmux server of its own, so it never shares one with the core's session.
+SOCKET_DIR_PREFIX = "sutando-mcp-"
+MAX_SOCKET_BYTES = 100
 CALLBACK_HOSTS = ("localhost", "127.0.0.1")
 PHONE_LINE = "On a phone the last page will not load. Send me its address here."
 WAITER_OUTCOMES = ("connected", "timeout")
+# The guarded send's exits that prove nothing was typed; any other failure may have been typed.
+SEND_REFUSALS = {1: "not_typed", 124: "not_typed", tmux_pane_keys.BUSY: "busy"}
 
 # run(argv, timeout) -> (exit code, stdout + stderr). Every tmux and claude call goes through one.
 Run = Callable[[list, float], "tuple[int, str]"]
@@ -109,7 +115,8 @@ def _valid_marker(data: Any, wait_id: str) -> bool:
         isinstance(data, dict)
         and data.get("wait_id") == wait_id
         and all(isinstance(data.get(k), str) and data[k]
-                for k in ("name", "room", "reply_to", "task", "owner", "session", "state_sha256"))
+                for k in ("name", "room", "reply_to", "task", "owner", "session", "socket", "state_sha256"))
+        and own_socket(data["socket"], wait_id)
         and bool(NAME_RE.match(data["name"]))
         and isinstance(data.get("port"), int)
         and isinstance(data.get("attempt"), int)
@@ -154,7 +161,7 @@ def dm_task(ws: Path, task: str) -> dict:
     if not TASK_RE.match(task or ""):
         raise Setup("invalid_arguments", "not a task id")
     try:
-        owner, text = wait_store.owner_task(ws, task, ORIGIN_SOURCE, "s.space")
+        owner, text = wait_store.owner_task(ws, task, ORIGIN_SOURCE)
     except wait_store.NotOwnerTask as exc:
         raise Setup("not_owner_dm", f"{task} {exc}: a sign-in card goes only to the owner, in their own DM.") from None
     if set(wait_store.header_values(text, "channel_kind")) != {"dm"}:
@@ -171,8 +178,20 @@ def dm_task(ws: Path, task: str) -> dict:
 # --------------------------------------------------------------------------- claude and tmux
 
 
-def tmux(*args: str) -> list:
-    return ["tmux", "-L", TMUX_SERVER, *args]
+def socket_path(wait_id: str) -> str:
+    """This wait's tmux socket: a short path under the temporary directory, in a folder of its own."""
+    base = tempfile.gettempdir()
+    path = os.path.join(base, SOCKET_DIR_PREFIX + wait_id, "s")
+    # A unix socket path has a small fixed size; a long temporary directory would not fit.
+    return path if len(os.fsencode(path)) <= MAX_SOCKET_BYTES else os.path.join("/tmp", SOCKET_DIR_PREFIX + wait_id, "s")
+
+
+def own_socket(socket: str, wait_id: str) -> bool:
+    return Path(socket).name == "s" and Path(socket).parent.name == SOCKET_DIR_PREFIX + wait_id
+
+
+def tmux(socket: str, *args: str) -> list:
+    return ["tmux", "-S", socket, *args]
 
 
 def session_name(wait_id: str) -> str:
@@ -192,25 +211,29 @@ def is_connected(status: str | None) -> bool:
     return bool(status) and "connected" in status.lower() and "not connected" not in status.lower()
 
 
-def session_alive(run: Run, session: str) -> bool:
-    return run(tmux("has-session", "-t", f"={session}"), 10.0)[0] == 0
+def session_alive(run: Run, marker: dict) -> bool:
+    return run(tmux(marker["socket"], "has-session", "-t", f"={marker['session']}"), 10.0)[0] == 0
 
 
-def kill_session(run: Run, session: str) -> None:
-    run(tmux("kill-session", "-t", f"={session}"), 10.0)
+def end_login(run: Run, marker: dict) -> None:
+    """Stop the login's tmux server and remove its socket folder, the send guard's files with it."""
+    run(tmux(marker["socket"], "kill-server"), 10.0)
+    if own_socket(marker["socket"], marker["wait_id"]):
+        shutil.rmtree(Path(marker["socket"]).parent, ignore_errors=True)
 
 
-def pane_text(run: Run, session: str) -> str:
-    code, out = run(tmux("capture-pane", "-p", "-J", "-S", "-200", "-t", f"={session}:"), 10.0)
+def pane_text(run: Run, marker: dict) -> str:
+    code, out = run(tmux(marker["socket"], "capture-pane", "-p", "-J", "-S", "-200", "-t",
+                         f"={marker['session']}:"), 10.0)
     return out if code == 0 else ""
 
 
-def login_command(session: str, name: str) -> list:
+def login_command(marker: dict) -> list:
     # Started outside the checkout, so the project's own session hooks do not fire for the login.
     config = os.environ.get("CLAUDE_CONFIG_DIR")
-    return tmux("new-session", "-d", "-s", session, "-x", "250", "-y", "50", "-c", tempfile.gettempdir(),
-                *(["-e", f"CLAUDE_CONFIG_DIR={config}"] if config else []),
-                "claude", "mcp", "login", name, "--no-browser")
+    return tmux(marker["socket"], "new-session", "-d", "-s", marker["session"], "-x", "250", "-y", "50",
+                "-c", tempfile.gettempdir(), *(["-e", f"CLAUDE_CONFIG_DIR={config}"] if config else []),
+                "claude", "mcp", "login", marker["name"], "--no-browser")
 
 
 def callback_of(link: str) -> tuple[int, str] | None:
@@ -240,12 +263,12 @@ def state_hash(state: str) -> str:
     return hashlib.sha256(state.encode("utf-8")).hexdigest()
 
 
-def read_link(run: Run, session: str, now: Callable[[], float], sleep: Callable[[float], None]) -> str | None:
+def read_link(run: Run, marker: dict, now: Callable[[], float], sleep: Callable[[float], None]) -> str | None:
     """The authorization link the login printed, waiting up to LINK_WAIT_S for it."""
     end = now() + LINK_WAIT_S
     while True:
-        link = find_link(pane_text(run, session))
-        if link or now() >= end or not session_alive(run, session):
+        link = find_link(pane_text(run, marker))
+        if link or now() >= end or not session_alive(run, marker):
             return link
         sleep(LINK_POLL_S)
 
@@ -343,12 +366,11 @@ def run_waiter(ws: Path, wait_id: str, run: Run, now: Callable[[], float] = time
                 return "claimed_elsewhere"
             t = now()
             deadline = float(marker["deadline"])
-            session = marker["session"]
             if t >= deadline + STALE_GRACE_S:
-                kill_session(run, session)
+                end_login(run, marker)
                 return "expired" if waits.claim(wait_id, "expired", t) is not None else "claimed_elsewhere"
             # The pane is the cheap probe; `claude mcp get` runs only when the login looks finished.
-            finished = "Authenticated" in pane_text(run, session) or not session_alive(run, session)
+            finished = "Authenticated" in pane_text(run, marker) or not session_alive(run, marker)
             outcome = None
             if (finished or t >= deadline) and is_connected(server_status(run, marker["name"])):
                 outcome = "connected"
@@ -358,7 +380,7 @@ def run_waiter(ws: Path, wait_id: str, run: Run, now: Callable[[], float] = time
                 won = waits.claim(wait_id, outcome, now())
                 if won is None:
                     return "claimed_elsewhere"
-                kill_session(run, session)
+                end_login(run, marker)
                 if won.get("invalid"):
                     return "invalid"
                 try:
@@ -417,7 +439,7 @@ def cmd_start(ws: Path, args: argparse.Namespace, *, run: Run, spawn: Callable[[
     for marker in waits.list_markers():
         if marker["name"] != name:
             continue
-        link = find_link(pane_text(run, marker["session"])) if now() < float(marker["deadline"]) else None
+        link = find_link(pane_text(run, marker)) if now() < float(marker["deadline"]) else None
         if link and marker["room"] == origin["room"] and state_hash(callback_of(link)[1]) == marker["state_sha256"]:
             pid = None if waits.waiter_alive(marker["wait_id"]) else _try_spawn(spawn, ws, marker["wait_id"])
             emit({**summary(marker), "reused": True, "waiter_pid": pid, "card_id": card_id(name),
@@ -425,7 +447,7 @@ def cmd_start(ws: Path, args: argparse.Namespace, *, run: Run, spawn: Callable[[
             return EXIT_OK
         # One login per server: an older one that cannot be reused is ended before a new link exists.
         if waits.claim(marker["wait_id"], "superseded", now()) is not None:
-            kill_session(run, marker["session"])
+            end_login(run, marker)
 
     status = server_status(run, name)
     if status is None:
@@ -436,25 +458,28 @@ def cmd_start(ws: Path, args: argparse.Namespace, *, run: Run, spawn: Callable[[
 
     t = now()
     wait_id = wait_store.new_wait_id(t)
-    session = session_name(wait_id)
-    code, _out = run(login_command(session, name), 30.0)
+    login = {"wait_id": wait_id, "name": name, "session": session_name(wait_id), "socket": socket_path(wait_id)}
+    try:
+        os.makedirs(Path(login["socket"]).parent, mode=0o700)
+    except OSError:
+        raise Setup("login_not_started", f"The {name} sign-in could not be started on this machine.") from None
+    code, _out = run(login_command(login), 30.0)
     if code != 0:
+        end_login(run, login)
         raise Setup("login_not_started", f"The {name} sign-in could not be started on this machine.")
-    link = read_link(run, session, now, sleep)
+    link = read_link(run, login, now, sleep)
     if not link:
-        kill_session(run, session)
+        end_login(run, login)
         raise Setup("no_link", f"The {name} sign-in printed no link: this server may not use OAuth sign-in.")
     port, state = callback_of(link)
     earlier = [r for r in recent_claims(ws, t)
                if r["name"] == name and r["room"] == origin["room"] and r.get("claimed_by") == "timeout"]
     marker = {
         "version": 1,
-        "wait_id": wait_id,
-        "name": name,
+        **login,
         **origin,
         "task": args.task,
         "request": request,
-        "session": session,
         "port": port,
         "state_sha256": state_hash(state),
         "attempt": min(MAX_ATTEMPTS, 1 + max((r.get("attempt", 1) for r in earlier), default=0)),
@@ -466,7 +491,7 @@ def cmd_start(ws: Path, args: argparse.Namespace, *, run: Run, spawn: Callable[[
         message = signin_message(marker, link)
         path = waits.write_marker(marker)
     except (OSError, ac.CardError):
-        kill_session(run, session)
+        end_login(run, login)
         raise
     pid = _try_spawn(spawn, ws, wait_id)
     emit({**summary(marker), "marker": str(path), "reused": False, "waiter_pid": pid, "card_id": card_id(name),
@@ -474,9 +499,19 @@ def cmd_start(ws: Path, args: argparse.Namespace, *, run: Run, spawn: Callable[[
     return EXIT_OK
 
 
+def scrub_send(socket: str) -> None:
+    """Remove the typed command that a guarded send which did not finish left in its work folder."""
+    try:
+        ticket = Path(json.loads((tmux_pane_keys.guard_path(socket) / "pending.json").read_text())["ticket"])
+        if ticket.name == "ticket" and ticket.parent.name.startswith("tmux-pane-keys."):
+            (ticket.parent / "cmd").unlink(missing_ok=True)
+    except (OSError, ValueError, KeyError, TypeError):
+        return
+
+
 def callback_problem(pasted: str, marker: dict) -> str | None:
     """Why `pasted` is not the address this wait's sign-in ends on, or None. Never echoes the address."""
-    if not pasted or len(pasted) > MAX_PASTE_CHARS or any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F
+    if not pasted or len(pasted) > MAX_PASTE_CHARS or pasted.endswith(";") or any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F
                                                           for c in pasted):
         return "not_one_address"
     try:
@@ -516,14 +551,17 @@ def cmd_paste(ws: Path, args: argparse.Namespace, *, run: Run, now: Callable[[],
     if problem:
         emit({"status": "refused", "reason": problem, "wait_id": marker["wait_id"]})
         return EXIT_NO
-    session = marker["session"]
-    if not session_alive(run, session):
+    if not session_alive(run, marker):
         emit({"status": "refused", "reason": "login_gone", "wait_id": marker["wait_id"]})
         return EXIT_NO
-    typed = run(tmux("send-keys", "-t", f"={session}:", "-l", pasted), 10.0)[0]
-    entered = run(tmux("send-keys", "-t", f"={session}:", "Enter"), 10.0)[0] if typed == 0 else 1
-    if typed != 0 or entered != 0:
-        emit({"status": "refused", "reason": "not_typed", "wait_id": marker["wait_id"]})
+    # One guarded send types the address and enters it, so there is no half-typed state to retry over.
+    code = run(tmux_pane_keys.argv(marker["socket"], f"={marker['session']}:", pasted, "Enter"),
+               float(tmux_pane_keys.TIMEOUT_S))[0]
+    if code != 0:
+        scrub_send(marker["socket"])
+        reason = SEND_REFUSALS.get(code, "uncertain")
+        emit({"status": "uncertain" if reason == "uncertain" else "refused", "reason": reason,
+              "wait_id": marker["wait_id"]})
         return EXIT_NO
     emit({"status": "sent", "wait_id": marker["wait_id"], "name": marker["name"]})
     return EXIT_OK

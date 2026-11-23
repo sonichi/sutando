@@ -233,6 +233,7 @@ class Delegation(Base):
     def mcp_marker(self):
         m = {"version": 1, "wait_id": WAIT_ID, "name": "luma", "room": ROOM, "reply_to": "$e", "request": "r",
              "task": "task-abc", "owner": OWNER, "session": "mcp-x", "port": 5000, "state_sha256": "ab",
+             "socket": str(self.ws / f"sutando-mcp-{WAIT_ID}" / "s"),
              "attempt": 1, "deadline": NOW + 60}
         connect_mcp.store(self.ws).write_marker(m)
         return m

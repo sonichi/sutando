@@ -66,6 +66,11 @@ in the Tools block. Never put the address on a command line, in a result, a note
 log or any other message: it carries a single-use sign-in code.
 
 - **Exit 0, `sent`:** write the result `[no-send]`. The waiter sees the sign-in finish and resumes.
+- **Exit 1, status `uncertain`:** the address may or may not have reached the sign-in. Do not run
+  `paste` again and do not ask the owner to send it again: write the result `[no-send]`. The waiter
+  reports the outcome either way (signed in, or the link expired).
+- **Exit 1, `busy` or `not_typed`:** nothing was typed. Run the same `paste` once more; if it is
+  refused again, treat it as an expired link (Step 4).
 - **Exit 1, `expired` or `login_gone`:** the link's time is up. Offer a new one (Step 4).
 - **Exit 1, `no_pending_wait`:** no sign-in is waiting in this DM. Say so in one line.
 - **Exit 1, any other reason** (`not_this_sign_in`, `not_this_machine`, `no_code`, `not_one_address`,
@@ -96,6 +101,11 @@ and you send none until the owner asks to sign in again.
   (`agent_card.EDIT_CARRIES_CARD` is false), so "Connected" and "Expired" are new cards posted under
   the same card id as the sign-in card. The first card stays in the DM with its expiry time.
 - **Five minutes.** The owner who taps an hour later gets an expired link; `start` again.
+- **Who can see a pasted address on the Mac.** `paste` reads it from STDIN, but it reaches the login
+  through the engine's one guarded key sender (`src/tmux-pane-keys.sh`), which takes keys as
+  arguments and writes the tmux command it runs to a private temporary file for the length of the
+  send (`paste` removes that file when a send does not finish cleanly). For those few seconds the
+  address is visible to processes of the same user on that Mac.
 - **A pasted address passes through the owner's DM.** It is single-use and bound to this sign-in, and
   this skill keeps it nowhere, but the DM message itself remains. That is why it is DM only.
 - **The sign-in is shared.** The core and its workers use one Claude Code configuration, so a server
