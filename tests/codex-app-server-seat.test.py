@@ -77,6 +77,22 @@ def write_result(prompt):
 
 
 rec({"argv": sys.argv[1:], "pid": os.getpid(), "cwd": os.getcwd()})
+# Like Codex, the login is read once, at start; a later sign-in revokes it (D/revoked) and writes a new one.
+try:
+    TOKEN = open(os.path.join(os.environ["CODEX_HOME"], "auth.json")).read().strip()
+except (KeyError, OSError):
+    TOKEN = ""
+
+
+def revoked():
+    try:
+        return TOKEN in open(os.path.join(D, "revoked")).read().split()
+    except OSError:
+        return False
+
+
+UNAUTH = {"message": "Your access token could not be refreshed because your refresh token was revoked. "
+                     "Please log out and sign in again.", "codexErrorInfo": "unauthorized"}
 if os.path.exists(os.path.join(D, "exit-at-start")):
     sys.exit(3)
 sys.stdout.write("this line is not JSON\n[1]\n")
@@ -130,7 +146,7 @@ for line in sys.stdin:
         if refused and p.get("model") == refused:
             out({"id": rid, "error": {"code": -32602, "message": "model %s is not supported" % refused}})
             continue
-        step = plan()
+        step = "unauth" if TOKEN and revoked() else plan()
         if step == "refuse":
             out({"id": rid, "error": {"code": -32000, "message": "thread is busy"}})
             continue
@@ -157,6 +173,9 @@ for line in sys.stdin:
         elif step == "fail":
             out({"method": "error", "params": {"threadId": thread, "error": {"message": "usage limit reached"}}})
             finish("failed", {"message": "usage limit reached"})
+        elif step == "unauth":
+            out({"method": "error", "params": {"threadId": thread, "error": UNAUTH}})
+            finish("failed", UNAUTH)
         elif step == "die":
             os._exit(7)
         elif step == "die_after_result":
@@ -227,7 +246,10 @@ class SeatCase(unittest.TestCase):
         self.stage_log = root / "stage.log"
         self.hook = root / "stage-hook.py"
         self.hook.write_text(STAGE_HOOK, encoding="utf-8")
-        env = mock.patch.dict(os.environ, {"FAKE_DIR": str(self.fake_dir), "STAGE_LOG": str(self.stage_log)})
+        self.codex_home = root / "codex-home"
+        self.codex_home.mkdir()
+        env = mock.patch.dict(os.environ, {"FAKE_DIR": str(self.fake_dir), "STAGE_LOG": str(self.stage_log),
+                                           "CODEX_HOME": str(self.codex_home)})
         env.start()
         self.addCleanup(env.stop)
         for name in ("SUTANDO_POOL_DELIVERY_SCRIPT", "FAKE_PROBE", "STAGE_REAL"):
@@ -886,6 +908,118 @@ class Crash(SeatCase):
         s.rpc.p.wait()
         self.assertEqual(s.step(), "done")
         self.assertEqual(len(self.sent("thread/resume")), 1)
+
+
+class AccountSwitch(SeatCase):
+    """The child reads its login once, at start; a sign-in or account switch since revoked that login's refresh
+    token (VM 11-22: the first turn after a switch failed with "refresh token was revoked"). A changed login
+    file restarts the child before the next turn; a turn refused as unauthorized restarts it and is tried once
+    more; refused again, the core seat shows the owner the account card."""
+
+    def make(self, decl=None, **kw):
+        s = super().make(decl, **kw)
+        self.cards = self.fake_dir / "cards.log"
+        script = self.fake_dir / "card.py"
+        script.write_text("import sys\nopen(sys.argv[1], 'a').write(' '.join(sys.argv[2:]) + '\\n')\n")
+        s.card_argv = [sys.executable, str(script), str(self.cards), *s.card_argv[2:]]
+        return s
+
+    def sign_in(self, token, revoke=None):
+        """A sign-in: the new login on disk, the one it replaced revoked."""
+        if revoke:
+            with open(self.fake_dir / "revoked", "a") as f:
+                f.write(revoke + "\n")
+        (self.codex_home / "auth.json").write_text(token)
+
+    def starts(self):
+        return len([r for r in self.sent() if "argv" in r])
+
+    def posted(self):
+        return self.cards.read_text().splitlines() if self.cards.exists() else []
+
+    def test_a_switch_restarts_the_app_server_before_the_next_turn(self):
+        self.sign_in("tok-a")
+        s = self.make()
+        s.ensure_server()
+        self.sign_in("tok-b", revoke="tok-a")
+        self.task("task-1.txt")
+        self.assertEqual(s.step(), "done")
+        self.assertEqual((self.starts(), len(self.sent("turn/start"))), (2, 1), "restarted before the turn, not after a failure")
+        self.assertEqual([r["params"]["threadId"] for r in self.sent("thread/resume")], ["thr-1"], "on the same thread")
+        self.assertIn("login changed on disk", self.out.getvalue())
+        self.task("task-2.txt")
+        self.assertEqual(s.step(), "done")
+        self.assertEqual(self.starts(), 2, "once per change")
+        self.assertEqual(self.posted(), [])
+
+    def test_an_unauthorized_turn_restarts_once_and_a_login_rotated_meanwhile_answers(self):
+        self.sign_in("tok-a")
+        self.task("task-1.txt")
+        self.plan("unauth", "result")
+        s = self.make()
+        s.ensure_server()
+        self.assertEqual(s.step(), "done")
+        self.assertEqual((self.starts(), len(self.sent("turn/start"))), (2, 2))
+        self.assertEqual(s.failures, 0, "a refused login is not a server failure")
+        self.assertIn("turn refused as unauthorized", self.out.getvalue())
+        self.assertEqual(self.posted(), [])
+
+    def test_still_unauthorized_after_the_restart_shows_the_owner_the_account_card_once(self):
+        self.sign_in("tok-a", revoke="tok-a")     # revoked, and no new sign-in on disk
+        self.task("task-1.txt")
+        s = self.make(retry_s=30, max_attempts=3)
+        s.ensure_server()
+        self.assertEqual(s.step(), seat_mod.UNAUTHORIZED)
+        self.assertEqual((self.starts(), len(self.sent("turn/start"))), (2, 2), "restarted and tried once more")
+        self.assertEqual(self.posted(), [f"--workspace {self.ws} post --signed-out"])
+        rec = json.loads(s.record_file("task-1.txt").read_text())
+        self.assertEqual(rec["outcome"], seat_mod.UNAUTHORIZED)
+        self.assertEqual(list(task_dispatch.pending_candidates(self.tasks, self.results)), ["task-1.txt"])
+        self.now[0] += 31
+        self.assertEqual(s.step(), seat_mod.UNAUTHORIZED)
+        self.assertEqual(len(self.posted()), 1, "once per login on disk")
+        self.sign_in("tok-b")                       # the owner switches from the card
+        self.now[0] += 31
+        self.assertEqual(s.step(), "done")
+        self.assertEqual(len(self.posted()), 1)
+
+    def test_a_card_that_could_not_be_sent_is_tried_again(self):
+        self.sign_in("tok-a", revoke="tok-a")
+        self.task("task-1.txt")
+        s = self.make(retry_s=30, max_attempts=3)
+        s.card_argv = [sys.executable, "-c", "import sys; print('no core lane'); sys.exit(1)"]
+        s.ensure_server()
+        self.assertEqual(s.step(), seat_mod.UNAUTHORIZED)
+        self.assertIn("the account card was not sent (no core lane)", self.out.getvalue())
+        self.assertIsNone(s.told_signed_out)
+
+    def test_a_worker_seat_restarts_on_the_shared_login_but_sends_no_card(self):
+        self.sign_in("tok-a", revoke="tok-a")
+        self.task("task-1.txt")
+        s = self.make()
+        s.worker = "w1"
+        s.ensure_server()
+        self.assertEqual(s.step(), seat_mod.UNAUTHORIZED)
+        self.assertEqual(self.starts(), 2)
+        self.assertEqual(self.posted(), [])
+
+    def test_what_reads_as_unauthorized(self):
+        yes = ({"codexErrorInfo": "unauthorized"}, {"codex_error_info": {"unauthorized": {}}},
+               {"message": "Your access token could not be refreshed because your refresh token was revoked. "
+                           "Please log out and sign in again."}, "turn/start: {'message': '401 Unauthorized'}")
+        no = (None, {"codexErrorInfo": "usageLimitExceeded"}, {"message": "stream disconnected"}, "thread is busy")
+        self.assertEqual([seat_mod.unauthorized(e) for e in yes], [True] * len(yes))
+        self.assertEqual([seat_mod.unauthorized(e) for e in no], [False] * len(no))
+
+    def test_the_login_print_names_the_file_never_its_contents(self):
+        path = self.codex_home / "auth.json"
+        self.assertIsNone(seat_mod.auth_print())
+        path.write_text("tok-SECRET")
+        printed = seat_mod.auth_print()
+        self.assertEqual(printed[0], os.path.realpath(path))
+        self.assertNotIn("tok-SECRET", repr(printed))
+        path.write_text("tok-SECRET-longer")
+        self.assertNotEqual(seat_mod.auth_print(), printed)
 
 
 class CoreModelSwitch(SeatCase):

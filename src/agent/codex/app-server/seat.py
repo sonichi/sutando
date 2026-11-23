@@ -24,6 +24,7 @@ import fcntl
 import json
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -56,6 +57,12 @@ STOP_RULING_SUFFIX = ".ruling.json"
 CLAIMS_DIR = ("state", "task-event-handler-claims")
 WATCHER = REPO / "src" / "watch-tasks-stream.sh"
 WORKSTREAMS = REPO / "skills" / "task-workstream-grouping" / "scripts" / "workstreams.py"
+ACCOUNT_CARD = REPO / "skills" / "account-switch" / "scripts" / "account_card.py"
+UNAUTHORIZED = "unauthorized"
+# A turn refused because the login no longer works (its refresh token revoked when another sign-in rotated
+# it); the message is read too, for a server that sends no codexErrorInfo.
+_UNAUTH_WORDS = re.compile(r"refresh token (was|has been) revoked|access token could not be refreshed|"
+                           r"log out and sign in again|\b401 unauthorized\b", re.IGNORECASE)
 STOPPED = "stopped"
 WITHDRAWN = "withdrawn"
 SETTLE_ATTEMPTS = 5
@@ -126,6 +133,36 @@ def log(*parts) -> None:
                 f.write(time.strftime("%Y-%m-%d ") + line + "\n")
         except OSError:
             pass
+
+
+def unauthorized(error) -> bool:
+    """Whether a turn's error (its `error` object, or a message) says the login no longer works."""
+    if isinstance(error, str):
+        return bool(_UNAUTH_WORDS.search(error))
+    if not isinstance(error, dict):
+        return False
+    info = error.get("codexErrorInfo", error.get("codex_error_info"))
+    names = list(info) if isinstance(info, dict) else [info]
+    if any(re.sub(r"[^a-z]", "", str(n).lower()) == UNAUTHORIZED for n in names if n):
+        return True
+    return bool(_UNAUTH_WORDS.search(str(error.get("message") or "")))
+
+
+def auth_file() -> str:
+    """The login file of the Codex home the app-server child runs on (CODEX_HOME, else ~/.codex)."""
+    home = os.environ.get("CODEX_HOME") or os.path.join(os.environ.get("HOME") or os.path.expanduser("~"), ".codex")
+    return os.path.join(home, "auth.json")
+
+
+def auth_print(path: Optional[str] = None) -> Optional[tuple]:
+    """What identifies the login on disk now (the file it resolves to, its inode, size and mtime), never its
+    contents; None when there is none. A sign-in, an account switch, an API key set or a logout changes it."""
+    path = path or auth_file()
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return os.path.realpath(path), st.st_ino, st.st_size, st.st_mtime_ns
 
 
 def one_line(text, limit: int = 160) -> str:
@@ -255,6 +292,12 @@ class Seat:
         self.declined: List[str] = []
         self.idle_logged = False
         self.lock_fd: Optional[int] = None
+        self.auth_seen: Optional[tuple] = None  # the login on disk when the running child was started
+        self.turn_unauth = False  # the current turn was refused because the login no longer works
+        self.told_signed_out: Optional[tuple] = None  # the login the owner was last shown the card for
+        # Shows the owner the core's account card when its login is refused even after a restart.
+        self.card_argv = [sys.executable, str(ACCOUNT_CARD), "--workspace", str(self.workspace), "post",
+                          "--signed-out"]
 
     # ---- the app-server child and the seat's one thread ----
 
@@ -270,6 +313,7 @@ class Seat:
         return p
 
     def start_server(self) -> None:
+        self.auth_seen = auth_print()  # read before the child reads it: a change during the start is seen
         self.rpc = Rpc(self.argv, cwd=self.cwd)  # from an unreadable cwd it drops every -c
         self.thread_id = None
         init = self.rpc.request("initialize", {"clientInfo": CLIENT, "capabilities": {"experimentalApi": True}})
@@ -316,6 +360,32 @@ class Seat:
                 self.close_server()
                 self.server_failed(f"app-server did not start: {one_line(e, 200)}")
         return started
+
+    def fresh_auth(self) -> None:
+        """Before a task: the child runs on the login on disk. It reads its tokens once, at start, and a
+        sign-in or account switch since (the desktop's Settings, the account card) revoked their refresh
+        token, so a changed login file closes it and the next ensure_server starts it on the new one."""
+        if self.rpc is not None and auth_print() != self.auth_seen:
+            log("login changed on disk; restarting the app-server before the turn")
+            self.close_server()
+
+    def signed_out(self, filename: str) -> None:
+        """The login was refused even on a restarted child: the core seat shows the owner the account card
+        in their DM, once per login on disk. A worker's seat shares the core's login and says nothing."""
+        now = auth_print()
+        if self.worker or self.told_signed_out == now:
+            return
+        try:
+            done = subprocess.run(self.card_argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                  timeout=120)
+            ok, why = done.returncode == 0, one_line(done.stdout or done.stderr, 200)
+        except (OSError, subprocess.SubprocessError) as e:
+            ok, why = False, one_line(e, 200)
+        if ok:
+            self.told_signed_out = now
+            log(f"task {filename}: Codex isn't signed in anymore; the account card was sent to the owner")
+        else:
+            log(f"task {filename}: Codex isn't signed in anymore; the account card was not sent ({why})")
 
     def server_failed(self, why: str) -> None:
         self.failures += 1
@@ -675,7 +745,8 @@ class Seat:
 
     def run_turn(self, filename: str, prompt: str) -> Tuple[str, str]:
         """(status, detail) once the turn is over: completed | failed | interrupted | stopped |
-        timeout | server-exited | seat-stopping."""
+        timeout | server-exited | seat-stopping. `turn_unauth` says whether the login was refused."""
+        self.turn_unauth = False
         try:
             return self._run_turn(filename, prompt)
         finally:
@@ -706,6 +777,7 @@ class Seat:
             turn_id = res["turn"]["id"]
             sent_model = params.get("model")
         except (RuntimeError, KeyError, TypeError) as e:
+            self.turn_unauth = unauthorized(str(e))
             return ("server-exited" if not self.rpc.alive() else "failed"), one_line(e, 240)
         log(f"task {filename}: turn started ({turn_id})")
         started = time.monotonic()
@@ -728,6 +800,8 @@ class Seat:
                     if method == "turn/completed" and turn.get("id") == turn_id:
                         status = turn.get("status") or "failed"
                         error = (turn.get("error") or {}).get("message") or ""
+                        if status != "completed" and unauthorized(turn.get("error")):
+                            self.turn_unauth = True
                         if status == "completed":
                             self.settle_model(True)
                             if self.restore is not None and sent_model == self.restore:
@@ -735,6 +809,8 @@ class Seat:
                         if interrupted and status == "interrupted":
                             return interrupted, error
                         return status, error
+                    if method == "error" and unauthorized(params.get("error")):
+                        self.turn_unauth = True
                     self.show(method, params)
             if interrupted:
                 if time.monotonic() - interrupt_at > self.interrupt_grace:
@@ -843,6 +919,7 @@ class Seat:
         prompt = self.prompt_for(filename, copy)
         started = time.monotonic()
         status, detail = "server-exited", ""
+        self.fresh_auth()
         for attempt in (1, 2):
             self.ensure_server()
             if self.stop_requested(filename):
@@ -853,6 +930,12 @@ class Seat:
                 status, detail = WITHDRAWN, "answered, no longer this seat's, or not the file that was admitted"
                 break
             status, detail = self.run_turn(filename, prompt)
+            if (self.turn_unauth and status != "completed" and attempt == 1
+                    and not has_ready_result(results, filename)):
+                log(f"task {filename}: turn refused as unauthorized; restarting the app-server on the login "
+                    "on disk and retrying once")
+                self.close_server()
+                continue
             if status != "server-exited" or has_ready_result(results, filename):
                 break
             self.close_server()
@@ -882,6 +965,9 @@ class Seat:
             log(f"task {filename}: stopped by Stop after {took} ({detail or 'turn interrupted'}); no result, "
                 "the task stays pending and is not started again")
             return status
+        if self.turn_unauth and status != "completed":
+            status = UNAUTHORIZED
+            self.signed_out(filename)
         outcome = "no-result" if status == "completed" else status
         rec = self.write_record(filename, payload, outcome, detail)
         wait = self.retry_s if rec["attempts"] < self.max_attempts else self.hold_s

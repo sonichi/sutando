@@ -239,6 +239,18 @@ class CodexCard(Base):
         self.assertEqual((rc, out["status"]), (1, "failed"))
         self.assertEqual(self.fake.calls, [])
 
+    def test_a_signed_out_card_goes_to_the_owner_dm_and_says_so_first(self):
+        # The Codex seat's call when the core's login is refused even after a restart: no --room.
+        self.signed_in(A)
+        self.keep(B)
+        rc, out = self.run_(["post", "--signed-out"])
+        self.assertEqual((rc, out["status"]), (0, "posted"))
+        card = self.fake.cards()[0]
+        self.assertTrue(card["text"].startswith(acc.SIGNED_OUT + " Pick a saved account"), card["text"])
+        self.assertNotIn("signed in as", card["text"])
+        self.assertEqual([b["label"] for b in card["buttons"]], ["Use b…@work.io (pro)", "Add another account"])
+        self.assertEqual(self.fake.calls[0][3], DM)
+
     def test_status_lists_in_use_and_saved_masked(self):
         self.signed_in(A)
         self.keep(B)
