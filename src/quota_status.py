@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """The core's Claude quota as a room-visible status (`quota_status.v1`): one projection, one debounce.
 
-`project()` turns the trusted quota record (`state/quota-state.json` through
-`quota_availability.trusted_record`) into the small block the gateway bridge sends as
-`health.quota` on its heartbeat, for the s.space agent sidebar. It carries only the 5-hour and
+`project()` turns the quota record (`state/quota-state.json`) into the small block the gateway
+bridge sends as `health.quota` on its heartbeat, for the s.space agent sidebar. `read()` projects
+only a record of the core's own login, by the rule the recovery record and the limit hold use
+(`quota_availability.record_for_account`, which holds a status line record to `trusted_record`
+and a proxy record to its `acct_` label). The block carries only the 5-hour and
 7-day used percentages and reset times, the limit state, when a limit resumes, and when the
 record was last checked. Never the account digest, the `accounts` map, headers, the rejection
 ledger, the model or anything else in the record.
@@ -113,7 +115,17 @@ def read(workspace: Path, runtime: Optional[str] = None, now: Optional[float] = 
         raw = json.loads(status_read_path("quota-state.json", Path(workspace)).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    return project(qa.trusted_record(raw), now)
+    # record_for_account applies trusted_record to a status line record; a proxy record needs its label.
+    return project(qa.record_for_account(raw, _core_account(workspace)), now)
+
+
+def _core_account(workspace: Path) -> Optional[str]:
+    """The digest of the account the core is signed in to, as the recovery record reads it."""
+    try:
+        import core_limit_hold
+        return core_limit_hold.launch_identity(Path(workspace))[1]
+    except Exception:  # noqa: BLE001 -- an unreadable identity is an unknown account
+        return None
 
 
 def moved(old: Optional[dict], new: Optional[dict], min_points: float = MIN_POINTS) -> bool:

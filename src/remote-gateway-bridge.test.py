@@ -982,9 +982,14 @@ def main() -> int:
         (_st / _f).unlink()
     check(_wrtc._QUOTA_STATUS_READER is None and rtc._QUOTA_STATUS_READER is not None,
           "quota-tracker's switch is on by default; a pool worker's lane carries no core quota")
+    # A proxy record speaks for the core only with the core's own acct_ label (none while unread).
+    import core_limit_hold as _clh
+    import quota_availability as _qa
+    _qlabel = _qa.account_label(_clh.launch_identity(rtc.WS)[1])
     (rtc.WS / "state" / "quota-state.json").write_text(json.dumps({
         "utilization_5h": 0.42, "resets_at_5h": "2026-11-20T16:00:00.000Z", "limit_state": "allowed",
-        "last_checked": "2026-11-20T12:00:00.000Z", "account": "acct-core", "accounts": {"acct-x": {}}}))
+        "last_checked": "2026-11-20T12:00:00.000Z", "accounts": {"acct-x": {}},
+        **({"account": _qlabel} if _qlabel else {})}))
     STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
     rtc._post_heartbeat(set(), force=True)
     hbq = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
@@ -992,6 +997,13 @@ def main() -> int:
           and "quota_status.v1" in hbq.get("capabilities", [])
           and "account" not in hbq["health"]["quota"],
           "the adapter's reader puts the core's quota on the heartbeat as health.quota, no account")
+    (rtc.WS / "state" / "quota-state.json").write_text(json.dumps({
+        "utilization_5h": 0.42, "limit_state": "allowed", "account": "acct_0f0f0f"}))
+    STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
+    rtc._post_heartbeat(set(), force=True)
+    hbq = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    check(_qlabel != "acct_0f0f0f" and "quota" not in (hbq.get("health") or {}),
+          "a proxy record labeled with another login puts no health.quota on the heartbeat")
     (rtc.WS / "state" / "quota-state.json").unlink()
     os.environ["QUOTA_STATUS_PUBLISH"] = "false"
     try:

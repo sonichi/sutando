@@ -62,7 +62,7 @@ With the recorder on, Sutando's Claude sessions (the core and every pool worker)
 
 ## The quota in the s.space agent sidebar
 
-On by default. The gateway bridge sends the core's quota to s.space as `health.quota` on its existing heartbeat (`POST /v1/heartbeat`, capability `quota_status.v1`), next to `health.recovery`, so the agent sidebar can show it. The block is built by `src/quota_status.py` from the trusted record (`trusted_record()`: a status line record only for the core's current login), and carries only:
+On by default. The gateway bridge sends the core's quota to s.space as `health.quota` on its existing heartbeat (`POST /v1/heartbeat`, capability `quota_status.v1`), next to `health.recovery`, so the agent sidebar can show it. The block is built by `src/quota_status.py` from a record of the core's own login, by the rule the recovery state and the limit hold use (`quota_availability.record_for_account`): a status line record only for the core's current login, a proxy record only when its `acct_` label is that login's (an unlabeled proxy record only while the core's account is unreadable). Another login's record sends no block. It carries only:
 
 ```json
 {"v": 1,
