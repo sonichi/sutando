@@ -446,8 +446,8 @@ class Switch(Base):
         import util_paths
         cores = self.ws / "state" / "cores"
         cores.mkdir(parents=True, exist_ok=True)
-        (cores / "h.alive").write_text(json.dumps({"pid": 111, "heartbeat_pid": 999, "session": "s",
-                                                    "last_beat_at": 5.0}))
+        (cores / "h.alive").write_text(json.dumps({"pid": 111, "heartbeat_pid": 999, "session": "sutando-core",
+                                                    "socket": "/tmp/sutando-tmux.sock", "last_beat_at": 5.0}))
         with mock.patch.object(util_paths, "_host_label", return_value="h"):
             self.switch()
         self.assertEqual(self.ready_since[-1][1], 111)
@@ -640,11 +640,11 @@ class Edges(Base):
         self.assertEqual(acc.restart_core(mock.Mock(side_effect=acc.subprocess.TimeoutExpired("bash", 1))), 124)
         self.assertEqual(acc.restart_core(mock.Mock(side_effect=OSError("no bash"))), 127)
 
-    def beat(self, pid, at, writer=999, session="sutando-core"):
+    def beat(self, pid, at, writer=999, session="sutando-core", socket="/tmp/sutando-tmux.sock"):
         cores = self.ws / "state" / "cores"
         cores.mkdir(parents=True, exist_ok=True)
         (cores / "h.alive").write_text(json.dumps({"pid": pid, "heartbeat_pid": writer, "session": session,
-                                                    "last_beat_at": at, "started_at": 1.0}))
+                                                    "socket": socket, "last_beat_at": at, "started_at": 1.0}))
 
     def ready_with(self, since, before, beats):
         """core_ready under a fake clock; `beats` is written one per poll."""
@@ -691,6 +691,31 @@ class Edges(Base):
         with mock.patch.object(util_paths, "_host_label", return_value="h"):
             self.beat(222, 5.0, session="")
             self.assertIsNone(acc.core_beat(self.ws)["pid"])
+
+    def test_a_beat_from_another_session_names_no_core(self):
+        import util_paths
+        with mock.patch.object(util_paths, "_host_label", return_value="h"):
+            self.beat(222, 5.0, session="sutando-core-watcher")
+            self.assertIsNone(acc.core_beat(self.ws)["pid"])
+
+    def test_a_beat_on_another_socket_names_no_core(self):
+        import util_paths
+        with mock.patch.object(util_paths, "_host_label", return_value="h"):
+            self.beat(222, 5.0, socket="/tmp/other.sock")
+            self.assertIsNone(acc.core_beat(self.ws)["pid"])
+
+    def test_the_intended_session_and_socket_follow_the_launch_env(self):
+        import util_paths
+        env = {"SUTANDO_TMUX_SESSION": "core-b", "SUTANDO_TMUX_SOCKET": "/tmp/b.sock"}
+        with mock.patch.object(util_paths, "_host_label", return_value="h"), mock.patch.dict(os.environ, env):
+            self.beat(222, 5.0)
+            self.assertIsNone(acc.core_beat(self.ws)["pid"])
+            self.beat(222, 5.0, session="core-b", socket="/tmp/b.sock")
+            self.assertEqual(acc.core_beat(self.ws)["pid"], 222)
+
+    def test_a_new_pid_from_another_session_after_the_restart_is_not_a_new_core(self):
+        self.beat(111, 900.0)
+        self.assertEqual(self.ready_with(1000.0, 111, [(222, 1001.0, 999, "other")] * 3), acc.SAME)
 
     def test_a_writer_only_beat_after_the_restart_is_not_a_new_core(self):
         self.beat(111, 900.0)

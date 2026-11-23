@@ -564,7 +564,7 @@ def _alive(ws: Path) -> Optional[Path]:
 
 def core_beat(ws: Path) -> dict:
     """{pid, last_beat_at} of the core's heartbeat; {} when absent or unreadable. `pid` is the core
-    process the beat names in an observed session, None for a writer-only beat (the writer outlives
+    process the beat names in the intended core session on its socket, None for any other beat or a writer-only one (the writer outlives
     restarts, so neither its pid nor its start time says anything about the core)."""
     alive = _alive(ws)
     if alive is None:
@@ -578,8 +578,15 @@ def core_beat(ws: Path) -> dict:
     def num(v):
         return v if isinstance(v, int) and not isinstance(v, bool) else None
     pid, writer = num(rec.get("pid")), num(rec.get("heartbeat_pid"))
-    # When the core cannot be observed the writer puts its own pid in `pid`: that names no core.
-    if pid is None or writer is None or pid == writer or not str(rec.get("session") or "").strip():
+    # When the core cannot be observed the writer puts its own pid in `pid`, and it can fall back to
+    # another live session: only a beat from the intended core session on its socket names the core.
+    try:
+        from core_heartbeat import _socket_path, core_session
+        intended = (core_session(), _socket_path())
+    except Exception:  # noqa: BLE001 - no intended session to check against: the beat names no core
+        intended = None
+    if pid is None or writer is None or pid == writer or intended is None \
+            or (rec.get("session"), rec.get("socket")) != intended:
         pid = None
     beat = rec.get("last_beat_at") if isinstance(rec.get("last_beat_at"), (int, float)) else None
     return {"pid": pid, "last_beat_at": beat}
