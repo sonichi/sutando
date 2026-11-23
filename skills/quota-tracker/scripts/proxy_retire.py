@@ -109,11 +109,9 @@ def proxy_connections(runner: Callable = _run) -> Optional[List[str]]:
 
 
 def core_record_fresh(workspace) -> bool:
-    from claude_account import account_key, core_config_dir
     from quota_availability import from_statusline, read_quota_record
     rec = read_quota_record(workspace)
-    return bool(rec and rec.fresh() and from_statusline(rec.payload)
-                and rec.payload.get("account") == account_key(core_config_dir()))
+    return bool(rec and rec.fresh() and from_statusline(rec.payload))
 
 
 def decide(enabled: bool, sessions: List[str], connections: Optional[List[str]], fresh: bool) -> Optional[str]:

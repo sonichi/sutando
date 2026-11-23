@@ -64,6 +64,10 @@ class Base(unittest.TestCase):
         self.core = self._login(root / "core", "acct-A")
         self.same = self._login(root / "worker-same", "acct-A")
         self.other = self._login(root / "worker-other", "acct-B")
+        # Readers verify a record against the core's current account, read from its config dir.
+        patch = mock.patch.object(claude_account, "core_config_dir", return_value=self.core)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     @staticmethod
     def _login(d, uuid):
@@ -126,7 +130,7 @@ class Writer(Base):
         self.assertEqual(self.rec()["utilization_5h"], 0.5)
 
     def test_recent_rejections_and_credential_state_are_preserved(self):
-        self.path.write_text(json.dumps(FX["prev"]))
+        self.path.write_text(json.dumps(dict(FX["prev"], account=claude_account.account_key(self.core))))
         self.sl(_status(), now=T0)
         rec = self.rec()
         self.assertEqual(rec["recent_rejections"], FX["prev"]["recent_rejections"])
@@ -188,10 +192,14 @@ class Writer(Base):
         self.assertFalse(qa.from_statusline(allowed))
         d = qa.availability_decision(allowed, base_url=None, stale=False)
         self.assertEqual(d["unavailable_reason"], "not-routed")
-        self.assertTrue(qa.availability_decision(dict(allowed, account="abc"), base_url=None, stale=False)["available"])
+        core = claude_account.account_key(self.core)
+        self.assertTrue(qa.availability_decision(dict(allowed, account=core), base_url=None, stale=False)["available"])
+        d = qa.availability_decision(dict(allowed, account=claude_account.account_key(self.other)),
+                                     base_url=None, stale=False)
+        self.assertEqual(d["unavailable_reason"], "not-routed")
 
     def test_a_later_429_than_the_observation_blocks_the_reader(self):
-        rec = dict(qr.record_from_statusline({}, _status(), T0), account="abc")
+        rec = dict(qr.record_from_statusline({}, _status(), T0), account=claude_account.account_key(self.core))
         rec["recent_rejections"] = [{"ts": qr.iso(T0 + 5), "status": 429}]
         self.assertFalse(qa.availability_decision(rec, base_url=None, stale=False)["available"])
 
@@ -225,7 +233,59 @@ class Writer(Base):
         b.mkdir()
         self.assertNotEqual(claude_account.account_key(str(a)), claude_account.account_key(str(b)))
         self.assertFalse(claude_account.same_login(str(a), str(b)))
-        self.assertTrue(claude_account.same_login(str(a), str(a)))
+        # A shared directory with no identified account is not a verified login.
+        self.assertFalse(claude_account.same_login(str(a), str(a)))
+        self.assertFalse(claude_account.is_identified(claude_account.account_key(str(a))))
+        self.assertTrue(claude_account.is_identified(claude_account.account_key(self.core)))
+
+    def test_a_login_change_in_the_same_config_dir_inherits_nothing(self):
+        self.sl(_status(five=80), now=T0)
+        self.rl(now=T0 + 10)
+        self.assertEqual(self.rec()["limit_state"], "rejected")
+        Path(self.core, ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "acct-C"}}))
+        self.sl(_status(five=80), now=T0 + 20)
+        rec = qa.read_quota_record(self.ws, now=T0 + 30).payload
+        self.assertEqual(rec["account"], claude_account.account_key(self.core))
+        self.assertEqual(rec["limit_state"], "allowed")
+        self.assertEqual(rec["recent_rejections"], [])
+        self.assertNotIn("rejected_by", rec)
+        self.assertTrue(qa.availability_decision(rec, base_url=None, stale=False)["available"])
+        # A rejection under the new login does not reach back to the old one either.
+        self.rl(now=T0 + 40)
+        old_key = [k for k in self.rec()["accounts"] if k != claude_account.account_key(self.core)][0]
+        self.assertEqual(len(self.rec()["accounts"][old_key]["recent_rejections"]), 1)
+
+    def test_readers_ignore_a_record_from_a_previous_core_login(self):
+        self.sl(_status(five=10), now=None)
+        Path(self.core, ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "acct-C"}}))
+        rec = qa.read_quota_record(self.ws).payload
+        self.assertFalse(qa.from_statusline(rec))
+        self.assertFalse(qa.availability_decision(rec, base_url=None, stale=False)["available"])
+
+    def test_an_unknown_login_is_advisory_only(self):
+        anon = Path(self._tmp.name) / "anon"
+        anon.mkdir()
+        self.sl(_status(five=40), now=T0)
+        self.sl(_status(five=99), now=T0 + 10, cd=str(anon))
+        self.rl(now=T0 + 20, cd=str(anon))
+        rec = self.rec()
+        self.assertEqual(rec["utilization_5h"], 0.4)
+        self.assertEqual(rec["limit_state"], "allowed")
+        key = claude_account.account_key(str(anon))
+        self.assertTrue(key.startswith("dir-"))
+        self.assertIn(key, rec["accounts"])
+        # The core itself without an identified account: written, but no reader trusts it.
+        Path(self.core, ".claude.json").unlink()
+        self.path.unlink()
+        self.sl(_status(five=40), now=None)
+        self.assertNotIn("headers", self.rec())
+        self.assertIsNone(claude_account.core_account())
+        unbound = next(iter(self.rec()["accounts"].values()))
+        self.assertFalse(qa.from_statusline(dict(unbound, account=claude_account.account_key(self.core))))
+        # An unbound entry seeds nothing: its own earlier rejection is not carried into the next write.
+        self.rl(cd=str(anon))
+        self.sl(_status(five=40), cd=str(anon))
+        self.assertEqual(self.rec()["accounts"][key]["recent_rejections"], [])
 
 
 class Scripts(Base):

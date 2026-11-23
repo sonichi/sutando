@@ -54,11 +54,19 @@ def points_at_credential_proxy(base_url: "str | None") -> bool:
 STATUSLINE_SOURCE = "statusline"
 
 
-def from_statusline(record: Any) -> bool:
+_CURRENT = object()
+
+
+def from_statusline(record: Any, account: Any = _CURRENT) -> bool:
     """Whether the record was written by Claude Code's own status line (src/quota_record.py) for
-    a known login: it speaks for that login whatever the seat's routing. Unbound ones are advisory."""
-    return (isinstance(record, dict) and record.get("source") == STATUSLINE_SOURCE
-            and isinstance(record.get("account"), str) and record["account"] not in ("", "unscoped"))
+    the account the core is signed in to now (`account`; default: read from its config dir).
+    Only then does it speak for the core whatever the seat's routing; otherwise it is advisory."""
+    if not isinstance(record, dict) or record.get("source") != STATUSLINE_SOURCE:
+        return False
+    if account is _CURRENT:
+        from claude_account import core_account
+        account = core_account()
+    return isinstance(account, str) and bool(account) and record.get("account") == account
 
 
 def _rejected_since_observed(record: dict) -> bool:

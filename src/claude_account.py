@@ -49,11 +49,17 @@ def core_config_dir() -> Optional[str]:
         return None
 
 
+def is_identified(key: Optional[str]) -> bool:
+    """A key from `account_key` that names a signed-in account (a fingerprint), not a directory."""
+    return bool(key) and key != "unscoped" and not key.startswith("dir-")
+
+
+def core_account() -> Optional[str]:
+    """The fingerprint of the account the core's config dir is signed in to now, else None."""
+    return account_fingerprint(core_config_dir())
+
+
 def same_login(config_dir: Optional[str], other: Optional[str]) -> bool:
-    """One config dir, or two signed in to the same identified account."""
-    if not config_dir or not other:
-        return False
-    if os.path.realpath(config_dir) == os.path.realpath(other):
-        return True
-    mine = account_fingerprint(config_dir)
-    return mine is not None and mine == account_fingerprint(other)
+    """Both config dirs signed in to the same identified account; a shared directory alone is not."""
+    mine = account_fingerprint(config_dir) if config_dir else None
+    return mine is not None and other is not None and mine == account_fingerprint(other)

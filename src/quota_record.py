@@ -11,6 +11,7 @@ no write; the lock is waited on briefly, then the observation is skipped.
 Per account: each write is keyed by the writing session's login (`claude_account`). The
 top level is the core's account only, so readers see the core's numbers; every account's
 latest entry is under `accounts`. Another login never changes the core's numbers or status.
+An entry continues only the same identified login's; a login with no oauthAccount is advisory.
 """
 from __future__ import annotations
 
@@ -271,7 +272,6 @@ def _update(workspace, build, wait: float) -> bool:
 
 
 MAX_ACCOUNTS = 8
-UNBOUND = "unscoped"  # claude_account.account_key with no config dir
 _OWN_KEYS = ("accounts", "account")
 
 
@@ -279,13 +279,20 @@ def _entry(rec: Any) -> dict:
     return {k: v for k, v in rec.items() if k not in _OWN_KEYS} if isinstance(rec, dict) else {}
 
 
-def route(prev: Any, key: str, is_core: bool, build) -> Optional[dict]:
+def route(prev: Any, key: str, is_core: bool, build, bound: bool = True) -> Optional[dict]:
     """Apply `build` to this account's entry. The top level stays the core's account, so
-    existing readers see only the core; every account's latest is kept under `accounts`."""
+    existing readers see only the core; every account's latest is kept under `accounts`.
+    An entry is seeded only from the same identified account's; an unbound one from nothing."""
     prev = prev if isinstance(prev, dict) else {}
     accounts = {k: v for k, v in (prev.get("accounts") or {}).items() if isinstance(v, dict)} \
         if isinstance(prev.get("accounts"), dict) else {}
-    entry = build(_entry(prev) if is_core else accounts.get(key, {}))
+    if not bound:
+        seed = {}
+    elif is_core:
+        seed = _entry(prev) if prev.get("account") == key else {}
+    else:
+        seed = accounts.get(key, {})
+    entry = build(seed)
     if entry is None:
         return None
     accounts[key] = entry
@@ -298,10 +305,13 @@ def route(prev: Any, key: str, is_core: bool, build) -> Optional[dict]:
 
 
 def _who(config_dir: Optional[str], core_dir: Optional[str]) -> tuple:
-    from claude_account import account_key, core_config_dir, same_login
+    """(key, is the core's account, is an identified account) for the writing session."""
+    from claude_account import account_key, core_config_dir, is_identified, same_login
     config_dir = config_dir or os.environ.get("CLAUDE_CONFIG_DIR") or None
     core_dir = core_dir if core_dir is not None else core_config_dir()
-    return account_key(config_dir), same_login(config_dir, core_dir)
+    key = account_key(config_dir)
+    bound = is_identified(key)
+    return key, bound and same_login(config_dir, core_dir), bound
 
 
 def record_statusline(workspace, status: Any, now: Optional[float] = None,
@@ -311,16 +321,16 @@ def record_statusline(workspace, status: Any, now: Optional[float] = None,
     if windows_from_statusline(status) is None:
         return False
     seen = observed_at(status, now)
-    key, is_core = _who(config_dir, core_dir)
+    key, is_core, bound = _who(config_dir, core_dir)
     return _update(workspace, lambda prev: route(
         prev, key, is_core,
-        lambda e: record_from_statusline(e, status, seen, now, bound=key != UNBOUND)), LOCK_WAIT_S)
+        lambda e: record_from_statusline(e, status, seen, now, bound=bound), bound), LOCK_WAIT_S)
 
 
 def record_rate_limit(workspace, now: Optional[float] = None, detail: str = "",
                       config_dir: Optional[str] = None, core_dir: Optional[str] = None) -> bool:
     """Record one StopFailure `rate_limit` under the session's account; True when written."""
     at = time.time() if now is None else now
-    key, is_core = _who(config_dir, core_dir)
+    key, is_core, bound = _who(config_dir, core_dir)
     return _update(workspace, lambda prev: route(
-        prev, key, is_core, lambda e: record_with_rate_limit(e, at, detail)), 2.0)
+        prev, key, is_core, lambda e: record_with_rate_limit(e, at, detail), bound), 2.0)
