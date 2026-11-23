@@ -373,14 +373,28 @@ class Lifecycle(D.Base):
         self.assertIn("1 open decision card(s) were withdrawn", told[0])
         self.assertIn("- Question a1?", told[0])
 
+    def test_a_failed_identity_removal_keeps_the_workers_cards(self):
+        from hitl import cards as hc, schema as hs
+        manager = hc.manager_for(self.ws)
+        mine = manager.create(hc.choice_request("Question b1?", [{"id": "approve", "label": "Approve"}], "b1",
+                                                {"ask_id": "b1", "by_worker": W}, runtime="pending-questions"))
+        with unittest.mock.patch.object(C, "_vault", lambda v=None: self.vault), \
+                unittest.mock.patch.object(C, "retire_worker_identity", side_effect=C.ConnectionsError("row locked")):
+            out = pool_manage.retire(self.ws, W, runner=self.runner, tell=lambda text: True)
+        self.assertEqual(out["identity"]["result"], "failed", out)
+        self.assertNotIn("cards_withdrawn", out["identity"])
+        self.assertEqual(manager.store.load(mine.id).status, hs.STATUS_PENDING)
+
     def test_a_card_withdrawal_that_raises_is_reported_and_the_worker_is_still_retired(self):
+        told = []
         with unittest.mock.patch.object(C, "_vault", lambda v=None: self.vault), \
                 unittest.mock.patch("hitl.cards.withdraw_worker_cards", side_effect=OSError("store gone")):
-            out = pool_manage.retire(self.ws, W, runner=self.runner, tell=lambda text: True)
+            out = pool_manage.retire(self.ws, W, runner=self.runner, tell=lambda text: told.append(text) or True)
         ident = out["identity"]
         self.assertEqual(ident["result"], "removed", ident)
         self.assertEqual(ident["cards_withdrawn"], [])
         self.assertIn("store gone", ident["cards_error"])
+        self.assertIn("could not be withdrawn (OSError: store gone)", told[0])
 
     def test_retire_by_default_queues_the_note_to_the_owner_s_dm(self):
         with unittest.mock.patch.object(C, "_vault", lambda v=None: self.vault):
