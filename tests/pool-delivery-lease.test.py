@@ -34,6 +34,18 @@ import pool_router as rt
 from delivery import task_dispatch
 
 A, B = "a" * 32, "b" * 32
+HUGE = "1" + "0" * 400
+# Each would raise or read as current if parsed naively; all must be unreadable.
+MALFORMED_LEASES = (
+    '{"delivered_at": Infinity, "ttl_s": 3600}', '{"delivered_at": 1000000, "ttl_s": Infinity}',
+    '{"delivered_at": NaN, "ttl_s": 3600}', '{"delivered_at": 1000000, "ttl_s": NaN}',
+    '{"delivered_at": 1e400, "ttl_s": 3600}', '{"delivered_at": 1000000, "ttl_s": 1e400}',
+    '{"delivered_at": %s, "ttl_s": 3600}' % HUGE, '{"delivered_at": 1000000, "ttl_s": %s}' % HUGE,
+    '{"delivered_at": 1000000, "ttl_s": -5}', '{"delivered_at": -1, "ttl_s": 3600}',
+    '{"delivered_at": "1000000", "ttl_s": 3600}', '{"delivered_at": 1000000, "ttl_s": true}',
+    '{"delivered_at": null, "ttl_s": 3600}', '{"delivered_at": [1], "ttl_s": 3600}', '[1, 2]', '7',
+    '{"delivered_at": 1e308, "ttl_s": 1e308}',
+)
 ROOM = "!bound:example.test"
 TID = "task-r"
 
@@ -121,6 +133,19 @@ class TheVerdict(Case):
             self.assertEqual(self.verdict(bad), pd.LEASE_UNREADABLE, bad)
         self.assertEqual(self.verdict(pd.lease_body(at + 3600, 3600), now=at), pd.LEASE_UNREADABLE)
 
+    def test_no_unrepresentable_or_mistyped_lease_raises_or_reads_as_current(self):
+        for body in MALFORMED_LEASES:
+            with self.subTest(body=body[:60]):
+                self.assertEqual(self.verdict(body), pd.LEASE_UNREADABLE)
+
+    def test_a_non_finite_number_is_named_as_such(self):
+        for body in MALFORMED_LEASES[:6]:
+            with self.subTest(body=body):
+                p = self.ws / "s"
+                p.write_text(body)
+                verdict, detail = pd.lease_verdict(p, 1_000_100.0)
+                self.assertEqual((verdict, "not finite" in detail), (pd.LEASE_UNREADABLE, True), detail)
+
     def test_a_missing_file_is_unreadable_not_live(self):
         self.assertEqual(pd.lease_verdict(self.ws / "absent", 0.0)[0], pd.LEASE_UNREADABLE)
 
@@ -158,6 +183,37 @@ class PoolDelegation(Case):
         with mock.patch.dict(os.environ, {pd.LEASE_MODE_KEY: "enforce"}):
             got = ph.pool_delegation(self.ws, TID, A, now=time.time() + pd.DEFAULT_LEASE_TTL_S + 1)
         self.assertEqual((got["held"], got["verdict"], got["allowed"]), (True, "expired", False))
+
+    def test_an_accept_between_the_lookup_and_the_read_still_reads_the_lease(self):
+        import worker_delivery
+        rt.deliver_one(self.ws, A, TID)
+        real = worker_delivery.sentinel_of
+        calls = []
+
+        def lookup_then_accept(ws, tid):
+            found = real(ws, tid)
+            if not calls:
+                pd.accept(found)
+            calls.append(found)
+            return found
+        with mock.patch.object(worker_delivery, "sentinel_of", lookup_then_accept):
+            got = ph.pool_delegation(self.ws, TID, A)
+        self.assertEqual(len(calls), 2, "the renamed sentinel was looked up again")
+        self.assertEqual((got["held"], got["verdict"], got["allowed"]), (True, "live", True))
+        self.assertTrue(self.sentinel(pd.ACCEPTED_SUFFIX).exists())
+
+    def test_a_sentinel_withdrawn_between_the_lookup_and_the_read_is_not_held(self):
+        import worker_delivery
+        rt.deliver_one(self.ws, A, TID)
+        real = worker_delivery.sentinel_of
+
+        def lookup_then_withdraw(ws, tid):
+            found = real(ws, tid)
+            if found is not None:
+                found.unlink()
+            return found
+        with mock.patch.object(worker_delivery, "sentinel_of", lookup_then_withdraw):
+            self.assertFalse(ph.pool_delegation(self.ws, TID, A)["held"])
 
     def test_another_worker_or_no_pool_is_not_held(self):
         rt.deliver_one(self.ws, A, TID)

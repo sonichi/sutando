@@ -26,6 +26,7 @@ import contextlib
 import errno
 import fcntl
 import json
+import math
 import os
 import re
 import stat
@@ -118,11 +119,27 @@ def lease_verdict(path, now: float) -> tuple[str, str]:
     if not raw.strip():
         return LEASE_LEGACY, "no lease"
     try:
-        d = json.loads(raw.decode("utf-8")) if len(raw) <= _MAX_LEASE_BYTES else None
-        at, ttl = float(d["delivered_at"]), float(d["ttl_s"])
-    except (ValueError, TypeError, KeyError, UnicodeError):
-        return LEASE_UNREADABLE, "malformed lease"
-    if not (at == at and ttl == ttl) or ttl <= 0 or at - now > _LEASE_FUTURE_SLACK_S:
+        return _judge_lease(raw, now)
+    except Exception as e:  # noqa: BLE001 - no malformed lease may raise past the verdict
+        return LEASE_UNREADABLE, f"malformed lease ({type(e).__name__}: {e})"[:160]
+
+
+def _lease_number(v) -> float:
+    """A finite, representable JSON number; anything else raises."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise TypeError("not a number")
+    f = float(v)
+    if not math.isfinite(f):
+        raise ValueError("not finite")
+    return f
+
+
+def _judge_lease(raw: bytes, now: float) -> tuple[str, str]:
+    if len(raw) > _MAX_LEASE_BYTES:
+        return LEASE_UNREADABLE, "oversized lease"
+    d = json.loads(raw.decode("utf-8"))
+    at, ttl = _lease_number(d["delivered_at"]), _lease_number(d["ttl_s"])
+    if ttl <= 0 or at < 0 or at - now > _LEASE_FUTURE_SLACK_S:
         return LEASE_UNREADABLE, "implausible lease"
     if now >= at + ttl:
         return LEASE_EXPIRED, f"expired {int(now - at - ttl)}s ago"

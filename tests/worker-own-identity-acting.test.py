@@ -430,6 +430,21 @@ class TheDelegationMustBeCurrent(TaskCase):
         self.assertIsInstance(got, C.NoConnectionForRoom)
         self.assertEqual([e["verdict"] for e in events], ["unreadable"])
 
+    def test_a_lease_no_parser_can_trust_is_logged_in_warn_and_refused_in_enforce(self):
+        huge = "1" + "0" * 400
+        for body in ('{"delivered_at": Infinity, "ttl_s": 3600}', '{"delivered_at": 1000000, "ttl_s": NaN}',
+                     '{"delivered_at": 1000000, "ttl_s": 1e400}', '{"delivered_at": %s, "ttl_s": 3600}' % huge,
+                     '{"delivered_at": 1000000, "ttl_s": -5}', '{"delivered_at": "1000000", "ttl_s": true}'):
+            with self.subTest(body=body[:60]):
+                task = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+                self.deliver("task-abc123")
+                (self.ws / "deliveries" / W / "task-abc123.txt").write_text(body)
+                got, events = self.answer(task, "warn", 1_000_100.0)
+                self.assertEqual((got, [e["verdict"] for e in events]), ("alpha", ["unreadable"]))
+                got, events = self.answer(task, "enforce", 1_000_100.0)
+                self.assertIsInstance(got, C.NoConnectionForRoom)
+                self.assertEqual([e["verdict"] for e in events], ["unreadable"])
+
     def test_the_mode_defaults_to_warn(self):
         task = self.leased("task-abc123", 1_000_000.0)
         with mock.patch("time.time", return_value=1_003_601.0), self.assertLogs("connections", "WARNING"):

@@ -61,7 +61,15 @@ def pool_delegation(workspace, task_id: str, worker: str, pool_scripts=None, now
     if found is None or found.parent.name != worker:
         return {"held": False, "verdict": None, "detail": "not delivered to this worker",
                 "mode": None, "allowed": False}
-    verdict, detail = pd.lease_verdict(found, time.time() if now is None else now)
+    now = time.time() if now is None else now
+    verdict, detail = pd.lease_verdict(found, now)
+    if verdict == pd.LEASE_UNREADABLE and not os.path.lexists(found):
+        # Accepting renames the sentinel between the lookup and the read; follow it once.
+        found = sentinel_of(Path(workspace), task_id)
+        if found is None or found.parent.name != worker:
+            return {"held": False, "verdict": None, "detail": "not delivered to this worker",
+                    "mode": None, "allowed": False}
+        verdict, detail = pd.lease_verdict(found, now)
     mode = pd.lease_mode()
     return {"held": True, "verdict": verdict, "detail": detail, "mode": mode,
             "allowed": pd.lease_allows(verdict, mode)}
