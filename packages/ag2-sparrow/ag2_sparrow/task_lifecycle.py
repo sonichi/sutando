@@ -372,15 +372,15 @@ def prepare_work_dir(work, check_only=False):
                 if name in STATE_OPTIONAL_DIRS and not _is_type(os.path.join(state, name), "dir"):
                     return "refusing to start: state/%s in %s is not a plain directory" % (name, state)
                 continue
-            if name.endswith(".tmp") and name[:-4] in LOCAL_FEATURE_FILES:
-                # A feature record's own temp (`<name>.tmp`, then replaced): a live writer's, or one left by a crash.
-                if not check_only and time.time() - os.lstat(os.path.join(state, name)).st_mtime > TEMP_SWEEP_AFTER:
-                    os.unlink(os.path.join(state, name))
-                continue
             if name in LEGACY_TEMPS:
                 if not _is_type(os.path.join(state, name), "file"):
                     return "refusing to start: state/%s in %s is not a plain file" % (name, state)
                 if not check_only:
+                    os.unlink(os.path.join(state, name))
+                continue
+            if name.endswith(".tmp") and name[:-4] in LOCAL_FEATURE_FILES:
+                # A feature record's own temp (`<name>.tmp`, then replaced): a live writer's, or one left by a crash.
+                if not check_only and time.time() - os.lstat(os.path.join(state, name)).st_mtime > TEMP_SWEEP_AFTER:
                     os.unlink(os.path.join(state, name))
                 continue
             if name.startswith(".") and name.endswith(".tmp") and any(name[1:].startswith(a + ".")
