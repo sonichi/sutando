@@ -12,6 +12,8 @@ const STUCK_TICKS = 300
 const ADOPT_TICKS = 1800
 // One taken back still waiting for its queued turn to start: intake stops waiting for it after this many.
 const ADOPT_CALL_TICKS = 300
+// A confirmation the CLI keeps asking to retry: intake stops waiting for it after this many ticks.
+const CONFIRM_TICKS = 300
 // The offers in flight, in the session's state: a reload starts this module's variables over, not these.
 const KEPT = { plugin: 'ag2space-inbox', key: 'offers' } as const
 const TASK_RE = /^task-[A-Za-z0-9._~-]+\.txt$/
@@ -88,7 +90,8 @@ function submittedAt(turnText: string, msg: string): number {
 // One lifecycle claim as the Mod sees it: the phase is the CLI's answer, never a shadow machine.
 type Offer = { file: string; rid: string; attempt: number; msg: string; hash: string; token: string; turnId: string; phase: string
                 confirming?: { turnId: string; hash: string; completed?: string }; stagedText?: string
-                parkPending?: string; unconfirmed?: boolean; adoptedAt?: number; submitted?: boolean }
+                parkPending?: string; unconfirmed?: boolean; adoptedAt?: number; submitted?: boolean
+                staging?: string; confirmSince?: number }
 
 // One session's inbox state: what was seen and answered, the offers in flight, the live watch, the
 // session-id witness and whether intake is open.
@@ -202,13 +205,14 @@ function retireTask($: any, s: State, name: string, rid: string, why: string, do
 
 // The offers as a reloaded plugin needs them, written at every change. An engine without `$.state` keeps
 // none, and a reload there goes the way it always has.
-// `staging`: the body about to be handed to `stage`, kept first so a reload in the middle still has its bytes.
-async function keep($: any, s: State, staging?: { rid: string; text: string }): Promise<void> {
-  const kept: KeptOffer[] = [...s.offers.values()].filter(o => !o.unconfirmed).map(o => {
-    const body = o.stagedText ?? (staging?.rid === o.rid ? staging.text : undefined)
+// `staging` is the body handed to `stage` and not settled yet: it rides on the offer, so every save made
+// while the CLI runs carries its bytes, whoever makes it.
+async function keep($: any, s: State): Promise<void> {
+  const kept: KeptOffer[] = [...s.offers.values()].map(o => {
+    const body = o.stagedText ?? o.staging
     return { file: o.file, rid: o.rid, attempt: o.attempt, msg: o.msg, hash: o.hash, token: o.token, turnId: o.turnId, phase: o.phase,
       ...(body === undefined ? {} : { stagedText: body }), ...(o.submitted ? { submitted: true } : {}),
-      ...(o.confirming ? { confirming: { ...o.confirming } } : {}) }
+      ...(o.confirming ? { confirming: { ...o.confirming } } : {}), ...(o.unconfirmed ? { unconfirmed: true } : {}) }
   })
   try { await $.state.set(KEPT, kept) } catch { /* not kept: the next reload fails closed */ }
 }
@@ -245,6 +249,12 @@ async function restore($: any, s: State): Promise<void> {
         // Its turn had started: the confirmation is tried again at the next tick, and its end is not lost.
         offer.submitted = true
         offer.confirming = { turnId: c.turnId, hash: c.hash, ...(typeof c.completed === 'string' ? { completed: c.completed } : {}) }
+        offer.confirmSince = s.tick
+        if (k.unconfirmed === true) offer.unconfirmed = true
+      } else if (k.unconfirmed === true) {
+        // Intake had already stopped waiting for it before this reload: still not waited for, still confirmable.
+        offer.submitted = k.submitted === true
+        offer.unconfirmed = true
       } else if (k.submitted === true) {
         offer.submitted = true
         if (!s.pending) s.pending = offer
@@ -408,6 +418,13 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
           o.unconfirmed = true
           if (s.pending === o) s.pending = null
           await $.ui.log(`${PLUGIN}: ${o.rid} taken back after a plugin reload, and its turn did not start within ${ADOPT_CALL_TICKS / 60} minutes; intake goes on, and the next start answers it`, {})
+        }
+        if (o.confirming && !o.unconfirmed && s.tick - (o.confirmSince ?? s.tick) >= CONFIRM_TICKS) {
+          // Still retried each tick, and kept for a reload, but intake no longer waits on it.
+          o.unconfirmed = true
+          if (s.pending === o) s.pending = null
+          await keep($, s)
+          await $.ui.log(`${PLUGIN}: ${o.rid} turn confirmation still not through after ${CONFIRM_TICKS / 60} minutes; intake goes on, and it is retried`, {})
         }
         if (o.confirming) { if (await confirmOffer($, s, o)) return }
         else if (o.unconfirmed) { if (await settleUnconfirmed(o)) return; continue }
@@ -627,6 +644,7 @@ export const register: Register = (on) => {
       if (hash === offer.hash) {
         // The turn is ours: CALLING -> TURN_CONFIRMED with the turn id, the nonce and the hash the claim recorded.
         offer.confirming = { turnId: e.turnId, hash }
+        offer.confirmSince = s.tick
         await confirmOffer($, s, offer)
       }
       // An unrelated manual turn: ours is still queued behind it; nothing changes.
@@ -679,10 +697,12 @@ export const register: Register = (on) => {
     }
     if (offer.phase !== 'RESULT_STAGED') {
       // Kept before the CLI is asked: a reload while `stage` runs may leave its descriptor recorded.
-      await keep($, s, { rid: id, text })
+      offer.staging = text
+      await keep($, s)
       const staged = await cli($, s, ['stage', id, offer.turnId], text + '\n')
       // Hard without "staged", or a retry: this text's descriptor may be recorded, so it is the accepted answer.
       if ((staged.hard && staged.data?.outcome !== 'staged') || (!staged.ok && staged.data?.retry)) offer.stagedText = text
+      offer.staging = undefined
       if (!(staged.ok || (staged.hard && staged.data?.outcome === 'staged'))) await keep($, s)
       if (!(staged.ok || (staged.hard && staged.data?.outcome === 'staged'))) return { result: `Error: stage refused: ${staged.data?.refused ?? staged.data?.error ?? ''}${staged.data?.retry || staged.hard ? again : ''}`, isError: true }
       offer.phase = 'RESULT_STAGED'

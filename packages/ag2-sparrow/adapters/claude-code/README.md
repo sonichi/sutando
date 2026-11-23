@@ -120,9 +120,14 @@ to have reached the session is not waited for at all; one that did reach it is
 waited for five minutes; after that intake goes on, the turn is still confirmed
 if it starts, and otherwise the next start answers it. A confirmation the CLI
 asked to retry is kept with the turn it is for (and that turn's end, once seen)
-and tried again after the reload. The body handed to `stage` is kept before the
-CLI is asked, so a reload between the stage's steps still holds the bytes: they
-are staged and published at the turn's end, and no other text is accepted.
+and tried again after the reload; one the CLI keeps asking to retry holds intake
+for five minutes, after which intake goes on and the retry continues. An offer
+intake stopped waiting for is still kept, so a second reload does not lose it or
+a confirmation that came late. The body handed to `stage` rides on the offer
+from before the CLI is asked until staging is settled, so every save made in
+between carries its bytes and a reload between the stage's steps still holds
+them: they are staged and published at the turn's end, and no other text is
+accepted.
 Whatever the Mod did not keep (an engine without `$.state`, a state that could
 not be written), or the CLI does not list, goes the way it always has: a Mod
 that lost its offers inside one generation claims every listed task afresh, and a claim it already
