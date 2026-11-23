@@ -2115,6 +2115,37 @@ test('a fresh turn start saves the confirmation\'s deadline with it', async ($, 
   expect(kept.waitUntil).toBe(before + 300_000)
 })
 
+test('a confirmed turn whose end was missed keeps its thirty-minute deadline across a second reload', async ($, on) => {
+  const h = host(on)
+  const t0 = h.clock.now()
+  // Taken back once already, 29 minutes 50 seconds ago: this is the second reload.
+  const writes = seed(on, [KEPT('task-e1', 'TURN_CONFIRMED', { endBy: t0 + 10_000 })])
+  h.files['/in/task-e1.txt'] = TASK('task-e1')
+  h.claims['task-e1'] = { attempt: 1, phase: 'TURN_CONFIRMED', token: 'tok', hash: 'h', turnId: 'turn-9' }
+  h.files['/in/task-e2.txt'] = TASK('task-e2')
+  await arm($, h)
+  await h.clock.advance(8000)
+  expect(h.files['/out/task-e1.txt']).toBe(undefined)
+  expect(h.submitted.length).toBe(0)                           // intake still waits on it
+  expect((writes[writes.length - 1] as any[]).find(o => o.rid === 'task-e1').endBy).toBe(t0 + 10_000)
+  await h.clock.advance(5000)
+  expect(h.files['/out/task-e1.txt']).toContain('did not end within 30 minutes of a plugin reload')
+  expect(h.submitted.length).toBe(1)                           // not another thirty minutes
+})
+
+test('the first reload that takes a confirmed turn back sets and saves its deadline; a confirmed turn drops the confirmation\'s', async ($, on) => {
+  const h = host(on)
+  const t0 = h.clock.now()
+  const writes = seed(on, [KEPT('task-e3', 'TURN_CONFIRMED', { waitUntil: t0 + 1000 })])
+  h.files['/in/task-e3.txt'] = TASK('task-e3')
+  h.claims['task-e3'] = { attempt: 1, phase: 'TURN_CONFIRMED', token: 'tok', hash: 'h', turnId: 'turn-9' }
+  await arm($, h)
+  await h.clock.advance(3000)
+  const kept = (writes[writes.length - 1] as any[]).find(o => o.rid === 'task-e3')
+  expect(kept.endBy).toBe(t0 + 1_800_000)
+  expect(h.files['/out/task-e3.txt']).toBe(undefined)          // a stale confirmation deadline closes nothing
+})
+
 const notTakenBack = async ($: any, on: any, opts: Record<string, unknown>) => {
   const h = host(on, opts)
   seed(on, [KEPT('task-r8', 'TURN_CONFIRMED'), { rid: '../x', phase: 'TURN_CONFIRMED' }, null, 'junk'])

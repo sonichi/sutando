@@ -9,7 +9,7 @@ const STALE_TICKS = 30
 const BACKOFF_MAX_TICKS = 60
 const STUCK_TICKS = 300
 // An offer taken back after a plugin reload whose turn's end was not seen: closed after this many ticks.
-const ADOPT_TICKS = 1800
+const ADOPT_MS = 1_800_000
 // One taken back still waiting for its queued turn to start: intake stops waiting for it after this many.
 const ADOPT_CALL_MS = 300_000
 // A confirmation the CLI keeps asking to retry: intake stops waiting for it after this many ticks.
@@ -87,7 +87,7 @@ function submittedAt(turnText: string, msg: string): number {
 type Offer = { file: string; rid: string; attempt: number; msg: string; hash: string; token: string; turnId: string; phase: string
                 confirming?: { turnId: string; hash: string; completed?: string }; stagedText?: string
                 parkPending?: string; unconfirmed?: boolean; adoptedAt?: number; submitted?: boolean
-                staging?: string; waitUntil?: number }
+                staging?: string; waitUntil?: number; endBy?: number }
 
 // One session's inbox state: what was seen and answered, the offers in flight, the live watch, the
 // session-id witness and whether intake is open.
@@ -219,7 +219,8 @@ async function keep($: any, s: State): Promise<void> {
     return { file: o.file, rid: o.rid, attempt: o.attempt, msg: o.msg, hash: o.hash, token: o.token, turnId: o.turnId, phase: o.phase,
       ...(body === undefined ? {} : { stagedText: body }), ...(o.submitted ? { submitted: true } : {}),
       ...(o.confirming ? { confirming: { ...o.confirming } } : {}), ...(o.unconfirmed ? { unconfirmed: true } : {}),
-      ...(o.waitUntil === undefined ? {} : { waitUntil: o.waitUntil }) }
+      ...(o.waitUntil === undefined ? {} : { waitUntil: o.waitUntil }),
+      ...(o.endBy === undefined ? {} : { endBy: o.endBy }) }
   })
   try { await $.state.set(KEPT, kept) } catch { /* not kept: the next reload fails closed */ }
 }
@@ -276,7 +277,9 @@ async function restore($: any, s: State): Promise<void> {
       }
     } else if ((t.phase === 'TURN_CONFIRMED' || t.phase === 'RESULT_STAGED') && typeof t.turn_id === 'string' && t.turn_id) {
       offer = { file, rid, attempt: k.attempt, msg: k.msg, hash: k.hash, token: '', turnId: t.turn_id,
-                phase: t.phase, adoptedAt: s.tick, ...(k.stagedText === undefined ? {} : { stagedText: k.stagedText }) }
+                phase: t.phase, adoptedAt: s.tick, ...(k.stagedText === undefined ? {} : { stagedText: k.stagedText }),
+                // From the first reload that took it back: a later reload keeps this deadline.
+                endBy: typeof k.endBy === 'number' && Number.isFinite(k.endBy) ? k.endBy : at + ADOPT_MS }
       // An accepted answer needs no turn: published at the next tick.
       if (t.phase === 'RESULT_STAGED') offer.parkPending = 'ended across a plugin reload'
     } else continue
@@ -334,6 +337,7 @@ async function confirmOffer($: any, s: State, offer: Offer): Promise<boolean> {
     offer.turnId = c.turnId
     offer.phase = 'TURN_CONFIRMED'
     offer.unconfirmed = undefined
+    offer.waitUntil = undefined         // the confirmation's deadline: it is through
     await keep($, s)
     return (c.completed ? (await parkOffer($, s, offer, c.completed)).hard : false) || r.hard
   }
@@ -423,8 +427,8 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
       let at: number | undefined
       for (const o of [...s.offers.values()]) {
         // Taken back after a reload and its turn's end never seen: closed, so intake is not held for good.
-        if (o.adoptedAt !== undefined && o.phase === 'TURN_CONFIRMED' && o.parkPending === undefined && s.tick - o.adoptedAt >= ADOPT_TICKS) {
-          o.parkPending = `did not end within ${ADOPT_TICKS / 60} minutes of a plugin reload`
+        if (o.endBy !== undefined && o.phase === 'TURN_CONFIRMED' && o.parkPending === undefined && (at ??= await nowMs($)) >= o.endBy) {
+          o.parkPending = `did not end within ${ADOPT_MS / 60_000} minutes of a plugin reload`
         }
         if (o.phase === 'CALLING' && !o.unconfirmed && o.waitUntil !== undefined && (at ??= await nowMs($)) >= o.waitUntil) {
           // Intake no longer waits on it, and that is kept, so a reload does not wait for it again. A

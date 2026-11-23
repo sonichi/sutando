@@ -19,6 +19,9 @@ export type KeptOffer = {
   unconfirmed?: boolean
   // When intake stops waiting for it, in ms since the epoch: absolute, so a reload does not start the wait over.
   waitUntil?: number
+  // A confirmed turn taken back after a reload: when it is closed if its end is never seen, in ms since
+  // the epoch. Set at the first reload that takes it back and kept, so a later reload does not extend it.
+  endBy?: number
 }
 
 declare module 'claude-code' {
