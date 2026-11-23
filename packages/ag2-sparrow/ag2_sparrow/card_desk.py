@@ -104,19 +104,27 @@ def led(publish, pending, quoted):
     return write
 
 
+def tapped_event(sent) -> str:
+    """The event id of the card a tap answers ('' for none): its answer is shown in place of that card."""
+    event = str((sent or {}).get("reply_to_event") or "")
+    return event if event.startswith("$") and not any(c.isspace() for c in event) else ""
+
+
 def usable(bridge_state) -> bool:
     """Whether a card can reach the room: the agent's own bridge keeps a state dir (made at install).
     Without one (a bridge run elsewhere, a bare connector) nothing would post what is queued."""
     return bool(bridge_state) and os.path.isdir(bridge_state)
 
 
-def post(bridge_state, room, built, log, key: str = "", at_ns: int = 0) -> bool:
+def post(bridge_state, room, built, log, key: str = "", at_ns: int = 0, edit: str = "") -> bool:
     """Queue a built card for the bridge to post in `room`; False when it cannot be. With `key` the
-    call may be repeated after a restart without a second card (connector_cards.queue)."""
+    call may be repeated after a restart without a second card (connector_cards.queue). With `edit` (the
+    event id of the card being answered) it is shown in place of that card, not as a second one."""
     if not usable(bridge_state):
         return False
     try:
-        connector_cards.queue(bridge_state, str(room or ""), *built, key=key, at_ns=at_ns)
+        connector_cards.queue(bridge_state, str(room or ""), *built, key=key, at_ns=at_ns,
+                              edit=edit if str(edit or "").startswith("$") else "")
         return True
     except (OSError, ValueError) as e:
         log("card not queued:", "%s: %s" % (type(e).__name__, e))
