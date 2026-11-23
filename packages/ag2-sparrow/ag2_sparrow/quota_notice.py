@@ -109,10 +109,13 @@ class QuotaNotice:
         kept = str(self._read(ROOM_FILE).get("room") or "")
         return kept if _ROOM.match(kept) else ""
 
-    def remember(self, task_text: str) -> None:
-        """A message of the owner's in their DM (the task's text, as the bridge wrote it) names the room a
-        notice goes to. Any other sender or room is ignored; nothing here stops the task."""
+    def remember(self, task_text: str = "", path=None) -> None:
+        """A message of the owner's in their DM (the task's text as the bridge wrote it, or its file at `path`)
+        names the room a notice goes to. Any other sender or room is ignored; nothing here stops the task."""
         try:
+            if path is not None:
+                with open(path, encoding="utf-8") as f:
+                    task_text = f.read()
             agent_card, _ = connector_cards._core()
             sent, _ = agent_card.reply_words(task_text or "")
             seen = str(sent.get("channel_id") or "")
