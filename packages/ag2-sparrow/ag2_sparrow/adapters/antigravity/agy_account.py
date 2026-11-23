@@ -1,8 +1,8 @@
 """Antigravity's account card, in the owner's DM with the agent (Commons "switch account / API key", part A).
 
 The owner says "switch account" or "use API key" (in English or Chinese, or /account, or the turn answers
-with the account card's mark) and gets a card with "Switch account" and "Use API key" (plus "Stop using API
-key" while a key is saved). Its words are English only. The card carries `account_controls`: in the desktop
+with the account card's mark) and gets a card with "Switch account" and "Use API key" (no "Stop using API key": the owner
+switches to whatever they want to use instead, 2026-11-23). Its words are English only. The card carries `account_controls`: in the desktop
 app, on the computer that runs the agent, the owner switches account or enters a key right in the card
 (nothing typed there reaches the room); elsewhere the client says where to open it. It is a card
 of card_desk's `Desk`, asked for and tapped as the Codex account card is (account_switch): only the owner's
@@ -17,7 +17,8 @@ message, so neither a sign-in code nor a key may travel that way.
   owner turn reads which account agy authenticated (`applyAuthResult` in agy's own log, `signed_in_as`) and
   says when it changed.
 - "Use API key" says the same for the key field (the Keychain item gemini_key reads).
-- "Stop using API key" deletes this agent's own Keychain item (gemini_key.clear_key).
+- "Stop using API key" (only on cards sent before 2026-11-23; new cards no longer offer it) deletes this
+  agent's own Keychain item (gemini_key.clear_key).
 - A sign-in code, a landing address with one, a Gemini key, or the bridge's redaction marker for one, sent
   in chat is never passed to agy (`carries_secret`): the owner is asked to delete the message.
 - When a turn fails on agy's quota (RESOURCE_EXHAUSTED, "Individual quota reached", a 429), the connector
@@ -34,6 +35,9 @@ from . import gemini_key
 
 SWITCH, KEY, UNKEY = "switch", "key", "unkey"
 LABELS = {SWITCH: "Switch account", KEY: "Use API key", UNKEY: "Stop using API key"}
+# The menu's buttons. No "Stop using API key" (owner 2026-11-23: whatever is switched to is what is used);
+# UNKEY stays handled for cards sent before that.
+MENU_VERBS = (SWITCH, KEY)
 SHARED = ("Note: every Antigravity agent on this Mac shares one Google sign-in, so switching moves them all to "
           "the new account.")
 # The card's own words and its marker (the same as the Codex account card's, account_switch on #6685).
@@ -162,9 +166,8 @@ class AgyAccount:
         agent_card, _ = connector_cards._core()
         buttons = []
         if menu:
-            verbs = (SWITCH, KEY, UNKEY) if keyed else (SWITCH, KEY)
             buttons = [agent_card.button(LABELS[v], "reply", reply=LABELS[v],
-                                         command=agent_card.reply("account", "agent", v)) for v in verbs]
+                                         command=agent_card.reply("account", "agent", v)) for v in MENU_VERBS]
         if url:
             buttons.append(agent_card.button("Open sign-in page", "url", url=url))
         body, built = agent_card.build(account_switch.CARD if menu else account_switch.NOTE, state,

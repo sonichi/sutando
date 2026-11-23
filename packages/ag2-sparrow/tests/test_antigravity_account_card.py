@@ -97,6 +97,12 @@ class AccountCardTest(unittest.TestCase):
                                lambda p: sent.append(p) or {"ok": True, "event_id": event}, log=lambda line: None).sweep()
         return [s["extra_content"]["space.ag2.card"] for s in sent]
 
+    def older_menu(self, **kw):
+        """A card as sent before 2026-11-23, when the menu still offered "Stop using API key"."""
+        from unittest import mock
+        with mock.patch.object(agy_account, "MENU_VERBS", (agy_account.SWITCH, agy_account.KEY, agy_account.UNKEY)):
+            return self.menu(**kw)
+
     def menu(self, ask="换账号", event="$card1"):
         self.dm("task-ask", ask)
         self.serve()
@@ -191,7 +197,7 @@ class AccountCardTest(unittest.TestCase):
 
     def test_a_tap_that_is_not_the_owners_changes_nothing(self):
         self.keychain["saved"] = True
-        card = self.menu()
+        card = self.older_menu()
         self.tap("task-team", card, "Stop using API key", tier="team", collaborator=True)
         self.assertIn("couldn't match that button", self.w.result("task-team"))
         self.tap("task-guest", card, "Switch account", tier="guest")
@@ -210,11 +216,15 @@ class AccountCardTest(unittest.TestCase):
         self.assertEqual(self.prompts(), [])
         self.assertNotIn(DUMMY_KEY, "\n".join(self.logs) + json.dumps(self.w.metrics()))
 
-    def test_with_a_saved_key_stop_removes_only_this_agents_item(self):
+    def test_a_new_card_offers_no_stop_using_api_key_even_with_a_saved_key(self):
         self.keychain["saved"] = True
         card = self.menu()
+        self.assertEqual([b["label"] for b in card["buttons"]], ["Switch account", "Use API key"])
+
+    def test_with_a_saved_key_stop_removes_only_this_agents_item(self):
+        self.keychain["saved"] = True
+        card = self.older_menu()
         self.assertIn("Gemini API key", card["text"])
-        self.assertEqual([b["label"] for b in card["buttons"]], ["Switch account", "Use API key", "Stop using API key"])
         self.tap("task-stop", card, "Stop using API key")
         self.assertEqual(self.cleared, [AGENT])
         (done,) = self.posted("$card2")
@@ -222,7 +232,7 @@ class AccountCardTest(unittest.TestCase):
 
     def test_a_keychain_failure_is_said_as_one_never_as_removed(self):
         self.keychain.update(saved=True, broken=True)
-        card = self.menu()
+        card = self.older_menu()
         self.tap("task-stop", card, "Stop using API key")
         (said,) = self.posted("$card2")
         self.assertEqual(said["state"], "error")
@@ -232,7 +242,7 @@ class AccountCardTest(unittest.TestCase):
 
     def test_stop_on_an_older_card_after_the_key_is_gone_changes_nothing_and_says_so(self):
         self.keychain["saved"] = True
-        card = self.menu()
+        card = self.older_menu()
         self.tap("task-stop1", card, "Stop using API key")
         self.posted("$card2")
         self.tap("task-stop2", card, "Stop using API key")
