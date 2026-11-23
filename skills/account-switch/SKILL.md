@@ -54,12 +54,13 @@ starts `account_card.py switch` detached, in its own session, because the core r
 2. writes the saved one as the core's `<CODEX_HOME>/auth.json` (0600);
 3. runs `src/agent/graceful-restart.sh` (it waits for the core's turn to end, then
    `start-cli.sh --restart`; a seat core is replaced as a seat);
-4. waits for a heartbeat that names a core process (in the intended core session on its tmux socket, not the writer's own pid) other than the one before the switch (the heartbeat
-   writer outlives restarts, so a fresh beat alone does not prove a restart), asks Codex's own
-   `account/read` which account the saved sign-in is, and posts the outcome in the same DM: **"Switched. The core restarted, and Codex confirms its saved
-   sign-in is X. I can't yet confirm which account the running core itself is using."**. When the beats
-   still name the old core, it says the restart was requested and a heartbeat seen, but not that the
-   core restarted. Otherwise it says why not.
+4. waits for a fresh heartbeat from the core session (its session and tmux socket), asks Codex's own
+   `account/read` which account the saved sign-in is, and posts the outcome in the same DM: **"I asked
+   the core to restart with X's sign-in, and its heartbeat came back after the request (or: I haven't
+   seen a heartbeat from the core session since). Saved sign-in verified: Codex confirms it is X. The
+   running core's own account isn't confirmed."**, or why the saved sign-in is not X. It never says
+   the core restarted: a heartbeat shows the session alive, not which process or account answers in it
+   (a known limit).
    When the restart definitely did not happen (exit 3 not ready, 4 put off, 5 rehearsal), the previous
    state is put back, absence included; after any other failure the new sign-in stays and the reply
    says the outcome is unknown. One switch runs at a time.
