@@ -5838,7 +5838,7 @@ def _statusline_quota_freshness(check: dict) -> dict:
 
 
 def check_claude_sign_in() -> dict:
-    """DOWN when the core's config dir is not signed in on its own while sessions go direct, and
+    """FAIL when the core's config dir is not signed in on its own while sessions go direct, and
     queue one owner message per day with the sign-in step (src/claude_signed_in.py)."""
     import claude_signed_in  # src/ is on sys.path
     from claude_account import core_config_dir
