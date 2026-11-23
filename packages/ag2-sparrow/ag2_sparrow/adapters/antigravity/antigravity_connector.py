@@ -699,6 +699,7 @@ class Connector:
         path = os.path.join(self.args.inbox, name)
         result_file = os.path.join(self.args.results, name)
         headers, message, operator_lines = parse_task(path)
+        task_text = card_desk.read_task(path)     # Desk.marked reads it after the turn, when it may be archived
         kind, turn_kind = turn_for(headers)
         if turn_kind is None:
             log("refused (non-owner) ->", task_id, headers["access_tier"])
@@ -727,7 +728,7 @@ class Connector:
         # The owner's pick runs on every turn, whoever sends it; the outcome is told in the owner's DM only,
         # and only the owner's own turn may settle it as failed (another runtime's refusal is not theirs).
         told = self.models.tell(turn.live, turn.model, headers.get("channel_id"), may_fail=kind == OWNER)
-        asked = self.desk.marked(headers.get("access_tier"), path, status, text, result_file)
+        asked = self.desk.marked(headers.get("access_tier"), task_text, status, text, result_file)
         unsaid = "" if asked else quoted(self.models.unsaid()).strip()
         body = self.answer_body(headers, status, text, detail, turn) + (unsaid and unsaid + "\n")
         reason = ""
