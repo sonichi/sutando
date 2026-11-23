@@ -9,13 +9,16 @@ and for ag2-sparrow's claude-local adapter (bundled verbatim; the package drift 
     python3 claude_model_switch.py model-pattern        # the names that may be typed, as an ERE
     python3 claude_model_switch.py accept <model>       # Claude Code's line for a switch to it, as an ERE
     python3 claude_model_switch.py count <model>        # how many such lines the screen on stdin holds
-    python3 claude_model_switch.py count <model> --settings FILE   # the same, a [1m] line without its size
-                                                                   # counting once FILE's model names it
+    python3 claude_model_switch.py baseline <model> --settings FILE           # pre-send evidence + FILE's mark
+    python3 claude_model_switch.py settled <model> --settings FILE --baseline B  # 1 when the screen shows
+                                                       # a NEW switch line (a size-omitted [1m] one only after a fresh save)
     python3 claude_model_switch.py confirm-text         # the text of Claude Code's confirm dialog
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import sys
 
@@ -87,6 +90,20 @@ def family_count(model: str, shown) -> int:
     return sum(1 for line in (shown or "").splitlines() if pattern.search(line))
 
 
+# A line that states a context size at all ("1M context", "200k"): only a line that states none is size-omitted.
+STATES_SIZE = re.compile(r"\d+(\.\d+)?\s*[km]\b|\bcontext\b", re.I)
+
+
+def evidence(model: str, shown) -> "tuple[int, int]":
+    """(strict, omitted) lines on screen for a switch to `model`: strict ones are `accepted_count`'s;
+    omitted ones name its family and version but state no context size. Claude Code 2.1.322 answers
+    `/model sonnet[1m]` with "Set model to Sonnet 5.5 and saved as your default for new sessions"
+    (measured 2026-11-22). A line stating another size contradicts a [1m] switch and is in neither."""
+    pattern = model_accepted(model)
+    omitted = sum(1 for line in (shown or "").splitlines() if pattern.search(line) and not STATES_SIZE.search(line))
+    return accepted_count(model, shown), omitted
+
+
 def saved_setting(settings_file) -> str:
     """The `model` a CLI's settings.json holds, '' when it cannot be read or names none."""
     try:
@@ -97,13 +114,36 @@ def saved_setting(settings_file) -> str:
     return saved if isinstance(saved, str) else ""
 
 
-def settled_count(model: str, shown, saved: str = "") -> int:
-    """`accepted_count`, except that a [1m] switch the CLI answered without naming the context size counts
-    once its saved setting (`saved`) names exactly that model: then every line of its family does. Taken
-    before a send and again after, with the setting as it is each time, a NEW line is still required."""
-    if model.endswith("[1m]") and saved == model:
-        return family_count(model, shown)
-    return accepted_count(model, shown)
+def settings_mark(settings_file) -> str:
+    """An opaque token for the settings file as it is now (mtime, size, saved model): a save changes it."""
+    try:
+        st = os.stat(settings_file)
+        stamp = "%d.%d" % (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = "absent"
+    return "%s.%s" % (stamp, hashlib.sha256(saved_setting(settings_file).encode()).hexdigest()[:12])
+
+
+def baseline(model: str, shown, settings_file) -> str:
+    """The pre-send reading `settled` compares against: "<strict> <omitted> <settings mark>"."""
+    strict, omitted = evidence(model, shown)
+    return "%d %d %s" % (strict, omitted, settings_mark(settings_file))
+
+
+def settled(model: str, shown, settings_file, base: str) -> bool:
+    """A NEW strict line accepts any switch. A [1m] switch is also accepted by a NEW size-omitted line,
+    but only when the settings file was saved since the baseline and now names exactly `model`: an
+    unchanged pane is never a switch, whatever the setting says, and an old setting confirms nothing."""
+    try:
+        b_strict, b_omitted, b_mark = base.split(" ")
+        b_strict, b_omitted = int(b_strict), int(b_omitted)
+    except ValueError:
+        return False
+    strict, omitted = evidence(model, shown)
+    if strict > b_strict:
+        return True
+    return (model.endswith("[1m]") and omitted > b_omitted and settings_mark(settings_file) != b_mark
+            and saved_setting(settings_file) == model)
 
 
 def main(argv) -> int:
@@ -119,11 +159,15 @@ def main(argv) -> int:
     if argv[:1] == ["count"] and len(argv) == 2 and MODEL_RE.match(argv[1]):
         print(accepted_count(argv[1], sys.stdin.read()))
         return 0
-    if argv[:1] == ["count"] and len(argv) == 4 and argv[2] == "--settings" and MODEL_RE.match(argv[1]):
-        print(settled_count(argv[1], sys.stdin.read(), saved_setting(argv[3])))
+    if argv[:1] == ["baseline"] and len(argv) == 4 and argv[2] == "--settings" and MODEL_RE.match(argv[1]):
+        print(baseline(argv[1], sys.stdin.read(), argv[3]))
         return 0
-    print("usage: claude_model_switch.py model-pattern | accept <model> | count <model> [--settings FILE] | "
-          "confirm-text", file=sys.stderr)
+    if (argv[:1] == ["settled"] and len(argv) == 6 and argv[2] == "--settings" and argv[4] == "--baseline"
+            and MODEL_RE.match(argv[1])):
+        print("1" if settled(argv[1], sys.stdin.read(), argv[3], argv[5]) else "0")
+        return 0
+    print("usage: claude_model_switch.py model-pattern | accept <model> | count <model> | "
+          "baseline <model> --settings FILE | settled <model> --settings FILE --baseline B | confirm-text", file=sys.stderr)
     return 2
 
 

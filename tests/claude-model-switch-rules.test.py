@@ -3,6 +3,7 @@
 the core's model-switch skill (through its command line) and for ag2-sparrow's claude-local adapter."""
 import contextlib
 import io
+import os
 import re
 import tempfile
 import json
@@ -174,29 +175,49 @@ class Rules(unittest.TestCase):
         self.assertNotIn("re.compile(r\"\\x1b", source, "no screen pattern of its own")
         self.assertEqual(bundled.pane_composer.__name__, "ag2_sparrow.pane_composer", "the package loads its bundled copy")
 
-    def test_a_1m_switch_answered_without_its_size_counts_once_the_saved_setting_names_it(self):
+    def test_a_1m_switch_answered_without_its_size_counts_only_after_a_fresh_save_naming_it(self):
         # Claude Code 2.1.322, measured 2026-11-22: `/model sonnet[1m]` printed this line, naming no
         # context size, and saved `"model": "sonnet[1m]"` in its settings.json.
         real = "  \u23bf  Set model to Sonnet 5.5 and saved as your default for new sessions"
         self.assertEqual(rules.accepted_count("sonnet[1m]", real), 0, "the line alone is not a [1m] switch")
-        self.assertEqual(rules.family_count("sonnet[1m]", real), 1)
-        self.assertEqual([rules.settled_count("sonnet[1m]", real, saved) for saved in ("sonnet[1m]", "sonnet", "")],
-                         [1, 0, 0])
-        self.assertEqual(rules.settled_count("sonnet", real, "sonnet[1m]"), 1, "a plain switch reads its line as before")
-        self.assertEqual(rules.settled_count("opus[1m]", real, "opus[1m]"), 0, "another family's line never counts")
-        # Before the send the setting is the old model, after it the new one: an old line on screen is
-        # counted in both readings, so only a NEW line takes the count above its baseline.
+        self.assertEqual(rules.evidence("sonnet[1m]", real), (0, 1))
+        self.assertEqual(rules.evidence("sonnet[1m]", "Set model to Sonnet 5.5 (200k context)"), (0, 0),
+                         "a line stating another size contradicts a [1m] switch")
+        self.assertEqual(rules.evidence("opus[1m]", real), (0, 0), "another family's line never counts")
         two = real + "\n" + real
-        self.assertEqual((rules.settled_count("sonnet[1m]", real, "sonnet[1m]"),
-                          rules.settled_count("sonnet[1m]", two, "sonnet[1m]")), (1, 2))
         with tempfile.TemporaryDirectory() as d:
             f = Path(d) / "settings.json"
-            self.assertEqual(rules.saved_setting(f), "")
-            f.write_text(json.dumps({"model": "sonnet[1m]", "theme": "dark"}))
-            self.assertEqual(rules.saved_setting(f), "sonnet[1m]")
-            out = subprocess.run([sys.executable, str(REPO / "src" / "claude_model_switch.py"), "count", "sonnet[1m]",
-                                  "--settings", str(f)], input=real + "\n", capture_output=True, text=True)
-            self.assertEqual(out.stdout.strip(), "1")
+
+            def save(model, ns):
+                f.write_text(json.dumps({"model": model, "theme": "dark"}))
+                os.utime(f, ns=(ns, ns))
+
+            # A fresh save naming the model confirms a NEW size-omitted line.
+            save("sonnet", 1_000_000_000)
+            base = rules.baseline("sonnet[1m]", real, f)
+            save("sonnet[1m]", 2_000_000_000)
+            self.assertTrue(rules.settled("sonnet[1m]", two, f, base))
+            # Unchanged pane, changed saved setting: no new line, so no switch.
+            self.assertFalse(rules.settled("sonnet[1m]", real, f, base))
+            # The same value already saved and not saved again: a new line is not confirmed by it.
+            base = rules.baseline("sonnet[1m]", real, f)
+            self.assertFalse(rules.settled("sonnet[1m]", two, f, base))
+            # A fresh save of another model confirms nothing; a new strict line always does.
+            save("sonnet", 3_000_000_000)
+            self.assertFalse(rules.settled("sonnet[1m]", two, f, base))
+            self.assertTrue(rules.settled("sonnet[1m]", real + "\nSet model to Sonnet 5.5 (1M context)", f, base))
+            # A plain switch reads its strict line as before, whatever the setting.
+            self.assertTrue(rules.settled("sonnet", two, f, rules.baseline("sonnet", real, f)))
+            self.assertFalse(rules.settled("sonnet[1m]", two, f, "garbage"), "an unreadable baseline accepts nothing")
+            # The command line, as pane-observe.sh calls it.
+            cli = [sys.executable, str(REPO / "src" / "claude_model_switch.py")]
+            save("sonnet", 4_000_000_000)
+            base = subprocess.run(cli + ["baseline", "sonnet[1m]", "--settings", str(f)], input=real + "\n",
+                                  capture_output=True, text=True).stdout.strip()
+            save("sonnet[1m]", 5_000_000_000)
+            out = subprocess.run(cli + ["settled", "sonnet[1m]", "--settings", str(f), "--baseline", base],
+                                 input=two + "\n", capture_output=True, text=True)
+            self.assertEqual(out.stdout.strip(), "1", out.stderr)
             for bad in ("not json", "[1]", json.dumps({"model": 5})):
                 f.write_text(bad)
                 self.assertEqual(rules.saved_setting(f), "", bad)

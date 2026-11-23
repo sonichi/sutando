@@ -272,5 +272,8 @@ R=$(python3 -c "import json;print(json.load(open('$T/state/model-switch.json'))[
 printf '{"model":"opus"}\n' > "$T/cfg1m/settings.json"; : > "$TMUX_LOG"; rm -f "$TMUX_LOG.caps"
 rc=$(TMUX_NO_SIZE=1 "$HERE/scripts/switch-model.sh" 'sonnet[1m]' --accept-timeout 2 --state-dir "$T/state" --brain "$T/cfg1m" > "$T/out" 2> "$T/err"; echo $?)
 [ "$rc" = 8 ] && ok "66 the same line with the pick NOT saved stays unconfirmed (rc=8)" || fail "66" "rc=$rc $(cat "$T/err")"
+printf '{"model":"sonnet[1m]"}\n' > "$T/cfg1m/settings.json"; : > "$TMUX_LOG"; rm -f "$TMUX_LOG.caps"
+rc=$(TMUX_NO_SIZE=1 "$HERE/scripts/switch-model.sh" 'sonnet[1m]' --accept-timeout 2 --state-dir "$T/state" --brain "$T/cfg1m" > "$T/out" 2> "$T/err"; echo $?)
+[ "$rc" = 8 ] && ok "67 the pick saved BEFORE the send and not saved again confirms nothing (rc=8)" || fail "67" "rc=$rc $(cat "$T/err")"
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 66 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+echo; [ $fails -eq 0 ] && echo "switch-model: all 67 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }

@@ -21,9 +21,9 @@ ACCEPT=""
 if [ "$MODE" != cancel ]; then ACCEPT="$("$PY" "$REPO_ROOT/src/claude_model_switch.py" accept "$REQ")" || { echo "pane-observe: '$REQ' is not a model" >&2; exit 2; }; fi
 # A failed capture is a failed observation, never a zero.
 cap() { tmux -S "$SOCK" capture-pane -p -t "$SESSION" 2>/dev/null || { echo "CAPTURE-FAILED"; return 12; }; }
-# With --settings (the CLI's settings.json), a [1m] switch the CLI answers without naming the context size
-# counts once that file names the model (Claude Code 2.1.322: "Set model to Sonnet 5.5 and saved ...").
-COUNT_ARGS=(count "$REQ"); [ -n "$SETTINGS" ] && COUNT_ARGS+=(--settings "$SETTINGS")
+# With --settings (the CLI's settings.json) the baseline is "<strict> <omitted> <mark>": a [1m] line without
+# its size counts only after a fresh save of that file naming the model (claude_model_switch.py settled).
+COUNT_ARGS=(count "$REQ"); [ -n "$SETTINGS" ] && COUNT_ARGS=(baseline "$REQ" --settings "$SETTINGS")
 count() { out="$(cap)" || { echo "CAPTURE-FAILED"; return 12; }; printf '%s\n' "$out" | "$PY" "$REPO_ROOT/src/claude_model_switch.py" "${COUNT_ARGS[@]}"; return 0; }
 case "$MODE" in
   count) count; exit $?;;
@@ -40,8 +40,13 @@ while :; do
     # Unobservable pane: keep polling, but never let a blind poll count as acceptance.
     [ "$(date +%s)" -ge "$deadline" ] && { echo TIMEOUT; exit 11; }; sleep 0.5; continue
   fi
-  n=$(printf '%s\n' "$text" | "$PY" "$REPO_ROOT/src/claude_model_switch.py" "${COUNT_ARGS[@]}")
-  if [ "$n" -gt "$BASE" ]; then echo ACCEPTED; exit 0; fi
+  if [ -n "$SETTINGS" ]; then
+    n=$(printf '%s\n' "$text" | "$PY" "$REPO_ROOT/src/claude_model_switch.py" settled "$REQ" --settings "$SETTINGS" --baseline "$BASE")
+    [ "$n" = 1 ] && { echo ACCEPTED; exit 0; }
+  else
+    n=$(printf '%s\n' "$text" | "$PY" "$REPO_ROOT/src/claude_model_switch.py" count "$REQ")
+    if [ "$n" -gt "$BASE" ]; then echo ACCEPTED; exit 0; fi
+  fi
   if [ -z "$ANSWER" ] && printf '%s' "$text" | grep -q -- "$DIALOG"; then echo DIALOG; exit 10; fi
   [ "$(date +%s)" -ge "$deadline" ] && { echo TIMEOUT; exit 11; }
   sleep 0.5
