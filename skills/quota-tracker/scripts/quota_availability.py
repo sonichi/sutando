@@ -44,6 +44,7 @@ PROXY_HOSTS = _authority.PROXY_HOSTS
 points_at_credential_proxy = _authority.points_at_credential_proxy
 resolve_available = _authority.resolve_available
 availability_decision = _authority.availability_decision
+trusted_record = _authority.trusted_record
 
 __all__ = ["PROXY_PORT", "PROXY_SCHEME", "PROXY_HOSTS", "points_at_credential_proxy",
-           "resolve_available", "availability_decision"]
+           "resolve_available", "availability_decision", "trusted_record"]

@@ -46,7 +46,6 @@ it holds nothing unless its text names a usage limit or a time to retry. The CLI
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -60,6 +59,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cli_wedge  # noqa: E402
 import quota_availability as qa  # noqa: E402
+from claude_account import account_fingerprint  # noqa: E402
 
 from workspace_default import resolve_workspace, status_read_path, write_status  # noqa: E402
 
@@ -409,23 +409,6 @@ def _same_family(limited_model: Optional[str], launch_model: Optional[str]) -> b
     return not (mine and theirs and mine != theirs)
 
 
-def account_fingerprint(config_dir: Optional[str]) -> Optional[str]:
-    """A non-reversible digest of the account the CLI is signed in to, else None.
-    Only non-secret identity fields of `.claude.json` are read; tokens never are."""
-    if not config_dir:
-        return None
-    try:
-        acct = json.loads((Path(config_dir) / ".claude.json").read_text(encoding="utf-8")).get("oauthAccount")
-    except (OSError, ValueError, AttributeError):
-        return None
-    if not isinstance(acct, dict):
-        return None
-    ident = [str(acct.get(k) or "") for k in ("accountUuid", "organizationUuid", "emailAddress")]
-    if not any(ident):
-        return None
-    return hashlib.sha256("\0".join(ident).encode("utf-8")).hexdigest()[:16]
-
-
 def _same_account(held_account: Optional[str], launch_account: Optional[str]) -> bool:
     """A hold binds only the account it was seen under; an unknown side keeps it binding."""
     return not (held_account and launch_account and held_account != launch_account)
@@ -602,7 +585,7 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
     if quota is None and not seat:
         rec = qa.read_quota_record(workspace, now)
         quota = rec.payload if rec else None
-    own = () if seat else (record_evidence(quota, now), transcript_evidence(projects_dir, now))
+    own = () if seat else (record_evidence(qa.trusted_record(quota), now), transcript_evidence(projects_dir, now))
     found = [lim for lim in (*own, *evidence) if _relevant(lim, launch_model, since)]
     limit = max(found, key=lambda lim: lim.at) if found else None
     seen = hold.get("evidence_at") if hold else None

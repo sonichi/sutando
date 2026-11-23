@@ -4597,11 +4597,39 @@ def _with_recovery(health: "dict | None") -> "dict | None":
     return {**(health or {"alive": None, "motion": "unknown"}), "recovery": rec}
 
 
+# The core's Claude quota (quota_status.v1) for the agent sidebar, through the adapter's injected
+# reader, which debounces it; like the recovery block, absent on a standalone sparrow.
+_QUOTA_STATUS_READER = globals().get("_SUTANDO_QUOTA_STATUS_READER")
+QUOTA_STATUS_CAPABILITY = "quota_status.v1"
+QUOTA_STATUS_MAX_BYTES = 1024
+_quota_status_refused_until = 0.0
+
+
+def _quota_status() -> "dict | None":
+    """The adapter's quota block when it has one and it fits the bound, else None. Never raises."""
+    if not callable(_QUOTA_STATUS_READER) or time.time() < _quota_status_refused_until:
+        return None
+    try:
+        block = _QUOTA_STATUS_READER()
+        if isinstance(block, dict) and len(json.dumps(block)) <= QUOTA_STATUS_MAX_BYTES:
+            return block
+    except Exception:  # noqa: BLE001 -- the block is advisory; the beat goes out without it
+        pass
+    return None
+
+
+def _with_quota(health: "dict | None") -> "dict | None":
+    block = _quota_status()
+    if block is None:
+        return health
+    return {**(health or {"alive": None, "motion": "unknown"}), "quota": block}
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
     global _heartbeat_retry_at, _heartbeat_backoff, _last_heartbeat_at, _last_core_health
-    global _core_recovery_refused_until
+    global _core_recovery_refused_until, _quota_status_refused_until
     now = time.time()
     # Ahead of every early return: a Stop reaches a running task only through these beats.
     _post_task_beats(inflight, force=force)
@@ -4612,7 +4640,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
               if _HEALTH_COMMAND else _core_health(_health_snapshot()))
     core_health = health
     base = _diagnostic_health(health)
-    health = _with_recovery(base)
+    health = _with_quota(_with_recovery(base))
     changed = health is not None and health != _last_core_health
     if not force and not changed and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
@@ -4642,14 +4670,21 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             payload["capabilities"].append("worker_health.v1")
             if "recovery" in health:
                 payload["capabilities"].append(CORE_RECOVERY_CAPABILITY)
+            if "quota" in health:
+                payload["capabilities"].append(QUOTA_STATUS_CAPABILITY)
         try:
             reply = _req("POST", "/v1/heartbeat", payload, timeout=10)
         except urllib.error.HTTPError as e:
-            if e.code not in (400, 422) or "recovery" not in (payload.get("health") or {}):
+            extra = [k for k in ("recovery", "quota") if k in (payload.get("health") or {})]
+            if e.code not in (400, 422) or not extra:
                 raise
-            _core_recovery_refused_until = time.time() + CORE_RECOVERY_REFUSED_BACKOFF_S
-            _log(f"heartbeat refused with the recovery block: HTTP {e.code} — sending without it")
-            drop = {CORE_RECOVERY_CAPABILITY} | (set() if base is not None else {"worker_health.v1"})
+            if "recovery" in extra:
+                _core_recovery_refused_until = time.time() + CORE_RECOVERY_REFUSED_BACKOFF_S
+            if "quota" in extra:
+                _quota_status_refused_until = time.time() + CORE_RECOVERY_REFUSED_BACKOFF_S
+            _log(f"heartbeat refused with the {' and '.join(extra)} block: HTTP {e.code} — sending without it")
+            drop = ({CORE_RECOVERY_CAPABILITY, QUOTA_STATUS_CAPABILITY}
+                    | (set() if base is not None else {"worker_health.v1"}))
             payload = {k: v for k, v in payload.items() if k != "health"}
             payload["capabilities"] = [c for c in payload["capabilities"] if c not in drop]
             if base is not None:

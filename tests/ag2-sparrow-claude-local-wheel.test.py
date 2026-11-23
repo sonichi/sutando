@@ -158,7 +158,7 @@ class InstalledWheel(unittest.TestCase):
         self.assertTrue((package / "tmux-pane-keys.sh").is_file() and (package / "bounded-wait.sh").is_file())
         self.assertTrue((venv / "bin" / "ag2-sparrow-claude-local").is_file(), "the console script is installed")
         plugin = package / "adapters" / "claude_code" / "ag2space-inbox"
-        for rel in (".claude-plugin/plugin.json", "hooks/hooks.json", "hooks/register.ts"):
+        for rel in (".claude-plugin/plugin.json", "hooks/hooks.json", "hooks/register.ts", "types/index.d.ts"):
             self.assertTrue((plugin / rel).is_file(), "the wheel ships the plugin's %s" % rel)
         self.assertEqual(Path(out["plugin"]), plugin, "the default --plugin-dir is the shipped plugin")
         # connect with no --plugin-dir passes its preflight on the shipped plugin and, with no job running,

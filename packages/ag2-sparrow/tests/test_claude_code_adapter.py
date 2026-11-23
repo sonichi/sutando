@@ -367,7 +367,7 @@ class InboxCli(ConnectBase):
 
     def test_the_contract_set_pin_fails_on_a_dropped_or_an_extra_scenario(self):
         names = [sc["name"] for sc in contract_scenarios()]
-        self.assertEqual(len(names), 33)
+        self.assertEqual(len(names), 34)
         self.assertEqual(contract_set_problem(names), "")
         for i in (0, 17, len(names) - 1):
             self.assertIn("missing [%r]" % names[i], contract_set_problem(names[:i] + names[i + 1:]), i)
@@ -966,6 +966,40 @@ class InboxCli(ConnectBase):
         self.assertNotIn(t, records.load_plugin(self.root)["inflight"], "released at SETTLED")
         rc, out = self.verb("claim", t)
         self.assertEqual((rc, "LIVE_READY" in out["refused"]), (1, True), "only ABSENT may be submitted")
+
+    def test_inflight_lists_only_this_generations_open_claims_past_their_call_and_changes_nothing(self):
+        """What a reloaded Mod checks its kept offers against: a claim it may still finish."""
+        from ag2_sparrow import task_lifecycle as tl
+        self.assertEqual(self.verb("inflight"), (0, {"tasks": {}}))
+        calling, confirmed, staged, done, prepared = (self.task("task-" + n) for n in ("c", "t", "s", "d", "p"))
+        tokens = {}
+        for t in (calling, confirmed, staged, done):
+            self.verb("claim", t)
+            tokens[t] = self.verb("authorize", t, "1", "--text-hash", "h")[1]["token"]
+        self.verb("claim", prepared)
+        for t in (confirmed, staged, done):
+            self.verb("confirm", t, "turn-" + t, tokens[t], "--text-hash", "h")
+        for t in (staged, done):
+            self.verb("stage", t, "turn-" + t, stdin=b"ok\n")
+        self.verb("publish", done)
+        before = {p: p.read_bytes() for p in sorted((self.work / "state").rglob("*")) if p.is_file() and p.suffix != ".lock"}
+        rc, out = self.verb("inflight")
+        self.assertEqual((rc, out), (0, {"tasks": {
+            calling: {"phase": "CALLING", "turn_id": "", "attempt": 1},
+            confirmed: {"phase": "TURN_CONFIRMED", "turn_id": "turn-" + confirmed, "attempt": 1},
+            staged: {"phase": "RESULT_STAGED", "turn_id": "turn-" + staged, "attempt": 1}}}))
+        self.assertEqual({p: p.read_bytes() for p in before}, before, "read-only")
+        # A claim of another generation, and one that cannot be read, are not this Mod's to finish.
+        claim_path = self.work / "state" / "claims" / confirmed / "claim.json"
+        rec = json.loads(claim_path.read_text())
+        claim_path.write_text(json.dumps(dict(rec, generation={"pid": rec["generation"]["pid"] + 1, "start": "x"})))
+        (self.work / "state" / "claims" / staged / "claim.json").write_text("not json")
+        self.assertEqual(sorted(self.verb("inflight")[1]["tasks"]), [calling])
+        # Without a live consumer there is no generation to speak for.
+        unhold(self.holder)
+        rc, out = self.verb("inflight")
+        self.assertEqual((rc, "no live consumer" in out["refused"]), (1, True))
+        self.assertEqual(tl.CALLING, "CALLING")
 
     def test_claim_refuses_without_a_live_consumer_and_a_second_cli_gets_the_same_attempt_unchanged(self):
         from ag2_sparrow import task_lifecycle as tl
