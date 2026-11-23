@@ -61,6 +61,7 @@ function assertMacOS() {
 }
 import { voiceTaskRows, workTool, submitWorkTask, captureWorkOrigin, voiceTaskStore, resetNoteViewingDebounce, logConversationAsync, logSessionBoundaryAsync, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, endVoiceClientSession, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile, submitVoiceSessionEndTask, voiceTaskResultText } from './task-bridge.js';
 import { createCallEndReporter, sessionEndTask } from './voice-session-end.js';
+import { OfflineNoticeStore } from './voice-offline-notice.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { createAudioHealthLedger } from './voice-audio-health.js';
@@ -896,12 +897,12 @@ async function main() {
 	// No client attached for this long parks the upstream (bodhi's upstreamRecovery idle park).
 	const IDLE_TEARDOWN_MS = Number(process.env.SUTANDO_VOICE_IDLE_TEARDOWN_MS) || 60_000;
 
-	// Declared outside the classifier IIFE below so the recovery hook can read it
-	// too; a banner already shown is what makes a recovery notice owed.
-	const voiceNotifiedCategories = new Set<string>();
+	// Shared with the recovery hook below: a banner already shown is what makes a recovery
+	// notice owed. Kept in the workspace, so a restarted agent does not announce it again.
+	const voiceNotifiedCategories = new OfflineNoticeStore(statusPath('voice-offline-notified.json', WORKSPACE_DIR));
 
 	// Announce recovery and re-arm the alert. Clearing the set is what lets a later
-	// failure of the same category notify at all; the throttle is once-per-process.
+	// failure of the same category notify at all; the throttle is once per outage.
 	const notifyVoiceRecovered = (): void => {
 		if (voiceNotifiedCategories.size === 0) return;
 		const had = [...voiceNotifiedCategories].join(', ');

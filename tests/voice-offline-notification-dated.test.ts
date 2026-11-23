@@ -92,7 +92,7 @@ describe('voice-agent wiring', () => {
 	it('the notified set is declared outside the classifier IIFE', () => {
 		// If it slips back inside the IIFE, recovery silently stops while the offline
 		// path keeps working — a partial failure that looks fine.
-		const decl = AGENT_SRC.indexOf('const voiceNotifiedCategories = new Set<string>()');
+		const decl = AGENT_SRC.indexOf('const voiceNotifiedCategories = new OfflineNoticeStore(');
 		const iife = AGENT_SRC.indexOf('const transport = (session as any).transport;');
 		assert.ok(decl > 0 && iife > 0, 'markers not found — update this test');
 		assert.ok(decl < iife,
