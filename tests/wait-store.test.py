@@ -453,7 +453,7 @@ class InterruptedClaim(InterruptedCase):
         self.assertEqual(len(self.written), 2)
 
     def test_a_deadline_that_is_not_a_time_falls_back_to_the_file(self):
-        for n, deadline in enumerate((True, "soon", float("inf"), None)):
+        for n, deadline in enumerate((True, "soon", float("inf"), None, 10 ** 400)):
             with self.subTest(repr(deadline)):
                 wait_id = f"178900000001{n}-0000abcd"
                 self.marker(wait_id, deadline=deadline)

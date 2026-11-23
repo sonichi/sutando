@@ -223,8 +223,12 @@ class WaitStore:
         """The latest an outcome-less claim can date from, read before recovery writes anything: the
         wait's own recorded deadline, else the claimed file's last write. None when neither can be read."""
         deadline = record.get("deadline")
-        if isinstance(deadline, (int, float)) and not isinstance(deadline, bool) and math.isfinite(deadline):
-            return float(deadline)
+        if isinstance(deadline, (int, float)) and not isinstance(deadline, bool):
+            try:
+                if math.isfinite(deadline):
+                    return float(deadline)
+            except OverflowError:  # an integer too large for a float is no deadline
+                pass
         try:
             return self.claimed_path(wait_id).stat().st_mtime
         except OSError:
