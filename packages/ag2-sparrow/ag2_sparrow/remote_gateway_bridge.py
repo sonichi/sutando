@@ -1936,11 +1936,15 @@ def _project_claude_local(mods, room: str, log=print):
 class _ClaimedStore:
     """A HITL store seen through CARD_CLAIM: this lane drives, archives and re-notifies only its own cards."""
 
-    def __init__(self, store, claims, log=print):
-        self._store, self._claims, self._log = store, claims, log
+    def __init__(self, store, claims, log=print, scope: str = ""):
+        self._store, self._claims, self._log, self._scope = store, claims, log, scope
 
     def __getattr__(self, name):
         return getattr(self._store, name)
+
+    def report_archive_failures(self, failures, now):
+        # Under its lane's own scope: this view archives only its cards, so it must not clear another's.
+        return self._store.report_archive_failures(failures, now, scope=self._scope)
 
     def all(self):
         mine = []
@@ -1983,7 +1987,9 @@ def _project_hitl(log=print) -> int:
         return 0
     workspace = _STATE.parent
     store = HitlStore(default_store(workspace))
-    manager = HitlManager(_ClaimedStore(store, CARD_CLAIM, log) if CARD_CLAIM is not None else store)
+    scope = "" if primary else (re.sub(r"[^a-z0-9-]", "-", (GATEWAY_INSTANCE or "").lower())[:64].strip("-")
+                                or "lane")
+    manager = HitlManager(_ClaimedStore(store, CARD_CLAIM, log, scope) if CARD_CLAIM is not None else store)
     done, refused, gave_up, failed, raised = [], [], [], False, None
     # Each store gets its pass: a stuck card in one never holds back the other's.
     for drive in ("default", "claude-local"):

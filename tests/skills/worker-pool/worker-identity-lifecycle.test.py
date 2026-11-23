@@ -351,6 +351,37 @@ class Lifecycle(D.Base):
         self.assertIn(NEW_AGENT, told[0])
         self.assertIn("Reviewer", told[0])
 
+    def test_retire_withdraws_the_workers_open_cards_and_names_them_to_the_owner(self):
+        from hitl import cards as hc, schema as hs
+        manager = hc.manager_for(self.ws)
+
+        def card(guard, worker=None):
+            subject = {"ask_id": guard, **({"by_worker": worker} if worker else {})}
+            return manager.create(hc.choice_request(f"Question {guard}?", [{"id": "approve", "label": "Approve"}], guard, subject, runtime="pending-questions"))
+        mine, others, cores = card("a1", W), card("a2", "otherw1"), card("a3")
+        told = []
+        with unittest.mock.patch.object(C, "_vault", lambda v=None: self.vault):
+            out = pool_manage.retire(self.ws, W, runner=self.runner, tell=lambda text: told.append(text) or True)
+        ident = out["identity"]
+        self.assertEqual(ident["result"], "removed", ident)
+        self.assertEqual(ident["cards_withdrawn"], ["Question a1?"])
+        self.assertEqual(manager.store.load(mine.id).status, hs.STATUS_CANCELLED)
+        self.assertFalse((manager.store.root / f"{mine.id}.json").exists(), "withdrawn and archived")
+        self.assertFalse(manager.needs_projection(mine.id), "no lane is left to post its edit")
+        for kept in (others, cores):
+            self.assertEqual(manager.store.load(kept.id).status, hs.STATUS_PENDING)
+        self.assertIn("1 open decision card(s) were withdrawn", told[0])
+        self.assertIn("- Question a1?", told[0])
+
+    def test_a_card_withdrawal_that_raises_is_reported_and_the_worker_is_still_retired(self):
+        with unittest.mock.patch.object(C, "_vault", lambda v=None: self.vault), \
+                unittest.mock.patch("hitl.cards.withdraw_worker_cards", side_effect=OSError("store gone")):
+            out = pool_manage.retire(self.ws, W, runner=self.runner, tell=lambda text: True)
+        ident = out["identity"]
+        self.assertEqual(ident["result"], "removed", ident)
+        self.assertEqual(ident["cards_withdrawn"], [])
+        self.assertIn("store gone", ident["cards_error"])
+
     def test_retire_by_default_queues_the_note_to_the_owner_s_dm(self):
         with unittest.mock.patch.object(C, "_vault", lambda v=None: self.vault):
             out = pool_manage.retire(self.ws, W, runner=self.runner)

@@ -252,11 +252,25 @@ AGENT_REMOVAL_OWNER_STEP = ("the server cannot delete a live agent for us yet: d
                             "(your agents list), or it stays there with no worker behind it")
 
 
-def agent_removal_note(worker_label: str, agent: str) -> str:
+def agent_removal_note(worker_label: str, agent: str, withdrawn=()) -> str:
     """The owner's DM once a retired worker's agent is cut loose here but still exists on s.space."""
-    return (f"[dm-only]\n**Delete agent `{agent}` in the app**\n\nYour worker {worker_label} was retired: "
+    note = (f"[dm-only]\n**Delete agent `{agent}` in the app**\n\nYour worker {worker_label} was retired: "
             "it no longer uses that agent, and its token is gone from this computer. The server cannot delete "
             "a live agent for me yet, so it stays in your agents list until you delete it there.")
+    if withdrawn:
+        note += (f"\n\nIts {len(withdrawn)} open decision card(s) were withdrawn, since nothing can answer them "
+                 "now; a click on one does nothing. The questions stay open in Pending questions:\n"
+                 + "\n".join(f"- {w}" for w in withdrawn))
+    return note
+
+
+def _withdraw_cards(ws: Path, wid: str) -> dict:
+    """The retiring worker's open decision cards, cancelled: no other lane may post or answer them."""
+    try:
+        from hitl.cards import withdraw_worker_cards
+        return {"cards_withdrawn": withdraw_worker_cards(wid, ws)}
+    except Exception as e:  # noqa: BLE001 — reported with the retirement, never blocks it
+        return {"cards_withdrawn": [], "cards_error": f"{type(e).__name__}: {e}"}
 
 
 def _tell_owner(workspace, text: str) -> bool:
@@ -306,13 +320,15 @@ def _retire_identity(workspace, wid: str, hand_off: bool = False, tell=None) -> 
         return {"result": "failed", **got,
                 "why": f"{len(got['kept'])} task(s) in its own folder could not be handed off (a task of that name "
                        "is already in the shared tasks/)"}
+    got.update(_withdraw_cards(ws, wid))
     try:
         row = connections.retire_worker_identity(wid, workspace=ws) or {}
     except connections.ConnectionsError as e:
         return {"result": "failed", **got, "why": f"{type(e).__name__}: {e}"}
     agent = row.get("agent_mxid") or ""
     label = str(((pr.load_roster(workspace) or {}).get("workers") or {}).get(wid, {}).get("label") or wid)
-    told = (tell or (lambda text: _tell_owner(workspace, text)))(agent_removal_note(label, agent or "?"))
+    told = (tell or (lambda text: _tell_owner(workspace, text)))(
+        agent_removal_note(label, agent or "?", got["cards_withdrawn"]))
     return {"result": "removed", "instance": row.get("instance"), "agent": agent,
             "agent_removal": "owner_step", "owner_told": bool(told),
             "note": AGENT_REMOVAL_OWNER_STEP, **got}
