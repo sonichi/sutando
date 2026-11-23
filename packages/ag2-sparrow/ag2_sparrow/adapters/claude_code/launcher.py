@@ -646,7 +646,8 @@ class Launcher:
             return False, "refused: the session's input box holds unsent text; nothing sent"
         shown = self.tm.capture(gen["pane_id"]) or ""
         before, other, asked = accepted_count(model, shown), shown.count(MODEL_SET), shown.count(MODEL_CONFIRM)
-        loose, saved_at = family_count(model, shown), self.saved_stamp()
+        settings = self.cfg.get("CLAUDE_CONFIG_DIR") or ""
+        loose, saved_at = family_count(model, shown), trust.saved_model(settings)[1]
 
         def keys(*names):
             pred = tmux_pane_keys.predicate(gen["nonce"], gen["pane_pid"], gen["session_id"], gen["session_created"],
@@ -663,10 +664,11 @@ class Launcher:
         answered, deadline, text = False, time.monotonic() + wait_s, shown
         while time.monotonic() < deadline:
             text = self.tm.capture(gen["pane_id"]) or ""
-            # A [1m] switch is answered without its context size (2.1.322: "Set model to Sonnet 5.5 and saved
-            # ..."): it counts once the family's line is new AND the settings file was written since the send.
+            # A [1m] switch may be answered with the family alone (2.1.322). The family proves no context size:
+            # it counts only with the CLI's own settings saved since the send AND naming exactly this model.
+            saved, stamp = trust.saved_model(settings) if model.endswith("[1m]") else ("", None)
             if accepted_count(model, text) > before or (
-                    model.endswith("[1m]") and family_count(model, text) > loose and self.saved_stamp() != saved_at):
+                    saved == model and stamp is not None and stamp != saved_at and family_count(model, text) > loose):
                 self.log("model: switched to %s" % model)
                 with contextlib.suppress(OSError):   # the switch happened whether or not it is recorded
                     path = Path(self.root).joinpath(*MODEL_RECORD)
@@ -689,17 +691,6 @@ class Launcher:
             return False, ("unconfirmed: /model %s was sent but Claude Code reported a different model; "
                            "nothing recorded" % model)
         return False, "unconfirmed: /model %s was sent but Claude Code did not report the switch in %d s" % (model, wait_s)
-
-    def saved_stamp(self) -> "tuple[int, int] | None":
-        """When the agent's settings file was last written, as (mtime in ns, size); None when there is none.
-        A different stamp after a send is Claude Code having saved its settings since. The file is never
-        opened here: it may hold more than the model, and only its having been written is the evidence."""
-        config = self.cfg.get("CLAUDE_CONFIG_DIR") or ""
-        try:
-            st = os.stat(os.path.join(config, "settings.json")) if config else None
-        except OSError:
-            st = None
-        return (st.st_mtime_ns, st.st_size) if st else None
 
     def stopped(self, started) -> str:
         self.log("stopped in %.1f s" % (self.clock() - started))
