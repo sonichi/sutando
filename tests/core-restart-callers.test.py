@@ -42,7 +42,7 @@ ALLOWED = {
 
 #: path -> (direct launcher invocations, why it may).
 ALLOWED_LAUNCH = {
-    "src/core_restart.py": (1, "the one route: its start-cli fallback outside the desktop bundle"),
+    "src/core_restart.py": (2, "the one route: the launcher executor and its recorded fallback argv"),
     "src/agent/start-cli.sh": (1, "the dispatcher handing off to the runtime's own launcher"),
     "scripts/start-cli.sh": (1, "the compat shim forwarding to src/agent/start-cli.sh"),
     "src/startup.sh": (1, "the standalone startup entry point; the desktop app runs its own launcher"),

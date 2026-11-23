@@ -3,9 +3,10 @@
 
 On a desktop install whose checkout is the app's own bundle (`<app-support>/engine/<checkout>`) a
 restart is the app's `sutando-ctl.sh restart-core`, which holds the app's launch lock, so it never
-overlaps the app's own launcher; it runs through `ctl` below, which appends one intent line and one
-outcome line to `state/recovery/audit.jsonl` (`event: ctl_restart`, the caller's name, and the
-card's `hitl_id` + `revision` when a card asked). That bundle with no ctl, or with a ctl that does
+overlaps the app's own launcher; it runs through `ctl` below. Every route appends one intent line
+and one outcome line to `state/recovery/audit.jsonl` (`event: core_restart`, the caller, and the
+card's `hitl_id` + `revision` when a card asked; otherwise `actor: host-supervisor`). A bundle with
+no ctl, or with a ctl that does
 not list `launch-lock`, is refused and nothing runs: `start-cli.sh --restart` would kill the
 gateway's session. Anywhere else the restart is `src/agent/start-cli.sh --restart`.
 
@@ -15,6 +16,9 @@ gateway's session. Anywhere else the restart is `src/agent/start-cli.sh --restar
     python3 src/core_restart.py ctl --ctl PATH --workspace W --caller NAME
                                     [--hitl-id ID --revision N] [--runtime R]
         run the ctl's restart-core between its intent and outcome lines; exits with the ctl's code
+    python3 src/core_restart.py start-cli --start-cli PATH --workspace W --caller NAME
+                                    [--hitl-id ID --revision N] [--runtime R] [-- ARGS...]
+        run start-cli --restart between the same two lines; exits with the launcher's code
 
 A runtime switch through the ctl takes the app's launch lock itself (the ctl then skips it), makes
 the runtime the desktop's selection (the app's launcher reads it), runs the ctl, and when the ctl
@@ -55,7 +59,8 @@ LOCK_MARKER = "SUTANDO_ENGINE_LAUNCH_LOCK_HELD"
 LAUNCH_LOCK_FILE = "engine-launch.lock"
 LOCK_WAIT_ENV, DEFAULT_LOCK_WAIT_S = "SUTANDO_CTL_LAUNCH_LOCK_WAIT_S", 60
 LOCK_LOCKED, LOCK_BUSY, LOCK_UNAVAILABLE = "locked", "busy", "unavailable"
-AUDIT_EVENT = "ctl_restart"
+AUDIT_EVENT = "core_restart"
+AUTOMATIC_ACTOR = "host-supervisor"
 INTENT, OUTCOME = "intent", "outcome"
 
 Runner = Callable[..., subprocess.CompletedProcess]
@@ -69,6 +74,24 @@ def start_cli_argv(repo: Path, runtime: Optional[str] = None, extra: Sequence[st
     return argv + ([] if start else ["--restart"]) + list(extra)
 
 
+def recorded_start_cli_argv(repo: Path, workspace: Path, caller: str, *, via: str,
+                            runtime: Optional[str] = None, hitl_id: str = "",
+                            revision: Optional[int] = None, extra: Sequence[str] = (),
+                            start_cli: Optional[str] = None, start: bool = False) -> List[str]:
+    argv = [sys.executable, str(Path(repo) / "src" / "core_restart.py"), "start-cli",
+            "--workspace", str(workspace), "--caller", caller, "--via", via,
+            "--start-cli", start_cli or str(Path(repo) / "src" / "agent" / "start-cli.sh")]
+    if hitl_id:
+        argv += ["--hitl-id", hitl_id, "--revision", str(int(revision or 0))]
+    if runtime:
+        argv += ["--runtime", runtime]
+    if start:
+        argv += ["--start"]
+    if extra:
+        argv += ["--", *extra]
+    return argv
+
+
 def route(repo: Path, env: Dict, runner: Runner, *, workspace: Path, caller: str,
           runtime: Optional[str] = None, hitl_id: str = "", revision: Optional[int] = None,
           extra: Sequence[str] = (), start_cli: Optional[str] = None,
@@ -76,13 +99,18 @@ def route(repo: Path, env: Dict, runner: Runner, *, workspace: Path, caller: str
     """(argv, via) for one core restart; argv None when nothing may run. `env` is the restart's
     environment and is updated for the ctl. Only the ctl's capability probe runs here. `start`
     starts a core that is down: start-cli with no flag, or the ctl's restart-core in the bundle."""
-    fallback = start_cli_argv(repo, runtime, extra, start_cli, start)
     app_support = sutando_config.desktop_app_support(repo)
     if app_support is None:
-        return fallback, VIA_START_CLI
+        via = VIA_START_CLI
+        return recorded_start_cli_argv(repo, workspace, caller, via=via, runtime=runtime,
+                                       hitl_id=hitl_id, revision=revision, extra=extra,
+                                       start_cli=start_cli, start=start), via
     resolved = Path(repo).resolve()
     if resolved.parent.name != "engine" or resolved.parent.parent != Path(app_support).resolve():
-        return fallback, VIA_FALLBACK  # a standalone clone the app's controller does not drive
+        via = VIA_FALLBACK
+        return recorded_start_cli_argv(repo, workspace, caller, via=via, runtime=runtime,
+                                       hitl_id=hitl_id, revision=revision, extra=extra,
+                                       start_cli=start_cli, start=start), via
     ctl = Path(repo).parent / DESKTOP_CTL
     if not ctl.is_file():
         return None, VIA_NO_CTL
@@ -113,6 +141,18 @@ def _audit(workspace: Path, entry: Dict) -> None:
     recovery.audit(Path(workspace), entry)
 
 
+def _audit_base(via: str, caller: str, hitl_id: str = "",
+                revision: Optional[int] = None, runtime: Optional[str] = None) -> Dict:
+    base = {"event": AUDIT_EVENT, "via": via, "caller": caller}
+    if hitl_id:
+        base.update(hitl_id=hitl_id, revision=int(revision or 0))
+    else:
+        base["actor"] = AUTOMATIC_ACTOR
+    if runtime:
+        base["runtime"] = runtime
+    return base
+
+
 def take_launch_lock(lock: Path, wait_s: float, sleep: Callable[[float], None] = time.sleep,
                      clock: Callable[[], float] = time.monotonic):
     """(open file, LOCKED) once this process holds the app's launch lock (the same flock the ctl and
@@ -141,11 +181,7 @@ def run_ctl(ctl: Path, workspace: Path, caller: str, *, hitl_id: str = "", revis
             lock_wait_s: Optional[float] = None) -> int:
     """Run the ctl's restart-core between one intent and one outcome audit line; its exit code.
     A runtime switch writes, restarts and rolls back under one hold of the app's launch lock."""
-    base = {"event": AUDIT_EVENT, "via": VIA_CTL, "caller": caller}
-    if hitl_id:
-        base.update(hitl_id=hitl_id, revision=int(revision or 0))
-    if runtime:
-        base["runtime"] = runtime
+    base = _audit_base(VIA_CTL, caller, hitl_id, revision, runtime)
     _audit(workspace, dict(base, phase=INTENT, at=int(now())))
     env = dict(os.environ if env is None else env)
     env.pop(LOCK_MARKER, None)
@@ -191,6 +227,26 @@ def run_ctl(ctl: Path, workspace: Path, caller: str, *, hitl_id: str = "", revis
     return 1 if rc is None else rc
 
 
+def run_start_cli(workspace: Path, caller: str, *, via: str = VIA_START_CLI,
+                  hitl_id: str = "", revision: Optional[int] = None,
+                  runtime: Optional[str] = None, extra: Sequence[str] = (),
+                  start_cli: str, runner: Runner = subprocess.run,
+                  now: Callable[[], float] = time.time, start: bool = False) -> int:
+    """Run the standalone launcher between the shared restart intent and outcome lines."""
+    base = _audit_base(via, caller, hitl_id, revision, runtime)
+    _audit(workspace, dict(base, phase=INTENT, at=int(now())))
+    try:
+        rc = runner(start_cli_argv(REPO, runtime, extra, start_cli, start),
+                    stdin=subprocess.DEVNULL).returncode
+    except (OSError, subprocess.SubprocessError):
+        rc = None
+    outcome = dict(base, phase=OUTCOME, at=int(now()), outcome="done" if rc == 0 else "failed")
+    if rc is not None:
+        outcome["rc"] = rc
+    _audit(workspace, outcome)
+    return 1 if rc is None else rc
+
+
 def restart(workspace: Path, caller: str, *, runtime: Optional[str] = None, extra: Sequence[str] = (),
             start_cli: Optional[str] = None, repo: Path = REPO, runner: Runner = subprocess.run,
             execv: Callable = os.execvpe, err=sys.stderr, start: bool = False) -> int:
@@ -229,10 +285,25 @@ def main(argv=None) -> int:
     c.add_argument("--hitl-id", default="")
     c.add_argument("--revision", type=int, default=None)
     c.add_argument("--runtime", default=None)
+    s = sub.add_parser("start-cli")
+    s.add_argument("--workspace", required=True)
+    s.add_argument("--caller", required=True)
+    s.add_argument("--via", choices=(VIA_START_CLI, VIA_FALLBACK), required=True)
+    s.add_argument("--start-cli", required=True)
+    s.add_argument("--hitl-id", default="")
+    s.add_argument("--revision", type=int, default=None)
+    s.add_argument("--runtime", default=None)
+    s.add_argument("--start", action="store_true", help="start a core that is down (start-cli without --restart)")
+    s.add_argument("extra", nargs=argparse.REMAINDER)
     a = p.parse_args(argv)
     if a.cmd == "ctl":
         return run_ctl(Path(a.ctl), Path(a.workspace), a.caller, hitl_id=a.hitl_id,
                        revision=a.revision, runtime=a.runtime)
+    if a.cmd == "start-cli":
+        extra = a.extra[1:] if a.extra[:1] == ["--"] else a.extra
+        return run_start_cli(Path(a.workspace), a.caller, via=a.via, hitl_id=a.hitl_id,
+                             revision=a.revision, runtime=a.runtime, extra=extra,
+                             start_cli=a.start_cli, start=a.start)
     extra = a.extra[1:] if a.extra[:1] == ["--"] else a.extra
     return restart(Path(a.workspace), a.caller, runtime=a.runtime, extra=extra, start_cli=a.start_cli,
                    repo=Path(a.repo), start=a.start)

@@ -166,10 +166,11 @@ refused; a restart that did not happen releases its restart lock), `health-check
 and `switch-model.sh` starting a core paused for a provider limit (`core_restart.py restart --start`:
 the launcher with no flag outside the bundle, the ctl's restart-core in it). `tests/core-restart-callers.test.py` fails on any
 other `start-cli.sh --restart` caller, and on any other direct `start-cli.sh` / `launch-sutando.sh`
-invocation. A ctl restart runs inside `core_restart.py ctl`, which appends
-two `state/recovery/audit.jsonl` lines, `event: ctl_restart` with `phase: intent` before the ctl
-and `phase: outcome` (`done` or `failed`, with the ctl's `rc`) after it; each carries `caller`,
-and a card's restart adds its `hitl_id` and `revision`.
+invocation. Both the ctl and standalone launcher run inside a
+`core_restart.py` recorder, which appends two `state/recovery/audit.jsonl` lines:
+`event: core_restart` with `phase: intent` before the command and `phase: outcome` (`done` or
+`failed`, with its `rc`) after it. Each carries `caller`; a card's restart adds its `hitl_id` and
+`revision`, while every automatic restart carries `actor: host-supervisor`.
 When the ctl exits 12 (another launcher run held the app's launch lock; nothing was killed or
 started), the receipt is `failed`, the card says the core is already being restarted and to try
 again shortly, any hold it lifted returns, and nothing is retried automatically.

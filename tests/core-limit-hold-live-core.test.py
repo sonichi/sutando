@@ -538,9 +538,13 @@ class Relaunch(unittest.TestCase):
         calls = []
 
         def run(cmd, **_kw):
-            calls.append(cmd[1:])
+            calls.append(cmd)
             return subprocess.CompletedProcess(cmd, codes[len(calls) - 1])
         return calls, run
+
+    def assert_restart(self, command):
+        self.assertEqual(command[1:3], [str(REPO / "src" / "core_restart.py"), "start-cli"])
+        self.assertEqual(command[command.index("--start-cli") + 1], "L")
 
     def told(self):
         return [p.read_text() for p in (self.ws / "results").glob("proactive-*.txt")]
@@ -548,7 +552,8 @@ class Relaunch(unittest.TestCase):
     def test_switch_restarts_held_then_the_switch_starts_the_core(self):
         calls, run = self.run_with([clh.HOLD_EXIT, 0])
         self.assertTrue(clh.relaunch_core(self.ws, "L", "sonnet", "S", run=run))
-        self.assertEqual(calls, [["L", "--restart"], ["S", "sonnet"]])
+        self.assert_restart(calls[0])
+        self.assertEqual(calls[1], ["bash", "S", "sonnet"])
         self.assertEqual(self.told(), [])
 
     def test_a_failed_switch_is_told_to_the_owner(self):
@@ -563,7 +568,8 @@ class Relaunch(unittest.TestCase):
             with self.subTest(rc=rc):
                 calls, run = self.run_with([rc])
                 self.assertEqual(clh.relaunch_core(self.ws, "L", run=run), ok)
-                self.assertEqual(calls, [["L", "--restart"]])
+                self.assertEqual(len(calls), 1)
+                self.assert_restart(calls[0])
 
     def test_gate_replay_of_an_unspawned_relaunch_marks_it_without_spawning(self):
         (self.ws / "state").mkdir()

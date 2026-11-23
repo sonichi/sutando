@@ -2,8 +2,8 @@
 """core_restart: the one route for a core restart, and its callers outside the recovery cards.
 
 In the desktop bundle (`<app>/engine/<checkout>`) a restart is the app's sutando-ctl.sh
-restart-core between an intent and an outcome line in state/recovery/audit.jsonl, refused when the
-ctl is missing or takes no launch lock; elsewhere it is start-cli.sh --restart.
+restart-core, refused when the ctl is missing or takes no launch lock; elsewhere it is
+start-cli.sh --restart. Both run between intent and outcome lines in state/recovery/audit.jsonl.
 """
 from __future__ import annotations
 
@@ -93,13 +93,18 @@ class Route(Base):
 
     def test_without_the_app_it_is_start_cli(self):
         argv, via = self.route(self.clone, runtime="codex", extra=["--visible"])
-        self.assertEqual(argv, ["bash", str(self.clone / "src" / "agent" / "start-cli.sh"),
-                                "--runtime", "codex", "--restart", "--visible"])
+        self.assertEqual(argv[:3], [sys.executable, str(self.clone / "src" / "core_restart.py"), "start-cli"])
+        self.assertEqual(argv[argv.index("--start-cli") + 1:],
+                         [str(self.clone / "src" / "agent" / "start-cli.sh"), "--runtime", "codex",
+                          "--", "--visible"])
         self.assertEqual(via, CR.VIA_START_CLI)
 
     def test_a_start_runs_the_launcher_with_no_restart_flag_outside_the_bundle(self):
         argv, via = self.route(self.clone, start=True, start_cli="/x/L")
-        self.assertEqual((argv, via), (["bash", "/x/L"], CR.VIA_START_CLI))
+        self.assertEqual((argv[:3], via),
+                         ([sys.executable, str(self.clone / "src" / "core_restart.py"), "start-cli"],
+                          CR.VIA_START_CLI))
+        self.assertEqual(argv[argv.index("--start-cli") + 1:], ["/x/L", "--start"])
 
     def test_a_start_in_the_bundle_is_the_ctl_like_a_restart(self):
         self.desktop()
@@ -108,13 +113,13 @@ class Route(Base):
 
     def test_a_given_launcher_is_kept_outside_the_app(self):
         argv, _via = self.route(self.clone, start_cli="/x/L")
-        self.assertEqual(argv, ["bash", "/x/L", "--restart"])
+        self.assertEqual(argv[argv.index("--start-cli") + 1], "/x/L")
 
     def test_a_clone_outside_the_bundle_falls_back_to_start_cli(self):
         self.desktop()
         run = Run()
         argv, via = self.route(self.clone, run)
-        self.assertEqual((argv[-1], via, run.calls), ("--restart", CR.VIA_FALLBACK, []))
+        self.assertEqual((argv[2], via, run.calls), ("start-cli", CR.VIA_FALLBACK, []))
 
     def test_the_bundle_without_its_ctl_is_refused(self):
         self.desktop()
@@ -162,7 +167,7 @@ class RunCtl(Base):
         self.assertEqual(argv, ["bash", str(self.ctl), "restart-core"])
         self.assertNotIn(CR.LOCK_MARKER, kw["env"])
         intent, outcome = self.audit()
-        base = {"event": "ctl_restart", "via": "ctl", "caller": "recovery-card", "hitl_id": "hitl_1",
+        base = {"event": "core_restart", "via": "ctl", "caller": "recovery-card", "hitl_id": "hitl_1",
                 "revision": 4, "at": 100}
         self.assertEqual(intent, dict(base, phase="intent"))
         self.assertEqual(outcome, dict(base, phase="outcome", outcome="done", rc=0))
@@ -171,7 +176,8 @@ class RunCtl(Base):
         rc = CR.run_ctl(self.ctl, self.ws, "graceful-restart", runner=Run(rc=CR.CTL_LAUNCH_LOCK_BUSY), env={})
         self.assertEqual(rc, CR.CTL_LAUNCH_LOCK_BUSY)
         intent, outcome = self.audit()
-        self.assertNotIn("hitl_id", intent, "no card, so only the caller's name")
+        self.assertNotIn("hitl_id", intent, "no card, so only the automatic actor and caller are named")
+        self.assertEqual(intent["actor"], "host-supervisor")
         self.assertEqual((outcome["outcome"], outcome["rc"], outcome["caller"]), ("failed", 12, "graceful-restart"))
 
     def test_a_ctl_that_cannot_run_is_failed_with_no_code(self):
@@ -342,17 +348,51 @@ class Restart(Base):
                 self.assertIn(want, err.getvalue())
                 execv.assert_not_called()
 
-    def test_outside_the_bundle_start_cli_replaces_the_process(self):
+    def test_outside_the_bundle_the_recording_wrapper_replaces_the_process(self):
         execv = mock.Mock()
         CR.restart(self.ws, "graceful-restart", repo=self.clone, extra=["--visible"], start_cli="/x/stub",
                    runner=Run(), execv=execv)
         execv.assert_called_once()
-        self.assertEqual(execv.call_args[0][:2], ("bash", ["bash", "/x/stub", "--restart", "--visible"]))
+        argv = execv.call_args[0][1]
+        self.assertEqual(argv[:3], [sys.executable, str(self.clone / "src" / "core_restart.py"), "start-cli"])
+        self.assertEqual(argv[argv.index("--start-cli") + 1:], ["/x/stub", "--", "--visible"])
+
+    def test_start_cli_writes_one_intent_and_one_outcome_for_an_automatic_restart(self):
+        run = Run(rc=0)
+        rc = CR.run_start_cli(self.ws, "health-check --recover-core", start_cli="/x/stub",
+                              runner=run, now=lambda: 100.0)
+        self.assertEqual(rc, 0)
+        self.assertEqual(run.argvs(), [["bash", "/x/stub", "--restart"]])
+        intent, outcome = self.audit()
+        base = {"event": "core_restart", "via": "start-cli", "caller": "health-check --recover-core",
+                "actor": "host-supervisor", "at": 100}
+        self.assertEqual(intent, dict(base, phase="intent"))
+        self.assertEqual(outcome, dict(base, phase="outcome", outcome="done", rc=0))
+
+    def test_start_cli_records_the_card_identity_instead_of_an_automatic_actor(self):
+        CR.run_start_cli(self.ws, "recovery-card", start_cli="/x/stub", hitl_id="hitl_9", revision=6,
+                         runner=Run(rc=1), now=lambda: 100.0)
+        intent, outcome = self.audit()
+        self.assertEqual((intent["hitl_id"], intent["revision"]), ("hitl_9", 6))
+        self.assertNotIn("actor", intent)
+        self.assertEqual((outcome["outcome"], outcome["rc"]), ("failed", 1))
+
+    def test_start_cli_that_cannot_run_is_failed_with_no_code(self):
+        def boom(argv, **kw):
+            raise OSError("no bash")
+        self.assertEqual(CR.run_start_cli(self.ws, "automatic", start_cli="/x/stub", runner=boom), 1)
+        self.assertEqual(self.audit()[-1]["outcome"], "failed")
+        self.assertNotIn("rc", self.audit()[-1])
 
     def test_a_start_outside_the_bundle_execs_the_launcher_without_the_flag(self):
         execv = mock.Mock()
         CR.restart(self.ws, "switch-model", repo=self.clone, start_cli="/x/L", runner=Run(), execv=execv, start=True)
-        self.assertEqual(execv.call_args[0][:2], ("bash", ["bash", "/x/L"]))
+        argv = execv.call_args[0][1]
+        self.assertEqual(argv[:3], [sys.executable, str(self.clone / "src" / "core_restart.py"), "start-cli"])
+        self.assertEqual(argv[argv.index("--start-cli") + 1:], ["/x/L", "--start"])
+        run = Run(rc=0)
+        CR.run_start_cli(self.ws, "switch-model", start_cli="/x/L", runner=run, start=True)
+        self.assertEqual(run.argvs(), [["bash", "/x/L"]])
 
     def test_in_the_bundle_the_ctl_runs_here_between_its_lines(self):
         self.desktop()
@@ -362,11 +402,17 @@ class Restart(Base):
         self.assertEqual(run.argvs()[-1], ["bash", str(self.ctl), "restart-core"])
         self.assertEqual([r["phase"] for r in self.audit()], ["intent", "outcome"])
 
-    def test_the_cli_dispatches_both_verbs(self):
+    def test_the_cli_dispatches_each_verb(self):
         with mock.patch.object(CR, "run_ctl", return_value=12) as rc_:
             self.assertEqual(CR.main(["ctl", "--ctl", "/c", "--workspace", "/w", "--caller", "c",
                                       "--hitl-id", "h", "--revision", "2", "--runtime", "codex"]), 12)
         rc_.assert_called_once_with(Path("/c"), Path("/w"), "c", hitl_id="h", revision=2, runtime="codex")
+        with mock.patch.object(CR, "run_start_cli", return_value=7) as sc:
+            self.assertEqual(CR.main(["start-cli", "--workspace", "/w", "--caller", "c", "--via",
+                                      "start-cli-fallback", "--start-cli", "/s", "--hitl-id", "h",
+                                      "--revision", "2", "--runtime", "codex", "--", "--visible"]), 7)
+        sc.assert_called_once_with(Path("/w"), "c", via="start-cli-fallback", hitl_id="h", revision=2,
+                                   runtime="codex", extra=["--visible"], start_cli="/s", start=False)
         with mock.patch.object(CR, "restart", return_value=0) as r:
             self.assertEqual(CR.main(["restart", "--workspace", "/w", "--caller", "g", "--repo", "/r",
                                       "--start-cli", "/s", "--", "--visible"]), 0)
@@ -409,7 +455,9 @@ class LimitHoldRetry(Base):
         run = Run(rc=0)
         with mock.patch.object(clh, "_REPO", self.clone):
             self.assertTrue(clh.relaunch_core(self.ws, "L", run=run))
-        self.assertEqual(run.argvs(), [["bash", "L", "--restart"]])
+        [argv] = run.argvs()
+        self.assertEqual(argv[:3], [sys.executable, str(self.clone / "src" / "core_restart.py"), "start-cli"])
+        self.assertEqual(argv[argv.index("--start-cli") + 1], "L")
 
 
 class RecoverCore(Base):
@@ -442,7 +490,10 @@ class RecoverCore(Base):
         self.patched(self.clone)
         run = Run(rc=1)
         self.assertFalse(HC._default_core_restart(run=run))
-        self.assertEqual(run.argvs(), [["bash", str(self.clone / "src" / "agent" / "start-cli.sh"), "--restart"]])
+        [argv] = run.argvs()
+        self.assertEqual(argv[:3], [sys.executable, str(self.clone / "src" / "core_restart.py"), "start-cli"])
+        self.assertEqual(argv[argv.index("--start-cli") + 1],
+                         str(self.clone / "src" / "agent" / "start-cli.sh"))
 
     def test_without_a_launcher_it_does_nothing(self):
         self.patched(self.root / "nowhere")
