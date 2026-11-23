@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -398,16 +399,22 @@ def ensure_remedy_timer(workspace, repo, *, runner=None,
 
 
 @contextlib.contextmanager
-def launch_lock(workspace, session_name: str):
+def launch_lock(workspace, session_name: str, wait: float = 1.0):
     """Hold the launch of one tmux session name, from its probe to its committed run; refuse a
-    second launch while one is in progress rather than queue it behind a session it would find."""
+    second launch while one is in progress rather than queue it behind a session it would find.
+    A viewer's shared hold (pool_sessions) lasts one read, so it is waited out for `wait` seconds."""
     path = Path(workspace) / "state" / "worker-launch" / f"{session_name}.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a+") as fh:
-        try:
-            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise SpawnRefused(f"another launch of tmux session {session_name!r} is in progress")
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise SpawnRefused(f"another launch of tmux session {session_name!r} is in progress")
+                time.sleep(0.05)
         try:
             yield
         finally:

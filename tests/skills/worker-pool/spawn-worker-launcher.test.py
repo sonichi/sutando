@@ -379,6 +379,17 @@ class TestSpawn(Base):
         self.assertEqual([r["incarnation_id"] for r in open_runs],
                          [t.launches()[0]["SUTANDO_WORKER_INCARNATION_ID"]])
 
+    def test_a_viewers_brief_shared_hold_is_waited_out(self):
+        import fcntl, threading
+        name = "sutando-worker-" + "a" * 32
+        path = self.ws / "state" / "worker-launch" / f"{name}.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(path, "a+")
+        fcntl.flock(fh, fcntl.LOCK_SH)
+        threading.Timer(0.2, lambda: (fcntl.flock(fh, fcntl.LOCK_UN), fh.close())).start()
+        with sw.launch_lock(self.ws, name, wait=2.0):
+            pass
+
     def test_the_launch_lock_is_released_after_a_spawn(self):
         got = sw.spawn(self.ws, REPO, runner=FakeTmux(), require_sentinel=False)
         with sw.launch_lock(self.ws, got["tmux"]["session_name"]):
