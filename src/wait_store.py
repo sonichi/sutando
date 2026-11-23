@@ -1,8 +1,14 @@
 """Wait markers: one pending owner request that resumes once something outside the core finishes.
 
-A wait is `<workspace>/state/<dirname>/<wait-id>.json`. Claiming it is a rename to
-`<wait-id>.claimed`, so of a waiter, a deadline and a command exactly one wins and only the
-winner acts; the claimed record keeps who took it and when. A waiter holds `<wait-id>.lock`
+A wait is `<workspace>/state/<dirname>/<wait-id>.json`. A claimer first stages the claimed
+record, with who takes it and when, as `<wait-id>.<token>.claiming`, then renames the pending
+file to `<wait-id>.<token>.taken`: that rename is the claim, so of a waiter, a deadline and a
+command exactly one wins and only the winner acts. The winner renames its staged record to
+`<wait-id>.claimed`, which therefore names its outcome from the instant it exists. A claimer
+stopped in between leaves a `.taken` file whose token names its own staged record, and
+`recover` finishes that claim with that outcome. Only a claimer that could not write its
+staged record leaves a claim with no outcome; `recover` closes that one as the non-success
+outcome its skill names rather than dropping it. A waiter holds `<wait-id>.lock`
 while it lives, so a dead one is seen and restarted. The winner writes one resume task, which
 the core processes like any other task, and then stamps `published_at` on the claimed record.
 A claim that owes a task and carries no stamp was interrupted: `recover` publishes it once,
@@ -34,6 +40,8 @@ WAIT_ID_RE = re.compile(r"^[0-9]{13}-[0-9a-f]{8}\Z")
 MXID_RE = re.compile(r"^@[^\s:]+:[^\s]+\Z")
 CLAIM_KEYS = ("claimed_by", "claimed_at")
 PUBLISHED_KEYS = ("published_at", "published")
+# An unstamped claim this young may still be getting its stamp from a live claimer.
+UNSTAMPED_SETTLE_S = 60.0
 
 
 class NotOwnerTask(ValueError):
@@ -104,6 +112,13 @@ class WaitStore:
             raise ValueError(f"malformed wait marker {wait_id}")
         return data
 
+    @staticmethod
+    def _unlink(path: Path) -> None:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
     def list_markers(self) -> list[dict]:
         out: list[dict] = []
         d = self.dir()
@@ -129,19 +144,63 @@ class WaitStore:
     def claim(self, wait_id: str, by: str = "claim", at: float | None = None) -> dict | None:
         """Atomically take the wait. The claimed record, stamped with who took it and when,
         `{"wait_id", "invalid": True}` for a marker that is not valid, or None when someone else won."""
+        marker, at = self.marker_path(wait_id), time.time() if at is None else at
+        token = secrets.token_hex(4)
+        data = self.read_json(marker)
+        staged = self.dir() / f"{wait_id}.{token}.claiming" if self.valid(data, wait_id) else None
+        if staged is not None:
+            try:
+                self.write_json(staged, {**data, "claimed_by": by, "claimed_at": at})
+            except OSError:
+                staged = None
+        taken = self.dir() / f"{wait_id}.{token}.taken"
         try:
-            os.rename(self.marker_path(wait_id), self.claimed_path(wait_id))
+            os.rename(marker, taken)
         except FileNotFoundError:
+            if staged is not None:
+                self._unlink(staged)
             return None
+        # Only the winner is here: its staged record becomes the claimed one, outcome included.
+        try:
+            os.rename(staged or taken, self.claimed_path(wait_id))
+        except FileNotFoundError:
+            pass  # a recovery finished this claim with the same staged record
+        if staged is not None:
+            self._unlink(taken)
         data = self.read_json(self.claimed_path(wait_id))
         if not self.valid(data, wait_id):
             return {"wait_id": wait_id, "invalid": True}
-        record = {**data, "claimed_by": by, "claimed_at": time.time() if at is None else at}
-        try:
-            self.write_json(self.claimed_path(wait_id), record)
-        except OSError:
-            pass  # the rename already decided the claim; only its report is lost
+        record = {**data, "claimed_by": by, "claimed_at": at}
+        if staged is None:
+            try:
+                self.write_json(self.claimed_path(wait_id), record)
+            except OSError:
+                pass  # the rename already decided the claim; `recover` closes an unstamped one
         return record
+
+    def finish_taken(self, wait_id: str) -> bool:
+        """Complete a claim whose claimer stopped after taking the wait: its own staged record, or
+        the bare taken file when it staged none, becomes the claimed record. True when one was finished."""
+        d = self.dir()
+        for taken in sorted(d.glob(f"{wait_id}.*.taken")) if d.is_dir() else []:
+            staged = taken.with_suffix(".claiming")
+            try:
+                os.rename(staged if staged.exists() else taken, self.claimed_path(wait_id))
+            except OSError:
+                continue
+            self._unlink(taken)
+            return True
+        return False
+
+    def taken_ids(self) -> list[str]:
+        """Wait ids with a claim taken and not finished."""
+        d = self.dir()
+        names = sorted(p.name.split(".")[0] for p in d.glob("*.taken")) if d.is_dir() else []
+        return sorted({n for n in names if WAIT_ID_RE.match(n)})
+
+    def claimed_since(self, wait_id: str) -> float:
+        """When the claimed record came to be, from the file itself."""
+        return self.claimed_path(wait_id).stat().st_ctime
 
     def release(self, record: dict) -> bool:
         """Undo a claim whose resume task could not be written, so the next poll or rearm retries."""
@@ -163,16 +222,18 @@ class WaitStore:
         self.write_json(self.claimed_path(record["wait_id"]), record)
         return record
 
-    def unpublished(self, outcomes: tuple) -> list[dict]:
-        """Claimed records that owe a resume task (claimed_by in `outcomes`) and carry no stamp."""
+    def unpublished(self, outcomes: tuple, unstamped: bool = False) -> list[dict]:
+        """Claimed records that owe a resume task (claimed_by in `outcomes`) and carry no published
+        stamp; with `unstamped`, also the ones that name no outcome at all."""
         out: list[dict] = []
         d = self.dir()
         if not d.is_dir():
             return out
         for p in sorted(d.glob("*.claimed")):
             record = self.read_json(self.claimed_path(p.stem)) if WAIT_ID_RE.match(p.stem) else None
-            if self.valid(record, p.stem) and record.get("claimed_by") in outcomes \
-                    and record.get("published_at") is None:
+            owes = self.valid(record, p.stem) and (
+                record.get("claimed_by") in outcomes or (unstamped and record.get("claimed_by") is None))
+            if owes and record.get("published_at") is None:
                 out.append(record)
         return out
 
@@ -195,13 +256,14 @@ class WaitStore:
         return False
 
     def prune(self, now: float, older_than_s: float) -> int:
-        """Drop claimed records, and locks whose marker is gone, last touched `older_than_s` ago."""
+        """Drop claimed records, staged claims, and locks whose marker is gone, last touched `older_than_s` ago."""
         removed = 0
         d = self.dir()
         if not d.is_dir():
             return removed
         for p in d.iterdir():
-            if p.suffix not in (".claimed", ".lock") or (p.suffix == ".lock" and self.marker_path(p.stem).exists()):
+            if p.suffix not in (".claimed", ".lock", ".claiming") \
+                    or (p.suffix == ".lock" and self.marker_path(p.stem).exists()):
                 continue
             try:
                 if now - p.stat().st_mtime >= older_than_s:
@@ -242,12 +304,26 @@ def task_known(ws: Path, task_id: str) -> bool:
 
 
 def recover_one(store: WaitStore, ws: Path, wait_id: str, *, outcomes: tuple, task_id: Callable[[dict], str],
-                write: Callable[[dict], Any], now: float, stale_after_s: float) -> str | None:
+                write: Callable[[dict], Any], now: float, stale_after_s: float,
+                unstamped_as: str | None = None) -> str | None:
     """Publish one interrupted claim; the caller holds the wait's lock. Returns task | found |
-    stale, or None when the claim owes nothing, is stamped already, or the task could not be written."""
+    stale, or None when the claim owes nothing, is stamped already, or the task could not be written.
+    A claim that names no outcome is closed as `unstamped_as` once it has settled."""
+    if not store.claimed_path(wait_id).exists():
+        store.finish_taken(wait_id)
     record = store.read_json(store.claimed_path(wait_id))
-    if not store.valid(record, wait_id) or record.get("claimed_by") not in outcomes \
-            or record.get("published_at") is not None:
+    if not store.valid(record, wait_id) or record.get("published_at") is not None:
+        return None
+    if record.get("claimed_by") is None and unstamped_as is not None:
+        try:
+            since = store.claimed_since(wait_id)
+        except OSError:
+            return None
+        if now - since < UNSTAMPED_SETTLE_S:
+            print(f"wait-store: claim {wait_id} names no outcome yet; left for the next rearm", file=sys.stderr)
+            return None
+        record = {**record, "claimed_by": unstamped_as, "claimed_at": since, "unstamped": True}
+    if record.get("claimed_by") not in outcomes:
         return None
     if now - float(record.get("claimed_at") or 0) >= stale_after_s:
         how = "stale"
@@ -267,20 +343,22 @@ def recover_one(store: WaitStore, ws: Path, wait_id: str, *, outcomes: tuple, ta
 
 
 def recover(store: WaitStore, ws: Path, *, outcomes: tuple, task_id: Callable[[dict], str],
-            write: Callable[[dict], Any], now: float, stale_after_s: float) -> list[dict]:
+            write: Callable[[dict], Any], now: float, stale_after_s: float,
+            unstamped_as: str | None = None) -> list[dict]:
     """Publish every interrupted claim whose waiter is gone; a wait whose lock is held is left to its holder."""
     out = []
-    for record in store.unpublished(outcomes):
-        lock = hold_lock(store, record["wait_id"])
+    owing = [r["wait_id"] for r in store.unpublished(outcomes, unstamped=unstamped_as is not None)]
+    for wait_id in sorted(set(owing + store.taken_ids())):
+        lock = hold_lock(store, wait_id)
         if lock is None:
             continue
         try:
-            how = recover_one(store, ws, record["wait_id"], outcomes=outcomes, task_id=task_id, write=write,
-                              now=now, stale_after_s=stale_after_s)
+            how = recover_one(store, ws, wait_id, outcomes=outcomes, task_id=task_id, write=write,
+                              now=now, stale_after_s=stale_after_s, unstamped_as=unstamped_as)
         finally:
             lock.close()
         if how:
-            out.append({"wait_id": record["wait_id"], "published": how})
+            out.append({"wait_id": wait_id, "published": how})
     return out
 
 

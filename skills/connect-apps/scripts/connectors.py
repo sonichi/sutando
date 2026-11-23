@@ -132,6 +132,8 @@ ORIGIN_SOURCE = "ag2space"
 # claimed_by values whose request is answered (or the owner told why not).
 WAITER_OUTCOMES = ("connected", "timeout", "user_changed", "unverified")
 RESUMED_BY = WAITER_OUTCOMES + ("claim",)
+# A claimed wait that names no outcome is closed as this one: it tells the owner to try again.
+UNSTAMPED_AS = "timeout"
 CLAIM_KEYS = wait_store.CLAIM_KEYS
 # Private cards: the line cap keeps a runaway loop from growing the card; the text cap matches the client's.
 CARDS_VERSION = 1
@@ -843,14 +845,16 @@ def resume_task_id(record: dict) -> str:
 def recover_one(ws: Path, wait_id: str, now: float) -> str | None:
     return wait_store.recover_one(
         _store(ws), ws, wait_id, outcomes=WAITER_OUTCOMES, task_id=resume_task_id, now=now,
-        write=lambda r: write_resume_task(ws, r, r["claimed_by"], now), stale_after_s=STALE_GRACE_S)
+        write=lambda r: write_resume_task(ws, r, r["claimed_by"], now), stale_after_s=STALE_GRACE_S,
+        unstamped_as=UNSTAMPED_AS)
 
 
 def recover(ws: Path, now: float) -> list[dict]:
     """Publish the resume task of every claimed wait whose waiter stopped before writing it."""
     return wait_store.recover(
         _store(ws), ws, outcomes=WAITER_OUTCOMES, task_id=resume_task_id, now=now,
-        write=lambda r: write_resume_task(ws, r, r["claimed_by"], now), stale_after_s=STALE_GRACE_S)
+        write=lambda r: write_resume_task(ws, r, r["claimed_by"], now), stale_after_s=STALE_GRACE_S,
+        unstamped_as=UNSTAMPED_AS)
 
 
 def write_resume_task(ws: Path, marker: dict, outcome: str, now: float) -> Path:

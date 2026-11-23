@@ -28,6 +28,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -542,6 +543,70 @@ class WaiterTests(Base):
         self.assertEqual((out["recovered"], self.new_tasks()), ([], []))
         code, out = self.cli(["rearm"])
         self.assertEqual(out["recovered"], [{"wait_id": wait_id, "published": "task"}])
+
+    def stopped_after_taking(self, outcome="connected", staged=True):
+        """The files a waiter leaves when it stops after taking the wait, before its outcome is placed."""
+        _, out = self.start()
+        real, seen = os.rename, []
+
+        class Stopped(BaseException):
+            pass
+
+        def rename(src, dst):
+            seen.append(dst)
+            if len(seen) == 2:
+                raise Stopped()
+            real(src, dst)
+
+        with contextlib.ExitStack() as stack:
+            if not staged:
+                stack.enter_context(mock.patch.object(cm.wait_store.WaitStore, "write_json",
+                                                      side_effect=OSError("disk full")))
+            stack.enter_context(mock.patch.object(os, "rename", rename))
+            with self.assertRaises(Stopped):
+                cm.store(self.ws).claim(out["wait_id"], outcome, self.clock.now())
+        self.assertFalse(cm.store(self.ws).claimed_path(out["wait_id"]).exists())
+        return out["wait_id"]
+
+    def resume_body(self, wait_id):
+        return ltp.parse_task_headers((self.ws / "tasks" / f"task-connect-mcp-{wait_id}.txt").read_text()).body
+
+    def test_a_waiter_stopped_before_its_outcome_was_placed_resumes_once_with_that_outcome(self):
+        wait_id = self.stopped_after_taking("connected")
+        code, out = self.cli(["rearm"])
+        self.assertEqual(out["recovered"], [{"wait_id": wait_id, "published": "task"}])
+        self.assertIn("Luma is now signed in", self.resume_body(wait_id))
+        code, again = self.cli(["rearm"])
+        self.assertEqual((again["recovered"], len(self.new_tasks())), ([], 1))
+        self.assertEqual(self.waiter(wait_id), "claimed_elsewhere")
+        self.assertEqual(len(self.new_tasks()), 1)
+
+    def test_a_restarted_waiter_finishes_a_claim_stopped_before_its_outcome_was_placed(self):
+        wait_id = self.stopped_after_taking("timeout")
+        self.assertEqual(self.waiter(wait_id), "recovered")
+        self.assertIn("expired", self.resume_body(wait_id))
+        code, out = self.cli(["rearm"])
+        self.assertEqual((out["recovered"], len(self.new_tasks())), ([], 1))
+
+    def test_a_claim_with_no_outcome_is_kept_then_closed_as_expired_never_as_signed_in(self):
+        wait_id = self.stopped_after_taking("connected", staged=False)
+        since = self.clock.now()
+        err = io.StringIO()
+        with mock.patch.object(cm.wait_store.WaitStore, "claimed_since", lambda store, w: since), \
+                contextlib.redirect_stderr(err):
+            code, out = self.cli(["rearm"])
+            self.assertEqual((out["recovered"], self.new_tasks()), ([], []))
+            self.assertTrue(cm.store(self.ws).claimed_path(wait_id).exists(), "kept, not dropped")
+            self.clock.t += cm.wait_store.UNSTAMPED_SETTLE_S
+            code, out = self.cli(["rearm"])
+            self.assertEqual(out["recovered"], [{"wait_id": wait_id, "published": "task"}])
+            code, out = self.cli(["rearm"])
+        self.assertIn("names no outcome yet", err.getvalue())
+        self.assertEqual((out["recovered"], len(self.new_tasks())), ([], 1))
+        self.assertIn("expired", self.resume_body(wait_id))
+        self.assertNotIn("is now signed in", self.resume_body(wait_id))
+        code, card = self.cli(["card", wait_id])
+        self.assertEqual((code, card["outcome"]), (0, "timeout"))
 
     def test_a_wait_file_that_is_not_a_wait_is_set_aside_without_a_task(self):
         _, out = self.start()

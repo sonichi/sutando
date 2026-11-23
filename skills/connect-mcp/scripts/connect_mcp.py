@@ -85,6 +85,8 @@ MAX_SOCKET_BYTES = 100
 CALLBACK_HOSTS = ("localhost", "127.0.0.1")
 PHONE_LINE = "On a phone the last page will not load. Send me its address here."
 WAITER_OUTCOMES = ("connected", "timeout")
+# A claimed wait that names no outcome is closed as this one: the owner is told to try again.
+UNSTAMPED_AS = "timeout"
 # The guarded send's exits that prove nothing was typed; any other failure may have been typed.
 SEND_REFUSALS = {1: "not_typed", 124: "not_typed", tmux_pane_keys.BUSY: "busy"}
 
@@ -348,6 +350,7 @@ def resume_task_id(record: dict) -> str:
 
 def recover_args(ws: Path, now: float) -> dict:
     return {"outcomes": WAITER_OUTCOMES, "task_id": resume_task_id, "now": now, "stale_after_s": STALE_GRACE_S,
+            "unstamped_as": UNSTAMPED_AS,
             "write": lambda r: write_resume_task(ws, r, r["claimed_by"], now)}
 
 
