@@ -10,8 +10,9 @@
 # Guards:
 #   - the tag MUST equal the packaged __version__ (fail loudly on mismatch);
 #   - the version MUST NOT already exist on PyPI (no silent re-upload);
-#   - the package test suites + src-drift guard run before any upload, and on
-#     every PR in ci.yml (sparrow-publish-gate job), on the same Python.
+#   - the package test suites + src-drift guard run before any upload, and in
+#     ci.yml (sparrow-publish-gate job) on every main push and every PR that
+#     reaches the package, on the same Python.
 #
 # One-time PyPI setup (owner): project ag2-sparrow → Publishing → add GitHub
 # Trusted Publisher (owner: sonichi, repo: sutando, workflow:

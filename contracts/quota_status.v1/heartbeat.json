@@ -1,0 +1,28 @@
+{
+  "client": "sutando-gateway-client",
+  "protocol_version": 1,
+  "provider": "remote-gateway",
+  "tier": "owner",
+  "inflight": 0,
+  "capabilities": [
+    "task-ack",
+    "heartbeat",
+    "worker_health.v1",
+    "quota_status.v1"
+  ],
+  "health": {
+    "alive": true,
+    "motion": "idle",
+    "condition": "healthy",
+    "reason": null,
+    "since": null,
+    "quota": {
+      "v": 1,
+      "five_hour": {"used_pct": 100.0, "resets_at": 1795190400},
+      "seven_day": {"used_pct": 7.0, "resets_at": 1795600000},
+      "limit_state": "rejected",
+      "resumes_at": 1795190400,
+      "last_checked": 1795176000
+    }
+  }
+}
