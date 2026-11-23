@@ -453,6 +453,24 @@ neither Codex nor the file gave an answer. Codex is found on the launcher's own 
 print or quote `auth.json` yourself. Pool Codex workers run under the core's home today, so the
 core's answer is theirs too. Exit 1 means that home is signed out (or its login cannot be read): say so.
 
+## Switch the core's account
+
+Triggers, from the **owner in their DM only**: "switch account", "use my other account", "sign in
+with another account", "add an account", or a tap on the core account card. Post the card; never
+start a sign-in yourself and never take a sign-in code or token in chat (if the owner pastes one,
+do not use it: tell them to paste it in Settings, in the app's own box).
+
+```bash
+python3 skills/account-switch/scripts/account_card.py post --room <owner DM>   # the card
+python3 skills/account-switch/scripts/account_card.py status                   # the same facts as JSON
+```
+
+The card names the account in use (masked) and, on a Codex core, a "Use" button for each account
+saved on this Mac (the desktop's store), plus "Add another account", which points to Settings →
+Connections → the Sutando core's row → "Switch account". A tap on it reaches
+`account_card.py reply` through `src/agent_card.py click`; a "Use" tap restarts the core on the
+saved account and the card confirms the outcome in the DM. Details: `skills/account-switch/SKILL.md`.
+
 ## Check quota
 
 Triggers: "how much quota do I have", "am I near the limit", "when does it reset", and any paused
