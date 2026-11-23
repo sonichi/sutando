@@ -174,12 +174,13 @@ def sign_in_words(rt: str, state: Optional[bool]) -> str:
 
 def sign_in_card(rt: str, state: Optional[bool]) -> tuple:
     """The "Sign in first" card: its words, and the marker by which the desktop app, on the computer that
-    runs the core, draws that runtime's sign-in controls in it. Nothing typed there reaches the room. A
+    runs the core, draws that runtime's sign-in controls in it (`core: true`: the core's own sign-in for
+    `runtime`, which need not be the runtime the core is on now). Nothing typed there reaches the room. A
     client that cannot draw them shows the body: where to open the card."""
     body, card = ac.build(NOTE_ID, "pending", title="Core runtime", avatar_=ac.avatar(initial="R"),
                           status="Sign in first", text=sign_in_words(rt, state),
                           body=SIGN_IN_ELSEWHERE.format(name=name(rt)))
-    return body, dict(card, **{CONTROLS: {"runtime": rt, "agent": "core"}})
+    return body, dict(card, **{CONTROLS: {"runtime": rt, "core": True}})
 
 
 # ── the cards ─────────────────────────────────────────────────────────────────────────────────────

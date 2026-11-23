@@ -250,7 +250,7 @@ class Taps(Base):
                 card = self.fake.cards()[-1]
                 self.assertEqual((card["id"], card["state"], card["header"]["status"]["label"]), (rtc.NOTE_ID, "pending", "Sign in first"))
                 # The marker the desktop app draws that runtime's sign-in controls from, on the core's computer.
-                self.assertEqual(card[rtc.CONTROLS], {"runtime": "claude", "agent": "core"})
+                self.assertEqual(card[rtc.CONTROLS], {"runtime": "claude", "core": True})
                 # Anywhere else the client shows the body: one line, where to open it.
                 self.assertEqual(self.fake.calls[-1][1]["body"],
                                  "Open this on the computer that runs the core to sign in to Claude Code.")
@@ -284,7 +284,7 @@ class Taps(Base):
         rc, out = self.tap("Switch the core to Codex")
         self.assertEqual(out["status"], "needs_sign_in")
         self.assertIn("Sign in to Codex below", out["say"])
-        self.assertEqual(self.fake.cards()[-1][rtc.CONTROLS], {"runtime": "codex", "agent": "core"})
+        self.assertEqual(self.fake.cards()[-1][rtc.CONTROLS], {"runtime": "codex", "core": True})
         (self.home / "auth.json").write_text(CODEX_AUTH)
         rc, out = self.tap("Switch the core to Codex")
         self.assertEqual((rc, out["status"]), (0, "started"))
