@@ -212,6 +212,11 @@ class Contract(Layout):
                 if not desktop:
                     shutil.rmtree(self.workspace)
 
+    def test_effective_resolves_a_relative_home_against_the_repo_off_a_desktop(self):
+        self.checkout(desktop=False)
+        with patch.object(codex_home, "configured", return_value=("CODEX_HOME", "rel/home")):
+            self.assertEqual(self.effective(), str(self.repo / "rel" / "home"))
+
     def test_effective_follows_the_home_codex_reads_off_a_desktop(self):
         self.checkout(desktop=False, env_name="CODEX_CONFIG_DIR")
         self.assertEqual(self.effective(), str(self.home / ".codex"))

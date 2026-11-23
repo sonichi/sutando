@@ -103,7 +103,8 @@ def effective(repo, home, environ=None):
     _env, value, path, verdict = _plan(repo, home, environ)
     if verdict is not None:
         _refuse(verdict, value)
-    return path
+    # The launcher runs from the repo, so a relative home is the repo's; a desktop host refuses one.
+    return os.path.normpath(os.path.join(os.fspath(repo), os.path.expanduser(path)))
 
 
 def child(repo, path, name, home):

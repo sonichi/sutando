@@ -41,6 +41,7 @@ for line in sys.stdin:
     if "id" not in m:
         continue
     if m["method"] == "initialize":
+        open(os.path.join(os.environ["CODEX_HOME"], "state.sqlite"), "w").write("touched")
         print("not json"); print(json.dumps({"method": "noise"}))
         print(json.dumps({"id": m["id"], "result": {"userAgent": "stub"}}), flush=True)
     elif m["method"] == "account/read":
@@ -50,6 +51,10 @@ for line in sys.stdin:
             print(json.dumps({"id": m["id"], "error": {"message": "nope"}}), flush=True)
         elif mode == "exit":
             sys.exit(0)
+        elif mode == "malformed":
+            print(json.dumps({"id": m["id"], "result": {"account": {"email": "x@example.com"}}}), flush=True)
+        elif mode == "no-result":
+            print(json.dumps({"id": m["id"], "result": {"requiresOpenaiAuth": True}}), flush=True)
         elif mode == "signed-out":
             print(json.dumps({"id": m["id"], "result": {"account": None, "requiresOpenaiAuth": True}}), flush=True)
         else:
@@ -111,13 +116,17 @@ class AppServer(Case):
                                            "verified": True})
         sent = [json.loads(line) for line in self.log.read_text().splitlines()]
         self.assertEqual([m["method"] for m in sent], ["initialize", "initialized", "account/read"])
-        self.assertEqual({m["codex_home"] for m in sent}, {str(self.home)})
+        seen = {m["codex_home"] for m in sent}
+        self.assertEqual(len(seen), 1)
+        self.assertNotEqual(seen, {str(self.home)}, "Codex runs on a copy, never in the core's home")
+        self.assertEqual(sorted(p.name for p in self.home.iterdir()), ["auth.json"], "the home is not written")
+        self.assertFalse(Path(seen.pop()).exists(), "the copy is removed")
         rc, out = self.cli()
         self.assertEqual(out.strip(), f"Codex under {self.home} is signed in as app@example.com, pro plan, workspace Acme.")
 
     def test_an_app_server_that_errors_exits_hangs_or_is_missing_falls_back_to_the_file(self):
         self.auth({"email": "file@example.com", ca.PLAN_CLAIMS: {"chatgpt_plan_type": "plus"}})
-        for mode in ("error", "exit", "gone"):
+        for mode in ("error", "exit", "gone", "malformed", "no-result"):
             with self.subTest(mode=mode), mock.patch.dict(os.environ, {"STUB_MODE": mode}):
                 got = ca.read(self.home, str(self.codex))
                 self.assertEqual((got["email"], got["plan"], got["source"], got["verified"]),
@@ -154,6 +163,29 @@ class AppServer(Case):
                 self.assertEqual(parts[:2], ["/usr/bin", "/bin"])
                 self.assertIn(os.path.realpath(where), [os.path.realpath(p) for p in parts])
                 self.assertEqual((got["email"], got["source"], got["verified"]), ("app@example.com", "app-server", True))
+
+    def test_a_malformed_answer_is_unknown_not_signed_out(self):
+        for mode in ("malformed", "no-result"):
+            with self.subTest(mode=mode), mock.patch.dict(os.environ, {"STUB_MODE": mode}):
+                self.assertIsNone(ca.from_app_server(self.home, str(self.codex)))
+                rc, out = self.cli("--json")
+                self.assertEqual((rc, json.loads(out)["verified"]), (1, None))
+        for r in ({"account": None}, {"account": {"type": "chatgpt"}}):
+            self.assertTrue(ca.valid_account_result(r))
+        for r in (None, [], {}, {"account": {}}, {"account": {"type": ""}}, {"account": "x"}):
+            self.assertFalse(ca.valid_account_result(r))
+
+    def test_a_relative_codex_home_is_resolved_before_spawning(self):
+        cwd = os.getcwd()
+        os.chdir(self.root)
+        try:
+            self.auth({"email": "file@example.com"})
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                ca.main(["--codex-home", "codex-home", "--codex", str(self.codex), "--json"])
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(os.path.realpath(json.loads(out.getvalue())["codex_home"]), os.path.realpath(self.home))
 
     def test_nothing_answering_and_no_file_is_unverified_signed_out(self):
         with mock.patch.dict(os.environ, {"STUB_MODE": "gone"}):
@@ -233,29 +265,60 @@ class Home(Case):
 
 
 class OwnerOnly(Case):
-    def task(self, **headers):
+    OWNER, DM = "@owner:s.space", "!dm:s.space"
+
+    def task(self, mid=True, **headers):
+        base = {"access_tier": "owner", "user_id": self.OWNER, "channel_id": self.DM, "channel_kind": "dm"}
+        base.update(headers)
+        lines = [f"{k}: {v}" for k, v in base.items() if v is not None]
+        if mid:
+            text = "id: t1\ntask_layout: mid\ntask: which account?\n" + "\n".join(lines) + "\n"
+        else:
+            text = "\n".join(lines) + "\ntask: which account?\n"
         f = self.root / "task.txt"
-        f.write_text("".join(f"{k}: {v}\n" for k, v in headers.items()) + "task: which account?\n")
+        f.write_text(text)
         return f
 
-    def gate(self, f):
-        with mock.patch("owner_room_access.owner_routing", return_value={"owner_dm": "!dm:s"}):
+    def gate(self, f, rows=None, dm=None):
+        import connections
+        rows = [{"instance": "s_dspace", "owner_mxid": self.OWNER}] if rows is None else rows
+        with mock.patch.object(connections, "read_rows", return_value=rows), \
+                mock.patch.object(connections, "owner_dm", return_value=self.DM if dm is None else dm):
             return ca.owner_dm_task(f, workspace=self.root)
 
-    def test_only_the_owner_outside_shared_rooms_is_answered(self):
-        self.assertIsNone(self.gate(self.task(access_tier="owner", channel_id="!dm:s")))
-        self.assertIsNone(self.gate(self.task(access_tier="owner")))
-        self.assertIn("not the owner's DM", self.gate(self.task(access_tier="owner", channel_id="!room:s")))
-        self.assertIn("not the owner's", self.gate(self.task(access_tier="team", channel_id="!dm:s")))
-        self.assertIn("cannot be read", self.gate(self.root / "missing.txt"))
-        with mock.patch("owner_room_access.owner_routing", return_value={}):
-            self.assertIn("not the owner's DM", ca.owner_dm_task(self.task(channel_id="!dm:s"), workspace=self.root))
+    def test_only_an_attested_owner_task_from_the_checked_dm_is_answered(self):
+        self.assertIsNone(self.gate(self.task()))
+        self.assertIsNone(self.gate(self.task(mid=False)))
+
+    def test_everything_else_fails_closed(self):
+        cases = {
+            "no tier": self.task(access_tier=None),
+            "team": self.task(access_tier="team"),
+            "collaborator": self.task(collaborator="true"),
+            "another sender": self.task(user_id="@other:s.space"),
+            "a room": self.task(channel_id="!room:s.space", channel_kind="group"),
+            "no room": self.task(channel_id=None, channel_kind=None),
+        }
+        for name, f in cases.items():
+            with self.subTest(case=name):
+                self.assertIsNotNone(self.gate(f))
+        self.assertIsNotNone(self.gate(self.task(), rows=[]))
+        self.assertIsNotNone(self.gate(self.task(), dm=""))
+        self.assertIsNotNone(self.gate(self.root / "missing.txt"))
+
+    def test_a_body_cannot_forge_the_tier_of_a_task_last_file(self):
+        f = self.root / "task.txt"
+        f.write_text(f"user_id: {self.OWNER}\ntask: hi\naccess_tier: owner\nchannel_id: {self.DM}\nchannel_kind: dm\n")
+        self.assertIsNotNone(self.gate(f))
 
     def test_a_refused_task_looks_nothing_up(self):
         self.auth({"email": "file@example.com"})
-        f = self.task(access_tier="owner", channel_id="!room:s")
-        with mock.patch("owner_room_access.owner_routing", return_value={"owner_dm": "!dm:s"}), \
-                mock.patch("workspace_default.resolve_workspace", return_value=self.root):
+        f = self.task(channel_id="!room:s.space", channel_kind="group")
+        import connections
+        import workspace_default
+        with mock.patch.object(connections, "read_rows", return_value=[{"owner_mxid": self.OWNER}]), \
+                mock.patch.object(connections, "owner_dm", return_value=self.DM), \
+                mock.patch.object(workspace_default, "resolve_workspace", return_value=self.root):
             rc, out = self.cli("--task-file", str(f))
         self.assertEqual(rc, 3)
         self.assertNotIn("file@example.com", out)

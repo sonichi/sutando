@@ -434,11 +434,14 @@ python3 src/codex_account.py --task-file <task file> --codex-home <dir>   # a wo
 ```
 
 Always pass the asking task's `--task-file`: the account is the owner's data, so it is looked up only
-for an owner task asked in the owner's DM or outside any room (exit 3 otherwise: answer in the
-owner's DM instead, and post nothing about it in the room). The home is the one the Codex core
+for a task the gateway attests as the owner's, sent from the owner's checked DM (the same test the
+owner's card taps pass). Anything else, including a task with no tier, a voice or local task, or one
+whose origin cannot be checked, exits 3: answer in the owner's DM instead, and post nothing about it in
+the room. The lookup runs Codex on a private copy of the home's sign-in, so the running core's home is
+never written. The home is the one the Codex core
 launcher uses, with the same checks; a home it would refuse is reported, not read. It asks Codex
-itself (`account/read` on a short-lived `codex app-server` under that home); Codex saying signed out
-is final. Only when Codex cannot answer does it read the email and plan claims of the home's
+itself (`account/read` on a short-lived `codex app-server`); only an explicit `account: null` means
+signed out, and a malformed answer counts as no answer. Only when Codex cannot answer does it read the email and plan claims of the home's
 `auth.json` id_token, and then `verified` is false: say the answer comes from the saved sign-in and
 was not confirmed. `verified` is true whenever Codex answered (signed out included), and null when
 neither Codex nor the file gave an answer. Codex is found on the launcher's own PATH
