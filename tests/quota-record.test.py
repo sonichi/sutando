@@ -348,7 +348,7 @@ class Installer(Base):
     def test_manifest_declares_the_session_config_hook(self):
         m = json.loads((ROOT / "skills" / "quota-tracker" / "manifest.json").read_text())
         self.assertTrue((ROOT / "skills" / "quota-tracker" / m["on_session_config"]).is_file())
-        self.assertIs(m["config"]["QUOTA_STATUSLINE_ENABLED"], True)
+        self.assertEqual(m["config"]["QUOTA_STATUSLINE_ENABLED"], "true")
 
 
 class SessionConfigHooks(Base):

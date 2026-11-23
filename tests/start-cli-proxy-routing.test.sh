@@ -47,7 +47,14 @@ done
 chmod +x "$TMP"/live-bin/* "$TMP"/dead-bin/* "$TMP"/exp-late-bin/* "$TMP"/exp-never-bin/* "$TMP"/exp-dead-bin/* \
   "$TMP"/app-late-bin/* "$TMP"/app-never-bin/*
 
+# Cases 1-9 pin the proxy routing that QUOTA_STATUSLINE_ENABLED=false brings back.
 run_probe() {  # $1 = stub bin dir; remaining args = extra env KEY=VAL pairs
+  local stub="$1"; shift
+  env -i HOME="$HOME" PATH="$stub:/usr/bin:/bin:/usr/sbin:/sbin" QUOTA_STATUSLINE_ENABLED=false "$@" \
+      bash "$STARTCLI" --print-core-env 2>"$TMP/stderr"
+}
+# Direct routing as shipped: the switch comes from the skill manifest, not the environment.
+run_direct() {
   local stub="$1"; shift
   env -i HOME="$HOME" PATH="$stub:/usr/bin:/bin:/usr/sbin:/sbin" "$@" \
       bash "$STARTCLI" --print-core-env 2>"$TMP/stderr"
@@ -133,6 +140,39 @@ echo "$out" | grep -q "ANTHROPIC_BASE_URL"
 check $? "app-supervised + never-listener → core env stays unwired"
 grep -q "expected (proxy process running).*no proxy protection" "$TMP/stderr"
 check $? "app-supervised budget exhaustion warns instead of staying silent"
+
+# 10. Recorder on (the manifest default): a live proxy is not wired.
+out="$(run_direct "$TMP/live-bin")"
+echo "$out" | grep -q "ANTHROPIC_BASE_URL"
+[ $? -ne 0 ]
+check $? "recorder on: a live proxy listener is not forwarded (sessions go direct)"
+echo "$out" | grep -qx "QUOTA_STATUSLINE_ENABLED=true"
+check $? "recorder on: the switch reaches the session from the manifest"
+
+# 11. Recorder on: an inherited local-proxy URL (any loopback spelling) is dropped.
+for u in http://localhost:7846 http://127.0.0.1:7846/ "http://[::1]:7846"; do
+  out="$(run_direct "$TMP/live-bin" ANTHROPIC_BASE_URL="$u")"
+  echo "$out" | grep -q "ANTHROPIC_BASE_URL"
+  [ $? -ne 0 ]
+  check $? "recorder on: inherited $u is dropped"
+done
+
+# 12. Recorder on: an owner-set base URL that is not the local proxy is kept verbatim.
+out="$(run_direct "$TMP/live-bin" ANTHROPIC_BASE_URL=http://example.test:1)"
+echo "$out" | grep -qx "ANTHROPIC_BASE_URL=http://example.test:1"
+check $? "recorder on: a custom ANTHROPIC_BASE_URL is left alone"
+out="$(run_direct "$TMP/live-bin" ANTHROPIC_BASE_URL=http://localhost:7847)"
+echo "$out" | grep -qx "ANTHROPIC_BASE_URL=http://localhost:7847"
+check $? "recorder on: another local port is not the proxy and is kept"
+
+# 13. The session itself drops a proxy URL its tmux server environment carries.
+. "$REPO/src/claude_routing.sh"
+got="$(ANTHROPIC_BASE_URL=http://localhost:7846 sh -c '. "$1"; shift; claude_unset_local_proxy; exec "$@"' sh "$REPO/src/claude_routing.sh" sh -c 'echo "${ANTHROPIC_BASE_URL-unset}"')"
+[ "$got" = "unset" ]
+check $? "session wrapper unsets an inherited local proxy URL"
+got="$(ANTHROPIC_BASE_URL=http://example.test:1 sh -c '. "$1"; shift; claude_unset_local_proxy; exec "$@"' sh "$REPO/src/claude_routing.sh" sh -c 'echo "${ANTHROPIC_BASE_URL-unset}"')"
+[ "$got" = "http://example.test:1" ]
+check $? "session wrapper keeps a custom base URL"
 
 echo
 if [ "$fail" -eq 0 ]; then echo "PASS — $pass checks green"; else echo "FAIL — $fail failed, $pass passed"; exit 1; fi

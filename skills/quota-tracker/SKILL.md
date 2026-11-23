@@ -31,7 +31,7 @@ If the config dir already had a status line, the installer saves it beside that 
 
 Config (`manifest.json` `config`; env overrides):
 
-- `QUOTA_STATUSLINE_ENABLED` (default `true`): `false` removes the recorder and hook at the next launch.
+- `QUOTA_STATUSLINE_ENABLED` (default `true`): `false` removes the recorder and hook at the next launch, and routes sessions through the proxy again.
 - `QUOTA_STATUSLINE_PASSTHROUGH`: a status line command to pass through to instead of the saved one.
 
 With `source: "statusline"`, the readers (`src/quota_availability.py`, health-check's `credential-proxy` and `quota-telemetry` rows) treat a missing proxy as expected, not as a failure. `quota-telemetry` warns when the record's `last_checked` is more than 10 minutes (the gate's freshness window) older than the core's last recorded work.
@@ -43,6 +43,14 @@ What it gives up compared with the proxy:
 - percentages only to the precision Claude Code reports (often whole numbers);
 - nothing for API-key, Bedrock or Vertex logins (Claude Code sends no `rate_limits` there);
 - a refresh only when a session on that login gets a reply; between replies the record ages and goes stale as usual.
+
+## Sessions call Anthropic directly
+
+With the recorder on, Sutando's Claude sessions (the core and every pool worker) no longer go through the credential proxy. The core and worker launchers (`src/agent/claude/cli/session-launch.sh`) and `src/startup.sh` drop an `ANTHROPIC_BASE_URL` that points at the local proxy (`http://localhost:7846`, `127.0.0.1` or `[::1]`), in the launcher and in the session's own environment, and no longer set it. A base URL the owner set to anything else is left alone.
+
+- The proxy's shared-credential role no longer applies to these sessions: each one uses its own config dir's login. On a host where workers run in the core's config dir, that is the core's login for all of them.
+- Nothing stops or uninstalls the proxy. The launch agent `com.sutando.credential-proxy` is then unused by these sessions; turn it off with `launchctl bootout gui/$(id -u)/com.sutando.credential-proxy` once the sessions have restarted, and keep its plist in `~/Library/LaunchAgents/` to turn it back on (`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.sutando.credential-proxy.plist`). Health-check does not fail when the proxy is down and the quota record comes from the status line.
+- To route through the proxy again, set `QUOTA_STATUSLINE_ENABLED` to `false` (env, or the skill's `manifest.json` `config`) and restart the sessions. This also removes the recorder and puts back the saved status line.
 
 ## Quick Check
 
