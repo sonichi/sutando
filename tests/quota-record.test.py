@@ -258,6 +258,32 @@ class Writer(Base):
         Path(self.core, ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "acct-A"}}))
         self.assertIs(qa.trusted_record(old), old)
 
+    def test_a_prior_logins_credit_rejection_never_marks_the_current_account_exhausted(self):
+        import core_recovery_state as crs
+        self.sl(_status(five=40), now=None)
+        self.rl(detail="Your credit balance is too low to access the API")
+        sup = {"state": "blocked-human", "kind": "usage-limit", "prompt": "limit reached"}
+        import time as _t
+        self.assertEqual(crs.gather(self.ws, sup, now=_t.time(), runtime="claude")["state"], "out_of_credits")
+        Path(self.core, ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "acct-C"}}))
+        self.assertEqual(crs.gather(self.ws, sup, now=_t.time(), runtime="claude")["state"], "paused_limit")
+
+    def test_promotion_keeps_the_accounts_existing_evidence(self):
+        self.sl(_status(five=40), now=T0)
+        self.sl(_status(five=70), now=T0 + 10, cd=self.other)
+        self.rl(now=T0 + 20, cd=self.other, detail="429")
+        b = claude_account.account_key(self.other)
+        before = self.rec()["accounts"][b]
+        # The core's config dir signs in to the worker's account: that account becomes the top level.
+        Path(self.core, ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "acct-B"}}))
+        self.sl(_status(five=70), now=T0 + 30)
+        rec = self.rec()
+        self.assertEqual(rec["account"], b)
+        self.assertEqual(rec["recent_rejections"], before["recent_rejections"])
+        self.assertEqual(rec["limit_state"], "rejected")  # same numbers since the 429: still held
+        self.assertEqual(rec["exhausted_since"], before["exhausted_since"])
+        self.assertEqual(rec["accounts"][b]["recent_rejections"], before["recent_rejections"])
+
     def test_a_login_change_in_the_same_config_dir_inherits_nothing(self):
         self.sl(_status(five=80), now=T0)
         self.rl(now=T0 + 10)

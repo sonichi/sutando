@@ -288,9 +288,9 @@ def route(prev: Any, key: str, is_core: bool, build, bound: bool = True) -> Opti
         if isinstance(prev.get("accounts"), dict) else {}
     if not bound:
         seed = {}
-    elif is_core:
-        seed = _entry(prev) if prev.get("account") == key else {}
-    else:
+    elif is_core and prev.get("account") == key:
+        seed = _entry(prev)
+    else:  # a non-core login, or one just promoted to the top: its own keyed history
         seed = accounts.get(key, {})
     entry = build(seed)
     if entry is None:

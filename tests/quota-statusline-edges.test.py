@@ -292,6 +292,30 @@ class HealthCheck(Tmp):
         qr.quota_path(self.ws).write_text("{broken")
         self.assertFalse(hc._quota_record_from_statusline())
 
+    def test_readers_show_nothing_for_another_logins_record(self):
+        qr.record_statusline(self.ws, _status(five=55), config_dir=str(self.core), core_dir=str(self.core))
+        (self.core / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "acct-Z"}}))
+        import dashboard
+        with mock.patch.object(dashboard, "WORKSPACE_DIR", self.ws):
+            self.assertEqual(dashboard.get_quota_status(), {"available": True})
+        (self.core / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "acct-A"}}))
+        with mock.patch.object(dashboard, "WORKSPACE_DIR", self.ws):
+            self.assertIn("headers", dashboard.get_quota_status())
+
+    def test_read_quota_refuses_another_logins_record(self):
+        qr.record_statusline(self.ws, _status(five=55), config_dir=str(self.core), core_dir=str(self.core))
+        (self.core / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "acct-Z"}}))
+        env = {"SUTANDO_WORKSPACE": str(self.ws), "SUTANDO_TEST_MODE": "1"}
+        with mock.patch.dict(os.environ, env):
+            mod = _load("read_quota_edges", SCRIPTS / "read-quota.py")
+        mod.QUOTA_FILE = qr.quota_path(self.ws)
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", ["read-quota.py"]), mock.patch.object(sys, "stdout", out):
+            with self.assertRaises(SystemExit) as stop:
+                mod.main()
+        self.assertEqual(stop.exception.code, 1)
+        self.assertIn("another login", out.getvalue())
+
     def test_statusline_freshness_with_an_unreadable_record(self):
         hc = self._hc()
         import quota_availability
