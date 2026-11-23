@@ -162,6 +162,19 @@ class SwitchModel(unittest.TestCase):
             self.assertIn("state/model-switch.json.tmp in", task_lifecycle.prepare_work_dir(str(self.root), check_only=check_only))
         self.assertEqual((target.read_text(), old.is_symlink()), ("kept", True))
         old.unlink()
+        # A temp under one of the allowed names is a plain file or it is refused, fresh or old, checked or
+        # started: a directory there would otherwise pass while fresh and then break the sweep.
+        for name in (".model-switch.json.x1.tmp", ".model-switch.lock.x1.tmp", ".isolated-turns.json.x1.tmp"):
+            odd = state / name
+            for make in (lambda: odd.mkdir(), lambda: odd.symlink_to(self.root / "nowhere")):
+                make()
+                for age in (None, (1, 1)):
+                    if age and odd.is_dir() and not odd.is_symlink():
+                        os.utime(odd, age)
+                    for check_only in (True, False):
+                        self.assertIn("state/%s in" % name, task_lifecycle.prepare_work_dir(str(self.root), check_only=check_only))
+                odd.rmdir() if odd.is_dir() and not odd.is_symlink() else odd.unlink()
+        self.assertIsNone(task_lifecycle.prepare_work_dir(str(self.root), check_only=True))
         # The isolated turn's hourly cap is kept there too, under the name the adapter itself gives it.
         from ag2_sparrow import relay_loop
         from ag2_sparrow.adapters.claude_code import inbox

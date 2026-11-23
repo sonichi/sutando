@@ -374,6 +374,9 @@ def prepare_work_dir(work, check_only=False):
                 continue
             if name.startswith(".") and name.endswith(".tmp") and any(name[1:].startswith(a + ".")
                                                                       for a in STATE_ALLOWED - {"format"}):
+                # A temp is a plain file, whatever its age: a link or directory under the name is refused.
+                if not _is_type(os.path.join(state, name), "file"):
+                    return "refusing to start: state/%s in %s is not a plain file" % (name, state)
                 # A fresh temp is a live writer's, mid-replace (the launcher's record as hold starts).
                 if not check_only and time.time() - os.lstat(os.path.join(state, name)).st_mtime > TEMP_SWEEP_AFTER:
                     os.unlink(os.path.join(state, name))
