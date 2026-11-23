@@ -1686,6 +1686,40 @@ def check_decision_card_clicks(workspace_dir: Optional[Path] = None) -> "dict | 
                        "`hitl_click: true` task (CLAUDE.md, Pending decisions)")}
 
 
+def check_task_event_handler(workspace_dir: Optional[Path] = None) -> "dict | None":
+    """DOWN when core's watcher would hold every task; mirrors read_handler_config_now's order."""
+    from util_paths import task_event_handler_config_path  # noqa: PLC0415
+    cfg = task_event_handler_config_path((Path(workspace_dir) if workspace_dir else WORKSPACE_DIR) / "state")
+    if not cfg.exists() and not cfg.is_symlink():
+        return None  # no declaration: the core takes every task, pin or not
+
+    def usable(path) -> bool:
+        return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+    try:
+        raw = cfg.read_bytes()
+    except OSError as exc:
+        why = f"{cfg.name} exists but cannot be read ({type(exc).__name__})"
+    else:
+        pin = os.environ.get("SUTANDO_TASK_EVENT_HANDLER", "")
+        if pin:
+            if usable(pin):
+                return None
+            why = f"the SUTANDO_TASK_EVENT_HANDLER override {pin!r} is not an executable file"
+        else:
+            try:
+                handler = (json.loads(raw) or {}).get("handler")
+            except (ValueError, AttributeError):
+                handler = None
+            if isinstance(handler, str) and usable(handler):
+                return None
+            why = f"{cfg.name} names a handler that is missing or not an executable file ({handler!r})"
+    return {"name": "task-event-handler", "status": "down",
+            "detail": (f"{why}; the core watcher holds every new task until it is fixed. Re-publish the "
+                       "handler from the checkout that should route, or remove the file to let the core "
+                       "take every task")}
+
+
 def check_connections_primary(workspace_dir: Optional[Path] = None) -> "dict | None":
     """WARN when the connections record has rows but no primary, or a primary whose bridge has no
     proactive room yet; otherwise say so when the legacy row is not primary. None when all is plain."""
@@ -13599,6 +13633,10 @@ def run_all_checks() -> list[dict]:
     _card_clicks = check_decision_card_clicks()
     if _card_clicks:
         checks.append(_card_clicks)
+
+    _handler = check_task_event_handler()
+    if _handler:
+        checks.append(_handler)
 
     _no_primary = check_connections_primary()
     if _no_primary:
