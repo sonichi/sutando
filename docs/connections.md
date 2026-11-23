@@ -596,8 +596,11 @@ answers before the rule above:
   task to be neither answered nor archived (`task_disposition`); it posts as that agent's core row.
   A sentinel carries a lease, `{"delivered_at", "ttl_s"}`, written by the router
   (`WORKER_POOL_DELIVERY_TTL_S`, default 4 h). A lapsed, missing or unreadable lease is logged
-  (`pool_delegation_not_current`) and, with `WORKER_POOL_DELIVERY_EXPIRY=enforce`, refused; the
-  default `warn` still allows it until the logs show no lease-less sentinels.
+  (`pool_delegation_not_current`) and still allowed. `WORKER_POOL_DELIVERY_EXPIRY=enforce`, which
+  would refuse it, is unavailable: `pool_delivery.ENFORCE_AVAILABLE` is False, so a configured
+  `enforce` reads as `warn` and logs `pool_delegation_enforce_unavailable`. It stays off until a
+  hand-back or renewal path lands, because a refused reply leaves the task in neither lane (the
+  review gap raised on #6760).
   A mismatch is refused, never answered as another identity;
 - a post with no task is the worker's own: its row on the room's server, with the token its vault
   key holds and its `agent_mxid`; with no room or a domainless one, its only enabled row. A core

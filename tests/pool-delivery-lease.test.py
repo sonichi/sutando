@@ -152,12 +152,34 @@ class TheVerdict(Case):
 
 class TheSwitch(Case):
     def test_the_mode_is_warn_unless_set_to_enforce(self):
-        self.assertEqual(pd.lease_mode(), "warn")
-        self.assertEqual(pd.lease_mode({pd.LEASE_MODE_KEY: "enforce"}), "enforce")
-        self.assertEqual(pd.lease_mode({pd.LEASE_MODE_KEY: "ENFORCE"}), "enforce")
-        self.assertEqual(pd.lease_mode({pd.LEASE_MODE_KEY: "strict"}), "warn")
+        with mock.patch.object(pd, "ENFORCE_AVAILABLE", True):
+            self.assertEqual(pd.lease_mode(), "warn")
+            self.assertEqual(pd.lease_mode({pd.LEASE_MODE_KEY: "enforce"}), "enforce")
+            self.assertEqual(pd.lease_mode({pd.LEASE_MODE_KEY: "ENFORCE"}), "enforce")
+            self.assertEqual(pd.lease_mode({pd.LEASE_MODE_KEY: "strict"}), "warn")
 
-    def test_the_manifest_declares_both_defaults(self):
+    def test_enforce_is_unavailable_until_the_hand_back_path_lands(self):
+        self.assertIs(pd.ENFORCE_AVAILABLE, False)
+        with mock.patch.dict(os.environ, {pd.LEASE_MODE_KEY: "enforce"}), \
+                self.assertLogs("pool_delivery", "WARNING") as logs:
+            self.assertEqual(pd.lease_mode(), "warn")
+        [line] = logs.output
+        event = json.loads(line.split(" unavailable ", 1)[1])
+        self.assertEqual(event, {"event": "pool_delegation_enforce_unavailable",
+                                 "requested_mode": "enforce", "mode": "warn"})
+
+    def test_the_gate_holds_against_the_env_and_the_manifest(self):
+        rt.deliver_one(self.ws, A, TID)
+        late = time.time() + pd.DEFAULT_LEASE_TTL_S + 1
+        with mock.patch.dict(os.environ, {pd.LEASE_MODE_KEY: "enforce"}), self.assertLogs("pool_delivery", "WARNING"):
+            got = ph.pool_delegation(self.ws, TID, A, now=late)
+        self.assertEqual((got["verdict"], got["mode"], got["allowed"]), ("expired", "warn", True))
+        manifest = Path(self._tmp.name) / "manifest.json"
+        manifest.write_text(json.dumps({"config": {pd.LEASE_MODE_KEY: "enforce"}}))
+        with mock.patch.object(pd, "LEASE_MANIFEST", manifest), self.assertLogs("pool_delivery", "WARNING"):
+            self.assertEqual(pd.lease_mode(), "warn")
+
+    def test_the_shipped_manifest_default_is_warn(self):
         cfg = json.loads((SCRIPTS.parent / "manifest.json").read_text())["config"]
         self.assertEqual(cfg[pd.LEASE_MODE_KEY], "warn")
         self.assertEqual(int(cfg[pd.LEASE_TTL_KEY]), pd.DEFAULT_LEASE_TTL_S)
@@ -180,7 +202,8 @@ class PoolDelegation(Case):
 
     def test_expired_under_enforce_is_held_but_not_allowed(self):
         rt.deliver_one(self.ws, A, TID)
-        with mock.patch.dict(os.environ, {pd.LEASE_MODE_KEY: "enforce"}):
+        with mock.patch.dict(os.environ, {pd.LEASE_MODE_KEY: "enforce"}), \
+                mock.patch.object(pd, "ENFORCE_AVAILABLE", True):
             got = ph.pool_delegation(self.ws, TID, A, now=time.time() + pd.DEFAULT_LEASE_TTL_S + 1)
         self.assertEqual((got["held"], got["verdict"], got["allowed"]), (True, "expired", False))
 

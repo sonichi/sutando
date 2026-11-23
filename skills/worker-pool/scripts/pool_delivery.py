@@ -26,6 +26,7 @@ import contextlib
 import errno
 import fcntl
 import json
+import logging
 import math
 import os
 import re
@@ -80,6 +81,8 @@ LEASE_TTL_KEY = "WORKER_POOL_DELIVERY_TTL_S"
 LEASE_MODE_KEY = "WORKER_POOL_DELIVERY_EXPIRY"
 DEFAULT_LEASE_TTL_S = 4 * 3600
 LEASE_MODES = ("warn", "enforce")
+# Refusing leaves an expired task in neither lane; flips only in the PR that adds its hand-back/renewal path.
+ENFORCE_AVAILABLE = False
 _MAX_LEASE_BYTES = 4096
 # Clock skew tolerated before a delivered_at in the future reads as implausible.
 _LEASE_FUTURE_SLACK_S = 5.0
@@ -98,10 +101,17 @@ def lease_ttl_s(environ=None) -> int:
 
 
 def lease_mode(environ=None) -> str:
-    """"warn" or "enforce" (env > manifest); anything else is "warn"."""
+    """"warn" or "enforce" (env > manifest); anything else is "warn". "enforce" also reads as
+    "warn", with a logged warning, while ENFORCE_AVAILABLE is False."""
     import skill_config
     v = skill_config.config_value(LEASE_MODE_KEY, LEASE_MANIFEST, environ=environ).lower()
-    return v if v in LEASE_MODES else "warn"
+    v = v if v in LEASE_MODES else "warn"
+    if v == "enforce" and not ENFORCE_AVAILABLE:
+        logging.getLogger(__name__).warning("pool_delivery: lease enforce unavailable %s", json.dumps(
+            {"event": "pool_delegation_enforce_unavailable", "requested_mode": v, "mode": "warn"},
+            sort_keys=True))
+        return "warn"
+    return v
 
 
 def lease_body(now: float, ttl_s: int) -> bytes:

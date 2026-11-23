@@ -162,8 +162,12 @@ The router does write one thing into a sentinel it creates or renews: a lease,
 `WORKER_POOL_DELIVERY_TTL_S`, default 4 h). It never changes who holds the task; every
 reader still keys on the name. It bounds how long the holding worker may answer that
 task as a core agent (`connections.task_reply_agent` through `pool_holder.pool_delegation`).
-A lapsed, missing or unreadable lease is logged as `pool_delegation_not_current`, and
-refused only under `WORKER_POOL_DELIVERY_EXPIRY=enforce`; the default is `warn`.
+A lapsed, missing or unreadable lease is logged as `pool_delegation_not_current` and still
+allowed (`WORKER_POOL_DELIVERY_EXPIRY=warn`). `enforce`, which would refuse it, is not
+available: until `pool_delivery.ENFORCE_AVAILABLE` flips, a configured `enforce` reads as
+`warn` and logs `pool_delegation_enforce_unavailable`. A refused reply would leave the task
+in neither lane, with no hand-back or renewal path (the review gap raised on #6760); the
+constant flips only in the change that adds that path.
 
 **Why not move the payload into the folder instead** (the rescue line's shape, and a
 draft of this section): a set to N workers then costs N copies of the payload plus a

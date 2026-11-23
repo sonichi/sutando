@@ -375,6 +375,17 @@ class TheDelegationMustBeCurrent(TaskCase):
 
     MODE = "WORKER_POOL_DELIVERY_EXPIRY"
 
+    def setUp(self):
+        super().setUp()
+        scripts = str(ROOT / "skills" / "worker-pool" / "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import pool_delivery
+        # Enforce is gated off in the product; these tests exercise the refusal it will turn on.
+        gate = mock.patch.object(pool_delivery, "ENFORCE_AVAILABLE", True)
+        gate.start()
+        self.addCleanup(gate.stop)
+
     def leased(self, tid, delivered_at, ttl_s=3600):
         scripts = str(ROOT / "skills" / "worker-pool" / "scripts")
         if scripts not in sys.path:
@@ -444,6 +455,16 @@ class TheDelegationMustBeCurrent(TaskCase):
                 got, events = self.answer(task, "enforce", 1_000_100.0)
                 self.assertIsInstance(got, C.NoConnectionForRoom)
                 self.assertEqual([e["verdict"] for e in events], ["unreadable"])
+
+    def test_without_the_gate_enforce_still_allows_and_says_why(self):
+        import pool_delivery
+        task = self.leased("task-abc123", 1_000_000.0)
+        with mock.patch.object(pool_delivery, "ENFORCE_AVAILABLE", False), \
+                self.assertLogs("pool_delivery", "WARNING") as gate:
+            got, events = self.answer(task, "enforce", 1_003_601.0)
+        self.assertEqual(got, "alpha")
+        self.assertEqual([(e["verdict"], e["mode"], e["allowed"]) for e in events], [("expired", "warn", True)])
+        self.assertIn("pool_delegation_enforce_unavailable", gate.output[0])
 
     def test_the_mode_defaults_to_warn(self):
         task = self.leased("task-abc123", 1_000_000.0)
