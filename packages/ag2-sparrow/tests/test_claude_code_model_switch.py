@@ -126,6 +126,12 @@ class SwitchModel(unittest.TestCase):
         os.utime(temp, (1, 1))
         self.assertIsNone(task_lifecycle.prepare_work_dir(str(self.root)))
         self.assertFalse(temp.exists(), "swept")
+        # The isolated turn's hourly cap is kept there too, under the name the adapter itself gives it.
+        from ag2_sparrow import relay_loop
+        from ag2_sparrow.adapters.claude_code import inbox
+        relay_loop.RateLimiter(str(self.root / "state" / inbox.ISOLATED_LIMITER_FILE), inbox.ISOLATED_PER_HOUR).record("task-g")
+        self.assertTrue((self.root / "state" / "isolated-turns.json").is_file())
+        self.assertIsNone(task_lifecycle.prepare_work_dir(str(self.root), check_only=True))
         # Anything else under state/ is still refused: the list did not become a pattern.
         (self.root / "state" / "model-switch.other").write_text("")
         self.assertIn("state/model-switch.other is not this adapter's state",
