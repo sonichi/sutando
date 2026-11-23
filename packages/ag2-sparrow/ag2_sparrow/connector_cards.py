@@ -7,6 +7,11 @@ posts each queued card as a room message carrying `space.ag2.card` and leaves th
 work root), which is what makes a later click count. `click` is `agent_card.click_verdict` for a task:
 only the owner's tap on a card this agent posted, in the DM it was posted in, is a command.
 
+A card queued with `edit` (the event id of a card this agent posted, e.g. the one the owner tapped) is
+shown in place of that card: the bridge sends it as an edit of that event, so the owner sees one card
+whose words change, not a second card. The edit's card is recorded under the original event, the one
+the owner sees and taps. An edit the server refuses is posted as a new card instead.
+
 Queue and posted files live under the bridge's state dir (`agent-cards/outbox`, `agent-cards/posted`);
 the bridge never writes into the work root. Standard library only, plus the bundled card modules.
 """
@@ -29,6 +34,7 @@ MAX_QUEUED_S = 600.0
 _NAME_RE = re.compile(r"^[0-9a-f]{32}\.json$")
 # A room id with its server, or the newer kind that has none (room version 12).
 _ROOM_RE = re.compile(r"^![^\s:]+(:\S+)?$")
+_EVENT_RE = re.compile(r"^\$\S+$")
 
 
 def _core():
@@ -63,8 +69,10 @@ def _entries(folder: Path) -> list:
         return []
 
 
-def queue(bridge_state, room: str, body: str, card: dict, *, now=None, key: str = "", at_ns: int = 0) -> str:
-    """Queue `card` for `room`; the queue id. A card the client would not draw is refused here.
+def queue(bridge_state, room: str, body: str, card: dict, *, now=None, key: str = "", at_ns: int = 0,
+          edit: str = "") -> str:
+    """Queue `card` for `room`; the queue id. A card the client would not draw is refused here. With
+    `edit` (a posted card's event id) it is shown in place of that card instead of as a new one.
 
     With `key` (and the `at_ns` it was first decided at) the call may be repeated: the id is made of
     those two, and a card already queued under it is not queued again, so a caller that saved its
@@ -75,6 +83,8 @@ def queue(bridge_state, room: str, body: str, card: dict, *, now=None, key: str 
         raise ValueError("the card would not render: %s" % found)
     if not _ROOM_RE.match(room or "") or not body or "\n" in body:
         raise ValueError("a card needs a room id and a one-line body")
+    if edit and not _EVENT_RE.match(edit):
+        raise ValueError("a card can only be shown in place of an event id")
     # The clock leads the id, so two cards queued between sweeps are posted in the order they were queued.
     if not key:
         qid = "%016x%s" % (time.time_ns(), uuid.uuid4().hex[:16])
@@ -84,7 +94,8 @@ def queue(bridge_state, room: str, body: str, card: dict, *, now=None, key: str 
         if marker.exists():
             return qid
     _write(Path(bridge_state).joinpath(*OUTBOX) / (qid + ".json"),
-           {"room": room, "body": body, "card": card, "queued_at": time.time() if now is None else now})
+           dict({"room": room, "body": body, "card": card, "queued_at": time.time() if now is None else now},
+                **({"edit": edit} if edit else {})))
     if key:
         # The marker follows the card: a stop between the two queues it once more, never drops it.
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -128,23 +139,47 @@ class Poster:
                 self.log("agent-card: dropped a card queued over %d s ago" % MAX_QUEUED_S)
                 path.unlink(missing_ok=True)
                 continue
+            payload = {"op": "message", "room_id": record["room"], "body": str(record.get("body") or ""),
+                       "extra_content": {CARD_KEY: card}, "dedupe_key": "agent-card:" + path.stem}
+            target = str(record.get("edit") or "")
             try:
-                answer = self.post({"op": "message", "room_id": record["room"], "body": str(record.get("body") or ""),
-                                    "extra_content": {CARD_KEY: card}, "dedupe_key": "agent-card:" + path.stem})
+                _, event_id = self.send(payload, target if _EVENT_RE.match(target) else "")
             except Exception as e:  # noqa: BLE001 - stays queued, retried next sweep
                 self.log("agent-card: post failed (will retry): %s" % type(e).__name__)
                 held.add(same)
                 continue
-            event_id = str((answer or {}).get("event_id") or "") if isinstance(answer, dict) else ""
             if not event_id.startswith("$"):
                 self.log("agent-card: the post returned no event id (will retry)")
                 held.add(same)
                 continue
             _write(self.state.joinpath(*POSTED) / path.name,
-                   {"event_id": event_id, "room": record["room"], "card": card, "posted_at": self.clock()})
+                   dict({"event_id": event_id, "room": record["room"], "card": card, "posted_at": self.clock()},
+                        **({"edited": True} if target and event_id == target else {})))
             path.unlink(missing_ok=True)
             posted += 1
         return posted
+
+    def send(self, payload, target: str = ""):
+        """(answer, event id the card now shows at). With `target` the card is sent as an edit of that
+        event, and stays recorded under it; an edit the server refuses (a 4xx: the event is not there, or not
+        this agent's; or an answer that is not a success) is posted as a new card instead, so the owner is
+        still told."""
+        if target:
+            try:
+                answer = self.post(dict(payload, op="edit", event_id=target,
+                                        dedupe_key="agent-card-edit:" + payload["dedupe_key"].split(":", 1)[1]))
+            except Exception as e:  # noqa: BLE001 - only a refusal falls back; anything else is retried
+                code = getattr(e, "code", None)
+                code = code if isinstance(code, int) else getattr(e, "status", None)
+                if not (isinstance(code, int) and 400 <= code < 500):
+                    raise
+                self.log("agent-card: edit refused (%s), posted as a new card" % code)
+            else:
+                if isinstance(answer, dict) and not answer.get("is_error") and (answer.get("ok") or answer.get("event_id")):
+                    return answer, target
+                self.log("agent-card: edit not accepted, posted as a new card")
+        answer = self.post(payload)
+        return answer, str((answer or {}).get("event_id") or "") if isinstance(answer, dict) else ""
 
 
 def absorb(bridge_state, work_root, handler: str = "") -> int:
@@ -154,8 +189,11 @@ def absorb(bridge_state, work_root, handler: str = "") -> int:
     for path in _entries(Path(bridge_state).joinpath(*POSTED)):
         record = _read(path)
         if record and isinstance(record.get("card"), dict):
-            issued_cards.record(Path(work_root), str(record.get("event_id") or ""), record["card"],
-                                room=str(record.get("room") or ""), lane="", handler=handler)
+            event, room = str(record.get("event_id") or ""), str(record.get("room") or "")
+            if record.get("edited") and str((issued_cards.live(Path(work_root), event) or {}).get("room") or "") == room:
+                # The card now shown at that event replaces the one tapped: its buttons stop acting.
+                issued_cards.settle(Path(work_root), event)
+            issued_cards.record(Path(work_root), event, record["card"], room=room, lane="", handler=handler)
             taken += 1
         path.unlink(missing_ok=True)
     return taken
