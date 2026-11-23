@@ -6021,6 +6021,10 @@ def check_core_request_rejections(window_sec: int = 900, sustained: int = 5,
         check["status"] = "warn"
         check["detail"] = "quota-state.json present but unreadable"
         return check
+    from quota_availability import trusted_record  # src/ is on sys.path
+    if isinstance(data, dict) and trusted_record(data) is None:
+        check["detail"] = "quota record is another login's status line record — not this core's"
+        return check
     ledger = data.get("recent_rejections") if isinstance(data, dict) else None
     if not isinstance(ledger, list) or not ledger:
         check["detail"] = "no upstream rejections recorded by the proxy"
@@ -6119,6 +6123,10 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
     if not isinstance(data, dict):
         check["status"] = "warn"
         check["detail"] = "quota-state.json is not a JSON object"
+        return check
+    from quota_availability import trusted_record  # src/ is on sys.path
+    if trusted_record(data) is None:
+        check["detail"] = "quota record is another login's status line record — not this core's"
         return check
     headers = data.get("headers")
     if not isinstance(headers, dict):

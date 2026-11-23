@@ -69,6 +69,16 @@ def from_statusline(record: Any, account: Any = _CURRENT) -> bool:
     return isinstance(account, str) and bool(account) and record.get("account") == account
 
 
+def trusted_record(record: Any, account: Any = _CURRENT) -> Optional[dict]:
+    """The record a decision may use: a proxy record as before; a status line record only
+    when it is the core's current login's (`from_statusline`); else None."""
+    if not isinstance(record, dict):
+        return None
+    if record.get("source") == STATUSLINE_SOURCE and not from_statusline(record, account):
+        return None
+    return record
+
+
 def _rejected_since_observed(record: dict) -> bool:
     """A 429 at or after the record's own observation: only a later observation clears it."""
     checked = _parse_when(record.get("last_checked"))
@@ -176,13 +186,16 @@ def availability_decision(
 ) -> dict[str, Any]:
     """Return the one authoritative routed/fresh/accepted quota decision."""
     payload = quota if isinstance(quota, dict) else {}
+    statusline = payload.get("source") == STATUSLINE_SOURCE
+    verified = statusline and from_statusline(payload)
     headers = payload.get("headers")
     headers = headers if isinstance(headers, dict) else {}
     status = headers.get("anthropic-ratelimit-unified-status", "unknown")
-    routed = points_at_credential_proxy(base_url) or from_statusline(payload)
+    # A status line record speaks for its own login only, whatever the proxy URL says.
+    routed = verified if statusline else points_at_credential_proxy(base_url)
     limit_state = classify_limit_state(payload)
     accepted = resolve_available(str(status), payload.get("available"), headers, limit_state)
-    if from_statusline(payload) and _rejected_since_observed(payload):
+    if verified and _rejected_since_observed(payload):
         accepted = False
     available = accepted and routed and not stale
     return {

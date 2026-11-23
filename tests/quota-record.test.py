@@ -30,7 +30,6 @@ import claude_account
 import quota_availability as qa
 import quota_record as qr
 import session_config_hooks as sch
-import proxy_retire as pr
 import statusline_config as cfg
 
 FX = json.loads((ROOT / "tests" / "fixtures" / "quota-record-shape.parity.json").read_text())
@@ -238,6 +237,27 @@ class Writer(Base):
         self.assertFalse(claude_account.is_identified(claude_account.account_key(str(a))))
         self.assertTrue(claude_account.is_identified(claude_account.account_key(self.core)))
 
+    def test_an_account_switch_and_a_proxy_rollback_never_use_the_old_login(self):
+        import core_limit_hold as clh
+        self.sl(_status(five=40), now=None)
+        self.rl()
+        old = self.rec()
+        Path(self.core, ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "acct-C"}}))
+        for base in (None, "http://localhost:7846"):  # direct, and rolled back to the proxy
+            d = qa.availability_decision(old, base_url=base, stale=False)
+            self.assertFalse(d["available"], (base, d))
+            self.assertEqual(d["unavailable_reason"], "not-routed")
+        self.assertIsNone(qa.trusted_record(old))
+        proxy = {k: v for k, v in old.items() if k not in ("source", "account", "accounts")}
+        self.assertIs(qa.trusted_record(proxy), proxy)  # a proxy record is judged as before
+        projects = Path(self._tmp.name) / "projects"
+        projects.mkdir()
+        decision = clh.decide(self.ws, projects_dir=projects, launch_model="claude-opus-5-5",
+                              launch_account=claude_account.account_fingerprint(self.core))
+        self.assertTrue(decision.launch, decision)  # the old login's 429 holds nothing
+        Path(self.core, ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "acct-A"}}))
+        self.assertIs(qa.trusted_record(old), old)
+
     def test_a_login_change_in_the_same_config_dir_inherits_nothing(self):
         self.sl(_status(five=80), now=T0)
         self.rl(now=T0 + 10)
@@ -442,124 +462,6 @@ class SessionConfigHooks(Base):
         __import__("time").sleep(3)
         self.assertFalse(late.exists())
         self.assertFalse(Path(f"{late}.2").exists())
-
-
-class FakeRun:
-    """Answers launchctl / ps / lsof from a table; records every argv."""
-
-    def __init__(self, ps="", lsof_rc=1, lsof_out="", loaded=True, pid=4242, bootout_rc=0):
-        self.calls, self.ps, self.lsof_rc, self.lsof_out = [], ps, lsof_rc, lsof_out
-        self.loaded, self.pid, self.bootout_rc = loaded, pid, bootout_rc
-
-    def __call__(self, argv):
-        self.calls.append(argv)
-        R = __import__("types").SimpleNamespace
-        if argv[:2] == ["launchctl", "print"]:
-            return R(returncode=0 if self.loaded else 113,
-                     stdout=f"\tstate = running\n\tpid = {self.pid}\n" if self.loaded else "")
-        if argv[:2] == ["launchctl", "bootout"]:
-            self.loaded = self.loaded and self.bootout_rc != 0
-            return R(returncode=self.bootout_rc, stdout="")
-        if argv[:2] == ["launchctl", "bootstrap"]:
-            self.loaded = True
-            return R(returncode=0, stdout="")
-        if argv[0] == "ps":
-            return R(returncode=0, stdout=self.ps)
-        if argv[0] == "lsof":
-            return R(returncode=self.lsof_rc, stdout=self.lsof_out)
-        raise AssertionError(argv)
-
-    def booted_out(self):
-        return any(a[:2] == ["launchctl", "bootout"] for a in self.calls)
-
-
-class ProxyRetire(Base):
-    def setUp(self):
-        super().setUp()
-        self.sl(_status(), now=None)  # a fresh core record
-        p = [mock.patch.object(claude_account, "core_config_dir", return_value=self.core),
-             mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "true"})]
-        for x in p:
-            x.start()
-            self.addCleanup(x.stop)
-        self.killed = []
-
-    def _gone(self, pid, sig):
-        self.killed.append((pid, sig))
-        if sig == 0:
-            raise OSError("no such process")
-
-    def retire(self, run):
-        return pr.retire(self.ws, runner=run, kill=self._gone, wait_s=0.2)
-
-    def test_kept_while_a_session_env_points_at_the_proxy(self):
-        ps = (f" 101 /opt/bin/claude --name sutando-core CLAUDE_CONFIG_DIR={self.core} "
-              "ANTHROPIC_BASE_URL=http://localhost:7846\n 102 /bin/zsh ANTHROPIC_BASE_URL=http://localhost:7846\n")
-        run = FakeRun(ps=ps)
-        said = self.retire(run)
-        self.assertIn("pid 101", said)
-        self.assertNotIn("pid 102", said)
-        self.assertFalse(run.booted_out())
-        rec = json.loads((self.ws / "state" / pr.RECORD).read_text())
-        self.assertEqual(rec["status"], "kept")
-        self.assertIn("pid 101", rec["reason"])
-
-    def test_kept_while_launch_settings_point_at_the_proxy(self):
-        Path(self.core, "settings.json").write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:7846"}}))
-        run = FakeRun()
-        self.assertIn("settings", self.retire(run))
-        self.assertFalse(run.booted_out())
-
-    def test_kept_while_a_connection_is_open(self):
-        out = ("COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"
-               "node 4242 u 20u IPv4 0x1 0t0 TCP 127.0.0.1:7846->127.0.0.1:50000 (ESTABLISHED)\n"
-               "curl 999 u 3u IPv4 0x2 0t0 TCP 127.0.0.1:50000->127.0.0.1:7846 (ESTABLISHED)\n")
-        run = FakeRun(lsof_rc=0, lsof_out=out)
-        said = self.retire(run)
-        self.assertIn("curl 999", said)
-        self.assertFalse(run.booted_out())
-
-    def test_kept_without_a_fresh_core_record(self):
-        self.path.unlink()
-        run = FakeRun()
-        self.assertIn("no fresh status line record", self.retire(run))
-        self.assertFalse(run.booted_out())
-
-    def test_turned_off_when_everything_is_clear_and_reenabled_on_opt_out(self):
-        run = FakeRun(ps=" 101 /opt/bin/claude --name sutando-core ANTHROPIC_BASE_URL=http://example.test:1\n")
-        said = self.retire(run)
-        self.assertTrue(said.startswith("turned off"), said)
-        self.assertTrue(run.booted_out())
-        self.assertEqual(self.killed, [(4242, 0)])  # gone after bootout: never signalled
-        rec = json.loads((self.ws / "state" / pr.RECORD).read_text())
-        self.assertEqual((rec["status"], rec["by"]), ("retired", "quota-tracker"))
-        plist = Path(self._tmp.name) / "LaunchAgents" / f"{pr.LABEL}.plist"
-        plist.parent.mkdir()
-        plist.write_text("<plist/>")
-        with mock.patch.object(pr, "plist_path", return_value=plist):
-            self.assertEqual(pr.restore(self.ws, runner=run), "restored")
-        boot = [a for a in run.calls if a[:2] == ["launchctl", "bootstrap"]]
-        self.assertEqual(boot[0][-1], str(plist))
-        self.assertEqual(json.loads((self.ws / "state" / pr.RECORD).read_text())["status"], "restored")
-
-    def test_a_job_that_outlives_bootout_is_stopped_by_its_own_pid_only(self):
-        run = FakeRun(pid=5151)
-        sent = []
-        said = pr.retire(self.ws, runner=run, kill=lambda pid, sig: sent.append((pid, sig)), wait_s=0.2)
-        self.assertTrue(said.startswith("turned off"), said)
-        self.assertEqual({p for p, _s in sent}, {5151})
-        self.assertIn(__import__("signal").SIGTERM, [s for _p, s in sent])
-
-    def test_opt_out_never_starts_a_job_it_did_not_turn_off(self):
-        run = FakeRun(loaded=False)
-        self.assertEqual(pr.restore(self.ws, runner=run), "nothing to restore")
-        self.assertFalse(any(a[:2] == ["launchctl", "bootstrap"] for a in run.calls))
-
-    def test_switch_off_keeps_the_proxy(self):
-        run = FakeRun()
-        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false"}):
-            self.assertIn("tracking is off", self.retire(run))
-        self.assertFalse(run.booted_out())
 
 
 class HealthCheck(Base):

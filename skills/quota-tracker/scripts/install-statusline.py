@@ -24,13 +24,6 @@ def main(argv=None) -> int:
     if done != "unchanged":
         print(f"quota-tracker: status line recorder {done} in {a.config_dir}/settings.json",
               file=sys.stderr)
-    try:
-        import proxy_retire
-        ws = cfg.workspace()
-        said = proxy_retire.retire(ws) if cfg.enabled() else proxy_retire.restore(ws)
-        print(f"quota-tracker: credential proxy launch agent: {said}", file=sys.stderr)
-    except Exception as exc:  # noqa: BLE001
-        print(f"quota-tracker: credential proxy check skipped ({type(exc).__name__})", file=sys.stderr)
     return 0
 
 

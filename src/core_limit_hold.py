@@ -585,7 +585,7 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
     if quota is None and not seat:
         rec = qa.read_quota_record(workspace, now)
         quota = rec.payload if rec else None
-    own = () if seat else (record_evidence(quota, now), transcript_evidence(projects_dir, now))
+    own = () if seat else (record_evidence(qa.trusted_record(quota), now), transcript_evidence(projects_dir, now))
     found = [lim for lim in (*own, *evidence) if _relevant(lim, launch_model, since)]
     limit = max(found, key=lambda lim: lim.at) if found else None
     seen = hold.get("evidence_at") if hold else None

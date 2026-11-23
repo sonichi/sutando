@@ -165,6 +165,18 @@ out="$(run_direct "$TMP/live-bin" ANTHROPIC_BASE_URL=http://localhost:7847)"
 echo "$out" | grep -qx "ANTHROPIC_BASE_URL=http://localhost:7847"
 check $? "recorder on: another local port is not the proxy and is kept"
 
+# 14. Opt-out: the first launch after the switch goes off is routed through the proxy again,
+#     decided at that launch (the proxy was never stopped, so its port is still served).
+out="$(run_direct "$TMP/live-bin")"
+echo "$out" | grep -q "ANTHROPIC_BASE_URL"
+[ $? -ne 0 ]
+check $? "before opt-out: the launch goes direct"
+out="$(run_direct "$TMP/live-bin" QUOTA_STATUSLINE_ENABLED=false)"
+echo "$out" | grep -qx "ANTHROPIC_BASE_URL=http://localhost:7846"
+check $? "first launch after opt-out: the proxy URL is set again"
+echo "$out" | grep -qx "QUOTA_STATUSLINE_ENABLED=false"
+check $? "first launch after opt-out: the session carries the switch as off"
+
 # 13. The session itself drops a proxy URL its tmux server environment carries.
 . "$REPO/src/claude_routing.sh"
 got="$(ANTHROPIC_BASE_URL=http://localhost:7846 sh -c '. "$1"; shift; claude_unset_local_proxy; exec "$@"' sh "$REPO/src/claude_routing.sh" sh -c 'echo "${ANTHROPIC_BASE_URL-unset}"')"

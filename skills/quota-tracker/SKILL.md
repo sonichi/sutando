@@ -49,14 +49,8 @@ What it gives up compared with the proxy:
 With the recorder on, Sutando's Claude sessions (the core and every pool worker) no longer go through the credential proxy. The core and worker launchers (`src/agent/claude/cli/session-launch.sh`) and `src/startup.sh` drop an `ANTHROPIC_BASE_URL` that points at the local proxy (`http://localhost:7846`, `127.0.0.1` or `[::1]`), in the launcher and in the session's own environment, and no longer set it. A base URL the owner set to anything else is left alone.
 
 - The proxy's shared-credential role no longer applies to these sessions: each one uses its own config dir's login. On a host where workers run in the core's config dir, that is the core's login for all of them.
-- The credential-proxy launch agent (`com.sutando.credential-proxy`) is turned off automatically once it is verifiably unused. At each session launch, `scripts/proxy_retire.py` (run by the session-config hook) runs `launchctl bootout` only when all of these hold:
-  - status line tracking is on;
-  - no live Claude process carries the local proxy as `ANTHROPIC_BASE_URL`, and no config dir it runs in sets it under `env` in `settings.json`;
-  - `lsof` finds no established connection on port 7846;
-  - a fresh status line record exists for the core's account.
-
-  The plist stays in `~/Library/LaunchAgents/`. If the job's process outlives the bootout, only that job's own PID (read from `launchctl print` beforehand) is stopped; nothing is killed by name. Otherwise the agent keeps running and the reason, naming the client still using it, goes to the launch log and `state/quota-proxy-retire.json`. `python3 scripts/proxy_retire.py --dry-run` shows the decision without acting. Health-check does not fail when the proxy is down and the quota record comes from the status line.
-- To route through the proxy again, set `QUOTA_STATUSLINE_ENABLED` to `false` (env, or the skill's `manifest.json` `config`) and restart the sessions. This also removes the recorder, puts back the saved status line, and turns the proxy launch agent back on (`launchctl bootstrap`) if `proxy_retire.py` turned it off; an agent the owner turned off is left alone.
+- Nothing stops or uninstalls the proxy: it keeps running, unused by these sessions. Health-check does not fail when the proxy is down or unused and the quota record comes from the status line.
+- To route through the proxy again, set `QUOTA_STATUSLINE_ENABLED` to `false` (env, or the skill's `manifest.json` `config`) and restart the sessions: the next launch decides its routing with the switch off and points the session at the proxy, which was never stopped. This also removes the recorder and puts back the saved status line.
 
 ## Quick Check
 
