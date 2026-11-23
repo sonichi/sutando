@@ -252,6 +252,23 @@ def _init_step(name):
     """A test seam between the first-init steps; production does nothing here."""
 
 
+def _temp_seen(path):
+    """One lstat of a listed temp: its mtime when it is a plain file, False when it is anything else,
+    None when it is gone (its writer renamed it into place since the listing)."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return st.st_mtime if _stat.S_ISREG(st.st_mode) else False
+
+
+def _unlink_if_there(path):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
 def _is_type(path, want):
     """lstat, never following a link: `want` is "file" (regular) or "dir"."""
     try:
@@ -367,19 +384,21 @@ def prepare_work_dir(work, check_only=False):
                     return "refusing to start: state/%s in %s is not a plain file" % (name, state)
                 continue
             if name in LEGACY_TEMPS:
-                if not _is_type(os.path.join(state, name), "file"):
+                seen = _temp_seen(os.path.join(state, name))
+                if seen is False:
                     return "refusing to start: state/%s in %s is not a plain file" % (name, state)
-                if not check_only:
-                    os.unlink(os.path.join(state, name))
+                if seen is not None and not check_only:
+                    _unlink_if_there(os.path.join(state, name))
                 continue
             if name.startswith(".") and name.endswith(".tmp") and any(name[1:].startswith(a + ".")
                                                                       for a in STATE_ALLOWED - {"format"}):
-                # A temp is a plain file, whatever its age: a link or directory under the name is refused.
-                if not _is_type(os.path.join(state, name), "file"):
+                # One look: a temp renamed into place since the listing is a writer finishing, not an error.
+                # One that is there is a plain file, whatever its age; a fresh one is a live writer's.
+                seen = _temp_seen(os.path.join(state, name))
+                if seen is False:
                     return "refusing to start: state/%s in %s is not a plain file" % (name, state)
-                # A fresh temp is a live writer's, mid-replace (the launcher's record as hold starts).
-                if not check_only and time.time() - os.lstat(os.path.join(state, name)).st_mtime > TEMP_SWEEP_AFTER:
-                    os.unlink(os.path.join(state, name))
+                if seen is not None and not check_only and time.time() - seen > TEMP_SWEEP_AFTER:
+                    _unlink_if_there(os.path.join(state, name))
                 continue
             if bridge_entry(work, os.path.join("state", name)):
                 continue

@@ -438,6 +438,24 @@ class FreshDirTest(Base):
         self.assertEqual((rc == 0, "state/.rate.jsonl.9.abcd.tmp in" in err and "not a plain file" in err), (False, True), err)
         (state / ".rate.jsonl.9.abcd.tmp").rmdir()
         self.assertEqual(self.main()[0], 0)
+        # A writer that renames its temp into place between the listing and the look is finishing, not
+        # breaking the layout: listed, then gone, is accepted in a check and in a start, fresh or not.
+        for copy in filter(None, (src_copy(), vendored)):
+            real_listdir = os.listdir
+            for gone in (".rate.jsonl.7.abcd.tmp", "model-switch.json.tmp"):
+                def listing(path, gone=gone):
+                    names = real_listdir(path)
+                    return names + [gone] if os.path.basename(str(path)) == "state" else names
+                with mock.patch.object(copy.os, "listdir", side_effect=listing):
+                    for check_only in (True, False):
+                        self.assertIsNone(copy.prepare_work_dir(str(self.work), check_only=check_only), gone)
+            # Removed by someone else between the look and the sweep: still not an error.
+            old = state / ".rate.jsonl.8.abcd.tmp"
+            old.write_text("")
+            os.utime(old, (1, 1))
+            with mock.patch.object(copy.os, "unlink", side_effect=FileNotFoundError()):
+                self.assertIsNone(copy.prepare_work_dir(str(self.work)))
+            old.unlink()
         # The canonical copy answers the same, read by read (the package's is its copy).
         for copy in filter(None, (src_copy(), vendored)):
             (state / "model-switch.json.tmp").write_text("x")
