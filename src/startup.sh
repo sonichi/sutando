@@ -741,6 +741,19 @@ fi
 # a child of this tmux tree beside it races the wrapper for the port and dies
 # with the tree. The legacy bare-& launch below runs only when no launchd job
 # exists (older checkout without the template, or an install that refused).
+# The proxy keeps running either way; with the status line recorder on, sessions go direct.
+_route_sessions_to_proxy() {
+  if [ -r "$REPO/src/skill-manifest-config.sh" ] && [ -r "$REPO/src/claude_routing.sh" ]; then
+    . "$REPO/src/skill-manifest-config.sh"
+    . "$REPO/src/claude_routing.sh"
+    if claude_direct_routing; then
+      claude_unset_local_proxy
+      echo "  ✓ Claude sessions call Anthropic directly (proxy left running, unused by them)"
+      return 0
+    fi
+  fi
+  export ANTHROPIC_BASE_URL=http://localhost:7846
+}
 start_credential_proxy() {
   local _PROXY_LABEL="com.sutando.credential-proxy"
   local _PROXY_INSTALLER="$REPO/src/install-credential-proxy-launchd.sh"
@@ -762,7 +775,7 @@ start_credential_proxy() {
   fi
   if lsof -i :7846 > /dev/null 2>&1; then
     echo "  ✓ credential proxy (already running)"
-    export ANTHROPIC_BASE_URL=http://localhost:7846
+    _route_sessions_to_proxy
     return 0
   fi
   if launchctl print "$_PROXY_SERVICE" > /dev/null 2>&1; then
@@ -771,7 +784,7 @@ start_credential_proxy() {
     for _ in $(seq 1 20); do lsof -i :7846 > /dev/null 2>&1 && break; sleep 0.5; done
     if lsof -i :7846 > /dev/null 2>&1; then
       echo "  ✓ credential proxy (launchd-supervised)"
-      export ANTHROPIC_BASE_URL=http://localhost:7846
+      _route_sessions_to_proxy
       return 0
     fi
     _state="$(launchctl print "$_PROXY_SERVICE" 2>/dev/null | awk -F' = ' '$1 ~ /^[[:space:]]*state$/ {print $2; exit}')"
@@ -796,7 +809,7 @@ start_credential_proxy() {
   sleep 1
   if lsof -i :7846 > /dev/null 2>&1; then
     echo "  ✓ credential proxy"
-    export ANTHROPIC_BASE_URL=http://localhost:7846
+    _route_sessions_to_proxy
   else
     echo "  ⚠ credential proxy failed — Claude will connect directly (check /tmp/credential-proxy.log)"
   fi
