@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://s.space/contracts/runtime_profile.v1/schema.json",
   "title": "runtime_profile.v1 heartbeat block",
-  "description": "The `runtime_profile` object a heartbeat carries when its capabilities list `runtime_profile.v1`. The core's own model, switch options and plan, plus one entry per worker. Names are the runtime's own display names, never aliases.",
+  "description": "The `runtime_profile` object a heartbeat carries when its capabilities list `runtime_profile.v1`. The core's own model, switch options and plan name, plus one entry per worker. Names are the runtime's own display names, never aliases. Usage and limit state are not here: the heartbeat's `health.quota` (`quota_status.v1`) is their one source.",
   "type": "object",
   "required": ["v", "reported_at", "model", "switch_options", "plan", "workers"],
   "additionalProperties": false,
@@ -61,15 +61,11 @@
     },
     "plan": {
       "type": "object",
-      "required": ["name", "usage_pct", "window", "resets_at", "limited_until"],
+      "required": ["name"],
       "additionalProperties": false,
       "properties": {
         "account": {"type": "string", "pattern": "^acct_[A-Za-z0-9_-]{1,48}$"},
-        "name": {"$ref": "#/$defs/label"},
-        "usage_pct": {"oneOf": [{"type": "number", "minimum": 0, "maximum": 100}, {"type": "null"}]},
-        "window": {"enum": ["5h", "daily", "weekly", "monthly", null]},
-        "resets_at": {"oneOf": [{"$ref": "#/$defs/epoch"}, {"type": "null"}]},
-        "limited_until": {"oneOf": [{"$ref": "#/$defs/epoch"}, {"type": "null"}]}
+        "name": {"$ref": "#/$defs/label"}
       }
     }
   }

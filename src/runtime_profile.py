@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""The core's runtime profile (`runtime_profile.v1`): its model, the switches it offers, its plan.
+"""The core's runtime profile (`runtime_profile.v1`): its model, the switches it offers, its plan name.
 
-What the owner's clients show as "which model is my agent on, what can it switch to, how much of
-the plan is used". The gateway bridge sends it as the heartbeat's top-level `runtime_profile`
-with the `runtime_profile.v1` capability, through the reader the sutando adapter injects.
-`derive()` is pure; `gather()` reads the records other modules already keep:
+What the owner's clients show as "which model is my agent on, what can it switch to, on which
+plan". The gateway bridge sends it as the heartbeat's top-level `runtime_profile` with the
+`runtime_profile.v1` capability, through the reader the sutando adapter injects. It carries no
+usage or limit state: the heartbeat's `health.quota` (`quota_status.v1`, src/quota_status.py) is
+their one source. `derive()` is pure; `gather()` reads the records other modules already keep:
 
     input                                  owner
     state/core-runtime.json                the core launchers (which runtime)
-    the seat's model (settings, switch)    core_limit_hold.launch_identity
+    the seat's model (settings, switch)    core_limit_hold.launch_model
     state/runtime-models.<runtime>.json    runtime_models (the runtime's own model list)
-    state/quota-state.json                 the credential proxy (its reading names its account)
-    state/core-limit-hold.json             core_limit_hold (only a hold that binds this seat)
+    state/quota-state.json                 its last request's model only, for the core's own login
+    state/core-limit-hold.json             core_limit_hold (the held model is not offered as a switch)
     the CLI's signed-in account            core_limit_hold.oauth_account (digest and plan name)
 
-The proxy stamps a reading with the `acct_` label of the credential its request was sent with (none
-when unbound), so its usage and last request model count only when that label is the signed-in
-account's; an unlabeled reading names neither.
+The quota record names the version of a model alias only when it is the signed-in account's: a
+proxy record by its `acct_` label, a status line record by `quota_availability.from_statusline`.
 
 Unknown is null, never guessed: a Codex core reports no plan, an unknown core model sends no
 block at all (the schema requires one), and `workers` stays [] until a worker reports its own
@@ -44,9 +44,6 @@ MAX_BYTES = 8192
 MAX_OPTIONS = 6
 MAX_WORKERS = 16
 RUNTIMES = ("claude", "codex")
-WINDOWS = ("5h", "daily", "weekly", "monthly")
-#: A reading with no reset time stands for this long after the proxy wrote it.
-QUOTA_STALE_S = 30 * 60
 
 _MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*(\[[A-Za-z0-9._-]+\])?$")
 _WORKER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -55,9 +52,6 @@ _FAMILIES = ("opus", "sonnet", "haiku", "fable")
 _CLAUDE_ID = re.compile(r"^claude-(opus|sonnet|haiku|fable)-(\d+(?:-\d+)*)$")
 _ROW_MODEL = re.compile(r"^(Opus|Sonnet|Haiku|Fable) (\d+(?:\.\d+)*)$")
 _TAG = re.compile(r"\[[^\]]*\]$")
-_HEADER = "anthropic-ratelimit-unified-"
-#: The proxy's representative claim, named as its window header.
-_CLAIM_WINDOW = {"five_hour": "5h", "seven_day": "7d"}
 #: A plan name is a few plain words ("Claude Max", "Ultra"); an id, email or path never fits.
 _PLAN_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9+]*(?: [A-Za-z0-9+]+){0,3}$")
 _ID_RUN = re.compile(r"[0-9A-Fa-f]{8,}|\d{5,}")
@@ -113,18 +107,10 @@ def _plan(value: Any) -> Any:
     """A plan block, None for null, or False when it is not one."""
     if value is None:
         return None
-    keys = {"name", "usage_pct", "window", "resets_at", "limited_until"}
-    if not isinstance(value, dict) or not keys <= set(value) <= keys | {"account"}:
+    if not isinstance(value, dict) or not {"name"} <= set(value) <= {"name", "account"}:
         return False
-    pct = value["usage_pct"]
-    pct_ok = pct is None or (not isinstance(pct, bool) and isinstance(pct, (int, float))
-                             and math.isfinite(pct) and 0 <= pct <= 100)
-    times_ok = all(value[k] is None or _epoch(value[k]) == value[k] for k in ("resets_at", "limited_until"))
     account_ok = "account" not in value or (isinstance(value["account"], str) and _ACCOUNT.fullmatch(value["account"]))
-    if not (_label(value["name"]) and pct_ok and times_ok and account_ok
-            and (value["window"] is None or value["window"] in WINDOWS)):
-        return False
-    return dict(value)
+    return dict(value) if _label(value["name"]) and account_ok else False
 
 
 def coerce(block: Any) -> Optional[dict]:
@@ -237,55 +223,8 @@ def switch_options(runtime: str, offered: List[dict]) -> List[dict]:
     return out
 
 
-def _window_name(header_window: str) -> Optional[str]:
-    if header_window == "5h":
-        return "5h"
-    if header_window == "7d" or header_window.startswith("7d_"):
-        return "weekly"
-    return None
-
-
-def usage(quota: Optional[dict], age_s: Optional[float], hold_until: Optional[float], now: float) -> dict:
-    """usage_pct, window, resets_at and limited_until from the proxy's last reading."""
-    import quota_availability as qa
-    out = {"usage_pct": None, "window": None, "resets_at": None, "limited_until": None}
-    headers = quota.get("headers") if isinstance(quota, dict) else None
-    windows = {w: v for w, v in qa.limit_windows(headers).items() if _window_name(w)} \
-        if isinstance(headers, dict) else {}
-
-    def reset(w: str) -> Optional[int]:
-        try:
-            return _epoch(int(str(headers.get(f"{_HEADER}{w}-reset"))))
-        except (TypeError, ValueError):
-            return None
-    rejected = [w for w, (_u, st) in windows.items() if st == "rejected"]
-    claim = _CLAIM_WINDOW.get(str(headers.get(f"{_HEADER}representative-claim"))) if windows else None
-    if rejected:
-        pick = max(rejected, key=lambda w: reset(w) or 0)
-    elif claim in windows:
-        pick = claim
-    elif windows:
-        pick = max(windows, key=lambda w: windows[w][0] if windows[w][0] is not None else -1)
-    else:
-        pick = None
-    if pick is not None:
-        resets_at = reset(pick)
-        current = resets_at > now if resets_at is not None else (age_s is not None and 0 <= age_s <= QUOTA_STALE_S)
-        if current:
-            util = windows[pick][0]
-            pct = None if util is None or not math.isfinite(util) else max(0, min(100, round(util * 100)))
-            out.update(usage_pct=pct, window=_window_name(pick), resets_at=resets_at)
-            if rejected and qa.classify_limit_state(quota) == "rejected" and resets_at is not None:
-                out["limited_until"] = resets_at
-    held = _epoch(hold_until)
-    if held is not None and held > now:
-        out["limited_until"] = held
-    return out
-
-
 def derive(*, runtime: Optional[str], model: Optional[dict], offered: List[dict],
-           plan_name: Optional[str], account_digest: Optional[str], quota: Optional[dict],
-           quota_age_s: Optional[float], hold_until: Optional[float], now: float) -> Optional[dict]:
+           plan_name: Optional[str], account_digest: Optional[str], now: float) -> Optional[dict]:
     """The block for one heartbeat, or None when the core's runtime or model is unknown."""
     if runtime not in RUNTIMES or _model(model) is None or model["runtime"] != runtime:
         return None
@@ -293,7 +232,7 @@ def derive(*, runtime: Optional[str], model: Optional[dict], offered: List[dict]
     plan = None
     name = _plan_label(plan_name)
     if runtime == "claude" and name:
-        plan = {"name": name, **usage(quota, quota_age_s, hold_until, now)}
+        plan = {"name": name}
         account = core_recovery_state.account_label(account_digest)
         if account:
             plan = {"account": account, **plan}
@@ -328,10 +267,19 @@ def _runtime(workspace: Path) -> Optional[str]:
     return value if value in RUNTIMES else None
 
 
+def _own_record(payload: Any, digest: Optional[str]) -> Optional[dict]:
+    """The quota record when the account signed in as `digest` produced it, else None."""
+    import quota_availability as qa
+    if not isinstance(payload, dict) or not digest:
+        return None
+    if payload.get("source") == qa.STATUSLINE_SOURCE:
+        return payload if qa.from_statusline(payload, digest) else None
+    return payload if payload.get("account") == qa.account_label(digest) else None
+
+
 def gather(workspace: Path, now: Optional[float] = None) -> Optional[dict]:
     """The block as the next heartbeat would send it. Read-only."""
     import core_limit_hold
-    import core_recovery_state
     import quota_availability as qa
     import recovery_actions
     import runtime_models
@@ -340,25 +288,21 @@ def gather(workspace: Path, now: Optional[float] = None) -> Optional[dict]:
     runtime = _runtime(workspace)
     if runtime == "codex":
         return derive(runtime=runtime, model=codex_model(_codex_rows(workspace)), offered=[], plan_name=None,
-                      account_digest=None, quota=None, quota_age_s=None, hold_until=None, now=at)
+                      account_digest=None, now=at)
     rows = runtime_models.entries(workspace, runtime) if runtime else []
     config_dir = core_limit_hold._launch_config_dir()
     acct = core_limit_hold.oauth_account(config_dir)
     digest = core_limit_hold.account_digest(acct)
     value = core_limit_hold.launch_model(workspace, config_dir)
     record = qa.read_quota_record(workspace, at)
-    label = core_recovery_state.account_label(digest)
-    ours = record is not None and label is not None and record.payload.get("account") == label
-    quota = record.payload if ours else None
     hold = core_limit_hold.binding_hold(workspace, at, identity=(value, digest))
     by_key = {r["key"]: r for r in rows}
     keys = recovery_actions.switch_offer(workspace, runtime, avoid=hold.get("model") if hold else None,
                                          launch_model=value)
-    return derive(runtime=runtime, model=claude_model(value, rows, qa.record_model(quota)),
+    hint = qa.record_model(_own_record(record.payload if record else None, digest))
+    return derive(runtime=runtime, model=claude_model(value, rows, hint),
                   offered=[by_key[k] for k in keys if k in by_key],
-                  plan_name=acct.get("planDisplayName") if acct else None, account_digest=digest,
-                  quota=quota, quota_age_s=record.age_s if ours else None,
-                  hold_until=hold.get("until") if hold else None, now=at)
+                  plan_name=acct.get("planDisplayName") if acct else None, account_digest=digest, now=at)
 
 
 def read(workspace: Path, now: Optional[float] = None) -> Optional[dict]:

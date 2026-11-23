@@ -19,13 +19,7 @@
       {"token": "gpt-5.5", "display_name": "GPT-5.5"},
       {"token": "gpt-5.5-mini", "display_name": "GPT-5.5 mini"}
     ],
-    "plan": {
-      "name": "ChatGPT Pro",
-      "usage_pct": null,
-      "window": null,
-      "resets_at": null,
-      "limited_until": null
-    },
+    "plan": {"name": "ChatGPT Pro"},
     "workers": []
   }
 }

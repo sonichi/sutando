@@ -21,14 +21,7 @@
       {"token": "opus", "display_name": "Claude Opus 5.5"},
       {"token": "sonnet", "display_name": "Claude Sonnet 5"}
     ],
-    "plan": {
-      "account": "acct_3f9a2b",
-      "name": "Claude Max",
-      "usage_pct": 100,
-      "window": "5h",
-      "resets_at": 1790003600,
-      "limited_until": 1790003600
-    },
+    "plan": {"account": "acct_3f9a2b", "name": "Claude Max"},
     "workers": [
       {"worker_id": "w-research"}
     ]

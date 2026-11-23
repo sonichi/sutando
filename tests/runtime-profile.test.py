@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """The core's runtime profile (runtime_profile.v1): the builder reproduces the contract fixtures'
-model and plan for a Claude core with usage, a Codex core with none and a core at its limit; its
-switch tokens are clicks the recovery executor admits; unknown is null; a missing or broken input
-never raises; and contracts/runtime_profile.v1/ stays byte-identical to the backend and client.
+model and plan name for a Claude core and a Codex core; it carries no usage or limit state (that is
+health.quota, quota_status.v1); its switch tokens are clicks the recovery executor admits; unknown
+is null; a missing or broken input never raises; and contracts/runtime_profile.v1/ is pinned.
 
 Run: python3 tests/runtime-profile.test.py
 """
@@ -32,16 +32,16 @@ import runtime_models
 import runtime_profile as rp
 
 CONTRACTS = REPO / "contracts" / "runtime_profile.v1"
-# The same bytes are pinned in ag2-space/ag2space-backend and ag2-space/cinny-webclient.
+# The consumers (ag2-space/ag2space-backend, ag2-space/cinny-webclient) pin their own copies.
 CONTRACT_HASHES = {
-    "README.md": "747845187a208e9def62fccabc297665158e47fb4cc2aa912fc2c76f3502bd69",
-    "heartbeat.claude.json": "ff72a1ebc88570af1ff9eec960f514cac17b7f9fb35979124e71ff4776fc8030",
-    "heartbeat.codex.json": "428294f9bc64dfc4a2db7093303b4c798bfaeba312bea2bbe01c484e1f75cffe",
-    "heartbeat.limited.json": "f3b948975fcabcc28a07d5e2830325b2e6572afa42cf2cafc2ff03575b3ba2b4",
-    "response.claude.json": "dbc38397f048c7f2d27f878181b9f2adfac21f3602d3501d8e6316ce9cf04f28",
-    "response.codex.json": "e3bb8f0d6232202cf072531278050349323e1a0fbdfe393752af5b54b452bf9d",
-    "response.limited.json": "d02cae3425ad48cedf91693011ec103adfed100d3f9cf9a520c6571eb72e8726",
-    "schema.json": "ca29bf3d2b4b41272c43157856e39f3c50e9ad47a3d80512832df897e8e7bb04",
+    "README.md": "ef3a811f48f090cdb5065d6750339def2d79172d8416c9b241eb1a662e2549c6",
+    "heartbeat.claude.json": "d02490ee96a00fe009b7654ab9bc7a4c9c725dc4d2d4e41d094f2de40e2e5698",
+    "heartbeat.codex.json": "c2557f8712d1e42ead34f58c57b997091f8d915120b28228b40f05342f5c0e09",
+    "heartbeat.limited.json": "22c78f0f95501624a8e4b3f7253fcbbdcbf901c0dc1c806c75789b998c5bdeb9",
+    "response.claude.json": "846b209c441a824cd30f58854819a0bdb1f530667aba402a87dc67d4eda72272",
+    "response.codex.json": "637b17d0aa771f5b609e4bfa894c3532dae0f0c0ac051fb0d492cdb7c1356653",
+    "response.limited.json": "57cc952524e593d832a958825f37f09d8151843fbfef7d58b0df874083d15f60",
+    "schema.json": "1144423a98ab38db231dce4a6ac02288c3a2e5741aad62b9611f35a2da96caf6",
 }
 PICKER = (REPO / "tests" / "fixtures" / "pane-claude-model-picker.txt").read_text()
 DIGEST = "3f9a2b" + "0" * 10  # core_limit_hold.account_fingerprint's shape: 16 hex
@@ -63,10 +63,22 @@ def headers(**windows):
     return out
 
 
-def claude(now, quota, model="opus", **kw):
+#: What health.quota (quota_status.v1) carries; no key of the profile may restate it.
+QUOTA_KEYS = {"usage_pct", "used_pct", "window", "resets_at", "resumes_at", "limited_until", "limit_state",
+              "five_hour", "seven_day", "last_checked", "quota", "usage", "utilization"}
+
+
+def keys_of(value):
+    if isinstance(value, dict):
+        return set(value) | {k for v in value.values() for k in keys_of(v)}
+    if isinstance(value, list):
+        return {k for v in value for k in keys_of(v)}
+    return set()
+
+
+def claude(now, model="opus", **kw):
     args = dict(runtime="claude", model=rp.claude_model(model, [], "claude-opus-5-5"), offered=[],
-                plan_name="Claude Max", account_digest=DIGEST, quota=quota, quota_age_s=5.0,
-                hold_until=None, now=now)
+                plan_name="Claude Max", account_digest=DIGEST, now=now)
     args.update(kw)
     return rp.derive(**args)
 
@@ -89,15 +101,22 @@ class Contract(unittest.TestCase):
         except ImportError:
             self.skipTest("jsonschema is not installed; coerce() carries the same shape checks")
         schema = json.loads((CONTRACTS / "schema.json").read_text())
-        quota = {"headers": headers(**{"7d": (0.14, "allowed", 1790150400)})}
-        jsonschema.Draft202012Validator(schema).validate(claude(1789999995, quota))
+        jsonschema.Draft202012Validator(schema).validate(claude(1789999995))
+
+    def test_no_contract_file_carries_usage_or_limit_state(self):
+        schema = json.loads((CONTRACTS / "schema.json").read_text())
+        self.assertEqual(set(schema["$defs"]["plan"]["properties"]), {"account", "name"})
+        self.assertEqual(schema["$defs"]["plan"]["required"], ["name"])
+        for path in sorted(CONTRACTS.glob("*.json")):
+            self.assertEqual(keys_of(json.loads(path.read_text())) & QUOTA_KEYS, set(), path.name)
 
     def test_the_validator_refuses_what_the_schema_refuses(self):
         good = block("heartbeat.claude.json")
         bad = [dict(good, extra=1), dict(good, v=2), dict(good, model=None),
                dict(good, plan=dict(good["plan"], account="someone@example.com")),
-               dict(good, plan=dict(good["plan"], window="hourly")),
-               dict(good, plan=dict(good["plan"], usage_pct=101)),
+               dict(good, plan=dict(good["plan"], usage_pct=14)),
+               dict(good, plan=dict(good["plan"], limited_until=None)),
+               dict(good, plan={"account": "acct_3f9a2b"}),
                dict(good, switch_options=[{"token": "opus; rm", "display_name": "x"}]),
                dict(good, workers=[{"worker_id": "../w"}])]
         for b in bad:
@@ -112,10 +131,10 @@ class Shapes(unittest.TestCase):
         opt = {"token": "o0123456789ab", "display_name": "Sonnet 5"}
         worker = {"worker_id": "w1"}
         bad = [dict(good, switch_options=[opt] * 7), dict(good, switch_options=["x"]),
-               dict(good, plan=[]), dict(good, plan={"name": "Claude Max"}),
+               dict(good, plan=[]), dict(good, plan={"name": ""}),
                dict(good, workers={}), dict(good, workers=[worker] * 17),
                dict(good, workers=[dict(worker, model={"id": "x"})]),
-               dict(good, workers=[dict(worker, plan={"name": "x"})]),
+               dict(good, workers=[dict(worker, plan={"name": "x", "window": "5h"})]),
                dict(good, workers=[dict(worker, extra=1)])]
         for b in bad:
             self.assertIsNone(rp.coerce(b), b)
@@ -135,14 +154,6 @@ class Shapes(unittest.TestCase):
         self.assertEqual(len(got), rp.MAX_OPTIONS)
         self.assertEqual(got[0]["display_name"], "Claude Sonnet 5")
 
-    def test_unknown_windows_and_unreadable_resets_are_skipped(self):
-        quota = {"headers": {"anthropic-ratelimit-unified-1d-utilization": "0.5",
-                             "anthropic-ratelimit-unified-5h-utilization": "0.25",
-                             "anthropic-ratelimit-unified-5h-reset": "soon"}}
-        got = rp.usage(quota, age_s=10.0, hold_until=None, now=1.0)
-        self.assertEqual((got["usage_pct"], got["window"], got["resets_at"]), (25, "5h", None))
-        self.assertEqual(rp.usage(quota, age_s=rp.QUOTA_STALE_S + 1, hold_until=None, now=1.0)["usage_pct"], None)
-
     def test_an_unresolvable_runtime_is_unknown(self):
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch("sutando_config.resolve_core_runtime", side_effect=RuntimeError("no config")):
@@ -161,46 +172,21 @@ class Shapes(unittest.TestCase):
 
 
 class ClaudeCore(unittest.TestCase):
-    def test_a_claude_core_with_usage_reads_as_the_fixture(self):
-        want = block("heartbeat.claude.json")
-        quota = {"headers": dict(headers(**{"5h": (0.03, "allowed", 1790010000),
-                                            "7d": (0.14, "allowed", 1790150400)}),
-                                 **{"anthropic-ratelimit-unified-representative-claim": "seven_day"})}
-        got = claude(want["reported_at"], quota)
-        self.assertEqual((got["v"], got["reported_at"], got["model"], got["plan"], got["workers"]),
-                         (1, want["reported_at"], want["model"], want["plan"], []))
+    def test_a_claude_core_reads_as_the_fixture(self):
+        for case in ("claude", "limited"):
+            want = block(f"heartbeat.{case}.json")
+            got = claude(want["reported_at"])
+            self.assertEqual((got["v"], got["reported_at"], got["model"], got["plan"], got["workers"]),
+                             (1, want["reported_at"], want["model"], want["plan"], []), case)
 
-    def test_a_core_at_its_limit_reads_as_the_fixture(self):
-        want = block("heartbeat.limited.json")
-        quota = {"headers": dict(headers(**{"5h": (1.0, "rejected", 1790003600), "7d": (0.4, "allowed", 1790150400)}),
-                                 **{"anthropic-ratelimit-unified-overage-status": "rejected"})}
-        got = claude(want["reported_at"], quota)
-        self.assertEqual((got["model"], got["plan"]), (want["model"], want["plan"]))
-
-    def test_a_hold_in_force_names_its_own_end(self):
-        quota = {"headers": headers(**{"7d": (0.2, "allowed", 1790150400)})}
-        self.assertEqual(claude(1789999998, quota, hold_until=1790003600.5)["plan"]["limited_until"], 1790003600)
-        self.assertIsNone(claude(1789999998, quota, hold_until=1789990000)["plan"]["limited_until"])
-
-    def test_extra_usage_is_not_a_limit(self):
-        quota = {"headers": dict(headers(**{"5h": (1.0, "rejected", 1790003600)}),
-                                 **{"anthropic-ratelimit-unified-overage-status": "allowed"})}
-        plan = claude(1789999998, quota)["plan"]
-        self.assertEqual((plan["usage_pct"], plan["limited_until"]), (100, None))
-
-    def test_a_reading_from_a_window_that_already_reset_is_unknown(self):
-        quota = {"headers": headers(**{"7d": (0.9, "allowed", 1789990000)})}
-        plan = claude(1789999995, quota)["plan"]
-        self.assertEqual([plan[k] for k in ("usage_pct", "window", "resets_at", "limited_until")], [None] * 4)
-
-    def test_no_reading_leaves_usage_null_and_keeps_the_plan(self):
-        plan = claude(1789999995, None)["plan"]
-        self.assertEqual(plan, {"account": "acct_3f9a2b", "name": "Claude Max", "usage_pct": None,
-                                "window": None, "resets_at": None, "limited_until": None})
+    def test_the_plan_is_its_name_and_account_and_nothing_about_usage(self):
+        got = claude(1789999995)
+        self.assertEqual(got["plan"], {"account": "acct_3f9a2b", "name": "Claude Max"})
+        self.assertEqual(keys_of(got) & QUOTA_KEYS, set(), "quota rides health.quota, never the profile")
 
     def test_no_plan_name_means_no_plan_and_a_non_digest_never_becomes_the_account(self):
-        self.assertIsNone(claude(1789999995, None, plan_name=None)["plan"])
-        plan = claude(1789999995, None, account_digest="someone@example.com")["plan"]
+        self.assertIsNone(claude(1789999995, plan_name=None)["plan"])
+        plan = claude(1789999995, account_digest="someone@example.com")["plan"]
         self.assertNotIn("account", plan)
 
     def test_the_model_is_named_by_version_never_by_alias(self):
@@ -211,7 +197,7 @@ class ClaudeCore(unittest.TestCase):
         self.assertIsNone(rp.claude_model("opus", [], "claude-sonnet-5"), "another family's request says nothing")
         self.assertIsNone(rp.claude_model(None, [], "claude-opus-5-5"))
         self.assertIsNone(rp.derive(runtime="claude", model=None, offered=[], plan_name="Claude Max",
-                                    account_digest=DIGEST, quota=None, quota_age_s=None, hold_until=None, now=1),
+                                    account_digest=DIGEST, now=1),
                           "an unknown core model sends no block: the schema requires one")
 
 
@@ -220,10 +206,10 @@ class Labels(unittest.TestCase):
 
     def test_a_plan_name_that_is_not_a_plain_name_is_dropped(self):
         for name in ("Claude Max", "Ultra", "Claude Max 20x", "Pro+"):
-            self.assertEqual(claude(1789999995, None, plan_name=name)["plan"]["name"], name)
+            self.assertEqual(claude(1789999995, plan_name=name)["plan"]["name"], name)
         for name in ("someone@example.com", "sk-ant-api03-AbCdEf0123456789", "/Users/someone/.claude",
                      "Max 0123456789abcdef", "Claude Max (team: acme)", "a b c d e"):
-            self.assertIsNone(claude(1789999995, None, plan_name=name)["plan"], name)
+            self.assertIsNone(claude(1789999995, plan_name=name)["plan"], name)
 
     def test_a_switch_is_named_by_the_model_it_runs_not_the_pickers_text(self):
         rows = [{"key": "o0123456789ab", "label": "Opus 5.5 sk-ant-api03-secret", "model": "Opus 5.5",
@@ -240,7 +226,7 @@ class Labels(unittest.TestCase):
         self.assertEqual(rp.codex_model([row]), {"id": "gpt-5.5", "display_name": "GPT-5.5", "runtime": "codex"})
 
     def test_the_account_label_is_the_recovery_records_own(self):
-        self.assertEqual(claude(1789999995, None)["plan"]["account"], core_recovery_state.account_label(DIGEST))
+        self.assertEqual(claude(1789999995)["plan"]["account"], core_recovery_state.account_label(DIGEST))
 
 
 class Switches(unittest.TestCase):
@@ -254,7 +240,7 @@ class Switches(unittest.TestCase):
             current = "opus"
             got = rp.derive(runtime="claude", model=rp.claude_model(current, rows, None),
                             offered=runtime_models.offer(ws, "claude", current, None), plan_name=None,
-                            account_digest=None, quota=None, quota_age_s=None, hold_until=None, now=1)
+                            account_digest=None, now=1)
             with mock.patch.object(recovery_actions, "current_model", return_value=current):
                 allowed = recovery_actions.switch_offer(ws, "claude")
         tokens = [o["token"] for o in got["switch_options"]]
@@ -271,12 +257,11 @@ class Switches(unittest.TestCase):
 
 
 class CodexCore(unittest.TestCase):
-    def test_a_codex_core_reports_its_model_and_no_usage(self):
+    def test_a_codex_core_reports_its_model_and_no_plan(self):
         want = block("heartbeat.codex.json")
         rows = [{"key": "o0123456789ab", "label": "GPT-5.5", "model": "gpt-5.5", "arg": None, "current": True}]
         got = rp.derive(runtime="codex", model=rp.codex_model(rows), offered=rows, plan_name="ChatGPT Pro",
-                        account_digest=DIGEST, quota={"headers": headers(**{"5h": (0.5, "allowed", 9e9)})},
-                        quota_age_s=1.0, hold_until=None, now=want["reported_at"])
+                        account_digest=DIGEST, now=want["reported_at"])
         self.assertEqual(got, {"v": 1, "reported_at": want["reported_at"], "model": want["model"],
                                "switch_options": [], "plan": None, "workers": []})
 
@@ -312,8 +297,10 @@ class Gather(unittest.TestCase):
     def test_the_block_from_the_files(self):
         got = rp.read(self.ws)
         self.assertEqual(got["model"], {"id": "claude-opus-5-5", "display_name": "Claude Opus 5.5", "runtime": "claude"})
-        self.assertEqual((got["plan"]["name"], got["plan"]["usage_pct"], got["plan"]["window"]), ("Claude Max", 14, "weekly"))
+        self.assertEqual(set(got["plan"]), {"account", "name"})
+        self.assertEqual(got["plan"]["name"], "Claude Max")
         self.assertRegex(got["plan"]["account"], r"^acct_[0-9a-f]{6}$")
+        self.assertEqual(keys_of(got) & QUOTA_KEYS, set())
         text = json.dumps(got)
         for private in ("someone@example.com", "u-1", str(self.cfg), str(self.ws)):
             self.assertNotIn(private, text)
@@ -342,23 +329,19 @@ class Gather(unittest.TestCase):
         self.write("core-limit-hold.json", dict({"status": "held", "until": self.now + 3600,
                                                  "account": self.digest, "model": "claude-opus-5-5"}, **kw))
 
-    def test_a_response_that_lands_after_an_account_switch_is_not_the_new_accounts(self):
-        """A's request is in flight when the seat switches to B; its response is written after."""
+    def test_no_quota_reading_or_hold_changes_the_plan(self):
+        """A rejected window, a reading at 100% and a binding hold: the plan says none of it."""
         self.model_list()
-        a = self.label()
-        self.assertEqual(rp.read(self.ws, self.now + 1)["plan"]["usage_pct"], 14)
-        self.sign_in("u-2")
-        plan = rp.read(self.ws, self.now + 2)["plan"]
-        self.assertNotEqual(plan["account"], a)
-        self.assertIsNone(plan["usage_pct"])
-        self.quota(self.now + 5, 0.9, account=a)
-        plan = rp.read(self.ws, self.now + 6)["plan"]
-        self.assertEqual([plan[k] for k in ("usage_pct", "window", "resets_at")], [None] * 3,
-                         "A's reading landed after the switch: B's usage is unknown")
-        self.quota(self.now + 7, 0.5)
-        self.assertEqual(rp.read(self.ws, self.now + 8)["plan"]["usage_pct"], 50, "B's own reading counts")
-        self.sign_in("u-1")
-        self.assertIsNone(rp.read(self.ws, self.now + 9)["plan"]["usage_pct"], "B's reading is not A's")
+        base = rp.read(self.ws, self.now + 1)
+        rec = {"last_checked": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.now)), "account": self.label(),
+               "last_request": {"model": "claude-opus-5-5"},
+               "headers": dict(headers(**{"5h": (1.0, "rejected", int(self.now) + 3600)}),
+                               **{"anthropic-ratelimit-unified-overage-status": "rejected"})}
+        self.write("quota-state.json", rec)
+        self.hold()
+        got = rp.read(self.ws, self.now + 1)
+        self.assertEqual(got["plan"], base["plan"])
+        self.assertEqual(keys_of(got) & QUOTA_KEYS, set())
 
     def test_another_accounts_last_request_does_not_name_the_model(self):
         """No model list: only the proxy's last request turns the `opus` alias into a version."""
@@ -370,26 +353,24 @@ class Gather(unittest.TestCase):
         self.quota(self.now + 4, 0.5)
         self.assertEqual(rp.read(self.ws, self.now + 5)["model"]["id"], "claude-opus-5-5", "B's own request does")
 
-    def test_an_unlabeled_reading_has_no_usage(self):
-        self.model_list()
+    def test_the_status_lines_record_names_the_model_only_for_its_own_login(self):
+        """A direct core: the status line stamps its record with the login's full digest."""
+        rec = {"source": "statusline", "account": self.digest, "last_request": {"model": "claude-opus-5-5"},
+               "last_checked": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.now))}
+        self.write("quota-state.json", rec)
+        self.assertEqual(rp.read(self.ws, self.now + 1)["model"]["id"], "claude-opus-5-5")
+        self.write("quota-state.json", dict(rec, account="f" * 16))
+        self.assertIsNone(rp.read(self.ws, self.now + 1), "a previous login's record names no model")
+
+    def test_an_unlabeled_reading_or_an_unknown_account_names_no_model(self):
         self.quota(self.now, 0.14, account=False)
-        plan = rp.read(self.ws, self.now + 1)["plan"]
-        self.assertEqual((plan["name"], plan["usage_pct"]), ("Claude Max", None))
-
-    def test_an_unknown_account_has_no_usage(self):
-        self.model_list()
+        self.assertIsNone(rp.read(self.ws, self.now + 1), "an unlabeled request names no model")
+        self.quota(self.now, 0.14)
         (self.cfg / ".claude.json").write_text(json.dumps({"oauthAccount": {"planDisplayName": "Claude Max"}}))
+        self.assertIsNone(rp.read(self.ws, self.now + 1), "no account to match the reading to")
+        self.model_list()
         plan = rp.read(self.ws, self.now + 1)["plan"]
-        self.assertEqual((plan["name"], plan["usage_pct"]), ("Claude Max", None))
-        self.assertNotIn("account", plan)
-
-    def test_only_a_hold_that_binds_this_seat_is_its_limit(self):
-        self.hold()
-        self.assertEqual(rp.read(self.ws, self.now + 1)["plan"]["limited_until"], int(self.now + 3600))
-        self.hold(account="f" * 16)
-        self.assertIsNone(rp.read(self.ws, self.now + 1)["plan"]["limited_until"], "another account's hold")
-        self.hold(model="claude-sonnet-5")
-        self.assertIsNone(rp.read(self.ws, self.now + 1)["plan"]["limited_until"], "another family's hold")
+        self.assertEqual(plan, {"name": "Claude Max"})
 
     def offered(self, **kw):
         return recovery_actions.switch_offer(self.ws, "claude", **kw)[:rp.MAX_OPTIONS]

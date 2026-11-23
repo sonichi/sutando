@@ -114,6 +114,19 @@ class Carriage(Base):
         for cap in (rgb.RUNTIME_PROFILE_CAPABILITY, rgb.CORE_RECOVERY_CAPABILITY, "worker_health.v1"):
             self.assertIn(cap, body["capabilities"])
 
+    def test_quota_rides_health_quota_and_never_the_profile(self):
+        """health.quota (quota_status.v1) is the heartbeat's one source of usage and limit state."""
+        quota = {"v": 1, "five_hour": {"used_pct": 100.0, "resets_at": 1795190400},
+                 "limit_state": "rejected", "resumes_at": 1795190400, "last_checked": 1795176000}
+        self.profile = fixture("heartbeat.limited.json")["runtime_profile"]
+        with mock.patch.object(rgb, "_QUOTA_STATUS_READER", lambda: quota), \
+                mock.patch.object(rgb, "_quota_status_refused_until", 0.0):
+            body = self.beat(core_row())
+        self.assertEqual(body["health"]["quota"], quota)
+        self.assertEqual(set(body["runtime_profile"]["plan"]), {"account", "name"})
+        for cap in (rgb.RUNTIME_PROFILE_CAPABILITY, rgb.QUOTA_STATUS_CAPABILITY):
+            self.assertIn(cap, body["capabilities"])
+
     def test_no_profile_means_no_field_and_no_capability(self):
         body = self.beat(core_row())
         self.assertNotIn("runtime_profile", body)
@@ -152,10 +165,11 @@ class Carriage(Base):
         self.profile = dict(self.profile, reported_at=self.profile["reported_at"] + 30)
         self.assertIsNone(self.beat(core_row(), force=False), "only reported_at moved: no early beat")
         rgb._runtime_profile_checked_at = time.time() - check - 1
-        self.profile = dict(self.profile, plan=dict(self.profile["plan"], limited_until=1790003600))
+        switched = {"id": "claude-sonnet-5", "display_name": "Claude Sonnet 5", "runtime": "claude"}
+        self.profile = dict(self.profile, model=switched)
         body = self.beat(core_row(), force=False)
-        self.assertIsNotNone(body, "the hold's end reaches clients before the next interval")
-        self.assertEqual(body["runtime_profile"]["plan"]["limited_until"], 1790003600)
+        self.assertIsNotNone(body, "a model switch reaches clients before the next interval")
+        self.assertEqual(body["runtime_profile"]["model"], switched)
         self.assertIsNone(self.beat(core_row(), force=False), "checked again only after the check interval")
 
 
@@ -196,6 +210,24 @@ class RefusingBroker(Base):
         self.assertIn(rgb.CORE_RECOVERY_CAPABILITY, body["capabilities"])
         self.assertEqual(rgb._core_recovery_refused_until, 0.0)
         self.assertGreater(rgb._runtime_profile_refused_until, time.time())
+
+    def test_a_receiver_that_refuses_only_the_profile_keeps_quota(self):
+        self.profile = fixture("heartbeat.claude.json")["runtime_profile"]
+        quota = {"v": 1, "five_hour": {"used_pct": 42.0, "resets_at": 1795190400}, "limit_state": "allowed",
+                 "last_checked": 1795176000}
+
+        def req(body):
+            if "runtime_profile" in body:
+                raise urllib.error.HTTPError("u", 422, "bad", {}, io.BytesIO(b""))
+            return {}
+        with mock.patch.object(rgb, "_QUOTA_STATUS_READER", lambda: quota), \
+                mock.patch.object(rgb, "_quota_status_refused_until", 0.0):
+            body = self.beat(core_row(), req=req)
+            self.assertEqual(rgb._quota_status_refused_until, 0.0)
+        self.assertEqual(len(self.sent), 2)
+        self.assertNotIn("runtime_profile", body)
+        self.assertEqual(body["health"]["quota"], quota)
+        self.assertIn(rgb.QUOTA_STATUS_CAPABILITY, body["capabilities"])
 
     def test_a_refusal_with_both_blocks_drops_both(self):
         self.profile = fixture("heartbeat.claude.json")["runtime_profile"]
