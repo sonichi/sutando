@@ -14,6 +14,10 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+isolate_os_environ()
 
 from ag2_sparrow import tmux_pane_keys  # noqa: E402
 from ag2_sparrow.adapters.claude_code import cli, launcher  # noqa: E402
@@ -110,7 +114,7 @@ class SwitchModel(unittest.TestCase):
     def test_a_work_root_whose_model_was_switched_still_starts(self):
         """The switch leaves a record and a lock under state/. The start check names every entry it lets
         an agent's state hold: with these two missing from it, the job refused its next start."""
-        from ag2_sparrow import task_lifecycle
+        from ag2_sparrow import claude_local_records as records, task_lifecycle
         self.assertIsNone(task_lifecycle.prepare_work_dir(str(self.root)))
         self.assertEqual(lc_for(Pane(says), self.root).switch_model(REC, "opus"), (True, "switched to opus"))
         left = sorted(p.name for p in (self.root / "state").iterdir() if "model" in p.name)
@@ -119,13 +123,45 @@ class SwitchModel(unittest.TestCase):
             self.assertIsNone(task_lifecycle.prepare_work_dir(str(self.root), check_only=check_only), left)
         # A switch stopped between writing its record and moving it into place leaves a temp the start
         # check takes for a live writer's, and sweeps once it is old.
-        with mock.patch.object(launcher.os, "replace", side_effect=OSError("stopped here")):
-            self.assertEqual(lc_for(Pane(says), self.root).switch_model(REC, "haiku"), (True, "switched to haiku"))
-        (temp,) = [p for p in (self.root / "state").iterdir() if p.name.endswith(".tmp")]
+        state, made = self.root / "state", []
+
+        def stopped(tmp, path):
+            made.append(Path(tmp).name)
+            raise KeyboardInterrupt("stopped between the write and the rename")
+        real_unlink = os.unlink
+        with mock.patch.object(records.os, "replace", side_effect=stopped), \
+                mock.patch.object(records.os, "unlink", side_effect=lambda p: None), \
+                self.assertRaises(KeyboardInterrupt):
+            lc_for(Pane(says), self.root).switch_model(REC, "haiku")
+        (temp,) = [p for p in state.iterdir() if p.name.endswith(".tmp")]
+        self.assertRegex(temp.name, r"^\.model-switch\.json\.\w+\.tmp$")
+        self.assertEqual(json.loads((state / "model-switch.json").read_text())["model"], "opus", "the old record stands")
+        # Two writers never share a temp: each staging file has its own name.
+        with mock.patch.object(records.os, "replace", side_effect=stopped), \
+                mock.patch.object(records.os, "unlink", side_effect=lambda p: None), \
+                self.assertRaises(KeyboardInterrupt):
+            lc_for(Pane(says), self.root).switch_model(REC, "haiku")
+        self.assertEqual(len(set(made)), 2, made)
+        real_unlink(state / made[1])
         self.assertIsNone(task_lifecycle.prepare_work_dir(str(self.root), check_only=True), temp.name)
         os.utime(temp, (1, 1))
         self.assertIsNone(task_lifecycle.prepare_work_dir(str(self.root)))
         self.assertFalse(temp.exists(), "swept")
+        # 0.11's fixed-name temp, left by a stop: removed at the next start whatever its age, and only when
+        # it is a plain file (a link is refused, and what it points at is never touched).
+        old = state / "model-switch.json.tmp"
+        old.write_text('{"model": "ha')
+        self.assertIsNone(task_lifecycle.prepare_work_dir(str(self.root), check_only=True))
+        self.assertTrue(old.exists(), "a check removes nothing")
+        self.assertIsNone(task_lifecycle.prepare_work_dir(str(self.root)))
+        self.assertFalse(old.exists())
+        target = self.root / "elsewhere.txt"
+        target.write_text("kept")
+        old.symlink_to(target)
+        for check_only in (True, False):
+            self.assertIn("state/model-switch.json.tmp in", task_lifecycle.prepare_work_dir(str(self.root), check_only=check_only))
+        self.assertEqual((target.read_text(), old.is_symlink()), ("kept", True))
+        old.unlink()
         # The isolated turn's hourly cap is kept there too, under the name the adapter itself gives it.
         from ag2_sparrow import relay_loop
         from ag2_sparrow.adapters.claude_code import inbox
