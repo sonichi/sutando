@@ -476,6 +476,8 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
     # fresh spawn sets: drop both, then state the single intent.
     env = inherited_env(drop=("SUTANDO_CLAUDE_RESUME", "SUTANDO_CLAUDE_SESSION_ID"))
     env.update(p["env"])
+    # The Codex seat stamps this on its declaration, so a viewer can tell this run's seat from a stale one.
+    env["SUTANDO_WORKER_INCARNATION_ID"] = (run or rec).get("incarnation_id") or ""
     if runtime == "claude":
         env.update({"SUTANDO_CLAUDE_RESUME": session_id} if resumed_id
                    else {"SUTANDO_CLAUDE_SESSION_ID": session_id})

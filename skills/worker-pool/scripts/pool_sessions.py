@@ -42,6 +42,42 @@ def live_incarnation(workspace, worker_id: str) -> "dict | None":
     return open_rows[-1] if open_rows else None
 
 
+def agent_mxid(workspace, worker_id: str) -> str:
+    """The worker's own agent id from its local identity row, or ''. A viewer matches it against a
+    room's members, so a worker's room offers its session before the broker profile lists it.
+    Reads `agent_mxid` only, never a credential reference."""
+    try:
+        import connections  # noqa: PLC0415 — engine src, only needed for this field
+        row = connections.worker_enabled_identity(worker_id, workspace)
+    except Exception:
+        return ""
+    return str((row or {}).get("agent_mxid") or "").strip()
+
+
+def is_seat(workspace, runtime: str, session_name: str, incarnation: "dict | None" = None) -> bool:
+    """Whether the session shows a Codex app-server seat, whose pane is the seat's log, not a
+    prompt: typing there reaches seat.py, and Ctrl-C ends it. A viewer keeps such a pane
+    read-only. The Codex runtime is required as well as the seat's host declaration
+    (seat-launch.sh: <workspace>/state/codex-seat/<session>/host.json), as the desktop's core
+    rule does: a leftover declaration under a Claude worker must not make it untypable.
+
+    The declaration must belong to the open run. Both Codex modes reuse the session name and a
+    TUI launch leaves an earlier seat's host.json in place, so the seat launcher stamps the run's
+    incarnation id beside it (`incarnation`) and a different id is a previous run's seat. When
+    either id is unknown the bare rule holds, so an unknown case stays read-only."""
+    if runtime != "codex":
+        return False
+    seat_dir = Path(workspace) / "state" / "codex-seat" / session_name
+    if not (seat_dir / "host.json").is_file():
+        return False
+    try:
+        stamped = (seat_dir / "incarnation").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        stamped = ""
+    current = str((incarnation or {}).get("incarnation_id") or "")
+    return not (stamped and current) or stamped == current
+
+
 def rooms_bound_to(roster: dict, worker_id: str) -> list:
     """Rooms whose binding resolves to this worker, via the roster's OWN
     resolution — a binding may be a bare id or a set, and only it decides."""
@@ -81,6 +117,7 @@ def sessions(workspace, probe=None) -> list:
             availability, detail = probe(name, socket=socket)
         else:
             availability, detail = "absent", "no open incarnation" if not inc else "no socket recorded"
+        runtime = str(row.get("runtime") or "")
         entry = {
             "worker_id": worker_id,
             "label": pool_roster.display_label(row, worker_id),
@@ -92,6 +129,9 @@ def sessions(workspace, probe=None) -> list:
             "availability": availability,
             "availability_detail": detail,
             "live": availability == "exists",
+            "runtime": runtime,
+            "agent_mxid": agent_mxid(workspace, worker_id),
+            "seat": is_seat(workspace, runtime, name, inc),
         }
         entry["attach_argv"] = (
             spawn_worker.attach_argv(socket, name) if entry["live"] else None
