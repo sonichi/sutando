@@ -27,7 +27,7 @@ A "Use" tap answers "switching" at once and starts `switch` detached, because th
 place (0600), and runs src/agent/graceful-restart.sh, which waits for the core to finish its turn.
 A sign-in that cannot be read or saved to switch back to is never replaced. One attempt runs at a
 time: admission and the switch each hold a lock, and only that attempt's record is cleared. After
-the restart it waits for the core's heartbeat and asks Codex (`account/read`) which account the
+the restart it waits for a heartbeat naming a new core process and asks Codex (`account/read`) which account the
 home's saved sign-in is, then posts the outcome in the same DM: "Switched. The core restarted, and
 Codex confirms its saved sign-in is X", saying that the running core's own identity is not
 confirmed, or why not. When the restart definitely did not happen (graceful-restart exit 3/4/5), the
@@ -551,22 +551,47 @@ def restart_core(run=subprocess.run) -> int:
         return 127
 
 
-def core_ready(ws: Path, since: float, *, sleep=time.sleep, clock=time.time) -> bool:
-    """True once the core's heartbeat is newer than `since`, within READY_TIMEOUT_S."""
+NEW, SAME, NONE = "new", "same", "none"
+
+
+def _alive(ws: Path) -> Optional[Path]:
     try:
         from util_paths import _host_label
-        alive = ws / "state" / "cores" / f"{_host_label()}.alive"
-    except Exception:  # noqa: BLE001 - no host label: readiness cannot be confirmed
-        return False
+        return ws / "state" / "cores" / f"{_host_label()}.alive"
+    except Exception:  # noqa: BLE001 - no host label: no heartbeat to read
+        return None
+
+
+def core_beat(ws: Path) -> dict:
+    """{pid, last_beat_at} of the core's heartbeat; {} when absent or unreadable. `pid` is the core
+    process the beat names (the writer outlives restarts, so its own start time says nothing)."""
+    alive = _alive(ws)
+    if alive is None:
+        return {}
+    try:
+        rec = json.loads(alive.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(rec, dict):
+        return {}
+    pid = rec.get("pid") if isinstance(rec.get("pid"), int) and not isinstance(rec.get("pid"), bool) else None
+    beat = rec.get("last_beat_at") if isinstance(rec.get("last_beat_at"), (int, float)) else None
+    return {"pid": pid, "last_beat_at": beat}
+
+
+def core_ready(ws: Path, since: float, before_pid: Optional[int], *, sleep=time.sleep, clock=time.time) -> str:
+    """NEW once a beat newer than `since` names a core pid other than `before_pid`, within
+    READY_TIMEOUT_S; SAME when fresh beats came but none named another core; NONE when no fresh beat came."""
     deadline = clock() + READY_TIMEOUT_S
+    fresh = False
     while True:
-        try:
-            if alive.stat().st_mtime > since:
-                return True
-        except OSError:
-            pass
+        beat = core_beat(ws)
+        if beat.get("last_beat_at") is not None and beat["last_beat_at"] > since:
+            fresh = True
+            if beat.get("pid") is not None and before_pid is not None and beat["pid"] != before_pid:
+                return NEW
         if clock() >= deadline:
-            return False
+            return SAME if fresh else NONE
         sleep(READY_POLL_S)
 
 
@@ -631,6 +656,7 @@ def do_switch(ws: Path, key: str, *, restart=restart_core, ready=core_ready, liv
         except OSError:
             pass
         return "error", f"I could not switch to {label}. I'm still signed in as {was}. The sign-in could not be written ({type(e).__name__})."
+    before_pid = core_beat(ws).get("pid")
     started = clock()
     rc = restart()
     if rc in NOT_RESTARTED:
@@ -644,14 +670,18 @@ def do_switch(ws: Path, key: str, *, restart=restart_core, ready=core_ready, liv
     if rc != 0:
         return "error", (f"The restart did not finish cleanly (exit {rc}), so I can't tell which account the core "
                          f"is on. Its saved sign-in is now {label}. Ask me for the account card to check.")
-    if not ready(ws, started):
-        return "error", (f"The core restarted with {label}'s sign-in but has not reported ready yet. "
+    generation = ready(ws, started, before_pid)
+    if generation == NONE:
+        return "error", (f"I asked the core to restart with {label}'s sign-in, but it has not reported back yet. "
                          "Ask me for the account card once it answers.")
     now_ident = identity(_live_auth(home) or "")
     acct = live(home)
     want_email = _email(want).lower()
     if now_ident and now_ident[0] == key and acct.get("kind") == "chatgpt" and \
             (not want_email or str(acct.get("email") or "").lower() == want_email):
+        if generation != NEW:
+            return "info", (f"I asked the core to restart and saw its heartbeat, but I can't tell it is a new core. "
+                            f"Codex confirms the saved sign-in is {label}; the running core may still use the old one.")
         return "done", (f"Switched. The core restarted, and Codex confirms its saved sign-in is {label}. "
                         "I can't yet confirm which account the running core itself is using.")
     if not acct:
@@ -684,7 +714,8 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
             unlock_fd(fd)
     finally:
         os.close(fd)
-    body, card = notice_card(state, "Switched" if state == "done" else "Not switched", words)
+    status = {"done": "Switched", "info": "Restart not confirmed"}.get(state, "Not switched")
+    body, card = notice_card(state, status, words)
     out = {"status": "failed"}
     for i in range(SETTLE_TRIES):
         out = _post(ws, args.room, body, card, f"account-card:{args.attempt}:outcome", core=core, execute=execute)
@@ -693,7 +724,8 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
         if i + 1 < SETTLE_TRIES:
             sleep(SETTLE_PAUSE_S)
     return _emit({**out, "outcome": state, "say": words,
-                  "verified": "saved-sign-in" if state == "done" else None, "core_identity": "unconfirmed"},
+                  "verified": "saved-sign-in" if state in ("done", "info") else None,
+                  "restart": "new-core" if state == "done" else "unconfirmed", "core_identity": "unconfirmed"},
                  0 if state == "done" else 1)
 
 

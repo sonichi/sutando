@@ -54,9 +54,12 @@ starts `account_card.py switch` detached, in its own session, because the core r
 2. writes the saved one as the core's `<CODEX_HOME>/auth.json` (0600);
 3. runs `src/agent/graceful-restart.sh` (it waits for the core's turn to end, then
    `start-cli.sh --restart`; a seat core is replaced as a seat);
-4. waits for the core's heartbeat, asks Codex's own `account/read` which account the saved sign-in is,
-   and posts the outcome in the same DM: **"Switched. The core restarted, and Codex confirms its saved
-   sign-in is X. I can't yet confirm which account the running core itself is using."**, or why not.
+4. waits for a heartbeat that names a core process other than the one before the switch (the heartbeat
+   writer outlives restarts, so a fresh beat alone does not prove a restart), asks Codex's own
+   `account/read` which account the saved sign-in is, and posts the outcome in the same DM: **"Switched. The core restarted, and Codex confirms its saved
+   sign-in is X. I can't yet confirm which account the running core itself is using."**. When the beats
+   still name the old core, it says the restart was requested and a heartbeat seen, but not that the
+   core restarted. Otherwise it says why not.
    When the restart definitely did not happen (exit 3 not ready, 4 put off, 5 rehearsal), the previous
    state is put back, absence included; after any other failure the new sign-in stays and the reply
    says the outcome is unknown. One switch runs at a time.
