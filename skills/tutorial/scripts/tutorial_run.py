@@ -8,9 +8,16 @@ src/agent_triggers.py) runs this once:
         --body-file <file holding the task's body> --greeting-file <file holding the reply>
 
 With `--greeting-file` it posts that reply to the room itself (room-ops `say`) and starts the publish
-only once that send has returned ok, so the reply and the page's card leave by one path, in that order,
-and neither waits on the result file's delivery. A reply that could not be sent publishes nothing: the
-line's `greeting` is `failed` and the agent sends the reply and `owner_line` as the task's one result.
+only once the reply is proven to be in the room, so the reply and the page's card leave by one path, in
+that order, and neither waits on the result file's delivery. Proof is the send's own event id, or the
+reply found by reading the room back (room-ops `read`) as an event that was not there before the send.
+The line's `greeting` is one of three settled states:
+  sent      proven in the room: the page is published; the task's result is `[REPLIED]`.
+  not_sent  proven absent (never sent, or the gateway answered and the read-back does not hold it):
+            nothing is published; the agent sends the reply and `owner_line` as the task's one result.
+  unknown   neither could be proven (the send got no answer, or the room could not be read back):
+            nothing is published and the reply is not sent again, since it may have landed; the
+            task's result is `owner_line` alone, which says the reply could not be confirmed.
 
 It then runs `getting_started.py publish` with the task's own room and owner, so whether the page
 is made never rests on anything else. The page it publishes is generic: no roles, no tailored prompts
@@ -48,6 +55,13 @@ OWNER_LINE = "I couldn't make your Getting started page just now. Send /tutorial
 # The page exists but its card did not reach the owner, so nothing in the DM points at it.
 CARD_LINE = ("Your Getting started page is ready in this room's Commons, but I couldn't send you its card. "
              "Send /tutorial to get it.")
+
+# The reply may or may not be in the room: the line claims neither, and is safe beside either.
+UNKNOWN_LINE = ("I sent you a reply but couldn't confirm it arrived, so I held your Getting started page. "
+                "If you don't see my reply above, send /tutorial and I'll try again.")
+SENT, NOT_SENT, UNKNOWN = "sent", "not_sent", "unknown"
+READ_LIMIT = 50
+READ_BACK_WAITS = (0.0, 1.0, 2.0)
 
 # Nothing was made or changed: a retry would end the same way, so the line does not ask for one.
 SKIPPED_LINE = "I didn't make or change a Getting started page this time, so there is no card for it."
@@ -107,30 +121,76 @@ def read_outcome(result: Dict[str, object], card_asked: bool) -> tuple:
     return "ok", ""
 
 
+def _room_ops(script: Path, *args: str, timeout: int = 120) -> tuple:
+    """(answer, error): room-ops' JSON answer, or None and why there is none."""
+    try:
+        proc = subprocess.run([sys.executable, str(script), *args], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    try:
+        answer = json.loads(proc.stdout)
+    except ValueError:
+        answer = None
+    if not isinstance(answer, dict):
+        return None, (proc.stderr or proc.stdout or "").strip()[-200:] or f"exit {proc.returncode} with no answer"
+    return answer, ""
+
+
+def read_room(room: str, script: Path) -> Optional[list]:
+    """The room's newest messages as room-ops `read` gives them, or None when it cannot be read."""
+    answer, _ = _room_ops(script, "read", room, "--limit", str(READ_LIMIT), timeout=60)
+    if not answer or answer.get("ok") is not True or not isinstance(answer.get("messages"), list):
+        return None
+    return [m for m in answer["messages"] if isinstance(m, dict)]
+
+
+def read_back(room: str, text: str, before: list, script: Path, sleep=time.sleep) -> Optional[bool]:
+    """True: the reply is in the room as an event that was not there before. False: the read reaches
+    back to what was there before and does not hold it. None: the room does not show either."""
+    seen = {m.get("event_id") for m in before if m.get("event_id")}
+    covered = None
+    for wait in READ_BACK_WAITS:
+        if wait > 0:
+            sleep(wait)
+        now = read_room(room, script)
+        if now is None:
+            continue
+        ids = {m.get("event_id") for m in now if m.get("event_id")}
+        if any(isinstance(m.get("body"), str) and m["body"].strip() == text.strip()
+               and m.get("event_id") and m["event_id"] not in seen for m in now):
+            return True
+        covered = bool(seen & ids)
+    return False if covered else None
+
+
 def send_greeting(room: str, text: str, script: Path = SAY_SCRIPT) -> tuple:
-    """(state, reason): `confirmed` or `unconfirmed` when room-ops `say` answered ok, else `failed`."""
+    """(state, reason): SENT, NOT_SENT or UNKNOWN, settled by the send's event id or a read-back."""
     if not (text or "").strip():
-        return "failed", "the reply is empty or its file could not be read"
+        return NOT_SENT, "the reply is empty or its file could not be read"
     if not Path(script).is_file():
-        return "failed", f"say script not found: {script}"
+        return NOT_SENT, f"say script not found: {script}"
+    before = read_room(room, script)
+    if before is None:
+        # Without the room as it was, an unanswered send could never be settled: do not send.
+        return NOT_SENT, "the room could not be read before sending, so the reply was not sent"
     fd, path = tempfile.mkstemp(prefix="tutorial-greeting-", suffix=".txt")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
-        proc = subprocess.run([sys.executable, str(script), "say", room, "--body-file", path],
-                              capture_output=True, text=True, timeout=120)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return "failed", f"{type(exc).__name__}: {exc}"
+        said, err = _room_ops(script, "say", room, "--body-file", path)
     finally:
         Path(path).unlink(missing_ok=True)
-    try:
-        said = json.loads(proc.stdout)
-    except ValueError:
-        said = None
-    if not isinstance(said, dict) or said.get("ok") is not True:
-        why = said.get("reason") if isinstance(said, dict) else (proc.stderr or proc.stdout or "").strip()[-200:]
-        return "failed", str(why or f"say exited {proc.returncode} with no answer")
-    return ("confirmed" if said.get("event_id") else "unconfirmed"), ""
+    if said and said.get("ok") is True and said.get("event_id"):
+        return SENT, ""
+    why = str((said or {}).get("reason") or err or "the send returned no event id")
+    landed = read_back(room, text, before, script)
+    if landed:
+        return SENT, ""
+    # Absence settles only a send the gateway answered; one with no answer may still land.
+    answered = said is not None and not why.startswith("network error")
+    if landed is False and answered:
+        return NOT_SENT, why
+    return UNKNOWN, why
 
 
 def health(outcome: str, reason: str, action: object, summoned: bool = False) -> Dict[str, str]:
@@ -143,6 +203,12 @@ def health(outcome: str, reason: str, action: object, summoned: bool = False) ->
     if outcome == "page-left-as-is":
         return {"status": "warn",
                 "detail": ("the last Getting started page run made or changed nothing: publish skipped it"
+                           + (f" ({reason[:200]})" if reason else "")
+                           + " — the owner was told; see skills/tutorial/SKILL.md")}
+    if outcome == "greeting-unconfirmed":
+        return {"status": "warn",
+                "detail": ("the reply's send could not be confirmed either way, so the Getting started page was "
+                           "held and the reply was not sent again"
                            + (f" ({reason[:200]})" if reason else "")
                            + " — the owner was told; see skills/tutorial/SKILL.md")}
     if outcome == "greeting-not-sent":
@@ -175,7 +241,7 @@ def run(room: str, owner: str, body: str, workspace: Path,
         script: Path = PUBLISH_SCRIPT, now: Optional[float] = None,
         greeting: Optional[str] = None, say_script: Path = SAY_SCRIPT) -> Dict[str, object]:
     """Send the greeting if given, publish once and record the outcome. Never raises for a failed
-    publish: it is recorded. A greeting that was not sent publishes nothing, so no card precedes it."""
+    publish: it is recorded. A greeting not proven in the room publishes nothing, so no card precedes it."""
     cmd = [sys.executable, str(script), "publish", "--room", room, "--name", "auto"]
     if owner:
         cmd += ["--owner", owner]
@@ -184,7 +250,7 @@ def run(room: str, owner: str, body: str, workspace: Path,
     if card_asked:
         cmd.append("--summon")
     greeted, why = send_greeting(room, greeting, say_script) if greeting is not None else (None, "")
-    if greeted == "failed":
+    if greeted in (NOT_SENT, UNKNOWN):
         code, out, err = None, "", why
     elif not Path(script).is_file():
         # Checked first: a missing script would exit 2 from the interpreter, which reads as publish's own 2.
@@ -200,7 +266,8 @@ def run(room: str, owner: str, body: str, workspace: Path,
         # Exit 0 is not a page: the verdict is what publish says it did.
         outcome, reason = read_outcome(result, card_asked)
     else:
-        outcome = "greeting-not-sent" if code is None else OUTCOMES.get(code, "publish-did-not-finish")
+        outcome = ("greeting-unconfirmed" if greeted == UNKNOWN else "greeting-not-sent" if code is None
+                   else OUTCOMES.get(code, "publish-did-not-finish"))
         reason = result.get("reason") if isinstance(result.get("reason"), str) else ""
         if not reason:
             reason = (err or "").strip().splitlines()[-1] if (err or "").strip() else f"exit {code}"
@@ -232,6 +299,8 @@ def run(room: str, owner: str, body: str, workspace: Path,
         shown["owner_line"] = CARD_LINE
     elif outcome == "page-left-as-is":
         shown["owner_line"] = SKIPPED_LINE
+    elif outcome == "greeting-unconfirmed":
+        shown["owner_line"] = UNKNOWN_LINE
     elif outcome != "ok":
         shown["owner_line"] = OWNER_LINE
     return shown
