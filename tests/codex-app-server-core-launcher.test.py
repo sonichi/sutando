@@ -45,7 +45,13 @@ case "${1:-}" in
     fi
     [ "${4:-}" = sutando-core-watcher ] && touch "$S.watcher"
     exit 0 ;;
-  new-window) echo seat > "$S.core"; seat_ready "$@"; echo 0; exit 0 ;;
+  new-window)
+    echo seat > "$S.core"; seat_ready "$@"
+    for a in "$@"; do [ "$a" = "#{window_id} #{window_index}" ] && { echo "@9 0"; exit 0; }; done
+    echo 0; exit 0 ;;
+  list-sessions)
+    [ -n "${FAKE_INSPECT_FAILS:-}" ] && exit 1
+    [ -f "$S.core" ] && echo '$7'; exit 0 ;;
   has-session)
     case "${3:-}" in =sutando-core|'$7') [ -f "$S.core" ] && exit 0 ;; esac
     [ "${3:-}" = =sutando-core-watcher ] && [ -f "$S.watcher" ] && exit 0
@@ -66,7 +72,7 @@ case "${1:-}" in
     echo "@0 0 $cmd --arg"
     exit 0 ;;
   list-windows)
-    for a in "$@"; do [ "$a" = "#{window_id}" ] && { [ -f "$S.core" ] && echo @9; exit 0; }; done
+    for a in "$@"; do [ "$a" = "#{window_id}" ] && { [ -n "${FAKE_INSPECT_FAILS:-}" ] && exit 1; [ -f "$S.core" ] && echo @9; exit 0; }; done
     echo 0; exit 0 ;;
   show-environment) echo "SUTANDO_CORE_RUNTIME=codex"; exit 0 ;;
   display-message)
@@ -355,15 +361,50 @@ class PersistedChoice(unittest.TestCase):
         sentinel.write_text('{"reason": "test", "ts": 0}\n')
         result = f.run(FAKE_SEAT_INIT_FAILS="1", FAKE_KILL_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
         self.assertNotEqual(result.returncode, 0, result.stderr)
-        self.assertIn("could not stop the unready Codex app-server seat (session $7)", result.stderr)
+        self.assertIn("could not stop the unready Codex app-server seat (session $7: alive)", result.stderr)
         self.assertTrue(sentinel.exists())
+        held = f.declaration().parent / "intake-held"
+        self.assertTrue(held.exists())
+        # The surviving seat is not accepted by the next launch until it reports ready...
+        result = f.run(FAKE_SEAT_INIT_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("is not ready — not accepting it", result.stderr)
+        self.assertTrue(sentinel.exists())
+        # ...and once it is, the intake held for it reopens.
+        (f.declaration().parent / "ready").write_text("1\n")
+        result = f.run(**self.UNSET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already running", result.stdout)
+        self.assertFalse(sentinel.exists())
+        self.assertFalse(held.exists())
+
+    def test_a_seat_whose_state_cannot_be_read_after_the_kill_is_unknown_not_gone(self):
+        f = Fixture(self, seat_tmux=True)
+        (f.tmp / "tmux.sock").unlink(missing_ok=True)
+        import socket as _s
+        sock = _s.socket(_s.AF_UNIX)
+        sock.bind(str(f.tmp / "tmux.sock"))
+        self.addCleanup(sock.close)
+        result = f.run(FAKE_SEAT_INIT_FAILS="1", FAKE_INSPECT_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("(session $7: unknown)", result.stderr)
+
+    def test_a_ready_seat_found_running_is_accepted_without_touching_intake(self):
+        f = Fixture(self, seat_tmux=True)
+        self.assertEqual(f.run(**self.UNSET).returncode, 0)
+        sentinel = f.workspace / "state" / "shutdown.sentinel"
+        sentinel.write_text('{"reason": "drain", "ts": 0}\n')
+        result = f.run(**self.UNSET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already running", result.stdout)
+        self.assertTrue(sentinel.exists(), "a shutdown someone else set is not this launcher's to lift")
 
     def test_a_healed_window_that_cannot_be_stopped_fails_loudly(self):
         f = Fixture(self, seat_tmux=True)
         f.core("gone")
         result = f.run(FAKE_SEAT_INIT_FAILS="1", FAKE_KILL_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
         self.assertNotEqual(result.returncode, 0, result.stderr)
-        self.assertIn("could not stop the unready Codex app-server seat (window @9)", result.stderr)
+        self.assertIn("could not stop the unready Codex app-server seat (window @9: alive)", result.stderr)
 
     def test_a_ready_seat_reopens_intake(self):
         f = Fixture(self, seat_tmux=True)

@@ -81,31 +81,63 @@ seat_wait_ready() {
     i=$(( i + 1 ))
   done
   [ -f "$SEAT_READY" ] && return 0
-  echo "  ⚠ the Codex app-server seat did not report ready (see logs/codex-seat.log) — stopping it; sentinel NOT cleared, no core is serving." >&2
+  echo "  ⚠ the Codex app-server seat did not report ready (see logs/codex-seat.log); sentinel NOT cleared." >&2
   return 1
 }
 
-# seat_stop <session|window> <tmux id>: stop exactly the seat this launch started (by its tmux id,
-# never a reusable name or index) and confirm it is gone; loud and nonzero when it is not.
+# seat_target_state <session|window> <tmux id>: alive, absent or unknown. A failed listing is unknown,
+# except with no tmux server socket at all, where nothing can be alive.
+seat_target_state() {
+  local kind="$1" target="$2" ids
+  if [ "$kind" = session ]; then
+    ids="$(tmux -S "$TMUX_SOCKET" list-sessions -F '#{session_id}' 2>/dev/null)"
+  else
+    ids="$(tmux -S "$TMUX_SOCKET" list-windows -a -F '#{window_id}' 2>/dev/null)"
+  fi || { [ -S "$TMUX_SOCKET" ] && echo unknown || echo absent; return 0; }
+  printf '%s\n' "$ids" | grep -qxF -- "$target" && echo alive || echo absent
+}
+
+# seat_stop <session|window> <tmux id>: stop exactly the seat this launch started (its immutable tmux
+# id) and confirm it is gone; loud and nonzero when it is not, with intake marked held for this seat.
 seat_stop() {
-  local kind="$1" target="$2"
+  local kind="$1" target="$2" state=unknown
   if [ -n "$target" ]; then
     tmux -S "$TMUX_SOCKET" "kill-$kind" -t "$target" 2>/dev/null || true
-    if [ "$kind" = session ]; then
-      tmux -S "$TMUX_SOCKET" has-session -t "$target" 2>/dev/null || return 0
-    else
-      tmux -S "$TMUX_SOCKET" list-windows -a -F '#{window_id}' 2>/dev/null | grep -qxF -- "$target" || return 0
-    fi
+    state="$(seat_target_state "$kind" "$target")"
+    [ "$state" = absent ] && return 0
   fi
-  echo "  ✗ could not stop the unready Codex app-server seat ($kind ${target:-of unknown id}) — intake stays shut; stop it by hand (tmux -S $TMUX_SOCKET kill-$kind -t ${target:-=$SESSION}) before the next launch." >&2
+  [ -n "$SEAT_READY" ] && : > "${SEAT_READY%/ready}/intake-held" 2>/dev/null
+  echo "  ✗ could not stop the unready Codex app-server seat ($kind ${target:-of unknown id}: $state) — intake stays shut; stop it by hand (tmux -S $TMUX_SOCKET kill-$kind -t ${target:-=$SESSION}) before the next launch." >&2
   return 1
+}
+
+# seat_reattach: a launch that finds the seat running accepts it as before, unless this launcher held
+# intake shut for that seat (intake-held: its teardown failed). Then it must report ready first, and
+# the intake held for it reopens only then.
+seat_reattach() {
+  local ws held py
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || ws=""
+  [ -n "$ws" ] || return 0
+  SEAT_READY="$(seat_state_dir "$ws" "$SESSION")/ready"
+  held="${SEAT_READY%/ready}/intake-held"
+  [ -f "$held" ] || return 0
+  if ! seat_wait_ready; then
+    echo "  ✗ the running Codex app-server seat in $SESSION is not ready — not accepting it; intake left shut. Restart it from outside the core: bash src/agent/start-cli.sh --restart" >&2
+    return 1
+  fi
+  py="$(heartbeat_python)"
+  if [ -z "$py" ] || ! "$py" "$REPO/src/shutdown.py" clear >/dev/null; then
+    echo "  ✗ the running Codex app-server seat is ready, but the intake held for it could not be reopened." >&2
+    return 1
+  fi
+  rm -f "$held"
 }
 
 seat_start_core_session_and_helpers() {
   local seat_id
   seat_core_prepare || return 1
   prepare_codex_home
-  rm -f "$SEAT_READY"
+  rm -f "$SEAT_READY" "${SEAT_READY%/ready}/intake-held"
   seat_id="$(tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" "${SEAT_ENV_ARGS[@]}" \
     -P -F '#{session_id}' "$SEAT_CLI" "${SEAT_ARGS[@]}")" || seat_id=""
   wait_core_up "$SESSION" session_exists "$SESSION" || return 1
@@ -135,14 +167,19 @@ seat_heal_core_window() {
     tmux -S "$TMUX_SOCKET" kill-window -t "$_win" 2>/dev/null || true
   done
   prepare_codex_home
-  rm -f "$SEAT_READY"
-  if ! idx="$(sutando_new_core_window "$TMUX_SOCKET" "$SESSION" "${CORE_ENV_ARGS[@]}" "${SEAT_ENV_ARGS[@]}" -c "$REPO" "$SEAT_CLI" "${SEAT_ARGS[@]}")" \
-     || [ -z "$idx" ]; then
+  rm -f "$SEAT_READY" "${SEAT_READY%/ready}/intake-held"
+  local created win_id
+  # The window's immutable id comes back from the call that creates it, with its index.
+  created="$(tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_id} #{window_index}' -t "$SESSION:0" \
+      "${CORE_ENV_ARGS[@]}" "${SEAT_ENV_ARGS[@]}" -c "$REPO" "$SEAT_CLI" "${SEAT_ARGS[@]}" 2>/dev/null \
+    || tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_id} #{window_index}' -t "$SESSION" \
+      "${CORE_ENV_ARGS[@]}" "${SEAT_ENV_ARGS[@]}" -c "$REPO" "$SEAT_CLI" "${SEAT_ARGS[@]}")" || created=""
+  win_id="${created%% *}"
+  idx="${created#* }"
+  if [ -z "$created" ] || [ -z "$win_id" ] || [ "$idx" = "$created" ]; then
     echo "  ⚠ could not create a seat window in $SESSION — sentinel NOT cleared, no core is serving." >&2
     return 1
   fi
-  local win_id
-  win_id="$(tmux -S "$TMUX_SOCKET" display-message -p -t "=$SESSION:$idx" '#{window_id}' 2>/dev/null)" || win_id=""
   low="$(tmux -S "$TMUX_SOCKET" list-windows -t "=$SESSION" -F '#{window_index}' 2>/dev/null | sort -n | head -1)"
   if [ -n "$low" ] && [ "$low" != "$idx" ]; then
     tmux -S "$TMUX_SOCKET" swap-window -d -s "=$SESSION:$idx" -t "=$SESSION:$low" 2>/dev/null && idx="$low"
@@ -176,7 +213,8 @@ seat_core_overrides() {
     local ids
     ids="$(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" live "$SEAT_NAME")" && [ -z "$ids" ]
   }
-  ensure_task_notifier() { seat_end_helper_sessions; }
+  # Called only on the launcher's already-running path while a seat is the core.
+  ensure_task_notifier() { seat_end_helper_sessions; seat_reattach || exit 1; }
   ensure_codex_observer() { :; }
   # The supervisor's block hooks read a TUI pane, and the seat draws none.
   add_codex_block_hooks() { :; }
