@@ -63,7 +63,7 @@ if ! { exec 9>"$LOCK"; } 2>/dev/null; then echo "switch-model: could not open th
 # A Codex core: its pick is core-only, kept in the switch record (src/codex_core_model.py), never in
 # the shared CODEX_HOME's config.toml, which the pool's Codex workers read too. Who applies it:
 # - the core's app-server seat: passes it as `model` on its next turn/start (seat.py), so it holds
-#   from the next task; recorded pending until Codex runs that turn (a refusal keeps the old model);
+#   from the next task; recorded pending until Codex runs that turn (exit 12: pending, not switched);
 # - the Codex TUI: nothing typed into it; its launcher starts it with `-m` from the record, so it
 #   holds from the core's next start (exit 11: saved, the running core keeps its model until then);
 # - no core running: the same, from its next launch.
@@ -81,7 +81,7 @@ if [ "$RUNTIME" = "codex" ]; then
   fi
   case "$OUT" in OK*) ;; *) echo "switch-model: could not record the Codex core's model ($STATE_DIR): ${OUT#FAILED }; nothing changed" >&2; exit 1;; esac
   case "$WHERE" in
-    seat) echo "switched: model=$MODEL (was ${OUT#OK }), pending until Codex runs the core's next task on it; if Codex refuses it the core stays on ${OUT#OK } and says so; pool workers keep their own model; record: $STATE_DIR/model-switch.json"; exit 0;;
+    seat) echo "switch-model: pending model=$MODEL (was ${OUT#OK }): saved, not switched yet; the Codex core's app-server seat tries it on its next task and says when Codex has taken or refused it; until then it stays on ${OUT#OK }; pool workers keep their own model; record: $STATE_DIR/model-switch.json" >&2; exit 12;;
     tui) echo "switch-model: saved model=$MODEL (was ${OUT#OK }) for the Codex core's next start; the running Codex TUI keeps its model until then (owner-gated restart: bash src/agent/codex/cli/start-cli.sh --restart); pool workers keep their own model; record: $STATE_DIR/model-switch.json" >&2; exit 11;;
     *) echo "switched: model=$MODEL (was ${OUT#OK }); the Codex core is not running, so it starts on it at its next launch; pool workers keep their own model; record: $STATE_DIR/model-switch.json"; exit 0;;
   esac

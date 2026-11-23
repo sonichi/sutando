@@ -918,6 +918,21 @@ class CodexCore(Base):
         self.using("gpt-a", runtime="codex", accepted=True)
         self.assertEqual(mc.current_model(self.ws)["name"], "GPT A")
 
+    def test_a_seat_pick_is_said_pending_never_switched_and_the_model_in_use_stays_the_working_one(self):
+        self.using("gpt-b", runtime="codex", status="pending", working="gpt-a", accepted=False, rev=2)
+        state, words = mc.outcome(self.ws, "gpt-b", mc.PENDING_RC)
+        self.assertEqual(state, "pending")
+        self.assertNotIn("Switched", words)
+        self.assertIn("not switched yet", words)
+        self.assertIn("I'm still using GPT A", words)
+        self.assertEqual(mc.current_model(self.ws)["name"], "GPT A", "the menu marks the working model")
+        body, card = mc.notice_card(state, "Pending", words)
+        self.assertEqual((card["state"], card["header"]["status"]["label"]), ("pending", "Pending"))
+
+    def test_a_refused_pick_names_the_working_model_in_use(self):
+        self.using("gpt-b", runtime="codex", status="rejected", working="gpt-a", accepted=False, rev=2)
+        self.assertEqual(mc.current_model(self.ws)["name"], "GPT A")
+
     def test_saved_for_the_next_start_is_said_as_such(self):
         self.using("gpt-a", runtime="codex", accepted=True)
         self.using("gpt-b", runtime="codex", accepted=False, previous="gpt-a")
