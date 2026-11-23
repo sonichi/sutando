@@ -51,6 +51,15 @@ def points_at_credential_proxy(base_url: "str | None") -> bool:
     )
 
 
+STATUSLINE_SOURCE = "statusline"
+
+
+def from_statusline(record: Any) -> bool:
+    """Whether the record was written by Claude Code's own status line (src/quota_record.py):
+    it speaks for the login whatever the seat's routing, so no proxy is needed."""
+    return isinstance(record, dict) and record.get("source") == STATUSLINE_SOURCE
+
+
 def quota_windows(headers: dict) -> dict:
     """Every window the proxy reported, keyed by window, as (utilization or None,
     that window's own status or None). A window is named by its `-utilization`
@@ -149,7 +158,7 @@ def availability_decision(
     headers = payload.get("headers")
     headers = headers if isinstance(headers, dict) else {}
     status = headers.get("anthropic-ratelimit-unified-status", "unknown")
-    routed = points_at_credential_proxy(base_url)
+    routed = points_at_credential_proxy(base_url) or from_statusline(payload)
     limit_state = classify_limit_state(payload)
     accepted = resolve_available(str(status), payload.get("available"), headers, limit_state)
     available = accepted and routed and not stale

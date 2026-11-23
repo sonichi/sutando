@@ -18,6 +18,32 @@ Monitor your Claude Code quota in real time by intercepting Anthropic API rate l
 
 A credential proxy sits between Claude Code and the Anthropic API. It reads `anthropic-ratelimit-unified-*` headers from every API response and writes quota state to a JSON file.
 
+Without the proxy, the status line recorder writes the same file from Claude Code's own reports (next section). Both sources write one record; the newest write wins.
+
+## Without the proxy: the status line recorder
+
+On by default. At every Claude session launch (the core and each pool worker), the skill's `on_session_config` hook (`scripts/install-statusline.py`) writes two entries into that session's config-dir `settings.json`:
+
+- `statusLine`: `scripts/statusline-record.py`, refreshed every 60 seconds. It reads the status line input's `rate_limits.five_hour` / `seven_day` (`used_percentage`, `resets_at`) and records them through `src/quota_record.py`, with `source: "statusline"`, the proxy's field shape and synthesized `anthropic-ratelimit-unified-5h/7d-utilization` and `-reset` headers. An observation older than the record on disk is dropped, so an idle session cannot overwrite a newer one; the observation time is the session transcript's last change.
+- A `StopFailure` hook (`matcher: rate_limit`, `scripts/stopfailure-record.py`): a turn that ends on a rate limit appends a 429 to `recent_rejections` (the newest 20 are kept) and marks the record rejected. The rejection holds until its window's reset passes, or a later reply shows every window under its limit.
+
+If the config dir already had a status line, the installer saves it beside that settings file as `quota-statusline-passthrough.json` and the recorder pipes the same input to it and prints its output unchanged; otherwise the recorder prints a short line (model, 5h and 7d percentages). Turning the recorder off puts the saved status line back.
+
+Config (`manifest.json` `config`; env overrides):
+
+- `QUOTA_STATUSLINE_ENABLED` (default `true`): `false` removes the recorder and hook at the next launch.
+- `QUOTA_STATUSLINE_PASSTHROUGH`: a status line command to pass through to instead of the saved one.
+
+With `source: "statusline"`, the readers (`src/quota_availability.py`, health-check's `credential-proxy` and `quota-telemetry` rows) treat a missing proxy as expected, not as a failure.
+
+What it gives up compared with the proxy:
+
+- no pre-send `rejected` or overage status: the headline is `allowed` until a StopFailure says otherwise, and no `overage-status` is recorded;
+- only 429s, from StopFailure; other upstream rejections are not recorded;
+- percentages only to the precision Claude Code reports (often whole numbers);
+- nothing for API-key, Bedrock or Vertex logins (Claude Code sends no `rate_limits` there);
+- a refresh only when a session on that login gets a reply; between replies the record ages and goes stale as usual.
+
 ## Quick Check
 
 ```bash

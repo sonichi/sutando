@@ -5846,6 +5846,14 @@ def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
     # result depends on ambient host state is worse than the bug it guards -- and CI,
     # having no live core, would have stayed green while developer hosts failed.
     check = {"name": "quota-telemetry", "status": "ok"}
+    if _quota_record_from_statusline():
+        path = status_read_path("quota-state.json", WORKSPACE_DIR)
+        try:
+            age = f" (updated {int((time.time() - path.stat().st_mtime) / 60)}m ago)"
+        except OSError:
+            age = ""
+        check["detail"] = f"quota state from the Claude status line recorder{age}"
+        return check
     # "stale" means listening but executing pre-deploy code -- still routing,
     # so gating it out here would mute this check exactly during a redeploy.
     if proxy_status not in ("ok", "stale"):
@@ -13239,6 +13247,16 @@ def _credential_proxy_wedge_from_quota_state(check: dict) -> None:
     )
 
 
+def _quota_record_from_statusline() -> bool:
+    """quota-state.json was last written by the status line recorder, which needs no proxy."""
+    try:
+        data = json.loads(status_read_path("quota-state.json", WORKSPACE_DIR).read_text())
+    except (OSError, ValueError):
+        return False
+    from quota_availability import from_statusline  # src/ is on sys.path
+    return from_statusline(data)
+
+
 def check_credential_proxy() -> dict:
     """Credential proxy (port 7846). probe=False: a forwarding proxy has no
     liveness endpoint, so an HTTP probe is forwarded and misread as wedged."""
@@ -13246,7 +13264,10 @@ def check_credential_proxy() -> dict:
     # Liveness, captured before staleness/pin rewrite `status`: a pinned proxy
     # still routes, so its consumers must not read the pin as "down".
     check["live"] = check["status"] == "ok"
-    if check["status"] == "down":
+    if check["status"] == "down" and _quota_record_from_statusline():
+        check["status"] = "ok"
+        check["detail"] = "not running — quota comes from the Claude status line recorder"
+    elif check["status"] == "down":
         check["status"] = "warn"
         check["detail"] = "not running (optional)"
     elif check["status"] == "ok":

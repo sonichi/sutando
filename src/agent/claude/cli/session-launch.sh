@@ -262,6 +262,14 @@ PY
   fi
 }
 
+# Runs the skills' `on_session_config` scripts against this session's CLAUDE_CONFIG_DIR
+# (src/session_config_hooks.py names no skill). Bounded and fail-open.
+apply_skill_session_config() {
+  [ -n "${PY:-}" ] && [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -f "$REPO/src/session_config_hooks.py" ] || return 0
+  "$PY" "$REPO/src/session_config_hooks.py" --config-dir "$CLAUDE_CONFIG_DIR" \
+    || echo "session-launch: session-config hooks failed (rc=$?) — launch continues" >&2
+}
+
 # 0 when the session's cwd is a folder other than this checkout.
 claude_session_outside_checkout() {
   [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ] || return 1

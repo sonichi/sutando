@@ -200,7 +200,7 @@ refuses their fields on a developer-only skill. Which directories depends on the
   when set, each `$SUTANDO_EXTERNAL_PLUGIN_DIRS` entry's `skills/`, and sibling checkouts' `skills/`;
 - `documented_for_core` (`src/inline-tools.ts`): `<repo>/skills`, `<workspace>/skills` and
   `$SUTANDO_MEMORY_DIR/skills`;
-- `pending_questions_store`, `on_launch` and `on_stop_requested` (`src/skill_roots.py`):
+- `pending_questions_store`, `on_launch`, `on_stop_requested` and `on_session_config` (`src/skill_roots.py`):
   `<repo>/skills` and `<workspace>/skills`;
 - `hooks` (`src/skill_hooks.py`), `claude_plugin` (`src/skill-manifest-config.sh`) and
   `supervised_worker` (`src/sparrowd.py`): `<repo>/skills` only.
@@ -228,6 +228,21 @@ the desktop app on each start, update, watchdog restart and reload); on Windows
 
 Several skills may declare one; each runs on every launch, a restart included, so a hook must be
 cheap when it has nothing to do.
+
+## Session-config hook (`on_session_config`)
+
+`"on_session_config": "scripts/<hook>.py"` (or `.sh`) declares a script that edits a Claude
+session's own config dir before the session starts. `apply_skill_session_config` in
+`src/agent/claude/cli/session-launch.sh` runs `src/session_config_hooks.py` right after
+`CLAUDE_CONFIG_DIR` is resolved, on both the core launcher (`src/agent/claude/cli/start-cli.sh`)
+and the pool worker launcher (`skills/worker-pool/scripts/launch-worker-session.sh`), naming no
+skill. The contract:
+
+- run as `<python> <script> --config-dir <dir>` for a `.py`, `bash <script> --config-dir <dir>`
+  for a `.sh`; any other suffix is never run;
+- stdin from the null device, output to the launcher's stderr, waited on for at most 10 seconds
+  (then killed), 20 seconds for all of them; the exit status is reported and never fails the launch;
+- it runs on every launch, so it must be idempotent and leave alone what it did not write.
 
 ## Stop handler (`on_stop_requested`)
 

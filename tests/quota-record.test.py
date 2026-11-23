@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""The status line quota recorder: src/quota_record.py (the writer), the skill's
+recorder / StopFailure / installer scripts, the session-config hook runner, and the
+readers that must treat `source: "statusline"` without a proxy as healthy.
+
+Run: python3 tests/quota-record.test.py
+"""
+from __future__ import annotations
+
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ()
+
+import importlib.util
+import io
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "skills" / "quota-tracker" / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(ROOT / "src"))  # ahead of the skill's quota_availability shim
+
+import quota_availability as qa
+import quota_record as qr
+import session_config_hooks as sch
+import statusline_config as cfg
+
+FX = json.loads((ROOT / "tests" / "fixtures" / "quota-record-shape.parity.json").read_text())
+P = "anthropic-ratelimit-unified-"
+T0 = FX["now_epoch"]
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _status(five=42, seven=7, model="claude-opus-5-5"):
+    rl = {}
+    if five is not None:
+        rl["five_hour"] = {"used_percentage": five, "resets_at": T0 + 4 * 3600}
+    if seven is not None:
+        rl["seven_day"] = {"used_percentage": seven, "resets_at": T0 + 5 * 86400}
+    return {"model": {"id": model, "display_name": "Opus"}, "rate_limits": rl}
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self._tmp.name) / "ws"
+        (self.ws / "state").mkdir(parents=True)
+        self.path = self.ws / "state" / "quota-state.json"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def rec(self):
+        return json.loads(self.path.read_text())
+
+
+class Parity(unittest.TestCase):
+    def test_statusline_record_matches_the_proxy_shape(self):
+        out = qr.record_from_statusline(FX["prev"], FX["statusline"], T0, now=T0)
+        self.assertEqual(out.pop("source"), "statusline")
+        self.assertEqual(out, FX["proxy_record"])
+
+
+class Writer(Base):
+    def test_sample_reads_back_through_the_readers(self):
+        self.assertTrue(qr.record_statusline(self.ws, _status(), now=T0))
+        rec = qa.read_quota_record(self.ws, now=T0 + 30)
+        self.assertTrue(rec.fresh())
+        self.assertEqual(qa.classify_limit_state(rec.payload), "allowed")
+        self.assertEqual(qa.quota_windows(rec.payload["headers"]),
+                         {"5h": (0.42, None), "7d": (0.07, None)})
+        self.assertTrue(qa.gate_windows_allowed(rec.payload))
+        d = qa.availability_decision(rec.payload, base_url=None, stale=False)
+        self.assertTrue(d["available"], d)
+        self.assertEqual(rec.payload["headers"][P + "5h-reset"], str(T0 + 4 * 3600))
+
+    def test_one_window_missing_still_writes(self):
+        self.assertTrue(qr.record_statusline(self.ws, _status(seven=None), now=T0))
+        self.assertNotIn(P + "7d-utilization", self.rec()["headers"])
+
+    def test_missing_or_partial_rate_limits_write_nothing(self):
+        for status in ({"model": {"id": "x"}}, {"rate_limits": {}}, {"rate_limits": None},
+                       {"rate_limits": {"five_hour": {"used_percentage": 3}}},
+                       {"rate_limits": {"five_hour": {"resets_at": T0}}}, None, "junk"):
+            with self.subTest(status=status):
+                self.assertFalse(qr.record_statusline(self.ws, status, now=T0))
+                self.assertFalse(self.path.exists())
+
+    def test_older_observation_does_not_overwrite_newer(self):
+        qr.record_statusline(self.ws, _status(five=50), now=T0)
+        transcript = Path(self._tmp.name) / "t.jsonl"
+        transcript.write_text("")
+        os.utime(transcript, (T0 - 600, T0 - 600))
+        old = dict(_status(five=10), transcript_path=str(transcript))
+        self.assertFalse(qr.record_statusline(self.ws, old, now=T0 + 60))
+        self.assertEqual(self.rec()["utilization_5h"], 0.5)
+
+    def test_recent_rejections_and_credential_state_are_preserved(self):
+        self.path.write_text(json.dumps(FX["prev"]))
+        qr.record_statusline(self.ws, _status(), now=T0)
+        rec = self.rec()
+        self.assertEqual(rec["recent_rejections"], FX["prev"]["recent_rejections"])
+        self.assertEqual(rec["credential_state"], "ok")
+
+    def test_stopfailure_rejects_then_next_write_clears(self):
+        qr.record_statusline(self.ws, _status(five=98), now=T0)
+        self.assertTrue(qr.record_rate_limit(self.ws, now=T0 + 10, detail="429 Too Many Requests"))
+        rec = qa.read_quota_record(self.ws, now=T0 + 20).payload
+        self.assertEqual(qa.classify_limit_state(rec), "rejected")
+        self.assertFalse(rec["available"])
+        self.assertEqual(rec["recent_rejections"][-1]["status"], 429)
+        self.assertEqual(rec["recent_rejections"][-1]["model"], "claude-opus-5-5")
+        # The timer re-render with the same numbers before the reset keeps it rejected.
+        qr.record_statusline(self.ws, _status(five=98), now=T0 + 70)
+        self.assertEqual(self.rec()["limit_state"], "rejected")
+        # After the 5h reset, the next write clears it.
+        qr.record_statusline(self.ws, _status(five=98), now=T0 + 4 * 3600 + 1)
+        rec = self.rec()
+        self.assertEqual(qa.classify_limit_state(rec), "allowed")
+        self.assertTrue(rec["available"])
+        self.assertNotIn("rejected_by", rec)
+        self.assertEqual(len(rec["recent_rejections"]), 1)
+
+    def test_a_reply_under_the_limit_clears_before_the_reset(self):
+        qr.record_statusline(self.ws, _status(five=98), now=T0)
+        qr.record_rate_limit(self.ws, now=T0 + 10)
+        qr.record_statusline(self.ws, _status(five=100), now=T0 + 20)
+        self.assertEqual(self.rec()["limit_state"], "rejected")
+        qr.record_statusline(self.ws, _status(five=3), now=T0 + 30)
+        self.assertEqual(self.rec()["limit_state"], "allowed")
+
+    def test_rejection_ledger_is_bounded(self):
+        for i in range(25):
+            qr.record_rate_limit(self.ws, now=T0 + i)
+        self.assertEqual(len(self.rec()["recent_rejections"]), qr.MAX_RECENT_REJECTIONS)
+
+
+class Scripts(Base):
+    def _run(self, script, stdin: bytes, env=None):
+        mod = _load(script.stem.replace("-", "_"), script)
+        out = io.BytesIO()
+        fake_in = io.TextIOWrapper(io.BytesIO(stdin))
+        fake_out = io.TextIOWrapper(out, write_through=True)
+        with mock.patch.object(cfg, "workspace", return_value=self.ws), \
+                mock.patch.dict(os.environ, env or {}), \
+                mock.patch.object(sys, "stdin", fake_in), mock.patch.object(sys, "stdout", fake_out):
+            mod.main()
+            fake_out.flush()
+        return out.getvalue().decode()
+
+    def test_recorder_records_and_prints_a_short_line(self):
+        line = self._run(SCRIPTS / "statusline-record.py", json.dumps(_status()).encode())
+        self.assertEqual(line.strip(), "Opus · 5h 42% · 7d 7%")
+        self.assertEqual(self.rec()["source"], "statusline")
+
+    def test_recorder_passes_through_the_foreign_status_line(self):
+        raw = json.dumps(_status()).encode()
+        cmd = "python3 -c \"import sys,json; d=json.load(sys.stdin); print('FOREIGN', d['model']['id'])\""
+        line = self._run(SCRIPTS / "statusline-record.py", raw, {"QUOTA_STATUSLINE_PASSTHROUGH": cmd})
+        self.assertEqual(line, "FOREIGN claude-opus-5-5\n")
+        self.assertTrue(self.path.exists())
+
+    def test_recorder_survives_garbage(self):
+        self._run(SCRIPTS / "statusline-record.py", b"\xff not json")
+        self.assertFalse(self.path.exists())
+
+    def test_stopfailure_only_on_rate_limit(self):
+        self._run(SCRIPTS / "stopfailure-record.py", json.dumps({"error": "server_error"}).encode())
+        self.assertFalse(self.path.exists())
+        self._run(SCRIPTS / "stopfailure-record.py", json.dumps({"error": "rate_limit"}).encode())
+        self.assertEqual(self.rec()["limit_state"], "rejected")
+
+
+class Installer(Base):
+    def setUp(self):
+        super().setUp()
+        self.ccd = Path(self._tmp.name) / "ccd"
+        self.ccd.mkdir()
+        self.settings = self.ccd / "settings.json"
+
+    def test_installs_statusline_and_stopfailure(self):
+        self.assertEqual(cfg.install(str(self.ccd), True), "installed")
+        st = json.loads(self.settings.read_text())
+        self.assertIn(cfg.STATUS_MARK, st["statusLine"]["command"])
+        self.assertEqual(st["statusLine"]["refreshInterval"], 60)
+        group = st["hooks"]["StopFailure"][0]
+        self.assertEqual(group["matcher"], "rate_limit")
+        self.assertIn(cfg.STOP_MARK, group["hooks"][0]["command"])
+        self.assertEqual(cfg.install(str(self.ccd), True), "unchanged")
+
+    def test_foreign_statusline_is_kept_passed_through_and_restored(self):
+        foreign = {"type": "command", "command": "~/bin/my-status", "padding": 1}
+        other_hook = {"matcher": "", "hooks": [{"type": "command", "command": "notify"}]}
+        self.settings.write_text(json.dumps({"statusLine": foreign, "model": "opus",
+                                             "hooks": {"StopFailure": [other_hook]}}))
+        cfg.install(str(self.ccd), True)
+        self.assertEqual(cfg.passthrough_command(str(self.ccd)), "~/bin/my-status")
+        cfg.install(str(self.ccd), True)  # a re-run must not save our own line as foreign
+        self.assertEqual(cfg.passthrough_command(str(self.ccd)), "~/bin/my-status")
+        self.assertEqual(cfg.install(str(self.ccd), False), "removed")
+        self.assertEqual(json.loads(self.settings.read_text()),
+                         {"statusLine": foreign, "model": "opus", "hooks": {"StopFailure": [other_hook]}})
+        self.assertIsNone(cfg.passthrough_command(str(self.ccd)))
+
+    def test_off_with_nothing_installed_changes_nothing(self):
+        self.settings.write_text(json.dumps({"statusLine": {"type": "command", "command": "mine"}}))
+        self.assertEqual(cfg.install(str(self.ccd), False), "unchanged")
+
+    def test_unreadable_settings_are_left_alone(self):
+        self.settings.write_text("{not json")
+        self.assertTrue(cfg.install(str(self.ccd), True).startswith("skipped"))
+        self.assertEqual(self.settings.read_text(), "{not json")
+
+    def test_enabled_reads_env_then_manifest(self):
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": ""}):
+            self.assertTrue(cfg.enabled())
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false"}):
+            self.assertFalse(cfg.enabled())
+
+    def test_manifest_declares_the_session_config_hook(self):
+        m = json.loads((ROOT / "skills" / "quota-tracker" / "manifest.json").read_text())
+        self.assertTrue((ROOT / "skills" / "quota-tracker" / m["on_session_config"]).is_file())
+        self.assertIs(m["config"]["QUOTA_STATUSLINE_ENABLED"], True)
+
+
+class SessionConfigHooks(Base):
+    def test_runs_each_hook_with_the_config_dir_and_survives_failures(self):
+        d = Path(self._tmp.name)
+        ok = d / "ok.py"
+        ok.write_text("import sys; open(sys.argv[2] + '/seen', 'w').write('1')\n")
+        bad = d / "bad.sh"
+        bad.write_text("exit 3\n")
+        skipped = d / "x.rb"
+        skipped.write_text("")
+        out = sch.run([("a", ok), ("b", bad), ("c", skipped)], str(d), sys.executable,
+                      deadline=__import__("time").monotonic() + 30)
+        self.assertEqual(out, [("a", 0), ("b", 3)])
+        self.assertTrue((d / "seen").exists())
+
+
+class HealthCheck(Base):
+    def setUp(self):
+        super().setUp()
+        spec = importlib.util.spec_from_file_location("hc_quota_record_test", ROOT / "src" / "health-check.py")
+        self.hc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.hc)
+        self.hc.WORKSPACE_DIR = self.ws
+        qr.record_statusline(self.ws, _status(), now=None)
+
+    def test_quota_telemetry_ok_without_proxy(self):
+        for proxy in ("down", "ok"):
+            c = self.hc.check_quota_telemetry(proxy, core_env_prober=lambda: False)
+            self.assertEqual(c["status"], "ok", c)
+            self.assertIn("status line", c["detail"])
+
+    def test_credential_proxy_down_is_ok_with_statusline_source(self):
+        hc = self.hc
+        with mock.patch.object(hc, "check_port",
+                               side_effect=lambda *a, **k: {"name": "credential-proxy", "status": "down"}), \
+                mock.patch.object(hc, "_proc_lstarts", return_value=([], [])), \
+                mock.patch.object(hc, "_pin_verdicts", return_value=[]), \
+                mock.patch.object(hc, "_apply_pin_findings", return_value=None):
+            c = hc.check_credential_proxy()
+            self.assertEqual(c["status"], "ok", c)
+            self.assertFalse(c["live"])
+            self.path.write_text(json.dumps(FX["proxy_record"]))
+            self.assertEqual(hc.check_credential_proxy()["status"], "warn")
+
+
+if __name__ == "__main__":
+    unittest.main()

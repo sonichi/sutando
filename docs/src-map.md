@@ -204,6 +204,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`python-binary.ts`** — Resolve a python3 interpreter that will actually run.
 - **`quota_availability.py`** — Shared authority for whether Claude quota telemetry is usable.
 - **`quota_projection.py`** — Quota usage history + even-pace projection series for the dashboard chart.
+- **`quota_record.py`** — One writer of `state/quota-state.json` from Claude Code's own reports, for logins without the credential proxy: the status line's `rate_limits` and the StopFailure hook's `error: "rate_limit"`.
 - **`reachability-endpoints.ts`** — Direct-reachability endpoint detection (US-10, Tier 2b) — "call your agent from another device and still reach YOUR core, directly, without routing through the cloud."
 - **`read_discord_channel.py`** — Gated Discord channel reader — compatibility wrapper over the shared reader and the shared contextNotFrom policy.
 - **`recording-state.ts`** — Shared recording state — used by both browser-tools.ts (describeScreenTool) and recording-tools.ts (scrollAndDescribeTool, screenRecordTool, etc.)
@@ -243,6 +244,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`send_failure_policy.py`** — Classify an outbound-send failure as transient (retry) or permanent (park).
 - **`services_status.py`** — Per-host services-status emitter for the bundled Sutando runtime.
 - **`session-handoff.sh`** — Session handoff — writes a summary for the next session to pick up.
+- **`session_config_hooks.py`** — Session-config hooks: the scripts installed skills declare with the manifest field `on_session_config`, run once per Claude session launch (the core and each pool worker) after its CLAUDE_CONFIG_DIR is resolved and before the session starts.
 - **`session_runtime.py`** — Runtime a tmux core session was launched with, read from the session's own environment.
 - **`shepherd_contract.py`** — Shepherd contract: the responsibility scope a task accepts for an external objective, and the admission rule deciding which observed events belong to it.
 - **`shutdown.py`** — Graceful-shutdown sentinel — a durable, cross-process "we are shutting down on purpose (not crashing)" signal.
