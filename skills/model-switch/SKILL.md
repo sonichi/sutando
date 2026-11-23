@@ -148,3 +148,9 @@ before its "switching" card; an untold outcome with a newer attempt after it is 
 in the record and never posted, so only the newest attempt's outcome stands for the card. The menu has its own card id: a newer menu retires an older one's
 buttons, while the "switching" answer and the outcome (another id) leave the menu acting, since its
 buttons stay on the owner's screen. Output of the detached line: `<workspace>/logs/model-card.log`.
+
+One card, updated in place: the "switching" answer is an edit of the tapped menu's own event
+(`room.message.edit`, so the event then shows "Core model: Switching the core to X…" in place of the
+card), and the outcome edits that same event again. A tap adds no message. Only where the edit cannot
+be made (a tap with no card event, or the edit refused) are the "switching" answer and the outcome
+posted as cards of their own, as above.
