@@ -46,7 +46,15 @@ What it gives up compared with the proxy:
 
 ## Sessions call Anthropic directly
 
-With the recorder on, Sutando's Claude sessions (the core and every pool worker) no longer go through the credential proxy. The core and worker launchers (`src/agent/claude/cli/session-launch.sh`) and `src/startup.sh` drop an `ANTHROPIC_BASE_URL` that points at the local proxy (`http://localhost:7846`, `127.0.0.1` or `[::1]`), in the launcher and in the session's own environment, and no longer set it. A base URL the owner set to anything else is left alone. A launch goes direct only when the config dir it will run under is signed in on its own (`src/claude_signed_in.py` asks `claude auth status --json`, which reports `loggedIn` and never a token, with an 8 s timeout): a session the proxy authenticated may have no login of its own. Not signed in, or a status check that fails or times out, keeps that launch on the proxy, logs `<config dir>: not signed in; staying on the proxy`, and health-check's `claude-direct-routing` row warns until that dir is signed in.
+This is the default after upgrading, for new and existing installs alike, and there is no fallback to the proxy. A session that worked through the proxy may have no login of its own, because the proxy injected the credential. If so, you are asked to sign in: health-check's `claude-sign-in` row fails, naming the config dir, and your DM gets one message a day until it is signed in. The message carries the exact command to run in a terminal on this computer, for example:
+
+```bash
+CLAUDE_CONFIG_DIR='<config dir>' claude auth login
+```
+
+Follow the link it prints and sign in; the next session launch picks the login up. The check (`src/claude_signed_in.py`) runs `claude auth status --json` with the environment the direct session gets and counts only exit 0 with `"loggedIn": true`; it never changes routing and never reads a credential.
+
+With the recorder on, Sutando's Claude sessions (the core and every pool worker) no longer go through the credential proxy. The core and worker launchers (`src/agent/claude/cli/session-launch.sh`) and `src/startup.sh` drop an `ANTHROPIC_BASE_URL` that points at the local proxy (`http://localhost:7846`, `127.0.0.1` or `[::1]`), in the launcher and in the session's own environment, and no longer set it. A base URL the owner set to anything else is left alone.
 
 - The proxy's shared-credential role no longer applies to these sessions: each one uses its own config dir's login. On a host where workers run in the core's config dir, that is the core's login for all of them.
 - Nothing stops or uninstalls the proxy: it keeps running, unused by these sessions. Health-check does not fail when the proxy is down or unused and the quota record comes from the status line.

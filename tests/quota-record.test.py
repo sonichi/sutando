@@ -237,6 +237,16 @@ class Writer(Base):
         self.assertFalse(claude_account.is_identified(claude_account.account_key(str(a))))
         self.assertTrue(claude_account.is_identified(claude_account.account_key(self.core)))
 
+    def test_tracking_only_mode_with_proxy_routing_is_trusted(self):
+        # Tracking on, direct routing off (the default): sessions still go through the proxy.
+        self.assertTrue(self.sl(_status(five=30), now=None))
+        rec = qa.read_quota_record(self.ws).payload
+        self.assertIs(qa.trusted_record(rec), rec)
+        for base in ("http://localhost:7846", None):
+            d = qa.availability_decision(rec, base_url=base, stale=False)
+            self.assertTrue(d["available"], (base, d))
+            self.assertTrue(d["routed"])
+
     def test_an_account_switch_and_a_proxy_rollback_never_use_the_old_login(self):
         import core_limit_hold as clh
         self.sl(_status(five=40), now=None)

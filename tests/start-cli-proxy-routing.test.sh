@@ -187,20 +187,16 @@ check $? "first launch after opt-out: the proxy URL is set again"
 echo "$out" | grep -qx "QUOTA_STATUSLINE_ENABLED=false"
 check $? "first launch after opt-out: the session carries the switch as off"
 
-# 15. Direct only when the session's config dir is signed in on its own: a session the proxy
-#     authenticated may have no login of its own, and would start unauthenticated.
+# 15. Always direct with tracking on, signed in or not: the launch never runs `claude auth status`
+#     (health-check's claude-sign-in row detects a dir that is not signed in and asks the owner).
+printf '#!/bin/sh\n[ "$1 $2" = "auth status" ] && echo called >> "%s/probe-calls"\necho '"'"'{"loggedIn": false}'"'"'\n' "$TMP" > "$TMP/out-bin/claude"
+rm -f "$TMP/probe-calls"
 out="$(run_direct "$TMP/out-bin")"
-echo "$out" | grep -qx "ANTHROPIC_BASE_URL=http://localhost:7846"
-check $? "recorder on, config dir not signed in: the launch stays on the proxy"
-grep -q "not signed in; staying on the proxy" "$TMP/stderr"
-check $? "recorder on, config dir not signed in: one line names it"
-out="$(run_direct "$TMP/broken-bin")"
-echo "$out" | grep -qx "ANTHROPIC_BASE_URL=http://localhost:7846"
-check $? "recorder on, sign-in status unreadable: the launch stays on the proxy"
-out="$(run_direct "$TMP/live-bin")"
 echo "$out" | grep -q "ANTHROPIC_BASE_URL"
 [ $? -ne 0 ]
-check $? "recorder on, config dir signed in: the launch goes direct"
+check $? "recorder on, config dir not signed in: the launch still goes direct (no proxy fallback)"
+[ ! -e "$TMP/probe-calls" ]
+check $? "the launch path never runs the sign-in probe"
 
 # 13. The session itself drops a proxy URL its tmux server environment carries.
 . "$REPO/src/claude_routing.sh"
