@@ -202,9 +202,11 @@ def marked_answer(root, task_id: str, body: bytes, cfg: dict) -> "bytes | None":
     path = os.path.join(root, "tasks", task_id + ".txt")
     from ... import task_io
     headers, _, _ = task_io.parse_task(path)
+    # The desk takes the task's text, not its path (a claimed task of this adapter is still in tasks/).
+    task_text = Path(path).read_text(encoding="utf-8")
     said: dict = {}
     shown = desk(root, cfg, lambda result_file, out: said.update(body=out)).marked(
-        headers.get("access_tier"), path, "completed", text, os.path.join(root, "results", task_id + ".txt"))
+        headers.get("access_tier"), task_text, "completed", text, os.path.join(root, "results", task_id + ".txt"))
     if not shown:
         return None
     answer = (said.get("body") or model_switch.ANSWERED).encode("utf-8")
