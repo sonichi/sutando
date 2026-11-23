@@ -64,7 +64,7 @@ RUNTIME_ACTIONS = {"claude": frozenset(CLICK_VERBS),
                    "codex": frozenset({"switch_runtime", "restart_core", "escape_prompt", "refresh_options"})}
 #: An unknown runtime gets only what works on any pane.
 NEUTRAL_ACTIONS = frozenset({"restart_core", "escape_prompt"})
-RECEIPT_OUTCOMES = ("done", "refused", "stale", "failed")
+RECEIPT_OUTCOMES = ("accepted", "executing", "done", "refused", "stale", "failed")
 
 MAX_ACTIONS = 8
 MAX_SWITCH_MODELS = 6

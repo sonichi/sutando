@@ -57,7 +57,8 @@ class Base(unittest.TestCase):
                             ("_last_heartbeat_at", 0.0), ("_last_core_health", None),
                             ("_core_recovery_refused_until", 0.0), ("_HEALTH_COMMAND", None),
                             ("_core_recovery_logged", None),
-                            ("_CORE_RECOVERY_READER", lambda: self.record)):
+                            ("_CORE_RECOVERY_READER", lambda: self.record),
+                            ("_CORE_RECOVERY_RECEIPTS_READER", lambda: [])):
             p = mock.patch.object(rgb, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -143,6 +144,25 @@ class Carriage(Base):
                 body = self.beat(core_row(), force=True)
             self.assertIsNotNone(body, reader)
             self.assertNotIn("recovery", body["health"])
+
+    def test_latest_receipts_ride_beside_the_recovery_record(self):
+        self.record = {"v": 1, "state": "running", "actions": []}
+        receipts = [{"v": 1, "hitl_id": "hr_1", "incident": "inc_0123abcd",
+                     "action_id": "restart_core", "outcome": "executing", "reason": None,
+                     "at": 8, "recovery": {}}]
+        with mock.patch.object(rgb, "_CORE_RECOVERY_RECEIPTS_READER", lambda: receipts):
+            body = self.beat(core_row(), force=True)
+        self.assertEqual(body["health"]["recovery_receipts"], receipts)
+        self.assertIn(rgb.CORE_RECOVERY_CAPABILITY, body["capabilities"])
+
+    def test_receipts_ride_without_a_current_recovery_record(self):
+        receipts = [{"v": 1, "hitl_id": "hr_1", "incident": "",
+                     "action_id": "restart_core", "outcome": "accepted", "reason": None,
+                     "at": 7, "recovery": {}}]
+        with mock.patch.object(rgb, "_CORE_RECOVERY_RECEIPTS_READER", lambda: receipts):
+            body = self.beat(None, force=True)
+        self.assertEqual(body["health"], {"alive": None, "motion": "unknown",
+                                          "recovery_receipts": receipts})
 
 
 class LiveEvidence(Base):

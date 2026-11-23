@@ -412,7 +412,11 @@ the state and offer the fix (see [Core recovery record](core-recovery-record.md)
 bodies in `contracts/core_recovery.v1/`). The adapter injects its reader, so a standalone
 Sparrow sends no such block. A missing, stale, malformed or oversized (over 4096 bytes)
 record is omitted, and the broker keeps its last value. A change in the record sends the
-heartbeat at once. A broker that answers `400` or `422` to a beat carrying the block gets the
+heartbeat at once. The newest 16 redacted receipt files ride beside it as
+`health.recovery_receipts`, one latest lifecycle row per `hitl_id`: `accepted`, `executing`, then
+a terminal `done`, `refused`, `stale` or `failed`. They may ride without a current recovery record,
+so a remote client can observe the result of the operation it requested. A broker that answers
+`400` or `422` to a beat carrying either recovery field gets the
 same beat again without it at once, and beats without it for the next hour.
 
 ### Task lifecycle *(opt-in: `REMOTE_TASK_LIFECYCLE_V2=1`)*

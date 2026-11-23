@@ -92,7 +92,9 @@ capability, on the core's lanes only; the wire rules are in
 not in the host's own list (aliases, runtimes, stored accounts), or any unknown id parses to None.
 `switch_account` is in `STEP_UP_ACTIONS`: never offered in the record, and confirmed by the owner
 before it runs.
-`RECEIPT_OUTCOMES` (`done`, `refused`, `stale`, `failed`) is the receipt's (`receipt.json`).
+`RECEIPT_OUTCOMES` is the receipt's (`receipt.json`): `accepted` is written with the durable
+hand-off, `executing` after the monitor claims it, then one of `done`, `refused`, `stale` or
+`failed` replaces it as the terminal outcome.
 The grammar itself lives in `src/hitl/recovery.py` (vendored into ag2-sparrow, since the bridge's
 reply handler parses the click); `parse_action_id` adds the runtime's and the host's lists to it.
 
@@ -182,8 +184,11 @@ owner when the restart did not happen. The card says "checking" until the seat i
 after an action that did not report done, it says "The block has cleared.", never "It is working
 again."
 
-The bridge logs `heartbeat carried core_recovery.v1: state=<state> incident=<id>` once per change
-of the record the broker accepted, so a live run can see the record leave the Mac.
+The core gateway also sends the newest 16 receipt files as `health.recovery_receipts`. Each row is
+reduced to the receipt contract fields before it leaves the host; sender, room and unknown fields
+never ride. Receipt changes trigger an immediate heartbeat, including when no current recovery
+record exists. The bridge logs `heartbeat carried core_recovery.v1: state=<state> incident=<id>`
+once per change of the record the broker accepted, so a live run can see the record leave the Mac.
 
 ## Contract fixtures
 

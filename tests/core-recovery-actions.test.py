@@ -1692,7 +1692,8 @@ class Contract(Base):
         [receipt] = self.run_pending(Run(), now=fixture["at"])
         self.assertEqual(receipt, {**fixture, "hitl_id": req.id, "incident": RA.incident_for(req)})
         self.assertEqual(recovery.read_receipt(self.ws, req.id), receipt)
-        self.assertEqual(set(recovery.OUTCOMES), {"done", "refused", "stale", "failed"})
+        self.assertEqual(set(recovery.OUTCOMES),
+                         {"accepted", "executing", "done", "refused", "stale", "failed"})
 
 
 if __name__ == "__main__":
