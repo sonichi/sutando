@@ -424,6 +424,17 @@ class Switch(Base):
         self.assertIn("Saved sign-in verified", out["say"])
         self.assertEqual(len(self.ready_since), 1)
 
+    def test_an_early_refusal_requests_no_restart(self):
+        (self.home / "auth.json").write_text("{not json")
+        rc, out = self.switch()
+        self.assertEqual((out["outcome"], out["restart"]), ("error", "not-requested"))
+        self.assertEqual(self.restarts, [])
+
+    def test_a_restart_that_was_put_off_was_still_requested(self):
+        self.restart_rc = 4
+        rc, out = self.switch()
+        self.assertEqual((out["outcome"], out["restart"]), ("error", "requested"))
+
     def test_codex_not_confirming_the_saved_sign_in_is_an_error(self):
         self.live_answer = {}
         rc, out = self.switch()
