@@ -415,11 +415,11 @@ def emit(payload: dict) -> None:
     print(json.dumps(payload, indent=2))
 
 
-def read_request(args: argparse.Namespace) -> str:
+def read_request(args: argparse.Namespace, stdin: Any = None) -> str:
     if args.request is not None:
         text = args.request
     elif args.request_file == "-":
-        text = sys.stdin.read(MAX_REQUEST_READ)
+        text = (stdin if stdin is not None else sys.stdin).read(MAX_REQUEST_READ)
     elif args.request_file:
         text = Path(args.request_file).read_text(encoding="utf-8")[:MAX_REQUEST_READ]
     else:
@@ -428,12 +428,12 @@ def read_request(args: argparse.Namespace) -> str:
 
 
 def cmd_start(ws: Path, args: argparse.Namespace, *, run: Run, spawn: Callable[[Path, str], int],
-              now: Callable[[], float], sleep: Callable[[float], None], **_: Any) -> int:
+              now: Callable[[], float], sleep: Callable[[float], None], stdin: Any = None, **_: Any) -> int:
     name = args.name
     if not NAME_RE.match(name):
         raise Setup("invalid_arguments", "not an MCP server name")
     origin = dm_task(ws, args.task)
-    request = read_request(args)
+    request = read_request(args, stdin)
     waits = store(ws)
 
     for marker in waits.list_markers():

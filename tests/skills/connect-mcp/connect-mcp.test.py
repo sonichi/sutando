@@ -68,6 +68,7 @@ class FakeHost:
         self.sockets: dict[str, str] = {}
         self.sends: list[tuple[str, str, tuple]] = []
         self.send_code = 0
+        self.new_session_code = 0
 
     def __call__(self, argv, timeout):
         argv = list(argv)
@@ -86,6 +87,8 @@ class FakeHost:
         assert cm.SOCKET_DIR_PREFIX in socket, f"not a login's own socket: {socket}"
         target = rest[rest.index("-t") + 1].lstrip("=").rstrip(":") if "-t" in rest else ""
         if verb == "new-session":
+            if self.new_session_code:
+                return self.new_session_code, "no server"
             session = rest[rest.index("-s") + 1]
             self.panes[session], self.sockets[session] = self.prints, socket
             return 0, ""
@@ -225,6 +228,7 @@ class StartTests(Base):
             "a collaborator": {"collaborator": "true"},
             "another source": {"source": "discord"},
             "no message": {"source_message_id": None},
+            "a channel that is not a room": {"channel_id": "not-a-room"},
         }
         for name, fields in cases.items():
             with self.subTest(name):
@@ -276,7 +280,8 @@ class StartTests(Base):
 
     def test_a_link_that_does_not_return_to_this_machine_is_not_a_link(self):
         for redirect in ("https%3A%2F%2Fevil.example%2Fcallback", "http%3A%2F%2Fevil.example%3A51234%2Fcallback",
-                         "http%3A%2F%2Flocalhost%3A51234%2Fother"):
+                         "http%3A%2F%2Flocalhost%3A51234%2Fother", "http%3A%2F%2Flocalhost%2Fcallback",
+                         "http%3A%2F%2Flocalhost%3A99999999%2Fcallback"):
             with self.subTest(redirect):
                 self.host.prints = f"https://auth.example.com/authorize?state=s&redirect_uri={redirect}\n"
                 code, out = self.start()
@@ -319,7 +324,147 @@ class StartTests(Base):
         self.assertNotIn(ROOT.resolve(), [cwd, *cwd.parents])
 
 
+class StartEdgeTests(Base):
+    def test_a_link_without_a_state_is_not_a_link(self):
+        self.host.prints = f"https://auth.example.com/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A{PORT}%2Fcallback\n"
+        code, out = self.start()
+        self.assertEqual((code, out["error"]), (2, "no_link"))
+        self.assertEqual(cm.store(self.ws).list_markers(), [])
+
+    def test_a_task_id_that_is_not_one_reads_no_file(self):
+        for task in ("../task-abc", "abc", "task-a b"):
+            with self.subTest(task):
+                code, out = self.cli(["start", "luma", "--task", task])
+                self.assertEqual((code, out["error"]), (2, "invalid_arguments"))
+        self.assertEqual(self.host.calls, [])
+
+    def test_the_request_is_read_from_stdin_or_a_file_and_kept_short(self):
+        code, out = self.cli(["start", "luma", "--task", "task-abc", "--request-file", "-"],
+                             stdin="what is   on\nluma " + "x" * 2000)
+        marker = cm.store(self.ws).read_marker(out["wait_id"])
+        self.assertEqual(code, 0)
+        self.assertTrue(marker["request"].startswith("what is on luma x"))
+        self.assertEqual(len(marker["request"]), cm.MAX_REQUEST_CHARS)
+        asked = self.ws / "asked.txt"
+        asked.write_text("my next luma event\n")
+        code, out = self.cli(["start", "other", "--task", "task-abc", "--request-file", str(asked)])
+        self.assertEqual(cm.store(self.ws).read_marker(out["wait_id"])["request"], "my next luma event")
+
+    def test_a_socket_folder_that_cannot_be_made_starts_no_login(self):
+        blocker = self.ws / "blocker"
+        blocker.write_text("")
+        with mock.patch.object(cm, "socket_path", lambda wait_id: str(blocker / f"sutando-mcp-{wait_id}" / "s")):
+            code, out = self.start()
+        self.assertEqual((code, out["error"]), (2, "login_not_started"))
+        self.assertEqual(self.host.of("tmux"), [])
+        self.assertEqual(cm.store(self.ws).list_markers(), [])
+
+    def test_a_tmux_that_will_not_start_leaves_no_wait_and_no_folder(self):
+        self.host.new_session_code = 1
+        code, out = self.start()
+        self.assertEqual((code, out["error"]), (2, "login_not_started"))
+        [new] = self.host.tmux("new-session")
+        self.assertFalse(Path(new[2]).parent.exists())
+        self.assertEqual(cm.store(self.ws).list_markers(), [])
+        self.assertEqual(self.spawned, [])
+
+    def test_a_wait_that_cannot_be_written_ends_the_login_it_started(self):
+        with mock.patch.object(cm.wait_store.WaitStore, "write_marker", side_effect=OSError("read-only")):
+            code, out = self.start()
+        self.assertEqual((code, out["error"], out["detail"]), (2, "not_written", "OSError"))
+        self.assertEqual(self.host.panes, {})
+        self.assertEqual(len(self.host.tmux("kill-server")), 1)
+        self.assertEqual(self.spawned, [])
+        self.assertNotIn("auth.example.com", self.stdout)
+
+    def test_a_waiter_that_cannot_start_still_leaves_the_card_and_the_wait(self):
+        def no_spawn(ws, wait_id):
+            raise OSError("no more processes")
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, out = self.cli(["start", "luma", "--task", "task-abc"], spawn=no_spawn)
+        self.assertEqual((code, out["waiter_pid"]), (0, None))
+        self.assertIsNotNone(out["message"])
+        self.assertIsNotNone(cm.store(self.ws).read_marker(out["wait_id"]))
+        self.assertIn("could not start the waiter", err.getvalue())
+
+    def test_a_command_that_cannot_run_or_hangs_reads_as_a_failure(self):
+        for error in (OSError("no such file"), cm.subprocess.TimeoutExpired("claude", 1)):
+            with self.subTest(type(error).__name__), mock.patch.object(cm.subprocess, "run", side_effect=error):
+                self.assertEqual(cm.run_command(["claude", "mcp", "get", "luma"], 1.0), (127, ""))
+
+    def test_the_workspace_comes_from_the_configured_one_and_falls_back_to_the_checkout(self):
+        _, out = self.start()
+        fake = mock.Mock(resolve_workspace=lambda: str(self.ws))
+        with mock.patch.dict(sys.modules, {"sutando_config": fake}):
+            shown = io.StringIO()
+            with contextlib.redirect_stdout(shown):
+                code = cm.main(["status"], run=self.host, spawn=self.spawn, now=self.clock.now)
+        self.assertEqual(code, 0)
+        self.assertEqual([p["wait_id"] for p in json.loads(shown.getvalue())["pending"]], [out["wait_id"]])
+        broken = mock.Mock(resolve_workspace=mock.Mock(side_effect=RuntimeError("unreadable config")))
+        with mock.patch.dict(sys.modules, {"sutando_config": broken}):
+            self.assertEqual(cm._workspace(), cm.REPO_ROOT / "workspace")
+
+
 class WaiterTests(Base):
+    def waiter_cli(self, wait_id):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cm.main(["--workspace", str(self.ws), "waiter", wait_id], run=self.host, spawn=self.spawn,
+                           now=self.clock.now, sleep=self.clock.sleep)
+        return code, out.getvalue()
+
+    def test_the_waiter_command_prints_its_outcome_line(self):
+        _, out = self.start()
+        code, line = self.waiter_cli(out["wait_id"])
+        self.assertEqual(code, 0)
+        self.assertTrue(line.strip().endswith(f"waiter {out['wait_id']}: timeout"), line)
+        self.assertEqual(len(self.new_tasks()), 1)
+
+    def test_the_waiter_command_refuses_what_is_not_a_wait_id(self):
+        code, line = self.waiter_cli("../../etc")
+        self.assertEqual((code, json.loads(line)["error"]), (2, "invalid_arguments"))
+        self.assertEqual(self.host.calls, [])
+        self.assertFalse((self.ws / "state").exists())
+
+    def test_a_wait_file_that_is_not_a_wait_is_set_aside_without_a_task(self):
+        _, out = self.start()
+        waits = cm.store(self.ws)
+        waits.marker_path(out["wait_id"]).write_text(json.dumps({"wait_id": out["wait_id"], "name": "luma"}))
+        self.assertEqual(self.waiter(out["wait_id"]), "invalid")
+        self.assertEqual(json.loads(waits.claimed_path(out["wait_id"]).read_text())["name"], "luma")
+        self.assertEqual(self.new_tasks(), [])
+
+    def test_a_waiter_that_loses_the_claim_writes_nothing_and_ends_nothing(self):
+        _, out = self.start()
+        self.host.status = CONNECTED
+        self.host.panes[cm.session_name(out["wait_id"])] += "\nAuthenticated\n"
+        with mock.patch.object(cm.wait_store.WaitStore, "claim", return_value=None):
+            self.assertEqual(self.waiter(out["wait_id"]), "claimed_elsewhere")
+        self.assertEqual(self.new_tasks(), [])
+        self.assertEqual(self.host.tmux("kill-server"), [])
+
+    def test_a_wait_spoiled_before_the_claim_gets_no_task(self):
+        _, out = self.start()
+        self.host.panes.clear()
+        spoiled = {"wait_id": out["wait_id"], "invalid": True}
+        with mock.patch.object(cm.wait_store.WaitStore, "claim", return_value=spoiled):
+            self.assertEqual(self.waiter(out["wait_id"]), "invalid")
+        self.assertEqual(self.new_tasks(), [])
+
+    def test_a_task_that_cannot_be_written_nor_the_wait_put_back_is_reported(self):
+        _, out = self.start()
+        self.host.panes.clear()
+        err = io.StringIO()
+        with mock.patch.object(ltp, "write_task_file", side_effect=OSError("disk full")), \
+                mock.patch.object(cm.wait_store.WaitStore, "release", return_value=False), \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(self.waiter(out["wait_id"]), "write_failed")
+        self.assertIn("not written", err.getvalue())
+        self.assertEqual(self.new_tasks(), [])
+
     def test_a_finished_login_writes_one_resume_task_and_ends_the_session(self):
         _, out = self.start()
         wait_id = out["wait_id"]
@@ -495,6 +640,26 @@ class PasteTests(Base):
         self.assertEqual(self.host.of("bash"), [])
         self.assertEqual(self.host.sends, [])
 
+    def test_an_address_whose_port_cannot_be_read_is_not_an_address(self):
+        for text in (f"http://localhost:port/callback?code={CODE}&state={STATE}",
+                     f"http://[localhost/callback?code={CODE}&state={STATE}"):
+            with self.subTest(text[:24]):
+                code, out = self.paste(text)
+                self.assertEqual((code, out["reason"]), (1, "not_an_address"))
+                self.assertNotIn(CODE, self.stdout)
+        self.assertEqual(self.host.of("bash"), [])
+
+    def test_a_paste_for_what_is_not_a_wait_id_is_a_setup_problem(self):
+        code, out = self.paste(CALLBACK, wait_id="../x")
+        self.assertEqual((code, out["error"]), (2, "invalid_arguments"))
+        self.assertEqual(self.host.of("bash"), [])
+
+    def test_a_wait_file_that_is_not_a_wait_takes_no_paste(self):
+        cm.store(self.ws).marker_path(self.wait_id).write_text("{}")
+        code, out = self.paste(CALLBACK)
+        self.assertEqual((code, out["reason"]), (1, "no_pending_wait"))
+        self.assertEqual(self.host.of("bash"), [])
+
     def test_the_loopback_address_is_the_same_listener(self):
         code, out = self.paste(CALLBACK.replace("localhost", "127.0.0.1"))
         self.assertEqual((code, out["status"]), (0, "sent"))
@@ -584,6 +749,14 @@ class CardAndRearmTests(Base):
         for wait_id in (out["wait_id"], "1789000000000-0000abcd"):
             code, card = self.cli(["card", wait_id])
             self.assertEqual((code, card["message"]), (1, None))
+
+    def test_a_wait_that_ended_without_a_word_has_no_card(self):
+        _, out = self.start()
+        cm.store(self.ws).claim(out["wait_id"], "superseded", NOW)
+        code, card = self.cli(["card", out["wait_id"]])
+        self.assertEqual((code, card["outcome"], card["message"]), (1, None, None))
+        code, bad = self.cli(["card", "../x"])
+        self.assertEqual((code, bad["error"]), (2, "invalid_arguments"))
 
     def test_rearm_starts_only_the_waiters_that_are_gone(self):
         _, first = self.start()
