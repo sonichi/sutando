@@ -263,9 +263,19 @@ class Apply(Base):
         self.assertEqual(inbox.live_inflight(self.root, both), {"task-now": {"phase": "TURN_CONFIRMED"}})
         self.assertEqual(inbox.live_inflight(self.root, None), {})
         self.assertEqual(inbox.live_inflight(self.root, ["not", "a", "dict"]), {})
-        # With no consumer holding the root there is no running session, so no turn of its.
-        with mock.patch.object(inbox.task_io, "holder_consumer", return_value=None):
-            self.assertEqual(inbox.live_inflight(self.root, both), {})
+        # The holder unknown (its record absent, or one that could not be read: both answer None) proves
+        # nothing stale, so every entry with a claim is kept; only the one with no claim at all is not.
+        for unknown in (None, {}, {"pid": None, "start": None}):
+            with mock.patch.object(inbox.task_io, "holder_consumer", return_value=unknown):
+                self.assertEqual(sorted(inbox.live_inflight(self.root, both)), ["task-now", "task-old"], unknown)
+                with mock.patch.object(model_card.records, "load_plugin", return_value={"inflight": left}):
+                    self.assertTrue(model_card.busy(self.root), "unknown is not idle")
+        from ag2_sparrow import holder_lock
+        with mock.patch.object(holder_lock, "status", side_effect=OSError("unreadable")):
+            self.assertEqual(sorted(inbox.live_inflight(self.root, both)), ["task-now", "task-old"])
+            self.assertEqual(detector.inflight_task({"inflight": inbox.live_inflight(self.root, left)}), "task-old")
+        # A holder that is read, and names another generation, is the one case that drops a claimed entry.
+        self.assertEqual(sorted(inbox.live_inflight(self.root, both)), ["task-now"])
         self.assertIn("inflight=inbox.live_inflight(self.root, plugin.get(\"inflight\"))", Path(launcher.__file__).read_text())
 
     def test_a_claim_that_cannot_be_read_or_names_no_generation_counts_as_a_turn(self):

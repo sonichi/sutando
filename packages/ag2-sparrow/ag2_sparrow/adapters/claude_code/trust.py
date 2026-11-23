@@ -121,6 +121,24 @@ def record(claude_config_dir: str, directory: str, home: str = "", wait_s: float
     return ""
 
 
+def saved_model(claude_config_dir: str) -> "tuple[str, tuple | None]":
+    """(model, stamp) of the CLI's own settings file in its config dir: the `model` it saved there ('' when
+    there is none or it cannot be read) and when the file was last written, as (mtime ns, size), None when
+    there is no file. Only that one key is read out; nothing else in the file leaves this function."""
+    if not claude_config_dir:
+        return "", None
+    path = os.path.join(claude_config_dir, "settings.json")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return "", None
+    try:
+        saved = _read(path).get("model")
+    except (OSError, ValueError):
+        saved = None
+    return (saved if isinstance(saved, str) else ""), (st.st_mtime_ns, st.st_size)
+
+
 def dialog(capture: "str | None") -> "str | None":
     """The Claude Code startup dialog a pane capture shows (folder-trust, bypass-permissions), else None."""
     if not capture or not EXIT_LINE.search(capture):

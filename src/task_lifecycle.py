@@ -85,7 +85,7 @@ LOCAL_STATE_FILES = ("claude-local-plugin.json", "claude-local-supervisor.json",
 # What claude-local's features keep beside them: the isolated turn's limiter, the live model switch's record
 # and lock, the model and account cards' records, the detached switch's log. Unnamed, each refuses the start.
 LOCAL_FEATURE_FILES = ("isolated-turns.json", "model-switch.json", "model-switch.lock", "model.json", "account.json",
-                       "model-apply.log", "quota-card.json")
+                       "model-apply.log", "quota-card.json", "quota-room.json")
 # Their directories: the cards this agent posted (issued_cards' ledger) and the card-mark answers kept for
 # a staging retry (adapters/claude_code/model_card.py). When present, each must be a plain directory.
 STATE_OPTIONAL_DIRS = frozenset(("agent-cards", "card-marks"))
