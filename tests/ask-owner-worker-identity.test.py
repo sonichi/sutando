@@ -7,7 +7,8 @@
 - The core's session, and a worker with no identity or a disabled one, queue unstamped names.
 - An ask bound for Discord, Slack or Telegram keeps its bare name, so that bridge delivers it.
 - The question records who asked (the worker's agent id when stamped) in the outbox and the row.
-- A decision card stays on the core's path: no asker, no stamped text beside it or in its fallback.
+- A worker's decision card names the worker (`by_worker`, its title, its asker) so only its own lane
+  posts it, and its text fallback is the worker's; the core's card is unchanged.
 - The identity is read from the workspace passed in, not the default one.
 - A worker's own-agent ask names the worker as "<name> (a worker on <host>)" (its agent's display
   name, else its roster label), else just "a worker on <host>"; the name is bounded, stripped of
@@ -233,7 +234,7 @@ class StoreAdapterAsk(_Ws):
         [name] = self.proactive()
         self.assertEqual((pr.proactive_worker(name), out["question"]["asked_by"]), (W, AGENT))
 
-    def test_a_decision_card_stays_the_cores_with_no_asker_and_no_stamped_text_beside_it(self):
+    def test_a_workers_decision_card_names_the_worker_for_its_own_lane(self):
         (self.ws / "state" / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space"}))
         from hitl.manager import HitlManager, HitlStore
         manager = HitlManager(HitlStore(self.ws / "state" / "hitl" / "requirements"))
@@ -242,11 +243,49 @@ class StoreAdapterAsk(_Ws):
                                      options=[("Hold", "wait")], manager=manager)
             self.assertEqual(pqa.create_card(out), pqa.CARD_STORED)
         self.assertEqual(self.proactive(), [], "the card is the ask; no text is queued")
-        self.assertIsNone(out["question"]["asked_by"], "the card is the core's")
+        self.assertEqual(out["question"]["asked_by"], AGENT)
         [q] = self.outbox_questions()
-        self.assertIsNone(q["asked_by"])
+        self.assertEqual(q["asked_by"], AGENT)
+        card = manager.get(out["card"])
+        self.assertEqual(card.subject.get("by_worker"), W, "only that worker's lane posts it")
+        self.assertNotIn("core", card.title)
+        self.assertTrue(pr.lane_claims_card(card.subject.get("by_worker"), W))
+        self.assertFalse(pr.lane_claims_card(card.subject.get("by_worker"), "", primary=True))
 
-    def test_a_card_that_cannot_be_stored_falls_back_to_the_cores_text(self):
+    def test_a_workers_card_pointer_goes_through_its_own_lane(self):
+        from hitl.manager import HitlManager, HitlStore
+        manager = HitlManager(HitlStore(self.ws / "state" / "hitl" / "requirements"))
+        (self.ws / "state" / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space"}))
+        with self.as_worker():
+            out = pqa.queue_question("Merge it?", workspace=self.ws, host=HOST, default_action="merge",
+                                     options=[("Hold", "wait")], manager=manager)
+            pqa.create_card(out)
+        results, name = pqa.pointer_target(manager, out["card"], self.ws, "proactive-1-pointer.txt")
+        self.assertEqual(pr.proactive_worker(name), W)
+        self.assertEqual(results, self.ws / "results")
+        core = pqa.queue_question("Core?", workspace=self.ws, host=HOST, default_action="merge",
+                                  options=[("Hold", "wait")], manager=manager)
+        pqa.create_card(core)
+        self.assertEqual(pqa.pointer_target(manager, core["card"], self.ws, "proactive-2-pointer.txt"),
+                         (self.ws / "results", "proactive-2-pointer.txt"))
+
+    def test_the_cores_decision_card_is_the_primarys(self):
+        (self.ws / "state" / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space"}))
+        from hitl.manager import HitlManager, HitlStore
+        manager = HitlManager(HitlStore(self.ws / "state" / "hitl" / "requirements"))
+        for worker in (None, "w-noid"):
+            with self.subTest(worker=worker), self.as_worker(worker):
+                out = pqa.queue_question(f"Merge it {worker}?", workspace=self.ws, host=HOST,
+                                         default_action="merge", options=[("Hold", "wait")], manager=manager)
+                self.assertEqual(pqa.create_card(out), pqa.CARD_STORED)
+                card = manager.get(out["card"])
+                self.assertNotIn("by_worker", card.subject)
+                self.assertEqual(card.title, f"Question from the {HOST} core")
+                self.assertIsNone(out["question"]["asked_by"])
+                self.assertTrue(pr.lane_claims_card(None, "", primary=True))
+                self.assertFalse(pr.lane_claims_card(None, "", primary=False))
+
+    def test_a_workers_card_that_cannot_be_stored_falls_back_to_the_workers_text(self):
         (self.ws / "state" / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space"}))
         manager = mock.Mock()
         manager.create.side_effect = OSError("store refused")
@@ -256,8 +295,8 @@ class StoreAdapterAsk(_Ws):
                                      options=[("Hold", "wait")], manager=manager)
             self.assertEqual(pqa.create_card(out), pqa.CARD_NOT_STORED)
         [name] = self.proactive()
-        self.assertIsNone(pr.proactive_worker(name), "a core card's fallback text is the core's")
-        self.assertIsNone(out["question"]["asked_by"])
+        self.assertEqual(pr.proactive_worker(name), W, "the fallback goes through the worker's own lane")
+        self.assertEqual(out["question"]["asked_by"], AGENT)
 
 
 class NoStoreAsk(_Ws):
@@ -450,7 +489,7 @@ class AskerWording(_Ws):
         [q] = self.outbox_questions()
         self.assertEqual(q["question"], "Merge #12 now?", "the question is still held")
 
-    def test_a_decision_cards_text_fallback_stays_the_cores(self):
+    def test_a_decision_cards_text_fallback_names_the_worker(self):
         self.record(agent_display_name="Helper")
         (self.ws / "state" / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space"}))
         manager = mock.Mock()
@@ -461,8 +500,9 @@ class AskerWording(_Ws):
                                      options=[("Hold", "wait")], manager=manager)
             pqa.create_card(out)
         [name] = self.proactive()
-        self.assertEqual((self.ws / "results" / name).read_text().splitlines()[1], self.CORE_LEAD)
-
+        lead = (self.ws / "results" / name).read_text().splitlines()[1]
+        self.assertNotEqual(lead, self.CORE_LEAD)
+        self.assertIn("Helper", lead)
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
