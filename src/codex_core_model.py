@@ -66,8 +66,8 @@ def read_record(state_dir) -> dict:
     return data
 
 
-def _rev(rec: dict) -> int:
-    rev = rec.get("rev")
+def _rev(rec: dict, key: str = "rev") -> int:
+    rev = rec.get(key)
     return rev if isinstance(rev, int) and not isinstance(rev, bool) and rev > 0 else 0
 
 
@@ -138,7 +138,7 @@ def confirm(state_dir, model: str, rev: int) -> bool:
         return False
     with _locked(state_dir):
         rec = read_record(state_dir)
-        if not rec or int(rec.get("confirmed_rev") or 0) > rev:
+        if not rec or _rev(rec, "confirmed_rev") > rev:
             return False
         rec["confirmed"], rec["confirmed_rev"] = model, rev
         _write(state_dir, rec)
@@ -155,7 +155,7 @@ def resolve(state_dir, rev: int, accepted: bool, reason: str = "") -> Optional[d
         rec["status"], rec["accepted"] = ("accepted" if accepted else "rejected"), bool(accepted)
         if accepted:
             rec["working"] = rec["confirmed"] = rec["model"]
-            rec["confirmed_rev"] = max(rev, int(rec.get("confirmed_rev") or 0))
+            rec["confirmed_rev"] = max(rev, _rev(rec, "confirmed_rev"))
         else:
             rec["rejected_reason"] = " ".join(str(reason).split())[:240]
         _write(state_dir, rec)
@@ -177,9 +177,8 @@ def save(state_dir, model: str, *, applied: str, accepted: bool, now: Optional[f
            "runtime": RUNTIME, "accepted": bool(accepted), "status": "accepted" if accepted else "pending",
            "working": model if accepted else (working(old) or None), "rev": _rev(old) + 1,
            "applied": applied, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "by": BY}
-    for key in ("confirmed", "confirmed_rev"):  # a turn's confirmation outlives later picks
-        if old.get(key):
-            rec[key] = old[key]
+    if valid(old.get("confirmed") or "") and _rev(old, "confirmed_rev"):  # outlives later picks
+        rec["confirmed"], rec["confirmed_rev"] = old["confirmed"], old["confirmed_rev"]
     if accepted:
         rec["confirmed"], rec["confirmed_rev"] = model, rec["rev"]
     _write(state_dir, rec)
