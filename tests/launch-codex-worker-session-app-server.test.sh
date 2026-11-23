@@ -166,9 +166,16 @@ check $? "an unstamped earlier seat, then a TUI launch: the session is the TUI w
 launch launch-codex-worker-session.sh SUTANDO_CODEX_APP_SERVER=1 SUTANDO_WORKER_INCARNATION_ID=i-live-seat
 decl_before="$(cat "$DECL")"; touch "$TMP/race-once"
 launch_keep launch-codex-worker-session.sh SUTANDO_CODEX_APP_SERVER=0 SUTANDO_WORKER_INCARNATION_ID=i-losing-tui
+[ $? = 75 ]; check $? "a TUI launch that loses to a live seat: exit 75, the launch-lost code"
+! grep -q -- "-observer" "$TMP/tmux.log"; check $? "a TUI launch that loses to a live seat: no observer is started for the winner's session"
 grep -q "new-session -d -s $SESSION .* codex -C " "$TMP/tmux.log" && [ "$(cat "$DECL" 2>/dev/null)" = "$decl_before" ] \
   && [ "$(cat "$(dirname "$DECL")/incarnation" 2>/dev/null)" = "i-live-seat" ]
 check $? "a TUI launch that loses to a live seat: the seat's declaration and run stamp are untouched"
+launch launch-codex-worker-session.sh SUTANDO_CODEX_APP_SERVER=1 SUTANDO_WORKER_INCARNATION_ID=i-live-seat
+touch "$TMP/race-once"
+launch_keep launch-codex-worker-session.sh SUTANDO_CODEX_APP_SERVER=1 SUTANDO_WORKER_INCARNATION_ID=i-losing-seat
+[ $? = 75 ] && [ "$(cat "$(dirname "$DECL")/incarnation" 2>/dev/null)" = "i-live-seat" ]
+check $? "a seat launch that loses to a live seat: exit 75 and the winner's run stamp is kept"
 
 # --- 3. flag on, a worker on its own folders: a plain inbox, no payload store ---
 # Only a launcher that accepts a worker without a resolver has this case.
