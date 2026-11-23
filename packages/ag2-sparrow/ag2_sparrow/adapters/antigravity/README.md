@@ -244,22 +244,26 @@ resumed (resuming a sign-in Session still bills the Google account's quota), a n
 
 ## The account card
 
-In the owner's DM (Commons "切换账号 / API key 需求", part A). The owner says 换账号 / switch account /
-用 API key (or `/account`, or the turn answers with the card's mark) and gets a card with 「切换账号」 and
-「用 API key」 (plus 「停用 API key」 while a key is saved). Only the owner's tap in their DM acts.
+In the owner's DM (Commons "switch account / API key", part A). The owner says "switch account" or "use
+API key" (in English or Chinese, or `/account`, or the turn answers with the card's mark) and gets a card
+with "Switch account" and "Use API key" (plus "Stop using API key" while a key is saved). Its words are
+English only. Only the owner's tap in their DM acts.
 
 No secret is taken in chat: in the web client every card reply and card input is sent as a room message.
+The card instead carries `account_controls` (`{"runtime": "antigravity", "agent": <mxid>}`): in the desktop
+app, on the computer that runs the agent, the owner's DM draws the agent's account controls (switch
+account with the code field, API key field) right in the card, and nothing typed there reaches the room.
+Anywhere else the client shows "Open this on the computer that runs <agent> to switch account."
 
-- **切换账号** points to the agent's settings, Connections, Antigravity row, "Switch account": the desktop
-  runs `agy acp --login` in its sign-in terminal, whose paste box takes the code (desktop
-  `agent_account_switch`). agy keeps one Google sign-in per Mac, so this moves every Antigravity agent here;
-  the card says so.
+- **Switch account** (a client without the in-card controls) says to open the card on the computer that
+  runs the agent, where the desktop runs `agy acp --login` headless (`agent_account_switch`). agy keeps one
+  Google sign-in per Mac, so this moves every Antigravity agent here; the card says so.
 - **The turn after a switch says so.** Each owner turn reads the account agy authenticated as from agy's own
   log (`~/.gemini/antigravity-cli/log/acp-server-*-<pid>.log`, `applyAuthResult: email=...`); when it differs
-  from the last one seen the answer starts with 已切到 <a…@domain> 账号. Only the shortened address is kept
+  from the last one seen the answer starts with (Switched to the <a…@domain> account.). Only the shortened address is kept
   (`state/agy-account.json`).
-- **用 API key** points to that row's API key box (the Keychain item `gemini_key` reads).
-- **停用 API key** deletes this agent's own Keychain item; the next turn opens a fresh Session on the sign-in.
+- **Use API key** says the same for the key field (the Keychain item `gemini_key` reads).
+- **Stop using API key** deletes this agent's own Keychain item; the next turn opens a fresh Session on the sign-in.
 - **A code or key sent in chat** (a Google sign-in code `4/...`, an address with `code=`, a Gemini key, or the
   bridge's `[REDACTED-Google API Key]`) is never passed to agy: the sender is asked to delete the message.
 - **Quota.** A turn that fails with `RESOURCE_EXHAUSTED` / "Individual quota reached" / a 429 makes the

@@ -590,7 +590,7 @@ class Connector:
         self.agy_pid = None   # the owner turn's agy process, whose own log names the account it used
         # Out of quota: the account card, unasked, in the owner's DM, once per limit (quota_notice).
         self.quota = quota_notice.QuotaNotice(args.state, getattr(args, "bridge_state", None), NAME,
-                                              self.accounts.quota_card, self.accounts.using_words, log)
+                                              self.accounts.quota_card, self.accounts.using, log)
         self.desk = card_desk.Desk(self.root, card_desk.led(publish, self.models.unsaid, quoted), quoted,
                                    [self.models, self.accounts])
 
