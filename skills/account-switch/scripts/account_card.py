@@ -2,6 +2,7 @@
 """A card in the owner's DM that says which account the core is signed in to and switches it.
 
     python3 account_card.py [--workspace WS] post --room ROOM [--reply-to EVENT] [--print]
+    python3 account_card.py [--workspace WS] post --owner-dm [--lead TEXT]
     python3 account_card.py [--workspace WS] reply --task-file PATH
     python3 account_card.py [--workspace WS] switch --room ROOM --key KEY --attempt ID
     python3 account_card.py [--workspace WS] status
@@ -9,7 +10,9 @@
 `post` sends the card to the owner's checked DM and records it (src/issued_cards.py), so only the
 owner's tap on it acts (agent_card.click_verdict). It names the account in use: on a Codex core
 (TUI or app-server seat) from src/codex_account.py, on a Claude core from `claude auth status --json`
-under the core's config dir. Addresses are shown masked (first letter and domain).
+under the core's config dir. Addresses are shown masked (first letter and domain). `--owner-dm`
+posts to the core lane's checked owner DM, and `--lead` puts a line before the card's words (the
+core's quota notice, src/core_quota_notice.py, says why it was sent unasked).
 
 Saved accounts are the desktop's store for the Sutando core on Codex
 (`<app support>/accounts/codex/<key>.json`, {label, auth}, folder 0700, files 0600; desktop
@@ -299,8 +302,9 @@ def in_use_words(cur: dict) -> str:
 
 # ── the card ──────────────────────────────────────────────────────────────────────────────────────
 
-def menu_card(cur: dict, others: list) -> tuple:
-    """(body, card): a "Use" button per other saved account (up to five), then "Add another account"."""
+def menu_card(cur: dict, others: list, lead: str = "") -> tuple:
+    """(body, card): a "Use" button per other saved account (up to five), then "Add another account".
+    `lead`, when given, opens the card's words and its fallback line."""
     buttons = []
     for s in others[:USE_BUTTONS]:
         label = ("Use " + masked_label(s["label"]))[: ac.LIMITS["label"]]
@@ -315,8 +319,11 @@ def menu_card(cur: dict, others: list) -> tuple:
     else:
         more = " To use another Anthropic account, add it in Settings."
     note = f"{NO_CODE} Adding an account happens in Settings, where the app takes the code."
-    return ac.build(CARD_ID, "info", title="Core account", avatar_=ac.avatar(initial="A"), text=using + more,
-                    buttons=buttons, note=note, note_tone="dim", body=f"{using} Reply \"switch account\" for options.")
+    lead = ac.md_escape(lead)[:1000]
+    first = lead + " " if lead else ""
+    return ac.build(CARD_ID, "info", title="Core account", avatar_=ac.avatar(initial="A"),
+                    text=first + using + more, buttons=buttons, note=note, note_tone="dim",
+                    body=f"{first}{using} Reply \"switch account\" for options.")
 
 
 def notice_card(state: str, status: str, words: str) -> tuple:
@@ -399,14 +406,23 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time, run=subp
             pass  # the card still names the account; only the copy for switching back is missing
     others = [s for s in saved(store, cur["key"]) if not s["current"]]
     try:
-        body, card = menu_card(cur, others)
+        body, card = menu_card(cur, others, getattr(args, "lead", "") or "")
     except ac.CardError as e:
         return _emit({"status": "failed", "why": str(e)}, 1)
     if args.print:
         return _emit({"body": body, "card": card, "handler": HANDLER})
     shown = [s["key"] for s in others[:USE_BUTTONS]]
     tag = hashlib.sha256(",".join(shown).encode()).hexdigest()[:12]
-    out = _post(ws, args.room, body, card, f"account-card:menu:{int(now())}:{tag}", reply_to=args.reply_to or "",
+    room = args.room
+    if getattr(args, "owner_dm", False):
+        try:
+            core = core if core is not None else _core(ws)
+            room = _owner_dm(ws, core)
+        except Exception as e:  # noqa: BLE001 - no core lane: named, nothing posted
+            return _emit({"status": "failed", "why": f"{type(e).__name__}: {e}"}, 1)
+        if not room:
+            return _emit({"status": "failed", "why": "no checked owner DM for the core"}, 1)
+    out = _post(ws, room, body, card, f"account-card:menu:{int(now())}:{tag}", reply_to=args.reply_to or "",
                 core=core, execute=execute)
     if out.get("event_id"):
         try:
@@ -728,8 +744,11 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, run=subp
     p.add_argument("--workspace", default=None)
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("post")
-    s.add_argument("--room", required=True)
+    to = s.add_mutually_exclusive_group(required=True)
+    to.add_argument("--room")
+    to.add_argument("--owner-dm", action="store_true", help="the core lane's checked owner DM")
     s.add_argument("--reply-to", default="")
+    s.add_argument("--lead", default="", help="a line that opens the card's words")
     s.add_argument("--print", action="store_true")
     r = sub.add_parser("reply")
     r.add_argument("--task-file", required=True)
