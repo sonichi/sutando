@@ -136,8 +136,8 @@ def step(manager, workspace: Path, session: str, runtime: Optional[str],
         reset = recovery.parse(f"{recovery.RESET_SERVICE}:{svc['service']}") if svc["resettable"] else None
         lines = [f"{svc['service']} keeps crashing, so the app stopped restarting it ({svc['reason']}).",
                  "", f"Last error: {svc['error'] or 'not recorded'}", "",
-                 f"Tap Start {svc['service']} again to have the app try it once more, or restart the s.space "
-                 "app on the Mac it runs on." if reset else
+                 f"Tap Start {svc['service']} again to have the app try it once more, or restart the app "
+                 "on the Mac it runs on." if reset else
                  "It stays stopped until the s.space app restarts on the Mac it runs on."]
         want[guard] = HumanRequirement(
             kind="core-blocked", runtime=runtime or "claude", message="\n".join(lines),
@@ -159,7 +159,7 @@ def step(manager, workspace: Path, session: str, runtime: Optional[str],
                  if isinstance(count, int) else "My core keeps crashing.",
                  "", f"Last error: {error or 'not recorded'}", ""]
         if gave_up:
-            lines += ["The s.space app could not revive it after repeated tries and now retries only "
+            lines += ["The desktop app could not revive it after repeated tries and now retries only "
                       "every few minutes.", ""]
         lines.append("Tap Restart core to start it fresh.")
         want[guard] = HumanRequirement(
