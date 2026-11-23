@@ -1131,10 +1131,14 @@ class AccountCardTest(CardWorld, unittest.TestCase):
     def test_the_card_names_the_account_and_a_tap_signs_in_and_says_which_account_is_used_now(self):
         (self.home / "stub-login").write_text("success bob@example.org")
         card = self.tap()
-        self.assertEqual(card["text"], "I'm signed in as a…@example.com (pro).")
+        self.assertEqual(card["text"], "I'm signed in as a…@example.com (pro). Switch this agent's account or API key below.")
+        # The marker the desktop app draws this agent's account controls from, in the card itself.
+        self.assertEqual(card["account_controls"], {"runtime": "codex"})
+        self.assertFalse(re.search(r"[\u4e00-\u9fff]", json.dumps(card, ensure_ascii=False)), "English only")
         self.assertEqual(result(self.work, "task-tap"), "[no-send] the account card answers\n")
         self.assertEqual(self.opened, ["https://stub.invalid/sign-in?id=login-1"], "the page is shown on this computer")
         (_, started), (room, done) = self.posted("$card2")
+        self.assertNotIn("account_controls", started, "a notice is not the account card")
         self.assertEqual((started["state"], [(b["kind"], b["url"]) for b in started["buttons"]]),
                          ("info", [("url", "https://stub.invalid/sign-in?id=login-1")]))
         self.assertEqual(started["text"], "I opened the sign-in page in the browser on the computer I run on. Finish "
@@ -1184,7 +1188,7 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         (self.home / "stub-account").write_text("")
         self.serve("task-3", "/account")
         ((_, card),) = self.posted()
-        self.assertEqual(card["text"], "I'm not signed in.")
+        self.assertEqual(card["text"], "I'm not signed in. " + account_switch.BELOW)
 
     def test_a_sign_in_page_that_is_not_an_https_address_is_never_opened_and_the_sign_in_is_given_up(self):
         for n, page in enumerate(("-a/Applications/Calculator.app", "file:///etc/hosts", "http://stub.invalid/x",

@@ -121,7 +121,13 @@ class ModelSwitch:
         seen = {"available": [{"id": str(mid)[:200], "name": " ".join(str(name or mid).split())[:80] or str(mid)[:80]}
                               for mid, name in offered if self.ok(mid)],
                 "current": str(current or "")[:200]}
-        if {k: self.state().get(k) for k in seen} != seen:
+        state = self.state()
+        # A runtime may report its own default as current before the turn's switch (agy advertises
+        # currentModelId on every session/new and session/load, then the turn's session/set_model
+        # moves it): while the owner's pick is in force the model in use is the one turns run on.
+        if state.get("wanted") and state.get("told") == state.get("wanted") == state.get("confirmed"):
+            seen["current"] = str(state.get("current") or "")
+        if {k: state.get(k) for k in seen} != seen:
             self.save(**seen)
 
     def words(self, state: dict, picked: str = "", ran: "str | None" = None, same: bool = False, why: str = "") -> str:
@@ -298,6 +304,10 @@ class ModelSwitch:
                                                    else {"wanted": ""}))
         elif unkeyed:
             self.save(untold=owed)
+        if (wanted and state.get("told") == wanted and state.get("confirmed") == wanted and live
+                and (ran or "") == wanted and state.get("current") != wanted):
+            # A pick already told and confirmed, and this turn ran on it: it is the model in use.
+            self.save(current=wanted)
         told, words = "", []
         while owed:
             first = {"picked": str(owed[0].get("picked") or ""), "ran": str(owed[0].get("ran") or ""),

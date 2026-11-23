@@ -332,7 +332,13 @@ def main():
                 remember_dirs(params["sessionId"], params)
                 launch(params.get("mcpServers"), loading=True)
                 chunk(params["sessionId"], "replayed history")
-                send({"jsonrpc": "2.0", "id": rid, "result": {}})
+                # With `models-on-load`, a loaded Session advertises the models with agy's default as
+                # current, as agy 1.5.13 does ("Advertising available models: current=…"), whatever
+                # an earlier session/set_model chose.
+                loaded = {}
+                if os.path.exists(os.path.join(HOME, "models")) and os.path.exists(os.path.join(HOME, "models-on-load")):
+                    loaded["models"] = MODELS
+                send({"jsonrpc": "2.0", "id": rid, "result": loaded})
             else:
                 send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": "session not found"}})
         elif method == "session/prompt":
