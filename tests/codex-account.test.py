@@ -4,6 +4,10 @@ synthetic (an unsigned JWT made here) and `codex` is a stub app-server that answ
 from a plan file."""
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ()
+
 import base64
 import contextlib
 import io
