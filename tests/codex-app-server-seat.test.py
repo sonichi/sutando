@@ -123,6 +123,13 @@ for line in sys.stdin:
         else:
             out({"id": rid, "error": {"code": -32600, "message": "no rollout found"}})
     elif method == "turn/start":
+        try:
+            refused = open(os.path.join(D, "refuse-model")).read().strip()
+        except OSError:
+            refused = ""
+        if refused and p.get("model") == refused:
+            out({"id": rid, "error": {"code": -32602, "message": "model %s is not supported" % refused}})
+            continue
         step = plan()
         if step == "refuse":
             out({"id": rid, "error": {"code": -32000, "message": "thread is busy"}})
@@ -875,32 +882,78 @@ class CoreModelSwitch(SeatCase):
     """The Codex core's switch (switch-model.sh, src/codex_core_model.py) reaches the core seat's next
     turn; it is core-only, so a worker's seat never reads it (TestWorker below)."""
 
-    def switch(self, model):
-        seat_mod.codex_core_model.save(self.ws / "state", model, applied="next-turn", accepted=True)
+    def switch(self, model, accepted=False):
+        return seat_mod.codex_core_model.save(self.ws / "state", model, applied="next-turn", accepted=accepted)
 
-    def test_a_switch_after_the_seat_started_is_the_next_turns_model_and_stays(self):
-        s = self.make(model="gpt-old")
-        s.started_at = time.time() - 60
+    def record(self):
+        return json.loads((self.ws / "state" / "model-switch.json").read_text())
+
+    def launched(self, rev, **kw):
+        """A seat whose launcher read the record at revision `rev` (SUTANDO_CORE_MODEL_REV)."""
+        with mock.patch.dict(os.environ, {"SUTANDO_CORE_MODEL_REV": str(rev)}):
+            return self.make(**kw)
+
+    def test_a_pick_after_the_launch_is_the_next_turns_model_and_codex_taking_it_settles_it(self):
+        self.switch("gpt-old", accepted=True)
+        s = self.launched(1, model="gpt-old")
         self.switch("gpt-new")
         self.task("task-1.txt")
         self.assertEqual(s.serve(once=True), 0)
         self.assertEqual([r["params"].get("model") for r in self.sent("turn/start")], ["gpt-new"])
         self.assertEqual(s.model, "gpt-new", "a restarted child resumes the thread on it too")
         self.assertEqual(s.thread_params()["model"], "gpt-new")
-        self.assertIn("model: gpt-new from the core's switch", self.out.getvalue())
+        self.assertEqual((self.record()["status"], self.record()["working"]), ("accepted", "gpt-new"))
 
-    def test_a_switch_recorded_before_the_seat_started_is_left_to_the_launch_model(self):
+    def test_a_pick_saved_between_the_launchers_read_and_the_seats_start_is_not_dropped(self):
+        self.switch("gpt-launched", accepted=True)  # rev 1: what the launcher read and passed as --model
+        self.switch("gpt-during-startup")           # rev 2: saved before the seat came up
+        s = self.launched(1, model="gpt-launched")
+        self.task("task-1.txt")
+        self.assertEqual(s.serve(once=True), 0)
+        self.assertEqual([r["params"].get("model") for r in self.sent("turn/start")], ["gpt-during-startup"])
+
+    def test_the_pick_the_launch_consumed_is_not_sent_again_but_is_settled_by_the_first_turn(self):
         self.switch("gpt-launched")
-        s = self.make(model="gpt-launched")
-        s.started_at = time.time() + 60
+        s = self.launched(1, model="gpt-launched")
         self.task("task-1.txt")
         self.assertEqual(s.serve(once=True), 0)
         self.assertEqual([("model" in r["params"]) for r in self.sent("turn/start")], [False])
+        self.assertEqual(self.record()["status"], "accepted")
+
+    def test_a_pick_codex_refuses_keeps_the_working_model_runs_the_task_and_tells_the_owner(self):
+        self.switch("gpt-old", accepted=True)
+        s = self.launched(1, model="gpt-old")
+        self.switch("gpt-bad")
+        (self.fake_dir / "refuse-model").write_text("gpt-bad")
+        self.task("task-1.txt")
+        self.assertEqual(s.serve(once=True), 0)
+        self.assertEqual([r["params"].get("model") for r in self.sent("turn/start")], ["gpt-bad", "gpt-old"])
+        self.assertTrue((self.results / "task-1.txt").exists(), "the task still ran, on the working model")
+        rec = self.record()
+        self.assertEqual((rec["status"], rec["working"]), ("rejected", "gpt-old"))
+        self.assertIn("not supported", rec["rejected_reason"])
+        self.assertEqual(seat_mod.codex_core_model.current(self.ws / "state"), "gpt-old")
+        self.assertEqual((s.model, s.thread_params()["model"]), ("gpt-old", "gpt-old"))
+        notice, = self.results.glob("proactive-model-refused-*.txt")
+        self.assertIn("stays on gpt-old", notice.read_text())
+        self.task("task-2.txt")
+        self.assertEqual(s.serve(once=True), 0)
+        self.assertEqual(len(self.sent("turn/start")), 3, "the refused pick is not retried")
+        self.assertNotIn("gpt-bad", json.dumps(self.sent("turn/start")[2]["params"]))
+
+    def test_a_turn_codex_fails_over_the_model_puts_the_working_model_back_for_the_next_turn(self):
+        s = self.launched(0, model="gpt-old")
+        s.trial = ("gpt-bad", 1, "gpt-old")
+        self.switch("gpt-bad")
+        s.model = "gpt-bad"
+        s.settle_model(False, "The 'gpt-bad' model does not exist")
+        self.assertEqual(self.record()["status"], "rejected")
+        self.assertEqual(s.turn_model(), "gpt-old", "the thread is moved back off the refused model")
+        self.assertEqual(s.turn_model(), "")
 
     def test_a_claude_cores_record_is_never_a_codex_model(self):
         (self.ws / "state" / "model-switch.json").write_text(json.dumps({"model": "opus", "accepted": True}))
-        s = self.make()
-        s.started_at = time.time() - 60
+        s = self.launched(0)
         self.assertEqual(s.turn_model(), "")
 
 
@@ -949,8 +1002,7 @@ class Worker(SeatCase):
         # Core and worker models are separate: the core's switch record is never a worker's model.
         self.deliver("task-1")
         s = self.worker_seat(stage=[sys.executable, str(self.hook)], model="gpt-worker")
-        s.started_at = time.time() - 60
-        seat_mod.codex_core_model.save(self.ws / "state", "gpt-core", applied="next-turn", accepted=True)
+        seat_mod.codex_core_model.save(self.ws / "state", "gpt-core", applied="next-turn", accepted=False)
         s.ensure_server()
         self.assertEqual(s.step(), "done")
         self.assertEqual([("model" in r["params"]) for r in self.sent("turn/start")], [False])

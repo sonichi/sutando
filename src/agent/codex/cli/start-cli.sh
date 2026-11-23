@@ -285,17 +285,24 @@ CODEX_ARGS=(
 )
 # The Codex core's own pick (skills/model-switch, src/codex_core_model.py) when this launch sets no
 # SUTANDO_CORE_MODEL: core-only, so the pool's Codex workers, which share CODEX_HOME, keep theirs.
-if [ -z "${SUTANDO_CORE_MODEL:-}" ] && [ -n "$(heartbeat_python)" ]; then
+# Its revision is handed on (SUTANDO_CORE_MODEL_REV), so a pick saved after this read is still taken.
+if [ -n "$(heartbeat_python)" ]; then
   _model_ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
-  _model_rec=""
+  _model_line=""
   if [ -n "$_model_ws" ]; then
-    _model_rec="$("$(heartbeat_python)" "$REPO/src/codex_core_model.py" current --state-dir "$_model_ws/state" 2>/dev/null || true)"
+    _model_line="$("$(heartbeat_python)" "$REPO/src/codex_core_model.py" launch --state-dir "$_model_ws/state" 2>/dev/null || true)"
   fi
-  if [ -n "$_model_rec" ]; then
-    SUTANDO_CORE_MODEL="$_model_rec"
-    echo "  ✓ Codex core model: $_model_rec (the core's last switch, $_model_ws/state/model-switch.json)"
-  fi
-  unset _model_ws _model_rec
+  case "$_model_line" in
+    [0-9]*" "?*)
+      SUTANDO_CORE_MODEL_REV="${_model_line%% *}"
+      _model_rec="${_model_line#* }"
+      if [ -z "${SUTANDO_CORE_MODEL:-}" ] && [ "$_model_rec" != "-" ]; then
+        SUTANDO_CORE_MODEL="$_model_rec"
+        echo "  ✓ Codex core model: $_model_rec (the core's last switch, $_model_ws/state/model-switch.json)"
+      fi
+      ;;
+  esac
+  unset _model_ws _model_line _model_rec
 fi
 if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   CODEX_ARGS+=(-m "$SUTANDO_CORE_MODEL")

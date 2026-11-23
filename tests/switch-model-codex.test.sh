@@ -27,8 +27,9 @@ rc=$(run -- '-m'); [ "$rc" = 2 ] && ok "3 a flag-looking name is refused" || fai
 rc=$(run gpt-6-luna --dry-run); [ "$rc" = 0 ] && [ ! -e "$T/state/model-switch.json" ] && grep -q "core-only" "$T/out" && ok "4 --dry-run writes nothing" || fail "4" "rc=$rc $(cat "$T/out")"
 
 rc=$(TMUX_PANES="$SEAT" run gpt-6-luna); R=$(rec)
-[ "$rc" = 0 ] && [ "$R" = "gpt-6-luna codex True next-turn None" ] && grep -q "next task" "$T/out" \
-  && ok "5 app-server seat: rc=0, recorded core-only for the next turn" || fail "5" "rc=$rc R=$R $(cat "$T/err")"
+S=$(python3 -c "import json;print(json.load(open('$T/state/model-switch.json'))['status'])")
+[ "$rc" = 0 ] && [ "$R" = "gpt-6-luna codex False next-turn None" ] && [ "$S" = pending ] && grep -q "next task" "$T/out" \
+  && ok "5 app-server seat: rc=0, recorded core-only and pending until Codex runs the next turn on it" || fail "5" "rc=$rc R=$R S=$S $(cat "$T/err")"
 rc=$(TMUX_PANES="$TUI" run gpt-5.6-terra); R=$(rec)
 [ "$rc" = 11 ] && [ "$R" = "gpt-5.6-terra codex False next-start gpt-6-luna" ] && grep -q "next start" "$T/err" \
   && ok "6 Codex TUI: rc=11, saved for the core's next start, previous kept" || fail "6" "rc=$rc R=$R $(cat "$T/err")"

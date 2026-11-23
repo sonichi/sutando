@@ -60,12 +60,39 @@ class Record(Case):
             ccm.record_path(self.state).write_text(text)
             self.assertEqual(ccm.current(self.state), "", text)
 
-    def test_newer_than_reads_only_a_record_written_after_the_moment(self):
-        self.assertEqual(ccm.newer_than(self.state, 0), "", "no record")
+    def test_each_save_is_one_revision_and_a_seat_pick_is_pending_on_the_working_model(self):
+        self.assertEqual((ccm.revision(self.state), ccm.launch(self.state)), (0, (0, "")))
         ccm.save(self.state, "gpt-a", applied="next-turn", accepted=True)
-        mtime = ccm.record_path(self.state).stat().st_mtime
-        self.assertEqual(ccm.newer_than(self.state, mtime - 1), "gpt-a")
-        self.assertEqual(ccm.newer_than(self.state, mtime + 1), "")
+        rec = ccm.save(self.state, "gpt-b", applied="next-turn", accepted=False)
+        self.assertEqual((rec["rev"], rec["status"], rec["working"], rec["previous"]), (2, "pending", "gpt-a", "gpt-a"))
+        self.assertEqual(ccm.pending(self.state), ("gpt-b", 2))
+        self.assertEqual(ccm.launch(self.state), (2, "gpt-b"))
+
+    def test_a_refused_pick_leaves_the_working_model_in_use(self):
+        ccm.save(self.state, "gpt-a", applied="next-turn", accepted=True)
+        ccm.save(self.state, "gpt-bad", applied="next-turn", accepted=False)
+        rec = ccm.resolve(self.state, 2, False, "model not supported")
+        self.assertEqual((rec["status"], rec["accepted"], rec["rejected_reason"]), ("rejected", False, "model not supported"))
+        self.assertEqual(ccm.current(self.state), "gpt-a")
+        self.assertEqual(ccm.launch(self.state), (2, "gpt-a"), "a restart is not retried on the refused pick")
+        self.assertEqual(ccm.pending(self.state), ("", 2))
+        nxt = ccm.save(self.state, "gpt-c", applied="next-turn", accepted=False)
+        self.assertEqual((nxt["previous"], nxt["working"], nxt["rev"]), ("gpt-a", "gpt-a", 3))
+
+    def test_an_accepted_pick_is_the_working_model_and_a_moved_on_record_is_never_settled(self):
+        ccm.save(self.state, "gpt-a", applied="next-turn", accepted=False)
+        ccm.save(self.state, "gpt-b", applied="next-turn", accepted=False)
+        self.assertIsNone(ccm.resolve(self.state, 1, True), "rev 1 is no longer the record's")
+        rec = ccm.resolve(self.state, 2, True)
+        self.assertEqual((rec["status"], rec["working"]), ("accepted", "gpt-b"))
+        self.assertIsNone(ccm.resolve(self.state, 2, False, "late"), "a settled pick stays settled")
+        self.assertEqual(ccm.current(self.state), "gpt-b")
+
+    def test_a_record_from_before_revisions_reads_as_revision_0_and_not_pending(self):
+        self.state.mkdir()
+        ccm.record_path(self.state).write_text(json.dumps({"model": "gpt-a", "runtime": "codex", "accepted": True}))
+        self.assertEqual((ccm.revision(self.state), ccm.pending(self.state), ccm.current(self.state)), (0, ("", 0), "gpt-a"))
+        self.assertEqual(ccm.save(self.state, "gpt-b", applied="next-turn", accepted=False)["working"], "gpt-a")
 
 
 class Choices(Case):
@@ -111,6 +138,7 @@ class Cli(Case):
                                    "--accepted"), (0, "OK gpt-a"))
         self.assertTrue(json.loads(ccm.record_path(self.state).read_text())["accepted"])
         self.assertEqual(self.main("current", "--state-dir", str(self.state)), (0, "gpt-b"))
+        self.assertEqual(self.main("launch", "--state-dir", str(self.state)), (0, "2 gpt-b"))
         rc, out = self.main("save", "--state-dir", str(self.state), "--model", "sonnet", "--applied", "next-turn")
         self.assertEqual(rc, 2)
         self.assertTrue(out.startswith("FAILED"))

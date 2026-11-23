@@ -75,10 +75,12 @@ is exit 2). **Core and worker models are separate**: the pick is never written t
 runtime, accepted, applied, ts, by}`; a record without `runtime` is a Claude core's and is never read
 as a Codex model). Nothing is typed into a pane. Under the same lock:
 
-- the core is an app-server seat (a live `codex-seat` window): `applied: next-turn`, `accepted: true`,
+- the core is an app-server seat (a live `codex-seat` window): `applied: next-turn`, `status: pending`,
   exit 0. The seat (`src/agent/codex/app-server/seat.py`, core seat only) passes the model on its next
-  `turn/start` once the record is newer than the seat's start; it holds for that thread's later turns
-  and a restarted child resumes on it.
+  `turn/start` once the record's `rev` is past the one its launcher read (`SUTANDO_CORE_MODEL_REV`), so a
+  pick saved during startup is kept. A turn Codex runs on it makes it `accepted` (the new `working`
+  model); a refusal makes it `rejected`, the core stays on `working`, the task runs on that, and the
+  owner gets a proactive notice. A refused pick is never retried, by the seat or by a restart.
 - the core is a Codex TUI: `applied: next-start`, `accepted: false`, **exit 11** — saved, the running
   TUI keeps its model until its next start (owner-gated `bash src/agent/codex/cli/start-cli.sh
   --restart`).

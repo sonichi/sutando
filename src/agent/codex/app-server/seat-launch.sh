@@ -51,7 +51,7 @@ seat_core_prepare() {
                  -e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION"
                  -e SUTANDO_STANDBY_MODE=type -e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}")
   local forwarded
-  for forwarded in SUTANDO_TASK_EVENT_HANDLER SUTANDO_ISOLATED_WORKING_DIR SUTANDO_CORE_MODEL \
+  for forwarded in SUTANDO_TASK_EVENT_HANDLER SUTANDO_ISOLATED_WORKING_DIR SUTANDO_CORE_MODEL SUTANDO_CORE_MODEL_REV \
                    SUTANDO_TASKS_DIR SUTANDO_RESULTS_DIR; do
     [ -n "${!forwarded:-}" ] && SEAT_ENV_ARGS+=(-e "$forwarded=${!forwarded}")
   done

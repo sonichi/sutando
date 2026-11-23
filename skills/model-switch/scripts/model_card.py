@@ -214,6 +214,8 @@ def current_model(ws: Path) -> dict:
     """{model, name, source, ts}: the model in use by the switch record; model None without one."""
     rec = record(ws)
     model = rec.get("model") if isinstance(rec.get("model"), str) and rec.get("model") else None
+    if rec.get("runtime") == "codex" and rec.get("status") == "rejected":
+        model = codex_core_model.working(rec) or None  # Codex refused the pick: the core kept this one
     return {"model": model, "name": name_of(model), "source": "model-switch.json" if model else None,
             "ts": rec.get("ts") if model else None}
 

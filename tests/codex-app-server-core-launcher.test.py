@@ -177,6 +177,32 @@ class FlagOn(unittest.TestCase):
         self.assertIn("--model gpt-explicit", line)
         self.assertNotIn("gpt-switched", line)
 
+    def test_the_record_revision_read_with_the_launch_model_goes_to_the_seat(self):
+        # A pick saved between this read and the seat's start is past this revision, so the seat takes it.
+        f = Fixture(self, seat_tmux=True)
+        state = f.workspace / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "model-switch.json").write_text(json.dumps(
+            {"model": "gpt-switched", "runtime": "codex", "status": "pending", "rev": 4}))
+        for env in ({}, {"SUTANDO_CORE_MODEL": "gpt-explicit"}):
+            with self.subTest(env=env):
+                result = f.run(**env, **self.ON)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                line = [ln for ln in f.calls().splitlines() if ln.startswith("-S <TMP>/tmux.sock new-session")][-1]
+                self.assertIn("-e SUTANDO_CORE_MODEL_REV=4", line)
+
+    def test_a_refused_pick_is_not_the_launch_model(self):
+        f = Fixture(self, seat_tmux=True)
+        state = f.workspace / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "model-switch.json").write_text(json.dumps(
+            {"model": "gpt-bad", "runtime": "codex", "status": "rejected", "working": "gpt-good", "rev": 2}))
+        result = f.run(**self.ON)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line, = [ln for ln in f.calls().splitlines() if ln.startswith("-S <TMP>/tmux.sock new-session")]
+        self.assertIn("--model gpt-good", line)
+        self.assertNotIn("gpt-bad", line)
+
     def test_a_claude_cores_record_is_not_a_codex_launch_model(self):
         f = Fixture(self, seat_tmux=True)
         (f.workspace / "state").mkdir(parents=True, exist_ok=True)

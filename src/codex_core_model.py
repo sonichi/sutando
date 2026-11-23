@@ -9,12 +9,15 @@ kept in the core's switch record instead (`model-switch.json` in the state folde
 - `src/agent/codex/cli/start-cli.sh` launches the core with `-m <model>` from it when
   SUTANDO_CORE_MODEL is not set for that launch (an explicit launch value wins);
 - the core's app-server seat (`src/agent/codex/app-server/seat.py`, no `--worker`) passes it as
-  `model` on the next `turn/start` once the record is newer than the seat's own start.
+  `model` on the next `turn/start` once the record's `rev` is past the one its launcher consumed
+  (SUTANDO_CORE_MODEL_REV). A pick stays `pending` until Codex runs a turn on it; one Codex refuses
+  is `rejected` and the core stays on `working`, the last model Codex took.
 
 Pool workers read none of this: their model is their own.
 
     python3 codex_core_model.py check <model>                 # exit 0 a Codex model name, 2 not
     python3 codex_core_model.py current --state-dir DIR       # the recorded model, or nothing
+    python3 codex_core_model.py launch --state-dir DIR        # "<rev> <model or ->", read once
     python3 codex_core_model.py save --state-dir DIR --model M --applied WHEN [--accepted]
     python3 codex_core_model.py choices [--codex-home DIR]    # id=Title;... from Codex's model cache
 
@@ -23,6 +26,7 @@ Stdlib only.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -39,6 +43,7 @@ BY = "skills/model-switch/scripts/switch-model.sh"
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
 _CLAUDE = re.compile(r"(default|opus|sonnet|haiku|fable|claude-.*)(\[1m\])?", re.I)
 APPLIED = ("next-turn", "next-start")
+LOCK = ".model-switch.lock"  # switch-model.sh holds the same lock while it saves
 
 
 def valid(name: str) -> bool:
@@ -61,39 +66,96 @@ def read_record(state_dir) -> dict:
     return data
 
 
+def _rev(rec: dict) -> int:
+    rev = rec.get("rev")
+    return rev if isinstance(rev, int) and not isinstance(rev, bool) and rev > 0 else 0
+
+
+def working(rec: dict) -> str:
+    """The last model Codex took by this record: its own once accepted, else the one it carried."""
+    if rec.get("status", "accepted" if rec.get("accepted") else "") == "accepted" and valid(rec.get("model") or ""):
+        return rec["model"]
+    w = rec.get("working")
+    return w if isinstance(w, str) and valid(w) else ""
+
+
 def current(state_dir) -> str:
-    """The model the Codex core was last switched to, '' for none."""
-    return read_record(state_dir).get("model") or ""
+    """The model the Codex core is to use, '' for none: the last pick, or, once Codex refused it,
+    the last model Codex took."""
+    rec = read_record(state_dir)
+    if rec.get("status") == "rejected":
+        return working(rec)
+    return rec.get("model") or ""
 
 
-def newer_than(state_dir, since: float) -> str:
-    """The recorded model when the record was written after `since` (epoch seconds), else ''."""
-    path = record_path(state_dir)
-    try:
-        if path.stat().st_mtime <= since:
-            return ""
-    except OSError:
-        return ""
-    return current(state_dir)
+def revision(state_dir) -> int:
+    """The record's revision, 0 for none; every save raises it by one."""
+    return _rev(read_record(state_dir))
 
 
-def save(state_dir, model: str, *, applied: str, accepted: bool, now: Optional[float] = None) -> dict:
-    """Write the record atomically; `previous` is the last Codex record's model. Raises ValueError for
-    a name that is not a Codex model, OSError when it cannot be written."""
-    if not valid(model):
-        raise ValueError(f"{model!r} is not a Codex model name")
-    if applied not in APPLIED:
-        raise ValueError(f"applied must be one of {APPLIED}")
-    prev = current(state_dir) or None
-    rec = {"model": model, "previous": prev, "previous_source": "last-record" if prev else "none",
-           "runtime": RUNTIME, "accepted": bool(accepted), "applied": applied,
-           "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "by": BY}
+def launch(state_dir) -> tuple:
+    """(rev, model) read in one go, for a launcher that hands the rev on to the seat."""
+    rec = read_record(state_dir)
+    model = working(rec) if rec.get("status") == "rejected" else (rec.get("model") or "")
+    return _rev(rec), model
+
+
+def pending(state_dir) -> tuple:
+    """(model, rev): the pick Codex has not yet taken or refused, '' when there is none."""
+    rec = read_record(state_dir)
+    return (rec.get("model") or "" if rec.get("status") == "pending" else ""), _rev(rec)
+
+
+@contextlib.contextmanager
+def _locked(state_dir):
+    import fcntl
+    os.makedirs(state_dir, exist_ok=True)
+    with open(Path(state_dir) / LOCK, "a") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+
+
+def _write(state_dir, rec: dict) -> None:
     os.makedirs(state_dir, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(state_dir), prefix=".model-switch.staged.")
     with os.fdopen(fd, "w") as f:
         json.dump(rec, f, indent=2)
         f.write("\n")
     os.replace(tmp, record_path(state_dir))
+
+
+def resolve(state_dir, rev: int, accepted: bool, reason: str = "") -> Optional[dict]:
+    """Settle the pending pick `rev`: accepted (it becomes `working`) or rejected (the core stays on
+    `working`). None when the record has moved on or is not pending; a newer pick is never touched."""
+    with _locked(state_dir):
+        rec = read_record(state_dir)
+        if not rec or _rev(rec) != rev or rec.get("status") != "pending":
+            return None
+        rec["status"], rec["accepted"] = ("accepted" if accepted else "rejected"), bool(accepted)
+        if accepted:
+            rec["working"] = rec["model"]
+        else:
+            rec["rejected_reason"] = " ".join(str(reason).split())[:240]
+        _write(state_dir, rec)
+        return rec
+
+
+def save(state_dir, model: str, *, applied: str, accepted: bool, now: Optional[float] = None) -> dict:
+    """Write the record atomically, one revision past the last. Without `accepted` the pick is
+    `pending` until Codex takes it; `previous` is the model in use before it and `working` the last
+    model Codex took. Raises ValueError for a name that is not a Codex model, OSError when it cannot
+    be written."""
+    if not valid(model):
+        raise ValueError(f"{model!r} is not a Codex model name")
+    if applied not in APPLIED:
+        raise ValueError(f"applied must be one of {APPLIED}")
+    old = read_record(state_dir)
+    prev = current(state_dir) or None
+    rec = {"model": model, "previous": prev, "previous_source": "last-record" if prev else "none",
+           "runtime": RUNTIME, "accepted": bool(accepted), "status": "accepted" if accepted else "pending",
+           "working": model if accepted else (working(old) or None), "rev": _rev(old) + 1,
+           "applied": applied, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "by": BY}
+    _write(state_dir, rec)
     return rec
 
 
@@ -144,6 +206,8 @@ def main(argv=None) -> int:
     c.add_argument("model")
     cur = sub.add_parser("current")
     cur.add_argument("--state-dir", required=True)
+    la = sub.add_parser("launch")
+    la.add_argument("--state-dir", required=True)
     s = sub.add_parser("save")
     s.add_argument("--state-dir", required=True)
     s.add_argument("--model", required=True)
@@ -158,6 +222,10 @@ def main(argv=None) -> int:
         model = current(a.state_dir)
         if model:
             print(model)
+        return 0
+    if a.cmd == "launch":
+        rev, model = launch(a.state_dir)
+        print(f"{rev} {model or '-'}")
         return 0
     if a.cmd == "choices":
         where = a.codex_home or home(Path(__file__).resolve().parents[1])  # lint-workspace-resolution: allow-repo-root

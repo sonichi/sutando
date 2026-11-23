@@ -308,8 +308,10 @@ class Seat:
         self.poll_s, self.retry_s, self.hold_s, self.max_attempts = poll_s, retry_s, hold_s, max_attempts
         self.backoff_s, self.turn_timeout, self.interrupt_grace = backoff_s, turn_timeout, interrupt_grace
         self.context, self.clock = context, clock
-        # A core switch recorded after this moment is the one the next turn takes (turn_model).
-        self.started_at = time.time()
+        # The switch revision this seat's launch model came from; a later one is the next turn's.
+        self.model_rev = self.launch_rev()
+        self.trial: Optional[tuple] = None  # (model, rev, the model before it) until Codex settles it
+        self.force_model = False
         self.cwd = host.cwd or str(self.workspace)
         self.rpc: Optional[Rpc] = None
         self.thread_id: Optional[str] = None
@@ -625,18 +627,62 @@ class Seat:
         elif method == "thread/status/changed" and (params.get("status") or {}).get("type") == "systemError":
             log("  thread status: systemError")
 
+    def launch_rev(self) -> int:
+        """The record revision the launcher read with the launch model (SUTANDO_CORE_MODEL_REV); a
+        launcher that passes none leaves the record as it is at this seat's start."""
+        if self.worker:
+            return 0
+        value = os.environ.get("SUTANDO_CORE_MODEL_REV", "")
+        return int(value) if value.isdigit() else codex_core_model.revision(self.workspace / "state")
+
     def turn_model(self) -> str:
         """The core's model for the next turn, '' to leave the thread's as it is. Only the core seat
-        reads the core's switch record (src/codex_core_model.py), and only one written after this seat
-        started: an older one is what the launcher already passed as --model. A pool worker's seat
-        never reads it, so a core switch leaves the workers' model alone."""
+        reads the core's switch record (src/codex_core_model.py), and only a pending pick past the
+        revision its launch consumed; the launch already holds that one. A worker's seat never does."""
         if self.worker:
             return ""
-        picked = codex_core_model.newer_than(self.workspace / "state", self.started_at)
-        if picked and picked != self.model:
-            log(f"model: {picked} from the core's switch (was {self.model or 'the default'}); it holds from this turn")
-            self.model = picked  # a restarted child's thread/resume keeps it too
+        if self.force_model:
+            self.force_model = False
+            return self.model
+        picked, rev = codex_core_model.pending(self.workspace / "state")
+        if picked and rev == self.model_rev and picked == self.model and self.trial is None:
+            self.trial = (picked, rev, picked)  # the launch took it: the first turn settles it
+            return ""
+        if not picked or rev <= self.model_rev:
+            return ""
+        self.model_rev = rev
+        self.trial = (picked, rev, self.model)
+        if picked == self.model:
+            return ""
+        log(f"model: trying {picked} from the core's switch (was {self.model or 'the default'})")
+        self.model = picked  # a restarted child's thread/resume keeps it too
         return picked
+
+    def settle_model(self, accepted: bool, reason: str = "") -> None:
+        """Record whether Codex took the pick under trial; a refused one puts the model before it back
+        for the next turn and tells the owner."""
+        if self.trial is None:
+            return
+        picked, rev, before = self.trial
+        self.trial = None
+        try:
+            codex_core_model.resolve(self.workspace / "state", rev, accepted, reason)
+        except OSError as e:
+            log(f"model: the switch record could not be settled ({one_line(e, 120)})")
+        if accepted:
+            log(f"model: {picked} taken by Codex; it holds from now on")
+            return
+        self.model, self.force_model = before, bool(before)
+        log(f"model: Codex refused {picked} ({one_line(reason, 160)}); staying on {before or 'the default'}")
+        notice = (f"Codex refused the model {picked} for the core ({one_line(reason, 160)}). "
+                  f"The core stays on {before or 'its default model'}.\n")
+        try:
+            out = Path(self.host.results) / f"proactive-model-refused-{int(time.time() * 1000)}.txt"
+            tmp = out.with_name("." + out.name + ".tmp")
+            tmp.write_text(notice, encoding="utf-8")
+            os.replace(tmp, out)
+        except OSError as e:
+            log(f"model: the refusal notice could not be written ({one_line(e, 120)})")
 
     def run_turn(self, filename: str, prompt: str) -> Tuple[str, str]:
         """(status, detail) once the turn is over: completed | failed | interrupted | stopped |
@@ -647,7 +693,19 @@ class Seat:
             # turn/start's model holds for this turn and the thread's later ones.
             params["model"] = model
         try:
-            res = self.rpc.request("turn/start", params)
+            try:
+                res = self.rpc.request("turn/start", params)
+            except RuntimeError as e:
+                # Only Codex's own error answer refuses the pick; a timeout or closed pipe is no verdict.
+                answered = str(e).startswith("turn/start: {")
+                if not (model and answered and self.trial and self.trial[0] == model and self.rpc.alive()):
+                    raise
+                self.settle_model(False, str(e))
+                params.pop("model")
+                if self.model:
+                    params["model"] = self.model
+                self.force_model = False
+                res = self.rpc.request("turn/start", params)
             turn_id = res["turn"]["id"]
         except (RuntimeError, KeyError, TypeError) as e:
             return ("server-exited" if not self.rpc.alive() else "failed"), one_line(e, 240)
@@ -672,6 +730,10 @@ class Seat:
                     if method == "turn/completed" and turn.get("id") == turn_id:
                         status = turn.get("status") or "failed"
                         error = (turn.get("error") or {}).get("message") or ""
+                        if status == "completed":
+                            self.settle_model(True)
+                        elif status == "failed" and "model" in error.lower():
+                            self.settle_model(False, error)
                         if interrupted and status == "interrupted":
                             return interrupted, error
                         return status, error
