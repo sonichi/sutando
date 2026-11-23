@@ -111,9 +111,8 @@ class ModelSwitch:
                               for mid, name in offered if self.ok(mid)],
                 "current": str(current or "")[:200]}
         state = self.state()
-        # A runtime may report its own default as current before the turn's switch (agy advertises
-        # currentModelId on every session/new and session/load, then the turn's session/set_model
-        # moves it): while the owner's pick is in force the model in use is the one turns run on.
+        # A runtime may report its default as current until the turn's own switch (agy does, on every
+        # session/new and session/load): while the owner's pick is in force, the model in use is the pick.
         if state.get("wanted") and state.get("told") == state.get("wanted") == state.get("confirmed"):
             seen["current"] = str(state.get("current") or "")
         if {k: state.get(k) for k in seen} != seen:

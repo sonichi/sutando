@@ -332,9 +332,8 @@ def main():
                 remember_dirs(params["sessionId"], params)
                 launch(params.get("mcpServers"), loading=True)
                 chunk(params["sessionId"], "replayed history")
-                # With `models-on-load`, a loaded Session advertises the models with agy's default as
-                # current, as agy 1.5.13 does ("Advertising available models: current=…"), whatever
-                # an earlier session/set_model chose.
+                # With `models-on-load`, a loaded Session advertises agy's default as current, as agy
+                # 1.5.13 does ("Advertising available models: current=…"), whatever set_model chose earlier.
                 loaded = {}
                 if os.path.exists(os.path.join(HOME, "models")) and os.path.exists(os.path.join(HOME, "models-on-load")):
                     loaded["models"] = MODELS
