@@ -2,9 +2,11 @@
 to switch it, and is shown the account (masked) and where to switch it.
 
 Same design as the model card (#6685's `account_switch` card, routed by `card_desk`), with one difference:
-a sign-in code never travels as a chat message. "Switch account" therefore starts nothing here; it points
-to the desktop app (Settings → this agent's Connections card → Switch account), which runs the agent's own
-sign-in (`ag2-sparrow-claude-local account --start`) and takes the code in the app's own box.
+a sign-in code never travels as a chat message. The card carries `account_controls`: in the desktop app, on
+the computer that runs the agent, the owner switches account right in the card (the app runs the agent's own
+sign-in, `ag2-sparrow-claude-local account --start`, and takes the code in the card's own box, never sent to
+the chat). "Switch account", for a client without those controls, starts nothing here and says where to open
+the card. English only.
 
 Asked by "/account" or "/login" in the owner's DM, a tap on this card, or the session answering the owner
 with the card's mark. The account is Claude Code's own answer for the agent's config dir
@@ -22,8 +24,7 @@ from ...acp_host import quoted
 NAME = "Claude Code"
 STATUS_WAIT_S = 10.0     # asked inside the claim: an answer the card cannot wait for reads as unknown
 ASKS = ("/account", "/login")
-WHERE = ("To switch it, open Settings in the S.space app, then this agent's Connections card, then Switch "
-         "account. The sign-in happens there and the code goes into the app's own box, never into this chat.")
+WHERE = account_switch.elsewhere(NAME) + " The sign-in code goes into the card there, never into this chat."
 _run = subprocess.run       # Claude Code's own `auth status`, the one command this card runs
 
 
@@ -66,11 +67,8 @@ class AccountCard(account_switch.AccountSwitch):
 
     def __init__(self, root, cfg: dict, publish, log, ask: str = "/account", run=None):
         super().__init__(str(records.state_dir(root)), str(cb.bridge_state(cfg)), NAME, publish, quoted, log,
-                         read=lambda: label(cfg, run=run), begin=None, cancel=None, opener=None)
+                         read=lambda: label(cfg, run=run), begin=None, cancel=None, opener=None, runtime="claude")
         self.ASK = ask
-
-    def card(self, state: str, text: str, url: str = "", ask: bool = False):
-        return super().card(state, "%s %s" % (text, WHERE) if ask else text, "", ask)
 
     def tapped(self, verb, sent, result_file) -> str:
         """"Switch account": where to switch it, in a card of its own. Nothing is started here."""

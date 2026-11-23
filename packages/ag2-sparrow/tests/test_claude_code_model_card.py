@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -382,8 +383,10 @@ class Account(Base):
         self.assertEqual(len(cards), 2)
         text = cards[0]["text"]
         self.assertIn("I'm signed in as s\u2026@example.com (max).", text)
-        self.assertIn("Settings in the S.space app", text)
-        self.assertIn("never into this chat", text)
+        self.assertTrue(text.endswith(account_card.account_switch.BELOW), text)
+        self.assertNotIn("Settings", text, "never sent elsewhere")
+        self.assertEqual(cards[0]["account_controls"], {"runtime": "claude"})
+        self.assertFalse(re.search(r"[\u4e00-\u9fff]", json.dumps(cards, ensure_ascii=False)), "English only")
         self.assertNotIn("sarah@", json.dumps(cards))
         self.assertEqual([b["label"] for b in cards[0]["buttons"]], ["Switch account"])
         argv, config = self.runs[0]
@@ -398,7 +401,9 @@ class Account(Base):
         self.assertEqual(rc, 1)
         self.assertIn("(account-where)", out["refused"])
         note, = [q["card"] for q in self.queued()]
-        self.assertEqual(note["text"], account_card.WHERE)
+        self.assertEqual(note["text"], "Open this on the computer that runs Claude Code to switch account. The sign-in "
+                                       "code goes into the card there, never into this chat.")
+        self.assertNotIn("account_controls", note)
         self.assertNotIn("buttons", note)
         self.assertEqual(self.runs, [], "no sign-in, no status call")
 
