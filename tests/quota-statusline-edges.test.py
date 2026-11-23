@@ -486,11 +486,52 @@ class SignedIn(Tmp):
             row = self.csi.check(self.ws, str(self.core), runner=self._runner(rc=1), now=T0)
         self.assertEqual(row["status"], "ok")
         self.assertEqual(self.calls, [])
+        bad = lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="maybe\n")
+        self.assertIsNone(self.csi.direct_routing_on(bad))
+        self.assertIsNone(self.csi.direct_routing_on(lambda *a, **k: types.SimpleNamespace(returncode=2, stdout="")))
+        self.assertIsNone(self.csi.direct_routing_on(lambda *a, **k: (_ for _ in ()).throw(OSError())))
+
+    def test_routing_agrees_with_the_launch_predicate(self):
+        launch = ('. "$1/scripts/python-binary.sh"; PY="$(resolve_python "$1")"; REPO="$1"; '
+                  '. "$1/src/skill-manifest-config.sh"; . "$1/src/claude_routing.sh"; claude_direct_routing')
+        for value in (None, "", "false", "off", "true", "1"):
+            env = {k: v for k, v in os.environ.items() if k != "QUOTA_STATUSLINE_ENABLED"}
+            if value is not None:
+                env["QUOTA_STATUSLINE_ENABLED"] = value
+            with self.subTest(value=value), mock.patch.dict(os.environ, env, clear=True):
+                rc = subprocess.run(["/bin/bash", "-c", launch, "bash", str(ROOT)]).returncode
+                self.assertIs(self.csi.direct_routing_on(), rc == 0)
         with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": ""}):
-            self.assertTrue(self.csi.direct_routing_on())  # the shipped manifest default
-            import skill_roots
-            with mock.patch.object(skill_roots, "skill_roots", side_effect=RuntimeError):
-                self.assertFalse(self.csi.direct_routing_on())
+            self.assertIs(self.csi.direct_routing_on(), False)  # set but empty: the proxy, as the launch does
+
+    def test_proxy_in_use(self):
+        ns = types.SimpleNamespace
+        ps = lambda out: (lambda *a, **k: ns(returncode=0, stdout=out))
+        lsof = lambda rc, out="", err="": (lambda *a, **k: ns(returncode=rc, stdout=out, stderr=err))
+        routed = f"/opt/bin/claude --name w CLAUDE_CONFIG_DIR={self.core} ANTHROPIC_BASE_URL=http://localhost:7846\n"
+        direct = f"/opt/bin/claude --name w CLAUDE_CONFIG_DIR={self.core} PATH=/bin\n"
+        self.live.stop()
+        try:
+            self.assertIs(self.csi.proxy_in_use(ps(routed), lsof(1)), True)
+            self.assertIs(self.csi.proxy_in_use(ps(direct), lsof(0, "123\n")), True)
+            self.assertIs(self.csi.proxy_in_use(ps(direct), lsof(1)), False)
+            self.assertIsNone(self.csi.proxy_in_use(ps(direct), lsof(1, err="lsof: boom")))
+            self.assertIsNone(self.csi.proxy_in_use(ps(direct), lambda *a, **k: (_ for _ in ()).throw(OSError())))
+            self.assertIsNone(self.csi.proxy_in_use(lambda *a, **k: ns(returncode=1, stdout=""), lsof(1)))
+        finally:
+            self.live.start()
+
+    def test_a_failed_prune_never_stops_the_check(self):
+        rec_dir = self.csi.record_path(self.ws, str(self.core)).parent
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        old = rec_dir / f"abc-{time.strftime('%Y%m%d', time.gmtime(T0 - 30 * 86400))}.notice"
+        old.write_text("")
+        with mock.patch.object(Path, "unlink", side_effect=OSError):
+            self.csi.prune_notices(self.ws, T0)
+        self.assertTrue(old.exists())
+        with mock.patch.object(self.csi, "prune_notices", side_effect=OSError):
+            row = self.csi.check(self.ws, str(self.core), runner=self._runner(), now=T0)
+        self.assertEqual(row["status"], "ok")
 
     def test_a_failed_notice_or_record_write_still_reports(self):
         run = self._runner(rc=1)

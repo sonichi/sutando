@@ -13314,8 +13314,9 @@ def check_credential_proxy() -> dict:
         )
         _credential_proxy_wedge_from_quota_state(check)
         import claude_signed_in  # src/ is on sys.path
-        if check["status"] != "ok" and claude_signed_in.direct_routing_on():
-            # Sessions route direct, so nothing depends on this process's code or credential.
+        if (check["status"] != "ok" and claude_signed_in.direct_routing_on() is True
+                and claude_signed_in.proxy_in_use() is False):
+            # Nothing routes through it, so its code or credential state affects no one.
             check["status"] = "ok"
             check["detail"] = f"unused, sessions route direct (info: {check.get('detail', '')})"
     # Pin verdicts resolve on EVERY branch: a healthy replacement or a down

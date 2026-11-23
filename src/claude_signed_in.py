@@ -39,9 +39,7 @@ POOL = 4
 NOTICE_KEEP_DAYS = 7
 PROBE = ["claude", "auth", "status", "--json"]
 _LOCAL_PROXY = re.compile(r"^http://(localhost|127\.0\.0\.1|\[::1\]):7846/?$")
-SWITCH = "QUOTA_STATUSLINE_ENABLED"
 ENV_LOGINS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
-OFF = {"0", "false", "no", "off"}
 
 
 def direct_auth_env(launcher_env: Mapping[str, str], config_dir: str,
@@ -136,34 +134,37 @@ def _notify(workspace, config_dir: str, now: float) -> str:
     return name
 
 
-def direct_routing_on() -> bool:
-    """Status line tracking is on (env, else the declaring skill's manifest `config`)."""
-    value = os.environ.get(SWITCH)
-    if value in (None, ""):
-        try:
-            import skill_roots
-            for manifest in (m for root in skill_roots.skill_roots()
-                             for m in sorted(Path(root).glob("*/manifest.json"))):
-                cfg = (skill_roots.read_manifest(manifest) or {}).get("config") or {}
-                if isinstance(cfg, dict) and SWITCH in cfg:
-                    value = str(cfg[SWITCH])
-                    break
-        except Exception:  # noqa: BLE001 — unknown reads as the shipped default
-            value = None
-    return value is not None and value.strip().lower() not in OFF
+REPO = Path(__file__).resolve().parent.parent
+# The launchers' own predicate (src/claude_routing.sh), with PY resolved as they resolve it.
+_ROUTING_SH = (
+    '. "$1/scripts/python-binary.sh" && PY="$(resolve_python "$1")" && REPO="$1" '
+    '&& . "$1/src/skill-manifest-config.sh" && . "$1/src/claude_routing.sh" '
+    '&& { if claude_direct_routing; then echo direct; else echo proxy; fi; }')
 
 
-def live_sessions(ps_runner: Callable = subprocess.run) -> Dict[str, Dict[str, str]]:
-    """{config dir: that session's own environment} for each live Sutando Claude session (a
-    `claude` process the launchers started with `--name`), the core's and every worker's, deduped."""
+def direct_routing_on(runner: Callable = subprocess.run, repo: Path = REPO) -> Optional[bool]:
+    """Whether the launchers route Claude sessions direct: True, False, or None when unknown."""
+    try:
+        out = runner(["/bin/bash", "-c", _ROUTING_SH, "bash", str(repo)], capture_output=True,
+                     text=True, timeout=15, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    verdict = (out.stdout or "").strip().splitlines()[-1:] if out.returncode == 0 else []
+    return {"direct": True, "proxy": False}.get(verdict[0]) if verdict else None
+
+
+def _live_sessions(ps_runner: Callable = subprocess.run) -> Optional[Dict[str, Dict[str, str]]]:
+    """live_sessions, but None when the process list could not be read."""
     from quota_availability import _env_pairs
     try:
         out = ps_runner(["ps", "-xeww", "-U", str(os.getuid()), "-o", "command="],
                         capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
-        return {}
+        return None
+    if out.returncode != 0:
+        return None
     found: Dict[str, Dict[str, str]] = {}
-    for cmd in (out.stdout or "").splitlines() if out.returncode == 0 else []:
+    for cmd in (out.stdout or "").splitlines():
         cmd = cmd.strip()
         argv = cmd.split(" ")
         if os.path.basename(argv[0]) != "claude" or "--name" not in argv:
@@ -173,6 +174,31 @@ def live_sessions(ps_runner: Callable = subprocess.run) -> Dict[str, Dict[str, s
         if ccd:
             found.setdefault(os.path.realpath(ccd), env)
     return found
+
+
+def live_sessions(ps_runner: Callable = subprocess.run) -> Dict[str, Dict[str, str]]:
+    """{config dir: that session's own environment} for each live Sutando Claude session (a
+    `claude` process the launchers started with `--name`), the core's and every worker's, deduped."""
+    return _live_sessions(ps_runner) or {}
+
+
+def proxy_in_use(ps_runner: Callable = subprocess.run, lsof_runner: Callable = subprocess.run) -> Optional[bool]:
+    """Whether anything still uses the local proxy: an established connection on its port, or a
+    live Sutando session whose environment carries the proxy URL. None when either is unreadable."""
+    sessions = _live_sessions(ps_runner)
+    if sessions is None:
+        return None
+    if any(_LOCAL_PROXY.match(env.get("ANTHROPIC_BASE_URL", "")) for env in sessions.values()):
+        return True
+    try:
+        out = lsof_runner(["/usr/sbin/lsof", "-nP", "-iTCP:7846", "-sTCP:ESTABLISHED", "-t"],
+                          capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode == 0 and (out.stdout or "").strip():
+        return True
+    # lsof exits 1 with no output when nothing matches; anything else is unknown.
+    return False if out.returncode == 1 and not (out.stdout or "").strip() and not (out.stderr or "").strip() else None
 
 
 def _claim_notice(workspace, config_dir: str, now: float) -> bool:
@@ -223,7 +249,7 @@ def check(workspace, config_dir: Optional[str], *, socket: Optional[str] = None,
     """Health-check row `claude-sign-in`: fail naming every config dir a live Sutando session uses
     (the core's and each worker's) that is not signed in on its own, with today's notice sent once."""
     row = {"name": "claude-sign-in", "status": "ok"}
-    if not direct_routing_on():
+    if direct_routing_on() is not True:
         row["detail"] = "sessions go through the credential proxy; no own sign-in needed"
         return row
     now = time.time() if now is None else now
