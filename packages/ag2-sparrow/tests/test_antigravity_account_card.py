@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Antigravity's account card (adapters/antigravity/agy_account.py) in the owner's DM: 切换账号 and 用 API key
-point to the agent's settings (no code or key is ever taken in chat), 停用 API key removes the key, the turn
+"""Antigravity's account card (adapters/antigravity/agy_account.py) in the owner's DM: "Switch account" and "Use API key"
+are done in the card on the computer that runs the agent (no code or key is ever taken in chat), "Stop using API key" removes the key, the turn
 after a switch says which account agy now uses, and a quota error shows the card.
 
 Driven through the connector against tests/agy_stub_acp.py, with the Keychain faked, dummy codes and keys only.
@@ -12,6 +12,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -126,30 +127,43 @@ class AccountCardTest(unittest.TestCase):
             self.dm("task-%d" % n, ask)
             self.serve()
             (card,) = self.posted("$c%d" % n)
-            self.assertEqual([b["label"] for b in card["buttons"]], ["切换账号", "用 API key"], ask)
+            self.assertEqual([b["label"] for b in card["buttons"]], ["Switch account", "Use API key"], ask)
         self.assertEqual(self.prompts(), [], "asking for the card never reaches agy")
 
+    def test_the_card_is_english_and_carries_the_marker_for_the_in_card_controls(self):
+        card = self.menu()
+        self.assertEqual(card["account_controls"], {"runtime": "antigravity", "agent": AGENT})
+        self.assertEqual(card["header"]["title"], "Antigravity account")
+        self.assertTrue(card["text"].endswith(agy_account.BELOW), card["text"])
+        self.assertEqual(agy_account.elsewhere("Antigravity"),
+                         "Open this on the computer that runs Antigravity to switch account.")
+        self.tap("task-key", card, "Use API key")
+        (info,) = self.posted("$card2")
+        self.assertNotIn("account_controls", info, "a notice is not the account card")
+        for said in (card, info):
+            self.assertFalse(re.search(r"[\u4e00-\u9fff]", json.dumps(said, ensure_ascii=False)), said)
+
     # ── A2 ──
-    def test_switch_points_to_the_settings_sign_in_and_starts_nothing_here(self):
+    def test_switch_is_done_in_the_card_and_starts_nothing_here(self):
         card = self.menu()
         with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("nothing is run")):
-            self.tap("task-switch", card, "切换账号")
+            self.tap("task-switch", card, "Switch account")
         (info,) = self.posted("$card2")
-        self.assertIn("Connections", info["text"])
-        self.assertIn("Switch account", info["text"])
-        self.assertIn("不要把授权码发在这个对话里", info["text"])
+        self.assertIn(agy_account.elsewhere(gc.NAME), info["text"])
+        self.assertNotIn("Settings", info["text"])
+        self.assertIn("Never send a sign-in code in this chat", info["text"])
         self.assertIn(agy_account.SHARED, info["text"])
         self.assertFalse(info.get("buttons"), "no input box and no link: no secret travels through the card")
         self.assertEqual(self.prompts(), [])
 
     def test_a_sign_in_code_sent_in_chat_is_never_taken_nor_passed_on(self):
         card = self.menu()
-        self.tap("task-switch", card, "切换账号")
+        self.tap("task-switch", card, "Switch account")
         self.posted("$card2")
         for n, body in enumerate((CODE, "http://localhost:51121/oauth2callback?state=s1&code=%s&scope=x" % CODE)):
             self.dm("task-code%d" % n, body)
             self.serve()
-            self.assertIn("请把它从对话里删掉", self.w.result("task-code%d" % n))
+            self.assertIn("Please delete it from the chat", self.w.result("task-code%d" % n))
         self.assertEqual(self.prompts(), [], "the code never reaches agy")
         self.assertEqual(self.posted("$x"), [], "and nothing acts on it")
         self.assertNotIn(CODE, "\n".join(self.logs) + json.dumps(self.w.metrics()) + self.state_text())
@@ -166,7 +180,7 @@ class AccountCardTest(unittest.TestCase):
         (self.w.home / "account").write_text("bob@example.com")
         self.dm("task-2", "STUB:TEXT hi")
         self.serve()
-        self.assertTrue(self.w.result("task-2").startswith(gc.quoted("（已切到 b…@example.com 账号。）").strip()))
+        self.assertTrue(self.w.result("task-2").startswith(gc.quoted("(Switched to the b…@example.com account.)").strip()))
         self.assertIn("hello from agy-stub", self.w.result("task-2"))
         self.dm("task-3", "STUB:TEXT hi")
         self.serve()
@@ -178,21 +192,21 @@ class AccountCardTest(unittest.TestCase):
     def test_a_tap_that_is_not_the_owners_changes_nothing(self):
         self.keychain["saved"] = True
         card = self.menu()
-        self.tap("task-team", card, "停用 API key", tier="team", collaborator=True)
+        self.tap("task-team", card, "Stop using API key", tier="team", collaborator=True)
         self.assertIn("couldn't match that button", self.w.result("task-team"))
-        self.tap("task-guest", card, "切换账号", tier="guest")
+        self.tap("task-guest", card, "Switch account", tier="guest")
         self.assertEqual((self.cleared, self.posted("$x")), ([], []))
 
     # ── A3 ──
-    def test_api_key_points_to_the_settings_and_a_key_sent_here_is_never_passed_on(self):
+    def test_api_key_is_entered_in_the_card_and_a_key_sent_here_is_never_passed_on(self):
         card = self.menu()
-        self.tap("task-key", card, "用 API key")
+        self.tap("task-key", card, "Use API key")
         (info,) = self.posted("$card2")
-        self.assertIn("Connections", info["text"])
+        self.assertIn("Open this on the computer that runs Antigravity", info["text"])
         for n, body in enumerate(("my key " + DUMMY_KEY, "my key [REDACTED-Google API Key]")):
             self.dm("task-paste%d" % n, body)
             self.serve()
-            self.assertIn("没有转给 Antigravity", self.w.result("task-paste%d" % n))
+            self.assertIn("did not pass it to Antigravity", self.w.result("task-paste%d" % n))
         self.assertEqual(self.prompts(), [])
         self.assertNotIn(DUMMY_KEY, "\n".join(self.logs) + json.dumps(self.w.metrics()))
 
@@ -200,8 +214,8 @@ class AccountCardTest(unittest.TestCase):
         self.keychain["saved"] = True
         card = self.menu()
         self.assertIn("Gemini API key", card["text"])
-        self.assertEqual([b["label"] for b in card["buttons"]], ["切换账号", "用 API key", "停用 API key"])
-        self.tap("task-stop", card, "停用 API key")
+        self.assertEqual([b["label"] for b in card["buttons"]], ["Switch account", "Use API key", "Stop using API key"])
+        self.tap("task-stop", card, "Stop using API key")
         self.assertEqual(self.cleared, [AGENT])
         (done,) = self.posted("$card2")
         self.assertEqual(done["state"], "done")
@@ -209,22 +223,22 @@ class AccountCardTest(unittest.TestCase):
     def test_a_keychain_failure_is_said_as_one_never_as_removed(self):
         self.keychain.update(saved=True, broken=True)
         card = self.menu()
-        self.tap("task-stop", card, "停用 API key")
+        self.tap("task-stop", card, "Stop using API key")
         (said,) = self.posted("$card2")
         self.assertEqual(said["state"], "error")
-        self.assertIn("没能删掉", said["text"])
-        self.assertNotIn("已停用", said["text"])
+        self.assertIn("could not delete the API key", said["text"])
+        self.assertNotIn("Stopped using the API key", said["text"])
         self.assertEqual(self.w.metrics()[-1]["card"], "account-key-not-cleared")
 
     def test_stop_on_an_older_card_after_the_key_is_gone_changes_nothing_and_says_so(self):
         self.keychain["saved"] = True
         card = self.menu()
-        self.tap("task-stop1", card, "停用 API key")
+        self.tap("task-stop1", card, "Stop using API key")
         self.posted("$card2")
-        self.tap("task-stop2", card, "停用 API key")
+        self.tap("task-stop2", card, "Stop using API key")
         (said,) = self.posted("$card3")
-        self.assertIn("已经没有保存 API key", said["text"])
-        self.assertNotIn("已停用", said["text"])
+        self.assertIn("has no saved API key", said["text"])
+        self.assertNotIn("Stopped using the API key", said["text"])
         self.assertEqual(self.w.metrics()[-1]["card"], "account-key-absent")
 
     def test_the_switch_notice_is_said_only_in_the_owners_dm(self):
@@ -237,10 +251,10 @@ class AccountCardTest(unittest.TestCase):
         self.assertEqual(self.w.result("task-room"), "hello from agy-stub\n", "never in a room with other people")
         self.dm("task-collab", "STUB:TEXT hi", tier="team", collaborator=True)
         self.serve()
-        self.assertNotIn("已切到", self.w.result("task-collab"))
+        self.assertNotIn("Switched to the", self.w.result("task-collab"))
         self.dm("task-dm", "STUB:TEXT hi")
         self.serve()
-        self.assertIn("已切到 b…@example.com 账号", self.w.result("task-dm"), "the DM is told once it is back there")
+        self.assertIn("Switched to the b…@example.com account", self.w.result("task-dm"), "the DM is told once it is back there")
         self.assertEqual(self.posted("$x"), [], "and no card goes anywhere")
 
     # ── A4 ──
@@ -248,8 +262,8 @@ class AccountCardTest(unittest.TestCase):
         self.dm("task-q1", "STUB:QUOTA hi")
         self.serve()
         (card,) = self.posted("$q1")
-        self.assertIn("额度用完了", card["text"])
-        self.assertEqual([b["label"] for b in card["buttons"]], ["切换账号", "用 API key"])
+        self.assertIn("out of quota", card["text"])
+        self.assertEqual([b["label"] for b in card["buttons"]], ["Switch account", "Use API key"])
         self.dm("task-q2", "STUB:QUOTA again")
         self.serve()
         self.assertEqual(self.posted("$q2"), [], "at most once per QUOTA_EVERY_S")
@@ -257,7 +271,7 @@ class AccountCardTest(unittest.TestCase):
     def test_a_quota_error_in_a_room_says_where_to_switch(self):
         self.dm("task-q", "STUB:QUOTA hi", kind="room")
         self.serve()
-        self.assertIn("在和我的私信里说「换账号」", self.w.result("task-q"))
+        self.assertIn("Say \"switch account\" in our direct message", self.w.result("task-q"))
         self.assertEqual(self.posted("$q"), [])
 
 

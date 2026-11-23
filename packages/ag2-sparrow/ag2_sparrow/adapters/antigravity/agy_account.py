@@ -1,20 +1,23 @@
-"""Antigravity's account card, in the owner's DM with the agent (Commons "切换账号 / API key 需求", part A).
+"""Antigravity's account card, in the owner's DM with the agent (Commons "switch account / API key", part A).
 
-The owner says 换账号 / switch account / 用 API key (or /account, or the turn answers with the account card's
-mark) and gets a card with 「切换账号」 and 「用 API key」 (plus 「停用 API key」 while a key is saved). It is a card
+The owner says "switch account" or "use API key" (in English or Chinese, or /account, or the turn answers
+with the account card's mark) and gets a card with "Switch account" and "Use API key" (plus "Stop using API
+key" while a key is saved). Its words are English only. The card carries `account_controls`: in the desktop
+app, on the computer that runs the agent, the owner switches account or enters a key right in the card
+(nothing typed there reaches the room); elsewhere the client says where to open it. It is a card
 of card_desk's `Desk`, asked for and tapped as the Codex account card is (account_switch): only the owner's
 tap in their DM acts.
 
 No secret is ever taken in chat: every card reply and card input in the web client is sent as a room
 message, so neither a sign-in code nor a key may travel that way.
 
-- 切换账号 points to the agent's settings, Connections, Antigravity row, "Switch account": the desktop runs
-  `agy acp --login` there in its sign-in terminal, whose paste box takes the code. agy keeps one Google
-  sign-in per Mac, so this moves every Antigravity agent here; the card says so. The next owner turn reads
-  which account agy authenticated (`applyAuthResult` in agy's own log, `signed_in_as`) and says when it
-  changed.
-- 用 API key points to that row's API key box (the Keychain item gemini_key reads).
-- 停用 API key deletes this agent's own Keychain item (gemini_key.clear_key).
+- "Switch account" (for a client without the in-card controls) says to open the card on the computer that
+  runs the agent, where the desktop runs `agy acp --login` headless and takes the code in the card. agy
+  keeps one Google sign-in per Mac, so this moves every Antigravity agent here; the card says so. The next
+  owner turn reads which account agy authenticated (`applyAuthResult` in agy's own log, `signed_in_as`) and
+  says when it changed.
+- "Use API key" says the same for the key field (the Keychain item gemini_key reads).
+- "Stop using API key" deletes this agent's own Keychain item (gemini_key.clear_key).
 - A sign-in code, a landing address with one, a Gemini key, or the bridge's redaction marker for one, sent
   in chat is never passed to agy (`carries_secret`): the owner is asked to delete the message.
 - When a turn fails on agy's quota (RESOURCE_EXHAUSTED, "Individual quota reached"), `quota_hit` posts the
@@ -31,8 +34,20 @@ from ... import account_switch, card_desk, connector_cards
 from . import gemini_key
 
 SWITCH, KEY, UNKEY = "switch", "key", "unkey"
-LABELS = {SWITCH: "切换账号", KEY: "用 API key", UNKEY: "停用 API key"}
-SHARED = "注意：这台 Mac 上所有 Antigravity agent 共用一个 Google 登录，换了以后它们都会用新账号。"
+LABELS = {SWITCH: "Switch account", KEY: "Use API key", UNKEY: "Stop using API key"}
+SHARED = ("Note: every Antigravity agent on this Mac shares one Google sign-in, so switching moves them all to "
+          "the new account.")
+# The card's own words and its marker (the same as the Codex account card's, account_switch on #6685).
+BELOW = "Switch this agent's account or API key below."
+CONTROLS = "account_controls"
+_MXID_RE = re.compile(r"^@[^\s:]+:\S+$")
+
+
+def elsewhere(name: str) -> str:
+    """Where the account controls are, for a place that cannot draw them."""
+    return "Open this on the computer that runs %s to switch account." % (name or "this agent")
+
+
 STATE_NAME = "agy-account.json"
 QUOTA_EVERY_S = 1800.0
 # Words that ask for the card, on their own (short messages only, so a long request is the model's).
@@ -41,9 +56,9 @@ ASK_RE = re.compile(r"^\s*(?:/account|(?:请|帮我|我要|我想)?(?:切换|换
                     r"\s*[。.!！?？]?\s*$", re.I)
 KEY_RE = re.compile(r"AIza[0-9A-Za-z_\-]{35}")
 REDACTED_KEY = "[REDACTED-Google API Key]"
-KEY_IN_CHAT = ("这条消息里像是有授权码或 API key，我没有转给 Antigravity，也没有存。请把它从对话里删掉；授权码请贴在 "
-               "设置 → Connections → 这个 agent 的 Antigravity 一行「Switch account」打开的登录终端里，key 请填在那一行的 "
-               "API key 框里。")
+KEY_IN_CHAT = ("This message looks like it has a sign-in code or an API key, so I did not pass it to Antigravity "
+               "and did not keep it. Please delete it from the chat. Send /account instead: on the computer that "
+               "runs me, the account card takes the code or the key without sending it to the chat.")
 QUOTA_RE = re.compile(r"RESOURCE_EXHAUSTED|Individual quota reached|quota (?:exceeded|exhausted|reached)", re.I)
 _SIGN_IN_CODE = re.compile(r"(?<![A-Za-z0-9])4/[0-9A-Za-z_\-]{20,}")
 _CODE_URL = re.compile(r"https?://\S*[?&]code=[^&\s]{8,}")
@@ -129,9 +144,9 @@ class AgyAccount:
     def using(self, keyed=None) -> str:
         keyed = self.keyed() if keyed is None else keyed
         if keyed:
-            return "现在用的是 Gemini API key（这个 agent 自己的）。"
+            return "I'm using this agent's own Gemini API key."
         who = str(self.record().get("account") or "")
-        return "现在用的是这台电脑上的 Google 登录%s。" % ("（%s）" % who if who else "")
+        return "I'm using this computer's Google sign-in%s." % (" (%s)" % who if who else "")
 
     def card(self, state, text, menu=False, keyed=False, url=""):
         agent_card, _ = connector_cards._core()
@@ -141,13 +156,22 @@ class AgyAccount:
             buttons = [agent_card.button(LABELS[v], "reply", reply=LABELS[v],
                                          command=agent_card.reply("account", "agent", v)) for v in verbs]
         if url:
-            buttons.append(agent_card.button("打开登录页", "url", url=url))
-        return agent_card.build(account_switch.CARD if menu else account_switch.NOTE, state, title="Antigravity 账号",
-                                body="Account of %s" % self.name, text=text, **({"buttons": buttons} if buttons else {}))
+            buttons.append(agent_card.button("Open sign-in page", "url", url=url))
+        body, built = agent_card.build(account_switch.CARD if menu else account_switch.NOTE, state,
+                                       title="Antigravity account", body="Account of %s" % self.name, text=text,
+                                       **({"buttons": buttons} if buttons else {}))
+        if menu:
+            # The marker the desktop app draws this agent's account controls from; older clients ignore it.
+            marker = {"runtime": "antigravity"}
+            if _MXID_RE.match(self.agent_id):
+                marker["agent"] = self.agent_id
+            built = dict(built, **{CONTROLS: marker})
+        return body, built
 
     def menu(self, lead=""):
         keyed = self.keyed()
-        return self.card("pending", (lead + " " if lead else "") + self.using(keyed), menu=True, keyed=keyed)
+        return self.card("pending", "%s%s %s" % (lead + " " if lead else "", self.using(keyed), BELOW),
+                         menu=True, keyed=keyed)
 
     def post(self, room, built) -> bool:
         return card_desk.post(self.bridge_state, room, built, self.log)
@@ -172,14 +196,14 @@ class AgyAccount:
     def tapped(self, verb, sent, result_file) -> str:
         room = str(sent.get("channel_id") or "")
         if verb == SWITCH:
-            self.say(room, self.card("info", "请打开 设置 → Connections → %s 的 Antigravity 一行，点「Switch account」：会打开登录"
-                                             "终端，用 Google 登录后把网页给出的授权码贴在那个终端的输入框里。请不要把授权码发在这个对话里。"
-                                             "%s换好以后，我下一条回复会告诉你新账号。" % (self.name, SHARED)), result_file)
+            self.say(room, self.card("info", "%s Never send a sign-in code in this chat. %s I'll name the new account "
+                                             "in my next reply." % (elsewhere(self.name), SHARED)), result_file)
             return "account-switch-where"
         if verb == KEY:
-            self.say(room, self.card("info", "Gemini API key 请填在 设置 → Connections → %s 的 Antigravity 一行的 API key 框里，它会存进这台 Mac "
-                                             "的钥匙串，下一条消息起就用 key。为了安全，发在对话里的 key 会被平台自动遮掉，我收不到，也"
-                                             "不会存。" % self.name), result_file)
+            self.say(room, self.card("info", "Open this on the computer that runs %s to enter a Gemini API key: it is "
+                                             "kept in that Mac's Keychain and used from the next message. A key sent "
+                                             "in this chat is masked by the platform, so I never receive or keep it."
+                                             % self.name), result_file)
             return "account-key-where"
         if verb == UNKEY:
             try:
@@ -188,15 +212,17 @@ class AgyAccount:
                 self.log("Gemini API key not removed:", type(e).__name__)
                 outcome = gemini_key.FAILED
             if outcome == gemini_key.REMOVED:
-                self.say(room, self.card("done", "已停用 API key，已从钥匙串删除。下一条消息起用 Google 登录（新开一个会话）。"),
+                self.say(room, self.card("done", "Stopped using the API key and deleted it from the Keychain. From the next "
+                                                 "message I use the Google sign-in, in a new session."),
                          result_file)
                 return "account-key-cleared"
             if outcome == gemini_key.ABSENT:
                 # A tap on an older card, after the key was already removed: nothing to do, and said so.
-                self.say(room, self.card("info", "这个 agent 已经没有保存 API key 了，没有改动。" + self.using(False)), result_file)
+                self.say(room, self.card("info", "This agent has no saved API key, so nothing changed. " + self.using(False)), result_file)
                 return "account-key-absent"
             self.log("Gemini API key not removed (security failed)")
-            self.say(room, self.card("error", "没能删掉 API key（钥匙串操作失败），key 还在用。请在 设置 → Connections 里删除。"),
+            self.say(room, self.card("error", "I could not delete the API key (the Keychain refused), so it is still in "
+                                              "use. Send /account to try again."),
                      result_file)
             return "account-key-not-cleared"
         self.publish(result_file, self.quoted("I couldn't match that button. Send /account for a new card.") + "\n")
@@ -212,9 +238,9 @@ class AgyAccount:
         if before == who:
             return ""
         self.keep(account=who)
-        return "（已切到 %s 账号。）" % who if before else ""
+        return "(Switched to the %s account.)" % who if before else ""
 
-    # ── 额度用完 ──
+    # ── out of quota ──
     def quota_hit(self, sent, status, text, detail, now=None) -> str:
         """The turn failed on agy's quota: post the card in the owner's DM (at most once per QUOTA_EVERY_S).
         A line for the answer when the turn was elsewhere, '' otherwise."""
@@ -222,11 +248,12 @@ class AgyAccount:
             return ""
         agent_card, _ = connector_cards._core()
         if agent_card.owner_may_act(sent) is not None:
-            return "Antigravity 这个账号的额度用完了。在和我的私信里说「换账号」可以切换账号或改用 API key。" \
+            return "This Antigravity account is out of quota. Say \"switch account\" in our direct message to switch " \
+                   "account or use an API key." \
                 if str(sent.get("access_tier") or "") == "owner" else ""
         now = time.time() if now is None else now
         if now - float(self.record().get("quota_card_at") or 0) < QUOTA_EVERY_S:
             return ""
-        if self.post(sent.get("channel_id"), self.menu("Antigravity 这个账号的额度用完了。可以切换账号，或改用 API key。")):
+        if self.post(sent.get("channel_id"), self.menu("This Antigravity account is out of quota.")):
             self.keep(quota_card_at=now)
         return ""
