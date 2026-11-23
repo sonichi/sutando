@@ -418,6 +418,27 @@ class FreshDirTest(Base):
         self.assertIn("task-a", (self.work / "state" / "settled-ids").read_text())
         self.assertEqual(self.main()[0], 0, "this binary's own state restarts")
 
+    def test_a_temp_under_an_allowed_name_is_a_plain_file_and_the_released_fixed_temp_is_removed(self):
+        self.assertEqual(self.main()[0], 0)
+        state = self.work / "state"
+        # The fixed-name temp 0.11's model switch could leave: removed at a start, whatever its age.
+        (state / "model-switch.json.tmp").write_text('{"model": "ha')
+        self.assertEqual(self.main()[0], 0)
+        self.assertFalse((state / "model-switch.json.tmp").exists())
+        # A link under that name is refused, and what it points at is left alone.
+        target = self.work / "kept.txt"
+        target.write_text("kept")
+        (state / "model-switch.json.tmp").symlink_to(target)
+        rc, err = self.main()
+        self.assertEqual((rc == 0, "state/model-switch.json.tmp in" in err, target.read_text()), (False, True, "kept"), err)
+        (state / "model-switch.json.tmp").unlink()
+        # A directory under a fresh temp's name is refused at once, not accepted until the sweep trips on it.
+        (state / ".rate.jsonl.9.abcd.tmp").mkdir()
+        rc, err = self.main()
+        self.assertEqual((rc == 0, "state/.rate.jsonl.9.abcd.tmp in" in err and "not a plain file" in err), (False, True), err)
+        (state / ".rate.jsonl.9.abcd.tmp").rmdir()
+        self.assertEqual(self.main()[0], 0)
+
     def test_with_the_marker_only_the_allowlist_is_accepted(self):
         self.assertEqual(self.main()[0], 0)
         for name in ("done", ".rate.jsonl.123.abcd.tmp", ".rate.jsonl.456.abcd.tmp"):
