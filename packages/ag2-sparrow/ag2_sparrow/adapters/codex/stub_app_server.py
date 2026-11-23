@@ -4,7 +4,9 @@
 Echoes the first line of each turn's input as the agentMessage. Markers in the input
 drive failure modes: `[[approval]]` sends an `item/commandExecution/requestApproval`
 request first and echoes the decision; `[[stall]]` never completes until
-`turn/interrupt`; `[[stall-hard]]` ignores the interrupt too.
+`turn/interrupt`; `[[stall-hard]]` ignores the interrupt too. `[[limit]]` fails the turn on the account's usage
+limit (a used-up rate-limit window, an `error` notification, the turn's codexErrorInfo); `[[limit-bare]]` the
+same with no rate-limit window; `[[fail]]` fails it on another error.
 """
 import json
 import os
@@ -172,6 +174,19 @@ for line in sys.stdin:
             PENDING[REQ_ID] = (tid, turn_id, item_id, reply)
             send({"jsonrpc": "2.0", "id": REQ_ID, "method": "item/commandExecution/requestApproval",
                   "params": {"threadId": tid, "turnId": turn_id, "itemId": item_id, "command": ["rm", "-rf", "x"]}})
+        elif "[[limit" in text:
+            error = {"message": "You've hit your usage limit. Upgrade to Pro or try again at 3:05 PM.",
+                     "codexErrorInfo": "usageLimitExceeded", "additionalDetails": None}
+            if "[[limit]]" in text:
+                send({"jsonrpc": "2.0", "method": "account/rateLimits/updated", "params": {"rateLimits": {
+                    "limitId": "codex", "primary": {"usedPercent": 100, "windowDurationMins": 300,
+                                                    "resetsAt": int(time.time()) + 3600}}}})
+            send({"jsonrpc": "2.0", "method": "error",
+                  "params": {"threadId": tid, "turnId": turn_id, "error": error, "willRetry": False}})
+            finish_turn(tid, turn_id, item_id, "", "failed", error)
+        elif "[[fail]]" in text:
+            finish_turn(tid, turn_id, item_id, "", "failed",
+                        {"message": "stream disconnected before completion", "codexErrorInfo": "responseStreamDisconnected"})
         elif p.get("model") == BROKEN:
             finish_turn(tid, turn_id, item_id, "", "failed", {"message": "the model is not available"})
         else:

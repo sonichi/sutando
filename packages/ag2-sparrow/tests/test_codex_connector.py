@@ -21,8 +21,8 @@ from unittest import mock
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import (account_switch, connector_cards, local_task_protocol, model_switch, result_markers,  # noqa: E402
-                         task_io, team_guardrail)
+from ag2_sparrow import (account_switch, connector_cards, local_task_protocol, model_switch, quota_notice,  # noqa: E402
+                         result_markers, task_io, team_guardrail)
 from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
 
 # The note as it was pinned before it moved to the shared owner: proves the move changed no byte.
@@ -1827,6 +1827,104 @@ class HeldRootRefusalTest(unittest.TestCase):
                 rc = cc.main(["--server", "stub", "--work", d])
         self.assertEqual((rc, err.getvalue().strip()), (2, "refusing to start: gone"))
         release.assert_called_once()
+
+
+class QuotaCardTest(CardWorld, unittest.TestCase):
+    """Out of usage: the connector itself queues the account card in the owner's DM, once per limit."""
+
+    def setUp(self):
+        super().setUp()
+        self.home = Path(self.tmp.name) / "codex-home"
+        self.home.mkdir()
+        (self.home / "stub-account").write_text("alice@example.com")
+        patch = mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home)})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def outbox(self):
+        folder = self.bridge / "agent-cards" / "outbox"
+        return [json.loads(p.read_text()) for p in sorted(folder.iterdir())] if folder.is_dir() else []
+
+    def test_a_limit_queues_one_account_card_to_the_owner_dm_and_a_second_limit_tick_nothing(self):
+        self.assertEqual(self.serve("task-1", "[[limit]] hello"), cc.LIMITED_NO_SEND)
+        (queued,) = self.outbox()
+        card = queued["card"]
+        self.assertEqual((queued["room"], card["id"], card["state"]), (self.DM, account_switch.CARD, "pending"))
+        self.assertEqual(card["account_controls"], {"runtime": "codex"})
+        self.assertRegex(card["text"], r"^Codex has reached its usage limit \(resets \d{1,2}:\d\d [AP]M\), so I can't "
+                                       r"answer until then\. Switch to another account or an API key to go on now\. "
+                                       r"I'm signed in as a…@example\.com \(pro\)\. " + re.escape(account_switch.BELOW) + "$")
+        self.assertEqual(metrics(self.work)[-1]["quota"], "quota-card")
+        # Another message while still limited: no second card, and no error line in the room either.
+        self.assertEqual(self.serve("task-2", "[[limit]] again"), cc.LIMITED_NO_SEND)
+        self.assertEqual(len(self.outbox()), 1)
+        ((room, _),) = self.posted()
+        self.assertEqual(room, self.DM)
+        self.serve("task-3", "[[limit-bare]] and again", channel="!room:s.space", kind="room")
+        self.assertEqual((self.outbox(), self.posted()), ([], []), "nothing more once the card is posted")
+        self.assertEqual(json.loads((self.work / "state" / quota_notice.FILE).read_text())["told"], True)
+
+    def test_a_turn_that_answers_clears_the_limit_and_a_later_limit_is_a_new_card(self):
+        self.serve("task-1", "[[limit-bare]] hello")
+        ((_, first),) = self.posted()
+        self.assertIn("(resets 3:05 PM)", first["text"], "the reset time in the error's own words")
+        self.assertTrue(self.serve("task-2", "hello").startswith("STUB echo"))
+        self.assertEqual(metrics(self.work)[-1]["quota"], "quota-cleared")
+        self.serve("task-3", "[[limit-bare]] hello")
+        self.assertEqual(len(self.posted("$card2")), 1, "the limit came back: a second card")
+
+    def test_another_error_queues_no_card(self):
+        self.assertEqual(self.serve("task-1", "[[fail]] hello"), "Codex ended this task with status failed.\n")
+        self.assertEqual(self.outbox(), [])
+        self.assertNotIn("quota", metrics(self.work)[-1])
+
+    def test_with_no_owner_dm_seen_no_card_is_sent_and_the_room_gets_the_limit_in_words(self):
+        said = self.serve("task-1", "[[limit-bare]] hi", channel="!room:s.space", kind="room")
+        self.assertEqual(self.outbox(), [])
+        self.assertIn("Codex has reached its usage limit", said)
+        self.assertNotIn("signed in", said)
+        self.assertEqual(metrics(self.work)[-1]["quota"], "quota-no-room")
+
+    def test_a_dropped_card_is_queued_again_and_a_used_up_window_while_idle_is_a_limit(self):
+        (self.work / "state").mkdir(parents=True)
+        args = cc.build_parser().parse_args(["--work", str(self.work)])
+        args.state, args.bridge_state = str(self.work / "state"), str(self.bridge)
+        c = cc.Connector(FakeRpc, args, note="n")
+        c.rpc.request = lambda method, params=None, timeout=0: {"account": {"type": "apiKey"}}
+        (self.work / "state" / quota_notice.ROOM_FILE).write_text(json.dumps({"room": self.DM}))
+        at = time.time() + 7200
+        self.assertEqual(c.saw_rate_limits({"rateLimits": {"primary": {"usedPercent": 40, "resetsAt": at}}}), "")
+        self.assertEqual(c.saw_rate_limits({"rateLimits": {"secondary": {"usedPercent": 100, "resetsAt": at}}}),
+                         "quota-card")
+        self.assertIn("I'm signed in as an API key.", self.outbox()[0]["card"]["text"])
+        for p in (self.bridge / "agent-cards" / "outbox").iterdir():
+            p.unlink()                                   # the bridge dropped it
+        rec = json.loads((self.work / "state" / quota_notice.FILE).read_text())
+        rec["queued"] = time.time() - connector_cards.MAX_QUEUED_S - 1
+        (self.work / "state" / quota_notice.FILE).write_text(json.dumps(rec))
+        self.assertEqual(c.quota.tick(), "quota-card-dropped")
+        self.assertEqual(c.quota.tick(), "quota-card")
+        self.assertEqual(len(self.outbox()), 1)
+        # Past the reset the runtime gave, a limit is a new one.
+        self.assertEqual(len(self.posted()), 1)
+        with mock.patch.object(c.quota, "now", return_value=at + 1):
+            self.assertEqual(c.quota.tick(), "quota-card-posted")
+            self.assertEqual(c.quota.hit(), "quota-card")
+
+    def test_what_reads_as_a_usage_limit(self):
+        yes = ({"codexErrorInfo": "usageLimitExceeded"}, {"codex_error_info": "usage_limit_exceeded"},
+               {"codexErrorInfo": {"usageLimitExceeded": {}}}, {"message": "You've hit your usage limit."})
+        no = (None, "usage limit", {"codexErrorInfo": "unauthorized", "message": "401"},
+              {"codexErrorInfo": "serverOverloaded", "message": "try again later"}, {"message": "rate limited by MCP tool"})
+        self.assertEqual([cc.usage_limit(e) for e in yes], [True] * len(yes))
+        self.assertEqual([cc.usage_limit(e) for e in no], [False] * len(no))
+        self.assertEqual(quota_notice.reset_from_text("You've hit your usage limit. Try again at 3:05 PM."), "3:05 PM")
+        self.assertEqual(quota_notice.reset_from_text("Limit reached; try again in 2 days 3 hours or upgrade."),
+                         "2 days 3 hours")
+        self.assertEqual(quota_notice.reset_from_text("no time here"), "")
+        self.assertIsNone(cc.limit_reset({"primary": {"usedPercent": 99.9, "resetsAt": 5}}))
+        self.assertEqual(cc.limit_reset({"primary": {"usedPercent": 100, "resetsAt": 5},
+                                         "secondary": {"usedPercent": 100, "resetsAt": 9}}), 9.0)
 
 
 if __name__ == "__main__":
