@@ -696,7 +696,12 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
         try:
             if not is_recorded(ws, rec):
                 return _emit({"status": "refused", "why": "that attempt is not the one under way"}, 2)
-            state, words = do_switch(ws, args.key, restart=restart, ready=ready, live=live)
+            asked = []
+
+            def request_restart():
+                asked.append(True)
+                return restart()
+            state, words = do_switch(ws, args.key, restart=request_restart, ready=ready, live=live)
         finally:
             settle(ws, rec)
             unlock_fd(fd)
@@ -713,7 +718,7 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
             sleep(SETTLE_PAUSE_S)
     return _emit({**out, "outcome": state, "say": words,
                   "verified": "saved-sign-in" if state in ("done", "info") else None,
-                  "restart": "requested", "core_identity": "unconfirmed"},
+                  "restart": "requested" if asked else "not-requested", "core_identity": "unconfirmed"},
                  0 if state == "done" else 1)
 
 
