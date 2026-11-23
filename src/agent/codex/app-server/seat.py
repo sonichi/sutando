@@ -39,7 +39,9 @@ for _p in (str(REPO / "src"), str(Path(__file__).resolve().parent)):
         sys.path.insert(0, _p)
 
 import codex_core_model  # noqa: E402
+import core_quota_notice  # noqa: E402
 import supervised_host  # noqa: E402
+from cli_wedge_patterns import ABNORMAL_PATTERNS, PROVIDER_LIMIT_PATTERNS  # noqa: E402
 from codex_rpc import Rpc  # noqa: E402,F401
 from delivery.task_dispatch import (has_ready_result, owned_task_ids,  # noqa: E402
                                     pending_candidates)
@@ -58,7 +60,12 @@ CLAIMS_DIR = ("state", "task-event-handler-claims")
 WATCHER = REPO / "src" / "watch-tasks-stream.sh"
 WORKSTREAMS = REPO / "skills" / "task-workstream-grouping" / "scripts" / "workstreams.py"
 ACCOUNT_CARD = REPO / "skills" / "account-switch" / "scripts" / "account_card.py"
+# What a refused turn's error says (TurnError.codexErrorInfo, else its message): one kind each, never both.
 UNAUTHORIZED = "unauthorized"
+# The app-server's word for a turn refused on the account's usage; its message is read too, by the CLI's
+# own limit banners.
+USAGE_LIMIT_INFO = "usagelimitexceeded"
+_LIMIT_WORDS = tuple(rx for name, rx in ABNORMAL_PATTERNS if name in PROVIDER_LIMIT_PATTERNS)
 # A turn refused because the login no longer works (its refresh token revoked when another sign-in rotated
 # it); the message is read too, for a server that sends no codexErrorInfo.
 _UNAUTH_WORDS = re.compile(r"refresh token (was|has been) revoked|access token could not be refreshed|"
@@ -77,6 +84,54 @@ DECLINES = {
     "execCommandApproval": {"decision": "denied"},
     "applyPatchApproval": {"decision": "denied"},
 }
+
+
+def error_kind(error) -> Optional[str]:
+    """USAGE_LIMIT_INFO, UNAUTHORIZED or None for a turn's error (a TurnError, an `error` notification's,
+    or a bare message). codexErrorInfo decides when it names either; otherwise the message, a limit banner
+    first: out of usage is not fixed by a restart, so it is never taken for a refused login."""
+    if isinstance(error, str):
+        message = error
+    elif isinstance(error, dict):
+        info = error.get("codexErrorInfo", error.get("codex_error_info"))
+        names = {re.sub(r"[^a-z]", "", str(n).lower())
+                 for n in (list(info) if isinstance(info, dict) else [info]) if n}
+        for kind in (USAGE_LIMIT_INFO, UNAUTHORIZED):
+            if kind in names:
+                return kind
+        message = str(error.get("message") or "")
+    else:
+        return None
+    if any(rx.search(message) for rx in _LIMIT_WORDS):
+        return USAGE_LIMIT_INFO
+    if _UNAUTH_WORDS.search(message):
+        return UNAUTHORIZED
+    return None
+
+
+def usage_limit(error) -> bool:
+    """Whether a turn's error (a TurnError, or an `error` notification's) says the account is out of usage."""
+    return isinstance(error, dict) and error_kind(error) == USAGE_LIMIT_INFO
+
+
+def unauthorized(error) -> bool:
+    """Whether a turn's error (its `error` object, or a message) says the login no longer works."""
+    return error_kind(error) == UNAUTHORIZED
+
+
+def limit_reset(snapshot) -> Optional[float]:
+    """From an `account/rateLimits` snapshot: when a used-up window resets (epoch seconds, the latest of
+    several); None when none is used up or it does not say."""
+    if not isinstance(snapshot, dict):
+        return None
+    found = []
+    for name in ("primary", "secondary"):
+        window = snapshot.get(name)
+        if isinstance(window, dict):
+            used, at = window.get("usedPercent"), window.get("resetsAt")
+            if isinstance(used, (int, float)) and used >= 100 and isinstance(at, (int, float)) and at > 0:
+                found.append(float(at))
+    return max(found) if found else None
 
 
 class SeatFatal(RuntimeError):
@@ -133,19 +188,6 @@ def log(*parts) -> None:
                 f.write(time.strftime("%Y-%m-%d ") + line + "\n")
         except OSError:
             pass
-
-
-def unauthorized(error) -> bool:
-    """Whether a turn's error (its `error` object, or a message) says the login no longer works."""
-    if isinstance(error, str):
-        return bool(_UNAUTH_WORDS.search(error))
-    if not isinstance(error, dict):
-        return False
-    info = error.get("codexErrorInfo", error.get("codex_error_info"))
-    names = list(info) if isinstance(info, dict) else [info]
-    if any(re.sub(r"[^a-z]", "", str(n).lower()) == UNAUTHORIZED for n in names if n):
-        return True
-    return bool(_UNAUTH_WORDS.search(str(error.get("message") or "")))
 
 
 def auth_file() -> str:
@@ -260,7 +302,8 @@ class Seat:
                  instructions: str = "", poll_s: float = 2.0, retry_s: float = 30.0,
                  hold_s: float = 900.0, max_attempts: int = 2, backoff_s: float = 2.0,
                  turn_timeout: float = 0.0, interrupt_grace: float = 30.0,
-                 context: Optional[Callable[[str], str]] = None, clock: Callable[[], float] = time.time):
+                 context: Optional[Callable[[str], str]] = None, clock: Callable[[], float] = time.time,
+                 quota: Optional["core_quota_notice.QuotaNotice"] = None):
         self.host, self.workspace, self.seat, self.worker = host, Path(workspace), seat, worker
         # `-c` before the subcommand: the desktop app counts a core alive only when the program
         # it reads up to the first flag is `codex`, and `codex app-server -c` reads as `codex app-server`.
@@ -270,6 +313,9 @@ class Seat:
         self.poll_s, self.retry_s, self.hold_s, self.max_attempts = poll_s, retry_s, hold_s, max_attempts
         self.backoff_s, self.turn_timeout, self.interrupt_grace = backoff_s, turn_timeout, interrupt_grace
         self.context, self.clock = context, clock
+        self.quota = quota            # the core's quota notice; a worker's seat has none
+        self.rate_limits: dict = {}   # the last `account/rateLimits/updated` snapshot
+        self.turn_limit: Optional[dict] = None  # the current turn's error when it said out of usage
         # The switch revision this seat's launch model came from; a later one is the next turn's.
         self.model_rev = self.launch_rev()
         # (model, rev, the model to restore, sent on turn/start) until Codex settles it
@@ -754,6 +800,7 @@ class Seat:
                 self.abandon_trial()
 
     def _run_turn(self, filename: str, prompt: str) -> Tuple[str, str]:
+        self.turn_limit = None
         params = {"threadId": self.thread_id, "cwd": self.cwd, "input": [{"type": "text", "text": prompt}]}
         model = self.turn_model()
         if model:
@@ -795,12 +842,18 @@ class Seat:
                 self.answer_server_request(m)
             elif m:
                 method, params = m.get("method"), m.get("params") or {}
+                if method == "account/rateLimits/updated" and isinstance(params.get("rateLimits"), dict):
+                    self.rate_limits = params["rateLimits"]
+                elif method == "error" and params.get("turnId") in (None, turn_id) and usage_limit(params.get("error")):
+                    self.turn_limit = params["error"]
                 if params.get("threadId") in (None, self.thread_id):
                     turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
                     if method == "turn/completed" and turn.get("id") == turn_id:
                         status = turn.get("status") or "failed"
                         error = (turn.get("error") or {}).get("message") or ""
-                        if status != "completed" and unauthorized(turn.get("error")):
+                        if usage_limit(turn.get("error")):
+                            self.turn_limit = turn["error"]
+                        elif status != "completed" and unauthorized(turn.get("error")):
                             self.turn_unauth = True
                         if status == "completed":
                             self.settle_model(True)
@@ -944,6 +997,7 @@ class Seat:
         took = f"{time.monotonic() - started:.1f}s"
         if status == "completed":
             self.failures = 0
+        self.quota_step(status)
         if has_ready_result(results, filename):
             if not self.still_admitted(filename, payload, picked):
                 aside = self.set_result_aside(filename)
@@ -975,6 +1029,24 @@ class Seat:
         log(f"task {filename}: turn {what} {results}/{filename} after {took}; the task stays pending "
             f"(attempt {rec['attempts']}, next try in {wait:g}s)")
         return outcome
+
+    def quota_step(self, status: str) -> None:
+        """Out of usage: the owner gets the account card once per limit (core_quota_notice); a turn
+        that completed ends the limit. A notice that cannot be sent never stops the seat."""
+        if self.quota is None:
+            return
+        try:
+            if self.turn_limit is not None:
+                at = limit_reset(self.rate_limits)
+                reset = (core_quota_notice.reset_from_epoch(at) if at else
+                         core_quota_notice.reset_from_text(self.turn_limit.get("message")))
+                done = self.quota.hit(reset, at)
+            else:
+                done = self.quota.cleared() if status == "completed" else ""
+        except Exception as e:  # noqa: BLE001 - advisory
+            done = f"quota-failed ({type(e).__name__})"
+        if done:
+            log(f"quota: {done}")
 
     # ---- the loop ----
 
@@ -1135,7 +1207,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 sandbox=a.sandbox, instructions=a.instructions, context=workstream_context,
                 poll_s=_number("SUTANDO_SEAT_POLL_S", 2.0), retry_s=_number("SUTANDO_SEAT_RETRY_S", 30.0),
                 hold_s=_number("SUTANDO_SEAT_HOLD_S", 900.0), backoff_s=_number("SUTANDO_SEAT_BACKOFF_S", 2.0),
-                turn_timeout=_number("SUTANDO_SEAT_TURN_TIMEOUT", 0.0))
+                turn_timeout=_number("SUTANDO_SEAT_TURN_TIMEOUT", 0.0),
+                quota=None if a.worker or not ACCOUNT_CARD.is_file() else core_quota_notice.QuotaNotice(
+                    workspace, "Codex", core_quota_notice.card_sender([sys.executable, str(ACCOUNT_CARD)], workspace, log),
+                    log))
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, seat.request_stop)
     watcher = Watcher(host.inbox, seat.wake) if a.watcher else None

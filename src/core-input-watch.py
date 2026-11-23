@@ -75,6 +75,7 @@ import cli_wedge  # noqa: E402
 import core_block_signal  # noqa: E402
 import core_gate_notice  # noqa: E402
 import core_limit_hold  # noqa: E402
+import core_quota_notice  # noqa: E402
 import core_recovery_state  # noqa: E402
 import self_opened_gate  # noqa: E402
 import tmux_probe  # noqa: E402
@@ -1125,13 +1126,52 @@ def drive_escalations(manager, session, prompt, state, send):
 _REPO = _Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 
 
+_LIMIT_LINE = tuple(rx for name, rx in cli_wedge.ABNORMAL_PATTERNS if name in cli_wedge.PROVIDER_LIMIT_PATTERNS)
+
+
+def limit_reset(text, now=None):
+    """(words, epoch or None): when the limit banner's own line says it resets; ('', None) when it does
+    not. No other line of the pane is read: none of it may reach the DM."""
+    now = time.time() if now is None else now
+    for line in reversed(str(text or "").splitlines()):
+        if any(rx.search(line) for rx in _LIMIT_LINE):
+            at = core_limit_hold.parse_reset(line, now)
+            return (core_quota_notice.reset_from_epoch(at, now) if at else core_quota_notice.reset_from_text(line)), at
+    return "", None
+
+
+def quota_step(quota, limited, text, now=None):
+    """The core's quota notice (core_quota_notice): the account card once per limit, cleared once the
+    pane shows the core idle or working again. Never fatal to the monitor."""
+    if quota is None:
+        return ""
+    try:
+        done = quota.hit(*limit_reset(text, now)) if limited else quota.cleared()
+    except Exception as exc:  # noqa: BLE001
+        done = f"quota-failed ({type(exc).__name__})"
+    if done:
+        print(f"quota: {done}", file=_sys.stderr, flush=True)
+    return done
+
+
+def card_replaces_notice(quota, kind, prompt, now=None):
+    """Whether the core's usage-limit screen is told by the account card, posted, in place of the
+    paused notice and the monitor's limit card. A rate limit keeps its notice."""
+    if quota is None or not is_usage_limit(kind, prompt):
+        return False
+    limit = core_limit_hold.classify_text(prompt or "", time.time() if now is None else now)
+    return (limit is None or limit.kind == "usage-limit") and quota.carded()
+
+
 def limit_reply_step(workspace, settled, seen, pane, runtime, now=None, repo=_REPO,
-                     seat=None, label=None, retry_cmd=None, card_surface=False):
+                     seat=None, label=None, retry_cmd=None, card_surface=False, quota=None):
     """While a live seat stands at a provider-limit screen, hold it and act on the owner's bare
     "switch to <model>" / "retry now" replies (core_limit_hold). Once its pane shows it idle or
     working again, a hold that screen caused is lifted. `settled` and `seen` are (state, kind,
     prompt) after and before the debounce. The core's seat is `seat` None; a worker seat (its tmux
-    session) acts only with the `retry_cmd` argv its pool injected. Returns the reply ids acted on."""
+    session) acts only with the `retry_cmd` argv its pool injected. The core's `quota` notice, when
+    given, sends the account card for a usage limit in place of the paused notice; a card that cannot
+    be posted leaves the notice to tell it. Returns the reply ids acted on."""
     if runtime not in (None, "claude"):
         return []  # the hold, its replies and the model aliases are Claude Code's
     if seat and not retry_cmd:
@@ -1142,14 +1182,23 @@ def limit_reply_step(workspace, settled, seen, pane, runtime, now=None, repo=_RE
     try:
         state, kind, prompt = settled
         if state == "blocked-human" and is_usage_limit(kind, prompt):
+            carded = False
+            limit = core_limit_hold.classify_text(prompt or "", time.time() if now is None else now)
+            if not seat and quota is not None and (limit is None or limit.kind == "usage-limit"):
+                quota_step(quota, True, prompt, now)
+                carded = card_replaces_notice(quota, kind, prompt, now)
+                if not carded:
+                    quota.yield_to_notice()
             if core_limit_hold.hold_while_wedged(workspace, prompt, now, seat=seat, seat_label=label,
-                                                 card_surface=card_surface) is None:
+                                                 card_surface=card_surface, account_card=carded) is None:
                 return []
             return core_limit_hold.handle_owner_actions(workspace, now, relaunch=relaunch, seat=seat)
         seen_state, seen_kind, seen_prompt = seen
         if pane and pane.strip() and not (seen_state == "blocked-human" and is_usage_limit(seen_kind, seen_prompt)) \
                 and ((_is_idle_ready(pane, runtime) and refused_turn(pane) is None) or cli_wedge.frame_working(pane)):
             core_limit_hold.release_pane_hold(workspace, now, seat=seat)
+            if not seat:
+                quota_step(quota, False, "", now)
     except Exception as exc:  # noqa: BLE001 — never let the hold take down the monitor
         print(f"limit reply step failed: {exc}", file=_sys.stderr)
     return []
@@ -1194,6 +1243,9 @@ def main():
     ap.add_argument("--retry-cmd", default="",
                     help="a worker seat's restart, as one shell-quoted argv its pool injects; with it "
                          "the owner's \"retry now\" reply to the seat's limit pause restarts that seat")
+    ap.add_argument("--quota-card-script", default="",
+                    help="the core's account card script; with it a usage-limit screen sends the owner "
+                         "that card in their DM, once per limit")
     a = ap.parse_args()
     if a.helper_receipt_dir:
         from external_core_helpers import publish
@@ -1233,6 +1285,13 @@ def main():
     last_live_pane = None
     state_dir = os.path.dirname(os.path.abspath(a.out))
     workspace = _Path(os.path.dirname(state_dir))
+    quota = None
+    if a.quota_card_script and not a.seat and os.path.isfile(a.quota_card_script):
+        def _log(*parts):
+            print(*parts, file=_sys.stderr, flush=True)
+        quota = core_quota_notice.QuotaNotice(
+            workspace, "Claude Code",
+            core_quota_notice.card_sender([_sys.executable, a.quota_card_script], workspace, _log), _log)
     while True:
         # Before the capture, so this tick reads the pane a recovery action left.
         if a.chat_escalation:
@@ -1297,7 +1356,7 @@ def main():
             limit_reply_step(workspace, (state, kind, prompt), (seen_state, seen_kind, seen_prompt),
                              pane, runtime, seat=a.session if a.seat else None, label=a.seat or None,
                              retry_cmd=shlex.split(a.retry_cmd) if a.retry_cmd else None,
-                             card_surface=a.chat_escalation)
+                             card_surface=a.chat_escalation, quota=quota)
 
         # The actor: only a settled, allowlisted gate is typed at, once per instance.
         key = answer_step(state, kind, prompt, answered_prompt, a.auto_answer)
@@ -1359,7 +1418,9 @@ def main():
                             socket=a.socket, seat=a.seat or None,
                             retry_cmd=shlex.split(a.retry_cmd) if a.retry_cmd else None)
             verdict, idle_ticks = card_step(bool(pane and pane.strip()), state, idle_ticks, a.stable, settling)
-            if verdict == "escalate":
+            if verdict == "escalate" and not a.seat and card_replaces_notice(quota, kind, prompt):
+                pass  # the account card is this limit's one message (limit_reply_step)
+            elif verdict == "escalate":
                 drive_escalations(hitl, a.session, prompt, state,
                                   lambda k: send_keys(a.socket, a.session, k))
                 # Only the core's own seat owns tasks/; a worker's queue lives elsewhere.

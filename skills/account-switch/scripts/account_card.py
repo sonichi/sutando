@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """A card in the owner's DM that says which account the core is signed in to and switches it.
 
-    python3 account_card.py [--workspace WS] post [--room ROOM] [--reply-to EVENT] [--print] [--signed-out]
+    python3 account_card.py [--workspace WS] post [--room ROOM | --owner-dm] [--reply-to EVENT] [--print]
+                                              [--signed-out] [--lead TEXT]
     python3 account_card.py [--workspace WS] reply --task-file PATH
     python3 account_card.py [--workspace WS] switch --room ROOM --key KEY --attempt ID
     python3 account_card.py [--workspace WS] status
@@ -11,7 +12,10 @@ owner's tap on it acts (agent_card.click_verdict); without `--room` it goes to t
 (the Codex seat, when the core's login is refused even after a restart) leads with "Codex isn't signed
 in anymore." instead of the account in use. It names the account in use: on a Codex core
 (TUI or app-server seat) from src/codex_account.py, on a Claude core from `claude auth status --json`
-under the core's config dir. Addresses are shown masked (first letter and domain).
+under the core's config dir. Addresses are shown masked (first letter and domain). `--owner-dm`
+names that same DM explicitly (the core's quota notice, src/core_quota_notice.py, uses it), and
+`--lead` puts a line before the card's words, saying why it was sent unasked; with `--signed-out` it
+replaces the "isn't signed in anymore" line.
 
 Saved accounts are the desktop's store for the Sutando core on Codex
 (`<app support>/accounts/codex/<key>.json`, {label, auth}, folder 0700, files 0600; desktop
@@ -302,9 +306,10 @@ def in_use_words(cur: dict) -> str:
 
 # ── the card ──────────────────────────────────────────────────────────────────────────────────────
 
-def menu_card(cur: dict, others: list, signed_out: bool = False) -> tuple:
+def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "") -> tuple:
     """(body, card): a "Use" button per other saved account (up to five), then "Add another account".
-    `signed_out`: the core's login was refused, so the card says so instead of naming the account in use."""
+    `lead`, when given, opens the card's words and its fallback line. `signed_out`: the core's login was
+    refused, so the card drops the account in use and, with no `lead`, opens with SIGNED_OUT."""
     buttons = []
     for s in others[:USE_BUTTONS]:
         label = ("Use " + masked_label(s["label"]))[: ac.LIMITS["label"]]
@@ -312,15 +317,19 @@ def menu_card(cur: dict, others: list, signed_out: bool = False) -> tuple:
                                  command=ac.reply(KIND, TARGET, s["key"])))
     buttons.append(ac.button("Add another account", "reply", style="primary", reply="Add another account",
                              command=ac.reply(KIND, TARGET, ADD)))
-    using = SIGNED_OUT if signed_out else in_use_words(cur)
+    if signed_out:
+        lead = lead or SIGNED_OUT
     if cur["runtime"] == "codex":
         more = (" Pick a saved account to switch to; the core restarts on it." if others else
                 " No other account is saved on this computer yet.")
     else:
         more = " To use another Anthropic account, add it in Settings."
     note = f"{NO_CODE} Adding an account happens in Settings, where the app takes the code."
-    return ac.build(CARD_ID, "info", title="Core account", avatar_=ac.avatar(initial="A"), text=using + more,
-                    buttons=buttons, note=note, note_tone="dim", body=f"{using} Reply \"switch account\" for options.")
+    lead = ac.md_escape(lead)[:1000]
+    words = " ".join(w for w in (lead, "" if signed_out else in_use_words(cur)) if w)
+    return ac.build(CARD_ID, "info", title="Core account", avatar_=ac.avatar(initial="A"),
+                    text=words + more, buttons=buttons, note=note, note_tone="dim",
+                    body=f"{words} Reply \"switch account\" for options.")
 
 
 def notice_card(state: str, status: str, words: str) -> tuple:
@@ -403,7 +412,7 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time, run=subp
             pass  # the card still names the account; only the copy for switching back is missing
     others = [s for s in saved(store, cur["key"]) if not s["current"]]
     try:
-        body, card = menu_card(cur, others, signed_out=args.signed_out)
+        body, card = menu_card(cur, others, signed_out=args.signed_out, lead=args.lead or "")
     except ac.CardError as e:
         return _emit({"status": "failed", "why": str(e)}, 1)
     if args.print:
@@ -742,8 +751,12 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, run=subp
     p.add_argument("--workspace", default=None)
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("post")
-    s.add_argument("--room", default="", help="the owner's DM (default: the core's checked owner DM)")
+    to = s.add_mutually_exclusive_group()
+    to.add_argument("--room", default="", help="the owner's DM (default: the core's checked owner DM)")
+    to.add_argument("--owner-dm", action="store_true",
+                    help="the core lane's checked owner DM (the default when --room is not given)")
     s.add_argument("--reply-to", default="")
+    s.add_argument("--lead", default="", help="a line that opens the card's words")
     s.add_argument("--print", action="store_true")
     s.add_argument("--signed-out", action="store_true", help="the core's login was refused: say so first")
     r = sub.add_parser("reply")

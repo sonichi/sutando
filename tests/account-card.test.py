@@ -233,6 +233,25 @@ class CodexCard(Base):
         self.assertFalse(self.store.exists())
         self.assertNotIn("sk-SECRET-key", "".join(self.outputs))
 
+    def test_the_quota_notice_posts_to_the_owner_dm_led_by_its_words(self):
+        self.signed_in(A)
+        lead = "Codex has reached its usage limit (resets 3:05 PM), so I can't answer until then."
+        rc, out = self.run_(["post", "--owner-dm", "--lead", lead])
+        self.assertEqual((rc, out["status"]), (0, "posted"))
+        self.assertEqual(self.fake.calls[0][3], DM)
+        card = self.fake.cards()[0]
+        self.assertIsNone(ac.problem(card))
+        self.assertTrue(card["text"].startswith(lead + " The core (Codex) is signed in as a…@example.com"))
+        self.assertTrue(self.fake.calls[0][1]["body"].startswith(lead))
+        self.assertEqual(card["buttons"][-1]["label"], "Add another account")
+
+    def test_the_quota_notice_with_no_owner_dm_posts_nothing(self):
+        self.signed_in(A)
+        with mock.patch.object(acc, "_owner_dm", lambda ws, core: ""):
+            rc, out = self.run_(["post", "--owner-dm", "--lead", "x"])
+        self.assertEqual((rc, out["status"]), (1, "failed"))
+        self.assertEqual(self.fake.calls, [])
+
     def test_the_card_goes_only_to_the_owner_dm(self):
         self.signed_in(A)
         rc, out = self.run_(["post", "--room", ROOM])
@@ -249,6 +268,16 @@ class CodexCard(Base):
         self.assertTrue(card["text"].startswith(acc.SIGNED_OUT + " Pick a saved account"), card["text"])
         self.assertNotIn("signed in as", card["text"])
         self.assertEqual([b["label"] for b in card["buttons"]], ["Use b…@work.io (pro)", "Add another account"])
+        self.assertEqual(self.fake.calls[0][3], DM)
+
+    def test_a_lead_replaces_the_signed_out_line_and_owner_dm_is_the_default_dm(self):
+        self.signed_in(A)
+        rc, out = self.run_(["post", "--owner-dm", "--signed-out", "--lead", "Out of usage."])
+        self.assertEqual((rc, out["status"]), (0, "posted"))
+        card = self.fake.cards()[0]
+        self.assertTrue(card["text"].startswith("Out of usage. No other account"), card["text"])
+        self.assertNotIn(acc.SIGNED_OUT, card["text"])
+        self.assertNotIn("signed in as", card["text"])
         self.assertEqual(self.fake.calls[0][3], DM)
 
     def test_status_lists_in_use_and_saved_masked(self):

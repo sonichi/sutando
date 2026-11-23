@@ -176,6 +176,19 @@ for line in sys.stdin:
         elif step == "unauth":
             out({"method": "error", "params": {"threadId": thread, "error": UNAUTH}})
             finish("failed", UNAUTH)
+        elif step in ("limit", "limit-bare"):
+            error = {"message": "You've hit your usage limit. Upgrade to Pro or try again at 3:05 PM.",
+                     "codexErrorInfo": "usageLimitExceeded", "additionalDetails": None}
+            if step == "limit":
+                out({"method": "account/rateLimits/updated", "params": {"rateLimits": {
+                    "limitId": "codex", "primary": {"usedPercent": 100, "windowDurationMins": 300,
+                                                    "resetsAt": 4102444800}}}})
+            out({"method": "error", "params": {"threadId": thread, "turnId": turn, "error": error,
+                                               "willRetry": False}})
+            finish("failed", error)
+        elif step == "fail-other":
+            finish("failed", {"message": "stream disconnected before completion",
+                              "codexErrorInfo": "responseStreamDisconnected"})
         elif step == "die":
             os._exit(7)
         elif step == "die_after_result":
@@ -1221,6 +1234,119 @@ class CoreModelSwitch(SeatCase):
         (self.ws / "state" / "model-switch.json").write_text(json.dumps({"model": "opus", "accepted": True}))
         s = self.launched(0)
         self.assertEqual(s.turn_model(), "")
+
+
+class QuotaCard(SeatCase):
+    """Out of usage, the core seat sends the owner the account card once per limit (core_quota_notice)."""
+
+    def quota(self, posted=True):
+        import core_quota_notice
+        self.cards = []
+
+        def send(text):
+            self.cards.append(text)
+            return posted
+        return core_quota_notice.QuotaNotice(self.ws, "Codex", send, log=lambda *a: None, now=lambda: self.now[0])
+
+    def test_a_limit_sends_one_card_with_the_reset_and_a_second_limit_sends_none(self):
+        self.task("task-1.txt")
+        self.plan("limit", "limit")
+        s = self.make(quota=self.quota())
+        s.ensure_server()
+        self.assertEqual(s.step(), "failed")
+        self.assertEqual(len(self.cards), 1)
+        import core_quota_notice
+        self.assertIn("Codex has reached its usage limit (resets %s)" % core_quota_notice.reset_from_epoch(4102444800),
+                      self.cards[0])
+        self.assertTrue(json.loads((self.ws / "state" / "core-quota-card.json").read_text())["told"])
+        self.now[0] += 3600
+        self.assertEqual(s.step(), "failed")
+        self.assertEqual(len(self.cards), 1, "a second card for the same limit")
+        self.assertIn("quota: quota-card", self.out.getvalue())
+
+    def test_the_errors_own_words_give_the_reset_when_no_window_says(self):
+        self.task("task-1.txt")
+        self.plan("limit-bare")
+        s = self.make(quota=self.quota())
+        s.ensure_server()
+        s.step()
+        self.assertIn("(resets 3:05 PM)", self.cards[0])
+
+    def test_another_error_sends_no_card(self):
+        self.task("task-1.txt")
+        self.plan("fail-other")
+        s = self.make(quota=self.quota())
+        s.ensure_server()
+        self.assertEqual(s.step(), "failed")
+        self.assertEqual(self.cards, [])
+
+    def test_a_completed_turn_ends_the_limit_and_a_later_one_is_a_new_card(self):
+        self.task("task-1.txt")
+        self.plan("limit", "result", "limit")
+        s = self.make(quota=self.quota(), retry_s=0.0)
+        s.ensure_server()
+        s.step()
+        self.assertEqual(s.step(), "done")
+        self.assertFalse(json.loads((self.ws / "state" / "core-quota-card.json").read_text()))
+        self.task("task-2.txt")
+        s.step()
+        self.assertEqual(len(self.cards), 2)
+
+    def test_a_card_that_was_not_posted_is_tried_again_later_not_every_turn(self):
+        self.task("task-1.txt")
+        self.plan("limit", "limit", "limit")
+        s = self.make(quota=self.quota(posted=False), retry_s=0.0, hold_s=0.0)
+        s.ensure_server()
+        s.step()
+        s.step()
+        self.assertEqual(len(self.cards), 1, "tried again inside the retry interval")
+        self.now[0] += 61
+        s.step()
+        self.assertEqual(len(self.cards), 2)
+
+    def test_a_seat_without_a_notice_sends_nothing_and_the_core_seat_names_the_account_card(self):
+        self.task("task-1.txt")
+        self.plan("limit")
+        s = self.make()
+        s.ensure_server()
+        self.assertEqual(s.step(), "failed")
+        self.assertFalse((self.ws / "state" / "core-quota-card.json").exists())
+        self.assertTrue(seat_mod.ACCOUNT_CARD.is_file())
+
+    def test_a_limit_is_not_a_refused_login_and_a_refused_login_is_not_a_limit(self):
+        self.task("task-1.txt")
+        self.plan("limit")
+        s = self.make(quota=self.quota())
+        s.ensure_server()
+        self.assertEqual(s.step(), "failed", "out of usage is not `unauthorized`")
+        self.assertEqual(len([r for r in self.sent() if "argv" in r]), 1, "no restart for a limit")
+        self.assertNotIn("turn refused as unauthorized", self.out.getvalue())
+        self.assertEqual(len(self.cards), 1)
+        self.task("task-2.txt")
+        self.plan("unauth", "unauth")
+        s.card_argv = [sys.executable, "-c", "pass"]
+        self.assertEqual(s.step(), seat_mod.UNAUTHORIZED)
+        self.assertEqual(len(self.cards), 1, "a refused login sends no quota card")
+
+    def test_the_two_kinds_never_collide(self):
+        limit = ({"codexErrorInfo": "usageLimitExceeded", "message": "401 Unauthorized"},
+                 {"message": "You've hit your usage limit. Log out and sign in again."}, "usage limit reached")
+        unauth = ({"codexErrorInfo": "unauthorized", "message": "You've hit your usage limit."},
+                  {"message": "refresh token was revoked"})
+        for e in limit:
+            self.assertEqual((seat_mod.error_kind(e), seat_mod.unauthorized(e)), (seat_mod.USAGE_LIMIT_INFO, False), e)
+        for e in unauth:
+            self.assertEqual((seat_mod.error_kind(e), seat_mod.usage_limit(e)), (seat_mod.UNAUTHORIZED, False), e)
+
+    def test_usage_limit_and_limit_reset(self):
+        self.assertTrue(seat_mod.usage_limit({"codexErrorInfo": "usageLimitExceeded"}))
+        self.assertTrue(seat_mod.usage_limit({"codexErrorInfo": {"usage_limit_exceeded": {}}}))
+        self.assertTrue(seat_mod.usage_limit({"message": "You've hit your usage limit."}))
+        self.assertFalse(seat_mod.usage_limit({"message": "stream disconnected", "codexErrorInfo": "other"}))
+        self.assertFalse(seat_mod.usage_limit(None))
+        self.assertEqual(seat_mod.limit_reset({"primary": {"usedPercent": 100, "resetsAt": 10},
+                                               "secondary": {"usedPercent": 100, "resetsAt": 20}}), 20.0)
+        self.assertIsNone(seat_mod.limit_reset({"primary": {"usedPercent": 99, "resetsAt": 10}}))
 
 
 class CoreQueue(SeatCase):
