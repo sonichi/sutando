@@ -384,6 +384,40 @@ class UnreadableRecordsDegradeToAbsent(unittest.TestCase):
             (row,) = pool_sessions.sessions(ws, probe=EXISTS)
             self.assertTrue(row["seat"])
 
+    def test_a_codex_row_is_read_only_while_its_launch_is_in_progress(self):
+        """A new seat can be in tmux before its run stamp: while spawn holds the launch lock,
+        an earlier stamp must not make the pane look typable."""
+        import spawn_worker
+        with tempfile.TemporaryDirectory() as d:
+            ws = self._codex_seat_ws(d, "i-tui-run", "i-old-seat-run")
+            name = f"sutando-worker-{W1}"
+            (row,) = pool_sessions.sessions(ws, probe=EXISTS)
+            self.assertFalse(row["seat"])
+            with spawn_worker.launch_lock(ws, name):
+                (row,) = pool_sessions.sessions(ws, probe=EXISTS)
+                self.assertTrue(row["seat"])
+                self.assertTrue(pool_sessions.launch_in_progress(ws, name))
+            (row,) = pool_sessions.sessions(ws, probe=EXISTS)
+            self.assertFalse(row["seat"])
+            self.assertFalse(pool_sessions.launch_in_progress(ws, name))
+
+    def test_a_claude_row_is_never_a_seat_even_mid_launch(self):
+        import spawn_worker
+        with tempfile.TemporaryDirectory() as d:
+            ws = workspace_with(Path(d), {W1: {"state": "live", "runtime": "claude"}},
+                                {}, {W1: [open_run(W1)]})
+            with spawn_worker.launch_lock(ws, f"sutando-worker-{W1}"):
+                (row,) = pool_sessions.sessions(ws, probe=EXISTS)
+                self.assertFalse(row["seat"])
+
+    def test_a_lock_file_that_cannot_be_locked_is_not_a_launch(self):
+        with tempfile.TemporaryDirectory() as d:
+            lock = Path(d) / "state" / "worker-launch" / "s.lock"
+            lock.parent.mkdir(parents=True)
+            lock.write_text("")
+            with mock.patch.object(pool_sessions.fcntl, "flock", side_effect=OSError("no locks here")):
+                self.assertFalse(pool_sessions.launch_in_progress(Path(d), "s"))
+
     def test_a_tui_run_with_no_declaration_is_not_a_seat(self):
         with tempfile.TemporaryDirectory() as d:
             run = dict(open_run(W1), started_at="2026-11-22T20:00:00Z")

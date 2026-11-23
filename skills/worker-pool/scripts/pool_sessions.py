@@ -16,6 +16,7 @@ session key at all.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import sys
 from pathlib import Path
@@ -67,6 +68,8 @@ def is_seat(workspace, runtime: str, session_name: str, incarnation: "dict | Non
     either id is unknown the bare rule holds, so an unknown case stays read-only."""
     if runtime != "codex":
         return False
+    if launch_in_progress(workspace, session_name):
+        return True
     seat_dir = Path(workspace) / "state" / "codex-seat" / session_name
     if not (seat_dir / "host.json").is_file():
         return False
@@ -76,6 +79,25 @@ def is_seat(workspace, runtime: str, session_name: str, incarnation: "dict | Non
         stamped = ""
     current = str((incarnation or {}).get("incarnation_id") or "")
     return not (stamped and current) or stamped == current
+
+
+def launch_in_progress(workspace, session_name: str) -> bool:
+    """Whether a spawn holds this session's launch lock (spawn_worker.launch_lock): until it
+    commits, a new seat can be in tmux before its run stamp is, so the row fails closed."""
+    path = Path(workspace) / "state" / "worker-launch" / f"{session_name}.lock"
+    try:
+        fh = open(path, "r")
+    except OSError:
+        return False
+    with fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    return False
 
 
 def rooms_bound_to(roster: dict, worker_id: str) -> list:
