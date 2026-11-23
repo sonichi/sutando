@@ -85,16 +85,33 @@ seat_wait_ready() {
   return 1
 }
 
+# seat_stop <session|window> <tmux id>: stop exactly the seat this launch started (by its tmux id,
+# never a reusable name or index) and confirm it is gone; loud and nonzero when it is not.
+seat_stop() {
+  local kind="$1" target="$2"
+  if [ -n "$target" ]; then
+    tmux -S "$TMUX_SOCKET" "kill-$kind" -t "$target" 2>/dev/null || true
+    if [ "$kind" = session ]; then
+      tmux -S "$TMUX_SOCKET" has-session -t "$target" 2>/dev/null || return 0
+    else
+      tmux -S "$TMUX_SOCKET" list-windows -a -F '#{window_id}' 2>/dev/null | grep -qxF -- "$target" || return 0
+    fi
+  fi
+  echo "  ✗ could not stop the unready Codex app-server seat ($kind ${target:-of unknown id}) — intake stays shut; stop it by hand (tmux -S $TMUX_SOCKET kill-$kind -t ${target:-=$SESSION}) before the next launch." >&2
+  return 1
+}
+
 seat_start_core_session_and_helpers() {
+  local seat_id
   seat_core_prepare || return 1
   prepare_codex_home
   rm -f "$SEAT_READY"
-  tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" "${SEAT_ENV_ARGS[@]}" \
-    "$SEAT_CLI" "${SEAT_ARGS[@]}"
+  seat_id="$(tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" "${SEAT_ENV_ARGS[@]}" \
+    -P -F '#{session_id}' "$SEAT_CLI" "${SEAT_ARGS[@]}")" || seat_id=""
   wait_core_up "$SESSION" session_exists "$SESSION" || return 1
   if ! seat_wait_ready; then
     # Torn down, not left starting: a later launch would find it live and skip this readiness check.
-    tmux -S "$TMUX_SOCKET" kill-session -t "=$SESSION" 2>/dev/null || true
+    seat_stop session "$seat_id"
     return 1
   fi
   log_session_start
@@ -124,6 +141,8 @@ seat_heal_core_window() {
     echo "  ⚠ could not create a seat window in $SESSION — sentinel NOT cleared, no core is serving." >&2
     return 1
   fi
+  local win_id
+  win_id="$(tmux -S "$TMUX_SOCKET" display-message -p -t "=$SESSION:$idx" '#{window_id}' 2>/dev/null)" || win_id=""
   low="$(tmux -S "$TMUX_SOCKET" list-windows -t "=$SESSION" -F '#{window_index}' 2>/dev/null | sort -n | head -1)"
   if [ -n "$low" ] && [ "$low" != "$idx" ]; then
     tmux -S "$TMUX_SOCKET" swap-window -d -s "=$SESSION:$idx" -t "=$SESSION:$low" 2>/dev/null && idx="$low"
@@ -132,7 +151,7 @@ seat_heal_core_window() {
   tmux -S "$TMUX_SOCKET" set-environment -t "=$SESSION" SUTANDO_CORE_RUNTIME codex 2>/dev/null || true
   wait_core_up "the healed seat window" codex_core_live || return 1
   if ! seat_wait_ready; then
-    tmux -S "$TMUX_SOCKET" kill-window -t "=$SESSION:$idx" 2>/dev/null || true
+    seat_stop window "$win_id"
     return 1
   fi
   log_session_start
