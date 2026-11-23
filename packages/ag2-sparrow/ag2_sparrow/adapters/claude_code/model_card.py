@@ -84,8 +84,11 @@ def card_matter(root, task_id: str, cfg: dict, popen=subprocess.Popen, environ=N
         said.update(body=body)
 
     ms = switcher(root, cfg, publish=publish)
-    # The desk routes a tap, a stale tap or the owner's /model to the card it names (card_desk, #6685).
-    outcome = card_desk.Desk(root, publish, quoted, [ms]).task(path, os.path.join(root, "results", task_id + ".txt"))
+    # The desk routes a tap, a stale tap, the owner's /model or /account (/login) to the card it names
+    # (card_desk, #6685): the model card here, the account card in account_card.
+    from . import account_card
+    owned = [ms] + account_card.cards(root, cfg, publish, log)
+    outcome = card_desk.Desk(root, publish, quoted, owned).task(path, os.path.join(root, "results", task_id + ".txt"))
     if not outcome:
         return "", ""
     if outcome == "model-picked":

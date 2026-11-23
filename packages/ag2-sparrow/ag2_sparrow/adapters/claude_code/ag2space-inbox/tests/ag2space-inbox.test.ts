@@ -5,6 +5,7 @@ const WATCH = 'mcp__ag2space-inbox__ag2space_inbox_watch'
 const REPLY = 'mcp__ag2space-inbox__ag2space_reply'
 const NOTE_START = 'Each item carries access_tier and collaborator from Sparrow'
 const AUDIENCE_START = "\nAudience: in any room other than your owner's own DM with you"
+const ACCOUNT_RULE = 'Account: your owner checks or switches the Anthropic account you run on by sending /account (or /login) in their DM with you; a card shows the account and says where to switch it (Settings in the S.space app, your Connections card, Switch account). Never ask them for a sign-in code in chat, and never send them to Claude\'s connector settings for it.'
 const MODEL_RULE = 'Model: your owner changes the model you run on by sending /model in their DM with you; a card with the choices appears and the switch needs no restart. If they ask you about changing models, tell them that. Never send them to a terminal for it.'
 // What the CLI publishes for a restricted task it answered on the isolated turn (its body is the turn's reply).
 const ISOLATED_ANSWER = 'an isolated answer\n'
@@ -351,6 +352,7 @@ test('each new task-*.txt is claimed, authorized and submitted once, wrapped in 
   expect(msg).toContain(TASK('task-a1'))
   expect(msg).not.toContain(NOTE_START)
   expect(msg).toContain('\n' + MODEL_RULE + '\n')
+  expect(msg).toContain('\n' + ACCOUNT_RULE + '\n')
   expect(h.claims['task-a1'].phase).toBe('CALLING')
   expect(h.claims['task-a1'].hash).toBe(h.hash(msg))
   expect(verbs(h)).toEqual(['progress', 'envelope', 'envelope', 'claim', 'authorize'])
@@ -387,6 +389,7 @@ test('a collaborator carries the Hatch non-owner note and the collaborator flag;
   expect(team).toContain('\n' + TASK('task-t2', 'team', 'collaborator: true\n'))
   expect(team).toContain(NOTE_START)
   expect(team).not.toContain(MODEL_RULE)
+  expect(team).not.toContain(ACCOUNT_RULE)
   expect(team.indexOf(AUDIENCE_START)).toBeGreaterThan(team.indexOf(NOTE_START))
   expect(team.indexOf(AUDIENCE_START)).toBeLessThan(team.indexOf('id: task-'))
 })

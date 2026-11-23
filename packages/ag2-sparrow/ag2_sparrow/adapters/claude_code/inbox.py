@@ -393,8 +393,8 @@ def claim(root, task_id) -> dict:
             carded, body = card_matter(root, task_id)
             if carded:
                 # A tap on the model card, or the owner's /model: answered here, never submitted to the session.
-                outcome = lc.complete_without_call(task_id, body, "model card: %s" % carded)
-                raise Refused("%s answered by the model card (%s); its answer is %s" % (task_id, carded, outcome))
+                outcome = lc.complete_without_call(task_id, body, "card: %s" % carded)
+                raise Refused("%s answered by its card (%s); its answer is %s" % (task_id, carded, outcome))
             try:
                 attempt = lc.prepare(task_id, INTERRUPTED_BODY, mode=lifecycle.LOCAL, generation=generation)
                 if kind == task_io.RESTRICTED:

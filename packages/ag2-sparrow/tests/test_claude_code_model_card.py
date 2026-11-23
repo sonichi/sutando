@@ -20,7 +20,7 @@ isolate_os_environ()
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from claude_code_fixtures import cli, ConnectBase, hold_consumer, inbox, unhold  # noqa: E402
 from ag2_sparrow import connector_cards, model_switch  # noqa: E402
-from ag2_sparrow.adapters.claude_code import model_card  # noqa: E402
+from ag2_sparrow.adapters.claude_code import account_card, model_card  # noqa: E402
 
 OWNER, DM = "@owner:s.space", "!dm:s.space"
 REAL_START_APPLY = model_card.start_apply
@@ -73,7 +73,7 @@ class Claim(Base):
     def test_the_owners_model_in_their_dm_is_the_menu_and_never_reaches_the_session(self):
         rc, out = self.claim(self.task("task-m", "/model"))
         self.assertEqual(rc, 1)
-        self.assertIn("answered by the model card (model-card)", out["refused"])
+        self.assertIn("answered by its card (model-card)", out["refused"])
         self.assertNotIn("admission", out, "nothing for the Mod to submit")
         self.assertEqual((self.results / "task-m.txt").read_text(), model_switch.ANSWERED)
         card, = [q["card"] for q in self.queued()]
@@ -244,6 +244,93 @@ class Apply(Base):
         lc = self.Launcher([(False, "busy: another pane-key sender holds the guard; /model not sent, retry later")])
         model_card.apply(self.root, cfg, self.home, launcher_factory=lc, sleep=lambda s: None)
         self.assertIn("(busy: another pane-key sender holds the guard)", self.queued()[-1]["card"]["text"])
+
+
+class Account(Base):
+    """`/account` or `/login` in the owner's DM, or a tap on the account card: the account (masked) and where
+    to switch it, answered in the claim. Nothing signs in here, and no code ever travels in chat."""
+
+    def setUp(self):
+        super().setUp()
+        self.answer = {"loggedIn": True, "email": "sarah@example.com", "subscriptionType": "max", "authMethod": "claude.ai"}
+        self.runs = []
+
+        def run(argv, **kw):
+            self.runs.append((argv, kw.get("env", {}).get("CLAUDE_CONFIG_DIR")))
+            if isinstance(self.answer, Exception):
+                raise self.answer
+            return mock.Mock(stdout=json.dumps(self.answer) if isinstance(self.answer, dict) else str(self.answer))
+        p = mock.patch.object(account_card, "_run", run)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def account_menu(self):
+        cfg = cli.read_config(cli.config_path())
+        card = account_card.AccountCard(self.root, cfg, lambda *a: None, print).card("pending", "x", ask=True)[1]
+        _, issued = connector_cards._core()
+        issued.record(Path(self.root), "$acct", card, room=DM, lane="")
+
+    def test_account_and_login_in_the_dm_show_the_masked_account_and_where_to_switch(self):
+        for t, said in (("task-a", "/account"), ("task-l", "/login")):
+            rc, out = self.claim(self.task(t, said))
+            self.assertEqual(rc, 1, t)
+            self.assertIn("answered by its card (account-card)", out["refused"])
+            self.assertNotIn("admission", out, "never submitted to the session")
+        cards = [q["card"] for q in self.queued()]
+        self.assertEqual(len(cards), 2)
+        text = cards[0]["text"]
+        self.assertIn("I'm signed in as s\u2026@example.com (max).", text)
+        self.assertIn("Settings in the S.space app", text)
+        self.assertIn("never into this chat", text)
+        self.assertNotIn("sarah@", json.dumps(cards))
+        self.assertEqual([b["label"] for b in cards[0]["buttons"]], ["Switch account"])
+        argv, config = self.runs[0]
+        self.assertEqual(argv[-3:], ["auth", "status", "--json"])
+        self.assertEqual(config, cli.read_config(cli.config_path()).get("CLAUDE_CONFIG_DIR") or None)
+
+    def test_switch_account_points_to_the_app_and_starts_nothing(self):
+        self.account_menu()
+        said = "Switch account"
+        rc, out = self.claim(self.task("task-s", said, reply_to="$acct",
+                                       click={"card_id": account_card.account_switch.CARD, "action": said}))
+        self.assertEqual(rc, 1)
+        self.assertIn("(account-where)", out["refused"])
+        note, = [q["card"] for q in self.queued()]
+        self.assertEqual(note["text"], account_card.WHERE)
+        self.assertNotIn("buttons", note)
+        self.assertEqual(self.runs, [], "no sign-in, no status call")
+
+    def test_a_tap_by_a_collaborator_is_refused_and_their_account_ask_goes_to_the_session(self):
+        self.account_menu()
+        said = "Switch account"
+        rc, out = self.claim(self.task("task-c", said, reply_to="$acct", tier="team", extra="collaborator: true\n",
+                                       click={"card_id": account_card.account_switch.CARD, "action": said}))
+        self.assertEqual(rc, 1)
+        self.assertIn("couldn't match that button", (self.results / "task-c.txt").read_text())
+        rc, out = self.claim(self.task("task-r", "/account", kind="room"))
+        self.assertEqual((rc, out.get("admission")), (0, "owner"), "outside the DM it is ordinary text")
+
+    def test_signed_out_unreadable_and_proxied_are_said_as_such(self):
+        cfg = cli.read_config(cli.config_path())
+        self.answer = {"loggedIn": False}
+        self.assertEqual(account_card.label(cfg), "")
+        self.answer = "not json"
+        with self.assertRaises(RuntimeError):
+            account_card.label(cfg)
+        self.answer = OSError("no claude")
+        self.assertIsNone(account_card.status(cfg)["signed_in"])
+        self.answer = {"loggedIn": True}
+        self.assertEqual(account_card.label(cfg), "an Anthropic account")
+        self.assertIn("credential proxy", account_card.label(cfg, env={"ANTHROPIC_BASE_URL": "http://localhost:7846"}))
+        self.answer = {"loggedIn": True, "email": "sarah@example.com"}
+        self.assertEqual(account_card.label(cfg), "s\u2026@example.com")
+        card = account_card.AccountCard(self.root, cfg, lambda *a: None, print)
+        self.answer = {"loggedIn": False}
+        self.assertEqual(card.using(), "I'm not signed in.")
+        self.answer = "nope"
+        self.assertEqual(card.using(), "I could not read which account I'm signed in with.")
+        out = []
+        self.assertEqual(card.tapped("other", {}, str(self.results / "x.txt")), "account-unknown")
 
 if __name__ == "__main__":
     unittest.main()
