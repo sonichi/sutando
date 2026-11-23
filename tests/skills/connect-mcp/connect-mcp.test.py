@@ -588,20 +588,11 @@ class WaiterTests(Base):
         code, out = self.cli(["rearm"])
         self.assertEqual((out["recovered"], len(self.new_tasks())), ([], 1))
 
-    def test_a_claim_with_no_outcome_is_kept_then_closed_as_expired_never_as_signed_in(self):
+    def test_a_claim_with_no_outcome_is_closed_as_expired_never_as_signed_in(self):
         wait_id = self.stopped_after_taking("connected", staged=False)
-        since = self.clock.now()
-        err = io.StringIO()
-        with mock.patch.object(cm.wait_store.WaitStore, "claimed_since", lambda store, w: since), \
-                contextlib.redirect_stderr(err):
-            code, out = self.cli(["rearm"])
-            self.assertEqual((out["recovered"], self.new_tasks()), ([], []))
-            self.assertTrue(cm.store(self.ws).claimed_path(wait_id).exists(), "kept, not dropped")
-            self.clock.t += cm.wait_store.UNSTAMPED_SETTLE_S
-            code, out = self.cli(["rearm"])
-            self.assertEqual(out["recovered"], [{"wait_id": wait_id, "published": "task"}])
-            code, out = self.cli(["rearm"])
-        self.assertIn("names no outcome yet", err.getvalue())
+        code, out = self.cli(["rearm"])
+        self.assertEqual(out["recovered"], [{"wait_id": wait_id, "published": "task"}])
+        code, out = self.cli(["rearm"])
         self.assertEqual((out["recovered"], len(self.new_tasks())), ([], 1))
         self.assertIn("expired", self.resume_body(wait_id))
         self.assertNotIn("is now signed in", self.resume_body(wait_id))

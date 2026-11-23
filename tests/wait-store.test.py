@@ -10,7 +10,10 @@
 - The claim: the claimed record names its outcome from the instant it exists; a claimer stopped
   between taking the wait and placing that record is finished by `recover` with the outcome it
   staged; a claim that names no outcome is closed as the non-success outcome its skill names,
-  after a settle time, and never dropped or turned into a success.
+  never dropped or turned into a success.
+- No replacing: every install, stamp, un-claim and adoption of a claimed record happens under
+  the store's mutex and only where no claimed record exists, so a record a claimer installed
+  survives a recovery of the same wait, and a taken file left beside it is removed.
 - Delegation: connect-apps and connect-mcp both reach the store's claim, release, lock, resume-task
   writer, owner check and detached spawn, so neither carries a copy of them.
 
@@ -30,6 +33,7 @@ isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
 
 import ast
 import contextlib
+import fcntl
 import importlib.util
 import io
 import json
@@ -201,8 +205,8 @@ class StoreContract(Base):
         self.assertTrue((self.ws / "logs" / "x.log").exists())
 
 
-class Publication(Base):
-    """A claimed wait's resume task is written once, whatever stopped between the claim and the task."""
+class PublicationCase(Base):
+    """A store whose resume tasks are written by a recording writer."""
 
     OUTCOMES = ("connected", "timeout")
 
@@ -229,6 +233,10 @@ class Publication(Base):
 
     def record(self, wait_id=WAIT_ID):
         return json.loads(self.store.claimed_path(wait_id).read_text())
+
+
+class Publication(PublicationCase):
+    """A claimed wait's resume task is written once, whatever stopped between the claim and the task."""
 
     def test_a_workspace_with_no_waits_has_nothing_to_recover(self):
         self.assertEqual(self.store.unpublished(self.OUTCOMES), [])
@@ -332,8 +340,8 @@ class Publication(Base):
         self.assertEqual(sum(len(r) for r in results), 1)
 
 
-class InterruptedClaim(Publication):
-    """Every stop between taking a wait and stamping its outcome ends in one task of the right kind."""
+class InterruptedCase(PublicationCase):
+    """Waits whose claimer was stopped part-way through a claim."""
 
     def names(self):
         return sorted(p.name.split(".")[-1] for p in self.store.dir().iterdir() if p.suffix != ".lock")
@@ -351,15 +359,16 @@ class InterruptedClaim(Publication):
         self.assertEqual(self.store.list_markers(), [], "the wait is no longer pending")
         self.assertFalse(self.store.claimed_path(WAIT_ID).exists())
 
-    def settled(self, seconds=wait_store.UNSTAMPED_SETTLE_S):
-        return mock.patch.object(wait_store.WaitStore, "claimed_since", lambda store, wait_id: NOW - seconds)
-
     def recover_closing(self, **kw):
         return wait_store.recover(self.store, self.ws, outcomes=self.OUTCOMES, task_id=self.task_id,
                                   write=self.write, now=NOW, stale_after_s=3600, unstamped_as="timeout", **kw)
 
     def body(self):
         return ltp.parse_task_headers((self.ws / "tasks" / f"task-connect-x-{WAIT_ID}.txt").read_text()).body.strip()
+
+
+class InterruptedClaim(InterruptedCase):
+    """Every stop between taking a wait and stamping its outcome ends in one task of the right kind."""
 
     def test_a_claimed_record_names_its_outcome_as_soon_as_it_exists(self):
         self.marker()
@@ -403,17 +412,11 @@ class InterruptedClaim(Publication):
     def test_a_stopped_claim_with_no_staged_outcome_is_closed_as_the_non_success_one(self):
         self.stop_after_taking("connected", staged=False)
         self.assertEqual(self.names(), ["taken"])
-        err = io.StringIO()
-        with self.settled(0), contextlib.redirect_stderr(err):
-            self.assertEqual(self.recover_closing(), [])
-        self.assertIn("names no outcome yet", err.getvalue())
-        self.assertEqual((self.names(), self.written), (["claimed"], []), "kept, and nothing sent yet")
-        with self.settled():
-            self.assertEqual(self.recover_closing(), [{"wait_id": WAIT_ID, "published": "task"}])
-            self.assertEqual(self.recover_closing(), [])
+        self.assertEqual(self.recover_closing(), [{"wait_id": WAIT_ID, "published": "task"}])
+        self.assertEqual(self.recover_closing(), [])
         self.assertEqual(self.body(), "resume timeout")
         self.assertEqual((self.record()["claimed_by"], self.record()["unstamped"]), ("timeout", True))
-        self.assertEqual(self.written, [WAIT_ID])
+        self.assertEqual((self.written, self.names()), ([WAIT_ID], ["claimed"]))
 
     def test_a_claim_whose_stamp_could_not_be_written_is_closed_the_same_way(self):
         self.marker()
@@ -421,33 +424,22 @@ class InterruptedClaim(Publication):
             won = self.store.claim(WAIT_ID, "connected", NOW)
         self.assertEqual(won["claimed_by"], "connected")
         self.assertNotIn("claimed_by", self.record())
-        with self.settled():
-            self.assertEqual(self.recover_closing(), [{"wait_id": WAIT_ID, "published": "task"}])
+        self.assertEqual(self.recover_closing(), [{"wait_id": WAIT_ID, "published": "task"}])
         self.assertEqual(self.body(), "resume timeout")
-
-    def test_the_settle_time_is_counted_from_the_claimed_file_itself(self):
-        self.stop_after_taking("connected", staged=False)
-        self.store.finish_taken(WAIT_ID)
-        placed = time.time()
-        self.assertAlmostEqual(self.store.claimed_since(WAIT_ID), placed, delta=5)
-        kw = dict(outcomes=self.OUTCOMES, task_id=self.task_id, write=self.write, stale_after_s=3600,
-                  unstamped_as="timeout")
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(wait_store.recover(self.store, self.ws, now=placed + 30, **kw), [])
-        self.assertEqual(wait_store.recover(self.store, self.ws, now=placed + 90, **kw),
-                         [{"wait_id": WAIT_ID, "published": "task"}])
 
     def test_a_claim_with_no_outcome_is_kept_when_no_closing_outcome_is_named(self):
         self.stop_after_taking("connected", staged=False)
-        with self.settled():
-            self.assertEqual(self.recover(), [])
+        self.assertEqual(self.recover(), [])
         self.assertEqual((self.names(), self.written), (["claimed"], []))
+        self.assertNotIn("claimed_by", self.record())
 
-    def test_a_claim_with_no_outcome_whose_file_cannot_be_dated_is_left(self):
+    def test_an_adoption_that_cannot_be_written_leaves_the_claim_for_next_time(self):
         self.stop_after_taking("connected", staged=False)
-        with mock.patch.object(wait_store.WaitStore, "claimed_since", side_effect=OSError("gone")):
+        with mock.patch.object(wait_store.WaitStore, "write_json", side_effect=OSError("read-only")):
             self.assertEqual(self.recover_closing(), [])
-        self.assertEqual(self.written, [])
+        self.assertEqual((self.names(), self.written), (["claimed"], []))
+        self.assertNotIn("claimed_by", self.record())
+        self.assertEqual(self.recover_closing(), [{"wait_id": WAIT_ID, "published": "task"}])
 
     def test_a_losers_staged_record_never_decides_the_outcome(self):
         self.marker()
@@ -456,24 +448,8 @@ class InterruptedClaim(Publication):
         with mock.patch.object(wait_store.WaitStore, "write_json", side_effect=OSError("disk full")), \
                 stopping_at_rename(2), self.assertRaises(Stopped):
             self.store.claim(WAIT_ID, "timeout", NOW)
-        with self.settled():
-            self.assertEqual(self.recover_closing(), [{"wait_id": WAIT_ID, "published": "task"}])
+        self.assertEqual(self.recover_closing(), [{"wait_id": WAIT_ID, "published": "task"}])
         self.assertEqual(self.body(), "resume timeout")
-
-    def test_a_claimer_that_resumes_after_recovery_finished_its_claim_still_has_it(self):
-        self.marker()
-        real, calls = os.rename, []
-
-        def rename(src, dst):
-            calls.append(dst)
-            if len(calls) == 2:
-                self.assertTrue(self.store.finish_taken(WAIT_ID))
-            real(src, dst)
-
-        with mock.patch.object(os, "rename", rename):
-            won = self.store.claim(WAIT_ID, "connected", NOW)
-        self.assertEqual((won["claimed_by"], self.record()["claimed_by"]), ("connected", "connected"))
-        self.assertEqual(self.names(), ["claimed"])
 
     def test_a_taken_file_that_cannot_be_placed_is_kept_for_the_next_recovery(self):
         self.stop_after_taking("connected")
@@ -482,6 +458,152 @@ class InterruptedClaim(Publication):
             self.assertEqual(self.recover(), [])
         self.assertEqual(self.names(), ["claiming", "taken"])
         self.assertEqual(self.recover(), [{"wait_id": WAIT_ID, "published": "task"}])
+
+    def test_two_recoveries_of_a_taken_wait_write_one_task_with_its_outcome(self):
+        self.stop_after_taking("connected")
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(self.recover_closing())) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual((self.written, sum(len(r) for r in results)), ([WAIT_ID], 1))
+        self.assertEqual((self.body(), self.names()), ("resume connected", ["claimed"]))
+
+
+class NoReplacing(InterruptedCase):
+    """A claimed record, once installed, is never replaced; whoever arrives second tidies up."""
+
+    def taken_and_staged(self):
+        [taken] = self.store.dir().glob(f"{WAIT_ID}.*.taken")
+        return taken, taken.with_suffix(".claiming")
+
+    def claimer_lands_before_recovery_installs(self, finish):
+        """Run `finish` (the live claimer's remaining steps) the first time recovery reaches for the mutex."""
+        real, fired = wait_store.WaitStore.installing, []
+
+        @contextlib.contextmanager
+        def installing(store):
+            if not fired:
+                fired.append(1)
+                finish()
+            with real(store):
+                yield
+
+        return mock.patch.object(wait_store.WaitStore, "installing", installing)
+
+    def test_a_foreground_claim_that_lands_first_keeps_its_named_outcome(self):
+        self.stop_after_taking("claim")
+        taken, staged = self.taken_and_staged()
+
+        def finish():
+            os.rename(staged, self.store.claimed_path(WAIT_ID))
+
+        with self.claimer_lands_before_recovery_installs(finish):
+            self.assertEqual(self.recover_closing(), [])
+        self.assertEqual((self.record()["claimed_by"], self.record()["claimed_at"]), ("claim", NOW))
+        self.assertNotIn("unstamped", self.record())
+        self.assertEqual((self.written, self.names()), ([], ["claimed"]), "no timeout task; the taken file is gone")
+
+    def test_a_waiters_outcome_that_lands_first_gets_its_one_task_not_a_timeout(self):
+        self.stop_after_taking("connected")
+        taken, staged = self.taken_and_staged()
+
+        def finish():
+            os.rename(staged, self.store.claimed_path(WAIT_ID))
+            taken.unlink()
+
+        with self.claimer_lands_before_recovery_installs(finish):
+            self.assertEqual(self.recover_closing(), [{"wait_id": WAIT_ID, "published": "task"}])
+        self.assertEqual((self.body(), self.written), ("resume connected", [WAIT_ID]))
+        self.assertEqual(self.recover_closing(), [])
+
+    def test_a_leftover_taken_file_beside_an_installed_claim_is_removed_by_recovery(self):
+        self.stop_after_taking("superseded")
+        taken, staged = self.taken_and_staged()
+        os.rename(staged, self.store.claimed_path(WAIT_ID))
+        before = self.store.claimed_path(WAIT_ID).read_bytes()
+        self.assertEqual(self.store.taken_ids(), [WAIT_ID])
+        self.assertFalse(self.store.finish_taken(WAIT_ID))
+        self.assertEqual(self.store.claimed_path(WAIT_ID).read_bytes(), before)
+        self.assertEqual((self.names(), self.store.taken_ids()), (["claimed"], []))
+
+    def test_prune_drops_a_taken_file_only_once_its_claim_is_installed(self):
+        self.stop_after_taking("connected")
+        taken, staged = self.taken_and_staged()
+        old = NOW - 10 ** 6
+        os.utime(taken, (old, old))
+        self.assertEqual(self.store.prune(NOW, 10 ** 9), 0)
+        self.assertTrue(taken.exists(), "a taken file with no claim installed is the wait itself")
+        os.rename(staged, self.store.claimed_path(WAIT_ID))
+        self.assertEqual(self.store.prune(time.time(), 10 ** 9), 1)
+        self.assertEqual(self.names(), ["claimed"])
+
+    def test_a_claim_never_replaces_an_installed_record(self):
+        self.marker()
+        self.store.claim(WAIT_ID, "connected", NOW)
+        before = self.store.claimed_path(WAIT_ID).read_bytes()
+        self.marker()
+        self.assertIsNone(self.store.claim(WAIT_ID, "timeout", NOW + 1))
+        self.assertEqual(self.store.claimed_path(WAIT_ID).read_bytes(), before)
+        self.assertEqual(self.names(), ["claimed"])
+
+    def mutex_is_held(self):
+        with open(self.store.dir().with_name(self.store.dir().name + ".mutex"), "a+") as fh:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            return False
+
+    def test_the_mutex_is_held_for_every_change_to_a_claimed_record(self):
+        held = {}
+        real_rename, real_write = os.rename, wait_store.write_json
+
+        def rename(src, dst):
+            held.setdefault("rename " + Path(dst).suffix, self.mutex_is_held())
+            real_rename(src, dst)
+
+        def write(path, data):
+            held.setdefault("write " + Path(path).suffix, self.mutex_is_held())
+            real_write(path, data)
+
+        with mock.patch.object(os, "rename", rename), mock.patch.object(wait_store, "write_json", write):
+            self.marker()
+            held.clear()
+            won = self.store.claim(WAIT_ID, "connected", NOW)
+            self.assertEqual(held, {"write .claiming": True, "rename .taken": True, "rename .claimed": True})
+            held.clear()
+            self.assertTrue(self.store.release(won))
+            self.assertEqual(held, {"write .claimed": True, "rename .json": True})
+        self.stop_after_taking("connected", staged=False)
+        with mock.patch.object(os, "rename", rename), mock.patch.object(wait_store, "write_json", write):
+            held.clear()
+            self.recover_closing()
+        self.assertEqual((held["rename .claimed"], held["write .claimed"]), (True, True))
+        self.assertFalse(self.mutex_is_held())
+
+    def test_a_claimer_cannot_put_back_a_claim_that_recovery_closed(self):
+        self.marker()
+        with mock.patch.object(wait_store.WaitStore, "write_json", side_effect=OSError("disk full")):
+            won = self.store.claim(WAIT_ID, "superseded", NOW)
+        self.assertEqual(self.recover_closing(), [{"wait_id": WAIT_ID, "published": "task"}])
+        self.assertFalse(self.store.release(won))
+        self.assertEqual(self.record()["published"], "task")
+        self.assertEqual(self.store.list_markers(), [])
+
+    def test_a_claimer_puts_back_its_own_claim_stamped_or_not(self):
+        self.marker()
+        won = self.store.claim(WAIT_ID, "connected", NOW)
+        self.assertTrue(self.store.release(won))
+        with mock.patch.object(wait_store.WaitStore, "write_json", side_effect=OSError("disk full")):
+            unstamped = self.store.claim(WAIT_ID, "connected", NOW)
+        self.assertTrue(self.store.release(unstamped))
+        self.assertEqual([m["wait_id"] for m in self.store.list_markers()], [WAIT_ID])
+
+    def test_a_workspace_with_no_waits_has_nothing_to_finish(self):
+        self.assertFalse(self.store.finish_taken(WAIT_ID))
+        self.assertEqual(self.store.taken_ids(), [])
 
 
 class OwnerTask(Base):
@@ -616,12 +738,23 @@ class Delegation(Base):
         with mock.patch.object(connectors, "_write_json", side_effect=OSError("disk full")), \
                 stopping_at_rename(2), self.assertRaises(Stopped):
             connectors.claim(self.ws, WAIT_ID, "connected", NOW)
-        with mock.patch.object(wait_store.WaitStore, "claimed_since", lambda store, wait_id: NOW - 61):
-            self.assertEqual(connectors.recover(self.ws, NOW), [{"wait_id": WAIT_ID, "published": "task"}])
-            self.assertEqual(connectors.recover(self.ws, NOW), [])
+        self.assertEqual(connectors.recover(self.ws, NOW), [{"wait_id": WAIT_ID, "published": "task"}])
+        self.assertEqual(connectors.recover(self.ws, NOW), [])
         text = (self.ws / "tasks" / f"task-connect-{WAIT_ID}.txt").read_text()
         self.assertIn("did not finish within", text)
         self.assertNotIn("now connected", text)
+
+    def test_a_connect_apps_foreground_claim_is_not_replaced_by_a_recovery_of_the_same_wait(self):
+        self.apps_marker()
+        with stopping_at_rename(2), self.assertRaises(Stopped):
+            connectors.claim(self.ws, WAIT_ID, "claim", NOW)
+        [taken] = connectors.waits_dir(self.ws).glob("*.taken")
+        os.rename(taken.with_suffix(".claiming"), connectors.claimed_path(self.ws, WAIT_ID))
+        self.assertEqual(connectors.recover(self.ws, NOW), [])
+        record = json.loads(connectors.claimed_path(self.ws, WAIT_ID).read_text())
+        self.assertEqual(record["claimed_by"], "claim")
+        self.assertFalse(taken.exists())
+        self.assertFalse((self.ws / "tasks").exists(), "no timeout task for a wait the agent answered itself")
 
     def test_a_connect_apps_claim_by_the_agent_itself_owes_no_task(self):
         self.apps_marker()
