@@ -183,6 +183,20 @@ def claim_generation(root, task_id):
     return gen if isinstance(gen, dict) else ""
 
 
+def live_inflight(root, inflight) -> dict:
+    """The entries of the Mod's `inflight` that can be a turn of the session now running: a claim bound to the
+    consumer generation holding the root, or one that cannot be read. An entry whose claim is gone or belongs
+    to an earlier generation is left out: a restart never clears the Mod's record, and such an entry is no turn."""
+    now = task_io.holder_consumer(root) or {}
+    live = {}
+    for task_id, entry in (inflight if isinstance(inflight, dict) else {}).items():
+        gen = claim_generation(root, task_id)
+        if gen is not None and (not isinstance(gen, dict) or (
+                now.get("pid") and (gen.get("pid"), gen.get("start")) == (now.get("pid"), now.get("start")))):
+            live[task_id] = entry
+    return live
+
+
 def card_matter(root, task_id, environ=None) -> "tuple[str, str]":
     """(outcome, answer) of a task that is a model-card matter (model_card.card_matter), ('', '') for any
     other task and whenever the card cannot be consulted: a task is never held back by the card."""
