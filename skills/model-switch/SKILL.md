@@ -13,7 +13,7 @@ anything else is refused before any write (exit 2).
 
 Order, under one lock per brain (`<workspace>/state/.model-switch.lock`, held across preflight, send,
 observation and record so overlapping switches linearize): (1) preflight through the shared sender
-(`scripts/tmux-send-line.sh --dry-run --refuse-if-pending`) — refuse on a Codex runtime (exit 4) or
+(`scripts/tmux-send-line.sh --dry-run --refuse-if-pending`) — refuse on an unresolved runtime (exit 4) or
 when the core's input box carries text (exit 5), nothing written; exit 3 when no live pane exists;
 (2) count the `Set model to` lines already on screen (`scripts/pane-observe.sh --count`), so a stale
 acceptance from an earlier switch cannot pass as this one; (3) `/model <model>` + Enter through the
@@ -65,13 +65,40 @@ Python comes from `sutando-config.sh python-bin`, never bare `python3`. The core
 `scripts/switch-model.sh` only execs this script. An owner message like "switch model to opus" is
 handled by running it; the dashboard's Quota tile shows the model the proxy then sees.
 
+## A Codex core
+
+The runtime is resolved first (fail closed, exit 4), and on `codex` the name must be a Codex model
+slug (`src/codex_core_model.py check`: letters, digits, `.`, `_`, `-`; a Claude alias or `claude-*` id
+is exit 2). **Core and worker models are separate**: the pick is never written to the shared
+`CODEX_HOME`'s `config.toml`, which the pool's Codex workers read. It is recorded core-only in
+`<workspace>/state/model-switch.json` with `runtime: "codex"` (`{model, previous, previous_source,
+runtime, accepted, applied, ts, by}`; a record without `runtime` is a Claude core's and is never read
+as a Codex model). Nothing is typed into a pane. Under the same lock:
+
+- the core is an app-server seat (a live `codex-seat` window): `applied: next-turn`, `status: pending`,
+  exit 0. The seat (`src/agent/codex/app-server/seat.py`, core seat only) always launches on
+  `working`, the last model Codex took, and passes the pending pick on its next `turn/start`. A turn
+  Codex runs on it makes it `accepted` (the seat's model from then on); a refusal naming the model
+  makes it `rejected`, the turn reruns on `working` and the owner gets a proactive notice. Any other
+  failure (a busy thread, a timeout, a restart) is no verdict: the pick stays pending and the next
+  turn tries it again. An explicit `SUTANDO_CORE_MODEL` launch outranks a pick saved before it
+  (`SUTANDO_CORE_MODEL_REV`).
+- the core is a Codex TUI: `applied: next-start`, `accepted: false`, **exit 11** — saved, the running
+  TUI keeps its model until its next start (owner-gated `bash src/agent/codex/cli/start-cli.sh
+  --restart`).
+- no core runs: `applied: next-start`, exit 0.
+
+`src/agent/codex/cli/start-cli.sh` launches the core with `-m` from the record whenever this launch
+sets no `SUTANDO_CORE_MODEL` (an explicit one wins). The pool's worker launcher reads none of it.
+
 ## The model card (`scripts/model_card.py`)
 
 When the owner asks in their DM which model the core is on, or asks to change it without naming one,
 post the menu: `python3 skills/model-switch/scripts/model_card.py post --room <the DM's room id>
 [--reply-to <their message's event id>]` (`--print` shows it without posting). Its buttons are this
 skill's `MODEL_SWITCH_CHOICES` (`manifest.json`, the list the menu-bar app offers), in that order and
-under those titles; each carries a slug of its id (`sonnet-1m`), unique on the card, and the exact ids
+under those titles (a Codex core: `MODEL_SWITCH_CODEX_CHOICES` when set, else the models Codex
+itself lists in its home's `models_cache.json`, hidden ones left out, by Codex's priority); each carries a slug of its id (`sonnet-1m`), unique on the card, and the exact ids
 the card was built with are kept by its event id (`<workspace>/state/model-card-choices.json`). A tap
 is resolved through its own card's ids (`sonnet[1m]`), so it never changes the context size the list
 names, and it acts only while the list still has that id. An entry whose id is not a model name (one

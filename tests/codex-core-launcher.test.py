@@ -130,6 +130,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/core_block_signal.py",
             "src/codex_host_instructions.py",
             "src/codex_home.py",
+            "src/codex_core_model.py",
             "src/agent/codex/codex-home.sh",
             "src/toml_fallback.py",
             "src/result_publish.py",

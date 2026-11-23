@@ -63,7 +63,7 @@ touch "$T/statefile"; rc=$("$HERE/scripts/switch-model.sh" sonnet --state-dir "$
 [ "$rc" = 1 ] && grep -q "nothing changed" "$T/err" && settings_untouched && ok "9 unwritable state path: exit 1, 'nothing changed', settings untouched" || fail "9" "rc=$rc $(cat "$T/err")"
 rc=$(TMUX_PANE_TEXT='────\n❯ half-typed message\n────\n' run haiku); [ "$rc" = 5 ] && ! grep -q send-keys "$TMUX_LOG" && grep -q "half-typed" "$T/err" && ok "10 pending text in the input box: exit 5, nothing sent, text quoted" || fail "10" "rc=$rc $(cat "$T/err")"
 rc=$(TMUX_PANE_TEXT='✽ Thinking… (12s)\n────\n❯\xc2\xa0\n────\n' run haiku); [ "$rc" = 0 ] && grep -q "send-keys -t sutando-core -l /model haiku" "$TMUX_LOG" && ok "11 a clear prompt (nbsp, turn running) still sends — the CLI queues it" || fail "11" "rc=$rc $(cat "$T/err")"
-rc=$(SUTANDO_CORE_RUNTIME=codex run opus); [ "$rc" = 4 ] && ! grep -q send-keys "$TMUX_LOG" && grep -q "start-cli.sh --restart" "$T/err" && ok "12 codex runtime: exit 4, restart path named" || fail "12" "rc=$rc"
+rc=$(SUTANDO_CORE_RUNTIME=codex run opus); [ "$rc" = 2 ] && ! grep -q send-keys "$TMUX_LOG" && grep -q "not a Codex model" "$T/err" && ok "12 codex runtime: a Claude alias is refused (rc=2), nothing sent (tests/switch-model-codex.test.sh covers the Codex switch)" || fail "12" "rc=$rc"
 mkdir -p "$T/Brain With Spaces"; printf '{"model":"claude-opus-5"}\n' > "$T/Brain With Spaces/settings.json"
 printf '{"brain":"%s","socket":"/private/tmp/socket path/s.sock","session":"core name"}\n' "$T/Brain With Spaces" > "$T/desc.json"
 rc=$(env -u SUTANDO_TMUX_SOCKET -u SUTANDO_TMUX_SESSION "$HERE/scripts/switch-model.sh" haiku --dry-run --descriptor-file "$T/desc.json" --state-dir "$T/state" > "$T/out" 2> "$T/err"; echo $?)

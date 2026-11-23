@@ -43,6 +43,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -53,6 +54,7 @@ for _p in (str(_REPO / "src"), str(_REPO / "skills" / "worker-pool" / "scripts")
         sys.path.insert(0, _p)
 
 import agent_card as ac  # noqa: E402
+import codex_core_model  # noqa: E402
 import issued_cards  # noqa: E402
 
 CARD_ID, KIND, TARGET = "core-model-switch", "model", "core"
@@ -63,6 +65,8 @@ HANDLER = "skills/model-switch/scripts/model_card.py reply"
 SWITCH = _HERE / "switch-model.sh"
 MANIFEST = _HERE.parent / "manifest.json"
 CHOICES_KEY = "MODEL_SWITCH_CHOICES"
+# A Codex core's list: this key when set, else the models Codex itself lists (its models_cache.json).
+CODEX_CHOICES_KEY = "MODEL_SWITCH_CODEX_CHOICES"
 NO_CHOICES = "I can't read the list of models (skills/model-switch/manifest.json), so I have no menu to show."
 DEFAULT_NAME = "the default model"
 GONE = "That choice is no longer on my list. Ask me for the model card again."
@@ -86,7 +90,8 @@ REASONS = {1: "the switch could not be locked or recorded",
            7: "the command could not be sent to the core",
            8: "the core did not accept the switch in time",
            9: "the core is running, so its settings were left alone",
-           10: "the model is set for the next start, but the core did not start"}
+           10: "the model is set for the next start, but the core did not start",
+           11: "it is saved, and the core uses it from its next start"}
 # The detached line: the switch, then always the outcome card with the switch's exit code.
 DETACHED = ('bash "$1" "$2" --confirm --accept-timeout "$3" --state-dir "$4"; '
             '"$5" "$6" --workspace "$7" settle --room "$8" --model "$2" --attempt "$9" --rc $?')
@@ -97,12 +102,39 @@ def _emit(payload: dict, code: int = 0) -> int:
     return code
 
 
-def choices(manifest: Optional[Path] = None) -> list:
-    """[(id, title, slug)] from the skill manifest's MODEL_SWITCH_CHOICES, in its order; [] when it
-    cannot be read. The slug is the id as a card reply may carry it, numbered when another id has it.
-    Left out: an id that is not a model name or is listed twice, and a title no button can carry."""
+@lru_cache(maxsize=1)
+def core_runtime() -> str:
+    """The configured core runtime (`sutando-config.sh core-runtime`), 'claude' when it cannot be read."""
+    try:
+        r = subprocess.run(["bash", str(_REPO / "scripts" / "sutando-config.sh"), "core-runtime"],
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return "claude"
+    return (r.stdout or "").strip() if r.returncode == 0 and (r.stdout or "").strip() else "claude"
+
+
+def codex_home() -> Path:
+    """The Codex core's home (src/codex_core_model.py resolves it)."""
+    return codex_core_model.home(_REPO)
+
+
+def _raw_choices(manifest: Optional[Path]):
     from skill_config import manifest_config
-    raw = manifest_config(manifest or MANIFEST).get(CHOICES_KEY)
+    cfg = manifest_config(manifest or MANIFEST)
+    if core_runtime() != "codex":
+        return cfg.get(CHOICES_KEY)
+    raw = cfg.get(CODEX_CHOICES_KEY)
+    if isinstance(raw, str) and raw.strip():
+        return raw
+    return ";".join(f"{slug}={title}" for slug, title in codex_core_model.choices(codex_home()))
+
+
+def choices(manifest: Optional[Path] = None) -> list:
+    """[(id, title, slug)] from the skill manifest's MODEL_SWITCH_CHOICES (a Codex core: its
+    MODEL_SWITCH_CODEX_CHOICES, else the models Codex lists), in its order; [] when it cannot be read.
+    The slug is the id as a card reply may carry it, numbered when another id has it.
+    Left out: an id that is not a model name or is listed twice, and a title no button can carry."""
+    raw = _raw_choices(manifest)
     out: list = []
     for entry in raw.split(";") if isinstance(raw, str) else []:
         model, _, title = entry.partition("=")
@@ -167,18 +199,23 @@ def name_of(model: Optional[str], picks: Optional[list] = None) -> str:
 
 
 def record(ws: Path) -> dict:
-    """The last switch's record, {} when there is none or it cannot be read."""
+    """The last switch's record for this core's runtime, {} when there is none or it cannot be read.
+    A Codex core's record says `runtime: codex`; a Claude core's says none."""
     try:
         data = json.loads((ws / "state" / "model-switch.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    return data if (data.get("runtime") == "codex") == (core_runtime() == "codex") else {}
 
 
 def current_model(ws: Path) -> dict:
     """{model, name, source, ts}: the model in use by the switch record; model None without one."""
     rec = record(ws)
     model = rec.get("model") if isinstance(rec.get("model"), str) and rec.get("model") else None
+    if rec.get("runtime") == "codex" and rec.get("status") == "rejected":
+        model = codex_core_model.working(rec) or None  # Codex refused the pick: the core kept this one
     return {"model": model, "name": name_of(model), "source": "model-switch.json" if model else None,
             "ts": rec.get("ts") if model else None}
 
