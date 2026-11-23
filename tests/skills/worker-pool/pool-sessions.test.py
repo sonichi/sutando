@@ -335,6 +335,42 @@ class UnreadableRecordsDegradeToAbsent(unittest.TestCase):
             self.assertEqual(row["runtime"], "codex")
             self.assertTrue(row["seat"])
 
+    def test_a_seat_to_tui_restart_is_not_left_read_only(self):
+        """Both Codex modes reuse `sutando-worker-<id>` and a TUI launch leaves the earlier
+        seat's host.json in place: a declaration older than the open run is not this run's."""
+        import os
+        with tempfile.TemporaryDirectory() as d:
+            tui = dict(open_run(W1), started_at="2026-11-22T20:00:00Z")
+            ws = workspace_with(Path(d), {W1: {"state": "live", "runtime": "codex"}},
+                                {}, {W1: [tui]})
+            host = ws / "state" / "codex-seat" / f"sutando-worker-{W1}" / "host.json"
+            write(host, {})
+            seat_era = pool_sessions._started_epoch({"started_at": "2026-11-22T19:00:00Z"})
+            os.utime(host, (seat_era, seat_era))
+            (row,) = pool_sessions.sessions(ws, probe=EXISTS)
+            self.assertFalse(row["seat"])
+
+    def test_a_declaration_written_by_this_run_marks_it_a_seat(self):
+        import os
+        with tempfile.TemporaryDirectory() as d:
+            run = dict(open_run(W1), started_at="2026-11-22T20:00:00Z")
+            ws = workspace_with(Path(d), {W1: {"state": "live", "runtime": "codex"}},
+                                {}, {W1: [run]})
+            host = ws / "state" / "codex-seat" / f"sutando-worker-{W1}" / "host.json"
+            write(host, {})
+            same_second = pool_sessions._started_epoch(run)
+            os.utime(host, (same_second, same_second))
+            (row,) = pool_sessions.sessions(ws, probe=EXISTS)
+            self.assertTrue(row["seat"])
+
+    def test_a_tui_run_with_no_declaration_is_not_a_seat(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = dict(open_run(W1), started_at="2026-11-22T20:00:00Z")
+            ws = workspace_with(Path(d), {W1: {"state": "live", "runtime": "codex"}},
+                                {}, {W1: [run]})
+            (row,) = pool_sessions.sessions(ws, probe=EXISTS)
+            self.assertFalse(row["seat"])
+
     def test_a_leftover_seat_declaration_does_not_make_a_claude_worker_a_seat(self):
         with tempfile.TemporaryDirectory() as d:
             ws = workspace_with(Path(d), {W1: {"state": "live", "runtime": "claude"}},

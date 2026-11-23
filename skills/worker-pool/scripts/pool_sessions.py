@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -54,15 +55,36 @@ def agent_mxid(workspace, worker_id: str) -> str:
     return str((row or {}).get("agent_mxid") or "").strip()
 
 
-def is_seat(workspace, runtime: str, session_name: str) -> bool:
+def is_seat(workspace, runtime: str, session_name: str, incarnation: "dict | None" = None) -> bool:
     """Whether the session shows a Codex app-server seat, whose pane is the seat's log, not a
     prompt: typing there reaches seat.py, and Ctrl-C ends it. A viewer keeps such a pane
     read-only. The Codex runtime is required as well as the seat's host declaration
     (seat-launch.sh: <workspace>/state/codex-seat/<session>/host.json), as the desktop's core
-    rule does: a leftover declaration under a Claude worker must not make it untypable."""
+    rule does: a leftover declaration under a Claude worker must not make it untypable.
+
+    The declaration must belong to this run. Both Codex modes reuse the session name and a TUI
+    launch leaves an earlier seat's host.json in place, so a declaration written before the open
+    incarnation started is a previous run's. A run with no readable start keeps the bare rule."""
     if runtime != "codex":
         return False
-    return (Path(workspace) / "state" / "codex-seat" / session_name / "host.json").is_file()
+    host = Path(workspace) / "state" / "codex-seat" / session_name / "host.json"
+    try:
+        declared = host.stat().st_mtime
+    except OSError:
+        return False
+    started = _started_epoch(incarnation)
+    return started is None or declared >= started
+
+
+def _started_epoch(incarnation: "dict | None") -> "float | None":
+    # started_at is whole seconds (worker_identity._now), so a same-second declaration counts.
+    raw = (incarnation or {}).get("started_at")
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
 
 
 def rooms_bound_to(roster: dict, worker_id: str) -> list:
@@ -118,7 +140,7 @@ def sessions(workspace, probe=None) -> list:
             "live": availability == "exists",
             "runtime": runtime,
             "agent_mxid": agent_mxid(workspace, worker_id),
-            "seat": is_seat(workspace, runtime, name),
+            "seat": is_seat(workspace, runtime, name, inc),
         }
         entry["attach_argv"] = (
             spawn_worker.attach_argv(socket, name) if entry["live"] else None
