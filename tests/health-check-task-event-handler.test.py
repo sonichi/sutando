@@ -80,6 +80,18 @@ class TaskEventHandlerCheck(unittest.TestCase):
         self.assertNotEqual(run.returncode, 0)
         self.assertEqual(run.stdout, "")
 
+    def test_watcher_lookup_refuses_a_pinned_directory(self):
+        d = self.ws / "pinned-dir"
+        d.mkdir()
+        d.chmod(0o755)
+        lookup = REPO / "src" / "agent" / "task-event-handler-lookup.sh"
+        run = subprocess.run(
+            ["bash", "-c", 'source "$1"; task_event_handler "$2"', "_", str(lookup), str(self.cfg)],
+            capture_output=True, text=True,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "SUTANDO_TASK_EVENT_HANDLER": str(d)})
+        self.assertNotEqual(run.returncode, 0)
+        self.assertEqual(run.stdout, "")
+
     def test_unparseable_config_fails(self):
         self.cfg.write_text("{not json")
         self.assertEqual(hc.check_task_event_handler(self.ws)["status"], "down")
