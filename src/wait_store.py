@@ -4,11 +4,14 @@ A wait is `<workspace>/state/<dirname>/<wait-id>.json`. Claiming it is a rename 
 `<wait-id>.claimed`, so of a waiter, a deadline and a command exactly one wins and only the
 winner acts; the claimed record keeps who took it and when. A waiter holds `<wait-id>.lock`
 while it lives, so a dead one is seen and restarted. The winner writes one resume task, which
-the core processes like any other task. `owner_task` is the one test of whose request may arm
+the core processes like any other task, and then stamps `published_at` on the claimed record.
+A claim that owes a task and carries no stamp was interrupted: `recover` publishes it once,
+writing the task only when no task of that id is pending, claimed, answered or archived. `owner_task` is the one test of whose request may arm
 a wait: a live owner-tier, non-collaborator task of the named source.
 
 Skills supply what differs: the directory name, what a valid marker is and when it is ready.
-Standard library only, plus local_task_protocol, task_body_guard and task_envelope.
+Standard library only, plus local_task_protocol, task_body_guard and task_envelope; recovery
+also asks task_disposition, imported when it runs.
 """
 from __future__ import annotations
 
@@ -30,6 +33,7 @@ from task_body_guard import header_safe_value
 WAIT_ID_RE = re.compile(r"^[0-9]{13}-[0-9a-f]{8}\Z")
 MXID_RE = re.compile(r"^@[^\s:]+:[^\s]+\Z")
 CLAIM_KEYS = ("claimed_by", "claimed_at")
+PUBLISHED_KEYS = ("published_at", "published")
 
 
 class NotOwnerTask(ValueError):
@@ -152,6 +156,26 @@ class WaitStore:
             return False
         return True
 
+    def mark_published(self, record: dict, at: float, how: str = "task") -> dict:
+        """Stamp the claimed record: its resume task is out (`task`, or `found` already there),
+        or it is too old to send one (`stale`)."""
+        record = {**record, "published_at": at, "published": how}
+        self.write_json(self.claimed_path(record["wait_id"]), record)
+        return record
+
+    def unpublished(self, outcomes: tuple) -> list[dict]:
+        """Claimed records that owe a resume task (claimed_by in `outcomes`) and carry no stamp."""
+        out: list[dict] = []
+        d = self.dir()
+        if not d.is_dir():
+            return out
+        for p in sorted(d.glob("*.claimed")):
+            record = self.read_json(self.claimed_path(p.stem)) if WAIT_ID_RE.match(p.stem) else None
+            if self.valid(record, p.stem) and record.get("claimed_by") in outcomes \
+                    and record.get("published_at") is None:
+                out.append(record)
+        return out
+
     def acquire_lock(self, wait_id: str):
         """An exclusive, non-blocking hold on the wait's lock file; None when a live waiter has it."""
         self.dir().mkdir(parents=True, exist_ok=True)
@@ -198,6 +222,66 @@ def hold_lock(store: WaitStore, wait_id: str):
     lock.write(f"{os.getpid()}\n")
     lock.flush()
     return lock
+
+
+def publish(store: WaitStore, record: dict, write: Callable[[dict], Any], at: float) -> None:
+    """Write the claimed wait's resume task, then stamp the claim. A write that fails raises and
+    leaves no stamp; a stamp that fails is left to `recover`, which finds the task by its id."""
+    write(record)
+    try:
+        store.mark_published(record, at)
+    except OSError:
+        pass
+
+
+def task_known(ws: Path, task_id: str) -> bool:
+    """Whether a task of this id is pending, claimed, answered or archived in the workspace."""
+    import task_disposition  # noqa: PLC0415
+
+    return task_disposition.task_disposition(ws, task_id) != task_disposition.MISSING
+
+
+def recover_one(store: WaitStore, ws: Path, wait_id: str, *, outcomes: tuple, task_id: Callable[[dict], str],
+                write: Callable[[dict], Any], now: float, stale_after_s: float) -> str | None:
+    """Publish one interrupted claim; the caller holds the wait's lock. Returns task | found |
+    stale, or None when the claim owes nothing, is stamped already, or the task could not be written."""
+    record = store.read_json(store.claimed_path(wait_id))
+    if not store.valid(record, wait_id) or record.get("claimed_by") not in outcomes \
+            or record.get("published_at") is not None:
+        return None
+    if now - float(record.get("claimed_at") or 0) >= stale_after_s:
+        how = "stale"
+    elif task_known(ws, task_id(record)):
+        how = "found"
+    else:
+        try:
+            write(record)
+        except (OSError, ValueError):
+            return None
+        how = "task"
+    try:
+        store.mark_published(record, now, how)
+    except OSError:
+        pass
+    return how
+
+
+def recover(store: WaitStore, ws: Path, *, outcomes: tuple, task_id: Callable[[dict], str],
+            write: Callable[[dict], Any], now: float, stale_after_s: float) -> list[dict]:
+    """Publish every interrupted claim whose waiter is gone; a wait whose lock is held is left to its holder."""
+    out = []
+    for record in store.unpublished(outcomes):
+        lock = hold_lock(store, record["wait_id"])
+        if lock is None:
+            continue
+        try:
+            how = recover_one(store, ws, record["wait_id"], outcomes=outcomes, task_id=task_id, write=write,
+                              now=now, stale_after_s=stale_after_s)
+        finally:
+            lock.close()
+        if how:
+            out.append({"wait_id": record["wait_id"], "published": how})
+    return out
 
 
 def spawn_detached(script: Path, ws: Path, wait_id: str, log_name: str) -> int:

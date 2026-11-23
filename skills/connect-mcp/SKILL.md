@@ -101,17 +101,19 @@ and you send none until the owner asks to sign in again.
   (`agent_card.EDIT_CARRIES_CARD` is false), so "Connected" and "Expired" are new cards posted under
   the same card id as the sign-in card. The first card stays in the DM with its expiry time.
 - **Five minutes.** The owner who taps an hour later gets an expired link; `start` again.
-- **Who can see a pasted address on the Mac.** `paste` reads it from STDIN, but it reaches the login
-  through the engine's one guarded key sender (`src/tmux-pane-keys.sh`), which takes keys as
-  arguments and writes the tmux command it runs to a private temporary file for the length of the
-  send (`paste` removes that file when a send does not finish cleanly). For those few seconds the
-  address is visible to processes of the same user on that Mac.
+- **Where a pasted address goes on the Mac.** `paste` reads it from STDIN and hands it to the login's
+  own tmux server on STDIN as a paste buffer with a name of that attempt's own; the engine's guarded
+  key sender (`src/tmux-pane-keys.sh`) then pastes that buffer, which deletes it. The address is
+  never an argument of a process and never written to a file. If `paste` is stopped between loading
+  and pasting, the buffer stays in that tmux server's memory until the login ends (five minutes at
+  most), readable only by processes of the same user.
 - **A pasted address passes through the owner's DM.** It is single-use and bound to this sign-in, and
   this skill keeps it nowhere, but the DM message itself remains. That is why it is DM only.
 - **The sign-in is shared.** The core and its workers use one Claude Code configuration, so a server
   signed in here is signed in for all of them.
-- **Dead waiters.** `rearm` restarts the waiter of a pending sign-in that lost it. Nothing calls it
-  automatically yet.
+- **Dead waiters.** `rearm` restarts the waiter of a pending sign-in that lost it, and writes the
+  resume task of a sign-in whose waiter stopped after it ended but before the task was written
+  (`recovered`; never a second task). Nothing calls `rearm` automatically yet.
 
 ## Rules
 

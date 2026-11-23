@@ -4,6 +4,9 @@
 - The contract: a claim is one rename with exactly one winner; a release puts the wait back; a held
   lock means a live waiter; the resume task is owner-tier, task-last and addressed to the wait's room;
   only a live owner-tier, non-collaborator task of the named source may arm a wait.
+- Publication: a claim that owes a resume task is stamped once the task is out; a claim left
+  without its stamp (a waiter stopped between the claim and the task) is published exactly once
+  by `recover`, and never when a task of that id is already pending or archived.
 - Delegation: connect-apps and connect-mcp both reach the store's claim, release, lock, resume-task
   writer, owner check and detached spawn, so neither carries a copy of them.
 
@@ -22,7 +25,9 @@ from _helpers.hermetic_env import isolate_os_environ
 isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
 
 import ast
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -172,6 +177,137 @@ class StoreContract(Base):
         self.assertTrue((self.ws / "logs" / "x.log").exists())
 
 
+class Publication(Base):
+    """A claimed wait's resume task is written once, whatever stopped between the claim and the task."""
+
+    OUTCOMES = ("connected", "timeout")
+
+    def setUp(self):
+        super().setUp()
+        self.written = []
+
+    def write(self, record):
+        self.written.append(record["wait_id"])
+        return wait_store.write_resume_task(self.ws, self.task_id(record), source="connector-resume", room=ROOM,
+                                            owner=OWNER, body=f"resume {record['claimed_by']}", now=NOW)
+
+    @staticmethod
+    def task_id(record):
+        return f"task-connect-x-{record['wait_id']}"
+
+    def recover(self, now=NOW, stale_after_s=3600):
+        return wait_store.recover(self.store, self.ws, outcomes=self.OUTCOMES, task_id=self.task_id,
+                                  write=self.write, now=now, stale_after_s=stale_after_s)
+
+    def claimed(self, by="connected", wait_id=WAIT_ID):
+        self.marker(wait_id)
+        return self.store.claim(wait_id, by, NOW)
+
+    def record(self, wait_id=WAIT_ID):
+        return json.loads(self.store.claimed_path(wait_id).read_text())
+
+    def test_a_workspace_with_no_waits_has_nothing_to_recover(self):
+        self.assertEqual(self.store.unpublished(self.OUTCOMES), [])
+        self.assertEqual(self.recover(), [])
+        self.assertFalse((self.ws / "tasks").exists())
+
+    def test_publish_writes_the_task_then_stamps_the_claim(self):
+        wait_store.publish(self.store, self.claimed(), self.write, NOW + 1)
+        self.assertEqual(self.written, [WAIT_ID])
+        self.assertEqual((self.record()["published_at"], self.record()["published"]), (NOW + 1, "task"))
+        self.assertEqual(self.store.unpublished(self.OUTCOMES), [])
+        self.assertEqual(self.recover(), [])
+
+    def test_a_write_that_fails_leaves_no_stamp(self):
+        def broken(record):
+            raise OSError("disk full")
+
+        with self.assertRaises(OSError):
+            wait_store.publish(self.store, self.claimed(), broken, NOW)
+        self.assertNotIn("published_at", self.record())
+
+    def test_a_claim_stopped_before_its_task_is_published_once(self):
+        self.claimed()
+        self.assertEqual([r["wait_id"] for r in self.store.unpublished(self.OUTCOMES)], [WAIT_ID])
+        self.assertEqual(self.recover(), [{"wait_id": WAIT_ID, "published": "task"}])
+        self.assertEqual(self.recover(), [])
+        self.assertEqual(self.written, [WAIT_ID])
+        self.assertEqual(sorted(p.name for p in (self.ws / "tasks").iterdir()), [f"task-connect-x-{WAIT_ID}.txt"])
+
+    def test_a_claim_stopped_after_its_task_and_before_the_stamp_writes_no_second_task(self):
+        record = self.claimed()
+        self.write(record)
+        self.written.clear()
+        self.assertEqual(self.recover(), [{"wait_id": WAIT_ID, "published": "found"}])
+        self.assertEqual(self.written, [])
+        self.assertEqual(self.record()["published"], "found")
+
+    def test_a_stamp_that_could_not_be_written_is_made_good_without_a_second_task(self):
+        record = self.claimed()
+        with mock.patch.object(wait_store.WaitStore, "mark_published", side_effect=OSError("read-only")):
+            wait_store.publish(self.store, record, self.write, NOW)
+        self.assertNotIn("published_at", self.record())
+        self.assertEqual(self.recover(), [{"wait_id": WAIT_ID, "published": "found"}])
+        self.assertEqual(self.written, [WAIT_ID])
+
+    def test_a_task_already_archived_counts_as_published(self):
+        path = self.write(self.claimed())
+        (self.ws / "tasks" / "archive").mkdir()
+        path.rename(self.ws / "tasks" / "archive" / path.name)
+        self.written.clear()
+        self.assertEqual(self.recover(), [{"wait_id": WAIT_ID, "published": "found"}])
+        self.assertEqual(self.written, [])
+
+    def test_a_claim_that_owes_no_task_is_never_published(self):
+        for by in ("superseded", "invalid", "expired", "claim"):
+            with self.subTest(by):
+                self.claimed(by)
+                self.assertEqual(self.recover(), [])
+                self.assertNotIn("published_at", self.record())
+        self.assertEqual(self.written, [])
+
+    def test_an_old_unstamped_claim_is_closed_without_a_task(self):
+        self.claimed()
+        self.assertEqual(self.recover(now=NOW + 3600), [{"wait_id": WAIT_ID, "published": "stale"}])
+        self.assertEqual(self.written, [])
+        self.assertEqual(self.recover(now=NOW + 3601), [])
+
+    def test_a_claim_whose_lock_is_held_is_left_to_the_holder(self):
+        self.claimed()
+        held = self.store.acquire_lock(WAIT_ID)
+        try:
+            self.assertEqual(self.recover(), [])
+        finally:
+            held.close()
+        self.assertEqual(self.written, [])
+        self.assertEqual(self.recover(), [{"wait_id": WAIT_ID, "published": "task"}])
+
+    def test_a_recovery_that_cannot_write_or_stamp_is_retried(self):
+        self.claimed()
+
+        def broken(record):
+            raise OSError("disk full")
+
+        self.assertEqual(wait_store.recover(self.store, self.ws, outcomes=self.OUTCOMES, task_id=self.task_id,
+                                            write=broken, now=NOW, stale_after_s=3600), [])
+        self.assertNotIn("published_at", self.record())
+        with mock.patch.object(wait_store.WaitStore, "mark_published", side_effect=OSError("read-only")):
+            self.assertEqual(self.recover(), [{"wait_id": WAIT_ID, "published": "task"}])
+        self.assertEqual(self.recover(), [{"wait_id": WAIT_ID, "published": "found"}])
+        self.assertEqual(self.written, [WAIT_ID])
+
+    def test_two_recoveries_at_once_write_one_task(self):
+        self.claimed()
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(self.recover())) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(self.written, [WAIT_ID])
+        self.assertEqual(sum(len(r) for r in results), 1)
+
+
 class OwnerTask(Base):
     def write(self, task="task-abc", **fields):
         (self.ws / "tasks").mkdir(exist_ok=True)
@@ -253,11 +389,42 @@ class Delegation(Base):
         claims, locks = self.spy("claim"), self.spy("acquire_lock")
         self.mcp_marker()
 
-        def gone(argv, timeout):
+        def gone(argv, timeout, stdin_text=None):
             return 1, ""
 
         self.assertEqual(connect_mcp.run_waiter(self.ws, WAIT_ID, gone, lambda: NOW, lambda s: None), "timeout")
         self.assertEqual((claims, locks), (["connect-mcp-waits"], ["connect-mcp-waits"]))
+
+    def test_connect_apps_republishes_a_claim_its_waiter_left_without_a_task(self):
+        self.apps_marker()
+        self.assertIsNotNone(connectors.claim(self.ws, WAIT_ID, "connected", NOW))
+        task = self.ws / "tasks" / f"task-connect-{WAIT_ID}.txt"
+        self.assertFalse(task.exists())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(connectors.cmd_rearm(self.ws, spawn=lambda ws, w: 1, now=lambda: NOW), 0)
+        self.assertEqual(json.loads(out.getvalue())["recovered"], [{"wait_id": WAIT_ID, "published": "task"}])
+        self.assertIn("Gmail is now connected", task.read_text())
+        written = task.read_bytes()
+        with contextlib.redirect_stdout(io.StringIO()) as again:
+            connectors.cmd_rearm(self.ws, spawn=lambda ws, w: 1, now=lambda: NOW)
+        self.assertEqual(json.loads(again.getvalue())["recovered"], [])
+        self.assertEqual(task.read_bytes(), written)
+
+    def test_a_connect_apps_waiter_restarted_on_a_claimed_wait_publishes_it_once(self):
+        self.apps_marker()
+        connectors.claim(self.ws, WAIT_ID, "timeout", NOW)
+        cloud = mock.Mock()
+        self.assertEqual(connectors.run_waiter(self.ws, WAIT_ID, cloud, lambda: NOW, lambda s: None), "recovered")
+        self.assertEqual(connectors.run_waiter(self.ws, WAIT_ID, cloud, lambda: NOW, lambda s: None),
+                         "claimed_elsewhere")
+        self.assertEqual([p.name for p in (self.ws / "tasks").iterdir()], [f"task-connect-{WAIT_ID}.txt"])
+
+    def test_a_connect_apps_claim_by_the_agent_itself_owes_no_task(self):
+        self.apps_marker()
+        connectors.claim(self.ws, WAIT_ID, "claim", NOW)
+        self.assertEqual(connectors.recover(self.ws, NOW), [])
+        self.assertFalse((self.ws / "tasks").exists())
 
     def test_both_write_their_resume_task_with_the_one_writer(self):
         seen = []

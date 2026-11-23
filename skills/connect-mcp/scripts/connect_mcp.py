@@ -22,9 +22,10 @@ A wait is `<workspace>/state/connect-mcp-waits/<wait-id>.json`, held by the shar
 rename, and the winner writes one resume task, `tasks/task-connect-mcp-<wait-id>.txt`.
 
 Only the owner's own DM task can start a sign-in or paste into one. The pasted address carries
-a single-use authorization code: it is read from STDIN, never taken as an argument, never
-printed, logged or stored; the wait keeps only the callback port and a hash of the link's
-`state`, which is what a pasted address is checked against.
+a single-use authorization code: it is read from STDIN and handed to tmux on STDIN as a paste
+buffer, so it is never an argument of any process and never printed, logged or written to a
+file; the wait keeps only the callback port and a hash of the link's `state`, which is what a
+pasted address is checked against.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -86,8 +88,8 @@ WAITER_OUTCOMES = ("connected", "timeout")
 # The guarded send's exits that prove nothing was typed; any other failure may have been typed.
 SEND_REFUSALS = {1: "not_typed", 124: "not_typed", tmux_pane_keys.BUSY: "busy"}
 
-# run(argv, timeout) -> (exit code, stdout + stderr). Every tmux and claude call goes through one.
-Run = Callable[[list, float], "tuple[int, str]"]
+# run(argv, timeout, stdin_text=None) -> (exit code, stdout + stderr). Every tmux and claude call goes through one.
+Run = Callable[..., "tuple[int, str]"]
 
 
 class Setup(Exception):
@@ -98,10 +100,11 @@ class Setup(Exception):
         self.code = code
 
 
-def run_command(argv: list, timeout: float) -> tuple[int, str]:
+def run_command(argv: list, timeout: float, stdin_text: str | None = None) -> tuple[int, str]:
     try:
-        proc = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              text=True, timeout=timeout, cwd=tempfile.gettempdir())
+        feed = {"stdin": subprocess.DEVNULL} if stdin_text is None else {"input": stdin_text}
+        proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True, timeout=timeout, cwd=tempfile.gettempdir(), **feed)
     except (OSError, subprocess.SubprocessError):
         return 127, ""
     return proc.returncode, proc.stdout or ""
@@ -339,9 +342,18 @@ def resume_text(record: dict, outcome: str) -> str:
     return confine_user_content(text)
 
 
+def resume_task_id(record: dict) -> str:
+    return f"task-connect-mcp-{record['wait_id']}"
+
+
+def recover_args(ws: Path, now: float) -> dict:
+    return {"outcomes": WAITER_OUTCOMES, "task_id": resume_task_id, "now": now, "stale_after_s": STALE_GRACE_S,
+            "write": lambda r: write_resume_task(ws, r, r["claimed_by"], now)}
+
+
 def write_resume_task(ws: Path, record: dict, outcome: str, now: float) -> Path:
     return wait_store.write_resume_task(
-        ws, f"task-connect-mcp-{record['wait_id']}", source=RESUME_SOURCE, room=record["room"],
+        ws, resume_task_id(record), source=RESUME_SOURCE, room=record["room"],
         owner=record["owner"], body=resume_text(record, outcome), now=now)
 
 
@@ -351,7 +363,8 @@ def write_resume_task(ws: Path, record: dict, outcome: str, now: float) -> Path:
 def run_waiter(ws: Path, wait_id: str, run: Run, now: Callable[[], float] = time.time,
                sleep: Callable[[float], None] = time.sleep) -> str:
     """Watch the login until it says it is done or its time is up, then claim and write the resume
-    task. Returns connected | timeout | expired | invalid | claimed_elsewhere | write_failed | busy."""
+    task. Returns connected | timeout | recovered (a claim another waiter left without its task) |
+    expired | invalid | claimed_elsewhere | write_failed | busy."""
     waits = store(ws)
     lock = wait_store.hold_lock(waits, wait_id)
     if lock is None:
@@ -363,7 +376,8 @@ def run_waiter(ws: Path, wait_id: str, run: Run, now: Callable[[], float] = time
             except ValueError:
                 return "invalid" if waits.claim(wait_id, "invalid", now()) is not None else "claimed_elsewhere"
             if marker is None:
-                return "claimed_elsewhere"
+                how = wait_store.recover_one(waits, ws, wait_id, **recover_args(ws, now()))
+                return "recovered" if how == "task" else "claimed_elsewhere"
             t = now()
             deadline = float(marker["deadline"])
             if t >= deadline + STALE_GRACE_S:
@@ -384,7 +398,7 @@ def run_waiter(ws: Path, wait_id: str, run: Run, now: Callable[[], float] = time
                 if won.get("invalid"):
                     return "invalid"
                 try:
-                    write_resume_task(ws, won, outcome, now())
+                    wait_store.publish(waits, won, lambda r: write_resume_task(ws, r, outcome, now()), now())
                     return outcome
                 except (OSError, ValueError) as exc:
                     print(f"connect-mcp: resume task for {wait_id} not written, retrying: {exc}", file=sys.stderr)
@@ -499,19 +513,25 @@ def cmd_start(ws: Path, args: argparse.Namespace, *, run: Run, spawn: Callable[[
     return EXIT_OK
 
 
-def scrub_send(socket: str) -> None:
-    """Remove the typed command that a guarded send which did not finish left in its work folder."""
-    try:
-        ticket = Path(json.loads((tmux_pane_keys.guard_path(socket) / "pending.json").read_text())["ticket"])
-        if ticket.name == "ticket" and ticket.parent.name.startswith("tmux-pane-keys."):
-            (ticket.parent / "cmd").unlink(missing_ok=True)
-    except (OSError, ValueError, KeyError, TypeError):
-        return
+def type_callback(run: Run, marker: dict, pasted: str) -> int:
+    """Type the address and Enter into the login in one guarded step; the guarded sender's exit code.
+    The address goes to tmux on stdin as a buffer of this attempt's own name, never as an argument."""
+    socket, target = marker["socket"], f"={marker['session']}:"
+    buffer = f"cb-{secrets.token_hex(8)}"
+    if run(tmux(socket, "load-buffer", "-b", buffer, "-"), 10.0, pasted + "\n")[0] != 0:
+        return 1
+    # The buffer's newline is pasted as Enter; the paste runs only while the pane is out of a mode.
+    code = run(tmux_pane_keys.fence_argv(socket, target, "#{==:#{pane_in_mode},0}",
+                                         f"paste-buffer -d -b {buffer} -t {tmux_pane_keys.tmux_quote(target)}"),
+               float(tmux_pane_keys.TIMEOUT_S))[0]
+    if code != 0:
+        run(tmux(socket, "delete-buffer", "-b", buffer), 10.0)
+    return code
 
 
 def callback_problem(pasted: str, marker: dict) -> str | None:
     """Why `pasted` is not the address this wait's sign-in ends on, or None. Never echoes the address."""
-    if not pasted or len(pasted) > MAX_PASTE_CHARS or pasted.endswith(";") or any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F
+    if not pasted or len(pasted) > MAX_PASTE_CHARS or any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F
                                                           for c in pasted):
         return "not_one_address"
     try:
@@ -554,11 +574,8 @@ def cmd_paste(ws: Path, args: argparse.Namespace, *, run: Run, now: Callable[[],
     if not session_alive(run, marker):
         emit({"status": "refused", "reason": "login_gone", "wait_id": marker["wait_id"]})
         return EXIT_NO
-    # One guarded send types the address and enters it, so there is no half-typed state to retry over.
-    code = run(tmux_pane_keys.argv(marker["socket"], f"={marker['session']}:", pasted, "Enter"),
-               float(tmux_pane_keys.TIMEOUT_S))[0]
+    code = type_callback(run, marker, pasted)
     if code != 0:
-        scrub_send(marker["socket"])
         reason = SEND_REFUSALS.get(code, "uncertain")
         emit({"status": "uncertain" if reason == "uncertain" else "refused", "reason": reason,
               "wait_id": marker["wait_id"]})
@@ -598,7 +615,9 @@ def cmd_rearm(ws: Path, args: argparse.Namespace, *, spawn: Callable[[Path, str]
             running.append(wait_id)
         else:
             rearmed.append({"wait_id": wait_id, "waiter_pid": _try_spawn(spawn, ws, wait_id)})
-    emit({"rearmed": rearmed, "running": running, "pruned": waits.prune(now(), PRUNE_S)})
+    emit({"rearmed": rearmed, "running": running,
+          "recovered": wait_store.recover(waits, ws, **recover_args(ws, now())),
+          "pruned": waits.prune(now(), PRUNE_S)})
     return EXIT_OK
 
 

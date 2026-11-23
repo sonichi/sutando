@@ -66,11 +66,12 @@ class FakeHost:
         self.prints = prints
         self.panes: dict[str, str] = {}
         self.sockets: dict[str, str] = {}
-        self.sends: list[tuple[str, str, tuple]] = []
+        self.sends: list[tuple[str, str, str]] = []
+        self.buffers: dict[tuple[str, str], str] = {}
         self.send_code = 0
         self.new_session_code = 0
 
-    def __call__(self, argv, timeout):
+    def __call__(self, argv, timeout, stdin_text=None):
         argv = list(argv)
         self.calls.append(argv)
         if argv[:3] == ["claude", "mcp", "get"]:
@@ -78,9 +79,11 @@ class FakeHost:
         if argv[:2] == ["bash", str(tmux_pane_keys.SCRIPT)]:
             socket, target = argv[argv.index("-S") + 1], argv[argv.index("-t") + 1]
             session = target.lstrip("=").rstrip(":")
-            assert self.sockets.get(session) == socket, "the send goes to the login's own tmux server"
+            assert self.sockets.get(session) == socket, "the paste goes to the login's own tmux server"
+            predicate, action = argv[argv.index("--fence") + 1:argv.index("--fence") + 3]
+            assert predicate == "#{==:#{pane_in_mode},0}" and action.startswith("paste-buffer -d -b "), action
             if self.send_code == 0:
-                self.sends.append((socket, session, tuple(argv[argv.index("--") + 1:])))
+                self.sends.append((socket, session, self.buffers.pop((socket, action.split()[3]))))
             return self.send_code, "tmux-pane-keys: output the caller must not repeat"
         assert argv[:2] == ["tmux", "-S"], f"not a tmux call on an explicit socket: {argv[:3]}"
         socket, verb, rest = argv[2], argv[3], argv[4:]
@@ -92,6 +95,12 @@ class FakeHost:
             session = rest[rest.index("-s") + 1]
             self.panes[session], self.sockets[session] = self.prints, socket
             return 0, ""
+        if verb == "load-buffer":
+            assert rest[-1] == "-" and stdin_text is not None, "a buffer is loaded from stdin only"
+            self.buffers[(socket, rest[rest.index("-b") + 1])] = stdin_text
+            return 0, ""
+        if verb == "delete-buffer":
+            return (0 if self.buffers.pop((socket, rest[rest.index("-b") + 1]), None) is not None else 1), ""
         if verb == "kill-server":
             gone = [n for n, sock in self.sockets.items() if sock == socket]
             for name in gone:
@@ -389,6 +398,19 @@ class StartEdgeTests(Base):
         self.assertIsNotNone(cm.store(self.ws).read_marker(out["wait_id"]))
         self.assertIn("could not start the waiter", err.getvalue())
 
+    def test_text_for_a_command_goes_to_its_stdin_and_nothing_else_does(self):
+        seen = []
+
+        def fake_run(argv, **kwargs):
+            seen.append(kwargs)
+            return mock.Mock(returncode=0, stdout="ok")
+
+        with mock.patch.object(cm.subprocess, "run", fake_run):
+            self.assertEqual(cm.run_command(["tmux", "x"], 1.0, "secret\n"), (0, "ok"))
+            cm.run_command(["tmux", "x"], 1.0)
+        self.assertEqual((seen[0]["input"], "stdin" in seen[0]), ("secret\n", False))
+        self.assertEqual((seen[1]["stdin"], "input" in seen[1]), (cm.subprocess.DEVNULL, False))
+
     def test_a_command_that_cannot_run_or_hangs_reads_as_a_failure(self):
         for error in (OSError("no such file"), cm.subprocess.TimeoutExpired("claude", 1)):
             with self.subTest(type(error).__name__), mock.patch.object(cm.subprocess, "run", side_effect=error):
@@ -428,6 +450,98 @@ class WaiterTests(Base):
         self.assertEqual((code, json.loads(line)["error"]), (2, "invalid_arguments"))
         self.assertEqual(self.host.calls, [])
         self.assertFalse((self.ws / "state").exists())
+
+    def stopped_after_the_claim(self, outcome="connected"):
+        """The files a waiter leaves when it stops between claiming the wait and writing its task."""
+        _, out = self.start()
+        self.assertIsNotNone(cm.store(self.ws).claim(out["wait_id"], outcome, self.clock.now()))
+        return out["wait_id"]
+
+    def test_a_waiter_stopped_after_the_claim_is_made_good_by_rearm_once(self):
+        wait_id = self.stopped_after_the_claim()
+        self.assertEqual(self.new_tasks(), [])
+        code, out = self.cli(["rearm"])
+        self.assertEqual(out["recovered"], [{"wait_id": wait_id, "published": "task"}])
+        self.assertEqual(self.new_tasks(), [f"task-connect-mcp-{wait_id}.txt"])
+        body = ltp.parse_task_headers((self.ws / "tasks" / self.new_tasks()[0]).read_text()).body
+        self.assertIn("Luma is now signed in", body)
+        first = (self.ws / "tasks" / self.new_tasks()[0]).stat().st_mtime_ns
+        code, again = self.cli(["rearm"])
+        self.assertEqual(again["recovered"], [])
+        self.assertEqual(self.new_tasks(), [f"task-connect-mcp-{wait_id}.txt"])
+        self.assertEqual((self.ws / "tasks" / self.new_tasks()[0]).stat().st_mtime_ns, first)
+
+    def test_a_waiter_stopped_after_the_task_and_before_its_stamp_writes_no_second_task(self):
+        wait_id = self.stopped_after_the_claim("timeout")
+        record = json.loads(cm.store(self.ws).claimed_path(wait_id).read_text())
+        path = cm.write_resume_task(self.ws, record, "timeout", self.clock.now())
+        written = path.read_bytes()
+        code, out = self.cli(["rearm"])
+        self.assertEqual(out["recovered"], [{"wait_id": wait_id, "published": "found"}])
+        self.assertEqual(path.read_bytes(), written)
+        archive = self.ws / "tasks" / "archive"
+        archive.mkdir()
+        path.rename(archive / path.name)
+        code, out = self.cli(["rearm"])
+        self.assertEqual((out["recovered"], self.new_tasks()), ([], []))
+
+    def test_a_task_the_core_already_archived_is_not_written_again(self):
+        wait_id = self.stopped_after_the_claim()
+        record = json.loads(cm.store(self.ws).claimed_path(wait_id).read_text())
+        path = cm.write_resume_task(self.ws, record, "connected", self.clock.now())
+        archive = self.ws / "tasks" / "archive"
+        archive.mkdir()
+        path.rename(archive / path.name)
+        code, out = self.cli(["rearm"])
+        self.assertEqual(out["recovered"], [{"wait_id": wait_id, "published": "found"}])
+        self.assertEqual(self.new_tasks(), [])
+
+    def test_a_restarted_waiter_publishes_the_claim_it_finds(self):
+        wait_id = self.stopped_after_the_claim()
+        self.assertEqual(self.waiter(wait_id), "recovered")
+        self.assertEqual(self.new_tasks(), [f"task-connect-mcp-{wait_id}.txt"])
+        self.assertEqual(self.waiter(wait_id), "claimed_elsewhere")
+        code, out = self.cli(["rearm"])
+        self.assertEqual((out["recovered"], len(self.new_tasks())), ([], 1))
+
+    def test_a_finished_waiter_leaves_nothing_for_rearm_to_recover(self):
+        _, out = self.start()
+        self.assertEqual(self.waiter(out["wait_id"]), "timeout")
+        record = json.loads(cm.store(self.ws).claimed_path(out["wait_id"]).read_text())
+        self.assertEqual(record["published"], "task")
+        code, again = self.cli(["rearm"])
+        self.assertEqual((again["recovered"], len(self.new_tasks())), ([], 1))
+
+    def test_a_claim_that_says_nothing_stays_silent_on_rearm(self):
+        for outcome in ("superseded", "invalid", "expired"):
+            with self.subTest(outcome):
+                self.stopped_after_the_claim(outcome)
+                code, out = self.cli(["rearm"])
+                self.assertEqual((out["recovered"], self.new_tasks()), ([], []))
+
+    def test_a_claim_found_long_after_gets_no_late_task(self):
+        wait_id = self.stopped_after_the_claim()
+        self.clock.t += cm.STALE_GRACE_S
+        code, out = self.cli(["rearm"])
+        self.assertEqual(out["recovered"], [{"wait_id": wait_id, "published": "stale"}])
+        self.assertEqual(self.new_tasks(), [])
+
+    def test_a_claim_whose_waiter_is_alive_is_left_to_it(self):
+        wait_id = self.stopped_after_the_claim()
+        held = cm.store(self.ws).acquire_lock(wait_id)
+        try:
+            code, out = self.cli(["rearm"])
+        finally:
+            held.close()
+        self.assertEqual((out["recovered"], self.new_tasks()), ([], []))
+
+    def test_a_recovery_that_cannot_write_tries_again_next_time(self):
+        wait_id = self.stopped_after_the_claim()
+        with mock.patch.object(ltp, "write_task_file", side_effect=OSError("disk full")):
+            code, out = self.cli(["rearm"])
+        self.assertEqual((out["recovered"], self.new_tasks()), ([], []))
+        code, out = self.cli(["rearm"])
+        self.assertEqual(out["recovered"], [{"wait_id": wait_id, "published": "task"}])
 
     def test_a_wait_file_that_is_not_a_wait_is_set_aside_without_a_task(self):
         _, out = self.start()
@@ -573,12 +687,62 @@ class PasteTests(Base):
         code, out = self.paste(CALLBACK + "\n")
         self.assertEqual((code, out["status"]), (0, "sent"))
         socket = cm.store(self.ws).read_marker(self.wait_id)["socket"]
-        self.assertEqual(self.host.sends, [(socket, self.session, (CALLBACK, "Enter"))])
+        self.assertEqual(self.host.sends, [(socket, self.session, CALLBACK + "\n")])
+        [loaded] = self.host.tmux("load-buffer")
         [guarded] = self.host.of("bash")
-        self.assertEqual(guarded, tmux_pane_keys.argv(socket, f"={self.session}:", CALLBACK, "Enter"))
+        self.assertEqual(guarded, tmux_pane_keys.fence_argv(
+            socket, f"={self.session}:", "#{==:#{pane_in_mode},0}",
+            f"paste-buffer -d -b {loaded[loaded.index('-b') + 1]} -t '={self.session}:'"))
+        self.assertEqual(self.host.buffers, {}, "the paste removed its buffer")
+        for argv in self.host.calls:
+            self.assertFalse(any(CODE in str(a) or STATE in str(a) for a in argv), "the address is no argument")
         self.assertNotIn(CODE, self.stdout)
         self.assertNotIn(CODE, self.everything_written())
         self.assertNotIn(STATE, self.everything_written())
+
+    def test_each_attempt_pastes_from_a_buffer_of_its_own_name(self):
+        self.host.send_code = 1
+        self.paste(CALLBACK)
+        self.paste(CALLBACK)
+        names = [c[c.index("-b") + 1] for c in self.host.tmux("load-buffer")]
+        self.assertEqual(len(set(names)), 2)
+        self.assertEqual([c[c.index("-b") + 1] for c in self.host.tmux("delete-buffer")], names)
+        self.assertEqual(self.host.buffers, {})
+
+    def test_a_busy_return_leaves_the_send_in_flight_untouched(self):
+        socket = cm.store(self.ws).read_marker(self.wait_id)["socket"]
+        work = Path(socket).parent / "tmux-pane-keys.other"
+        guard = tmux_pane_keys.guard_path(socket)
+        for folder in (work, guard):
+            folder.mkdir(parents=True)
+        (work / "cmd").write_text("paste-buffer -d -b cb-other -t 'x'\n")
+        (work / "ticket").write_text("")
+        (guard / "pending.json").write_text(json.dumps({"ticket": str(work / "ticket")}))
+        self.host.buffers[(socket, "cb-other")] = "another attempt's address\n"
+        before = {p: p.read_bytes() for p in Path(socket).parent.rglob("*") if p.is_file()}
+        self.host.send_code = tmux_pane_keys.BUSY
+        code, out = self.paste(CALLBACK)
+        self.assertEqual((code, out["status"], out["reason"]), (1, "refused", "busy"))
+        self.assertEqual({p: p.read_bytes() for p in Path(socket).parent.rglob("*") if p.is_file()}, before)
+        self.assertEqual(self.host.buffers, {(socket, "cb-other"): "another attempt's address\n"})
+        [own] = self.host.tmux("delete-buffer")
+        self.assertNotEqual(own[own.index("-b") + 1], "cb-other")
+
+    def test_a_buffer_that_cannot_be_loaded_types_nothing(self):
+        real = self.host.__call__
+
+        def no_buffers(argv, timeout, stdin_text=None):
+            if "load-buffer" in argv:
+                self.host.calls.append(list(argv))
+                return 1, ""
+            return real(argv, timeout, stdin_text)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cm.main(["--workspace", str(self.ws), "paste", self.wait_id, "--task", "task-paste"],
+                           run=no_buffers, now=self.clock.now, stdin=io.StringIO(CALLBACK))
+        self.assertEqual((code, json.loads(out.getvalue())["reason"]), (1, "not_typed"))
+        self.assertEqual(self.host.of("bash"), [])
 
     def test_a_send_that_proved_nothing_was_typed_is_refused_not_sent(self):
         for code, reason in ((1, "not_typed"), (124, "not_typed"), (tmux_pane_keys.BUSY, "busy")):
@@ -596,22 +760,9 @@ class PasteTests(Base):
                 rc, out = self.paste(CALLBACK)
                 self.assertEqual((rc, out["status"], out["reason"]), (1, "uncertain", "uncertain"))
                 self.assertEqual(len(self.host.of("bash")), 1, "one attempt, never a retry")
+                self.assertEqual(self.host.buffers, {}, "the unpasted buffer is dropped")
                 self.assertNotIn(CODE, self.stdout)
         self.assertIsNotNone(cm.store(self.ws).read_marker(self.wait_id), "the wait stays for the waiter")
-
-    def test_an_unfinished_send_leaves_the_address_in_no_file(self):
-        socket = cm.store(self.ws).read_marker(self.wait_id)["socket"]
-        work = self.ws.parent / f"{self.ws.name}-sock" / "tmux-pane-keys.abc"
-        guard = tmux_pane_keys.guard_path(socket)
-        for folder in (work, guard):
-            folder.mkdir(parents=True)
-        (work / "cmd").write_text(f"send-keys -t 'x' '{CALLBACK}' 'Enter'\n")
-        (guard / "pending.json").write_text(json.dumps({"ticket": str(work / "ticket")}))
-        self.host.send_code = tmux_pane_keys.UNCERTAIN
-        self.paste(CALLBACK)
-        self.assertFalse((work / "cmd").exists())
-        left = "".join(p.read_text(errors="replace") for p in work.parent.rglob("*") if p.is_file())
-        self.assertNotIn(CODE, left + self.everything_written())
 
     def test_an_address_that_is_not_this_waits_callback_is_not_typed(self):
         cases = {

@@ -836,9 +836,26 @@ def private_resume_text(marker: dict, outcome: str) -> str:
     return confine_user_content(text)
 
 
+def resume_task_id(record: dict) -> str:
+    return f"task-connect-{record['wait_id']}"
+
+
+def recover_one(ws: Path, wait_id: str, now: float) -> str | None:
+    return wait_store.recover_one(
+        _store(ws), ws, wait_id, outcomes=WAITER_OUTCOMES, task_id=resume_task_id, now=now,
+        write=lambda r: write_resume_task(ws, r, r["claimed_by"], now), stale_after_s=STALE_GRACE_S)
+
+
+def recover(ws: Path, now: float) -> list[dict]:
+    """Publish the resume task of every claimed wait whose waiter stopped before writing it."""
+    return wait_store.recover(
+        _store(ws), ws, outcomes=WAITER_OUTCOMES, task_id=resume_task_id, now=now,
+        write=lambda r: write_resume_task(ws, r, r["claimed_by"], now), stale_after_s=STALE_GRACE_S)
+
+
 def write_resume_task(ws: Path, marker: dict, outcome: str, now: float) -> Path:
     return wait_store.write_resume_task(
-        ws, f"task-connect-{marker['wait_id']}", source=RESUME_SOURCE, room=marker["room"],
+        ws, resume_task_id(marker), source=RESUME_SOURCE, room=marker["room"],
         owner=marker["owner"], body=resume_text(marker, outcome), now=now)
 
 
@@ -881,7 +898,7 @@ def run_waiter(
             except ValueError:
                 return "invalid" if claim(ws, wait_id, "invalid", now()) is not None else "claimed_elsewhere"
             if marker is None:
-                return "claimed_elsewhere"
+                return "recovered" if recover_one(ws, wait_id, now()) == "task" else "claimed_elsewhere"
             t = now()
             deadline = float(marker.get("deadline") or 0)
             if t >= deadline + STALE_GRACE_S:
@@ -900,7 +917,7 @@ def run_waiter(
                 if won.get("invalid"):
                     return "invalid"
                 try:
-                    write_resume_task(ws, won, outcome, now())
+                    wait_store.publish(_store(ws), won, lambda r: write_resume_task(ws, r, outcome, now()), now())
                     return outcome
                 except (OSError, ValueError) as exc:
                     print(f"connect-apps: resume task for {wait_id} not written, retrying: {exc}", file=sys.stderr)
@@ -1625,7 +1642,8 @@ def cmd_rearm(
             running.append(wait_id)
         else:
             rearmed.append({"wait_id": wait_id, "waiter_pid": _try_spawn(spawn, ws, wait_id)})
-    emit({"rearmed": rearmed, "running": running, "pruned": prune(ws, now()) + prune_cards(ws, now())})
+    emit({"rearmed": rearmed, "running": running, "recovered": recover(ws, now()),
+          "pruned": prune(ws, now()) + prune_cards(ws, now())})
     return EXIT_OK
 
 
