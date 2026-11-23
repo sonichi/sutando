@@ -955,6 +955,51 @@ def main() -> int:
         _wl.lane_dirs = _lane_dirs
     check(_wrtc._CORE_RECOVERY_READER is None and rtc._CORE_RECOVERY_READER is not None,
           "a pool worker's lane carries no core recovery record; the core's lane does")
+    check(_wrtc._QUOTA_STATUS_READER is None and rtc._QUOTA_STATUS_READER is not None,
+          "quota-tracker's switch is on by default; a pool worker's lane carries no core quota")
+    (rtc.WS / "state" / "quota-state.json").write_text(json.dumps({
+        "utilization_5h": 0.42, "resets_at_5h": "2026-11-20T16:00:00.000Z", "limit_state": "allowed",
+        "last_checked": "2026-11-20T12:00:00.000Z", "account": "acct-core", "accounts": {"acct-x": {}}}))
+    STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
+    rtc._post_heartbeat(set(), force=True)
+    hbq = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    check((hbq.get("health") or {}).get("quota", {}).get("five_hour", {}).get("used_pct") == 42.0
+          and "quota_status.v1" in hbq.get("capabilities", [])
+          and "account" not in hbq["health"]["quota"],
+          "the adapter's reader puts the core's quota on the heartbeat as health.quota, no account")
+    (rtc.WS / "state" / "quota-state.json").unlink()
+    os.environ["QUOTA_STATUS_PUBLISH"] = "false"
+    try:
+        _qspec = importlib.util.spec_from_file_location("rtc_quota_off", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _qrtc = importlib.util.module_from_spec(_qspec)
+        _qspec.loader.exec_module(_qrtc)
+    finally:
+        del os.environ["QUOTA_STATUS_PUBLISH"]
+    check(_qrtc._QUOTA_STATUS_READER is None, "QUOTA_STATUS_PUBLISH=false: no quota reader")
+    _saved_qs = sys.modules.get("quota_status")
+    sys.modules["quota_status"] = None  # the next import raises ImportError
+    import io as _qio
+    from contextlib import redirect_stderr as _qredirect
+    _qerr = _qio.StringIO()
+    try:
+        with _qredirect(_qerr):
+            _bspec = importlib.util.spec_from_file_location("rtc_quota_broken", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+            _brtc = importlib.util.module_from_spec(_bspec)
+            _bspec.loader.exec_module(_brtc)
+    finally:
+        if _saved_qs is None:
+            sys.modules.pop("quota_status", None)
+        else:
+            sys.modules["quota_status"] = _saved_qs
+    check(_brtc._QUOTA_STATUS_READER is None and callable(getattr(_brtc, "_post_heartbeat", None))
+          and _qerr.getvalue().count("quota status off: ModuleNotFoundError") == 1,
+          "a broken quota module: the bridge still loads, logs once, and sends no quota block")
+    _brtc._last_heartbeat_at = 0.0
+    STATE["heartbeats"].clear()
+    _brtc._post_heartbeat(set(), force=True)
+    _hbb = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    check(bool(STATE["heartbeats"]) and "quota" not in (_hbb.get("health") or {}),
+          "a broken quota module: the heartbeat still goes out, without health.quota")
 
     # SECURITY / robustness: core-status.json is written by another process and
     # may be malformed. _read_core_status runs in the main loop BEFORE the poll,
