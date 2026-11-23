@@ -912,13 +912,39 @@ class CoreModelSwitch(SeatCase):
         self.assertEqual(s.serve(once=True), 0)
         self.assertEqual([r["params"].get("model") for r in self.sent("turn/start")], ["gpt-during-startup"])
 
-    def test_the_pick_the_launch_consumed_is_not_sent_again_but_is_settled_by_the_first_turn(self):
-        self.switch("gpt-launched")
-        s = self.launched(1, model="gpt-launched")
+    def test_a_pick_pending_at_launch_starts_on_the_working_model_and_is_tried_on_the_first_turn(self):
+        self.switch("gpt-old", accepted=True)
+        self.switch("gpt-new")
+        s = self.launched(0, model="gpt-old")  # the launcher passes the working model, never the pick
+        self.assertEqual(s.thread_params()["model"], "gpt-old")
+        self.task("task-1.txt")
+        self.assertEqual(s.serve(once=True), 0)
+        self.assertEqual([r["params"].get("model") for r in self.sent("thread/start")], ["gpt-old"])
+        self.assertEqual([r["params"].get("model") for r in self.sent("turn/start")], ["gpt-new"])
+        self.assertEqual((self.record()["status"], s.model), ("accepted", "gpt-new"))
+
+    def test_an_explicit_launch_model_outranks_a_pick_saved_before_it(self):
+        self.switch("gpt-new")
+        s = self.launched(1, model="gpt-explicit")
         self.task("task-1.txt")
         self.assertEqual(s.serve(once=True), 0)
         self.assertEqual([("model" in r["params"]) for r in self.sent("turn/start")], [False])
-        self.assertEqual(self.record()["status"], "accepted")
+        self.assertEqual(self.record()["status"], "pending")
+
+    def test_a_refusal_that_is_not_about_the_model_leaves_the_pick_pending_and_the_seat_on_its_model(self):
+        self.switch("gpt-old", accepted=True)
+        self.switch("gpt-new")
+        s = self.launched(0, model="gpt-old")
+        s.ensure_server()
+        (self.fake_dir / "plan.json").write_text(json.dumps(["refuse"]))  # "thread is busy"
+        status, detail = s.run_turn("task-1.txt", "hello")
+        self.assertEqual(status, "failed")
+        self.assertIn("busy", detail)
+        self.assertEqual(self.record()["status"], "pending", "a busy thread is no verdict on the model")
+        self.assertEqual((s.model, s.thread_params()["model"], s.trial), ("gpt-old", "gpt-old", None),
+                         "a restarted child resumes on the working model, not the untried pick")
+        self.assertEqual(s.turn_model(), "gpt-new", "the next turn tries it again")
+        self.assertEqual(list(self.results.glob("proactive-model-refused-*.txt")), [])
 
     def test_a_pick_codex_refuses_keeps_the_working_model_runs_the_task_and_tells_the_owner(self):
         self.switch("gpt-old", accepted=True)
@@ -945,8 +971,8 @@ class CoreModelSwitch(SeatCase):
         s = self.launched(0, model="gpt-old")
         s.trial = ("gpt-bad", 1, "gpt-old")
         self.switch("gpt-bad")
-        s.model = "gpt-bad"
         s.settle_model(False, "The 'gpt-bad' model does not exist")
+        self.assertEqual(s.model, "gpt-old")
         self.assertEqual(self.record()["status"], "rejected")
         self.assertEqual(s.turn_model(), "gpt-old", "the thread is moved back off the refused model")
         self.assertEqual(s.turn_model(), "")

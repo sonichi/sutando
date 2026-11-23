@@ -61,12 +61,12 @@ class Record(Case):
             self.assertEqual(ccm.current(self.state), "", text)
 
     def test_each_save_is_one_revision_and_a_seat_pick_is_pending_on_the_working_model(self):
-        self.assertEqual((ccm.revision(self.state), ccm.launch(self.state)), (0, (0, "")))
+        self.assertEqual((ccm.revision(self.state), ccm.launch(self.state)), (0, (0, "", "")))
         ccm.save(self.state, "gpt-a", applied="next-turn", accepted=True)
         rec = ccm.save(self.state, "gpt-b", applied="next-turn", accepted=False)
         self.assertEqual((rec["rev"], rec["status"], rec["working"], rec["previous"]), (2, "pending", "gpt-a", "gpt-a"))
         self.assertEqual(ccm.pending(self.state), ("gpt-b", 2))
-        self.assertEqual(ccm.launch(self.state), (2, "gpt-b"))
+        self.assertEqual(ccm.launch(self.state), (2, "gpt-b", "gpt-a"), "a TUI takes the pick; a seat starts on gpt-a")
 
     def test_a_refused_pick_leaves_the_working_model_in_use(self):
         ccm.save(self.state, "gpt-a", applied="next-turn", accepted=True)
@@ -74,7 +74,7 @@ class Record(Case):
         rec = ccm.resolve(self.state, 2, False, "model not supported")
         self.assertEqual((rec["status"], rec["accepted"], rec["rejected_reason"]), ("rejected", False, "model not supported"))
         self.assertEqual(ccm.current(self.state), "gpt-a")
-        self.assertEqual(ccm.launch(self.state), (2, "gpt-a"), "a restart is not retried on the refused pick")
+        self.assertEqual(ccm.launch(self.state), (2, "gpt-a", "gpt-a"), "a restart is not retried on the refused pick")
         self.assertEqual(ccm.pending(self.state), ("", 2))
         nxt = ccm.save(self.state, "gpt-c", applied="next-turn", accepted=False)
         self.assertEqual((nxt["previous"], nxt["working"], nxt["rev"]), ("gpt-a", "gpt-a", 3))
@@ -138,7 +138,7 @@ class Cli(Case):
                                    "--accepted"), (0, "OK gpt-a"))
         self.assertTrue(json.loads(ccm.record_path(self.state).read_text())["accepted"])
         self.assertEqual(self.main("current", "--state-dir", str(self.state)), (0, "gpt-b"))
-        self.assertEqual(self.main("launch", "--state-dir", str(self.state)), (0, "2 gpt-b"))
+        self.assertEqual(self.main("launch", "--state-dir", str(self.state)), (0, "2 gpt-b gpt-b"))
         rc, out = self.main("save", "--state-dir", str(self.state), "--model", "sonnet", "--applied", "next-turn")
         self.assertEqual(rc, 2)
         self.assertTrue(out.startswith("FAILED"))

@@ -292,6 +292,11 @@ class Watcher:
             self.p.kill()
 
 
+def model_refusal(text: str) -> bool:
+    """Codex's error is about the model itself (unknown, unsupported, not allowed), not the turn."""
+    return "model" in str(text).lower()
+
+
 class Seat:
     def __init__(self, host, workspace, seat: str, worker: str = "", codex: str = "codex",
                  config: Optional[List[str]] = None, model: str = "", sandbox: str = SANDBOX,
@@ -310,6 +315,7 @@ class Seat:
         self.context, self.clock = context, clock
         # The switch revision this seat's launch model came from; a later one is the next turn's.
         self.model_rev = self.launch_rev()
+        self.tried_rev = 0
         self.trial: Optional[tuple] = None  # (model, rev, the model before it) until Codex settles it
         self.force_model = False
         self.cwd = host.cwd or str(self.workspace)
@@ -628,35 +634,39 @@ class Seat:
             log("  thread status: systemError")
 
     def launch_rev(self) -> int:
-        """The record revision the launcher read with the launch model (SUTANDO_CORE_MODEL_REV); a
-        launcher that passes none leaves the record as it is at this seat's start."""
+        """Pending picks at or below this revision are not tried: SUTANDO_CORE_MODEL_REV, which the
+        launcher sets only when this launch named its model explicitly. 0 otherwise."""
         if self.worker:
             return 0
         value = os.environ.get("SUTANDO_CORE_MODEL_REV", "")
-        return int(value) if value.isdigit() else codex_core_model.revision(self.workspace / "state")
+        return int(value) if value.isdigit() else 0
 
     def turn_model(self) -> str:
         """The core's model for the next turn, '' to leave the thread's as it is. Only the core seat
-        reads the core's switch record (src/codex_core_model.py), and only a pending pick past the
-        revision its launch consumed; the launch already holds that one. A worker's seat never does."""
+        reads the core's switch record (src/codex_core_model.py). The seat starts on the verified
+        working model; a pending pick is tried here, on a turn, and becomes the seat's model only once
+        Codex runs that turn. A worker's seat never reads it."""
         if self.worker:
             return ""
         if self.force_model:
             self.force_model = False
             return self.model
         picked, rev = codex_core_model.pending(self.workspace / "state")
-        if picked and rev == self.model_rev and picked == self.model and self.trial is None:
-            self.trial = (picked, rev, picked)  # the launch took it: the first turn settles it
+        if not picked or rev <= self.model_rev or rev == self.tried_rev:
             return ""
-        if not picked or rev <= self.model_rev:
-            return ""
-        self.model_rev = rev
+        self.tried_rev = rev
         self.trial = (picked, rev, self.model)
         if picked == self.model:
             return ""
-        log(f"model: trying {picked} from the core's switch (was {self.model or 'the default'})")
-        self.model = picked  # a restarted child's thread/resume keeps it too
+        log(f"model: trying {picked} from the core's switch (on {self.model or 'the default'} until Codex takes it)")
         return picked
+
+    def abandon_trial(self) -> None:
+        """A turn that ended with no verdict on the pick (busy, timeout, exit): it stays pending and
+        the next turn tries it again."""
+        if self.trial is not None:
+            log(f"model: no verdict on {self.trial[0]} this turn; it stays pending")
+        self.trial, self.tried_rev = None, 0
 
     def settle_model(self, accepted: bool, reason: str = "") -> None:
         """Record whether Codex took the pick under trial; a refused one puts the model before it back
@@ -670,6 +680,7 @@ class Seat:
         except OSError as e:
             log(f"model: the switch record could not be settled ({one_line(e, 120)})")
         if accepted:
+            self.model = picked  # a restarted child's thread/resume keeps it too
             log(f"model: {picked} taken by Codex; it holds from now on")
             return
         self.model, self.force_model = before, bool(before)
@@ -687,6 +698,13 @@ class Seat:
     def run_turn(self, filename: str, prompt: str) -> Tuple[str, str]:
         """(status, detail) once the turn is over: completed | failed | interrupted | stopped |
         timeout | server-exited | seat-stopping."""
+        try:
+            return self._run_turn(filename, prompt)
+        finally:
+            if self.trial is not None:
+                self.abandon_trial()
+
+    def _run_turn(self, filename: str, prompt: str) -> Tuple[str, str]:
         params = {"threadId": self.thread_id, "cwd": self.cwd, "input": [{"type": "text", "text": prompt}]}
         model = self.turn_model()
         if model:
@@ -696,8 +714,9 @@ class Seat:
             try:
                 res = self.rpc.request("turn/start", params)
             except RuntimeError as e:
-                # Only Codex's own error answer refuses the pick; a timeout or closed pipe is no verdict.
-                answered = str(e).startswith("turn/start: {")
+                # Only Codex's own answer naming the model refuses the pick; busy, timeout or a
+                # closed pipe is no verdict (run_turn leaves the pick pending).
+                answered = str(e).startswith("turn/start: {") and model_refusal(str(e))
                 if not (model and answered and self.trial and self.trial[0] == model and self.rpc.alive()):
                     raise
                 self.settle_model(False, str(e))
@@ -732,7 +751,7 @@ class Seat:
                         error = (turn.get("error") or {}).get("message") or ""
                         if status == "completed":
                             self.settle_model(True)
-                        elif status == "failed" and "model" in error.lower():
+                        elif status == "failed" and model_refusal(error):
                             self.settle_model(False, error)
                         if interrupted and status == "interrupted":
                             return interrupted, error

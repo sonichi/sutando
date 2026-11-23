@@ -8,16 +8,16 @@ kept in the core's switch record instead (`model-switch.json` in the state folde
 
 - `src/agent/codex/cli/start-cli.sh` launches the core with `-m <model>` from it when
   SUTANDO_CORE_MODEL is not set for that launch (an explicit launch value wins);
-- the core's app-server seat (`src/agent/codex/app-server/seat.py`, no `--worker`) passes it as
-  `model` on the next `turn/start` once the record's `rev` is past the one its launcher consumed
-  (SUTANDO_CORE_MODEL_REV). A pick stays `pending` until Codex runs a turn on it; one Codex refuses
-  is `rejected` and the core stays on `working`, the last model Codex took.
+- the core's app-server seat (`src/agent/codex/app-server/seat.py`, no `--worker`) launches on
+  `working`, the last model Codex took, and passes a pending pick as `model` on a `turn/start`. It
+  is `accepted` once Codex runs that turn and `rejected` when Codex refuses that model; any other
+  failure leaves it pending for the next turn.
 
 Pool workers read none of this: their model is their own.
 
     python3 codex_core_model.py check <model>                 # exit 0 a Codex model name, 2 not
     python3 codex_core_model.py current --state-dir DIR       # the recorded model, or nothing
-    python3 codex_core_model.py launch --state-dir DIR        # "<rev> <model or ->", read once
+    python3 codex_core_model.py launch --state-dir DIR        # "<rev> <pick> <working>" ('-' none), read once
     python3 codex_core_model.py save --state-dir DIR --model M --applied WHEN [--accepted]
     python3 codex_core_model.py choices [--codex-home DIR]    # id=Title;... from Codex's model cache
 
@@ -94,10 +94,12 @@ def revision(state_dir) -> int:
 
 
 def launch(state_dir) -> tuple:
-    """(rev, model) read in one go, for a launcher that hands the rev on to the seat."""
+    """(rev, model, working) read in one go: the pick a TUI launch takes, and the last model Codex
+    took, which a seat launches on while a pick is still pending."""
     rec = read_record(state_dir)
     model = working(rec) if rec.get("status") == "rejected" else (rec.get("model") or "")
-    return _rev(rec), model
+    verified = model if rec.get("status") in (None, "accepted") else working(rec)
+    return _rev(rec), model, verified
 
 
 def pending(state_dir) -> tuple:
@@ -224,8 +226,8 @@ def main(argv=None) -> int:
             print(model)
         return 0
     if a.cmd == "launch":
-        rev, model = launch(a.state_dir)
-        print(f"{rev} {model or '-'}")
+        rev, model, verified = launch(a.state_dir)
+        print(f"{rev} {model or '-'} {verified or '-'}")
         return 0
     if a.cmd == "choices":
         where = a.codex_home or home(Path(__file__).resolve().parents[1])  # lint-workspace-resolution: allow-repo-root
