@@ -75,7 +75,7 @@ def working(rec: dict) -> str:
     """The last model Codex took: `confirmed` (what a completed turn last ran on, whatever pick is
     pending), else the record's own once accepted, else the one it carried."""
     c = rec.get("confirmed")
-    if isinstance(c, str) and valid(c):
+    if isinstance(c, str) and valid(c) and _rev(rec, "confirmed_rev"):  # only as a valid pair
         return c
     if rec.get("status", "accepted" if rec.get("accepted") else "") == "accepted" and valid(rec.get("model") or ""):
         return rec["model"]
