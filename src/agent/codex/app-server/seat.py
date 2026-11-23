@@ -673,6 +673,7 @@ class Seat:
             return
         picked, rev, before, sent = self.trial
         self.trial = None
+        self.unmark_running(rev)    # this turn is over, whether or not its pick is still the newest
         try:
             if accepted:  # recorded even when a newer pick is pending: a restart then starts on it
                 codex_core_model.confirm(self.workspace / "state", picked, rev)

@@ -932,8 +932,8 @@ class CodexCore(Base):
                    running={"model": "gpt-b", "rev": 2, "ts": _time.time()})
         self.assertEqual(mc.current_model(self.ws)["name"], "GPT B")
         self.using("gpt-b", runtime="codex", status="pending", working="gpt-a", accepted=False, rev=2,
-                   running={"model": "gpt-b", "rev": 1, "ts": _time.time()})
-        self.assertEqual(mc.current_model(self.ws)["name"], "GPT A", "another revision's mark says nothing")
+                   running={"model": "gpt-b", "rev": 2, "ts": _time.time() - 3 * 3600})
+        self.assertEqual(mc.current_model(self.ws)["name"], "GPT A", "a mark left hours ago is not a running turn")
         self.using("gpt-b", runtime="codex", status="pending", working="gpt-a", accepted=False, rev=2)
         body, card = mc.notice_card(state, "Pending", words)
         self.assertEqual((card["state"], card["header"]["status"]["label"]), ("pending", "Pending"))

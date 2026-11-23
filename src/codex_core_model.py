@@ -87,13 +87,13 @@ RUNNING_STALE_S = 2 * 3600.0     # a `running` mark older than this is a seat th
 
 
 def in_use(rec: dict, now: Optional[float] = None) -> str:
-    """The model the core is on right now: the pending pick while a turn the seat started on it is
-    running (`running`, set by `started` once Codex took the turn), else the last model Codex took
-    (`working`). What a reader that says "I'm using X" reports; the pick is still not `working`,
-    and not what a restart launches on, until that turn completes."""
+    """The model the core is on right now: the model of the turn that is running, when the seat
+    started it on a pick (`running`, set by `started` once Codex took the turn), else the last model
+    Codex took (`working`). What a reader that says "I'm using X" reports. It is an observation of
+    the turn, kept apart from the pending pick (a newer pick saved meanwhile does not change what
+    this turn runs on) and from `working`, which is what a restart launches on."""
     run = rec.get("running")
-    if (rec.get("status") == "pending" and isinstance(run, dict) and run.get("model") == rec.get("model")
-            and run.get("rev") == _rev(rec) and valid(run.get("model") or "")):
+    if isinstance(run, dict) and valid(run.get("model") or "") and _rev(run) > 0:
         try:
             age = (time.time() if now is None else now) - float(run.get("ts") or 0)
         except (TypeError, ValueError):
@@ -198,7 +198,8 @@ def resolve(state_dir, rev: int, accepted: bool, reason: str = "") -> Optional[d
         if not rec or _rev(rec) != rev or rec.get("status") != "pending":
             return None
         rec["status"], rec["accepted"] = ("accepted" if accepted else "rejected"), bool(accepted)
-        rec.pop("running", None)
+        if isinstance(rec.get("running"), dict) and rec["running"].get("rev") == rev:
+            rec.pop("running")
         if accepted:
             rec["working"] = rec["confirmed"] = rec["model"]
             rec["confirmed_rev"] = max(rev, _rev(rec, "confirmed_rev"))
@@ -223,6 +224,8 @@ def save(state_dir, model: str, *, applied: str, accepted: bool, now: Optional[f
            "runtime": RUNTIME, "accepted": bool(accepted), "status": "accepted" if accepted else "pending",
            "working": model if accepted else (working(old) or None), "rev": _rev(old) + 1,
            "applied": applied, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "by": BY}
+    if isinstance(old.get("running"), dict):  # the turn now running is on it, whatever is picked next
+        rec["running"] = old["running"]
     if valid(old.get("confirmed") or "") and _rev(old, "confirmed_rev"):  # outlives later picks
         rec["confirmed"], rec["confirmed_rev"] = old["confirmed"], old["confirmed_rev"]
     if accepted:

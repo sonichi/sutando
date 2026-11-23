@@ -95,13 +95,26 @@ class Record(Case):
         ccm.resolve(self.state, rec["rev"], True)
         self.assertEqual((ccm.in_use(read()), read()["working"], "running" in read()), ("gpt-b", "gpt-b", False))
         self.assertFalse(ccm.started(self.state, "gpt-b", rec["rev"]), "a settled pick is not pending")
-        # A newer pick drops an older mark with the record it replaces.
-        newer = ccm.save(self.state, "gpt-c", applied="next-turn", accepted=False)
-        self.assertTrue(ccm.started(self.state, "gpt-c", newer["rev"]))
-        ccm.save(self.state, "gpt-d", applied="next-turn", accepted=False)
+        # A second pick saved while the first trial's turn is still running: that turn is on the first
+        # pick, and says so; the second is what is pending; a restart would still launch on gpt-b.
+        first = ccm.save(self.state, "gpt-c", applied="next-turn", accepted=False)
+        self.assertTrue(ccm.started(self.state, "gpt-c", first["rev"]))
+        second = ccm.save(self.state, "gpt-d", applied="next-turn", accepted=False)
+        self.assertEqual((ccm.in_use(read()), ccm.pending(self.state)[0], ccm.working(read()), ccm.launch(self.state)[2]),
+                         ("gpt-c", "gpt-d", "gpt-b", "gpt-b"))
+        # Settling the newer pick does not end the older turn's observation; that turn's own end does.
+        self.assertIsNone(ccm.resolve(self.state, first["rev"], True), "the record moved on: not settled")
+        self.assertEqual(ccm.in_use(read()), "gpt-c")
+        self.assertFalse(ccm.stopped(self.state, second["rev"]))
+        self.assertTrue(ccm.stopped(self.state, first["rev"]))
         self.assertEqual((ccm.in_use(read()), "running" in read()), ("gpt-b", False))
-        self.assertTrue(ccm.started(self.state, "gpt-d", newer["rev"] + 1))
+        self.assertTrue(ccm.started(self.state, "gpt-d", second["rev"]))
+        ccm.resolve(self.state, second["rev"], False, "refused")
+        self.assertNotIn("running", read(), "its own settlement ends its mark")
+        third = ccm.save(self.state, "gpt-e", applied="next-turn", accepted=False)
+        self.assertTrue(ccm.started(self.state, "gpt-e", third["rev"]))
         self.assertTrue(ccm.stopped(self.state), "any mark, for a seat that is starting")
+        self.assertEqual(ccm.in_use(dict(read(), running={"model": "gpt-e", "rev": 0, "ts": 1e18})), "gpt-b")
 
     def test_a_refused_pick_leaves_the_working_model_in_use(self):
         ccm.save(self.state, "gpt-a", applied="next-turn", accepted=True)

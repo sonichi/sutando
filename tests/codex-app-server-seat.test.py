@@ -965,6 +965,29 @@ class CoreModelSwitch(SeatCase):
         self.assertEqual((after["status"], after["working"], "running" in after), ("accepted", "gpt-new", False))
         self.assertEqual(ccm.in_use(after), "gpt-new")
 
+    def test_a_second_pick_saved_while_the_first_trial_runs_does_not_change_what_that_turn_says_it_is_on(self):
+        ccm = seat_mod.codex_core_model
+        self.switch("gpt-old", accepted=True)
+        s = self.launched(1, model="gpt-old")
+        self.switch("gpt-new")
+        self.task("task-1.txt")
+        mid = []
+        settle = s.settle_model
+
+        def settle_seeing(accepted, reason=""):
+            self.switch("gpt-newer")            # the owner picks again while the turn is still running
+            mid.append(self.record())
+            return settle(accepted, reason)
+        s.settle_model = settle_seeing
+        self.assertEqual(s.serve(once=True), 0)
+        (during,) = mid
+        self.assertEqual((ccm.in_use(during), during["model"], during["status"], ccm.working(during)),
+                         ("gpt-new", "gpt-newer", "pending", "gpt-old"))
+        after = self.record()
+        self.assertNotIn("running", after, "cleared at that turn's own completion, though the record had moved on")
+        self.assertEqual((after["status"], after["model"], after["confirmed"], ccm.in_use(after)),
+                         ("pending", "gpt-newer", "gpt-new", "gpt-new"), "Codex did run gpt-new; gpt-newer is next")
+
     def test_a_turn_on_the_pick_that_ends_with_no_verdict_clears_the_mark_and_so_does_a_seats_start(self):
         ccm = seat_mod.codex_core_model
         self.switch("gpt-old", accepted=True)
