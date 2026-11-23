@@ -194,6 +194,46 @@ class Contract(Layout):
         (self.repo / "sutando.config.json").write_text(json.dumps(config))
         self.assertEqual(self.prepare(environ={}), ("", "", str(self.home / ".codex")))
 
+    def effective(self, environ=None):
+        with patch.dict(sys.modules):
+            sys.modules.pop("src.sutando_config", None)
+            sys.modules.pop("src", None)
+            return codex_home.effective(self.repo, self.home, environ or {})
+
+    def test_effective_is_the_prepared_home_without_creating_it(self):
+        for desktop in (True, False):
+            with self.subTest(desktop=desktop):
+                self.checkout(desktop=desktop)
+                before = self.tree()
+                self.assertEqual(self.effective(), str(self.app_home))
+                self.assertEqual(self.tree(), before)
+                self.assertEqual(self.prepare()[2], self.effective())
+                shutil.rmtree(self.root / ("app-support" if desktop else "code"))
+                if not desktop:
+                    shutil.rmtree(self.workspace)
+
+    def test_effective_follows_the_home_codex_reads_off_a_desktop(self):
+        self.checkout(desktop=False, env_name="CODEX_CONFIG_DIR")
+        self.assertEqual(self.effective(), str(self.home / ".codex"))
+        self.assertEqual(self.effective({"CODEX_HOME": "/elsewhere"}), "/elsewhere")
+
+    def test_effective_refuses_what_prepare_refuses_creating_nothing(self):
+        self.checkout(env_name="CODEX_CONFIG_DIR")
+        with self.assertRaisesRegex(codex_home.Refused, "not a CODEX_HOME"):
+            self.effective()
+        shutil.rmtree(self.root / "app-support")
+        self.checkout()
+        self.owner.symlink_to(self.app_home)
+        before = self.tree()
+        with self.assertRaisesRegex(codex_home.Refused, "owner's own Codex home"):
+            self.effective()
+        for verdict, why in (("invalid-home", "symlink or non-directory"), ("maybe", "could not be checked")):
+            with self.subTest(verdict=verdict), \
+                    patch.object(codex_home.codex_host_instructions, "check", return_value=verdict):
+                with self.assertRaisesRegex(codex_home.Refused, why):
+                    self.effective()
+        self.assertEqual(self.tree(), before)
+
     def main(self, *argv):
         out, err = io.StringIO(), io.StringIO()
         with patch.object(Path, "home", return_value=self.home), \

@@ -103,7 +103,8 @@ class AppServer(Case):
         rc, out = self.cli("--json")
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(out), {"codex_home": str(self.home), "email": "app@example.com", "plan": "pro",
-                                           "workspace": "Acme", "kind": "chatgpt", "source": "app-server"})
+                                           "workspace": "Acme", "kind": "chatgpt", "source": "app-server",
+                                           "verified": True})
         sent = [json.loads(line) for line in self.log.read_text().splitlines()]
         self.assertEqual([m["method"] for m in sent], ["initialize", "initialized", "account/read"])
         self.assertEqual({m["codex_home"] for m in sent}, {str(self.home)})
@@ -112,13 +113,33 @@ class AppServer(Case):
 
     def test_an_app_server_that_errors_exits_hangs_or_is_missing_falls_back_to_the_file(self):
         self.auth({"email": "file@example.com", ca.PLAN_CLAIMS: {"chatgpt_plan_type": "plus"}})
-        for mode in ("error", "exit", "signed-out", "gone"):
+        for mode in ("error", "exit", "gone"):
             with self.subTest(mode=mode), mock.patch.dict(os.environ, {"STUB_MODE": mode}):
                 got = ca.read(self.home, str(self.codex))
-                self.assertEqual((got["email"], got["plan"], got["source"]), ("file@example.com", "plus", "auth.json"))
+                self.assertEqual((got["email"], got["plan"], got["source"], got["verified"]),
+                                 ("file@example.com", "plus", "auth.json", False))
         with mock.patch.dict(os.environ, {"STUB_MODE": "hang"}):
             self.assertIsNone(ca.from_app_server(self.home, str(self.codex), timeout=1))
         self.assertEqual(ca.read(self.home, str(self.root / "no-such-codex"))["source"], "auth.json")
+
+    def test_codex_saying_signed_out_wins_over_a_leftover_file(self):
+        self.auth({"email": "stale@example.com"})
+        with mock.patch.dict(os.environ, {"STUB_MODE": "signed-out"}):
+            got = ca.read(self.home, str(self.codex))
+            rc, out = self.cli()
+        self.assertEqual((got["kind"], got["email"], got["verified"]), (None, None, True))
+        self.assertEqual((rc, out.strip()), (1, f"Codex is not signed in under {self.home}."))
+        self.assertNotIn("stale@example.com", out)
+
+    def test_a_bare_codex_name_is_found_where_the_launcher_looks(self):
+        bindir = self.root / "npm-bin"
+        bindir.mkdir()
+        (bindir / "codex").symlink_to(self.codex)
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin", "CODEX_INSTALL_BIN": str(bindir),
+                                          "CODEX_NODE_BIN": str(self.root / "no-node")}):
+            self.assertEqual(ca.launch_path().split(os.pathsep), ["/usr/bin", "/bin", str(bindir)])
+            got = ca.from_app_server(self.home, "codex")
+        self.assertEqual((got["email"], got["source"]), ("app@example.com", "app-server"))
 
     def test_a_signed_out_answer_names_no_account(self):
         with mock.patch.dict(os.environ, {"STUB_MODE": "signed-out"}):
@@ -134,7 +155,8 @@ class AuthFile(Case):
         rc, out = self.cli("--no-app-server", "--json")
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(out), {"codex_home": str(self.home), "email": "file@example.com", "plan": "plus",
-                                           "workspace": None, "kind": "chatgpt", "source": "auth.json"})
+                                           "workspace": None, "kind": "chatgpt", "source": "auth.json",
+                                           "verified": False})
         self.assertNoSecrets(out)
         self.assertNotIn("secret-sub", out)
         self.assertFalse(self.log.exists(), "--no-app-server starts no Codex")
@@ -143,12 +165,13 @@ class AuthFile(Case):
         (self.home / "auth.json").write_text(json.dumps({"tokens": {"id_token": {"raw_jwt": jwt({"email": "p@example.com"})}}}))
         got = ca.from_auth_file(self.home)
         self.assertEqual((got["email"], got["plan"]), ("p@example.com", None))
-        self.assertEqual(ca.words(got, self.home), f"Codex under {self.home} is signed in as p@example.com.")
+        self.assertEqual(ca.words(got, self.home), f"Codex under {self.home} is signed in as p@example.com (from its saved sign-in file; "
+                         "Codex itself did not confirm it).")
 
     def test_an_api_key_login_says_so_without_the_key(self):
         self.auth(api_key=SECRET)
         rc, out = self.cli("--no-app-server")
-        self.assertEqual((rc, out.strip()), (0, f"Codex under {self.home} uses an API key (no ChatGPT account)."))
+        self.assertEqual((rc, out.strip()), (0, f"Codex under {self.home} uses an API key (no ChatGPT account) (from its saved sign-in file)."))
         self.assertNoSecrets(out)
 
     def test_no_file_or_a_broken_one_is_signed_out(self):
@@ -161,22 +184,26 @@ class AuthFile(Case):
         self.assertEqual((rc, json.loads(out)["kind"]), (1, None))
 
     def test_an_account_with_no_email_is_named_as_such(self):
-        self.assertEqual(ca.words({"kind": "chatgpt"}, self.home),
+        self.assertEqual(ca.words({"kind": "chatgpt", "verified": True}, self.home),
                          f"Codex under {self.home} is signed in as an account whose email Codex does not report.")
 
 
 class Home(Case):
-    def test_the_configured_home_then_codex_home_then_the_default(self):
+    def test_the_launchers_effective_home_is_used_and_its_refusal_kept(self):
         import codex_home
-        with mock.patch.object(codex_home, "configured", return_value=("CODEX_HOME", str(self.root / "cfg"))):
+        with mock.patch.object(codex_home, "effective", return_value=str(self.root / "cfg")) as eff:
             self.assertEqual(ca.home(REPO), self.root / "cfg")
-        with mock.patch.object(codex_home, "configured", side_effect=RuntimeError("unreadable")), \
-                mock.patch.dict(os.environ, {"CODEX_HOME": str(self.root / "env")}):
-            self.assertEqual(ca.home(), self.root / "env")
-        with mock.patch.object(codex_home, "configured", return_value=("", "")), \
-                mock.patch.dict(os.environ, {"HOME": str(self.root)}), mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("CODEX_HOME", None)
-            self.assertEqual(ca.home(REPO), self.root / ".codex")
+        self.assertEqual(eff.call_args.args[0], REPO)
+        with mock.patch.object(codex_home, "effective", side_effect=codex_home.Refused("not a CODEX_HOME")):
+            with self.assertRaisesRegex(ca.NoHome, "not a CODEX_HOME"):
+                ca.home(REPO)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = ca.main(["--no-app-server"])
+        self.assertEqual((rc, out.getvalue().strip()), (1, "No Codex home to read: not a CODEX_HOME."))
+        with mock.patch.object(codex_home, "effective", side_effect=RuntimeError("unreadable")):
+            with self.assertRaisesRegex(ca.NoHome, "cannot be read"):
+                ca.home(REPO)
 
     def test_without_codex_home_the_cores_home_is_read(self):
         self.auth({"email": "core@example.com"})
@@ -184,6 +211,36 @@ class Home(Case):
         with mock.patch.object(ca, "home", return_value=self.home), contextlib.redirect_stdout(out):
             rc = ca.main(["--no-app-server", "--json"])
         self.assertEqual((rc, json.loads(out.getvalue())["email"]), (0, "core@example.com"))
+
+
+class OwnerOnly(Case):
+    def task(self, **headers):
+        f = self.root / "task.txt"
+        f.write_text("".join(f"{k}: {v}\n" for k, v in headers.items()) + "task: which account?\n")
+        return f
+
+    def gate(self, f):
+        with mock.patch("owner_room_access.owner_routing", return_value={"owner_dm": "!dm:s"}):
+            return ca.owner_dm_task(f, workspace=self.root)
+
+    def test_only_the_owner_outside_shared_rooms_is_answered(self):
+        self.assertIsNone(self.gate(self.task(access_tier="owner", channel_id="!dm:s")))
+        self.assertIsNone(self.gate(self.task(access_tier="owner")))
+        self.assertIn("not the owner's DM", self.gate(self.task(access_tier="owner", channel_id="!room:s")))
+        self.assertIn("not the owner's", self.gate(self.task(access_tier="team", channel_id="!dm:s")))
+        self.assertIn("cannot be read", self.gate(self.root / "missing.txt"))
+        with mock.patch("owner_room_access.owner_routing", return_value={}):
+            self.assertIn("not the owner's DM", ca.owner_dm_task(self.task(channel_id="!dm:s"), workspace=self.root))
+
+    def test_a_refused_task_looks_nothing_up(self):
+        self.auth({"email": "file@example.com"})
+        f = self.task(access_tier="owner", channel_id="!room:s")
+        with mock.patch("owner_room_access.owner_routing", return_value={"owner_dm": "!dm:s"}), \
+                mock.patch("workspace_default.resolve_workspace", return_value=self.root):
+            rc, out = self.cli("--task-file", str(f))
+        self.assertEqual(rc, 3)
+        self.assertNotIn("file@example.com", out)
+        self.assertFalse(self.log.exists())
 
 
 if __name__ == "__main__":
