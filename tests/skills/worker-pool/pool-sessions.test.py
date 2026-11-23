@@ -396,10 +396,31 @@ class UnreadableRecordsDegradeToAbsent(unittest.TestCase):
             with spawn_worker.launch_lock(ws, name):
                 (row,) = pool_sessions.sessions(ws, probe=EXISTS)
                 self.assertTrue(row["seat"])
-                self.assertTrue(pool_sessions.launch_in_progress(ws, name))
             (row,) = pool_sessions.sessions(ws, probe=EXISTS)
             self.assertFalse(row["seat"])
-            self.assertFalse(pool_sessions.launch_in_progress(ws, name))
+
+    def test_a_launch_cannot_complete_between_a_rows_reads(self):
+        """The reader holds the launch lock shared from the incarnation read through the tmux
+        probe and the stamp: a launch trying to take it in between is held off."""
+        import spawn_worker
+        with tempfile.TemporaryDirectory() as d:
+            ws = self._codex_seat_ws(d, "i-tui-run", "i-old-seat-run")
+            name = f"sutando-worker-{W1}"
+            tried = {}
+
+            def probe_with_a_competing_launch(n, socket=None):
+                try:
+                    with spawn_worker.launch_lock(ws, name, wait=0):
+                        tried["launched"] = True
+                except spawn_worker.SpawnRefused:
+                    tried["launched"] = False
+                return ("exists", "")
+
+            (row,) = pool_sessions.sessions(ws, probe=probe_with_a_competing_launch)
+            self.assertIs(tried["launched"], False)
+            self.assertFalse(row["seat"])
+            with spawn_worker.launch_lock(ws, name, wait=0):
+                pass
 
     def test_a_claude_row_is_never_a_seat_even_mid_launch(self):
         import spawn_worker
@@ -410,13 +431,15 @@ class UnreadableRecordsDegradeToAbsent(unittest.TestCase):
                 (row,) = pool_sessions.sessions(ws, probe=EXISTS)
                 self.assertFalse(row["seat"])
 
-    def test_a_lock_file_that_cannot_be_locked_is_not_a_launch(self):
+    def test_a_lock_error_reads_a_codex_row_as_a_seat(self):
         with tempfile.TemporaryDirectory() as d:
-            lock = Path(d) / "state" / "worker-launch" / "s.lock"
-            lock.parent.mkdir(parents=True)
-            lock.write_text("")
+            ws = self._codex_seat_ws(d, "i-tui-run", "i-old-seat-run")
             with mock.patch.object(pool_sessions.fcntl, "flock", side_effect=OSError("no locks here")):
-                self.assertFalse(pool_sessions.launch_in_progress(Path(d), "s"))
+                (row,) = pool_sessions.sessions(ws, probe=EXISTS)
+            self.assertTrue(row["seat"])
+            with mock.patch.object(pool_sessions.Path, "mkdir", side_effect=OSError("read-only")):
+                (row,) = pool_sessions.sessions(ws, probe=EXISTS)
+            self.assertTrue(row["seat"])
 
     def test_a_tui_run_with_no_declaration_is_not_a_seat(self):
         with tempfile.TemporaryDirectory() as d:
