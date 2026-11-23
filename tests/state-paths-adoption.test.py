@@ -159,6 +159,9 @@ ALLOWLIST = {
     # station_stamp never resolves the workspace — read_station_stamp(ws) takes the
     # dir from its caller (marketplace / connect-apps resolve it).
     "src/station_stamp.py",
+    # wait_store never resolves the workspace: every call takes the root from its caller
+    # (connect-apps and connect-mcp resolve it).
+    "src/wait_store.py",
     # owner_channel never resolves the workspace — bound_worker(workspace, …) and
     # its `--workspace` CLI both take the root from the caller (the loop step).
     "src/owner_channel.py",

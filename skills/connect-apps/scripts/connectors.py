@@ -88,13 +88,11 @@ import json
 import math
 import os
 import re
-import secrets
-import subprocess
+import subprocess  # noqa: F401 — the waiter spawn's seam, patched by name
 import sys
 import tempfile
 import time
 import urllib.parse
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -103,6 +101,7 @@ REPO_ROOT = SCRIPT_PATH.parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 import cloud_auth  # noqa: E402
 import local_task_protocol as ltp  # noqa: E402
+import wait_store  # noqa: E402
 
 from station_stamp import read_station_stamp  # noqa: E402
 from task_body_guard import confine_user_content, header_safe_value  # noqa: E402
@@ -123,17 +122,17 @@ MAX_REQUEST_READ = 64 * 1024
 # Pauses between the tries of reading the account a new wait is made under.
 ACCOUNT_RETRY_S = (0.5, 1.0)
 SLUG_RE = re.compile(r"^[a-z0-9_]{1,64}\Z")
-WAIT_ID_RE = re.compile(r"^[0-9]{13}-[0-9a-f]{8}\Z")
+WAIT_ID_RE = wait_store.WAIT_ID_RE
 # Room ids from room version 12 carry no ":server" part.
 ROOM_RE = re.compile(r"^!\S{1,255}\Z")
-MXID_RE = re.compile(r"^@[^\s:]+:[^\s]+\Z")
+MXID_RE = wait_store.MXID_RE
 TOKEN_RE = re.compile(r"^\S{1,255}\Z")
 RESUME_SOURCE = "connector-resume"
 ORIGIN_SOURCE = "ag2space"
 # claimed_by values whose request is answered (or the owner told why not).
 WAITER_OUTCOMES = ("connected", "timeout", "user_changed", "unverified")
 RESUMED_BY = WAITER_OUTCOMES + ("claim",)
-CLAIM_KEYS = ("claimed_by", "claimed_at")
+CLAIM_KEYS = wait_store.CLAIM_KEYS
 # Private cards: the line cap keeps a runaway loop from growing the card; the text cap matches the client's.
 CARDS_VERSION = 1
 MAX_CARD_LINES = 20
@@ -418,8 +417,12 @@ def join_names(names: list[str]) -> str:
 # --------------------------------------------------------------------------- wait files
 
 
+WAITS_DIRNAME = "connect-waits"
+WAITER_LOG = "connect-waits.log"
+
+
 def waits_dir(ws: Path) -> Path:
-    return ws / "state" / "connect-waits"
+    return ws / "state" / WAITS_DIRNAME
 
 
 def marker_path(ws: Path, wait_id: str) -> Path:
@@ -434,34 +437,46 @@ def lock_path(ws: Path, wait_id: str) -> Path:
     return waits_dir(ws) / f"{wait_id}.lock"
 
 
-def now_iso(t: float) -> str:
-    return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+now_iso = wait_store.now_iso
 
 
 def _read_json(path: Path) -> Any:
-    try:
-        return json.loads(path.read_text())
-    except (OSError, ValueError):
-        return None
+    return wait_store.read_json(path)
 
 
 def _write_json(path: Path, data: dict) -> None:
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n")
-    os.replace(tmp, path)
+    wait_store.write_json(path, data)
+
+
+class _Waits(wait_store.WaitStore):
+    """The shared wait store over this module's own path and JSON functions, read at call time."""
+
+    def dir(self) -> Path:
+        return waits_dir(self.ws)
+
+    def marker_path(self, wait_id: str) -> Path:
+        return marker_path(self.ws, wait_id)
+
+    def claimed_path(self, wait_id: str) -> Path:
+        return claimed_path(self.ws, wait_id)
+
+    def lock_path(self, wait_id: str) -> Path:
+        return lock_path(self.ws, wait_id)
+
+    def read_json(self, path: Path) -> Any:
+        return _read_json(path)
+
+    def write_json(self, path: Path, data: dict) -> None:
+        _write_json(path, data)
+
+
+def _store(ws: Path) -> _Waits:
+    return _Waits(ws, WAITS_DIRNAME, _valid_marker)
 
 
 def read_marker(ws: Path, wait_id: str) -> dict | None:
     """The unclaimed marker, or None once it is claimed. Raises ValueError when unreadable."""
-    try:
-        data = json.loads(marker_path(ws, wait_id).read_text())
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise ValueError(str(exc)) from None
-    if not _valid_marker(data, wait_id):
-        raise ValueError(f"malformed wait marker {wait_id}")
-    return data
+    return _store(ws).read_marker(wait_id)
 
 
 def _valid_marker(data: Any, wait_id: str) -> bool:
@@ -481,62 +496,28 @@ def _valid_marker(data: Any, wait_id: str) -> bool:
 
 
 def list_markers(ws: Path) -> list[dict]:
-    out = []
-    d = waits_dir(ws)
-    if not d.is_dir():
-        return out
-    for p in sorted(d.glob("*.json")):
-        if not WAIT_ID_RE.match(p.stem):
-            continue
-        try:
-            marker = read_marker(ws, p.stem)
-        except ValueError:
-            continue
-        if marker is not None:
-            out.append(marker)
-    return out
+    return _store(ws).list_markers()
 
 
 def write_marker(ws: Path, marker: dict) -> Path:
-    waits_dir(ws).mkdir(parents=True, exist_ok=True)
-    final = marker_path(ws, marker["wait_id"])
-    _write_json(final, marker)
-    return final
+    return _store(ws).write_marker(marker)
 
 
 def claim(ws: Path, wait_id: str, by: str = "claim", at: float | None = None) -> dict | None:
     """Atomically take the wait. The claimed record, stamped with who took it and when,
     or None when someone else won."""
-    try:
-        os.rename(marker_path(ws, wait_id), claimed_path(ws, wait_id))
-    except FileNotFoundError:
-        return None
-    data = _read_json(claimed_path(ws, wait_id))
-    if not _valid_marker(data, wait_id):
-        return {"wait_id": wait_id, "invalid": True}
-    record = {**data, "claimed_by": by, "claimed_at": time.time() if at is None else at}
-    try:
-        _write_json(claimed_path(ws, wait_id), record)
-    except OSError:
-        pass  # the rename already decided the claim; only its report is lost
-    if data.get("private") and by in CARD_STATUS:
+    record = _store(ws).claim(wait_id, by, at)
+    if record and not record.get("invalid") and record.get("private") and by in CARD_STATUS:
         set_card(ws, wait_id, status=CARD_STATUS[by], at=record["claimed_at"])
     return record
 
 
 def release(ws: Path, record: dict) -> bool:
     """Undo a claim whose resume task could not be written, so the next poll or `rearm` retries."""
-    wait_id = record["wait_id"]
-    try:
-        _write_json(claimed_path(ws, wait_id), {k: v for k, v in record.items() if k not in CLAIM_KEYS})
-    except OSError:
-        pass
-    try:
-        os.rename(claimed_path(ws, wait_id), marker_path(ws, wait_id))
-    except OSError:
+    if not _store(ws).release(record):
         return False
     if record.get("private"):
-        set_card(ws, wait_id, status="waiting")
+        set_card(ws, record["wait_id"], status="waiting")
     return True
 
 
@@ -683,66 +664,23 @@ def recent_claims(ws: Path, room: str | None, now: float) -> list[dict]:
     return out
 
 
-def _header_values(text: str, key: str) -> list[str]:
-    prefix = f"{key}:"
-    return [ln[len(prefix):].strip() for ln in text.splitlines() if ln.startswith(prefix)]
-
-
 def origin_owner(ws: Path, task: str) -> str:
     """The owner mxid of `task` when it is a live owner-tier, non-collaborator AG2 Space task.
     Anything else raises not_owner_task: only the owner's own request may arm an owner resume."""
-
-    def refuse(why: str) -> Setup:
-        return Setup("not_owner_task", f"{task} {why}: connect waits are only for the owner's own AG2 Space requests.")
-
     try:
-        text = (ws / "tasks" / f"{task}.txt").read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        raise refuse("is not a live task in this workspace") from None
-    above_body = ltp.parse_task_headers(text).headers
-    if above_body.get("id") != task:
-        raise refuse("does not carry its own id")
-    # The gateway writes source above the body and one-lines every value; any other
-    # header line anywhere in the file counts against the task, never for it.
-    if above_body.get("source") != ORIGIN_SOURCE or set(_header_values(text, "source")) != {ORIGIN_SOURCE}:
-        raise refuse("is not from AG2 Space")
-    if _header_values(text, "collaborator"):
-        raise refuse("is a collaborator task")
-    tiers = {ltp.canonical_access_tier(v) for v in _header_values(text, "access_tier")}
-    if tiers != {"owner"}:
-        raise refuse("is not owner tier")
-    users = set(_header_values(text, "user_id"))
-    if len(users) != 1 or not MXID_RE.match(next(iter(users))):
-        raise refuse("has no single user_id")
-    try:
-        import task_envelope  # noqa: PLC0415
-
-        verdict = task_envelope.verify_text(text, ws).get("verdict")
-    except Exception:  # noqa: BLE001 — an unverifiable stamp is soak-mode telemetry, not a refusal
-        verdict = None
-    if verdict == "invalid":
-        raise refuse("has an envelope stamp that does not verify")
-    return next(iter(users))
+        return wait_store.owner_task(ws, task, ORIGIN_SOURCE, "AG2 Space")[0]
+    except wait_store.NotOwnerTask as exc:
+        raise Setup("not_owner_task",
+                    f"{task} {exc}: connect waits are only for the owner's own AG2 Space requests.") from None
 
 
 def acquire_lock(ws: Path, wait_id: str):
     """An exclusive, non-blocking hold on the wait's lock file; None when a live waiter has it."""
-    waits_dir(ws).mkdir(parents=True, exist_ok=True)
-    fh = open(lock_path(ws, wait_id), "a+")
-    try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        fh.close()
-        return None
-    return fh
+    return _store(ws).acquire_lock(wait_id)
 
 
 def waiter_alive(ws: Path, wait_id: str) -> bool:
-    fh = acquire_lock(ws, wait_id)
-    if fh is None:
-        return True
-    fh.close()
-    return False
+    return _store(ws).waiter_alive(wait_id)
 
 
 # --------------------------------------------------------------------------- resume task
@@ -898,32 +836,10 @@ def private_resume_text(marker: dict, outcome: str) -> str:
     return confine_user_content(text)
 
 
-def _stamp(text: str, ws: Path) -> str:
-    try:
-        import task_envelope  # noqa: PLC0415
-
-        return task_envelope.stamp_text(text, ws)
-    except Exception:  # noqa: BLE001 — a stamping error costs the stamp, never the task
-        return text
-
-
 def write_resume_task(ws: Path, marker: dict, outcome: str, now: float) -> Path:
-    task_id = f"task-connect-{marker['wait_id']}"
-    headers = [
-        ("id", task_id),
-        ("timestamp", now_iso(now)),
-        ("source", RESUME_SOURCE),
-        ("interaction_type", "message"),
-        ("channel_id", header_safe_value(marker["room"])),
-        ("user_id", header_safe_value(marker["owner"])),
-        ("access_tier", "owner"),
-        ("priority", "normal"),
-    ]
-    ltp.set_task_stamper(lambda text: _stamp(text, ws))
-    try:
-        return ltp.write_task_file(ws / "tasks", task_id, headers, resume_text(marker, outcome))
-    finally:
-        ltp.set_task_stamper(None)
+    return wait_store.write_resume_task(
+        ws, f"task-connect-{marker['wait_id']}", source=RESUME_SOURCE, room=marker["room"],
+        owner=marker["owner"], body=resume_text(marker, outcome), now=now)
 
 
 # --------------------------------------------------------------------------- waiter
@@ -955,14 +871,10 @@ def run_waiter(
     deadline passes, then claim and
     write the resume task. Returns connected | timeout | user_changed | unverified | expired |
     invalid | claimed_elsewhere | write_failed | busy (another waiter holds the lock)."""
-    lock = acquire_lock(ws, wait_id)
+    lock = wait_store.hold_lock(_store(ws), wait_id)
     if lock is None:
         return "busy"
     try:
-        lock.seek(0)
-        lock.truncate()
-        lock.write(f"{os.getpid()}\n")
-        lock.flush()
         while True:
             try:
                 marker = read_marker(ws, wait_id)
@@ -1001,19 +913,7 @@ def run_waiter(
 
 def spawn_waiter(ws: Path, wait_id: str) -> int:
     """Start a waiter in its own session, so it outlives the core that asked for it."""
-    logs = ws / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
-    with open(logs / "connect-waits.log", "ab") as log:
-        proc = subprocess.Popen(
-            [sys.executable, str(SCRIPT_PATH), "--workspace", str(ws), "waiter", wait_id],
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            cwd=str(ws),
-            start_new_session=True,
-            close_fds=True,
-        )
-    return proc.pid
+    return wait_store.spawn_detached(SCRIPT_PATH, ws, wait_id, WAITER_LOG)
 
 
 def _try_spawn(spawn: Callable[[Path, str], int], ws: Path, wait_id: str) -> int | None:
@@ -1322,7 +1222,7 @@ def arm_wait(
     if own_handled or (resumed and not superseded and set(slugs) <= answered):
         return {"wait_id": None, "reused": False, "superseded": [], "resumed": resumed, "waiter_pid": None}
 
-    wait_id = f"{int(t * 1000):013d}-{secrets.token_hex(4)}"
+    wait_id = wait_store.new_wait_id(t)
     marker = {
         "version": 1,
         "wait_id": wait_id,
@@ -1710,20 +1610,7 @@ def cmd_note(ws: Path, cloud: Cloud | None, args: argparse.Namespace, now: Calla
 
 
 def prune(ws: Path, now: float) -> int:
-    removed = 0
-    d = waits_dir(ws)
-    if not d.is_dir():
-        return removed
-    for p in d.iterdir():
-        if p.suffix not in (".claimed", ".lock") or (p.suffix == ".lock" and marker_path(ws, p.stem).exists()):
-            continue
-        try:
-            if now - p.stat().st_mtime >= PRUNE_S:
-                p.unlink()
-                removed += 1
-        except OSError:
-            continue
-    return removed
+    return _store(ws).prune(now, PRUNE_S)
 
 
 def cmd_rearm(
