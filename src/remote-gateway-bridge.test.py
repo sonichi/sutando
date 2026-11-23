@@ -955,6 +955,27 @@ def main() -> int:
         _wl.lane_dirs = _lane_dirs
     check(_wrtc._CORE_RECOVERY_READER is None and rtc._CORE_RECOVERY_READER is not None,
           "a pool worker's lane carries no core recovery record; the core's lane does")
+    check(_wrtc._QUOTA_STATUS_READER is None and rtc._QUOTA_STATUS_READER is not None,
+          "quota-tracker's switch is on by default; a pool worker's lane carries no core quota")
+    (rtc.WS / "state" / "quota-state.json").write_text(json.dumps({
+        "utilization_5h": 0.42, "resets_at_5h": "2026-11-20T16:00:00.000Z", "limit_state": "allowed",
+        "last_checked": "2026-11-20T12:00:00.000Z", "account": "acct-core", "accounts": {"acct-x": {}}}))
+    STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
+    rtc._post_heartbeat(set(), force=True)
+    hbq = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    check((hbq.get("health") or {}).get("quota", {}).get("five_hour", {}).get("used_pct") == 42.0
+          and "quota_status.v1" in hbq.get("capabilities", [])
+          and "account" not in hbq["health"]["quota"],
+          "the adapter's reader puts the core's quota on the heartbeat as health.quota, no account")
+    (rtc.WS / "state" / "quota-state.json").unlink()
+    os.environ["QUOTA_STATUS_PUBLISH"] = "false"
+    try:
+        _qspec = importlib.util.spec_from_file_location("rtc_quota_off", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _qrtc = importlib.util.module_from_spec(_qspec)
+        _qspec.loader.exec_module(_qrtc)
+    finally:
+        del os.environ["QUOTA_STATUS_PUBLISH"]
+    check(_qrtc._QUOTA_STATUS_READER is None, "QUOTA_STATUS_PUBLISH=false: no quota reader")
 
     # SECURITY / robustness: core-status.json is written by another process and
     # may be malformed. _read_core_status runs in the main loop BEFORE the poll,

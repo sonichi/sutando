@@ -60,6 +60,28 @@ With the recorder on, Sutando's Claude sessions (the core and every pool worker)
 - Nothing stops or uninstalls the proxy: it keeps running, unused by these sessions. Health-check does not fail when the proxy is down or unused and the quota record comes from the status line.
 - To route through the proxy again, set `QUOTA_STATUSLINE_ENABLED` to `false` (env, or the skill's `manifest.json` `config`) and restart the sessions: the next launch decides its routing with the switch off and points the session at the proxy, which was never stopped. This also removes the recorder and puts back the saved status line.
 
+## The quota in the s.space agent sidebar
+
+On by default. The gateway bridge sends the core's quota to s.space as `health.quota` on its existing heartbeat (`POST /v1/heartbeat`, capability `quota_status.v1`), next to `health.recovery`, so the agent sidebar can show it. The block is built by `src/quota_status.py` from the trusted record (`trusted_record()`: a status line record only for the core's current login), and carries only:
+
+```json
+{"v": 1,
+ "five_hour": {"used_pct": 100.0, "resets_at": 1795190400},
+ "seven_day": {"used_pct": 7.0, "resets_at": 1795600000},
+ "limit_state": "rejected",
+ "resumes_at": 1795190400,
+ "last_checked": 1795176000}
+```
+
+Times are epoch seconds. `limit_state` is `allowed`, `overage` or `rejected`; `resumes_at` is present only when it is not `allowed`. A window the record does not name is left out. No account digest, other login's numbers, headers, rejection ledger or model is sent. The full heartbeat example is `contracts/quota_status.v1/heartbeat.json`.
+
+- The block changes when a used percentage moves by at least 1 point or the limit state flips, and is otherwise refreshed at most every 5 minutes; a change sends a heartbeat early, nothing else does. The status line never sends anything.
+- A failed read keeps the last block; a broker that refuses the block (400/422) gets beats without it for an hour.
+- Not sent from a pool worker's lane, a Codex core, or a standalone Sparrow.
+- `QUOTA_STATUS_PUBLISH` (`manifest.json` `config`, default `true`; env overrides): `false` stops it at the gateway's next start.
+
+`python3 src/quota_status.py show` prints the block as it would be sent now.
+
 ## Quick Check
 
 ```bash
