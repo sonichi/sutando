@@ -10,6 +10,10 @@ export type KeptOffer = {
   turnId: string
   phase: string
   stagedText?: string
+  // The submit is known to have reached the session's queue.
+  submitted?: boolean
+  // Its turn started and the confirmation is not through yet (the CLI asked for a retry).
+  confirming?: { turnId: string; hash: string; completed?: string }
 }
 
 declare module 'claude-code' {

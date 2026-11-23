@@ -115,6 +115,14 @@ its own turn, a running turn can still answer with `ag2space_reply`, and an
 accepted answer is published at the next tick. A taken-back turn whose end the
 Mod did not see is closed with the protocol failure when the session's next
 main-loop turn starts, or after 30 minutes, so intake is never held for good.
+A queued prompt is never submitted a second time. One whose submit is not known
+to have reached the session is not waited for at all; one that did reach it is
+waited for five minutes; after that intake goes on, the turn is still confirmed
+if it starts, and otherwise the next start answers it. A confirmation the CLI
+asked to retry is kept with the turn it is for (and that turn's end, once seen)
+and tried again after the reload. The body handed to `stage` is kept before the
+CLI is asked, so a reload between the stage's steps still holds the bytes: they
+are staged and published at the turn's end, and no other text is accepted.
 Whatever the Mod did not keep (an engine without `$.state`, a state that could
 not be written), or the CLI does not list, goes the way it always has: a Mod
 that lost its offers inside one generation claims every listed task afresh, and a claim it already

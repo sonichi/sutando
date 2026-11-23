@@ -1876,6 +1876,116 @@ test('a reload whose turn never ends in sight: the taken-back offer is closed af
   expect(h.submitted.length).toBe(1)
 })
 
+test('a reload before the submit is known to have landed: never submitted again, intake goes on at once, and a turn that starts after all is confirmed', async ($, on) => {
+  const h = host(on)
+  const msg = 'the submitted text of task-s1'
+  seed(on, [KEPT('task-s1', 'CALLING', { msg, hash: h.hash(msg) })])
+  h.files['/in/task-s1.txt'] = TASK('task-s1')
+  h.claims['task-s1'] = { attempt: 1, phase: 'CALLING', token: 'tok', hash: h.hash(msg) }
+  h.files['/in/task-s2.txt'] = TASK('task-s2')
+  await arm($, h)
+  await h.clock.advance(2000)
+  expect(h.submitted.length).toBe(1)                           // task-s2 only: intake did not wait
+  expect(h.submitted[0].includes('task-s1')).toBe(false)
+  expect(verbs(h).filter((v: string) => v === 'claim').length).toBe(1)
+  await $.turn.start({ text: FRAMED(msg), turnId: 'turn-s1' })
+  expect(h.claims['task-s1'].phase).toBe('TURN_CONFIRMED')
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-s1', text: 'late but mine' })
+  expect(String(r.text ?? r.result)).toContain('Published /out/task-s1.txt')
+})
+
+test('a reload with the submit landed and its turn never starting: intake waits five minutes, then goes on without it', async ($, on) => {
+  const h = host(on)
+  const msg = 'the submitted text of task-s3'
+  seed(on, [KEPT('task-s3', 'CALLING', { msg, hash: h.hash(msg), submitted: true })])
+  h.files['/in/task-s3.txt'] = TASK('task-s3')
+  h.claims['task-s3'] = { attempt: 1, phase: 'CALLING', token: 'tok', hash: h.hash(msg) }
+  h.files['/in/task-s4.txt'] = TASK('task-s4')
+  await arm($, h)
+  await h.clock.advance(290 * 1000)
+  expect(h.submitted.length).toBe(0)                           // its queued turn may still start
+  await h.clock.advance(15 * 1000)
+  expect(h.submitted.length).toBe(1)
+  expect(h.submitted[0].includes('task-s3')).toBe(false)       // never resubmitted
+  expect(h.logs.some((l: string) => l.includes('task-s3 taken back after a plugin reload, and its turn did not start within 5 minutes'))).toBe(true)
+  expect(h.claims['task-s3'].phase).toBe('CALLING')            // left to the next start's interrupted answer
+})
+
+test('a reload while the confirmation was being retried: it is tried again at the next tick, and the turn\'s end kept with it is delivered', async ($, on) => {
+  const h = host(on)
+  const msg = 'the submitted text of task-s5'
+  seed(on, [KEPT('task-s5', 'CALLING', { msg, hash: h.hash(msg), submitted: true,
+    confirming: { turnId: 'turn-s5', hash: h.hash(msg), completed: 'answer' } })])
+  h.files['/in/task-s5.txt'] = TASK('task-s5')
+  h.claims['task-s5'] = { attempt: 1, phase: 'CALLING', token: 'tok', hash: h.hash(msg) }
+  await arm($, h)
+  await h.clock.advance(2000)
+  expect(h.submitted.length).toBe(0)
+  expect(h.files['/out/task-s5.txt']).toContain('turn answer without a reply')
+  expect(h.claims['task-s5'].phase).toBe('SETTLED')
+})
+
+test('a confirmation asked to retry, and the turn\'s end seen meanwhile, are both kept for a reload', async ($, on) => {
+  const h = host(on, { lockFailsOnce: ['confirm'] })
+  const writes = seed(on, [])
+  h.files['/in/task-s6.txt'] = TASK('task-s6')
+  await arm($, h)
+  await h.clock.advance(1000)
+  const of = (w: any) => (w as any[]).find(o => o.rid === 'task-s6')
+  expect(of(writes[writes.length - 1]).submitted).toBe(true)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-s6' })
+  expect(h.claims['task-s6'].phase).toBe('CALLING')
+  expect(of(writes[writes.length - 1]).confirming.turnId).toBe('t-s6')
+  await $.turn.complete({ turnId: 't-s6', reason: 'answer', text: 'x' })
+  expect(of(writes[writes.length - 1]).confirming.completed).toBe('answer')
+})
+
+test('the body is kept before the CLI is asked to stage it, and stays kept when the stage asks for a retry', async ($, on) => {
+  const h = host(on, { stageLinkFailsOnce: true })
+  const writes = seed(on, [])
+  h.files['/in/task-s7.txt'] = TASK('task-s7')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-s7' })
+  const before = writes.length
+  const first = await $.tool.call({ tool: REPLY, task_id: 'task-s7', text: 'the answer' })
+  expect(String(first.text ?? first.result)).toContain('call ag2space_reply again')
+  const of = (w: any) => (w as any[]).find(o => o.rid === 'task-s7')
+  expect(of(writes[before]).stagedText).toBe('the answer')     // written before `stage` ran
+  expect(of(writes[before]).phase).toBe('TURN_CONFIRMED')
+  expect(writes.length).toBe(before + 2)
+  expect(of(writes[writes.length - 1]).stagedText).toBe('the answer')
+})
+
+test('a reload between the two steps of a stage: the kept body is staged and published at the turn\'s end, and no other text is taken', async ($, on) => {
+  const h = host(on)
+  seed(on, [KEPT('task-s8', 'TURN_CONFIRMED', { stagedText: 'the answer' })])
+  h.files['/in/task-s8.txt'] = TASK('task-s8')
+  // As the CLI left it: the descriptor recorded, the blob not written, the phase not moved.
+  h.claims['task-s8'] = { attempt: 1, phase: 'TURN_CONFIRMED', token: 'tok', hash: 'h', turnId: 'turn-9', staged: 'the answer\n', blobOk: false }
+  await arm($, h)
+  await h.clock.advance(1000)
+  const other = await $.tool.call({ tool: REPLY, task_id: 'task-s8', text: 'something else' })
+  expect(String(other.text ?? other.result)).toContain('already staged')
+  await $.turn.complete({ turnId: 'turn-9', reason: 'answer', text: 'x' })
+  await h.clock.advance(2000)
+  expect(h.files['/out/task-s8.txt']).toBe('the answer\n')
+  expect(h.claims['task-s8'].phase).toBe('SETTLED')
+})
+
+test('a plain stage refusal does not leave its body kept as the accepted answer', async ($, on) => {
+  const h = host(on)
+  const writes = seed(on, [])
+  h.files['/in/task-s9.txt'] = TASK('task-s9')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-s9' })
+  h.claims['task-s9'].turnId = 'another-turn'                  // the CLI refuses: not this turn
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-s9', text: 'refused text' })
+  expect(String(r.text ?? r.result)).toContain('stage refused')
+  expect((writes[writes.length - 1] as any[]).find(o => o.rid === 'task-s9').stagedText).toBe(undefined)
+})
+
 const notTakenBack = async ($: any, on: any, opts: Record<string, unknown>) => {
   const h = host(on, opts)
   seed(on, [KEPT('task-r8', 'TURN_CONFIRMED'), { rid: '../x', phase: 'TURN_CONFIRMED' }, null, 'junk'])
