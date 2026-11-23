@@ -3,10 +3,10 @@ Antigravity's and local Codex's (`model_switch.ModelSwitch`).
 
 The Mod hands every task to `inbox claim` before the session sees it, so a card matter is answered there
 and never reaches the model (`card_matter`): the owner's tap on a model card this agent posted, or "/model"
-in their DM (the menu), or "/model <name>". A pick is saved as the owner's wanted model, a "switching"
-card is posted, and `apply` is started detached: it runs the launcher's live switch (#6679,
-`Launcher.switch_model --confirm`: `/model <id>` typed into the session's pane, no restart) and then tells
-the owner in the DM whether it took. The session's model is every later turn's, whoever sends it; the
+in their DM (the menu), or "/model <name>". A pick is saved as the owner's wanted model, "switching" is
+shown in place of the card tapped, and `apply` is started detached: it runs the launcher's live switch
+(#6679, `Launcher.switch_model --confirm`: `/model <id>` typed into the session's pane, no restart) and then
+shows in that same card whether it took (a pick in words has no card to update and gets a new one). The session's model is every later turn's, whoever sends it; the
 isolated turn for a restricted sender runs on the same pick (`turn_model`).
 
     python3 -m ag2_sparrow.adapters.claude_code.model_card apply --root ROOT   # the detached step

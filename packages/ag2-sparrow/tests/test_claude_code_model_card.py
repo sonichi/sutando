@@ -94,8 +94,9 @@ class Claim(Base):
         self.assertEqual(self.state()["wanted"], "opus")
         self.assertEqual(self.started, [self.root])
         self.assertEqual((self.results / "task-t.txt").read_text(), model_switch.ANSWERED)
-        note, = [q["card"] for q in self.queued()]
-        self.assertIn("Switching to Opus", note["text"])
+        queued, = self.queued()
+        self.assertIn("Switching to Opus", queued["card"]["text"])
+        self.assertEqual(queued.get("edit"), "$menu", "shown in place of the menu tapped, not as a second card")
 
     def test_a_tap_by_anyone_but_the_owner_in_their_dm_is_refused_and_picks_nothing(self):
         self.menu_posted()
@@ -137,10 +138,10 @@ class Apply(Base):
             self.calls.append((model, confirm))
             return self.answers.pop(0)
 
-    def picked(self, mid="opus"):
+    def picked(self, mid="opus", card=""):
         cfg = cli.read_config(cli.config_path())
         ms = model_card.switcher(self.root, cfg)
-        ms.save(wanted=mid, asked_in=DM, told="")
+        ms.save(wanted=mid, asked_in=DM, told="", card=card)
         return cfg
 
     def test_the_pick_is_switched_live_with_confirm_and_told_as_switched(self):
@@ -152,6 +153,13 @@ class Apply(Base):
         note, = [q["card"] for q in self.queued()]
         self.assertIn("Switched. I'm now using Opus.", note["text"])
         self.assertEqual(model_card.turn_model(self.root, cfg), "opus", "the isolated turn runs on the pick too")
+
+    def test_the_outcome_of_a_tapped_pick_is_shown_in_place_of_the_card_tapped(self):
+        cfg = self.picked(card="$menu")
+        lc = self.Launcher([(True, "switched to opus")])
+        self.assertEqual(model_card.apply(self.root, cfg, self.home, launcher_factory=lc, sleep=lambda s: None), "switched")
+        queued, = self.queued()
+        self.assertEqual((queued.get("edit"), queued["card"]["state"]), ("$menu", "done"))
 
     def test_a_busy_box_is_tried_again_and_a_switch_that_never_lands_is_told_as_not_switched(self):
         cfg = self.picked("haiku")
@@ -440,10 +448,13 @@ class Account(Base):
                                        click={"card_id": account_card.account_switch.CARD, "action": said}))
         self.assertEqual(rc, 1)
         self.assertIn("(account-where)", out["refused"])
-        note, = [q["card"] for q in self.queued()]
+        queued, = self.queued()
+        note = queued["card"]
+        self.assertEqual(queued.get("edit"), "$acct", "shown in place of the card tapped, not as a second card")
         self.assertEqual(note["text"], "Open this on the computer that runs Claude Code to switch account. The sign-in "
                                        "code goes into the card there, never into this chat.")
-        self.assertNotIn("account_controls", note)
+        # Opened there, the same card draws the controls; it is not the menu, so it retires no account card.
+        self.assertEqual((note["account_controls"], note["id"]), ({"runtime": "claude"}, account_card.account_switch.NOTE))
         self.assertNotIn("buttons", note)
         self.assertEqual(self.runs, [], "no sign-in, no status call")
 
