@@ -135,6 +135,24 @@ check $? "flag on: the launcher says what it started"
 launch launch-codex-worker-session.sh SUTANDO_CODEX_APP_SERVER=1 SUTANDO_WORKER_INCARNATION_ID=i-this-run
 [ "$(cat "$(dirname "$DECL")/incarnation" 2>/dev/null)" = "i-this-run" ]
 check $? "flag on: the declaration is stamped with this run's incarnation id"
+# An unstamped seat from an older launcher, then a TUI launch under the same session name.
+launch_keep() {  # as launch, but over the workspace the previous launch left
+  local script="$1"; shift
+  rm -rf "$TMP/sessions" "$TMP/tmux.log"; mkdir -p "$TMP/sessions"
+  env -i HOME="$TMP" PATH="$STUB_PATH" TEST_TMP="$TMP" SUTANDO_PY="$TMP/bin/python3" \
+      SUTANDO_INSTANCE_ID="$ID" SUTANDO_TMUX_SESSION="$SESSION" SUTANDO_TMUX_SOCKET="$TMP/sock" \
+      SUTANDO_TASKS_DIR="$TMP/ws/deliveries/$ID" SUTANDO_WORKSPACE_DIR="$TMP/ws" SUTANDO_RESULTS_DIR="$TMP/ws/results" \
+      SUTANDO_INBOX_RESOLVER=/bin/true SUTANDO_POOL_DELIVERY_SCRIPT=/bin/true SUTANDO_CODEX_WORKING_DIR="$TMP/wd" "$@" \
+      bash "$POOL/$script" >/dev/null 2>"$TMP/err"
+}
+launch launch-codex-worker-session.sh SUTANDO_CODEX_APP_SERVER=1
+rm -f "$(dirname "$DECL")/incarnation"
+launch_keep launch-codex-worker-session.sh SUTANDO_CODEX_APP_SERVER=0 SUTANDO_WORKER_INCARNATION_ID=i-tui-run
+rc=$?
+[ "$rc" = 0 ] && [ ! -e "$DECL" ] && [ ! -e "$(dirname "$DECL")/incarnation" ]
+check $? "an unstamped earlier seat, then a TUI launch: the seat's declaration is removed"
+[ "$(sessions)" = "$SESSION $SESSION-observer " ]
+check $? "an unstamped earlier seat, then a TUI launch: the session is the TUI with its observer"
 
 # --- 3. flag on, a worker on its own folders: a plain inbox, no payload store ---
 # Only a launcher that accepts a worker without a resolver has this case.

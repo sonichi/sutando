@@ -164,6 +164,8 @@ if [ "${SUTANDO_CODEX_APP_SERVER:-}" = 1 ]; then
   echo "launch-codex-worker-session: $SESSION is a Codex app-server seat; no observer or notifier session was started" >&2
   exit 0
 fi
+# A TUI run under the seat's session name: an earlier seat's declaration would keep its pane read-only.
+rm -f "$SUTANDO_WORKSPACE_DIR/state/codex-seat/$SESSION/host.json" "$SUTANDO_WORKSPACE_DIR/state/codex-seat/$SESSION/incarnation"
 # <<< codex-app-server-seat
 tmux -S "$SOCKET" new-session -d -s "$SESSION" "${ENV_ARGS[@]}" \
   codex "${CODEX_ARGS[@]}" "$BOOT_PROMPT"
