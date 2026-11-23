@@ -11,11 +11,12 @@ the pane's environment when tmux reports one (else this process's), the local pr
 `ANTHROPIC_BASE_URL` removed exactly as the launch removes it, the environment logins
 (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`) removed so the answer is
 the config dir's own login, and `CLAUDE_CONFIG_DIR` set to the dir. Signed in means exit status 0 AND a literal JSON `"loggedIn": true`; anything else (a non-zero
-exit even with JSON, a timeout, other output) is not signed in. A missing `claude` binary is
-unknown. Environment values are passed to the probe only, never logged or stored, and the probe's
+exit even with JSON, other output) is not signed in. A missing `claude` binary or a timed-out
+probe is unknown and sends no notice. Dirs are probed concurrently, at most POOL at a time. Environment values are passed to the probe only, never logged or stored, and the probe's
 other output (email, org) is not kept.
 
-Records: one atomically replaced file per config dir under `<workspace>/state/claude-sign-in/`.
+Records: one atomically replaced file per config dir under `<workspace>/state/claude-sign-in/`;
+daily notice markers there older than NOTICE_KEEP_DAYS are pruned on each check.
 """
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Dict, Mapping, Optional
 
@@ -33,6 +35,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 RECORD_DIR = "claude-sign-in"
 TIMEOUT_S = 8.0
+POOL = 4
+NOTICE_KEEP_DAYS = 7
 PROBE = ["claude", "auth", "status", "--json"]
 _LOCAL_PROXY = re.compile(r"^http://(localhost|127\.0\.0\.1|\[::1\]):7846/?$")
 SWITCH = "QUOTA_STATUSLINE_ENABLED"
@@ -74,12 +78,12 @@ def pane_env(socket: Optional[str], runner: Callable = subprocess.run) -> Option
 
 def signed_in(env: Mapping[str, str], runner: Callable = subprocess.run,
               timeout: float = TIMEOUT_S) -> Optional[bool]:
-    """True only on exit 0 with a literal `"loggedIn": true`; None when `claude` cannot run."""
+    """True only on exit 0 with a literal `"loggedIn": true`; None when `claude` is missing or times out."""
     cmd = [env.get("CLAUDE_BIN") or PROBE[0], *PROBE[1:]]
     try:
         out = runner(cmd, capture_output=True, text=True, timeout=timeout,
                      stdin=subprocess.DEVNULL, env=dict(env))
-    except FileNotFoundError:
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         return None
     except (OSError, subprocess.SubprocessError):
         return False
@@ -183,6 +187,19 @@ def _claim_notice(workspace, config_dir: str, now: float) -> bool:
     return True
 
 
+def prune_notices(workspace, now: float, keep_days: int = NOTICE_KEEP_DAYS) -> None:
+    """Remove daily notice markers whose day is more than `keep_days` before `now`."""
+    from workspace_default import status_path
+    cutoff = time.strftime("%Y%m%d", time.gmtime(now - keep_days * 86400))
+    for marker in status_path(RECORD_DIR, Path(workspace)).glob("*-*.notice"):
+        day = marker.stem.rpartition("-")[2]
+        if len(day) == 8 and day.isdigit() and day < cutoff:
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+
+
 def check_dir(workspace, config_dir: str, env: Mapping[str, str], runner: Callable, now: float) -> Optional[bool]:
     """Probe one config dir, record it, and send today's notice once when it is not signed in."""
     verdict = signed_in(env, runner)
@@ -218,7 +235,13 @@ def check(workspace, config_dir: Optional[str], *, socket: Optional[str] = None,
     if not dirs:
         row["detail"] = "no config dir to check (the core's could not be resolved and no session is live)"
         return row
-    verdicts = {d: check_dir(workspace, d, env, runner, now) for d, env in dirs.items()}
+    try:
+        prune_notices(workspace, now)
+    except OSError:
+        pass
+    with ThreadPoolExecutor(max_workers=min(POOL, len(dirs))) as pool:
+        futures = {d: pool.submit(check_dir, workspace, d, env, runner, now) for d, env in dirs.items()}
+    verdicts = {d: f.result() for d, f in futures.items()}
     unsigned = [d for d, v in verdicts.items() if v is False]
     unknown = [d for d, v in verdicts.items() if v is None]
     if unsigned:
@@ -226,7 +249,8 @@ def check(workspace, config_dir: Optional[str], *, socket: Optional[str] = None,
         row["detail"] = ("Claude is not signed in for " + ", ".join(unsigned) + ": sessions there go direct and "
                          "cannot reach Anthropic. Sign in: " + "; ".join(sign_in_command(d) for d in unsigned))
     elif unknown:
-        row["detail"] = "claude CLI not found; sign-in not checked for " + ", ".join(unknown)
+        row["detail"] = ("sign-in unknown (claude CLI not found or the probe timed out) for "
+                         + ", ".join(unknown))
     else:
         row["detail"] = "signed in: " + ", ".join(verdicts)
     return row

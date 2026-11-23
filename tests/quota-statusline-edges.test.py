@@ -306,7 +306,7 @@ class SignedIn(Tmp):
         self.assertIs(self.csi.signed_in(env, self._runner(out='{"loggedIn": "true"}')), False)
         self.assertIs(self.csi.signed_in(env, self._runner(out='{"loggedIn": 1}')), False)
         self.assertIs(self.csi.signed_in(env, self._runner(out="garbage")), False)
-        self.assertIs(self.csi.signed_in(env, self._runner(exc=subprocess.TimeoutExpired("claude", 8))), False)
+        self.assertIsNone(self.csi.signed_in(env, self._runner(exc=subprocess.TimeoutExpired("claude", 8))))
         self.assertIsNone(self.csi.signed_in(env, self._runner(exc=FileNotFoundError())))
 
     def test_probe_env_is_the_panes_without_the_proxy(self):
@@ -361,6 +361,54 @@ class SignedIn(Tmp):
         self.assertIn("not found", row["detail"])
         self.assertEqual(self._results(), [])
         self.assertIn("no config dir to check", self.csi.check(self.ws, None, runner=self._runner())["detail"])
+
+    def test_a_timed_out_probe_is_unknown_and_sends_no_notice(self):
+        run = self._runner(exc=subprocess.TimeoutExpired("claude", 8))
+        row = self.csi.check(self.ws, str(self.core), runner=run, now=T0)
+        self.assertEqual(row["status"], "ok")
+        self.assertIn("timed out", row["detail"])
+        self.assertEqual(self._results(), [])
+        self.assertIsNone(self.csi.read_record(self.ws, str(self.core))["signed_in"])
+
+    def test_dirs_are_probed_concurrently_within_the_pool(self):
+        dirs = {}
+        for i in range(self.csi.POOL + 2):
+            d = self.d / f"w{i}"
+            d.mkdir()
+            dirs[os.path.realpath(d)] = {"PATH": "/bin"}
+        self.live.stop()
+        live = mock.patch.object(self.csi, "live_sessions", return_value=dirs)
+        live.start()
+        self.addCleanup(live.stop)
+        lock, state = threading.Lock(), {"now": 0, "max": 0}
+
+        def claude(cmd, **kw):
+            with lock:
+                state["now"] += 1
+                state["max"] = max(state["max"], state["now"])
+            time.sleep(0.2)
+            with lock:
+                state["now"] -= 1
+            return types.SimpleNamespace(returncode=0, stdout='{"loggedIn": true}')
+        row = self.csi.check(self.ws, None, runner=claude, now=T0)
+        self.assertEqual(row["status"], "ok")
+        self.assertGreater(state["max"], 1)
+        self.assertLessEqual(state["max"], self.csi.POOL)
+        self.assertEqual(len(row["detail"].split(", ")), len(dirs))
+
+    def test_old_notice_markers_are_pruned(self):
+        rec_dir = self.csi.record_path(self.ws, str(self.core)).parent
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        day = lambda ts: time.strftime("%Y%m%d", time.gmtime(ts))
+        old = rec_dir / f"abc-{day(T0 - 8 * 86400)}.notice"
+        recent = rec_dir / f"abc-{day(T0 - 2 * 86400)}.notice"
+        other = rec_dir / "abc.json"
+        for p in (old, recent, other):
+            p.write_text("")
+        self.csi.check(self.ws, str(self.core), runner=self._runner(), now=T0)
+        self.assertFalse(old.exists())
+        self.assertTrue(recent.exists())
+        self.assertTrue(other.exists())
 
     def test_an_unsigned_worker_dir_is_reported_while_the_core_is_signed_in(self):
         worker = self.d / "worker-ccd"

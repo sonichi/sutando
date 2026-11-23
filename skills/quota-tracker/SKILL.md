@@ -52,12 +52,12 @@ This is the default after upgrading, for new and existing installs alike, and th
 CLAUDE_CONFIG_DIR='<config dir>' claude auth login
 ```
 
-Follow the link it prints and sign in; the next session launch picks the login up. The check (`src/claude_signed_in.py`) runs `claude auth status --json` with the environment the direct session gets and counts only exit 0 with `"loggedIn": true`; it never changes routing and never reads a credential.
+Follow the link it prints and sign in; the next session launch picks the login up. The check (`src/claude_signed_in.py`) runs `claude auth status --json` with the environment the direct session gets and counts only exit 0 with `"loggedIn": true`; a probe that times out (8 seconds) or a missing `claude` is unknown and sends no message. Config dirs are probed four at a time, and the daily message markers are removed after 7 days. It never changes routing and never reads a credential.
 
 With the recorder on, Sutando's Claude sessions (the core and every pool worker) no longer go through the credential proxy. The core and worker launchers (`src/agent/claude/cli/session-launch.sh`) and `src/startup.sh` drop an `ANTHROPIC_BASE_URL` that points at the local proxy (`http://localhost:7846`, `127.0.0.1` or `[::1]`), in the launcher and in the session's own environment, and no longer set it. A base URL the owner set to anything else is left alone.
 
 - The proxy's shared-credential role no longer applies to these sessions: each one uses its own config dir's login. On a host where workers run in the core's config dir, that is the core's login for all of them.
-- Nothing stops or uninstalls the proxy: it keeps running, unused by these sessions. Health-check does not fail when the proxy is down or unused and the quota record comes from the status line.
+- Nothing stops or uninstalls the proxy: it keeps running, unused by these sessions. Health-check does not fail when the proxy is down or unused and the quota record comes from the status line. With the recorder on, a running proxy that is out of date or reports an exhausted credential is shown as `ok`, unused, with that state as information; with the recorder off it is reported as before.
 - To route through the proxy again, set `QUOTA_STATUSLINE_ENABLED` to `false` (env, or the skill's `manifest.json` `config`) and restart the sessions: the next launch decides its routing with the switch off and points the session at the proxy, which was never stopped. This also removes the recorder and puts back the saved status line.
 
 ## Quick Check

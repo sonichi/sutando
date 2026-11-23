@@ -102,8 +102,12 @@ class CredentialProxyStalenessTests(unittest.TestCase):
                 cmd, 0, stdout=_lstart(self.proc_start) + "\n", stderr="")
         return _REAL_RUN(cmd, *args, **kwargs)
 
-    def _check(self, port_status="ok", pids=FAKE_PID + "\n"):
+    def _check(self, port_status="ok", pids=FAKE_PID + "\n", direct=False):
         self.pids = pids
+        import claude_signed_in
+        routing = patch.object(claude_signed_in, "direct_routing_on", return_value=direct)
+        routing.start()
+        self.addCleanup(routing.stop)
         port_check = {"name": "credential-proxy", "status": port_status,
                       "detail": "listening" if port_status == "ok" else "not listening"}
         with patch.object(hc, "check_port", return_value=port_check), \
@@ -121,6 +125,12 @@ class CredentialProxyStalenessTests(unittest.TestCase):
         _set_mtime(self.artifact, self.proc_start - 3600)
         check = self._check()
         self.assertEqual(check["status"], "ok")
+
+    def test_stale_proxy_is_informational_when_sessions_route_direct(self):
+        check = self._check(direct=True)
+        self.assertEqual(check["status"], "ok")
+        self.assertIn("unused", check["detail"])
+        self.assertIn("restart needed", check["detail"])
 
     # ---- (b)/(c) what the call site passes ---------------------------------
     def test_bundled_proxy_passes_the_artifact(self):

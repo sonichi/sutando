@@ -32,6 +32,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 
 ## Fixed
 
+- quota-tracker: with status line tracking on, health-check no longer reports a running but out-of-date (or credential-exhausted) credential proxy as an issue: nothing routes through it, so the row is `ok` with that state as information. The `claude-sign-in` check treats a timed-out probe as unknown (no daily message), probes config dirs concurrently (four at a time), and removes its daily message markers after 7 days.
 - ag2-sparrow (antigravity-local): images and files people send now reach Antigravity: images as ACP image blocks in the prompt (when agy declares `image`), and on the owner's turn a read-only copy of the task's own files in a folder agy may read (`additionalDirectories`) but never change; an isolated non-owner turn gets the images only. The owner's final message keeps its delivery markers (`[channel:]`, `[thread]`, `[file:]` for a file under the working directory only), as Claude Code and Codex results do; non-owners' markers stay neutralised. A bridge launched without `REMOTE_MEDIA_MARKER` (the desktop's and connect's seat bridges) now resolves the AG2 Space gateway's `[ag2space-media: …]` marker too, so its download reaches every local adapter.
 
 <!-- fix() PRs go here -->
