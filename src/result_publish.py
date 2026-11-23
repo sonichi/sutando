@@ -339,6 +339,12 @@ def _main(argv: list[str]) -> int:
         print(_USAGE, file=sys.stderr)
         return 2
     path, allow, title, outcome, parent = parsed
+    rel = Path(path)
+    if not rel.is_absolute() and (len(rel.parts) != 2 or rel.parts[0] != "results" or rel.parts[1] in (".", "..")):
+        # A relative path is anchored to the workspace; anything but results/<name> lands where no lane reads.
+        print(f"result_publish: refused, relative path {path} is not results/<name>, so it would "
+              "land where no reader looks; pass results/<id>.txt or the absolute path", file=sys.stderr)
+        return 2
     stamped = worker_published_path(path)
     if stamped.name != Path(path).name:
         print(f"result_publish: publishing {Path(path).name} as {stamped.name}: a pool worker's "
