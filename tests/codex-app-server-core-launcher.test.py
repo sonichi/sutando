@@ -479,6 +479,23 @@ class PersistedChoice(unittest.TestCase):
         result = f.run(**self.UNSET)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('"newer"', sentinel.read_text(), "only the stop this launch wrote is cleared")
+        self.assertIn("a newer stop holds intake", result.stderr)
+        self.assertFalse(held.exists(), "a newer drain is a normal 'not mine': the marker is done")
+
+    def test_a_reattach_whose_clear_cannot_run_keeps_the_marker_and_fails(self):
+        f, sentinel, held = self.held_launch()
+        (f.declaration().parent / "ready").write_text("1\n")
+        lock = sentinel.with_name("shutdown.sentinel.lock")
+        lock.unlink(missing_ok=True)
+        lock.mkdir()  # the compare-and-clear cannot take its lock: an operational error
+        result = f.run(**self.UNSET)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not be reopened", result.stderr)
+        self.assertTrue(held.exists(), "the recovery marker is kept for the next try")
+        self.assertTrue(sentinel.exists())
+        lock.rmdir()
+        self.assertEqual(f.run(**self.UNSET).returncode, 0)
+        self.assertFalse(sentinel.exists())
         self.assertFalse(held.exists())
 
     def test_a_stop_already_in_place_is_never_cleared_by_the_reattach(self):

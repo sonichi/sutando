@@ -23,7 +23,7 @@ CLI:
   python3 src/shutdown.py clear           # remove it (startup)
   python3 src/shutdown.py check           # exit 0 if shutting down, 1 if not
   python3 src/shutdown.py mark-if-absent R  # write one only if none; print its token, else nothing
-  python3 src/shutdown.py clear-if TOKEN    # remove it only if it is still that one (exit 0), else 1
+  python3 src/shutdown.py clear-if TOKEN    # 0 removed; 3 not that stop (left alone); else an error
 """
 from __future__ import annotations
 
@@ -117,6 +117,9 @@ def shutdown_info() -> dict | None:
         return {"reason": "unknown", "ts": 0}
 
 
+NOT_MINE = 3  # clear-if: the stop in place is not the one named, a normal outcome, not an error
+
+
 def main(argv: list[str]) -> int:
     cmd = argv[1] if len(argv) > 1 else "check"
     if cmd == "mark":
@@ -132,7 +135,7 @@ def main(argv: list[str]) -> int:
             print(token)
         return 0
     if cmd == "clear-if":
-        return 0 if clear_if(argv[2] if len(argv) > 2 else "") else 1
+        return 0 if clear_if(argv[2] if len(argv) > 2 else "") else NOT_MINE
     if cmd == "check":
         return 0 if is_shutting_down() else 1
     if cmd == "path":
