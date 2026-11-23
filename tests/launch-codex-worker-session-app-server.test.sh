@@ -62,8 +62,12 @@ case "$cmd" in
     name=""; while [ $# -gt 0 ]; do
       case "$1" in -d) shift ;; -s) name="$2"; shift 2 ;; -e) shift 2 ;; *) break ;; esac
     done
+    [ -f "$TEST_TMP/sessions/$name" ] && { echo "duplicate session: $name" >&2; exit 1; }
     touch "$TEST_TMP/sessions/$name"; exit 0 ;;
-  has-session) n="${2#=}"; [ -f "$TEST_TMP/sessions/$n" ] ;;
+  has-session) n="${2#=}"
+    # race-once: the launcher's pre-check misses a session a competing launch creates before new-session.
+    [ -f "$TEST_TMP/race-once" ] && { rm -f "$TEST_TMP/race-once"; exit 1; }
+    [ -f "$TEST_TMP/sessions/$n" ] ;;
   kill-session) n="${2#=}"; rm -f "$TEST_TMP/sessions/$n"; exit 0 ;;
   show-environment) [ -n "${TMUX_STUB_SEAT_ENV:-}" ] && echo "${TMUX_STUB_SEAT_ENV_LINE:-SUTANDO_CODEX_SEAT=1}"; exit 0 ;;
   *) exit 0 ;;
@@ -140,6 +144,31 @@ check $? "flag on: the launcher says what it started"
 launch launch-codex-worker-session.sh SUTANDO_CODEX_APP_SERVER=1 SUTANDO_WORKER_INCARNATION_ID=i-this-run
 [ "$(cat "$(dirname "$DECL")/incarnation" 2>/dev/null)" = "i-this-run" ]
 check $? "flag on: the declaration is stamped with this run's incarnation id"
+# An unstamped seat from an older launcher, then a TUI launch under the same session name.
+launch_keep() {  # as launch, but over the workspace the previous launch left
+  local script="$1"; shift
+  rm -f "$TMP/tmux.log"; mkdir -p "$TMP/sessions"
+  env -i HOME="$TMP" PATH="$STUB_PATH" TEST_TMP="$TMP" SUTANDO_PY="$TMP/bin/python3" \
+      SUTANDO_INSTANCE_ID="$ID" SUTANDO_TMUX_SESSION="$SESSION" SUTANDO_TMUX_SOCKET="$TMP/sock" \
+      SUTANDO_TASKS_DIR="$TMP/ws/deliveries/$ID" SUTANDO_WORKSPACE_DIR="$TMP/ws" SUTANDO_RESULTS_DIR="$TMP/ws/results" \
+      SUTANDO_INBOX_RESOLVER=/bin/true SUTANDO_POOL_DELIVERY_SCRIPT=/bin/true SUTANDO_CODEX_WORKING_DIR="$TMP/wd" "$@" \
+      bash "$POOL/$script" >/dev/null 2>"$TMP/err"
+}
+launch launch-codex-worker-session.sh SUTANDO_CODEX_APP_SERVER=1
+rm -f "$(dirname "$DECL")/incarnation"; rm -rf "$TMP/sessions"
+launch_keep launch-codex-worker-session.sh SUTANDO_CODEX_APP_SERVER=0 SUTANDO_WORKER_INCARNATION_ID=i-tui-run
+rc=$?
+[ "$rc" = 0 ] && [ ! -e "$DECL" ] && [ ! -e "$(dirname "$DECL")/incarnation" ]
+check $? "an unstamped earlier seat, then a TUI launch: the seat's declaration is removed"
+[ "$(sessions)" = "$SESSION $SESSION-observer " ]
+check $? "an unstamped earlier seat, then a TUI launch: the session is the TUI with its observer"
+# A live seat wins the session name between a competing TUI launch's check and its new-session.
+launch launch-codex-worker-session.sh SUTANDO_CODEX_APP_SERVER=1 SUTANDO_WORKER_INCARNATION_ID=i-live-seat
+decl_before="$(cat "$DECL")"; touch "$TMP/race-once"
+launch_keep launch-codex-worker-session.sh SUTANDO_CODEX_APP_SERVER=0 SUTANDO_WORKER_INCARNATION_ID=i-losing-tui
+grep -q "new-session -d -s $SESSION .* codex -C " "$TMP/tmux.log" && [ "$(cat "$DECL" 2>/dev/null)" = "$decl_before" ] \
+  && [ "$(cat "$(dirname "$DECL")/incarnation" 2>/dev/null)" = "i-live-seat" ]
+check $? "a TUI launch that loses to a live seat: the seat's declaration and run stamp are untouched"
 
 # --- 3. flag on, a worker on its own folders: a plain inbox, no payload store ---
 # Only a launcher that accepts a worker without a resolver has this case.
