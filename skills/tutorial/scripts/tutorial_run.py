@@ -9,15 +9,18 @@ src/agent_triggers.py) runs this once:
 
 With `--greeting-file` it posts that reply to the room itself (room-ops `say`) and starts the publish
 only once the reply is proven to be in the room, so the reply and the page's card leave by one path, in
-that order, and neither waits on the result file's delivery. Proof is the send's own event id, or the
-reply found by reading the room back (room-ops `read`) as an event that was not there before the send.
+that order, and neither waits on the result file's delivery. The only proof is the event id `say`
+returns for this send. `say` takes no per-send identifier and room-ops `read` returns none, so a
+message read back from the room, even this agent's own with the same text, cannot be tied to this
+send, and a read that does not show the reply cannot rule it out. The room is therefore not read.
 The line's `greeting` is one of three settled states:
-  sent      proven in the room: the page is published; the task's result is `[REPLIED]`.
-  not_sent  proven absent (never sent, or the gateway answered and the read-back does not hold it):
-            nothing is published; the agent sends the reply and `owner_line` as the task's one result.
-  unknown   neither could be proven (the send got no answer, or the room could not be read back):
-            nothing is published and the reply is not sent again, since it may have landed; the
-            task's result is `owner_line` alone, which says the reply could not be confirmed.
+  sent      `say` returned an event id: the page is published; the task's result is `[REPLIED]`.
+  not_sent  the reply cannot be in the room: nothing left this process (no reply text, no script, a
+            send room-ops refused before any network call), or the gateway answered it with a 4xx.
+            Nothing is published; the agent sends the reply and `owner_line` as the task's one result.
+  unknown   anything else that left this process: an ok with no event id, a 5xx, a network error, a
+            timeout, no answer. Nothing is published and the reply is not sent again, since it may
+            have landed; the task's result is `owner_line` alone, which says so.
 
 It then runs `getting_started.py publish` with the task's own room and owner, so whether the page
 is made never rests on anything else. The page it publishes is generic: no roles, no tailored prompts
@@ -38,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -57,11 +61,11 @@ CARD_LINE = ("Your Getting started page is ready in this room's Commons, but I c
              "Send /tutorial to get it.")
 
 # The reply may or may not be in the room: the line claims neither, and is safe beside either.
-UNKNOWN_LINE = ("I sent you a reply but couldn't confirm it arrived, so I held your Getting started page. "
-                "If you don't see my reply above, send /tutorial and I'll try again.")
+UNKNOWN_LINE = ("I couldn't confirm my reply reached you, so I held your Getting started page. "
+                "Send /tutorial to get it.")
 SENT, NOT_SENT, UNKNOWN = "sent", "not_sent", "unknown"
-READ_LIMIT = 50
-READ_BACK_WAITS = (0.0, 1.0, 2.0)
+# room-ops say's reasons for a send that cannot land: refused before any network call, or an HTTP 4xx.
+REFUSED = re.compile(r"(?:^client gate denied for |^no gateway configured$|^HTTP 4\d\d$|\(4\d\d\)$)")
 
 # Nothing was made or changed: a retry would end the same way, so the line does not ask for one.
 SKIPPED_LINE = "I didn't make or change a Getting started page this time, so there is no card for it."
@@ -121,10 +125,10 @@ def read_outcome(result: Dict[str, object], card_asked: bool) -> tuple:
     return "ok", ""
 
 
-def _room_ops(script: Path, *args: str, timeout: int = 120) -> tuple:
+def _room_ops(script: Path, *args: str) -> tuple:
     """(answer, error): room-ops' JSON answer, or None and why there is none."""
     try:
-        proc = subprocess.run([sys.executable, str(script), *args], capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run([sys.executable, str(script), *args], capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.SubprocessError) as exc:
         return None, f"{type(exc).__name__}: {exc}"
     try:
@@ -136,43 +140,12 @@ def _room_ops(script: Path, *args: str, timeout: int = 120) -> tuple:
     return answer, ""
 
 
-def read_room(room: str, script: Path) -> Optional[list]:
-    """The room's newest messages as room-ops `read` gives them, or None when it cannot be read."""
-    answer, _ = _room_ops(script, "read", room, "--limit", str(READ_LIMIT), timeout=60)
-    if not answer or answer.get("ok") is not True or not isinstance(answer.get("messages"), list):
-        return None
-    return [m for m in answer["messages"] if isinstance(m, dict)]
-
-
-def read_back(room: str, text: str, before: list, script: Path, sleep=time.sleep) -> Optional[bool]:
-    """True: the reply is in the room as an event that was not there before. False: the read reaches
-    back to what was there before and does not hold it. None: the room does not show either."""
-    seen = {m.get("event_id") for m in before if m.get("event_id")}
-    covered = None
-    for wait in READ_BACK_WAITS:
-        if wait > 0:
-            sleep(wait)
-        now = read_room(room, script)
-        if now is None:
-            continue
-        ids = {m.get("event_id") for m in now if m.get("event_id")}
-        if any(isinstance(m.get("body"), str) and m["body"].strip() == text.strip()
-               and m.get("event_id") and m["event_id"] not in seen for m in now):
-            return True
-        covered = bool(seen & ids)
-    return False if covered else None
-
-
 def send_greeting(room: str, text: str, script: Path = SAY_SCRIPT) -> tuple:
-    """(state, reason): SENT, NOT_SENT or UNKNOWN, settled by the send's event id or a read-back."""
+    """(state, reason): SENT on the send's own event id, NOT_SENT when it cannot have landed, else UNKNOWN."""
     if not (text or "").strip():
         return NOT_SENT, "the reply is empty or its file could not be read"
     if not Path(script).is_file():
         return NOT_SENT, f"say script not found: {script}"
-    before = read_room(room, script)
-    if before is None:
-        # Without the room as it was, an unanswered send could never be settled: do not send.
-        return NOT_SENT, "the room could not be read before sending, so the reply was not sent"
     fd, path = tempfile.mkstemp(prefix="tutorial-greeting-", suffix=".txt")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -183,12 +156,7 @@ def send_greeting(room: str, text: str, script: Path = SAY_SCRIPT) -> tuple:
     if said and said.get("ok") is True and said.get("event_id"):
         return SENT, ""
     why = str((said or {}).get("reason") or err or "the send returned no event id")
-    landed = read_back(room, text, before, script)
-    if landed:
-        return SENT, ""
-    # Absence settles only a send the gateway answered; one with no answer may still land.
-    answered = said is not None and not why.startswith("network error")
-    if landed is False and answered:
+    if said is not None and said.get("ok") is False and REFUSED.search(why):
         return NOT_SENT, why
     return UNKNOWN, why
 

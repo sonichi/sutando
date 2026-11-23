@@ -393,6 +393,10 @@ class ReportedOutcome(_Run):
         self.assertEqual(json.loads(out.getvalue())["owner_line"], tr.SKIPPED_LINE)
 
 
+AGENT = "@agent:example.org"
+OTHER = "@someone:example.org"
+
+
 class _Room(_Run):
     """One room's timeline as a file of events. The room-ops and publish stand-ins post to it at once,
     as the real ones do; a result file reaches it only when the test's bridge drains, which may be late."""
@@ -401,16 +405,14 @@ class _Room(_Run):
         super().setUp()
         self.room = self.base / "room.jsonl"
         self.result = self.base / "result.txt"
-        self.post("owner", SETUP_BODY)
-        # Three reads, no pauses between them.
-        waits = getattr(tr, "READ_BACK_WAITS", None)
-        tr.READ_BACK_WAITS = (0.0, -1.0, -1.0)
-        self.addCleanup(setattr, tr, "READ_BACK_WAITS", waits)
+        self.calls = self.base / "room_ops.calls"
+        self.post("owner", SETUP_BODY, sender=OWNER)
 
-    def post(self, kind: str, body: str) -> None:
+    def post(self, kind: str, body: str, sender: str = AGENT) -> None:
         events = self.events()
         with self.room.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"event_id": f"$e{len(events)}", "kind": kind, "body": body}) + "\n")
+            fh.write(json.dumps({"event_id": f"$e{len(events)}", "kind": kind, "body": body, "sender": sender})
+                     + "\n")
 
     def events(self) -> list:
         if not self.room.exists():
@@ -418,39 +420,46 @@ class _Room(_Run):
         return [json.loads(line) for line in self.room.read_text(encoding="utf-8").splitlines()]
 
     def timeline(self) -> list:
-        """What the agent put in the room, in order."""
+        """What was put in the room after the owner's message, in order."""
         return [f"{e['kind']}:{e['body']}" if e["body"] else e["kind"] for e in self.events()
                 if e["kind"] != "owner"]
 
-    def room_ops(self, say: str = "confirmed", lands: bool = True, read: str = "ok") -> Path:
-        """room_ops.py's `read` and `say` over the room file. `say`: confirmed (an event id), no_id
-        (200, no event id), refused (ok false), network (a network error), silent (no answer at all).
-        `lands`: whether the say reaches the room. `read`: ok, down, or down_after_say."""
+    def room_ops(self, say: str = "confirmed", lands: bool = True, also: str = "") -> Path:
+        """room_ops.py's `say` over the room file (and `read`, for a runner that asks). `say`: confirmed (an event id), no_id (200, no event
+        id), refused (a 403), gated (refused before any network call), error (a 502), network (a
+        network error), silent (no answer at all). `lands`: whether the say reaches the room.
+        `also`: a sender whose message with the same words reaches the room as the say is made."""
         script = self.base / "fake_room_ops.py"
         script.write_text(textwrap.dedent(f"""\
-            import json, os, sys
-            room, said_flag = {str(self.room)!r}, {str(self.base / "said.flag")!r}
-            events = [json.loads(l) for l in open(room)] if os.path.exists(room) else []
+            import json, sys
+            room = {str(self.room)!r}
+            open({str(self.calls)!r}, "a").write(sys.argv[1] + "\\n")
             if sys.argv[1] == "read":
-                assert sys.argv[3] == "--limit", sys.argv
-                if {read!r} == "down" or ({read!r} == "down_after_say" and os.path.exists(said_flag)):
-                    print(json.dumps({{"ok": False, "reason": "network error: down", "messages": []}}, indent=2))
-                else:
-                    shown = [{{"event_id": e["event_id"], "body": e["body"], "sender": e["kind"]}}
-                             for e in reversed(events)][:int(sys.argv[4])]
-                    print(json.dumps({{"ok": True, "messages": shown, "complete": False}}, indent=2))
+                shown = [{{"event_id": e["event_id"], "body": e["body"], "sender": e["sender"]}}
+                         for e in reversed([json.loads(l) for l in open(room)])]
+                print(json.dumps({{"ok": True, "messages": shown, "complete": False}}, indent=2))
                 sys.exit(0)
-            assert sys.argv[1] == "say" and sys.argv[3] == "--body-file", sys.argv
-            open(said_flag, "w").close()
-            eid = None
-            if {lands!r}:
-                eid = "$e%d" % len(events)
+            assert sys.argv[1] == "say" and sys.argv[3] == "--body-file" and len(sys.argv) == 5, sys.argv
+            body, eid = open(sys.argv[4]).read(), None
+
+            def add(kind, sender):
                 with open(room, "a") as fh:
-                    fh.write(json.dumps({{"event_id": eid, "kind": "say", "body": open(sys.argv[4]).read()}}) + "\\n")
+                    fh.write(json.dumps({{"event_id": "$e%d" % sum(1 for _ in open(room)), "kind": kind,
+                                         "body": body, "sender": sender}}) + "\\n")
+
+            if {also!r}:
+                add("other", {also!r})
+            if {lands!r}:
+                eid = "$e%d" % sum(1 for _ in open(room))
+                add("say", {AGENT!r})
             answer = {{"confirmed": {{"ok": True, "event_id": eid, "reason": None, "state": "confirmed"}},
                       "no_id": {{"ok": True, "event_id": None, "state": "unconfirmed",
                                 "reason": "gateway returned 200 with no event_id — delivery not confirmed"}},
-                      "refused": {{"ok": False, "event_id": None, "reason": "HTTP 502", "state": "failed"}},
+                      "refused": {{"ok": False, "event_id": None, "state": "failed",
+                                  "reason": "denied — agent not a joined member (403)"}},
+                      "gated": {{"ok": False, "event_id": None, "state": "failed",
+                                "reason": "client gate denied for {AGENT}"}},
+                      "error": {{"ok": False, "event_id": None, "reason": "HTTP 502", "state": "failed"}},
                       "network": {{"ok": False, "event_id": None, "reason": "network error: timed out",
                                   "state": "failed"}}}}.get({say!r})
             if answer is not None:
@@ -460,10 +469,15 @@ class _Room(_Run):
 
     def card_publish(self) -> Path:
         script = self.fake_publish(0, CREATED)
-        card = json.dumps({"event_id": "$card", "kind": "card", "body": ""})
+        card = json.dumps({"event_id": "$card", "kind": "card", "body": "", "sender": AGENT})
         script.write_text(f'open({str(self.room)!r}, "a").write({card!r} + "\\n")\n'
                           + script.read_text(encoding="utf-8"), encoding="utf-8")
         return script
+
+    def fresh_room(self) -> None:
+        for name in ("room.jsonl", "argv.json"):
+            (self.base / name).unlink(missing_ok=True)
+        self.post("owner", SETUP_BODY, sender=OWNER)
 
     def greet(self, **room_ops) -> dict:
         return tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.card_publish(), greeting="Hello Dana",
@@ -499,18 +513,22 @@ class GreetingOrder(_Room):
         self.assertEqual(self.timeline(), ["card", "result:Hello Dana"])
         self.assertNotIn("greeting", shown)
 
-    def test_a_refused_reply_publishes_nothing_and_goes_out_as_one_result(self):
-        shown = self.greet(say="refused", lands=False)
-        self.assertFalse(self.argv_file.exists(), "no card may precede a reply that has not been sent")
-        self.assertEqual(self.timeline(), [])
-        self.assertEqual((shown["ok"], shown["greeting"], shown["owner_line"]), (False, "not_sent", tr.OWNER_LINE))
-        rec = self.record()
-        self.assertEqual((rec["outcome"], rec["exit"], rec["reason"]), ("greeting-not-sent", None, "HTTP 502"))
-        row = tutorial_row(self.ws)
-        self.assertEqual(row["status"], "warn")
-        self.assertIn("page was not run", row["detail"])
-        self.close_task(shown)
-        self.assertEqual(self.timeline(), [f"result:Hello Dana  {tr.OWNER_LINE}"])
+    def test_a_reply_that_cannot_have_landed_publishes_nothing_and_goes_out_as_one_result(self):
+        for say, reason in (("refused", "denied — agent not a joined member (403)"),
+                            ("gated", f"client gate denied for {AGENT}")):
+            self.fresh_room()
+            shown = self.greet(say=say, lands=False)
+            self.assertFalse(self.argv_file.exists(), "no card may precede a reply that has not been sent")
+            self.assertEqual(self.timeline(), [])
+            self.assertEqual((shown["ok"], shown["greeting"], shown["owner_line"]),
+                             (False, "not_sent", tr.OWNER_LINE), say)
+            rec = self.record()
+            self.assertEqual((rec["outcome"], rec["exit"], rec["reason"]), ("greeting-not-sent", None, reason))
+            row = tutorial_row(self.ws)
+            self.assertEqual(row["status"], "warn")
+            self.assertIn("page was not run", row["detail"])
+            self.close_task(shown)
+            self.assertEqual(self.timeline(), [f"result:Hello Dana  {tr.OWNER_LINE}"], say)
 
     def test_a_reply_file_that_is_empty_or_a_missing_script_sends_nothing(self):
         for text, script in (("  ", self.room_ops()), ("Hello Dana", self.base / "no_room_ops.py")):
@@ -518,6 +536,7 @@ class GreetingOrder(_Room):
                            say_script=script)
             self.assertEqual((shown["greeting"], shown["outcome"]), ("not_sent", "greeting-not-sent"), text)
         self.assertEqual(self.timeline(), [])
+        self.assertFalse(self.calls.exists(), "room-ops was never called")
 
     def test_the_cli_takes_the_reply_from_a_file_and_an_unreadable_one_is_not_sent(self):
         import contextlib
@@ -541,9 +560,8 @@ class GreetingOrder(_Room):
     def test_the_script_is_room_ops_and_takes_the_arguments_sent(self):
         self.assertEqual(tr.SAY_SCRIPT, REPO / "skills" / "agent-room-ops" / "room_ops.py")
         src = tr.SAY_SCRIPT.read_text(encoding="utf-8")
-        for parser, flag in (("say", '"--body-file"'), ("read", '"--limit"')):
-            self.assertIn(f'sub.add_parser("{parser}"', src)
-            self.assertIn(flag, src)
+        self.assertIn('sub.add_parser("say"', src)
+        self.assertIn('"--body-file"', src)
 
     def test_the_playbook_steps_send_the_reply_through_the_runner(self):
         steps = (REPO / "skills" / "tutorial" / "SKILL.md").read_text(encoding="utf-8")
@@ -552,117 +570,124 @@ class GreetingOrder(_Room):
         for state in ("`sent`", "`not_sent`", "`unknown`"):
             self.assertIn(state, steps)
         self.assertNotIn("`unconfirmed`", steps)
+        playbook = steps.split("### A `playbook: tutorial` task")[1].split("**The greeting comes first.**")[0]
+        self.assertIn("event id", playbook)
+        for gone in ("--reply-to", "reads the room back", "read back"):
+            self.assertNotIn(gone, playbook)
 
 
 class AmbiguousSend(_Room):
-    """An ok with no event id, or a send with no answer, proves nothing: the room is read back, and the
-    card goes out only behind a reply that is there."""
+    """Only the event id `say` returns ties a message to this send. Without it the card is held and
+    the reply is never sent a second time, whatever the room shows."""
+
+    def assert_held(self, shown, why):
+        self.assertFalse(self.argv_file.exists(), f"{why}: no card")
+        self.assertEqual((shown["ok"], shown["greeting"], shown["outcome"], shown["owner_line"]),
+                         (False, "unknown", "greeting-unconfirmed", tr.UNKNOWN_LINE), why)
 
     def test_an_ok_with_no_event_id_whose_reply_never_landed_shows_no_card_alone(self):
         shown = self.greet(say="no_id", lands=False)
-        self.assertFalse(self.argv_file.exists(), "the card would be the only message in the room")
-        self.assertEqual((shown["greeting"], shown["outcome"], shown["owner_line"]),
-                         ("not_sent", "greeting-not-sent", tr.OWNER_LINE))
+        self.assert_held(shown, "the card would be the only message in the room")
         self.close_task(shown)
-        self.assertEqual(self.timeline(), [f"result:Hello Dana  {tr.OWNER_LINE}"], "the reply, once, and no card")
-
-    def test_an_ok_with_no_event_id_whose_reply_landed_is_proven_by_the_read_back(self):
-        shown = self.greet(say="no_id")
-        self.close_task(shown)
-        self.assertEqual(self.timeline(), ["say:Hello Dana", "card"])
-        self.assertEqual(shown["greeting"], "sent")
+        self.assertEqual(self.timeline(), [f"result:{tr.UNKNOWN_LINE}"])
 
     def test_a_send_that_landed_but_lost_its_answer_is_not_sent_twice(self):
-        for say in ("network", "silent"):
-            self.room.unlink()
-            self.post("owner", SETUP_BODY)
+        for say in ("network", "silent", "error", "no_id"):
+            self.fresh_room()
             shown = self.greet(say=say)
+            self.assert_held(shown, f"{say}: nothing ties the message in the room to this send")
             self.close_task(shown)
-            self.assertEqual(self.timeline(), ["say:Hello Dana", "card"], f"{say}: one reply, then the card")
-            self.assertEqual((shown["greeting"], shown["outcome"]), ("sent", "ok"), say)
+            self.assertEqual(self.timeline(), ["say:Hello Dana", f"result:{tr.UNKNOWN_LINE}"],
+                             f"{say}: the reply once, never a second copy")
 
-    def test_a_say_that_times_out_after_landing_is_found_by_the_read_back(self):
+    def test_a_say_that_times_out_after_landing_is_not_sent_twice(self):
         real = tr.subprocess.run
 
         def slow_say(cmd, **kw):
-            done = real(cmd, **kw)
-            if "say" in cmd:
-                raise tr.subprocess.TimeoutExpired(cmd="say", timeout=120)
-            return done
+            real(cmd, **kw)
+            raise tr.subprocess.TimeoutExpired(cmd="say", timeout=120)
 
         tr.subprocess.run = slow_say
         try:
-            shown = self.greet(say="confirmed")
+            shown = tr.send_greeting(ROOM, "Hello Dana", self.room_ops())
         finally:
             tr.subprocess.run = real
+        self.assertEqual(shown[0], "unknown")
+        self.assertIn("TimeoutExpired", shown[1])
+        self.assertEqual(self.timeline(), ["say:Hello Dana"])
+
+    def test_the_same_words_from_another_sender_are_not_this_reply(self):
+        shown = self.greet(say="no_id", lands=False, also=OTHER)
+        self.assertEqual(self.timeline(), ["other:Hello Dana"], "only the other sender's message is there")
+        self.assert_held(shown, "another sender's identical message proves nothing about this send")
         self.close_task(shown)
-        self.assertEqual(self.timeline(), ["say:Hello Dana", "card"])
-        self.assertEqual(shown["greeting"], "sent")
+        self.assertEqual(self.timeline(), ["other:Hello Dana", f"result:{tr.UNKNOWN_LINE}"])
 
-    def test_a_send_with_no_answer_and_no_reply_in_the_room_is_unknown_and_holds_everything(self):
-        for say in ("network", "silent"):
-            shown = self.greet(say=say, lands=False)
-            self.assertFalse(self.argv_file.exists(), f"{say}: no card behind a reply nobody can vouch for")
-            self.assertEqual((shown["ok"], shown["greeting"], shown["outcome"], shown["owner_line"]),
-                             (False, "unknown", "greeting-unconfirmed", tr.UNKNOWN_LINE), say)
-            self.assertEqual(self.timeline(), [], say)
-            row = tutorial_row(self.ws)
-            self.assertEqual(row["status"], "warn", say)
-            self.assertIn("could not be confirmed either way", row["detail"], say)
-        self.close_task(shown)
-        self.assertEqual(self.timeline(), [f"result:{tr.UNKNOWN_LINE}"], "never the reply a second time")
-        self.assertNotIn("Hello Dana", tr.UNKNOWN_LINE)
+    def test_the_same_words_from_this_agent_in_another_turn_are_not_this_reply(self):
+        for say in ("no_id", "network", "silent"):
+            self.fresh_room()
+            shown = self.greet(say=say, lands=False, also=AGENT)
+            self.assertEqual(self.events()[-1]["sender"], AGENT, "the other turn's message is this agent's own")
+            self.assert_held(shown, f"{say}: this agent's identical message from another turn is not this send")
+            self.close_task(shown)
+            self.assertEqual(self.timeline(), ["other:Hello Dana", f"result:{tr.UNKNOWN_LINE}"], say)
 
-    def test_an_unknown_send_that_lands_late_is_still_one_reply(self):
-        shown = self.greet(say="network", lands=False)
-        self.post("say", "Hello Dana")
-        self.close_task(shown)
-        self.assertEqual(self.timeline(), ["say:Hello Dana", f"result:{tr.UNKNOWN_LINE}"])
-
-    def test_a_room_that_cannot_be_read_back_leaves_an_unproven_send_unknown(self):
-        for say, lands in (("no_id", True), ("no_id", False), ("refused", False)):
-            self.room.unlink()
-            self.post("owner", SETUP_BODY)
-            (self.base / "said.flag").unlink(missing_ok=True)
-            shown = self.greet(say=say, lands=lands, read="down_after_say")
-            self.assertEqual(shown["greeting"], "unknown", (say, lands))
-            self.assertFalse(self.argv_file.exists(), (say, lands))
-
-    def test_a_room_that_cannot_be_read_first_is_never_sent_to(self):
-        shown = self.greet(read="down")
-        self.assertEqual((shown["greeting"], shown["outcome"]), ("not_sent", "greeting-not-sent"))
-        self.assertFalse((self.base / "said.flag").exists(), "say was never called")
-        self.close_task(shown)
-        self.assertEqual(self.timeline(), [f"result:Hello Dana  {tr.OWNER_LINE}"])
-
-    def test_an_older_message_with_the_same_words_is_not_taken_for_this_reply(self):
-        self.post("say", "Hello Dana")
+    def test_a_reply_that_becomes_visible_later_is_not_sent_again(self):
+        """The room shows nothing when the run ends; the reply turns up afterwards."""
         shown = self.greet(say="no_id", lands=False)
-        self.assertEqual(shown["greeting"], "not_sent")
-        self.assertFalse(self.argv_file.exists())
+        self.assertEqual(self.timeline(), [])
+        self.assert_held(shown, "a room that does not show the reply yet rules nothing out")
+        self.post("say", "Hello Dana")
+        self.close_task(shown)
+        self.assertEqual(self.timeline(), ["say:Hello Dana", f"result:{tr.UNKNOWN_LINE}"],
+                         "the reply once, never a second copy, and no card")
 
-    def test_absence_is_proven_only_when_the_read_reaches_what_was_there_before(self):
-        before = [{"event_id": "$old", "body": "x"}]
-        tr.READ_BACK_WAITS = (0.0, 1.0, 2.0)
-        real = tr.read_room
-        waits = []
-        try:
-            tr.read_room = lambda *_a: [{"event_id": "$new", "body": "y"}]
-            self.assertIsNone(tr.read_back(ROOM, "Hello", before, Path("x"), waits.append))
-            tr.read_room = lambda *_a: [{"event_id": "$new", "body": "y"}, {"event_id": "$old", "body": "x"}]
-            self.assertIs(tr.read_back(ROOM, "Hello", before, Path("x"), waits.append), False)
-            self.assertIsNone(tr.read_back(ROOM, "Hello", [], Path("x"), waits.append), "an empty room before")
-            tr.read_room = lambda *_a: [{"event_id": "$new", "body": " Hello\n"}]
-            self.assertIs(tr.read_back(ROOM, "Hello", before, Path("x"), waits.append), True)
-        finally:
-            tr.read_room = real
-        self.assertEqual(waits[:2], [1.0, 2.0], "an absent reply is looked for more than once")
-        self.assertEqual(len(tr.READ_BACK_WAITS), 3)
+    def test_an_unknown_send_is_a_health_warning_and_its_line_repeats_nothing(self):
+        shown = self.greet(say="error", lands=False)
+        self.assert_held(shown, "a 5xx may have applied")
+        self.assertEqual(self.record()["reason"], "HTTP 502")
+        row = tutorial_row(self.ws)
+        self.assertEqual(row["status"], "warn")
+        self.assertIn("could not be confirmed either way", row["detail"])
+        self.assertNotIn("Hello Dana", tr.UNKNOWN_LINE)
+        self.assertIn("/tutorial", tr.UNKNOWN_LINE)
 
-    def test_a_read_answer_that_is_not_a_message_list_is_no_read(self):
-        script = self.base / "odd_read.py"
-        script.write_text('print(\'{"ok": true, "messages": "none"}\')\n', encoding="utf-8")
-        self.assertIsNone(tr.read_room(ROOM, script))
+    def test_the_room_is_never_read_to_settle_a_send(self):
+        for say, lands in (("confirmed", True), ("no_id", True), ("network", False)):
+            self.greet(say=say, lands=lands)
+        self.assertEqual(self.calls.read_text().split(), ["say", "say", "say"])
+        src = (SCRIPTS / "tutorial_run.py").read_text(encoding="utf-8")
+        self.assertNotIn('"read"', src)
+
+    def test_only_a_send_that_cannot_land_is_not_sent(self):
+        gw = importlib.util.spec_from_file_location("gw_for_tutorial_run", tr.SAY_SCRIPT.parent / "_gateway.py")
+        say_src = (tr.SAY_SCRIPT.parent / "say.py").read_text(encoding="utf-8")
+        gateway = importlib.util.module_from_spec(gw)
+        sys.path.insert(0, str(tr.SAY_SCRIPT.parent))
+        self.addCleanup(sys.path.remove, str(tr.SAY_SCRIPT.parent))
+        gw.loader.exec_module(gateway)
+        for code in (400, 401, 403, 404, 409, 429):
+            self.assertTrue(tr.REFUSED.search(gateway.degrade_reason(code)), code)
+        for code in (500, 502, 503):
+            self.assertFalse(tr.REFUSED.search(gateway.degrade_reason(code)), code)
+        for before_network in ('f"client gate denied for {agent_mxid}"', '"no gateway configured"'):
+            self.assertIn(before_network, say_src)
+        self.assertTrue(tr.REFUSED.search(f"client gate denied for {AGENT}"))
+        self.assertTrue(tr.REFUSED.search("no gateway configured"))
+        for unsettled in ("network error: timed out", "gateway returned 200 with no event_id — delivery not confirmed",
+                          "the send returned no event id", "TimeoutExpired: say"):
+            self.assertFalse(tr.REFUSED.search(unsettled), unsettled)
+
+    def test_room_ops_carries_no_per_send_identifier(self):
+        """The reason a read-back cannot prove a send: if either half appears, this rule can be revisited."""
+        ops = tr.SAY_SCRIPT.parent
+        say_flags = re.findall(r'"(--[a-z-]+)"', tr.SAY_SCRIPT.read_text(encoding="utf-8").split(
+            'sub.add_parser("say"')[1].split("sub.add_parser(")[0])
+        self.assertEqual(sorted(say_flags), ["--agent", "--body-file", "--extra-content", "--reply-to",
+                                             "--thread-root", "--worker"])
+        returned = set(re.findall(r'^\s+"([a-z_]+)": ', (ops / "read.py").read_text(encoding="utf-8").split(
+            "def _normalize")[1].split("def read_room")[0], re.M))
+        self.assertEqual(returned, {"sender", "ts", "body", "event_id", "reactions"})
 
 
 class HealthRow(_Run):

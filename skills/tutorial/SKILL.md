@@ -53,26 +53,29 @@ For a tagged task, do exactly this, in order:
 
    It posts your reply in the room first (room-ops `say`), and only when the reply is proven to be
    in the room does it run `getting_started.py publish` (step 2 below) with that room and owner,
-   and nothing else. Proof is the send's own event id, or the reply found by reading the room back
-   as an event that was not there before the send; an "ok" with no event id proves nothing by
-   itself. The reply and the card leave by the same path, one after the other. The page it
-   publishes is generic, with no roles and no tailored prompts, because a room's Commons page
-   cannot yet be limited to its owner. The setup app's `tutorial-inputs.json` is not a gate. It
-   records the outcome in `<workspace>/state/tutorial/last-run.json`, the manifest's `last_run`
-   record, which health-check shows as the `skill:tutorial` row, and prints one JSON line.
+   and nothing else. The only proof is the event id the send itself returns. An "ok" with no
+   event id proves nothing, and neither does a message seen in the room afterwards, your own
+   included: nothing ties it to this send. The reply and the card leave by the same path, one
+   after the other. The page it publishes is generic, with no roles and no tailored prompts,
+   because a room's Commons page cannot yet be limited to its owner. The setup app's
+   `tutorial-inputs.json` is not a gate. It records the outcome in
+   `<workspace>/state/tutorial/last-run.json`, the manifest's `last_run` record, which
+   health-check shows as the `skill:tutorial` row, and prints one JSON line.
 3. **Close the task by the line's `greeting`.** It is one of three states:
-   - `sent`: your reply is proven to be in the room. Write `[REPLIED]` as the task's result, never
-     the reply again. If the line has an `owner_line` (the publish failed, nothing was made or
-     changed, or the page is there but its card did not reach the owner), send it word for word as
-     your only message about the page
+   - `sent`: the send returned an event id, so your reply is in the room. Write `[REPLIED]` as the
+     task's result, never the reply again. If the line has an `owner_line` (the publish failed,
+     nothing was made or changed, or the page is there but its card did not reach the owner), send
+     it word for word as your only message about the page
      (`python3 skills/agent-room-ops/room_ops.py say '<channel_id>' '<owner_line>'`).
      No `owner_line`: the page's card in the DM is the one line about it; post nothing more.
-   - `not_sent`: your reply is proven not to be in the room and the page was not run. Write your
-     reply as the task's result, with the `owner_line` as its last paragraph: one message, nothing
-     sent beside it.
-   - `unknown`: the send got no answer, or the room could not be read back, so your reply may or
-     may not be there. The page was not run. Write the `owner_line` alone as the task's result,
-     word for word. Do not write `[REPLIED]`, and do not send your reply again by any path: it may
+   - `not_sent`: your reply cannot be in the room: nothing was sent (no reply text, the send was
+     refused before any network call), or the gateway answered the send with a 4xx. The page was
+     not run. Write your reply as the task's result, with the `owner_line` as its last paragraph:
+     one message, nothing sent beside it.
+   - `unknown`: everything else: an ok with no event id, a 5xx, a network error, a timeout, no
+     answer. Your reply may or may not be there, now or a moment later. The page was not run.
+     Write the `owner_line` alone as the task's result, word for word. Do not write `[REPLIED]`,
+     do not look in the room to decide, and do not send your reply again by any path: it may
      already have landed, and a second copy is worse than the one line.
 
    Do not explain a failure in chat and do not retry in the same turn; the owner retries with
