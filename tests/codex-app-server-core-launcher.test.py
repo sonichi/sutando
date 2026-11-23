@@ -517,7 +517,15 @@ class PersistedChoice(unittest.TestCase):
         result = f.run(FAKE_SEAT_INIT_FAILS="1", FAKE_KILL_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn("could not shut intake for the surviving seat", result.stderr)
-        self.assertTrue((f.declaration().parent / "intake-held").exists(), "a later launch still knows")
+        held = f.declaration().parent / "intake-held"
+        self.assertEqual(held.read_text().strip(), "unknown", "not the same as a confirmed external stop")
+        lock.rmdir()
+        (f.declaration().parent / "ready").write_text("1\n")
+        result = f.run(**self.UNSET)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("does not say which stop holds intake", result.stderr)
+        self.assertIn("rm '", result.stderr, "it says how an operator clears it")
+        self.assertTrue(held.exists(), "an unknown marker is never cleared automatically")
 
     def test_a_stop_already_in_place_is_never_cleared_by_the_reattach(self):
         f = Fixture(self, seat_tmux=True)
@@ -527,7 +535,7 @@ class PersistedChoice(unittest.TestCase):
         result = f.run(FAKE_SEAT_INIT_FAILS="1", FAKE_KILL_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
         self.assertNotIn("could not shut intake", result.stderr, "already held is a success, not a failure")
         held = f.declaration().parent / "intake-held"
-        self.assertEqual(held.read_text().strip(), "", "not this launch's stop")
+        self.assertEqual(held.read_text().strip(), "external", "not this launch's stop")
         (f.declaration().parent / "ready").write_text("1\n")
         self.assertEqual(f.run(**self.UNSET).returncode, 0)
         self.assertTrue(sentinel.exists())
