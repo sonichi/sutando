@@ -11,15 +11,24 @@ from pathlib import Path
 from typing import Optional
 
 
-def account_fingerprint(config_dir: Optional[str]) -> Optional[str]:
-    """A non-reversible digest of the account the CLI is signed in to, else None.
-    Only non-secret identity fields of `.claude.json` are read; tokens never are."""
+def oauth_account(config_dir: Optional[str]) -> Optional[dict]:
+    """The `oauthAccount` object of the CLI's `.claude.json`, else None; tokens are not in it."""
     if not config_dir:
         return None
     try:
         acct = json.loads((Path(config_dir) / ".claude.json").read_text(encoding="utf-8")).get("oauthAccount")
     except (OSError, ValueError, AttributeError):
         return None
+    return acct if isinstance(acct, dict) else None
+
+
+def account_fingerprint(config_dir: Optional[str]) -> Optional[str]:
+    """A non-reversible digest of the account the CLI is signed in to, else None."""
+    return account_digest(oauth_account(config_dir))
+
+
+def account_digest(acct: Optional[dict]) -> Optional[str]:
+    """The digest of an `oauthAccount` object; only its non-secret identity fields are read."""
     if not isinstance(acct, dict):
         return None
     ident = [str(acct.get(k) or "") for k in ("accountUuid", "organizationUuid", "emailAddress")]

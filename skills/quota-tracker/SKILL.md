@@ -52,13 +52,45 @@ This is the default after upgrading, for new and existing installs alike, and th
 CLAUDE_CONFIG_DIR='<config dir>' claude auth login
 ```
 
-Follow the link it prints and sign in; the next session launch picks the login up. The check (`src/claude_signed_in.py`) runs `claude auth status --json` with the environment the direct session gets and counts only exit 0 with `"loggedIn": true`; it never changes routing and never reads a credential.
+Follow the link it prints and sign in; the next session launch picks the login up. The check (`src/claude_signed_in.py`) runs `claude auth status --json` with the environment the direct session gets and counts only exit 0 with `"loggedIn": true`; a probe that times out (8 seconds) or a missing `claude` is unknown and sends no message. Config dirs are probed four at a time, and the daily message markers are removed after 7 days. It never changes routing and never reads a credential.
 
 With the recorder on, Sutando's Claude sessions (the core and every pool worker) no longer go through the credential proxy. The core and worker launchers (`src/agent/claude/cli/session-launch.sh`) and `src/startup.sh` drop an `ANTHROPIC_BASE_URL` that points at the local proxy (`http://localhost:7846`, `127.0.0.1` or `[::1]`), in the launcher and in the session's own environment, and no longer set it. A base URL the owner set to anything else is left alone.
 
 - The proxy's shared-credential role no longer applies to these sessions: each one uses its own config dir's login. On a host where workers run in the core's config dir, that is the core's login for all of them.
-- Nothing stops or uninstalls the proxy: it keeps running, unused by these sessions. Health-check does not fail when the proxy is down or unused and the quota record comes from the status line.
+- Nothing stops or uninstalls the proxy: it keeps running, unused by these sessions. Health-check does not fail when the proxy is down or unused and the quota record comes from the status line. With the recorder on (the launchers' own `claude_direct_routing` decides) and nothing still using the proxy (no established connection on port 7846 and no live Sutando session carrying the proxy URL), a running proxy that is out of date or reports an exhausted credential is shown as `ok`, unused, with that state as information. If either is unknown, or with the recorder off, it is reported as before.
 - To route through the proxy again, set `QUOTA_STATUSLINE_ENABLED` to `false` (env, or the skill's `manifest.json` `config`) and restart the sessions: the next launch decides its routing with the switch off and points the session at the proxy, which was never stopped. This also removes the recorder and puts back the saved status line.
+
+## The quota in the s.space agent sidebar
+
+On by default. The gateway bridge sends the core's quota to s.space as `health.quota` on its existing heartbeat (`POST /v1/heartbeat`, capability `quota_status.v1`), next to `health.recovery`, so the agent sidebar can show it. The block is built by `src/quota_status.py` from a record of the core's own login, by the rule the recovery state and the limit hold use (`quota_availability.record_for_account`): a status line record only for the core's current login, a proxy record only when its `acct_` label is that login's (an unlabeled proxy record only while the core's account is unreadable). Another login's record sends no block. It carries only:
+
+```json
+{"v": 1,
+ "five_hour": {"used_pct": 42.0, "resets_at": 1795190400},
+ "seven_day": {"used_pct": 7.0, "resets_at": 1795600000},
+ "limit_state": "allowed",
+ "last_checked": 1795176000}
+```
+
+and, when limited:
+
+```json
+{"v": 1,
+ "five_hour": {"used_pct": 100.0, "resets_at": 1795190400},
+ "seven_day": {"used_pct": 7.0, "resets_at": null},
+ "limit_state": "rejected",
+ "resumes_at": 1795190400,
+ "last_checked": 1795176000}
+```
+
+Times are epoch seconds. `limit_state` is `allowed`, `overage` or `rejected`. `resumes_at` is omitted when the state is `allowed`; otherwise it is present, and null when no reset time is known. A window the record does not name is left out. A window's `resets_at` and the block's `last_checked` are null when the record does not carry them. `used_pct` is not clamped: in `overage` it can exceed 100, and a consumer may clamp it for display. No account digest, other login's numbers, headers, rejection ledger or model is sent. The full heartbeat examples are `contracts/quota_status.v1/heartbeat.json` (allowed) and `heartbeat-limited.json` (limited).
+
+- The block changes when a used percentage moves by at least 1 point or the limit state flips, and is otherwise refreshed at most every 5 minutes; a change sends a heartbeat early, nothing else does. The status line never sends anything.
+- A failed read keeps the last block; a broker that refuses the block (400/422) gets beats without it for an hour.
+- Not sent from a pool worker's lane, a Codex core, or a standalone Sparrow.
+- `QUOTA_STATUS_PUBLISH` (`manifest.json` `config`, default `true`; env overrides): `false` stops it at the gateway's next start.
+
+`python3 src/quota_status.py show` prints the block as it would be sent now.
 
 ## Quick Check
 
@@ -76,7 +108,7 @@ Output includes:
 
 `limit_state` is `allowed`, `overage` or `rejected`. `overage` means a limit window is rejected but `anthropic-ratelimit-unified-overage-status` is `allowed`/`allowed_warning` and no 429 has landed since: the core is serving on extra usage, so `available` stays `true`. Clients read this field rather than re-deriving it from the headers; the rule is `classify_limit_state` in `src/quota_availability.py`.
 
-`recent_rejections` is a bounded ledger (newest 20) of upstream responses the proxy forwarded with a 4xx/5xx other than 401 — `{ts, status, path, snippet, model, user_agent, peer_port}` — the proxy serves every seat on the host, so the client fields are what make a rejection attributable; the probe counts only entries for this core's own model (`SUTANDO_CORE_MODEL` or `core-runtime.json`) and counts every client when that is unknown. It survives the per-response header rewrite, and `health-check.py`'s `core-request-rejections` probe warns on one inside 15 minutes and fails on five inside an hour, so a credits/overage rejection that leaves every unified-status header `allowed` still reaches the owner.
+`recent_rejections` is a bounded ledger (newest 20) of upstream responses the proxy forwarded with a 4xx/5xx other than 401 — `{ts, status, path, snippet, model, user_agent, peer_port, account}` — the proxy serves every seat on the host, so the client fields are what make a rejection attributable; the probe counts only entries for this core's own model (`SUTANDO_CORE_MODEL` or `core-runtime.json`) and counts every client when that is unknown. `account` (on a rejection and on the record) is the `acct_` label of the credential the request was sent with, present only when the proxy took it from its config dir's own keychain item; a rejection counts toward the limit state only on a record of the same account (`record_rejections` / `boundRejections`), a model-less request keeps `last_request` only from a record of the same account, and the recovery state and limit hold act on the record only when it is labeled with the core's signed-in account (`record_for_account`; while that account is unknown, only an unlabeled record, and the resulting hold is marked `account_unread` so it does not bind an account read later). It survives the per-response header rewrite, and `health-check.py`'s `core-request-rejections` probe warns on one inside 15 minutes and fails on five inside an hour, so a credits/overage rejection that leaves every unified-status header `allowed` still reaches the owner.
 
 ## Setup
 

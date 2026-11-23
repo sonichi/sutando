@@ -2546,7 +2546,8 @@ def task_reply_agent(task_file, room_id: Optional[str], worker: str, rows: list,
     the live file of the id it declares; its receiving agent and queuing lane must agree; the room
     must be the task's own. Addressed to the worker's own agent, that is all. Addressed to a core
     agent, its envelope must verify (`task_envelope`), the worker must hold the task (its own tasks
-    folder, or the pool's delivery sentinel) and it must be neither answered, archived nor quarantined.
+    folder, or the pool's delivery sentinel, whose lease `pool_holder.pool_delegation` judges) and it
+    must be neither answered, archived nor quarantined.
     NoConnectionForRoom names any failed check."""
     import local_task_protocol
     import task_archive
@@ -2592,10 +2593,18 @@ def task_reply_agent(task_file, room_id: Optional[str], worker: str, rows: list,
     held = home["own"] and home["worker"] == worker and _same_file(path.parent, home["tasks"])
     if not held and _same_file(path.parent, ws / "tasks"):
         try:
-            from pool_holder import pool_holder
-            held = pool_holder(ws, tid) == worker
+            from pool_holder import pool_delegation
+            lease = pool_delegation(ws, tid, worker)
         except OSError:
             refuse("who holds it cannot be read")
+        held = lease["held"]
+        if held and lease["verdict"] != "live":
+            logging.getLogger(__name__).warning("connections: pool delegation not current %s", json.dumps(
+                {"event": "pool_delegation_not_current", "task_id": tid, "worker": worker,
+                 "verdict": lease["verdict"], "detail": lease["detail"], "mode": lease["mode"],
+                 "allowed": lease["allowed"]}, sort_keys=True))
+        if held and not lease["allowed"]:
+            refuse(f"its delegation to this worker is not current ({lease['verdict']}: {lease['detail']})")
     if not held:
         refuse("this worker does not hold it")
     from task_disposition import CLAIMED, PENDING, task_disposition

@@ -208,6 +208,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`quota_availability.py`** — Shared authority for whether Claude quota telemetry is usable.
 - **`quota_projection.py`** — Quota usage history + even-pace projection series for the dashboard chart.
 - **`quota_record.py`** — One writer of `state/quota-state.json` from Claude Code's own reports, for logins without the credential proxy: the status line's `rate_limits` and the StopFailure hook's `error: "rate_limit"`.
+- **`quota_status.py`** — The core's Claude quota as a room-visible status (`quota_status.v1`): one projection, one debounce.
 - **`reachability-endpoints.ts`** — Direct-reachability endpoint detection (US-10, Tier 2b) — "call your agent from another device and still reach YOUR core, directly, without routing through the cloud."
 - **`read_discord_channel.py`** — Gated Discord channel reader — compatibility wrapper over the shared reader and the shared contextNotFrom policy.
 - **`recording-state.ts`** — Shared recording state — used by both browser-tools.ts (describeScreenTool) and recording-tools.ts (scrollAndDescribeTool, screenRecordTool, etc.)
@@ -234,6 +235,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
 - **`runtime_models.py`** — The models the core's runtime itself offers, read from its own model picker, by exact name.
 - **`runtime_observation.py`** — Runtime observations: one leased record per seat, written by whatever observes that seat's CLI.
+- **`runtime_profile.py`** — The core's runtime profile (`runtime_profile.v1`): its model, the switches it offers, its plan name.
 - **`safe_number.py`** — One reader for a number from untrusted JSON (a ledger, a record, a payload).
 - **`scan-call-logs.py`** — Proactive call log scanner — detects issues and classifies by actionability.
 - **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).
