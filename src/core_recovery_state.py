@@ -14,7 +14,7 @@ pure: it folds the records other modules already keep into one small dict.
     state/quota-state.json               the credential proxy
     the pane's abnormal text             cli_wedge.frame_abnormal
     state/session-starts.log             the core launchers (restarts in the last 10 min)
-    state/core-revive.json               the desktop app's core revive loop (it gave up)
+    state/core-revive.json               the desktop app's core revive loop (it gave up), bound to its app session
 
 The record is what the gateway bridge sends as `health.recovery`, so it carries
 no prompt text, path, token or model output: `state`, times, the model alias,
@@ -496,11 +496,25 @@ def recorded_runtime(workspace: Path) -> Optional[str]:
     return value if value in RUNTIMES else None
 
 
-def revive_exhausted(workspace: Path) -> bool:
-    """Whether the desktop app's core revive loop has given up (state/core-revive.json); the app
-    removes the file once the core is up again and when its loop starts."""
+#: The supervisor rewrites its heartbeat every few seconds; an older one means its app is gone.
+APP_BEAT_FRESH_S = 60.0
+
+
+def revive_exhausted(workspace: Path, now: float, supervisor_status: Optional[dict] = None) -> bool:
+    """Whether the running desktop app's core revive loop has given up (state/core-revive.json).
+    The marker counts only as that app's own: it names an app session, the supervisor's status
+    names the same one under a fresh heartbeat, and it is not stamped in the future. A marker left
+    by an app that quit, crashed or was replaced is not the current app giving up."""
     rec = _read_json(status_read_path(REVIVE_FILE, Path(workspace)))
-    return bool(rec and rec.get("v") == VERSION and rec.get("state") == "exhausted")
+    if not rec or rec.get("v") != VERSION or rec.get("state") != "exhausted":
+        return False
+    session, since = rec.get("appSessionId"), _int(rec.get("since"))
+    status = supervisor_status if supervisor_status is not None else \
+        _read_json(status_read_path("supervisor-status.json", Path(workspace)))
+    beat = status.get("heartbeatAt") if isinstance(status, dict) else None
+    live = isinstance(beat, (int, float)) and not isinstance(beat, bool) and 0 <= now - beat / 1000.0 <= APP_BEAT_FRESH_S
+    return bool(live and isinstance(session, str) and session and status.get("appSessionId") == session
+                and since is not None and since <= now)
 
 
 def runtimes_on_host() -> tuple:
@@ -533,7 +547,7 @@ def gather(workspace: Path, supervisor: Optional[dict], *, now: float, runtime: 
         waiting_tasks=core_gate_notice.queued_count(workspace),
         restarts_10m=None if launches is None else len(launches), runtimes_available=runtimes_on_host(),
         crash_since=crash_loop_start(workspace, now) if launches else None,
-        revive_exhausted=revive_exhausted(workspace),
+        revive_exhausted=revive_exhausted(workspace, now),
         models_offered=[e["key"] for e in offered], model_labels=[e["label"] for e in offered])
 
 
