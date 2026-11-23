@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """The live view of a connector with no terminal: what a turn writes, and what a viewer follows."""
+import argparse
+import importlib.util
 import io
 import os
+import queue
 import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ag2_sparrow import live_view  # noqa: E402
-from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
+from ag2_sparrow.adapters.codex import codex_connector as cc, connect_cli  # noqa: E402
 
 
 class Base(unittest.TestCase):
@@ -140,6 +145,21 @@ class Following(Base):
         got = self.follow([lambda: None, trim_and_add, lambda: None], first=3)
         self.assertEqual(got.splitlines(), ["line 47", "line 48", "line 49", "after the trim"])
 
+    def test_a_log_that_cannot_be_read_is_waited_out_never_raised(self):
+        self.w.line("one")
+        real = open
+
+        def unreadable(path, *a, **kw):
+            if str(path) == str(self.path):
+                raise OSError("gone mid-read")
+            return real(path, *a, **kw)
+        with mock.patch("builtins.open", unreadable):
+            self.assertEqual(self.follow([lambda: None, lambda: None]), live_view.WAITING + "\n")
+            self.assertEqual(live_view._after(self.path, b"one"), 0)
+            self.assertEqual(live_view._start_of_last(self.path, 4, 3), 0)
+        self.assertEqual(live_view._after(self.path, b""), 0, "nothing shown yet: from the start")
+        self.assertEqual(live_view._after(self.path, b"one"), 4)
+
     def test_a_half_written_line_is_not_shown_until_it_ends(self):
         self.path.parent.mkdir(parents=True)
         self.path.write_text("whole\npart")
@@ -164,6 +184,58 @@ class CodexTurn(unittest.TestCase):
         self.assertEqual(step({"type": "somethingNew"}), ("somethingNew", "", ""))
         for hidden in ({"type": "agentMessage", "text": "hi"}, {"type": "reasoning"}, {"type": None}, {}):
             self.assertIsNone(step(hidden), hidden)
+
+    def test_a_completed_command_in_a_turn_is_written_as_it_completes(self):
+        with tempfile.TemporaryDirectory() as d:
+            events = queue.Queue()
+            c = cc.Connector(lambda: types.SimpleNamespace(events=events),
+                             argparse.Namespace(state=os.path.join(d, "state")), note="")
+            c.thread_id = "t1"
+            for m in ({"method": "item/completed", "params": {"threadId": "t1", "turnId": "u1", "item": {
+                          "type": "commandExecution", "command": ["ls", "\x1b[2J"], "status": "completed", "exitCode": 0}}},
+                      {"method": "item/agentMessage/delta", "params": {"threadId": "t1", "turnId": "u1", "delta": "done\n"}},
+                      {"method": "turn/completed", "params": {"threadId": "t1", "turn": {"id": "u1", "status": "completed"}}}):
+                events.put(m)
+            self.assertEqual(c.wait_turn("u1", 5), ("completed", "done\n", None))
+            self.assertEqual(Path(live_view.path_of(d)).read_text(), "\u2022 ran ls [2J\ndone\n")
+        # A connector given no state dir (a unit under test) keeps no view and serves the turn the same.
+        bare = cc.Connector(lambda: types.SimpleNamespace(events=events), argparse.Namespace(), note="")
+        self.assertIsNone(bare.view)
+
+    def test_the_view_command_follows_the_agents_log_until_interrupted(self):
+        seen = []
+
+        def followed(path):
+            seen.append(path)
+            raise KeyboardInterrupt
+        with mock.patch.object(connect_cli, "selected", return_value=("job", "")), \
+                mock.patch.object(connect_cli, "load_config", return_value=({"WORK": "/w"}, "")), \
+                mock.patch.object(connect_cli.cm, "work_root", return_value="/w"), \
+                mock.patch.object(connect_cli.live_view, "follow", followed):
+            self.assertEqual(connect_cli.view(argparse.Namespace()), 0)
+        self.assertEqual(seen, [live_view.path_of("/w")])
+        err = io.StringIO()
+        with mock.patch.object(connect_cli, "selected", return_value=(None, "several jobs are installed")), \
+                mock.patch.object(connect_cli.live_view, "follow", followed), mock.patch.object(sys, "stderr", err):
+            self.assertEqual(connect_cli.view(argparse.Namespace()), connect_cli.EXIT_UNUSABLE)
+        self.assertEqual((seen, err.getvalue()), ([live_view.path_of("/w")], "error: several jobs are installed\n"))
+        with mock.patch.object(connect_cli, "selected", return_value=("job", "")), \
+                mock.patch.object(connect_cli, "load_config", return_value=({}, "no config")), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(connect_cli.view(argparse.Namespace()), connect_cli.EXIT_UNUSABLE)
+
+    def test_the_differential_recording_reads_the_view_with_its_clock_times_replaced(self):
+        spec = importlib.util.spec_from_file_location("adapter_differential_driver",
+                                                      Path(__file__).resolve().parent / "adapter_differential_driver.py")
+        driver = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(driver)
+        with tempfile.TemporaryDirectory() as d:
+            w = live_view.Writer(live_view.path_of(d))
+            w.turn("owner, owner", "at 12:34:56 exactly")
+            w.done("completed")
+            got = driver.read_state(d, Path(d))
+        self.assertEqual(got, {live_view.NAME: "\n\u2500\u2500 <hh:mm:ss> owner, owner \u2500\u2500\n"
+                                                "> at <hh:mm:ss> exactly\n\u2500\u2500 turn completed \u2500\u2500\n"})
 
     def test_a_served_turn_leaves_its_lines_in_the_work_roots_view_and_the_command_follows_them(self):
         from test_codex_connector import run_connector, write_task, gateway_mid_task
