@@ -114,6 +114,8 @@ check("clear-if with the old token leaves a newer stop in place", sd.clear_if(_t
 _tok2 = sd._token(_tmp)
 check("clear-if with the current token clears it", sd.clear_if(_tok2) is True and not sd.is_shutting_down())
 check("clear-if with no token clears nothing", sd.clear_if("") is False)
+with contextlib.redirect_stdout(io.StringIO()):
+    check("the clear-if CLI says 'not mine' with exit 3, not an error", sd.main(["shutdown.py", "clear-if", "bogus"]) == 3)
 _a = sd.mark_if_absent("x"); sd.clear_shutdown(); _b = sd.mark_if_absent("x")
 check("two stops with the same reason in the same second still differ", _a != _b)
 sd.clear_shutdown()

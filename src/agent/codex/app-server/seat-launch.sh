@@ -125,7 +125,7 @@ seat_stop() {
 # intake shut for that seat (intake-held: its teardown failed). Then it must report ready first, and
 # only the stop this launcher wrote is cleared (compare-and-clear on its token); a newer one stays.
 seat_reattach() {
-  local ws held py token
+  local ws held py token rc
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || ws=""
   [ -n "$ws" ] || return 0
   SEAT_READY="$(seat_state_dir "$ws" "$SESSION")/ready"
@@ -137,8 +137,15 @@ seat_reattach() {
   fi
   py="$(heartbeat_python)"
   token="$(head -n1 "$held" 2>/dev/null)"
-  if [ -n "$token" ] && [ -n "$py" ] && ! "$py" "$REPO/src/shutdown.py" clear-if "$token"; then
-    echo "  · the Codex app-server seat is ready; a newer stop holds intake, so it stays shut." >&2
+  if [ -n "$token" ]; then
+    rc=1
+    [ -n "$py" ] && { "$py" "$REPO/src/shutdown.py" clear-if "$token" >/dev/null 2>&1 && rc=0 || rc=$?; }
+    case "$rc" in
+      0) ;;
+      3) echo "  · the Codex app-server seat is ready; a newer stop holds intake, so it stays shut." >&2 ;;
+      *) echo "  ✗ the Codex app-server seat is ready, but the intake held for it could not be reopened (shutdown.py clear-if: ${py:+exit }${py:+$rc}${py:-no Python}) — keeping $held; not accepting the seat." >&2
+         return 1 ;;
+    esac
   fi
   rm -f "$held"
 }
