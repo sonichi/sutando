@@ -48,17 +48,39 @@ if [ -f "$REPO/.env" ]; then
   unset _codex_reset_was_set _codex_reset_ambient
 fi
 
-# `--runtime <name>` names the runtime for THIS launch (leading arg only). A
-# caller that recorded one must not get the core's config substituted for it.
+# `--runtime <name>` (or `--runtime=<name>`) names the runtime for THIS launch,
+# wherever it appears: graceful-restart.sh relays its args after `--restart`, so
+# a leading-only parse silently dropped the switch. A caller that recorded one
+# must not get the core's config substituted for it.
 requested_runtime=""
-if [ "${1:-}" = "--runtime" ]; then
-  requested_runtime="${2:-}"
-  if [ -z "$requested_runtime" ]; then
-    echo "start-cli: --runtime needs a value" >&2
-    exit 2
-  fi
-  shift 2
-fi
+_rest=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --runtime)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "start-cli: --runtime needs a value" >&2
+        exit 2
+      fi
+      requested_runtime="$2"
+      shift 2
+      ;;
+    --runtime=*)
+      requested_runtime="${1#--runtime=}"
+      if [ -z "$requested_runtime" ]; then
+        echo "start-cli: --runtime needs a value" >&2
+        exit 2
+      fi
+      shift
+      ;;
+    *)
+      _rest+=("$1")
+      shift
+      ;;
+  esac
+done
+# The `+` guard keeps an empty array valid under `set -u` on bash 3.2.
+set -- ${_rest[@]+"${_rest[@]}"}
+unset _rest
 
 if [ -n "$requested_runtime" ]; then
   runtime="$requested_runtime"
