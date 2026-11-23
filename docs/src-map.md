@@ -72,9 +72,11 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`conversation-log-store.ts`** — The voice session's conversation log (conversation.log + the sqlite mirror) as a bodhi ConversationHistoryStore, written like bodhi's own Markdown store: bodhi's history writer calls it asynchronously after each turn, it appends the spoken lines without blocking (fs/promises, sqlite in a worker) on its own serial queue, and a failed write is logged, never thrown.
 - **`conversation-store-migrations.ts`** — Startup-only SQLite migration policy for the conversation store.
 - **`conversation-store.ts`** — SQLite mirror of conversation.log — per-surface tables.
+- **`core-block-hook.sh`** — Hook for Claude Code and Codex: record whether the core is blocked on a dialog (src/core_block_signal.py).
 - **`core-input-watch.py`** — core-input-watch.py — the core supervisor MONITOR (M1).
 - **`core-supervisor-gate.py`** — core-supervisor-gate.py — the RECOVER decision gate (sonichi#2401 prototype).
 - **`core-supervisor-relay.py`** — core-supervisor-relay.py — the COMMUNICATOR (outbound ESCALATE).
+- **`core_block_signal.py`** — The core CLI's own word on whether it is blocked on the owner, from its hook events.
 - **`core_crash_loop.py`** — core_crash_loop.py — a crash loop reaches the owner as one card per incident.
 - **`core_gate_notice.py`** — Tell each task waiting behind a blocked core why it is on hold.
 - **`core_heartbeat.py`** — Per-host heartbeat for sutando-core sessions.

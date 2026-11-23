@@ -130,4 +130,6 @@ seat_core_overrides() {
   }
   ensure_task_notifier() { seat_end_helper_sessions; }
   ensure_codex_observer() { :; }
+  # The supervisor's block hooks read a TUI pane, and the seat draws none.
+  add_codex_block_hooks() { :; }
 }

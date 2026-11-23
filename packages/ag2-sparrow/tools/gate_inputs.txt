@@ -1,0 +1,27 @@
+# Repo paths outside sync_from_src.MAP whose change must run the ag2-sparrow publish gate on a PR.
+# fnmatch globs (`*` crosses `/`), one per line; read by gate_reach.py.
+# tests/sparrow-gate-inputs-cover-package-loads.test.py fails when a package test loads an uncovered file.
+
+# The package and the gate's own machinery.
+packages/ag2-sparrow/*
+.github/workflows/ci.yml
+scripts/parallel-suite-lane.sh
+scripts/shard-by-cost.sh
+tests/sparrow-suite-costs.txt
+.coveragerc
+
+# Shared test helpers and fixtures the package suites import or read.
+tests/_helpers/*
+tests/fixtures/*
+
+# Repo files individual package suites load (the scan finds these; keep it green).
+docs/design-holder-lock.md
+skills/agent-room-ops/room_ops.py
+src/remote-gateway-bridge.test.py
+src/runtime-api/server.py
+src/task_envelope.py
+tests/ag2-sparrow-claude-local-bridge.test.py
+tests/ag2-sparrow-claude-local-wheel.test.py
+tests/ag2-sparrow-tmux-vendored.test.py
+tests/hitl-schema.test.py
+tests/holder-lock.test.py

@@ -496,8 +496,6 @@ _SH_ASSIGN = re.compile(r"^\s*(?:local\s+|export\s+|readonly\s+)?([A-Za-z_]\w*)=
 _TS_ASSIGN = re.compile(r"\b(?:const|let|var)\s+(\w+)\s*(?::[^=;]+)?=\s*([^;]+);")
 _TS_WRITE = re.compile(r"\b(?:writeFileSync|appendFileSync|writeFile|createWriteStream)\(\s*([^,)]+)")
 _TS_RESULTS = re.compile(r"""['"`]results['"`/]|/results/|\bRESULTS?_DIR\b|\bresultsDir\b|\bresultDir\b""")
-# Not result bodies a drain delivers: a smoke test's backdated fixture.
-_SCAN_EXEMPT = {"skills/self-diagnose/scripts/test-gather.sh"}
 
 
 def shell_results_writes(text: str) -> list:
@@ -531,7 +529,7 @@ def scan_results_writes(root: Path = REPO) -> list:
     for top in ("src", "skills", "scripts"):
         for p in sorted((root / top).rglob("*")):
             rel = p.relative_to(root).as_posix()
-            if not p.is_file() or "node_modules" in p.parts or ".test." in p.name or rel in _SCAN_EXEMPT:
+            if not p.is_file() or "node_modules" in p.parts or ".test." in p.name:
                 continue
             if p.suffix in (".sh", ".bash"):
                 found = shell_results_writes(p.read_text(encoding="utf-8", errors="replace"))

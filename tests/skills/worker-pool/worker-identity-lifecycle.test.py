@@ -3,6 +3,7 @@
 
 - `create_worker.py` starts the identity step by default, as `pool_identity.py add <worker>
   --device-flow --label <label>` in the background, and returns once the owner was sent the link.
+  Once approved, the worker is on its agent's own folders before its lane starts.
   `--no-identity` (or WORKER_POOL_IDENTITY_ON_CREATE=0) skips it, and a step that cannot start
   still creates the worker, which answers through the core.
 - The label is the worker's name as a device-connect label, made unique against the agents this
@@ -15,6 +16,14 @@ The device-connect server is the in-process fake from pool-device-connect.test.p
 Run: python3 tests/skills/worker-pool/worker-identity-lifecycle.test.py
 """
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
 
 import contextlib
 import importlib.util
@@ -107,7 +116,9 @@ class Base(D.Base):
             kw.update(request=fake.request, preview=self.preview, deliver=self.sent.append, vault=self.vault,
                       sleep=sleep, clock=self.backend.clock)
             return real(worker, **kw)
+        import worker_lane
         patches = [unittest.mock.patch.object(dc, "connect", wired),
+                   unittest.mock.patch.object(worker_lane, "handler_lookup", lambda ws: ("", "")),
                    unittest.mock.patch.object(C, "start_added", lambda row, **kw: {"ok": True}),
                    unittest.mock.patch.object(pool_manage, "reseat", lambda ws, repo, wid, **kw: {"result": "skipped"})]
         for p in patches:
@@ -140,6 +151,7 @@ class ByDefault(Base):
                                      str(self.ws), "add", wid, "--device-flow", "--label"])
         self.assertEqual(argv[8], "code-reviewer")
         self.assertIn("--display-name", argv)
+        self.assertNotIn("--shared-dirs", argv)
         rec = dc.read_record(self.ws, wid)
         self.assertEqual(rec["state"], "pending", "creation returned while the approval was still open")
         until = time.strftime("%H:%M", time.localtime(rec["expires_at"]))
@@ -154,6 +166,9 @@ class ByDefault(Base):
         self.assertEqual(self.child_rc, 0)
         self.assertEqual(C.worker_identity(wid, self.ws)["agent_mxid"], NEW_AGENT)
         self.assertEqual(self.fake.started[0]["label"], "code-reviewer")
+        root = C.worker_root(NEW_AGENT, self.ws)
+        self.assertEqual(C.worker_dirs(wid, self.ws), (root / "tasks", root / "results"))
+        self.assertEqual(sw.inbox_env(self.ws, wid)["SUTANDO_TASKS_DIR"], str(root / "tasks"))
 
     def test_json_output_carries_the_identity_status(self):
         def child(argv, log):
@@ -180,6 +195,8 @@ class OptOut(Base):
         self.assertEqual((rc, self.identity_argvs), (0, []))
         self.assertEqual(self.identity_line(text), "identity  skipped (--no-identity)")
         self.assertEqual(dc.read_record(self.ws, self.made[0]), {})
+        self.assertIsNone(C.worker_dirs(self.made[0], self.ws))
+        self.assertEqual(sw.inbox_env(self.ws, self.made[0])["SUTANDO_INBOX_KIND"], "deliveries")
 
     def test_the_manifest_key_turned_off_in_the_env_skips_it(self):
         with unittest.mock.patch.dict("os.environ", {pir.FLAG: "0"}):
