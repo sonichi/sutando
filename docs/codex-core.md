@@ -598,14 +598,25 @@ toggle on the Sutando core's settings row, which restarts the core for you. The 
 the desktop's `runtime.json` (`codexAppServer`) on a desktop install, else in
 `core.codex_app_server` of `<workspace>/sutando.config.local.json`;
 `bash scripts/sutando-config.sh codex-app-server` prints the resolved `1` or `0`.
+`codex-app-server-select` prints `updated` when it wrote the key and `unchanged` when the stored key
+already held that value. It compares the stored key, not the resolved value: on an install with
+nothing stored, `select on` writes the key and prints `updated` even though the default was on.
+Engine writers of `runtime.json` take one cross-process lock (`runtime.json.lock`) around each
+read-merge-replace; the desktop's own writer must take the same lock file to be serialized with them.
 Nothing recorded means on. `SUTANDO_CODEX_APP_SERVER` set non-empty overrides the choice for one
 launch (`1` on, anything else off): `SUTANDO_CODEX_APP_SERVER=0 bash src/agent/start-cli.sh --restart`
 starts the TUI once.
 
 Turned off, the next restart replaces the seat's window with the TUI and brings the notifier
 and observer sessions back. A pool worker reads the same choice, through the same resolver, when
-it is spawned, unless the environment of the process that spawns it sets the variable (a seat
-core passes `1` to what it spawns, so its workers are seats too).
+it is spawned, unless the environment of the process that spawns it sets the variable. A seat's
+session is marked `SUTANDO_CODEX_SEAT=1`, not with the variable, so a worker spawned by a running
+seat core follows the choice saved since, not the mode the core started in.
+
+A seat reopens task intake (clears the shutdown sentinel) only once `seat.py` reports ready, its
+app-server initialized and its thread open (`state/codex-seat/<session>/ready`). If that does not
+happen within `SUTANDO_SEAT_READY_TIMEOUT` seconds (60), or the seat exits first, the launch fails
+and intake stays shut.
 
 ## Rollback
 

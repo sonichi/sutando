@@ -122,16 +122,21 @@ fi
 # Unset for this launch, the core's persisted choice decides, through the same resolver
 # (scripts/sutando-config.sh codex-app-server): on by default, off when set off. When it cannot be
 # read, or the seat's files are missing, the worker is a TUI, as before.
-if [ -z "${SUTANDO_CODEX_APP_SERVER:-}" ]; then
-  if [ -f "$REPO/src/agent/codex/app-server/seat-launch.sh" ] \
-     && [ "$(bash "$REPO/scripts/sutando-config.sh" codex-app-server 2>/dev/null)" = 1 ]; then
-    # Not exported: the seat gets it with -e, and a tmux server started here must not keep it.
-    SUTANDO_CODEX_APP_SERVER=1
-  fi
-fi
-# SUTANDO_CODEX_APP_SERVER=1: the worker is a seat on `codex app-server` in the same session name,
+# CODEX_SEAT_ON is this launch's resolved mode, never exported; a spawning seat passes no mode, so
+# a choice saved while it runs decides. SUTANDO_CODEX_APP_SERVER stays the caller's override only.
+unset CODEX_SEAT_ON
+CODEX_SEAT_ON=""
+case "${SUTANDO_CODEX_APP_SERVER:-}" in
+  1) CODEX_SEAT_ON=1 ;;
+  "")
+    if [ -f "$REPO/src/agent/codex/app-server/seat-launch.sh" ] \
+       && [ "$(bash "$REPO/scripts/sutando-config.sh" codex-app-server 2>/dev/null)" = 1 ]; then
+      CODEX_SEAT_ON=1
+    fi ;;
+esac
+# CODEX_SEAT_ON=1: the worker is a seat on `codex app-server` in the same session name,
 # with no observer and no notifier session; it takes its deliveries itself. Unset: as before.
-if [ "${SUTANDO_CODEX_APP_SERVER:-}" = 1 ]; then
+if [ "$CODEX_SEAT_ON" = 1 ]; then
   . "$REPO/src/agent/codex/app-server/seat-launch.sh"
   seat_translate_args "${CODEX_ARGS[@]}"
   seat_state="$(seat_state_dir "$SUTANDO_WORKSPACE_DIR" "$SESSION")"
@@ -144,7 +149,7 @@ if [ "${SUTANDO_CODEX_APP_SERVER:-}" = 1 ]; then
     echo "launch-codex-worker-session: could not write the seat's host declaration; not starting $SESSION" >&2
     exit 1
   fi
-  tmux -S "$SOCKET" new-session -d -s "$SESSION" "${ENV_ARGS[@]}" -e SUTANDO_CODEX_APP_SERVER=1 \
+  tmux -S "$SOCKET" new-session -d -s "$SESSION" "${ENV_ARGS[@]}" -e SUTANDO_CODEX_SEAT=1 \
     -e SUTANDO_STANDBY_MODE=type -e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}" \
     -e "SUTANDO_WATCHER_BEAT=$REPO/skills/worker-pool/scripts/pool_beat.py" \
     "$SEAT_CLI" --host "$seat_state/host.json" --workspace "$SUTANDO_WORKSPACE_DIR" --seat "$SESSION" \

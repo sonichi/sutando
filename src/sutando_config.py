@@ -36,6 +36,7 @@ schema.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -724,30 +725,40 @@ def persist_desktop_runtime_selection(runtime: str, repo_root: Optional[Path] = 
     path = desktop_runtime_selection_path(repo_root)
     if path is None or not path.parent.is_dir():
         return "no-desktop"
-    try:
-        body = json.loads(path.read_text())
-    except FileNotFoundError:
-        body = {}
-    except (OSError, ValueError) as exc:
-        raise ValueError(f"cannot read {path}: {exc}") from exc
-    if not isinstance(body, dict):
-        raise ValueError(f"{path} is not a JSON object")
-    if body.get("coreRuntime") == runtime:
-        return "unchanged"
-    if check:
-        return "would-update"
-    body["coreRuntime"] = runtime
-    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
-    try:
-        with open(tmp, "w") as f:
-            f.write(json.dumps(body, indent=2) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-    return "updated"
+
+    def mutate(body: Dict[str, Any]) -> bool:
+        if body.get("coreRuntime") == runtime:
+            return False
+        body["coreRuntime"] = runtime
+        return True
+
+    return update_desktop_runtime_json(path, mutate, check=check)
+
+
+@contextlib.contextmanager
+def _runtime_json_lock(path: Path):
+    """Exclusive flock on ``<runtime.json>.lock``, held across one read-merge-replace."""
+    import fcntl
+    with open(path.with_name(path.name + ".lock"), "a") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+
+
+def update_desktop_runtime_json(path: Path, mutate, check: bool = False) -> str:
+    """The engine's one writer of the desktop's ``runtime.json``: read, ``mutate(body)`` (True when
+    it changed something), atomic replace, all under one cross-process lock, so two engine
+    writers never drop each other's keys. Returns ``"updated"``, ``"unchanged"`` or, with
+    ``check``, ``"would-update"`` (nothing written). A file that is not a JSON object is refused.
+    The desktop's own writer (``core_runtime.rs`` ``update_runtime_json``) has to take the same
+    lock file for the desktop/engine pair to be serialized too."""
+    with _runtime_json_lock(path):
+        body = _read_json_object(path)
+        if not mutate(body):
+            return "unchanged"
+        if check:
+            return "would-update"
+        _replace_json_atomically(path, body)
+        return "updated"
 
 
 def resolve_core_runtime(repo_root: Optional[Path] = None) -> str:
@@ -847,19 +858,22 @@ def persist_codex_app_server(enabled: bool, repo_root: Optional[Path] = None) ->
     On a desktop install that is ``codexAppServer`` in the desktop's ``runtime.json`` (the
     app's toggle writes the same key), else ``core.codex_app_server`` in
     ``<workspace>/sutando.config.local.json``. Every other key survives and the file is
-    replaced atomically. Returns (``"updated"``|``"unchanged"``, the file). It takes effect
+    replaced atomically. Returns (``"updated"``|``"unchanged"``, the file): ``unchanged`` means
+    the stored key already held that value, not that the resolved value matched, so a
+    default-on install with no key reports ``updated`` for ``on``. It takes effect
     on the next launch; a running core keeps its mode until restarted.
     """
     if not isinstance(enabled, bool):
         raise ValueError(f"codex app-server choice must be a boolean, got {enabled!r}")
     desktop = desktop_runtime_selection_path(repo_root)
     if desktop is not None and desktop.parent.is_dir():
-        body = _read_json_object(desktop)
-        if body.get("codexAppServer") is enabled:
-            return "unchanged", desktop
-        body["codexAppServer"] = enabled
-        _replace_json_atomically(desktop, body)
-        return "updated", desktop
+        def mutate(body: Dict[str, Any]) -> bool:
+            if body.get("codexAppServer") is enabled:
+                return False
+            body["codexAppServer"] = enabled
+            return True
+
+        return update_desktop_runtime_json(desktop, mutate), desktop
     root = repo_root or _find_repo_root()
     if root is None:
         raise ValueError("no Sutando checkout found to resolve the workspace")

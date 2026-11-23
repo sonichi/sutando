@@ -90,6 +90,24 @@ class Resolve(Base):
 
 
 class Persist(Base):
+    def test_engine_runtime_json_writers_share_one_cross_process_lock(self):
+        # Another process holding <runtime.json>.lock keeps this writer from its read-merge-replace.
+        import subprocess as sp
+        import time as _t
+        self.runtime_json.write_text(json.dumps({"coreRuntime": "codex"}))
+        lock = self.runtime_json.with_name(self.runtime_json.name + ".lock")
+        holder = sp.Popen([sys.executable, "-c",
+                           "import fcntl,sys,time;f=open(sys.argv[1],'a');fcntl.flock(f,fcntl.LOCK_EX);"
+                           "print('held',flush=True);time.sleep(1.0)", str(lock)], stdout=sp.PIPE, text=True)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        started = _t.monotonic()
+        self.assertEqual(sutando_config.persist_codex_app_server(False, self.repo)[0], "updated")
+        self.assertGreater(_t.monotonic() - started, 0.5, "the write waited for the lock")
+        holder.wait(timeout=10)
+        self.assertEqual(sutando_config.persist_desktop_runtime_selection("claude", self.repo), "updated")
+        self.assertEqual(json.loads(self.runtime_json.read_text()), {"coreRuntime": "claude", "codexAppServer": False},
+                         "each writer kept the other's key")
+
     def test_a_desktop_install_writes_runtime_json_and_keeps_its_other_keys(self):
         self.runtime_json.write_text(json.dumps({"coreRuntime": "codex", "corePath": "/x"}))
         outcome, path = sutando_config.persist_codex_app_server(True, self.repo)
@@ -181,7 +199,7 @@ class Edges(Base):
             with self.assertRaises(OSError):
                 sutando_config.persist_codex_app_server(True, self.repo)
         self.assertEqual(json.loads(self.runtime_json.read_text()), {"coreRuntime": "codex"})
-        self.assertEqual(sorted(p.name for p in self.runtime_json.parent.iterdir()), ["engine", "runtime.json"])
+        self.assertEqual(sorted(p.name for p in self.runtime_json.parent.iterdir()), ["engine", "runtime.json", "runtime.json.lock"])
 
 class Cli(unittest.TestCase):
     """The subcommands in a copied checkout, with no desktop: the workspace layer."""
@@ -209,6 +227,14 @@ class Cli(unittest.TestCase):
     def cli(self, *args, **env):
         return subprocess.run(["bash", str(self.root / "scripts/sutando-config.sh"), *args],
                               capture_output=True, text=True, env={**self.env, **env}, timeout=60)
+
+    def test_on_with_no_key_stored_is_updated_though_the_default_was_already_on(self):
+        # `unchanged` means the stored key already held the value, not that the resolved one matched.
+        self.assertEqual(self.cli("codex-app-server").stdout, "1", "on by default, nothing stored")
+        r = self.cli("codex-app-server-select", "on")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(r.stdout.startswith("updated "), r.stdout)
+        self.assertTrue(self.cli("codex-app-server-select", "on").stdout.startswith("unchanged "))
 
     def test_get_select_get(self):
         self.assertEqual(self.cli("codex-app-server").stdout, "1", "on by default")

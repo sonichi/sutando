@@ -7,6 +7,7 @@ SEAT_CLI="$REPO/src/agent/codex/app-server/$SEAT_NAME"
 SEAT_PY="$REPO/src/agent/codex/app-server/seat.py"
 SEAT_ARGS=()
 SEAT_ENV_ARGS=()
+SEAT_READY=""
 
 # seat_translate_args <the TUI's codex args>...: the same launch as seat.py flags, in SEAT_ARGS.
 # Every `-c key=value` is passed on to `codex app-server`; `--search` is config there, not a flag.
@@ -41,13 +42,14 @@ seat_core_prepare() {
   tasks="${tasks/#\~/$HOME}"
   results="${SUTANDO_RESULTS_DIR:-$ws/results}"
   state="$(seat_state_dir "$ws" "$SESSION")"
+  SEAT_READY="$state/ready"
   "$py" "$SEAT_PY" declare --out "$state/host.json" --inbox "$tasks" --results "$results" \
     --state "$state" --cwd "$WORKING_DIR" || return 1
   seat_translate_args "${CODEX_ARGS[@]}"
   SEAT_ARGS=(--host "$state/host.json" --workspace "$ws" --seat "$SESSION" --codex "$codex_bin"
              --log "$ws/logs/codex-seat.log" "${SEAT_ARGS[@]}")
   # The seat's standby watcher reads what the notifier session's watcher reads today.
-  SEAT_ENV_ARGS=(-e SUTANDO_CODEX_APP_SERVER=1 -e "SUTANDO_PY=$py" -e "PATH=$PATH"
+  SEAT_ENV_ARGS=(-e SUTANDO_CODEX_SEAT=1 -e "SUTANDO_PY=$py" -e "PATH=$PATH"
                  -e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION"
                  -e SUTANDO_STANDBY_MODE=type -e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}")
   local forwarded
@@ -67,12 +69,30 @@ seat_end_helper_sessions() {
   return 0
 }
 
+# seat_wait_ready: until the seat reports its app-server and thread up (seat.py writes $SEAT_READY),
+# its session ends, or SUTANDO_SEAT_READY_TIMEOUT seconds (60) pass. Intake stays shut on failure.
+seat_wait_ready() {
+  local limit="${SUTANDO_SEAT_READY_TIMEOUT:-60}" i=0
+  case "$limit" in ''|*[!0-9]*) limit=60 ;; esac
+  while [ "$i" -lt $(( limit * 5 )) ]; do
+    [ -f "$SEAT_READY" ] && return 0
+    session_exists "$SESSION" || break
+    sleep 0.2
+    i=$(( i + 1 ))
+  done
+  [ -f "$SEAT_READY" ] && return 0
+  echo "  ⚠ the Codex app-server seat did not report ready (see logs/codex-seat.log) — sentinel NOT cleared, no core is serving." >&2
+  return 1
+}
+
 seat_start_core_session_and_helpers() {
   seat_core_prepare || return 1
   prepare_codex_home
+  rm -f "$SEAT_READY"
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" "${SEAT_ENV_ARGS[@]}" \
     "$SEAT_CLI" "${SEAT_ARGS[@]}"
   wait_core_up "$SESSION" session_exists "$SESSION" || return 1
+  seat_wait_ready || return 1
   log_session_start
   record_confirmed_core_runtime codex "$(heartbeat_python)"
   clear_shutdown_sentinel
@@ -94,6 +114,7 @@ seat_heal_core_window() {
     tmux -S "$TMUX_SOCKET" kill-window -t "$_win" 2>/dev/null || true
   done
   prepare_codex_home
+  rm -f "$SEAT_READY"
   if ! idx="$(sutando_new_core_window "$TMUX_SOCKET" "$SESSION" "${CORE_ENV_ARGS[@]}" "${SEAT_ENV_ARGS[@]}" -c "$REPO" "$SEAT_CLI" "${SEAT_ARGS[@]}")" \
      || [ -z "$idx" ]; then
     echo "  ⚠ could not create a seat window in $SESSION — sentinel NOT cleared, no core is serving." >&2
@@ -106,6 +127,7 @@ seat_heal_core_window() {
   tmux -S "$TMUX_SOCKET" select-window -t "=$SESSION:$idx" 2>/dev/null || true
   tmux -S "$TMUX_SOCKET" set-environment -t "=$SESSION" SUTANDO_CORE_RUNTIME codex 2>/dev/null || true
   wait_core_up "the healed seat window" codex_core_live || return 1
+  seat_wait_ready || return 1
   log_session_start
   record_confirmed_core_runtime codex "$(heartbeat_python)"
   clear_shutdown_sentinel

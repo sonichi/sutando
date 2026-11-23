@@ -272,8 +272,8 @@ print('1' if resolve_codex_app_server() else '0', end='')
     ;;
 
   codex-app-server-select)
-    # Persist the app-server choice for every later launch. Prints updated|unchanged and the
-    # file written; nonzero when unwritable. A running core keeps its mode until --restart.
+    # Persist the app-server choice for every later launch. Prints updated|unchanged (the stored key
+    # already held it, whatever the default) and the file; nonzero when unwritable. Takes effect at --restart.
     case "${2:-}" in
       on) _cas=True ;;
       off) _cas=False ;;

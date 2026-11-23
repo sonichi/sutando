@@ -578,22 +578,27 @@ ensure_local_agent_api
 # `sutando-config.sh codex-app-server-select off` or core.codex_app_server=false says so. A set
 # value overrides it. Without tmux, without the seat's files, or when the choice cannot be read,
 # the TUI runs as before.
-if [ -z "${SUTANDO_CODEX_APP_SERVER:-}" ]; then
-  if tmux_available && [ -f "$REPO/src/agent/codex/app-server/seat-launch.sh" ] \
-     && [ "$(bash "$REPO/scripts/sutando-config.sh" codex-app-server 2>/dev/null)" = 1 ]; then
-    # Not exported: the seat gets it with -e, and a tmux server started here must not keep it.
-    SUTANDO_CODEX_APP_SERVER=1
-  fi
-fi
+# CODEX_SEAT_ON is this launch's resolved mode, never exported (unset first drops an inherited
+# export); SUTANDO_CODEX_APP_SERVER stays the caller's override only and is never assigned here.
+unset CODEX_SEAT_ON
+CODEX_SEAT_ON=""
+case "${SUTANDO_CODEX_APP_SERVER:-}" in
+  1) CODEX_SEAT_ON=1 ;;
+  "")
+    if tmux_available && [ -f "$REPO/src/agent/codex/app-server/seat-launch.sh" ] \
+       && [ "$(bash "$REPO/scripts/sutando-config.sh" codex-app-server 2>/dev/null)" = 1 ]; then
+      CODEX_SEAT_ON=1
+    fi ;;
+esac
 # A core last started as an app-server seat (its declaration exists): --restart replaces that
-# window too, whichever way SUTANDO_CODEX_APP_SERVER is set now.
+# window too, whichever mode this launch resolved.
 if [ "${1:-}" = "--restart" ] && tmux_available; then
   _seat_ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || _seat_ws=""
   if [ -n "$_seat_ws" ] && [ -f "$_seat_ws/state/codex-seat/$SESSION/host.json" ]; then
     for _win in $(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" all codex-seat 2>/dev/null); do
       tmux -S "$TMUX_SOCKET" kill-window -t "$_win" 2>/dev/null || true
     done
-    [ "${SUTANDO_CODEX_APP_SERVER:-}" = 1 ] || rm -f "$_seat_ws/state/codex-seat/$SESSION/host.json"
+    [ "$CODEX_SEAT_ON" = 1 ] || rm -f "$_seat_ws/state/codex-seat/$SESSION/host.json"
   fi
 fi
 # <<< codex-app-server-seat
@@ -640,10 +645,10 @@ codex_core_missing() {
 }
 
 # >>> codex-app-server-seat
-# SUTANDO_CODEX_APP_SERVER=1: the core is a seat on `codex app-server` (docs/codex-core.md), with
+# CODEX_SEAT_ON=1: the core is a seat on `codex app-server` (docs/codex-core.md), with
 # no notifier or observer session beside it. Unset, nothing below this block changes.
 SEAT_MODE=""
-if [ "${SUTANDO_CODEX_APP_SERVER:-}" = 1 ]; then
+if [ "$CODEX_SEAT_ON" = 1 ]; then
   SEAT_MODE=1
   . "$REPO/src/agent/codex/app-server/seat-launch.sh"
   seat_core_overrides
