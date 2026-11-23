@@ -142,9 +142,9 @@ _SKIP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # `*` not `+`: `[deduped:]` and `[deduped: ]` differ only by a space and
     # must parse alike, or one is audited and the other ships its own marker.
     (re.compile(r"^\s*\[deduped:\s*([^\]]*)\]\s*", re.IGNORECASE), "deduped"),
-    # A body that is only a connector card's mark ([model-card], [account-card]) asks the connector for
-    # that card. Written as a result by the runtime itself, it is closed silently, never posted as text.
-    (re.compile(r"^\s*\[[a-z]+(?:-[a-z]+)*-card\]\s*\Z"), "no-send"),
+    # A body that is only one of the two connector card marks asks the connector for that card. Written as
+    # a result by the runtime itself, it is closed silently. Any other bracketed word is an ordinary reply.
+    (re.compile(r"^\s*\[(?:model|account)-card\]\s*\Z"), "no-send"),
 ]
 
 # Redirect marker — Discord channel IDs are 17-20 digits; Slack channel IDs

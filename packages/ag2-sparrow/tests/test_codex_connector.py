@@ -876,7 +876,9 @@ class ModelCardTest(CardWorld, unittest.TestCase):
             parsed = result_markers.parse_markers(mark)
             self.assertEqual(([a.kind for a in parsed.actions], parsed.body), (["skip"], ""), mark)
             self.assertTrue(result_markers.has_skip_action(parsed.actions))
-        for prose in ("[model-card] is the mark", "use [model-card]", "[Model-Card]"):
+        # Only the two registered marks: any other bracketed word alone is someone's ordinary reply.
+        for prose in ("[model-card] is the mark", "use [model-card]", "[Model-Card]", "[birthday-card]", "[id-card]",
+                      "[card]", "[some-other-card]", "[model-card-card]"):
             self.assertFalse(result_markers.has_skip_action(result_markers.parse_markers(prose).actions), prose)
 
     def test_a_guests_turn_runs_on_the_owners_pick_and_its_outcome_goes_to_the_dm(self):
