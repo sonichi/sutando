@@ -7,14 +7,20 @@ agent's own room membership and grants.
 
     ag2-sparrow-mcp headers   # {"Authorization": "Bearer <access token>"}, for headersHelper
     ag2-sparrow-mcp setup     # the `claude mcp add-json` line that wires `headers` in
+    ag2-sparrow-mcp acp       # one ACP `McpServer` (http, with that header), for an ACP client
+    ag2-sparrow-mcp descriptor --env-file <the agent's .env>  # the stdio `ag2-mcp-proxy` descriptor for it
 
 `headers` mints on every run and caches nothing: Claude Code runs it at connect and
 again after a 401, so an expired token is replaced without the bearer touching disk.
+`acp` is the same discovery and mint, printed as the HTTP `McpServer` an ACP client puts in
+`session/new` (ACP carries headers, not a helper, so the Antigravity adapter runs it per turn).
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import shlex
 import sys
 import urllib.error
@@ -31,6 +37,25 @@ HTTP_TIMEOUT_S = 3
 USER_AGENT = "sutando-gateway-client/1.0"
 SERVER_NAME = "ag2-space"
 _LOOPBACK = {"localhost", "127.0.0.1", "::1"}
+# The tools a per-tool permission policy (the Antigravity adapter's) grants: rooms, Commons Actions, tasks.
+# Never: agent link/unlink, setup steps, relay-token issuance, events, Space-level execution, ui.*.
+OWNER_TOOLS = frozenset({
+    "ag2.whoami", "room.list", "room.inspect", "room.actions.search", "room.actions.describe",
+    "room.action.read", "room.action.execute", "room.action.execute_safe", "room.task.list",
+    "room.task.create", "room.task.update", "operation.inspect", "approval.inspect", "space.action.read"})
+
+
+def _tool_key(name: str) -> str:
+    # A client may report a dotted MCP tool name with its dots as underscores (room_action_execute).
+    return name.replace("_", ".")
+
+
+_OWNER_TOOL_KEYS = frozenset(_tool_key(t) for t in OWNER_TOOLS)
+
+
+def owner_tool_ok(server: str, tool: str) -> bool:
+    """True for one of OWNER_TOOLS on the server this module names (SERVER_NAME), compared exactly."""
+    return server == SERVER_NAME and _tool_key(tool) in _OWNER_TOOL_KEYS
 
 Gateway = Tuple[str, str, str]  # (relay URL, bearer, the .env file that supplied it or "")
 
@@ -88,8 +113,24 @@ def _call(method: str, url: str, bearer: str, gateway_url: str = "") -> Tuple[in
     return status, body if isinstance(body, dict) else {}
 
 
+MINT_PATH = "/api/v1/mcp/agent-access-tokens"   # the bridge's AGENT_ACCESS_MINT_PATH (a test keeps them equal)
+
+
+def same_origin(url: str, base: str) -> bool:
+    """The bridge's `_same_origin` (a test keeps them equal), without importing the bridge: its import resolves a
+    token, and `descriptor` must read nothing but the file it is given."""
+    try:
+        u, b = urllib.parse.urlsplit(url), urllib.parse.urlsplit(base)
+        if not u.scheme or not u.hostname or u.scheme != b.scheme:
+            return False
+        default = {"https": 443, "http": 80}.get(u.scheme)
+        return u.hostname.lower() == (b.hostname or "").lower() and (u.port or default) == (b.port or default)
+    except ValueError:
+        return False
+
+
 def discover(relay_url: str, bearer: str) -> Tuple[str, str]:
-    from .remote_gateway_bridge import AGENT_ACCESS_MINT_PATH, _same_origin
+    AGENT_ACCESS_MINT_PATH, _same_origin = MINT_PATH, same_origin
     _safe_url("the relay URL", relay_url)  # the bearer goes to discovery first: same rule as mint_url
     status, body = _call("GET", relay_url.rstrip("/") + DISCOVERY_PATH, bearer, relay_url)
     if status != 200:
@@ -160,6 +201,62 @@ def setup_entry(gateway: Gateway, source_root: str = "") -> dict:
     return {"type": "http", "url": mcp_url, "headersHelper": _helper_command(env_file, source_root)}
 
 
+def acp_entry(gateway: Gateway) -> dict:
+    """The ACP `McpServer` (HttpMcpServer: type, name, url, headers as name/value pairs) for this agent:
+    the discovered MCP URL with a freshly minted access token. The relay token is not in it."""
+    url, bearer, _ = _require(gateway)
+    mint_url, mcp_url = discover(url, bearer)
+    return {"type": "http", "name": SERVER_NAME, "url": mcp_url,
+            "headers": [{"name": "Authorization", "value": f"Bearer {mint(mint_url, bearer)}"}]}
+
+
+def stdio_descriptor(env_path: str) -> dict:
+    """The non-secret descriptor the desktop's stdio `ag2-mcp-proxy` reads (AG2_MCP_DESCRIPTOR) for the agent's
+    own `.env` at `env_path`: that file and the key its token line has, the mint and MCP URLs discovered with that
+    very token, and `bearer_digest`, the sha256 of its secret the proxy checks a plain mint against (as the
+    desktop writes it). A seat .env (only a token-file pointer) gives the `token_format: "raw"` form instead:
+    `env_file` is the raw token file it names, `relay` that file's own relay half, and no `env_key`, so a proxy
+    without raw support fails loudly. Nothing else is read: a token in the environment, a vault or another file
+    is never the descriptor's, since the proxy mints from the file alone."""
+    if not env_path:
+        raise McpAuthError("descriptor needs --env-file, the agent's own .env")
+    from .bounded_file_read import read_private
+    from .gateway_credential_sources import plain_token, raw_token_line, seat_token_pointer
+    text, why = read_private(env_path)   # this user's, 0600, no symlink: it holds or names the credential
+    if text is None:
+        raise McpAuthError(f"{env_path} was refused ({why or 'missing'})")
+    key, url, bearer = plain_token(text)
+    if not key:
+        pointer = seat_token_pointer(env_path, text)
+        if not pointer:
+            raise McpAuthError(f"{env_path} has neither a REMOTE_TASK_TOKEN= line nor a seat's token-file pointer")
+        raw, why = read_private(pointer)   # the path as named, so a symlinked token file is refused
+        if raw is None:
+            raise McpAuthError(f"the seat's token file {pointer} was refused ({why or 'missing'})")
+        raw_path = os.path.realpath(pointer)
+        relay, secret = raw_token_line(raw)
+        if not relay or not secret.strip():
+            raise McpAuthError(f"the seat's token file {raw_path} holds no <relay_url>|<secret> line")
+        mint_url, mcp_url = discover(relay, secret)
+        return {"version": 1, "lane": "primary", "token_format": "raw", "env_file": raw_path, "mint_url": mint_url,
+                "mcp_url": mcp_url, "relay": relay,
+                "bearer_digest": hashlib.sha256(secret.strip().encode("utf-8")).hexdigest()}
+    if not url or not bearer:
+        raise McpAuthError(f"{env_path}'s token names no relay URL (<relay_url>|<secret>)")
+    mint_url, mcp_url = discover(url, bearer)
+    return {"version": 1, "lane": "primary", "env_file": env_path, "env_key": key, "mint_url": mint_url,
+            "mcp_url": mcp_url, "relay": url.rstrip("/"),
+            "bearer_digest": hashlib.sha256(bearer.strip().encode("utf-8")).hexdigest()}
+
+
+def seat_token_file(env_path: str) -> str:
+    """The realpath of the raw token file the seat .env at `env_path` names, '' when it names none."""
+    from .bounded_file_read import read_private
+    from .gateway_credential_sources import seat_token_path
+    text, _why = read_private(env_path)
+    return seat_token_path(env_path, text) if text is not None else ""
+
+
 def setup_lines(gateway: Gateway) -> list:
     _url, _bearer, env_file = _require(gateway)
     cfg = setup_entry(gateway)
@@ -173,12 +270,18 @@ def setup_lines(gateway: Gateway) -> list:
 
 def main(argv=None, resolve: Callable[[], Gateway] = resolve_gateway) -> int:
     parser = argparse.ArgumentParser(prog="ag2-sparrow-mcp", description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("headers", "setup"))
+    parser.add_argument("command", choices=("headers", "setup", "acp", "descriptor"))
+    parser.add_argument("--env-file", default="", help="descriptor: the agent's own .env the stdio proxy reads")
     args = parser.parse_args(argv)
     try:
+        if args.command == "descriptor":
+            print(json.dumps(stdio_descriptor(args.env_file)))
+            return 0
         gateway = resolve()
         if args.command == "headers":
             print(json.dumps(headers(gateway)))
+        elif args.command == "acp":
+            print(json.dumps(acp_entry(gateway)))
         else:
             print("\n".join(setup_lines(gateway)))
     except McpAuthError as exc:

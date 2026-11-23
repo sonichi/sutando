@@ -104,11 +104,39 @@ def entry_heading(question: str, now: float) -> str:
 
 
 def question_dict(ask_id: str, question: str, context: Optional[str], asked_at: float,
-                  default_action: Optional[str], reason: Optional[str], options, priority: str) -> dict:
+                  default_action: Optional[str], reason: Optional[str], options, priority: str,
+                  asked_by: Optional[str] = None) -> dict:
     """The outbox's `question` record; the store skill's Question dataclass reads the same keys."""
     return {"ask_id": ask_id, "question": question, "context": context, "asked_at": asked_at,
             "default_action": default_action, "reason": reason,
-            "options": [list(o) for o in options or ()], "priority": priority or "Medium"}
+            "options": [list(o) for o in options or ()], "priority": priority or "Medium",
+            "asked_by": asked_by}
+
+
+def published_name(ws: Path, name: str) -> str:
+    """`name` as this session publishes it: `result_publish`'s stamp, so a pool worker acting as its
+    own agent asks through its own lane; the core's session and any other worker keep `name`."""
+    from result_publish import worker_published_path  # noqa: PLC0415
+    return worker_published_path(Path(ws) / "results" / name, workspace=Path(ws)).name
+
+
+def asked_by(ws: Path, name: str) -> Optional[str]:
+    """The agent a question published under `name` is asked as; None for the core's own agent."""
+    try:
+        import connections  # noqa: PLC0415
+        return connections.proactive_author_agent(name, Path(ws))
+    except Exception:  # noqa: BLE001 — a missing asker never blocks the ask
+        return None
+
+
+def speaker(ws: Path, name: str, host: str) -> str:
+    """Who a question published under `name` comes from, as its text names it (the core, or the worker)."""
+    try:
+        import connections  # noqa: PLC0415
+        return connections.proactive_author_phrase(name, host, Path(ws))
+    except Exception:  # noqa: BLE001 — an unreadable name never blocks the ask
+        from proactive_routing import proactive_worker  # noqa: PLC0415
+        return f"a worker on {host}" if proactive_worker(name) else f"the {host} core"
 
 
 def queued_send(body: str):
@@ -202,6 +230,19 @@ def mark_pointer_sent(manager, card_id: str, token: str, now: float) -> None:
             manager.store.save(req)
 
 
+def pointer_target(manager, card_id: str, ws: Path, name: str) -> tuple:
+    """(results dir, file name) of a card's pointer: a worker's card points from that worker's own lane,
+    as its card was posted; any other from the shared results/."""
+    req = manager.get(card_id)
+    worker = (getattr(req, "subject", None) or {}).get("by_worker") if req is not None else None
+    if not isinstance(worker, str) or not worker:
+        return ws / "results", name
+    import connections  # noqa: PLC0415
+    from proactive_routing import stamp_worker  # noqa: PLC0415
+    own = connections.worker_dirs(worker, ws)
+    return (own[1] if own else ws / "results"), stamp_worker(name, worker)
+
+
 def send_card_pointers(questions, workspace: Path, now: Optional[float] = None, manager=None,
                        host: Optional[str] = None) -> list:
     """For each question whose card is live, has no post recorded and is older than
@@ -229,12 +270,12 @@ def send_card_pointers(questions, workspace: Path, now: Optional[float] = None, 
             token = claim_pointer(manager, c[0], now)
             if token is None:
                 continue
-            name = proactive_filename(f"{q.get('ask_id') or c[0]}-pointer", None)
+            results, name = pointer_target(manager, c[0], Path(workspace),
+                                           proactive_filename(f"{q.get('ask_id') or c[0]}-pointer", None))
             with manager.store.locked():  # re-checked and written as one step against the store
                 if _pointer_owed(manager, c[0], token) is None:
                     continue  # posted, settled or re-claimed since the claim: no pointer
-                write_proactive(Path(workspace) / "results", name, card_pointer_body(q.get("title", ""),
-                                                                                   host or host_label()))
+                write_proactive(results, name, card_pointer_body(q.get("title", ""), host or host_label()))
             mark_pointer_sent(manager, c[0], token, now)
             out.append((q.get("ask_id"), name))
         except Exception as e:  # noqa: BLE001
@@ -332,13 +373,15 @@ def destination_from_task(text: str, workspace: Optional[Path] = None) -> Destin
 
 
 def proactive_body(question: str, context: Optional[str], host: str,
-                   dest: Destination, link: Optional[str] = None, intro: Optional[str] = None):
+                   dest: Destination, link: Optional[str] = None, intro: Optional[str] = None,
+                   asker: Optional[str] = None):
     """(body, routed): routed is True when a `[channel:]` redirect leads the body.
     `link` is where the owner can also answer, when the store knows it; `intro` is one
-    extra paragraph the store adds the first time."""
+    extra paragraph the store adds the first time; `asker` names who asks (default the core)."""
     routed = dest.bridge in _ROOM_MARKER_BRIDGES and bool(dest.channel)
+    who = neutralize_markers(asker) if asker else f"the {host} core"
     lines = [f"[channel: {dest.channel}]" if routed else "[dm-only]",
-             f"Question for you from the {host} core — it needs your word:", "",
+             f"Question for you from {who} — it needs your word:", "",
              neutralize_markers(question).strip()]
     if context and context.strip():
         lines += ["", neutralize_markers(context).strip()]
@@ -409,16 +452,31 @@ def card_message(question: str, context: Optional[str], default_action: Optional
     return "\n\n".join(parts)
 
 
+def card_asker(ws: Path, ask_id: str, dest: Destination, host: str) -> tuple:
+    """(who, by_worker, asked_by) for a card this session asks: a pool worker acting as its own agent
+    asks as itself, so its lane posts the card in its own DM; the core's session asks as the core."""
+    from proactive_routing import proactive_worker  # noqa: PLC0415
+    name = published_name(ws, proactive_filename(ask_id, dest.bridge))
+    worker = proactive_worker(name) or ""
+    if not worker:
+        return "", "", None
+    return speaker(ws, name, host), worker, asked_by(ws, name)
+
+
 def build_card(ask_id: str, question: str, context: Optional[str], host: str,
                default_action: Optional[str], reason: Optional[str], options,
-               link: Optional[str] = None, intro: Optional[str] = None, room: str = ""):
-    """The question's card, built but not stored, with its id already allocated."""
+               link: Optional[str] = None, intro: Optional[str] = None, room: str = "",
+               who: str = "", by_worker: str = ""):
+    """The question's card, built but not stored, with its id already allocated. `by_worker` names the
+    pool worker whose own agent asks it; only that worker's lane posts it."""
     from hitl.cards import choice_request, new_id  # noqa: PLC0415
+    subject = {"ask_id": ask_id, "choices": card_consequences(default_action, options)}
+    if by_worker:
+        subject["by_worker"] = by_worker
     return choice_request(
         card_message(question, context, default_action, reason, options, link, intro),
-        card_actions(default_action, options), ask_id,
-        {"ask_id": ask_id, "choices": card_consequences(default_action, options)},
-        runtime=CARD_RUNTIME, title=f"Question from the {host} core",
+        card_actions(default_action, options), ask_id, subject,
+        runtime=CARD_RUNTIME, title=f"Question from {who or f'the {host} core'}",
         device={"id": f"{CARD_RUNTIME}:{ask_id}", "name": host}, req_id=new_id(), room=room)
 
 
@@ -477,8 +535,11 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
     card = None
     if wants_card(default_action, options) and card_reaches_owner(dest, ws):
         try:
+            who, by_worker, agent = card_asker(ws, ask_id, dest, host)
+            if by_worker:
+                out["question"]["asked_by"] = agent
             card = build_card(ask_id, question, context, host, default_action, reason, options, link, intro,
-                              card_room(dest))
+                              card_room(dest), who=who, by_worker=by_worker)
         except Exception as e:  # noqa: BLE001 — asked as text below
             out["card_error"] = f"{type(e).__name__}: {e}"
     if card is not None:
@@ -503,18 +564,30 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
     return out
 
 
-def _ask_by_text(out: dict, question, context, host, dest, link, intro) -> None:
-    body, routed = proactive_body(question, context, host, dest, link, intro)
+def _ask_by_text(out: dict, question, context, host, dest, link, intro, as_session: bool = True) -> None:
+    """`as_session` False keeps the core's name: a question first asked by the core's card stays the core's."""
+    ws, name, who, err = Path(out["workspace"]), None, None, None
+    try:
+        name = proactive_filename(out["ask_id"], dest.bridge)
+        if as_session:
+            name = published_name(ws, name)
+            out["question"]["asked_by"] = asked_by(ws, name)
+            who = speaker(ws, name, host)
+    except Exception as e:  # noqa: BLE001 — the question is still recorded
+        err = f"{type(e).__name__}: {e}"
+    body, routed = proactive_body(question, context, host, dest, link, intro, who)
     out["bridge"], out["channel"] = dest.bridge, dest.channel if routed else None
     out["where"] = (f"{dest.bridge} {dest.channel}" if routed else
                     f"{dest.bridge} owner-dm" if dest.bridge else "owner-dm (last-active bridge)")
     out["card"] = None
-    try:
-        name = proactive_filename(out["ask_id"], dest.bridge)
-        write_proactive(Path(out["workspace"]) / "results", name, body)
-        out["proactive_file"] = name
-    except Exception as e:  # noqa: BLE001 — the question is still recorded
-        out["send_error"] = f"{type(e).__name__}: {e}"
+    if err is None:
+        try:
+            write_proactive(ws / "results", name, body)
+            out["proactive_file"] = name
+        except Exception as e:  # noqa: BLE001 — the question is still recorded
+            err = f"{type(e).__name__}: {e}"
+    if err is not None:
+        out["send_error"] = err
     if out["proactive_file"]:
         out["sent_line"] = f"**Sent:** queued {out['where']} via {out['proactive_file']} at {_iso(time.time())}"
     else:
@@ -554,18 +627,19 @@ def create_card(out: dict, link: Optional[str] = None) -> str:
         return CARD_STORED
     out["card_outcome"] = CARD_NOT_STORED
     out["card_error"] = f"card {card.id} not stored ({err})"
-    card_to_text(out, dest, link, intro)
+    # A worker's card falls back to that worker's own text; the core's to the core's.
+    card_to_text(out, dest, link, intro, as_session=bool((card.subject or {}).get("by_worker")))
     return CARD_NOT_STORED
 
 
-def card_to_text(out: dict, dest, link, intro) -> None:
+def card_to_text(out: dict, dest, link, intro, as_session: bool = False) -> None:
     """The definite-failure fallback: the text goes first, to the question's own destination with
     its link; then the question is held again, flagged `redeliver`, naming that file, until its
     row carries the same record (the caller's rewrite, or the next reconcile's replay). A death
     before the hold leaves a record naming an absent card, which the reminder reads as due: text
     again, never silence."""
     q = out["question"]
-    _ask_by_text(out, q["question"], q.get("context"), out["host"], dest, link, intro)
+    _ask_by_text(out, q["question"], q.get("context"), out["host"], dest, link, intro, as_session=as_session)
     try:
         out["outbox"] = str(Outbox(Path(out["workspace"])).save(q, out["sent_line"], redeliver=True))
     except Exception as e:  # noqa: BLE001

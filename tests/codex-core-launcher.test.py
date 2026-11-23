@@ -127,6 +127,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/local_services.sh",
             "src/core_runtime_record.py",
             "src/codex_project_trust.py",
+            "src/core_block_signal.py",
             "src/codex_host_instructions.py",
             "src/codex_home.py",
             "src/agent/codex/codex-home.sh",
@@ -138,6 +139,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             # dies on import and the gate reads every pane as unreadable.
             "src/cli_wedge.py",
             "src/cli_wedge_patterns.py",
+            "src/pane_composer.py",
             "src/sutando_platform.py",
             "src/delivery/__init__.py",
             "src/delivery/worker-stage.sh",
@@ -382,7 +384,7 @@ exit 0
                 return
             time.sleep(0.01)
         self.fail(f"heartbeat stub pid {pid} did not exit")
-    def _notifier_version(self, handler="", stop=""):
+    def _notifier_version(self, handler="", stop="", mode="-mtype"):
         first = subprocess.check_output([
             "cksum",
             str(self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"),
@@ -400,7 +402,7 @@ exit 0
             check=True, text=False).stdout.decode().split()[0]
         stop_cksum = subprocess.run(["cksum"], input=stop.encode(), capture_output=True,
                                     check=True, text=False).stdout.decode().split()[0]
-        return f"{checksum[0]}-{checksum[1]}-h{handler_cksum}-s{stop_cksum}"
+        return f"{checksum[0]}-{checksum[1]}-h{handler_cksum}-s{stop_cksum}{mode}"
 
     def run_launcher(self, *args, env_extra=None, launcher="src/agent/start-cli.sh"):
         env = dict(os.environ)
@@ -750,6 +752,49 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         invocation = scheduler_log.read_text()
         self.assertIn("install --workspace", invocation)
         self.assertIn("--host-label test-host", invocation)
+    def _codex_with_app_server(self):
+        fake = REAL_REPO / "tests" / "fixtures" / "fake-codex-app-server.py"
+        self._write_exe("codex", '#!/bin/bash\n[ "${1:-}" = login ] && exit 0\n'
+                        f'[ "${{1:-}}" = app-server ] && exec "{sys.executable}" "{fake}" "$@"\nexit 0\n')
+
+    def _trust_writes(self):
+        log = self.root / "codex-home" / "writes.jsonl"
+        return [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
+
+    def test_block_signal_hooks_are_trusted_for_themselves_and_trust_is_never_bypassed(self):
+        self._codex_with_app_server()
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._tmux_calls()
+        self.assertNotIn("--dangerously-bypass-hook-trust", calls)
+        for ev in ("PermissionRequest", "PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop"):
+            self.assertIn(f"hooks.{ev}=", calls)
+        writes = self._trust_writes()
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(sorted(writes[0]["value"]), sorted(
+            f"/<session-flags>/config.toml:{ev}:0:0"
+            for ev in ("permission_request", "pre_tool_use", "post_tool_use", "user_prompt_submit", "stop")))
+        self.assertIn("SUTANDO_CODEX_BLOCK_HOOKS=0 to turn them off", result.stderr)
+
+    def test_block_signal_hooks_stay_off_when_codex_cannot_record_their_trust(self):
+        # The stock fake answers no app-server: untrusted hooks would wait at a review screen.
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._tmux_calls()
+        self.assertNotIn("--dangerously-bypass-hook-trust", calls)
+        self.assertNotIn("hooks.", calls)
+        self.assertIn("block-signal hooks off", result.stderr)
+
+    def test_block_signal_opt_out_keeps_codex_trust_untouched(self):
+        self._codex_with_app_server()
+        result = self.run_launcher(env_extra={"SUTANDO_CODEX_BLOCK_HOOKS": "0"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._tmux_calls()
+        self.assertNotIn("--dangerously-bypass-hook-trust", calls)
+        self.assertNotIn("hooks.", calls)
+        self.assertEqual(self._trust_writes(), [])
+        self.assertNotIn("block-signal hooks", result.stderr)
+
     def test_a_worker_instance_launch_is_refused_before_any_core_write(self):
         """The core entry point refuses a pool instance. Through the dispatcher's
         --runtime and directly, an instance launch touches none of the core's durable
@@ -1202,6 +1247,40 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         calls = self._tmux_calls()
         self.assertNotIn("kill-session -t =sutando-core-watcher", calls)
         self.assertNotIn("new-session -d -s sutando-core-watcher", calls)
+
+    def test_a_stale_global_alert_mode_never_reaches_the_codex_standby(self):
+        result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "codex", "SUTANDO_STANDBY_MODE": "alert"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        watcher = [l for l in self._tmux_calls().splitlines() if "new-session -d -s sutando-core-watcher" in l]
+        self.assertEqual(len(watcher), 1, self._tmux_calls())
+        self.assertIn("-e SUTANDO_STANDBY_MODE=type", watcher[0])
+        self.assertNotIn("SUTANDO_STANDBY_MODE=alert", watcher[0])
+
+    def test_the_alert_only_knobs_are_inert_on_the_codex_standby(self):
+        # A Codex core is pinned to "type", which never reads the alert knobs (pile-up included):
+        # they are neither forwarded nor in the identity, so setting them replaces nothing.
+        knobs = {"SUTANDO_NOTIFIER_ALERT_PILEUP": "5", "SUTANDO_NOTIFIER_ALERT_REPEAT": "60",
+                 "SUTANDO_NOTIFIER_ALERT_GRACE": "7"}
+        result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "codex", **knobs})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        watcher = [l for l in self._tmux_calls().splitlines() if "new-session -d -s sutando-core-watcher" in l]
+        self.assertEqual(len(watcher), 1, self._tmux_calls())
+        self.assertIn("-e SUTANDO_STANDBY_MODE=type", watcher[0])
+        self.assertNotIn("SUTANDO_NOTIFIER_ALERT_", watcher[0])
+        self.log.unlink()
+        result = self.run_launcher(env_extra={
+            "TMUX_ACTIVE_RUNTIME": "codex", "TMUX_WATCHER_EXISTS": "1",
+            "TMUX_ACTIVE_NOTIFIER_VERSION": self._notifier_version(), **knobs})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("kill-session -t =sutando-core-watcher", self._tmux_calls())
+
+    def test_a_watcher_from_before_the_mode_was_pinned_is_replaced(self):
+        result = self.run_launcher(env_extra={
+            "TMUX_ACTIVE_RUNTIME": "codex", "TMUX_WATCHER_EXISTS": "1",
+            "TMUX_ACTIVE_NOTIFIER_VERSION": self._notifier_version(mode="")})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("kill-session -t =sutando-core-watcher", self._tmux_calls())
+        self.assertIn("-e SUTANDO_STANDBY_MODE=type", self._tmux_calls())
 
     def test_turning_the_stop_interrupt_on_or_off_replaces_the_watcher(self):
         for running, wanted in (("", "1"), ("1", ""), ("1", "1")):
@@ -3029,9 +3108,11 @@ class CoreWindowRestartTests(unittest.TestCase):
         self.addCleanup(subprocess.run, [REAL_TMUX, "-S", self.sock, "kill-server"], capture_output=True)
         (self.case.bin / "tmux").unlink()
         (self.case.bin / "tmux").symlink_to(REAL_TMUX)
-        # A core that stays up like the real CLI; `login status` still succeeds.
+        # A core that stays up like the real CLI; `login status` still succeeds. It serves no
+        # app-server, so the launcher's hook-trust step fails at once instead of waiting it out.
         codex = self.case.bin / "codex"
-        codex.write_text('#!/bin/bash\n[ "${1:-}" = login ] && exit 0\nexec sleep 300\n')
+        codex.write_text('#!/bin/bash\n[ "${1:-}" = login ] && exit 0\n[ "${1:-}" = app-server ] && exit 1\n'
+                         'exec sleep 300\n')
         codex.chmod(0o755)
 
     def tmux(self, *args):

@@ -93,10 +93,8 @@ def sessions(workspace, probe=None) -> list:
             "availability_detail": detail,
             "live": availability == "exists",
         }
-        # `=` forces tmux to match the name exactly; without it a short id
-        # prefix-matches and attaches to a different worker.
         entry["attach_argv"] = (
-            ["tmux", "-S", socket, "attach-session", "-t", f"={name}"] if entry["live"] else None
+            spawn_worker.attach_argv(socket, name) if entry["live"] else None
         )
         rows.append(entry)
     return rows

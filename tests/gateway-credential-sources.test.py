@@ -626,6 +626,28 @@ class DiscoveryCases:
         self.assertEqual(self.o.first_env({"REMOTE_TASK_TOKEN": "''", "AG2_REMOTE_TOKEN": "x"}, self.o.TOKEN_KEYS),
                          ("", "REMOTE_TASK_TOKEN"), "a set but quoted-empty env value still wins, as it always has")
 
+    def test_what_the_desktop_stdio_proxy_reads_from_a_token_file(self):
+        self.assertEqual(self.o.plain_token_key("export REMOTE_TASK_TOKEN=x\nAG2_REMOTE_TOKEN='y'\n"), "AG2_REMOTE_TOKEN",
+                         "the proxy reads no `export ` line")
+        self.assertEqual(self.o.plain_token_key("REMOTE_TASK_TOKEN=''\n"), "", "an empty value is none")
+        text = "REMOTE_TASK_TOKEN='https://r.example/relay|s3'\n"
+        self.assertEqual(self.o.plain_token(text), ("REMOTE_TASK_TOKEN", "https://r.example/relay", "s3"))
+        self.assertEqual(self.o.plain_token(text + "REMOTE_TASK_URL=https://o.example/r/\n")[1], "https://o.example/r",
+                         "a plain .env's URL line wins, as the proxy's primary lane reads it")
+        self.assertEqual(self.o.plain_token("https://r.example|raw\n"), ("", "", ""))
+        self.assertEqual(self.o.raw_token_line("\n  https://r.example/relay/|s3  \n"), ("https://r.example/relay", "s3"))
+        self.assertEqual(self.o.raw_token_line("bare\n"), ("", "bare"))
+        for none in ("", "\n \n", "REMOTE_TASK_TOKEN=a|b\n"):
+            self.assertEqual(self.o.raw_token_line(none), ("", ""), none)
+        with tempfile.TemporaryDirectory() as td:
+            env = os.path.join(td, ".env")
+            Path(td, "token").write_text("x")
+            self.assertEqual(self.o.seat_token_path(env, "REMOTE_TASK_TOKEN_FILE=token\n"),
+                             os.path.realpath(os.path.join(td, "token")), "a relative pointer is the .env's sibling")
+            self.assertEqual(self.o.seat_token_path(env, "AGENT_MXID=@a:s\n"), "")
+            self.assertEqual(self.o.seat_token_path(env, "REMOTE_TASK_TOKEN_FILE=token\nREMOTE_TASK_TOKEN=a|b\n"), "",
+                             "a file that assigns a token itself is no seat .env")
+
     def test_a_file_value_is_unquoted_once(self):
         padded = 'REMOTE_TASK_TOKEN="  pad-tok-1  "\nREMOTE_TASK_URL="  https://p.example/r  "\n'
         vals = self.o.parse_env_text(padded)
@@ -2045,7 +2067,9 @@ return env
 READER_WRITES = {("bridge_environ", "env.update(decl['env'], REMOTE_PROACTIVE_ROOM='')"),
                  ("bridge_environ", "env.update(_sources.bridge_carried_config(host, read_regular))"),
                  ("bridge_environ", "env.update(token_env)"),
-                 ("main", "os.environ.clear()"), ("main", "os.environ.update(environ)")}
+                 ("main", "os.environ.clear()"), ("main", "os.environ.update(environ)"),
+                 # A pool worker's lane dirs and instance (worker_lane.bridge_overlay): no credential.
+                 ("main", "os.environ.update(overlay)")}
 MAPPING_WRITES = {"update", "setdefault", "__setitem__", "__delitem__", "pop", "popitem", "clear", "putenv", "unsetenv",
                   "__ior__", "__or__", "__ror__"}
 # Every reach of a process environment in the reader, by (function, the expression holding it).

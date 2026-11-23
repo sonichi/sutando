@@ -50,6 +50,14 @@ count (`python3 src/pending_questions_reader.py summary`).
   If the outbox cannot hold the question, NO row is written: the owner is still
   asked, and the report says nothing holds it. Read the output: a `FAILED` line is not an
   ask. Then continue; never block.
+- From a pool worker that acts as its own agent, the text ask is queued under the name
+  `result_publish.worker_published_path` gives it (`.by-<worker>`, unless it is bound for
+  Discord, Slack or Telegram, which deliver it themselves), so that worker's own lane asks as its
+  agent, the row's `Asked by` names that agent, and the text says it is from that worker
+  ("<name> (a worker on <host>)", with its agent's display name, else its roster label; else just
+  "a worker on <host>"). A decision card it asks is its own too: the card
+  names the worker, only that worker's lane posts it (in its own DM, where the click comes back),
+  the row's `Asked by` names its agent, and its fallback text and pointer go through that lane.
 - `list` is READ-ONLY — it writes no file, not even the history marker — and lists each ask
   id in exactly one bucket, by precedence: a terminal or locally closed row is done; a
   complete open row waits; an open row whose body has not landed is stood in for by its held
@@ -86,7 +94,8 @@ count (`python3 src/pending_questions_reader.py summary`).
 A question asked with `--default-action` and/or `--option` whose destination is s.space (its
 task's bridge, else the bridge the owner was last active on) is asked as a decision card, built by
 `src/hitl/cards.py` (the one builder every card producer uses): one button per choice — with a
-default, one per `ordered_options()` entry, Approve first and carrying it; with options alone,
+default, one per `ordered_options()` entry, Approve first and carrying it (an option named like
+the default is that same choice: Approve takes its consequence and it is not shown twice); with options alone,
 exactly the options as given, with no Approve — and `subject.choices` holding each consequence.
 
 - **Order.** The card is built and its id allocated; the question is held in the outbox and its

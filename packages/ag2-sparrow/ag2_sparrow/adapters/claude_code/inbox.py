@@ -13,13 +13,14 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from ... import connect_common as cm, task_io, task_lifecycle as lifecycle
-from ... import claude_local_records as records
+from ... import connect_bridge as cb, connect_common as cm, task_io, task_lifecycle as lifecycle
+from ... import claude_local_records as records, collaborator_turn as isolated, relay_loop
 from . import hmac_policy
 from .shape import LOCAL
 
@@ -31,6 +32,13 @@ ROOT_VAR = "AG2_SPARROW_ROOT"
 CONFIG_DIR_VAR = "AG2_SPARROW_CONFIG_DIR"
 ALLOW_NON_OWNER = "ALLOW_NON_OWNER"
 ALLOW_COLLABORATOR = "ALLOW_COLLABORATOR"
+# A restricted turn (task_io.turn_policy: a guest, plain team, an unknown tier) runs as the one isolated local
+# `claude -p` turn the routine and cloud-session adapters use (collaborator_turn), never in the owner's session.
+ISOLATED_TIMEOUT_S = 120.0
+ISOLATED_PER_HOUR = 10
+ISOLATED_LIMITER_FILE = "isolated-turns.json"
+ISOLATED_FAILED = ("This agent could not answer this message right now; send it again later if it is "
+                   "still wanted.\n")
 
 
 # The verbs whose success is a durable progress write: one clears the launcher's alarm.
@@ -114,21 +122,22 @@ def _installed_config(environ=None) -> Path:
     return Path(config_dir) / cm.config_path(LOCAL).name if config_dir else cm.config_path(LOCAL)
 
 
-def _installed_flag(key, environ=None) -> bool:
+def _installed_on(key, environ=None) -> bool:
+    """On unless the config the pane names (else the CLI's own) records the opt-out ("0"); unreadable reads as off."""
     try:
-        return cm.read_config(_installed_config(environ)).get(key) == "1"
+        return cm.read_config(_installed_config(environ)).get(key, "") != "0"
     except (OSError, ValueError):
         return False
 
 
 def allow_non_owner(environ=None) -> bool:
-    """The installed --allow-non-owner, read from the config the pane names; unreadable reads as off."""
-    return _installed_flag(ALLOW_NON_OWNER, environ)
+    """The installed non-owner setting: on unless install recorded --no-allow-non-owner."""
+    return _installed_on(ALLOW_NON_OWNER, environ)
 
 
 def allow_collaborator(environ=None) -> bool:
-    """The installed --allow-collaborator, read as allow_non_owner is; unreadable reads as off."""
-    return _installed_flag(ALLOW_COLLABORATOR, environ)
+    """The installed collaborator setting: on unless install recorded --no-allow-collaborator."""
+    return _installed_on(ALLOW_COLLABORATOR, environ)
 
 
 def envelope(verdict: str, environ=None, key_seen=None) -> dict:
@@ -144,23 +153,64 @@ def envelope(verdict: str, environ=None, key_seen=None) -> dict:
 
 
 def admit(root, task_id, allow: bool, allow_collab: bool = False) -> "tuple[str | None, dict, str]":
-    """(admission, headers, why refused) for tasks/<task_id>.txt through the shared task_io.admission. A
-    file with no access_tier header is malformed (Sparrow's bridge always writes one). As the relay loop
-    does, an attested collaborator is served only under --allow-collaborator, which --allow-non-owner
-    does not imply; any other non-owner only under --allow-non-owner."""
+    """(admission, headers, why refused) for tasks/<task_id>.txt through the shared task_io.turn_policy. A
+    file with no access_tier header is malformed (Sparrow's bridge always writes one). An attested
+    collaborator is served unless --no-allow-collaborator, in the owner's session; a restricted sender only
+    unless --no-allow-non-owner, on the isolated read-only turn (claim runs it), never in the owner's session."""
     path = os.path.join(root, "tasks", task_id + ".txt")
     with open(path, encoding="utf-8", errors="replace") as f:
         raw = task_io.attested_headers(f.read()).headers
     if "access_tier" not in raw:
         return None, {}, "malformed: no access_tier header"
     headers, _, _ = task_io.parse_task(path)
-    kind = task_io.admission(headers, allow)
-    flag = "--allow-collaborator" if kind == "collaborator" else "--allow-non-owner"
-    if kind == "collaborator" and not allow_collab:
-        kind = None
-    why = "" if kind else "sender tier %s (collaborator %s) and %s is off" % (
-        headers["access_tier"], headers["collaborator"], flag)
-    return kind, headers, why
+    policy = task_io.turn_policy(headers, allow, allow_collab)
+    if not policy.served:
+        return None, headers, "sender tier %s (collaborator %s) and %s is off" % (
+            headers["access_tier"], headers["collaborator"], policy.unlock)
+    return policy.kind, headers, ""
+
+
+def isolated_prompt(root, task_id) -> "tuple[str, dict]":
+    """(text, attested headers) of the isolated turn: the routine and cloud-session adapters' payload (attested
+    routing fields, the non-owner note, the untrusted body between nonce markers), with the gateway's tier
+    block said as this turn can follow it (collaborator_turn.isolated_lines)."""
+    headers, message, operator_lines = task_io.parse_task(os.path.join(root, "tasks", task_id + ".txt"))
+    return relay_loop.build_payload(task_id, headers, message, isolated.isolated_lines(operator_lines),
+                                    task_io.NON_OWNER_NOTE)[1], headers
+
+
+def media_root(cfg) -> Path:
+    """The remote-media folder of the bridge feeding this root (its state dir's, as the bridge writes it)."""
+    return cb.bridge_state(cfg) / "remote-media"
+
+
+def isolated_answer(root, task_id, environ=None, run=None) -> "tuple[str, str]":
+    """(result body, detail) of one restricted task's isolated turn: the claude the install recorded, on the
+    agent's own login (the recorded CLAUDE_CONFIG_DIR, else the session's), in a fresh empty directory, with
+    no session, connector, MCP server, plugin, hook or memory (collaborator_turn.TURN_ARGV). Its reply, made
+    inert, is the body; a failure, a missing CLI or the hourly cap gives ISOLATED_FAILED. Never raises."""
+    try:
+        cfg = cm.read_config(_installed_config(environ))
+        claude = cfg.get("CLAUDE") or ""
+        if not claude:
+            return ISOLATED_FAILED, "no CLAUDE in the installed config"
+        env = isolated.child_env(environ)
+        if cfg.get("CLAUDE_CONFIG_DIR"):
+            env["CLAUDE_CONFIG_DIR"] = cfg["CLAUDE_CONFIG_DIR"]
+        limiter = relay_loop.RateLimiter(str(records.state_dir(root) / ISOLATED_LIMITER_FILE), ISOLATED_PER_HOUR)
+        if limiter.wait_seconds() > 0:
+            return ISOLATED_FAILED, "isolated turns are at their hourly cap (%d)" % ISOLATED_PER_HOUR
+        limiter.record(task_id)
+        text, headers = isolated_prompt(root, task_id)
+        media = str(media_root(cfg))
+
+        def own_attachments(cwd, text):
+            return isolated.with_staged_paths(text, isolated.stage_own_attachments(headers, cwd, media))
+        turn = isolated.run_collaborator_turn(claude, text, env, ISOLATED_TIMEOUT_S, run=run or subprocess.run,
+                                              allow_skip=True, prepare=own_attachments)
+    except Exception as e:      # the claim is CALLING: it must end in an answer, never a crash
+        return ISOLATED_FAILED, "%s: %s" % (type(e).__name__, e)
+    return (turn.text + "\n", "answered") if turn.kind == "ok" else (ISOLATED_FAILED, turn.detail)
 
 
 # The lifecycle's answers about the claim itself: final, whatever raised them. An unreadable claim is not
@@ -324,6 +374,9 @@ def claim(root, task_id) -> dict:
                 raise Refused("%s not admitted (%s); the owner-only refusal is %s" % (task_id, why, outcome))
             try:
                 attempt = lc.prepare(task_id, INTERRUPTED_BODY, mode=lifecycle.LOCAL, generation=generation)
+                if kind == task_io.RESTRICTED:
+                    # CALLING before the turn: a crash is answered as interrupted by the next start's recovery.
+                    lc.mark_calling(task_id, attempt)
             except lifecycle.AttemptInProgress as e:
                 lost = lost_turn_answered(lc, task_id, generation)
                 if not lost:
@@ -332,6 +385,8 @@ def claim(root, task_id) -> dict:
             if state in lifecycle.TERMINAL:
                 _settle_terminal(lc, task_id)
             terminal = resolved(lc, task_id)[0]
+    if verdict == "call" and not lost and kind == task_io.RESTRICTED:
+        return _isolated_claim(root, lc, task_id, attempt, generation, headers)
     if lost:
         # After claims.lock, as every mirror write; a mirror that fails is the hard answer, the Mod retries.
         out = _mirror(root, task_id, None, {"task_id": task_id, "phase": lifecycle.SETTLED, "answered": lost}, unstuck=True)
@@ -349,6 +404,30 @@ def claim(root, task_id) -> dict:
                    {"task_id": task_id, "attempt": attempt, "generation": generation, "admission": kind,
                     "access_tier": headers["access_tier"], "collaborator": headers["collaborator"] == "true"},
                    {"attempt": attempt}, unstuck=True)
+
+
+def _isolated_claim(root, lc, task_id, attempt, generation, headers):
+    """A restricted task, claimed CALLING: its isolated turn runs outside claims.lock, then its answer is
+    recorded and published under it, only while the claim is still this attempt's CALLING one (a recovery
+    that answered it first wins). The reply is a final refusal of the claim, so the Mod retires the task:
+    nothing of it, text or answer, ever reaches the owner's session."""
+    body, detail = isolated_answer(root, task_id)
+    with _claims_step(root, lc, task_id, "claim"):
+        rec = lc.claims.load(task_id)
+        if rec and rec["phase"] == lifecycle.CALLING and rec["attempt"] == attempt and \
+                rec.get("generation") == generation:
+            lc.record_outcome(task_id, "final", body, "isolated turn: %s" % detail)
+        try:
+            published = lc.publish_and_settle(task_id, io_raises=True)
+        except lifecycle.PublishedNotDurable as e:
+            raise Parked("%s: the isolated answer landed, its durability unknown (%s); retried" % (task_id, e))
+    if published != "settled":
+        raise Parked("%s: the isolated answer is not published yet (%s); retried" % (task_id, published))
+    out = _mirror(root, task_id, None, {"task_id": task_id, "phase": lifecycle.SETTLED}, unstuck=True)
+    if out.get("hard"):
+        return out
+    raise Refused("%s answered on the isolated read-only turn (sender tier %s, collaborator %s; %s); never "
+                  "submitted to this session" % (task_id, headers["access_tier"], headers["collaborator"], detail))
 
 
 def resolved(lc, task_id) -> "tuple[bool, str]":

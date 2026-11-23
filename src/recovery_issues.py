@@ -14,11 +14,11 @@ except ImportError:
 
 HEALTH_CAUSES = frozenset("""
 voice-agent voice-watchers voice-transport bodhi-dist cli-wedge pane-key-fence proactive-undelivered secret-scanner
-node-runtime cron-runner session-crons memory-dir-override workspace-wiring decision-card-clicks connections-primary
+node-runtime cron-runner session-crons memory-dir-override workspace-wiring decision-card-clicks connections-primary task-event-handler
 context-read-budget workspace-root-tidy memory-dir-siblings carrier-set memory-index git-index-lock
 memory-sync onboarding-status hitl-archive host-subtrees per-host-config-backup sync-conflicts-unmerged
 skills-driver-code-drift live-checkout-branch engine-revision-drift migrate-reader-contract
-tcc-documents-access quota-telemetry core-request-rejections core-quota quota-account-identity
+tcc-documents-access quota-telemetry claude-sign-in core-request-rejections core-quota quota-account-identity
 battery memory cron-schedule core-proactive-loop core-supervisor gateway-bridge sspace-migration runtime-identity owner-dm-routing-stale
 daily-cron-punctuality live-tree-drift disk-space skill-symlinks task-queue pool-advertisement pool-suspended held-no-consumer
 orphaned-results stranded-destined-proactive proactive-quarantine stale-proactive-backlog

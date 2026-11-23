@@ -469,6 +469,23 @@ def channel_env_paths(env: Mapping[str, str], channel_dir: str = DEFAULT_CHANNEL
     return [p for p in paths if p]
 
 
+# The desktop app's own data dir, where its host keeps the channel .env files it reads for "bound".
+APP_SUPPORT_KEY = "SUTANDO_APP_SUPPORT"
+
+
+def retirement_paths(env: Mapping[str, str], token_file: str = "") -> "list[str]":
+    """Every file a deleted agent's bearer may sit in for a bridge given `env`: its token file, the
+    channel .env files it reads (channel_env_paths), and on a desktop install the host's copies under
+    APP_SUPPORT_KEY: the primary channels/ag2space/.env, which carries a lane's launch key, and the
+    lane's channels/<dir>/.env. In order, without repeats. Paths only: the caller reads them."""
+    paths = [token_file, *channel_env_paths(env, channel_dir(env))]
+    app = env.get(APP_SUPPORT_KEY) or ""
+    if app:
+        paths += [os.path.join(app, "channels", DEFAULT_CHANNEL_DIR, ".env"),
+                  os.path.join(app, "channels", channel_dir(env), ".env")]
+    return [p for p in dict.fromkeys(paths) if p]
+
+
 def first(values: Mapping[str, str], keys) -> "tuple[str, str]":
     """(value, key) of the first key with a non-empty value; ('', '') when none. The values are
     already parsed (parse_env_text, _assignments): unquoting them again would change a padded token."""
@@ -540,9 +557,107 @@ def token_file_pairs(text: str) -> "list[tuple[str, str]]":
     return pairs
 
 
+def plain_token_key(text: str) -> str:
+    """The token key a reader that takes only plain `KEY=value` lines (no `export `, as the desktop's stdio MCP
+    proxy) finds in a token file's text: the first of TOKEN_KEYS assigned a value that way, else ""."""
+    for key in TOKEN_KEYS:
+        if any(line.strip().startswith(key + "=") and line.strip()[len(key) + 1:].strip(" '\"")
+               for line in text.splitlines()):
+            return key
+    return ""
+
+
+def plain_token(text: str) -> "tuple[str, str, str]":
+    """(key, relay URL, secret) of the token that plain_token_key's reader takes from a token file's text (its
+    REMOTE_TASK_URL line, else the token's URL half, as the desktop's stdio MCP proxy reads it); ('', '', '')
+    when it finds none."""
+    key = plain_token_key(text)
+    if not key:
+        return "", "", ""
+    url_from_token, secret = contract.parse_onboarding_token(first(_assignments(text, (key,)), (key,))[0])
+    return key, (token_file_url(text) or url_from_token).rstrip("/"), secret
+
+
+def raw_token_line(text: str) -> "tuple[str, str]":
+    """(relay, secret) of a seat's raw token file as the desktop's stdio MCP proxy reads one (token_format "raw"):
+    its first nonempty line, split at the first `|` (relay trailing `/` stripped; no `|` is a bare secret).
+    ('', '') when that line is a `KEY=` assignment or there is none."""
+    line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    if not line or "=" in line.split("|", 1)[0]:
+        return "", ""
+    relay, sep, secret = line.partition("|")
+    return (relay.rstrip("/"), secret) if sep else ("", line)
+
+
+def seat_token_pointer(env_path: str, env_text: str) -> str:
+    """The raw token file a seat .env (its text `env_text`, at `env_path`) names, as named (absolute, symlinks
+    not resolved, so a no-follow read checks the link itself); '' when it names none or assigns a token itself."""
+    values = parse_env_text(env_text)
+    named = named_token_file(values)
+    if not named or first(values, TOKEN_KEYS)[0]:
+        return ""
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(env_path)), os.path.expanduser(named)))
+
+
+def seat_token_path(env_path: str, env_text: str) -> str:
+    """The realpath of `seat_token_pointer`, '' when there is none."""
+    pointer = seat_token_pointer(env_path, env_text)
+    return os.path.realpath(pointer) if pointer else ""
+
+
 def token_file_url(text: str) -> str:
     """The REMOTE_TASK_URL (legacy AG2_REMOTE_URL) of a split-layout token file's text, or ""."""
     return first(_assignments(text, URL_KEYS), URL_KEYS)[0]
+
+
+DELETED_BINDING_ID_KEYS = ("AGENT_MXID", "AGENT_ID")
+
+
+def _binding_line(line: str) -> "tuple[bool, str, str]":
+    """(is an assignment, key, unquoted value) of one credential-file line; `export ` dropped."""
+    bare = line.strip()
+    key, _, val = bare.partition("=")
+    key = key.strip()
+    key = key[len("export "):].strip() if key.startswith("export ") else key
+    assigned = bool(bare) and not bare.startswith("#") and "=" in bare
+    return assigned, key, unquote(val) if assigned else ""
+
+
+def split_deleted_binding(text: str, *, secret: str, agent_id: str,
+                          bearer_proven: bool = False) -> "tuple[str, list[str], list[str]]":
+    """(kept text, removed lines, their keys) for a credential file whose agent the server deleted: the
+    lines holding `secret` under a token key (a lane-suffixed one included) or alone (a token file's bare
+    line), and the AGENT_MXID / AGENT_ID lines naming `agent_id`. The server's answer names an id, not a
+    bearer, so nothing moves unless the file itself ties the two: it names `agent_id` and no other agent,
+    and holds `secret`. `bearer_proven`: another file already tied this bearer to that id, so its lines
+    move here without the tie, and an id line moves only where the file names that id alone. Line
+    endings are kept as they are; any other credential stays."""
+    lines = text.splitlines(keepends=True)
+    ids = {v for assigned, k, v in map(_binding_line, lines) if assigned and k in DELETED_BINDING_ID_KEYS and v}
+    tied = bool(agent_id) and ids == {agent_id}
+    kept: "list[str]" = []
+    removed: "list[str]" = []
+    keys: "list[str]" = []
+    for line in lines:
+        assigned, key, value = _binding_line(line)
+        bare = line.strip()
+        if assigned and secret and any(key == k or key.startswith(k + "_") for k in TOKEN_KEYS) \
+                and contract.parse_onboarding_token(value)[1] == secret:
+            hit = key
+        elif assigned and tied and key in DELETED_BINDING_ID_KEYS and value == agent_id:
+            hit = key
+        elif bare and not assigned and not bare.startswith("#") and secret \
+                and contract.parse_onboarding_token(bare)[1] == secret:
+            hit = "token"
+        else:
+            kept.append(line)
+            continue
+        removed.append(line if line.endswith(("\n", "\r")) else line + "\n")
+        keys.append(hit)
+    bearer_moves = any(k not in DELETED_BINDING_ID_KEYS for k in keys)
+    if not bearer_moves or not (tied or bearer_proven):
+        return text, [], []
+    return "".join(kept), removed, keys
 
 
 def token_from_files(files: "Sequence[EnvFile]"):
