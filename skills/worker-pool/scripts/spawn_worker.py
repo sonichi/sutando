@@ -532,10 +532,8 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
                     f"remove the worker if it is not wanted.",
                     worker_id=rec["worker_id"], delivery_dir=str(p["delivery_dir"]),
                     tmux_session=name, tmux_socket=str(socket))
-            # No session: nothing can be pointing at either path, so roll back
-            # exactly what this call minted.
-            # A resumed worker existed before this call: its records and inbox are
-            # not ours to remove, only the run we failed to start.
+            # No session, so nothing points at what this call minted: roll that back. A resumed
+            # or recovered worker predates the call, so only the run we failed to start is ours.
             if run is not None:
                 wi.end_incarnation(workspace, worker_id, run["incarnation_id"], "crashed")
             if not resumed_id and not existing_worker_id:
