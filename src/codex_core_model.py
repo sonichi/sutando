@@ -72,7 +72,11 @@ def _rev(rec: dict) -> int:
 
 
 def working(rec: dict) -> str:
-    """The last model Codex took by this record: its own once accepted, else the one it carried."""
+    """The last model Codex took: `confirmed` (what a completed turn last ran on, whatever pick is
+    pending), else the record's own once accepted, else the one it carried."""
+    c = rec.get("confirmed")
+    if isinstance(c, str) and valid(c):
+        return c
     if rec.get("status", "accepted" if rec.get("accepted") else "") == "accepted" and valid(rec.get("model") or ""):
         return rec["model"]
     w = rec.get("working")
@@ -126,6 +130,21 @@ def _write(state_dir, rec: dict) -> None:
     os.replace(tmp, record_path(state_dir))
 
 
+def confirm(state_dir, model: str, rev: int) -> bool:
+    """Record that Codex completed a turn on `model` (the pick of revision `rev`): `confirmed` and
+    `confirmed_rev`, kept apart from the pending pick, which this never settles. An older revision
+    never replaces a newer confirmation."""
+    if not valid(model):
+        return False
+    with _locked(state_dir):
+        rec = read_record(state_dir)
+        if not rec or int(rec.get("confirmed_rev") or 0) > rev:
+            return False
+        rec["confirmed"], rec["confirmed_rev"] = model, rev
+        _write(state_dir, rec)
+        return True
+
+
 def resolve(state_dir, rev: int, accepted: bool, reason: str = "") -> Optional[dict]:
     """Settle the pending pick `rev`: accepted (it becomes `working`) or rejected (the core stays on
     `working`). None when the record has moved on or is not pending; a newer pick is never touched."""
@@ -135,7 +154,8 @@ def resolve(state_dir, rev: int, accepted: bool, reason: str = "") -> Optional[d
             return None
         rec["status"], rec["accepted"] = ("accepted" if accepted else "rejected"), bool(accepted)
         if accepted:
-            rec["working"] = rec["model"]
+            rec["working"] = rec["confirmed"] = rec["model"]
+            rec["confirmed_rev"] = max(rev, int(rec.get("confirmed_rev") or 0))
         else:
             rec["rejected_reason"] = " ".join(str(reason).split())[:240]
         _write(state_dir, rec)
@@ -157,6 +177,11 @@ def save(state_dir, model: str, *, applied: str, accepted: bool, now: Optional[f
            "runtime": RUNTIME, "accepted": bool(accepted), "status": "accepted" if accepted else "pending",
            "working": model if accepted else (working(old) or None), "rev": _rev(old) + 1,
            "applied": applied, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "by": BY}
+    for key in ("confirmed", "confirmed_rev"):  # a turn's confirmation outlives later picks
+        if old.get(key):
+            rec[key] = old[key]
+    if accepted:
+        rec["confirmed"], rec["confirmed_rev"] = model, rec["rev"]
     _write(state_dir, rec)
     return rec
 

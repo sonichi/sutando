@@ -733,6 +733,8 @@ class Seat:
         picked, rev, before, sent = self.trial
         self.trial = None
         try:
+            if accepted:  # recorded even when a newer pick is pending: a restart then starts on it
+                codex_core_model.confirm(self.workspace / "state", picked, rev)
             settled = codex_core_model.resolve(self.workspace / "state", rev, accepted, reason)
         except OSError as e:
             settled = None
