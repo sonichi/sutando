@@ -116,7 +116,7 @@ the recovery actions for its state, picked by `recovery_actions.card_controls`:
 | Limit menu (`/rate-limit-options`) | every choice the menu shows, in its own words, but a purchase or a model switch (keystrokes), Add another account, Refresh options; the core also gets Restart core |
 | Paused by the relaunch hold | Retry now, Switch to <model>, Switch runtime, Add another account, Refresh options |
 | Other blocked prompt (core) | Refresh options, Restart core |
-| Crash loop (`core_crash_loop`) | the core: Restart core (titled "Can't recover: core", as a new card, once the app's revive loop gives up); a stopped service: Start <service> again when the supervisor marks its terminal state `resettable`, else none (only an app restart clears it) |
+| Crash loop (`core_crash_loop`) | the core: Restart core (titled "Can't recover: core", as a new card, once the app's revive loop gives up); a stopped service: Start <service> again when the supervisor marks its terminal state `resettable` with an incident id, else none (only an app restart clears it) |
 
 No card offers a purchase. `Open terminal` stays last, as the client-local action.
 
@@ -145,14 +145,17 @@ to `state/recovery/actions/<hitl_id>.json`. The monitor watching that card's ses
 (`src/recovery_actions.py`): once, within 10 minutes, only an id the card offered and the
 runtime carries out, with fixed argv, never what a subprocess printed. It writes the receipt to
 `state/recovery/receipts/<hitl_id>.json`, one line to `state/recovery/audit.jsonl` (who, what,
-session, outcome) and edits the card in place. `reset_service:<service>` runs only while the
-supervisor's fresh status still says that service is stopped and resettable in its current app
-session: it writes one request, `state/control/services/req-<id>.json`
-(`{"schemaVersion": 1, "id", "kind": "reset-service", "service", "appSessionId", "requestedAtMs"}`),
-which the supervisor reads on its watchdog tick, clears that service's crash-loop stop and launches
-it once more. The card closes once the status no longer reports the service stopped. `add_account` and `switch_account` are refused
-until the confirmed, re-authenticated sign-in flow exists; a worker seat's card never runs
-`switch_model`, `restart_core` or `switch_runtime`.
+session, outcome) and edits the card in place. `reset_service:<service>` is bound to the stop its card was raised on: the card keeps the
+supervisor's app session and the stop's incident id, and the executor writes a request only while
+the fresh status still reports exactly that stop (a newer session or a newer trip makes the tap
+`stale`). The request is `state/control/services/req-<id>.json`
+(`{"schemaVersion": 1, "id", "kind": "reset-service", "service", "appSessionId", "incident", "requestedAtMs"}`).
+The supervisor answers in `res-<id>.json` (`outcome: running`, `failed`, or the word it refused
+with). The card, its receipt and a second audit line take that answer: `done` only on `running`,
+`failed` on any other answer or when none arrives within 5 minutes. A stop marker going away is
+never read as the service running. A stop marker itself raises a card only when it belongs to the
+status file's own session, its trip time (when stamped) is not later than the heartbeat carrying
+it, and the supervisor's lifecycle word for the service does not say it is up.
 
 A tap from anyone but the owner runs nothing, leaves the card as it was and posts nothing in the
 room. On a card this store holds, tapped in the room the card was posted in (its requirement's
