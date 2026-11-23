@@ -4,6 +4,10 @@ taps one on a card, and is told in that DM whether the switch happened.
 One card for every runtime: a connector gives `ModelSwitch` the models its runtime offers (`seen`),
 asks it whether a task is a card matter (`card_task`), runs the next owner turn on `wanted()`, and
 reports the model that turn ran on (`tell`). What is kept, in `state/model.json`, is ids and names only.
+
+One card, updated in place: a tap's answer ("Switching to X", "already X") and then the outcome
+("Switched", "could not switch") are shown in place of the card that was tapped (connector_cards'
+edit), never as a second card. A pick in words ("/model <name>") has no card to update and gets a new one.
 """
 from __future__ import annotations
 
@@ -13,7 +17,7 @@ import os
 import time
 import uuid
 
-from . import connector_cards
+from . import card_desk, connector_cards
 
 FILE, CARD, ASK = "model.json", "model-switch", "/model"
 # What a pick came to is a card of its own: recorded under the menu's id it would retire the menu
@@ -181,11 +185,12 @@ class ModelSwitch:
             self.log("model card not built:", str(e)[:200])
             return None
 
-    def post(self, room, built, key: str = "", at_ns: int = 0) -> bool:
+    def post(self, room, built, key: str = "", at_ns: int = 0, edit: str = "") -> bool:
         if built is None or not self.usable():
             return False
         try:
-            connector_cards.queue(self.bridge_state, str(room or ""), *built, key=key, at_ns=at_ns)
+            connector_cards.queue(self.bridge_state, str(room or ""), *built, key=key, at_ns=at_ns,
+                                  edit=edit if str(edit or "").startswith("$") else "")
             return True
         except (OSError, ValueError) as e:
             self.log("model card not queued:", "%s: %s" % (type(e).__name__, e))
@@ -204,9 +209,11 @@ class ModelSwitch:
         return self.expired_card(sent, self.state(), result_file)
 
     def expired_card(self, sent, state, result_file) -> str:
-        """Answer a tap on a model card that no longer acts: the words, and a fresh card when one can be shown."""
-        fresh = bool(self.offered(state)) and self.post(sent.get("channel_id"), self.menu(state))
-        self.publish(result_file, self.quoted(EXPIRED if fresh else EXPIRED_NO_CARD) + "\n")
+        """Answer a tap on a model card that no longer acts: a fresh card in its place when one can be
+        shown, else the words."""
+        fresh = bool(self.offered(state)) and self.post(sent.get("channel_id"), self.menu(state),
+                                                        edit=card_desk.tapped_event(sent))
+        self.publish(result_file, ANSWERED if fresh else self.quoted(EXPIRED_NO_CARD) + "\n")
         return "model-card-expired"
 
     def listed(self, result_file) -> "dict | None":
@@ -219,6 +226,8 @@ class ModelSwitch:
     def pick(self, picked, sent, result_file, by_name=False, by_verb=False) -> str:
         """The owner chose `picked` (a tap or "/model <name>"): the next turn runs on it, and a card says so."""
         state, room = self.listed(result_file), str(sent.get("channel_id") or "")
+        # A tap is answered in place of the card tapped; a pick in words has none.
+        tapped = card_desk.tapped_event(sent) if by_verb else ""
         if state is None:
             return "model-unlisted"
         keys = (lambda m: (m["id"].lower(), m["name"].lower())) if by_name else (
@@ -233,10 +242,10 @@ class ModelSwitch:
             # Only a model a turn has run on is "in use": a repeated pending pick is still coming.
             outcome = "model-pending" if self.pending(state) == picked else "model-same"
         else:
-            self.save(wanted=picked, asked_in=room, told="")
+            self.save(wanted=picked, asked_in=room, told="", card=tapped)
         same = outcome == "model-same"
         card = self.built(state, picked=picked, same=same)
-        self.publish(result_file, ANSWERED if self.post(room, card)
+        self.publish(result_file, ANSWERED if self.post(room, card, edit=tapped)
                      else self.quoted(self.words(state, picked=picked, same=same)) + "\n")
         return outcome
 
@@ -284,7 +293,8 @@ class ModelSwitch:
             # Later than every notice already owed: the bridge posts in the order of this moment. Saved
             # whole: the cap is for what is still undeliverable after this turn's drain, below.
             at = max([time.time_ns()] + [int(o.get("at") or 0) + 1 for o in owed])
-            owed.append({"picked": wanted, "ran": ran, "room": state.get("asked_in"), "key": uuid.uuid4().hex, "at": at})
+            owed.append(dict({"picked": wanted, "ran": ran, "room": state.get("asked_in"), "key": uuid.uuid4().hex,
+                              "at": at}, **({"edit": state["card"]} if state.get("card") else {})))
             # Only a confirmed pick becomes the model in use: a model the runtime moved the turn to was never picked.
             self.save(untold=owed, told=wanted, **({"current": wanted, "confirmed": wanted} if outcome == "switched"
                                                    else {"wanted": ""}))
@@ -302,7 +312,8 @@ class ModelSwitch:
                 if room is None or str(owed[0].get("room") or "") != str(room):
                     break           # its words wait for a turn in the room the card was for
                 words.append(self.words(state, **first))
-            elif not self.post(owed[0].get("room"), card, str(owed[0].get("key") or ""), int(owed[0].get("at") or 0)):
+            elif not self.post(owed[0].get("room"), card, str(owed[0].get("key") or ""), int(owed[0].get("at") or 0),
+                               str(owed[0].get("edit") or "")):
                 break
             owed.pop(0)
             self.save(untold=list(owed))
