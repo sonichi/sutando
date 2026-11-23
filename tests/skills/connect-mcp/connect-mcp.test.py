@@ -599,6 +599,24 @@ class WaiterTests(Base):
         code, card = self.cli(["card", wait_id])
         self.assertEqual((code, card["outcome"]), (0, "timeout"))
 
+    def test_an_old_claim_with_no_outcome_gets_no_late_expired_notice(self):
+        wait_id = self.stopped_after_taking("connected", staged=False)
+        self.clock.t += cm.LOGIN_S + cm.STALE_GRACE_S
+        code, out = self.cli(["rearm"])
+        self.assertEqual(out["recovered"], [{"wait_id": wait_id, "published": "stale"}])
+        self.assertEqual(self.new_tasks(), [])
+        record = json.loads(cm.store(self.ws).claimed_path(wait_id).read_text())
+        self.assertEqual(record["claimed_at"], int(NOW + cm.LOGIN_S))
+        code, out = self.cli(["rearm"])
+        self.assertEqual((out["recovered"], self.new_tasks()), ([], []))
+
+    def test_a_claim_with_no_outcome_a_second_inside_the_window_still_gets_its_notice(self):
+        wait_id = self.stopped_after_taking("connected", staged=False)
+        self.clock.t += cm.LOGIN_S + cm.STALE_GRACE_S - 1
+        code, out = self.cli(["rearm"])
+        self.assertEqual(out["recovered"], [{"wait_id": wait_id, "published": "task"}])
+        self.assertIn("expired", self.resume_body(wait_id))
+
     def test_a_wait_file_that_is_not_a_wait_is_set_aside_without_a_task(self):
         _, out = self.start()
         waits = cm.store(self.ws)

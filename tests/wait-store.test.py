@@ -418,6 +418,74 @@ class InterruptedClaim(InterruptedCase):
         self.assertEqual((self.record()["claimed_by"], self.record()["unstamped"]), ("timeout", True))
         self.assertEqual((self.written, self.names()), ([WAIT_ID], ["claimed"]))
 
+    def test_an_old_claim_with_no_outcome_gets_no_late_task(self):
+        self.stop_after_taking("connected", staged=False)
+        [taken] = self.store.dir().glob("*.taken")
+        os.utime(taken, (NOW - 7200, NOW - 7200))
+        self.assertEqual(self.recover_closing(), [{"wait_id": WAIT_ID, "published": "stale"}])
+        self.assertEqual(self.written, [])
+        self.assertEqual((self.record()["claimed_by"], self.record()["claimed_at"], self.record()["published"]),
+                         ("timeout", NOW - 7200, "stale"))
+        self.assertEqual(self.recover_closing(), [])
+
+    def test_a_claim_with_no_outcome_inside_the_window_is_dated_by_its_file_not_by_recovery(self):
+        self.stop_after_taking("connected", staged=False)
+        [taken] = self.store.dir().glob("*.taken")
+        os.utime(taken, (NOW - 1800, NOW - 1800))
+        self.assertEqual(self.recover_closing(), [{"wait_id": WAIT_ID, "published": "task"}])
+        self.assertEqual((self.record()["claimed_at"], self.body()), (NOW - 1800, "resume timeout"))
+
+    def test_the_waits_recorded_deadline_dates_the_claim_whatever_the_files_time(self):
+        cases = {"old deadline, fresh file": (NOW - 7200, NOW, "stale", NOW - 7200),
+                 "deadline still ahead, old file": (NOW + 600, NOW - 7200, "task", NOW),
+                 "deadline inside the window": (NOW - 600, NOW, "task", NOW - 600)}
+        for n, (name, (deadline, file_time, how, claimed_at)) in enumerate(cases.items()):
+            with self.subTest(name):
+                wait_id = f"178900000000{n}-0000abcd"
+                self.marker(wait_id, deadline=deadline)
+                with mock.patch.object(wait_store.WaitStore, "write_json", side_effect=OSError("disk full")), \
+                        stopping_at_rename(2), self.assertRaises(Stopped):
+                    self.store.claim(wait_id, "connected", NOW)
+                [taken] = self.store.dir().glob(f"{wait_id}.*.taken")
+                os.utime(taken, (file_time, file_time))
+                self.assertEqual(self.recover_closing(), [{"wait_id": wait_id, "published": how}])
+                self.assertEqual(self.record(wait_id)["claimed_at"], claimed_at)
+        self.assertEqual(len(self.written), 2)
+
+    def test_a_deadline_that_is_not_a_time_falls_back_to_the_file(self):
+        for n, deadline in enumerate((True, "soon", float("inf"), None)):
+            with self.subTest(repr(deadline)):
+                wait_id = f"178900000001{n}-0000abcd"
+                self.marker(wait_id, deadline=deadline)
+                with mock.patch.object(wait_store.WaitStore, "write_json", side_effect=OSError("disk full")), \
+                        stopping_at_rename(2), self.assertRaises(Stopped):
+                    self.store.claim(wait_id, "connected", NOW)
+                [taken] = self.store.dir().glob(f"{wait_id}.*.taken")
+                os.utime(taken, (NOW - 7200, NOW - 7200))
+                self.assertEqual(self.recover_closing(), [{"wait_id": wait_id, "published": "stale"}])
+        self.assertEqual(self.written, [])
+
+    def test_a_claim_that_cannot_be_dated_is_closed_as_stale_and_said_so(self):
+        self.stop_after_taking("connected", staged=False)
+        err = io.StringIO()
+        with mock.patch.object(wait_store.WaitStore, "unstamped_since", return_value=None), \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(self.recover_closing(), [{"wait_id": WAIT_ID, "published": "stale"}])
+        self.assertIn("cannot be dated", err.getvalue())
+        self.assertEqual((self.written, self.record()["claimed_at"]), ([], 0.0))
+
+    def test_a_claimed_file_that_cannot_be_read_for_its_time_has_no_date(self):
+        self.assertIsNone(self.store.unstamped_since(WAIT_ID, {"wait_id": WAIT_ID}))
+
+    def test_recovery_does_not_refresh_a_stamped_claims_time(self):
+        self.stop_after_taking("connected")
+        self.assertEqual(self.recover(now=NOW + 3599), [{"wait_id": WAIT_ID, "published": "task"}])
+        self.assertEqual(self.record()["claimed_at"], NOW)
+        self.marker("1789000000009-0000abcd")
+        with stopping_at_rename(2), self.assertRaises(Stopped):
+            self.store.claim("1789000000009-0000abcd", "connected", NOW)
+        self.assertEqual(self.recover(now=NOW + 3600), [{"wait_id": "1789000000009-0000abcd", "published": "stale"}])
+
     def test_a_claim_whose_stamp_could_not_be_written_is_closed_the_same_way(self):
         self.marker()
         with mock.patch.object(wait_store.WaitStore, "write_json", side_effect=OSError("disk full")):
@@ -743,6 +811,25 @@ class Delegation(Base):
         text = (self.ws / "tasks" / f"task-connect-{WAIT_ID}.txt").read_text()
         self.assertIn("did not finish within", text)
         self.assertNotIn("now connected", text)
+
+    def test_connect_apps_sends_no_late_note_for_an_old_claim_with_no_outcome(self):
+        self.apps_marker()
+        with mock.patch.object(connectors, "_write_json", side_effect=OSError("disk full")), \
+                stopping_at_rename(2), self.assertRaises(Stopped):
+            connectors.claim(self.ws, WAIT_ID, "connected", NOW)
+        late = NOW + 60 + connectors.STALE_GRACE_S
+        self.assertEqual(connectors.recover(self.ws, late), [{"wait_id": WAIT_ID, "published": "stale"}])
+        self.assertFalse((self.ws / "tasks").exists())
+        record = json.loads(connectors.claimed_path(self.ws, WAIT_ID).read_text())
+        self.assertEqual((record["claimed_at"], record["published"]), (NOW + 60, "stale"))
+
+    def test_connect_apps_still_closes_one_inside_its_window_a_second_before_it_ends(self):
+        self.apps_marker()
+        with mock.patch.object(connectors, "_write_json", side_effect=OSError("disk full")), \
+                stopping_at_rename(2), self.assertRaises(Stopped):
+            connectors.claim(self.ws, WAIT_ID, "connected", NOW)
+        almost = NOW + 60 + connectors.STALE_GRACE_S - 1
+        self.assertEqual(connectors.recover(self.ws, almost), [{"wait_id": WAIT_ID, "published": "task"}])
 
     def test_a_connect_apps_foreground_claim_is_not_replaced_by_a_recovery_of_the_same_wait(self):
         self.apps_marker()

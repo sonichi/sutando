@@ -29,6 +29,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import json
+import math
 import os
 import re
 import secrets
@@ -218,14 +219,31 @@ class WaitStore:
         names = sorted(p.name.split(".")[0] for p in d.glob("*.taken")) if d.is_dir() else []
         return sorted({n for n in names if WAIT_ID_RE.match(n)})
 
+    def unstamped_since(self, wait_id: str, record: dict) -> float | None:
+        """The latest an outcome-less claim can date from, read before recovery writes anything: the
+        wait's own recorded deadline, else the claimed file's last write. None when neither can be read."""
+        deadline = record.get("deadline")
+        if isinstance(deadline, (int, float)) and not isinstance(deadline, bool) and math.isfinite(deadline):
+            return float(deadline)
+        try:
+            return self.claimed_path(wait_id).stat().st_mtime
+        except OSError:
+            return None
+
     def adopt_unstamped(self, wait_id: str, by: str, at: float) -> dict | None:
-        """Give a claimed record that names no outcome the outcome `by`, on disk; the record, or None
-        when it names one already, is not valid, or cannot be written."""
+        """Give a claimed record that names no outcome the outcome `by`, on disk, dated by
+        `unstamped_since` and never by `at`, the time of this recovery; undatable, it is dated as
+        long past. The record, or None when it names one already, is not valid, or cannot be written."""
         with self.installing():
             record = self.read_json(self.claimed_path(wait_id))
             if not self.valid(record, wait_id) or record.get("claimed_by") is not None:
                 return None
-            record = {**record, "claimed_by": by, "claimed_at": at, "unstamped": True}
+            since = self.unstamped_since(wait_id, record)
+            if since is None:
+                print(f"wait-store: claim {wait_id} names no outcome and cannot be dated; closed as stale",
+                      file=sys.stderr)
+            record = {**record, "claimed_by": by, "claimed_at": 0.0 if since is None else min(since, at),
+                      "unstamped": True}
             try:
                 self.write_json(self.claimed_path(wait_id), record)
             except OSError:
