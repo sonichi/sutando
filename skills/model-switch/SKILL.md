@@ -78,8 +78,9 @@ as a Codex model). Nothing is typed into a pane. Under the same lock:
 - the core is an app-server seat (a live `codex-seat` window): `applied: next-turn`, `status: pending`,
   **exit 12**: saved, not switched. Say it as pending ("I'll try X on my next task"), never as switched.
   The seat (`src/agent/codex/app-server/seat.py`, core seat only) always launches on `working`, the
-  last model Codex took. Before a turn it reads Codex's own `model/list`: a pick that is not in it is
-  `rejected` without being sent. Otherwise it passes the pick on that `turn/start`, and a completed
+  last model Codex took. Before a turn it reads Codex's own `model/list`: a pick that is not in a
+  complete, well-formed list is `rejected` without being sent (a partial list is no verdict). No pick
+  is tried until the model to go back to is known (the launch model, or Codex's named default). Otherwise it passes the pick on that `turn/start`, and a completed
   turn makes it `accepted`. Either verdict reaches the owner as a proactive notice. Nothing else
   rejects a pick: an error answer, a failed turn, a timeout or an unreadable list is no verdict, the
   turn reruns on the model before it (Codex's default named explicitly when the seat had none), and

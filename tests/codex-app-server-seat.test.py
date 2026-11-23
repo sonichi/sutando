@@ -173,7 +173,10 @@ for line in sys.stdin:
         except (OSError, ValueError):
             out({"id": rid, "error": {"code": -32601, "message": "method not found"}})
             continue
-        out({"id": rid, "result": {"data": models, "nextCursor": None}})
+        if isinstance(models, dict):
+            out({"id": rid, "result": models})
+        else:
+            out({"id": rid, "result": {"data": models, "nextCursor": None}})
     elif method == "turn/interrupt":
         if os.path.exists(os.path.join(D, "die-on-interrupt")):
             os._exit(8)
@@ -1018,6 +1021,29 @@ class CoreModelSwitch(SeatCase):
         self.assertEqual(s.serve(once=True), 0)
         notice, = self.results.glob("proactive-model-switched-*.txt")
         self.assertIn("gpt-new", notice.read_text())
+
+    def test_an_incomplete_or_malformed_model_list_is_no_verdict(self):
+        for listing in ({"data": [{"id": "gpt-old", "model": "gpt-old"}], "nextCursor": "more"},
+                        [{"id": "gpt-old", "model": "gpt-old"}, {"id": "gpt-x"}],
+                        [{"id": "gpt-old", "model": "gpt-old"}, "not a row"]):
+            with self.subTest(listing=listing):
+                (self.fake_dir / "models.json").write_text(json.dumps(listing))
+                s = self.launched(0, model="gpt-old")
+                s.ensure_server()
+                self.switch("gpt-new")
+                self.assertEqual(s.turn_model(), "gpt-new", "tried, never refused, on a partial list")
+                self.assertEqual(self.record()["status"], "pending")
+                s.close_server()
+
+    def test_no_trial_until_the_model_to_go_back_to_is_known(self):
+        self.catalog("gpt-new", "gpt-other")  # complete, but names no default
+        s = self.launched(0)                 # and the seat has no launch model
+        s.ensure_server()
+        self.switch("gpt-new")
+        self.assertEqual(s.turn_model(), "")
+        self.assertIsNone(s.trial)
+        self.assertEqual(self.record()["status"], "pending")
+        self.assertIn("the model to go back to is unknown", self.out.getvalue())
 
     def test_an_unreadable_model_list_is_no_verdict(self):
         self.switch("gpt-new")  # no models.json: model/list errors

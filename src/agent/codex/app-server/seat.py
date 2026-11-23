@@ -643,7 +643,8 @@ class Seat:
 
     def catalog(self) -> Optional[Tuple[set, str]]:
         """(model ids, Codex's default) from the app-server's own `model/list`, hidden ones included;
-        None when it cannot be read. The only evidence a pick is refused: it is not in the list."""
+        None unless the whole list was read and every row is well formed. Only a complete list is
+        evidence that a pick is refused (it is not in it)."""
         ids, default, cursor = set(), "", None
         try:
             for _ in range(20):
@@ -651,18 +652,23 @@ class Seat:
                 if cursor:
                     params["cursor"] = cursor
                 res = self.rpc.request("model/list", params, timeout=30)
-                for m in res.get("data") or []:
-                    if not isinstance(m, dict):
-                        continue
-                    names = [m.get(k) for k in ("model", "id") if isinstance(m.get(k), str) and m.get(k)]
+                rows = res.get("data") if isinstance(res, dict) else None
+                if not isinstance(rows, list):
+                    raise TypeError("model/list answered without a data list")
+                for m in rows:
+                    names = [m.get(k) for k in ("model", "id")] if isinstance(m, dict) else []
+                    if not names or not all(isinstance(n, str) and n for n in names):
+                        raise TypeError(f"a malformed model/list row: {one_line(m, 80)}")
                     ids.update(names)
-                    if m.get("isDefault") and names and not default:
+                    if m.get("isDefault") is True and not default:
                         default = names[0]
                 cursor = res.get("nextCursor")
                 if not cursor:
                     break
+            else:
+                raise TypeError("model/list has more pages than this seat reads")
         except (RuntimeError, AttributeError, TypeError) as e:
-            log(f"model: Codex's model list could not be read ({one_line(e, 120)}); no verdict from it")
+            log(f"model: Codex's model list is not complete ({one_line(e, 120)}); no verdict from it")
             return None
         return (ids, default) if ids else None
 
@@ -681,6 +687,10 @@ class Seat:
             return ""
         cat = self.catalog()
         before = self.model or (cat[1] if cat else "")  # an implicit default, named so it can be restored
+        if not before:
+            log(f"model: {picked} stays pending: the model to go back to is unknown (no launch model, "
+                "and Codex names no default)")
+            return ""
         if cat is not None and picked not in cat[0]:
             self.trial = (picked, rev, before, False)
             self.settle_model(False, f"{picked} is not in the model list Codex gives this account")
