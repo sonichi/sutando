@@ -592,6 +592,8 @@ class NoIntegrationsTest(unittest.TestCase):
 
     def connector(self, answer):
         class Rpc:
+            events = queue.Queue()      # nothing queued between turns
+
             def request(self, method, params=None, timeout=120):
                 if isinstance(answer, Exception):
                     raise answer
@@ -1187,6 +1189,50 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.assertTrue(result(self.work, "task-next").startswith("STUB echo:"), "the turn it arrived in is answered as usual")
         self.assertEqual([m.get("card") for m in metrics(self.work)], ["account-card", "account-started", None])
 
+    def test_a_switch_restarts_the_app_server_before_the_next_turn(self):
+        # The server holds the token it started with; the sign-in revokes it (VM 11-22: the first turn after
+        # a switch failed with "refresh token was revoked" because no restart happened).
+        (self.home / "stub-token").write_text("tok-a")
+        (self.home / "stub-login").write_text("success bob@example.org")
+        self.tap()
+        self.assertEqual((self.home / "stub-revoked").read_text().split(), ["tok-a"])
+        self.assertTrue(result(self.work, "task-next").startswith("STUB echo:"), result(self.work, "task-next"))
+        self.assertEqual(metrics(self.work)[-1].get("auth"), "reloaded", "restarted before the turn, not after a failure")
+        (_, _started), (_, done) = self.posted("$card2")
+        self.assertEqual(done["text"], "Signed in. I'm signed in as b…@example.org (pro).", "no shared login here")
+
+    def test_a_switch_on_a_login_shared_with_the_core_says_the_core_takes_it_at_its_next_restart(self):
+        core = Path(self.tmp.name) / "core-home"
+        core.mkdir()
+        (core / "auth.json").write_text("{}")
+        os.symlink(core / "auth.json", self.home / "auth.json")
+        (self.home / "stub-login").write_text("success bob@example.org")
+        self.tap(extra_task=False)
+        (_, _started), (_, done) = self.posted("$card2")
+        self.assertEqual(done["text"], "Signed in. I'm signed in as b…@example.org (pro). " + cc.SHARED_LOGIN)
+
+    def test_an_unauthorized_turn_restarts_once_and_a_login_rotated_meanwhile_answers(self):
+        (self.home / "stub-token").write_text("tok-a")
+        self.assertTrue(self.serve("task-1", "[[rotate]] hello").startswith("STUB echo:"))
+        self.assertEqual((metrics(self.work)[-1]["status"], metrics(self.work)[-1]["auth"]),
+                         ("completed", "restarted-unauthorized"))
+
+    def test_still_unauthorized_after_the_restart_shows_the_owner_the_account_card(self):
+        (self.home / "stub-token").write_text("tok-a")
+        (self.home / "stub-revoked").write_text("tok-a\n")     # revoked, and no new sign-in on disk
+        self.assertEqual(self.serve("task-1", "hello"), account_switch.ANSWERED)
+        ((room, card),) = self.posted()
+        self.assertEqual((room, card["state"], card["text"], [b["label"] for b in card["buttons"]]),
+                         (self.DM, "pending", cc.SIGNED_OUT + " " + account_switch.BELOW, ["Switch account"]))
+        self.assertEqual(card["account_controls"], {"runtime": "codex"})
+        rec = metrics(self.work)[-1]
+        self.assertEqual((rec["status"], rec["card"], rec["auth"]), ("unauthorized", "signed-out-card", "restarted-unauthorized"))
+        # Anywhere but the owner's DM: the line, never the bare status, and no card.
+        said = self.serve("task-2", "hello", channel="!room:s.space", kind="room")
+        self.assertEqual(said, cc.quoted(cc.SIGNED_OUT_ELSEWHERE).rstrip("\n") + "\n")
+        self.assertNotIn("status failed", said)
+        self.assertEqual(self.posted("$card2"), [])
+
     def test_a_sign_in_that_fails_or_cannot_start_says_so_and_names_the_account_still_in_use(self):
         (self.home / "stub-login").write_text("fail")
         self.tap(extra_task=False)       # nothing else to do: the report arrives while the connector idles
@@ -1444,6 +1490,57 @@ class FakeRpc:
 
     def notify(self, method, params=None):
         pass
+
+
+class AuthReloadTest(unittest.TestCase):
+    """The app-server runs on the login on disk: after a sign-in, an API key set or a logout it is restarted
+    before the next turn; the shared daemon is not."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patch = mock.patch.dict(os.environ, {"CODEX_HOME": self.tmp.name})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.auth = Path(self.tmp.name) / "auth.json"
+
+    def connector(self, server="stdio"):
+        c = cc.Connector(FakeRpc, cc.build_parser().parse_args(["--server", server, "--work", "w"]), note="n")
+        c.restarts = 0
+
+        def restart():
+            c.restarts += 1
+            c.auth_seen = cc.auth_print()
+        c.restart_server = restart
+        return c
+
+    def test_a_changed_login_file_or_a_finished_sign_in_restarts_the_server_once(self):
+        c = self.connector()
+        self.assertEqual((c.fresh_auth(), c.restarts), ("", 0), "nothing changed")
+        self.auth.write_text('{"OPENAI_API_KEY": "sk-x"}')            # an API key set
+        self.assertEqual((c.fresh_auth(), c.restarts), ("reloaded", 1))
+        self.assertEqual((c.fresh_auth(), c.restarts), ("", 1), "once per change")
+        self.auth.unlink()                                             # a logout
+        self.assertEqual((c.fresh_auth(), c.restarts), ("reloaded", 2))
+        c.rpc.events.put({"jsonrpc": "2.0", "method": "account/updated", "params": {"authMode": "chatgpt"}})
+        self.assertEqual((c.fresh_auth(), c.restarts), ("reloaded", 3), "a queued account change is read first")
+        c.auth_stale = True                                            # a sign-in finished (login_over)
+        self.assertEqual((c.fresh_auth(), c.restarts), ("reloaded", 4))
+
+    def test_the_shared_daemon_is_never_restarted(self):
+        c = self.connector("proxy")
+        self.auth.write_text("{}")
+        c.auth_stale = True
+        self.assertEqual((c.fresh_auth(), c.restarts), ("", 0))
+
+    def test_what_reads_as_unauthorized(self):
+        yes = ({"codexErrorInfo": "unauthorized"}, {"codex_error_info": {"unauthorized": {}}},
+               {"message": "Your access token could not be refreshed because your refresh token was revoked. "
+                           "Please log out and sign in again."})
+        no = (None, "unauthorized", {"codexErrorInfo": "usageLimitExceeded"}, {"message": "stream disconnected"})
+        self.assertEqual([cc.unauthorized(e) for e in yes], [True] * len(yes))
+        self.assertEqual([cc.unauthorized(e) for e in no], [False] * len(no))
+        self.assertTrue(cc.shared_login(str(self.auth)) is False)
 
 
 class EdgePathTest(unittest.TestCase):

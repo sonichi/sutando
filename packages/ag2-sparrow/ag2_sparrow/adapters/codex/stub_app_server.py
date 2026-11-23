@@ -7,6 +7,10 @@ request first and echoes the decision; `[[stall]]` never completes until
 `turn/interrupt`; `[[stall-hard]]` ignores the interrupt too. `[[limit]]` fails the turn on the account's usage
 limit (a used-up rate-limit window, an `error` notification, the turn's codexErrorInfo); `[[limit-bare]]` the
 same with no rate-limit window; `[[fail]]` fails it on another error.
+
+Tokens, as the real server holds them: `stub-token` under CODEX_HOME is read once, at start, and kept in
+memory. A sign-in that succeeds writes a new one there and lists the old one in `stub-revoked`; a turn on a
+token listed there fails as `unauthorized`, as a server that kept the old login after a switch does.
 """
 import json
 import os
@@ -73,6 +77,7 @@ def finish_turn(tid, turn_id, item_id, reply, status="completed", error=None):
           "params": {"threadId": tid, "turn": {"id": turn_id, "status": status, "items": [], "error": error}}})
 
 
+TOKEN = home_file("stub-token")    # read once, at start: a later sign-in does not reach this process
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -101,6 +106,11 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": rid, "result": {"type": "chatgpt", "loginId": "login-1", "authUrl": page}})
         if plan[:1] == ["success"]:
             home_file("stub-account", "\n" + plan[1])
+            old = home_file("stub-token")
+            if old:
+                home_file("stub-revoked", old + "\n")
+                with open(os.path.join(os.environ.get("CODEX_HOME") or ".", "stub-token"), "w") as f:
+                    f.write("tok-" + uuid.uuid4().hex[:8])
         if plan and plan[0] != "page":
             send({"jsonrpc": "2.0", "method": "account/login/completed",
                   "params": {"loginId": "login-1", "success": plan[0] == "success",
@@ -167,6 +177,12 @@ for line in sys.stdin:
             for n, (method, params) in enumerate((("item/tool/requestUserInput", {"questions": []}),
                                                   ("currentTime/read", {}), ("stub/unknownRequest", {}))):
                 send({"jsonrpc": "2.0", "id": REQ_ID + 100 + n, "method": method, "params": params})
+        if "[[rotate]]" in text and TOKEN and not home_file("stub-rotated"):
+            # Another sign-in rotated the login while this server ran: the disk has a new token, memory the old.
+            home_file("stub-rotated", "1")
+            home_file("stub-revoked", TOKEN + "\n")
+            with open(os.path.join(os.environ.get("CODEX_HOME") or ".", "stub-token"), "w") as f:
+                f.write("tok-rotated")
         if "[[stall" in text:
             STALLED[turn_id] = (tid, "late" if "[[stall-late]]" in text else "[[stall-hard]]" in text)
         elif "[[approval]]" in text:
@@ -174,6 +190,13 @@ for line in sys.stdin:
             PENDING[REQ_ID] = (tid, turn_id, item_id, reply)
             send({"jsonrpc": "2.0", "id": REQ_ID, "method": "item/commandExecution/requestApproval",
                   "params": {"threadId": tid, "turnId": turn_id, "itemId": item_id, "command": ["rm", "-rf", "x"]}})
+        elif TOKEN and TOKEN in home_file("stub-revoked").split():
+            error = {"message": "Your access token could not be refreshed because your refresh token was revoked. "
+                                "Please log out and sign in again.", "codexErrorInfo": "unauthorized",
+                     "additionalDetails": None}
+            send({"jsonrpc": "2.0", "method": "error",
+                  "params": {"threadId": tid, "turnId": turn_id, "error": error, "willRetry": False}})
+            finish_turn(tid, turn_id, item_id, "", "failed", error)
         elif "[[limit" in text:
             error = {"message": "You've hit your usage limit. Upgrade to Pro or try again at 3:05 PM.",
                      "codexErrorInfo": "usageLimitExceeded", "additionalDetails": None}
