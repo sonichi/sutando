@@ -36,6 +36,7 @@ import quota_status as qs  # noqa: E402
 from ag2_sparrow import remote_gateway_bridge as rgb  # noqa: E402
 
 CONTRACT = json.loads((REPO / "contracts" / "quota_status.v1" / "heartbeat.json").read_text())
+LIMITED = json.loads((REPO / "contracts" / "quota_status.v1" / "heartbeat-limited.json").read_text())
 NOW = 1795176000.0
 TOP_KEYS = {"v", "five_hour", "seven_day", "limit_state", "resumes_at", "last_checked"}
 WINDOW_KEYS = {"used_pct", "resets_at"}
@@ -72,8 +73,20 @@ class Projection(unittest.TestCase):
         for leak in ("acct", "secret", "claude-opus", "detail", "stopfailure", "headers"):
             self.assertNotIn(leak, text)
 
-    def test_the_contract_fixture_is_what_the_record_projects_to(self):
-        self.assertEqual(qs.project(record(), NOW), CONTRACT["health"]["quota"])
+    def test_the_contract_fixtures_are_what_the_records_project_to(self):
+        allowed = record(limit_state="allowed", utilization_5h=0.42)
+        self.assertEqual(qs.project(allowed, NOW), CONTRACT["health"]["quota"])
+        self.assertEqual(qs.project(record(resets_at_7d=None), NOW), LIMITED["health"]["quota"])
+        self.assertEqual({k: v for k, v in LIMITED.items() if k != "health"},
+                         {k: v for k, v in CONTRACT.items() if k != "health"})
+
+    def test_unknown_times_are_null_and_overage_is_not_clamped(self):
+        rec = record(limit_state="overage", utilization_5h=1.042, resets_at_5h=None, last_checked=None,
+                     rejected_until=None, headers={})
+        block = qs.project(rec, NOW)
+        self.assertEqual(block["five_hour"], {"used_pct": 104.2, "resets_at": None})
+        self.assertIsNone(block["last_checked"])
+        self.assertIn("resumes_at", block)
 
     def test_allowed_has_no_resumes_at(self):
         block = qs.project(record(limit_state="allowed", utilization_5h=0.42), NOW)

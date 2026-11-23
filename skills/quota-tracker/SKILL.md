@@ -66,14 +66,24 @@ On by default. The gateway bridge sends the core's quota to s.space as `health.q
 
 ```json
 {"v": 1,
- "five_hour": {"used_pct": 100.0, "resets_at": 1795190400},
+ "five_hour": {"used_pct": 42.0, "resets_at": 1795190400},
  "seven_day": {"used_pct": 7.0, "resets_at": 1795600000},
+ "limit_state": "allowed",
+ "last_checked": 1795176000}
+```
+
+and, when limited:
+
+```json
+{"v": 1,
+ "five_hour": {"used_pct": 100.0, "resets_at": 1795190400},
+ "seven_day": {"used_pct": 7.0, "resets_at": null},
  "limit_state": "rejected",
  "resumes_at": 1795190400,
  "last_checked": 1795176000}
 ```
 
-Times are epoch seconds. `limit_state` is `allowed`, `overage` or `rejected`; `resumes_at` is present only when it is not `allowed`. A window the record does not name is left out. No account digest, other login's numbers, headers, rejection ledger or model is sent. The full heartbeat example is `contracts/quota_status.v1/heartbeat.json`.
+Times are epoch seconds. `limit_state` is `allowed`, `overage` or `rejected`. `resumes_at` is omitted when the state is `allowed`; otherwise it is present, and null when no reset time is known. A window the record does not name is left out. A window's `resets_at` and the block's `last_checked` are null when the record does not carry them. `used_pct` is not clamped: in `overage` it can exceed 100, and a consumer may clamp it for display. No account digest, other login's numbers, headers, rejection ledger or model is sent. The full heartbeat examples are `contracts/quota_status.v1/heartbeat.json` (allowed) and `heartbeat-limited.json` (limited).
 
 - The block changes when a used percentage moves by at least 1 point or the limit state flips, and is otherwise refreshed at most every 5 minutes; a change sends a heartbeat early, nothing else does. The status line never sends anything.
 - A failed read keeps the last block; a broker that refuses the block (400/422) gets beats without it for an hour.

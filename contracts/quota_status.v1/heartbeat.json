@@ -18,10 +18,9 @@
     "since": null,
     "quota": {
       "v": 1,
-      "five_hour": {"used_pct": 100.0, "resets_at": 1795190400},
+      "five_hour": {"used_pct": 42.0, "resets_at": 1795190400},
       "seven_day": {"used_pct": 7.0, "resets_at": 1795600000},
-      "limit_state": "rejected",
-      "resumes_at": 1795190400,
+      "limit_state": "allowed",
       "last_checked": 1795176000
     }
   }
