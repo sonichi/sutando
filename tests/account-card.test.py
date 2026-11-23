@@ -351,7 +351,10 @@ class Switch(Base):
         self.assertEqual(self.live(), B)
         self.assertEqual(stat.S_IMODE((self.home / "auth.json").stat().st_mode), 0o600)
         self.assertTrue((self.store / f"{key_of('acct-a')}.json").exists(), "the previous account stays saved")
-        self.assertEqual(out["say"], "Switched. The core restarted and is signed in as b…@work.io (pro).")
+        self.assertEqual(out["say"], "Switched. The core restarted, and Codex confirms its saved sign-in is "
+                                     "b…@work.io (pro). I can't yet confirm which account the running core "
+                                     "itself is using.")
+        self.assertEqual((out["verified"], out["core_identity"]), ("saved-sign-in", "unconfirmed"))
         last = self.fake.cards()[-1]
         self.assertEqual((last["id"], last["state"]), (acc.NOTE_ID, "done"))
         self.assertFalse(self.ws.joinpath(*acc.RUNNING).exists())

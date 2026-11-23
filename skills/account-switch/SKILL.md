@@ -49,13 +49,17 @@ refused.
 A "Use" tap answers at once ("Switching the core to X. It restarts once this turn has finished…") and
 starts `account_card.py switch` detached, in its own session, because the core restarts. `switch`:
 
-1. keeps the current `auth.json` in memory and saves it in the store;
+1. refuses, changing nothing, when the current `auth.json` exists but cannot be read or cannot be saved
+   to switch back to (an API key, a broken file); otherwise keeps it in memory and saves it in the store;
 2. writes the saved one as the core's `<CODEX_HOME>/auth.json` (0600);
 3. runs `src/agent/graceful-restart.sh` (it waits for the core's turn to end, then
    `start-cli.sh --restart`; a seat core is replaced as a seat);
-4. reads the core's sign-in again and posts the outcome in the same DM: **"Switched. The core restarted
-   and is signed in as X."**, or **"I could not switch to X. I'm still signed in as Y. <reason>"**. When
-   the restart did not happen (exit 3 not ready, 4 put off), the previous `auth.json` is put back.
+4. waits for the core's heartbeat, asks Codex's own `account/read` which account the saved sign-in is,
+   and posts the outcome in the same DM: **"Switched. The core restarted, and Codex confirms its saved
+   sign-in is X. I can't yet confirm which account the running core itself is using."**, or why not.
+   When the restart definitely did not happen (exit 3 not ready, 4 put off, 5 rehearsal), the previous
+   state is put back, absence included; after any other failure the new sign-in stays and the reply
+   says the outcome is unknown. One switch runs at a time.
 
 Its log is `<workspace>/logs/account-card.log`; nothing in it, in the cards or in the JSON output is a
 token or a code.

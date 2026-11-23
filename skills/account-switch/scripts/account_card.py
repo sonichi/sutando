@@ -28,8 +28,9 @@ place (0600), and runs src/agent/graceful-restart.sh, which waits for the core t
 A sign-in that cannot be read or saved to switch back to is never replaced. One attempt runs at a
 time: admission and the switch each hold a lock, and only that attempt's record is cleared. After
 the restart it waits for the core's heartbeat and asks Codex (`account/read`) which account the
-home is on, then posts the outcome in the same DM: "Switched. The core restarted and is signed in
-as X." or why not. When the restart definitely did not happen (graceful-restart exit 3/4/5), the
+home's saved sign-in is, then posts the outcome in the same DM: "Switched. The core restarted, and
+Codex confirms its saved sign-in is X", saying that the running core's own identity is not
+confirmed, or why not. When the restart definitely did not happen (graceful-restart exit 3/4/5), the
 previous state, absence included, is put back; after any other failure the new sign-in stays.
 
 Every command prints one JSON object. Exit 0 done, 1 a negative answer, 2 refused. Stdlib only.
@@ -570,7 +571,8 @@ def core_ready(ws: Path, since: float, *, sleep=time.sleep, clock=time.time) -> 
 
 
 def live_account(home: Path) -> dict:
-    """Codex's own answer for the home the restarted core runs under (never the file alone)."""
+    """Codex's own answer for the sign-in saved in the core's home (never the file alone). It runs a
+    separate app-server, so it verifies the saved sign-in, not the identity the running core uses."""
     import codex_account
     return codex_account.from_app_server(home) or {}
 
@@ -650,7 +652,8 @@ def do_switch(ws: Path, key: str, *, restart=restart_core, ready=core_ready, liv
     want_email = _email(want).lower()
     if now_ident and now_ident[0] == key and acct.get("kind") == "chatgpt" and \
             (not want_email or str(acct.get("email") or "").lower() == want_email):
-        return "done", f"Switched. The core restarted and is signed in as {label}."
+        return "done", (f"Switched. The core restarted, and Codex confirms its saved sign-in is {label}. "
+                        "I can't yet confirm which account the running core itself is using.")
     if not acct:
         return "error", (f"The core restarted with {label}'s sign-in, but Codex did not confirm the account. "
                          "Ask me for the account card to check.")
@@ -689,7 +692,9 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
             break
         if i + 1 < SETTLE_TRIES:
             sleep(SETTLE_PAUSE_S)
-    return _emit({**out, "outcome": state, "say": words}, 0 if state == "done" else 1)
+    return _emit({**out, "outcome": state, "say": words,
+                  "verified": "saved-sign-in" if state == "done" else None, "core_identity": "unconfirmed"},
+                 0 if state == "done" else 1)
 
 
 def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, run=subprocess.run, codex_read=None,
