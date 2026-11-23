@@ -157,9 +157,9 @@ class Base(unittest.TestCase):
             self.signed_in(self.restart_writes)
         return self.restart_rc
 
-    def ready(self, ws, since):
-        self.ready_since.append(since)
-        return self.ready_ok
+    def ready(self, ws, since, before_pid):
+        self.ready_since.append((since, before_pid))
+        return {True: acc.NEW, False: acc.NONE}.get(self.ready_ok, self.ready_ok)
 
     def live_account(self, home):
         """Codex's answer for the restarted core: the home's sign-in unless a test says otherwise."""
@@ -371,7 +371,8 @@ class Switch(Base):
         self.restart_writes = A
         rc, out = self.switch()
         self.assertEqual(out["outcome"], "error")
-        self.assertIn("its sign-in is a…@example.com (plus), not b…@work.io (pro)", out["say"])
+        self.assertIn("The core restarted, but its saved sign-in is a…@example.com (plus), not b…@work.io (pro)",
+                      out["say"])
 
     def reset_attempt(self):
         rec = {"attempt": self.attempt, "key": self.key, "room": DM, "ts": 1e12}
@@ -419,7 +420,7 @@ class Switch(Base):
         self.ready_ok = False
         rc, out = self.switch()
         self.assertEqual(out["outcome"], "error")
-        self.assertIn("has not reported ready", out["say"])
+        self.assertIn("has not reported back", out["say"])
         self.assertEqual(len(self.ready_since), 1)
         self.reset_attempt()
         self.ready_ok = True
@@ -432,6 +433,39 @@ class Switch(Base):
                 self.assertEqual(out["outcome"], "error")
                 self.assertIn(words, out["say"])
                 self.reset_attempt()
+
+    def test_a_heartbeat_from_the_same_core_is_not_called_a_restart(self):
+        self.ready_ok = acc.SAME
+        rc, out = self.switch()
+        self.assertEqual((rc, out["outcome"], out["restart"]), (1, "info", "unconfirmed"))
+        self.assertIn("can't tell it is a new core", out["say"])
+        self.assertNotIn("Switched", out["say"])
+        self.assertEqual(self.fake.cards()[-1]["state"], "info")
+
+    def test_the_pre_switch_core_pid_is_what_a_new_core_is_compared_with(self):
+        import util_paths
+        cores = self.ws / "state" / "cores"
+        cores.mkdir(parents=True, exist_ok=True)
+        (cores / "h.alive").write_text(json.dumps({"pid": 111, "heartbeat_pid": 999, "session": "sutando-core",
+                                                    "socket": "/tmp/sutando-tmux.sock", "last_beat_at": 5.0}))
+        with mock.patch.object(util_paths, "_host_label", return_value="h"):
+            self.switch()
+        self.assertEqual(self.ready_since[-1][1], 111)
+
+    def assertNoRestartClaim(self, answer):
+        self.ready_ok, self.live_answer = acc.SAME, answer
+        rc, out = self.switch()
+        self.assertNotIn("restarted", out["say"])
+        self.assertNotIn("Switched", out["say"])
+
+    def test_same_generation_and_the_wanted_account_claims_no_restart(self):
+        self.assertNoRestartClaim(None)
+
+    def test_same_generation_and_no_confirmation_claims_no_restart(self):
+        self.assertNoRestartClaim({})
+
+    def test_same_generation_and_another_account_claims_no_restart(self):
+        self.assertNoRestartClaim({"kind": "chatgpt", "email": "alice@example.com"})
 
     def test_settlement_is_bound_to_the_whole_recorded_attempt(self):
         rec = json.loads(self.ws.joinpath(*acc.RUNNING).read_text())
@@ -606,24 +640,102 @@ class Edges(Base):
         self.assertEqual(acc.restart_core(mock.Mock(side_effect=acc.subprocess.TimeoutExpired("bash", 1))), 124)
         self.assertEqual(acc.restart_core(mock.Mock(side_effect=OSError("no bash"))), 127)
 
-    def test_core_ready_waits_for_a_newer_heartbeat_within_the_limit(self):
-        import util_paths
+    def beat(self, pid, at, writer=999, session="sutando-core", socket="/tmp/sutando-tmux.sock"):
         cores = self.ws / "state" / "cores"
-        cores.mkdir(parents=True)
-        with mock.patch.object(util_paths, "_host_label", return_value="h"):
-            t = [1000.0]
-            beats = []
+        cores.mkdir(parents=True, exist_ok=True)
+        (cores / "h.alive").write_text(json.dumps({"pid": pid, "heartbeat_pid": writer, "session": session,
+                                                    "socket": socket, "last_beat_at": at, "started_at": 1.0}))
 
-            def sleep(_):
-                t[0] += acc.READY_POLL_S
-                beats.append(1)
-                if len(beats) == 2:
-                    (cores / "h.alive").write_text("{}")
-                    os.utime(cores / "h.alive", (2000, 2000))
-            self.assertTrue(acc.core_ready(self.ws, 1500.0, sleep=sleep, clock=lambda: t[0]))
-            self.assertFalse(acc.core_ready(self.ws, 3000.0, sleep=sleep, clock=lambda: t[0]))
+    def ready_with(self, since, before, beats):
+        """core_ready under a fake clock; `beats` is written one per poll."""
+        import util_paths
+        t = [1000.0]
+        beats = list(beats)
+
+        def sleep(_):
+            t[0] += acc.READY_POLL_S
+            if beats:
+                self.beat(*beats.pop(0))
+        with mock.patch.object(util_paths, "_host_label", return_value="h"):
+            return acc.core_ready(self.ws, since, before, sleep=sleep, clock=lambda: t[0])
+
+    def test_a_fresh_beat_naming_another_core_is_a_new_generation(self):
+        self.beat(111, 900.0)
+        self.assertEqual(self.ready_with(1000.0, 111, [(111, 1001.0), (222, 1002.0)]), acc.NEW)
+
+    def test_fresh_beats_from_the_same_core_are_same(self):
+        self.beat(111, 900.0)
+        self.assertEqual(self.ready_with(1000.0, 111, [(111, 1001.0)] * 3), acc.SAME)
+
+    def test_no_fresh_beat_is_none(self):
+        self.beat(222, 900.0)
+        self.assertEqual(self.ready_with(1000.0, 111, []), acc.NONE)
+
+    def test_without_a_known_previous_core_a_fresh_beat_is_not_a_new_generation(self):
+        self.assertEqual(self.ready_with(1000.0, None, [(222, 1001.0)]), acc.SAME)
+
+    def test_a_writer_only_beat_names_no_core(self):
+        import util_paths
+        with mock.patch.object(util_paths, "_host_label", return_value="h"):
+            self.beat(999, 5.0, writer=999)
+            self.assertIsNone(acc.core_beat(self.ws)["pid"])
+
+    def test_a_beat_without_the_writers_pid_names_no_core(self):
+        import util_paths
+        with mock.patch.object(util_paths, "_host_label", return_value="h"):
+            self.beat(222, 5.0, writer=None)
+            self.assertIsNone(acc.core_beat(self.ws)["pid"])
+
+    def test_a_beat_without_an_observed_session_names_no_core(self):
+        import util_paths
+        with mock.patch.object(util_paths, "_host_label", return_value="h"):
+            self.beat(222, 5.0, session="")
+            self.assertIsNone(acc.core_beat(self.ws)["pid"])
+
+    def test_a_beat_from_another_session_names_no_core(self):
+        import util_paths
+        with mock.patch.object(util_paths, "_host_label", return_value="h"):
+            self.beat(222, 5.0, session="sutando-core-watcher")
+            self.assertIsNone(acc.core_beat(self.ws)["pid"])
+
+    def test_a_beat_on_another_socket_names_no_core(self):
+        import util_paths
+        with mock.patch.object(util_paths, "_host_label", return_value="h"):
+            self.beat(222, 5.0, socket="/tmp/other.sock")
+            self.assertIsNone(acc.core_beat(self.ws)["pid"])
+
+    def test_the_intended_session_and_socket_follow_the_launch_env(self):
+        import util_paths
+        env = {"SUTANDO_TMUX_SESSION": "core-b", "SUTANDO_TMUX_SOCKET": "/tmp/b.sock"}
+        with mock.patch.object(util_paths, "_host_label", return_value="h"), mock.patch.dict(os.environ, env):
+            self.beat(222, 5.0)
+            self.assertIsNone(acc.core_beat(self.ws)["pid"])
+            self.beat(222, 5.0, session="core-b", socket="/tmp/b.sock")
+            self.assertEqual(acc.core_beat(self.ws)["pid"], 222)
+
+    def test_a_new_pid_from_another_session_after_the_restart_is_not_a_new_core(self):
+        self.beat(111, 900.0)
+        self.assertEqual(self.ready_with(1000.0, 111, [(222, 1001.0, 999, "other")] * 3), acc.SAME)
+
+    def test_a_writer_only_beat_after_the_restart_is_not_a_new_core(self):
+        self.beat(111, 900.0)
+        self.assertEqual(self.ready_with(1000.0, 111, [(999, 1001.0, 999)] * 3), acc.SAME)
+
+    def test_a_writer_only_beat_before_the_restart_leaves_the_generation_unknown(self):
+        self.assertEqual(self.ready_with(1000.0, None, [(222, 1001.0)]), acc.SAME)
+
+    def test_unreadable_heartbeats_are_empty(self):
+        import util_paths
+        with mock.patch.object(util_paths, "_host_label", return_value="h"):
+            self.assertEqual(acc.core_beat(self.ws), {})
+            self.beat("x", "y", writer="z")
+            self.assertEqual(acc.core_beat(self.ws), {"pid": None, "last_beat_at": None})
+            (self.ws / "state" / "cores" / "h.alive").write_text("[]")
+            self.assertEqual(acc.core_beat(self.ws), {})
+            (self.ws / "state" / "cores" / "h.alive").write_text("{")
+            self.assertEqual(acc.core_beat(self.ws), {})
         with mock.patch.object(util_paths, "_host_label", side_effect=RuntimeError("x")):
-            self.assertFalse(acc.core_ready(self.ws, 0.0))
+            self.assertEqual(acc.core_beat(self.ws), {})
 
     def test_live_account_asks_codex_and_email_reads_only_the_claim(self):
         import codex_account
