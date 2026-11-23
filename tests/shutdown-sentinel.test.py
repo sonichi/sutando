@@ -104,6 +104,20 @@ sd.clear_shutdown()
 check("after clear on boot — task intake resumes (no permanent suppression)",
       _intake_accepts_new_task() is True)
 
+# Compare-and-clear: a stop is cleared only by the token of the write that made it.
+sd.clear_shutdown()
+_tok = sd.mark_if_absent("codex-seat-not-ready")
+check("mark-if-absent writes a stop and returns its token", bool(_tok) and sd.is_shutting_down())
+check("mark-if-absent leaves an existing stop alone and returns no token", sd.mark_if_absent("other") == "")
+sd.mark_shutdown("a newer drain")
+check("clear-if with the old token leaves a newer stop in place", sd.clear_if(_tok) is False and sd.is_shutting_down())
+_tok2 = sd._token(_tmp)
+check("clear-if with the current token clears it", sd.clear_if(_tok2) is True and not sd.is_shutting_down())
+check("clear-if with no token clears nothing", sd.clear_if("") is False)
+_a = sd.mark_if_absent("x"); sd.clear_shutdown(); _b = sd.mark_if_absent("x")
+check("two stops with the same reason in the same second still differ", _a != _b)
+sd.clear_shutdown()
+
 print()
 if failures:
     print(f"FAIL — {len(failures)}: {failures}")
