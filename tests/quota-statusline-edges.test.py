@@ -282,6 +282,10 @@ class SignedIn(Tmp):
         env = mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "true"})
         env.start()
         self.addCleanup(env.stop)
+        # No host process leaks in: tests that need live sessions say so.
+        self.live = mock.patch.object(csi, "live_sessions", return_value={})
+        self.live.start()
+        self.addCleanup(self.live.stop)
 
     def _runner(self, rc=0, out='{"loggedIn": true}', exc=None):
         def run(cmd, **kw):
@@ -342,7 +346,7 @@ class SignedIn(Tmp):
         self.assertIn(str(self.core), row["detail"])
         self.assertEqual(len(self._results()), 1)
         body = (self.ws / "results" / self._results()[0]).read_text()
-        self.assertIn(self.csi.sign_in_command(str(self.core)), body)
+        self.assertIn(self.csi.sign_in_command(os.path.realpath(self.core)), body)
         self.assertEqual(self.calls[-1][1]["CLAUDE_CONFIG_DIR"], str(self.core))
         self.csi.check(self.ws, str(self.core), runner=run, now=T0 + 3600)
         self.assertEqual(len(self._results()), 1, "deduped within the day")
@@ -356,7 +360,67 @@ class SignedIn(Tmp):
         self.assertEqual(row["status"], "ok")
         self.assertIn("not found", row["detail"])
         self.assertEqual(self._results(), [])
-        self.assertIn("could not be resolved", self.csi.check(self.ws, None, runner=self._runner())["detail"])
+        self.assertIn("no config dir to check", self.csi.check(self.ws, None, runner=self._runner())["detail"])
+
+    def test_an_unsigned_worker_dir_is_reported_while_the_core_is_signed_in(self):
+        worker = self.d / "worker-ccd"
+        worker.mkdir()
+        worker_env = {"PATH": "/bin", "CLAUDE_CONFIG_DIR": str(worker), "ANTHROPIC_API_KEY": "worker-env"}
+        self.live.stop()
+        live = mock.patch.object(self.csi, "live_sessions",
+                                 return_value={os.path.realpath(worker): worker_env,
+                                               os.path.realpath(self.core): {"PATH": "/bin"}})
+        live.start()
+        self.addCleanup(live.stop)
+        core = os.path.realpath(self.core)
+
+        def claude(cmd, **kw):
+            e = kw["env"]
+            self.calls.append(e)
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(
+                {"loggedIn": os.path.realpath(e["CLAUDE_CONFIG_DIR"]) == core}))
+        row = self.csi.check(self.ws, str(self.core), runner=claude, now=T0)
+        self.assertEqual(row["status"], "fail")
+        self.assertIn(os.path.realpath(worker), row["detail"])
+        self.assertNotIn(f"for {core}", row["detail"])
+        self.assertEqual(len(self.calls), 2, "the core's dir is probed once though a live session also uses it")
+        worker_probe = [e for e in self.calls if e["CLAUDE_CONFIG_DIR"] == os.path.realpath(worker)][0]
+        self.assertNotIn("ANTHROPIC_API_KEY", worker_probe)  # that worker's own env, scoped the same way
+        self.assertEqual(len(self._results()), 1)
+
+    def test_live_sessions_reads_each_sutando_session_once(self):
+        a, b = self.d / "a", self.d / "b"
+        a.mkdir()
+        b.mkdir()
+        ps = (f"/opt/bin/claude --name sutando-core --x CLAUDE_CONFIG_DIR={a} PATH=/bin\n"
+              f"/opt/bin/claude --name w-1 CLAUDE_CONFIG_DIR={b} PATH=/bin\n"
+              f"/opt/bin/claude --name w-2 CLAUDE_CONFIG_DIR={b} PATH=/usr/bin\n"
+              f"/opt/bin/claude CLAUDE_CONFIG_DIR={self.d} PATH=/bin\n"
+              f"/usr/bin/vim --name x CLAUDE_CONFIG_DIR={self.d}\n")
+        self.live.stop()
+        got = self.csi.live_sessions(lambda argv, **kw: types.SimpleNamespace(returncode=0, stdout=ps))
+        self.live.start()
+        self.assertEqual(set(got), {os.path.realpath(a), os.path.realpath(b)})
+        self.assertEqual(got[os.path.realpath(b)]["PATH"], "/bin")
+        self.live.stop()
+        self.assertEqual(self.csi.live_sessions(lambda a, **k: types.SimpleNamespace(returncode=1, stdout=ps)), {})
+        self.assertEqual(self.csi.live_sessions(lambda a, **k: (_ for _ in ()).throw(OSError())), {})
+        self.live.start()
+
+    def test_concurrent_runs_send_one_notice(self):
+        run = self._runner(rc=1)
+        env = self.csi.direct_auth_env({"PATH": "/bin"}, str(self.core))
+        barrier = threading.Barrier(8)
+
+        def go():
+            barrier.wait()
+            self.csi.check_dir(self.ws, str(self.core), env, run, T0)
+        threads = [threading.Thread(target=go) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        self.assertEqual(len(self._results()), 1)
 
     def test_records_are_per_config_dir_so_one_never_erases_another(self):
         other = self.d / "other"

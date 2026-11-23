@@ -33,7 +33,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 RECORD_DIR = "claude-sign-in"
 TIMEOUT_S = 8.0
-NOTIFY_EVERY_S = 24 * 3600
 PROBE = ["claude", "auth", "status", "--json"]
 _LOCAL_PROXY = re.compile(r"^http://(localhost|127\.0\.0\.1|\[::1\]):7846/?$")
 SWITCH = "QUOTA_STATUSLINE_ENABLED"
@@ -150,42 +149,84 @@ def direct_routing_on() -> bool:
     return value is not None and value.strip().lower() not in OFF
 
 
-def check(workspace, config_dir: Optional[str], *, socket: Optional[str] = None,
-          runner: Callable = subprocess.run, tmux_runner: Callable = subprocess.run,
-          now: Optional[float] = None) -> dict:
-    """Health-check row `claude-sign-in`: fail for a config dir that is not signed in on its own,
-    queuing one owner message for it per NOTIFY_EVERY_S."""
-    row = {"name": "claude-sign-in", "status": "ok"}
-    if not direct_routing_on():
-        row["detail"] = "sessions go through the credential proxy; no own sign-in needed"
-        return row
-    if not config_dir:
-        row["detail"] = "the core's config dir could not be resolved; sign-in not checked"
-        return row
-    now = time.time() if now is None else now
-    env = direct_auth_env(os.environ, config_dir, pane_env(socket, tmux_runner))
+def live_sessions(ps_runner: Callable = subprocess.run) -> Dict[str, Dict[str, str]]:
+    """{config dir: that session's own environment} for each live Sutando Claude session (a
+    `claude` process the launchers started with `--name`), the core's and every worker's, deduped."""
+    from quota_availability import _env_pairs
+    try:
+        out = ps_runner(["ps", "-xeww", "-U", str(os.getuid()), "-o", "command="],
+                        capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    found: Dict[str, Dict[str, str]] = {}
+    for cmd in (out.stdout or "").splitlines() if out.returncode == 0 else []:
+        cmd = cmd.strip()
+        argv = cmd.split(" ")
+        if os.path.basename(argv[0]) != "claude" or "--name" not in argv:
+            continue
+        env = _env_pairs(cmd)
+        ccd = env.get("CLAUDE_CONFIG_DIR")
+        if ccd:
+            found.setdefault(os.path.realpath(ccd), env)
+    return found
+
+
+def _claim_notice(workspace, config_dir: str, now: float) -> bool:
+    """True for the one caller that claims today's notice for this dir (exclusive create)."""
+    day = time.strftime("%Y%m%d", time.gmtime(now))
+    marker = record_path(workspace, config_dir).with_name(f"{record_path(workspace, config_dir).stem}-{day}.notice")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.close(os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    except FileExistsError:
+        return False
+    return True
+
+
+def check_dir(workspace, config_dir: str, env: Mapping[str, str], runner: Callable, now: float) -> Optional[bool]:
+    """Probe one config dir, record it, and send today's notice once when it is not signed in."""
     verdict = signed_in(env, runner)
-    prev = read_record(workspace, config_dir)
     rec = {"config_dir": os.path.realpath(config_dir), "signed_in": verdict, "checked_at": now}
-    if verdict is None:
-        row["detail"] = "claude CLI not found; sign-in not checked"
-    elif verdict:
-        row["detail"] = f"signed in: {config_dir}"
-    else:
-        notified = prev.get("notified_at")
-        if not isinstance(notified, (int, float)) or now - notified >= NOTIFY_EVERY_S:
-            try:
+    if verdict is False:
+        try:
+            if _claim_notice(workspace, config_dir, now):
                 rec["notice"] = _notify(workspace, config_dir, now)
-                notified = now
-            except (OSError, ValueError):
-                pass
-        if isinstance(notified, (int, float)):
-            rec["notified_at"] = notified
-        row["status"] = "fail"
-        row["detail"] = (f"Claude is not signed in for {config_dir}: sessions there go direct and cannot "
-                         f"reach Anthropic. Sign in: {sign_in_command(config_dir)}")
+        except (OSError, ValueError):
+            pass
     try:
         write_record(workspace, config_dir, rec)
     except OSError:
         pass
+    return verdict
+
+
+def check(workspace, config_dir: Optional[str], *, socket: Optional[str] = None,
+          runner: Callable = subprocess.run, tmux_runner: Callable = subprocess.run,
+          ps_runner: Callable = subprocess.run, now: Optional[float] = None) -> dict:
+    """Health-check row `claude-sign-in`: fail naming every config dir a live Sutando session uses
+    (the core's and each worker's) that is not signed in on its own, with today's notice sent once."""
+    row = {"name": "claude-sign-in", "status": "ok"}
+    if not direct_routing_on():
+        row["detail"] = "sessions go through the credential proxy; no own sign-in needed"
+        return row
+    now = time.time() if now is None else now
+    dirs: Dict[str, Dict[str, str]] = {}
+    if config_dir:
+        dirs[os.path.realpath(config_dir)] = direct_auth_env(os.environ, config_dir, pane_env(socket, tmux_runner))
+    for ccd, env in live_sessions(ps_runner).items():
+        dirs.setdefault(ccd, direct_auth_env(os.environ, ccd, env))
+    if not dirs:
+        row["detail"] = "no config dir to check (the core's could not be resolved and no session is live)"
+        return row
+    verdicts = {d: check_dir(workspace, d, env, runner, now) for d, env in dirs.items()}
+    unsigned = [d for d, v in verdicts.items() if v is False]
+    unknown = [d for d, v in verdicts.items() if v is None]
+    if unsigned:
+        row["status"] = "fail"
+        row["detail"] = ("Claude is not signed in for " + ", ".join(unsigned) + ": sessions there go direct and "
+                         "cannot reach Anthropic. Sign in: " + "; ".join(sign_in_command(d) for d in unsigned))
+    elif unknown:
+        row["detail"] = "claude CLI not found; sign-in not checked for " + ", ".join(unknown)
+    else:
+        row["detail"] = "signed in: " + ", ".join(verdicts)
     return row
