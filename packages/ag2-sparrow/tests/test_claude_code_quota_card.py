@@ -70,7 +70,8 @@ class Notice(Base):
         self.assertEqual(self.tick(QUIET, 10.0), "")
         self.assertEqual(self.tick(QUIET, quota_card.CLEAR_S - 1), "")
         self.assertEqual(self.tick(QUIET, 2.0), "quota-cleared")
-        self.assertEqual(quota_card.load(self.root), {"room": DM})
+        self.assertEqual(quota_card.load(self.root), {})
+        self.assertEqual(quota_card.room(self.root), DM, "the room is the claim's record: untouched")
         self.assertEqual(self.tick(QUIET, 5.0), "")
         self.assertEqual(self.tick(LIMITED, 5.0), "quota-card")
         self.assertEqual(len(self.queued()), 2)
@@ -81,17 +82,19 @@ class Notice(Base):
         self.assertEqual(self.tick(LIMITED, 5.0), "", "asked again no sooner than a minute")
         # The owner's own message in their DM is claimed (and cannot be answered): its room is kept.
         self.claim(self.task("task-q1", "are you there?"))
-        self.assertEqual(quota_card.load(self.root)["room"], DM)
+        self.assertEqual(quota_card.room(self.root), DM)
         self.assertEqual(self.tick(LIMITED, quota_card.RETRY_S), "quota-card")
         self.assertEqual(self.queued()[0]["room"], DM)
 
     def test_only_the_owner_in_their_dm_names_the_room(self):
         for n, (tier, kind) in enumerate((("team", "dm"), ("owner", "room"), ("guest", "dm"))):
             self.claim(self.task("task-n%d" % n, "hello", tier=tier, kind=kind))
-        self.assertEqual(quota_card.load(self.root), {})
+        self.assertEqual(quota_card.room(self.root), "")
         quota_card.remember_room(self.root, "not a room")
         quota_card.remember_room(self.root, None)
-        self.assertEqual(quota_card.load(self.root), {})
+        self.assertEqual(quota_card.room(self.root), "")
+        (Path(self.root) / "state" / quota_card.ROOM_FILE).write_text(json.dumps({"room": "not a room"}))
+        self.assertEqual(quota_card.room(self.root), "", "a record that names no room is no room")
         with mock.patch.object(quota_card, "remember_room", side_effect=RuntimeError("broken")):
             rc, out = self.claim(self.task("task-n9", "hello"))
         self.assertEqual((rc, out.get("admission")), (0, "owner"), "a room that cannot be kept never holds a task")
@@ -101,15 +104,67 @@ class Notice(Base):
         with mock.patch.object(connector_cards, "queue", side_effect=OSError("disk full")):
             self.assertEqual(self.tick(LIMITED), "quota-not-posted")
         kept = quota_card.load(self.root)
-        self.assertFalse(kept.get("told"))
+        self.assertFalse(kept.get("qid"))
         self.assertEqual(self.tick(LIMITED, 1.0), "")
         self.assertEqual(self.tick(LIMITED, quota_card.RETRY_S), "quota-card")
         self.assertEqual(quota_card.load(self.root)["key"], kept["key"], "queued under the key saved first")
-        # A stop after the queue and before `told` was saved queues it again under that key: still one card.
-        again = dict(quota_card.load(self.root), told=False, tried=0)
-        quota_card.save(self.root, again)
+        # A stop after the queue and before its id was saved queues it again under that key: still one card.
+        again = {k: v for k, v in quota_card.load(self.root).items() if k not in ("qid", "queued")}
+        quota_card.save(self.root, dict(again, tried=0))
         self.assertEqual(self.tick(LIMITED, 1.0), "quota-card")
         self.assertEqual(len(self.queued()), 1)
+        # With no bridge to post it, nothing is queued and nothing is called told.
+        quota_card.save(self.root, {})
+        self.bridge.rename(self.bridge.with_name("bridge-gone"))
+        self.assertEqual(self.tick(LIMITED, quota_card.RETRY_S), "quota-not-posted")
+        self.assertFalse(quota_card.load(self.root).get("told"))
+
+    def test_queued_is_not_told_and_a_card_the_bridge_dropped_is_queued_again(self):
+        quota_card.remember_room(self.root, DM)
+        self.assertEqual(self.tick(LIMITED), "quota-card")
+        qid = quota_card.load(self.root)["qid"]
+        outbox = self.bridge.joinpath(*connector_cards.OUTBOX) / (qid + ".json")
+        self.assertTrue(outbox.is_file())
+        self.assertEqual(self.tick(LIMITED, 30.0), "", "still in the outbox: waiting, not told")
+        self.assertFalse(quota_card.load(self.root).get("told"))
+        # The bridge was down and drops the card at MAX_QUEUED_S. Seen gone after that, it is taken for
+        # dropped and queued again under a new key (the same card id, which replaces the first).
+        outbox.unlink()
+        self.assertEqual(self.tick(LIMITED, connector_cards.MAX_QUEUED_S), "quota-card-dropped")
+        self.assertEqual(self.tick(LIMITED, 1.0), "quota-card")
+        second = quota_card.load(self.root)["qid"]
+        self.assertNotEqual(second, qid)
+        # Its receipt in the bridge's posted folder: told.
+        posted = self.bridge.joinpath(*connector_cards.POSTED)
+        posted.mkdir(parents=True, exist_ok=True)
+        self.bridge.joinpath(*connector_cards.OUTBOX, second + ".json").rename(posted / (second + ".json"))
+        self.assertEqual(self.tick(LIMITED, 5.0), "quota-card-posted")
+        self.assertTrue(quota_card.load(self.root)["told"])
+        self.assertEqual(self.tick(LIMITED, 3600.0), "", "one card per limit")
+
+    def test_a_card_gone_from_the_outbox_in_time_was_posted_even_with_its_receipt_already_absorbed(self):
+        quota_card.remember_room(self.root, DM)
+        self.assertEqual(self.tick(LIMITED), "quota-card")
+        qid = quota_card.load(self.root)["qid"]
+        # Posted, and its receipt taken into the agent's ledger at a claim, before this tick looked.
+        self.bridge.joinpath(*connector_cards.OUTBOX, qid + ".json").unlink()
+        self.assertEqual(self.tick(LIMITED, 20.0), "quota-card-posted")
+        self.assertEqual(len(self.queued()), 0)
+
+    def test_the_claim_and_the_supervisor_never_undo_each_others_record(self):
+        # The supervisor holds its snapshot of the incident while the claim learns the room, and saves after.
+        self.assertEqual(self.tick(LIMITED), "quota-no-room")
+        held = quota_card.load(self.root)
+        quota_card.remember_room(self.root, DM)
+        quota_card.save(self.root, dict(held, tried=0))
+        self.assertEqual(quota_card.room(self.root), DM, "the room survives the supervisor's later save")
+        self.assertEqual(self.tick(LIMITED, 1.0), "quota-card")
+        # And the other way: the claim's write, landing after the incident's key was saved, keeps that key.
+        key = quota_card.load(self.root)["key"]
+        quota_card.remember_room(self.root, "!other:s.space")
+        self.assertEqual(quota_card.load(self.root)["key"], key)
+        self.assertEqual(sorted(p.name for p in (Path(self.root) / "state").iterdir() if p.name.startswith("quota-")),
+                         ["quota-card.json", "quota-room.json"])
 
     def test_a_state_that_cannot_be_written_or_read_sends_nothing(self):
         quota_card.remember_room(self.root, DM)
@@ -126,12 +181,23 @@ class Notice(Base):
         self.assertEqual(quota_card.reset_words("Weekly limit reached │ resets Nov 28, 9am. │ other"), "resets Nov 28, 9am")
         self.assertEqual(quota_card.reset_words("You've hit your usage limit"), "")
         self.assertEqual(quota_card.reset_words(None), "")
+        # Other lines of the pane are never read, whatever they say (a transcript line about resets, a
+        # pasted secret): only the recognised banner's own line gives the time.
+        pane = ("the token resets tomorrow, key sk-secret-123\n"
+                "  ⎿  You've hit your usage limit\n"
+                "this counter resets at 9pm and the password is hunter2\n❯ \n")
+        self.assertEqual(quota_card.reset_words(pane), "")
+        self.assertNotIn("hunter2", quota_card.words(["quota-limit"], pane, "x"))
+        self.assertNotIn("sk-secret", quota_card.words(["quota-limit"], pane, "x"))
+        # Inside the banner line, only time-like characters are taken: nothing after an odd one.
+        self.assertEqual(quota_card.reset_words("You've hit your usage limit · resets 3pm <b>x</b> $(rm)"), "resets 3pm")
 
     def test_the_agents_state_dir_still_passes_the_start_check_with_the_record_in_it(self):
         from ag2_sparrow import task_lifecycle
         quota_card.remember_room(self.root, DM)
         self.tick(LIMITED)
-        self.assertTrue((Path(self.root) / "state" / quota_card.FILE).is_file())
+        for name in (quota_card.FILE, quota_card.ROOM_FILE):
+            self.assertTrue((Path(self.root) / "state" / name).is_file(), name)
         self.assertIsNone(task_lifecycle.prepare_work_dir(self.root, check_only=True))
 
 
