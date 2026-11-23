@@ -5797,6 +5797,28 @@ def _agent_activity_age() -> "float | None":
         return None
 
 
+def _statusline_quota_freshness(check: dict) -> dict:
+    """A status line record is current only while replies land: warn when the core has
+    worked more than the gate's freshness window after the record's `last_checked`."""
+    from quota_availability import FRESH_SEC, read_quota_record  # src/ is on sys.path
+    rec = read_quota_record(WORKSPACE_DIR)
+    age = None if rec is None else rec.age_s
+    if age is None:
+        check["detail"] = "quota state from the Claude status line recorder (age unknown)"
+        return check
+    check["detail"] = f"quota state from the Claude status line recorder (updated {int(age / 60)}m ago)"
+    agent_age = _agent_activity_age()
+    if age > FRESH_SEC and agent_age is not None and agent_age < age - FRESH_SEC:
+        check["status"] = "warn"
+        check["detail"] = (
+            f"quota state from the Claude status line recorder is {int(age / 60)}m old while the "
+            f"core worked {int(agent_age / 60)}m ago — the core's replies are not reaching the "
+            "recorder. Check that the core's config-dir settings.json has the quota-tracker "
+            "statusLine (it is reinstalled at launch) and that a project statusLine does not hide it."
+        )
+    return check
+
+
 def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
     """Warn when the credential proxy is up but producing no quota state.
 
@@ -5847,13 +5869,7 @@ def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
     # having no live core, would have stayed green while developer hosts failed.
     check = {"name": "quota-telemetry", "status": "ok"}
     if _quota_record_from_statusline():
-        path = status_read_path("quota-state.json", WORKSPACE_DIR)
-        try:
-            age = f" (updated {int((time.time() - path.stat().st_mtime) / 60)}m ago)"
-        except OSError:
-            age = ""
-        check["detail"] = f"quota state from the Claude status line recorder{age}"
-        return check
+        return _statusline_quota_freshness(check)
     # "stale" means listening but executing pre-deploy code -- still routing,
     # so gating it out here would mute this check exactly during a redeploy.
     if proxy_status not in ("ok", "stale"):

@@ -24,7 +24,7 @@ Without the proxy, the status line recorder writes the same file from Claude Cod
 
 On by default. At every Claude session launch (the core and each pool worker), the skill's `on_session_config` hook (`scripts/install-statusline.py`) writes two entries into that session's config-dir `settings.json`:
 
-- `statusLine`: `scripts/statusline-record.py`, refreshed every 60 seconds. It reads the status line input's `rate_limits.five_hour` / `seven_day` (`used_percentage`, `resets_at`) and records them through `src/quota_record.py`, with `source: "statusline"`, the proxy's field shape and synthesized `anthropic-ratelimit-unified-5h/7d-utilization` and `-reset` headers. An observation older than the record on disk is dropped, so an idle session cannot overwrite a newer one; the observation time is the session transcript's last change.
+- `statusLine`: `scripts/statusline-record.py`, refreshed every 60 seconds. It reads the status line input's `rate_limits.five_hour` / `seven_day` (`used_percentage`, `resets_at`) and records them through `src/quota_record.py`, with `source: "statusline"`, the proxy's field shape and synthesized `anthropic-ratelimit-unified-5h/7d-utilization` and `-reset` headers. An observation older than the record on disk is dropped, so an idle session cannot overwrite a newer one; the observation time is the session transcript's last change. Each write is keyed by the writing session's login (a digest of the non-secret `oauthAccount` identity in its config dir's `.claude.json`, else of the config dir): the top level is the core's login only, and every login's latest entry is under `accounts`. A worker signed in to another account never changes the core's numbers, and its rate-limit stop never marks the core rejected; a worker on the core's account updates them.
 - A `StopFailure` hook (`matcher: rate_limit`, `scripts/stopfailure-record.py`): a turn that ends on a rate limit appends a 429 to `recent_rejections` (the newest 20 are kept) and marks the record rejected. The rejection holds until its window's reset passes, or a later reply shows every window under its limit.
 
 If the config dir already had a status line, the installer saves it beside that settings file as `quota-statusline-passthrough.json` and the recorder pipes the same input to it and prints its output unchanged; otherwise the recorder prints a short line (model, 5h and 7d percentages). Turning the recorder off puts the saved status line back.
@@ -34,7 +34,7 @@ Config (`manifest.json` `config`; env overrides):
 - `QUOTA_STATUSLINE_ENABLED` (default `true`): `false` removes the recorder and hook at the next launch.
 - `QUOTA_STATUSLINE_PASSTHROUGH`: a status line command to pass through to instead of the saved one.
 
-With `source: "statusline"`, the readers (`src/quota_availability.py`, health-check's `credential-proxy` and `quota-telemetry` rows) treat a missing proxy as expected, not as a failure.
+With `source: "statusline"`, the readers (`src/quota_availability.py`, health-check's `credential-proxy` and `quota-telemetry` rows) treat a missing proxy as expected, not as a failure. `quota-telemetry` warns when the record's `last_checked` is more than 10 minutes (the gate's freshness window) older than the core's last recorded work.
 
 What it gives up compared with the proxy:
 

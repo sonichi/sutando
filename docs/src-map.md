@@ -56,6 +56,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`chat_secret_filter.py`** — Fail-closed secret redaction for persisted inbound chat content.
 - **`check-pending-questions.py`** — Thin entry for the pending-questions reminder: hands argv to the `remind` of the adapter an installed skill declares (`--store-adapter <path>` overrides), resolved here across the installed roots (src/skill_roots.py) and injected into src/pending_questions_reader.py.
 - **`check-pending-tasks.sh`** — Stop hook: blocks Claude from finishing when unprocessed tasks exist.
+- **`claude_account.py`** — Which Claude account a config dir is signed in to, as a non-reversible digest, and the config dir the Sutando core runs under.
 - **`claude_config_dir.sh`** — Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
 - **`claude_hooks_settings.py`** — Sutando-owned hook entries in a project-level Claude Code settings.json: install one idempotently, prune dead copies of the same hook, and re-point hooks a moved install left on its old path.
 - **`claude_model_switch.py`** — What switching Claude Code's model by typing `/model` relies on: which model names may be typed, the two texts Claude Code answers with, and whether its input box is empty (read by the core's own parser, src/pane_composer.py).

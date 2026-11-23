@@ -26,6 +26,7 @@ SCRIPTS = ROOT / "skills" / "quota-tracker" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(ROOT / "src"))  # ahead of the skill's quota_availability shim
 
+import claude_account
 import quota_availability as qa
 import quota_record as qr
 import session_config_hooks as sch
@@ -58,6 +59,22 @@ class Base(unittest.TestCase):
         self.ws = Path(self._tmp.name) / "ws"
         (self.ws / "state").mkdir(parents=True)
         self.path = self.ws / "state" / "quota-state.json"
+        root = Path(self._tmp.name)
+        self.core = self._login(root / "core", "acct-A")
+        self.same = self._login(root / "worker-same", "acct-A")
+        self.other = self._login(root / "worker-other", "acct-B")
+
+    @staticmethod
+    def _login(d, uuid):
+        d.mkdir()
+        (d / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": uuid}}))
+        return str(d)
+
+    def sl(self, status, now=None, cd=None):
+        return qr.record_statusline(self.ws, status, now=now, config_dir=cd or self.core, core_dir=self.core)
+
+    def rl(self, now=None, cd=None, **kw):
+        return qr.record_rate_limit(self.ws, now=now, config_dir=cd or self.core, core_dir=self.core, **kw)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -75,7 +92,7 @@ class Parity(unittest.TestCase):
 
 class Writer(Base):
     def test_sample_reads_back_through_the_readers(self):
-        self.assertTrue(qr.record_statusline(self.ws, _status(), now=T0))
+        self.assertTrue(self.sl(_status(), now=T0))
         rec = qa.read_quota_record(self.ws, now=T0 + 30)
         self.assertTrue(rec.fresh())
         self.assertEqual(qa.classify_limit_state(rec.payload), "allowed")
@@ -87,7 +104,7 @@ class Writer(Base):
         self.assertEqual(rec.payload["headers"][P + "5h-reset"], str(T0 + 4 * 3600))
 
     def test_one_window_missing_still_writes(self):
-        self.assertTrue(qr.record_statusline(self.ws, _status(seven=None), now=T0))
+        self.assertTrue(self.sl(_status(seven=None), now=T0))
         self.assertNotIn(P + "7d-utilization", self.rec()["headers"])
 
     def test_missing_or_partial_rate_limits_write_nothing(self):
@@ -95,38 +112,38 @@ class Writer(Base):
                        {"rate_limits": {"five_hour": {"used_percentage": 3}}},
                        {"rate_limits": {"five_hour": {"resets_at": T0}}}, None, "junk"):
             with self.subTest(status=status):
-                self.assertFalse(qr.record_statusline(self.ws, status, now=T0))
+                self.assertFalse(self.sl(status, now=T0))
                 self.assertFalse(self.path.exists())
 
     def test_older_observation_does_not_overwrite_newer(self):
-        qr.record_statusline(self.ws, _status(five=50), now=T0)
+        self.sl(_status(five=50), now=T0)
         transcript = Path(self._tmp.name) / "t.jsonl"
         transcript.write_text("")
         os.utime(transcript, (T0 - 600, T0 - 600))
         old = dict(_status(five=10), transcript_path=str(transcript))
-        self.assertFalse(qr.record_statusline(self.ws, old, now=T0 + 60))
+        self.assertFalse(self.sl(old, now=T0 + 60))
         self.assertEqual(self.rec()["utilization_5h"], 0.5)
 
     def test_recent_rejections_and_credential_state_are_preserved(self):
         self.path.write_text(json.dumps(FX["prev"]))
-        qr.record_statusline(self.ws, _status(), now=T0)
+        self.sl(_status(), now=T0)
         rec = self.rec()
         self.assertEqual(rec["recent_rejections"], FX["prev"]["recent_rejections"])
         self.assertEqual(rec["credential_state"], "ok")
 
     def test_stopfailure_rejects_then_next_write_clears(self):
-        qr.record_statusline(self.ws, _status(five=98), now=T0)
-        self.assertTrue(qr.record_rate_limit(self.ws, now=T0 + 10, detail="429 Too Many Requests"))
+        self.sl(_status(five=98), now=T0)
+        self.assertTrue(self.rl(now=T0 + 10, detail="429 Too Many Requests"))
         rec = qa.read_quota_record(self.ws, now=T0 + 20).payload
         self.assertEqual(qa.classify_limit_state(rec), "rejected")
         self.assertFalse(rec["available"])
         self.assertEqual(rec["recent_rejections"][-1]["status"], 429)
         self.assertEqual(rec["recent_rejections"][-1]["model"], "claude-opus-5-5")
         # The timer re-render with the same numbers before the reset keeps it rejected.
-        qr.record_statusline(self.ws, _status(five=98), now=T0 + 70)
+        self.sl(_status(five=98), now=T0 + 70)
         self.assertEqual(self.rec()["limit_state"], "rejected")
         # After the 5h reset, the next write clears it.
-        qr.record_statusline(self.ws, _status(five=98), now=T0 + 4 * 3600 + 1)
+        self.sl(_status(five=98), now=T0 + 4 * 3600 + 1)
         rec = self.rec()
         self.assertEqual(qa.classify_limit_state(rec), "allowed")
         self.assertTrue(rec["available"])
@@ -134,17 +151,50 @@ class Writer(Base):
         self.assertEqual(len(rec["recent_rejections"]), 1)
 
     def test_a_reply_under_the_limit_clears_before_the_reset(self):
-        qr.record_statusline(self.ws, _status(five=98), now=T0)
-        qr.record_rate_limit(self.ws, now=T0 + 10)
-        qr.record_statusline(self.ws, _status(five=100), now=T0 + 20)
+        self.sl(_status(five=98), now=T0)
+        self.rl(now=T0 + 10)
+        self.sl(_status(five=100), now=T0 + 20)
         self.assertEqual(self.rec()["limit_state"], "rejected")
-        qr.record_statusline(self.ws, _status(five=3), now=T0 + 30)
+        self.sl(_status(five=3), now=T0 + 30)
         self.assertEqual(self.rec()["limit_state"], "allowed")
 
     def test_rejection_ledger_is_bounded(self):
         for i in range(25):
-            qr.record_rate_limit(self.ws, now=T0 + i)
+            self.rl(now=T0 + i)
         self.assertEqual(len(self.rec()["recent_rejections"]), qr.MAX_RECENT_REJECTIONS)
+
+
+    def test_a_worker_on_another_account_never_touches_the_core(self):
+        self.sl(_status(five=40), now=T0)
+        self.sl(_status(five=90), now=T0 + 60, cd=self.other)
+        self.rl(now=T0 + 70, cd=self.other)
+        rec = qa.read_quota_record(self.ws, now=T0 + 80).payload
+        self.assertEqual(rec["utilization_5h"], 0.4)
+        self.assertEqual(qa.classify_limit_state(rec), "allowed")
+        self.assertTrue(rec["available"])
+        self.assertEqual(rec["recent_rejections"], [])
+        theirs = rec["accounts"][claude_account.account_key(self.other)]
+        self.assertEqual((theirs["utilization_5h"], theirs["limit_state"]), (0.9, "rejected"))
+        self.assertEqual(rec["account"], claude_account.account_key(self.core))
+        # Before the core has written at all, another account still leaves the top level empty.
+        self.path.unlink()
+        self.sl(_status(five=90), now=T0, cd=self.other)
+        self.assertNotIn("headers", self.rec())
+
+    def test_a_worker_on_the_same_account_updates_the_core(self):
+        self.sl(_status(five=40), now=T0)
+        self.sl(_status(five=55), now=T0 + 60, cd=self.same)
+        self.assertEqual(self.rec()["utilization_5h"], 0.55)
+        self.rl(now=T0 + 70, cd=self.same)
+        self.assertEqual(qa.classify_limit_state(self.rec()), "rejected")
+
+    def test_unidentified_logins_are_kept_apart_by_config_dir(self):
+        a, b = Path(self._tmp.name) / "anon-a", Path(self._tmp.name) / "anon-b"
+        a.mkdir()
+        b.mkdir()
+        self.assertNotEqual(claude_account.account_key(str(a)), claude_account.account_key(str(b)))
+        self.assertFalse(claude_account.same_login(str(a), str(b)))
+        self.assertTrue(claude_account.same_login(str(a), str(a)))
 
 
 class Scripts(Base):
@@ -154,7 +204,8 @@ class Scripts(Base):
         fake_in = io.TextIOWrapper(io.BytesIO(stdin))
         fake_out = io.TextIOWrapper(out, write_through=True)
         with mock.patch.object(cfg, "workspace", return_value=self.ws), \
-                mock.patch.dict(os.environ, env or {}), \
+                mock.patch.object(claude_account, "core_config_dir", return_value=self.core), \
+                mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": self.core, **(env or {})}), \
                 mock.patch.object(sys, "stdin", fake_in), mock.patch.object(sys, "stdout", fake_out):
             mod.main()
             fake_out.flush()
@@ -257,7 +308,7 @@ class HealthCheck(Base):
         self.hc = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.hc)
         self.hc.WORKSPACE_DIR = self.ws
-        qr.record_statusline(self.ws, _status(), now=None)
+        self.sl(_status(), now=None)
 
     def test_quota_telemetry_ok_without_proxy(self):
         for proxy in ("down", "ok"):
@@ -277,6 +328,19 @@ class HealthCheck(Base):
             self.assertFalse(c["live"])
             self.path.write_text(json.dumps(FX["proxy_record"]))
             self.assertEqual(hc.check_credential_proxy()["status"], "warn")
+
+    def test_stale_statusline_record_warns_while_the_core_works(self):
+        import time as _t
+        stale = _t.time() - 30 * 60
+        self.path.write_text(json.dumps(dict(self.rec(), last_checked=qr.iso(stale))))
+        status = self.ws / "state" / "core-status.json"
+        status.write_text("{}")
+        c = self.hc.check_quota_telemetry("down")
+        self.assertEqual(c["status"], "warn", c)
+        os.utime(status, (stale, stale))  # the core has been quiet since the record
+        self.assertEqual(self.hc.check_quota_telemetry("down")["status"], "ok")
+        status.unlink()
+        self.assertEqual(self.hc.check_quota_telemetry("down")["status"], "ok")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,10 @@ pinned by tests/fixtures/quota-record-shape.parity.json), headers synthesized.
 Contract: atomic replace; an observation older than `last_checked` is dropped;
 `recent_rejections` and `credential_state*` carry across; no usable `rate_limits`,
 no write; the lock is waited on briefly, then the observation is skipped.
+
+Per account: each write is keyed by the writing session's login (`claude_account`). The
+top level is the core's account only, so readers see the core's numbers; every account's
+latest entry is under `accounts`. Another login never changes the core's numbers or status.
 """
 from __future__ import annotations
 
@@ -195,8 +199,9 @@ def observed_at(status: Any, now: Optional[float] = None) -> float:
     return now
 
 
-def quota_path(workspace) -> Path:
-    return Path(workspace) / "state" / QUOTA_FILE
+def quota_path(workspace=None) -> Path:
+    from workspace_default import resolve_workspace, status_path
+    return status_path(QUOTA_FILE, Path(workspace) if workspace is not None else resolve_workspace())
 
 
 def read(path: Path) -> dict:
@@ -245,15 +250,55 @@ def _update(workspace, build, wait: float) -> bool:
         os.close(fd)
 
 
-def record_statusline(workspace, status: Any, now: Optional[float] = None) -> bool:
-    """Record one status line observation; True when the file was written."""
+MAX_ACCOUNTS = 8
+_OWN_KEYS = ("accounts", "account")
+
+
+def _entry(rec: Any) -> dict:
+    return {k: v for k, v in rec.items() if k not in _OWN_KEYS} if isinstance(rec, dict) else {}
+
+
+def route(prev: Any, key: str, is_core: bool, build) -> Optional[dict]:
+    """Apply `build` to this account's entry. The top level stays the core's account, so
+    existing readers see only the core; every account's latest is kept under `accounts`."""
+    prev = prev if isinstance(prev, dict) else {}
+    accounts = {k: v for k, v in (prev.get("accounts") or {}).items() if isinstance(v, dict)} \
+        if isinstance(prev.get("accounts"), dict) else {}
+    entry = build(_entry(prev) if is_core else accounts.get(key, {}))
+    if entry is None:
+        return None
+    accounts[key] = entry
+    while len(accounts) > MAX_ACCOUNTS:
+        oldest = min((k for k in accounts if k != key), key=lambda k: str(accounts[k].get("last_checked") or ""))
+        del accounts[oldest]
+    out = {**entry, "account": key} if is_core else dict(prev)
+    out["accounts"] = accounts
+    return out
+
+
+def _who(config_dir: Optional[str], core_dir: Optional[str]) -> tuple:
+    from claude_account import account_key, core_config_dir, same_login
+    config_dir = config_dir or os.environ.get("CLAUDE_CONFIG_DIR") or None
+    core_dir = core_dir if core_dir is not None else core_config_dir()
+    return account_key(config_dir), same_login(config_dir, core_dir)
+
+
+def record_statusline(workspace, status: Any, now: Optional[float] = None,
+                      config_dir: Optional[str] = None, core_dir: Optional[str] = None) -> bool:
+    """Record one status line observation under the session's account; True when written.
+    `config_dir` defaults to the session's CLAUDE_CONFIG_DIR, `core_dir` to the core's."""
     if windows_from_statusline(status) is None:
         return False
     seen = observed_at(status, now)
-    return _update(workspace, lambda prev: record_from_statusline(prev, status, seen, now), LOCK_WAIT_S)
+    key, is_core = _who(config_dir, core_dir)
+    return _update(workspace, lambda prev: route(
+        prev, key, is_core, lambda e: record_from_statusline(e, status, seen, now)), LOCK_WAIT_S)
 
 
-def record_rate_limit(workspace, now: Optional[float] = None, detail: str = "") -> bool:
-    """Record one StopFailure `rate_limit`; True when the file was written."""
+def record_rate_limit(workspace, now: Optional[float] = None, detail: str = "",
+                      config_dir: Optional[str] = None, core_dir: Optional[str] = None) -> bool:
+    """Record one StopFailure `rate_limit` under the session's account; True when written."""
     at = time.time() if now is None else now
-    return _update(workspace, lambda prev: record_with_rate_limit(prev, at, detail), 2.0)
+    key, is_core = _who(config_dir, core_dir)
+    return _update(workspace, lambda prev: route(
+        prev, key, is_core, lambda e: record_with_rate_limit(e, at, detail)), 2.0)
