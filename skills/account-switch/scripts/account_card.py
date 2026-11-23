@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """A card in the owner's DM that says which account the core is signed in to and switches it.
 
-    python3 account_card.py [--workspace WS] post --room ROOM [--reply-to EVENT] [--print]
+    python3 account_card.py [--workspace WS] post [--room ROOM] [--reply-to EVENT] [--print] [--signed-out]
     python3 account_card.py [--workspace WS] reply --task-file PATH
     python3 account_card.py [--workspace WS] switch --room ROOM --key KEY --attempt ID
     python3 account_card.py [--workspace WS] status
 
 `post` sends the card to the owner's checked DM and records it (src/issued_cards.py), so only the
-owner's tap on it acts (agent_card.click_verdict). It names the account in use: on a Codex core
+owner's tap on it acts (agent_card.click_verdict); without `--room` it goes to that DM. `--signed-out`
+(the Codex seat, when the core's login is refused even after a restart) leads with "Codex isn't signed
+in anymore." instead of the account in use. It names the account in use: on a Codex core
 (TUI or app-server seat) from src/codex_account.py, on a Claude core from `claude auth status --json`
 under the core's config dir. Addresses are shown masked (first letter and domain).
 
@@ -83,6 +85,7 @@ USE_BUTTONS = ac.LIMITS["buttons"] - 1          # one place is "Add another acco
 SETTINGS = ("Settings → Connections → the Sutando (on this computer) row → \"Switch account\". "
             "A sign-in opens there; paste the code only into that box in the app, never in this chat.")
 NO_CODE = "Never send me a sign-in code or token here."
+SIGNED_OUT = "Codex isn't signed in anymore."
 GONE = "That account is no longer on my list. Ask me for the account card again."
 BUSY = "An account switch is already under way. I'll confirm here when it has finished."
 NOT_CODEX = "Saved accounts are kept only for a core on Codex. Add the account in Settings instead."
@@ -299,8 +302,9 @@ def in_use_words(cur: dict) -> str:
 
 # ── the card ──────────────────────────────────────────────────────────────────────────────────────
 
-def menu_card(cur: dict, others: list) -> tuple:
-    """(body, card): a "Use" button per other saved account (up to five), then "Add another account"."""
+def menu_card(cur: dict, others: list, signed_out: bool = False) -> tuple:
+    """(body, card): a "Use" button per other saved account (up to five), then "Add another account".
+    `signed_out`: the core's login was refused, so the card says so instead of naming the account in use."""
     buttons = []
     for s in others[:USE_BUTTONS]:
         label = ("Use " + masked_label(s["label"]))[: ac.LIMITS["label"]]
@@ -308,7 +312,7 @@ def menu_card(cur: dict, others: list) -> tuple:
                                  command=ac.reply(KIND, TARGET, s["key"])))
     buttons.append(ac.button("Add another account", "reply", style="primary", reply="Add another account",
                              command=ac.reply(KIND, TARGET, ADD)))
-    using = in_use_words(cur)
+    using = SIGNED_OUT if signed_out else in_use_words(cur)
     if cur["runtime"] == "codex":
         more = (" Pick a saved account to switch to; the core restarts on it." if others else
                 " No other account is saved on this computer yet.")
@@ -399,14 +403,24 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time, run=subp
             pass  # the card still names the account; only the copy for switching back is missing
     others = [s for s in saved(store, cur["key"]) if not s["current"]]
     try:
-        body, card = menu_card(cur, others)
+        body, card = menu_card(cur, others, signed_out=args.signed_out)
     except ac.CardError as e:
         return _emit({"status": "failed", "why": str(e)}, 1)
     if args.print:
         return _emit({"body": body, "card": card, "handler": HANDLER})
+    room = args.room
+    if not room:
+        try:
+            core = core if core is not None else _core(ws)
+            room = _owner_dm(ws, core)
+        except Exception as e:  # noqa: BLE001 - no core lane: named, nothing posted
+            return _emit({"status": "failed", "why": f"{type(e).__name__}: {e}"}, 1)
+        if not room:
+            return _emit({"status": "failed", "why": "the owner's DM is not known"}, 1)
     shown = [s["key"] for s in others[:USE_BUTTONS]]
     tag = hashlib.sha256(",".join(shown).encode()).hexdigest()[:12]
-    out = _post(ws, args.room, body, card, f"account-card:menu:{int(now())}:{tag}", reply_to=args.reply_to or "",
+    kind = "signed-out" if args.signed_out else "menu"
+    out = _post(ws, room, body, card, f"account-card:{kind}:{int(now())}:{tag}", reply_to=args.reply_to or "",
                 core=core, execute=execute)
     if out.get("event_id"):
         try:
@@ -728,9 +742,10 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, run=subp
     p.add_argument("--workspace", default=None)
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("post")
-    s.add_argument("--room", required=True)
+    s.add_argument("--room", default="", help="the owner's DM (default: the core's checked owner DM)")
     s.add_argument("--reply-to", default="")
     s.add_argument("--print", action="store_true")
+    s.add_argument("--signed-out", action="store_true", help="the core's login was refused: say so first")
     r = sub.add_parser("reply")
     r.add_argument("--task-file", required=True)
     w = sub.add_parser("switch")

@@ -16,6 +16,10 @@ python3 skills/account-switch/scripts/account_card.py post --room <owner DM> --p
 python3 skills/account-switch/scripts/account_card.py status                          # JSON: in use + saved
 ```
 
+The Codex app-server seat runs `account_card.py post --signed-out` itself (no `--room`: the core's checked
+owner DM) when the core's login is refused even after it restarted the app-server on the login on disk;
+that card leads with "Codex isn't signed in anymore." and offers the same switch.
+
 Never start a sign-in yourself, and never ask for, accept or repeat a sign-in code, link code or
 token in chat. If the owner pastes one, do not use it; tell them to paste it in Settings, in the
 app's own box.
