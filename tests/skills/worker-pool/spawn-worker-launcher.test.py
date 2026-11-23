@@ -380,7 +380,8 @@ class TestSpawn(Base):
                          [t.launches()[0]["SUTANDO_WORKER_INCARNATION_ID"]])
 
     def test_a_viewers_brief_shared_hold_is_waited_out(self):
-        import fcntl, threading
+        import fcntl
+        import threading
         name = "sutando-worker-" + "a" * 32
         path = self.ws / "state" / "worker-launch" / f"{name}.lock"
         path.parent.mkdir(parents=True, exist_ok=True)
