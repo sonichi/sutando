@@ -133,18 +133,6 @@ class AnotherLogin(unittest.TestCase):
         self.assertEqual(block["five_hour"]["used_pct"], 10.0)
         self.assertNotIn("99", json.dumps(block))
 
-    def test_the_account_rule_is_the_shared_trusted_record(self):
-        proxy = {"utilization_5h": 0.3, "resets_at_5h": "2026-11-20T16:00:00.000Z", "limit_state": "allowed",
-                 "last_checked": "2026-11-20T12:00:00.000Z"}
-        cases = ((record(account="acct-previous"), False), (record(), True), (proxy, True))
-        for rec, published in cases:
-            self.write(rec)
-            with mock.patch("claude_account.core_account", return_value="acct-core"), \
-                    mock.patch.object(qs.qa, "trusted_record", wraps=qs.qa.trusted_record) as spy:
-                block = qs.read(self.ws, now=NOW)
-            spy.assert_called_once_with(rec)
-            self.assertEqual(block is not None, published, rec.get("account"))
-
     def test_a_codex_core_has_no_claude_quota(self):
         self.write(record())
         with mock.patch("claude_account.core_account", return_value="acct-core"):
@@ -154,6 +142,102 @@ class AnotherLogin(unittest.TestCase):
         self.assertIsNone(qs.read(self.ws, now=NOW))
         (self.ws / "state" / "quota-state.json").write_text("{ nope")
         self.assertIsNone(qs.read(self.ws, now=NOW))
+
+
+DIGEST, PREVIOUS = "3f9a2b" + "0" * 10, "7c41d0" + "0" * 10
+
+
+def proxy(label=None):
+    """The credential proxy's record: no `source`; `account` is the request's `acct_` label, if bound."""
+    rej = {"ts": "2026-11-20T11:59:00.000Z", "status": 429, "snippet": "usage limit reached"}
+    rec = {k: v for k, v in record().items() if k not in ("source", "account", "accounts")}
+    if label:
+        rec["account"], rej["account"] = label, label
+    return dict(rec, recent_rejections=[rej])
+
+
+def status_line(digest):
+    rej = {"ts": "2026-11-20T11:59:00.000Z", "status": 429, "snippet": "usage limit reached"}
+    return record(account=digest, recent_rejections=[rej])
+
+
+#: record kind -> (accepted with the core's account known, accepted with it unknown)
+ACCOUNT_RULE = {
+    "status line, the core's login": (status_line(DIGEST), True, False),
+    "status line, a previous login": (status_line(PREVIOUS), False, False),
+    "proxy, labeled with the core's login": (proxy(qs.qa.account_label(DIGEST)), True, False),
+    "proxy, labeled with a previous login": (proxy(qs.qa.account_label(PREVIOUS)), False, False),
+    "proxy, unlabeled": (proxy(), False, True),
+}
+
+
+class AccountRule(unittest.TestCase):
+    """health.quota speaks for the account recovery and the limit hold speak for, by one rule."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = Path(tmp.name)
+        (self.ws / "state").mkdir()
+
+    def signed_in(self, digest):
+        import core_limit_hold
+        stack = (mock.patch("claude_account.core_account", return_value=digest),
+                 mock.patch.object(core_limit_hold, "launch_identity", return_value=("opus", digest)))
+        for p in stack:
+            p.start()
+            self.addCleanup(p.stop)
+        return stack
+
+    def published(self, rec, digest):
+        (self.ws / "state" / "quota-state.json").write_text(json.dumps(rec))
+        stack = self.signed_in(digest)
+        try:
+            return qs.read(self.ws, now=NOW) is not None
+        finally:
+            for p in stack:
+                p.stop()
+
+    def test_a_proxy_record_labeled_with_a_previous_login_is_never_published(self):
+        self.assertFalse(self.published(proxy(qs.qa.account_label(PREVIOUS)), DIGEST))
+
+    def test_a_proxy_record_labeled_with_the_cores_login_is_published(self):
+        (self.ws / "state" / "quota-state.json").write_text(json.dumps(proxy(qs.qa.account_label(DIGEST))))
+        self.signed_in(DIGEST)
+        block = qs.read(self.ws, now=NOW)
+        self.assertEqual((block["five_hour"]["used_pct"], block["limit_state"]), (100.0, "rejected"))
+        self.assertNotIn("acct_", json.dumps(block))
+
+    def test_each_record_kind_by_account_state(self):
+        for name, (rec, known, unknown) in ACCOUNT_RULE.items():
+            self.assertEqual(self.published(rec, DIGEST), known, f"{name}, account known")
+            self.assertEqual(self.published(rec, None), unknown, f"{name}, account unknown")
+
+    def test_an_unreadable_identity_is_an_unknown_account(self):
+        import core_limit_hold
+        (self.ws / "state" / "quota-state.json").write_text(json.dumps(proxy()))
+        with mock.patch.object(core_limit_hold, "launch_identity", side_effect=OSError("unreadable")):
+            self.assertIsNotNone(qs.read(self.ws, now=NOW))
+
+    def test_quota_recovery_and_the_hold_accept_the_same_records(self):
+        """The three readers of quota-state.json cannot drift: one fixture table, one answer each."""
+        import core_limit_hold
+        import core_recovery_state
+        for digest in (DIGEST, None):
+            for name, (rec, known, unknown) in ACCOUNT_RULE.items():
+                want = known if digest else unknown
+                (self.ws / "state" / "quota-state.json").write_text(json.dumps(rec))
+                stack = self.signed_in(digest)
+                try:
+                    quota = qs.read(self.ws, now=NOW) is not None
+                    with mock.patch.object(core_recovery_state, "derive", return_value={}) as derive:
+                        core_recovery_state.gather(self.ws, None, now=NOW, runtime="claude")
+                    recovery = derive.call_args.args[3] is not None
+                    hold = core_limit_hold.record_evidence(qs.qa.trusted_record(rec), NOW, digest) is not None
+                finally:
+                    for p in stack:
+                        p.stop()
+                self.assertEqual((quota, recovery, hold), (want, want, want), f"{name}, account {digest}")
 
 
 def block(pct5=40.0, state="allowed", checked=1):
