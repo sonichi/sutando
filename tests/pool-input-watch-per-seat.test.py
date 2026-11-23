@@ -9,6 +9,10 @@ never mistakes a worker's watcher for the core's and skips starting it. A card
 raised with `--seat` names that seat and its terminal jump names its session;
 without it the core's card is unchanged.
 """
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
+
 import importlib.util
 import json
 import re
