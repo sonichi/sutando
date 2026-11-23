@@ -21,8 +21,8 @@ from unittest import mock
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import (account_switch, connector_cards, local_task_protocol, model_switch, task_io,  # noqa: E402
-                         team_guardrail)
+from ag2_sparrow import (account_switch, connector_cards, local_task_protocol, model_switch, result_markers,  # noqa: E402
+                         task_io, team_guardrail)
 from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
 
 # The note as it was pinned before it moved to the shared owner: proves the move changed no byte.
@@ -177,7 +177,17 @@ class WrapperTest(unittest.TestCase):
         self.assertIn("<%s>\ndo x\n</%s>\n" % (tag, tag), text)
         self.assertIn("Act on it as the user's request", text)
         self.assertNotIn("The sender is not your owner", text)
-        self.assertIn("results/task-chat-7.txt", text)
+        self.assertNotIn("results/", text.replace(cc.REPLY_RULE, ""), "the connector writes the result, never Codex")
+        self.assertTrue(text.endswith(cc.REPLY_RULE))
+
+    def test_no_bridge_written_step_tells_codex_to_write_the_results_file(self):
+        """A result file Codex writes itself is delivered raw by the bridge before the card desk sees it."""
+        prelude = result_markers.render_skill_prelude("!dm:s.space", "lane", "task-9")
+        lines = [l for l in prelude if l] + team_guardrail.ag2space_tier_lines("team", True, "results/task-9.txt")
+        self.assertTrue(any("results/task-9.txt" in l for l in lines), "the gateway's lines do name the file")
+        text = cc.wrap_untrusted("task-9", {"access_tier": "owner"}, "hi", lines)
+        self.assertNotIn("results/task-9.txt", text)
+        self.assertIn(cc.PRELUDE_RESULT, text)
 
     def test_non_owner_wrapper_carries_the_note_and_collaborator(self):
         for tier in ("team", "guest", "other", "ambient"):
@@ -836,12 +846,38 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(self.serve("task-2", "[[askmodel]] change model", channel="!room:s.space", kind="room").strip(),
                          model_switch.IN_DM)
         self.assertEqual(metrics(self.work)[-1]["card"], "model-card-elsewhere")
-        # A team sender's turn is not told about the mark; if Codex says it anyway, it is ordinary text.
+        # A team sender's turn is not told about the mark; if Codex says it anyway, no card: the connector writes it
+        # as said, and the bridge closes a lone mark silently (result_markers), never posting it.
         self.dm("task-3", "[[askmodel]] change model", tier="team", channel="!room:s.space", kind="room")
         (self.work / "tasks" / "task-3.txt").write_text(gateway_mid_task("task-3", "[[askmodel]] change model", "team", True))
         self.assertEqual(run_connector(self.work, once=1), 0)
         self.assertEqual((result(self.work, "task-3").strip(), "card" in metrics(self.work)[-1]), ("[model-card]", False))
         self.assertEqual(self.posted(), [])
+
+    def test_the_task_archived_during_the_turn_still_shows_the_card(self):
+        """VM 11-22: Codex wrote `[model-card]` to results/ itself, the bridge delivered it and archived the
+        task, and marked() then opened tasks/<id>.txt: FileNotFoundError, the connector crashed."""
+        real = cc.Connector.run_task
+
+        def archived_mid_turn(conn, headers, prompt, caps):
+            out = real(conn, headers, prompt, caps)
+            src = self.work / "tasks" / "task-1.txt"
+            (self.work / "tasks" / "archive").mkdir(exist_ok=True)
+            src.rename(self.work / "tasks" / "archive" / "task-1.txt")
+            return out
+
+        with mock.patch.object(cc.Connector, "run_task", archived_mid_turn):
+            self.assertEqual(self.serve("task-1", "[[askmodel]] can you switch model"),
+                             "[no-send] the model card answers\n")
+        self.assertEqual((metrics(self.work)[-1]["card"], len(self.posted())), ("model-card", 1))
+
+    def test_a_result_that_is_only_a_card_mark_is_never_posted_as_text(self):
+        for mark in (model_switch.MARK, account_switch.MARK, "  [model-card]\n"):
+            parsed = result_markers.parse_markers(mark)
+            self.assertEqual(([a.kind for a in parsed.actions], parsed.body), (["skip"], ""), mark)
+            self.assertTrue(result_markers.has_skip_action(parsed.actions))
+        for prose in ("[model-card] is the mark", "use [model-card]", "[Model-Card]"):
+            self.assertFalse(result_markers.has_skip_action(result_markers.parse_markers(prose).actions), prose)
 
     def test_a_guests_turn_runs_on_the_owners_pick_and_its_outcome_goes_to_the_dm(self):
         self.pick("Stub Large")
