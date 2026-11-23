@@ -88,6 +88,37 @@ class Record(Case):
         self.assertIsNone(ccm.resolve(self.state, 2, False, "late"), "a settled pick stays settled")
         self.assertEqual(ccm.current(self.state), "gpt-b")
 
+    def test_a_malformed_confirmed_rev_never_raises(self):
+        for bad in ("x", [1], True, -3, None, 2.5):
+            with self.subTest(bad=bad):
+                ccm.save(self.state, "gpt-a", applied="next-turn", accepted=False)
+                rec = json.loads(ccm.record_path(self.state).read_text())
+                rec.update(confirmed="gpt-z", confirmed_rev=bad)
+                ccm.record_path(self.state).write_text(json.dumps(rec))
+                self.assertTrue(ccm.confirm(self.state, "gpt-a", rec["rev"]))
+                rec = json.loads(ccm.record_path(self.state).read_text())
+                rec["confirmed_rev"] = bad
+                ccm.record_path(self.state).write_text(json.dumps(rec))
+                self.assertIsNotNone(ccm.resolve(self.state, rec["rev"], True))
+                rec = json.loads(ccm.record_path(self.state).read_text())
+                rec["confirmed_rev"] = bad
+                ccm.record_path(self.state).write_text(json.dumps(rec))
+                ccm.save(self.state, "gpt-b", applied="next-turn", accepted=False)
+
+    def test_a_confirmed_model_without_a_valid_revision_is_ignored_for_the_working_one(self):
+        for bad in ("x", [1], True, -3, None, 2.5, 0):
+            with self.subTest(bad=bad):
+                rec = {"model": "gpt-p", "runtime": "codex", "status": "pending", "rev": 4,
+                       "working": "gpt-w", "confirmed": "gpt-z", "confirmed_rev": bad}
+                self.assertEqual(ccm.working(rec), "gpt-w")
+                self.state.mkdir(exist_ok=True)
+                ccm.record_path(self.state).write_text(json.dumps(rec))
+                self.assertEqual(ccm.launch(self.state)[2], "gpt-w")
+                nxt = ccm.save(self.state, "gpt-q", applied="next-turn", accepted=False)
+                self.assertEqual(nxt["working"], "gpt-w", "the unverified value is never carried")
+                self.assertNotIn("confirmed", nxt)
+        self.assertEqual(ccm.working({"working": "gpt-w", "confirmed": "gpt-z", "confirmed_rev": 3}), "gpt-z")
+
     def test_a_record_from_before_revisions_reads_as_revision_0_and_not_pending(self):
         self.state.mkdir()
         ccm.record_path(self.state).write_text(json.dumps({"model": "gpt-a", "runtime": "codex", "accepted": True}))
