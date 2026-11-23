@@ -615,8 +615,9 @@ seat core follows the choice saved since, not the mode the core started in.
 
 A seat reopens task intake (clears the shutdown sentinel) only once `seat.py` reports ready, its
 app-server initialized and its thread open (`state/codex-seat/<session>/ready`). If that does not
-happen within `SUTANDO_SEAT_READY_TIMEOUT` seconds (60), or the seat exits first, the launch fails
-and intake stays shut.
+happen within `SUTANDO_SEAT_READY_TIMEOUT` seconds (60), or the seat exits first, the launcher
+stops that seat (its session, or the healed window), the launch fails and intake stays shut, so the
+next launch starts a seat and checks readiness again instead of finding a half-started one.
 
 ## Rollback
 

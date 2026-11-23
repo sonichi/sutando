@@ -320,6 +320,26 @@ class PersistedChoice(unittest.TestCase):
         self.assertRegex(f.calls(), r"new-session -d -s sutando-core .*codex-seat --host ")
         self.assertIn("did not report ready", result.stderr)
         self.assertTrue(sentinel.exists(), "intake is not reopened before the seat is ready")
+        self.assertIn("kill-session -t =sutando-core", f.calls(), "the unready seat is torn down")
+        # The next launch therefore starts a seat and checks readiness again, not a fast return.
+        f.h.log.unlink()
+        result = f.run(**self.UNSET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("already running", result.stdout)
+        self.assertRegex(f.calls(), r"new-session -d -s sutando-core .*codex-seat --host ")
+        self.assertFalse(sentinel.exists())
+
+    def test_a_healed_seat_window_that_never_comes_up_is_removed_and_intake_stays_shut(self):
+        f = Fixture(self, seat_tmux=True)
+        f.core("gone")
+        sentinel = f.workspace / "state" / "shutdown.sentinel"
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text('{"reason": "test", "ts": 0}\n')
+        result = f.run(FAKE_SEAT_INIT_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("new-window", f.calls())
+        self.assertRegex(f.calls(), r"kill-window -t =sutando-core:\d+")
+        self.assertTrue(sentinel.exists())
 
     def test_a_ready_seat_reopens_intake(self):
         f = Fixture(self, seat_tmux=True)

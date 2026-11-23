@@ -81,7 +81,7 @@ seat_wait_ready() {
     i=$(( i + 1 ))
   done
   [ -f "$SEAT_READY" ] && return 0
-  echo "  ⚠ the Codex app-server seat did not report ready (see logs/codex-seat.log) — sentinel NOT cleared, no core is serving." >&2
+  echo "  ⚠ the Codex app-server seat did not report ready (see logs/codex-seat.log) — stopping it; sentinel NOT cleared, no core is serving." >&2
   return 1
 }
 
@@ -92,7 +92,11 @@ seat_start_core_session_and_helpers() {
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" "${SEAT_ENV_ARGS[@]}" \
     "$SEAT_CLI" "${SEAT_ARGS[@]}"
   wait_core_up "$SESSION" session_exists "$SESSION" || return 1
-  seat_wait_ready || return 1
+  if ! seat_wait_ready; then
+    # Torn down, not left starting: a later launch would find it live and skip this readiness check.
+    tmux -S "$TMUX_SOCKET" kill-session -t "=$SESSION" 2>/dev/null || true
+    return 1
+  fi
   log_session_start
   record_confirmed_core_runtime codex "$(heartbeat_python)"
   clear_shutdown_sentinel
@@ -127,7 +131,10 @@ seat_heal_core_window() {
   tmux -S "$TMUX_SOCKET" select-window -t "=$SESSION:$idx" 2>/dev/null || true
   tmux -S "$TMUX_SOCKET" set-environment -t "=$SESSION" SUTANDO_CORE_RUNTIME codex 2>/dev/null || true
   wait_core_up "the healed seat window" codex_core_live || return 1
-  seat_wait_ready || return 1
+  if ! seat_wait_ready; then
+    tmux -S "$TMUX_SOCKET" kill-window -t "=$SESSION:$idx" 2>/dev/null || true
+    return 1
+  fi
   log_session_start
   record_confirmed_core_runtime codex "$(heartbeat_python)"
   clear_shutdown_sentinel
