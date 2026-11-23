@@ -407,12 +407,34 @@ class PersistedChoice(unittest.TestCase):
         self.assertFalse(sentinel.exists())
         self.assertFalse(held.exists())
 
+    def test_an_unreadable_marker_is_kept_and_the_reattach_fails(self):
+        f, sentinel, held = self.held_launch()
+        (f.declaration().parent / "ready").write_text("1\n")
+        held.chmod(0)
+        self.addCleanup(lambda: held.exists() and held.chmod(0o600))
+        result = f.run(**self.UNSET)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not read", result.stderr)
+        self.assertTrue(held.exists())
+        self.assertTrue(sentinel.exists())
+
+    def test_a_stop_that_cannot_be_written_is_reported_not_taken_for_already_held(self):
+        f = Fixture(self, seat_tmux=True)
+        lock = f.workspace / "state" / "shutdown.sentinel.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.mkdir()  # mark-if-absent cannot take its lock
+        result = f.run(FAKE_SEAT_INIT_FAILS="1", FAKE_KILL_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not shut intake for the surviving seat", result.stderr)
+        self.assertTrue((f.declaration().parent / "intake-held").exists(), "a later launch still knows")
+
     def test_a_stop_already_in_place_is_never_cleared_by_the_reattach(self):
         f = Fixture(self, seat_tmux=True)
         sentinel = f.workspace / "state" / "shutdown.sentinel"
         sentinel.parent.mkdir(parents=True, exist_ok=True)
         sentinel.write_text('{"reason": "drain", "ts": 0}\n')
-        f.run(FAKE_SEAT_INIT_FAILS="1", FAKE_KILL_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
+        result = f.run(FAKE_SEAT_INIT_FAILS="1", FAKE_KILL_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
+        self.assertNotIn("could not shut intake", result.stderr, "already held is a success, not a failure")
         held = f.declaration().parent / "intake-held"
         self.assertEqual(held.read_text().strip(), "", "not this launch's stop")
         (f.declaration().parent / "ready").write_text("1\n")

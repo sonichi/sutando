@@ -100,11 +100,17 @@ seat_target_state() {
 # seat_hold_intake: shut intake for a seat that could not be stopped, and remember which stop is ours:
 # intake-held holds the token of a sentinel this launch wrote, empty when another stop already held it.
 seat_hold_intake() {
-  local py token=""
+  local py token="" rc=1
   [ -n "$SEAT_READY" ] || return 0
   py="$(heartbeat_python)"
-  [ -n "$py" ] && token="$("$py" "$REPO/src/shutdown.py" mark-if-absent codex-seat-not-ready 2>/dev/null)"
-  printf '%s\n' "$token" > "${SEAT_READY%/ready}/intake-held" 2>/dev/null || true
+  # Exit 0 with a token: this launch wrote the stop; 0 with none: one was already held; else failed.
+  [ -n "$py" ] && { token="$("$py" "$REPO/src/shutdown.py" mark-if-absent codex-seat-not-ready 2>/dev/null)" && rc=0 || rc=$?; }
+  if [ "$rc" != 0 ]; then
+    token=""
+    echo "  ✗ could not shut intake for the surviving seat (shutdown.py mark-if-absent: ${py:+exit $rc}${py:-no Python}) — task intake may still be open." >&2
+  fi
+  printf '%s\n' "$token" > "${SEAT_READY%/ready}/intake-held" 2>/dev/null \
+    || echo "  ✗ could not write ${SEAT_READY%/ready}/intake-held; a later launch will not know this seat failed." >&2
 }
 
 # seat_stop <session|window> <tmux id>: stop exactly the seat this launch started (its immutable tmux
@@ -136,7 +142,10 @@ seat_reattach() {
     return 1
   fi
   py="$(heartbeat_python)"
-  token="$(head -n1 "$held" 2>/dev/null)"
+  if [ ! -r "$held" ] || ! token="$(head -n1 -- "$held" 2>/dev/null)"; then
+    echo "  ✗ could not read $held — keeping it; not accepting the seat." >&2
+    return 1
+  fi
   if [ -n "$token" ]; then
     rc=1
     [ -n "$py" ] && { "$py" "$REPO/src/shutdown.py" clear-if "$token" >/dev/null 2>&1 && rc=0 || rc=$?; }
