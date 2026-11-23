@@ -169,6 +169,21 @@ class Base(unittest.TestCase):
     def post(self):
         return self.run_(["post", "--room", DM])
 
+    def run_with(self, **over):
+        """A tap on Claude Code with one of the injected fakes replaced."""
+        path = self.ws / "task.txt"
+        path.write_text(task("Switch the core to Claude Code", reply_to_event="$card1",
+                             card_click=json.dumps({"card_id": rtc.CARD_ID, "action": "Switch the core to Claude Code"})))
+        out = io.StringIO()
+        kw = dict(core=CORE, popen=self.launch, run=self.claude_run, codex_read=self.codex_read,
+                  execute=lambda *a, **k: self.fake.execute(*a, **k), restart=self.restart,
+                  sleep=self.clock.sleep, clock=self.clock)
+        kw.update(over)
+        with contextlib.redirect_stdout(out):
+            rc = rtc.main(["--workspace", str(self.ws), "reply", "--task-file", str(path)], **kw)
+        self.outputs.append(out.getvalue())
+        return rc, json.loads(out.getvalue())
+
     def tap(self, label, *, event="$card1", card_id=rtc.CARD_ID, **kw):
         kw.setdefault("reply_to_event", event)
         kw.setdefault("card_click", json.dumps({"card_id": card_id, "action": label}))
@@ -272,12 +287,28 @@ class Taps(Base):
         self.assertEqual(json.loads(self.ws.joinpath(*rtc.WAITING).read_text())["attempt"], again["waiting"])
         self.assertEqual(len(self.launch.calls), 2)
 
-    def test_a_waiter_that_cannot_be_started_says_to_ask_again(self):
+    def test_a_waiter_that_cannot_be_started_promises_nothing_and_clears_only_its_own_attempt(self):
         self.claude_json = {"loggedIn": False}
         self.launch.fail = OSError("no nohup")
         rc, out = self.tap("Switch the core to Claude Code")
         self.assertEqual((rc, out["status"], out["waiting"]), (1, "needs_sign_in", ""))
         self.assertIn("ask again", out["why"])
+        # The card in the room says what is true: sign in, then ask again. No automatic switch is promised.
+        card = self.fake.cards()[-1]
+        self.assertIn("then ask me to switch again", card["text"])
+        self.assertNotIn("you don't need to ask again", card["text"])
+        self.assertEqual(card[rtc.CONTROLS], {"runtime": "claude", "core": True}, "the sign-in is still in the card")
+        self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists(), "its own attempt is cleared")
+        # A newer tap's wait, written while this one was failing to start, is not the one cleared.
+        newer = {"attempt": "9-newer", "runtime": "claude", "room": DM, "ts": self.clock.t}
+
+        def fails_after_a_newer_tap(argv, **kw):
+            rtc.set_wait(self.ws, newer)
+            raise OSError("no nohup")
+        self.launch.fail = None
+        rc, out = self.run_with(popen=fails_after_a_newer_tap)
+        self.assertEqual(out["waiting"], "")
+        self.assertEqual(json.loads(self.ws.joinpath(*rtc.WAITING).read_text()), newer)
 
     def test_codex_target_sign_in_is_probed_on_the_codex_home(self):
         self.current = self.selected = "claude"
@@ -389,6 +420,56 @@ class AwaitSignIn(Base):
         self.assertEqual(out["status"], "superseded")
         self.assertEqual((len(self.fake.cards()), self.launch.calls), (cards, []))
         self.assertTrue(self.ws.joinpath(*rtc.WAITING).exists(), "the newer tap's wait is left alone")
+
+    def test_a_wait_replaced_while_the_probe_ran_neither_switches_nor_speaks_nor_removes_its_replacement(self):
+        newer = {"attempt": "9-newer", "runtime": "claude", "room": DM, "ts": self.clock.t}
+        cards = len(self.fake.cards())
+
+        def probe(argv, **kw):
+            # A newer tap lands while this waiter is still asking whether Claude Code is signed in.
+            rtc.set_wait(self.ws, newer)
+            return mock.Mock(stdout=json.dumps({"loggedIn": True}), returncode=0)
+        self.claude_run = probe
+        rc, out = self.wait()
+        self.assertEqual((rc, out["status"]), (0, "superseded"))
+        self.assertEqual((self.launch.calls, self.restarts, len(self.fake.cards())), ([], [], cards))
+        self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists(), "no switch was admitted")
+        self.assertEqual(json.loads(self.ws.joinpath(*rtc.WAITING).read_text()), newer, "the newer tap's wait stands")
+
+        # The same at the deadline: replaced while probing, it posts no expiry notice.
+        self.attempt = "9-newer"
+
+        def slow_probe(argv, **kw):
+            self.clock.t += rtc.SIGN_IN_WAIT_S + 1
+            rtc.set_wait(self.ws, dict(newer, attempt="9-newest"))
+            return mock.Mock(stdout=json.dumps({"loggedIn": False}), returncode=0)
+        self.claude_run = slow_probe
+        rc, out = self.wait()
+        self.assertEqual((out["status"], len(self.fake.cards())), ("superseded", cards))
+        self.assertEqual(json.loads(self.ws.joinpath(*rtc.WAITING).read_text())["attempt"], "9-newest")
+
+    def test_a_sign_in_seen_only_after_the_waits_own_deadline_switches_nothing(self):
+        def late(argv, **kw):
+            self.clock.t += rtc.SIGN_IN_WAIT_S + 5         # the probe itself outlasted the wait
+            return mock.Mock(stdout=json.dumps({"loggedIn": True}), returncode=0)
+        self.claude_run = late
+        rc, out = self.wait()
+        self.assertEqual((rc, out["status"]), (1, "gave_up"))
+        self.assertEqual((self.launch.calls, self.restarts), ([], []))
+        self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists())
+
+    def test_the_deadline_is_the_waits_own_not_the_waiters(self):
+        # A waiter started late (or again) does not get a fresh fifteen minutes: the wait's saved time counts.
+        self.clock.t += rtc.SIGN_IN_WAIT_S - 2
+        polls = []
+        real = self.clock.sleep
+
+        def sleep(sec):
+            polls.append(sec)
+            real(sec)
+        self.clock.sleep = sleep
+        rc, out = self.wait()
+        self.assertEqual((out["status"], len(polls)), ("gave_up", 1))
 
     def test_a_core_already_on_that_runtime_ends_the_wait(self):
         self.current = "claude"

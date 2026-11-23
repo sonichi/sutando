@@ -82,9 +82,12 @@ POST_TRIES, POST_PAUSE_S = 4, 15
 # account cards use, naming the runtime to sign in to) and the tap is kept while a waiter watches for it.
 CONTROLS = "account_controls"
 WAITING = ("state", "runtime-card-signin.json")
+WAITING_LOCK = ("state", "runtime-card-signin.lock")
 SIGN_IN_WAIT_S, SIGN_IN_POLL_S = 900, 5
 SIGN_IN = ("Sign in to {name} below. I'll switch the core to it as soon as you are signed in; you don't "
            "need to ask again.")
+SIGN_IN_ASK_AGAIN = ("Sign in to {name} below, then ask me to switch again: I could not set up the "
+                     "automatic switch this time.")
 SIGN_IN_ELSEWHERE = "Open this on the computer that runs the core to sign in to {name}."
 SIGN_IN_GAVE_UP = ("I stopped waiting for the {name} sign-in after {minutes} minutes. The core is still on "
                    "{was}; nothing changed. Ask me to switch again when you are ready.")
@@ -166,19 +169,21 @@ def signed_in(rt: str, *, run=subprocess.run, codex_read=None) -> Optional[bool]
         return None
 
 
-def sign_in_words(rt: str, state: Optional[bool]) -> str:
+def sign_in_words(rt: str, state: Optional[bool], waiting: bool = True) -> str:
+    """What the "Sign in first" card says. The automatic switch is promised only with `waiting`: a
+    waiter that is running. Without one the owner is told to ask again after signing in."""
     why = (f"{name(rt)} is not signed in on this computer" if state is False
            else f"I could not confirm {name(rt)} is signed in on this computer")
-    return f"{why}, so I have not restarted the core. " + SIGN_IN.format(name=name(rt))
+    return f"{why}, so I have not restarted the core. " + (SIGN_IN if waiting else SIGN_IN_ASK_AGAIN).format(name=name(rt))
 
 
-def sign_in_card(rt: str, state: Optional[bool]) -> tuple:
+def sign_in_card(rt: str, state: Optional[bool], waiting: bool = True) -> tuple:
     """The "Sign in first" card: its words, and the marker by which the desktop app, on the computer that
     runs the core, draws that runtime's sign-in controls in it (`core: true`: the core's own sign-in for
     `runtime`, which need not be the runtime the core is on now). Nothing typed there reaches the room. A
     client that cannot draw them shows the body: where to open the card."""
     body, card = ac.build(NOTE_ID, "pending", title="Core runtime", avatar_=ac.avatar(initial="R"),
-                          status="Sign in first", text=sign_in_words(rt, state),
+                          status="Sign in first", text=sign_in_words(rt, state, waiting),
                           body=SIGN_IN_ELSEWHERE.format(name=name(rt)))
     return body, dict(card, **{CONTROLS: {"runtime": rt, "core": True}})
 
@@ -353,38 +358,67 @@ def begin_switch(ws: Path, room: str, rt: str, current: str, t: float, *, event:
     return out
 
 
+def set_wait(ws: Path, wait: dict) -> None:
+    """Make `wait` the one sign-in waited for. Written under the lock its waiters claim it under."""
+    from file_lock import locked_file
+    from local_record import write_whole
+    ws.joinpath(*WAITING).parent.mkdir(parents=True, exist_ok=True)
+    with locked_file(ws.joinpath(*WAITING_LOCK), create_mode=0o600):
+        write_whole(ws.joinpath(*WAITING), wait)
+
+
+def claim_wait(ws: Path, mine: Optional[dict]) -> bool:
+    """End the wait and say whether it was `mine` ({attempt, runtime, room}), in one step under the lock:
+    a waiter acts only on a True, so one a newer tap replaced can neither switch nor speak, and never
+    removes its replacement. `mine` None ends whatever wait there is (a tap that goes ahead)."""
+    from file_lock import locked_file
+    ws.joinpath(*WAITING).parent.mkdir(parents=True, exist_ok=True)
+    with locked_file(ws.joinpath(*WAITING_LOCK), create_mode=0o600):
+        rec = _read_json(ws.joinpath(*WAITING))
+        if mine is not None and {k: rec.get(k) for k in mine} != mine:
+            return False
+        ws.joinpath(*WAITING).unlink(missing_ok=True)
+        return True
+
+
 def cmd_await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, run=subprocess.run,
               codex_read=None, sleep=time.sleep, clock=time.time) -> int:
-    """Wait for the sign-in a "Sign in first" card asked for, then switch as the tap wanted. Stops without
-    a word when a newer tap replaced this one or the core is already on that runtime, and says so in the
-    room when the sign-in did not come within SIGN_IN_WAIT_S. It never signs anyone in."""
+    """Wait for the sign-in a "Sign in first" card asked for, then switch as the tap wanted. It acts only
+    after claiming the wait as its own (claim_wait), which it does after the sign-in probe, not before:
+    one a newer tap replaced while it was probing stops without a word. It says so in the room when the
+    sign-in did not come by the wait's own deadline (its saved `ts` + SIGN_IN_WAIT_S), and a sign-in
+    seen only after that deadline switches nothing. It never signs anyone in."""
     mine = {"attempt": args.attempt, "runtime": args.runtime, "room": args.room}
-    started = clock()
+    superseded = {"status": "superseded", "runtime": args.runtime}
 
-    def still_mine() -> bool:
+    def waited() -> Optional[dict]:
         rec = _read_json(ws.joinpath(*WAITING))
-        return {k: rec.get(k) for k in mine} == mine
+        return rec if {k: rec.get(k) for k in mine} == mine else None
 
-    def done(payload: dict, code: int = 0) -> int:
-        if still_mine():
-            ws.joinpath(*WAITING).unlink(missing_ok=True)
-        return _emit(payload, code)
-
-    while still_mine():
+    while True:
+        rec = waited()
+        if rec is None:
+            return _emit(superseded)
+        deadline = float(rec.get("ts") or 0) + SIGN_IN_WAIT_S
         if runtime() == args.runtime:
-            return done({"status": "already", "runtime": args.runtime})
-        if signed_in(args.runtime, run=run, codex_read=codex_read) is True:
+            claim_wait(ws, mine)
+            return _emit({"status": "already", "runtime": args.runtime})
+        there = signed_in(args.runtime, run=run, codex_read=codex_read) is True     # may take a while
+        if there and clock() < deadline:
+            if not claim_wait(ws, mine):
+                return _emit(superseded)
             out = begin_switch(ws, args.room, args.runtime, runtime(), clock(), core=core, execute=execute,
                                popen=popen)
-            return done(dict(out, after_sign_in=True), 0 if out["status"] == "started" else 1)
-        if clock() - started >= SIGN_IN_WAIT_S:
+            return _emit(dict(out, after_sign_in=True), 0 if out["status"] == "started" else 1)
+        if clock() >= deadline:
+            if not claim_wait(ws, mine):
+                return _emit(superseded)
             words = SIGN_IN_GAVE_UP.format(name=name(args.runtime), minutes=SIGN_IN_WAIT_S // 60, was=name(runtime()))
             body, card = notice_card("error", "Not switched", words)
             posted = _post(ws, args.room, body, card, f"runtime-card:signin:{args.attempt}:gave-up", core=core,
                            execute=execute)
-            return done({"status": "gave_up", "runtime": args.runtime, "say": words, "posted": posted["status"]}, 1)
+            return _emit({"status": "gave_up", "runtime": args.runtime, "say": words, "posted": posted["status"]}, 1)
         sleep(SIGN_IN_POLL_S)
-    return _emit({"status": "superseded", "runtime": args.runtime})
 
 
 def start_switch(ws: Path, room: str, rt: str, attempt: str, popen=subprocess.Popen) -> int:
@@ -424,25 +458,27 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
         return _emit({"status": "say", "say": f"The core is already running on {name(rt)}. Nothing changed."})
     state = signed_in(rt, run=run, codex_read=codex_read)
     if state is not True:
-        words = sign_in_words(rt, state)
-        body, card = sign_in_card(rt, state)
         t = now()
         wait = {"attempt": f"{int(t)}-{secrets.token_hex(4)}", "runtime": rt, "room": room, "ts": t}
-        posted = _post(ws, room, body, card, f"runtime-card:signin:{wait['attempt']}", reply_to=event,
-                       core=core or None, execute=execute)
-        out = {"status": "needs_sign_in", "runtime": rt, "say": words,
-               **({"event_id": posted["event_id"]} if posted.get("event_id") else {})}
+        mine = {k: wait[k] for k in ("attempt", "runtime", "room")}
+        out = {"status": "needs_sign_in", "runtime": rt}
+        # The waiter first, the card after: the card promises the automatic switch only once a waiter is
+        # running. The newest tap is the one waited for; an earlier waiter finds it is not its and stops.
         try:
-            # The newest tap is the one waited for: an earlier waiter sees it is no longer named and stops.
-            from local_record import write_whole
-            ws.joinpath(*WAITING).parent.mkdir(parents=True, exist_ok=True)
-            write_whole(ws.joinpath(*WAITING), wait)
+            set_wait(ws, wait)
             out.update(waiting=wait["attempt"], pid=start_waiter(ws, wait, popen))
         except OSError as e:
+            claim_wait(ws, mine)        # only this attempt's record; a newer tap's stays
             out.update(waiting="", why=f"not waiting for the sign-in ({type(e).__name__}); ask again after it")
+        waiting = bool(out["waiting"])
+        body, card = sign_in_card(rt, state, waiting)
+        posted = _post(ws, room, body, card, f"runtime-card:signin:{wait['attempt']}", reply_to=event,
+                       core=core or None, execute=execute)
+        out.update(say=sign_in_words(rt, state, waiting),
+                   **({"event_id": posted["event_id"]} if posted.get("event_id") else {}))
         return _emit(out, 1)
     # A tap that can go ahead ends any wait an earlier tap left.
-    ws.joinpath(*WAITING).unlink(missing_ok=True)
+    claim_wait(ws, None)
     out = begin_switch(ws, room, rt, current, now(), event=event, core=core, execute=execute, popen=popen)
     return _emit(out, 1 if out["status"] == "failed" else 0)
 
@@ -592,7 +628,7 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, run=subp
     if args.cmd == "post":
         return cmd_post(ws, args, core=core, execute=execute)
     if args.cmd == "reply":
-        return cmd_reply(ws, args, core=core, execute=execute, popen=popen, run=run, codex_read=codex_read)
+        return cmd_reply(ws, args, core=core, execute=execute, popen=popen, run=run, codex_read=codex_read, now=clock)
     if args.cmd == "switch":
         return cmd_switch(ws, args, core=core, execute=execute, restart=restart, sleep=sleep, clock=clock)
     if args.cmd == "await-sign-in":
