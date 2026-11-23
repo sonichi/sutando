@@ -8,6 +8,11 @@ app, on the computer that runs the agent, the owner switches account or enters a
 of card_desk's `Desk`, asked for and tapped as the Codex account card is (account_switch): only the owner's
 tap in their DM acts.
 
+One card, updated in place: what a tap comes to is shown in place of the card tapped (connector_cards'
+edit), never as a second card; the "where to open this" answers keep the account controls, so the same
+card opened on the agent's computer draws them. When agy then signs in as another account, that card
+says so ("Switched to the … account.") instead of a line in the next reply.
+
 No secret is ever taken in chat: every card reply and card input in the web client is sent as a room
 message, so neither a sign-in code nor a key may travel that way.
 
@@ -15,7 +20,7 @@ message, so neither a sign-in code nor a key may travel that way.
   runs the agent, where the desktop runs `agy acp --login` headless and takes the code in the card. agy
   keeps one Google sign-in per Mac, so this moves every Antigravity agent here; the card says so. The next
   owner turn reads which account agy authenticated (`applyAuthResult` in agy's own log, `signed_in_as`) and
-  says when it changed.
+  says when it changed: in the tapped card when there is one, else leading that turn's answer.
 - "Use API key" says the same for the key field (the Keychain item gemini_key reads).
 - "Stop using API key" (only on cards sent before 2026-11-23; new cards no longer offer it) deletes this
   agent's own Keychain item (gemini_key.clear_key).
@@ -162,7 +167,7 @@ class AgyAccount:
         who = str(self.record().get("account") or "")
         return "I'm using this computer's Google sign-in%s." % (" (%s)" % who if who else "")
 
-    def card(self, state, text, menu=False, keyed=False, url=""):
+    def card(self, state, text, menu=False, keyed=False, url="", controls=False):
         agent_card, _ = connector_cards._core()
         buttons = []
         if menu:
@@ -173,7 +178,7 @@ class AgyAccount:
         body, built = agent_card.build(account_switch.CARD if menu else account_switch.NOTE, state,
                                        title="Antigravity account", body="Account of %s" % self.name, text=text,
                                        **({"buttons": buttons} if buttons else {}))
-        if menu:
+        if menu or controls:
             # The marker the desktop app draws this agent's account controls from; older clients ignore it.
             marker = {"runtime": "antigravity"}
             if _MXID_RE.match(self.agent_id):
@@ -186,11 +191,12 @@ class AgyAccount:
         return self.card("pending", "%s%s %s" % (lead + " " if lead else "", self.using(keyed), BELOW),
                          menu=True, keyed=keyed)
 
-    def post(self, room, built) -> bool:
-        return card_desk.post(self.bridge_state, room, built, self.log)
+    def post(self, room, built, edit="") -> bool:
+        return card_desk.post(self.bridge_state, room, built, self.log, edit=edit)
 
-    def say(self, room, built, result_file) -> None:
-        posted = self.post(room, built)
+    def say(self, room, built, result_file, edit="") -> None:
+        """Post the card, in place of the card `edit` names when given; else its words answer the task."""
+        posted = self.post(room, built, edit)
         self.publish(result_file, account_switch.ANSWERED if posted else self.quoted(built[1]["text"]) + "\n")
 
     # ── card_desk's card ──
@@ -202,21 +208,26 @@ class AgyAccount:
         return self.offer(sent, result_file)
 
     def expired(self, sent, result_file) -> str:
-        fresh = self.post(sent.get("channel_id"), self.menu())
-        self.publish(result_file, self.quoted(account_switch.EXPIRED if fresh else account_switch.EXPIRED_NO_CARD) + "\n")
+        # A fresh menu in place of the card tapped, not a line of words and a second card.
+        fresh = self.post(sent.get("channel_id"), self.menu(), card_desk.tapped_event(sent))
+        self.publish(result_file, account_switch.ANSWERED if fresh else self.quoted(account_switch.EXPIRED_NO_CARD) + "\n")
         return "account-card-expired"
 
     def tapped(self, verb, sent, result_file) -> str:
-        room = str(sent.get("channel_id") or "")
+        room, tapped = str(sent.get("channel_id") or ""), card_desk.tapped_event(sent)
         if verb == SWITCH:
-            self.say(room, self.card("info", "%s Never send a sign-in code in this chat. %s I'll name the new account "
-                                             "in my next reply." % (elsewhere(self.name), SHARED)), result_file)
+            if tapped:
+                # The card to say "Switched to …" in once agy signs in as another account (saw).
+                self.keep(card=tapped, card_room=room)
+            self.say(room, self.card("info", "%s Never send a sign-in code in this chat. %s I'll say here when the "
+                                             "account has changed." % (elsewhere(self.name), SHARED), controls=True),
+                     result_file, tapped)
             return "account-switch-where"
         if verb == KEY:
             self.say(room, self.card("info", "Open this on the computer that runs %s to enter a Gemini API key: it is "
                                              "kept in that Mac's Keychain and used from the next message. A key sent "
                                              "in this chat is masked by the platform, so I never receive or keep it."
-                                             % self.name), result_file)
+                                             % self.name, controls=True), result_file, tapped)
             return "account-key-where"
         if verb == UNKEY:
             try:
@@ -227,16 +238,17 @@ class AgyAccount:
             if outcome == gemini_key.REMOVED:
                 self.say(room, self.card("done", "Stopped using the API key and deleted it from the Keychain. From the next "
                                                  "message I use the Google sign-in, in a new session."),
-                         result_file)
+                         result_file, tapped)
                 return "account-key-cleared"
             if outcome == gemini_key.ABSENT:
                 # A tap on an older card, after the key was already removed: nothing to do, and said so.
-                self.say(room, self.card("info", "This agent has no saved API key, so nothing changed. " + self.using(False)), result_file)
+                self.say(room, self.card("info", "This agent has no saved API key, so nothing changed. " + self.using(False)),
+                         result_file, tapped)
                 return "account-key-absent"
             self.log("Gemini API key not removed (security failed)")
             self.say(room, self.card("error", "I could not delete the API key (the Keychain refused), so it is still in "
                                               "use. Send /account to try again."),
-                     result_file)
+                     result_file, tapped)
             return "account-key-not-cleared"
         self.publish(result_file, self.quoted("I couldn't match that button. Send /account for a new card.") + "\n")
         return "account-unknown"
@@ -244,14 +256,22 @@ class AgyAccount:
     # ── which account agy used ──
     def saw(self, who) -> str:
         """A turn's agy authenticated as `who` (masked, '' unknown): the words to lead the answer with when
-        that is another account than the last one seen, else ''. The first account seen is only kept."""
+        that is another account than the last one seen, else ''. The first account seen is only kept. After
+        a "Switch account" tap the change is said in that card instead (no words in the answer)."""
         if not who:
             return ""
-        before = str(self.record().get("account") or "")
+        rec = self.record()
+        before, tapped, room = (str(rec.get(k) or "") for k in ("account", "card", "card_room"))
         if before == who:
             return ""
         self.keep(account=who)
-        return "(Switched to the %s account.)" % who if before else ""
+        if not before:
+            return ""
+        if tapped and room and self.post(room, self.card("done", "Switched to the %s account. %s" % (who, BELOW),
+                                                         controls=True), tapped):
+            self.keep(card="", card_room="")
+            return ""
+        return "(Switched to the %s account.)" % who
 
     # ── out of quota (quota_notice posts it) ──
     def quota_card(self, text):

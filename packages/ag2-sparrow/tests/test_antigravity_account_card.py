@@ -92,7 +92,7 @@ class AccountCardTest(unittest.TestCase):
                                                             encoding="utf-8")
 
     def posted(self, event="$card1"):
-        sent = []
+        sent = self.sent = []
         connector_cards.Poster(Path(str(self.w.root) + ".bridge") / "state",
                                lambda p: sent.append(p) or {"ok": True, "event_id": event}, log=lambda line: None).sweep()
         return [s["extra_content"]["space.ag2.card"] for s in sent]
@@ -103,10 +103,10 @@ class AccountCardTest(unittest.TestCase):
         with mock.patch.object(agy_account, "MENU_VERBS", (agy_account.SWITCH, agy_account.KEY, agy_account.UNKEY)):
             return self.menu(**kw)
 
-    def menu(self, ask="换账号", event="$card1"):
-        self.dm("task-ask", ask)
+    def menu(self, ask="换账号", event="$card1", tid="task-ask"):
+        self.dm(tid, ask)
         self.serve()
-        self.assertEqual(self.w.result("task-ask"), account_switch.ANSWERED)
+        self.assertEqual(self.w.result(tid), account_switch.ANSWERED)
         (card,) = self.posted(event)
         return card
 
@@ -145,7 +145,11 @@ class AccountCardTest(unittest.TestCase):
                          "Open this on the computer that runs Antigravity to switch account.")
         self.tap("task-key", card, "Use API key")
         (info,) = self.posted("$card2")
-        self.assertNotIn("account_controls", info, "a notice is not the account card")
+        # The answer replaces the card tapped, and keeps the controls: opened on the agent's computer, the
+        # same card draws them. It is not the menu, so it retires no account card.
+        self.assertEqual([(p["op"], p.get("event_id")) for p in self.sent], [("edit", "$card1")])
+        self.assertEqual((info["account_controls"], info["id"]),
+                         ({"runtime": "antigravity", "agent": AGENT}, account_switch.NOTE))
         for said in (card, info):
             self.assertFalse(re.search(r"[\u4e00-\u9fff]", json.dumps(said, ensure_ascii=False)), said)
 
@@ -158,6 +162,7 @@ class AccountCardTest(unittest.TestCase):
         self.assertIn(agy_account.elsewhere(gc.NAME), info["text"])
         self.assertNotIn("Settings", info["text"])
         self.assertIn("Never send a sign-in code in this chat", info["text"])
+        self.assertEqual([(p["op"], p.get("event_id")) for p in self.sent], [("edit", "$card1")])
         self.assertIn(agy_account.SHARED, info["text"])
         self.assertFalse(info.get("buttons"), "no input box and no link: no secret travels through the card")
         self.assertEqual(self.prompts(), [])
@@ -245,11 +250,37 @@ class AccountCardTest(unittest.TestCase):
         card = self.older_menu()
         self.tap("task-stop1", card, "Stop using API key")
         self.posted("$card2")
-        self.tap("task-stop2", card, "Stop using API key")
-        (said,) = self.posted("$card3")
+        # Another older card (the one tapped now shows the answer, its buttons gone).
+        other = self.older_menu(event="$card3", tid="task-ask2")
+        self.tap("task-stop2", other, "Stop using API key", event="$card3")
+        (said,) = self.posted("$card4")
+        self.assertEqual([(p["op"], p.get("event_id")) for p in self.sent], [("edit", "$card3")])
         self.assertIn("has no saved API key", said["text"])
         self.assertNotIn("Stopped using the API key", said["text"])
         self.assertEqual(self.w.metrics()[-1]["card"], "account-key-absent")
+
+    def test_after_a_switch_tap_the_new_account_is_said_in_that_card_not_in_the_answer(self):
+        (self.w.home / "account").write_text("alice@example.com")
+        self.dm("task-1", "STUB:TEXT hi")
+        self.serve()
+        card = self.menu(event="$menu")
+        self.tap("task-switch", card, "Switch account", event="$menu")
+        self.posted("$x")
+        # The desktop app (or anything else) signs agy in as another account; the next owner turn sees it.
+        (self.w.home / "account").write_text("bob@example.com")
+        self.dm("task-dm", "STUB:TEXT hi")
+        self.serve()
+        self.assertNotIn("Switched to the", self.w.result("task-dm"), "no line in the answer")
+        (done,) = self.posted("$y")
+        self.assertEqual([(p["op"], p.get("event_id")) for p in self.sent], [("edit", "$menu")])
+        self.assertEqual((done["state"], done["text"].startswith("Switched to the b…@example.com account.")), ("done", True))
+        self.assertIn("account_controls", done)
+        # Said once: a later change, with no card waiting, is said in the answer as before.
+        (self.w.home / "account").write_text("carol@example.com")
+        self.dm("task-dm2", "STUB:TEXT hi")
+        self.serve()
+        self.assertIn("Switched to the c…@example.com account", self.w.result("task-dm2"))
+        self.assertEqual(self.posted("$z"), [])
 
     def test_the_switch_notice_is_said_only_in_the_owners_dm(self):
         (self.w.home / "account").write_text("alice@example.com")
