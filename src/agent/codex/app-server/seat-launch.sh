@@ -98,7 +98,8 @@ seat_target_state() {
 }
 
 # seat_hold_intake: shut intake for a seat that could not be stopped, and remember which stop is ours:
-# intake-held holds the token of a sentinel this launch wrote, empty when another stop already held it.
+# intake-held holds the token of a sentinel this launch wrote, `external` when another stop already
+# held it, `unknown` when writing the stop failed (who holds intake is not known).
 seat_hold_intake() {
   local py token="" rc=1
   [ -n "$SEAT_READY" ] || return 0
@@ -106,10 +107,10 @@ seat_hold_intake() {
   # Exit 0 with a token: this launch wrote the stop; 0 with none: one was already held; else failed.
   [ -n "$py" ] && { token="$("$py" "$REPO/src/shutdown.py" mark-if-absent codex-seat-not-ready 2>/dev/null)" && rc=0 || rc=$?; }
   if [ "$rc" != 0 ]; then
-    token=""
+    token=unknown
     echo "  ✗ could not shut intake for the surviving seat (shutdown.py mark-if-absent: ${py:+exit $rc}${py:-no Python}) — task intake may still be open." >&2
   fi
-  printf '%s\n' "$token" > "${SEAT_READY%/ready}/intake-held" 2>/dev/null \
+  printf '%s\n' "${token:-external}" > "${SEAT_READY%/ready}/intake-held" 2>/dev/null \
     || echo "  ✗ could not write ${SEAT_READY%/ready}/intake-held; a later launch will not know this seat failed." >&2
 }
 
@@ -146,16 +147,20 @@ seat_reattach() {
     echo "  ✗ could not read $held — keeping it; not accepting the seat." >&2
     return 1
   fi
-  if [ -n "$token" ]; then
-    rc=1
-    [ -n "$py" ] && { "$py" "$REPO/src/shutdown.py" clear-if "$token" >/dev/null 2>&1 && rc=0 || rc=$?; }
-    case "$rc" in
-      0) ;;
-      3) echo "  · the Codex app-server seat is ready; a newer stop holds intake, so it stays shut." >&2 ;;
-      *) echo "  ✗ the Codex app-server seat is ready, but the intake held for it could not be reopened (shutdown.py clear-if: ${py:+exit }${py:+$rc}${py:-no Python}) — keeping $held; not accepting the seat." >&2
-         return 1 ;;
-    esac
-  fi
+  case "$token" in
+    external) rm -f "$held"; return 0 ;;
+    ""|unknown)
+      echo "  ✗ $held does not say which stop holds intake (it could not be recorded) — keeping it; not accepting the seat. Once you have checked intake, remove it by hand: rm '$held' (and python3 src/shutdown.py clear if intake should reopen)." >&2
+      return 1 ;;
+  esac
+  rc=1
+  [ -n "$py" ] && { "$py" "$REPO/src/shutdown.py" clear-if "$token" >/dev/null 2>&1 && rc=0 || rc=$?; }
+  case "$rc" in
+    0) ;;
+    3) echo "  · the Codex app-server seat is ready; a newer stop holds intake, so it stays shut." >&2 ;;
+    *) echo "  ✗ the Codex app-server seat is ready, but the intake held for it could not be reopened (shutdown.py clear-if: ${py:+exit }${py:+$rc}${py:-no Python}) — keeping $held; not accepting the seat." >&2
+       return 1 ;;
+  esac
   rm -f "$held"
 }
 
