@@ -16,7 +16,8 @@ Without `--codex-home` the home is the one the Codex core launcher uses (`codex_
 the same resolution and desktop-host checks, read-only), and a home the launcher would refuse is
 refused here too. Pool Codex workers run under the core's home today, so the same answer is theirs;
 pass a worker's own home with `--codex-home` when it has one. A signed-out answer from Codex is
-final; only when Codex cannot answer is the file read, and that answer is marked unverified.
+final; only when Codex cannot answer is the file read. `verified` is true when Codex answered,
+false for a file-only answer, null when neither answered. `codex` is found on the launcher's PATH.
 With `--task-file` nothing is looked up unless the task is the owner's and was asked outside a room
 other than the owner's DM (exit 3). Exit 0 an account was read, 1 signed out or unreadable.
 Stdlib only.
@@ -87,15 +88,17 @@ def _answer(account: dict, source: str) -> dict:
     return {k: (str(v) if v is not None else None) for k, v in out.items()}
 
 
-def launch_path(repo: Optional[Path] = None, environ=None) -> str:
-    """PATH as the Codex core launcher extends it: the bundled node, then the Codex install dir, appended."""
-    env = os.environ if environ is None else environ
+def launch_path(repo: Optional[Path] = None) -> str:
+    """PATH as the Codex core launcher builds it (src/agent/launch-path.sh, the one owner): the bundled
+    node, the Codex install dir, the desktop's cli/codex/bin. The caller's PATH when that cannot run."""
     repo = Path(repo or Path(__file__).resolve().parents[1])  # lint-workspace-resolution: allow-repo-root
-    extra = [env.get("CODEX_NODE_BIN") or str(repo.parent / "runtime" / "node" / "bin"),
-             env.get("CODEX_INSTALL_BIN") or os.path.expanduser("~/.npm-global/bin")]
-    parts = [d for d in (env.get("PATH") or "").split(os.pathsep) if d]
-    parts += [d for d in extra if d and os.path.isdir(d) and d not in parts]
-    return os.pathsep.join(parts)
+    try:
+        r = subprocess.run(["/bin/bash", str(repo / "src" / "agent" / "launch-path.sh"), "--codex-path", str(repo)],
+                           capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        r = None
+    path = r.stdout.strip() if r is not None and r.returncode == 0 else ""
+    return path or os.environ.get("PATH", "")
 
 
 def from_app_server(codex_home: Path, codex: str = "codex", timeout: float = 20.0) -> Optional[dict]:

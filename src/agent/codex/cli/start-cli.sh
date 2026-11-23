@@ -130,7 +130,6 @@ session_runtime() {
 # shell does not necessarily have on PATH: .zprofile is written with the
 # bundled git and python3 but not this one. Put the known install dir on PATH
 # ourselves rather than trusting what we inherited.
-CODEX_INSTALL_BIN="${CODEX_INSTALL_BIN:-$HOME/.npm-global/bin}"
 # `codex` is a node script (#!/usr/bin/env node) and a fresh Mac ships no
 # system node, so the app's bundled runtime must be reachable or every codex
 # invocation dies with "env: node: No such file or directory" (exit 127) —
@@ -138,7 +137,7 @@ CODEX_INSTALL_BIN="${CODEX_INSTALL_BIN:-$HOME/.npm-global/bin}"
 # launch-path.sh owns where the bundled runtime lives; it only appends, so an
 # operator's (or a test harness's) codex or node earlier on PATH keeps winning.
 . "$REPO/src/agent/launch-path.sh"
-sutando_append_launch_path "$REPO" "${CODEX_NODE_BIN:-$(sutando_bundled_node_dir "$REPO")}" "$CODEX_INSTALL_BIN"
+sutando_append_codex_launch_path "$REPO"
 
 # The core can be launched while the app is still installing Codex (observed:
 # engine unpacked at :25, codex landed at :32 of the following minute). Exiting

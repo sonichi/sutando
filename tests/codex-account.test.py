@@ -133,13 +133,28 @@ class AppServer(Case):
 
     def test_a_bare_codex_name_is_found_where_the_launcher_looks(self):
         bindir = self.root / "npm-bin"
+        app = self.root / "app"
+        (app / "cli" / "codex" / "bin").mkdir(parents=True)
         bindir.mkdir()
-        (bindir / "codex").symlink_to(self.codex)
-        with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin", "CODEX_INSTALL_BIN": str(bindir),
-                                          "CODEX_NODE_BIN": str(self.root / "no-node")}):
-            self.assertEqual(ca.launch_path().split(os.pathsep), ["/usr/bin", "/bin", str(bindir)])
-            got = ca.from_app_server(self.home, "codex")
-        self.assertEqual((got["email"], got["source"]), ("app@example.com", "app-server"))
+        for where, extra in ((bindir, {"CODEX_INSTALL_BIN": str(bindir)}),
+                             (app / "cli" / "codex" / "bin", {"SUTANDO_APP_SUPPORT": str(app)})):
+            with self.subTest(where=where.name):
+                for d in (bindir, app / "cli" / "codex" / "bin"):
+                    (d / "codex").unlink(missing_ok=True)
+                (where / "codex").symlink_to(self.codex)
+                env = {"PATH": "/usr/bin:/bin", "CODEX_NODE_BIN": str(self.root / "no-node"),
+                       "CODEX_INSTALL_BIN": str(self.root / "none"), "SUTANDO_APP_SUPPORT": "", **extra}
+                with mock.patch.dict(os.environ, env):
+                    parts = ca.launch_path().split(os.pathsep)
+                    got = ca.from_app_server(self.home, "codex")
+                self.assertEqual(parts[:2], ["/usr/bin", "/bin"])
+                self.assertIn(os.path.realpath(where), [os.path.realpath(p) for p in parts])
+                self.assertEqual((got["email"], got["source"], got["verified"]), ("app@example.com", "app-server", True))
+
+    def test_nothing_answering_and_no_file_is_unverified_signed_out(self):
+        with mock.patch.dict(os.environ, {"STUB_MODE": "gone"}):
+            rc, out = self.cli("--json")
+        self.assertEqual((rc, json.loads(out)["kind"], json.loads(out)["verified"]), (1, None, None))
 
     def test_a_signed_out_answer_names_no_account(self):
         with mock.patch.dict(os.environ, {"STUB_MODE": "signed-out"}):
