@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shlex
 import shutil
 import subprocess
 import sys
@@ -52,6 +51,20 @@ def inherited_env(drop=()) -> dict:
 
 
 DEFAULT_SOCKET = "/tmp/sutando-tmux.sock"
+
+
+def attach_argv(socket, session_name) -> list[str]:
+    """Attach to exactly this session, never a session sharing its prefix."""
+    return ["tmux", "-S", str(socket), "attach-session", "-t", f"={session_name}"]
+
+
+def attach_command(socket, session_name) -> str:
+    """A copyable Bash/Zsh command targeting exactly this worker session."""
+    # shlex.quote leaves '=' bare, but Zsh expands a word starting with '='.
+    return " ".join(
+        "'" + str(arg).replace("'", "'\"'\"'") + "'"
+        for arg in attach_argv(socket, session_name)
+    )
 
 
 def default_socket() -> str:
@@ -228,6 +241,32 @@ def resolve_runtime(repo, runtime=None, runner=_run) -> str:
     return runtime
 
 
+def inbox_env(workspace, worker_id: str, scripts=None) -> dict:
+    """The inbox half of a worker session's env, the one rule its spawn and its remedy share. A worker
+    with its own folders (`connections.worker_dirs`) reads a plain inbox of task files and answers in its
+    own results; any other reads sentinels from its deliveries folder through the resolver."""
+    import connections
+    scripts = Path(scripts or _SCRIPTS)
+    own = connections.worker_dirs(worker_id, Path(workspace))
+    if own:
+        # Set empty, not left out: a value inherited from the caller would make the inbox a sentinel one.
+        return {"SUTANDO_TASKS_DIR": str(own[0]), "SUTANDO_RESULTS_DIR": str(own[1]),
+                "SUTANDO_INBOX_KIND": "", "SUTANDO_INBOX_RESOLVER": "", "SUTANDO_WORKSPACE_DIR": str(workspace)}
+    return {"SUTANDO_TASKS_DIR": str(pd.deliveries_dir(workspace, worker_id)),
+            # The inbox holds sentinels, not task bodies. The reader is TOLD
+            # that here; inferring it from the path is the reader deciding.
+            "SUTANDO_INBOX_KIND": "deliveries",
+            # The watcher infers the workspace from its inbox; a delivery
+            # folder would put state/ and results/ under deliveries/.
+            "SUTANDO_WORKSPACE_DIR": str(workspace),
+            # Named, not derived: every runtime writes its answers where the
+            # bridges drain them, which is the workspace's own results/.
+            "SUTANDO_RESULTS_DIR": str(pd.results_dir(workspace)),
+            # REQUIRED: the inbox above holds sentinels, so without a resolver
+            # the watcher hands over the zero-byte one.
+            "SUTANDO_INBOX_RESOLVER": str(scripts / "resolve-inbox-entry")}
+
+
 def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
          socket=None, label: str = "", worker_id=None) -> dict:
     """What a spawn would create. Pure — no side effects, so it is reviewable
@@ -235,7 +274,12 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
     socket = socket or default_socket()
     worker_id = worker_id or wi.new_worker_id()
     delivery_dir = str(pd.deliveries_dir(workspace, worker_id))
+    skipped: list = []
+    plugin_dirs = pr.worker_plugin_dirs(workspace, worker_id, skipped=skipped,
+                                        warn=lambda m: print(m, file=sys.stderr))
     return {
+        # Recorded dirs this start leaves out, so the start's result shows what is missing.
+        "plugin_dirs_skipped": skipped,
         "worker_id": worker_id,
         "label": label or worker_id,
         "runtime": runtime,
@@ -251,30 +295,21 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
                 # stamps the same bare id, so both paths name one worker.
                 "SUTANDO_WORKER_ID": worker_id,
                 "SUTANDO_WORKER_RUNTIME": runtime,
-                "SUTANDO_TASKS_DIR": delivery_dir,
-                # The inbox holds sentinels, not task bodies. The reader is TOLD
-                # that here; inferring it from the path is the reader deciding.
-                "SUTANDO_INBOX_KIND": "deliveries",
-                # The watcher infers the workspace from its inbox; a delivery
-                # folder would put state/ and results/ under deliveries/.
-                "SUTANDO_WORKSPACE_DIR": str(workspace),
-                # Named, not derived: every runtime writes its answers where the
-                # bridges drain them, which is the workspace's own results/.
-                "SUTANDO_RESULTS_DIR": str(pd.results_dir(workspace)),
+                **inbox_env(workspace, worker_id),
                 "SUTANDO_CLAUDE_WORKING_DIR": str(cwd or repo),
                 "SUTANDO_CODEX_WORKING_DIR": str(cwd or repo),
                 # The worker's own gate, named by the skill that owns it: the
                 # core's `/startup --worker` runs what it is handed, not a path.
                 "SUTANDO_WORKER_BOOTSTRAP": str(_SCRIPTS / "worker_bootstrap.py"),
-                # Same rule, and REQUIRED here: the inbox above holds sentinels,
-                # so without a resolver the watcher hands over the zero-byte one.
-                "SUTANDO_INBOX_RESOLVER": str(_SCRIPTS / "resolve-inbox-entry"),
                 # A core exports this; the launcher reads the INHERITED value
                 # to decide it was invoked from inside one. A worker is not.
                 "SUTANDO_CORE_SESSION": "",
                 # The done-flag writer, so a finished delivery can reach
                 # `finished` instead of being re-reported on every boot.
-                "SUTANDO_POOL_DELIVERY_SCRIPT": str(_SCRIPTS / "pool_delivery.py")},
+                "SUTANDO_POOL_DELIVERY_SCRIPT": str(_SCRIPTS / "pool_delivery.py"),
+                # The owner's per-worker plugin opt-in (pool_manage.py plugins), one per line;
+                # always set, so a value inherited from the caller never loads into this worker.
+                "SUTANDO_WORKER_PLUGIN_DIRS": "\n".join(plugin_dirs)},
     }
 
 
@@ -457,7 +492,7 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
                 f"the runtime launcher failed ({why}), and tmux session {name!r} "
                 f"{fate}, so worker {rec['worker_id']} was KEPT with its records "
                 f"and inbox {p['delivery_dir']}. Attach with "
-                f"`tmux -S {socket} attach -t {name}` to finish or stop it, then "
+                f"`{attach_command(socket, name)}` to finish or stop it, then "
                 f"remove the worker if it is not wanted.",
                 worker_id=rec["worker_id"], delivery_dir=str(p["delivery_dir"]),
                 tmux_session=name, tmux_socket=str(socket))

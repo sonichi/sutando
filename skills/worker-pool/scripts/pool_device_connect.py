@@ -7,7 +7,8 @@ text note when no card can be posted), and asks again (`POST /api/connect/poll`)
 until the owner has approved it in a browser or the code expires. The answered bearer goes straight into
 the vault as the worker's connection, and only after the gateway confirms it is the agent the poll
 named, a new agent owned by the core's owner. `rotate=True` asks the same way for a new token of the
-worker's existing agent and replaces its secret in place.
+worker's existing agent and replaces its secret in place. A worker's first agent also puts it on that
+agent's own task and result folders (`switch_to_own_dirs`) before its lane starts, unless `own_dirs=False`.
 
 The device code and the bearer stay in this process and the vault: nothing here returns, prints, logs,
 writes or raises either; callers get the agent id and a status.
@@ -362,6 +363,62 @@ def _record_lock(workspace: Optional[Path], worker: str):
 
 
 RESEND_STALE_S = 15 * 60
+WITHDRAWN, RETIRED_AFTER_APPROVAL = "withdrawn", "retired_after_approval"
+
+
+def withdrawn_note(worker_label: str, label: str) -> str:
+    worker_label, label = _md(worker_label), _md(label)
+    return (f"[dm-only]\n**The approval link for {worker_label} is withdrawn**\n\nYour worker {worker_label} was "
+            f"retired, so do not approve agent \"{label}\". If you already did, delete that agent in the app; "
+            "nothing on this computer uses it.")
+
+
+def retired_approval_note(worker_label: str, label: str, agent_id: str) -> str:
+    worker_label, label = _md(worker_label), _md(label)
+    return (f"[dm-only]\n**Delete agent `{agent_id}` in the app**\n\nAgent \"{label}\" was approved after your "
+            f"worker {worker_label} was retired, so nothing on this computer saved or uses it. The server cannot "
+            "delete a live agent for me yet, so it stays in your agents list until you delete it there.")
+
+
+def withdrawn_card(worker: str, worker_label: str, label: str, *, server: str, subtitle: str) -> tuple:
+    return ac.build(card_id(worker, server), "expired", title=worker_label, subtitle=subtitle,
+                    avatar_=ac.avatar(seed=label), status="Withdrawn",
+                    text=f"{worker_label} was retired, so this approval is withdrawn. Do not approve {label}; if "
+                         "you already did, delete that agent in the app.",
+                    body=ac.body_line(f"The approval for agent \"{label}\" (pool worker {worker_label}) is withdrawn: "
+                                      "the worker was retired."))
+
+
+def withdraw(workspace: Optional[Path], worker: str, *, deliver: Optional[Callable[[str], object]] = None,
+             cards: Optional["CardSink"] = None) -> dict:
+    """At retirement, withdraw `worker`'s open approval: {result: withdrawn|none, label?, owner_told?}. The
+    server has no way to cancel a device code, so a running flow keeps asking until it expires; an approval
+    that lands after this is reported to the owner by `connect`, by the agent's id."""
+    with _record_lock(workspace, worker):
+        rec = read_record(workspace, worker)
+        if rec.get("state") not in ("pending", "resending") or not rec.get("label"):
+            return {"result": "none"}
+        write_record(workspace, worker, {**rec, "state": WITHDRAWN})
+    who, label = str(rec.get("worker_label") or worker), str(rec["label"])
+    if cards is None and deliver is None:
+        try:
+            cards = default_cards(workspace, pp.core_lane(workspace, rec.get("lane")))
+        except (pp.ProvisionError, connections.ConnectionsError, OSError):
+            cards = None
+    shown = ""
+    if cards is not None and rec.get("event_id"):
+        try:
+            shown = cards.show(*withdrawn_card(worker, who, label, server=str(rec.get("server") or ""),
+                                               subtitle=worker_subtitle(workspace, worker)),
+                               f"{CARD_KIND}:{worker}:{secrets.token_hex(6)}:withdrawn",
+                               previous=str(rec["event_id"]))
+        except (ac.CardError, OSError):
+            shown = ""
+    told = bool(shown)
+    if not told:
+        send = deliver or (lambda text: send_to_owner(workspace or connections._workspace(None), text))
+        told = send(withdrawn_note(who, label)) is not False
+    return {"result": WITHDRAWN, "label": label, "owner_told": told}
 
 
 def _alive(pid: int) -> bool:
@@ -393,6 +450,8 @@ def _why_not(worker: str, rec: dict, now: float) -> Optional[str]:
         return f"the approval link for {who} still works; use Approve on the newest card"
     if rec.get("state") == "done":
         return f"{who} already has its own agent"
+    if rec.get("state") in (WITHDRAWN, RETIRED_AFTER_APPROVAL):
+        return f"{who} was retired, so its approval was withdrawn"
     return None
 
 
@@ -415,6 +474,9 @@ def resend(worker: str, *, workspace: Optional[Path] = None, spawn=None, clock=t
             argv += ["--display-name", str(rec["display_name"])]
         if rec.get("lane") is not None:
             argv += ["--lane", str(rec["lane"])]
+        # A record from before the folder switch has no `own_dirs`: it keeps the shared folders it asked for.
+        if rec.get("own_dirs") is not True and not rec.get("rotate"):
+            argv += ["--shared-dirs"]
         claimed = {**rec, "state": "resending", "resend_id": resend_id, "resend_at": now}
         claimed.pop("resend_pid", None)
         write_record(workspace, worker, claimed)
@@ -487,12 +549,15 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
             request=pp.http_json, preview=None, deliver: Optional[Callable[[str], object]] = None,
             cards: Optional[CardSink] = None, say: Callable[[str], None] = lambda text: None, sleep=time.sleep,
             clock=time.time, repo: Optional[Path] = None, logs_dir: Optional[Path] = None,
-            start_lane: Optional[Callable[[dict], Optional[dict]]] = None) -> dict:
+            start_lane: Optional[Callable[[dict], Optional[dict]]] = None, own_dirs: bool = True) -> dict:
     """Give `worker` its own agent, or with `rotate` a new token for the one it has: {agent_id, status, row}.
+    Unless `own_dirs` is False, a first agent's worker is switched onto its own folders once the token is
+    saved and before `start_lane` (`dirs`: {"own", "why"?}); a rotate never changes the worker's folders.
     The owner gets an approval card in their DM (`cards`; by default the core's own, unless `deliver` is
     given), and `deliver(text)` the text note when no card was posted. The token is saved only when
     the gateway confirms the agent the poll named, on the core's server and owned by the core's owner, and
-    the save and `start_lane(row)` run under `fenced`, so a worker retired during the wait gets neither."""
+    the save and `start_lane(row)` each run under `fenced`, so a worker retired during the wait gets neither;
+    the folder switch between them runs outside it."""
     current = connections.worker_identity(worker, workspace)
     if rotate and current is None:
         raise DeviceConnectError(f"worker {worker} has no agent of its own to rotate")
@@ -516,7 +581,7 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
     op = f"{CARD_KIND}:{worker}:{secrets.token_hex(6)}"
     record = {"label": label, "display_name": display_name, "worker_label": who, "rotate": rotate,
               "lane": core.get("instance"), "server": server, "expires_at": pending["expires_at"],
-              "state": "pending"}
+              "state": "pending", **({} if rotate else {"own_dirs": bool(own_dirs)})}
     shown = ""
     if cards is not None:
         shown = cards.show(*approval_card(worker, who, label, pending["verify_url"], pending["expires_at"],
@@ -540,7 +605,9 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
     try:
         got = collect(base, pending, request=request, sleep=sleep, clock=clock)
     except DeviceConnectError as e:
-        if e.status == "expired":
+        if read_record(workspace, worker).get("state") == WITHDRAWN:
+            _keep(workspace, worker, {**read_record(workspace, worker), "lapsed": e.status})
+        elif e.status == "expired":
             tell(expired_card(worker, who, label, pending["expires_at"], server=server, subtitle=subtitle),
                  expiry_note(who, label, pending["expires_at"], now=clock()), "expired")
         else:
@@ -556,10 +623,19 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
                                          "pending; nothing was saved", status="identity_changed")
             out = _save(worker, token, got["agent_id"], core, current, workspace=workspace, vault=vault,
                         preview=preview, repo=repo, logs_dir=logs_dir)
-            if start_lane is not None and not rotate:
+        # Outside the fence: its handler passes can take minutes. A retire meanwhile only finds less to move.
+        if own_dirs and not rotate:
+            out["dirs"] = switch_to_own_dirs(worker, workspace)
+        if start_lane is not None and not rotate:
+            with fenced(worker, workspace):
                 out["launch"] = start_lane(out["row"])
     except DeviceConnectError as e:
-        _keep(workspace, worker, {**record, "state": e.status})
+        if e.status == "worker_retired":
+            # The owner approved an agent nothing here will use: name it so they can delete it.
+            send(retired_approval_note(who, label, got["agent_id"]))
+            _keep(workspace, worker, {**record, "state": RETIRED_AFTER_APPROVAL, "agent_id": got["agent_id"]})
+        else:
+            _keep(workspace, worker, {**record, "state": e.status})
         raise DeviceConnectError(pp.scrub(str(e), known), status=e.status) from None
     except (pp.ProvisionError, connections.ConnectionsError) as e:
         _keep(workspace, worker, {**record, "state": "failed"})
@@ -568,6 +644,21 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
     tell(done_card(worker, who, label, out["agent_id"], server=server, subtitle=subtitle, rotated=rotate),
          done_note(who, label, out["agent_id"], rotated=rotate), "done")
     return out
+
+
+def switch_to_own_dirs(worker: str, workspace: Optional[Path]) -> dict:
+    """Switch a worker that just got its first agent onto its own folders, as `migrate-dirs --apply` does:
+    {"state": "own" | "migrating" | "shared", "own": bool, "why"?}. Only "own" moves its lane and seat;
+    "migrating" keeps both on the shared folders until a re-run finishes. Never raises."""
+    import worker_lane
+    ws = Path(connections._workspace(workspace))
+    try:
+        _done, why = worker_lane.migrate_dirs(worker, ws)
+    except Exception as e:  # noqa: BLE001 - the identity is saved; the folders are reported, never raised
+        why = f"{type(e).__name__}: {e}"
+    state = connections.worker_dirs_state(worker, ws) or "shared"
+    out = {"state": state, "own": state == connections.WORKER_DIRS_OWN}
+    return {**out, "why": why[:300]} if why else out
 
 
 def _keep(workspace: Optional[Path], worker: str, record: dict) -> None:

@@ -250,6 +250,14 @@ The helper reads the token the way `ag2-sparrow` does. When Sparrow read it from
 `.env` named by `AG2_DEVICE_ENV`, the printed helper names that file. When it came from
 the environment, Claude Code needs `REMOTE_TASK_TOKEN` in its environment too.
 
+`ag2-sparrow-mcp acp` makes the same exchange and prints the ACP `McpServer` (`type: http`, the MCP URL,
+an `Authorization` header with the access token) for an ACP client that takes headers rather than a
+helper (the Antigravity adapter does not use it: over HTTP nothing would filter the server's tools). `ag2-sparrow-mcp descriptor --env-file <the
+agent's .env>` prints, without minting, the non-secret descriptor the desktop's stdio `ag2-mcp-proxy` reads
+(`AG2_MCP_DESCRIPTOR`) for that file: for a seat `.env`, the `token_format: "raw"` form naming the raw
+token file it points at. It reads only that file (and that token file), never a token from the environment
+or the vault, because the proxy mints from that file alone.
+
 Check it with `ag2.whoami`: it answers `Authenticated as @<agent> (agent)`. Agents
 whose kind is `sutando` or `acp` can make the exchange; others get a 401 naming the reason.
 
@@ -560,6 +568,17 @@ Pass `--no-service` to skip all of this; the keepawake task then keeps Sparrow
 running alone. Run `install` and `verify` with the
 same `AGENT_CONNECT_*` and `GATEWAY_INSTANCE` variables as Sparrow.
 
+A task poll the relay holds past the read timeout is not a success: its status
+write says the poll timed out, `connected` is `false`, and `last_ok_ts` stays
+at the last answer, so health-check reports it as transient within the grace.
+Five such polls in
+a row while other requests to the relay still answer mark a stuck relay session
+(`stuck_poll: true`, `consecutive_poll_timeouts`, `stuck_since`). Where a
+restart owner is declared (`SUTANDO_BRIDGE_RESTART_OWNER`, set by the launchd
+plist), Sparrow then exits 69 so it is relaunched, at most once every 10
+minutes; with none declared it keeps polling and reports the stuck session.
+Claimed tasks are on disk before that exit and reload on the next start.
+
 Sparrow rewrites `state/gateway-status.json` every poll. `verify` fails its
 `sparrow` check when that file is missing, not connected, older than 3
 minutes, or dated more than 5 seconds in the future (a timestamp that is not a bounded
@@ -847,6 +866,15 @@ over the Agent Client Protocol, resumes that room's Session, and OpenClaw answer
 `ag2-sparrow-openclaw reply <result_file>` or `no-reply`. `install` and `verify` work as
 `ag2-sparrow-codex-local`'s do. See
 [`ag2_sparrow/adapters/openclaw/README.md`](ag2_sparrow/adapters/openclaw/README.md).
+
+## Antigravity agents (`ag2-sparrow[antigravity]`)
+
+`ag2-sparrow-antigravity-local` hosts Google's Antigravity CLI (`agy`) as an agent: for each task Sparrow
+queues it wakes `agy acp` over the Agent Client Protocol, resumes that room's Session (a non-owner's turn
+runs in a throwaway, read-only Session with its own agy home instead), and posts the turn's final message
+(`NO_REPLY` posts nothing). `install` refuses until agy is signed in on the machine;
+`install` and `verify` otherwise work as `ag2-sparrow-codex-local`'s do. See
+[`ag2_sparrow/adapters/antigravity/README.md`](ag2_sparrow/adapters/antigravity/README.md).
 
 ## Optional: room-event subscription (0.3.0)
 

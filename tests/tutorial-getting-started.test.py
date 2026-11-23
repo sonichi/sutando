@@ -121,7 +121,8 @@ def parse(page):
 
 def steps(page):
     """The step headings, without the closing card's (which comes first in the markup)."""
-    heads = parse(page).headings
+    checklist = page.split('<details id="tutorial-checklist">', 1)[-1]
+    heads = parse(checklist).headings
     assert heads[0] == FINALE, heads[0]
     return heads[1:]
 
@@ -139,7 +140,7 @@ class RenderTest(unittest.TestCase):
             self.assertNotIn("Import your Claude Code history", page)
             self.assertNotIn("Import my Claude Code history", page)
             self.assertNotIn('id="s-import"', page)
-            self.assertNotIn("Claude Code", page)
+            self.assertIn("separate local-agent options", page)
         self.assertFalse(hasattr(gs, "IMPORT_PROMPT"))
 
     def test_unknown_core_value_is_refused(self):
@@ -158,7 +159,7 @@ class RenderTest(unittest.TestCase):
     def test_dm_step_comes_first_and_says_personal_answers_stay_in_the_dm(self):
         dm = gs.SECTIONS[0]
         self.assertEqual((dm.id, dm.title, dm.where), ("dm", "Your DM", "dm"))
-        self.assertIn("never in a room", dm.what)
+        self.assertIn("unless you explicitly ask to share it", dm.what)
         self.assertEqual(dm.prompt, "What can you do for me today?")
 
     def test_every_prompt_says_where_to_paste_it(self):
@@ -174,6 +175,11 @@ class RenderTest(unittest.TestCase):
         self.assertIn("finale.hidden = n !== ids.length", gs.tour_page.SCRIPT)
         self.assertIn(html.escape(gs.tour_page.FINALE_PROMPT), page)
 
+    def test_touch_target_css_data_pins(self):
+        page = gs.render_page("Example")
+        self.assertIn("button { min-height:44px", page)
+        self.assertIn("grid-template-columns:repeat(2,minmax(0,1fr))", page)
+
     def test_step_title_replaces_step_numbers(self):
         page = gs.render_page("Blue", "codex")
         self.assertNotRegex(page, r"Step \d+ of \d+")
@@ -185,13 +191,24 @@ class RenderTest(unittest.TestCase):
 
     def test_reviewed_wording(self):
         by = {s.id: s for s in gs.sections_for("claude")}
-        self.assertIn("Dot (by OpenAI, in ChatGPT), Grokbot (in Grok), Muse (by Meta), Duet (in Claude), or Other for Gemini and more", by["agents"].how)
+        self.assertIn("Claude Duet, Dot, Grok Bot, Hermes, Muse or OpenClaw", by["agents"].how)
         self.assertIn("Mention &amp; Keywords", by["activity"].how)
         self.assertIn("Activity tab", by["activity"].how)
         self.assertNotIn("import", by)
         self.assertIn("headphone icon in the room header", by["calls"].how)
         self.assertIn("Bring an agent?", by["calls"].how)
         self.assertIn("+ at the top of the room list", by["rooms"].how)
+
+    def test_latest_commons_copy_is_rendered_in_ten_step_tour(self):
+        # These are intentional emitted-copy pins, not source-code assertions.
+        page = gs.render_page("Example", "claude")
+        for phrase in ("Antigravity", "availability depends on the host",
+                       "owner can still access and invoke", "other room members cannot",
+                       "Room-call screen sharing is work in progress",
+                       "supported, configured local session", "authorize the edit",
+                       "confirm the agent received the selection", "paste the passage"):
+            self.assertIn(phrase, page)
+        self.assertEqual(len(gs.sections_for("claude")), 10)
 
     def test_second_review_wording(self):
         by = {s.id: s for s in gs.sections_for("claude")}
@@ -208,7 +225,7 @@ class RenderTest(unittest.TestCase):
         self.assertIn("Ask your agent anything", room)
         self.assertNotIn("Blue", re.sub(r'src="data:[^"]*"', "", room))
         dm = gs.render_page("Blue", "claude", "dm")
-        self.assertIn("<h1>Getting started with Blue</h1>", dm)
+        self.assertIn("<h1>Get started with <span>your agent</span> in s.space</h1>", dm)
         self.assertEqual(gs.render_page("Blue", "claude"), dm)
         with self.assertRaises(ValueError):
             gs.render_page("Blue", "claude", "everyone")
@@ -219,10 +236,10 @@ class RenderTest(unittest.TestCase):
             self.assertNotRegex(text, r"micro|\bmic\b|push to talk")
         self.assertNotIn("02-microphone", " ".join(shot.file for s in gs.SECTIONS for shot in s.images))
 
-    def test_codex_and_claude_code_are_not_offered_as_addable_agents(self):
+    def test_local_agents_are_distinguished_from_external_apps(self):
         agents = [s for s in gs.SECTIONS if s.title == "Connect other agents"][0]
-        self.assertNotIn("Codex", agents.what + agents.how)
-        self.assertNotIn("Claude Code", agents.what + agents.how)  # Claude the app is one "Other" pick
+        self.assertIn("Claude Code and Codex are separate local-agent options", agents.how)
+        self.assertIn("not other names for Duet and Dot", agents.how)
 
     def test_render_is_deterministic_and_depends_only_on_name_and_core(self):
         self.assertEqual(gs.render_page("Kai"), gs.render_page("  Kai "))
@@ -318,9 +335,10 @@ class InteractiveTest(unittest.TestCase):
             self.assertFalse('role="img"' in tag and 'aria-hidden="true"' in tag, tag)
         self.assertNotIn('role="img"', self.page)
 
-    def test_an_svg_per_section_and_a_hero(self):
+    def test_an_svg_per_section_and_one_overview_banner(self):
         self.assertEqual(self.page.count('<div class="icon" aria-hidden="true"><svg'), 10)
-        self.assertIn('class="hero-art"', self.page)
+        self.assertEqual(self.page.count("<h1>"), 1)
+        self.assertIn('class="brand-mark"', self.page)
         for core in gs.CORES:
             self.assertEqual(set(gs.tour_page.ICONS), {s.id for s in gs.sections_for(core)})
 
@@ -328,10 +346,15 @@ class InteractiveTest(unittest.TestCase):
         for core in gs.CORES:
             page = gs.render_page("Blue", core)
             bare = re.sub(r'src="data:image/(?:jpeg|png);base64,[A-Za-z0-9+/=]+"', 'src=""', page)
-            # The phone step's App Store anchor is the one outbound URL: a link, never a resource.
-            store = re.findall(r'<a href="([^"]*)"', bare)
-            self.assertEqual(store, ["https://apps.apple.com/us/app/s-space/id6788541784"])
-            bare = bare.replace(f'href="{store[0]}"', 'href=""')
+            links = re.findall(r'<a href="([^"]*)"', bare)
+            self.assertEqual({link for link in links if not link.startswith("#")}, {
+                "https://s.space/docs/how-it-works", "https://s.space/docs/terminal",
+                "https://s.space/docs/tour#6-calls-and-voice",
+                "https://s.space/docs/other-agents#how-they-differ-from-sutando",
+                "https://apps.apple.com/us/app/s-space/id6788541784",
+            })
+            for link in links:
+                bare = bare.replace(f'href="{link}"', 'href=""')
             self.assertNotRegex(bare, r"(?i)\b(?:https?:)?//[a-z0-9]")
             self.assertNotRegex(bare, r"(?i)<(?:link|iframe|object|embed)\b|url\(")
             self.assertEqual(re.findall(r'\bsrc="([^"]*)"', bare), [""] * bare.count("<img "))
@@ -386,7 +409,7 @@ class InteractiveTest(unittest.TestCase):
         if not node:
             self.skipTest("node not installed")
         bodies = re.findall(r"<script>(.*?)</script>", self.page, re.S)
-        self.assertEqual(len(bodies), 3)
+        self.assertEqual(len(bodies), 4)
         for body in bodies:
             with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
                 fh.write(body)
@@ -412,7 +435,7 @@ const dom = new JSDOM(html, { url: 'https://page.test/', runScripts: 'dangerousl
     if (scenario === 'nome') w.artifact = runtime(null, () => ['rooms']);
     if (scenario === 'slow') w.artifact = { ready: new Promise(() => {}), me: null, state: { get: () => undefined, set: () => {}, on: () => {} } };
     if (scenario === 'advance') w.artifact = runtime({ id: 'u7' }, () => []);
-    if (scenario === 'finale') w.artifact = runtime({ id: 'u8' }, () => ['dm', 'rooms', 'commons', 'agents', 'teamwork', 'calls', 'apps', 'activity', 'mobile']);
+    if (scenario === 'finale') w.artifact = runtime({ id: 'u8' }, () => ['dm', 'rooms', 'commons', 'agents', 'teamwork', 'calls', 'apps', 'activity', 'phone']);
     if (scenario === 'copy-ok') Object.defineProperty(w.navigator, 'clipboard', { value: { writeText: () => Promise.resolve() } });
     if (scenario === 'copy-fail') {
       Object.defineProperty(w.navigator, 'clipboard', { value: { writeText: () => Promise.reject(new Error('denied')) } });
@@ -449,6 +472,7 @@ const mark = (i) => { const b = d.querySelectorAll('input[data-done]')[i]; b.che
     out.focused = d.activeElement && d.activeElement.id;
   }
   if (scenario === 'showall') {
+    out.navLabels = Array.from(d.querySelectorAll('.dot'), b => b.textContent);
     const all = d.getElementById('all');
     out.labelBefore = all.textContent;
     all.click();
@@ -541,6 +565,9 @@ class PageBehaviourTest(unittest.TestCase):
 
     def test_show_all_keeps_one_label_and_dots_scroll_and_focus(self):
         out = self.run_page("showall")
+        self.assertEqual(len(out["navLabels"]), len(gs.sections_for("claude")))
+        for label, section in zip(out["navLabels"], gs.sections_for("claude")):
+            self.assertIn(html.unescape(section.title), label)
         self.assertEqual((out["labelBefore"], out["labelAfter"], out["pressed"]), ("Show all", "Show all", "true"))
         self.assertEqual(out["mode"], "all")
         self.assertEqual(out["scrolled"], ["s-teamwork", "smooth"])
@@ -760,7 +787,7 @@ class AssetTest(unittest.TestCase):
         used = {shot.file for s in tp.sections_for("claude") for shot in s.images}
         files = {name: (tp.ASSETS / name).stat().st_size for name in used}  # the inlined fallbacks
         hd = {shot.hd for s in tp.sections_for("claude") for shot in s.images if shot.hd}
-        on_disk = {p.name for p in tp.ASSETS.iterdir() if p.suffix in (".jpg", ".png")}
+        on_disk = {p.name for p in tp.ASSETS.iterdir() if p.suffix in (".jpg", ".png") and p.name != "dm-app-store-qr.png"}
         self.assertEqual(used | hd, on_disk)
         self.assertTrue(all(size <= 60_000 for size in files.values()), files)
         self.assertLessEqual(sum(files.values()), 500_000)
@@ -890,7 +917,7 @@ class MainTest(unittest.TestCase):
         with mock.patch.object(gs, "_https_get", side_effect=OSError("offline")):
             code, out, _ = self.main("render", "--name", "auto", "--agent-mxid", "@kai-blue.agent:example.test")
         self.assertEqual(code, 0)
-        self.assertIn("<h1>Getting started with Kai Blue</h1>", out)
+        self.assertIn("Your DM with Kai Blue", out)
 
     def test_bad_name_exits_2(self):
         code, _, err = self.main("render", "--name", " ")
@@ -907,16 +934,16 @@ class MainTest(unittest.TestCase):
                                  "--agent-mxid", "@kai.agent:example.test")
         self.assertEqual(code, 0)
         got = json.loads(out)
-        self.assertEqual(got.pop("upload"), NO_MEDIA_SUPPORT)
+        self.assertEqual(got.pop("upload")["reason"], "compact owner guide")
         self.assertEqual(got, {"ok": True, "action": "created", "kind": "html-p1",
-                               "summoned": True, "name": "Blue", "list": "file",
+                               "summoned": True, "name": gs.GENERIC_NAME, "list": "file",
                                "revision": gs.tour_page.FEATURES.revision, "media": []})
         with mock.patch.object(gs, "detect_core", return_value="codex"):
             code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue",
                                      "--room-commons", str(self.stub), "--agent-mxid", "@kai.agent:example.test")
         self.assertEqual((code, json.loads(out)["action"]), (0, "unchanged"))
 
-    def test_publish_with_tailored_prompts_and_roles(self):
+    def test_publish_ignores_tailored_prompts_and_roles_without_setup(self):
         f = self.tmp / "p.json"
         f.write_text(json.dumps({"dm": "Draft my weekly update."}))
         code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
@@ -924,8 +951,23 @@ class MainTest(unittest.TestCase):
                                  "--prompts", str(f), "--roles", "founder")
         self.assertEqual(code, 0)
         page = json.loads((self.tmp / "room.json").read_text())["pages"][json.loads(out)["kind"]]
-        self.assertIn("Draft my weekly update.", page)
-        self.assertIn("Picked for: Founder", page)
+        self.assertNotIn("Draft my weekly update.", page)
+        self.assertNotIn("Picked for: Founder", page)
+
+    def test_explicit_dm_without_setup_uses_generic_editable_drafts(self):
+        prompts = self.tmp / "prompts.json"
+        prompts.write_text(json.dumps({"dm": "A fictional private example."}))
+        code, out, _ = self.main("publish", "--room", self.ROOM, "--audience", "dm",
+                                 "--name", "Fictional Private Name", "--roles", "Designer",
+                                 "--prompts", str(prompts), "--room-commons", str(self.stub),
+                                 "--agent-mxid", "@kai.agent:example.test")
+        self.assertEqual(code, 0)
+        page = self.room_state()["pages"][json.loads(out)["kind"]]
+        self.assertIn('id="guide-draft"', page)
+        self.assertIn("Review &amp; send", page)
+        self.assertNotIn("Fictional Private Name", page)
+        self.assertNotIn("A fictional private example.", page)
+        self.assertNotIn("Picked for:", page)
 
     def test_publish_reason_never_carries_a_credential(self):
         def leak(*a, **k):
@@ -972,15 +1014,16 @@ class MainTest(unittest.TestCase):
         (channels / ".env").write_text("AGENT_MXID=@file.agent:example.test\n")
         self.assertEqual(gs.agent_mxid(), "@file.agent:example.test")
 
-    def test_the_identity_is_resolved_once_for_the_name_and_the_tag(self):
+    def test_the_identity_is_resolved_once_for_the_tag_without_a_profile_read(self):
         with mock.patch.object(gs, "agent_mxid", side_effect=["@alpha.agent:example.test", "@beta.agent:example.test"]) \
                 as resolver, mock.patch.object(gs, "_https_get", side_effect=OSError("offline")):
             code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "auto", "--core", "codex",
                                      "--room-commons", str(self.stub))
-        self.assertEqual((code, json.loads(out)["action"], json.loads(out)["name"]), (0, "created", "Alpha"))
+        self.assertEqual((code, json.loads(out)["action"], json.loads(out)["name"]), (0, "created", gs.GENERIC_NAME))
         self.assertEqual(resolver.call_count, 1)
         page = self.room_state()["pages"]["html-p1"]
-        self.assertIn("<h1>Getting started with Alpha</h1>", page)
+        self.assertNotIn("Your DM with Alpha", page)
+        self.assertIn("Your DM with your agent", page)
         self.assertEqual(gs.read_marker(page)[0], "@alpha.agent:example.test")
 
     def test_a_malformed_identity_is_refused_before_any_commons_call(self):
@@ -1013,7 +1056,7 @@ class MainTest(unittest.TestCase):
     def room_state(self):
         return json.loads((self.tmp / "room.json").read_text())
 
-    def test_publish_alone_takes_room_owner_and_roles_from_the_inputs_file(self):
+    def test_matching_saved_setup_cannot_authorize_personal_html(self):
         self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test",
                           "agent_mxid": "@kai.agent:example.test", "roles": "I picked: Founder, Sales."})
         with mock.patch.object(gs, "detect_core", return_value="codex"), \
@@ -1021,19 +1064,68 @@ class MainTest(unittest.TestCase):
             code, out, _ = self.main("publish", "--room-commons", str(self.stub))
         self.assertEqual(code, 0)
         result = json.loads(out)
-        self.assertEqual((result["action"], result["summoned"], result["name"]), ("created", True, "Kai"))
+        self.assertEqual((result["action"], result["summoned"], result["name"]), ("created", True, gs.GENERIC_NAME))
         self.assertIn(["summon", result["kind"], "@owner:example.test"], self.room_state()["calls"])
-        self.assertIn("Picked for: Founder, Sales", self.room_state()["pages"][result["kind"]])
+        page = self.room_state()["pages"][result["kind"]]
+        self.assertNotIn("Picked for:", page)
+        self.assertIn("Get started with <span>your agent</span> in s.space", page)
+        self.assertNotIn("Examples for team project.", page)
 
     def test_command_line_overrides_the_inputs_file(self):
-        self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test", "roles": "Founder"})
-        code, out, _ = self.main("publish", "--name", "Blue", "--core", "codex", "--owner", "@other:example.test",
+        self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test", "roles": "Founder",
+                          "agent_mxid": "@kai.agent:example.test"})
+        code, out, _ = self.main("publish", "--name", "Blue", "--core", "codex", "--owner", "@owner:example.test",
                                  "--roles", "Sales", "--room-commons", str(self.stub),
                                  "--agent-mxid", "@kai.agent:example.test")
         self.assertEqual(code, 0)
         page = self.room_state()["pages"][json.loads(out)["kind"]]
-        self.assertIn("Picked for: Sales", page)
-        self.assertNotIn("Founder", page.split("Picked for:", 1)[1][:80])
+        self.assertNotIn("Picked for:", page)
+        self.assertNotIn("<span>Blue</span>", page)
+
+    def test_mismatched_setup_identity_does_not_use_implicit_roles(self):
+        self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test",
+                          "agent_mxid": "@kai.agent:example.test", "roles": "Founder"})
+        code, out, _ = self.main("publish", "--name", "Blue", "--core", "codex",
+                                 "--owner", "@other:example.test", "--room-commons", str(self.stub))
+        self.assertEqual(code, 0)
+        page = self.room_state()["pages"][json.loads(out)["kind"]]
+        self.assertNotIn("Picked for:", page)
+        self.assertNotIn("Examples for team project.", page)
+        self.assertIn("Get started with <span>your agent</span> in s.space", page)
+
+    def test_refresh_on_owner_mismatch_does_not_reuse_private_content(self):
+        self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test",
+                          "agent_mxid": "@kai.agent:example.test", "roles": "Founder"})
+        agent = "@kai.agent:example.test"
+        previous = gs.render_page("Example Test Agent", "codex", agent=agent, roles="Founder",
+                                  prompts={"dm": "Write my fictional private agenda."}, private_setup=True)
+        common = ("publish", "--name", "Example Test Agent", "--core", "codex",
+                  "--room-commons", str(self.stub))
+        code, out, _ = self.main(*common)
+        self.assertEqual(code, 0)
+        kind = json.loads(out)["kind"]
+        db = self.room_state()
+        db["pages"][kind] = previous
+        (self.tmp / "room.json").write_text(json.dumps(db))
+        marker = gs.marker_path(self.tmp / "ws")
+        entries = gs.load_marker(marker)
+        entry = entries[self.ROOM]
+        entry.pop("privacy", None)
+        entry.update(hash=gs.content_hash(previous), roles="Founder",
+                     prompts={"dm": "Write my fictional private agenda."})
+        gs.save_marker(marker, entries)
+        feature_data = json.loads(gs.LIST_PATH.read_text())
+        newer_list = self.tmp / "newer.json"
+        newer_list.write_text(json.dumps({**feature_data, "revision": "tutorial.2026-12-01.1"}))
+        code, out, _ = self.main(*common, "--owner", "@other:example.test", "--if-newer",
+                                 "--list", str(newer_list))
+        result = json.loads(out)
+        self.assertEqual((code, result["kind"], result["action"]), (0, kind, "updated"))
+        page = self.room_state()["pages"][kind]
+        for private in ("Example Test Agent", "Picked for: Founder", "Write my fictional private agenda."):
+            self.assertNotIn(private, page)
+        self.assertIn('id="guide-draft"', page)
+        self.assertTrue(gs.page_digest_ok(page))
 
     def test_owner_and_roles_stay_in_the_inputs_room(self):
         self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test", "roles": "Founder"})
@@ -1350,8 +1442,13 @@ class PublishTest(unittest.TestCase):
         kw.setdefault("agent", self.ME)
         return gs.publish(gs.Commons(self.stub, self.ROOM, actions=lambda: self.door), self.marker, name, **kw)
 
-    def page(self, name="Sutando", core="codex", audience="dm"):
-        return gs.render_page(name, core, audience, self.ME)
+    def page(self, core="codex", audience="dm", features=None):
+        return gs.render_page(gs.GENERIC_NAME, core, audience, self.ME, features=features)
+
+    def changed_features(self):
+        base = gs.tour_page.FEATURES
+        first = base.steps[0]._replace(what="A revised synthetic feature description.")
+        return base._replace(steps=(first, *base.steps[1:]))
 
     def ops(self):
         return [c for c in self.room()["calls"] if c[0] == "create"]
@@ -1386,17 +1483,203 @@ class PublishTest(unittest.TestCase):
 
     def test_changed_content_rewrites_the_same_page(self):
         self.publish()
-        out = self.publish(name="Kai")
+        changed = self.changed_features()
+        out = self.publish(features=changed)
         self.assertEqual(out["action"], "updated")
-        self.assertEqual(self.room()["pages"], {"html-p1": self.page("Kai")})
+        self.assertEqual(self.room()["pages"], {"html-p1": self.page(features=changed)})
+
+    def test_generic_migration_preserves_concurrent_edit_without_restoring_private_html(self):
+        self.publish()
+        before = gs.render_page("Fictional Private Name", "codex", agent=self.ME,
+                                private_setup=True, roles="Designer",
+                                prompts={"dm": "A fictional private example."})
+        db = self.room()
+        db["pages"]["html-p1"] = before
+        self.state.write_text(json.dumps(db))
+        rooms = gs.load_marker(self.marker)
+        entry = rooms[self.ROOM]
+        entry.pop("privacy")
+        entry.update(hash=gs.content_hash(before), roles="Designer",
+                     prompts={"dm": "A fictional private example."})
+        gs.save_marker(self.marker, rooms)
+        with mock.patch.dict(os.environ, {"STUB_EDIT_AFTER": "replace:1:append"}):
+            result = self.publish()
+        self.assertEqual((result["action"], result["reason"]), ("skipped", "owner edit detected during migration"))
+        page = self.room()["pages"]["html-p1"]
+        self.assertTrue(page.endswith("<p>OWNER NOTES</p>"))
+        self.assertNotIn("Fictional Private Name", page)
+        self.assertNotIn("A fictional private example.", page)
+        self.assertEqual([c[0] for c in self.room()["calls"]].count("replace"), 1)
+        self.assertFalse({"prompts", "roles"} & gs.load_marker(self.marker)[self.ROOM].keys())
+
+    def old_entry(self, live, **entry):
+        self.state.write_text(json.dumps({"pages": {"html-p1": live}, "calls": [], "next": 2}))
+        gs.save_marker(self.marker, {self.ROOM: {"kind": "html-p1", **entry}})
+
+    def legacy_dm(self):
+        return gs.render_page("Fictional Agent", "codex", agent=self.ME, roles="Designer",
+                              prompts={"dm": "A fictional private draft."}, private_setup=True)
+
+    def test_same_revision_legacy_page_migrates_without_upload_or_summon(self):
+        before = self.legacy_dm()
+        self.old_entry(before, state="complete", audience="dm", hash=gs.content_hash(before),
+                       revision=gs.tour_page.FEATURES.revision, roles="Designer")
+        result = self.publish(if_newer=True, owner="@chi:ag2.space", summon=True)
+        self.assertEqual((result["action"], result["migrated"], result["summoned"]), ("updated", True, False))
+        live = self.room()["pages"]["html-p1"]
+        self.assertNotIn("Fictional Agent", live)
+        self.assertNotIn("A fictional private draft.", live)
+        self.assertIn("sendToMyAgent", live)
+        self.assertEqual(sum(c[0] == "replace" for c in self.room()["calls"]), 1)
+        self.assertFalse(any(c[0] in ("append", "create", "summon") for c in self.room()["calls"]))
+        self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["privacy"], gs.PUBLISH_PRIVACY)
+        self.assertEqual(self.publish(if_newer=True)["action"], "unchanged")
+
+    def test_interrupted_pages_migrate_from_exact_known_snapshots_without_replaying(self):
+        target = self.legacy_dm()
+        for state in ("creating", "pending", "updating"):
+            with self.subTest(state=state):
+                before = gs.chunks(target, 900)[0]
+                journal = gs._journal({"state": state, "audience": "dm", "hash": gs.content_hash(target)},
+                                      before, target, None, "Fictional Agent", "codex", "dm", self.ME, mode="fill")
+                journal["state"] = state
+                if state == "creating":
+                    journal["operation_id"] = "fictional-old-create"
+                self.old_entry(before, **journal)
+                if state == "creating":
+                    saved = gs.load_marker(self.marker)
+                    saved[self.ROOM].pop("kind")
+                    gs.save_marker(self.marker, saved)
+                result = self.publish(if_newer=True)
+                self.assertEqual((result["action"], result["kind"]), ("updated", "html-p1"))
+                self.assertNotIn("Fictional Agent", self.room()["pages"]["html-p1"])
+                self.assertEqual(sum(c[0] == "replace" for c in self.room()["calls"]), 1)
+                self.assertFalse(any(c[0] in ("append", "create", "summon") for c in self.room()["calls"]))
+                self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["state"], "complete")
+
+    def test_legacy_page_with_owner_edit_or_wrong_publisher_is_not_changed(self):
+        before = self.legacy_dm()
+        for live, attributed in ((before + "\n<p>owner kept</p>", self.ME), (before, "@other:example.test")):
+            with self.subTest(attributed=attributed):
+                self.old_entry(live, state="complete", audience="dm", hash=gs.content_hash(before), agent=attributed)
+                marker = self.marker.read_bytes()
+                result = self.publish(if_newer=True)
+                self.assertEqual(result["action"], "skipped")
+                self.assertEqual(self.room()["pages"]["html-p1"], live)
+                self.assertEqual(self.marker.read_bytes(), marker)
+                self.assertFalse(any(c[0] in ("replace", "append", "create") for c in self.room()["calls"]))
+
+    def test_legacy_migration_resumes_its_generic_target_after_write_failure(self):
+        before = self.legacy_dm()
+        self.old_entry(before, state="complete", audience="dm", hash=gs.content_hash(before))
+        with mock.patch.dict(os.environ, {"STUB_FAIL": "replace"}):
+            with self.assertRaises(gs.PublishError):
+                self.publish(if_newer=True)
+        entry = gs.load_marker(self.marker)[self.ROOM]
+        self.assertTrue(entry["privacy_migration"])
+        self.assertNotIn("before", entry)
+        self.assertNotIn("Fictional Agent", json.dumps(entry))
+        result = self.publish(if_newer=True)
+        self.assertEqual((result["action"], result["summoned"]), ("resumed", False))
+        self.assertNotIn("Fictional Agent", self.room()["pages"]["html-p1"])
+
+    def test_legacy_migration_preserves_unclassified_newer_or_unrewritable_pages(self):
+        before = self.legacy_dm()
+        future = gs.tour_page.FEATURES._replace(revision="tutorial.2099-01-01.1")
+        newer = gs.render_page("Fictional Agent", "codex", agent=self.ME, features=future,
+                               private_setup=True)
+        cases = (
+            (before, {}, {"audience": None}, gs.CALL_BYTES, "audience unknown"),
+            (newer, {"audience": "dm"}, {}, gs.CALL_BYTES, "legacy page uses a newer guide version"),
+            (before, {"audience": "dm"}, {}, 1, "legacy page exceeds a single exact replacement"),
+        )
+        for live, entry, args, budget, reason in cases:
+            with self.subTest(reason=reason):
+                self.old_entry(live, state="complete", hash=gs.content_hash(live), **entry)
+                marker = self.marker.read_bytes()
+                with mock.patch.object(gs, "call_budget", return_value=(budget, budget * 2)):
+                    result = self.publish(if_newer=True, **args)
+                self.assertEqual((result["action"], result["reason"], result["summoned"]),
+                                 ("skipped", reason, False))
+                self.assertEqual(self.room()["pages"], {"html-p1": live})
+                self.assertEqual(self.marker.read_bytes(), marker)
+                self.assertFalse(any(c[0] in ("replace", "append", "create", "summon")
+                                     for c in self.room()["calls"]))
+
+    def test_malformed_legacy_journal_is_not_replayed_or_rewritten(self):
+        target = self.legacy_dm()
+        before = gs.chunks(target, 900)[0]
+        journal = gs._journal({"hash": gs.content_hash(target)}, before, target, None,
+                              "Fictional Agent", "codex", "dm", self.ME, mode="fill")
+        journal["piece"] = "not a byte limit"
+        self.old_entry(before, **journal)
+        marker = self.marker.read_bytes()
+        result = self.publish(if_newer=True)
+        self.assertEqual((result["action"], result["reason"]),
+                         ("skipped", "publisher ownership not verified"))
+        self.assertEqual(self.room()["calls"], [])
+        self.assertEqual(self.room()["pages"], {"html-p1": before})
+        self.assertEqual(self.marker.read_bytes(), marker)
+
+    def test_already_generic_legacy_page_updates_only_its_marker(self):
+        page = gs.render_page(gs.GENERIC_NAME, "codex", agent=self.ME, native_dm=True)
+        self.old_entry(page, state="complete", audience="dm", hash=gs.content_hash(page),
+                       roles="Designer", prompts={"dm": "A fictional private draft."})
+        db = self.room()
+        db["pages"]["html-p2"] = page
+        self.state.write_text(json.dumps(db))
+        result = self.publish(if_newer=True, summon=True)
+        self.assertEqual((result["action"], result["kind"], result["migrated"], result["summoned"]),
+                         ("unchanged", "html-p1", True, False))
+        self.assertEqual(self.room()["pages"], {"html-p1": page, "html-p2": page})
+        self.assertEqual([c[0] for c in self.room()["calls"]], ["pages", "read"])
+        entry = gs.load_marker(self.marker)[self.ROOM]
+        self.assertEqual(entry["privacy"], gs.PUBLISH_PRIVACY)
+        self.assertFalse({"roles", "prompts"} & entry.keys())
+
+    def test_recovery_holds_migrations_with_missing_page_corrupt_target_or_smaller_budget(self):
+        before = self.legacy_dm()
+        for case in ("missing", "corrupted", "small budget"):
+            with self.subTest(case=case):
+                self.old_entry(before, state="complete", audience="dm", hash=gs.content_hash(before))
+                with mock.patch.dict(os.environ, {"STUB_FAIL": "replace"}):
+                    with self.assertRaisesRegex(gs.PublishError, "generic target stays recorded"):
+                        self.publish(if_newer=True)
+                rooms = gs.load_marker(self.marker)
+                self.assertTrue(rooms[self.ROOM]["privacy_migration"])
+                if case == "corrupted":
+                    rooms[self.ROOM]["target"] += "<!-- corrupted journal -->"
+                    gs.save_marker(self.marker, rooms)
+                marker = self.marker.read_bytes()
+                db = self.room()
+                db["calls"] = []
+                if case == "missing":
+                    db["pages"] = {}
+                self.state.write_text(json.dumps(db))
+                if case == "missing":
+                    result = self.publish(if_newer=True)
+                    self.assertEqual((result["action"], result["reason"], result["summoned"]),
+                                     ("skipped", "migration page no longer listed", False))
+                elif case == "corrupted":
+                    with self.assertRaisesRegex(gs.PublishError, "target failed verification"):
+                        self.publish(if_newer=True)
+                else:
+                    with mock.patch.object(gs, "call_budget", return_value=(1, 2)):
+                        with self.assertRaisesRegex(gs.PublishError, "generic target stays recorded"):
+                            self.publish(if_newer=True)
+                self.assertEqual(self.marker.read_bytes(), marker)
+                self.assertEqual(self.room()["pages"], db["pages"])
+                self.assertFalse(any(c[0] in ("replace", "append", "create", "summon")
+                                     for c in self.room()["calls"]))
 
     def test_a_large_change_replaces_the_whole_page_by_its_first_piece_then_appends(self):
         self.publish()
         before = len(self.room()["calls"])
-        old, new = self.page(), self.page(name="Kai")
+        changed = self.changed_features()
+        old, new = self.page(), self.page(features=changed)
         self.assertGreater(len(old.encode()), gs.CHUNK_BYTES)
         with mock.patch.object(gs, "one_call", return_value=False):  # above the one-call budget
-            out = self.publish(name="Kai")
+            out = self.publish(features=changed)
         self.assertEqual(out["action"], "updated")
         calls = self.room()["calls"][before:]
         replaces = [c for c in calls if c[0] == "replace"]
@@ -1428,8 +1711,9 @@ class PublishTest(unittest.TestCase):
             out = self.publish(owner="@chi:ag2.space")
             self.assertEqual((out["action"], out["summoned"]), ("created", True))
             self.assertEqual(self.room()["pages"], {"html-p1": self.page()})
-            self.assertEqual(self.publish(name="Kai")["action"], "updated")  # a whole-page replace, re-run too
-            self.assertEqual(self.room()["pages"], {"html-p1": self.page("Kai")})
+            changed = self.changed_features()
+            self.assertEqual(self.publish(features=changed)["action"], "updated")
+            self.assertEqual(self.room()["pages"], {"html-p1": self.page(features=changed)})
         finally:
             os.environ.pop("STUB_REEXEC")
 
@@ -1485,12 +1769,13 @@ class PublishTest(unittest.TestCase):
         self.door.fail = "after"
         with self.assertRaises(gs.PublishError):
             self.publish(name="Old")
-        out = self.publish(name="New")  # finishes the journalled "Old" page first; "New" waits
-        self.assertEqual((out["action"], out["kind"], out["name"]), ("resumed", "html-p1", "Old"))
-        self.assertEqual(self.room()["pages"], {"html-p1": self.page("Old")})
-        out = self.publish(name="New")
+        changed = self.changed_features()
+        out = self.publish(name="New", features=changed)  # the saved generic write finishes first
+        self.assertEqual((out["action"], out["kind"], out["name"]), ("resumed", "html-p1", gs.GENERIC_NAME))
+        self.assertEqual(self.room()["pages"], {"html-p1": self.page()})
+        out = self.publish(name="New", features=changed)
         self.assertEqual((out["action"], out["kind"]), ("updated", "html-p1"))
-        self.assertEqual(self.room()["pages"], {"html-p1": self.page("New")})
+        self.assertEqual(self.room()["pages"], {"html-p1": self.page(features=changed)})
         self.assertEqual(len(self.door.ops), 1)
 
     def test_resume_without_a_listed_tagged_page_reissues_the_same_operation_id(self):
@@ -1501,10 +1786,11 @@ class PublishTest(unittest.TestCase):
         db = self.room()
         db["titles"] = {"html-p1": "Untitled page"}  # not yet listed as "Getting started"
         self.state.write_text(json.dumps(db))
-        out = self.publish(name="Other")  # content changed since the first attempt
+        changed = self.changed_features()
+        out = self.publish(features=changed)  # content changed since the first attempt
         self.assertEqual(self.door.ops, [op, op])  # the server answers the same operation id
         self.assertEqual((out["action"], out["kind"]), ("created", "html-p1"))
-        self.assertEqual(self.room()["pages"], {"html-p1": self.page("Other")})
+        self.assertEqual(self.room()["pages"], {"html-p1": self.page(features=changed)})
 
     def test_actions_client_errors_are_redacted(self):
         commons = gs.Commons(self.stub, self.ROOM, env={"AG2_REMOTE_TOKEN": "https://relay.x.test/r|abcdefghijkl"},

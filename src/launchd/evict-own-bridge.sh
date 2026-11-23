@@ -88,6 +88,8 @@ _own_bridge_candidates() {
   pgrep -f "src/$1-bridge\.py\$" 2>/dev/null
 }
 
+# EVICT_PROVEN_PID: the lease holder the caller proved, the only indeterminate candidate killed. EVICT_WAIT_S:
+# wait for killed pids to exit; when set, one still alive then returns 4. Failed discovery returns pgrep's rc.
 evict_own_bridge() {
   channel="$1"; repo="$2"; inst_var="${3:-}"; inst_val="${4:-}"
   candidates="$(_own_bridge_candidates "$channel")" && _disc_rc=0 || _disc_rc=$?
@@ -95,12 +97,31 @@ evict_own_bridge() {
     echo "evict_own_bridge: candidate discovery FAILED (pgrep rc=$_disc_rc); no eviction attempted" >&2
     return "$_disc_rc"
   fi
+  _evicted=""
   for pid in $candidates; do
     [ "$pid" = "$$" ] && continue
     case "$(_own_bridge_verdict "$pid" "$channel" "$repo" "$inst_var" "$inst_val")" in
-      OWN) kill "$pid" 2>/dev/null || true ;;
-      INDETERMINATE) echo "evict_own_bridge: skip pid $pid (identity indeterminate; never killing)" >&2 ;;
+      OWN) kill "$pid" 2>/dev/null && _evicted="$_evicted $pid" ;;
+      INDETERMINATE)
+        if [ -n "${EVICT_PROVEN_PID:-}" ] && [ "$pid" = "$EVICT_PROVEN_PID" ]; then
+          echo "evict_own_bridge: pid $pid holds this bridge's lease; evicting" >&2
+          kill "$pid" 2>/dev/null && _evicted="$_evicted $pid"
+        else
+          echo "evict_own_bridge: skip pid $pid (identity indeterminate; never killing)" >&2
+        fi
+        ;;
     esac
+  done
+  _wait_end=$(( $(date +%s) + ${EVICT_WAIT_S:-0} ))
+  for pid in $_evicted; do
+    while kill -0 "$pid" 2>/dev/null && [ "$(date +%s)" -lt "$_wait_end" ]; do sleep 0.2; done
+  done
+  [ -n "${EVICT_WAIT_S:-}" ] || return 0
+  for pid in $_evicted; do
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "evict_own_bridge: pid $pid still running ${EVICT_WAIT_S}s after SIGTERM" >&2
+      return 4
+    fi
   done
   return 0
 }

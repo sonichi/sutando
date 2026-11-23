@@ -6,8 +6,8 @@ connection row naming the worker (src/connections.py, "a pool worker's own ident
 of its own that answers only what is addressed to that agent, hands every task it queues to the
 worker, and posts nothing proactively. Retiring the worker (pool_manage retire) takes it away.
 
-    python3 pool_identity.py [--workspace WS] add <worker> --repo REPO --logs-dir DIR [TOKEN|-] [--yes --expected-server NAME]
-    python3 pool_identity.py [--workspace WS] add <worker> --device-flow --label LABEL [--display-name TEXT] [--lane INSTANCE]
+    python3 pool_identity.py [--workspace WS] add <worker> --repo REPO --logs-dir DIR [TOKEN|-] [--yes --expected-server NAME] [--shared-dirs]
+    python3 pool_identity.py [--workspace WS] add <worker> --device-flow --label LABEL [--display-name TEXT] [--lane INSTANCE] [--shared-dirs]
     python3 pool_identity.py [--workspace WS] show <worker>
     python3 pool_identity.py [--workspace WS] rotate <worker> --repo REPO --logs-dir DIR [TOKEN|-]
     python3 pool_identity.py [--workspace WS] rotate <worker> --device-flow --label LABEL [--lane INSTANCE]
@@ -19,10 +19,22 @@ worker, and posts nothing proactively. Retiring the worker (pool_manage retire) 
     python3 pool_identity.py [--workspace WS] provision-abort <worker>
     python3 pool_identity.py [--workspace WS] retire-remote <worker> [--local-anyway]
     python3 pool_identity.py [--workspace WS] card-reply --task-file PATH
+    python3 pool_identity.py [--workspace WS] rooms <worker>
+    python3 pool_identity.py [--workspace WS] worked <worker>
+    python3 pool_identity.py [--workspace WS] hand-room <worker> --room ROOM [--wait SECONDS]
+    python3 pool_identity.py [--workspace WS] join-room <worker> --room ROOM [--wait SECONDS]
+    python3 pool_identity.py [--workspace WS] return-room <worker> --room ROOM [--binding KEY ...] [--wait SECONDS]
 
 TOKEN is the agent's access token from its settings page in AG2 Space. Leave it out to type it
 at a hidden prompt, or pass '-' to read it from stdin; it is stored in the secret vault, never in
 a file, and never printed. `add` shows what the token's gateway says before anything is saved.
+
+A worker's first agent (`add`, pasted or `--device-flow`) also moves the worker onto that agent's own task
+and result folders before its lane starts, as `worker_lane.py migrate-dirs --apply` does: work already
+delivered to it moves or is handed back, and the output says `dirs`. `--shared-dirs` keeps it on the shared
+folders: use it only when something still reads this worker's work from the shared `tasks/` and `results/`
+(`migrate-dirs --apply` switches it later). `rotate` never changes a worker's folders. `provision-*` does
+not switch them either; run `migrate-dirs --apply` after it.
 
 `--device-flow` needs no pasted token either (pool_device_connect.py): the core starts s.space's
 device-connect flow for agent LABEL, sends the owner the approval link in their DM, waits until they
@@ -39,6 +51,16 @@ the core's own agent, asks again until the owner has approved it, and redeems th
 `provision-finish` redeems a claim an earlier call already returned, for the agent id it returned.
 Both print the agent id and a status. `retire-remote` removes the identity once its server rejects
 the token. Each prints one JSON line and never a secret.
+
+`rooms` lists the rooms bound to a worker, and `worked` the unbound rooms it worked in as the core's
+agent, one line of JSON. `hand-room` hands a bound room from the core's agent to the worker's own agent
+(pool_room_handoff.py): the core invites it, waits up to SECONDS for it to join, leaves, and drops the
+binding; the core never leaves a room the worker's agent is not confirmed in. Its `status` is handed,
+waiting, unknown, skipped, not_bound or failed. `join-room` only invites the worker's agent and waits for
+it; the core stays and no binding changes (joined, waiting, skipped or failed). `return-room` undoes a
+hand-off: the worker's agent invites the core's agent back, and once it is joined the room is bound to the
+worker again (each --binding, default the room's id) and the worker's agent leaves (returned, waiting,
+skipped or failed).
 """
 from __future__ import annotations
 
@@ -55,6 +77,7 @@ import agent_card
 import connections
 import pool_device_connect
 import pool_provision
+import pool_room_handoff
 import pool_roster as pr
 from workspace_default import resolve_workspace
 
@@ -99,6 +122,14 @@ def reseat_after_add(ws: Path, repo, wid: str) -> dict:
     return out
 
 
+def dirs_said(wid: str, dirs: dict) -> str:
+    """A first agent's folder state ("own", "migrating", "shared"); one that stopped says how to finish it."""
+    if dirs.get("why"):
+        print(f"worker {wid}'s folders: {dirs['why']}; finish with: worker_lane.py migrate-dirs "
+              f"--worker {wid} --apply", file=sys.stderr)
+    return str(dirs.get("state") or ("own" if dirs.get("own") else "shared"))
+
+
 def cmd_device_flow(args, ws: Path, *, rotate: bool) -> int:
     """The device flow; a resend attempt (--resend-id) that ends without a new card says why and frees its button."""
     resend_id = getattr(args, "resend_id", None) or ""
@@ -130,7 +161,8 @@ def _device_flow(args, ws: Path, *, rotate: bool) -> tuple:
         out = pool_device_connect.connect(
             wid, label=args.label, display_name=args.display_name or "", worker_label=label, rotate=rotate,
             workspace=ws, lane=args.lane, base=args.base or "", repo=args.repo, logs_dir=args.logs_dir,
-            start_lane=start_lane, say=lambda text: print(text, file=sys.stderr, flush=True))
+            start_lane=start_lane, say=lambda text: print(text, file=sys.stderr, flush=True),
+            own_dirs=not getattr(args, "shared_dirs", False) and not rotate)
     except pool_device_connect.DeviceConnectError as e:
         print(f"pool_identity: {e}", file=sys.stderr)
         print(json.dumps({"status": e.status}, sort_keys=True))
@@ -141,6 +173,8 @@ def _device_flow(args, ws: Path, *, rotate: bool) -> tuple:
         print(f"lane {out['row']['instance']} not started: {launch.get('reason')}", file=sys.stderr)
     status = out["status"] if started else "stored_lane_not_started"
     line = {"agent_id": out["agent_id"], "status": status}
+    if "dirs" in out:
+        line["dirs"] = dirs_said(wid, out["dirs"])
     if not rotate and not args.no_start:
         line["seat"] = reseat_after_add(ws, args.repo, wid).get("result")
     print(json.dumps(line, sort_keys=True))
@@ -164,11 +198,19 @@ def cmd_add(args, ws: Path) -> int:
             print("not saved")
             return 1
         expected = str(preview.get("server") or "")
-    row, created = connections.add_worker_identity(wid, token, expected_server=expected, preview=preview,
-                                                   workspace=ws)
-    print(f"{'added' if created else 'already present:'} {row['instance']}: worker {wid} runs as "
-          f"{row.get('agent_mxid') or '?'} (token in the vault as {row['token_ref']})")
-    launch = connections.start_added(row, repo=args.repo, logs_dir=args.logs_dir, workspace=ws)
+    try:
+        with pool_device_connect.fenced(wid, ws):
+            row, created = connections.add_worker_identity(wid, token, expected_server=expected, preview=preview,
+                                                           workspace=ws)
+        print(f"{'added' if created else 'already present:'} {row['instance']}: worker {wid} runs as "
+              f"{row.get('agent_mxid') or '?'} (token in the vault as {row['token_ref']})")
+        if created and not args.shared_dirs:
+            print(f"dirs: {dirs_said(wid, pool_device_connect.switch_to_own_dirs(wid, ws))}")
+        with pool_device_connect.fenced(wid, ws):
+            launch = connections.start_added(row, repo=args.repo, logs_dir=args.logs_dir, workspace=ws)
+    except pool_device_connect.DeviceConnectError:
+        print(f"pool_identity: worker {wid} was retired; no lane was started for it", file=sys.stderr)
+        return 1
     if created:
         print(f"seat: {reseat_after_add(ws, args.repo, wid).get('result')}")
     if launch is not None and not launch.get("ok"):
@@ -296,6 +338,39 @@ def cmd_card_reply(args, ws: Path) -> int:
     return 0 if out["status"] == "started" else 1
 
 
+def cmd_rooms(args, ws: Path) -> int:
+    wid = live_worker(ws, args.worker)
+    server = str(pool_provision.core_lane(ws, None).get("server") or "")
+    print(json.dumps({"worker": wid, "rooms": pool_room_handoff.bound_rooms(ws, wid, server)}, sort_keys=True))
+    return 0
+
+
+def cmd_worked(args, ws: Path) -> int:
+    wid = live_worker(ws, args.worker)
+    server = str(pool_provision.core_lane(ws, None).get("server") or "")
+    print(json.dumps({"worker": wid, "rooms": pool_room_handoff.worked_rooms(ws, wid, server)}, sort_keys=True))
+    return 0
+
+
+def cmd_return_room(args, ws: Path) -> int:
+    out = pool_room_handoff.return_room(live_worker(ws, args.worker), args.room, bindings=args.binding or None,
+                                        workspace=ws, wait_s=args.wait)
+    print(json.dumps(out, sort_keys=True))
+    return 1 if out["status"] == "failed" else 0
+
+
+def cmd_join_room(args, ws: Path) -> int:
+    out = pool_room_handoff.join_room(live_worker(ws, args.worker), args.room, workspace=ws, wait_s=args.wait)
+    print(json.dumps(out, sort_keys=True))
+    return 1 if out["status"] == "failed" else 0
+
+
+def cmd_hand_room(args, ws: Path) -> int:
+    out = pool_room_handoff.hand_room(live_worker(ws, args.worker), args.room, workspace=ws, wait_s=args.wait)
+    print(json.dumps(out, sort_keys=True))
+    return 1 if out["status"] == "failed" else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="pool_identity", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -314,6 +389,9 @@ def build_parser() -> argparse.ArgumentParser:
         s.add_argument("--display-name", default=None); s.add_argument("--lane", default=None)
         s.add_argument("--base", default=None, help=argparse.SUPPRESS); s.add_argument("--no-start", action="store_true")
         s.add_argument("--resend-id", default=None, help=argparse.SUPPRESS)
+    a.add_argument("--shared-dirs", action="store_true",
+                   help="keep the worker on the shared tasks/ and results/ (only while something still reads "
+                        "its work there; worker_lane.py migrate-dirs --apply switches it later)")
     s = sub.add_parser("remove"); s.add_argument("worker"); s.set_defaults(fn=cmd_remove)
     s = sub.add_parser("provision-begin"); s.add_argument("worker"); s.add_argument("--role", default=None)
     s.add_argument("--lane", default=None); s.set_defaults(fn=cmd_provision_begin)
@@ -331,6 +409,13 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("retire-remote"); s.add_argument("worker"); s.add_argument("--local-anyway", action="store_true")
     s.set_defaults(fn=cmd_retire_remote)
     s = sub.add_parser("card-reply"); s.add_argument("--task-file", required=True); s.set_defaults(fn=cmd_card_reply)
+    s = sub.add_parser("rooms"); s.add_argument("worker"); s.set_defaults(fn=cmd_rooms)
+    s = sub.add_parser("worked"); s.add_argument("worker"); s.set_defaults(fn=cmd_worked)
+    for verb, fn in (("hand-room", cmd_hand_room), ("join-room", cmd_join_room), ("return-room", cmd_return_room)):
+        s = sub.add_parser(verb); s.add_argument("worker"); s.add_argument("--room", required=True)
+        s.add_argument("--wait", type=float, default=0.0); s.set_defaults(fn=fn)
+        if verb == "return-room":
+            s.add_argument("--binding", action="append", default=[])
     return p
 
 

@@ -51,7 +51,7 @@ _LIMIT = {"state": "blocked-human", "detail": "awaiting user: session-limit",
                     "/usage-credits to finish what you're working on.\n"
                     "Continuing automatically at 12:10pm · esc to cancel",
           "kind": "session-limit"}
-_LOGGED_OUT = {"state": "logged-out", "detail": "core not authenticated (needs /login)",
+_LOGGED_OUT = {"state": "logged-out", "detail": "core not authenticated (needs a sign-in)",
                "prompt": None, "kind": None}
 # The monitor's refused-turn signal (#4015): the core sits at its idle prompt and every turn
 # it is sent ends in this line. The prompt IS the line, so the remedy is chosen from it.
@@ -59,6 +59,8 @@ _REFUSED_LINE = ("You're out of usage credits. Run /usage-credits to keep using 
                  "or /model to switch models.")
 _REFUSED = {"state": "blocked-human", "detail": "awaiting user: turn-rejected",
             "prompt": _REFUSED_LINE, "kind": "turn-rejected"}
+# The no-backend remedy: no transport is named when the core recorded none.
+_GENERIC = "Open the core's terminal or the Runtime panel to answer it"
 _IDLE = {"state": "idle-ready", "detail": "ready for a task", "prompt": None, "kind": None}
 _RUNNING = {"state": "running", "detail": "actively processing", "prompt": None, "kind": None}
 _CRASHED = {"state": "crashed", "detail": "core process/session not found", "prompt": None}
@@ -250,17 +252,47 @@ class TestComposeMessage(unittest.TestCase):
         self.assertIn("not authenticated", m)
         self.assertTrue(m.endswith("resolve this."))
 
-    # Login-class states (sonichi#2397): the remedy is a GUI /login on the host —
-    # "reply here or open the app" prescribes actions that cannot clear them.
-    def test_logged_out_names_gui_login_remedy(self):
-        m = compose_message(_LOGGED_OUT)
-        self.assertIn("GUI /login", m)
-        self.assertNotIn("reply here or open the app", m)
+    # Login-class states (sonichi#2397): the relay sends only where no card shows the block, so
+    # every surface, s.space included, names the sign-in on the host and no card.
+    _NO_CARD = ("", "telegram", "discord", "macos")
+    _ALL = ("ag2space",) + _NO_CARD
+    _UNFOCUSED = {"state": "blocked-human", "detail": "awaiting user: fable-limit-unfocused",
+                  "prompt": "You've reached your Fable limit\n❯ Continue with Fable 5.1",
+                  "kind": "fable-limit-unfocused"}
+    _UNKNOWN_GATE = {"state": "blocked-human", "detail": "awaiting user: unknown",
+                     "prompt": "Something the CLI asks that no classifier knows", "kind": "unknown"}
 
-    def test_login_prompt_names_gui_login_remedy(self):
-        m = compose_message(_LOGIN)
-        self.assertIn("GUI /login", m)
-        self.assertNotIn("reply here or open the app", m)
+    def test_every_surface_names_the_sign_in_on_the_host(self):
+        for sig in (_LOGGED_OUT, _LOGIN):
+            for surface in self._ALL:
+                with self.subTest(sig=sig["state"], surface=surface), _no_backend():
+                    m = compose_message(sig, surface=surface)
+                    self.assertNotIn("its card", m)
+                    self.assertIn("run /login in the core terminal (the Runtime panel)", m)
+                    self.assertNotIn("reply here or open the app", m)
+
+    def test_the_limit_notice_names_no_card(self):
+        for surface in self._ALL:
+            with self.subTest(surface=surface):
+                m = compose_message(_LIMIT, surface=surface)
+                self.assertNotIn("its card", m)
+                self.assertIn("from the Runtime panel", m)
+                self.assertIn("switch it to another model or runtime", m)
+
+    def test_the_fable_notice_names_no_card(self):
+        for surface in self._ALL:
+            with self.subTest(surface=surface):
+                m = compose_message(self._UNFOCUSED, surface=surface)
+                self.assertNotIn("its card", m)
+                self.assertIn("Pick the switch, or restart the core, in the Runtime panel", m)
+
+    def test_the_terminal_notice_names_no_card_on_any_surface(self):
+        with _no_backend():
+            for surface in self._ALL:
+                with self.subTest(surface=surface):
+                    m = compose_message(self._UNKNOWN_GATE, surface=surface)
+                    self.assertNotIn("its card", m)
+                    self.assertIn("answer it", m)
 
     def test_session_limit_escalates(self):
         self.assertTrue(should_escalate(_LIMIT, None)[0])
@@ -268,7 +300,8 @@ class TestComposeMessage(unittest.TestCase):
     def test_session_limit_names_the_reset_time_not_login(self):
         m = compose_message(_LIMIT)
         self.assertIn("resumes on its own at 12:10pm", m)
-        self.assertIn("/usage-credits", m)
+        self.assertIn("switch it to another model or runtime", m)
+        self.assertNotIn("/usage-credits", m)
         # The owner named this third route (2026-09-02): the limit is per
         # subscription, so signing in under another one is often the fastest.
         self.assertIn("different subscription", m)
@@ -296,19 +329,21 @@ class TestComposeMessage(unittest.TestCase):
     def test_turn_rejected_says_every_turn_is_refused_and_names_the_line(self):
         m = compose_message(_REFUSED)
         self.assertIn("refuses every turn", m)
-        self.assertIn("out of usage credits", m)
-        # A credit line gets the limit remedy, never the login one.
-        self.assertIn("/usage-credits", m)
+        # A credit line gets the limit remedy, never the login one, and its own words, which
+        # name a purchase, are not echoed (a client that must hide purchases shows the rest).
+        self.assertNotIn("credit", m)
         self.assertIn("not a login problem", m)
-        self.assertNotIn("GUI /login", m)
+        self.assertNotIn("tap Sign in", m)
         self.assertNotIn("restart.sh", m)
 
     def test_turn_rejected_login_line_names_gui_login_remedy(self):
         sig = dict(_REFUSED, prompt="OAuth access token has expired · Please run /login")
-        m = compose_message(sig)
+        with _no_backend():
+            m = compose_message(sig, surface="ag2space")
         self.assertIn("refuses every turn", m)
         self.assertIn("OAuth access token has expired", m)
-        self.assertIn("GUI /login", m)
+        self.assertIn("run /login in the core terminal", m)
+        self.assertNotIn("its card", m)
         self.assertNotIn("usage limit", m)
 
     def test_turn_rejected_unknown_line_falls_back_to_the_terminal(self):
@@ -316,71 +351,20 @@ class TestComposeMessage(unittest.TestCase):
         with _no_backend():
             m = compose_message(sig)
         self.assertIn("refuses every turn", m)
-        self.assertIn("where the core is running", m)
+        self.assertIn(_GENERIC, m)
 
     _PICKER = "Select model\n  1. Opus\n❯ 2. Sonnet\n  3. Haiku\n  Enter to confirm · Esc to cancel"
-    _YESNO = "Allow Bash(rm -rf build)?\n❯ 1. Yes\n  2. No\n  Esc to cancel"
 
-    def test_a_selection_or_permission_gate_names_the_choice_card_first_on_ag2space(self):
-        """A numbered picker or a permission dialog is projected to the owner's AG2 Space DM
-        as a HITL card whose buttons type the answer; the notice says so before the
-        terminal. A typed reply still cannot answer it."""
-        for kind, prompt in (("selection", self._PICKER), ("permission", self._YESNO)):
-            sig = {"state": "blocked-human", "detail": f"awaiting user: {kind}", "prompt": prompt, "kind": kind}
-            with _no_backend():
-                m = compose_message(sig, surface="ag2space")
-            self.assertIn("choice card in our DM", m, kind)
-            self.assertLess(m.index("choice card"), m.index("where the core is running"), kind)
-            self.assertIn("A typed chat reply can't answer it", m)
-        sig = {"state": "blocked-human", "detail": "awaiting user: unknown", "prompt": "??", "kind": "unknown"}
-        with _no_backend():
-            self.assertNotIn("choice card", compose_message(sig, surface="ag2space"))
-
-    def test_the_choice_card_is_named_only_where_a_card_with_buttons_exists(self):
-        """No card on discord/slack/telegram or macOS-only; a trust/bypass/limit dialog and an
-        unparseable prompt get the button-less card, so the notice names the terminal instead."""
-        base = {"state": "blocked-human", "detail": "awaiting user: selection", "kind": "selection"}
-        for surface in ("discord", "slack", "telegram", ""):
-            with _no_backend():
-                m = compose_message({**base, "prompt": self._PICKER}, surface=surface)
-            self.assertNotIn("choice card", m, surface or "macos-only")
-            self.assertIn("answer it where the core is running", m, surface or "macos-only")
-        never = ("Do you trust the files in this folder?\n❯ 1. Yes, proceed\n  2. No, exit",
-                 "Bypass Permissions mode\n❯ 1. Yes, I accept\n  2. No",
-                 "You've hit your weekly limit\n❯ 1. Switch to Opus and continue\n  2. Stop")
-        for prompt in never:
-            with _no_backend():
-                m = compose_message({**base, "prompt": prompt}, surface="ag2space")
-            self.assertNotIn("choice card", m, prompt.splitlines()[0])
-            self.assertIn("answer it where the core is running", m)
-        with _no_backend():
-            m = compose_message({**base, "prompt": "pick one"}, surface="ag2space")
-        self.assertNotIn("choice card", m, "no numbered options: no buttons")
-        # A permission gate keyed on a Yes/No pair is a card on a configured homeserver bridge too.
-        with _no_backend():
-            m = compose_message({**base, "kind": "permission", "prompt": self._YESNO}, surface="dev-ag2space")
-        self.assertIn("choice card", m)
-
-    def test_a_card_lookup_failure_falls_back_to_the_terminal_wording(self):
+    def test_the_text_no_longer_names_a_choice_card(self):
+        """Where a card shows the block the relay sends nothing; anywhere it still sends, no
+        card is there to name."""
         sig = {"state": "blocked-human", "detail": "awaiting user: selection", "prompt": self._PICKER,
                "kind": "selection"}
-        with _no_backend(), patch.dict(sys.modules, {"hitl": None, "hitl.tui_gate": None}):
-            m = compose_message(sig, surface="ag2space")
-        self.assertNotIn("choice card", m)
-        self.assertIn("answer it where the core is running", m)
-        # Run as a script, src/ is not on sys.path yet: the lookup puts it there itself.
-        src = os.path.dirname(os.path.abspath(_SRC))
-        with patch.object(sys, "path", [p for p in sys.path if os.path.abspath(p) != src]):
-            self.assertTrue(_mod._card_projected(sig, "ag2space"))
-
-    def test_run_cycle_hands_the_delivery_surface_to_the_composer(self):
-        sig = {"state": "blocked-human", "detail": "awaiting user: selection", "prompt": self._PICKER,
-               "kind": "selection"}
-        with _no_backend():
-            on_space = run_cycle(sig, "", macos=False, source="ag2space", channel="!r:x", dry_run=True)
-            on_discord = run_cycle(sig, "", macos=False, source="discord", channel="1", dry_run=True)
-        self.assertIn("choice card", on_space)
-        self.assertNotIn("choice card", on_discord)
+        for surface in ("ag2space", "discord", ""):
+            with _no_backend():
+                m = compose_message(sig, surface=surface)
+            self.assertNotIn("choice card", m, surface)
+            self.assertIn(_GENERIC, m, surface)
 
     def test_non_login_blocker_names_the_cli_terminal(self):
         """A `blocked-human` prompt waits on the core's stdin. Neither a chat reply
@@ -391,7 +375,7 @@ class TestComposeMessage(unittest.TestCase):
             m = compose_message(sig)
         # FALLBACK shape: with no derivable backend (embedded core, unreadable .alive)
         # the remedy must still not invent a transport name.
-        self.assertIn("where the core is running", m)
+        self.assertIn(_GENERIC, m)
         self.assertNotIn("tmux", m)
         self.assertNotIn("sutando-core", m)
         self.assertNotIn("reply here", m)
@@ -407,7 +391,7 @@ class TestComposeMessage(unittest.TestCase):
             m = compose_message(sig)
         self.assertIn("/tmp/probe-tmux.sock", m)
         self.assertIn("terminal", m)
-        self.assertNotIn("where the core is running", m,
+        self.assertNotIn(_GENERIC, m,
                          "the derived form must REPLACE the vague one, not append to it")
 
     def test_derivation_failure_is_fail_open_not_fatal(self):
@@ -417,7 +401,7 @@ class TestComposeMessage(unittest.TestCase):
                "prompt": "pick one", "kind": "selection"}
         with _backend_raises():
             m = compose_message(sig)
-        self.assertIn("where the core is running", m)
+        self.assertIn(_GENERIC, m)
 
     def test_truncates_long_prompt(self):
         """The prompt echo is bounded, the remedy is not, and the bound must hold
@@ -437,7 +421,7 @@ class TestComposeMessage(unittest.TestCase):
     def test_kind_appended_when_not_in_detail(self):
         sig = {"state": "blocked-human", "detail": "the core is waiting",
                "prompt": "pick one", "kind": "selection"}
-        self.assertIn("(selection)", compose_message(sig))
+        self.assertIn("(the core is waiting, selection)", compose_message(sig))
 
 
 class TestRunCycleAndCli(unittest.TestCase):
@@ -563,6 +547,8 @@ class TestRunCycleAndCli(unittest.TestCase):
         tag = calls[0][3]["extra"][_mod.ALERT_FIELD]
         self.assertEqual(tag["agent"], f"core@{_mod._core_host_label()}")
         self.assertEqual(tag["state"], _LOGIN.get("state"))
+        # A client that hides purchases (iOS) still shows a card that has another way out.
+        self.assertIs(tag["has_non_purchase_actions"], True)
 
     def test_a_failed_channel_send_falls_back_to_macos(self):
         self.assertEqual([c[0] for c in self._dispatch(channel_ok=False)], ["chan", "macos"])
@@ -1201,7 +1187,7 @@ class TestTargetIsRunnable(unittest.TestCase):
     def test_no_backend_still_degrades_to_generic_phrasing(self):
         with _no_backend():
             msg = compose_message(_HUNG)
-        self.assertIn("where the core is running", msg)
+        self.assertIn(_GENERIC, msg)
         self.assertNotIn("tmux -S", msg)
 
 

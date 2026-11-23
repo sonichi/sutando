@@ -197,7 +197,7 @@ python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py add "Call Bob
 python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py add "Fix bug" "2026-03-17" --owner-asked  # with due date
 python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py complete "Call Bob" --owner-asked  # mark done
 ```
-Use for "add a reminder", "what's on my todo list", "remind me to...", "mark X as done".
+Use for "add a reminder", "what's on my todo list", "remind me to...", "mark X as done". A message or job delivered at a set time in an s.space room or DM goes to the platform scheduler instead (see `CLAUDE.md`).
 
 **macOS GUI control** — click, type, scroll, press keys in any Mac app via `macos-use` MCP skill. Works in non-interactive mode (which is how the proactive loop runs), unlike Claude's built-in computer-use. Accessibility-tree based — no screenshots leave the machine.
 
@@ -441,5 +441,5 @@ launch (`switch-model.sh --offline`) and lifts the hold; "retry now" lifts it as
 then starts the core. A hold binds only the Claude account it was seen under: after signing in to
 another account, the next restart launches the core at once. Signing in with `/login` in the running
 core's terminal resumes it in place: once the pane sits idle with nothing run since "Login successful",
-the core supervisor types `/startup` once, which re-arms the task watcher and crons. For engineers: `python3 src/core_limit_hold.py status` prints the hold and
+the core supervisor types `/startup` once, which re-arms the task watcher (unless the task-watch Mod already runs it) and crons. For engineers: `python3 src/core_limit_hold.py status` prints the hold and
 `... clear` lifts it.

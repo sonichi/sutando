@@ -286,6 +286,25 @@ CODEX_ARGS=(
 if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   CODEX_ARGS+=(-m "$SUTANDO_CORE_MODEL")
 fi
+# On unless =0 (docs/codex-core.md): hooks that tell the core supervisor when Codex is blocked
+# on a dialog. Passed only once Codex has recorded trust for exactly these hooks.
+add_codex_block_hooks() {
+  [ "${SUTANDO_CODEX_BLOCK_HOOKS:-1}" != 0 ] && [ -n "$_HB_PY" ] || return 0
+  if [ -z "$CODEX_HOME_DIR" ]; then
+    echo "  ⚠ Codex block-signal hooks off: no usable Codex home to record their trust in" >&2
+    return 0
+  fi
+  local args=() arg
+  while IFS= read -r -d '' arg; do args+=("$arg"); done \
+    < <("$_HB_PY" "$REPO/src/core_block_signal.py" codex-args "$REPO" \
+          --codex-home "$CODEX_HOME_DIR" --cwd "$WORKING_DIR" 2>/dev/null || true)
+  if [ "${#args[@]}" -gt 0 ]; then
+    CODEX_ARGS+=("${args[@]}")
+    echo "  · Codex block-signal hooks on (trusted for these hooks only); set SUTANDO_CODEX_BLOCK_HOOKS=0 to turn them off" >&2
+  else
+    echo "  ⚠ Codex block-signal hooks off: Codex could not record their trust" >&2
+  fi
+}
 # A git checkout's first Codex launch stops on "Trust this folder?", which a headless core
 # never answers; see src/codex_project_trust.py. Best effort: a failure leaves the prompt.
 ensure_codex_project_trust() {
@@ -355,7 +374,7 @@ ensure_task_notifier() {
   expected_version="$(
     cksum "${version_files[@]}" \
       | cksum | awk '{print $1 "-" $2}'
-  )-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-s$(printf '%s' "${SUTANDO_STOP_INTERRUPT:-}" | cksum | awk '{print $1}')"
+  )-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-s$(printf '%s' "${SUTANDO_STOP_INTERRUPT:-}" | cksum | awk '{print $1}')-mtype"
   if session_exists "$WATCHER_SESSION"; then
     active_version="$(
       tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \
@@ -369,6 +388,8 @@ ensure_task_notifier() {
   fi
   NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
+  # A Codex core always types; pinned so a stale or global "alert" in the tmux server never reaches it.
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_STANDBY_MODE=type")
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
   # The stop handler reads it in the watcher's environment; it is in the version, so a change restarts it.
   # Always set, empty included: an omitted one inherits whatever the tmux server's global env holds.
@@ -552,6 +573,19 @@ ensure_local_agent_api() {
 }
 ensure_local_agent_api
 
+# >>> codex-app-server-seat
+# A core last started as an app-server seat (its declaration exists): --restart replaces that
+# window too, whichever way SUTANDO_CODEX_APP_SERVER is set now.
+if [ "${1:-}" = "--restart" ] && tmux_available; then
+  _seat_ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || _seat_ws=""
+  if [ -n "$_seat_ws" ] && [ -f "$_seat_ws/state/codex-seat/$SESSION/host.json" ]; then
+    for _win in $(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" all codex-seat 2>/dev/null); do
+      tmux -S "$TMUX_SOCKET" kill-window -t "$_win" 2>/dev/null || true
+    done
+    [ "${SUTANDO_CODEX_APP_SERVER:-}" = 1 ] || rm -f "$_seat_ws/state/codex-seat/$SESSION/host.json"
+  fi
+fi
+# <<< codex-app-server-seat
 if [ "${1:-}" = "--restart" ]; then
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$OBSERVER_SESSION" 2>/dev/null || true
@@ -594,6 +628,16 @@ codex_core_missing() {
   ids="$(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" live codex)" && [ -z "$ids" ]
 }
 
+# >>> codex-app-server-seat
+# SUTANDO_CODEX_APP_SERVER=1: the core is a seat on `codex app-server` (docs/codex-core.md), with
+# no notifier or observer session beside it. Unset, nothing below this block changes.
+SEAT_MODE=""
+if [ "${SUTANDO_CODEX_APP_SERVER:-}" = 1 ]; then
+  SEAT_MODE=1
+  . "$REPO/src/agent/codex/app-server/seat-launch.sh"
+  seat_core_overrides
+fi
+# <<< codex-app-server-seat
 if session_exists "$SESSION" && ! codex_core_missing; then
   record_confirmed_core_runtime codex "$(heartbeat_python)"
   apply_tmux_defaults
@@ -614,6 +658,7 @@ if session_exists "$SESSION" && ! codex_core_missing; then
   exit 0
 fi
 
+add_codex_block_hooks
 # Past the attach/reuse exit above, so this is a genuine Codex core boot. The
 # sentinel is cleared at each launch site below, never before one can fail.
 if [ -r "$REPO/scripts/python-binary.sh" ]; then
@@ -715,6 +760,9 @@ wait_core_up() {
 # core as the session's lowest window, the notifier's target, and leave every sibling running.
 heal_core_window() {
   local idx low others
+  # >>> codex-app-server-seat
+  if [ -n "$SEAT_MODE" ]; then seat_heal_core_window; return; fi
+  # <<< codex-app-server-seat
   # Empty "live codex" also means a core the command match cannot see: a second core would poll the same workspace.
   if others="$(sutando_unidentified_live_windows "$TMUX_SOCKET" "$SESSION" codex)" && [ -n "$others" ]; then
     echo "  ⚠ $SESSION has live windows ($(echo $others)) that are not a known sibling and not identifiable as the Codex core — not healing, a second core would double-poll. Stop the core or kill the session, then relaunch." >&2
@@ -759,6 +807,9 @@ fi
 # Creates the core session, waits for has-session within the configured budget
 # (new-session rc=0 only means tmux accepted it), then starts the helpers.
 start_core_session_and_helpers() {
+  # >>> codex-app-server-seat
+  if [ -n "$SEAT_MODE" ]; then seat_start_core_session_and_helpers; return; fi
+  # <<< codex-app-server-seat
   prepare_codex_bootstrap || return 1
   prepare_codex_home
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"

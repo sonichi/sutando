@@ -1,0 +1,21 @@
+{
+  "name": "worker-pool",
+  "enabled": true,
+  "access_tier": "owner",
+  "version": "0.1.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Pool workers the core delegates to. No tools; manifest present to DECLARE config per this convention: WORKER_POOL_IDENTITY_ON_CREATE (on by default) makes create_worker start the new worker's own agent identity (the owner approves a link in their DM; set 0 or pass --no-identity to skip). WORKER_POOL_SSPACE_HANDOFF (off by default) sends pool_ask from the core to a worker that has its own enabled agent identity as one message in a room both agents are in instead of through deliveries/<worker>/; the worker's threaded reply arrives as a new task. WORKER_POOL_DELIVERY_TTL_S (14400) is how long a delivery sentinel's lease lets the worker reply as the core; WORKER_POOL_DELIVERY_EXPIRY (warn) logs a lapsed or missing lease; enforce, which would refuse that reply, is unavailable until pool_delivery.ENFORCE_AVAILABLE flips and reads as warn.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  },
+  "config": {
+    "WORKER_POOL_IDENTITY_ON_CREATE": "1",
+    "WORKER_POOL_SSPACE_HANDOFF": "0",
+    "WORKER_POOL_HANDOFF_ROOM": "",
+    "WORKER_POOL_HANDOFF_ROOM_CLI": "",
+    "WORKER_POOL_DELIVERY_TTL_S": "14400",
+    "WORKER_POOL_DELIVERY_EXPIRY": "warn"
+  }
+}

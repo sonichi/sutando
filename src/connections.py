@@ -70,14 +70,17 @@ import subprocess
 import sys
 import contextlib
 import datetime
+import glob
 import hashlib
 import http.client
 import ipaddress
 import socket
+import stat
 import ssl
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1030,6 +1033,11 @@ def _validate_row(row: object, index: int) -> dict:
             raise SchemaError(f"connections.json: row {index} worker is not a pool worker id")
         if row["primary"] or not row["instance"]:
             raise SchemaError(f"connections.json: row {index} is a worker's identity, so it is a named, non-primary row")
+    if WORKER_DIRS_KEY in row and (row[WORKER_DIRS_KEY] not in WORKER_DIRS_STATES or "worker" not in row):
+        raise SchemaError(f"connections.json: row {index} {WORKER_DIRS_KEY} is one of "
+                          f"{', '.join(map(repr, WORKER_DIRS_STATES))} on a worker's row only")
+    if WORKER_RETIRING_KEY in row and (row[WORKER_RETIRING_KEY] is not True or "worker" not in row):
+        raise SchemaError(f"connections.json: row {index} {WORKER_RETIRING_KEY} is true on a worker's row only")
     return row
 
 
@@ -1604,6 +1612,20 @@ def lane_server(instance: str, workspace: Optional[Path] = None) -> str:
     return str((row or {}).get("server") or "")
 
 
+def lane_agent_group(instance: str, workspace: Optional[Path] = None) -> Optional[str]:
+    """The agent the row running as `instance` speaks for: its pool worker id, or "" for the core,
+    whose rows on several homeservers are one agent; "" with no record at all (no pool workers then).
+    None when the record or the row is unreadable."""
+    if not record_path(workspace).exists():
+        return ""
+    try:
+        rows = _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return None
+    row = next((r for r in rows if instance in [r["instance"]] + alias_instances(r)), None)
+    return None if row is None else str(row.get("worker") or "")
+
+
 def _names_mxid(text: str, mxid: str) -> bool:
     """Whether `text` names `mxid` as a whole token; localparts alone repeat across homeservers."""
     return bool(re.search(r"(?<![\w./#=+\-@])" + re.escape(mxid) + r"(?![\w\-/+=@]|[.:][\w\-])", text or ""))
@@ -1615,21 +1637,33 @@ def _listed_members(field: object) -> set:
     return {str(m).strip() for m in items if str(m).strip()}
 
 
-def event_owner_lanes(task: Mapping[str, object], workspace: Optional[Path] = None) -> list:
+def event_owner_lanes(task: Mapping[str, object], workspace: Optional[Path] = None,
+                      group: Optional[str] = None) -> list:
     """The lane names (instance, then its aliases) whose bridge answers a room message more than one
-    running lane may receive: the one lane whose agent the message names or replies to, else the
-    primary. Only facts every lane reads alike decide it (body, `reply_to_sender`, `room_members`).
+    running lane of one agent may receive: the one lane whose agent the body names, else (the body
+    naming none) the one it replies to, else the primary. `group` (`lane_agent_group`) limits the
+    lanes to that agent's: another agent's lanes answer their own copy. Only facts every lane reads
+    alike decide it (body, `reply_to_sender`, `room_members`).
     [] (no preference: the first lane to see it answers) unless two lanes are enabled, the owner's
     bridge runs and its agent is a listed member of the room; an unreadable record is []."""
     try:
         rows = [r for r in _read(record_path(workspace)) if not r.get("disabled") and not r.get("parked")]
     except (SchemaError, OSError):
         return []
+    if group is not None:
+        rows = [r for r in rows if str(r.get("worker") or "") == group]
     if len(rows) < 2:
         return []
+    import local_task_protocol
     body, replied = str(task.get("task") or ""), str(task.get("reply_to_sender") or "")
-    named = [r for r in rows if r.get("agent_mxid")
-             and (replied == r["agent_mxid"] or _names_mxid(body, str(r["agent_mxid"])))]
+    # Only a reply's own words count (its quote of the parent names that sender); a non-reply's
+    # leading "> " lines are its own text.
+    if replied or local_task_protocol.split_reply_context(body)[0] is not None:
+        body = local_task_protocol.reply_action_text(body)
+    # A body mention is addressed on purpose; a reply only says whose message it answers.
+    named = [r for r in rows if r.get("agent_mxid") and _names_mxid(body, str(r["agent_mxid"]))]
+    if not named:
+        named = [r for r in rows if r.get("agent_mxid") and replied == r["agent_mxid"]]
     owner = named[0] if len(named) == 1 else next((r for r in rows if r["primary"]), None)
     if owner is None or str(owner.get("agent_mxid") or "") not in _listed_members(task.get("room_members")):
         return []
@@ -1653,19 +1687,6 @@ def _row_servers(row: Mapping[str, object]) -> set:
     return {s for s in (str(row["server"]).lower(), server_of_mxid(str(row.get("agent_mxid") or ""))) if s}
 
 
-def _lane_holds_room(row: Mapping[str, object], room_id: str, workspace: Optional[Path]) -> bool:
-    """Whether the row's bridge has an open task in `room_id` (its `remote-task-rooms` sidecar)."""
-    for inst in [str(row["instance"])] + alias_instances(row):
-        path = _workspace(workspace) / "state" / f"remote-task-rooms{'.' + inst if inst else ''}.json"
-        try:
-            rooms = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(rooms, dict) and room_id in rooms.values():
-            return True
-    return False
-
-
 def primary_row(workspace: Optional[Path] = None) -> Optional[dict]:
     """The primary row as recorded, read only (no import, no vault); None when no row is
     primary or the record is missing or unreadable."""
@@ -1677,19 +1698,22 @@ def primary_row(workspace: Optional[Path] = None) -> Optional[dict]:
 
 
 def connection_for_room(room_id: Optional[str], workspace: Optional[Path] = None,
-                        environ: Optional[Mapping[str, str]] = None) -> Optional[dict]:
+                        environ: Optional[Mapping[str, str]] = None, task_file=None) -> Optional[dict]:
     """The row a room operation acts through: the row whose server equals the room ID's domain
-    exactly; for an ID naming no domain, the one row whose bridge has a task open in it, else the
-    primary; with no room, the primary. None keeps the caller's own single-connection
-    resolution: fewer than two rows, no primary, or an unreadable record.
+    exactly; for an ID naming no domain, or no room, the primary. None keeps the caller's own
+    single-connection resolution: fewer than two rows, no primary, or an unreadable record.
     NoConnectionForRoom when the domain has no row, or its row is disconnected.
-    In a pool worker's session (`session_worker`) that worker's own identity comes first
-    (`acting_identity`); every other caller acts through the install's own rows."""
+    In a pool worker's session (`session_worker`) with an identity of its own, `acting_identity`
+    decides; a reply to `task_file` posts as the agent `task_reply_agent` binds it to, or is refused."""
     try:
         every = _read(record_path(workspace))
     except (SchemaError, OSError):
         return None
-    own = acting_identity(every, room_id, session_worker(environ), workspace)
+    worker = session_worker(environ)
+    agent = ""
+    if task_file is not None and _enabled_own(every, worker):
+        agent = task_reply_agent(task_file, room_id, worker, every, workspace)
+    own = acting_identity(every, room_id, worker, workspace, agent)
     if own is not None:
         return dict(own)
     rows = _core_rows(every)
@@ -1697,9 +1721,13 @@ def connection_for_room(room_id: Optional[str], workspace: Optional[Path] = None
         return None
     server = server_of_room(room_id or "")
     if not server:
-        lanes = [r for r in rows if room_id and _lane_holds_room(r, room_id, workspace)]
-        primary = lanes[0] if len(lanes) == 1 else next((r for r in rows if r["primary"]), None)
+        primary = next((r for r in rows if r["primary"]), None)
         return dict(primary) if primary else None
+    return dict(_server_row(rows, server))
+
+
+def _server_row(rows: list, server: str) -> dict:
+    """The row serving `server` among `rows`; NoConnectionForRoom when none does or it is disconnected."""
     row = next((r for r in rows if server in _row_servers(r)), None)
     if row is None:
         have = ", ".join(sorted(str(r["server"]) for r in rows))
@@ -1708,15 +1736,15 @@ def connection_for_room(room_id: Optional[str], workspace: Optional[Path] = None
     if row.get("disabled"):
         raise NoConnectionForRoom(f"connection {row['instance'] or '<legacy>'} for server {server} "
                                   "is disconnected; reconnect it to act in this room")
-    return dict(row)
+    return row
 
 
 def room_agent_mxid(room_id: Optional[str], *, workspace: Optional[Path] = None,
-                    environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
+                    environ: Optional[Mapping[str, str]] = None, task_file=None) -> Optional[str]:
     """The agent identity a room operation acts as, from the row `connection_for_room` routes it to:
     the row's recorded `agent_mxid`, else AGENT_MXID in the row's channel env file, kept only when it
     names that row's server. None keeps the caller's own resolution; '' when the row names none."""
-    row = connection_for_room(room_id, workspace, environ)
+    row = connection_for_room(room_id, workspace, environ, task_file)
     if row is None:
         return None
     environ = os.environ if environ is None else environ
@@ -1773,10 +1801,17 @@ def _channel_dir_tokens(channel_dir: Optional[str]) -> list:
         return []
 
 
+def row_token(row: Mapping[str, object], token: str) -> str:
+    """`token` as the `url|secret` a row's credential is: a combined one as it is, a bare secret joined
+    to the row's own gateway_url (`legacy_relay_token`); '' when that gateway is no gateway URL."""
+    return legacy_relay_token(token, str(row.get("gateway_url") or ""))
+
+
 def connection_credential(row: Mapping[str, object], environ: Optional[Mapping[str, str]] = None, *,
                           vault=None) -> "tuple[str, str]":
     """(gateway_url, token) for one row: the first token among its env var, its launch keys, its
-    channel env file and its vault key whose embedded gateway (if any) is the row's own host."""
+    channel env file and its vault key whose embedded gateway (if any) is the row's own host. The
+    token is always `url|secret`: a bare secret is joined to the row's gateway (`row_token`)."""
     environ = os.environ if environ is None else environ
     ref, instance = str(row["token_ref"]), str(row["instance"])
     refs = [ref] + [str(k) for k in row.get("launch_keys") or []]
@@ -1788,8 +1823,8 @@ def connection_credential(row: Mapping[str, object], environ: Optional[Mapping[s
     host = host_of_url(str(row["gateway_url"]))
 
     def own(tok) -> str:
-        tok = (tok or "").strip()
-        return tok if tok and (not gateway_url_of(tok) or host_of_url(gateway_url_of(tok)) == host) else ""
+        tok = row_token(row, tok)
+        return tok if tok and host_of_url(gateway_url_of(tok)) == host else ""
     tok = next((own(t) for t in candidates if own(t)), "")
     if not tok:
         try:
@@ -1803,10 +1838,11 @@ def connection_credential(row: Mapping[str, object], environ: Optional[Mapping[s
 
 
 def room_credential(room_id: Optional[str], *, workspace: Optional[Path] = None,
-                    environ: Optional[Mapping[str, str]] = None, vault=None) -> "Optional[tuple[str, str]]":
+                    environ: Optional[Mapping[str, str]] = None, vault=None,
+                    task_file=None) -> "Optional[tuple[str, str]]":
     """(gateway_url, token) a room operation must use, or None to keep the caller's own resolution
     (see `connection_for_room`). NoConnectionForRoom names what is missing."""
-    row = connection_for_room(room_id, workspace, environ)
+    row = connection_for_room(room_id, workspace, environ, task_file)
     return None if row is None else connection_credential(row, environ, vault=vault)
 
 
@@ -1869,15 +1905,15 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
     a refused stop (`BridgeStillRunning`, `BridgeLeaseIndeterminate`) and `PromoteConflict` (the
     primary moved, or the row to park was removed or parked, while it waited) re-raise after the
     rollback: the primary flag (never over a newer move) and a cleared `parked` flag are restored,
-    a bridge this call started is stopped and one it stopped is started again, and the old bridge was never touched
-    (a rowless legacy bridge already stopped stays parked). The legacy row is `_promote_legacy`.
+    a bridge this call started is stopped and one it stopped is started again, the lanes are synced to
+    the restored record, and the old bridge was never touched (a rowless legacy bridge already stopped stays parked). The legacy row is `_promote_legacy`.
     Idempotent: on the current primary it only starts the bridge if it is down. The row carries
     `previous` (the parked instance, None when nothing was parked), `kept` (the old owner left
     running, None when there was none or it was parked), `stopped_pid`, `legacy_stopped_pid`,
     `launch`, `changed` and `relaunch_needed` (the new primary's bridge runs without the room: one
     that was up under another launch and could not be relaunched)."""
     if not instance:
-        return _promote_legacy(workspace, kill, park)
+        return _promote_legacy(workspace, kill, park, environ=environ, vault=vault)
     with _transaction(workspace) as rec:
         row = _find(rec["rows"], instance)
         if row.get("worker"):
@@ -1908,12 +1944,16 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
         _await_connected(instance, int(launch.get("holder_pid") or launch.get("pid") or 0), workspace,
                          CONNECT_TIMEOUT_S if connect_timeout_s is None else connect_timeout_s)
     except ConnectionsError:
-        with _records_lock(workspace):
-            _undo_promote(_read_record(record_path(workspace)), **undo)
-            _restart_secondary(undo, start_kw)
+        # The record is rolled back under the lock: its lanes follow it even if the restart itself fails.
+        try:
+            with _records_lock(workspace):
+                _undo_promote(_read_record(record_path(workspace)), **undo)
+                _restart_secondary(undo, start_kw)
+        finally:
+            _refresh_mcp_lanes(workspace, environ, vault)
         raise
     path = record_path(workspace)
-    failure = None
+    failure = restart_failure = None
     with _records_lock(workspace):  # a rollback's stop and restart share one hold
         rec = _read_record(path)
         row = next((r for r in rec["rows"] if r["instance"] == instance), None)
@@ -1940,8 +1980,17 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
                 r["primary"] = r is row
             _write(path, rec)
         if failure is not None:
-            _restart_secondary(undo, start_kw)
-            raise failure
+            try:
+                _restart_secondary(undo, start_kw)
+            except Exception as e:  # noqa: BLE001 - re-raised below, once the lanes follow the record
+                restart_failure = e
+    # The lanes follow the committed record, not the launch: `start` synced them while the old
+    # owner was still unparked, and parking it above is a change no launch follows.
+    _refresh_mcp_lanes(workspace, environ, vault)
+    if restart_failure is not None:
+        raise restart_failure from failure
+    if failure is not None:
+        raise failure
     out = dict(row)
     parked = old if park else None
     out.update(previous=None if parked is None else parked["instance"],
@@ -1963,12 +2012,13 @@ def _connected_bridge(row: Mapping[str, object], workspace: Optional[Path]) -> i
     return pid if pid and sidecar.get("pid") == pid and sidecar.get("connected") and not _writer_gone(sidecar) else 0
 
 
-def _promote_legacy(workspace: Optional[Path], kill, park: bool = False) -> dict:
+def _promote_legacy(workspace: Optional[Path], kill, park: bool = False, *,
+                    environ: Optional[Mapping[str, str]] = None, vault=None) -> dict:
     """`promote('')`: the engine never launches the legacy bridge, so it must already run
     (`LegacyBridgeNotRunning`); under one hold of the record lock flip, and under `park` stop the old
     owner's bridge and park its row. That bridge settled the proactive room when it started, so with a named
     primary then it runs without the room and the row carries `relaunch_needed`: its launchers
-    restart it (`bash src/restart.sh`)."""
+    restart it (`bash src/restart.sh`). The lanes are synced to the committed record after."""
     path = record_path(workspace)
     with _records_lock(workspace):
         rec = _read_record(path)
@@ -1988,6 +2038,8 @@ def _promote_legacy(workspace: Optional[Path], kill, park: bool = False) -> dict
         for r in rec["rows"]:
             r["primary"] = r is row
         _write(path, rec)
+    # No launch follows the legacy flip, so nothing else would drop the parked owner's lane.
+    _refresh_mcp_lanes(workspace, environ, vault)
     out = dict(row)
     parked = old if park else None
     out.update(previous=None if parked is None else parked["instance"],
@@ -2047,7 +2099,8 @@ def unpark(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
     """Clear the row's `parked` flag and, for a named row, `start` its bridge as a secondary (`launch`
     in the row; None for the legacy row, whose launchers resume it, and for a disabled one).
     Un-parking a row that is not parked only starts it. `''` also clears the parked legacy bridge
-    that has no row of its own (a bare `{"instance": ""}` comes back)."""
+    that has no row of its own (a bare `{"instance": ""}` comes back). The lanes are synced to the
+    committed record after: the legacy row gets no launch, so no launch would bring its lane back."""
     with _transaction(workspace) as rec:
         if not instance:
             rec[LEGACY_PARKED_KEY] = False
@@ -2059,6 +2112,7 @@ def unpark(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
     out = dict(row)
     out["launch"] = start_added(row, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
                                 vault=vault, spawn=spawn, python=python)
+    _refresh_mcp_lanes(workspace, environ, vault)
     return out
 
 
@@ -2084,6 +2138,7 @@ def park(instance: str, *, workspace: Optional[Path] = None, kill=None) -> dict:
         stopped = _stop_row(row, workspace, kill)
         row["parked"] = True
         _write(path, rec)
+    drop_mcp_lane(instance, workspace)
     out = dict(row)
     out["stopped_pid"] = stopped
     return out
@@ -2116,6 +2171,8 @@ def park_legacy(*, workspace: Optional[Path] = None, kill=None) -> dict:
                 rec[LEGACY_PARKED_KEY] = rec[LEGACY_PARKED_KEY] or bool(pid)
         finally:
             _write(path, rec)
+            for inst in parked:
+                drop_mcp_lane(inst, workspace)
     return {"primary": primary["instance"], "parked": parked, "stopped": stopped}
 
 
@@ -2150,6 +2207,7 @@ def remove_connection(instance: str, *, force: bool = False, workspace: Optional
                 stale_path.unlink()
             except FileNotFoundError:
                 pass
+        drop_mcp_lane(instance, workspace)
     out = dict(row)
     out["stopped_pid"] = stopped
     return out
@@ -2163,6 +2221,26 @@ def remove_connection(instance: str, *, force: bool = False, workspace: Optional
 WORKER_TOKEN_SOURCES = {"paste": "owner", "agent_link": "agent_link"}
 
 
+def agent_ids(workspace: Optional[Path] = None) -> "Optional[dict]":
+    """{"": the primary row's agent_mxid, worker id: its row's agent_mxid} for rows that name one,
+    read only; {} with no record; None when the record exists but cannot be read."""
+    path = record_path(workspace)
+    try:
+        rows = _read(path)
+    except (SchemaError, OSError):
+        return {} if not path.exists() else None
+    out = {}
+    primary = next((r for r in rows if r.get("primary") and not r.get("worker")), None)
+    if str((primary or {}).get("agent_mxid") or "").strip():
+        out[""] = str(primary["agent_mxid"]).strip()
+    # The row worker_identity picks, so --who names the identity the session uses.
+    for worker in dict.fromkeys(str(r["worker"]) for r in rows if r.get("worker")):
+        mxid = str((worker_identity(worker, workspace) or {}).get("agent_mxid") or "").strip()
+        if mxid:
+            out[worker] = mxid
+    return out
+
+
 def worker_identity(worker: str, workspace: Optional[Path] = None) -> Optional[dict]:
     """`worker`'s own identity row as stored, read only; None when it has none or the record is unreadable."""
     try:
@@ -2170,6 +2248,216 @@ def worker_identity(worker: str, workspace: Optional[Path] = None) -> Optional[d
     except (SchemaError, OSError):
         return None
     return next((dict(r) for r in rows if r.get("worker") == worker), None)
+
+
+# A worker row's `dirs: "own"`: its tasks and results live in its agent's own folder, not the shared ones.
+# `"migrating"`: a switch has started; the worker still runs on the shared ones. `"committing"`: its
+# lane is being moved onto its own folders; the rest of it still reads the shared ones until "own".
+WORKER_DIRS_KEY = "dirs"
+WORKER_DIRS_OWN = "own"
+WORKER_DIRS_MIGRATING = "migrating"
+WORKER_DIRS_COMMITTING = "committing"
+WORKER_DIRS_STATES = (WORKER_DIRS_OWN, WORKER_DIRS_MIGRATING, WORKER_DIRS_COMMITTING)
+WORKER_LANE_DIRS_STATES = (WORKER_DIRS_OWN, WORKER_DIRS_COMMITTING)
+# `"retiring": true`: retirement has begun; no folder switch may move anything for the worker any more.
+WORKER_RETIRING_KEY = "retiring"
+WORKER_AGENTS_DIR = "agents"
+
+
+def worker_agents_dir(workspace: Optional[Path] = None) -> Path:
+    """`<workspace>/agents`: the folder every agent's own root and declaration lives under."""
+    return _workspace(workspace) / WORKER_AGENTS_DIR
+
+
+def worker_root(agent_mxid: str, workspace: Optional[Path] = None) -> Path:
+    """`<workspace>/agents/<segment of agent_mxid>`: the agent's own folder; ValueError on an empty id."""
+    return worker_agents_dir(workspace) / _agent_identity().root_segment(agent_mxid)
+
+
+def _row_dirs(row: Optional[Mapping[str, object]], workspace: Optional[Path],
+              states: tuple = (WORKER_DIRS_OWN,)) -> "Optional[tuple[Path, Path]]":
+    mxid = str((row or {}).get("agent_mxid") or "").strip()
+    if not row or not row.get("worker") or row.get(WORKER_DIRS_KEY) not in states or not mxid:
+        return None
+    root = worker_root(mxid, workspace)
+    return root / "tasks", root / "results"
+
+
+def worker_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tuple[Path, Path]]":
+    """(tasks dir, results dir) of `worker` when its identity row names an agent and `dirs: "own"`;
+    None otherwise (the worker uses the workspace's shared tasks/ and results/), or when unreadable."""
+    return _row_dirs(worker_identity(worker, workspace), workspace) if worker else None
+
+
+def worker_dirs_state(worker: str, workspace: Optional[Path] = None) -> str:
+    """`worker`'s folder state: "own" (`worker_dirs` names them), "migrating" or "committing" (a switch not
+    yet committed: nothing new is routed to it, and only a "committing" worker's lane runs on its own
+    folders) or "" (shared, or unreadable)."""
+    row = worker_identity(worker, workspace) if worker else None
+    return str(row[WORKER_DIRS_KEY]) if row and _row_dirs(row, workspace, WORKER_DIRS_STATES) else ""
+
+
+def worker_target_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tuple[Path, Path]]":
+    """The folders `worker` is switching to or is on (any `dirs` state); None otherwise."""
+    return _row_dirs(worker_identity(worker, workspace), workspace, WORKER_DIRS_STATES) if worker else None
+
+
+def worker_lane_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tuple[Path, Path]]":
+    """The folders `worker`'s lane runs on: its own once its switch is "committing" or "own"; else None."""
+    return _row_dirs(worker_identity(worker, workspace), workspace, WORKER_LANE_DIRS_STATES) if worker else None
+
+
+def worker_retiring(worker: str, workspace: Optional[Path] = None) -> bool:
+    """Whether `worker`'s retirement has begun (`begin_worker_retirement`); False for an unreadable record."""
+    return bool((worker_identity(worker, workspace) or {}).get(WORKER_RETIRING_KEY)) if worker else False
+
+
+@contextlib.contextmanager
+def worker_switch_lock(worker: str, workspace: Optional[Path] = None) -> Iterator[None]:
+    """One worker's folder-switch lock: a switch's moves and its "own" write, and retirement's marker,
+    read and hand-off of its own inbox, each run whole under it, so neither lands inside the other."""
+    if not WORKER_RE.match(str(worker or "")):
+        raise ConnectionsError(f"{worker!r} is not a pool worker id")
+    # Lock order: task (pool_router) -> deliveries folder (pool_delivery) -> this -> the record lock.
+    with locked_file(_workspace(workspace) / "state" / "locks" / f"worker-switch-{worker}.lock", create_mode=0o600):
+        yield
+
+
+def begin_worker_retirement(worker: str, *, workspace: Optional[Path] = None, kill=None) -> Optional[dict]:
+    """Mark `worker`'s row retiring (under its switch lock, so a switch's moves are all before it or none
+    after it), then stop its lane and disable the row (`disconnect`); the row, its secret and its own
+    folders stay until `retire_worker_identity`. None when it has no row; ConnectionsError when it fails."""
+    with worker_switch_lock(worker, workspace):
+        with _transaction(workspace) as record:
+            row = next((r for r in record["rows"] if r.get("worker") == worker), None)
+            if row is None:
+                return None
+            row[WORKER_RETIRING_KEY] = True
+            instance = str(row["instance"])
+    disconnect(instance, workspace=workspace, kill=kill)
+    return worker_identity(worker, workspace)
+
+
+def end_worker_retirement(worker: str, *, workspace: Optional[Path] = None) -> Optional[dict]:
+    """Undo `begin_worker_retirement` (an `enable`): the marker cleared and the row enabled again; the caller
+    starts its lane. None when it has no row."""
+    with _transaction(workspace) as record:
+        row = next((r for r in record["rows"] if r.get("worker") == worker), None)
+        if row is None:
+            return None
+        row.pop(WORKER_RETIRING_KEY, None)
+        row["disabled"] = False
+        return dict(row)
+
+
+def ensure_worker_dirs(worker: str, workspace: Optional[Path] = None, *,
+                       target: bool = False, lane: bool = False) -> "Optional[tuple[Path, Path]]":
+    """`worker_dirs` (with `target`, `worker_target_dirs`; with `lane`, `worker_lane_dirs`), created: the agent
+    root 0o700 (another local account reads none of its tasks), then tasks/ and results/ with their archive/
+    beneath it. None for a worker without own folders."""
+    dirs = (worker_target_dirs if target else worker_lane_dirs if lane else worker_dirs)(worker, workspace)
+    if dirs is None:
+        return None
+    root = dirs[0].parent
+    root.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(root, 0o700)
+    os.chmod(root, 0o700)
+    for d in dirs:
+        (d / "archive").mkdir(parents=True, exist_ok=True)
+    return dirs
+
+
+def task_home(task_id: str, workspace: Optional[Path] = None) -> dict:
+    """Where `task_id` lives: {"lane", "worker", "tasks", "results", "own"}. A task an own-dir worker's
+    lane queued (`task_lane`) is in that worker's dirs, as is any other id whose task file (live or
+    archived) is in an own-dir worker's tasks folder; else, or on an unreadable record, the shared ones."""
+    ws = _workspace(workspace)
+    home = {"lane": task_lane(task_id), "worker": "", "tasks": ws / "tasks", "results": ws / "results", "own": False}
+    try:
+        rows = _read(record_path(ws))
+    except (SchemaError, OSError):
+        return home
+    if home["lane"]:
+        row = next((r for r in rows if home["lane"] in [r["instance"]] + alias_instances(r)), None)
+    else:
+        row = next((r for r in rows if _row_dirs(r, ws) and _holds_task(_row_dirs(r, ws)[0], task_id)), None)
+    home["worker"] = str((row or {}).get("worker") or "")
+    dirs = _row_dirs(row, ws)
+    if dirs:
+        home.update(tasks=dirs[0], results=dirs[1], own=True)
+    return home
+
+
+def _holds_task(tasks_dir: Path, task_id: str) -> bool:
+    """Whether `tasks_dir` holds `task_id`'s task file: live under any claimed or assigned name, or archived."""
+    import local_task_protocol
+    import task_archive
+    if not local_task_protocol.valid_archive_lookup_id(task_id):
+        return False
+    try:
+        return (task_archive.find_task_file(tasks_dir, task_id) or
+                local_task_protocol.find_archived_task(tasks_dir, task_id)) is not None
+    except (OSError, ValueError):
+        return False
+
+
+def task_other_home(task_id: str, workspace: Optional[Path] = None) -> Optional[dict]:
+    """{"tasks", "results"} a lane-queued task's worker uses under its other setting (own <-> shared),
+    whose ARCHIVES may still hold the task's history after a switch; None for any other task."""
+    ws = _workspace(workspace)
+    home = task_home(task_id, ws)
+    if not home["worker"]:
+        return None
+    if home["own"]:
+        return {"tasks": ws / "tasks", "results": ws / "results"}
+    mxid = str((worker_identity(home["worker"], ws) or {}).get("agent_mxid") or "").strip()
+    if not mxid:
+        return None
+    root = worker_root(mxid, ws)
+    return {"tasks": root / "tasks", "results": root / "results"}
+
+
+def own_worker_homes(workspace: Optional[Path] = None) -> list:
+    """[{"worker", "tasks", "results"}] for every worker with its own folders (`worker_dirs`), from one
+    read of the record; [] when it is unreadable. Paths are lexical under the workspace, as worker_dirs'."""
+    ws = _workspace(workspace)
+    try:
+        rows = _read(record_path(ws))
+    except (SchemaError, OSError):
+        return []
+    homes = []
+    for row in rows:
+        dirs = _row_dirs(row, ws)
+        if dirs:
+            homes.append({"worker": str(row["worker"]), "tasks": dirs[0], "results": dirs[1]})
+    return homes
+
+
+def set_worker_dirs(worker: str, own, *, workspace: Optional[Path] = None) -> dict:
+    """Set `worker`'s `dirs` under the record lock: True "own", WORKER_DIRS_MIGRATING or WORKER_DIRS_COMMITTING
+    that state, False clears it; returns the row. Refused (`ConnectionsError`) when the worker has no identity
+    row, its row names no agent, or (for any state but False) its retirement has begun."""
+    if own not in (True, False, WORKER_DIRS_MIGRATING, WORKER_DIRS_COMMITTING):
+        raise ConnectionsError(f"dirs state must be True, False, {WORKER_DIRS_MIGRATING!r} or "
+                               f"{WORKER_DIRS_COMMITTING!r}, not {own!r}")
+    with _transaction(workspace) as record:
+        row = next((r for r in record["rows"] if r.get("worker") == worker), None)
+        mxid = str((row or {}).get("agent_mxid") or "").strip()
+        if not mxid:
+            raise ConnectionsError(f"worker {worker} has no agent identity row")
+        # One agent folder is one inbox: two lanes, each with its own lease, must not poll it.
+        twins = [r["worker"] for r in record["rows"] if r.get("worker") and r is not row
+                 and str(r.get("agent_mxid") or "").strip() == mxid]
+        if own and twins:
+            raise ConnectionsError(f"worker {twins[0]}'s row also names agent {mxid}: its own folder would be shared")
+        if own and row.get(WORKER_RETIRING_KEY):
+            raise ConnectionsError(f"worker {worker} is being retired: its folders are not switched")
+        if own:
+            row[WORKER_DIRS_KEY] = WORKER_DIRS_OWN if own is True else own
+        else:
+            row.pop(WORKER_DIRS_KEY, None)
+        return dict(row)
 
 
 # A worker's seat names its worker here (the pool launchers export it); the core's names none.
@@ -2183,24 +2471,150 @@ def session_worker(environ: Optional[Mapping[str, str]] = None) -> str:
     return worker if WORKER_RE.match(worker) else ""
 
 
+def _enabled_own(rows: list, worker: str) -> list:
+    return [r for r in rows if worker and r.get("worker") == worker and not r.get("disabled")]
+
+
+def _agent_of(row: Mapping[str, object]) -> str:
+    return str(row.get("agent_mxid") or "").strip()
+
+
 def acting_identity(rows: list, room_id: Optional[str], worker: str,
-                    workspace: Optional[Path] = None) -> Optional[dict]:
-    """`worker`'s own identity row when its session acts through it in `room_id`, else None (the
-    core's rows): its enabled row on the room's server; with no room, its only enabled row. A room
-    local state says is the core's stays the core's: one where a core lane, and not the worker's,
-    has a task open (that task is answered as the core's agent), or a core lane's own owner DM."""
-    own = [r for r in rows if worker and r.get("worker") == worker and not r.get("disabled")]
-    if not room_id:
-        return own[0] if len(own) == 1 else None
-    server = server_of_room(room_id)
-    mine = next((r for r in own if server in _row_servers(r)), None) if server else next(
-        (r for r in own if _lane_holds_room(r, room_id, workspace)), None)
-    if mine is None or _lane_holds_room(mine, room_id, workspace):
-        return mine
-    core = [r for r in _core_rows(rows) if not server or server in _row_servers(r)]
-    if any(_lane_holds_room(r, room_id, workspace) or room_id in _lane_owner_dms(r, workspace) for r in core):
+                    workspace: Optional[Path] = None, task_agent: str = "") -> Optional[dict]:
+    """The row `worker`'s session acts through in `room_id`; None when it has no enabled identity
+    row of its own (or is the core's session), leaving the install's rule. Identity comes from the
+    task, never from which lane once handled the room:
+    - answering a task (`task_agent`, as `task_reply_agent` bound it): exactly that agent's row, the
+      worker's own or a core one, serving the room; any other row is refused, never substituted;
+    - no task: its own row on the room's server (with no room or a domainless one, its only row),
+      except a core lane's own owner DM, which stays the core's.
+    NoConnectionForRoom when nothing serves the room: never the core or the shared token in its place."""
+    own = _enabled_own(rows, worker)
+    if not own:
         return None
-    return mine
+    server = server_of_room(room_id or "")
+    mine = next((r for r in own if server in _row_servers(r)), None) if server else (
+        own[0] if len(own) == 1 else None)
+    agent = (task_agent or "").strip()
+    if agent:
+        if mine is not None and agent == _agent_of(mine):
+            return mine
+        if any(agent == _agent_of(r) for r in own):
+            raise NoConnectionForRoom(f"the task is addressed to {agent}, which does not serve this room")
+        return _core_row_for(rows, server, agent)
+    core = [r for r in _core_rows(rows) if not server or server in _row_servers(r)]
+    if room_id and any(room_id in _lane_owner_dms(r, workspace) for r in core):
+        return _core_row_for(rows, server, "")
+    if mine is not None:
+        return mine
+    raise NoConnectionForRoom(f"worker {worker} has no identity of its own for this room"
+                              f"{' (server ' + server + ')' if server else ''}; an unprompted post is "
+                              "never sent as the core or with the shared token")
+
+
+def _core_row_for(rows: list, server: str, agent: str) -> dict:
+    """The core row a worker's session acts through on `server` (any, with none named): `agent`'s
+    only, when one is named; else the only or primary one. NoConnectionForRoom when none serves it."""
+    core = _core_rows(rows)
+    if agent:
+        row = next((r for r in core if _agent_of(r) == agent and (not server or server in _row_servers(r))), None)
+        if row is None:
+            raise NoConnectionForRoom(f"no core connection is agent {agent} on this room's server")
+    elif server:
+        return _server_row(core, server)
+    else:
+        row = core[0] if len(core) == 1 else next((r for r in core if r["primary"]), None)
+    if row is None:
+        raise NoConnectionForRoom("no connection serves this room or is primary; a worker's session "
+                                  "never posts with the shared token")
+    if row.get("disabled"):
+        raise NoConnectionForRoom(f"connection {row['instance'] or '<legacy>'} is disconnected; "
+                                  "reconnect it to act in this room")
+    return row
+
+
+def _same_file(a, b) -> bool:
+    try:
+        return a is not None and b is not None and os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def task_reply_agent(task_file, room_id: Optional[str], worker: str, rows: list,
+                     workspace: Optional[Path] = None) -> str:
+    """The agent `worker`'s reply to `task_file` in `room_id` posts as. The file must be readable and
+    the live file of the id it declares; its receiving agent and queuing lane must agree; the room
+    must be the task's own. Addressed to the worker's own agent, that is all. Addressed to a core
+    agent, its envelope must verify (`task_envelope`), the worker must hold the task (its own tasks
+    folder, or the pool's delivery sentinel, whose lease `pool_holder.pool_delegation` judges) and it
+    must be neither answered, archived nor quarantined.
+    NoConnectionForRoom names any failed check."""
+    import local_task_protocol
+    import task_archive
+    from task_envelope import attested_task_headers, verify_text
+    ws = _workspace(workspace)
+    path = Path(task_file) if task_file else None
+
+    def refuse(why: str):
+        raise NoConnectionForRoom(f"refusing to post for task file {task_file!r}: {why}")
+    try:
+        text = path.read_text(encoding="utf-8") if path is not None else None
+    except (OSError, UnicodeError) as e:
+        refuse(f"unreadable ({type(e).__name__})")
+    if text is None:
+        refuse("no task file named")
+    tid = task_archive.task_id_for(path, accept=local_task_protocol.valid_archive_lookup_id)
+    if not tid or not _same_file(task_archive.find_task_file(path.parent, tid), path):
+        refuse("it is not the live file of the task it names")
+    # archive_file parks a task it could not archive as `<id>.txt.archive-failed`: out of the queue, not a claim.
+    if not path.name.endswith(".txt") or any(path.parent.glob(f"{glob.escape(tid)}.txt.archive-failed*")):
+        refuse("it is quarantined (its archive failed), not a live task")
+    headers = attested_task_headers(text, ws).headers
+    said = str(headers.get("receiving_instance") or "").strip()
+    lane = task_agent_mxid(tid, ws)
+    if said and not _STRICT_MXID_RE.fullmatch(said):
+        refuse("its receiving agent is malformed")
+    if said and lane and said != lane:
+        refuse(f"it is addressed to {said} but its lane runs as {lane}")
+    agent = said or lane
+    if not agent:
+        refuse("it names no receiving agent")
+    task_room = str(headers.get("channel_id") or headers.get("source_room_id") or "").strip()
+    if not task_room or task_room != (room_id or ""):
+        refuse("the post's room is not the task's room")
+    if any(agent == _agent_of(r) for r in _enabled_own(rows, worker)):
+        return agent
+    if not any(agent == _agent_of(r) for r in _core_rows(rows)):
+        refuse(f"it is addressed to {agent}, neither this worker's agent nor the core's")
+    verdict = verify_text(text, ws).get("verdict")
+    if verdict != "verified":
+        refuse(f"a core agent's reply needs a verified task envelope; it is {verdict}")
+    home = task_home(tid, ws)
+    held = home["own"] and home["worker"] == worker and _same_file(path.parent, home["tasks"])
+    if not held and _same_file(path.parent, ws / "tasks"):
+        try:
+            from pool_holder import pool_delegation
+            lease = pool_delegation(ws, tid, worker)
+        except OSError:
+            refuse("who holds it cannot be read")
+        held = lease["held"]
+        if held and lease["verdict"] != "live":
+            logging.getLogger(__name__).warning("connections: pool delegation not current %s", json.dumps(
+                {"event": "pool_delegation_not_current", "task_id": tid, "worker": worker,
+                 "verdict": lease["verdict"], "detail": lease["detail"], "mode": lease["mode"],
+                 "allowed": lease["allowed"]}, sort_keys=True))
+        if held and not lease["allowed"]:
+            refuse(f"its delegation to this worker is not current ({lease['verdict']}: {lease['detail']})")
+    if not held:
+        refuse("this worker does not hold it")
+    from task_disposition import CLAIMED, PENDING, task_disposition
+    state = task_disposition(ws, tid)
+    if state not in (PENDING, CLAIMED):
+        refuse(f"it is {state}")
+    from undelivered_quarantine import find_quarantined
+    if find_quarantined(home["results"], tid):
+        refuse("its result is quarantined as undelivered")
+    return agent
 
 
 class NoWorkerCredential(ConnectionsError):
@@ -2237,6 +2651,50 @@ def session_proactive_name(name, environ: Optional[Mapping[str, str]] = None,
     from proactive_routing import stamp_worker
     worker = session_worker(environ)
     return stamp_worker(name, worker) if worker and worker_enabled_identity(worker, workspace) else Path(name).name
+
+
+def proactive_author_agent(name, workspace: Optional[Path] = None) -> Optional[str]:
+    """The agent a proactive file named `name` is posted as when a worker's session stamped it
+    (`session_proactive_name`): that worker's own identity's `agent_mxid`; None for an unstamped name."""
+    from proactive_routing import proactive_worker
+    worker = proactive_worker(name)
+    row = worker_identity(worker, workspace) if worker else None
+    return str((row or {}).get("agent_mxid") or "").strip() or None
+
+
+# Lower-case Cyrillic and Greek letters that render like Latin ones, folded before the core check.
+_CONFUSABLES = str.maketrans("аеорсухікмтвнгјѕοεαρκτνιυ", "aeopcyxikmtbhrjsoeapktviu")
+AUTHOR_PHRASE_MAX = 64
+
+
+def _reads_as_core(phrase: str, host: str) -> bool:
+    def fold(text):
+        return unicodedata.normalize("NFKC", text).casefold().translate(_CONFUSABLES)
+    folded = re.sub(r"[\W_]+$", "", fold(phrase))
+    return bool(re.search(r"(^|[\W_])core$", folded)) or fold(f"the {host} core") in fold(phrase)
+
+
+def proactive_author_phrase(name, host: str, workspace: Optional[Path] = None) -> str:
+    """Who a proactive file named `name` speaks as, for its text: "the <host> core" for an unstamped
+    name; for a worker's stamped one, "<name> (a worker on <host>)" with its own agent's display name,
+    else its roster label, else just "a worker on <host>". The name is stripped of format characters
+    and bounded; one that reads as the core (ends with "core", or holds the core's phrase) is dropped."""
+    from proactive_routing import proactive_worker
+    worker = proactive_worker(name)
+    if not worker:
+        return f"the {host} core"
+    label = str((worker_identity(worker, workspace) or {}).get("agent_display_name") or "").strip()
+    if not label:
+        rows = _read_json(_workspace(workspace) / "state" / "roster.json").get("workers")
+        row = rows.get(worker) if isinstance(rows, dict) else None
+        row = row if isinstance(row, dict) else {}
+        label = str(row.get("display_label") or row.get("label") or "").strip()
+        label = "" if label == worker else label
+    label = " ".join("".join(ch for ch in label if unicodedata.category(ch) != "Cf").split())
+    if len(label) > AUTHOR_PHRASE_MAX:
+        label = label[:AUTHOR_PHRASE_MAX - 1].rstrip() + "…"
+    fallback = f"a worker on {host}"
+    return fallback if not label or _reads_as_core(label, host) else f"{label} ({fallback})"
 
 
 def worker_mcp_credential(worker: str, *, workspace: Optional[Path] = None,
@@ -2334,12 +2792,37 @@ def lane_worker_at_start(instance: str, environ: Optional[Mapping[str, str]] = N
     if said is not None and said != recorded:
         raise LaneIdentityUnknown(f"the launch names worker {said or '<core>'} but the row names "
                                   f"{recorded or '<core>'}")
-    if recorded:
-        owners = {r.get("owner_mxid") for r in _core_rows(rows) if r.get("owner_mxid")}
-        if not row.get("owner_mxid") or row.get("owner_mxid") not in owners:
-            raise LaneIdentityUnknown(f"worker {recorded}'s agent is held by {row.get('owner_mxid') or 'no owner'}, "
-                                      "not the core's owner")
+    problem = _worker_owner_problem(row, rows) if recorded else None
+    if problem:
+        raise LaneIdentityUnknown(problem)
     return recorded, None
+
+
+def _worker_owner_problem(row: dict, rows: list) -> Optional[str]:
+    """Why the worker row `row` must not be served as its worker's agent: one no core row's owner holds."""
+    owners = {r.get("owner_mxid") for r in _core_rows(rows) if r.get("owner_mxid")}
+    if not row.get("owner_mxid") or row.get("owner_mxid") not in owners:
+        return f"worker {row.get('worker')}'s agent is held by {row.get('owner_mxid') or 'no owner'}, not the core's owner"
+    return None
+
+
+def worker_serving_agent(agent_mxid: str, workspace: Optional[Path] = None) -> "tuple[str, str, Optional[str]]":
+    """(worker, its row's instance, None) when the record names `agent_mxid` exactly as one pool worker's own
+    agent; ("", "", None) when no worker row names it; ("", "", why) when one does but must not be served
+    (two rows, an owner no core row has, disabled or parked). Raises on an unreadable record."""
+    rows = _read(record_path(workspace))
+    named = [r for r in rows if r.get("worker") and r.get("agent_mxid") == agent_mxid]
+    if not named:
+        return "", "", None
+    if len(named) > 1:
+        return "", "", f"{len(named)} worker rows name agent {agent_mxid}"
+    row = named[0]
+    problem = _worker_owner_problem(row, rows)
+    if not problem and (row.get("disabled") or row.get("parked")):
+        problem = f"worker {row['worker']}'s row is {'disabled' if row.get('disabled') else 'parked'}"
+    if not problem and not row.get("instance"):
+        problem = f"worker {row['worker']}'s row names no lane instance"
+    return ("", "", problem) if problem else (str(row["worker"]), str(row["instance"]), None)
 
 
 def lane_worker(instance: str, workspace: Optional[Path] = None) -> str:
@@ -2390,6 +2873,7 @@ def disconnect(instance: str, *, workspace: Optional[Path] = None, kill=None) ->
             raise PrimaryCannotDisconnect(instance)
         stopped = _stop_row(row, workspace, kill)
         row["disabled"] = True
+    drop_mcp_lane(instance, workspace)
     out = dict(row)
     out["stopped_pid"] = stopped
     return out
@@ -2412,17 +2896,49 @@ def env_token_vars(environ: Mapping[str, str]) -> list:
     return out
 
 
+def legacy_relay_token(token: str, url: str) -> str:
+    """The legacy row's `url|secret`: a combined `token` as it is, a bare secret joined to `url` (the
+    gateway the bridge pairs it with); '' when either is missing or `url` is no gateway URL."""
+    token = (token or "").strip()
+    if gateway_url_of(token):
+        return token
+    url = (url or "").strip()
+    if not token or not url:
+        return ""
+    import channel_token  # noqa: F401 - puts the shared credential contract on the path
+    from gateway_credential_sources import contract, gateway_url_problem
+    if gateway_url_problem(url):
+        return ""
+    creds = contract.normalize_credentials(token, explicit_url=url)
+    joined = f"{creds.base_url}|{creds.token}"
+    return joined if gateway_url_of(joined) else ""
+
+
+def _env_gateway_url(environ: Mapping[str, str]) -> str:
+    """REMOTE_TASK_URL (legacy AG2_REMOTE_URL) as the bridge reads it from its environment; '' when unset."""
+    import channel_token  # noqa: F401 - puts the shared credential contract on the path
+    from gateway_credential_sources import URL_KEYS, first_env
+    return first_env(environ, URL_KEYS)[0]
+
+
 def primary_token_from_channel_file(environ: Mapping[str, str]) -> str:
     """The relay token (`url|secret`) the AG2 Space channel env file holds under either relay
-    spelling, read through the resolver `scripts/channel-env.sh` uses; '' when the environment
-    names one itself, when no file resolves, or when the file holds none."""
+    spelling, read through the resolver `scripts/channel-env.sh` uses; a bare secret is joined to
+    the gateway URL the bridge would pair it with (the environment's, else that file's). '' when
+    the environment names a token itself, when no file resolves, or when the file holds none."""
     try:
         from channel_credentials import channel_credentials
         from channel_token import RELAY_TOKEN_VARS
-        found = channel_credentials(RELAY_TOKEN_VARS, environ)
+        from gateway_credential_sources import URL_KEYS
+        if any(environ.get(v) for v in RELAY_TOKEN_VARS):
+            return ""
+        # Token and URL in one read, so both come from the same file; only a token in the env gates it.
+        found = channel_credentials(RELAY_TOKEN_VARS + URL_KEYS, {})
+        token = next((found[var].strip() for var in RELAY_TOKEN_VARS if found.get(var)), "")
+        file_url = next((found[var].strip() for var in URL_KEYS if found.get(var)), "")
+        return legacy_relay_token(token, _env_gateway_url(environ) or file_url)
     except Exception:  # noqa: BLE001 - no channel home or an unreadable file is simply no token
         return ""
-    return next((found[var].strip() for var in RELAY_TOKEN_VARS if found.get(var)), "")
 
 
 def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
@@ -2432,6 +2948,7 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
     The REMOTE_TASK_TOKEN row comes from the environment, else from the channel env file the
     connect flow writes (`primary_token_from_channel_file`): a desktop install signs in after
     the engine started, so the token reaches the file but never this process's environment.
+    A bare REMOTE_TASK_TOKEN counts beside a REMOTE_TASK_URL, joined as `legacy_relay_token`.
     Env rows are unverified: the resolver's server when it knows the host, else the host. The
     REMOTE_TASK_TOKEN row (the legacy unsuffixed bridge) becomes primary when the install has none.
     A named env row becomes primary only when it is then the record's sole row, with no primary,
@@ -2445,7 +2962,9 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
     """
     environ = os.environ if environ is None else environ
     candidates = []
-    primary_token = environ.get(PRIMARY_TOKEN_REF, "").strip() or primary_token_from_channel_file(environ)
+    env_token = environ.get(PRIMARY_TOKEN_REF, "").strip()
+    primary_token = (legacy_relay_token(env_token, _env_gateway_url(environ)) if env_token
+                     else primary_token_from_channel_file(environ))
     if gateway_url_of(primary_token):
         candidates.append(("", PRIMARY_TOKEN_REF, primary_token))
     for inst, var in env_token_vars(environ):
@@ -2772,18 +3291,24 @@ def _token_file(entry: Mapping[str, str], environ: Mapping[str, str]) -> str:
     return str(path) if path.is_file() else ""
 
 
+def lane_token_file(entry: Mapping[str, str], environ: Optional[Mapping[str, str]] = None) -> str:
+    """The file a plan entry's bridge re-reads its token from (REMOTE_TASK_TOKEN_FILE); "" when none."""
+    return _token_file(entry, os.environ if environ is None else environ)
+
+
 def launch_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]] = None, *,
                vault=None) -> dict:
     """The bridge's environment for one plan entry: the token from the env var of its token_ref,
     else the vault; no gateway URL beside the token; the proactive room only for the primary.
     A named entry runs as its row's own agent (`NoIdentity` when the row has none), never one the
-    environment inherited, and without the legacy device env file."""
+    environment inherited, and without the legacy device env file. Nothing of the calling session
+    (`SESSION_ENV`) is passed on, so a start from a worker's shell runs as the lane keeper's would."""
     environ = os.environ if environ is None else environ
     ref = str(entry["token_ref"])
     token = (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
     if not token:
         raise NoToken(f"no token under {ref}")
-    env = dict(environ)
+    env = {k: v for k, v in environ.items() if k not in SESSION_ENV}
     if entry["instance"]:
         mxid = str(entry.get("agent_mxid") or "").strip()
         if not server_of_mxid(mxid):
@@ -2792,21 +3317,42 @@ def launch_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]]
         env = _agent_identity().launch_environ(env, mxid)
         env.pop(DEVICE_ENV_VAR, None)
     env.update({
-        "SUTANDO_SUPERVISED": "1",
-        "GATEWAY_INSTANCE": str(entry["instance"]),
         "REMOTE_TASK_TOKEN": token,
         "REMOTE_TASK_URL": "",
         "REMOTE_TASK_TOKEN_FILE": _token_file(entry, environ),
-        "REMOTE_TASK_CHANNEL_DIR": str(entry["channel_dir"]),
-        "REMOTE_PROACTIVE_ROOM": environ.get("REMOTE_PROACTIVE_ROOM", "") if entry.get("primary") else "",
-        NOT_BEFORE_ENV: str(entry["not_before"]) if isinstance(entry.get("not_before"), int) else "",
-        LANE_WORKER_ENV: str(entry.get("worker") or ""),
+        **lane_identity_env(entry, environ),
     })
     return env
 
 
+def lane_identity_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]] = None) -> dict:
+    """What a plan entry's bridge runs as, short of its token: the same for its lane and for a declared
+    bridge serving that lane's worker (`worker_lane.bridge_overlay`)."""
+    environ = os.environ if environ is None else environ
+    return {
+        "SUTANDO_SUPERVISED": "1",
+        "GATEWAY_INSTANCE": str(entry["instance"]),
+        "REMOTE_TASK_CHANNEL_DIR": str(entry["channel_dir"]),
+        "REMOTE_PROACTIVE_ROOM": environ.get("REMOTE_PROACTIVE_ROOM", "") if entry.get("primary") else "",
+        NOT_BEFORE_ENV: str(entry["not_before"]) if isinstance(entry.get("not_before"), int) else "",
+        LANE_WORKER_ENV: str(entry.get("worker") or ""),
+    }
+
+
 # The bridge's intake reads its row's `not_before` here; empty when the row has none.
 NOT_BEFORE_ENV = "SUTANDO_INTAKE_NOT_BEFORE"
+# What a core's or pool worker's session carries about itself: a bridge started from inside one is
+# the host's, so none of it is passed on (the lane keeper's launches never had it).
+SESSION_ENV = frozenset((
+    "SUTANDO_INSTANCE_ID", "SUTANDO_WORKER_ID", "SUTANDO_WORKER_RUNTIME", "SUTANDO_WORKER_SEAT",
+    "SUTANDO_CORE_ID", "SUTANDO_CORE_POOL_SIZE", "SUTANDO_CORE_SESSION", "SUTANDO_CORE_RUNTIME",
+    "SUTANDO_TMUX_SOCKET", "SUTANDO_TMUX_SESSION", "SUTANDO_TASKS_DIR", "SUTANDO_RESULTS_DIR",
+    "SUTANDO_WORKSPACE_DIR", "SUTANDO_INBOX_KIND", "SUTANDO_INBOX_RESOLVER", "SUTANDO_INBOX_RESOLVER_TIMEOUT",
+    "SUTANDO_CLAUDE_WORKING_DIR", "SUTANDO_CODEX_WORKING_DIR", "SUTANDO_WORKER_BOOTSTRAP",
+    "SUTANDO_POOL_DELIVERY_SCRIPT", "SUTANDO_WORKER_PLUGIN_DIRS", "SUTANDO_WATCHER_CMD", "SUTANDO_WATCHER_BEAT",
+    "SUTANDO_TASK_WATCH_MOD", "SUTANDO_TASK_WATCH_MOD_WORKER", "SUTANDO_TASK_EVENT_HANDLER",
+    "SUTANDO_CLAUDE_SESSION_ID", "SUTANDO_CLAUDE_RESUME", "AG2_MCP_WORKER_CREDENTIAL",
+))
 # The worker a lane runs as (a row's `worker`), empty for a core lane: the lane's start check.
 LANE_WORKER_ENV = "SUTANDO_LANE_WORKER"
 
@@ -2869,7 +3415,7 @@ def _learn_missing_identity(instance: str, environ: Mapping[str, str], workspace
 
     def token_of(r):
         ref = str(r["token_ref"])
-        return (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
+        return row_token(r, (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref))
     _learn_row_identity(row, token_of, workspace, fetch=fetch, getaddrinfo=getaddrinfo)
 
 
@@ -2934,6 +3480,12 @@ def _record_launch(instance: str, workspace: Optional[Path], **fields) -> dict:
             record["last_repo"] = prev.get("repo") or prev.get("last_repo")
     _atomic_json(launch_record_path(instance, workspace), record)
     return record
+
+
+def record_supervised_start(instance: str, *, pid: int, repo: Path, workspace: Optional[Path] = None) -> dict:
+    """The launch record of a lane another supervisor starts in place (sparrowd's core), so its status
+    reads the start and not an earlier failed one; its lease is proven later, by the lease itself."""
+    return _record_launch(instance, workspace, ok=True, pid=pid, lease="supervised", repo=str(Path(repo).resolve()))
 
 
 def _launch_record(instance: str, workspace: Optional[Path]) -> dict:
@@ -3176,6 +3728,17 @@ def _exit_code(child) -> Optional[int]:
 def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
            workspace: Optional[Path] = None, vault=None, spawn=None, python: Optional[str] = None,
            env_only: bool = False, fetch=None, getaddrinfo=None) -> dict:
+    """`_launch`, then a successful launch refreshes the MCP lanes (`sync_mcp_lanes`)."""
+    rec = _launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace, vault=vault,
+                  spawn=spawn, python=python, env_only=env_only, fetch=fetch, getaddrinfo=getaddrinfo)
+    if rec.get("ok"):
+        _refresh_mcp_lanes(workspace, environ, vault)
+    return rec
+
+
+def _launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
+            workspace: Optional[Path] = None, vault=None, spawn=None, python: Optional[str] = None,
+            env_only: bool = False, fetch=None, getaddrinfo=None) -> dict:
     """Start the bridge for one plan entry and leave a launch record; the bridge's own
     singleton lock turns a duplicate into a clean stand-down. The record lock is held from the
     plan read until the child is proven to hold its lease or has exited (`lease` in the record),
@@ -3318,7 +3881,8 @@ def _keep_lane(inst: str, state: dict, now: float, say: Callable[[str], None], *
                environ: Mapping[str, str], workspace: Optional[Path], vault, spawn, python: Optional[str]) -> None:
     """`keep_lanes_up` for one lane, under the record lock."""
     with _records_lock(workspace):
-        if inst not in {e["instance"] for e in launch_plan(environ, workspace=workspace)}:
+        entry = next((e for e in launch_plan(environ, workspace=workspace) if e["instance"] == inst), None)
+        if entry is None:
             state.pop(inst, None)  # disconnected, parked or removed since the plan was read
             return
         row = _row_named(inst, workspace) or {}
@@ -3326,6 +3890,14 @@ def _keep_lane(inst: str, state: dict, now: float, say: Callable[[str], None], *
             state.pop(inst, None)
             return
         due = state.get(inst) or {}
+        declared = _declared_bridge_serves(entry, workspace)
+        owner = "its declared bridge" if declared else "sparrowd's core" if _core_serves(entry, workspace) else ""
+        if owner:
+            since = due.get("declared_unheld_since") if isinstance(due, dict) else None
+            since = since if isinstance(since, (int, float)) and not isinstance(since, bool) else now
+            if now - since < DECLARED_BRIDGE_GRACE_S:
+                state[inst] = {"declared_unheld_since": since}  # its supervisor's turn to take the lease
+                return
         try:
             if float(due.get("next_try") or 0) > now:
                 return
@@ -3337,12 +3909,46 @@ def _keep_lane(inst: str, state: dict, now: float, say: Callable[[str], None], *
         except ConnectionsError as e:
             reason = _launch_record(inst, workspace).get("reason") if isinstance(e, LaunchFailed) else None
             state[inst] = _lane_retry(due, now)
+            if owner:  # the grace is one window: a failed fallback start backs off, never waits again
+                state[inst]["declared_unheld_since"] = since
             say(f"lane {inst} is down and did not start ({reason or _error_reason(e)}); "
                 f"next try in {state[inst]['next_try'] - now:.0f}s")
             return
         state.pop(inst, None)
-        if rec.get("lease") == "held":
+        if rec.get("lease") == "held" and owner:
+            say(f"lane {inst}: {owner} took no lease in {DECLARED_BRIDGE_GRACE_S:.0f}s; "
+                f"started the lane instead (pid {rec.get('pid')})")
+        elif rec.get("lease") == "held":
             say(f"lane {inst} was down; started it (pid {rec.get('pid')})")
+
+
+# How long a lane another supervisor serves (a worker's declared bridge, sparrowd's core) stays down with
+# no lease holder before the keeper starts the lane anyway: past sparrowd's longest restart backoff and its rescan.
+DECLARED_BRIDGE_GRACE_S = 180.0
+
+
+def _declared_bridge_serves(entry: Mapping[str, object], workspace: Optional[Path]) -> bool:
+    """Whether a worker lane's agent runs as a valid declared Sparrow bridge instead (`worker_lane`);
+    a check that cannot be made answers False, and the bridge lease still keeps one poller."""
+    if not entry.get("worker"):
+        return False
+    try:
+        import worker_lane
+        return worker_lane.declared_bridge(str(entry["worker"]), _workspace(workspace))
+    except Exception:  # noqa: BLE001 - an unanswerable check never keeps a lane down
+        return False
+
+
+def _core_serves(entry: Mapping[str, object], workspace: Optional[Path]) -> bool:
+    """Whether a live sparrowd supervises this primary lane as its core (`sparrow_core_bridge.claims`); a
+    check that cannot be made answers False, and the bridge lease still keeps one poller."""
+    if not entry.get("primary"):
+        return False
+    try:
+        import sparrow_core_bridge
+        return sparrow_core_bridge.claims(str(entry["instance"]), _workspace(workspace))
+    except Exception:  # noqa: BLE001 - an unanswerable check never keeps a lane down
+        return False
 
 
 def keep_lanes_up(*, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
@@ -3773,9 +4379,20 @@ def _old_identity(row: Mapping[str, object], environ, vault, probe: dict) -> "tu
     return str(seen["agent_mxid"]), str(seen.get("owner_mxid") or "")
 
 
+class UnquotableValue(ConnectionsError):
+    """A value the single-quoted env line cannot hold: a `'` or a line break."""
+
+
 def _env_file_with(path: Path, key: str, value: str) -> str:
     """`path`'s lines with `key` set to `value`, single-quoted so a shell that sources the file
-    never runs what follows the `|` (every other line kept)."""
+    never runs what follows the `|` (every other line kept). A value holding `'` or a line break
+    is refused (`UnquotableValue`): the env readers only strip the outer quotes, so `'\\''` would
+    reach them undecoded."""
+    if "'" in value or "\n" in value or "\r" in value:
+        logging.getLogger(__name__).warning(
+            "connections: not writing %s to %s: its value holds a quote or line break the env readers "
+            "cannot decode", key, path.name)
+        raise UnquotableValue(key)
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
@@ -3789,18 +4406,77 @@ def mcp_descriptor_path(workspace: Optional[Path], mcp_config: Optional[Path] = 
     MCP config (`mcp_config`, default `<claude home>/.claude.json`) names inside the workspace, else
     `state/ag2-mcp.json`. A descriptor outside the workspace is the desktop host's and never chosen."""
     ws = _workspace(workspace).resolve()
+    for named in _claude_config_descriptors(mcp_config):
+        if named.resolve().is_relative_to(ws):
+            return named
+    return ws / "state" / MCP_DESCRIPTOR_NAME
+
+
+def _named_entries(servers) -> "list[tuple[Path, Mapping]]":
+    """(descriptor, env) for each MCP server entry whose `env` names an `AG2_MCP_DESCRIPTOR`, in entry
+    order; an entry or `env` that is not a table names nothing."""
+    out = []
+    for entry in servers.values() if isinstance(servers, Mapping) else []:
+        env = entry.get("env") if isinstance(entry, Mapping) else None
+        named = env.get("AG2_MCP_DESCRIPTOR") if isinstance(env, Mapping) else None
+        if isinstance(named, str) and named:
+            out.append((Path(named), env))
+    return out
+
+
+def _named_descriptors(servers) -> "list[Path]":
+    """The `AG2_MCP_DESCRIPTOR` each MCP server entry's `env` names, in entry order."""
+    return [path for path, _ in _named_entries(servers)]
+
+
+def _claude_config_descriptors(mcp_config: Optional[Path]) -> "list[Path]":
+    """Descriptors the Claude Code MCP config (`mcp_config`, default `<claude home>/.claude.json`) names."""
+    return _named_descriptors(_claude_config_servers(mcp_config))
+
+
+def _claude_config_servers(mcp_config: Optional[Path]):
+    """The Claude Code MCP config's `mcpServers` table; {} when unreadable."""
     if mcp_config is None:
         from util_paths import claude_home_path
         mcp_config = claude_home_path(".claude.json")
     try:
-        servers = json.loads(Path(mcp_config).read_text(encoding="utf-8")).get("mcpServers") or {}
+        return json.loads(Path(mcp_config).read_text(encoding="utf-8")).get("mcpServers") or {}
     except (OSError, ValueError, AttributeError):
-        servers = {}
-    for entry in servers.values() if isinstance(servers, dict) else []:
-        named = (entry.get("env") or {}).get("AG2_MCP_DESCRIPTOR") if isinstance(entry, dict) else None
-        if isinstance(named, str) and named and Path(named).resolve().is_relative_to(ws):
-            return Path(named)
-    return ws / "state" / MCP_DESCRIPTOR_NAME
+        return {}
+
+
+def _codex_config_path(environ: Mapping[str, str]) -> Optional[Path]:
+    """`config.toml` of the Codex home: `CODEX_HOME`, else the codex `core_config_dirs` entry."""
+    home = (environ.get("CODEX_HOME") or "").strip()
+    if not home:
+        try:
+            from sutando_config import find_core_config_dir
+            home = str((find_core_config_dir(type_="codex") or {}).get("value") or "").strip()
+        except Exception:  # noqa: BLE001 - an unreadable config only means no Codex home to read
+            home = ""
+    return Path(home).expanduser() / "config.toml" if home else None
+
+
+def _codex_config_descriptors(codex_config: Optional[Path]) -> "list[Path]":
+    """Descriptors Codex's `config.toml` names under `[mcp_servers.<name>.env]`."""
+    return _named_descriptors(_codex_config_servers(codex_config))
+
+
+def _codex_config_servers(codex_config: Optional[Path]):
+    """Codex's `config.toml` `mcp_servers` table; {} when there is none or it is unreadable."""
+    if codex_config is None:
+        return {}
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+        try:
+            import tomli as tomllib
+        except ModuleNotFoundError:
+            import toml_fallback as tomllib
+    try:
+        return tomllib.loads(Path(codex_config).read_text(encoding="utf-8")).get("mcp_servers") or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
 
 
 def repoint_mcp_descriptor(path: Path, *, legacy: str, code: str, agent_mxid: str,
@@ -3846,6 +4522,336 @@ def repoint_mcp_descriptor(path: Path, *, legacy: str, code: str, agent_mxid: st
     except (OSError, UnicodeDecodeError, ConnectionsError):
         return "write_failed"
     return "repointed"
+
+
+# ── MCP lanes: one proxy descriptor per extra connection ─────────────────────
+
+MCP_LANES_DIR_NAME = "ag2-mcp.d"
+MCP_LANES_DIR_ENV = "AG2_MCP_LANES_DIR"
+MCP_LANE_PREFIX = "conn-"
+# A lane descriptor naming this env_file has no env copy: the proxy asks `lane_mcp_credential` for its
+# bearer through the argv `MCP_LANE_CREDENTIAL_ENV` carries, which the desktop host sets.
+MCP_VAULT_ENV_FILE = "(vault)"
+MCP_LANE_CREDENTIAL_ENV = "AG2_MCP_LANE_CREDENTIAL"
+
+
+def mcp_lanes_dir(workspace: Optional[Path] = None, environ: Optional[Mapping[str, str]] = None) -> Path:
+    """Where the MCP proxy reads its extra lanes: `AG2_MCP_LANES_DIR`, else `state/ag2-mcp.d`."""
+    environ = os.environ if environ is None else environ
+    named = (environ.get(MCP_LANES_DIR_ENV) or "").strip()
+    return Path(named) if named else _workspace(workspace) / "state" / MCP_LANES_DIR_NAME
+
+
+def _main_mcp_descriptor(workspace: Optional[Path], environ: Mapping[str, str], mcp_config: Optional[Path],
+                         descriptor: Optional[Path], codex_config: Optional[Path] = None) -> "Optional[tuple[dict, Path]]":
+    """(descriptor, its path) of the primary lane, read only: `descriptor`, else `AG2_MCP_DESCRIPTOR`, else any
+    descriptor the Claude Code MCP config names, else any the Codex `config.toml` names (the desktop's
+    lives outside the workspace), else `state/ag2-mcp.json`. None when none is a readable version-1
+    descriptor."""
+    def candidates():  # lazily, in precedence order: a later source is read only if every earlier one fails
+        if descriptor is not None:
+            yield descriptor
+        if (environ.get("AG2_MCP_DESCRIPTOR") or "").strip():
+            yield Path(environ["AG2_MCP_DESCRIPTOR"].strip())
+        yield from _claude_config_descriptors(mcp_config)
+        yield from _codex_config_descriptors(_codex_config_path(environ) if codex_config is None else codex_config)
+        yield _workspace(workspace) / "state" / MCP_DESCRIPTOR_NAME
+    for path in candidates():
+        try:
+            desc = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(desc, dict) and desc.get("version") == 1 and isinstance(desc.get("mint_url"), str):
+            return desc, Path(path)
+    return None
+
+
+def _resolver_argv(raw) -> Optional[list]:
+    """`raw` as the proxy reads `MCP_LANE_CREDENTIAL_ENV`: a JSON array of non-empty strings, else None."""
+    try:
+        argv = json.loads(raw) if isinstance(raw, str) and raw else None
+    except ValueError:
+        return None
+    return argv if isinstance(argv, list) and argv and all(isinstance(a, str) and a for a in argv) else None
+
+
+def _proxy_reads_vault_lanes(main_path: Path, environ: Mapping[str, str], mcp_config: Optional[Path],
+                             codex_config: Optional[Path]) -> bool:
+    """Whether the proxy serving `main_path` resolves `(vault)` lanes: `MCP_LANE_CREDENTIAL_ENV` holds a
+    resolver argv in this environment or in the env of an MCP config entry naming that descriptor."""
+    if _resolver_argv(environ.get(MCP_LANE_CREDENTIAL_ENV)):
+        return True
+    codex_config = _codex_config_path(environ) if codex_config is None else codex_config
+    entries = _named_entries(_claude_config_servers(mcp_config)) + _named_entries(_codex_config_servers(codex_config))
+    target = main_path.resolve()
+    return any(path.resolve() == target and _resolver_argv(env.get(MCP_LANE_CREDENTIAL_ENV)) for path, env in entries)
+
+
+def mcp_lane_slug(instance: str) -> str:
+    return instance or LEGACY_PATH_SEGMENT
+
+
+def _lane_relay(url: str) -> str:
+    return (url or "").strip().rstrip("/")
+
+
+def _lane_relay_secret(row: Mapping[str, object], token: str) -> "tuple[str, str]":
+    """(relay, secret) a lane descriptor and the lane resolver both state for `row`'s `token`."""
+    relay = _lane_relay(gateway_url_of(token) or str(row["gateway_url"]))
+    return relay, secret_of(token) if gateway_url_of(token) else token.strip()
+
+
+def _main_serves(row: Mapping[str, object], main: Mapping[str, object]) -> bool:
+    """Whether the main descriptor already serves `row` (by server or relay), so it gets no lane."""
+    served = {s for s in (str(main.get("server") or "").lower(), server_of_mxid(str(main.get("agent_id") or ""))) if s}
+    main_relay = _lane_relay(str(main.get("relay") or ""))
+    return bool(_row_servers(row) & served) or bool(main_relay and _lane_relay(str(row["gateway_url"])) == main_relay)
+
+
+def _mcp_lane(row: Mapping[str, object], token: str, main: Mapping[str, object], env_file: Path,
+              space_of=None) -> "tuple[Optional[dict], str]":
+    """(descriptor, '') for one row, or (None, reason). Endpoints are never invented: MCP from the
+    row server's DotSpace, mint at the main descriptor's mint path on the row's own relay origin."""
+    relay, secret = _lane_relay_secret(row, token)
+    mxid = str(row.get("agent_mxid") or "").strip()
+    server = server_of_mxid(mxid) or str(row["server"]).lower()
+    space = _space(server, space_of)
+    mcp_url = str(getattr(space, "mcp_url", "") or "")
+    mint_path = urllib.parse.urlsplit(str(main.get("mint_url") or "")).path
+    parts = urllib.parse.urlsplit(relay)
+    secure = parts.scheme == "https" or (parts.scheme == "http" and _loopback_host(parts.hostname or ""))
+    if not (mcp_url and mint_path and parts.netloc and secure and secret):
+        return None, "no_endpoints"
+    return {
+        "version": 1, "lane": mcp_lane_slug(str(row["instance"])), "server": server,
+        "env_file": str(env_file), "env_key": str(row["token_ref"]),
+        "mint_url": urllib.parse.urlunsplit((parts.scheme, parts.netloc, mint_path, "", "")),
+        "mcp_url": mcp_url, "ca_bundle": main.get("ca_bundle"),
+        "agent_id": mxid if _STRICT_MXID_RE.fullmatch(mxid) else None,
+        "relay": relay, "bearer_digest": hashlib.sha256(secret.encode()).hexdigest(),
+    }, ""
+
+
+def _write_if_changed(path: Path, body: str) -> bool:
+    try:
+        if path.read_text(encoding="utf-8") == body:
+            return False
+    except (OSError, UnicodeDecodeError):
+        pass
+    _atomic_text(path, body)
+    return True
+
+
+def _unlink_lane(lanes: Path, slug: str) -> bool:
+    gone = False
+    for suffix in (".json", ".env"):  # descriptor first: the proxy never sees one without its env
+        try:
+            (lanes / f"{MCP_LANE_PREFIX}{slug}{suffix}").unlink()
+            gone = True
+        except FileNotFoundError:
+            pass
+    return gone
+
+
+def drop_mcp_lane(instance: str, workspace: Optional[Path] = None,
+                  environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Remove one connection's lane descriptor and env file, offline; whether any existed. Under the
+    lanes lock `sync_mcp_lanes` holds, so a sync that read the row before it changed cannot write
+    the lane back after this. With no lock file yet no sync has reached its row read, so any sync
+    reads the row as already changed and no lock is created here."""
+    lanes, slug = mcp_lanes_dir(workspace, environ), mcp_lane_slug(instance)
+    lock = _workspace(workspace) / "state" / f"{MCP_LANES_DIR_NAME}.lock"
+    try:
+        if not lock.exists():
+            return _unlink_lane(lanes, slug)
+        with locked_file(lock, create_mode=0o600):
+            return _unlink_lane(lanes, slug)
+    except OSError as e:
+        logging.getLogger(__name__).warning("connections: dropping MCP lane %s failed (%s)",
+                                            mcp_lane_slug(instance), type(e).__name__)
+        return False
+
+
+def sync_mcp_lanes(workspace: Optional[Path] = None, *, environ: Optional[Mapping[str, str]] = None, vault=None,
+                   mcp_config: Optional[Path] = None, descriptor: Optional[Path] = None, space_of=None,
+                   codex_config: Optional[Path] = None) -> dict:
+    """Write `conn-<instance>.json` (and a 0600 `conn-<instance>.env` holding the row's bearer under its
+    `token_ref`) in `mcp_lanes_dir` for each enabled core row the main descriptor does not already
+    serve, and remove every other `conn-*` file there. When that proxy resolves vault lanes
+    (`_proxy_reads_vault_lanes`) and the token is found with no environment, the descriptor names
+    `MCP_VAULT_ENV_FILE` and no env file is kept. Without a readable main descriptor nothing is
+    touched (`skipped: no_main_descriptor`). Returns slugs only, never a secret."""
+    environ = os.environ if environ is None else environ
+    lanes = mcp_lanes_dir(workspace, environ)
+    out = {"ok": True, "lanes_dir": str(lanes), "written": [], "unchanged": [], "removed": [], "skipped": {}}
+    found = _main_mcp_descriptor(workspace, environ, mcp_config, descriptor, codex_config)
+    if found is None:
+        out.update(ok=False, reason="no_main_descriptor")
+        return out
+    main, main_path = found
+    vault_lanes = _proxy_reads_vault_lanes(main_path, environ, mcp_config, codex_config)
+    want = set()
+    lock = _workspace(workspace) / "state" / f"{MCP_LANES_DIR_NAME}.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with locked_file(lock, create_mode=0o600):
+        for row in _core_rows(enabled_rows(workspace)):
+            slug = mcp_lane_slug(str(row["instance"]))
+            if _main_serves(row, main):
+                continue
+            try:
+                _, token = connection_credential(row, environ, vault=vault)
+            except ConnectionsError:
+                out["skipped"][slug] = "no_token"
+                continue
+            env_file = lanes / f"{MCP_LANE_PREFIX}{slug}.env"
+            from_vault = vault_lanes and _resolvable_offline(row, token, vault)
+            desc, reason = _mcp_lane(row, token, main, MCP_VAULT_ENV_FILE if from_vault else env_file, space_of)
+            if desc is None:
+                out["skipped"][slug] = reason
+                continue
+            if from_vault:
+                want.add(slug)
+                body = json.dumps(desc, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+                changed = _write_if_changed(lanes / f"{MCP_LANE_PREFIX}{slug}.json", body)
+                # The descriptor no longer names the copy, so it goes after the descriptor is rewritten.
+                with contextlib.suppress(FileNotFoundError):
+                    env_file.unlink()
+                    changed = True
+                out["written" if changed else "unchanged"].append(slug)
+                continue
+            value = token.strip() if gateway_url_of(token) else f"{desc['relay']}|{token.strip()}"
+            try:
+                env_body = _env_file_with(env_file, str(row["token_ref"]), value)
+            except UnquotableValue:
+                out["skipped"][slug] = "unquotable_token"
+                continue
+            want.add(slug)
+            # The env first, then the descriptor: the proxy reads the descriptor to find the env.
+            changed = _write_if_changed(env_file, env_body)
+            body = json.dumps(desc, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+            changed = _write_if_changed(lanes / f"{MCP_LANE_PREFIX}{slug}.json", body) or changed
+            out["written" if changed else "unchanged"].append(slug)
+        try:
+            entries = list(lanes.iterdir())
+        except FileNotFoundError:
+            entries = []
+        present = sorted({p.stem[len(MCP_LANE_PREFIX):] for p in entries
+                          if p.name.startswith(MCP_LANE_PREFIX) and p.suffix in (".json", ".env")})
+        # A temp file left by a crash mid-write may hold a token; no write of ours is in flight here.
+        for p in entries:
+            if p.name.startswith(f".{MCP_LANE_PREFIX}") and p.name.endswith(".tmp"):
+                with contextlib.suppress(FileNotFoundError):
+                    p.unlink()
+        for slug in present:
+            if slug not in want and _unlink_lane(lanes, slug):
+                out["removed"].append(slug)
+    return out
+
+
+def _vault_lane_token(row: Mapping[str, object], vault) -> str:
+    """The row's token from the vault alone, as `url|secret` on the row's own gateway host; '' if none.
+    The lane resolver reads nothing else, so no environment or channel file can make it disagree."""
+    try:
+        tok = row_token(row, _vault_get(_vault(vault), str(row["token_ref"])))
+    except ConnectionsError:
+        return ""
+    return tok if tok and host_of_url(gateway_url_of(tok)) == host_of_url(str(row["gateway_url"])) else ""
+
+
+def _resolvable_offline(row: Mapping[str, object], token: str, vault) -> bool:
+    """Whether the lane resolver answers the token the sync resolved (`connection_credential`, which reads
+    the environment and channel files ahead of the vault): only when the vault holds that same token."""
+    return bool(token) and _vault_lane_token(row, vault) == token
+
+
+class NoLaneCredential(ConnectionsError):
+    """`lane_mcp_credential` refused; `reason` is one of LANE_CREDENTIAL_REASONS. Never carries a secret."""
+
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason, self.detail = reason, detail
+
+
+LANE_CREDENTIAL_REASONS = ("not_owner", "unknown_lane", "disabled", "parked", "not_engine_descriptor",
+                           "no_token", "descriptor_stale")
+
+
+LANE_DESCRIPTOR_MAX_BYTES = 64 * 1024
+
+
+def _engine_lane_descriptor(path: Path) -> Optional[dict]:
+    """The lane descriptor at `path` when it is a regular file of this user that no other user may write,
+    at most LANE_DESCRIPTOR_MAX_BYTES. One no-follow open: the checks and the read are of the same file."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022 \
+                or st.st_size > LANE_DESCRIPTOR_MAX_BYTES:
+            return None
+        chunks, size = [], 0
+        while size <= LANE_DESCRIPTOR_MAX_BYTES:
+            chunk = os.read(fd, LANE_DESCRIPTOR_MAX_BYTES + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        if size > LANE_DESCRIPTOR_MAX_BYTES:
+            return None
+        desc = json.loads(b"".join(chunks).decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    finally:
+        os.close(fd)
+    return desc if isinstance(desc, dict) and desc.get("version") == 1 else None
+
+
+def lane_mcp_credential(lane: str, *, workspace: Optional[Path] = None,
+                        environ: Optional[Mapping[str, str]] = None, vault=None,
+                        mcp_config: Optional[Path] = None, codex_config: Optional[Path] = None) -> dict:
+    """`{lane, bearer, relay}` for the MCP proxy's `(vault)` lane `lane` (a `mcp_lane_slug`), `bearer` the
+    secret half of the row's vault token (`_vault_lane_token`), `relay` its gateway. Refused with
+    NoLaneCredential unless this user owns the workspace, `lane` is an enabled core row the main
+    descriptor does not serve (the primary lane is `unknown_lane`), and its `conn-<lane>.json` is a
+    `(vault)` descriptor this user wrote for that row, its relay and its secret."""
+    environ = os.environ if environ is None else environ
+    ws = _workspace(workspace)
+    try:
+        owner = ws.stat().st_uid
+    except OSError:
+        owner = None
+    if owner != os.geteuid():
+        raise NoLaneCredential("not_owner", "this user does not own the workspace")
+    row = next((r for r in _core_rows(read_rows(ws)) if mcp_lane_slug(str(r["instance"])) == lane), None) \
+        if isinstance(lane, str) and lane else None
+    found = _main_mcp_descriptor(ws, environ, mcp_config, None, codex_config) if row is not None else None
+    if row is None or found is None or _main_serves(row, found[0]):
+        raise NoLaneCredential("unknown_lane", "no extra core connection has this lane")
+    if row.get("disabled") or row.get("parked"):
+        reason = "disabled" if row.get("disabled") else "parked"
+        raise NoLaneCredential(reason, f"connection {lane} is {reason}")
+    desc = _engine_lane_descriptor(mcp_lanes_dir(ws, environ) / f"{MCP_LANE_PREFIX}{lane}.json")
+    if desc is None or desc.get("lane") != lane or desc.get("env_file") != MCP_VAULT_ENV_FILE \
+            or desc.get("env_key") != str(row["token_ref"]):
+        raise NoLaneCredential("not_engine_descriptor", f"lane {lane} has no vault descriptor of this engine")
+    token = _vault_lane_token(row, vault)
+    if not token:
+        raise NoLaneCredential("no_token", f"connection {lane} has no token in the vault")
+    relay, secret = _lane_relay_secret(row, token)
+    if not secret or _lane_relay(str(desc.get("relay") or "")) != relay \
+            or desc.get("bearer_digest") != hashlib.sha256(secret.encode()).hexdigest():
+        raise NoLaneCredential("descriptor_stale", f"lane {lane}'s descriptor was written for another credential")
+    return {"lane": lane, "bearer": secret, "relay": relay}
+
+
+def _refresh_mcp_lanes(workspace: Optional[Path], environ: Optional[Mapping[str, str]], vault) -> None:
+    """`sync_mcp_lanes` after a lifecycle change; it never fails the change it follows."""
+    try:
+        sync_mcp_lanes(workspace, environ=environ, vault=vault)
+    except Exception as e:  # noqa: BLE001 - derived state: the next lifecycle change or CLI run repairs it
+        logging.getLogger(__name__).warning("connections: MCP lane sync failed (%s)", type(e).__name__)
 
 
 def mirror_room_bindings(bindings: Mapping[str, str], legacy: str, successor: str,

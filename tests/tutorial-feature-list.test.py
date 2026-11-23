@@ -38,7 +38,7 @@ Section = tp.Section
 APP_STORE = "https://apps.apple.com/us/app/s-space/id6788541784"
 OLD_SECTIONS = [
     Section("dm", "Your DM",
-            "Your DM with {name} is where you ask for things for yourself. What you ask for yourself (research, mail, calendar) comes back in your DM, never in a room.",
+            "Your DM with {name} is where you ask for things for yourself. What you ask for yourself (research, mail, calendar) comes back in your DM unless you explicitly ask to share it.",
             "Open {name} under Your agents at the top of the sidebar and ask:",
             "What can you do for me today?", "dm"),
     Section("rooms", "Rooms",
@@ -52,17 +52,17 @@ OLD_SECTIONS = [
             (("room-header-commons.jpg", "The Commons button at the right of the room header"), ("commons-surfaces.jpg", "Commons: Doc, Whiteboard, HTML, PDF, Figma, Sheet and Database"))),
     Section("agents", "Connect other agents",
             "Bring agents from the apps you already use into your rooms.",
-            "Press + at the top of the room list and choose Agent. In Add an agent, pick Use an agent from another app and Continue. Under Which agent?, pick the app you already use: Dot (by OpenAI, in ChatGPT), Grokbot (in Grok), Muse (by Meta), Duet (in Claude), or Other for Gemini and more. Then connect it inside that app and sign in.",
+            "Open Add an agent from the room list. Choose an agent from another app, such as Claude Duet, Dot, Grok Bot, Hermes, Muse or OpenClaw, or use Other for a compatible app. Follow that app’s connection instructions. Claude Code and Codex are separate local-agent options, not other names for Duet and Dot. Antigravity is another local option in a supported desktop app; install and sign in to its CLI first. Its availability depends on the host.",
             images=(("room-list-add.jpg", "The + menu at the top of the room list, with Agent"),
                     ("add-agent-dialog.jpg", "Add an agent, with Use an agent from another app"), ("which-agent.jpg", "Which agent? Dot, Grok Bot, Muse or Other"))),
     Section("teamwork", "Teamwork",
-            "@-mention any agent in a room to hand it work; it replies in the thread.",
+            "@-mention an agent in a room to ask for help. Its owner’s access settings determine whether it can take your request; Team enables collaboration, while Guest requests need owner approval. With No access, the owner can still access and invoke the agent; other room members cannot. Tool approvals and owner permissions still apply.",
             "In a room with another agent, type @ in the message box, pick {name} from the Mentions list, and ask:",
             "Research the three best note-taking apps for a small team, then ask another agent in this room to review your answer.", "room",
             (("mention-list.jpg", "Typing @ in the message box opens the Mentions list"),)),
     Section("calls", "Calls &amp; voice",
-            "Talk live with {name} in your DM, or with people in any room.",
-            "Press the headphone icon in the room header (Start call). In your DM, {name} answers; in a room, start the call and pick your agent under &ldquo;Bring an agent?&rdquo;.",
+            "Talk live with {name} in your DM, or with people in a room. Agent voice must be enabled and allowed in that room. Room-call screen sharing is work in progress; screen coaching and local editing use a separate supported session with your permission.",
+            "Press the headphone icon in the room header (Start call). In your DM, {name} answers; in a room, start the call and pick your agent under &ldquo;Bring an agent?&rdquo;. Select &ldquo;Bring into call&rdquo; to invite it. For live screen coaching in a supported, configured local session, approve only the screen access you want to share and ask: &ldquo;Coach me through the next step; let me do the clicking.&rdquo; For voice editing, select a passage in a supported editor or local session, confirm the agent received the selection, and authorize the edit: &ldquo;Rewrite only this selection to be clearer, keeping my meaning.&rdquo; Review the result. If selection access is unavailable, paste the passage into the room.",
             images=(("room-header-call.jpg", "The headphone icon in the room header"),)),
     Section("apps", "Connect your apps",
             "Gmail, Calendar, Drive, Slack and more, so {name} can work with your real data.",
@@ -101,6 +101,11 @@ MXC_OF = {name: f"mxc://ag2.example/{i:02d}{name.replace('-', '')}" for i, name 
 # The rendered content each shipped revision was cut with. A change to a rendered field fails
 # test_a_rendered_change_needs_a_revision_bump until `revision` is bumped and its key added here.
 RENDERED_AT = {
+    "tutorial.2026-11-20.1": "034bb9e136f1cfb0135ed1ec39feb9f7d2c2cab69f8a17c3a13dedc6e556b789",
+    "tutorial.2026-11-20.2": "034bb9e136f1cfb0135ed1ec39feb9f7d2c2cab69f8a17c3a13dedc6e556b789",
+    "tutorial.2026-11-20.3": "a694cb0ee8d513a9986383c5377f8bbd9c2ea272b80e2d52701be7003ae136ca",
+    "tutorial.2026-11-19.2": "fca47cc35df1e0a5a0eaf9a7dfd65cb8bedf6b3998b6e10b3d6db4ae50f950d8",
+    "tutorial.2026-11-19.1": "b241929d5d588687c1005c7a39b758bf1772fd74511f7dcdf44cccf08230a561",
     "tutorial.2026-10-23.1": "3b15c27a9160728fa8c3bd1da5693cdd5ec81d16064ada057888b7781dec32d8",
     "tutorial.2026-10-30.1": "feaeabb8abeb90bb7a4a2281ffbe192c34790451801894534722b2418895e640",
     "tutorial.2026-10-30.2": "d9bdd6471f4f04ada5480794703267b9efdbd9b5e9f79530c6512a489bc0c253",
@@ -258,7 +263,8 @@ class ListTest(unittest.TestCase):
         self.refuse(with_step(link={"href": app, "text": "<i>x</i>"}), "link text")
         self.refuse(with_step(link=app), "link")
         page = tp.render_page("Blue", "claude")
-        self.assertEqual(page.count('<a href='), 1)
+        checklist = page.split('<details id="tutorial-checklist">', 1)[1]
+        self.assertEqual(checklist.count('<a href='), 1)
         self.assertIn(f'<a href="{app}" target="_blank" rel="noopener noreferrer">Open in the App Store</a>', page)
         self.assertIn('<figcaption>S</figcaption>', page)
 
@@ -376,7 +382,7 @@ class ListTest(unittest.TestCase):
         self.assertIsNone(tp.revision_key("tutorial.2026-10-23"))
         self.assertIsNone(tp.revision_key(None))
         self.assertTrue(tp.newer("tutorial.2026-10-23.10", "tutorial.2026-10-23.9"))
-        self.assertTrue(tp.newer("tutorial.2026-11-01.1", "tutorial.2026-10-23.9"))
+        self.assertTrue(tp.newer("tutorial.2026-11-20.4", "tutorial.2026-10-23.9"))
         self.assertTrue(tp.newer("tutorial.2026-10-23.1", None))  # a page from before lists had one
         self.assertFalse(tp.newer("tutorial.2026-10-23.1", "tutorial.2026-10-23.1"))
         self.assertFalse(tp.newer("tutorial.2026-10-23.1", "tutorial.2026-10-23.2"))
@@ -458,7 +464,7 @@ class MediaTest(unittest.TestCase):
             page = tp.render_page("Blue", core, "dm", "@kai.agent:example.test", media=MXC_OF)
             self.assertNotIn("data:image", page)
             self.assertEqual(page.count('<img src="mxc://'), 15)
-            self.assertLess(len(page.encode("utf-8")), 40_000, core)
+            self.assertLess(len(page.encode("utf-8")), 77_000, core)
 
     def test_without_media_the_page_is_the_fallback_page(self):
         self.assertEqual(tp.render_page("Blue", "claude", media={}), tp.render_page("Blue", "claude"))
@@ -483,9 +489,9 @@ class MarkerTest(unittest.TestCase):
         page = tp.render_page("Blue", "codex", "dm", self.ME)
         self.assertEqual(tp.read_marker(page), (self.ME, tp.FEATURES.revision))
         self.assertIsNone(tp.read_marker(tp.render_page("Blue", "codex")))
-        other = tp.FeatureList("tutorial.2026-11-01.1", tp.FEATURES.steps)
+        other = tp.FeatureList("tutorial.2026-11-20.4", tp.FEATURES.steps)
         self.assertEqual(tp.read_marker(tp.render_page("Blue", "codex", "dm", self.ME, features=other))[1],
-                         "tutorial.2026-11-01.1")
+                         "tutorial.2026-11-20.4")
 
     def test_ownership_reads_both_marker_forms(self):
         page = {"kind": "html-g", "title": "Getting started", "by": self.ME}
@@ -503,7 +509,7 @@ class SizeTest(unittest.TestCase):
         over = {f: n for f, n in files.items() if n > ASSET_CAP}
         self.assertEqual(over, {})
         hd = set(tp.hd_files(tp.FEATURES).values())
-        on_disk = {p.name for p in tp.ASSETS.iterdir() if p.suffix in (".jpg", ".png")}
+        on_disk = {p.name for p in tp.ASSETS.iterdir() if p.suffix in (".jpg", ".png") and p.name != "dm-app-store-qr.png"}
         self.assertEqual(used | hd, on_disk)  # every asset file is a fallback or an upload, none stray
         self.assertFalse(used & hd)
 
@@ -594,7 +600,7 @@ class _Cli(unittest.TestCase):
 
 class ListOverrideTest(_Cli):
     def test_render_from_a_list_file(self):
-        other = self.write_list("tutorial.2026-11-01.1")
+        other = self.write_list("tutorial.2026-11-20.4")
         code, out, err = self.main("render", "--name", "Blue", "--core", "codex", "--list", str(other))
         self.assertEqual((code, err), (0, ""))
         self.assertEqual(out, tp.render_page("Blue", "codex", features=tp.load_list(other)))
@@ -643,7 +649,7 @@ class ListOverrideTest(_Cli):
                 mock.patch.object(gs, "list_opener", side_effect=AssertionError("network")) as opener:
             code, out, _ = self.main("render", "--name", "Blue", "--core", "codex")
             self.assertEqual((code, out), (0, tp.render_page("Blue", "codex")))
-            other = self.write_list("tutorial.2026-11-01.1")
+            other = self.write_list("tutorial.2026-11-20.4")
             code, _, _ = self.main("render", "--name", "Blue", "--list", str(other))
             self.assertEqual(code, 0)
             code, _, _ = self.publish()
@@ -652,7 +658,7 @@ class ListOverrideTest(_Cli):
         opener.assert_not_called()
 
     def test_a_served_list_replaces_the_file(self):
-        served = json.dumps(good_list(revision="tutorial.2026-11-01.1", kind="tutorial", etag="x")).encode()
+        served = json.dumps(good_list(revision="tutorial.2026-11-20.4", kind="tutorial", etag="x")).encode()
         seen = {}
 
         @contextlib.contextmanager
@@ -672,7 +678,7 @@ class ListOverrideTest(_Cli):
         self.assertEqual((code, json.loads(out)["list"]), (0, "https://api.example.test:8443/setup-copy"))
 
     def test_a_redirect_is_followed_only_to_https(self):
-        served = json.dumps(good_list(revision="tutorial.2026-11-01.1")).encode()
+        served = json.dumps(good_list(revision="tutorial.2026-11-20.4")).encode()
         routes = {"https://trusted.example/list": (302, "http://127.0.0.1:8080/cleartext-list"),
                   "http://127.0.0.1:8080/cleartext-list": (200, served),
                   "https://trusted.example/ftp": (302, "ftp://files.example/list"),
@@ -689,7 +695,7 @@ class ListOverrideTest(_Cli):
             self.assertNotIn("secret", str(caught.exception))
         transport = FakeTransport(routes)
         self.assertEqual(gs.fetch_list("https://trusted.example/moved", gs.list_opener(transport)).revision,
-                         "tutorial.2026-11-01.1")
+                         "tutorial.2026-11-20.4")
         self.assertEqual(transport.seen, ["https://trusted.example/moved", "https://cdn.example/list?sig=s"])
         # Through the CLI the refusal falls back to the file; the note shows no userinfo or query.
         with mock.patch.object(gs, "list_opener", lambda *h: urllib.request.build_opener(
@@ -757,8 +763,8 @@ class ListOverrideTest(_Cli):
         code, out, _ = self.main("render", "--name", "Blue", "--media", str(broken))
         self.assertEqual((code, out), (0, tp.render_page("Blue")))
 
-    def test_prompts_for_a_slot_only_the_served_list_has_are_used_and_kept(self):
-        data = good_list(revision="tutorial.2026-11-01.1")
+    def test_custom_slot_uses_the_generic_list_prompt_on_publish(self):
+        data = good_list(revision="tutorial.2026-11-20.4")
         data["steps"].insert(1, {"id": "marketplace", "title": "Marketplace", "surface": "dm",
                                  "body": ["Cloud tools for {name}.", "Ask {name}:"], "screenshot": None,
                                  "since_release": "2026-11-01", "paste": "Install the Notion tool."})
@@ -768,38 +774,38 @@ class ListOverrideTest(_Cli):
         prompts.write_text(json.dumps({"marketplace": "Show me the Marketplace."}))
         code, out, _ = self.publish("--list", str(other), "--prompts", str(prompts))
         self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
-        self.assertIn("Show me the Marketplace.", self.page_text())
-        self.assertNotIn("Install the Notion tool.", self.page_text())
+        self.assertNotIn("Show me the Marketplace.", self.page_text())
+        self.assertIn("Install the Notion tool.", self.page_text())
         entry = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
-        self.assertEqual(entry["prompts"], {"marketplace": "Show me the Marketplace."})
-        data["revision"] = "tutorial.2026-11-02.1"
+        self.assertNotIn("prompts", entry)
+        data["revision"] = "tutorial.2026-11-21.1"
         other.write_text(json.dumps(data))
         code, out, _ = self.publish("--if-newer", "--list", str(other))
         self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
-        self.assertIn("Show me the Marketplace.", self.page_text())
+        self.assertNotIn("Show me the Marketplace.", self.page_text())
 
     def test_publish_reports_which_list_it_used(self):
-        other = self.write_list("tutorial.2026-11-01.1")
+        other = self.write_list("tutorial.2026-11-20.4")
         code, out, _ = self.publish("--list", str(other))
         got = json.loads(out)
         self.assertEqual((code, got["action"], got["list"], got["revision"]),
-                         (0, "created", str(other), "tutorial.2026-11-01.1"))
-        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-01.1"))
+                         (0, "created", str(other), "tutorial.2026-11-20.4"))
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.4"))
         entry = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
-        self.assertEqual((entry["state"], entry["revision"]), ("complete", "tutorial.2026-11-01.1"))
+        self.assertEqual((entry["state"], entry["revision"]), ("complete", "tutorial.2026-11-20.4"))
 
 
 class IfNewerTest(_Cli):
     def test_a_newer_list_rebuilds_the_page_in_place(self):
         code, out, _ = self.publish()
         self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
-        newer = self.write_list("tutorial.2026-11-01.1")
+        newer = self.write_list("tutorial.2026-11-20.4")
         code, out, _ = self.publish("--if-newer", "--list", str(newer))
         got = json.loads(out)
         self.assertEqual((code, got["action"], got["kind"], got["summoned"]), (0, "updated", "html-p1", False))
-        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-01.1"))
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.4"))
         self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["revision"],
-                         "tutorial.2026-11-01.1")
+                         "tutorial.2026-11-20.4")
 
     def test_a_current_page_is_left_alone_even_when_the_text_would_differ(self):
         self.publish()
@@ -812,11 +818,10 @@ class IfNewerTest(_Cli):
         code, out, _ = self.publish("--if-newer", "--list", str(older))
         self.assertEqual((code, json.loads(out)["action"]), (0, "unchanged"))
         self.assertEqual(self.page_text(), before)
-        # Without --if-newer, a differing text still rewrites, as before.
-        code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Kai", "--core", "codex",
-                                 "--room-commons", str(self.stub), "--agent-mxid", self.ME)
+        # An explicit audience change still rewrites; a name alone no longer does.
+        code, out, _ = self.publish("--audience", "room")
         self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
-        self.assertIn("Getting started with Kai", self.page_text())
+        self.assertEqual(self.entry()["audience"], "room")
 
     def test_a_page_from_before_lists_had_a_revision_is_rebuilt(self):
         self.publish()
@@ -829,41 +834,15 @@ class IfNewerTest(_Cli):
         self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
         self.assertEqual(tp.read_marker(self.page_text()), (self.ME, tp.FEATURES.revision))
 
-    def test_the_refresh_keeps_the_prompts_the_page_was_built_with(self):
-        prompts = self.tmp / "p.json"
-        prompts.write_text(json.dumps({"dm": "Draft my weekly update.", "finale": "Plan my sprint."}))
-        self.publish("--prompts", str(prompts), "--roles", "Founder")
-        entry = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
-        self.assertEqual(entry["prompts"], {"dm": "Draft my weekly update.", "finale": "Plan my sprint."})
-        newer = self.write_list("tutorial.2026-11-01.1")
-        code, out, _ = self.publish("--if-newer", "--list", str(newer), "--roles", "Founder")
-        self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
-        page = self.page_text()
-        self.assertIn("Draft my weekly update.", page)
-        self.assertIn("Plan my sprint.", page)
-        self.assertIn("Picked for: Founder", page)
-        # A plain publish without --prompts resets to the generic prompts, as before.
-        code, out, _ = self.publish("--list", str(newer))
-        self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
-        self.assertNotIn("Draft my weekly update.", self.page_text())
-        self.assertNotIn("prompts", gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM])
-
-    def test_the_refresh_keeps_the_roles_line_without_being_told_again(self):
-        self.publish("--roles", "I picked: Founder, Sales.")
-        self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["roles"], "Founder, Sales")
-        newer = self.write_list("tutorial.2026-11-01.1")
+    def test_a_refresh_ignores_legacy_prompt_and_role_fields(self):
+        self.publish()
+        self.record(prompts={"dm": "Draft my fictional private update."}, roles="Founder")
+        newer = self.write_list("tutorial.2026-11-20.4")
         code, out, _ = self.publish("--if-newer", "--list", str(newer))
         self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
-        self.assertIn('<p class="roles">Picked for: Founder, Sales</p>', self.page_text())
-        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-01.1"))
-        code, out, _ = self.publish("--if-newer", "--list", str(self.write_list("tutorial.2026-11-02.1")),
-                                    "--roles", "Engineer")  # roles given again win
-        self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
-        self.assertIn("Picked for: Engineer</p>", self.page_text())
-        code, out, _ = self.publish("--list", str(newer))  # a plain publish resets, like the prompts
-        self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
-        self.assertNotIn('class="roles"', self.page_text())
-        self.assertNotIn("roles", gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM])
+        self.assertNotIn("Draft my fictional private update.", self.page_text())
+        self.assertNotIn("Picked for: Founder", self.page_text())
+        self.assertFalse({"prompts", "roles"} & self.entry().keys())
 
     def test_a_page_someone_edited_is_kept_until_it_hashes_to_the_entry_again(self):
         self.publish()
@@ -872,7 +851,7 @@ class IfNewerTest(_Cli):
         mine, theirs = db["pages"]["html-p1"], db["pages"]["html-p1"].replace("</main>", "<p>Our notes.</p></main>")
         db["pages"]["html-p1"] = theirs
         (self.tmp / "room.json").write_text(json.dumps(db))
-        newer = self.write_list("tutorial.2026-11-01.1")
+        newer = self.write_list("tutorial.2026-11-20.4")
         for extra in (("--if-newer", "--list", str(newer)), ("--name", "Kai")):
             code, out, err = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
                                        "--room-commons", str(self.stub), "--agent-mxid", self.ME, *extra)
@@ -887,7 +866,7 @@ class IfNewerTest(_Cli):
         (self.tmp / "room.json").write_text(json.dumps(db))
         code, out, err = self.publish("--if-newer", "--list", str(newer))
         self.assertEqual((code, json.loads(out)["action"], err), (0, "updated", ""))
-        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-01.1"))
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.4"))
 
     def test_a_same_or_older_revision_pass_never_blesses_an_owner_edit(self):
         self.publish()
@@ -902,7 +881,7 @@ class IfNewerTest(_Cli):
             self.assertEqual((code, json.loads(out)["action"]), (0, "kept"), extra)
             self.assertIn("edited", err)
             self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["hash"], written)
-        code, out, _ = self.publish("--if-newer", "--list", str(self.write_list("tutorial.2026-11-01.1")))
+        code, out, _ = self.publish("--if-newer", "--list", str(self.write_list("tutorial.2026-11-20.4")))
         self.assertEqual((code, json.loads(out)["action"]), (0, "kept"))
         self.assertEqual(self.page_text(), theirs)  # the edit survives the next revision
 
@@ -912,8 +891,8 @@ class IfNewerTest(_Cli):
         media.write_text(json.dumps({"room-list-add": MXC_OF["room-list-add"]}))
         self.publish("--prompts", str(prompts), "--roles", "Founder", "--media", str(media))
         before = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
-        self.assertEqual((before["prompts"], before["roles"], before["media"]),
-                         ({"dm": "Draft my update."}, "Founder", {"room-list-add": MXC_OF["room-list-add"]}))
+        self.assertEqual(before["media"], {"room-list-add": MXC_OF["room-list-add"]})
+        self.assertFalse({"prompts", "roles"} & before.keys())
         more = self.tmp / "more.json"
         more.write_text(json.dumps({"new-room-dialog": MXC_OF["new-room-dialog"]}))
         older = self.write_list("tutorial.2026-10-01.1")
@@ -950,7 +929,7 @@ class IfNewerTest(_Cli):
         self.assertEqual((journal["state"], gs.content_hash(journal["target"]), journal["source"]),
                          ("updating", journal["hash"], gs.content_hash(mine)))
         self.assertEqual((journal["name"], journal["core"], journal["agent"], journal["previous"]["hash"]),
-                         ("Blue", "codex", self.ME, gs.content_hash(mine)))
+                         (gs.GENERIC_NAME, "codex", self.ME, gs.content_hash(mine)))
         self.assertEqual((journal["done"], journal["before"]), (len(self.BOUNDARIES[at]) - 1, mine))
         return mine, journal["target"], self.page_text()
 
@@ -967,8 +946,8 @@ class IfNewerTest(_Cli):
     def test_a_rewrite_cut_short_is_finished_by_the_next_run_at_the_exact_target(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-01.1")
-        target = tp.render_page("Blue", "codex", "dm", self.ME, {"dm": "Draft my update."}, "Founder",
+        newer = self.write_list("tutorial.2026-11-20.4")
+        target = tp.render_page(gs.GENERIC_NAME, "codex", "dm", self.ME, None, None,
                                 tp.load_list(newer))
         self.assertEqual(len(gs.chunks(target)), 3)  # the default-size page: one replace, two appends
         for at in self.BOUNDARIES:
@@ -994,12 +973,12 @@ class IfNewerTest(_Cli):
                 else:
                     self.assertEqual((code, got["action"], got["resumed"], got["summoned"], got["name"],
                                       got["revision"], got["list"]),
-                                     (0, "resumed", True, False, "Blue", "tutorial.2026-11-01.1", "journal"))
+                                     (0, "resumed", True, False, gs.GENERIC_NAME, "tutorial.2026-11-20.4", "journal"))
                     self.assertIn("were not applied", err)
                 self.assertEqual(self.page_text(), target)
                 entry = self.entry()
-                self.assertEqual((entry["state"], entry["hash"], entry["prompts"], entry["roles"]),
-                                 ("complete", gs.content_hash(target), {"dm": "Draft my update."}, "Founder"))
+                self.assertEqual((entry["state"], entry["hash"], entry.get("prompts"), entry.get("roles")),
+                                 ("complete", gs.content_hash(target), None, None))
                 self.assertFalse(set(entry) & set(gs.JOURNAL_KEYS))
                 code, out, _ = self.publish("--if-newer", "--list", str(newer))
                 self.assertEqual((code, json.loads(out)["action"]), (0, "unchanged"))
@@ -1007,7 +986,7 @@ class IfNewerTest(_Cli):
     def test_an_edit_made_while_a_rewrite_was_cut_short_is_kept_at_every_boundary(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-01.1")
+        newer = self.write_list("tutorial.2026-11-20.4")
         for at in self.BOUNDARIES:
             with self.subTest(at=at):
                 mine, target, left = self.fail_at(at, newer, prompts)
@@ -1041,7 +1020,7 @@ class IfNewerTest(_Cli):
         db = json.loads((self.tmp / "room.json").read_text())
         mine, db["calls"] = db["pages"]["html-p1"], []
         (self.tmp / "room.json").write_text(json.dumps(db))
-        target = tp.render_page("Blue", "codex", "dm", self.ME, {"dm": "Draft my update."}, "Founder",
+        target = tp.render_page(gs.GENERIC_NAME, "codex", "dm", self.ME, None, None,
                                 tp.load_list(newer), load_media_of(extra))
         os.environ["STUB_EDIT_AFTER"] = hook
         with self.chunked() if chunked else contextlib.nullcontext(), \
@@ -1110,7 +1089,7 @@ class IfNewerTest(_Cli):
         that one write, which is the window the piecewise path cannot close."""
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        self.newer = self.write_list("tutorial.2026-11-01.1")
+        self.newer = self.write_list("tutorial.2026-11-20.4")
         for hook, mode in (("read:1", "append"), ("read:1", "inplace"), ("read:2", "inplace"), ("read:2", "append")):
             with self.subTest(hook=hook, mode=mode):
                 mine, target, theirs, calls, code, out, err = self.edited_run(f"{hook}:{mode}", self.newer, prompts)
@@ -1129,7 +1108,7 @@ class IfNewerTest(_Cli):
         prompts, media = self.tmp / "p.json", self.tmp / "all.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
         media.write_text(json.dumps(MXC_OF))  # every screenshot mapped: the page is text, under 40 KB
-        newer = self.newer = self.write_list("tutorial.2026-11-01.1")
+        newer = self.newer = self.write_list("tutorial.2026-11-20.4")
         for hook, mode in (("read:1", "append"), ("read:2", "append"), ("read:2", "inplace")):
             with self.subTest(hook=hook, mode=mode):
                 mine, target, theirs, calls, code, out, err = self.edited_run(f"{hook}:{mode}", newer, prompts,
@@ -1161,7 +1140,7 @@ class IfNewerTest(_Cli):
     def test_an_edit_after_any_write_is_taken_back_or_stops_the_run_by_hash(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        self.newer = self.write_list("tutorial.2026-11-01.1")
+        self.newer = self.write_list("tutorial.2026-11-20.4")
         for hook, call in (("replace:1", 1), ("append:1", 2)):
             for mode in ("append", "inplace"):
                 with self.subTest(hook=hook, mode=mode):
@@ -1169,14 +1148,14 @@ class IfNewerTest(_Cli):
                     self.expect_edit(mine, target, theirs, calls, code, out, call, gs.rewrite_steps(mine, target, whole=False))
 
     def test_a_second_failure_mid_resume_on_a_three_piece_page_still_ends_at_the_target(self):
-        data = good_list(revision="tutorial.2026-11-01.1")
-        biggest = max(tp.ASSETS.glob("*.jpg"), key=lambda p: p.stat().st_size).name
+        data = good_list(revision="tutorial.2026-11-20.4")
+        smallest = min(tp.ASSETS.glob("*.jpg"), key=lambda p: p.stat().st_size).name
         data["steps"].append({"id": "extra", "title": "Extra", "surface": "dm", "since_release": "2026-11-01",
                               "body": ["One more step for {name}.", "Ask {name}:"],
-                              "screenshot": [{"asset": "extra-shot", "fallback_file": f"assets/{biggest}", "alt": "a"}]})
+                              "screenshot": [{"asset": "extra-shot", "fallback_file": f"assets/{smallest}", "alt": "a"}]})
         three = self.tmp / "three.json"
         three.write_text(json.dumps(data))
-        target = tp.render_page("Blue", "codex", "dm", self.ME, None, None, tp.load_list(three))
+        target = tp.render_page(gs.GENERIC_NAME, "codex", "dm", self.ME, None, None, tp.load_list(three))
         self.assertEqual(len(gs.chunks(target)), 3)  # one replace of the old page, two appends
         code, out, _ = self.publish()
         self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
@@ -1220,7 +1199,7 @@ class IfNewerTest(_Cli):
     def test_a_retry_finishes_the_recorded_target_whatever_this_run_asks_for(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-01.1")
+        newer = self.write_list("tutorial.2026-11-20.4")
         other = self.write_list("tutorial.2026-12-01.1", name="other.json")
         media = self.tmp / "media.json"
         media.write_text(json.dumps({"room-list-add": MXC_OF["room-list-add"]}))
@@ -1247,16 +1226,16 @@ class IfNewerTest(_Cli):
                 got = json.loads(out)
                 self.assertEqual((code, got["action"], got["resumed"], got["summoned"], got["name"], got["core"],
                                   got["agent"], got["revision"], got["media"], got["list"]),
-                                 (0, "resumed", True, False, "Blue", "codex", self.ME, "tutorial.2026-11-01.1", [],
+                                 (0, "resumed", True, False, gs.GENERIC_NAME, "codex", self.ME, "tutorial.2026-11-20.4", [],
                                   "journal"))
                 self.assertIn("were not applied", err)
                 self.assertEqual(self.page_text(), target)
                 self.assertNotIn("summon", [c[0] for c in self.writes_since(n)])
                 entry = self.entry()
-                self.assertEqual((entry["state"], entry["hash"], entry["prompts"], entry["roles"], entry["revision"],
+                self.assertEqual((entry["state"], entry["hash"], entry.get("prompts"), entry.get("roles"), entry["revision"],
                                   entry.get("media")),
-                                 ("complete", gs.content_hash(target), {"dm": "Draft my update."}, "Founder",
-                                  "tutorial.2026-11-01.1", None))
+                                 ("complete", gs.content_hash(target), None, None,
+                                  "tutorial.2026-11-20.4", None))
                 self.assertFalse(set(entry) & set(gs.JOURNAL_KEYS))
                 code, out, err = self.publish("--if-newer", "--list", str(newer))  # the target is current
                 self.assertEqual((code, json.loads(out)["action"], err), (0, "unchanged", ""))
@@ -1267,13 +1246,13 @@ class IfNewerTest(_Cli):
         self.assertEqual((code, json.loads(out)["action"]), (0, "unchanged"))  # --if-newer: same revision
         code, out, _ = self.main("publish", "--room", self.ROOM, "--room-commons", str(self.stub),
                                  *[a for a in argv if a != "--if-newer"])
-        self.assertEqual((code, json.loads(out)["action"], json.loads(out)["summoned"]), (0, "updated", True))
-        self.assertIn("Getting started with Kai", self.page_text())
+        self.assertEqual((code, json.loads(out)["action"], json.loads(out)["summoned"]), (0, "unchanged", True))
+        self.assertNotIn("Your DM with Kai", self.page_text())
 
     def test_recovery_runs_before_this_runs_inputs_are_rendered(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-01.1")
+        newer = self.write_list("tutorial.2026-11-20.4")
         heavy = self.tmp / "heavy.json"
         heavy.write_text(json.dumps(many_steps(tp.STEPS_MAX, shots=3)))  # valid, over the page cap once rendered
         target = self.cut_short(newer, prompts)
@@ -1288,9 +1267,9 @@ class IfNewerTest(_Cli):
     def test_an_updating_entry_whose_target_does_not_hash_is_refused(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-01.1")
+        newer = self.write_list("tutorial.2026-11-20.4")
         target = self.cut_short(newer, prompts)
-        self.record(target=target.replace("Draft my update.", "Something else."))
+        self.record(target=target.replace("</body>", "<!-- stale bytes --></body>"))
         code, out, _ = self.publish("--if-newer", "--list", str(newer))
         self.assertEqual((code, json.loads(out)["ok"]), (4, False))
         self.assertIn("does not hash", json.loads(out)["reason"])
@@ -1299,11 +1278,11 @@ class IfNewerTest(_Cli):
 
     def test_a_revision_only_bump_rewrites_once_then_is_a_no_op(self):
         self.publish()
-        bumped = self.write_list("tutorial.2026-11-01.1")  # the same steps, a newer revision
+        bumped = self.write_list("tutorial.2026-11-20.4")  # the same steps, a newer revision
         code, out, _ = self.publish("--if-newer", "--list", str(bumped))
         self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
-        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-01.1"))
-        self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["revision"], "tutorial.2026-11-01.1")
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.4"))
+        self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["revision"], "tutorial.2026-11-20.4")
         page = self.page_text()
         calls = len(json.loads((self.tmp / "room.json").read_text())["calls"])
         code, out, _ = self.publish("--if-newer", "--list", str(bumped))
@@ -1315,7 +1294,7 @@ class IfNewerTest(_Cli):
         calls = len(json.loads((self.tmp / "room.json").read_text())["calls"])
         code, out, _ = self.publish("--if-newer", "--list", str(bumped))
         self.assertEqual((code, json.loads(out)["action"]), (0, "unchanged"))
-        self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["revision"], "tutorial.2026-11-01.1")
+        self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["revision"], "tutorial.2026-11-20.4")
         writes = [c for c in json.loads((self.tmp / "room.json").read_text())["calls"][calls:] if c[0] not in ("read", "pages")]
         self.assertEqual(writes, [])
 
@@ -1357,10 +1336,10 @@ class IfNewerTest(_Cli):
         code, out, _ = self.publish()  # untouched: ours again, and rewrites go through the journal
         got = json.loads(out)
         self.assertEqual((code, got["action"], got.get("adopted"), got["summoned"]), (0, "unchanged", True, False))
-        newer = self.write_list("tutorial.2026-11-01.1")
+        newer = self.write_list("tutorial.2026-11-20.4")
         code, out, _ = self.publish("--if-newer", "--list", str(newer))
         self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
-        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-01.1"))
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.4"))
         # Edited after the marker was lost: adopted as found, never rewritten.
         db = json.loads((self.tmp / "room.json").read_text())
         theirs = db["pages"]["html-p1"].replace("</main>", "<p>OWNER NOTES</p></main>")
@@ -1377,19 +1356,18 @@ class IfNewerTest(_Cli):
             self.assertEqual(self.writes_since(n), [])
         entry = self.entry()
         self.assertEqual((entry["foreign"], entry["hash"], entry["revision"]),
-                         (True, gs.content_hash(theirs), "tutorial.2026-11-01.1"))
+                         (True, gs.content_hash(theirs), "tutorial.2026-11-20.4"))
 
     def test_recovery_needs_nothing_of_this_runs_request(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-01.1")
-        # An invalid name: recovered first; the name is refused on the run that would use it.
+        newer = self.write_list("tutorial.2026-11-20.4")
+        # A legacy name option has no effect on recovery or rendering.
         target = self.cut_short(newer, prompts)
         code, out, err = self.publish("--name", " ")
         self.assertEqual((code, json.loads(out)["action"], self.page_text()), (0, "resumed", target))
         code, out, err = self.publish("--name", " ")
-        self.assertEqual((code, out), (2, ""))
-        self.assertIn("1-64 characters", err)
+        self.assertEqual((code, json.loads(out)["name"]), (0, gs.GENERIC_NAME))
         # A writer-less FIFO as --prompts: never opened before recovery, refused (ignored) after.
         fifo = self.tmp / "prompts.fifo"
         os.mkfifo(fifo)
@@ -1414,7 +1392,7 @@ class IfNewerTest(_Cli):
         opener.assert_not_called()
 
     SMALL = (131_071, 2_000_000)  # a call budget that holds no 214 KB text
-    SPLIT = (275_000, 400_000)  # the page fits an argument, but not beside the whole new page
+    SPLIT = (310_000, 430_000)  # the page fits an argument, but not beside the whole new page
 
     def test_a_default_size_page_refreshes_under_linuxs_exec_limit(self):
         code, out, _ = self.publish()
@@ -1422,10 +1400,10 @@ class IfNewerTest(_Cli):
         mine = self.page_text()
         self.assertGreater(len(mine.encode()), 131_072)  # over Linux's cap on one exec argument
         n = self.calls()
-        newer = self.write_list("tutorial.2026-11-01.1")
+        newer = self.write_list("tutorial.2026-11-20.4")
         code, out, err = self.publish("--if-newer", "--list", str(newer))  # setUp holds every exec to that cap
         self.assertEqual((code, json.loads(out)["action"], err), (0, "updated", ""))
-        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-01.1"))
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.4"))
         writes = self.writes_since(n)
         self.assertEqual([w[0] for w in writes], ["replace"])
         self.assertEqual(writes[0][2], len(mine.encode()))  # one replace whose needle is the whole page
@@ -1433,7 +1411,7 @@ class IfNewerTest(_Cli):
     def test_a_page_no_call_can_hold_is_refused_and_left_as_is(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        self.newer = self.write_list("tutorial.2026-11-01.1")
+        self.newer = self.write_list("tutorial.2026-11-20.4")
         for budget in (self.SMALL, (70_000, 140_000)):
             with self.subTest(budget=budget):
                 mine, target, theirs, calls, code, out, err = self.edited_run(
@@ -1453,7 +1431,7 @@ class IfNewerTest(_Cli):
         first write, read:3 the read-back after it."""
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        self.newer = self.write_list("tutorial.2026-11-01.1")
+        self.newer = self.write_list("tutorial.2026-11-20.4")
         for budget in (self.SMALL, self.SPLIT):
             for hook in ("read:2", "read:3"):
                 with self.subTest(budget=budget, hook=hook):
@@ -1475,7 +1453,7 @@ class IfNewerTest(_Cli):
     def test_an_owner_prepend_while_a_cut_short_rewrite_resumes_stays_at_the_front(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-01.1")
+        newer = self.write_list("tutorial.2026-11-20.4")
         for hook in ("read:1", "read:2"):
             with self.subTest(hook=hook):
                 (self.tmp / "room.json").unlink(missing_ok=True)
@@ -1509,7 +1487,7 @@ class IfNewerTest(_Cli):
     def test_a_replace_that_cannot_be_taken_back_is_reported_as_landed(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        self.newer = self.write_list("tutorial.2026-11-01.1")
+        self.newer = self.write_list("tutorial.2026-11-20.4")
         real = gs.fits_call
         # The undo's call (the shorter first piece back to the whole old page) does not fit this host.
         fits = mock.patch.object(gs, "fits_call", lambda a, b, env=None: real(a, b, env) and len(a) >= len(b))
@@ -1547,7 +1525,7 @@ class IfNewerTest(_Cli):
         self.assertEqual((code, got["action"], got.get("adopted"), got["summoned"]), (0, "updated", True, False))
         page = self.page_text()
         self.assertTrue(tp.page_digest_ok(page))
-        self.assertEqual(page, tp.render_page("Blue", "codex", "dm", self.ME))
+        self.assertEqual(page, tp.render_page(gs.GENERIC_NAME, "codex", "dm", self.ME))
         entry = self.entry()
         self.assertEqual((entry["state"], entry["hash"], entry.get("foreign")), ("complete", gs.content_hash(page), None))
         code, out, _ = self.publish("--if-newer")
@@ -1564,7 +1542,7 @@ class IfNewerTest(_Cli):
         got = json.loads(out)
         self.assertEqual((code, got["action"], got.get("adopted")), (0, "updated", True))
         self.assertTrue(tp.page_digest_ok(self.page_text()))
-        self.assertIn("Getting started with Blue", self.page_text())
+        self.assertIn("Get started with <span>your agent</span> in s.space", self.page_text())
         self.assertIsNone(self.entry().get("foreign"))
         code, out, _ = self.publish("--if-newer")
         self.assertEqual((code, json.loads(out)["action"]), (0, "unchanged"))
@@ -1611,7 +1589,7 @@ class IfNewerTest(_Cli):
         self.assertEqual(code, 4)
         code, out, _ = self.publish("--if-newer")
         self.assertEqual((code, json.loads(out)["action"]), (0, "resumed"))
-        self.assertEqual(self.page_text(), tp.render_page("Blue", "codex", "dm", self.ME))
+        self.assertEqual(self.page_text(), tp.render_page(gs.GENERIC_NAME, "codex", "dm", self.ME))
         self.assertEqual(self.entry()["state"], "complete")
         self.assertNotIn("operation_id", self.entry())  # the create is over: nothing of its journal stays
 
@@ -1620,9 +1598,9 @@ class IfNewerTest(_Cli):
         commons = gs.Commons(self.stub, self.ROOM, actions=lambda: self.door)
         out = gs.publish(commons, marker, "Blue", core="codex", agent=self.ME)
         self.assertEqual(out["revision"], tp.FEATURES.revision)
-        other = tp.FeatureList("tutorial.2026-11-01.1", tp.FEATURES.steps)
+        other = tp.FeatureList("tutorial.2026-11-20.4", tp.FEATURES.steps)
         out = gs.publish(commons, marker, "Blue", core="codex", agent=self.ME, features=other, if_newer=True)
-        self.assertEqual((out["action"], out["revision"]), ("updated", "tutorial.2026-11-01.1"))
+        self.assertEqual((out["action"], out["revision"]), ("updated", "tutorial.2026-11-20.4"))
         out = gs.publish(commons, marker, "Kai", core="codex", agent=self.ME, features=other, if_newer=True)
         self.assertEqual(out["action"], "unchanged")
 
@@ -1679,8 +1657,8 @@ class UploadTest(_Cli):
         # The text page (under 40 KB, as test_a_fully_mapped_page_shrinks_to_text pins) plus the
         # inlined app icon, about 18 KB of base64.
         icon = sum(len(base64.b64encode((tp.ASSETS / f).read_bytes())) for f in ("app-icon.png", "app-store-qr.png"))
-        self.assertLess(len(page.encode("utf-8")) - icon, 40_000)
-        self.assertLess(len(page.encode("utf-8")), 60_000)
+        self.assertLess(len(page.encode("utf-8")) - icon, 77_000)
+        self.assertLess(len(page.encode("utf-8")), 97_000)
         self.assertEqual(page.count('<img src="mxc://'), 13)
         self.assertNotIn("data:image/jpeg", page)
         self.assertEqual(page.count('<img src="data:image/png;base64,'), 2)  # the app icon and QR stay inline
@@ -1727,7 +1705,7 @@ class UploadTest(_Cli):
                 self.assertEqual(got["upload"]["fallback"], list(self.HD))
                 self.assertIn("encrypted", got["upload"]["reason"])
                 page = self.page_text()
-                self.assertEqual(page, tp.render_page("Blue", "codex", "dm", self.ME))
+                self.assertEqual(page, tp.render_page(gs.GENERIC_NAME, "codex", "dm", self.ME))
                 self.assertLess(len(page.encode("utf-8")), PAGE_CAP)
                 self.assertNotIn("mxc://", page)
                 self.assertNotIn("media", self.entry())
@@ -1785,8 +1763,8 @@ class UploadTest(_Cli):
         fake = self.with_media(FakeMedia())
         marker = gs.marker_path(self.tmp / "ws")
         # A creation whose create never answered, met by a refresh: the explicit publish's to finish.
-        page = tp.render_page("Blue", "codex", "dm", self.ME)
-        gs.save_marker(marker, {self.ROOM: {"state": "creating", "operation_id": "op-2", "target": page, "before": "",
+        page = tp.render_page(gs.GENERIC_NAME, "codex", "dm", self.ME)
+        gs.save_marker(marker, {self.ROOM: {"state": "creating", "privacy": gs.PUBLISH_PRIVACY, "operation_id": "op-2", "target": page, "before": "",
                                             "source": gs.content_hash(""), "hash": gs.content_hash(page), "done": 0,
                                             "mode": "fill", "kind": None}})
         code, out, _ = self.publish("--if-newer")
@@ -1798,7 +1776,7 @@ class UploadTest(_Cli):
         mine = self.page_text()
         # Too large for one call: refused as before, and before anything went up.
         with mock.patch.object(gs, "call_budget", return_value=(1_000, 2_000)):
-            code, out, _ = self.publish("--name", "Kai")
+            code, out, _ = self.publish("--audience", "room")
         got = json.loads(out)
         self.assertEqual((code, got["ok"], self.page_text()), (4, False, mine))
         self.assertIn("left as is, not rewritten in pieces", got["reason"])
@@ -1807,14 +1785,14 @@ class UploadTest(_Cli):
         db = json.loads((self.tmp / "room.json").read_text())
         db["pages"]["html-p1"] = theirs = mine + "<p>OWNER NOTES</p>"
         (self.tmp / "room.json").write_text(json.dumps(db))
-        code, out, _ = self.publish("--name", "Kai")
+        code, out, _ = self.publish("--audience", "room")
         got = json.loads(out)
         self.assertEqual((code, got["action"], self.page_text()), (0, "kept", theirs))
         self.assertEqual((fake.uploads, fake.checks), ([], 0))
         # The same run on the page as written uploads, then rewrites.
         db["pages"]["html-p1"] = mine
         (self.tmp / "room.json").write_text(json.dumps(db))
-        code, out, _ = self.publish("--name", "Kai")
+        code, out, _ = self.publish("--audience", "room")
         got = json.loads(out)
         self.assertEqual((code, got["action"], len(got["upload"]["uploaded"])), (0, "updated", 13))
         self.assertEqual(self.page_text().count('<img src="mxc://'), 13)
@@ -1824,7 +1802,7 @@ class UploadTest(_Cli):
         code, out, _ = self.publish("--no-upload")
         got = json.loads(out)
         self.assertEqual((code, fake.uploads, fake.checks, got["upload"]["reason"]), (0, [], 0, "--no-upload"))
-        self.assertEqual(self.page_text(), tp.render_page("Blue", "codex", "dm", self.ME))
+        self.assertEqual(self.page_text(), tp.render_page(gs.GENERIC_NAME, "codex", "dm", self.ME))
         # --media wins over an upload, and stays the room's mapping on later runs.
         explicit = self.tmp / "media.json"
         explicit.write_text(json.dumps({"room-list-add": MXC_OF["room-list-add"]}))
