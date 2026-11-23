@@ -232,18 +232,120 @@ class Apply(Base):
         self.assertGreaterEqual(now[0], model_card.IDLE_WAIT_S)
         self.assertIn("I could not switch to Opus (%s)." % model_card.BUSY, self.queued()[-1]["card"]["text"])
 
+    def claim_of(self, task_id, generation):
+        d = Path(self.root) / "state" / "claims" / task_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "claim.json").write_text(json.dumps({"task_id": task_id, "generation": generation}))
+
     def test_an_offer_in_flight_or_an_unreadable_record_is_busy(self):
         self.assertFalse(model_card.busy(self.root))
+        live = model_card.task_io_consumer(self.root)
+        self.claim_of("task-a", live)
         with mock.patch.object(model_card.records, "load_plugin", return_value={"inflight": {"task-a": {}}}):
             self.assertTrue(model_card.busy(self.root))
         with mock.patch.object(model_card.records, "load_plugin", side_effect=model_card.records.RecordError("bad")):
             self.assertTrue(model_card.busy(self.root))
+
+    def test_an_offer_left_in_flight_by_an_earlier_session_never_blocks_the_switch(self):
+        # Live 2026-11-22: a TURN_CONFIRMED entry from before a restart (another consumer pid) held every switch.
+        live = model_card.task_io_consumer(self.root)
+        self.claim_of("task-old", {"pid": live["pid"] + 1, "start": 1.0})
+        plugin = {"inflight": {"task-old": {"phase": "TURN_CONFIRMED", "turn_id": "t-1"}, "task-gone": {"phase": "PREPARED"}}}
+        with mock.patch.object(model_card.records, "load_plugin", return_value=plugin):
+            self.assertFalse(model_card.busy(self.root), "an earlier generation's entry, and one with no claim, are not turns")
+            cfg = self.picked()
+            lc = self.Launcher([(True, "switched to opus")])
+            outcome = model_card.apply(self.root, cfg, self.home, launcher_factory=lc, sleep=lambda s: None)
+        self.assertEqual((outcome, lc.calls), ("switched", [("opus", True)]))
+        self.claim_of("task-now", live)
+        plugin["inflight"]["task-now"] = {"phase": "TURN_CONFIRMED"}
+        with mock.patch.object(model_card.records, "load_plugin", return_value=plugin):
+            self.assertTrue(model_card.busy(self.root), "the running session's own turn still is")
+
+    def test_a_pick_no_apply_is_working_on_is_settled_and_told_never_left_pending(self):
+        # Live 2026-11-22: wanted "opus" outlived its apply, and the card said "Pending: Opus" for good.
+        cfg = self.picked()
+        self.assertFalse(model_card.apply_alive(self.root))
+        ms = model_card.switcher(self.root, cfg)
+        self.assertEqual(ms.pending(ms.state()), "", "settled on the next look")
+        self.assertEqual(self.state()["wanted"], "")
+        note = self.queued()[-1]["card"]
+        self.assertIn("I could not switch to Opus (%s)." % model_card.NOT_APPLIED, note["text"])
+        body, card = ms.card(ms.state())
+        self.assertNotIn("Pending", card["text"])
+
+    def test_a_pick_whose_apply_is_running_stays_pending(self):
+        cfg = self.picked()
+        import os
+        model_switch.ModelSwitch(str(Path(self.root) / "state"), self.root, None, "x", None, None, None).save(
+            apply={"pid": os.getpid(), "start": None})
+        self.assertTrue(model_card.apply_alive(self.root))
+        ms = model_card.switcher(self.root, cfg)
+        self.assertEqual(ms.pending(ms.state()), "opus")
+        self.assertIn("Pending: Opus", ms.card(ms.state())[1]["text"])
+
+    def test_start_apply_records_the_detached_process(self):
+        class Proc:
+            pid = 4242
+        REAL_START_APPLY(self.root, lambda *a, **k: Proc())
+        self.assertEqual(self.state()["apply"]["pid"], 4242)
+
+    def test_an_apply_that_crashes_settles_the_pick_as_not_switched(self):
+        cfg = self.picked()
+
+        class Broken(self.Launcher):
+            def switch_model(self, rec, model, confirm=False):
+                raise RuntimeError("tmux gone")
+        outcome = model_card.apply(self.root, cfg, self.home, launcher_factory=Broken([]), sleep=lambda s: None)
+        self.assertEqual(outcome, "not-switched")
+        self.assertEqual(self.state()["wanted"], "")
+        self.assertIn("the switch failed (RuntimeError)", self.queued()[-1]["card"]["text"])
 
     def test_an_unknown_refusal_is_told_by_its_first_clause(self):
         cfg = self.picked()
         lc = self.Launcher([(False, "busy: another pane-key sender holds the guard; /model not sent, retry later")])
         model_card.apply(self.root, cfg, self.home, launcher_factory=lc, sleep=lambda s: None)
         self.assertIn("(busy: another pane-key sender holds the guard)", self.queued()[-1]["card"]["text"])
+
+
+class Named(Base):
+    """A model named in the owner's own words is picked directly; the card names models as Claude's menu does."""
+
+    def test_switch_to_a_named_model_picks_it_directly_and_says_switching(self):
+        rc, out = self.claim(self.task("task-h", "switch to haiku"))
+        self.assertEqual(rc, 1)
+        self.assertIn("(model-picked)", out["refused"])
+        self.assertEqual(self.state()["wanted"], "haiku")
+        self.assertEqual(self.started, [self.root])
+        note, = [q["card"] for q in self.queued()]
+        self.assertEqual(note["text"], "Switching to Haiku… I'll confirm here once it has switched.")
+        self.assertFalse(note.get("buttons"), "no menu")
+
+    def test_the_owners_words_name_one_model_or_none(self):
+        cfg = cli.read_config(cli.config_path())
+        ms = model_card.switcher(self.root, cfg)
+        for said, mid in (("switch to haiku", "haiku"), ("Switch to Fable.", "fable[1m]"), ("use opus", "opus"),
+                          ("change the model to sonnet", "sonnet[1m]"), ("换成 haiku", "haiku"),
+                          ("切换到 Opus 模型", "opus"), ("please switch to the haiku model", "haiku")):
+            self.assertEqual(ms.named_in(said), mid, said)
+        for said in ("switch to something faster", "what model are you on?", "use the force", "/model haiku",
+                     "switch to haiku and then write me a long essay about the history of poetry please"):
+            self.assertEqual(ms.named_in(said), "", said)
+
+    def test_other_owner_words_still_go_to_the_session(self):
+        rc, out = self.claim(self.task("task-x", "switch to something faster"))
+        self.assertEqual((rc, out.get("admission")), (0, "owner"))
+
+    def test_a_model_is_shown_by_its_name_never_its_raw_id(self):
+        cfg = cli.read_config(cli.config_path())
+        ms = model_card.switcher(self.root, cfg)
+        names = {m["id"]: m["name"] for m in ms.offered(ms.state())}
+        for mid, name in (("fable", "Fable"), ("fable[1m]", "Fable (1M context)"), ("haiku", "Haiku"),
+                          ("sonnet", "Sonnet"), ("claude-opus-4-7", "Opus"), ("default", "Default")):
+            self.assertEqual(ms.display(names, mid), name, mid)
+        ms.save(current="fable")
+        self.assertIn("Now using Fable.", ms.card(ms.state())[1]["text"])
+        self.assertNotIn("fable", ms.card(ms.state())[1]["text"])
 
 
 class Account(Base):

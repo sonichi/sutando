@@ -61,6 +61,17 @@ class ModelSwitch:
 
     KIND, ASK, MARK, HINT, IN_DM = "model", ASK, MARK, HINT, IN_DM      # what card_desk routes by
     CARD_ID = CARD
+    # The card after a pick, before it is applied; a runtime that switches live says so (model_card).
+    SWITCHING = "Switching to %s on your next message. I'll confirm here once it has switched."
+
+    def display(self, names: dict, mid: str, fallback: str = "") -> str:
+        """A model's name as the card shows it: the runtime's own name for `mid`, else `mid` itself."""
+        return names.get(mid) or mid or fallback
+
+    def named_in(self, words: str) -> str:
+        """The model the owner's own words name for a direct pick ("switch to haiku"), '' for none: the card
+        desk then picks it as a tap would. A runtime opts in by overriding this."""
+        return ""
 
     def __init__(self, state_dir, root, bridge_state, name, publish, quoted, log, refresh=None, allowed=None):
         self.state_dir, self.root, self.bridge_state, self.name = state_dir, root, bridge_state, name
@@ -138,9 +149,9 @@ class ModelSwitch:
                                      command=agent_card.reply("model", "agent", model_verb(mid)))
                    for mid, name in list(names.items())[:BUTTONS]]
         more = list(names.values())[BUTTONS:]
-        text = "Now using %s." % names.get(now, now or "the default model")
+        text = "Now using %s." % self.display(names, now, "the default model")
         if coming:
-            text += " Pending: %s, on your next message." % names.get(coming, coming)
+            text += " Pending: %s, on your next message." % self.display(names, coming)
         if more:
             text += " Also: %s (send /model and the name)." % ", ".join(more)
         # The menu says when it stops acting (the time its record is kept), so the app can show it expired.
@@ -151,18 +162,17 @@ class ModelSwitch:
         """(kind, body, text, status) of the card after a pick; `why`, one short clause, says why a pick
         did not take."""
         names = {m["id"]: m["name"] for m in self.offered(state)}
-        name = names.get(picked, picked)
+        name = self.display(names, picked)
         if same:
             return "done", "Model: already %s" % name, "I'm already using %s. Nothing changed." % name, ""
         if ran is None:
-            return ("info", "Model: switching to %s" % name,
-                    "Switching to %s on your next message. I'll confirm here once it has switched." % name, "")
+            return "info", "Model: switching to %s" % name, self.SWITCHING % name, ""
         if ran == picked:
             return "done", "Model: now %s" % name, "Switched. I'm now using %s." % name, "Switched"
         reason = " (%s)" % why if why else ""
         return ("error", "Model: could not switch to %s" % name,
                 "I could not switch to %s%s. I'm still using %s. Send /model to try again."
-                % (name, reason, names.get(ran, ran or "my default model")), "")
+                % (name, reason, self.display(names, ran, "my default model")), "")
 
     def usable(self) -> bool:
         """Whether a card can reach the room: the agent's own bridge keeps a state dir (made at install).
