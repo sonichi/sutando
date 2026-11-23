@@ -136,11 +136,17 @@ def _sutando_quota_status():
 
 
 def _sutando_quota_status_reader():
-    import skill_config
-    if _OWN_DIRS or not skill_config.enabled("QUOTA_STATUS_PUBLISH", _QUOTA_TRACKER_MANIFEST):
+    """The debounced reader, or None; a broken quota module costs the block, never the start."""
+    try:
+        import skill_config
+        if _OWN_DIRS or not skill_config.enabled("QUOTA_STATUS_PUBLISH", _QUOTA_TRACKER_MANIFEST):
+            return None
+        import quota_status
+        return quota_status.Debounced(_sutando_quota_status)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[remote-gateway-bridge] quota status off: {type(exc).__name__}: {exc}",
+              file=sys.stderr, flush=True)
         return None
-    import quota_status
-    return quota_status.Debounced(_sutando_quota_status)
 
 
 # Like the recovery record, the core's lanes only; off without quota-tracker or with its switch off.

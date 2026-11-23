@@ -976,6 +976,30 @@ def main() -> int:
     finally:
         del os.environ["QUOTA_STATUS_PUBLISH"]
     check(_qrtc._QUOTA_STATUS_READER is None, "QUOTA_STATUS_PUBLISH=false: no quota reader")
+    _saved_qs = sys.modules.get("quota_status")
+    sys.modules["quota_status"] = None  # the next import raises ImportError
+    import io as _qio
+    from contextlib import redirect_stderr as _qredirect
+    _qerr = _qio.StringIO()
+    try:
+        with _qredirect(_qerr):
+            _bspec = importlib.util.spec_from_file_location("rtc_quota_broken", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+            _brtc = importlib.util.module_from_spec(_bspec)
+            _bspec.loader.exec_module(_brtc)
+    finally:
+        if _saved_qs is None:
+            sys.modules.pop("quota_status", None)
+        else:
+            sys.modules["quota_status"] = _saved_qs
+    check(_brtc._QUOTA_STATUS_READER is None and callable(getattr(_brtc, "_post_heartbeat", None))
+          and _qerr.getvalue().count("quota status off: ModuleNotFoundError") == 1,
+          "a broken quota module: the bridge still loads, logs once, and sends no quota block")
+    _brtc._last_heartbeat_at = 0.0
+    STATE["heartbeats"].clear()
+    _brtc._post_heartbeat(set(), force=True)
+    _hbb = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    check(bool(STATE["heartbeats"]) and "quota" not in (_hbb.get("health") or {}),
+          "a broken quota module: the heartbeat still goes out, without health.quota")
 
     # SECURITY / robustness: core-status.json is written by another process and
     # may be malformed. _read_core_status runs in the main loop BEFORE the poll,
