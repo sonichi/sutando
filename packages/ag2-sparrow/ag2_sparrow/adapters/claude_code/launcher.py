@@ -45,6 +45,7 @@ MODEL_ACCEPT_S = 20.0
 # (src/claude_model_switch.py, bundled verbatim): one source for the skill and for this adapter.
 MODEL_RE, MODEL_SET, MODEL_CONFIRM = claude_model_switch.MODEL_RE, claude_model_switch.MODEL_SET, claude_model_switch.MODEL_CONFIRM
 composer_text, accepted_count = claude_model_switch.composer_text, claude_model_switch.accepted_count
+family_count = claude_model_switch.family_count
 composer_boxed, composer_typed = claude_model_switch.composer_boxed, claude_model_switch.composer_typed
 MODEL_RECORD = ("state", "model-switch.json")
 
@@ -643,6 +644,7 @@ class Launcher:
             return False, "refused: the session's input box holds unsent text; nothing sent"
         shown = self.tm.capture(gen["pane_id"]) or ""
         before, other, asked = accepted_count(model, shown), shown.count(MODEL_SET), shown.count(MODEL_CONFIRM)
+        loose = family_count(model, shown)
 
         def keys(*names):
             pred = tmux_pane_keys.predicate(gen["nonce"], gen["pane_pid"], gen["session_id"], gen["session_created"],
@@ -659,7 +661,10 @@ class Launcher:
         answered, deadline, text = False, time.monotonic() + wait_s, shown
         while time.monotonic() < deadline:
             text = self.tm.capture(gen["pane_id"]) or ""
-            if accepted_count(model, text) > before:
+            # A [1m] switch Claude Code answers without naming the context size counts once its own saved
+            # setting names exactly this model (2.1.322 prints "Set model to Sonnet 5.5 and saved ...").
+            if accepted_count(model, text) > before or (
+                    model.endswith("[1m]") and family_count(model, text) > loose and self.saved_model() == model):
                 self.log("model: switched to %s" % model)
                 with contextlib.suppress(OSError):   # the switch happened whether or not it is recorded
                     path = Path(self.root).joinpath(*MODEL_RECORD)
@@ -682,6 +687,18 @@ class Launcher:
             return False, ("unconfirmed: /model %s was sent but Claude Code reported a different model; "
                            "nothing recorded" % model)
         return False, "unconfirmed: /model %s was sent but Claude Code did not report the switch in %d s" % (model, wait_s)
+
+    def saved_model(self) -> str:
+        """The `model` Claude Code saved in this agent's own settings (its CLAUDE_CONFIG_DIR), '' when unread."""
+        config = self.cfg.get("CLAUDE_CONFIG_DIR") or ""
+        if not config:
+            return ""
+        try:
+            with open(os.path.join(config, "settings.json"), encoding="utf-8") as f:
+                saved = json.load(f).get("model")
+        except (OSError, ValueError, AttributeError):
+            return ""
+        return saved if isinstance(saved, str) else ""
 
     def stopped(self, started) -> str:
         self.log("stopped in %.1f s" % (self.clock() - started))

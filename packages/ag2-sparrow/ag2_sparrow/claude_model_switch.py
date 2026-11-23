@@ -75,6 +75,15 @@ def accepted_count(model: str, shown) -> int:
                if pattern.search(line) and (model == "default" or bool(re.search(r"1m", line, re.I)) == wants_1m))
 
 
+def family_count(model: str, shown) -> int:
+    """How many lines on screen name a switch to `model`'s family and version, whatever context size they
+    state. Claude Code 2.1.322 answers `/model sonnet[1m]` with "Set model to Sonnet 5.5 and saved as your
+    default for new sessions", naming no context size (measured 2026-11-22; its saved setting was
+    `sonnet[1m]`): such a line is only half the evidence for a [1m] switch, the saved setting the rest."""
+    pattern = model_accepted(model)
+    return sum(1 for line in (shown or "").splitlines() if pattern.search(line))
+
+
 def main(argv) -> int:
     if argv[:1] == ["model-pattern"] and len(argv) == 1:
         print(MODEL_PATTERN)
