@@ -37,6 +37,14 @@ This skill's `hooks/compact-carry.py` keeps owner questions out of compaction su
 one, has the core file any never-asked question it carried; `session-state.md` shows only the
 count (`python3 src/pending_questions_reader.py summary`).
 
+**Every ask comes with a proposal.** Never hand the owner an open choice: say what you would do,
+why, and what else he could pick. Ask it as a decision card: your proposal is the default action
+(`--default` on `scripts/ask-owner.py`, `--default-action` here), each alternative is an `--option
+"Label=what it does"`, and `--reason` says why you propose it. One-click approval is the point.
+Text-only asks ("reply y") are for destinations that cannot show a card. A question with no proposal
+you can stand behind ("what time suits you?") is still asked with your best guess as the default
+action and the other answers as options.
+
 - `ask` queues the question to the owner (the task's conversation only for an
   owner-tier task in his DM; otherwise his DM), saves it to the outbox, writes the row born
   with its `**Sent:**` record, and once that exact row is confirmed complete commits the
