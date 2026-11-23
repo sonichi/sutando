@@ -102,6 +102,30 @@ class TaskEventHandlerCheck(unittest.TestCase):
         with mock.patch.dict(os.environ, {"SUTANDO_TASK_EVENT_HANDLER": str(self.ws / "gone-pin")}):
             self.assertEqual(hc.check_task_event_handler(self.ws)["status"], "down")
 
+    def test_an_invalid_pin_is_down_even_over_a_good_declaration(self):
+        good = self.ws / "router"
+        good.write_text("#!/bin/sh\n")
+        good.chmod(0o755)
+        self.declare(str(good))
+        with mock.patch.dict(os.environ, {"SUTANDO_TASK_EVENT_HANDLER": str(self.ws / "gone-pin")}):
+            row = hc.check_task_event_handler(self.ws)
+        self.assertEqual(row["status"], "down")
+        self.assertIn("override", row["detail"])
+
+    def test_an_unreadable_declaration_is_down_even_with_a_working_pin(self):
+        pin = self.ws / "pinned-router"
+        pin.write_text("#!/bin/sh\n")
+        pin.chmod(0o755)
+        self.cfg.mkdir()  # exists, and reading it fails
+        with mock.patch.dict(os.environ, {"SUTANDO_TASK_EVENT_HANDLER": str(pin)}):
+            row = hc.check_task_event_handler(self.ws)
+        self.assertEqual(row["status"], "down")
+        self.assertIn("cannot be read", row["detail"])
+
+    def test_no_declaration_is_silent_even_with_an_invalid_pin(self):
+        with mock.patch.dict(os.environ, {"SUTANDO_TASK_EVENT_HANDLER": str(self.ws / "gone-pin")}):
+            self.assertIsNone(hc.check_task_event_handler(self.ws))
+
     def test_unparseable_config_fails(self):
         self.cfg.write_text("{not json")
         self.assertEqual(hc.check_task_event_handler(self.ws)["status"], "down")

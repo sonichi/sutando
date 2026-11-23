@@ -1687,25 +1687,37 @@ def check_decision_card_clicks(workspace_dir: Optional[Path] = None) -> "dict | 
 
 
 def check_task_event_handler(workspace_dir: Optional[Path] = None) -> "dict | None":
-    """DOWN when the declared task-event handler is gone: core's watcher then holds every task."""
+    """DOWN when core's watcher would hold every task; mirrors read_handler_config_now's order."""
     from util_paths import task_event_handler_config_path  # noqa: PLC0415
     cfg = task_event_handler_config_path((Path(workspace_dir) if workspace_dir else WORKSPACE_DIR) / "state")
     if not cfg.exists() and not cfg.is_symlink():
-        return None
-    pin = os.environ.get("SUTANDO_TASK_EVENT_HANDLER", "")
-    if pin and os.path.isfile(pin) and os.access(pin, os.X_OK):
-        return None  # the watcher routes on the pin and never reads the config
+        return None  # no declaration: the core takes every task, pin or not
+
+    def usable(path) -> bool:
+        return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
     try:
-        handler = (json.loads(cfg.read_text(encoding="utf-8")) or {}).get("handler")
-    except (OSError, ValueError, AttributeError):
-        handler = None
-    if isinstance(handler, str) and handler and os.path.isfile(handler) and os.access(handler, os.X_OK):
-        return None
+        raw = cfg.read_bytes()
+    except OSError as exc:
+        why = f"{cfg.name} exists but cannot be read ({type(exc).__name__})"
+    else:
+        pin = os.environ.get("SUTANDO_TASK_EVENT_HANDLER", "")
+        if pin:
+            if usable(pin):
+                return None
+            why = f"the SUTANDO_TASK_EVENT_HANDLER override {pin!r} is not an executable file"
+        else:
+            try:
+                handler = (json.loads(raw) or {}).get("handler")
+            except (ValueError, AttributeError):
+                handler = None
+            if isinstance(handler, str) and usable(handler):
+                return None
+            why = f"{cfg.name} names a handler that is missing or not an executable file ({handler!r})"
     return {"name": "task-event-handler", "status": "down",
-            "detail": (f"{cfg.name} names a handler that is missing or not an executable file ({handler!r}); "
-                       "the core watcher holds every new task until it is fixed (unless it runs with a "
-                       "SUTANDO_TASK_EVENT_HANDLER override). Re-publish it from "
-                       "the checkout that should route, or remove the file to let the core take every task")}
+            "detail": (f"{why}; the core watcher holds every new task until it is fixed. Re-publish the "
+                       "handler from the checkout that should route, or remove the file to let the core "
+                       "take every task")}
 
 
 def check_connections_primary(workspace_dir: Optional[Path] = None) -> "dict | None":
