@@ -672,10 +672,8 @@ def model(args) -> int:
 ROUTE_NOTE = ("from here I cannot tell whether this agent's session goes through the credential proxy; if it does, "
               "the proxy's sign-in decides its account and this one changes nothing. Ask the agent which account it is "
               "on to check")
-NOT_OWNERS_TURN = ("a sign-in is started only for the agent's owner: at a terminal, or by the agent while every "
-                   "message it is working on is its owner's. Nothing was done")
-NOT_IN_THE_DM = ("a sign-in is started only from the owner's DM with the agent, since its link must not be posted "
-                 "in a room with other people: ask me in our DM. Nothing was done")
+NOT_AT_A_TERMINAL = ("a sign-in is started only at a terminal: in the app, open Settings, this agent's Connections "
+                     "card, Switch account (the code goes into the app's own box, never into a chat). Nothing was done")
 
 
 def account_env(cfg: dict, local) -> dict:
@@ -699,24 +697,16 @@ def other_agents_dirs(local) -> list:
     return [d for d in found if d]
 
 
-def sign_in_refused(cfg: dict, local, args) -> str:
-    """'' when this run may start or finish a sign-in, else why not. A person at a terminal may (the
-    app's settings run the command under one); the agent may only while every task its session holds is
-    its owner's own and from their DM: it cannot be asked to sign in on someone else's turn, and the
-    link (whoever opens it chooses the account) is never the answer to a message in a shared room."""
-    if sys.stdin.isatty():
-        return ""
-    try:
-        turns = inbox.open_turns(cm.work_root(cfg))
-    except Exception:
-        return NOT_OWNERS_TURN
-    if not turns or not all(kind == task_io.OWNER for kind, _ in turns):
-        return NOT_OWNERS_TURN
-    return "" if all(where == "dm" for _, where in turns) else NOT_IN_THE_DM
+def sign_in_refused() -> str:
+    """'' when this run may start or finish a sign-in, else why not: only with a terminal on its input.
+    That is a person at a terminal, or the app's settings, which run the command under one. An agent's
+    own shell has none, so no message in a room, whoever sent it, can have the agent sign in or hand a
+    sign-in link or code through a chat."""
+    return "" if sys.stdin.isatty() else NOT_AT_A_TERMINAL
 
 
-START_SAY = ("Open this link and sign in, then give me the code the page shows, here in our DM (the link works for "
-             "10 minutes, the code once): %s")
+START_SAY = ("Open this link and sign in, then enter the code the page shows where you started this (the link "
+             "works for 10 minutes, the code once): %s")
 
 
 def account(args) -> int:
@@ -737,7 +727,7 @@ def account(args) -> int:
         print(json.dumps({"changed": "", "cancelled": accounts.cancel(waiting)}))
         return 0
     if args.start or args.switch or args.code:
-        refused = sign_in_refused(cfg, local, args)
+        refused = sign_in_refused()
         if refused:
             print(json.dumps({"changed": "", "detail": refused, **accounts.status(cfg, env)}))
             return 1
@@ -910,8 +900,7 @@ def main(argv=None) -> int:
                    "the credential proxy, whose own sign-in decides the account")
     a.add_argument("--start", action="store_true", help="sign in again from anywhere, step 1: print the link of the "
                    "sign-in page and leave the sign-in waiting 10 minutes for its code. A sign-in (--start, --code, "
-                   "--switch) runs only at a terminal, or by the agent while every message it is working on is its "
-                   "owner's and came from their DM")
+                   "--switch) runs only with a terminal on its input: by hand, or from the app's settings")
     a.add_argument("--code", action="store_true", help="step 2: read the code the sign-in page showed from standard "
                    "input (never an argument) and finish the waiting sign-in")
     a.add_argument("--cancel", action="store_true", help="end a waiting sign-in")

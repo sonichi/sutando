@@ -307,77 +307,33 @@ class TwoSteps(Base):
             self.assertEqual((rc, out["detail"]), (1, account.PROXIED))
 
 
-class OwnerOnly(Base):
-    """Who may start or finish a sign-in: a person at a terminal, or the agent while every task its
-    session holds is its owner's own."""
+class AtATerminalOnly(Base):
+    """A sign-in starts or finishes only with a terminal on its input: a person, or the app's settings.
+    An agent's shell has none, so no message can have it sign in or pass a link or a code through a chat."""
 
-    def refused(self, turns=None, tty=False, boom=False):
-        args = types.SimpleNamespace()
-        held = mock.Mock(side_effect=OSError("claims unreadable")) if boom else mock.Mock(return_value=turns or [])
-        with mock.patch.object(cli.sys, "stdin", mock.Mock(isatty=lambda: tty)), \
-                mock.patch.object(cli.cm, "work_root", return_value=str(self.tmp)), \
-                mock.patch.object(cli.inbox, "open_turns", held):
-            return cli.sign_in_refused(self.cfg, cli.LOCAL, args)
+    def test_only_a_terminal_may_start_or_finish_a_sign_in(self):
+        for tty, want in ((True, ""), (False, cli.NOT_AT_A_TERMINAL)):
+            with mock.patch.object(cli.sys, "stdin", mock.Mock(isatty=lambda: tty)):
+                self.assertEqual(cli.sign_in_refused(), want)
+        self.assertIn("Settings", cli.NOT_AT_A_TERMINAL)
+        self.assertIn("never into a chat", cli.NOT_AT_A_TERMINAL)
+        self.assertFalse(hasattr(inbox, "open_turns"), "no path reads whose turn it is: there is no agent path")
 
-    def test_a_terminal_or_only_the_owners_own_open_tasks_may_sign_in(self):
-        self.assertEqual(self.refused(tty=True), "")
-        self.assertEqual(self.refused([("owner", "dm")]), "")
-        self.assertEqual(self.refused([("owner", "dm"), ("owner", "dm")]), "")
-        for turns in ([], [("collaborator", "dm")], [("restricted", "dm")], [("refused", "dm")], [("unknown", "")],
-                      [("owner", "dm"), ("collaborator", "room")], [("owner", "dm"), ("restricted", "dm")]):
-            self.assertEqual(self.refused(turns), cli.NOT_OWNERS_TURN, turns)
-
-    def test_the_owners_message_in_a_shared_room_is_told_to_ask_in_the_dm(self):
-        """Whoever opens the link chooses the account, and an answer goes to the room it was asked in."""
-        for turns in ([("owner", "room")], [("owner", "")], [("owner", "dm"), ("owner", "room")]):
-            self.assertEqual(self.refused(turns), cli.NOT_IN_THE_DM, turns)
-        self.assertIn("ask me in our DM", cli.NOT_IN_THE_DM)
-        self.assertEqual(self.refused(boom=True), cli.NOT_OWNERS_TURN)
-
-    def test_open_turns_are_read_from_the_claims_and_a_claim_past_its_answer_does_not_count(self):
-        root = self.tmp / "root"
-        (root / "tasks").mkdir(parents=True)
-
-        def task(tid, tier, collab="false", raw=None):
-            (root / "tasks" / (tid + ".txt")).write_text(raw if raw is not None else
-                                                          "access_tier: %s\ncollaborator: %s\nchannel_kind: %s\ntask: hi\n" % (
-                                                              tier, collab, "dm" if tid == "t-owner" else "room"))
-        task("t-owner", "owner")
-        task("t-collab", "team", "true")
-        task("t-guest", "guest")
-        task("t-done", "owner")
-        task("t-answered", "team", "true")
-        task("t-bad", "", raw="task: no headers\n")
-        phases = {"t-owner": "PREPARED", "t-collab": "CALLING", "t-guest": "CALLING", "t-done": "SETTLED",
-                  "t-answered": "PREPARED", "t-bad": "PREPARED", "t-gone": "PREPARED", "t-unreadable": None}
-
-        def load(tid):
-            if phases[tid] is None:
-                raise inbox.lifecycle.ClaimUnreadable(tid)
-            return {"task_id": tid, "phase": phases[tid]}
-        lc = types.SimpleNamespace(claims=types.SimpleNamespace(ids=lambda: sorted(phases), load=load),
-                                   classify=lambda tid: inbox.lifecycle.LIVE_READY if tid == "t-answered" else inbox.lifecycle.ABSENT)
-        with mock.patch.object(inbox, "_lifecycle", return_value=lc):
-            turns = inbox.open_turns(str(root))
-        self.assertEqual(sorted(turns), sorted([("owner", "dm"), ("collaborator", "room"), ("restricted", "room"),
-                                                ("unknown", ""), ("unknown", ""), ("unknown", "")]))
-        self.assertTrue(inbox.records.claims_lock_path(str(root)).exists(), "read under claims.lock")
-
-    def test_the_command_refuses_a_sign_in_that_is_not_the_owners_and_still_reads_and_cancels(self):
+    def test_the_command_refuses_a_sign_in_with_no_terminal_and_still_reads_and_cancels(self):
         cmd = Command("run_")
         cmd.cfg, cmd.env, cmd.dir = self.cfg, self.env, self.dir
         self.signed_in()
         with mock.patch.object(cli, "config_dir", return_value=self.tmp):
             for flag in ("--start", "--switch", "--code"):
                 with mock.patch.object(sys, "stdin", io.StringIO("good-code#s1\n")):
-                    rc, out = cmd.run_(flag, gate=cli.NOT_OWNERS_TURN)
+                    rc, out = cmd.run_(flag, gate=cli.NOT_AT_A_TERMINAL)
                 self.assertEqual((rc, out["changed"], out["detail"], out["account"]),
-                                 (1, "", cli.NOT_OWNERS_TURN, "a\u2026@example.com"), flag)
+                                 (1, "", cli.NOT_AT_A_TERMINAL, "a\u2026@example.com"), flag)
             self.assertFalse((self.dir / "stub-logins").exists())
-            self.assertEqual(cmd.run_(gate=cli.NOT_OWNERS_TURN)[0], 0)
-            self.assertEqual(cmd.run_("--cancel", gate=cli.NOT_OWNERS_TURN), (0, {"changed": "", "cancelled": False}))
-        self.assertIn("here in our DM", cli.START_SAY)
-        self.assertNotIn("from-app", cli.NOT_OWNERS_TURN)
+            self.assertEqual(cmd.run_(gate=cli.NOT_AT_A_TERMINAL)[0], 0)
+            self.assertEqual(cmd.run_("--cancel", gate=cli.NOT_AT_A_TERMINAL), (0, {"changed": "", "cancelled": False}))
+        for word in ("DM", "chat", "room"):
+            self.assertNotIn(word, cli.START_SAY, "the words given with the link never ask for the code in a conversation")
 
 
 class Command(Base):
