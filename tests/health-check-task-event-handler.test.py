@@ -92,6 +92,16 @@ class TaskEventHandlerCheck(unittest.TestCase):
         self.assertNotEqual(run.returncode, 0)
         self.assertEqual(run.stdout, "")
 
+    def test_a_working_pin_overrides_a_stale_declaration(self):
+        pin = self.ws / "pinned-router"
+        pin.write_text("#!/bin/sh\n")
+        pin.chmod(0o755)
+        self.declare(str(self.ws / "gone" / "router"))
+        with mock.patch.dict(os.environ, {"SUTANDO_TASK_EVENT_HANDLER": str(pin)}):
+            self.assertIsNone(hc.check_task_event_handler(self.ws))
+        with mock.patch.dict(os.environ, {"SUTANDO_TASK_EVENT_HANDLER": str(self.ws / "gone-pin")}):
+            self.assertEqual(hc.check_task_event_handler(self.ws)["status"], "down")
+
     def test_unparseable_config_fails(self):
         self.cfg.write_text("{not json")
         self.assertEqual(hc.check_task_event_handler(self.ws)["status"], "down")
