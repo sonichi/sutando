@@ -170,6 +170,19 @@ def admit(root, task_id, allow: bool, allow_collab: bool = False) -> "tuple[str 
     return policy.kind, headers, ""
 
 
+def claim_generation(root, task_id):
+    """The consumer generation `task_id`'s claim is bound to: a dict, None when the task has no claim, and ""
+    when the claim cannot be read or names none (a caller takes that for a turn that may be live)."""
+    try:
+        claim = lifecycle.ClaimStore(records.state_dir(root) / "claims").load(task_id)
+    except Exception:  # noqa: BLE001 - unreadable is not "no claim"
+        return ""
+    if not claim:
+        return None
+    gen = claim.get("generation")
+    return gen if isinstance(gen, dict) else ""
+
+
 def card_matter(root, task_id, environ=None) -> "tuple[str, str]":
     """(outcome, answer) of a task that is a model-card matter (model_card.card_matter), ('', '') for any
     other task and whenever the card cannot be consulted: a task is never held back by the card."""

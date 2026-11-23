@@ -14,7 +14,9 @@ isolated turn for a restricted sender runs on the same pick (`turn_model`).
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -39,6 +41,54 @@ RETRYABLE = {"unsent text": "your message box in the session held unsent text",
              "does not show its whole input box": "the session's screen could not be read",
              "unconfirmed": "Claude Code did not confirm the switch"}
 BUSY = "the session stayed busy with a turn for 5 minutes"
+NOT_APPLIED = "the switch was never applied"
+# The detached apply's pid and start, kept in the card's own record (model.json): a pick with none alive is dead.
+APPLY_KEY = "apply"
+# The owner's own words naming a model: "switch to haiku", "use opus", "换成 haiku" (short messages only).
+_NAMED_RE = re.compile(r"^\s*(?:please\s+|can you\s+)?(?:(?:switch|change|move|go)(?:\s+the)?(?:\s+models?)?\s+to"
+                       r"|use|try|(?:请|帮我)?(?:切换|换|改|切)(?:到|成)|用)\s*(?:the\s+)?(.+?)"
+                       r"(?:\s+models?|\s*模型)?\s*(?:please)?\s*[.!?。！？]*\s*$", re.I)
+_CONTEXT = re.compile(r"\s*(?:\[1m\]|\(1m context\))\s*$", re.I)
+_FAMILIES = ("opus", "sonnet", "haiku", "fable")
+
+
+def _base(text: str) -> str:
+    """A model id or name without its context size, lowercased: "fable[1m]" and "Fable (1M context)" are "fable"."""
+    return _CONTEXT.sub("", str(text or "")).strip().lower()
+
+
+class ClaudeModels(model_switch.ModelSwitch):
+    """The model card for Claude: switched live (no "next message"), its models named as Claude's menu names
+    them however the session reports the id ("fable" is "Fable", never the raw id), and a model named in the
+    owner's own words picked directly."""
+
+    SWITCHING = "Switching to %s… I'll confirm here once it has switched."
+
+    def display(self, names: dict, mid: str, fallback: str = "") -> str:
+        if not mid:
+            return fallback
+        if names.get(mid):
+            return names[mid]
+        exact = dict(CHOICES).get(mid)
+        if exact:
+            return exact
+        # Another id of a menu model ("fable" beside "fable[1m]", "claude-opus-4-7"): its family's name, with no
+        # context size, since this id may not have it.
+        base = _base(mid)
+        family = next((f for f in _FAMILIES if f in base), "")
+        if family:
+            return family.capitalize()
+        return mid[:1].upper() + mid[1:]
+
+    def named_in(self, words: str) -> str:
+        if not words or len(words) > 60 or words.startswith("/"):
+            return ""
+        m = _NAMED_RE.match(words)
+        if not m:
+            return ""
+        said = _base(m.group(1))
+        ids = [cid for cid, name in CHOICES if said in (cid.lower(), _base(cid), name.lower(), _base(name))]
+        return ids[0] if len(ids) == 1 else ""
 
 
 def log(*parts):
@@ -51,12 +101,50 @@ def current_model(root) -> str:
     return switched_model(root) or "default"
 
 
-def switcher(root, cfg: dict, publish=None) -> model_switch.ModelSwitch:
-    """The card's state and rules for this agent, its offer set to Claude's menu and its model in use."""
-    ms = model_switch.ModelSwitch(str(records.state_dir(root)), str(root), str(cb.bridge_state(cfg)), NAME,
-                                  publish or (lambda path, body: None), quoted, log, allowed=ALLOWED)
+def switcher(root, cfg: dict, publish=None, settle=True) -> model_switch.ModelSwitch:
+    """The card's state and rules for this agent, its offer set to Claude's menu and its model in use. A pick
+    no apply is working on any more (it stopped, or never started) is settled as not switched first, and the
+    owner told, so the card never shows a pending model that will not come (`settle`; apply itself does not)."""
+    ms = ClaudeModels(str(records.state_dir(root)), str(root), str(cb.bridge_state(cfg)), NAME,
+                      publish or (lambda path, body: None), quoted, log, allowed=ALLOWED)
     ms.seen(CHOICES, str(ms.state().get("confirmed") or "") or current_model(root))
+    if settle:
+        settle_dead(root, ms)
     return ms
+
+
+def apply_alive(root) -> bool:
+    """Whether the detached apply recorded by `start_apply` is still running (same pid, same start)."""
+    try:
+        with open(records.state_dir(root) / model_switch.FILE, encoding="utf-8") as f:
+            rec = json.load(f).get(APPLY_KEY) or {}
+        pid = int(rec.get("pid") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    from ... import task_io
+    try:
+        return rec.get("start") is None or task_io.start_time(pid) == rec.get("start")
+    except Exception:  # noqa: BLE001 - a start that cannot be read is taken as the same process
+        return True
+
+
+def settle_dead(root, ms) -> str:
+    """A pending pick with no apply alive to finish it: settled as not switched, the owner told why."""
+    state = ms.state()
+    wanted = ms.pending(state)
+    if not wanted or apply_alive(root):
+        return ""
+    before = str(state.get("current") or "")
+    log("pending", wanted, "has no apply running: settled as not switched")
+    return ms.tell(True, before if before != wanted else "", why=NOT_APPLIED)
 
 
 def turn_model(root, cfg: dict) -> str:
@@ -152,19 +240,51 @@ def start_apply(root, popen=subprocess.Popen, environ=None) -> None:
     log_path = records.state_dir(root) / "model-apply.log"
     try:
         with open(log_path, "ab") as fh:
-            popen([sys.executable, "-m", __name__, "apply", "--root", str(root)], stdin=subprocess.DEVNULL,
-                  stdout=fh, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+            proc = popen([sys.executable, "-m", __name__, "apply", "--root", str(root)], stdin=subprocess.DEVNULL,
+                         stdout=fh, stderr=subprocess.STDOUT, env=env, start_new_session=True)
     except OSError as e:
         log("apply did not start:", "%s: %s" % (type(e).__name__, e))
+        return
+    pid = getattr(proc, "pid", None)
+    if isinstance(pid, int):
+        from ... import task_io
+        try:
+            start = task_io.start_time(pid)
+        except Exception:  # noqa: BLE001 - liveness then rests on the pid alone
+            start = None
+        try:
+            model_switch.ModelSwitch(str(records.state_dir(root)), str(root), None, NAME, None, quoted, log).save(
+                **{APPLY_KEY: {"pid": pid, "start": start}})
+        except OSError as e:
+            log("apply record not kept:", "%s: %s" % (type(e).__name__, e))
+
+
+def task_io_consumer(root) -> dict:
+    """The consumer generation now holding the root ({pid, start}, as a local claim binds it), pid None for none."""
+    from ... import task_io
+    consumer = task_io.holder_consumer(root) or {}
+    return {"pid": consumer.get("pid"), "start": consumer.get("start")}
 
 
 def busy(root) -> bool:
-    """Whether the session is in a task's turn (an offer in flight in the Mod's record); an unreadable
-    record counts as busy, so nothing is typed into a turn this cannot see."""
+    """Whether the session is in a task's turn (an offer in flight in the Mod's record, claimed by the session
+    now running); an unreadable record counts as busy, so nothing is typed into a turn this cannot see. An
+    entry left by an earlier session (its claim bound to another consumer generation, or gone) is not a turn:
+    a restart never clears the Mod's record, and such an entry would block every switch for good."""
     try:
-        return bool(records.load_plugin(root).get("inflight"))
+        inflight = records.load_plugin(root).get("inflight") or {}
     except Exception:  # noqa: BLE001 - unknown is not idle
         return True
+    if not inflight:
+        return False
+    from . import inbox       # the adapter's one reader of the claims
+    now = task_io_consumer(root)
+    for task_id in inflight:
+        gen = inbox.claim_generation(root, task_id)
+        if gen is not None and (not isinstance(gen, dict) or (now["pid"] and {"pid": gen.get("pid"), "start": gen.get("start")} == now)):
+            return True
+        log("inflight", task_id, "is from another session (generation %s, now %s): not busy" % (gen, now))
+    return False
 
 
 def wait_idle(root, deadline: float, clock=time.monotonic, sleep=time.sleep) -> bool:
@@ -179,10 +299,19 @@ def wait_idle(root, deadline: float, clock=time.monotonic, sleep=time.sleep) -> 
 def apply(root, cfg: dict, config_dir, *, launcher_factory=None, sleep=time.sleep, clock=time.monotonic) -> str:
     """Switch the session to the owner's wanted model once it is idle, then tell them in the DM whether it
     took, and why not when it did not: the `ModelSwitch.tell` outcome, '' when nothing is wanted."""
-    ms = switcher(root, cfg)
+    ms = switcher(root, cfg, settle=False)
     wanted = ms.pending(ms.state())
     if not wanted:
         return ""
+    try:
+        return _apply(root, cfg, config_dir, ms, wanted, launcher_factory, sleep, clock)
+    except Exception as e:  # noqa: BLE001 - a pick never stays pending behind a crash: told as not switched
+        log("apply failed:", "%s: %s" % (type(e).__name__, e))
+        before = str(ms.state().get("current") or "")
+        return ms.tell(True, before if before != wanted else "", why="the switch failed (%s)" % type(e).__name__)
+
+
+def _apply(root, cfg, config_dir, ms, wanted, launcher_factory, sleep, clock) -> str:
     if launcher_factory is None:
         from .launcher import Launcher as launcher_factory
     lc = launcher_factory(cfg, Path(config_dir))

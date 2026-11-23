@@ -29,6 +29,23 @@ HINT = ("If the person asks to switch, change or sign in to another account for 
         "use, reply with exactly %s and nothing else: they are then shown a card for it. Do not start a "
         "sign-in yourself." % MARK)
 IN_DM = "I can switch accounts from our direct message. Ask me there."
+# The account card's words, English only. On the agent's own computer the desktop app draws the account
+# controls below them (from the `account_controls` marker); elsewhere the client says where to open it.
+BELOW = "Switch this agent's account or API key below."
+CONTROLS = "account_controls"
+
+
+def elsewhere(name: str) -> str:
+    """Where the account controls are, for a place that cannot draw them."""
+    return "Open this on the computer that runs %s to switch account." % (name or "this agent")
+
+
+def with_controls(built, runtime: str = "", agent: str = ""):
+    """`built` (body, card) marked as an account card: a client that knows the marker draws the agent's
+    account controls in it, nothing typed there reaching the room; one that does not shows the text."""
+    body, card = built
+    marker = {k: v for k, v in (("runtime", runtime), ("agent", agent)) if v}
+    return body, dict(card, **{CONTROLS: marker})
 ANSWERED = "[no-send] the account card answers\n"
 
 
@@ -51,8 +68,8 @@ class AccountSwitch:
     KIND, ASK, MARK, HINT, IN_DM = "account", "/account", MARK, HINT, IN_DM
     CARD_ID = CARD
 
-    def __init__(self, state_dir, bridge_state, name, publish, quoted, log, read, begin, cancel, opener):
-        self.state_dir, self.bridge_state, self.name = state_dir, bridge_state, name
+    def __init__(self, state_dir, bridge_state, name, publish, quoted, log, read, begin, cancel, opener, runtime=""):
+        self.state_dir, self.bridge_state, self.name, self.runtime = state_dir, bridge_state, name, runtime
         self.publish, self.quoted, self.log = publish, quoted, log
         self.read, self.begin, self.cancel, self.opener = read, begin, cancel, opener
 
@@ -106,8 +123,10 @@ class AccountSwitch:
                                              command=agent_card.reply("account", "agent", "switch")))
         if url:
             buttons.append(agent_card.button("Open sign-in page", "url", url=url))
-        return agent_card.build(CARD if ask else NOTE, state, title="Account", body="Account of %s" % self.name, text=text,
-                                **({"buttons": buttons} if buttons else {}))
+        built = agent_card.build(CARD if ask else NOTE, state, title="Account", body="Account of %s" % self.name,
+                                 text="%s %s" % (text, BELOW) if ask else text,
+                                 **({"buttons": buttons} if buttons else {}))
+        return with_controls(built, self.runtime) if ask else built
 
     def say(self, room, built, result_file=None) -> None:
         """Post the card; where it cannot be posted, a task's result carries its words instead."""
