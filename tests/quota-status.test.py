@@ -261,6 +261,50 @@ class Heartbeat(unittest.TestCase):
         self.assertNotIn("health", body)
 
 
+class EdgeCases(unittest.TestCase):
+    def test_an_unreadable_reset_header_leaves_the_reset_unknown(self):
+        rec = {"headers": {"anthropic-ratelimit-unified-5h-utilization": "0.5",
+                           "anthropic-ratelimit-unified-5h-reset": "soon"}, "limit_state": "allowed"}
+        self.assertEqual(qs.project(rec, NOW)["five_hour"], {"used_pct": 50.0, "resets_at": None})
+        rec["headers"]["anthropic-ratelimit-unified-5h-reset"] = None
+        self.assertIsNone(qs.project(rec, NOW)["five_hour"]["resets_at"])
+
+    def test_a_window_that_appears_or_disappears_publishes(self):
+        with_7d = dict(block(), seven_day={"used_pct": 1.0, "resets_at": 2})
+        self.assertTrue(qs.moved(block(), with_7d))
+        self.assertTrue(qs.moved(with_7d, block()))
+        self.assertTrue(qs.moved(None, block()))
+        self.assertFalse(qs.moved(None, None))
+
+    def test_a_read_failure_on_the_file_is_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "state").mkdir()
+            (Path(tmp) / "state" / "quota-state.json").mkdir()  # a directory: read_text raises OSError
+            self.assertIsNone(qs.read(Path(tmp), now=NOW))
+
+
+class Cli(unittest.TestCase):
+    def test_show_prints_the_block_as_it_would_be_sent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "state").mkdir()
+            (Path(tmp) / "state" / "quota-state.json").write_text(json.dumps(record(limit_state="allowed")))
+            out = io.StringIO()
+            with mock.patch.object(qs, "resolve_workspace", return_value=tmp), \
+                    mock.patch("claude_account.core_account", return_value="acct-core"), \
+                    mock.patch("sys.stdout", out):
+                self.assertEqual(qs.main(["show"]), 0)
+        shown = json.loads(out.getvalue())
+        self.assertEqual(shown["limit_state"], "allowed")
+        self.assertNotIn("account", shown)
+
+    def test_anything_else_prints_usage(self):
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            self.assertEqual(qs.main([]), 2)
+            self.assertEqual(qs.main(["show", "extra"]), 2)
+        self.assertIn("usage: quota_status.py show", err.getvalue())
+
+
 class Switch(unittest.TestCase):
     MANIFEST = REPO / "skills" / "quota-tracker" / "manifest.json"
 
