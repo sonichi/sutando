@@ -438,6 +438,20 @@ class FreshDirTest(Base):
         self.assertEqual((rc == 0, "state/.rate.jsonl.9.abcd.tmp in" in err and "not a plain file" in err), (False, True), err)
         (state / ".rate.jsonl.9.abcd.tmp").rmdir()
         self.assertEqual(self.main()[0], 0)
+        # The canonical copy answers the same, read by read (the package's is its copy).
+        for copy in filter(None, (src_copy(), vendored)):
+            (state / "model-switch.json.tmp").write_text("x")
+            self.assertIsNone(copy.prepare_work_dir(str(self.work), check_only=True))
+            self.assertTrue((state / "model-switch.json.tmp").exists(), "a check removes nothing")
+            self.assertIsNone(copy.prepare_work_dir(str(self.work)))
+            self.assertFalse((state / "model-switch.json.tmp").exists())
+            (state / "model-switch.json.tmp").mkdir()
+            (state / ".rate.jsonl.9.abcd.tmp").mkdir()
+            for check_only in (True, False):
+                self.assertIn("state/.rate.jsonl.9.abcd.tmp in", copy.prepare_work_dir(str(self.work), check_only=check_only))
+            (state / ".rate.jsonl.9.abcd.tmp").rmdir()
+            self.assertIn("state/model-switch.json.tmp in", copy.prepare_work_dir(str(self.work), check_only=True))
+            (state / "model-switch.json.tmp").rmdir()
 
     def test_with_the_marker_only_the_allowlist_is_accepted(self):
         self.assertEqual(self.main()[0], 0)
