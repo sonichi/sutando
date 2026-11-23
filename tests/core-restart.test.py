@@ -196,17 +196,98 @@ class RunCtl(Base):
     def test_a_failed_restore_still_records_the_failure(self):
         self.desktop()
         (self.app / "runtime.json").write_text(json.dumps({"coreRuntime": "claude"}))
-        real = sutando_config.persist_desktop_runtime_selection
-        calls = []
-
-        def persist(runtime, repo=None, check=False):
-            calls.append(runtime)
-            if len(calls) > 1:
-                raise OSError("read-only")
-            return real(runtime, repo, check)
-        with mock.patch.object(sutando_config, "persist_desktop_runtime_selection", side_effect=persist):
+        with mock.patch.object(sutando_config, "restore_desktop_runtime_selection", side_effect=OSError("ro")) as r:
             rc = CR.run_ctl(self.ctl, self.ws, "x", runtime="codex", runner=Run(rc=1), env={}, repo=self.bundle)
-        self.assertEqual((rc, calls, self.audit()[-1]["outcome"]), (1, ["codex", "claude"], "failed"))
+        self.assertEqual((rc, self.audit()[-1]["outcome"]), (1, "failed"))
+        r.assert_called_once_with("codex", "claude", self.bundle)
+
+    def test_with_no_prior_selection_a_failed_switch_leaves_none(self):
+        self.desktop()
+        (self.app / "runtime.json").write_text(json.dumps({"other": 1}))
+        CR.run_ctl(self.ctl, self.ws, "x", runtime="codex", runner=Run(rc=1), env={}, repo=self.bundle)
+        self.assertEqual(json.loads((self.app / "runtime.json").read_text()), {"other": 1})
+
+    def test_a_newer_choice_made_during_the_restart_is_not_rolled_back(self):
+        self.desktop()
+        selection = self.app / "runtime.json"
+        selection.write_text(json.dumps({"coreRuntime": "claude"}))
+
+        def run(argv, **kw):
+            selection.write_text(json.dumps({"coreRuntime": "claude-next"}))  # the app's own writer
+            return subprocess.CompletedProcess(argv, 1)
+        CR.run_ctl(self.ctl, self.ws, "x", runtime="codex", runner=run, env={}, repo=self.bundle)
+        self.assertEqual(json.loads(selection.read_text())["coreRuntime"], "claude-next")
+
+    def test_an_unchanged_selection_is_never_rolled_back(self):
+        self.desktop()
+        (self.app / "runtime.json").write_text(json.dumps({"coreRuntime": "codex"}))
+        with mock.patch.object(sutando_config, "restore_desktop_runtime_selection") as r:
+            CR.run_ctl(self.ctl, self.ws, "x", runtime="codex", runner=Run(rc=1), env={}, repo=self.bundle)
+        r.assert_not_called()
+
+    def test_select_restart_and_rollback_run_under_one_hold_of_the_launch_lock(self):
+        import fcntl
+        self.desktop()
+        (self.app / "runtime.json").write_text(json.dumps({"coreRuntime": "claude"}))
+        lock = self.app / "run" / CR.LAUNCH_LOCK_FILE
+        seen = {}
+
+        def run(argv, **kw):
+            with open(lock, "a") as probe:
+                try:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    seen["free"] = True
+                except OSError:
+                    seen["free"] = False
+            seen["marker"] = kw["env"].get(CR.LOCK_MARKER)
+            return subprocess.CompletedProcess(argv, 0)
+        CR.run_ctl(self.ctl, self.ws, "x", runtime="codex", runner=run, env={}, repo=self.bundle)
+        self.assertEqual(seen, {"free": False, "marker": str(lock)}, "the ctl runs inside this process's hold")
+        with open(lock, "a") as after:
+            fcntl.flock(after, fcntl.LOCK_EX | fcntl.LOCK_NB)  # released once the switch is over
+
+    def test_a_busy_launch_lock_changes_nothing_and_runs_nothing(self):
+        import fcntl
+        self.desktop()
+        selection = self.app / "runtime.json"
+        selection.write_text(json.dumps({"coreRuntime": "claude"}))
+        lock = self.app / "run" / CR.LAUNCH_LOCK_FILE
+        lock.parent.mkdir(parents=True)
+        run = Run()
+        with open(lock, "a") as other:
+            fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            rc = CR.run_ctl(self.ctl, self.ws, "x", runtime="codex", runner=run, env={}, repo=self.bundle,
+                            lock_wait_s=0)
+        self.assertEqual((rc, run.calls), (CR.CTL_LAUNCH_LOCK_BUSY, []))
+        self.assertEqual(json.loads(selection.read_text())["coreRuntime"], "claude")
+        self.assertEqual((self.audit()[-1]["outcome"], self.audit()[-1]["rc"]), ("failed", CR.CTL_LAUNCH_LOCK_BUSY))
+
+    def test_the_lock_wait_follows_the_ctls_setting_and_waits_before_giving_up(self):
+        lock = self.root / "l"
+        held, state = CR.take_launch_lock(lock, 1)
+        self.assertEqual(state, CR.LOCK_LOCKED)
+        ticks, slept = iter([0.0, 0.5, 2.0]), []
+        try:
+            self.assertEqual(CR.take_launch_lock(lock, 1, sleep=slept.append, clock=lambda: next(ticks)),
+                             (None, CR.LOCK_BUSY))
+        finally:
+            held.close()
+        self.assertEqual(slept, [0.2])
+        self.desktop()
+        (self.app / "runtime.json").write_text(json.dumps({"coreRuntime": "claude"}))
+        with mock.patch.object(CR, "take_launch_lock", return_value=(None, CR.LOCK_BUSY)) as take:
+            CR.run_ctl(self.ctl, self.ws, "x", runtime="codex", runner=Run(), env={CR.LOCK_WAIT_ENV: "7"},
+                       repo=self.bundle)
+        self.assertEqual(take.call_args[0][1], 7.0)
+
+    def test_a_lock_that_cannot_be_opened_is_left_to_the_ctl(self):
+        self.desktop()
+        (self.app / "runtime.json").write_text(json.dumps({"coreRuntime": "claude"}))
+        (self.app / "run").write_text("a file where the run dir would be")
+        run = Run(rc=0)
+        self.assertEqual(CR.run_ctl(self.ctl, self.ws, "x", runtime="codex", runner=run, env={}, repo=self.bundle), 0)
+        self.assertNotIn(CR.LOCK_MARKER, run.calls[-1][1]["env"], "the ctl takes the lock itself, as it would")
+
 
     def test_an_unselectable_runtime_is_refused_before_the_ctl_runs(self):
         self.desktop()
@@ -215,6 +296,27 @@ class RunCtl(Base):
         rc = CR.run_ctl(self.ctl, self.ws, "x", runtime="codex", runner=run, env={}, repo=self.bundle)
         self.assertEqual((rc, run.calls), (CR.REFUSED_EXIT, []))
         self.assertEqual((self.audit()[-1]["outcome"], self.audit()[-1]["reason"]), ("refused", "runtime-not-selectable"))
+
+
+class RestoreSelection(Base):
+    def test_restore_is_compare_and_swap_and_keeps_other_keys(self):
+        self.desktop()
+        path = self.app / "runtime.json"
+        path.write_text(json.dumps({"coreRuntime": "codex", "k": 1}))
+        self.assertEqual(sutando_config.restore_desktop_runtime_selection("codex", "claude", self.bundle), "restored")
+        self.assertEqual(json.loads(path.read_text()), {"coreRuntime": "claude", "k": 1})
+        self.assertEqual(sutando_config.restore_desktop_runtime_selection("codex", "", self.bundle), "superseded")
+        path.unlink()
+        self.assertEqual(sutando_config.restore_desktop_runtime_selection("codex", "", self.bundle), "superseded")
+
+    def test_restore_refuses_what_it_cannot_read_and_needs_a_desktop(self):
+        self.assertEqual(sutando_config.restore_desktop_runtime_selection("codex", "", self.clone), "no-desktop")
+        self.desktop()
+        for body in ("[]", "{not json"):
+            with self.subTest(body):
+                (self.app / "runtime.json").write_text(body)
+                with self.assertRaises(ValueError):
+                    sutando_config.restore_desktop_runtime_selection("codex", "", self.bundle)
 
 
 class Restart(Base):

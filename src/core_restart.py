@@ -16,8 +16,10 @@ gateway's session. Anywhere else the restart is `src/agent/start-cli.sh --restar
                                     [--hitl-id ID --revision N] [--runtime R]
         run the ctl's restart-core between its intent and outcome lines; exits with the ctl's code
 
-A runtime switch through the ctl first makes the runtime the desktop's selection (the app's
-launcher reads it) and puts the previous one back when the ctl does not exit 0.
+A runtime switch through the ctl takes the app's launch lock itself (the ctl then skips it), makes
+the runtime the desktop's selection (the app's launcher reads it), runs the ctl, and when the ctl
+does not exit 0 puts the previous selection back (none, if there was none) unless a newer choice
+replaced it meanwhile; all of it under that one hold.
 """
 from __future__ import annotations
 
@@ -49,6 +51,10 @@ CTL_LAUNCH_LOCK_BUSY = 12
 REFUSED_EXIT = 13
 #: Set by an app launcher run that holds the lock; a restart requested from here never inherits it.
 LOCK_MARKER = "SUTANDO_ENGINE_LAUNCH_LOCK_HELD"
+#: The app's launch lock under its app-support dir, and how long the ctl waits for it.
+LAUNCH_LOCK_FILE = "engine-launch.lock"
+LOCK_WAIT_ENV, DEFAULT_LOCK_WAIT_S = "SUTANDO_CTL_LAUNCH_LOCK_WAIT_S", 60
+LOCK_LOCKED, LOCK_BUSY, LOCK_UNAVAILABLE = "locked", "busy", "unavailable"
 AUDIT_EVENT = "ctl_restart"
 INTENT, OUTCOME = "intent", "outcome"
 
@@ -105,36 +111,77 @@ def _audit(workspace: Path, entry: Dict) -> None:
     recovery.audit(Path(workspace), entry)
 
 
+def take_launch_lock(lock: Path, wait_s: float, sleep: Callable[[float], None] = time.sleep,
+                     clock: Callable[[], float] = time.monotonic):
+    """(open file, LOCKED) once this process holds the app's launch lock (the same flock the ctl and
+    the app take); (None, BUSY) after `wait_s`; (None, UNAVAILABLE) when it cannot be opened."""
+    import fcntl
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(lock, "a")
+    except OSError:
+        return None, LOCK_UNAVAILABLE
+    end = clock() + wait_s
+    while True:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh, LOCK_LOCKED
+        except OSError:
+            if clock() >= end:
+                fh.close()
+                return None, LOCK_BUSY
+            sleep(0.2)
+
+
 def run_ctl(ctl: Path, workspace: Path, caller: str, *, hitl_id: str = "", revision: Optional[int] = None,
             runtime: Optional[str] = None, runner: Runner = subprocess.run, env: Optional[Dict] = None,
-            repo: Path = REPO, now: Callable[[], float] = time.time) -> int:
-    """Run the ctl's restart-core between one intent and one outcome audit line; its exit code."""
+            repo: Path = REPO, now: Callable[[], float] = time.time,
+            lock_wait_s: Optional[float] = None) -> int:
+    """Run the ctl's restart-core between one intent and one outcome audit line; its exit code.
+    A runtime switch writes, restarts and rolls back under one hold of the app's launch lock."""
     base = {"event": AUDIT_EVENT, "via": VIA_CTL, "caller": caller}
     if hitl_id:
         base.update(hitl_id=hitl_id, revision=int(revision or 0))
     if runtime:
         base["runtime"] = runtime
     _audit(workspace, dict(base, phase=INTENT, at=int(now())))
-    previous = ""
-    if runtime:
-        previous = sutando_config._desktop_selected_runtime(repo)
-        try:
-            sutando_config.persist_desktop_runtime_selection(runtime, repo)
-        except (OSError, ValueError):
-            _audit(workspace, dict(base, phase=OUTCOME, at=int(now()), outcome="refused",
-                                   reason="runtime-not-selectable"))
-            return REFUSED_EXIT
     env = dict(os.environ if env is None else env)
     env.pop(LOCK_MARKER, None)
+    held = None
     try:
-        rc = runner(["bash", str(ctl), "restart-core"], env=env, stdin=subprocess.DEVNULL).returncode
-    except (OSError, subprocess.SubprocessError):
-        rc = None
-    if rc != 0 and runtime and previous and previous != runtime:
+        if runtime:
+            app = env.get("SUTANDO_APP_SUPPORT") or str(sutando_config.desktop_app_support(repo) or "")
+            env["SUTANDO_APP_SUPPORT"] = app
+            lock = os.path.join(app, "run", LAUNCH_LOCK_FILE)
+            wait = float(env.get(LOCK_WAIT_ENV) or DEFAULT_LOCK_WAIT_S) if lock_wait_s is None else lock_wait_s
+            held, state = take_launch_lock(Path(lock), wait)
+            if state == LOCK_BUSY:
+                _audit(workspace, dict(base, phase=OUTCOME, at=int(now()), outcome="failed",
+                                       rc=CTL_LAUNCH_LOCK_BUSY, reason="launch-lock-busy"))
+                return CTL_LAUNCH_LOCK_BUSY
+            if held is not None:
+                env[LOCK_MARKER] = lock  # the ctl skips the lock this process already holds
+        rc, changed, previous = None, False, ""
+        if runtime:
+            previous = sutando_config._desktop_selected_runtime(repo)
+            try:
+                changed = sutando_config.persist_desktop_runtime_selection(runtime, repo) == "updated"
+            except (OSError, ValueError):
+                _audit(workspace, dict(base, phase=OUTCOME, at=int(now()), outcome="refused",
+                                       reason="runtime-not-selectable"))
+                return REFUSED_EXIT
         try:
-            sutando_config.persist_desktop_runtime_selection(previous, repo)
-        except (OSError, ValueError):
-            pass  # the outcome line still says the switch failed
+            rc = runner(["bash", str(ctl), "restart-core"], env=env, stdin=subprocess.DEVNULL).returncode
+        except (OSError, subprocess.SubprocessError):
+            rc = None
+        if rc != 0 and changed:
+            try:
+                sutando_config.restore_desktop_runtime_selection(runtime, previous, repo)
+            except (OSError, ValueError):
+                pass  # the outcome line still says the switch failed
+    finally:
+        if held is not None:
+            held.close()
     outcome = dict(base, phase=OUTCOME, at=int(now()), outcome="done" if rc == 0 else "failed")
     if rc is not None:
         outcome["rc"] = rc

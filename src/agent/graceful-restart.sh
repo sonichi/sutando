@@ -108,7 +108,7 @@ printf '%s' "$RID" > "$LOCKDIR/rid"
 RESTART_DECIDED=0
 cleanup_lock() {
   retire_prep_task
-  # Production ends in `exec` so this never runs and retention is structural.
+  # A decided restart keeps the lock (do_restart drops it when the restart fails).
   # A dry-run DOES reach here; retaining would self-block the next real run.
   if [ "$RESTART_DECIDED" = 1 ] && \
      { [ "$DRY_RUN" != 1 ] || [ "${GR_RETAIN_LOCK_ON_DECISION:-0}" = 1 ]; }; then
@@ -200,10 +200,15 @@ do_restart() {
   # GR_START_CLI is a test seam: dry-run never reaches this line.
   export GR_RID="$RID"   # lets the launcher release THIS run's lock if it aborts
   # core_restart: the app's ctl under its launch lock in the desktop bundle, else start-cli.sh --restart.
-  local py
+  local py rc=0
   py="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null)" && [ -x "$py" ] || py=python3
-  exec "$py" "$REPO/src/core_restart.py" restart --workspace "$WS" --caller graceful-restart --repo "$REPO" \
-    --start-cli "${GR_START_CLI:-$REPO/src/agent/start-cli.sh}" -- ${RESTART_ARGS[@]+"${RESTART_ARGS[@]}"}
+  "$py" "$REPO/src/core_restart.py" restart --workspace "$WS" --caller graceful-restart --repo "$REPO" \
+    --start-cli "${GR_START_CLI:-$REPO/src/agent/start-cli.sh}" -- ${RESTART_ARGS[@]+"${RESTART_ARGS[@]}"} || rc=$?
+  if [ "$rc" != 0 ]; then
+    log "restart did not happen (exit $rc) — releasing the restart lock so the next request is not deferred"
+    own_lock && rm -rf "$LOCKDIR"
+  fi
+  exit "$rc"
 }
 
 # ---- Phase 1: quiet gate -------------------------------------------------

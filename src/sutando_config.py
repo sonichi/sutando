@@ -746,6 +746,40 @@ def persist_desktop_runtime_selection(runtime: str, repo_root: Optional[Path] = 
     if check:
         return "would-update"
     body["coreRuntime"] = runtime
+    _replace_runtime_json(path, body)
+    return "updated"
+
+
+def restore_desktop_runtime_selection(expected: str, previous: str,
+                                      repo_root: Optional[Path] = None) -> str:
+    """Undo a switch that did not take: put ``previous`` back (no ``coreRuntime`` key when
+    it is empty) only while the file still says ``expected``, so a newer choice survives.
+
+    Returns ``"restored"``, ``"superseded"`` (it no longer says ``expected``) or
+    ``"no-desktop"``; raises ValueError/OSError like the writer above.
+    """
+    path = desktop_runtime_selection_path(repo_root)
+    if path is None or not path.parent.is_dir():
+        return "no-desktop"
+    try:
+        body = json.loads(path.read_text())
+    except FileNotFoundError:
+        return "superseded"
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(body, dict):
+        raise ValueError(f"{path} is not a JSON object")
+    if body.get("coreRuntime") != expected:
+        return "superseded"
+    if previous:
+        body["coreRuntime"] = previous
+    else:
+        body.pop("coreRuntime", None)
+    _replace_runtime_json(path, body)
+    return "restored"
+
+
+def _replace_runtime_json(path: Path, body: dict) -> None:
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
     try:
         with open(tmp, "w") as f:
@@ -756,7 +790,6 @@ def persist_desktop_runtime_selection(runtime: str, repo_root: Optional[Path] = 
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    return "updated"
 
 
 def resolve_core_runtime(repo_root: Optional[Path] = None) -> str:

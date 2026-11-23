@@ -717,6 +717,10 @@ CTL21_NO_LOCK=1 CTL21_OUT="$TMP/ws21b.calls" SUTANDO_APP_SUPPORT="$APP21" GR_STA
 [ "$rc21b" = 13 ] && [ ! -s "$TMP/ws21b.calls" ] && grep -q "refused (ctl-no-lock)" "$TMP/ws21b.out" \
   && say ok "a ctl without the launch lock: exit 13, neither the ctl nor start-cli ran" \
   || say FAIL "no-lock ctl: rc=$rc21b calls='$(cat "$TMP/ws21b.calls")'"
+# Nothing restarted, so the orchestrator's lock must not defer the next request for 15 minutes.
+[ ! -e "$WS21b/state/locks/graceful-restart.lock" ] && [ -d "$WS21/state/locks/graceful-restart.lock" ] \
+  && say ok "the refused run released its restart lock; the restarted one kept it, as a start-cli restart does" \
+  || say FAIL "restart lock: refused run left=$([ -e "$WS21b/state/locks/graceful-restart.lock" ] && echo yes || echo no) restarted run kept=$([ -d "$WS21/state/locks/graceful-restart.lock" ] && echo yes || echo no)"
 
 if [ "$fails" = 0 ]; then
   echo "ALL PASS"
