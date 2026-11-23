@@ -218,9 +218,25 @@ class Rules(unittest.TestCase):
             out = subprocess.run(cli + ["settled", "sonnet[1m]", "--settings", str(f), "--baseline", base],
                                  input=two + "\n", capture_output=True, text=True)
             self.assertEqual(out.stdout.strip(), "1", out.stderr)
+            # In process, as the command line runs it.
+            save("sonnet", 6_000_000_000)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                with unittest.mock.patch.object(sys, "stdin", io.StringIO(real + "\n")):
+                    self.assertEqual(rules.main(["baseline", "sonnet[1m]", "--settings", str(f)]), 0)
+                base = out.getvalue().strip()
+                save("sonnet[1m]", 7_000_000_000)
+                with unittest.mock.patch.object(sys, "stdin", io.StringIO(two + "\n")):
+                    self.assertEqual(rules.main(["settled", "sonnet[1m]", "--settings", str(f), "--baseline", base]), 0)
+            self.assertEqual(out.getvalue().split()[-1], "1")
             for bad in ("not json", "[1]", json.dumps({"model": 5})):
                 f.write_text(bad)
                 self.assertEqual(rules.saved_setting(f), "", bad)
+            # A missing file has a mark of its own, so its first save is fresh.
+            missing = Path(d) / "absent.json"
+            self.assertTrue(rules.settings_mark(missing).startswith("absent."))
+        self.assertEqual(rules.family_count("sonnet[1m]", two + "\nSet model to Sonnet 5.5 (200k context)"), 3,
+                         "family_count, kept for the claude-local launcher, counts every size")
 
     def test_the_shell_scripts_get_the_same_patterns_from_the_command_line(self):
         def run(*argv):
