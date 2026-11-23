@@ -687,6 +687,37 @@ sleep 0.3; kill -TERM "$gr20e" 2>/dev/null; wait "$gr20e" 2>/dev/null; rc20e=$?
   && say ok "TERM 0.3s in -> exit 143, no 'command not found'" \
   || say FAIL "early TERM -> exit $rc20e: $(grep -i 'not found' "$TMP/ws20e.out" | head -1)"
 
+echo "21. in the desktop bundle the restart is the app's ctl, recorded; a ctl with no launch lock is refused"
+# The bundle layout (<app>/engine/<checkout>) is what makes core_restart pick the ctl over start-cli.
+APP21="$TMP/app21"; B21="$APP21/engine/sutando"; mkdir -p "$B21"
+ln -s "$REPO/src" "$B21/src"; ln -s "$REPO/scripts" "$B21/scripts"
+cat > "$APP21/engine/sutando-ctl.sh" <<'CTL'
+#!/bin/bash
+case "$1" in
+  capabilities) [ -n "${CTL21_NO_LOCK:-}" ] || echo launch-lock ;;
+  restart-core) echo restart-core >> "$CTL21_OUT" ;;
+esac
+CTL
+stub21="$TMP/stub21-start-cli.sh"; printf '#!/bin/bash\necho start-cli >> "$CTL21_OUT"\n' > "$stub21"; chmod +x "$stub21"
+WS21="$TMP/ws21"; mkws "$WS21"
+CTL21_OUT="$TMP/ws21.calls" SUTANDO_APP_SUPPORT="$APP21" GR_START_CLI="$stub21" GR_WS="$WS21" GR_SYNC_CMD="true" \
+  GR_POLL_S=1 bash "$B21/src/agent/graceful-restart.sh" > "$TMP/ws21.out" 2>&1; rc21=$?
+calls21="$(tr '\n' ' ' < "$TMP/ws21.calls" 2>/dev/null)"
+phases21="$(python3 -c 'import json,sys
+rows=[json.loads(l) for l in open(sys.argv[1])]
+print(" ".join(r["phase"]+":"+r["caller"]+":"+r.get("outcome","-") for r in rows if r.get("event")=="ctl_restart"))' \
+  "$WS21/state/recovery/audit.jsonl" 2>/dev/null)"
+[ "$rc21" = 0 ] && [ "$calls21" = "restart-core " ] \
+  && [ "$phases21" = "intent:graceful-restart:- outcome:graceful-restart:done" ] \
+  && say ok "bundle restart ran the ctl's restart-core, not start-cli, with an intent and an outcome line" \
+  || say FAIL "bundle restart: rc=$rc21 calls='$calls21' audit='$phases21'"
+WS21b="$TMP/ws21b"; mkws "$WS21b"; : > "$TMP/ws21b.calls"
+CTL21_NO_LOCK=1 CTL21_OUT="$TMP/ws21b.calls" SUTANDO_APP_SUPPORT="$APP21" GR_START_CLI="$stub21" GR_WS="$WS21b" \
+  GR_SYNC_CMD="true" GR_POLL_S=1 bash "$B21/src/agent/graceful-restart.sh" > "$TMP/ws21b.out" 2>&1; rc21b=$?
+[ "$rc21b" = 13 ] && [ ! -s "$TMP/ws21b.calls" ] && grep -q "refused (ctl-no-lock)" "$TMP/ws21b.out" \
+  && say ok "a ctl without the launch lock: exit 13, neither the ctl nor start-cli ran" \
+  || say FAIL "no-lock ctl: rc=$rc21b calls='$(cat "$TMP/ws21b.calls")'"
+
 if [ "$fails" = 0 ]; then
   echo "ALL PASS"
 else

@@ -83,6 +83,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`core_limit_hold.py`** — Hold the core's relaunch while its provider refuses it for a limit.
 - **`core_lineage.py`** — Which conversation this host's core is having, and which it had before.
 - **`core_recovery_state.py`** — The core's recovery record (`core_recovery.v1`): one derivation, one writer.
+- **`core_restart.py`** — The one route every engine caller takes to restart the core.
 - **`core_restart_intent.py`** — core_restart_intent.py — the owner's easy-restart intent file (sonichi#2401).
 - **`core_runtime_record.py`** — Atomic publication of a confirmed core launch observation shared by CLI adapters.
 - **`correlation_log.py`** — One writer for task-correlation records: <workspace>/state/correlation.jsonl.

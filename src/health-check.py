@@ -14792,21 +14792,30 @@ def _core_limit_hold(now: float) -> "dict | None":
         return None
 
 
-def _default_core_restart() -> bool:
+def _default_core_restart(run=None) -> bool:
     """Restart the core out-of-process, setting no model: recovery must not change
-    which model the core runs on. True if the restart command exited 0."""
+    which model the core runs on. Under the desktop app it is the app's ctl
+    (core_restart), never start-cli. True if the restart command exited 0."""
     script = REPO_DIR / "src" / "agent" / "start-cli.sh"
     if not script.exists():
         return False
-    env = _resolve_launch_env()  # pragma: no cover — real-subprocess restart path (integration, not unit)
+    env = _resolve_launch_env()
+    run = run or subprocess.run
     try:
-        proc = subprocess.run(
-            ["/bin/bash", str(script), "--restart"],
-            env=env, capture_output=True, text=True, timeout=120,
-        )
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import core_restart
+        argv, via = core_restart.route(REPO_DIR, env, run, workspace=WORKSPACE_DIR, caller=RECOVER_CALLER)
+        if argv is None:
+            print(f"  recover-core: refused ({via}): restart the core from the desktop app", file=sys.stderr)
+            return False
+        proc = run(argv, env=env, capture_output=True, text=True, timeout=120)
         return proc.returncode == 0
     except Exception:
         return False
+
+
+#: The caller name a ctl restart from the watchdog records (core_restart's intent/outcome lines).
+RECOVER_CALLER = "health-check --recover-core"
 
 
 def _recovery_metric(event: str, **properties) -> None:

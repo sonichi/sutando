@@ -14,11 +14,12 @@ a click supplies is an id the card itself offered:
                         alive gets Escape and `continue` once idle, and its pool's --retry-cmd only
                         if still blocked after VERIFY_S; else a refused turn gets `continue` once idle
     switch_model:<m>    scripts/switch-model.sh <m> --confirm on that session (alias from the list)
-    switch_runtime:<r>  core only: src/agent/start-cli.sh --runtime <r> --restart, detached
-    restart_core        core only, detached (detached_action): on a desktop install the app's
-                        sutando-ctl.sh restart-core (its own launcher), else src/agent/start-cli.sh
-                        --restart; it closes the tmux session or window this monitor's core runs in,
-                        so it never runs as its child
+    switch_runtime:<r>  core only: restart_core's route with runtime <r> (on the ctl, <r> becomes
+                        the desktop's selection first), detached
+    restart_core        core only, detached (detached_action), through core_restart: on a desktop
+                        install the app's sutando-ctl.sh restart-core (its own launcher, under its
+                        launch lock), else src/agent/start-cli.sh --restart; it closes the tmux
+                        session or window this monitor's core runs in, so it never runs as its child
     escape_prompt       one Escape key into the pane
     buy_credits, add_account, switch_account:<id>
                         never run here: each needs a confirmed, re-authenticated step (P1)
@@ -53,6 +54,7 @@ from hitl.schema import STATUS_IN_PROGRESS, STATUS_PENDING  # noqa: E402
 from workspace_default import status_read_path
 import detached_action
 import recovery_gate
+import core_restart
 import runtime_models
 import sutando_config
 
@@ -322,13 +324,11 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
         if target.seat:
             why = "That acts on the core, not on this worker; nothing was done."
             return "refused", why, why, {}
-        if verb == recovery.SWITCH_RUNTIME:
-            argv, via = ["bash", str(REPO / "src" / "agent" / "start-cli.sh"), "--runtime", arg, "--restart"], None
-        else:
-            argv, via = _restart_core_argv(env, runner)
-            if argv is None:
-                why = NO_LOCK_LINE if via == VIA_NO_LOCK else NO_CTL_LINE
-                return "refused", why, why, {VIA_FIELD: via}
+        runtime = arg if verb == recovery.SWITCH_RUNTIME else None
+        argv, via = _restart_core_argv(env, runner, ws, req, runtime)
+        if argv is None:
+            why = NO_LOCK_LINE if via == VIA_NO_LOCK else NO_CTL_LINE
+            return "refused", why, why, {VIA_FIELD: via}
         # The launcher's --restart closes the tmux session this monitor runs in: it runs detached,
         # and the monitor that comes back with the core reads its outcome (verify_step).
         key = _detached_key(req)
@@ -339,13 +339,14 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
         check = {"detached": key, "what": f"the core under {arg}" if arg else "the core"}
         if via:
             check[VIA_FIELD] = via
-        if verb == recovery.SWITCH_RUNTIME:
-            return ("done", None, f"Switching the core to {arg}; checking that it is working again.",
-                    {"state": "starting", "runtime": arg, VERIFY_FIELD: check})
-        line = "Restarting the core; checking that it is working again."
+        line = (f"Switching the core to {arg}; checking that it is working again." if runtime
+                else "Restarting the core; checking that it is working again.")
         if via == VIA_FALLBACK:
             line = f"{line} {STANDALONE_LINE}"
-        return ("done", None, line, {"state": "starting", VERIFY_FIELD: check, VIA_FIELD: via})
+        fields = {"state": "starting", VERIFY_FIELD: check, VIA_FIELD: via}
+        if runtime:
+            fields["runtime"] = runtime
+        return ("done", None, line, fields)
     if verb == recovery.REFRESH_OPTIONS:
         # The owner asked: the pane's own menu is read again, and a core idle at its limit has its
         # model picker opened, read and closed once; the card is replaced with what the screen shows.
@@ -375,9 +376,8 @@ NEW_CARD = "If it is still blocked, a new card follows with what you can do now.
 spawn_detached = subprocess.Popen
 #: Which command restart_core ran, kept on its audit line only (the receipt is unchanged).
 VIA_FIELD = "via"
-VIA_CTL, VIA_START_CLI, VIA_FALLBACK = "ctl", "start-cli", "start-cli-fallback"
-#: The app's bundle without its controller, or with one that takes no launch lock: refused, nothing run.
-VIA_NO_CTL, VIA_NO_LOCK = "ctl-missing", "ctl-no-lock"
+VIA_CTL, VIA_START_CLI, VIA_FALLBACK = core_restart.VIA_CTL, core_restart.VIA_START_CLI, core_restart.VIA_FALLBACK
+VIA_NO_CTL, VIA_NO_LOCK = core_restart.VIA_NO_CTL, core_restart.VIA_NO_LOCK
 NO_CTL_LINE = ("This core runs inside the desktop app, and the app's restart control is missing here, "
                "so nothing was restarted. Restart the core from the desktop app.")
 NO_LOCK_LINE = ("This core runs inside the desktop app, and this version of the app cannot restart it "
@@ -386,43 +386,19 @@ NO_LOCK_LINE = ("This core runs inside the desktop app, and this version of the 
 VIA_REASON_FIELD = "via_reason"
 NOT_BUNDLE = "not-bundle"
 STANDALONE_LINE = "This checkout is not the desktop app's own copy, so the standalone restart was used."
-#: The ctl's side-effect-free capability list; `launch-lock` means restart-core takes the app's lock.
-CTL_CAPABILITIES_TIMEOUT_S = 5
-LAUNCH_LOCK_CAPABILITY = "launch-lock"
-#: The desktop app's control script, installed beside the engine checkout it drives.
-DESKTOP_CTL = "sutando-ctl.sh"
-#: Its restart-core exit when another launcher run held the launch lock: nothing was killed or started.
-CTL_LAUNCH_LOCK_BUSY = 12
+CTL_CAPABILITIES_TIMEOUT_S = core_restart.CTL_CAPABILITIES_TIMEOUT_S
+CTL_LAUNCH_LOCK_BUSY = core_restart.CTL_LAUNCH_LOCK_BUSY
 BUSY_LINE = ("The core is already being restarted, so nothing was done this time. "
              "Try again in a minute if it is still blocked.")
+#: The caller name a card-driven ctl restart records beside its hitl_id and revision.
+CARD_CALLER = "recovery-card"
 
 
-def _restart_core_argv(env: Dict, runner: Runner):
-    """(argv, via) for restart_core; argv None when nothing may run. In the app's own bundle its
-    restart-core keeps the gateway's session, and start-cli --restart would kill that session."""
-    start_cli = ["bash", str(REPO / "src" / "agent" / "start-cli.sh"), "--restart"]
-    app_support = sutando_config.desktop_app_support(REPO)
-    if app_support is None:
-        return start_cli, VIA_START_CLI
-    repo = REPO.resolve()
-    if repo.parent.name != "engine" or repo.parent.parent != app_support.resolve():
-        return start_cli, VIA_FALLBACK  # a standalone clone the app's controller does not drive
-    ctl = REPO.parent / DESKTOP_CTL
-    if not ctl.is_file():
-        return None, VIA_NO_CTL
-    env["SUTANDO_APP_SUPPORT"] = str(app_support)
-    if not _ctl_has_launch_lock(ctl, env, runner):
-        return None, VIA_NO_LOCK  # an app older than the lock: its restart can overlap the launcher
-    return ["bash", str(ctl), "restart-core"], VIA_CTL
-
-
-def _ctl_has_launch_lock(ctl: Path, env: Dict, runner: Runner) -> bool:
-    try:
-        run = runner(["bash", str(ctl), "capabilities"], capture_output=True, text=True,
-                     timeout=CTL_CAPABILITIES_TIMEOUT_S, env=env, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return run.returncode == 0 and LAUNCH_LOCK_CAPABILITY in (run.stdout or "").split()
+def _restart_core_argv(env: Dict, runner: Runner, ws: Path, req, runtime: Optional[str] = None):
+    """(argv, via) for restart_core or switch_runtime, from the one restart route (core_restart)."""
+    return core_restart.route(REPO, env, runner, workspace=ws, caller=CARD_CALLER, runtime=runtime,
+                              hitl_id=req.id if req is not None else "",
+                              revision=req.revision if req is not None else None)
 
 
 def _detached_key(req) -> str:

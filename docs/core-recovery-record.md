@@ -153,8 +153,18 @@ restart never overlaps the app's own launcher. A standalone clone, even with
 `$SUTANDO_APP_SUPPORT` exported, and any install without the app run
 `src/agent/start-cli.sh --restart`; with an app dir configured the card says the standalone
 restart was used and the audit adds `via_reason: not-bundle`. The audit line's `via` says which:
-`ctl`, `ctl-missing`, `ctl-no-lock`, `start-cli` or `start-cli-fallback`. Switch runtime always
-runs `start-cli.sh --runtime`.
+`ctl`, `ctl-missing`, `ctl-no-lock`, `start-cli` or `start-cli-fallback`. Switch runtime takes
+the same route: through the ctl it first writes the runtime as the desktop's selection (the app's
+launcher reads it) and puts the previous one back if the ctl does not exit 0; elsewhere it runs
+`start-cli.sh --runtime <r> --restart`.
+
+That route is `src/core_restart.py`, and every engine core restart takes it: these cards, the
+paused core's retry (`core_limit_hold` relaunch), `src/agent/graceful-restart.sh` (exit 13 when
+refused) and `health-check.py --recover-core`. `tests/core-restart-callers.test.py` fails on any
+other `start-cli.sh --restart` caller. A ctl restart runs inside `core_restart.py ctl`, which appends
+two `state/recovery/audit.jsonl` lines, `event: ctl_restart` with `phase: intent` before the ctl
+and `phase: outcome` (`done` or `failed`, with the ctl's `rc`) after it; each carries `caller`,
+and a card's restart adds its `hitl_id` and `revision`.
 When the ctl exits 12 (another launcher run held the app's launch lock; nothing was killed or
 started), the receipt is `failed`, the card says the core is already being restarted and to try
 again shortly, any hold it lifted returns, and nothing is retried automatically.

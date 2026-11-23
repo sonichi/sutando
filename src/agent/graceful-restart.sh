@@ -1,7 +1,7 @@
 #!/bin/bash
 # Graceful core-restart orchestrator. Flow, flags and rationale live in
 # notes/graceful-restart-design.md. Exit: 0 ok · 3 prep failed · 4 deferred ·
-# 5 dry-run (nothing killed or restarted).
+# 5 dry-run (nothing killed or restarted) · 13 refused in the desktop bundle (core_restart).
 set -euo pipefail
 
 DRY_RUN=0
@@ -199,7 +199,11 @@ do_restart() {
   # The `+` guard keeps an empty array valid under `set -u` on bash 3.2.
   # GR_START_CLI is a test seam: dry-run never reaches this line.
   export GR_RID="$RID"   # lets the launcher release THIS run's lock if it aborts
-  exec bash "${GR_START_CLI:-$REPO/src/agent/start-cli.sh}" --restart ${RESTART_ARGS[@]+"${RESTART_ARGS[@]}"}
+  # core_restart: the app's ctl under its launch lock in the desktop bundle, else start-cli.sh --restart.
+  local py
+  py="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null)" && [ -x "$py" ] || py=python3
+  exec "$py" "$REPO/src/core_restart.py" restart --workspace "$WS" --caller graceful-restart --repo "$REPO" \
+    --start-cli "${GR_START_CLI:-$REPO/src/agent/start-cli.sh}" -- ${RESTART_ARGS[@]+"${RESTART_ARGS[@]}"}
 }
 
 # ---- Phase 1: quiet gate -------------------------------------------------

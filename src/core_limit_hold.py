@@ -83,6 +83,9 @@ PANE_SOURCE = "cli-pane"
 # The old limit screen outlives an owner's action by a restart's length; it must not re-arm.
 REARM_GRACE_S = 180
 RELAUNCH_TIMEOUT_S = 300
+#: The caller name a ctl restart from here records (core_restart's intent/outcome lines).
+RELAUNCH_CALLER = "core_limit_hold.relaunch"
+_REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 # A live seat's monitor sees a reply within seconds; one older than this waited out a dead monitor.
 REPLY_TTL_S = 10 * 60
 AUDIT_LOG = "core-limit-actions.jsonl"
@@ -979,10 +982,12 @@ def _relaunch(workspace: Path, launcher: Optional[str], model: Optional[str], sw
               run, command: Optional[list]) -> bool:
     import subprocess
 
+    env = dict(os.environ)
+
     def rc(cmd):
         try:
             return run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                       timeout=RELAUNCH_TIMEOUT_S).returncode
+                       timeout=RELAUNCH_TIMEOUT_S, env=env).returncode
         except (OSError, subprocess.SubprocessError):
             return None
     if command:
@@ -990,7 +995,14 @@ def _relaunch(workspace: Path, launcher: Optional[str], model: Optional[str], sw
         if not ok:
             _tell_owner(workspace, 'I could not restart the worker, so it is still paused. Send "retry now" to try again.')
         return ok
-    first = rc(["bash", launcher, "--restart"])
+    import core_restart
+    restart, _via = core_restart.route(_REPO, env, run, workspace=workspace, caller=RELAUNCH_CALLER,
+                                       start_cli=launcher)
+    if restart is None:
+        _tell_owner(workspace, "This core runs inside the desktop app, which has to restart it, so it is still "
+                    "paused. Restart the core from the desktop app.")
+        return False
+    first = rc(restart)
     ok = first == 0 if not model else first in (0, HOLD_EXIT)
     if ok and model:
         ok = bool(switch_entry) and rc(["bash", switch_entry, model]) == 0

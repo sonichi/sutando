@@ -1415,7 +1415,7 @@ class NothingPrintedLeaks(Base):
                     self.assertNotIn("/Users/someone", text)
                 [line] = self.audit()
                 keys = sorted(self.AUDIT_KEYS + ["path"]) if seat else self.AUDIT_KEYS
-                if aid == "restart_core":
+                if aid in ("restart_core", "switch_runtime:codex"):
                     keys = sorted(keys + ["via"])
                 self.assertEqual(sorted(line), keys,
                                  "the tap audit holds ids, outcomes, the retry's path and the restart's command only")
@@ -1700,7 +1700,12 @@ class DesktopRestart(Base):
         [(probe, probe_kw)] = run.calls
         self.assertEqual(probe, ["bash", str(app / "engine" / "sutando-ctl.sh"), "capabilities"])
         self.assertEqual(probe_kw["timeout"], RA.CTL_CAPABILITIES_TIMEOUT_S)
-        self.assertEqual(self.spawned.command(), ["bash", str(app / "engine" / "sutando-ctl.sh"), "restart-core"])
+        cmd = self.spawned.command()
+        self.assertEqual(cmd[1:4], [str(repo / "src" / "core_restart.py"), "ctl", "--ctl"])
+        self.assertEqual(cmd[4], str(app / "engine" / "sutando-ctl.sh"))
+        self.assertEqual(cmd[cmd.index("--caller") + 1], RA.CARD_CALLER)
+        self.assertIn("--hitl-id", cmd, "a card's restart records its hitl_id and revision")
+        self.assertIn("--revision", cmd)
         _, kw = self.spawned.calls[-1]
         self.assertEqual(kw["env"]["SUTANDO_APP_SUPPORT"], str(app))
         self.assertNotIn("SUTANDO_ENGINE_LAUNCH_LOCK_HELD", kw["env"], "a lock marker is never inherited")
@@ -1813,7 +1818,7 @@ class DesktopRestart(Base):
         req = self.card()
         self.click(req, "retry_now")
         [receipt] = self.run_pending(Run(out=LOCKING_CTL), now=now)
-        self.assertEqual((receipt["outcome"], self.spawned.command()[-1]), ("done", "restart-core"))
+        self.assertEqual((receipt["outcome"], self.spawned.command()[2]), ("done", "ctl"))
         self.answer(detached_action.FAILED, rc=RA.CTL_LAUNCH_LOCK_BUSY, reason="exit")
         self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=True, now=now + 5), [req.id])
         card = self.mgr.get(req.id)
@@ -1835,14 +1840,38 @@ class DesktopRestart(Base):
         RA.verify_step(self.mgr, self.ws, CORE, blocked=True)
         self.assertIn("did not complete (exit 12)", self.mgr.get(req.id).message)
 
-    def test_a_runtime_switch_on_a_desktop_install_stays_start_cli(self):
-        _, repo = self._desktop()
+    def test_a_runtime_switch_on_a_desktop_install_goes_through_the_ctl(self):
+        app, repo = self._desktop()
+        req = self.card(runtime="codex")
+        self.click(req, "switch_runtime:claude")
+        [receipt] = self.run_pending(Run(out=LOCKING_CTL))
+        cmd = self.spawned.command()
+        self.assertEqual(cmd[1:5], [str(repo / "src" / "core_restart.py"), "ctl", "--ctl",
+                                    str(app / "engine" / "sutando-ctl.sh")])
+        self.assertEqual(cmd[cmd.index("--runtime") + 1], "claude")
+        self.assertEqual((cmd[cmd.index("--hitl-id") + 1], cmd[cmd.index("--revision") + 1]),
+                         (req.id, str(self.mgr.get(req.id).revision - 1)))
+        self.assertEqual(receipt["outcome"], "done")
+        self.assertEqual(receipt["recovery"]["runtime"], "claude")
+        self.assertIn("Switching the core to claude", self.mgr.get(req.id).message)
+        self.assertEqual(self.audit()[-1]["via"], RA.VIA_CTL)
+
+    def test_a_runtime_switch_on_the_bundle_without_its_ctl_is_refused(self):
+        self._desktop(ctl=False)
+        req = self.card(runtime="codex")
+        self.click(req, "switch_runtime:claude")
+        [receipt] = self.run_pending(Run())
+        self.assertEqual(self.spawned.calls, [], "start-cli --runtime would kill the gateway's session")
+        self.assertEqual(receipt["outcome"], "refused")
+        self.assertEqual(self.audit()[-1]["via"], RA.VIA_NO_CTL)
+
+    def test_a_runtime_switch_elsewhere_stays_start_cli(self):
         req = self.card(runtime="codex")
         self.click(req, "switch_runtime:claude")
         self.run_pending(Run())
         self.assertEqual(self.spawned.command(),
-                         ["bash", str(repo / "src" / "agent" / "start-cli.sh"), "--runtime", "claude", "--restart"])
-        self.assertNotIn("via", self.audit()[-1])
+                         ["bash", str(SRC / "agent" / "start-cli.sh"), "--runtime", "claude", "--restart"])
+        self.assertEqual(self.audit()[-1]["via"], RA.VIA_START_CLI)
 
 
 class WireReceipt(unittest.TestCase):
