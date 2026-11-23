@@ -49,7 +49,7 @@ import uuid
 from pathlib import Path
 
 from ... import (acp_host, card_desk, connector_cards, held_start, local_task_protocol, mcp_auth, model_switch,
-                 result_labels, result_publish)
+                 quota_notice, result_labels, result_publish)
 from ...bounded_file_read import read_regular_bytes
 from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore, quoted, trigger_of  # noqa: F401
 from ...acp_client import AcpClient as _SharedClient
@@ -62,6 +62,7 @@ from ...task_io import (COLLABORATOR, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, 
                         record_done, release_lock, root_path, stop_requested, turn_policy)
 
 NAME = "Antigravity"
+LIMITED_NO_SEND = "[no-send] Antigravity is at its usage limit; the owner was sent the account card\n"
 DEFAULT_ACP_COMMAND = "agy acp"
 NO_REPLY = "NO_REPLY"
 HELD_WAIT_S = held_start.WAIT_S
@@ -587,6 +588,9 @@ class Connector:
             args.state, getattr(args, "bridge_state", None), NAME, getattr(args, "agent_id", None) or "", publish,
             quoted, log)
         self.agy_pid = None   # the owner turn's agy process, whose own log names the account it used
+        # Out of quota: the account card, unasked, in the owner's DM, once per limit (quota_notice).
+        self.quota = quota_notice.QuotaNotice(args.state, getattr(args, "bridge_state", None), NAME,
+                                              self.accounts.quota_card, self.accounts.using_words, log)
         self.desk = card_desk.Desk(self.root, card_desk.led(publish, self.models.unsaid, quoted), quoted,
                                    [self.models, self.accounts])
 
@@ -700,16 +704,15 @@ class Connector:
             log("account not read:", type(e).__name__)
             return ""
 
-    def quota_card(self, path, status, text, detail):
-        """agy ran out of quota on this turn: the account card says so in the owner's DM (agy_account)."""
-        agent_card, _ = connector_cards._core()
+    def quota_hit(self, text, detail) -> str:
+        """agy is out of quota: tell the owner once (quota_notice), with the reset time when agy said one."""
         try:
-            with open(path, encoding="utf-8") as f:
-                sent, _ = agent_card.reply_words(f.read())
-            return self.accounts.quota_hit(sent, status, text, detail)
-        except (OSError, ValueError) as e:
-            log("quota card not shown:", type(e).__name__)
-            return ""
+            done = self.quota.hit(quota_notice.reset_from_text("%s %s" % (detail or "", text or "")))
+        except Exception as e:  # noqa: BLE001 - a notice that cannot be sent never stops task service
+            done = "quota-failed (%s: %s)" % (type(e).__name__, str(e)[:120])
+        if done:
+            log("quota:", done)
+        return done
 
     def account_task(self, task_id, headers, path, status_kind, result_file):
         """A message that is the account card's (agy_account), else None: the owner's words asking for the card
@@ -772,6 +775,7 @@ class Connector:
         path = os.path.join(self.args.inbox, name)
         result_file = os.path.join(self.args.results, name)
         headers, message, operator_lines = parse_task(path)
+        self.quota.remember(path=path)     # the owner's DM, where a quota notice goes
         kind, turn_kind = turn_for(headers)
         if turn_kind is None:
             log("refused (non-owner) ->", task_id, headers["access_tier"])
@@ -807,14 +811,17 @@ class Connector:
         # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
         told = self.models.tell(turn.live, turn.model, headers.get("channel_id")) if kind == OWNER else ""
         asked = self.desk.marked(headers.get("access_tier"), path, status, text, result_file)
-        quota = "" if asked or status == "completed" and not agy_account.QUOTA_RE.search(text or "") else \
-            self.quota_card(path, status, text, detail)
+        # Out of quota: the owner is told once, by the account card; the card is the notice, so the room gets
+        # no error line while agy is out (or the limit's own words when no card could be sent).
+        limited = not asked and agy_account.quota_error(status, text, detail)
+        quota = self.quota_hit(text, detail) if limited else (self.quota.cleared() if status == "completed" else "")
         unsaid = "" if asked else quoted(self.models.unsaid()).strip()
         body = self.answer_body(headers, status, text, detail, turn) + (unsaid and unsaid + "\n")
         if owner_turn and switched and not body.startswith("[no-send]"):
             body = quoted(switched).strip() + "\n" + body
-        if quota:
-            body = body.rstrip("\n") + "\n\n" + quoted(quota).strip() + "\n"
+        if limited:
+            body = LIMITED_NO_SEND if self.quota.limited() else quoted(quota_notice.words(
+                NAME, quota_notice.reset_from_text("%s %s" % (detail or "", text or "")), "")) + "\n"
         reason = ""
         if self.launch is not None:
             launches = LaunchLog(self.args.session_store)
@@ -833,7 +840,8 @@ class Connector:
                 "tier": headers["access_tier"], "policy": kind, "isolated": not owner_turn, "turn_s": round(time.time() - t0, 3),
                 "permissions": turn.decisions, "updates": dict(turn.updates), "answer_chars": len(text or ""),
                 "sspace_tools_down": reason,
-                "model": turn.model, **({"model_switch": told} if told else {}), **({"card": asked} if asked else {})}
+                "model": turn.model, **({"model_switch": told} if told else {}), **({"card": asked} if asked else {}),
+                **({"quota": quota} if quota else {})}
 
     def pending_tasks(self, seen):
         now = time.time()
@@ -852,6 +860,8 @@ class Connector:
         while not stop_requested():
             with contextlib.suppress(Exception):   # a card's ledger entry never stops task service
                 connector_cards.absorb(self.args.bridge_state, self.root)
+            with contextlib.suppress(Exception):   # a quota card the bridge dropped is queued again
+                self.quota.tick()
             names = self.pending_tasks(seen)
             if not names:
                 if self.args.once and done >= self.args.once:

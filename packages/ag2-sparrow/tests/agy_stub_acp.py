@@ -139,6 +139,13 @@ def prompt(rid, params):
         send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message":
               "RESOURCE_EXHAUSTED: Individual quota reached. Try again later."}})
         return
+    if "STUB:LIMIT429" in text:
+        send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message":
+              "HTTP 429 Too Many Requests: quota for this project is used up; retry in 2h 10m."}})
+        return
+    if "STUB:FAIL" in text:
+        send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": "internal error: stream reset"}})
+        return
     cwd = sessions().get(sid) or os.getcwd()
     told = re.search(r"write the result to (results/\S+?\.txt)", text)
     if told:

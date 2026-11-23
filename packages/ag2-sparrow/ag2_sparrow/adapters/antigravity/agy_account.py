@@ -17,15 +17,15 @@ message, so neither a sign-in code nor a key may travel that way.
 - 停用 API key deletes this agent's own Keychain item (gemini_key.clear_key).
 - A sign-in code, a landing address with one, a Gemini key, or the bridge's redaction marker for one, sent
   in chat is never passed to agy (`carries_secret`): the owner is asked to delete the message.
-- When a turn fails on agy's quota (RESOURCE_EXHAUSTED, "Individual quota reached"), `quota_hit` posts the
-  card on its own, at most once per QUOTA_EVERY_S.
+- When a turn fails on agy's quota (RESOURCE_EXHAUSTED, "Individual quota reached", a 429), the connector
+  posts the quota card (`quota_card`, English, with the account controls marker) in the owner's DM on its
+  own, once per limit (quota_notice).
 """
 from __future__ import annotations
 
 import json
 import os
 import re
-import time
 
 from ... import account_switch, card_desk, connector_cards
 from . import gemini_key
@@ -34,7 +34,10 @@ SWITCH, KEY, UNKEY = "switch", "key", "unkey"
 LABELS = {SWITCH: "切换账号", KEY: "用 API key", UNKEY: "停用 API key"}
 SHARED = "注意：这台 Mac 上所有 Antigravity agent 共用一个 Google 登录，换了以后它们都会用新账号。"
 STATE_NAME = "agy-account.json"
-QUOTA_EVERY_S = 1800.0
+# The quota card's words, English only: its buttons act as the menu's, and the desktop draws the controls below.
+QUOTA_LABELS = {SWITCH: "Switch account", KEY: "Use an API key"}
+QUOTA_BELOW = "Switch this agent's account or API key below."   # account_switch.BELOW, where #6685 has it
+QUOTA_TEXT_MAX = 400     # a completed turn's text counts as agy's quota error only when it is this short
 # Words that ask for the card, on their own (short messages only, so a long request is the model's).
 ASK_RE = re.compile(r"^\s*(?:/account|(?:请|帮我|我要|我想)?(?:切换|换|更换)(?:一下|个)?账号|switch(?: the)? accounts?|"
                     r"change(?: the)? accounts?|(?:改)?用\s*api\s*key|use (?:an |a |the )?(?:gemini )?api key)"
@@ -44,10 +47,21 @@ REDACTED_KEY = "[REDACTED-Google API Key]"
 KEY_IN_CHAT = ("这条消息里像是有授权码或 API key，我没有转给 Antigravity，也没有存。请把它从对话里删掉；授权码请贴在 "
                "设置 → Connections → 这个 agent 的 Antigravity 一行「Switch account」打开的登录终端里，key 请填在那一行的 "
                "API key 框里。")
-QUOTA_RE = re.compile(r"RESOURCE_EXHAUSTED|Individual quota reached|quota (?:exceeded|exhausted|reached)", re.I)
+QUOTA_RE = re.compile(r"RESOURCE_EXHAUSTED|Individual quota reached|quota (?:exceeded|exhausted|reached)"
+                      r"|exceeded your (?:current )?quota|\b429\b.{0,40}\b(?:Too Many Requests|quota|rate.?limit)"
+                      r"|(?:status|code|HTTP)\W{0,3}429\b", re.I)
 _SIGN_IN_CODE = re.compile(r"(?<![A-Za-z0-9])4/[0-9A-Za-z_\-]{20,}")
 _CODE_URL = re.compile(r"https?://\S*[?&]code=[^&\s]{8,}")
 _AUTH_LINE = re.compile(r"applyAuthResult: email=([^,\s]+@[^,\s]+)")
+
+
+def quota_error(status, text, detail) -> bool:
+    """Whether a turn ended on agy's quota: a failed turn whose error says so, or a completed one whose whole
+    (short) answer is that error, as agy has answered it."""
+    if status == "completed":
+        said = (text or "").strip()
+        return 0 < len(said) <= QUOTA_TEXT_MAX and bool(QUOTA_RE.search(said))
+    return status in ("failed", "refused") and bool(QUOTA_RE.search("%s %s" % (text or "", detail or "")))
 
 
 def asks_for_card(text) -> bool:
@@ -214,19 +228,21 @@ class AgyAccount:
         self.keep(account=who)
         return "（已切到 %s 账号。）" % who if before else ""
 
-    # ── 额度用完 ──
-    def quota_hit(self, sent, status, text, detail, now=None) -> str:
-        """The turn failed on agy's quota: post the card in the owner's DM (at most once per QUOTA_EVERY_S).
-        A line for the answer when the turn was elsewhere, '' otherwise."""
-        if not QUOTA_RE.search("%s %s" % (text or "", detail or "")):
-            return ""
+    # ── out of quota (quota_notice posts it) ──
+    def using_words(self) -> str:
+        """The account in use, in English, for the quota card."""
+        if self.keyed():
+            return "I'm using this agent's own Gemini API key."
+        who = str(self.record().get("account") or "")
+        return "I'm using this computer's Google sign-in%s." % (" (%s)" % who if who else "")
+
+    def quota_card(self, text):
+        """The account card for the quota notice, led by `text`: English, with the menu's buttons, and the
+        account_controls marker so the desktop draws this agent's saved keys, sign-in and API key in it."""
         agent_card, _ = connector_cards._core()
-        if agent_card.owner_may_act(sent) is not None:
-            return "Antigravity 这个账号的额度用完了。在和我的私信里说「换账号」可以切换账号或改用 API key。" \
-                if str(sent.get("access_tier") or "") == "owner" else ""
-        now = time.time() if now is None else now
-        if now - float(self.record().get("quota_card_at") or 0) < QUOTA_EVERY_S:
-            return ""
-        if self.post(sent.get("channel_id"), self.menu("Antigravity 这个账号的额度用完了。可以切换账号，或改用 API key。")):
-            self.keep(quota_card_at=now)
-        return ""
+        buttons = [agent_card.button(QUOTA_LABELS[v], "reply", reply=QUOTA_LABELS[v],
+                                     command=agent_card.reply("account", "agent", v)) for v in (SWITCH, KEY)]
+        body, card = agent_card.build(account_switch.CARD, "pending", title="Antigravity account",
+                                      body="Account of %s" % self.name,
+                                      text="%s %s" % (text, getattr(account_switch, "BELOW", QUOTA_BELOW)), buttons=buttons)
+        return body, dict(card, account_controls={"runtime": "antigravity"})

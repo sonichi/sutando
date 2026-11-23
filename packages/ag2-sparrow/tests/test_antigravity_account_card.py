@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Antigravity's account card (adapters/antigravity/agy_account.py) in the owner's DM: 切换账号 and 用 API key
 point to the agent's settings (no code or key is ever taken in chat), 停用 API key removes the key, the turn
-after a switch says which account agy now uses, and a quota error shows the card.
+after a switch says which account agy now uses, and a quota error shows the card in the owner's DM once.
 
 Driven through the connector against tests/agy_stub_acp.py, with the Keychain faked, dummy codes and keys only.
 
@@ -244,21 +244,64 @@ class AccountCardTest(unittest.TestCase):
         self.assertEqual(self.posted("$x"), [], "and no card goes anywhere")
 
     # ── A4 ──
-    def test_a_quota_error_shows_the_card_in_the_dm_once(self):
+    def outbox(self):
+        folder = Path(str(self.w.root) + ".bridge") / "state" / "agent-cards" / "outbox"
+        return [json.loads(p.read_text()) for p in sorted(folder.iterdir())] if folder.is_dir() else []
+
+    def test_a_quota_error_queues_one_account_card_to_the_owner_dm_and_a_second_limit_tick_nothing(self):
         self.dm("task-q1", "STUB:QUOTA hi")
         self.serve()
-        (card,) = self.posted("$q1")
-        self.assertIn("额度用完了", card["text"])
-        self.assertEqual([b["label"] for b in card["buttons"]], ["切换账号", "用 API key"])
+        (queued,) = self.outbox()
+        card = queued["card"]
+        self.assertEqual((queued["room"], card["id"], card["state"]), (DM, account_switch.CARD, "pending"))
+        self.assertEqual(card["account_controls"], {"runtime": "antigravity"})
+        self.assertEqual(card["text"], "Antigravity has reached its usage limit (it does not say when that resets), so "
+                                       "I can't answer until then. Switch to another account or an API key to go on "
+                                       "now. I'm using this computer's Google sign-in. Switch this agent's account or "
+                                       "API key below.")
+        self.assertEqual([b["label"] for b in card["buttons"]], ["Switch account", "Use an API key"])
+        self.assertEqual(self.w.result("task-q1"), gc.LIMITED_NO_SEND, "the card is the notice: no error line")
         self.dm("task-q2", "STUB:QUOTA again")
         self.serve()
-        self.assertEqual(self.posted("$q2"), [], "at most once per QUOTA_EVERY_S")
+        self.assertEqual(len(self.outbox()), 1, "a second limit tick queues nothing")
+        self.assertEqual(len(self.posted("$q1")), 1)
+        self.dm("task-q3", "STUB:LIMIT429 and again", kind="room")
+        self.serve()
+        self.assertEqual((self.outbox(), self.posted("$q3")), ([], []), "nothing more once the card is posted")
+        self.assertEqual(self.w.result("task-q3"), gc.LIMITED_NO_SEND)
 
-    def test_a_quota_error_in_a_room_says_where_to_switch(self):
+    def test_a_turn_that_answers_clears_the_limit_and_a_later_limit_is_a_new_card(self):
+        self.dm("task-q1", "STUB:LIMIT429 hi")
+        self.serve()
+        (first,) = self.posted("$q1")
+        self.assertIn("(resets 2h 10m)", first["text"], "the reset time in agy's own words")
+        self.dm("task-ok", "STUB:TEXT hi")
+        self.serve()
+        self.dm("task-q2", "STUB:QUOTA hi")
+        self.serve()
+        self.assertEqual(len(self.posted("$q2")), 1, "the limit came back: a second card")
+
+    def test_another_error_queues_no_card(self):
+        self.dm("task-f", "STUB:FAIL hi")
+        self.serve()
+        self.assertEqual(self.outbox(), [])
+        self.assertIn("internal error", self.w.result("task-f"))
+        self.assertNotIn("usage limit", self.w.result("task-f"))
+
+    def test_a_quota_error_with_no_owner_dm_seen_sends_no_card_and_says_the_limit_in_the_room(self):
         self.dm("task-q", "STUB:QUOTA hi", kind="room")
         self.serve()
-        self.assertIn("在和我的私信里说「换账号」", self.w.result("task-q"))
-        self.assertEqual(self.posted("$q"), [])
+        self.assertEqual(self.outbox(), [])
+        self.assertIn("Antigravity has reached its usage limit", self.w.result("task-q"))
+
+    def test_what_reads_as_agys_quota_error(self):
+        yes = (("failed", "", "session/prompt: RESOURCE_EXHAUSTED: Individual quota reached."),
+               ("failed", "", "HTTP 429 Too Many Requests"), ("failed", "", "status: 429"),
+               ("completed", "RESOURCE_EXHAUSTED: quota exceeded", "end_turn"))
+        no = (("failed", "", "internal error"), ("completed", "Your quota exceeded talk: " + "x" * 500, "end_turn"),
+              ("failed", "", "port 4290 refused"), ("completed", "", "end_turn"))
+        self.assertEqual([agy_account.quota_error(*t) for t in yes], [True] * len(yes))
+        self.assertEqual([agy_account.quota_error(*t) for t in no], [False] * len(no))
 
 
 class PartsTest(unittest.TestCase):

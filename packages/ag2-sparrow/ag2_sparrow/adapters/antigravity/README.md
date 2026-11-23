@@ -262,8 +262,12 @@ No secret is taken in chat: in the web client every card reply and card input is
 - **停用 API key** deletes this agent's own Keychain item; the next turn opens a fresh Session on the sign-in.
 - **A code or key sent in chat** (a Google sign-in code `4/...`, an address with `code=`, a Gemini key, or the
   bridge's `[REDACTED-Google API Key]`) is never passed to agy: the sender is asked to delete the message.
-- **Quota.** A turn that fails with `RESOURCE_EXHAUSTED` / "Individual quota reached" shows the card in the
-  owner's DM (at most every 30 minutes), or, elsewhere, says to ask for it in the DM. See `agy_account.py`.
+- **Quota.** A turn that fails with `RESOURCE_EXHAUSTED` / "Individual quota reached" / a 429 makes the
+  connector itself post the account card (English, with the `account_controls` marker) in the owner's DM:
+  that the limit was reached, when it resets if agy said, and the account in use. One card per limit: the
+  next only after a turn answered and the limit came back (`quota_notice.py`). The DM is remembered from the
+  owner's own messages there; until one is seen no card is sent and the room gets the limit in words. While
+  the card is out, a refused turn posts no error line.
 
 ## S.space tools (Room Commons pages and room actions)
 
