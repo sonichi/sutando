@@ -76,13 +76,15 @@ runtime, accepted, applied, ts, by}`; a record without `runtime` is a Claude cor
 as a Codex model). Nothing is typed into a pane. Under the same lock:
 
 - the core is an app-server seat (a live `codex-seat` window): `applied: next-turn`, `status: pending`,
-  exit 0. The seat (`src/agent/codex/app-server/seat.py`, core seat only) always launches on
-  `working`, the last model Codex took, and passes the pending pick on its next `turn/start`. A turn
-  Codex runs on it makes it `accepted` (the seat's model from then on); a refusal naming the model
-  makes it `rejected`, the turn reruns on `working` and the owner gets a proactive notice. Any other
-  failure (a busy thread, a timeout, a restart) is no verdict: the pick stays pending and the next
-  turn tries it again. An explicit `SUTANDO_CORE_MODEL` launch outranks a pick saved before it
-  (`SUTANDO_CORE_MODEL_REV`).
+  **exit 12**: saved, not switched. Say it as pending ("I'll try X on my next task"), never as switched.
+  The seat (`src/agent/codex/app-server/seat.py`, core seat only) always launches on `working`, the
+  last model Codex took. Before a turn it reads Codex's own `model/list`: a pick that is not in it is
+  `rejected` without being sent. Otherwise it passes the pick on that `turn/start`, and a completed
+  turn makes it `accepted`. Either verdict reaches the owner as a proactive notice. Nothing else
+  rejects a pick: an error answer, a failed turn, a timeout or an unreadable list is no verdict, the
+  turn reruns on the model before it (Codex's default named explicitly when the seat had none), and
+  the pick stays pending, tried at most twice per seat. An explicit `SUTANDO_CORE_MODEL` launch
+  outranks a pick saved before it (`SUTANDO_CORE_MODEL_REV`).
 - the core is a Codex TUI: `applied: next-start`, `accepted: false`, **exit 11** — saved, the running
   TUI keeps its model until its next start (owner-gated `bash src/agent/codex/cli/start-cli.sh
   --restart`).
@@ -128,7 +130,9 @@ skills/model-switch/scripts/model_card.py reply`, run that with `--task-file <ta
 Each tap is one attempt with its own id (`attempt` in the output): the "switching" card is posted
 before the switch is started, so the outcome can only follow it. The detached line always ends in
 `model_card.py settle --room <DM> --model <model id> --attempt <id> --rc <the switch's exit code>`, which
-saves the outcome in `<workspace>/state/model-card-outcome.json` and then posts it in the same DM: "Switched. I'm now using X." on exit 0, else "I
+saves the outcome in `<workspace>/state/model-card-outcome.json` and then posts it in the same DM: "Switched. I'm now using X." on exit 0, a
+pending card ("Saved, not switched yet: I'll try X on my next task") on exit 12 (the seat's own notice
+follows once Codex has taken or refused it), else "I
 could not switch to X. I'm still using Y." and one short reason for the exit code (5 unsent text in the
 input box, 8 not accepted in time, 3 the core is not running, and so on; an unknown code is "the switch
 did not finish"). A post that fails is tried again a few times inside the detached step; an outcome
