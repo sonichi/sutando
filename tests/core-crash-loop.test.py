@@ -407,12 +407,18 @@ class ResetService(Base):
 
 
 class ReviveExhausted(Base):
-    """The app's revive loop giving up reaches the record and the owner's card."""
+    """The app's revive loop giving up reaches the record and the owner's card, but only while the
+    marker is the running app's own: same app session as a live supervisor heartbeat."""
 
-    def give_up(self, on=True):
+    def give_up(self, on=True, now=None, session=RUN, live=RUN, beat_age=2.0, **over):
+        now = time.time() if now is None else now
         path = self.ws / "state" / crs.REVIVE_FILE
         if on:
-            path.write_text(json.dumps({"v": 1, "state": "exhausted", "since": 1763730000, "attempts": 25}))
+            body = {"v": 1, "state": "exhausted", "since": int(now - 120), "attempts": 25, "appSessionId": session}
+            body.update(over)
+            path.write_text(json.dumps({k: v for k, v in body.items() if v is not None}))
+            if live:
+                self.write(status(now, terminal=False, app_session=live, beat_age=beat_age))
         elif path.exists():
             path.unlink()
 
@@ -421,6 +427,25 @@ class ReviveExhausted(Base):
         rec = crs.gather(self.ws, {"state": sup}, now=now, runtime="claude")
         crs.publish(self.ws, rec, now)
         return rec
+
+    def test_a_stale_give_up_marker_is_never_read_as_the_current_app_giving_up(self):
+        now = time.time()
+        for why, kw in (("left by an earlier app session", {"session": "run-older"}),
+                        ("the app that wrote it is gone: its supervisor's heartbeat stopped",
+                         {"beat_age": 600.0}),
+                        ("no supervisor status to match it against", {"live": None}),
+                        ("it names no app session", {"appSessionId": None}),
+                        ("stamped in the future", {"since": int(now + 3600)}),
+                        ("no time at all", {"since": None})):
+            with self.subTest(why=why):
+                (self.ws / "state" / C.STATUS_FILE).unlink(missing_ok=True)
+                self.give_up(now=now, **kw)
+                self.assertFalse(crs.revive_exhausted(self.ws, now), why)
+                rec = self.record(now=now)
+                self.assertEqual(rec["state"], "starting", why)
+                self.assertNotIn("reason", rec, why)
+        self.give_up(now=now)
+        self.assertTrue(crs.revive_exhausted(self.ws, now), "the running app's own marker counts")
 
     def test_a_core_the_app_gave_up_on_is_a_crash_loop_with_its_reason(self):
         self.give_up()
@@ -437,8 +462,8 @@ class ReviveExhausted(Base):
         rec = self.record()
         self.assertEqual(rec["state"], "starting")
         self.assertNotIn("reason", rec)
-        (self.ws / "state" / crs.REVIVE_FILE).write_text(json.dumps({"v": 1, "state": "ok"}))
-        self.assertFalse(crs.revive_exhausted(self.ws))
+        self.give_up(state="ok")
+        self.assertFalse(crs.revive_exhausted(self.ws, time.time()))
         self.assertIsNone(crs.coerce({"v": 1, "state": "crash_loop", "reason": "nope"}).get("reason"))
 
     def test_giving_up_replaces_the_crash_card_with_a_cant_recover_card(self):
