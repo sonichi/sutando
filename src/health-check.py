@@ -1687,7 +1687,7 @@ def check_decision_card_clicks(workspace_dir: Optional[Path] = None) -> "dict | 
 
 
 def check_task_event_handler(workspace_dir: Optional[Path] = None) -> "dict | None":
-    """FAIL when the declared task-event handler is gone: core's watcher then holds every task."""
+    """DOWN when the declared task-event handler is gone: core's watcher then holds every task."""
     from util_paths import task_event_handler_config_path  # noqa: PLC0415
     cfg = task_event_handler_config_path((Path(workspace_dir) if workspace_dir else WORKSPACE_DIR) / "state")
     if not cfg.exists() and not cfg.is_symlink():
@@ -1698,7 +1698,7 @@ def check_task_event_handler(workspace_dir: Optional[Path] = None) -> "dict | No
         handler = None
     if isinstance(handler, str) and handler and os.access(handler, os.X_OK):
         return None
-    return {"name": "task-event-handler", "status": "fail",
+    return {"name": "task-event-handler", "status": "down",
             "detail": (f"{cfg.name} names a handler that is missing or not executable ({handler!r}); "
                        "the core watcher holds every new task until it is fixed. Re-publish it from "
                        "the checkout that should route, or remove the file to let the core take every task")}
@@ -5838,7 +5838,7 @@ def _statusline_quota_freshness(check: dict) -> dict:
 
 
 def check_claude_sign_in() -> dict:
-    """FAIL when the core's config dir is not signed in on its own while sessions go direct, and
+    """DOWN when the core's config dir is not signed in on its own while sessions go direct, and
     queue one owner message per day with the sign-in step (src/claude_signed_in.py)."""
     import claude_signed_in  # src/ is on sys.path
     from claude_account import core_config_dir

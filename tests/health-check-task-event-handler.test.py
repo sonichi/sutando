@@ -47,13 +47,13 @@ class TaskEventHandlerCheck(unittest.TestCase):
     def test_missing_handler_fails(self):
         self.declare(str(self.ws / "gone" / "router"))
         row = hc.check_task_event_handler(self.ws)
-        self.assertEqual(row["status"], "fail")
+        self.assertEqual(row["status"], "down")
         self.assertEqual(row["name"], "task-event-handler")
         self.assertIn("holds every new task", row["detail"])
 
     def test_unparseable_config_fails(self):
         self.cfg.write_text("{not json")
-        self.assertEqual(hc.check_task_event_handler(self.ws)["status"], "fail")
+        self.assertEqual(hc.check_task_event_handler(self.ws)["status"], "down")
 
 
 if __name__ == "__main__":
