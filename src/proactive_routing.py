@@ -33,6 +33,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 # Bridges that deliver proactive files; any other activity channel (voice, github-commits)
@@ -67,28 +68,50 @@ def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
     Pure function — no side effects, no logging. Callers handle
     skip/continue control flow.
     """
+    return proactive_route(state_file_path)["channel"] == this_channel
+
+
+#: The bridge an unrecorded or non-bridge owner activity routes to.
+DEFAULT_PROACTIVE_CHANNEL = "discord"
+
+
+def proactive_route(state_file_path: Path, now: "float | None" = None) -> dict:
+    """Where activity routing sends an untagged proactive file right now, and why.
+
+    Returns ``{"channel", "reason", "field", "value", "age_s"}``: ``channel`` is
+    the one bridge ``should_claim_proactive`` lets claim; ``reason`` is one of
+    ``last-activity`` (``field`` ``channel`` named a bridge), ``non-bridge``
+    (it named another surface), ``no-channel``, ``malformed``, ``unreadable``
+    or ``missing``, the last five routing to DEFAULT_PROACTIVE_CHANNEL.
+    ``value`` is the raw field, ``age_s`` the record's age from its ``ts``
+    field (None without a usable one). A tag or a body ``[channel:]`` address
+    still outranks this per file; a lone bridge claims an unrecorded file itself
+    (``claims_unless_routed_elsewhere``).
+    """
+    def route(channel, reason, value=None, age_s=None):
+        return {"channel": channel, "reason": reason, "field": "channel",
+                "value": value, "age_s": age_s}
+
     try:
         data = json.loads(state_file_path.read_text())
     except FileNotFoundError:
-        return this_channel == "discord"
+        return route(DEFAULT_PROACTIVE_CHANNEL, "missing")
     except (OSError, json.JSONDecodeError):
-        return this_channel == "discord"
-
+        return route(DEFAULT_PROACTIVE_CHANNEL, "unreadable")
     if not isinstance(data, dict):
-        return this_channel == "discord"
-
+        return route(DEFAULT_PROACTIVE_CHANNEL, "malformed")
+    ts = data.get("ts")
+    age_s = None
+    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+        age_s = (time.time() if now is None else now) - float(ts)
     last_channel = data.get("channel", "")
     if not isinstance(last_channel, str) or not last_channel:
-        return this_channel == "discord"
-
-    # If the last-active channel is a known bridge, match strictly so
-    # only that bridge claims.
+        return route(DEFAULT_PROACTIVE_CHANNEL, "no-channel", last_channel or None, age_s)
     if last_channel in BRIDGE_CHANNELS:
-        return last_channel == this_channel
-
+        return route(last_channel, "last-activity", last_channel, age_s)
     # Non-bridge channel: the owner was last on a surface that delivers no DMs,
     # so default to Discord rather than strand the file.
-    return this_channel == "discord"
+    return route(DEFAULT_PROACTIVE_CHANNEL, "non-bridge", last_channel, age_s)
 
 
 # The .to-<channel> tag rides between stem and suffix (globs/claims keep it).
