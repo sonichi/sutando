@@ -81,7 +81,9 @@ FORMAT = "cloud-session/1"
 FORMAT_LOCAL = "claude-local/1"
 FORMATS = frozenset((FORMAT, FORMAT_LOCAL))
 # The two claude-local records and the two per-root locks live in state/ by name.
-LOCAL_STATE_FILES = ("claude-local-plugin.json", "claude-local-supervisor.json", "claims.lock", "progress.lock")
+# model-switch.*: the record and the lock of claude-local's live model switch (launcher.switch_model).
+LOCAL_STATE_FILES = ("claude-local-plugin.json", "claude-local-supervisor.json", "claims.lock", "progress.lock",
+                     "model-switch.json", "model-switch.lock")
 STATE_ALLOWED = frozenset(("format", "claims", "settled-ids", "rate.jsonl", "done", "collaborator-turns.json")
                           + LOCAL_STATE_FILES)
 # Optional records the adapters rewrite in place: when present, each must be a plain file.

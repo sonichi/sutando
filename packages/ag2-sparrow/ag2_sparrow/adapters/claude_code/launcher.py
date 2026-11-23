@@ -664,8 +664,10 @@ class Launcher:
                 with contextlib.suppress(OSError):   # the switch happened whether or not it is recorded
                     path = Path(self.root).joinpath(*MODEL_RECORD)
                     path.parent.mkdir(parents=True, exist_ok=True)
-                    path.with_name(path.name + ".tmp").write_text(json.dumps({"model": model, "at": self.clock()}))
-                    os.replace(path.with_name(path.name + ".tmp"), path)
+                    # Named as the start check knows a record's temp, so one left by a stop is swept, not refused.
+                    temp = path.with_name(".%s.tmp" % path.name)
+                    temp.write_text(json.dumps({"model": model, "at": self.clock()}))
+                    os.replace(temp, path)
                 return True, "switched to %s" % model
             if text.count(MODEL_CONFIRM) > asked and not answered:
                 if not confirm:

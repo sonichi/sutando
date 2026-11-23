@@ -4,6 +4,7 @@ this runs where no tmux does. The same paths on a real tmux server are in test_c
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -105,6 +106,30 @@ class SwitchModel(unittest.TestCase):
             lc.unsent = lambda gen, title, rc, what: seen.append(rc) or "uncertain"
             self.assertEqual((lc.switch_model(REC, "opus"), seen), ((False, "uncertain"), [tmux_pane_keys.UNCERTAIN]))
         self.assertEqual(launcher.switched_model(self.root), "")
+
+    def test_a_work_root_whose_model_was_switched_still_starts(self):
+        """The switch leaves a record and a lock under state/. The start check names every entry it lets
+        an agent's state hold: with these two missing from it, the job refused its next start."""
+        from ag2_sparrow import task_lifecycle
+        self.assertIsNone(task_lifecycle.prepare_work_dir(str(self.root)))
+        self.assertEqual(lc_for(Pane(says), self.root).switch_model(REC, "opus"), (True, "switched to opus"))
+        left = sorted(p.name for p in (self.root / "state").iterdir() if "model" in p.name)
+        self.assertEqual(left, ["model-switch.json", "model-switch.lock"])
+        for check_only in (True, False):
+            self.assertIsNone(task_lifecycle.prepare_work_dir(str(self.root), check_only=check_only), left)
+        # A switch stopped between writing its record and moving it into place leaves a temp the start
+        # check takes for a live writer's, and sweeps once it is old.
+        with mock.patch.object(launcher.os, "replace", side_effect=OSError("stopped here")):
+            self.assertEqual(lc_for(Pane(says), self.root).switch_model(REC, "haiku"), (True, "switched to haiku"))
+        (temp,) = [p for p in (self.root / "state").iterdir() if p.name.endswith(".tmp")]
+        self.assertIsNone(task_lifecycle.prepare_work_dir(str(self.root), check_only=True), temp.name)
+        os.utime(temp, (1, 1))
+        self.assertIsNone(task_lifecycle.prepare_work_dir(str(self.root)))
+        self.assertFalse(temp.exists(), "swept")
+        # Anything else under state/ is still refused: the list did not become a pattern.
+        (self.root / "state" / "model-switch.other").write_text("")
+        self.assertIn("state/model-switch.other is not this adapter's state",
+                      task_lifecycle.prepare_work_dir(str(self.root), check_only=True))
 
     def test_a_session_that_never_reports_the_switch_is_unconfirmed(self):
         pane = Pane()
