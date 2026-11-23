@@ -20,6 +20,8 @@ NOTICE_FIELD = "space.ag2.hitl_notice"
 # The subject fields a card may show. The rest of `subject` is the producer's own bookkeeping
 # (claims, tokens, leases, session keys) and never leaves the host.
 WIRE_SUBJECT_FIELDS = ("tool", "input", "options", "choices")
+# A recovery card also shows its tap's receipt outcome (hitl.recovery), so a client knows the answer.
+WIRE_RECEIPT_OUTCOMES = ("done", "refused", "stale", "failed")
 
 
 # Canonical JSON's integer range; a number outside it is refused like a float.
@@ -191,6 +193,15 @@ class HumanRequirement:
         if self.actions:
             wire["actions"] = [a.to_wire() for a in self.actions]
         subject = {k: self.subject[k] for k in WIRE_SUBJECT_FIELDS if k in (self.subject or {})}
+        receipt = (self.subject or {}).get("receipt")
+        if isinstance(receipt, dict) and receipt.get("outcome") in WIRE_RECEIPT_OUTCOMES:
+            # A recovery tap's answer: its outcome and time only, the rest of the receipt stays on the host.
+            at = receipt.get("at")
+            subject["receipt"] = {"outcome": receipt["outcome"],
+                                  **({"at": at} if isinstance(at, int) and not isinstance(at, bool)
+                                     and 0 <= at <= WIRE_INT_MAX else {})}
+        if (self.subject or {}).get("superseded") is True:
+            subject["superseded"] = True  # closed for a fresh card: a done receipt here is not success
         if subject:
             wire["subject"] = subject
         if self.expires_at is not None:

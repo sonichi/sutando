@@ -10,6 +10,8 @@ Machine-readable ownership and lifecycle metadata lives in
 
 ## Start here
 
+- [Interactive s.space overview](../skills/tutorial/assets/getting-started.html) — download/open the HTML in a browser to explore agents, teamwork, calls and Commons.
+
 - [Configure a workspace](workspace-config.md) — defaults, overrides, and
   resolver APIs.
 - [Run Codex as the core](codex-core.md) — core selection, setup, and rollback.
@@ -41,6 +43,7 @@ Machine-readable ownership and lifecycle metadata lives in
 
 ## Operations
 
+- [PR-watch runner lifecycle](pr-watch-lifecycle.md) — thread and process draining, shutdown limits, and isolated verification.
 - [Recovery issue metrics](recovery-issue-metrics.md) — persistent issue IDs and recovery-rate definitions.
 
 - [Release process and migrations](release-process.md)
@@ -66,6 +69,7 @@ Machine-readable ownership and lifecycle metadata lives in
 ## Architecture and decisions
 
 - [Architecture boundaries](architecture-boundaries.md)
+- [Agent-native design rules](agent-native-design-rules.md) — the rules every contribution follows: an agent can do what a person can through an Action; what an agent needs from a person is a control, not a sentence; the contributor and reviewer checklist.
 - [ag2-sparrow v1 delivery contract](sparrow-v1-contract.md)
 - [D1 identity/state census (strangler Slice 1)](census/d1-identity-census.md)
 - [The file delivery protocol as a formal state machine](delivery-protocol.md)
@@ -75,6 +79,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Workspace two-space model](workspace-design.md)
 - [Core health verdict + severity gate](design-core-health-verdict.md)
 - [Health snapshot: `GET /health`](health-snapshot.md)
+- [Core recovery record (`core_recovery.v1`)](core-recovery-record.md)
 - [Pointer Teacher design](pointer-teacher-design.md)
 - [Credential resolution by capability (G8)](design-credential-capability-resolver.md)
 - [holder_lock: the one flock-and-holder primitive](design-holder-lock.md)

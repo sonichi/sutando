@@ -259,7 +259,7 @@ def main(argv=None) -> None:
     atexit.register(zero_matches)
     mod.__name__ = "__main__"
     mod.VOICE_ROOM_VERIFIER.start()
-    mod.main()
+    mod.run()
 
 
 if __name__ == "__main__":

@@ -210,6 +210,9 @@ KNOWN_HEADER_KEYS = (
     # trusted bridge wrote it; the guard defangs a forged `platform_card:`
     # body line the same as `attachments:`.
     "platform_card",
+    # A card click's `space.ag2.card_click` ({card_id, action}, one-line JSON) as the trusted bridge
+    # passed it on; header status defangs a body line claiming one.
+    "card_click",
     # Which instance a task belongs to; header status defangs forged
     # body-line claims, consumers may verify before executing.
     "instance_id",
@@ -225,6 +228,9 @@ KNOWN_HEADER_KEYS = (
     # Broker attestation that the message @-mentioned the owner, not this agent;
     # the core reads it to keep out of the room, so the guard defangs a forged copy.
     "owner_mentioned",
+    # Who asked a relay task, which its `user_id` (the account it runs for) does not say.
+    # Bridge-written above task:, so the guard defangs a forged body copy.
+    "asked_by",
     # Writer-declared layout, above task: so a body cannot claim it. `mid` = the body is
     # one line and every later line is the writer's; meaningful only under a verified envelope.
     "task_layout",
@@ -242,6 +248,9 @@ KNOWN_HEADER_KEYS = (
     # AgentTrigger context (vocabulary: agent_triggers.py). Bridge-written above task:,
     # so the guard defangs forged body copies.
     "event_type", "agent_trigger_id", "playbook",
+    # The broker's handle for the window the owner messaged from; the agent passes it to the
+    # ui_* MCP tools. Bridge-written above task:, so the guard defangs a forged body copy.
+    "ui_origin",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 # Only the task-mid writer may declare its layout; a task-last file carrying it
@@ -382,6 +391,31 @@ _QUOTED_BLOCK = re.compile(
 _JSON_DECODER = json.JSONDecoder()
 
 
+def quoted_block_spans(text: str) -> "tuple[int | None, tuple[int, int, dict, str] | None]":
+    """(where the message after the broker's quoted blocks starts, the reply-context
+    record's (start, end, decoded record, label) or None); (None, None) when a block is malformed."""
+    pos, reply = len(text) - len(text.lstrip()), None
+    for kind in ("room metadata", "reply context"):
+        m = _QUOTED_BLOCK.match(text, pos)
+        if m is None or m.group(1) != kind:
+            continue
+        try:
+            record, end = _JSON_DECODER.raw_decode(text, m.end())
+        except ValueError:
+            return None, None
+        tail = len(text) - len(text[end:].lstrip())
+        closer = next((f"[End {p} {kind}]" for p in _MARKER_PRODUCTS
+                       if text.startswith(f"[End {p} {kind}]", tail)), None)
+        if not isinstance(record, dict) or closer is None:
+            return None, None
+        pos = len(text) - len(text[tail + len(closer):].lstrip())
+        if kind == "reply context":
+            if not isinstance(record.get("sender"), str) or not isinstance(record.get("body"), str):
+                return None, None
+            reply = (m.end(), end, record, m.group(2))
+    return pos, reply
+
+
 def split_reply_context(text: str) -> "tuple[dict | None, str]":
     """({"sender", "body", "label"} of the message an ag2space task replies to, the
     message after the broker's quoted blocks), or (None, text) when there is no
@@ -390,27 +424,11 @@ def split_reply_context(text: str) -> "tuple[dict | None, str]":
     `label` is the broker's own wording from the opening tag, verbatim (None when
     empty). The JSON is decoded whole, so a closing marker inside the quoted body
     cannot end the block early."""
-    rest, reply = text.lstrip(), None
-    for kind in ("room metadata", "reply context"):
-        m = _QUOTED_BLOCK.match(rest)
-        if m is None or m.group(1) != kind:
-            continue
-        try:
-            record, end = _JSON_DECODER.raw_decode(rest, m.end())
-        except ValueError:
-            return None, text
-        tail = rest[end:].lstrip()
-        closer = next((f"[End {p} {kind}]" for p in _MARKER_PRODUCTS
-                       if tail.startswith(f"[End {p} {kind}]")), None)
-        if not isinstance(record, dict) or closer is None:
-            return None, text
-        rest = tail[len(closer):].lstrip()
-        if kind == "reply context":
-            sender, body = record.get("sender"), record.get("body")
-            if not isinstance(sender, str) or not isinstance(body, str):
-                return None, text
-            reply = {"sender": sender, "body": body, "label": m.group(2).strip() or None}
-    return (reply, rest) if reply is not None else (None, text)
+    pos, reply = quoted_block_spans(text)
+    if reply is None:
+        return None, text
+    record, label = reply[2], reply[3]
+    return {"sender": record["sender"], "body": record["body"], "label": label.strip() or None}, text[pos:]
 
 
 # A run of >=3 leading '=' opens a writer's ===SKILL …=== / ===SUTANDO …=== block;
@@ -778,7 +796,7 @@ def _iter_archived_result_candidates(results_dir: Path, task_id: str) -> Iterato
     yield from reversed(_epoch_suffixed(archive, task_id))
 
 
-def iter_result_candidates(results_dir: Path, task_id: str) -> Iterator[Path]:
+def iter_result_candidates(results_dir: Path, task_id: str, *, include_live: bool = True) -> Iterator[Path]:
     """Every EXISTING result file for `task_id`, in lookup precedence: the live
     `results/<id>.txt`, then each archive layout in `find_archived_result`
     order, newest first within a layout.
@@ -788,11 +806,12 @@ def iter_result_candidates(results_dir: Path, task_id: str) -> Iterator[Path]:
     live file hiding a ready archived body) walks it until a body is ready.
     Existence is all it checks — readiness belongs to `delivery.readiness`.
     Rejects malformed ids rather than globbing with them (traversal gate).
+    `include_live=False` walks the archive layouts only.
     """
     if not valid_archive_lookup_id(task_id):
         return
     live = Path(results_dir) / f"{task_id}.txt"
-    if live.is_file():
+    if include_live and live.is_file():
         yield live
     yield from _iter_archived_result_candidates(results_dir, task_id)
 
@@ -880,11 +899,12 @@ def find_result(results_dir: Path, task_id: str) -> Path | None:
     return next(iter_result_candidates(results_dir, task_id), None)
 
 
-def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
+def find_archived_task(tasks_dir: Path, task_id: str, *, include_live: bool = True) -> Path | None:
     """Locate a task file across the live dir, the legacy flat archive, and
     the month-partitioned archive — the same candidate set task-bridge's
     `_isVoiceTask` walks. Returns the first existing path or None. Rejects
     malformed ids rather than globbing with them (traversal gate).
+    `include_live=False` skips the live dir: archives only.
 
     The month scan uses `os.scandir` and filters on the NAME before asking
     whether the entry is a directory. The archive root holds one file per
@@ -910,7 +930,7 @@ def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
     """
     if not valid_archive_lookup_id(task_id):
         return None
-    dirs = [tasks_dir, tasks_dir / "processed", tasks_dir / "archive"]
+    dirs = ([tasks_dir] if include_live else []) + [tasks_dir / "processed", tasks_dir / "archive"]
     archive_root = tasks_dir / "archive"
     try:
         with os.scandir(archive_root) as entries:

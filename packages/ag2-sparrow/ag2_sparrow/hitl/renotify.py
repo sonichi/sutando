@@ -61,6 +61,17 @@ def reminds(req: HumanRequirement) -> bool:
     return (req.subject or {}).get("remind") is not False
 
 
+def said_on_card(req: HumanRequirement) -> bool:
+    """A recovery card that owes no "Cleared" message: its own message said the block lifted (working
+    again, or up but its waiting work not seen starting), or it was superseded by a fresh card (which
+    then carries the incident's notice). A "still blocked" line alone never counts."""
+    subject = req.subject or {}
+    check = subject.get("verify")
+    if not subject.get("recovery"):
+        return False
+    return bool(subject.get("superseded")) or (isinstance(check, dict) and check.get("seen") in ("working", "up"))
+
+
 def interval(reminders: int) -> float:
     return REMIND_INTERVALS_S[min(max(reminders, 0), len(REMIND_INTERVALS_S) - 1)]
 
@@ -72,6 +83,8 @@ def due(req: HumanRequirement, projection: Dict, now: float) -> Optional[str]:
     if projection.get("revision", 0) < req.revision:
         return None  # the edit goes first
     if req.status == STATUS_RESOLVED:
+        if said_on_card(req):
+            return None  # the recovery card itself says how it ended: one surface per incident
         # Only a card this module scheduled owes a recovery; a pre-upgrade ledger has no notified_at.
         owed = projection.get("notified_at") and not projection.get("recovered")
         return RECOVERY if owed else None
@@ -186,7 +199,7 @@ def body(notice: str, req: HumanRequirement, now: float,
     if notice == FAILED:
         head = _headline(req)
         head = head if len(head) <= _FAILED_HEADLINE_MAX else head[:_FAILED_HEADLINE_MAX - 1] + "…"
-        return f"⚠ Sutando could not show you a card — {head}. The relay refused it."
+        return f"⚠ Sutando could not show you a card — {head}. The card could not be delivered."
     if notice == RECOVERY:
         tail = (f"resuming {n} queued task{'s' if n != 1 else ''}" if n
                 else "Sutando has continued its work")
@@ -197,7 +210,7 @@ def body(notice: str, req: HumanRequirement, now: float,
     waiting = f" {n} task{'s are' if n != 1 else ' is'} waiting." if n else ""
     started = req.created_at if since is None else since
     return (f"⚠ Still blocked after {_duration(now - started)} — "
-            f"{_headline(req)}.{waiting} The card above has the way to clear it.")
+            f"{_headline(req)}.{waiting} Its card has the way to clear it.")
 
 
 def dedupe_key(notice: str, req: HumanRequirement, projection: Dict,

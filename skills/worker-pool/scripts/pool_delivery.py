@@ -233,6 +233,34 @@ def hand_off_to_core(workspace: Path, recipient: str) -> dict:
             return out
 
 
+def hand_off_own_inbox(workspace: Path, recipient: str, owed) -> dict:
+    """The owner's hand-off for a worker on its own folders: each (task id, file) it still owes there
+    (`pool_supervise.own_inbox_owed`) moves to the shared tasks/, attribution revoked once it has moved, and
+    is touched so the core's watcher picks it up. A name the shared folder already holds is kept, never
+    replaced. Returns {"handed_off": [...], "kept": {task_id: why}}."""
+    import pool_attribution
+    import undelivered_quarantine
+    ws = Path(workspace)
+    require_recipient(recipient)
+    out = {"handed_off": [], "kept": {}}
+    (ws / "tasks").mkdir(parents=True, exist_ok=True)
+    for task_id, path in owed:
+        dest = ws / "tasks" / f"{task_id}.txt"
+        try:
+            undelivered_quarantine.rename_noreplace(Path(path), dest)
+        except FileExistsError as e:
+            if undelivered_quarantine.no_primitive(e):
+                raise
+            out["kept"][task_id] = "shared-folder-holds-the-name"
+            continue
+        # Only a task that moved loses its owner record; a kept or failed one still needs it.
+        pool_attribution.revoke(ws, task_id, recipient)
+        with contextlib.suppress(FileNotFoundError):
+            os.utime(dest)
+        out["handed_off"].append(task_id)
+    return out
+
+
 def _owed_names(dfd: int) -> set:
     names = set()
     for name in os.listdir(dfd):
@@ -267,6 +295,78 @@ def _hand_off_pass(ws: Path, recipient: str, out: dict) -> set:
                 pool_attribution.revoke(ws, task_id, recipient)
                 out["handed_off"].append(task_id)
             return _owed_names(dfd) - set(out["kept"]) - set(task_ids)
+
+
+def migrate_to_own_dirs(workspace, recipient: str, own_tasks, own_origin) -> dict:
+    """Empty `recipient`'s deliveries folder into its own tasks folder, for a worker switched to its own
+    folders. Under each task's lock and the folder lock: a task its own lane queued (`own_origin(id)`) has
+    its payload moved into `own_tasks` and its sentinel archived. Any other task still `pending` (never
+    accepted) is handed back as `hand_off_to_core` does: attribution revoked first, then sentinel and `.pending`
+    record withdrawn, payload touched so the core's watcher picks it up. One the worker accepted, or answered,
+    stays the worker's: its session may still be running it, so only a hand-off after that session is gone
+    (`pool_manage.py retire --hand-off`) gives it to the core. While any task the worker accepted is still
+    unanswered (`died-mid-work`, its own lane's included) nothing moves at all, so the switch waits and that
+    work stays where supervision reads it. Idempotent: an interrupted pass leaves the sentinel, so a re-run
+    revisits the task. Returns {"moved", "returned", "kept": {id: why}, "owed": [ids accepted, unanswered]}.
+    Refused (ValueError) once the worker's retirement has begun (`connections.worker_retiring`)."""
+    import connections
+    import pool_attribution
+    import pool_router
+    import undelivered_quarantine
+
+    ws, own_tasks = Path(workspace), Path(own_tasks)
+    require_recipient(recipient)
+    out = {"moved": [], "returned": [], "kept": {}, "owed": []}
+    task_ids = sorted({parse_sentinel(p.name)[0] for p in accepted(ws, recipient) + pending(ws, recipient)
+                       if is_regular_file(p)})
+    with contextlib.ExitStack() as locks:
+        for task_id in task_ids:
+            locks.enter_context(pool_router.task_arbitration(ws, task_id))
+        with arbitration(ws, recipient) as dfd:
+            locks.enter_context(connections.worker_switch_lock(recipient, ws))
+            if connections.worker_retiring(recipient, ws):
+                raise ValueError(f"worker {recipient} is being retired: nothing was moved")
+            out["owed"] = [t for t in task_ids if find_in(dfd, t) is not None
+                           and _residue_state(ws, recipient, t, find_in(dfd, t)) == "died-mid-work"]
+            if out["owed"]:
+                out["kept"] = {t: "accepted" for t in out["owed"]}
+                return out
+            for task_id in task_ids:
+                if find_in(dfd, task_id) is None:
+                    continue
+                payload = payload_path(ws, task_id)
+                if not own_origin(task_id):
+                    state = _residue_state(ws, recipient, task_id, find_in(dfd, task_id))
+                    if state != "pending":
+                        out["kept"][task_id] = "accepted" if state == "died-mid-work" else state
+                        continue
+                    # Attribution first: a sentinel left by an interruption makes the next pass revisit.
+                    pool_attribution.revoke(ws, task_id, recipient)
+                    _withdraw_locked(ws, recipient, task_id, dfd)
+                    with contextlib.suppress(FileNotFoundError):
+                        os.utime(payload)
+                    out["returned"].append(task_id)
+                    continue
+                if is_regular_file(payload):
+                    own_tasks.mkdir(parents=True, exist_ok=True)
+                    try:
+                        undelivered_quarantine.rename_noreplace(payload, own_tasks / payload.name)
+                    except FileExistsError as e:
+                        if undelivered_quarantine.no_primitive(e):
+                            raise  # nothing moved: the run fails and a re-run retries
+                        out["kept"][task_id] = "own-folder-holds-the-name"
+                        continue
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(pending_flag(ws, recipient, task_id))
+                afd = _open_archive(dfd)
+                try:
+                    for name in sentinel_names(task_id):
+                        if regular_file_state(name, dir_fd=dfd) == "regular":
+                            _move_into_archive(dfd, afd, name)
+                finally:
+                    os.close(afd)
+                out["moved"].append(task_id)
+    return out
 
 
 def writer_path() -> Path:

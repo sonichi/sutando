@@ -48,6 +48,7 @@ from __future__ import annotations
 import os.path as _osp
 import re
 import sys as _sys
+import unicodedata
 from typing import List, Optional, Tuple
 
 _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
@@ -57,10 +58,31 @@ from cli_wedge import needs_login_line  # noqa: E402 — the one banner grammar
 # frame has scrolled. Indented text without the glyph is prose or a quoted prompt.
 LOGGED_IN_AGAIN = re.compile(r"login successful\.?", re.I)
 _RESULT_ROW = re.compile(r"^(?:\s*⎿|\S)")
+# The CLI's turn verb ("Cooked", "Sautéed"): a letter of any script, then letters or the
+# combining marks `re` has no \p{M} for (Latin, Greek, Cyrillic and general-use blocks).
+VERB_START = r"[^\W\d_]"
+VERB_MARKS = "\u0300-\u036f\u0483-\u0489\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f"
+VERB = rf"{VERB_START}(?:[^\W\d_]|[{VERB_MARKS}])*"
+
+
+class TurnPattern:
+    """A pane-row pattern that reads its input in NFC, so a decomposed accent is one letter."""
+
+    def __init__(self, pattern: str):
+        self._re = re.compile(pattern)
+        self.pattern = self._re.pattern
+
+    def match(self, text: str):
+        return self._re.match(unicodedata.normalize("NFC", text))
+
+    def search(self, text: str):
+        return self._re.search(unicodedata.normalize("NFC", text))
+
+
 # The completed-turn line ("✻ Worked for 0s", "✻ Cooked for 1m 3s · done 12:32 PM"); the
 # spinner reuses the glyph ("✻ Perambulating… (1m 46s · …)") and must not match.
-TURN_DONE = re.compile(
-    r"^✻\s+[A-Za-z]+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?$")
+TURN_DONE = TurnPattern(
+    rf"^\s*✻\s+{VERB}(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?\s*$")
 _SHORT = re.compile(r"[01]s")
 _PROMPT = re.compile(r"^❯")
 _COMMAND_PROMPT = re.compile(r"^[❯›»]\s*/")

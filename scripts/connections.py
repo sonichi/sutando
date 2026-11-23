@@ -47,11 +47,17 @@
   launch INSTANCE --repo DIR --logs-dir DIR [--env-only]
                                start one bridge from the launch plan (--env-only: from the
                                AG2_REMOTE_TOKEN_<INST> variable alone, when the record is unreadable)
+  stop INSTANCE                stop the process holding that bridge's lease, once; the row is unchanged
+                               (the lane keeper starts it again unless a declared bridge serves it)
   start INSTANCE --repo DIR --logs-dir DIR
                                launch unless a bridge already holds the lease; exit 1 naming the
                                reason when it did not start
   import-env                   rows once for REMOTE_TASK_TOKEN and each AG2_REMOTE_TOKEN_<INST>
   launch-plan                  one 'instance<TAB>token_ref<TAB>channel_dir<TAB>primary' line per bridge
+  keep-lanes --repo DIR --logs-dir DIR [--max-s N]
+                               one pass of the primary gateway wrapper: start each launch-plan lane
+                               no bridge holds, backing off a lane that does not start; one line per try.
+                               A pass still running after N seconds (default 300) says so and exits 3
   worker-mcp-credential [--worker ID]
                                one JSON line for a worker seat's MCP proxy: the worker's own identity
                                and vault token, or acts_as=core for a worker with no enabled identity
@@ -61,6 +67,16 @@
   primary                      the primary row's instance ('' = the legacy bridge); exit 2 when none
   enabled                      each row a bridge serves (neither disabled nor parked), one instance per
                                line ('' = the legacy bridge); exit 1 when there is none
+  sync-mcp-lanes [--json] [--descriptor PATH]
+                               write one MCP proxy lane descriptor (+ 0600 env file) per enabled
+                               connection the main descriptor does not serve, and remove stale ones;
+                               a successful launch and park/disconnect/remove keep them current.
+                               Exit 1 with no readable main descriptor (nothing touched)
+  lane-mcp-credential --lane SLUG
+                               one JSON line {lane, bearer, relay} for the MCP proxy's '(vault)' lane
+                               SLUG, from the vault (stdout only; exit 3 refused, the reason on stderr)
+  bridge-pid [INSTANCE]        the pid proven to hold that bridge's lease ('' = the legacy bridge);
+                               nothing when none runs; exit 3 when the lease proves neither
 
 Each verb parses, calls one unit and prints; policy lives in the module.
 """
@@ -258,6 +274,12 @@ def cmd_launch(args) -> int:
     return 0
 
 
+def cmd_stop(args) -> int:
+    pid = connections.stop_bridge(args.instance, workspace=args.workspace)
+    print(f"stopped {args.instance or '(legacy)'} (pid {pid})" if pid else f"{args.instance or '(legacy)'} was not running")
+    return 0
+
+
 def cmd_start(args) -> int:
     record = connections.start(args.instance, repo=args.repo, logs_dir=args.logs_dir, workspace=args.workspace)
     if not record.get("ok"):
@@ -308,6 +330,19 @@ def cmd_primary(args) -> int:
     return 0
 
 
+def cmd_bridge_pid(args) -> int:
+    """Print the pid proven to hold the instance's bridge lease; nothing when none runs, exit 3 when
+    the lease proves neither (`connections.bridge_pid`). A caller may signal only a printed pid."""
+    try:
+        pid = connections.bridge_pid(args.instance, args.workspace)
+    except connections.BridgeLeaseIndeterminate as e:
+        print(f"connections: {e}", file=sys.stderr)
+        return 3
+    if pid:
+        print(pid)
+    return 0
+
+
 def cmd_enabled(args) -> int:
     rows = connections.enabled_rows(args.workspace)
     for r in rows:
@@ -329,6 +364,20 @@ def cmd_worker_mcp_credential(args) -> int:
     return 0
 
 
+def cmd_lane_mcp_credential(args) -> int:
+    """One JSON line with a `(vault)` lane's bearer for the MCP proxy (`connections.lane_mcp_credential`),
+    to stdout alone; a refusal names its reason, never the secret, on stderr and exits 3."""
+    # The proxy logs only the first stderr line, and runs this with no CLAUDE_CONFIG_DIR.
+    os.environ.setdefault("SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER", "1")
+    try:
+        cred = connections.lane_mcp_credential(args.lane, workspace=args.workspace)
+    except connections.NoLaneCredential as e:
+        print(f"lane-mcp-credential: refused, {e.reason}: {e.detail}", file=sys.stderr)
+        return 3
+    print(json.dumps(cred, sort_keys=True))
+    return 0
+
+
 def cmd_worker_mcp_credential_argv(args) -> int:
     """The JSON argv a worker seat exports as AG2_MCP_WORKER_CREDENTIAL (no secret, no vault read)."""
     print(json.dumps(connections.mcp_worker_credential_argv(args.worker, args.repo, args.python, args.workspace)))
@@ -338,6 +387,27 @@ def cmd_worker_mcp_credential_argv(args) -> int:
 def cmd_launch_plan(args) -> int:
     for e in connections.launch_plan(os.environ, workspace=args.workspace):
         print(f"{e['instance']}\t{e['token_ref']}\t{e['channel_dir']}\t{1 if e['primary'] else 0}")
+    return 0
+
+
+def cmd_sync_mcp_lanes(args) -> int:
+    out = connections.sync_mcp_lanes(args.workspace, descriptor=args.descriptor)
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+    elif not out["ok"]:
+        print(f"connections: MCP lanes not synced: {out['reason']}", file=sys.stderr)
+    else:
+        for key in ("written", "unchanged", "removed"):
+            for slug in out[key]:
+                print(f"{key}\t{slug}")
+        for slug, reason in sorted(out["skipped"].items()):
+            print(f"skipped\t{slug}\t{reason}")
+    return 0 if out["ok"] else 1
+
+
+def cmd_keep_lanes(args) -> int:
+    connections.keep_lanes_bounded(max_s=args.max_s, repo=args.repo, logs_dir=args.logs_dir,
+                                   workspace=args.workspace)
     return 0
 
 
@@ -379,6 +449,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_known_servers)
     s = sub.add_parser("launch"); _launch_args(s); s.add_argument("--env-only", action="store_true")
     s.set_defaults(fn=cmd_launch)
+    s = sub.add_parser("stop"); s.add_argument("instance"); s.set_defaults(fn=cmd_stop)
     s = sub.add_parser("start"); _launch_args(s); s.set_defaults(fn=cmd_start)
     s = sub.add_parser("reconnect"); _launch_args(s); s.set_defaults(fn=cmd_reconnect)
     s = sub.add_parser("update-token"); s.add_argument("instance")
@@ -389,13 +460,23 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_update_token)
     sub.add_parser("import-env").set_defaults(fn=cmd_import_env)
     sub.add_parser("launch-plan").set_defaults(fn=cmd_launch_plan)
+    s = sub.add_parser("keep-lanes"); s.add_argument("--repo", type=Path, required=True)
+    s.add_argument("--logs-dir", type=Path, required=True); s.set_defaults(fn=cmd_keep_lanes)
+    s.add_argument("--max-s", type=float, default=connections.LANE_PASS_MAX_S)
     s = sub.add_parser("worker-mcp-credential"); s.add_argument("--worker", default="")
     s.set_defaults(fn=cmd_worker_mcp_credential)
     s = sub.add_parser("worker-mcp-credential-argv"); s.add_argument("--worker", required=True)
     s.add_argument("--repo", type=Path, required=True); s.add_argument("--python", default="")
     s.set_defaults(fn=cmd_worker_mcp_credential_argv)
+    s = sub.add_parser("lane-mcp-credential"); s.add_argument("--lane", required=True)
+    s.set_defaults(fn=cmd_lane_mcp_credential)
     sub.add_parser("primary").set_defaults(fn=cmd_primary)
     sub.add_parser("enabled").set_defaults(fn=cmd_enabled)
+    s = sub.add_parser("sync-mcp-lanes"); s.add_argument("--json", action="store_true")
+    s.add_argument("--descriptor", type=Path, default=None, help="the main MCP descriptor (default: discovered)")
+    s.set_defaults(fn=cmd_sync_mcp_lanes)
+    s = sub.add_parser("bridge-pid"); s.add_argument("instance", nargs="?", default="")
+    s.set_defaults(fn=cmd_bridge_pid)
     return p
 
 

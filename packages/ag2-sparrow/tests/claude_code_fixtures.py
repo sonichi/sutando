@@ -127,9 +127,30 @@ if read("claude-ignore-hup", ""):
 if read("claude-signal-parent", ""):
     os.kill(os.getppid(), getattr(signal, "SIG" + read("claude-signal-parent", "")))
 if read("claude-exit-on-exit", ""):
+    import re as _re
+    def shown(model):
+        # Claude Code echoes a display name for an id ("Fable 5.2"), and an alias as typed.
+        m = _re.match(r"claude-([a-z]+)-([0-9]+(?:-[0-9]+)*)", model)
+        tag = " (1M context)" if model.endswith("[1m]") else ""
+        return "%s %s%s" % (m.group(1).capitalize(), m.group(2).replace("-", "."), tag) if m else model
+    def box():
+        # The input box as Claude Code draws it: a rule, the prompt row, a rule, the footer.
+        print("\u2500" * 40 + "\n" + read("claude-prompt", "\u276f ") + "\n" + "\u2500" * 40 + "\n  \u23f5\u23f5 bypass permissions on",
+              flush=True)
+    box()
     for line in sys.stdin:
+        line = line.lstrip("\x1b")
         if line.strip() == "/exit":
             break
+        if line.startswith("/model ") and read("claude-model-asks", "") and not read("claude-model-asked", ""):
+            open(os.path.join(home, "claude-model-asked"), "w").write(line.strip())
+            print("Switch model?  Yes, switch / No, go back", flush=True)
+        elif line.startswith("/model ") and not read("claude-model-deaf", ""):
+            print("Set model to " + shown(line.split(None, 1)[1].strip()), flush=True)
+            box()
+        elif line.strip() == "" and read("claude-model-asked", ""):
+            print("Set model to " + shown(read("claude-model-asked", "").split(None, 1)[1]), flush=True)
+            box()
     sys.exit(0)
 time.sleep(float(read("claude-linger", "0")))
 sys.exit(int(read("claude-exit", "0")))
@@ -992,3 +1013,37 @@ READY_PANE = """ ▐▛███▛█   Claude Code
 def cm_dict(req):
     from ag2_sparrow.hitl.manager import _req_to_dict
     return _req_to_dict(req)
+
+
+ISOLATED_REPLY = "an isolated answer"
+# A stand-in for the isolated turn's `claude -p`: records what it was given, prints the CLI's JSON result.
+ISOLATED_STUB = r"""import json, os, sys
+rec = os.path.join(%(dir)r, "isolated-runs.jsonl")
+text = sys.stdin.read()
+with open(rec, "a") as f:
+    f.write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(), "listing": sorted(os.listdir(".")),
+                        "files": {n: open(n, "rb").read().decode("latin-1") for n in os.listdir(".")},
+                        "env": dict(os.environ), "stdin": text}) + "\n")
+try:
+    reply = open(os.path.join(%(dir)r, "isolated-reply")).read()
+except OSError:
+    reply = %(reply)r
+if reply == "EXIT1":
+    sys.exit(1)
+print(json.dumps({"type": "result", "is_error": False, "result": reply}))
+"""
+
+
+def write_isolated_stub(d):
+    d = Path(d)
+    py = d / "claude-isolated.py"
+    py.write_text(ISOLATED_STUB % {"dir": str(d), "reply": ISOLATED_REPLY})
+    sh = d / "claude-isolated"
+    sh.write_text('#!/bin/sh\nexec "%s" "%s" "$@"\n' % (sys.executable, py))
+    sh.chmod(0o755)
+    return sh
+
+
+def isolated_runs(d):
+    p = Path(d) / "isolated-runs.jsonl"
+    return [json.loads(line) for line in p.read_text().splitlines()] if p.exists() else []

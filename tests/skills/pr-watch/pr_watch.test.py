@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import signal
 import stat
 import subprocess
@@ -851,6 +852,231 @@ class InProcess(_Tmp):
         self.assertEqual(json.loads(self.st.hooks.read_text()), {})
         self.assertEqual(json.loads(self.st.forwarders.read_text()), {})
 
+    def test_shutdown_drains_a_repo_writer_before_returning(self):
+        runner = pw.Runner(self.st)
+        started, at_cleanup, release, done = [threading.Event() for _ in range(4)]
+        save = runner._save_forwarders
+
+        def gated_save():
+            if runner.stop.is_set():
+                at_cleanup.set()
+                self.assertTrue(release.wait(5))
+            save()
+            started.set()
+
+        def stop():
+            runner.shutdown()
+            done.set()
+
+        with mock.patch.object(runner, "_save_forwarders", side_effect=gated_save), \
+                contextlib.redirect_stdout(io.StringIO()):
+            worker = runner._start_thread(runner.loop, "acme/widgets", threading.Event())
+            self.assertTrue(started.wait(5))
+            stopper = threading.Thread(target=stop)
+            stopper.start()
+            try:
+                self.assertTrue(at_cleanup.wait(5))
+                self.assertFalse(done.wait(1), "shutdown must wait while the actual writer remains gated")
+            finally:
+                release.set()
+                stopper.join(5)
+                worker.join(5)
+            self.assertTrue(done.is_set())
+            self.assertFalse(worker.is_alive())
+        import shutil
+        shutil.rmtree(self.state)
+        self.assertFalse(self.state.exists())
+
+    def test_stop_refuses_a_forwarder_after_its_preflight_finished(self):
+        runner = pw.Runner(self.st)
+        at_spawn, release = threading.Event(), threading.Event()
+        spawn = runner._spawn
+
+        def gated_spawn(args, **kwargs):
+            if args[1:3] == ["webhook", "forward"]:
+                at_spawn.set()
+                self.assertTrue(release.wait(5))
+            return spawn(args, **kwargs)
+
+        with mock.patch.object(runner, "_spawn", side_effect=gated_spawn), \
+                contextlib.redirect_stdout(io.StringIO()):
+            worker = runner._start_thread(runner.loop, "acme/widgets", threading.Event())
+            self.assertTrue(at_spawn.wait(5))
+            stopper = threading.Thread(target=runner.shutdown)
+            stopper.start()
+            try:
+                self.assertTrue(runner.stop.wait(5))
+            finally:
+                release.set()
+                stopper.join(5)
+                worker.join(5)
+        self.assertFalse(stopper.is_alive())
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(self.calls("webhook forward"), [])
+        self.assertEqual(json.loads(self.st.forwarders.read_text()), {})
+
+    def test_shutdown_joins_the_real_recorder_and_stderr_helpers(self):
+        runner = pw.Runner(self.st)
+        ready = threading.Event()
+        track = runner.track_row
+
+        def row(payload):
+            track(payload)
+            ready.set()
+
+        os.environ["FAKE_GH_HOLD"] = "30"
+        with mock.patch.object(runner, "track_row", side_effect=row), contextlib.redirect_stdout(io.StringIO()):
+            runner.sync()
+            self.assertTrue(ready.wait(5))
+            live = list(runner.background)
+            self.assertGreaterEqual(len(live), 3)
+            procs = list(runner.procs.values())
+            runner.shutdown()
+        self.assertTrue(all(not t.is_alive() for t in live))
+        self.assertTrue(all(p.poll() is not None and p.stdout.closed and p.stderr.closed for p in procs))
+        self.assertEqual(json.loads(self.st.forwarders.read_text()), {})
+        self.assertEqual(json.loads(self.st.backoff.read_text()), {})
+
+    def test_shutdown_cancels_and_reaps_a_hung_api_child(self):
+        ready = self.tmp / "api-ready"
+        gh = self.tmp / "bin" / "gh"
+        gh.write_text("#!/usr/bin/env python3\nimport os, signal, time\n"
+                      "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                      "open(os.environ['API_READY'], 'w').write(str(os.getpid()))\n"
+                      "while True: time.sleep(1)\n")
+        os.environ["API_READY"] = str(ready)
+        runner = pw.Runner(self.st)
+        result = []
+        worker = runner._start_thread(lambda: result.append(runner._gh(["api", "synthetic"])))
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            threading.Event().wait(0.01)
+        self.assertTrue(ready.exists())
+        child = next(iter(runner.api_procs))
+        before = time.monotonic()
+        runner.shutdown()
+        self.assertLess(time.monotonic() - before, 5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(child.returncode, -signal.SIGKILL)
+        self.assertNotEqual(result[0].returncode, 0)
+        self.assertEqual(runner.api_procs, set())
+
+    def test_runner_api_timeout_is_bounded_and_its_child_is_reaped(self):
+        gh = self.tmp / "bin" / "gh"
+        gh.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n")
+        runner = pw.Runner(self.st)
+        spawned = []
+        spawn = runner._spawn
+
+        def capture(*args, **kwargs):
+            child = spawn(*args, **kwargs)
+            spawned.append(child)
+            return child
+
+        with mock.patch.object(runner, "_spawn", side_effect=capture), \
+                mock.patch.object(pw, "RUNNER_GH_TIMEOUT_S", 0.05):
+            result = runner._gh(["api", "synthetic"])
+            self.assertEqual(result.returncode, 124)
+            self.assertIsNotNone(spawned[0].returncode)
+            with self.assertRaises(subprocess.CalledProcessError):
+                runner._gh(["api", "synthetic"], check=True)
+        self.assertEqual(runner.api_procs, set())
+        runner.shutdown()
+
+    def descendant_retirement_probe(self, *, after_snapshot):
+        ready = self.tmp / "descendant-ready"
+        leader_exit = self.tmp / "leader-exit"
+        child_code = ("import os,signal,time\n"
+                      "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                      "open(os.environ['CHILD_READY'],'w').write(str(os.getpid()))\n"
+                      "while True: time.sleep(1)\n")
+        gh = self.tmp / "bin" / "gh"
+        gh.write_text("#!/usr/bin/env python3\nimport os,subprocess,sys,time\n"
+                      f"subprocess.Popen([sys.executable,'-c',{child_code!r}], "
+                      "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                      "while not os.path.exists(os.environ['LEADER_EXIT']): time.sleep(0.01)\n")
+        os.environ["CHILD_READY"] = str(ready)
+        os.environ["LEADER_EXIT"] = str(leader_exit)
+        runner = pw.Runner(self.st)
+        retired = threading.Event()
+
+        def call():
+            runner._gh(["api", "synthetic"])
+            retired.set()
+
+        worker = runner._start_thread(call)
+        deadline = time.monotonic() + 5
+        while (not ready.exists() or not ready.read_text()) and time.monotonic() < deadline:
+            threading.Event().wait(0.01)
+        self.assertTrue(ready.exists())
+        child = int(ready.read_text())
+        terminate = runner._terminate
+
+        def retire_before_termination(procs):
+            leader_exit.touch()
+            self.assertTrue(retired.wait(5))
+            self.assertEqual(runner.process_groups, set())
+            terminate(procs)
+
+        try:
+            if after_snapshot:
+                with mock.patch.object(runner, "_terminate", side_effect=retire_before_termination):
+                    runner.shutdown()
+            else:
+                leader_exit.touch()
+                self.assertTrue(retired.wait(5))
+                status = subprocess.run(["ps", "-o", "stat=", "-p", str(child)],
+                                        capture_output=True, text=True).stdout.strip()
+                self.assertTrue(not status or status.startswith("Z"), status)
+                runner.shutdown()
+            self.assertFalse(worker.is_alive())
+            status = subprocess.run(["ps", "-o", "stat=", "-p", str(child)],
+                                    capture_output=True, text=True).stdout.strip()
+            self.assertTrue(not status or status.startswith("Z"), status)
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(child, signal.SIGKILL)
+
+    def test_shutdown_handles_api_retirement_after_its_process_snapshot(self):
+        self.descendant_retirement_probe(after_snapshot=True)
+
+    def test_normal_api_completion_ends_its_private_descendants(self):
+        self.descendant_retirement_probe(after_snapshot=False)
+
+    def test_shutdown_cleanup_has_one_budget_and_retains_failed_deletions(self):
+        runner = pw.Runner(self.st)
+        pw.record_hooks(self.st, "acme/widgets", [77, 78])
+        with mock.patch.object(pw, "SHUTDOWN_CLEANUP_S", 0), \
+                mock.patch.object(runner, "_gh", wraps=runner._gh) as run:
+            runner.shutdown()
+        self.assertEqual(run.call_count, 0)
+        self.assertEqual(json.loads(self.st.hooks.read_text()), {"acme/widgets": [77, 78]})
+
+    def test_stopped_runner_accepts_no_threads_or_api_children(self):
+        runner = pw.Runner(self.st)
+        runner.shutdown()
+        target = mock.Mock()
+        self.assertIsNone(runner._start_thread(target))
+        self.assertEqual(runner._gh(["api", "synthetic"]).returncode, 130)
+        target.assert_not_called()
+        self.assertEqual(self.calls("api"), [])
+
+    def test_shutdown_reaps_a_replaced_forwarder_still_owned_by_the_runner(self):
+        runner = pw.Runner(self.st)
+        os.environ["FAKE_GH_HOLD"] = "30"
+        args = ["gh", "webhook", "forward", "--repo=acme/widgets"]
+        children = [runner._spawn(args, repo="acme/widgets") for _ in range(2)]
+        try:
+            runner.shutdown()
+            self.assertTrue(all(child.returncode is not None for child in children))
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait()
+                child.stdout.close()
+                child.stderr.close()
+
     def test_main_dispatches_run(self):
         with mock.patch.object(pw, "cmd_run", return_value=0) as run:
             self.assertEqual(self.cli("run")[0], 0)
@@ -1421,6 +1647,124 @@ class Tracker(_Tmp):
         self.assertEqual(rc, 0)
         self.assertTrue(out.startswith("PR_WATCH_NOTE tracker publish skipped: no room-commons script"), out)
         self.assertIn("acme/widgets#7", self.data()["rows"])
+
+
+ROUTE_SCRIPT = r"""
+import json, os, sys, time
+with open(os.environ["ROUTE_LOG"], "a") as fh:
+    fh.write(json.dumps(sys.argv[1:]) + "\n")
+mode = os.environ.get("ROUTE_MODE", "handed")
+if mode == "sleep":
+    time.sleep(30)
+if mode == "fail":
+    print("handed someone")
+    sys.exit(3)
+print("thinking...")
+print("handed w-1" if mode == "handed" else "local")
+"""
+
+
+class RouteCmd(_Tmp):
+    """PR_WATCH_ROUTE_CMD: an event the command hands off is noted, not sent; anything else stays here."""
+
+    LINE = "PR_EVENT acme/widgets#7 review_submitted by=bob state=changes_requested author=alice head=0badc0de"
+
+    def setUp(self):
+        super().setUp()
+        self.st = pw.State(self.state)
+        self.st.ensure()
+        script = self.tmp / "route.py"
+        script.write_text(ROUTE_SCRIPT)
+        self.route_log = self.tmp / "route.log"
+        os.environ["ROUTE_LOG"] = str(self.route_log)
+        os.environ["PR_WATCH_ROUTE_CMD"] = shlex.join([sys.executable, str(script)])
+        self.payload = fixture("pull_request_review.submitted")
+        self.cli("add", "--repo", "acme/widgets", "--author", "alice", "--author", "bob")
+        self.runner = pw.Runner(self.st)
+
+    def deliver(self, line=None):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.runner.deliver(line or self.LINE, self.payload)
+        return out.getvalue().splitlines()
+
+    def runs(self):
+        return [json.loads(l) for l in self.route_log.read_text().splitlines()] if self.route_log.exists() else []
+
+    def test_a_handed_event_is_noted_not_sent_and_the_command_gets_the_event(self):
+        self.assertEqual(self.deliver(), [f"PR_WATCH_NOTE handed to w-1: {self.LINE}"])
+        self.assertEqual(self.runs(), [["--event", self.LINE, "--repo", "acme/widgets", "--number", "7",
+                                        "--head", "0badc0de9999", "--authors", "alice,bob",
+                                        "--cache-dir", str(self.state / "route")]])
+
+    def test_a_command_whose_path_has_a_space_runs_when_quoted(self):
+        spaced = self.tmp / "Application Support"
+        spaced.mkdir()
+        script = spaced / "route.py"
+        script.write_text(ROUTE_SCRIPT)
+        os.environ["PR_WATCH_ROUTE_CMD"] = shlex.join([sys.executable, str(script)])
+        self.assertEqual(self.deliver(), [f"PR_WATCH_NOTE handed to w-1: {self.LINE}"])
+
+    def test_a_repeat_within_the_window_is_dropped_without_rerunning(self):
+        self.deliver()
+        self.assertEqual(self.deliver(), [])
+        self.assertEqual(len(self.runs()), 1)
+
+    def test_local_keeps_the_event_here_and_a_repeat_is_still_sent(self):
+        os.environ["ROUTE_MODE"] = "local"
+        self.assertEqual(self.deliver(), [self.LINE])
+        self.assertEqual(self.deliver(), [self.LINE], "the mod dedupes it, as before")
+        self.assertEqual(len(self.runs()), 1)
+
+    def test_a_failing_command_keeps_the_event_here(self):
+        os.environ["ROUTE_MODE"] = "fail"
+        self.assertEqual(self.deliver(), ["PR_WATCH_NOTE route command exited 3; kept the event here", self.LINE])
+
+    def test_a_timeout_keeps_the_event_here(self):
+        os.environ["ROUTE_MODE"] = "sleep"
+        with mock.patch.object(pw, "ROUTE_TIMEOUT_S", 0.5):
+            t0 = time.monotonic()
+            lines = self.deliver()
+        self.assertLess(time.monotonic() - t0, 10)
+        self.assertEqual(lines, ["PR_WATCH_NOTE route command timed out; kept the event here", self.LINE])
+
+    def test_unset_is_todays_behaviour(self):
+        del os.environ["PR_WATCH_ROUTE_CMD"]
+        self.assertEqual(self.deliver(), [self.LINE])
+        self.assertEqual(self.runs(), [])
+
+    def test_the_config_json_layer_turns_it_on(self):
+        cmd = os.environ.pop("PR_WATCH_ROUTE_CMD")
+        self.assertEqual(self.cli("config", "set", "PR_WATCH_ROUTE_CMD", cmd)[0], 0)
+        self.assertEqual(self.deliver(), [f"PR_WATCH_NOTE handed to w-1: {self.LINE}"])
+
+    def test_an_unsplittable_or_missing_command_keeps_the_event_here(self):
+        os.environ["PR_WATCH_ROUTE_CMD"] = "'unterminated"
+        lines = self.deliver()
+        self.assertEqual(lines[-1], self.LINE)
+        self.assertIn("is not a command line", lines[0])
+        os.environ["PR_WATCH_ROUTE_CMD"] = str(self.tmp / "no-such-command")
+        lines = self.deliver(self.LINE + "x")
+        self.assertEqual(lines[-1], self.LINE + "x")
+        self.assertIn("route command did not start", lines[0])
+
+    def test_forward_once_routes_each_emitted_event_and_still_updates_the_row(self):
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        gh = bin_dir / "gh"
+        gh.write_text(FWD_GH)
+        gh.chmod(gh.stat().st_mode | stat.S_IXUSR)
+        os.environ.update({"PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                           "FAKE_GH_LOG": str(self.tmp / "gh.log"),
+                           "FAKE_GH_HOOKFILE": str(self.tmp / "hooks.txt"),
+                           "FAKE_GH_EMIT": str(FIXTURES / "pull_request.opened.json")})
+        self.cli("add", "--repo", "acme/widgets", "--author", "alice")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.runner.forward_once("acme/widgets")
+        line = "PR_EVENT acme/widgets#7 opened author=alice head=a1b2c3d4 merged=false reason=author"
+        self.assertEqual(out.getvalue().splitlines(), [f"PR_WATCH_NOTE handed to w-1: {line}"])
+        self.assertIn("acme/widgets#7", json.loads(self.st.tracker.read_text())["rows"])
 
 
 if __name__ == "__main__":

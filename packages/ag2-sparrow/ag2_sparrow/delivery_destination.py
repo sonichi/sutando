@@ -130,8 +130,8 @@ def route(body: str, skip_after_channel: bool = True) -> "tuple[str, str | None,
       * [channel: !r:s]→ 'send' to that room, marker stripped
       * [channel: C…/digits] → 'foreign' — that bridge owns the file (review
                          blocker: claiming it here would leak the raw body)
-      * attach markers → stripped by the parser; uploads are unsupported on
-                         the room-message op, so the actions are ignored
+      * attach markers → stripped by the parser; the gateway drain uploads
+                         them to the room after the message is delivered
       * [thread: $root]→ stripped here; the send reads it via
                          _proactive_thread_root and posts in that thread
       * bare [thread]  → task results only; stripped and ignored here

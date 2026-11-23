@@ -208,6 +208,7 @@ SHELL_SENDERS = (
     "src/agent/codex/cli/task-notifier-supervisor.sh",
     "src/launchd/channel-bridge-wrapper.sh",
     "src/launchd/gateway-bridge-wrapper.sh",
+    "src/launchd/gateway-bridge-lib.sh",
 )
 
 # Every file allowed to spell an osascript notification, and the gate it must carry.

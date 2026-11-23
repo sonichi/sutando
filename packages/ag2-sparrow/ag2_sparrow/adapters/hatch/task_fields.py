@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 from ... import agent_triggers, gateway_instance, local_task_protocol, task_hold
-from ...task_io import attested_headers
+from ...task_io import attested_headers, is_collaborator
 
 SNIPPET_MAX = 500
 REPLY_CONTEXT_MAX = 2000
@@ -117,12 +117,12 @@ def task_fields(task_file: Path, result_dir: Path, instance: "str | None" = "") 
         "thread_root": _field(h, "thread_root"),
         # Which AgentTrigger raised the task; None (no header) reads as a message.
         "event_type": agent_triggers.event_type_value(_field(h, "event_type")),
-        # No skills tree here: only registry playbooks, which the core would also allow.
+        # No skills tree here: only registry ids; the core still checks the manifest opt-in.
         "playbook": agent_triggers.allowed_playbook_value(_field(h, "playbook")),
         "sender": _field(h, "user_id"),
         "sender_name": _field(h, "sender_name"),
         "access_tier": tier,
-        "collaborator": tier == "team" and (h.get("collaborator") or "").strip() == "true",
+        "collaborator": is_collaborator({"access_tier": tier, "collaborator": (h.get("collaborator") or "").strip()}),
         "snippet": snippet(message),
         "task_file": str(task_file),
         "result_file": str(result_dir / f"{tid}.txt"),

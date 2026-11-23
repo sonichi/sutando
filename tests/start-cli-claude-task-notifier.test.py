@@ -5,8 +5,8 @@
 Real launcher, real tmux on a private socket, a copied repo whose
 sutando-config.sh names a scratch workspace, and a stub `claude`.
 Run: python3 tests/start-cli-claude-task-notifier.test.py
-The heal-path and watcher-identity classes live in the -heal and -identity
-files beside this one; both import the Harness from here.
+The heal-path, watcher-identity and replace/mode classes live in the -heal,
+-identity and -modes files beside this one; each imports the Harness from here.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ REPO = Path(__file__).resolve().parent.parent
 TMUX = shutil.which("tmux") or shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
 PGREP_STUB = ('[ "$*" = "-ax claude" ] || exit 0\n'
               '[ -s "$HOME/claude.pid" ] && echo "$(cat "$HOME/claude.pid") claude"\n')
-CLAUDE_STUB = 'echo $$ > "$HOME/claude.pid"\nsleep 120\n'
+CLAUDE_STUB = '[ "$1" = --version ] && exit 0\necho $$ > "$HOME/claude.pid"\nsleep 120\n'
 
 
 class Harness:
@@ -36,8 +36,8 @@ class Harness:
         # Only the worker's own launcher, not the whole skill: this harness
         # tests the launch mechanics, not worker-pool's own behavior.
         (root / "skills" / "worker-pool" / "scripts").mkdir(parents=True)
-        shutil.copy2(REPO / "skills/worker-pool/scripts/launch-worker-session.sh",
-                    root / "skills/worker-pool/scripts/launch-worker-session.sh")
+        for name in ("launch-worker-session.sh", "worker-mcp-credential.sh"):
+            shutil.copy2(REPO / "skills/worker-pool/scripts" / name, root / "skills/worker-pool/scripts" / name)
         self.root = root
         ws = self.td / "ws"
         (ws / "state").mkdir(parents=True)
@@ -60,7 +60,9 @@ class Harness:
         self.sock = self.td / "t.sock"
         self.env = {"PATH": f"{bind}:{Path(TMUX).parent}:/usr/bin:/bin:/usr/sbin",
                     "HOME": str(self.td / "home"), "SUTANDO_TMUX_SOCKET": str(self.sock),
-                    "SUTANDO_TEST_MODE": "1"}
+                    "SUTANDO_TEST_MODE": "1",
+                    # The stub claude never answers --version; the Mod has its own launch tests.
+                    "SUTANDO_TASK_WATCH_MOD_CORE": "0"}
 
     def tm(self, *a):
         return subprocess.run([TMUX, "-S", str(self.sock), *a], capture_output=True, text=True)
@@ -143,80 +145,16 @@ class CoreLaunchStartsSupervisedNotifier(unittest.TestCase):
             time.sleep(0.1)
         self.assertEqual(out.read_text().splitlines()[0], "", "the session's explicit empty value wins over the global 1")
 
-    def test_restart_tears_the_watcher_down_with_the_core(self):
-        created_before = self.h.watcher_created()
-        time.sleep(1.1)
-        run = self.h.launch("--restart", extra_env={"SUTANDO_RESTART_GRACE_S": "2"})
-        # --restart recreates the core, and with it a fresh watcher; the old one must be gone
-        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        exists, cmd, _ = self.h.watcher()
-        self.assertTrue(exists, "restart left no watcher for the new core")
-        self.assertIn("task-notifier-supervisor.sh", cmd)
-        self.assertNotEqual(created_before, self.h.watcher_created(),
-                            "restart kept the old watcher session alive")
-        sessions = self.h.tm("list-sessions", "-F", "#{session_name}").stdout.split()
-        self.assertEqual(sessions.count("sutando-core-watcher"), 1)
-
-
-class LauncherForwardsOnlyAGenuinePin(unittest.TestCase):
-    """Since #4503, the launcher resolves nothing: the watcher declares/reads
-    its own handler via a config file it fswatches. The launcher's only job
-    left is to forward a pin the operator already set, verbatim."""
-
-    def setUp(self):
-        self.h = Harness()
-
-    def tearDown(self):
-        self.h.close()
-
-    def test_no_pin_no_handler_reaches_the_watcher(self):
+    def test_the_alert_knobs_are_always_set_so_a_server_global_value_never_reaches_the_watcher(self):
+        self.h.tm("set-environment", "-g", "SUTANDO_NOTIFIER_ALERT_GRACE", "7")
+        self.h.tm("set-environment", "-g", "SUTANDO_NOTIFIER_ALERT_REPEAT", "0")
+        self.h.tm("kill-session", "-t", "=sutando-core-watcher")
         run = self.h.launch()
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         _, _, env = self.h.watcher()
-        self.assertNotIn("SUTANDO_TASK_EVENT_HANDLER=", env)
-
-    def test_an_explicit_pin_reaches_the_watcher_verbatim(self):
-        run = self.h.launch(extra_env={"SUTANDO_TASK_EVENT_HANDLER": "/opt/handler"})
-        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        _, _, env = self.h.watcher()
-        self.assertIn("SUTANDO_TASK_EVENT_HANDLER=/opt/handler", env)
-
-
-class WorkerLaunchStartsNoNotifier(unittest.TestCase):
-    """A worker no longer even CAN reach start-cli.sh's notifier/monitor
-    machinery: it has its own launcher (skills/worker-pool/scripts/
-    launch-worker-session.sh), which contains no ensure_task_notifier or
-    ensure_core_monitor call at all -- not a guard that happens to return
-    early, an absent call site. Real launcher, real tmux, same rigor as the
-    core-side tests above."""
-
-    def test_worker_launch_creates_no_watcher_session(self):
-        h = Harness()
-        try:
-            wid = "c" * 32
-            delivery_writer = h.td / "pool_delivery.py"
-            delivery_writer.write_text("# Test-only writer path for the worker launcher.\n")
-            run = h.launch_worker(extra_env={"SUTANDO_INSTANCE_ID": wid,
-                                             "SUTANDO_TMUX_SESSION": "sutando-worker-" + wid,
-                                             "SUTANDO_TASKS_DIR": "/tmp/never-read-worker-inbox",
-                                             "SUTANDO_POOL_DELIVERY_SCRIPT": str(delivery_writer),
-                                             "SUTANDO_CLAUDE_SESSION_ID": "11111111-2222-3333-4444-555555555555"})
-            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-            sessions = h.tm("list-sessions", "-F", "#{session_name}").stdout.split()
-            self.assertIn("sutando-worker-" + wid, sessions, sessions)
-            self.assertFalse(any(s.endswith("-watcher") for s in sessions), sessions)
-        finally:
-            h.close()
-
-    def test_the_worker_launcher_has_no_notifier_or_monitor_call_site(self):
-        """Source-tied guard, same shape as the core-side tests: if a future
-        edit reintroduces a notifier/monitor call into the worker's own
-        launcher, this fails even if the live-tmux test above somehow didn't
-        exercise the new path."""
-        worker_launcher = (REPO / "skills/worker-pool/scripts/launch-worker-session.sh").read_text()
-        for forbidden in ("ensure_task_notifier", "ensure_core_monitor"):
-            self.assertNotIn(forbidden, worker_launcher,
-                             f"the worker launcher calls {forbidden}, which is core-only")
+        lines = env.splitlines()
+        self.assertIn("SUTANDO_NOTIFIER_ALERT_GRACE=", lines)
+        self.assertIn("SUTANDO_NOTIFIER_ALERT_REPEAT=", lines)
 
 
 if __name__ == "__main__":

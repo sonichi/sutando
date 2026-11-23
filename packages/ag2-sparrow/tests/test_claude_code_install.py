@@ -93,7 +93,7 @@ class ConnectInstall(ConnectBase):
         self.assertEqual((cfg["CLAUDE"], cfg["PLUGIN_DIR"], cfg["INBOX_DIR"], cfg["RESULTS_DIR"], cfg["ROOT"]),
                          (str(self.claude), str(self.plugin), str(self.inbox), str(self.results), str(self.work)))
         self.assertEqual((cfg["PERMISSION_MODE"], cfg["HMAC_STRICT"], cfg["ALLOW_NON_OWNER"], cfg["ALLOW_COLLABORATOR"]),
-                         ("bypassPermissions", "1", "", ""), "a key file alone is strict; non-owner and collaborator tasks are off")
+                         ("bypassPermissions", "1", "1", "1"), "a key file alone is strict; collaborators and other non-owners on")
         self.assertTrue(cli.SESSION_ID_RE.match(cfg["SESSION_ID"]), "install mints the session id")
         self.assertEqual(cfg["HITL_STORE"], str(cli.hitl_store_root()), "the bridge's claude-local root is persisted")
         self.assertTrue(self.inbox.is_dir() and self.results.is_dir())
@@ -148,6 +148,113 @@ class ConnectInstall(ConnectBase):
         second = cli.read_config(cli.config_path())["SESSION_ID"]
         self.assertNotEqual(second, first)
         self.assertTrue(cli.SESSION_ID_RE.match(second))
+
+    RESUMED = "0f1e2d3c-4b5a-4968-8778-695a4b3c2d1e"
+
+    def transcript(self, session_id=None, folder="-Users-owner-long-project"):
+        """A conversation the owner made elsewhere: its transcript in another project folder of the config dir."""
+        projects = self.home / ".claude-sutando" / "projects" / folder
+        projects.mkdir(parents=True, exist_ok=True)
+        path = projects / ((session_id or self.RESUMED) + ".jsonl")
+        path.write_text('{"type":"user","sessionId":"%s"}\n' % (session_id or self.RESUMED))
+        return path
+
+    def live_registry(self, session_id, pid):
+        """The CLI's own record of a running process holding a conversation open."""
+        sessions = self.home / ".claude-sutando" / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        (sessions / f"{pid}.json").write_text(json.dumps({"pid": pid, "sessionId": session_id, "kind": "interactive"}))
+
+    def test_resume_session_records_an_existing_conversation_as_the_session_id(self):
+        transcript = self.transcript()
+        runner = self.runner()
+        rc, out, err = self.install_with(runner, False, "--resume-session", self.RESUMED.upper())
+        self.assertEqual(rc, 0, err)
+        self.assertIn(f"resuming the existing conversation {self.RESUMED}", out)
+        cfg = cli.read_config(cli.config_path())
+        self.assertEqual(cfg["SESSION_ID"], self.RESUMED, "recorded lower-cased, as the CLI names it")
+        self.assertEqual(hold_mod.claude_argv(cfg, cfg["SESSION_ID"])[-2:], ["--resume", self.RESUMED],
+                         "the pane resumes it although its transcript sits in another project folder")
+        self.assertEqual(transcript.read_text(), '{"type":"user","sessionId":"%s"}\n' % self.RESUMED, "never copied or touched")
+        self.assertEqual(self.install_with(runner)[0], 0)
+        self.assertEqual(cli.read_config(cli.config_path())["SESSION_ID"], self.RESUMED, "a reinstall keeps it")
+
+    def test_resume_session_refuses_a_malformed_id_a_missing_transcript_and_a_conversation_open_elsewhere(self):
+        runner = self.runner()
+        rc, _, err = self.install_with(runner, False, "--resume-session", "not-a-uuid")
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertIn("is not a Claude Code session id", err)
+        rc, _, err = self.install_with(runner, False, "--resume-session", self.RESUMED)
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertIn(f"no conversation {self.RESUMED} under {self.home / '.claude-sutando' / 'projects'}", err)
+        self.transcript()
+        self.live_registry(self.RESUMED, os.getpid())
+        rc, _, err = self.install_with(runner, False, "--resume-session", self.RESUMED)
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertIn(f"is open in a running Claude Code process (pid {os.getpid()})", err)
+        self.assertFalse(cli.config_path().exists(), "refused before anything is written")
+        self.assertEqual(runner.verbs("systemctl"), [], "nor anything stopped or started")
+        dead = subprocess.Popen(["sleep", "0"]); dead.wait()
+        self.live_registry(self.RESUMED, dead.pid)
+        (self.home / ".claude-sutando" / "sessions" / f"{os.getpid()}.json").unlink()
+        rc, _, err = self.install_with(runner, False, "--resume-session", self.RESUMED)
+        self.assertEqual(rc, 0, "a registry entry whose process is gone does not hold it: " + err)
+
+    def test_resume_session_looks_only_in_the_configured_claude_config_dir(self):
+        """A host installs with a config dir of the agent's own: the CLI's default ~/.claude is never searched."""
+        default = self.home / ".claude" / "projects" / "-Users-owner-long-project"
+        default.mkdir(parents=True)
+        (default / (self.RESUMED + ".jsonl")).write_text("{}\n")
+        rc, _, err = self.install_with(self.runner(), False, "--resume-session", self.RESUMED)
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertIn(f"no conversation {self.RESUMED} under {self.home / '.claude-sutando' / 'projects'}", err)
+        self.assertEqual(cli.resume_problem("", self.RESUMED), "", "with no config dir recorded, the CLI's default is it")
+
+    def test_resume_session_and_new_session_are_exclusive(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()) as err:
+            cli.main(["install", "--new-session", "--resume-session", self.RESUMED])
+        self.assertIn("not allowed with argument", err.getvalue())
+
+    def test_resume_session_replaces_a_kept_id_only_over_a_dead_generation(self):
+        runner = self.runner()
+        self.assertEqual(self.install_with(runner)[0], 0)
+        first = cli.read_config(cli.config_path())["SESSION_ID"]
+        self.transcript()
+        live = {"server_pid": os.getpid(), "server_start": holder_lock.start_time(os.getpid()), "session_id": "$1",
+                "session_created": 1, "pane_id": "%0", "pane_pid": 1, "start_command": "x", "nonce": "0" * 32}
+        self.assertEqual(inbox.prepare_root(str(self.work)), "")
+        records.save_supervisor(str(self.work), dict(records.empty_supervisor(), generation=live))
+        rc, out, err = self.install_with(runner, False, "--resume-session", self.RESUMED)
+        self.assertEqual(rc, cli.EXIT_RESUME_NOT_APPLIED, err)
+        self.assertIn(f"kept the session id {first}", out)
+        self.assertIn(f"error: --resume-session {self.RESUMED} was not applied", err)
+        self.assertIsNotNone(runner.pid(), "the job is installed and running under the kept id")
+        self.assertEqual(cli.read_config(cli.config_path())["SESSION_ID"], first)
+        dead = subprocess.Popen(["sleep", "0"]); dead.wait()
+        records.save_supervisor(str(self.work), dict(records.empty_supervisor(), generation=dict(live, server_pid=dead.pid,
+                                                                                                 server_start="never")))
+        rc, out, err = self.install_with(runner, False, "--resume-session", self.RESUMED)
+        self.assertEqual(rc, 0, err)
+        self.assertIn(f"resuming the existing conversation {self.RESUMED}", out)
+        self.assertNotIn("rotating", out)
+        self.assertEqual(cli.read_config(cli.config_path())["SESSION_ID"], self.RESUMED)
+
+    def test_the_connectors_own_running_session_does_not_block_resuming_its_own_id(self):
+        self.transcript()
+        runner = self.runner()
+        self.assertEqual(self.install_with(runner, False, "--resume-session", self.RESUMED)[0], 0)
+        self.live_registry(self.RESUMED, os.getpid())
+        rc, _, err = self.install_with(runner, False, "--resume-session", self.RESUMED)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(cli.resume_problem(str(self.home / ".claude-sutando"), self.RESUMED, kept="")[:18],
+                         "conversation 0f1e2", "another job's id open elsewhere is still refused")
+
+    def test_the_default_install_still_mints_and_starts_with_session_id(self):
+        self.transcript()
+        self.assertEqual(self.install_with(self.runner())[0], 0)
+        cfg = cli.read_config(cli.config_path())
+        self.assertNotEqual(cfg["SESSION_ID"], self.RESUMED)
+        self.assertEqual(hold_mod.claude_argv(cfg, cfg["SESSION_ID"])[-2:], ["--session-id", cfg["SESSION_ID"]])
 
     def test_an_identical_retry_performs_the_whole_apply_again(self):
         runner = self.runner()
@@ -1082,38 +1189,51 @@ class ConnectStrict(ConnectBase):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             self.install("--hmac-strict", "--no-hmac-strict")
 
-    def test_allow_collaborator_is_persisted_off_by_default_independent_of_allow_non_owner_and_shown_by_verify(self):
-        runner = self.runner()
-        self.assertEqual(self.install_with(runner, False, "--allow-non-owner")[0], 0)
-        self.assertEqual(cli.read_config(cli.config_path())["ALLOW_COLLABORATOR"], "", "--allow-non-owner does not imply it")
-        self.assertIn("INFO collaborator tasks: refused (--allow-collaborator off)", self.main("verify")[1])
-        self.assertFalse(inbox.allow_collaborator())
-        self.assertEqual(self.install_with(runner, False, "--allow-collaborator")[0], 0)
-        cfg = cli.read_config(cli.config_path())
-        self.assertEqual((cfg["ALLOW_COLLABORATOR"], cfg["ALLOW_NON_OWNER"]), ("1", ""))
-        self.assertIn("INFO collaborator tasks: submitted into this session with the non-owner note (--allow-collaborator)",
-                      self.main("verify")[1])
-        self.assertTrue(inbox.allow_collaborator())
-        self.assertFalse(inbox.allow_non_owner())
-        self.assertTrue(inbox.allow_collaborator({inbox.CONFIG_DIR_VAR: str(cli.config_dir())}), "the pane's config dir")
-        self.assertFalse(inbox.allow_collaborator({inbox.CONFIG_DIR_VAR: str(self.home / "none")}), "unreadable reads as off")
-        path = cli.config_path()
-        path.write_text("".join(l for l in path.read_text().splitlines(True) if not l.startswith("ALLOW_COLLABORATOR=")))
-        self.assertFalse(inbox.allow_collaborator(), "a config written before the flag existed keeps refusing")
-        self.assertIn("INFO collaborator tasks: refused (--allow-collaborator off)", self.main("verify")[1])
-
-    def test_allow_non_owner_is_persisted_off_by_default_and_shown_by_verify(self):
+    def test_collaborators_are_on_by_default_opted_out_by_no_allow_collaborator_and_shown_by_verify(self):
         runner = self.runner()
         self.assertEqual(self.install_with(runner)[0], 0)
-        self.assertEqual(cli.read_config(cli.config_path())["ALLOW_NON_OWNER"], "")
-        self.assertIn("INFO non-owner tasks: refused (owner only)", self.main("verify")[1])
-        self.assertFalse(inbox.allow_non_owner())
-        self.assertEqual(self.install_with(runner, False, "--allow-non-owner")[0], 0)
+        cfg = cli.read_config(cli.config_path())
+        self.assertEqual((cfg["ALLOW_COLLABORATOR"], cfg["ALLOW_NON_OWNER"]), ("1", "1"))
+        self.assertIn("INFO collaborator tasks: submitted into this session with the non-owner note (the default; "
+                      "--no-allow-collaborator opts out)", self.main("verify")[1])
+        self.assertTrue(inbox.allow_collaborator())
+        self.assertTrue(inbox.allow_collaborator({inbox.CONFIG_DIR_VAR: str(cli.config_dir())}), "the pane's config dir")
+        self.assertFalse(inbox.allow_collaborator({inbox.CONFIG_DIR_VAR: str(self.home / "none")}), "unreadable reads as off")
+        self.assertEqual(self.install_with(runner, False, "--no-allow-collaborator")[0], 0)
+        self.assertEqual(cli.read_config(cli.config_path())["ALLOW_COLLABORATOR"], "0")
+        self.assertIn("INFO collaborator tasks: refused (--no-allow-collaborator)", self.main("verify")[1])
+        self.assertFalse(inbox.allow_collaborator())
+        self.assertEqual(self.install_with(runner, False, "--allow-collaborator")[0], 0)
+        self.assertEqual(cli.read_config(cli.config_path())["ALLOW_COLLABORATOR"], "1", "the older flag still works")
+        self.assertTrue(inbox.allow_collaborator())
+        path = cli.config_path()
+        for written in ("", None):
+            lines = [l for l in path.read_text().splitlines(True) if not l.startswith("ALLOW_COLLABORATOR=")]
+            path.write_text("".join(lines + ([] if written is None else ["ALLOW_COLLABORATOR=\n"])))
+            self.assertTrue(inbox.allow_collaborator(), "an older install's empty or absent value serves them now")
+
+    def test_non_owners_are_on_by_default_opted_out_by_no_allow_non_owner_and_shown_by_verify(self):
+        runner = self.runner()
+        self.assertEqual(self.install_with(runner)[0], 0)
         self.assertEqual(cli.read_config(cli.config_path())["ALLOW_NON_OWNER"], "1")
-        self.assertIn("INFO non-owner tasks: submitted with the non-owner note (--allow-non-owner)", self.main("verify")[1])
+        self.assertIn("INFO non-owner tasks: answered on an isolated read-only `claude -p` turn, never this session "
+                      "(the default; --no-allow-non-owner opts out)", self.main("verify")[1])
         self.assertTrue(inbox.allow_non_owner())
         self.assertTrue(inbox.allow_non_owner({inbox.CONFIG_DIR_VAR: str(cli.config_dir())}), "the pane's config dir")
         self.assertFalse(inbox.allow_non_owner({inbox.CONFIG_DIR_VAR: str(self.home / "none")}), "unreadable reads as off")
+        self.assertEqual(self.install_with(runner, False, "--no-allow-non-owner")[0], 0)
+        self.assertEqual(cli.read_config(cli.config_path())["ALLOW_NON_OWNER"], "0")
+        self.assertIn("INFO non-owner tasks: refused (--no-allow-non-owner)", self.main("verify")[1])
+        self.assertFalse(inbox.allow_non_owner())
+        self.assertEqual(self.install_with(runner, False, "--allow-non-owner")[0], 0)
+        self.assertEqual(cli.read_config(cli.config_path())["ALLOW_NON_OWNER"], "1", "the older flag still works")
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self.install("--allow-non-owner", "--no-allow-non-owner")
+        path = cli.config_path()
+        for written in ("", None):
+            lines = [l for l in path.read_text().splitlines(True) if not l.startswith("ALLOW_NON_OWNER=")]
+            path.write_text("".join(lines + ([] if written is None else ["ALLOW_NON_OWNER=\n"])))
+            self.assertTrue(inbox.allow_non_owner(), "an older install's empty or absent value serves them now")
         self.assertEqual(inbox.CONFIG_DIR_VAR, hold_mod.ENV_CONFIG_DIR)
 
 
@@ -1536,8 +1656,8 @@ class ConnectOccupancy(ConnectBase):
 
 
 class CollaboratorAdmission(ConnectBase):
-    """--allow-collaborator through the real inbox verbs: refused by default and under --allow-non-owner
-    alone, claimed with its admission when set; plain team and guest stay with --allow-non-owner."""
+    """Collaborators through the real inbox verbs: claimed by default, refused under --no-allow-collaborator;
+    plain team and guest are always refused."""
 
     def setUp(self):
         super().setUp()
@@ -1556,8 +1676,8 @@ class CollaboratorAdmission(ConnectBase):
         (self.inbox / (task_id + ".txt")).write_text("id: %s\n%saccess_tier: %s\ntask: hi\n" % (task_id, extra, tier))
         return task_id
 
-    def test_a_collaborator_is_refused_by_default_and_under_allow_non_owner_alone_naming_allow_collaborator(self):
-        for i, over in enumerate(({}, {"ALLOW_NON_OWNER": "1"})):
+    def test_a_collaborator_is_refused_under_no_allow_collaborator_whatever_allow_non_owner_says(self):
+        for i, over in enumerate(({"ALLOW_COLLABORATOR": "0"}, {"ALLOW_COLLABORATOR": "0", "ALLOW_NON_OWNER": "1"})):
             self.configure(**over)
             t = self.task("task-c%d" % i, "team", "collaborator: true\n")
             rc, out = self.verb("claim", t)
@@ -1567,14 +1687,19 @@ class CollaboratorAdmission(ConnectBase):
         self.assertEqual((rc, out.get("answered"), out.get("interrupted")), (0, True, False), out)
         self.assertEqual((self.results / "task-ci.txt").read_text(), task_io.NON_OWNER_REFUSED, "interrupt refuses it too")
 
-    def test_allow_collaborator_claims_a_collaborator_with_its_admission_and_still_refuses_team_and_guest(self):
-        self.configure(ALLOW_COLLABORATOR="1")
+    def test_by_default_a_collaborator_is_claimed_and_team_and_guest_are_never_submitted(self):
+        self.configure()
         t = self.task("task-c", "team", "collaborator: true\n")
         rc, out = self.verb("claim", t)
         self.assertEqual((rc, out.get("admission"), out.get("access_tier"), out.get("collaborator")),
                          (0, "collaborator", "team", True), out)
         self.assertFalse((self.results / (t + ".txt")).exists(), "submitted to the session, never refused")
         for t, tier, extra in (("task-t", "team", ""), ("task-g", "guest", ""), ("task-gc", "guest", "collaborator: true\n")):
+            rc, out = self.verb("claim", self.task(t, tier, extra))
+            self.assertEqual((rc, "admission" in out, "isolated read-only turn" in out.get("refused", "")),
+                             (1, False, True), (t, out))
+        self.configure(ALLOW_NON_OWNER="0")
+        for t, tier, extra in (("task-t0", "team", ""), ("task-g0", "guest", ""), ("task-gc0", "guest", "collaborator: true\n")):
             rc, out = self.verb("claim", self.task(t, tier, extra))
             self.assertEqual((rc, (self.results / (t + ".txt")).read_text()), (1, task_io.NON_OWNER_REFUSED), t)
         rc, out = self.verb("interrupt", self.task("task-ci", "team", "collaborator: true\n"))

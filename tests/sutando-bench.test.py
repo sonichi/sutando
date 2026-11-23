@@ -328,6 +328,60 @@ class BenchTests(unittest.TestCase):
         self.assertIsNone(run["summary"]["latency_ms"]["p50"])
         self.assertEqual(run["cases"][0]["status"], "timeout")
 
+    def test_run_suite_isolates_colliding_case_names(self):
+        names = ["plan / verify", "plan ? verify", "***", "???", "case", "1-case"]
+        cases = [{"id": name, "prompt": f"answer-{index}",
+                  "expect": {"equals": f"reply-{index}"}}
+                 for index, name in enumerate(names)]
+        suite = {"schema": 1, "name": "collisions", "cases": cases}
+        with tempfile.TemporaryDirectory() as td:
+            ws = workspace(Path(td) / "ws")
+            suite_path = Path(td) / "suite.json"
+            suite_path.write_text(json.dumps(suite))
+            loaded = bench.load_suite(suite_path)
+            responses = {case["prompt"]: case["expect"]["equals"] for case in cases}
+            with Responder(ws, responses):
+                run = bench.run_suite(ws, loaded, 2, 1, 0.001, "collisions")
+            rows = run["cases"]
+            self.assertEqual(len(rows), 12)
+            self.assertEqual(len({row["task_id"] for row in rows}), 12)
+            self.assertEqual(run["summary"]["passed"], 12)
+            for row, case in zip(rows, cases * 2):
+                self.assertEqual(row["case_id"], case["id"])
+                self.assertEqual(row["response"], case["expect"]["equals"])
+                task = ws / "tasks" / (row["task_id"] + ".txt")
+                result = ws / "results" / (row["task_id"] + ".txt")
+                self.assertIn("task: " + case["prompt"] + "\n", task.read_text())
+                self.assertEqual(result.read_text(), row["response"])
+                self.assertEqual(row["result_path"], str(result))
+                self.assertRegex(row["task_id"], r"^[A-Za-z0-9_-]+$")
+            output = Path(td) / "output"
+            bench.write_run(run, output)
+            self.assertEqual(bench._load_run(output), run)
+
+    def test_colliding_case_without_reply_times_out(self):
+        suite = {"schema": 1, "name": "timeout-collision", "cases": [
+            {"id": "a/b", "prompt": "answered", "expect": {"equals": "OK"}},
+            {"id": "a b", "prompt": "unanswered", "expect": {"equals": "OK"}},
+        ]}
+        submit = bench._submit
+
+        def publish_first(tasks, task_id, prompt):
+            path = submit(tasks, task_id, prompt)
+            if prompt == "answered":
+                (tasks.parent / "results" / path.name).write_text("OK")
+            return path
+
+        with tempfile.TemporaryDirectory() as td:
+            ws = workspace(Path(td))
+            with mock.patch.object(bench, "_submit", side_effect=publish_first):
+                run = bench.run_suite(ws, suite, 1, 0.03, 0.001, "timeout")
+        self.assertEqual([row["status"] for row in run["cases"]], ["completed", "timeout"])
+        self.assertEqual([row["passed"] for row in run["cases"]], [True, False])
+        self.assertIsNone(run["cases"][1]["response"])
+        self.assertIsNone(run["cases"][1]["result_path"])
+        self.assertEqual(run["summary"]["no_response"], 1)
+
     def test_compare(self):
         baseline = example_run("base", True, 10)
         candidate = example_run("new", True, 11)

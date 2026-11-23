@@ -108,6 +108,17 @@ class EntryTest(Fixture):
             self.assertEqual(adn._main(list(argv)), 0)
         return out.getvalue()
 
+    def test_offline_never_asks_the_homeserver_and_keeps_the_order(self):
+        def no_network(url):
+            raise AssertionError(f"offline fetched {url}")
+        with self.rows({"agent_mxid": MXID, "agent_display_name": DISPLAY}):
+            self.assertEqual(adn.resolve(MXID, fetch=no_network, offline=True), (DISPLAY, "connection"))
+        with self.rows(), mock.patch.object(adn, "profile_name", side_effect=AssertionError("fetched")):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                adn._main(["--agent-mxid", MXID, "--offline", "--json"])
+            self.assertEqual(json.loads(out.getvalue())["source"], "localpart")
+
     def test_resolve_reads_the_agent_mxid_and_survives_none(self):
         with self.rows(), mock.patch.dict(os.environ, {"AGENT_MXID": MXID}):
             self.assertEqual(adn.resolve(fetch=profile(DISPLAY)), (DISPLAY, "profile"))
@@ -157,7 +168,7 @@ class OtherServerRoomTest(Fixture):
 class GreetingPathsTest(Fixture):
     """Each introduction path takes the name from the one resolver."""
 
-    def test_tutorial_page_name_is_the_display_name(self):
+    def test_local_tutorial_preview_name_is_the_display_name(self):
         gs = _load_getting_started()
         with self.rows():
             self.assertEqual(gs.resolve_name("auto", MXID, profile(DISPLAY)), DISPLAY)
@@ -175,7 +186,7 @@ class GreetingPathsTest(Fixture):
         self.assertEqual(plain.stdout.strip(), DISPLAY)
 
     def test_every_greeting_instruction_names_the_resolver(self):
-        for rel in ("CLAUDE.md", "AGENTS.md", "skills/room-onboard/SKILL.md", "skills/tutorial/SKILL.md"):
+        for rel in ("CLAUDE.md", "AGENTS.md", "skills/room-onboard/SKILL.md"):
             text = (REPO / rel).read_text(encoding="utf-8")
             self.assertIn("agent_display_name.py", text, rel)
         onboard = (REPO / "skills/room-onboard/SKILL.md").read_text(encoding="utf-8")
