@@ -278,6 +278,21 @@ class Writer(Base):
         Path(self.core, ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "acct-C"}}))
         self.assertEqual(crs.gather(self.ws, sup, now=_t.time(), runtime="claude")["state"], "paused_limit")
 
+    def test_the_core_logins_status_line_429_is_evidence_for_its_own_account(self):
+        import core_limit_hold as clh
+        import time as _t
+        self.sl(_status(five=40), now=None)
+        self.rl(detail="usage limit reached")
+        rec = self.rec()
+        self.assertEqual(len(qa.record_rejections(rec)), 1)
+        digest = claude_account.account_fingerprint(self.core)
+        self.assertIs(qa.record_for_account(rec, digest), rec)
+        self.assertIsNotNone(clh.record_evidence(qa.trusted_record(rec), _t.time(), digest))
+        Path(self.core, ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "acct-C"}}))
+        other = claude_account.account_fingerprint(self.core)
+        self.assertIsNone(qa.record_for_account(rec, other))
+        self.assertIsNone(clh.record_evidence(rec, _t.time(), other))
+
     def test_promotion_keeps_the_accounts_existing_evidence(self):
         self.sl(_status(five=40), now=T0)
         self.sl(_status(five=70), now=T0 + 10, cd=self.other)
