@@ -89,8 +89,12 @@ class PluginShape(unittest.TestCase):
         self.assertEqual(mod, task_io.AUDIENCE_RULE)
         frames = re.findall(r"`\[s\.space task \$\{rid\}; sender tier[^`]*`", src)
         self.assertEqual(len(frames), 2, frames)
-        for frame in frames:
-            self.assertTrue(frame.endswith(r"\n${AUDIENCE_RULE}\n`"), frame)
+        # The audience rule is in both; the owner's own frame then adds the two card rules (the model's and
+        # the account's), which no other sender's frame carries.
+        owner, other = sorted(frames, key=lambda f: "untrusted room data" in f)
+        self.assertTrue(owner.endswith(r"\n${AUDIENCE_RULE}\n${MODEL_RULE}\n${ACCOUNT_RULE}\n`"), owner)
+        self.assertTrue(other.endswith(r"\n${AUDIENCE_RULE}\n`"), other)
+        self.assertNotIn("_RULE}", other.replace("${AUDIENCE_RULE}", ""))
 
 
 class VerifierMirrorsSparrow(unittest.TestCase):

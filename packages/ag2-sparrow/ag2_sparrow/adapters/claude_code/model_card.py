@@ -97,6 +97,7 @@ def desk(root, cfg: dict, publish) -> card_desk.Desk:
 
 
 MARKED_DIR = "card-marks"
+MARKED_KEEP_S = 24 * 3600.0     # a staging retry comes within minutes; a kept answer older than this is of no use
 
 
 def marked_answer(root, task_id: str, body: bytes, cfg: dict) -> "bytes | None":
@@ -120,9 +121,28 @@ def marked_answer(root, task_id: str, body: bytes, cfg: dict) -> "bytes | None":
         return None
     answer = (said.get("body") or model_switch.ANSWERED).encode("utf-8")
     kept.parent.mkdir(parents=True, exist_ok=True)
+    prune_marks(kept.parent)
     kept.with_name(kept.name + ".tmp").write_bytes(answer)
     os.replace(kept.with_name(kept.name + ".tmp"), kept)
     return answer
+
+
+def prune_marks(folder: Path, now=time.time) -> int:
+    """Remove the kept card-mark answers older than MARKED_KEEP_S, so one small file per card ask does not
+    pile up for the life of the work root; how many went. One that cannot be removed is left."""
+    gone = 0
+    try:
+        names = list(folder.iterdir())
+    except OSError:
+        return 0
+    for path in names:
+        try:
+            if now() - path.stat().st_mtime > MARKED_KEEP_S:
+                path.unlink()
+                gone += 1
+        except OSError:
+            continue
+    return gone
 
 
 def start_apply(root, popen=subprocess.Popen, environ=None) -> None:

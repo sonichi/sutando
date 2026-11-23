@@ -4,6 +4,7 @@ this runs where no tmux does. The same paths on a real tmux server are in test_c
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -195,46 +196,47 @@ class SwitchModel(unittest.TestCase):
             switched, line = lc_for(Pane(plain), self.root).switch_model(REC, "opus[1m]", wait_s=2)
         self.assertEqual((switched, line.startswith("unconfirmed"), launcher.switched_model(self.root)), (False, True, ""))
 
-    def test_a_1m_switch_answered_without_its_context_size_counts_once_the_saved_setting_names_it(self):
+    def test_a_1m_switch_answered_without_its_context_size_counts_once_the_settings_were_saved_since(self):
         # Claude Code 2.1.322, measured 2026-11-22 on a claude-local agent: `/model sonnet[1m]` printed
-        # this line (no context size) and saved `"model": "sonnet[1m]"` in the agent's settings.json.
+        # this line (no context size) and saved its settings.
         real = "  \u23bf  Set model to Sonnet 5.5 and saved as your default for new sessions"
         config = self.root / "claude-config"
         config.mkdir()
 
-        def answers(saved):
+        def answers(save):
             def react(keys, pane):
                 if keys[0] == "/model":
                     pane.text += "\n" + real
-                    if saved is not None:
-                        (config / "settings.json").write_text(json.dumps({"model": saved, "theme": "dark"}))
+                    if save:
+                        (config / "settings.json").write_text(json.dumps({"theme": "dark", "n": len(pane.sent)}))
             return react
 
-        for saved, ok in (("sonnet[1m]", True), ("sonnet", False), (None, False)):
-            (config / "settings.json").unlink(missing_ok=True)
-            pane = Pane(answers(saved))
+        def switch(pane):
             lc = lc_for(pane, self.root)
             lc.cfg = {"CLAUDE_CONFIG_DIR": str(config)}
             with mock.patch.object(launcher.time, "monotonic", side_effect=[0.0, 0.0, 1.0, 5.0]):
-                switched, line = lc.switch_model(REC, "sonnet[1m]", wait_s=2)
-            self.assertEqual(switched, ok, (saved, line))
+                return lc.switch_model(REC, "sonnet[1m]", wait_s=2)
+
+        # No settings file at all, then one written by the switch: only the second is a switch.
+        self.assertEqual(switch(Pane(answers(False)))[0], False)
+        self.assertEqual(switch(Pane(answers(True))), (True, "switched to sonnet[1m]"))
         self.assertEqual(launcher.switched_model(self.root), "sonnet[1m]")
-        # A line already on screen from an earlier switch is not this one's, saved setting or not.
-        (config / "settings.json").write_text(json.dumps({"model": "sonnet[1m]"}))
+        # A settings file an earlier switch left, not written again: the plain line alone confirms nothing.
+        os.utime(config / "settings.json", (1, 1))
+        switched, line = switch(Pane(answers(False)))
+        self.assertEqual((switched, line.startswith("unconfirmed")), (False, True), line)
+        # A line already on screen from an earlier switch is not this one's, whatever the settings say.
         pane = Pane()
         pane.text = real + "\n" + box()
-        lc = lc_for(pane, self.root)
-        lc.cfg = {"CLAUDE_CONFIG_DIR": str(config)}
-        with mock.patch.object(launcher.time, "monotonic", side_effect=[0.0, 0.0, 1.0, 5.0]):
-            self.assertFalse(lc.switch_model(REC, "sonnet[1m]", wait_s=2)[0])
-        # A plain switch is still never confirmed by a 1M setting, nor by a line naming another family.
+        self.assertFalse(switch(pane)[0])
+        # A plain switch is never confirmed this way, nor a 1M one by a line naming another family.
         self.assertEqual(launcher.family_count("sonnet[1m]", real), 1)
         self.assertEqual(launcher.family_count("opus[1m]", real), 0)
-        lc.cfg = {}
-        self.assertEqual(lc.saved_model(), "")
-        (config / "settings.json").write_text("not json")
-        lc.cfg = {"CLAUDE_CONFIG_DIR": str(config)}
-        self.assertEqual(lc.saved_model(), "")
+        self.assertIsNone(lc_for(Pane(), self.root).saved_stamp(), "no config dir: no stamp")
+        # The settings file is never opened: it may hold more than the model.
+        source = Path(launcher.__file__).read_text()
+        self.assertNotIn("settings.json\"), encoding", source)
+        self.assertFalse(hasattr(launcher.Launcher, "saved_model"))
 
     def test_a_confirmation_that_may_not_have_been_sent_is_tried_once_and_is_not_a_switch(self):
         class Asks(Pane):

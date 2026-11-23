@@ -82,10 +82,8 @@ FORMAT_LOCAL = "claude-local/1"
 FORMATS = frozenset((FORMAT, FORMAT_LOCAL))
 # The two claude-local records and the two per-root locks live in state/ by name.
 LOCAL_STATE_FILES = ("claude-local-plugin.json", "claude-local-supervisor.json", "claims.lock", "progress.lock")
-# What claude-local's own features keep beside them, rewritten in place: the isolated turn's hourly limiter,
-# the live model switch's record and lock (#6679), the model and account cards' records (model_switch,
-# account_switch), the detached switch's log. Live 2026-11-22: a work root that had used `model` or a card
-# refused to start ("state/agent-cards is not this adapter's state").
+# What claude-local's features keep beside them: the isolated turn's limiter, the live model switch's record
+# and lock, the model and account cards' records, the detached switch's log. Unnamed, each refuses the start.
 LOCAL_FEATURE_FILES = ("isolated-turns.json", "model-switch.json", "model-switch.lock", "model.json", "account.json",
                        "model-apply.log")
 # Their directories: the cards this agent posted (issued_cards' ledger) and the card-mark answers kept for

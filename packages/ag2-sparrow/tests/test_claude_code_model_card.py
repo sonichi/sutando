@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -345,6 +346,17 @@ class Marks(Account):
         self.assertEqual(card["id"], model_switch.CARD)
         self.assertEqual(inbox.marked(self.root, t, b"[model-card]\n"), first, "a retry stages the same bytes")
         self.assertEqual(len(self.queued()), 1, "and shows no second card")
+
+    def test_kept_mark_answers_older_than_a_day_are_removed_when_the_next_one_is_kept(self):
+        marks = Path(self.root) / "state" / model_card.MARKED_DIR
+        inbox.marked(self.root, self.task("task-old", "can I switch model?"), b"[model-card]\n")
+        old = marks / "task-old.txt"
+        self.assertTrue(old.is_file())
+        os.utime(old, (1, 1))
+        inbox.marked(self.root, self.task("task-new", "and now?"), b"[model-card]\n")
+        self.assertEqual(sorted(p.name for p in marks.iterdir()), ["task-new.txt"])
+        self.assertEqual(model_card.prune_marks(marks), 0, "a fresh one stays for its retry")
+        self.assertEqual(model_card.prune_marks(marks / "missing"), 0)
 
     def test_the_account_mark_shows_the_account_card(self):
         t = self.task("task-q", "can you switch account?")
