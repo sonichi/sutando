@@ -41,10 +41,13 @@ hold uses it for the owner's "switch to <model>" reply.
 **Held for a provider limit (no flag needed).** When no core process runs and
 `src/core_limit_hold.py held` reports a hold in force, a plain switch (the desktop's Model picker)
 takes the `--offline` write, releases the switch lock, and starts the core through
-`src/agent/start-cli.sh` (`--launcher` overrides it), whose limit gate lets a launch on another
-model family through. Exit 0: the core is starting on the new model; exit 10: the model is set but
-the launcher did not start the core (its reason and log path on stderr). Without a hold, a down core
-is never started from here.
+`src/core_restart.py restart --start`: outside the desktop app that is `src/agent/start-cli.sh`
+(`--launcher` overrides it), whose limit gate lets a launch on another model family through; in the
+app's bundle it is the app's own launcher, run under the app's launch lock and only if the core is
+still down. Exit 0: the core is starting on the new model; exit 10: the model is set but
+the launcher did not start the core (its reason and log path on stderr); exit 11: the model is set
+but a core started meanwhile and was left running, so run the switch again to apply it live.
+Without a hold, a down core is never started from here.
 
 **A picker left on screen.** Right before the send the script writes an attribution record through
 `src/self_opened_gate.py` (`<workspace>/state/self-opened-gate.<session>.json`) and clears it once the
