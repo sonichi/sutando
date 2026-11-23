@@ -36,7 +36,7 @@ import core_crash_loop as C
 import core_recovery_state as crs
 from hitl.manager import HitlManager, HitlStore
 from hitl.replies import REPLY_FIELD
-from hitl.schema import STATUS_RESOLVED
+from hitl.schema import STATUS_IN_PROGRESS, STATUS_RESOLVED
 
 CORE = "sutando-core"
 RUN = "run-3f6b1c2a"
@@ -44,15 +44,19 @@ OWNER = "@owner:s.space"
 DM = "!dm:s.space"
 
 
+INCIDENT = "st_1a2b3c4d"
+
+
 def status(now, terminal=True, session=RUN, beat_age=2.0, error="exited (code 1): TypeError: x is undefined",
-           resettable=False):
+           resettable=False, incident=INCIDENT, app_session=None, verdict="failed", trip_age=30.0):
+    """supervisor-status.json: `session` is the terminal marker's, `app_session` the running app's."""
     svc = {"recoveryBudget": {"used": 5, "cap": 5, "windowEndsAt": None},
-           "lifecycle": {"verdict": "failed", "reason": error}}
+           "lifecycle": {"verdict": verdict, "reason": error}}
     if terminal:
         svc["terminal"] = {"state": "failed", "reason": "crash-loop", "appSessionId": session}
         if resettable:
-            svc["terminal"]["resettable"] = True
-    return {"schemaVersion": 1, "heartbeatAt": int((now - beat_age) * 1000), "appSessionId": RUN,
+            svc["terminal"].update(resettable=True, incident=incident, at=int((now - trip_age) * 1000))
+    return {"schemaVersion": 1, "heartbeatAt": int((now - beat_age) * 1000), "appSessionId": app_session or RUN,
             "services": {"voice-agent": svc, "agent-api": {"recoveryBudget": {"used": 0, "cap": 5}}}}
 
 
@@ -199,20 +203,32 @@ class CoreCrashes(Base):
         self.assertEqual(calls, [CORE], "the core's monitor runs it")
 
 class ResetService(Base):
-    """A crash-looped service the supervisor can retry gets one button; its tap reaches the supervisor."""
+    """A crash-looped service the supervisor can retry gets one button. The tap is bound to the
+    card's own app session and breaker trip, and its outcome is the supervisor's own answer."""
 
     def setUp(self):
         super().setUp()
         import recovery_actions as RA
+        from hitl import recovery
         from hitl.replies import HitlReplyHandler
-        self.RA = RA
+        self.RA, self.recovery = RA, recovery
         self.handler = HitlReplyHandler(self.mgr, OWNER, workspace=self.ws, log=lambda m: None)
 
-    def requests(self):
-        folder = self.ws.joinpath(*C.RESET_DIR)
-        return [json.loads(p.read_text()) for p in sorted(folder.glob("req-*.json"))] if folder.is_dir() else []
+    def folder(self):
+        return self.ws.joinpath(*C.RESET_DIR)
 
-    def tap(self, card, aid):
+    def requests(self):
+        return [json.loads(p.read_text()) for p in sorted(self.folder().glob("req-*.json"))] \
+            if self.folder().is_dir() else []
+
+    def answer(self, req, outcome="running", at=None, **over):
+        """The supervisor's result for `req`, as engine/service-reset.mjs writes it."""
+        body = {"schemaVersion": 1, "id": req["id"], "kind": "reset-service-result", "service": req["service"],
+                "appSessionId": req["appSessionId"], "incident": req["incident"], "outcome": outcome,
+                "atMs": req["requestedAtMs"] + 3000 if at is None else int(at * 1000), **over}
+        (self.folder() / f"res-{req['id']}.json").write_text(json.dumps(body))
+
+    def tap(self, card, aid="reset_service:voice-agent"):
         if not self.mgr.store.projection(card.id).get("event_id"):
             self.mgr.record_projection(card.id, card.revision, f"$card-{card.id}", {"room_id": DM})
         self.handler.offer({"type": "message.created", "event_id": "$c", "actor_id": OWNER, "room_id": DM,
@@ -224,6 +240,19 @@ class ResetService(Base):
         target = self.RA.Target(self.ws, "/tmp/x.sock", CORE)
         return self.RA.run_pending(self.mgr, target, runner=lambda *a, **k: None, now=now)
 
+    def tapped(self, now):
+        """A resettable card, tapped and executed: (card, the request the supervisor would read)."""
+        self.write(status(now, resettable=True))
+        [card] = self.tick(now=now)
+        self.assertEqual(self.tap(card), "applied")
+        [receipt] = self.run_pending(now + 1)
+        self.assertEqual(receipt["outcome"], "done")
+        [req] = self.requests()
+        return card, req
+
+    def receipt(self, card):
+        return self.recovery.read_receipt(self.ws, card.id)
+
     def test_a_resettable_service_card_carries_one_start_again_button(self):
         now = time.time()
         self.write(status(now, resettable=True))
@@ -231,58 +260,150 @@ class ResetService(Base):
         self.assertEqual([(a.id, a.label) for a in card.actions],
                          [("reset_service:voice-agent", "Start voice-agent again")])
         self.assertTrue(card.subject["recovery"])
+        self.assertEqual((card.subject["service_session"], card.subject["service_incident"]), (RUN, INCIDENT))
         self.assertIn("Tap Start voice-agent again", card.message)
         self.assertNotIn("until the s.space app restarts", card.message)
 
-    def test_a_tap_hands_the_supervisor_one_request_and_the_card_closes_once_the_service_is_back(self):
+    def test_the_request_carries_the_cards_own_session_and_incident(self):
         now = time.time()
-        self.write(status(now, resettable=True))
-        [card] = self.tick(now=now)
-        self.assertEqual(self.tap(card, "reset_service:voice-agent"), "applied")
-        [receipt] = self.run_pending(now + 1)
-        self.assertEqual(receipt["outcome"], "done")
-        [req] = self.requests()
-        self.assertEqual((req["schemaVersion"], req["kind"], req["service"], req["appSessionId"]),
-                         (1, "reset-service", "voice-agent", RUN))
+        card, req = self.tapped(now)
+        self.assertEqual((req["schemaVersion"], req["kind"], req["service"]), (1, "reset-service", "voice-agent"))
+        self.assertEqual((req["appSessionId"], req["incident"]), (RUN, INCIDENT), "the card's, not whatever is current")
         self.assertEqual(req["requestedAtMs"], int((now + 1) * 1000))
         open_card = self.mgr.get(card.id)
         self.assertIn("Asked the app to start voice-agent again", open_card.message)
-        self.assertFalse(self.RA.verify_pending(open_card, now + 2), "the crash-loop step closes it, not verify")
+        self.assertNotIn("receipt", open_card.subject, "no outcome is claimed before the supervisor answers")
+
+    def test_a_vanished_stop_marker_is_not_proof_the_service_runs(self):
+        now = time.time()
+        card, req = self.tapped(now)
+        self.write(status(now + 5, terminal=False))
+        self.assertEqual(self.tick(now=now + 5), [])
+        still = self.mgr.get(card.id)
+        self.assertEqual(still.status, STATUS_IN_PROGRESS, "the marker going away closes nothing")
+        self.assertNotIn("running again", still.message)
         self.assertEqual(self.RA.verify_step(self.mgr, self.ws, CORE, blocked=False, now=now + 90), [],
                          "the core being up says nothing about the service")
-        [still] = self.tick(now=now + 2)
-        self.assertEqual(still.id, card.id, "still stopped: the same card, no second one")
-        self.write(status(now + 120, terminal=False))
-        self.assertEqual(self.tick(now=now + 120), [])
-        self.assertEqual(self.mgr.get(card.id).status, STATUS_RESOLVED)
+        self.answer(req)
+        self.tick(now=now + 6)
+        done = self.mgr.get(card.id)
+        self.assertEqual(done.status, STATUS_RESOLVED)
+        self.assertIn("voice-agent is running again.", done.message)
+        self.assertEqual(done.subject["receipt"]["outcome"], "done")
+        self.assertEqual(self.receipt(card)["outcome"], "done")
+
+    def test_a_failed_start_is_said_and_recorded_as_failed(self):
+        now = time.time()
+        card, req = self.tapped(now)
+        self.answer(req, outcome="failed")
+        self.tick(now=now + 6)
+        closed = self.mgr.get(card.id)
+        self.assertEqual(closed.status, STATUS_RESOLVED)
+        self.assertIn("voice-agent did not start", closed.message)
+        self.assertEqual(closed.subject["receipt"]["outcome"], "failed")
+        self.assertEqual(self.receipt(card)["outcome"], "failed", "the receipt on disk is corrected")
+        audit = (self.recovery.recovery_dir(self.ws) / self.RA.AUDIT_FILE).read_text().splitlines()
+        self.assertEqual([json.loads(x)["outcome"] for x in audit], ["done", "failed"])
+
+    def test_no_answer_is_a_timeout_never_a_success(self):
+        now = time.time()
+        card, req = self.tapped(now)
+        self.write(status(now + 5, terminal=False))
+        self.tick(now=now + C.RESET_TIMEOUT_S - 5)
+        self.assertEqual(self.mgr.get(card.id).status, STATUS_IN_PROGRESS, "still inside the wait")
+        self.tick(now=now + C.RESET_TIMEOUT_S + 5)
+        closed = self.mgr.get(card.id)
+        self.assertEqual(closed.status, STATUS_RESOLVED)
+        self.assertIn("did not answer", closed.message)
+        self.assertEqual(self.receipt(card)["outcome"], "failed")
+
+    def test_an_answer_for_another_request_session_or_incident_or_a_stale_one_is_ignored(self):
+        now = time.time()
+        card, req = self.tapped(now)
+        for over in ({"id": "f" * 32}, {"appSessionId": "run-other"}, {"incident": "st_ffffffff"},
+                     {"service": "agent-api"}, {"atMs": req["requestedAtMs"] - 60_000}, {"atMs": "soon"},
+                     {"schemaVersion": 2}, {"outcome": 7}):
+            with self.subTest(over=over):
+                self.answer(req, **over)
+                self.tick(now=now + 6)
+                self.assertEqual(self.mgr.get(card.id).status, STATUS_IN_PROGRESS, over)
+        (self.folder() / f"res-{req['id']}.json").write_text("[not an object")
+        self.tick(now=now + 7)
+        self.assertEqual(self.mgr.get(card.id).status, STATUS_IN_PROGRESS)
+
+    def test_session_turnover_makes_the_old_cards_tap_stale(self):
+        now = time.time()
+        self.write(status(now, resettable=True))
+        [card] = self.tick(now=now)
+        self.assertEqual(self.tap(card), "applied")
+        # The app restarted and the service crash-looped again: another session, another trip.
+        self.write(status(now + 1, resettable=True, session="run-new", app_session="run-new", incident="st_99999999"))
+        [receipt] = self.run_pending(now + 2)
+        self.assertEqual(receipt["outcome"], "stale")
+        self.assertEqual(self.requests(), [], "nothing is asked of a session the card was not raised in")
+        self.assertIn("no longer stopped by the crash this card is about", self.mgr.get(card.id).message)
+
+    def test_a_newer_incident_in_the_same_session_makes_the_old_cards_tap_stale(self):
+        now = time.time()
+        self.write(status(now, resettable=True))
+        [card] = self.tick(now=now)
+        self.tap(card)
+        self.write(status(now + 1, resettable=True, incident="st_99999999"))
+        [receipt] = self.run_pending(now + 2)
+        self.assertEqual(receipt["outcome"], "stale")
+        self.assertEqual(self.requests(), [])
+        [fresh] = self.tick(now=now + 3)
+        self.assertNotEqual(fresh.id, card.id, "the newer trip has its own card")
+        self.assertEqual(fresh.subject["service_incident"], "st_99999999")
 
     def test_a_tap_after_the_service_stopped_being_stopped_writes_nothing(self):
         now = time.time()
         self.write(status(now, resettable=True))
         [card] = self.tick(now=now)
-        self.tap(card, "reset_service:voice-agent")
+        self.tap(card)
         self.write(status(now, terminal=False))
         [receipt] = self.run_pending(now + 1)
-        self.assertEqual(receipt["outcome"], "refused")
+        self.assertEqual(receipt["outcome"], "stale")
         self.assertEqual(self.requests(), [])
 
-    def test_a_terminal_not_marked_resettable_or_another_service_is_never_requested(self):
+    def test_a_request_names_exactly_the_stop_the_status_reports(self):
         now = time.time()
         self.write(status(now))
-        self.assertFalse(C.request_reset(self.ws, "voice-agent", now), "an older supervisor reads no request")
+        self.assertIsNone(C.request_reset(self.ws, "voice-agent", RUN, INCIDENT, now), "no marker identity")
         self.write(status(now, resettable=True))
-        self.assertFalse(C.request_reset(self.ws, "agent-api", now), "only a service it reports stopped")
-        self.assertTrue(C.request_reset(self.ws, "voice-agent", now))
+        for service, session, incident in (("agent-api", RUN, INCIDENT), ("voice-agent", "run-other", INCIDENT),
+                                           ("voice-agent", RUN, "st_00000000"), ("voice-agent", RUN, "")):
+            self.assertIsNone(C.request_reset(self.ws, service, session, incident, now), (service, session, incident))
+        self.assertTrue(C.request_reset(self.ws, "voice-agent", RUN, INCIDENT, now))
         self.assertEqual(len(self.requests()), 1)
 
+    def test_a_stop_marker_is_checked_for_identity_and_freshness_before_it_raises_a_card(self):
+        now = time.time()
+        for why, doc in (("stamped after the heartbeat that carries it", status(now, resettable=True, trip_age=-600)),
+                         ("the supervisor itself says it is running", status(now, resettable=True, verdict="running")),
+                         ("adopted", status(now, resettable=True, verdict="adopted")),
+                         ("another session's marker", status(now, resettable=True, session="run-older"))):
+            with self.subTest(why=why):
+                self.write(doc)
+                self.assertEqual(C.terminal_services(self.ws, now), [], why)
+                self.assertEqual(self.tick(now=now), [], why)
+        for why, edit in (("no incident", {"incident": None}), ("an incident that is not an id", {"incident": "../x"}),
+                          ("no trip time", {"at": None}), ("a trip time that is not a number", {"at": "now"})):
+            with self.subTest(why=why):
+                doc = status(now, resettable=True)
+                doc["services"]["voice-agent"]["terminal"].update(edit)
+                self.write(doc)
+                found = C.terminal_services(self.ws, now)
+                self.assertEqual([s["resettable"] for s in found] if edit.get("at") != "now" else found,
+                                 [False] if edit.get("at") != "now" else [], why)
+
     def test_the_id_names_one_service_shaped_word(self):
-        from hitl import recovery
         self.assertEqual(crs.parse_action_id("reset_service:voice-agent", "codex"), ("reset_service", "voice-agent"))
         self.assertEqual(crs.parse_action_id("reset_service:agent-api", "agy"), ("reset_service", "agent-api"))
         for bad in ("reset_service", "reset_service:", "reset_service:../etc", "reset_service:a b",
                     "reset_service:x\n", "reset_service:" + "a" * 41, "reset_service:-x"):
             self.assertIsNone(crs.parse_action_id(bad), repr(bad))
-        self.assertIn(recovery.RESET_SERVICE, recovery.CORE_ONLY, "a seat's card never carries it")
+        self.assertIn(self.recovery.RESET_SERVICE, self.recovery.CORE_ONLY, "a seat's card never carries it")
 
 
 class ReviveExhausted(Base):
