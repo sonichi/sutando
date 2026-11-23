@@ -5,7 +5,7 @@
 # sutando_core_window_ids <socket> <session> <live|all> <cli>...: ids of windows whose pane
 # was started as one of the named CLIs (`live`: still running). Fails when panes are unreadable.
 sutando_core_window_ids() {
-  local socket="$1" session="$2" mode="$3" rows row wid dead cmd first rt
+  local socket="$1" session="$2" mode="$3" rows row wid dead cmd rt
   shift 3
   rows="$(tmux -S "$socket" list-panes -s -t "=$session" -F '#{window_id} #{pane_dead} #{pane_start_command}' 2>/dev/null)" \
     || return 1
@@ -13,11 +13,14 @@ sutando_core_window_ids() {
     | while IFS= read -r row; do
         wid="${row%% *}"; row="${row#* }"; dead="${row%% *}"; cmd="${row#* }"
         [ "$mode" = all ] || [ "$dead" = 0 ] || continue
-        # tmux quotes a word that holds a space: a CLI under "Application Support" (the whole quoted
-        # word is the command), or a one-string command line (its first word is). Both are tried.
-        case "$cmd" in \"*) cmd="${cmd#\"}"; cmd="${cmd%%\"*}"; first="${cmd%% *}" ;; *) cmd="${cmd%% *}"; first="$cmd" ;; esac
+        # tmux quotes a word that holds a space. A quoted word that is a file on this machine is the
+        # executable (a CLI under "Application Support"); any other is a command line, read by its first word.
+        case "$cmd" in
+          \"*) cmd="${cmd#\"}"; cmd="${cmd%%\"*}"; [ -f "$cmd" ] || cmd="${cmd%% *}" ;;
+          *) cmd="${cmd%% *}" ;;
+        esac
         for rt in "$@"; do
-          if [ "${cmd##*/}" = "$rt" ] || [ "${first##*/}" = "$rt" ]; then echo "$wid"; break; fi
+          if [ "${cmd##*/}" = "$rt" ]; then echo "$wid"; break; fi
         done
       done | sort -u
 }
