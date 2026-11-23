@@ -39,10 +39,10 @@ import tmux_probe  # noqa: E402
 import worker_identity as wi  # noqa: E402
 
 
+# The Codex worker launcher's exit when another launch holds the session name.
+LAUNCH_LOST = 75
 # The core's own identity: inherited, these stamp a worker's direct posts as
 # "worker-<core id>" while pool delivery stamps the worker's real id.
-# The Codex worker launcher's exit when another launch holds the session name (launch-codex-worker-session.sh).
-LAUNCH_LOST = 75
 _CORE_ONLY_ENV = ("SUTANDO_CORE_ID", "SUTANDO_CORE_POOL_SIZE", "SUTANDO_WORKER_SEAT")
 
 
