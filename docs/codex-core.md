@@ -621,7 +621,11 @@ A seat reopens task intake (clears the shutdown sentinel) only once `seat.py` re
 app-server initialized and its thread open (`state/codex-seat/<session>/ready`). If that does not
 happen within `SUTANDO_SEAT_READY_TIMEOUT` seconds (60), or the seat exits first, the launcher
 stops that seat (its session, or the healed window), the launch fails and intake stays shut, so the
-next launch starts a seat and checks readiness again instead of finding a half-started one.
+next launch starts a seat and checks readiness again instead of finding a half-started one. The seat
+is stopped by the tmux id its creation returned, never a name or index. If that stop cannot be confirmed
+(the kill fails, or tmux cannot be read), the launch fails loudly and marks intake held for that seat
+(`intake-held`); a later launch that finds it running accepts it only once it reports ready, and only
+then reopens intake.
 
 ## Rollback
 
