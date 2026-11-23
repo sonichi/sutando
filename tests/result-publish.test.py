@@ -242,7 +242,7 @@ class RelativePathAnchoring(unittest.TestCase):
     def test_cli_refuses_a_relative_path_outside_results(self):
         for mod in self.MODULES:
             for rel in ("workspace/results/task-1.txt", "task-1.txt", "results/sub/task-1.txt",
-                        "results/../task-1.txt"):
+                        "results/../task-1.txt", "results/.."):
                 with self.subTest(mod=mod.__file__, rel=rel), tempfile.TemporaryDirectory() as td:
                     err = io.StringIO()
                     with mock.patch("workspace_default.resolve_workspace", return_value=Path(td)), \
