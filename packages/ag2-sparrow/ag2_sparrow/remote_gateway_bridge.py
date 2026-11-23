@@ -1933,6 +1933,30 @@ def _project_claude_local(mods, room: str, log=print):
                                   describe=_http_error_body)
 
 
+class _ClaimedStore:
+    """A HITL store seen through CARD_CLAIM: this lane drives, archives and re-notifies only its own cards."""
+
+    def __init__(self, store, claims, log=print, scope: str = ""):
+        self._store, self._claims, self._log, self._scope = store, claims, log, scope
+
+    def __getattr__(self, name):
+        return getattr(self._store, name)
+
+    def report_archive_failures(self, failures, now):
+        # Under its lane's own scope: this view archives only its cards, so it must not clear another's.
+        return self._store.report_archive_failures(failures, now, scope=self._scope)
+
+    def all(self):
+        mine = []
+        for req in self._store.all():
+            try:
+                if self._claims(req):
+                    mine.append(req)
+            except Exception as e:  # noqa: BLE001 - an unanswerable claim leaves the card to its lane
+                _log_backoff(("card-claim", type(e).__name__), f"card claim check failed ({diagnostics.describe(e)})")
+        return mine
+
+
 def _project_hitl(log=print) -> int:
     """Push every un-projected HITL requirement out as a card, or 0 when
     `src/hitl` is absent (standalone sparrow) — same optional tier as the
@@ -1942,7 +1966,8 @@ def _project_hitl(log=print) -> int:
     calling this every pulse re-sends nothing; it is the driver that was
     missing, not the machinery.
     """
-    if not owns_unaddressed():
+    primary = owns_unaddressed()
+    if not primary and CARD_CLAIM is None:
         return 0  # only the primary gateway projects the owner's cards
     room = resolve_destination(OWNER_PRIVATE)  # a runtime prompt is the owner's, whatever room raised it
     if not room:
@@ -1961,11 +1986,16 @@ def _project_hitl(log=print) -> int:
         log(f"hitl: projector unavailable ({diagnostics.describe(e)}); cards will not be delivered")
         return 0
     workspace = _STATE.parent
-    manager = HitlManager(HitlStore(default_store(workspace)))
+    store = HitlStore(default_store(workspace))
+    scope = "" if primary else (re.sub(r"[^a-z0-9-]", "-", (GATEWAY_INSTANCE or "").lower())[:64].strip("-")
+                                or "lane")
+    manager = HitlManager(_ClaimedStore(store, CARD_CLAIM, log, scope) if CARD_CLAIM is not None else store)
     done, refused, gave_up, failed, raised = [], [], [], False, None
     # Each store gets its pass: a stuck card in one never holds back the other's.
     for drive in ("default", "claude-local"):
         try:
+            if drive == "claude-local" and not primary:
+                continue
             if drive == "claude-local":
                 got = _project_claude_local(mods, room, log)
             elif pending_ids(manager):
@@ -2295,6 +2325,8 @@ OWNS_UNADDRESSED: Callable[[], bool] | None = None
 # Host-injected (path) -> bool: an owner-directed file this lane delivers although it owns no
 # unaddressed ones (a worker's lane, its worker's files). None: only `owns_unaddressed` decides.
 PROACTIVE_OWN_FILE: Callable[[Path], bool] | None = None
+# Host hook: whether this lane posts a decision card (a HumanRequirement). None: the primary posts every card.
+CARD_CLAIM: Callable[[object], bool] | None = None
 # Host-injected () -> the worker every task this lane queues is addressed to (`requested_worker`),
 # or "". None (standalone default) leaves each task's field as the gateway sent it.
 TASK_ADDRESSEE: Callable[[], str] | None = None
