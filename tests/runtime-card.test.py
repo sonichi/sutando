@@ -308,6 +308,21 @@ class Taps(Base):
         self.assertEqual(out["status"], ac.FORGED)
         self.assertEqual(self.launch.calls, [])
 
+    def test_a_switch_that_cannot_be_recorded_or_started_changes_nothing_and_leaves_no_record(self):
+        with mock.patch.object(rtc, "admit", side_effect=OSError("read-only")):
+            rc, out = self.tap("Switch the core to Claude Code")
+        self.assertEqual((rc, out["status"], out["why"]), (1, "failed", "OSError"))
+        self.assertIn("Nothing changed", out["say"])
+        self.assertEqual(self.launch.calls, [])
+        self.launch.fail = OSError("no nohup")
+        rc, out = self.tap("Switch the core to Claude Code")
+        self.assertEqual((rc, out["status"]), (1, "failed"))
+        self.assertIn("no nohup", out["why"])
+        self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists(), "the attempt is released: a later tap can go ahead")
+        self.launch.fail = None
+        rc, out = self.tap("Switch the core to Claude Code")
+        self.assertEqual((rc, out["status"]), (0, "started"))
+
     def test_a_second_switch_while_one_runs_is_refused(self):
         self.tap("Switch the core to Claude Code")
         rc, out = self.tap("Switch the core to Claude Code")
