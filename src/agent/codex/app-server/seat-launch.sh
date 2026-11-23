@@ -118,6 +118,16 @@ seat_target_state() {
   printf '%s\n' "$ids" | grep -qxF -- "$target" && echo alive || echo absent
 }
 
+# seat_hold_intake: shut intake for a seat that could not be stopped, and remember which stop is ours:
+# intake-held holds the token of a sentinel this launch wrote, empty when another stop already held it.
+seat_hold_intake() {
+  local py token=""
+  [ -n "$SEAT_READY" ] || return 0
+  py="$(heartbeat_python)"
+  [ -n "$py" ] && token="$("$py" "$REPO/src/shutdown.py" mark-if-absent codex-seat-not-ready 2>/dev/null)"
+  printf '%s\n' "$token" > "${SEAT_READY%/ready}/intake-held" 2>/dev/null || true
+}
+
 # seat_stop <session|window> <tmux id>: stop exactly the seat this launch started (its immutable tmux
 # id) and confirm it is gone; loud and nonzero when it is not, with intake marked held for this seat.
 seat_stop() {
@@ -127,16 +137,16 @@ seat_stop() {
     state="$(seat_target_state "$kind" "$target")"
     [ "$state" = absent ] && return 0
   fi
-  [ -n "$SEAT_READY" ] && : > "${SEAT_READY%/ready}/intake-held" 2>/dev/null
+  seat_hold_intake
   echo "  ✗ could not stop the unready Codex app-server seat ($kind ${target:-of unknown id}: $state) — intake stays shut; stop it by hand (tmux -S $TMUX_SOCKET kill-$kind -t ${target:-=$SESSION}) before the next launch." >&2
   return 1
 }
 
 # seat_reattach: a launch that finds the seat running accepts it as before, unless this launcher held
 # intake shut for that seat (intake-held: its teardown failed). Then it must report ready first, and
-# the intake held for it reopens only then.
+# only the stop this launcher wrote is cleared (compare-and-clear on its token); a newer one stays.
 seat_reattach() {
-  local ws held py
+  local ws held py token
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || ws=""
   [ -n "$ws" ] || return 0
   SEAT_READY="$(seat_state_dir "$ws" "$SESSION")/ready"
@@ -147,9 +157,9 @@ seat_reattach() {
     return 1
   fi
   py="$(heartbeat_python)"
-  if [ -z "$py" ] || ! "$py" "$REPO/src/shutdown.py" clear >/dev/null; then
-    echo "  ✗ the running Codex app-server seat is ready, but the intake held for it could not be reopened." >&2
-    return 1
+  token="$(head -n1 "$held" 2>/dev/null)"
+  if [ -n "$token" ] && [ -n "$py" ] && ! "$py" "$REPO/src/shutdown.py" clear-if "$token"; then
+    echo "  · the Codex app-server seat is ready; a newer stop holds intake, so it stays shut." >&2
   fi
   rm -f "$held"
 }

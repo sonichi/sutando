@@ -445,29 +445,53 @@ class PersistedChoice(unittest.TestCase):
         self.assertIn("kill-window -t @9", f.calls(), "the healed window is stopped by its id")
         self.assertTrue(sentinel.exists())
 
-    def test_a_seat_that_cannot_be_stopped_fails_the_launch_loudly_with_intake_shut(self):
+    def held_launch(self):
+        """A seat that never reports ready and cannot be stopped: the launch holds intake for it."""
         f = Fixture(self, seat_tmux=True)
         sentinel = f.workspace / "state" / "shutdown.sentinel"
-        sentinel.parent.mkdir(parents=True, exist_ok=True)
-        sentinel.write_text('{"reason": "test", "ts": 0}\n')
         result = f.run(FAKE_SEAT_INIT_FAILS="1", FAKE_KILL_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn("could not stop the unready Codex app-server seat (session $7: alive)", result.stderr)
-        self.assertTrue(sentinel.exists())
+        self.assertTrue(sentinel.exists(), "this launch shut intake itself")
         held = f.declaration().parent / "intake-held"
-        self.assertTrue(held.exists())
+        self.assertTrue(held.read_text().strip(), "the token of the stop this launch wrote")
+        return f, sentinel, held
+
+    def test_a_seat_that_cannot_be_stopped_fails_the_launch_loudly_with_intake_shut(self):
+        f, sentinel, held = self.held_launch()
         # The surviving seat is not accepted by the next launch until it reports ready...
         result = f.run(FAKE_SEAT_INIT_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn("is not ready — not accepting it", result.stderr)
         self.assertTrue(sentinel.exists())
-        # ...and once it is, the intake held for it reopens.
+        # ...and once it is, the stop this launcher wrote is cleared.
         (f.declaration().parent / "ready").write_text("1\n")
         result = f.run(**self.UNSET)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("already running", result.stdout)
         self.assertFalse(sentinel.exists())
         self.assertFalse(held.exists())
+
+    def test_a_newer_drain_survives_the_ready_reattach(self):
+        f, sentinel, held = self.held_launch()
+        sentinel.write_text('{"reason": "drain", "ts": 1, "gen": "newer"}\n')  # someone else's stop since
+        (f.declaration().parent / "ready").write_text("1\n")
+        result = f.run(**self.UNSET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"newer"', sentinel.read_text(), "only the stop this launch wrote is cleared")
+        self.assertFalse(held.exists())
+
+    def test_a_stop_already_in_place_is_never_cleared_by_the_reattach(self):
+        f = Fixture(self, seat_tmux=True)
+        sentinel = f.workspace / "state" / "shutdown.sentinel"
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text('{"reason": "drain", "ts": 0}\n')
+        f.run(FAKE_SEAT_INIT_FAILS="1", FAKE_KILL_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
+        held = f.declaration().parent / "intake-held"
+        self.assertEqual(held.read_text().strip(), "", "not this launch's stop")
+        (f.declaration().parent / "ready").write_text("1\n")
+        self.assertEqual(f.run(**self.UNSET).returncode, 0)
+        self.assertTrue(sentinel.exists())
 
     def test_a_seat_whose_state_cannot_be_read_after_the_kill_is_unknown_not_gone(self):
         f = Fixture(self, seat_tmux=True)
