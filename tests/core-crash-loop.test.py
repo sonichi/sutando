@@ -424,9 +424,8 @@ class ReviveExhausted(Base):
 
     def record(self, sup="crashed", restarts=1, now=None):
         now = time.time() if now is None else now
-        rec = crs.gather(self.ws, {"state": sup}, now=now, runtime="claude")
-        crs.publish(self.ws, rec, now)
-        return rec
+        crs.update(self.ws, {"state": sup}, runtime="claude", now=now)  # the monitor's own tick
+        return crs.read(self.ws, now, max_age_s=None)
 
     def test_a_stale_give_up_marker_is_never_read_as_the_current_app_giving_up(self):
         now = time.time()
@@ -446,6 +445,40 @@ class ReviveExhausted(Base):
                 self.assertNotIn("reason", rec, why)
         self.give_up(now=now)
         self.assertTrue(crs.revive_exhausted(self.ws, now), "the running app's own marker counts")
+
+    def test_a_marker_whose_removal_failed_is_not_reused_by_a_second_crash(self):
+        """Same app, same live heartbeat: the core came back, the app could not remove its marker,
+        and the core crashed again. The old give-up is from an outage that ended."""
+        now = time.time()
+        self.give_up(now=now)
+        self.assertEqual(self.record(now=now)["reason"], crs.REVIVE_EXHAUSTED)
+        # The core is up again; the marker is still on disk (its removal failed).
+        self.give_up(now=now + 60, since=int(now - 120))
+        self.assertEqual(self.record(sup="running", now=now + 60)["state"], "running")
+        self.assertTrue((self.ws / "state" / crs.REVIVE_FILE).exists())
+        # Second crash, minutes later, under the same app session and a fresh heartbeat.
+        self.give_up(now=now + 600, since=int(now - 120))
+        self.assertFalse(crs.revive_exhausted(self.ws, now + 600), "an outage that ended is not this one")
+        rec = self.record(now=now + 600)
+        self.assertEqual(rec["state"], "starting")
+        self.assertNotIn("reason", rec)
+        # The app gives up on THIS outage: a marker stamped after the core was last seen up counts.
+        self.give_up(now=now + 1500, since=int(now + 1400))
+        self.assertEqual(self.record(now=now + 1500)["reason"], crs.REVIVE_EXHAUSTED)
+
+    def test_the_last_time_the_core_was_up_is_kept_and_a_bad_record_binds_nothing(self):
+        now = time.time()
+        self.assertIsNone(crs.last_up(self.ws))
+        self.record(sup="idle-ready", now=now)
+        self.assertEqual(crs.last_up(self.ws), int(now))
+        self.record(sup="running", now=now + 5)
+        self.assertEqual(crs.last_up(self.ws), int(now), "rewritten at most once a refresh interval")
+        self.record(sup="running", now=now + crs.REFRESH_S + 1)
+        self.assertEqual(crs.last_up(self.ws), int(now + crs.REFRESH_S + 1))
+        self.record(sup="crashed", now=now + 200)
+        self.assertEqual(crs.last_up(self.ws), int(now + crs.REFRESH_S + 1), "a core that is down is not up")
+        (self.ws / "state" / crs.LAST_UP_FILE).write_text(json.dumps({"v": 1, "at": "then"}))
+        self.assertIsNone(crs.last_up(self.ws))
 
     def test_a_core_the_app_gave_up_on_is_a_crash_loop_with_its_reason(self):
         self.give_up()
