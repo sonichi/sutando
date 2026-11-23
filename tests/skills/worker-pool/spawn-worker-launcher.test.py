@@ -308,6 +308,44 @@ class TestSpawn(Base):
         self.assertEqual(env["SUTANDO_WORKER_INCARNATION_ID"], newest["incarnation_id"])
         self.assertNotEqual(newest["incarnation_id"], first["incarnation_id"])
 
+    def test_a_codex_recovery_that_loses_the_session_closes_its_run(self):
+        """A competing launch won the session name between the probe and the launcher: the
+        losing attempt's run is closed, so the open run stays the winner's (pool_sessions)."""
+        wid = "e" * 32
+        wi.create_worker(self.ws, runtime="codex", worker_id=wid, cwd=str(REPO))
+        (first,) = wi.incarnations(self.ws, wid)
+        wi.end_incarnation(self.ws, wid, first["incarnation_id"], "crashed")
+
+        class LosesTheName(FakeTmux):
+            def __call__(self, argv, **kw):
+                if argv[0] == "bash" and argv[1].endswith("launch-worker-session.sh"):
+                    self.calls.append(argv); self.envs.append(dict(kw.get("env") or {}))
+                    self.existing.add(kw["env"]["SUTANDO_TMUX_SESSION"])
+                    return subprocess.CompletedProcess(argv, sw.LAUNCH_LOST, "", "another launch holds it")
+                return super().__call__(argv, **kw)
+
+        t = LosesTheName(runtime="codex")
+        with mock.patch.object(sw.pr, "load_roster",
+                               return_value={"workers": {wid: {"runtime": "codex"}}}):
+            with self.assertRaisesRegex(sw.SpawnRefused, "another launch holds"):
+                sw.spawn(self.ws, REPO, runtime="codex", existing_worker_id=wid,
+                         runner=t, require_sentinel=False)
+        losing = wi.incarnations(self.ws, wid)[-1]
+        self.assertEqual(losing["incarnation_id"], t.launches()[0]["SUTANDO_WORKER_INCARNATION_ID"])
+        self.assertEqual(losing["end_reason"], "superseded")
+        self.assertTrue(wi.worker_dir(self.ws, wid).is_dir())
+
+    def test_a_lost_code_with_no_session_is_an_ordinary_failure(self):
+        class LostButNothingThere(FakeTmux):
+            def __call__(self, argv, **kw):
+                if argv[0] == "bash" and argv[1].endswith("launch-worker-session.sh"):
+                    self.calls.append(argv); self.envs.append(dict(kw.get("env") or {}))
+                    return subprocess.CompletedProcess(argv, sw.LAUNCH_LOST, "", "new-session failed")
+                return super().__call__(argv, **kw)
+
+        with self.assertRaisesRegex(sw.SpawnRefused, "the runtime launcher failed"):
+            sw.spawn(self.ws, REPO, runner=LostButNothingThere(), require_sentinel=False)
+
     def test_the_delivery_folder_matches_the_identity_record(self):
         """A record naming one id and a folder named another is a silent orphan."""
         got = sw.spawn(self.ws, REPO, runner=FakeTmux(), require_sentinel=False)

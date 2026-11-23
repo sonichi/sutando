@@ -90,7 +90,7 @@ if ! codex login status >/dev/null 2>&1; then
 fi
 if tmux -S "$SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
   echo "launch-codex-worker-session: $SESSION already exists" >&2
-  exit 2
+  exit 75
 fi
 
 BOOT_PROMPT="You are Sutando worker $SUTANDO_INSTANCE_ID. The pool delivers tasks to your inbox. Do not run core startup, register schedules, start a watcher, or write core status. Handle only a delivered task prompt, read its named payload, and write the answer to its named result file. Reply Worker ready, then wait."
@@ -134,18 +134,21 @@ if [ "${SUTANDO_CODEX_APP_SERVER:-}" = 1 ]; then
     echo "launch-codex-worker-session: could not write the seat's host declaration; not starting $SESSION" >&2
     exit 1
   fi
-  # The run this declaration belongs to (pool_sessions.is_seat); no id leaves the viewer's read-only default.
+  if ! tmux -S "$SOCKET" new-session -d -s "$SESSION" "${ENV_ARGS[@]}" -e SUTANDO_CODEX_APP_SERVER=1 \
+    -e SUTANDO_STANDBY_MODE=type -e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}" \
+    -e "SUTANDO_WATCHER_BEAT=$REPO/skills/worker-pool/scripts/pool_beat.py" \
+    "$SEAT_CLI" --host "$seat_state/host.json" --workspace "$SUTANDO_WORKSPACE_DIR" --seat "$SESSION" \
+    --worker "$SUTANDO_INSTANCE_ID" --codex "$(command -v codex)" --instructions "$BOOT_PROMPT" \
+    --log "$SUTANDO_WORKSPACE_DIR/logs/codex-seat-$SESSION.log" "${SEAT_ARGS[@]}"; then
+    echo "launch-codex-worker-session: another launch holds $SESSION" >&2
+    exit 75
+  fi
+  # The run this declaration belongs to (pool_sessions.is_seat), stamped once this launch won the name.
   rm -f "$seat_state/incarnation"
   if [ -n "${SUTANDO_WORKER_INCARNATION_ID:-}" ]; then
     printf '%s\n' "$SUTANDO_WORKER_INCARNATION_ID" > "$seat_state/incarnation.tmp" &&
       mv -f "$seat_state/incarnation.tmp" "$seat_state/incarnation"
   fi
-  tmux -S "$SOCKET" new-session -d -s "$SESSION" "${ENV_ARGS[@]}" -e SUTANDO_CODEX_APP_SERVER=1 \
-    -e SUTANDO_STANDBY_MODE=type -e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}" \
-    -e "SUTANDO_WATCHER_BEAT=$REPO/skills/worker-pool/scripts/pool_beat.py" \
-    "$SEAT_CLI" --host "$seat_state/host.json" --workspace "$SUTANDO_WORKSPACE_DIR" --seat "$SESSION" \
-    --worker "$SUTANDO_INSTANCE_ID" --codex "$(command -v codex)" --instructions "$BOOT_PROMPT" \
-    --log "$SUTANDO_WORKSPACE_DIR/logs/codex-seat-$SESSION.log" "${SEAT_ARGS[@]}"
   for i in 1 2 3 4 5 6 7 8 9 10; do
     tmux -S "$SOCKET" has-session -t "=$SESSION" 2>/dev/null && break
     sleep 0.5
@@ -165,14 +168,14 @@ if [ "${SUTANDO_CODEX_APP_SERVER:-}" = 1 ]; then
   exit 0
 fi
 # <<< codex-app-server-seat
-tmux -S "$SOCKET" new-session -d -s "$SESSION" "${ENV_ARGS[@]}" \
-  codex "${CODEX_ARGS[@]}" "$BOOT_PROMPT"
-# >>> codex-app-server-seat
-# This TUI run won the session name: an earlier seat's declaration would keep its pane read-only.
-# A launch that lost it (the session exists) leaves the live run's files alone.
-if [ $? = 0 ]; then
-  rm -f "$SUTANDO_WORKSPACE_DIR/state/codex-seat/$SESSION/host.json" "$SUTANDO_WORKSPACE_DIR/state/codex-seat/$SESSION/incarnation"
+if ! tmux -S "$SOCKET" new-session -d -s "$SESSION" "${ENV_ARGS[@]}" \
+    codex "${CODEX_ARGS[@]}" "$BOOT_PROMPT"; then
+  echo "launch-codex-worker-session: another launch holds $SESSION" >&2
+  exit 75
 fi
+# >>> codex-app-server-seat
+# This TUI launch won the session name: an earlier seat's declaration would keep its pane read-only.
+rm -f "$SUTANDO_WORKSPACE_DIR/state/codex-seat/$SESSION/host.json" "$SUTANDO_WORKSPACE_DIR/state/codex-seat/$SESSION/incarnation"
 # <<< codex-app-server-seat
 for i in 1 2 3 4 5 6 7 8 9 10; do
   tmux -S "$SOCKET" has-session -t "=$SESSION" 2>/dev/null && break

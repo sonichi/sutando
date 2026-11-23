@@ -41,6 +41,8 @@ import worker_identity as wi  # noqa: E402
 
 # The core's own identity: inherited, these stamp a worker's direct posts as
 # "worker-<core id>" while pool delivery stamps the worker's real id.
+# The Codex worker launcher's exit when another launch holds the session name (launch-codex-worker-session.sh).
+LAUNCH_LOST = 75
 _CORE_ONLY_ENV = ("SUTANDO_CORE_ID", "SUTANDO_CORE_POOL_SIZE", "SUTANDO_WORKER_SEAT")
 
 
@@ -482,6 +484,10 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
         env.update({"SUTANDO_CLAUDE_RESUME": session_id} if resumed_id
                    else {"SUTANDO_CLAUDE_SESSION_ID": session_id})
     r = runner(p["launcher_argv"], env=env)
+    if r.returncode == LAUNCH_LOST and session_probe(name, socket, runner)[0] == "exists":
+        # Another launch holds the session name: this run never started, so it must not stay the open one.
+        wi.end_incarnation(workspace, worker_id, (run or rec)["incarnation_id"], "superseded")
+        raise SpawnRefused(f"another launch holds tmux session {name!r}; this attempt did not start")
     if r.returncode != 0:
         why = (r.stderr or "").strip()
         # A non-zero launcher may still have started the session (a readiness
