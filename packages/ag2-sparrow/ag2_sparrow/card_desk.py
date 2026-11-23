@@ -63,15 +63,16 @@ class Desk:
                                                   "own words." % card.KIND) + "\n")
             return "%s-card-failed" % card.KIND
 
-    def marked(self, tier, path, status, text, result_file) -> str:
+    def marked(self, tier, task_text, status, text, result_file) -> str:
         """The runtime answered the owner with a card's mark alone: show that card in their DM, or say
-        where to ask. '' for any other answer, and for any sender but the owner, whose mark is ordinary text."""
+        where to ask. '' for any other answer, and for any sender but the owner, whose mark is ordinary text.
+        `task_text` is the task as read before the turn (`read_task`): by the time the turn ends the bridge
+        may have archived the file, so it is never opened again here."""
         card = next((c for c in self.cards if (text or "").strip() == c.MARK), None)
         if status != "completed" or tier != "owner" or card is None:
             return ""
         agent_card, _ = connector_cards._core()
-        with open(path, encoding="utf-8") as f:
-            sent, _ = agent_card.reply_words(f.read())
+        sent, _ = agent_card.reply_words(task_text or "")
         if agent_card.owner_may_act(sent) is None:
             return self.drawn(card, result_file, lambda: card.offer(sent, result_file))
         self.publish(result_file, self.quoted(card.IN_DM) + "\n")
@@ -80,6 +81,15 @@ class Desk:
     def hint(self) -> str:
         """What an owner turn is told about the cards that can be shown, '' when none can."""
         return "\n\n".join(card.HINT for card in self.cards if card.usable())
+
+
+def read_task(path) -> str:
+    """The task file's text, read before the turn for `Desk.marked`; '' when it is already gone."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
 
 
 def led(publish, pending, quoted):
