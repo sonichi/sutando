@@ -166,6 +166,7 @@ def card_matter(root, task_id: str, cfg: dict, popen=subprocess.Popen, environ=N
         connector_cards.absorb(bridge, root)      # the cards the bridge posted since, so their taps can act
     except Exception as e:  # noqa: BLE001 - a ledger that cannot take them leaves their taps refused, not a crash
         log("absorb failed:", "%s: %s" % (type(e).__name__, e))
+    remember_owner_dm(root, path)
     said: dict = {}
     outcome = desk(root, cfg, lambda result_file, body: said.update(body=body)).task(
         path, os.path.join(root, "results", task_id + ".txt"))
@@ -174,6 +175,19 @@ def card_matter(root, task_id: str, cfg: dict, popen=subprocess.Popen, environ=N
     if outcome == "model-picked":
         start_apply(root, popen, environ)
     return outcome, said.get("body") or model_switch.ANSWERED
+
+
+def remember_owner_dm(root, path) -> None:
+    """A message of the owner's in their DM names the room a quota notice goes to (quota_card)."""
+    try:
+        from . import quota_card
+        agent_card, _ = connector_cards._core()
+        with open(path, encoding="utf-8") as f:
+            sent, _ = agent_card.reply_words(f.read())
+        if agent_card.owner_may_act(sent) is None:
+            quota_card.remember_room(root, sent.get("channel_id"))
+    except Exception as e:  # noqa: BLE001 - the task goes on without it
+        log("owner DM not remembered:", "%s: %s" % (type(e).__name__, e))
 
 
 def desk(root, cfg: dict, publish) -> card_desk.Desk:
