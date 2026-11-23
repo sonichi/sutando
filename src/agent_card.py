@@ -548,7 +548,7 @@ class Click:
 def lane_owner(workspace, default: str = "") -> Callable[[str], str]:
     """lane -> its owner's mxid, from this machine's core connections. A card with no lane was posted on
     the legacy connection (the core row whose `instance` is ""), so it is that row's owner; `default`
-    only when this machine has no such row."""
+    when this machine has no such row or that row names no owner."""
     def owner(lane: str) -> str:
         try:
             import connections
