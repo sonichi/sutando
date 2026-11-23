@@ -440,7 +440,9 @@ launcher uses, with the same checks; a home it would refuse is reported, not rea
 itself (`account/read` on a short-lived `codex app-server` under that home); Codex saying signed out
 is final. Only when Codex cannot answer does it read the email and plan claims of the home's
 `auth.json` id_token, and then `verified` is false: say the answer comes from the saved sign-in and
-was not confirmed. It prints only the email, plan, workspace and login kind, never a token, and never
+was not confirmed. `verified` is true whenever Codex answered (signed out included), and null when
+neither Codex nor the file gave an answer. Codex is found on the launcher's own PATH
+(`src/agent/launch-path.sh --codex-path`), so the desktop's `cli/codex/bin` copy is used. It prints only the email, plan, workspace and login kind, never a token, and never
 print or quote `auth.json` yourself. Pool Codex workers run under the core's home today, so the
 core's answer is theirs too. Exit 1 means that home is signed out (or its login cannot be read): say so.
 
