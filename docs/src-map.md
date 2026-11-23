@@ -67,6 +67,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`codex_home.py`** — Resolve, check and create the Codex core's home once, for every launcher that uses it.
 - **`codex_host_instructions.py`** — Give a Codex core the instructions its desktop host ships beside the checkout.
 - **`codex_project_trust.py`** — Record the Codex core's own checkout as a trusted project before launch.
+- **`codex_rpc.py`** — JSON-RPC 2.0 over a child's stdio, the client every Codex app-server caller uses (the seat, the account lookup): one JSON object per line, responses matched to requests by id.
 - **`connections.py`** — Connections: the install's directory of homeserver gateways, one row per bridge instance.
 - **`context-drop.sh`** — Sutando context drop — triggered by macOS hotkey via Automator Quick Action.
 - **`context_resume.py`** — Extract recent conversation turns from a Claude Code transcript (.jsonl).

@@ -440,14 +440,15 @@ whose origin cannot be checked, exits 3: answer in the owner's DM instead, and p
 the room. The lookup runs Codex on a private copy of the home's sign-in, so the running core's home is
 never written. The home is the one the Codex core
 launcher uses, with the same checks; a home it would refuse is reported, not read. It asks Codex
-itself (`account/read` on a short-lived `codex app-server`); only an explicit `account: null` means
-signed out, and a malformed answer counts as no answer. Only when Codex cannot answer does it read the email and plan claims of the home's
-`auth.json` id_token, and then `verified` is false: say the answer comes from the saved sign-in and
-was not confirmed. `verified` is true whenever Codex answered (signed out included), and null when
-neither Codex nor the file gave an answer. Codex is found on the launcher's own PATH
-(`src/agent/launch-path.sh --codex-path`), so the desktop's `cli/codex/bin` copy is used. It prints only the email, plan, workspace and login kind, never a token, and never
-print or quote `auth.json` yourself. Pool Codex workers run under the core's home today, so the
-core's answer is theirs too. Exit 1 means that home is signed out (or its login cannot be read): say so.
+itself (`account/read` on a short-lived `codex app-server`); `verified` is true only when Codex names
+an account. Codex naming none proves nothing (the copy cannot reach a sign-in kept in the keyring), so
+it then reads the email and plan claims of the home's `auth.json` id_token, and `verified` is false:
+say the answer comes from the saved sign-in and was not confirmed. When neither names an account,
+`verified` is null and it exits 1: say you found no sign-in, not that Codex is signed out. Codex is
+found on the launcher's own PATH (`src/agent/launch-path.sh --codex-path`), so the desktop's
+`cli/codex/bin` copy is used. It prints only the email, plan, workspace and login kind, never a token,
+and never print or quote `auth.json` yourself. Pool Codex workers run under the core's home today, so
+the core's answer is theirs too.
 
 ## Check quota
 

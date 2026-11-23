@@ -126,7 +126,7 @@ class AppServer(Case):
 
     def test_an_app_server_that_errors_exits_hangs_or_is_missing_falls_back_to_the_file(self):
         self.auth({"email": "file@example.com", ca.PLAN_CLAIMS: {"chatgpt_plan_type": "plus"}})
-        for mode in ("error", "exit", "gone", "malformed", "no-result"):
+        for mode in ("error", "exit", "gone", "malformed", "no-result", "signed-out"):
             with self.subTest(mode=mode), mock.patch.dict(os.environ, {"STUB_MODE": mode}):
                 got = ca.read(self.home, str(self.codex))
                 self.assertEqual((got["email"], got["plan"], got["source"], got["verified"]),
@@ -134,15 +134,6 @@ class AppServer(Case):
         with mock.patch.dict(os.environ, {"STUB_MODE": "hang"}):
             self.assertIsNone(ca.from_app_server(self.home, str(self.codex), timeout=1))
         self.assertEqual(ca.read(self.home, str(self.root / "no-such-codex"))["source"], "auth.json")
-
-    def test_codex_saying_signed_out_wins_over_a_leftover_file(self):
-        self.auth({"email": "stale@example.com"})
-        with mock.patch.dict(os.environ, {"STUB_MODE": "signed-out"}):
-            got = ca.read(self.home, str(self.codex))
-            rc, out = self.cli()
-        self.assertEqual((got["kind"], got["email"], got["verified"]), (None, None, True))
-        self.assertEqual((rc, out.strip()), (1, f"Codex is not signed in under {self.home}."))
-        self.assertNotIn("stale@example.com", out)
 
     def test_a_bare_codex_name_is_found_where_the_launcher_looks(self):
         bindir = self.root / "npm-bin"
@@ -164,17 +155,6 @@ class AppServer(Case):
                 self.assertIn(os.path.realpath(where), [os.path.realpath(p) for p in parts])
                 self.assertEqual((got["email"], got["source"], got["verified"]), ("app@example.com", "app-server", True))
 
-    def test_a_malformed_answer_is_unknown_not_signed_out(self):
-        for mode in ("malformed", "no-result"):
-            with self.subTest(mode=mode), mock.patch.dict(os.environ, {"STUB_MODE": mode}):
-                self.assertIsNone(ca.from_app_server(self.home, str(self.codex)))
-                rc, out = self.cli("--json")
-                self.assertEqual((rc, json.loads(out)["verified"]), (1, None))
-        for r in ({"account": None}, {"account": {"type": "chatgpt"}}):
-            self.assertTrue(ca.valid_account_result(r))
-        for r in (None, [], {}, {"account": {}}, {"account": {"type": ""}}, {"account": "x"}):
-            self.assertFalse(ca.valid_account_result(r))
-
     def test_a_relative_codex_home_is_resolved_before_spawning(self):
         cwd = os.getcwd()
         os.chdir(self.root)
@@ -187,16 +167,90 @@ class AppServer(Case):
             os.chdir(cwd)
         self.assertEqual(os.path.realpath(json.loads(out.getvalue())["codex_home"]), os.path.realpath(self.home))
 
-    def test_nothing_answering_and_no_file_is_unverified_signed_out(self):
+    def test_a_null_from_the_copy_is_unknown_and_the_file_decides(self):
+        self.auth({"email": "kept@example.com"})
+        with mock.patch.dict(os.environ, {"STUB_MODE": "signed-out"}):
+            self.assertIsNone(ca.from_app_server(self.home, str(self.codex)))
+            got = ca.read(self.home, str(self.codex))
+        self.assertEqual((got["email"], got["verified"]), ("kept@example.com", False))
+
+    def test_no_account_anywhere_is_none_found_not_signed_out(self):
+        with mock.patch.dict(os.environ, {"STUB_MODE": "signed-out"}):
+            rc, out = self.cli("--json")
+            rc2, text = self.cli()
+        self.assertEqual((rc, json.loads(out)["kind"], json.loads(out)["verified"]), (1, None, None))
+        self.assertEqual((rc2, text.strip()), (1, f"I found no sign-in for Codex under {self.home}."))
+
+    def test_nothing_answering_and_no_file_is_none_found(self):
         with mock.patch.dict(os.environ, {"STUB_MODE": "gone"}):
             rc, out = self.cli("--json")
         self.assertEqual((rc, json.loads(out)["kind"], json.loads(out)["verified"]), (1, None, None))
 
-    def test_a_signed_out_answer_names_no_account(self):
-        with mock.patch.dict(os.environ, {"STUB_MODE": "signed-out"}):
-            self.assertEqual(ca.from_app_server(self.home, str(self.codex))["kind"], None)
-            rc, out = self.cli()
-        self.assertEqual((rc, out.strip()), (1, f"Codex is not signed in under {self.home}."))
+    def test_a_failure_while_preparing_the_copy_leaves_nothing_behind(self):
+        self.auth({"email": "file@example.com"})
+        made = []
+        real = ca.tempfile.mkdtemp
+
+        def mkdtemp(**kw):
+            made.append(real(**kw))
+            return made[-1]
+
+        def copy_then_fail(scratch, home):
+            (Path(scratch) / "auth.json").write_text("copy")
+            raise OSError("disk full")
+        with mock.patch.object(ca.tempfile, "mkdtemp", mkdtemp), mock.patch.object(ca, "_copy_into", copy_then_fail):
+            self.assertIsNone(ca.from_app_server(self.home, str(self.codex)))
+        self.assertEqual(len(made), 1)
+        self.assertFalse(Path(made[0]).exists(), "the partial copy is removed")
+        self.assertFalse(self.log.exists(), "no Codex was started")
+
+    def test_a_failure_starting_codex_leaves_no_copy(self):
+        self.auth({"email": "file@example.com"})
+        made = []
+        real = ca.tempfile.mkdtemp
+
+        def mkdtemp(**kw):
+            made.append(real(**kw))
+            return made[-1]
+        with mock.patch.object(ca.tempfile, "mkdtemp", mkdtemp):
+            self.assertIsNone(ca.from_app_server(self.home, str(self.root / "no-such-codex")))
+        self.assertFalse(Path(made[0]).exists())
+
+
+class Envelope(unittest.TestCase):
+    """`account_of`: only a successful response naming an account with a type is an answer."""
+
+    def test_an_account_with_a_type_is_the_answer(self):
+        acct = {"type": "chatgpt", "email": "a@example.com"}
+        self.assertEqual(ca.account_of({"id": 2, "result": {"account": acct}}), acct)
+
+    def test_an_explicit_null_account_is_no_answer(self):
+        self.assertIsNone(ca.account_of({"id": 2, "result": {"account": None, "requiresOpenaiAuth": True}}))
+
+    def test_an_error_response_is_no_answer(self):
+        self.assertIsNone(ca.account_of({"id": 2, "error": {"message": "nope"}, "result": {"account": {"type": "x"}}}))
+
+    def test_a_response_without_result_is_no_answer(self):
+        self.assertIsNone(ca.account_of({"id": 2}))
+
+    def test_a_result_that_is_not_an_object_is_no_answer(self):
+        self.assertIsNone(ca.account_of({"id": 2, "result": "account"}))
+
+    def test_a_result_without_account_is_no_answer(self):
+        self.assertIsNone(ca.account_of({"id": 2, "result": {"requiresOpenaiAuth": True}}))
+
+    def test_an_account_without_a_type_is_no_answer(self):
+        self.assertIsNone(ca.account_of({"id": 2, "result": {"account": {"email": "a@example.com"}}}))
+
+    def test_an_account_with_an_empty_type_is_no_answer(self):
+        self.assertIsNone(ca.account_of({"id": 2, "result": {"account": {"type": ""}}}))
+
+    def test_an_account_that_is_not_an_object_is_no_answer(self):
+        self.assertIsNone(ca.account_of({"id": 2, "result": {"account": "chatgpt"}}))
+
+    def test_an_envelope_that_is_not_an_object_is_no_answer(self):
+        self.assertIsNone(ca.account_of(None))
+        self.assertIsNone(ca.account_of([]))
 
 
 class AuthFile(Case):
@@ -225,7 +279,7 @@ class AuthFile(Case):
         self.assertEqual((rc, out.strip()), (0, f"Codex under {self.home} uses an API key (no ChatGPT account) (from its saved sign-in file)."))
         self.assertNoSecrets(out)
 
-    def test_no_file_or_a_broken_one_is_signed_out(self):
+    def test_no_file_or_a_broken_one_names_no_account(self):
         self.assertIsNone(ca.from_auth_file(self.home))
         for raw in ("{", "[]", json.dumps({"tokens": {"id_token": "not-a-jwt"}}), json.dumps({"tokens": "x"})):
             with self.subTest(raw=raw):
