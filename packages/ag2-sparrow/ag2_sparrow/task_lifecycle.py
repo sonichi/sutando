@@ -98,6 +98,8 @@ FORMAT_TEMP = re.compile(r"\.format\.\d+\.[0-9a-f]{6}\.tmp")
 BLOB_TEMP = re.compile(r"^\.(.+)\.(\d+)\.([0-9a-f]{24})\.(\d+)\.[0-9a-f]{8}\.tmp$")
 # A private temp older than the launcher's inner stop bound belongs to nobody.
 TEMP_SWEEP_AFTER = 120.0
+# The fixed-name temp 0.11's model switch could leave under state/; no writer of this build makes one.
+LEGACY_TEMPS = frozenset(("model-switch.json.tmp",))
 # The gateway bridge's own entries when its state dir sits directly in the work root: its poller lock
 # files, its default HITL stores and its log (the bridge's names, pinned to it by test).
 BRIDGE_LOCKS = re.compile(r"gateway-bridge(\.[A-Za-z0-9_-]+)?\.lock(\.guard|\.tmp\.\d+)?")
@@ -373,6 +375,12 @@ def prepare_work_dir(work, check_only=False):
             if name.endswith(".tmp") and name[:-4] in LOCAL_FEATURE_FILES:
                 # A feature record's own temp (`<name>.tmp`, then replaced): a live writer's, or one left by a crash.
                 if not check_only and time.time() - os.lstat(os.path.join(state, name)).st_mtime > TEMP_SWEEP_AFTER:
+                    os.unlink(os.path.join(state, name))
+                continue
+            if name in LEGACY_TEMPS:
+                if not _is_type(os.path.join(state, name), "file"):
+                    return "refusing to start: state/%s in %s is not a plain file" % (name, state)
+                if not check_only:
                     os.unlink(os.path.join(state, name))
                 continue
             if name.startswith(".") and name.endswith(".tmp") and any(name[1:].startswith(a + ".")

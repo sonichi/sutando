@@ -814,26 +814,78 @@ records the task as the worker's (`--attribute-only`), and the worker's stamped 
 in the shared `results/` are moved into its own. Its session reads a plain inbox of task files and answers in
 its own results (`spawn_worker.inbox_env`, `result_publish`). A worker without the field is unchanged.
 
-`python3 src/worker_lane.py migrate-dirs --worker <id>` shows what switching the worker would do (its
+A switch passes through two states before `own` (`connections.worker_dirs_state`). `dirs: "migrating"`:
+the worker still runs on the shared folders (`worker_dirs` is None), so its lane, its seat's inbox and
+supervision read `deliveries/<id>/` as before. `dirs: "committing"`: its lane has moved onto its own folders
+(`connections.worker_lane_dirs`; a declared bridge's revision changes here, so sparrowd replaces it), while
+its seat and supervision still read the shared ones. `own` is written only after that lane has stopped and
+started again, or been replaced. In both states the router delivers it no new core task: `deliver_one`
+re-reads the state under the deliveries folder's lock, the lock the switch empties that folder under, so a
+pass that chose the worker before the switch began is `fenced` and the core takes the task. A trusted stop
+for work it holds still reaches it (`deliver_one(stop=True)`). A task its own lane queued goes to it while
+"migrating"; once "committing" or "own", such a task is never given to the core: the handler answers
+"must handle" (`pool_router.lane_holder`), the task waits in the shared `tasks/`, and the switch's final step
+moves it into the worker's own folder.
+
+Supervision (`pool_supervise.owed_task_ids`) counts both the unanswered tasks in the worker's own tasks
+folder (`pool_supervise.own_inbox_owed`, in any of the three states) and any owed sentinel still in
+`deliveries/<id>/`, so reseat, stop and retire never lose sight of work on either side. `pool_manage.py
+retire` refuses a worker owing either. Its own agent goes in two steps: `connections.begin_worker_retirement`
+marks the row `retiring` (the identity row's own writer, under the worker's switch lock) and stops its lane
+with the row disabled; then, under that lock, the tasks it still owes in its own folder are handed to the
+core (`retire --hand-off`, `pool_delivery.hand_off_own_inbox`: moved to the shared `tasks/` and touched, never
+replacing a file) or refuse the retire. Only once that has fully succeeded are the row and its secret removed
+(`connections.retire_worker_identity`). A stop, move or name collision that fails leaves the worker retired
+with its row kept: the retire reports `failed`, a re-run finishes it, and `pool_manage.py enable` takes it back
+(`connections.end_worker_retirement`, then its lane is started). A `retiring` row is never switched:
+`set_worker_dirs` refuses every state but clearing, and the handler moves nothing for it.
+
+**Lock order.** Task (`pool_router.task_arbitration`) -> deliveries folder (`pool_delivery.arbitration`) ->
+the worker's switch lock (`connections.worker_switch_lock`) -> the connection record's lock. The switch lock
+is held only for a switch's final step (the `own` write and its moves), each handler pass's moves, and
+retirement's marker write and its read and hand-off of the worker's own inbox.
+
+A worker that gets its first own agent moves to its own folders. That covers a new worker whose agent
+`create_worker.py` requests (the default; `--no-identity` opts out) and an existing worker given one by
+`pool_identity.py add`, pasted or `--device-flow`. The identity save and the lane start each run under the
+roster fence retirement takes, so a worker retired meanwhile gets neither; the folder switch between them
+runs outside it, since its handler passes can take minutes. The switch runs as soon as the agent is
+saved, before its lane first starts and before the seat restarts as that agent, through the same
+`worker_lane.migrate_dirs` as `--apply` below, so work already in `deliveries/<id>/` moves or is handed back
+as described there. The add reports `dirs` as `own`; as `migrating` when the switch could not finish (a
+handler that failed, or work the worker accepted and still owes), in which case its lane and seat stay on the
+shared folders; or as `shared` when nothing was switched. A reason and the command that finishes it go to
+stderr; the identity and lane go ahead either way. `add --shared-dirs` keeps the worker on the shared folders: use it only
+while something still reads that worker's work from the shared `tasks/` and `results/`, and switch it later
+with `migrate-dirs --apply`. A resend of an expired link keeps that choice; a link started before this
+default existed keeps the shared folders. A rotate never changes a worker's
+folders, and neither do the `provision-*` verbs (run `migrate-dirs --apply` after one). A worker without its
+own agent stays on the shared folders.
+
+For a worker that already has its own agent, `python3 src/worker_lane.py migrate-dirs --worker <id>` shows what switching the worker would do (its
 folders, who holds its lane, what is delivered to it, and which tasks and results would move) and writes
 nothing. With `--apply` it switches the worker over:
 1. It finds the declared task-event handler first. A failed lookup, or work delivered with no handler to
    move it, refuses before anything changes.
-2. It writes the field and creates the folders (a private agent root), and relaunches the worker's lane
-   under the record lock. A wrapper lane is stopped and started again on the new folders in that same
+2. It writes `dirs: "migrating"`, creates the folders (a private agent root) and has the handler empty the
+   worker's `deliveries/<id>/` as in step 4. While the worker still owes a task it accepted, nothing moves;
+   that, or a handler that fails, ends the run there with the worker still on the shared folders, and a
+   re-run picks it up. A worker whose retirement has begun is refused here.
+3. It writes `dirs: "committing"` and relaunches the worker's lane under the record lock. A wrapper lane is stopped and started again on its own folders in that same
    hold, through `connections.start`, because not every install runs a lane keeper (the desktop app starts
    lanes once). A start that finds the lane already held spawns nothing. One that fails ends the run not
    ok (exit 1, the reason in `lane` and `why` with the command that starts it) and keeps the switch. The
    restart is recorded as owed before the lane is stopped, so a run that dies between the stop and the
    start leaves it too: a re-run starts that lane, if it is still down, before finishing the rest. The
    record goes once the lane runs again, or when the lane is disabled or parked. A declared bridge is
-   waited for until sparrowd has replaced it.
-3. It has the handler empty the worker's `deliveries/<id>/` under the router's locks. A task its own lane
-   queued moves into its tasks folder and its sentinel is archived. A core task the worker never accepted is
-   handed back (attribution first, then the sentinel) and touched so the core's watcher picks it up. One it
-   accepted or answered stays the worker's until `pool_manage.py retire --hand-off` once its session is gone.
-4. It moves into the worker's folders any task its own lane queued that is still in the shared `tasks/`,
-   and the worker's unclaimed live results.
+   waited for until sparrowd has replaced it. A lane that did not stop or start leaves it "committing".
+4. It has the handler empty the worker's `deliveries/<id>/` again under the router's locks, for anything its
+   old lane queued before it stopped. A task its own lane queued moves into its tasks folder and its sentinel
+   is archived. A core task the worker never accepted is handed back (attribution first, then the sentinel)
+   and touched so the core's watcher picks it up. One it answered stays as residue.
+5. Under the worker's switch lock it writes `dirs: "own"` (refused once its retirement has begun, which ends
+   the run) and moves into the worker's folders any task its own lane queued that is still in the shared
+   `tasks/`, and the worker's unclaimed live results.
 
 It prints one JSON line and is idempotent: a refusal, or a file that could not be moved, says why, and a
 re-run finishes. It restarts no session: respawn the worker so its session takes the new inbox.
