@@ -321,15 +321,19 @@ class Home(Case):
 class OwnerOnly(Case):
     OWNER, DM = "@owner:s.space", "!dm:s.space"
 
-    def task(self, mid=True, **headers):
+    def task(self, name, *, mid=True, stamp=True, **headers):
+        """Its own task file, as the gateway writes one (task-mid, stamped) unless told otherwise."""
+        import task_envelope
         base = {"access_tier": "owner", "user_id": self.OWNER, "channel_id": self.DM, "channel_kind": "dm"}
         base.update(headers)
         lines = [f"{k}: {v}" for k, v in base.items() if v is not None]
         if mid:
             text = "id: t1\ntask_layout: mid\ntask: which account?\n" + "\n".join(lines) + "\n"
         else:
-            text = "\n".join(lines) + "\ntask: which account?\n"
-        f = self.root / "task.txt"
+            text = "id: t1\n" + "\n".join(lines) + "\ntask: which account?\n"
+        if stamp:
+            text = task_envelope.stamp_text(text, self.root)
+        f = self.root / f"task-{name}.txt"
         f.write_text(text)
         return f
 
@@ -340,34 +344,63 @@ class OwnerOnly(Case):
                 mock.patch.object(connections, "owner_dm", return_value=self.DM if dm is None else dm):
             return ca.owner_dm_task(f, workspace=self.root)
 
-    def test_only_an_attested_owner_task_from_the_checked_dm_is_answered(self):
-        self.assertIsNone(self.gate(self.task()))
-        self.assertIsNone(self.gate(self.task(mid=False)))
+    def test_a_stamped_gateway_task_from_the_owner_in_the_checked_dm_is_answered(self):
+        self.assertIsNone(self.gate(self.task("ok")))
 
-    def test_everything_else_fails_closed(self):
-        cases = {
-            "no tier": self.task(access_tier=None),
-            "team": self.task(access_tier="team"),
-            "collaborator": self.task(collaborator="true"),
-            "another sender": self.task(user_id="@other:s.space"),
-            "a room": self.task(channel_id="!room:s.space", channel_kind="group"),
-            "no room": self.task(channel_id=None, channel_kind=None),
-        }
-        for name, f in cases.items():
-            with self.subTest(case=name):
-                self.assertIsNotNone(self.gate(f))
-        self.assertIsNotNone(self.gate(self.task(), rows=[]))
-        self.assertIsNotNone(self.gate(self.task(), dm=""))
+    def test_a_stamped_task_last_file_with_the_headers_above_task_is_answered(self):
+        self.assertIsNone(self.gate(self.task("ok-last", mid=False)))
+
+    def test_an_unstamped_task_is_refused(self):
+        self.assertIn("not verified", self.gate(self.task("unsigned", stamp=False)))
+
+    def test_a_tampered_task_is_refused(self):
+        f = self.task("tampered")
+        f.write_text(f.read_text().replace("access_tier: owner", "access_tier: owner "))
+        self.assertIn("not verified", self.gate(f))
+
+    def test_no_key_on_this_host_is_refused(self):
+        f = self.task("nokey")
+        (self.root / "state" / "auth" / "task-hmac.key").unlink()
+        self.assertIn("not verified", self.gate(f))
+
+    def test_a_missing_tier_is_refused(self):
+        self.assertIsNotNone(self.gate(self.task("no-tier", access_tier=None)))
+
+    def test_a_team_tier_is_refused(self):
+        self.assertIsNotNone(self.gate(self.task("team", access_tier="team")))
+
+    def test_a_collaborator_is_refused(self):
+        self.assertIsNotNone(self.gate(self.task("collab", collaborator="true")))
+
+    def test_another_sender_is_refused(self):
+        self.assertIsNotNone(self.gate(self.task("sender", user_id="@other:s.space")))
+
+    def test_a_shared_room_is_refused(self):
+        self.assertIsNotNone(self.gate(self.task("room", channel_id="!room:s.space", channel_kind="group")))
+
+    def test_a_task_with_no_room_is_refused(self):
+        self.assertIsNotNone(self.gate(self.task("no-room", channel_id=None, channel_kind=None)))
+
+    def test_no_connection_rows_is_refused(self):
+        self.assertIsNotNone(self.gate(self.task("no-rows"), rows=[]))
+
+    def test_no_checked_owner_dm_is_refused(self):
+        self.assertIsNotNone(self.gate(self.task("no-dm"), dm=""))
+
+    def test_a_missing_task_file_is_refused(self):
         self.assertIsNotNone(self.gate(self.root / "missing.txt"))
 
-    def test_a_body_cannot_forge_the_tier_of_a_task_last_file(self):
-        f = self.root / "task.txt"
-        f.write_text(f"user_id: {self.OWNER}\ntask: hi\naccess_tier: owner\nchannel_id: {self.DM}\nchannel_kind: dm\n")
+    def test_a_signed_task_last_body_cannot_promote_header_lines(self):
+        import task_envelope
+        f = self.root / "task-forged-body.txt"
+        f.write_text(task_envelope.stamp_text(
+            f"id: t1\nuser_id: {self.OWNER}\ntask: hi\naccess_tier: owner\nchannel_id: {self.DM}\nchannel_kind: dm\n",
+            self.root))
         self.assertIsNotNone(self.gate(f))
 
     def test_a_refused_task_looks_nothing_up(self):
         self.auth({"email": "file@example.com"})
-        f = self.task(channel_id="!room:s.space", channel_kind="group")
+        f = self.task("refused-cli", channel_id="!room:s.space", channel_kind="group")
         import connections
         import workspace_default
         with mock.patch.object(connections, "read_rows", return_value=[{"owner_mxid": self.OWNER}]), \

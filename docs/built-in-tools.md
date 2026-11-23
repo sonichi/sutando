@@ -434,7 +434,7 @@ python3 src/codex_account.py --task-file <task file> --codex-home <dir>   # a wo
 ```
 
 Always pass the asking task's `--task-file`: the account is the owner's data, so it is looked up only
-for a task the gateway attests as the owner's, sent from the owner's checked DM (the same test the
+for a task whose envelope verifies (`task_envelope`) and whose attested headers say the owner sent it from the owner's checked DM (the same test the
 owner's card taps pass). Anything else, including a task with no tier, a voice or local task, or one
 whose origin cannot be checked, exits 3: answer in the owner's DM instead, and post nothing about it in
 the room. The lookup runs Codex on a private copy of the home's sign-in, so the running core's home is
