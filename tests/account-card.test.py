@@ -371,7 +371,8 @@ class Switch(Base):
         self.restart_writes = A
         rc, out = self.switch()
         self.assertEqual(out["outcome"], "error")
-        self.assertIn("its sign-in is a…@example.com (plus), not b…@work.io (pro)", out["say"])
+        self.assertIn("The core restarted, but its saved sign-in is a…@example.com (plus), not b…@work.io (pro)",
+                      out["say"])
 
     def reset_attempt(self):
         rec = {"attempt": self.attempt, "key": self.key, "room": DM, "ts": 1e12}
@@ -445,10 +446,26 @@ class Switch(Base):
         import util_paths
         cores = self.ws / "state" / "cores"
         cores.mkdir(parents=True, exist_ok=True)
-        (cores / "h.alive").write_text(json.dumps({"pid": 111, "last_beat_at": 5.0}))
+        (cores / "h.alive").write_text(json.dumps({"pid": 111, "heartbeat_pid": 999, "session": "s",
+                                                    "last_beat_at": 5.0}))
         with mock.patch.object(util_paths, "_host_label", return_value="h"):
             self.switch()
         self.assertEqual(self.ready_since[-1][1], 111)
+
+    def assertNoRestartClaim(self, answer):
+        self.ready_ok, self.live_answer = acc.SAME, answer
+        rc, out = self.switch()
+        self.assertNotIn("restarted", out["say"])
+        self.assertNotIn("Switched", out["say"])
+
+    def test_same_generation_and_the_wanted_account_claims_no_restart(self):
+        self.assertNoRestartClaim(None)
+
+    def test_same_generation_and_no_confirmation_claims_no_restart(self):
+        self.assertNoRestartClaim({})
+
+    def test_same_generation_and_another_account_claims_no_restart(self):
+        self.assertNoRestartClaim({"kind": "chatgpt", "email": "alice@example.com"})
 
     def test_settlement_is_bound_to_the_whole_recorded_attempt(self):
         rec = json.loads(self.ws.joinpath(*acc.RUNNING).read_text())
@@ -623,10 +640,11 @@ class Edges(Base):
         self.assertEqual(acc.restart_core(mock.Mock(side_effect=acc.subprocess.TimeoutExpired("bash", 1))), 124)
         self.assertEqual(acc.restart_core(mock.Mock(side_effect=OSError("no bash"))), 127)
 
-    def beat(self, pid, at):
+    def beat(self, pid, at, writer=999, session="sutando-core"):
         cores = self.ws / "state" / "cores"
         cores.mkdir(parents=True, exist_ok=True)
-        (cores / "h.alive").write_text(json.dumps({"pid": pid, "last_beat_at": at, "started_at": 1.0}))
+        (cores / "h.alive").write_text(json.dumps({"pid": pid, "heartbeat_pid": writer, "session": session,
+                                                    "last_beat_at": at, "started_at": 1.0}))
 
     def ready_with(self, since, before, beats):
         """core_ready under a fake clock; `beats` is written one per poll."""
@@ -656,11 +674,36 @@ class Edges(Base):
     def test_without_a_known_previous_core_a_fresh_beat_is_not_a_new_generation(self):
         self.assertEqual(self.ready_with(1000.0, None, [(222, 1001.0)]), acc.SAME)
 
+    def test_a_writer_only_beat_names_no_core(self):
+        import util_paths
+        with mock.patch.object(util_paths, "_host_label", return_value="h"):
+            self.beat(999, 5.0, writer=999)
+            self.assertIsNone(acc.core_beat(self.ws)["pid"])
+
+    def test_a_beat_without_the_writers_pid_names_no_core(self):
+        import util_paths
+        with mock.patch.object(util_paths, "_host_label", return_value="h"):
+            self.beat(222, 5.0, writer=None)
+            self.assertIsNone(acc.core_beat(self.ws)["pid"])
+
+    def test_a_beat_without_an_observed_session_names_no_core(self):
+        import util_paths
+        with mock.patch.object(util_paths, "_host_label", return_value="h"):
+            self.beat(222, 5.0, session="")
+            self.assertIsNone(acc.core_beat(self.ws)["pid"])
+
+    def test_a_writer_only_beat_after_the_restart_is_not_a_new_core(self):
+        self.beat(111, 900.0)
+        self.assertEqual(self.ready_with(1000.0, 111, [(999, 1001.0, 999)] * 3), acc.SAME)
+
+    def test_a_writer_only_beat_before_the_restart_leaves_the_generation_unknown(self):
+        self.assertEqual(self.ready_with(1000.0, None, [(222, 1001.0)]), acc.SAME)
+
     def test_unreadable_heartbeats_are_empty(self):
         import util_paths
         with mock.patch.object(util_paths, "_host_label", return_value="h"):
             self.assertEqual(acc.core_beat(self.ws), {})
-            self.beat("x", "y")
+            self.beat("x", "y", writer="z")
             self.assertEqual(acc.core_beat(self.ws), {"pid": None, "last_beat_at": None})
             (self.ws / "state" / "cores" / "h.alive").write_text("[]")
             self.assertEqual(acc.core_beat(self.ws), {})

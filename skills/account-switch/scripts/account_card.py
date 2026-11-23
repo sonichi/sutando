@@ -564,7 +564,8 @@ def _alive(ws: Path) -> Optional[Path]:
 
 def core_beat(ws: Path) -> dict:
     """{pid, last_beat_at} of the core's heartbeat; {} when absent or unreadable. `pid` is the core
-    process the beat names (the writer outlives restarts, so its own start time says nothing)."""
+    process the beat names in an observed session, None for a writer-only beat (the writer outlives
+    restarts, so neither its pid nor its start time says anything about the core)."""
     alive = _alive(ws)
     if alive is None:
         return {}
@@ -574,7 +575,12 @@ def core_beat(ws: Path) -> dict:
         return {}
     if not isinstance(rec, dict):
         return {}
-    pid = rec.get("pid") if isinstance(rec.get("pid"), int) and not isinstance(rec.get("pid"), bool) else None
+    def num(v):
+        return v if isinstance(v, int) and not isinstance(v, bool) else None
+    pid, writer = num(rec.get("pid")), num(rec.get("heartbeat_pid"))
+    # When the core cannot be observed the writer puts its own pid in `pid`: that names no core.
+    if pid is None or writer is None or pid == writer or not str(rec.get("session") or "").strip():
+        pid = None
     beat = rec.get("last_beat_at") if isinstance(rec.get("last_beat_at"), (int, float)) else None
     return {"pid": pid, "last_beat_at": beat}
 
@@ -684,13 +690,14 @@ def do_switch(ws: Path, key: str, *, restart=restart_core, ready=core_ready, liv
                             f"Codex confirms the saved sign-in is {label}; the running core may still use the old one.")
         return "done", (f"Switched. The core restarted, and Codex confirms its saved sign-in is {label}. "
                         "I can't yet confirm which account the running core itself is using.")
+    restarted = "The core restarted" if generation == NEW else "I asked the core to restart"
     if not acct:
-        return "error", (f"The core restarted with {label}'s sign-in, but Codex did not confirm the account. "
+        return "error", (f"{restarted} with {label}'s sign-in, but Codex did not confirm the account. "
                          "Ask me for the account card to check.")
     shown = masked(str(acct.get("email") or ""))
     shown = (shown + (f" ({acct['plan']})" if acct.get("plan") else "")) if shown else \
         ("no ChatGPT account" if not acct.get("kind") else "another account")
-    return "error", f"The core restarted, but its sign-in is {shown}, not {label}. Ask me for the account card to try again."
+    return "error", f"{restarted}, but its saved sign-in is {shown}, not {label}. Ask me for the account card to try again."
 
 
 def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core, sleep=time.sleep,
