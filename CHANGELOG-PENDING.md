@@ -31,6 +31,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 
 ## Fixed
 
+- Model switch (core skill): a switch to a 1M model (`sonnet[1m]`, `fable[1m]`) that Claude Code 2.1.322 answers without naming the context size ("Set model to Sonnet 5.5 and saved as your default for new sessions") was reported as not accepted (exit 8) although it happened. It now counts once the core's `settings.json` names exactly that model; the line alone still does not.
 - ag2-sparrow (antigravity-local): images and files people send now reach Antigravity: images as ACP image blocks in the prompt (when agy declares `image`), and on the owner's turn a read-only copy of the task's own files in a folder agy may read (`additionalDirectories`) but never change; an isolated non-owner turn gets the images only. The owner's final message keeps its delivery markers (`[channel:]`, `[thread]`, `[file:]` for a file under the working directory only), as Claude Code and Codex results do; non-owners' markers stay neutralised. A bridge launched without `REMOTE_MEDIA_MARKER` (the desktop's and connect's seat bridges) now resolves the AG2 Space gateway's `[ag2space-media: …]` marker too, so its download reaches every local adapter.
 
 <!-- fix() PRs go here -->

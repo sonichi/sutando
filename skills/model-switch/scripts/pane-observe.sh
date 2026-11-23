@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# pane-observe.sh <session> --socket PATH --model M (--count | --wait --baseline N [--timeout S] [--answer-enter] | --cancel)
+# pane-observe.sh <session> --socket PATH --model M [--settings FILE] (--count | --wait --baseline N [--timeout S] [--answer-enter] | --cancel)
 # Acceptance = a "Set model to <family> [<version>]" line for the REQUESTED model; any other model's line does not count.
 set -u
 SESSION="${1:?session}"; shift
-SOCK=""; MODE=""; BASE=0; TIMEOUT=20; ANSWER=""; REQ=""
+SOCK=""; MODE=""; BASE=0; TIMEOUT=20; ANSWER=""; REQ=""; SETTINGS=""
 while [ $# -gt 0 ]; do case "$1" in
   --socket) SOCK="${2:?}"; shift;; --count) MODE=count;; --wait) MODE=wait;; --cancel) MODE=cancel;;
-  --baseline) BASE="${2:?}"; shift;; --timeout) TIMEOUT="${2:?}"; shift;; --answer-enter) ANSWER=1;; --model) REQ="${2:?}"; shift;;
+  --baseline) BASE="${2:?}"; shift;; --timeout) TIMEOUT="${2:?}"; shift;; --answer-enter) ANSWER=1;; --model) REQ="${2:?}"; shift;; --settings) SETTINGS="${2:?}"; shift;;
   *) echo "pane-observe: unknown arg $1" >&2; exit 2;;
 esac; shift; done
 [ -n "$SOCK" ] || { echo "pane-observe: --socket required" >&2; exit 2; }
@@ -21,7 +21,10 @@ ACCEPT=""
 if [ "$MODE" != cancel ]; then ACCEPT="$("$PY" "$REPO_ROOT/src/claude_model_switch.py" accept "$REQ")" || { echo "pane-observe: '$REQ' is not a model" >&2; exit 2; }; fi
 # A failed capture is a failed observation, never a zero.
 cap() { tmux -S "$SOCK" capture-pane -p -t "$SESSION" 2>/dev/null || { echo "CAPTURE-FAILED"; return 12; }; }
-count() { out="$(cap)" || { echo "CAPTURE-FAILED"; return 12; }; printf '%s\n' "$out" | "$PY" "$REPO_ROOT/src/claude_model_switch.py" count "$REQ"; return 0; }
+# With --settings (the CLI's settings.json), a [1m] switch the CLI answers without naming the context size
+# counts once that file names the model (Claude Code 2.1.322: "Set model to Sonnet 5.5 and saved ...").
+COUNT_ARGS=(count "$REQ"); [ -n "$SETTINGS" ] && COUNT_ARGS+=(--settings "$SETTINGS")
+count() { out="$(cap)" || { echo "CAPTURE-FAILED"; return 12; }; printf '%s\n' "$out" | "$PY" "$REPO_ROOT/src/claude_model_switch.py" "${COUNT_ARGS[@]}"; return 0; }
 case "$MODE" in
   count) count; exit $?;;
   cancel) bash "$PANE_KEYS" --python "$PY" -S "$SOCK" -t "$SESSION" -- Escape || exit $?; echo CANCELLED; exit 0;;
@@ -37,7 +40,7 @@ while :; do
     # Unobservable pane: keep polling, but never let a blind poll count as acceptance.
     [ "$(date +%s)" -ge "$deadline" ] && { echo TIMEOUT; exit 11; }; sleep 0.5; continue
   fi
-  n=$(printf '%s\n' "$text" | "$PY" "$REPO_ROOT/src/claude_model_switch.py" count "$REQ")
+  n=$(printf '%s\n' "$text" | "$PY" "$REPO_ROOT/src/claude_model_switch.py" "${COUNT_ARGS[@]}")
   if [ "$n" -gt "$BASE" ]; then echo ACCEPTED; exit 0; fi
   if [ -z "$ANSWER" ] && printf '%s' "$text" | grep -q -- "$DIALOG"; then echo DIALOG; exit 10; fi
   [ "$(date +%s)" -ge "$deadline" ] && { echo TIMEOUT; exit 11; }

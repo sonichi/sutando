@@ -9,10 +9,13 @@ and for ag2-sparrow's claude-local adapter (bundled verbatim; the package drift 
     python3 claude_model_switch.py model-pattern        # the names that may be typed, as an ERE
     python3 claude_model_switch.py accept <model>       # Claude Code's line for a switch to it, as an ERE
     python3 claude_model_switch.py count <model>        # how many such lines the screen on stdin holds
+    python3 claude_model_switch.py count <model> --settings FILE   # the same, a [1m] line without its size
+                                                                   # counting once FILE's model names it
     python3 claude_model_switch.py confirm-text         # the text of Claude Code's confirm dialog
 """
 from __future__ import annotations
 
+import json
 import re
 import sys
 
@@ -75,6 +78,34 @@ def accepted_count(model: str, shown) -> int:
                if pattern.search(line) and (model == "default" or bool(re.search(r"1m", line, re.I)) == wants_1m))
 
 
+def family_count(model: str, shown) -> int:
+    """How many lines on screen name a switch to `model`'s family and version, whatever context size they
+    state. Claude Code 2.1.322 answers `/model sonnet[1m]` with "Set model to Sonnet 5.5 and saved as your
+    default for new sessions", naming no context size (measured 2026-11-22; its saved setting was
+    `sonnet[1m]`): such a line is only half the evidence for a [1m] switch, the saved setting the rest."""
+    pattern = model_accepted(model)
+    return sum(1 for line in (shown or "").splitlines() if pattern.search(line))
+
+
+def saved_setting(settings_file) -> str:
+    """The `model` a CLI's settings.json holds, '' when it cannot be read or names none."""
+    try:
+        with open(settings_file, encoding="utf-8") as f:
+            saved = json.load(f).get("model")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return ""
+    return saved if isinstance(saved, str) else ""
+
+
+def settled_count(model: str, shown, saved: str = "") -> int:
+    """`accepted_count`, except that a [1m] switch the CLI answered without naming the context size counts
+    once its saved setting (`saved`) names exactly that model: then every line of its family does. Taken
+    before a send and again after, with the setting as it is each time, a NEW line is still required."""
+    if model.endswith("[1m]") and saved == model:
+        return family_count(model, shown)
+    return accepted_count(model, shown)
+
+
 def main(argv) -> int:
     if argv[:1] == ["model-pattern"] and len(argv) == 1:
         print(MODEL_PATTERN)
@@ -88,7 +119,11 @@ def main(argv) -> int:
     if argv[:1] == ["count"] and len(argv) == 2 and MODEL_RE.match(argv[1]):
         print(accepted_count(argv[1], sys.stdin.read()))
         return 0
-    print("usage: claude_model_switch.py model-pattern | accept <model> | count <model> | confirm-text", file=sys.stderr)
+    if argv[:1] == ["count"] and len(argv) == 4 and argv[2] == "--settings" and MODEL_RE.match(argv[1]):
+        print(settled_count(argv[1], sys.stdin.read(), saved_setting(argv[3])))
+        return 0
+    print("usage: claude_model_switch.py model-pattern | accept <model> | count <model> [--settings FILE] | "
+          "confirm-text", file=sys.stderr)
     return 2
 
 
