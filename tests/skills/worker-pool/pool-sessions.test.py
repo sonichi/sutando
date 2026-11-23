@@ -10,6 +10,7 @@ Run: python3 tests/skills/worker-pool/pool-sessions.test.py
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -335,46 +336,51 @@ class UnreadableRecordsDegradeToAbsent(unittest.TestCase):
             self.assertEqual(row["runtime"], "codex")
             self.assertTrue(row["seat"])
 
-    def test_a_seat_to_tui_restart_is_not_left_read_only(self):
+    def _codex_seat_ws(self, d, run_id, stamped):
+        run = dict(open_run(W1), incarnation_id=run_id, started_at="2026-11-22T20:00:00Z")
+        ws = workspace_with(Path(d), {W1: {"state": "live", "runtime": "codex"}}, {}, {W1: [run]})
+        seat = ws / "state" / "codex-seat" / f"sutando-worker-{W1}"
+        write(seat / "host.json", {})
+        if stamped is not None:
+            (seat / "incarnation").write_text(stamped + "\n")
+        return ws
+
+    def test_a_same_second_seat_to_tui_replacement_is_not_left_read_only(self):
         """Both Codex modes reuse `sutando-worker-<id>` and a TUI launch leaves the earlier
-        seat's host.json in place: a declaration older than the open run is not this run's."""
-        import os
+        seat's host.json in place. Launched in the same second, only the run id tells them
+        apart: the stale seat's stamp names the previous run, so the TUI pane is typable."""
         with tempfile.TemporaryDirectory() as d:
-            tui = dict(open_run(W1), started_at="2026-11-22T20:00:00Z")
-            ws = workspace_with(Path(d), {W1: {"state": "live", "runtime": "codex"}},
-                                {}, {W1: [tui]})
+            ws = self._codex_seat_ws(d, "i-tui-run", "i-old-seat-run")
             host = ws / "state" / "codex-seat" / f"sutando-worker-{W1}" / "host.json"
-            write(host, {})
-            seat_era = pool_sessions._started_epoch({"started_at": "2026-11-22T19:00:00Z"})
-            os.utime(host, (seat_era, seat_era))
+            same = host.stat().st_mtime
+            os.utime(host, (same, same))
             (row,) = pool_sessions.sessions(ws, probe=EXISTS)
             self.assertFalse(row["seat"])
 
-    def test_a_declaration_written_by_this_run_marks_it_a_seat(self):
-        import os
+    def test_a_declaration_stamped_by_the_open_run_marks_it_a_seat(self):
         with tempfile.TemporaryDirectory() as d:
-            run = dict(open_run(W1), started_at="2026-11-22T20:00:00Z")
-            ws = workspace_with(Path(d), {W1: {"state": "live", "runtime": "codex"}},
-                                {}, {W1: [run]})
-            host = ws / "state" / "codex-seat" / f"sutando-worker-{W1}" / "host.json"
-            write(host, {})
-            same_second = pool_sessions._started_epoch(run)
-            os.utime(host, (same_second, same_second))
+            ws = self._codex_seat_ws(d, "i-seat-run", "i-seat-run")
             (row,) = pool_sessions.sessions(ws, probe=EXISTS)
             self.assertTrue(row["seat"])
 
-    def test_an_unreadable_run_start_keeps_the_bare_declaration_rule(self):
-        """A start that does not parse cannot date the declaration, so the row stays read-only
-        (a seat) rather than offering a typable pane over a seat's log."""
-        import os
+    def test_an_unstamped_declaration_stays_read_only(self):
+        """A seat from a launcher that predates the stamp cannot be dated to a run, so the row
+        stays read-only rather than offering a typable pane over a seat's log."""
         with tempfile.TemporaryDirectory() as d:
-            run = dict(open_run(W1), started_at="not a time")
-            ws = workspace_with(Path(d), {W1: {"state": "live", "runtime": "codex"}},
-                                {}, {W1: [run]})
-            host = ws / "state" / "codex-seat" / f"sutando-worker-{W1}" / "host.json"
-            write(host, {})
-            os.utime(host, (0, 0))
-            self.assertIsNone(pool_sessions._started_epoch(run))
+            ws = self._codex_seat_ws(d, "i-run", None)
+            (row,) = pool_sessions.sessions(ws, probe=EXISTS)
+            self.assertTrue(row["seat"])
+
+    def test_an_unreadable_stamp_stays_read_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = self._codex_seat_ws(d, "i-run", None)
+            (ws / "state" / "codex-seat" / f"sutando-worker-{W1}" / "incarnation").write_bytes(b"\xff\xfe")
+            (row,) = pool_sessions.sessions(ws, probe=EXISTS)
+            self.assertTrue(row["seat"])
+
+    def test_a_run_with_no_id_keeps_the_bare_rule(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = self._codex_seat_ws(d, "", "i-old-seat-run")
             (row,) = pool_sessions.sessions(ws, probe=EXISTS)
             self.assertTrue(row["seat"])
 

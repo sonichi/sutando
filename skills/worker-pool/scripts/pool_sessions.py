@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -62,29 +61,21 @@ def is_seat(workspace, runtime: str, session_name: str, incarnation: "dict | Non
     (seat-launch.sh: <workspace>/state/codex-seat/<session>/host.json), as the desktop's core
     rule does: a leftover declaration under a Claude worker must not make it untypable.
 
-    The declaration must belong to this run. Both Codex modes reuse the session name and a TUI
-    launch leaves an earlier seat's host.json in place, so a declaration written before the open
-    incarnation started is a previous run's. A run with no readable start keeps the bare rule."""
+    The declaration must belong to the open run. Both Codex modes reuse the session name and a
+    TUI launch leaves an earlier seat's host.json in place, so the seat launcher stamps the run's
+    incarnation id beside it (`incarnation`) and a different id is a previous run's seat. When
+    either id is unknown the bare rule holds, so an unknown case stays read-only."""
     if runtime != "codex":
         return False
-    host = Path(workspace) / "state" / "codex-seat" / session_name / "host.json"
-    try:
-        declared = host.stat().st_mtime
-    except OSError:
+    seat_dir = Path(workspace) / "state" / "codex-seat" / session_name
+    if not (seat_dir / "host.json").is_file():
         return False
-    started = _started_epoch(incarnation)
-    return started is None or declared >= started
-
-
-def _started_epoch(incarnation: "dict | None") -> "float | None":
-    # started_at is whole seconds (worker_identity._now), so a same-second declaration counts.
-    raw = (incarnation or {}).get("started_at")
-    if not isinstance(raw, str):
-        return None
     try:
-        return datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
-    except ValueError:
-        return None
+        stamped = (seat_dir / "incarnation").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        stamped = ""
+    current = str((incarnation or {}).get("incarnation_id") or "")
+    return not (stamped and current) or stamped == current
 
 
 def rooms_bound_to(roster: dict, worker_id: str) -> list:

@@ -131,6 +131,10 @@ PY
 check $? "flag on: the declaration names the delivery inbox, the task store and the pool's stage hook"
 grep -q "is a Codex app-server seat; no observer or notifier session was started" "$TMP/err"
 check $? "flag on: the launcher says what it started"
+[ ! -e "$(dirname "$DECL")/incarnation" ]; check $? "flag on, no run id: no run stamp is written"
+launch launch-codex-worker-session.sh SUTANDO_CODEX_APP_SERVER=1 SUTANDO_WORKER_INCARNATION_ID=i-this-run
+[ "$(cat "$(dirname "$DECL")/incarnation" 2>/dev/null)" = "i-this-run" ]
+check $? "flag on: the declaration is stamped with this run's incarnation id"
 
 # --- 3. flag on, a worker on its own folders: a plain inbox, no payload store ---
 # Only a launcher that accepts a worker without a resolver has this case.

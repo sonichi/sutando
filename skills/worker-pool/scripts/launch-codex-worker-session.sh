@@ -134,6 +134,12 @@ if [ "${SUTANDO_CODEX_APP_SERVER:-}" = 1 ]; then
     echo "launch-codex-worker-session: could not write the seat's host declaration; not starting $SESSION" >&2
     exit 1
   fi
+  # The run this declaration belongs to (pool_sessions.is_seat); no id leaves the viewer's read-only default.
+  rm -f "$seat_state/incarnation"
+  if [ -n "${SUTANDO_WORKER_INCARNATION_ID:-}" ]; then
+    printf '%s\n' "$SUTANDO_WORKER_INCARNATION_ID" > "$seat_state/incarnation.tmp" &&
+      mv -f "$seat_state/incarnation.tmp" "$seat_state/incarnation"
+  fi
   tmux -S "$SOCKET" new-session -d -s "$SESSION" "${ENV_ARGS[@]}" -e SUTANDO_CODEX_APP_SERVER=1 \
     -e SUTANDO_STANDBY_MODE=type -e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}" \
     -e "SUTANDO_WATCHER_BEAT=$REPO/skills/worker-pool/scripts/pool_beat.py" \

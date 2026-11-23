@@ -284,6 +284,30 @@ class TestSpawn(Base):
         for core_only in ("SUTANDO_CORE_ID", "SUTANDO_CORE_POOL_SIZE", "SUTANDO_WORKER_SEAT"):
             self.assertNotIn(core_only, env)
 
+    def test_the_launcher_is_told_the_run_it_starts(self):
+        """A Codex seat stamps this id on its declaration, so a later TUI run under the same
+        session name is not mistaken for the seat."""
+        t = FakeTmux()
+        got = sw.spawn(self.ws, REPO, runner=t, require_sentinel=False)
+        env = t.launches()[0]
+        (run,) = wi.incarnations(self.ws, got["worker_id"])
+        self.assertEqual(env["SUTANDO_WORKER_INCARNATION_ID"], run["incarnation_id"])
+
+    def test_a_codex_recovery_names_its_new_run_not_the_previous_one(self):
+        wid = "d" * 32
+        wi.create_worker(self.ws, runtime="codex", worker_id=wid, cwd=str(REPO))
+        (first,) = wi.incarnations(self.ws, wid)
+        wi.end_incarnation(self.ws, wid, first["incarnation_id"], "crashed")
+        t = FakeTmux(runtime="codex")
+        with mock.patch.object(sw.pr, "load_roster",
+                               return_value={"workers": {wid: {"runtime": "codex"}}}):
+            sw.spawn(self.ws, REPO, runtime="codex", existing_worker_id=wid,
+                     runner=t, require_sentinel=False)
+        env = t.launches()[0]
+        newest = wi.incarnations(self.ws, wid)[-1]
+        self.assertEqual(env["SUTANDO_WORKER_INCARNATION_ID"], newest["incarnation_id"])
+        self.assertNotEqual(newest["incarnation_id"], first["incarnation_id"])
+
     def test_the_delivery_folder_matches_the_identity_record(self):
         """A record naming one id and a folder named another is a silent orphan."""
         got = sw.spawn(self.ws, REPO, runner=FakeTmux(), require_sentinel=False)
