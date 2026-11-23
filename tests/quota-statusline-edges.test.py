@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Error and refusal paths of the status line quota recorder: the writer, the account
 helpers, the session-config hook runner, the installer, the recorder and StopFailure
-scripts. Everything runs in-process.
+scripts, and proxy retirement. Everything runs in-process.
 
 Run: python3 tests/quota-statusline-edges.test.py
 """
@@ -31,6 +31,7 @@ sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(ROOT / "src"))  # ahead of the skill's quota_availability shim
 
 import claude_account
+import proxy_retire as pr
 import quota_record as qr
 import session_config_hooks as sch
 import statusline_config as cfg
@@ -185,12 +186,12 @@ class SessionConfigHooks(Tmp):
         self.assertEqual(sch.main([]), 0)
         calls = []
         hooks = [("s", self.d / "s.py")]
-        with mock.patch.object(sch, "_discover", side_effect=lambda f: f.extend([*hooks, None])), \
+        with mock.patch.object(sch, "_discover", side_effect=lambda f, *a: f.extend([*hooks, None])), \
                 mock.patch.object(sch, "run", side_effect=lambda h, c, py, dl: calls.append((h, c))):
             self.assertEqual(sch.main(["--config-dir", str(self.core)]), 0)
         self.assertEqual(calls, [(hooks, str(self.core))])
         calls.clear()
-        with mock.patch.object(sch, "_discover", side_effect=lambda f: time.sleep(1)), \
+        with mock.patch.object(sch, "_discover", side_effect=lambda f, *a: time.sleep(1)), \
                 mock.patch.object(sch, "DISCOVERY_SECONDS", 0.1), \
                 mock.patch.object(sch, "run", side_effect=lambda *a: calls.append(a)):
             self.assertEqual(sch.main(["--config-dir", str(self.core)]), 0)
@@ -262,15 +263,160 @@ class Scripts(Tmp):
 
 
 class InstallHook(Tmp):
-    def test_main_installs_and_survives_a_failure(self):
+    def test_main_installs_retires_restores_and_survives_failures(self):
         mod = _load("install_statusline_edges", SCRIPTS / "install-statusline.py")
-        with mock.patch.object(sys, "stderr", io.StringIO()) as err, \
-                mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "true"}):
-            self.assertEqual(mod.main(["--config-dir", str(self.core)]), 0)
+        with mock.patch.object(cfg, "workspace", return_value=self.ws), \
+                mock.patch.object(pr, "retire", return_value="kept: test") as retire, \
+                mock.patch.object(pr, "restore", return_value="nothing to restore") as restore, \
+                mock.patch.object(sys, "stderr", io.StringIO()) as err:
+            with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "true"}):
+                self.assertEqual(mod.main(["--config-dir", str(self.core)]), 0)
             self.assertIn("installed", err.getvalue())
+            retire.assert_called_once()
+            with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false"}):
+                self.assertEqual(mod.main(["--config-dir", str(self.core)]), 0)
+            restore.assert_not_called()  # route-proxy.py restores it, before routing
             with mock.patch.object(cfg, "install", side_effect=RuntimeError("boom")):
                 self.assertEqual(mod.main(["--config-dir", str(self.core)]), 0)
             self.assertIn("not installed", err.getvalue())
+            with mock.patch.object(cfg, "enabled", side_effect=[True, RuntimeError()]):
+                self.assertEqual(mod.main(["--config-dir", str(self.core)]), 0)
+            self.assertIn("check skipped", err.getvalue())
+
+
+class RouteHook(Tmp):
+    def setUp(self):
+        super().setUp()
+        self.mod = _load("route_proxy_edges", SCRIPTS / "route-proxy.py")
+        self.listen_after = 2
+        self.calls = []
+
+    def run_(self, argv):
+        self.calls.append(argv)
+        R = types.SimpleNamespace
+        if argv[:2] == ["launchctl", "print"]:
+            return R(returncode=0 if any(a[:2] == ["launchctl", "bootstrap"] for a in self.calls) else 113, stdout="")
+        if argv[:2] == ["launchctl", "bootstrap"]:
+            return R(returncode=0, stdout="")
+        if argv[0] == "lsof":
+            self.listen_after -= 1
+            return R(returncode=0 if self.listen_after <= 0 else 1, stdout="")
+        raise AssertionError(argv)
+
+    def test_opt_out_restores_and_waits_for_the_port_before_routing(self):
+        pr._record(self.ws, status="retired")
+        plist = self.d / "p.plist"
+        plist.write_text("<plist/>")
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false"}), \
+                mock.patch.object(cfg, "workspace", return_value=self.ws), \
+                mock.patch.object(pr, "plist_path", return_value=plist), mock.patch.object(sys, "stderr", err):
+            self.assertEqual(self.mod.main(runner=self.run_, sleep=lambda s: None), 0)
+        self.assertIn("restored, listening", err.getvalue())
+        boot = [i for i, a in enumerate(self.calls) if a[:2] == ["launchctl", "bootstrap"]]
+        listen = [i for i, a in enumerate(self.calls) if a[0] == "lsof"]
+        self.assertTrue(boot and listen and boot[0] < listen[0])
+
+    def test_port_that_never_listens_is_reported_and_tracking_on_does_nothing(self):
+        pr._record(self.ws, status="retired")
+        plist = self.d / "p.plist"
+        plist.write_text("<plist/>")
+        self.listen_after = 10 ** 6
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false"}), \
+                mock.patch.object(cfg, "workspace", return_value=self.ws), \
+                mock.patch.object(pr, "plist_path", return_value=plist), mock.patch.object(sys, "stderr", err):
+            self.mod.main(runner=self.run_, wait_s=0.05, sleep=lambda s: None)
+        self.assertIn("not listening yet", err.getvalue())
+        self.calls.clear()
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "true"}):
+            self.assertEqual(self.mod.main(runner=self.run_), 0)
+        self.assertEqual(self.calls, [])
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false"}), \
+                mock.patch.object(cfg, "workspace", side_effect=RuntimeError), mock.patch.object(sys, "stderr", err):
+            self.assertEqual(self.mod.main(runner=self.run_), 0)
+        self.assertIn("restore skipped", err.getvalue())
+
+    def test_route_phase_runs_route_declarers_without_a_config_dir(self):
+        hook = self.d / "r.py"
+        hook.write_text("import sys, pathlib; pathlib.Path(sys.argv[0]).with_suffix('.args').write_text(repr(sys.argv[1:]))\n")
+        seen = []
+        with mock.patch.object(sch, "_discover", side_effect=lambda f, field: (seen.append(field), f.extend([("x", hook), None]))):
+            self.assertEqual(sch.main(["--route"]), 0)
+        self.assertEqual(seen, [sch.ROUTE_FIELD])
+        self.assertEqual((self.d / "r.args").read_text(), "[]")
+        found = []
+        sch._discover(found, sch.ROUTE_FIELD)
+        self.assertIn("quota-tracker", [n for n, _p in found[:-1]])
+
+
+class Run:
+    def __init__(self, loaded=True, pid_line=True, bootout_rc=0, bootstrap_rc=0, lsof=None):
+        self.loaded, self.pid_line, self.bootout_rc, self.bootstrap_rc = loaded, pid_line, bootout_rc, bootstrap_rc
+        self.lsof, self.calls = lsof, []
+
+    def __call__(self, argv):
+        self.calls.append(argv)
+        R = types.SimpleNamespace
+        if argv[:2] == ["launchctl", "print"]:
+            return R(returncode=0 if self.loaded else 113,
+                     stdout="\tpid = 4242\n" if self.pid_line else "\tstate = waiting\n")
+        if argv[:2] == ["launchctl", "bootout"]:
+            return R(returncode=self.bootout_rc, stdout="")
+        if argv[:2] == ["launchctl", "bootstrap"]:
+            return R(returncode=self.bootstrap_rc, stdout="")
+        if argv[0] == "ps":
+            return R(returncode=0, stdout="")
+        if argv[0] == "lsof":
+            return self.lsof
+        raise AssertionError(argv)
+
+
+class ProxyRetire(Tmp):
+    def setUp(self):
+        super().setUp()
+        qr.record_statusline(self.ws, _status(), config_dir=str(self.core), core_dir=str(self.core))
+        env = mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "true"})
+        env.start()
+        self.addCleanup(env.stop)
+        self.clear = types.SimpleNamespace(returncode=1, stdout="")
+
+    def test_run_and_paths(self):
+        self.assertEqual(pr._run([sys.executable, "-c", "print(1)"]).stdout.strip(), "1")
+        self.assertIsNone(pr._run([str(self.d / "missing-binary")]))
+        self.assertEqual(pr.plist_path().name, f"{pr.LABEL}.plist")
+
+    def test_job_pid_absent(self):
+        self.assertIsNone(pr.job_pid(Run(loaded=False)))
+        self.assertIsNone(pr.job_pid(Run(pid_line=False)))
+
+    def test_unreadable_connections_keep_it(self):
+        self.assertIsNone(pr.proxy_connections(lambda argv: None))
+        self.assertIn("could not be read", pr.retire(self.ws, runner=Run(lsof=None)))
+
+    def test_not_loaded_dry_run_and_failed_bootout(self):
+        self.assertEqual(pr.retire(self.ws, runner=Run(loaded=False)), "proxy launch agent not loaded")
+        self.assertEqual(pr.retire(self.ws, runner=Run(lsof=self.clear), dry_run=True), "would turn off: unused")
+        self.assertEqual(pr.retire(self.ws, runner=Run(lsof=self.clear, bootout_rc=5)),
+                         "kept: launchctl bootout failed")
+
+    def test_a_signal_that_fails_is_tolerated(self):
+        def kill(pid, sig):
+            if sig != 0:
+                raise OSError("gone")
+        said = pr.retire(self.ws, runner=Run(lsof=self.clear), kill=kill, wait_s=0.1)
+        self.assertTrue(said.startswith("turned off"), said)
+
+    def test_restore_refusals(self):
+        pr._record(self.ws, status="retired")
+        self.assertEqual(pr.restore(self.ws, runner=Run(loaded=True)), "already loaded")
+        pr._record(self.ws, status="retired")
+        with mock.patch.object(pr, "plist_path", return_value=self.d / "missing.plist"):
+            self.assertIn("missing", pr.restore(self.ws, runner=Run(loaded=False)))
+        plist = self.d / "p.plist"
+        plist.write_text("<plist/>")
+        with mock.patch.object(pr, "plist_path", return_value=plist):
+            self.assertIn("bootstrap failed", pr.restore(self.ws, runner=Run(loaded=False, bootstrap_rc=1)))
 
 
 class SignedIn(Tmp):
@@ -597,6 +743,10 @@ class HealthCheck(Tmp):
                 mod.main()
         self.assertEqual(stop.exception.code, 1)
         self.assertIn("another login", out.getvalue())
+
+    def test_cwd_without_a_name_line_is_unknown(self):
+        R = types.SimpleNamespace
+        self.assertIsNone(pr._cwd("1", lambda argv: R(returncode=0, stdout="p1\n")))
 
     def test_statusline_freshness_with_an_unreadable_record(self):
         hc = self._hc()

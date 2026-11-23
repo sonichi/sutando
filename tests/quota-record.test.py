@@ -30,6 +30,7 @@ import claude_account
 import quota_availability as qa
 import quota_record as qr
 import session_config_hooks as sch
+import proxy_retire as pr
 import statusline_config as cfg
 
 FX = json.loads((ROOT / "tests" / "fixtures" / "quota-record-shape.parity.json").read_text())
@@ -513,6 +514,168 @@ class SessionConfigHooks(Base):
         __import__("time").sleep(3)
         self.assertFalse(late.exists())
         self.assertFalse(Path(f"{late}.2").exists())
+
+
+class FakeRun:
+    """Answers launchctl / ps / lsof from a table; records every argv."""
+
+    def __init__(self, ps="", lsof_rc=1, lsof_out="", loaded=True, pid=4242, bootout_rc=0, cwd=None, ps_rc=0):
+        self.calls, self.ps, self.lsof_rc, self.lsof_out = [], ps, lsof_rc, lsof_out
+        self.loaded, self.pid, self.bootout_rc, self.cwd, self.ps_rc = loaded, pid, bootout_rc, cwd, ps_rc
+
+    def __call__(self, argv):
+        self.calls.append(argv)
+        R = __import__("types").SimpleNamespace
+        if argv[:2] == ["launchctl", "print"]:
+            return R(returncode=0 if self.loaded else 113,
+                     stdout=f"\tstate = running\n\tpid = {self.pid}\n" if self.loaded else "")
+        if argv[:2] == ["launchctl", "bootout"]:
+            self.loaded = self.loaded and self.bootout_rc != 0
+            return R(returncode=self.bootout_rc, stdout="")
+        if argv[:2] == ["launchctl", "bootstrap"]:
+            self.loaded = True
+            return R(returncode=0, stdout="")
+        if argv[0] == "ps":
+            return R(returncode=self.ps_rc, stdout=self.ps)
+        if argv[0] == "lsof" and "cwd" in argv:
+            return R(returncode=0, stdout=f"p{argv[3]}\nn{self.cwd}\n") if self.cwd else R(returncode=1, stdout="")
+        if argv[0] == "lsof":
+            return R(returncode=self.lsof_rc, stdout=self.lsof_out)
+        raise AssertionError(argv)
+
+    def booted_out(self):
+        return any(a[:2] == ["launchctl", "bootout"] for a in self.calls)
+
+
+class ProxyRetire(Base):
+    def setUp(self):
+        super().setUp()
+        self.sl(_status(), now=None)  # a fresh core record
+        p = [mock.patch.object(claude_account, "core_config_dir", return_value=self.core),
+             mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "true"})]
+        for x in p:
+            x.start()
+            self.addCleanup(x.stop)
+        self.killed = []
+
+    def _gone(self, pid, sig):
+        self.killed.append((pid, sig))
+        if sig == 0:
+            raise OSError("no such process")
+
+    def retire(self, run):
+        return pr.retire(self.ws, runner=run, kill=self._gone, wait_s=0.2)
+
+    def test_kept_while_a_session_env_points_at_the_proxy(self):
+        ps = (f" 101 /opt/bin/claude --name sutando-core CLAUDE_CONFIG_DIR={self.core} "
+              "ANTHROPIC_BASE_URL=http://localhost:7846\n 102 /bin/zsh ANTHROPIC_BASE_URL=http://localhost:7846\n")
+        run = FakeRun(ps=ps)
+        said = self.retire(run)
+        self.assertIn("pid 101", said)
+        self.assertIn("pid 102 zsh", said)  # any process of this user, not only claude
+        self.assertFalse(run.booted_out())
+        rec = json.loads((self.ws / "state" / pr.RECORD).read_text())
+        self.assertEqual(rec["status"], "kept")
+        self.assertIn("pid 101", rec["reason"])
+
+    def test_kept_while_launch_settings_point_at_the_proxy(self):
+        Path(self.core, "settings.json").write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:7846"}}))
+        run = FakeRun()
+        self.assertIn("settings", self.retire(run))
+        self.assertFalse(run.booted_out())
+
+    def test_a_non_claude_process_pointing_at_the_proxy_keeps_it(self):
+        ps = " 301 /usr/local/bin/node /srv/agent-sdk.js ANTHROPIC_BASE_URL=http://127.0.0.1:7846/ HOME=/h\n"
+        run = FakeRun(ps=ps)
+        said = self.retire(run)  # an idle SDK client: no connection open at this instant
+        self.assertIn("pid 301 node", said)
+        self.assertFalse(run.booted_out())
+        unreadable = FakeRun(ps=" 302 /usr/local/bin/node /srv/agent-sdk.js\n")
+        self.assertIn("pid 302 node (environment unreadable)", self.retire(unreadable))
+        ps_argv = [a for a in run.calls if a[0] == "ps"][0]
+        self.assertEqual(ps_argv[ps_argv.index("-U") + 1], str(os.getuid()))
+
+    def test_a_failed_process_list_keeps_it(self):
+        run = FakeRun(ps_rc=1)
+        self.assertIn("process list unreadable", self.retire(run))
+        self.assertFalse(run.booted_out())
+
+    def test_an_unreadable_session_config_keeps_it(self):
+        Path(self.core, "settings.json").write_text("{not json")
+        run = FakeRun()
+        self.assertIn("unreadable", self.retire(run))
+        self.assertFalse(run.booted_out())
+
+    def test_an_idle_session_still_pointing_at_the_proxy_keeps_it(self):
+        proj = Path(self._tmp.name) / "proj"
+        (proj / ".claude").mkdir(parents=True)
+        (proj / ".claude" / "settings.local.json").write_text(
+            json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://localhost:7846"}}))
+        run = FakeRun(ps=f" 101 /opt/bin/claude --name w CLAUDE_CONFIG_DIR={self.same}\n", cwd=str(proj))
+        said = self.retire(run)  # no connection open: idle, yet still configured for the proxy
+        self.assertIn("settings.local.json", said)
+        self.assertFalse(run.booted_out())
+
+    def test_an_unknown_session_keeps_it(self):
+        run = FakeRun(ps=" 101 /opt/bin/claude --name w\n")
+        self.assertIn("environment unreadable", self.retire(run))
+        run = FakeRun(ps=f" 102 /opt/bin/claude --name w CLAUDE_CONFIG_DIR={self.same}\n")
+        self.assertIn("working folder unreadable", self.retire(run))
+        self.assertFalse(run.booted_out())
+
+    def test_kept_while_a_connection_is_open(self):
+        out = ("COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"
+               "node 4242 u 20u IPv4 0x1 0t0 TCP 127.0.0.1:7846->127.0.0.1:50000 (ESTABLISHED)\n"
+               "curl 999 u 3u IPv4 0x2 0t0 TCP 127.0.0.1:50000->127.0.0.1:7846 (ESTABLISHED)\n")
+        run = FakeRun(lsof_rc=0, lsof_out=out)
+        said = self.retire(run)
+        self.assertIn("curl 999", said)
+        self.assertFalse(run.booted_out())
+
+    def test_kept_without_a_fresh_core_record(self):
+        self.path.unlink()
+        run = FakeRun()
+        self.assertIn("no fresh status line record", self.retire(run))
+        self.assertFalse(run.booted_out())
+
+    def test_turned_off_when_everything_is_clear_and_reenabled_on_opt_out(self):
+        proj = Path(self._tmp.name) / "proj"
+        proj.mkdir()
+        run = FakeRun(ps=" 101 /opt/bin/claude --name sutando-core ANTHROPIC_BASE_URL=http://example.test:1\n",
+                      cwd=str(proj))
+        said = self.retire(run)
+        self.assertTrue(said.startswith("turned off"), said)
+        self.assertTrue(run.booted_out())
+        self.assertEqual(self.killed, [(4242, 0)])  # gone after bootout: never signalled
+        rec = json.loads((self.ws / "state" / pr.RECORD).read_text())
+        self.assertEqual((rec["status"], rec["by"]), ("retired", "quota-tracker"))
+        plist = Path(self._tmp.name) / "LaunchAgents" / f"{pr.LABEL}.plist"
+        plist.parent.mkdir()
+        plist.write_text("<plist/>")
+        with mock.patch.object(pr, "plist_path", return_value=plist):
+            self.assertEqual(pr.restore(self.ws, runner=run), "restored")
+        boot = [a for a in run.calls if a[:2] == ["launchctl", "bootstrap"]]
+        self.assertEqual(boot[0][-1], str(plist))
+        self.assertEqual(json.loads((self.ws / "state" / pr.RECORD).read_text())["status"], "restored")
+
+    def test_a_job_that_outlives_bootout_is_stopped_by_its_own_pid_only(self):
+        run = FakeRun(pid=5151)
+        sent = []
+        said = pr.retire(self.ws, runner=run, kill=lambda pid, sig: sent.append((pid, sig)), wait_s=0.2)
+        self.assertTrue(said.startswith("turned off"), said)
+        self.assertEqual({p for p, _s in sent}, {5151})
+        self.assertIn(__import__("signal").SIGTERM, [s for _p, s in sent])
+
+    def test_opt_out_never_starts_a_job_it_did_not_turn_off(self):
+        run = FakeRun(loaded=False)
+        self.assertEqual(pr.restore(self.ws, runner=run), "nothing to restore")
+        self.assertFalse(any(a[:2] == ["launchctl", "bootstrap"] for a in run.calls))
+
+    def test_switch_off_keeps_the_proxy(self):
+        run = FakeRun()
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false"}):
+            self.assertIn("tracking is off", self.retire(run))
+        self.assertFalse(run.booted_out())
 
 
 class HealthCheck(Base):

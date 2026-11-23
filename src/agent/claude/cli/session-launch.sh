@@ -262,6 +262,14 @@ PY
   fi
 }
 
+# Runs the skills' `on_session_route` scripts before this launch decides its API routing
+# (resolve_claude_credential_proxy). Bounded and fail-open, like the config hooks below.
+apply_skill_session_route() {
+  [ -n "${PY:-}" ] && [ -f "$REPO/src/session_config_hooks.py" ] || return 0
+  "$PY" "$REPO/src/session_config_hooks.py" --route \
+    || echo "session-launch: session-route hooks failed (rc=$?) — launch continues" >&2
+}
+
 # Runs the skills' `on_session_config` scripts against this session's CLAUDE_CONFIG_DIR
 # (src/session_config_hooks.py names no skill). Bounded and fail-open.
 apply_skill_session_config() {
