@@ -57,7 +57,8 @@ def home(repo: Optional[Path] = None) -> Path:
 
 
 def owner_dm_task(task_file: Path, workspace: Optional[Path] = None) -> Optional[str]:
-    """None only when the task is attested as the owner's, from the owner's checked DM; else why not.
+    """None only when the task's envelope verifies and its attested headers (`task_envelope`) say the
+    owner sent it from the owner's checked DM; else why not.
 
     The same tests the owner's card taps pass (`agent_card.owner_may_act`, DM only): a missing or other
     tier, a collaborator, a sender other than the connection's owner, or a room that is not that
@@ -66,15 +67,14 @@ def owner_dm_task(task_file: Path, workspace: Optional[Path] = None) -> Optional
     try:
         import agent_card
         import connections
-        import local_task_protocol as ltp
+        from task_envelope import attested_task_headers, verify_text
         text = Path(task_file).read_text(encoding="utf-8")
-        strict = ltp.parse_task_headers(text)
-        # Only the gateway writes task-mid files, and only those may be read past the `task:` line.
-        mid = (strict.headers.get("task_layout") or "").strip() == "mid"
-        headers = dict((ltp.parse_task_headers_trusted(text) if mid else strict).headers)
         if workspace is None:
             from workspace_default import resolve_workspace
             workspace = resolve_workspace(migrate=False)
+        if verify_text(text, Path(workspace)).get("verdict") != "verified":
+            return "the task's envelope is not verified; the account is the owner's data"
+        headers = dict(attested_task_headers(text, Path(workspace)).headers)
         rows = connections.read_rows(Path(workspace))
     except Exception as exc:  # noqa: BLE001 - anything unreadable refuses
         return f"the task's origin cannot be checked ({type(exc).__name__})"
