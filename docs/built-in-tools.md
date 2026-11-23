@@ -425,6 +425,34 @@ pane; 4 = runtime unresolved; 5 = input box busy; 6 = confirm dialog not confirm
 seen; 11 = Codex TUI, saved for its next start.
 The capability lives in `skills/model-switch/`.
 
+## Which account the core is on
+
+Triggers: "which account are you on", "what account is Codex signed in to", "whose login is this",
+and before saying an account switch took effect. `codex login status` only says "Logged in using
+ChatGPT"; do not answer from it. On a Codex core run:
+
+```bash
+python3 src/codex_account.py --task-file <task file>              # the core's Codex home: "signed in as <email>, <plan> plan"
+python3 src/codex_account.py --task-file <task file> --json       # {codex_home, email, plan, workspace, kind, source, verified}
+python3 src/codex_account.py --task-file <task file> --codex-home <dir>   # a worker's own Codex home, when it has one
+```
+
+Always pass the asking task's `--task-file`: the account is the owner's data, so it is looked up only
+for a task the gateway attests as the owner's, sent from the owner's checked DM (the same test the
+owner's card taps pass). Anything else, including a task with no tier, a voice or local task, or one
+whose origin cannot be checked, exits 3: answer in the owner's DM instead, and post nothing about it in
+the room. The lookup runs Codex on a private copy of the home's sign-in, so the running core's home is
+never written. The home is the one the Codex core
+launcher uses, with the same checks; a home it would refuse is reported, not read. It asks Codex
+itself (`account/read` on a short-lived `codex app-server`); only an explicit `account: null` means
+signed out, and a malformed answer counts as no answer. Only when Codex cannot answer does it read the email and plan claims of the home's
+`auth.json` id_token, and then `verified` is false: say the answer comes from the saved sign-in and
+was not confirmed. `verified` is true whenever Codex answered (signed out included), and null when
+neither Codex nor the file gave an answer. Codex is found on the launcher's own PATH
+(`src/agent/launch-path.sh --codex-path`), so the desktop's `cli/codex/bin` copy is used. It prints only the email, plan, workspace and login kind, never a token, and never
+print or quote `auth.json` yourself. Pool Codex workers run under the core's home today, so the
+core's answer is theirs too. Exit 1 means that home is signed out (or its login cannot be read): say so.
+
 ## Check quota
 
 Triggers: "how much quota do I have", "am I near the limit", "when does it reset", and any paused
