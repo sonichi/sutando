@@ -126,7 +126,7 @@ class AppServer(Case):
 
     def test_an_app_server_that_errors_exits_hangs_or_is_missing_falls_back_to_the_file(self):
         self.auth({"email": "file@example.com", ca.PLAN_CLAIMS: {"chatgpt_plan_type": "plus"}})
-        for mode in ("error", "exit", "gone", "malformed", "no-result"):
+        for mode in ("error", "exit", "gone", "malformed", "no-result", "signed-out"):
             with self.subTest(mode=mode), mock.patch.dict(os.environ, {"STUB_MODE": mode}):
                 got = ca.read(self.home, str(self.codex))
                 self.assertEqual((got["email"], got["plan"], got["source"], got["verified"]),
@@ -134,15 +134,6 @@ class AppServer(Case):
         with mock.patch.dict(os.environ, {"STUB_MODE": "hang"}):
             self.assertIsNone(ca.from_app_server(self.home, str(self.codex), timeout=1))
         self.assertEqual(ca.read(self.home, str(self.root / "no-such-codex"))["source"], "auth.json")
-
-    def test_codex_saying_signed_out_wins_over_a_leftover_file(self):
-        self.auth({"email": "stale@example.com"})
-        with mock.patch.dict(os.environ, {"STUB_MODE": "signed-out"}):
-            got = ca.read(self.home, str(self.codex))
-            rc, out = self.cli()
-        self.assertEqual((got["kind"], got["email"], got["verified"]), (None, None, True))
-        self.assertEqual((rc, out.strip()), (1, f"Codex is not signed in under {self.home}."))
-        self.assertNotIn("stale@example.com", out)
 
     def test_a_bare_codex_name_is_found_where_the_launcher_looks(self):
         bindir = self.root / "npm-bin"
@@ -164,17 +155,6 @@ class AppServer(Case):
                 self.assertIn(os.path.realpath(where), [os.path.realpath(p) for p in parts])
                 self.assertEqual((got["email"], got["source"], got["verified"]), ("app@example.com", "app-server", True))
 
-    def test_a_malformed_answer_is_unknown_not_signed_out(self):
-        for mode in ("malformed", "no-result"):
-            with self.subTest(mode=mode), mock.patch.dict(os.environ, {"STUB_MODE": mode}):
-                self.assertIsNone(ca.from_app_server(self.home, str(self.codex)))
-                rc, out = self.cli("--json")
-                self.assertEqual((rc, json.loads(out)["verified"]), (1, None))
-        for r in ({"account": None}, {"account": {"type": "chatgpt"}}):
-            self.assertTrue(ca.valid_account_result(r))
-        for r in (None, [], {}, {"account": {}}, {"account": {"type": ""}}, {"account": "x"}):
-            self.assertFalse(ca.valid_account_result(r))
-
     def test_a_relative_codex_home_is_resolved_before_spawning(self):
         cwd = os.getcwd()
         os.chdir(self.root)
@@ -187,16 +167,90 @@ class AppServer(Case):
             os.chdir(cwd)
         self.assertEqual(os.path.realpath(json.loads(out.getvalue())["codex_home"]), os.path.realpath(self.home))
 
-    def test_nothing_answering_and_no_file_is_unverified_signed_out(self):
+    def test_a_null_from_the_copy_is_unknown_and_the_file_decides(self):
+        self.auth({"email": "kept@example.com"})
+        with mock.patch.dict(os.environ, {"STUB_MODE": "signed-out"}):
+            self.assertIsNone(ca.from_app_server(self.home, str(self.codex)))
+            got = ca.read(self.home, str(self.codex))
+        self.assertEqual((got["email"], got["verified"]), ("kept@example.com", False))
+
+    def test_no_account_anywhere_is_none_found_not_signed_out(self):
+        with mock.patch.dict(os.environ, {"STUB_MODE": "signed-out"}):
+            rc, out = self.cli("--json")
+            rc2, text = self.cli()
+        self.assertEqual((rc, json.loads(out)["kind"], json.loads(out)["verified"]), (1, None, None))
+        self.assertEqual((rc2, text.strip()), (1, f"I found no sign-in for Codex under {self.home}."))
+
+    def test_nothing_answering_and_no_file_is_none_found(self):
         with mock.patch.dict(os.environ, {"STUB_MODE": "gone"}):
             rc, out = self.cli("--json")
         self.assertEqual((rc, json.loads(out)["kind"], json.loads(out)["verified"]), (1, None, None))
 
-    def test_a_signed_out_answer_names_no_account(self):
-        with mock.patch.dict(os.environ, {"STUB_MODE": "signed-out"}):
-            self.assertEqual(ca.from_app_server(self.home, str(self.codex))["kind"], None)
-            rc, out = self.cli()
-        self.assertEqual((rc, out.strip()), (1, f"Codex is not signed in under {self.home}."))
+    def test_a_failure_while_preparing_the_copy_leaves_nothing_behind(self):
+        self.auth({"email": "file@example.com"})
+        made = []
+        real = ca.tempfile.mkdtemp
+
+        def mkdtemp(**kw):
+            made.append(real(**kw))
+            return made[-1]
+
+        def copy_then_fail(scratch, home):
+            (Path(scratch) / "auth.json").write_text("copy")
+            raise OSError("disk full")
+        with mock.patch.object(ca.tempfile, "mkdtemp", mkdtemp), mock.patch.object(ca, "_copy_into", copy_then_fail):
+            self.assertIsNone(ca.from_app_server(self.home, str(self.codex)))
+        self.assertEqual(len(made), 1)
+        self.assertFalse(Path(made[0]).exists(), "the partial copy is removed")
+        self.assertFalse(self.log.exists(), "no Codex was started")
+
+    def test_a_failure_starting_codex_leaves_no_copy(self):
+        self.auth({"email": "file@example.com"})
+        made = []
+        real = ca.tempfile.mkdtemp
+
+        def mkdtemp(**kw):
+            made.append(real(**kw))
+            return made[-1]
+        with mock.patch.object(ca.tempfile, "mkdtemp", mkdtemp):
+            self.assertIsNone(ca.from_app_server(self.home, str(self.root / "no-such-codex")))
+        self.assertFalse(Path(made[0]).exists())
+
+
+class Envelope(unittest.TestCase):
+    """`account_of`: only a successful response naming an account with a type is an answer."""
+
+    def test_an_account_with_a_type_is_the_answer(self):
+        acct = {"type": "chatgpt", "email": "a@example.com"}
+        self.assertEqual(ca.account_of({"id": 2, "result": {"account": acct}}), acct)
+
+    def test_an_explicit_null_account_is_no_answer(self):
+        self.assertIsNone(ca.account_of({"id": 2, "result": {"account": None, "requiresOpenaiAuth": True}}))
+
+    def test_an_error_response_is_no_answer(self):
+        self.assertIsNone(ca.account_of({"id": 2, "error": {"message": "nope"}, "result": {"account": {"type": "x"}}}))
+
+    def test_a_response_without_result_is_no_answer(self):
+        self.assertIsNone(ca.account_of({"id": 2}))
+
+    def test_a_result_that_is_not_an_object_is_no_answer(self):
+        self.assertIsNone(ca.account_of({"id": 2, "result": "account"}))
+
+    def test_a_result_without_account_is_no_answer(self):
+        self.assertIsNone(ca.account_of({"id": 2, "result": {"requiresOpenaiAuth": True}}))
+
+    def test_an_account_without_a_type_is_no_answer(self):
+        self.assertIsNone(ca.account_of({"id": 2, "result": {"account": {"email": "a@example.com"}}}))
+
+    def test_an_account_with_an_empty_type_is_no_answer(self):
+        self.assertIsNone(ca.account_of({"id": 2, "result": {"account": {"type": ""}}}))
+
+    def test_an_account_that_is_not_an_object_is_no_answer(self):
+        self.assertIsNone(ca.account_of({"id": 2, "result": {"account": "chatgpt"}}))
+
+    def test_an_envelope_that_is_not_an_object_is_no_answer(self):
+        self.assertIsNone(ca.account_of(None))
+        self.assertIsNone(ca.account_of([]))
 
 
 class AuthFile(Case):
@@ -225,7 +279,7 @@ class AuthFile(Case):
         self.assertEqual((rc, out.strip()), (0, f"Codex under {self.home} uses an API key (no ChatGPT account) (from its saved sign-in file)."))
         self.assertNoSecrets(out)
 
-    def test_no_file_or_a_broken_one_is_signed_out(self):
+    def test_no_file_or_a_broken_one_names_no_account(self):
         self.assertIsNone(ca.from_auth_file(self.home))
         for raw in ("{", "[]", json.dumps({"tokens": {"id_token": "not-a-jwt"}}), json.dumps({"tokens": "x"})):
             with self.subTest(raw=raw):
@@ -267,15 +321,19 @@ class Home(Case):
 class OwnerOnly(Case):
     OWNER, DM = "@owner:s.space", "!dm:s.space"
 
-    def task(self, mid=True, **headers):
+    def task(self, name, *, mid=True, stamp=True, **headers):
+        """Its own task file, as the gateway writes one (task-mid, stamped) unless told otherwise."""
+        import task_envelope
         base = {"access_tier": "owner", "user_id": self.OWNER, "channel_id": self.DM, "channel_kind": "dm"}
         base.update(headers)
         lines = [f"{k}: {v}" for k, v in base.items() if v is not None]
         if mid:
             text = "id: t1\ntask_layout: mid\ntask: which account?\n" + "\n".join(lines) + "\n"
         else:
-            text = "\n".join(lines) + "\ntask: which account?\n"
-        f = self.root / "task.txt"
+            text = "id: t1\n" + "\n".join(lines) + "\ntask: which account?\n"
+        if stamp:
+            text = task_envelope.stamp_text(text, self.root)
+        f = self.root / f"task-{name}.txt"
         f.write_text(text)
         return f
 
@@ -286,34 +344,63 @@ class OwnerOnly(Case):
                 mock.patch.object(connections, "owner_dm", return_value=self.DM if dm is None else dm):
             return ca.owner_dm_task(f, workspace=self.root)
 
-    def test_only_an_attested_owner_task_from_the_checked_dm_is_answered(self):
-        self.assertIsNone(self.gate(self.task()))
-        self.assertIsNone(self.gate(self.task(mid=False)))
+    def test_a_stamped_gateway_task_from_the_owner_in_the_checked_dm_is_answered(self):
+        self.assertIsNone(self.gate(self.task("ok")))
 
-    def test_everything_else_fails_closed(self):
-        cases = {
-            "no tier": self.task(access_tier=None),
-            "team": self.task(access_tier="team"),
-            "collaborator": self.task(collaborator="true"),
-            "another sender": self.task(user_id="@other:s.space"),
-            "a room": self.task(channel_id="!room:s.space", channel_kind="group"),
-            "no room": self.task(channel_id=None, channel_kind=None),
-        }
-        for name, f in cases.items():
-            with self.subTest(case=name):
-                self.assertIsNotNone(self.gate(f))
-        self.assertIsNotNone(self.gate(self.task(), rows=[]))
-        self.assertIsNotNone(self.gate(self.task(), dm=""))
+    def test_a_stamped_task_last_file_with_the_headers_above_task_is_answered(self):
+        self.assertIsNone(self.gate(self.task("ok-last", mid=False)))
+
+    def test_an_unstamped_task_is_refused(self):
+        self.assertIn("not verified", self.gate(self.task("unsigned", stamp=False)))
+
+    def test_a_tampered_task_is_refused(self):
+        f = self.task("tampered")
+        f.write_text(f.read_text().replace("access_tier: owner", "access_tier: owner "))
+        self.assertIn("not verified", self.gate(f))
+
+    def test_no_key_on_this_host_is_refused(self):
+        f = self.task("nokey")
+        (self.root / "state" / "auth" / "task-hmac.key").unlink()
+        self.assertIn("not verified", self.gate(f))
+
+    def test_a_missing_tier_is_refused(self):
+        self.assertIsNotNone(self.gate(self.task("no-tier", access_tier=None)))
+
+    def test_a_team_tier_is_refused(self):
+        self.assertIsNotNone(self.gate(self.task("team", access_tier="team")))
+
+    def test_a_collaborator_is_refused(self):
+        self.assertIsNotNone(self.gate(self.task("collab", collaborator="true")))
+
+    def test_another_sender_is_refused(self):
+        self.assertIsNotNone(self.gate(self.task("sender", user_id="@other:s.space")))
+
+    def test_a_shared_room_is_refused(self):
+        self.assertIsNotNone(self.gate(self.task("room", channel_id="!room:s.space", channel_kind="group")))
+
+    def test_a_task_with_no_room_is_refused(self):
+        self.assertIsNotNone(self.gate(self.task("no-room", channel_id=None, channel_kind=None)))
+
+    def test_no_connection_rows_is_refused(self):
+        self.assertIsNotNone(self.gate(self.task("no-rows"), rows=[]))
+
+    def test_no_checked_owner_dm_is_refused(self):
+        self.assertIsNotNone(self.gate(self.task("no-dm"), dm=""))
+
+    def test_a_missing_task_file_is_refused(self):
         self.assertIsNotNone(self.gate(self.root / "missing.txt"))
 
-    def test_a_body_cannot_forge_the_tier_of_a_task_last_file(self):
-        f = self.root / "task.txt"
-        f.write_text(f"user_id: {self.OWNER}\ntask: hi\naccess_tier: owner\nchannel_id: {self.DM}\nchannel_kind: dm\n")
+    def test_a_signed_task_last_body_cannot_promote_header_lines(self):
+        import task_envelope
+        f = self.root / "task-forged-body.txt"
+        f.write_text(task_envelope.stamp_text(
+            f"id: t1\nuser_id: {self.OWNER}\ntask: hi\naccess_tier: owner\nchannel_id: {self.DM}\nchannel_kind: dm\n",
+            self.root))
         self.assertIsNotNone(self.gate(f))
 
     def test_a_refused_task_looks_nothing_up(self):
         self.auth({"email": "file@example.com"})
-        f = self.task(channel_id="!room:s.space", channel_kind="group")
+        f = self.task("refused-cli", channel_id="!room:s.space", channel_kind="group")
         import connections
         import workspace_default
         with mock.patch.object(connections, "read_rows", return_value=[{"owner_mxid": self.OWNER}]), \

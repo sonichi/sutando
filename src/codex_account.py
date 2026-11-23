@@ -15,11 +15,11 @@ its tokens are never printed, logged or passed on, and the app-server's stderr i
 Without `--codex-home` the home is the one the Codex core launcher uses (`codex_home.effective`:
 the same resolution and desktop-host checks, read-only), and a home the launcher would refuse is
 refused here too. Pool Codex workers run under the core's home today, so the same answer is theirs;
-pass a worker's own home with `--codex-home` when it has one. A signed-out answer from Codex is
-final; only when Codex cannot answer is the file read. `verified` is true when Codex answered,
-false for a file-only answer, null when neither answered. `codex` is found on the launcher's PATH.
-With `--task-file` nothing is looked up unless the task is the owner's and was asked outside a room
-other than the owner's DM (exit 3). Exit 0 an account was read, 1 signed out or unreadable.
+pass a worker's own home with `--codex-home` when it has one. `verified` is true only
+when Codex names an account; otherwise the file is read (`verified` false), and when neither names
+one `verified` is null: no sign-in was found, which is not proof of a signed-out home. `codex` is found on the launcher's PATH.
+With `--task-file` nothing is looked up unless the task is attested as the owner's, from the owner's
+checked DM (exit 3). Exit 0 an account was read, 1 none was found.
 Stdlib only.
 """
 from __future__ import annotations
@@ -32,7 +32,6 @@ import subprocess
 import sys
 import shutil
 import tempfile
-import threading
 from pathlib import Path
 from typing import Optional
 
@@ -58,7 +57,8 @@ def home(repo: Optional[Path] = None) -> Path:
 
 
 def owner_dm_task(task_file: Path, workspace: Optional[Path] = None) -> Optional[str]:
-    """None only when the task is attested as the owner's, from the owner's checked DM; else why not.
+    """None only when the task's envelope verifies and its attested headers (`task_envelope`) say the
+    owner sent it from the owner's checked DM; else why not.
 
     The same tests the owner's card taps pass (`agent_card.owner_may_act`, DM only): a missing or other
     tier, a collaborator, a sender other than the connection's owner, or a room that is not that
@@ -67,15 +67,14 @@ def owner_dm_task(task_file: Path, workspace: Optional[Path] = None) -> Optional
     try:
         import agent_card
         import connections
-        import local_task_protocol as ltp
+        from task_envelope import attested_task_headers, verify_text
         text = Path(task_file).read_text(encoding="utf-8")
-        strict = ltp.parse_task_headers(text)
-        # Only the gateway writes task-mid files, and only those may be read past the `task:` line.
-        mid = (strict.headers.get("task_layout") or "").strip() == "mid"
-        headers = dict((ltp.parse_task_headers_trusted(text) if mid else strict).headers)
         if workspace is None:
             from workspace_default import resolve_workspace
             workspace = resolve_workspace(migrate=False)
+        if verify_text(text, Path(workspace)).get("verdict") != "verified":
+            return "the task's envelope is not verified; the account is the owner's data"
+        headers = dict(attested_task_headers(text, Path(workspace)).headers)
         rows = connections.read_rows(Path(workspace))
     except Exception as exc:  # noqa: BLE001 - anything unreadable refuses
         return f"the task's origin cannot be checked ({type(exc).__name__})"
@@ -117,100 +116,64 @@ def launch_path(repo: Optional[Path] = None) -> str:
 READ_FILES = ("auth.json", "config.toml")
 
 
-def _scratch_home(codex_home: Path) -> str:
-    """A private temporary CODEX_HOME holding copies of READ_FILES, so the app-server writes nothing
-    (sessions, logs, state, a refreshed token) into the running core's home."""
-    scratch = tempfile.mkdtemp(prefix="codex-account-")
+def _copy_into(scratch: str, codex_home: Path) -> None:
     for name in READ_FILES:
         src = Path(codex_home) / name
         if src.is_file():
-            dst = Path(scratch) / name
-            fd = os.open(str(dst), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            fd = os.open(str(Path(scratch) / name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as fh:
                 fh.write(src.read_bytes())
-    return scratch
 
 
-def valid_account_result(r) -> bool:
-    """Only `{"account": null}` or an account object naming its type is an answer; anything else is unknown."""
-    if not isinstance(r, dict) or "account" not in r:
-        return False
-    account = r["account"]
-    return account is None or (isinstance(account, dict) and isinstance(account.get("type"), str)
-                               and bool(account["type"]))
+def account_of(envelope) -> Optional[dict]:
+    """The account a response envelope names, or None when it names none for certain.
+
+    Only a JSON-RPC response with no `error` and a `result` object whose `account` is an object with
+    a non-empty string `type` names one. Anything else, `account: null` included, is no answer: the
+    lookup runs on a copy of the home, which cannot reach a sign-in Codex keeps under the original
+    home's keyring entry, so a null there does not prove the home is signed out."""
+    if not isinstance(envelope, dict) or "error" in envelope or not isinstance(envelope.get("result"), dict):
+        return None
+    account = envelope["result"].get("account")
+    if isinstance(account, dict) and isinstance(account.get("type"), str) and account["type"]:
+        return account
+    return None
 
 
 def from_app_server(codex_home: Path, codex: str = "codex", timeout: float = 20.0) -> Optional[dict]:
-    """The account by Codex's own `account/read`, None when the app-server cannot answer or answers
-    something malformed. Only an explicit `account: null` is a signed-out answer ({"kind": None})."""
+    """The account by Codex's own `account/read`, None when Codex names none (signed out, or a sign-in a
+    copy of the home cannot reach) or cannot answer. It runs on a private copy of READ_FILES that lives,
+    preparation included, only inside this call, so nothing is written into the running core's home."""
+    from codex_rpc import Rpc
     path = launch_path()
     if os.sep not in codex:
         codex = shutil.which(codex, path=path) or codex
+    scratch = None
+    rpc = None
     try:
-        scratch = _scratch_home(Path(codex_home))
-    except OSError:
+        scratch = tempfile.mkdtemp(prefix="codex-account-")
+        _copy_into(scratch, Path(codex_home))
+        rpc = Rpc([codex, "app-server", "--listen", "stdio://"], env=dict(os.environ, CODEX_HOME=scratch, PATH=path),
+                  cwd=scratch, stderr=subprocess.DEVNULL)
+        init = rpc.call("initialize", {"clientInfo": CLIENT, "capabilities": {}}, timeout=timeout)
+        if "error" in init:
+            return None
+        rpc.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        account = account_of(rpc.call("account/read", {"refreshToken": False}, timeout=timeout))
+    except (OSError, RuntimeError, ValueError):
         return None
-    try:
-        return _ask(codex, scratch, path, timeout)
     finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-
-
-def _ask(codex: str, scratch: str, path: str, timeout: float) -> Optional[dict]:
-    env = dict(os.environ, CODEX_HOME=scratch, PATH=path)
-    try:
-        p = subprocess.Popen([codex, "app-server", "--listen", "stdio://"], stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=env, cwd=scratch)
-    except OSError:
+        if rpc is not None:
+            try:
+                rpc.p.kill()
+                rpc.close()
+            except (OSError, ValueError, subprocess.SubprocessError):  # pragma: no cover - a child that will not die
+                pass
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
+    if account is None:
         return None
-    result: dict = {}
-
-    def talk():
-        try:
-            for rid, method, params in ((1, "initialize", {"clientInfo": CLIENT, "capabilities": {}}),
-                                        (None, "initialized", {}),
-                                        (2, "account/read", {"refreshToken": False})):
-                msg = {"jsonrpc": "2.0", "method": method, "params": params}
-                if rid is not None:
-                    msg["id"] = rid
-                p.stdin.write(json.dumps(msg) + "\n")
-                p.stdin.flush()
-                if rid is None:
-                    continue
-                for line in p.stdout:
-                    try:
-                        m = json.loads(line)
-                    except ValueError:
-                        continue
-                    if isinstance(m, dict) and m.get("id") == rid and "method" not in m:
-                        if "error" in m:
-                            return
-                        if rid == 2:
-                            result["r"] = m.get("result")
-                        break
-                else:
-                    return
-        except (OSError, ValueError):
-            return
-
-    t = threading.Thread(target=talk, daemon=True)
-    t.start()
-    t.join(timeout)
-    try:
-        p.kill()
-        p.wait(timeout=5)
-    except (OSError, subprocess.SubprocessError):  # pragma: no cover - a child that will not die
-        pass
-    for pipe in (p.stdin, p.stdout):
-        try:
-            pipe.close()
-        except (OSError, ValueError):  # pragma: no cover - a pipe already broken
-            pass
-    r = result.get("r")
-    if not valid_account_result(r):
-        return None
-    account = r["account"]
-    out = _answer(account if isinstance(account, dict) else {}, "app-server")
+    out = _answer(account, "app-server")
     out["verified"] = True
     return out
 
@@ -262,7 +225,7 @@ def read(codex_home: Path, codex: str = "codex", app_server: bool = True) -> Opt
 
 def words(acct: Optional[dict], codex_home: Path) -> str:
     if not acct or not acct.get("kind"):
-        return f"Codex is not signed in under {codex_home}."
+        return f"I found no sign-in for Codex under {codex_home}."
     if acct["kind"] == "apiKey":
         note = "" if acct.get("verified") else " (from its saved sign-in file)"
         return f"Codex under {codex_home} uses an API key (no ChatGPT account){note}."
