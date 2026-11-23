@@ -466,7 +466,9 @@ class Launcher:
             plugin = records.load_plugin(self.root)
         except records.RecordError:
             plugin = records.empty_plugin()     # a torn record still lets the alarm through
-        plugin = dict(plugin, stuck=inbox.unresolved_stuck(self.root, plugin.get("stuck")),
+        # An entry an earlier session left in the Mod's record is not a turn: it must not read as a stall.
+        plugin = dict(plugin, inflight=inbox.live_inflight(self.root, plugin.get("inflight")),
+                      stuck=inbox.unresolved_stuck(self.root, plugin.get("stuck")),
                       progress_unwritable=records.read_progress_alarm(self.config_dir))
         self.observation = detector.derive(self.observation, text, plugin, self.clock())
         stall = self.observation["stall"]

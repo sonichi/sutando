@@ -280,13 +280,10 @@ def busy(root) -> bool:
     if not inflight:
         return False
     from . import inbox       # the adapter's one reader of the claims
-    now = task_io_consumer(root)
-    for task_id in inflight:
-        gen = inbox.claim_generation(root, task_id)
-        if gen is not None and (not isinstance(gen, dict) or (now["pid"] and {"pid": gen.get("pid"), "start": gen.get("start")} == now)):
-            return True
-        log("inflight", task_id, "is from another session (generation %s, now %s): not busy" % (gen, now))
-    return False
+    live = inbox.live_inflight(root, inflight)
+    for task_id in sorted(set(inflight) - set(live)):
+        log("inflight", task_id, "is from another session or has no claim: not busy")
+    return bool(live)
 
 
 def wait_idle(root, deadline: float, clock=time.monotonic, sleep=time.sleep) -> bool:

@@ -249,6 +249,25 @@ class Apply(Base):
         with mock.patch.object(model_card.records, "load_plugin", side_effect=model_card.records.RecordError("bad")):
             self.assertTrue(model_card.busy(self.root))
 
+    def test_the_stall_check_sees_only_the_running_sessions_turns(self):
+        # Live 2026-11-23: a TURN_CONFIRMED entry from before a restart raised a stall card every ten minutes.
+        from ag2_sparrow.adapters.claude_code import detector, launcher
+        live = model_card.task_io_consumer(self.root)
+        self.claim_of("task-old", {"pid": live["pid"] + 1, "start": 1.0})
+        left = {"task-old": {"phase": "TURN_CONFIRMED", "turn_id": "t-1"}, "task-gone": {"phase": "CALLING"}}
+        self.assertEqual(inbox.live_inflight(self.root, left), {})
+        self.assertIsNone(detector.inflight_task({"inflight": inbox.live_inflight(self.root, left)}))
+        self.assertEqual(detector.inflight_task({"inflight": left}), "task-gone", "unfiltered, it read as a turn")
+        self.claim_of("task-now", live)
+        both = dict(left, **{"task-now": {"phase": "TURN_CONFIRMED"}})
+        self.assertEqual(inbox.live_inflight(self.root, both), {"task-now": {"phase": "TURN_CONFIRMED"}})
+        self.assertEqual(inbox.live_inflight(self.root, None), {})
+        self.assertEqual(inbox.live_inflight(self.root, ["not", "a", "dict"]), {})
+        # With no consumer holding the root there is no running session, so no turn of its.
+        with mock.patch.object(inbox.task_io, "holder_consumer", return_value=None):
+            self.assertEqual(inbox.live_inflight(self.root, both), {})
+        self.assertIn("inflight=inbox.live_inflight(self.root, plugin.get(\"inflight\"))", Path(launcher.__file__).read_text())
+
     def test_a_claim_that_cannot_be_read_or_names_no_generation_counts_as_a_turn(self):
         self.assertIsNone(inbox.claim_generation(self.root, "task-none"))
         self.claim_of("task-bare", None)
