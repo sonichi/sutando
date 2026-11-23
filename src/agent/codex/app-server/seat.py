@@ -633,9 +633,29 @@ class Seat:
         self.trial = None
         if sent and before:
             self.restore = before
+        self.unmark_running(rev)
         left = TRIAL_ATTEMPTS - self.attempts.get(rev, 0)
         log(f"model: no verdict on {picked} this turn; it stays pending"
             + (f" ({left} more try)" if left > 0 else "; this seat does not try it again"))
+
+    def mark_running(self) -> None:
+        """Codex took turn/start with the pick: the record says this turn runs on it, so whatever the
+        turn itself reads about the core's model names the pick, not the model before it."""
+        if self.trial is None or not self.trial[3]:
+            return
+        picked, rev = self.trial[0], self.trial[1]
+        try:
+            codex_core_model.started(self.workspace / "state", picked, rev)
+        except OSError as e:
+            log(f"model: the switch record could not say the turn runs on {picked} ({one_line(e, 120)})")
+
+    def unmark_running(self, rev: Optional[int] = None) -> None:
+        if self.worker:
+            return
+        try:
+            codex_core_model.stopped(self.workspace / "state", rev)
+        except OSError as e:
+            log(f"model: the switch record's running mark could not be cleared ({one_line(e, 120)})")
 
     def notify(self, kind: str, text: str) -> None:
         try:
@@ -705,6 +725,7 @@ class Seat:
                 res = self.rpc.request("turn/start", params)
             turn_id = res["turn"]["id"]
             sent_model = params.get("model")
+            self.mark_running()
         except (RuntimeError, KeyError, TypeError) as e:
             return ("server-exited" if not self.rpc.alive() else "failed"), one_line(e, 240)
         log(f"task {filename}: turn started ({turn_id})")
@@ -922,6 +943,7 @@ class Seat:
             return EXIT_LOCKED
         mode = f"worker {self.worker}" if self.worker else "core"
         log(f"seat {self.seat} ({mode}) on codex app-server; inbox {self.host.inbox}; this panel is a read-only log")
+        self.unmark_running()   # a mark left by a seat that died mid-turn: no turn of this one is running
         ready = Path(self.host.state) / "ready"
         try:
             self.ensure_server()

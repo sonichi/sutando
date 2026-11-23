@@ -941,6 +941,57 @@ class CoreModelSwitch(SeatCase):
         self.assertEqual([("model" in r["params"]) for r in self.sent("turn/start")], [False])
         self.assertEqual(self.record()["status"], "pending")
 
+    def test_while_the_turn_runs_on_the_pick_the_record_says_so_and_it_is_confirmed_only_at_the_turns_end(self):
+        # VM 2026-11-23: the turn that applied the pick ran on it, read the record mid-turn, and answered
+        # "currently <the old model>; <the pick> pending". The record only changed at the turn's end.
+        ccm = seat_mod.codex_core_model
+        self.switch("gpt-old", accepted=True)
+        s = self.launched(1, model="gpt-old")
+        self.switch("gpt-new")
+        self.task("task-1.txt")
+        mid = []
+        settle = s.settle_model
+
+        def settle_seeing(accepted, reason=""):
+            mid.append(self.record())           # the record as the running turn could read it
+            return settle(accepted, reason)
+        s.settle_model = settle_seeing
+        self.assertEqual(s.serve(once=True), 0)
+        (during,) = mid
+        self.assertEqual((during["status"], during["working"], during["running"]["model"]), ("pending", "gpt-old", "gpt-new"))
+        self.assertEqual(ccm.in_use(during), "gpt-new", "what the turn runs on, said while it runs")
+        self.assertEqual(ccm.working(during), "gpt-old", "not yet what a restart would launch on")
+        after = self.record()
+        self.assertEqual((after["status"], after["working"], "running" in after), ("accepted", "gpt-new", False))
+        self.assertEqual(ccm.in_use(after), "gpt-new")
+
+    def test_a_turn_on_the_pick_that_ends_with_no_verdict_clears_the_mark_and_so_does_a_seats_start(self):
+        ccm = seat_mod.codex_core_model
+        self.switch("gpt-old", accepted=True)
+        s = self.launched(1, model="gpt-old")
+        rev = self.switch("gpt-new")["rev"]
+        s.trial = ("gpt-new", rev, "gpt-old", True)
+        s.mark_running()
+        self.assertEqual(ccm.in_use(self.record()), "gpt-new")
+        s.abandon_trial()
+        self.assertEqual((self.record()["status"], "running" in self.record(), ccm.in_use(self.record())),
+                         ("pending", False, "gpt-old"))
+        # A seat that died mid-turn left its mark: the next seat's start clears it, whatever its revision.
+        self.assertTrue(ccm.started(self.ws / "state", "gpt-new", rev))
+        s.unmark_running()
+        self.assertNotIn("running", self.record())
+        # A pick that was not sent to Codex (already the seat's model) marks nothing; a record that cannot
+        # be written is logged and the turn goes on.
+        s.trial = ("gpt-new", rev, "gpt-old", False)
+        s.mark_running()
+        self.assertNotIn("running", self.record())
+        s.trial = ("gpt-new", rev, "gpt-old", True)
+        with mock.patch.object(ccm, "started", side_effect=OSError("read-only")), \
+                mock.patch.object(ccm, "stopped", side_effect=OSError("read-only")):
+            s.mark_running()
+            s.unmark_running()
+        s.trial = None
+
     def test_a_refusal_that_is_not_about_the_model_leaves_the_pick_pending_and_the_seat_on_its_model(self):
         self.switch("gpt-old", accepted=True)
         self.switch("gpt-new")

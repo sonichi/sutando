@@ -83,6 +83,26 @@ def working(rec: dict) -> str:
     return w if isinstance(w, str) and valid(w) else ""
 
 
+RUNNING_STALE_S = 2 * 3600.0     # a `running` mark older than this is a seat that died mid-turn
+
+
+def in_use(rec: dict, now: Optional[float] = None) -> str:
+    """The model the core is on right now: the pending pick while a turn the seat started on it is
+    running (`running`, set by `started` once Codex took the turn), else the last model Codex took
+    (`working`). What a reader that says "I'm using X" reports; the pick is still not `working`,
+    and not what a restart launches on, until that turn completes."""
+    run = rec.get("running")
+    if (rec.get("status") == "pending" and isinstance(run, dict) and run.get("model") == rec.get("model")
+            and run.get("rev") == _rev(rec) and valid(run.get("model") or "")):
+        try:
+            age = (time.time() if now is None else now) - float(run.get("ts") or 0)
+        except (TypeError, ValueError):
+            age = -1.0
+        if 0 <= age < RUNNING_STALE_S:
+            return run["model"]
+    return working(rec)
+
+
 def current(state_dir) -> str:
     """The model the Codex core is to use, '' for none: the last pick, or, once Codex refused it,
     the last model Codex took."""
@@ -145,6 +165,31 @@ def confirm(state_dir, model: str, rev: int) -> bool:
         return True
 
 
+def started(state_dir, model: str, rev: int, now: Optional[float] = None) -> bool:
+    """Record that a turn is running on the pending pick `rev` (Codex took turn/start with it): from
+    here `in_use` names it. False when the record has moved on. The pick stays pending."""
+    with _locked(state_dir):
+        rec = read_record(state_dir)
+        if not rec or _rev(rec) != rev or rec.get("status") != "pending" or rec.get("model") != model:
+            return False
+        rec["running"] = {"model": model, "rev": rev, "ts": time.time() if now is None else now}
+        _write(state_dir, rec)
+        return True
+
+
+def stopped(state_dir, rev: Optional[int] = None) -> bool:
+    """Forget the `running` mark (of revision `rev`, or any with None): the turn ended with no verdict,
+    or the seat is starting and no turn of its is running. The pick's own status is untouched."""
+    with _locked(state_dir):
+        rec = read_record(state_dir)
+        run = rec.get("running") if rec else None
+        if not isinstance(run, dict) or (rev is not None and run.get("rev") != rev):
+            return False
+        rec.pop("running")
+        _write(state_dir, rec)
+        return True
+
+
 def resolve(state_dir, rev: int, accepted: bool, reason: str = "") -> Optional[dict]:
     """Settle the pending pick `rev`: accepted (it becomes `working`) or rejected (the core stays on
     `working`). None when the record has moved on or is not pending; a newer pick is never touched."""
@@ -153,6 +198,7 @@ def resolve(state_dir, rev: int, accepted: bool, reason: str = "") -> Optional[d
         if not rec or _rev(rec) != rev or rec.get("status") != "pending":
             return None
         rec["status"], rec["accepted"] = ("accepted" if accepted else "rejected"), bool(accepted)
+        rec.pop("running", None)
         if accepted:
             rec["working"] = rec["confirmed"] = rec["model"]
             rec["confirmed_rev"] = max(rev, _rev(rec, "confirmed_rev"))
@@ -234,6 +280,8 @@ def main(argv=None) -> int:
     cur.add_argument("--state-dir", required=True)
     la = sub.add_parser("launch")
     la.add_argument("--state-dir", required=True)
+    for verb in ("working", "in-use"):
+        sub.add_parser(verb).add_argument("--state-dir", required=True)
     s = sub.add_parser("save")
     s.add_argument("--state-dir", required=True)
     s.add_argument("--model", required=True)
@@ -246,6 +294,12 @@ def main(argv=None) -> int:
         return 0 if valid(a.model) else 2
     if a.cmd == "current":
         model = current(a.state_dir)
+        if model:
+            print(model)
+        return 0
+    if a.cmd in ("working", "in-use"):
+        rec = read_record(a.state_dir)
+        model = working(rec) if a.cmd == "working" else in_use(rec)
         if model:
             print(model)
         return 0

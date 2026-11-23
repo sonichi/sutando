@@ -926,6 +926,15 @@ class CodexCore(Base):
         self.assertIn("not switched yet", words)
         self.assertIn("I'm still using GPT A", words)
         self.assertEqual(mc.current_model(self.ws)["name"], "GPT A", "the menu marks the working model")
+        # Once the seat started a turn on the pick, that turn is on it: asked "which model", it says the pick.
+        import time as _time
+        self.using("gpt-b", runtime="codex", status="pending", working="gpt-a", accepted=False, rev=2,
+                   running={"model": "gpt-b", "rev": 2, "ts": _time.time()})
+        self.assertEqual(mc.current_model(self.ws)["name"], "GPT B")
+        self.using("gpt-b", runtime="codex", status="pending", working="gpt-a", accepted=False, rev=2,
+                   running={"model": "gpt-b", "rev": 1, "ts": _time.time()})
+        self.assertEqual(mc.current_model(self.ws)["name"], "GPT A", "another revision's mark says nothing")
+        self.using("gpt-b", runtime="codex", status="pending", working="gpt-a", accepted=False, rev=2)
         body, card = mc.notice_card(state, "Pending", words)
         self.assertEqual((card["state"], card["header"]["status"]["label"]), ("pending", "Pending"))
 

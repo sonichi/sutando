@@ -219,7 +219,9 @@ def current_model(ws: Path) -> dict:
     rec = record(ws)
     model = rec.get("model") if isinstance(rec.get("model"), str) and rec.get("model") else None
     if rec.get("runtime") == "codex" and rec.get("status") in ("rejected", "pending"):
-        model = codex_core_model.working(rec) or None  # not taken by Codex (yet): the core is on this one
+        # Not confirmed by Codex (yet): the core is on the model before it, unless the turn now running was
+        # started on the pick (the seat's `running` mark), in which case this very turn is on the pick.
+        model = codex_core_model.in_use(rec) or None
     return {"model": model, "name": name_of(model), "source": "model-switch.json" if model else None,
             "ts": rec.get("ts") if model else None}
 

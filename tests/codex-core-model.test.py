@@ -68,6 +68,41 @@ class Record(Case):
         self.assertEqual(ccm.pending(self.state), ("gpt-b", 2))
         self.assertEqual(ccm.launch(self.state), (2, "gpt-b", "gpt-a"), "a TUI takes the pick; a seat starts on gpt-a")
 
+    def test_in_use_is_the_pick_only_while_a_turn_the_seat_started_on_it_is_running(self):
+        ccm.save(self.state, "gpt-a", applied="next-turn", accepted=True)
+        rec = ccm.save(self.state, "gpt-b", applied="next-turn", accepted=False)
+        read = lambda: ccm.read_record(self.state)
+        self.assertEqual(ccm.in_use(read()), "gpt-a", "saved and not started: still the working model")
+        self.assertFalse(ccm.started(self.state, "gpt-b", rec["rev"] - 1), "an older revision marks nothing")
+        self.assertFalse(ccm.started(self.state, "gpt-c", rec["rev"]), "nor another model")
+        self.assertTrue(ccm.started(self.state, "gpt-b", rec["rev"], now=1000.0))
+        self.assertEqual((ccm.in_use(read(), now=1010.0), ccm.working(read()), ccm.pending(self.state)[0]),
+                         ("gpt-b", "gpt-a", "gpt-b"), "running on the pick; still pending, still launched on gpt-a")
+        self.assertEqual(ccm.launch(self.state)[2], "gpt-a")
+        # A mark from a seat that died mid-turn, or one with a broken time, is not believed.
+        self.assertEqual(ccm.in_use(read(), now=1000.0 + ccm.RUNNING_STALE_S + 1), "gpt-a")
+        self.assertEqual(ccm.in_use(read(), now=999.0), "gpt-a")
+        broken = dict(read(), running={"model": "gpt-b", "rev": rec["rev"], "ts": "soon"})
+        self.assertEqual(ccm.in_use(broken), "gpt-a")
+        self.assertEqual(ccm.in_use(dict(read(), running="yes")), "gpt-a")
+        # No verdict: the mark goes, the pick stays pending. Only its own revision's mark is removed.
+        self.assertFalse(ccm.stopped(self.state, rec["rev"] + 1))
+        self.assertTrue(ccm.stopped(self.state, rec["rev"]))
+        self.assertEqual((ccm.in_use(read()), read()["status"], "running" in read()), ("gpt-a", "pending", False))
+        self.assertFalse(ccm.stopped(self.state))
+        # Codex took it: confirmed at the turn's end, and the mark is gone with the settlement.
+        self.assertTrue(ccm.started(self.state, "gpt-b", rec["rev"]))
+        ccm.resolve(self.state, rec["rev"], True)
+        self.assertEqual((ccm.in_use(read()), read()["working"], "running" in read()), ("gpt-b", "gpt-b", False))
+        self.assertFalse(ccm.started(self.state, "gpt-b", rec["rev"]), "a settled pick is not pending")
+        # A newer pick drops an older mark with the record it replaces.
+        newer = ccm.save(self.state, "gpt-c", applied="next-turn", accepted=False)
+        self.assertTrue(ccm.started(self.state, "gpt-c", newer["rev"]))
+        ccm.save(self.state, "gpt-d", applied="next-turn", accepted=False)
+        self.assertEqual((ccm.in_use(read()), "running" in read()), ("gpt-b", False))
+        self.assertTrue(ccm.started(self.state, "gpt-d", newer["rev"] + 1))
+        self.assertTrue(ccm.stopped(self.state), "any mark, for a seat that is starting")
+
     def test_a_refused_pick_leaves_the_working_model_in_use(self):
         ccm.save(self.state, "gpt-a", applied="next-turn", accepted=True)
         ccm.save(self.state, "gpt-bad", applied="next-turn", accepted=False)
@@ -170,6 +205,14 @@ class Cli(Case):
         self.assertTrue(json.loads(ccm.record_path(self.state).read_text())["accepted"])
         self.assertEqual(self.main("current", "--state-dir", str(self.state)), (0, "gpt-b"))
         self.assertEqual(self.main("launch", "--state-dir", str(self.state)), (0, "2 gpt-b gpt-b"))
+        self.assertEqual(self.main("working", "--state-dir", str(self.state)), (0, "gpt-b"))
+        self.main("save", "--state-dir", str(self.state), "--model", "gpt-c", "--applied", "next-turn")
+        self.assertEqual(self.main("working", "--state-dir", str(self.state)), (0, "gpt-b"), "the pick is not it yet")
+        self.assertEqual(self.main("in-use", "--state-dir", str(self.state)), (0, "gpt-b"))
+        ccm.started(self.state, "gpt-c", 3)
+        self.assertEqual(self.main("in-use", "--state-dir", str(self.state)), (0, "gpt-c"))
+        self.assertEqual(self.main("working", "--state-dir", str(self.root / "none")), (0, ""))
+        ccm.save(self.state, "gpt-b", applied="next-turn", accepted=True)
         rc, out = self.main("save", "--state-dir", str(self.state), "--model", "sonnet", "--applied", "next-turn")
         self.assertEqual(rc, 2)
         self.assertTrue(out.startswith("FAILED"))

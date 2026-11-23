@@ -46,4 +46,16 @@ M=$(python3 "$HERE/src/codex_core_model.py" current --state-dir "$T/state"); [ "
 printf '{"model":"opus","accepted":true}\n' > "$T/state/model-switch.json"
 M=$(python3 "$HERE/src/codex_core_model.py" current --state-dir "$T/state"); [ -z "$M" ] && ok "11 a Claude core's record is not read as a Codex model" || fail "11" "$M"
 
-echo; [ $fails -eq 0 ] && echo "switch-model-codex: all 11 checks pass" || { echo "switch-model-codex: $fails FAILED"; exit 1; }
+# The text names the model the core is on (the last one Codex took), not the last pick saved.
+# VM 2026-11-23: with Sol working and Astra pending, a pick of Luna said "(was astra) … stays on astra".
+python3 "$HERE/src/codex_core_model.py" save --state-dir "$T/state" --model gpt-6.2-sol --applied next-turn --accepted > /dev/null
+rc=$(TMUX_PANES="$SEAT" run gpt-6.2-astra)
+rc=$(TMUX_PANES="$SEAT" run gpt-6-luna)
+[ "$rc" = 12 ] && grep -q "pending model=gpt-6-luna (the core is on gpt-6.2-sol)" "$T/err" && grep -q "until then it stays on gpt-6.2-sol;" "$T/err" \
+  && ! grep -q "astra" "$T/err" && ok "12 a pending pick over a pending pick: the text says the working model, never the untaken pick" || fail "12" "rc=$rc $(cat "$T/err")"
+rc=$(TMUX_PANES="$TUI" run gpt-5.6-terra)
+[ "$rc" = 11 ] && grep -q "(the core is on gpt-6.2-sol)" "$T/err" && ok "13 the TUI's text names the working model too" || fail "13" "rc=$rc $(cat "$T/err")"
+rm -f "$T/state/model-switch.json"; rc=$(run gpt-5.6-luna)
+[ "$rc" = 13 ] && grep -q "(the core was last on its launch model)" "$T/err" && ok "14 with no record, it says the launch model rather than a dash" || fail "14" "rc=$rc $(cat "$T/err")"
+
+echo; [ $fails -eq 0 ] && echo "switch-model-codex: all 14 checks pass" || { echo "switch-model-codex: $fails FAILED"; exit 1; }
