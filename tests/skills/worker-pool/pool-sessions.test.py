@@ -363,6 +363,21 @@ class UnreadableRecordsDegradeToAbsent(unittest.TestCase):
             (row,) = pool_sessions.sessions(ws, probe=EXISTS)
             self.assertTrue(row["seat"])
 
+    def test_an_unreadable_run_start_keeps_the_bare_declaration_rule(self):
+        """A start that does not parse cannot date the declaration, so the row stays read-only
+        (a seat) rather than offering a typable pane over a seat's log."""
+        import os
+        with tempfile.TemporaryDirectory() as d:
+            run = dict(open_run(W1), started_at="not a time")
+            ws = workspace_with(Path(d), {W1: {"state": "live", "runtime": "codex"}},
+                                {}, {W1: [run]})
+            host = ws / "state" / "codex-seat" / f"sutando-worker-{W1}" / "host.json"
+            write(host, {})
+            os.utime(host, (0, 0))
+            self.assertIsNone(pool_sessions._started_epoch(run))
+            (row,) = pool_sessions.sessions(ws, probe=EXISTS)
+            self.assertTrue(row["seat"])
+
     def test_a_tui_run_with_no_declaration_is_not_a_seat(self):
         with tempfile.TemporaryDirectory() as d:
             run = dict(open_run(W1), started_at="2026-11-22T20:00:00Z")
