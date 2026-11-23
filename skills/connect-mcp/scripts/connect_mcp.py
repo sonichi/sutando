@@ -47,6 +47,7 @@ REPO_ROOT = SCRIPT_PATH.parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 import agent_card as ac  # noqa: E402
 import wait_store  # noqa: E402
+
 from task_body_guard import confine_user_content, header_safe_value  # noqa: E402
 
 EXIT_OK, EXIT_NO, EXIT_SETUP = 0, 1, 2
