@@ -14,11 +14,18 @@ fails on any direct start-cli.sh / launch-sutando.sh invocation outside ALLOWED_
 `bash`/`sh`/`exec` of either script or of a $...LAUNCHER / $...START_CLI variable, or a Python
 string literal naming either script.
 """
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ()
+
 import re
 import subprocess
 import tempfile
 import unittest
-from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCOPE = ("src", "scripts", "skills", "packages")
