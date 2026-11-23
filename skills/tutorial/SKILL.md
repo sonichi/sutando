@@ -37,27 +37,39 @@ body has a line that is exactly `/tutorial` arrives with the header `playbook: t
 A `/tutorial` quoted or inside a sentence, a room message and any other sender are never tagged.
 For a tagged task, do exactly this, in order:
 
-1. **Greet first.** Write your reply to the message (for the setup message, your first-contact
-   greeting) to the task's result file, so it is posted before the page. The message's first line
-   names the owner ("Hi, I am <owner's name> …"): that is who you are greeting, never your own name.
+1. **Write your reply to a file; do not send it yourself.** For the setup message it is your
+   first-contact greeting. The message's first line names the owner ("Hi, I am <owner's name> …"):
+   that is who you are greeting, never your own name. Do not write it to the task's result file
+   yet: result files are delivered separately and later, so a reply left there can land after the
+   page's card.
 2. **Always run the page, once**, with the task's own `channel_id` as the room and `user_id` as the
-   owner. Put the task's body in a file and pass it:
+   owner. Put the task's body in a file and pass it, with the reply's file:
 
    ```bash
    python3 skills/tutorial/scripts/tutorial_run.py \
-     --room '<channel_id>' --owner '<user_id>' --body-file <file holding the task body>
+     --room '<channel_id>' --owner '<user_id>' --body-file <file holding the task body> \
+     --greeting-file <file holding your reply>
    ```
 
-   It runs `getting_started.py publish` (step 2 below) with that room and owner, and nothing else:
-   the page it publishes is generic, with no roles and no tailored prompts, because a room's Commons
-   page cannot yet be limited to its owner. The setup app's `tutorial-inputs.json` is not a gate.
-   It records the outcome in `<workspace>/state/tutorial/last-run.json`, the manifest's `last_run`
-   record, which health-check shows as the `skill:tutorial` row, and prints one JSON line.
-3. **The line has an `owner_line`** (the publish failed, or the page was made but its card did not
-   reach the owner): send it word for word as your only message about the page
-   (`python3 skills/agent-room-ops/room_ops.py say '<channel_id>' '<owner_line>'`). Do not explain the
-   failure in chat and do not retry in the same turn; the owner retries with `/tutorial`.
-   **No `owner_line`:** the page's card in the DM is the one line about it; post nothing more.
+   It posts your reply in the room first (room-ops `say`), and only when that send has returned ok
+   does it run `getting_started.py publish` (step 2 below) with that room and owner, and nothing
+   else. The reply and the card leave by the same path, one after the other. The page it publishes
+   is generic, with no roles and no tailored prompts, because a room's Commons page cannot yet be
+   limited to its owner. The setup app's `tutorial-inputs.json` is not a gate. It records the
+   outcome in `<workspace>/state/tutorial/last-run.json`, the manifest's `last_run` record, which
+   health-check shows as the `skill:tutorial` row, and prints one JSON line.
+3. **Close the task by the line's `greeting`.**
+   - `confirmed` or `unconfirmed`: your reply is already in the room. Write `[REPLIED]` as the
+     task's result, never the reply again. If the line has an `owner_line` (the publish failed,
+     nothing was made or changed, or the page is there but its card did not reach the owner), send
+     it word for word as your only message about the page
+     (`python3 skills/agent-room-ops/room_ops.py say '<channel_id>' '<owner_line>'`).
+     No `owner_line`: the page's card in the DM is the one line about it; post nothing more.
+   - `failed`: your reply was not posted and the page was not run. Write your reply as the task's
+     result, with the `owner_line` as its last paragraph: one message, nothing sent beside it.
+
+   Do not explain a failure in chat and do not retry in the same turn; the owner retries with
+   `/tutorial`.
 
 **The greeting comes first.** Send the first-contact reply in the DM before anything here. The page
 is extra: if any step below fails, the greeting stands. Do not edit, retract or repeat it, and do

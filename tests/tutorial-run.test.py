@@ -4,12 +4,15 @@
 A task tagged `playbook: tutorial` always runs the Getting started page publish with the task's own
 room and owner and publishes a generic page (no roles, prompts or owner name, whatever the setup
 inputs or the message say); every run, ok or failed, is recorded for health-check, and a failed run
-hands the agent one owner line in place of silence.
+hands the agent one owner line in place of silence. The verdict is read from what publish reports
+(action, page, card), and a reply handed to the runner reaches the room before the page's card
+however late the result file is delivered.
 
 Run: python3 tests/tutorial-run.test.py
 """
 import importlib.util
 import json
+import re
 import sys
 import tempfile
 import textwrap
@@ -29,6 +32,9 @@ import tutorial_run as tr  # noqa: E402
 
 ROOM = "!dm:example.org"
 OWNER = "@o:example.org"
+# What getting_started.py publish prints for a page it made and summoned the owner to.
+CREATED = {"ok": True, "action": "created", "kind": "html-1", "summoned": True}
+
 SETUP_BODY = ("Hi, I am Dana Reyes. I am all set up and saying hello. I want to use s.space for "
               "Founder, Product Manager. Give me a quick tour. /tutorial")
 
@@ -80,7 +86,7 @@ class _Run(unittest.TestCase):
 
 class Publish(_Run):
     def test_always_publishes_with_the_tasks_room_and_owner(self):
-        script = self.fake_publish(0, {"action": "created", "kind": "html-1"})
+        script = self.fake_publish(0, CREATED)
         shown = tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=script, now=0)
         argv = self.argv()
         self.assertEqual(argv[:1], ["publish"])
@@ -91,7 +97,7 @@ class Publish(_Run):
         self.assertNotIn("owner_line", shown)
 
     def test_no_inputs_file_is_no_gate(self):
-        script = self.fake_publish(0, {"action": "created", "kind": "html-1"})
+        script = self.fake_publish(0, CREATED)
         self.assertFalse((self.ws / "state" / "onboarding" / "tutorial-inputs.json").exists())
         self.assertTrue(tr.run(ROOM, OWNER, "/tutorial", self.ws, script=script)["ok"])
         self.assertTrue(self.argv_file.exists(), "publish ran without the setup inputs file")
@@ -127,7 +133,7 @@ class Summon(_Run):
 
 class Outcome(_Run):
     def test_success_is_recorded(self):
-        tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.fake_publish(0, {"action": "created", "kind": "html-9"}),
+        tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.fake_publish(0, {**CREATED, "kind": "html-9"}),
                now=1795000000)
         rec = self.record()
         self.assertEqual((rec["outcome"], rec["exit"], rec["action"], rec["kind"]), ("ok", 0, "created", "html-9"))
@@ -208,7 +214,7 @@ class EdgePaths(_Run):
 
     def test_a_record_that_cannot_be_written_leaves_no_temp_file_and_no_false_failure(self):
         self._refusing_record_writes()
-        shown = tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.fake_publish(0, {"action": "created"}))
+        shown = tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.fake_publish(0, CREATED))
         self.assertTrue(shown["ok"], "a published page is not reported failed because recording failed")
         self.assertNotIn("owner_line", shown)
         self.assertIn("read-only", shown["record_error"])
@@ -245,7 +251,7 @@ class EdgePaths(_Run):
             for path in (body, self.base / "absent.txt"):
                 with contextlib.redirect_stdout(io.StringIO()):
                     tr.main(["--room", ROOM, "--owner", OWNER, "--body-file", str(path),
-                             "--publish-script", str(self.fake_publish(0, {"action": "created"}))])
+                             "--publish-script", str(self.fake_publish(0, CREATED))])
                 self.assertEqual(self.record()["outcome"], "ok", path)
         finally:
             tr._workspace = real
@@ -286,11 +292,251 @@ class CardNotSent(_Run):
         try:
             with contextlib.redirect_stdout(out):
                 rc = tr.main(["--room", ROOM, "--owner", OWNER, "--body", SETUP_BODY, "--publish-script",
-                              str(self.fake_publish(0, {"action": "created", "summon_error": "x"}))])
+                              str(self.fake_publish(0, {**CREATED, "summoned": False, "summon_error": "x"}))])
         finally:
             tr._workspace = real
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(out.getvalue())["owner_line"], tr.CARD_LINE)
+
+
+class ReportedOutcome(_Run):
+    """Exit 0 is not a page: the verdict comes from the action, the page and the card publish reports."""
+
+    def _run(self, out, body=SETUP_BODY):
+        return tr.run(ROOM, OWNER, body, self.ws, script=self.fake_publish(0, out))
+
+    def test_the_actions_are_the_ones_publish_can_report(self):
+        src = (SCRIPTS / "getting_started.py").read_text()
+        reported = set(re.findall(r'"action": "([a-z]+)"', src)) | set(re.findall(r'action = "([a-z]+)"', src))
+        reported -= {"create", "update", "resume", "reconcile", "refreshed"}  # plan's and --all-rooms' own
+        self.assertEqual(reported, set(tr.PAGE_ACTIONS) | {tr.SKIPPED_ACTION})
+
+    def test_a_skipped_run_with_no_page_is_not_published(self):
+        shown = self._run({"ok": True, "action": "skipped", "kind": None, "summoned": False,
+                           "reason": "legacy page missing, edited or ambiguous"})
+        self.assertFalse(shown["ok"])
+        self.assertEqual(shown["owner_line"], tr.SKIPPED_LINE)
+        rec = self.record()
+        self.assertEqual((rec["outcome"], rec["exit"], rec["action"]), ("page-left-as-is", 0, "skipped"))
+        self.assertEqual(rec["reason"], "legacy page missing, edited or ambiguous")
+        row = tutorial_row(self.ws)
+        self.assertEqual(row["status"], "warn")
+        self.assertIn("made or changed nothing", row["detail"])
+        self.assertNotIn("published", row["detail"])
+
+    def test_a_skipped_run_that_names_a_page_is_still_not_published(self):
+        shown = self._run({"ok": True, "action": "skipped", "kind": "html-4", "summoned": False,
+                           "reason": "owner edit detected during migration"}, body="/tutorial")
+        self.assertEqual((shown["outcome"], shown["owner_line"]), ("page-left-as-is", tr.SKIPPED_LINE))
+
+    def test_a_requested_card_that_was_not_sent_is_told_without_a_summon_error(self):
+        for action in ("updated", "unchanged", "kept", "resumed"):
+            shown = self._run({"ok": True, "action": action, "kind": "html-4", "summoned": False}, body="/tutorial")
+            self.assertIn("--summon", self.argv(), action)
+            self.assertTrue(shown["ok"], f"{action}: the page is there")
+            self.assertEqual(shown["owner_line"], tr.CARD_LINE, action)
+            self.assertEqual(self.record()["outcome"], "page-made-card-not-sent", action)
+            self.assertEqual(tutorial_row(self.ws)["status"], "warn", action)
+
+    def test_a_requested_card_that_was_sent_is_ok(self):
+        for action in ("created", "updated", "unchanged", "kept"):
+            shown = self._run({"ok": True, "action": action, "kind": "html-4", "summoned": True}, body="/tutorial")
+            self.assertNotIn("owner_line", shown, action)
+            rec = self.record()
+            self.assertEqual((rec["outcome"], rec["summoned"]), ("ok", True), action)
+            self.assertIn(f"page {action}, its card was sent", tutorial_row(self.ws)["detail"], action)
+
+    def test_a_kept_or_unchanged_page_with_no_card_asked_is_quiet_and_says_so(self):
+        for action in ("kept", "unchanged", "updated", "resumed"):
+            shown = self._run({"ok": True, "action": action, "kind": "html-4", "summoned": False,
+                               **({"edited": True} if action == "kept" else {})})
+            self.assertTrue(shown["ok"], action)
+            self.assertNotIn("owner_line", shown, action)
+            row = tutorial_row(self.ws)
+            self.assertEqual(row["status"], "ok", action)
+            self.assertIn(f"page {action}, no card was owed", row["detail"], action)
+
+    def test_a_created_page_owes_a_card_even_when_none_was_asked(self):
+        shown = self._run({"ok": True, "action": "created", "kind": "html-4", "summoned": False})
+        self.assertEqual(shown["owner_line"], tr.CARD_LINE)
+
+    def test_an_unknown_or_missing_action_is_not_success(self):
+        for out in ({}, {"ok": True}, {"ok": True, "action": "refreshed", "kind": "html-4"},
+                    {"ok": True, "action": ["created"], "kind": "html-4", "summoned": True}):
+            shown = self._run(out)
+            self.assertFalse(shown["ok"], out)
+            self.assertEqual(shown["owner_line"], tr.OWNER_LINE, out)
+            self.assertEqual(self.record()["outcome"], "publish-outcome-unknown", out)
+            self.assertEqual(tutorial_row(self.ws)["status"], "warn", out)
+
+    def test_a_page_action_that_names_no_page_is_not_success(self):
+        for kind in (None, "", "doc-1", 7):
+            shown = self._run({"ok": True, "action": "created", "kind": kind, "summoned": True})
+            self.assertFalse(shown["ok"], kind)
+            self.assertEqual(shown["owner_line"], tr.OWNER_LINE, kind)
+            self.assertIn("named no page", self.record()["reason"], kind)
+
+    def test_the_cli_exits_nonzero_when_no_page_was_reported(self):
+        import contextlib
+        import io
+        real = tr._workspace
+        tr._workspace = lambda: self.ws
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                rc = tr.main(["--room", ROOM, "--owner", OWNER, "--body", "/tutorial", "--publish-script",
+                              str(self.fake_publish(0, {"ok": True, "action": "skipped", "kind": None,
+                                                        "summoned": False, "reason": "audience unknown"}))])
+        finally:
+            tr._workspace = real
+        self.assertEqual(rc, 1)
+        self.assertEqual(json.loads(out.getvalue())["owner_line"], tr.SKIPPED_LINE)
+
+
+class _Room(_Run):
+    """One room's timeline as a file. The say and publish stand-ins post to it at once, as the real
+    ones do; a result file reaches it only when the test's bridge drains, which may be late."""
+
+    def setUp(self):
+        super().setUp()
+        self.room = self.base / "room.log"
+        self.result = self.base / "result.txt"
+
+    def timeline(self) -> list:
+        return self.room.read_text(encoding="utf-8").splitlines() if self.room.exists() else []
+
+    def fake_say(self, answer: dict, post: bool = True) -> Path:
+        script = self.base / "fake_say.py"
+        script.write_text(textwrap.dedent(f"""\
+            import json, sys
+            assert sys.argv[1] == "say" and sys.argv[3] == "--body-file", sys.argv
+            if {post!r}:
+                open({str(self.room)!r}, "a").write("say:" + open(sys.argv[4]).read() + "\\n")
+            print(json.dumps({answer!r}, indent=2))
+            """), encoding="utf-8")
+        return script
+
+    def card_publish(self) -> Path:
+        script = self.fake_publish(0, CREATED)
+        script.write_text(f'open({str(self.room)!r}, "a").write("card\\n")\n'
+                          + script.read_text(encoding="utf-8"), encoding="utf-8")
+        return script
+
+    def write_result(self, shown: dict, greeting: str) -> None:
+        """The playbook's last step: [REPLIED] once the runner posted the reply, else the reply itself."""
+        if shown.get("greeting") in ("confirmed", "unconfirmed"):
+            body = "[REPLIED]"
+        else:
+            body = "\n\n".join(x for x in (greeting, shown.get("owner_line")) if x)
+        self.result.write_text(body, encoding="utf-8")
+
+    def drain(self) -> None:
+        body = self.result.read_text(encoding="utf-8")
+        if not body.startswith("[REPLIED]"):
+            with self.room.open("a", encoding="utf-8") as fh:
+                fh.write("result:" + body.replace("\n", " ") + "\n")
+
+
+class GreetingOrder(_Room):
+    SAID = {"ok": True, "room_id": ROOM, "event_id": "$e1", "reason": None, "state": "confirmed"}
+
+    def test_the_reply_is_in_the_room_before_the_card_when_result_delivery_is_late(self):
+        shown = tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.card_publish(),
+                       greeting="Hello Dana", say_script=self.fake_say(self.SAID))
+        self.assertEqual(self.timeline(), ["say:Hello Dana", "card"], "before any result file is delivered")
+        self.write_result(shown, "Hello Dana")
+        self.drain()
+        self.assertEqual(self.timeline(), ["say:Hello Dana", "card"], "the late result adds no second reply")
+        self.assertEqual((shown["greeting"], self.record()["greeting"]), ("confirmed", "confirmed"))
+        self.assertNotIn("owner_line", shown)
+
+    def test_a_reply_left_to_the_result_file_lands_after_the_card(self):
+        """What the runner's own send exists to prevent: the same run with the reply sent the old way."""
+        shown = tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.card_publish())
+        self.write_result(shown, "Hello Dana")
+        self.drain()
+        self.assertEqual(self.timeline(), ["card", "result:Hello Dana"])
+        self.assertNotIn("greeting", shown)
+
+    def test_a_reply_that_was_not_sent_publishes_nothing_and_goes_out_as_one_result(self):
+        refused = {"ok": False, "room_id": ROOM, "event_id": None, "reason": "no gateway configured",
+                   "state": "failed"}
+        shown = tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.card_publish(),
+                       greeting="Hello Dana", say_script=self.fake_say(refused, post=False))
+        self.assertFalse(self.argv_file.exists(), "no card may precede a reply that has not been sent")
+        self.assertEqual(self.timeline(), [])
+        self.assertEqual((shown["ok"], shown["greeting"], shown["owner_line"]), (False, "failed", tr.OWNER_LINE))
+        rec = self.record()
+        self.assertEqual((rec["outcome"], rec["exit"], rec["reason"]),
+                         ("greeting-not-sent", None, "no gateway configured"))
+        row = tutorial_row(self.ws)
+        self.assertEqual(row["status"], "warn")
+        self.assertIn("page was not run", row["detail"])
+        self.write_result(shown, "Hello Dana")
+        self.drain()
+        self.assertEqual(self.timeline(), [f"result:Hello Dana  {tr.OWNER_LINE}"])
+
+    def test_an_accepted_send_with_no_event_id_still_goes_first_and_is_not_sent_twice(self):
+        said = {"ok": True, "room_id": ROOM, "event_id": None, "reason": "no event_id", "state": "unconfirmed"}
+        shown = tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.card_publish(),
+                       greeting="Hello Dana", say_script=self.fake_say(said))
+        self.write_result(shown, "Hello Dana")
+        self.drain()
+        self.assertEqual(self.timeline(), ["say:Hello Dana", "card"])
+        self.assertEqual(shown["greeting"], "unconfirmed")
+
+    def test_a_say_that_cannot_run_or_answer_counts_as_not_sent(self):
+        silent = self.base / "silent_say.py"
+        silent.write_text("print('not json')\n", encoding="utf-8")
+        for script in (self.base / "no_say.py", silent):
+            shown = tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.card_publish(),
+                           greeting="Hello Dana", say_script=script)
+            self.assertEqual((shown["greeting"], shown["outcome"]), ("failed", "greeting-not-sent"), script)
+            self.assertFalse(self.argv_file.exists(), script)
+        real = tr.subprocess.run
+
+        def boom(*_a, **_k):
+            raise tr.subprocess.TimeoutExpired(cmd="say", timeout=120)
+
+        tr.subprocess.run = boom
+        try:
+            state, why = tr.send_greeting(ROOM, "Hello Dana", self.fake_say(self.SAID))
+        finally:
+            tr.subprocess.run = real
+        self.assertEqual(state, "failed")
+        self.assertIn("TimeoutExpired", why)
+        self.assertEqual(self.timeline(), [])
+
+    def test_the_cli_takes_the_reply_from_a_file_and_an_unreadable_one_is_not_sent(self):
+        import contextlib
+        import io
+        greeting = self.base / "greeting.txt"
+        greeting.write_text("Hello Dana", encoding="utf-8")
+        real = tr._workspace
+        tr._workspace = lambda: self.ws
+        try:
+            for path, state, rc_want in ((greeting, "confirmed", 0), (self.base / "absent.txt", "failed", 1)):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = tr.main(["--room", ROOM, "--owner", OWNER, "--body", SETUP_BODY,
+                                  "--greeting-file", str(path), "--publish-script", str(self.card_publish()),
+                                  "--say-script", str(self.fake_say(self.SAID))])
+                self.assertEqual((rc, json.loads(out.getvalue())["greeting"]), (rc_want, state), path)
+        finally:
+            tr._workspace = real
+        self.assertEqual(self.timeline(), ["say:Hello Dana", "card"])
+
+    def test_the_say_script_is_room_ops_and_takes_the_arguments_sent(self):
+        self.assertEqual(tr.SAY_SCRIPT, REPO / "skills" / "agent-room-ops" / "room_ops.py")
+        src = tr.SAY_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('sub.add_parser("say"', src)
+        self.assertIn('"--body-file"', src)
+
+    def test_the_playbook_steps_send_the_reply_through_the_runner(self):
+        steps = (REPO / "skills" / "tutorial" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("--greeting-file", steps)
+        self.assertIn("[REPLIED]", steps)
+        self.assertNotIn("to the task's result file, so it is posted before the page", steps)
 
 
 class HealthRow(_Run):
@@ -298,7 +544,7 @@ class HealthRow(_Run):
         self.assertIsNone(tutorial_row(self.ws))
 
     def test_a_published_page_is_an_ok_row(self):
-        tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.fake_publish(0, {"action": "created"}))
+        tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.fake_publish(0, CREATED))
         row = tutorial_row(self.ws)
         self.assertEqual((row["name"], row["status"]), ("skill:tutorial", "ok"))
 
