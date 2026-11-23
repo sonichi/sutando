@@ -178,7 +178,7 @@ print(f"{prev or ''}\t{src}")
 PYEOF
 )"; PREV="${PREVLINE%%	*}"; PREV_SRC="${PREVLINE#*	}"
 # Baseline the acceptance lines for THIS model already on screen, so a stale one cannot pass as new.
-BASE="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --count)"; BRC=$?
+BASE="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --count)"; BRC=$?
 case "$BRC:$BASE" in 0:[0-9]*) ;; *) echo "switch-model: could not read the core pane before sending (rc=$BRC, '$BASE'); nothing sent, nothing recorded" >&2; exit 7;; esac
 # Attribute any picker this send leaves on screen to us, so the supervisor may Esc it later (CLI > env > manifest).
 [ -n "$DISMISS_AFTER" ] || DISMISS_AFTER="${MODEL_SWITCH_PICKER_DISMISS_AFTER_S:-$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["config"]["MODEL_SWITCH_PICKER_DISMISS_AFTER_S"])' "$REPO/skills/model-switch/manifest.json" 2>/dev/null)}"
@@ -193,12 +193,12 @@ elif [ "$SEND_RC" != 0 ]; then
   "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION"; echo "switch-model: send failed; nothing recorded" >&2; exit 7
 fi
 CONFIRMED=false
-VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT")"
+VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT")"
 case "$VERDICT" in
   ACCEPTED) "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION";;
   DIALOG)
     if [ -n "$CONFIRM" ]; then
-      VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT" --answer-enter)"; ANSWER_RC=$?
+      VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT" --answer-enter)"; ANSWER_RC=$?
       case "$ANSWER_RC" in
         0|11) CONFIRMED=true;;
         125) "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"
