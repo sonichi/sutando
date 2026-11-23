@@ -5797,6 +5797,36 @@ def _agent_activity_age() -> "float | None":
         return None
 
 
+def _statusline_quota_freshness(check: dict) -> dict:
+    """A status line record is current only while replies land: warn when the core has
+    worked more than the gate's freshness window after the record's `last_checked`."""
+    from quota_availability import FRESH_SEC, read_quota_record  # src/ is on sys.path
+    rec = read_quota_record(WORKSPACE_DIR)
+    age = None if rec is None else rec.age_s
+    if age is None:
+        check["detail"] = "quota state from the Claude status line recorder (age unknown)"
+        return check
+    check["detail"] = f"quota state from the Claude status line recorder (updated {int(age / 60)}m ago)"
+    agent_age = _agent_activity_age()
+    if age > FRESH_SEC and agent_age is not None and agent_age < age - FRESH_SEC:
+        check["status"] = "warn"
+        check["detail"] = (
+            f"quota state from the Claude status line recorder is {int(age / 60)}m old while the "
+            f"core worked {int(agent_age / 60)}m ago — the core's replies are not reaching the "
+            "recorder. Check that the core's config-dir settings.json has the quota-tracker "
+            "statusLine (it is reinstalled at launch) and that a project statusLine does not hide it."
+        )
+    return check
+
+
+def check_claude_sign_in() -> dict:
+    """FAIL when the core's config dir is not signed in on its own while sessions go direct, and
+    queue one owner message per day with the sign-in step (src/claude_signed_in.py)."""
+    import claude_signed_in  # src/ is on sys.path
+    from claude_account import core_config_dir
+    return claude_signed_in.check(WORKSPACE_DIR, core_config_dir(), socket=_local_core_socket())
+
+
 def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
     """Warn when the credential proxy is up but producing no quota state.
 
@@ -5846,6 +5876,8 @@ def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
     # result depends on ambient host state is worse than the bug it guards -- and CI,
     # having no live core, would have stayed green while developer hosts failed.
     check = {"name": "quota-telemetry", "status": "ok"}
+    if _quota_record_from_statusline():
+        return _statusline_quota_freshness(check)
     # "stale" means listening but executing pre-deploy code -- still routing,
     # so gating it out here would mute this check exactly during a redeploy.
     if proxy_status not in ("ok", "stale"):
@@ -5997,6 +6029,10 @@ def check_core_request_rejections(window_sec: int = 900, sustained: int = 5,
         check["status"] = "warn"
         check["detail"] = "quota-state.json present but unreadable"
         return check
+    from quota_availability import trusted_record  # src/ is on sys.path
+    if isinstance(data, dict) and trusted_record(data) is None:
+        check["detail"] = "quota record is another login's status line record — not this core's"
+        return check
     ledger = data.get("recent_rejections") if isinstance(data, dict) else None
     if not isinstance(ledger, list) or not ledger:
         check["detail"] = "no upstream rejections recorded by the proxy"
@@ -6095,6 +6131,10 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
     if not isinstance(data, dict):
         check["status"] = "warn"
         check["detail"] = "quota-state.json is not a JSON object"
+        return check
+    from quota_availability import trusted_record  # src/ is on sys.path
+    if trusted_record(data) is None:
+        check["detail"] = "quota record is another login's status line record — not this core's"
         return check
     headers = data.get("headers")
     if not isinstance(headers, dict):
@@ -13239,6 +13279,16 @@ def _credential_proxy_wedge_from_quota_state(check: dict) -> None:
     )
 
 
+def _quota_record_from_statusline() -> bool:
+    """quota-state.json was last written by the status line recorder, which needs no proxy."""
+    try:
+        data = json.loads(status_read_path("quota-state.json", WORKSPACE_DIR).read_text())
+    except (OSError, ValueError):
+        return False
+    from quota_availability import from_statusline  # src/ is on sys.path
+    return from_statusline(data)
+
+
 def check_credential_proxy() -> dict:
     """Credential proxy (port 7846). probe=False: a forwarding proxy has no
     liveness endpoint, so an HTTP probe is forwarded and misread as wedged."""
@@ -13246,7 +13296,10 @@ def check_credential_proxy() -> dict:
     # Liveness, captured before staleness/pin rewrite `status`: a pinned proxy
     # still routes, so its consumers must not read the pin as "down".
     check["live"] = check["status"] == "ok"
-    if check["status"] == "down":
+    if check["status"] == "down" and _quota_record_from_statusline():
+        check["status"] = "ok"
+        check["detail"] = "not running — quota comes from the Claude status line recorder"
+    elif check["status"] == "down":
         check["status"] = "warn"
         check["detail"] = "not running (optional)"
     elif check["status"] == "ok":
@@ -13466,6 +13519,7 @@ def run_all_checks() -> list[dict]:
     # NOT carry_proxy_veto: this check's remedy relaunches the CORE, and a pin on
     # the proxy must not veto a different process's remedy.
     checks.append(check_quota_telemetry(proxy_live))
+    checks.append(check_claude_sign_in())
     # ...and WHOSE account those numbers describe. The check above answers
     # "fresh?"; this one answers "ours?" — a fresh file for a foreign account
     # passes every branch above (observed 2026-08-03).

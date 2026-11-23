@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the package-canonical claude-code adapter suite under repository coverage."""
+"""Run the package-canonical connector card suite under repository coverage."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 if os.name == "nt":
-    print("ok - package claude-code adapter suite is covered by the Linux coverage job")
+    print("ok - package connector-cards suite is covered by the Linux coverage job")
     raise SystemExit(0)
 
 TARGET = (
@@ -17,7 +17,7 @@ TARGET = (
     / "packages"
     / "ag2-sparrow"
     / "tests"
-    / "test_claude_code_adapter.py"
+    / "test_connector_cards.py"
 )
 
 try:

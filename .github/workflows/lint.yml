@@ -1,0 +1,186 @@
+name: lint
+
+# Every repo lint as a step of one job, on one runner. The job is a required check, so it has no
+# `paths:` filter (an unreported required check strands the PR); only ESLint's steps skip by scope.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: repo lints
+    runs-on: ubuntu-24.04
+    # ESLint's `npm ci` alone spends ~4 min on a cold cache.
+    timeout-minutes: 15
+
+    steps:
+      # Full history: the --diff lints compare against the PR base or HEAD~1.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Each lint step runs even when an earlier one failed, so one run reports every lint.
+      - name: refuse AGENTS.md stale vs CLAUDE.md
+        if: ${{ !cancelled() }}
+        run: bash scripts/agents-md-sync.sh --check
+
+      - name: refuse new inline CLAUDE_CONFIG_DIR fallback
+        if: ${{ !cancelled() }}
+        env:
+          BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'HEAD~1' }}
+        run: bash scripts/lint-claude-home-path.sh --diff
+
+      - name: refuse bridge tests that read host config
+        if: ${{ !cancelled() }}
+        run: python3 scripts/lint-hermetic-bridge-tests.py
+
+      - name: refuse raw hostname-slug recipe in agent docs
+        if: ${{ !cancelled() }}
+        env:
+          BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'HEAD~1' }}
+        run: bash scripts/lint-host-label.sh --diff
+
+      - name: refuse new hardcoded hotkey assertions
+        if: ${{ !cancelled() }}
+        env:
+          BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'HEAD~1' }}
+        run: bash scripts/lint-hotkey-assertions.sh --diff
+
+      - name: refuse docs/src-map.md stale vs src/
+        if: ${{ !cancelled() }}
+        run: python3 scripts/gen-src-map.py --check
+
+      - name: refuse new inline sutando-home install-path literal
+        if: ${{ !cancelled() }}
+        env:
+          BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'HEAD~1' }}
+        run: bash scripts/lint-sutando-home-path.sh --diff
+
+      - name: refuse new direct workspace-path resolution
+        if: ${{ !cancelled() }}
+        env:
+          BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'HEAD~1' }}
+        run: bash scripts/lint-workspace-resolution.sh --diff
+
+      # CI mirror of .githooks/pre-commit: nothing under workspace/ but workspace/.gitkeep.
+      - name: refuse workspace/ contents in commits
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+
+          # For pull_request: base is github.base_ref. For push to main:
+          # diff against the previous commit so a direct push that adds
+          # workspace/ still trips.
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base_ref="origin/${{ github.base_ref }}"
+            diff_args="$base_ref...HEAD"
+          else
+            base_ref="${{ github.event.before }}"
+            # First push to a branch has before=0000000... — fall back to
+            # the parent of HEAD in that case.
+            if [[ "$base_ref" =~ ^0+$ ]]; then
+              diff_args="HEAD~1...HEAD"
+            else
+              diff_args="$base_ref...HEAD"
+            fi
+          fi
+
+          # Added or modified paths in the PR diff. Same filter as the local
+          # pre-commit hook: anything under workspace/, except .gitkeep.
+          changed="$(git diff --name-only --diff-filter=AMRC $diff_args)"  # AMRC: keep in lockstep with .githooks/pre-commit (rename bypass fix)
+          offenders="$(printf '%s\n' "$changed" \
+            | grep -E '^workspace/' \
+            | grep -vxF 'workspace/.gitkeep' \
+            || true)"
+
+          if [[ -n "$offenders" ]]; then
+            echo "::error::workspace/ contents detected — these files must not be committed:"
+            printf '%s\n' "$offenders" | sed 's/^/  • /'
+            echo ""
+            echo "workspace/ holds per-user runtime state (tasks, results, notes, state, logs)"
+            echo "and is gitignored. Remove these files from the PR or move them outside workspace/."
+            echo ""
+            echo "If you cloned recently, install the local pre-commit hook to catch this earlier:"
+            echo "  git config core.hooksPath .githooks"
+            exit 1
+          fi
+
+          echo "✓ No workspace/ leaks in this diff."
+
+      # Ruff is pinned: a release that adds rules must not turn an unrelated PR red.
+      - name: Install ruff (pinned)
+        if: ${{ !cancelled() }}
+        run: python3 -m pip install 'ruff==0.15.22'
+
+      - name: ruff over Python sources
+        if: ${{ !cancelled() }}
+        run: ruff check --output-format=github .
+
+      # ubuntu-24.04 ships shellcheck, so nothing to install. Gated at `error` only: the
+      # warning backlog is too large to gate yet; raise the bar as it comes down.
+      - name: Show shellcheck version
+        if: ${{ !cancelled() }}
+        run: shellcheck --version
+
+      - name: shellcheck over shell scripts
+        if: ${{ !cancelled() }}
+        run: |
+          # -print0/-0 so paths with spaces cannot split into bogus arguments.
+          # `-S error` sets the gate; see the step comment for why not `warning` yet.
+          find src scripts skills tests hooks -name '*.sh' -not -path '*/node_modules/*' -print0 \
+            | xargs -0 shellcheck -S error -f gcc
+
+      # The skip lives in step guards, never a `paths:` filter, so the required job always reports.
+      - name: Decide whether this diff has anything to lint
+        id: scope
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+          # Unknown or empty scope lints: a lookup that failed is not evidence
+          # that no lintable file changed.
+          if [ "${{ github.event_name }}" != "pull_request" ] \
+             || ! gh pr diff "$PR" --name-only > /tmp/eslint-scope.txt \
+             || ! grep -q . /tmp/eslint-scope.txt; then
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+            echo 'Scope undetermined (or push to main) — linting.'
+            exit 0
+          fi
+          # Everything ESLint reads, plus every dependency input `npm ci` consults:
+          # package.json, package-lock.json, npm-shrinkwrap.json and .npmrc.
+          if grep -qE '\.(ts|tsx|js|mjs|cjs)$|^eslint\.config\.mjs$|^package(-lock)?\.json$|^npm-shrinkwrap\.json$|^\.npmrc$|^tsconfig[^/]*\.json$|^\.github/workflows/lint\.yml$' /tmp/eslint-scope.txt; then
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+            echo 'No file ESLint reads changed — nothing to lint. Changed files:'
+            cat /tmp/eslint-scope.txt
+          fi
+
+      - name: Setup Node
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies (clean)
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' }}
+        run: npm ci
+
+      - name: eslint over first-party TS + JS
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' }}
+        run: npm run lint

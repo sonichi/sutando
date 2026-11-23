@@ -11315,6 +11315,32 @@ def _maybe_start_event_channel() -> None:
         _log(f"event channel start failed (task delivery unaffected): {diagnostics.describe(e)}")
 
 
+AGENT_CARD_SWEEP_S = 2.0
+
+
+def _start_agent_cards() -> None:
+    """Post the agent panel cards this agent's connector queued (connector_cards), on a daemon
+    thread of its own: a card that cannot be posted never touches task delivery."""
+    try:
+        from .connector_cards import Poster
+        poster = Poster(_STATE, lambda payload: _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S),
+                        log=_log)
+    except Exception as e:  # noqa: BLE001 - cards are additive
+        _log(f"agent-card: sweep not started: {diagnostics.describe(e)}")
+        return
+
+    # Its own timer, never time.sleep: the poll loop's stall accounting counts every sleep it sees.
+    idle = threading.Event()
+
+    def _loop():
+        while not idle.wait(AGENT_CARD_SWEEP_S):
+            try:
+                poster.sweep()
+            except Exception as e:  # noqa: BLE001 - one bad sweep is not the last
+                _log(f"agent-card: sweep error (isolated): {diagnostics.describe(e)}")
+    threading.Thread(target=_loop, name="sparrow-agent-cards", daemon=True).start()
+
+
 def _poll_timeout_is_empty(last_ok: float, now: float,
                            grace: float = POLL_TIMEOUT_GRACE_S) -> bool:
     """Whether a long-poll read timeout should be read as `{"tasks": []}`.
@@ -11621,6 +11647,7 @@ def main() -> int | None:
     _emit_gateway_status(False, error="starting — not yet connected")
     refresh_routing(force=True)  # the owner's DM comes from the gateway at connect, not from a pin
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
+    _start_agent_cards()
     _results_watcher = _start_results_watcher()
     _outbound_thread = _start_outbound_worker(inflight)
     stop_workers = lambda: _stop_background_workers(_outbound_thread, _results_watcher)  # noqa: E731

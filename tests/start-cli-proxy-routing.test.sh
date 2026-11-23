@@ -16,6 +16,16 @@ mkdir -p "$TMP/live-bin" "$TMP/dead-bin" "$TMP/exp-late-bin" "$TMP/exp-never-bin
 printf '#!/bin/sh\nexit 0\n' > "$TMP/live-bin/lsof"
 printf '#!/bin/sh\nexit 1\n' > "$TMP/dead-bin/lsof"
 printf '#!/bin/sh\nexit 1\n' > "$TMP/live-bin/launchctl"
+# `claude auth status --json` stand-ins: live-bin's config dir is signed in; the others are not.
+printf '#!/bin/sh\necho '"'"'{"loggedIn": true}'"'"'\n' > "$TMP/live-bin/claude"
+mkdir -p "$TMP/out-bin" "$TMP/broken-bin"
+printf '#!/bin/sh\nexit 0\n' > "$TMP/out-bin/lsof"
+printf '#!/bin/sh\nexit 1\n' > "$TMP/out-bin/launchctl"
+printf '#!/bin/sh\nexit 1\n' > "$TMP/out-bin/pgrep"
+printf '#!/bin/sh\necho '"'"'{"loggedIn": false}'"'"'\n' > "$TMP/out-bin/claude"
+cp "$TMP/out-bin/lsof" "$TMP/out-bin/launchctl" "$TMP/out-bin/pgrep" "$TMP/broken-bin/"
+printf '#!/bin/sh\necho "not json"\nexit 1\n' > "$TMP/broken-bin/claude"
+chmod +x "$TMP"/out-bin/* "$TMP"/broken-bin/*
 printf '#!/bin/sh\nexit 1\n' > "$TMP/dead-bin/launchctl"
 printf '#!/bin/sh\nexit 0\n' > "$TMP/exp-late-bin/launchctl"
 printf '#!/bin/sh\nexit 0\n' > "$TMP/exp-never-bin/launchctl"
@@ -47,7 +57,14 @@ done
 chmod +x "$TMP"/live-bin/* "$TMP"/dead-bin/* "$TMP"/exp-late-bin/* "$TMP"/exp-never-bin/* "$TMP"/exp-dead-bin/* \
   "$TMP"/app-late-bin/* "$TMP"/app-never-bin/*
 
+# Cases 1-9 pin the proxy routing that QUOTA_STATUSLINE_ENABLED=false brings back.
 run_probe() {  # $1 = stub bin dir; remaining args = extra env KEY=VAL pairs
+  local stub="$1"; shift
+  env -i HOME="$HOME" PATH="$stub:/usr/bin:/bin:/usr/sbin:/sbin" QUOTA_STATUSLINE_ENABLED=false "$@" \
+      bash "$STARTCLI" --print-core-env 2>"$TMP/stderr"
+}
+# Direct routing as shipped: the switch comes from the skill manifest, not the environment.
+run_direct() {
   local stub="$1"; shift
   env -i HOME="$HOME" PATH="$stub:/usr/bin:/bin:/usr/sbin:/sbin" "$@" \
       bash "$STARTCLI" --print-core-env 2>"$TMP/stderr"
@@ -133,6 +150,62 @@ echo "$out" | grep -q "ANTHROPIC_BASE_URL"
 check $? "app-supervised + never-listener → core env stays unwired"
 grep -q "expected (proxy process running).*no proxy protection" "$TMP/stderr"
 check $? "app-supervised budget exhaustion warns instead of staying silent"
+
+# 10. Recorder on (the manifest default): a live proxy is not wired.
+out="$(run_direct "$TMP/live-bin")"
+echo "$out" | grep -q "ANTHROPIC_BASE_URL"
+[ $? -ne 0 ]
+check $? "recorder on: a live proxy listener is not forwarded (sessions go direct)"
+echo "$out" | grep -qx "QUOTA_STATUSLINE_ENABLED=true"
+check $? "recorder on: the switch reaches the session from the manifest"
+
+# 11. Recorder on: an inherited local-proxy URL (any loopback spelling) is dropped.
+for u in http://localhost:7846 http://127.0.0.1:7846/ "http://[::1]:7846"; do
+  out="$(run_direct "$TMP/live-bin" ANTHROPIC_BASE_URL="$u")"
+  echo "$out" | grep -q "ANTHROPIC_BASE_URL"
+  [ $? -ne 0 ]
+  check $? "recorder on: inherited $u is dropped"
+done
+
+# 12. Recorder on: an owner-set base URL that is not the local proxy is kept verbatim.
+out="$(run_direct "$TMP/live-bin" ANTHROPIC_BASE_URL=http://example.test:1)"
+echo "$out" | grep -qx "ANTHROPIC_BASE_URL=http://example.test:1"
+check $? "recorder on: a custom ANTHROPIC_BASE_URL is left alone"
+out="$(run_direct "$TMP/live-bin" ANTHROPIC_BASE_URL=http://localhost:7847)"
+echo "$out" | grep -qx "ANTHROPIC_BASE_URL=http://localhost:7847"
+check $? "recorder on: another local port is not the proxy and is kept"
+
+# 14. Opt-out: the first launch after the switch goes off is routed through the proxy again,
+#     decided at that launch (the proxy was never stopped, so its port is still served).
+out="$(run_direct "$TMP/live-bin")"
+echo "$out" | grep -q "ANTHROPIC_BASE_URL"
+[ $? -ne 0 ]
+check $? "before opt-out: the launch goes direct"
+out="$(run_direct "$TMP/live-bin" QUOTA_STATUSLINE_ENABLED=false)"
+echo "$out" | grep -qx "ANTHROPIC_BASE_URL=http://localhost:7846"
+check $? "first launch after opt-out: the proxy URL is set again"
+echo "$out" | grep -qx "QUOTA_STATUSLINE_ENABLED=false"
+check $? "first launch after opt-out: the session carries the switch as off"
+
+# 15. Always direct with tracking on, signed in or not: the launch never runs `claude auth status`
+#     (health-check's claude-sign-in row detects a dir that is not signed in and asks the owner).
+printf '#!/bin/sh\n[ "$1 $2" = "auth status" ] && echo called >> "%s/probe-calls"\necho '"'"'{"loggedIn": false}'"'"'\n' "$TMP" > "$TMP/out-bin/claude"
+rm -f "$TMP/probe-calls"
+out="$(run_direct "$TMP/out-bin")"
+echo "$out" | grep -q "ANTHROPIC_BASE_URL"
+[ $? -ne 0 ]
+check $? "recorder on, config dir not signed in: the launch still goes direct (no proxy fallback)"
+[ ! -e "$TMP/probe-calls" ]
+check $? "the launch path never runs the sign-in probe"
+
+# 13. The session itself drops a proxy URL its tmux server environment carries.
+. "$REPO/src/claude_routing.sh"
+got="$(ANTHROPIC_BASE_URL=http://localhost:7846 sh -c '. "$1"; shift; claude_unset_local_proxy; exec "$@"' sh "$REPO/src/claude_routing.sh" sh -c 'echo "${ANTHROPIC_BASE_URL-unset}"')"
+[ "$got" = "unset" ]
+check $? "session wrapper unsets an inherited local proxy URL"
+got="$(ANTHROPIC_BASE_URL=http://example.test:1 sh -c '. "$1"; shift; claude_unset_local_proxy; exec "$@"' sh "$REPO/src/claude_routing.sh" sh -c 'echo "${ANTHROPIC_BASE_URL-unset}"')"
+[ "$got" = "http://example.test:1" ]
+check $? "session wrapper keeps a custom base URL"
 
 echo
 if [ "$fail" -eq 0 ]; then echo "PASS — $pass checks green"; else echo "FAIL — $fail failed, $pass passed"; exit 1; fi

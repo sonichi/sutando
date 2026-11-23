@@ -510,7 +510,7 @@ def gather(workspace: Path, supervisor: Optional[dict], *, now: float, runtime: 
     return derive(
         supervisor, hold,
         _read_json(status_read_path("supervisor-status.json", workspace)),
-        qa.record_for_account(_read_json(status_read_path("quota-state.json", workspace)), account),
+        qa.record_for_account(qa.trusted_record(_read_json(status_read_path("quota-state.json", workspace))), account),
         cli_wedge.frame_abnormal(pane) if pane else None,
         now=now, prev=read(workspace, now), runtime=runtime, model=model,
         waiting_tasks=core_gate_notice.queued_count(workspace),
