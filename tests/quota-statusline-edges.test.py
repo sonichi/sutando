@@ -306,7 +306,7 @@ class SignedIn(Tmp):
         self.assertIs(self.csi.signed_in(env, self._runner(out='{"loggedIn": "true"}')), False)
         self.assertIs(self.csi.signed_in(env, self._runner(out='{"loggedIn": 1}')), False)
         self.assertIs(self.csi.signed_in(env, self._runner(out="garbage")), False)
-        self.assertIs(self.csi.signed_in(env, self._runner(exc=subprocess.TimeoutExpired("claude", 8))), False)
+        self.assertIsNone(self.csi.signed_in(env, self._runner(exc=subprocess.TimeoutExpired("claude", 8))))
         self.assertIsNone(self.csi.signed_in(env, self._runner(exc=FileNotFoundError())))
 
     def test_probe_env_is_the_panes_without_the_proxy(self):
@@ -361,6 +361,54 @@ class SignedIn(Tmp):
         self.assertIn("not found", row["detail"])
         self.assertEqual(self._results(), [])
         self.assertIn("no config dir to check", self.csi.check(self.ws, None, runner=self._runner())["detail"])
+
+    def test_a_timed_out_probe_is_unknown_and_sends_no_notice(self):
+        run = self._runner(exc=subprocess.TimeoutExpired("claude", 8))
+        row = self.csi.check(self.ws, str(self.core), runner=run, now=T0)
+        self.assertEqual(row["status"], "ok")
+        self.assertIn("timed out", row["detail"])
+        self.assertEqual(self._results(), [])
+        self.assertIsNone(self.csi.read_record(self.ws, str(self.core))["signed_in"])
+
+    def test_dirs_are_probed_concurrently_within_the_pool(self):
+        dirs = {}
+        for i in range(self.csi.POOL + 2):
+            d = self.d / f"w{i}"
+            d.mkdir()
+            dirs[os.path.realpath(d)] = {"PATH": "/bin"}
+        self.live.stop()
+        live = mock.patch.object(self.csi, "live_sessions", return_value=dirs)
+        live.start()
+        self.addCleanup(live.stop)
+        lock, state = threading.Lock(), {"now": 0, "max": 0}
+
+        def claude(cmd, **kw):
+            with lock:
+                state["now"] += 1
+                state["max"] = max(state["max"], state["now"])
+            time.sleep(0.2)
+            with lock:
+                state["now"] -= 1
+            return types.SimpleNamespace(returncode=0, stdout='{"loggedIn": true}')
+        row = self.csi.check(self.ws, None, runner=claude, now=T0)
+        self.assertEqual(row["status"], "ok")
+        self.assertGreater(state["max"], 1)
+        self.assertLessEqual(state["max"], self.csi.POOL)
+        self.assertEqual(len(row["detail"].split(", ")), len(dirs))
+
+    def test_old_notice_markers_are_pruned(self):
+        rec_dir = self.csi.record_path(self.ws, str(self.core)).parent
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        day = lambda ts: time.strftime("%Y%m%d", time.gmtime(ts))
+        old = rec_dir / f"abc-{day(T0 - 8 * 86400)}.notice"
+        recent = rec_dir / f"abc-{day(T0 - 2 * 86400)}.notice"
+        other = rec_dir / "abc.json"
+        for p in (old, recent, other):
+            p.write_text("")
+        self.csi.check(self.ws, str(self.core), runner=self._runner(), now=T0)
+        self.assertFalse(old.exists())
+        self.assertTrue(recent.exists())
+        self.assertTrue(other.exists())
 
     def test_an_unsigned_worker_dir_is_reported_while_the_core_is_signed_in(self):
         worker = self.d / "worker-ccd"
@@ -438,11 +486,55 @@ class SignedIn(Tmp):
             row = self.csi.check(self.ws, str(self.core), runner=self._runner(rc=1), now=T0)
         self.assertEqual(row["status"], "ok")
         self.assertEqual(self.calls, [])
+        bad = lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="maybe\n")
+        self.assertIsNone(self.csi.direct_routing_on(bad))
+        self.assertIsNone(self.csi.direct_routing_on(lambda *a, **k: types.SimpleNamespace(returncode=2, stdout="")))
+        self.assertIsNone(self.csi.direct_routing_on(lambda *a, **k: (_ for _ in ()).throw(OSError())))
+        import sutando_config
+        with mock.patch.object(sutando_config, "_find_repo_root", return_value=None):
+            self.assertIsNone(self.csi.direct_routing_on())
+
+    def test_routing_agrees_with_the_launch_predicate(self):
+        launch = ('. "$1/scripts/python-binary.sh"; PY="$(resolve_python "$1")"; REPO="$1"; '
+                  '. "$1/src/skill-manifest-config.sh"; . "$1/src/claude_routing.sh"; claude_direct_routing')
+        for value in (None, "", "false", "off", "true", "1"):
+            with self.subTest(value=value), mock.patch.dict(os.environ):
+                os.environ.pop("QUOTA_STATUSLINE_ENABLED", None)
+                if value is not None:
+                    os.environ["QUOTA_STATUSLINE_ENABLED"] = value
+                rc = subprocess.run(["/bin/bash", "-c", launch, "bash", str(ROOT)]).returncode
+                self.assertIs(self.csi.direct_routing_on(), rc == 0)
         with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": ""}):
-            self.assertTrue(self.csi.direct_routing_on())  # the shipped manifest default
-            import skill_roots
-            with mock.patch.object(skill_roots, "skill_roots", side_effect=RuntimeError):
-                self.assertFalse(self.csi.direct_routing_on())
+            self.assertIs(self.csi.direct_routing_on(), False)  # set but empty: the proxy, as the launch does
+
+    def test_proxy_in_use(self):
+        ns = types.SimpleNamespace
+        ps = lambda out: (lambda *a, **k: ns(returncode=0, stdout=out))
+        lsof = lambda rc, out="", err="": (lambda *a, **k: ns(returncode=rc, stdout=out, stderr=err))
+        routed = f"/opt/bin/claude --name w CLAUDE_CONFIG_DIR={self.core} ANTHROPIC_BASE_URL=http://localhost:7846\n"
+        direct = f"/opt/bin/claude --name w CLAUDE_CONFIG_DIR={self.core} PATH=/bin\n"
+        self.live.stop()
+        try:
+            self.assertIs(self.csi.proxy_in_use(ps(routed), lsof(1)), True)
+            self.assertIs(self.csi.proxy_in_use(ps(direct), lsof(0, "123\n")), True)
+            self.assertIs(self.csi.proxy_in_use(ps(direct), lsof(1)), False)
+            self.assertIsNone(self.csi.proxy_in_use(ps(direct), lsof(1, err="lsof: boom")))
+            self.assertIsNone(self.csi.proxy_in_use(ps(direct), lambda *a, **k: (_ for _ in ()).throw(OSError())))
+            self.assertIsNone(self.csi.proxy_in_use(lambda *a, **k: ns(returncode=1, stdout=""), lsof(1)))
+        finally:
+            self.live.start()
+
+    def test_a_failed_prune_never_stops_the_check(self):
+        rec_dir = self.csi.record_path(self.ws, str(self.core)).parent
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        old = rec_dir / f"abc-{time.strftime('%Y%m%d', time.gmtime(T0 - 30 * 86400))}.notice"
+        old.write_text("")
+        with mock.patch.object(Path, "unlink", side_effect=OSError):
+            self.csi.prune_notices(self.ws, T0)
+        self.assertTrue(old.exists())
+        with mock.patch.object(self.csi, "prune_notices", side_effect=OSError):
+            row = self.csi.check(self.ws, str(self.core), runner=self._runner(), now=T0)
+        self.assertEqual(row["status"], "ok")
 
     def test_a_failed_notice_or_record_write_still_reports(self):
         run = self._runner(rc=1)
