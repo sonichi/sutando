@@ -307,6 +307,24 @@ def test_a_standalone_bridge_tags_nothing():
         print("PASS test_a_standalone_bridge_tags_nothing")
 
 
+def test_an_unreadable_skills_tree_still_writes_the_task_untagged():
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+
+        class Unreadable(type(pathlib.Path())):
+            def glob(self, *_a, **_k):
+                raise PermissionError("skills tree unreadable")
+        real = m.agent_triggers.Path
+        m.agent_triggers.Path = Unreadable
+        try:
+            text = _written(m, _dm_task("task-1786000000860"))
+        finally:
+            m.agent_triggers.Path = real
+        assert not any(ln.startswith("playbook:") for ln in text.splitlines()), text
+        assert "Give me a quick tour. /tutorial" in m.local_task_protocol.parse_task_headers(text).body, text
+        print("PASS test_an_unreadable_skills_tree_still_writes_the_task_untagged")
+
+
 def test_a_broker_named_playbook_is_not_replaced():
     with tempfile.TemporaryDirectory() as d:
         m = _load(pathlib.Path(d))
@@ -339,6 +357,7 @@ if __name__ == "__main__":
     test_tutorial_tag_needs_the_owner_a_dm_and_a_line_of_its_own()
     test_the_bridge_injects_the_monorepo_skills_tree()
     test_a_standalone_bridge_tags_nothing()
+    test_an_unreadable_skills_tree_still_writes_the_task_untagged()
     test_a_broker_named_playbook_is_not_replaced()
     test_the_tagged_task_keeps_its_body()
     print("ALL PASS test_agent_trigger")

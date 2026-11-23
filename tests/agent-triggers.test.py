@@ -460,6 +460,18 @@ class PlaybookLines(unittest.TestCase):
                 raise AssertionError("manifests read for a body with no slash line")
         self.assertIsNone(at.owner_dm_playbook("Hi, give me a tour.", "owner", "dm", Boom("/nonexistent")))
 
+    def test_a_skills_tree_that_cannot_be_listed_tags_nothing(self):
+        class Unreadable(type(Path())):
+            def glob(self, *_a, **_k):
+                raise PermissionError("skills tree unreadable")
+        real = at.Path
+        at.Path = Unreadable
+        try:
+            self.assertEqual(at.playbook_lines(SKILLS), {})
+            self.assertIsNone(at.owner_dm_playbook("/tutorial", "owner", "dm", SKILLS))
+        finally:
+            at.Path = real
+
     def test_core_names_no_playbook_line(self):
         for copy in (SRC_COPY, VENDORED_COPY):
             text = Path(copy.__file__).read_text(encoding="utf-8")

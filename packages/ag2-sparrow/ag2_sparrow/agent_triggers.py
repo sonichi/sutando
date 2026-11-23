@@ -133,7 +133,11 @@ def playbook_lines(skills_root: Optional[Path]) -> dict:
     if skills_root is None:
         return {}
     found: dict = {}
-    for manifest in sorted(Path(skills_root).glob("*/manifest.json")):
+    try:
+        manifests = sorted(Path(skills_root).glob("*/manifest.json"))
+    except OSError:
+        return {}
+    for manifest in manifests:
         playbook = manifest.parent.name
         try:
             data = json.loads(manifest.read_text(encoding="utf-8"))
