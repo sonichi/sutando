@@ -31,6 +31,7 @@ import os
 import subprocess
 import sys
 import shutil
+import tempfile
 import threading
 from pathlib import Path
 from typing import Optional
@@ -57,27 +58,38 @@ def home(repo: Optional[Path] = None) -> Path:
 
 
 def owner_dm_task(task_file: Path, workspace: Optional[Path] = None) -> Optional[str]:
-    """None when this task may be told the owner's account; else why not."""
+    """None only when the task is attested as the owner's, from the owner's checked DM; else why not.
+
+    The same tests the owner's card taps pass (`agent_card.owner_may_act`, DM only): a missing or other
+    tier, a collaborator, a sender other than the connection's owner, or a room that is not that
+    connection's checked owner DM is refused, and so is anything that cannot be read."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from local_task_protocol import parse_task_headers
     try:
-        headers = parse_task_headers(Path(task_file).read_text(encoding="utf-8")).headers
-    except (OSError, ValueError) as exc:
-        return f"the task file cannot be read ({exc})"
-    tier = (headers.get("access_tier") or "owner").strip()
-    if tier != "owner":
-        return "the account is the owner's data; this task is not the owner's"
-    room = (headers.get("channel_id") or headers.get("source_room_id") or "").strip()
-    if not room:
-        return None
-    import owner_room_access
-    if workspace is None:
-        from workspace_default import resolve_workspace
-        workspace = resolve_workspace(migrate=False)
-    dm = owner_room_access.owner_dm(owner_room_access.owner_routing(Path(workspace)))
-    if dm and room == dm:
-        return None
-    return "asked in a room that is not the owner's DM; answer it in the owner's DM"
+        import agent_card
+        import connections
+        import local_task_protocol as ltp
+        text = Path(task_file).read_text(encoding="utf-8")
+        strict = ltp.parse_task_headers(text)
+        # Only the gateway writes task-mid files, and only those may be read past the `task:` line.
+        mid = (strict.headers.get("task_layout") or "").strip() == "mid"
+        headers = dict((ltp.parse_task_headers_trusted(text) if mid else strict).headers)
+        if workspace is None:
+            from workspace_default import resolve_workspace
+            workspace = resolve_workspace(migrate=False)
+        rows = connections.read_rows(Path(workspace))
+    except Exception as exc:  # noqa: BLE001 - anything unreadable refuses
+        return f"the task's origin cannot be checked ({type(exc).__name__})"
+    room = str(headers.get("channel_id") or "").strip()
+    for row in rows or []:
+        owner = str(row.get("owner_mxid") or "").strip()
+        try:
+            dm = connections.owner_dm(row, Path(workspace))
+        except Exception:  # noqa: BLE001 - a row without a readable DM attests nothing
+            continue
+        if owner and dm and room == dm:
+            why = agent_card.owner_may_act(headers, owner, dm_only=True)
+            return f"{why}; the account is the owner's data" if why else None
+    return "not asked in the owner's checked DM; the account is the owner's data"
 
 
 def _answer(account: dict, source: str) -> dict:
@@ -101,17 +113,54 @@ def launch_path(repo: Optional[Path] = None) -> str:
     return path or os.environ.get("PATH", "")
 
 
+# The files an `account/read` needs; the lookup reads copies of these and nothing else of the home.
+READ_FILES = ("auth.json", "config.toml")
+
+
+def _scratch_home(codex_home: Path) -> str:
+    """A private temporary CODEX_HOME holding copies of READ_FILES, so the app-server writes nothing
+    (sessions, logs, state, a refreshed token) into the running core's home."""
+    scratch = tempfile.mkdtemp(prefix="codex-account-")
+    for name in READ_FILES:
+        src = Path(codex_home) / name
+        if src.is_file():
+            dst = Path(scratch) / name
+            fd = os.open(str(dst), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(src.read_bytes())
+    return scratch
+
+
+def valid_account_result(r) -> bool:
+    """Only `{"account": null}` or an account object naming its type is an answer; anything else is unknown."""
+    if not isinstance(r, dict) or "account" not in r:
+        return False
+    account = r["account"]
+    return account is None or (isinstance(account, dict) and isinstance(account.get("type"), str)
+                               and bool(account["type"]))
+
+
 def from_app_server(codex_home: Path, codex: str = "codex", timeout: float = 20.0) -> Optional[dict]:
-    """The account by Codex's own `account/read`, None when the app-server cannot answer. A signed-out
-    home answers {"kind": None, ...} with no email."""
+    """The account by Codex's own `account/read`, None when the app-server cannot answer or answers
+    something malformed. Only an explicit `account: null` is a signed-out answer ({"kind": None})."""
     path = launch_path()
-    env = dict(os.environ, CODEX_HOME=str(codex_home), PATH=path)
     if os.sep not in codex:
         codex = shutil.which(codex, path=path) or codex
     try:
+        scratch = _scratch_home(Path(codex_home))
+    except OSError:
+        return None
+    try:
+        return _ask(codex, scratch, path, timeout)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _ask(codex: str, scratch: str, path: str, timeout: float) -> Optional[dict]:
+    env = dict(os.environ, CODEX_HOME=scratch, PATH=path)
+    try:
         p = subprocess.Popen([codex, "app-server", "--listen", "stdio://"], stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=env,
-                             cwd=str(codex_home) if Path(codex_home).is_dir() else None)
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=env, cwd=scratch)
     except OSError:
         return None
     result: dict = {}
@@ -137,7 +186,7 @@ def from_app_server(codex_home: Path, codex: str = "codex", timeout: float = 20.
                         if "error" in m:
                             return
                         if rid == 2:
-                            result["r"] = m.get("result") or {}
+                            result["r"] = m.get("result")
                         break
                 else:
                     return
@@ -158,9 +207,9 @@ def from_app_server(codex_home: Path, codex: str = "codex", timeout: float = 20.
         except (OSError, ValueError):  # pragma: no cover - a pipe already broken
             pass
     r = result.get("r")
-    if not isinstance(r, dict):
+    if not valid_account_result(r):
         return None
-    account = r.get("account")
+    account = r["account"]
     out = _answer(account if isinstance(account, dict) else {}, "app-server")
     out["verified"] = True
     return out
@@ -238,7 +287,7 @@ def main(argv=None) -> int:
             print(f"Not looked up: {why}.")
             return 3
     try:
-        where = Path(os.path.expanduser(a.codex_home)) if a.codex_home else home()
+        where = Path(os.path.abspath(os.path.expanduser(a.codex_home))) if a.codex_home else home()
     except NoHome as exc:
         print(f"No Codex home to read: {exc}.")
         return 1
