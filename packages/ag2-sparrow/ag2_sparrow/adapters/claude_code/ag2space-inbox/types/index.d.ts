@@ -14,6 +14,9 @@ export type KeptOffer = {
   submitted?: boolean
   // Its turn started and the confirmation is not through yet (the CLI asked for a retry).
   confirming?: { turnId: string; hash: string; completed?: string }
+  // Intake stopped waiting for it (its turn did not start, or its confirmation did not get through): its
+  // turn, should it still start, is confirmed; else the next start answers it.
+  unconfirmed?: boolean
 }
 
 declare module 'claude-code' {
