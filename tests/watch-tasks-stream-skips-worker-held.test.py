@@ -55,7 +55,7 @@ class CoreWatcher(unittest.TestCase):
     def hold(self, tid, attributed=True):
         folder = self.ws / "deliveries" / W
         folder.mkdir(parents=True, exist_ok=True)
-        (folder / f"{tid}.txt").touch()
+        (folder / f"{tid}.txt").write_text('{"delivered_at":1789600000.0,"ttl_s":14400}')
         if attributed:
             (self.ws / "state" / "attribution").mkdir(parents=True, exist_ok=True)
             (self.ws / "state" / "attribution" / tid).write_text(W + "\n")

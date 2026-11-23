@@ -5,7 +5,7 @@ Stage 1 of docs/worker-pool-design.md. A recipient — the core, or later a
 worker — receives work as *sentinels* in `deliveries/<recipient>/`:
 
     tasks/<task-id>.txt                      the payload; immutable, never copied
-    deliveries/<me>/<task-id>.txt            a sentinel; existing IS the assignment
+    deliveries/<me>/<task-id>.txt            a sentinel; existing IS the assignment, its content the lease
     deliveries/<me>/<task-id>.accepted       the same sentinel, suffix substituted
     deliveries/<me>/archive/<sentinel>       a finished task's sentinel, moved; never read as owed
 
@@ -72,6 +72,66 @@ _SENTINEL = re.compile(
 
 # RECIPIENT, the record layout and the record predicate are imported above:
 # the gateway bridge reads what this module writes, so both bind one contract.
+
+# The lease a sentinel carries: when the router delivered it and for how long that hand-off counts.
+LEASE_MANIFEST = Path(__file__).resolve().parents[1] / "manifest.json"
+LEASE_TTL_KEY = "WORKER_POOL_DELIVERY_TTL_S"
+LEASE_MODE_KEY = "WORKER_POOL_DELIVERY_EXPIRY"
+DEFAULT_LEASE_TTL_S = 4 * 3600
+LEASE_MODES = ("warn", "enforce")
+_MAX_LEASE_BYTES = 4096
+# Clock skew tolerated before a delivered_at in the future reads as implausible.
+_LEASE_FUTURE_SLACK_S = 5.0
+# Lease verdicts: only LEASE_LIVE is a current delegation.
+LEASE_LIVE, LEASE_EXPIRED, LEASE_LEGACY, LEASE_UNREADABLE = "live", "expired", "legacy", "unreadable"
+
+
+def lease_ttl_s(environ=None) -> int:
+    """Seconds a new delivery stays current (env > manifest); a missing or bad value is the default."""
+    import skill_config
+    try:
+        v = int(skill_config.config_value(LEASE_TTL_KEY, LEASE_MANIFEST, environ=environ))
+    except ValueError:
+        return DEFAULT_LEASE_TTL_S
+    return v if v > 0 else DEFAULT_LEASE_TTL_S
+
+
+def lease_mode(environ=None) -> str:
+    """"warn" or "enforce" (env > manifest); anything else is "warn"."""
+    import skill_config
+    v = skill_config.config_value(LEASE_MODE_KEY, LEASE_MANIFEST, environ=environ).lower()
+    return v if v in LEASE_MODES else "warn"
+
+
+def lease_body(now: float, ttl_s: int) -> bytes:
+    return json.dumps({"delivered_at": round(float(now), 3), "ttl_s": int(ttl_s)},
+                      separators=(",", ":")).encode("utf-8")
+
+
+def lease_verdict(path, now: float) -> tuple[str, str]:
+    """(verdict, detail) for the lease in the sentinel at `path`. An empty file is LEASE_LEGACY."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(_MAX_LEASE_BYTES + 1)
+    except OSError as e:
+        return LEASE_UNREADABLE, type(e).__name__
+    if not raw.strip():
+        return LEASE_LEGACY, "no lease"
+    try:
+        d = json.loads(raw.decode("utf-8")) if len(raw) <= _MAX_LEASE_BYTES else None
+        at, ttl = float(d["delivered_at"]), float(d["ttl_s"])
+    except (ValueError, TypeError, KeyError, UnicodeError):
+        return LEASE_UNREADABLE, "malformed lease"
+    if not (at == at and ttl == ttl) or ttl <= 0 or at - now > _LEASE_FUTURE_SLACK_S:
+        return LEASE_UNREADABLE, "implausible lease"
+    if now >= at + ttl:
+        return LEASE_EXPIRED, f"expired {int(now - at - ttl)}s ago"
+    return LEASE_LIVE, f"{int(at + ttl - now)}s left"
+
+
+def lease_allows(verdict: str, mode: str) -> bool:
+    """Warn mode allows every verdict; enforce allows only a live lease."""
+    return verdict == LEASE_LIVE or mode != "enforce"
 
 
 class NotDelivered(Exception):
