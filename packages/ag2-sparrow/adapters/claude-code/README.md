@@ -767,6 +767,8 @@ wait can report `unconfirmed` for a switch that lands later.
 
 **The account card.** `/account` or `/login` in the owner's DM, or a tap on the card, is also answered by `inbox claim` (`adapters/claude_code/account_card.py`, #6685's account card): the account Claude Code reports for the agent's own config dir (`claude auth status --json`; masked address and plan), and "Switch account". That button starts nothing here: a sign-in code never travels as a chat message, so it says where to switch (Settings in the S.space app, this agent's Connections card, Switch account), where the app runs `account --start` and takes the code in its own box. The owner's frame says the same, so the session never sends the owner to Claude's connector settings or asks for a code in chat.
 
+**Asked in words.** The owner need not type a command: the owner's frame tells the session to answer a question about its model or its account with exactly `[model-card]` or `[account-card]`, and `inbox stage` turns that answer into the card in the DM (`model_card.marked_answer`, #6685's `Desk.marked`), staging the card's no-send line instead; the first answer is kept in `state/card-marks/`, so a staging retry stages the same bytes and shows no second card. A mark from anyone but the owner is published as written, and outside the DM the answer says where to ask.
+
 `attach` is `tmux attach` on the adapter's own socket: the same session under the same lock, so a
 `/exit` typed there ends it and the launcher resumes it by id; `--help` states the limits.
 

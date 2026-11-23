@@ -5,8 +5,8 @@ const WATCH = 'mcp__ag2space-inbox__ag2space_inbox_watch'
 const REPLY = 'mcp__ag2space-inbox__ag2space_reply'
 const NOTE_START = 'Each item carries access_tier and collaborator from Sparrow'
 const AUDIENCE_START = "\nAudience: in any room other than your owner's own DM with you"
-const ACCOUNT_RULE = 'Account: your owner checks or switches the Anthropic account you run on by sending /account (or /login) in their DM with you; a card shows the account and says where to switch it (Settings in the S.space app, your Connections card, Switch account). Never ask them for a sign-in code in chat, and never send them to Claude\'s connector settings for it.'
-const MODEL_RULE = 'Model: your owner changes the model you run on by sending /model in their DM with you; a card with the choices appears and the switch needs no restart. If they ask you about changing models, tell them that. Never send them to a terminal for it.'
+const ACCOUNT_RULE = 'Account: if your owner asks which account you use, or to switch, change or sign in to another account, reply with exactly [account-card] and nothing else: a card shows the account and where to switch it. Never ask them for a sign-in code in chat, and never send them to Claude\'s connector settings for it.'
+const MODEL_RULE = 'Model: if your owner asks which model you run on, or to change, switch or choose it, reply with exactly [model-card] and nothing else: a card with the choices appears in their DM, and the switch needs no restart. Never send them to a terminal for it.'
 // What the CLI publishes for a restricted task it answered on the isolated turn (its body is the turn's reply).
 const ISOLATED_ANSWER = 'an isolated answer\n'
 const TASK = (id: string, tier = 'owner', extra = '') =>

@@ -79,21 +79,50 @@ def card_matter(root, task_id: str, cfg: dict, popen=subprocess.Popen, environ=N
     except Exception as e:  # noqa: BLE001 - a ledger that cannot take them leaves their taps refused, not a crash
         log("absorb failed:", "%s: %s" % (type(e).__name__, e))
     said: dict = {}
-
-    def publish(result_file, body):
-        said.update(body=body)
-
-    ms = switcher(root, cfg, publish=publish)
-    # The desk routes a tap, a stale tap, the owner's /model or /account (/login) to the card it names
-    # (card_desk, #6685): the model card here, the account card in account_card.
-    from . import account_card
-    owned = [ms] + account_card.cards(root, cfg, publish, log)
-    outcome = card_desk.Desk(root, publish, quoted, owned).task(path, os.path.join(root, "results", task_id + ".txt"))
+    outcome = desk(root, cfg, lambda result_file, body: said.update(body=body)).task(
+        path, os.path.join(root, "results", task_id + ".txt"))
     if not outcome:
         return "", ""
     if outcome == "model-picked":
         start_apply(root, popen, environ)
     return outcome, said.get("body") or model_switch.ANSWERED
+
+
+def desk(root, cfg: dict, publish) -> card_desk.Desk:
+    """This agent's cards behind #6685's desk: the model card here, the account card (account_card). The desk
+    routes a tap, a stale tap, the owner's /model or /account (/login), or the session's mark."""
+    from . import account_card
+    return card_desk.Desk(root, publish, quoted, [switcher(root, cfg, publish=publish)]
+                          + account_card.cards(root, cfg, publish, log))
+
+
+MARKED_DIR = "card-marks"
+
+
+def marked_answer(root, task_id: str, body: bytes, cfg: dict) -> "bytes | None":
+    """The answer to stage instead of `body` when the session answered its owner with a card's mark alone
+    ("[model-card]", "[account-card]"): the card is shown in their DM and the answer is its no-send line (or
+    where to ask, outside the DM). None for any other answer. The first answer is kept, so a staging retry
+    stages the same bytes and never shows the card twice."""
+    text = body.decode("utf-8", "replace").strip()
+    if text not in (model_switch.MARK, "[account-card]"):
+        return None
+    kept = records.state_dir(root) / MARKED_DIR / (task_id + ".txt")
+    if kept.is_file():
+        return kept.read_bytes()
+    path = os.path.join(root, "tasks", task_id + ".txt")
+    from ... import task_io
+    headers, _, _ = task_io.parse_task(path)
+    said: dict = {}
+    shown = desk(root, cfg, lambda result_file, out: said.update(body=out)).marked(
+        headers.get("access_tier"), path, "completed", text, os.path.join(root, "results", task_id + ".txt"))
+    if not shown:
+        return None
+    answer = (said.get("body") or model_switch.ANSWERED).encode("utf-8")
+    kept.parent.mkdir(parents=True, exist_ok=True)
+    kept.with_name(kept.name + ".tmp").write_bytes(answer)
+    os.replace(kept.with_name(kept.name + ".tmp"), kept)
+    return answer
 
 
 def start_apply(root, popen=subprocess.Popen, environ=None) -> None:

@@ -332,5 +332,56 @@ class Account(Base):
         out = []
         self.assertEqual(card.tapped("other", {}, str(self.results / "x.txt")), "account-unknown")
 
+
+class Marks(Account):
+    """The session answered its owner with a card's mark alone: the card is shown in their DM and the staged
+    answer is its no-send line, as Antigravity and Codex do; any other answer is staged as written."""
+
+    def test_the_model_mark_shows_the_menu_once_however_often_it_is_staged(self):
+        t = self.task("task-n", "which model are you on? can I change it?")
+        first = inbox.marked(self.root, t, b"[model-card]\n")
+        self.assertEqual(first, model_switch.ANSWERED.encode())
+        card, = [q["card"] for q in self.queued()]
+        self.assertEqual(card["id"], model_switch.CARD)
+        self.assertEqual(inbox.marked(self.root, t, b"[model-card]\n"), first, "a retry stages the same bytes")
+        self.assertEqual(len(self.queued()), 1, "and shows no second card")
+
+    def test_the_account_mark_shows_the_account_card(self):
+        t = self.task("task-q", "can you switch account?")
+        self.assertTrue(inbox.marked(self.root, t, b"  [account-card]  ").startswith(b"[no-send]"))
+        card, = [q["card"] for q in self.queued()]
+        self.assertIn("I'm signed in as s\u2026@example.com (max).", card["text"])
+
+    def test_any_other_answer_or_sender_is_staged_as_written(self):
+        t = self.task("task-x", "hi")
+        self.assertEqual(inbox.marked(self.root, t, b"hello [model-card]"), b"hello [model-card]")
+        c = self.task("task-cm", "model?", tier="team", extra="collaborator: true\n")
+        self.assertEqual(inbox.marked(self.root, c, b"[model-card]"), b"[model-card]", "not the owner: plain text")
+        r = self.task("task-rm", "model?", kind="room")
+        self.assertIn(b"direct message", inbox.marked(self.root, r, b"[model-card]"), "outside the DM: where to ask")
+        self.assertEqual(self.queued(), [])
+        with mock.patch.object(inbox.cm, "load_config_at", return_value=({}, "unreadable")):
+            self.assertEqual(inbox.marked(self.root, t, b"[model-card]"), b"[model-card]")
+        with mock.patch.object(model_card, "marked_answer", side_effect=RuntimeError("broken")):
+            self.assertEqual(inbox.marked(self.root, t, b"[model-card]"), b"[model-card]")
+
+    def test_stage_stages_the_cards_answer_in_place_of_the_mark(self):
+        seen = []
+
+        class Lc:
+            claims = mock.Mock()
+
+            def stage_result(self, task_id, body, turn_id):
+                seen.append(body)
+                return "staged"
+
+        with mock.patch.object(inbox, "_lifecycle", return_value=Lc()), \
+                mock.patch.object(inbox, "_claims_step", return_value=contextlib.nullcontext()), \
+                mock.patch.object(inbox, "_mirror", side_effect=lambda root, t, phase, out, extra=None: out), \
+                mock.patch.object(inbox, "marked", return_value=b"[no-send] the model card answers\n") as m:
+            inbox.stage(self.root, "task-s", "turn-1", b"[model-card]\n")
+        self.assertEqual(seen, [b"[no-send] the model card answers\n"])
+        m.assert_called_once_with(self.root, "task-s", b"[model-card]\n")
+
 if __name__ == "__main__":
     unittest.main()

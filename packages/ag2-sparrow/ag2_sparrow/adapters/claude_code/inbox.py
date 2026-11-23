@@ -589,7 +589,22 @@ def confirm(root, task_id, turn_id, nonce, hash_) -> dict:
     return _mirror(root, task_id, lifecycle.TURN_CONFIRMED, {"task_id": task_id, "turn_id": turn_id}, {"turn_id": turn_id})
 
 
+def marked(root, task_id, body: bytes, environ=None) -> bytes:
+    """`body`, or the answer that replaces it when the session answered its owner with a card's mark alone
+    (model_card.marked_answer: the card is shown instead). Any failure stages `body` as it is."""
+    try:
+        cfg, why = cm.load_config_at(LOCAL, _installed_config(environ))
+        if why:
+            return body
+        from . import model_card
+        return model_card.marked_answer(root, task_id, body, cfg) or body
+    except Exception as e:  # noqa: BLE001 - the mark is then published as the session wrote it
+        print("card mark not read for %s: %s: %s" % (task_id, type(e).__name__, e), file=sys.stderr)
+        return body
+
+
 def stage(root, task_id, turn_id, body: bytes) -> dict:
+    body = marked(root, task_id, body)
     lc = _lifecycle(root)
     with _claims_step(root, lc, task_id, "stage"):
         outcome = lc.stage_result(task_id, body, turn_id)
