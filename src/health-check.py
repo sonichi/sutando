@@ -1686,6 +1686,24 @@ def check_decision_card_clicks(workspace_dir: Optional[Path] = None) -> "dict | 
                        "`hitl_click: true` task (CLAUDE.md, Pending decisions)")}
 
 
+def check_task_event_handler(workspace_dir: Optional[Path] = None) -> "dict | None":
+    """FAIL when the declared task-event handler is gone: core's watcher then holds every task."""
+    from util_paths import task_event_handler_config_path  # noqa: PLC0415
+    cfg = task_event_handler_config_path((Path(workspace_dir) if workspace_dir else WORKSPACE_DIR) / "state")
+    if not cfg.exists() and not cfg.is_symlink():
+        return None
+    try:
+        handler = (json.loads(cfg.read_text(encoding="utf-8")) or {}).get("handler")
+    except (OSError, ValueError, AttributeError):
+        handler = None
+    if isinstance(handler, str) and handler and os.access(handler, os.X_OK):
+        return None
+    return {"name": "task-event-handler", "status": "fail",
+            "detail": (f"{cfg.name} names a handler that is missing or not executable ({handler!r}); "
+                       "the core watcher holds every new task until it is fixed. Re-publish it from "
+                       "the checkout that should route, or remove the file to let the core take every task")}
+
+
 def check_connections_primary(workspace_dir: Optional[Path] = None) -> "dict | None":
     """WARN when the connections record has rows but no primary, or a primary whose bridge has no
     proactive room yet; otherwise say so when the legacy row is not primary. None when all is plain."""
@@ -13599,6 +13617,10 @@ def run_all_checks() -> list[dict]:
     _card_clicks = check_decision_card_clicks()
     if _card_clicks:
         checks.append(_card_clicks)
+
+    _handler = check_task_event_handler()
+    if _handler:
+        checks.append(_handler)
 
     _no_primary = check_connections_primary()
     if _no_primary:
