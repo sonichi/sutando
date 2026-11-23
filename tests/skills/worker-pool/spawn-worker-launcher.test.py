@@ -346,6 +346,44 @@ class TestSpawn(Base):
         with self.assertRaisesRegex(sw.SpawnRefused, "the runtime launcher failed"):
             sw.spawn(self.ws, REPO, runner=LostButNothingThere(), require_sentinel=False)
 
+    def test_two_competing_codex_launches_are_serialized(self):
+        """A second spawn of the same worker while the first is inside its launcher is refused
+        before it registers a run or reaches a launcher, so the open run is the first's."""
+        wid = "f" * 32
+        wi.create_worker(self.ws, runtime="codex", worker_id=wid, cwd=str(REPO))
+        (first,) = wi.incarnations(self.ws, wid)
+        wi.end_incarnation(self.ws, wid, first["incarnation_id"], "crashed")
+        roster = {"workers": {wid: {"runtime": "codex"}}}
+        ws, seen = self.ws, {}
+
+        class CompetesDuringLaunch(FakeTmux):
+            def __call__(self, argv, **kw):
+                if argv[0] == "bash" and argv[1].endswith("launch-worker-session.sh") and not seen:
+                    seen["rows"] = len(wi.incarnations(ws, wid))
+                    try:
+                        sw.spawn(ws, REPO, runtime="codex", existing_worker_id=wid,
+                                 runner=FakeTmux(runtime="codex"), require_sentinel=False)
+                    except sw.SpawnRefused as e:
+                        seen["refused"] = str(e)
+                    seen["rows_after"] = len(wi.incarnations(ws, wid))
+                return super().__call__(argv, **kw)
+
+        t = CompetesDuringLaunch(runtime="codex")
+        with mock.patch.object(sw.pr, "load_roster", return_value=roster):
+            sw.spawn(self.ws, REPO, runtime="codex", existing_worker_id=wid,
+                     runner=t, require_sentinel=False)
+        self.assertIn("is in progress", seen["refused"])
+        self.assertEqual(seen["rows_after"], seen["rows"])
+        self.assertEqual(len(t.launches()), 1)
+        open_runs = [r for r in wi.incarnations(self.ws, wid) if r["ended_at"] is None]
+        self.assertEqual([r["incarnation_id"] for r in open_runs],
+                         [t.launches()[0]["SUTANDO_WORKER_INCARNATION_ID"]])
+
+    def test_the_launch_lock_is_released_after_a_spawn(self):
+        got = sw.spawn(self.ws, REPO, runner=FakeTmux(), require_sentinel=False)
+        with sw.launch_lock(self.ws, got["tmux"]["session_name"]):
+            pass
+
     def test_the_delivery_folder_matches_the_identity_record(self):
         """A record naming one id and a folder named another is a silent orphan."""
         got = sw.spawn(self.ws, REPO, runner=FakeTmux(), require_sentinel=False)
