@@ -229,15 +229,16 @@ class AccountSwitch:
             self.keep(self.pending(), owed)
         return owed
 
-    def finished(self, login, success, error="") -> str:
+    def finished(self, login, success, error="", note="") -> str:
         """The runtime reported a sign-in over: tell the owner, in the DM it was asked in, how it ended
-        and which account is in use now. '' for any report that does not name the sign-in in progress:
-        one without an id could be another sign-in's, and must not end this one."""
+        and which account is in use now, and after a sign-in that took the connector's `note` (e.g. that a
+        login shared with the core reaches it at its next restart). '' for any report that does not name
+        the sign-in in progress: one without an id could be another sign-in's, and must not end this one."""
         waiting = self.pending()
         if not waiting or not login or str(login) != waiting["id"]:
             return ""
         if success:
-            self.last_word(waiting, "done", "Signed in. %s" % self.using())
+            self.last_word(waiting, "done", " ".join(x for x in ("Signed in.", self.using(), note) if x))
             return "account-switched"
         why = " (%s)" % str(error)[:120] if error else ""
         self.last_word(waiting, "error", "The sign-in did not finish%s. %s" % (why, self.using()))
