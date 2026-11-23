@@ -55,9 +55,22 @@ STATUSLINE_SOURCE = "statusline"
 
 
 def from_statusline(record: Any) -> bool:
-    """Whether the record was written by Claude Code's own status line (src/quota_record.py):
-    it speaks for the login whatever the seat's routing, so no proxy is needed."""
-    return isinstance(record, dict) and record.get("source") == STATUSLINE_SOURCE
+    """Whether the record was written by Claude Code's own status line (src/quota_record.py) for
+    a known login: it speaks for that login whatever the seat's routing. Unbound ones are advisory."""
+    return (isinstance(record, dict) and record.get("source") == STATUSLINE_SOURCE
+            and isinstance(record.get("account"), str) and record["account"] not in ("", "unscoped"))
+
+
+def _rejected_since_observed(record: dict) -> bool:
+    """A 429 at or after the record's own observation: only a later observation clears it."""
+    checked = _parse_when(record.get("last_checked"))
+    ledger = record.get("recent_rejections")
+    for rej in ledger if isinstance(ledger, list) else []:
+        if isinstance(rej, dict) and rej.get("status") == 429:
+            at = _parse_when(rej.get("ts"))
+            if checked is None or at is None or at >= checked:
+                return True
+    return False
 
 
 def quota_windows(headers: dict) -> dict:
@@ -161,6 +174,8 @@ def availability_decision(
     routed = points_at_credential_proxy(base_url) or from_statusline(payload)
     limit_state = classify_limit_state(payload)
     accepted = resolve_available(str(status), payload.get("available"), headers, limit_state)
+    if from_statusline(payload) and _rejected_since_observed(payload):
+        accepted = False
     available = accepted and routed and not stale
     return {
         "available": available,

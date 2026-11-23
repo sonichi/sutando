@@ -154,18 +154,29 @@ def install(config_dir: str, on: bool) -> str:
             settings.setdefault("hooks", {}).setdefault("StopFailure", []).append(
                 {"matcher": "rate_limit", "hooks": [{"type": "command", "command": cmd}]})
     else:
+        restore = None
         if _is_ours(current):
-            saved = _read_json(saved_path)
-            if saved:
-                settings["statusLine"] = saved
+            restore = _read_json(saved_path)
+            if restore is None:
+                return "skipped: saved status line unreadable, kept"
+            if restore:
+                settings["statusLine"] = restore
             else:
                 del settings["statusLine"]
+        _strip_stop_hooks(settings)
+        if json.dumps(settings, sort_keys=True) == before:
+            return "unchanged"
+        _write_json(settings_path, settings)
+        # The backup is the only copy of the original until the restore is read back.
+        if restore and (_read_json(settings_path) or {}).get("statusLine") != restore:
+            return "skipped: restore not verified, saved status line kept"
+        if restore is not None:
             try:
                 saved_path.unlink()
             except OSError:
                 pass
-        _strip_stop_hooks(settings)
+        return "removed"
     if json.dumps(settings, sort_keys=True) == before:
         return "unchanged"
     _write_json(settings_path, settings)
-    return "installed" if on else "removed"
+    return "installed"

@@ -104,22 +104,41 @@ def _model(status: Any) -> str:
     return mid if isinstance(mid, str) else ""
 
 
-def _rejection_holds(prev: dict, windows: dict, now: float) -> bool:
-    """A StopFailure rejection stands until its window's reset passes, or a reply
-    shows every window under its limit with numbers that moved since the 429."""
-    if prev.get("rejected_by") != "stopfailure":
+def rejected_at(rec: Any) -> Optional[float]:
+    """When the record's standing rejection was observed (the latest of its stamps), else None."""
+    if not isinstance(rec, dict) or rec.get("limit_state") == "overage":
+        return None
+    headers = rec.get("headers") if isinstance(rec.get("headers"), dict) else {}
+    rejected = (rec.get("rejected_by") == "stopfailure" or rec.get("limit_state") == "rejected"
+                or headers.get(f"{P}status") == "rejected")
+    if not rejected:
+        return None
+    stamps = [_parse_iso(rec.get("exhausted_since"))]
+    if headers.get(f"{P}status") == "rejected":
+        stamps.append(_parse_iso(rec.get("last_checked")))
+    stamps += [_parse_iso(r.get("ts")) for r in _ledger(rec) if r.get("status") == 429]
+    known = [t for t in stamps if t is not None]
+    return max(known) if known else float("inf")
+
+
+def _rejection_holds(prev: dict, windows: dict, observed: float, bound: bool) -> bool:
+    """A rejection stands until this account itself observes, after the rejection, a reply
+    whose numbers moved with every window under its limit. Unbound records never clear one."""
+    since = rejected_at(prev)
+    if since is None:
         return False
-    until = _number(prev.get("rejected_until"))
-    if until is not None and now >= until:
-        return False
-    old = prev.get("headers") if isinstance(prev.get("headers"), dict) else {}
+    if not bound or not observed > since:
+        return True
+    old = prev.get("rejected_numbers")
+    if not isinstance(old, dict):
+        old = prev.get("headers") if isinstance(prev.get("headers"), dict) else {}
     moved = any(old.get(f"{P}{s}-utilization") != _fraction(u) or old.get(f"{P}{s}-reset") != str(int(r))
                 for s, (u, r) in windows.items())
     return not (moved and all(u < 100 for u, _r in windows.values()))
 
 
 def record_from_statusline(prev: Any, status: Any, observed_at: float,
-                           now: Optional[float] = None) -> Optional[dict]:
+                           now: Optional[float] = None, bound: bool = True) -> Optional[dict]:
     """The record one status line observation writes, or None for no write (no
     usable `rate_limits`, or older than the record on disk)."""
     prev = prev if isinstance(prev, dict) else {}
@@ -129,8 +148,7 @@ def record_from_statusline(prev: Any, status: Any, observed_at: float,
     checked = _parse_iso(prev.get("last_checked"))
     if checked is not None and observed_at < checked:
         return None
-    now = time.time() if now is None else now
-    held = _rejection_holds(prev, windows, now)
+    held = _rejection_holds(prev, windows, observed_at, bound)
     at = iso(observed_at)
     state: dict = {
         "available": not held,
@@ -149,7 +167,7 @@ def record_from_statusline(prev: Any, status: Any, observed_at: float,
         state[f"resets_at_{short}"] = iso(reset)
     state["limit_state"] = "rejected" if held else "allowed"
     if held:
-        for k in ("exhausted_since", "rejected_by", "rejected_until"):
+        for k in ("exhausted_since", "rejected_by", "rejected_until", "rejected_numbers"):
             if k in prev:
                 state[k] = prev[k]
     state["source"] = SOURCE
@@ -179,6 +197,8 @@ def record_with_rate_limit(prev: Any, at: float, detail: str = "") -> dict:
     state = {**prev, "headers": headers, "recent_rejections": ledger, "available": False,
              "limit_state": "rejected", "exhausted_since": iso(at), "rejected_by": "stopfailure"}
     state.pop("rejected_until", None)
+    state["rejected_numbers"] = {k: v for k, v in headers.items()
+                                 if k.endswith(("-utilization", "-reset"))}
     if best is not None:
         state["rejected_until"] = best[1]
     if not prev:
@@ -251,6 +271,7 @@ def _update(workspace, build, wait: float) -> bool:
 
 
 MAX_ACCOUNTS = 8
+UNBOUND = "unscoped"  # claude_account.account_key with no config dir
 _OWN_KEYS = ("accounts", "account")
 
 
@@ -292,7 +313,8 @@ def record_statusline(workspace, status: Any, now: Optional[float] = None,
     seen = observed_at(status, now)
     key, is_core = _who(config_dir, core_dir)
     return _update(workspace, lambda prev: route(
-        prev, key, is_core, lambda e: record_from_statusline(e, status, seen, now)), LOCK_WAIT_S)
+        prev, key, is_core,
+        lambda e: record_from_statusline(e, status, seen, now, bound=key != UNBOUND)), LOCK_WAIT_S)
 
 
 def record_rate_limit(workspace, now: Optional[float] = None, detail: str = "",

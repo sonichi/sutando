@@ -142,8 +142,10 @@ class Writer(Base):
         # The timer re-render with the same numbers before the reset keeps it rejected.
         self.sl(_status(five=98), now=T0 + 70)
         self.assertEqual(self.rec()["limit_state"], "rejected")
-        # After the 5h reset, the next write clears it.
+        # Unchanged numbers are no evidence, even after the reset; a later reply that moved is.
         self.sl(_status(five=98), now=T0 + 4 * 3600 + 1)
+        self.assertEqual(self.rec()["limit_state"], "rejected")
+        self.sl(_status(five=2), now=T0 + 4 * 3600 + 2)
         rec = self.rec()
         self.assertEqual(qa.classify_limit_state(rec), "allowed")
         self.assertTrue(rec["available"])
@@ -163,6 +165,34 @@ class Writer(Base):
             self.rl(now=T0 + i)
         self.assertEqual(len(self.rec()["recent_rejections"]), qr.MAX_RECENT_REJECTIONS)
 
+
+    def test_an_older_observation_never_clears_a_later_rejection(self):
+        self.sl(_status(five=40), now=T0)
+        self.rl(now=T0 + 100)
+        transcript = Path(self._tmp.name) / "t.jsonl"
+        transcript.write_text("")
+        os.utime(transcript, (T0 + 50, T0 + 50))
+        self.sl(dict(_status(five=3), transcript_path=str(transcript)), now=T0 + 200)
+        rec = qa.read_quota_record(self.ws, now=T0 + 210).payload
+        self.assertEqual(rec["limit_state"], "rejected")
+        self.assertFalse(qa.availability_decision(rec, base_url=None, stale=False)["available"])
+        self.sl(_status(five=3), now=T0 + 300)
+        self.assertEqual(self.rec()["limit_state"], "allowed")
+
+    def test_an_unbound_record_is_advisory_and_never_clears(self):
+        held = qr.record_with_rate_limit(qr.record_from_statusline({}, _status(five=40), T0), T0 + 10)
+        out = qr.record_from_statusline(held, _status(five=3), T0 + 20, bound=False)
+        self.assertEqual(out["limit_state"], "rejected")
+        allowed = qr.record_from_statusline({}, _status(), T0)
+        self.assertFalse(qa.from_statusline(allowed))
+        d = qa.availability_decision(allowed, base_url=None, stale=False)
+        self.assertEqual(d["unavailable_reason"], "not-routed")
+        self.assertTrue(qa.availability_decision(dict(allowed, account="abc"), base_url=None, stale=False)["available"])
+
+    def test_a_later_429_than_the_observation_blocks_the_reader(self):
+        rec = dict(qr.record_from_statusline({}, _status(), T0), account="abc")
+        rec["recent_rejections"] = [{"ts": qr.iso(T0 + 5), "status": 429}]
+        self.assertFalse(qa.availability_decision(rec, base_url=None, stale=False)["available"])
 
     def test_a_worker_on_another_account_never_touches_the_core(self):
         self.sl(_status(five=40), now=T0)
@@ -269,6 +299,41 @@ class Installer(Base):
         self.settings.write_text(json.dumps({"statusLine": {"type": "command", "command": "mine"}}))
         self.assertEqual(cfg.install(str(self.ccd), False), "unchanged")
 
+    def test_opt_out_keeps_the_backup_until_the_restore_is_read_back(self):
+        foreign = {"type": "command", "command": "~/bin/my-status"}
+        self.settings.write_text(json.dumps({"statusLine": foreign}))
+        cfg.install(str(self.ccd), True)
+        backup = self.ccd / cfg.PASSTHROUGH_FILE
+        real_write = cfg._write_json
+
+        def boom(path, data):
+            if Path(path).name == "settings.json":
+                raise OSError("disk full")
+            real_write(path, data)
+
+        with mock.patch.object(cfg, "_write_json", side_effect=boom):
+            with self.assertRaises(OSError):
+                cfg.install(str(self.ccd), False)
+        self.assertTrue(backup.exists())
+
+        def lossy(path, data):
+            real_write(path, {k: v for k, v in data.items() if k != "statusLine"}
+                       if Path(path).name == "settings.json" else data)
+
+        with mock.patch.object(cfg, "_write_json", side_effect=lossy):
+            self.assertIn("not verified", cfg.install(str(self.ccd), False))
+        self.assertTrue(backup.exists())
+        self.settings.write_text(json.dumps({"statusLine": {"type": "command", "command": cfg.hook_command(cfg.RECORDER)}}))
+        self.assertEqual(cfg.install(str(self.ccd), False), "removed")
+        self.assertEqual(json.loads(self.settings.read_text())["statusLine"], foreign)
+        self.assertFalse(backup.exists())
+
+    def test_unreadable_backup_keeps_the_recorder(self):
+        self.settings.write_text(json.dumps({"statusLine": {"type": "command", "command": cfg.hook_command(cfg.RECORDER)}}))
+        (self.ccd / cfg.PASSTHROUGH_FILE).write_text("{broken")
+        self.assertIn("unreadable", cfg.install(str(self.ccd), False))
+        self.assertIn(cfg.STATUS_MARK, json.loads(self.settings.read_text())["statusLine"]["command"])
+
     def test_unreadable_settings_are_left_alone(self):
         self.settings.write_text("{not json")
         self.assertTrue(cfg.install(str(self.ccd), True).startswith("skipped"))
@@ -299,6 +364,23 @@ class SessionConfigHooks(Base):
                       deadline=__import__("time").monotonic() + 30)
         self.assertEqual(out, [("a", 0), ("b", 3)])
         self.assertTrue((d / "seen").exists())
+
+    def test_a_timed_out_hook_and_its_children_are_killed_before_return(self):
+        d = Path(self._tmp.name)
+        late = d / "late-write"
+        hook = d / "slow.sh"
+        hook.write_text(f"(sleep 2; echo x > {late}) &\nsleep 30\n")
+        leaky = d / "leaky.sh"
+        leaky.write_text(f"(sleep 2; echo x > {late}.2) &\nexit 0\n")
+        t0 = __import__("time").monotonic()
+        with mock.patch.object(sch, "HOOK_SECONDS", 0.5):
+            out = sch.run([("slow", hook), ("leaky", leaky)], str(d), sys.executable,
+                          deadline=t0 + 30)
+        self.assertEqual(out, [("slow", None), ("leaky", 0)])
+        self.assertLess(__import__("time").monotonic() - t0, 10)
+        __import__("time").sleep(3)
+        self.assertFalse(late.exists())
+        self.assertFalse(Path(f"{late}.2").exists())
 
 
 class HealthCheck(Base):
