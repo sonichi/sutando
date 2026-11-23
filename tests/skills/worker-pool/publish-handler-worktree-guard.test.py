@@ -80,6 +80,29 @@ try:
     main.publish(ws)
     checks["a main checkout replaces a worktree's router"] = declared(ws) == str(main_router.resolve())
 
+    main_router.unlink()
+    main_router.mkdir()
+    main_router.chmod(0o755)
+    wt.publish(ws)
+    checks["an executable directory is not a live handler"] = declared(ws) == str(wt_router.resolve())
+    main_router.rmdir()
+    main_router.write_text("#!/bin/sh\n")
+    main_router.chmod(0o755)
+    main.publish(ws)
+
+    import contextlib
+    import io
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        wt.publish(ws)
+    checks["a kept handler is reported, naming both paths"] = (
+        str(main_router.resolve()) in err.getvalue() and str(wt_router.resolve()) in err.getvalue())
+
+    loose = tmp / "loose"
+    (loose / "router").mkdir(parents=True)
+    checks["a path with no .git above it is not a linked worktree"] = (
+        pr._in_linked_worktree(loose / "router") is False)
+
     fresh = tmp / "fresh"
     (fresh / "state").mkdir(parents=True)
     wt.publish(fresh)

@@ -12,9 +12,12 @@ isolate_os_environ()
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -50,6 +53,32 @@ class TaskEventHandlerCheck(unittest.TestCase):
         self.assertEqual(row["status"], "down")
         self.assertEqual(row["name"], "task-event-handler")
         self.assertIn("holds every new task", row["detail"])
+
+    def test_executable_directory_is_down(self):
+        d = self.ws / "router-dir"
+        d.mkdir()
+        d.chmod(0o755)
+        self.declare(str(d))
+        self.assertEqual(hc.check_task_event_handler(self.ws)["status"], "down")
+
+    def test_run_all_checks_carries_the_row(self):
+        row = {"name": "task-event-handler", "status": "down", "detail": "sentinel"}
+        with mock.patch.object(hc, "check_task_event_handler", return_value=row) as probe:
+            checks = hc.run_all_checks()
+        probe.assert_called_once_with()
+        self.assertIn(row, checks)
+
+    def test_watcher_lookup_refuses_an_executable_directory(self):
+        d = self.ws / "router-dir"
+        d.mkdir()
+        d.chmod(0o755)
+        self.declare(str(d))
+        lookup = REPO / "src" / "agent" / "task-event-handler-lookup.sh"
+        run = subprocess.run(
+            ["bash", "-c", 'source "$1"; read_task_event_handler_config "$2"', "_", str(lookup), str(self.cfg)],
+            capture_output=True, text=True, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")})
+        self.assertNotEqual(run.returncode, 0)
+        self.assertEqual(run.stdout, "")
 
     def test_unparseable_config_fails(self):
         self.cfg.write_text("{not json")

@@ -1696,10 +1696,10 @@ def check_task_event_handler(workspace_dir: Optional[Path] = None) -> "dict | No
         handler = (json.loads(cfg.read_text(encoding="utf-8")) or {}).get("handler")
     except (OSError, ValueError, AttributeError):
         handler = None
-    if isinstance(handler, str) and handler and os.access(handler, os.X_OK):
+    if isinstance(handler, str) and handler and os.path.isfile(handler) and os.access(handler, os.X_OK):
         return None
     return {"name": "task-event-handler", "status": "down",
-            "detail": (f"{cfg.name} names a handler that is missing or not executable ({handler!r}); "
+            "detail": (f"{cfg.name} names a handler that is missing or not an executable file ({handler!r}); "
                        "the core watcher holds every new task until it is fixed. Re-publish it from "
                        "the checkout that should route, or remove the file to let the core take every task")}
 

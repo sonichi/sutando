@@ -350,12 +350,12 @@ class HandlerPublishError(RosterError):
 
 
 def _live_declared_handler(cfg: Path) -> "str | None":
-    """The handler the config already names, if that file is still executable."""
+    """The handler the config already names, if it is still an executable regular file."""
     try:
         handler = (json.loads(cfg.read_text(encoding="utf-8")) or {}).get("handler")
     except (OSError, ValueError, AttributeError):
         return None
-    if isinstance(handler, str) and handler and os.access(handler, os.X_OK):
+    if isinstance(handler, str) and handler and os.path.isfile(handler) and os.access(handler, os.X_OK):
         return handler
     return None
 
@@ -386,6 +386,8 @@ def publish_task_event_handler(workspace):
     live = _live_declared_handler(cfg)
     if live and live != str(handler) and _in_linked_worktree(handler):
         # A worktree's copy would outlive nothing: when it is removed, core holds every task.
+        print(f"worker-pool: kept the live task-event handler {live}; a linked worktree does not "
+              f"replace it with {handler}", file=sys.stderr)
         return cfg
     try:
         _write_atomic(cfg, {"handler": str(handler)})

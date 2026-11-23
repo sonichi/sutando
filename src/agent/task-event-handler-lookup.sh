@@ -21,7 +21,7 @@ try:
         handler = (json.load(fh) or {}).get("handler")
 except (OSError, ValueError):
     sys.exit(1)
-if not isinstance(handler, str) or not handler or not os.access(handler, os.X_OK):
+if not isinstance(handler, str) or not handler or not os.path.isfile(handler) or not os.access(handler, os.X_OK):
     sys.exit(1)
 print(handler)
 ' "$cfg"
