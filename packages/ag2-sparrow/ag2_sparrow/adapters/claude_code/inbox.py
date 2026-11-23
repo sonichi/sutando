@@ -184,15 +184,19 @@ def claim_generation(root, task_id):
 
 
 def live_inflight(root, inflight) -> dict:
-    """The entries of the Mod's `inflight` that can be a turn of the session now running: a claim bound to the
-    consumer generation holding the root, or one that cannot be read. An entry whose claim is gone or belongs
-    to an earlier generation is left out: a restart never clears the Mod's record, and such an entry is no turn."""
+    """The entries of the Mod's `inflight` that can be a turn of the session now running. Left out are only
+    the ones known not to be: an entry with no claim, and one whose claim is bound to a consumer generation
+    other than the one holding the root (a restart never clears the Mod's record). Whatever cannot be told is
+    kept: a claim that cannot be read, and every claim while the holder itself is unknown or unreadable."""
     now = task_io.holder_consumer(root) or {}
     live = {}
     for task_id, entry in (inflight if isinstance(inflight, dict) else {}).items():
         gen = claim_generation(root, task_id)
-        if gen is not None and (not isinstance(gen, dict) or (
-                now.get("pid") and (gen.get("pid"), gen.get("start")) == (now.get("pid"), now.get("start")))):
+        if gen is None:
+            continue
+        stale = (isinstance(gen, dict) and now.get("pid") is not None
+                 and (gen.get("pid"), gen.get("start")) != (now.get("pid"), now.get("start")))
+        if not stale:
             live[task_id] = entry
     return live
 
