@@ -275,6 +275,32 @@ class ConnectorTest(unittest.TestCase):
         (told,) = self.post_queued("$card3")
         self.assertEqual(told["extra_content"]["space.ag2.card"]["text"], "Switched. I'm now using Claude Opus 4.6.")
 
+    def test_after_a_switch_the_model_in_use_is_the_one_turns_run_on_not_agys_advertised_default(self):
+        # agy advertises its default (currentModelId) on every session/new or load, before the turn's
+        # own session/set_model: the record must keep the model the turns actually run on.
+        (self.w.home / "models").write_text("")
+        (self.w.home / "models-on-load").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        state = lambda: json.loads((self.w.root / "state" / "model.json").read_text())
+        default = state()["current"]
+        self.dm_task("task-2", "/model")
+        self.w.serve()
+        (sent,) = self.post_queued()
+        said = sent["extra_content"]["space.ag2.card"]["buttons"][1]["reply"]
+        self.dm_task("task-3", said, reply_to="$card1", click=said)
+        self.w.serve()
+        self.post_queued("$card2")
+        picked = state()["wanted"]
+        self.assertNotEqual(picked, default)
+        for n in range(4, 7):
+            self.w.task("task-%d" % n, "STUB:TEXT turn %d" % n)
+            self.w.serve()
+            self.post_queued()
+            self.assertEqual(self.w.metrics()[-1]["model"], picked)
+            self.assertEqual(state()["current"], picked, "turn %d: the record names the model in use" % n)
+        self.assertGreaterEqual(len(self.set_model_calls()), 3, "every turn switches the Session again")
+
     def test_picking_the_model_already_in_use_says_so_at_once_and_nothing_is_switched_or_confirmed(self):
         (self.w.home / "models").write_text("")
         self.w.task("task-1", "STUB:TEXT hi")

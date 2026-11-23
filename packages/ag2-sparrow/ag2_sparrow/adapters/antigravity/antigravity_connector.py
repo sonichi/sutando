@@ -638,7 +638,12 @@ class Connector:
         offered = [{"id": str(m.get("modelId") or "")[:200], "name": str(m.get("name") or m.get("modelId") or "")[:80]}
                    for m in (models.get("availableModels") or []) if isinstance(m, dict) and m.get("modelId")]
         seen = {"available": offered, "current": str(models.get("currentModelId") or "")[:200]}
-        if {k: self.model_state().get(k) for k in seen} != seen:
+        state = self.model_state()
+        # A Session reports agy's default before this turn's session/set_model: while the owner's
+        # pick is in force, the model in use is the one turns run on (tell_model_outcome), not that.
+        if state.get("wanted") and state.get("told") == state.get("wanted"):
+            seen["current"] = str(state.get("current") or "")
+        if {k: state.get(k) for k in seen} != seen:
             self.save_model_state(**seen)
 
     def model_card(self, state: dict, picked: str = "", ran: "str | None" = None, same: bool = False):
@@ -779,6 +784,9 @@ class Connector:
         kept = state.get("untold")
         owed = [o for o in (kept if isinstance(kept, list) else [kept]) if isinstance(o, dict)]
         wanted, outcome, changes = str(state.get("wanted") or ""), "", {}
+        if wanted and state.get("told") == wanted and turn.live and turn.model and turn.model != state.get("current"):
+            # A pick already told: the model this owner turn ran on is the one in use.
+            changes = {"current": turn.model}
         if wanted and state.get("told") != wanted and turn.live:
             ran = turn.model or ""
             outcome = "switched" if ran == wanted else "not-switched"
