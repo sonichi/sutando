@@ -57,6 +57,15 @@ ALLOW: dict[str, "tuple[str, ...] | None"] = {
         "s.space task(s) need answers",
     ),
     # The product name s.space in prose a person or agent reads, never a host a caller acts on.
+    # Recovery cards and notices name the app the owner opens, never a host.
+    "src/core-input-watch.py": ("panel in the s.space app on the Mac it runs on",),
+    "src/core-supervisor-relay.py": (
+        "on its card in your s.space DM",
+        "Model in the s.space app picks a model",
+        "Model in the s.space app changes it",
+        "finishes in the s.space app on {host}",
+    ),
+    "src/core_crash_loop.py": ("stays stopped until the s.space app restarts on the Mac it runs on",),
     "src/policy/guardrail.py": (
         "\"s.space\", \"GUEST tier\"",
         "the s.space broker attests",
@@ -64,6 +73,9 @@ ALLOW: dict[str, "tuple[str, ...] | None"] = {
     "packages/ag2-sparrow/ag2_sparrow/team_guardrail.py": (
         "\"s.space\", \"GUEST tier\"",
         "the s.space broker attests",
+    ),
+    "packages/ag2-sparrow/ag2_sparrow/adapters/antigravity/antigravity_connector.py": (
+        "S.space tools didn't start this turn",
     ),
     "packages/ag2-sparrow/ag2_sparrow/adapters/claude_cloud_session/session_adapter.py": (
         "standing s.space instructions",

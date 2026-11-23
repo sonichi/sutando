@@ -6,7 +6,9 @@ action_id, guard}. This handler runs it through the Manager's two-layer stale
 gate and, when the chosen action is a TUI keystroke, hands the request to the
 runtime driver through <workspace>/state/hitl/actions/<hitl_id>.json — the
 desktop watchdog re-validates the guard against the live screen before it
-types anything. EventConsumer handler contract (claims / offer / last_path),
+types anything. A recovery action (hitl.recovery: retry, switch model, restart)
+goes to <workspace>/state/recovery/actions/<hitl_id>.json for the host monitor
+instead. EventConsumer handler contract (claims / offer / last_path),
 chain-compatible with the bridge's HandlerChain: it claims only what it
 recognises, only the configured owner resolves, and a rejected reply changes
 nothing. No owner configured => inert, fail-closed.
@@ -26,6 +28,7 @@ try:
 except ImportError:
     from local_task_protocol import reply_action_text     # the repo's src/ on sys.path
 
+from . import recovery
 from .manager import HitlManager
 from .schema import Action, ActionReply, HumanRequirement, MalformedActionError, StaleRequirementError, STATUS_IN_PROGRESS
 
@@ -134,6 +137,7 @@ class HitlReplyHandler:
         # AUTHORIZATION — the whole point: only the owner resolves.
         if not self._owner or actor != self._owner:
             self._log(f"hitl: action reply from non-owner {actor or '?'} ignored")
+            self._audit_not_owner(event, actor)
             return claimed
         reply = parse_reply(event)
         if reply is None:
@@ -149,6 +153,12 @@ class HitlReplyHandler:
             self.last_reason = str(reason)
             self._log(f"hitl: {reply.hitl_id} refused for {actor} — {reason}")
             return claimed
+        posted = self._recovery_room(reply.hitl_id)
+        if posted is not None and posted != reply.room:
+            self.last_outcome = "rejected"
+            self.last_reason = "a recovery card is answered only in the room it was posted in"
+            self._log(f"hitl: {reply.hitl_id} recovery tap from another room rejected")
+            return claimed
         try:
             action = self._manager.apply_action(reply)
         except (StaleRequirementError, MalformedActionError) as e:
@@ -157,6 +167,7 @@ class HitlReplyHandler:
                 self._log(f"hitl: reply for {reply.hitl_id} rejected — {e}")
                 self.last_outcome = "rejected"
                 self.last_reason = str(e)
+                self._stamp_stale(reply.hitl_id)
                 return claimed
             # The click was applied but the turn it asked for was never written (a death in
             # between): the redelivery is the same click, so the turn is still owed, not stale.
@@ -170,10 +181,68 @@ class HitlReplyHandler:
         if req is not None and getattr(req, "turn_on_action", False):
             self.last_turn = True
             note = "; a turn follows"
+        # A recovery id the card maps to a dialog option is a keystroke the monitor drives.
+        keyed = ((req.subject or {}).get("option_for_action") or {}) if req is not None else {}
         if action.kind == TUI_ACTION_KIND and self._workspace is not None and req is not None:
             note = f"; driver action {write_driver_action(self._workspace, req, action).name}"
+        elif (recovery.is_recovery(action.id) and action.kind == recovery.kind_of(action.id)
+              and action.id not in keyed and self._workspace is not None):
+            path = recovery.write_action(self._workspace, reply, actor, reply.room,
+                                         tapped_at=recovery.event_time(event))
+            note = f"; recovery action {path.name}"
         self._log(f"hitl: {reply.hitl_id} -> {action.id} by {actor} (in_progress{note})")
         return claimed
+
+    def _audit_not_owner(self, event: Dict[str, Any], actor: str) -> None:
+        """The owner's recovery audit gets the refusal, for a card this store holds tapped in the room
+        it was posted in; the card and the room are left alone. A typed label is a message, not a tap."""
+        if not self._owner or not actor or self._workspace is None or event.get("_typed"):
+            return
+        reply = parse_reply(event)
+        if reply is None:
+            return
+        try:
+            req = self._manager.get(reply.hitl_id)
+            if req is None:
+                return
+            posted = req.room or str(self._manager.store.projection(req.id).get("room_id") or "")
+            room = str(event.get("room_id") or "")
+            if not posted or room != posted:
+                self._log(f"hitl: non-owner tap on {req.id} outside its card's room not recorded")
+                return
+            aid = reply.action_id if any(a.id == reply.action_id for a in req.actions) else ""
+            done = recovery.audit_not_owner(self._workspace, req.id, aid, actor[:255], room)
+        except Exception as e:  # noqa: BLE001 — the refusal stands whether or not it is recorded
+            self._log(f"hitl: non-owner audit not written — {e}")
+            return
+        if done == recovery.NOT_RECORDED:
+            self._log(f"hitl: non-owner audit not written for {req.id}")
+
+    def _stamp_stale(self, hitl_id: str) -> None:
+        """A rejected tap on a still-open recovery card gets an answer on that card: a fresh revision
+        whose receipt says `stale`, so the tapping client shows "not run" instead of waiting. Only a
+        pending card: one already running a tap keeps that tap's outcome as its receipt."""
+        import time
+        from .schema import STATUS_PENDING
+        try:
+            with self._manager.store.locked():
+                cur = self._manager.get(hitl_id)
+                if cur is None or cur.status != STATUS_PENDING or not (cur.subject or {}).get("recovery"):
+                    return
+                cur.subject = {**(cur.subject or {}), "receipt": {"outcome": "stale", "at": int(time.time())}}
+                cur.revision += 1
+                cur.updated_at = time.time()
+                self._manager.store.save(cur)
+        except Exception as e:  # noqa: BLE001 — the rejection stands whether or not the card is edited
+            self._log(f"hitl: {hitl_id} stale receipt not written — {e}")
+
+    def _recovery_room(self, hitl_id: str) -> Optional[str]:
+        """For a recovery card, the room it was posted in ("" when no post is recorded, which no
+        room matches); None for any other card, whose own room rule applies."""
+        req = self._manager.get(hitl_id)
+        if req is None or not (req.subject or {}).get("recovery"):
+            return None
+        return req.room or str(self._manager.store.projection(hitl_id).get("room_id") or "")
 
     def _same_click_redelivered(self, reply: ActionReply):
         """The Action when `reply` is the click already applied to a turn-requesting requirement
@@ -228,6 +297,7 @@ class HitlReplyHandler:
         if action is None:
             return None  # a reply to the card that is not a click stays a message
         self.last_branch = "fallback"
+        base["_typed"] = True
         payload = {"hitl_id": req.id, "expected_revision": req.revision,
                    "action_id": action.id, "guard": req.guard}
         if note:

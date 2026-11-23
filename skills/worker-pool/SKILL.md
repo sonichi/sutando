@@ -20,7 +20,7 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `apply_profile_label_overrides.py` — apply an s.space profile's complete worker display-label map from JSON stdin with `--workspace W --profile-mxid M --config-version N`.
 - `worker_bootstrap.py` — a worker session's first-turn decision (worker vs core mode) from its env.
 - `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write. `set_worker_state` / `remove_worker` are its writers for a worker's lifecycle; `set_worker_plugin_dirs` writes a row's `plugin_dirs`.
-- `pool_manage.py` — stop, retire, re-enable, remove or reseat a worker, record its extra Claude plugin dirs, and bind or unbind a room (below).
+- `pool_manage.py` — stop, retire, re-enable, remove, reseat or retry (restart at once after a provider limit, on the owner's "retry now") a worker, record its extra Claude plugin dirs, and bind or unbind a room (below).
 - `pool_identity.py` — give a worker an s.space agent of its own, show it, rotate its token or remove it (below).
 - `pool_provision.py` — the local half of creating that agent without a pasted token: claim secret, redeem, retire (below).
 - `provision_e2e.py` — check that whole flow against one server, with a scan for leaked secrets (below).
@@ -87,6 +87,8 @@ python3 skills/worker-pool/scripts/pool_manage.py unbind <room id>
   owner restart (`pool_remedy --restart`), which resumes its conversation.
   With `--no-start` it only lifts them; the sweep's death ladder then restarts
   the dead session like any other, after its sustained ticks.
+  `retire` and `enable` on the same worker never overlap: whichever starts second
+  is refused while the other runs; run it again once that one ends.
 - `remove` drops a retired worker's roster row (same `--hand-off` rule), leaving
   its id in the roster's `removed` list so late deliveries stay fenced. Its
   records under `state/workers/<id>/` and its `deliveries/<id>/` folder stay as
@@ -179,7 +181,10 @@ creates that agent in AG2 Space, and its access token becomes a connection row n
 The core owns that identity's lifecycle and its lane; the worker's session uses it. From the worker's seat, room
 clients (`room_ops.py`, `notify.py`, the room-database adapters) act as the worker's own agent in rooms on its
 server, through the one resolver (`connections.acting_identity`, see `docs/connections.md`, "In a pool worker's
-session"). A task a core lane routed to the worker is still answered as the core's agent. The seat's
+session"). Identity comes from the task: pass `--task-file` when a post answers one. A task a core lane
+routed to the worker, which the worker holds and has not answered, is answered as the core's agent in that
+task's room; a task file that does not bind is refused. A post with no task is the worker's own, and a room no
+identity serves is refused, never sent with the shared token. The seat's
 `s-space` MCP tools mint as the worker's agent too: the launcher exports `AG2_MCP_WORKER_CREDENTIAL`, the
 argv of `scripts/connections.py worker-mcp-credential`, which hands the desktop's MCP proxy the worker's vault
 token in memory, or tells it `acts_as: core` for a worker with no enabled identity; with no resolver the proxy
@@ -204,7 +209,12 @@ The lane routes each task it queues itself (`pool_route_handler.py --from-lane -
 the task is its worker's when it reaches `tasks/` and the core's watcher, which never routes a held task, leaves it;
 see `docs/connections.md`, "In a pool worker's session".
 
-A worker with its own agent can be switched onto its own task and result folders
+A worker that gets its first own agent (a new worker's identity step, or `pool_identity.py add`, pasted or
+`--device-flow`) starts on its own task and result folders: the switch runs as soon as the agent is saved,
+before its lane starts, and moves anything already delivered to it. While it still owes a task it accepted, or
+if the move fails, it stays `dirs: "migrating"` on the shared folders until `migrate-dirs --apply` finishes it.
+`add --shared-dirs` opts out, only while something still reads that worker's work from the shared folders. A rotate keeps the worker's folders. A
+worker that already had its agent, or got it through `provision-*`, is switched by hand
 (`python3 src/worker_lane.py migrate-dirs --worker <id>` previews, `--apply` does it, `--undo --apply` switches back; then respawn it): its lane
 queues straight into `<workspace>/agents/<segment>/tasks`, nothing is routed through `deliveries/<id>/`, and
 its session answers in that folder's `results/`; see `docs/connections.md`, "A worker on its own folders".
@@ -467,7 +477,11 @@ python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --to <label|id|
 
 - `--who` lists `core` and each worker as `name (full worker_id)`, with bound
   rooms and session liveness; `(you)` marks the caller. It shows the base routing
-  alias separately when an s.space display override differs.
+  alias separately when an s.space display override differs. `agent=` is the one
+  s.space agent id each one's session uses (the core's primary row, a worker's first
+  identity row); a recipient with lanes on two homeservers has other ids not shown.
+  `(none)` without an identity row, `unavailable` when the record cannot be read;
+  `agent_mxid` in `--json`.
 - `--to X --ask "..."` writes `tasks/<task id>.txt` with `source: pool-ask`,
   `requested_worker: <id>` (never for the core, which is the default recipient) and
   `reply_to_instance: <asker>`, then routes it. A worker finds it in its inbox like

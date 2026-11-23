@@ -51,6 +51,46 @@ def points_at_credential_proxy(base_url: "str | None") -> bool:
     )
 
 
+STATUSLINE_SOURCE = "statusline"
+
+
+_CURRENT = object()
+
+
+def from_statusline(record: Any, account: Any = _CURRENT) -> bool:
+    """Whether the record was written by Claude Code's own status line (src/quota_record.py) for
+    the account the core is signed in to now (`account`; default: read from its config dir).
+    Only then does it speak for the core whatever the seat's routing; otherwise it is advisory."""
+    if not isinstance(record, dict) or record.get("source") != STATUSLINE_SOURCE:
+        return False
+    if account is _CURRENT:
+        from claude_account import core_account
+        account = core_account()
+    return isinstance(account, str) and bool(account) and record.get("account") == account
+
+
+def trusted_record(record: Any, account: Any = _CURRENT) -> Optional[dict]:
+    """The record a decision may use: a proxy record as before; a status line record only
+    when it is the core's current login's (`from_statusline`); else None."""
+    if not isinstance(record, dict):
+        return None
+    if record.get("source") == STATUSLINE_SOURCE and not from_statusline(record, account):
+        return None
+    return record
+
+
+def _rejected_since_observed(record: dict) -> bool:
+    """A 429 at or after the record's own observation: only a later observation clears it."""
+    checked = _parse_when(record.get("last_checked"))
+    ledger = record.get("recent_rejections")
+    for rej in ledger if isinstance(ledger, list) else []:
+        if isinstance(rej, dict) and rej.get("status") == 429:
+            at = _parse_when(rej.get("ts"))
+            if checked is None or at is None or at >= checked:
+                return True
+    return False
+
+
 def quota_windows(headers: dict) -> dict:
     """Every window the proxy reported, keyed by window, as (utilization or None,
     that window's own status or None). A window is named by its `-utilization`
@@ -146,12 +186,17 @@ def availability_decision(
 ) -> dict[str, Any]:
     """Return the one authoritative routed/fresh/accepted quota decision."""
     payload = quota if isinstance(quota, dict) else {}
+    statusline = payload.get("source") == STATUSLINE_SOURCE
+    verified = statusline and from_statusline(payload)
     headers = payload.get("headers")
     headers = headers if isinstance(headers, dict) else {}
     status = headers.get("anthropic-ratelimit-unified-status", "unknown")
-    routed = points_at_credential_proxy(base_url)
+    # A status line record speaks for its own login only, whatever the proxy URL says.
+    routed = verified if statusline else points_at_credential_proxy(base_url)
     limit_state = classify_limit_state(payload)
     accepted = resolve_available(str(status), payload.get("available"), headers, limit_state)
+    if verified and _rejected_since_observed(payload):
+        accepted = False
     available = accepted and routed and not stale
     return {
         "available": available,
