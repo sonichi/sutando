@@ -73,6 +73,8 @@ RECEIPT_OUTCOMES = ("done", "refused", "stale", "failed")
 REVIVE_EXHAUSTED = "revive_exhausted"
 REASONS = (REVIVE_EXHAUSTED,)
 REVIVE_FILE = "core-revive.json"
+#: When this monitor last saw the core up: a give-up from before it is an outage that ended.
+LAST_UP_FILE = "core-last-up.json"
 
 MAX_ACTIONS = 8
 MAX_SWITCH_MODELS = 6
@@ -504,7 +506,8 @@ def revive_exhausted(workspace: Path, now: float, supervisor_status: Optional[di
     """Whether the running desktop app's core revive loop has given up (state/core-revive.json).
     The marker counts only as that app's own: it names an app session, the supervisor's status
     names the same one under a fresh heartbeat, and it is not stamped in the future. A marker left
-    by an app that quit, crashed or was replaced is not the current app giving up."""
+    by an app that quit, crashed or was replaced is not the current app giving up, and neither is
+    one from before this monitor last saw the core up (an outage that ended, its marker left behind)."""
     rec = _read_json(status_read_path(REVIVE_FILE, Path(workspace)))
     if not rec or rec.get("v") != VERSION or rec.get("state") != "exhausted":
         return False
@@ -513,8 +516,26 @@ def revive_exhausted(workspace: Path, now: float, supervisor_status: Optional[di
         _read_json(status_read_path("supervisor-status.json", Path(workspace)))
     beat = status.get("heartbeatAt") if isinstance(status, dict) else None
     live = isinstance(beat, (int, float)) and not isinstance(beat, bool) and 0 <= now - beat / 1000.0 <= APP_BEAT_FRESH_S
+    up = last_up(workspace)
     return bool(live and isinstance(session, str) and session and status.get("appSessionId") == session
-                and since is not None and since <= now)
+                and since is not None and since <= now and (up is None or since > up))
+
+
+def last_up(workspace: Path) -> Optional[int]:
+    """When the monitor last saw the core running or idle (state/core-last-up.json), else None."""
+    rec = _read_json(status_read_path(LAST_UP_FILE, Path(workspace)))
+    return _int(rec.get("at")) if rec and rec.get("v") == VERSION else None
+
+
+def note_up(workspace: Path, record: Optional[dict], now: float) -> bool:
+    """Stamp the core as up when `record` says so, at most once per REFRESH_S; True when written."""
+    if not record or record.get("state") not in ("running", "idle"):
+        return False
+    seen = last_up(workspace)
+    if seen is not None and 0 <= now - seen < REFRESH_S:
+        return False
+    write_status(LAST_UP_FILE, {"v": VERSION, "at": int(now)}, workspace=Path(workspace))
+    return True
 
 
 def runtimes_on_host() -> tuple:
@@ -562,7 +583,9 @@ def update(workspace: Path, supervisor: Optional[dict], *, runtime: Optional[str
     """One monitor tick: gather, derive and publish. Never raises: the monitor must keep ticking."""
     at = time.time() if now is None else now
     try:
-        return publish(workspace, gather(workspace, supervisor, now=at, runtime=runtime, pane=pane), at)
+        record = gather(workspace, supervisor, now=at, runtime=runtime, pane=pane)
+        note_up(workspace, record, at)
+        return publish(workspace, record, at)
     except Exception as exc:  # noqa: BLE001
         print(f"core-recovery record not written: {type(exc).__name__}: {exc}", file=sys.stderr)
         return False

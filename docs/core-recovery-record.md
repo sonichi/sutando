@@ -18,7 +18,7 @@ does not write it. `derive()` is pure and folds records other modules already ke
 | `state/quota-state.json` | the credential proxy |
 | the pane's abnormal text | `cli_wedge.frame_abnormal` |
 | `state/session-starts.log` | the core launchers (launches on this host in the last 10 minutes) |
-| `state/core-revive.json` | the desktop app's core revive loop: `{"v": 1, "state": "exhausted", "since", "attempts", "appSessionId"}` once it has spent its revive budget; removed when the core is up again and when the loop starts. Read only as the running app's own: `appSessionId` must equal `supervisor-status.json`'s under a heartbeat at most 60 s old, and `since` must not be in the future. A marker left by an app that quit or was replaced is ignored |
+| `state/core-revive.json` | the desktop app's core revive loop: `{"v": 1, "state": "exhausted", "since", "attempts", "appSessionId"}` once it has spent its revive budget; removed when the core is up again and when the loop starts. Read only as the running app's own: `appSessionId` must equal `supervisor-status.json`'s under a heartbeat at most 60 s old, and `since` must not be in the future. A marker left by an app that quit or was replaced is ignored, and so is one stamped before the monitor last saw the core up (`state/core-last-up.json`, written by `core_recovery_state.note_up` at most once a minute while the core is running or idle): a give-up from an outage that ended, whose removal failed, is never reused by the next crash |
 
 The file is written atomically (`workspace_default.write_status`), at once on a change and every
 60 s while unchanged, so its age says whether the monitor still runs. A reader treats a record
