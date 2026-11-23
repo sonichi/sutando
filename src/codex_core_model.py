@@ -166,11 +166,13 @@ def confirm(state_dir, model: str, rev: int) -> bool:
 
 
 def started(state_dir, model: str, rev: int, now: Optional[float] = None) -> bool:
-    """Record that a turn is running on the pending pick `rev` (Codex took turn/start with it): from
-    here `in_use` names it. False when the record has moved on. The pick stays pending."""
+    """Record that a turn is running on `model`, the pick of revision `rev` (Codex took turn/start
+    with it): from here `in_use` names it. The turn is what is recorded, not the pick: a newer pick
+    saved while turn/start was being answered does not make this turn run on anything else, so the
+    mark is written whatever is pending now. False for no record, or a model or revision that is none."""
     with _locked(state_dir):
         rec = read_record(state_dir)
-        if not rec or _rev(rec) != rev or rec.get("status") != "pending" or rec.get("model") != model:
+        if not rec or not valid(model) or not isinstance(rev, int) or rev <= 0:
             return False
         rec["running"] = {"model": model, "rev": rev, "ts": time.time() if now is None else now}
         _write(state_dir, rec)

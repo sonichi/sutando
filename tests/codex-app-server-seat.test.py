@@ -988,6 +988,37 @@ class CoreModelSwitch(SeatCase):
         self.assertEqual((after["status"], after["model"], after["confirmed"], ccm.in_use(after)),
                          ("pending", "gpt-newer", "gpt-new", "gpt-new"), "Codex did run gpt-new; gpt-newer is next")
 
+    def test_a_pick_saved_before_codex_answers_turn_start_does_not_hide_what_the_turn_runs_on(self):
+        ccm = seat_mod.codex_core_model
+        self.switch("gpt-old", accepted=True)
+        s = self.launched(1, model="gpt-old")
+        self.switch("gpt-new")
+        self.task("task-1.txt")
+        seen = []
+        choose = s.turn_model
+
+        def choosing():
+            model = choose()                    # the seat has chosen gpt-new and is about to send turn/start
+            if model and not seen:
+                seen.append(model)
+                self.switch("gpt-newer")        # the owner picks again before Codex has answered it
+            return model
+        s.turn_model = choosing
+        mid = []
+        settle = s.settle_model
+
+        def settle_seeing(accepted, reason=""):
+            mid.append(self.record())
+            return settle(accepted, reason)
+        s.settle_model = settle_seeing
+        self.assertEqual(s.serve(once=True), 0)
+        self.assertEqual(seen, ["gpt-new"])
+        self.assertEqual([r["params"].get("model") for r in self.sent("turn/start")], ["gpt-new"])
+        (during,) = mid
+        self.assertEqual((ccm.in_use(during), during["model"], ccm.working(during)), ("gpt-new", "gpt-newer", "gpt-old"))
+        self.assertNotIn("running", self.record())
+        self.assertEqual(self.record()["confirmed"], "gpt-new")
+
     def test_a_turn_on_the_pick_that_ends_with_no_verdict_clears_the_mark_and_so_does_a_seats_start(self):
         ccm = seat_mod.codex_core_model
         self.switch("gpt-old", accepted=True)

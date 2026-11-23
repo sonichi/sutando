@@ -73,8 +73,9 @@ class Record(Case):
         rec = ccm.save(self.state, "gpt-b", applied="next-turn", accepted=False)
         read = lambda: ccm.read_record(self.state)
         self.assertEqual(ccm.in_use(read()), "gpt-a", "saved and not started: still the working model")
-        self.assertFalse(ccm.started(self.state, "gpt-b", rec["rev"] - 1), "an older revision marks nothing")
-        self.assertFalse(ccm.started(self.state, "gpt-c", rec["rev"]), "nor another model")
+        self.assertFalse(ccm.started(self.state, "gpt-b", 0), "a revision that is none marks nothing")
+        self.assertFalse(ccm.started(self.state, "sonnet", rec["rev"]), "nor a name that is no Codex model")
+        self.assertFalse(ccm.started(self.root / "no-record", "gpt-b", 1), "nor anything without a record")
         self.assertTrue(ccm.started(self.state, "gpt-b", rec["rev"], now=1000.0))
         self.assertEqual((ccm.in_use(read(), now=1010.0), ccm.working(read()), ccm.pending(self.state)[0]),
                          ("gpt-b", "gpt-a", "gpt-b"), "running on the pick; still pending, still launched on gpt-a")
@@ -94,7 +95,15 @@ class Record(Case):
         self.assertTrue(ccm.started(self.state, "gpt-b", rec["rev"]))
         ccm.resolve(self.state, rec["rev"], True)
         self.assertEqual((ccm.in_use(read()), read()["working"], "running" in read()), ("gpt-b", "gpt-b", False))
-        self.assertFalse(ccm.started(self.state, "gpt-b", rec["rev"]), "a settled pick is not pending")
+        # A newer pick saved while Codex was still answering turn/start for an older one: Codex took the
+        # older, and that is what the turn runs on. The mark is the turn's, whatever is pending by then.
+        raced = ccm.save(self.state, "gpt-x", applied="next-turn", accepted=False)
+        beat = ccm.save(self.state, "gpt-y", applied="next-turn", accepted=False)
+        self.assertTrue(ccm.started(self.state, "gpt-x", raced["rev"]), "recorded though gpt-y is the pick now")
+        self.assertEqual((ccm.in_use(read()), ccm.pending(self.state), ccm.working(read())),
+                         ("gpt-x", ("gpt-y", beat["rev"]), "gpt-b"))
+        self.assertTrue(ccm.stopped(self.state, raced["rev"]))
+        ccm.resolve(self.state, beat["rev"], False, "refused")
         # A second pick saved while the first trial's turn is still running: that turn is on the first
         # pick, and says so; the second is what is pending; a restart would still launch on gpt-b.
         first = ccm.save(self.state, "gpt-c", applied="next-turn", accepted=False)

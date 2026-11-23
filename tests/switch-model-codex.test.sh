@@ -51,11 +51,18 @@ M=$(python3 "$HERE/src/codex_core_model.py" current --state-dir "$T/state"); [ -
 python3 "$HERE/src/codex_core_model.py" save --state-dir "$T/state" --model gpt-6.2-sol --applied next-turn --accepted > /dev/null
 rc=$(TMUX_PANES="$SEAT" run gpt-6.2-astra)
 rc=$(TMUX_PANES="$SEAT" run gpt-6-luna)
-[ "$rc" = 12 ] && grep -q "pending model=gpt-6-luna (the core is on gpt-6.2-sol)" "$T/err" && grep -q "until then it stays on gpt-6.2-sol;" "$T/err" \
+[ "$rc" = 12 ] && grep -q "pending model=gpt-6-luna (the core is on gpt-6.2-sol now)" "$T/err" && ! grep -q "stays on" "$T/err" \
   && ! grep -q "astra" "$T/err" && ok "12 a pending pick over a pending pick: the text says the working model, never the untaken pick" || fail "12" "rc=$rc $(cat "$T/err")"
+# A task is running on luna (the seat's mark): asked for terra, the text names luna as what the core is on.
+REV=$(python3 -c "import json;print(json.load(open('$T/state/model-switch.json'))['rev'])")
+python3 -c "import sys;sys.path.insert(0,'$HERE/src');import codex_core_model as c;assert c.started('$T/state','gpt-6-luna',$REV)"
+rc=$(TMUX_PANES="$SEAT" run gpt-5.6-terra)
+[ "$rc" = 12 ] && grep -q "(the core is on gpt-6-luna now)" "$T/err" && grep -q "a task already running is not changed" "$T/err" \
+  && ok "15 with a task running on a pick, that pick is what the core is said to be on" || fail "15" "rc=$rc $(cat "$T/err")"
+python3 -c "import sys;sys.path.insert(0,'$HERE/src');import codex_core_model as c;c.stopped('$T/state')"
 rc=$(TMUX_PANES="$TUI" run gpt-5.6-terra)
 [ "$rc" = 11 ] && grep -q "(the core is on gpt-6.2-sol)" "$T/err" && ok "13 the TUI's text names the working model too" || fail "13" "rc=$rc $(cat "$T/err")"
 rm -f "$T/state/model-switch.json"; rc=$(run gpt-5.6-luna)
 [ "$rc" = 13 ] && grep -q "(the core was last on its launch model)" "$T/err" && ok "14 with no record, it says the launch model rather than a dash" || fail "14" "rc=$rc $(cat "$T/err")"
 
-echo; [ $fails -eq 0 ] && echo "switch-model-codex: all 14 checks pass" || { echo "switch-model-codex: $fails FAILED"; exit 1; }
+echo; [ $fails -eq 0 ] && echo "switch-model-codex: all 15 checks pass" || { echo "switch-model-codex: $fails FAILED"; exit 1; }

@@ -80,10 +80,11 @@ if [ "$RUNTIME" = "codex" ]; then
     OUT="$("$PY" "$REPO/src/codex_core_model.py" save --state-dir "$STATE_DIR" --model "$MODEL" --applied next-start)"
   fi
   case "$OUT" in OK*) ;; *) echo "switch-model: could not record the Codex core's model ($STATE_DIR): ${OUT#FAILED }; nothing changed" >&2; exit 1;; esac
-  # What the core is on until the pick is taken: the last model Codex took, not the last pick saved.
-  ON="$("$PY" "$REPO/src/codex_core_model.py" working --state-dir "$STATE_DIR" 2>/dev/null)"; ON="${ON:-its launch model}"
+  # What the core is on: the model of the task a seat is running now (a pick under trial), else the last
+  # model Codex took. Never the last pick saved, which Codex may not have taken.
+  ON="$("$PY" "$REPO/src/codex_core_model.py" in-use --state-dir "$STATE_DIR" 2>/dev/null)"; ON="${ON:-its launch model}"
   case "$WHERE" in
-    seat) echo "switch-model: pending model=$MODEL (the core is on $ON): saved, not switched yet; the Codex core's app-server seat tries it on its next task and says when Codex has taken or refused it; until then it stays on $ON; pool workers keep their own model; record: $STATE_DIR/model-switch.json" >&2; exit 12;;
+    seat) echo "switch-model: pending model=$MODEL (the core is on $ON now): saved, not switched yet; the Codex core's app-server seat tries it on its next task and says when Codex has taken or refused it; a task already running is not changed; pool workers keep their own model; record: $STATE_DIR/model-switch.json" >&2; exit 12;;
     tui) echo "switch-model: saved model=$MODEL (the core is on $ON) for the Codex core's next start; the running Codex TUI keeps its model until then (owner-gated restart: bash src/agent/codex/cli/start-cli.sh --restart); pool workers keep their own model; record: $STATE_DIR/model-switch.json" >&2; exit 11;;
     *) echo "switch-model: saved model=$MODEL (the core was last on $ON); applies at the next core start (no Codex core is running), not switched yet; pool workers keep their own model; record: $STATE_DIR/model-switch.json" >&2; exit 13;;
   esac
