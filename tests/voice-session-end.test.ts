@@ -141,6 +141,38 @@ describe('the session-end task', () => {
 		assert.match(parsed.SUTANDO_VOICE_CALL_END_INSTRUCTION, /\[no-send\]/);
 		assert.equal(r.stdout, `${parsed.SUTANDO_VOICE_CALL_END_INSTRUCTION}|after`);
 		assert.equal(parsed.B, 'after');
+		// The example itself holds nothing bash would expand inside double quotes.
+		assert.doesNotMatch(line.slice(line.indexOf('=') + 1), /[$`\\]/);
+	});
+
+	// Both loaders, as startup and voice-agent run them: bash `set -a; source` and dotenv's parse.
+	const loadBoth = (name: string, valueSource: string) => {
+		const file = join(TMP, `${name}.env`);
+		const text = `SUTANDO_VOICE_CALL_END_INSTRUCTION=${valueSource}\n`;
+		writeFileSync(file, text);
+		const r = spawnSync('bash', ['-c', 'set -e; set -a; source "$1"; set +a; printf "%s" "$SUTANDO_VOICE_CALL_END_INSTRUCTION"', '_', file], {
+			encoding: 'utf-8', env: { PATH: process.env.PATH ?? '/usr/bin:/bin' },
+		});
+		assert.equal(r.status, 0, `bash could not source ${valueSource}: ${r.stderr}`);
+		return { bash: r.stdout, dotenv: parseDotenv(text).SUTANDO_VOICE_CALL_END_INSTRUCTION };
+	};
+
+	it('single quotes keep $, ` and \\ literal in both startup\'s bash source and dotenv', () => {
+		const literal = 'Pay $5 by `noon`, path C:\\x. Else [no-send].';
+		const { bash, dotenv } = loadBoth('single-quoted', `'${literal}'`);
+		assert.equal(bash, literal);
+		assert.equal(dotenv, literal);
+	});
+
+	it('in double quotes bash expands a $ that dotenv keeps, and .env.example says what to use instead', () => {
+		const { bash, dotenv } = loadBoth('double-quoted-dollar', '"Pay $5 now."');
+		assert.equal(dotenv, 'Pay $5 now.');
+		assert.notEqual(bash, dotenv, 'bash expands $5 inside double quotes');
+		const example = readFileSync(join(import.meta.dirname, '..', '.env.example'), 'utf-8');
+		const at = example.indexOf('# SUTANDO_VOICE_CALL_END_INSTRUCTION=');
+		const block = example.slice(example.lastIndexOf('\n\n', at), at);
+		assert.match(block, /single quotes/, '.env.example names single quotes for text with $, ` or \\');
+		assert.match(block, /host's environment/, '.env.example names the host environment for text with both');
 	});
 
 	it('a long session keeps its end', () => {
