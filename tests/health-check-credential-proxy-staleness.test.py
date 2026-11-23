@@ -25,6 +25,7 @@ from _helpers.hermetic_env import isolate_os_environ
 isolate_os_environ()
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -102,8 +103,13 @@ class CredentialProxyStalenessTests(unittest.TestCase):
                 cmd, 0, stdout=_lstart(self.proc_start) + "\n", stderr="")
         return _REAL_RUN(cmd, *args, **kwargs)
 
-    def _check(self, port_status="ok", pids=FAKE_PID + "\n"):
+    def _check(self, port_status="ok", pids=FAKE_PID + "\n", direct=False, in_use=False):
         self.pids = pids
+        import claude_signed_in
+        for name, value in (("direct_routing_on", direct), ("proxy_in_use", in_use)):
+            p = patch.object(claude_signed_in, name, return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
         port_check = {"name": "credential-proxy", "status": port_status,
                       "detail": "listening" if port_status == "ok" else "not listening"}
         with patch.object(hc, "check_port", return_value=port_check), \
@@ -121,6 +127,29 @@ class CredentialProxyStalenessTests(unittest.TestCase):
         _set_mtime(self.artifact, self.proc_start - 3600)
         check = self._check()
         self.assertEqual(check["status"], "ok")
+
+    def test_stale_proxy_is_informational_when_sessions_route_direct(self):
+        check = self._check(direct=True)
+        self.assertEqual(check["status"], "ok")
+        self.assertIn("unused", check["detail"])
+        self.assertIn("restart needed", check["detail"])
+
+    def test_exhausted_unused_proxy_is_informational_when_sessions_route_direct(self):
+        _set_mtime(self.artifact, self.proc_start - 3600)
+        (self.repo / "state").mkdir(exist_ok=True)
+        (self.repo / "state" / "quota-state.json").write_text(json.dumps({
+            "credential_state": "exhausted", "credential_state_detail": "401",
+            "credential_state_at": datetime.fromtimestamp(self.now).astimezone().isoformat()}))
+        self.assertEqual(self._check()["status"], "warn")
+        check = self._check(direct=True)
+        self.assertEqual(check["status"], "ok")
+        self.assertIn("exhausted", check["detail"])
+
+    def test_a_proxy_still_in_use_or_unknown_keeps_the_issue(self):
+        for in_use in (True, None):
+            with self.subTest(in_use=in_use):
+                self.assertEqual(self._check(direct=True, in_use=in_use)["status"], "stale")
+        self.assertEqual(self._check(direct=None)["status"], "stale")
 
     # ---- (b)/(c) what the call site passes ---------------------------------
     def test_bundled_proxy_passes_the_artifact(self):

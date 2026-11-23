@@ -135,6 +135,33 @@ def _sutando_runtime_profile():
 # Like the recovery record: the core's lanes carry the core's profile, a pool worker's lane none.
 _SUTANDO_RUNTIME_PROFILE_READER = None if _OWN_DIRS else _sutando_runtime_profile
 
+_QUOTA_TRACKER_MANIFEST = _REPO / "skills" / "quota-tracker" / "manifest.json"
+
+
+def _sutando_quota_status():
+    """The core's quota block (src/quota_status.py); a Codex core has none."""
+    import core_recovery_state
+    import quota_status
+    return quota_status.read(WS, runtime=core_recovery_state.recorded_runtime(WS))
+
+
+def _sutando_quota_status_reader():
+    """The debounced reader, or None; a broken quota module costs the block, never the start."""
+    try:
+        import skill_config
+        if _OWN_DIRS or not skill_config.enabled("QUOTA_STATUS_PUBLISH", _QUOTA_TRACKER_MANIFEST):
+            return None
+        import quota_status
+        return quota_status.Debounced(_sutando_quota_status)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[remote-gateway-bridge] quota status off: {type(exc).__name__}: {exc}",
+              file=sys.stderr, flush=True)
+        return None
+
+
+# Like the recovery record, the core's lanes only; off without quota-tracker or with its switch off.
+_SUTANDO_QUOTA_STATUS_READER = _sutando_quota_status_reader()
+
 # Logged recovery commands name the workspace through its resolver, never its absolute path.
 _SUTANDO_WORKSPACE_RESOLVER = "bash scripts/sutando-config.sh workspace"
 

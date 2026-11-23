@@ -4622,18 +4622,40 @@ def _runtime_profile() -> "dict | None":
     return None
 
 
+# The core's Claude quota (quota_status.v1) for the agent sidebar, through the adapter's injected
+# reader, which debounces it; like the recovery block, absent on a standalone sparrow.
+_QUOTA_STATUS_READER = globals().get("_SUTANDO_QUOTA_STATUS_READER")
+QUOTA_STATUS_CAPABILITY = "quota_status.v1"
+QUOTA_STATUS_MAX_BYTES = 1024
+_quota_status_refused_until = 0.0
+
+
+def _quota_status() -> "dict | None":
+    """The adapter's quota block when it has one and it fits the bound, else None. Never raises."""
+    if not callable(_QUOTA_STATUS_READER) or time.time() < _quota_status_refused_until:
+        return None
+    try:
+        block = _QUOTA_STATUS_READER()
+        if isinstance(block, dict) and len(json.dumps(block)) <= QUOTA_STATUS_MAX_BYTES:
+            return block
+    except Exception:  # noqa: BLE001 -- the block is advisory; the beat goes out without it
+        pass
+    return None
+
+
 def _profile_key(profile: "dict | None") -> "str | None":
     return None if profile is None else json.dumps({k: v for k, v in profile.items() if k != "reported_at"},
                                                    sort_keys=True)
 
 
 def _send_heartbeat(payload: dict, base: "dict | None") -> tuple:
-    """POST the beat; a 400/422 drops the newest optional block first (the profile), then recovery."""
-    global _core_recovery_refused_until, _runtime_profile_refused_until
+    """POST the beat; a 400/422 drops the profile first, then the recovery and quota blocks."""
+    global _core_recovery_refused_until, _runtime_profile_refused_until, _quota_status_refused_until
     while True:
         try:
             return _req("POST", "/v1/heartbeat", payload, timeout=10), payload
         except urllib.error.HTTPError as e:
+            extra = [k for k in ("recovery", "quota") if k in (payload.get("health") or {})]
             if e.code not in (400, 422):
                 raise
             if "runtime_profile" in payload:
@@ -4641,16 +4663,27 @@ def _send_heartbeat(payload: dict, base: "dict | None") -> tuple:
                 _log(f"heartbeat refused with {RUNTIME_PROFILE_CAPABILITY}: HTTP {e.code} — sending without it")
                 payload = {k: v for k, v in payload.items() if k != "runtime_profile"}
                 payload["capabilities"] = [c for c in payload["capabilities"] if c != RUNTIME_PROFILE_CAPABILITY]
-            elif "recovery" in (payload.get("health") or {}):
-                _core_recovery_refused_until = time.time() + CORE_RECOVERY_REFUSED_BACKOFF_S
-                _log(f"heartbeat refused with the recovery block: HTTP {e.code} — sending without it")
-                drop = {CORE_RECOVERY_CAPABILITY} | (set() if base is not None else {"worker_health.v1"})
+            elif extra:
+                if "recovery" in extra:
+                    _core_recovery_refused_until = time.time() + CORE_RECOVERY_REFUSED_BACKOFF_S
+                if "quota" in extra:
+                    _quota_status_refused_until = time.time() + CORE_RECOVERY_REFUSED_BACKOFF_S
+                _log(f"heartbeat refused with the {' and '.join(extra)} block: HTTP {e.code} — sending without it")
+                drop = ({CORE_RECOVERY_CAPABILITY, QUOTA_STATUS_CAPABILITY}
+                        | (set() if base is not None else {"worker_health.v1"}))
                 payload = {k: v for k, v in payload.items() if k != "health"}
                 payload["capabilities"] = [c for c in payload["capabilities"] if c not in drop]
                 if base is not None:
                     payload["health"] = base
             else:
                 raise
+
+
+def _with_quota(health: "dict | None") -> "dict | None":
+    block = _quota_status()
+    if block is None:
+        return health
+    return {**(health or {"alive": None, "motion": "unknown"}), "quota": block}
 
 
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
@@ -4668,7 +4701,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
               if _HEALTH_COMMAND else _core_health(_health_snapshot()))
     core_health = health
     base = _diagnostic_health(health)
-    health = _with_recovery(base)
+    health = _with_quota(_with_recovery(base))
     changed = health is not None and health != _last_core_health
     due = force or changed or now - _last_heartbeat_at >= HEARTBEAT_INTERVAL
     if not due and now - _runtime_profile_checked_at < RUNTIME_PROFILE_CHECK_S:
@@ -4703,6 +4736,8 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             payload["capabilities"].append("worker_health.v1")
             if "recovery" in health:
                 payload["capabilities"].append(CORE_RECOVERY_CAPABILITY)
+            if "quota" in health:
+                payload["capabilities"].append(QUOTA_STATUS_CAPABILITY)
         if profile is not None:
             payload["runtime_profile"] = profile
             payload["capabilities"].append(RUNTIME_PROFILE_CAPABILITY)
