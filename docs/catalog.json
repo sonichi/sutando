@@ -106,7 +106,7 @@
    ],
    "status": "active",
    "canonical_for": "Codex core setup, earned-reset policy, and rollback",
-   "last_verified": "2026-11-10"
+   "last_verified": "2026-11-22"
   },
   "docs/community-use-cases/README.md": {
    "title": "Community use cases",
@@ -267,7 +267,7 @@
    ],
    "status": "canonical",
    "canonical_for": "remote gateway wire protocol",
-   "last_verified": "2026-11-21"
+   "last_verified": "2026-11-22"
   },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",
@@ -360,7 +360,7 @@
    ],
    "status": "canonical",
    "canonical_for": "test coverage policy",
-   "last_verified": "2026-11-17"
+   "last_verified": "2026-11-22"
   },
   "docs/tutorial-delivery.md": {
    "title": "Tutorial delivery",
@@ -391,7 +391,7 @@
    ],
    "status": "canonical",
    "canonical_for": "workspace configuration and resolver APIs",
-   "last_verified": "2026-11-03"
+   "last_verified": "2026-11-22"
   },
   "docs/workspace-contract.md": {
    "title": "Workspace contract",
@@ -617,7 +617,7 @@
    ],
    "status": "canonical",
    "canonical_for": "the core recovery record state/core-recovery.json: its states, fields, bounds, runtimes, single writer and the core_recovery.v1 contract fixtures",
-   "last_verified": "2026-11-21"
+   "last_verified": "2026-11-22"
   }
  }
 }

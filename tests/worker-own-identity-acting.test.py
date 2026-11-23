@@ -8,8 +8,10 @@ uses it. `connections.acting_identity` is the one rule, reached by every room cl
 - In the worker's session a room on its agent's server resolves to the worker's own row, its
   token (the vault's) and its agent. The core's session, another worker's session and a room on
   another server never do.
-- A room local state says is the core's stays the core's: one where only a core lane has a task
-  open, and a core lane's own owner DM.
+- Identity comes from the task: a reply posts as the agent the task was addressed to, only in the
+  task's own room; a core agent only for a task this worker holds that is still open. A task file
+  that does not bind is refused. An unprompted post is the worker's own, except in a core lane's
+  own owner DM. A room nothing serves is refused, never sent with the shared token.
 - room_ops and task-progress send that worker's bearer, with no change of their own.
 - A task's rows in the local activity log name the agent the task is answered as, so a reader
   need not assume every row is the core's.
@@ -46,6 +48,7 @@ sys.modules["vault_intercept"] = _FAKE_VI
 
 import _gateway
 import activity_rows
+import task_envelope
 import channel_env_resolve
 import connections as C
 
@@ -127,8 +130,11 @@ class TheWorkersSession(Base):
         self.assertEqual(self.instance(ROOM, SEAT), OWN)
         self.assertIsNone(self.instance(ROOM, CORE_ENV))
 
-    def test_a_room_on_another_server_is_the_core_rows(self):
-        self.assertEqual(self.instance(BETA_ROOM, SEAT), "beta")
+    def test_an_unprompted_post_on_a_server_it_has_no_identity_on_is_refused_never_the_cores(self):
+        with self.assertRaises(C.NoConnectionForRoom) as cm:
+            C.connection_for_room(BETA_ROOM, self.ws, SEAT)
+        self.assertIn("no identity of its own", str(cm.exception))
+        self.assertEqual(self.instance(BETA_ROOM, CORE_ENV), "beta")
 
     def test_a_disconnected_identity_answers_through_the_cores(self):
         self.record(rows(disabled=True))
@@ -155,32 +161,228 @@ class NeverSomeoneElses(Base):
             self.assertIn(SEAT_VAR, (scripts / launcher).read_text(), launcher)
 
 
-class TheCoresRooms(Base):
-    def test_a_task_only_a_core_lane_holds_is_answered_as_the_core(self):
-        self.open_task("alpha", ROOM)
-        self.assertEqual(self.instance(ROOM, SEAT), "alpha")
+def write_task(ws, tid, room, agent="", folder="tasks", stamped=True):
+    """A task file as the gateway writes it: HMAC-stamped with the workspace's key unless `stamped` is False."""
+    path = ws / folder / f"{tid}.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    recv = f"receiving_instance: {agent}\n" if agent else ""
+    text = f"id: {tid}\n{recv}channel_id: {room}\nsource: ag2space\ntask: hi\n"
+    path.write_text(task_envelope.stamp_text(text, ws) if stamped else text)
+    return path
 
-    def test_a_task_its_own_lane_holds_is_its_own_whatever_the_core_holds(self):
+
+class TaskCase(Base):
+    def deliver(self, tid, worker=W):
+        d = self.ws / "deliveries" / worker
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{tid}.txt").write_text("")
+
+    def via(self, room, environ, task_file):
+        r = C.connection_for_room(room, self.ws, environ, task_file)
+        return None if r is None else r["instance"]
+
+    def refused(self, room, task_file, environ=SEAT):
+        with self.assertRaises(C.NoConnectionForRoom) as cm:
+            C.connection_for_room(room, self.ws, environ, task_file)
+        return str(cm.exception)
+
+
+class IdentityComesFromTheTask(TaskCase):
+    """Which lane once handled a room never decides: its task ledger outlives every task in it."""
+
+    def test_its_own_task_is_its_own_even_where_a_stale_core_entry_names_the_room(self):
         self.open_task("alpha", ROOM)
-        self.open_task(OWN, ROOM)
+        own = write_task(self.ws, f"task-{OWN}~abc123", ROOM, OWN_AGENT)
+        self.assertEqual(self.via(ROOM, SEAT, own), OWN)
         self.assertEqual(self.instance(ROOM, SEAT), OWN)
 
+    def test_its_own_task_in_another_room_is_refused(self):
+        own = write_task(self.ws, f"task-{OWN}~abc123", ROOM, OWN_AGENT)
+        self.assertIn("not the task's room", self.refused(CORE_DM, own))
+
+    def test_a_core_task_delivered_to_it_is_answered_as_the_core(self):
+        core = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+        self.deliver("task-abc123")
+        self.assertEqual(self.via(ROOM, SEAT, core), "alpha")
+        beta = write_task(self.ws, "task-beta~def456", BETA_ROOM, BETA_AGENT)
+        self.deliver("task-beta~def456")
+        self.assertEqual(self.via(BETA_ROOM, SEAT, beta), "beta")
+
+    def test_a_core_task_is_the_cores_row_even_with_one_core_connection(self):
+        self.record([r for r in rows() if r["instance"] != "beta"])
+        core = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+        self.deliver("task-abc123")
+        self.assertEqual(C.room_credential(ROOM, workspace=self.ws, environ=SEAT, task_file=core),
+                         (ALPHA, ALPHA + "|core-secret"))
+
+    def test_a_forged_core_header_in_a_task_it_does_not_hold_is_refused(self):
+        forged = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+        self.assertIn("does not hold", self.refused(ROOM, forged))
+        self.deliver("task-abc123", worker=OTHER_W)
+        self.assertIn("does not hold", self.refused(ROOM, forged))
+        scratch = write_task(self.ws, "task-abc999", ROOM, CORE_AGENT, folder="scratch")
+        self.deliver("task-abc999")
+        self.assertIn("does not hold", self.refused(ROOM, scratch))
+
+    def test_an_unsigned_or_tampered_core_task_is_refused(self):
+        unsigned = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT, stamped=False)
+        self.deliver("task-abc123")
+        self.assertIn("it is unsigned", self.refused(ROOM, unsigned))
+        tampered = write_task(self.ws, "task-abc124", ROOM, CORE_AGENT)
+        self.deliver("task-abc124")
+        tampered.write_text(tampered.read_text().replace("task: hi", "task: something else"))
+        self.assertIn("it is invalid", self.refused(ROOM, tampered))
+
+    def test_its_own_task_needs_no_envelope(self):
+        own = write_task(self.ws, f"task-{OWN}~abc123", ROOM, OWN_AGENT, stamped=False)
+        self.assertEqual(self.via(ROOM, SEAT, own), OWN)
+
+    def test_a_held_core_task_posted_to_another_room_is_refused(self):
+        core = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+        self.deliver("task-abc123")
+        self.assertIn("not the task's room", self.refused(CORE_DM, core))
+
+    def test_an_answered_or_archived_core_task_is_refused(self):
+        core = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+        self.deliver("task-abc123")
+        (self.ws / "results").mkdir()
+        (self.ws / "results" / "task-abc123.txt").write_text("done\n")
+        self.assertIn("answered", self.refused(ROOM, core))
+        (self.ws / "results" / "task-abc123.txt").unlink()
+        archived = self.ws / "tasks" / "archive"
+        archived.mkdir()
+        core.rename(archived / core.name)
+        self.assertIn("unreadable", self.refused(ROOM, core))
+
+    def test_a_core_task_whose_result_is_quarantined_is_refused(self):
+        core = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+        self.deliver("task-abc123")
+        parked = self.ws / "results" / "undelivered"
+        parked.mkdir(parents=True)
+        (parked / "task-abc123-1700000000000000000.txt").write_text("the reply that did not go\n")
+        self.assertIn("quarantined", self.refused(ROOM, core))
+
+    def test_a_quarantined_core_task_file_is_refused(self):
+        moved = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT, folder="tasks/quarantine")
+        self.deliver("task-abc123")
+        self.assertIn("does not hold", self.refused(ROOM, moved))
+        live = write_task(self.ws, "task-abc124", ROOM, CORE_AGENT)
+        self.deliver("task-abc124")
+        parked = live.rename(live.with_name(live.name + ".archive-failed"))
+        self.assertIn("quarantined", self.refused(ROOM, parked))
+
+    def test_a_live_claim_left_beside_an_archive_failed_payload_is_refused(self):
+        core = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+        self.deliver("task-abc123")
+        core.with_name(core.name + ".archive-failed").write_text(core.read_text())
+        self.assertIn("quarantined", self.refused(ROOM, core))
+
+    def test_a_missing_unreadable_or_inconsistent_task_file_is_refused(self):
+        self.assertIn("unreadable", self.refused(ROOM, self.ws / "tasks" / "task-gone.txt"))
+        self.assertIn("no task file", self.refused(ROOM, ""))
+        lane_says_beta = write_task(self.ws, "task-beta~abc123", ROOM, CORE_AGENT)
+        self.assertIn("lane runs as", self.refused(ROOM, lane_says_beta))
+        nameless = write_task(self.ws, "task-abc777", ROOM)
+        self.assertIn("names no receiving agent", self.refused(ROOM, nameless))
+        stranger = write_task(self.ws, "task-abc888", ROOM, "@someone:alpha-fixture.net")
+        self.deliver("task-abc888")
+        self.assertIn("neither", self.refused(ROOM, stranger))
+
+    def test_an_unprompted_post_is_its_own(self):
+        self.open_task("alpha", ROOM)
+        self.open_task("beta", ROOM)
+        self.assertEqual(self.instance(ROOM, SEAT), OWN)
+        self.assertEqual(self.instance("!bare", SEAT), OWN)
+
+    def test_no_identity_for_the_room_is_refused_never_the_shared_token(self):
+        with self.assertRaises(C.NoConnectionForRoom):
+            C.connection_for_room("!r:gamma-fixture.net", self.ws, SEAT)
+        self.record([r for r in rows() if r["instance"] != "beta"])
+        with self.assertRaises(C.NoConnectionForRoom):
+            C.connection_for_room(BETA_ROOM, self.ws, SEAT)
+
+    def test_the_core_session_and_single_connection_installs_ignore_the_task_file(self):
+        missing = self.ws / "tasks" / "task-gone.txt"
+        self.assertEqual(self.via(ROOM, CORE_ENV, missing), "alpha")
+        self.record([r for r in rows() if r["instance"] != "beta"])
+        self.assertIsNone(self.via(ROOM, CORE_ENV, missing))
+        C.record_path(self.ws).unlink()
+        self.assertIsNone(self.via(ROOM, SEAT, missing))
+
+
+class EveryRefusalNamesItsReason(TaskCase):
+    """Each refusal branch, reached the way a real caller reaches it."""
+
+    def delivered(self, tid, room, agent):
+        path = write_task(self.ws, tid, room, agent)
+        self.deliver(tid)
+        return path
+
+    def test_its_own_agent_named_for_a_room_its_row_does_not_serve(self):
+        own = write_task(self.ws, f"task-{OWN}~abc123", BETA_ROOM, OWN_AGENT)
+        self.assertIn("does not serve this room", self.refused(BETA_ROOM, own))
+
+    def test_a_core_agent_named_for_a_room_on_another_server(self):
+        core = self.delivered("task-abc123", BETA_ROOM, CORE_AGENT)
+        self.assertIn("no core connection is agent", self.refused(BETA_ROOM, core))
+
+    def test_a_disconnected_core_row_named_by_the_task(self):
+        self.record([dict(r, disabled=True) if r["instance"] == "beta" else r for r in rows()])
+        core = self.delivered("task-abc123", "!bare", BETA_AGENT)
+        self.assertIn("disconnected", self.refused("!bare", core))
+
+    def test_the_cores_domainless_owner_dm_is_its_only_or_primary_row(self):
+        self.owner_dm("alpha", CORE_AGENT, "!bare-dm")
+        self.assertEqual(self.instance("!bare-dm", SEAT), "alpha")
+        self.record([r for r in rows() if r["instance"] != "beta"])
+        self.assertEqual(self.instance("!bare-dm", SEAT), "alpha")
+        self.record([dict(r, primary=False) for r in rows()])
+        with self.assertRaises(C.NoConnectionForRoom) as cm:
+            C.connection_for_room("!bare-dm", self.ws, SEAT)
+        self.assertIn("is primary", str(cm.exception))
+
+    def test_a_file_that_is_not_the_live_file_of_the_id_it_declares(self):
+        path = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+        path.write_text(path.read_text().replace("id: task-abc123", "id: task-abc999"))
+        self.assertIn("not the live file", self.refused(ROOM, path))
+
+    def test_a_malformed_receiving_agent(self):
+        path = write_task(self.ws, "task-abc123", ROOM, "not-an-agent")
+        self.assertIn("malformed", self.refused(ROOM, path))
+
+    def test_a_holder_that_cannot_be_read(self):
+        core = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+        with mock.patch("pool_holder.pool_holder", side_effect=PermissionError("deliveries")):
+            self.assertIn("cannot be read", self.refused(ROOM, core))
+
+    def test_paths_that_cannot_be_compared_are_not_the_same_file(self):
+        self.assertFalse(C._same_file(self.ws / "nowhere", self.ws / "nowhere"))
+
+    def test_room_ops_hands_its_task_file_to_the_gateway(self):
+        import room_ops
+        core = self.delivered("task-abc123", ROOM, CORE_AGENT)
+        self.addCleanup(_gateway.set_task_file, None)
+        seen = []
+        with mock.patch.object(room_ops._say, "say", lambda *a, **k: seen.append(_gateway._TASK_FILE) or {"ok": True}), \
+                mock.patch.object(room_ops, "_record_say", lambda res: None), \
+                contextlib.redirect_stdout(io.StringIO()):
+            room_ops._run(["say", ROOM, "hi", "--task-file", str(core)])
+        self.assertEqual(seen, [str(core)])
+
+
+class TheCoresOwnerDM(Base):
     def test_the_cores_owner_dm_stays_the_cores(self):
         self.owner_dm("alpha", CORE_AGENT, CORE_DM)
         self.assertEqual(self.instance(CORE_DM, SEAT), "alpha")
         self.assertEqual(self.instance(ROOM, SEAT), OWN)
 
-    def test_a_core_bridge_running_under_a_launch_key_alias_keeps_both(self):
+    def test_a_core_bridge_running_under_a_launch_key_alias_keeps_its_owner_dm(self):
         self.record(rows(core={"launch_keys": [C.token_ref_for("alias")]}))
         for name in ("alpha", "alias"):
             with self.subTest(owner_dm_written_as=name):
                 self.owner_dm(name, CORE_AGENT, CORE_DM)
                 self.assertEqual(self.instance(CORE_DM, SEAT), "alpha")
                 (self.ws / "state" / f"owner-routing.{name}.json").unlink()
-            with self.subTest(task_rooms_written_as=name):
-                self.open_task(name, ROOM)
-                self.assertEqual(self.instance(ROOM, SEAT), "alpha")
-                (self.ws / "state" / f"remote-task-rooms.{name}.json").unlink()
         self.assertEqual(self.instance(CORE_DM, SEAT), OWN)
         self.assertEqual(C.task_agent_mxid("task-alias~abc123", self.ws), CORE_AGENT)
 
@@ -191,11 +393,6 @@ class TheCoresRooms(Base):
         (self.ws / "state" / "owner-routing.alias.json").write_text(json.dumps(
             {"owner_dm": CORE_DM, "private": False, "identity": CORE_AGENT}))
         self.assertEqual(self.instance(CORE_DM, SEAT), OWN)
-
-    def test_a_room_id_naming_no_server_follows_the_lane_that_holds_it(self):
-        self.open_task(OWN, "!bare")
-        self.assertEqual(self.instance("!bare", SEAT), OWN)
-        self.assertEqual(self.instance("!other", SEAT), "alpha")
 
 
 class RoomClients(Base):
@@ -219,6 +416,33 @@ class RoomClients(Base):
         VAULT.clear()
         with mock.patch.dict("os.environ", SEAT), self.assertRaises(_gateway.RoomConnectionError):
             _gateway.gateway(ROOM)
+
+    def test_a_task_file_makes_room_ops_answer_as_the_agent_it_was_addressed_to(self):
+        task = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+        d = self.ws / "deliveries" / W
+        d.mkdir(parents=True)
+        (d / "task-abc123.txt").write_text("")
+        self.addCleanup(_gateway.set_task_file, None)
+        _gateway.set_task_file(str(task))
+        with mock.patch.dict("os.environ", SEAT):
+            self.assertEqual(_gateway.gateway(ROOM)[1]["Authorization"], "Bearer core-secret")
+            self.assertEqual(notify._gateway_config("ag2space", ROOM, str(task)), (ALPHA, "core-secret"))
+        _gateway.set_task_file(None)
+        self.assertEqual(self.bearer(SEAT), "own-secret")
+
+    def test_a_task_file_that_does_not_bind_is_refused_by_both_clients(self):
+        self.addCleanup(_gateway.set_task_file, None)
+        _gateway.set_task_file(str(self.ws / "tasks" / "task-gone.txt"))
+        with mock.patch.dict("os.environ", SEAT), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(_gateway.RoomConnectionError):
+                _gateway.gateway(ROOM)
+            self.assertIsNone(notify._gateway_config("ag2space", ROOM, str(self.ws / "tasks" / "task-gone.txt")))
+
+    def test_a_room_no_identity_serves_is_refused_by_both_clients(self):
+        with mock.patch.dict("os.environ", SEAT), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(_gateway.RoomConnectionError):
+                _gateway.gateway("!r:gamma-fixture.net")
+            self.assertIsNone(notify._gateway_config("ag2space", "!r:gamma-fixture.net"))
 
 
 class WhoATaskIsAnsweredAs(Base):

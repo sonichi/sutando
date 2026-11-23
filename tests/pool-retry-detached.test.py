@@ -9,6 +9,10 @@ happen, and the seat must never be left paused.
 
 Run: python3 tests/pool-retry-detached.test.py
 """
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
+
 import os
 import subprocess
 import sys
@@ -74,7 +78,7 @@ class RetryOutlivesItsSession(unittest.TestCase):
             (ws / "logs").mkdir()
             wrapper = ws / "pool_manage_wrapper.py"
             wrapper.write_text(WRAPPER.format(scripts=str(SCRIPTS), src=str(REPO / "src"), wid=WID))
-            env = dict(os.environ, SUTANDO_WORKSPACE=str(ws), SUTANDO_TEST_MODE="1")
+            env = isolated_child_env(SUTANDO_WORKSPACE=str(ws), SUTANDO_TEST_MODE="1")
             env.pop("MONITOR_PGID", None)
             asked = subprocess.Popen([sys.executable, str(wrapper), "--workspace", str(ws), "--repo", str(REPO),
                                       "retry", WID], env=env, start_new_session=True,

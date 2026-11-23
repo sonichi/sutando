@@ -12,6 +12,14 @@ Run: python3 tests/skills/worker-pool/pool-manage.test.py
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
+
 import importlib.util
 import io
 import json

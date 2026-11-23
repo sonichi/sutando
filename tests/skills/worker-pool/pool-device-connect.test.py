@@ -13,6 +13,14 @@ Run: python3 tests/skills/worker-pool/pool-device-connect.test.py
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
+
 import contextlib
 import importlib.util
 import io
@@ -419,6 +427,267 @@ class Rotate(Base):
             self.connect(ConnectFake(self.backend), rotate=True)
 
 
+
+
+class OwnDirs(Base):
+    """A worker's first agent puts it on that agent's own folders before its lane starts; a rotate never does."""
+
+    def setUp(self):
+        super().setUp()
+        import worker_lane
+        lookup = unittest.mock.patch.object(worker_lane, "handler_lookup", lambda ws: ("", ""))
+        lookup.start()
+        self.addCleanup(lookup.stop)
+
+    def own(self):
+        root = C.worker_root(NEW_AGENT, self.ws)
+        return root / "tasks", root / "results"
+
+    def test_a_first_agent_starts_the_worker_on_its_agent_s_folders(self):
+        import spawn_worker
+        seen = []
+        out = self.connect(ConnectFake(self.backend),
+                           start_lane=lambda row: seen.append(C.worker_dirs(W, self.ws)) or {"ok": True})
+        tasks, results = self.own()
+        self.assertEqual(out["dirs"], {"state": "own", "own": True})
+        self.assertEqual(C.worker_dirs(W, self.ws), (tasks, results))
+        self.assertEqual(seen, [(tasks, results)], "the lane first starts on its own folders")
+        self.assertTrue((tasks / "archive").is_dir() and (results / "archive").is_dir())
+        env = spawn_worker.inbox_env(self.ws, W)
+        self.assertEqual((env["SUTANDO_TASKS_DIR"], env["SUTANDO_RESULTS_DIR"], env["SUTANDO_INBOX_KIND"]),
+                         (str(tasks), str(results), ""))
+
+    def test_opted_out_the_worker_stays_on_the_shared_folders(self):
+        import spawn_worker
+        out = self.connect(ConnectFake(self.backend), own_dirs=False)
+        self.assertNotIn("dirs", out)
+        self.assertIsNone(C.worker_dirs(W, self.ws))
+        self.assertEqual(spawn_worker.inbox_env(self.ws, W)["SUTANDO_INBOX_KIND"], "deliveries")
+
+    def test_a_rotate_of_an_existing_shared_worker_keeps_its_folders(self):
+        self.connect(ConnectFake(self.backend), own_dirs=False)
+        again = ConnectFake(self.backend)
+        self.backend.agents[NEW_AGENT]["bearer"] = again.bearer = "bearer-" + secrets.token_hex(16)
+        with unittest.mock.patch.object(C, "update_token", lambda instance, token, **kw: {"instance": instance}):
+            out = self.connect(again, rotate=True)
+        self.assertEqual((out["status"], "dirs" in out), ("rotated", False))
+        self.assertIsNone(C.worker_dirs(W, self.ws))
+        self.assertNotIn("own_dirs", dc.read_record(self.ws, W))
+
+    def deliver(self, *pairs):
+        import pool_attribution as pat
+        import pool_delivery as pd
+        box = pd.deliveries_dir(self.ws, W)
+        box.mkdir(parents=True, exist_ok=True)
+        (self.ws / "tasks").mkdir(parents=True, exist_ok=True)
+        for task_id, suffix in pairs:
+            (self.ws / "tasks" / f"{task_id}.txt").write_text(f"id: {task_id}\ntask: x\n")
+            (box / f"{task_id}{suffix}").write_text("")
+            pat.record(self.ws, task_id, W)
+        return box
+
+    def handler(self, path):
+        import worker_lane
+        return unittest.mock.patch.object(worker_lane, "handler_lookup", lambda ws: (str(path), ""))
+
+    def test_an_existing_worker_s_delivered_work_is_handed_back_and_nothing_is_lost(self):
+        import pool_attribution as pat
+        pending = "task-1700000000001"
+        box = self.deliver((pending, ".txt"))
+        with self.handler(ROOT / "skills" / "worker-pool" / "scripts" / "pool_route_handler.py"):
+            out = self.connect(ConnectFake(self.backend))
+        self.assertEqual(out["dirs"], {"state": "own", "own": True})
+        # Never accepted: handed back to the core, its payload still where the core's watcher reads it.
+        self.assertFalse((box / f"{pending}.txt").exists())
+        self.assertTrue((self.ws / "tasks" / f"{pending}.txt").is_file())
+        self.assertNotEqual(pat.worker_for_task(self.ws, pending), W)
+
+    def test_a_handler_that_fails_after_the_switch_began_leaves_the_worker_on_its_old_inbox(self):
+        import spawn_worker
+        pending = "task-1700000000001"
+        box = self.deliver((pending, ".txt"))
+        failing = self.ws / "failing-handler"
+        failing.write_text("#!/bin/sh\necho handler broke >&2\nexit 3\n")
+        failing.chmod(0o755)
+        seen = []
+        with self.handler(failing):
+            out = self.connect(ConnectFake(self.backend),
+                               start_lane=lambda row: seen.append(C.worker_dirs(W, self.ws)) or {"ok": True})
+        self.assertIsNone(C.worker_dirs(W, self.ws), "not on its own folders while its work is still delivered")
+        self.assertEqual(seen, [None], "its lane starts on the shared folders")
+        self.assertEqual(spawn_worker.inbox_env(self.ws, W)["SUTANDO_INBOX_KIND"], "deliveries")
+        self.assertTrue((box / f"{pending}.txt").is_file(), "the delivered work stays where its seat reads it")
+        self.assertEqual(list((C.worker_root(NEW_AGENT, self.ws) / "tasks").glob("*.txt")), [])
+        self.assertEqual((out["status"], out["dirs"]["own"], out["dirs"]["state"]), ("ok", False, "migrating"))
+        self.assertIn("handler broke", out["dirs"]["why"])
+
+    def test_a_switch_that_cannot_be_made_is_reported_and_the_identity_and_lane_stay(self):
+        import worker_lane
+        starts = []
+        with unittest.mock.patch.object(worker_lane, "handler_lookup", lambda ws: ("", "lookup failed")):
+            out = self.connect(ConnectFake(self.backend), start_lane=lambda row: starts.append(row) or {"ok": True})
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual((out["dirs"]["own"], out["dirs"]["state"]), (False, "shared"))
+        self.assertIn("lookup failed", out["dirs"]["why"])
+        self.assertIsNone(C.worker_dirs(W, self.ws))
+        self.assertEqual(len(starts), 1)
+
+    def test_the_folder_switch_runs_without_holding_the_roster_fence(self):
+        import fcntl
+        import pool_roster as pr
+        import worker_lane
+        real, free = worker_lane.migrate_dirs, []
+
+        def switch(worker, ws, **kw):
+            with open(pr._lock_path(ws), "a+") as fh:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    free.append(True)
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except BlockingIOError:
+                    free.append(False)
+            return real(worker, ws, **kw)
+        with unittest.mock.patch.object(worker_lane, "migrate_dirs", switch):
+            out = self.connect(ConnectFake(self.backend), start_lane=lambda row: {"ok": True})
+        self.assertEqual((free, out["dirs"]["state"]), ([True], "own"))
+
+    def test_a_worker_retired_during_the_folder_switch_gets_no_lane(self):
+        import pool_roster as pr
+        import worker_lane
+        real, starts = worker_lane.migrate_dirs, []
+
+        def switch_then_retire(worker, ws, **kw):
+            got = real(worker, ws, **kw)
+            # A retire waits on the fence: a thread, so a fence still held here cannot hang the test.
+            retire = threading.Thread(target=pr.set_worker_state, args=(ws, W, "retired"),
+                                      kwargs={"keep_bindings": True}, daemon=True)
+            retire.start()
+            retire.join(5)
+            return got
+        with unittest.mock.patch.object(worker_lane, "migrate_dirs", switch_then_retire), \
+                self.assertRaises(dc.DeviceConnectError) as e:
+            self.connect(ConnectFake(self.backend), start_lane=lambda row: starts.append(row) or {"ok": True})
+        self.assertEqual((e.exception.status, starts), ("worker_retired", []))
+
+    def test_a_switch_that_raises_is_reported_and_never_raised(self):
+        import worker_lane
+        with unittest.mock.patch.object(worker_lane, "migrate_dirs", side_effect=RuntimeError("boom")):
+            out = self.connect(ConnectFake(self.backend))
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["dirs"], {"state": "shared", "own": False, "why": "RuntimeError: boom"})
+
+    def test_the_cli_names_the_command_that_finishes_a_switch_that_stopped(self):
+        import worker_lane
+        with unittest.mock.patch.object(worker_lane, "handler_lookup", lambda ws: ("", "lookup failed")):
+            rc, out = self.run_flow(["--workspace", str(self.ws), "add", "Reviewer", "--device-flow", "--label",
+                                     "reviewer"], ConnectFake(self.backend), [True])
+        self.assertEqual((rc, json.loads(out[-1])["dirs"]), (0, "shared"), out)
+        self.assertTrue(any("lookup failed" in line and f"migrate-dirs --worker {W} --apply" in line
+                            for line in out), out)
+
+    def run_flow(self, argv, fake, approve):
+        real, out = dc.connect, []
+
+        def sleep(seconds):
+            self.backend.sleep(seconds)
+            if approve:
+                fake.approve()
+
+        def wired(worker, **kw):
+            kw.update(request=fake.request, preview=self.preview, deliver=self.sent.append, vault=self.vault,
+                      sleep=sleep, clock=self.backend.clock)
+            return real(worker, **kw)
+        with unittest.mock.patch.object(dc, "connect", wired), \
+                unittest.mock.patch.object(C, "start_added", lambda row, **kw: {"ok": True}), \
+                unittest.mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
+            rc = pool_identity.main(argv)
+        return rc, out
+
+    def test_the_manual_device_flow_add_switches_by_default(self):
+        rc, out = self.run_flow(["--workspace", str(self.ws), "add", "Reviewer", "--device-flow", "--label",
+                                 "reviewer"], ConnectFake(self.backend), [True])
+        self.assertEqual((rc, json.loads(out[-1])["dirs"]), (0, "own"), out)
+        self.assertEqual(C.worker_dirs(W, self.ws), self.own())
+
+    def test_shared_dirs_opts_out_and_a_resend_keeps_the_opt_out(self):
+        fake, approve = ConnectFake(self.backend, expires_in=60), []
+        argv = ["--workspace", str(self.ws), "add", "Reviewer", "--device-flow", "--label", "reviewer", "--shared-dirs"]
+        self.assertEqual(self.run_flow(argv, fake, approve)[0], 1)
+        self.assertIs(dc.read_record(self.ws, W)["own_dirs"], False)
+        spawned = []
+        self.assertEqual(dc.resend(W, workspace=self.ws, spawn=lambda a: spawned.append(a) or 1)["status"], "started")
+        self.assertIn("--shared-dirs", spawned[0])
+        approve.append(True)
+        rc, out = self.run_flow(spawned[0][2:], fake, approve)
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("dirs", json.loads(out[-1]))
+        self.assertIsNone(C.worker_dirs(W, self.ws))
+
+    def paste(self, *extra):
+        token = self.backend.add_agent(NEW_AGENT, "bearer-" + secrets.token_hex(16))
+        server = str(self.preview(token).get("server") or "")
+        real, out = C.add_worker_identity, []
+        with unittest.mock.patch.object(C, "preview_connection", self.preview), \
+                unittest.mock.patch.object(C, "add_worker_identity",
+                                           lambda *a, **kw: real(*a, vault=self.vault, **kw)), \
+                unittest.mock.patch.object(C, "start_added", lambda row, **kw: {"ok": True}), \
+                unittest.mock.patch.object(pool_manage, "reseat", lambda *a, **kw: {"result": "skipped"}), \
+                unittest.mock.patch("sys.stdin", io.StringIO(token + "\n")), \
+                unittest.mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
+            rc = pool_identity.main(["--workspace", str(self.ws), "add", "Reviewer", "-", "--repo", str(ROOT),
+                                     "--logs-dir", str(self.ws / "logs"), "--yes", "--expected-server", server,
+                                     *extra])
+        return rc, out
+
+    def test_a_pasted_token_first_agent_switches_too(self):
+        rc, out = self.paste()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("dirs: own", out)
+        self.assertEqual(C.worker_dirs(W, self.ws), self.own())
+
+    def test_a_pasted_token_add_for_a_worker_retired_meanwhile_saves_nothing(self):
+        import pool_roster as pr
+        token = self.backend.add_agent(NEW_AGENT, "bearer-" + secrets.token_hex(16))
+        server = str(self.preview(token).get("server") or "")
+        starts, out, real = [], [], C.add_worker_identity
+
+        def preview_then_retire(tok, **kw):
+            seen = self.preview(tok, **kw)
+            pr.set_worker_state(self.ws, W, "retired", keep_bindings=True)
+            return seen
+        with unittest.mock.patch.object(C, "preview_connection", preview_then_retire), \
+                unittest.mock.patch.object(C, "add_worker_identity",
+                                           lambda *a, **kw: real(*a, vault=self.vault, **kw)), \
+                unittest.mock.patch.object(C, "start_added", lambda row, **kw: starts.append(row) or {"ok": True}), \
+                unittest.mock.patch.object(pool_manage, "reseat", lambda *a, **kw: {"result": "skipped"}), \
+                unittest.mock.patch("sys.stdin", io.StringIO(token + "\n")), \
+                unittest.mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
+            rc = pool_identity.main(["--workspace", str(self.ws), "add", "Reviewer", "-", "--repo", str(ROOT),
+                                     "--logs-dir", str(self.ws / "logs"), "--yes", "--expected-server", server])
+        self.assertEqual(rc, 1, out)
+        self.assertIsNone(C.worker_identity(W, self.ws))
+        self.assertEqual((C.worker_dirs(W, self.ws), starts), (None, []))
+        self.assertFalse((self.ws / "agents").exists())
+
+    def test_a_resend_of_a_record_from_before_the_folder_switch_keeps_the_shared_folders(self):
+        dc.write_record(self.ws, W, {"label": "reviewer", "state": "expired", "rotate": False,
+                                     "expires_at": self.backend.clock() - 1})
+        spawned = []
+        self.assertEqual(dc.resend(W, workspace=self.ws, spawn=lambda a: spawned.append(a) or 1)["status"], "started")
+        self.assertIn("--shared-dirs", spawned[0])
+        dc.write_record(self.ws, W, {"label": "reviewer", "state": "expired", "rotate": False, "own_dirs": True,
+                                     "expires_at": self.backend.clock() - 1})
+        spawned.clear()
+        dc.resend(W, workspace=self.ws, spawn=lambda a: spawned.append(a) or 1)
+        self.assertNotIn("--shared-dirs", spawned[0])
+
+    def test_a_pasted_token_with_shared_dirs_stays_shared(self):
+        rc, out = self.paste("--shared-dirs")
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(any(line.startswith("dirs:") for line in out), out)
+        self.assertIsNone(C.worker_dirs(W, self.ws))
+
+
 class Cli(Base):
     def test_add_device_flow_prints_one_json_line_without_a_secret(self):
         fake = ConnectFake(self.backend)
@@ -435,7 +704,7 @@ class Cli(Base):
             rc = pool_identity.main(["--workspace", str(self.ws), "add", "Reviewer", "--device-flow",
                                      "--label", "reviewer"])
         self.assertEqual(rc, 0, out)
-        self.assertEqual(json.loads(out[-1]), {"agent_id": NEW_AGENT, "status": "ok", "seat": "skipped"})
+        self.assertEqual(json.loads(out[-1]), {"agent_id": NEW_AGENT, "status": "ok", "seat": "skipped", "dirs": "own"})
         self.assertNoSecret(fake, *out)
 
     def test_a_new_identity_restarts_the_running_seat_and_a_rotate_does_not(self):

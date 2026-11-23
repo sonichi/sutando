@@ -164,6 +164,11 @@
       "type": "string",
       "pattern": "^(?!/)(?!(.*/)?\\.\\.(/|$))[^\\s]+\\.(py|sh)$",
       "description": "A script the task watcher offers each Stop (a CANCEL_INSTRUCTION naming a task), relative to the skill directory and resolving inside it. Exit 0 takes the stop and its ruling; anything else leaves it to the watcher, which cancels the task at once. Run by src/stop_hooks.py (skills/MANIFEST.md)."
+    },
+    "on_session_config": {
+      "type": "string",
+      "pattern": "^(?!/)(?!(.*/)?\\.\\.(/|$))[^\\s]+\\.(py|sh)$",
+      "description": "A script run once per Claude session launch (the core and each pool worker) with `--config-dir <dir>`, after the session's CLAUDE_CONFIG_DIR is resolved and before it starts, relative to the skill directory and resolving inside it. Waited on for at most 10 seconds; its exit status never fails the launch. Run by src/session_config_hooks.py (skills/MANIFEST.md)."
     }
   },
   "allOf": [
