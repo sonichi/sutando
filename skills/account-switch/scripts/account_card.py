@@ -25,9 +25,12 @@ own box. A sign-in code or token never goes in a message, a card or a log.
 A "Use" tap answers "switching" at once and starts `switch` detached, because the core restarts.
 `switch` keeps the current `auth.json` in memory and saves it to the store, puts the saved one in
 place (0600), and runs src/agent/graceful-restart.sh, which waits for the core to finish its turn.
-After the restart it reads the core's sign-in again and posts the outcome in the same DM:
-"Switched. The core restarted and is signed in as X." or "I could not switch to X. I'm still
-signed in as Y. <reason>". When the restart does not happen, the previous `auth.json` is put back.
+A sign-in that cannot be read or saved to switch back to is never replaced. One attempt runs at a
+time: admission and the switch each hold a lock, and only that attempt's record is cleared. After
+the restart it waits for the core's heartbeat and asks Codex (`account/read`) which account the
+home is on, then posts the outcome in the same DM: "Switched. The core restarted and is signed in
+as X." or why not. When the restart definitely did not happen (graceful-restart exit 3/4/5), the
+previous state, absence included, is put back; after any other failure the new sign-in stays.
 
 Every command prints one JSON object. Exit 0 done, 1 a negative answer, 2 refused. Stdlib only.
 """
@@ -66,8 +69,13 @@ STORE_SUB = ("accounts", "codex")
 ISSUED = ("state", "account-card-keys.json")
 ISSUED_KEPT = 20
 RUNNING = ("state", "account-card-switch.json")
-RUNNING_STALE_S = 1800
+RUNNING_LOCK = ("state", "account-card-switch.lock")
+EXEC_LOCK = ("state", "account-card-switch.exec.lock")
 RESTART_TIMEOUT_S = 1500
+READY_TIMEOUT_S, READY_POLL_S = 300, 5
+RUNNING_STALE_S = RESTART_TIMEOUT_S + READY_TIMEOUT_S + 600
+# graceful-restart.sh exits 3/4/5 before it stops the core; any other failure may have restarted it.
+NOT_RESTARTED = (3, 4, 5)
 SETTLE_TRIES, SETTLE_PAUSE_S = 4, 15
 USE_BUTTONS = ac.LIMITS["buttons"] - 1          # one place is "Add another account"
 SETTINGS = ("Settings → Connections → the Sutando (on this computer) row → \"Switch account\". "
@@ -110,8 +118,13 @@ def runtime() -> str:
 
 
 def codex_home() -> Path:
+    """The Codex core's home as its launcher resolves it; raises codex_account.NoHome when refused."""
     import codex_account
     return codex_account.home()
+
+
+class Unreadable(Exception):
+    """The live sign-in exists but cannot be read, so it must not be replaced."""
 
 
 def store_dir() -> Optional[Path]:
@@ -162,6 +175,16 @@ def _live_auth(home: Path) -> Optional[str]:
         return (home / "auth.json").read_text(encoding="utf-8")
     except OSError:
         return None
+
+
+def _previous_auth(home: Path) -> Optional[str]:
+    """The live `auth.json`, None when absent; raises Unreadable when it exists but cannot be read."""
+    try:
+        return (home / "auth.json").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as e:
+        raise Unreadable(type(e).__name__) from None
 
 
 def _private_dir(path: Path) -> None:
@@ -240,7 +263,11 @@ def claude_status(run=subprocess.run) -> dict:
 def current(rt: str, *, run=subprocess.run, codex_read=None) -> dict:
     """{runtime, signed_in, shown, key}: the core's sign-in as the owner may read it (masked)."""
     if rt == "codex":
-        home = codex_home()
+        import codex_account
+        try:
+            home = codex_home()
+        except codex_account.NoHome:
+            return {"runtime": rt, "signed_in": None, "shown": "", "key": ""}
         ident = identity(_live_auth(home) or "")
         if codex_read is None:
             import codex_account
@@ -363,9 +390,10 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time, run=subp
     cur = current(rt, run=run, codex_read=codex_read)
     store = store_dir() if rt == "codex" else None
     if store is not None:
+        import codex_account
         try:
             save_current(store, _live_auth(codex_home()))
-        except OSError:
+        except (OSError, codex_account.NoHome):
             pass  # the card still names the account; only the copy for switching back is missing
     others = [s for s in saved(store, cur["key"]) if not s["current"]]
     try:
@@ -393,6 +421,47 @@ def running(ws: Path, now: float) -> dict:
     return rec if rec.get("attempt") and now - float(rec.get("ts") or 0) < RUNNING_STALE_S else {}
 
 
+def executing(ws: Path) -> bool:
+    """True while a `switch` holds the execution lock."""
+    from file_lock import try_lock_fd, unlock_fd
+    path = ws.joinpath(*EXEC_LOCK)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if try_lock_fd(fd):
+            unlock_fd(fd)
+            return False
+        return True
+    finally:
+        os.close(fd)
+
+
+def admit(ws: Path, rec: dict, now: float) -> bool:
+    """Record `rec` as the one attempt under way; False when another is running. Check and write are
+    one transaction under the record's lock."""
+    from file_lock import locked_file
+    from local_record import write_whole
+    with locked_file(ws.joinpath(*RUNNING_LOCK), create_mode=0o600):
+        if running(ws, now) or executing(ws):
+            return False
+        write_whole(ws.joinpath(*RUNNING), rec)
+    return True
+
+
+def is_recorded(ws: Path, rec: dict) -> bool:
+    from file_lock import locked_file
+    with locked_file(ws.joinpath(*RUNNING_LOCK), create_mode=0o600):
+        return _read_json(ws.joinpath(*RUNNING)) == rec
+
+
+def settle(ws: Path, rec: dict) -> None:
+    """Clear the record only while it is still exactly this attempt's."""
+    from file_lock import locked_file
+    with locked_file(ws.joinpath(*RUNNING_LOCK), create_mode=0o600):
+        if _read_json(ws.joinpath(*RUNNING)) == rec:
+            ws.joinpath(*RUNNING).unlink(missing_ok=True)
+
+
 def start_switch(ws: Path, room: str, key: str, attempt: str, popen=subprocess.Popen) -> int:
     """Start `switch` in a session of its own, so it outlives the core's restart; its pid."""
     log = ws / "logs" / "account-card.log"
@@ -409,7 +478,6 @@ def start_switch(ws: Path, room: str, key: str, attempt: str, popen=subprocess.P
 
 def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, now=time.time,
               run=subprocess.run, codex_read=None) -> int:
-    from local_record import write_whole
     try:
         headers, said = ac.reply_words(Path(args.task_file).read_text(encoding="utf-8"))
     except OSError as e:
@@ -443,11 +511,11 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     if cur["key"] == verb:
         return _emit({"status": "say", "say": f"The core is already signed in as {label}. Nothing changed."})
     t = now()
-    if running(ws, t):
-        return _emit({"status": "say", "say": BUSY})
     attempt = f"{int(t)}-{secrets.token_hex(4)}"
+    rec = {"attempt": attempt, "key": verb, "room": room, "ts": t}
     try:
-        write_whole(ws.joinpath(*RUNNING), {"attempt": attempt, "key": verb, "room": room, "ts": t})
+        if not admit(ws, rec, t):
+            return _emit({"status": "say", "say": BUSY})
     except OSError as e:
         return _emit({"status": "failed", "say": "I couldn't start the switch. Nothing changed.",
                       "why": type(e).__name__}, 1)
@@ -459,7 +527,7 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     try:
         pid = start_switch(ws, room, verb, attempt, popen)
     except OSError as e:
-        ws.joinpath(*RUNNING).unlink(missing_ok=True)
+        settle(ws, rec)
         return _emit({"status": "failed", "say": "I couldn't start the switch. Nothing changed.",
                       "why": f"{type(e).__name__}: {e}"}, 1)
     out = {"status": "started", "attempt": attempt, "pid": pid, "say": say}
@@ -482,47 +550,137 @@ def restart_core(run=subprocess.run) -> int:
         return 127
 
 
-def do_switch(ws: Path, key: str, *, restart=restart_core) -> tuple:
-    """(state, words). The previous `auth.json` is kept in memory, saved in the store, and put back
-    when the saved one could not be put in place or the core did not restart."""
+def core_ready(ws: Path, since: float, *, sleep=time.sleep, clock=time.time) -> bool:
+    """True once the core's heartbeat is newer than `since`, within READY_TIMEOUT_S."""
+    try:
+        from util_paths import _host_label
+        alive = ws / "state" / "cores" / f"{_host_label()}.alive"
+    except Exception:  # noqa: BLE001 - no host label: readiness cannot be confirmed
+        return False
+    deadline = clock() + READY_TIMEOUT_S
+    while True:
+        try:
+            if alive.stat().st_mtime > since:
+                return True
+        except OSError:
+            pass
+        if clock() >= deadline:
+            return False
+        sleep(READY_POLL_S)
+
+
+def live_account(home: Path) -> dict:
+    """Codex's own answer for the home the restarted core runs under (never the file alone)."""
+    import codex_account
+    return codex_account.from_app_server(home) or {}
+
+
+def _email(auth_text: str) -> str:
+    try:
+        tokens = json.loads(auth_text).get("tokens") or {}
+        raw = tokens.get("id_token")
+        raw = raw.get("raw_jwt") if isinstance(raw, dict) else raw
+        return str(_claims(raw).get("email") or "") if isinstance(raw, str) else ""
+    except (AttributeError, TypeError, ValueError):
+        return ""
+
+
+def _restore(home: Path, before: Optional[str]) -> None:
     from local_record import write_text_whole
-    store, home = store_dir(), codex_home()
+    if before is None:
+        (home / "auth.json").unlink(missing_ok=True)
+    else:
+        write_text_whole(home / "auth.json", before)
+
+
+def do_switch(ws: Path, key: str, *, restart=restart_core, ready=core_ready, live=live_account,
+              clock=time.time) -> tuple:
+    """(state, words). The previous `auth.json` is kept in memory and saved in the store first; a
+    sign-in that cannot be read or saved is never replaced. When the restart definitely did not
+    happen, the previous state (absence included) is put back."""
+    import codex_account
+    from local_record import write_text_whole
+    store = store_dir()
+    try:
+        home = codex_home()
+    except codex_account.NoHome as e:
+        return "error", f"I could not switch: the core's Codex home is not usable ({e}). Nothing changed."
     want = _saved_auth(store, key) if store else None
     if want is None:
         return "error", "I could not switch: that account is no longer saved here. Nothing changed."
     label = masked_label(identity(want)[1])
-    before = _live_auth(home)
-    was = masked_label(identity(before)[1]) if before and identity(before) else "the account it had"
+    try:
+        before = _previous_auth(home)
+    except Unreadable as e:
+        return "error", (f"I could not switch to {label}: the core's current sign-in could not be read ({e}), "
+                         "so I left it in place. Nothing changed.")
+    if before is not None and identity(before) is None:
+        return "error", (f"I could not switch to {label}: the core's current sign-in is not one I can save to "
+                         "switch back to (an API key or an unreadable file), so I left it in place. Nothing changed.")
+    was = masked_label(identity(before)[1]) if before else "no account"
     try:
         save_current(store, before)
+        if before is not None and _saved_auth(store, identity(before)[0]) != before:
+            raise OSError("the current sign-in was not saved")
         write_text_whole(home / "auth.json", want)
     except OSError as e:
-        return "error", f"I could not switch to {label}. I'm still signed in as {was}. The sign-in could not be written ({type(e).__name__})."
-    rc = restart()
-    if rc != 0:
         try:
-            if before is not None:
-                write_text_whole(home / "auth.json", before)
+            _restore(home, before)
+        except OSError:
+            pass
+        return "error", f"I could not switch to {label}. I'm still signed in as {was}. The sign-in could not be written ({type(e).__name__})."
+    started = clock()
+    rc = restart()
+    if rc in NOT_RESTARTED:
+        try:
+            _restore(home, before)
         except OSError:
             return "error", (f"The core did not restart ({RESTART_REASONS.get(rc, 'the restart failed')}), and the "
                              f"previous sign-in could not be put back: the core uses {label} from its next start.")
         reason = RESTART_REASONS.get(rc, "the restart failed")
         return "error", f"I could not switch to {label}. I'm still signed in as {was}. {reason[:1].upper()}{reason[1:]}."
+    if rc != 0:
+        return "error", (f"The restart did not finish cleanly (exit {rc}), so I can't tell which account the core "
+                         f"is on. Its saved sign-in is now {label}. Ask me for the account card to check.")
+    if not ready(ws, started):
+        return "error", (f"The core restarted with {label}'s sign-in but has not reported ready yet. "
+                         "Ask me for the account card once it answers.")
     now_ident = identity(_live_auth(home) or "")
-    if now_ident and now_ident[0] == key:
+    acct = live(home)
+    want_email = _email(want).lower()
+    if now_ident and now_ident[0] == key and acct.get("kind") == "chatgpt" and \
+            (not want_email or str(acct.get("email") or "").lower() == want_email):
         return "done", f"Switched. The core restarted and is signed in as {label}."
-    shown = masked_label(now_ident[1]) if now_ident else "no ChatGPT account"
+    if not acct:
+        return "error", (f"The core restarted with {label}'s sign-in, but Codex did not confirm the account. "
+                         "Ask me for the account card to check.")
+    shown = masked(str(acct.get("email") or ""))
+    shown = (shown + (f" ({acct['plan']})" if acct.get("plan") else "")) if shown else \
+        ("no ChatGPT account" if not acct.get("kind") else "another account")
     return "error", f"The core restarted, but its sign-in is {shown}, not {label}. Ask me for the account card to try again."
 
 
-def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core, sleep=time.sleep) -> int:
+def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core, sleep=time.sleep,
+               ready=core_ready, live=live_account) -> int:
+    from file_lock import try_lock_fd, unlock_fd
     rec = _read_json(ws.joinpath(*RUNNING))
-    if rec.get("attempt") != args.attempt:
+    if rec.get("attempt") != args.attempt or rec.get("key") != args.key or rec.get("room") != args.room \
+            or not is_recorded(ws, rec):
         return _emit({"status": "refused", "why": "that attempt is not the one under way"}, 2)
+    lock = ws.joinpath(*EXEC_LOCK)
+    fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        state, words = do_switch(ws, args.key, restart=restart)
+        if not try_lock_fd(fd):
+            return _emit({"status": "refused", "why": "another switch is running"}, 2)
+        try:
+            if not is_recorded(ws, rec):
+                return _emit({"status": "refused", "why": "that attempt is not the one under way"}, 2)
+            state, words = do_switch(ws, args.key, restart=restart, ready=ready, live=live)
+        finally:
+            settle(ws, rec)
+            unlock_fd(fd)
     finally:
-        ws.joinpath(*RUNNING).unlink(missing_ok=True)
+        os.close(fd)
     body, card = notice_card(state, "Switched" if state == "done" else "Not switched", words)
     out = {"status": "failed"}
     for i in range(SETTLE_TRIES):
@@ -535,7 +693,7 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
 
 
 def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, run=subprocess.run, codex_read=None,
-         restart=restart_core, sleep=time.sleep) -> int:
+         restart=restart_core, sleep=time.sleep, ready=core_ready, live=live_account) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--workspace", default=None)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -563,7 +721,7 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, run=subp
     if args.cmd == "switch":
         if not KEY_RE.fullmatch(args.key):
             return _emit({"status": "refused", "why": "that is not a saved account's key"}, 2)
-        return cmd_switch(ws, args, core=core, execute=execute, restart=restart, sleep=sleep)
+        return cmd_switch(ws, args, core=core, execute=execute, restart=restart, sleep=sleep, ready=ready, live=live)
     rt = runtime()
     cur = current(rt, run=run, codex_read=codex_read)
     store = store_dir() if rt == "codex" else None

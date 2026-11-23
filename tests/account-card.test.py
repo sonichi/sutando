@@ -120,6 +120,7 @@ class Base(unittest.TestCase):
         self.store = self.app / "accounts" / "codex"
         self.fake, self.launch, self.restarts, self.outputs = Fake(), Launch(), [], []
         self.restart_rc, self.restart_writes = 0, None
+        self.ready_ok, self.live_answer, self.ready_since = True, None, []
         self.claude_json = {"loggedIn": True, "email": "susan@example.com", "subscriptionType": "max"}
         for target, name, value in ((acc, "_owner_dm", lambda ws, core: DM),
                                     (acc, "runtime", lambda: self.RUNTIME),
@@ -152,12 +153,23 @@ class Base(unittest.TestCase):
             self.signed_in(self.restart_writes)
         return self.restart_rc
 
+    def ready(self, ws, since):
+        self.ready_since.append(since)
+        return self.ready_ok
+
+    def live_account(self, home):
+        """Codex's answer for the restarted core: the home's sign-in unless a test says otherwise."""
+        if self.live_answer is not None:
+            return self.live_answer
+        import codex_account
+        return codex_account.from_auth_file(home) or {}
+
     def run_(self, argv):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             rc = acc.main(["--workspace", str(self.ws)] + argv, core=CORE, popen=self.launch, run=self.claude_run,
                           execute=lambda *a, **k: self.fake.execute(*a, **k), codex_read=codex_read_from(self),
-                          restart=self.restart, sleep=lambda s: None)
+                          restart=self.restart, sleep=lambda s: None, ready=self.ready, live=self.live_account)
         self.outputs.append(out.getvalue())
         return rc, json.loads(out.getvalue())
 
@@ -354,6 +366,104 @@ class Switch(Base):
         self.assertEqual(out["outcome"], "error")
         self.assertIn("its sign-in is a…@example.com (plus), not b…@work.io (pro)", out["say"])
 
+    def reset_attempt(self):
+        rec = {"attempt": self.attempt, "key": self.key, "room": DM, "ts": 1e12}
+        self.ws.joinpath(*acc.RUNNING).write_text(json.dumps(rec))
+
+    def test_an_unreadable_previous_sign_in_is_never_replaced(self):
+        (self.home / "auth.json").unlink()
+        (self.home / "auth.json").mkdir()
+        rc, out = self.switch()
+        self.assertEqual((rc, out["outcome"]), (1, "error"))
+        self.assertIn("could not be read", out["say"])
+        self.assertEqual(self.restarts, [])
+        self.assertTrue((self.home / "auth.json").is_dir())
+
+    def test_a_previous_sign_in_that_cannot_be_saved_is_never_replaced(self):
+        for text in ("{not json", json.dumps({"OPENAI_API_KEY": "sk-SECRET"})):
+            with self.subTest(text=text[:8]):
+                self.signed_in(text)
+                self.restarts.clear()
+                rc, out = self.switch()
+                self.assertEqual(out["outcome"], "error")
+                self.assertIn("left it in place", out["say"])
+                self.assertEqual((self.restarts, self.live()), ([], text))
+                self.assertNotIn("sk-SECRET", json.dumps(out))
+                self.reset_attempt()
+
+    def test_a_definite_restart_failure_restores_an_absent_sign_in(self):
+        (self.home / "auth.json").unlink()
+        for rc_ in acc.NOT_RESTARTED:
+            with self.subTest(rc=rc_):
+                self.restart_rc = rc_
+                rc, out = self.switch()
+                self.assertEqual(out["outcome"], "error")
+                self.assertFalse((self.home / "auth.json").exists(), "absence is put back too")
+                self.reset_attempt()
+
+    def test_an_uncertain_restart_failure_keeps_the_new_sign_in_and_says_so(self):
+        self.restart_rc = 1
+        rc, out = self.switch()
+        self.assertEqual(out["outcome"], "error")
+        self.assertEqual(self.live(), B, "the core may already run on it, so it is not swapped back")
+        self.assertIn("can't tell which account", out["say"])
+
+    def test_success_needs_the_restarted_core_ready_and_codex_confirming_the_account(self):
+        self.ready_ok = False
+        rc, out = self.switch()
+        self.assertEqual(out["outcome"], "error")
+        self.assertIn("has not reported ready", out["say"])
+        self.assertEqual(len(self.ready_since), 1)
+        self.reset_attempt()
+        self.ready_ok = True
+        for answer, words in (({}, "did not confirm"),
+                              ({"kind": "chatgpt", "email": "alice@example.com"}, "not b…@work.io (pro)")):
+            with self.subTest(answer=answer):
+                self.signed_in(A)
+                self.live_answer = answer
+                rc, out = self.switch()
+                self.assertEqual(out["outcome"], "error")
+                self.assertIn(words, out["say"])
+                self.reset_attempt()
+
+    def test_settlement_is_bound_to_the_whole_recorded_attempt(self):
+        rec = json.loads(self.ws.joinpath(*acc.RUNNING).read_text())
+        for field, value in (("key", key_of("acct-c")), ("room", ROOM)):
+            with self.subTest(field=field):
+                self.ws.joinpath(*acc.RUNNING).write_text(json.dumps({**rec, field: value}))
+                rc, out = self.switch()
+                self.assertEqual(rc, 2)
+                self.assertEqual(self.restarts, [])
+                self.assertTrue(self.ws.joinpath(*acc.RUNNING).exists(), "another attempt's record stays")
+
+    def test_a_newer_attempt_recorded_mid_switch_is_not_cleared(self):
+        newer = {"attempt": "9-cafebabe", "key": self.key, "room": DM, "ts": 2e12}
+
+        def restart():
+            self.ws.joinpath(*acc.RUNNING).write_text(json.dumps(newer))
+            return 0
+        self.restart = restart
+        self.switch()
+        self.assertEqual(json.loads(self.ws.joinpath(*acc.RUNNING).read_text()), newer)
+
+    def test_a_switch_already_executing_refuses_a_second_and_blocks_admission(self):
+        from file_lock import try_lock_fd, unlock_fd
+        fd = os.open(str(self.ws.joinpath(*acc.EXEC_LOCK)), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            self.assertTrue(try_lock_fd(fd))
+            self.assertTrue(acc.executing(self.ws))
+            rc, out = self.switch()
+            self.assertEqual((rc, out["why"]), (2, "another switch is running"))
+            self.assertEqual(self.restarts, [])
+            self.ws.joinpath(*acc.RUNNING).unlink()
+            self.assertFalse(acc.admit(self.ws, {"attempt": "x", "ts": 1.0}, 1.0))
+            unlock_fd(fd)
+        finally:
+            os.close(fd)
+        self.assertFalse(acc.executing(self.ws))
+        self.assertTrue(acc.admit(self.ws, {"attempt": "x", "ts": 1.0}, 1.0))
+        self.assertFalse(acc.admit(self.ws, {"attempt": "y", "ts": 2.0}, 2.0), "one attempt at a time")
+
     def test_another_attempt_or_a_bad_key_is_refused(self):
         rc, out = self.switch("0-deadbeef")
         self.assertEqual(rc, 2)
@@ -372,6 +482,197 @@ class Switch(Base):
         self.assertEqual(seen["argv"], ["bash", str(acc.RESTART)])
         self.assertEqual(seen["env"]["SUTANDO_ALLOW_INSESSION_RESTART"], "1")
         self.assertTrue(acc.RESTART.is_file())
+
+
+class Edges(Base):
+    """The failure branches: each says what it could not do and changes nothing it should not."""
+
+    def test_runtime_codex_home_and_store_resolve_from_config(self):
+        import sutando_config
+        import codex_account
+        for value, want in (("codex", "codex"), ("claude", "claude")):
+            with mock.patch.object(sutando_config, "resolve_core_runtime", return_value=value):
+                self.assertEqual(_real_runtime(), want)
+        with mock.patch.object(sutando_config, "resolve_core_runtime", side_effect=RuntimeError("x")):
+            self.assertEqual(_real_runtime(), "claude")
+        with mock.patch.object(codex_account, "home", return_value=self.home):
+            self.assertEqual(_real_codex_home(), self.home)
+        with mock.patch.dict(os.environ, {"SUTANDO_APP_SUPPORT": ""}):
+            with mock.patch.object(sutando_config, "desktop_runtime_selection_path",
+                                   return_value=self.app / "runtime.json"):
+                self.assertEqual(acc.store_dir(), self.store)
+            with mock.patch.object(sutando_config, "desktop_runtime_selection_path", side_effect=RuntimeError("x")):
+                self.assertIsNone(acc.store_dir())
+
+    def test_saved_skips_what_it_cannot_read(self):
+        self.keep(B)
+        (self.store / "notakey.json").write_text("{}")
+        (self.store / ("0" * 16 + ".json")).write_text("{")
+        (self.store / ("1" * 16 + ".json")).write_text(json.dumps({"label": 3}))
+        self.assertEqual([x["key"] for x in acc.saved(self.store)], [key_of("acct-b")])
+        self.assertIsNone(acc._live_auth(self.ws / "nowhere"))
+
+    def test_claude_status_unreadable_answers(self):
+        import sutando_config
+        with mock.patch.object(sutando_config, "resolve_claude_sutando_config_dir", side_effect=RuntimeError("x")):
+            for run in (mock.Mock(side_effect=OSError("no claude")), mock.Mock(return_value=mock.Mock(stdout="nope")),
+                        mock.Mock(return_value=mock.Mock(stdout="[]"))):
+                self.assertEqual(acc.claude_status(run)["signed_in"], None)
+
+    def test_current_without_a_usable_home_or_with_an_api_key(self):
+        import codex_account
+        with mock.patch.object(acc, "codex_home", side_effect=codex_account.NoHome("refused")):
+            self.assertEqual(acc.current("codex")["signed_in"], None)
+            rc, out = self.post()
+            self.assertIn("could not read", out.get("why", "") + json.dumps(self.fake.calls))
+        self.signed_in(json.dumps({"OPENAI_API_KEY": "sk-SECRET"}))
+        with mock.patch.object(codex_account, "read", return_value={"kind": "apiKey"}):
+            self.assertEqual(acc.current("codex")["shown"], "an OpenAI API key")
+        (self.home / "auth.json").unlink()
+        self.assertFalse(acc.current("codex", codex_read=lambda h: {})["signed_in"])
+
+    def test_the_core_lane_helpers_ask_pool_provision(self):
+        pp = mock.Mock()
+        pp.core_lane.return_value = CORE
+        pp.core_actions.return_value = (mock.Mock(execute="EXEC"),)
+        with mock.patch.dict(sys.modules, {"pool_provision": pp}):
+            self.assertEqual(acc._core(self.ws), CORE)
+            self.assertEqual(acc._execute(self.ws, "s_dspace"), "EXEC")
+        with mock.patch.object(connections, "owner_dm", return_value=DM):
+            self.assertEqual(_real_owner_dm(self.ws, CORE), DM)
+
+    def test_post_failures_are_named(self):
+        body, card = acc.notice_card("info", "x", "words")
+        self.assertEqual(acc._post(self.ws, ROOM, body, card, "op", core=CORE, execute=self.fake.execute)["status"],
+                         "failed")
+        self.assertIn("RuntimeError", acc._post(self.ws, DM, body, card, "op", core=CORE,
+                                                 execute=mock.Mock(side_effect=RuntimeError("down")))["why"])
+        with mock.patch.object(acc.issued_cards, "record", side_effect=OSError("ro")):
+            out = acc._post(self.ws, DM, body, card, "op", core=CORE, execute=self.fake.execute)
+        self.assertEqual(out["status"], "posted")
+        self.assertIn("will not act", out["why"])
+
+    def test_cmd_post_degrades_and_prints(self):
+        self.signed_in(A)
+        with mock.patch.object(acc, "save_current", side_effect=OSError("ro")), \
+                mock.patch.object(acc, "remember_keys", side_effect=OSError("ro")):
+            rc, out = self.post()
+        self.assertEqual(out["status"], "posted")
+        self.assertIn("will not act", out["why"])
+        with mock.patch.object(acc, "menu_card", side_effect=acc.ac.CardError("too long")):
+            rc, out = self.post()
+        self.assertEqual((rc, out["status"]), (1, "failed"))
+        rc, out = self.run_(["post", "--room", DM, "--print"])
+        self.assertEqual(out["handler"], acc.HANDLER)
+
+    def test_reply_failures_change_nothing(self):
+        rc, out = self.run_(["reply", "--task-file", str(self.ws / "gone.txt")])
+        self.assertEqual((rc, out["status"]), (2, "refused"))
+        self.signed_in(A)
+        self.keep(B)
+        self.post()
+        use = "Use b…@work.io (pro)"
+        with mock.patch.object(acc, "admit", side_effect=OSError("ro")):
+            rc, out = self.tap(use)
+        self.assertEqual((rc, out["status"]), (1, "failed"))
+        self.launch = mock.Mock(side_effect=OSError("no fork"))
+        rc, out = self.tap(use)
+        self.assertEqual((rc, out["status"]), (1, "failed"))
+        self.assertFalse(self.ws.joinpath(*acc.RUNNING).exists(), "a failed start clears its own record")
+
+    def test_reply_without_a_core_row_and_to_another_target(self):
+        self.signed_in(A)
+        self.post()
+        path = self.ws / "task.txt"
+        path.write_text(task("Use x", reply_to_event="$card1",
+                             card_click=json.dumps({"card_id": acc.CARD_ID, "action": "Use x"})))
+        verdict = mock.Mock(command=mock.Mock(target="worker", verb="add"))
+        with mock.patch.object(acc.ac, "click_verdict", return_value=verdict), \
+                mock.patch.object(acc.ac, "click_answer", return_value=None), \
+                mock.patch.object(acc, "_core", side_effect=RuntimeError("no row")):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = acc.main(["--workspace", str(self.ws), "reply", "--task-file", str(path)])
+        self.assertEqual((rc, json.loads(out.getvalue())["say"]), (2, acc.GONE))
+
+    def test_restart_core_timeout_and_missing_bash(self):
+        self.assertEqual(acc.restart_core(mock.Mock(side_effect=acc.subprocess.TimeoutExpired("bash", 1))), 124)
+        self.assertEqual(acc.restart_core(mock.Mock(side_effect=OSError("no bash"))), 127)
+
+    def test_core_ready_waits_for_a_newer_heartbeat_within_the_limit(self):
+        import util_paths
+        cores = self.ws / "state" / "cores"
+        cores.mkdir(parents=True)
+        with mock.patch.object(util_paths, "_host_label", return_value="h"):
+            t = [1000.0]
+            beats = []
+
+            def sleep(_):
+                t[0] += acc.READY_POLL_S
+                beats.append(1)
+                if len(beats) == 2:
+                    (cores / "h.alive").write_text("{}")
+                    os.utime(cores / "h.alive", (2000, 2000))
+            self.assertTrue(acc.core_ready(self.ws, 1500.0, sleep=sleep, clock=lambda: t[0]))
+            self.assertFalse(acc.core_ready(self.ws, 3000.0, sleep=sleep, clock=lambda: t[0]))
+        with mock.patch.object(util_paths, "_host_label", side_effect=RuntimeError("x")):
+            self.assertFalse(acc.core_ready(self.ws, 0.0))
+
+    def test_live_account_asks_codex_and_email_reads_only_the_claim(self):
+        import codex_account
+        with mock.patch.object(codex_account, "from_app_server", return_value=None):
+            self.assertEqual(acc.live_account(self.home), {})
+        self.assertEqual(acc._email(B), "bob@work.io")
+        for bad in ("{", "[]", json.dumps({"tokens": {"id_token": {"raw_jwt": jwt({"email": "p@q.r"})}}})):
+            self.assertIn(acc._email(bad), ("", "p@q.r"))
+
+    def test_do_switch_refusals_before_anything_is_written(self):
+        import codex_account
+        with mock.patch.object(acc, "codex_home", side_effect=codex_account.NoHome("refused")):
+            state, words = acc.do_switch(self.ws, key_of("acct-b"))
+        self.assertIn("not usable", words)
+        self.signed_in(A)
+        self.keep(B)
+        with mock.patch.object(acc, "save_current", return_value=False), \
+                mock.patch.object(acc, "_saved_auth", side_effect=lambda st, k: B if k == key_of("acct-b") else None):
+            state, words = acc.do_switch(self.ws, key_of("acct-b"), restart=lambda: 0)
+        self.assertIn("could not be written", words)
+        self.assertEqual(self.live(), A)
+
+    def test_a_restore_that_fails_says_which_sign_in_the_core_will_use(self):
+        self.signed_in(A)
+        self.keep(B)
+        with mock.patch.object(acc, "_restore", side_effect=OSError("ro")):
+            state, words = acc.do_switch(self.ws, key_of("acct-b"), restart=lambda: 4)
+        self.assertIn("could not be put back", words)
+
+    def test_the_outcome_is_posted_again_until_it_lands(self):
+        self.signed_in(A)
+        self.keep(B)
+        self.post()
+        self.tap("Use b…@work.io (pro)")
+        argv = self.launch.calls[0][0]
+        attempt = argv[argv.index("--attempt") + 1]
+        posts = iter([{"status": "failed"}, {"status": "posted", "event_id": "$x"}])
+        slept = []
+        with mock.patch.object(acc, "_post", side_effect=lambda *a, **k: next(posts)):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                acc.main(["--workspace", str(self.ws), "switch", "--room", DM, "--key", key_of("acct-b"),
+                          "--attempt", attempt], restart=lambda: 0, sleep=slept.append, ready=self.ready,
+                         live=self.live_account)
+        self.assertEqual(slept, [acc.SETTLE_PAUSE_S])
+
+    def test_main_resolves_the_workspace(self):
+        import workspace_default
+        with mock.patch.object(workspace_default, "resolve_workspace", return_value=self.ws):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                acc.main(["status"], codex_read=codex_read_from(self))
+        self.assertIn("words", json.loads(out.getvalue()))
+
+
+_real_runtime, _real_codex_home, _real_owner_dm = acc.runtime, acc.codex_home, acc._owner_dm
 
 
 class Identity(unittest.TestCase):
