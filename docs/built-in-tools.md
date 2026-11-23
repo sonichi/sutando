@@ -484,8 +484,8 @@ python3 skills/runtime-switch/scripts/runtime_card.py status                   #
 ```
 
 The card marks the runtime in use and offers "Codex" and "Claude Code". A tap checks the target is
-signed in before anything stops (otherwise it answers "Sign in to <runtime> first" and points to the
-desktop's Settings), then restarts the core onto it after the current turn and confirms in the DM from
+signed in before anything stops (otherwise it answers "Sign in first" with that runtime's sign-in
+controls in the card, keeps the tap, and switches by itself once the sign-in is there), then restarts the core onto it after the current turn and confirms in the DM from
 `state/core-runtime.json` and the desktop's selection. Tasks, memory and the workspace carry over; the
 live conversation does not. Details: `skills/runtime-switch/SKILL.md`.
 

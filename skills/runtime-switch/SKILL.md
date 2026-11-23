@@ -34,8 +34,10 @@ is under way is refused.
 
 1. **Sign-in first, before anything stops.** Claude Code: `claude auth status --json` under the core's
    config dir; Codex: `src/codex_account.py` on the core's Codex home (the account card's probes).
-   Not signed in, or not readable: the card answers **"Sign in to <runtime> first"** and points to the
-   desktop app's Settings → Connections → the Sutando (on this computer) row. Nothing restarts.
+   Not signed in, or not readable: the card answers **"Sign in first"** with that runtime's sign-in
+   controls in the card itself (drawn by the desktop app on the computer that runs the core; elsewhere
+   the card says to open it there). Nothing restarts. The tap is kept: `runtime_card.py await-sign-in`
+   waits up to 15 minutes, and once the sign-in is there it switches without being asked again.
 2. Signed in: it answers "Switching the core from X to Y…" at once and starts `runtime_card.py switch`
    detached, in its own session, because the core restarts.
 3. `switch` runs `src/agent/graceful-restart.sh -- --runtime <rt>`: it waits for the core's current

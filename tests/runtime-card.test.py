@@ -85,7 +85,11 @@ class Launch:
     def __init__(self):
         self.calls = []
 
+    fail = None
+
     def __call__(self, argv, **kw):
+        if self.fail:
+            raise self.fail
         self.calls.append((argv, kw))
         return mock.Mock(pid=4242)
 
@@ -233,29 +237,59 @@ class Taps(Base):
         self.assertEqual((self.fake.cards()[-1]["id"], self.fake.cards()[-1]["state"]), (rtc.NOTE_ID, "pending"))
         self.assertEqual(self.restarts, [], "nothing is restarted in the tap itself")
 
-    def test_a_signed_out_target_says_sign_in_first_and_restarts_nothing(self):
+    def test_a_signed_out_target_gets_the_sign_in_controls_in_the_card_and_restarts_nothing(self):
         for answer, why in (({"loggedIn": False}, "is not signed in"), ("nonsense", "could not confirm")):
             with self.subTest(why=why):
                 self.claude_json = answer
                 rc, out = self.tap("Switch the core to Claude Code")
                 self.assertEqual((rc, out["status"]), (1, "needs_sign_in"))
-                self.assertTrue(out["say"].startswith("Sign in to Claude Code first."))
                 self.assertIn(why, out["say"])
-                self.assertIn("Settings → Connections", out["say"])
+                self.assertIn("Sign in to Claude Code below.", out["say"])
+                self.assertIn("you don't need to ask again", out["say"])
+                self.assertNotIn("Settings", out["say"], "the card acts in place: it sends nobody elsewhere")
                 card = self.fake.cards()[-1]
-                self.assertEqual((card["id"], card["state"]), (rtc.NOTE_ID, "error"))
-        self.assertEqual(self.launch.calls, [])
-        self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists())
+                self.assertEqual((card["id"], card["state"], card["header"]["status"]["label"]), (rtc.NOTE_ID, "pending", "Sign in first"))
+                # The marker the desktop app draws that runtime's sign-in controls from, on the core's computer.
+                self.assertEqual(card[rtc.CONTROLS], {"runtime": "claude", "agent": "core"})
+                # Anywhere else the client shows the body: one line, where to open it.
+                self.assertEqual(self.fake.calls[-1][1]["body"],
+                                 "Open this on the computer that runs the core to sign in to Claude Code.")
+        self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists(), "no switch is under way yet")
+        self.assertEqual(self.restarts, [])
+
+    def test_the_tap_is_kept_and_a_waiter_is_started_for_it(self):
+        self.claude_json = {"loggedIn": False}
+        rc, out = self.tap("Switch the core to Claude Code")
+        waiting = json.loads(self.ws.joinpath(*rtc.WAITING).read_text())
+        self.assertEqual((waiting["runtime"], waiting["room"], waiting["attempt"]), ("claude", DM, out["waiting"]))
+        argv, kw = self.launch.calls[0]
+        self.assertIn("await-sign-in", argv)
+        self.assertEqual((argv[argv.index("--runtime") + 1], argv[argv.index("--attempt") + 1]), ("claude", out["waiting"]))
+        self.assertTrue(kw["start_new_session"])
+        # A second tap replaces the first: one wait is named, and the earlier waiter will find it is not its.
+        rc, again = self.tap("Switch the core to Claude Code")
+        self.assertNotEqual(again["waiting"], out["waiting"])
+        self.assertEqual(json.loads(self.ws.joinpath(*rtc.WAITING).read_text())["attempt"], again["waiting"])
+        self.assertEqual(len(self.launch.calls), 2)
+
+    def test_a_waiter_that_cannot_be_started_says_to_ask_again(self):
+        self.claude_json = {"loggedIn": False}
+        self.launch.fail = OSError("no nohup")
+        rc, out = self.tap("Switch the core to Claude Code")
+        self.assertEqual((rc, out["status"], out["waiting"]), (1, "needs_sign_in", ""))
+        self.assertIn("ask again", out["why"])
 
     def test_codex_target_sign_in_is_probed_on_the_codex_home(self):
         self.current = self.selected = "claude"
         rc, out = self.tap("Switch the core to Codex")
         self.assertEqual(out["status"], "needs_sign_in")
-        self.assertIn("Sign in to Codex first", out["say"])
+        self.assertIn("Sign in to Codex below", out["say"])
+        self.assertEqual(self.fake.cards()[-1][rtc.CONTROLS], {"runtime": "codex", "agent": "core"})
         (self.home / "auth.json").write_text(CODEX_AUTH)
         rc, out = self.tap("Switch the core to Codex")
         self.assertEqual((rc, out["status"]), (0, "started"))
-        self.assertEqual(len(self.launch.calls), 1)
+        self.assertEqual([c[0][c[0].index("--workspace") + 2] for c in self.launch.calls], ["await-sign-in", "switch"])
+        self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists(), "a tap that goes ahead ends the wait")
 
     def test_the_runtime_in_use_changes_nothing(self):
         rc, out = self.tap("Switch the core to Codex")
@@ -279,6 +313,83 @@ class Taps(Base):
         rc, out = self.tap("Switch the core to Claude Code")
         self.assertEqual(out["say"], rtc.BUSY)
         self.assertEqual(len(self.launch.calls), 1)
+
+
+
+class AwaitSignIn(Base):
+    """The waiter a "Sign in first" card starts: it switches as the tap wanted once the sign-in is there."""
+
+    def setUp(self):
+        super().setUp()
+        self.post()
+        self.claude_json = {"loggedIn": False}
+        rc, out = self.tap("Switch the core to Claude Code")
+        self.attempt = out["waiting"]
+        self.launch.calls.clear()
+
+    def wait(self, attempt=None, runtime="claude"):
+        return self.run_(["await-sign-in", "--room", DM, "--runtime", runtime, "--attempt", attempt or self.attempt])
+
+    def test_signed_in_after_a_while_it_switches_without_being_asked_again(self):
+        polls = []
+        real = self.clock.sleep
+
+        def sleep(s):
+            polls.append(s)
+            real(s)
+            if len(polls) == 3:
+                self.claude_json = {"loggedIn": True, "email": "susan@example.com"}
+        self.clock.sleep = sleep
+        rc, out = self.wait()
+        self.assertEqual((rc, out["status"], out["runtime"], out["after_sign_in"]), (0, "started", "claude", True))
+        self.assertEqual(polls, [rtc.SIGN_IN_POLL_S] * 3)
+        argv = self.launch.calls[0][0]
+        self.assertIn("switch", argv)
+        self.assertEqual((argv[argv.index("--runtime") + 1], argv[argv.index("--room") + 1]), ("claude", DM))
+        card = self.fake.cards()[-1]
+        self.assertEqual((card["state"], card["header"]["status"]["label"]), ("pending", "Switching"))
+        self.assertIn("Switching the core from Codex to Claude Code", out["say"])
+        self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists())
+        self.assertTrue(self.ws.joinpath(*rtc.RUNNING).exists(), "the one switch under way")
+        self.assertEqual(self.restarts, [], "the waiter restarts nothing itself")
+
+    def test_no_sign_in_within_the_wait_says_so_and_changes_nothing(self):
+        rc, out = self.wait()
+        self.assertEqual((rc, out["status"], out["posted"]), (1, "gave_up", "posted"))
+        self.assertIn("I stopped waiting for the Claude Code sign-in after 15 minutes. The core is still on Codex", out["say"])
+        card = self.fake.cards()[-1]
+        self.assertEqual((card["state"], card["header"]["status"]["label"]), ("error", "Not switched"))
+        self.assertEqual((self.launch.calls, self.restarts), ([], []))
+        self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists())
+
+    def test_a_newer_tap_or_another_attempt_makes_it_stop_without_a_word(self):
+        cards = len(self.fake.cards())
+        rc, out = self.wait(attempt="1-deadbeef")
+        self.assertEqual((rc, out["status"]), (0, "superseded"))
+        self.tap("Switch the core to Claude Code")            # a newer tap: the record names it now
+        self.launch.calls.clear()
+        cards = len(self.fake.cards())
+        self.claude_json = {"loggedIn": True}
+        rc, out = self.wait()
+        self.assertEqual(out["status"], "superseded")
+        self.assertEqual((len(self.fake.cards()), self.launch.calls), (cards, []))
+        self.assertTrue(self.ws.joinpath(*rtc.WAITING).exists(), "the newer tap's wait is left alone")
+
+    def test_a_core_already_on_that_runtime_ends_the_wait(self):
+        self.current = "claude"
+        rc, out = self.wait()
+        self.assertEqual((rc, out["status"]), (0, "already"))
+        self.assertEqual(self.launch.calls, [])
+        self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists())
+
+    def test_a_switch_already_under_way_is_not_started_twice(self):
+        self.claude_json = {"loggedIn": True}
+        # Another switch was admitted meanwhile (a tap that went ahead): the waiter starts no second one.
+        self.assertTrue(rtc.admit(self.ws, {"attempt": "9-cafe", "runtime": "claude", "room": DM, "ts": self.clock.t},
+                                  self.clock.t))
+        rc, out = self.wait()
+        self.assertEqual((rc, out["status"], out["say"]), (1, "say", rtc.BUSY))
+        self.assertEqual(self.launch.calls, [])
 
 
 class Switch(Base):
