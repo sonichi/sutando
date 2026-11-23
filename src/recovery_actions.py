@@ -18,6 +18,9 @@ a click supplies is an id the card itself offered:
     restart_core        core only: src/agent/start-cli.sh --restart, detached (detached_action): it
                         closes the tmux session this monitor runs in, so it never runs as its child
     escape_prompt       one Escape key into the pane
+    reset_service:<s>   core only: one request to the desktop supervisor to clear the crash-loop stop on
+                        service <s> and launch it again (core_crash_loop.request_reset), only while its
+                        fresh status says <s> is stopped; the card closes once it is no longer stopped
     buy_credits, add_account, switch_account:<id>
                         never run here: each needs a confirmed, re-authenticated step (P1)
 
@@ -340,6 +343,13 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
             runtime_models.request_probe(ws, target.session, now)
         return ("done", None, "Reading the current options again; a new card shows what the screen offers now.",
                 {})
+    if verb == recovery.RESET_SERVICE:
+        import core_crash_loop
+        if not core_crash_loop.request_reset(ws, arg, now):
+            why = f"The app no longer reports {arg} as stopped, so there is nothing to start again."
+            return "refused", why, why, {}
+        return ("done", None, f"Asked the app to start {arg} again; this card closes once it is no longer "
+                "stopped (within a couple of minutes).", {VERIFY_FIELD: {"service": arg}})
     if verb == recovery.ESCAPE_PROMPT:
         if not target.send_key("Escape"):
             why = "The terminal did not take the key."
@@ -511,7 +521,7 @@ def verify_pending(req, now: float) -> bool:
     """A done action's card still verifying (a detached restart unanswered, or the waiting work not
     yet seen starting), within its deadline: resolve_escalations leaves it open until it says how."""
     check = (req.subject or {}).get("verify")
-    if not isinstance(check, dict) or check.get("seen") or check.get("outcome") != "done":
+    if not isinstance(check, dict) or check.get("seen") or check.get("outcome") != "done" or check.get("service"):
         return False
     try:
         return now - float(check.get("at") or 0) < VERIFY_DEADLINE_S
@@ -533,8 +543,8 @@ def verify_step(manager, workspace: Path, session: str, blocked: bool, now: Opti
         subject = r.subject or {}
         check = subject.get("verify")
         if subject.get("session") != session or not subject.get("recovery") or not isinstance(check, dict) \
-                or check.get("seen"):
-            continue
+                or check.get("seen") or check.get("service"):
+            continue  # a service's card is the crash-loop step's to close: the core's state says nothing of it
         if check.get("detached"):
             done = detached_action.status(workspace, check["detached"], at)
             if done.state == detached_action.RUNNING:
