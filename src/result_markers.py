@@ -142,9 +142,8 @@ _SKIP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # `*` not `+`: `[deduped:]` and `[deduped: ]` differ only by a space and
     # must parse alike, or one is audited and the other ships its own marker.
     (re.compile(r"^\s*\[deduped:\s*([^\]]*)\]\s*", re.IGNORECASE), "deduped"),
-    # A body that is a connector card's mark and nothing else ([model-card], [account-card]) asks the
-    # connector to post that card; the connector answers it. Should the runtime write it as a result
-    # itself, it is closed silently, never posted as text.
+    # A body that is only a connector card's mark ([model-card], [account-card]) asks the connector for
+    # that card. Written as a result by the runtime itself, it is closed silently, never posted as text.
     (re.compile(r"^\s*\[[a-z]+(?:-[a-z]+)*-card\]\s*\Z"), "no-send"),
 ]
 

@@ -270,10 +270,8 @@ def capabilities(headers):
     return turn_policy(headers, allow_non_owner=True).capabilities
 
 
-# The gateway's SKILL INSTRUCTIONS step that tells a core to write results/<task>.txt itself. This connector
-# writes the result from the turn's reply, after the card desk has seen it; a file Codex writes there is
-# delivered raw by the bridge first (a lone "[model-card]" reached the owner as text, and the task was
-# archived under the connector). So the step, and the tier block's result steps, are said as "your reply".
+# The gateway's step telling a core to write results/<task>.txt itself. Here the connector writes the result
+# from the reply, after the card desk saw it; a file Codex wrote would be delivered raw first. Said as "your reply".
 PRELUDE_RESULT_RE = re.compile(r"Process and write the result to results/[^\s()`'\"]+\.txt; to end it with no "
                                r"reply, write `\[no-send\]` as the result\.")
 PRELUDE_RESULT = ("Process it: your reply text is the result (there is no results file to write); to end it "
