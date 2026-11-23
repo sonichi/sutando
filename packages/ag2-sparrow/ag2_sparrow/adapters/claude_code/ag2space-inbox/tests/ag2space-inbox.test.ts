@@ -2067,6 +2067,54 @@ test('every save made while a body is being staged carries its bytes, whoever ma
   expect(h.files['/out/task-u6.txt']).toBe('the staged answer\n')
 })
 
+test('a reload just before the wait runs out does not start it over: intake goes on at the original deadline', async ($, on) => {
+  const h = host(on)
+  const msg = 'the submitted text of task-w1'
+  const t0 = h.clock.now()
+  // Kept by the plugin before this reload: 290 of its 300 seconds were already spent.
+  const writes = seed(on, [KEPT('task-w1', 'CALLING', { msg, hash: h.hash(msg), submitted: true, waitUntil: t0 + 10_000 })])
+  h.files['/in/task-w1.txt'] = TASK('task-w1')
+  h.claims['task-w1'] = { attempt: 1, phase: 'CALLING', token: 'tok', hash: h.hash(msg) }
+  h.files['/in/task-w2.txt'] = TASK('task-w2')
+  await arm($, h)
+  await h.clock.advance(8000)
+  expect(h.submitted.length).toBe(0)                           // still inside the original wait
+  expect((writes[writes.length - 1] as any[]).find(o => o.rid === 'task-w1').waitUntil).toBe(t0 + 10_000)
+  await h.clock.advance(4000)
+  expect(h.submitted.length).toBe(1)                           // not a fresh five minutes
+  const kept = (writes[writes.length - 1] as any[]).find(o => o.rid === 'task-w1')
+  expect(kept.unconfirmed).toBe(true)                          // the unblocked state is kept too
+})
+
+test('a confirmation being retried keeps its own deadline across a reload', async ($, on) => {
+  const h = host(on, { lockFailsOnce: Array(40).fill('confirm') })
+  const msg = 'the submitted text of task-w3'
+  const t0 = h.clock.now()
+  seed(on, [KEPT('task-w3', 'CALLING', { msg, hash: h.hash(msg), submitted: true, waitUntil: t0 + 5000,
+    confirming: { turnId: 'turn-w3', hash: h.hash(msg) } })])
+  h.files['/in/task-w3.txt'] = TASK('task-w3')
+  h.claims['task-w3'] = { attempt: 1, phase: 'CALLING', token: 'tok', hash: h.hash(msg) }
+  h.files['/in/task-w4.txt'] = TASK('task-w4')
+  await arm($, h)
+  await h.clock.advance(3000)
+  expect(h.submitted.length).toBe(0)
+  await h.clock.advance(4000)
+  expect(h.submitted.length).toBe(1)                           // the deadline it was kept with, not a new one
+  expect(h.logs.some((l: string) => l.includes('task-w3 turn confirmation still not through after 5 minutes'))).toBe(true)
+})
+
+test('a fresh turn start saves the confirmation\'s deadline with it', async ($, on) => {
+  const h = host(on, { lockFailsOnce: ['confirm'] })
+  const writes = seed(on, [])
+  h.files['/in/task-w5.txt'] = TASK('task-w5')
+  await arm($, h)
+  await h.clock.advance(1000)
+  const before = h.clock.now()
+  await $.turn.start({ text: h.submitted[0], turnId: 't-w5' })
+  const kept = (writes[writes.length - 1] as any[]).find(o => o.rid === 'task-w5')
+  expect(kept.waitUntil).toBe(before + 300_000)
+})
+
 const notTakenBack = async ($: any, on: any, opts: Record<string, unknown>) => {
   const h = host(on, opts)
   seed(on, [KEPT('task-r8', 'TURN_CONFIRMED'), { rid: '../x', phase: 'TURN_CONFIRMED' }, null, 'junk'])

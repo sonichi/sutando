@@ -17,6 +17,8 @@ export type KeptOffer = {
   // Intake stopped waiting for it (its turn did not start, or its confirmation did not get through): its
   // turn, should it still start, is confirmed; else the next start answers it.
   unconfirmed?: boolean
+  // When intake stops waiting for it, in ms since the epoch: absolute, so a reload does not start the wait over.
+  waitUntil?: number
 }
 
 declare module 'claude-code' {

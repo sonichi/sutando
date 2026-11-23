@@ -11,9 +11,9 @@ const STUCK_TICKS = 300
 // An offer taken back after a plugin reload whose turn's end was not seen: closed after this many ticks.
 const ADOPT_TICKS = 1800
 // One taken back still waiting for its queued turn to start: intake stops waiting for it after this many.
-const ADOPT_CALL_TICKS = 300
+const ADOPT_CALL_MS = 300_000
 // A confirmation the CLI keeps asking to retry: intake stops waiting for it after this many ticks.
-const CONFIRM_TICKS = 300
+const CONFIRM_MS = 300_000
 // The offers in flight, in the session's state: a reload starts this module's variables over, not these.
 const KEPT = { plugin: 'ag2space-inbox', key: 'offers' } as const
 const TASK_RE = /^task-[A-Za-z0-9._~-]+\.txt$/
@@ -87,7 +87,7 @@ function submittedAt(turnText: string, msg: string): number {
 type Offer = { file: string; rid: string; attempt: number; msg: string; hash: string; token: string; turnId: string; phase: string
                 confirming?: { turnId: string; hash: string; completed?: string }; stagedText?: string
                 parkPending?: string; unconfirmed?: boolean; adoptedAt?: number; submitted?: boolean
-                staging?: string; confirmSince?: number }
+                staging?: string; waitUntil?: number }
 
 // One session's inbox state: what was seen and answered, the offers in flight, the live watch, the
 // session-id witness and whether intake is open.
@@ -203,12 +203,23 @@ function retireTask($: any, s: State, name: string, rid: string, why: string, do
 // none, and a reload there goes the way it always has.
 // `staging` is the body handed to `stage` and not settled yet: it rides on the offer, so every save made
 // while the CLI runs carries its bytes, whoever makes it.
+// The time as the engine tells it, in ms since the epoch: what a deadline that must outlive a reload is
+// measured against (a tick count starts over with the module).
+async function nowMs($: any): Promise<number> {
+  try {
+    const t = Number(await $.clock.now())
+    if (Number.isFinite(t) && t >= 0) return t
+  } catch { /* an engine without clock.now */ }
+  return Date.now()
+}
+
 async function keep($: any, s: State): Promise<void> {
   const kept: KeptOffer[] = [...s.offers.values()].map(o => {
     const body = o.stagedText ?? o.staging
     return { file: o.file, rid: o.rid, attempt: o.attempt, msg: o.msg, hash: o.hash, token: o.token, turnId: o.turnId, phase: o.phase,
       ...(body === undefined ? {} : { stagedText: body }), ...(o.submitted ? { submitted: true } : {}),
-      ...(o.confirming ? { confirming: { ...o.confirming } } : {}), ...(o.unconfirmed ? { unconfirmed: true } : {}) }
+      ...(o.confirming ? { confirming: { ...o.confirming } } : {}), ...(o.unconfirmed ? { unconfirmed: true } : {}),
+      ...(o.waitUntil === undefined ? {} : { waitUntil: o.waitUntil }) }
   })
   try { await $.state.set(KEPT, kept) } catch { /* not kept: the next reload fails closed */ }
 }
@@ -226,6 +237,7 @@ async function restore($: any, s: State): Promise<void> {
     kept = Array.isArray(held?.value) ? held.value.filter((o: any) => o && typeof o.rid === 'string' && ID_RE.test(o.rid)) : []
   } catch { kept = [] }
   if (!kept.length) return
+  const at = await nowMs($)
   const live = await cli($, s, ['inflight'])
   const tasks = live.ok && live.data?.tasks && typeof live.data.tasks === 'object' ? live.data.tasks : null
   if (!tasks) return
@@ -240,12 +252,14 @@ async function restore($: any, s: State): Promise<void> {
       // Only the plugin that submitted it holds the token and the text its turn is checked against.
       if (k.phase !== 'CALLING' || !k.token || !k.msg || !k.hash) continue
       offer = { file, rid, attempt: k.attempt, msg: k.msg, hash: k.hash, token: k.token, turnId: '', phase: 'CALLING', adoptedAt: s.tick }
+      // The deadline kept with it stands: a reload never gives the same wait a fresh five minutes.
+      const until = (ms: number) => (typeof k.waitUntil === 'number' && Number.isFinite(k.waitUntil) ? k.waitUntil : at + ms)
       const c = k.confirming
       if (c && typeof c.turnId === 'string' && c.turnId && typeof c.hash === 'string') {
         // Its turn had started: the confirmation is tried again at the next tick, and its end is not lost.
         offer.submitted = true
         offer.confirming = { turnId: c.turnId, hash: c.hash, ...(typeof c.completed === 'string' ? { completed: c.completed } : {}) }
-        offer.confirmSince = s.tick
+        offer.waitUntil = until(CONFIRM_MS)
         if (k.unconfirmed === true) offer.unconfirmed = true
       } else if (k.unconfirmed === true) {
         // Intake had already stopped waiting for it before this reload: still not waited for, still confirmable.
@@ -253,6 +267,7 @@ async function restore($: any, s: State): Promise<void> {
         offer.unconfirmed = true
       } else if (k.submitted === true) {
         offer.submitted = true
+        offer.waitUntil = until(ADOPT_CALL_MS)
         if (!s.pending) s.pending = offer
       } else {
         // Not known to have reached the session: never submitted again, and intake does not wait for it. Its
@@ -405,22 +420,21 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
       const stopped = sessionStopped(s)
       // No reopen on a tick whose session id did not read back unchanged.
       if (s.intake === 'closed' && !stopped && (!live || !(await reopenIntake($, s)))) return
+      let at: number | undefined
       for (const o of [...s.offers.values()]) {
         // Taken back after a reload and its turn's end never seen: closed, so intake is not held for good.
         if (o.adoptedAt !== undefined && o.phase === 'TURN_CONFIRMED' && o.parkPending === undefined && s.tick - o.adoptedAt >= ADOPT_TICKS) {
           o.parkPending = `did not end within ${ADOPT_TICKS / 60} minutes of a plugin reload`
         }
-        if (o.adoptedAt !== undefined && o.phase === 'CALLING' && !o.confirming && !o.unconfirmed && s.tick - o.adoptedAt >= ADOPT_CALL_TICKS) {
-          o.unconfirmed = true
-          if (s.pending === o) s.pending = null
-          await $.ui.log(`${PLUGIN}: ${o.rid} taken back after a plugin reload, and its turn did not start within ${ADOPT_CALL_TICKS / 60} minutes; intake goes on, and the next start answers it`, {})
-        }
-        if (o.confirming && !o.unconfirmed && s.tick - (o.confirmSince ?? s.tick) >= CONFIRM_TICKS) {
-          // Still retried each tick, and kept for a reload, but intake no longer waits on it.
+        if (o.phase === 'CALLING' && !o.unconfirmed && o.waitUntil !== undefined && (at ??= await nowMs($)) >= o.waitUntil) {
+          // Intake no longer waits on it, and that is kept, so a reload does not wait for it again. A
+          // confirmation is still retried each tick; a turn that starts late is still confirmed.
           o.unconfirmed = true
           if (s.pending === o) s.pending = null
           await keep($, s)
-          await $.ui.log(`${PLUGIN}: ${o.rid} turn confirmation still not through after ${CONFIRM_TICKS / 60} minutes; intake goes on, and it is retried`, {})
+          await $.ui.log(o.confirming
+            ? `${PLUGIN}: ${o.rid} turn confirmation still not through after ${CONFIRM_MS / 60_000} minutes; intake goes on, and it is retried`
+            : `${PLUGIN}: ${o.rid} taken back after a plugin reload, and its turn did not start within ${ADOPT_CALL_MS / 60_000} minutes; intake goes on, and the next start answers it`, {})
         }
         if (o.confirming) { if (await confirmOffer($, s, o)) return }
         else if (o.unconfirmed) { if (await settleUnconfirmed(o)) return; continue }
@@ -640,7 +654,7 @@ export const register: Register = (on) => {
       if (hash === offer.hash) {
         // The turn is ours: CALLING -> TURN_CONFIRMED with the turn id, the nonce and the hash the claim recorded.
         offer.confirming = { turnId: e.turnId, hash }
-        offer.confirmSince = s.tick
+        offer.waitUntil = (await nowMs($)) + CONFIRM_MS
         await confirmOffer($, s, offer)
       }
       // An unrelated manual turn: ours is still queued behind it; nothing changes.
