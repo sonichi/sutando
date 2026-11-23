@@ -10,7 +10,7 @@ not list `launch-lock`, is refused and nothing runs: `start-cli.sh --restart` wo
 gateway's session. Anywhere else the restart is `src/agent/start-cli.sh --restart`.
 
     python3 src/core_restart.py restart --workspace W --caller NAME [--runtime R] [--repo DIR]
-                                        [--start-cli PATH] [-- START_CLI_ARGS...]
+                                        [--start] [--start-cli PATH] [-- START_CLI_ARGS...]
         resolve and run a restart in the foreground; exits with its code, or REFUSED_EXIT
     python3 src/core_restart.py ctl --ctl PATH --workspace W --caller NAME
                                     [--hitl-id ID --revision N] [--runtime R]
@@ -62,19 +62,21 @@ Runner = Callable[..., subprocess.CompletedProcess]
 
 
 def start_cli_argv(repo: Path, runtime: Optional[str] = None, extra: Sequence[str] = (),
-                   start_cli: Optional[str] = None) -> List[str]:
+                   start_cli: Optional[str] = None, start: bool = False) -> List[str]:
     argv = ["bash", start_cli or str(Path(repo) / "src" / "agent" / "start-cli.sh")]
     if runtime:
         argv += ["--runtime", runtime]
-    return argv + ["--restart", *extra]
+    return argv + ([] if start else ["--restart"]) + list(extra)
 
 
 def route(repo: Path, env: Dict, runner: Runner, *, workspace: Path, caller: str,
           runtime: Optional[str] = None, hitl_id: str = "", revision: Optional[int] = None,
-          extra: Sequence[str] = (), start_cli: Optional[str] = None) -> Tuple[Optional[List[str]], str]:
+          extra: Sequence[str] = (), start_cli: Optional[str] = None,
+          start: bool = False) -> Tuple[Optional[List[str]], str]:
     """(argv, via) for one core restart; argv None when nothing may run. `env` is the restart's
-    environment and is updated for the ctl. Only the ctl's capability probe runs here."""
-    fallback = start_cli_argv(repo, runtime, extra, start_cli)
+    environment and is updated for the ctl. Only the ctl's capability probe runs here. `start`
+    starts a core that is down: start-cli with no flag, or the ctl's restart-core in the bundle."""
+    fallback = start_cli_argv(repo, runtime, extra, start_cli, start)
     app_support = sutando_config.desktop_app_support(repo)
     if app_support is None:
         return fallback, VIA_START_CLI
@@ -191,12 +193,12 @@ def run_ctl(ctl: Path, workspace: Path, caller: str, *, hitl_id: str = "", revis
 
 def restart(workspace: Path, caller: str, *, runtime: Optional[str] = None, extra: Sequence[str] = (),
             start_cli: Optional[str] = None, repo: Path = REPO, runner: Runner = subprocess.run,
-            execv: Callable = os.execvpe, err=sys.stderr) -> int:
+            execv: Callable = os.execvpe, err=sys.stderr, start: bool = False) -> int:
     """A foreground restart for a caller with no card: start-cli replaces this process; the ctl runs
     here; a refusal says why and exits REFUSED_EXIT."""
     env = dict(os.environ)
     argv, via = route(repo, env, runner, workspace=workspace, caller=caller, runtime=runtime,
-                      extra=extra, start_cli=start_cli)
+                      extra=extra, start_cli=start_cli, start=start)
     if argv is None:
         why = "no launch lock in its sutando-ctl.sh" if via == VIA_NO_LOCK else "its sutando-ctl.sh is missing"
         print(f"core_restart: refused ({via}): this core runs inside the desktop app and {why}; "
@@ -218,6 +220,7 @@ def main(argv=None) -> int:
     r.add_argument("--runtime", default=None)
     r.add_argument("--start-cli", default=None)
     r.add_argument("--repo", default=str(REPO), help="the caller's checkout (its own path, unresolved)")
+    r.add_argument("--start", action="store_true", help="start a core that is down (start-cli without --restart)")
     r.add_argument("extra", nargs=argparse.REMAINDER)
     c = sub.add_parser("ctl")
     c.add_argument("--ctl", required=True)
@@ -232,7 +235,7 @@ def main(argv=None) -> int:
                        revision=a.revision, runtime=a.runtime)
     extra = a.extra[1:] if a.extra[:1] == ["--"] else a.extra
     return restart(Path(a.workspace), a.caller, runtime=a.runtime, extra=extra, start_cli=a.start_cli,
-                   repo=Path(a.repo))
+                   repo=Path(a.repo), start=a.start)
 
 
 if __name__ == "__main__":  # pragma: no cover

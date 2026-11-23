@@ -162,8 +162,11 @@ meanwhile. Elsewhere it runs `start-cli.sh --runtime <r> --restart`.
 
 That route is `src/core_restart.py`, and every engine core restart takes it: these cards, the
 paused core's retry (`core_limit_hold` relaunch), `src/agent/graceful-restart.sh` (exit 13 when
-refused; a restart that did not happen releases its restart lock) and `health-check.py --recover-core`. `tests/core-restart-callers.test.py` fails on any
-other `start-cli.sh --restart` caller. A ctl restart runs inside `core_restart.py ctl`, which appends
+refused; a restart that did not happen releases its restart lock), `health-check.py --recover-core`
+and `switch-model.sh` starting a core paused for a provider limit (`core_restart.py restart --start`:
+the launcher with no flag outside the bundle, the ctl's restart-core in it). `tests/core-restart-callers.test.py` fails on any
+other `start-cli.sh --restart` caller, and on any other direct `start-cli.sh` / `launch-sutando.sh`
+invocation. A ctl restart runs inside `core_restart.py ctl`, which appends
 two `state/recovery/audit.jsonl` lines, `event: ctl_restart` with `phase: intent` before the ctl
 and `phase: outcome` (`done` or `failed`, with the ctl's `rc`) after it; each carries `caller`,
 and a card's restart adds its `hitl_id` and `revision`.

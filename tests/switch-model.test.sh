@@ -242,6 +242,28 @@ rc=$(PGREP_CORE=1 TMUX_PANE_TEXT="$GW" run sonnet --confirm --launcher "$T/launc
 [ "$rc" = 5 ] && [ "$R" = opus ] && [ ! -e "$LCALLS" ] && ok "58 held but a core process runs: no settings write, no launch" || fail "58" "rc=$rc R=$R"
 rm -f "$T/state/core-limit-hold.json"
 
+# --- in the desktop bundle (<app>/engine/<checkout>) the held core is started by the app's ctl, never the launcher
+APPB="$T/app"; B="$APPB/engine/sutando"; mkdir -p "$B"
+for d in src scripts skills; do ln -s "$HERE/$d" "$B/$d"; done
+cat > "$APPB/engine/sutando-ctl.sh" <<'CTL'
+#!/bin/bash
+case "$1" in
+  capabilities) [ -n "${CTLB_NO_LOCK:-}" ] || echo launch-lock ;;
+  restart-core) echo ctl-restart-core >> "$LCALLS" ;;
+esac
+CTL
+brun(){ : > "$TMUX_LOG"; SUTANDO_APP_SUPPORT="$APPB" "$B/skills/model-switch/scripts/switch-model.sh" --accept-timeout 3 "$@" --state-dir "$T/state" --brain "$T/cfg" > "$T/out" 2> "$T/err"; echo $?; }
+printf '{"model":"opus"}\n' > "$T/cfg/settings.json"; rm -f "$LCALLS" "$T/state/recovery/audit.jsonl"; hold
+rc=$(TMUX_PANE_TEXT="$GW" brun sonnet --confirm --launcher "$T/launcher.sh")
+CALLER=$(python3 -c "import json,sys;print(' '.join(r['phase']+':'+r['caller'] for r in map(json.loads,open(sys.argv[1]))))" "$T/state/recovery/audit.jsonl" 2>/dev/null)
+[ "$rc" = 0 ] && [ "$(tr '\n' ' ' < "$LCALLS")" = "ctl-restart-core " ] && [ "$CALLER" = "intent:switch-model outcome:switch-model" ] \
+  && ok "58b bundle: the held core is started by the app's ctl restart-core (recorded), not the launcher" || fail "58b" "rc=$rc calls=$(cat "$LCALLS" 2>/dev/null) audit=$CALLER $(cat "$T/err")"
+printf '{"model":"opus"}\n' > "$T/cfg/settings.json"; rm -f "$LCALLS"; hold
+rc=$(CTLB_NO_LOCK=1 TMUX_PANE_TEXT="$GW" brun sonnet --confirm --launcher "$T/launcher.sh")
+[ "$rc" = 10 ] && [ ! -e "$LCALLS" ] && grep -q "launcher rc=13" "$T/err" \
+  && ok "58c bundle with a ctl that takes no launch lock: refused (rc=10, launcher rc=13), nothing started" || fail "58c" "rc=$rc calls=$(cat "$LCALLS" 2>/dev/null) $(cat "$T/err")"
+rm -f "$T/state/core-limit-hold.json"
+
 # --- a sibling session's core (`<session>-worker`) is not this session's, in either name form
 if command -v cc > /dev/null 2>&1; then
   printf '#include <unistd.h>\nint main(void){sleep(60);return 0;}\n' > "$T/c.c"; mkdir -p "$T/cb"; cc -o "$T/cb/claude" "$T/c.c"
@@ -263,4 +285,4 @@ else
   ok "59-62 skipped: no cc to build a process named claude"
 fi
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 64 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+echo; [ $fails -eq 0 ] && echo "switch-model: all 66 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }

@@ -97,6 +97,15 @@ class Route(Base):
                                 "--runtime", "codex", "--restart", "--visible"])
         self.assertEqual(via, CR.VIA_START_CLI)
 
+    def test_a_start_runs_the_launcher_with_no_restart_flag_outside_the_bundle(self):
+        argv, via = self.route(self.clone, start=True, start_cli="/x/L")
+        self.assertEqual((argv, via), (["bash", "/x/L"], CR.VIA_START_CLI))
+
+    def test_a_start_in_the_bundle_is_the_ctl_like_a_restart(self):
+        self.desktop()
+        argv, via = self.route(self.bundle, start=True, start_cli="/x/L")
+        self.assertEqual((via, argv[2]), (CR.VIA_CTL, "ctl"))
+
     def test_a_given_launcher_is_kept_outside_the_app(self):
         argv, _via = self.route(self.clone, start_cli="/x/L")
         self.assertEqual(argv, ["bash", "/x/L", "--restart"])
@@ -340,6 +349,11 @@ class Restart(Base):
         execv.assert_called_once()
         self.assertEqual(execv.call_args[0][:2], ("bash", ["bash", "/x/stub", "--restart", "--visible"]))
 
+    def test_a_start_outside_the_bundle_execs_the_launcher_without_the_flag(self):
+        execv = mock.Mock()
+        CR.restart(self.ws, "switch-model", repo=self.clone, start_cli="/x/L", runner=Run(), execv=execv, start=True)
+        self.assertEqual(execv.call_args[0][:2], ("bash", ["bash", "/x/L"]))
+
     def test_in_the_bundle_the_ctl_runs_here_between_its_lines(self):
         self.desktop()
         run, execv = Run(rc=0), mock.Mock()
@@ -356,7 +370,10 @@ class Restart(Base):
         with mock.patch.object(CR, "restart", return_value=0) as r:
             self.assertEqual(CR.main(["restart", "--workspace", "/w", "--caller", "g", "--repo", "/r",
                                       "--start-cli", "/s", "--", "--visible"]), 0)
-        r.assert_called_once_with(Path("/w"), "g", runtime=None, extra=["--visible"], start_cli="/s", repo=Path("/r"))
+            CR.main(["restart", "--start", "--workspace", "/w", "--caller", "switch-model"])
+        r.assert_any_call(Path("/w"), "g", runtime=None, extra=["--visible"], start_cli="/s", repo=Path("/r"),
+                          start=False)
+        self.assertTrue(r.call_args.kwargs["start"])
 
 
 class LimitHoldRetry(Base):
