@@ -178,6 +178,7 @@ fi
 install_claude_personal_hook
 resolve_claude_cwd_args
 resolve_claude_config_dir_and_seed
+apply_skill_session_config
 resolve_claude_settings_args
 apply_claude_obs_metering
 apply_claude_tmux_defaults

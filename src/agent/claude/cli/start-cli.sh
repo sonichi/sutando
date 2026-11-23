@@ -188,6 +188,7 @@ resolve_claude_cwd_args
 # pane, and src/startup.sh all exec this script), so seeding here covers
 # every core path.
 resolve_claude_config_dir_and_seed
+apply_skill_session_config
 
 # NO --model flag: the core inherits the user's global model, so 1M stays the
 # default. An ambient env pin is indistinguishable from a deliberate choice.

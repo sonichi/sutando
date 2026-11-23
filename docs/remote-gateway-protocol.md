@@ -415,6 +415,34 @@ record is omitted, and the broker keeps its last value. A change in the record s
 heartbeat at once. A broker that answers `400` or `422` to a beat carrying the block gets the
 same beat again without it at once, and beats without it for the next hour.
 
+On the core's own lanes the heartbeat also carries a top-level `runtime_profile`, with the
+`runtime_profile.v1` capability: the core's model, the models it can switch to and its plan's
+name (schema and literal bodies in `contracts/runtime_profile.v1/`). It carries no usage and no
+limit state: `health.quota` (`quota_status.v1`) is the heartbeat's one source of both.
+`src/runtime_profile.py` builds it from the seat's model, the runtime's own model list and the
+CLI's signed-in account; the adapter injects its reader, so a standalone Sparrow and a pool
+worker's lane send none. Unknown is null: a Codex core reports no plan, `workers` is `[]` until
+workers report their own model, and a core whose model is unknown sends no block at all. A
+Codex core's model counts only when its picker was read during the launch `core-runtime.json`
+records. A model alias with no row in the runtime's list is given its version by the quota
+record's last request model, and only when that record is the signed-in account's: a proxy record
+by its `acct_` label, a status line record by its login digest. The proxy stamps each reading and
+each rejection with the `acct_` label of the credential its request was sent with, and only when
+it took that credential from its config dir's own keychain item with the dir's account unchanged
+across the pick; a passed-through credential is unbound, and a rejection counts only for a record
+of its own account. The recovery state and the limit hold act on a proxy record only when it is
+labeled with the core's signed-in account (with that account unknown, only an unlabeled record,
+as before), and a hold set while the account was unread does not bind an account read since. A
+switch option is a row the recovery card
+itself offers (`recovery_actions.switch_offer`, the held model avoided), its `token` the runtime
+list's opaque row key that the card's `switch_model:<token>` click names; its name comes from the
+model the row runs, and the plan name must be a few plain words. `plan.account` is `acct_` and six
+hex digits of the signed-in account's digest, never a name or address. Between beats the block is
+re-read every 15 seconds and a change other than `reported_at` sends the beat at once. It never
+exceeds 8192 bytes and is omitted when it cannot be built. A broker that answers `400` or `422` to
+a beat carrying it gets the same beat at once without it, and beats without it for the next hour;
+only if that beat is refused too are `health.recovery` and `health.quota` dropped.
+
 ### Task lifecycle *(opt-in: `REMOTE_TASK_LIFECYCLE_V2=1`)*
 
 - **Ack** adds `worker_id` (one lease-holder id per install, `state/relay-lease-worker-id`) and

@@ -555,8 +555,9 @@ connection to use. The rule:
 - a room ID's domain (after its first colon) picks the row whose `server` (or `agent_mxid`
   server) is **exactly** that domain, so a room on `dev.example.org` never matches a row for
   `example.org`;
-- an ID with no domain picks the one row whose bridge has a task open in that room (its
-  `state/remote-task-rooms[.<instance>].json`), else the primary;
+- an ID with no domain picks the primary (which lane once had a task in the room never decides:
+  a bridge's `state/remote-task-rooms[.<instance>].json` is its own delivery ledger, not an
+  identity signal);
 - no room picks the primary;
 - fewer than two rows, no primary, or an unreadable record answers `None`, and the tool keeps
   its single-connection credential chain unchanged.
@@ -583,15 +584,33 @@ A pool worker that has its own agent (`pool_identity.py add`) acts as that agent
 session. The seat names its worker in `SUTANDO_WORKER_ID`, and `connections.acting_identity`
 answers before the rule above:
 
-- a room on the server of the worker's own row resolves to that row, with the token its vault
-  key holds and its `agent_mxid`; with no room, the worker's only enabled row;
-- a room local state says is the core's stays with the core's rows: one where a core lane has a
-  task open and the worker's lane has none (that task is answered as the core's agent), and a
-  core lane's own owner DM (`state/owner-routing[.<instance>].json`, under the row's instance or a
-  launch-key alias its bridge runs as);
-- a disconnected row, a room on a server the worker has no row for, another worker's session
-  and the core's session all fall through to the rule above. The core never acts as a worker's
-  agent.
+- identity comes from the task being answered, never from which lane once handled the room. A
+  client answering a task passes it (`room_ops.py <verb> --task-file <task>`, `notify.py
+  --task-file`), and the reply posts as exactly the agent the task was addressed to, or is refused
+  (`connections.task_reply_agent`). The file must be readable and the live file of the id it
+  declares; its `receiving_instance` header and the lane that queued it must agree; the post's room
+  must be the task's own (`channel_id`, else `source_room_id`). A task addressed to the worker's
+  agent then posts as the worker's row. One addressed to a core agent also needs a verified task
+  envelope (`task_envelope.verify_text`; unsigned, invalid or unverifiable is refused), the worker to hold
+  it (in its own tasks folder, or in `tasks/` with the pool's delivery sentinel naming it) and the
+  task to be neither answered nor archived (`task_disposition`); it posts as that agent's core row.
+  A sentinel carries a lease, `{"delivered_at", "ttl_s"}`, written by the router
+  (`WORKER_POOL_DELIVERY_TTL_S`, default 4 h). A lapsed, missing or unreadable lease is logged
+  (`pool_delegation_not_current`) and still allowed. `WORKER_POOL_DELIVERY_EXPIRY=enforce`, which
+  would refuse it, is unavailable: `pool_delivery.ENFORCE_AVAILABLE` is False, so a configured
+  `enforce` reads as `warn` and logs `pool_delegation_enforce_unavailable`. It stays off until a
+  hand-back or renewal path lands, because a refused reply leaves the task in neither lane (the
+  review gap raised on #6760).
+  A mismatch is refused, never answered as another identity;
+- a post with no task is the worker's own: its row on the room's server, with the token its vault
+  key holds and its `agent_mxid`; with no room or a domainless one, its only enabled row. A core
+  lane's own owner DM (`state/owner-routing[.<instance>].json`, under the row's instance or a
+  launch-key alias its bridge runs as) stays the core's. A server the worker has no row on is
+  refused, never posted as the core;
+- when nothing serves the room the post is refused (`NoConnectionForRoom`), never sent with the
+  shared env or vault token;
+- a disconnected worker row, another worker's session and the core's session fall through to the
+  rule above. The core never acts as a worker's agent.
 
 A worker's lane delivers each task it queues to its worker itself, before the core can see it. The
 lane stages the task file, runs the core's declared task-event handler (the pool router, from
