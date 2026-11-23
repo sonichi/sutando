@@ -3,6 +3,7 @@
 # Suites those logs did not run (they were quarantined then) keep their previous row.
 # Regenerate: scripts/gen-suite-costs.sh -r '<run-ids>' <leg-logs>... > tests/<python|shell>-suite-costs.txt
 # A missing file counts as 1s; the table only steers balance, never which files run.
+# start-cli-claude-task-notifier{,-modes}: one measured 210s row, halved by launch count when the file was split.
 0 tests/a-fallback-hits-probe.test.py
 1 tests/access-mutate-cli-commands.test.py
 0 tests/access-mutate-cli-concurrency.test.py
@@ -1268,7 +1269,8 @@
 3 tests/start-cli-claude-hooks-wiring.test.py
 65 tests/start-cli-claude-task-notifier-heal.test.py
 87 tests/start-cli-claude-task-notifier-identity.test.py
-210 tests/start-cli-claude-task-notifier.test.py
+110 tests/start-cli-claude-task-notifier-modes.test.py
+110 tests/start-cli-claude-task-notifier.test.py
 0 tests/start-cli-claude-trust-seed.test.py
 0 tests/start-cli-dangerous-mode-seed.test.py
 0 tests/start-cli-fullscreen-upsell-seed.test.py
