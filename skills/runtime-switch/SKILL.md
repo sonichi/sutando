@@ -1,0 +1,50 @@
+---
+name: runtime-switch
+description: "The core's runtime card in the owner's DM: which runtime the core runs on (Codex or Claude Code) and a button to switch to the other. Checks the target is signed in first, restarts the core onto it after the current turn, and confirms in the DM. Owner-only, DM-only."
+user-invocable: true
+---
+
+# runtime-switch
+
+Use it when the **owner, in their DM**, asks to switch the core's runtime: "switch to Claude Code",
+"use Codex", "run on Codex", "换成 Claude Code", "切到 Codex", or asks which runtime the core is on
+and wants to change it. Anyone else, or any other room: say the runtime is switched from the owner's
+DM and do nothing. Never run `start-cli.sh --runtime …` or `--restart` yourself from inside the core.
+
+```bash
+python3 skills/runtime-switch/scripts/runtime_card.py post --room <owner DM> [--reply-to <event>]
+python3 skills/runtime-switch/scripts/runtime_card.py post --room <owner DM> --print   # the card, not sent
+python3 skills/runtime-switch/scripts/runtime_card.py status                          # JSON: in use, next start, confirmed core
+```
+
+Post the card even when the owner already named the runtime: the switch happens on the tap.
+
+## The card
+
+Two buttons, **Codex** and **Claude Code**; the runtime in use is the primary one and is named in the
+text. The note says what carries over: tasks, results, state, memory and the workspace are shared by
+both runtimes; only the live conversation does not.
+
+## A tap
+
+`src/agent_card.py click` routes a tap to `runtime_card.py reply` (the recorded handler). Only the
+owner's tap, in the DM the card was posted in, on a card this agent posted, acts
+(`agent_card.click_verdict`). A tap on the runtime in use changes nothing; a second switch while one
+is under way is refused.
+
+1. **Sign-in first, before anything stops.** Claude Code: `claude auth status --json` under the core's
+   config dir; Codex: `src/codex_account.py` on the core's Codex home (the account card's probes).
+   Not signed in, or not readable: the card answers **"Sign in to <runtime> first"** and points to the
+   desktop app's Settings → Connections → the Sutando (on this computer) row. Nothing restarts.
+2. Signed in: it answers "Switching the core from X to Y…" at once and starts `runtime_card.py switch`
+   detached, in its own session, because the core restarts.
+3. `switch` runs `src/agent/graceful-restart.sh -- --runtime <rt>`: it waits for the core's current
+   turn, then `start-cli.sh --restart --runtime <rt>`. The launcher writes the desktop's selection
+   (`runtime.json` `coreRuntime`) and `<workspace>/state/core-runtime.json` only once the new core's
+   panes run that CLI.
+4. `settle` confirms from those two, never from a heartbeat alone: the record names the target with a
+   session created after the switch began, and the runtime the launcher picks next is the target. It
+   posts "Switched. The core is now running on Y." or what could not be confirmed. When graceful-restart
+   did not stop the core (exit 3, 4, 5) it says the core is still on X.
+
+Its log is `<workspace>/logs/runtime-card.log`.

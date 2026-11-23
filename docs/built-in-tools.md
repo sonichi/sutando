@@ -472,6 +472,23 @@ Connections → the Sutando core's row → "Switch account". A tap on it reaches
 `account_card.py reply` through `src/agent_card.py click`; a "Use" tap restarts the core on the
 saved account and the card confirms the outcome in the DM. Details: `skills/account-switch/SKILL.md`.
 
+## Switch the core's runtime (Codex / Claude Code)
+
+Triggers, from the **owner in their DM only**: "switch to Claude Code", "use Codex", "run on Codex",
+"换成 Claude Code", "切到 Codex", or a tap on the core runtime card. Post the card; never run
+`start-cli.sh --runtime` or `--restart` from inside the core.
+
+```bash
+python3 skills/runtime-switch/scripts/runtime_card.py post --room <owner DM>   # the card
+python3 skills/runtime-switch/scripts/runtime_card.py status                   # the same facts as JSON
+```
+
+The card marks the runtime in use and offers "Codex" and "Claude Code". A tap checks the target is
+signed in before anything stops (otherwise it answers "Sign in to <runtime> first" and points to the
+desktop's Settings), then restarts the core onto it after the current turn and confirms in the DM from
+`state/core-runtime.json` and the desktop's selection. Tasks, memory and the workspace carry over; the
+live conversation does not. Details: `skills/runtime-switch/SKILL.md`.
+
 ## Check quota
 
 Triggers: "how much quota do I have", "am I near the limit", "when does it reset", and any paused
