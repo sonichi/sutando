@@ -1,4 +1,5 @@
 import type { Register } from 'claude-code'
+import type { KeptOffer } from '../types'
 
 const PLUGIN = 'ag2space-inbox'
 const POLL_MS = 1000
@@ -7,6 +8,10 @@ const STALE_TICKS = 30
 // record (verify and the card name it) once it has failed for STUCK_TICKS.
 const BACKOFF_MAX_TICKS = 60
 const STUCK_TICKS = 300
+// An offer taken back after a plugin reload whose turn's end was not seen: closed after this many ticks.
+const ADOPT_TICKS = 1800
+// The offers in flight, in the session's state: a reload starts this module's variables over, not these.
+const KEPT = { plugin: 'ag2space-inbox', key: 'offers' } as const
 const TASK_RE = /^task-[A-Za-z0-9._~-]+\.txt$/
 const ID_RE = /^[A-Za-z0-9._~-]+$/
 const VERDICTS = new Set(['verified', 'unsigned', 'invalid', 'unverifiable'])
@@ -77,7 +82,7 @@ function submittedAt(turnText: string, msg: string): number {
 // One lifecycle claim as the Mod sees it: the phase is the CLI's answer, never a shadow machine.
 type Offer = { file: string; rid: string; attempt: number; msg: string; hash: string; token: string; turnId: string; phase: string
                 confirming?: { turnId: string; hash: string; completed?: string }; stagedText?: string
-                parkPending?: string; unconfirmed?: boolean }
+                parkPending?: string; unconfirmed?: boolean; adoptedAt?: number }
 
 // One session's inbox state: what was seen and answered, the offers in flight, the live watch, the
 // session-id witness and whether intake is open.
@@ -189,10 +194,62 @@ function retireTask($: any, s: State, name: string, rid: string, why: string, do
   return clearMark($, s, name, { rid, why, fails: 0, delay: 0, next: s.tick, done })
 }
 
+// The offers as a reloaded plugin needs them, written at every change. An engine without `$.state` keeps
+// none, and a reload there goes the way it always has.
+async function keep($: any, s: State): Promise<void> {
+  const kept: KeptOffer[] = [...s.offers.values()].filter(o => !o.unconfirmed).map(o => ({
+    file: o.file, rid: o.rid, attempt: o.attempt, msg: o.msg, hash: o.hash, token: o.token, turnId: o.turnId, phase: o.phase,
+    ...(o.stagedText === undefined ? {} : { stagedText: o.stagedText }) }))
+  try { await $.state.set(KEPT, kept) } catch { /* not kept: the next reload fails closed */ }
+}
+
+// After a plugin reload inside a live session: take back the offers this plugin kept, but only those the CLI
+// still lists as this generation's open claims at the same attempt (`inbox inflight`). Such an offer goes on as
+// before: a queued prompt can still be confirmed, a running turn can still answer, an accepted answer is
+// published. Anything it did not keep, or the CLI does not list, is left to the claim, which fails closed (a
+// lost turn is answered as interrupted). With nothing kept the CLI is not asked.
+async function restore($: any, s: State): Promise<void> {
+  if (s.offers.size) return
+  let kept: KeptOffer[] = []
+  try {
+    const held = await $.state.get(KEPT)
+    kept = Array.isArray(held?.value) ? held.value.filter((o: any) => o && typeof o.rid === 'string' && ID_RE.test(o.rid)) : []
+  } catch { kept = [] }
+  if (!kept.length) return
+  const live = await cli($, s, ['inflight'])
+  const tasks = live.ok && live.data?.tasks && typeof live.data.tasks === 'object' ? live.data.tasks : null
+  if (!tasks) return
+  const took: string[] = []
+  for (const [rid, t] of Object.entries<any>(tasks)) {
+    if (!ID_RE.test(rid) || !t) continue
+    const k = kept.find(o => o.rid === rid && o.attempt === t.attempt)
+    if (!k) continue
+    const file = `${rid}.txt`
+    let offer: Offer
+    if (t.phase === 'CALLING') {
+      // Only the plugin that submitted it holds the token and the text its turn is checked against.
+      if (k.phase !== 'CALLING' || !k.token || !k.msg || !k.hash) continue
+      offer = { file, rid, attempt: k.attempt, msg: k.msg, hash: k.hash, token: k.token, turnId: '', phase: 'CALLING', adoptedAt: s.tick }
+      if (!s.pending) s.pending = offer
+    } else if ((t.phase === 'TURN_CONFIRMED' || t.phase === 'RESULT_STAGED') && typeof t.turn_id === 'string' && t.turn_id) {
+      offer = { file, rid, attempt: k.attempt, msg: k.msg, hash: k.hash, token: '', turnId: t.turn_id,
+                phase: t.phase, adoptedAt: s.tick, ...(k.stagedText === undefined ? {} : { stagedText: k.stagedText }) }
+      // An accepted answer needs no turn: published at the next tick.
+      if (t.phase === 'RESULT_STAGED') offer.parkPending = 'ended across a plugin reload'
+    } else continue
+    s.offers.set(rid, offer)
+    s.seen.add(file)
+    took.push(`${rid} (${offer.phase}${offer.parkPending ? ', closing' : ''})`)
+  }
+  if (took.length) await $.ui.log(`${PLUGIN}: taken back after a plugin reload: ${took.join(', ')}`, {})
+  await keep($, s)
+}
+
 // The one way a settled offer leaves the Mod's hands: through the mark clear.
 async function releaseOffer($: any, s: State, offer: Offer, why: string): Promise<boolean> {
   s.offers.delete(offer.rid)
   if (s.pending === offer) s.pending = null
+  await keep($, s)
   return retireTask($, s, offer.file, offer.rid, why, async () => {})
 }
 
@@ -233,6 +290,7 @@ async function confirmOffer($: any, s: State, offer: Offer): Promise<boolean> {
   if (r.ok || (r.hard && r.data?.turn_id)) {
     offer.turnId = c.turnId
     offer.phase = 'TURN_CONFIRMED'
+    await keep($, s)
     return (c.completed ? (await parkOffer($, s, offer, c.completed)).hard : false) || r.hard
   }
   await $.ui.log(`${PLUGIN}: ${offer.rid} turn not confirmed: ${r.data?.refused ?? ''}; held until the next start answers it`, {})
@@ -319,6 +377,10 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
       // No reopen on a tick whose session id did not read back unchanged.
       if (s.intake === 'closed' && !stopped && (!live || !(await reopenIntake($, s)))) return
       for (const o of [...s.offers.values()]) {
+        // Taken back after a reload and its turn's end never seen: closed, so intake is not held for good.
+        if (o.adoptedAt !== undefined && o.phase === 'TURN_CONFIRMED' && o.parkPending === undefined && s.tick - o.adoptedAt >= ADOPT_TICKS) {
+          o.parkPending = `did not end within ${ADOPT_TICKS / 60} minutes of a plugin reload`
+        }
         if (o.unconfirmed) { if (await settleUnconfirmed(o)) return; continue }
         if (o.confirming) { if (await confirmOffer($, s, o)) return }
         else if (o.parkPending !== undefined) {
@@ -434,6 +496,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
         s.offers.set(rid, offer)
         s.pending = offer
         s.seen.add(entry.name)
+        await keep($, s)
         s.retry.delete(entry.name)            // the offer owns the task now; releasing it clears any mark
         log(`submitting ${rid} (${ask.label}, attempt ${offer.attempt})`)
         $.prompt.submit({ text: msg }).then(
@@ -500,6 +563,8 @@ export const register: Register = (on) => {
     }
     // The connect launcher sets AG2_AUTOARM=1 beside the dirs: arm now, no model turn needed. A hand
     // launch without the marker keeps the explicit arming prompt.
+    // A reload inside a live session runs this again with empty variables: the offers it kept come back first.
+    await restore($, s)
     if ((await $.env.get('AG2_AUTOARM')) === '1') {
       let r: { result: string; isError?: boolean }
       try {
@@ -515,6 +580,14 @@ export const register: Register = (on) => {
 
   on('turn.start', async ($, e, next) => {
     await witness($, s, 'turn.start')
+    // A main-loop turn other than the one a taken-back offer is waiting on: that turn is over, its end unseen.
+    if (e.agentId === undefined) {
+      for (const o of s.offers.values()) {
+        if (o.adoptedAt !== undefined && o.phase === 'TURN_CONFIRMED' && o.parkPending === undefined && o.turnId !== e.turnId) {
+          o.parkPending = 'ended during a plugin reload'
+        }
+      }
+    }
     const offer = s.pending
     const at = offer ? submittedAt(String(e.text ?? ''), offer.msg) : -1
     // A transient close does not stop our own submitted turn's confirmation; a session change does.
@@ -567,7 +640,9 @@ export const register: Register = (on) => {
     if (!text.trim()) return { result: 'Error: text is empty; Sparrow never delivers a blank body', isError: true }
     if (!results) return { result: 'Error: no results dir: arm ag2space_inbox_watch or set AG2_RESULTS_DIR', isError: true }
     const again = ' (transient: call ag2space_reply again with the same text)'
-    if ((offer.phase === 'RESULT_STAGED' || offer.stagedText !== undefined) && text !== offer.stagedText) {
+    // An answer accepted before a reload whose text this plugin no longer holds is published as it is.
+    const acceptedUnseen = offer.adoptedAt !== undefined && offer.phase === 'RESULT_STAGED' && offer.stagedText === undefined
+    if (!acceptedUnseen && (offer.phase === 'RESULT_STAGED' || offer.stagedText !== undefined) && text !== offer.stagedText) {
       // The staged answer is the one publication delivers: a different text is refused, never swapped in.
       return { result: `Error: an answer is already staged for ${id} and is the one that will be delivered; call ` +
         `ag2space_reply again with exactly that text to publish it:\n${offer.stagedText ?? ''}`, isError: true }
@@ -579,6 +654,7 @@ export const register: Register = (on) => {
       if (!(staged.ok || (staged.hard && staged.data?.outcome === 'staged'))) return { result: `Error: stage refused: ${staged.data?.refused ?? staged.data?.error ?? ''}${staged.data?.retry || staged.hard ? again : ''}`, isError: true }
       offer.phase = 'RESULT_STAGED'
       offer.stagedText = text
+      await keep($, s)
     }
     const published = await cli($, s, ['publish', id])
     if (!(published.ok || (published.hard && published.data?.outcome === 'settled'))) return { result: `Error: publish refused: ${published.data?.refused ?? published.data?.error ?? ''}${published.data?.retry ? again : ''}`, isError: true }

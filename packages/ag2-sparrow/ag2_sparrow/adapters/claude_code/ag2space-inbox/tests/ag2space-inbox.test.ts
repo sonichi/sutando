@@ -35,7 +35,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
                                lockFailsOnce?: string[]; storeFailsOnce?: string[]; unreadableOnce?: string[];
                                committedHardOnce?: string[]; committedHardWhy?: string; stageLandsOnce?: boolean;
                                parkRefusedOnce?: boolean; authorizeLostOnce?: boolean; stageLinkFailsOnce?: boolean;
-                               lostTurnFsyncFails?: number;
+                               lostTurnFsyncFails?: number; otherGeneration?: string[]; inflightFails?: boolean;
                                parkAlwaysRefuses?: boolean; parkRefuses?: number; authorizeRetries?: number; stageThrows?: number } = {}) {
   const files: Record<string, string> = {}
   const submitted: string[] = []
@@ -297,6 +297,16 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       files[`/out/${task}.txt`] = claims[task].body!
       delete stuck[task]                                // the CLI clears the mark in the resolving write
       return answer({ ...done, answered: true, interrupted: true })
+    }
+    if (verb === 'inflight') {
+      // As the CLI: this generation's open claims past their call; read-only.
+      const tasks: Record<string, unknown> = {}
+      for (const [id, k] of Object.entries(claims)) {
+        if (['CALLING', 'TURN_CONFIRMED', 'RESULT_STAGED'].includes(k.phase) && !(opts.otherGeneration ?? []).includes(id)) {
+          tasks[id] = { phase: k.phase, turn_id: k.turnId ?? '', attempt: k.attempt }
+        }
+      }
+      return opts.inflightFails ? out(1, { refused: 'no live consumer holds /w' }) : out(0, { tasks })
     }
     if (verb === 'park') {
       // As the CLI: an accepted answer (its descriptor recorded) is published whatever the turn, never the failure.
@@ -1771,6 +1781,165 @@ test('a lost turn whose interruption landed before its directory fsync failed is
   expect(h.submitted.length).toBe(0)
 })
 
+// A plugin reload inside a live session: `register` and session.start run again with empty variables, and the
+// session's `$.state` still holds what the plugin kept. `kept` seeds that state; the claims are the CLI's.
+const KEPT = (rid: string, phase: string, more: Record<string, unknown> = {}) =>
+  ({ file: `${rid}.txt`, rid, attempt: 1, msg: `msg of ${rid}`, hash: 'h', token: 'tok', turnId: phase === 'CALLING' ? '' : 'turn-9', phase, ...more })
+const seed = (on: any, kept: unknown[]) => {
+  const writes: unknown[][] = []
+  on('state.get', () => ({ value: { value: kept, version: 1 } }))
+  on('state.set', (_: any, e: any) => { writes.push(e.value); return { value: { isSet: true, version: writes.length + 1 } } })
+  return writes
+}
+
+test('a reload mid-turn: the kept offer is taken back, never claimed again, and the running turn\'s reply is published once', async ($, on) => {
+  const h = host(on)
+  seed(on, [KEPT('task-r1', 'TURN_CONFIRMED')])
+  h.files['/in/task-r1.txt'] = TASK('task-r1')
+  h.claims['task-r1'] = { attempt: 1, phase: 'TURN_CONFIRMED', token: 'tok', hash: 'h', turnId: 'turn-9' }
+  await arm($, h)
+  await h.clock.advance(3000)
+  expect(verbs(h).includes('inflight')).toBe(true)
+  expect(verbs(h).includes('claim')).toBe(false)
+  expect(h.submitted.length).toBe(0)
+  expect(h.logs.some((l: string) => l.includes('taken back after a plugin reload: task-r1 (TURN_CONFIRMED)'))).toBe(true)
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-r1', text: 'four' })
+  expect(String(r.text ?? r.result)).toContain('Published /out/task-r1.txt')
+  expect(h.files['/out/task-r1.txt']).toBe('four\n')
+  await $.turn.complete({ turnId: 'turn-9', reason: 'answer', text: 'x' })
+  await h.clock.advance(2000)
+  expect(h.publishes()).toBe(1)
+  expect(h.claims['task-r1'].phase).toBe('SETTLED')
+  // Intake is open again: the next task is claimed and submitted as always.
+  h.files['/in/task-r2.txt'] = TASK('task-r2')
+  await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(1)
+})
+
+test('a reload before the turn started: the kept offer still confirms its own turn and is answered', async ($, on) => {
+  const h = host(on)
+  const msg = 'the submitted text of task-r3'
+  seed(on, [KEPT('task-r3', 'CALLING', { msg, hash: h.hash(msg) })])
+  h.files['/in/task-r3.txt'] = TASK('task-r3')
+  h.claims['task-r3'] = { attempt: 1, phase: 'CALLING', token: 'tok', hash: h.hash(msg) }
+  await arm($, h)
+  await h.clock.advance(2000)
+  expect(verbs(h).includes('claim')).toBe(false)
+  await $.turn.start({ text: FRAMED(msg), turnId: 'turn-3' })
+  expect(h.claims['task-r3'].phase).toBe('TURN_CONFIRMED')
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-r3', text: 'ok' })
+  expect(String(r.text ?? r.result)).toContain('Published /out/task-r3.txt')
+})
+
+test('a reload after an answer was accepted: the staged answer is published at the next tick, whatever is said later', async ($, on) => {
+  const h = host(on)
+  seed(on, [KEPT('task-r4', 'TURN_CONFIRMED')])               // kept before the stage landed
+  h.files['/in/task-r4.txt'] = TASK('task-r4')
+  h.claims['task-r4'] = { attempt: 1, phase: 'RESULT_STAGED', token: 'tok', hash: 'h', turnId: 'turn-9', staged: 'four\n', body: 'four\n', blobOk: true }
+  await arm($, h)
+  await h.clock.advance(1000)
+  expect(h.files['/out/task-r4.txt']).toBe('four\n')
+  expect(h.publishes()).toBe(1)
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-r4', text: 'five' })
+  expect(String(r.text ?? r.result)).toContain('already answered')
+})
+
+test('a reload whose turn ended unseen: the next turn of the session closes the taken-back offer', async ($, on) => {
+  const h = host(on)
+  seed(on, [KEPT('task-r5', 'TURN_CONFIRMED')])
+  h.files['/in/task-r5.txt'] = TASK('task-r5')
+  h.claims['task-r5'] = { attempt: 1, phase: 'TURN_CONFIRMED', token: 'tok', hash: 'h', turnId: 'turn-9' }
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: 'a subagent turn', turnId: 'turn-sub', agentId: 'agent-1' })
+  await h.clock.advance(1000)
+  expect(h.files['/out/task-r5.txt']).toBe(undefined)          // a subagent's turn says nothing about the main loop's
+  await $.turn.start({ text: 'something the person typed', turnId: 'turn-10' })
+  await h.clock.advance(1000)
+  expect(h.files['/out/task-r5.txt']).toContain('turn ended during a plugin reload without a reply')
+  expect(h.claims['task-r5'].phase).toBe('SETTLED')
+})
+
+test('a reload whose turn never ends in sight: the taken-back offer is closed after the bound, and intake goes on', async ($, on) => {
+  const h = host(on)
+  seed(on, [KEPT('task-r6', 'TURN_CONFIRMED')])
+  h.files['/in/task-r6.txt'] = TASK('task-r6')
+  h.claims['task-r6'] = { attempt: 1, phase: 'TURN_CONFIRMED', token: 'tok', hash: 'h', turnId: 'turn-9' }
+  await arm($, h)
+  await h.clock.advance(1790 * 1000)
+  expect(h.files['/out/task-r6.txt']).toBe(undefined)
+  h.files['/in/task-r7.txt'] = TASK('task-r7')
+  await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(0)                           // intake waits on the turn it took back
+  await h.clock.advance(15 * 1000)
+  expect(h.files['/out/task-r6.txt']).toContain('did not end within 30 minutes of a plugin reload')
+  expect(h.submitted.length).toBe(1)
+})
+
+const notTakenBack = async ($: any, on: any, opts: Record<string, unknown>) => {
+  const h = host(on, opts)
+  seed(on, [KEPT('task-r8', 'TURN_CONFIRMED'), { rid: '../x', phase: 'TURN_CONFIRMED' }, null, 'junk'])
+  h.files['/in/task-r8.txt'] = TASK('task-r8')
+  h.claims['task-r8'] = { attempt: 1, phase: 'TURN_CONFIRMED', token: 'tok', hash: 'h', turnId: 'turn-9' }
+  await arm($, h)
+  await h.clock.advance(2000)
+  expect(verbs(h).includes('claim')).toBe(true)
+  expect(h.files['/out/task-r8.txt']).toBe(INTERRUPTED)
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-r8', text: 'late' })
+  expect(String(r.text ?? r.result)).toContain('is not a task this session received')
+}
+
+test('a kept offer whose claim is another generation\'s is not taken back: the claim answers the lost turn as before', async ($, on) => {
+  await notTakenBack($, on, { otherGeneration: ['task-r8'] })
+})
+
+test('a kept offer is not taken back when the CLI cannot say what is in flight', async ($, on) => {
+  await notTakenBack($, on, { inflightFails: true })
+})
+
+test('a kept offer of another attempt, or a kept confirmed one the CLI lists as still calling, is not taken back', async ($, on) => {
+  const h = host(on)
+  seed(on, [KEPT('task-r9', 'TURN_CONFIRMED', { attempt: 2 }), KEPT('task-rA', 'TURN_CONFIRMED')])
+  h.claims['task-r9'] = { attempt: 1, phase: 'TURN_CONFIRMED', token: 'tok', hash: 'h', turnId: 'turn-9' }
+  h.claims['task-rA'] = { attempt: 1, phase: 'CALLING', token: 'tok', hash: 'h' }
+  await arm($, h)
+  expect(h.logs.some((l: string) => l.includes('taken back'))).toBe(false)
+  for (const id of ['task-r9', 'task-rA']) {
+    const r = await $.tool.call({ tool: REPLY, task_id: id, text: 'x' })
+    expect(String(r.text ?? r.result)).toContain('is not a task this session received')
+  }
+})
+
+test('the offers in flight are written to the session state at every change, and a state that cannot be written changes nothing', async ($, on) => {
+  const h = host(on)
+  const writes = seed(on, [])
+  h.files['/in/task-k1.txt'] = TASK('task-k1')
+  await arm($, h)
+  await h.clock.advance(1000)
+  const last = () => writes[writes.length - 1] as any[]
+  expect(last().map(o => [o.rid, o.phase, o.turnId])).toEqual([['task-k1', 'CALLING', '']])
+  expect(last()[0].msg).toBe(h.submitted[0])
+  expect(last()[0].token.length > 0).toBe(true)
+  await $.turn.start({ text: FRAMED(h.submitted[0]), turnId: 'turn-1' })
+  expect(last().map(o => [o.rid, o.phase, o.turnId])).toEqual([['task-k1', 'TURN_CONFIRMED', 'turn-1']])
+  await $.tool.call({ tool: REPLY, task_id: 'task-k1', text: 'four' })
+  expect(last()).toEqual([])
+  expect(verbs(h).includes('inflight')).toBe(false)             // nothing kept at the start: the CLI is not asked
+})
+
+test('an engine whose state cannot be read or written serves tasks as it always has', async ($, on) => {
+  const h = host(on)
+  on('state.get', () => { throw new Error('no state here') })
+  on('state.set', () => { throw new Error('no state here') })
+  h.files['/in/task-k2.txt'] = TASK('task-k2')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: FRAMED(h.submitted[0]), turnId: 'turn-1' })
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-k2', text: 'four' })
+  expect(String(r.text ?? r.result)).toContain('Published /out/task-k2.txt')
+  expect(verbs(h).includes('inflight')).toBe(false)
+})
+
 // Every scenario in cli-contract.ts, which tests/test_claude_code_adapter.py runs against the real verbs: the fake
 // answers each step with the same shape (exit, refused, retry, fields, keys), so it cannot drift from the CLI.
 test('the fake CLI answers every contract scenario as the real verbs do', async ($, on) => {
@@ -1804,6 +1973,11 @@ test('the fake CLI answers every contract scenario as the real verbs do', async 
       if (step.expect.reason_suffix !== undefined && !reason.endsWith(step.expect.reason_suffix)) bad.push(`reason ${JSON.stringify(reason)}`)
       for (const k of step.expect.marked ?? []) if (!(k in (data.stuck ?? {}))) bad.push(`${k} not marked`)
       for (const k of step.expect.unmarked ?? []) if (k in (data.stuck ?? {})) bad.push(`${k} still marked`)
+      for (const [k, want] of Object.entries<any>(step.expect.listed ?? {})) {
+        const got = (data.tasks ?? {})[k]
+        if (!got || Object.keys(want).some(f => got[f] !== want[f])) bad.push(`${k} listed as ${JSON.stringify(got)}, not ${JSON.stringify(want)}`)
+      }
+      for (const k of step.expect.unlisted ?? []) if (k in (data.tasks ?? {})) bad.push(`${k} still listed`)
       if (bad.length) diffs.push(`${sc.name}, step ${i} ${argv[0]}: ${bad.join('; ')}`)
     })
   }
@@ -1821,7 +1995,7 @@ function scenarioSetProblem(ran: string[]): string {
 
 test('the contract set pin fails on a dropped or an extra scenario', async () => {
   const names = (CONTRACT as any[]).map(sc => sc.name)
-  expect(names.length).toBe(33)
+  expect(names.length).toBe(34)
   expect(scenarioSetProblem(names)).toBe('')
   for (const i of [0, 17, names.length - 1]) {
     expect(scenarioSetProblem(names.filter((_, j) => j !== i))).toContain(`missing ${JSON.stringify([names[i]])}`)

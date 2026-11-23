@@ -34,7 +34,8 @@ export const CONTRACT_NAMES = [
  "park a turn whose answer is staged: the staged answer is published",
  "strict envelope with the key present: only verified is submitted",
  "strict envelope with the key file missing: every task held",
- "strict envelope whose verdict was read with another key: held"
+ "strict envelope whose verdict was read with another key: held",
+ "inflight lists a calling task, then its confirmed turn, and nothing once it is published"
 ]
 export const CONTRACT = [
  {
@@ -1743,6 +1744,175 @@ export const CONTRACT = [
       "submit": false,
       "reason": "the key file changed after this envelope was verified; verified again"
      }
+    }
+   }
+  ]
+ },
+ {
+  "name": "inflight lists a calling task, then its confirmed turn, and nothing once it is published",
+  "task": "task-fl1",
+  "tier": "owner",
+  "hmac": "off",
+  "steps": [
+   {
+    "argv": [
+     "claim",
+     "task-fl1"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "has": [
+      "attempt"
+     ]
+    },
+    "save": "attempt"
+   },
+   {
+    "argv": [
+     "inflight"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "has": [
+      "tasks"
+     ],
+     "unlisted": [
+      "task-fl1"
+     ]
+    }
+   },
+   {
+    "argv": [
+     "authorize",
+     "task-fl1",
+     "{attempt}",
+     "--text-hash",
+     "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "has": [
+      "token"
+     ]
+    },
+    "save": "token"
+   },
+   {
+    "argv": [
+     "inflight"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "listed": {
+      "task-fl1": {
+       "phase": "CALLING",
+       "turn_id": ""
+      }
+     }
+    }
+   },
+   {
+    "argv": [
+     "confirm",
+     "task-fl1",
+     "turn-i",
+     "{token}",
+     "--text-hash",
+     "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "turn_id": "turn-i"
+     }
+    }
+   },
+   {
+    "argv": [
+     "inflight"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "listed": {
+      "task-fl1": {
+       "phase": "TURN_CONFIRMED",
+       "turn_id": "turn-i"
+      }
+     }
+    }
+   },
+   {
+    "argv": [
+     "stage",
+     "task-fl1",
+     "turn-i"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "outcome": "staged"
+     }
+    },
+    "stdin": "done\n"
+   },
+   {
+    "argv": [
+     "inflight"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "listed": {
+      "task-fl1": {
+       "phase": "RESULT_STAGED",
+       "turn_id": "turn-i"
+      }
+     }
+    }
+   },
+   {
+    "argv": [
+     "publish",
+     "task-fl1"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "outcome": "settled"
+     }
+    }
+   },
+   {
+    "argv": [
+     "inflight"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "has": [
+      "tasks"
+     ],
+     "unlisted": [
+      "task-fl1"
+     ]
     }
    }
   ]
