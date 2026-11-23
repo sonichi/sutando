@@ -99,6 +99,7 @@ MAP = {
     "src/hitl/__init__.py": "hitl/__init__.py",
     "src/hitl/schema.py": "hitl/schema.py",
     "src/hitl/host.py": "hitl/host.py",
+    "src/hitl/instance_actions.py": "hitl/instance_actions.py",
     "src/hitl/manager.py": "hitl/manager.py",
     "src/hitl/projector.py": "hitl/projector.py",
     "src/hitl/renotify.py": "hitl/renotify.py",
