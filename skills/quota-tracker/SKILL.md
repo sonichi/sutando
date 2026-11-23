@@ -62,7 +62,7 @@ With the recorder on, Sutando's Claude sessions (the core and every pool worker)
 
 ## The quota in the s.space agent sidebar
 
-On by default. The gateway bridge sends the core's quota to s.space as `health.quota` on its existing heartbeat (`POST /v1/heartbeat`, capability `quota_status.v1`), next to `health.recovery`, so the agent sidebar can show it. The block is built by `src/quota_status.py` from the trusted record (`trusted_record()`: a status line record only for the core's current login), and carries only:
+On by default. The gateway bridge sends the core's quota to s.space as `health.quota` on its existing heartbeat (`POST /v1/heartbeat`, capability `quota_status.v1`), next to `health.recovery`, so the agent sidebar can show it. The block is built by `src/quota_status.py` from the trusted record (`trusted_record()`, the same rule recovery state and the limit hold use). A status line record is checked against the core's current login, and another login's record is never sent. A proxy record carries no account label, so it is used as-is: after an account switch on a proxy-routed (opted-out) core, the block can briefly show the previous account's numbers until the proxy's next write. The block carries only:
 
 ```json
 {"v": 1,
@@ -83,7 +83,7 @@ and, when limited:
  "last_checked": 1795176000}
 ```
 
-Times are epoch seconds. `limit_state` is `allowed`, `overage` or `rejected`. `resumes_at` is omitted when the state is `allowed`; otherwise it is present, and null when no reset time is known. A window the record does not name is left out. A window's `resets_at` and the block's `last_checked` are null when the record does not carry them. `used_pct` is not clamped: in `overage` it can exceed 100, and a consumer may clamp it for display. No account digest, other login's numbers, headers, rejection ledger or model is sent. The full heartbeat examples are `contracts/quota_status.v1/heartbeat.json` (allowed) and `heartbeat-limited.json` (limited).
+Times are epoch seconds. `limit_state` is `allowed`, `overage` or `rejected`. `resumes_at` is omitted when the state is `allowed`; otherwise it is present, and null when no reset time is known. A window the record does not name is left out. A window's `resets_at` and the block's `last_checked` are null when the record does not carry them. `used_pct` is not clamped: in `overage` it can exceed 100, and a consumer may clamp it for display. No account digest, headers, rejection ledger or model is sent. The full heartbeat examples are `contracts/quota_status.v1/heartbeat.json` (allowed) and `heartbeat-limited.json` (limited).
 
 - The block changes when a used percentage moves by at least 1 point or the limit state flips, and is otherwise refreshed at most every 5 minutes; a change sends a heartbeat early, nothing else does. The status line never sends anything.
 - A failed read keeps the last block; a broker that refuses the block (400/422) gets beats without it for an hour.
