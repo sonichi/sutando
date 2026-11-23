@@ -66,7 +66,7 @@ if ! { exec 9>"$LOCK"; } 2>/dev/null; then echo "switch-model: could not open th
 #   from the next task; recorded pending until Codex runs that turn (exit 12: pending, not switched);
 # - the Codex TUI: nothing typed into it; its launcher starts it with `-m` from the record, so it
 #   holds from the core's next start (exit 11: saved, the running core keeps its model until then);
-# - no core running: the same, from its next launch.
+# - no core running: the same, from its next launch (exit 13: saved, pending the next core start).
 if [ "$RUNTIME" = "codex" ]; then
   # shellcheck source=../../../src/agent/core-window.sh
   . "$REPO/src/agent/core-window.sh"
@@ -83,7 +83,7 @@ if [ "$RUNTIME" = "codex" ]; then
   case "$WHERE" in
     seat) echo "switch-model: pending model=$MODEL (was ${OUT#OK }): saved, not switched yet; the Codex core's app-server seat tries it on its next task and says when Codex has taken or refused it; until then it stays on ${OUT#OK }; pool workers keep their own model; record: $STATE_DIR/model-switch.json" >&2; exit 12;;
     tui) echo "switch-model: saved model=$MODEL (was ${OUT#OK }) for the Codex core's next start; the running Codex TUI keeps its model until then (owner-gated restart: bash src/agent/codex/cli/start-cli.sh --restart); pool workers keep their own model; record: $STATE_DIR/model-switch.json" >&2; exit 11;;
-    *) echo "switched: model=$MODEL (was ${OUT#OK }); the Codex core is not running, so it starts on it at its next launch; pool workers keep their own model; record: $STATE_DIR/model-switch.json"; exit 0;;
+    *) echo "switch-model: saved model=$MODEL (was ${OUT#OK }); applies at the next core start (no Codex core is running), not switched yet; pool workers keep their own model; record: $STATE_DIR/model-switch.json" >&2; exit 13;;
   esac
 fi
 # The launcher's own test for a running core: a `claude` process named for the session. A `pgrep -f`

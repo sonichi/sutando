@@ -237,7 +237,7 @@ class Seat:
         self.model_rev = self.launch_rev()
         # (model, rev, the model to restore, sent on turn/start) until Codex settles it
         self.trial: Optional[tuple] = None
-        self.restore: Optional[str] = None  # the next turn passes this model explicitly
+        self.restore: Optional[str] = None  # passed explicitly on every turn until one completes on it
         self.attempts: dict = {}
         self.cwd = host.cwd or str(self.workspace)
         self.rpc: Optional[Rpc] = None
@@ -601,8 +601,7 @@ class Seat:
         if self.worker:
             return ""
         if self.restore is not None:
-            model, self.restore = self.restore, None
-            return model
+            return self.restore  # kept until Codex completes a turn on it (_run_turn)
         picked, rev = codex_core_model.pending(self.workspace / "state")
         if not picked or rev <= self.model_rev or self.attempts.get(rev, 0) >= TRIAL_ATTEMPTS:
             return ""
@@ -655,6 +654,8 @@ class Seat:
         picked, rev, before, sent = self.trial
         self.trial = None
         try:
+            if accepted:  # recorded even when a newer pick is pending: a restart then starts on it
+                codex_core_model.confirm(self.workspace / "state", picked, rev)
             settled = codex_core_model.resolve(self.workspace / "state", rev, accepted, reason)
         except OSError as e:
             settled = None
@@ -698,12 +699,12 @@ class Seat:
                     raise
                 before = self.trial[2]
                 self.abandon_trial()
-                self.restore = None
                 params.pop("model")
                 if before:
                     params["model"] = before
                 res = self.rpc.request("turn/start", params)
             turn_id = res["turn"]["id"]
+            sent_model = params.get("model")
         except (RuntimeError, KeyError, TypeError) as e:
             return ("server-exited" if not self.rpc.alive() else "failed"), one_line(e, 240)
         log(f"task {filename}: turn started ({turn_id})")
@@ -729,6 +730,8 @@ class Seat:
                         error = (turn.get("error") or {}).get("message") or ""
                         if status == "completed":
                             self.settle_model(True)
+                            if self.restore is not None and sent_model == self.restore:
+                                self.restore = None
                         if interrupted and status == "interrupted":
                             return interrupted, error
                         return status, error

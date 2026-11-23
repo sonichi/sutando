@@ -929,6 +929,14 @@ class CodexCore(Base):
         body, card = mc.notice_card(state, "Pending", words)
         self.assertEqual((card["state"], card["header"]["status"]["label"]), ("pending", "Pending"))
 
+    def test_a_pick_saved_with_no_core_running_is_pending_for_the_next_start(self):
+        self.using("gpt-b", runtime="codex", status="pending", working="gpt-a", accepted=False, rev=2,
+                   applied="next-start")
+        state, words = mc.outcome(self.ws, "gpt-b", mc.NEXT_START_RC)
+        self.assertEqual(state, "pending")
+        self.assertIn("applies at the next core start", words)
+        self.assertNotIn("Switched", words)
+
     def test_a_refused_pick_names_the_working_model_in_use(self):
         self.using("gpt-b", runtime="codex", status="rejected", working="gpt-a", accepted=False, rev=2)
         self.assertEqual(mc.current_model(self.ws)["name"], "GPT A")

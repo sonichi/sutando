@@ -1009,8 +1009,39 @@ class CoreModelSwitch(SeatCase):
             self.assertEqual(s.turn_model(), "gpt-new")
             s.abandon_trial()
             self.assertEqual(s.turn_model(), "gpt-old", "the thread is moved back off the untried pick")
+            s.restore = None  # a turn completed on it
         self.assertEqual(s.turn_model(), "")
         self.assertEqual(self.record()["status"], "pending")
+
+    def test_the_restore_holds_until_codex_completes_a_turn_on_it(self):
+        self.catalog("gpt-old", "gpt-new")
+        s = self.launched(0, model="gpt-old")
+        s.ensure_server()
+        self.switch("gpt-new")
+        self.assertEqual(s.turn_model(), "gpt-new")
+        s.abandon_trial()  # no verdict: the thread may be on gpt-new, so it must go back
+        (self.fake_dir / "plan.json").write_text(json.dumps(["fail", "none"]))
+        self.assertEqual(s.run_turn("task-1.txt", "hello")[0], "failed")
+        self.assertEqual(s.restore, "gpt-old", "a failed turn on the restore keeps the intent")
+        self.assertEqual(s.run_turn("task-2.txt", "hello")[0], "completed")
+        self.assertIsNone(s.restore)
+        self.assertEqual([r["params"].get("model") for r in self.sent("turn/start")], ["gpt-old", "gpt-old"])
+
+    def test_a_pick_codex_ran_while_a_newer_one_was_saved_is_still_the_confirmed_model(self):
+        self.catalog("gpt-old", "gpt-new", "gpt-bad-later")
+        self.switch("gpt-old", accepted=True)
+        s = self.launched(1, model="gpt-old")
+        self.switch("gpt-new")                      # rev 2: tried on the next turn
+        s.ensure_server()
+        self.assertEqual(s.turn_model(), "gpt-new")
+        self.switch("gpt-bad-later")                # rev 3 saved while that turn runs
+        s.settle_model(True)                         # Codex completed the turn on gpt-new
+        rec = self.record()
+        self.assertEqual((rec["status"], rec["rev"], rec["confirmed"], rec["confirmed_rev"]),
+                         ("pending", 3, "gpt-new", 2), "rev 3 is not settled by rev 2's turn")
+        seat_mod.codex_core_model.resolve(self.ws / "state", 3, False, "refused")
+        self.assertEqual(seat_mod.codex_core_model.launch(self.ws / "state")[2], "gpt-new",
+                         "a restart after the newer pick fails starts on what Codex last ran")
 
     def test_codex_taking_the_pick_tells_the_owner(self):
         self.catalog("gpt-old", "gpt-new")
