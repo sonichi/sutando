@@ -428,17 +428,21 @@ and before saying an account switch took effect. `codex login status` only says 
 ChatGPT"; do not answer from it. On a Codex core run:
 
 ```bash
-python3 src/codex_account.py                       # the core's Codex home: "signed in as <email>, <plan> plan"
-python3 src/codex_account.py --json                # {codex_home, email, plan, workspace, kind, source}
-python3 src/codex_account.py --codex-home <dir>    # a worker's own Codex home, when it has one
+python3 src/codex_account.py --task-file <task file>              # the core's Codex home: "signed in as <email>, <plan> plan"
+python3 src/codex_account.py --task-file <task file> --json       # {codex_home, email, plan, workspace, kind, source, verified}
+python3 src/codex_account.py --task-file <task file> --codex-home <dir>   # a worker's own Codex home, when it has one
 ```
 
-It asks Codex itself (`account/read` on a short-lived `codex app-server` under that home) and falls
-back to the email and plan claims of the home's `auth.json` id_token; it prints only the email, plan,
-workspace and login kind, never a token, and never print or quote `auth.json` yourself. Pool Codex
-workers run under the core's home today, so the core's answer is theirs too. Exit 1 means that home
-is signed out (or its login cannot be read): say so. The answer is the owner's account data: give it
-to the owner only.
+Always pass the asking task's `--task-file`: the account is the owner's data, so it is looked up only
+for an owner task asked in the owner's DM or outside any room (exit 3 otherwise: answer in the
+owner's DM instead, and post nothing about it in the room). The home is the one the Codex core
+launcher uses, with the same checks; a home it would refuse is reported, not read. It asks Codex
+itself (`account/read` on a short-lived `codex app-server` under that home); Codex saying signed out
+is final. Only when Codex cannot answer does it read the email and plan claims of the home's
+`auth.json` id_token, and then `verified` is false: say the answer comes from the saved sign-in and
+was not confirmed. It prints only the email, plan, workspace and login kind, never a token, and never
+print or quote `auth.json` yourself. Pool Codex workers run under the core's home today, so the
+core's answer is theirs too. Exit 1 means that home is signed out (or its login cannot be read): say so.
 
 ## Switch the core's account
 
