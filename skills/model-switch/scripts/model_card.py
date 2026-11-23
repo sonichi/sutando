@@ -94,7 +94,8 @@ REASONS = {1: "the switch could not be locked or recorded",
            10: "the model is set for the next start, but the core did not start",
            11: "it is saved, and the core uses it from its next start"}
 # Exit 12: a Codex seat saved the pick; it is not switched until Codex runs a turn on it.
-PENDING_RC = 12
+# Exit 13: no core is running; the pick applies at the next core start.
+PENDING_RC, NEXT_START_RC = 12, 13
 # The detached line: the switch, then always the outcome card with the switch's exit code.
 DETACHED = ('bash "$1" "$2" --confirm --accept-timeout "$3" --state-dir "$4"; '
             '"$5" "$6" --workspace "$7" settle --room "$8" --model "$2" --attempt "$9" --rc $?')
@@ -264,6 +265,9 @@ def outcome(ws: Path, alias: str, rc: int) -> tuple:
     """(state, words) for a switch to `alias` that exited `rc`."""
     if rc == 0:
         return "done", f"Switched. I'm now using {name_of(alias)}."
+    if rc == NEXT_START_RC:
+        return "pending", (f"Saved; {name_of(alias)} applies at the next core start. No core is running "
+                           "now, so nothing has switched yet.")
     if rc == PENDING_RC:
         return "pending", (f"Saved, not switched yet: I'll try {name_of(alias)} on my next task. Until "
                            f"Codex has run it I'm still using {still_using(ws, alias)}. I'll tell you "

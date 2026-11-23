@@ -1009,8 +1009,23 @@ class CoreModelSwitch(SeatCase):
             self.assertEqual(s.turn_model(), "gpt-new")
             s.abandon_trial()
             self.assertEqual(s.turn_model(), "gpt-old", "the thread is moved back off the untried pick")
+            s.restore = None  # a turn completed on it
         self.assertEqual(s.turn_model(), "")
         self.assertEqual(self.record()["status"], "pending")
+
+    def test_the_restore_holds_until_codex_completes_a_turn_on_it(self):
+        self.catalog("gpt-old", "gpt-new")
+        s = self.launched(0, model="gpt-old")
+        s.ensure_server()
+        self.switch("gpt-new")
+        self.assertEqual(s.turn_model(), "gpt-new")
+        s.abandon_trial()  # no verdict: the thread may be on gpt-new, so it must go back
+        (self.fake_dir / "plan.json").write_text(json.dumps(["fail", "none"]))
+        self.assertEqual(s.run_turn("task-1.txt", "hello")[0], "failed")
+        self.assertEqual(s.restore, "gpt-old", "a failed turn on the restore keeps the intent")
+        self.assertEqual(s.run_turn("task-2.txt", "hello")[0], "completed")
+        self.assertIsNone(s.restore)
+        self.assertEqual([r["params"].get("model") for r in self.sent("turn/start")], ["gpt-old", "gpt-old"])
 
     def test_codex_taking_the_pick_tells_the_owner(self):
         self.catalog("gpt-old", "gpt-new")

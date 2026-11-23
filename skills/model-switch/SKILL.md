@@ -89,7 +89,8 @@ as a Codex model). Nothing is typed into a pane. Under the same lock:
 - the core is a Codex TUI: `applied: next-start`, `accepted: false`, **exit 11** — saved, the running
   TUI keeps its model until its next start (owner-gated `bash src/agent/codex/cli/start-cli.sh
   --restart`).
-- no core runs: `applied: next-start`, exit 0.
+- no core runs: `applied: next-start`, `status: pending`, **exit 13**: saved, applies at the next core
+  start. Say it as saved, not switched.
 
 `src/agent/codex/cli/start-cli.sh` launches the core with `-m` from the record whenever this launch
 sets no `SUTANDO_CORE_MODEL` (an explicit one wins). The pool's worker launcher reads none of it.

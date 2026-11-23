@@ -35,8 +35,9 @@ rc=$(TMUX_PANES="$TUI" run gpt-5.6-terra); R=$(rec)
 [ "$rc" = 11 ] && [ "$R" = "gpt-5.6-terra codex False next-start gpt-6-luna" ] && grep -q "next start" "$T/err" \
   && ok "6 Codex TUI: rc=11, saved for the core's next start, previous kept" || fail "6" "rc=$rc R=$R $(cat "$T/err")"
 rc=$(run gpt-5.6-luna); R=$(rec)
-[ "$rc" = 0 ] && [ "$R" = "gpt-5.6-luna codex False next-start gpt-5.6-terra" ] && grep -q "next launch" "$T/out" \
-  && ok "7 no core running: rc=0, saved for its next launch" || fail "7" "rc=$rc R=$R $(cat "$T/err")"
+[ "$rc" = 13 ] && [ "$R" = "gpt-5.6-luna codex False next-start gpt-5.6-terra" ] && grep -q "applies at the next core start" "$T/err" \
+  && ! grep -q "^switched" "$T/out" \
+  && ok "7 no core running: rc=13, saved, applies at the next core start, never said switched" || fail "7" "rc=$rc R=$R $(cat "$T/err")"
 ! grep -q "send-keys" "$TMUX_LOG" && ok "8 nothing is typed into any pane" || fail "8" "$(cat "$TMUX_LOG")"
 [ "$(cat "$T/codex-home/config.toml")" = "$HOME_BEFORE" ] && ok "9 the shared CODEX_HOME config.toml (the workers' model) is untouched" || fail "9" "$(cat "$T/codex-home/config.toml")"
 
