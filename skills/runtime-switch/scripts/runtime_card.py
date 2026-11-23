@@ -32,6 +32,14 @@ pick next (desktop selection, else config) is the target too. It posts the outco
 The workspace, tasks, results, state and memory are shared by both runtimes; only the live
 conversation does not carry over, and the cards say so.
 
+One card, updated in place (owner 2026-11-23): the "switching" answer is an edit of the tapped card's
+own event (`room.message.edit`), and the outcome edits that same event again (the detached `switch`
+gets it as `--card`), so a tap adds no message. No Action carries a card in an edit, so the event then
+shows the words in place of the card. The "Sign in first" card is still posted as a card of its own:
+its sign-in controls cannot ride in an edit. Its event is kept with the wait, and the waiter edits it
+to the "switching" words, to "gave up", or, when the core is already on that runtime (switched some
+other way), to say so. Where an edit cannot be made the answer is posted as a card, as before.
+
 One switch runs at a time (a lock and a record, as the account card). Every command prints one JSON
 object. Exit 0 done, 1 a negative answer, 2 refused. Stdlib only.
 """
@@ -241,6 +249,50 @@ def _post(ws: Path, room: str, body: str, card: dict, operation_id: str, *, repl
     return {"status": "posted", "event_id": eid}
 
 
+def card_words(words: str) -> str:
+    """What an edited card says: the card is gone from the event, so the words name it."""
+    return f"Core runtime: {words}"
+
+
+def _edit(ws: Path, room: str, event: str, words: str, operation_id: str, *, core=None, execute=None) -> dict:
+    """Show `words` in place of the card at `event` (the owner's checked DM only); {"status": "posted",
+    "event_id": event, "edited": True}, or {"status": "failed", "why"} when it cannot be edited."""
+    if not event:
+        return {"status": "failed", "why": "no card to edit"}
+    try:
+        core = core if core is not None else _core(ws)
+        lane = str(core.get("instance") or "")
+        if room != _owner_dm(ws, core):
+            return {"status": "failed", "why": "the card is not in the owner's DM"}
+        execute = execute if execute is not None else _execute(ws, lane or None)
+        answer = execute("room.message.edit", {"event_id": event, "body": card_words(words)},
+                         operation_id=operation_id, room_id=room)
+    except Exception as e:  # noqa: BLE001 - not edited: the caller posts the card instead
+        return {"status": "failed", "why": f"{type(e).__name__}: {e}"}
+    if not isinstance(answer, dict) or answer.get("is_error") or not ac._event_id(answer):
+        code = str(answer.get("code") or answer.get("error") or "") if isinstance(answer, dict) else ""
+        return {"status": "failed", "why": f"room.message.edit did not edit the card{f' ({code})' if code else ''}"}
+    return {"status": "posted", "event_id": event, "edited": True}
+
+
+def _answer(ws: Path, room: str, card_event: str, state: str, status: str, words: str, operation_id: str, *,
+            reply_to: str = "", core=None, execute=None, tries: int = 1, sleep=time.sleep) -> dict:
+    """Say `words` by editing `card_event` in place; only when that cannot be done (no card, or its last
+    try refused) post them as a notice card. Up to `tries` tries, POST_PAUSE_S apart."""
+    out = {"status": "failed"}
+    for i in range(max(tries, 1)):
+        if card_event:
+            out = _edit(ws, room, card_event, words, operation_id + "-edit", core=core, execute=execute)
+        if out["status"] != "posted" and (not card_event or i + 1 == tries):
+            body, card = notice_card(state, status, words)
+            out = _post(ws, room, body, card, operation_id, reply_to=reply_to, core=core, execute=execute)
+        if out["status"] == "posted":
+            break
+        if i + 1 < tries:
+            sleep(POST_PAUSE_S)
+    return out
+
+
 def _read_json(path: Path) -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -334,7 +386,8 @@ def start_waiter(ws: Path, wait: dict, popen=subprocess.Popen) -> int:
 def begin_switch(ws: Path, room: str, rt: str, current: str, t: float, *, event: str = "", core=None,
                  execute=None, popen=subprocess.Popen) -> dict:
     """Admit one switch to `rt`, say so in the room, and start it detached. What a tap on a signed-in
-    runtime does, and what the sign-in waiter does once the sign-in is there."""
+    runtime does, and what the sign-in waiter does once the sign-in is there. `event` is the card the
+    tap answered: it is edited to say so, and the outcome edits it again."""
     attempt = f"{int(t)}-{secrets.token_hex(4)}"
     rec = {"attempt": attempt, "runtime": rt, "room": room, "ts": t}
     try:
@@ -344,11 +397,10 @@ def begin_switch(ws: Path, room: str, rt: str, current: str, t: float, *, event:
         return {"status": "failed", "say": "I couldn't start the switch. Nothing changed.", "why": type(e).__name__}
     say = (f"Switching the core from {name(current)} to {name(rt)}. It restarts once this turn has finished; "
            f"I'll confirm here when it is back. {CARRIES}")
-    body, card = notice_card("pending", "Switching", say)
-    posted = _post(ws, room, body, card, f"runtime-card:{attempt}:switching", reply_to=event, core=core or None,
-                   execute=execute)
+    posted = _answer(ws, room, event, "pending", "Switching", say, f"runtime-card:{attempt}:switching",
+                     reply_to=event, core=core or None, execute=execute)
     try:
-        pid = start_switch(ws, room, rt, attempt, popen)
+        pid = start_switch(ws, room, rt, attempt, popen, card=event if posted.get("edited") else "")
     except OSError as e:
         release(ws, rec)
         return {"status": "failed", "say": "I couldn't start the switch. Nothing changed.",
@@ -365,6 +417,16 @@ def set_wait(ws: Path, wait: dict) -> None:
     ws.joinpath(*WAITING).parent.mkdir(parents=True, exist_ok=True)
     with locked_file(ws.joinpath(*WAITING_LOCK), create_mode=0o600):
         write_whole(ws.joinpath(*WAITING), wait)
+
+
+def keep_wait_card(ws: Path, mine: dict, event: str) -> None:
+    """Keep `event`, the "Sign in first" card, with the wait that is still `mine`, for the waiter to edit."""
+    from file_lock import locked_file
+    from local_record import write_whole
+    with locked_file(ws.joinpath(*WAITING_LOCK), create_mode=0o600):
+        rec = _read_json(ws.joinpath(*WAITING))
+        if {k: rec.get(k) for k in mine} == mine:
+            write_whole(ws.joinpath(*WAITING), dict(rec, card=event))
 
 
 def claim_wait(ws: Path, mine: Optional[dict]) -> bool:
@@ -400,33 +462,39 @@ def cmd_await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
         if rec is None:
             return _emit(superseded)
         deadline = float(rec.get("ts") or 0) + SIGN_IN_WAIT_S
+        card_event = str(rec.get("card") or "")
         if runtime() == args.runtime:
-            claim_wait(ws, mine)
-            return _emit({"status": "already", "runtime": args.runtime})
+            out = {"status": "already", "runtime": args.runtime}
+            if claim_wait(ws, mine) and card_event:
+                # Switched some other way (the desktop, say): the "Sign in first" card says so in place.
+                words = f"The core is now running on {name(args.runtime)}. {CARRIES}"
+                out["edited"] = _edit(ws, args.room, card_event, words, f"runtime-card:signin:{args.attempt}:already-edit",
+                                      core=core, execute=execute)["status"]
+            return _emit(out)
         there = signed_in(args.runtime, run=run, codex_read=codex_read) is True     # may take a while
         if there and clock() < deadline:
             if not claim_wait(ws, mine):
                 return _emit(superseded)
-            out = begin_switch(ws, args.room, args.runtime, runtime(), clock(), core=core, execute=execute,
-                               popen=popen)
+            out = begin_switch(ws, args.room, args.runtime, runtime(), clock(), event=card_event, core=core,
+                               execute=execute, popen=popen)
             return _emit(dict(out, after_sign_in=True), 0 if out["status"] == "started" else 1)
         if clock() >= deadline:
             if not claim_wait(ws, mine):
                 return _emit(superseded)
             words = SIGN_IN_GAVE_UP.format(name=name(args.runtime), minutes=SIGN_IN_WAIT_S // 60, was=name(runtime()))
-            body, card = notice_card("error", "Not switched", words)
-            posted = _post(ws, args.room, body, card, f"runtime-card:signin:{args.attempt}:gave-up", core=core,
-                           execute=execute)
+            posted = _answer(ws, args.room, card_event, "error", "Not switched", words,
+                             f"runtime-card:signin:{args.attempt}:gave-up", core=core, execute=execute)
             return _emit({"status": "gave_up", "runtime": args.runtime, "say": words, "posted": posted["status"]}, 1)
         sleep(SIGN_IN_POLL_S)
 
 
-def start_switch(ws: Path, room: str, rt: str, attempt: str, popen=subprocess.Popen) -> int:
-    """Start `switch` in a session of its own, so it outlives the core's restart; its pid."""
+def start_switch(ws: Path, room: str, rt: str, attempt: str, popen=subprocess.Popen, card: str = "") -> int:
+    """Start `switch` in a session of its own, so it outlives the core's restart; its pid. `card` is the
+    event its outcome edits in place ("" posts the outcome as a card)."""
     log = ws / "logs" / "runtime-card.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     argv = ["nohup", sys.executable, str(Path(__file__).resolve()), "--workspace", str(ws), "switch",
-            "--room", room, "--runtime", rt, "--attempt", attempt]
+            "--room", room, "--runtime", rt, "--attempt", attempt] + (["--card", card] if card else [])
     with open(log, "ab") as fh:
         fh.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} runtime switch to {rt} ({attempt})\n".encode())
         fh.flush()
@@ -474,6 +542,11 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
         body, card = sign_in_card(rt, state, waiting)
         posted = _post(ws, room, body, card, f"runtime-card:signin:{wait['attempt']}", reply_to=event,
                        core=core or None, execute=execute)
+        if waiting and posted.get("event_id"):
+            try:
+                keep_wait_card(ws, mine, posted["event_id"])
+            except OSError:
+                pass  # the waiter then posts its answer as a card of its own
         out.update(say=sign_in_words(rt, state, waiting),
                    **({"event_id": posted["event_id"]} if posted.get("event_id") else {}))
         return _emit(out, 1)
@@ -536,18 +609,12 @@ def outcome(rt: str, was: str, got: dict, rc: int = 0) -> tuple:
 
 
 def settle_and_tell(ws: Path, room: str, rt: str, was: str, since: float, attempt: str, *, rc: int = 0,
-                    core=None, execute=None, sleep=time.sleep, clock=time.time) -> dict:
+                    card: str = "", core=None, execute=None, sleep=time.sleep, clock=time.time) -> dict:
     got = confirm(ws, rt, since, sleep=sleep, clock=clock)
     state, words = outcome(rt, was, got, rc)
     status = {"done": "Switched", "info": "Switched"}.get(state, "Not confirmed")
-    body, card = notice_card(state, status, words)
-    out = {"status": "failed"}
-    for i in range(POST_TRIES):
-        out = _post(ws, room, body, card, f"runtime-card:{attempt}:outcome", core=core, execute=execute)
-        if out["status"] == "posted":
-            break
-        if i + 1 < POST_TRIES:
-            sleep(POST_PAUSE_S)
+    out = _answer(ws, room, card, state, status, words, f"runtime-card:{attempt}:outcome", core=core,
+                  execute=execute, tries=POST_TRIES, sleep=sleep)
     return {**out, "outcome": state, "say": words, "core_confirmed": got["core"],
             "selection_confirmed": got["selected"]}
 
@@ -574,18 +641,12 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
                 reason = RESTART_REASONS[rc]
                 words = (f"I could not switch to {name(args.runtime)}. The core is still on {name(was)}. "
                          f"{reason[:1].upper()}{reason[1:]}.")
-                body, card = notice_card("error", "Not switched", words)
-                out = {"status": "failed"}
-                for i in range(POST_TRIES):
-                    out = _post(ws, args.room, body, card, f"runtime-card:{args.attempt}:outcome", core=core,
-                                execute=execute)
-                    if out["status"] == "posted":
-                        break
-                    if i + 1 < POST_TRIES:
-                        sleep(POST_PAUSE_S)
+                out = _answer(ws, args.room, args.card, "error", "Not switched", words,
+                              f"runtime-card:{args.attempt}:outcome", core=core, execute=execute, tries=POST_TRIES,
+                              sleep=sleep)
                 return _emit({**out, "outcome": "error", "say": words, "restart": "not-restarted", "rc": rc}, 1)
-            told = settle_and_tell(ws, args.room, args.runtime, was, started, args.attempt, rc=rc, core=core,
-                                   execute=execute, sleep=sleep, clock=clock)
+            told = settle_and_tell(ws, args.room, args.runtime, was, started, args.attempt, rc=rc, card=args.card,
+                                   core=core, execute=execute, sleep=sleep, clock=clock)
         finally:
             release(ws, rec)
             unlock_fd(fd)
@@ -609,6 +670,7 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, run=subp
     w.add_argument("--room", required=True)
     w.add_argument("--runtime", required=True, choices=ORDER)
     w.add_argument("--attempt", required=True)
+    w.add_argument("--card", default="")
     a = sub.add_parser("await-sign-in")
     a.add_argument("--room", required=True)
     a.add_argument("--runtime", required=True, choices=ORDER)
@@ -618,6 +680,7 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, run=subp
     t.add_argument("--runtime", required=True, choices=ORDER)
     t.add_argument("--since", required=True, type=float)
     t.add_argument("--attempt", default="")
+    t.add_argument("--card", default="")
     sub.add_parser("status")
     args = p.parse_args(argv)
     if args.workspace:
@@ -636,8 +699,8 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, run=subp
                          sleep=sleep, clock=clock)
     if args.cmd == "settle":
         attempt = args.attempt or f"settle-{int(args.since)}"
-        told = settle_and_tell(ws, args.room, args.runtime, "", args.since, attempt, core=core, execute=execute,
-                               sleep=sleep, clock=clock)
+        told = settle_and_tell(ws, args.room, args.runtime, "", args.since, attempt, card=args.card, core=core,
+                               execute=execute, sleep=sleep, clock=clock)
         return _emit(told, 0 if told["outcome"] == "done" else 1)
     rec = confirmed_record(ws)
     return _emit({"runtime": runtime(), "next_start": configured_runtime(), "confirmed_core": rec,

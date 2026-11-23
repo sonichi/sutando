@@ -49,4 +49,12 @@ is under way is refused.
    posts "Switched. The core is now running on Y." or what could not be confirmed. When graceful-restart
    did not stop the core (exit 3, 4, 5) it says the core is still on X.
 
+One card, updated in place: the "switching" answer edits the tapped card's own event
+(`room.message.edit`, so it then shows "Core runtime: Switching…" in place of the card), and the
+outcome edits that same event again (`switch --card <event>`). A tap adds no message. The "Sign in
+first" card is the one card still posted, since its sign-in controls cannot ride in an edit; the
+waiter then edits it (to "switching", to "stopped waiting", or, when the core is already on that
+runtime because it was switched another way, to say so). Where an edit is refused, the answer is
+posted as a card, as before.
+
 Its log is `<workspace>/logs/runtime-card.log`.
