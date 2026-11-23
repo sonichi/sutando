@@ -363,7 +363,7 @@ def proactive_body(question: str, context: Optional[str], host: str,
                    dest: Destination, link: Optional[str] = None, intro: Optional[str] = None,
                    asker: Optional[str] = None):
     """(body, routed): routed is True when a `[channel:]` redirect leads the body.
-    `link` is where the owner can also answer, when the store knows it; `intro` is one
+    `link` is the row's address, kept out of the body (it unfurls as a card); `intro` is one
     extra paragraph the store adds the first time; `asker` names who asks (default the core)."""
     routed = dest.bridge in _ROOM_MARKER_BRIDGES and bool(dest.channel)
     who = neutralize_markers(asker) if asker else f"the {host} core"
@@ -372,10 +372,7 @@ def proactive_body(question: str, context: Optional[str], host: str,
              neutralize_markers(question).strip()]
     if context and context.strip():
         lines += ["", neutralize_markers(context).strip()]
-    if link:
-        lines += ["", f"Reply here, or set its Status on the row: {neutralize_markers(link)}"]
-    else:
-        lines += ["", "Reply here."]
+    lines += ["", "Reply here."]
     body = "\n".join(lines) + "\n"
     if intro and intro.strip():
         body += "\n" + neutralize_markers(intro).strip() + "\n"

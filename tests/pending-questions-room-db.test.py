@@ -405,6 +405,17 @@ class TestEdges(_Ws):
         self.assertIn("Label=what it does", err.getvalue())
 
 
+    def test_ask_owner_cli_refuses_choices_listed_in_the_text(self):
+        cli = str(REPO / "scripts" / "ask-owner.py")
+        with mock.patch.object(sys, "argv", [cli, "Which one?", "--context", "1. merge now\n2. hold"]), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit) as e:
+                runpy.run_path(cli, run_name="__main__")
+        self.assertEqual(e.exception.code, 2)
+        self.assertIn("--option", err.getvalue())
+        self.assertEqual(runpy.run_path(cli)["listed_choices"]("Merge #123 despite the absent CLA check?"), 0)
+
+
 class TestAskOwner(_Ws):
     def test_the_row_is_born_with_its_record_and_the_outbox_entry_is_deleted(self):
         db = self.db()
@@ -417,7 +428,8 @@ class TestAskOwner(_Ws):
         self.assertEqual(e["ask_id"], out["ask_id"])
         self.assertIn(f"via {out['proactive_file']} at", e["body"])
         body = (self.ws / "results" / out["proactive_file"]).read_text()
-        self.assertIn("set its Status on the row: https://db/page", body)
+        self.assertNotIn("https://db/page", body)
+        self.assertIn("Reply here.", body)
         self.assertIn("Pending questions database", body)
         self.assertEqual("\n".join(pqa.report_lines(out)).count("recorded:"), 1)
         self.assertIn("row: https://link/row", pqa.report_lines(out))

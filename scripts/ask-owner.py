@@ -15,7 +15,9 @@ database, holds it in the workspace outbox while the room is unreachable, and re
 With --default and/or --option, a question bound for AG2 Space is asked as a decision card
 (one button per choice) instead of text; the owner's click comes back as a `hitl_click: true`
 task, and `python3 src/pending_questions_reader.py clicks` hands it to the core.
-Always exits 0 after a non-empty question: every failure is printed, never raised. With
+A question that lists its choices in the text ("1. … 2. …") without --option or --default is
+refused (exit 2, nothing sent): the owner would get text with nothing to press.
+Otherwise it exits 0 after a non-empty question: every failure is printed, never raised. With
 --unless-open, a question whose title matches one the store holds open is reported
 (`already open: [<id>]`) and not filed again, so a carried list can be filed without doubling rows.
 
@@ -26,6 +28,7 @@ routing it implies need the skill) and keeps one generic local record of the ask
 report says so.
 """
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -40,6 +43,13 @@ from skill_roots import declared
 from util_paths import host_label
 
 RECORDS = "ask-owner"
+# A line that starts a listed choice: "1." "2)" "A)" "(b)" "Option A:".
+_CHOICE = re.compile(r"^\s*(?:\(?(?:\d{1,2}|[A-Za-z])[.)]|option\s+\w+\s*[:.)-])\s+\S", re.I)
+
+
+def listed_choices(*texts) -> int:
+    """How many lines of the texts start a listed choice."""
+    return sum(1 for t in texts if t for line in t.splitlines() if _CHOICE.match(line))
 
 
 def _option(text: str):
@@ -106,7 +116,7 @@ def ask_without_store(question: str, context, ws: Path, why: str) -> list:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Send a pending question to the owner and record it.")
     ap.add_argument("question")
-    ap.add_argument("--context", default=None, help="one or two lines of why / options")
+    ap.add_argument("--context", default=None, help="one or two lines of why; choices go in --option")
     ap.add_argument("--urgency", choices=("live", "durable"), default="live",
                     help="live also fires the macOS notification; durable sends and records only")
     ap.add_argument("--task-file", default=None,
@@ -125,6 +135,11 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if not args.question.strip():
         print("ask-owner: the question is empty", file=sys.stderr)
+        return 2
+    if not args.default and not args.option and listed_choices(args.question, args.context) >= 2:
+        print("ask-owner: the question lists choices but gives none as --option, so the owner would get "
+              "text with nothing to press; pass each as --option 'Label=what it does' (and --default "
+              "for the one you propose). Nothing was sent.", file=sys.stderr)
         return 2
     if args.workspace:
         ws = Path(args.workspace)

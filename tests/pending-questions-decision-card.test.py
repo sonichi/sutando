@@ -317,7 +317,7 @@ class CardOutcomes(unittest.TestCase):
         self.assertFalse(any("asked as text" in ln for ln in lines), lines)
         self.assertTrue(any("could not be checked" in ln and "no text was sent" in ln for ln in lines), lines)
 
-    def test_a_definite_failure_texts_the_same_destination_with_the_link_and_rewrites_the_record(self):
+    def test_a_definite_failure_texts_the_same_destination_and_rewrites_the_record(self):
         ws = _ws("ag2space")
         m = _manager(ws)
         out = self._queued(ws, m)
@@ -327,7 +327,8 @@ class CardOutcomes(unittest.TestCase):
         self.assertTrue(out["proactive_file"].endswith(".to-ag2space.txt"), out["proactive_file"])
         body = (ws / "results" / out["proactive_file"]).read_text()
         self.assertIn("[channel: !dm:test.invalid]", body)
-        self.assertIn("https://row.test.invalid/7", body)
+        self.assertNotIn("https://row.test.invalid/7", body)
+        self.assertIn("Reply here.", body)
         held = json.loads(Path(out["outbox"]).read_text())
         self.assertEqual(held["sent"], out["sent_line"])
         self.assertIn(f"via {out['proactive_file']}", held["sent"])
@@ -758,7 +759,7 @@ class CrashBoundaries(unittest.TestCase):
         self.assertNotIn("**Sent:** card", row["body"])
         self.assertNotIn(out["ask_id"], self.held())
 
-    def test_the_fallback_carries_the_rows_own_link_not_the_one_guessed_before(self):
+    def test_the_text_fallback_carries_no_row_link(self):
         store, _ = room_db.room_store(self.ws)
         real = room_db.write_question
 
@@ -770,7 +771,8 @@ class CrashBoundaries(unittest.TestCase):
                 mock.patch.object(room_db, "write_question", write_with_new_link):
             out = self.ask(store)
         body = (self.ws / "results" / out["proactive_file"]).read_text()
-        self.assertIn("https://row.test.invalid/after-write", body)
+        self.assertNotIn("https://row.test.invalid/", body)
+        self.assertIn("Reply here.", body)
 
     def test_death_after_the_hold_before_the_row_rewrite_is_reconciled(self):
         self.child("with mock.patch('hitl.manager.HitlManager.create', side_effect=OSError('disk full')), \\\n"
