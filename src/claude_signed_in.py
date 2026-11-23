@@ -134,7 +134,6 @@ def _notify(workspace, config_dir: str, now: float) -> str:
     return name
 
 
-REPO = Path(__file__).resolve().parent.parent
 # The launchers' own predicate (src/claude_routing.sh), with PY resolved as they resolve it.
 _ROUTING_SH = (
     '. "$1/scripts/python-binary.sh" && PY="$(resolve_python "$1")" && REPO="$1" '
@@ -142,8 +141,13 @@ _ROUTING_SH = (
     '&& { if claude_direct_routing; then echo direct; else echo proxy; fi; }')
 
 
-def direct_routing_on(runner: Callable = subprocess.run, repo: Path = REPO) -> Optional[bool]:
+def direct_routing_on(runner: Callable = subprocess.run, repo: Optional[Path] = None) -> Optional[bool]:
     """Whether the launchers route Claude sessions direct: True, False, or None when unknown."""
+    if repo is None:
+        from sutando_config import _find_repo_root
+        repo = _find_repo_root()
+        if repo is None:
+            return None
     try:
         out = runner(["/bin/bash", "-c", _ROUTING_SH, "bash", str(repo)], capture_output=True,
                      text=True, timeout=15, stdin=subprocess.DEVNULL)

@@ -490,15 +490,18 @@ class SignedIn(Tmp):
         self.assertIsNone(self.csi.direct_routing_on(bad))
         self.assertIsNone(self.csi.direct_routing_on(lambda *a, **k: types.SimpleNamespace(returncode=2, stdout="")))
         self.assertIsNone(self.csi.direct_routing_on(lambda *a, **k: (_ for _ in ()).throw(OSError())))
+        import sutando_config
+        with mock.patch.object(sutando_config, "_find_repo_root", return_value=None):
+            self.assertIsNone(self.csi.direct_routing_on())
 
     def test_routing_agrees_with_the_launch_predicate(self):
         launch = ('. "$1/scripts/python-binary.sh"; PY="$(resolve_python "$1")"; REPO="$1"; '
                   '. "$1/src/skill-manifest-config.sh"; . "$1/src/claude_routing.sh"; claude_direct_routing')
         for value in (None, "", "false", "off", "true", "1"):
-            env = {k: v for k, v in os.environ.items() if k != "QUOTA_STATUSLINE_ENABLED"}
-            if value is not None:
-                env["QUOTA_STATUSLINE_ENABLED"] = value
-            with self.subTest(value=value), mock.patch.dict(os.environ, env, clear=True):
+            with self.subTest(value=value), mock.patch.dict(os.environ):
+                os.environ.pop("QUOTA_STATUSLINE_ENABLED", None)
+                if value is not None:
+                    os.environ["QUOTA_STATUSLINE_ENABLED"] = value
                 rc = subprocess.run(["/bin/bash", "-c", launch, "bash", str(ROOT)]).returncode
                 self.assertIs(self.csi.direct_routing_on(), rc == 0)
         with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": ""}):
