@@ -308,6 +308,14 @@ class TestSkillRules(unittest.TestCase):
         self.assertNotIn("must join the room first", back)
         self.assertLess(back.index("your owner is not in the room"), back.index("Any other reason, or none"))
 
+    def test_no_owner_chat_holds_nothing(self):
+        back = " ".join(section(self.text, "What comes back").split())
+        item = bullet(back, "**`UPSTREAM_UNAVAILABLE`:**")
+        self.assertIn('"there is no chat with your owner to ask in"', item)
+        self.assertIn("nothing was held: tell your owner, and ask them to open a DM with you and then ask again.",
+                      item)
+        self.assertNotIn("for the approval card", item)
+
     def test_filter_off_is_an_approval_required_change(self):
         back = " ".join(section(self.text, "What comes back").split())
         self.assertIn("or turning the secrets check off), so your owner must approve it", back)

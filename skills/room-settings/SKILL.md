@@ -175,8 +175,8 @@ own first; then read again and send the ones that open access.
     this change from here, and that your owner can change it in the room's settings in the
     app, or ask a room admin to.
 - **`UPSTREAM_UNAVAILABLE`:** something s.space needs did not answer. Read its message and
-  do what it suggests. If it says there is no DM with your owner for the approval card,
-  nothing was held: tell your owner, and ask them to open a DM with you and then ask again.
+  do what it suggests. If it says there is no chat (DM) with your owner to ask in (for
+  example "there is no chat with your owner to ask in"), nothing was held: tell your owner, and ask them to open a DM with you and then ask again.
   Don't try again until you have a DM with them. If
   it says the write may or may not have happened, read again with `room.agent_policy.read`
   and tell your owner what is stored.
