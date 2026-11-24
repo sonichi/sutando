@@ -67,8 +67,10 @@ def is_id_name(name: str, mxid: str) -> bool:
     m = MXID.match(mxid or "")
     if not m:
         return False
-    local = m.group(1).lower()
-    return name.strip().lstrip("@").lower() in {mxid.lstrip("@").lower(), local, re.sub(r"\.agent$", "", local)}
+    local = m.group(1)
+    forms = (mxid, mxid[1:], local, re.sub(r"\.agent$", "", local))
+    # Tiers cap names at NAME_MAX, so a long id echo arrives cut: compare the cut forms too.
+    return clean(name).lower() in {f.lower() for form in forms for f in (form, clean(form))}
 
 
 def profile_name(mxid: str, fetch: Optional[Fetch] = None) -> str:
