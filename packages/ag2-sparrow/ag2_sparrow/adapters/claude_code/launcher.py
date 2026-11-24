@@ -750,7 +750,8 @@ class Launcher:
             return False, rec
         kept = rec.get("signin") or {}
         if not kept.get("fp") or kept.get("consumer") != rec.get("consumer"):
-            return False, self._with_record(lambda r: dict(r, signin=mark))
+            self._with_record(lambda r: dict(r, signin=mark))
+            return False, dict(rec, signin=mark)       # this tick's observation (a stall) stays in hand
         if kept["fp"] == mark["fp"]:
             self.signin_waiting = False
             return False, rec

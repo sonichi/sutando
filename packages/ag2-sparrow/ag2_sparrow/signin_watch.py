@@ -113,7 +113,7 @@ def _codex_account(home: str):
 
 
 def claude_config_dir(claude_config_dir: str = "", home: str = "") -> str:
-    """Where the desktop writes Claude Code's switch marker: CLAUDE_CONFIG_DIR, else ~/.claude."""
+    """Where the desktop writes Claude Code's switch marker: CLAUDE_CONFIG_DIR, else the CLI's default."""
     return claude_config_dir or os.path.join(home or os.path.expanduser("~"), ".claude")
 
 

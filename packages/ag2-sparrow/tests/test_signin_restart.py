@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ag2_sparrow import signin_watch  # noqa: E402
 from ag2_sparrow.adapters.claude_code import launcher  # noqa: E402
+
 from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
 
 
