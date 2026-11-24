@@ -17,6 +17,15 @@ import worker_lane as L
 W = 'a' * 32
 
 
+class FakeVault:
+    """No keychain on the test host: the record, not the vault, is under test."""
+    def __init__(self):
+        self.deleted = []
+
+    def delete(self, key):
+        self.deleted.append(key)
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -91,8 +100,10 @@ class TwoServers(Base):
 
     def test_a_fully_retired_worker_keeps_its_anchor_but_not_its_retirement(self):
         C.begin_worker_retirement(W, workspace=self.ws)
-        removed = C.retire_worker_identity(W, workspace=self.ws)
+        vault = FakeVault()
+        removed = C.retire_worker_identity(W, workspace=self.ws, vault=vault, kill=lambda *a, **k: None)
         self.assertEqual(len(removed), 2)
+        self.assertEqual(sorted(vault.deleted), sorted(C.token_ref_for(i) for i in self.lanes.values()))
         self.assertEqual(C.worker_identities(W, self.ws), [])
         self.assertNotIn('retiring', self.stored())
         self.assertFalse(C.worker_retiring(W, self.ws))
