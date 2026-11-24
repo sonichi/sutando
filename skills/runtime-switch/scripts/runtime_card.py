@@ -738,12 +738,23 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
                         f"The core is still on {name(was)}.",
                         f"runtime-card:{args.attempt}:waiting", core=core, execute=execute)
                 if restart_lock_clears(ws, sleep=sleep, clock=clock):
-                    seen = check(ws, args.runtime, started)
-                    if seen["core"] and seen["selected"]:
-                        rc = 0      # the other restart already brought it up on this runtime: nothing to restart
-                    else:
-                        was, started = configured_runtime(), clock()
+                    # What the restart that was in the way left, by the record its launcher publishes before
+                    # it lets the lock go. No time bound: its session may be older than this request.
+                    now_on = confirmed_record(ws)
+                    if now_on.get("runtime") == args.runtime:
+                        rc, started = 0, float(now_on["started_at"])    # already there: nothing to restart
+                    elif now_on:
+                        was, started = configured_runtime(), clock()    # confirmed on another runtime
                         rc = restart(args.runtime)
+                    else:
+                        words = (f"Another restart finished, but I could not read which runtime the core is on "
+                                 f"now, so I did not restart it again for {name(args.runtime)}. "
+                                 "Ask me for the runtime card to check.")
+                        out = _answer(ws, args.room, args.card, "error", "Not confirmed", words,
+                                      f"runtime-card:{args.attempt}:outcome", core=core, execute=execute,
+                                      tries=POST_TRIES, sleep=sleep)
+                        return _emit({**out, "outcome": "error", "say": words, "restart": "not-restarted",
+                                      "rc": rc, "why": "inconclusive"}, 1)
             if rc in NOT_RESTARTED:
                 reason = RESTART_REASONS[rc]
                 words = (f"I could not switch to {name(args.runtime)}. The core is still on {name(was)}. "

@@ -614,6 +614,7 @@ class Switch(Base):
         self.assertIn("config still names Codex", out["say"])
 
     def test_a_restart_that_did_not_happen_says_still_on_the_old_runtime(self):
+        self.record("codex", T0 - 500)
         for code in rtc.NOT_RESTARTED:
             with self.subTest(rc=code):
                 self.restart_rc = code
@@ -629,6 +630,7 @@ class Switch(Base):
     def test_a_restart_put_off_waits_for_the_other_restart_then_switches_on_the_same_card(self):
         lock = self.ws.joinpath(*rtc.RESTART_LOCK)
         lock.mkdir(parents=True)
+        self.record("codex", T0 - 500)          # what the restart in the way leaves: still Codex
         self.restart_rc = rtc.DEFERRED
         polls, real, first = [], self.clock.sleep, self.restart
 
@@ -664,7 +666,8 @@ class Switch(Base):
             real(s)
             if lock.exists():
                 # The restart that was in the way was itself a switch to Claude Code (the desktop's, say).
-                self.record("claude", self.clock.t)
+                # Its session was created before this card's request; it published and let go only now.
+                self.record("claude", T0 - 60)
                 self.current = self.selected = "claude"
                 lock.rmdir()
         self.clock.sleep = sleep
@@ -674,6 +677,25 @@ class Switch(Base):
         said = [words for event, words in self.fake.edits() if event == "$card1"]
         self.assertIn("Waiting for another restart to finish", said[-2])
         self.assertIn("Switched. The core is now running on Claude Code", said[-1])
+
+    def test_with_no_readable_record_after_the_other_restart_nothing_is_restarted_and_the_card_says_so(self):
+        for left in (None, "{not json", json.dumps({"runtime": "claude"})):     # none, unreadable, incomplete
+            with self.subTest(left=left):
+                self.restarts.clear()
+                self.restart_rc = rtc.DEFERRED
+                record = self.ws.joinpath(*rtc.RECORD)
+                record.unlink(missing_ok=True)
+                if left is not None:
+                    record.parent.mkdir(parents=True, exist_ok=True)
+                    record.write_text(left)
+                rc, out = self.carded()
+                self.assertEqual((rc, out["outcome"], out["restart"], out["why"]), (1, "error", "not-restarted", "inconclusive"))
+                self.assertEqual(self.restarts, ["claude"], "not restarted blindly")
+                self.assertIn("I could not read which runtime the core is on now, so I did not restart it again", out["say"])
+                self.assertEqual(self.fake.edits()[-1], ("$card1", "Core runtime: " + out["say"]))
+                self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists(), "released: she can ask again")
+                self.ws.joinpath(*rtc.RUNNING).write_text(json.dumps(
+                    {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": 1e12}))
 
     def test_a_restart_still_in_the_way_after_the_wait_is_not_asked_again_and_the_card_says_so(self):
         lock = self.ws.joinpath(*rtc.RESTART_LOCK)
@@ -690,6 +712,7 @@ class Switch(Base):
         self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists(), "the attempt is released: she can tap again")
         # Put off twice with the lock gone both times (a lost lease): asked once more, then the same words.
         lock.rmdir()
+        self.record("codex", T0 - 500)
         self.restarts.clear()
         self.ws.joinpath(*rtc.RUNNING).write_text(json.dumps(
             {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": 1e12}))
