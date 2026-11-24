@@ -15,7 +15,7 @@ a real room or a browser. See [`NOTES.md`](NOTES.md) for what a real room must s
   rollback. A page that needs none of that is simpler without it.
 - **It must be inlined.** A page runs in a sandbox with no network, so it cannot load a script
   from anywhere. Copy `commons-sdk.js` into a `<script>` in the page. `examples/inline.js` shows
-  one way to do that between two marker comments. The file is about 33 KB; a page body is at most
+  one way to do that between two marker comments. The file is about 35 KB; a page body is at most
   196,608 bytes. Once it has run, the global `Commons` exists, whatever other scripts the page
   carries (it also sets `module.exports` when a `module` with `exports` is there, as in Node).
 - **The bridge is not ours.** The library is built on the page API (`window.artifact`). The host
@@ -64,7 +64,7 @@ Everyone with the page open sees the number change. An agent can change it too, 
 row through Actions.
 
 `update` reads the value, runs your function on it and writes the result back. It resolves to
-`{value, mode}`. Where the room offers conditional writes, `mode` is `"exact"` and no press is
+`{value, mode}`. Where the s.space deployment has conditional writes turned on, `mode` is `"exact"` and no press is
 lost. Where it does not, `mode` is `"best-effort"`: two people who press at the same moment both
 write the same new number and one press is lost. See "Conditional writes".
 
@@ -146,11 +146,11 @@ const tasks = await room.list('My app — Tasks', { orderBy: 'Order' });
 | `tasks.get(id)` | One row, or `undefined` |
 | `tasks.length` | How many rows |
 | `tasks.titleProp` | The name of the title column. Read it; never assume it |
-| `tasks.push(cells)` | Promise of the new row's id. All values in one call: all fit, or nothing is created |
+| `tasks.push(cells)` | Promise of the new row's id. All values in one call: all fit, or nothing is created. The row shows when the bridge answers, or with the room's next snapshot if one arrived first |
 | `tasks.update(id, cells)` | Promise. Shown at once; undone if the room refuses |
 | `tasks.remove(id)` | Promise. Hides the row by writing the "removed" marker |
 | `tasks.claim(id, {ttl?, onLost?})` | Promise of `{ok, holder, certainty, reason?}`. See "Claims" |
-| `tasks.release(id)` | Promise of `true`, or `false` when you did not hold it |
+| `tasks.release(id)` | Promise of `true`; `false` when the viewer's claim was not there, or is now another claim. See "Claims" |
 | `tasks.claimOf(id)` | `{id, name, kind, until, mine}`, or `null` when free |
 | `tasks.observe(cb)` | `cb(changes, origin)`. Returns a stop function |
 | `tasks.databaseId`, `tasks.gone` | As on the map |
@@ -186,7 +186,7 @@ words when there are any.
 | `AGENT_UNAVAILABLE` | The agent is not the viewer's, or cannot be reached |
 | `BUSY` | Another ask is open |
 | `OUTCOME_UNKNOWN` | No answer came back. For an ask: send again with the same key. For `map.update`: the write may or may not have landed; `value` (and `version`, when there is one) hold what this page sees now. Show it and let the person decide; do not repeat it blindly |
-| `OFFLINE`, `APPROVAL_PENDING` | A conditional write was not sent because the page is offline, or is held for an approval and has not landed yet |
+| `OFFLINE`, `APPROVAL_PENDING` | A conditional write was not sent because the page is offline, or is held for an approval: it has not landed, and may land later if approved |
 | `BAD_MENTION` | A mention names someone who is not a joined member, or a group |
 | `UNSUPPORTED` | This bridge does not have the call |
 | `CONTENDED` | `map.update` gave up: the database kept changing between its read and its write |
@@ -253,7 +253,8 @@ This is not a CRDT. The rules below are what the library does on top of the brid
 ### Conditional writes
 
 A host can give each database snapshot a `version` and accept "write only if the database is
-still at this version". Both sit behind host switches and can be off. The library looks for
+still at this version". Both are a deployment setting: they work only where the s.space
+deployment turns them on, not per room. A page still finds out on each read. The library looks for
 them at run time:
 
 - A snapshot (from the first read, or from a change) with a number in `version`: the library
@@ -265,17 +266,26 @@ them at run time:
 - A successful answer carries the database's new version when the server returns it. The
   library builds its next write on that version and on the value it just wrote, so several
   updates in a row work even while the page's own copy is behind. A snapshot older than that
-  version is ignored; a newer one wins. If the answer has no version, the next write waits for
+  version does not undo the write; a newer one wins. If the answer has no version, the next write waits for
   the page's copy to catch up (and ends as `CONTENDED` if it does not).
 - No answer to a conditional write means the outcome is unknown: it may have landed. The host
   offers no key to resend the same write safely and no receipt to look it up, so:
   - `map.update` rejects with `OUTCOME_UNKNOWN`. It does not treat an equal value as proof (a
     peer can write the same number) and does not run your function a second time.
-  - `claim` and `release` read again and go on, because a claim carries its own proof: each
-    attempt writes a fresh token, and "the cell holds a token this call wrote" cannot be
-    someone else's doing.
+  - `claim` reads again and goes on, because a claim carries its own proof: each attempt
+    writes a fresh token, and "the cell holds a token this call wrote" cannot be someone
+    else's doing. If it still cannot tell, it resolves `ok: false, reason: "unknown"`.
+  - `release` writes an empty cell, which carries no proof of who emptied it. It is pinned to
+    the exact claim it saw when called. After reading again: an empty cell counts as released;
+    the same claim still there is tried again, conditionally; any other value, even a renewal
+    by the same viewer from another tab, is left alone and `release` resolves `false`. If the
+    page cannot tell, it rejects with `OUTCOME_UNKNOWN`.
 - `"exact"` therefore means: the room accepted this write at the version this page had read,
   and said so.
+- An acknowledged write is shown on top of the page's last snapshot until a snapshot new enough
+  to hold it arrives, then the snapshot rules. If the acknowledgement arrives after such a
+  snapshot (the row was changed or deleted since), it adds nothing. A snapshot older than the
+  last one is dropped. The orderings the library handles are listed in `NOTES.md`.
 
 Three things differ from a plain write, by the host's design:
 
@@ -324,6 +334,7 @@ optional), reads the row back, and treats the claim as its own only if its value
 | `ok: false, reason: "held"` | Someone else holds the row. `holder` says who. Nothing was written, or the room refused the write |
 | `ok: false, reason: "expired"` | The write was accepted, but so late that the claim had already run out |
 | `ok: false, reason: "contended"` | The database kept changing, or the claim did not stick. Try again |
+| `ok: false, reason: "unknown"` | The room gave no answer and the page could not tell afterwards. The claim may be in the room until it runs out |
 
 `certainty` is `"local"` on every `ok: false`: the answer rests on what this page can see.
 
@@ -346,9 +357,14 @@ optional), reads the row back, and treats the claim as its own only if its value
 6. A claim ends at `until`, by `room.now()`. Nobody has to clear it. `claimOf` then returns
    `null`, and anyone may claim. No event fires when a claim runs out: redraw on a timer if you
    show it.
-7. Claiming a row you hold renews it. `release` empties the cell; with conditional writes it
-   does not wipe a claim someone else took in the meantime. If a renewal or a release is refused,
-   the earlier claim is still tracked, and `onLost` still fires if it is taken over.
+7. Claiming a row you hold renews it. `release` empties the cell, and only while the cell still
+   holds the exact claim this page saw when `release` was called. With conditional writes the
+   room checks that too, so a release never clears a newer claim. With plain writes it cannot:
+   a release can clear a claim made elsewhere that this page has not seen yet.
+8. Two tabs of one viewer are two pages. A claim from the second tab replaces the first tab's
+   token, and the first tab's `onLost` is called with a holder whose `mine` is `true`.
+9. If a renewal or a release is refused, the earlier claim is still tracked, and `onLost` still
+   fires if it is taken over.
 
 Claims are cooperative. Any member can overwrite the cell by hand. They stop honest players
 from doing the same work twice; they do not lock anything.
@@ -408,7 +424,7 @@ Each line is something the documented bridge does not let a library do.
 
 1. **Delete a row from a page.** There is no page call for it, so `remove` and `delete` leave rows behind. The list's marker lives in one place (`removal`), so a real delete can replace it there.
 2. **Write several cells of one row in one call.** `update` and "claim and set status" are not atomic.
-3. **Write only if unchanged.** This exists, per database, behind host switches (see "Conditional writes"); the library uses it when present. Still missing: the same check per row or per cell. Where it is off, claims have a race window and counters lose presses.
+3. **Write only if unchanged.** This exists, per database, where the s.space deployment turns it on (see "Conditional writes"); the library uses it when present. Still missing: the same check per row or per cell. Where it is off, claims have a race window and counters lose presses.
 4. **A unique title per database.** Without it two pages can create one map key twice.
 5. **A server-stamped time on a row or a cell.** Claim expiry rests on a time the claimer wrote.
 6. **An attested "last edited by" a page can read per cell.** Without it a claim's holder is self-declared.
@@ -431,6 +447,7 @@ Each line is something the documented bridge does not let a library do.
 | `commons-sdk.js` | The library. Inline it in a page, or `require` it in Node |
 | `test/fake-room.js` | A fake bridge: several pages share one store, with consent, limits and a clock you move |
 | `test/commons-sdk.test.js` | The library's tests |
+| `test/interleavings.test.js` | 300 seeded orderings of answers and snapshots, checked against invariants |
 | `examples/signup.html` | A sign-up sheet: a form and a live list |
 | `examples/board.html` | A task board: a person or an agent takes a task, works, marks it done |
 | `examples/_head.css` | The styles both examples share |
