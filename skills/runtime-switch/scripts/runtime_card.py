@@ -802,9 +802,14 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
         out.update(say=sign_in_words(rt, state, waiting),
                    **({"event_id": posted["event_id"]} if posted.get("event_id") else {}))
         return _emit(out, 1)
-    # A tap that can go ahead ends any wait an earlier tap left.
-    claim_wait(ws, None)
     out = begin_switch(ws, room, rt, current, now(), event=event, core=core, execute=execute, popen=popen)
+    if out["status"] == "started":
+        # Only a tap whose own switch was admitted and started ends a wait an earlier tap left: one
+        # told it is busy leaves it, since the switch under way may be that wait's own hand-off.
+        try:
+            claim_wait(ws, None)
+        except OSError:
+            pass
     return _emit(out, 1 if out["status"] == "failed" else 0)
 
 

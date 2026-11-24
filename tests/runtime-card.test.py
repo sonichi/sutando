@@ -973,6 +973,37 @@ class AwaitSignIn(Base):
         self.assertEqual(self.clock.t - began, rtc.POST_PAUSE_S, "it waited before asking a third time")
         self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists())
 
+    def test_a_re_tap_during_the_waiters_backoff_is_told_busy_and_the_waiter_still_finishes_its_hand_off(self):
+        room, seen = self.losing(answers=3)
+        self.claude_json = {"loggedIn": True}
+        real, taps = self.clock.sleep, []
+
+        def sleep(s):
+            real(s)
+            if not taps:                                # the owner taps the same runtime again meanwhile
+                taps.append(self.tap_with(room))
+        self.clock.sleep = sleep
+        rc, out = self.wait_with(room)
+        self.clock.sleep = real
+        (tap_rc, tapped), = taps
+        self.assertEqual((tapped["status"], tapped["say"]), ("say", rtc.BUSY))
+        fallback = [v for k, v in seen.items() if k.endswith(":switching")][0]["result"]["event_id"]
+        argv = self.launch.calls[-1][0]
+        self.assertEqual((rc, out["status"], argv[argv.index("--card") + 1]), (0, "started", fallback))
+        self.assertEqual((len(self.launch.calls), len(self.switching_posts())), (1, 1), "one card recovered, one launch")
+        self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists(), "retired by its own waiter, once done")
+
+    def test_a_tap_whose_own_switch_starts_retires_an_earlier_wait_and_one_that_fails_to_start_does_not(self):
+        self.claude_json = {"loggedIn": True}
+        self.launch.fail = OSError("no fork")
+        rc, out = self.tap("Switch the core to Claude Code")
+        self.assertEqual(out["status"], "failed")
+        self.assertTrue(self.ws.joinpath(*rtc.WAITING).exists(), "nothing replaced it")
+        self.launch.fail = None
+        rc, out = self.tap("Switch the core to Claude Code")
+        self.assertEqual(out["status"], "started")
+        self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists())
+
     def test_a_fallback_never_confirmed_starts_no_worker_and_stays_pending_for_the_next_waiter(self):
         room, seen = self.losing(answers=rtc.CARD_TRIES + 1)
         self.claude_json = {"loggedIn": True}
