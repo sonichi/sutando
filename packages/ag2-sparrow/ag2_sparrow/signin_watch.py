@@ -7,13 +7,14 @@ its id token, Claude Code's `.claude.json` `oauthAccount` uuid and email. No tok
 logged; what a supervisor records is `fingerprint()`, a short hash of the identity.
 
 The desktop's account switch can change only the Keychain item (Claude Code's `.claude.json` then keeps
-the old email), so it also writes a marker, `.ag2-signin-changed` (the new email and a time, no secret),
-in the CLI's config dir (CODEX_HOME, CLAUDE_CONFIG_DIR) on every switch; the marker's content hash and
-mtime are part of the identity, so a rewritten marker is a change.
+the old email), so on every switch it also writes `.ag2-signin-changed` in the CLI's config dir
+(CODEX_HOME, CLAUDE_CONFIG_DIR) as JSON `{"email": "<new email>", "at": <epoch seconds>}`. Exactly those
+two fields are read; a change in either is an identity change. A missing or malformed marker is no
+change: `SigninWatch` keeps the last marker it read.
 
 An identity is `(account, email, marker)`; account and email are `SIGNED_OUT` when the file is absent or
-names no account, the marker '' when there is none; None when the sign-in file or the marker could not be
-read (refused, mid-write, not JSON), which never counts as a change. Stdlib.
+names no account; the whole identity is None when the sign-in file could not be read (refused,
+mid-write, not JSON), which never counts as a change. Stdlib.
 """
 from __future__ import annotations
 
@@ -33,30 +34,29 @@ CLAUDE_CONFIG_MAX = 32 << 20     # `.claude.json` holds every project's history;
 
 def fingerprint(identity) -> str:
     """A short, stable hash of an identity: what is recorded and compared, never the fields themselves."""
-    fields = list(identity)
+    fields = [f or "" for f in identity]
     fields[1] = fields[1].lower()
     return hashlib.sha256("\0".join(fields).encode("utf-8")).hexdigest()[:16]
 
 
 def marker(config_dir: str):
-    """The desktop's switch marker in `config_dir`: '<mtime_ns>:<content hash>', '' when there is none,
-    None when it cannot be read. Its content is hashed, never kept or logged."""
-    path = os.path.join(config_dir, MARKER)
+    """The desktop's switch marker in `config_dir`, `{"email": str, "at": number}`, as '<email>|<at>';
+    None when it is missing or malformed (no change)."""
+    text, _ = read_regular(os.path.join(config_dir, MARKER), MARKER_MAX)
     try:
-        mtime = os.stat(path).st_mtime_ns
-    except FileNotFoundError:
-        return ""
-    except OSError:
+        data = json.loads(text) if text else None
+    except ValueError:
         return None
-    text, why = read_regular(path, MARKER_MAX)
-    if text is None:
-        return "" if not why else None
-    return "%d:%s" % (mtime, hashlib.sha256(text.encode("utf-8")).hexdigest()[:16])
+    if not isinstance(data, dict):
+        return None
+    email, at = data.get("email"), data.get("at")
+    if not isinstance(email, str) or not email or isinstance(at, bool) or not isinstance(at, (int, float)):
+        return None
+    return "%s|%r" % (email.strip().lower(), at)
 
 
 def _with_marker(identity, config_dir: str):
-    mark = marker(config_dir) if identity is not None else None
-    return None if mark is None else tuple(identity) + (mark,)
+    return None if identity is None else tuple(identity) + (marker(config_dir),)
 
 
 def _load(path: str, limit: int):
@@ -141,7 +141,7 @@ class SigninWatch:
     def __init__(self, paths, read, stat=os.stat):
         self.paths = [paths] if isinstance(paths, str) else list(paths)
         self.read, self.stat = read, stat
-        self._sig, self._seen = object(), None
+        self._sig, self._seen, self._marker = object(), None, ""
 
     def _stat(self, path):
         try:
@@ -156,5 +156,9 @@ class SigninWatch:
             seen = self.read()
             if seen is None:
                 return None             # not cached: a file caught mid-write is read again next time
+            if len(seen) > 2:           # a missing or malformed marker keeps the last one read
+                if seen[2] is None:
+                    seen = tuple(seen[:2]) + (self._marker,)
+                self._marker = seen[2]
             self._sig, self._seen = sig, seen
         return self._seen
