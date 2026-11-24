@@ -398,7 +398,8 @@ def _restart_core_argv(env: Dict, runner: Runner, ws: Path, req, runtime: Option
     """(argv, via) for restart_core or switch_runtime, from the one restart route (core_restart)."""
     return core_restart.route(REPO, env, runner, workspace=ws, caller=CARD_CALLER, runtime=runtime,
                               hitl_id=req.id if req is not None else "",
-                              revision=req.revision if req is not None else None)
+                              revision=req.revision if req is not None else None,
+                              caller_deadline_s=detached_action.DEADLINE_S)
 
 
 def _detached_key(req) -> str:

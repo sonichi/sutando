@@ -49,6 +49,7 @@ AUDIT_FILE = "audit.jsonl"
 AUDIT_KEEP = 500
 #: Every audit writer (bridge and executor, src and vendored) holds this sidecar's flock.
 AUDIT_LOCK = "audit.lock"
+AUDIT_LOCK_POLL_S = 0.05
 #: A non-owner's tap: recorded once per (card, actor), never run.
 NOT_OWNER = "not_owner"
 #: What audit_not_owner did: wrote the row, found it already there, or could not write.
@@ -192,6 +193,28 @@ def _audit_locked(path: Path):
     return locked_file(path.with_name(AUDIT_LOCK))
 
 
+@contextlib.contextmanager
+def _audit_locked_within(path: Path, wait_s: float):
+    """The same lock, waited for at most `wait_s`; TimeoutError when another holder keeps it."""
+    try:
+        from ..file_lock import try_lock_fd, unlock_fd
+    except ImportError:
+        from file_lock import try_lock_fd, unlock_fd
+    fd = os.open(str(path.with_name(AUDIT_LOCK)), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        end = time.monotonic() + wait_s
+        while not try_lock_fd(fd):
+            if time.monotonic() >= end:
+                raise TimeoutError("recovery audit lock busy")
+            time.sleep(AUDIT_LOCK_POLL_S)
+        try:
+            yield
+        finally:
+            unlock_fd(fd)
+    finally:
+        os.close(fd)
+
+
 def _append(path: Path, entry: Dict[str, Any]) -> None:
     """Append one row, then trim to the newest AUDIT_KEEP past twice that; the caller holds the lock.
     A failed trim leaves the appended row in place and is only logged."""
@@ -209,13 +232,14 @@ def _append(path: Path, entry: Dict[str, Any]) -> None:
             tmp.unlink()
 
 
-def audit(workspace: Path, entry: Dict[str, Any]) -> bool:
+def audit(workspace: Path, entry: Dict[str, Any], wait_s: Optional[float] = None) -> bool:
     """One line per action or refusal, bounded; ids and outcomes only, never message text.
-    True when the line was written; a failure is swallowed (the receipt and card are the record)."""
+    True when the line was written; a failure is swallowed (the receipt and card are the record).
+    With `wait_s`, the lock is waited for at most that long and a busy lock is a line not written."""
     path = recovery_dir(workspace) / AUDIT_FILE
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with _audit_locked(path):
+        with (_audit_locked(path) if wait_s is None else _audit_locked_within(path, wait_s)):
             _append(path, entry)
         return True
     except (OSError, ValueError):

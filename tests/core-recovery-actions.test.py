@@ -443,7 +443,11 @@ class Executor(Base):
         argv, kw = self.spawned.calls[0]
         self.assertTrue(kw["start_new_session"])
         self.assertEqual(argv[1:3], [str(SRC / "detached_action.py"), "run"])
-        self.assertEqual(self.spawned.command(), ["bash", str(SRC / "agent" / "start-cli.sh"), "--restart"])
+        command = self.spawned.command()
+        self.assertEqual(command[:3], [sys.executable, str(SRC / "core_restart.py"), "start-cli"])
+        self.assertEqual(command[command.index("--start-cli") + 1], str(SRC / "agent" / "start-cli.sh"))
+        self.assertEqual((command[command.index("--hitl-id") + 1], command[command.index("--revision") + 1]),
+                         (req.id, str(self.mgr.get(req.id).revision - 1)))
         gate = self.spawned.gate()
         self.assertEqual((recovery_gate.state(self.ws, gate) or {}).get("state"), recovery_gate.FINISHED,
                          "the tap was fully recorded before the child is allowed to act")
@@ -456,7 +460,8 @@ class Executor(Base):
         req = self.card(runtime="codex")
         self.click(req, "switch_runtime:claude")
         [receipt] = self.run_pending(Run())
-        self.assertEqual(self.spawned.command()[2:], ["--runtime", "claude", "--restart"])
+        command = self.spawned.command()
+        self.assertEqual(command[command.index("--runtime") + 1], "claude")
         self.assertEqual(receipt["recovery"]["runtime"], "claude")
 
     def test_a_restart_whose_hand_off_was_not_confirmed_says_nothing_ran(self):
@@ -558,7 +563,8 @@ class Executor(Base):
         self.click(req, "retry_now")
         run = Run()
         [receipt] = self.run_pending(run, now=now)
-        self.assertEqual((receipt["outcome"], run.calls, self.spawned.command()[-1]), ("done", [], "--restart"))
+        self.assertEqual((receipt["outcome"], run.calls, self.spawned.command()[2]),
+                         ("done", [], "start-cli"))
         self.assertTrue(self.spawned.calls[0][1]["start_new_session"], "a live core's Retry is detached too")
         self.assertEqual(core_limit_hold.read_hold(self.ws)["status"], "cleared")
 
@@ -1718,7 +1724,9 @@ class DesktopRestart(Base):
 
     def test_elsewhere_the_core_restarts_through_start_cli(self):
         self._restart()
-        self.assertEqual(self.spawned.command(), ["bash", str(SRC / "agent" / "start-cli.sh"), "--restart"])
+        command = self.spawned.command()
+        self.assertEqual(command[:3], [sys.executable, str(SRC / "core_restart.py"), "start-cli"])
+        self.assertEqual(command[command.index("--start-cli") + 1], str(SRC / "agent" / "start-cli.sh"))
         self.assertEqual(self.audit()[-1]["via"], RA.VIA_START_CLI)
 
     def test_the_apps_bundle_without_its_ctl_is_refused_and_launches_nothing(self):
@@ -1753,7 +1761,10 @@ class DesktopRestart(Base):
         clone.mkdir(parents=True)
         with mock.patch.object(RA, "REPO", clone):
             self._restart()
-        self.assertEqual(self.spawned.command(), ["bash", str(clone / "src" / "agent" / "start-cli.sh"), "--restart"])
+        command = self.spawned.command()
+        self.assertEqual(command[:3], [sys.executable, str(SRC / "core_restart.py"), "start-cli"])
+        self.assertEqual(command[command.index("--start-cli") + 1],
+                         str(clone / "src" / "agent" / "start-cli.sh"))
         self.assertEqual(self.audit()[-1]["via"], RA.VIA_FALLBACK)
 
     def test_a_standalone_restart_under_a_configured_app_dir_says_so_on_the_card_and_audit(self):
@@ -1869,8 +1880,10 @@ class DesktopRestart(Base):
         req = self.card(runtime="codex")
         self.click(req, "switch_runtime:claude")
         self.run_pending(Run())
-        self.assertEqual(self.spawned.command(),
-                         ["bash", str(SRC / "agent" / "start-cli.sh"), "--runtime", "claude", "--restart"])
+        command = self.spawned.command()
+        self.assertEqual(command[:3], [sys.executable, str(SRC / "core_restart.py"), "start-cli"])
+        self.assertEqual(command[command.index("--start-cli") + 1], str(SRC / "agent" / "start-cli.sh"))
+        self.assertEqual(command[command.index("--runtime") + 1], "claude")
         self.assertEqual(self.audit()[-1]["via"], RA.VIA_START_CLI)
 
 

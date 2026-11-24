@@ -189,5 +189,23 @@ class VendoredCardAnswers(unittest.TestCase):
             self.handler._stamp_stale(self.req.id)  # logged, never raised
 
 
+
+class VendoredAuditLock(unittest.TestCase):
+    def test_a_bounded_audit_gives_up_on_a_held_lock_and_writes_once_it_is_free(self):
+        import threading
+        from ag2_sparrow.file_lock import locked_file
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            self.assertTrue(vendored.audit(ws, {"n": 1}, wait_s=1))
+            path = vendored.recovery_dir(ws) / vendored.AUDIT_FILE
+            held = []
+            with locked_file(path.with_name(vendored.AUDIT_LOCK)):
+                waiter = threading.Thread(target=lambda: held.append(vendored.audit(ws, {"n": 2}, wait_s=0.2)))
+                waiter.start()
+                waiter.join(10)
+            self.assertEqual(held, [False], "a busy lock is a line not written, within the wait")
+            self.assertTrue(vendored.audit(ws, {"n": 3}, wait_s=1))
+            self.assertEqual([json.loads(line)["n"] for line in path.read_text().splitlines()], [1, 3])
+
 if __name__ == "__main__":
     unittest.main()

@@ -705,7 +705,7 @@ CTL21_OUT="$TMP/ws21.calls" SUTANDO_APP_SUPPORT="$APP21" GR_START_CLI="$stub21" 
 calls21="$(tr '\n' ' ' < "$TMP/ws21.calls" 2>/dev/null)"
 phases21="$(python3 -c 'import json,sys
 rows=[json.loads(l) for l in open(sys.argv[1])]
-print(" ".join(r["phase"]+":"+r["caller"]+":"+r.get("outcome","-") for r in rows if r.get("event")=="ctl_restart"))' \
+print(" ".join(r["phase"]+":"+r["caller"]+":"+r.get("outcome","-") for r in rows if r.get("event")=="core_restart"))' \
   "$WS21/state/recovery/audit.jsonl" 2>/dev/null)"
 [ "$rc21" = 0 ] && [ "$calls21" = "restart-core " ] \
   && [ "$phases21" = "intent:graceful-restart:- outcome:graceful-restart:done" ] \

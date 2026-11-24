@@ -2,8 +2,8 @@
 """core_restart: the one route for a core restart, and its callers outside the recovery cards.
 
 In the desktop bundle (`<app>/engine/<checkout>`) a restart is the app's sutando-ctl.sh
-restart-core between an intent and an outcome line in state/recovery/audit.jsonl, refused when the
-ctl is missing or takes no launch lock; elsewhere it is start-cli.sh --restart.
+restart-core, refused when the ctl is missing or takes no launch lock; elsewhere it is
+start-cli.sh --restart. Both run between intent and outcome lines in state/recovery/audit.jsonl.
 """
 from __future__ import annotations
 
@@ -19,8 +19,11 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -53,6 +56,21 @@ class Run:
 
     def argvs(self):
         return [a for a, _kw in self.calls]
+
+
+#: What the recorder says on stderr when both of an attempt's audit lines could not be written.
+LOST = ["core_restart: audit intent line not written (attempt att_0123456789ab)",
+        "core_restart: audit outcome line not written (attempt att_0123456789ab)"]
+
+
+class LostAudit(Run):
+    """A restart whose recorder lost both audit lines, with the launcher's own output around them."""
+
+    def __call__(self, argv, **kw):
+        done = super().__call__(argv, **kw)
+        if argv[-1] != "capabilities":
+            done.stderr = "launcher noise\n" + "\n".join(LOST) + "\nmore launcher noise\n"
+        return done
 
 
 class Base(unittest.TestCase):
@@ -93,13 +111,18 @@ class Route(Base):
 
     def test_without_the_app_it_is_start_cli(self):
         argv, via = self.route(self.clone, runtime="codex", extra=["--visible"])
-        self.assertEqual(argv, ["bash", str(self.clone / "src" / "agent" / "start-cli.sh"),
-                                "--runtime", "codex", "--restart", "--visible"])
+        self.assertEqual(argv[:3], [sys.executable, CR.RECORDER, "start-cli"])
+        self.assertEqual(argv[argv.index("--start-cli") + 1:],
+                         [str(self.clone / "src" / "agent" / "start-cli.sh"), "--runtime", "codex",
+                          "--", "--visible"])
         self.assertEqual(via, CR.VIA_START_CLI)
 
     def test_a_start_runs_the_launcher_with_no_restart_flag_outside_the_bundle(self):
         argv, via = self.route(self.clone, start=True, start_cli="/x/L")
-        self.assertEqual((argv, via), (["bash", "/x/L"], CR.VIA_START_CLI))
+        self.assertEqual((argv[:3], via),
+                         ([sys.executable, CR.RECORDER, "start-cli"],
+                          CR.VIA_START_CLI))
+        self.assertEqual(argv[argv.index("--start-cli") + 1:], ["/x/L", "--start"])
 
     def test_a_start_in_the_bundle_is_the_ctl_like_a_restart(self):
         self.desktop()
@@ -109,13 +132,13 @@ class Route(Base):
 
     def test_a_given_launcher_is_kept_outside_the_app(self):
         argv, _via = self.route(self.clone, start_cli="/x/L")
-        self.assertEqual(argv, ["bash", "/x/L", "--restart"])
+        self.assertEqual(argv[argv.index("--start-cli") + 1], "/x/L")
 
     def test_a_clone_outside_the_bundle_falls_back_to_start_cli(self):
         self.desktop()
         run = Run()
         argv, via = self.route(self.clone, run)
-        self.assertEqual((argv[-1], via, run.calls), ("--restart", CR.VIA_FALLBACK, []))
+        self.assertEqual((argv[2], via, run.calls), ("start-cli", CR.VIA_FALLBACK, []))
 
     def test_the_bundle_without_its_ctl_is_refused(self):
         self.desktop()
@@ -163,8 +186,8 @@ class RunCtl(Base):
         self.assertEqual(argv, ["bash", str(self.ctl), "restart-core"])
         self.assertNotIn(CR.LOCK_MARKER, kw["env"])
         intent, outcome = self.audit()
-        base = {"event": "ctl_restart", "via": "ctl", "caller": "recovery-card", "hitl_id": "hitl_1",
-                "revision": 4, "at": 100}
+        base = {"event": "core_restart", "via": "ctl", "caller": "recovery-card", "hitl_id": "hitl_1",
+                "revision": 4, "at": 100, "attempt": intent["attempt"]}
         self.assertEqual(intent, dict(base, phase="intent"))
         self.assertEqual(outcome, dict(base, phase="outcome", outcome="done", rc=0))
 
@@ -172,7 +195,8 @@ class RunCtl(Base):
         rc = CR.run_ctl(self.ctl, self.ws, "graceful-restart", runner=Run(rc=CR.CTL_LAUNCH_LOCK_BUSY), env={})
         self.assertEqual(rc, CR.CTL_LAUNCH_LOCK_BUSY)
         intent, outcome = self.audit()
-        self.assertNotIn("hitl_id", intent, "no card, so only the caller's name")
+        self.assertNotIn("hitl_id", intent, "no card, so only the automatic actor and caller are named")
+        self.assertEqual(intent["actor"], "host-supervisor")
         self.assertEqual((outcome["outcome"], outcome["rc"], outcome["caller"]), ("failed", 12, "graceful-restart"))
 
     def test_a_ctl_that_cannot_run_is_failed_with_no_code(self):
@@ -449,17 +473,214 @@ class Restart(Base):
                 self.assertIn(want, err.getvalue())
                 execv.assert_not_called()
 
-    def test_outside_the_bundle_start_cli_replaces_the_process(self):
+    def test_outside_the_bundle_the_recording_wrapper_replaces_the_process(self):
         execv = mock.Mock()
         CR.restart(self.ws, "graceful-restart", repo=self.clone, extra=["--visible"], start_cli="/x/stub",
                    runner=Run(), execv=execv)
         execv.assert_called_once()
-        self.assertEqual(execv.call_args[0][:2], ("bash", ["bash", "/x/stub", "--restart", "--visible"]))
+        argv = execv.call_args[0][1]
+        self.assertEqual(argv[:3], [sys.executable, CR.RECORDER, "start-cli"])
+        self.assertEqual(argv[argv.index("--start-cli") + 1:], ["/x/stub", "--foreground", "--", "--visible"])
+
+    def test_start_cli_writes_one_intent_and_one_outcome_for_an_automatic_restart(self):
+        run = Run(rc=0)
+        rc = CR.run_start_cli(self.ws, "health-check --recover-core", start_cli="/x/stub",
+                              runner=run, now=lambda: 100.0)
+        self.assertEqual(rc, 0)
+        self.assertEqual(run.argvs(), [["bash", "/x/stub", "--restart"]])
+        intent, outcome = self.audit()
+        base = {"event": "core_restart", "via": "start-cli", "caller": "health-check --recover-core",
+                "actor": "host-supervisor", "at": 100, "attempt": intent["attempt"]}
+        self.assertRegex(intent["attempt"], r"^att_[0-9a-f]{12}$")
+        self.assertEqual(intent, dict(base, phase="intent"))
+        self.assertEqual(outcome, dict(base, phase="outcome", outcome="done", rc=0))
+
+    def test_start_cli_records_the_card_identity_instead_of_an_automatic_actor(self):
+        CR.run_start_cli(self.ws, "recovery-card", start_cli="/x/stub", hitl_id="hitl_9", revision=6,
+                         runner=Run(rc=1), now=lambda: 100.0)
+        intent, outcome = self.audit()
+        self.assertEqual((intent["hitl_id"], intent["revision"]), ("hitl_9", 6))
+        self.assertNotIn("actor", intent)
+        self.assertEqual((outcome["outcome"], outcome["rc"]), ("failed", 1))
+
+    def _launcher(self, body):
+        """A real launcher that records its own pid before running `body`."""
+        script = self.root / "launcher.sh"
+        script.write_text(f'#!/bin/bash\necho $$ > "{self.root}/launcher.pid"\n{body}\n')
+        return script
+
+    def _launcher_gone(self):
+        pid = int((self.root / "launcher.pid").read_text())
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        return False
+
+    def test_a_launcher_past_the_recorders_deadline_is_killed_reaped_and_recorded(self):
+        script = self._launcher("exec sleep 60")
+        began = time.monotonic()
+        rc = CR.run_start_cli(self.ws, "health-check --recover-core", start_cli=str(script), deadline_s=4)
+        self.assertLess(time.monotonic() - began, 20)
+        self.assertEqual(rc, 1)
+        self.assertTrue(self._launcher_gone(), "the launcher outlived the recorder's deadline")
+        intent, outcome = self.audit()
+        self.assertEqual((outcome["outcome"], outcome["reason"]), ("failed", "deadline"))
+        self.assertNotIn("rc", outcome)
+        self.assertEqual(outcome["attempt"], intent["attempt"])
+
+    def test_a_cancelled_recorder_ends_its_launcher_and_still_writes_the_outcome(self):
+        script = self._launcher("exec sleep 60")
+        argv = CR.recorded_start_cli_argv(REPO, self.ws, "health-check --recover-core", via=CR.VIA_START_CLI,
+                                          start_cli=str(script))
+        recorder = subprocess.Popen(argv, stdin=subprocess.DEVNULL, start_new_session=True)
+        try:
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline and not (self.root / "launcher.pid").exists():
+                time.sleep(0.05)
+            self.assertTrue((self.root / "launcher.pid").exists(), "the launcher never started")
+            recorder.send_signal(signal.SIGTERM)
+            self.assertEqual(recorder.wait(timeout=20), 1)
+        finally:
+            if recorder.poll() is None:
+                recorder.kill()
+                recorder.wait()
+        self.assertTrue(self._launcher_gone(), "the launcher outlived its cancelled recorder")
+        intent, outcome = self.audit()
+        self.assertEqual((outcome["outcome"], outcome["reason"]), ("failed", "cancelled"))
+        self.assertEqual(outcome["attempt"], intent["attempt"])
+
+    def test_a_stop_signal_is_turned_into_a_cancel(self):
+        installed = {}
+        CR._cancel_on_signal(install=lambda sig, handler: installed.__setitem__(sig, handler))
+        self.assertEqual(set(installed), set(CR.CANCEL_SIGNALS))
+
+        def cancelled(argv, **kw):
+            installed[signal.SIGTERM](signal.SIGTERM, None)
+        self.assertEqual(CR.run_start_cli(self.ws, "automatic", start_cli="/x/stub", runner=cancelled), 1)
+        self.assertEqual(self.audit()[-1]["reason"], "cancelled")
+
+    def test_the_recorder_is_bounded_only_when_the_caller_names_its_own_deadline(self):
+        argv, _via = CR.route(self.clone, {}, Run(), workspace=self.ws, caller="c", caller_deadline_s=120)
+        self.assertEqual(argv[argv.index("--deadline-s") + 1], str(120 - CR.DEADLINE_MARGIN_S))
+        argv, _via = CR.route(self.clone, {}, Run(), workspace=self.ws, caller="c")
+        self.assertNotIn("--deadline-s", argv)
+        run = Run(rc=0)
+        CR.run_start_cli(self.ws, "c", start_cli="/x/stub", runner=run, deadline_s=8, clock=lambda: 50.0)
+        CR.run_start_cli(self.ws, "c", start_cli="/x/stub", runner=run)
+        self.assertEqual([kw["timeout"] for _argv, kw in run.calls], [6, None],
+                         "the launcher leaves a quarter of a short budget for the outcome line")
+        with mock.patch.object(CR, "run_start_cli", return_value=0) as sc, mock.patch.object(CR, "_cancel_on_signal"):
+            CR.main(["start-cli", "--workspace", "/w", "--caller", "c", "--via", "start-cli",
+                     "--start-cli", "/s", "--deadline-s", "100"])
+        self.assertEqual(sc.call_args.kwargs["deadline_s"], 100)
+
+    def test_a_held_audit_lock_cannot_outlast_the_recorders_deadline(self):
+        from file_lock import locked_file
+        from hitl import recovery
+        lock = recovery.recovery_dir(self.ws) / recovery.AUDIT_LOCK
+        run, err, done = Run(rc=0), io.StringIO(), []
+
+        def record():
+            with mock.patch.object(sys, "stderr", err):
+                done.append(CR.run_start_cli(self.ws, "health-check --recover-core", start_cli="/x/stub",
+                                             runner=run, deadline_s=2))
+        with locked_file(lock):  # another process appending, stalled
+            began = time.monotonic()
+            worker = threading.Thread(target=record, daemon=True)
+            worker.start()
+            worker.join(15)
+            waited = time.monotonic() - began
+            self.assertFalse(worker.is_alive(), "the recorder waited on the audit lock past its deadline")
+        self.assertLess(waited, 2 + 1, "both lines and the launcher fit one budget")
+        self.assertEqual(done, [0], "the restart itself still ran and its code is returned")
+        self.assertEqual(len(run.calls), 1)
+        self.assertEqual(self.audit(), [])
+        self.assertIn("audit intent line not written", err.getvalue())
+        self.assertIn("audit outcome line not written", err.getvalue())
+        self.assertEqual(len(CR.audit_diagnostics(err.getvalue())), 2, "a caller can pick both reports out")
+        self.assertTrue(recovery.audit(self.ws, {"event": "after"}, wait_s=1), "the lock was left free")
+
+    def test_an_unbounded_recorder_still_bounds_each_audit_line(self):
+        run = Run(rc=0)
+        with mock.patch.object(CR, "_audit", return_value=True) as audit:
+            CR.run_start_cli(self.ws, "graceful-restart", start_cli="/x/stub", runner=run)
+        self.assertEqual([c.kwargs["wait_s"] for c in audit.call_args_list], [CR.AUDIT_LOCK_WAIT_S] * 2)
+        from hitl import recovery
+        with mock.patch.object(recovery, "audit", return_value=True) as written:
+            CR.run_ctl(self.ctl, self.ws, "recovery-card", runner=run)
+        self.assertEqual([c.kwargs["wait_s"] for c in written.call_args_list], [CR.AUDIT_LOCK_WAIT_S] * 2)
+
+    def test_a_foreground_restart_keeps_the_terminal_and_an_unattended_one_does_not(self):
+        import pty
+        script = self._launcher('if [ -t 0 ]; then echo terminal; else echo detached; fi > "$0.stdin"')
+        seen = Path(str(script) + ".stdin")
+        for foreground, want in ((True, "terminal"), (False, "detached")):
+            argv = CR.recorded_start_cli_argv(REPO, self.ws, "graceful-restart", via=CR.VIA_START_CLI,
+                                              start_cli=str(script), foreground=foreground)
+            master, slave = pty.openpty()
+            try:
+                self.assertEqual(subprocess.run(argv, stdin=slave, stdout=subprocess.DEVNULL,
+                                                stderr=subprocess.DEVNULL, timeout=30).returncode, 0)
+            finally:
+                os.close(master)
+                os.close(slave)
+            self.assertEqual(seen.read_text().strip(), want)
+        run = Run(rc=0)
+        CR.run_start_cli(self.ws, "c", start_cli="/x/stub", runner=run, foreground=True)
+        CR.run_start_cli(self.ws, "c", start_cli="/x/stub", runner=run)
+        self.assertEqual([kw["stdin"] for _argv, kw in run.calls], [None, subprocess.DEVNULL])
+        execv = mock.Mock()
+        CR.restart(self.ws, "graceful-restart", repo=self.clone, start_cli="/x/stub", runner=Run(), execv=execv)
+        self.assertIn("--foreground", execv.call_args[0][1], "only the foreground verb asks for the terminal")
+        argv, _via = CR.route(self.clone, {}, Run(), workspace=self.ws, caller="health-check --recover-core")
+        self.assertNotIn("--foreground", argv)
+
+    def test_overlapping_attempts_pair_their_own_intent_and_outcome(self):
+        def nested(argv, **kw):
+            if not self.audit()[1:]:
+                CR.run_start_cli(self.ws, "second", start_cli="/x/stub", runner=Run(rc=3))
+            return subprocess.CompletedProcess(argv, 0)
+        CR.run_start_cli(self.ws, "first", start_cli="/x/stub", runner=nested)
+        lines = self.audit()
+        self.assertEqual([(r["caller"], r["phase"]) for r in lines],
+                         [("first", "intent"), ("second", "intent"), ("second", "outcome"), ("first", "outcome")])
+        self.assertEqual(lines[0]["attempt"], lines[3]["attempt"])
+        self.assertEqual(lines[1]["attempt"], lines[2]["attempt"])
+        self.assertNotEqual(lines[0]["attempt"], lines[1]["attempt"])
+
+    def test_an_audit_line_that_cannot_be_written_is_said_and_marks_the_outcome(self):
+        from hitl import recovery
+        real, err = recovery.audit, io.StringIO()
+
+        def intent_fails(workspace, entry, **kw):
+            return False if entry["phase"] == "intent" else real(workspace, entry, **kw)
+        with mock.patch.object(recovery, "audit", side_effect=intent_fails), mock.patch.object(sys, "stderr", err):
+            self.assertEqual(CR.run_start_cli(self.ws, "c", start_cli="/x/stub", runner=Run(rc=0)), 0)
+            self.assertEqual(CR.run_ctl(self.ctl, self.ws, "c", runner=Run(rc=0)), 0)
+        self.assertEqual(err.getvalue().count("core_restart: audit intent line not written (attempt att_"), 2)
+        self.assertEqual([(r["phase"], r["intent_recorded"]) for r in self.audit()],
+                         [("outcome", False), ("outcome", False)])
+        with mock.patch.object(recovery, "audit", return_value=False), mock.patch.object(sys, "stderr", err):
+            self.assertEqual(CR.run_start_cli(self.ws, "c", start_cli="/x/stub", runner=Run(rc=0)), 0)
+        self.assertIn("audit outcome line not written", err.getvalue())
+
+    def test_start_cli_that_cannot_run_is_failed_with_no_code(self):
+        def boom(argv, **kw):
+            raise OSError("no bash")
+        self.assertEqual(CR.run_start_cli(self.ws, "automatic", start_cli="/x/stub", runner=boom), 1)
+        self.assertEqual(self.audit()[-1]["outcome"], "failed")
+        self.assertNotIn("rc", self.audit()[-1])
 
     def test_a_start_outside_the_bundle_execs_the_launcher_without_the_flag(self):
         execv = mock.Mock()
         CR.restart(self.ws, "switch-model", repo=self.clone, start_cli="/x/L", runner=Run(), execv=execv, start=True)
-        self.assertEqual(execv.call_args[0][:2], ("bash", ["bash", "/x/L"]))
+        argv = execv.call_args[0][1]
+        self.assertEqual(argv[:3], [sys.executable, CR.RECORDER, "start-cli"])
+        self.assertEqual(argv[argv.index("--start-cli") + 1:], ["/x/L", "--start", "--foreground"])
+        run = Run(rc=0)
+        CR.run_start_cli(self.ws, "switch-model", start_cli="/x/L", runner=run, start=True)
+        self.assertEqual(run.argvs(), [["bash", "/x/L"]])
 
     def test_in_the_bundle_the_ctl_runs_here_between_its_lines(self):
         self.desktop()
@@ -476,13 +697,20 @@ class Restart(Base):
         self.assertEqual(rc, CR.ALREADY_RUNNING_EXIT)
         self.assertTrue(rc_.call_args.kwargs["start"])
 
-    def test_the_cli_dispatches_both_verbs(self):
+    def test_the_cli_dispatches_each_verb(self):
         with mock.patch.object(CR, "run_ctl", return_value=12) as rc_:
             self.assertEqual(CR.main(["ctl", "--ctl", "/c", "--workspace", "/w", "--caller", "c",
                                       "--hitl-id", "h", "--revision", "2", "--runtime", "codex"]), 12)
             CR.main(["ctl", "--ctl", "/c", "--workspace", "/w", "--caller", "c", "--start"])
         rc_.assert_any_call(Path("/c"), Path("/w"), "c", hitl_id="h", revision=2, runtime="codex", start=False)
         self.assertTrue(rc_.call_args.kwargs["start"])
+        with mock.patch.object(CR, "run_start_cli", return_value=7) as sc:
+            self.assertEqual(CR.main(["start-cli", "--workspace", "/w", "--caller", "c", "--via",
+                                      "start-cli-fallback", "--start-cli", "/s", "--hitl-id", "h",
+                                      "--revision", "2", "--runtime", "codex", "--", "--visible"]), 7)
+        sc.assert_called_once_with(Path("/w"), "c", via="start-cli-fallback", hitl_id="h", revision=2,
+                                   runtime="codex", extra=["--visible"], start_cli="/s", start=False,
+                                   deadline_s=None, foreground=False)
         with mock.patch.object(CR, "restart", return_value=0) as r:
             self.assertEqual(CR.main(["restart", "--workspace", "/w", "--caller", "g", "--repo", "/r",
                                       "--start-cli", "/s", "--", "--visible"]), 0)
@@ -521,11 +749,23 @@ class LimitHoldRetry(Base):
         [body] = self.told()
         self.assertIn("Restart the core from the desktop app", body)
 
+    def test_a_relaunch_that_succeeds_with_its_audit_lines_lost_says_so(self):
+        run = LostAudit(rc=0)
+        err = io.StringIO()
+        with mock.patch.object(clh, "_REPO", self.clone), mock.patch.object(sys, "stderr", err):
+            self.assertTrue(clh.relaunch_core(self.ws, "L", run=run))
+        self.assertEqual(err.getvalue().splitlines(), [f"{clh.RELAUNCH_CALLER}: {line}" for line in LOST])
+        trace = (self.ws / "logs" / CR.RESTART_TRACE).read_text().splitlines()
+        self.assertEqual([line.split(" ", 1)[1] for line in trace],
+                         [f"[audit] {clh.RELAUNCH_CALLER}: {line}" for line in LOST])
+
     def test_elsewhere_the_given_launcher_restarts(self):
         run = Run(rc=0)
         with mock.patch.object(clh, "_REPO", self.clone):
             self.assertTrue(clh.relaunch_core(self.ws, "L", run=run))
-        self.assertEqual(run.argvs(), [["bash", "L", "--restart"]])
+        [argv] = run.argvs()
+        self.assertEqual(argv[:3], [sys.executable, CR.RECORDER, "start-cli"])
+        self.assertEqual(argv[argv.index("--start-cli") + 1], "L")
 
 
 class RecoverCore(Base):
@@ -554,11 +794,38 @@ class RecoverCore(Base):
             self.assertFalse(HC._default_core_restart(run=run))
         self.assertEqual(run.calls, [])
 
+    def test_a_recovery_that_succeeds_with_its_audit_lines_lost_says_so(self):
+        self.patched(self.clone)
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err):
+            self.assertTrue(HC._default_core_restart(run=LostAudit(rc=0)))
+        self.assertEqual(err.getvalue().splitlines(), [f"{HC.RECOVER_CALLER}: {line}" for line in LOST])
+        trace = (self.ws / "logs" / CR.RESTART_TRACE).read_text()
+        self.assertEqual(trace.count("[audit] "), 2)
+        self.assertNotIn("launcher noise", trace + err.getvalue())
+
+    def test_only_the_recorders_own_reports_are_relayed_and_at_most_a_few(self):
+        many = "\n".join(f"core_restart: audit intent line not written (attempt att_{i:012x})" for i in range(9))
+        self.assertEqual(len(CR.audit_diagnostics(many)), CR.MAX_AUDIT_DIAGNOSTICS)
+        for other in (None, "", "core_restart: audit intent line not written (attempt att_1) and more",
+                      "x core_restart: audit outcome line not written (attempt att_0123456789ab)"):
+            self.assertEqual(CR.audit_diagnostics(other), [])
+        trace = self.ws / "logs" / CR.RESTART_TRACE
+        self.assertEqual(CR.report_audit_diagnostics(trace, "c", "launcher noise"), [])
+        self.assertFalse((self.ws / "logs").exists(), "nothing is written when there is nothing to relay")
+        (self.ws / "logs").write_text("not a directory")
+        err = io.StringIO()
+        self.assertEqual(CR.report_audit_diagnostics(trace, "c", LOST[0], err=err), [LOST[0]])
+        self.assertEqual(err.getvalue(), f"c: {LOST[0]}\n", "an unwritable trace still leaves the stderr report")
+
     def test_elsewhere_it_is_start_cli(self):
         self.patched(self.clone)
         run = Run(rc=1)
         self.assertFalse(HC._default_core_restart(run=run))
-        self.assertEqual(run.argvs(), [["bash", str(self.clone / "src" / "agent" / "start-cli.sh"), "--restart"]])
+        [argv] = run.argvs()
+        self.assertEqual(argv[:3], [sys.executable, CR.RECORDER, "start-cli"])
+        self.assertEqual(argv[argv.index("--start-cli") + 1],
+                         str(self.clone / "src" / "agent" / "start-cli.sh"))
 
     def test_without_a_launcher_it_does_nothing(self):
         self.patched(self.root / "nowhere")

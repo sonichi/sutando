@@ -169,10 +169,26 @@ the launcher with no flag outside the bundle; in it, under the launch lock, the 
 read and the app's `launch-sutando.sh` runs only when the core is down, while a core that is running
 is left alone, `outcome: skipped`, `rc: 14`). `tests/core-restart-callers.test.py` fails on any
 other `start-cli.sh --restart` caller, and on any other direct `start-cli.sh` / `launch-sutando.sh`
-invocation. A ctl restart runs inside `core_restart.py ctl`, which appends
-two `state/recovery/audit.jsonl` lines, `event: ctl_restart` with `phase: intent` before the ctl
-and `phase: outcome` (`done` or `failed`, with the ctl's `rc`) after it; each carries `caller`,
-and a card's restart adds its `hitl_id` and `revision`.
+invocation. Both the ctl and standalone launcher run inside a
+`core_restart.py` recorder, which appends two `state/recovery/audit.jsonl` lines:
+`event: core_restart` with `phase: intent` before the command and `phase: outcome` (`done` or
+`failed`, with its `rc`) after it. Each carries `caller`; a card's restart adds its `hitl_id` and
+`revision`, while every automatic restart carries `actor: host-supervisor`. The two lines of one
+attempt share an `attempt` id (`att_` and 12 hex digits), so overlapping attempts pair up. A line
+that cannot be written is reported on the recorder's stderr, and an outcome whose intent was not
+written carries `intent_recorded: false`. A caller that bounds its restart (the watchdog, the
+paused core's relaunch, a card's detached restart) passes that bound to the route; the standalone
+recorder then ends its launcher 20 seconds earlier, and also when it is itself told to stop
+(SIGTERM, SIGHUP, SIGINT). In both cases the launcher is killed and reaped before the outcome is
+written: `failed` with `reason: deadline` or `reason: cancelled` and no `rc`. That deadline is one
+budget for the intent line, the launcher and the outcome line: each line waits at most 5 seconds
+for the audit lock (less on a short budget), and a line that waits longer is reported as not
+written. The watchdog and the paused core's relaunch capture the recorder's stderr and read only
+its exit code, so they relay those reports (at most 4, on a successful restart too) to their own
+stderr and to `logs/restart-attempts.log` as `[audit]` lines. The recorder kills the launcher
+process itself, not commands the launcher had already started. A foreground `core_restart.py restart` passes no bound, because its launcher may stay
+attached to a terminal, and it alone leaves the launcher its stdin (`--foreground`); every other
+route gives the launcher no stdin.
 When the ctl exits 12 (another launcher run held the app's launch lock; nothing was killed or
 started), the receipt is `failed`, the card says the core is already being restarted and to try
 again shortly, any hold it lifted returns, and nothing is retried automatically.
