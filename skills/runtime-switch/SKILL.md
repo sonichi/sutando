@@ -46,7 +46,7 @@ is under way is refused.
    panes run that CLI.
 4. `settle` confirms from those two, never from a heartbeat alone: the record names the target with a
    session created after the switch began, and the runtime the launcher picks next is the target. It
-   posts "Switched. The core is now running on Y." or what could not be confirmed. When graceful-restart
+   posts "Switched to Y. The core restarted on it ✓" or what could not be confirmed. When graceful-restart
    did not stop the core (exit 3, 4, 5) it says the core is still on X.
 
 One card, updated in place: the "switching" answer edits the tapped card's own event
