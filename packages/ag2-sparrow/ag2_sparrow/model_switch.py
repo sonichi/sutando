@@ -152,7 +152,7 @@ class ModelSwitch:
         if coming:
             text += " Saved, not switched yet: %s, from your next message." % names.get(coming, coming)
         menu = dict(buttons=self.buttons(agent_card, names, now)) if len(names) <= BUTTONS else \
-            dict(groups=self.groups(agent_card, names, now))
+            dict(groups=self.family_rows(agent_card, names, now))
         # The menu says when it stops acting (the time its record is kept), so the app can show it expired.
         return agent_card.build(CARD, "pending", title="Model", body="Pick a model for %s" % self.name,
                                 text=text, note=NOTE_TEXT, note_tone="dim",
@@ -167,7 +167,7 @@ class ModelSwitch:
     def buttons(self, agent_card, names: dict, now: str) -> list:
         return [self.choice(agent_card, name, mid, name, now) for mid, name in names.items()]
 
-    def groups(self, agent_card, names: dict, now: str) -> list:
+    def family_rows(self, agent_card, names: dict, now: str) -> list:
         """More models than buttons: a row per family ("Gemini 4 Neon"), its levels ("High", "Low") the
         row's taps, so every model is one tap away and none is left to be typed."""
         families, order = {}, []
