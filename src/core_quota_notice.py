@@ -152,11 +152,14 @@ class QuotaNotice:
         (tried again later), or '' (told already this episode, or tried too recently). `tasks`: the
         owner's messages now waiting on the limit; each gets the card once ('quota-card-again')."""
         rec, at = self.load(), self.now()
+        if rec.get("name") and rec.get("name") != self.name:
+            rec = {}                     # another runtime's limit (the core switched): this one is new
         until = rec.get("reset_at")
         if rec.get("told") and until is not None and at >= float(until):
             rec = {}                     # the earlier limit reset and this is a new one
         if not rec.get("since"):
             rec = {"since": at}
+        rec["name"] = self.name
         if reset_at is not None:
             rec["reset_at"] = float(reset_at)
         if reset and not rec.get("reset"):

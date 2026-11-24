@@ -1246,9 +1246,10 @@ def main():
     ap.add_argument("--retry-cmd", default="",
                     help="a worker seat's restart, as one shell-quoted argv its pool injects; with it "
                          "the owner's \"retry now\" reply to the seat's limit pause restarts that seat")
-    ap.add_argument("--quota-card-script", default="",
-                    help="the core's account card script; with it a usage-limit screen sends the owner "
-                         "that card in their DM, once per limit")
+    ap.add_argument("--quota-card-script", default=str(_REPO / "skills" / "account-switch" / "scripts" / "account_card.py"),
+                    help="the core's account card script (default: this checkout's), so a usage-limit "
+                         "screen sends the owner that card whichever launcher started this monitor (one "
+                         "started while the core ran on Codex outlives a switch to Claude Code); '' for none")
     a = ap.parse_args()
     if a.helper_receipt_dir:
         from external_core_helpers import publish

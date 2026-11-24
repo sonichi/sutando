@@ -313,5 +313,21 @@ class EveryMessage(Base):
         self.assertEqual(cqn.owner_waiting(self.ws), ["task-a"])
 
 
+class RuntimeSwitch(Base):
+    """VM 2026-11-23 21:14-21:57 PT: the core switched Codex -> Claude Code while the Codex limit's card
+    was on record (told, weekly reset days away), so the Claude Code core's own limit was never carded."""
+
+    def test_another_runtimes_told_limit_does_not_silence_this_ones_first_card(self):
+        self.assertEqual(self.notice("Codex").hit("Nov 28, 1:00 PM", 4102444800), "quota-card")
+        self.assertEqual(self.notice("Codex").hit("Nov 28, 1:00 PM", 4102444800), "")
+        self.assertEqual(self.notice("Claude Code").hit("Nov 28 at 1pm"), "quota-card")
+        self.assertEqual(len(self.cards), 2)
+        self.assertIn("Claude Code has reached its usage limit", self.cards[1])
+
+    def test_the_monitor_defaults_to_this_checkouts_card_script(self):
+        src = (Path(__file__).resolve().parents[1] / "src" / "core-input-watch.py").read_text()
+        self.assertIn('"--quota-card-script", default=str(_REPO / "skills" / "account-switch"', src)
+
+
 if __name__ == "__main__":
     unittest.main()
