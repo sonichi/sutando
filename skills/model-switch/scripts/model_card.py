@@ -29,6 +29,13 @@ untold outcome with a newer attempt after it is marked `superseded` and never po
 attempt's outcome may stand for the card.
 The menu, the "switching" answer and the outcome share one card id, so the newest stands for the card.
 
+One card, updated in place (owner 2026-11-23): a tap edits the tapped menu's own event to the
+"switching" words (`room.message.edit`), and the outcome edits that same event again, so a tap adds
+no message. No Action carries a card in an edit, so the event then shows the words in place of the
+card. The edited event is kept with the attempt (`card`); where the edit cannot be made (no card
+event known, or the edit is refused) the "switching" answer and the outcome are posted as notice
+cards, as before.
+
 The model in use is read only from `<workspace>/state/model-switch.json`, the record switch-model.sh
 writes; with no record it is "the default model". Every command prints one JSON object.
 Exit 0 done, 1 a negative answer, 2 refused.
@@ -219,7 +226,9 @@ def current_model(ws: Path) -> dict:
     rec = record(ws)
     model = rec.get("model") if isinstance(rec.get("model"), str) and rec.get("model") else None
     if rec.get("runtime") == "codex" and rec.get("status") in ("rejected", "pending"):
-        model = codex_core_model.working(rec) or None  # not taken by Codex (yet): the core is on this one
+        # Not confirmed by Codex (yet): the core is on the model before it, unless the turn now running was
+        # started on the pick (the seat's `running` mark), in which case this very turn is on the pick.
+        model = codex_core_model.in_use(rec) or None
     return {"model": model, "name": name_of(model), "source": "model-switch.json" if model else None,
             "ts": rec.get("ts") if model else None}
 
@@ -349,6 +358,40 @@ def _post(ws: Path, room: str, body: str, card: dict, operation_id: str, *, repl
     return {"status": "posted", "event_id": eid}
 
 
+def card_words(words: str) -> str:
+    """What an edited card says: the card is gone from the event, so the words name it."""
+    return f"Core model: {words}"
+
+
+def _edit(ws: Path, room: str, event: str, words: str, operation_id: str, *, core=None, execute=None) -> dict:
+    """Show `words` in place of the card at `event` (the owner's checked DM only); {"status": "posted",
+    "event_id": event, "edited": True}, or {"status": "failed", "why"} when it cannot be edited."""
+    if not event:
+        return {"status": "failed", "why": "no card to edit"}
+    try:
+        core = core if core is not None else _core(ws)
+        lane = str(core.get("instance") or "")
+        if room != _owner_dm(ws, core):
+            return {"status": "failed", "why": "the card is not in the owner's DM"}
+        execute = execute if execute is not None else _execute(ws, lane or None)
+        answer = execute("room.message.edit", {"event_id": event, "body": card_words(words)},
+                         operation_id=operation_id, room_id=room)
+    except Exception as e:  # noqa: BLE001 — not edited: the caller posts the card instead
+        return {"status": "failed", "why": f"{type(e).__name__}: {e}"}
+    if not isinstance(answer, dict) or answer.get("is_error") or not ac._event_id(answer):
+        code = str(answer.get("code") or answer.get("error") or "") if isinstance(answer, dict) else ""
+        return {"status": "failed", "why": f"room.message.edit did not edit the card{f' ({code})' if code else ''}"}
+    return {"status": "posted", "event_id": event, "edited": True}
+
+
+def keep_card(ws: Path, attempt: str, event: str, now: float) -> None:
+    """Keep `event`, the card the attempt's "switching" words replaced, for its outcome to replace."""
+    with _outcome_book(ws, now) as rows:
+        for row in rows:
+            if row["attempt"] == attempt:
+                row["card"] = event
+
+
 def new_attempt(now: float) -> str:
     """An id for one tap's switch: its "switching" card, its switch and its outcome carry it."""
     return f"{int(now)}-{secrets.token_hex(4)}"
@@ -415,8 +458,11 @@ def tell(ws: Path, attempt: str, *, core=None, execute=None, now: float) -> dict
                 return {"status": "superseded"}
             if row.get("state") not in ("done", "error", "pending"):
                 return {"status": "failed", "why": "that attempt has no outcome yet"}
-            out = _outcome_post(ws, attempt, str(row.get("room") or ""), row["state"],
-                                str(row.get("words") or UNFINISHED), core, execute)
+            words = str(row.get("words") or UNFINISHED)
+            out = _edit(ws, str(row.get("room") or ""), str(row.get("card") or ""), words,
+                        f"model-card:{attempt}:outcome-edit", core=core, execute=execute)
+            if out["status"] != "posted":
+                out = _outcome_post(ws, attempt, str(row.get("room") or ""), row["state"], words, core, execute)
             if out["status"] == "posted":
                 row.update(told=True, event_id=out["event_id"])
             return out
@@ -520,9 +566,17 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     if other is not None:
         return _emit({**other, **extra}, code)
     say = switching_words(alias)
-    body, card = notice_card("pending", "Switching", say)
-    posted = _post(ws, room, body, card, f"model-card:{attempt}:switching",
-                   reply_to=str(headers.get("reply_to_event") or ""), core=core or None, execute=execute)
+    tapped = str(headers.get("reply_to_event") or "")
+    posted = _edit(ws, room, tapped, say, f"model-card:{attempt}:switching-edit", core=core or None, execute=execute)
+    if posted["status"] == "posted":
+        try:
+            keep_card(ws, attempt, tapped, now())
+        except OSError:
+            pass  # the outcome is then posted as a card of its own
+    else:
+        body, card = notice_card("pending", "Switching", say)
+        posted = _post(ws, room, body, card, f"model-card:{attempt}:switching", reply_to=tapped,
+                       core=core or None, execute=execute)
     try:
         pid = start_switch(ws, alias, room, attempt, popen)
     except OSError as e:
