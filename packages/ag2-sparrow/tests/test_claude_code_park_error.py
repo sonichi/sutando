@@ -23,6 +23,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from claude_code_fixtures import cli, ConnectBase, hold_consumer, inbox, unhold  # noqa: E402
 
 
+# SDKAssistantMessageError, the StopFailure `error` values of the CLI version CI pins (2.1.303).
+CLI_STOP_FAILURE_CODES = {"authentication_failed", "oauth_org_not_allowed", "account_on_hold", "verification_required",
+                          "billing_error", "rate_limit", "overloaded", "invalid_request", "model_not_found",
+                          "server_error", "unknown", "max_output_tokens", "cloud_credential_error"}
+
+
 class ParkError(ConnectBase):
     def setUp(self):
         super().setUp()
@@ -57,6 +63,20 @@ class ParkError(ConnectBase):
             self.assertIn(want, body, t)
             self.assertNotIn("/Users/someone", body)
 
+    def test_a_known_cli_error_code_reads_as_its_plain_reason_and_an_unknown_one_is_shown_as_is(self):
+        for t, error, want in (
+                ("task-b1", b"billing_error\n", "(turn error: your Claude account is out of credits)"),
+                ("task-b2", b"authentication_failed", "(turn error: Claude is signed out on this computer; sign in again)"),
+                ("task-b3", b"rate_limit\n", "(turn error: Claude's usage limit was reached; try again later)"),
+                ("task-b4", b"overloaded\n", "(turn error: Claude's service is busy; try again shortly)"),
+                ("task-b5", b"model_not_found\n", "(turn error: model_not_found)"),
+                ("task-b6", b"some_new_code\n", "(turn error: some_new_code)")):
+            self.confirmed(t)
+            rc, out = self.verb("park", t, "turn-1", "--detail", "turn error without a reply", "--error-stdin", stdin=error)
+            self.assertEqual((rc, out["outcome"]), (0, "settled"), t)
+            self.assertIn(want, (self.results / (t + ".txt")).read_text(), t)
+        self.assertEqual(set(inbox.STOP_FAILURE_REASONS) - CLI_STOP_FAILURE_CODES, set())
+
     def test_without_the_flag_stdin_is_never_read_and_the_detail_stands(self):
         t = self.confirmed("task-d1")
         rc, out = self.verb("park", t, "turn-1", "--detail", "turn aborted without a reply", stdin=b"not an error\n")
@@ -79,6 +99,14 @@ class ParkError(ConnectBase):
             body = (self.results / (t + ".txt")).read_text()
             self.assertIn(generic, body, t)
             self.assertNotIn("Credit balance", body, t)
+        for t in ("task-r2", "task-c2"):
+            self.confirmed(t, "access_tier: owner\nchannel_kind: room\n" if t == "task-r2"
+                           else "access_tier: team\ncollaborator: true\nchannel_kind: dm\n")
+            self.verb("park", t, "turn-1", "--detail", "turn error without a reply", "--error-stdin", stdin=b"billing_error\n")
+            body = (self.results / (t + ".txt")).read_text()
+            self.assertIn(generic, body, t)
+            self.assertNotIn("credits", body, t)
+            self.assertNotIn("billing_error", body, t)
         self.assertEqual(inbox._audience(self.root, gone), (None, None))
         self.assertEqual(inbox._audience(self.root, collab), ("team", "dm"))
         self.assertEqual(inbox._audience(self.root, room), ("owner", "room"))

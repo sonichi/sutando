@@ -28,6 +28,17 @@ EXIT_OK, EXIT_REFUSED, EXIT_USAGE, EXIT_PROGRESS = 0, 1, 2, 3
 INTERRUPTED_BODY = ("[s.space] This attempt was interrupted before the session answered; send the request "
                     "again if it is still wanted.")
 PROTOCOL_FAILURE = "[s.space] The session's turn ended without a reply (%s); send the request again if still wanted."
+# The CLI's StopFailure `error` codes (SDKAssistantMessageError) a person can act on; any other code is shown as-is.
+STOP_FAILURE_REASONS = {
+    "billing_error": "your Claude account is out of credits",
+    "authentication_failed": "Claude is signed out on this computer; sign in again",
+    "oauth_org_not_allowed": "your organization does not allow this Claude sign-in; use an API key or ask your admin",
+    "account_on_hold": "your Claude account is on hold",
+    "cloud_credential_error": "the cloud credentials Claude uses are unavailable; check or refresh them",
+    "rate_limit": "Claude's usage limit was reached; try again later",
+    "overloaded": "Claude's service is busy; try again shortly",
+    "server_error": "Claude's service is unavailable right now; try again shortly",
+}
 ROOT_VAR = "AG2_SPARROW_ROOT"
 CONFIG_DIR_VAR = "AG2_SPARROW_CONFIG_DIR"
 ALLOW_NON_OWNER = "ALLOW_NON_OWNER"
@@ -614,9 +625,10 @@ def park(root, task_id, turn_id, detail, error="") -> dict:
     A turn whose answer was already accepted (its descriptor recorded) publishes that answer instead.
     The identical park again after one that settled but whose reply was lost answers settled, naming
     the protocol failure only when that is what it delivered; nothing is published twice.
-    `error`: what the session said ended the turn; its scrubbed line replaces `detail` in the room's line
-    only when the task's attested sender is the owner and its room is a DM."""
+    `error`: what the session said ended the turn, a known CLI error code read as its plain reason; its
+    scrubbed line replaces `detail` in the room's line only when the task's attested sender is the owner and its room is a DM."""
     rec = _lifecycle(root).claims.load(task_id)
+    error = STOP_FAILURE_REASONS.get(error.strip(), error) if error else ""
     why = turn_error.owner_reason(*_audience(root, task_id), error) if error else ""
     body = (PROTOCOL_FAILURE % ("turn error: " + why if why else detail)).encode("utf-8")
     if rec and rec.get("staged") and rec["phase"] in (lifecycle.TURN_CONFIRMED, lifecycle.RESULT_STAGED, lifecycle.SETTLED):
