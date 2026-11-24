@@ -24,6 +24,8 @@ import os
 import subprocess
 import sys
 
+from ...acp_client import AcpError, AcpGone, AcpTimeout
+
 METHOD_ID = "gemini-api-key"
 API_KEY_AUTH = METHOD_ID   # the saved Session's `auth` when it was opened on the key
 ACCOUNT = "GEMINI_API_KEY"
@@ -32,6 +34,10 @@ OPT_OUT_ENV = "AG2_AGY_GEMINI_KEY"
 SECURITY = "/usr/bin/security"
 READ_TIMEOUT_S = 10.0
 GUEST_FLAG = "--gemini-dir"
+
+
+class AuthUnconfirmed(AcpError):
+    """`authenticate` was sent and not answered: whether this agy runs on the key is not known."""
 
 
 def agent_service(agent_id: str) -> str:
@@ -98,8 +104,10 @@ def restricted(argv) -> bool:
 def authenticate_with_app_key(client, init, timeout, argv, agent_id="", log=lambda *a: None,
                               key_source=None) -> bool:
     """After `initialize`: send `authenticate` gemini-api-key with the app's key when this is not a restricted
-    turn, agy advertises the method and a key is saved. True when agy accepted it. A refusal is logged (without
-    the key or agy's message, which could echo it) and the turn goes on on the Google sign-in."""
+    turn, agy advertises the method and a key is saved. True when agy accepted it. A refusal (agy answers with
+    an error) is logged, without the key or agy's message, which could echo it, and the turn goes on on the
+    Google sign-in. No answer at all (a timeout, agy gone, a failed send) raises AuthUnconfirmed: that process
+    may or may not be on the key, so no Session is opened or recorded on it."""
     if restricted(argv) or not advertised(init):
         return False
     key = (key_source or gemini_api_key_from_app)(agent_id)
@@ -111,9 +119,17 @@ def authenticate_with_app_key(client, init, timeout, argv, agent_id="", log=lamb
         redact(key)
     try:
         client.call("authenticate", {"methodId": METHOD_ID, "_meta": {"apiKey": key}}, timeout)
-    except Exception as e:  # noqa: BLE001 - the sign-in still works; never fail the turn over the key
+    except (AcpTimeout, AcpGone) as e:
+        # No answer is not a refusal: agy may still finish authenticating, so which account this process
+        # runs on is unknown. It gets no Session; the caller stops, and the next turn starts a fresh agy.
+        log("Gemini API key from the app: no answer to authenticate (%s); this agy is not used" % type(e).__name__)
+        raise AuthUnconfirmed("authenticate: no answer, so this process's account is unknown") from None
+    except AcpError as e:   # agy answered with an error: an explicit refusal, and the sign-in still works
         log("Gemini API key from the app not accepted (%s); staying on the Google sign-in" % type(e).__name__)
         return False
+    except Exception as e:  # noqa: BLE001 - a broken pipe and the like: unknown too
+        log("Gemini API key from the app: authenticate failed (%s); this agy is not used" % type(e).__name__)
+        raise AuthUnconfirmed("authenticate: it could not be sent or answered") from None
     finally:
         key = None
     log("using the Gemini API key saved in the app for this agent")

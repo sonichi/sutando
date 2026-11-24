@@ -190,6 +190,38 @@ class OwnerTurns(Base):
         self.assertNotIn(DUMMY_KEY, logs)
 
 
+    def test_an_unanswered_authenticate_stops_the_turn_and_no_session_is_opened_or_recorded(self):
+        self.keychain.items[gk.agent_service(AGENT)] = wrapped(DUMMY_KEY)
+        for boom in (acp_client.AcpTimeout("authenticate: no response in 30s"),     # a delayed acknowledgement
+                     acp_client.AcpGone("authenticate: the ACP agent exited before answering"),
+                     BrokenPipeError("stdin closed")):                               # it could not be sent
+            with self.subTest(error=type(boom).__name__):
+                FakeAgy.spawned = []
+                shutil.rmtree(self.tmp / "work", True)      # each case starts with no saved Session
+                conn = gc.Connector(self.args())
+                status, detail, logs = self.owner_turn(conn, factory=lambda *a, **k: FakeAgy(*a, auth_error=boom, **k))
+                self.assertNotEqual(status, "completed", "not run on a process whose account is unknown")
+                (agy,) = FakeAgy.spawned
+                self.assertEqual(agy.methods_called(), ["initialize", "authenticate"], "no Session on it")
+                self.assertIsNone(conn.store.get(("!r:s.space", "owner")), "and none recorded, under any mode")
+                self.assertIn("this agy is not used", logs)
+                self.assertNotIn(DUMMY_KEY, logs + str(detail))
+                # The next turn is a fresh agy that answers: it runs on the key and records that.
+                status, _, _ = self.owner_turn(conn, task="task-2")
+                self.assertEqual(status, "completed")
+                self.assertEqual(conn.store.get(("!r:s.space", "owner"))["auth"], gk.API_KEY_AUTH)
+                self.assertEqual(len(FakeAgy.spawned), 2, "a new process, not the one left in doubt")
+
+    def test_the_setup_check_reports_an_unanswered_authenticate_instead_of_calling_it_signed_in(self):
+        self.keychain.items[gk.agent_service(AGENT)] = wrapped(DUMMY_KEY)
+        boom = acp_client.AcpTimeout("authenticate: no response in 30s")
+        said, why = cli.probe({"ACP_COMMAND": "/opt/agy/bin/agy acp", "AGENT_ID": AGENT},
+                              factory=lambda *a, **k: FakeAgy(*a, auth_error=boom, **k))
+        self.assertEqual(said, "")
+        self.assertIn("did not answer", why)
+        self.assertNotIn("session/new", FakeAgy.spawned[0].methods_called())
+
+
 class SessionsKeepTheirAuth(Base):
     """A Session opened on the Google sign-in still bills that account's quota when resumed (session/load)
     under the key ("Individual quota reached"): the auth mode is saved with the Session and a mismatch opens a
