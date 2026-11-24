@@ -228,6 +228,7 @@ def install(args) -> int:
 
 
 def _install(args) -> int:
+    cm.take_over(args)
     if getattr(args, "token_stdin", False):
         return cb.install_token_stdin(args, LOCAL, lambda: connect_preflight(args, login=False), _install, COMMAND,
                                       work=None, inbox=None, bridge_state_dir=None)
@@ -864,6 +865,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("install", help="record the paths, mint the session id, write the unit, have the manager "
                        "start the session (a reinstall stops the old one first)")
+    cm.replace_option(p)
     p.add_argument("--work", help="an explicit work root, served by a bridge you run (default: the agent's own "
                    "root, <agents dir>/<agent id>, whose bridge install wires)")
     p.add_argument("--inbox", help="an explicit work root by its <work>/tasks, as your bridge's task dir; the "

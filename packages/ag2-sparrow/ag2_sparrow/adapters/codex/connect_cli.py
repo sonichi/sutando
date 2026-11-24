@@ -163,6 +163,7 @@ RECORDED = (("CODEX", "codex", str), ("CODEX_HOME", "codex_home", str), ("SANDBO
 
 
 def install(args) -> int:
+    cm.take_over(args)
     if getattr(args, "token_stdin", False):
         return cb.install_token_stdin(args, LOCAL, lambda: connect_preflight(args, login=False), install, COMMAND,
                                       work=None)
@@ -442,6 +443,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("install", help="record the settings, write the unit, have the manager start the connector "
                        "(a reinstall stops the old one first)")
+    cm.replace_option(p)
     p.add_argument("--work", help="an explicit work root, fed by a bridge you run: Sparrow's tasks/ and results/ must "
                    "be <work>/tasks and <work>/results")
     tok = p.add_mutually_exclusive_group()

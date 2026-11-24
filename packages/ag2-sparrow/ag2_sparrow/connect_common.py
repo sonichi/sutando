@@ -1631,7 +1631,8 @@ def _managed_here(shape: Shape, root: str) -> str:
         cfg, problem = _repairable(shape, root, problem)
     managed = (cfg or ({} if problem else recovered_config(shape))).get("ROOT", "")
     rec = lock_holder(root)
-    ours = rec.get("live") is True and rec.get("adapter") == shape.name and rec.get("install_id") == install_id()
+    same = rec.get("install_id") == install_id() or _REPLACING.get(threading.get_ident(), False)
+    ours = rec.get("live") is True and rec.get("adapter") == shape.name and same
     if problem or managed != root or not ours:
         who = ("a holder with no live record" if rec.get("live") is not True else f"{rec.get('adapter')} pid "
                f"{rec.get('pid')}" + ("" if rec.get("install_id") == install_id() else " of another install"))
@@ -1787,6 +1788,24 @@ def _connect_install_locked(shape: Shape, values: dict, root: str, revise, prech
 
 _PENDING: dict = {}
 _MUTATED: dict = {}
+
+
+_REPLACING: dict = {}
+
+
+def replace_option(p):
+    """--replace-install on an install: for an app that updated and now runs another copy of this package."""
+    p.add_argument("--replace-install", action="store_true",
+                   help="take this agent's job over from another install of ag2-sparrow on this computer (an "
+                        "updated app's new environment): the session that install started is stopped through the "
+                        "manager and started again from this one. Without it such a session is refused")
+    return p
+
+
+def take_over(args) -> None:
+    """This install invocation's word on --replace-install, read where the root's holder is judged
+    (_managed_here): the holder must still be this adapter's live session on the job's own recorded root."""
+    _REPLACING[threading.get_ident()] = bool(getattr(args, "replace_install", False))
 
 
 def begin_operation() -> None:
