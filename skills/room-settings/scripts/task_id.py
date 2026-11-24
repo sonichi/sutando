@@ -4,12 +4,11 @@
     python3 skills/room-settings/scripts/task_id.py <task-file>
 
 Exit 0 prints the id. Exit 2: the task is not the owner's. Exit 3: the file names no
-s.space task id (a local chat task, another channel, or a requeued copy). Headers are
-read the attested way, so body text cannot claim either.
+s.space task id (a local chat task, or another channel). Headers are read the attested
+way, so body text can neither claim them nor hide a valid task.
 """
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
 
@@ -36,9 +35,8 @@ def wire_task_id(text: str) -> "tuple[int, str]":
     room = (headers.get("source_room_id") or headers.get("channel_id") or "").strip()
     if not room.startswith("!"):
         return NO_TASK, "not an s.space room task"
-    # A requeue rewrites `id:`, so only a `task_id:` header names the broker's task.
-    if re.search(r"(?m)^dedup_requeue_count:", text):
-        return NO_TASK, "requeued task has no broker id"
+    # A requeue's synthetic `id:` is left to the server, which refuses it as not this agent's.
+
     # A named instance's local id is `task-<instance>~<broker id>`; the primary's has no `~`.
     base = gateway_instance.first_run(local)
     instance = base[len("task-"):base.index("~")] if base.startswith("task-") and "~" in base else ""

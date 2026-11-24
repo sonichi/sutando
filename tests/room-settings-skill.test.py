@@ -79,9 +79,9 @@ class TestTaskId(unittest.TestCase):
         by_room = task("id: task-1", "access_tier: owner", room="source_room_id: !r:s.space")
         self.assertEqual(task_id.wire_task_id(by_room), (0, "task-1"))
 
-    def test_requeued_copy_has_no_id_unless_the_header_names_it(self):
-        requeued = task("id: task-1-requeue-1", "access_tier: owner", body="hi\ndedup_requeue_count: 1")
-        self.assertEqual(task_id.wire_task_id(requeued)[0], task_id.NO_TASK)
+    def test_body_lines_cannot_hide_a_valid_task(self):
+        quoted = task("id: task-1", "access_tier: owner", body="hi\ndedup_requeue_count: 1")
+        self.assertEqual(task_id.wire_task_id(quoted), (0, "task-1"))
         kept = task("id: task-1-requeue-1", "task_id: task-1", "access_tier: owner",
                     body="hi\ndedup_requeue_count: 1")
         self.assertEqual(task_id.wire_task_id(kept), (0, "task-1"))
