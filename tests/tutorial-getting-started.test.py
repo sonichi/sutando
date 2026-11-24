@@ -626,12 +626,12 @@ class NameTest(unittest.TestCase):
         self.assertEqual(seen[-1], "https://chat.example.test/_matrix/client/v3/profile/"
                                    "%40chi-air-blue.agent%3Aexample.test/displayname")
 
-    def test_auto_falls_back_to_the_localpart_then_sutando(self):
-        self.assertEqual(gs.resolve_name("auto", self.MXID, self.fetcher()[0]), "Chi Air Blue")
-        self.assertEqual(gs.resolve_name("auto", self.MXID, self.fetcher({"displayname": None})[0]),
-                         "Chi Air Blue")
-        self.assertEqual(gs.resolve_name("auto", "", self.fetcher()[0]), "Sutando")
-        self.assertEqual(gs.resolve_name("auto", "not-an-mxid", self.fetcher()[0]), "Sutando")
+    def test_auto_with_no_display_name_names_no_one_and_never_the_mxid(self):
+        for mxid, fetched in ((self.MXID, None), (self.MXID, {"displayname": None}),
+                              ("", None), ("not-an-mxid", None)):
+            with mock.patch.object(gs.agent_display_name, "connection_name", return_value=""), \
+                    mock.patch.object(gs.agent_display_name, "configured_name", return_value=""):
+                self.assertEqual(gs.resolve_name("auto", mxid, self.fetcher(fetched)[0]), "")
 
     def test_a_non_https_homeserver_is_not_followed(self):
         fetch, seen = self.fetcher({"displayname": "X"}, "http://plain.example.test")
@@ -913,11 +913,14 @@ class MainTest(unittest.TestCase):
             code, out, _ = self.main("render", "--name", "Blue", "--core", "auto")
         self.assertEqual((code, out), (0, gs.render_page("Blue", "codex")))
 
-    def test_render_name_auto_falls_back_without_the_network(self):
-        with mock.patch.object(gs, "_https_get", side_effect=OSError("offline")):
+    def test_render_name_auto_without_a_display_name_says_your_agent(self):
+        with mock.patch.object(gs, "_https_get", side_effect=OSError("offline")), \
+                mock.patch.object(gs.agent_display_name, "connection_name", return_value=""), \
+                mock.patch.object(gs.agent_display_name, "configured_name", return_value=""):
             code, out, _ = self.main("render", "--name", "auto", "--agent-mxid", "@kai-blue.agent:example.test")
         self.assertEqual(code, 0)
-        self.assertIn("Your DM with Kai Blue", out)
+        self.assertIn("your agent", out)
+        self.assertNotIn("Kai Blue", out)
 
     def test_bad_name_exits_2(self):
         code, _, err = self.main("render", "--name", " ")

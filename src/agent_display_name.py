@@ -11,18 +11,19 @@ takes its name from `resolve()`, in this order:
                   connection was made (<workspace>/state/connections.json), for when (1) is offline.
 3. `configured` - SUTANDO_DISPLAY_NAME, else AGENT_DISPLAY_NAME (environment, else the AG2 Space
                   channel env file).
-4. `localpart`  - a name made from the mxid's localpart: `@blue-fox.agent:host` gives `Blue Fox`.
-5. `fallback`   - "Sutando".
+4. `none`       - no name: the agent states none.
 
-A Stand persona name (stand-identity.json) or a codename is never used: it is internal, and the
-people greeted know the agent by its s.space display name. The agent's mxid is $AGENT_MXID, else
+A name is never made from the mxid (`@sky-lark-vm-stand.agent` is not "Sky Lark Vm Stand"),
+and a Stand persona name (stand-identity.json) or a codename is never used: the people greeted know
+the agent by its s.space display name only. The agent's mxid is $AGENT_MXID, else
 the channel env file's, else the launcher-named device file or channels/ag2space/.env.
 
 CLI (what an agent runs before introducing itself):
     python3 src/agent_display_name.py [--room ROOM] [--agent-mxid MXID] [--offline] [--json]
-prints the name (with --json: {"name", "source", "agent_mxid"}). It never fails. Stdlib only.
+prints the name (with --json: {"name", "source", "agent_mxid"}). With no name it prints an empty
+line and says on stderr not to state one. It never fails. Stdlib only.
 With --room, a room whose connection names no identity, or that no connection serves, resolves with
-no mxid (tiers 3 and 5): another server's room never borrows the primary agent's name.
+no mxid (tier 3 only): another server's room never borrows the primary agent's name.
 --offline skips tier 1 (no network), for a caller that cannot wait on the homeserver.
 """
 from __future__ import annotations
@@ -40,7 +41,6 @@ from typing import Callable, Mapping, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-FALLBACK_NAME = "Sutando"
 NAME_MAX = 64
 CONFIGURED_VARS = ("SUTANDO_DISPLAY_NAME", "AGENT_DISPLAY_NAME")
 PROFILE_TIMEOUT = 5
@@ -53,14 +53,6 @@ Fetch = Callable[[str], bytes]
 def clean(name: object) -> str:
     """`name` single-spaced and cut to NAME_MAX; '' for anything that is not a non-blank string."""
     return " ".join(name.split())[:NAME_MAX] if isinstance(name, str) else ""
-
-
-def localpart_name(mxid: str) -> str:
-    """A readable name from an mxid's localpart: `@blue-fox.agent:x` -> `Blue Fox`."""
-    m = MXID.match(mxid or "")
-    local = re.sub(r"\.agent$", "", m.group(1)) if m else ""
-    words = [w for w in re.split(r"[-._=/]+", local) if w]
-    return " ".join(w[:1].upper() + w[1:] for w in words)[:NAME_MAX]
 
 
 def https_get(url: str) -> bytes:
@@ -140,20 +132,19 @@ def resolve(mxid: Optional[str] = None, *, fetch: Optional[Fetch] = None,
     if mxid is None:
         try:
             mxid = agent_mxid(environ)
-        except Exception:  # noqa: BLE001 - no identity still yields a name
+        except Exception:  # noqa: BLE001 - no identity leaves the configured tier
             mxid = ""
     mxid = (mxid or "").strip()
     for source, name in (("profile", lambda: "" if offline else profile_name(mxid, fetch)),
                          ("connection", lambda: connection_name(mxid, workspace)),
-                         ("configured", lambda: configured_name(environ)),
-                         ("localpart", lambda: localpart_name(mxid))):
+                         ("configured", lambda: configured_name(environ))):
         try:
             got = name()
         except Exception:  # noqa: BLE001 - a failing tier leaves the next one
             got = ""
         if got:
             return got, source
-    return FALLBACK_NAME, "fallback"
+    return "", "none"
 
 
 def _main(argv) -> int:
@@ -178,6 +169,9 @@ def _main(argv) -> int:
         print(json.dumps({"name": name, "source": source, "agent_mxid": mxid or ""}))
     else:
         print(name)
+    if not name:
+        print("agent_display_name: your s.space display name could not be read. Do not state a name, "
+              "and never make one from your user id.", file=sys.stderr)
     return 0
 
 

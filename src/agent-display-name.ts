@@ -5,7 +5,7 @@
  * name); this module only runs it and caches the answer. A prompt build never waits on the
  * homeserver: the first call resolves with `--offline`, and a live resolve runs in the background
  * (again at most every LIVE_REFRESH_MS), so later builds pick up the live name and any rename.
- * When python or the resolver is unavailable, the name is the resolver's own fallback, "Sutando".
+ * When python or the resolver gives no name, the prompts use "Sutando"; never a name made from the id.
  */
 import { execFile, execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';

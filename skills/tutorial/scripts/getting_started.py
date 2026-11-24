@@ -100,7 +100,7 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "src"))
 import agent_display_name  # noqa: E402
-from agent_display_name import FALLBACK_NAME, MXID, agent_mxid, localpart_name  # noqa: E402,F401
+from agent_display_name import MXID, agent_mxid  # noqa: E402,F401
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tour_page  # noqa: E402,F401
@@ -212,7 +212,7 @@ def room_agent_mxid(room: Optional[str]) -> Optional[str]:
 
 def resolve_name(name: str, mxid: Optional[str] = None,
                  fetch: Optional[Callable[[str], bytes]] = None) -> str:
-    """`name` itself, or for `auto` the name agent_display_name.resolve gives this agent."""
+    """`name` itself, or for `auto` the name agent_display_name.resolve gives this agent ('' for none)."""
     if name != "auto":
         return name
     mxid = mxid if mxid is not None else agent_mxid()  # callers that resolved the identity pass it
@@ -1247,7 +1247,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub = ap.add_subparsers(dest="command", required=True)
     r = sub.add_parser("render", help="print the page's HTML")
     r.add_argument("--name", required=True,
-                   help="the agent's own name; auto: its Matrix profile name, else its mxid's localpart")
+                   help="the agent's own name; auto: its s.space display name, else \"your agent\"")
     r.add_argument("--agent-mxid", help="with --name auto: this agent's mxid (default $AGENT_MXID or the "
                                         "channel env file's)")
     r.add_argument("--audience", choices=AUDIENCES, default="dm",
@@ -1299,7 +1299,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "render":
         agent = (args.agent_mxid or agent_mxid() or "").strip()
         try:
-            name = clean_name(resolve_name(args.name, agent))
+            name = clean_name(resolve_name(args.name, agent) or "your agent")
             features, listed = resolve_list(args.feature_list, lambda s: print(s, file=sys.stderr))
             prompts = load_prompts(args.prompts, tour_page.prompt_slots(features))
             core = detect_core() if args.core == "auto" else args.core
