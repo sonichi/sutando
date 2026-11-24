@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const Commons = require('../commons-sdk.js');
-const { createFakeRoom, createClock, settle } = require('./fake-room.js');
+const { createFakeRoom, createClock, settle, NO_ANSWER } = require('./fake-room.js');
 
 const MAP_PROPS = [{ id: 'k', name: 'Key', type: 'title' }, { id: 'v', name: 'Value', type: 'text' }];
 const TASK_PROPS = [
@@ -622,9 +622,48 @@ test('conditional writes: a lost answer means read again, never refused', async 
   landed.pa.loseAnswer = true;
   assert.deepEqual([(await landed.la.claim(landed.one)).certainty, exactWrites(landed.pa).length], ['room', 1]);
   const dropped = await board({ room: EXACT });
-  dropped.pa.failNext = 'no answer from the room';
+  dropped.pa.failNext = NO_ANSWER;
   const r = await dropped.la.claim(dropped.one);
   assert.deepEqual([r.ok, r.certainty, exactWrites(dropped.pa).length], [true, 'room', 2]);
+  const [first, second] = exactWrites(dropped.pa).map((c) => JSON.parse(c[4]).n);
+  assert.notEqual(first, second);
+});
+
+test('claim, lost answer while the own copy lags: the token of the attempt that landed is the proof', async () => {
+  const { pa, clock, fake, taskDb } = await setup({ rows: [{ Task: 'One' }], room: EXACT, a: { sync: 'manual' } });
+  const sleep = async (ms) => { clock.advance(ms); pa.sync(); };
+  const list = await (await Commons.connect({ artifact: pa.artifact, now: clock.now, sleep })).list('App — Tasks');
+  const one = list.toArray()[0].id;
+  pa.loseAnswer = true;
+  const r = await list.claim(one);
+  assert.deepEqual([r.ok, r.certainty, r.holder.mine], [true, 'room', true]);
+  assert.equal(JSON.parse(fake.rows(taskDb)[0].cells.Claim).by, 'u-ana');
+});
+
+test('claim, lost answer: an earlier attempt that stayed is recognised by its token even when later tries ran out', async () => {
+  const { pa, clock } = await setup({ rows: [{ Task: 'One' }], room: EXACT, a: { sync: 'manual' } });
+  let sleeps = 0;
+  const sleep = async (ms) => { clock.advance(ms); sleeps += 1; if (sleeps === 4) pa.sync(); };
+  const list = await (await Commons.connect({ artifact: pa.artifact, now: clock.now, sleep })).list('App — Tasks');
+  pa.loseAnswer = true;
+  const r = await list.claim(list.toArray()[0].id);
+  assert.deepEqual([r.ok, r.certainty, r.holder.mine, exactWrites(pa).length], [true, 'room', true, 5]);
+});
+
+test('claim, then renew and release at once while the own copy lags: each write builds on the last answer', async () => {
+  const { la, one, fake, taskDb } = await board({ room: EXACT, a: { sync: 'manual' } });
+  const lost = [];
+  const out = [(await la.claim(one, { onLost: (h) => lost.push(h) })).certainty, (await la.claim(one)).certainty, await la.release(one)];
+  assert.deepEqual([out, fake.rows(taskDb)[0].cells.Claim, lost], [['room', 'room', true], '', []]);
+});
+
+test('conditional writes: "offline" and "waiting for approval" are refusals with their own codes', async () => {
+  const { la, one, pa } = await board({ room: EXACT });
+  for (const [reason, c] of [['offline', 'OFFLINE'], ['this write is waiting for approval', 'APPROVAL_PENDING']]) {
+    pa.failNext = reason;
+    await assert.rejects(la.claim(one), code(c));
+  }
+  assert.equal(la.claimOf(one), null);
 });
 
 test('claim: a renewal whose own write shows up before it returns raises no false onLost', async () => {
@@ -837,6 +876,63 @@ test('map.update: bad keys and values are refused, and a copy that never catches
   await assert.rejects(ma.update('k', () => 1), code('CONTENDED'));
   pa.sync();
   assert.deepEqual(await ma.update('k', () => 1), { value: 1, mode: 'exact' });
+});
+
+const inc = (n) => (n || 0) + 1;
+/* A counter at 1, two pages. The peer's increment lands between this page's write and its next read. */
+async function counter(opts) {
+  const s = await setup(Object.assign({ room: EXACT }, opts));
+  s.fake.serverAddRow(s.mapDb, { Key: 'n', Value: '1' });
+  s.pa.sync();
+  s.ma = await s.a.map('App — State'); s.mb = await s.b.map('App — State');
+  s.room = () => s.fake.rows(s.mapDb)[0].cells.Value;
+  s.peerAfterFirstWrite = () => {
+    const write = s.pa.artifact.db.write;
+    let first = true;
+    s.pa.artifact.db.write = async (...args) => { const r = await write(...args); if (first) { first = false; await s.mb.update('n', inc); } return r; };
+  };
+  return s;
+}
+
+test('map.update, lost answer: an update that never landed is not called exact because a peer wrote the same number', async () => {
+  const { ma, pa, room, peerAfterFirstWrite } = await counter();
+  peerAfterFirstWrite();
+  pa.failNext = NO_ANSWER;
+  await assert.rejects(ma.update('n', inc), (e) => e.code === 'OUTCOME_UNKNOWN' && e.value === 2 && typeof e.version === 'number' && e.reason === NO_ANSWER);
+  assert.equal(room(), '2');
+});
+
+test('map.update, lost answer: an update that did land is not applied a second time', async () => {
+  const { ma, pa, room, peerAfterFirstWrite } = await counter();
+  let runs = 0;
+  peerAfterFirstWrite();
+  pa.loseAnswer = true;
+  await assert.rejects(ma.update('n', (n) => { runs += 1; return inc(n); }), (e) => e.code === 'OUTCOME_UNKNOWN' && e.value === 3);
+  assert.deepEqual([room(), runs], ['3', 1]);
+});
+
+test('map.update, own copy lagging: two and three updates in a row build on the acknowledged version and value', async () => {
+  const { ma, mb, pa, room } = await counter({ a: { sync: 'manual' } });
+  const got = [];
+  for (let i = 0; i < 3; i += 1) got.push(await ma.update('n', inc));
+  assert.deepEqual([got.map((r) => r.value), got.map((r) => r.mode), room(), ma.get('n')], [[2, 3, 4], ['exact', 'exact', 'exact'], '4', 4]);
+  await ma.set('other', 1); await settle();
+  assert.equal(ma.get('n'), 4, 'a stale snapshot of the own copy does not undo an acknowledged write');
+  assert.deepEqual(await ma.update('n', inc), { value: 5, mode: 'exact' });
+  await mb.set('n', 10); pa.sync();
+  assert.equal(ma.get('n'), 10, 'a newer version from the room wins');
+  assert.deepEqual(await ma.update('n', inc), { value: 11, mode: 'exact' });
+  assert.equal(room(), '11');
+});
+
+test('map.update, an answer without a version: never wrong, but a lagging copy has to sync before the next update', async () => {
+  const { ma, pa, room } = await counter({ room: Object.assign({ ackVersion: false }, EXACT), a: { sync: 'manual' } });
+  assert.deepEqual(await ma.update('n', inc), { value: 2, mode: 'exact' });
+  await assert.rejects(ma.update('n', inc), code('CONTENDED'));
+  pa.sync();
+  assert.deepEqual([await ma.update('n', inc), room()], [{ value: 3, mode: 'exact' }, '3']);
+  const live = await counter({ room: Object.assign({ ackVersion: false }, EXACT) });
+  assert.deepEqual([(await live.ma.update('n', inc)).value, (await live.ma.update('n', inc)).value, live.room()], [2, 3, '3']);
 });
 
 test('map: with two rows for one key, delete empties the lowest; if that row is removed the other value returns', async () => {

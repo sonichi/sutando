@@ -100,11 +100,13 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
     [/mention is not a joined member|cannot mention a group/i, 'BAD_MENTION'],
   ];
 
-  /* A conditional write's reasons, as the host's page API words them. GUIDE.md does not quote them yet. */
+  /* A conditional write's reasons, as the host's page API document words them. */
   const CONDITIONAL = [
     [/version changed/i, 'VERSION_CHANGED'],
     [/conditional writes are not available|invalid request/i, 'CONDITIONAL_UNAVAILABLE'],
     [/no answer from the room/i, 'NO_ANSWER'],
+    [/^offline$/i, 'OFFLINE'],
+    [/waiting for approval/i, 'APPROVAL_PENDING'],
   ];
 
   function refusal(reason, fallback, extra) {
@@ -175,7 +177,7 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
 
     ingest(snap) {
       const version = snap && typeof snap.version === 'number' ? snap.version : null;
-      // A snapshot no newer than a write the room accepted was taken before that write.
+      // A snapshot older than a write the room acknowledged was taken before that write.
       if (version !== null && this.floor !== null && version <= this.floor) return;
       this.version = version;
       this.gen += 1;
@@ -234,25 +236,30 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
       return r.rowId;
     }
 
-    /* One conditional attempt at the version this page last saw: the bridge's answer, or the
-       word for what to do next. The host never queues it, so a lost answer means "read again". */
+    /* One conditional attempt at the version this page holds: the bridge's answer when it landed,
+       else what is known. The host never queues it, so a lost answer leaves the outcome unknown. */
     async cas(call) {
       const at = this.version;
-      try {
-        const r = await this.room.send(() => call({ ifVersion: at }), CONDITIONAL);
-        this.floor = at;
-        return r;
-      } catch (e) {
-        if (e.code === 'VERSION_CHANGED') return 'changed';
-        if (e.code === 'NO_ANSWER') return 'unknown';
+      try { return await this.room.send(() => call({ ifVersion: at }), CONDITIONAL); } catch (e) {
+        if (e.code === 'VERSION_CHANGED') return { changed: true, version: e.version };
+        if (e.code === 'NO_ANSWER') return { unknown: true, reason: e.reason };
         if (e.code !== 'CONDITIONAL_UNAVAILABLE') throw e;
         this.plain = true;
-        return 'plain';
+        return { plain: true };
       }
     }
 
-    /* Runs `step()` until its write lands. "room": the room took it at the version this page had
-       seen. "local": a plain write. `null`: step() declined. "contended": the database kept moving. */
+    /* The room took a write sent at version `at`: its answer's version is the new basis, and
+       an older snapshot can no longer replace what this page holds. */
+    acked(at, r) {
+      const stale = !(this.version > at), known = typeof r.version === 'number';
+      this.floor = known ? r.version - 1 : at;
+      if (known && !(this.version >= r.version)) this.version = r.version;
+      return stale;
+    }
+
+    /* Runs `step()` until its write lands. "room": the room took it at the version this page
+       held. "local": a plain write. `null`: step() declined. "contended": the database kept moving. */
     async change(step) {
       for (let tries = 0; tries < 5; tries += 1) {
         this.check();
@@ -264,10 +271,13 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
           return 'local';
         }
         const at = this.version, r = await this.cas(s.call);
-        if (r === 'plain') continue;
-        if (r !== 'changed' && r !== 'unknown') { s.done(r, this.version <= at); return 'room'; }
+        if (r.plain) continue;
+        if (r.ok) { s.done(r, this.acked(at, r)); return 'room'; }
+        // Only a step whose value is its own proof (a claim token) may look for it and go on.
+        if (r.unknown && !s.landed) throw new CommonsError('OUTCOME_UNKNOWN', 'No answer from the room: the change may or may not have been saved.', r.reason);
         this.ingest(await this.read());
-        if (r === 'unknown' && s.landed()) return 'room';
+        if (r.unknown && s.landed()) return 'room';
+        if (typeof r.version === 'number' && !(this.version >= r.version)) await this.room.sleep(this.room.opts.retryEvery);
       }
       return 'contended';
     }
@@ -289,7 +299,6 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
       return {
         call: (o) => (o ? db.createRow(this.id, cells, o) : db.createRow(this.id, cells)),
         done: (r) => { if (!this.row(r.rowId)) this.rows.push({ id: r.rowId, cells: Object.assign({}, cells) }); },
-        landed: () => this.rows.some((row) => Object.keys(cells).every((k) => same(row.cells[k], cells[k]))),
       };
     }
   }
@@ -411,12 +420,24 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
         if (json === undefined) throw bad('A map value must be JSON.');
         const cells = { [this.keyProp]: key, [this.valueProp]: json };
         checkSize(cells);
-        return row ? this.t.cell(row.id, this.valueProp, () => json) : this.t.fresh(cells);
+        // A value is no proof that this write landed: a peer can write the same one.
+        return Object.assign(row ? this.t.cell(row.id, this.valueProp, () => json) : this.t.fresh(cells), { landed: null });
       };
       let mode;
-      try { mode = await this.t.enqueue(() => this.t.change(step)); } finally { this.t.emit('local'); }
+      try { mode = await this.t.enqueue(() => this.t.change(step)); } catch (e) {
+        if (e.code === 'OUTCOME_UNKNOWN') await this.unknown(e, key);
+        throw e;
+      } finally { this.t.emit('local'); }
       if (mode === 'contended') throw new CommonsError('CONTENDED', 'The database kept changing. Try again.');
       return { value, mode: mode === 'room' ? 'exact' : 'best-effort' };
+    }
+
+    /* Adds what this page can see now to an unknown outcome. Its own copy may be behind the room. */
+    async unknown(e, key) {
+      try { this.t.ingest(await this.t.read()); } catch (_e) { /* the error already says the outcome is unknown */ }
+      const row = this.rowFor(key), cell = row && row.cells[this.valueProp];
+      e.value = cleared.is(cell) ? undefined : decode(cell);
+      if (this.t.version !== null) e.version = this.t.version;
     }
 
     checkKey(key) { if (typeof key !== 'string' || key === '') throw bad('A map key is a non-empty string.'); }
@@ -568,11 +589,12 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
       const early = this.claimOf(id);
       if (early && !early.mine) return { ok: false, reason: 'held', holder: early, certainty: 'local' };
       const room = this.t.room, me = room.me(), op = { id, prop: this.claimProp, value: '' };
-      let token, until;
+      const tokens = new Set();
       // Stamped anew for every attempt: a write can wait on the viewer for longer than the ttl.
       const stamp = () => {
-        token = nonce(); until = room.now() + ttl;
-        return (op.value = JSON.stringify({ by: me.id, name: me.name, kind: me.kind, until, n: token }));
+        const n = nonce();
+        tokens.add(n);
+        return (op.value = JSON.stringify({ by: me.id, name: me.name, kind: me.kind, until: room.now() + ttl, n }));
       };
       stamp();
       const step = () => {
@@ -580,11 +602,12 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
         return raw && raw.by !== me.id && raw.until > room.now() ? null : this.t.cell(id, this.claimProp, stamp);
       };
       const mode = await this.guarded(id, op, step);
+      // Any token this call wrote is proof: an attempt whose answer was lost may be the one that stayed.
       const raw = this.claimIn(this.t.row(id));
-      const won = (mode === 'room' || mode === 'local') && !!raw && raw.n === token;
-      if (won && until > room.now()) {
-        this.held.set(id, { token, until, onLost: o.onLost });
-        return { ok: true, holder: this.claimOf(id), certainty: mode };
+      const won = mode !== null && !!raw && raw.by === me.id && tokens.has(raw.n);
+      if (won && raw.until > room.now()) {
+        this.held.set(id, { token: raw.n, until: raw.until, onLost: o.onLost });
+        return { ok: true, holder: this.claimOf(id), certainty: mode === 'local' ? 'local' : 'room' };
       }
       this.settle(id);
       const holder = this.claimOf(id);
@@ -692,6 +715,7 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
         const r = await call();
         if (r && r.ok) return r;
         const err = refusal(r && r.reason, undefined, extra);
+        if (r && typeof r.version === 'number') err.version = r.version;
         if ((err.code !== 'CONSENT_PENDING' && err.code !== 'RATE_LIMITED') || this.now() >= until) throw err;
         for (const cb of Array.from(this.waiting)) cb(err.code);
         await this.sleep(this.opts.retryEvery);

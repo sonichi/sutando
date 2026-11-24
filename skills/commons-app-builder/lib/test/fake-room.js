@@ -5,6 +5,7 @@
 const copy = (v) => (v === undefined ? v : JSON.parse(JSON.stringify(v)));
 const KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const ACTION_RE = /^[A-Za-z0-9._-]{1,64}$/;
+const NO_ANSWER = 'no answer from the room; read again before deciding';
 
 /** A clock tests move by hand. */
 function createClock(start) {
@@ -161,11 +162,11 @@ function createFakeRoom(options) {
         return Number.isInteger(opts.ifVersion) && opts.ifVersion >= 0 ? null : 'invalid request';
       };
       const moved = (db, opts) => (db.version === opts.ifVersion ? null : 'version changed');
+      const refused = (db, reason) => (reason === 'version changed' ? { ok: false, reason, version: db.version } : { ok: false, reason });
       // A conditional write that landed can still lose its answer on the way back.
-      const answer = (extra) => {
-        if (!c.loseAnswer) return Object.assign({ ok: true }, extra);
-        c.loseAnswer = false;
-        return { ok: false, reason: 'no answer from the room' };
+      const answer = (db, extra) => {
+        if (c.loseAnswer) { c.loseAnswer = false; return { ok: false, reason: NO_ANSWER }; }
+        return Object.assign({ ok: true }, opt.ackVersion === false ? null : { version: db.version }, extra);
       };
       if (c.manual) pull();
 
@@ -186,8 +187,8 @@ function createFakeRoom(options) {
             const exact = exactly(opts), db = exact ? dbs.get(id) : view(id);
             const row = db && db.rows.find((r) => r.id === rowId);
             if (!row) return { ok: false, reason: 'row not found' };
-            const reason = (exact && unfit(opts)) || writeGate(value) || fits(db, prop, value) || (exact && moved(db, opts));
-            if (reason) return { ok: false, reason };
+            const reason = writeGate(value) || fits(db, prop, value) || (exact && (unfit(opts) || moved(db, opts)));
+            if (reason) return refused(db, reason);
             row.cells[propName(db, prop)] = copy(value);
             if (c.manual && !exact) {
               c.queue.push({ id, rowId, prop, value: copy(value) });
@@ -195,16 +196,16 @@ function createFakeRoom(options) {
               return { ok: true };
             }
             changed(id);
-            return exact ? answer() : { ok: true };
+            return exact ? answer(db) : { ok: true };
           },
           createRow: async (id, cells, opts) => {
             call('db.createRow', id, cells, ...(opts ? [opts] : []));
             const exact = exactly(opts), db = exact ? dbs.get(id) : view(id);
             if (!db) return { ok: false, reason: 'database not found' };
-            let reason = (exact && unfit(opts)) || writeGate(cells);
+            let reason = writeGate(cells);
             for (const [k, v] of Object.entries(cells)) reason = reason || fits(db, k, v);
-            reason = reason || (exact && moved(db, opts));
-            if (reason) return { ok: false, reason };
+            reason = reason || (exact && (unfit(opts) || moved(db, opts)));
+            if (reason) return refused(db, reason);
             if (c.manual && !exact) {
               const row = { id: nextId('r'), cells: {} };
               for (const [k, v] of Object.entries(cells)) row.cells[propName(db, k)] = copy(v);
@@ -214,7 +215,7 @@ function createFakeRoom(options) {
               return { ok: true, rowId: row.id };
             }
             const rowId = addRow(dbs.get(id), cells, c.account);
-            return exact ? answer({ rowId }) : { ok: true, rowId };
+            return exact ? answer(db, { rowId }) : { ok: true, rowId };
           },
           onChange: (id, fn) => {
             call('db.onChange', id);
@@ -320,4 +321,4 @@ function createFakeRoom(options) {
   return room;
 }
 
-module.exports = { createFakeRoom, createClock, settle };
+module.exports = { createFakeRoom, createClock, settle, NO_ANSWER };
