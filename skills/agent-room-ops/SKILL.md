@@ -101,7 +101,8 @@ python3 skills/agent-room-ops/room_ops.py read   '!room:hs' --limit 20 --agent '
 #     `in_reply_to`, `thread_root`         the message replied to / the thread it is in
 #     `edited` (true), `edit_event_id`     the message was edited; the id of its latest edit
 #   An edit is never a message of its own: the gateway folds it into the message it changed,
-#   which keeps its `event_id` and shows the edited `body`. `msgtype` comes only beside an
+#   which keeps its `event_id` and shows the edited `body`. No `edited` means this read
+#   reported no edit, not that the message was never edited. `msgtype` comes only beside an
 #   attachment, so text, a notice (`m.notice`) and an emote (`m.emote`) read alike here.
 python3 skills/agent-room-ops/room_ops.py fetch  'mxc://hs/abc' --room '!room:hs' --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py send   '!room:hs' /tmp/pic.png --caption 'fig 1' --agent '@a:hs'
