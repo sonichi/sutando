@@ -405,15 +405,28 @@ class TestEdges(_Ws):
         self.assertIn("Label=what it does", err.getvalue())
 
 
-    def test_ask_owner_cli_refuses_choices_listed_in_the_text(self):
+    def test_ask_owner_cli_refuses_choices_listed_in_the_question(self):
         cli = str(REPO / "scripts" / "ask-owner.py")
-        with mock.patch.object(sys, "argv", [cli, "Which one?", "--context", "1. merge now\n2. hold"]), \
+        with mock.patch.object(sys, "argv", [cli, "Which one?\n1. merge now\n2. hold"]), \
                 contextlib.redirect_stderr(io.StringIO()) as err:
             with self.assertRaises(SystemExit) as e:
                 runpy.run_path(cli, run_name="__main__")
         self.assertEqual(e.exception.code, 2)
         self.assertIn("--option", err.getvalue())
         self.assertEqual(runpy.run_path(cli)["listed_choices"]("Merge #123 despite the absent CLA check?"), 0)
+
+    def test_ask_owner_cli_delivers_numbered_context(self):
+        """Numbered evidence in --context is not a choice list: the ask reaches delivery."""
+        cli = str(REPO / "scripts" / "ask-owner.py")
+        argv = [cli, "What caused the timeout?", "--context", "1. CI is red on main\n2. the branch is behind",
+                "--urgency", "durable", "--workspace", str(self.ws)]
+        with mock.patch.object(skill_roots, "declared_script", return_value=None), \
+                mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            with contextlib.suppress(SystemExit):
+                runpy.run_path(cli, run_name="__main__")
+        self.assertIn("sent: queued", out.getvalue())
+        self.assertTrue(list((self.ws / "results").glob("proactive-*.txt")))
 
 
 class TestAskOwner(_Ws):
@@ -429,7 +442,8 @@ class TestAskOwner(_Ws):
         self.assertIn(f"via {out['proactive_file']} at", e["body"])
         body = (self.ws / "results" / out["proactive_file"]).read_text()
         self.assertNotIn("https://db/page", body)
-        self.assertIn("Reply here.", body)
+        self.assertIn("- Approve: merge\n", body)
+        self.assertIn("Reply here with the one you choose.", body)
         self.assertIn("Pending questions database", body)
         self.assertEqual("\n".join(pqa.report_lines(out)).count("recorded:"), 1)
         self.assertIn("row: https://link/row", pqa.report_lines(out))

@@ -328,7 +328,8 @@ class CardOutcomes(unittest.TestCase):
         body = (ws / "results" / out["proactive_file"]).read_text()
         self.assertIn("[channel: !dm:test.invalid]", body)
         self.assertNotIn("https://row.test.invalid/7", body)
-        self.assertIn("Reply here.", body)
+        self.assertIn("- Approve: merge\n- Hold: wait for the CLA", body, "the choices the card would offer")
+        self.assertIn("Reply here with the one you choose.", body)
         held = json.loads(Path(out["outbox"]).read_text())
         self.assertEqual(held["sent"], out["sent_line"])
         self.assertIn(f"via {out['proactive_file']}", held["sent"])
@@ -772,7 +773,8 @@ class CrashBoundaries(unittest.TestCase):
             out = self.ask(store)
         body = (self.ws / "results" / out["proactive_file"]).read_text()
         self.assertNotIn("https://row.test.invalid/", body)
-        self.assertIn("Reply here.", body)
+        self.assertIn("- Approve: merge it\n- Hold: wait", body)
+        self.assertIn("Reply here with the one you choose.", body)
 
     def test_death_after_the_hold_before_the_row_rewrite_is_reconciled(self):
         self.child("with mock.patch('hitl.manager.HitlManager.create', side_effect=OSError('disk full')), \\\n"

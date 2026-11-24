@@ -15,7 +15,7 @@ database, holds it in the workspace outbox while the room is unreachable, and re
 With --default and/or --option, a question bound for AG2 Space is asked as a decision card
 (one button per choice) instead of text; the owner's click comes back as a `hitl_click: true`
 task, and `python3 src/pending_questions_reader.py clicks` hands it to the core.
-A question that lists its choices in the text ("1. … 2. …") without --option or --default is
+A question whose own text lists its choices ("1. … 2. …") without --option or --default is
 refused (exit 2, nothing sent): the owner would get text with nothing to press.
 Otherwise it exits 0 after a non-empty question: every failure is printed, never raised. With
 --unless-open, a question whose title matches one the store holds open is reported
@@ -47,9 +47,10 @@ RECORDS = "ask-owner"
 _CHOICE = re.compile(r"^\s*(?:\(?(?:\d{1,2}|[A-Za-z])[.)]|option\s+\w+\s*[:.)-])\s+\S", re.I)
 
 
-def listed_choices(*texts) -> int:
-    """How many lines of the texts start a listed choice."""
-    return sum(1 for t in texts if t for line in t.splitlines() if _CHOICE.match(line))
+def listed_choices(question: str) -> int:
+    """How many lines of the question start a listed choice; --context is never counted, since
+    numbered reasons or evidence there offer no choice."""
+    return sum(1 for line in (question or "").splitlines() if _CHOICE.match(line))
 
 
 def _option(text: str):
@@ -136,7 +137,7 @@ def main(argv=None) -> int:
     if not args.question.strip():
         print("ask-owner: the question is empty", file=sys.stderr)
         return 2
-    if not args.default and not args.option and listed_choices(args.question, args.context) >= 2:
+    if not args.default and not args.option and listed_choices(args.question) >= 2:
         print("ask-owner: the question lists choices but gives none as --option, so the owner would get "
               "text with nothing to press; pass each as --option 'Label=what it does' (and --default "
               "for the one you propose). Nothing was sent.", file=sys.stderr)
