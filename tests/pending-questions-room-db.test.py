@@ -430,6 +430,12 @@ class TestEdges(_Ws):
 
 
 class TestAskOwner(_Ws):
+    def test_a_text_ask_with_a_default_says_why_approve(self):
+        out = self.ask("Merge #12?", store=self.db(), default_action="merge", reason="CI is green",
+                       options=[("Hold", "wait for review")])
+        body = (self.ws / "results" / out["proactive_file"]).read_text()
+        self.assertIn("Why Approve: CI is green\n\n- Approve: merge\n- Hold: wait for review\n", body)
+
     def test_the_row_is_born_with_its_record_and_the_outbox_entry_is_deleted(self):
         db = self.db()
         db.link = "https://db/page"

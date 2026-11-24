@@ -22,7 +22,8 @@ Otherwise it exits 0 after a non-empty question: every failure is printed, never
 (`already open: [<id>]`) and not filed again, so a carried list can be filed without doubling rows.
 
 With no adapter this entry does only what core can: it queues the question to the
-owner's DM on the bridge he was last active on (the proactive path; --task-file and the
+owner's DM on the bridge he was last active on, listing any --default/--option choices as text
+(the proactive path; --task-file and the
 routing it implies need the skill) and keeps one generic local record of the ask under
 `<workspace>/state/ask-owner/`, which nothing lists, counts, closes or reminds — the
 report says so.
@@ -76,7 +77,16 @@ def _speaker(name, ws: Path) -> str:
         return f"a worker on {host_label()}" if proactive_worker(name or "") else f"the {host_label()} core"
 
 
-def ask_without_store(question: str, context, ws: Path, why: str) -> list:
+def text_choices(default, options) -> list:
+    """(label, what) per choice a card would offer: Approve first carrying a proposed default."""
+    opts = [(a.strip(), b.strip()) for a, b in options or () if a.strip()]
+    if (default or "").strip():
+        opts = [("Approve", default.strip())] + [o for o in opts if o[0].lower() != "approve"]
+    return opts
+
+
+def ask_without_store(question: str, context, ws: Path, why: str, default=None, reason=None,
+                      options=()) -> list:
     """Core's part alone: the DM through the proactive path, then one generic local record.
     Returns the report lines; nothing raises past here."""
     from workspace_default import status_path  # noqa: PLC0415 — heavy loader
@@ -93,7 +103,15 @@ def ask_without_store(question: str, context, ws: Path, why: str) -> list:
            f"{neutralize_markers(question).strip()}\n"
     if context and context.strip():
         body += f"\n{neutralize_markers(context).strip()}\n"
-    body += "\nReply here.\n"
+    choices = text_choices(default, options)
+    if choices:
+        if (reason or "").strip() and (default or "").strip():
+            body += f"\nWhy Approve: {neutralize_markers(reason).strip()}\n"
+        body += "\n" + "".join(f"- {neutralize_markers(label)}: {neutralize_markers(what)}\n" if what
+                               else f"- {neutralize_markers(label)}\n" for label, what in choices)
+        body += "\nReply here with the one you choose.\n"
+    else:
+        body += "\nReply here.\n"
     if target is not None:
         try:
             asker = _asker(target.name, ws)
@@ -152,7 +170,8 @@ def main(argv=None) -> int:
         why = why if mod is None else f"adapter {why} has no ask_owner"
         print(f"ask-owner: NO STORE ({why}); the owner is asked, and nothing holds the question — "
               "ask by hand if he does not answer", file=sys.stderr)
-        print("\n".join(ask_without_store(args.question, args.context, ws, why)))
+        print("\n".join(ask_without_store(args.question, args.context, ws, why, args.default,
+                                           args.reason, args.option)))
         return 0
     dup = reader.open_duplicate(ws, args.question, mod) if args.unless_open else None
     if dup is not None:
