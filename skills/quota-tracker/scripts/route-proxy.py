@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """`on_session_route` hook: runs before a launch decides its API routing. With status line
-tracking off, it turns the credential-proxy launch agent back on (only if proxy_retire.py
-turned it off) and waits for its port to listen, so the first launch after an opt-out is
-routed through the proxy rather than going direct with neither proxy nor recorder."""
+tracking off, it makes sure the credential-proxy launch agent runs (bootstrap, or install
+if never installed) unless CREDENTIAL_PROXY_ENABLED is off, and waits for its port, so the
+first launch after an opt-out is routed through the proxy, never left with neither."""
 from __future__ import annotations
 
 import sys
@@ -22,12 +22,13 @@ def listening(runner: Callable = proxy_retire._run) -> bool:
     return out is not None and out.returncode == 0
 
 
-def main(runner: Callable = proxy_retire._run, wait_s: float = LISTEN_WAIT_S, sleep: Callable = time.sleep) -> int:
+def main(runner: Callable = proxy_retire._run, wait_s: float = LISTEN_WAIT_S, sleep: Callable = time.sleep,
+         install: Callable[[], bool] = proxy_retire._install) -> int:
     try:
         if cfg.enabled():
             return 0
-        said = proxy_retire.restore(cfg.workspace(), runner=runner)
-        if said in ("restored", "already loaded"):
+        said = proxy_retire.ensure_running(cfg.workspace(), runner=runner, install=install)
+        if said in ("restored", "started", "installed", "already loaded"):
             deadline = time.monotonic() + wait_s
             while not listening(runner) and time.monotonic() < deadline:
                 sleep(0.25)

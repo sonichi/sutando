@@ -652,8 +652,8 @@ class ProxyRetire(Base):
         plist = Path(self._tmp.name) / "LaunchAgents" / f"{pr.LABEL}.plist"
         plist.parent.mkdir()
         plist.write_text("<plist/>")
-        with mock.patch.object(pr, "plist_path", return_value=plist):
-            self.assertEqual(pr.restore(self.ws, runner=run), "restored")
+        with mock.patch.object(pr, "plist_path", return_value=plist), mock.patch.object(pr.sys, "platform", "darwin"):
+            self.assertEqual(pr.ensure_running(self.ws, runner=run, install=self.no_install), "restored")
         boot = [a for a in run.calls if a[:2] == ["launchctl", "bootstrap"]]
         self.assertEqual(boot[0][-1], str(plist))
         self.assertEqual(json.loads((self.ws / "state" / pr.RECORD).read_text())["status"], "restored")
@@ -666,9 +666,45 @@ class ProxyRetire(Base):
         self.assertEqual({p for p, _s in sent}, {5151})
         self.assertIn(__import__("signal").SIGTERM, [s for _p, s in sent])
 
-    def test_opt_out_never_starts_a_job_it_did_not_turn_off(self):
+    def no_install(self):
+        raise AssertionError("installer run")
+
+    def _ensure(self, run, plist_exists=True, env=None, install=None):
+        plist = Path(self._tmp.name) / "LaunchAgents" / f"{pr.LABEL}.plist"
+        if plist_exists:
+            plist.parent.mkdir(exist_ok=True)
+            plist.write_text("<plist/>")
+        with mock.patch.object(pr, "plist_path", return_value=plist), mock.patch.object(pr.sys, "platform", "darwin"), \
+                mock.patch.dict(os.environ, env or {}):
+            return pr.ensure_running(self.ws, runner=run, install=install or self.no_install)
+
+    def test_opt_out_after_a_stop_only_or_manual_bootout_starts_it_again(self):
+        run = FakeRun(loaded=False)  # plist kept, job unloaded, no retire record
+        self.assertEqual(self._ensure(run), "started")
+        self.assertTrue(any(a[:2] == ["launchctl", "bootstrap"] for a in run.calls))
+        self.assertFalse((self.ws / "state" / pr.RECORD).exists())
+
+    def test_opt_out_on_a_host_that_never_installed_it_installs_it(self):
+        run, ran = FakeRun(loaded=False), []
+        self.assertEqual(self._ensure(run, plist_exists=False, install=lambda: ran.append(1) or True), "installed")
+        self.assertEqual(ran, [1])
+        self.assertEqual(self._ensure(FakeRun(loaded=False), plist_exists=False, install=lambda: False),
+                         "not installed: the installer failed")
+
+    def test_owner_off_is_left_alone(self):
+        for plist_exists in (True, False):
+            run = FakeRun(loaded=False)
+            said = self._ensure(run, plist_exists=plist_exists, env={"CREDENTIAL_PROXY_ENABLED": "false"})
+            self.assertIn("CREDENTIAL_PROXY_ENABLED is off", said)
+            self.assertFalse(any(a[:2] == ["launchctl", "bootstrap"] for a in run.calls))
+        pr._record(self.ws, status="retired")
         run = FakeRun(loaded=False)
-        self.assertEqual(pr.restore(self.ws, runner=run), "nothing to restore")
+        self.assertIn("is off", self._ensure(run, env={"CREDENTIAL_PROXY_ENABLED": "off"}))
+        self.assertFalse(any(a[:2] == ["launchctl", "bootstrap"] for a in run.calls))
+
+    def test_already_loaded_is_left_running(self):
+        run = FakeRun(loaded=True)
+        self.assertEqual(self._ensure(run), "already loaded")
         self.assertFalse(any(a[:2] == ["launchctl", "bootstrap"] for a in run.calls))
 
     def test_switch_off_keeps_the_proxy(self):

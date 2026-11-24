@@ -267,7 +267,7 @@ class InstallHook(Tmp):
         mod = _load("install_statusline_edges", SCRIPTS / "install-statusline.py")
         with mock.patch.object(cfg, "workspace", return_value=self.ws), \
                 mock.patch.object(pr, "retire", return_value="kept: test") as retire, \
-                mock.patch.object(pr, "restore", return_value="nothing to restore") as restore, \
+                mock.patch.object(pr, "ensure_running", return_value="already loaded") as restore, \
                 mock.patch.object(sys, "stderr", io.StringIO()) as err:
             with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "true"}):
                 self.assertEqual(mod.main(["--config-dir", str(self.core)]), 0)
@@ -310,7 +310,8 @@ class RouteHook(Tmp):
         err = io.StringIO()
         with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false"}), \
                 mock.patch.object(cfg, "workspace", return_value=self.ws), \
-                mock.patch.object(pr, "plist_path", return_value=plist), mock.patch.object(sys, "stderr", err):
+                mock.patch.object(pr, "plist_path", return_value=plist), mock.patch.object(sys, "stderr", err), \
+                mock.patch.object(pr.sys, "platform", "darwin"):
             self.assertEqual(self.mod.main(runner=self.run_, sleep=lambda s: None), 0)
         self.assertIn("restored, listening", err.getvalue())
         boot = [i for i, a in enumerate(self.calls) if a[:2] == ["launchctl", "bootstrap"]]
@@ -325,7 +326,8 @@ class RouteHook(Tmp):
         err = io.StringIO()
         with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false"}), \
                 mock.patch.object(cfg, "workspace", return_value=self.ws), \
-                mock.patch.object(pr, "plist_path", return_value=plist), mock.patch.object(sys, "stderr", err):
+                mock.patch.object(pr, "plist_path", return_value=plist), mock.patch.object(sys, "stderr", err), \
+                mock.patch.object(pr.sys, "platform", "darwin"):
             self.mod.main(runner=self.run_, wait_s=0.05, sleep=lambda s: None)
         self.assertIn("not listening yet", err.getvalue())
         self.calls.clear()
@@ -336,6 +338,31 @@ class RouteHook(Tmp):
                 mock.patch.object(cfg, "workspace", side_effect=RuntimeError), mock.patch.object(sys, "stderr", err):
             self.assertEqual(self.mod.main(runner=self.run_), 0)
         self.assertIn("restore skipped", err.getvalue())
+
+    def test_first_opt_out_on_a_never_installed_host_installs_then_waits_for_the_port(self):
+        order, err = [], io.StringIO()
+        def install():
+            order.append("install")
+            self.calls.append(["launchctl", "bootstrap", "(installer)"])
+            return True
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false"}), \
+                mock.patch.object(cfg, "workspace", return_value=self.ws), \
+                mock.patch.object(pr, "plist_path", return_value=self.d / "absent.plist"), \
+                mock.patch.object(sys, "stderr", err), mock.patch.object(pr.sys, "platform", "darwin"):
+            self.assertEqual(self.mod.main(runner=lambda a: (order.append(a[0]), self.run_(a))[1],
+                                           sleep=lambda s: None, install=install), 0)
+        self.assertIn("installed, listening", err.getvalue())
+        self.assertLess(order.index("install"), order.index("lsof"))
+
+    def test_owner_off_starts_nothing(self):
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false", "CREDENTIAL_PROXY_ENABLED": "false"}), \
+                mock.patch.object(cfg, "workspace", return_value=self.ws), \
+                mock.patch.object(pr, "plist_path", return_value=self.d / "absent.plist"), \
+                mock.patch.object(sys, "stderr", err), mock.patch.object(pr.sys, "platform", "darwin"):
+            self.mod.main(runner=self.run_, sleep=lambda s: None, install=lambda: self.fail("installed"))
+        self.assertIn("left off", err.getvalue())
+        self.assertEqual(self.calls, [])
 
     def test_route_phase_runs_route_declarers_without_a_config_dir(self):
         hook = self.d / "r.py"
@@ -407,17 +434,23 @@ class ProxyRetire(Tmp):
         said = pr.retire(self.ws, runner=Run(lsof=self.clear), kill=kill, wait_s=0.1)
         self.assertTrue(said.startswith("turned off"), said)
 
-    def test_restore_refusals(self):
+    def test_ensure_running_refusals(self):
         pr._record(self.ws, status="retired")
-        self.assertEqual(pr.restore(self.ws, runner=Run(loaded=True)), "already loaded")
-        pr._record(self.ws, status="retired")
-        with mock.patch.object(pr, "plist_path", return_value=self.d / "missing.plist"):
-            self.assertIn("missing", pr.restore(self.ws, runner=Run(loaded=False)))
-        plist = self.d / "p.plist"
-        plist.write_text("<plist/>")
-        with mock.patch.object(pr, "plist_path", return_value=plist):
-            self.assertIn("bootstrap failed", pr.restore(self.ws, runner=Run(loaded=False, bootstrap_rc=1)))
-
+        with mock.patch.object(pr.sys, "platform", "darwin"):
+            self.assertEqual(pr.ensure_running(self.ws, runner=Run(loaded=True)), "already loaded")
+            self.assertEqual(pr._read_record(self.ws)["status"], "restored")
+            plist = self.d / "p.plist"
+            plist.write_text("<plist/>")
+            with mock.patch.object(pr, "plist_path", return_value=plist):
+                self.assertIn("bootstrap failed",
+                              pr.ensure_running(self.ws, runner=Run(loaded=False, bootstrap_rc=1)))
+        with mock.patch.object(pr.sys, "platform", "linux"):
+            self.assertIn("launchd only", pr.ensure_running(self.ws, runner=Run(loaded=False)))
+        with mock.patch.object(pr.subprocess, "run", return_value=types.SimpleNamespace(returncode=0)) as ran:
+            self.assertTrue(pr._install())
+        self.assertEqual(ran.call_args[0][0][-1], "install")
+        with mock.patch.object(pr.subprocess, "run", side_effect=subprocess.TimeoutExpired("x", 1)):
+            self.assertFalse(pr._install())
 
 class SignedIn(Tmp):
     def setUp(self):

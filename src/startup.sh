@@ -767,6 +767,10 @@ start_credential_proxy() {
     echo "  ✓ Claude sessions call Anthropic directly; credential proxy not started"
     return 0
   fi
+  if claude_proxy_owner_off 2>/dev/null; then
+    echo "  credential proxy kept off (CREDENTIAL_PROXY_ENABLED is off); Claude will connect directly"
+    return 0
+  fi
   if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ]; then
     # An already-loaded job may carry a plist generated before the current pins existed;
     # the installer owns that comparison because it owns what the plist renders.

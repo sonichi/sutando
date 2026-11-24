@@ -4,7 +4,7 @@
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "stable",
-  "description": "Track Claude Code quota usage via Anthropic API rate limit headers (credential proxy) or, without the proxy, Claude Code's own status line rate_limits and StopFailure rate_limit hook. Shows 5h and 7d utilization, reset times, and quota status. Config: QUOTA_STATUSLINE_ENABLED (default true) installs the status line recorder and StopFailure hook in every Claude session's config dir at launch, and false removes them and routes sessions through the credential proxy again (on, the launchers drop a local-proxy ANTHROPIC_BASE_URL so sessions call Anthropic directly); QUOTA_STATUSLINE_PASSTHROUGH names a status line command to show instead of the short line (unset: the one the installer replaced). QUOTA_STATUS_PUBLISH (default true) sends the core's 5h/7d used percentages, reset times, limit state and last check on the gateway heartbeat (health.quota, quota_status.v1) for the agent sidebar; false stops it at the gateway's next start.",
+  "description": "Track Claude Code quota usage via Anthropic API rate limit headers (credential proxy) or, without the proxy, Claude Code's own status line rate_limits and StopFailure rate_limit hook. Shows 5h and 7d utilization, reset times, and quota status. Config: QUOTA_STATUSLINE_ENABLED (default true) installs the status line recorder and StopFailure hook in every Claude session's config dir at launch, and false removes them and routes sessions through the credential proxy again (on, the launchers drop a local-proxy ANTHROPIC_BASE_URL so sessions call Anthropic directly); QUOTA_STATUSLINE_PASSTHROUGH names a status line command to show instead of the short line (unset: the one the installer replaced). CREDENTIAL_PROXY_ENABLED (default true): false keeps the credential proxy off even with status line tracking off; true lets the session launch start it, or install it if it never was. QUOTA_STATUS_PUBLISH (default true) sends the core's 5h/7d used percentages, reset times, limit state and last check on the gateway heartbeat (health.quota, quota_status.v1) for the agent sidebar; false stops it at the gateway's next start.",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   },
@@ -13,6 +13,7 @@
   "config": {
     "QUOTA_STATUSLINE_ENABLED": "true",
     "QUOTA_STATUSLINE_PASSTHROUGH": "",
-    "QUOTA_STATUS_PUBLISH": "true"
+    "QUOTA_STATUS_PUBLISH": "true",
+    "CREDENTIAL_PROXY_ENABLED": "true"
   }
 }

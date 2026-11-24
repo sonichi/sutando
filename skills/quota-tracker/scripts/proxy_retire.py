@@ -9,7 +9,8 @@ the proxy port; and a fresh status-line record exists for the core's account. A 
 list, environment, working folder or settings file that cannot be read keeps the proxy. Then `launchctl bootout` (the plist is
 kept) and, if the job's own verified PID outlives that, that PID alone is stopped. Every
 decision is recorded in `<workspace>/state/quota-proxy-retire.json` with its reason.
-Re-enabling happens only for a job this module turned off.
+With tracking off, `ensure_running` brings the agent up (bootstrap, or install if never
+installed) unless the owner set CREDENTIAL_PROXY_ENABLED off.
 
 Run by install-statusline.py on each session launch; `python3 proxy_retire.py [--dry-run]`
 runs it by hand.
@@ -32,6 +33,7 @@ LABEL = "com.sutando.credential-proxy"
 PORT = 7846
 RECORD = "quota-proxy-retire.json"
 TIMEOUT_S = 5
+INSTALL_TIMEOUT_S = 30
 
 
 def _run(argv: List[str]):
@@ -226,22 +228,37 @@ def retire(workspace, runner: Callable = _run, dry_run: bool = False,
     return f"turned off: {reason}"
 
 
-def restore(workspace, runner: Callable = _run) -> str:
-    """Turn the launch agent back on, only if this module turned it off."""
-    if _read_record(workspace).get("status") != "retired":
-        return "nothing to restore"
-    if job_loaded(runner):
-        _record(workspace, status="restored", reason="already loaded")
-        return "already loaded"
-    plist = plist_path()
-    if not plist.is_file():
-        return f"not restored: {plist.name} missing"
-    out = runner(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)])
-    if out is None or out.returncode != 0:
-        return "not restored: launchctl bootstrap failed"
-    _record(workspace, status="restored", reason="status line tracking turned off")
-    return "restored"
+def _install() -> bool:
+    script = cfg.REPO / "src" / "install-credential-proxy-launchd.sh"
+    try:
+        out = subprocess.run(["bash", str(script), "install"], capture_output=True, text=True,
+                             timeout=INSTALL_TIMEOUT_S, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.returncode == 0
 
+
+def ensure_running(workspace, runner: Callable = _run, install: Callable[[], bool] = _install) -> str:
+    """With tracking off: the launch agent runs unless the owner turned it off explicitly."""
+    if not cfg.proxy_allowed():
+        return "left off (CREDENTIAL_PROXY_ENABLED is off)"
+    if sys.platform != "darwin":
+        return "not started: launchd only"
+    retired = _read_record(workspace).get("status") == "retired"
+    if job_loaded(runner):
+        said = "already loaded"
+    elif plist_path().is_file():
+        out = runner(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path())])
+        if out is None or out.returncode != 0:
+            return "not started: launchctl bootstrap failed"
+        said = "restored" if retired else "started"
+    elif not install():
+        return "not installed: the installer failed"
+    else:
+        said = "installed"
+    if retired:
+        _record(workspace, status="restored", reason="status line tracking turned off")
+    return said
 
 if __name__ == "__main__":
     print(retire(cfg.workspace(), dry_run="--dry-run" in sys.argv))

@@ -133,6 +133,11 @@ stub_launchctl 1 -; stub_lsof -1
 out="$(QUOTA_STATUSLINE_ENABLED=false run_arm)"
 grep -q 'run_node_service credential-proxy' "$CHILD_LOG" && ok "recorder off: the proxy is started as before" \
   || bad "recorder off: not started: $out"
+stub_launchctl 1 -; stub_lsof -1; rm -f "$TMP/launchctl.log"
+out="$(QUOTA_STATUSLINE_ENABLED=false CREDENTIAL_PROXY_ENABLED=false run_arm)"
+[ -s "$CHILD_LOG" ] || [ -s "$TMP/launchctl.log" ] && bad "owner off: proxy touched: $(cat "$CHILD_LOG" "$TMP/launchctl.log" 2>/dev/null)" \
+  || ok "owner off: nothing installed or started"
+echo "$out" | grep -q 'CREDENTIAL_PROXY_ENABLED is off' && ok "owner off: says so" || bad "owner off: no line: $out"
 
 echo
 if [ "$fails" = 0 ]; then echo "PASS startup-credential-proxy-one-supervisor"; else echo "FAIL startup-credential-proxy-one-supervisor ($fails)"; exit 1; fi
