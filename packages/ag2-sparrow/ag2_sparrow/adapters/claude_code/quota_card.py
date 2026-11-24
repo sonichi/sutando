@@ -43,6 +43,7 @@ ROOM_FILE = "quota-room.json"   # the owner's DM room: the claim's alone
 
 CLEAR_S = 600.0         # the banner gone this long: the limit is over, and a later one is a new card
 SAME_CARD_S = 120.0     # a message known this soon after the unasked card is answered by that card
+ECHO_TASKS, ECHO_BYTES, ECHO_MIN = 40, 200_000, 8    # the task files a pane line is checked against
 RETRY_S = 60.0          # a card that could not be queued is tried again no sooner than this
 UNKNOWN_S = 2 * connector_cards.MAX_QUEUED_S
 TAIL_LINES = 8          # a banner this near the bottom is the limit the session sits at, not old scrollback
@@ -180,6 +181,29 @@ def _owner_task(root, task_id: str) -> "str | None":
     return room(root)
 
 
+def _flat(text: str) -> str:
+    return " ".join(str(text or "").split())
+
+
+def own_ui(root, text: str) -> str:
+    """The pane without the lines that only repeat a waiting task's text (its message, a quoted reply, the
+    command lines of its instructions), however the terminal wrapped them: what is left is Claude Code's own."""
+    said = []
+    try:
+        files = sorted((Path(root) / "tasks").glob("*.txt"), key=lambda p: p.stat().st_mtime)[-ECHO_TASKS:]
+        for path in files:
+            said.append(_flat(path.read_text(encoding="utf-8", errors="replace")[:ECHO_BYTES]))
+    except OSError:
+        pass
+    if not said:
+        return str(text or "")
+    kept = []
+    for line in str(text or "").splitlines():
+        flat = _flat(detector._DECOR.sub("", line))
+        kept.append("" if len(flat) >= ECHO_MIN and any(flat in task for task in said) else line)
+    return "\n".join(kept)
+
+
 def current(text: str) -> bool:
     """Whether the limit is what the session sits at now, not an old banner still in view above later work:
     Claude Code's limit menu is on the pane (it is modal), or a limit banner is among the last TAIL_LINES
@@ -269,6 +293,10 @@ def notice(root, cfg: dict, names, text: str, log, now=time.time) -> str:
     'quota-not-posted' (tried again later), 'quota-cleared', 'quota-task-card xN' (that many owner tasks
     told this tick), or '' for nothing."""
     limited = [n for n in names or [] if n in PROVIDER_LIMIT_PATTERNS]
+    if limited:
+        # A task's own words, shown on the pane, can read like the banner ("... hit its usage limit ...").
+        text = own_ui(root, text)
+        limited = [n for n in detector.abnormal_names(text) if n in PROVIDER_LIMIT_PATTERNS]
     rec, at = load(root), now()
     if not limited:
         if rec.get("since") is None:

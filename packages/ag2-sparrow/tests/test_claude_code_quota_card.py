@@ -359,6 +359,24 @@ class LimitMenu(NoticeBase):
         self.assertEqual(self.tick(TURN_MENU, 5.0), "quota-task-card x1")
         self.assertEqual(len(self.queued()), 2)
 
+    def test_a_tasks_own_words_on_the_pane_are_not_the_limit(self):
+        # An account with quota left was said to have hit its limit: the owner's message quoted the card, and the
+        # terminal wrapped it so a line began "hit its usage limit".
+        quota_card.remember_room(self.root, DM)
+        self.task("task-q", "why does it say sarah@example.com has hit its usage limit; resets Nov 28? "
+                            "then read with room_ops.py read --limit 30")
+        pane = ("> why does it say sarah@example.com has\n  hit its usage limit; resets Nov 28? then read with\n"
+                "  room_ops.py read --limit 30\n\n● Looking at the room now.\n❯ \n")
+        self.assertEqual(detector.abnormal_names(pane), ["quota-limit"], "the pattern alone is fooled")
+        for later in (0.0, 30.0, 120.0):
+            self.assertEqual(self.tick(pane, later), "")
+        self.assertEqual(self.queued(), [])
+        # Claude Code's own banner under the same task is still the limit.
+        self.assertEqual(self.tick(pane.replace("● Looking at the room now.", LIMITED.strip("\n")), 5.0),
+                         "quota-task-card x1")
+        # The pane is left as it is when no task is waiting or its text cannot be read.
+        self.assertEqual(quota_card.own_ui(str(self.root) + "-nowhere", pane), pane)
+
     def test_a_message_from_another_room_or_before_the_unasked_card_gets_its_own_card(self):
         self.assertTrue(quota_card._just_carded({"qid": "q", "queued": 100.0}, DM, DM, 130.0), "queued, not yet posted")
         for rec, to, at, why in (({"told": True, "queued": 100.0}, "!other:s.space", 130.0, "another room"),
