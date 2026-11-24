@@ -1666,6 +1666,30 @@ class EdgePathTest(unittest.TestCase):
                          "Codex did not finish this task in time (interrupted after 1s).\n\nPartial reply:\npart")
         self.assertEqual(c.result_body("failed", "", {"message": "x"}), "Codex ended this task with status failed.")
 
+    def test_a_model_the_signed_in_account_cannot_use_is_said_plainly_and_the_pick_is_dropped(self):
+        # The owner switched accounts; the model picked on the old one was refused and all they were told was
+        # "Codex ended this task with status failed."
+        with tempfile.TemporaryDirectory() as d:
+            args = cc.build_parser().parse_args(["--work", d])
+            args.state = os.path.join(d, "state")
+            os.makedirs(args.state)
+            c = cc.Connector(FakeRpc, args, note="n")
+            c.models.save(wanted="gpt-6-astra", confirmed="gpt-6-astra", told="gpt-6-astra")
+            c.turn_ran_on = "gpt-6-astra"
+            refused = {"message": "The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account.",
+                       "codexErrorInfo": "modelNotFound"}
+            self.assertEqual(c.result_body("failed", "", refused),
+                             "This account can't use the model gpt-6-astra. I've gone back to Codex's own default "
+                             "model; send /model to choose another.")
+            state = c.models.state()
+            self.assertEqual((state["wanted"], state["confirmed"]), ("", ""), "the next message is not refused too")
+            # The model the install fixed cannot be dropped here: the owner is told how to choose.
+            c.args.model, c.turn_ran_on = "gpt-6-astra", "gpt-6-astra"
+            self.assertEqual(c.result_body("failed", "", "model_not_found"),
+                             "This account can't use the model gpt-6-astra. Send /model to choose one this account has.")
+        for other in (None, "", {"message": "rate limited"}, {"message": "the model answered nothing"}):
+            self.assertFalse(cc.model_refused(other), other)
+
     def test_done_list_is_bounded_and_deduplicated(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "done")

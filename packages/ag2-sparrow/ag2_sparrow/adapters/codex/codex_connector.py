@@ -20,6 +20,7 @@ NON_OWNER_REFUSED.
 import argparse
 import hashlib
 import json
+import re
 import os
 import queue
 import shutil
@@ -51,6 +52,14 @@ MODEL_ALLOWLIST = ("gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt
 NO_INTEGRATIONS = {"web_search": "disabled",
                    "features": dict.fromkeys(("apps", "plugins", "hooks", "memories", "browser_use",
                                               "browser_use_external", "computer_use", "in_app_browser"), False)}
+
+
+# Codex's refusal of a model the signed-in account has no access to (its codexErrorInfo, or its sentence).
+_MODEL_REFUSED = re.compile(r"modelNotFound|model_not_found|\bmodel\b.{0,80}\bis not supported\b", re.I)
+
+
+def model_refused(err) -> bool:
+    return bool(err) and bool(_MODEL_REFUSED.search(err if isinstance(err, str) else json.dumps(err)))
 
 
 class IntegrationsUnknown(RuntimeError):
@@ -684,7 +693,8 @@ class Connector:
                 # The turn reads its own folder only: this task's own attachments are copied into it.
                 staged = stage_own_attachments(headers, self.scratch_cwd, getattr(self.args, "media_root", None))
                 turn_prompt = with_staged_paths(prompt, staged)
-            status, text, err = self.run_turn(turn_prompt, self.turn_model(caps, kind), self.turn_cwd(caps))
+            self.turn_ran_on = self.turn_model(caps, kind)
+            status, text, err = self.run_turn(turn_prompt, self.turn_ran_on, self.turn_cwd(caps))
             if status == "server-exited":
                 self.restart_server()
                 if durable and attempt == 1:
@@ -707,10 +717,24 @@ class Connector:
             head = "Codex did not finish this task in time (%s)." % err
         elif status == "server-exited":
             head = "Codex stopped before this task finished (%s)." % err
+        elif model_refused(err):
+            head = self.model_refused_words()
         else:
             head = "Codex ended this task with status %s." % status
         partial = (text or "").strip()
         return head + ("\n\nPartial reply:\n" + partial if partial else "")
+
+    def model_refused_words(self) -> str:
+        """The account signed in cannot run the model the turn asked for (an account switched under a pick made
+        on another one): said plainly, and the owner's pick is dropped so the next message is not refused too."""
+        model = str(getattr(self, "turn_ran_on", None) or "")
+        named = "the model %s" % model if model else "the model this agent was set to"
+        dropped = bool(model) and model != self.args.model and bool(getattr(self.args, "state", None))
+        if dropped:
+            self.models.save(wanted="", confirmed="", told="")
+        return "This account can't use %s. %s" % (
+            named, "I've gone back to Codex's own default model; send /model to choose another." if dropped
+            else "Send /model to choose one this account has.")
 
     def pending_tasks(self, seen):
         names = [n for n in os.listdir(self.args.inbox)
