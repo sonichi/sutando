@@ -599,14 +599,23 @@ def publish(root, task_id) -> dict:
     return _mirror(root, task_id, None, {"task_id": task_id, "outcome": outcome})
 
 
+def _asker_tier(root, task_id) -> "str | None":
+    """The task file's attested sender tier (parse_task maps unknown to guest); None when it cannot be read."""
+    try:
+        return task_io.parse_task(os.path.join(root, "tasks", task_id + ".txt"))[0]["access_tier"]
+    except (OSError, ValueError):
+        return None
+
+
 def park(root, task_id, turn_id, detail, error="") -> dict:
     """A completed or aborted turn with nothing staged: the explicit protocol failure, published once.
     A turn whose answer was already accepted (its descriptor recorded) publishes that answer instead.
     The identical park again after one that settled but whose reply was lost answers settled, naming
     the protocol failure only when that is what it delivered; nothing is published twice.
-    `error`: what the session said ended the turn; its scrubbed line replaces `detail` in the room's line."""
+    `error`: what the session said ended the turn; its scrubbed line replaces `detail` in the room's line
+    only when the task's attested sender is the owner."""
     rec = _lifecycle(root).claims.load(task_id)
-    why = turn_error.error_line(error)
+    why = turn_error.owner_reason(_asker_tier(root, task_id), error) if error else ""
     body = (PROTOCOL_FAILURE % ("turn error: " + why if why else detail)).encode("utf-8")
     if rec and rec.get("staged") and rec["phase"] in (lifecycle.TURN_CONFIRMED, lifecycle.RESULT_STAGED, lifecycle.SETTLED):
         # `parked` names what the recorded descriptor delivers: this park's failure line, or an accepted answer.

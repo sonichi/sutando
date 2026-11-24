@@ -23,6 +23,11 @@ class ErrorLineTest(unittest.TestCase):
         self.assertEqual(turn_error.error_line("You've hit your usage limit.\n  Try again later."),
                          "You've hit your usage limit. Try again later.")
 
+    def test_only_the_owner_reads_the_cause(self):
+        self.assertEqual(turn_error.owner_reason("owner", "Credit balance is too low"), "Credit balance is too low")
+        for tier in ("team", "guest", "other", None, "", "Owner "):
+            self.assertEqual(turn_error.owner_reason(tier, "Credit balance is too low"), "", tier)
+
     def test_nothing_usable_is_empty(self):
         for message in (None, "", "  \n\t", {"message": "x"}, 3):
             self.assertEqual(turn_error.error_line(message), "", message)

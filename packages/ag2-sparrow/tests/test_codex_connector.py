@@ -993,15 +993,42 @@ class EdgePathTest(unittest.TestCase):
         self.assertEqual(c.result_body("completed", "", None), cc.NO_REPLY)
         self.assertEqual(c.result_body("timeout", "part", "interrupted after 1s"),
                          "Codex did not finish this task in time (interrupted after 1s).\n\nPartial reply:\npart")
-        self.assertEqual(c.result_body("failed", "", {"message": "Quota exceeded."}),
+        self.assertEqual(c.result_body("failed", "", {"message": "Quota exceeded."}, "owner"),
                          "Codex ended this task with status failed: Quota exceeded.")
         for no_message in (None, {}, {"message": ""}, {"message": "  \n "}, "boom"):
-            self.assertEqual(c.result_body("failed", "", no_message), "Codex ended this task with status failed.", no_message)
-        said = c.result_body("failed", "part", {"message": "denied for /Users/o/.codex/auth.json\n" + "y" * 400})
+            self.assertEqual(c.result_body("failed", "", no_message, "owner"), "Codex ended this task with status failed.",
+                             no_message)
+        said = c.result_body("failed", "part", {"message": "denied for /Users/o/.codex/auth.json\n" + "y" * 400}, "owner")
         line = said.split("\n")[0]
         self.assertNotIn("/Users/o", line)
         self.assertLessEqual(len(line), len("Codex ended this task with status failed: .") + turn_error.LIMIT)
         self.assertTrue(said.endswith("\n\nPartial reply:\npart"))
+        self.assertTrue(line.startswith("Codex ended this task with status failed: denied for <path>"), line)
+
+    def test_a_failure_reason_reaches_only_the_owner(self):
+        args = cc.build_parser().parse_args(["--work", "w"])
+        c = cc.Connector(FakeRpc, args, note="n")
+        quota = {"message": "Credit balance is too low"}
+        self.assertEqual(c.result_body("failed", "", quota, "owner"),
+                         "Codex ended this task with status failed: Credit balance is too low.")
+        for tier in ("team", "guest", None, "", "unknown"):
+            self.assertEqual(c.result_body("failed", "", quota, tier), "Codex ended this task with status failed.", tier)
+        self.assertEqual(c.result_body("failed", "", quota), "Codex ended this task with status failed.", "unknown fails closed")
+
+    def test_serve_passes_the_attested_tier_to_the_failure_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            now = time.time()
+            write_task(d, "task-chat-o", "owner asks", tier="owner", mtime=now - 30)
+            write_task(d, "task-chat-t", "team asks", tier="team", mtime=now - 20)
+            write_text(d, "task-chat-n", "id: task-chat-n\nchannel_id: !r:x\ntask: no tier\n", mtime=now - 10)
+            failed = ("failed", "", {"message": "Credit balance is too low"})
+            with mock.patch.object(cc.Connector, "run_task", return_value=failed), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(run_connector(d, once=3), 0)
+            self.assertEqual(result(d, "task-chat-o").strip(),
+                             "Codex ended this task with status failed: Credit balance is too low.")
+            for tid in ("task-chat-t", "task-chat-n"):
+                self.assertEqual(result(d, tid).strip(), "Codex ended this task with status failed.", tid)
 
     def test_done_list_is_bounded_and_deduplicated(self):
         with tempfile.TemporaryDirectory() as d:

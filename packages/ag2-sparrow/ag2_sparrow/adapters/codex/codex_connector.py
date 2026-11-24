@@ -588,7 +588,7 @@ class Connector:
             return status, text, err
         return status, text, err
 
-    def result_body(self, status, text, err):
+    def result_body(self, status, text, err, access_tier=None):
         if status == "completed":
             said = (text or "").strip()
             if said:
@@ -600,7 +600,8 @@ class Connector:
         elif status == "server-exited":
             head = "Codex stopped before this task finished (%s)." % err
         else:
-            why = turn_error.error_line(err.get("message") if isinstance(err, dict) else None).rstrip(".")
+            message = err.get("message") if isinstance(err, dict) else None
+            why = turn_error.owner_reason(access_tier, message).rstrip(".")
             head = "Codex ended this task with status %s%s." % (status, ": " + why if why else "")
         partial = (text or "").strip()
         return head + ("\n\nPartial reply:\n" + partial if partial else "")
@@ -653,7 +654,7 @@ class Connector:
             t_sent = time.time()
             status, text, err = self.run_task(headers, prompt, policy.capabilities)
             t_done = time.time()
-            out = self.result_body(status, text, err)
+            out = self.result_body(status, text, err, headers["access_tier"])
             t_result = write_atomic(os.path.join(self.args.results, name), out.rstrip("\n") + "\n")
             record_done(done_path, task_id)
             rec = {"task": task_id, "status": status, "chars": len(out), "tier": headers["access_tier"],

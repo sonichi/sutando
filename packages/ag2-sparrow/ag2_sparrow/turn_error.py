@@ -1,7 +1,8 @@
 """Why a local agent's turn failed, as one line a room may read.
 
-Codex and Claude Code adapters both post a failed turn's cause in the room; this is the one place that
-decides what of an error's text may go there: control characters dropped, secrets and local paths
+Codex and Claude Code adapters both post a failed turn's cause in the room when the owner asked
+(owner_reason; anyone else gets the plain line); this is the one place that decides whether, and what
+of an error's text may go there: control characters dropped, secrets and local paths
 removed, delivery markers made inert, one line, bounded. Identifiers an error names to be actionable
 (an email address, a request, organization, room or user id) are kept on purpose.
 """
@@ -28,6 +29,12 @@ _PATH_START = (r"file://|(?<![\w.:/\\$%])(?:~|\$\{?HOME\}?(?=[/\\])|%\w+%(?=[/\\
 # A path names the owner's machine layout; a space-separated word that continues it with a separator
 # (`Application Support/...`) is still that path.
 _PATH = re.compile(r"(?:%s)[^\s'\"()<>\[\],;:]*(?: [^\s'\"()<>\[\],;:/\\]+[/\\][^\s'\"()<>\[\],;:]*)*" % _PATH_START)
+
+
+def owner_reason(access_tier, message, limit: int = LIMIT) -> str:
+    """The cause line for a task its owner asked; "" for any other tier, and for an unknown one.
+    A failure's cause names the owner's account state (credit, limits, sign-in), so only the owner reads it."""
+    return error_line(message, limit) if access_tier == "owner" else ""
 
 
 def error_line(message, limit: int = LIMIT) -> str:

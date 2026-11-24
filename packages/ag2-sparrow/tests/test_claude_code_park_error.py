@@ -38,9 +38,9 @@ class ParkError(ConnectBase):
             rc = cli.main(["inbox", "--root", self.root, *args])
         return rc, json.loads(out.getvalue())
 
-    def confirmed(self, task_id):
-        (self.inbox / (task_id + ".txt")).write_text("id: %s\naccess_tier: owner\ntask: hi\n" % task_id)
-        self.verb("claim", task_id)
+    def confirmed(self, task_id, headers="access_tier: owner\n"):
+        (self.inbox / (task_id + ".txt")).write_text("id: %s\n%stask: hi\n" % (task_id, headers))
+        self.assertEqual(self.verb("claim", task_id)[0], 0)
         token = self.verb("authorize", task_id, "1", "--text-hash", "h")[1]["token"]
         self.verb("confirm", task_id, "turn-1", token, "--text-hash", "h")
         return task_id
@@ -64,6 +64,21 @@ class ParkError(ConnectBase):
         body = (self.results / (t + ".txt")).read_text()
         self.assertIn("ended without a reply (turn aborted without a reply)", body)
         self.assertNotIn("not an error", body)
+
+    def test_the_reason_reaches_only_the_owner_and_an_unknown_sender_fails_closed(self):
+        generic = "ended without a reply (turn error without a reply)"
+        collab = self.confirmed("task-c1", "access_tier: team\ncollaborator: true\n")
+        unknown = self.confirmed("task-u1")
+        (self.inbox / (unknown + ".txt")).unlink()
+        for t in (collab, unknown):
+            rc, out = self.verb("park", t, "turn-1", "--detail", "turn error without a reply", "--error-stdin",
+                                stdin=b"Credit balance is too low\n")
+            self.assertEqual((rc, out["outcome"]), (0, "settled"), t)
+            body = (self.results / (t + ".txt")).read_text()
+            self.assertIn(generic, body, t)
+            self.assertNotIn("Credit balance", body, t)
+        self.assertIsNone(inbox._asker_tier(self.root, unknown))
+        self.assertEqual(inbox._asker_tier(self.root, collab), "team")
 
     def test_park_called_directly_takes_the_error_argument(self):
         t = self.confirmed("task-p1")
