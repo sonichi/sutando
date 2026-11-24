@@ -205,7 +205,7 @@ def sign_in_card(rt: str, state: Optional[bool], waiting: bool = True) -> tuple:
     runs the core, draws that runtime's sign-in controls in it (`core: true`: the core's own sign-in for
     `runtime`, which need not be the runtime the core is on now). Nothing typed there reaches the room. A
     client that cannot draw them shows the body: where to open the card."""
-    body, card = ac.build(NOTE_ID, "pending", title="Core runtime", avatar_=ac.avatar(initial="R"),
+    body, card = ac.build(NOTE_ID, "pending", title="Runtime", avatar_=ac.avatar(initial="R"),
                           status="Sign in first", text=sign_in_words(rt, state, waiting),
                           body=SIGN_IN_ELSEWHERE.format(name=name(rt)))
     return body, dict(card, **{CONTROLS: {"runtime": rt, "core": True}})
@@ -217,15 +217,15 @@ def menu_card(current: str) -> tuple:
     buttons = [ac.button(name(rt), "reply", style="primary" if rt == current else "secondary",
                          reply=f"Switch the core to {name(rt)}", command=ac.reply(KIND, TARGET, rt))
                for rt in ORDER]
-    using = f"The core is running on {name(current)}."
-    return ac.build(CARD_ID, "info", title="Core runtime", avatar_=ac.avatar(initial="R"),
+    using = f"I'm using {name(current)}."
+    return ac.build(CARD_ID, "info", title="Runtime", avatar_=ac.avatar(initial="R"),
                     text=f"{using} Pick a runtime to switch to; the core restarts on it after its current turn.",
                     buttons=buttons, note=CARRIES, note_tone="dim",
                     body=f"{using} Reply \"switch to Codex\" or \"switch to Claude Code\".")
 
 
 def notice_card(state: str, status: str, words: str) -> tuple:
-    return ac.build(NOTE_ID, state, title="Core runtime", avatar_=ac.avatar(initial="R"), status=status,
+    return ac.build(NOTE_ID, state, title="Runtime", avatar_=ac.avatar(initial="R"), status=status,
                     text=words, body=words)
 
 
@@ -266,7 +266,7 @@ def _post(ws: Path, room: str, body: str, card: dict, operation_id: str, *, repl
 
 def card_words(words: str) -> str:
     """What an edited card says: the card is gone from the event, so the words name it."""
-    return f"Core runtime: {words}"
+    return f"Runtime: {words}"
 
 
 def _edit(ws: Path, room: str, event: str, words: str, operation_id: str, *, core=None, execute=None) -> dict:
@@ -897,12 +897,12 @@ def confirm(ws: Path, rt: str, since: float, *, sleep=time.sleep, clock=time.tim
 def outcome(rt: str, was: str, got: dict, rc: int = 0) -> tuple:
     """(state, words) of a switch from `was` to `rt` from the confirmation `got`."""
     if got["core"] and got["selected"]:
-        return "done", f"Switched. The core is now running on {name(rt)}. {CARRIES}"
+        return "done", f"Switched to {name(rt)}. The core restarted on it ✓ {CARRIES}"
     if got["core"]:
         if not desktop_hosted():
-            return "info", (f"Switched. The core is now running on {name(rt)}, but this computer's config "
+            return "info", (f"Switched to {name(rt)}. The core restarted on it, but this computer's config "
                             f"still names {name(got['configured'])}, so a full relaunch goes back to it.")
-        return "info", (f"The core is now running on {name(rt)}, but the desktop still selects "
+        return "info", (f"Switched to {name(rt)}. The core restarted on it, but the desktop still selects "
                         f"{name(got['configured'])}, so it would go back on its next relaunch. Choose "
                         f"{name(rt)} in Settings → Connections → the Sutando (on this computer) row.")
     lead = (f"The restart did not finish cleanly (exit {rc}), and" if rc else "I asked the core to restart, but")
@@ -918,6 +918,8 @@ def settle_and_tell(ws: Path, room: str, rt: str, was: str, since: float, attemp
     got = confirm(ws, rt, since, sleep=sleep, clock=clock)
     state, words = outcome(rt, was, got, rc)
     if gateway not in ("", "restored"):
+        # Not a clean success any more: the tick goes, the warning follows.
+        words = words.replace(" ✓ ", ". ", 1)
         state, words = ("info" if state == "done" else state), f"{words} {GATEWAY_LOST.format(why=gateway)}"
     status = {"done": "Switched", "info": "Switched"}.get(state, "Not confirmed")
     out = _answer(ws, room, card, state, status, words, f"runtime-card:{attempt}:outcome", core=core,
@@ -975,8 +977,7 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
                                       "rc": rc, "why": "inconclusive"}, 1)
             if rc in NOT_RESTARTED:
                 reason = RESTART_REASONS[rc]
-                words = (f"I could not switch to {name(args.runtime)}. The core is still on {name(was)}. "
-                         f"{reason[:1].upper()}{reason[1:]}.")
+                words = (f"Couldn't switch to {name(args.runtime)}: {reason}. The core is still on {name(was)}.")
                 if waited and rc == DEFERRED:
                     words = (f"Still busy: another restart was still in the way after I waited, so I did not "
                              f"switch to {name(args.runtime)}. The core is still on {name(was)}. "
