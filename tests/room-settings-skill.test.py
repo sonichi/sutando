@@ -39,6 +39,13 @@ def mid(*above: str, body: str = "only answer when I mention you", tier: str = "
         f"\ntask: {body}\naccess_tier: {tier}\n"
 
 
+def bullet(flat: str, start: str) -> str:
+    """One list item of whitespace-flattened text, from `start` to the next item."""
+    rest = flat[flat.index(start):]
+    nxt = re.search(r" (?:- (?=\*\*|`|Any |When )|(?=Tell your owner every refusal))", rest[1:])
+    return rest[:nxt.start() + 1] if nxt else rest
+
+
 def section(text: str, heading: str) -> str:
     m = re.search(rf"^## {re.escape(heading)}\n(.*?)(?=^## |\Z)", text, re.S | re.M)
     assert m, f"section {heading!r} missing"
@@ -200,11 +207,14 @@ class TestSkillRules(unittest.TestCase):
                        "ask them to open a DM with you and then ask again",
                        "they approve it on the card in your DM with them",
                        "your owner first has to make you able to work with a Team",
-                       "If it is refused again, tell your owner you couldn't make the change and that "
-                       "they can make it in the room's settings in the app.",
-                       "Say you can't make this change from here, and that your owner can change it in "
-                       "the room's settings in the app, or ask a room admin to."):
+                       ):
             self.assertIn(phrase, back)
+        self.assertIn("If it is refused again, tell your owner you couldn't make the change and that they "
+                      "can make it in the room's settings in the app.",
+                      bullet(back, "**`INVALID_INPUT`** for anything else"))
+        self.assertIn("Say you can't make this change from here, and that your owner can change it in the "
+                      "room's settings in the app, or ask a room admin to.",
+                      bullet(back, "Any other reason (for example `approver_below_level`)"))
         tail = " ".join(self.text.rsplit("## What comes back", 1)[1].split())
         self.assertIn("Tell your owner every refusal in plain words, with the one thing they can do next.", tail)
 
@@ -278,9 +288,11 @@ class TestSkillRules(unittest.TestCase):
         settings = " ".join(section(self.text, "The settings").split())
         back = " ".join(section(self.text, "What comes back").split())
         self.assertIn("Copy each id exactly as `room.members.list` gives it, never typed from a name", settings)
-        self.assertIn("A listed user id must be a plain id like `@name:s.space`: a name, extra symbols or "
-                      "formatting are refused this way.", back)
-        self.assertIn("if that id is refused too, ask your owner who they meant.", back)
+        ids = bullet(back, "**`INVALID_INPUT`** for a listed user id")
+        self.assertIn("each must be a plain id like `@name:s.space`; a name, extra symbols or formatting "
+                      "are refused.", ids)
+        self.assertIn("If it is refused again, ask your owner who they meant.", ids)
+        self.assertNotIn("settings in the app", ids)
 
     def test_mixed_request_is_held_whole(self):
         change = " ".join(section(self.text, "Change").split())

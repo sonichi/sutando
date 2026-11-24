@@ -180,11 +180,13 @@ own first; then read again and send the ones that open access.
   Don't try again until you have a DM with them. If
   it says the write may or may not have happened, read again with `room.agent_policy.read`
   and tell your owner what is stored.
-- **`INVALID_INPUT`:** fix the arguments and try once more. `room.actions.describe` with the
-  action shows the schema. A listed user id must be a plain id like `@name:s.space`: a name,
-  extra symbols or formatting are refused this way. Take it again from `room.members.list`;
-  if that id is refused too, ask your owner who they meant. If it is refused again, tell your owner you couldn't make the change
-  and that they can make it in the room's settings in the app.
+- **`INVALID_INPUT`** for a listed user id: each must be a plain id like `@name:s.space`; a
+  name, extra symbols or formatting are refused. Take it again from `room.members.list` and
+  try once more. If it is refused again, ask your owner who they meant.
+- **`INVALID_INPUT`** for anything else: fix the arguments and try once more.
+  `room.actions.describe` with the action shows the schema. If it is refused again, tell your
+  owner you couldn't make the change and that they can make it in the room's settings in the
+  app.
 
 Tell your owner every refusal in plain words, with the one thing they can do next. Never show
 them the error codes or reasons above (`FORBIDDEN`, `no_origin` and the like).
