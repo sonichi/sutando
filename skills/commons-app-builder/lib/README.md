@@ -15,7 +15,7 @@ a real room or a browser. See [`NOTES.md`](NOTES.md) for what a real room must s
   rollback. A page that needs none of that is simpler without it.
 - **It must be inlined.** A page runs in a sandbox with no network, so it cannot load a script
   from anywhere. Copy `commons-sdk.js` into a `<script>` in the page. `examples/inline.js` shows
-  one way to do that between two marker comments. The file is about 37 KB; a page body is at most
+  one way to do that between two marker comments. The file is about 38 KB; a page body is at most
   196,608 bytes. Once it has run, the global `Commons` exists, whatever other scripts the page
   carries (it also sets `module.exports` when a `module` with `exports` is there, as in Node).
 - **The bridge is not ours.** The library is built on the page API (`window.artifact`). The host
@@ -185,7 +185,7 @@ words when there are any.
 | `DECLINED` | The viewer cancelled an ask or a post |
 | `AGENT_UNAVAILABLE` | The agent is not the viewer's, or cannot be reached |
 | `BUSY` | Another ask is open |
-| `OUTCOME_UNKNOWN` | No answer came back. For an ask: send again with the same key. For `map.update`: the write may or may not have landed; `value` (and `version`, when there is one) hold what this page sees now. Show it and let the person decide; do not repeat it blindly |
+| `OUTCOME_UNKNOWN` | No answer came back. For an ask: send again with the same key. For a write (`map.update`, `release`, or any plain write that got no answer in time): it may or may not have landed. For `map.update`, `value` (and `version`, when there is one) hold what this page sees now. Show it and let the person decide; do not repeat it blindly |
 | `OFFLINE`, `APPROVAL_PENDING` | A conditional write was not sent because the page is offline, or is held for an approval: it has not landed, and may land later if approved |
 | `BAD_MENTION` | A mention names someone who is not a joined member, or a group |
 | `UNSUPPORTED` | This bridge does not have the call |
@@ -197,6 +197,13 @@ may throw without changing what a write does: the error is thrown again on a tim
 reaches the page's own error handling (`window.onerror`), and the other observers still run.
 `fn` in `map.update` is different: it is part of the operation, so when it throws, the update
 rejects with that error and nothing is written.
+
+The library waits at most 30 seconds for the answer to one bridge call (`callTimeout` in
+`connect`), so a call that never answers cannot stall a database: the calls behind it then run.
+A plain write that got no answer rejects with `OUTCOME_UNKNOWN`, not `REFUSED`, because it may
+still land later. A conditional write that got no answer is treated like any lost answer. A late
+answer is ignored; if the write did land, the snapshot that carries it updates the page as usual.
+The limit is per call, so waiting for the viewer is not cut off: each of those calls is answered.
 
 Writes retry on their own while the viewer has not answered or the page is rate-limited: every
 1.5 seconds, for up to 2 minutes. Use `room.onWaiting` to show a hint such as "Allow this page to
@@ -247,10 +254,11 @@ This is not a CRDT. The rules below are what the library does on top of the brid
   `claim` and `release`, show on this page before the room answers. If the room refuses, the
   change is undone and `observe` fires again. Two exceptions: a list's `push` and a map's
   `update` show when the bridge answers.
-- **Writes from one page run in order,** one at a time per database. A write decides (which
+- **Writes from one page are sent in order,** one at a time per database; a plain write can
+  still land later than a conditional write sent after it. A write decides (which
   row, what `fn` gets, whether a claim is there) when its turn comes, from what the bridge has
   answered for by then, not from what the page is showing early.
-- **A plain write can be missing for a moment.** If an older snapshot arrives while a plain
+- **A plain write can be missing for a moment.** If a snapshot arrives while a plain
   write is in flight, the page trusts the snapshot and shows the write again with the next one.
 - **Do not mix the two kinds on one cell.** A plain write (`set`) still on its way to the server
   can land after a later conditional write (`update`) from the same page and replace it.
@@ -460,7 +468,7 @@ Each line is something the documented bridge does not let a library do.
 6. **An attested "last edited by" a page can read per cell.** Without it a claim's holder is self-declared.
 7. **Presence a page can read:** who has the app open now, people and agents. `players()` is membership only.
 8. **A documented row order** for `db.read` (creation order or other). The default list order assumes it is stable.
-9. **Stable refusal codes** from `db.write`, `db.createRow` and `db.read`. Today the library matches reason text, in one function (`refusal`), so codes can replace it there. Reasons the guide does not quote, such as a write waiting for an approval, a page that is offline, or no answer from the room, come back as `REFUSED` with the text in `reason`.
+9. **Stable refusal codes** from `db.write`, `db.createRow` and `db.read`. Today the library matches reason text, in one function (`refusal`), so codes can replace it there. A write waiting for an approval, a page that is offline, and no answer from the room have no code of their own on a plain write: they come back as `REFUSED` with the text in `reason`. On a conditional write they are `APPROVAL_PENDING`, `OFFLINE` and `OUTCOME_UNKNOWN`.
 10. **Create a database or a column from a page** (or an install step). Today an agent must create the schema first.
 11. **A documented path for an agent's reply or outcome to reach the page.** None exists, so the library offers no reply reading.
 12. **Ask a named agent that is not the viewer's own, with state and outcome back.** Designed, not built; see "Experimental".

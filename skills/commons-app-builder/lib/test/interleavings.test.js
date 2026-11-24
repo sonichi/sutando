@@ -34,7 +34,7 @@ async function run(seed, mode) {
   const mapDb = fake.addDatabase('State', MAP, [{ Key: 'n', Value: '0' }]);
   const taskDb = fake.addDatabase('Tasks', TASKS, [{ Task: 'one' }, { Task: 'two' }]);
   const counterRow = fake.rows(mapDb)[0].id;
-  const tally = { exact: 0, unknown: 0, room: 0, released: 0, bursts: 0, thrown: 0 };
+  const tally = { exact: 0, unknown: 0, room: 0, released: 0, bursts: 0, thrown: 0, silent: 0 };
   const where = 'seed ' + seed + ' (' + mode + ')';
   let unique = 100;
   const fresh = () => (unique += 1);
@@ -51,10 +51,16 @@ async function run(seed, mode) {
     return order.get(rowId + '|' + prop + '|' + JSON.stringify(value));
   };
 
+  // A page's wait for one bridge call ends when the test says so, like any other delivery.
+  const timer = (ms, fn) => {
+    const item = { kind: 'timeout', run: fn };
+    fake.pending.push(item);
+    return () => { const i = fake.pending.indexOf(item); if (i >= 0) fake.pending.splice(i, 1); };
+  };
   const pages = [];
   for (const id of ['ana', 'bot', 'ana']) {
     const c = fake.client({ id, name: id });
-    const room = await Commons.connect({ artifact: c.artifact, now: clock.now, sleep: async (ms) => { clock.advance(ms); }, report: () => { tally.thrown += 1; } });
+    const room = await Commons.connect({ artifact: c.artifact, now: clock.now, sleep: async (ms) => { clock.advance(ms); }, report: () => { tally.thrown += 1; }, timer });
     pages.push({ c, map: await room.map('State'), list: await room.list('Tasks'), last: {}, shown: new Map() });
   }
   // The page's own functions break now and then. That must change nothing below.
@@ -148,7 +154,14 @@ async function run(seed, mode) {
   let done = false, failure = null;
   Promise.all(pages.map(script)).then(() => { done = true; }, (e) => { failure = e; done = true; });
 
-  const deliver = () => { if (fake.pending.length) fake.pending.splice(Math.floor(rnd() * fake.pending.length), 1)[0].run(); };
+  // Now and then an answer never comes, or a page stops waiting for one that is only late.
+  const deliver = () => {
+    const waits = fake.pending.filter((x) => x.kind === 'timeout'), rest = fake.pending.filter((x) => x.kind !== 'timeout');
+    const item = rest.length && !(waits.length && rnd() < 0.03) ? pick(rest) : pick(waits);
+    if (!item) return;
+    fake.pending.splice(fake.pending.indexOf(item), 1);
+    if (item.kind.endsWith('answer') && rnd() < 0.03) tally.silent += 1; else item.run();
+  };
   const watch = () => {
     for (const p of pages) {
       for (const [name, t, db, props] of [['map', p.map.t, mapDb, ['Value']], ['list', p.list.t, taskDb, ['Claim', 'Result']]]) {
@@ -159,6 +172,8 @@ async function run(seed, mode) {
         }
         if (!ordered) continue;
         for (const row of sure(t)) {
+          // Without conditional writes two pages can write the same count, so its values are not unique.
+          if (!exact && row.id === counterRow) continue;
           for (const prop of props) {
             const at = blank(row.cells[prop]) ? undefined : indexOf(row.id, prop, row.cells[prop]), key = row.id + '|' + prop;
             if (at === undefined) continue;
@@ -184,7 +199,8 @@ async function run(seed, mode) {
   }
   if (failure) throw failure;
 
-  while (fake.pending.length) fake.pending.shift().run();
+  // What is left is snapshots and late answers. A wait that is still open has nothing to end.
+  for (let item = fake.pending.shift(); item; item = fake.pending.shift()) if (item.kind !== 'timeout') item.run();
   // With versions a page must reach the room's state from what it was sent, with no fresh copy to
   // undo a mistake. Without them it cannot drop a snapshot that arrives out of order, so it gets one.
   if (!exact) for (const p of pages) p.c.refresh();
@@ -213,7 +229,7 @@ async function run(seed, mode) {
 }
 
 async function sweep(mode, count) {
-  const sum = { exact: 0, unknown: 0, room: 0, released: 0, bursts: 0, thrown: 0 }, failed = [];
+  const sum = { exact: 0, unknown: 0, room: 0, released: 0, bursts: 0, thrown: 0, silent: 0 }, failed = [];
   for (let seed = 0; seed < count; seed += 1) {
     try { const r = await run(seed, mode); for (const k of Object.keys(sum)) sum[k] += r[k]; } catch (e) { failed.push(e.message.split('\n')[0]); }
   }
@@ -230,7 +246,7 @@ async function sweep(mode, count) {
 test('600 seeded interleavings, conditional writes, late snapshots show the room as it is: every invariant holds', async () => {
   const sum = await sweep('ordered', 600);
   // A run that never reaches these outcomes proves nothing about them.
-  assert.ok(sum.exact > 300 && sum.unknown > 30 && sum.room > 300 && sum.released > 100 && sum.bursts > 500 && sum.thrown > 500, JSON.stringify(sum));
+  assert.ok(sum.exact > 300 && sum.unknown > 30 && sum.room > 300 && sum.released > 100 && sum.bursts > 500 && sum.thrown > 500 && sum.silent > 100, JSON.stringify(sum));
 });
 
 test('200 seeded interleavings, conditional writes, stale snapshots in any order at all', async () => {

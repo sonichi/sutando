@@ -28,7 +28,10 @@ async function open(file, artifact) {
   const ticks = [];
   const page = {
     document: { getElementById: (id) => byId.get(id), createElement: (tag) => new El(tag) },
-    setInterval: (fn) => ticks.push(fn), setTimeout: (fn) => setImmediate(fn), console,
+    setInterval: (fn) => ticks.push(fn), console,
+    // A short wait (a retry) passes at once; a long one (the limit on one bridge call) never fires here.
+    setTimeout: (fn, ms) => { const t = { live: true }; if (!(ms >= 5000)) setImmediate(() => t.live && fn()); return t; },
+    clearTimeout: (t) => { if (t) t.live = false; },
   };
   page.window = page;
   if (artifact) page.artifact = artifact;

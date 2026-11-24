@@ -112,6 +112,9 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
     [/waiting for approval/i, 'APPROVAL_PENDING'],
   ];
 
+  /* What a bridge call "answers" when this page stops waiting for it. It may still have landed. */
+  const SILENT = Object.freeze({ ok: false, reason: 'no answer from the room: this page stopped waiting' });
+
   function refusal(reason, fallback, extra) {
     const text = String(reason == null ? '' : reason);
     const hit = (extra || []).concat(REASONS).find(([re]) => re.test(text));
@@ -185,7 +188,10 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
     }
 
     async read() {
-      try { return await this.room.art.db.read(this.id); } catch (e) { throw refusal(e && e.message); }
+      let snap;
+      try { snap = await this.room.bounded(this.room.art.db.read(this.id)); } catch (e) { throw refusal(e && e.message); }
+      if (snap === SILENT) throw refusal(SILENT.reason);
+      return snap;
     }
 
     ingest(snap) {
@@ -715,8 +721,9 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
   class Room {
     constructor(art, opts) {
       this.art = art;
-      this.opts = Object.assign({ retryEvery: 1500, retryFor: 120000 }, opts);
+      this.opts = Object.assign({ retryEvery: 1500, retryFor: 120000, callTimeout: 30000 }, opts);
       this.sleep = this.opts.sleep || ((ms) => new Promise((ok) => setTimeout(ok, ms)));
+      this.timer = this.opts.timer || ((ms, fn) => { const t = setTimeout(fn, ms); return () => clearTimeout(t); });
       // A page function's error is thrown again on its own, so it reaches the page's error handling.
       this.report = this.opts.report || ((err) => { setTimeout(() => { throw err; }, 0); });
       this.tables = new Map();
@@ -767,11 +774,22 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
     }
 
     /* The guide's write loop: retry while the viewer has not answered or the page is rate-limited. */
+    /* Bounds one bridge call: a call that never settles would stall its database for good. A late
+       answer finds the promise settled and changes nothing; the snapshots still tell what happened. */
+    bounded(promise) {
+      return new Promise((ok, no) => {
+        const stop = this.timer(this.opts.callTimeout, () => ok(SILENT));
+        Promise.resolve(promise).then((r) => { stop(); ok(r); }, (e) => { stop(); no(e); });
+      });
+    }
+
     async send(call, extra) {
       const until = this.now() + this.opts.retryFor;
       for (;;) {
-        const r = await call();
+        const r = await this.bounded(call());
         if (r && r.ok) return r;
+        // A plain write that got no answer may still land: that is unknown, not refused.
+        if (r === SILENT && !extra) throw new CommonsError('OUTCOME_UNKNOWN', 'No answer from the room: the change may or may not have been saved.', r.reason);
         const err = refusal(r && r.reason, undefined, extra);
         if (r && typeof r.version === 'number') err.version = r.version;
         if ((err.code !== 'CONSENT_PENDING' && err.code !== 'RATE_LIMITED') || this.now() >= until) throw err;
@@ -844,7 +862,7 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
   }
 
   /** Connects to the room this page is open in; rejects with code NO_BRIDGE outside a room.
-   *  `opts` are test hooks and retry timing: `{artifact?, now?, sleep?, report?, retryEvery?, retryFor?}`. */
+   *  `opts` are test hooks and retry timing: `{artifact?, now?, sleep?, timer?, report?, retryEvery?, retryFor?, callTimeout?}`. */
   async function connect(opts) {
     const o = opts || {};
     const host = typeof window !== 'undefined' ? window : globalThis;

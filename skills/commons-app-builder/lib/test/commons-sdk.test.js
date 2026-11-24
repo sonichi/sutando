@@ -753,6 +753,102 @@ test('claim held for an approval: it rolls back untracked; if approved later it 
   assert.deepEqual([await la.release(one), fake.rows(taskDb)[0].cells.Claim, lost], [true, '', []]);
 });
 
+/* a bridge call that never answers */
+
+/* A page whose per-call timers the test fires by hand, and whose next `method` call gets no answer.
+   `land()` lets that call reach the room after all and delivers its late answer. */
+async function patient(opts) {
+  const s = await setup(opts), timers = [];
+  const timer = (ms, fn) => { timers.push(fn); return () => { const i = timers.indexOf(fn); if (i >= 0) timers.splice(i, 1); }; };
+  s.room = await Commons.connect(Object.assign({ artifact: s.pa.artifact, timer }, s.hooks));
+  s.timers = timers;
+  s.giveUp = async () => { assert.equal(timers.length, 1, 'one call is being waited on'); timers.shift()(); await settle(); };
+  let real, args, answer;
+  s.silence = (method) => {
+    real = s.pa.artifact.db[method];
+    s.pa.artifact.db[method] = (...given) => {
+      s.pa.artifact.db[method] = real;
+      args = given;
+      return new Promise((ok) => { answer = ok; });
+    };
+  };
+  s.land = async () => { answer(await real(...args)); await settle(); };
+  return s;
+}
+
+test('a bridge call that never answers does not stall the database: the claim, the release behind it and another row\'s update all finish', async () => {
+  const { room, silence, giveUp, land, timers, fake, taskDb, clock } = await patient({ room: EXACT, rows: [{ Task: 'One' }, { Task: 'Two' }] });
+  const l = await room.list('App — Tasks'), [one, two] = l.toArray().map((r) => r.id), state = {};
+  silence('write');
+  const note = (name) => [(r) => { state[name] = r === undefined ? 'done' : r.ok === undefined ? r : r.ok; }, (e) => { state[name] = e.code; }];
+  l.claim(one).then(...note('claim')); l.release(one).then(...note('release')); l.update(two, { Result: 'x' }).then(...note('update'));
+  await settle();
+  assert.deepEqual(state, {}, 'all three wait on the one call');
+  await giveUp();
+  assert.deepEqual([state, l.busy.get(one), l.t.entries.length, timers.length], [{ claim: true, release: true, update: 'done' }, 0, 0, 0]);
+  const before = JSON.stringify([l.t.version, l.t.rows]);
+  await land();
+  assert.deepEqual([l.t.entries.length, JSON.stringify([l.t.version, l.t.rows])], [0, before], 'the late answer (the room refused that stale write) changes nothing');
+  const lost = [];
+  assert.equal((await l.claim(one, { onLost: (h) => lost.push(h.id) })).ok, true);
+  fake.serverWrite(taskDb, one, 'Claim', JSON.stringify({ by: 'runner', name: 'Runner', kind: 'agent', until: clock.now() + 60000 }));
+  await settle();
+  assert.deepEqual(lost, ['runner'], 'loss tracking on that row works again');
+});
+
+test('a plain write that gets no answer: OUTCOME_UNKNOWN, not refused; when it lands later its snapshot shows, and no entry is left', async () => {
+  const { room, silence, giveUp, land, fake, mapDb } = await patient();
+  const m = await room.map('App — State');
+  await m.set('k', 1); await settle();
+  silence('write');
+  const saving = m.set('k', 2);
+  assert.equal(m.get('k'), 2, 'shown while it waits');
+  await settle();
+  const [out] = await Promise.all([saving.catch((e) => e.code), giveUp()]);
+  assert.deepEqual([out, m.get('k'), fake.rows(mapDb)[0].cells.Value, m.t.entries.length], ['OUTCOME_UNKNOWN', 1, '1', 0]);
+  await m.set('other', 5); await settle();
+  await land();
+  assert.deepEqual([m.get('k'), fake.rows(mapDb)[0].cells.Value, m.t.entries.length], [2, '2', 0]);
+});
+
+test('a conditional write that gets no answer: OUTCOME_UNKNOWN; when it lands later its snapshot shows, and no entry is left', async () => {
+  const { room, silence, giveUp, land, fake, mapDb } = await patient({ room: EXACT });
+  const m = await room.map('App — State');
+  await m.update('n', (n) => (n || 0) + 1); await settle();
+  silence('write');
+  const [out] = await Promise.all([m.update('n', (n) => n + 1).catch((e) => [e.code, e.value]), settle().then(giveUp)]);
+  assert.deepEqual([out, m.get('n'), m.t.entries.length], [['OUTCOME_UNKNOWN', 1], 1, 0]);
+  const version = m.t.version;
+  await land();
+  assert.deepEqual([m.get('n'), fake.rows(mapDb)[0].cells.Value, m.t.entries.length, m.t.version > version], [2, '2', 0, true]);
+});
+
+test('waiting for the viewer for longer than the per-call timeout is not cut off: each call was answered', async () => {
+  const { pa, clock } = await setup({ rows: [{ Task: 'One' }], a: { consent: 'unasked' } });
+  const fired = [], start = clock.now();
+  const timer = (ms, fn) => { let live = true; fired.push(() => live && fn()); return () => { live = false; }; };
+  const sleep = async (ms) => { clock.advance(ms); if (clock.now() - start >= 90000) pa.answer(true); };
+  const l = await (await Commons.connect({ artifact: pa.artifact, now: clock.now, sleep, timer, callTimeout: 30000 })).list('App — Tasks');
+  await l.update(l.toArray()[0].id, { Result: 'saved' });
+  for (const fire of fired) fire();
+  await settle();
+  assert.ok(clock.now() - start >= 90000 && fired.length > 50);
+  assert.equal(l.toArray()[0].cells.Result, 'saved');
+});
+
+test('a first read that gets no answer: the database does not open, and its watch is freed', async () => {
+  const { pa, hooks } = await setup({ rows: [{ Task: 'One' }] });
+  const timers = [], read = pa.artifact.db.read;
+  pa.artifact.db.read = () => new Promise(() => {});
+  const room = await Commons.connect(Object.assign({ artifact: pa.artifact, timer: (ms, fn) => { timers.push(fn); return () => {}; } }, hooks));
+  const opening = room.list('App — Tasks').catch((e) => e.code);
+  await settle();
+  timers.shift()();
+  assert.deepEqual([await opening, pa.watchers.size], ['REFUSED', 0]);
+  pa.artifact.db.read = read;
+  assert.equal((await room.list('App — Tasks')).length, 1);
+});
+
 /* functions the page hands in */
 
 const boom = () => { throw new Error('the page broke'); };
