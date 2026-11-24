@@ -429,8 +429,10 @@ starting from an empty file, then still follow steps 2, 6 and 7 for the app you 
 [`lib/commons-sdk.js`](lib/commons-sdk.js) is one file with no dependencies that wraps the page
 API for a common case: a shared list or key-value map over a database's rows, the write retry of
 step 3 with an undo when a write is refused, the room's members, a cooperative claim and release
-on a row, and asking an agent. It is optional. Everything in this guide works without it, and the
-starter templates do not use it.
+on a row, and asking an agent. It is optional. Everything in this guide works without it, and
+existing apps and the starter templates do not load it: nothing changes for them. If you have this
+guide without its folder, the file is in the public Sutando repository, under
+`skills/commons-app-builder/lib/`; without the file, follow the guide as written.
 
 - **When to use it.** The page is a list people add to and change together, such as a sign-up
   sheet or a task board. Skip it for a page that replays or groups rows in its own way, such as a
@@ -440,7 +442,8 @@ starter templates do not use it.
   between two marker comments in the example pages, and `--check` says when a page carries an old
   copy. The pre-flight in `scripts/check_page.py` passes on a page that carries it.
 - **It is not a CRDT.** The last write to reach the room wins, per map key or per list cell. A
-  claim is cooperative, not a lock.
+  claim is cooperative, not a lock, and unless the room confirmed it, two pages can hold one for a
+  while.
 - **Still do steps 2, 6 and 7.** The library is tested against a fake bridge only; no real room
   has confirmed it yet.
 

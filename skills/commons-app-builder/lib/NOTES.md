@@ -19,7 +19,7 @@ was run in a real room.
 | 9 | What do the 20,000 bytes measure? | Not stated. The library measures the JSON of the value (for `push`, of the whole cells object) and refuses above 20,000 before sending. |
 | 10 | Refusal reasons are free text. | The library maps the phrases the guide quotes (`waiting for the viewer`, `not allowed by the viewer`, `page permission required`, `rate limit`, `too many`, `declined`, and the `sendTask`/`post` reasons) to codes. Anything else is `REFUSED` with the text in `reason`. |
 | 11 | Should the library retry? | Yes, as the guide's `save` loop does: while the viewer has not answered or the page is rate-limited, every 1.5 s for up to 2 minutes. Both are options of `connect`. |
-| 12 | How to settle a claim race? | One text cell holds the whole claim, so a claim is a single write. Last write wins; the claimer reads the row back once (`db.read`) to learn the result; later loss is reported by `onLost`. An append-only claims table was considered and dropped: it needs a trusted order, and the bridge offers no server time or row order. |
+| 12 | How to settle a claim race? | One text cell holds the whole claim, so a claim is a single write. Where the bridge gives a `version` and takes `{ifVersion}`, the write is conditional and the room settles the race (`certainty: "room"`). Elsewhere the write is plain, the result is `certainty: "local"`, and a loss is reported by `onLost` when the copies meet. There is no read-back after a plain write: the page's read answers from its own copy and would only show its own claim. An append-only claims table was considered and dropped: it needs a trusted order. |
 | 13 | Who is the holder in a claim? | What the claimer wrote: `by`, `name`, `kind`. It is not attested. The guide warns that a writable field is never proof of identity; the README repeats it. |
 | 14 | What clock ends a claim? | `artifact.now()` (estimated server time), and the device clock while that is `NaN`. |
 | 15 | `agent.list()` returns `kind`. Kind of what? | Not stated. The library drops it and returns `kind: "agent"`, plus `inRoom` from `userId`. |
@@ -30,6 +30,9 @@ was run in a real room.
 | 20 | Unsubscribing an experimental `requests` watch. | The design shows no way. `watch` returns none. |
 | 21 | One watch per database. | All handles on one database share one watch and one write queue. What the bridge does on a second watch is not stated; the fake throws, to catch misuse. |
 | 22 | `db.list()`: does it count as a read? | Not stated. The library calls it once per `map()` or `list()` call. |
+| 23 | Versions and conditional writes. | The guide does not describe them. The library's use rests on the host's page API as reported in review: a number in `version` on what `db.read` and `db.onChange` give; `{ifVersion}` as the last argument of `db.write` and `db.createRow`; the reasons "version changed", "conditional writes are not available here" and "invalid request"; a conditional write is never queued and never enters the page's own copy early. All of it is behind feature detection, and a missing `version` means the plain path. |
+| 24 | A snapshot that is older than an accepted conditional write. | Ignored: after the room accepts a write at version `v`, a snapshot with a version of `v` or lower was taken before it. This assumes the version only grows. |
+| 25 | Reasons the guide does not quote ("this write is waiting for approval", "offline", "no answer from the room…"). | Not given codes for plain writes: they come back as `REFUSED` with the text. On a conditional write only, "no answer from the room" means "read again". |
 
 ## Real-room checklist
 
@@ -58,12 +61,19 @@ Each item is an assumption. Check it with two people (and one agent) in a real r
 21. An agent writing the `Claim`, `Status` or `Result` cell through Actions does not trigger an unwanted summon on that row.
 22. `agent.sendTask` with a repeated `key` returns the first receipt and shows no second dialog.
 23. `room.post` and `agent.sendTask` reasons match the guide's wording exactly.
-24. The inlined library (about 25 KB) plus a page stays well under the 196,608-byte page limit, and runs in the sandbox with no blocked call. (The guide's static pre-flight, `check_page.py`, passes on both examples.)
-25. A claim's read-back (one `db.read`) is affordable in a busy app: 20 reads a minute per page.
+24. The inlined library (about 31 KB) plus a page stays well under the 196,608-byte page limit, and runs in the sandbox with no blocked call. (The guide's static pre-flight, `check_page.py`, passes on both examples.)
+25. Each "version changed" answer costs one `db.read`; check that is affordable in a busy app: 20 reads a minute per page.
 26. Phone layout of the two examples at about 390px, light and dark. Not rendered here: the checks run without a browser.
+27. With the host's switches on: `db.read` and `db.onChange` snapshots carry a number in `version`, it grows with every change to the database, and it is absent (not `0` or `null`) when the switch is off.
+28. `db.write(db, row, prop, value, {ifVersion})` and `db.createRow(db, cells, {ifVersion})` are the call shapes, and their refusal reasons are exactly "version changed", "conditional writes are not available here" and "invalid request".
+29. After an accepted conditional write, when does the page's own copy show it, and can a snapshot older than it still arrive? (The library ignores such a snapshot by its version.)
+30. A plain write goes into the page's own copy first and `db.read` answers from that copy. Two pages claim one row with plain writes: both get `certainty: "local"`, and `onLost` fires on one of them after they sync.
+31. "No answer from the room" on a conditional write: the exact text, and whether the write may still have landed.
+32. The exact texts for a write waiting for an approval and for an offline page, and whether such a plain write is kept in the page's own copy (the library reports `REFUSED` and undoes its own early display).
 
 ## Not tested here
 
 - No real room, no real consent prompt, no second device, no real agent.
 - No browser: the example checks run the pages' scripts in Node with a small stand-in DOM. Layout and CSS were not rendered.
 - The fake room's reason texts for size, bad values and read limits are its own; only the phrases the guide quotes are faithful.
+- The conditional-write path and the "page's own copy" behaviour are tested only against the fake's model of them, which was written from a description, not from a running host.
