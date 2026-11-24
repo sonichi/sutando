@@ -1717,6 +1717,13 @@ class WeeklyLimit(unittest.TestCase):
         self.assertTrue(pg.limit_line("You've reached your weekly limit."))
         self.assertTrue(pg.is_usage_limit("turn-rejected", "⎿  You've used your weekly limit · resets Nov 28"))
 
+    def test_the_vms_own_weekly_screen_is_a_usage_limit(self):
+        vm = ("  ⎿  You've hit your weekly limit · resets Nov 28 at 1pm (UTC)\n❯ /rate-limit-options\n"
+              "What do you want to do?\n❯ 1. Stop and wait for limit to reset\n"
+              "  2. Wait here, then continue automatically at Nov 28 at 1pm\n  3. Switch to usage credits\n"
+              "Enter to confirm · Esc to cancel\n")
+        self.assertTrue(pg.is_usage_limit("selection", vm))
+
     def test_an_ordinary_menu_or_reply_is_not(self):
         menu = "Pick one\n❯ 1. Keep the weekly report\n  2. Drop it\nEnter to confirm · Esc to cancel\n"
         self.assertFalse(pg.is_usage_limit("selection", menu))
