@@ -67,7 +67,8 @@ DEFAULT_ACP_COMMAND = "agy acp"
 # agy replaces its own binary in place when it updates itself (VM 2026-11-24 15:08: the app's pinned 1.5.13
 # became 1.5.16, and the desktop, which checks its pin, then said Antigravity was not installed). The app's
 # wrapper turns that off, but an ACP command naming the binary itself does not: every agy started here gets it.
-NO_SELF_UPDATE = ("AGY_CLI_DISABLE_AUTO_UPDATE", "1")
+# agy reads the switch only as "true" (tested 2026-11-24: with "1" it still spawned its updater).
+NO_SELF_UPDATE = ("AGY_CLI_DISABLE_AUTO_UPDATE", "true")   # agy reads only "true"; "1" is ignored
 NO_REPLY = "NO_REPLY"
 HELD_WAIT_S = held_start.WAIT_S
 RETRY_S = 60.0
