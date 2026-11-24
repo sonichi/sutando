@@ -308,6 +308,12 @@ class TestSkillRules(unittest.TestCase):
         self.assertNotIn("must join the room first", back)
         self.assertLess(back.index("your owner is not in the room"), back.index("Any other reason, or none"))
 
+    def test_note_means_read_again(self):
+        back = " ".join(section(self.text, "What comes back").split())
+        item = bullet(back, "**Done:**")
+        self.assertIn("If the result has a `note`, read the policy again with `room.agent_policy.read` "
+                      "and report what it shows now, not `changed`.", item)
+
     def test_no_owner_chat_holds_nothing(self):
         back = " ".join(section(self.text, "What comes back").split())
         item = bullet(back, "**`UPSTREAM_UNAVAILABLE`:**")

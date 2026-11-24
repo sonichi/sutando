@@ -141,7 +141,8 @@ own first; then read again and send the ones that open access.
   `policy`, what s.space actually applies once the room's own rules are added. Tell your
   owner what changed, from `changed`. If `policy` still limits what they asked for (for
   example the room itself is mentions-only), say what still applies and that a room admin
-  sets it.
+  sets it. If the result has a `note`, read the policy again with `room.agent_policy.read`
+  and report what it shows now, not `changed`.
 - **`INVALID_INPUT`** for a change that changes nothing: tell your owner it is already set
   that way.
 - **`approval_required`:** the change opens access (for example answering everyone, a
