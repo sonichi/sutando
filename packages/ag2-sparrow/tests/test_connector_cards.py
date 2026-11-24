@@ -175,6 +175,42 @@ class ConnectorCards(unittest.TestCase):
         posted = sorted((self.state / "agent-cards" / "posted").iterdir())
         self.assertEqual([json.loads(p.read_text())["event_id"] for p in posted], ["$new1", "$new2"])
 
+    def test_what_became_of_a_queued_card_is_recorded_and_outlives_its_receipt(self):
+        outbox = self.state.joinpath(*cc.OUTBOX)
+        posted = cc.queue(self.state, ROOM, *model_card(), now=1000.0)
+        self.assertEqual(cc.outcome(self.state, posted), "", "queued is not an outcome")
+        self.assertEqual(self.poster(OSError("down")).sweep(), 0)
+        self.assertEqual(cc.outcome(self.state, posted), "", "nor is a post that failed")
+        self.assertEqual(self.poster().sweep(), 1)
+        self.assertEqual(cc.outcome(self.state, posted), "posted")
+        self.assertEqual(cc.absorb(self.state, self.root), 1)
+        self.assertEqual(cc.outcome(self.state, posted), "posted", "the receipt is consumed; the outcome stays")
+        # Dropped for age, and dropped for being unreadable: both are recorded before the entry goes.
+        aged = cc.queue(self.state, ROOM, *model_card(), now=1000.0)
+        self.assertEqual(self.poster(clock=lambda: 1000.0 + cc.MAX_QUEUED_S + 1).sweep(), 0)
+        broken = "0" * 31 + "f"
+        outbox.joinpath(broken + ".json").write_text("{not json", encoding="utf-8")
+        self.assertEqual(self.poster().sweep(), 0)
+        self.assertEqual((cc.outcome(self.state, aged), cc.outcome(self.state, broken), list(outbox.iterdir())),
+                         ("dropped", "dropped", []))
+        # Only a queue id is looked up, only the two words are an outcome, and an old one is forgotten.
+        folder = self.state.joinpath(*cc.OUTCOMES)
+        folder.joinpath("1" * 32).write_text("maybe", encoding="utf-8")
+        self.assertEqual([cc.outcome(self.state, q) for q in ("1" * 32, "2" * 32, "../keys/x", "", None)], [""] * 5)
+        os.utime(folder / aged, (0, 0))
+        self.poster().sweep()
+        cc._settle(self.state, "3" * 32, "posted")
+        self.assertEqual((cc.outcome(self.state, aged), cc.outcome(self.state, posted)), ("", "posted"))
+
+    def test_an_outcome_that_cannot_be_recorded_leaves_the_card_queued(self):
+        qid = cc.queue(self.state, ROOM, *model_card(), now=1000.0)
+        with mock.patch.object(cc, "_settle", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.poster().sweep()
+        self.assertTrue((self.state.joinpath(*cc.OUTBOX) / (qid + ".json")).is_file(), "never gone without a reason")
+        self.assertEqual(self.poster().sweep(), 1)
+        self.assertEqual(cc.outcome(self.state, qid), "posted")
+
     def test_a_card_that_would_not_render_or_has_no_room_is_refused_at_the_queue(self):
         body, card = model_card()
         for room, line, bad in (("", body, card), ("not-a-room", body, card), (ROOM, "", card),

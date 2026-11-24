@@ -119,37 +119,76 @@ class Notice(Base):
         self.assertEqual(self.tick(LIMITED, quota_card.RETRY_S), "quota-not-posted")
         self.assertFalse(quota_card.load(self.root).get("told"))
 
+    def sweep(self, at, post=None):
+        """The bridge's own sweep of the outbox, at its clock `at`; `post` answers its room call."""
+        sent = []
+        answer = post or (lambda payload: sent.append(payload) or {"ok": True, "event_id": "$ev%d" % len(sent)})
+        connector_cards.Poster(self.bridge, answer, log=self.logs.append, clock=lambda: at).sweep()
+        return sent
+
+    def queued_at(self, qid):
+        return json.loads((self.bridge.joinpath(*connector_cards.OUTBOX) / (qid + ".json")).read_text())["queued_at"]
+
     def test_queued_is_not_told_and_a_card_the_bridge_dropped_is_queued_again(self):
         quota_card.remember_room(self.root, DM)
         self.assertEqual(self.tick(LIMITED), "quota-card")
         qid = quota_card.load(self.root)["qid"]
-        outbox = self.bridge.joinpath(*connector_cards.OUTBOX) / (qid + ".json")
-        self.assertTrue(outbox.is_file())
+        born = self.queued_at(qid)
+
+        def down(payload):
+            raise OSError("no route")
+        self.sweep(born + 30, down)
         self.assertEqual(self.tick(LIMITED, 30.0), "", "still in the outbox: waiting, not told")
         self.assertFalse(quota_card.load(self.root).get("told"))
-        # The bridge was down and drops the card at MAX_QUEUED_S. Seen gone after that, it is taken for
-        # dropped and queued again under a new key (the same card id, which replaces the first).
-        outbox.unlink()
-        self.assertEqual(self.tick(LIMITED, connector_cards.MAX_QUEUED_S), "quota-card-dropped")
+        # The bridge could not post it and drops it past MAX_QUEUED_S: its own sweep records that.
+        self.assertEqual(self.sweep(born + connector_cards.MAX_QUEUED_S + 1), [])
+        self.assertEqual((connector_cards.outcome(self.bridge, qid), self.queued()), ("dropped", []))
+        self.assertEqual(self.tick(LIMITED, 5.0), "quota-card-dropped", "seen well inside the deadline: the record decides")
         self.assertEqual(self.tick(LIMITED, 1.0), "quota-card")
         second = quota_card.load(self.root)["qid"]
         self.assertNotEqual(second, qid)
-        # Its receipt in the bridge's posted folder: told.
-        posted = self.bridge.joinpath(*connector_cards.POSTED)
-        posted.mkdir(parents=True, exist_ok=True)
-        self.bridge.joinpath(*connector_cards.OUTBOX, second + ".json").rename(posted / (second + ".json"))
+        # The second is posted by a real sweep: told, once.
+        (sent,) = self.sweep(self.queued_at(second) + 1)
+        self.assertEqual(sent["room_id"], DM)
         self.assertEqual(self.tick(LIMITED, 5.0), "quota-card-posted")
         self.assertTrue(quota_card.load(self.root)["told"])
         self.assertEqual(self.tick(LIMITED, 3600.0), "", "one card per limit")
 
-    def test_a_card_gone_from_the_outbox_in_time_was_posted_even_with_its_receipt_already_absorbed(self):
+    def test_a_posted_card_whose_receipt_was_consumed_is_told_on_either_side_of_the_deadline(self):
+        for late in (20.0, connector_cards.MAX_QUEUED_S + 300, 3 * 86400.0):
+            with self.subTest(late=late):
+                quota_card.save(self.root, {})
+                quota_card.remember_room(self.root, DM)
+                self.assertEqual(self.tick(LIMITED, quota_card.RETRY_S), "quota-card")
+                qid = quota_card.load(self.root)["qid"]
+                self.assertEqual(len(self.sweep(self.queued_at(qid) + 1)), 1)
+                # Its receipt is taken into the agent's ledger at a claim, before the supervisor looks.
+                self.assertEqual(connector_cards.absorb(self.bridge, self.root), 1)
+                self.assertEqual(list(self.bridge.joinpath(*connector_cards.POSTED).iterdir()), [])
+                self.assertEqual(self.tick(LIMITED, late), "quota-card-posted", "never queued a second time")
+                self.assertEqual(self.queued(), [])
+                self.assertEqual(self.tick(LIMITED, 60.0), "")
+
+    def test_a_card_gone_with_no_recorded_outcome_is_neither_posted_nor_sent_again(self):
         quota_card.remember_room(self.root, DM)
         self.assertEqual(self.tick(LIMITED), "quota-card")
         qid = quota_card.load(self.root)["qid"]
-        # Posted, and its receipt taken into the agent's ledger at a claim, before this tick looked.
+        # Removed by something that is not the bridge's sweep: no outcome, no receipt.
         self.bridge.joinpath(*connector_cards.OUTBOX, qid + ".json").unlink()
-        self.assertEqual(self.tick(LIMITED, 20.0), "quota-card-posted")
-        self.assertEqual(len(self.queued()), 0)
+        self.assertEqual(self.tick(LIMITED, 20.0), "", "early absence is not delivery")
+        self.assertFalse(quota_card.load(self.root).get("told"))
+        self.assertEqual(self.tick(LIMITED, connector_cards.MAX_QUEUED_S), "", "nor is late absence a drop")
+        self.assertEqual(self.tick(LIMITED, quota_card.UNKNOWN_S), "quota-card-unknown")
+        self.assertEqual(self.queued(), [], "not queued under a new key: it may have been posted")
+        self.assertEqual(self.tick(LIMITED, 3600.0), "")
+        # An older bridge's receipt, with no outcome record, still counts while it is there.
+        quota_card.save(self.root, {})
+        self.assertEqual(self.tick(LIMITED, quota_card.RETRY_S), "quota-card")
+        again = quota_card.load(self.root)["qid"]
+        posted = self.bridge.joinpath(*connector_cards.POSTED)
+        posted.mkdir(parents=True, exist_ok=True)
+        self.bridge.joinpath(*connector_cards.OUTBOX, again + ".json").rename(posted / (again + ".json"))
+        self.assertEqual(self.tick(LIMITED, 5.0), "quota-card-posted")
 
     def test_the_claim_and_the_supervisor_never_undo_each_others_record(self):
         # The supervisor holds its snapshot of the incident while the claim learns the room, and saves after.
@@ -179,6 +218,10 @@ class Notice(Base):
     def test_the_reset_time_is_read_from_the_banner_line_only(self):
         self.assertEqual(quota_card.reset_words(LIMITED), "resets 3pm (America/Los_Angeles)")
         self.assertEqual(quota_card.reset_words("Weekly limit reached │ resets Nov 28, 9am. │ other"), "resets Nov 28, 9am")
+        self.assertEqual(quota_card.reset_words("You've hit your usage limit · resets at 9:30 PM (UTC)"), "resets 9:30pm (UTC)")
+        self.assertEqual(quota_card.reset_words("You've hit your usage limit · resets soon, see https://x.example"), "",
+                         "words that are not a time are not copied")
+        self.assertEqual(quota_card.reset_words("You've hit your usage limit · resets 3pm (call 555 now)"), "resets 3pm")
         self.assertEqual(quota_card.reset_words("You've hit your usage limit"), "")
         self.assertEqual(quota_card.reset_words(None), "")
         # Other lines of the pane are never read, whatever they say (a transcript line about resets, a

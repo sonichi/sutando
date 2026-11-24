@@ -11,10 +11,11 @@ messages there (`remember_room`, at the claim), in a record of its own: the clai
 one and the supervisor only the incident's, so neither can undo the other's write. Until a room has
 been seen no card can be sent, and the launcher's own stall card still reaches the owner.
 
-Queued is not told. The bridge drops a card it could not post within connector_cards.MAX_QUEUED_S,
-so the incident counts as told only once the card left the outbox in time or its posted receipt is
-there; one that was dropped is queued again (the same card id, which replaces the earlier in the
-room). Nothing here types into the session or changes an account.
+Queued is not told. The bridge records what became of each queued card (connector_cards.outcome), and
+only that record decides: `posted` is told, `dropped` (the bridge could not post it within
+connector_cards.MAX_QUEUED_S) is queued again as a new card. A card with no record and no file left
+is not known to be either, so it is never sent again: that could tell the owner twice. Nothing here
+types into the session or changes an account.
 """
 from __future__ import annotations
 
@@ -33,8 +34,14 @@ ROOM_FILE = "quota-room.json"   # the owner's DM room: the claim's alone
 
 CLEAR_S = 600.0         # the banner gone this long: the limit is over, and a later one is a new card
 RETRY_S = 60.0          # a card that could not be queued is tried again no sooner than this
+UNKNOWN_S = 2 * connector_cards.MAX_QUEUED_S
+
+# The reset time as the banner gives it: a clock time, optionally after a date, optionally with a zone.
+_CLOCK = r"\d{1,2}(?::\d{2})?\s?[ap]m"
+_DAY = r"(?:[A-Z][a-z]{2}\s\d{1,2}|\d{1,2}\s[A-Z][a-z]{2})"
+_WHEN = re.compile(r"\bresets?\s+(?:at\s+|on\s+)?(?:(?P<day>%s),?\s+(?:at\s+)?)?(?P<clock>%s)(?:\s*\((?P<zone>[A-Za-z_]+(?:/[A-Za-z_]+){0,2})\))?"
+                   % (_DAY, _CLOCK), re.IGNORECASE)
 _LIMIT = tuple(rx for name, rx in ABNORMAL_PATTERNS if name in PROVIDER_LIMIT_PATTERNS)
-_RESET = re.compile(r"\bresets?\b[\w :,()/+-]{1,60}", re.IGNORECASE)
 _ROOM = re.compile(r"^![^\s:]+(:\S+)?$")
 
 
@@ -76,13 +83,19 @@ def remember_room(root, seen) -> None:
 
 
 def reset_words(text: str) -> str:
-    """When the limit resets, from the limit banner's own line only ("resets 3pm (America/Los_Angeles)");
-    '' when that line does not say. No other line of the pane is read: none of it may reach the DM."""
+    """When the limit resets ("resets 3pm (America/Los_Angeles)", "resets Nov 28, 9am"), '' when the
+    banner does not say. Only the limit banner's own line is read, and only a time is taken from it: a
+    clock time, with a date before it and a zone after it when given. The words are built from those
+    parts, never copied from the pane, so nothing else on the line can reach the DM."""
     for line in reversed(str(text or "").splitlines()):
         line = detector._DECOR.sub("", line)
         if any(rx.match(line) for rx in _LIMIT):
-            found = _RESET.search(line)
-            return " ".join(found.group(0).split()).rstrip(" ,:(/+-")[:60] if found else ""
+            found = _WHEN.search(line)
+            if not found:
+                return ""
+            day, zone = found.group("day"), found.group("zone")
+            return "resets %s%s%s" % (" ".join(day.split()) + ", " if day else "", "".join(found.group("clock").split()).lower(),
+                                      " (%s)" % zone if zone else "")
     return ""
 
 
@@ -94,21 +107,25 @@ def words(limited: list, text: str, using: str) -> str:
 
 
 def delivery(bridge, rec: dict, at: float) -> str:
-    """What became of the card `rec` queued: 'posted', 'pending' (still in the bridge's outbox), or 'dropped'.
-    A card gone from the outbox before the bridge's deadline can only have been posted (its receipt may
-    already be in the agent's ledger); one gone after it is taken for dropped."""
-    name = str(rec.get("qid") or "") + ".json"
-    if Path(bridge).joinpath(*connector_cards.POSTED, name).is_file():
+    """What became of the card `rec` queued: 'posted' or 'dropped' as the bridge recorded it, 'pending'
+    while it is in the outbox or the bridge may still be settling it, 'unknown' when UNKNOWN_S later
+    there is still neither a record nor a file. Absence is never read as either outcome."""
+    qid = str(rec.get("qid") or "")
+    said = connector_cards.outcome(bridge, qid)
+    if said:
+        return said
+    if Path(bridge).joinpath(*connector_cards.POSTED, qid + ".json").is_file():
         return "posted"
-    if Path(bridge).joinpath(*connector_cards.OUTBOX, name).is_file():
+    if Path(bridge).joinpath(*connector_cards.OUTBOX, qid + ".json").is_file():
         return "pending"
-    return "posted" if at - float(rec.get("queued") or 0) <= connector_cards.MAX_QUEUED_S else "dropped"
+    return "pending" if at - float(rec.get("queued") or 0) <= UNKNOWN_S else "unknown"
 
 
 def notice(root, cfg: dict, names, text: str, log, now=time.time) -> str:
     """One tick's reading of the pane: `names` are the banner families on it. What was done: 'quota-card'
     (queued for the owner's DM), 'quota-card-posted', 'quota-card-dropped' (queued again later),
-    'quota-no-room', 'quota-not-posted' (tried again later), 'quota-cleared', or '' for nothing."""
+    'quota-card-unknown' (no outcome was ever recorded: not sent again), 'quota-no-room',
+    'quota-not-posted' (tried again later), 'quota-cleared', or '' for nothing."""
     limited = [n for n in names or [] if n in PROVIDER_LIMIT_PATTERNS]
     rec, at = load(root), now()
     if not limited:
@@ -134,6 +151,9 @@ def notice(root, cfg: dict, names, text: str, log, now=time.time) -> str:
         if fate == "posted":
             save(root, dict(rec, told=True))
             return "quota-card-posted"
+        if fate == "unknown":   # it may have been posted: a second card would tell the owner twice
+            save(root, dict(rec, told=True, unknown=True))
+            return "quota-card-unknown"
         rec = {k: v for k, v in rec.items() if k not in ("qid", "key", "at", "queued", "tried")}
         save(root, rec)
         return "quota-card-dropped"

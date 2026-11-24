@@ -12,6 +12,10 @@ shown in place of that card: the bridge sends it as an edit of that event, so th
 whose words change, not a second card. The edit's card is recorded under the original event, the one
 the owner sees and taps. An edit the server refuses is posted as a new card instead.
 
+What became of a queued card outlives both files: the bridge leaves `outcomes/<queue id>` saying
+`posted` or `dropped`, kept as long as a key's marker, so a connector that looks after the receipt was
+absorbed still reads a fact (`outcome`) and never infers one from a file's absence.
+
 Queue and posted files live under the bridge's state dir (`agent-cards/outbox`, `agent-cards/posted`);
 the bridge never writes into the work root. Standard library only, plus the bundled card modules.
 """
@@ -28,6 +32,7 @@ from pathlib import Path
 
 OUTBOX, POSTED = ("agent-cards", "outbox"), ("agent-cards", "posted")
 KEYS = ("agent-cards", "keys")     # one marker per keyed card ever queued, so a repeat is not a second card
+OUTCOMES = ("agent-cards", "outcomes")     # what became of each queued card: "posted" or "dropped"
 KEYS_KEEP_S = 7 * 86400.0
 CARD_KEY = "space.ag2.card"
 MAX_QUEUED_S = 600.0
@@ -104,6 +109,29 @@ def queue(bridge_state, room: str, body: str, card: dict, *, now=None, key: str 
     return qid
 
 
+def _settle(bridge_state, qid: str, what: str) -> None:
+    """Record what became of the queued card `qid`. Written before its outbox entry is removed, so the
+    entry being gone always has a recorded reason; one that cannot be written leaves the entry queued."""
+    path = Path(bridge_state).joinpath(*OUTCOMES) / qid
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(what, encoding="utf-8")
+    os.replace(tmp, path)
+    _forget_old_keys(path.parent)
+
+
+def outcome(bridge_state, qid: str) -> str:
+    """'posted' or 'dropped' once the bridge has settled the queued card `qid`; '' while it has not
+    (still queued, never queued, or settled longer ago than KEYS_KEEP_S)."""
+    if not re.match(r"^[0-9a-f]{32}$", str(qid or "")):
+        return ""
+    try:
+        said = (Path(bridge_state).joinpath(*OUTCOMES) / qid).read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return ""
+    return said if said in ("posted", "dropped") else ""
+
+
 def _forget_old_keys(folder: Path) -> None:
     """Drop markers older than KEYS_KEEP_S: long past any restart that could repeat their card."""
     horizon = time.time() - KEYS_KEEP_S
@@ -128,6 +156,7 @@ class Poster:
             record = _read(path)
             card = (record or {}).get("card")
             if not record or not isinstance(card, dict) or not _ROOM_RE.match(str(record.get("room") or "")):
+                _settle(self.state, path.stem, "dropped")
                 path.unlink(missing_ok=True)
                 continue
             # A card waits behind an earlier one of the same card in the same room that is not posted
@@ -137,6 +166,7 @@ class Poster:
                 continue
             if self.clock() - float(record.get("queued_at") or 0) > MAX_QUEUED_S:
                 self.log("agent-card: dropped a card queued over %d s ago" % MAX_QUEUED_S)
+                _settle(self.state, path.stem, "dropped")
                 path.unlink(missing_ok=True)
                 continue
             payload = {"op": "message", "room_id": record["room"], "body": str(record.get("body") or ""),
@@ -155,6 +185,7 @@ class Poster:
             _write(self.state.joinpath(*POSTED) / path.name,
                    dict({"event_id": event_id, "room": record["room"], "card": card, "posted_at": self.clock()},
                         **({"edited": True} if target and event_id == target else {})))
+            _settle(self.state, path.stem, "posted")
             path.unlink(missing_ok=True)
             posted += 1
         return posted
