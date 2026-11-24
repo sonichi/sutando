@@ -899,6 +899,35 @@ class AwaitSignIn(Base):
         self.assertEqual([e for e, _ in self.fake.edits() if e == "$card2"], [], "the old card is not made to say Switching")
         self.assertEqual(len([c for c in self.fake.calls if c[0] == "room.message.send" and c[2].endswith(":switching")]), 1)
 
+    def test_a_route_that_cannot_be_recorded_means_no_fallback_card_is_posted(self):
+        room = self.deduping(refuse_edits_of=("$card2",))
+        self.claude_json = {"loggedIn": True}
+        real = rtc.keep_wait_card
+
+        def keep(ws, mine, event="", **noted):
+            if noted.get("route"):
+                raise OSError("disk full")              # the route cannot be put on record
+            return real(ws, mine, event, **noted)
+        with mock.patch.object(rtc, "keep_wait_card", keep):
+            rc, out = self.wait_with(room)
+        self.assertEqual([c for c in self.fake.calls if c[0] == "room.message.send" and c[2].endswith(":switching")], [],
+                         "no card whose route is not on record")
+        # The switch itself still goes ahead, with no card of its own: its worker posts the outcome.
+        argv = self.launch.calls[-1][0]
+        self.assertEqual((out["status"], "--card" in argv), ("started", False))
+        self.assertNotIn("event_id", out)
+
+    def test_a_saved_switching_card_is_used_as_it_is_on_resume_and_nothing_is_sent_again(self):
+        self.stopped_after_claiming("switching", switch="7-abc")
+        self.admitted("7-abc")
+        mine = {"attempt": self.attempt, "runtime": "claude", "room": DM}
+        rtc.keep_wait_card(self.ws, mine, "$card9", says="$card9", route="post")
+        said = len(self.fake.calls)
+        rc, out = self.wait()
+        argv = self.launch.calls[-1][0]
+        self.assertEqual((out["status"], argv[argv.index("--card") + 1]), ("started", "$card9"))
+        self.assertEqual(len(self.fake.calls), said, "no edit and no post: the saved card is the target")
+
     def test_a_waiter_stopped_before_its_last_words_leaves_them_for_the_next_to_say(self):
         for phase, status, said in (("expired", "gave_up", "I stopped waiting for the Claude Code sign-in"),
                                     ("already", "already", "The core is now running on Claude Code")):

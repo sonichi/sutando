@@ -405,15 +405,16 @@ def say_switching(ws: Path, room: str, rt: str, current: str, attempt: str, even
     """Put "Switching…" on the card at `event`, or on a new card when that one cannot be edited:
     (words, what was posted). One operation id per attempt and route, so asking again returns the same
     card. `before_new_card` is called before the new card is posted, for a caller that puts the route on
-    record; `new_card` goes straight to that route, as a caller that finds it on record does."""
+    record: when it answers False the route is not on record and nothing is posted. `new_card` goes
+    straight to that route, as a caller that finds it on record does."""
     say = (f"Switching the core from {name(current)} to {name(rt)}. It restarts once this turn has finished; "
            f"I'll confirm here when it is back. {CARRIES}")
     op, out = f"runtime-card:{attempt}:switching", {"status": "failed"}
     if event and not new_card:
         out = _edit(ws, room, event, say, op + "-edit", core=core or None, execute=execute)
     if out["status"] != "posted":
-        if before_new_card is not None:
-            before_new_card()
+        if before_new_card is not None and before_new_card() is False:
+            return say, {"status": "failed", "why": "the new card's route could not be recorded"}
         body, card = notice_card("pending", "Switching", say)
         out = _post(ws, room, body, card, op, reply_to=event, core=core or None, execute=execute)
     return say, out
@@ -595,18 +596,20 @@ def _await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, r
         return rec if {k: rec.get(k) for k in mine} == mine else None
 
     def note_card(event: str) -> None:
-        """The card this attempt now speaks on goes on record with the wait, for whoever resumes it."""
+        """The card that says "Switching" goes on record with the wait, for whoever resumes it."""
         try:
-            keep_wait_card(ws, mine, event)
+            keep_wait_card(ws, mine, event, says=event)
         except OSError:
             pass
 
-    def note_new_card_route() -> None:
-        """"Switching" is about to go out as a new card: on record first, so a resume asks for that card."""
+    def note_new_card_route() -> bool:
+        """"Switching" is about to go out as a new card: on record first, so a resume asks for that card.
+        False when it could not be recorded, and then the card is not posted."""
         try:
             keep_wait_card(ws, mine, route="post")
         except OSError:
-            pass
+            return False
+        return _read_json(ws.joinpath(*WAITING)).get("route") == "post"
 
     def refuse(card_event: str, words: str, out: dict) -> int:
         """The switch is not happening, in `words`, which are already on record with the `refused` phase:
@@ -620,7 +623,7 @@ def _await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, r
         return _emit(out, 1)
 
     def conclude(phase: str, card_event: str, switch: str, resumed: bool = False, words: str = "",
-                 new_card: bool = False) -> int:
+                 new_card: bool = False, says: str = "") -> int:
         """Carry out a claimed step and remove the wait only once it is done: the switch's worker
         launched, or the card's last words delivered. Each is safe to do twice: the card edits carry the
         attempt's own operation ids, and a second worker for one attempt is refused by its execution lock."""
@@ -660,10 +663,15 @@ def _await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, r
             if admitted:
                 # Admitted, and no worker holds the execution lock: it was never launched, or died. Ask for
                 # "Switching" again under the attempt's id, which returns the card that already says it.
-                _, posted = say_switching(ws, args.room, args.runtime, runtime(), switch, card_event, core=core,
-                                          execute=execute, new_card=new_card, before_new_card=note_new_card_route)
-                card_event = str(posted.get("event_id") or card_event)
-                note_card(card_event)
+                if says:
+                    card_event = says       # the card that says it is on record: used as it is, nothing re-sent
+                else:
+                    _, posted = say_switching(ws, args.room, args.runtime, runtime(), switch, card_event, core=core,
+                                              execute=execute, new_card=new_card,
+                                              before_new_card=note_new_card_route)
+                    if posted.get("event_id"):
+                        card_event = str(posted["event_id"])
+                        note_card(card_event)
                 try:
                     pid = start_switch(ws, args.room, args.runtime, switch, popen, card=card_event)
                 except OSError as e:
@@ -698,7 +706,8 @@ def _await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, r
         if rec.get("phase") in ("already", "expired", "switching", "refused"):
             # Claimed by a waiter that was stopped before it finished.
             return conclude(rec["phase"], card_event, str(rec.get("switch") or ""), resumed=True,
-                            words=str(rec.get("words") or ""), new_card=rec.get("route") == "post")
+                            words=str(rec.get("words") or ""), new_card=rec.get("route") == "post",
+                            says=str(rec.get("says") or ""))
         if runtime() == args.runtime:
             return conclude("already", card_event, "") if claim_wait(ws, mine, "already") else _emit(superseded)
         there = signed_in(args.runtime, run=run, codex_read=codex_read) is True     # may take a while
