@@ -101,6 +101,14 @@ class Classifier(unittest.TestCase):
                      "fetch failed", "The core exited with status 1"):
             self.assertIsNone(clh.classify_text(text, now), text)
 
+    def test_the_limit_menu_alone_is_a_usage_limit(self):
+        # 2026-11-24 08:26 UTC on the VM: the hold took the bare menu as a rate limit, so no quota card.
+        menu = ("❯ /rate-limit-options\nWhat do you want to do?\n❯ 1. Stop and wait for limit to reset\n"
+                "  2. Wait here, then continue automatically at Nov 28 at 1pm\n  3. Switch to usage credits\n"
+                "Enter to confirm · Esc to cancel\n")
+        self.assertEqual(clh.classify_text(menu, time.time()).kind, "usage-limit")
+        self.assertEqual(clh.classify_text("API Error: 429 rate limited", time.time()).kind, "rate-limit")
+
     def test_reset_from_cli_text(self):
         at = datetime(2026, 10, 17, 10, 0, tzinfo=timezone.utc).timestamp()
         lim = clh.classify_text("5-hour limit reached ∙ resets 3pm (UTC)", at)

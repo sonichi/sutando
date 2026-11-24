@@ -96,6 +96,10 @@ _CLI_LIMIT = tuple(rx for name, rx in cli_wedge.ABNORMAL_PATTERNS
 # limit."), and the API's own words for a refusal.
 _USAGE_EXTRA = re.compile(r"\b\d+-hour limit (?:reached|exceeded|hit)\b|\bquota\b.{0,20}\b(?:exceeded|exhausted)\b"
                           r"|\binsufficient_quota\b", re.I)
+# Claude Code's /rate-limit-options menu, which only a plan's usage limit opens; its command name alone
+# would read as a rate limit when the "You've hit your ... limit" line above has scrolled away.
+_LIMIT_MENU = re.compile(r"\bwait for (?:the |your )?(?:session |usage |weekly )?limit to reset\b"
+                         r"|\bswitch to usage credits\b", re.I)
 _NAMED_CAP = re.compile(r"\breached your ([A-Za-z][\w.-]{0,24}) limit\b", re.I)
 # The CLI's words for a 429 the account's quota did not cause: the server is throttling.
 _NOT_A_LIMIT = re.compile(r"\bnot your usage limit\b", re.I)
@@ -172,7 +176,7 @@ def classify_text(text: str, at: float, model: Optional[str] = None,
     if named:
         # The banner names the capped model; an earlier turn may have run another one.
         model = qa._model_family(named.group(1).lower()) or model
-    if named or any(rx.search(text) for rx in _CLI_LIMIT) or _USAGE_EXTRA.search(text):
+    if named or any(rx.search(text) for rx in _CLI_LIMIT) or _USAGE_EXTRA.search(text) or _LIMIT_MENU.search(text):
         kind = "usage-limit"
     elif _RATE.search(text):
         kind = "rate-limit"
