@@ -26,7 +26,7 @@ CREDITS = "You're out of credits. Add more to keep going.\n"
 QUIET = "❯ \n  ? for shortcuts\n"
 
 
-class Notice(Base):
+class NoticeBase(Base):
     def setUp(self):
         super().setUp()
         self.cfg = cli.read_config(cli.config_path())
@@ -41,6 +41,18 @@ class Notice(Base):
         return quota_card.notice(self.root, self.cfg, detector.abnormal_names(text), text,
                                  lambda *parts: self.logs.append(" ".join(map(str, parts))), now=lambda: self.at[0])
 
+    def sweep(self, at, post=None):
+        """The bridge's own sweep of the outbox, at its clock `at`; `post` answers its room call."""
+        sent = []
+        answer = post or (lambda payload: sent.append(payload) or {"ok": True, "event_id": "$ev%d" % len(sent)})
+        connector_cards.Poster(self.bridge, answer, log=self.logs.append, clock=lambda: at).sweep()
+        return sent
+
+    def queued_at(self, qid):
+        return json.loads((self.bridge.joinpath(*connector_cards.OUTBOX) / (qid + ".json")).read_text())["queued_at"]
+
+
+class Notice(NoticeBase):
     def test_the_limit_banner_sends_the_account_card_to_the_owners_dm_once(self):
         quota_card.remember_room(self.root, DM)
         self.assertEqual(self.tick(QUIET), "")
@@ -49,8 +61,7 @@ class Notice(Base):
         self.assertEqual(queued["room"], DM)
         card = queued["card"]
         self.assertEqual(card["id"], account_switch.CARD)
-        self.assertIn("Claude Code has reached its usage limit (resets 3pm (America/Los_Angeles))", card["text"])
-        self.assertIn("I'm signed in as s…@example.com.", card["text"])
+        self.assertIn("s…@example.com (Claude Code) has hit its usage limit; resets 3pm (America/Los_Angeles).", card["text"])
         self.assertEqual(card[account_switch.CONTROLS], {"runtime": "claude"}, "the client draws the controls in it")
         for later in (5.0, 120.0, 3600.0):
             self.assertEqual(self.tick(LIMITED, later), "", "one card per limit")
@@ -60,7 +71,7 @@ class Notice(Base):
         quota_card.remember_room(self.root, DM)
         self.assertEqual(self.tick(CREDITS), "quota-card")
         text = self.queued()[0]["card"]["text"]
-        self.assertIn("Claude Code is out of credits (it does not say when that resets)", text)
+        self.assertIn("s…@example.com (Claude Code) is out of credits; it does not say when that resets.", text)
 
     def test_the_limit_over_then_back_is_a_new_card_and_a_banner_that_flickers_is_not(self):
         quota_card.remember_room(self.root, DM)
@@ -83,8 +94,10 @@ class Notice(Base):
         # The owner's own message in their DM is claimed (and cannot be answered): its room is kept.
         self.claim(self.task("task-q1", "are you there?"))
         self.assertEqual(quota_card.room(self.root), DM)
-        self.assertEqual(self.tick(LIMITED, quota_card.RETRY_S), "quota-card")
-        self.assertEqual(self.queued()[0]["room"], DM)
+        # That message has no answer: it carries the card, and no unasked one is sent besides.
+        self.assertEqual(self.tick(LIMITED, quota_card.RETRY_S), "quota-task-card x1")
+        (queued,) = self.queued()
+        self.assertEqual(queued["room"], DM)
 
     def test_only_the_owner_in_their_dm_names_the_room(self):
         for n, (tier, kind) in enumerate((("team", "dm"), ("owner", "room"), ("guest", "dm"))):
@@ -118,16 +131,6 @@ class Notice(Base):
         self.bridge.rename(self.bridge.with_name("bridge-gone"))
         self.assertEqual(self.tick(LIMITED, quota_card.RETRY_S), "quota-not-posted")
         self.assertFalse(quota_card.load(self.root).get("told"))
-
-    def sweep(self, at, post=None):
-        """The bridge's own sweep of the outbox, at its clock `at`; `post` answers its room call."""
-        sent = []
-        answer = post or (lambda payload: sent.append(payload) or {"ok": True, "event_id": "$ev%d" % len(sent)})
-        connector_cards.Poster(self.bridge, answer, log=self.logs.append, clock=lambda: at).sweep()
-        return sent
-
-    def queued_at(self, qid):
-        return json.loads((self.bridge.joinpath(*connector_cards.OUTBOX) / (qid + ".json")).read_text())["queued_at"]
 
     def test_queued_is_not_told_and_a_card_the_bridge_dropped_is_queued_again(self):
         quota_card.remember_room(self.root, DM)
@@ -258,6 +261,153 @@ class Notice(Base):
         self.assertIsNone(task_lifecycle.prepare_work_dir(self.root, check_only=True))
 
 
+# Captured on a VM (Claude Code restarted after an account switch onto an account at its weekly limit):
+# at startup, before any turn, the pane is the CLI's own limit menu, with no banner line of its own.
+STARTUP_MENU = (
+    "╭───────────────────────────────────────────────────╮\n"
+    "│ ✻ Welcome to Claude Code!                         │\n"
+    "│                                                   │\n"
+    "│   /help for help, /status for your current setup  │\n"
+    "╰───────────────────────────────────────────────────╯\n"
+    "\n"
+    " What do you want to do?\n"
+    "\n"
+    " ❯ 1. Stop and wait for limit to reset\n"
+    "   2. Wait here, then continue automatically at Nov 28 at 1pm\n"
+    "   3. Switch to usage credits\n"
+    "\n"
+    " Enter to confirm · Esc to cancel\n")
+# The same menu as a turn that hits the limit shows it, under the CLI's banner.
+TURN_MENU = (
+    "> summarize the thread\n"
+    "  ⎿  You've hit your weekly limit · resets Nov 28 at 1pm\n"
+    "\n"
+    " What do you want to do?\n"
+    "\n"
+    " ❯ 1. Stop and wait for limit to reset\n"
+    "   2. Wait here, then continue automatically at Nov 28 at 1pm\n"
+    "   3. Switch to usage credits\n"
+    "\n"
+    " Enter to confirm · Esc to cancel\n")
+# A limit long over: its banner is still in view, far above the work the session did after it.
+OLD_BANNER = ("  ⎿  You've hit your usage limit · resets 3pm (America/Los_Angeles)\n"
+              + "".join("● step %d of the next answer\n" % n for n in range(12)) + "❯ \n")
+
+
+class LimitMenu(NoticeBase):
+    """Claude Code's limit menu is a limit: every owner message left unanswered gets the account card."""
+
+    def text_of(self, queued):
+        return queued["card"]["text"]
+
+    def test_the_startup_menu_is_read_as_the_limit_with_its_reset_time(self):
+        self.assertEqual(detector.abnormal_names(STARTUP_MENU), ["quota-limit"])
+        self.assertEqual(detector.abnormal_names(TURN_MENU), ["quota-limit"])
+        self.assertEqual(quota_card.reset_words(STARTUP_MENU), "resets Nov 28, 1pm")
+        self.assertEqual(quota_card.reset_words(TURN_MENU), "resets Nov 28, 1pm")
+        self.assertTrue(quota_card.current(STARTUP_MENU))
+        self.assertFalse(quota_card.current(OLD_BANNER), "an old banner above later work is not the limit now")
+        self.assertTrue(quota_card.current(LIMITED))
+        # Only the menu's own option line gives the time, and only its time-like part.
+        self.assertEqual(quota_card.reset_words(STARTUP_MENU.replace("at Nov 28 at 1pm", "whenever, key sk-1")), "")
+        self.assertEqual(quota_card.reset_words("2. Wait here, then continue automatically at 1pm\n"), "",
+                         "the option line alone, with no menu, is not read")
+
+    def test_every_queued_owner_task_at_the_startup_menu_gets_the_card_and_nothing_is_pressed(self):
+        for n in range(3):
+            self.task("task-s%d" % n, "message %d" % n)
+        # No DM room was ever remembered (the Mod never claimed anything behind the menu): the tasks name it.
+        self.assertEqual(quota_card.room(self.root), "")
+        self.assertEqual(self.tick(STARTUP_MENU), "quota-task-card x3")
+        queued = self.queued()
+        self.assertEqual(len(queued), 3, "one card per message, and no unasked card besides")
+        for q in queued:
+            self.assertEqual(q["room"], DM)
+            self.assertEqual(q["card"]["id"], account_switch.CARD)
+            self.assertEqual(q["card"][account_switch.CONTROLS], {"runtime": "claude"}, "the switch dropdown")
+            self.assertTrue(self.text_of(q).startswith(
+                "s…@example.com (Claude Code) has hit its usage limit; resets Nov 28, 1pm."), self.text_of(q))
+            self.assertNotIn("usage credits", self.text_of(q))
+        self.assertEqual(quota_card.room(self.root), DM)
+        # The messages stay queued for the session once the account is switched: none was answered here.
+        self.assertEqual(sorted(p.name for p in self.inbox.iterdir()), ["task-s0.txt", "task-s1.txt", "task-s2.txt"])
+        self.assertEqual(sorted(launcher.inbox.unanswered(self.root)), ["task-s0", "task-s1", "task-s2"])
+        for later in (5.0, 120.0, 3600.0):
+            self.assertEqual(self.tick(STARTUP_MENU, later), "", "each message is told once")
+        self.assertEqual(len(self.queued()), 3)
+        # A new message while the menu is still up is told too.
+        self.task("task-s3", "still there?")
+        self.assertEqual(self.tick(STARTUP_MENU, 5.0), "quota-task-card x1")
+        self.assertEqual(len(self.queued()), 4)
+
+    def test_a_limit_told_before_still_tells_each_new_message(self):
+        quota_card.remember_room(self.root, DM)
+        self.assertEqual(self.tick(TURN_MENU), "quota-card")
+        quota_card.save(self.root, dict(quota_card.load(self.root), told=True))
+        self.task("task-t1", "hello?")
+        self.assertEqual(self.tick(TURN_MENU, 30.0), "quota-task-card x1")
+        self.assertEqual(len(self.queued()), 2)
+
+    def test_a_new_session_is_a_new_incident(self):
+        quota_card.remember_room(self.root, DM)
+        self.assertEqual(self.tick(STARTUP_MENU), "quota-card")
+        quota_card.save(self.root, dict(quota_card.load(self.root), told=True))
+        self.assertEqual(self.tick(STARTUP_MENU, 30.0), "")
+        quota_card.new_session(self.root)    # the account switch restarted the session, onto a limited account
+        self.assertEqual(quota_card.room(self.root), DM, "the DM room is kept")
+        self.assertEqual(self.tick(STARTUP_MENU, 5.0), "quota-card")
+        self.assertEqual(len(self.queued()), 2)
+
+    def test_only_the_owners_own_unanswered_messages_get_it(self):
+        quota_card.remember_room(self.root, DM)
+        self.task("task-g", "hi", tier="guest")
+        self.task("task-c", "Switch account", click={"card_id": account_switch.CARD, "action": "switch"})
+        self.task("task-done", "answered already")
+        (self.results / "task-done.txt").write_text("[s.space] done\n")
+        self.task("task-r", "from a room", kind="room")
+        self.assertEqual(self.tick(STARTUP_MENU), "quota-task-card x1")
+        (only,) = self.queued()
+        self.assertEqual(only["room"], DM, "the owner's message in a room is told in their DM")
+        self.assertEqual(sorted(quota_card.load(self.root)["tasks"]), ["task-c", "task-g", "task-r"])
+        self.assertEqual(self.tick(STARTUP_MENU, 5.0), "")
+        self.assertEqual(len(self.queued()), 1)
+
+    def test_an_old_banner_in_view_tells_no_message(self):
+        quota_card.remember_room(self.root, DM)
+        self.task("task-o", "next question")
+        self.assertEqual(self.tick(OLD_BANNER), "quota-card", "the incident's own card, as before")
+        self.assertEqual(len(self.queued()), 1, "the message itself is not told")
+        self.assertEqual(quota_card.load(self.root).get("tasks") or {}, {})
+
+    def test_a_task_card_the_bridge_dropped_is_queued_again_once(self):
+        quota_card.remember_room(self.root, DM)
+        self.task("task-d", "hello")
+        self.assertEqual(self.tick(STARTUP_MENU), "quota-task-card x1")
+        first = quota_card.load(self.root)["tasks"]["task-d"]["qid"]
+        born = self.queued_at(first)
+        self.assertEqual(self.sweep(born + connector_cards.MAX_QUEUED_S + 1), [])
+        self.assertEqual(connector_cards.outcome(self.bridge, first), "dropped")
+        self.assertEqual(self.tick(STARTUP_MENU, quota_card.RETRY_S), "quota-task-card x1")
+        second = quota_card.load(self.root)["tasks"]["task-d"]["qid"]
+        self.assertNotEqual(second, first)
+        (sent,) = self.sweep(self.queued_at(second) + 1)
+        self.assertEqual(sent["room_id"], DM)
+        self.assertEqual(self.tick(STARTUP_MENU, 5.0), "")
+        self.assertEqual(self.queued(), [])
+
+    def test_a_restarted_supervisor_never_tells_a_message_twice(self):
+        quota_card.remember_room(self.root, DM)
+        self.task("task-k", "hello")
+        # A stop after the key was kept and before the queue id was: the same card, under the same key.
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("stopped")):
+            self.assertEqual(self.tick(STARTUP_MENU), "quota-not-posted")
+        self.assertEqual(self.queued(), [])
+        key = quota_card.load(self.root)["tasks"]["task-k"]["key"]
+        self.assertEqual(self.tick(STARTUP_MENU, quota_card.RETRY_S), "quota-task-card x1")
+        self.assertEqual(quota_card.load(self.root)["tasks"]["task-k"]["key"], key)
+        self.assertEqual(len(self.queued()), 1)
+
+
 class Supervisor(unittest.TestCase):
     """The launcher's tick hands the pane to the notice, logs each change once, and survives its failure."""
 
@@ -280,6 +430,10 @@ class Supervisor(unittest.TestCase):
         with mock.patch.object(quota_card, "notice", return_value=""):
             launcher.Launcher.quota(lc, QUIET)
         self.assertEqual(len(logs), 4)
+
+    def test_a_created_session_starts_a_new_incident(self):
+        source = Path(launcher.__file__).read_text()
+        self.assertIn("rec = self.retire_card()\n        try:\n            quota_card.new_session(self.root)", source)
 
     def test_the_ticks_observation_calls_it_with_the_pane(self):
         source = Path(launcher.__file__).read_text()

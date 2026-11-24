@@ -201,6 +201,17 @@ def live_inflight(root, inflight) -> dict:
     return live
 
 
+def unanswered(root) -> list:
+    """The ids of tasks/<id>.txt with no result of any kind yet (ABSENT), claimed or not, oldest name first.
+    A task whose result cannot be told apart (UNKNOWN, LIVE_UNREADY) is left out: it may be answered."""
+    tasks, results = Path(root) / "tasks", Path(root) / "results"
+    try:
+        names = sorted(p.name for p in tasks.iterdir() if p.suffix == ".txt" and not p.name.startswith("."))
+    except OSError:
+        return []
+    return [n[:-4] for n in names if lifecycle.classify(results, n[:-4]) == lifecycle.ABSENT]
+
+
 def card_matter(root, task_id, environ=None) -> "tuple[str, str]":
     """(outcome, answer) of a task that is a model-card matter (model_card.card_matter), ('', '') for any
     other task and whenever the card cannot be consulted: a task is never held back by the card."""

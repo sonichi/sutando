@@ -436,6 +436,10 @@ class Launcher:
         if problem:
             return False, problem
         rec = self.retire_card()
+        try:
+            quota_card.new_session(self.root)     # this session's account may be at its limit too: told anew
+        except Exception as e:  # noqa: BLE001 - advisory
+            self.log("quota: new session not recorded (%s: %s)" % (type(e).__name__, str(e)[:120]))
         nonce = os.urandom(16).hex()
         generation, problem = create_session(self.tm, self.cfg, self.config_dir, self.root, nonce, self.environ, self.run)
         if generation is None:
@@ -481,7 +485,8 @@ class Launcher:
         return rec
 
     def quota(self, text: str) -> None:
-        """The usage-limit banner on the pane: the owner is told once, with the account card (quota_card).
+        """The usage-limit banner or Claude Code's limit menu on the pane: the owner is told, with the account
+        card, once per limit and on each of their messages left unanswered (quota_card).
         A notice that cannot be sent never stops the supervisor."""
         try:
             done = quota_card.notice(self.root, self.cfg, detector.abnormal_names(text), text,

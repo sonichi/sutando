@@ -21,6 +21,11 @@ STALL_MIN_S = 600.0
 ABNORMAL_MIN_S = 60.0
 INFLIGHT_PHASES = frozenset(("CALLING", "TURN_CONFIRMED"))
 _DECOR = re.compile(r"^[\s>·─-╿✓✗✻✳⏵⎿⣀-⣿]+")
+# Claude Code's own limit menu ("What do you want to do? ❯ 1. Stop and wait for limit to reset 2. Wait here,
+# then continue automatically at ... 3. Switch to usage credits"), shown at startup on an account already at
+# its limit or when a turn hits it. It carries no banner line of its own, so it is a limit by itself; nothing
+# here answers it (picking "usage credits" would spend the owner's money).
+LIMIT_MENU = re.compile(r"^[\s>❯]*\d+\.\s+Stop and wait for (?:the )?(?:usage )?limit to reset\b", re.M | re.I)
 
 
 def frame_hash(text: str) -> str:
@@ -31,8 +36,10 @@ def abnormal_names(text: str) -> list:
     """The banner families whose pattern leads a line of the capture (prose mid-line never counts)."""
     lines = [_DECOR.sub("", ln) for ln in text.splitlines()]
     waiting = trust.dialog(text)
-    return [name for name, rx in ABNORMAL_PATTERNS if any(rx.match(ln) for ln in lines)] + (
-        ["dialog:" + waiting] if waiting else [])
+    names = [name for name, rx in ABNORMAL_PATTERNS if any(rx.match(ln) for ln in lines)]
+    if "quota-limit" not in names and LIMIT_MENU.search(text):
+        names.insert(0, "quota-limit")
+    return names + (["dialog:" + waiting] if waiting else [])
 
 
 def inflight_task(plugin: dict) -> "str | None":
