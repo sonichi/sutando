@@ -527,23 +527,28 @@ def recovery_card(workspace: Path, session: Optional[str], supervisor: dict, rec
             return None
         manager = HitlManager(HitlStore(root))
         guard = _recovery_guard(session, supervisor)
+        crash_loop = record.get("state") == "crash_loop"
         matches = []
-        for req in manager.active():
-            subject = req.subject or {}
-            if (subject.get("session") != session or subject.get("seat") or subject.get("recovery") is not True
-                    or req.decided_by == POLICY_DECIDER):
-                continue
-            source = subject.get("source")
-            if source == "tui":
-                current = record.get("state") != "crash_loop" and req.guard == guard
-            else:
-                current = (source == "crash-loop" and subject.get("crash_loop") == "core"
-                           and subject.get("incident") == record.get("incident"))
-            if not current:
-                continue
-            identity = _card({"hitl_id": req.id, **manager.store.projection(req.id)})
-            if identity:
-                matches.append((req.updated_at, req.id, identity))
+        # Under the store lock each requirement and its ledger are one snapshot: a card is named
+        # only at the requirement's own revision, never an earlier one whose actions may be stale.
+        with manager.store.locked():
+            for req in manager.active():
+                subject = req.subject or {}
+                if (subject.get("session") != session or subject.get("seat")
+                        or subject.get("recovery") is not True or req.decided_by == POLICY_DECIDER):
+                    continue
+                source = subject.get("source")
+                if source == "tui":
+                    current = not crash_loop and req.guard == guard
+                else:
+                    current = (crash_loop and source == "crash-loop" and subject.get("crash_loop") == "core"
+                               and subject.get("incident") == record.get("incident"))
+                ledger = manager.store.projection(req.id)
+                if not current or ledger.get("revision") != req.revision:
+                    continue
+                identity = _card({"hitl_id": req.id, **ledger})
+                if identity:
+                    matches.append((req.updated_at, req.id, identity))
         return max(matches)[2] if matches else None
     except Exception:  # noqa: BLE001 -- a recovery record remains useful without its optional card pointer
         return None

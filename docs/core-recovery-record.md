@@ -60,7 +60,9 @@ older than 5 minutes, larger than 4 KiB or outside the schema as absent.
   gave one).
 - `card`, when the current recovery episode has reached s.space, names that live HITL projection:
   its requirement id, projected revision and Matrix event id. The complete object is omitted while
-  projection is pending or when any member is malformed; readers need not scan room history.
+  projection is pending (a card projected at an earlier revision of the requirement is not named)
+  or when any member is malformed; readers need not scan room history. The crash-loop card is
+  named only while `state` is `crash_loop`.
 - `actions` come from a fixed set (`retry_now`, `switch_model`, `switch_runtime`, `restart_core`,
   `escape_prompt`, `refresh_options`), filtered to what the core's runtime can carry out (below).
   `switch_models` are keys of the runtime's own model list (with `model_labels`, its words), the
