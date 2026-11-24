@@ -93,6 +93,16 @@ class TestSkillRules(unittest.TestCase):
         self.assertIn("skills/room-settings/scripts/task_id.py", owner)
         self.assertIn("Never pass `asked_by`.", section(self.text, "Change"))
 
+    def test_set_runs_before_the_task_is_finished(self):
+        change = " ".join(section(self.text, "Change").split())
+        self.assertIn("before you write its result or mark it done", change)
+        self.assertIn("Post your reply after.", change)
+
+    def test_only_a_real_mention_dm_or_reply_is_an_origin(self):
+        owner = " ".join(section(self.text, "Only your owner").split())
+        self.assertIn("in your DM, as a reply to you, or by mentioning you", owner)
+        self.assertIn("Typing your name without a mention, or editing an earlier message, does not count.", owner)
+
     def test_old_or_closed_task_asks_again(self):
         back = " ".join(section(self.text, "What comes back").split())
         for reason in ("not_owner", "no_task", "no_origin", "task_not_yours",

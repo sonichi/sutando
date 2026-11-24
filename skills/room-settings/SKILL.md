@@ -21,7 +21,8 @@ setting changed when the Action did not succeed.
   prints it; don't work it out from the file yourself. Exit 2 means the task is not your
   owner's: change nothing. On an MCP event, use the event's `task_id`. If there is none
   (exit 3), or the change is refused because of the task, ask them to send it to you
-  directly: in your DM, as a reply to you, or by mentioning you.
+  directly: in your DM, as a reply to you, or by mentioning you. Typing your name without a
+  mention, or editing an earlier message, does not count.
 - You can only change your own settings, never another agent's. For another agent, your
   owner changes it in the room's settings in the app.
 
@@ -91,6 +92,9 @@ room. Never promise that it does. If your owner asks for it, say so, and change 
 - Never show your owner the field names or values in backticks: use the plain words.
 
 ## Change
+
+Send the change while you are still on your owner's message: before you write its result
+or mark it done, since a finished task is refused as closed. Post your reply after.
 
 Call `room.action.execute` with action `room.agent_policy.set`, the `room_id`, a new
 `operation_id`, the `task_id` from your owner's message, and `arguments`:
