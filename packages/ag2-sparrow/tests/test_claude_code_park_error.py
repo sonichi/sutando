@@ -38,7 +38,7 @@ class ParkError(ConnectBase):
             rc = cli.main(["inbox", "--root", self.root, *args])
         return rc, json.loads(out.getvalue())
 
-    def confirmed(self, task_id, headers="access_tier: owner\n"):
+    def confirmed(self, task_id, headers="access_tier: owner\nchannel_kind: dm\n"):
         (self.inbox / (task_id + ".txt")).write_text("id: %s\n%stask: hi\n" % (task_id, headers))
         self.assertEqual(self.verb("claim", task_id)[0], 0)
         token = self.verb("authorize", task_id, "1", "--text-hash", "h")[1]["token"]
@@ -65,20 +65,24 @@ class ParkError(ConnectBase):
         self.assertIn("ended without a reply (turn aborted without a reply)", body)
         self.assertNotIn("not an error", body)
 
-    def test_the_reason_reaches_only_the_owner_and_an_unknown_sender_fails_closed(self):
+    def test_the_reason_reaches_only_the_owner_in_a_dm_and_anything_unknown_fails_closed(self):
         generic = "ended without a reply (turn error without a reply)"
-        collab = self.confirmed("task-c1", "access_tier: team\ncollaborator: true\n")
-        unknown = self.confirmed("task-u1")
-        (self.inbox / (unknown + ".txt")).unlink()
-        for t in (collab, unknown):
+        room = self.confirmed("task-r1", "access_tier: owner\nchannel_kind: room\n")
+        no_kind = self.confirmed("task-k1", "access_tier: owner\n")
+        collab = self.confirmed("task-c1", "access_tier: team\ncollaborator: true\nchannel_kind: dm\n")
+        gone = self.confirmed("task-u1")
+        (self.inbox / (gone + ".txt")).unlink()
+        for t in (room, no_kind, collab, gone):
             rc, out = self.verb("park", t, "turn-1", "--detail", "turn error without a reply", "--error-stdin",
                                 stdin=b"Credit balance is too low\n")
             self.assertEqual((rc, out["outcome"]), (0, "settled"), t)
             body = (self.results / (t + ".txt")).read_text()
             self.assertIn(generic, body, t)
             self.assertNotIn("Credit balance", body, t)
-        self.assertIsNone(inbox._asker_tier(self.root, unknown))
-        self.assertEqual(inbox._asker_tier(self.root, collab), "team")
+        self.assertEqual(inbox._audience(self.root, gone), (None, None))
+        self.assertEqual(inbox._audience(self.root, collab), ("team", "dm"))
+        self.assertEqual(inbox._audience(self.root, room), ("owner", "room"))
+        self.assertEqual(inbox._audience(self.root, no_kind), ("owner", None))
 
     def test_park_called_directly_takes_the_error_argument(self):
         t = self.confirmed("task-p1")

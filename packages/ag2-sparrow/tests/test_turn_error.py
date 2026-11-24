@@ -23,10 +23,39 @@ class ErrorLineTest(unittest.TestCase):
         self.assertEqual(turn_error.error_line("You've hit your usage limit.\n  Try again later."),
                          "You've hit your usage limit. Try again later.")
 
-    def test_only_the_owner_reads_the_cause(self):
-        self.assertEqual(turn_error.owner_reason("owner", "Credit balance is too low"), "Credit balance is too low")
+    def test_only_the_owner_in_a_dm_reads_the_cause(self):
+        why = "Credit balance is too low"
+        self.assertEqual(turn_error.owner_reason("owner", "dm", why), why)
+        self.assertEqual(turn_error.owner_reason("owner", " DM ", why), why)
         for tier in ("team", "guest", "other", None, "", "Owner "):
-            self.assertEqual(turn_error.owner_reason(tier, "Credit balance is too low"), "", tier)
+            self.assertEqual(turn_error.owner_reason(tier, "dm", why), "", tier)
+        for kind in ("room", None, "", "group", "dm-ish"):
+            self.assertEqual(turn_error.owner_reason("owner", kind, why), "", kind)
+
+    def test_slash_commands_and_plain_word_values_are_kept(self):
+        for kept in ("Invalid API key · Please run /login", "OAuth token has expired. Please run /login",
+                     "Usage limit reached; try /status or /upgrade", "Token: expired",
+                     "Error: 401 Unauthorized - token: invalid_grant", "Please reauth: run codex login",
+                     "Your API key: is invalid", "Missing bearer or basic authentication in header",
+                     "prompt is too long: 215000 tokens > 200000 maximum"):
+            self.assertEqual(turn_error.error_line(kept), kept)
+
+    def test_the_second_review_leftovers_are_removed(self):
+        cases = {
+            "file:/Users/alice/a.txt": "<path>",
+            "open:/Users/alice/x": "open:<path>",
+            "/Users/alice/Documents/secret plan.txt": "<path>",
+            "Cookie: session=abcd1234efgh5678ijkl": "Cookie: [REDACTED]",
+            "pwd=hunter2pass": "pwd=[REDACTED]",
+            "pass: hunter2pass": "pass: [REDACTED]",
+            "session_id=a1b2c3d4e5f6": "session_id=[REDACTED]",
+            'api_key = "abc def ghi"': 'api_key = "[REDACTED]"',
+            "api_key=abc,def1234567890": "api_key=[REDACTED]",
+            "https://tokenonly@host.example/x": "https://[REDACTED]@host.example/x",
+            "https://user:pa/ss@host.example/": "https://[REDACTED]@host.example/",
+        }
+        for message, want in cases.items():
+            self.assertEqual(turn_error.error_line(message), want, message)
 
     def test_nothing_usable_is_empty(self):
         for message in (None, "", "  \n\t", {"message": "x"}, 3):
