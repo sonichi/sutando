@@ -275,15 +275,23 @@ def is_worker_card_lane(instance: str, worker: str, workspace=None, room_id: str
     return row is not None and instance in [str(row["instance"])] + alias_instances(row)
 
 
+def note_lane(worker: str, room_id: str = "", workspace=None):
+    """The identity row whose lane posts `worker`'s note bound for `room_id`, or None when none can: a room
+    names its server's serving identity; a note naming no server goes to the home lane."""
+    from connections import server_of_room, worker_identity, _serving
+    server = server_of_room(room_id or "")
+    if not server:
+        return primary_identity(worker, workspace)
+    row = worker_identity(worker, workspace, server=server)
+    return row if row is not None and _serving(row) else None
+
+
 def is_worker_note_lane(instance: str, worker: str, room_id: str = "", workspace=None) -> bool:
     """Room-addressed notes use only that server's serving identity, so with none they stay unclaimed;
     notes naming no server use the home lane."""
-    from connections import server_of_room, worker_identity, _serving, alias_instances
-    server = server_of_room(room_id or "")
-    if not server:
-        return is_worker_home_lane(instance, worker, workspace)
-    row = worker_identity(worker, workspace, server=server)
-    return row is not None and _serving(row) and instance in [str(row["instance"])] + alias_instances(row)
+    from connections import alias_instances
+    row = note_lane(worker, room_id, workspace)
+    return row is not None and instance in [str(row["instance"])] + alias_instances(row)
 
 
 def claim_gate(worker: str, *, instance: str = "", workspace=None, route=None):

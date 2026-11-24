@@ -469,6 +469,12 @@ def card_has_lane(worker: str, room: str, ws: Path) -> bool:
     return card_lane(worker, room, ws) is not None
 
 
+def note_has_lane(worker: str, room: str, ws: Path) -> bool:
+    """Whether one of `worker`'s serving lanes claims its text note bound for `room` (`worker_lane.note_lane`)."""
+    from worker_lane import note_lane  # noqa: PLC0415
+    return note_lane(worker, room, ws) is not None
+
+
 def build_card(ask_id: str, question: str, context: Optional[str], host: str,
                default_action: Optional[str], reason: Optional[str], options,
                link: Optional[str] = None, intro: Optional[str] = None, room: str = "",
@@ -530,7 +536,7 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
     out = {"ask_id": ask_id, "heading": entry_heading(question, now), "workspace": str(ws), "host": host,
            "bridge": None, "channel": None, "where": None, "proactive_file": None, "send_error": None,
            "card": None, "card_error": None,
-           "sent_line": None, "outbox": None, "outbox_error": None,
+           "sent_line": None, "undeliverable": None, "outbox": None, "outbox_error": None,
            "question": question_dict(ask_id, question, context, now, default_action, reason, options, priority)}
     dest = Destination()
     if task_file:
@@ -575,6 +581,7 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
 
 def _ask_by_text(out: dict, question, context, host, dest, link, intro, as_session: bool = True) -> None:
     """`as_session` False keeps the core's name: a question first asked by the core's card stays the core's."""
+    from proactive_routing import proactive_worker  # noqa: PLC0415
     ws, name, who, err = Path(out["workspace"]), None, None, None
     try:
         name = proactive_filename(out["ask_id"], dest.bridge)
@@ -589,6 +596,13 @@ def _ask_by_text(out: dict, question, context, host, dest, link, intro, as_sessi
     out["where"] = (f"{dest.bridge} {dest.channel}" if routed else
                     f"{dest.bridge} owner-dm" if dest.bridge else "owner-dm (last-active bridge)")
     out["card"] = None
+    worker = proactive_worker(name or "") if err is None and as_session else ""
+    if worker and not note_has_lane(worker, dest.channel if routed else "", ws):
+        # A note no lane claims would sit in results/ unsent: nothing is queued.
+        out["undeliverable"] = (f"no serving lane of worker {worker} reaches {out['where']}, "
+                                "so nothing was queued")
+        err = f"UNDELIVERABLE: {out['undeliverable']}"
+        print(f"pending_questions_ask: {out['ask_id']} {err}", file=sys.stderr)
     if err is None:
         try:
             write_proactive(ws / "results", name, body)
@@ -693,11 +707,15 @@ def report_lines(out: dict) -> list:
     elif out.get("proactive_file"):
         lines.append(f"sent: queued {out['where']} via results/{out['proactive_file']} "
                      "(a bridge drain delivers it; the reminder re-raises an undrained file)")
+    elif out.get("undeliverable"):
+        lines.append(f"sent: FAILED, UNDELIVERABLE — {out['undeliverable']} (the record stands; ask by hand)")
     else:
         lines.append(f"sent: FAILED — {out.get('send_error')} (the record stands; ask by hand)")
     if out.get("send_error") and (out.get("proactive_file") or out.get("card")):
         lines.append(f"note: {out['send_error']}")
-    if out.get("card_error"):
+    if out.get("card_error") and out.get("undeliverable"):
+        lines.append(f"note: decision card not used ({out['card_error']}); not asked as text either")
+    elif out.get("card_error"):
         lines.append(f"note: decision card not used ({out['card_error']}); asked as text instead")
     if out.get("card_note"):
         lines.append(f"note: {out['card_note']}; kept as the decision card, and no text was sent")

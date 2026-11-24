@@ -32,7 +32,7 @@ from pathlib import Path
 from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
-for p in (REPO / "src", REPO / "skills" / "pending-questions" / "scripts"):
+for p in (REPO / "src", REPO / "skills" / "pending-questions" / "scripts", REPO / "packages" / "ag2-sparrow"):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
@@ -297,6 +297,51 @@ class StoreAdapterAsk(_Ws):
         [name] = self.proactive()
         self.assertEqual(pr.proactive_worker(name), W, "the fallback goes through the worker's own lane")
         self.assertEqual(out["question"]["asked_by"], AGENT)
+
+
+class UnreachableDestination(_Ws):
+    """The worker serves only alpha: a question bound for a room on another server has no lane to post it,
+    so nothing is queued and the caller hears it is undeliverable; a reachable room is unchanged."""
+
+    def headers(self, room):
+        return f"access_tier: owner\nsource: ag2space\nchannel_id: {room}\nchannel_kind: dm\n"
+
+    def gates(self):
+        import worker_lane as L
+        from ag2_sparrow import delivery_destination
+        lanes = [r["instance"] for r in json.loads(C.record_path(self.ws).read_text())["connections"]]
+        return {i: L.claim_gate(W, instance=i, workspace=self.ws, route=delivery_destination.route) for i in lanes}
+
+    def ask(self, room, **kw):
+        with self.as_worker():
+            return room_db.ask_owner("Merge #12 now?", urgency="durable", workspace=self.ws, host=HOST,
+                                     store=None, task_file=self.task(self.headers(room)), **kw)
+
+    def test_no_serving_lane_queues_nothing_and_reports_undeliverable(self):
+        for label, kw in (("card", {"default_action": "merge", "options": [("Hold", "wait")]}), ("text", {})):
+            with self.subTest(label), contextlib.redirect_stderr(io.StringIO()) as err:
+                out = self.ask("!dm:gamma-fixture.test", **kw)
+                self.assertEqual(self.proactive(), [], "no note that no lane would claim")
+                self.assertIsNone(out["proactive_file"])
+                self.assertIsNone(out.get("card"))
+                self.assertIn("no serving lane", out["undeliverable"])
+                lines = "\n".join(room_db.report_lines(out))
+                self.assertIn("sent: FAILED, UNDELIVERABLE", lines)
+                self.assertNotIn("asked as text instead", lines)
+                self.assertIn("UNDELIVERABLE", err.getvalue(), "the refusal is logged")
+        note = self.ws / "results" / f"proactive-9.by-{W}.txt"
+        note.write_text("[channel: !dm:gamma-fixture.test]\nhello\n")
+        self.assertEqual([i for i, gate in self.gates().items() if gate(note)], [],
+                         "the note the fallback used to queue: no lane claims it")
+
+    def test_a_reachable_room_is_queued_and_claimed_once_by_the_workers_lane(self):
+        out = self.ask("!dm:alpha-fixture.test")
+        [name] = self.proactive()
+        self.assertIsNone(out["undeliverable"])
+        self.assertEqual(out["proactive_file"], name)
+        lane = C.worker_instance_for("alpha-fixture.test", W)
+        self.assertEqual([i for i, gate in self.gates().items() if gate(self.ws / "results" / name)], [lane])
+        self.assertIn("sent: queued", "\n".join(room_db.report_lines(out)))
 
 
 class NoStoreAsk(_Ws):
