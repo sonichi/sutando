@@ -94,8 +94,9 @@ your owner asks for it, say so, and change nothing.
   start working with you, so say that when your owner asks for it. You can't give it to one
   person, and it still keeps out anyone blocked or not on a "specific people" list. Say too
   what Team means here: Team members can have you use your owner's workspace, tools,
-  connected accounts, saved keys and network, and the only check is on what you send back.
-  It is for rooms whose members your owner trusts with all of that.
+  connected accounts, saved keys and network. Your normal permission and approval rules
+  still apply to them, and what you send back gets an extra check for secrets. It is for
+  rooms whose members your owner trusts with all of that.
   It also needs your owner to have made you able to work with a Team; if the change is
   refused as `CONFLICT` for that, say so.
 - Turning the secrets check off only matters with Team access, and only for members you

@@ -206,8 +206,10 @@ class TestSkillRules(unittest.TestCase):
 
     def test_team_says_what_it_reaches_and_guest_has_no_research(self):
         settings = " ".join(section(self.text, "The settings").split())
-        self.assertIn("your owner's workspace, tools, connected accounts, saved keys and network, and the "
-                      "only check is on what you send back", settings)
+        self.assertIn("your owner's workspace, tools, connected accounts, saved keys and network.", settings)
+        self.assertIn("Your normal permission and approval rules still apply to them, and what you send back "
+                      "gets an extra check for secrets.", settings)
+        self.assertNotIn("the only check", settings)
         self.assertIn("Guest access only lets you answer, explain and draft for them", settings)
         self.assertNotIn("research", settings)
 
