@@ -586,62 +586,59 @@ class AwaitSignIn(Base):
                           sleep=self.clock.sleep, clock=self.clock)
         return rc, json.loads(out.getvalue()), ops
 
-    def test_a_hand_off_that_did_not_start_and_could_not_be_said_stays_on_record_until_it_is(self):
-        # Another switch is admitted, and the room is unreachable: the refusal is not delivered.
+    def test_a_hand_off_that_did_not_start_is_an_outcome_on_record_and_only_its_delivery_is_retried(self):
+        # Another switch is admitted, and the room is unreachable: the refusal is decided, not delivered.
         self.stopped_after_claiming("switching", switch="7-abc")
         self.admitted("9-other")
         rc, out, ops = self.offline_wait()
-        self.assertEqual((rc, out["status"], out["told"], out["kept"]), (1, "say", "failed", "switching"))
-        self.assertEqual(json.loads(self.ws.joinpath(*rtc.WAITING).read_text())["phase"], "switching")
-        # The worker cannot be spawned, and neither the "Switching" edit nor its correction gets through.
+        self.assertEqual((rc, out["status"], out["told"], out["kept"]), (1, "say", "failed", "refused"))
+        kept = json.loads(self.ws.joinpath(*rtc.WAITING).read_text())
+        self.assertEqual((kept["phase"], kept["words"]), ("refused", rtc.BUSY), "the exact words, before sending")
+        # By the next waiter the other switch is over and a sign-in is there: it still only tells the card.
         self.ws.joinpath(*rtc.RUNNING).unlink()
-        self.launch.fail = OSError("no fork")
-        rc, out, ops = self.offline_wait()
-        self.assertEqual((rc, out["status"], out["told"], out["kept"]), (1, "failed", "failed", "switching"))
-        self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists(), "the attempt is released")
-        self.assertEqual(json.loads(self.ws.joinpath(*rtc.WAITING).read_text())["switch"], "7-abc")
-        # The next waiter, with the room back and a worker that starts: the same attempt goes through.
-        self.launch.fail = None
+        self.claude_json = {"loggedIn": True}
         rc, out = self.wait()
-        self.assertEqual((rc, out["status"], out["attempt"]), (0, "started", "7-abc"))
+        self.assertEqual((rc, out["status"], out["told"]), (1, "refused", "posted"))
+        self.assertEqual((self.launch.calls, self.restarts), ([], []), "the switch is not started after all")
+        self.assertEqual(self.fake.edits()[-1], ("$card2", "Core runtime: " + rtc.BUSY))
+        self.assertEqual(self.fake.calls[-1][2], f"runtime-card:signin:{self.attempt}:not-switched-edit")
+        self.assertIn(self.fake.calls[-1][2], ops, "the same operation id as the tries that failed")
         self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists())
 
-    def test_a_switch_whose_worker_cannot_be_started_does_not_leave_the_card_saying_switching(self):
-        self.claude_json = {"loggedIn": True}
+    def test_a_refusal_the_card_service_applied_without_a_receipt_is_told_again_never_switched(self):
+        self.stopped_after_claiming("switching", switch="7-abc")
+        self.admitted("9-other")
+        applied = []
+
+        def applied_then_lost(action, arguments, *, operation_id, room_id):
+            applied.append((operation_id, arguments.get("body")))     # the service did it; the answer never came
+            raise ac.CardError("timed out")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rtc.main(["--workspace", str(self.ws), "await-sign-in", "--room", DM, "--runtime", "claude",
+                      "--attempt", self.attempt], core=CORE, popen=self.launch, run=self.claude_run,
+                     execute=applied_then_lost, codex_read=self.codex_read, restart=self.restart,
+                     sleep=self.clock.sleep, clock=self.clock)
+        self.assertEqual(json.loads(out.getvalue())["kept"], "refused")
+        self.ws.joinpath(*rtc.RUNNING).unlink()
+        rc, again = self.wait()
+        self.assertEqual((again["status"], self.launch.calls), ("refused", []))
+        edits = {(op, body) for op, body in applied if op.endswith("-edit")}
+        self.assertEqual(edits, {(self.fake.calls[-1][2], self.fake.calls[-1][1]["body"])},
+                         "one operation id, one text, on every try")
+
+    def test_a_worker_that_cannot_start_and_a_correction_that_cannot_be_sent_leave_that_outcome_on_record(self):
+        self.stopped_after_claiming("switching", switch="7-abc")
         self.launch.fail = OSError("no fork")
-        rc, out = self.tap("Switch the core to Claude Code")
-        self.assertEqual((out["status"], out["say"], out["told"]), ("failed", rtc.FAILED_TO_START, "posted"))
-        words = [w for _, w in self.fake.edits()]
-        self.assertIn("Switching the core from Codex to Claude Code", words[-2])
-        self.assertEqual(words[-1], "Core runtime: " + rtc.FAILED_TO_START)
-        self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists(), "released: she can tap again")
-
-    def test_last_words_that_could_not_be_delivered_keep_the_phase_and_are_said_by_the_next_waiter(self):
-        for phase, status in (("expired", "gave_up"), ("already", "already")):
-            with self.subTest(phase=phase):
-                rtc.set_wait(self.ws, {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": self.clock.t,
-                                       "card": "$card2"})
-                self.stopped_after_claiming(phase)
-                ops = []
-
-                def offline(action, arguments, *, operation_id, room_id):
-                    ops.append(operation_id)
-                    raise ac.CardError("offline")
-                out = io.StringIO()
-                with contextlib.redirect_stdout(out):
-                    rc = rtc.main(["--workspace", str(self.ws), "await-sign-in", "--room", DM, "--runtime", "claude",
-                                   "--attempt", self.attempt], core=CORE, popen=self.launch, run=self.claude_run,
-                                  execute=offline, codex_read=self.codex_read, restart=self.restart,
-                                  sleep=self.clock.sleep, clock=self.clock)
-                first = json.loads(out.getvalue())
-                self.assertEqual((rc, first["status"], first["kept"]), (1, status, phase))
-                self.assertEqual(json.loads(self.ws.joinpath(*rtc.WAITING).read_text())["phase"], phase, "not delivered: kept")
-                self.assertGreaterEqual(len(ops), rtc.POST_TRIES, "it tried more than once before leaving it")
-                rc, again = self.wait()             # the next waiter, with the room reachable
-                self.assertEqual(again["status"], status)
-                self.assertEqual(self.fake.edits()[-1][0], "$card2")
-                self.assertIn(self.fake.calls[-1][2], ops, "the same operation id as the failed delivery")
-                self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists())
+        rc, out, ops = self.offline_wait()
+        self.assertEqual((rc, out["status"], out["told"], out["kept"]), (1, "failed", "failed", "refused"))
+        self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists(), "the attempt is released")
+        self.assertEqual(json.loads(self.ws.joinpath(*rtc.WAITING).read_text())["words"], rtc.FAILED_TO_START)
+        self.launch.fail = None
+        rc, out = self.wait()
+        self.assertEqual((out["status"], self.launch.calls), ("refused", []))
+        self.assertEqual(self.fake.edits()[-1], ("$card2", "Core runtime: " + rtc.FAILED_TO_START))
+        self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists())
 
     def test_a_waiter_stopped_before_its_last_words_leaves_them_for_the_next_to_say(self):
         for phase, status, said in (("expired", "gave_up", "I stopped waiting for the Claude Code sign-in"),

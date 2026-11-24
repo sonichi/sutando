@@ -566,7 +566,18 @@ def _await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, r
         rec = _read_json(ws.joinpath(*WAITING))
         return rec if {k: rec.get(k) for k in mine} == mine else None
 
-    def conclude(phase: str, card_event: str, switch: str, resumed: bool = False) -> int:
+    def refuse(card_event: str, words: str, out: dict) -> int:
+        """The switch is not happening, in `words`, which are already on record with the `refused` phase:
+        deliver exactly those, under one operation id, and remove the wait on a delivery receipt."""
+        out["told"] = _answer(ws, args.room, card_event, "error", "Not switched", words,
+                              f"runtime-card:signin:{args.attempt}:not-switched", core=core, execute=execute,
+                              tries=POST_TRIES, sleep=sleep)["status"]
+        if out["told"] != "posted":
+            return _emit(dict(out, kept="refused"), 1)
+        finish_wait(ws, mine)
+        return _emit(out, 1)
+
+    def conclude(phase: str, card_event: str, switch: str, resumed: bool = False, words: str = "") -> int:
         """Carry out a claimed step and remove the wait only once it is done: the switch's worker
         launched, or the card's last words delivered. Each is safe to do twice: the card edits carry the
         attempt's own operation ids, and a second worker for one attempt is refused by its execution lock."""
@@ -585,6 +596,9 @@ def _await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, r
                     return _emit(dict(out, kept="already"), 1)      # not said yet: the phase stays for the next waiter
             finish_wait(ws, mine)
             return _emit(out)
+        if phase == "refused":      # decided by a waiter before this one: only the delivery is left
+            return refuse(card_event, words, {"status": "refused", "runtime": args.runtime, "say": words,
+                                              "after_sign_in": True})
         if phase == "expired":
             words = SIGN_IN_GAVE_UP.format(name=name(args.runtime), minutes=SIGN_IN_WAIT_S // 60, was=name(runtime()))
             posted = _answer(ws, args.room, card_event, "error", "Not switched", words,
@@ -619,16 +633,14 @@ def _await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, r
         if out["status"] == "started":
             finish_wait(ws, mine)
             return _emit(out)
-        # Not started (another switch under way, or it could not be admitted or launched): this waiter's
-        # output goes to a log, so the card is told, and the claim stays until it has been.
-        if out.get("told") != "posted":
-            out["told"] = _answer(ws, args.room, card_event, "error", "Not switched", out["say"],
-                                  f"runtime-card:signin:{args.attempt}:not-switched", core=core, execute=execute,
-                                  tries=POST_TRIES, sleep=sleep)["status"]
-        if out["told"] != "posted":
-            return _emit(dict(out, kept="switching"), 1)
-        finish_wait(ws, mine)
-        return _emit(out, 1)
+        # Not started: that is this attempt's outcome. Its exact words go on record before the card is
+        # told, so a waiter resumed after a lost receipt repeats the telling and never the switch.
+        if out.get("told") == "posted":
+            finish_wait(ws, mine)
+            return _emit(out, 1)
+        if not claim_wait(ws, mine, "refused", words=out["say"]):
+            return _emit(superseded)
+        return refuse(card_event, out["say"], out)
 
     while True:
         rec = waited()
@@ -636,9 +648,10 @@ def _await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, r
             return _emit(superseded)
         deadline = float(rec.get("ts") or 0) + SIGN_IN_WAIT_S
         card_event = str(rec.get("card") or "")
-        if rec.get("phase") in ("already", "expired", "switching"):
+        if rec.get("phase") in ("already", "expired", "switching", "refused"):
             # Claimed by a waiter that was stopped before it finished.
-            return conclude(rec["phase"], card_event, str(rec.get("switch") or ""), resumed=True)
+            return conclude(rec["phase"], card_event, str(rec.get("switch") or ""), resumed=True,
+                            words=str(rec.get("words") or ""))
         if runtime() == args.runtime:
             return conclude("already", card_event, "") if claim_wait(ws, mine, "already") else _emit(superseded)
         there = signed_in(args.runtime, run=run, codex_read=codex_read) is True     # may take a while
