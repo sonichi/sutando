@@ -679,8 +679,8 @@ class Connector:
         if caps is None:                        # else the gate's decision, which the caller has
             policy = turn_policy(headers, allow_non_owner=True)
             caps, kind = policy.capabilities, policy.kind
-        durable = caps.session == "durable"
-        for attempt in (1, 2):
+        durable, fallback = caps.session == "durable", None
+        for attempt in (1, 2, 3):
             try:
                 self.open_for(headers, caps)
             except IntegrationsUnknown as e:
@@ -693,8 +693,17 @@ class Connector:
                 # The turn reads its own folder only: this task's own attachments are copied into it.
                 staged = stage_own_attachments(headers, self.scratch_cwd, getattr(self.args, "media_root", None))
                 turn_prompt = with_staged_paths(prompt, staged)
-            self.turn_ran_on = self.turn_model(caps, kind)
+            self.turn_ran_on = fallback or self.turn_model(caps, kind)
             status, text, err = self.run_turn(turn_prompt, self.turn_ran_on, self.turn_cwd(caps))
+            if status == "failed" and model_refused(err) and fallback is None:
+                # A kept thread goes on with the model it last ran, whatever this turn passed: the account's own
+                # default is named outright, once, and kept as the owner's pick so the next turn runs on it too.
+                fallback = self.account_default_model(self.turn_ran_on)
+                if fallback:
+                    log("model refused for this account; running the turn again on its default", fallback)
+                    if kind == OWNER and durable and getattr(self.args, "state", None) and self.models.ok(fallback):
+                        self.models.save(wanted=fallback, confirmed="", told="")
+                    continue
             if status == "server-exited":
                 self.restart_server()
                 if durable and attempt == 1:
@@ -723,6 +732,18 @@ class Connector:
             head = "Codex ended this task with status %s." % status
         partial = (text or "").strip()
         return head + ("\n\nPartial reply:\n" + partial if partial else "")
+
+    def account_default_model(self, refused) -> str:
+        """The model the signed-in account runs by default, as the server lists it now ('' when it will not say,
+        names none, or names the one just refused)."""
+        try:
+            offered = self.rpc.request("model/list", {"limit": 100}).get("data") or []
+        except (RuntimeError, TimeoutError) as e:
+            log("model/list failed:", str(e)[:200])
+            return ""
+        usable = (m for m in offered if isinstance(m, dict) and m.get("isDefault") and not m.get("hidden"))
+        default = str(next((m.get("id") for m in usable), "") or "")
+        return default if default != str(refused or "") else ""
 
     def model_refused_words(self) -> str:
         """The account signed in cannot run the model the turn asked for (an account switched under a pick made

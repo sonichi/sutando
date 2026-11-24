@@ -1690,6 +1690,32 @@ class EdgePathTest(unittest.TestCase):
         for other in (None, "", {"message": "rate limited"}, {"message": "the model answered nothing"}):
             self.assertFalse(cc.model_refused(other), other)
 
+    def test_a_refused_model_is_run_again_on_the_accounts_default_and_that_default_is_kept(self):
+        # The first fix passed no model and the kept thread went on with gpt-6-astra: every turn failed the same way.
+        refused = {"message": "The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account.",
+                   "codexErrorInfo": "modelNotFound"}
+        with tempfile.TemporaryDirectory() as d:
+            args = cc.build_parser().parse_args(["--work", d])
+            args.state = os.path.join(d, "state")
+            os.makedirs(args.state)
+            c = cc.Connector(FakeRpc, args, note="n")
+            c.rpc = mock.Mock()
+            c.rpc.request.return_value = {"data": [{"id": "gpt-6-astra"}, {"id": "gpt-5.5", "isDefault": True}]}
+            ran = []
+            turns = iter([("failed", "", refused), ("completed", "hello", None)])
+            policy = cc.turn_policy({"access_tier": "owner"}, allow_non_owner=True)
+            with mock.patch.object(c, "open_for"), mock.patch.object(c, "turn_cwd", return_value=d), \
+                    mock.patch.object(c, "run_turn", side_effect=lambda p, model, cwd: (ran.append(model), next(turns))[1]):
+                c.thread_id = "t"
+                out = c.run_task({"access_tier": "owner"}, "hi", policy.capabilities, policy.kind)
+            self.assertEqual((out, ran), (("completed", "hello", None), [None, "gpt-5.5"]))
+            self.assertEqual(c.models.state().get("wanted"), "gpt-5.5" if c.models.ok("gpt-5.5") else None)
+            # The default refused too, or none named: said plainly, and the turn is not run a third time.
+            c.rpc.request.return_value = {"data": [{"id": "gpt-6-astra", "isDefault": True}]}
+            self.assertEqual(c.account_default_model("gpt-6-astra"), "")
+            c.rpc.request.side_effect = RuntimeError("model/list: refused")
+            self.assertEqual(c.account_default_model(""), "")
+
     def test_done_list_is_bounded_and_deduplicated(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "done")
