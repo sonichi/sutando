@@ -919,11 +919,15 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
 	return lines.join('\n') + '\n';
 }
 
-/** Tells the core a voice session ended: its facts as the task line, its spoken lines below. Low priority. */
+/** Tells the core a voice session ended: its facts as the task line, its spoken lines below. Low priority.
+ *  `interaction_type: system_event`, as the phone call-end summary has: the call-end lifecycle wrote it, not
+ *  something the owner said, so readers that put the owner's own requests first (task_watch_owner.py) leave it. */
 export async function submitVoiceSessionEndTask(summary: string, transcript: string): Promise<string> {
 	const taskId = `task-${Date.now()}`;
 	const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
-	const header = buildVoiceTaskHeader(taskId, new Date().toISOString(), ownerId, null).replace('priority: urgent', 'priority: low');
+	const header = buildVoiceTaskHeader(taskId, new Date().toISOString(), ownerId, null)
+		.replace('interaction_type: realtime_audio', 'interaction_type: system_event')
+		.replace('priority: urgent', 'priority: low');
 	const body = transcript ? `\n\n--- the session's spoken lines (may contain ASR errors) ---\n${confineUserContent(transcript)}\n` : '\n';
 	await _delegation.submitTask(taskId, `${header}task: ${confineUserContent(summary)}${body}`);
 	console.log(`${ts()} [TaskBridge] Session-end task: ${taskId}`);

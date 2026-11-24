@@ -46,18 +46,64 @@ def percentile(values: Iterable[float], quantile: float) -> Optional[float]:
 
 def load_suite(path: Path) -> Dict[str, Any]:
     data = json.loads(path.read_text())
-    if data.get("schema") != SCHEMA or not data.get("name"):
-        raise ValueError("suite must have schema=1 and a non-empty name")
+    validate_suite(data)
+    return data
+
+
+def validate_suite(data: Any) -> None:
+    if not isinstance(data, dict):
+        raise ValueError("suite must be a JSON object")
+    if type(data.get("schema")) is not int or data["schema"] != SCHEMA:
+        raise ValueError("suite must have schema=1")
+    if not isinstance(data.get("name"), str) or not data["name"].strip():
+        raise ValueError("suite name must be a non-empty string")
     cases = data.get("cases")
     if not isinstance(cases, list) or not cases:
-        raise ValueError("suite must contain at least one case")
+        raise ValueError("suite cases must be a non-empty list")
     seen = set()
-    for case in cases:
-        case_id = case.get("id") if isinstance(case, dict) else None
-        if not case_id or case_id in seen or not case.get("prompt"):
-            raise ValueError("every case needs a unique id and a prompt")
+    for index, case in enumerate(cases, 1):
+        prefix = f"case {index}"
+        if not isinstance(case, dict):
+            raise ValueError(f"{prefix} must be a JSON object")
+        for field in ("id", "prompt"):
+            if not isinstance(case.get(field), str) or not case[field].strip():
+                raise ValueError(f"{prefix}: {field} must be a non-empty string")
+        case_id = case["id"]
+        if case_id in seen:
+            raise ValueError(f"{prefix}: id must be unique")
         seen.add(case_id)
-    return data
+        _validate_expectation(case.get("expect", {}), prefix)
+
+
+def _validate_expectation(expected: Any, prefix: str) -> None:
+    if not isinstance(expected, dict):
+        raise ValueError(f"{prefix}: expect must be a JSON object")
+    unknown = set(expected) - {"equals", "contains", "regex", "max_chars"}
+    if unknown:
+        names = ", ".join(sorted(str(name) for name in unknown))
+        raise ValueError(f"{prefix}: unknown expect assertion(s): {names}; "
+                         "use equals, contains, regex or max_chars")
+    for field in ("equals", "regex"):
+        if field in expected and not isinstance(expected[field], str):
+            raise ValueError(f"{prefix}: expect.{field} must be a string")
+    if "contains" in expected:
+        value = expected["contains"]
+        if not ((isinstance(value, str) and value) or (
+                isinstance(value, list) and value
+                and all(isinstance(item, str) and item for item in value))):
+            raise ValueError(f"{prefix}: expect.contains must be a non-empty string "
+                             "or a non-empty list of non-empty strings")
+    if "max_chars" in expected:
+        maximum = expected["max_chars"]
+        if type(maximum) is not int or maximum < 0:
+            raise ValueError(f"{prefix}: expect.max_chars must be a non-negative integer")
+    if "regex" in expected:
+        if not expected["regex"]:
+            raise ValueError(f"{prefix}: expect.regex must be a non-empty string")
+        try:
+            re.compile(expected["regex"], re.IGNORECASE | re.MULTILINE)
+        except (re.error, OverflowError, RecursionError) as exc:
+            raise ValueError(f"{prefix}: invalid expect.regex: {exc}") from exc
 
 
 def score_response(response: str, expected: Dict[str, Any]) -> Tuple[bool, List[Dict[str, Any]]]:
@@ -251,6 +297,7 @@ def summarize(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 def run_suite(workspace: Path, suite: Dict[str, Any], repeat: int,
               timeout_s: float, poll_s: float, label: str,
               runtime: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    validate_suite(suite)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     rows: List[Dict[str, Any]] = []
     started_at = utc_now()
@@ -519,11 +566,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("sutando-bench: repeat, timeout, and poll must be positive", file=sys.stderr)
         return 2
     try:
+        suite = load_suite(args.suite)
+    except (OSError, ValueError) as exc:
+        print(f"sutando-bench: invalid suite: {exc}; fix the suite and retry", file=sys.stderr)
+        return 2
+    try:
         runtime_start = probe_runtime(args.sutando_config, args.workspace)
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"sutando-bench: cannot attribute runtime version: {exc}", file=sys.stderr)
         return 2
-    suite = load_suite(args.suite)
     run = run_suite(args.workspace, suite, args.repeat, args.timeout, args.poll,
                     args.label, runtime_start)
     try:

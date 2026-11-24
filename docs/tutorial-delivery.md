@@ -6,23 +6,38 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
   `notes/first-time-tutorial.md` and deliver it one brief, voice-friendly section at a time,
   waiting for the user to try each step.
 - **s.space mode.** Right after the first-contact greeting in the owner's DM, the skill creates
-  one "Getting started" HTML page (Room Commons) in that DM, a short s.space tour with one thing
-  to try per part, and summons the owner to it. A marker under `<workspace>/state/tutorial/` keeps it to one page per room, so
+  one "Getting started" HTML page (Room Commons) in that DM, with an optional checklist,
+  and summons the owner to it. A marker under `<workspace>/state/tutorial/` keeps it to one page per room, so
   a re-link or reinstall refreshes the page instead of adding another.
 
 ## Product overview
 
-[`getting-started.html`](getting-started.html) is a standalone four-part overview, adapted from
-the interactive review draft. Its topic selectors are simulations: they do not connect accounts,
-change access, start calls or schedule work. Copy falls back to selecting the prompt when the
-clipboard is unavailable. It complements, rather than replaces, the per-owner ten-step tour.
+The onboarding DM opens on four shared topics plus **Sutando Guides**. Each suggested action
+opens a draft the reader can edit. **Choose my agent** lists their own agents in a supported
+Commons client; **Review & send** hands the edited text to the host, which shows a separate
+confirmation. Only confirming in the host sends the message. The guide never connects apps,
+starts calls, schedules work, or submits drafts by itself. The App Store link and QR are real
+install affordances. Phone sign-in and pairing are one checklist step.
 
-## Using the ten-step owner tour
+Commons publication is always generic: it does not embed a display name, onboarding roles or
+tailored prompts, even when all saved setup fields match. A room roster read alone cannot bind
+Commons creation or edits to a private audience, or prevent someone who joins later from reading
+persistent HTML. Keep synthetic personalization previews local until there is a server-enforced
+owner-only surface that also covers later reads. A client without the draft bridge can read the
+guide, but does not show inoperative messaging buttons.
 
-The labelled step navigator lets readers jump directly to a topic instead of guessing a number.
-Use Back and Next for the guided path, Show all for a reference view, and Copy for an example
-prompt. Completion is per viewer when the Commons runtime supplies a viewer identity; otherwise
-it uses browser-local storage, falling back to memory when storage is unavailable.
+The publisher never replays a pre-fix target or rolls back to older HTML. A normal publish or refresh
+can migrate a listed legacy DM page at the same feature revision, or replace a legacy interrupted
+page from a state verified by its saved journal. It requires the acting agent’s ownership marker and
+an exact recorded content hash. The old page is only the match text for a single replacement; the
+new text is generic. Missing, edited, ambiguous, or oversized pages are reported and left as they
+are. Migration does not create or summon a page, upload media, or delete versions. It cannot
+revoke content already seen, copied, cached, or retained in history.
+
+The onboarding checklist uses per-viewer Commons progress when the runtime provides it, otherwise
+local storage or memory. Completion from the former install or pairing row counts for the
+combined mobile row. The [standalone four-topic guide](../skills/tutorial/assets/getting-started.html)
+and the separate explicit reference flow retain their own checklist and controls.
 
 The layout uses the s.space orange, yellow and pink gradient pairs with ink/offwhite surfaces.
 Avantt SemiBold and Haas Recast are named in the font stack, with system-font fallbacks; no
@@ -33,7 +48,9 @@ wraps on narrow screens, and reduced-motion and dark-mode preferences are respec
 
 - **The feature list.** The steps come from `skills/tutorial/feature-list.json` (one step per
   feature: title, two body parts, where to try it, a paste prompt, screenshots, the release that
-  added it, and optionally the repo paths it `watches`). A watched path that changes in a release
+  added it, and optionally the repo paths it `watches`). This list describes the reference tour;
+  the compact onboarding layout deliberately keeps its nine approved goals and the App Store QR.
+  A watched path that changes in a release
   without a revision bump or a matching `reviewed_at` makes the release audit warn
   (`docs/release-process.md` §4.2). `--list <file|https URL>` swaps the list; nothing is fetched by default, only https
   is fetched (redirects included), a list is at most 1 MiB and 24 steps, and a list that does not
@@ -42,8 +59,8 @@ wraps on narrow screens, and reduced-motion and dark-mode preferences are respec
 - **Revisions and `--if-newer`.** The list carries a revision (`tutorial.YYYY-MM-DD.N`), which the
   page records in its ownership tag. `publish --all-rooms --if-newer` runs once per room with an entry, in the
   audience recorded for it, never creates a page (a deleted one stays deleted), and rebuilds a
-  page only when the list's revision is newer than the page's, with the prompts and roles the page
-  was last built with; a current page is left alone even when a rebuild would differ.
+  page when the list's revision is newer or when a verified legacy page needs a privacy migration.
+  An up-to-date page already marked generic needs no room call.
 - **Owner edits are kept.** Before any rewrite the page's text is compared with the hash recorded
   when the skill last wrote it. A page edited since is kept, with or without `--if-newer` and
   whatever the revision (`"action": "kept"`, one stderr line), and its entry is not touched, so a
@@ -54,7 +71,7 @@ wraps on narrow screens, and reduced-motion and dark-mode preferences are respec
   the entry before. The next run settles the journal before rendering anything of its own. A page
   in a state the rewrite itself leaves is finished to the target byte for byte, checked against the
   recorded hash, and the run stops there (`"action": "resumed"`, reporting the journalled name and
-  revision; its own request, `--summon` and new prompts or media included, waits for the next
+  revision; its own request, `--summon` and new media included, waits for the next
   run). A page still as before means the rewrite never ran and the run proceeds as usual. Any other
   page is someone's edit: it is kept, and the entry from before the rewrite stands whole, so the
   next run keeps it too. A rewrite that fits one room-commons call (1 MiB a text; arguments travel
@@ -74,15 +91,15 @@ wraps on narrow screens, and reduced-motion and dark-mode preferences are respec
   exactly as one is written; otherwise it is kept. Creation runs through the same journal as a
   rewrite. A write taken back is undone in place, the way it was made; an undo that cannot fit a
   call writes nothing, and the result names the page as left.
-- **Recovery comes first.** A run settles any journal in the room before it resolves its name,
-  fetches or opens a list, or opens prompts or media; the identity is resolved and checked once and
-  used for the name, the tag and the journal alike.
+- **Recovery comes first.** A run checks the journal before it loads
+  a list or media; the identity is resolved and checked once for the tag and journal.
 - **Identity.** `publish` needs the agent's mxid (`--agent-mxid`, `$AGENT_MXID` or the s.space
   channel env file), resolved and checked once (`@localpart:server`, whitespace trimmed) before any
   Room Commons call, and refuses to run without one: the page's ownership tag is how a later run
   finds it. A revision-only bump of the list rewrites the page once (its tag records the revision)
   and the next `--if-newer` is a no-op.
-- **Screenshots.** Each screenshot is a Room Commons asset reference: `publish` uploads its
+- **Screenshots.** The compact onboarding guide inlines only the App Store QR. In the reference
+  tour, each screenshot is a Room Commons asset reference: `publish` uploads its
   full-resolution `hd_file` to the room's media (`room.media.upload`, an operation id per room and
   file hash, never in an encrypted room), records `{asset: {mxc, sha256}}` and re-uploads only a
   changed file; the page points at that `mxc://` (or one from `--media`) and inlines the bundled
@@ -90,9 +107,10 @@ wraps on narrow screens, and reduced-motion and dark-mode preferences are respec
   run that skips, keeps an edited page or stops on the page's size uploads nothing. Every page
   variant stays under 300 KB.
 
-Last verified: navigation and responsive polish, 2026-11-19 in Chromium at 1280, 390 and 320 pixels,
-including light/dark mode, Show all, step navigation, copying and completion after reload.
-Existing screenshot assets were not recaptured in that pass.
+Last verified: the interactive onboarding flow is covered by an offline mock of recipient discovery, editing,
+confirmation and failure. A live send, pairing, and existing install refresh are not verified
+here. Earlier reference-flow browser checks covered navigation and progress at 1280, 390 and
+320 pixels in light and dark mode.
 
 Earlier publishing verification: 2026-10-31, against `tests/tutorial-feature-list.test.py` and
 `tests/tutorial-getting-started.test.py`. The screenshot upload and the HTML-surface rendering of

@@ -60,7 +60,9 @@ _FALLBACK_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
     )),
     ("JSON Web Token", re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")),
     ("Slack Token", SLACK_TOKEN_PATTERN),
-    ("OpenAI Token", re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{32,}")),
+    # No letter/digit before `sk-`, so "task-ctl-…" is not a key; `_`/`-` still
+    # count as a boundary (`OPENAI_KEY_sk-…` stays redacted, which `\b` misses).
+    ("OpenAI Token", re.compile(r"(?<![A-Za-z0-9])sk-(?:proj-)?[A-Za-z0-9_-]{32,}")),
     ("Stripe Access Key", re.compile(r"sk_(?:live|test)_[A-Za-z0-9]{24,}")),
     ("Discord Bot Token", re.compile(
         r"[MNO][A-Za-z\d_-]{23,}\.[A-Za-z\d_-]{6,}\.[A-Za-z\d_-]{27,}"

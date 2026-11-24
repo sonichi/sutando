@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "revision": "tutorial.2026-11-20.1",
+  "revision": "tutorial.2026-11-20.3",
   "steps": [
     {
       "id": "dm",
       "title": "Your DM",
       "body": [
-        "Your DM with {name} is where you ask for things for yourself. What you ask for yourself (research, mail, calendar) comes back in your DM, never in a room.",
+        "Your DM with {name} is where you ask for things for yourself. What you ask for yourself (research, mail, calendar) comes back in your DM unless you explicitly ask to share it.",
         "Open {name} under Your agents at the top of the sidebar and ask:"
       ],
       "surface": "dm",

@@ -23,7 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
 from clean_watcher_env import clean_env  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _helpers.process_group import popen_bound  # noqa: E402
+from _helpers.process_group import kill_group, popen_bound  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 W = "d" * 32
@@ -55,7 +55,7 @@ class CoreWatcher(unittest.TestCase):
     def hold(self, tid, attributed=True):
         folder = self.ws / "deliveries" / W
         folder.mkdir(parents=True, exist_ok=True)
-        (folder / f"{tid}.txt").touch()
+        (folder / f"{tid}.txt").write_text('{"delivered_at":1789600000.0,"ttl_s":14400}')
         if attributed:
             (self.ws / "state" / "attribution").mkdir(parents=True, exist_ok=True)
             (self.ws / "state" / "attribution" / tid).write_text(W + "\n")
@@ -86,10 +86,8 @@ class CoreWatcher(unittest.TestCase):
                     break
                 time.sleep(0.1)
         finally:
-            try:
-                os.killpg(os.getpgid(p.pid), 15)
-            except OSError:
-                pass
+            # Bash defers its TERM trap until a foreground child exits; a loaded runner can outlast a fixed wait.
+            kill_group(p.pid, wait_s=10.0)
             p.wait(timeout=10)
             p.stdout.close()
             errf.seek(0)

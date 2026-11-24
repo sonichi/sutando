@@ -350,9 +350,12 @@ def input_watch_command(workspace, repo, worker_id, socket, seat) -> list:
     name = wi.tmux_session_name(worker_id)
     out = Path(workspace) / "state" / f"core-supervisor.{name}.json"
     tmux = shutil.which("tmux") or "tmux"
+    # The owner's "retry now" to this seat's limit pause restarts this worker, nothing else.
+    retry = shlex.join([sys.executable, str(_HERE / "pool_manage.py"), "--workspace", str(workspace),
+                        "--repo", str(repo), "retry", worker_id])
     watch = shlex.join([sys.executable, str(Path(repo) / "src" / "core-input-watch.py"),
                         f"--socket={socket}", f"--session={name}", f"--out={out}",
-                        f"--seat={seat}"])
+                        f"--seat={seat}", f"--retry-cmd={retry}"])
     alive = f"{shlex.quote(tmux)} -S {shlex.quote(str(socket))} has-session -t {shlex.quote('=' + name)}"
     # The watcher ends with its seat; the next tick starts one for a new session.
     loop = (f"{watch} & w=$!; while {alive} 2>/dev/null && kill -0 $w 2>/dev/null; "

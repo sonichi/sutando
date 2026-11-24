@@ -4,11 +4,16 @@ from pathlib import Path
 import json
 import re
 import shutil
+import sys
 import subprocess
 import tempfile
 import unittest
 
-PAGE = Path(__file__).resolve().parent.parent / "docs" / "getting-started.html"
+PAGE = Path(__file__).resolve().parent.parent / "skills" / "tutorial" / "assets" / "getting-started.html"
+
+
+sys.path.insert(0, str(PAGE.parent.parent / "scripts"))
+import tour_page
 
 
 class OverviewTest(unittest.TestCase):
@@ -38,6 +43,35 @@ class OverviewTest(unittest.TestCase):
                          "setCommons('cron'", "logs on my screen", "Share any window"):
             self.assertNotIn(obsolete, page)
 
+    def test_private_setup_uses_escaped_name_and_known_roles_only(self):
+        named = tour_page.render_page("A&B", roles="Designer", private_setup=True)
+        self.assertIn("<span>A&amp;B</span>", named)
+        self.assertIn("Examples for design work.", named)
+        self.assertIn("main design tradeoff", named)
+        self.assertNotIn("A&B", named)
+        fallback = tour_page.render_page("A&B", roles="Designer")
+        self.assertIn("<h1>Get started with <span>your agent</span>", fallback)
+        self.assertNotIn("main design tradeoff", fallback)
+        unknown = tour_page.render_page("A&B", roles="<script>bad()</script>", private_setup=True)
+        self.assertNotIn("bad()", unknown)
+        self.assertIn("Help me set up a voice conversation for a kickoff", unknown)
+        room = tour_page.render_page("A&B", audience="room", roles="Designer",
+                                    prompts={"dm": "Private agenda"}, private_setup=True)
+        for text in ("A&amp;B", "Designer", "Private agenda", 'id="step-4"'):
+            self.assertNotIn(text, room)
+
+    def test_unrecognized_reference_prompt_is_preserved(self):
+        from personalized_overview import overview
+
+        style, body = tour_page.overview_parts()
+        extra = '<div class="prompt-box"><button type="button">Static example</button></div>'
+        body = body.replace('<section class="tour-card active" id="step-0">',
+                            '<section class="tour-card active" id="step-0">' + extra, 1)
+        self.assertIn(extra, body)
+        _, rendered = overview(style, body, "Example Agent", ("Designer",))
+        self.assertIn(extra, rendered)
+        self.assertIn("Examples for design work.", rendered)
+
     def test_scripts_parse(self):
         node = shutil.which("node")
         if not node:
@@ -52,6 +86,17 @@ class OverviewTest(unittest.TestCase):
 
 class OverviewBehaviourTest(unittest.TestCase):
     def test_denied_clipboard_selects_prompt_and_next_focuses_heading(self):
+        self.check_behaviour(PAGE)
+
+    def test_reference_page_opens_overview_and_preserves_checklist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rendered = Path(tmp) / "tutorial.html"
+            page = tour_page.render_page("Test Agent", agent="@test:example.test")
+            self.assertTrue(tour_page.page_digest_ok(page))
+            rendered.write_text(page)
+            self.check_behaviour(rendered, embedded=True)
+
+    def check_behaviour(self, page, embedded=False):
         node = shutil.which("node")
         if not node or subprocess.run([node, "-e", "require('jsdom')"],
                                       capture_output=True).returncode:
@@ -90,7 +135,7 @@ const dom = new JSDOM(html, { url: 'https://page.test/', runScripts: 'dangerousl
   });
   result.topics = [...d.querySelectorAll('.tab-btn')].map(button => {
     button.click();
-    return { label: button.textContent.trim(), status: d.getElementById('progressStatus').textContent,
+    return { label: button.textContent.trim(), status: d.getElementById('progressStatus')?.textContent,
       focused: d.activeElement === d.querySelector('.tour-card.active h2') };
   });
   result.tiers = [...d.querySelectorAll('#step-1 .sub-tab')].map(button => {
@@ -99,6 +144,34 @@ const dom = new JSDOM(html, { url: 'https://page.test/', runScripts: 'dangerousl
   result.scenarios = [...d.querySelectorAll('#step-2 .sub-tab')].map(button => {
     button.click(); return { label: button.textContent, text: d.getElementById('callInfo').textContent };
   });
+  const checklist = d.querySelector('#tutorial-checklist');
+  if (checklist) {
+    const summary = checklist.querySelector('summary');
+    result.startsClosed = !checklist.open;
+    result.label = summary.textContent;
+    result.overviewFirst = Boolean(d.querySelector('#overview').compareDocumentPosition(checklist) & 4);
+    summary.click();
+    result.opens = checklist.open;
+    result.stepCount = checklist.querySelectorAll('section.sec').length;
+    result.personalized = d.querySelector('h1').textContent;
+    const first = checklist.querySelector('input[data-done]');
+    for (let i = 0; first.disabled && i < 100; i++) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    first.click();
+    result.done = first.checked;
+    result.saved = JSON.parse(dom.window.localStorage.getItem('gs-done'));
+    summary.click();
+    summary.click();
+    result.doneAfterReopen = first.checked;
+  }
+  if (checklist) {
+    result.names = [...d.querySelectorAll('.tab-btn')].map(x => x.lastElementChild.textContent);
+    d.querySelector('.tab-btn:last-child').click();
+    [...d.querySelectorAll('#step-4 button[onclick]')]
+      .find(button => button.getAttribute('onclick').startsWith('setGuide(3')).click();
+    result.guidePrompt = d.querySelector('#sutando-example').textContent;
+  }
   result.errors = errors;
   console.log(JSON.stringify(result));
   dom.window.close();
@@ -107,7 +180,7 @@ const dom = new JSDOM(html, { url: 'https://page.test/', runScripts: 'dangerousl
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "overview.cjs"
             target.write_text(harness)
-            result = subprocess.run([node, str(target), str(PAGE)],
+            result = subprocess.run([node, str(target), str(page)],
                                     capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         out = json.loads(result.stdout)
@@ -122,16 +195,34 @@ const dom = new JSDOM(html, { url: 'https://page.test/', runScripts: 'dangerousl
         self.assertIn("separate from Claude Duet", providers["Claude Code"])
         self.assertIn("separate from Dot", providers["Codex"])
         self.assertIn("Hermes and OpenClaw", providers["Other apps"])
-        self.assertEqual([t["status"] for t in out["topics"]],
-                         ["Ecosystem", "Multiplayer", "Calls & Local Tools", "Commons & Tasks"])
+        if embedded:
+            self.assertEqual(out["names"], ["Ecosystem", "Multiplayer", "Calls & Local Tools",
+                                            "Commons & Tasks", "Sutando Guides"])
+            self.assertIn("once I approve", out["guidePrompt"])
+        else:
+            self.assertEqual([t["status"] for t in out["topics"]],
+                             ["Ecosystem", "Multiplayer", "Calls & Local Tools", "Commons & Tasks"])
         self.assertTrue(all(t["focused"] for t in out["topics"]))
         self.assertIn("owner can still access and invoke", out["tiers"][2])
         self.assertIn("other room members cannot", out["tiers"][2])
         scenarios = {s["label"]: s["text"] for s in out["scenarios"]}
-        self.assertIn("supported, configured local session", scenarios["Live screen coach"])
-        self.assertIn("approved local screen access", scenarios["Live screen coach"])
-        self.assertIn("authorize the edit", scenarios["Write & edit by voice"])
-        self.assertIn("paste the passage", scenarios["Write & edit by voice"])
+        if embedded:
+            self.assertEqual(len(scenarios), 3)
+        else:
+            self.assertIn("supported, configured local session", scenarios["Live screen coach"])
+            self.assertIn("approved local screen access", scenarios["Live screen coach"])
+            self.assertIn("authorize the edit", scenarios["Write & edit by voice"])
+            self.assertIn("paste the passage", scenarios["Write & edit by voice"])
+        if embedded:
+            self.assertTrue(out["overviewFirst"])
+            self.assertTrue(out["startsClosed"])
+            self.assertEqual(out["label"], "Try it step by step")
+            self.assertTrue(out["opens"])
+            self.assertEqual(out["stepCount"], 10)
+            self.assertEqual(out["personalized"], "Get started with your agent in s.space")
+            self.assertTrue(out["done"])
+            self.assertEqual(out["saved"], ["dm"])
+            self.assertTrue(out["doneAfterReopen"])
         self.assertEqual(out["errors"], [])
         self.assertEqual(out["copies"], 1)
         self.assertTrue(out["prompt"].strip())

@@ -391,6 +391,31 @@ _QUOTED_BLOCK = re.compile(
 _JSON_DECODER = json.JSONDecoder()
 
 
+def quoted_block_spans(text: str) -> "tuple[int | None, tuple[int, int, dict, str] | None]":
+    """(where the message after the broker's quoted blocks starts, the reply-context
+    record's (start, end, decoded record, label) or None); (None, None) when a block is malformed."""
+    pos, reply = len(text) - len(text.lstrip()), None
+    for kind in ("room metadata", "reply context"):
+        m = _QUOTED_BLOCK.match(text, pos)
+        if m is None or m.group(1) != kind:
+            continue
+        try:
+            record, end = _JSON_DECODER.raw_decode(text, m.end())
+        except ValueError:
+            return None, None
+        tail = len(text) - len(text[end:].lstrip())
+        closer = next((f"[End {p} {kind}]" for p in _MARKER_PRODUCTS
+                       if text.startswith(f"[End {p} {kind}]", tail)), None)
+        if not isinstance(record, dict) or closer is None:
+            return None, None
+        pos = len(text) - len(text[tail + len(closer):].lstrip())
+        if kind == "reply context":
+            if not isinstance(record.get("sender"), str) or not isinstance(record.get("body"), str):
+                return None, None
+            reply = (m.end(), end, record, m.group(2))
+    return pos, reply
+
+
 def split_reply_context(text: str) -> "tuple[dict | None, str]":
     """({"sender", "body", "label"} of the message an ag2space task replies to, the
     message after the broker's quoted blocks), or (None, text) when there is no
@@ -399,27 +424,11 @@ def split_reply_context(text: str) -> "tuple[dict | None, str]":
     `label` is the broker's own wording from the opening tag, verbatim (None when
     empty). The JSON is decoded whole, so a closing marker inside the quoted body
     cannot end the block early."""
-    rest, reply = text.lstrip(), None
-    for kind in ("room metadata", "reply context"):
-        m = _QUOTED_BLOCK.match(rest)
-        if m is None or m.group(1) != kind:
-            continue
-        try:
-            record, end = _JSON_DECODER.raw_decode(rest, m.end())
-        except ValueError:
-            return None, text
-        tail = rest[end:].lstrip()
-        closer = next((f"[End {p} {kind}]" for p in _MARKER_PRODUCTS
-                       if tail.startswith(f"[End {p} {kind}]")), None)
-        if not isinstance(record, dict) or closer is None:
-            return None, text
-        rest = tail[len(closer):].lstrip()
-        if kind == "reply context":
-            sender, body = record.get("sender"), record.get("body")
-            if not isinstance(sender, str) or not isinstance(body, str):
-                return None, text
-            reply = {"sender": sender, "body": body, "label": m.group(2).strip() or None}
-    return (reply, rest) if reply is not None else (None, text)
+    pos, reply = quoted_block_spans(text)
+    if reply is None:
+        return None, text
+    record, label = reply[2], reply[3]
+    return {"sender": record["sender"], "body": record["body"], "label": label.strip() or None}, text[pos:]
 
 
 # A run of >=3 leading '=' opens a writer's ===SKILL …=== / ===SUTANDO …=== block;

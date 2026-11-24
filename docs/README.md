@@ -10,7 +10,7 @@ Machine-readable ownership and lifecycle metadata lives in
 
 ## Start here
 
-- [Interactive s.space overview](getting-started.html) — download/open the HTML in a browser to explore agents, teamwork, calls and Commons.
+- [Interactive s.space overview](../skills/tutorial/assets/getting-started.html) — download/open the HTML in a browser to explore agents, teamwork, calls and Commons.
 
 - [Configure a workspace](workspace-config.md) — defaults, overrides, and
   resolver APIs.
@@ -79,6 +79,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Workspace two-space model](workspace-design.md)
 - [Core health verdict + severity gate](design-core-health-verdict.md)
 - [Health snapshot: `GET /health`](health-snapshot.md)
+- [Core recovery record (`core_recovery.v1`)](core-recovery-record.md)
 - [Pointer Teacher design](pointer-teacher-design.md)
 - [Credential resolution by capability (G8)](design-credential-capability-resolver.md)
 - [holder_lock: the one flock-and-holder primitive](design-holder-lock.md)
