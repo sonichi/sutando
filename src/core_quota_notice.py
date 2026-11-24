@@ -3,8 +3,10 @@
 
 A core at its limit cannot answer, so nobody learns why it went quiet. Each core adapter sees its own
 runtime's limit (the Codex seat from the app-server's turn errors, the Claude Code monitor from the
-pane's limit banner) and hands it here. One card per limit episode: the next only after the limit
-cleared (a turn that answered, the banner gone, or the reset time given has passed) and came back.
+pane's limit banner) and hands it here. One card when the limit hits, then one more for every owner
+message that arrives while it lasts (`tasks`), so no message waits silently behind the limit; a
+message is carded once. A new episode starts after the limit cleared (a turn that answered, the banner
+gone, or the reset time given has passed) and came back.
 The episode lives in `<workspace>/state/core-quota-card.json`, so a restart does not send it again.
 
 The card is sent by a command the adapter injects (the account card's `post --owner-dm --lead`), which
@@ -24,6 +26,7 @@ from typing import Callable, Optional, Sequence
 
 FILE = ("state", "core-quota-card.json")
 RETRY_S = 60.0
+CARDED_KEEP = 100   # the owner messages already answered with the card, this episode
 SEND_TIMEOUT_S = 90.0
 # The runtime's own words for when the limit ends ("try again at 3:05 PM", "resets in 2 hours"); only
 # time-like characters of them are kept, so nothing else of the error reaches the DM.
@@ -144,9 +147,10 @@ class QuotaNotice:
         self.health("ok")
         return "quota-cleared"
 
-    def hit(self, reset: str = "", reset_at=None) -> str:
+    def hit(self, reset: str = "", reset_at=None, tasks: Sequence[str] = ()) -> str:
         """The runtime said it is out of usage. 'quota-card' (posted to the owner's DM), 'quota-not-posted'
-        (tried again later), or '' (told already this episode, or tried too recently)."""
+        (tried again later), or '' (told already this episode, or tried too recently). `tasks`: the
+        owner's messages now waiting on the limit; each gets the card once ('quota-card-again')."""
         rec, at = self.load(), self.now()
         until = rec.get("reset_at")
         if rec.get("told") and until is not None and at >= float(until):
@@ -158,7 +162,9 @@ class QuotaNotice:
         if reset and not rec.get("reset"):
             rec["reset"] = reset[:60]
         self.health("quota", rec.get("reset_at"))
-        if rec.get("told") or at - float(rec.get("tried") or 0) < RETRY_S:
+        if rec.get("told"):
+            return self.again(rec, [str(t) for t in tasks if t])
+        if at - float(rec.get("tried") or 0) < RETRY_S:
             self.save(rec)
             return ""
         # Tried is kept before the send: a stop mid-send waits RETRY_S rather than posting twice at once.
@@ -172,5 +178,48 @@ class QuotaNotice:
             posted = False
         if not posted:
             return "quota-not-posted"
-        self.save(dict(rec, told=True, via="card"))
+        # The messages waiting now are answered by this card.
+        self.save(dict(rec, told=True, via="card", carded=[str(t) for t in tasks if t][-CARDED_KEEP:]))
         return "quota-card"
+
+    def again(self, rec: dict, tasks: list) -> str:
+        """The card once more for each owner message that arrived since: told, never left to wait."""
+        carded = [t for t in rec.get("carded") or [] if isinstance(t, str)]
+        fresh = [t for t in tasks if t not in carded]
+        if rec.get("via") == "notice" or not fresh:
+            self.save(rec)
+            return ""
+        # Recorded before the send: a stop mid-send never posts it twice for the same message.
+        self.save(dict(rec, carded=(carded + fresh)[-CARDED_KEEP:]))
+        try:
+            posted = bool(self.send(words(self.name, str(rec.get("reset") or ""))))
+        except Exception as e:  # noqa: BLE001 - a notice that cannot be sent never stops the core's adapter
+            self.log("quota card not sent:", type(e).__name__)
+            posted = False
+        return "quota-card-again" if posted else "quota-not-posted"
+
+
+def owner_waiting(workspace) -> list:
+    """Ids of the owner's messages waiting in the core's queue (`access_tier: owner`)."""
+    out = []
+    try:
+        import task_queue
+        files = task_queue.pending_files(Path(workspace))
+    except Exception:  # noqa: BLE001 - no queue read: nobody to card
+        return out
+    for p in files:
+        if is_owner_task(p):
+            out.append(p.name[:-4] if p.name.endswith(".txt") else p.name)
+    return out
+
+
+def is_owner_task(path) -> bool:
+    """The task's own header says the owner sent it."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            for _, line in zip(range(80), f):
+                if line.startswith("access_tier:"):
+                    return line.split(":", 1)[1].strip() == "owner"
+    except OSError:
+        pass
+    return False

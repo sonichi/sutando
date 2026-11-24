@@ -416,6 +416,7 @@ class Seat:
         if self.rpc is not None and auth_print() != self.auth_seen:
             log("login changed on disk; restarting the app-server before the turn")
             self.close_server()
+            self.release_limit_hold()
         self.health_auth_check()
 
     # ---- the core's account health (core_account_health), for Settings and the profile tab ----
@@ -443,6 +444,20 @@ class Seat:
         without waiting for a task. The next turn says otherwise if the new login is refused too."""
         if self.health_auth is not None and auth_print() != self.health_auth:
             self.health("ok")
+            self.release_limit_hold()
+
+    def release_limit_hold(self) -> None:
+        """A sign-in or account switch on the core: a limit hold seen under the old login no longer
+        applies (a limit is the account's), so it is lifted. Core seat only; never fatal."""
+        if self.worker:
+            return
+        try:
+            import core_limit_hold
+            if (core_limit_hold.read_hold(self.workspace) or {}).get("status") == "held":
+                core_limit_hold.clear(self.workspace, by="account-change", mirror=False)
+                log("limit hold lifted: the login on disk changed")
+        except Exception as e:  # noqa: BLE001 - advisory
+            log(f"limit hold not lifted ({type(e).__name__})")
 
     def signed_out(self, filename: str) -> None:
         """The login was refused even on a restarted child: the core seat shows the owner the account card
@@ -1028,7 +1043,7 @@ class Seat:
             self.failures = 0
             if self.turn_limit is None:
                 self.health("ok")
-        self.quota_step(status)
+        self.quota_step(status, filename, payload)
         if has_ready_result(results, filename):
             if not self.still_admitted(filename, payload, picked):
                 aside = self.set_result_aside(filename)
@@ -1062,7 +1077,7 @@ class Seat:
             f"(attempt {rec['attempts']}, next try in {wait:g}s)")
         return outcome
 
-    def quota_step(self, status: str) -> None:
+    def quota_step(self, status: str, filename: str = "", payload: Optional[Path] = None) -> None:
         """Out of usage: the owner gets the account card once per limit (core_quota_notice); a turn
         that completed ends the limit. A notice that cannot be sent never stops the seat. The limit is
         recorded in the core's account health first, card or no card."""
@@ -1075,7 +1090,8 @@ class Seat:
                 at = limit_reset(self.rate_limits)
                 reset = (core_quota_notice.reset_from_epoch(at) if at else
                          core_quota_notice.reset_from_text(self.turn_limit.get("message")))
-                done = self.quota.hit(reset, at)
+                owner = payload is not None and core_quota_notice.is_owner_task(payload)
+                done = self.quota.hit(reset, at, tasks=[filename[:-4]] if owner and filename else ())
             else:
                 done = self.quota.cleared() if status == "completed" else ""
         except Exception as e:  # noqa: BLE001 - advisory

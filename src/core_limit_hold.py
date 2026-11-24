@@ -721,6 +721,22 @@ def hold_while_wedged(workspace: Path, text: Optional[str], now: Optional[float]
     return active_hold(workspace, now, seat)
 
 
+def release_on_account_change(workspace: Path, now: Optional[float] = None, account: Optional[str] = None,
+                              seat: Optional[str] = None) -> Optional[dict]:
+    """Lift a hold seen under one account once the core is signed in to another: a limit is the
+    account's, and the owner switched to go on (VM 2026-11-23: the core stayed paused after a switch to
+    an account with quota). `account` is the account now in use (default: the launch's). A hold that
+    recorded no account, or an account that cannot be read now, is left as it is."""
+    hold = read_hold(workspace, seat)
+    if not hold or hold.get("status") != "held":
+        return None
+    held = hold.get("account")
+    now_on = launch_identity(workspace)[1] if account is None else account
+    if not held or not now_on or held == now_on:
+        return None
+    return clear(workspace, now, by="account-change", seat=seat)
+
+
 def release_pane_hold(workspace: Path, now: Optional[float] = None,
                       seat: Optional[str] = None) -> Optional[dict]:
     """Lift a hold a live core's limit screen caused, once that core is idle or working again."""

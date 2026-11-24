@@ -1009,6 +1009,22 @@ class AccountSwitch(SeatCase):
         self.assertEqual(len(self.posted()), 1)
         self.assertEqual(health(self.ws)["state"], "ok")
 
+    def test_a_login_change_lifts_the_cores_limit_hold_but_a_workers_seat_leaves_it(self):
+        import core_limit_hold
+        held = {"status": "held", "kind": "usage-limit", "model": None, "evidence_at": 1, "set_at": 1,
+                "until": 4102444800, "strikes": 1, "reason": "paused"}
+        self.sign_in("tok-a")
+        for worker, lifted in (("w1", False), ("", True)):
+            with self.subTest(worker=worker):
+                core_limit_hold._write_hold(self.ws, held)
+                s = self.make()
+                s.worker = worker
+                s.ensure_server()
+                self.sign_in("tok-b" + worker)
+                s.fresh_auth()
+                self.assertEqual(core_limit_hold.read_hold(self.ws)["status"], "cleared" if lifted else "held")
+                s.close_server()
+
     def test_a_sign_in_while_idle_puts_the_health_back_to_ok_without_a_task(self):
         self.sign_in("tok-a", revoke="tok-a")
         self.task("task-1.txt")
@@ -1292,6 +1308,20 @@ class QuotaCard(SeatCase):
         self.assertEqual(s.step(), "failed")
         self.assertEqual(len(self.cards), 1, "a second card for the same limit")
         self.assertIn("quota: quota-card", self.out.getvalue())
+
+    def test_every_owner_message_during_the_limit_gets_the_card_once(self):
+        self.task("task-1.txt", "access_tier: owner\ntask: hi\n")
+        self.plan("limit", "limit", "limit", "limit")
+        s = self.make(quota=self.quota(), retry_s=3600.0, hold_s=3600.0)
+        s.ensure_server()
+        self.assertEqual(s.step(), "failed")
+        self.assertEqual(len(self.cards), 1)
+        self.task("task-2.txt", "access_tier: owner\ntask: are you there?\n")
+        self.task("task-3.txt", "access_tier: team\ntask: a collaborator\n")
+        self.assertEqual([s.step(), s.step()], ["failed", "failed"])
+        self.now[0] += 3601
+        s.step()                                    # task-1 again
+        self.assertEqual(len(self.cards), 2, "task-2 gets its card; task-1 again and a collaborator do not")
 
     def test_the_errors_own_words_give_the_reset_when_no_window_says(self):
         self.task("task-1.txt")

@@ -760,6 +760,29 @@ class AccountChange(unittest.TestCase):
         self.assertIsNone(clh.active_hold(self.ws))
         self.assertEqual(self.gate(), 0, "the old account's evidence re-armed the hold")
 
+    def test_a_live_core_held_under_one_account_is_released_once_it_is_on_another(self):
+        """VM 2026-11-23: the core stayed paused after the owner switched to an account with quota.
+        The monitor lifts the hold as soon as the account in use is not the one the hold was seen under."""
+        import os
+        from unittest import mock
+        self.sign_in("acct-a", "a@example.com")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}):
+            clh.hold_while_wedged(self.ws, "You've hit your usage limit · resets 3pm", self.now)
+            self.assertEqual(clh.read_hold(self.ws)["status"], "held")
+            self.assertIsNone(clh.release_on_account_change(self.ws, self.now + 1), "the same account stays held")
+            self.sign_in("acct-b", "b@example.com")
+            released = clh.release_on_account_change(self.ws, self.now + 2)
+        self.assertEqual((released["status"], released["cleared_by"]), ("cleared", "account-change"))
+
+    def test_a_hold_with_no_account_or_an_unreadable_one_now_is_left_alone(self):
+        t = self.now
+        clh._write_hold(self.ws, {"status": "held", "kind": "usage-limit", "model": None, "evidence_at": t,
+                                  "set_at": t, "until": t + 600, "strikes": 1, "reason": "paused"})
+        self.assertIsNone(clh.release_on_account_change(self.ws, t, account="B"))
+        clh._write_hold(self.ws, dict(clh.read_hold(self.ws), account="A"))
+        self.assertIsNone(clh.release_on_account_change(self.ws, t, account=""))
+        self.assertEqual(clh.read_hold(self.ws)["status"], "held")
+
     def test_a_limit_hit_before_any_hold_is_not_pinned_on_the_account_signed_in_next(self):
         """The owner's report: account A ran with no hold on record, hit its limit and the core
         died; the owner signed in to account B before the next launch. The gate had never

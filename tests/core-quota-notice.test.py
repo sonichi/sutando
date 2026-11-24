@@ -281,5 +281,37 @@ class PausedNotice(Base):
         self.assertEqual(len(self.paused_notices()), 1)
 
 
+class EveryMessage(Base):
+    """Owner rule (VM 2026-11-23): while out of quota, every owner message gets the card right away;
+    none waits silently behind the limit, and none is carded twice."""
+
+    def test_each_owner_message_during_the_limit_gets_the_card_once(self):
+        q = self.notice()
+        self.assertEqual(q.hit("3:05 PM", tasks=["t1"]), "quota-card")
+        self.assertEqual(q.hit("3:05 PM", tasks=["t1"]), "", "the message the first card answered")
+        self.assertEqual(q.hit("3:05 PM", tasks=["t1", "t2"]), "quota-card-again")
+        self.assertEqual(q.hit("3:05 PM", tasks=["t1", "t2"]), "")
+        self.assertEqual(q.hit("3:05 PM", tasks=["t3"]), "quota-card-again")
+        self.assertEqual(len(self.cards), 3)
+        self.assertTrue(all("usage limit" in c for c in self.cards))
+        q.cleared()
+        self.assertEqual(q.hit("", tasks=["t3"]), "quota-card", "a new limit is a new episode")
+
+    def test_after_the_paused_notice_told_it_no_card_follows(self):
+        self.posted = False
+        q = self.notice()
+        q.hit("", tasks=["t1"])
+        q.yield_to_notice()
+        self.posted = True
+        self.assertEqual(q.hit("", tasks=["t2"]), "")
+        self.assertEqual(self.cards, [self.cards[0]])
+
+    def test_only_the_owners_waiting_messages_count(self):
+        (self.ws / "tasks" / "task-a.txt").write_text("id: task-a\naccess_tier: owner\ntask: hi\n")
+        (self.ws / "tasks" / "task-b.txt").write_text("id: task-b\naccess_tier: team\ntask: hi\n")
+        (self.ws / "tasks" / "task-c.txt").write_text("id: task-c\ntask: no tier\n")
+        self.assertEqual(cqn.owner_waiting(self.ws), ["task-a"])
+
+
 if __name__ == "__main__":
     unittest.main()

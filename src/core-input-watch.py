@@ -1146,7 +1146,8 @@ def quota_step(quota, limited, text, now=None):
     if quota is None:
         return ""
     try:
-        done = quota.hit(*limit_reset(text, now)) if limited else quota.cleared()
+        done = quota.hit(*limit_reset(text, now), tasks=core_quota_notice.owner_waiting(quota.workspace)) \
+            if limited else quota.cleared()
     except Exception as exc:  # noqa: BLE001
         done = f"quota-failed ({type(exc).__name__})"
     if done:
@@ -1180,6 +1181,8 @@ def limit_reply_step(workspace, settled, seen, pane, runtime, now=None, repo=_RE
                 {"launcher": str(repo / "src" / "agent" / "start-cli.sh"),
                  "switch": str(repo / "scripts" / "switch-model.sh")})
     try:
+        if not seat and core_limit_hold.release_on_account_change(workspace, now):
+            print("limit hold lifted: the core is signed in to another account", file=_sys.stderr, flush=True)
         state, kind, prompt = settled
         if state == "blocked-human" and is_usage_limit(kind, prompt):
             carded = False

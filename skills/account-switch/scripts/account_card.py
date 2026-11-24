@@ -176,7 +176,7 @@ def identity(auth_text: str) -> Optional[tuple]:
         return None
     email = claims.get("email") if isinstance(claims.get("email"), str) else ""
     plan = auth_claims.get("chatgpt_plan_type") if isinstance(auth_claims.get("chatgpt_plan_type"), str) else ""
-    label = f"{email} ({plan})" if email and plan else email or (f"ChatGPT account ({plan})" if plan else "ChatGPT account")
+    label = email or "ChatGPT account"  # the email only: no plan name
     return hashlib.sha256(ident.encode("utf-8")).hexdigest()[:16], label
 
 
@@ -290,11 +290,10 @@ def current(rt: str, *, run=subprocess.run, codex_read=None) -> dict:
         if not acct.get("kind") and ident is None:
             return {"runtime": rt, "signed_in": False, "shown": "", "key": ""}
         email = masked(str(acct.get("email") or "")) or (masked_label(ident[1]) if ident else "")
-        plan = f" ({acct['plan']})" if acct.get("plan") and acct.get("email") else ""
-        return {"runtime": rt, "signed_in": True, "shown": (email + plan) or "a ChatGPT account",
+        return {"runtime": rt, "signed_in": True, "shown": email or "a ChatGPT account",
                 "key": ident[0] if ident else ""}
     st = claude_status(run)
-    shown = (masked(st["email"]) or "an Anthropic account") + (f" ({st['plan']})" if st["plan"] else "")
+    shown = masked(st["email"]) or "an Anthropic account"  # the email only: the owner reads no plan name
     return {"runtime": rt, "signed_in": st["signed_in"], "shown": shown if st["signed_in"] else "", "key": ""}
 
 
@@ -721,8 +720,7 @@ def do_switch(ws: Path, key: str, *, restart=restart_core, ready=core_ready, liv
     if not acct:
         return "error", f"{asked} Codex did not confirm the saved sign-in. Ask me for the account card to check."
     shown = masked(str(acct.get("email") or ""))
-    shown = (shown + (f" ({acct['plan']})" if acct.get("plan") else "")) if shown else \
-        ("no ChatGPT account" if not acct.get("kind") else "another account")
+    shown = shown or ("no ChatGPT account" if not acct.get("kind") else "another account")
     return "error", f"{asked} But its saved sign-in is {shown}, not {label}. Ask me for the account card to try again."
 
 
