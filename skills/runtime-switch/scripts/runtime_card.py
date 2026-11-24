@@ -669,14 +669,13 @@ def restart_lock_clears(ws: Path, *, sleep=time.sleep, clock=time.time) -> Optio
     return rid
 
 
-def restart_left(ws: Path, rid: str, since: float) -> str:
+def restart_left(ws: Path, rid: str) -> str:
     """What the restart that was in the way came to, from the result its launcher leaves under its id:
     the runtime it confirmed and published, or "" for anything less (no result, another restart's, a
-    publication that failed). With no id read off the lock, only a result left since `since` is its."""
+    publication that failed). With no id read off the lock nothing identifies its result, and none is
+    taken for it: a time near this switch is not an identity."""
     res = _read_json(ws.joinpath(*RESTART_RESULT))
-    at = res.get("at")
-    mine = res.get("rid") == rid if rid else (isinstance(at, (int, float)) and not isinstance(at, bool) and at >= int(since))
-    if not mine or res.get("published") is not True or res.get("runtime") not in NAMES:
+    if not rid or res.get("rid") != rid or res.get("published") is not True or res.get("runtime") not in NAMES:
         return ""
     return str(res["runtime"])
 
@@ -759,7 +758,7 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
                 if held_by is not None:
                     # Only what that very restart published counts: an older record says nothing about
                     # the core it left, and one it could not publish is not known either.
-                    left, now_on = restart_left(ws, held_by, started), confirmed_record(ws)
+                    left, now_on = restart_left(ws, held_by), confirmed_record(ws)
                     if left == args.runtime and now_on.get("runtime") == args.runtime:
                         rc, started = 0, float(now_on["started_at"])    # already there: nothing to restart
                     elif left and left != args.runtime:
