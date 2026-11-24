@@ -85,12 +85,14 @@ def mcp_proxy_command(value: "str | None") -> "tuple[str, str]":
 
 
 def child_env(cfg: dict, environ=None) -> dict:
-    """The allowlist, the ACP command's own directory first on PATH, and the package root for `-m`."""
+    """The allowlist, the ACP command's own directory first on PATH, the package root for `-m`, and agy's
+    self-update off."""
     env = cm.child_env_from(ENV_KEEP, environ)
     rest = [p for p in env.get("PATH", "/usr/bin:/bin").split(os.pathsep) if p]
     first = os.path.dirname(shlex.split(cfg["ACP_COMMAND"])[0])
     env["PATH"] = os.pathsep.join([first] + [p for p in rest if p != first])
     env["PYTHONPATH"] = str(Path(gc.__file__).resolve().parents[3])
+    env[gc.NO_SELF_UPDATE[0]] = gc.NO_SELF_UPDATE[1]   # agy never updates itself in place (connector's note)
     return env
 
 

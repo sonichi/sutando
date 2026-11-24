@@ -64,6 +64,10 @@ from ...task_io import (COLLABORATOR, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, 
 NAME = "Antigravity"
 LIMITED_NO_SEND = "[no-send] Antigravity is at its usage limit; the owner was sent the account card\n"
 DEFAULT_ACP_COMMAND = "agy acp"
+# agy replaces its own binary in place when it updates itself (VM 2026-11-24 15:08: the app's pinned 1.5.13
+# became 1.5.16, and the desktop, which checks its pin, then said Antigravity was not installed). The app's
+# wrapper turns that off, but an ACP command naming the binary itself does not: every agy started here gets it.
+NO_SELF_UPDATE = ("AGY_CLI_DISABLE_AUTO_UPDATE", "1")
 NO_REPLY = "NO_REPLY"
 HELD_WAIT_S = held_start.WAIT_S
 RETRY_S = 60.0
@@ -931,7 +935,7 @@ def _prepare(args):
     args.cwd = os.path.abspath(os.path.expanduser(args.cwd or os.getcwd()))
     args.bridge_state = os.path.abspath(os.path.expanduser(
         getattr(args, "bridge_state", None) or os.path.join(args.work.rstrip(os.sep) + ".bridge", "state")))
-    args.child_env = dict(os.environ)
+    args.child_env = dict(os.environ, **dict([NO_SELF_UPDATE]))
 
 
 def _paths(args, base):

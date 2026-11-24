@@ -1424,6 +1424,8 @@ class ConnectorTest(unittest.TestCase):
         gc._prepare(a)
         gc._paths(a, str(self.w.root))
         self.assertEqual(a.acp_argv, ["agy", "acp"])
+        # Every agy the connector starts has its self-update off, whatever command names it.
+        self.assertEqual(a.child_env.get("AGY_CLI_DISABLE_AUTO_UPDATE"), "1")
         self.assertEqual(gc.Connector(a).name, "Antigravity")
         self.assertIn("run `agy` once in a terminal and sign in, or run `agy acp --login`", gc.NOT_SIGNED_IN)
         with self.assertRaises(SystemExit):
@@ -2062,6 +2064,8 @@ class InstallVerifyTest(unittest.TestCase):
         self.assertEqual(env["PATH"].split(os.pathsep)[0], str(self.bin))
         self.assertNotIn("SECRET_TOKEN", env)
         self.assertNotIn("GEMINI_API_KEY", env, "the unit passes no API key; agy uses its own sign-in")
+        # VM 2026-11-24: agy replaced the app's pinned binary when started without its wrapper.
+        self.assertEqual(env.get("AGY_CLI_DISABLE_AUTO_UPDATE"), "1", "agy never updates itself in place")
         self.assertNotIn("--runtime", argv)
 
     def write_config(self, **more):
