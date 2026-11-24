@@ -232,6 +232,17 @@ class ConnectorCards(unittest.TestCase):
         self.assertEqual(cc.outcome(self.state, qid), "unsure", "not a confirmed drop")
         self.assertEqual(cc.queue(self.state, ROOM, body, card, **keyed), qid)
         self.assertEqual(list(self.state.joinpath(*cc.OUTBOX).iterdir()), [], "a plain repeat is still one card")
+        # The replacement cannot be written: the unsure record is still there, so a restart can try again.
+        with mock.patch.object(cc, "_write", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                cc.queue(self.state, ROOM, body, card, again=True, **keyed)
+        self.assertEqual((cc.outcome(self.state, qid), list(self.state.joinpath(*cc.OUTBOX).iterdir())), ("unsure", []))
+        # Written, and stopped before the record was retired: both files exist. The sweep does not expire
+        # or lose it, and the same call again leaves one entry and retires the record.
+        with mock.patch.object(Path, "unlink", side_effect=OSError("stopped here")):
+            with self.assertRaises(OSError):
+                cc.queue(self.state, ROOM, body, card, again=True, **keyed)
+        self.assertEqual((cc.outcome(self.state, qid), len(list(self.state.joinpath(*cc.OUTBOX).iterdir()))), ("unsure", 1))
         self.assertEqual(cc.queue(self.state, ROOM, body, card, again=True, **keyed), qid, "the same id: the same dedupe key")
         self.assertEqual(cc.outcome(self.state, qid), "")
         self.sent.clear()

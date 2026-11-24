@@ -151,7 +151,12 @@ class Notice(Base):
         self.sweep(self.queued_at(second) + connector_cards.MAX_QUEUED_S + 1)
         self.assertEqual(connector_cards.outcome(self.bridge, second), "unsure")
         self.assertEqual(self.tick(LIMITED, 5.0), "quota-card-unsure")
+        # The requeue fails once (and the supervisor restarts): the next try still queues it, never gives up.
+        with mock.patch.object(connector_cards, "_write", side_effect=OSError("disk full")):
+            self.assertEqual(self.tick(LIMITED, quota_card.RETRY_S), "quota-not-posted")
+        self.assertEqual((connector_cards.outcome(self.bridge, second), self.queued()), ("unsure", []))
         self.assertEqual(self.tick(LIMITED, quota_card.RETRY_S), "quota-card")
+        self.assertEqual(len(self.queued()), 1)
         self.assertEqual(quota_card.load(self.root)["qid"], second, "the same queue id: one message at the server")
         self.assertNotIn("again", quota_card.load(self.root))
         # The second is posted by a real sweep: told, once.

@@ -100,13 +100,15 @@ def queue(bridge_state, room: str, body: str, card: dict, *, now=None, key: str 
     else:
         qid = "%016x%s" % (int(at_ns) & 0xFFFFFFFFFFFFFFFF, hashlib.sha256(key.encode("utf-8")).hexdigest()[:16])
         marker = Path(bridge_state).joinpath(*KEYS) / qid
-        if marker.exists():
-            if not again or outcome(bridge_state, qid) != "unsure":
-                return qid
-            (Path(bridge_state).joinpath(*OUTCOMES) / qid).unlink(missing_ok=True)
+        if marker.exists() and not (again and outcome(bridge_state, qid) == "unsure"):
+            return qid
     _write(Path(bridge_state).joinpath(*OUTBOX) / (qid + ".json"),
            dict({"room": room, "body": body, "card": card, "queued_at": time.time() if now is None else now},
                 **({"edit": edit} if edit else {})))
+    if key and again:
+        # Retired only once the replacement is on disk: a stop before this leaves `unsure`, and the same
+        # call again writes the entry over and gets here; the sweep's own outcome replaces it otherwise.
+        (Path(bridge_state).joinpath(*OUTCOMES) / qid).unlink(missing_ok=True)
     if key:
         # The marker follows the card: a stop between the two queues it once more, never drops it.
         marker.parent.mkdir(parents=True, exist_ok=True)
