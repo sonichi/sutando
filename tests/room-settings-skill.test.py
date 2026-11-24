@@ -103,6 +103,34 @@ class TestSkillRules(unittest.TestCase):
         self.assertIn("in your DM, as a reply to you, or by mentioning you", owner)
         self.assertIn("Typing your name without a mention, or editing an earlier message, does not count.", owner)
 
+    def test_only_the_owner_dm_is_exempt(self):
+        read = " ".join(section(self.text, "Read first").split())
+        self.assertIn("In your DM with your owner", read)
+        self.assertIn("a direct room with at most two joined members, you and your owner", read)
+        self.assertIn("A direct room with a third member is a room like any other, and its settings apply.", read)
+        self.assertNotIn("In a DM,", read)
+
+    def test_only_a_stale_conflict_is_retried(self):
+        back = " ".join(section(self.text, "What comes back").split())
+        self.assertIn("**`CONFLICT`** for a stale revision", back)
+        self.assertIn("try once more. Any other `CONFLICT`", back)
+        self.assertIn("tell your owner what its message says, and don't try again.", back)
+
+    def test_filter_off_confirmation_uses_the_new_task(self):
+        settings = " ".join(section(self.text, "The settings").split())
+        self.assertIn("send the change with the `task_id` of their new message that confirms it, "
+                      "never the first one's", settings)
+
+    def test_task_id_is_the_asking_message(self):
+        owner = " ".join(section(self.text, "Only your owner").split())
+        self.assertIn("the task id of the very message that asks for it", owner)
+        self.assertIn("never an earlier message's", owner)
+
+    def test_refusals_in_plain_words(self):
+        tail = " ".join(self.text.rsplit("## What comes back", 1)[1].split())
+        self.assertIn("Tell your owner every refusal in plain words.", tail)
+        self.assertIn("Never show them the error codes or reasons", tail)
+
     def test_old_or_closed_task_asks_again(self):
         back = " ".join(section(self.text, "What comes back").split())
         for reason in ("not_owner", "no_task", "no_origin", "task_not_yours",
@@ -153,7 +181,7 @@ class TestSkillRules(unittest.TestCase):
         self.assertIn("room's own rules", read)
 
     def test_dm_has_no_effect(self):
-        self.assertIn("Don't change it in the DM.", section(self.text, "Read first"))
+        self.assertIn("Don't change it in that DM.", " ".join(section(self.text, "Read first").split()))
 
     def test_team_guest_and_mention_rules(self):
         settings = " ".join(section(self.text, "The settings").split())

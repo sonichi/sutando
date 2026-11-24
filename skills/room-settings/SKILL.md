@@ -16,8 +16,8 @@ setting changed when the Action did not succeed.
 - Only your owner can change your settings: the task must have `access_tier: owner`. If
   anyone else asks, say only your owner can change how you work here, and change nothing.
   Don't call the Action for them.
-- The change must come from your owner's own message to you: pass that message's task id as
-  `task_id`. For a task file, `python3 skills/room-settings/scripts/task_id.py <task file>`
+- The change must come from your owner's own message to you: pass the task id of the very
+  message that asks for it as `task_id`, never an earlier message's. For a task file, `python3 skills/room-settings/scripts/task_id.py <task file>`
   prints it; don't work it out from the file yourself. Exit 2 means the task is not your
   owner's: change nothing. On an MCP event, use the event's `task_id`. If there is none
   (exit 3), or the change is refused because of the task, ask them to send it to you
@@ -37,10 +37,13 @@ the room's own rules and the defaults.
 When your owner asks what your settings are or how you behave, answer from `policy`, in plain
 words. If it differs from the `card` (for example the room itself is mentions-only), say so.
 
-In a DM, what you read, when you answer, who you answer and members' access are not used:
-you get every message there, whatever `policy` says. If the room your owner means is a DM,
-say so: it only matters in rooms with other people. To change one, ask which room they
-mean, unless they already named it. Don't change it in the DM.
+In your DM with your owner, what you read, when you answer, who you answer and members'
+access are not used: you get every message there, whatever `policy` says. That DM is a direct
+room with at most two joined members, you and your owner (check with `room.members.list`).
+A direct room with a third member is a room like any other, and its settings apply. If the
+room your owner means is your DM with them, say so: these settings only matter in rooms with
+other people. To change one, ask which room they mean, unless they already named it. Don't
+change it in that DM.
 
 ## The settings
 
@@ -83,6 +86,8 @@ room. Never promise that it does. If your owner asks for it, say so, and change 
 - The secrets check only matters with Team access, and only for members you work with as
   your Team. Turning it off lets a secret in your answer to them be posted: say that, and
   ask your owner to confirm before you send the change. It changes nothing for your owner or Guests.
+  Your question ends the first message's task, so send the change with the `task_id` of
+  their new message that confirms it, never the first one's (that is refused as closed).
 - "What reaches you" is about which messages are sent to you to answer. It does not hide the
   room's history from you, so never promise your owner that you can't read other messages.
 - Before you list people, check each one is in the room: `room.action.read` with action
@@ -123,7 +128,9 @@ Never pass `asked_by`.
   whether the change then ran or failed (an approved change can still fail if the settings
   moved meanwhile). Then read again with `room.agent_policy.read` to say what applies now.
 - **`CONFLICT`** for a stale revision: the settings changed since you read them. Read again,
-  check the change still makes sense, and try once more.
+  check the change still makes sense, and try once more. Any other `CONFLICT` (for example
+  Team access when you can't work with a Team yet): tell your owner what its message says,
+  and don't try again.
 - **`FORBIDDEN`** with a `reason`:
   - `not_owner`: the person asking is not your owner. Change nothing.
   - `no_task`, `no_origin`, `task_not_yours`: the request did not come straight from your
@@ -137,6 +144,9 @@ Never pass `asked_by`.
   and tell your owner what is stored.
 - **`INVALID_INPUT`:** fix the arguments and try once more. `room.actions.describe` with the
   action shows the schema.
+
+Tell your owner every refusal in plain words. Never show them the error codes or reasons
+above (`FORBIDDEN`, `no_origin` and the like).
 
 Never retry a refused change in another way, and never tell anyone a setting is on before
 `room.agent_policy.read` shows it stored.
