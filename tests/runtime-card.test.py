@@ -623,6 +623,60 @@ class Switch(Base):
                 self.ws.joinpath(*rtc.RUNNING).write_text(json.dumps(
                     {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": 1e12}))
 
+    def carded(self):
+        return self.run_(["switch", "--room", DM, "--runtime", "claude", "--attempt", self.attempt, "--card", "$card1"])
+
+    def test_a_restart_put_off_waits_for_the_other_restart_then_switches_on_the_same_card(self):
+        lock = self.ws.joinpath(*rtc.RESTART_LOCK)
+        lock.mkdir(parents=True)
+        self.restart_rc = rtc.DEFERRED
+        polls, real, first = [], self.clock.sleep, self.restart
+
+        def restart(rt):
+            code = first(rt)
+            self.restart_rc = 0             # the next one is not in anybody's way
+            return code
+        self.restart = restart
+
+        def sleep(s):
+            polls.append(s)
+            real(s)
+            if len(polls) == 3:
+                lock.rmdir()                # the other restart ended
+        self.clock.sleep = sleep
+        rc, out = self.carded()
+        self.assertEqual((rc, out["outcome"], out["event_id"]), (0, "done", "$card1"))
+        self.assertEqual((self.restarts, polls[:3]), (["claude", "claude"], [rtc.DEFER_POLL_S] * 3))
+        said = [words for event, words in self.fake.edits() if event == "$card1"]
+        self.assertIn("Waiting for another restart to finish, then I'll switch to Claude Code. The core is still on Codex.",
+                      said[-2])
+        self.assertIn("Switched. The core is now running on Claude Code", said[-1])
+        self.assertEqual(len(self.fake.cards()), 1, "one card throughout")
+        self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists())
+
+    def test_a_restart_still_in_the_way_after_the_wait_is_not_asked_again_and_the_card_says_so(self):
+        lock = self.ws.joinpath(*rtc.RESTART_LOCK)
+        lock.mkdir(parents=True)
+        self.restart_rc = rtc.DEFERRED
+        began = self.clock.t
+        rc, out = self.carded()
+        self.assertEqual((rc, out["outcome"], out["restart"], out["rc"]), (1, "error", "not-restarted", rtc.DEFERRED))
+        self.assertEqual(self.restarts, ["claude"], "the lock never cleared: no second restart")
+        self.assertGreaterEqual(self.clock.t - began, rtc.DEFER_WAIT_S)
+        self.assertIn("Still busy: another restart was still in the way after I waited", out["say"])
+        self.assertIn("The core is still on Codex. Ask me for the runtime card to try again.", out["say"])
+        self.assertEqual(self.fake.edits()[-1], ("$card1", "Core runtime: " + out["say"]))
+        self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists(), "the attempt is released: she can tap again")
+        # Put off twice with the lock gone both times (a lost lease): asked once more, then the same words.
+        lock.rmdir()
+        self.restarts.clear()
+        self.ws.joinpath(*rtc.RUNNING).write_text(json.dumps(
+            {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": 1e12}))
+        rc, out = self.carded()
+        self.assertEqual((self.restarts, out["rc"]), (["claude", "claude"], rtc.DEFERRED))
+        self.assertIn("Still busy", out["say"])
+        self.assertGreater(rtc.RUNNING_STALE_S, 2 * rtc.RESTART_TIMEOUT_S + rtc.DEFER_WAIT_S)
+
     def test_an_unclean_restart_still_confirms_what_it_can(self):
         self.restart_rc, self.launcher_confirms, self.launcher_selects = 1, False, False
         rc, out = self.switch()

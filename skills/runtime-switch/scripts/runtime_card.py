@@ -82,7 +82,12 @@ EXEC_LOCK = ("state", "runtime-card-switch.exec.lock")
 RECORD = ("state", "core-runtime.json")
 RESTART_TIMEOUT_S = 1500
 CONFIRM_TIMEOUT_S, CONFIRM_POLL_S = 180, 5
-RUNNING_STALE_S = RESTART_TIMEOUT_S + CONFIRM_TIMEOUT_S + 600
+# A restart put off because another one holds graceful-restart.sh's lock: the switch waits for that
+# lock to go, this long at most, and then asks once more.
+RESTART_LOCK = ("state", "locks", "graceful-restart.lock")
+DEFERRED = 4
+DEFER_WAIT_S, DEFER_POLL_S = 600, 10
+RUNNING_STALE_S = 2 * RESTART_TIMEOUT_S + DEFER_WAIT_S + CONFIRM_TIMEOUT_S + 600
 # graceful-restart.sh exits 3/4/5 before it stops the core; any other failure may have restarted it.
 NOT_RESTARTED = (3, 4, 5)
 RESTART_REASONS = {3: "the core could not get ready to restart",
@@ -646,6 +651,18 @@ def restart_core(rt: str, run=subprocess.run) -> int:
         return 127
 
 
+def restart_lock_clears(ws: Path, *, sleep=time.sleep, clock=time.time) -> bool:
+    """Wait until graceful-restart.sh's lock is gone (the other restart ended), DEFER_WAIT_S at most.
+    True when it is gone; False when it is still held at the end, and then nothing is asked again."""
+    lock = ws.joinpath(*RESTART_LOCK)
+    deadline = clock() + DEFER_WAIT_S
+    while lock.exists():
+        if clock() >= deadline:
+            return False
+        sleep(DEFER_POLL_S)
+    return True
+
+
 def check(ws: Path, rt: str, since: float) -> dict:
     """{core, selected, record, configured}: whether the confirmed record names `rt` with a session
     created after `since` (tmux stamps whole seconds), and whether the launcher's next pick is `rt`."""
@@ -712,10 +729,25 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
             was = configured_runtime()
             started = clock()
             rc = restart(args.runtime)
+            waited = False
+            if rc == DEFERRED:
+                # Not a failure yet: say so on the card, wait for the other restart, and ask once more.
+                waited = True
+                _answer(ws, args.room, args.card, "pending", "Waiting",
+                        f"Waiting for another restart to finish, then I'll switch to {name(args.runtime)}. "
+                        f"The core is still on {name(was)}.",
+                        f"runtime-card:{args.attempt}:waiting", core=core, execute=execute)
+                if restart_lock_clears(ws, sleep=sleep, clock=clock):
+                    was, started = configured_runtime(), clock()
+                    rc = restart(args.runtime)
             if rc in NOT_RESTARTED:
                 reason = RESTART_REASONS[rc]
                 words = (f"I could not switch to {name(args.runtime)}. The core is still on {name(was)}. "
                          f"{reason[:1].upper()}{reason[1:]}.")
+                if waited and rc == DEFERRED:
+                    words = (f"Still busy: another restart was still in the way after I waited, so I did not "
+                             f"switch to {name(args.runtime)}. The core is still on {name(was)}. "
+                             "Ask me for the runtime card to try again.")
                 out = _answer(ws, args.room, args.card, "error", "Not switched", words,
                               f"runtime-card:{args.attempt}:outcome", core=core, execute=execute, tries=POST_TRIES,
                               sleep=sleep)
