@@ -330,6 +330,8 @@ class Launcher(unittest.TestCase):
             "ANTHROPIC_BASE_URL": "http://127.0.0.1:9", "SUTANDO_TEST_MODE": "1",
             "SUTANDO_WORKSPACE": str(self.ws), "SUTANDO_RESTART_GRACE_S": "1",
             "SUTANDO_TMUX_SOCKET": str(td / "run" / "tmux.sock"),
+            # The held inbox would outlive the test and run the real launcher (core_held_inbox.py).
+            "SUTANDO_NO_HELD_INBOX": "1",
         }
 
     def tearDown(self):

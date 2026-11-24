@@ -603,6 +603,12 @@ if [ -n "$PY" ] && [ -f "$REPO/src/core_limit_hold.py" ]; then
     [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "held: ${_hold_line:-provider limit}"
     # No core window will exist, so a notifier left running would type into a sibling.
     tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+    # Nothing else reads tasks/ now: the held inbox posts the owner's cards, acts on "retry now" /
+    # "switch to <model>", and launches the core once the hold lifts (src/core_held_inbox.py, one per workspace).
+    if [ -f "$REPO/src/core_held_inbox.py" ] && [ -z "${SUTANDO_NO_HELD_INBOX:-}" ] \
+       && [ "${SUTANDO_TEST_MODE:-}" != 1 ]; then
+      nohup "$PY" "$REPO/src/core_held_inbox.py" --repo "$REPO" >> /tmp/core-held-inbox.log 2>&1 < /dev/null &
+    fi
     release_orchestrator_lock
     exit 75
   fi
