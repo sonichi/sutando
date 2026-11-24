@@ -38,6 +38,11 @@ claude_proxy_owner_off() {
   claude_routing_is_off "$(claude_routing_switch CREDENTIAL_PROXY_ENABLED)"
 }
 
+# Whether a session goes direct: tracking on, or the owner keeps the proxy off.
+claude_routes_direct() {
+  claude_direct_routing || claude_proxy_owner_off
+}
+
 # In the session's own environment (which tmux may take from its server, not the launcher).
 claude_unset_local_proxy() {
   if claude_proxy_url_is_local "${ANTHROPIC_BASE_URL:-}"; then

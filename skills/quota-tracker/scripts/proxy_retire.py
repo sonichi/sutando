@@ -3,12 +3,15 @@
 when the status line recorder is turned off.
 
 Off only on complete positive evidence: the recorder is on; every process this user owns was
-enumerated and none carries the local proxy as ANTHROPIC_BASE_URL, nor does `env` in the
-settings a live Claude process runs under (its config dir's, its project's); nothing holds an established connection to
-the proxy port; and a fresh status-line record exists for the core's account. A process
-list, environment, working folder or settings file that cannot be read keeps the proxy. Then `launchctl bootout` (the plist is
-kept) and, if the job's own verified PID outlives that, that PID alone is stopped. Every
-decision is recorded in `<workspace>/state/quota-proxy-retire.json` with its reason.
+enumerated (no diagnostics, no ambiguous row) and none carries the local proxy as
+ANTHROPIC_BASE_URL, nor does `env` in the settings a live Claude process runs under (its config
+dir's, its project's); a clean read of the proxy port shows no established connection; and a
+fresh status-line record exists for the core's account. Anything unread or ambiguous keeps it.
+
+The job is per user, so the intent is too: `intent_path()` records `retiring` before
+`launchctl bootout` (the plist is kept) and `retired` once the port stops listening. Nothing is
+signalled by PID; a run that finds `retiring` reconciles it against the job and the port. Each
+decision is also logged in `<workspace>/state/quota-proxy-retire.json` with its reason.
 With tracking off, `ensure_running` brings the agent up (bootstrap, or install if never
 installed) unless the owner set CREDENTIAL_PROXY_ENABLED off.
 
@@ -19,7 +22,6 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -51,16 +53,39 @@ def plist_path() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
 
 
-def job_pid(runner: Callable = _run) -> Optional[int]:
-    """The PID launchd reports for the loaded job, else None (not loaded, or not running)."""
-    out = runner(["launchctl", "print", service()])
-    if out is None or out.returncode != 0:
+def intent_path() -> Path:
+    return Path.home() / "Library" / "Application Support" / "Sutando" / "credential-proxy-retire.json"
+
+
+def read_intent() -> dict:
+    try:
+        data = json.loads(intent_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_intent(status: str, **fields) -> bool:
+    try:
+        cfg._write_json(intent_path(), {"status": status, "by": "quota-tracker", **fields,
+                                        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+    except OSError:
+        return False
+    return True
+
+
+def _diagnostics(out) -> bool:
+    return bool((getattr(out, "stderr", "") or "").strip())
+
+
+def listening(runner: Callable = _run) -> Optional[bool]:
+    """Whether the proxy port has a listener; None when that cannot be read cleanly."""
+    out = runner(["lsof", "-nP", f"-iTCP:{PORT}", "-sTCP:LISTEN"])
+    if out is None or _diagnostics(out):
         return None
-    for line in (out.stdout or "").splitlines():
-        key, _, val = line.strip().partition(" = ")
-        if key == "pid" and val.strip().isdigit():
-            return int(val.strip())
-    return None
+    if out.returncode == 0:
+        return True
+    return False if not (out.stdout or "").strip() else None
 
 
 def job_loaded(runner: Callable = _run) -> bool:
@@ -108,8 +133,18 @@ def sessions_on_proxy(runner: Callable = _run) -> Tuple[List[str], List[str]]:
     out = runner(["ps", "-xeww", "-U", str(os.getuid()), "-o", "pid=,command="])
     if out is None or out.returncode != 0:
         return found, ["process list unreadable"]
+    if _diagnostics(out):
+        return found, ["process list returned diagnostics"]
+    if not (out.stdout or "").strip():
+        return found, ["process list empty"]
     for line in (out.stdout or "").splitlines():
+        if not line.strip():
+            continue
         pid, _, cmd = line.strip().partition(" ")
+        cmd = cmd.strip()
+        if not pid.isdigit() or not cmd:
+            unknown.append(f"ambiguous process row {line.strip()[:60]!r}")
+            continue
         name = os.path.basename(cmd.split(" ", 1)[0])
         env = _env_pairs(cmd)
         if not env:
@@ -133,17 +168,21 @@ def sessions_on_proxy(runner: Callable = _run) -> Tuple[List[str], List[str]]:
 
 
 def proxy_connections(runner: Callable = _run) -> Optional[List[str]]:
-    """Established TCP connections on the proxy port as `command pid`; None when unknown."""
+    """Established TCP connections on the proxy port as `command pid`; None when not cleanly read."""
     out = runner(["lsof", "-nP", f"-iTCP:{PORT}", "-sTCP:ESTABLISHED"])
-    if out is None:
+    if out is None or _diagnostics(out):
         return None
-    if out.returncode != 0 and not (out.stdout or "").strip():
-        return []  # lsof exits 1 when nothing matches
+    lines = (out.stdout or "").splitlines()
+    if out.returncode != 0:
+        return [] if not lines else None  # lsof exits 1, silently, when nothing matches
+    if not lines or not lines[0].startswith("COMMAND"):
+        return None
     rows = []
-    for line in (out.stdout or "").splitlines()[1:]:
+    for line in lines[1:]:
         parts = line.split()
-        if len(parts) >= 2:
-            rows.append(f"{parts[0]} {parts[1]}")
+        if len(parts) < 2 or not parts[1].isdigit():
+            return None
+        rows.append(f"{parts[0]} {parts[1]}")
     return rows
 
 
@@ -192,10 +231,27 @@ def _read_record(workspace) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def retire(workspace, runner: Callable = _run, dry_run: bool = False,
-           kill: Callable = os.kill, wait_s: float = 3.0) -> str:
+def reconcile(workspace, runner: Callable = _run) -> Optional[str]:
+    """Settle a `retiring` intent left by a run that died or could not confirm; None if none."""
+    if read_intent().get("status") != "retiring":
+        return None
+    if job_loaded(runner):
+        write_intent("kept", reason="the job is loaded again; the bootout did not take")
+        return "kept"
+    if listening(runner) is False:
+        write_intent("retired")
+        _record(workspace, status="retired", by="quota-tracker", reason="confirmed: the port stopped listening")
+        return "retired"
+    return "unconfirmed"
+
+
+def retire(workspace, runner: Callable = _run, dry_run: bool = False, wait_s: float = 3.0,
+           sleep: Callable = time.sleep) -> str:
     """Turn the launch agent off if it is verifiably unused; returns what happened."""
+    settled = None if dry_run else reconcile(workspace, runner)
     if not job_loaded(runner):
+        if settled == "unconfirmed":
+            return "turned off, unconfirmed: the proxy port is still served"
         return "proxy launch agent not loaded"
     uses, unknown = sessions_on_proxy(runner)
     why = decide(cfg.enabled(), uses, proxy_connections(runner), core_record_fresh(workspace), tuple(unknown))
@@ -205,25 +261,23 @@ def retire(workspace, runner: Callable = _run, dry_run: bool = False,
         return f"kept: {why}"
     if dry_run:
         return "would turn off: unused"
-    pid = job_pid(runner)
+    if not write_intent("retiring"):
+        _record(workspace, status="kept", reason="could not record the retirement intent")
+        return "kept: could not record the retirement intent"
     out = runner(["launchctl", "bootout", service()])
     if out is None or out.returncode != 0:
+        write_intent("kept", reason="launchctl bootout failed")
         _record(workspace, status="kept", reason="launchctl bootout failed")
         return "kept: launchctl bootout failed"
     deadline = time.monotonic() + wait_s
-    while pid is not None and time.monotonic() < deadline:
-        try:
-            kill(pid, 0)
-        except OSError:
-            pid = None
-            break
-        time.sleep(0.1)
-    if pid is not None:
-        try:
-            kill(pid, signal.SIGTERM)  # the job's own PID, read from launchd before bootout
-        except OSError:
-            pass
+    while listening(runner) is not False:
+        if time.monotonic() >= deadline:
+            reason = "booted out, but the proxy port is still served; left unconfirmed"
+            _record(workspace, status="unconfirmed", by="quota-tracker", reason=reason)
+            return f"turned off, unconfirmed: {reason}"
+        sleep(0.1)
     reason = "unused: no session on the proxy, no open connection, fresh core status line record"
+    write_intent("retired", reason=reason)
     _record(workspace, status="retired", by="quota-tracker", reason=reason)
     return f"turned off: {reason}"
 
@@ -244,7 +298,7 @@ def ensure_running(workspace, runner: Callable = _run, install: Callable[[], boo
         return "left off (CREDENTIAL_PROXY_ENABLED is off)"
     if sys.platform != "darwin":
         return "not started: launchd only"
-    retired = _read_record(workspace).get("status") == "retired"
+    retired = read_intent().get("status") in ("retiring", "retired")
     if job_loaded(runner):
         said = "already loaded"
     elif plist_path().is_file():
@@ -257,6 +311,7 @@ def ensure_running(workspace, runner: Callable = _run, install: Callable[[], boo
     else:
         said = "installed"
     if retired:
+        write_intent("restored", reason="status line tracking turned off")
         _record(workspace, status="restored", reason="status line tracking turned off")
     return said
 

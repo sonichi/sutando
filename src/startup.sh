@@ -768,6 +768,7 @@ start_credential_proxy() {
     return 0
   fi
   if claude_proxy_owner_off 2>/dev/null; then
+    claude_unset_local_proxy
     echo "  credential proxy kept off (CREDENTIAL_PROXY_ENABLED is off); Claude will connect directly"
     return 0
   fi
