@@ -702,6 +702,104 @@ test('release, lost answer: an empty cell means released, whoever emptied it', a
   assert.deepEqual([await la.release(one), cell()], [true, '']);
 });
 
+test('claim on a copy that lags: "held" once the page can see the winner, "contended" while it cannot', async () => {
+  const { a, pb, clock } = await setup({ rows: [{ Task: 'One' }], room: EXACT, b: { sync: 'manual' } });
+  const la = await a.list('App — Tasks'), one = la.toArray()[0].id;
+  let sleeps = 0;
+  // The copy catches up during the last wait, with no snapshot sent: only the final read shows it.
+  const sleep = async (ms) => { clock.advance(ms); sleeps += 1; if (sleeps === 5) pb.sync(true); };
+  const lb = await (await Commons.connect({ artifact: pb.artifact, now: clock.now, sleep })).list('App — Tasks');
+  assert.equal((await la.claim(one)).certainty, 'room');
+  const seen = await lb.claim(one);
+  assert.deepEqual([seen.ok, seen.reason, seen.holder && seen.holder.id, sleeps], [false, 'held', 'u-ana', 5]);
+  const behind = await board({ room: EXACT, b: { sync: 'manual' } });
+  await behind.la.claim(behind.one);
+  const blind = await behind.lb.claim(behind.one);
+  assert.deepEqual([blind.ok, blind.reason, blind.holder], [false, 'contended', null]);
+});
+
+test('onLost(null): the cell was emptied, not taken; and after an unknown release an empty cell is no alarm', async () => {
+  const { la, one, fake, taskDb } = await board();
+  const lost = [];
+  await la.claim(one, { onLost: (h) => lost.push(h) });
+  fake.serverWrite(taskDb, one, 'Claim', ''); await settle();
+  assert.deepEqual(lost, [null], 'a member cleared the cell by hand');
+
+  const tabs = await board({ b: { id: 'u-ana', name: 'Ana', kind: 'human' } });
+  await tabs.la.claim(tabs.one, { onLost: (h) => lost.push(h) }); await settle();
+  await tabs.lb.release(tabs.one); await settle();
+  assert.deepEqual(lost, [null, null], 'the viewer\'s other tab released it');
+
+  for (const [after, expected] of [['', []], [JSON.stringify({ by: 'runner', name: 'Runner', kind: 'agent', until: 1e15 }), ['runner']]]) {
+    const s = await board({ room: EXACT, a: { sync: 'manual' } }), quiet = [];
+    await s.la.claim(s.one, { onLost: (h) => quiet.push(h && h.id) });
+    s.pa.loseAnswer = true;
+    await assert.rejects(s.la.release(s.one), code('OUTCOME_UNKNOWN'));
+    if (after) s.fake.serverWrite(s.taskDb, s.one, 'Claim', after);
+    s.pa.sync();
+    assert.deepEqual([quiet, s.la.held.has(s.one)], [expected, false]);
+  }
+});
+
+test('claim held for an approval: it rolls back untracked; if approved later it shows as the viewer\'s and can be released', async () => {
+  const { la, one, pa, fake, taskDb } = await board({ room: EXACT });
+  const lost = [];
+  pa.failNext = 'this write is waiting for approval';
+  await assert.rejects(la.claim(one, { onLost: (h) => lost.push(h) }), code('APPROVAL_PENDING'));
+  assert.deepEqual([la.claimOf(one), la.held.has(one)], [null, false]);
+  const asked = pa.calls.filter((c) => c[0] === 'db.write').pop()[4];
+  fake.serverWrite(taskDb, one, 'Claim', asked); await settle();
+  assert.deepEqual([la.claimOf(one).mine, la.held.has(one)], [true, false]);
+  assert.deepEqual([await la.release(one), fake.rows(taskDb)[0].cells.Claim, lost], [true, '', []]);
+});
+
+/* functions the page hands in */
+
+const boom = () => { throw new Error('the page broke'); };
+async function reporting(opts) {
+  const s = await setup(opts), reported = [];
+  s.reported = reported;
+  s.room = await Commons.connect(Object.assign({ artifact: s.pa.artifact, report: (e) => reported.push(e.message) }, s.hooks));
+  return s;
+}
+
+test('an observer that throws when a set is shown: the write is still sent and saved, nothing stale stays, the error is reported', async () => {
+  const { room, fake, mapDb, reported } = await reporting({ room: EXACT });
+  const m = await room.map('App — State'), second = [];
+  m.observe(boom);
+  m.observe((changes) => second.push(changes[0].action));
+  await m.set('k', 1); await settle();
+  assert.deepEqual([fake.rows(mapDb).map((r) => r.cells.Value), m.get('k'), second[0]], [['1'], 1, 'add']);
+  assert.ok(reported.length > 0 && reported.every((text) => text === 'the page broke'));
+});
+
+test('an observer that throws at the acknowledgement: an accepted update resolves, so nothing invites a second count', async () => {
+  const { room, fake, mapDb, reported } = await reporting({ room: EXACT });
+  const m = await room.map('App — State');
+  m.observe(boom);
+  assert.deepEqual(await m.update('n', (n) => (n || 0) + 1), { value: 1, mode: 'exact' });
+  assert.deepEqual([fake.rows(mapDb).map((r) => r.cells.Value), reported], [['1'], ['the page broke']]);
+});
+
+test('onLost, onWaiting and an experimental watch that throw are reported and change nothing', async () => {
+  const { room, pa, fake, taskDb, reported } = await reporting({ rows: [{ Task: 'One' }], a: { consent: 'unasked' } });
+  const l = await room.list('App — Tasks'), one = l.toArray()[0].id;
+  room.onWaiting((...args) => { if (pa.consent === 'asking') pa.answer(true); boom(...args); });
+  assert.equal((await l.claim(one, { onLost: boom })).ok, true);
+  fake.serverWrite(taskDb, one, 'Claim', ''); await settle();
+  assert.deepEqual([l.held.has(one), reported.length], [false, 2]);
+  pa.enableRequests([]);
+  const rq = (await Commons.connect({ artifact: pa.artifact, report: (e) => reported.push(e.message) })).experimental.requests;
+  assert.deepEqual([await rq.watch({ database: taskDb }, boom), reported.length], [[], 3]);
+});
+
+test('fn in map.update is part of the operation: when it throws, nothing is written and nothing is shown', async () => {
+  const { room, pa, reported } = await reporting({ room: EXACT });
+  const m = await room.map('App — State'), seen = record(m);
+  await assert.rejects(m.update('k', boom), /the page broke/);
+  assert.deepEqual([pa.calls.filter((c) => /write|createRow/.test(c[0])).length, m.has('k'), m.t.entries.length, seen, reported], [0, false, 0, [], []]);
+});
+
 test('release, lost answer on a copy that never catches up: the outcome is reported as unknown, and the claim stays tracked', async () => {
   const { la, one, pa, fake, taskDb } = await board({ room: EXACT, a: { sync: 'manual' } });
   const lost = [];
@@ -711,7 +809,7 @@ test('release, lost answer on a copy that never catches up: the outcome is repor
   assert.equal(la.held.has(one), true);
   assert.equal(fake.rows(taskDb)[0].cells.Claim, '');
   pa.sync();
-  assert.deepEqual([la.claimOf(one), la.held.has(one), lost], [null, false, [null]], 'the sync shows the release went through');
+  assert.deepEqual([la.claimOf(one), la.held.has(one), lost], [null, false, []], 'the sync shows the release went through, quietly');
 });
 
 test('claim, lost answer and then no read either: the result says "unknown", not a read error', async () => {

@@ -112,11 +112,11 @@ Each item is an assumption. Check it with two people (and one agent) in a real r
 21. An agent writing the `Claim`, `Status` or `Result` cell through Actions does not trigger an unwanted summon on that row.
 22. `agent.sendTask` with a repeated `key` returns the first receipt and shows no second dialog.
 23. `room.post` and `agent.sendTask` reasons match the guide's wording exactly.
-24. The inlined library (about 36 KB) plus a page stays well under the 196,608-byte page limit, and runs in the sandbox with no blocked call. (The guide's static pre-flight, `check_page.py`, passes on both examples.)
+24. The inlined library (about 37 KB) plus a page stays well under the 196,608-byte page limit, and runs in the sandbox with no blocked call. (The guide's static pre-flight, `check_page.py`, passes on both examples.)
 25. Each "version changed" answer costs one `db.read`; check that is affordable in a busy app: 20 reads a minute per page.
 26. Phone layout of the two examples at about 390px, light and dark. Not rendered here: the checks run without a browser.
 27. The s.space deployment you ship to has versions and conditional writes turned on: `db.read` and `db.onChange` snapshots carry a number in `version`. This is a deployment setting, not a per-room one; a page still feature-detects on each read.
-28. With them on, two pages claim one row at the same moment: one gets `certainty: "room"`, the other `reason: "held"`, and neither page shows a false `onLost` afterwards.
+28. With them on, two pages claim one row at the same moment: one gets `certainty: "room"`; the other gets `reason: "held"` when it can see the winner and `reason: "contended"` while its copy is behind; and neither page shows a false `onLost` afterwards. Note how often the second happens.
 29. After an accepted conditional write, when the page's own copy shows it under real sync, and whether a snapshot older than it can still arrive. (The library ignores such a snapshot by its version.)
 30. With them off, two pages claim one row with plain writes: both get `certainty: "local"`, and `onLost` fires on one of them after they sync. Note how long that takes on a slow connection.
 31. After "no answer from the room" on a conditional write, how often the write had in fact landed, and that the read which follows shows it.

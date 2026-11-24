@@ -203,6 +203,27 @@ test('board, conditional writes: the room settles a tie at once, and a hold it c
   assert.equal(bot.items()[0], 'OneAna is on it10 min left');
 });
 
+test('board: a hold that is cleared rather than taken (onLost with no holder) is said plainly, and nothing breaks', async () => {
+  const { fake, db } = room('Board — Tasks', BOARD);
+  const id = fake.serverAddRow(db, { Task: 'One', Status: 'Open' });
+  const ana = await open('board.html', fake.client({ id: 'u-ana', name: 'Ana' }).artifact);
+  await ana.button('Take it').click(); await settle();
+  fake.serverWrite(db, id, 'Claim', ''); await settle();
+  assert.equal(ana.$('status').textContent, 'Your hold on "One" was cleared.');
+  assert.deepEqual(ana.items(), ['OneOpenTake it']);
+});
+
+test('board: a claim held for an approval says so, and not that it failed', async () => {
+  const { fake, db } = room('Board — Tasks', BOARD, { versions: true, conditional: true });
+  fake.serverAddRow(db, { Task: 'One', Status: 'Open' });
+  const client = fake.client({ id: 'u-ana', name: 'Ana' });
+  const ana = await open('board.html', client.artifact);
+  client.failNext = 'this write is waiting for approval';
+  await ana.button('Take it').click(); await settle();
+  assert.equal(ana.$('status').textContent, 'Waiting for an approval. "One" may show as yours later.');
+  assert.deepEqual(ana.items(), ['OneOpenTake it']);
+});
+
 test('board: letting go, and a hold that runs out, both open the task again', async () => {
   const { fake, db, clock } = room('Board — Tasks', BOARD);
   fake.serverAddRow(db, { Task: 'One', Status: 'Open' });

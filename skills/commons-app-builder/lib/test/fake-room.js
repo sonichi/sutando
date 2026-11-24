@@ -287,7 +287,7 @@ function createFakeRoom(options) {
         /** The viewer answers the access question. */
         answer(yes) { c.consent = yes ? 'granted' : 'denied'; },
         /** A manual page meets the room: its queued writes land in order, then it takes the room's state. */
-        sync() {
+        sync(quiet) {
           for (const op of c.queue.splice(0)) {
             const db = dbs.get(op.id), row = db && db.rows.find((r) => r.id === op.rowId);
             if (db && op.cells) addRow(db, op.cells, c.account, op.rowId);
@@ -295,7 +295,8 @@ function createFakeRoom(options) {
           }
           const watched = Array.from(c.watchers.keys());
           pull();
-          for (const id of watched) tell(id);
+          // `quiet`: the copy moved but no snapshot was sent yet; only a read shows it.
+          if (!quiet) for (const id of watched) tell(id);
         },
         /** Hands this page the room as it is now, for every database it watches. */
         refresh() { for (const id of Array.from(c.watchers.keys())) c.watchers.get(id)(dbs.has(id) ? snapshot(dbs.get(id)) : null); },

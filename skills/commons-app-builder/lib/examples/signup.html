@@ -144,6 +144,12 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
   /* The one place a map key is "deleted": its value cell is emptied, and the row stays. */
   const cleared = { json: '', is: (v) => v === undefined || v === null || v === '' };
 
+  /* Every function the page hands in (observe, onLost, onWaiting, watch) is called through here: its
+     error is reported later, outside the library, and never changes what a write does. */
+  const guard = (room, fn, ...args) => {
+    try { return fn(...args); } catch (err) { room.report(err); }
+  };
+
   const toPlayer = (m) => {
     const p = { id: m.id, name: m.name, kind: m.kind === 'agent' ? 'agent' : 'person' };
     if (m.avatar) p.avatar = m.avatar;
@@ -329,6 +335,8 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
           if (r.unknown && e.proof()) return 'room';
           if (typeof r.version === 'number' && !(this.version >= r.version)) await this.room.sleep(this.room.opts.retryEvery);
         }
+        // One more look before giving up: a claim may now be able to see who holds the row.
+        if (e.proof) try { this.ingest(await this.read()); } catch (_e) { /* giving up either way */ }
         return unsure ? 'unknown' : 'contended';
       } finally { this.drop(e); }
     }
@@ -353,7 +361,7 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
       const next = this.project();
       const changes = this.diff(this.last, next);
       this.last = next;
-      if (changes.length) for (const cb of Array.from(this.observers)) cb(changes, origin);
+      if (changes.length) for (const cb of Array.from(this.observers)) guard(this.t.room, cb, changes, origin);
       this.after(origin);
     }
 
@@ -543,7 +551,10 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
       const raw = this.parse(this.t.cell(id, this.claimProp));
       if (raw && raw.n === mine.token) return;
       this.held.delete(id);
-      if (mine.until > this.t.room.now() && mine.onLost) mine.onLost(this.holder(raw));
+      const now = this.holder(raw);
+      // An empty cell after a release whose answer was lost is what the page asked for: no alarm.
+      if (mine.letGo && !now) return;
+      if (mine.until > this.t.room.now() && mine.onLost) guard(this.t.room, mine.onLost, now);
     }
 
     /* Runs a claim-cell entry in the queue with loss tracking paused. A refusal leaves the earlier claim tracked. */
@@ -665,7 +676,10 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
       };
       const mode = await this.guarded(id, e, step);
       if (pinned && cleared.is(t.cell(id, prop))) { this.held.delete(id); return true; }
-      if (mode === 'unknown') throw new CommonsError('OUTCOME_UNKNOWN', 'No answer from the room: the claim may or may not have been released.');
+      if (mode === 'unknown') {
+        if (this.held.has(id)) this.held.get(id).letGo = true;
+        throw new CommonsError('OUTCOME_UNKNOWN', 'No answer from the room: the claim may or may not have been released.');
+      }
       this.settle(id);
       return false;
     }
@@ -673,7 +687,7 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
 
   /* EXPERIMENTAL: the named-agent request calls are designed and not built, and may change.
      Lists pass through untouched: `state` and `outcome` are the bridge's own, as plain text. */
-  function requestsAdapter(art) {
+  function requestsAdapter(art, room) {
     const a = art.agent;
     // That design's own reason codes. Nothing built documents them, so they stay out of REASONS.
     const codes = [[/^consent_required$/i, 'CONSENT_REQUIRED'], [/^rate(_page|_agent)?$/i, 'RATE_LIMITED']];
@@ -689,8 +703,9 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
       },
       /** Calls `cb(wholeList)` now and on every change, with the bridge's list as given. */
       watch: async (scope, cb) => {
-        const first = await a.requests(scope, { onChange: cb });
-        cb(first);
+        const tell = (list) => guard(room, cb, list);
+        const first = await a.requests(scope, { onChange: tell });
+        tell(first);
         return first;
       },
     };
@@ -702,12 +717,14 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
       this.art = art;
       this.opts = Object.assign({ retryEvery: 1500, retryFor: 120000 }, opts);
       this.sleep = this.opts.sleep || ((ms) => new Promise((ok) => setTimeout(ok, ms)));
+      // A page function's error is thrown again on its own, so it reaches the page's error handling.
+      this.report = this.opts.report || ((err) => { setTimeout(() => { throw err; }, 0); });
       this.tables = new Map();
       this.waiting = new Set();
       /** The app record `{id, name, database}`, or null when the page is opened on its own. */
       this.app = art.app || null;
       /** EXPERIMENTAL adapters. `requests` is null unless the bridge has the named-agent calls. */
-      this.experimental = { requests: requestsAdapter(art) };
+      this.experimental = { requests: requestsAdapter(art, this) };
       /** What this bridge offers. Check before showing a control. */
       this.capabilities = Object.freeze({
         players: typeof art.members === 'function',
@@ -758,7 +775,7 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
         const err = refusal(r && r.reason, undefined, extra);
         if (r && typeof r.version === 'number') err.version = r.version;
         if ((err.code !== 'CONSENT_PENDING' && err.code !== 'RATE_LIMITED') || this.now() >= until) throw err;
-        for (const cb of Array.from(this.waiting)) cb(err.code);
+        for (const cb of Array.from(this.waiting)) guard(this, cb, err.code);
         await this.sleep(this.opts.retryEvery);
       }
     }
@@ -827,7 +844,7 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
   }
 
   /** Connects to the room this page is open in; rejects with code NO_BRIDGE outside a room.
-   *  `opts` are test hooks and retry timing: `{artifact?, now?, sleep?, retryEvery?, retryFor?}`. */
+   *  `opts` are test hooks and retry timing: `{artifact?, now?, sleep?, report?, retryEvery?, retryFor?}`. */
   async function connect(opts) {
     const o = opts || {};
     const host = typeof window !== 'undefined' ? window : globalThis;

@@ -15,7 +15,7 @@ a real room or a browser. See [`NOTES.md`](NOTES.md) for what a real room must s
   rollback. A page that needs none of that is simpler without it.
 - **It must be inlined.** A page runs in a sandbox with no network, so it cannot load a script
   from anywhere. Copy `commons-sdk.js` into a `<script>` in the page. `examples/inline.js` shows
-  one way to do that between two marker comments. The file is about 36 KB; a page body is at most
+  one way to do that between two marker comments. The file is about 37 KB; a page body is at most
   196,608 bytes. Once it has run, the global `Commons` exists, whatever other scripts the page
   carries (it also sets `module.exports` when a `module` with `exports` is there, as in Node).
 - **The bridge is not ours.** The library is built on the page API (`window.artifact`). The host
@@ -192,6 +192,12 @@ words when there are any.
 | `CONTENDED` | `map.update` gave up: the database kept changing between its read and its write |
 | `REFUSED` | Any other refusal. Read `reason` |
 
+A function you hand to the library (`observe`, `onLost`, `onWaiting`, the experimental `watch`)
+may throw without changing what a write does: the error is thrown again on a timer, so it
+reaches the page's own error handling (`window.onerror`), and the other observers still run.
+`fn` in `map.update` is different: it is part of the operation, so when it throws, the update
+rejects with that error and nothing is written.
+
 Writes retry on their own while the viewer has not answered or the page is rate-limited: every
 1.5 seconds, for up to 2 minutes. Use `room.onWaiting` to show a hint such as "Allow this page to
 edit data, and it will save". Limits are in `Commons.LIMITS`.
@@ -337,9 +343,9 @@ optional), reads the row back, and treats the claim as its own only if its value
 | --- | --- |
 | `ok: true, certainty: "room"` | The room accepted the claim with a conditional write. Nobody else's claim was there when it landed |
 | `ok: true, certainty: "local"` | A plain write. Only this page's own copy shows the claim. Another page may have claimed too; if so, `onLost` is called once the copies meet |
-| `ok: false, reason: "held"` | Someone else holds the row. `holder` says who. Nothing was written, or the room refused the write |
+| `ok: false, reason: "held"` | Someone else holds the row and this page can see it. `holder` says who. Nothing was written, or the room refused the write |
 | `ok: false, reason: "expired"` | The write was accepted, but so late that the claim had already run out |
-| `ok: false, reason: "contended"` | The database kept changing, or the claim did not stick. Try again |
+| `ok: false, reason: "contended"` | The database kept changing, or this page's copy is behind and it cannot see who holds the row. Try again |
 | `ok: false, reason: "unknown"` | The room gave no answer and the page could not tell afterwards. The claim may be in the room until it runs out |
 
 `certainty` is `"local"` on every `ok: false`: the answer rests on what this page can see.
@@ -349,8 +355,10 @@ optional), reads the row back, and treats the claim as its own only if its value
 1. If this page already sees a live claim by someone else, `claim` writes nothing and resolves to
    `{ok: false, reason: "held", holder}`.
 2. **With conditional writes,** the room takes one of two simultaneous claims. The other page is
-   told the version changed, reads again, sees the holder and gets `reason: "held"`. Two pages
-   cannot both get `certainty: "room"` for one row.
+   told the version changed and reads again. It gets `reason: "held"`, with the holder, when it
+   can see the winner; it gets `reason: "contended"`, with no holder, while its own copy is still
+   behind after five tries and one last read. Two pages cannot both get `certainty: "room"` for
+   one row.
 3. **Without them,** each page writes into its own copy and both get `{ok: true, certainty:
    "local"}`. When the copies meet, the claim that reached the room last stays, and the other
    page's `onLost(holder)` is called. The window in which both believe they hold the row is the
@@ -373,6 +381,20 @@ optional), reads the row back, and treats the claim as its own only if its value
    token, and the first tab's `onLost` is called with a holder whose `mine` is `true`.
 9. If a renewal or a release is refused, the earlier claim is still tracked, and `onLost` still
    fires if it is taken over.
+10. After `APPROVAL_PENDING` the claim may appear later as yours. It is not tracked, so `onLost`
+    will not fire, but `release` works.
+
+**`onLost(holder)`: `holder` can be `null`.** It is the new holder when someone took the row. It
+is `null` when the cell was emptied instead: a member cleared it by hand, or the viewer's other
+tab released it. After a `release` whose outcome was unknown, an empty cell is what the page
+asked for, so `onLost` is not called then; it still is if a holder appears. Write the handler
+for both:
+
+```js
+await tasks.claim(id, {
+  onLost: (holder) => { note.textContent = holder ? holder.name + ' took it.' : 'Your hold was cleared.'; },
+});
+```
 
 Claims are cooperative. Any member can overwrite the cell by hand. They stop honest players
 from doing the same work twice; they do not lock anything.
