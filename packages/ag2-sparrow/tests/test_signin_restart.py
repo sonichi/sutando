@@ -284,6 +284,18 @@ class ClaudeRestart(unittest.TestCase):
         self.assertTrue(self.check())
         self.assertEqual((lc.keys, len(lc.stops)), ([("Escape",)], 1))
 
+    def test_a_card_raised_for_the_stuck_session_does_not_hold_the_restart_back(self):
+        # The limit menu left up is a stall and raises a card; with one pending the account switch never restarted.
+        lc, retired = self.lc, []
+        lc.retire_card = lambda: retired.append(1)
+        lc.observation, lc.pane = {"task": "task-1"}, LIMIT
+        lc.rec["hitl"] = {"id": "hitl-1", "store_root": "/store"}
+        self.assertFalse(self.check())
+        self.assertEqual((lc.stops, retired), ([], []), "the same account: the card stays, nothing restarts")
+        write(self.conf, claude_conf("u-2", "b@x.org"))
+        self.assertTrue(self.check())
+        self.assertEqual((lc.keys, len(lc.stops), retired), ([("Escape",)], 1, [1]))
+
     def test_the_same_account_restarts_nothing(self):
         write(self.conf, dict(claude_conf("u-1", "a@x.org"), numStartups=9))   # the CLI rewrote its config
         for _ in range(3):

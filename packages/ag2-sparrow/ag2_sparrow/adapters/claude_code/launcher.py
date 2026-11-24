@@ -738,9 +738,11 @@ class Launcher:
         with, the session is stopped once its turn is over (a usage-limit menu, which no turn gets past, is
         dismissed first) and the next tick starts a new one on the new account, which then takes the queued
         tasks. An unreadable file changes nothing; a consumer this record has no mark for (a new start, a
-        launcher from before this) is marked with the account now on disk and not restarted."""
+        launcher from before this) is marked with the account now on disk and not restarted. A card raised for
+        the session (a limit menu left up is a stall, and raises one) does not hold the restart back: the new
+        session answers what the card asked, and the card is retired with the old one."""
         now = self.clock()
-        if rec.get("hitl") or not rec.get("generation") or now < self.signin_next:
+        if not rec.get("generation") or now < self.signin_next:
             return False, rec
         self.signin_next = now + SIGNIN_CHECK_S
         mark = self.signin_mark(rec.get("consumer"))
@@ -767,6 +769,8 @@ class Launcher:
             self.log("sign-in: restart not done (%s); trying again" % outcome)
             return False, rec
         self.signin_waiting = False
+        if rec.get("hitl"):
+            self.retire_card()
         return True, self._with_record(lambda r: dict(r, generation=None, signin=None, stall=None, deadline=None))
 
     def stopped(self, started) -> str:
