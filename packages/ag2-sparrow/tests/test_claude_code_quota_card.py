@@ -376,6 +376,12 @@ class LimitMenu(NoticeBase):
         self.assertEqual(self.tick(STARTUP_MENU, 5.0), "")
         self.assertEqual(len(self.queued()), 1)
 
+    def test_a_root_with_no_tasks_folder_has_nothing_unanswered(self):
+        self.assertEqual(launcher.inbox.unanswered(str(Path(self.root) / "missing")), [])
+        (self.inbox / ".task-tmp.txt").write_text("x")
+        (self.inbox / "notes.json").write_text("{}")
+        self.assertEqual(launcher.inbox.unanswered(self.root), [])
+
     def test_an_old_banner_in_view_tells_no_message(self):
         quota_card.remember_room(self.root, DM)
         self.task("task-o", "next question")
@@ -437,7 +443,15 @@ class Supervisor(unittest.TestCase):
 
     def test_a_created_session_starts_a_new_incident(self):
         source = Path(launcher.__file__).read_text()
-        self.assertIn("rec = self.retire_card()\n        try:\n            quota_card.new_session(self.root)", source)
+        self.assertIn("rec = self.retire_card()\n        self.new_quota_incident()\n", source)
+        lc, logs = self.lc()
+        with mock.patch.object(quota_card, "new_session") as new:
+            launcher.Launcher.new_quota_incident(lc)
+        new.assert_called_once_with("/r")
+        self.assertEqual(logs, [])
+        with mock.patch.object(quota_card, "new_session", side_effect=OSError("ro")):
+            launcher.Launcher.new_quota_incident(lc)
+        self.assertEqual(logs, ["quota: new session not recorded (OSError: ro)"], "advisory: never raises")
 
     def test_the_ticks_observation_calls_it_with_the_pane(self):
         source = Path(launcher.__file__).read_text()

@@ -436,10 +436,7 @@ class Launcher:
         if problem:
             return False, problem
         rec = self.retire_card()
-        try:
-            quota_card.new_session(self.root)     # this session's account may be at its limit too: told anew
-        except Exception as e:  # noqa: BLE001 - advisory
-            self.log("quota: new session not recorded (%s: %s)" % (type(e).__name__, str(e)[:120]))
+        self.new_quota_incident()
         nonce = os.urandom(16).hex()
         generation, problem = create_session(self.tm, self.cfg, self.config_dir, self.root, nonce, self.environ, self.run)
         if generation is None:
@@ -483,6 +480,13 @@ class Launcher:
                 self.log("progress: the stall %s" % ("cleared" if stall is None else "changed"))
             return self.clear_card(stall, plugin.get("session_id"))
         return rec
+
+    def new_quota_incident(self) -> None:
+        """A session being created (an account switch restarts it) may be on an account at its limit too."""
+        try:
+            quota_card.new_session(self.root)
+        except Exception as e:  # noqa: BLE001 - advisory
+            self.log("quota: new session not recorded (%s: %s)" % (type(e).__name__, str(e)[:120]))
 
     def quota(self, text: str) -> None:
         """The usage-limit banner or Claude Code's limit menu on the pane: the owner is told, with the account
