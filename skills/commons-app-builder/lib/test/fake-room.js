@@ -44,17 +44,24 @@ function createFakeRoom(options) {
     for (const c of clients) {
       for (const id of now) {
         if (c.manual || !c.watchers.has(id)) continue;
+        const snap = dbs.has(id) ? snapshot(dbs.get(id)) : null;
         if (c.paused) c.missed.add(id);
-        else c.watchers.get(id)(dbs.has(id) ? snapshot(dbs.get(id)) : null);
+        else later('snapshot', () => { if (c.watchers.has(id)) c.watchers.get(id)(snap); });
       }
     }
   }
+
+  // With `hold`, every snapshot and every write answer waits in `pending` until the test runs it.
+  const pending = [], log = [];
+  const later = (kind, run) => { if (opt.hold) pending.push({ kind, run }); else run(); };
+  const answered = (result) => (opt.hold ? new Promise((ok) => pending.push({ kind: 'answer', run: () => ok(result) })) : result);
 
   // Changes are coalesced: one snapshot per database per turn, to every watcher, the writer too.
   function changed(id) {
     if (dbs.has(id)) dbs.get(id).version += 1;
     dirty.add(id);
-    if (!scheduled) { scheduled = true; setImmediate(deliver); }
+    if (opt.hold) deliver();
+    else if (!scheduled) { scheduled = true; setImmediate(deliver); }
   }
 
   function fits(db, name, value) {
@@ -82,7 +89,9 @@ function createFakeRoom(options) {
   }
 
   const room = {
-    clock, posts, requests,
+    clock, posts, requests, pending, log,
+
+    versionOf(id) { return dbs.get(id).version; },
 
     /** Adds a database the way an agent would through Actions. Returns its id. */
     addDatabase(name, props, rows) {
@@ -127,7 +136,7 @@ function createFakeRoom(options) {
         me: { id: o.id, name: o.name, kind: o.kind }, account: '@' + o.id + ':fake',
         consent: o.consent, watchers: new Map(), paused: false, missed: new Set(),
         writes: [], reads: [], asks: [], postTimes: [], calls: [], dialogs: [], sent: [], keys: new Map(),
-        dialog: 'yes', failNext: null, inRoom: o.inRoom !== false,
+        dialog: 'yes', failNext: null, inRoom: o.inRoom !== false, tab: clients.length,
         manual: o.sync === 'manual', local: new Map(), queue: [], loseAnswer: false,
       };
       clients.push(c);
@@ -188,7 +197,8 @@ function createFakeRoom(options) {
             const row = db && db.rows.find((r) => r.id === rowId);
             if (!row) return { ok: false, reason: 'row not found' };
             const reason = writeGate(value) || fits(db, prop, value) || (exact && (unfit(opts) || moved(db, opts)));
-            if (reason) return refused(db, reason);
+            if (reason) return answered(refused(db, reason));
+            const prev = row.cells[propName(db, prop)];
             row.cells[propName(db, prop)] = copy(value);
             if (c.manual && !exact) {
               c.queue.push({ id, rowId, prop, value: copy(value) });
@@ -196,7 +206,8 @@ function createFakeRoom(options) {
               return { ok: true };
             }
             changed(id);
-            return exact ? answer(db) : { ok: true };
+            log.push({ tab: c.tab, exact, rowId, prop, value: copy(value), prev, version: db.version });
+            return answered(exact ? answer(db) : { ok: true });
           },
           createRow: async (id, cells, opts) => {
             call('db.createRow', id, cells, ...(opts ? [opts] : []));
@@ -205,7 +216,7 @@ function createFakeRoom(options) {
             let reason = writeGate(cells);
             for (const [k, v] of Object.entries(cells)) reason = reason || fits(db, k, v);
             reason = reason || (exact && (unfit(opts) || moved(db, opts)));
-            if (reason) return refused(db, reason);
+            if (reason) return answered(refused(db, reason));
             if (c.manual && !exact) {
               const row = { id: nextId('r'), cells: {} };
               for (const [k, v] of Object.entries(cells)) row.cells[propName(db, k)] = copy(v);
@@ -215,7 +226,8 @@ function createFakeRoom(options) {
               return { ok: true, rowId: row.id };
             }
             const rowId = addRow(dbs.get(id), cells, c.account);
-            return exact ? answer(db, { rowId }) : { ok: true, rowId };
+            log.push({ tab: c.tab, exact, rowId, cells: copy(cells), version: db.version });
+            return answered(exact ? answer(db, { rowId }) : { ok: true, rowId });
           },
           onChange: (id, fn) => {
             call('db.onChange', id);
@@ -284,6 +296,8 @@ function createFakeRoom(options) {
           pull();
           for (const id of watched) tell(id);
         },
+        /** Hands this page the room as it is now, for every database it watches. */
+        refresh() { for (const id of Array.from(c.watchers.keys())) c.watchers.get(id)(dbs.has(id) ? snapshot(dbs.get(id)) : null); },
         /** Hold this page's snapshots back, as a slow connection would. */
         pause() { c.paused = true; },
         resume() {

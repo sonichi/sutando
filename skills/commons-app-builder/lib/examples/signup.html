@@ -155,8 +155,10 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
     constructor(room, id) {
       this.room = room; this.id = id;
       this.props = []; this.rows = [];
+      // `base` is the last snapshot; `acks` are writes the room acknowledged that it does not hold yet.
+      this.base = []; this.acks = [];
       this.gen = 0; this.gone = false;
-      this.version = null; this.floor = null; this.plain = false;
+      this.version = null; this.seen = null; this.plain = false;
       this.listeners = new Set();
       this.tail = Promise.resolve();
     }
@@ -179,15 +181,50 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
     }
 
     ingest(snap) {
-      const version = snap && typeof snap.version === 'number' ? snap.version : null;
-      // A snapshot older than a write the room acknowledged was taken before that write.
-      if (version !== null && this.floor !== null && version <= this.floor) return;
-      this.version = version;
+      const seen = snap && typeof snap.version === 'number' ? snap.version : null;
+      // The page's copy only moves forward: a snapshot older than the last one is dropped.
+      if (seen !== null && this.seen !== null && seen < this.seen) return;
+      this.seen = seen;
+      // An acknowledged write stays on top until a snapshot is new enough to hold it, or its fate.
+      this.acks = seen === null ? [] : this.acks.filter((a) => a.until > seen);
+      this.version = seen === null ? null : this.acks.reduce((v, a) => Math.max(v, a.version), seen);
       this.gen += 1;
       this.gone = !snap;
       if (snap) this.props = snap.props || [];
-      this.rows = snap ? (snap.rows || []).map((r) => ({ id: r.id, cells: Object.assign({}, r.cells) })) : [];
+      this.base = snap ? (snap.rows || []).map((r) => ({ id: r.id, cells: Object.assign({}, r.cells) })) : [];
+      this.rebuild();
       this.emit('remote');
+    }
+
+    /* One place puts a write into a row set: a cell of a row that is there, or a row that is not. */
+    put(rows, w) {
+      const row = rows.find((r) => r.id === w.rowId);
+      if (w.cells) { if (!row) rows.push({ id: w.rowId, cells: Object.assign({}, w.cells) }); } else if (row) row.cells[w.prop] = w.value;
+    }
+
+    rebuild() {
+      this.rows = this.base.map((r) => ({ id: r.id, cells: Object.assign({}, r.cells) }));
+      for (const a of this.acks) this.put(this.rows, a);
+    }
+
+    /* A plain write the bridge accepted: kept only when no snapshot arrived meanwhile, because a
+       snapshot is the room's word. It replaces an acknowledged write to the same cell. */
+    keep(gen, w) {
+      if (gen !== this.gen) return;
+      this.acks = this.acks.filter((a) => a.cells || a.rowId !== w.rowId || a.prop !== w.prop);
+      this.put(this.base, w);
+      this.rebuild();
+    }
+
+    /* A conditional write the room acknowledged, sent at version `at`. Nothing is added when the
+       snapshot this page holds is already that new: it has the write, or what became of it. */
+    ack(at, r, w) {
+      const known = typeof r.version === 'number';
+      const a = Object.assign({ version: known ? r.version : at, until: known ? r.version : at + 1 }, w);
+      if (this.seen === null || this.seen >= a.until) return;
+      this.acks.push(a);
+      this.version = Math.max(this.version, a.version);
+      this.rebuild();
     }
 
     emit(origin) { for (const fn of Array.from(this.listeners)) fn(origin); }
@@ -227,15 +264,14 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
       this.check();
       const gen = this.gen;
       await this.room.send(() => this.room.art.db.write(this.id, rowId, prop, value));
-      // Keep the value only if no snapshot arrived meanwhile; a snapshot is the room's word.
-      const row = this.row(rowId);
-      if (gen === this.gen && row) row.cells[prop] = value;
+      this.keep(gen, { rowId, prop, value });
     }
 
     async create(cells) {
       this.check();
+      const gen = this.gen;
       const r = await this.room.send(() => this.room.art.db.createRow(this.id, cells));
-      if (!this.row(r.rowId)) this.rows.push({ id: r.rowId, cells: Object.assign({}, cells) });
+      this.keep(gen, { rowId: r.rowId, cells });
       return r.rowId;
     }
 
@@ -252,37 +288,33 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
       }
     }
 
-    /* The room took a write sent at version `at`: its answer's version is the new basis, and
-       an older snapshot can no longer replace what this page holds. */
-    acked(at, r) {
-      const stale = !(this.version > at), known = typeof r.version === 'number';
-      this.floor = known ? r.version - 1 : at;
-      if (known && !(this.version >= r.version)) this.version = r.version;
-      return stale;
-    }
-
-    /* Runs `step()` until its write lands. "room": the room took it at the version this page
-       held. "local": a plain write. `null`: step() declined. "contended": the database kept moving. */
+    /* Runs `step()` until its write lands. "room": the room took it at the version this page held.
+       "local": a plain write. `null`: step() declined. "contended" or "unknown": it gave up. */
     async change(step) {
+      let unsure = false;
       for (let tries = 0; tries < 5; tries += 1) {
         this.check();
         const s = step();
         if (!s) return null;
         if (this.version === null || this.plain) {
           const gen = this.gen, r = await this.room.send(() => s.call());
-          s.done(r, gen === this.gen);
+          this.keep(gen, s.wrote(r));
           return 'local';
         }
         const at = this.version, r = await this.cas(s.call);
         if (r.plain) continue;
-        if (r.ok) { s.done(r, this.acked(at, r)); return 'room'; }
+        if (r.ok) { this.ack(at, r, s.wrote(r)); return 'room'; }
         // Only a step whose value is its own proof (a claim token) may look for it and go on.
         if (r.unknown && !s.landed) throw new CommonsError('OUTCOME_UNKNOWN', 'No answer from the room: the change may or may not have been saved.', r.reason);
-        this.ingest(await this.read());
+        unsure = unsure || !!r.unknown;
+        try { this.ingest(await this.read()); } catch (e) {
+          if (unsure) return 'unknown';
+          throw e;
+        }
         if (r.unknown && s.landed()) return 'room';
         if (typeof r.version === 'number' && !(this.version >= r.version)) await this.room.sleep(this.room.opts.retryEvery);
       }
-      return 'contended';
+      return unsure ? 'unknown' : 'contended';
     }
 
     /* A step for change(): write one cell. `make()` builds the value anew for every attempt. */
@@ -291,7 +323,7 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
       let value;
       return {
         call: (o) => { value = make(); return o ? db.write(this.id, rowId, prop, value, o) : db.write(this.id, rowId, prop, value); },
-        done: (_r, fresh) => { const row = this.row(rowId); if (row && fresh) row.cells[prop] = value; },
+        wrote: () => ({ rowId, prop, value }),
         landed: () => { const row = this.row(rowId); return !!row && same(row.cells[prop], value); },
       };
     }
@@ -301,7 +333,7 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
       const db = this.room.art.db;
       return {
         call: (o) => (o ? db.createRow(this.id, cells, o) : db.createRow(this.id, cells)),
-        done: (r) => { if (!this.row(r.rowId)) this.rows.push({ id: r.rowId, cells: Object.assign({}, cells) }); },
+        wrote: (r) => ({ rowId: r.rowId, cells }),
       };
     }
   }
@@ -614,22 +646,23 @@ li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-
       }
       this.settle(id);
       const holder = this.claimOf(id);
-      return { ok: false, reason: won ? 'expired' : holder && !holder.mine ? 'held' : 'contended', holder, certainty: 'local' };
+      const reason = won ? 'expired' : holder && !holder.mine ? 'held' : mode === 'unknown' ? 'unknown' : 'contended';
+      return { ok: false, reason, holder, certainty: 'local' };
     }
 
-    /** Gives up a claim this page holds, by emptying the claim cell.
-     *  @returns {Promise<boolean>} false when this page did not hold it, or could not let it go */
+    /** Gives up the viewer's claim on a row by emptying the claim cell, and only while the cell still holds
+     *  the exact claim seen at the call. @returns {Promise<boolean>} false when it was not, or is no longer, there */
     async release(id) {
-      const holder = this.claimOf(id), me = this.t.room.me();
+      const holder = this.claimOf(id), cellOf = () => { const row = this.t.row(id); return row && row.cells[this.claimProp]; };
       if (!holder || !holder.mine) { this.held.delete(id); return false; }
-      const step = () => {
-        const raw = this.claimIn(this.t.row(id));
-        return raw && raw.by === me.id ? this.t.cell(id, this.claimProp, () => '') : null;
-      };
+      // Pinned to this one claim: a renewal from the viewer's other tab is a different value.
+      const pinned = cellOf();
+      const step = () => (cellOf() === pinned ? this.t.cell(id, this.claimProp, () => '') : null);
       const mode = await this.guarded(id, { id, prop: this.claimProp, value: '' }, step);
-      if (mode !== 'room' && mode !== 'local') { this.settle(id); return false; }
-      this.held.delete(id);
-      return true;
+      if (cleared.is(cellOf())) { this.held.delete(id); return true; }
+      if (mode === 'unknown') throw new CommonsError('OUTCOME_UNKNOWN', 'No answer from the room: the claim may or may not have been released.');
+      this.settle(id);
+      return false;
     }
   }
 

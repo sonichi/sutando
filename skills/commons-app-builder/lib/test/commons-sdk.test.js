@@ -650,6 +650,64 @@ test('claim, lost answer: an earlier attempt that stayed is recognised by its to
   assert.deepEqual([r.ok, r.certainty, r.holder.mine, exactWrites(pa).length], [true, 'room', true, 5]);
 });
 
+/* Two tabs of one viewer on a board with conditional writes. */
+async function tabs() {
+  const s = await board({ room: EXACT, b: { id: 'u-ana', name: 'Ana', kind: 'human' } });
+  // The other tab acts between this tab's first write and whatever it does next.
+  s.between = (act) => {
+    const write = s.pa.artifact.db.write;
+    let first = true;
+    s.pa.artifact.db.write = async (...args) => { const r = await write(...args); if (first) { first = false; await act(); } return r; };
+  };
+  s.cell = () => s.fake.rows(s.taskDb)[0].cells.Claim;
+  return s;
+}
+
+test('release, lost answer: a claim renewed from the viewer\'s other tab is not cleared by the retry', async () => {
+  const { la, lb, one, pa, between, cell } = await tabs();
+  const lost = [];
+  await la.claim(one, { onLost: (h) => lost.push(h.mine) }); await settle();
+  between(() => lb.claim(one));
+  pa.failNext = NO_ANSWER;
+  assert.equal(await la.release(one), false);
+  assert.equal(JSON.parse(cell()).n, lb.held.get(one).token);
+  assert.deepEqual(lost, [true]);
+});
+
+test('release, lost answer: an empty cell means released, whoever emptied it', async () => {
+  const { la, one, pa, cell } = await tabs();
+  await la.claim(one);
+  pa.loseAnswer = true;
+  assert.deepEqual([await la.release(one), cell()], [true, '']);
+});
+
+test('release, lost answer on a copy that never catches up: the outcome is reported as unknown, and the claim stays tracked', async () => {
+  const { la, one, pa, fake, taskDb } = await board({ room: EXACT, a: { sync: 'manual' } });
+  const lost = [];
+  await la.claim(one, { onLost: (h) => lost.push(h) });
+  pa.loseAnswer = true;
+  await assert.rejects(la.release(one), code('OUTCOME_UNKNOWN'));
+  assert.equal(la.held.has(one), true);
+  assert.equal(fake.rows(taskDb)[0].cells.Claim, '');
+  pa.sync();
+  assert.deepEqual([la.claimOf(one), la.held.has(one), lost], [null, false, [null]], 'the sync shows the release went through');
+});
+
+test('claim, lost answer and then no read either: the result says "unknown", not a read error', async () => {
+  const { la, one, pa } = await board({ room: EXACT });
+  pa.loseAnswer = true;
+  for (let i = 0; i < 20; i += 1) await pa.artifact.db.read('nope').catch(() => {});
+  const r = await la.claim(one);
+  assert.deepEqual([r.ok, r.reason, r.certainty], [false, 'unknown', 'local']);
+});
+
+test('release with plain writes is pinned to what this page sees, and says nothing about the room', async () => {
+  const { la, lb, one } = await board({ b: { id: 'u-ana', name: 'Ana', kind: 'human' } });
+  await la.claim(one); await settle();
+  await lb.claim(one);
+  assert.equal(await la.release(one), true, 'this tab has not seen the other tab\'s renewal, and a plain write cannot check');
+});
+
 test('claim, then renew and release at once while the own copy lags: each write builds on the last answer', async () => {
   const { la, one, fake, taskDb } = await board({ room: EXACT, a: { sync: 'manual' } });
   const lost = [];
@@ -933,6 +991,51 @@ test('map.update, an answer without a version: never wrong, but a lagging copy h
   assert.deepEqual([await ma.update('n', inc), room()], [{ value: 3, mode: 'exact' }, '3']);
   const live = await counter({ room: Object.assign({ ackVersion: false }, EXACT) });
   assert.deepEqual([(await live.ma.update('n', inc)).value, (await live.ma.update('n', inc)).value, live.room()], [2, 3, '3']);
+});
+
+/* A create whose answer arrives after the room's next snapshot. `then` runs between the two. */
+function lateAnswer(page, then) {
+  const createRow = page.artifact.db.createRow;
+  page.artifact.db.createRow = async (...args) => { const r = await createRow(...args); await then(r.rowId); await settle(); return r; };
+}
+
+test('a create acknowledged after the snapshot that removed the row does not bring the row back', async () => {
+  for (const room of [EXACT, Object.assign({ ackVersion: false }, EXACT)]) {
+    const { a, pa, fake, mapDb } = await setup({ room });
+    const m = await a.map('App — State');
+    lateAnswer(pa, (rowId) => fake.serverDeleteRow(mapDb, rowId));
+    assert.equal((await m.update('k', () => 1)).mode, 'exact');
+    assert.deepEqual([m.has('k'), fake.rows(mapDb).length], [false, 0]);
+  }
+});
+
+test('a create acknowledged in the normal order, or after a snapshot that holds the row, shows the row once', async () => {
+  const { a, pa, fake, mapDb } = await setup({ room: EXACT });
+  const m = await a.map('App — State');
+  await m.update('early', () => 1);
+  assert.equal(m.get('early'), 1);
+  lateAnswer(pa, () => {});
+  await m.update('late', () => 2);
+  assert.deepEqual([m.get('late'), m.t.rows.length, fake.rows(mapDb).length], [2, 2, 2]);
+});
+
+test('a plain create answered after the snapshot that removed the row does not bring the row back', async () => {
+  const { a, pa, fake, taskDb } = await setup();
+  const l = await a.list('App — Tasks');
+  lateAnswer(pa, (rowId) => fake.serverDeleteRow(taskDb, rowId));
+  await l.push({ Task: 'gone at once' });
+  assert.deepEqual([l.length, fake.rows(taskDb).length], [0, 0]);
+});
+
+test('a snapshot older than the last one is dropped, even when it is newer than the last acknowledged write', async () => {
+  const { a } = await setup({ room: EXACT, rows: [{ Task: 'One' }] });
+  const l = await a.list('App — Tasks'), t = l.t, at = t.version;
+  const snap = (version, title) => ({ version, props: t.props, rows: [{ id: 'r', cells: { Task: title } }] });
+  t.ingest(snap(at + 5, 'newer'));
+  t.ingest(snap(at + 3, 'older'));
+  assert.deepEqual([t.version, l.toArray().map((r) => r.cells.Task)], [at + 5, ['newer']]);
+  t.ingest(snap(at + 5, 'same version, own plain write'));
+  assert.deepEqual(l.toArray().map((r) => r.cells.Task), ['same version, own plain write']);
 });
 
 test('map: with two rows for one key, delete empties the lowest; if that row is removed the other value returns', async () => {

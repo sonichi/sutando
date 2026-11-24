@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const LIB = join(dirname(fileURLToPath(import.meta.url)), '..', 'skills', 'commons-app-builder', 'lib');
-const SUITES = ['test/commons-sdk.test.js', 'examples/check.js'];
+const SUITES = ['test/commons-sdk.test.js', 'test/interleavings.test.js', 'examples/check.js'];
 
 // A parent `node --test` marks its children through this variable; unset, the child reports TAP.
 const env = { ...process.env };
