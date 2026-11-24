@@ -14,7 +14,7 @@ a real room or a browser. See [`NOTES.md`](NOTES.md) for what a real room must s
   rollback. A page that needs none of that is simpler without it.
 - **It must be inlined.** A page runs in a sandbox with no network, so it cannot load a script
   from anywhere. Copy `commons-sdk.js` into a `<script>` in the page. `examples/inline.js` shows
-  one way to do that between two marker comments. The file is about 24 KB; a page body is at most
+  one way to do that between two marker comments. The file is about 25 KB; a page body is at most
   196,608 bytes.
 - **The bridge is not ours.** The library is built on the page API (`window.artifact`). The host
   that runs the page owns that contract. In this repo the reference is the guide, section

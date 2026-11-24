@@ -58,7 +58,7 @@ Each item is an assumption. Check it with two people (and one agent) in a real r
 21. An agent writing the `Claim`, `Status` or `Result` cell through Actions does not trigger an unwanted summon on that row.
 22. `agent.sendTask` with a repeated `key` returns the first receipt and shows no second dialog.
 23. `room.post` and `agent.sendTask` reasons match the guide's wording exactly.
-24. The inlined library (about 24 KB) plus a page stays well under the 196,608-byte page limit, and runs in the sandbox with no blocked call. (The guide's static pre-flight, `check_page.py`, passes on both examples.)
+24. The inlined library (about 25 KB) plus a page stays well under the 196,608-byte page limit, and runs in the sandbox with no blocked call. (The guide's static pre-flight, `check_page.py`, passes on both examples.)
 25. A claim's read-back (one `db.read`) is affordable in a busy app: 20 reads a minute per page.
 26. Phone layout of the two examples at about 390px, light and dark. Not rendered here: the checks run without a browser.
 
