@@ -1173,7 +1173,7 @@ class AccountCardTest(CardWorld, unittest.TestCase):
     def test_the_card_names_the_account_and_a_tap_signs_in_and_says_which_account_is_used_now(self):
         (self.home / "stub-login").write_text("success bob@example.org")
         card = self.tap()
-        self.assertEqual(card["text"], "I'm signed in as a…@example.com (pro). Switch this agent's account or API key below.")
+        self.assertEqual(card["text"], "I'm using alice@example.com. Switch this agent's account below.")
         # The marker the desktop app draws this agent's account controls from, in the card itself.
         self.assertEqual(card["account_controls"], {"runtime": "codex"})
         self.assertFalse(re.search(r"[\u4e00-\u9fff]", json.dumps(card, ensure_ascii=False)), "English only")
@@ -1186,9 +1186,9 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.assertEqual((started["state"], [(b["kind"], b["url"]) for b in started["buttons"]]),
                          ("info", [("url", "https://stub.invalid/sign-in?id=login-1")]))
         self.assertEqual(started["text"], "I opened the sign-in page in the browser on the computer I run on. Finish "
-                                          "signing in there; I'll confirm here. Until then: I'm signed in as "
-                                          "a…@example.com (pro).")
-        self.assertEqual((room, done["state"], done["text"]), (self.DM, "done", "Signed in. I'm signed in as b…@example.org (pro)."))
+                                          "signing in there; I'll confirm here. Until then: I'm using "
+                                          "alice@example.com.")
+        self.assertEqual((room, done["state"], done["text"]), (self.DM, "done", "Signed in. I'm using bob@example.org."))
         self.assertEqual(json.loads((self.work / "state" / "account.json").read_text()), {})
         self.assertTrue(result(self.work, "task-next").startswith("STUB echo:"), "the turn it arrived in is answered as usual")
         self.assertEqual([m.get("card") for m in metrics(self.work)], ["account-card", "account-started", None])
@@ -1203,7 +1203,7 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.assertTrue(result(self.work, "task-next").startswith("STUB echo:"), result(self.work, "task-next"))
         self.assertEqual(metrics(self.work)[-1].get("auth"), "reloaded", "restarted before the turn, not after a failure")
         (_, _started), (_, done) = self.posted("$card2")
-        self.assertEqual(done["text"], "Signed in. I'm signed in as b…@example.org (pro).", "no shared login here")
+        self.assertEqual(done["text"], "Signed in. I'm using bob@example.org.", "no shared login here")
 
     def test_a_switch_on_a_login_shared_with_the_core_says_the_core_takes_it_at_its_next_restart(self):
         core = Path(self.tmp.name) / "core-home"
@@ -1213,7 +1213,7 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         (self.home / "stub-login").write_text("success bob@example.org")
         self.tap(extra_task=False)
         (_, _started), (_, done) = self.posted("$card2")
-        self.assertEqual(done["text"], "Signed in. I'm signed in as b…@example.org (pro). " + cc.SHARED_LOGIN)
+        self.assertEqual(done["text"], "Signed in. I'm using bob@example.org. " + cc.SHARED_LOGIN)
 
     def test_an_unauthorized_turn_restarts_once_and_a_login_rotated_meanwhile_answers(self):
         (self.home / "stub-token").write_text("tok-a")
@@ -1242,12 +1242,12 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.tap(extra_task=False)       # nothing else to do: the report arrives while the connector idles
         (_, _started), (_, failed) = self.posted("$card2")
         self.assertEqual((failed["state"], failed["text"]),
-                         ("error", "The sign-in did not finish (access_denied). I'm signed in as a…@example.com (pro)."))
+                         ("error", "The sign-in did not finish (access_denied). I'm using alice@example.com."))
         (self.home / "stub-login").write_text("refuse")
         self.again("$card3")
         ((_, refused),) = self.posted("$card4")
         self.assertEqual((refused["state"], refused["text"], metrics(self.work)[-1]["card"]),
-                         ("error", "I could not start a sign-in. I'm signed in as a…@example.com (pro).", "account-not-started"))
+                         ("error", "I could not start a sign-in. I'm using alice@example.com.", "account-not-started"))
 
     def test_a_sign_in_nobody_finishes_is_given_up_after_ten_minutes_and_a_new_tap_gives_up_the_old_one(self):
         with mock.patch.object(cc, "open_page", return_value=False):
@@ -1263,8 +1263,8 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.assertTrue(self.serve("task-later", "hello").startswith("STUB echo:"))
         ((room, gone),) = self.posted("$card5")
         self.assertEqual((room, gone["state"]), (self.DM, "error"))
-        self.assertEqual(gone["text"], "The sign-in was not finished in 10 minutes, so I stopped waiting. I'm signed in "
-                                       "as a…@example.com (pro). Send /account to try again.")
+        self.assertEqual(gone["text"], "The sign-in was not finished in 10 minutes, so I stopped waiting. I'm using "
+                                       "alice@example.com. Send /account to try again.")
         self.assertEqual(len((self.home / "stub-cancelled").read_text().split()), 2)
         self.assertEqual(json.loads((self.work / "state" / "account.json").read_text()), {})
 
@@ -1430,7 +1430,7 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         c.accounts.keep({})
         self.assertTrue(self.serve("task-later", "hello again").startswith("STUB echo:"))
         ((room, done),) = self.posted("$card3")
-        self.assertEqual((room, done["state"], done["text"]), (self.DM, "done", "Signed in. I'm signed in as b…@example.org (pro)."))
+        self.assertEqual((room, done["state"], done["text"]), (self.DM, "done", "Signed in. I'm using bob@example.org."))
         self.assertEqual(json.loads((self.work / "state" / "account.json").read_text()), {})
 
     def test_a_card_that_cannot_be_drawn_is_answered_in_words_and_the_task_is_done(self):
@@ -1442,18 +1442,26 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.assertEqual([m["card"] for m in metrics(self.work)], ["account-card-failed"] * 2)
         self.assertEqual((self.work / "state" / "done").read_text().split(), ["task-1", "task-2"])
 
-    def test_the_account_is_named_without_its_address_and_what_cannot_be_read_is_not_called_signed_out(self):
+    def test_the_account_is_named_by_its_full_email_and_what_cannot_be_read_is_not_called_signed_out(self):
         self.assertEqual([account_switch.masked(e) for e in ("alice@example.com", "", "no-at-sign", "@x.org")],
-                         ["a…@example.com", "", "", ""])
+                         ["alice@example.com", "", "", ""])
         args = cc.build_parser().parse_args(["--work", str(self.work)])
         args.state, args.bridge_state = str(self.work / "state"), str(self.bridge)
         (self.work / "state").mkdir(parents=True)
         c = cc.Connector(FakeRpc, args, note="n")
         for account, label in (({"type": "apiKey"}, "an API key"), ({"type": "amazonBedrock"}, "Amazon Bedrock"),
                                ({"type": "new-kind"}, "an account I can't name"), (None, ""),
-                               ({"type": "chatgpt", "email": None, "planType": None}, "a ChatGPT account")):
+                               ({"type": "chatgpt", "email": None, "planType": None}, "a ChatGPT account"),
+                               # Owner 2026-11-24: an account card never shows a plan suffix like "(pro)"/"(plus)".
+                               ({"type": "chatgpt", "email": "alice@example.com", "planType": "pro"}, "alice@example.com"),
+                               ({"type": "chatgpt", "email": "bob@example.org", "planType": "plus"}, "bob@example.org"),
+                               ({"type": "chatgpt", "email": None, "planType": "max"}, "a ChatGPT account")):
             with mock.patch.object(c.rpc, "request", return_value={"account": account}, create=True):
                 self.assertEqual(c.account_label(), label, account)
+        with mock.patch.object(c.rpc, "request", return_value={"account": {"type": "chatgpt", "email": "alice@example.com",
+                                                                           "planType": "pro"}}, create=True):
+            self.assertEqual(c.accounts.using(), "I'm using alice@example.com.")
+        self.assertEqual(account_switch.BELOW, "Switch this agent's account below.")
         with mock.patch.object(c.rpc, "request", side_effect=RuntimeError("account/read: timed out"), create=True):
             self.assertEqual(c.accounts.using(), "I could not read which account I'm signed in with.")
             # A cancel the server refuses still clears the pending sign-in; one this card did not start is ignored.
@@ -1953,7 +1961,7 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(card["account_controls"], {"runtime": "codex"})
         self.assertRegex(card["text"], r"^Codex has reached its usage limit \(resets \d{1,2}:\d\d [AP]M\), so I can't "
                                        r"answer until then\. Switch to another account or an API key to go on now\. "
-                                       r"I'm signed in as a…@example\.com \(pro\)\. " + re.escape(account_switch.BELOW) + "$")
+                                       r"I'm using alice@example\.com\. " + re.escape(account_switch.BELOW) + "$")
         self.assertEqual(metrics(self.work)[-1]["quota"], "quota-card")
         # Another message while still limited: no second card, and no error line in the room either.
         self.assertEqual(self.serve("task-2", "[[limit]] again"), cc.LIMITED_NO_SEND)
@@ -1996,7 +2004,7 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(c.saw_rate_limits({"rateLimits": {"primary": {"usedPercent": 40, "resetsAt": at}}}), "")
         self.assertEqual(c.saw_rate_limits({"rateLimits": {"secondary": {"usedPercent": 100, "resetsAt": at}}}),
                          "quota-card")
-        self.assertIn("I'm signed in as an API key.", self.outbox()[0]["card"]["text"])
+        self.assertIn("I'm using an API key.", self.outbox()[0]["card"]["text"])
         for p in (self.bridge / "agent-cards" / "outbox").iterdir():
             p.unlink()                                   # the bridge dropped it
         rec = json.loads((self.work / "state" / quota_notice.FILE).read_text())

@@ -32,7 +32,7 @@ class NoticeBase(Base):
         self.cfg = cli.read_config(cli.config_path())
         self.at = [1000.0]
         self.logs = []
-        p = mock.patch.object(account_card, "label", lambda cfg, env=None, run=None: "s…@example.com")
+        p = mock.patch.object(account_card, "label", lambda cfg, env=None, run=None: "sarah@example.com")
         p.start()
         self.addCleanup(p.stop)
 
@@ -61,7 +61,9 @@ class Notice(NoticeBase):
         self.assertEqual(queued["room"], DM)
         card = queued["card"]
         self.assertEqual(card["id"], account_switch.CARD)
-        self.assertIn("s…@example.com (Claude Code) has hit its usage limit; resets 3pm (America/Los_Angeles).", card["text"])
+        self.assertIn("sarah@example.com (Claude Code) has hit its usage limit; resets 3pm (America/Los_Angeles).", card["text"])
+        self.assertTrue(card["text"].endswith(account_switch.BELOW), card["text"])
+        self.assertEqual(account_switch.BELOW, "Switch this agent's account below.")
         self.assertEqual(card[account_switch.CONTROLS], {"runtime": "claude"}, "the client draws the controls in it")
         for later in (5.0, 120.0, 3600.0):
             self.assertEqual(self.tick(LIMITED, later), "", "one card per limit")
@@ -71,7 +73,7 @@ class Notice(NoticeBase):
         quota_card.remember_room(self.root, DM)
         self.assertEqual(self.tick(CREDITS), "quota-card")
         text = self.queued()[0]["card"]["text"]
-        self.assertIn("s…@example.com (Claude Code) is out of credits; it does not say when that resets.", text)
+        self.assertIn("sarah@example.com (Claude Code) is out of credits; it does not say when that resets.", text)
 
     def test_the_limit_over_then_back_is_a_new_card_and_a_banner_that_flickers_is_not(self):
         quota_card.remember_room(self.root, DM)
@@ -326,9 +328,9 @@ class LimitMenu(NoticeBase):
             self.assertEqual(q["card"]["id"], account_switch.CARD)
             self.assertEqual(q["card"][account_switch.CONTROLS], {"runtime": "claude"}, "the switch dropdown")
             self.assertTrue(self.text_of(q).startswith(
-                "s…@example.com (Claude Code) has hit its usage limit; resets Nov 28, 1pm. I can't answer until "
+                "sarah@example.com (Claude Code) has hit its usage limit; resets Nov 28, 1pm. I can't answer until "
                 "then: switch to another account below to go on now."), self.text_of(q))
-            self.assertNotIn("or an API key to go on", self.text_of(q), "Claude Code is not offered an API key")
+            self.assertNotIn("API key", self.text_of(q), "Claude Code is not offered an API key")
             self.assertNotIn("usage credits", self.text_of(q))
         self.assertEqual(quota_card.room(self.root), DM)
         # The messages stay queued for the session once the account is switched: none was answered here.
