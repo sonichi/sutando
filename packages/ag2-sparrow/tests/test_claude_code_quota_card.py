@@ -32,7 +32,7 @@ class Notice(Base):
         self.cfg = cli.read_config(cli.config_path())
         self.at = [1000.0]
         self.logs = []
-        p = mock.patch.object(account_card, "label", lambda cfg, env=None, run=None: "s…@example.com")
+        p = mock.patch.object(account_card, "label", lambda cfg, env=None, run=None: "sarah@example.com")
         p.start()
         self.addCleanup(p.stop)
 
@@ -50,7 +50,7 @@ class Notice(Base):
         card = queued["card"]
         self.assertEqual(card["id"], account_switch.CARD)
         self.assertIn("Claude Code has reached its usage limit (resets 3pm (America/Los_Angeles))", card["text"])
-        self.assertIn("I'm signed in as s…@example.com.", card["text"])
+        self.assertIn("I'm using sarah@example.com.", card["text"])
         self.assertEqual(card[account_switch.CONTROLS], {"runtime": "claude"}, "the client draws the controls in it")
         for later in (5.0, 120.0, 3600.0):
             self.assertEqual(self.tick(LIMITED, later), "", "one card per limit")

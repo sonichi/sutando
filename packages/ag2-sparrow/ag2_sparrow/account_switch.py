@@ -35,7 +35,7 @@ HINT = ("If the person asks to switch, change or sign in to another account for 
 IN_DM = "I can switch accounts from our direct message. Ask me there."
 # The account card's words, English only. On the agent's own computer the desktop app draws the account
 # controls below them (from the `account_controls` marker); elsewhere the client says where to open it.
-BELOW = "Switch this agent's account or API key below."
+BELOW = "Switch this agent's account below."
 CONTROLS = "account_controls"
 
 
@@ -63,9 +63,10 @@ def page_ok(url) -> bool:
 
 
 def masked(email: str) -> str:
-    """An address shortened to what tells two accounts apart: its first letter and its domain."""
-    name, at, domain = (email or "").partition("@")
-    return "%s…@%s" % (name[:1], domain) if name and at and domain else ""
+    """An address as the owner reads it in their DM with the agent: in full (owner 2026-11-24: one way to
+    show an account everywhere, the full email, never a plan); "" when it is not an address."""
+    name, at, domain = (email or "").strip().partition("@")
+    return "%s@%s" % (name, domain) if name and at and domain and " " not in name + domain else ""
 
 
 class AccountSwitch:
@@ -117,7 +118,7 @@ class AccountSwitch:
         except Exception as e:  # noqa: BLE001 - the card still says what it can
             self.log("account not read:", "%s: %s" % (type(e).__name__, str(e)[:200]))
             return "I could not read which account I'm signed in with."
-        return "I'm signed in as %s." % label if label else "I'm not signed in."
+        return "I'm using %s." % label if label else "I'm not signed in."
 
     def card(self, state: str, text: str, url: str = "", ask: bool = False):
         agent_card, _ = connector_cards._core()
