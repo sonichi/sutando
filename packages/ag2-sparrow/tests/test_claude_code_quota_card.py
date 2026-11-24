@@ -251,6 +251,10 @@ class Notice(NoticeBase):
         self.assertEqual(quota_card.reset_words(pane), "")
         self.assertNotIn("hunter2", quota_card.words(["quota-limit"], pane, "x"))
         self.assertNotIn("sk-secret", quota_card.words(["quota-limit"], pane, "x"))
+        # A banner the pane wrapped inside its "resets ..." is read on: the card said it "does not say when".
+        wrapped = "  ⎿  You've hit your weekly limit · resets Nov 28 at\n     1pm (UTC)\n\n❯ \n"
+        self.assertEqual(quota_card.reset_words(wrapped), "resets Nov 28, 1pm (UTC)")
+        self.assertEqual(quota_card.reset_words("You've hit your weekly limit · resets\nNov 28 at 1pm\n"), "resets Nov 28, 1pm")
         # Inside the banner line, only time-like characters are taken: nothing after an odd one.
         self.assertEqual(quota_card.reset_words("You've hit your usage limit · resets 3pm <b>x</b> $(rm)"), "resets 3pm")
 
@@ -382,6 +386,22 @@ class LimitMenu(NoticeBase):
         self.assertEqual(fooled["stall"]["reason"], "abnormal:quota-limit", "the raw pane, as before")
         # The pane is left as it is when no task is waiting or its text cannot be read.
         self.assertEqual(quota_card.own_ui(str(self.root) + "-nowhere", pane), pane)
+
+    def test_a_banner_a_new_session_redraws_from_the_conversation_before_is_history(self):
+        # After a restart Claude Code shows the old transcript, its limit banner included: the card fired again.
+        quota_card.remember_room(self.root, DM)
+        quota_card.new_session(self.root, now=lambda: self.at[0])
+        self.assertEqual(self.tick(QUIET), "")                 # nothing drawn yet
+        for later in (5.0, 60.0, 600.0):
+            self.assertEqual(self.tick(LIMITED, later), "", "the banner was on the pane when the session started")
+        self.assertEqual(self.queued(), [])
+        # The same banner again under it is a limit now.
+        self.assertEqual(self.tick(LIMITED + "● next answer\n" + LIMITED, 5.0), "quota-card")
+        # And the limit menu is never history, however early.
+        quota_card.new_session(self.root, now=lambda: self.at[0])
+        self.assertEqual(self.tick(STARTUP_MENU, 1.0), "quota-card")
+        # A session that never restarted has no history to set aside.
+        self.assertFalse(quota_card._history(str(self.root) + "-other", LIMITED, 0.0))
 
     def test_a_message_from_another_room_or_before_the_unasked_card_gets_its_own_card(self):
         self.assertTrue(quota_card._just_carded({"qid": "q", "queued": 100.0}, DM, DM, 130.0), "queued, not yet posted")

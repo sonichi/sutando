@@ -28,6 +28,7 @@ types into the session or changes an account.
 """
 from __future__ import annotations
 
+import collections
 import json
 import re
 import time
@@ -44,6 +45,9 @@ ROOM_FILE = "quota-room.json"   # the owner's DM room: the claim's alone
 CLEAR_S = 600.0         # the banner gone this long: the limit is over, and a later one is a new card
 SAME_CARD_S = 120.0     # a message known this soon after the unasked card is answered by that card
 ECHO_TASKS, ECHO_BYTES, ECHO_MIN = 40, 200_000, 8    # the task files a pane line is checked against
+_CUT = re.compile(r"\bresets?\b[\w ,]{0,24}$", re.IGNORECASE)
+SEEN_FILE = "quota-seen.json"   # the limit lines a new session's pane already showed
+SETTLE_S = 30.0         # how long a new session takes to draw the conversation before it
 RETRY_S = 60.0          # a card that could not be queued is tried again no sooner than this
 UNKNOWN_S = 2 * connector_cards.MAX_QUEUED_S
 TAIL_LINES = 8          # a banner this near the bottom is the limit the session sits at, not old scrollback
@@ -107,14 +111,16 @@ def reset_words(text: str) -> str:
     automatically at <when>" option line, and only a time is taken from it: a clock time, with a date
     before it and a zone after it when given. The words are built from those parts, never copied from
     the pane, so nothing else on the line can reach the DM."""
-    text = str(text or "")
+    text, under = str(text or ""), ""
     for line in reversed(text.splitlines()):
         line = detector._DECOR.sub("", line)
         if any(rx.match(line) for rx in _LIMIT):
-            found = _WHEN.search(line)
+            # A narrow pane wraps the banner: a line that ends inside its own "resets ..." goes on underneath.
+            found = _WHEN.search(line) or (_CUT.search(line) and _WHEN.search(line + " " + under))
             if found:
                 return _said(found)
             break
+        under = line.strip()
     if detector.LIMIT_MENU.search(text):
         menu = _MENU_WHEN.search(text)
         found = _WHEN.search("resets " + menu.group(1)) if menu else None
@@ -157,11 +163,33 @@ def _card_words(card, limited: list, text: str, log) -> str:
     return words(limited, text, "" if who else card.using(), who)
 
 
-def new_session(root) -> None:
+def new_session(root, now=None) -> None:
     """A session was just created (an account switch restarts it): what was told was about the session
     before, so a limit on this one is a new incident, told again. The DM room is the claim's and stays."""
     if load(root):
         save(root, {})
+    _write(root, SEEN_FILE, {"since": (now or time.time)(), "lines": []})
+
+
+def _limit_lines(text: str) -> list:
+    lines = (_flat(detector._DECOR.sub("", ln)) for ln in str(text or "").splitlines())
+    return [ln for ln in lines if any(rx.match(ln) for rx in _LIMIT)]
+
+
+def _history(root, text: str, at: float) -> bool:
+    """Whether the limit lines on the pane are only what a new session drew of the conversation before it: Claude
+    Code shows the old transcript again, its banner included. They stay history until another limit line joins
+    them; the limit menu, which only a live limit opens, is never history."""
+    seen = _read(root, SEEN_FILE)
+    if not seen or detector.LIMIT_MENU.search(str(text or "")):
+        return False
+    lines = _limit_lines(text)
+    if at - float(seen.get("since") or 0) < SETTLE_S:
+        if lines != seen.get("lines"):
+            _write(root, SEEN_FILE, dict(seen, lines=lines))
+        return True
+    old = collections.Counter(seen.get("lines") or [])
+    return bool(lines) and all(n <= old[ln] for ln, n in collections.Counter(lines).items())
 
 
 def _owner_task(root, task_id: str) -> "str | None":
@@ -298,6 +326,8 @@ def notice(root, cfg: dict, names, text: str, log, now=time.time) -> str:
         text = own_ui(root, text)
         limited = [n for n in detector.abnormal_names(text) if n in PROVIDER_LIMIT_PATTERNS]
     rec, at = load(root), now()
+    if limited and _history(root, text, at):
+        limited = []
     if not limited:
         if rec.get("since") is None:
             return ""
