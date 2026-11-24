@@ -70,6 +70,15 @@ def unrostered(workspace, workers: dict) -> list:
                   if p.is_dir() and p.name not in workers)
 
 
+def _declared_handler(config) -> str:
+    """The config's handler field as written, for naming it when the lookup refuses it."""
+    try:
+        handler = (json.loads(Path(config).read_text(encoding="utf-8")) or {}).get("handler")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return handler if isinstance(handler, str) else ""
+
+
 def preflight(workspace, repo, room: str) -> None:
     """Refuse before anything is created, not after.
 
@@ -114,7 +123,8 @@ def preflight(workspace, repo, room: str) -> None:
         # which the watcher cannot execute, so the binding would still be unrouted.
         if (lookup.returncode != 0 or not handler or not os.path.isfile(handler)
                 or not os.access(handler, os.X_OK)):
-            invalid = handler or os.environ.get("SUTANDO_TASK_EVENT_HANDLER", "")
+            invalid = (handler or os.environ.get("SUTANDO_TASK_EVENT_HANDLER", "")
+                       or _declared_handler(config))
             raise Refused(
                 diagnostic
                 + (f" (it names {invalid!r}, which is not an executable file)"

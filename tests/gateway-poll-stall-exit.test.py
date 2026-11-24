@@ -2,8 +2,8 @@
 """Discovered entry point for the ag2-sparrow poll-stall-exit suite.
 
 The assertions live in `packages/ag2-sparrow/tests/test_poll_stall_exit.py`;
-this file only makes them discoverable. `ci.yml` hand-lists that suite, which
-runs it but leaves it invisible to the coverage gate: `discover-python-tests.sh`
+this file only makes them discoverable. The ag2-sparrow publish gate runs that suite,
+but leaves it invisible to the coverage gate: `discover-python-tests.sh`
 -- the single owner of "which Python tests does CI run" -- globs `*.test.py`
 under `tests/` and `skills/` only, so the coverage run never executes it and the
 stall-exit branch it covers reports as uncovered. Same reason

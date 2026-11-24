@@ -37,6 +37,9 @@ idle / wedged":
     (any, + gateway down)   →   gateway-down       (gateway probe is bundled-specific)
     (any, + active gate)    →   blocked-known / blocked-human   (net-new: pane classify)
     (idle, + refused turn)  →   blocked-human (turn-rejected)   (net-new: refused_turn)
+    (any, + hook record)    →   a fresh hook "clear" voids only an ambiguous pane reading (unknown,
+                                or a selection with no focused row); a hook "blocked" is
+                                blocked-human (src/core_block_signal.py)
 
 runtime-health.json stays the Console's coarse view (unchanged, its consumers
 untouched); core-supervisor.json is the escalation-facing refinement of the same
@@ -69,6 +72,7 @@ _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
 from gateway_serving import read_verdict as read_gateway_verdict, status_path as gateway_status_path  # noqa: E402
 from worker_auth_state import authenticated_turn, idle_since_sign_in, login_expired, refusal_answered  # noqa: E402
 import cli_wedge  # noqa: E402
+import core_block_signal  # noqa: E402
 import core_gate_notice  # noqa: E402
 import core_limit_hold  # noqa: E402
 import core_recovery_state  # noqa: E402
@@ -169,6 +173,11 @@ _TURN_WINDOW = 40
 _HUMAN_GATES = {"login", "selection", "permission", "session-limit", "usage-limit", "fable-limit-unfocused",
                 "turn-rejected", "unknown"}
 
+#: A selection is positively identified only by a focused numbered row (Claude's ❯, Codex's ›/»);
+#: a bare "Select" word under a key hint is a guess, like "unknown".
+_FOCUSED_ROW = re.compile(r"^\s*[❯›»]\s*\d+\.\s", re.M)
+_HOOK_KIND = {"permission": "permission", "question": "selection"}
+
 # --- M4 AUTO-ANSWER (Layer 2): the safe key per gate; `answer_step` in the loop sends it
 # once per prompt instance (`--no-auto-answer` disables). Unlisted → None → ESCALATE.
 _AUTO_ANSWER = {
@@ -238,13 +247,9 @@ def auto_answer(kind):
     return _AUTO_ANSWER.get(kind)
 
 
-def classify(pane: str, styled_pane: "str | None" = None):
-    """Return (kind, excerpt) if the pane is awaiting user input, else None.
-
-    `styled_pane` supplies placeholder evidence to the shared filter. It must be
-    the SAME capture as `pane` (e.g. `pane = _ANSI_SGR.sub("", styled_pane)`),
-    so stripping never shifts a line out of the window the two share.
-    Only rows below the last turn spinner / completion line are read (pane_gate.live_tail)."""
+def _live_tails(pane: str, styled_pane: "str | None" = None):
+    """(plain, styled) text of the rows `classify()` reads: the last 14 non-empty rows below
+    the last turn spinner or completion line, the styled one from the same capture."""
     plain_lines = pane.splitlines()
     kept = [i for i, ln in enumerate(plain_lines) if ln.strip()][-14:]
     kept = kept[len(kept) - len(live_tail([plain_lines[i] for i in kept])):]
@@ -253,6 +258,17 @@ def classify(pane: str, styled_pane: "str | None" = None):
     styled_tail = ("\n".join(styled_lines[i] for i in kept)
                    if styled_lines is not None and kept and max(kept) < len(styled_lines)
                    else tail)
+    return tail, styled_tail
+
+
+def classify(pane: str, styled_pane: "str | None" = None):
+    """Return (kind, excerpt) if the pane is awaiting user input, else None.
+
+    `styled_pane` supplies placeholder evidence to the shared filter. It must be
+    the SAME capture as `pane` (e.g. `pane = _ANSI_SGR.sub("", styled_pane)`),
+    so stripping never shifts a line out of the window the two share.
+    Only rows below the last turn spinner / completion line are read (pane_gate.live_tail)."""
+    tail, styled_tail = _live_tails(pane, styled_pane)
     menu_gates = slash_menu_gate_rows(tail, styled_tail, CLAUDE)
     tail = gate_evidence(tail, styled_tail, CLAUDE)
     if not _AWAIT_HINT.search(tail):
@@ -280,7 +296,23 @@ def classify(pane: str, styled_pane: "str | None" = None):
     return "unknown", tail
 
 
-def _is_idle_ready(pane: str, runtime: "str | None" = None) -> bool:
+def _ambiguous_gate(kind: str, excerpt: str) -> bool:
+    """A reading the screen only guesses: no named gate, or a selection with no focused row."""
+    return kind == "unknown" or (kind == "selection" and not _FOCUSED_ROW.search(excerpt or ""))
+
+
+def _live_gate(pane: str, styled_pane: "str | None" = None, hook=None):
+    """`classify()`, less a guess the CLI's hooks have just said is not a dialog. A gate the
+    screen names (signature and key hint) stands whatever the hooks say, and so does gate text
+    under a completion-menu row, which classify() sends to a human on purpose."""
+    hit = classify(pane, styled_pane)
+    if hit and hook and hook[0] == core_block_signal.CLEAR and _ambiguous_gate(*hit) \
+            and not slash_menu_gate_rows(*_live_tails(pane, styled_pane), CLAUDE):
+        return None
+    return hit
+
+
+def _is_idle_ready(pane: str, runtime: "str | None" = None, hook=None) -> bool:
     """True when the pane POSITIVELY shows the idle-ready prompt (the bypass /
     for-agents footer) and no gate signature — the core is sitting ready for a
     task. Distinct from `classify(pane) is None`, which is ALSO None for a
@@ -296,7 +328,7 @@ def _is_idle_ready(pane: str, runtime: "str | None" = None) -> bool:
     if adapter is not None and adapter is not CLAUDE:
         state = _pg_classify_pane(pane, adapter).state
         return state == "idle-ready" or (state == "pending" and bool(adapter.idle_ready.search(tail)))
-    return bool(_IDLE.search(tail)) and classify(pane) is None
+    return bool(_IDLE.search(tail)) and _live_gate(pane, hook=hook) is None
 
 
 def _composer_is_empty(pane: str) -> bool:
@@ -429,7 +461,7 @@ def owes_work(seat, workspace):
 
 
 def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None, runtime=None,
-                  styled_pane: "str | None" = None, limit_stale=False, still_s=None):
+                  styled_pane: "str | None" = None, limit_stale=False, still_s=None, hook=None):
     """Refine runtime-health's coarse `base_health` into a supervisor state.
 
     `base_health` ∈ {offline, needs_login, working, idle, unknown} comes from
@@ -445,6 +477,8 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
     (see `classify()`); omitted it changes nothing else here.
     `limit_stale` (from `limit_step`) drops a limit banner the seat has outrun.
     `still_s` is how long the normalised pane has been unchanged (see `still_step`).
+    `hook` is `core_block_signal.verdict()` for this pane: ("blocked", reason), ("clear", None),
+    or None when no fresh hook record speaks for it (then the pane alone decides, as before).
     """
     if limit_stale and pane:
         pane = strip_limit_banners(pane)
@@ -454,7 +488,7 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
     # "sitting at a prompt waiting for input" from the coarse health (e.g. the live
     # /login MENU, which runtime-health's needs_login markers don't match). Check it
     # first so we carry the prompt text + kind for ESCALATE / AUTO-ANSWER.
-    hit = classify(pane, styled_pane) if pane else None
+    hit = _live_gate(pane, styled_pane, hook) if pane else None
     if hit:
         kind, excerpt = hit
         if kind in _HUMAN_GATES:
@@ -480,6 +514,12 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
     # After the pane: a live core held at its limit screen still shows that screen.
     if base_health == "paused":
         return "blocked-known", _BASE_TO_STATE["paused"][1], None, None
+    # A sign-in, refusal or limit (on screen, or a paused queue) outranks a held dialog.
+    if (hook and hook[0] == core_block_signal.BLOCKED and pane
+            and not _is_idle_ready(pane, runtime) and not _turn_moving(pane, prev_pane, still_s)):
+        kind = _HOOK_KIND.get(hook[1], "permission")
+        tail = "\n".join([ln for ln in pane.splitlines() if ln.strip()][-14:])
+        return "blocked-human", f"awaiting user: {kind} (hook)", tail or None, kind
     if not gateway_alive:
         return "gateway-down", "core up but relay gateway not running", None, None
     state, detail = _BASE_TO_STATE.get(base_health, _BASE_TO_STATE["unknown"])
@@ -492,7 +532,7 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
         # direct evidence over the stale status file: it's idle, not wedged. Only
         # a positive idle match overrides — a no-affordance pane (mid-work or truly
         # frozen) still reads hung, preserving genuine wedge detection.
-        if pane and _is_idle_ready(pane, runtime):
+        if pane and _is_idle_ready(pane, runtime, hook):
             return "idle-ready", _BASE_TO_STATE["idle"][1], None, None
         if pane and _turn_moving(pane, prev_pane, still_s):
             return "running", _BASE_TO_STATE["working"][1], None, None
@@ -637,6 +677,19 @@ def session_runtime(socket, session):
         return None
     out = (r.stdout or "").strip() if r.returncode == 0 else ""
     return out.split("=", 1)[1].strip() or None if out.startswith("SUTANDO_CORE_RUNTIME=") else None
+
+
+def hook_verdict(socket, session, state_dir, now):
+    """`core_block_signal.verdict()` for the core pane, or None when no record speaks for it.
+    With no record for this tmux server (no hooks installed) it makes no tmux call at all."""
+    if not core_block_signal.has_records(state_dir, socket):
+        return None
+    target = cli_wedge.core_target(socket, session)
+    ident = core_block_signal.pane_identity(socket, target) if target else None
+    if ident is None:
+        return None
+    _, pane_id, pane_pid = ident
+    return core_block_signal.verdict(core_block_signal.read(state_dir, socket, pane_id), pane_pid, now)
 
 
 def capture(socket, session):
@@ -1201,7 +1254,8 @@ def main():
             pane or "", base.get("health", "unknown"),
             gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
             process=(base.get("signals") or {}).get("process", True), prev_pane=prev_pane,
-            runtime=runtime, styled_pane=styled_pane, limit_stale=limit_stale, still_s=still_s)
+            runtime=runtime, styled_pane=styled_pane, limit_stale=limit_stale, still_s=still_s,
+            hook=hook_verdict(a.socket, a.session, state_dir, time.time()))
         prev_pane = pane
         if pane and pane.strip():
             last_live_pane = pane

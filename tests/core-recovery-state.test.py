@@ -352,6 +352,36 @@ class Edges(unittest.TestCase):
     def test_a_non_string_label_is_dropped(self):
         self.assertEqual(crs.coerce({"v": 1, "state": "running", "menu": [3, None, "Wait"]})["menu"], ["Wait"])
 
+    def test_a_credit_refusal_sent_with_another_account_is_not_this_records(self):
+        rej = {"status": 429, "ts": "2025-11-21T13:00:00Z", "account": "acct_aaaaaa",
+               "snippet": "Your credit balance is too low to access the API"}
+        now = 1763730000.0 + 60
+        self.assertTrue(crs._quota_says_credits({"account": "acct_aaaaaa", "recent_rejections": [rej]}, now))
+        self.assertFalse(crs._quota_says_credits({"account": "acct_bbbbbb", "recent_rejections": [rej]}, now))
+
+    def test_only_a_record_of_the_cores_own_account_drives_the_state(self):
+        """A credit refusal in the proxy's record turns a pause into out_of_credits only when the
+        record is labeled with the running core's account; with that account unknown, as before."""
+        digest = HOLD["account"]
+        mine, other = f"acct_{digest[:6]}", "acct_bbbbbb"
+        rej = {"status": 429, "ts": "2025-11-21T13:01:00Z",
+               "snippet": "Your credit balance is too low to access the API"}
+        cases = [(mine, ("opus", digest), "out_of_credits"), (other, ("opus", digest), "paused_limit"),
+                 (None, ("opus", digest), "paused_limit"), (None, ("opus", None), "out_of_credits"),
+                 (mine, ("opus", None), "paused_limit")]
+        for label, identity, want in cases:
+            with tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.object(crs.core_limit_hold, "launch_identity", return_value=identity):
+                ws = Path(tmp)
+                (ws / "state").mkdir()
+                (ws / "state" / "core-limit-hold.json").write_text(json.dumps(HOLD))
+                quota = {"recent_rejections": [dict(rej, account=label) if label else rej]}
+                if label:
+                    quota["account"] = label
+                (ws / "state" / "quota-state.json").write_text(json.dumps(quota))
+                rec = crs.gather(ws, {"state": "crashed"}, now=NOW, runtime="claude")
+                self.assertEqual(rec["state"], want, (label, identity))
+
     def test_a_junk_proxy_rejection_is_skipped(self):
         self.assertFalse(crs._quota_says_credits({"recent_rejections": ["junk", 3]}, NOW))
 

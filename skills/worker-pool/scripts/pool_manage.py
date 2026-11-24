@@ -52,6 +52,8 @@ Every verb prints one JSON line. Exit 0 done, 1 failed, 2 refused.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import subprocess
@@ -99,6 +101,19 @@ def _worker(workspace, target: str) -> tuple[str, dict]:
     return wid, row
 
 
+@contextlib.contextmanager
+def _lifecycle_lock(workspace, wid: str, action: str):
+    """Retire and enable each run whole under one worker's lock; either refuses while the other holds it."""
+    path = Path(workspace) / "state" / "locks" / f"worker-lifecycle-{wid}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+b") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Refused(f"worker {wid} has a retire or enable in progress; {action} it again once that ends") from None
+        yield
+
+
 def _not_self(wid: str, force: bool) -> None:
     """Killing the caller's own seat ends the call before it can record or report anything."""
     if wid == os.environ.get("SUTANDO_INSTANCE_ID") and not force:
@@ -106,13 +121,15 @@ def _not_self(wid: str, force: bool) -> None:
 
 
 def _outstanding(workspace, wid) -> list:
-    """Owed task ids, via the supervisor's own reading of what a worker owes."""
+    """Owed task ids, via the supervisor's own reading of what a worker owes: its owed sentinels and,
+    on (or switching to) its own folders, the unanswered tasks in its own inbox (`sup.own_inbox_owed`)."""
     owed = sup.work_outstanding(workspace, wid)
     if owed is None:
         raise Refused(f"cannot tell what {wid} still owes (deliveries or results unreadable)")
     if not owed:
         return []
-    return sorted(t for t, _ in _owed_residue(workspace, wid))
+    own = [t for t, _f in sup.own_inbox_owed(workspace, wid)]
+    return sorted(set(t for t, _ in _owed_residue(workspace, wid)) | set(own))
 
 
 def _owed_residue(workspace, wid):
@@ -183,6 +200,11 @@ def retire(workspace, target, *, unbind=False, hand_off=False, runner=subprocess
     `retired`, which the router re-checks under the delivery lock) comes first, so no
     new or replayed task can commit to the worker once the owed set is read."""
     wid, _ = _worker(workspace, target)
+    with _lifecycle_lock(workspace, wid, "retire"):
+        return _retire(workspace, wid, unbind=unbind, hand_off=hand_off, runner=runner, tell=tell)
+
+
+def _retire(workspace, wid, *, unbind, hand_off, runner, tell) -> dict:
     _not_self(wid, False)
     rooms = pr.rooms_bound_to(pr.load_bindings(workspace), wid)
     if rooms and not unbind:
@@ -212,9 +234,15 @@ def retire(workspace, target, *, unbind=False, hand_off=False, runner=subprocess
                            "paused, owning it: re-run retire --hand-off, or enable"}
         moved = {"handed_off": [], "kept": {}}
     _, _, _, unbound = pr.set_worker_state(workspace, wid, "retired", unbind=unbind)
+    identity = _retire_identity(workspace, wid, hand_off=hand_off, tell=tell)
+    moved = {"handed_off": moved["handed_off"] + identity.pop("handed_off", []),
+             "kept": {**moved["kept"], **identity.pop("kept", {})}}
+    if identity["result"] == "failed":
+        return {**base, "result": "failed", "unbound": unbound, "handed_off": moved["handed_off"],
+                "kept": moved["kept"], "identity": identity,
+                "why": f"{identity['why']}; the worker stays retired with its agent's row kept: re-run retire"}
     return {**base, "result": "retired", "unbound": unbound,
-            "handed_off": moved["handed_off"], "kept": moved["kept"],
-            "identity": _retire_identity(workspace, wid, tell=tell),
+            "handed_off": moved["handed_off"], "kept": moved["kept"], "identity": identity,
             "pending_approval": _withdraw_approval(workspace, wid, tell=tell)}
 
 
@@ -224,11 +252,28 @@ AGENT_REMOVAL_OWNER_STEP = ("the server cannot delete a live agent for us yet: d
                             "(your agents list), or it stays there with no worker behind it")
 
 
-def agent_removal_note(worker_label: str, agent: str) -> str:
+def agent_removal_note(worker_label: str, agent: str, withdrawn=(), withdraw_error: str = "") -> str:
     """The owner's DM once a retired worker's agent is cut loose here but still exists on s.space."""
-    return (f"[dm-only]\n**Delete agent `{agent}` in the app**\n\nYour worker {worker_label} was retired: "
+    note = (f"[dm-only]\n**Delete agent `{agent}` in the app**\n\nYour worker {worker_label} was retired: "
             "it no longer uses that agent, and its token is gone from this computer. The server cannot delete "
             "a live agent for me yet, so it stays in your agents list until you delete it there.")
+    if withdrawn:
+        note += (f"\n\nIts {len(withdrawn)} open decision card(s) were withdrawn, since nothing can answer them "
+                 "now; a click on one does nothing. The questions stay open in Pending questions:\n"
+                 + "\n".join(f"- {w}" for w in withdrawn))
+    if withdraw_error:
+        note += (f"\n\nIts open decision cards could not be withdrawn ({withdraw_error}). Nothing can answer them "
+                 "now; resolve each in Pending questions.")
+    return note
+
+
+def _withdraw_cards(ws: Path, wid: str) -> dict:
+    """The retiring worker's open decision cards, cancelled: no other lane may post or answer them."""
+    try:
+        from hitl.cards import withdraw_worker_cards
+        return {"cards_withdrawn": withdraw_worker_cards(wid, ws)}
+    except Exception as e:  # noqa: BLE001 — reported with the retirement, never blocks it
+        return {"cards_withdrawn": [], "cards_error": f"{type(e).__name__}: {e}"}
 
 
 def _tell_owner(workspace, text: str) -> bool:
@@ -250,33 +295,72 @@ def _withdraw_approval(workspace, wid: str, tell=None) -> dict:
         return {"result": "failed", "why": f"{type(e).__name__}: {e}"}
 
 
-def _retire_identity(workspace, wid: str, tell=None) -> dict:
-    """The worker's own agent, if it has one, goes with it: its lane, row and vault secret
-    (connections.retire_worker_identity). Retired, the router hands its tasks to the core, and
-    a lane still running as the worker would post the core's answers in the worker's name."""
+def _retire_identity(workspace, wid: str, hand_off: bool = False, tell=None) -> dict:
+    """The worker's own agent, if it has one, goes with it: its lane is stopped and its row marked retiring
+    (`connections.begin_worker_retirement`), the tasks it owes in its own folder are handed to the core under
+    its switch lock (`hand_off`; else they refuse), and only then its row and vault secret go
+    (`connections.retire_worker_identity`). Anything short of that is "failed" with the row kept."""
     import connections
-    try:
-        row = connections.retire_worker_identity(wid, workspace=Path(workspace))
-    except connections.ConnectionsError as e:
-        return {"result": "failed", "why": f"{type(e).__name__}: {e}"}
-    if row is None:
+    ws = Path(workspace)
+    if connections.worker_identity(wid, ws) is None:
         return {"result": "none"}
+    try:
+        connections.begin_worker_retirement(wid, workspace=ws)
+    except connections.ConnectionsError as e:
+        return {"result": "failed", "why": f"its lane did not stop ({type(e).__name__}: {e})"}
+    got = {"handed_off": [], "kept": {}}
+    try:
+        with connections.worker_switch_lock(wid, ws):
+            owed = sup.own_inbox_owed(ws, wid)
+            if owed and not hand_off:
+                return {"result": "failed", "owed_kept": sorted(t for t, _f in owed),
+                        "why": f"it owes {len(owed)} task(s) in its own folder (pass --hand-off)"}
+            if owed:
+                got = pd.hand_off_own_inbox(ws, wid, owed)
+    except OSError as e:
+        return {"result": "failed", **got, "why": f"its own folder's tasks were not handed off ({type(e).__name__}: {e})"}
+    if got["kept"]:
+        return {"result": "failed", **got,
+                "why": f"{len(got['kept'])} task(s) in its own folder could not be handed off (a task of that name "
+                       "is already in the shared tasks/)"}
+    try:
+        row = connections.retire_worker_identity(wid, workspace=ws) or {}
+    except connections.ConnectionsError as e:
+        return {"result": "failed", **got, "why": f"{type(e).__name__}: {e}"}
+    # Only once the identity is gone: a failed retirement keeps the worker, and its cards with it.
+    got.update(_withdraw_cards(ws, wid))
     agent = row.get("agent_mxid") or ""
     label = str(((pr.load_roster(workspace) or {}).get("workers") or {}).get(wid, {}).get("label") or wid)
-    told = (tell or (lambda text: _tell_owner(workspace, text)))(agent_removal_note(label, agent or "?"))
-    return {"result": "removed", "instance": row["instance"], "agent": agent,
+    told = (tell or (lambda text: _tell_owner(workspace, text)))(
+        agent_removal_note(label, agent or "?", got["cards_withdrawn"], got.get("cards_error", "")))
+    return {"result": "removed", "instance": row.get("instance"), "agent": agent,
             "agent_removal": "owner_step", "owner_told": bool(told),
-            "note": AGENT_REMOVAL_OWNER_STEP}
+            "note": AGENT_REMOVAL_OWNER_STEP, **got}
 
 
 def enable(workspace, repo, target, *, start=True, runner=None, spawn=None) -> dict:
-    wid, row = _worker(workspace, target)
+    wid, _ = _worker(workspace, target)
+    with _lifecycle_lock(workspace, wid, "enable"):
+        return _enable(workspace, repo, wid, start=start, runner=runner, spawn=spawn)
+
+
+def _enable(workspace, repo, wid, *, start, runner, spawn) -> dict:
+    import connections
+    wid, row = _worker(workspace, wid)
     old = row.get("state")
     if old == "retired":
         pr.set_worker_state(workspace, wid, "live")
     sup.set_paused(workspace, wid, False)
     out = {"worker_id": wid, "action": "enable", "result": "enabled", "previous_state": old,
            "paused": False}
+    if connections.worker_retiring(wid, Path(workspace)):
+        # A retire that stopped part-way kept the agent's row: this takes it back, lane and all.
+        lane = connections.end_worker_retirement(wid, workspace=Path(workspace)) or {}
+        try:
+            out["lane"] = connections.start_added(lane, repo=Path(repo), logs_dir=Path(workspace) / "logs",
+                                                  workspace=Path(workspace))
+        except connections.ConnectionsError as e:
+            out["lane"] = {"ok": False, "reason": str(e)}
     if start:
         restarted = rem.restart(workspace, repo, wid, runner=runner, spawn=spawn)
         out["start"] = {"result": restarted["result"], "detail": restarted["detail"]}
@@ -369,8 +453,8 @@ def bind(workspace, room: str, target: str) -> dict:
     import connections
     roster = pr.load_roster(workspace) or {}
     wid = pr.resolve_label(roster, target) if roster else target
-    if connections.worker_dirs(wid, Path(workspace)) is not None:
-        raise Refused(f"worker {wid} keeps its own folders: the router never delivers to it, so a room "
+    if connections.worker_target_dirs(wid, Path(workspace)) is not None:
+        raise Refused(f"worker {wid} keeps (or is switching to) its own folders: the router never delivers to it, so a room "
                       "is not bound to it (the core asks it with pool_ask)")
     # The checked id, not the label: a rename in between must not bind another worker.
     out = pr.bind_room(workspace, room, wid)
