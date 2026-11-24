@@ -19,7 +19,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from ... import connect_bridge as cb, connect_common as cm, task_io, task_lifecycle as lifecycle
+from ... import connect_bridge as cb, connect_common as cm, task_io, task_lifecycle as lifecycle, turn_error
 from ... import claude_local_records as records, collaborator_turn as isolated, relay_loop
 from . import hmac_policy
 from .shape import LOCAL
@@ -599,13 +599,15 @@ def publish(root, task_id) -> dict:
     return _mirror(root, task_id, None, {"task_id": task_id, "outcome": outcome})
 
 
-def park(root, task_id, turn_id, detail) -> dict:
+def park(root, task_id, turn_id, detail, error="") -> dict:
     """A completed or aborted turn with nothing staged: the explicit protocol failure, published once.
     A turn whose answer was already accepted (its descriptor recorded) publishes that answer instead.
     The identical park again after one that settled but whose reply was lost answers settled, naming
-    the protocol failure only when that is what it delivered; nothing is published twice."""
+    the protocol failure only when that is what it delivered; nothing is published twice.
+    `error`: what the session said ended the turn; its scrubbed line replaces `detail` in the room's line."""
     rec = _lifecycle(root).claims.load(task_id)
-    body = (PROTOCOL_FAILURE % detail).encode("utf-8")
+    why = turn_error.error_line(error)
+    body = (PROTOCOL_FAILURE % ("turn error: " + why if why else detail)).encode("utf-8")
     if rec and rec.get("staged") and rec["phase"] in (lifecycle.TURN_CONFIRMED, lifecycle.RESULT_STAGED, lifecycle.SETTLED):
         # `parked` names what the recorded descriptor delivers: this park's failure line, or an accepted answer.
         failure = rec["staged"].get("sha256") == hashlib.sha256(body).hexdigest()
@@ -671,7 +673,8 @@ def main(args) -> int:
         elif verb == "publish":
             out = publish(root, args.task_id)
         elif verb == "park":
-            out = park(root, args.task_id, args.turn_id, args.detail)
+            out = park(root, args.task_id, args.turn_id, args.detail,
+                       sys.stdin.read() if args.error_stdin else "")
         elif verb == "progress":
             gen = task_io.holder_consumer(root) if args.bind_generation else None
             out = progress(root, args.session_id, args.nonce, args.intake, args.reason,
@@ -719,6 +722,7 @@ def add_parser(sub) -> None:
     s = v.add_parser("stage"); s.add_argument("task_id"); s.add_argument("turn_id")
     u = v.add_parser("publish"); u.add_argument("task_id")
     k = v.add_parser("park"); k.add_argument("task_id"); k.add_argument("turn_id"); k.add_argument("--detail", default="no result")
+    k.add_argument("--error-stdin", action="store_true")
     g = v.add_parser("progress")
     g.add_argument("--session-id"); g.add_argument("--nonce"); g.add_argument("--intake", choices=("open", "stopped"))
     g.add_argument("--reason"); g.add_argument("--bind-generation", action="store_true")

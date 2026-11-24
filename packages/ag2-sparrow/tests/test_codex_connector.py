@@ -20,7 +20,7 @@ from unittest import mock
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import local_task_protocol, task_io, team_guardrail  # noqa: E402
+from ag2_sparrow import local_task_protocol, task_io, team_guardrail, turn_error  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
 
 # The note as it was pinned before it moved to the shared owner: proves the move changed no byte.
@@ -993,7 +993,15 @@ class EdgePathTest(unittest.TestCase):
         self.assertEqual(c.result_body("completed", "", None), cc.NO_REPLY)
         self.assertEqual(c.result_body("timeout", "part", "interrupted after 1s"),
                          "Codex did not finish this task in time (interrupted after 1s).\n\nPartial reply:\npart")
-        self.assertEqual(c.result_body("failed", "", {"message": "x"}), "Codex ended this task with status failed.")
+        self.assertEqual(c.result_body("failed", "", {"message": "Quota exceeded."}),
+                         "Codex ended this task with status failed: Quota exceeded.")
+        for no_message in (None, {}, {"message": ""}, {"message": "  \n "}, "boom"):
+            self.assertEqual(c.result_body("failed", "", no_message), "Codex ended this task with status failed.", no_message)
+        said = c.result_body("failed", "part", {"message": "denied for /Users/o/.codex/auth.json\n" + "y" * 400})
+        line = said.split("\n")[0]
+        self.assertNotIn("/Users/o", line)
+        self.assertLessEqual(len(line), len("Codex ended this task with status failed: .") + turn_error.LIMIT)
+        self.assertTrue(said.endswith("\n\nPartial reply:\npart"))
 
     def test_done_list_is_bounded_and_deduplicated(self):
         with tempfile.TemporaryDirectory() as d:

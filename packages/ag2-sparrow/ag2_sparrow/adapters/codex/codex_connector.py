@@ -30,7 +30,7 @@ import threading
 import time
 import uuid
 
-from ... import held_start
+from ... import held_start, turn_error
 from ...collaborator_turn import stage_own_attachments, with_staged_paths
 from ...relay_loop import count_arg
 from ...task_io import (AUDIENCE_RULE, DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER_CAPABILITIES,  # noqa: F401
@@ -600,7 +600,8 @@ class Connector:
         elif status == "server-exited":
             head = "Codex stopped before this task finished (%s)." % err
         else:
-            head = "Codex ended this task with status %s." % status
+            why = turn_error.error_line(err.get("message") if isinstance(err, dict) else None).rstrip(".")
+            head = "Codex ended this task with status %s%s." % (status, ": " + why if why else "")
         partial = (text or "").strip()
         return head + ("\n\nPartial reply:\n" + partial if partial else "")
 

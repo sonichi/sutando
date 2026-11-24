@@ -76,8 +76,8 @@ function submittedAt(turnText: string, msg: string): number {
 
 // One lifecycle claim as the Mod sees it: the phase is the CLI's answer, never a shadow machine.
 type Offer = { file: string; rid: string; attempt: number; msg: string; hash: string; token: string; turnId: string; phase: string
-                confirming?: { turnId: string; hash: string; completed?: string }; stagedText?: string
-                parkPending?: string; unconfirmed?: boolean }
+                confirming?: { turnId: string; hash: string; completed?: string; completedError?: string }; stagedText?: string
+                parkPending?: string; parkError?: string; unconfirmed?: boolean }
 
 // One session's inbox state: what was seen and answered, the offers in flight, the live watch, the
 // session-id witness and whether intake is open.
@@ -198,7 +198,9 @@ async function releaseOffer($: any, s: State, offer: Offer, why: string): Promis
 
 // The turn ended: an accepted answer is delivered as it is, else the protocol failure. why is '' once delivered,
 // else why not (kept, retried by the scan behind the backoff); hard: a write closed intake (the scan ends).
-async function parkOffer($: any, s: State, offer: Offer, reason: string): Promise<{ why: string; hard: boolean }> {
+// error: the session's own words for an API error that ended the turn; the CLI scrubs it into the room's line.
+async function parkOffer($: any, s: State, offer: Offer, reason: string, error: string = offer.parkError ?? ''): Promise<{ why: string; hard: boolean }> {
+  offer.parkError = error
   if (offer.stagedText !== undefined && offer.phase === 'TURN_CONFIRMED') {
     const st = await cli($, s, ['stage', offer.rid, offer.turnId], offer.stagedText + '\n')
     if (st.ok || (st.hard && st.data?.outcome === 'staged')) offer.phase = 'RESULT_STAGED'
@@ -209,7 +211,8 @@ async function parkOffer($: any, s: State, offer: Offer, reason: string): Promis
     }
   }
   const r = offer.phase === 'RESULT_STAGED' ? await cli($, s, ['publish', offer.rid])
-    : await cli($, s, ['park', offer.rid, offer.turnId, '--detail', `turn ${reason} without a reply`])
+    : await cli($, s, ['park', offer.rid, offer.turnId, '--detail', `turn ${reason} without a reply`, ...(error ? ['--error-stdin'] : [])],
+                error || undefined)
   if (!(r.ok || (r.hard && r.data?.outcome === 'settled'))) {
     offer.parkPending = reason
     return { why: String(r.data?.refused ?? r.data?.error ?? 'not published'), hard: r.hard }
@@ -217,6 +220,7 @@ async function parkOffer($: any, s: State, offer: Offer, reason: string): Promis
   await $.ui.log(`${PLUGIN}: ${offer.rid} delivered at the turn's end (${offer.stagedText !== undefined || r.data?.parked === false ? 'the accepted answer' : 'the protocol failure'})`, {})
   s.answered.add(offer.rid)
   offer.parkPending = undefined
+  offer.parkError = undefined
   const hard = await releaseOffer($, s, offer, "delivered at the turn's end")
   return { why: '', hard: hard || r.hard }
 }
@@ -233,7 +237,7 @@ async function confirmOffer($: any, s: State, offer: Offer): Promise<boolean> {
   if (r.ok || (r.hard && r.data?.turn_id)) {
     offer.turnId = c.turnId
     offer.phase = 'TURN_CONFIRMED'
-    return (c.completed ? (await parkOffer($, s, offer, c.completed)).hard : false) || r.hard
+    return (c.completed ? (await parkOffer($, s, offer, c.completed, c.completedError)).hard : false) || r.hard
   }
   await $.ui.log(`${PLUGIN}: ${offer.rid} turn not confirmed: ${r.data?.refused ?? ''}; held until the next start answers it`, {})
   // The claim stays CALLING with no answer and the CLI refuses to claim it again: the offer is kept, never
@@ -532,11 +536,15 @@ export const register: Register = (on) => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    // On an API error the turn's last visible text is the error message itself.
+    const error = e.reason === 'error' ? String(e.answer ?? '') : ''
     for (const offer of [...s.offers.values()]) {
       // Its confirmation still pending: parked once it lands, so the turn's end is never lost.
-      if (offer.confirming?.turnId === e.turnId) { offer.confirming.completed = String(e.reason); continue }
+      if (offer.confirming?.turnId === e.turnId) {
+        offer.confirming.completed = String(e.reason); offer.confirming.completedError = error; continue
+      }
       if (offer.turnId === e.turnId && (offer.phase === 'TURN_CONFIRMED' || offer.phase === 'RESULT_STAGED')) {
-        await parkOffer($, s, offer, String(e.reason))
+        await parkOffer($, s, offer, String(e.reason), error)
       }
     }
     return next(e)

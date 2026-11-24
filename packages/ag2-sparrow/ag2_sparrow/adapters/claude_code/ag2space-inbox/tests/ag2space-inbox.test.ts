@@ -309,7 +309,9 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
         c.phase = 'SETTLED'; c.body = c.staged; files[`/out/${task}.txt`] = c.body; publishes++
         return out(0, { outcome: 'settled', parked: false })
       }
-      c.phase = 'SETTLED'; c.body = `[s.space] The session's turn ended without a reply (${argv[argv.indexOf('--detail') + 1]})`
+      // As the CLI: the session's error words, when sent, name the cause in place of the detail.
+      const why = argv.includes('--error-stdin') ? `turn error: ${e.init.stdin}` : argv[argv.indexOf('--detail') + 1]
+      c.phase = 'SETTLED'; c.body = `[s.space] The session's turn ended without a reply (${why})`
       files[`/out/${task}.txt`] = c.body; publishes++
       return out(0, { outcome: 'settled', parked: argv[argv.indexOf('--detail') + 1] })
     }
@@ -490,6 +492,22 @@ test('a completed or aborted turn without a reply parks as an explicit protocol 
   expect(late.isError).toBe(true)
   await h.clock.advance(3000)
   expect(h.submitted.length).toBe(1)
+})
+
+test('a turn an API error ended parks with the error it showed; without one, the generic line', async ($, on) => {
+  const h = host(on)
+  h.files['/in/task-e1.txt'] = TASK('task-e1')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-e1' })
+  await $.turn.complete({ turnId: 't-e1', reason: 'error', answer: 'Credit balance is too low' } as any)
+  expect(h.files['/out/task-e1.txt']).toContain('ended without a reply (turn error: Credit balance is too low)')
+  h.files['/in/task-e2.txt'] = TASK('task-e2')
+  await h.clock.advance(3000)
+  expect(h.submitted[1]).toContain('task-e2')
+  await $.turn.start({ text: h.submitted[1], turnId: 't-e2' })
+  await $.turn.complete({ turnId: 't-e2', reason: 'error', answer: '' } as any)
+  expect(h.files['/out/task-e2.txt']).toContain('ended without a reply (turn error without a reply)')
 })
 
 test('a rejected submit spends the authorization: never resubmitted, no second authorize', async ($, on) => {
