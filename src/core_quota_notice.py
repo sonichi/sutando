@@ -84,9 +84,29 @@ class QuotaNotice:
     """`send(text) -> bool` posts the account card led by `text`; `name` is the runtime as the owner reads it."""
 
     def __init__(self, workspace, name: str, send: Callable[[str], bool], log: Callable[..., None] = print,
-                 now: Callable[[], float] = time.time):
+                 now: Callable[[], float] = time.time, runtime: str = "",
+                 account: Optional[Callable[[], str]] = None):
         self.path = Path(workspace).joinpath(*FILE)
+        self.workspace = Path(workspace)
         self.name, self.send, self.log, self.now = name, send, log, now
+        # With `runtime` ("codex" | "claude"), the limit is also recorded in core_account_health.
+        self.runtime, self.account = runtime, account
+
+    def health(self, state: str, resets_at=None) -> None:
+        if not self.runtime:
+            return
+        try:
+            import core_account_health
+            account = ""
+            if self.account is not None:
+                account = self.account() or ""
+            if state == "ok":
+                core_account_health.mark_ok(self.workspace, self.runtime, account, now=self.now(), log=self.log)
+            else:
+                core_account_health.mark(self.workspace, state, self.runtime, account, resets_at,
+                                         now=self.now(), log=self.log)
+        except Exception as e:  # noqa: BLE001 - advisory: the health record never stops the notice
+            self.log("account health not kept:", type(e).__name__)
 
     def load(self) -> dict:
         try:
@@ -121,6 +141,7 @@ class QuotaNotice:
         if not self.load().get("since"):
             return ""
         self.save({})
+        self.health("ok")
         return "quota-cleared"
 
     def hit(self, reset: str = "", reset_at=None) -> str:
@@ -136,6 +157,7 @@ class QuotaNotice:
             rec["reset_at"] = float(reset_at)
         if reset and not rec.get("reset"):
             rec["reset"] = reset[:60]
+        self.health("quota", rec.get("reset_at"))
         if rec.get("told") or at - float(rec.get("tried") or 0) < RETRY_S:
             self.save(rec)
             return ""

@@ -923,6 +923,15 @@ class Crash(SeatCase):
         self.assertEqual(len(self.sent("thread/resume")), 1)
 
 
+
+def health(ws):
+    """The core's account health record (core_account_health), {} when none."""
+    try:
+        return json.loads((Path(ws) / "state" / "core-account-health.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
 class AccountSwitch(SeatCase):
     """The child reads its login once, at start; a sign-in or account switch since revoked that login's refresh
     token (VM 11-22: the first turn after a switch failed with "refresh token was revoked"). A changed login
@@ -985,16 +994,33 @@ class AccountSwitch(SeatCase):
         self.assertEqual(s.step(), seat_mod.UNAUTHORIZED)
         self.assertEqual((self.starts(), len(self.sent("turn/start"))), (2, 2), "restarted and tried once more")
         self.assertEqual(self.posted(), [f"--workspace {self.ws} post --signed-out"])
+        self.assertEqual((health(self.ws)["state"], health(self.ws)["runtime"]), ("signed_out", "codex"))
+        since = health(self.ws)["since"]
         rec = json.loads(s.record_file("task-1.txt").read_text())
         self.assertEqual(rec["outcome"], seat_mod.UNAUTHORIZED)
         self.assertEqual(list(task_dispatch.pending_candidates(self.tasks, self.results)), ["task-1.txt"])
         self.now[0] += 31
         self.assertEqual(s.step(), seat_mod.UNAUTHORIZED)
         self.assertEqual(len(self.posted()), 1, "once per login on disk")
+        self.assertEqual(health(self.ws)["since"], since, "rewritten only when it changes")
         self.sign_in("tok-b")                       # the owner switches from the card
         self.now[0] += 31
         self.assertEqual(s.step(), "done")
         self.assertEqual(len(self.posted()), 1)
+        self.assertEqual(health(self.ws)["state"], "ok")
+
+    def test_a_sign_in_while_idle_puts_the_health_back_to_ok_without_a_task(self):
+        self.sign_in("tok-a", revoke="tok-a")
+        self.task("task-1.txt")
+        s = self.make(retry_s=3600, max_attempts=3)
+        s.ensure_server()
+        self.assertEqual(s.step(), seat_mod.UNAUTHORIZED)
+        s.health_auth_check()
+        self.assertEqual(health(self.ws)["state"], "signed_out", "the same login: still signed out")
+        self.sign_in("tok-b")
+        s.health_auth_check()
+        self.assertEqual(health(self.ws)["state"], "ok")
+        self.assertIn("account health: ok", self.out.getvalue())
 
     def test_a_card_that_could_not_be_sent_is_tried_again(self):
         self.sign_in("tok-a", revoke="tok-a")
@@ -1015,6 +1041,7 @@ class AccountSwitch(SeatCase):
         self.assertEqual(s.step(), seat_mod.UNAUTHORIZED)
         self.assertEqual(self.starts(), 2)
         self.assertEqual(self.posted(), [])
+        self.assertEqual(health(self.ws), {}, "a worker never writes the core's health")
 
     def test_what_reads_as_unauthorized(self):
         yes = ({"codexErrorInfo": "unauthorized"}, {"codex_error_info": {"unauthorized": {}}},
@@ -1259,6 +1286,8 @@ class QuotaCard(SeatCase):
         self.assertIn("Codex has reached its usage limit (resets %s)" % core_quota_notice.reset_from_epoch(4102444800),
                       self.cards[0])
         self.assertTrue(json.loads((self.ws / "state" / "core-quota-card.json").read_text())["told"])
+        self.assertEqual({k: health(self.ws).get(k) for k in ("state", "runtime", "resets_at")},
+                         {"state": "quota", "runtime": "codex", "resets_at": 4102444800.0})
         self.now[0] += 3600
         self.assertEqual(s.step(), "failed")
         self.assertEqual(len(self.cards), 1, "a second card for the same limit")
@@ -1286,8 +1315,11 @@ class QuotaCard(SeatCase):
         s = self.make(quota=self.quota(), retry_s=0.0)
         s.ensure_server()
         s.step()
+        self.assertEqual(health(self.ws)["state"], "quota")
         self.assertEqual(s.step(), "done")
         self.assertFalse(json.loads((self.ws / "state" / "core-quota-card.json").read_text()))
+        self.assertEqual(health(self.ws)["state"], "ok")
+        self.assertNotIn("resets_at", health(self.ws))
         self.task("task-2.txt")
         s.step()
         self.assertEqual(len(self.cards), 2)

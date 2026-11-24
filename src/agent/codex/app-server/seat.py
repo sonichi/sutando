@@ -39,6 +39,7 @@ for _p in (str(REPO / "src"), str(Path(__file__).resolve().parent)):
         sys.path.insert(0, _p)
 
 import codex_core_model  # noqa: E402
+import core_account_health  # noqa: E402
 import core_quota_notice  # noqa: E402
 import supervised_host  # noqa: E402
 from cli_wedge_patterns import ABNORMAL_PATTERNS, PROVIDER_LIMIT_PATTERNS  # noqa: E402
@@ -341,6 +342,7 @@ class Seat:
         self.auth_seen: Optional[tuple] = None  # the login on disk when the running child was started
         self.turn_unauth = False  # the current turn was refused because the login no longer works
         self.told_signed_out: Optional[tuple] = None  # the login the owner was last shown the card for
+        self.health_auth: Optional[tuple] = None  # the login on disk when the core's health went bad
         # Shows the owner the core's account card when its login is refused even after a restart.
         self.card_argv = [sys.executable, str(ACCOUNT_CARD), "--workspace", str(self.workspace), "post",
                           "--signed-out"]
@@ -414,6 +416,33 @@ class Seat:
         if self.rpc is not None and auth_print() != self.auth_seen:
             log("login changed on disk; restarting the app-server before the turn")
             self.close_server()
+        self.health_auth_check()
+
+    # ---- the core's account health (core_account_health), for Settings and the profile tab ----
+
+    def health(self, state: str, resets_at=None) -> None:
+        """Record the core seat's account health; a worker's seat shares the core's login and says nothing."""
+        if self.worker:
+            return
+        try:
+            account = core_account_health.codex_email(auth_file())
+            if state == "ok":
+                changed = core_account_health.mark_ok(self.workspace, "codex", account, log=log)
+                self.health_auth = None
+            else:
+                changed = core_account_health.mark(self.workspace, state, "codex", account, resets_at, log=log)
+                self.health_auth = auth_print()
+        except Exception as e:  # noqa: BLE001 - advisory: the record never stops the seat
+            log(f"account health not kept ({type(e).__name__})")
+            return
+        if changed:
+            log(f"account health: {state}")
+
+    def health_auth_check(self) -> None:
+        """The login on disk changed since the health went bad (a sign-in or account switch): back to ok,
+        without waiting for a task. The next turn says otherwise if the new login is refused too."""
+        if self.health_auth is not None and auth_print() != self.health_auth:
+            self.health("ok")
 
     def signed_out(self, filename: str) -> None:
         """The login was refused even on a restarted child: the core seat shows the owner the account card
@@ -997,6 +1026,8 @@ class Seat:
         took = f"{time.monotonic() - started:.1f}s"
         if status == "completed":
             self.failures = 0
+            if self.turn_limit is None:
+                self.health("ok")
         self.quota_step(status)
         if has_ready_result(results, filename):
             if not self.still_admitted(filename, payload, picked):
@@ -1021,6 +1052,7 @@ class Seat:
             return status
         if self.turn_unauth and status != "completed":
             status = UNAUTHORIZED
+            self.health("signed_out")
             self.signed_out(filename)
         outcome = "no-result" if status == "completed" else status
         rec = self.write_record(filename, payload, outcome, detail)
@@ -1032,7 +1064,10 @@ class Seat:
 
     def quota_step(self, status: str) -> None:
         """Out of usage: the owner gets the account card once per limit (core_quota_notice); a turn
-        that completed ends the limit. A notice that cannot be sent never stops the seat."""
+        that completed ends the limit. A notice that cannot be sent never stops the seat. The limit is
+        recorded in the core's account health first, card or no card."""
+        if self.turn_limit is not None:
+            self.health("quota", limit_reset(self.rate_limits))
         if self.quota is None:
             return
         try:
@@ -1098,6 +1133,7 @@ class Seat:
                 if not self.idle_logged:
                     log("idle: waiting for tasks")
                     self.idle_logged = True
+                self.health_auth_check()
                 self.wake.wait(self.poll_s)
                 self.wake.clear()
         except SeatFatal as e:
