@@ -55,11 +55,12 @@ def stuck_answers(plugin: dict) -> dict:
 
 
 def derive(previous: dict, text: str, plugin: dict, now: float, stall_min_s: float = STALL_MIN_S,
-           abnormal_min_s: float = ABNORMAL_MIN_S) -> dict:
+           abnormal_min_s: float = ABNORMAL_MIN_S, own: "str | None" = None) -> dict:
     """The next observation: {frame_hash, static_since, task, abnormal, stall}. `stall` is None or
     {reason, since, frame_hash, task, checks, lines}: `static` once the pane has not changed for
     stall_min_s with an offer in flight, `abnormal:<names>` once abnormal text has shown for
-    abnormal_min_s. Any change of frame, task or banner set resets the clock and clears the stall."""
+    abnormal_min_s. Any change of frame, task or banner set resets the clock and clears the stall.
+    `own` is the pane without what only repeats a task's text: banners are read there when given."""
     h = frame_hash(text)
     alarm = plugin.get("progress_unwritable") or {}
     if alarm:
@@ -79,7 +80,7 @@ def derive(previous: dict, text: str, plugin: dict, now: float, stall_min_s: flo
                           "checks": "tasks without an answer: %s" % ", ".join(
                               "%s (%s)" % (i, stuck[i].get("detail") or "no detail") for i in ids), "lines": []}}
     task = inflight_task(plugin)
-    names = abnormal_names(text)
+    names = abnormal_names(text if own is None else own)
     same = previous.get("frame_hash") == h and previous.get("task") == task
     static_since = previous["static_since"] if same and previous.get("static_since") is not None else now
     abnormal_since = (previous["abnormal_since"] if names and previous.get("abnormal") == names

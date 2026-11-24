@@ -472,7 +472,9 @@ class Launcher:
         plugin = dict(plugin, inflight=inbox.live_inflight(self.root, plugin.get("inflight")),
                       stuck=inbox.unresolved_stuck(self.root, plugin.get("stuck")),
                       progress_unwritable=records.read_progress_alarm(self.config_dir))
-        self.observation = detector.derive(self.observation, text, plugin, self.clock())
+        # A task's own words on the pane ("... hit its usage limit ...") are not a banner, and no stall.
+        self.observation = detector.derive(self.observation, text, plugin, self.clock(),
+                                           own=quota_card.own_ui(self.root, text))
         self.quota(text)
         stall = self.observation["stall"]
         if (rec.get("stall") or None) != stall:

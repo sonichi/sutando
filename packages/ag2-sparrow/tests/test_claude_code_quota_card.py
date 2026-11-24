@@ -374,6 +374,12 @@ class LimitMenu(NoticeBase):
         # Claude Code's own banner under the same task is still the limit.
         self.assertEqual(self.tick(pane.replace("● Looking at the room now.", LIMITED.strip("\n")), 5.0),
                          "quota-task-card x1")
+        # Nor a stall: the launcher raised "abnormal text on the pane" cards for the same wrapped words.
+        own, plugin = quota_card.own_ui(self.root, pane), {"inflight": {}, "stuck": {}}
+        seen = detector.derive({}, pane, plugin, 0.0, own=own)
+        self.assertEqual((seen["abnormal"], detector.derive(seen, pane, plugin, 600.0, own=own)["stall"]), ([], None))
+        fooled = detector.derive(detector.derive({}, pane, plugin, 0.0), pane, plugin, 600.0)
+        self.assertEqual(fooled["stall"]["reason"], "abnormal:quota-limit", "the raw pane, as before")
         # The pane is left as it is when no task is waiting or its text cannot be read.
         self.assertEqual(quota_card.own_ui(str(self.root) + "-nowhere", pane), pane)
 
@@ -533,7 +539,7 @@ class Supervisor(unittest.TestCase):
 
     def test_the_ticks_observation_calls_it_with_the_pane(self):
         source = Path(launcher.__file__).read_text()
-        self.assertIn("self.observation = detector.derive(self.observation, text, plugin, self.clock())\n        self.quota(text)", source)
+        self.assertIn("own=quota_card.own_ui(self.root, text))\n        self.quota(text)", source)
 
 
 if __name__ == "__main__":
