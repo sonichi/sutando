@@ -37,8 +37,8 @@ Write `[no-send]` as the result and stop when any of these holds:
      s.space display name, never a persona or Stand name.
      `<owner's display name>` is how this room shows your owner: in the room roster
      (`room.members.list`), the display name of the row whose user id is `ag2.whoami`'s
-     `runtime.owner_id`. No such row, or no display name on it, means no owner name. The inviter is
-     your owner only when their id is that one.
+     `runtime.owner_id`. No such row, no display name on it, or one that is only that user id or
+     its localpart, means no owner name. The inviter is your owner only when their id is that one.
      Without a name, say "I'm <owner's display name>'s agent"; without an owner, "I'm <your
      name>, an agent"; without either, "I'm an agent". Never make a name from a user id.
    - What you understand the room is for (or your guess, flagged as one).

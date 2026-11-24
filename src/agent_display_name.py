@@ -62,6 +62,15 @@ def https_get(url: str) -> bytes:
         return resp.read(65536)
 
 
+def is_id_name(name: str, mxid: str) -> bool:
+    """Whether `name` is only `mxid` or its localpart, as a server fills an unset display name."""
+    m = MXID.match(mxid or "")
+    if not m:
+        return False
+    local = m.group(1).lower()
+    return name.strip().lstrip("@").lower() in {mxid.lstrip("@").lower(), local, re.sub(r"\.agent$", "", local)}
+
+
 def profile_name(mxid: str, fetch: Optional[Fetch] = None) -> str:
     """The mxid's Matrix profile displayname from its homeserver; '' on any failure."""
     m = MXID.match(mxid or "")
@@ -142,7 +151,7 @@ def resolve(mxid: Optional[str] = None, *, fetch: Optional[Fetch] = None,
             got = name()
         except Exception:  # noqa: BLE001 - a failing tier leaves the next one
             got = ""
-        if got:
+        if got and not is_id_name(got, mxid):
             return got, source
     return "", "none"
 

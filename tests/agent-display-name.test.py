@@ -95,6 +95,13 @@ class ResolveTest(Fixture):
             self.assertEqual(adn.resolve("not-an-mxid", fetch=profile(DISPLAY)), ("", "none"))
         self.assertFalse(hasattr(adn, "localpart_name"))
 
+    def test_a_name_that_is_only_the_id_or_its_localpart_is_no_name(self):
+        local = MXID[1:].split(":")[0]
+        with self.rows():
+            for echoed in (MXID, MXID[1:], local, local.upper(), local.removesuffix(".agent")):
+                self.assertEqual(adn.resolve(MXID, fetch=profile(echoed)), ("", "none"), echoed)
+            self.assertEqual(adn.resolve(MXID, fetch=profile(DISPLAY)), (DISPLAY, "profile"))
+
     def test_the_cli_prints_no_name_and_says_not_to_state_one(self):
         out, err = io.StringIO(), io.StringIO()
         with self.rows(), mock.patch.object(adn, "profile_name", return_value=""), \
