@@ -101,6 +101,9 @@ class ResolveTest(Fixture):
             for echoed in (MXID, MXID[1:], local, local.upper(), local.removesuffix(".agent")):
                 self.assertEqual(adn.resolve(MXID, fetch=profile(echoed)), ("", "none"), echoed)
             self.assertEqual(adn.resolve(MXID, fetch=profile(DISPLAY)), (DISPLAY, "profile"))
+        with self.rows(), mock.patch.dict(os.environ, {"SUTANDO_DISPLAY_NAME": "blue-fox"}):
+            self.assertEqual(adn.resolve("", fetch=profile(None)), ("blue-fox", "configured"))
+            self.assertEqual(adn.resolve("not-an-mxid", fetch=profile(None)), ("blue-fox", "configured"))
         long_mxid = "@" + "a-very-long-agent-handle-" * 4 + "x.agent:example.invalid"
         with self.rows():
             for echoed in (long_mxid, long_mxid[1:], long_mxid[1:].split(":")[0]):
