@@ -423,6 +423,8 @@ def begin_switch(ws: Path, room: str, rt: str, current: str, t: float, *, event:
     except OSError as e:
         release(ws, rec)
         out = {"status": "failed", "say": FAILED_TO_START, "why": f"{type(e).__name__}: {e}"}
+        if posted.get("event_id"):
+            out["event_id"] = posted["event_id"]    # the card that now says "Switching", edited or newly posted
         if tell_failure:    # the card just said "Switching": it must not go on saying so
             out["told"] = _answer(ws, room, event if posted.get("edited") else "", "error", "Not switched",
                                   FAILED_TO_START, f"runtime-card:{attempt}:not-started", core=core or None,
@@ -636,11 +638,12 @@ def _await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, r
         if out["status"] == "started":
             finish_wait(ws, mine)
             return _emit(out)
-        # Not started: that is this attempt's outcome. Its exact words go on record before the card is
-        # told, so a waiter resumed after a lost receipt repeats the telling and never the switch.
-        if not claim_wait(ws, mine, "refused", words=out["say"]):
+        # Not started: the outcome, its words and the card that says "Switching" now (a new one when the
+        # original could not be edited) go on record first; a resumed waiter only repeats that edit.
+        target = str(out.get("event_id") or card_event)
+        if not claim_wait(ws, mine, "refused", words=out["say"], card=target):
             return _emit(superseded)
-        return refuse(card_event, out["say"], out)
+        return refuse(target, out["say"], out)
 
     while True:
         rec = waited()
