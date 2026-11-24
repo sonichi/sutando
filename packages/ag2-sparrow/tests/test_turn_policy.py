@@ -144,6 +144,13 @@ class RefusalNotice(unittest.TestCase):
                                  task_io.NON_OWNER_REFUSED, other)
             self.assertEqual(task_io.REFUSED_QUIETLY, "[no-send]\n")
 
+    def test_the_task_that_took_the_notice_says_it_again_when_answered_again(self):
+        # A refusal whose result write failed is answered again: its sender has not been told yet.
+        with tempfile.TemporaryDirectory() as d:
+            first, later = dict(self.HUMAN, id="task-1"), dict(self.HUMAN, id="task-2")
+            said = [task_io.refusal_body(h, d, now=t) for h, t in ((first, 10.0), (first, 20.0), (later, 30.0), (first, 40.0))]
+            self.assertEqual(said, [task_io.NON_OWNER_REFUSED] * 2 + [task_io.REFUSED_QUIETLY, task_io.NON_OWNER_REFUSED])
+
     def test_an_agent_or_a_message_for_someone_else_is_never_told(self):
         with tempfile.TemporaryDirectory() as d:
             for quiet in ({"user_id": "@blue.agent:s.example"}, {"addressed_to": "Pat"}, {"owner_mentioned": "true"}):
