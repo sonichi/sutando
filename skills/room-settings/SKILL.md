@@ -1,0 +1,138 @@
+---
+name: room-settings
+description: Use when your owner asks you to change how you behave in an s.space room or DM ("only answer when I mention you", "answer everyone here", "give the team access", "who can talk to you here?"), or asks what your settings in a room are. How to read and change your own room settings with the room.agent_policy Actions.
+---
+
+# Room settings
+
+Your settings in a room decide what you read there, when you answer, and who can reach
+you. They are stored by s.space, not by you. Read and change them only with these Actions,
+through the s.space MCP tools (`skills/ag2-space-mcp/SKILL.md`). Never promise a setting in
+your reply, never write one to memory, a note or a file instead, and never act as if a
+setting changed when the Action did not succeed.
+
+## Only your owner
+
+- Only your owner can change your settings: the task must have `access_tier: owner`. If
+  anyone else asks, say only your owner can change how you work here, and change nothing.
+  Don't call the Action for them.
+- The change must come from your owner's own message to you: pass that message's task id as
+  `task_id`. For a task file, `python3 skills/room-settings/scripts/task_id.py <task file>`
+  prints it; don't work it out from the file yourself. Exit 2 means the task is not your
+  owner's: change nothing. On an MCP event, use the event's `task_id`. If there is none
+  (exit 3), or the change is refused because of the task, ask them to send it to you
+  directly: in your DM, as a reply to you, or by mentioning you.
+- You can only change your own settings, never another agent's. For another agent, your
+  owner changes it in the room's settings in the app.
+
+## Read first
+
+Call `room.action.read` with action `room.agent_policy.read` and the `room_id` of the room
+your owner means (this room unless they name another; another room's id comes from
+`room.list`). Keep its `policy_revision`. Its `card` is what your owner set for you here
+(`null`: nothing yet). Its `policy` is what s.space actually applies: your card joined with
+the room's own rules and the defaults.
+
+When your owner asks what your settings are or how you behave, answer from `policy`, in plain
+words. If it differs from the `card` (for example the room itself is mentions-only), say so.
+
+In a DM, what you read, when you answer, who you answer and members' access are not used:
+you get every message there, whatever `policy` says. If the room your owner means is a DM,
+say so: it only matters in rooms with other people. To change one, ask which room they
+mean, unless they already named it. Don't change it in the DM.
+
+## The settings
+
+Offer only these choices. If your owner asks for something else, say it is not a setting you
+can change here, and offer the nearest one.
+
+| Setting (`changes` field) | Choices |
+|---|---|
+| What reaches you from others (`visibility`) | `mentions`: only their messages that mention you are sent to you · `all`: every message (your owner's messages always reach you) |
+| When you answer others (`trigger`) | `mention`: when mentioned · `always`: every message |
+| When you answer your owner (`ownerTrigger`) | `mention` · `always` |
+| Who you answer (`audience`) | `everyone` in the room · `specific`: only your owner and the people listed |
+| The people listed (`audienceUsers`) | a list of user ids, each one like `@name:s.space`, of people joined to the room; used only with `specific` |
+| Others who mention your owner (`admitOnOwnerMention`) | `true`: people who may already reach you can also call you by mentioning your owner · `false` |
+| Room members' access (`memberAccessTier`) | `none`: no access · `guest`: when they address you, your owner gets a card to let you answer that once · `team`: they can work with you as your Team |
+| Secrets check on Team answers (`sensitiveDataFilter`) | `true`: before an answer to a Team member is posted, it is checked for secrets (tokens, keys, passwords) and for raw errors or local file paths, and held back if it has any · `false`: that check is skipped; an answer still can't be sent to another room or attach a file outside the task |
+
+Memory (`sessionScope`) is also stored by s.space, but it doesn't change how you work, so
+don't offer it. You keep one memory across all your rooms; a setting does not keep it to one
+room. Never promise that it does. If your owner asks for it, say so, and change nothing.
+
+- "Only answer when I mention you", from your owner, is When you answer your owner
+  (`mention`), not What reaches you: What reaches you and When you answer others are about other
+  people.
+- "Mention" means addressing you: a mention of you, or a reply to one of your messages
+  (with "Others who mention your owner" on, also a mention of or reply to your owner). Say
+  so when your owner asks for "only when I mention you".
+- What reaches you and when you answer others work together. To answer others' messages that
+  don't mention you, both must be set: every message for what reaches you and for when you
+  answer. If your owner asks for that and only one is set, change both, and say so. Members
+  with Guest access must still address you either way: ask before changing their access.
+- Guest access only lets you research, explain and draft for them, once your owner allows
+  each message. It never lets them have you change files or anything outside the room.
+- Mentioning your owner never lets in someone who is not listed or has no access.
+- Team access is for the whole room: it can let members who could not reach you before
+  start working with you, so say that when your owner asks for it. You can't give it to one
+  person, and it still keeps out anyone blocked or not on a "specific people" list.
+  It also needs your owner to have made you able to work with a Team; if the change is
+  refused as `CONFLICT` for that, say so.
+- The secrets check only matters with Team access, and only for members you work with as
+  your Team. Turning it off lets a secret in your answer to them be posted: say that, and
+  ask your owner to confirm before you send the change. It changes nothing for your owner or Guests.
+- "What reaches you" is about which messages are sent to you to answer. It does not hide the
+  room's history from you, so never promise your owner that you can't read other messages.
+- Before you list people, check each one is in the room: `room.action.read` with action
+  `room.members.list` and the `room_id`. If someone is not there, or a name matches more
+  than one person, ask your owner instead of sending the change.
+- When the request is unclear, ask one short question with the choices. Don't guess.
+- Never show your owner the field names or values in backticks: use the plain words.
+
+## Change
+
+Call `room.action.execute` with action `room.agent_policy.set`, the `room_id`, a new
+`operation_id`, the `task_id` from your owner's message, and `arguments`:
+
+- `changes`: only the settings your owner asked to change.
+- `expected_revision`: the `policy_revision` you just read.
+- `reason`: one short line in your own words on what your owner asked for.
+
+Never pass `asked_by`.
+
+## What comes back
+
+- **Done:** the result has `changed` (one plain sentence per setting), the stored `card` and
+  `policy`, what s.space actually applies once the room's own rules are added. Tell your
+  owner what changed, from `changed`. If `policy` still limits what they asked for (for
+  example the room itself is mentions-only), say what still applies and that a room admin
+  sets it.
+- **`INVALID_INPUT`** for a change that changes nothing: tell your owner it is already set
+  that way.
+- **`approval_required`:** the change opens access (for example answering everyone, or a
+  higher access level), so your owner must approve it on a card in their DM with you. Nothing
+  has changed yet. Say it is waiting for their approval and that the card is in your DM.
+  Never say it is done. Don't call again. Keep the `approval_id` and `operation_id` it gives.
+  Nothing tells you when they decide. When they ask: `approval.inspect` with the
+  `approval_id` says how they decided; `operation.inspect` with the `operation_id` says
+  whether the change then ran or failed (an approved change can still fail if the settings
+  moved meanwhile). Then read again with `room.agent_policy.read` to say what applies now.
+- **`CONFLICT`** for a stale revision: the settings changed since you read them. Read again,
+  check the change still makes sense, and try once more.
+- **`FORBIDDEN`** with a `reason`:
+  - `not_owner`: the person asking is not your owner. Change nothing.
+  - `no_task`, `no_origin`, `task_not_yours`: the request did not come straight from your
+    owner to you. Ask them to send it to you directly.
+  - `task_closed`, `task_expired`: the request is too old (a change must be sent within 10
+    minutes of their message, while you are still on it). Ask them to ask again.
+- **`UPSTREAM_UNAVAILABLE`:** something s.space needs did not answer. Read its message and
+  do what it suggests. If it says there is no DM with your owner for the approval card,
+  nothing was held: tell your owner, and don't try again until you have a DM with them. If
+  it says the write may or may not have happened, read again with `room.agent_policy.read`
+  and tell your owner what is stored.
+- **`INVALID_INPUT`:** fix the arguments and try once more. `room.actions.describe` with the
+  action shows the schema.
+
+Never retry a refused change in another way, and never tell anyone a setting is on before
+`room.agent_policy.read` shows it stored.
