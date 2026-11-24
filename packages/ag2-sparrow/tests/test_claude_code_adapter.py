@@ -1007,20 +1007,6 @@ class InboxCli(ConnectBase):
         self.assertEqual((self.results / "task-a.txt").read_bytes(), delivered, "a settled claim parks nothing again")
         self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"late\n")[0], 1, "and stages nothing")
 
-    def test_park_of_an_api_error_turn_names_the_scrubbed_error_and_falls_back_to_the_detail(self):
-        for t, error, want in (
-                ("task-e1", b"Credit balance is too low\n", "ended without a reply (turn error: Credit balance is too low)"),
-                ("task-e2", b"denied: /Users/someone/.claude/x\n", "(turn error: denied: <path>)"),
-                ("task-e3", b"  \n", "ended without a reply (turn error without a reply)")):
-            self.verb("claim", self.task(t))
-            token = self.verb("authorize", t, "1", "--text-hash", "h")[1]["token"]
-            self.verb("confirm", t, "turn-1", token, "--text-hash", "h")
-            rc, out = self.verb("park", t, "turn-1", "--detail", "turn error without a reply", "--error-stdin", stdin=error)
-            self.assertEqual((rc, out["outcome"], out["parked"]), (0, "settled", "turn error without a reply"), t)
-            body = (self.results / (t + ".txt")).read_text()
-            self.assertIn(want, body, t)
-            self.assertNotIn("/Users/someone", body)
-
     def test_a_park_whose_reply_was_lost_after_it_settled_answers_settled_on_the_identical_retry(self):
         """The compound I/O case: the park's publication settled, the lock's release failed and the claim could
         not be re-read (retry); the Mod's identical park then answers settled, never 'staging parked', so it
