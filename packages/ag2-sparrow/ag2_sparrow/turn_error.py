@@ -6,8 +6,8 @@ decides what of an error's text may go there: secrets and local paths removed, o
 from __future__ import annotations
 
 import re
+import sys
 
-from . import diagnostics
 from .chat_secret_filter import filter_chat_secrets
 
 LIMIT = 300
@@ -27,7 +27,14 @@ def error_line(message, limit: int = LIMIT) -> str:
     text = _URL_SECRET.sub(r"\1[REDACTED]", text)
     text = _PATH.sub("<path>", text)
     text = " ".join(text.split())
-    text = diagnostics.scrub(text)
+    text = _scrub_registered(text)
     if len(text) > limit:
         text = text[:limit - 1].rstrip() + "…"
     return text
+
+
+def _scrub_registered(text: str) -> str:
+    # Secrets are registered only in a process that loaded diagnostics; importing it here would put every
+    # adapter that reports a turn error in gateway-credential scope.
+    diagnostics = sys.modules.get(f"{__package__}.diagnostics")
+    return diagnostics.scrub(text) if diagnostics is not None else text

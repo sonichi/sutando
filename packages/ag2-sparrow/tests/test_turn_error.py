@@ -7,6 +7,12 @@ import sys
 import unittest
 from pathlib import Path
 
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# The registered-secret case loads diagnostics, which reads gateway credentials: no outer selector survives.
+isolate_os_environ()
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ag2_sparrow import diagnostics, turn_error  # noqa: E402
 

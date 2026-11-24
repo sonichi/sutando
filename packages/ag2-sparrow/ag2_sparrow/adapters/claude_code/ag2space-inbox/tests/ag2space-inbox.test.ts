@@ -93,7 +93,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   on('session.cwd', () => ({ value: '/w/tasks' }))
   on('session.end', (_: any, e: any) => ({ sessionId: e.sessionId }))
   on('turn.start', (_: any, e: any) => ({ turnId: e.turnId }))
-  on('turn.complete', (_: any, e: any) => ({ text: e.text }))
+  on('turn.complete', (_: any, e: any) => ({ text: String(e.answer ?? e.text ?? '') }))
   on('tool.register', () => ({ value: { tool: 'x' } }))
   on('ui.log', (_: any, e: any) => { logs.push(String(e?.message ?? e?.text ?? JSON.stringify(e))); return { value: undefined } })
   mock.env(on, opts.env ?? { AG2_RESULTS_DIR: '/out' })
