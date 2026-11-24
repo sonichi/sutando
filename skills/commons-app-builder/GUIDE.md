@@ -63,6 +63,14 @@ they answer, writes are refused with "waiting for the viewer's answer", and `mem
 `personId()` reject with "page permission required". A "no" gives "not allowed by the viewer".
 Editing the page asks again.
 
+**Database versions and conditional writes.** A database can carry a `version`, and a write can
+name the version it was based on (`{ifVersion}`), so that it lands only if the database has not
+changed since. Both are off unless the room has them turned on. Feature-detect: a read or a
+snapshot without `version` means "not available here", and the page falls back to the plain
+writes above. For the call shape and the refusal reasons, see the "Database versions and
+conditional writes" section of `docs/commons-html-page-api.md` in the web client
+(cinny-webclient) repository.
+
 **The sandbox.** The frame is `allow-scripts` on an opaque origin. It has no network (`fetch`,
 XHR and WebSocket fail), `localStorage` throws, `alert`, `confirm` and `prompt` are blocked,
 `history.replaceState` is unavailable, and a `<form>` never submits. Inline all CSS and JS. Keep
