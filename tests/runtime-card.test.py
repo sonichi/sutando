@@ -928,6 +928,39 @@ class AwaitSignIn(Base):
         self.assertEqual((out["status"], argv[argv.index("--card") + 1]), ("started", "$card9"))
         self.assertEqual(len(self.fake.calls), said, "no edit and no post: the saved card is the target")
 
+    def test_a_fallback_that_landed_and_lost_two_answers_is_asked_for_until_its_card_is_known(self):
+        refused, seen, lost = {"$card2"}, {}, []
+
+        def room(action, arguments, *, operation_id, room_id):
+            if action == "room.message.edit" and arguments["event_id"] in refused:
+                raise ac.CardError("briefly unavailable")
+            if operation_id not in seen:
+                seen[operation_id] = self.fake.execute(action, arguments, operation_id=operation_id, room_id=room_id)
+            if action == "room.message.send" and operation_id.endswith(":switching") and len(lost) < 2:
+                lost.append(1)
+                raise ac.CardError("timed out")         # it landed; the answer was lost, twice
+            return seen[operation_id]
+        # The first waiter: route recorded, the post landed, no answer; it was then stopped before the spawn.
+        self.stopped_after_claiming("switching", switch="7-abc")
+        self.admitted("7-abc")
+        mine = {"attempt": self.attempt, "runtime": "claude", "room": DM}
+        rtc.keep_wait_card(self.ws, mine, route="post")
+        rtc.say_switching(self.ws, DM, "claude", "codex", "7-abc", "$card2", core=CORE, execute=room, new_card=True)
+        fallback = [v for k, v in seen.items() if k.endswith(":switching")][0]["result"]["event_id"]
+        refused.clear()                                 # the old card could be edited again by now
+        # First replay: the answer is lost again. The worker is not started on the old card.
+        rc, out = self.wait_with(room)
+        self.assertEqual((rc, out["status"], out["kept"], self.launch.calls), (1, "failed", "switching", []))
+        kept = json.loads(self.ws.joinpath(*rtc.WAITING).read_text())
+        self.assertEqual((kept["phase"], kept["route"], kept.get("says")), ("switching", "post", None))
+        self.assertEqual(json.loads(self.ws.joinpath(*rtc.RUNNING).read_text())["attempt"], "7-abc", "still admitted")
+        # Second replay: the receipt comes back. One card was ever posted, and the worker gets it.
+        rc, out = self.wait_with(room)
+        argv = self.launch.calls[-1][0]
+        self.assertEqual((out["status"], argv[argv.index("--card") + 1]), ("started", fallback))
+        self.assertEqual(len([c for c in self.fake.calls if c[0] == "room.message.send" and c[2].endswith(":switching")]), 1)
+        self.assertEqual([e for e, _ in self.fake.edits() if e == "$card2"], [])
+
     def test_a_waiter_stopped_before_its_last_words_leaves_them_for_the_next_to_say(self):
         for phase, status, said in (("expired", "gave_up", "I stopped waiting for the Claude Code sign-in"),
                                     ("already", "already", "The core is now running on Claude Code")):

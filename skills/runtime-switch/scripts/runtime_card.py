@@ -672,6 +672,11 @@ def _await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, r
                     if posted.get("event_id"):
                         card_event = str(posted["event_id"])
                         note_card(card_event)
+                    elif new_card:
+                        # A new card may be out there and this try did not learn which: the worker is not
+                        # started on a guess. The claim stays, and the next waiter asks for the same post.
+                        return _emit({"status": "failed", "runtime": args.runtime, "kept": "switching",
+                                      "why": "the card that says Switching is not confirmed yet"}, 1)
                 try:
                     pid = start_switch(ws, args.room, args.runtime, switch, popen, card=card_event)
                 except OSError as e:
