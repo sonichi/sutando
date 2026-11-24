@@ -30,9 +30,9 @@ was run in a real room.
 | 20 | Unsubscribing an experimental `requests` watch. | The design shows no way. `watch` returns none. |
 | 21 | One watch per database. | All handles on one database share one watch and one write queue. What the bridge does on a second watch is not stated; the fake throws, to catch misuse. |
 | 22 | `db.list()`: does it count as a read? | Not stated. The library calls it once per `map()` or `list()` call. |
-| 23 | Versions and conditional writes. | The guide does not describe them. The library's use rests on the host's page API as reported in review: a number in `version` on what `db.read` and `db.onChange` give; `{ifVersion}` as the last argument of `db.write` and `db.createRow`; the reasons "version changed", "conditional writes are not available here" and "invalid request"; a conditional write is never queued and never enters the page's own copy early. All of it is behind feature detection, and a missing `version` means the plain path. |
+| 23 | Versions and conditional writes. | The guide does not describe them. The source is `docs/commons-html-page-api.md` in the web client (cinny-webclient) repository, section "Database versions and conditional writes": the number in `version` on what `db.read` and `db.onChange` give, `{ifVersion}` as the last argument of `db.write` and `db.createRow`, and the refusal reasons. That document owns the contract and it is not copied here. The library feature-detects: a missing `version` means the plain path. |
 | 24 | A snapshot that is older than an accepted conditional write. | Ignored: after the room accepts a write at version `v`, a snapshot with a version of `v` or lower was taken before it. This assumes the version only grows. |
-| 25 | Reasons the guide does not quote ("this write is waiting for approval", "offline", "no answer from the room…"). | Not given codes for plain writes: they come back as `REFUSED` with the text. On a conditional write only, "no answer from the room" means "read again". |
+| 25 | Reasons the guide does not quote. | "This write is waiting for approval" and "no answer from the room; read again before deciding" are worded in that same section; an offline page is not. For plain writes the library gives none of them a code: they come back as `REFUSED` with the text. On a conditional write, "no answer from the room" means "read again". |
 
 ## Real-room checklist
 
@@ -64,16 +64,16 @@ Each item is an assumption. Check it with two people (and one agent) in a real r
 24. The inlined library (about 31 KB) plus a page stays well under the 196,608-byte page limit, and runs in the sandbox with no blocked call. (The guide's static pre-flight, `check_page.py`, passes on both examples.)
 25. Each "version changed" answer costs one `db.read`; check that is affordable in a busy app: 20 reads a minute per page.
 26. Phone layout of the two examples at about 390px, light and dark. Not rendered here: the checks run without a browser.
-27. With the host's switches on: `db.read` and `db.onChange` snapshots carry a number in `version`, it grows with every change to the database, and it is absent (not `0` or `null`) when the switch is off.
-28. `db.write(db, row, prop, value, {ifVersion})` and `db.createRow(db, cells, {ifVersion})` are the call shapes, and their refusal reasons are exactly "version changed", "conditional writes are not available here" and "invalid request".
-29. After an accepted conditional write, when does the page's own copy show it, and can a snapshot older than it still arrive? (The library ignores such a snapshot by its version.)
-30. A plain write goes into the page's own copy first and `db.read` answers from that copy. Two pages claim one row with plain writes: both get `certainty: "local"`, and `onLost` fires on one of them after they sync.
-31. "No answer from the room" on a conditional write: the exact text, and whether the write may still have landed.
-32. The exact texts for a write waiting for an approval and for an offline page, and whether such a plain write is kept in the page's own copy (the library reports `REFUSED` and undoes its own early display).
+27. The room you ship to has the switches on: `db.read` and `db.onChange` snapshots carry a number in `version`. A document cannot tell you that about a given room.
+28. With the switches on, two pages claim one row at the same moment: one gets `certainty: "room"`, the other `reason: "held"`, and neither page shows a false `onLost` afterwards.
+29. After an accepted conditional write, when the page's own copy shows it under real sync, and whether a snapshot older than it can still arrive. (The library ignores such a snapshot by its version.)
+30. With the switches off, two pages claim one row with plain writes: both get `certainty: "local"`, and `onLost` fires on one of them after they sync. Note how long that takes on a slow connection.
+31. After "no answer from the room" on a conditional write, how often the write had in fact landed, and that the read which follows shows it.
+32. A plain write made while the page is offline or waiting for an approval: whether it stays in the page's own copy. (The library reports `REFUSED` and undoes its own early display.)
 
 ## Not tested here
 
 - No real room, no real consent prompt, no second device, no real agent.
 - No browser: the example checks run the pages' scripts in Node with a small stand-in DOM. Layout and CSS were not rendered.
 - The fake room's reason texts for size, bad values and read limits are its own; only the phrases the guide quotes are faithful.
-- The conditional-write path and the "page's own copy" behaviour are tested only against the fake's model of them, which was written from a description, not from a running host.
+- The conditional-write path and the "page's own copy" behaviour are tested only against the fake's model of them, which was written from the page API document, not checked against a running host.

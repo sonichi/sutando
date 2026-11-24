@@ -262,10 +262,13 @@ A plain write is different: it goes into the page's own copy first, and the page
 from that copy. So after a plain write, reading back shows the page its own value and proves
 nothing about the room. The library therefore does not read back after a plain write.
 
-Honest limits. This repo's guide does not describe versions or conditional writes yet, so the
-library's use of them rests on the host's page API as reported to us, and it has been tested
-only against the fake bridge's model of that behaviour. The assumptions are listed in
-`NOTES.md`. `set`, `delete`, `push`, `update` (list) and `remove` always write plainly.
+Where this comes from. The call shape and the refusal reasons are documented in
+`docs/commons-html-page-api.md`
+in the web client (cinny-webclient) repository, section
+"Database versions and conditional writes". That document owns the contract, so it is
+not repeated here. What is still unchecked: the library has run only against the fake bridge's
+model of that section, never against a real room. `NOTES.md` lists what a live check must
+confirm. `set`, `delete`, `push`, `update` (list) and `remove` always write plainly.
 
 ### What is attested, and what is not
 
@@ -380,7 +383,7 @@ Each line is something the documented bridge does not let a library do.
 
 1. **Delete a row from a page.** There is no page call for it, so `remove` and `delete` leave rows behind. The list's marker lives in one place (`removal`), so a real delete can replace it there.
 2. **Write several cells of one row in one call.** `update` and "claim and set status" are not atomic.
-3. **Write only if unchanged.** This exists, per database, behind host switches (see "Conditional writes"); the library uses it when present. Still missing: the same check per row or per cell, and a description of it in this repo's guide. Where it is off, claims have a race window and counters lose presses.
+3. **Write only if unchanged.** This exists, per database, behind host switches (see "Conditional writes"); the library uses it when present. Still missing: the same check per row or per cell. Where it is off, claims have a race window and counters lose presses.
 4. **A unique title per database.** Without it two pages can create one map key twice.
 5. **A server-stamped time on a row or a cell.** Claim expiry rests on a time the claimer wrote.
 6. **An attested "last edited by" a page can read per cell.** Without it a claim's holder is self-declared.
