@@ -476,6 +476,67 @@ class AwaitSignIn(Base):
         rc, out = self.run_(["status"])
         self.assertEqual((rc, out["runtime"]), (0, "codex"), "a resume that fails is never in the card's way")
 
+    def stopped_after_claiming(self, phase):
+        """A waiter that claimed `phase` and was killed before doing it: what it leaves on record."""
+        mine = {"attempt": self.attempt, "runtime": "claude", "room": DM}
+        self.assertTrue(rtc.claim_wait(self.ws, mine, phase))
+        rec = json.loads(self.ws.joinpath(*rtc.WAITING).read_text())
+        self.assertEqual((rec["phase"], rec["attempt"], rec["card"]), (phase, self.attempt, "$card2"))
+        return rec
+
+    def test_a_waiter_stopped_between_claiming_the_sign_in_and_admitting_the_switch_is_finished_by_the_next(self):
+        self.stopped_after_claiming("switching")
+        # The core's start hook: the wait is still on record, so a waiter is started for it again.
+        self.assertEqual(self.run_(["resume"])[1]["status"], "resumed")
+        self.launch.calls.clear()
+        self.claude_json = {"loggedIn": False}      # it does not ask again: the sign-in was already seen in time
+        self.clock.sleep(rtc.SIGN_IN_WAIT_S * 2)    # nor does a deadline that passed meanwhile undo it
+        rc, out = self.wait()
+        self.assertEqual((rc, out["status"], out["after_sign_in"]), (0, "started", True))
+        self.assertIn("switch", self.launch.calls[0][0])
+        self.assertEqual(self.fake.edits()[-1][0], "$card2")
+        self.assertTrue(self.ws.joinpath(*rtc.RUNNING).exists())
+        self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists(), "removed only once the switch was admitted")
+
+    def test_a_waiter_stopped_after_the_switch_was_admitted_does_not_start_a_second_one(self):
+        self.stopped_after_claiming("switching")
+        self.ws.joinpath(*rtc.RUNNING).write_text(json.dumps(
+            {"attempt": "7-abc", "runtime": "claude", "room": DM, "ts": self.clock.t}))
+        cards = len(self.fake.calls)
+        rc, out = self.wait()
+        self.assertEqual((rc, out["status"]), (0, "handed_off"))
+        self.assertEqual((self.launch.calls, len(self.fake.calls)), ([], cards), "nothing started, nothing said twice")
+        self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists())
+
+    def test_a_waiter_stopped_before_its_last_words_leaves_them_for_the_next_to_say(self):
+        for phase, status, said in (("expired", "gave_up", "I stopped waiting for the Claude Code sign-in"),
+                                    ("already", "already", "The core is now running on Claude Code")):
+            with self.subTest(phase=phase):
+                rtc.set_wait(self.ws, {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": self.clock.t,
+                                       "card": "$card2"})
+                self.stopped_after_claiming(phase)
+                self.claude_json = {"loggedIn": True}       # a sign-in now changes nothing: the step was decided
+                rc, out = self.wait()
+                self.assertEqual(out["status"], status)
+                event, words = self.fake.edits()[-1]
+                self.assertEqual(event, "$card2")
+                self.assertIn(said, words)
+                self.assertEqual((self.launch.calls, self.restarts), ([], []))
+                self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists())
+
+    def test_a_newer_tap_replaces_a_claimed_wait_and_the_older_waiter_stops(self):
+        self.stopped_after_claiming("switching")
+        rc, newer = self.tap("Switch the core to Claude Code")
+        self.launch.calls.clear()
+        rc, out = self.wait()                       # the older attempt's resumed waiter
+        self.assertEqual((out["status"], self.launch.calls), ("superseded", []))
+        rec = json.loads(self.ws.joinpath(*rtc.WAITING).read_text())
+        self.assertEqual((rec["attempt"], "phase" in rec), (newer["waiting"], False))
+        # A wait whose removal fails stays on record; repeating its step later is safe.
+        with mock.patch.object(rtc, "claim_wait", side_effect=OSError("disk")):
+            rtc.finish_wait(self.ws, {"attempt": newer["waiting"], "runtime": "claude", "room": DM})
+        self.assertTrue(self.ws.joinpath(*rtc.WAITING).exists())
+
     def test_no_sign_in_within_the_wait_says_so_and_changes_nothing(self):
         rc, out = self.wait()
         self.assertEqual((rc, out["status"], out["posted"]), (1, "gave_up", "posted"))
