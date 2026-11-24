@@ -327,9 +327,9 @@ class LimitMenu(NoticeBase):
             self.assertEqual(q["room"], DM)
             self.assertEqual(q["card"]["id"], account_switch.CARD)
             self.assertEqual(q["card"][account_switch.CONTROLS], {"runtime": "claude"}, "the switch dropdown")
-            self.assertTrue(self.text_of(q).startswith(
-                "sarah@example.com (Claude Code) has hit its usage limit; resets Nov 28, 1pm. I can't answer until "
-                "then: switch to another account below to go on now."), self.text_of(q))
+            # Said once where to switch: the card showed two sentences pointing below.
+            self.assertEqual(self.text_of(q), "sarah@example.com (Claude Code) has hit its usage limit; resets Nov 28, "
+                             "1pm. I can't answer until then. Switch this agent's account below.")
             self.assertNotIn("API key", self.text_of(q), "Claude Code is not offered an API key")
             self.assertNotIn("usage credits", self.text_of(q))
         self.assertEqual(quota_card.room(self.root), DM)
