@@ -15,7 +15,7 @@ fails=0
 ok()  { echo "  ok   — $1"; }
 bad() { echo "  FAIL — $1"; fails=$((fails + 1)); }
 
-fn="$(awk '/^start_credential_proxy\(\) \{/,/^\}/' "$STARTUP")"
+fn="$(awk '/^_route_sessions_to_proxy\(\) \{/,/^\}/' "$STARTUP")"$'\n'"$(awk '/^start_credential_proxy\(\) \{/,/^\}/' "$STARTUP")"
 if [ -z "$fn" ]; then
   echo "FAIL — start_credential_proxy() not found in src/startup.sh (renamed or removed?)"
   exit 1
@@ -107,6 +107,18 @@ grep -q 'run_node_service' "$CHILD_LOG" && bad "already running: a child was sta
   || ok "already running: nothing started"
 echo "$out" | grep -q 'already running' && echo "$out" | grep -q 'ANTHROPIC_BASE_URL=http://localhost:7846' \
   && ok "already running: reported and routed" || bad "already running: $out"
+
+# --- arm 5: the status line recorder on -> the proxy is left running, seats go direct ---
+cp "$REPO_SRC/src/claude_routing.sh" "$REPO_SRC/src/skill-manifest-config.sh" "$TMP/repo/src/"
+stub_launchctl 0 running; stub_lsof 0
+out="$(QUOTA_STATUSLINE_ENABLED=true run_arm)"
+grep -q 'run_node_service' "$CHILD_LOG" && bad "direct: a child was started anyway" \
+  || ok "direct: the running proxy is left as it is"
+echo "$out" | grep -q 'ANTHROPIC_BASE_URL=<unset>' && ok "direct: seats are not pointed at the proxy" \
+  || bad "direct: base URL exported: $out"
+out="$(QUOTA_STATUSLINE_ENABLED=false run_arm)"
+echo "$out" | grep -q 'ANTHROPIC_BASE_URL=http://localhost:7846' && ok "recorder off: seats route through the proxy again" \
+  || bad "recorder off: $out"
 
 echo
 if [ "$fails" = 0 ]; then echo "PASS startup-credential-proxy-one-supervisor"; else echo "FAIL startup-credential-proxy-one-supervisor ($fails)"; exit 1; fi

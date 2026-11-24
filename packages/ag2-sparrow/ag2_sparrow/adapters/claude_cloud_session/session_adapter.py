@@ -23,7 +23,7 @@ from ...collaborator_turn import ENV_KEEP, child_env, run_collaborator_turn  # n
 from ...relay_loop import (COLLAB_LIMITER_FILE, NO_ROOM, NON_OWNER_FAILED, TEXT_MAX, Outcome, RateLimiter, RelayLoop,
                            build_payload, count_arg, log, nonnegative_float, positive_arg, positive_float, result_body)
 from ...task_io import (LockRefused, acquire_lock, clear_attributed_pidfile, exit_code, exit_on_sigterm,
-                        is_collaborator, make_dirs, non_owner_note, process_identity, release_lock, root_path,
+                        make_dirs, non_owner_note, turn_policy, process_identity, release_lock, root_path,
                         stoppable_sleep, verify_lineage)
 
 SESSION_RE = re.compile(r"session_[A-Za-z0-9]+")
@@ -45,7 +45,7 @@ def channel_kind(headers):
 
 def build_text(task_id, headers, message, operator_lines=(), note=None, owner_dm=None):
     extra = [("channel_kind", channel_kind(headers))]
-    if owner_dm and headers.get("access_tier") == "owner":
+    if owner_dm and turn_policy(headers, allow_non_owner=True).capabilities.owner_dm:
         extra.append(("owner_dm", owner_dm))
     room, payload = build_payload(task_id, headers, message, operator_lines, note,
                                   text_max=TEXT_MAX - len(REMINDER) - 1, extra=extra)
@@ -219,12 +219,12 @@ class Adapter(RelayLoop):
         if task is None:
             return True
         headers, message, operator_lines = task
-        owner = headers.get("access_tier") == "owner"
         refused = self.refusal(name, headers, seen)
         if refused is not None:
             return refused
-        collaborator = is_collaborator(headers)
-        if collaborator:
+        caps = self.policy(headers).capabilities
+        owner, isolated = caps.framing == "owner", caps.workspace == "isolated"
+        if isolated:
             # The isolated turn has no standing instructions, so no reminder and no owner_dm.
             room, text = build_payload(task_id, headers, message, operator_lines, self.note)
         else:
@@ -239,16 +239,16 @@ class Adapter(RelayLoop):
             return True
         if decision == "park":
             return self.park(task_id, state)
-        if collaborator and self.too_old(name):
-            log("collaborator task waited too long ->", task_id)
+        if isolated and self.too_old(name):
+            log("restricted task waited too long ->", task_id)
             return self.finish(name, NON_OWNER_FAILED, seen)
         attempt = self.lc.prepare(task_id, result_body(INTERRUPTED, self.args.result_mode, owner, LABEL))
         if not self.lc.begin_call(task_id, attempt, os.path.join(self.args.inbox, name)):
             self._settled(name, seen)
             return True
-        if collaborator:
+        if isolated:
             self.collab_limiter.record()
-            log("collaborator turn ->", task_id, "attempt", attempt, "chars", len(text))
+            log("isolated turn ->", task_id, "attempt", attempt, "chars", len(text))
             turn = run_collaborator_turn(self.args.claude, text, self.env, self.args.collaborator_timeout, run=self.run)
             log("result <-", task_id, turn.kind, turn.detail)
             self.lc.record_outcome(task_id, "final", turn.text if turn.kind == "ok" else NON_OWNER_FAILED, turn.detail)
@@ -282,21 +282,21 @@ def build_parser():
                          "instead of a shared room")
     ap.add_argument("--result-mode", choices=["no-send", "echo"], default="no-send")
     ap.add_argument("--allow-non-owner", action="store_true",
-                    help="queue tasks from non-owner senders without collaborator access too (guests, and any "
-                         "collaborator claim the broker did not attest), into the same session and connector "
-                         "scope as the owner. Off by default: the session holds the owner's history and AG2 "
-                         "Space connector, and such a sender is bounded only by the prompt's note otherwise. An "
-                         "attested collaborator is not covered by it: see --allow-collaborator.")
+                    help="serve tasks from non-owner senders without collaborator access too (guests, and any "
+                         "collaborator claim the broker did not attest) on an isolated local turn, never this "
+                         "session: a fresh `claude -p` with the three read tools in an empty directory, no "
+                         "connector, no history, and never saved (--no-session-persistence). Off by default, so "
+                         "they are refused with a plain line. An attested collaborator is not covered by it: see "
+                         "--allow-collaborator.")
     ap.add_argument("--allow-collaborator", action="store_true",
-                    help="serve attested collaborators (Team) on an isolated local turn: a fresh `claude -p` "
-                         "with the three read tools in an empty directory, never this session, no connector, "
-                         "no history, and never saved (--no-session-persistence); off by default, so they are "
-                         "refused with the same plain line")
+                    help="queue attested collaborators' (Team) tasks into this session, at the owner's session "
+                         "and connector scope, with the non-owner note; off by default, so they are refused with "
+                         "the same plain line")
     ap.add_argument("--min-gap-seconds", type=float, default=2.0, help="least time between two queued turns")
     ap.add_argument("--max-per-hour", type=int, default=60,
                     help="turns queued (or possibly queued) in a sliding hour; proven-unsent attempts do not count")
     ap.add_argument("--max-collaborator-per-hour", type=positive_arg, default=10,
-                    help="isolated collaborator turns in a sliding hour, 1 or more; their own gate, so they never "
+                    help="isolated (restricted) turns in a sliding hour, 1 or more; their own gate, so they never "
                          "count against --max-per-hour or --min-gap-seconds, and neither delays them")
     ap.add_argument("--max-retries", type=int, default=2,
                     help="retries per task for failures that prove the turn was not queued; anything ambiguous is never retried")
@@ -304,9 +304,9 @@ def build_parser():
     ap.add_argument("--backoff-max", type=float, default=60.0)
     ap.add_argument("--timeout", type=float, default=60.0, help="seconds per claude --cloud call")
     ap.add_argument("--collaborator-timeout", type=positive_float, default=60.0,
-                    help="seconds per collaborator turn, more than 0")
+                    help="seconds per isolated (restricted) turn, more than 0")
     ap.add_argument("--collaborator-max-age", type=nonnegative_float, default=1800.0,
-                    help="a collaborator task that waited longer than this many seconds gets the plain failure line "
+                    help="a restricted task that waited longer than this many seconds gets the plain failure line "
                          "at once instead of a turn, counted since the task was first seen in a pending scan, or "
                          "its file time if earlier; a restart does not reset it. 0 turns the cut-off off")
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")

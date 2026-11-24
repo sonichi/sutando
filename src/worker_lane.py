@@ -28,10 +28,14 @@ from (`<workspace>/agents/<segment>.bridge/worker.json`), `withdraw --worker <w>
 `status --worker <w>` prints one JSON line: whether it is declared, which process holds the lane's lease
 (`held_by`: the declared bridge under sparrowd, another process, none) and each running sparrowd.
 `migrate-dirs --worker <w>` shows what a switch would do; with `--apply` it switches the worker onto its
-own folders: it creates them, sets `dirs: "own"`,
+own folders: it sets `dirs: "migrating"` (nothing new is routed to it; it still runs on the shared folders),
 has the declared handler empty the worker's deliveries folder (its own lane's tasks move into its tasks
-folder, the core's are handed back) and moves its unclaimed live results; `--undo` switches it back and
-returns its live tasks and results to the shared folders. Both are idempotent. Each takes `--workspace`.
+folder, the core's are handed back; nothing moves while it still owes accepted work), then sets
+`dirs: "committing"` and relaunches its lane on its own folders (a declared bridge is waited for), empties
+what the old lane left, and only then, under the worker's switch lock, sets `dirs: "own"` and moves its
+queued tasks and unclaimed live results. A handler that fails or work still owed leaves it "migrating", a
+lane that did not stop "committing", and a worker being retired is never switched. `--undo` switches it back
+and returns its live tasks and results to the shared folders. Both are idempotent. Each takes `--workspace`.
 """
 from __future__ import annotations
 
@@ -248,6 +252,15 @@ def is_worker_home_lane(instance: str, worker: str, workspace=None) -> bool:
     return home is not None and instance in [str(home["instance"])] + alias_instances(home)
 
 
+def is_worker_card_lane(instance: str, worker: str, workspace=None) -> bool:
+    """Whether lane `instance` posts `worker`'s decision cards: any of its lanes while at most one serves;
+    with several, its home lane alone (`is_worker_home_lane`), so no card is posted twice."""
+    from connections import worker_identities, _serving
+    if len([r for r in worker_identities(worker, workspace) if _serving(r)]) <= 1:
+        return True
+    return is_worker_home_lane(instance, worker, workspace)
+
+
 def is_worker_note_lane(instance: str, worker: str, room_id: str = "", workspace=None) -> bool:
     """Room-addressed notes use only that server's serving identity, so with none they stay unclaimed;
     notes naming no server use the home lane."""
@@ -311,12 +324,12 @@ def _install_own(ns: dict, worker: str, argv, *, workspace, results_dir, log, wh
 
 
 def lane_dirs(workspace, instance: str) -> "tuple[Path, Path, bool]":
-    """(tasks dir, results dir, own) a lane `instance` runs on: its worker's own folders when that worker
-    has them (`connections.worker_dirs`), else the workspace's shared tasks/ and results/. Paths are
+    """(tasks dir, results dir, own) a lane `instance` runs on: its worker's own folders once its switch is
+    "committing" or "own" (`connections.worker_lane_dirs`), else the workspace's shared tasks/ and results/. Paths are
     lexical under `workspace` as given; resolve both sides before comparing with a recorded realpath."""
     from connections import ensure_worker_dirs, lane_worker
     ws = Path(workspace)
-    own = ensure_worker_dirs(lane_worker(instance, ws), ws) if instance else None
+    own = ensure_worker_dirs(lane_worker(instance, ws), ws, lane=True) if instance else None
     return (own[0], own[1], True) if own else (ws / "tasks", ws / "results", False)
 
 
@@ -346,9 +359,10 @@ def runtime_identity(worker: str, instance: str, workspace) -> bytes:
     revision: a record-only change to any of it is a changed bridge that sparrowd restarts."""
     row = _identity(worker, workspace, instance) or {}
     fields = [worker, instance] + [str(row.get(k) or "") for k in ("token_ref", "gateway_url", "server")]
-    # Appended only when set, so a shared-dir worker's revision is unchanged.
-    from connections import worker_dirs
-    if worker_dirs(worker, Path(workspace)):
+    # "own" once its lanes move ("committing" or "own"), so sparrowd replaces the bridge exactly then;
+    # appended only then, so a shared-dir worker's revision is unchanged.
+    from connections import worker_lane_dirs
+    if worker_lane_dirs(worker, Path(workspace)):
         fields.append("own")
     return "\0".join(fields).encode("utf-8")
 
@@ -588,12 +602,14 @@ RELAUNCH_WAIT_S = 180.0
 
 
 def relaunch_lane(worker: str, workspace, kill=None, procs=None, wait_s: "float | None" = None,
-                  sleep=None, clock=None, switch=None) -> "tuple[str, str]":
+                  sleep=None, clock=None, switch=None, start=None) -> "tuple[str, str]":
     """Make the process serving `worker`'s lane pick up its folders anew; (what happens, '' or why not).
     A declared bridge is restarted by sparrowd (the field is in its revision): this waits until its old
-    process no longer holds the lease. Any other holder is stopped, and the lane keeper starts it again.
-    `switch` (the field change) runs first under the record lock, which the keeper's starts take, so a
-    stopped lane cannot be started again before the field it must start on is written."""
+    process no longer holds the lease. Any other holder is stopped and started again here, in the same
+    hold of the record lock, since not every install runs a lane keeper. Every lane of the worker's
+    identities is relaunched: they share its folders. `switch` (the field change) runs first under that
+    lock, so a stopped lane cannot be started again before the field it must start on is written.
+    `start(instance, workspace)` returns a `connections.start` record."""
     from connections import _records_lock, worker_identities
     pending, outcomes = [], []
     with _records_lock(Path(workspace)):
@@ -601,7 +617,8 @@ def relaunch_lane(worker: str, workspace, kill=None, procs=None, wait_s: "float 
             switch()
         for row in worker_identities(worker, Path(workspace)):
             instance = str(row["instance"])
-            kind, pid, why = _stop_unless_declared(worker, workspace, kill, procs, instance=instance)
+            kind, pid, why = _stop_unless_declared(worker, workspace, kill, procs, start or _start_lane,
+                                                   instance=instance)
             if why:
                 return kind, why
             if kind == "declared":
@@ -617,7 +634,16 @@ def relaunch_lane(worker: str, workspace, kill=None, procs=None, wait_s: "float 
     return "; ".join(dict.fromkeys(outcomes)) or "not-running", ""
 
 
-def _stop_unless_declared(worker: str, workspace, kill, procs, *, instance=None) -> "tuple[str, int, str]":
+def _start_lane(instance: str, workspace) -> dict:
+    """`connections.py start <instance>`, as the keeper runs it: the token read fresh from the channel env."""
+    from connections import keeper_environ, start
+    ws = Path(workspace)
+    return start(instance, repo=Path(__file__).resolve().parents[1], logs_dir=ws / "logs",
+                 environ=keeper_environ(), workspace=ws)
+
+
+def _stop_unless_declared(worker: str, workspace, kill, procs, start=_start_lane, *,
+                          instance=None) -> "tuple[str, int, str]":
     from connections import BridgeLeaseIndeterminate, BridgeStillRunning, _stop_row, bridge_pid
     ws = Path(workspace)
     row = _identity(worker, ws, instance) or {}
@@ -627,15 +653,65 @@ def _stop_unless_declared(worker: str, workspace, kill, procs, *, instance=None)
     except BridgeLeaseIndeterminate as e:
         return "", 0, f"whether the lane runs cannot be told ({e}); re-run"
     if not pid:
+        # A lane an earlier run stopped but did not see running again is started on the re-run.
+        owed = _restart_owed(worker, ws, instance)
+        if owed.exists() and not row.get("disabled") and not row.get("parked"):
+            return _start_again(worker, instance, ws, 0, start)
+        owed.unlink(missing_ok=True)
         return "not-running", 0, ""
     decl, _why = _declaration_for(worker, ws, instance=instance)
     if decl and held_by(pid, processes() if procs is None else procs, decl["path"]) == "declared-bridge":
         return "declared", pid, ""
+    # Owed before the stop: a run killed between the stop and the start leaves this for the re-run.
+    _owe_restart(worker, ws, instance, "stopped_for_relaunch")
     try:
         _stop_row(row, ws, kill)
-    except (BridgeStillRunning, BridgeLeaseIndeterminate) as e:
+    except BridgeStillRunning as e:
+        _restart_owed(worker, ws, instance).unlink(missing_ok=True)
         return "", pid, f"lane {instance} did not stop ({e}); re-run"
-    return f"stopped pid {pid}; the lane keeper starts it again", pid, ""
+    except BridgeLeaseIndeterminate as e:
+        return "", pid, f"lane {instance} did not stop ({e}); re-run"
+    return _start_again(worker, instance, ws, pid, start)
+
+
+def _restart_owed(worker: str, ws: Path, instance=None) -> Path:
+    """The restart owed to one lane of `worker` (`instance`; None, its only identity's lane)."""
+    if instance is None:
+        instance = str((_identity(worker, ws) or {}).get("instance") or "")
+    owed_dir = ws / "state" / "worker-lane-restart-owed"
+    path, legacy = owed_dir / f"{worker}.{instance}.json", owed_dir / f"{worker}.json"
+    # A one-file-per-worker owed restart from an earlier release is taken over by the lane it names.
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        if instance and json.loads(legacy.read_text(encoding="utf-8")).get("instance") == instance:
+            os.replace(legacy, path)
+    return path
+
+
+def _owe_restart(worker: str, ws: Path, instance: str, reason: str) -> None:
+    owed = _restart_owed(worker, ws, instance)
+    owed.parent.mkdir(parents=True, exist_ok=True)
+    tmp = owed.with_name(f".{owed.name}.{os.getpid()}")
+    tmp.write_text(json.dumps({"instance": instance, "reason": reason}) + "\n", encoding="utf-8")
+    os.replace(tmp, owed)
+
+
+def _start_again(worker: str, instance: str, ws: Path, pid: int, start) -> "tuple[str, int, str]":
+    """Start the lane `relaunch_lane` stopped (or an earlier run left down); a failure is owed to the re-run."""
+    owed = _restart_owed(worker, ws, instance)
+    try:
+        rec = start(instance, ws) or {}
+    except Exception as e:  # noqa: BLE001 - the switch is done; a lane that did not start is reported
+        rec = {"ok": False, "reason": type(e).__name__}
+    lead = f"stopped pid {pid}; " if pid else "the lane was down; "
+    if rec.get("ok"):
+        owed.unlink(missing_ok=True)
+        how = "already running" if rec.get("lease") == "already_running" else "started"
+        return f"{lead}{how} again (pid {rec.get('pid')})", pid, ""
+    reason = rec.get("reason") or "launch_failed"
+    _owe_restart(worker, ws, instance, reason)
+    return (f"{lead}it did not start again ({reason})", pid,
+            f"lane {instance} did not start again ({reason}): run connections.py start {instance}, "
+            "or re-run to retry and finish")
 
 
 def _await_replacement(worker: str, workspace, pid: int, wait_s, sleep, clock, *, instance=None) -> "tuple[str, str]":
@@ -657,7 +733,7 @@ def _await_replacement(worker: str, workspace, pid: int, wait_s, sleep, clock, *
 
 
 def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=subprocess.run,
-                 kill=None, procs=None) -> "tuple[dict, str]":
+                 kill=None, procs=None, start=None) -> "tuple[dict, str]":
     """Switch `worker` onto its own folders (or back, `undo`); (what was done, '' or why it stopped).
     Idempotent: a re-run picks up whatever an interrupted one left."""
     from connections import ConnectionsError, ensure_worker_dirs, set_worker_dirs, worker_identities, worker_storage_root
@@ -668,7 +744,7 @@ def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=s
     tasks, results = root / "tasks", root / "results"
     out = {"worker": worker, "tasks": str(tasks), "results": str(results), "undo": undo, "respawn_needed": True}
     if undo:
-        out["lane"], why = relaunch_lane(worker, ws, kill, procs,
+        out["lane"], why = relaunch_lane(worker, ws, kill, procs, start=start,
                                          switch=lambda: set_worker_dirs(worker, False, workspace=ws))
         if why:
             return out, why
@@ -694,38 +770,92 @@ def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=s
         if owed:
             return out, (f"{len(owed)} task(s) delivered to {worker} but no task-event handler can move them; "
                          "nothing was switched")
-    def switch():
-        set_worker_dirs(worker, True, workspace=ws)
-        ensure_worker_dirs(worker, ws)
+    from connections import (WORKER_DIRS_COMMITTING, WORKER_DIRS_MIGRATING, WORKER_DIRS_OWN, worker_dirs_state,
+                             worker_retiring, worker_switch_lock)
+    state = worker_dirs_state(worker, ws)
+    if worker_retiring(worker, ws):
+        out["state"] = state or "shared"
+        return out, f"worker {worker} is being retired: its folders are not switched"
     try:
-        out["lane"], why = relaunch_lane(worker, ws, kill, procs, switch=switch)
+        if state not in (WORKER_DIRS_COMMITTING, WORKER_DIRS_OWN):
+            # Written before any scan of its deliveries: the router re-reads it under the folder lock.
+            set_worker_dirs(worker, WORKER_DIRS_MIGRATING, workspace=ws)
+        ensure_worker_dirs(worker, ws, target=True)
+    except (ConnectionsError, OSError) as e:
+        out["state"] = worker_dirs_state(worker, ws) or "shared"
+        return out, str(e)
+    out["state"] = state or WORKER_DIRS_MIGRATING
+    if state not in (WORKER_DIRS_COMMITTING, WORKER_DIRS_OWN):
+        why = _drain_deliveries(worker, ws, handler, run, out, "deliveries", committed=False)
+        if why:
+            return out, why
+    try:
+        if state != WORKER_DIRS_OWN:
+            # Only its lane moves now; "own", which its seat and supervision read, waits for that lane.
+            set_worker_dirs(worker, WORKER_DIRS_COMMITTING, workspace=ws)
+        out["lane"], why = relaunch_lane(worker, ws, kill, procs, start=start)
     except (ConnectionsError, OSError) as e:
         return out, str(e)
+    finally:
+        out["state"] = worker_dirs_state(worker, ws) or "shared"
     if why:
         return out, why
-    if handler:
-        try:
-            done = run([handler, "--workspace", str(ws), "--migrate-dirs", "--worker", worker],
-                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=MIGRATE_TIMEOUT_S)
-        except (OSError, subprocess.TimeoutExpired) as e:
-            return out, f"the declared handler did not run ({e!r}); re-run to finish"
-        if done.returncode != 0:
-            return out, f"the declared handler refused (exit {done.returncode}: {done.stderr.strip()[-300:]}); re-run to finish"
-        try:
-            out["deliveries"] = json.loads(done.stdout.strip().splitlines()[-1])
-        except (ValueError, IndexError):
-            out["deliveries"] = done.stdout.strip()[-300:]
+    # The old lane may have queued into deliveries/ until it stopped; this pass takes what it left.
+    why = _drain_deliveries(worker, ws, handler, run, out, "deliveries_after", committed=True)
+    if why:
+        return out, why
     failed: "list[str]" = []
-    out["tasks_moved"] = _move_live(ws / "tasks", tasks, _queued_for(worker, ws), failed)
-    out["results_moved"] = adopt_stray_results(worker, ws, results, lease=False, failed=failed)
-    out["proactive_moved"] = adopt_stray_proactive(worker, ws / "results", results, lease=False, failed=failed)
+    try:
+        with worker_switch_lock(worker, ws):
+            # A retirement marked meanwhile refuses this write, so nothing below moves for it.
+            set_worker_dirs(worker, True, workspace=ws)
+            out["tasks_moved"] = _move_live(ws / "tasks", tasks, _queued_for(worker, ws), failed)
+            out["results_moved"] = adopt_stray_results(worker, ws, results, lease=False, failed=failed)
+            out["proactive_moved"] = adopt_stray_proactive(worker, ws / "results", results, lease=False, failed=failed)
+    except (ConnectionsError, OSError) as e:
+        return out, str(e)
+    finally:
+        out["state"] = worker_dirs_state(worker, ws) or "shared"
     return out, _failed(out, failed)
+
+
+def _drain_deliveries(worker: str, ws: Path, handler: str, run, out: dict, key: str, committed: bool) -> str:
+    """Empty `worker`'s deliveries folder through `handler`; '' once nothing it owes is left there, else why
+    (`committed`: the switch is already written, so the work stays visible to supervision until a re-run)."""
+    after = "re-run to finish" if committed else "it stays on the shared folders; re-run to finish"
+    if not handler:
+        from delivery.task_dispatch import WorkerHoldUnreadable, owned_task_ids
+        try:
+            owed = owned_task_ids(ws / "deliveries", worker)
+        except WorkerHoldUnreadable as e:
+            return f"{e}; {after}"
+        return f"{len(owed)} task(s) delivered to {worker} but no task-event handler can move them; {after}" if owed else ""
+    try:
+        done = run([handler, "--workspace", str(ws), "--migrate-dirs", "--worker", worker],
+                   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=MIGRATE_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"the declared handler did not run ({e!r}); {after}"
+    if done.returncode != 0:
+        return f"the declared handler refused (exit {done.returncode}: {done.stderr.strip()[-300:]}); {after}"
+    try:
+        report = json.loads(done.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        report = done.stdout.strip()[-300:]
+    out[key] = report
+    owed = report.get("owed") if isinstance(report, dict) else None
+    if not isinstance(owed, list):
+        return f"the declared handler did not say what {worker} still owes; {after}"
+    if owed:
+        return (f"{len(owed)} task(s) {worker} accepted are still in its deliveries folder ({', '.join(owed[:5])}): "
+                f"none of them was moved; {after} once they are answered")
+    return ""
 
 
 def preview_migrate(worker: str, workspace, undo: bool = False, procs=None) -> "tuple[dict, str]":
     """What `migrate_dirs` would do, writing nothing: the folders, the lane's holder and the files it would
     move; ('', why) parts as `migrate_dirs` reports a refusal it can already see."""
-    from connections import BridgeLeaseIndeterminate, bridge_pid, task_home, worker_dirs, worker_identities, worker_storage_root
+    from connections import (BridgeLeaseIndeterminate, bridge_pid, task_home, worker_dirs, worker_dirs_state,
+                             worker_identities, worker_storage_root)
     from delivery.task_dispatch import WorkerHoldUnreadable, owned_task_ids
     from proactive_routing import lane_claims_proactive
     ws = Path(workspace)
@@ -735,7 +865,7 @@ def preview_migrate(worker: str, workspace, undo: bool = False, procs=None) -> "
         return {"worker": worker, "applied": False}, f"worker {worker} has no agent identity row"
     tasks, results = root / "tasks", root / "results"
     out = {"worker": worker, "tasks": str(tasks), "results": str(results), "undo": undo, "applied": False,
-           "own_now": worker_dirs(worker, ws) is not None}
+           "own_now": worker_dirs(worker, ws) is not None, "state": worker_dirs_state(worker, ws) or "shared"}
     lanes = {}
     for row in rows:
         instance = str(row["instance"])

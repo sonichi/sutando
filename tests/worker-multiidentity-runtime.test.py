@@ -51,7 +51,8 @@ class MultiIdentity(S.Base):
         stopped = []
         with mock.patch.object(C, "bridge_pid", return_value=4242), \
                 mock.patch.object(C, "_stop_row", side_effect=lambda row, *a: stopped.append(row["instance"])):
-            out, why = L.migrate_dirs(W, self.ws, handler="", procs={})
+            out, why = L.migrate_dirs(W, self.ws, handler="", procs={},
+                                      start=lambda instance, ws: {"ok": True, "lease": "held", "pid": 1})
         self.assertEqual(why, "")
         self.assertCountEqual(stopped, [self.row["instance"], self.second["instance"]])
         for row in (self.row, self.second):

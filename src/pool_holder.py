@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -38,6 +39,40 @@ def pool_holder(workspace, task_id: str, pool_scripts=None) -> Optional[str]:
         sys.path.insert(0, str(scripts))
     from worker_delivery import holder_of  # noqa: E402
     return holder_of(Path(workspace), task_id)
+
+
+def pool_delegation(workspace, task_id: str, worker: str, pool_scripts=None, now=None) -> dict:
+    """Whether `worker`'s delivery of `task_id` is still a current delegation.
+
+    {"held", "verdict", "detail", "mode", "allowed"}: `verdict` is the sentinel lease's
+    (pool_delivery.lease_verdict), `allowed` applies the configured expiry mode to it.
+    OSError propagates as in `pool_holder`.
+    """
+    scripts = Path(pool_scripts) if pool_scripts is not None else DEFAULT_POOL_SCRIPTS
+    try:
+        os.stat(scripts / "worker_delivery.py")
+    except FileNotFoundError:
+        return {"held": False, "verdict": None, "detail": "no worker pool", "mode": None, "allowed": False}
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    import pool_delivery as pd  # noqa: E402
+    from worker_delivery import sentinel_of  # noqa: E402
+    found = sentinel_of(Path(workspace), task_id)
+    if found is None or found.parent.name != worker:
+        return {"held": False, "verdict": None, "detail": "not delivered to this worker",
+                "mode": None, "allowed": False}
+    now = time.time() if now is None else now
+    verdict, detail = pd.lease_verdict(found, now)
+    if verdict == pd.LEASE_UNREADABLE and not os.path.lexists(found):
+        # Accepting renames the sentinel between the lookup and the read; follow it once.
+        found = sentinel_of(Path(workspace), task_id)
+        if found is None or found.parent.name != worker:
+            return {"held": False, "verdict": None, "detail": "not delivered to this worker",
+                    "mode": None, "allowed": False}
+        verdict, detail = pd.lease_verdict(found, now)
+    mode = pd.lease_mode()
+    return {"held": True, "verdict": verdict, "detail": detail, "mode": mode,
+            "allowed": pd.lease_allows(verdict, mode)}
 
 
 def _task_id(arg: str) -> str:

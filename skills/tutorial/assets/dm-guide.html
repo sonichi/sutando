@@ -1,0 +1,949 @@
+{{PAGE_HEAD}}{{OWNER_MARKER}}
+<title>Get started with your agent in s.space</title>
+<style>
+#overview {
+  --display: "Avantt", "Avantt SemiBold", "Avenir Next", sans-serif;
+  --sans: "Haas Recast", "Haas Recast Dense", "Avenir Next", sans-serif;
+  --bg: #f4f4f4;
+  --card: #ffffff;
+  --ink: #1c1b1c;
+  --mute: #6b6661;
+  --line: #e2dfdb;
+  --acc: #b85f14;
+  --accbg: #fbefe3;
+  --soft: #f7f4ef;
+  --green: #1e7e48;
+  --greenbg: #e8f5ec;
+  --shadow: 0 1px 3px rgba(0,0,0,0.04), 0 8px 24px rgba(0,0,0,0.06);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) #overview {
+    --bg: #0e0e0f;
+    --card: #19191b;
+    --ink: #f1efec;
+    --mute: #aaa49e;
+    --line: #2c2c2f;
+    --acc: #f8a358;
+    --accbg: #2a1f15;
+    --soft: #222225;
+    --green: #34d399;
+    --greenbg: #132a1e;
+    --shadow: 0 1px 3px rgba(0,0,0,0.2), 0 8px 24px rgba(0,0,0,0.3);
+  }
+}
+:root[data-theme="dark"] #overview {
+  --bg: #0e0e0f;
+  --card: #19191b;
+  --ink: #f1efec;
+  --mute: #aaa49e;
+  --line: #2c2c2f;
+  --acc: #f8a358;
+  --accbg: #2a1f15;
+  --soft: #222225;
+  --green: #34d399;
+  --greenbg: #132a1e;
+  --shadow: 0 1px 3px rgba(0,0,0,0.2), 0 8px 24px rgba(0,0,0,0.3);
+}
+:root[data-theme="light"] #overview {
+  --bg: #f4f4f4;
+  --card: #ffffff;
+  --ink: #1c1b1c;
+  --mute: #6b6661;
+  --line: #e2dfdb;
+  --acc: #b85f14;
+  --accbg: #fbefe3;
+  --soft: #f7f4ef;
+  --green: #1e7e48;
+  --greenbg: #e8f5ec;
+  --shadow: 0 1px 3px rgba(0,0,0,0.04), 0 8px 24px rgba(0,0,0,0.06);
+}
+#overview * { box-sizing: border-box; margin: 0; padding: 0; }
+#overview {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.5 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  padding: 24px 16px 64px;
+}
+#overview .container { max-width: 880px; margin: 0 auto; }
+#overview .overview-hero {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 28px 24px;
+  box-shadow: var(--shadow);
+  margin-bottom: 20px;
+}
+#overview .tag-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--accbg);
+  color: var(--acc);
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 12px;
+}
+#overview h1 { font-size: 26px; font-weight: 700; line-height: 1.25; margin-bottom: 8px; }
+#overview .subtitle { color: var(--mute); font-size: 15px; line-height: 1.5; margin-bottom: 20px; }
+#overview .nav-tracker {
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px;
+}
+#overview .nav-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  padding: 0 2px;
+}
+#overview .nav-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--mute); }
+#overview .badge-status {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--acc);
+  background: var(--accbg);
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+#overview .steps-tabs {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  width: 100%;
+}
+#overview .tab-btn {
+  background: var(--card);
+  border: 1px solid var(--line);
+  color: var(--mute);
+  padding: 10px 8px;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+}
+#overview .tab-btn:hover { color: var(--ink); border-color: var(--acc); }
+#overview .tab-btn.active {
+  background: var(--card);
+  color: var(--acc);
+  border-color: var(--acc);
+  box-shadow: 0 0 0 1px var(--acc);
+}
+#overview .tab-num {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--line);
+  color: var(--mute);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+#overview .tab-btn.active .tab-num {
+  background: var(--acc);
+  color: #fff;
+}
+@media (max-width: 640px) {
+  #overview .steps-tabs { grid-template-columns: repeat(2, 1fr); }
+}
+#overview .tour-card {
+  display: none;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 28px 24px;
+  box-shadow: var(--shadow);
+  margin-top: 18px;
+}
+#overview .tour-card.active { display: block; }
+#overview .card-num {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--acc);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 4px;
+}
+#overview h2 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
+#overview .card-desc { color: var(--mute); font-size: 14.5px; margin-bottom: 20px; }
+#overview .feature-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+#overview .feature-box {
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px;
+}
+#overview .feature-box h4 {
+  font-size: 14px;
+  font-weight: 700;
+  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+#overview .feature-box p { font-size: 13.5px; color: var(--mute); line-height: 1.45; }
+#overview .callout {
+  background: var(--accbg);
+  border-left: 4px solid var(--acc);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin-bottom: 18px;
+}
+#overview .callout-title { font-weight: 700; font-size: 14px; color: var(--acc); margin-bottom: 4px; }
+#overview .callout p { font-size: 13.5px; color: var(--ink); margin: 0; }
+#overview .interactive-panel {
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 18px;
+}
+#overview .panel-title { font-weight: 700; font-size: 13.5px; margin-bottom: 10px; }
+#overview .interactive-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+#overview .sub-tab {
+  background: var(--card);
+  border: 1px solid var(--line);
+  color: var(--mute);
+  padding: 6px 12px;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+#overview .sub-tab:hover { color: var(--ink); }
+#overview .sub-tab.active { background: var(--acc); color: #fff; border-color: var(--acc); }
+#overview .panel-content {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px;
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+#overview .prompt-box {
+  background: var(--soft);
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  padding: 14px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+#overview .prompt-meta { font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--mute); margin-bottom: 2px; }
+#overview .prompt-text { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; color: var(--ink); }
+#overview .btn-copy {
+  background: var(--acc);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 12px;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: opacity 0.15s;
+}
+#overview .btn-copy:hover { opacity: 0.9; }
+#overview .card-nav {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+#overview .btn-nav {
+  background: var(--card);
+  border: 1px solid var(--line);
+  color: var(--ink);
+  padding: 8px 16px;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+#overview .btn-nav:hover { background: var(--soft); }
+#overview .btn-nav.primary {
+  background: var(--acc);
+  color: #fff;
+  border-color: var(--acc);
+}
+#overview .btn-nav.primary:hover { opacity: 0.95; }
+#overview h1, #overview h2 { font-family:var(--display); font-weight:600; }
+#overview .overview-hero { border-radius:26px; border-top:4px solid #f26a21; background:radial-gradient(ellipse at 110% -10%,#f9a75c 0,transparent 45%),var(--card); }
+#overview .tour-card { border-radius:22px; }
+#overview button { min-height:44px; max-width:100%; white-space:normal; overflow-wrap:anywhere; }
+#overview button:focus-visible { outline:3px solid var(--ink); outline-offset:3px; }
+#overview .feature-grid { grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr)); }
+#overview .prompt-text { overflow-wrap:anywhere; }
+@media(max-width:440px) { #overview .prompt-box, #overview .card-nav { flex-wrap:wrap; gap:8px; } #overview .overview-hero, #overview .tour-card { padding:22px 18px; } }
+@media(prefers-reduced-motion:reduce) { #overview * { transition:none!important; } }
+@media print { #overview .tour-card { display:block; } #overview .card-nav { display:none; } }
+
+/* Unified guide header and optional checklist */
+#overview { min-height:100vh; padding:28px max(14px, 3vw) 56px; }
+#overview .container { max-width:992px; }
+#overview .overview-hero { padding:clamp(22px, 4vw, 42px); margin-bottom:16px; }
+#overview .hero-copy { max-width:710px; }
+#overview .guide-label { display:flex; align-items:center; gap:9px; margin:0 0 20px; font-size:13px; font-weight:700; letter-spacing:.025em; }
+#overview .brand-mark { width:30px; height:30px; display:grid; place-items:center; border-radius:9px; background:#ff9a4b; color:#241912; font-size:18px; font-weight:800; }
+#overview h1 { max-width:690px; font-size:clamp(31px, 5.3vw, 59px); letter-spacing:-.055em; line-height:1.03; margin-bottom:12px; }
+#overview h1 span { color:var(--acc); }
+#overview .hero-copy .subtitle { max-width:56ch; margin-bottom:9px; }
+#overview .preview-note { color:var(--mute); font-size:12px; line-height:1.45; }
+#overview .guide-nav { margin-top:24px; }
+#overview .steps-tabs { grid-template-columns:repeat(5,minmax(0,1fr)); }
+#overview .tab-btn { min-height:58px; flex-direction:column; align-items:flex-start; justify-content:center; gap:5px; padding:9px 11px; line-height:1.15; hyphens:none; }
+#overview .tab-num { width:auto; height:auto; padding:0; border-radius:0; background:transparent; color:var(--mute); font-size:10px; letter-spacing:.09em; }
+#overview .tab-btn.active .tab-num { background:transparent; color:var(--acc); }
+#overview .tab-btn.active { background:var(--accbg); box-shadow:none; }
+#overview .checklist-jump { display:inline-flex; align-items:center; gap:7px; min-height:44px; color:var(--acc); font-size:13px; font-weight:700; text-underline-offset:.23em; }
+#overview .guide-nav > .checklist-jump { margin-top:7px; }
+#overview .tour-card { margin-top:0; }
+#overview h2 { scroll-margin-top:16px; }
+#overview .guide-links { display:flex; flex-wrap:wrap; gap:4px 18px; margin:0 0 14px; }
+#overview .guide-links a { color:var(--acc); font-size:13px; font-weight:600; min-height:44px; display:inline-flex; align-items:center; text-underline-offset:.23em; }
+#overview .guide-example { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; }
+#overview .guide-example :is(p,span) { flex:1 1 190px; overflow-wrap:anywhere; margin:0; }
+#overview #checklist { margin-top:16px; border:1px solid var(--line); border-radius:19px; background:var(--card); box-shadow:var(--shadow); scroll-margin-top:12px; }
+#overview #checklist summary { cursor:pointer; line-height:1.3; font-weight:700; min-height:44px; }
+#overview #checklist > summary { position:relative; padding:18px 20px; }
+#overview #checklist > summary::marker { color:var(--acc); }
+#overview .list-title { margin-left:5px; }
+#overview #checklist-count { color:var(--mute); margin-left:10px; font-size:12px; font-weight:500; white-space:nowrap; }
+#overview .checklist-inner { margin:0 20px 20px; }
+#overview .checklist-inner .card-desc { margin-bottom:10px; }
+#overview #checklist-progress { width:100%; height:8px; border:0; margin:0 0 14px; accent-color:var(--acc); }
+#overview .check-step { border-top:1px solid var(--line); }
+#overview .check-step > summary { padding:14px 0; }
+#overview .step-index { margin:0 8px; font-size:11px; letter-spacing:.06em; color:var(--acc); }
+#overview .check-body { padding:0 0 14px 16px; display:grid; gap:9px; }
+#overview .check-body .guide-example { background:var(--soft); border-radius:9px; padding:9px 11px; }
+#overview .check-body label { display:inline-flex; gap:8px; align-items:center; min-height:44px; width:fit-content; cursor:pointer; }
+#overview .check-body input { width:18px; height:18px; accent-color:var(--acc); }
+#overview :is(a,summary,input):focus-visible { outline:3px solid var(--acc); outline-offset:3px; border-radius:4px; }
+@media(max-width:680px) {
+  #overview .steps-tabs { grid-template-columns:repeat(3,minmax(0,1fr)); }
+}
+@media(max-width:390px) {
+  #overview .steps-tabs { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  #overview .overview-hero { padding:19px 15px; }
+}
+/* Contrast for guide navigation and actions only */
+#overview {
+  --guide-action-bg:#98470e;
+  --guide-action-ink:#fff;
+  --guide-selected-ink:#823a09;
+}
+@media (prefers-color-scheme:dark) {
+  :root:not([data-theme="light"]) #overview {
+    --guide-action-bg:#f8a358;
+    --guide-action-ink:#261609;
+    --guide-selected-ink:#f8a358;
+  }
+}
+:root[data-theme="dark"] #overview {
+  --guide-action-bg:#f8a358;
+  --guide-action-ink:#261609;
+  --guide-selected-ink:#f8a358;
+}
+#overview .sub-tab.active:not([role="tab"]),
+#overview .btn-copy,
+#overview .btn-nav.primary {
+  background:var(--guide-action-bg);
+  color:var(--guide-action-ink);
+  border-color:var(--guide-action-bg);
+}
+#overview .tab-btn.active,
+#overview .tab-btn.active .tab-num { color:var(--guide-selected-ink); }
+</style>
+<style>
+#overview .guide-ask[hidden], #overview #guide-draft[hidden] { display:none !important; }
+#overview .guide-ask, #overview .guide-actions { margin-block:8px; }
+#overview .guide-ask, #overview #guide-draft button, #overview .check-body a.btn-nav { min-height:44px; }
+#overview .check-body a.btn-nav { display:inline-flex; align-items:center; text-decoration:none; }
+#overview #guide-draft { margin:auto; max-width:min(500px,calc(100% - 24px)); max-height:calc(100% - 24px); border:1px solid var(--line); border-radius:14px; color:var(--ink); background:var(--card); padding:20px; box-shadow:var(--shadow); }
+#overview #guide-draft::backdrop { background:#17131a88; }
+#overview #guide-draft .draft-layout { display:grid; gap:11px; }
+#overview #guide-draft p { color:var(--mute); }
+#overview #guide-draft label { font-weight:600; }
+#overview #guide-draft textarea, #overview #guide-draft select { width:100%; background:var(--bg); color:var(--ink); padding:9px; font:inherit; border:1px solid var(--mute); border-radius:8px; }
+#overview #guide-draft textarea { min-height:110px; resize:vertical; }
+#overview #guide-draft button { width:fit-content; }
+#overview #guide-draft button:disabled { opacity:.6; cursor:not-allowed; }
+#overview #guide-draft .draft-actions { display:flex; flex-wrap:wrap; gap:8px; }
+</style></head>
+<body style="margin:0">
+<div id="overview">
+<div class="container">
+  <header class="overview-hero">
+    <div class="hero-copy">
+      <p class="guide-label"><span class="brand-mark" aria-hidden="true">S</span> Getting started</p>
+      <h1>Get started with <span>{{AGENT_NAME}}</span> in s.space</h1>
+      <p class="subtitle">Pick a goal to open an editable message to your agent. Nothing is sent until you confirm.</p>
+      <p class="preview-note">The agent you choose receives your request privately.</p>{{SETUP_CONTEXT}}
+    </div>
+    <div class="guide-nav">
+      <nav class="steps-tabs" aria-label="Guide topics">
+        <button type="button" class="tab-btn active" aria-current="true" onclick="showStep(0)"><span class="tab-num" aria-hidden="true">01</span><span>Ecosystem</span></button>
+        <button type="button" class="tab-btn" onclick="showStep(1)"><span class="tab-num" aria-hidden="true">02</span><span>Multiplayer</span></button>
+        <button type="button" class="tab-btn" onclick="showStep(2)"><span class="tab-num" aria-hidden="true">03</span><span>Calls &amp; Local Tools</span></button>
+        <button type="button" class="tab-btn" onclick="showStep(3)"><span class="tab-num" aria-hidden="true">04</span><span>Commons &amp; Tasks</span></button>
+        <button type="button" class="tab-btn" onclick="showStep(4)"><span class="tab-num" aria-hidden="true">05</span><span>Sutando Guides</span></button>
+      </nav>
+      <a href="#checklist" class="checklist-jump" onclick="document.getElementById('checklist').open=true">Try it step by step <span aria-hidden="true">↓</span></a>
+    </div>
+  </header>
+
+  <!-- Step 1: Cross-Provider AI Ecosystem -->
+  <section class="tour-card active" id="step-0">
+    <div class="card-num">Topic · Agent connections</div>
+    <h2>Bring your agents together</h2>
+    <p class="card-desc">Connect an agent from another app, run a local coding agent, or set up Sutando as your personal agent. Choose the connection that fits your work.</p>
+
+    <div class="feature-grid">
+      <div class="feature-box">
+        <h4>🖥️ Local agent (Sutando)</h4>
+        <p>Runs locally on your Mac. Can use local files and tools you authorize. Model requests and connected services may send data off the device.</p>
+      </div>
+      <div class="feature-box">
+        <h4>☁️ Frontier Cloud Agents</h4>
+        <p>Bring supported agents from the apps you use. Each connection has its own account, plan and available capabilities.</p>
+      </div>
+      <div class="feature-box">
+        <h4>🔌 Connected apps</h4>
+        <p>Connected apps let your agent work with services you authorize.</p>
+      </div>
+    </div>
+
+    <div class="interactive-panel">
+      <div class="panel-title">Explore the connections</div>
+      <p style="font-size:13.5px;color:var(--mute);margin-bottom:12px">Compare where agents run and what they can do.</p>
+      <div class="interactive-tabs" role="group" aria-label="Agent connection examples">
+        <button type="button" class="sub-tab active" aria-pressed="true" onclick="setProvider('antigravity', this)">Antigravity</button>
+        <button type="button" class="sub-tab" aria-pressed="false" onclick="setProvider('claudeCode', this)">Claude Code</button>
+        <button type="button" class="sub-tab" aria-pressed="false" onclick="setProvider('claude', this)">Claude Duet</button>
+        <button type="button" class="sub-tab" aria-pressed="false" onclick="setProvider('codex', this)">Codex</button>
+        <button type="button" class="sub-tab" aria-pressed="false" onclick="setProvider('openai', this)">Dot</button>
+        <button type="button" class="sub-tab" aria-pressed="false" onclick="setProvider('grok', this)">Grok Bot</button>
+        <button type="button" class="sub-tab" aria-pressed="false" onclick="setProvider('muse', this)">Muse</button>
+        <button type="button" class="sub-tab" aria-pressed="false" onclick="setProvider('sutando', this)">Sutando (Local Mac)</button>
+        <button type="button" class="sub-tab" aria-pressed="false" onclick="setProvider('other', this)">Other apps</button>
+      </div>
+      <div class="panel-content" id="providerInfo">
+        <strong>Antigravity · on your computer:</strong> Google’s Antigravity CLI can reply in s.space DMs and rooms. Availability depends on your desktop build and Google sign-in.
+      </div>
+    </div>
+
+    <div class="guide-actions"><button type="button" class="btn-nav primary guide-ask" data-draft="{{TOPIC_CONNECT}}" hidden>Ask about connecting an agent</button></div>
+
+    <div class="card-nav">
+      <span></span>
+      <button class="btn-nav primary" onclick="showStep(1)">Explore Multiplayer →</button>
+    </div>
+  </section>
+
+  <!-- Step 2: Multiplayer Collaboration in Rooms -->
+  <section class="tour-card" id="step-1">
+    <div class="card-num">Topic · Multiplayer collaboration</div>
+    <h2 id="rooms">Rooms Where People &amp; Personal Agents Collaborate</h2>
+    <p class="card-desc">People and their agents work together in a shared room. Each agent keeps its own owner, connections and permissions.</p>
+
+    <div class="feature-grid">
+      <div class="feature-box">
+        <h4>👥 Multi-Human &amp; Multi-Agent</h4>
+        <p>Invite colleagues and their agents into a shared room. Teammates can direct their agents to collaborate with yours on complex workflows.</p>
+      </div>
+      <div class="feature-box">
+        <h4>🤝 Agent-to-agent teamwork</h4>
+        <p>Ask one agent to work with another: for example, one prepares a patch and another reviews it. Collaboration depends on each agent’s access and owner authorization.</p>
+      </div>
+      <div class="feature-box">
+        <h4>🛡️ Granular Access Tiers</h4>
+        <p>Owners choose how other room members can work with their agents. Room permissions and agent settings keep collaboration within that scope.</p>
+      </div>
+    </div>
+
+    <div class="interactive-panel">
+      <div class="panel-title">Access settings explained (example only)</div>
+      <div class="interactive-tabs" role="group" aria-label="Room access examples">
+        <button type="button" class="sub-tab active" aria-pressed="true" onclick="setTier('collaborator', this)">Team — collaborator</button>
+        <button type="button" class="sub-tab" aria-pressed="false" onclick="setTier('guest', this)">Guest — owner approves first</button>
+        <button type="button" class="sub-tab" aria-pressed="false" onclick="setTier('none', this)">No access — other members cannot invoke</button>
+      </div>
+      <div class="panel-content" id="tierInfo">
+        <strong>Team — collaborator:</strong> Work with the agent in the shared workspace, within its owner’s permissions and tool-approval settings.
+      </div>
+    </div>
+
+    <div class="guide-actions"><button type="button" class="btn-nav primary guide-ask" data-draft="{{TOPIC_TEAM}}" hidden>Ask for a second perspective</button></div>
+
+    <div class="card-nav">
+      <button class="btn-nav" onclick="showStep(0)">← Previous topic</button>
+      <button class="btn-nav primary" onclick="showStep(2)">Explore Calls &amp; Local Tools →</button>
+    </div>
+  </section>
+
+  <!-- Step 3: Live Calls, Screen Sharing & Realtime Computer Use -->
+  <section class="tour-card" id="step-2">
+    <div class="card-num">Topic · Calls and local tools</div>
+    <h2>Talk through ideas and work live</h2>
+    <p class="card-desc">Supported voice-enabled agents can join certain s.space calls. For screen coaching on your Mac, see <a href="#step-4" onclick="showStep(4); return false;">Sutando Guides</a>.</p>
+
+    <div class="callout">
+      <div class="callout-title">🎙️ Bring an agent into the conversation</div>
+      <p>A supported agent can help turn a discussion into a decision using the context you choose to share.</p>
+    </div>
+
+    <div class="feature-grid">
+      <div class="feature-box">
+        <h4>Voice in the room</h4>
+        <p>Direct voice and room calls depend on agent eligibility, voice setup and room permissions.</p>
+      </div>
+      <div class="feature-box">
+        <h4>🖥️ Share context for the conversation</h4>
+        <p>A voice-enabled agent can help summarize an artifact it has access to.</p>
+      </div>
+      <div class="feature-box">
+        <h4>Give the agent a question to answer</h4>
+        <p>An eligible agent can help the group identify an open question or next step.</p>
+      </div>
+    </div>
+
+    <div class="interactive-panel">
+      <div class="panel-title">Explore voice workflows</div>
+      <div class="interactive-tabs" role="group" aria-label="Voice scenarios">
+        <button type="button" class="sub-tab active" aria-pressed="true" onclick="setCallScenario('debug', this)">Discuss a bug report</button>
+        <button type="button" class="sub-tab" aria-pressed="false" onclick="setCallScenario('design', this)">UI / Spec Review</button>
+        <button type="button" class="sub-tab" aria-pressed="false" onclick="setCallScenario('triage', this)">Issue Triage</button>
+      </div>
+      <div class="panel-content" id="callInfo">
+        <strong>Debug Scenario:</strong> Example goal: <em>"Read that error and suggest a way to reproduce it."</em> The agent can help diagnose the shared evidence.
+      </div>
+    </div>
+
+    <div class="guide-actions"><button type="button" class="btn-nav primary guide-ask" data-draft="{{TOPIC_CALL}}" hidden>Ask for help with a live discussion</button></div>
+
+    <div class="card-nav">
+      <button class="btn-nav" onclick="showStep(1)">← Previous topic</button>
+      <button class="btn-nav primary" onclick="showStep(3)">Explore Commons &amp; Tasks →</button>
+    </div>
+  </section>
+
+  <!-- Step 4: Room Commons & Autonomous Background Tasks -->
+  <section class="tour-card" id="step-3">
+    <div class="card-num">Topic · Commons and follow-up</div>
+    <h2>Keep shared work in Commons</h2>
+    <p class="card-desc">Room Commons holds shared pages and other artifacts alongside the conversation. Agents can create and open artifacts the room supports.</p>
+
+    <div class="feature-grid">
+      <div class="feature-box">
+        <h4>📄 Collaborative Docs &amp; Whiteboard</h4>
+        <p>Live multiplayer editing for specs, design notes, and system architecture sketches anchored right alongside chat.</p>
+      </div>
+      <div class="feature-box">
+        <h4>📊 Interactive Commons HTML</h4>
+        <p>Ask an agent to build interactive examples, charts and tools. Live data and account actions use supported integrations with your authorization.</p>
+      </div>
+      <div class="feature-box">
+        <h4>⏰ Scheduled follow-up work</h4>
+        <p>Agents can schedule follow-up when the room supports it. A pending approval is not an active schedule.</p>
+      </div>
+    </div>
+
+    <div class="interactive-panel">
+      <div class="panel-title">Commons surface examples</div>
+      <div class="interactive-tabs" role="group" aria-label="Commons surface examples">
+        <button type="button" class="sub-tab active" aria-pressed="true" onclick="setCommons('html', this)">Commons HTML App</button>
+        <button type="button" class="sub-tab" aria-pressed="false" onclick="setCommons('doc', this)">Multiplayer Doc</button>
+        <button type="button" class="sub-tab" aria-pressed="false" onclick="setCommons('board', this)">Whiteboard</button>
+      </div>
+      <div class="panel-content" id="commonsInfo">
+        <strong>Commons HTML Pages:</strong> Build interactive guides, charts and tools in Commons. Add live data or actions through supported, authorized integrations.
+      </div>
+    </div>
+
+    <div class="guide-actions"><button type="button" class="btn-nav primary guide-ask" data-draft="{{TOPIC_COMMONS}}" hidden>Ask for a kickoff page</button></div>
+
+    <div class="card-nav">
+      <button class="btn-nav" onclick="showStep(2)">← Previous topic</button>
+      <button class="btn-nav primary" onclick="showStep(4)">Explore Sutando Guides →</button>
+    </div>
+  </section>
+  <section class="tour-card" id="step-4">
+    <style>
+      #step-4 [hidden] { display:none !important; }
+      #step-4 [role="tabpanel"] h3 { font-size:15px; line-height:1.35; margin:0 0 6px; }
+      #step-4 [role="tabpanel"]:focus-visible { outline:2px solid var(--ink); outline-offset:2px; }
+      #step-4 [role="tab"][aria-selected="true"] { color:var(--ink); background:var(--accbg); border-color:var(--acc); }
+    </style>
+    <div class="card-num">Topic · Sutando Guides</div>
+    <h2>Lead the work with Sutando</h2>
+    <p class="card-desc">Give Sutando a goal and ask it to bring the work together.</p>
+    <div class="interactive-panel">
+      <div class="interactive-tabs" role="tablist" aria-label="Sutando workflows" hidden>
+        <button class="sub-tab" type="button" role="tab" id="sutando-workflow-tab-0" aria-controls="sutando-workflow-panel-0" aria-selected="true" tabindex="0">Own agents</button>
+        <button class="sub-tab" type="button" role="tab" id="sutando-workflow-tab-1" aria-controls="sutando-workflow-panel-1" aria-selected="false" tabindex="-1">Shared Commons</button>
+        <button class="sub-tab" type="button" role="tab" id="sutando-workflow-tab-2" aria-controls="sutando-workflow-panel-2" aria-selected="false" tabindex="-1">Screen coaching</button>
+      </div>
+      <div class="panel-content" role="tabpanel" id="sutando-workflow-panel-0" aria-labelledby="sutando-workflow-tab-0" tabindex="0">
+        <h3>01 · Coordinate your own agents</h3>
+        <p>Sutando can combine work from agents that are allowed to collaborate.</p>
+        <button type="button" class="btn-nav primary guide-ask" data-draft="Ask one of my agents for three newsletter names and another for naming criteria. Combine their replies into one shortlist." hidden>Ask your agents to coordinate</button>
+      </div>
+      <div class="panel-content" role="tabpanel" id="sutando-workflow-panel-1" aria-labelledby="sutando-workflow-tab-1" tabindex="0">
+        <h3>02 · Work with teammates and their agents</h3>
+        <p>A shared draft gives people and their agents one place to review.</p>
+        <button type="button" class="btn-nav primary guide-ask" data-draft="Draft our next meeting agenda in Commons. Ask a teammate and their agent, if permitted, to flag one missing decision." hidden>Ask for a shared agenda</button>
+      </div>
+      <div class="panel-content" role="tabpanel" id="sutando-workflow-panel-2" aria-labelledby="sutando-workflow-tab-2" tabindex="0">
+        <h3>03 · Get live help with what’s on your Mac</h3>
+        <p>Screen coaching depends on your Mac setup and what you authorize your agent to see.</p>
+        <button type="button" class="btn-nav primary guide-ask" data-draft="Can you help me export a PDF using screen coaching on my Mac? Ask for my permission before viewing my screen." hidden>Ask for screen coaching</button>
+      </div>
+    </div>
+    <p class="preview-note" style="margin-bottom:14px"><strong>Room access.</strong> Each agent keeps its owner and tool approvals. Team access follows room settings. Guest requests wait for the agent’s owner unless already approved for that room. Keep private material out of the shared brief.</p>
+    <div class="card-nav"><button type="button" class="btn-nav" onclick="showStep(3)">← Previous topic</button><a class="checklist-jump" href="#checklist" onclick="document.getElementById('checklist').open=true">Try it step by step ↓</a></div>
+    <script>
+    (() => {
+      const guide = document.getElementById('step-4');
+      const tablist = guide.querySelector('[role=tablist]');
+      const tabs = [...tablist.querySelectorAll('[role=tab]')];
+      const panels = tabs.map(tab => document.getElementById(tab.getAttribute('aria-controls')));
+      function select(index, focus = false) {
+        tabs.forEach((tab, i) => {
+          tab.setAttribute('aria-selected', String(i === index));
+          tab.tabIndex = i === index ? 0 : -1;
+          panels[i].hidden = i !== index;
+        });
+        if (focus) tabs[index].focus();
+      }
+      tabs.forEach((tab, index) => {
+        tab.addEventListener('click', () => select(index));
+        tab.addEventListener('keydown', event => {
+          let next;
+          if (event.key === 'ArrowRight') next = (index + 1) % tabs.length;
+          else if (event.key === 'ArrowLeft') next = (index + tabs.length - 1) % tabs.length;
+          else if (event.key === 'Home') next = 0;
+          else if (event.key === 'End') next = tabs.length - 1;
+          else return;
+          event.preventDefault();
+          select(next, true);
+        });
+      });
+      select(0);
+      tablist.hidden = false;
+    })();
+    </script>
+  </section>
+  <details id="checklist">
+    <summary><span class="list-title">Try it step by step</span><span id="checklist-count">9 steps</span></summary>
+    <div class="checklist-inner">
+      <p class="card-desc">Try a goal or install the mobile app.</p>
+      <progress id="checklist-progress" max="9" value="0" aria-label="Checklist progress"></progress>
+      <details class="check-step"><summary><span class="step-index" aria-hidden="true">01</span>Your DM</summary><div class="check-body"><p>Personal work stays in your agent DM unless you explicitly ask to share it.</p><button type="button" class="btn-nav primary guide-ask" data-draft="{{DRAFT_DM}}" hidden>Ask what your agent can do</button><label><input type="checkbox" value="dm"> Mark done</label></div></details>
+      <details class="check-step"><summary><span class="step-index" aria-hidden="true">02</span>Rooms</summary><div class="check-body"><p>You, your teammates and all of your agents meet in one room. Invite your team, and everyone brings their own agents. Each agent works for its owner, right in the room.</p><button type="button" class="btn-nav primary guide-ask" data-draft="Help me set up a room for our project and invite the agents we need." hidden>Ask to set up a room</button><label><input type="checkbox" value="rooms"> Mark done</label></div></details>
+      <details class="check-step"><summary><span class="step-index" aria-hidden="true">03</span>Commons</summary><div class="check-body"><p>Commons holds pages, boards and tables, depending on what the room supports.</p><button type="button" class="btn-nav primary guide-ask" data-draft="{{DRAFT_COMMONS}}" hidden>Ask for an offsite plan</button><label><input type="checkbox" value="commons"> Mark done</label></div></details>
+      <details class="check-step"><summary><span class="step-index" aria-hidden="true">04</span>Connect other agents</summary><div class="check-body"><p>Bring agents from the apps you already use into your rooms.</p><button type="button" class="btn-nav primary guide-ask" data-draft="Help me connect my other agent and test its first reply." hidden>Ask to connect another agent</button><label><input type="checkbox" value="agents"> Mark done</label></div></details>
+      <details class="check-step"><summary><span class="step-index" aria-hidden="true">05</span>Teamwork</summary><div class="check-body"><p>Room access controls which agents can collaborate. Guest requests need owner approval; with No access, only the owner can invoke the agent.</p><button type="button" class="btn-nav primary guide-ask" data-draft="{{DRAFT_TEAMWORK}}" hidden>Ask for a teammate’s review</button><label><input type="checkbox" value="teamwork"> Mark done</label></div></details>
+      <details class="check-step"><summary><span class="step-index" aria-hidden="true">06</span>Calls &amp; voice</summary><div class="check-body"><p>Voice is available with a supported agent and setup; room calls also require room permission.</p><button type="button" class="btn-nav primary guide-ask" data-draft="Help me set up voice for a project kickoff, if it’s supported." hidden>Ask about voice setup</button><label><input type="checkbox" value="calls"> Mark done</label></div></details>
+      <details class="check-step"><summary><span class="step-index" aria-hidden="true">07</span>Connect your apps</summary><div class="check-body"><p>Connected apps let your agent work with services you authorize.</p><p>If a Connect card is available, sign-in stays with you. Connected apps require s.space Cloud sign-in.</p><button type="button" class="btn-nav primary guide-ask" data-draft="{{DRAFT_APPS}}" hidden>Ask to connect Google Calendar</button><label><input type="checkbox" value="apps"> Mark done</label></div></details>
+      <details class="check-step"><summary><span class="step-index" aria-hidden="true">08</span>Activity &amp; notices</summary><div class="check-body"><p>Activity tracks what agents are working on and what needs your input.</p><button type="button" class="btn-nav primary guide-ask" data-draft="What work is still open? Ask me which project or room I mean if you need to." hidden>Ask for a work update</button><label><input type="checkbox" value="activity"> Mark done</label></div></details>
+      <details class="check-step"><summary><span class="step-index" aria-hidden="true">09</span>Set up the mobile app</summary><div class="check-body"><div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px 20px"><p style="flex:1 1 220px"><a class="btn-nav primary" href="https://apps.apple.com/us/app/s-space-human-ai-workspace/id6788541784" target="_blank" rel="noopener noreferrer">Open in the App Store</a></p><figure style="margin:0;text-align:center;max-width:180px"><img src="data:image/png;base64,{{APP_STORE_QR}}" width="180" height="180" style="display:block;max-width:100%;height:auto;margin-inline:auto;border-radius:6px" alt="QR code for the s.space App Store listing"><figcaption>Scan to open the App Store</figcaption></figure></div><button type="button" class="btn-nav primary guide-ask" data-draft="Help me pair my phone." hidden>Ask about phone pairing</button><label><input type="checkbox" value="mobile"> Mark done</label></div></details>
+      {{FINALE_CONTROL}}
+      <p class="preview-note">Progress is saved for you when storage is available.</p>
+    </div>
+  </details>
+<dialog id="guide-draft" aria-labelledby="draft-title">
+  <div class="draft-layout">
+    <h2 id="draft-title">Message your agent</h2>
+    <p>Edit the message, choose your agent, then review it before sending.</p>
+    <label for="draft-text">Message</label>
+      <textarea id="draft-text" rows="4" maxlength="4000" required></textarea>
+    <button id="draft-choose" class="btn-nav" type="button">Choose my agent</button>
+    <div id="draft-recipient" hidden>
+      <label for="draft-agent">Send privately to</label>
+      <select id="draft-agent" required></select>
+    </div>
+    <p id="draft-status" role="status" aria-live="polite"></p>
+    <div class="draft-actions"><button id="draft-send" class="btn-nav primary" type="button" disabled>Review &amp; send</button><button id="draft-close" class="btn-nav" type="button">Close</button></div>
+  </div>
+</dialog>
+<p id="guide-bridge-status" class="preview-note" role="status" hidden>Messaging buttons are available when this page is opened in a supported s.space Commons client.</p>
+<p id="guide-send-receipt" class="preview-note" role="status" aria-live="polite"></p>
+</div>
+
+<script>
+const steps = document.querySelectorAll('.tour-card');
+const tabs = document.querySelectorAll('.tab-btn');
+
+
+function showStep(idx) {
+  steps.forEach((step, i) => step.classList.toggle('active', i === idx));
+  tabs.forEach((tab, i) => { tab.classList.toggle('active', i === idx); tab.setAttribute('aria-current', i === idx ? 'true' : 'false'); });
+  const heading = steps[idx].querySelector('h2'); heading.tabIndex = -1; heading.focus({preventScroll:true});
+  if (heading.getBoundingClientRect().top < 0 || heading.getBoundingClientRect().top > innerHeight - 100) heading.scrollIntoView({block:'start'});
+
+}
+
+function openRoomsFromLink() {
+  if (location.hash !== '#rooms') return;
+  showStep(1);
+  document.getElementById('rooms').scrollIntoView({block:'start'});
+}
+if (location.hash === '#rooms') requestAnimationFrame(openRoomsFromLink);
+window.addEventListener('hashchange', openRoomsFromLink);
+
+function selectGuideChoice(button) {
+  button.closest('.interactive-tabs').querySelectorAll('.sub-tab').forEach(choice => {
+    const selected = choice === button;
+    choice.classList.toggle('active', selected);
+    choice.setAttribute('aria-pressed', String(selected));
+  });
+}
+
+function setProvider(p, btn) {
+  selectGuideChoice(btn);
+  const info = document.getElementById('providerInfo');
+  const details = {
+    "antigravity": "<strong>Antigravity · on your computer:</strong> Google’s Antigravity CLI can reply in s.space DMs and rooms. Availability depends on your desktop build and Google sign-in.",
+    "claudeCode": "<strong>Claude Code · on your computer:</strong> Claude Code runs locally through Sparrow. It’s separate from Claude Duet and Sutando.",
+    "claude": "<strong>Claude Duet · from another app:</strong> Claude Duet brings a personal agent from Claude into s.space. It is distinct from local Claude Code.",
+    "codex": "<strong>Codex · on your computer:</strong> Connect OpenAI’s coding agent with your Codex CLI login. It runs locally through Sparrow and replies in s.space DMs and rooms. This is separate from Dot and from setting up Sutando. Local file and command access depend on the setup and permissions you approve.",
+    "openai": "<strong>Dot · from ChatGPT:</strong> Dot brings your personal ChatGPT assistant into s.space. Connecting it does not share your private apps or data with other members.",
+    "grok": "<strong>Grok Bot · from Grok:</strong> Grok Bot can reply in s.space rooms and DMs. Available tools depend on the connection.",
+    "muse": "<strong>Muse · from another app:</strong> Muse can reply when its link and listener are active.",
+    "sutando": "<strong>Sutando · your local personal agent:</strong> Sutando is an open-source personal agent that runs on your Mac through a supported core such as Claude Code or Codex. Local tools require your authorization.",
+    "other": "<strong>Other apps:</strong> Hermes, OpenClaw and other compatible agents may be available. A model name or API key alone is not an agent connection."
+};
+  info.innerHTML = details[p] || "";
+}
+
+function setTier(tier, btn) {
+  selectGuideChoice(btn);
+  const info = document.getElementById('tierInfo');
+  const details = {
+    collaborator: "<strong>Team — collaborator:</strong> Work with the agent in the shared workspace, within its owner’s permissions and tool-approval settings.",
+    guest: "<strong>Guest:</strong> Guests can ask for help. The agent waits for the owner’s approval before acting on the request.",
+    none: "<strong>No access:</strong> The owner can still access and invoke the agent; other room members cannot."
+  };
+  info.innerHTML = details[tier] || "";
+}
+
+function setCallScenario(scen, btn) {
+  selectGuideChoice(btn);
+  const info = document.getElementById('callInfo');
+  const details = {
+    debug: "<strong>Debug Scenario:</strong> Example goal: <em>\"Read that error and suggest a way to reproduce it.\"</em> The agent can help diagnose the shared evidence.",
+    design: "<strong>UI / Spec Review:</strong> Example goal: <em>\"Read the comments on this design and summarize the decisions we still need.\"</em>",
+    triage: "<strong>Issue Triage:</strong> Example goal: <em>\"Read the bug thread in this room and summarize the unresolved questions.\"</em>",
+  };
+  info.innerHTML = details[scen] || "";
+}
+
+function setCommons(surf, btn) {
+  selectGuideChoice(btn);
+  const info = document.getElementById('commonsInfo');
+  const details = {
+    html: "<strong>Commons HTML Pages:</strong> Build interactive guides, charts and tools in Commons. Add live data or actions through supported, authorized integrations.",
+    doc: "<strong>Multiplayer Docs:</strong> Shared documents for plans, meeting notes and test checklists. Edit the document or leave a comment for discussion.",
+    board: "<strong>Whiteboard:</strong> Sketch ideas and diagrams together on a shared visual canvas."
+  };
+  info.innerHTML = details[surf] || "";
+}
+(() => {
+  const list = document.getElementById('checklist');
+  const boxes = [...list.querySelectorAll('input[type=checkbox]')];
+  const localKey = 'gs-done';
+  const runtime = window.artifact;
+  let save = () => {};
+  const count = document.getElementById('checklist-count');
+  const meter = document.getElementById('checklist-progress');
+  const selected = () => boxes.filter(box => box.checked).map(box => box.value);
+  function paint() {
+    meter.value = selected().length;
+    count.textContent = selected().length + ' of ' + boxes.length + ' done';
+  }
+  function load(value) {
+    const saved = Array.isArray(value) ? value : [];
+    boxes.forEach(box => {
+      box.checked = saved.includes(box.value) || (box.value === 'mobile' && saved.includes('phone'));
+    });
+    paint();
+  }
+  boxes.forEach(box => {
+    box.disabled = true;
+    box.addEventListener('change', () => { paint(); save(selected()); });
+  });
+  (async () => {
+    try {
+      if (runtime?.state && runtime.ready) {
+        await Promise.race([runtime.ready, new Promise(resolve => setTimeout(resolve, 1500))]);
+        const viewer = runtime.me?.id;
+        if (typeof viewer === 'string' && viewer) {
+          const key = localKey + '-' + viewer;
+          load(await runtime.state.get(key));
+          save = value => { Promise.resolve().then(() => runtime.state.set(key, value)).catch(() => {}); };
+          if (typeof runtime.state.on === 'function') runtime.state.on(key, load);
+          return;
+        }
+      }
+      const stored = localStorage.getItem(localKey);
+      load(JSON.parse(stored || '[]'));
+      save = value => { try { localStorage.setItem(localKey, JSON.stringify(value)); } catch (_) {} };
+    } catch (_) {
+      paint();
+    } finally {
+      boxes.forEach(box => { box.disabled = false; });
+    }
+  })();
+})();
+
+(() => {
+  const $ = id => document.getElementById(id);
+  const dialog = $('guide-draft'), message = $('draft-text');
+  const choose = $('draft-choose'), to = $('draft-agent'), recipient = $('draft-recipient');
+  const status = $('draft-status'), send = $('draft-send'), close = $('draft-close');
+  const controls = [...document.querySelectorAll('.guide-ask')];
+  const unavailable = $('guide-bridge-status'), receipt = $('guide-send-receipt');
+  let source, busy = false, blocked = false, nonce = null, targets = new Map();
+  const api = () => {
+    const host = window.artifact;
+    return typeof host?.agent?.list === 'function' && typeof host?.sendToMyAgent === 'function' ? host : null;
+  };
+  function update() {
+    choose.disabled = busy || blocked;
+    close.disabled = busy;
+    to.disabled = busy;
+    message.readOnly = busy || blocked;
+    send.disabled = busy || blocked || !targets.has(to.value) || !message.value.trim();
+  }
+  function disclose() {
+    const supported = !!api() && typeof dialog.showModal === 'function' && typeof window.crypto?.getRandomValues === 'function';
+    controls.forEach(button => { button.hidden = !supported; });
+    unavailable.hidden = supported;
+  }
+  const resetAgents = () => {
+    targets = new Map();
+    to.replaceChildren(new Option('Choose an agent', ''));
+    recipient.hidden = true;
+    choose.hidden = false;
+  };
+  controls.forEach(button => button.addEventListener('click', () => {
+    if (!api() || dialog.open) { disclose(); return; }
+    source = button;
+    message.value = button.dataset.draft || "";
+    nonce = null;
+    blocked = false;
+    resetAgents();
+    status.textContent = '';
+    update();
+    dialog.showModal();
+    message.focus();
+  }));
+  close.addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', () => source?.focus());
+  dialog.addEventListener('cancel', event => { if (busy) event.preventDefault(); });
+  message.addEventListener('input', () => { nonce = null; update(); });
+  to.addEventListener('change', () => { nonce = null; update(); });
+  choose.addEventListener('click', async () => {
+    if (busy || blocked) return;
+    const host = api();
+    if (!host) return;
+    busy = true;
+    status.textContent = 'Looking up your agents. s.space may ask for permission.';
+    update();
+    try {
+      const list = await host.agent.list();
+      resetAgents();
+      if (Array.isArray(list)) list.forEach(agent => {
+        if (!agent || !/^u[0-9a-f]{64}$/.test(agent.id) || typeof agent.name !== 'string') return;
+        const name = agent.name.trim() || 'Agent';
+        if (targets.has(agent.id)) return;
+        targets.set(agent.id, name);
+        to.add(new Option(name, agent.id));
+      });
+      if (!targets.size) {
+        status.textContent = 'No agents are available to this page. Nothing was sent.';
+      } else {
+        recipient.hidden = false;
+        choose.hidden = true;
+        if (targets.size === 1) to.value = targets.keys().next().value;
+        status.textContent = '';
+      }
+    } catch (_) {
+      status.textContent = 'Couldn’t load your agents. Nothing was sent.';
+    } finally {
+      busy = false;
+      update();
+      if (!recipient.hidden) to.focus();
+    }
+  });
+  send.addEventListener('click', async () => {
+    if (busy || blocked || !targets.has(to.value) || !message.value.trim()) return;
+    const host = api();
+    if (!host) { status.textContent = 'Messaging is unavailable here. Nothing was sent.'; return; }
+    const agentId = to.value, text = message.value, name = targets.get(agentId);
+    nonce ??= 'guide-' + [...crypto.getRandomValues(new Uint8Array(16))].map(value => value.toString(16).padStart(2, '0')).join('');
+    busy = true;
+    update();
+    status.textContent = 'Review your message in the s.space confirmation.';
+    try {
+      const result = await host.sendToMyAgent({agentId, text, key: nonce});
+      if (result?.ok === true) {
+        receipt.textContent = 'Message sent to ' + name + '.';
+        dialog.close();
+      } else {
+        const reason = result?.reason ?? '';
+        if (/^(declined|confirmation interrupted|page permission required|agent not owned or unavailable|agent has no private DM with you|too many agent requests|another request is in progress|invalid request)$/.test(reason)) {
+          status.textContent = reason === 'declined' ? 'Not sent. Your draft is still here.' : 'Nothing was sent. Your draft is still here.';
+          nonce = null;
+        } else {
+          blocked = true;
+          status.textContent = 's.space did not confirm delivery. Check your agent DM before sending again.';
+          receipt.textContent = status.textContent;
+        }
+      }
+    } catch (_) {
+      blocked = true;
+      status.textContent = 's.space did not confirm delivery. Check your agent DM before sending again.';
+      receipt.textContent = status.textContent;
+    } finally {
+      busy = false;
+      update();
+    }
+  });
+  disclose();
+  window.addEventListener('load', disclose, {once:true});
+})();
+
+</script>
+<noscript><style>#overview .tour-card{display:block}</style><p>With scripts off, the examples cannot open a message.</p></noscript>
+</div>
+</body>
+</html>
