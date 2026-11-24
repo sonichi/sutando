@@ -251,7 +251,11 @@ class Notice(NoticeBase):
         self.assertEqual(quota_card.reset_words(pane), "")
         self.assertNotIn("hunter2", quota_card.words(["quota-limit"], pane, "x"))
         self.assertNotIn("sk-secret", quota_card.words(["quota-limit"], pane, "x"))
-        # A banner the pane wrapped inside its "resets ..." is read on: the card said it "does not say when".
+        # The line under the banner ("/usage-credits to finish ...") is a limit line too, with no time: the card
+        # said the limit "does not say when that resets" with the time one line up.
+        two = "  ⎿  You've hit your weekly limit · resets Nov 28 at 1pm (UTC)\n     /usage-credits to finish what you’re working on.\n\n❯ \n"
+        self.assertEqual(quota_card.reset_words(two), "resets Nov 28, 1pm (UTC)")
+        # A banner the pane wrapped inside its "resets ..." is read on to the line under it.
         wrapped = "  ⎿  You've hit your weekly limit · resets Nov 28 at\n     1pm (UTC)\n\n❯ \n"
         self.assertEqual(quota_card.reset_words(wrapped), "resets Nov 28, 1pm (UTC)")
         self.assertEqual(quota_card.reset_words("You've hit your weekly limit · resets\nNov 28 at 1pm\n"), "resets Nov 28, 1pm")

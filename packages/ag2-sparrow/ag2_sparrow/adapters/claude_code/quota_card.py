@@ -119,7 +119,6 @@ def reset_words(text: str) -> str:
             found = _WHEN.search(line) or (_CUT.search(line) and _WHEN.search(line + " " + under))
             if found:
                 return _said(found)
-            break
         under = line.strip()
     if detector.LIMIT_MENU.search(text):
         menu = _MENU_WHEN.search(text)
