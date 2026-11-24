@@ -6,7 +6,9 @@ connected agent onto the ag2-sparrow it ships: all eight local agents of a test 
     python3 packages/ag2-sparrow/tests/test_install_replaces_other_install.py
 """
 import argparse
+import contextlib
 import importlib
+import io
 import sys
 import unittest
 from pathlib import Path
@@ -32,12 +34,18 @@ class ReplaceInstall(unittest.TestCase):
     def setUp(self):
         self.addCleanup(cm.take_over, argparse.Namespace())
 
-    def held(self, shape, root=ROOT, adapter=None, install=OLD, live=True, recorded=ROOT):
-        """_managed_here's word on `root`, held by `adapter`'s session of `install` while the job records `recorded`."""
+    def facts(self, shape, adapter=None, install=OLD, live=True, recorded=ROOT, job=4242):
+        """The machine as _managed_here reads it: `adapter`'s session of `install` (pid 4242) holds the root, the
+        job records `recorded`, and the manager runs the job as pid `job`."""
         rec = {"live": live, "adapter": adapter or shape.name, "pid": 4242, "install_id": install}
-        with mock.patch.object(cm, "owned_config", return_value=({"ROOT": recorded}, "")), \
-                mock.patch.object(cm, "lock_holder", return_value=rec), \
-                mock.patch.object(cm, "install_id", return_value=NEW):
+        stack = contextlib.ExitStack()
+        for name, value in (("owned_config", ({"ROOT": recorded}, "")), ("lock_holder", rec), ("install_id", NEW),
+                            ("manager_pid", job), ("_parent_pid", 1), ("_spawning_launcher", None)):
+            stack.enter_context(mock.patch.object(cm, name, return_value=value))
+        return stack
+
+    def held(self, shape, root=ROOT, **facts):
+        with self.facts(shape, **facts):
             return cm._managed_here(shape, root)
 
     def test_a_session_of_another_install_is_refused_unless_the_install_says_replace(self):
@@ -56,6 +64,27 @@ class ReplaceInstall(unittest.TestCase):
         self.assertIn("a holder with no live record", self.held(shape, live=False))
         self.assertIn("is active for /agents/other", self.held(shape, recorded="/agents/other"))
         self.assertEqual(self.held(shape, install=NEW), "", "its own install's session, as before")
+
+    def test_a_holder_the_manager_does_not_run_is_refused_before_anything_is_stopped(self):
+        # Stopping the job would not free a root held by a session started by hand: the stop would only be an outage.
+        shape = claude.LOCAL
+        cm.take_over(argparse.Namespace(replace_install=True))
+        for job in (777, None):
+            with self.subTest(job=job):
+                self.assertIn("is not the process", self.held(shape, job=job))
+                self.assertIn("nothing was stopped", self.held(shape, job=job))
+                with self.facts(shape, job=job), contextlib.redirect_stderr(io.StringIO()), \
+                        mock.patch.object(cm, "owned_text", return_value=("unit", "")), \
+                        mock.patch.object(cm, "render_supervisor", return_value=("unit", "")), \
+                        mock.patch.object(cm, "lock_held", return_value="held"), \
+                        mock.patch.object(cm, "manager_state", return_value="active"), \
+                        mock.patch.object(cm, "stop_supervisor") as stop, mock.patch.object(cm, "_write") as write:
+                    self.assertNotEqual(cm._install_locked(shape, {}, ROOT), 0)
+                stop.assert_not_called()
+                write.assert_not_called()
+        # The job's own launcher, or its child, is taken over.
+        with self.facts(shape, job=1):
+            self.assertEqual(cm._managed_here(shape, ROOT), "")
 
     def test_every_local_adapters_install_takes_the_option_and_reads_it(self):
         for mod in (claude, codex, agy, openclaw):

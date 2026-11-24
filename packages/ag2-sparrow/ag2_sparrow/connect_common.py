@@ -1638,6 +1638,13 @@ def _managed_here(shape: Shape, root: str) -> str:
                f"{rec.get('pid')}" + ("" if rec.get("install_id") == install_id() else " of another install"))
         return (f"{root} is held by {who} while {job_name(shape)} is active for "
                 f"{managed or 'no recorded work root'}; stop that session, then run install again")
+    if rec.get("install_id") != install_id():
+        # Taken over only when stopping the job is what frees the root: a holder the manager does not run (a
+        # session started by hand, one left by a recovery) would outlive the stop.
+        launcher, job, runs = _run_by_job(shape, root, rec)
+        if not runs:
+            return (f"{root} is held by {rec.get('adapter')} pid {launcher} of another install, which is not the "
+                    f"process {job_name(shape)} runs as ({job or 'none'}); nothing was stopped")
     return ""
 
 
@@ -1939,15 +1946,23 @@ def _then(shape: Shape, root: str, steps) -> int:
     return 0
 
 
-def _holder_problem(shape: Shape, root: str, rec, p: dict) -> str:
-    if rec is None:
-        return (f"the managed launcher did not acquire {root} within {CONFIRM_TIMEOUT_S:.0f} s ({holder_line(root)}); "
-                f"its refusal is in {launcher_log(shape)}")
+def _run_by_job(shape: Shape, root: str, rec: dict) -> "tuple[object, object, bool]":
+    """(the holder's launcher pid, the pid the manager runs the job as, whether that job is what holds the
+    root): the launcher itself, its parent, or the launcher whose run spawned the holder."""
     launcher = rec.get("owner_pid", rec.get("pid"))
     job = manager_pid(shape)
     spawner = _spawning_launcher(shape, root, rec) if job is not None and job not in (launcher, _parent_pid(launcher)) \
         else None
-    if job is None or job not in (launcher, _parent_pid(launcher), spawner, _parent_pid(spawner) if spawner else None):
+    return launcher, job, job is not None and job in (launcher, _parent_pid(launcher), spawner,
+                                                      _parent_pid(spawner) if spawner else None)
+
+
+def _holder_problem(shape: Shape, root: str, rec, p: dict) -> str:
+    if rec is None:
+        return (f"the managed launcher did not acquire {root} within {CONFIRM_TIMEOUT_S:.0f} s ({holder_line(root)}); "
+                f"its refusal is in {launcher_log(shape)}")
+    launcher, job, runs = _run_by_job(shape, root, rec)
+    if not runs:
         return (f"the launcher holding {root} (pid {launcher}) is not the process {job_name(shape)} runs as "
                 f"({job or 'none'}); it was not started by this operation")
     if p["root_id"] is not None and dir_identity(root) != p["root_id"]:
