@@ -1,0 +1,38 @@
+:root {
+  color-scheme: light dark;
+  --ss-red-dark: #780B20; --ss-red-light: #FACEFE;
+  --ss-green-dark: #06813D; --ss-green-mid: #9EE2BF;
+  --ss-blue-dark: #0A185B; --ss-blue-mid: #465EC9;
+  --ss-yellow-dark: #8A5911; --ss-yellow-mid: #F0E345;
+  --ss-neutral-dark: #1B1919; --ss-neutral-mid: #B7B2AD; --ss-neutral-light: #F4F4F4;
+  --bg: #fff; --surface: var(--ss-neutral-light); --text: var(--ss-neutral-dark); --soft: #6B6560;
+  --line: var(--ss-neutral-mid); --bad: var(--ss-red-dark);
+  --dot-done: var(--ss-green-dark); --dot-busy: var(--ss-yellow-dark); --dot-idle: var(--ss-neutral-mid);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: var(--ss-neutral-dark); --surface: #262323; --text: var(--ss-neutral-light); --soft: var(--ss-neutral-mid);
+    --bad: var(--ss-red-light); --dot-done: var(--ss-green-mid); --dot-busy: var(--ss-yellow-mid);
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 16px; background: var(--bg); color: var(--text); font: 16px/1.4 system-ui, sans-serif; }
+main { max-width: 640px; margin: 0 auto; display: grid; gap: 12px; }
+h1 { font-size: 20px; margin: 0; }
+p { margin: 0; }
+.soft { color: var(--soft); font-size: 14px; }
+.status { padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; }
+.status.bad { border-color: var(--bad); color: var(--bad); }
+.entry { display: grid; gap: 8px; }
+input { min-height: 44px; padding: 8px 12px; font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; width: 100%; }
+button { min-height: 44px; min-width: 44px; padding: 8px 16px; font: inherit; color: inherit; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+button.primary { background: var(--accent); color: var(--on-accent); border-color: var(--accent); font-weight: 600; }
+button:disabled { opacity: .55; }
+ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+li { display: grid; gap: 8px; padding: 12px; background: var(--surface); border-radius: 8px; overflow-wrap: anywhere; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--bg); font-size: 14px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dot-idle); }
+.dot.done { background: var(--dot-done); }
+.dot.busy { background: var(--dot-busy); }
+@media (min-width: 640px) { .entry { grid-template-columns: 1fr 1fr auto; } }

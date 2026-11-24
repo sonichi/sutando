@@ -1,0 +1,574 @@
+/*! commons-sdk 0.1.0: a small client library for Room Commons apps. No dependencies. */
+(function (root, factory) {
+  const api = factory();
+  if (typeof module === 'object' && module && module.exports) module.exports = api;
+  else root.Commons = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
+
+  const LIMITS = Object.freeze({ writeBytes: 20000, writesPerMinute: 30, readsPerMinute: 20, players: 200, mentions: 20 });
+  const KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+  const ACTION_RE = /^[A-Za-z0-9._-]{1,64}$/;
+
+  /** Every failure the library reports: `code` is stable, `reason` is the bridge's own text.
+   *  The README lists the codes. */
+  class CommonsError extends Error {
+    constructor(code, message, reason) {
+      super(message);
+      this.name = 'CommonsError';
+      this.code = code;
+      if (reason !== undefined) this.reason = reason;
+    }
+  }
+
+  /* The one place bridge reason text is matched: REASONS and refusal(). Callers read `code` only. */
+  const REASONS = [
+    [/waiting for the viewer/i, 'CONSENT_PENDING'],
+    [/not allowed by the viewer/i, 'CONSENT_DENIED'],
+    [/page permission required|^consent_required$/i, 'CONSENT_REQUIRED'],
+    [/rate limit|too many|^rate(_page|_agent)?$/i, 'RATE_LIMITED'],
+    [/^declined$/i, 'DECLINED'],
+    [/agent not owned or unavailable/i, 'AGENT_UNAVAILABLE'],
+    [/another request is in progress/i, 'BUSY'],
+    [/request outcome unknown/i, 'OUTCOME_UNKNOWN'],
+    [/mention is not a joined member|cannot mention a group/i, 'BAD_MENTION'],
+  ];
+
+  function refusal(reason, fallback) {
+    const text = String(reason == null ? '' : reason);
+    const hit = REASONS.find(([re]) => re.test(text));
+    return new CommonsError(hit ? hit[1] : fallback || 'REFUSED', text || 'The room refused the call.', text);
+  }
+
+  const bad = (message) => new CommonsError('BAD_ARGUMENT', message);
+  const bytes = (text) => (typeof TextEncoder === 'function' ? new TextEncoder().encode(text).length : unescape(encodeURIComponent(text)).length);
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const empty = (v) => v === undefined || v === null || v === '';
+  let seq = 0;
+  const nonce = () => (seq += 1).toString(36) + Math.random().toString(36).slice(2, 10);
+
+  function checkSize(value) {
+    const size = bytes(JSON.stringify(value === undefined ? null : value));
+    if (size > LIMITS.writeBytes) throw new CommonsError('TOO_LARGE', 'A write is ' + size + ' bytes; the limit is ' + LIMITS.writeBytes + '.');
+  }
+
+  function decode(raw) {
+    if (typeof raw !== 'string') return raw;
+    try { return JSON.parse(raw); } catch (_e) { return raw; }
+  }
+
+  /* The one place a list row is "removed": a marker cell, because a page cannot delete rows. */
+  const removal = (opts) => {
+    const m = Object.assign({ prop: 'Removed', value: 'yes' }, opts);
+    return { cells: () => ({ [m.prop]: m.value }), hides: (cells) => cells[m.prop] === m.value };
+  };
+
+  const toPlayer = (m) => {
+    const p = { id: m.id, name: m.name, kind: m.kind === 'agent' ? 'agent' : 'person' };
+    if (m.avatar) p.avatar = m.avatar;
+    return p;
+  };
+
+  /* One database: the last snapshot, one watch, one write queue. Shared by every handle on it. */
+  class Table {
+    constructor(room, id) {
+      this.room = room; this.id = id;
+      this.props = []; this.rows = [];
+      this.gen = 0; this.gone = false;
+      this.listeners = new Set();
+      this.tail = Promise.resolve();
+    }
+
+    async open() {
+      const db = this.room.art.db;
+      // Subscribe, then read: no edit is missed in between.
+      this.stop = db.onChange(this.id, (snap) => this.ingest(snap));
+      this.ingest(await this.read());
+    }
+
+    async read() {
+      try { return await this.room.art.db.read(this.id); } catch (e) { throw refusal(e && e.message); }
+    }
+
+    ingest(snap) {
+      this.gen += 1;
+      this.gone = !snap;
+      if (snap) this.props = snap.props || [];
+      this.rows = snap ? (snap.rows || []).map((r) => ({ id: r.id, cells: Object.assign({}, r.cells) })) : [];
+      this.emit('remote');
+    }
+
+    emit(origin) { for (const fn of Array.from(this.listeners)) fn(origin); }
+
+    need(name) {
+      if (!this.props.some((p) => p.name === name)) throw new CommonsError('SCHEMA', 'The database has no column named "' + name + '".');
+    }
+
+    title() {
+      const p = this.props.find((x) => x.type === 'title');
+      if (!p) throw new CommonsError('SCHEMA', 'The database has no title column.');
+      return p.name;
+    }
+
+    row(id) { return this.rows.find((r) => r.id === id); }
+
+    /* Jobs run one at a time, in call order. */
+    enqueue(job) {
+      const run = this.tail.then(job);
+      this.tail = run.catch(() => {});
+      return run;
+    }
+
+    /* Shows `ops` at once, runs `job` in the queue, then drops them: a refused write rolls back. */
+    async optimistic(list, ops, job) {
+      list.push(...ops);
+      this.emit('local');
+      try { return await this.enqueue(job); } finally {
+        for (const op of ops) list.splice(list.indexOf(op), 1);
+        this.emit('local');
+      }
+    }
+
+    check() { if (this.gone) throw new CommonsError('DB_GONE', 'The database was removed.'); }
+
+    async write(rowId, prop, value) {
+      this.check();
+      const gen = this.gen;
+      await this.room.send(() => this.room.art.db.write(this.id, rowId, prop, value));
+      // Keep the value only if no snapshot arrived meanwhile; a snapshot is the room's word.
+      const row = this.row(rowId);
+      if (gen === this.gen && row) row.cells[prop] = value;
+    }
+
+    async create(cells) {
+      this.check();
+      const r = await this.room.send(() => this.room.art.db.createRow(this.id, cells));
+      if (!this.row(r.rowId)) this.rows.push({ id: r.rowId, cells: Object.assign({}, cells) });
+      return r.rowId;
+    }
+  }
+
+  /* Shared by SharedMap and SharedList: keep a projection, diff it, tell observers. */
+  class Handle {
+    constructor(table) {
+      this.t = table;
+      this.ops = [];
+      this.observers = new Set();
+      this.off = null;
+    }
+
+    start() {
+      this.last = this.project();
+      const fn = (origin) => this.refresh(origin);
+      this.t.listeners.add(fn);
+      this.off = () => this.t.listeners.delete(fn);
+    }
+
+    refresh(origin) {
+      const next = this.project();
+      const changes = this.diff(this.last, next);
+      this.last = next;
+      if (changes.length) for (const cb of Array.from(this.observers)) cb(changes, origin);
+      this.after(origin);
+    }
+
+    after() {}
+
+    /** Calls `cb(changes, origin)` after each change; origin is "local" (this page, or its rollback)
+     *  or "remote" (a room snapshot). Returns a function that stops it. */
+    observe(cb) {
+      this.observers.add(cb);
+      return () => this.observers.delete(cb);
+    }
+
+    /** The bridge id of the database behind this handle. */
+    get databaseId() { return this.t.id; }
+
+    /** True once the database behind this handle was removed from the room. */
+    get gone() { return this.t.gone; }
+  }
+
+  /** A key → value map stored as rows: the title column is the key, a text column holds JSON.
+   *  Last write to reach the room wins, per key. Not a CRDT. */
+  class SharedMap extends Handle {
+    constructor(table, opts) {
+      super(table);
+      this.keyProp = table.title();
+      this.valueProp = (opts && opts.valueProp) || 'Value';
+      table.need(this.valueProp);
+      this.start();
+    }
+
+    /* Two rows with one key (two pages created it at once): the lowest row id is the key's row. */
+    rowFor(key) {
+      let hit;
+      for (const r of this.t.rows) if (r.cells[this.keyProp] === key && (!hit || r.id < hit.id)) hit = r;
+      return hit;
+    }
+
+    project() {
+      const rows = new Map();
+      for (const r of this.t.rows) {
+        const k = r.cells[this.keyProp];
+        if (typeof k !== 'string' || k === '') continue;
+        const cur = rows.get(k);
+        if (!cur || r.id < cur.id) rows.set(k, r);
+      }
+      const out = new Map();
+      for (const [k, r] of rows) if (!empty(r.cells[this.valueProp])) out.set(k, decode(r.cells[this.valueProp]));
+      for (const op of this.ops) { if (op.json === '') out.delete(op.key); else out.set(op.key, JSON.parse(op.json)); }
+      return out;
+    }
+
+    diff(a, b) {
+      const changes = [];
+      for (const [key, value] of b) {
+        if (!a.has(key)) changes.push({ key, action: 'add', value });
+        else if (!same(a.get(key), value)) changes.push({ key, action: 'update', value, oldValue: a.get(key) });
+      }
+      for (const [key, oldValue] of a) if (!b.has(key)) changes.push({ key, action: 'delete', oldValue });
+      return changes;
+    }
+
+    /** @param {string} key @returns {*} the value, or undefined */
+    get(key) { return this.last.get(key); }
+
+    /** @param {string} key @returns {boolean} */
+    has(key) { return this.last.has(key); }
+
+    /** @returns {Array<[string, *]>} every key and value */
+    entries() { return Array.from(this.last.entries()); }
+
+    /** @returns {number} how many keys hold a value */
+    get size() { return this.last.size; }
+
+    /** Sets a key to any JSON value. Shown at once; rolled back if the room refuses.
+     *  @returns {Promise<void>} rejects with a CommonsError when refused */
+    async set(key, value) {
+      const json = JSON.stringify(value);
+      if (json === undefined) throw bad('A map value must be JSON.');
+      return this.put(key, json);
+    }
+
+    /** Deletes a key by emptying its value cell. The row stays: a page cannot delete rows. */
+    async delete(key) { return this.put(key, ''); }
+
+    async put(key, json) {
+      if (typeof key !== 'string' || key === '') throw bad('A map key is a non-empty string.');
+      checkSize({ [this.keyProp]: key, [this.valueProp]: json });
+      await this.t.optimistic(this.ops, [{ key, json }], async () => {
+        const row = this.rowFor(key);
+        if (row) await this.t.write(row.id, this.valueProp, json);
+        else if (json !== '') await this.t.create({ [this.keyProp]: key, [this.valueProp]: json });
+      });
+    }
+  }
+
+  /** The rows of one database as a list of `{id, cells}`.
+   *  Last write to reach the room wins, per cell (one row, one column). Not a CRDT. */
+  class SharedList extends Handle {
+    constructor(table, opts) {
+      super(table);
+      const o = opts || {};
+      this.orderBy = o.orderBy || null;
+      this.removed = removal(o.removed);
+      this.claimProp = o.claimProp || 'Claim';
+      this.held = new Map();
+      this.start();
+    }
+
+    /** The name of the database's title column. */
+    get titleProp() { return this.t.title(); }
+
+    project() {
+      const rows = [];
+      for (const r of this.t.rows) {
+        const cells = Object.assign({}, r.cells);
+        for (const op of this.ops) if (op.id === r.id) cells[op.prop] = op.value;
+        if (!this.removed.hides(cells)) rows.push(Object.freeze({ id: r.id, cells: Object.freeze(cells) }));
+      }
+      const by = this.orderBy;
+      if (by) {
+        rows.sort((x, y) => {
+          const a = x.cells[by], b = y.cells[by];
+          if (empty(a) !== empty(b)) return empty(a) ? 1 : -1;
+          return a < b ? -1 : a > b ? 1 : x.id < y.id ? -1 : x.id > y.id ? 1 : 0;
+        });
+      }
+      return rows;
+    }
+
+    diff(a, b) {
+      const before = new Map(a.map((r) => [r.id, r])), now = new Map(b.map((r) => [r.id, r]));
+      const changes = [];
+      for (const row of b) {
+        const oldRow = before.get(row.id);
+        if (!oldRow) changes.push({ id: row.id, action: 'add', row });
+        else if (!same(oldRow.cells, row.cells)) changes.push({ id: row.id, action: 'update', row, oldRow });
+      }
+      for (const oldRow of a) if (!now.has(oldRow.id)) changes.push({ id: oldRow.id, action: 'delete', oldRow });
+      return changes;
+    }
+
+    /* A claim this page held that now shows another token was taken over. */
+    after(origin) {
+      if (origin !== 'remote') return;
+      for (const [id, mine] of Array.from(this.held)) {
+        const raw = this.rawClaim(id);
+        if (raw && raw.n === mine.token) continue;
+        this.held.delete(id);
+        if (mine.until > this.t.room.now() && mine.onLost) mine.onLost(this.claimOf(id));
+      }
+    }
+
+    /** @returns {Array<{id: string, cells: object}>} the rows, in order */
+    toArray() { return this.last.slice(); }
+
+    /** @param {string} id @returns {{id: string, cells: object}|undefined} */
+    get(id) { return this.last.find((r) => r.id === id); }
+
+    /** @returns {number} how many rows */
+    get length() { return this.last.length; }
+
+    /** Adds a row from `{column: value}` in one call: all fit, or nothing is created. The row
+     *  appears once the room confirms it. @returns {Promise<string>} the new row's id */
+    async push(cells) {
+      if (!cells || typeof cells !== 'object') throw bad('push takes an object of column values.');
+      checkSize(cells);
+      const id = await this.t.enqueue(() => this.t.create(cells));
+      this.t.emit('local');
+      return id;
+    }
+
+    /** Changes cells of one row. Shown at once; rolled back if the room refuses. One write per
+     *  column, so not atomic: on a refusal the error's `written` lists the columns already saved. */
+    async update(id, cells) {
+      if (!this.t.row(id)) throw new CommonsError('NOT_FOUND', 'No row with id "' + id + '".');
+      const entries = Object.entries(cells || {});
+      for (const [prop, value] of entries) { this.t.need(prop); checkSize(value); }
+      const written = [];
+      await this.t.optimistic(this.ops, entries.map(([prop, value]) => ({ id, prop, value })), async () => {
+        for (const [prop, value] of entries) {
+          try { await this.t.write(id, prop, value); } catch (e) { e.written = written; throw e; }
+          written.push(prop);
+        }
+      });
+    }
+
+    /** Hides a row from the list by writing the removal marker. @returns {Promise<void>} */
+    async remove(id) { return this.update(id, this.removed.cells()); }
+
+    rawClaim(id) {
+      const row = this.get(id);
+      const raw = row && decode(row.cells[this.claimProp]);
+      return raw && typeof raw === 'object' && typeof raw.by === 'string' && Number.isFinite(raw.until) ? raw : null;
+    }
+
+    /** Who holds a row now: `{id, name, kind, until, mine}`, or null when free or expired.
+     *  The holder is what the claimer wrote about itself: the room does not attest it. */
+    claimOf(id) {
+      const raw = this.rawClaim(id);
+      if (!raw || raw.until <= this.t.room.now()) return null;
+      const me = this.t.room.art.me;
+      return { id: raw.by, name: String(raw.name || ''), kind: raw.kind === 'agent' ? 'agent' : 'person', until: raw.until, mine: !!me && raw.by === me.id };
+    }
+
+    /** Claims a row for `opts.ttl` ms (default 60000); the last claim to reach the room wins. Resolves
+     *  `{ok, holder, confirmed}`; a later loss calls `opts.onLost(holder)`. The README has the race rule. */
+    async claim(id, opts) {
+      const o = opts || {}, ttl = o.ttl === undefined ? 60000 : o.ttl;
+      if (!(ttl > 0) || !Number.isFinite(ttl)) throw bad('ttl is a positive number of milliseconds.');
+      this.t.need(this.claimProp);
+      if (!this.get(id)) throw new CommonsError('NOT_FOUND', 'No row with id "' + id + '".');
+      const holder = this.claimOf(id);
+      if (holder && !holder.mine) return { ok: false, holder, confirmed: true };
+      const room = this.t.room, me = room.me(), token = nonce(), until = room.now() + ttl;
+      const json = JSON.stringify({ by: me.id, name: me.name, kind: me.kind, until, n: token });
+      this.held.delete(id);
+      let confirmed = true;
+      await this.t.optimistic(this.ops, [{ id, prop: this.claimProp, value: json }], async () => {
+        await this.t.write(id, this.claimProp, json);
+        try { this.t.ingest(await this.t.read()); } catch (_e) { confirmed = false; }
+      });
+      const raw = this.rawClaim(id);
+      const ok = !!raw && raw.n === token;
+      if (ok) this.held.set(id, { token, until, onLost: o.onLost });
+      return { ok, holder: this.claimOf(id), confirmed };
+    }
+
+    /** Gives up a claim this page holds, by emptying the claim cell.
+     *  @returns {Promise<boolean>} false when this page did not hold it */
+    async release(id) {
+      const holder = this.claimOf(id);
+      this.held.delete(id);
+      if (!holder || !holder.mine) return false;
+      await this.t.optimistic(this.ops, [{ id, prop: this.claimProp, value: '' }], () => this.t.write(id, this.claimProp, ''));
+      return true;
+    }
+  }
+
+  /* EXPERIMENTAL: the named-agent request calls are designed and not built, and may change.
+     Lists pass through untouched: `state` and `outcome` are the bridge's own, as plain text. */
+  function requestsAdapter(art) {
+    const a = art.agent;
+    if (!a || typeof a.requestable !== 'function' || typeof a.request !== 'function' || typeof a.requests !== 'function') return null;
+    return {
+      /** @returns {Promise<Array<{id: string, name: string, actions: string[]}>>} */
+      agents: async () => (await a.requestable()) || [],
+      /** @returns {Promise<{requestId: string, duplicate: boolean}>} */
+      send: async (request) => {
+        const r = await a.request(request);
+        if (!r || !r.ok) throw refusal(r && r.reason, 'REQUEST_REFUSED');
+        return { requestId: r.requestId, duplicate: !!r.duplicate };
+      },
+      /** Calls `cb(wholeList)` now and on every change, with the bridge's list as given. */
+      watch: async (scope, cb) => {
+        const first = await a.requests(scope, { onChange: cb });
+        cb(first);
+        return first;
+      },
+    };
+  }
+
+  /** A connected room. Get one from `Commons.connect()`. */
+  class Room {
+    constructor(art, opts) {
+      this.art = art;
+      this.opts = Object.assign({ retryEvery: 1500, retryFor: 120000 }, opts);
+      this.sleep = this.opts.sleep || ((ms) => new Promise((ok) => setTimeout(ok, ms)));
+      this.tables = new Map();
+      this.waiting = new Set();
+      /** The app record `{id, name, database}`, or null when the page is opened on its own. */
+      this.app = art.app || null;
+      /** EXPERIMENTAL adapters. `requests` is null unless the bridge has the named-agent calls. */
+      this.experimental = { requests: requestsAdapter(art) };
+      /** What this bridge offers. Check before showing a control. */
+      this.capabilities = Object.freeze({
+        players: typeof art.members === 'function',
+        authorship: typeof art.personId === 'function',
+        agents: !!art.agent && typeof art.agent.list === 'function' && typeof art.agent.sendTask === 'function',
+        post: !!art.room && typeof art.room.post === 'function',
+        requests: !!this.experimental.requests,
+      });
+    }
+
+    /** @returns {number} room time in ms: the bridge's estimate, or this device's clock */
+    now() {
+      if (this.opts.now) return this.opts.now();
+      const t = typeof this.art.now === 'function' ? this.art.now() : NaN;
+      return Number.isFinite(t) ? t : Date.now();
+    }
+
+    /** @returns {{id: string, name: string, kind: 'person'|'agent'}} the viewer, as the host says */
+    me() { return toPlayer(this.art.me); }
+
+    /** The room's joined members, people and agents alike (at most 200). Not "who is viewing".
+     *  @returns {Promise<Array<{id: string, name: string, kind: 'person'|'agent', avatar?: string}>>} */
+    async players() {
+      if (!this.capabilities.players) throw new CommonsError('UNSUPPORTED', 'This bridge does not list members.');
+      try { return (await this.art.members()).map(toPlayer); } catch (e) { throw refusal(e && e.message); }
+    }
+
+    /** The player a "created by" or person cell names: the attested author of a row.
+     *  @returns {Promise<string|null>} a player id */
+    async playerOf(cell) {
+      if (!this.capabilities.authorship) throw new CommonsError('UNSUPPORTED', 'This bridge does not resolve authors.');
+      try { return await this.art.personId(cell); } catch (e) { throw refusal(e && e.message); }
+    }
+
+    /** Calls `cb(code)` each time a write waits and will retry: "CONSENT_PENDING" or "RATE_LIMITED".
+     *  Returns a function that stops it. */
+    onWaiting(cb) {
+      this.waiting.add(cb);
+      return () => this.waiting.delete(cb);
+    }
+
+    /* The guide's write loop: retry while the viewer has not answered or the page is rate-limited. */
+    async send(call) {
+      const until = this.now() + this.opts.retryFor;
+      for (;;) {
+        const r = await call();
+        if (r && r.ok) return r;
+        const err = refusal(r && r.reason);
+        if ((err.code !== 'CONSENT_PENDING' && err.code !== 'RATE_LIMITED') || this.now() >= until) throw err;
+        for (const cb of Array.from(this.waiting)) cb(err.code);
+        await this.sleep(this.opts.retryEvery);
+      }
+    }
+
+    async table(name) {
+      const list = await this.art.db.list();
+      const id = name ? (list.find((d) => d.name === name) || {}).id : this.app && this.app.database;
+      if (!id) throw new CommonsError('DB_MISSING', name ? 'This room has no database named "' + name + '".' : 'This page is not opened as an app: name the database.');
+      if (!this.tables.has(id)) {
+        const t = new Table(this, id);
+        this.tables.set(id, t.open().then(() => t));
+        this.tables.get(id).catch(() => this.tables.delete(id));
+      }
+      return this.tables.get(id);
+    }
+
+    /** A shared map on a database, found by exact name (omit it to use the app's own database).
+     *  `opts.valueProp` names the value column, default "Value". @returns {Promise<SharedMap>} */
+    async map(name, opts) { return new SharedMap(await this.table(name), opts); }
+
+    /** A shared list of a database's rows, found by exact name (omit it to use the app's own).
+     *  `opts`: `{orderBy?, removed?: {prop, value}, claimProp?}`. @returns {Promise<SharedList>} */
+    async list(name, opts) { return new SharedList(await this.table(name), opts); }
+
+    /** The viewer's own agents; empty until the viewer allows the page.
+     *  @returns {Promise<Array<{id: string, name: string, kind: 'agent', inRoom: boolean}>>} */
+    async agents() {
+      if (!this.capabilities.agents) return [];
+      return ((await this.art.agent.list()) || []).map((a) => ({ id: a.id, name: a.name, kind: 'agent', inRoom: !!a.userId }));
+    }
+
+    /** Asks one of the viewer's own agents, after the viewer confirms `text`. `opts`: `{key, actionId?, row?}`;
+     *  the same key never asks twice. @returns {Promise<{eventId: string}>} a dispatch receipt, nothing more */
+    async ask(agentId, text, opts) {
+      const o = opts || {};
+      if (!this.capabilities.agents) throw new CommonsError('UNSUPPORTED', 'This bridge cannot ask an agent.');
+      if (!KEY_RE.test(o.key || '')) throw bad('ask needs a key of letters, digits, ".", "_" or "-" (1 to 64).');
+      if (o.actionId !== undefined && !ACTION_RE.test(o.actionId)) throw bad('actionId is letters, digits, ".", "_" or "-" (1 to 64).');
+      const request = { agentId, text, key: o.key };
+      if (o.actionId !== undefined) request.actionId = o.actionId;
+      if (o.row) request.row = o.row;
+      const r = await this.art.agent.sendTask(request);
+      if (!r || !r.ok) throw refusal(r && r.reason);
+      return { eventId: r.eventId };
+    }
+
+    /** Posts in the room as the viewer, after they confirm the exact text; `mention(id)` calls a player.
+     *  The page gets no answer of its own. @returns {Promise<{eventId: string}>} */
+    async post(text, opts) {
+      if (!this.capabilities.post) throw new CommonsError('UNSUPPORTED', 'This bridge cannot post in the room.');
+      const message = { text };
+      if (opts && opts.key !== undefined) message.key = opts.key;
+      const r = await this.art.room.post(message);
+      if (!r || !r.posted) throw refusal(r && r.reason);
+      return { eventId: r.eventId };
+    }
+
+    /** @param {string} playerId an id from `players()` @returns {string} mention text for `post` */
+    mention(playerId) { return '<@' + playerId + '>'; }
+
+    /** Stops every watch this room handle started. */
+    close() {
+      for (const p of this.tables.values()) p.then((t) => { if (typeof t.stop === 'function') t.stop(); t.listeners.clear(); }, () => {});
+      this.tables.clear();
+    }
+  }
+
+  /** Connects to the room this page is open in; rejects with code NO_BRIDGE outside a room.
+   *  `opts` are test hooks and retry timing: `{artifact?, now?, sleep?, retryEvery?, retryFor?}`. */
+  async function connect(opts) {
+    const o = opts || {};
+    const host = typeof window !== 'undefined' ? window : globalThis;
+    const art = o.artifact || host.artifact;
+    if (!art || !art.db) throw new CommonsError('NO_BRIDGE', 'Open this page in a room to use it.');
+    await art.ready;
+    return new Room(art, o);
+  }
+
+  return { connect, CommonsError, LIMITS, version: '0.1.0' };
+});
