@@ -202,5 +202,58 @@ class NoneOnThePrimary(Base):
         self.assertTrue(ask.card_has_lane(W, '', self.ws))
 
 
+def _load_ask():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        'pq_ask', ROOT / 'skills/pending-questions/scripts/pending_questions_ask.py')
+    sys.path.insert(0, str(ROOT / 'skills/pending-questions/scripts'))
+    ask = sys.modules['pq_ask'] = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ask)
+    return ask
+
+
+class OneActiveOneDisabled(Base):
+    """The worker's identity on beta is disabled, so alpha's lane is its only serving one."""
+
+    def setUp(self):
+        super().setUp()
+        path = C.record_path(self.ws)
+        data = json.loads(path.read_text())
+        for row in data['connections']:
+            if row['instance'] == self.lanes['beta.example']:
+                row['disabled'] = True
+        path.write_text(json.dumps(data))
+        self.alpha, self.beta = self.lanes['alpha.example'], self.lanes['beta.example']
+
+    def test_a_card_bound_for_the_disabled_server_is_neither_staged_nor_claimed(self):
+        self.assertIsNone(L.card_lane(W, '!dm:beta.example', self.ws))
+        self.assertFalse(L.is_worker_card_lane(self.alpha, W, self.ws, '!dm:beta.example'))
+        self.assertFalse(L.is_worker_card_lane(self.beta, W, self.ws, '!dm:beta.example'))
+        self.assertFalse(_load_ask().card_has_lane(W, '!dm:beta.example', self.ws))
+
+    def test_a_card_bound_for_the_active_server_is_claimed_once_by_its_lane(self):
+        for room in ('!dm:alpha.example', ''):
+            with self.subTest(room=room):
+                self.assertEqual([i for i in (self.alpha, self.beta)
+                                  if L.is_worker_card_lane(i, W, self.ws, room)], [self.alpha])
+                self.assertTrue(_load_ask().card_has_lane(W, room, self.ws))
+
+
+class NoServingLane(Base):
+    def test_no_lane_stages_or_claims_any_card(self):
+        path = C.record_path(self.ws)
+        data = json.loads(path.read_text())
+        for row in data['connections']:
+            if row.get('worker'):
+                row['disabled'] = True
+        path.write_text(json.dumps(data))
+        ask = _load_ask()
+        for room in ('!dm:alpha.example', '!dm:beta.example', ''):
+            with self.subTest(room=room):
+                self.assertIsNone(L.card_lane(W, room, self.ws))
+                self.assertFalse(any(L.is_worker_card_lane(i, W, self.ws, room) for i in self.lanes.values()))
+                self.assertFalse(ask.card_has_lane(W, room, self.ws))
+
+
 if __name__ == '__main__':
     unittest.main()

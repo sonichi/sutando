@@ -254,30 +254,23 @@ def is_worker_home_lane(instance: str, worker: str, workspace=None) -> bool:
 
 def card_lane(worker: str, room_id: str = "", workspace=None):
     """The one identity row whose lane posts `worker`'s decision card bound for `room_id`, or None when no
-    serving lane can reach it: its only serving lane; with several, the one on the room's server, else (the
-    owner's DM, no room named) the one on the primary's server, else the lowest instance."""
+    serving lane can reach it: a room's server is resolved first, so only the serving identity there posts
+    it, however many lanes serve; the owner's DM (no room named) goes to the only serving lane, else the one
+    on the primary's server, else the lowest instance."""
     from connections import server_of_room, worker_identities, _row_servers, _serving
     serving = [r for r in worker_identities(worker, workspace) if _serving(r)]
-    if len(serving) <= 1:
-        return serving[0] if serving else None
     server = server_of_room(room_id or "")
     if server:
         return next((r for r in serving if server in _row_servers(r)), None)
+    if len(serving) <= 1:
+        return serving[0] if serving else None
     return primary_identity(worker, workspace) or min(serving, key=lambda r: str(r["instance"]))
-
-
-def card_lane_unchecked(worker: str, workspace=None) -> bool:
-    """At most one serving lane: whichever runs posts the card, as before several servers."""
-    from connections import worker_identities, _serving
-    return len([r for r in worker_identities(worker, workspace) if _serving(r)]) <= 1
 
 
 def is_worker_card_lane(instance: str, worker: str, workspace=None, room_id: str = "") -> bool:
     """Whether lane `instance` posts `worker`'s decision card bound for `room_id` (`card_lane`): exactly one
-    lane does, so no card is posted twice or by none while one can reach its room."""
+    lane does, and none when no serving identity reaches its destination."""
     from connections import alias_instances
-    if card_lane_unchecked(worker, workspace):
-        return True
     row = card_lane(worker, room_id, workspace)
     return row is not None and instance in [str(row["instance"])] + alias_instances(row)
 

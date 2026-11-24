@@ -465,8 +465,8 @@ def card_asker(ws: Path, ask_id: str, dest: Destination, host: str) -> tuple:
 
 def card_has_lane(worker: str, room: str, ws: Path) -> bool:
     """Whether one of `worker`'s serving lanes posts its card bound for `room` (`worker_lane.card_lane`)."""
-    from worker_lane import card_lane, card_lane_unchecked  # noqa: PLC0415
-    return card_lane_unchecked(worker, ws) or card_lane(worker, room, ws) is not None
+    from worker_lane import card_lane  # noqa: PLC0415
+    return card_lane(worker, room, ws) is not None
 
 
 def build_card(ask_id: str, question: str, context: Optional[str], host: str,

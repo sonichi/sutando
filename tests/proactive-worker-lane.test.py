@@ -177,8 +177,15 @@ class TheGatewayHost(unittest.TestCase):
         cases = [("", True, {workers_card: False, cores_card: True, others_card: False}),
                  ("", False, {workers_card: False, cores_card: False, others_card: False}),
                  (W, False, {workers_card: True, cores_card: False, others_card: False})]
-        saved = rgb._LANE_WORKER
-        self.addCleanup(setattr, rgb, "_LANE_WORKER", saved)
+        import connections as C
+        inst = C.worker_instance_for("alpha.example", W)
+        C.record_path(self.tmp).write_text(json.dumps({"schema_version": C.SCHEMA_VERSION, "connections": [
+            dict(server="alpha.example", gateway_url="https://x", added_by="owner", added_at="2026-11-01T00:00:00Z",
+                 verified=True, server_source="identity", primary=False, instance=inst,
+                 token_ref=C.token_ref_for(inst), worker=W, agent_mxid="@worker:alpha.example")]}))
+        saved = (rgb._LANE_WORKER, rgb.GATEWAY_INSTANCE)
+        self.addCleanup(lambda: (setattr(rgb, "_LANE_WORKER", saved[0]), setattr(rgb, "GATEWAY_INSTANCE", saved[1])))
+        rgb.GATEWAY_INSTANCE = inst
         for lane, primary, want in cases:
             rgb._LANE_WORKER = lane
             with mock.patch.object(rgb, "owns_unaddressed", return_value=primary):
@@ -212,6 +219,32 @@ class TheGatewayHost(unittest.TestCase):
                 claims[server] = (rgb.CARD_CLAIM(to_beta), rgb.CARD_CLAIM(stranded), rgb.CARD_CLAIM(stranded))
         self.assertEqual(claims, {"alpha.example": (False, False, False), "beta.example": (True, False, False)})
         told = [line for line in lines if "c2" in line]
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("undeliverable", told[0])
+
+    def test_the_only_active_lane_does_not_claim_a_card_for_its_disabled_siblings_server(self):
+        import connections as C
+        rgb = self.rgb
+        base = dict(gateway_url="https://x", added_by="owner", added_at="2026-11-01T00:00:00Z", verified=True,
+                    server_source="identity", primary=False)
+        rows = [dict(base, server="alpha.example", instance="alpha", token_ref=C.token_ref_for("alpha"),
+                     primary=True, agent_mxid="@core:alpha.example")]
+        lanes = {}
+        for server in ("alpha.example", "beta.example"):
+            lanes[server] = inst = C.worker_instance_for(server, W)
+            rows.append(dict(base, server=server, instance=inst, token_ref=C.token_ref_for(inst), worker=W,
+                             agent_mxid="@worker:" + server, disabled=server.startswith("beta")))
+        C.record_path(self.tmp).write_text(json.dumps({"schema_version": C.SCHEMA_VERSION, "connections": rows}))
+        lines = []
+        saved = (rgb._LANE_WORKER, rgb.GATEWAY_INSTANCE, rgb._log)
+        self.addCleanup(lambda: (setattr(rgb, "_LANE_WORKER", saved[0]), setattr(rgb, "GATEWAY_INSTANCE", saved[1]),
+                                 setattr(rgb, "_log", saved[2])))
+        rgb._LANE_WORKER, rgb._log, rgb.GATEWAY_INSTANCE = W, lines.append, lanes["alpha.example"]
+        to_beta = mock.Mock(subject={"by_worker": W}, room="!dm:beta.example", id="c3")
+        to_alpha = mock.Mock(subject={"by_worker": W}, room="!dm:alpha.example", id="c4")
+        with mock.patch.object(rgb, "owns_unaddressed", return_value=False):
+            self.assertEqual((rgb.CARD_CLAIM(to_beta), rgb.CARD_CLAIM(to_alpha)), (False, True))
+        told = [line for line in lines if "c3" in line]
         self.assertEqual(len(told), 1, told)
         self.assertIn("undeliverable", told[0])
 
