@@ -45,7 +45,10 @@ def percentile(values: Iterable[float], quantile: float) -> Optional[float]:
 
 
 def load_suite(path: Path) -> Dict[str, Any]:
-    data = json.loads(path.read_text())
+    try:
+        data = json.loads(path.read_text())
+    except RecursionError as exc:
+        raise ValueError("suite JSON exceeds supported nesting") from exc
     validate_suite(data)
     return data
 
@@ -78,11 +81,11 @@ def validate_suite(data: Any) -> None:
 def _validate_expectation(expected: Any, prefix: str) -> None:
     if not isinstance(expected, dict):
         raise ValueError(f"{prefix}: expect must be a JSON object")
-    unknown = set(expected) - {"equals", "contains", "regex", "max_chars"}
+    unknown = set(expected) - {"equals", "contains", "regex", "max_chars", "json_equals"}
     if unknown:
         names = ", ".join(sorted(str(name) for name in unknown))
         raise ValueError(f"{prefix}: unknown expect assertion(s): {names}; "
-                         "use equals, contains, regex or max_chars")
+                         "use equals, contains, regex, max_chars or json_equals")
     for field in ("equals", "regex"):
         if field in expected and not isinstance(expected[field], str):
             raise ValueError(f"{prefix}: expect.{field} must be a string")
@@ -104,6 +107,64 @@ def _validate_expectation(expected: Any, prefix: str) -> None:
             re.compile(expected["regex"], re.IGNORECASE | re.MULTILINE)
         except (re.error, OverflowError, RecursionError) as exc:
             raise ValueError(f"{prefix}: invalid expect.regex: {exc}") from exc
+    if "json_equals" in expected:
+        try:
+            _validate_json_value(expected["json_equals"], set())
+        except (ValueError, RecursionError) as exc:
+            raise ValueError(f"{prefix}: invalid expect.json_equals: {exc}") from exc
+
+
+def _validate_json_value(value: Any, active: set) -> None:
+    kind = type(value)
+    if value is None or kind in (str, bool, int):
+        return
+    if kind is float:
+        if not math.isfinite(value):
+            raise ValueError("numbers must be finite")
+        return
+    if kind not in (list, dict):
+        raise ValueError("values must use plain JSON types")
+    if kind is dict and any(type(key) is not str for key in value):
+        raise ValueError("object keys must be strings")
+    identity = id(value)
+    if identity in active:
+        raise ValueError("cyclic values are not JSON")
+    active.add(identity)
+    try:
+        for item in value.values() if kind is dict else value:
+            _validate_json_value(item, active)
+    finally:
+        active.remove(identity)
+
+
+def _unique_json_object(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    value: Dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON object key")
+        value[key] = item
+    return value
+
+
+def _finite_json_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("JSON numbers must be finite")
+    return number
+
+
+def _json_values_equal(actual: Any, wanted: Any) -> bool:
+    if type(actual) in (int, float) and type(wanted) in (int, float):
+        return actual == wanted
+    if type(actual) is not type(wanted):
+        return False
+    if isinstance(actual, list):
+        return len(actual) == len(wanted) and all(
+            _json_values_equal(item, other) for item, other in zip(actual, wanted))
+    if isinstance(actual, dict):
+        return actual.keys() == wanted.keys() and all(
+            _json_values_equal(item, wanted[key]) for key, item in actual.items())
+    return actual == wanted
 
 
 def score_response(response: str, expected: Dict[str, Any]) -> Tuple[bool, List[Dict[str, Any]]]:
@@ -126,6 +187,15 @@ def score_response(response: str, expected: Dict[str, Any]) -> Tuple[bool, List[
     if "max_chars" in expected:
         maximum = int(expected["max_chars"])
         add("max_chars", maximum, len(response.strip()) <= maximum)
+    if "json_equals" in expected:
+        wanted = expected["json_equals"]
+        try:
+            actual = json.loads(response, object_pairs_hook=_unique_json_object,
+                                parse_float=_finite_json_float, parse_constant=_finite_json_float)
+            passed = _json_values_equal(actual, wanted)
+        except (ValueError, OverflowError, RecursionError):
+            passed = False
+        add("json_equals", wanted, passed)
     if not checks:
         add("nonempty", True, bool(response.strip()))
     return all(check["passed"] for check in checks), checks

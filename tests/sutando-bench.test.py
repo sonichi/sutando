@@ -122,6 +122,230 @@ class BenchTests(unittest.TestCase):
         self.assertTrue(bench.score_response("anything", {})[0])
         self.assertFalse(bench.score_response("", {})[0])
 
+    def test_json_equals_matches_structural_values(self):
+        for response, wanted in [
+            (" null \n", None), ("true", True), ("false", False),
+            ("0", 0), ("-0.0", 0), ("1.0", 1), ("1", 1.0),
+            ("1e2", 100), ("1e308", 1e308), ("5e-324", 5e-324),
+            ('"Paris"', "Paris"), ('""', ""), ('"\\u00e9"', "é"),
+            ("[]", []), ("{}", {}),
+            (' {"b": [true, null, 2.0], "a": {"x": "ok"}}\n',
+             {"a": {"x": "ok"}, "b": [True, None, 2]}),
+        ]:
+            with self.subTest(response=response, wanted=wanted):
+                passed, checks = bench.score_response(response, {"json_equals": wanted})
+                self.assertTrue(passed)
+                self.assertEqual(checks, [{"kind": "json_equals", "expected": wanted,
+                                           "passed": True}])
+
+    def test_json_equals_preserves_types_and_array_order(self):
+        for response, wanted in [
+            ("true", 1), ("1", True), ("false", 0), ("0.0", False),
+            ('"1"', 1), ('"True"', True), ('"Paris"', "paris"),
+            ("null", "null"), ("[]", {}), ("{}", []),
+            ("[1, 2]", [2, 1]), ("[1]", [1, 2]),
+            ('{"x": 1}', {"x": 1, "y": 2}),
+            ('{"x": [true]}', {"x": [1]}),
+            ('{"x": [{"y": 0}]}', {"x": [{"y": False}]}),
+            ("9007199254740993", 9007199254740992.0),
+        ]:
+            with self.subTest(response=response, wanted=wanted):
+                passed, checks = bench.score_response(response, {"json_equals": wanted})
+                self.assertFalse(passed)
+                self.assertEqual(checks, [{"kind": "json_equals", "expected": wanted,
+                                           "passed": False}])
+
+    def test_json_equals_rejects_non_json_responses(self):
+        for response in [
+            "", " \n\t", "{", "[1,]", '{"x": 1,}', "{'x': 1}",
+            '"line\nbreak"', "01", "+1", "undefined", "NULL",
+            "null trailing prose", "null\nnull", "Here is JSON: null",
+            "```json\nnull\n```", "```\nnull\n```", "\ufeffnull",
+            "NaN", "Infinity", "-Infinity", "1e309", "-1e309",
+            '[1, {"x": NaN}]', '{"x": [1e309]}',
+        ]:
+            with self.subTest(response=response):
+                passed, checks = bench.score_response(response, {"json_equals": None})
+                self.assertFalse(passed)
+                self.assertEqual(checks, [{"kind": "json_equals", "expected": None,
+                                           "passed": False}])
+        for response, wanted in [
+            ('{"x": 1, "x": 1}', {"x": 1}),
+            ('{"x": 1, "\\u0078": 2}', {"x": 2}),
+            ('{"outer": [{"x": 1, "x": 2}]}', {"outer": [{"x": 2}]}),
+        ]:
+            with self.subTest(response=response):
+                self.assertFalse(bench.score_response(response, {"json_equals": wanted})[0])
+        for response in ["NaN", "Infinity", "-Infinity", "1e309", "-1e309",
+                         '[1, {"x": NaN}]', '{"x": [1e309]}']:
+            with self.subTest(response=response), \
+                    mock.patch.object(bench, "_json_values_equal", return_value=True) as compare:
+                self.assertFalse(bench.score_response(response, {"json_equals": None})[0])
+                compare.assert_not_called()
+
+    def test_json_equals_handles_parser_value_and_recursion_failures(self):
+        depth = sys.getrecursionlimit() * 10
+        for response in ["[" * depth + "0" + "]" * depth, "1" * 5000]:
+            with self.subTest(response_length=len(response)):
+                self.assertFalse(bench.score_response(response, {"json_equals": None})[0])
+        for error in [ValueError("unsupported value"), OverflowError("overflow"),
+                      RecursionError("nesting")]:
+            with self.subTest(error=error), mock.patch.object(bench.json, "loads", side_effect=error):
+                self.assertFalse(bench.score_response("null", {"json_equals": None})[0])
+
+    def test_json_equals_combines_with_existing_assertions(self):
+        response = ' {"answer": "Paris"} \n'
+        expected = {"equals": response.strip(), "contains": ["ANSWER", "paris"],
+                    "regex": '"answer":.*"Paris"', "max_chars": len(response.strip()),
+                    "json_equals": {"answer": "Paris"}}
+        passed, checks = bench.score_response(response, expected)
+        self.assertTrue(passed)
+        self.assertEqual([check["kind"] for check in checks],
+                         ["equals", "contains", "contains", "regex", "max_chars", "json_equals"])
+        for field, value in [("equals", "wrong"), ("contains", "wrong"),
+                             ("regex", "wrong"), ("max_chars", 0),
+                             ("json_equals", {"answer": "Rome"})]:
+            with self.subTest(field=field):
+                passed, checks = bench.score_response(response, dict(expected, **{field: value}))
+                self.assertFalse(passed)
+                self.assertEqual([check["kind"] for check in checks if not check["passed"]], [field])
+
+    def test_validate_json_equals_accepts_plain_json_values(self):
+        shared = {"nested": [None, True, False, 1, 1.5, "text"]}
+        for wanted in [None, True, False, 0, 10 ** 100, 1.5, "", [], {},
+                       {"first": shared, "second": shared}]:
+            with self.subTest(wanted=wanted):
+                bench.validate_suite({"schema": 1, "name": "json", "cases": [
+                    {"id": "one", "prompt": "p", "expect": {"json_equals": wanted}}]})
+
+    def test_run_suite_rejects_invalid_json_equals_before_submission(self):
+        class CustomInt(int):
+            pass
+
+        class CustomList(list):
+            pass
+
+        for wanted in [float("nan"), float("inf"), float("-inf"),
+                       {"nested": [float("inf")]}, {1: "number key"},
+                       {"nested": {False: "boolean key"}}, (1, 2), {1, 2}, b"json",
+                       object(), CustomInt(1), CustomList([1])]:
+            with self.subTest(wanted=wanted), tempfile.TemporaryDirectory() as td:
+                ws = workspace(Path(td))
+                suite = {"schema": 1, "name": "json", "cases": [
+                    {"id": "first", "prompt": "p"},
+                    {"id": "second", "prompt": "p", "expect": {"json_equals": wanted}}]}
+                with mock.patch.object(bench, "_submit") as submit:
+                    with self.assertRaisesRegex(ValueError, "case 2.*json_equals"):
+                        bench.run_suite(ws, suite, 1, 0.01, 0.001, "json")
+                submit.assert_not_called()
+                self.assertEqual(list((ws / "tasks").iterdir()), [])
+
+    def test_json_equals_validation_reports_cycles_and_excessive_nesting(self):
+        cyclic_list = []
+        cyclic_list.append(cyclic_list)
+        cyclic_dict = {}
+        cyclic_dict["self"] = cyclic_dict
+        nested = None
+        for _ in range(sys.getrecursionlimit() + 100):
+            nested = [nested]
+        for wanted in [cyclic_list, cyclic_dict, nested]:
+            with tempfile.TemporaryDirectory() as td:
+                ws = workspace(Path(td))
+                suite = {"schema": 1, "name": "json", "cases": [
+                    {"id": "one", "prompt": "p", "expect": {"json_equals": wanted}}]}
+                with self.assertRaisesRegex(ValueError, "case 1.*json_equals"):
+                    bench.run_suite(ws, suite, 1, 0.01, 0.001, "json")
+                self.assertEqual(list((ws / "tasks").iterdir()), [])
+
+    def test_main_rejects_invalid_json_equals_before_probe_or_dispatch(self):
+        for wanted in ["NaN", "Infinity", "-Infinity", "1e309", '{"nested": [NaN]}']:
+            with self.subTest(wanted=wanted), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                ws = workspace(root / "ws")
+                suite = root / "suite.json"
+                body = {"schema": 1, "name": "json", "cases": [
+                    {"id": "first", "prompt": "p"},
+                    {"id": "second", "prompt": "p", "expect": {"json_equals": "VALUE"}}]}
+                suite.write_text(json.dumps(body).replace('"VALUE"', wanted))
+                stderr = io.StringIO()
+                with mock.patch.object(bench, "probe_runtime") as probe, \
+                        mock.patch.object(bench, "_submit") as submit, \
+                        contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                    rc = bench.main(["run", "--workspace", str(ws), "--suite", str(suite),
+                                     "--output", str(root / "output")])
+                self.assertEqual(rc, 2)
+                self.assertIn("case 2", stderr.getvalue())
+                self.assertIn("json_equals", stderr.getvalue())
+                self.assertIn("fix the suite", stderr.getvalue())
+                probe.assert_not_called()
+                submit.assert_not_called()
+                self.assertEqual(list((ws / "tasks").iterdir()), [])
+                self.assertFalse((root / "output").exists())
+
+    def test_main_saves_json_equals_checks_from_disposable_responder(self):
+        cases = [
+            {"id": "object", "prompt": "object response",
+             "expect": {"json_equals": {"a": 1, "b": [True, None]}}},
+            {"id": "null", "prompt": "null response", "expect": {"json_equals": None}},
+            {"id": "boolean", "prompt": "boolean response", "expect": {"json_equals": True}},
+            {"id": "prose", "prompt": "prose response", "expect": {"json_equals": {}}},
+        ]
+        responses = {"object response": ' {"b": [true, null], "a": 1.0}\n',
+                     "null response": "null", "boolean response": "1",
+                     "prose response": "{} done"}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = workspace(root / "ws")
+            suite = root / "suite.json"
+            suite.write_text(json.dumps({"schema": 1, "name": "json", "cases": cases}))
+            output = root / "output"
+            with Responder(ws, responses), \
+                    mock.patch.object(bench, "probe_runtime", return_value=runtime_snapshot(ws)) as probe, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rc = bench.main(["run", "--workspace", str(ws), "--suite", str(suite),
+                                 "--output", str(output), "--timeout", "1", "--poll", "0.001"])
+            self.assertEqual(rc, 1)
+            self.assertEqual(probe.call_count, 2)
+            run = bench._load_run(output)
+            self.assertEqual(run["schema"], 1)
+            self.assertEqual(run["kind"], "sutando-benchmark-run")
+            self.assertEqual(run["summary"]["attempts"], 4)
+            self.assertEqual(run["summary"]["passed"], 2)
+            self.assertEqual(run["summary"]["no_response"], 0)
+            for row, case, passed in zip(run["cases"], cases, [True, True, False, False]):
+                self.assertEqual(row["status"], "completed")
+                self.assertEqual(row["passed"], passed)
+                self.assertEqual(row["response"], responses[case["prompt"]])
+                self.assertEqual(row["checks"], [{"kind": "json_equals",
+                                                 "expected": case["expect"]["json_equals"],
+                                                 "passed": passed}])
+            self.assertIn("2/4", (output / "report.md").read_text())
+
+    def test_main_rejects_excessively_nested_json_equals_before_probe_or_dispatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = workspace(root / "ws")
+            suite = root / "suite.json"
+            body = {"schema": 1, "name": "json", "cases": [
+                {"id": "one", "prompt": "p", "expect": {"json_equals": "VALUE"}}]}
+            depth = sys.getrecursionlimit() * 10
+            nested = "[" * depth + "null" + "]" * depth
+            suite.write_text(json.dumps(body).replace('"VALUE"', nested))
+            stderr = io.StringIO()
+            with mock.patch.object(bench, "probe_runtime") as probe, \
+                    mock.patch.object(bench, "_submit") as submit, \
+                    contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                rc = bench.main(["run", "--workspace", str(ws), "--suite", str(suite),
+                                 "--output", str(root / "output")])
+            self.assertEqual(rc, 2)
+            self.assertIn("invalid suite", stderr.getvalue())
+            self.assertIn("nesting", stderr.getvalue())
+            self.assertIn("fix the suite", stderr.getvalue())
+            probe.assert_not_called()
+            submit.assert_not_called()
+            self.assertEqual(list((ws / "tasks").iterdir()), [])
+            self.assertFalse((root / "output").exists())
+
     def test_load_suite_rejects_malformed_case_shapes(self):
         valid = {"schema": 1, "name": "validation", "cases": [{"id": "one", "prompt": "p"}]}
         invalid = [
