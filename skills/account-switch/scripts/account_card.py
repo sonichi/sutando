@@ -276,7 +276,9 @@ def current(rt: str, *, run=subprocess.run, codex_read=None) -> dict:
         try:
             home = codex_home()
         except codex_account.NoHome:
-            return {"runtime": rt, "signed_in": None, "shown": "", "key": ""}
+            home = _seat_home()
+            if home is None:
+                return {"runtime": rt, "signed_in": None, "shown": "", "key": ""}
         ident = identity(_live_auth(home) or "")
         if codex_read is None:
             import codex_account
@@ -295,13 +297,25 @@ def current(rt: str, *, run=subprocess.run, codex_read=None) -> dict:
     return {"runtime": rt, "signed_in": st["signed_in"], "shown": shown if st["signed_in"] else "", "key": ""}
 
 
+def _seat_home() -> Optional[Path]:
+    """The Codex home the running seat was started with (its own CODEX_HOME), when the launcher's
+    resolution is refused from here: an absolute directory holding a sign-in file, else None. Read only."""
+    raw = os.environ.get("CODEX_HOME", "").strip()
+    if not raw or not os.path.isabs(raw):
+        return None
+    path = Path(raw)
+    return path if (path / "auth.json").is_file() else None
+
+
 def in_use_words(cur: dict) -> str:
+    """The sentence naming the core's account; empty when it cannot be read, so the card's own
+    account controls (which the desktop fills) are never contradicted."""
     cli = "Codex" if cur["runtime"] == "codex" else "Claude Code"
     if cur["signed_in"] is None:
-        return f"I could not read which account the core ({cli}) is signed in to."
+        return ""
     if not cur["signed_in"]:
         return f"The core ({cli}) is not signed in."
-    return f"The core ({cli}) is signed in as {ac.md_escape(cur['shown'])}."
+    return f"You're on {ac.md_escape(cur['shown'])}."
 
 
 # ── the card ──────────────────────────────────────────────────────────────────────────────────────
@@ -324,12 +338,13 @@ def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "")
                 " No other account is saved on this computer yet.")
     else:
         more = " To use another Anthropic account, add it in Settings."
-    note = f"{NO_CODE} Adding an account happens in Settings, where the app takes the code."
+    note = NO_CODE
     lead = ac.md_escape(lead)[:1000]
-    words = " ".join(w for w in (lead, "" if signed_out else in_use_words(cur)) if w)
+    using = "" if signed_out else in_use_words(cur)
+    words = " ".join(w for w in (lead, using, more.strip()) if w)
     return ac.build(CARD_ID, "info", title="Core account", avatar_=ac.avatar(initial="A"),
-                    text=words + more, buttons=buttons, note=note, note_tone="dim",
-                    body=f"{words} Reply \"switch account\" for options.")
+                    text=words, buttons=buttons, note=note, note_tone="dim",
+                    body=" ".join(w for w in (lead, using, 'Reply "switch account" for options.') if w))
 
 
 def notice_card(state: str, status: str, words: str) -> tuple:

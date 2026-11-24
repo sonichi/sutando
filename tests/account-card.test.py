@@ -241,7 +241,8 @@ class CodexCard(Base):
         self.assertEqual(self.fake.calls[0][3], DM)
         card = self.fake.cards()[0]
         self.assertIsNone(ac.problem(card))
-        self.assertTrue(card["text"].startswith(lead + " The core (Codex) is signed in as a…@example.com"))
+        self.assertTrue(card["text"].startswith(lead + " You're on a…@example.com"))
+        self.assertNotIn("Settings", card["note"])
         self.assertTrue(self.fake.calls[0][1]["body"].startswith(lead))
         self.assertEqual(card["buttons"][-1]["label"], "Add another account")
 
@@ -296,7 +297,7 @@ class ClaudeCard(Base):
         rc, out = self.post()
         self.assertEqual(rc, 0)
         card = self.fake.cards()[0]
-        self.assertIn("Claude Code", card["text"])
+        self.assertIn("You're on s…@example.com (max)", card["text"])
         self.assertIn("s…@example.com (max)", card["text"])
         self.assertEqual([b["label"] for b in card["buttons"]], ["Add another account"])
         self.assertFalse(self.store.exists())
@@ -307,7 +308,8 @@ class ClaudeCard(Base):
         self.assertIn("is not signed in", self.fake.cards()[0]["text"])
         self.claude_json = "nonsense"
         self.post()
-        self.assertIn("could not read", self.fake.cards()[1]["text"])
+        self.assertNotIn("could not read", self.fake.cards()[1]["text"])
+        self.assertNotIn("signed in", self.fake.cards()[1]["text"])
 
     def test_a_use_tap_on_a_claude_core_starts_nothing(self):
         self.post()
@@ -602,10 +604,23 @@ class Edges(Base):
 
     def test_current_without_a_usable_home_or_with_an_api_key(self):
         import codex_account
-        with mock.patch.object(acc, "codex_home", side_effect=codex_account.NoHome("refused")):
+        with mock.patch.object(acc, "codex_home", side_effect=codex_account.NoHome("refused")), \
+                mock.patch.dict(os.environ, {"CODEX_HOME": ""}):
             self.assertEqual(acc.current("codex")["signed_in"], None)
             rc, out = self.post()
-            self.assertIn("could not read", out.get("why", "") + json.dumps(self.fake.calls))
+            sent = json.dumps(self.fake.calls)
+            self.assertNotIn("could not read", sent)
+            self.assertNotIn("signed in as", sent)
+        # Refused from here, but the seat's own CODEX_HOME holds the sign-in: that is the account named.
+        (self.home / "auth.json").write_text("{}")
+        with mock.patch.object(acc, "codex_home", side_effect=codex_account.NoHome("refused")), \
+                mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home)}), \
+                mock.patch.object(codex_account, "read", return_value={"kind": "chatgpt", "email": "a@example.com"}):
+            cur = acc.current("codex")
+            self.assertEqual((cur["signed_in"], cur["shown"]), (True, "a…@example.com"))
+        with mock.patch.object(acc, "codex_home", side_effect=codex_account.NoHome("refused")), \
+                mock.patch.dict(os.environ, {"CODEX_HOME": "relative/home"}):
+            self.assertIsNone(acc.current("codex")["signed_in"])
         self.signed_in(json.dumps({"OPENAI_API_KEY": "sk-SECRET"}))
         with mock.patch.object(codex_account, "read", return_value={"kind": "apiKey"}):
             self.assertEqual(acc.current("codex")["shown"], "an OpenAI API key")
