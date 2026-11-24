@@ -20,8 +20,8 @@ core's CLI takes /model only after the current turn ends. Each tap is one attemp
 "switching" card is posted first, then the switch is started, so its outcome can only come after.
 The detached line always ends in `settle` with the switch's exit code and the attempt's id. `settle`
 saves the outcome in `<workspace>/state/model-card-outcome.json`, then posts it in the same DM:
-"Switched. I'm now using X.", a pending "Saved, not switched yet" for a Codex seat's pick (exit 12),
-or "I could not switch to X. I'm still using Y. <reason>". A post that
+"Switched to X ✓", a pending "Saved, not switched yet" for a Codex seat's pick (exit 12),
+or "Couldn't switch to X: <reason>. I'm still using Y.". A post that
 fails is tried again a few times; an outcome still untold is posted by the next `post` or `reply`
 before its own work. An attempt's posts carry its id as their operation id, an outcome is told once,
 and no retry runs the switch again. `reply` records an attempt before its "switching" card, and an
@@ -290,7 +290,7 @@ def menu_card(model: Optional[str], picks: list) -> tuple:
                                    actions=[tap(level or "Use", c, t, sl) for c, t, sl, level in part]))
         menu["groups"] = [ac.group("Models", rows)]
     using = f"I'm using {name_of(model, picks)}."
-    return ac.build(CARD_ID, "info", title="Core model", avatar_=ac.avatar(initial="M"),
+    return ac.build(CARD_ID, "info", title="Model", avatar_=ac.avatar(initial="M"),
                     text=f"{using} Pick a model to switch to.",
                     note="A switch takes effect after the core finishes its current turn.", note_tone="dim",
                     body=f"{using} Reply with a model to switch.", **menu)
@@ -303,14 +303,14 @@ def switching_words(alias: str) -> str:
 
 def notice_card(state: str, status: str, words: str) -> tuple:
     """(body, card) with no buttons, under its own id: the "switching" answer or the outcome."""
-    return ac.build(NOTE_ID, state, title="Core model", avatar_=ac.avatar(initial="M"), status=status,
+    return ac.build(NOTE_ID, state, title="Model", avatar_=ac.avatar(initial="M"), status=status,
                     text=words, body=words)
 
 
 def outcome(ws: Path, alias: str, rc: int) -> tuple:
     """(state, words) for a switch to `alias` that exited `rc`."""
     if rc == 0:
-        return "done", f"Switched. I'm now using {name_of(alias)}."
+        return "done", f"Switched to {name_of(alias)} ✓"
     if rc == NEXT_START_RC:
         return "pending", (f"Saved; {name_of(alias)} applies at the next core start. No core is running "
                            "now, so nothing has switched yet.")
@@ -319,7 +319,13 @@ def outcome(ws: Path, alias: str, rc: int) -> tuple:
                            f"Codex has run it I'm still using {still_using(ws, alias)}. I'll tell you "
                            "here when it has switched, or why it could not.")
     reason = REASONS.get(rc, UNFINISHED)
-    return "error", f"I could not switch to {name_of(alias)}. I'm still using {still_using(ws, alias)}. {reason[:1].upper()}{reason[1:]}."
+    return "error", f"Couldn't switch to {name_of(alias)}: {refusal_reason(reason)}. I'm still using {still_using(ws, alias)}."
+
+
+def refusal_reason(reason: str) -> str:
+    """A reason as the one refusal pattern reads it: "Couldn't switch to X: <reason>."."""
+    reason = (reason or "").strip().rstrip(".")
+    return reason if reason[1:2].isupper() else reason[:1].lower() + reason[1:]  # "API key …" keeps its caps
 
 
 def _core(ws: Path) -> dict:
@@ -360,7 +366,7 @@ def _post(ws: Path, room: str, body: str, card: dict, operation_id: str, *, repl
 
 def card_words(words: str) -> str:
     """What an edited card says: the card is gone from the event, so the words name it."""
-    return f"Core model: {words}"
+    return f"Model: {words}"
 
 
 def _edit(ws: Path, room: str, event: str, words: str, operation_id: str, *, core=None, execute=None) -> dict:

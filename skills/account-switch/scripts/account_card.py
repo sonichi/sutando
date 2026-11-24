@@ -107,14 +107,16 @@ def _emit(payload: dict, code: int = 0) -> int:
 
 
 def masked(email: str) -> str:
-    """An address shortened to what tells two accounts apart: its first letter and its domain."""
-    name, at, domain = (email or "").partition("@")
-    return "%s…@%s" % (name[:1], domain) if name and at and domain else ""
+    """An address as the owner reads it in their own DM: in full (owner 2026-11-24: one way to show an
+    account everywhere, the full email, no plan); "" when it is not an address."""
+    name, at, domain = (email or "").strip().partition("@")
+    return f"{name}@{domain}" if name and at and domain and " " not in name + domain else ""
 
 
 def masked_label(label: str) -> str:
-    """A desktop store label ("me@example.com (plus)") with its address masked."""
-    return re.sub(r"[^\s()@]+@[^\s()@]+", lambda m: masked(m.group(0)) or m.group(0), label or "")
+    """A desktop store label ("me@example.com (plus)") as the owner reads it: the address alone, no plan."""
+    label = (label or "").strip()
+    return re.sub(r"\s*\([^()]*\)$", "", label) if "@" in label else label
 
 
 # ── the core and its sign-in ──────────────────────────────────────────────────────────────────────
@@ -316,7 +318,7 @@ def in_use_words(cur: dict) -> str:
         return ""
     if not cur["signed_in"]:
         return f"The core ({cli}) is not signed in."
-    return f"You're on {ac.md_escape(cur['shown'])}."
+    return f"I'm using {ac.md_escape(cur['shown'])}."
 
 
 # ── the card ──────────────────────────────────────────────────────────────────────────────────────
@@ -339,7 +341,7 @@ def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "",
     if signed_out:
         lead = lead or SIGNED_OUT
     if cur["runtime"] == "codex":
-        more = (" Pick a saved account to switch to; the core restarts on it." if others else
+        more = (" Pick an account to switch to; the core restarts on it." if others else
                 " No other account is saved on this computer yet.")
     else:
         more = ""
@@ -348,7 +350,7 @@ def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "",
     using = "" if signed_out else in_use_words(cur)
     words = " ".join(w for w in (lead, using, more.strip()) if w)
     words = words or "Pick an account below."
-    body, card = ac.build(CARD_ID, "info", title="Core account", avatar_=ac.avatar(initial="A"),
+    body, card = ac.build(CARD_ID, "info", title="Account", avatar_=ac.avatar(initial="A"),
                           text=words, buttons=buttons, note=note, note_tone="dim",
                           body=" ".join(w for w in (lead, using, 'Reply "switch account" for options.') if w))
     # The marker by which the desktop app, on the computer that runs the core, draws the core's own
@@ -357,7 +359,7 @@ def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "",
 
 
 def notice_card(state: str, status: str, words: str) -> tuple:
-    return ac.build(NOTE_ID, state, title="Core account", avatar_=ac.avatar(initial="A"), status=status,
+    return ac.build(NOTE_ID, state, title="Account", avatar_=ac.avatar(initial="A"), status=status,
                     text=words, body=words)
 
 
@@ -559,7 +561,7 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     cur = current("codex", run=run, codex_read=codex_read)
     label = masked_label(next((s["label"] for s in saved(store) if s["key"] == verb), "that account"))
     if cur["key"] == verb:
-        return _emit({"status": "say", "say": f"The core is already signed in as {label}. Nothing changed."})
+        return _emit({"status": "say", "say": f"Already using {label} — nothing to change."})
     t = now()
     attempt = f"{int(t)}-{secrets.token_hex(4)}"
     rec = {"attempt": attempt, "key": verb, "room": room, "ts": t}
@@ -672,18 +674,18 @@ def do_switch(ws: Path, key: str, *, restart=restart_core, ready=core_ready, liv
     try:
         home = codex_home()
     except codex_account.NoHome as e:
-        return "error", f"I could not switch: the core's Codex home is not usable ({e}). Nothing changed."
+        return "error", f"Couldn't switch: the core's Codex home is not usable ({e}). Nothing changed."
     want = _saved_auth(store, key) if store else None
     if want is None:
-        return "error", "I could not switch: that account is no longer saved here. Nothing changed."
+        return "error", "Couldn't switch: that account is no longer saved here. Nothing changed."
     label = masked_label(identity(want)[1])
     try:
         before = _previous_auth(home)
     except Unreadable as e:
-        return "error", (f"I could not switch to {label}: the core's current sign-in could not be read ({e}), "
+        return "error", (f"Couldn't switch to {label}: the core's current sign-in could not be read ({e}), "
                          "so I left it in place. Nothing changed.")
     if before is not None and identity(before) is None:
-        return "error", (f"I could not switch to {label}: the core's current sign-in is not one I can save to "
+        return "error", (f"Couldn't switch to {label}: the core's current sign-in is not one I can save to "
                          "switch back to (an API key or an unreadable file), so I left it in place. Nothing changed.")
     was = masked_label(identity(before)[1]) if before else "no account"
     try:
@@ -696,7 +698,7 @@ def do_switch(ws: Path, key: str, *, restart=restart_core, ready=core_ready, liv
             _restore(home, before)
         except OSError:
             pass
-        return "error", f"I could not switch to {label}. I'm still signed in as {was}. The sign-in could not be written ({type(e).__name__})."
+        return "error", f"Couldn't switch to {label}: the sign-in could not be written ({type(e).__name__}). I'm still signed in as {was}."
     started = clock()
     rc = restart()
     if rc in NOT_RESTARTED:
@@ -706,7 +708,7 @@ def do_switch(ws: Path, key: str, *, restart=restart_core, ready=core_ready, liv
             return "error", (f"The core did not restart ({RESTART_REASONS.get(rc, 'the restart failed')}), and the "
                              f"previous sign-in could not be put back: the core uses {label} from its next start.")
         reason = RESTART_REASONS.get(rc, "the restart failed")
-        return "error", f"I could not switch to {label}. I'm still signed in as {was}. {reason[:1].upper()}{reason[1:]}."
+        return "error", f"Couldn't switch to {label}: {reason}. I'm still signed in as {was}."
     if rc != 0:
         return "error", (f"The restart did not finish cleanly (exit {rc}), so I can't tell which account the core "
                          f"is on. Its saved sign-in is now {label}. Ask me for the account card to check.")
@@ -720,6 +722,7 @@ def do_switch(ws: Path, key: str, *, restart=restart_core, ready=core_ready, liv
     want_email = _email(want).lower()
     if now_ident and now_ident[0] == key and acct.get("kind") == "chatgpt" and \
             (not want_email or str(acct.get("email") or "").lower() == want_email):
+        # Not "Switched … ✓": only the saved sign-in is verified, never the running core's own account.
         return ("done" if beat else "info"), f"{asked} Saved sign-in verified: Codex confirms it is {label}. {unconfirmed}"
     if not acct:
         return "error", f"{asked} Codex did not confirm the saved sign-in. Ask me for the account card to check."

@@ -50,7 +50,7 @@ is under way is refused.
    did not stop the core (exit 3, 4, 5) it says the core is still on X.
 
 One card, updated in place: the "switching" answer edits the tapped card's own event
-(`room.message.edit`, so it then shows "Core runtime: Switching…" in place of the card), and the
+(`room.message.edit`, so it then shows "Runtime: Switching…" in place of the card), and the
 outcome edits that same event again (`switch --card <event>`). A tap adds no message. The "Sign in
 first" card is the one card still posted, since its sign-in controls cannot ride in an edit; the
 waiter then edits it (to "switching", to "stopped waiting", or, when the core is already on that

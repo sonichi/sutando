@@ -136,7 +136,7 @@ skills/model-switch/scripts/model_card.py reply`, run that with `--task-file <ta
 Each tap is one attempt with its own id (`attempt` in the output): the "switching" card is posted
 before the switch is started, so the outcome can only follow it. The detached line always ends in
 `model_card.py settle --room <DM> --model <model id> --attempt <id> --rc <the switch's exit code>`, which
-saves the outcome in `<workspace>/state/model-card-outcome.json` and then posts it in the same DM: "Switched. I'm now using X." on exit 0, a
+saves the outcome in `<workspace>/state/model-card-outcome.json` and then posts it in the same DM: "Switched to X ✓" on exit 0, a
 pending card ("Saved, not switched yet: I'll try X on my next task") on exit 12 (the seat's own notice
 follows once Codex has taken or refused it), else "I
 could not switch to X. I'm still using Y." and one short reason for the exit code (5 unsent text in the
@@ -150,7 +150,7 @@ buttons, while the "switching" answer and the outcome (another id) leave the men
 buttons stay on the owner's screen. Output of the detached line: `<workspace>/logs/model-card.log`.
 
 One card, updated in place: the "switching" answer is an edit of the tapped menu's own event
-(`room.message.edit`, so the event then shows "Core model: Switching the core to X…" in place of the
+(`room.message.edit`, so the event then shows "Model: Switching the core to X…" in place of the
 card), and the outcome edits that same event again. A tap adds no message. Only where the edit cannot
 be made (a tap with no card event, or the edit refused) are the "switching" answer and the outcome
 posted as cards of their own, as above.

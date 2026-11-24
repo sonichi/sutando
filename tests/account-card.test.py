@@ -207,10 +207,10 @@ class CodexCard(Base):
         card = self.fake.cards()[0]
         self.assertIsNone(ac.problem(card))
         self.assertEqual(card["id"], acc.CARD_ID)
-        self.assertIn("a…@example.com", card["text"])
-        self.assertNotIn("alice", json.dumps(card))
+        self.assertIn("alice@example.com", card["text"])
+        self.assertNotIn("(plus)", json.dumps(card))  # the full email, never a plan
         labels = [b["label"] for b in card["buttons"]]
-        self.assertEqual(labels, ["Use b…@work.io", "Use c…@example.org", "Add another account"])
+        self.assertEqual(labels, ["Use bob@work.io", "Use carol@example.org", "Add another account"])
         self.assertEqual([b["command"] for b in card["buttons"]],
                          [f"card:account:core:{key_of('acct-b')}", f"card:account:core:{key_of('acct-c')}",
                           "card:account:core:add"])
@@ -241,12 +241,12 @@ class CodexCard(Base):
         self.assertEqual(self.fake.calls[0][3], DM)
         card = self.fake.cards()[0]
         self.assertIsNone(ac.problem(card))
-        self.assertTrue(card["text"].startswith(lead + " You're on a…@example.com"))
+        self.assertTrue(card["text"].startswith(lead + " I'm using alice@example.com"))
         self.assertNotIn("Settings", card["note"])
         self.assertNotIn("Retry", [b["label"] for b in card["buttons"]])
         # The desktop draws the core's own account controls (saved accounts, Add account…) in it.
         self.assertEqual(card["account_controls"], {"runtime": "codex", "core": True})
-        acc_card = acc.menu_card({"runtime": "codex", "signed_in": True, "shown": "a…@example.com", "key": ""},
+        acc_card = acc.menu_card({"runtime": "codex", "signed_in": True, "shown": "alice@example.com", "key": ""},
                                  [], lead, retry=True)[1]
         retry = [b for b in acc_card["buttons"] if b["label"] == "Retry"]
         self.assertEqual(len(retry), 1)
@@ -278,9 +278,9 @@ class CodexCard(Base):
         rc, out = self.run_(["post", "--signed-out"])
         self.assertEqual((rc, out["status"]), (0, "posted"))
         card = self.fake.cards()[0]
-        self.assertTrue(card["text"].startswith(acc.SIGNED_OUT + " Pick a saved account"), card["text"])
+        self.assertTrue(card["text"].startswith(acc.SIGNED_OUT + " Pick an account"), card["text"])
         self.assertNotIn("signed in as", card["text"])
-        self.assertEqual([b["label"] for b in card["buttons"]], ["Use b…@work.io", "Add another account"])
+        self.assertEqual([b["label"] for b in card["buttons"]], ["Use bob@work.io", "Add another account"])
         self.assertEqual(self.fake.calls[0][3], DM)
 
     def test_a_lead_replaces_the_signed_out_line_and_owner_dm_is_the_default_dm(self):
@@ -299,7 +299,7 @@ class CodexCard(Base):
         rc, out = self.run_(["status"])
         self.assertEqual(rc, 0)
         self.assertEqual(out["runtime"], "codex")
-        self.assertEqual([s["label"] for s in out["saved"]], ["b…@work.io"])
+        self.assertEqual([s["label"] for s in out["saved"]], ["bob@work.io"])
 
 
 class ClaudeCard(Base):
@@ -309,8 +309,8 @@ class ClaudeCard(Base):
         rc, out = self.post()
         self.assertEqual(rc, 0)
         card = self.fake.cards()[0]
-        self.assertIn("You're on s…@example.com", card["text"])
-        self.assertIn("s…@example.com", card["text"])
+        self.assertIn("I'm using susan@example.com", card["text"])
+        self.assertNotIn("(max)", card["text"])  # the email alone, never the plan
         self.assertEqual([b["label"] for b in card["buttons"]], ["Add another account"])
         self.assertFalse(self.store.exists())
 
@@ -336,7 +336,7 @@ class Taps(Base):
         self.signed_in(A)
         self.keep(B)
         self.post()
-        self.use_b = "Use b…@work.io"
+        self.use_b = "Use bob@work.io"
 
     def test_add_points_to_settings_and_starts_nothing(self):
         rc, out = self.tap("Add another account")
@@ -354,7 +354,7 @@ class Taps(Base):
         self.assertEqual(argv[argv.index("--key") + 1], key_of("acct-b"))
         self.assertEqual(argv[argv.index("--room") + 1], DM)
         self.assertTrue(kw["start_new_session"])
-        self.assertIn("Switching the core to b…@work.io", out["say"])
+        self.assertIn("Switching the core to bob@work.io", out["say"])
         self.assertEqual(self.fake.cards()[-1]["state"], "pending")
         self.assertEqual(self.live(), A, "nothing is swapped before the detached step")
 
@@ -375,7 +375,7 @@ class Taps(Base):
         self.signed_in(B)
         rc, out = self.tap(self.use_b)
         self.assertEqual(out["status"], "say")
-        self.assertIn("already signed in", out["say"])
+        self.assertIn("Already using bob@work.io", out["say"])
         self.assertEqual(self.launch.calls, [])
 
     def test_a_second_switch_while_one_runs_is_refused(self):
@@ -391,7 +391,7 @@ class Switch(Base):
         self.signed_in(A)
         self.keep(B)
         self.post()
-        self.tap("Use b…@work.io")
+        self.tap("Use bob@work.io")
         argv = self.launch.calls[0][0]
         self.attempt = argv[argv.index("--attempt") + 1]
         self.key = key_of("acct-b")
@@ -406,9 +406,9 @@ class Switch(Base):
         self.assertEqual(self.live(), B)
         self.assertEqual(stat.S_IMODE((self.home / "auth.json").stat().st_mode), 0o600)
         self.assertTrue((self.store / f"{key_of('acct-a')}.json").exists(), "the previous account stays saved")
-        self.assertEqual(out["say"], "I asked the core to restart with b…@work.io's sign-in, and its heartbeat "
+        self.assertEqual(out["say"], "I asked the core to restart with bob@work.io's sign-in, and its heartbeat "
                                      "came back after the request. Saved sign-in verified: Codex confirms it is "
-                                     "b…@work.io. The running core's own account isn't confirmed.")
+                                     "bob@work.io. The running core's own account isn't confirmed.")
         self.assertEqual((out["verified"], out["restart"], out["core_identity"]),
                          ("saved-sign-in", "requested", "unconfirmed"))
         last = self.fake.cards()[-1]
@@ -420,14 +420,14 @@ class Switch(Base):
         rc, out = self.switch()
         self.assertEqual((rc, out["outcome"]), (1, "error"))
         self.assertEqual(self.live(), A)
-        self.assertIn("I'm still signed in as a…@example.com", out["say"])
+        self.assertIn("I'm still signed in as alice@example.com", out["say"])
         self.assertIn("put off", out["say"])
 
     def test_a_sign_in_overwritten_during_the_restart_is_reported(self):
         self.restart_writes = A
         rc, out = self.switch()
         self.assertEqual(out["outcome"], "error")
-        self.assertIn("But its saved sign-in is a…@example.com, not b…@work.io", out["say"])
+        self.assertIn("But its saved sign-in is alice@example.com, not bob@work.io", out["say"])
 
     def reset_attempt(self):
         rec = {"attempt": self.attempt, "key": self.key, "room": DM, "ts": 1e12}
@@ -500,7 +500,7 @@ class Switch(Base):
         self.live_answer = {"kind": "chatgpt", "email": "alice@example.com"}
         rc, out = self.switch()
         self.assertEqual(out["outcome"], "error")
-        self.assertIn("not b…@work.io", out["say"])
+        self.assertIn("not bob@work.io", out["say"])
 
     def assertNoRestartClaim(self, ready, answer):
         self.ready_ok, self.live_answer = ready, answer
@@ -629,7 +629,7 @@ class Edges(Base):
                 mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home)}), \
                 mock.patch.object(codex_account, "read", return_value={"kind": "chatgpt", "email": "a@example.com"}):
             cur = acc.current("codex")
-            self.assertEqual((cur["signed_in"], cur["shown"]), (True, "a…@example.com"))
+            self.assertEqual((cur["signed_in"], cur["shown"]), (True, "a@example.com"))
         with mock.patch.object(acc, "codex_home", side_effect=codex_account.NoHome("refused")), \
                 mock.patch.dict(os.environ, {"CODEX_HOME": "relative/home"}):
             self.assertIsNone(acc.current("codex")["signed_in"])
@@ -679,7 +679,7 @@ class Edges(Base):
         self.signed_in(A)
         self.keep(B)
         self.post()
-        use = "Use b…@work.io"
+        use = "Use bob@work.io"
         with mock.patch.object(acc, "admit", side_effect=OSError("ro")):
             rc, out = self.tap(use)
         self.assertEqual((rc, out["status"]), (1, "failed"))
@@ -801,7 +801,7 @@ class Edges(Base):
         self.signed_in(A)
         self.keep(B)
         self.post()
-        self.tap("Use b…@work.io")
+        self.tap("Use bob@work.io")
         argv = self.launch.calls[0][0]
         attempt = argv[argv.index("--attempt") + 1]
         posts = iter([{"status": "failed"}, {"status": "posted", "event_id": "$x"}])
@@ -835,7 +835,8 @@ class Identity(unittest.TestCase):
             self.assertIsNone(acc.identity(bad))
 
     def test_masking(self):
-        self.assertEqual(acc.masked_label("alice@example.com"), "a…@example.com")
+        self.assertEqual(acc.masked_label("alice@example.com"), "alice@example.com")
+        self.assertEqual(acc.masked_label("alice@example.com (plus)"), "alice@example.com")
         self.assertEqual(acc.masked_label("ChatGPT account (pro)"), "ChatGPT account (pro)")
 
 

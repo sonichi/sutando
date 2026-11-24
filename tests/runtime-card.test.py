@@ -208,7 +208,7 @@ class Card(Base):
         card = self.fake.cards()[0]
         self.assertIsNone(ac.problem(card))
         self.assertEqual(card["id"], rtc.CARD_ID)
-        self.assertIn("running on Codex", card["text"])
+        self.assertIn("I'm using Codex.", card["text"])
         self.assertEqual([(b["label"], b["style"]) for b in card["buttons"]],
                          [("Codex", "primary"), ("Claude Code", "secondary")])
         self.assertEqual([b["command"] for b in card["buttons"]], ["card:runtime:core:codex", "card:runtime:core:claude"])
@@ -219,7 +219,7 @@ class Card(Base):
         self.current = "claude"
         self.post()
         card = self.fake.cards()[0]
-        self.assertIn("running on Claude Code", card["text"])
+        self.assertIn("I'm using Claude Code.", card["text"])
         self.assertEqual([b["style"] for b in card["buttons"]], ["secondary", "primary"])
 
     def test_the_card_goes_only_to_the_owner_dm(self):
@@ -257,7 +257,7 @@ class Taps(Base):
         self.assertIn("Switching the core from Codex to Claude Code", out["say"])
         # One card, updated in place: the tapped card's own event says it, no message is added, and the
         # detached switch is handed that event for its outcome.
-        self.assertEqual(self.fake.edits(), [("$card1", "Core runtime: " + out["say"])])
+        self.assertEqual(self.fake.edits(), [("$card1", "Runtime: " + out["say"])])
         self.assertEqual((len(self.fake.cards()), out["event_id"]), (1, "$card1"))
         self.assertEqual(argv[argv.index("--card") + 1], "$card1")
         self.assertEqual(self.restarts, [], "nothing is restarted in the tap itself")
@@ -413,7 +413,7 @@ class AwaitSignIn(Base):
         self.assertIn("switch", argv)
         self.assertEqual((argv[argv.index("--runtime") + 1], argv[argv.index("--room") + 1]), ("claude", DM))
         # The "Sign in first" card ($card2) is edited in place, and handed on for the outcome.
-        self.assertEqual(self.fake.edits(), [("$card2", "Core runtime: " + out["say"])])
+        self.assertEqual(self.fake.edits(), [("$card2", "Runtime: " + out["say"])])
         self.assertEqual((len(self.fake.cards()), argv[argv.index("--card") + 1]), (2, "$card2"))
         self.assertIn("Switching the core from Codex to Claude Code", out["say"])
         self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists())
@@ -475,7 +475,7 @@ class AwaitSignIn(Base):
         rc, out = self.wait()
         self.assertEqual((rc, out["status"], out["posted"]), (1, "gave_up", "posted"))
         self.assertIn("I stopped waiting for the Claude Code sign-in after 15 minutes. The core is still on Codex", out["say"])
-        self.assertEqual(self.fake.edits(), [("$card2", "Core runtime: " + out["say"])])
+        self.assertEqual(self.fake.edits(), [("$card2", "Runtime: " + out["say"])])
         self.assertEqual(len(self.fake.cards()), 2, "no message is added")
         self.assertEqual((self.launch.calls, self.restarts), ([], []))
         self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists())
@@ -551,7 +551,7 @@ class AwaitSignIn(Base):
         rc, out = self.wait()
         self.assertEqual((rc, out["status"], out["edited"]), (0, "already", "posted"))
         # Switched some other way: the "Sign in first" card says so in place, and nothing is added.
-        self.assertEqual(self.fake.edits(), [("$card2", "Core runtime: The core is now running on Claude Code. "
+        self.assertEqual(self.fake.edits(), [("$card2", "Runtime: The core is now running on Claude Code. "
                                                         + rtc.CARRIES)])
         self.assertEqual(len(self.fake.cards()), 2)
         self.assertEqual(self.launch.calls, [])
@@ -582,7 +582,7 @@ class Switch(Base):
         rc, out = self.switch()
         self.assertEqual((rc, out["outcome"]), (0, "done"))
         self.assertEqual(self.restarts, ["claude"])
-        self.assertEqual(out["say"], "Switched. The core is now running on Claude Code. " + rtc.CARRIES)
+        self.assertEqual(out["say"], "Switched to Claude Code. The core restarted on it ✓ " + rtc.CARRIES)
         self.assertTrue(out["core_confirmed"] and out["selection_confirmed"])
         last = self.fake.cards()[-1]
         self.assertEqual((last["id"], last["state"]), (rtc.NOTE_ID, "done"))
@@ -666,7 +666,7 @@ class Switch(Base):
         said = [words for event, words in self.fake.edits() if event == "$card1"]
         self.assertIn("Waiting for another restart to finish, then I'll switch to Claude Code. The core is still on Codex.",
                       said[-2])
-        self.assertIn("Switched. The core is now running on Claude Code", said[-1])
+        self.assertIn("Switched to Claude Code. The core restarted on it", said[-1])
         self.assertEqual(len(self.fake.cards()), 1, "one card throughout")
         self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists())
 
@@ -687,7 +687,7 @@ class Switch(Base):
         self.assertEqual(self.restarts, ["claude"], "the confirmed core is not restarted a second time")
         said = [words for event, words in self.fake.edits() if event == "$card1"]
         self.assertIn("Waiting for another restart to finish", said[-2])
-        self.assertIn("Switched. The core is now running on Claude Code", said[-1])
+        self.assertIn("Switched to Claude Code. The core restarted on it", said[-1])
 
     def test_what_the_other_restart_did_not_publish_is_not_known_and_nothing_is_restarted_blindly(self):
         def claude_came_up_unpublished(lock):
@@ -725,7 +725,7 @@ class Switch(Base):
                 self.assertEqual((rc, out["outcome"], out["restart"], out["why"]), (1, "error", "not-restarted", "inconclusive"))
                 self.assertEqual(self.restarts, ["claude"], "not restarted blindly")
                 self.assertIn("I could not read which runtime the core is on now, so I did not restart it again", out["say"])
-                self.assertEqual(self.fake.edits()[-1], ("$card1", "Core runtime: " + out["say"]))
+                self.assertEqual(self.fake.edits()[-1], ("$card1", "Runtime: " + out["say"]))
                 self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists(), "released: she can ask again")
                 self.ws.joinpath(*rtc.RUNNING).write_text(json.dumps(
                     {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": 1e12}))
@@ -740,7 +740,7 @@ class Switch(Base):
         self.assertGreaterEqual(self.clock.t - began, rtc.DEFER_WAIT_S)
         self.assertIn("Still busy: another restart was still in the way after I waited", out["say"])
         self.assertIn("The core is still on Codex. Ask me for the runtime card to try again.", out["say"])
-        self.assertEqual(self.fake.edits()[-1], ("$card1", "Core runtime: " + out["say"]))
+        self.assertEqual(self.fake.edits()[-1], ("$card1", "Runtime: " + out["say"]))
         self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists(), "the attempt is released: she can tap again")
         self.assertGreater(rtc.RUNNING_STALE_S, 2 * rtc.RESTART_TIMEOUT_S + rtc.DEFER_WAIT_S)
 
@@ -778,7 +778,7 @@ class Switch(Base):
     def test_the_outcome_edits_the_card_the_tap_answered(self):
         rc, out = self.run_(["switch", "--room", DM, "--runtime", "claude", "--attempt", self.attempt, "--card", "$card1"])
         self.assertEqual((rc, out["outcome"], out["event_id"]), (0, "done", "$card1"))
-        self.assertEqual(self.fake.edits()[-1], ("$card1", "Core runtime: " + out["say"]))
+        self.assertEqual(self.fake.edits()[-1], ("$card1", "Runtime: " + out["say"]))
         self.assertEqual(self.fake.calls[-1][2], f"runtime-card:{self.attempt}:outcome-edit")
         self.assertEqual(len(self.fake.cards()), 1, "the outcome adds no message")
 
