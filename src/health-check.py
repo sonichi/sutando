@@ -1686,6 +1686,40 @@ def check_decision_card_clicks(workspace_dir: Optional[Path] = None) -> "dict | 
                        "`hitl_click: true` task (CLAUDE.md, Pending decisions)")}
 
 
+def check_task_event_handler(workspace_dir: Optional[Path] = None) -> "dict | None":
+    """DOWN when core's watcher would hold every task; mirrors read_handler_config_now's order."""
+    from util_paths import task_event_handler_config_path  # noqa: PLC0415
+    cfg = task_event_handler_config_path((Path(workspace_dir) if workspace_dir else WORKSPACE_DIR) / "state")
+    if not cfg.exists() and not cfg.is_symlink():
+        return None  # no declaration: the core takes every task, pin or not
+
+    def usable(path) -> bool:
+        return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+    try:
+        raw = cfg.read_bytes()
+    except OSError as exc:
+        why = f"{cfg.name} exists but cannot be read ({type(exc).__name__})"
+    else:
+        pin = os.environ.get("SUTANDO_TASK_EVENT_HANDLER", "")
+        if pin:
+            if usable(pin):
+                return None
+            why = f"the SUTANDO_TASK_EVENT_HANDLER override {pin!r} is not an executable file"
+        else:
+            try:
+                handler = (json.loads(raw) or {}).get("handler")
+            except (ValueError, AttributeError):
+                handler = None
+            if isinstance(handler, str) and usable(handler):
+                return None
+            why = f"{cfg.name} names a handler that is missing or not an executable file ({handler!r})"
+    return {"name": "task-event-handler", "status": "down",
+            "detail": (f"{why}; the core watcher holds every new task until it is fixed. Re-publish the "
+                       "handler from the checkout that should route, or remove the file to let the core "
+                       "take every task")}
+
+
 def check_connections_primary(workspace_dir: Optional[Path] = None) -> "dict | None":
     """WARN when the connections record has rows but no primary, or a primary whose bridge has no
     proactive room yet; otherwise say so when the legacy row is not primary. None when all is plain."""
@@ -7237,6 +7271,102 @@ def check_gateway_bridge() -> "dict | None":
         served = ", ".join(_gateway_lane_label(ln) for ln, serving, _ in lanes if serving)
         return _gateway_ok_unless_lane_stalled(f"running + connected (lane {served})")
     return _gateway_ok_unless_lane_stalled("running")
+
+
+OWNER_DM_STALE_MIN_AGE_S = 1800.0
+# Grace for float/JSON round-trip imprecision only — not a real clock-skew budget.
+OWNER_DM_CLOCK_SKEW_TOLERANCE_S = 5.0
+
+
+def check_owner_dm_routing_stale(min_age_sec: float = OWNER_DM_STALE_MIN_AGE_S,
+                                  now: "float | None" = None) -> "dict | None":
+    """WARN once the owner/gateway DM-room mismatch has itself persisted past
+    `min_age_sec` — not how recently the owner spoke, which refreshes every message."""
+    name = "owner-dm-routing-stale"
+    state_file = WORKSPACE_DIR / "state" / "owner-dm-routing-stale.json"
+
+    def _clear_divergence():
+        try:
+            state_file.unlink()
+        except OSError:
+            pass
+
+    if not _gateway_configured():
+        # Not-configured is unobservable, same as every "ok" case below — clear
+        # the clock so it can't resume a stale duration once reconfigured.
+        _clear_divergence()
+        return None
+    import owner_room_access  # noqa: PLC0415
+    routing = owner_room_access.owner_routing(WORKSPACE_DIR)
+    current_dm = owner_room_access.owner_dm(routing)
+
+    if not current_dm:
+        _clear_divergence()
+        return {"name": name, "status": "ok", "detail": "no owner DM routing reading yet"}
+    try:
+        activity = json.loads(status_read_path("last-owner-activity.json", WORKSPACE_DIR)
+                              .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        _clear_divergence()
+        return {"name": name, "status": "ok", "detail": "no owner activity recorded yet"}
+    if not isinstance(activity, dict) or activity.get("channel") != "ag2space":
+        _clear_divergence()
+        return {"name": name, "status": "ok", "detail": "owner's last recorded activity is not on ag2space"}
+    last_room = str(activity.get("channel_id") or "").strip()
+    if not last_room or last_room == current_dm:
+        _clear_divergence()
+        return {"name": name, "status": "ok", "detail": "owner's last-active room matches proactive routing"}
+
+    now = time.time() if now is None else now
+    try:
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+    first_seen = _gateway_num(state.get("first_seen"), nonneg=True)
+    # A first_seen beyond now (clock skew, a tampered/corrupted file) can never age — discard it.
+    if first_seen is not None and first_seen > now + OWNER_DM_CLOCK_SKEW_TOLERANCE_S:
+        first_seen = None
+    measured = True
+    # A new or changed pair starts its own clock; the same pair keeps the one already running.
+    if state.get("last_room") != last_room or state.get("current_dm") != current_dm or not first_seen:
+        first_seen = now
+        tmp = None
+        try:
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", dir=state_file.parent,
+                                             prefix=".owner-dm-routing-stale-", delete=False) as out:
+                tmp = Path(out.name)
+                json.dump({"last_room": last_room, "current_dm": current_dm, "first_seen": first_seen}, out)
+            os.replace(tmp, state_file)
+        except OSError:
+            measured = False
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+    if not measured:
+        # Nothing was persisted, so first_seen is only in memory — reporting its
+        # age would lie ("0s old") forever. Say the divergence is real but unmeasured.
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": (f"routing mismatch ({last_room} vs {current_dm}) is real, but its duration "
+                       "could not be measured — the clock file could not be written"),
+        }
+    age = max(0.0, now - first_seen)
+    if age < min_age_sec:
+        return {"name": name, "status": "ok",
+                "detail": f"routing mismatch ({last_room} vs {current_dm}) is {int(age)}s old, within "
+                          f"the {int(min_age_sec)}s settle window — not yet sustained"}
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (f"owner's last {_gateway_where()} messages (for {int(age // 60)}m) still come from "
+                   f"{last_room}, but proactive messages keep routing to {current_dm} — the gateway's "
+                   "owner_dm_room may be stuck stale, and no agent/owner Action exists yet to redesignate "
+                   "it; this signal is heuristic, a shared-room message reads the same as a moved DM"),
+    }
 
 
 def _gateway_rows(workspace: "Path | None" = None) -> "list[dict]":
@@ -13608,6 +13738,10 @@ def run_all_checks() -> list[dict]:
     if _card_clicks:
         checks.append(_card_clicks)
 
+    _handler = check_task_event_handler()
+    if _handler:
+        checks.append(_handler)
+
     _no_primary = check_connections_primary()
     if _no_primary:
         checks.append(_no_primary)
@@ -13945,6 +14079,7 @@ def run_all_checks() -> list[dict]:
     # branches are unit-tested in tests/health-check-gateway-bridge.test.py; this
     # call site is exercised by the running health check, not that unit test.)
     checks += [c for c in (check_gateway_bridge(),) if c is not None]  # pragma: no cover
+    checks += [c for c in (check_owner_dm_routing_stale(),) if c is not None]  # pragma: no cover
     checks += [c for c in (check_sspace_migration(),) if c is not None]  # pragma: no cover
 
     # (External plugin probes moved out with their plugins in #1427 round ④ —

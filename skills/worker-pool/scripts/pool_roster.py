@@ -355,6 +355,26 @@ class HandlerPublishError(RosterError):
     """
 
 
+def _live_declared_handler(cfg: Path) -> "str | None":
+    """The handler the config already names, if it is still an executable regular file."""
+    try:
+        handler = (json.loads(cfg.read_text(encoding="utf-8")) or {}).get("handler")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if isinstance(handler, str) and handler and os.path.isfile(handler) and os.access(handler, os.X_OK):
+        return handler
+    return None
+
+
+def _in_linked_worktree(path: Path) -> bool:
+    """True when `path` sits in a `git worktree add` checkout, whose `.git` is a file."""
+    for parent in Path(path).resolve().parents:
+        git = parent / ".git"
+        if git.exists():
+            return git.is_file()
+    return False
+
+
 def publish_task_event_handler(workspace):
     """Declare this skill's router as core's task-event handler.
 
@@ -369,6 +389,12 @@ def publish_task_event_handler(workspace):
     """
     handler = Path(__file__).resolve().parent / "pool_route_handler.py"
     cfg = task_event_handler_config_path(Path(workspace) / "state")
+    live = _live_declared_handler(cfg)
+    if live and live != str(handler) and _in_linked_worktree(handler):
+        # A worktree's copy would outlive nothing: when it is removed, core holds every task.
+        print(f"worker-pool: kept the live task-event handler {live}; a linked worktree does not "
+              f"replace it with {handler}", file=sys.stderr)
+        return cfg
     try:
         _write_atomic(cfg, {"handler": str(handler)})
     except OSError as e:
