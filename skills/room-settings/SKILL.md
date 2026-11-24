@@ -66,7 +66,7 @@ can change here, and offer the nearest one.
 | The people listed (`audienceUsers`) | a list of user ids, each one like `@name:s.space`, of people joined to the room; used only with `specific` |
 | Others who mention your owner (`admitOnOwnerMention`) | `true`: messages from people who may already reach you that mention your owner are sent to you too; you don't answer those in the room, you tell your owner about them in your DM · `false` |
 | Room members' access (`memberAccessTier`) | `none`: no access · `guest`: when they address you, your owner gets a card to let you answer that once · `team`: they can work with you as your Team |
-| Secrets check for Team (`sensitiveDataFilter`) | `true`: before the bridge delivers your answer to anyone but your owner, Sutando scans it for secrets (tokens, keys, passwords), raw errors and tracebacks, and file paths in home or temporary folders, and holds it back if it finds any · `false`: only answers to members s.space vouches for as your Team, on messages that arrived after the change, skip that scan; Guests' answers are still scanned, and sending to another room or attaching a file outside the task is still refused |
+| Secrets check for Team (`sensitiveDataFilter`) | `true`: before the bridge delivers a task's result file to anyone but your owner, Sutando scans it for secrets (tokens, keys, passwords), raw errors and tracebacks, and file paths in home or temporary folders, and holds it back if it finds any · `false`: only answers to members s.space vouches for as your Team, on messages that arrived after the change, skip that scan; Guests' answers are still scanned, and sending to another room or attaching a file outside the task is still refused. What you post yourself with room Actions is not part of this scan |
 
 Memory (`sessionScope`) is also stored by s.space, but it doesn't change how you work, so
 don't offer it. Whether a room's conversation is kept apart from your other rooms depends on
@@ -106,14 +106,16 @@ your owner asks for it, say so, and change nothing.
   old setting.
 - Ask that confirmation in plain words, never with an `ask-owner.py` card: a click on a card
   arrives as a task that must answer `[no-send]`, which leaves no turn to send the change.
-  - Asked with `room.question.ask`: their answer comes back to this same task, so send the
-    change with the same `task_id`. It only works while the task is open and within 10
-    minutes of their first message; if the answer comes later, ask them to ask again. If no
-    answer comes back to this task at all (not every connection sends one), ask in your reply
-    instead.
-  - Asked in your reply: that reply ends this task, and their answer is a new message. Send
-    the change with that new message's `task_id`, never the first one's (that is refused as
-    closed).
+  Choose how to ask before you ask:
+  - Use `room.question.ask` only when this task's own instructions tell you to ask that way:
+    only then does the answer come back to this same task. Send the change with the same
+    `task_id`, while the task is open and within 10 minutes of their first message; if the
+    answer comes later, ask them to ask again. Anyone in the room can answer, so first check
+    that `answered_by` is your owner. If anyone else answered, change nothing and ask your
+    owner to confirm themselves.
+  - Otherwise ask in your reply, and ask your owner to answer in a message to you: in your DM,
+    as a reply to you, or by mentioning you. Your reply ends this task, so send the change with
+    that new message's `task_id`, never the first one's (that is refused as closed).
 - "What reaches you" is about which messages are sent to you to answer. It does not hide the
   room's history from you, so never promise your owner that you can't read other messages.
 - Before you list people, check each one is in the room: `room.action.read` with action

@@ -160,7 +160,6 @@ class TestSkillRules(unittest.TestCase):
 
     def test_filter_off_confirmation_uses_the_new_task(self):
         settings = " ".join(section(self.text, "The settings").split())
-        self.assertIn("Send the change with that new message's `task_id`, never the first one's", settings)
 
     def test_task_id_is_the_asking_message(self):
         owner = " ".join(section(self.text, "Only your owner").split())
@@ -182,11 +181,17 @@ class TestSkillRules(unittest.TestCase):
     def test_confirmation_by_room_question_keeps_the_task_id(self):
         settings = " ".join(section(self.text, "The settings").split())
         self.assertIn("never with an `ask-owner.py` card", settings)
-        self.assertIn("Asked with `room.question.ask`: their answer comes back to this same task, "
-                      "so send the change with the same `task_id`", settings)
-        self.assertIn("within 10 minutes of their first message; if the answer comes later, ask them "
-                      "to ask again", settings)
-        self.assertIn("Asked in your reply: that reply ends this task", settings)
+        self.assertIn("Choose how to ask before you ask", settings)
+        self.assertIn("Use `room.question.ask` only when this task's own instructions tell you to ask that way", settings)
+        self.assertIn("Send the change with the same `task_id`, while the task is open and within 10 minutes "
+                      "of their first message", settings)
+        self.assertIn("Otherwise ask in your reply", settings)
+        self.assertIn("send the change with that new message's `task_id`, never the first one's", settings)
+
+    def test_room_question_answer_must_come_from_the_owner(self):
+        settings = " ".join(section(self.text, "The settings").split())
+        self.assertIn("first check that `answered_by` is your owner. If anyone else answered, change nothing "
+                      "and ask your owner to confirm themselves.", settings)
 
     def test_owner_mention_handling_depends_on_the_setting(self):
         settings = " ".join(section(self.text, "The settings").split())
@@ -199,10 +204,9 @@ class TestSkillRules(unittest.TestCase):
         self.assertIn("Any other exit (4: the task file could not be read, 64, an error): change nothing, "
                       "tell your owner you couldn't check the request, and don't try again.", owner)
 
-    def test_no_wake_falls_back_to_the_reply(self):
+    def test_no_fallback_after_asking(self):
         settings = " ".join(section(self.text, "The settings").split())
-        self.assertIn("If no answer comes back to this task at all (not every connection sends one), "
-                      "ask in your reply instead.", settings)
+        self.assertNotIn("If no answer comes back", settings)
 
     def test_team_says_what_it_reaches_and_guest_has_no_research(self):
         settings = " ".join(section(self.text, "The settings").split())
@@ -238,7 +242,8 @@ class TestSkillRules(unittest.TestCase):
         """Off skips only the Team scan (secrets, raw errors, local paths); the redirect and
         attach refusals stay (policy/egress/result.py scan_team_result)."""
         settings = " ".join(section(self.text, "The settings").split())
-        self.assertIn("before the bridge delivers your answer to anyone but your owner, Sutando scans it", settings)
+        self.assertIn("before the bridge delivers a task's result file to anyone but your owner, Sutando scans it", settings)
+        self.assertIn("What you post yourself with room Actions is not part of this scan", settings)
         self.assertIn("only answers to members s.space vouches for as your Team, on messages that arrived after "
                       "the change, skip that scan", settings)
         self.assertIn("Guests' answers are still scanned", settings)
