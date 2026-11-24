@@ -33,6 +33,7 @@ import io
 import json
 import os
 import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -761,6 +762,74 @@ class Switch(Base):
                     {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": 1e12}))
         self.assertEqual(rtc.restart_left(self.ws, ""), "")
         self.assertEqual(rtc.restart_left(self.ws, "grp-9-9"), "codex")
+
+    def gateway_ctl(self, rc=0, raises=None):
+        """A desktop's control script beside the engine; `calls` gets each run of it."""
+        ctl = self.ws / "sutando-ctl.sh"
+        ctl.write_text("#!/bin/bash\n")
+        patch = mock.patch.object(rtc, "DESKTOP_CTL", ctl)
+        patch.start()
+        self.addCleanup(patch.stop)
+        calls = []
+
+        def run(argv, **kw):
+            if argv[:1] == ["claude"]:
+                return self.claude_run(argv, **kw)
+            calls.append((argv, kw))
+            if raises:
+                raise raises
+            return mock.Mock(returncode=rc)
+        self.claude_run_real, self.gateway_run = self.claude_run, run
+        return ctl, calls
+
+    def switch_with(self, run):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = rtc.main(["--workspace", str(self.ws), "switch", "--room", DM, "--runtime", "claude",
+                           "--attempt", self.attempt, "--card", "$card1"], core=CORE, run=run,
+                          execute=lambda *a, **k: self.fake.execute(*a, **k), restart=self.restart,
+                          sleep=self.clock.sleep, clock=self.clock)
+        return rc, json.loads(out.getvalue())
+
+    def test_a_desktop_hosted_core_gets_its_gateway_window_back_after_the_switchs_restart(self):
+        ctl, calls = self.gateway_ctl()
+        rc, out = self.switch_with(self.gateway_run)
+        self.assertEqual((rc, out["outcome"], out["gateway"]), (0, "done", "restored"))
+        (argv, kw), = calls
+        self.assertEqual((argv, kw["cwd"]), (["bash", str(ctl), "restart-gateway"], str(ctl.parent)))
+        self.assertNotIn("SUTANDO_CORE_RUNTIME", kw["env"])
+        self.assertNotIn("gateway", self.fake.edits()[-1][1], "a gateway that came back is not news")
+
+    def test_a_gateway_that_does_not_come_back_is_said_on_the_card(self):
+        for rc_ctl, raises, why in ((3, None, "exit 3"), (0, subprocess.TimeoutExpired("ctl", 1), "timed out"),
+                                    (0, OSError("gone"), "OSError")):
+            with self.subTest(why=why):
+                ctl, calls = self.gateway_ctl(rc=rc_ctl, raises=raises)
+                self.current = self.selected = "codex"
+                rc, out = self.switch_with(self.gateway_run)
+                self.assertEqual((out["outcome"], out["gateway"]), ("info", why))
+                self.assertIn("The core is now running on Claude Code", out["say"])
+                self.assertIn(f"Messages may not reach the core until the app is quit and reopened: its gateway did not come back ({why}).",
+                              out["say"])
+                self.assertEqual(self.fake.edits()[-1], ("$card1", "Core runtime: " + out["say"]))
+                self.ws.joinpath(*rtc.RUNNING).write_text(json.dumps(
+                    {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": 1e12}))
+
+    def test_the_gateway_is_left_alone_with_no_desktop_no_control_script_or_no_restart_of_ours(self):
+        ctl, calls = self.gateway_ctl()
+        self.desktop = False
+        rc, out = self.switch_with(self.gateway_run)                    # not hosted by a desktop
+        self.assertEqual((calls, "gateway" in out), ([], False))
+        self.desktop = True
+        ctl.unlink()                                                    # an engine with no desktop script beside it
+        self.assertEqual(rtc.restore_desktop_gateway(self.gateway_run), "")
+        ctl.write_text("#!/bin/bash\n")
+        self.ws.joinpath(*rtc.RUNNING).write_text(json.dumps(
+            {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": 1e12}))
+        self.current = self.selected = "codex"
+        self.restart_rc = 3                                             # the restart never happened
+        rc, out = self.switch_with(self.gateway_run)
+        self.assertEqual((calls, out["restart"]), ([], "not-restarted"))
 
     def test_an_unclean_restart_still_confirms_what_it_can(self):
         self.restart_rc, self.launcher_confirms, self.launcher_selects = 1, False, False

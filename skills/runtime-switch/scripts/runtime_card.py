@@ -81,6 +81,11 @@ RUNNING_LOCK = ("state", "runtime-card-switch.lock")
 EXEC_LOCK = ("state", "runtime-card-switch.exec.lock")
 RECORD = ("state", "core-runtime.json")
 RESTART_TIMEOUT_S = 1500
+# A desktop keeps its gateway as a window of the core's tmux session, which --restart replaces; the
+# desktop's own control script, beside the engine, puts that window back.
+DESKTOP_CTL = _REPO.parent / "sutando-ctl.sh"
+GATEWAY_TIMEOUT_S = 180
+GATEWAY_LOST = "Messages may not reach the core until the app is quit and reopened: its gateway did not come back ({why})."
 CONFIRM_TIMEOUT_S, CONFIRM_POLL_S = 180, 5
 # A restart put off because another one holds graceful-restart.sh's lock: the switch waits for that
 # lock to go, this long at most, and then asks once more.
@@ -680,6 +685,22 @@ def restart_left(ws: Path, rid: str) -> str:
     return str(res["runtime"])
 
 
+def restore_desktop_gateway(run=subprocess.run) -> str:
+    """After a restart on a desktop-hosted engine, have the desktop recreate its gateway window: "" where
+    no desktop hosts the engine, "restored", or why it failed. Without it the restarted core is deaf."""
+    if not desktop_hosted() or not DESKTOP_CTL.is_file():
+        return ""
+    try:
+        rc = run(["bash", str(DESKTOP_CTL), "restart-gateway"], cwd=str(DESKTOP_CTL.parent), env=detached_env(),
+                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                 timeout=GATEWAY_TIMEOUT_S).returncode
+    except subprocess.TimeoutExpired:
+        return "timed out"
+    except OSError as e:
+        return type(e).__name__
+    return "restored" if rc == 0 else f"exit {rc}"
+
+
 def check(ws: Path, rt: str, since: float) -> dict:
     """{core, selected, record, configured}: whether the confirmed record names `rt` with a session
     created after `since` (tmux stamps whole seconds), and whether the launcher's next pick is `rt`."""
@@ -718,9 +739,12 @@ def outcome(rt: str, was: str, got: dict, rc: int = 0) -> tuple:
 
 
 def settle_and_tell(ws: Path, room: str, rt: str, was: str, since: float, attempt: str, *, rc: int = 0,
-                    card: str = "", core=None, execute=None, sleep=time.sleep, clock=time.time) -> dict:
+                    card: str = "", core=None, execute=None, sleep=time.sleep, clock=time.time,
+                    gateway: str = "") -> dict:
     got = confirm(ws, rt, since, sleep=sleep, clock=clock)
     state, words = outcome(rt, was, got, rc)
+    if gateway not in ("", "restored"):
+        state, words = ("info" if state == "done" else state), f"{words} {GATEWAY_LOST.format(why=gateway)}"
     status = {"done": "Switched", "info": "Switched"}.get(state, "Not confirmed")
     out = _answer(ws, room, card, state, status, words, f"runtime-card:{attempt}:outcome", core=core,
                   execute=execute, tries=POST_TRIES, sleep=sleep)
@@ -729,7 +753,7 @@ def settle_and_tell(ws: Path, room: str, rt: str, was: str, since: float, attemp
 
 
 def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core, sleep=time.sleep,
-               clock=time.time) -> int:
+               clock=time.time, run=subprocess.run) -> int:
     from file_lock import try_lock_fd, unlock_fd
     rec = _read_json(ws.joinpath(*RUNNING))
     if rec.get("attempt") != args.attempt or rec.get("runtime") != args.runtime or rec.get("room") != args.room \
@@ -746,6 +770,7 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
             was = configured_runtime()
             started = clock()
             rc = restart(args.runtime)
+            restarted = rc not in NOT_RESTARTED
             waited = False
             if rc == DEFERRED:
                 # Not a failure yet: say so on the card, wait for the other restart, and ask once more.
@@ -764,6 +789,7 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
                     elif left and left != args.runtime:
                         was, started = configured_runtime(), clock()    # confirmed on another runtime
                         rc = restart(args.runtime)
+                        restarted = rc not in NOT_RESTARTED
                     else:
                         words = (f"Another restart finished, but I could not read which runtime the core is on "
                                  f"now, so I did not restart it again for {name(args.runtime)}. "
@@ -785,8 +811,11 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
                               f"runtime-card:{args.attempt}:outcome", core=core, execute=execute, tries=POST_TRIES,
                               sleep=sleep)
                 return _emit({**out, "outcome": "error", "say": words, "restart": "not-restarted", "rc": rc}, 1)
+            # This switch's own restart replaced the session: the desktop's gateway window went with it.
+            gateway = restore_desktop_gateway(run) if restarted else ""
             told = settle_and_tell(ws, args.room, args.runtime, was, started, args.attempt, rc=rc, card=args.card,
-                                   core=core, execute=execute, sleep=sleep, clock=clock)
+                                   core=core, execute=execute, sleep=sleep, clock=clock, gateway=gateway)
+            told = dict(told, **({"gateway": gateway} if gateway else {}))
         finally:
             release(ws, rec)
             unlock_fd(fd)
@@ -841,7 +870,7 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, run=subp
     if args.cmd == "reply":
         return cmd_reply(ws, args, core=core, execute=execute, popen=popen, run=run, codex_read=codex_read, now=clock)
     if args.cmd == "switch":
-        return cmd_switch(ws, args, core=core, execute=execute, restart=restart, sleep=sleep, clock=clock)
+        return cmd_switch(ws, args, core=core, execute=execute, restart=restart, sleep=sleep, clock=clock, run=run)
     if args.cmd == "await-sign-in":
         return cmd_await(ws, args, core=core, execute=execute, popen=popen, run=run, codex_read=codex_read,
                          sleep=sleep, clock=clock)

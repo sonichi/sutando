@@ -63,6 +63,10 @@ A restart that is put off because another restart is under way is not a failure:
 waiting, the switch waits for that restart's lock to clear (10 minutes at most) and asks once more,
 then the same card says "Switched" or that it is still busy.
 
+On a desktop-hosted engine the restart replaces the tmux session the desktop keeps its gateway window
+in, so after its own restart the switch runs the desktop's `sutando-ctl.sh restart-gateway` (the script
+beside the engine). If that fails, the outcome on the card says messages may not reach the core.
+
 The sign-in waiter runs in a session of its own and holds a lock for as long as it lives. If something
 stops it anyway (a restart that kills every process of the core, a reboot), `runtime_card.py resume`
 starts one again for the sign-in still waited for; `post` and `status` do the same on their way.
