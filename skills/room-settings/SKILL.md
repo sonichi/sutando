@@ -168,10 +168,10 @@ own first; then read again and send the ones that open access.
   - `task_closed`, `task_expired`: the request is too old. A change must be sent within 10
     minutes of when their message was first sent to you (of the message itself, if it never
     was), while you are still on it, and never more than 24 hours after they sent it. Ask them to ask you again.
-  - When its message says your owner must join the room first (a change that opens access,
-    in a room they are not in): nothing was held. Ask them to join the room, then ask you
-    again.
-  - Any other reason (for example `approver_below_level`): change nothing. Say you can't make
+  - No `reason`, and its message says your owner is not in the room (for example "your owner
+    is not in this room"; it comes for a change that opens access): nothing was held. Ask
+    them to join the room, then ask you again.
+  - Any other reason, or none (for example `approver_below_level`): change nothing. Say you can't make
     this change from here, and that your owner can change it in the room's settings in the
     app, or ask a room admin to.
 - **`UPSTREAM_UNAVAILABLE`:** something s.space needs did not answer. Read its message and

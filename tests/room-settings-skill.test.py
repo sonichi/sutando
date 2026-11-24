@@ -203,7 +203,7 @@ class TestSkillRules(unittest.TestCase):
         for phrase in ("say only your owner can change how you work here",
                        "Ask them to send it to you directly: in your DM, as a reply to you, or by mentioning you.",
                        "Ask them to ask you again.",
-                       "Any other reason (for example `approver_below_level`): change nothing.",
+                       "Any other reason, or none (for example `approver_below_level`): change nothing.",
                        "ask them to open a DM with you and then ask again",
                        "they approve it on the card in your DM with them",
                        "your owner first has to make you able to work with a Team",
@@ -214,7 +214,7 @@ class TestSkillRules(unittest.TestCase):
                       bullet(back, "**`INVALID_INPUT`** for anything else"))
         self.assertIn("Say you can't make this change from here, and that your owner can change it in the "
                       "room's settings in the app, or ask a room admin to.",
-                      bullet(back, "Any other reason (for example `approver_below_level`)"))
+                      bullet(back, "Any other reason, or none (for example `approver_below_level`)"))
         tail = " ".join(self.text.rsplit("## What comes back", 1)[1].split())
         self.assertIn("Tell your owner every refusal in plain words, with the one thing they can do next.", tail)
 
@@ -302,9 +302,11 @@ class TestSkillRules(unittest.TestCase):
 
     def test_owner_not_in_room_holds_nothing(self):
         back = " ".join(section(self.text, "What comes back").split())
-        self.assertIn("When its message says your owner must join the room first", back)
-        self.assertIn("nothing was held. Ask them to join the room, then ask you again.", back)
-        self.assertLess(back.index("must join the room first"), back.index("Any other reason"))
+        item = bullet(back, "No `reason`, and its message says your owner is not in the room")
+        self.assertIn('"your owner is not in this room"', item)
+        self.assertIn("nothing was held. Ask them to join the room, then ask you again.", item)
+        self.assertNotIn("must join the room first", back)
+        self.assertLess(back.index("your owner is not in the room"), back.index("Any other reason, or none"))
 
     def test_filter_off_is_an_approval_required_change(self):
         back = " ".join(section(self.text, "What comes back").split())
