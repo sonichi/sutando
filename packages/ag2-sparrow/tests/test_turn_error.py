@@ -14,7 +14,7 @@ from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
 isolate_os_environ()
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from ag2_sparrow import diagnostics, turn_error  # noqa: E402
+from ag2_sparrow import diagnostics, result_markers, turn_error  # noqa: E402
 
 
 class ErrorLineTest(unittest.TestCase):
@@ -49,6 +49,40 @@ class ErrorLineTest(unittest.TestCase):
         diagnostics.register_secret("registered-relay-secret-value")
         self.assertEqual(turn_error.error_line("refused: registered-relay-secret-value"), diagnostics.WITHHELD_TEXT)
 
+    def test_secrets_outside_a_query_and_in_url_userinfo_are_removed(self):
+        cases = {
+            "failed to connect via proxy https://user:hunter2pass@proxy.corp.example:8080/": "hunter2pass",
+            "x-api-key: 9f8e7d6c5b4a39281706f5e4d3c2b1a0": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+            '{"api_key": "abcdef1234567890abcdef1234567890"}': "abcdef1234567890abcdef1234567890",
+            "token=abcdef1234567890abcdef": "abcdef1234567890abcdef",
+            "https://x.test/cb#access_token=FRAGTOKEN123456": "FRAGTOKEN123456",
+            "authorization=Bearer:abc123secretvalue": "abc123secretvalue",
+        }
+        for message, secret in cases.items():
+            line = turn_error.error_line(message)
+            self.assertNotIn(secret, line, message)
+            self.assertIn("[REDACTED]", line, message)
+        self.assertEqual(turn_error.error_line("https://user:pw@proxy.example:8080/ refused"),
+                         "https://[REDACTED]@proxy.example:8080/ refused")
+        for kept in ("authentication_failed: invalid request", "max_tokens: 4096 exceeded"):
+            self.assertEqual(turn_error.error_line(kept), kept)
+
+    def test_control_characters_are_dropped(self):
+        self.assertEqual(turn_error.error_line("\x1b[31mCredit balance\x1b[0m is too low"), "Credit balance is too low")
+        self.assertEqual(turn_error.error_line("a\x00b\x07c"), "abc")
+        self.assertEqual(turn_error.error_line("evil‮txt.exe"), "eviltxt.exe")
+        self.assertEqual(turn_error.error_line("a\x0bb\x0cc\x85d e"), "a b c d e")
+
+    def test_delivery_markers_in_the_error_are_inert(self):
+        for message in ("stream error [file: notes/private.md]", "oops [dm-only] [channel: 123] [no-send]",
+                        "bad [send: /tmp/x] [attach: a.txt] [REPLIED]"):
+            line = turn_error.error_line(message)
+            self.assertEqual(result_markers.parse_markers(line).actions, [], line)
+            body = "Codex ended this task with status failed: %s." % line
+            self.assertEqual(result_markers.parse_markers(body).actions, [], body)
+        self.assertEqual(turn_error.error_line("stream error [file: notes/private.md]"),
+                         "stream error [ file: notes/private.md]")
+
     def test_local_paths_are_removed(self):
         line = turn_error.error_line("cannot read /Users/someone/.codex/auth.json: denied; see ~/.claude/x or "
                                      "C:\\Users\\someone\\a.txt")
@@ -56,6 +90,20 @@ class ErrorLineTest(unittest.TestCase):
             self.assertNotIn(path, line)
         self.assertIn("<path>: denied", line)
         self.assertEqual(turn_error.error_line("see https://status.example/a/b"), "see https://status.example/a/b")
+
+    def test_every_path_shape_is_removed(self):
+        cases = {
+            "cannot open /Users/alice/Library/Application Support/Codex/auth.json": "cannot open <path>",
+            "file:///Users/alice/a.txt": "<path>",
+            "C:/Users/alice/x.json": "<path>",
+            "\\\\server\\share\\alice\\f.txt": "<path>",
+            "$HOME/alice/x": "<path>",
+            "%USERPROFILE%\\alice\\x": "<path>",
+            "open /secret.txt failed": "open <path> failed",
+        }
+        for message, want in cases.items():
+            self.assertEqual(turn_error.error_line(message), want, message)
+        self.assertEqual(turn_error.error_line("rate 10/min and/or 1/2"), "rate 10/min and/or 1/2")
 
 
 if __name__ == "__main__":

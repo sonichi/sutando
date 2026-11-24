@@ -496,7 +496,7 @@ test('a completed or aborted turn without a reply parks as an explicit protocol 
 })
 
 // As a session: an API error ends the turn with an empty answer; StopFailure carries the error's words.
-const BILLING = { error: 'billing_error', last_assistant_message: 'Credit balance is too low' } as any
+const BILLING = { session_id: 'sid-1', error: 'billing_error', last_assistant_message: 'Credit balance is too low' } as any
 
 test('a turn an API error ended parks with the words its StopFailure carried, raised before or after the turn ended; without one, the generic line', async ($, on) => {
   const h = host(on)
@@ -525,6 +525,50 @@ test('a turn an API error ended parks with the words its StopFailure carried, ra
   await $.turn.complete({ turnId: 't-e3', reason: 'error', answer: '' } as any)
   await h.clock.advance(1000)
   expect(h.files['/out/task-e3.txt']).toContain('ended without a reply (turn error without a reply)')
+})
+
+test("an error turn's own answer is never the error: only its StopFailure words, error_details first", async ($, on) => {
+  const h = host(on)
+  h.files['/in/task-y1.txt'] = TASK('task-y1')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-y1' })
+  await $.classic.StopFailure({ session_id: 'sid-1', error: 'server_error', error_details: 'API Error: Overloaded',
+                                last_assistant_message: 'Let me look at the owner notes first.' } as any)
+  await $.turn.complete({ turnId: 't-y1', reason: 'error', answer: 'Let me look at the owner notes first.' } as any)
+  expect(h.files['/out/task-y1.txt']).toContain('(turn error: API Error: Overloaded)')
+  expect(h.files['/out/task-y1.txt']).not.toContain('owner notes')
+
+  h.files['/in/task-y2.txt'] = TASK('task-y2')
+  await h.clock.advance(3000)
+  await $.turn.start({ text: h.submitted[1], turnId: 't-y2' })
+  await $.turn.complete({ turnId: 't-y2', reason: 'error', answer: 'Let me look at the owner notes first.' } as any)
+  await h.clock.advance(1000)
+  expect(h.files['/out/task-y2.txt']).toContain('(turn error without a reply)')
+  expect(h.files['/out/task-y2.txt']).not.toContain('owner notes')
+})
+
+test("a StopFailure from another turn or session never names a task's error", async ($, on) => {
+  const h = host(on)
+  h.files['/in/task-x1.txt'] = TASK('task-x1')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-x1' })
+  await $.turn.complete({ turnId: 't-x1', reason: 'error', answer: '' } as any)
+  await $.turn.start({ text: 'the owner typed something else', turnId: 't-other' })
+  await $.classic.StopFailure({ session_id: 'sid-1', error: 'unknown', last_assistant_message: 'OTHER TURN WORDS' } as any)
+  await h.clock.advance(1000)
+  expect(h.files['/out/task-x1.txt']).toContain('(turn error without a reply)')
+  expect(h.files['/out/task-x1.txt']).not.toContain('OTHER TURN WORDS')
+
+  h.files['/in/task-x2.txt'] = TASK('task-x2')
+  await h.clock.advance(3000)
+  const at = h.submitted.findIndex((t: string) => t.includes('task-x2'))
+  await $.turn.start({ text: h.submitted[at], turnId: 't-x2' })
+  await $.classic.StopFailure({ session_id: 'sid-elsewhere', error: 'unknown', last_assistant_message: 'OTHER SESSION WORDS' } as any)
+  await $.turn.complete({ turnId: 't-x2', reason: 'error', answer: '' } as any)
+  await h.clock.advance(1000)
+  expect(h.files['/out/task-x2.txt']).toContain('(turn error without a reply)')
 })
 
 test('a rejected submit spends the authorization: never resubmitted, no second authorize', async ($, on) => {
