@@ -30,7 +30,7 @@ import threading
 import time
 import uuid
 
-from ... import account_switch, card_desk, connector_cards, held_start, model_switch
+from ... import account_switch, card_desk, connector_cards, held_start, model_switch, signin_watch
 from ...acp_host import quoted
 from ...collaborator_turn import stage_own_attachments, with_staged_paths
 from ...relay_loop import count_arg
@@ -306,6 +306,12 @@ class Connector:
         self.turn_items = {}
         self.rerouted = ""        # the model Codex moved the current turn to, when it said so
         self._models = self._accounts = None
+        # The sign-in the running server started with (a fingerprint; None until auth.json reads): an account
+        # switched under it (the card, the desktop's Settings) restarts the server between turns.
+        home = signin_watch.codex_home()
+        self.signin = signin_watch.SigninWatch(os.path.join(home, signin_watch.CODEX_AUTH),
+                                               lambda: signin_watch.codex_identity(home))
+        self.signin_started = self.signin_mark()
 
     @property
     def root(self):
@@ -588,7 +594,43 @@ class Connector:
         self.rpc = self.rpc_factory()
         self.live = {}
         self.thread_id = None
+        self.signin_started = self.signin_mark()     # a new server reads auth.json afresh
         self.handshake()
+
+    def signin_mark(self):
+        """The fingerprint of the sign-in now in auth.json, None when it cannot be read."""
+        now = self.signin.current()
+        return signin_watch.fingerprint(now) if now is not None else None
+
+    def server_email(self) -> str:
+        """The email the running server is signed in with ('' when it cannot or will not say)."""
+        try:
+            acct = (self.rpc.request("account/read", {"refreshToken": False}, timeout=10) or {}).get("account")
+        except Exception:  # noqa: BLE001 - unknown reads as not confirmed, so the server is restarted
+            return ""
+        email = acct.get("email") if isinstance(acct, dict) else ""
+        return email if isinstance(email, str) else ""
+
+    def signin_check(self) -> bool:
+        """Between turns: restart the server once when auth.json names another account than the one it
+        started with; True when it did. An unreadable file changes nothing; a server already on the new
+        account (its own sign-in wrote the file) is kept; the shared daemon (proxy) is not ours to restart."""
+        if self.args.server == "proxy":
+            return False
+        now = self.signin.current()
+        if now is None:
+            return False
+        mark = signin_watch.fingerprint(now)
+        if self.signin_started is None or mark == self.signin_started:
+            self.signin_started = mark
+            return False
+        email = now[1]
+        if email and self.server_email().lower() == email.lower():
+            self.signin_started = mark
+            return False
+        log("sign-in changed in auth.json; restarting Codex on the new account")
+        self.restart_server()
+        return True
 
     def wait_turn(self, turn_id, timeout):
         """Consume events until this turn completes; returns (status, text, error) or None
@@ -731,6 +773,7 @@ class Connector:
                 self.accounts.expire()
             except Exception as e:  # noqa: BLE001
                 log("card upkeep failed:", "%s: %s" % (type(e).__name__, e))
+            self.signin_check()     # here no turn runs: the next task starts on the new account
             names = self.pending_tasks(seen)
             if not names:
                 if self.args.once and done >= self.args.once:

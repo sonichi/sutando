@@ -24,7 +24,7 @@ import sys
 import time
 from pathlib import Path
 
-from ... import claude_model_switch, connect_common as cm, task_io, tmux_pane_keys, tmux_probe
+from ... import claude_model_switch, connect_common as cm, signin_watch, task_io, tmux_pane_keys, tmux_probe
 from ...file_lock import locked_file
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
 from . import detector, hmac_policy, hold, inbox, trust
@@ -41,6 +41,7 @@ CONSUMER_WAIT_S = 30.0
 INNER_STOP_S = 120.0
 TITLE_CHANGED = "title changed"
 MODEL_ACCEPT_S = 20.0
+SIGNIN_CHECK_S = 5.0       # how often the sign-in file's stat is looked at
 # The names that may be typed, Claude Code's two texts and its input-box check are the core's
 # (src/claude_model_switch.py, bundled verbatim): one source for the skill and for this adapter.
 MODEL_RE, MODEL_SET, MODEL_CONFIRM = claude_model_switch.MODEL_RE, claude_model_switch.MODEL_SET, claude_model_switch.MODEL_CONFIRM
@@ -405,6 +406,12 @@ class Launcher:
         self.store_root = Path(cfg["HITL_STORE"]) if cfg.get("HITL_STORE") else None
         self.supervisor_lock = self.config_dir / SUPERVISOR_LOCK
         self.opaque = card.opaque_install(task_io.install_id(), self.root)
+        # The account the pane's claude started with is recorded (as a fingerprint, with that consumer) in
+        # the supervisor record; another one in `.claude.json` restarts the session once its turn ends.
+        conf = trust.config_file(cfg.get("CLAUDE_CONFIG_DIR", ""),
+                                 home=(os.environ if environ is None else environ).get("HOME", ""))
+        self.signin = signin_watch.SigninWatch(conf, lambda: signin_watch.claude_identity(conf))
+        self.signin_next, self.signin_waiting = 0.0, False
 
     # ── the record, always under the supervisor lock ─────────────────────────
 
@@ -465,7 +472,7 @@ class Launcher:
         consumer, title = await_consumer(self.tm, self.root, generation["pane_id"], sleep=self.sleep)
         if consumer is None:
             return False, "no consumer attached within %d s of the session's start" % CONSUMER_WAIT_S
-        self._with_record(lambda r: dict(r, consumer=consumer, title_token=title))
+        self._with_record(lambda r: dict(r, consumer=consumer, title_token=title, signin=self.signin_mark(consumer)))
         self.log("created session %s (pane %s, claude pid %d)" % (generation["session_id"], generation["pane_id"], consumer["pid"]))
         return True, ""
 
@@ -707,6 +714,58 @@ class Launcher:
                            "nothing recorded" % model)
         return False, "unconfirmed: /model %s was sent but Claude Code did not report the switch in %d s" % (model, wait_s)
 
+    # ── the sign-in: an account switched under the running claude ───────────
+
+    def signin_mark(self, consumer) -> "dict | None":
+        """What the supervisor record keeps of the sign-in a consumer started on; None when unreadable."""
+        now = self.signin.current()
+        return {"fp": signin_watch.fingerprint(now), "consumer": consumer} if now is not None else None
+
+    def send_keys(self, gen: dict, title: str, *names) -> int:
+        pred = tmux_pane_keys.predicate(gen["nonce"], gen["pane_pid"], gen["session_id"], gen["session_created"],
+                                        title_token=title or None)
+        argv = tmux_pane_keys.fence_keys_argv(self.tm.sock, gen["pane_id"], pred, *names, tmux=self.tm.tmux)
+        try:
+            return self.run(argv, capture_output=True, text=True, timeout=tmux_pane_keys.TIMEOUT_S + 5).returncode
+        except (OSError, subprocess.SubprocessError):
+            return tmux_pane_keys.UNCERTAIN
+
+    def signin_check(self, rec: dict) -> "tuple[bool, dict]":
+        """(restarted, record). When `.claude.json` names another account than the one this consumer started
+        with, the session is stopped once its turn is over (a usage-limit menu, which no turn gets past, is
+        dismissed first) and the next tick starts a new one on the new account, which then takes the queued
+        tasks. An unreadable file changes nothing; a consumer this record has no mark for (a new start, a
+        launcher from before this) is marked with the account now on disk and not restarted."""
+        now = self.clock()
+        if rec.get("hitl") or not rec.get("generation") or now < self.signin_next:
+            return False, rec
+        self.signin_next = now + SIGNIN_CHECK_S
+        mark = self.signin_mark(rec.get("consumer"))
+        if mark is None:
+            return False, rec
+        kept = rec.get("signin") or {}
+        if not kept.get("fp") or kept.get("consumer") != rec.get("consumer"):
+            return False, self._with_record(lambda r: dict(r, signin=mark))
+        if kept["fp"] == mark["fp"]:
+            self.signin_waiting = False
+            return False, rec
+        gen, title = rec["generation"], rec.get("title_token") or ""
+        limited = out_of_quota(self.tm.capture(gen["pane_id"]) or "") is not None
+        if not limited and self.observation.get("task") is not None:
+            if not self.signin_waiting:
+                self.log("sign-in: the account changed; restarting once the current turn ends")
+                self.signin_waiting = True
+            return False, rec
+        if limited:
+            self.send_keys(gen, title, "Escape")     # the limit menu holds the input box /exit is typed into
+            self.sleep(0.5)
+        outcome = self.stop_session(rec, "the account it is signed in with changed")
+        if outcome != "stopped":
+            self.log("sign-in: restart not done (%s); trying again" % outcome)
+            return False, rec
+        self.signin_waiting = False
+        return True, self._with_record(lambda r: dict(r, generation=None, signin=None, stall=None, deadline=None))
+
     def stopped(self, started) -> str:
         self.log("stopped in %.1f s" % (self.clock() - started))
         return "stopped"
@@ -767,6 +826,10 @@ class Launcher:
             rec = self._with_record(lambda r: dict(r, launcher=task_io.process_identity(), deadline=None))
             self.log("supervising session %s (pane %s)" % (rec["generation"]["session_id"], rec["generation"]["pane_id"]))
         rec = self.observe(rec)
+        restarted, rec = self.signin_check(rec)
+        if restarted:
+            self.adopted = False
+            return None, rec
         if rec.get("stall") and not rec.get("hitl"):
             rec = self.raise_card(rec, card.KIND_STALL, rec["stall"]["checks"])
         return None, self.apply_effects(rec)
