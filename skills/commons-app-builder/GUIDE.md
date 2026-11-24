@@ -424,6 +424,29 @@ reports on the row).
 `templates/README.md` says which to pick and how to create one. Copy and adapt rather than
 starting from an empty file, then still follow steps 2, 6 and 7 for the app you ship.
 
+## Optional helper library
+
+[`lib/commons-sdk.js`](lib/commons-sdk.js) is one file with no dependencies that wraps the page
+API for a common case: a shared list or key-value map over a database's rows, the write retry of
+step 3 with an undo when a write is refused, the room's members, a cooperative claim and release
+on a row, and asking an agent. It is optional. Everything in this guide works without it, and the
+starter templates do not use it.
+
+- **When to use it.** The page is a list people add to and change together, such as a sign-up
+  sheet or a task board. Skip it for a page that replays or groups rows in its own way, such as a
+  turn game or a poll tally.
+- **Inline it.** The sandbox has no network, so a page cannot load the file. Paste the whole file
+  into a `<script>` in the page, before your own script. `node lib/examples/inline.js` copies it
+  between two marker comments in the example pages, and `--check` says when a page carries an old
+  copy. The pre-flight in `scripts/check_page.py` passes on a page that carries it.
+- **It is not a CRDT.** The last write to reach the room wins, per map key or per list cell. A
+  claim is cooperative, not a lock.
+- **Still do steps 2, 6 and 7.** The library is tested against a fake bridge only; no real room
+  has confirmed it yet.
+
+[`lib/README.md`](lib/README.md) has the API, the conflict and claim rules, what is experimental
+and which templates it suits. This guide stays the reference for the page API itself.
+
 ## Patterns from apps that shipped
 
 - **Turn games** (Gomoku, Chinese checkers): a moves database, one row per move with
