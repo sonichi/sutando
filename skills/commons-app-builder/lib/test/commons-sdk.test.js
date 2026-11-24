@@ -674,6 +674,27 @@ test('release, lost answer: a claim renewed from the viewer\'s other tab is not 
   assert.deepEqual(lost, [true]);
 });
 
+test('release issued while this page\'s claim is pending: it waits for the claim, and when a peer won it writes nothing', async () => {
+  const { la, lb, one, pa, fake, taskDb } = await board({ room: EXACT });
+  const write = pa.artifact.db.write;
+  let first = true, release;
+  // The peer's claim, and its snapshot, land while this page's claim write is on its way.
+  pa.artifact.db.write = async (...args) => {
+    if (first) { first = false; await lb.claim(one); await settle(); release = la.release(one); }
+    return write(...args);
+  };
+  const claim = await la.claim(one);
+  assert.deepEqual([claim.ok, claim.reason, await release], [false, 'held', false]);
+  assert.equal(JSON.parse(fake.rows(taskDb)[0].cells.Claim).by, 'u-bot');
+  assert.equal(pa.calls.filter((c) => c[0] === 'db.write' && c[4] === '').length, 0);
+});
+
+test('release issued right behind a claim that wins: it releases that claim', async () => {
+  const { la, one, fake, taskDb } = await board({ room: EXACT });
+  const [claim, released] = await Promise.all([la.claim(one), la.release(one)]);
+  assert.deepEqual([claim.ok, released, fake.rows(taskDb)[0].cells.Claim, la.held.has(one)], [true, true, '', false]);
+});
+
 test('release, lost answer: an empty cell means released, whoever emptied it', async () => {
   const { la, one, pa, cell } = await tabs();
   await la.claim(one);
@@ -991,6 +1012,71 @@ test('map.update, an answer without a version: never wrong, but a lagging copy h
   assert.deepEqual([await ma.update('n', inc), room()], [{ value: 3, mode: 'exact' }, '3']);
   const live = await counter({ room: Object.assign({ ackVersion: false }, EXACT) });
   assert.deepEqual([(await live.ma.update('n', inc)).value, (await live.ma.update('n', inc)).value, live.room()], [2, 3, '3']);
+});
+
+test('a plain set right after an update that created the key shows at once, and stays', async () => {
+  const { a } = await setup({ room: EXACT });
+  const m = await a.map('App — State');
+  assert.equal((await m.update('k', () => 1)).value, 1);
+  await m.set('k', 2);
+  assert.equal(m.get('k'), 2, 'before any snapshot: the set sits on top of the acknowledged create');
+  await settle();
+  assert.equal(m.get('k'), 2);
+});
+
+test('a set on a row that only an acknowledged create supplies outlives a snapshot that does not hold the row yet', async () => {
+  const { a } = await setup({ room: EXACT });
+  const m = await a.map('App — State'), t = m.t, before = { version: t.base.version, props: t.props, rows: [] };
+  await m.update('k', () => 1);
+  await m.set('k', 2);
+  t.ingest(before);
+  assert.equal(m.get('k'), 2);
+});
+
+test('a snapshot whose rows are ahead of its version does not show a created row twice', async () => {
+  const { a, fake, mapDb } = await setup({ room: EXACT });
+  const m = await a.map('App — State'), t = m.t, version = t.base.version;
+  await m.update('k', () => 1);
+  t.ingest({ version, props: t.props, rows: fake.rows(mapDb) });
+  assert.deepEqual([t.rows.length, t.sure.length, m.get('k')], [1, 1, 1]);
+});
+
+test('set, delete, push, list update and remove stay plain writes where conditional writes exist', async () => {
+  const { a, pa } = await setup({ room: EXACT, rows: [{ Task: 'One' }] });
+  const m = await a.map('App — State'), l = await a.list('App — Tasks');
+  await m.set('k', 1); await m.delete('k');
+  const id = await l.push({ Task: 'Two' });
+  await l.update(id, { Result: 'x' }); await l.remove(id);
+  assert.equal(pa.calls.filter((c) => /^db\.(write|createRow)$/.test(c[0])).length, 5);
+  assert.equal(pa.calls.filter((c) => c.some((arg) => arg && typeof arg === 'object' && 'ifVersion' in arg)).length, 0);
+});
+
+test('calls issued back to back run in order, and each decides on what the earlier ones left', async () => {
+  const { a, fake, mapDb } = await setup({ room: EXACT });
+  const m = await a.map('App — State'), seen = [];
+  const done = await Promise.all([m.set('k', 5), m.update('k', (n) => { seen.push(n); return n + 1; }), m.delete('k'), m.update('k', (n) => { seen.push(n); return 9; })]);
+  assert.deepEqual([seen[0], seen[seen.length - 1], done[1].value, m.get('k'), fake.rows(mapDb).length], [5, undefined, 6, 9, 1]);
+});
+
+test('a plain write that waited for the viewer is shown when it is accepted, whatever arrived while it waited', async () => {
+  const { pa, fake, taskDb, clock } = await setup({ rows: [{ Task: 'One' }], a: { consent: 'unasked' } });
+  const sleep = async (ms) => { clock.advance(ms); await settle(1); };
+  const l = await (await Commons.connect({ artifact: pa.artifact, now: clock.now, sleep })).list('App — Tasks'), id = l.toArray()[0].id;
+  const saving = l.update(id, { Result: 'mine' });
+  await settle();
+  fake.serverWrite(taskDb, id, 'Status', 'Done'); await settle();
+  pa.answer(true);
+  await saving;
+  assert.equal(l.get(id).cells.Result, 'mine');
+});
+
+test('after an update with an unknown outcome, a set issued right behind it is still shown', async () => {
+  const { a, pa } = await setup({ room: EXACT });
+  const m = await a.map('App — State');
+  await m.set('k', 1); await settle();
+  pa.failNext = NO_ANSWER;
+  const [lost] = await Promise.allSettled([m.update('k', (n) => n + 1), m.set('k', 5)]);
+  assert.deepEqual([lost.reason.code, m.get('k')], ['OUTCOME_UNKNOWN', 5]);
 });
 
 /* A create whose answer arrives after the room's next snapshot. `then` runs between the two. */

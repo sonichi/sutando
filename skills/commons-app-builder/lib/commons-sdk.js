@@ -83,15 +83,17 @@
     return p;
   };
 
-  /* One database: the last snapshot, one watch, one write queue. Shared by every handle on it. */
+  /* One database. Its whole state is `base` (the newest snapshot) and `entries` (this page's own
+     writes, in the order they were issued). Every view of it is computed from those two by build(). */
   class Table {
     constructor(room, id) {
       this.room = room; this.id = id;
-      this.props = []; this.rows = [];
-      // `base` is the last snapshot; `acks` are writes the room acknowledged that it does not hold yet.
-      this.base = []; this.acks = [];
-      this.gen = 0; this.gone = false;
-      this.version = null; this.seen = null; this.plain = false;
+      this.props = [];
+      this.base = { rows: [], version: null };
+      this.entries = [];
+      this.rows = []; this.sure = [];
+      this.version = null; this.gen = 0; this.local = 0;
+      this.gone = false; this.plain = false;
       this.listeners = new Set();
       this.tail = Promise.resolve();
     }
@@ -114,53 +116,78 @@
     }
 
     ingest(snap) {
-      const seen = snap && typeof snap.version === 'number' ? snap.version : null;
+      const version = snap && typeof snap.version === 'number' ? snap.version : null;
       // The page's copy only moves forward: a snapshot older than the last one is dropped.
-      if (seen !== null && this.seen !== null && seen < this.seen) return;
-      this.seen = seen;
-      // An acknowledged write stays on top until a snapshot is new enough to hold it, or its fate.
-      this.acks = seen === null ? [] : this.acks.filter((a) => a.until > seen);
-      this.version = seen === null ? null : this.acks.reduce((v, a) => Math.max(v, a.version), seen);
+      if (version !== null && this.base.version !== null && version < this.base.version) return;
       this.gen += 1;
       this.gone = !snap;
       if (snap) this.props = snap.props || [];
-      this.base = snap ? (snap.rows || []).map((r) => ({ id: r.id, cells: Object.assign({}, r.cells) })) : [];
-      this.rebuild();
-      this.emit('remote');
+      this.base = { version, rows: snap ? (snap.rows || []).map((r) => ({ id: r.id, cells: Object.assign({}, r.cells) })) : [] };
+      this.refresh('remote');
     }
 
-    /* One place puts a write into a row set: a cell of a row that is there, or a row that is not. */
-    put(rows, w) {
-      const row = rows.find((r) => r.id === w.rowId);
-      if (w.cells) { if (!row) rows.push({ id: w.rowId, cells: Object.assign({}, w.cells) }); } else if (row) row.cells[w.prop] = w.value;
+    /* The one rule for dropping an entry. Pending: never. Acknowledged at a version: once the snapshot
+       is that new. A plain write: at the first snapshot after its answer, or with the row's creator. */
+    prune() {
+      const v = this.base.version, made = new Set();
+      this.entries = this.entries.filter((e) => {
+        let keep = e.status === 'pending';
+        if (e.status === 'acked') keep = v !== null && (e.version !== null ? v < e.version : v <= e.at);
+        if (e.status === 'plain') keep = e.gen === this.gen || (e.kind === 'cell' && made.has(e.rowId));
+        if (keep && e.kind === 'create' && e.rowId && !this.base.rows.some((r) => r.id === e.rowId)) made.add(e.rowId);
+        return keep;
+      });
     }
 
-    rebuild() {
-      this.rows = this.base.map((r) => ({ id: r.id, cells: Object.assign({}, r.cells) }));
-      for (const a of this.acks) this.put(this.rows, a);
+    /* The one function that computes a view: the snapshot, then the entries in order. `sure` leaves
+       out everything the bridge has not answered for; the page's display leaves out only quiet ones. */
+    build(sure) {
+      const rows = this.base.rows.map((r) => ({ id: r.id, cells: Object.assign({}, r.cells) }));
+      for (const e of this.entries) {
+        if (e.kind === 'none' || (e.status === 'pending' && (sure || e.quiet))) continue;
+        const row = e.kind === 'upsert' ? e.find(rows) : rows.find((r) => r.id === (e.rowId || e.local));
+        if (row && e.kind !== 'create') row.cells[e.prop] = e.value;
+        else if (!row && e.kind !== 'cell') rows.push({ id: e.rowId || e.local, cells: Object.assign({}, e.cells) });
+      }
+      return rows;
     }
 
-    /* A plain write the bridge accepted: kept only when no snapshot arrived meanwhile, because a
-       snapshot is the room's word. It replaces an acknowledged write to the same cell. */
-    keep(gen, w) {
-      if (gen !== this.gen) return;
-      this.acks = this.acks.filter((a) => a.cells || a.rowId !== w.rowId || a.prop !== w.prop);
-      this.put(this.base, w);
-      this.rebuild();
+    /* Recomputes both views and the version the next conditional write builds on, then tells the handles. */
+    refresh(origin) {
+      this.prune();
+      this.rows = this.build(false);
+      this.sure = this.build(true);
+      const v = this.base.version, known = (m, e) => (e.status === 'acked' ? Math.max(m, e.version === null ? e.at : e.version) : m);
+      this.version = v === null ? null : this.entries.reduce(known, v);
+      for (const fn of Array.from(this.listeners)) fn(origin);
     }
 
-    /* A conditional write the room acknowledged, sent at version `at`. Nothing is added when the
-       snapshot this page holds is already that new: it has the write, or what became of it. */
-    ack(at, r, w) {
-      const known = typeof r.version === 'number';
-      const a = Object.assign({ version: known ? r.version : at, until: known ? r.version : at + 1 }, w);
-      if (this.seen === null || this.seen >= a.until) return;
-      this.acks.push(a);
-      this.version = Math.max(this.version, a.version);
-      this.rebuild();
+    /* A write joins the list when it is issued, so the list keeps the order of the page's calls. */
+    add(entry) {
+      const e = Object.assign({ status: 'pending', local: '~' + (this.local += 1) }, entry);
+      this.entries.push(e);
+      this.refresh('local');
+      return e;
     }
 
-    emit(origin) { for (const fn of Array.from(this.listeners)) fn(origin); }
+    /* A write that was refused, declined or left unknown: gone at once, which is the rollback. */
+    drop(e) {
+      const i = e.status === 'pending' ? this.entries.indexOf(e) : -1;
+      if (i < 0) return;
+      this.entries.splice(i, 1);
+      this.refresh('local');
+    }
+
+    /* The bridge said yes. `mark` is the version the write was sent at (conditional), or the snapshot
+       count at its answer, -1 when a snapshot came while it was in flight and is trusted over it (plain). */
+    settle(e, r, status, mark) {
+      e.status = status;
+      if (e.kind === 'create') e.rowId = r.rowId;
+      if (status === 'plain') e.gen = mark;
+      else Object.assign(e, { at: mark, version: typeof r.version === 'number' ? r.version : null });
+      this.refresh('local');
+      return status === 'plain' ? 'local' : 'room';
+    }
 
     need(name) {
       if (!this.props.some((p) => p.name === name)) throw new CommonsError('SCHEMA', 'The database has no column named "' + name + '".');
@@ -174,6 +201,12 @@
 
     row(id) { return this.rows.find((r) => r.id === id); }
 
+    /* A cell as the bridge has answered for it: what a write may be decided on. */
+    cell(id, prop) {
+      const row = this.sure.find((r) => r.id === id);
+      return row && row.cells[prop];
+    }
+
     /* Jobs run one at a time, in call order. */
     enqueue(job) {
       const run = this.tail.then(job);
@@ -181,32 +214,10 @@
       return run;
     }
 
-    /* Shows `ops` at once, runs `job` in the queue, then drops them: a refused write rolls back. */
-    async optimistic(list, ops, job) {
-      list.push(...ops);
-      this.emit('local');
-      try { return await this.enqueue(job); } finally {
-        for (const op of ops) list.splice(list.indexOf(op), 1);
-        this.emit('local');
-      }
-    }
-
     check() { if (this.gone) throw new CommonsError('DB_GONE', 'The database was removed.'); }
 
-    async write(rowId, prop, value) {
-      this.check();
-      const gen = this.gen;
-      await this.room.send(() => this.room.art.db.write(this.id, rowId, prop, value));
-      this.keep(gen, { rowId, prop, value });
-    }
-
-    async create(cells) {
-      this.check();
-      const gen = this.gen;
-      const r = await this.room.send(() => this.room.art.db.createRow(this.id, cells));
-      this.keep(gen, { rowId: r.rowId, cells });
-      return r.rowId;
-    }
+    /* A bridge call for run(): the options are passed only when the write is conditional. */
+    call(name, ...args) { return (o) => this.room.art.db[name](this.id, ...args, ...(o ? [o] : [])); }
 
     /* One conditional attempt at the version this page holds: the bridge's answer when it landed,
        else what is known. The host never queues it, so a lost answer leaves the outcome unknown. */
@@ -221,61 +232,45 @@
       }
     }
 
-    /* Runs `step()` until its write lands. "room": the room took it at the version this page held.
-       "local": a plain write. `null`: step() declined. "contended" or "unknown": it gave up. */
-    async change(step) {
+    /* Carries one entry out, when its turn in the queue comes. `step()` decides from the sure view and
+       gives the bridge call, or null to decline. Resolves "room", "local", null, "contended" or "unknown". */
+    async run(e, step, exact) {
       let unsure = false;
-      for (let tries = 0; tries < 5; tries += 1) {
-        this.check();
-        const s = step();
-        if (!s) return null;
-        if (this.version === null || this.plain) {
-          const gen = this.gen, r = await this.room.send(() => s.call());
-          this.keep(gen, s.wrote(r));
-          return 'local';
+      try {
+        for (let tries = 0; tries < 5; tries += 1) {
+          this.check();
+          const call = step();
+          if (!call) return null;
+          this.refresh('local');
+          if (!exact || this.version === null || this.plain) {
+            // Counted from the attempt the bridge accepts: an earlier one may have waited on the viewer.
+            let gen;
+            const r = await this.room.send(() => { gen = this.gen; return call(); });
+            return this.settle(e, r, 'plain', gen === this.gen ? gen : -1);
+          }
+          const at = this.version, r = await this.cas(call);
+          if (r.plain) continue;
+          if (r.ok) return this.settle(e, r, 'acked', at);
+          unsure = unsure || !!r.unknown;
+          // Read inside the entry's own turn, so no later write of this page is in flight meanwhile.
+          try { this.ingest(await this.read()); } catch (err) {
+            if (!unsure) throw err;
+            if (e.proof) return 'unknown';
+          }
+          // Only an entry whose value is its own proof (a claim token) may look for it and go on.
+          if (r.unknown && !e.proof) throw new CommonsError('OUTCOME_UNKNOWN', 'No answer from the room: the change may or may not have been saved.', r.reason);
+          if (r.unknown && e.proof()) return 'room';
+          if (typeof r.version === 'number' && !(this.version >= r.version)) await this.room.sleep(this.room.opts.retryEvery);
         }
-        const at = this.version, r = await this.cas(s.call);
-        if (r.plain) continue;
-        if (r.ok) { this.ack(at, r, s.wrote(r)); return 'room'; }
-        // Only a step whose value is its own proof (a claim token) may look for it and go on.
-        if (r.unknown && !s.landed) throw new CommonsError('OUTCOME_UNKNOWN', 'No answer from the room: the change may or may not have been saved.', r.reason);
-        unsure = unsure || !!r.unknown;
-        try { this.ingest(await this.read()); } catch (e) {
-          if (unsure) return 'unknown';
-          throw e;
-        }
-        if (r.unknown && s.landed()) return 'room';
-        if (typeof r.version === 'number' && !(this.version >= r.version)) await this.room.sleep(this.room.opts.retryEvery);
-      }
-      return unsure ? 'unknown' : 'contended';
-    }
-
-    /* A step for change(): write one cell. `make()` builds the value anew for every attempt. */
-    cell(rowId, prop, make) {
-      const db = this.room.art.db;
-      let value;
-      return {
-        call: (o) => { value = make(); return o ? db.write(this.id, rowId, prop, value, o) : db.write(this.id, rowId, prop, value); },
-        wrote: () => ({ rowId, prop, value }),
-        landed: () => { const row = this.row(rowId); return !!row && same(row.cells[prop], value); },
-      };
-    }
-
-    /* A step for change(): create one row. */
-    fresh(cells) {
-      const db = this.room.art.db;
-      return {
-        call: (o) => (o ? db.createRow(this.id, cells, o) : db.createRow(this.id, cells)),
-        wrote: (r) => ({ rowId: r.rowId, cells }),
-      };
+        return unsure ? 'unknown' : 'contended';
+      } finally { this.drop(e); }
     }
   }
 
-  /* Shared by SharedMap and SharedList: keep a projection, diff it, tell observers. */
+  /* Shared by SharedMap and SharedList: keep a projection of the table's view, diff it, tell observers. */
   class Handle {
     constructor(table) {
       this.t = table;
-      this.ops = [];
       this.observers = new Set();
       this.off = null;
     }
@@ -323,9 +318,9 @@
     }
 
     /* Two rows with one key (two pages created it at once): the lowest row id is the key's row. */
-    rowFor(key) {
+    rowIn(rows, key) {
       let hit;
-      for (const r of this.t.rows) if (r.cells[this.keyProp] === key && (!hit || r.id < hit.id)) hit = r;
+      for (const r of rows) if (r.cells[this.keyProp] === key && (!hit || r.id < hit.id)) hit = r;
       return hit;
     }
 
@@ -339,7 +334,6 @@
       }
       const out = new Map();
       for (const [k, r] of rows) if (!cleared.is(r.cells[this.valueProp])) out.set(k, decode(r.cells[this.valueProp]));
-      for (const op of this.ops) { if (cleared.is(op.json)) out.delete(op.key); else out.set(op.key, JSON.parse(op.json)); }
       return out;
     }
 
@@ -380,30 +374,30 @@
      *  before the room answers. @returns {Promise<{value: *, mode: 'exact'|'best-effort'}>} see the README */
     async update(key, fn) {
       this.checkKey(key);
+      const t = this.t, prop = this.valueProp, e = t.add({ kind: 'none', quiet: true });
       let value;
       const step = () => {
-        const row = this.rowFor(key), cell = row && row.cells[this.valueProp];
+        const row = this.rowIn(t.sure, key), cell = row && row.cells[prop];
         value = fn(cleared.is(cell) ? undefined : decode(cell));
         const json = JSON.stringify(value);
         if (json === undefined) throw bad('A map value must be JSON.');
-        const cells = { [this.keyProp]: key, [this.valueProp]: json };
+        const cells = { [this.keyProp]: key, [prop]: json };
         checkSize(cells);
-        // A value is no proof that this write landed: a peer can write the same one.
-        return Object.assign(row ? this.t.cell(row.id, this.valueProp, () => json) : this.t.fresh(cells), { landed: null });
+        Object.assign(e, row ? { kind: 'cell', rowId: row.id, prop, value: json } : { kind: 'create', rowId: null, cells });
+        return row ? t.call('write', row.id, prop, json) : t.call('createRow', cells);
       };
-      let mode;
-      try { mode = await this.t.enqueue(() => this.t.change(step)); } catch (e) {
-        if (e.code === 'OUTCOME_UNKNOWN') await this.unknown(e, key);
-        throw e;
-      } finally { this.t.emit('local'); }
-      if (mode === 'contended') throw new CommonsError('CONTENDED', 'The database kept changing. Try again.');
+      // No proof is given to run(): a value cannot show that this write landed, a peer can write the same one.
+      const mode = await t.enqueue(() => t.run(e, step, true)).catch((err) => {
+        if (err.code === 'OUTCOME_UNKNOWN') this.unknown(err, key);
+        throw err;
+      });
+      if (mode !== 'room' && mode !== 'local') throw new CommonsError('CONTENDED', 'The database kept changing. Try again.');
       return { value, mode: mode === 'room' ? 'exact' : 'best-effort' };
     }
 
     /* Adds what this page can see now to an unknown outcome. Its own copy may be behind the room. */
-    async unknown(e, key) {
-      try { this.t.ingest(await this.t.read()); } catch (_e) { /* the error already says the outcome is unknown */ }
-      const row = this.rowFor(key), cell = row && row.cells[this.valueProp];
+    unknown(e, key) {
+      const row = this.rowIn(this.t.sure, key), cell = row && row.cells[this.valueProp];
       e.value = cleared.is(cell) ? undefined : decode(cell);
       if (this.t.version !== null) e.version = this.t.version;
     }
@@ -412,12 +406,17 @@
 
     async put(key, json) {
       this.checkKey(key);
-      checkSize({ [this.keyProp]: key, [this.valueProp]: json });
-      await this.t.optimistic(this.ops, [{ key, json }], async () => {
-        const row = this.rowFor(key);
-        if (row) await this.t.write(row.id, this.valueProp, json);
-        else if (!cleared.is(json)) await this.t.create({ [this.keyProp]: key, [this.valueProp]: json });
-      });
+      const t = this.t, prop = this.valueProp, cells = { [this.keyProp]: key, [prop]: json };
+      checkSize(cells);
+      // Shown at once by key; which row it writes, or whether it creates one, is decided at its turn.
+      const e = t.add({ kind: 'upsert', find: (rows) => this.rowIn(rows, key), prop, value: json, cells });
+      const step = () => {
+        const row = this.rowIn(t.sure, key);
+        if (!row && cleared.is(json)) return null;
+        Object.assign(e, row ? { kind: 'cell', rowId: row.id } : { kind: 'create' });
+        return row ? t.call('write', row.id, prop, json) : t.call('createRow', cells);
+      };
+      await t.enqueue(() => t.run(e, step, false));
     }
   }
 
@@ -431,7 +430,7 @@
       this.removed = removal(o.removed);
       this.claimProp = o.claimProp || 'Claim';
       this.held = new Map();
-      this.busy = new Set();
+      this.busy = new Map();
       this.start();
     }
 
@@ -440,11 +439,7 @@
 
     project() {
       const rows = [];
-      for (const r of this.t.rows) {
-        const cells = Object.assign({}, r.cells);
-        for (const op of this.ops) if (op.id === r.id) cells[op.prop] = op.value;
-        if (!this.removed.hides(cells)) rows.push(Object.freeze({ id: r.id, cells: Object.freeze(cells) }));
-      }
+      for (const r of this.t.rows) if (!this.removed.hides(r.cells)) rows.push(Object.freeze({ id: r.id, cells: Object.freeze(Object.assign({}, r.cells)) }));
       const by = this.orderBy;
       if (by) {
         rows.sort((x, y) => {
@@ -474,24 +469,26 @@
     }
 
     /* A claim this page held that now shows another token was taken over. Not judged while this
-       page's own write to that cell is in flight. */
+       page's own write to that cell is queued or in flight. */
     settle(id) {
       const mine = this.held.get(id);
-      if (!mine || this.busy.has(id)) return;
-      const raw = this.claimIn(this.t.row(id));
+      if (!mine || this.busy.get(id)) return;
+      const raw = this.parse(this.t.cell(id, this.claimProp));
       if (raw && raw.n === mine.token) return;
       this.held.delete(id);
-      if (mine.until > this.t.room.now() && mine.onLost) mine.onLost(this.claimOf(id));
+      if (mine.until > this.t.room.now() && mine.onLost) mine.onLost(this.holder(raw));
     }
 
-    /* Changes a claim cell with loss tracking paused. A refusal leaves the earlier claim tracked. */
-    async guarded(id, op, step) {
-      this.busy.add(id);
-      try { return await this.t.optimistic(this.ops, [op], () => this.t.change(step)); } catch (e) {
-        this.busy.delete(id);
+    /* Runs a claim-cell entry in the queue with loss tracking paused. A refusal leaves the earlier claim tracked. */
+    async guarded(id, e, step) {
+      const count = (by) => this.busy.set(id, (this.busy.get(id) || 0) + by);
+      count(1);
+      try { return await this.t.enqueue(() => this.t.run(e, step, true)); } catch (err) {
+        count(-1);
         this.settle(id);
-        throw e;
-      } finally { this.busy.delete(id); }
+        count(1);
+        throw err;
+      } finally { count(-1); }
     }
 
     /** @returns {Array<{id: string, cells: object}>} the rows, in order */
@@ -508,22 +505,26 @@
     async push(cells) {
       if (!cells || typeof cells !== 'object') throw bad('push takes an object of column values.');
       checkSize(cells);
-      const id = await this.t.enqueue(() => this.t.create(cells));
-      this.t.emit('local');
-      return id;
+      const t = this.t, e = t.add({ kind: 'create', cells, quiet: true });
+      await t.enqueue(() => t.run(e, () => t.call('createRow', cells), false));
+      return e.rowId;
     }
 
     /** Changes cells of one row. Shown at once; rolled back if the room refuses. One write per
      *  column, so not atomic: on a refusal the error's `written` lists the columns already saved. */
     async update(id, cells) {
-      if (!this.t.row(id)) throw new CommonsError('NOT_FOUND', 'No row with id "' + id + '".');
-      const entries = Object.entries(cells || {});
-      for (const [prop, value] of entries) { this.t.need(prop); checkSize(value); }
-      const written = [];
-      await this.t.optimistic(this.ops, entries.map(([prop, value]) => ({ id, prop, value })), async () => {
-        for (const [prop, value] of entries) {
-          try { await this.t.write(id, prop, value); } catch (e) { e.written = written; throw e; }
-          written.push(prop);
+      const t = this.t;
+      if (!t.row(id)) throw new CommonsError('NOT_FOUND', 'No row with id "' + id + '".');
+      const pairs = Object.entries(cells || {});
+      for (const [prop, value] of pairs) { t.need(prop); checkSize(value); }
+      const entries = pairs.map(([prop, value]) => t.add({ kind: 'cell', rowId: id, prop, value })), written = [];
+      await t.enqueue(async () => {
+        try {
+          for (const e of entries) { await t.run(e, () => t.call('write', id, e.prop, e.value), false); written.push(e.prop); }
+        } catch (err) {
+          for (const e of entries) t.drop(e);
+          err.written = written;
+          throw err;
         }
       });
     }
@@ -531,68 +532,72 @@
     /** Hides a row from the list by writing the removal marker. @returns {Promise<void>} */
     async remove(id) { return this.update(id, this.removed.cells()); }
 
-    claimIn(row) {
-      const raw = row && decode(row.cells[this.claimProp]);
+    parse(cell) {
+      const raw = decode(cell);
       return raw && typeof raw === 'object' && typeof raw.by === 'string' && Number.isFinite(raw.until) ? raw : null;
     }
 
-    rawClaim(id) { return this.claimIn(this.get(id)); }
-
-    /** Who holds a row now: `{id, name, kind, until, mine}`, or null when free or expired.
-     *  The holder is what the claimer wrote about itself: the room does not attest it. */
-    claimOf(id) {
-      const raw = this.rawClaim(id);
+    /* A live claim as callers see it; null for none or one that ran out. */
+    holder(raw) {
       if (!raw || raw.until <= this.t.room.now()) return null;
       const me = this.t.room.art.me;
       return { id: raw.by, name: String(raw.name || ''), kind: raw.kind === 'agent' ? 'agent' : 'person', until: raw.until, mine: !!me && raw.by === me.id };
     }
 
+    /** Who holds a row now: `{id, name, kind, until, mine}`, or null when free or expired.
+     *  The holder is what the claimer wrote about itself: the room does not attest it. */
+    claimOf(id) {
+      const row = this.get(id);
+      return this.holder(row && this.parse(row.cells[this.claimProp]));
+    }
+
     /** Claims a row for `opts.ttl` ms (default 60000). Resolves `{ok, holder, certainty, reason?}`: "room" when
      *  the room took a conditional write, else "local". A later loss calls `opts.onLost(holder)`. See the README. */
     async claim(id, opts) {
-      const o = opts || {}, ttl = o.ttl === undefined ? 60000 : o.ttl;
+      const o = opts || {}, ttl = o.ttl === undefined ? 60000 : o.ttl, t = this.t, prop = this.claimProp;
       if (!(ttl > 0) || !Number.isFinite(ttl)) throw bad('ttl is a positive number of milliseconds.');
-      this.t.need(this.claimProp);
+      t.need(prop);
       if (!this.get(id)) throw new CommonsError('NOT_FOUND', 'No row with id "' + id + '".');
-      const early = this.claimOf(id);
-      if (early && !early.mine) return { ok: false, reason: 'held', holder: early, certainty: 'local' };
-      const room = this.t.room, me = room.me(), op = { id, prop: this.claimProp, value: '' };
-      const tokens = new Set();
+      const room = t.room, me = room.me(), tokens = new Set();
+      // Any token this call wrote is proof: an attempt whose answer was lost may be the one that stayed.
+      const mine = () => { const raw = this.parse(t.cell(id, prop)); return raw && raw.by === me.id && tokens.has(raw.n) ? raw : null; };
       // Stamped anew for every attempt: a write can wait on the viewer for longer than the ttl.
       const stamp = () => {
         const n = nonce();
         tokens.add(n);
-        return (op.value = JSON.stringify({ by: me.id, name: me.name, kind: me.kind, until: room.now() + ttl, n }));
+        return JSON.stringify({ by: me.id, name: me.name, kind: me.kind, until: room.now() + ttl, n });
       };
-      stamp();
+      const e = t.add({ kind: 'cell', rowId: id, prop, value: stamp(), proof: () => !!mine() });
       const step = () => {
-        const raw = this.claimIn(this.t.row(id));
-        return raw && raw.by !== me.id && raw.until > room.now() ? null : this.t.cell(id, this.claimProp, stamp);
+        const raw = this.parse(t.cell(id, prop));
+        if (raw && raw.by !== me.id && raw.until > room.now()) return null;
+        return (opt) => t.call('write', id, prop, (e.value = stamp()))(opt);
       };
-      const mode = await this.guarded(id, op, step);
-      // Any token this call wrote is proof: an attempt whose answer was lost may be the one that stayed.
-      const raw = this.claimIn(this.t.row(id));
-      const won = mode !== null && !!raw && raw.by === me.id && tokens.has(raw.n);
-      if (won && raw.until > room.now()) {
-        this.held.set(id, { token: raw.n, until: raw.until, onLost: o.onLost });
-        return { ok: true, holder: this.claimOf(id), certainty: mode === 'local' ? 'local' : 'room' };
+      const mode = await this.guarded(id, e, step), won = mode !== null && mine();
+      if (won && won.until > room.now()) {
+        this.held.set(id, { token: won.n, until: won.until, onLost: o.onLost });
+        return { ok: true, holder: this.holder(won), certainty: mode === 'local' ? 'local' : 'room' };
       }
       this.settle(id);
-      const holder = this.claimOf(id);
+      const holder = this.holder(this.parse(t.cell(id, prop)));
       const reason = won ? 'expired' : holder && !holder.mine ? 'held' : mode === 'unknown' ? 'unknown' : 'contended';
       return { ok: false, reason, holder, certainty: 'local' };
     }
 
     /** Gives up the viewer's claim on a row by emptying the claim cell, and only while the cell still holds
-     *  the exact claim seen at the call. @returns {Promise<boolean>} false when it was not, or is no longer, there */
+     *  the exact claim found when its turn came. @returns {Promise<boolean>} false when it was not, or is no longer, there */
     async release(id) {
-      const holder = this.claimOf(id), cellOf = () => { const row = this.t.row(id); return row && row.cells[this.claimProp]; };
-      if (!holder || !holder.mine) { this.held.delete(id); return false; }
-      // Pinned to this one claim: a renewal from the viewer's other tab is a different value.
-      const pinned = cellOf();
-      const step = () => (cellOf() === pinned ? this.t.cell(id, this.claimProp, () => '') : null);
-      const mode = await this.guarded(id, { id, prop: this.claimProp, value: '' }, step);
-      if (cleared.is(cellOf())) { this.held.delete(id); return true; }
+      const t = this.t, prop = this.claimProp, me = t.room.me();
+      let pinned;
+      const e = t.add({ kind: 'cell', rowId: id, prop, value: '', proof: () => cleared.is(t.cell(id, prop)) });
+      // Authorised and pinned from the same view, at its turn: a claim of this page still pending counts for nothing.
+      const step = () => {
+        const cell = t.cell(id, prop), raw = this.parse(cell);
+        if (pinned === undefined) pinned = raw && raw.by === me.id && raw.until > t.room.now() ? cell : null;
+        return pinned !== null && cell === pinned ? t.call('write', id, prop, '') : null;
+      };
+      const mode = await this.guarded(id, e, step);
+      if (pinned && cleared.is(t.cell(id, prop))) { this.held.delete(id); return true; }
       if (mode === 'unknown') throw new CommonsError('OUTCOME_UNKNOWN', 'No answer from the room: the claim may or may not have been released.');
       this.settle(id);
       return false;

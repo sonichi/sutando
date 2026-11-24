@@ -44,17 +44,18 @@ function createFakeRoom(options) {
     for (const c of clients) {
       for (const id of now) {
         if (c.manual || !c.watchers.has(id)) continue;
-        const snap = dbs.has(id) ? snapshot(dbs.get(id)) : null;
+        // hold: "sync" hands over the room as it is when the page gets the snapshot, not as it was.
+        const now = () => (dbs.has(id) ? snapshot(dbs.get(id)) : null), snap = opt.hold === 'sync' ? null : now();
         if (c.paused) c.missed.add(id);
-        else later('snapshot', () => { if (c.watchers.has(id)) c.watchers.get(id)(snap); });
+        else later('snapshot', c.tab, () => { if (c.watchers.has(id)) c.watchers.get(id)(opt.hold === 'sync' ? now() : snap); });
       }
     }
   }
 
   // With `hold`, every snapshot and every write answer waits in `pending` until the test runs it.
   const pending = [], log = [];
-  const later = (kind, run) => { if (opt.hold) pending.push({ kind, run }); else run(); };
-  const answered = (result) => (opt.hold ? new Promise((ok) => pending.push({ kind: 'answer', run: () => ok(result) })) : result);
+  const later = (kind, tab, run) => { if (opt.hold) pending.push({ kind, tab, run }); else run(); };
+  const answered = (result, tab, exact) => (opt.hold ? new Promise((ok) => later(exact ? 'exact-answer' : 'answer', tab, () => ok(result))) : result);
 
   // Changes are coalesced: one snapshot per database per turn, to every watcher, the writer too.
   function changed(id) {
@@ -197,7 +198,7 @@ function createFakeRoom(options) {
             const row = db && db.rows.find((r) => r.id === rowId);
             if (!row) return { ok: false, reason: 'row not found' };
             const reason = writeGate(value) || fits(db, prop, value) || (exact && (unfit(opts) || moved(db, opts)));
-            if (reason) return answered(refused(db, reason));
+            if (reason) return answered(refused(db, reason), c.tab, exact);
             const prev = row.cells[propName(db, prop)];
             row.cells[propName(db, prop)] = copy(value);
             if (c.manual && !exact) {
@@ -206,8 +207,8 @@ function createFakeRoom(options) {
               return { ok: true };
             }
             changed(id);
-            log.push({ tab: c.tab, exact, rowId, prop, value: copy(value), prev, version: db.version });
-            return answered(exact ? answer(db) : { ok: true });
+            log.push({ tab: c.tab, db: id, exact, rowId, prop: propName(db, prop), value: copy(value), prev, version: db.version, time: clock.now() });
+            return answered(exact ? answer(db) : { ok: true }, c.tab, exact);
           },
           createRow: async (id, cells, opts) => {
             call('db.createRow', id, cells, ...(opts ? [opts] : []));
@@ -216,7 +217,7 @@ function createFakeRoom(options) {
             let reason = writeGate(cells);
             for (const [k, v] of Object.entries(cells)) reason = reason || fits(db, k, v);
             reason = reason || (exact && (unfit(opts) || moved(db, opts)));
-            if (reason) return answered(refused(db, reason));
+            if (reason) return answered(refused(db, reason), c.tab, exact);
             if (c.manual && !exact) {
               const row = { id: nextId('r'), cells: {} };
               for (const [k, v] of Object.entries(cells)) row.cells[propName(db, k)] = copy(v);
@@ -226,8 +227,8 @@ function createFakeRoom(options) {
               return { ok: true, rowId: row.id };
             }
             const rowId = addRow(dbs.get(id), cells, c.account);
-            log.push({ tab: c.tab, exact, rowId, cells: copy(cells), version: db.version });
-            return answered(exact ? answer(db, { rowId }) : { ok: true, rowId });
+            log.push({ tab: c.tab, db: id, exact, rowId, cells: copy(cells), version: db.version, time: clock.now() });
+            return answered(exact ? answer(db, { rowId }) : { ok: true, rowId }, c.tab, exact);
           },
           onChange: (id, fn) => {
             call('db.onChange', id);
