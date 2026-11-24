@@ -401,11 +401,12 @@ FAILED_TO_START = "I couldn't start the switch. Nothing changed."
 
 
 def begin_switch(ws: Path, room: str, rt: str, current: str, t: float, *, event: str = "", core=None,
-                 execute=None, popen=subprocess.Popen, attempt: str = "") -> dict:
+                 execute=None, popen=subprocess.Popen, attempt: str = "", tell_failure: bool = True) -> dict:
     """Admit one switch to `rt`, say so in the room, and start it detached. What a tap on a signed-in
     runtime does, and what the sign-in waiter does once the sign-in is there. `event` is the card the
     tap answered: it is edited to say so, and the outcome edits it again. `attempt` is the id the caller
-    already put on record for it (the waiter's hand-off); one is made otherwise."""
+    already put on record for it (the waiter's hand-off); one is made otherwise. The waiter also passes
+    `tell_failure` False: it records a failed launch itself before the card hears of it."""
     attempt = attempt or f"{int(t)}-{secrets.token_hex(4)}"
     rec = {"attempt": attempt, "runtime": rt, "room": room, "ts": t}
     try:
@@ -421,10 +422,12 @@ def begin_switch(ws: Path, room: str, rt: str, current: str, t: float, *, event:
         pid = start_switch(ws, room, rt, attempt, popen, card=event if posted.get("edited") else "")
     except OSError as e:
         release(ws, rec)
-        # The card just said "Switching": it must not go on saying so.
-        told = _answer(ws, room, event if posted.get("edited") else "", "error", "Not switched", FAILED_TO_START,
-                       f"runtime-card:{attempt}:not-started", core=core or None, execute=execute)
-        return {"status": "failed", "say": FAILED_TO_START, "why": f"{type(e).__name__}: {e}", "told": told["status"]}
+        out = {"status": "failed", "say": FAILED_TO_START, "why": f"{type(e).__name__}: {e}"}
+        if tell_failure:    # the card just said "Switching": it must not go on saying so
+            out["told"] = _answer(ws, room, event if posted.get("edited") else "", "error", "Not switched",
+                                  FAILED_TO_START, f"runtime-card:{attempt}:not-started", core=core or None,
+                                  execute=execute)["status"]
+        return out
     out = {"status": "started", "attempt": attempt, "pid": pid, "runtime": rt, "say": say}
     out.update({"event_id": posted["event_id"]} if posted.get("event_id") else {"card_why": posted.get("why", "")})
     return out
@@ -628,16 +631,13 @@ def _await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, r
                 finish_wait(ws, mine)       # not admitted any more because its worker ran and finished
                 return _emit({"status": "handed_off", "runtime": args.runtime, "after_sign_in": True})
         out = begin_switch(ws, args.room, args.runtime, runtime(), clock(), event=card_event, core=core,
-                           execute=execute, popen=popen, attempt=switch)
+                           execute=execute, popen=popen, attempt=switch, tell_failure=False)
         out["after_sign_in"] = True
         if out["status"] == "started":
             finish_wait(ws, mine)
             return _emit(out)
         # Not started: that is this attempt's outcome. Its exact words go on record before the card is
         # told, so a waiter resumed after a lost receipt repeats the telling and never the switch.
-        if out.get("told") == "posted":
-            finish_wait(ws, mine)
-            return _emit(out, 1)
         if not claim_wait(ws, mine, "refused", words=out["say"]):
             return _emit(superseded)
         return refuse(card_event, out["say"], out)
