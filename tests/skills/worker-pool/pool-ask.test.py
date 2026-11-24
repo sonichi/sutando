@@ -107,7 +107,7 @@ class WhoAgentIds(Base):
                      self._row(instance="alpha-lane-2", worker=self.alpha, server="other.net",
                                gateway_url="https://other.net", agent_mxid="@alpha-other:other.net")])
         by = {r["id"]: r for r in pa.who(self.ws, runner=Tmux())}
-        want = connections.worker_identity(self.alpha, self.ws)["agent_mxid"]
+        want = connections.worker_identity(self.alpha, self.ws, server="fixture.net")["agent_mxid"]
         self.assertEqual(by[self.alpha]["agent_mxid"], want)
         self.assertEqual(want, "@alpha-agent:fixture.net")
 

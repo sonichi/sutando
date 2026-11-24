@@ -178,6 +178,10 @@ creates that agent in AG2 Space, and its access token becomes a connection row n
   unstamped notes that a core lane sends.
 - It never becomes primary, and owns no unaddressed message or owner card.
 
+A worker holds at most one such agent per server: one on each homeserver the core is connected to, each its own
+row and lane. Rooms use the agent on their server; a note naming no room goes from the one on the primary's server.
+`show` lists them all; `rotate` and `remove` take `--server` (or infer it while there is one); `retire` removes all.
+
 The core owns that identity's lifecycle and its lane; the worker's session uses it. From the worker's seat, room
 clients (`room_ops.py`, `notify.py`, the room-database adapters) act as the worker's own agent in rooms on its
 server, through the one resolver (`connections.acting_identity`, see `docs/connections.md`, "In a pool worker's
@@ -194,9 +198,9 @@ naming `SUTANDO_WORKER_ID` and `AG2_MCP_WORKER_CREDENTIAL` (`codex_worker_mcp.py
 
 ```bash
 python3 skills/worker-pool/scripts/pool_identity.py add <worker> --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"
-python3 skills/worker-pool/scripts/pool_identity.py show <worker>
-python3 skills/worker-pool/scripts/pool_identity.py rotate <worker> --repo . --logs-dir <logs dir>
-python3 skills/worker-pool/scripts/pool_identity.py remove <worker>
+python3 skills/worker-pool/scripts/pool_identity.py show <worker> [--server <server>]
+python3 skills/worker-pool/scripts/pool_identity.py rotate <worker> --repo . --logs-dir <logs dir> [--server <server>]
+python3 skills/worker-pool/scripts/pool_identity.py remove <worker> [--server <server>]
 ```
 
 `add` asks for the token at a hidden prompt (`-` reads it from stdin), then shows what the token's gateway says and
@@ -219,11 +223,11 @@ worker that already had its agent, or got it through `provision-*`, is switched 
 queues straight into `<workspace>/agents/<segment>/tasks`, nothing is routed through `deliveries/<id>/`, and
 its session answers in that folder's `results/`; see `docs/connections.md`, "A worker on its own folders".
 
-`pool_manage.py retire` also removes the worker's agent identity: its lane, its row and its vault secret. s.space
-cannot delete a live agent for us yet (`account.agents.retire` refuses one with `identity_retire_unavailable`), so
-the agent itself stays on its server until the owner deletes it in the app. Retire says so in its JSON line
+`pool_manage.py retire` also removes the worker's agent identities, one per server: it marks them all retiring,
+stops every lane, then drops their rows and vault secrets. s.space cannot delete a live agent for us yet (`account.agents.retire` refuses one with `identity_retire_unavailable`), so
+each agent itself stays on its server until the owner deletes it in the app. Retire says so in its JSON line
 (`identity.agent_removal: "owner_step"`, `identity.owner_told`) and sends the owner a note in their DM naming the
-agent to delete.
+agents to delete.
 
 Retiring a worker whose device-flow approval is still open withdraws it (`pool_device_connect.withdraw`): the
 approval record turns `withdrawn`, the approval card turns to "Withdrawn" (or the owner gets a text note) telling the
