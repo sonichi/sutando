@@ -138,7 +138,7 @@ def _notify(workspace, config_dir: str, now: float) -> str:
 _ROUTING_SH = (
     '. "$1/scripts/python-binary.sh" && PY="$(resolve_python "$1")" && REPO="$1" '
     '&& . "$1/src/skill-manifest-config.sh" && . "$1/src/claude_routing.sh" '
-    '&& { if claude_direct_routing; then echo direct; else echo proxy; fi; }')
+    '&& { if claude_routes_direct; then echo direct; else echo proxy; fi; }')
 
 
 def direct_routing_on(runner: Callable = subprocess.run, repo: Optional[Path] = None) -> Optional[bool]:

@@ -477,8 +477,12 @@ def pending(workspace: Path, recipient: str) -> list[Path]:
     for p in d.iterdir():
         got = parse_sentinel(p.name)
         if got and not got[1]:
-            out.append(p)
-    return sorted(out, key=lambda q: (q.stat().st_mtime, q.name))
+            # Unlocked listing: a sentinel withdrawn since is no longer pending. Only ENOENT says so.
+            try:
+                out.append((p.stat().st_mtime, p.name, p))
+            except FileNotFoundError:
+                continue
+    return [p for _mtime, _name, p in sorted(out, key=lambda t: t[:2])]
 
 
 def accepted(workspace: Path, recipient: str) -> list[Path]:
