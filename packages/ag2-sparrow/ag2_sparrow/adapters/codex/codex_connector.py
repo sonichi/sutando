@@ -35,7 +35,8 @@ from ...collaborator_turn import stage_own_attachments, with_staged_paths
 from ...relay_loop import count_arg
 from ...task_io import (AUDIENCE_RULE, DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER_CAPABILITIES,  # noqa: F401
                         LockRefused, acquire_lock, attested_headers, exit_on_sigterm, holder_consumer, load_done,
-                        make_dirs, non_owner_note, parse_task, pid_alive, exit_code, record_done, release_lock,
+                        make_dirs, non_owner_note, parse_task, pid_alive, exit_code, record_done, refusal_body,
+                        release_lock,
                         root_path, start_time, stop_requested, turn_policy, write_atomic)
 
 CLIENT = {"name": "ag2-sparrow-codex", "version": "0.1.0"}
@@ -642,7 +643,8 @@ class Connector:
             policy = turn_policy(headers, self.args.allow_non_owner)
             if not policy.served:
                 log("refused (non-owner, %s not set) ->" % policy.unlock, task_id, headers["access_tier"])
-                write_atomic(os.path.join(self.args.results, name), NON_OWNER_REFUSED)
+                write_atomic(os.path.join(self.args.results, name),
+                             refusal_body(headers, self.args.state))
                 record_done(done_path, task_id)
                 done += 1
                 idle_since = time.time()

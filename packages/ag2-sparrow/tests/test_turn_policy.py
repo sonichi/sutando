@@ -6,8 +6,10 @@ each adapter's suite also proves its mechanics follow the capabilities (sandbox,
 file operations, isolated turn). Run:
     python3 packages/ag2-sparrow/tests/test_turn_policy.py
 """
+import os
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -124,6 +126,42 @@ class AdapterDelegation(unittest.TestCase):
         for copy in ('if headers.get("access_tier") == "owner":', "kind = admission(headers, x)",
                      'headers.get("collaborator") == "true"', "if is_collaborator(headers):"):
             self.assertIsNotNone(PRIVATE_TIER.search(copy), copy)
+
+
+class RefusalNotice(unittest.TestCase):
+    """A refused sender is told once, not under every message: an older connector answered each room
+    message, other agents' included, with the owner-only line."""
+    HUMAN = {"access_tier": "guest", "user_id": "@pat:s.example", "channel_id": "!room:s.example"}
+
+    def test_a_sender_is_told_once_a_day_in_a_room(self):
+        with tempfile.TemporaryDirectory() as d:
+            said = [task_io.refusal_body(self.HUMAN, d, now=t) for t in (1000.0, 1060.0, 1000.0 + 86399)]
+            self.assertEqual(said, [task_io.NON_OWNER_REFUSED, task_io.REFUSED_QUIETLY, task_io.REFUSED_QUIETLY])
+            self.assertEqual(task_io.refusal_body(self.HUMAN, d, now=1000.0 + 86401), task_io.NON_OWNER_REFUSED)
+            # Another room, and another sender, are each told for themselves.
+            for other in ({"channel_id": "!other:s.example"}, {"user_id": "@sam:s.example"}):
+                self.assertEqual(task_io.refusal_body(dict(self.HUMAN, **other), d, now=1061.0),
+                                 task_io.NON_OWNER_REFUSED, other)
+            self.assertEqual(task_io.REFUSED_QUIETLY, "[no-send]\n")
+
+    def test_an_agent_or_a_message_for_someone_else_is_never_told(self):
+        with tempfile.TemporaryDirectory() as d:
+            for quiet in ({"user_id": "@blue.agent:s.example"}, {"addressed_to": "Pat"}, {"owner_mentioned": "true"}):
+                self.assertEqual(task_io.refusal_body(dict(self.HUMAN, **quiet), d), task_io.REFUSED_QUIETLY, quiet)
+            self.assertEqual(os.listdir(d), [], "a quiet refusal records nothing")
+            # A name that only contains the word is a person.
+            self.assertEqual(task_io.refusal_body(dict(self.HUMAN, user_id="@agent.pat:s.example"), d),
+                             task_io.NON_OWNER_REFUSED)
+
+    def test_without_a_state_folder_or_a_sender_the_notice_is_kept(self):
+        self.assertEqual(task_io.refusal_body(self.HUMAN), task_io.NON_OWNER_REFUSED)
+        with tempfile.TemporaryDirectory() as d:
+            for _ in range(2):
+                self.assertEqual(task_io.refusal_body({"access_tier": "guest"}, d), task_io.NON_OWNER_REFUSED)
+            # A state folder that cannot be written keeps the notice.
+            blocked = os.path.join(d, "file")
+            open(blocked, "w").close()
+            self.assertEqual(task_io.refusal_body(self.HUMAN, blocked), task_io.NON_OWNER_REFUSED)
 
 
 if __name__ == "__main__":

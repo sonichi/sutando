@@ -6,6 +6,7 @@ Package level so adapters share it without importing one another. Stdlib only.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import signal
@@ -43,6 +44,36 @@ AUDIENCE_RULE = (
 )
 # The one refusal every adapter writes for a tier it does not serve; the sender learns nothing else.
 NON_OWNER_REFUSED = "This agent only answers its owner here.\n"
+# A refusal that owes its sender no notice: the task is answered and nothing is posted.
+REFUSED_QUIETLY = "[no-send]\n"
+NOTICE_EVERY_S = 24 * 3600
+
+
+def refusal_body(headers, state_dir="", now=None):
+    """What a refused task is answered with: NON_OWNER_REFUSED at most once a day for a sender in a room,
+    and never to another agent, nor for a message that replies to someone else or mentions only the owner.
+    A room that delivers every message would otherwise get the notice under each one."""
+    who, room = (headers.get("user_id") or "").strip(), (headers.get("channel_id") or "").strip()
+    to_other = (headers.get("addressed_to") or "").strip() or headers.get("owner_mentioned") == "true"
+    if who.split(":", 1)[0].endswith(".agent") or to_other:
+        return REFUSED_QUIETLY
+    if not state_dir or not who:
+        return NON_OWNER_REFUSED
+    said = os.path.join(state_dir, "refusal-notices", hashlib.sha256(f"{who}\0{room}".encode()).hexdigest()[:32])
+    now = time.time() if now is None else now
+    try:
+        if now - os.stat(said).st_mtime < NOTICE_EVERY_S:
+            return REFUSED_QUIETLY
+    except OSError:
+        pass
+    try:
+        os.makedirs(os.path.dirname(said), exist_ok=True)
+        with open(said, "wb"):
+            pass
+        os.utime(said, (now, now))
+    except OSError:
+        pass
+    return NON_OWNER_REFUSED
 
 
 def attested_headers(text: str) -> "local_task_protocol.TaskHeaders":

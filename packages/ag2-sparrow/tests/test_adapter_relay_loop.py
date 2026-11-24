@@ -212,6 +212,13 @@ class AdmissionTest(unittest.TestCase):
             self.assertEqual([c.args[0]["access_tier"] for c in spy.call_args_list], ["guest", "team"])
             self.assertEqual((Path(loop.args.results) / "task-g.txt").read_text(), task_io.NON_OWNER_REFUSED)
         self.assertIs(rl.NON_OWNER_REFUSED, task_io.NON_OWNER_REFUSED)
+        # One notice for a sender in a room, then silence; an agent sender is never told.
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stderr(io.StringIO()):
+            loop, pat = Loop(d), {"access_tier": "guest", "user_id": "@pat:s.x", "channel_id": "!r:x"}
+            for name, headers in (("task-1.txt", pat), ("task-2.txt", pat), ("task-3.txt", dict(pat, user_id="@b.agent:s.x"))):
+                self.assertTrue(loop.refusal(name, headers, set()))
+            said = [(Path(loop.args.results) / ("task-%d.txt" % n)).read_text() for n in (1, 2, 3)]
+            self.assertEqual(said, [task_io.NON_OWNER_REFUSED, task_io.REFUSED_QUIETLY, task_io.REFUSED_QUIETLY])
         for mod in (rl, cc):
             self.assertIs(mod.turn_policy, task_io.turn_policy, mod)
         for mod in (ra, cc):
