@@ -1,11 +1,17 @@
 {
   "name": "quota-tracker",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "stable",
-  "description": "Track Claude Code quota usage via Anthropic API rate limit headers. Shows 5h and 7d utilization, reset times, and quota status. Works with both subscription and API key auth.",
+  "description": "Track Claude Code quota usage via Anthropic API rate limit headers (credential proxy) or, without the proxy, Claude Code's own status line rate_limits and StopFailure rate_limit hook. Shows 5h and 7d utilization, reset times, and quota status. Config: QUOTA_STATUSLINE_ENABLED (default true) installs the status line recorder and StopFailure hook in every Claude session's config dir at launch, and false removes them and routes sessions through the credential proxy again (on, the launchers drop a local-proxy ANTHROPIC_BASE_URL so sessions call Anthropic directly); QUOTA_STATUSLINE_PASSTHROUGH names a status line command to show instead of the short line (unset: the one the installer replaced). QUOTA_STATUS_PUBLISH (default true) sends the core's 5h/7d used percentages, reset times, limit state and last check on the gateway heartbeat (health.quota, quota_status.v1) for the agent sidebar; false stops it at the gateway's next start.",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
+  },
+  "on_session_config": "scripts/install-statusline.py",
+  "config": {
+    "QUOTA_STATUSLINE_ENABLED": "true",
+    "QUOTA_STATUSLINE_PASSTHROUGH": "",
+    "QUOTA_STATUS_PUBLISH": "true"
   }
 }

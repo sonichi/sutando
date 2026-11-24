@@ -106,19 +106,10 @@ class TestSelection(Base):
         self.record(THREE)
         self.assertEqual(self.instance("!opaqueid"), "s-space")
 
-    def test_a_domainless_room_follows_the_lane_with_a_task_open_in_it(self):
+    def test_a_domainless_room_is_the_primary_whatever_a_lane_once_handled(self):
         self.record(THREE)
         state = C.record_path(self.ws).parent
         (state / "remote-task-rooms.dev-s-space.json").write_text(json.dumps({"task-dev-s-space~1": "!opaqueid"}))
-        (state / "remote-task-rooms.json").write_text("{broken")
-        self.assertEqual(self.instance("!opaqueid"), "dev-s-space")
-        self.assertEqual(self.instance("!otherid"), "s-space")
-
-    def test_a_domainless_room_open_on_two_lanes_is_the_primary(self):
-        self.record(THREE)
-        state = C.record_path(self.ws).parent
-        for name in ("remote-task-rooms.json", "remote-task-rooms.dev-s-space.json"):
-            (state / name).write_text(json.dumps({"t": "!opaqueid"}))
         self.assertEqual(self.instance("!opaqueid"), "s-space")
 
     def test_unknown_server_is_refused_by_name(self):

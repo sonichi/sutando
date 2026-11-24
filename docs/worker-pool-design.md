@@ -100,6 +100,28 @@ That last rule is the point: a surviving sentinel, `.alive` file, done-flag or
 archived header from the deleted worker can never be read as belonging to its
 namesake.
 
+### Attaching from a terminal
+
+`create_worker.py` prints a copyable `session` command. If a launcher reports
+failure while its session is alive or cannot be checked, the retained-worker
+diagnostic prints the same form of command. Both use `spawn_worker.attach_command`:
+
+```sh
+'tmux' '-S' '/path/with spaces/worker.sock' 'attach-session' '-t' '=sutando-worker-7c54b230a8d94ea9b86f52d70134ac68'
+```
+
+The `-S` server path remains one literal argument, including quotes and shell
+metacharacters. The quoted `=session` target requires an exact tmux session name
+and also prevents Zsh's leading-`=` expansion; the command works in Bash and Zsh.
+If that worker session is absent, it fails instead of attaching to its
+`-watcher` session or another session sharing the prefix. Once the exact target
+exists again, the same command can attach. It does not create or recover a
+session or establish conversation continuity.
+
+This formatting is only for human-readable guidance. JSON server/session
+coordinates, worker identities, roster and inboxes, exit statuses, and the
+decision to retain or roll back a failed launch keep their existing contracts.
+
 ## Task, delivery, attempt
 
 | level | what it is | cardinality |
@@ -149,10 +171,22 @@ the id is its name, the recipient is its folder, and the worker reads the payloa
 location records nothing, because it does not move until `finish`. Two records, two
 different facts — who owns it, what it says — so nothing can disagree.
 
+The router does write one thing into a sentinel it creates or renews: a lease,
+`{"delivered_at": <unix time>, "ttl_s": <seconds>}` (`pool_delivery.lease_body`,
+`WORKER_POOL_DELIVERY_TTL_S`, default 4 h). It never changes who holds the task; every
+reader still keys on the name. It bounds how long the holding worker may answer that
+task as a core agent (`connections.task_reply_agent` through `pool_holder.pool_delegation`).
+A lapsed, missing or unreadable lease is logged as `pool_delegation_not_current` and still
+allowed (`WORKER_POOL_DELIVERY_EXPIRY=warn`). `enforce`, which would refuse it, is not
+available: until `pool_delivery.ENFORCE_AVAILABLE` flips, a configured `enforce` reads as
+`warn` and logs `pool_delegation_enforce_unavailable`. A refused reply would leave the task
+in neither lane, with no hand-back or renewal path (the review gap raised on #6760); the
+constant flips only in the change that adds that path.
+
 **Why not move the payload into the folder instead** (the rescue line's shape, and a
 draft of this section): a set to N workers then costs N copies of the payload plus a
 persisted member list so a crash mid-copy resumes rather than repeats. With sentinels a
-set is N empty files and one payload, and that machinery does not exist. The price is
+set is N small sentinels and one payload, and that machinery does not exist. The price is
 two extra residue rows below — a sentinel whose payload was archived, and a payload
 archived between noticing the sentinel and reading it — both bounded and cheap.
 
@@ -521,7 +555,7 @@ parses the headers with `local_task_protocol`, never by hand.
  "bindings":{"!abc:ag2.space":"7c54b230a8d94ea9b86f52d70134ac68","!def:ag2.space":["7c54b230a8d94ea9b86f52d70134ac68","e1f0a94c73bd4a1e8c6f2b5d09a7e341"]}}
 ```
 
-A sentinel is empty, so an assignment carries no roster `version`; the router reports the version of the pass in its status output only.
+A sentinel carries only its lease, so an assignment carries no roster `version`; the router reports the version of the pass in its status output only.
 
 `create_worker.py` validates an existing roster through
 `pool_roster.validate_current_roster` before previewing or launching a worker.
@@ -535,6 +569,11 @@ Registration still performs its final checks under the roster lock. If the
 roster becomes invalid after preflight, creation reports the newly created
 worker's id and explains that it will receive nothing until the roster names
 it; the live worker and its records are retained.
+
+Once registered, creation starts the worker's own s.space identity by default
+(`pool_identity_request.py`, the device-connect flow run in the background; opt out with
+`--no-identity` or `WORKER_POOL_IDENTITY_ON_CREATE=0`). That step is reported, never fatal:
+a worker whose identity step cannot start is created and answers through the core.
 
 The broker's complete `display.worker_labels` map is applied atomically under
 the roster lock. `worker_label_config_version` tracks the last fully applied

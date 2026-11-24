@@ -262,6 +262,14 @@ PY
   fi
 }
 
+# Runs the skills' `on_session_config` scripts against this session's CLAUDE_CONFIG_DIR
+# (src/session_config_hooks.py names no skill). Bounded and fail-open.
+apply_skill_session_config() {
+  [ -n "${PY:-}" ] && [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -f "$REPO/src/session_config_hooks.py" ] || return 0
+  "$PY" "$REPO/src/session_config_hooks.py" --config-dir "$CLAUDE_CONFIG_DIR" \
+    || echo "session-launch: session-config hooks failed (rc=$?) — launch continues" >&2
+}
+
 # 0 when the session's cwd is a folder other than this checkout.
 claude_session_outside_checkout() {
   [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ] || return 1
@@ -387,6 +395,15 @@ apply_claude_obs_metering() {
 # whether/how to forward it into a new session's env (same
 # `[ -n "${ANTHROPIC_BASE_URL:-}" ]` check as before this file existed).
 resolve_claude_credential_proxy() {
+  CLAUDE_ROUTE_PREFIX=()
+  [ -r "$REPO/src/claude_routing.sh" ] && . "$REPO/src/claude_routing.sh"
+  if declare -F claude_direct_routing > /dev/null && claude_direct_routing; then
+    claude_unset_local_proxy
+    # tmux hands a new session its server's environment, which may still carry the proxy.
+    CLAUDE_ROUTE_PREFIX=(sh -c '. "$1"; shift; claude_unset_local_proxy; exec "$@"' sh "$REPO/src/claude_routing.sh")
+    echo "  ✓ Claude calls Anthropic directly (quota from the status line recorder)"
+    return 0
+  fi
   _proxy_listener_up() {
     lsof -nP -iTCP:7846 -sTCP:LISTEN > /dev/null 2>&1
   }
@@ -569,7 +586,7 @@ launch_claude_session() {
   claude_cli_resolves || return 1
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     -e "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" \
-    "${CLAUDE_BIN:-claude}" --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
+    ${CLAUDE_ROUTE_PREFIX[@]+"${CLAUDE_ROUTE_PREFIX[@]}"} "${CLAUDE_BIN:-claude}" --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
     -- "$BOOT_PROMPT" || true
   for _ in $(seq 1 25); do

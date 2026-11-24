@@ -206,7 +206,7 @@ class TestDelivery(Base):
         self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
         s = self.ws / "deliveries" / W / "task-1.txt"
         self.assertTrue(s.exists())
-        self.assertEqual(s.stat().st_size, 0)
+        self.assertEqual(set(json.loads(s.read_text())), {"delivered_at", "ttl_s"}, "a sentinel holds its lease only")
         self.assertTrue(Path(t).exists(), "the payload is never moved or copied")
 
     def test_a_malformed_roster_row_does_not_route_a_bound_task_to_the_core(self):

@@ -71,10 +71,26 @@ queue_line() {
 	[ "$n" -gt 0 ] && printf 'QUEUE: %s pending after this\n' "$n"
 	return 0
 }
+# SUTANDO_ANNOUNCE_GENERATION=1 (set by the Codex app-server seat for its own watcher child): every
+# TASK_FILE line is preceded by `TASK_GENERATION: <name> <dev> <ino> <size> <mtime_ns>`, the file the
+# watcher read BEFORE it routed the task, or `<name> -` when it has none. Unset, nothing is printed and
+# every line is byte-identical to before. The reader runs only a file that still matches.
+task_file_generation() {
+	[ "${SUTANDO_ANNOUNCE_GENERATION:-}" = 1 ] || return 0
+	"${SUTANDO_PY_BIN:-python3}" -c 'import os, sys
+s = os.stat(sys.argv[1])
+print(s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)' "$1" 2>/dev/null || true
+}
+generation_line() {
+	[ "${SUTANDO_ANNOUNCE_GENERATION:-}" = 1 ] || return 0
+	local name="${1##*/}" gen="-"
+	if [ "${DECISION_GENERATION_NAME:-}" = "$name" ] && [ -n "${DECISION_GENERATION:-}" ]; then gen="$DECISION_GENERATION"; fi
+	printf 'TASK_GENERATION: %s %s\n' "$name" "$gen"
+}
 emit_task_file() {
 	local filename="$1"
 	queued_activity_row "$filename"
-	{ printf 'TASK_FILE: %s\n' "$filename" && queue_line "$filename"; } >&9 && { activity_transition RUNNING "$filename"; return 0; }
+	{ generation_line "$filename" && printf 'TASK_FILE: %s\n' "$filename" && queue_line "$filename"; } >&9 && { activity_transition RUNNING "$filename"; return 0; }
 	echo "watch-tasks-stream: FAILED to emit TASK_FILE for $filename on fd 9 (rc=$?); the task file is written but the live core was not told" >&2
 	return 0
 }
@@ -85,6 +101,7 @@ emit_task_file() {
 # (the printf failing means stdout is gone and the watcher exits, as before) and RUNNING follows.
 emit_dispatch_task_file() {
 	local filename="$1"
+	generation_line "$filename" || exit 0
 	printf 'TASK_FILE: %s\n' "$filename" || exit 0
 	queue_line "$filename"
 	activity_transition RUNNING "$filename"
@@ -93,7 +110,7 @@ emit_dispatch_task_file() {
 emit_fallback_task_file() {
 	local filename="$1"
 	queued_activity_row "$filename"
-	printf 'TASK_FILE: %s\n' "$filename" && { queue_line "$filename"; activity_transition RUNNING "$filename"; return 0; }
+	generation_line "$filename" && printf 'TASK_FILE: %s\n' "$filename" && { queue_line "$filename"; activity_transition RUNNING "$filename"; return 0; }
 	echo "watch-tasks-stream: FAILED to emit TASK_FILE for $filename on stdout after a handler fallback (rc=$?); the fallback file is written but the live core was not told" >&2
 	return 0
 }

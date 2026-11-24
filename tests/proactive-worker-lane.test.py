@@ -169,6 +169,23 @@ class TheGatewayHost(unittest.TestCase):
             self.assertFalse(gate(self.file(PLAIN)))
             self.assertFalse(gate(self.file("proactive-4.to-ag2space.txt", "[channel: !r:alpha-fixture.net]\n")))
 
+    def test_a_decision_card_is_its_askers_lane_alone(self):
+        rgb = self.rgb
+        workers_card = mock.Mock(subject={"by_worker": W})
+        cores_card = mock.Mock(subject={"ask_id": "a"})
+        others_card = mock.Mock(subject={"by_worker": "other1"})
+        cases = [("", True, {workers_card: False, cores_card: True, others_card: False}),
+                 ("", False, {workers_card: False, cores_card: False, others_card: False}),
+                 (W, False, {workers_card: True, cores_card: False, others_card: False})]
+        saved = rgb._LANE_WORKER
+        self.addCleanup(setattr, rgb, "_LANE_WORKER", saved)
+        for lane, primary, want in cases:
+            rgb._LANE_WORKER = lane
+            with mock.patch.object(rgb, "owns_unaddressed", return_value=primary):
+                for card, mine in want.items():
+                    with self.subTest(lane=lane, primary=primary, subject=card.subject):
+                        self.assertIs(rgb.CARD_CLAIM(card), mine)
+
     def test_the_drain_hands_an_owner_directed_file_to_the_lane_that_names_it_its_own(self):
         rgb = self.rgb
         rgb.OWNS_UNADDRESSED = lambda: False

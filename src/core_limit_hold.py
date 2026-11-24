@@ -29,6 +29,11 @@ another before the next launch was pinned on the new account.
 
 While a hold is in force the gate also acts on the owner's bare replies to the notice,
 "switch to <model>" and "retry now", since nothing else reads the inbox with the core down.
+A core that stays alive at a limit screen never reaches the gate, so the supervisor monitor
+records the hold from that screen (`hold_while_wedged`) and acts on the same replies by
+restarting the core from outside it (`relaunch_core`); the hold lifts once the screen is gone.
+A worker seat's monitor does the same for its seat, given the restart its pool injects: the
+seat's hold is its own record (`seat`), and a reply reaches the seat whose notice it quotes.
 Tasks that arrive during a hold are listed in its record (`held_tasks`), so the orphan check
 on the next boot leaves them for the core; each hold incident sends its own notice. Given the
 desktop's card presenter (`gate --card-entry`), that notice also presents the core-model card.
@@ -41,7 +46,6 @@ it holds nothing unless its text names a usage limit or a time to retry. The CLI
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -55,6 +59,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cli_wedge  # noqa: E402
 import quota_availability as qa  # noqa: E402
+from claude_account import account_digest, account_fingerprint, oauth_account  # noqa: E402,F401
 
 from workspace_default import resolve_workspace, status_read_path, write_status  # noqa: E402
 
@@ -74,6 +79,16 @@ LONG_RESET_RECHECK_S = 6 * 3600
 TRANSCRIPT_TAIL_BYTES = 256 * 1024
 # The 429's own headers land a moment after it; only a later response says the provider served.
 SERVED_SLACK_S = 5
+PANE_SOURCE = "cli-pane"
+# The old limit screen outlives an owner's action by a restart's length; it must not re-arm.
+REARM_GRACE_S = 180
+RELAUNCH_TIMEOUT_S = 300
+# A live seat's monitor sees a reply within seconds; one older than this waited out a dead monitor.
+REPLY_TTL_S = 10 * 60
+AUDIT_LOG = "core-limit-actions.jsonl"
+# Every reply ever acted on, across incidents and seats: a replayed message never acts again.
+ACTED_FILE = "core-limit-acted.json"
+ACTED_MAX = 1024
 
 _CLI_LIMIT = tuple(rx for name, rx in cli_wedge.ABNORMAL_PATTERNS
                    if name in cli_wedge.PROVIDER_LIMIT_PATTERNS)
@@ -185,14 +200,15 @@ def _record_reset(headers: dict, now: float) -> Optional[float]:
     return max(ahead) if ahead else None
 
 
-def record_evidence(payload, now: float) -> Optional[Limit]:
-    """A recent 429 in the proxy's record, unless the provider served since then."""
-    if not isinstance(payload, dict):
+def record_evidence(payload, now: float, account: Optional[str] = None) -> Optional[Limit]:
+    """A recent 429 in the proxy's record, unless the provider served since then.
+    With the seat's `account` digest known, only a record labeled with it is evidence."""
+    payload = qa.record_for_account(payload, account)
+    if payload is None:
         return None
-    ledger = payload.get("recent_rejections")
     newest = None
-    for rej in ledger if isinstance(ledger, list) else []:
-        if not isinstance(rej, dict) or rej.get("status") != 429:
+    for rej in qa.record_rejections(payload):
+        if rej.get("status") != 429:
             continue
         at = qa._parse_when(rej.get("ts"))
         if at is None or not (0 <= now - at <= EVIDENCE_WINDOW_S):
@@ -291,17 +307,26 @@ def _served_turn(entry: dict) -> Optional[str]:
 
 # ---- the hold record ----------------------------------------------------------
 
-def read_hold(workspace: Path) -> Optional[dict]:
+def _hold_file(seat: Optional[str] = None) -> str:
+    """The core's record, or a worker seat's own, named by its tmux session."""
+    if not seat:
+        return HOLD_FILE
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", seat):
+        raise ValueError(f"not a seat session name: {seat!r}")
+    return f"core-limit-hold.{seat}.json"
+
+
+def read_hold(workspace: Path, seat: Optional[str] = None) -> Optional[dict]:
     try:
-        data = json.loads(status_read_path(HOLD_FILE, Path(workspace)).read_text(encoding="utf-8"))
+        data = json.loads(status_read_path(_hold_file(seat), Path(workspace)).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
 
 
-def active_hold(workspace: Path, now: Optional[float] = None) -> Optional[dict]:
+def active_hold(workspace: Path, now: Optional[float] = None, seat: Optional[str] = None) -> Optional[dict]:
     """The hold in force right now, else None. Read-only."""
-    hold = read_hold(workspace)
+    hold = read_hold(workspace, seat)
     at = time.time() if now is None else now
     if hold and hold.get("status") == "held" and isinstance(hold.get("until"), (int, float)) and at < hold["until"]:
         return hold
@@ -323,8 +348,25 @@ def status_line(hold: dict) -> str:
     return f"core paused: {what} on {model}, {tail}"
 
 
-def _write_hold(workspace: Path, hold: dict) -> None:
-    write_status(HOLD_FILE, hold, workspace=Path(workspace))
+def _write_hold(workspace: Path, hold: dict, seat: Optional[str] = None) -> None:
+    write_status(_hold_file(seat), hold, workspace=Path(workspace))
+
+
+def _active_holds(workspace: Path, now: float) -> list:
+    """Every hold in force, the core's and each seat's, as (seat, hold); the core's seat is None."""
+    from workspace_default import status_path
+    found = [(None, active_hold(workspace, now))]
+    try:
+        names = sorted(status_path(HOLD_FILE, Path(workspace)).parent.glob("core-limit-hold.*.json"))
+    except OSError:
+        names = []
+    for path in names:
+        seat = path.name[len("core-limit-hold."):-len(".json")]
+        try:
+            found.append((seat, active_hold(workspace, now, seat)))
+        except ValueError:
+            continue
+    return [(seat, hold) for seat, hold in found if hold]
 
 
 def _live_tasks(workspace: Path) -> list:
@@ -368,29 +410,15 @@ def _same_family(limited_model: Optional[str], launch_model: Optional[str]) -> b
     return not (mine and theirs and mine != theirs)
 
 
-def account_fingerprint(config_dir: Optional[str]) -> Optional[str]:
-    """A non-reversible digest of the account the CLI is signed in to, else None.
-    Only non-secret identity fields of `.claude.json` are read; tokens never are."""
-    if not config_dir:
-        return None
-    try:
-        acct = json.loads((Path(config_dir) / ".claude.json").read_text(encoding="utf-8")).get("oauthAccount")
-    except (OSError, ValueError, AttributeError):
-        return None
-    if not isinstance(acct, dict):
-        return None
-    ident = [str(acct.get(k) or "") for k in ("accountUuid", "organizationUuid", "emailAddress")]
-    if not any(ident):
-        return None
-    return hashlib.sha256("\0".join(ident).encode("utf-8")).hexdigest()[:16]
-
-
 def _same_account(held_account: Optional[str], launch_account: Optional[str]) -> bool:
     """A hold binds only the account it was seen under; an unknown side keeps it binding."""
     return not (held_account and launch_account and held_account != launch_account)
 
 
 def _binds(hold: dict, launch_model: Optional[str], launch_account: Optional[str]) -> bool:
+    # A hold set while the account was unreadable says nothing about an account read since.
+    if hold.get("account_unread") and launch_account:
+        return False
     return _same_family(hold.get("model"), launch_model) and _same_account(hold.get("account"), launch_account)
 
 
@@ -409,17 +437,22 @@ def _launch_config_dir() -> Optional[str]:
 def launch_identity(workspace: Path, config_dir: Optional[str] = None) -> tuple:
     """(model, account) the next launch would run as, read the way the gate reads them."""
     config_dir = _launch_config_dir() if config_dir is None else config_dir
-    model = qa.seat_model(qa.SeatEnv(True, None, config_dir), Path(workspace))
-    return model, account_fingerprint(config_dir)
+    return launch_model(workspace, config_dir), account_fingerprint(config_dir)
 
 
-def binding_hold(workspace: Path, now: Optional[float] = None) -> Optional[dict]:
+def launch_model(workspace: Path, config_dir: Optional[str]) -> Optional[str]:
+    return qa.seat_model(qa.SeatEnv(True, None, config_dir), Path(workspace))
+
+
+def binding_hold(workspace: Path, now: Optional[float] = None,
+                 identity: Optional[tuple] = None) -> Optional[dict]:
     """The hold in force that would stop the next launch, else None. Read-only.
-    A hold the owner switched away from (another model family or account) does not bind."""
+    A hold the owner switched away from (another model family or account) does not bind.
+    `identity` is a (model, account) the caller already read, as launch_identity returns it."""
     hold = active_hold(workspace, now)
     if hold is None:
         return None
-    model, account = launch_identity(workspace)
+    model, account = launch_identity(workspace) if identity is None else identity
     return hold if _binds(hold, model, account) else None
 
 
@@ -454,8 +487,19 @@ def _when_line(hold: dict) -> str:
             else f"It tries again {_when(hold['until'])}")
 
 
+def _seat_model_locked() -> str:
+    from hitl.recovery import SEAT_MODEL_LOCKED
+    return SEAT_MODEL_LOCKED
+
+
 def _notice_body(hold: dict, card: bool = False) -> str:
     from result_markers import neutralize_markers
+    if hold.get("seat"):
+        who = hold.get("seat_label") or hold["seat"]
+        return "[dm-only]\n" + neutralize_markers(
+            f"Your worker {who} is paused: {hold['reason'].split(': ', 1)[-1]} (pause {_incident_ref(hold)}).\n\n"
+            f"{_when_line(hold)}, and it continues by itself after that.\n\n"
+            f'To restart it now, reply to this message with "retry now". {_seat_model_locked()}\n')
     where = ('pick a model on the "Your agent\'s model" card I left you, or under Agent Settings, Runtime, Model'
              if card else "pick a model in the core-model card under Agent Settings, Runtime, Model")
     return "[dm-only]\n" + neutralize_markers(
@@ -484,12 +528,16 @@ def _present_card(hold: dict, card_entry: str, now: float) -> bool:
 
 
 def _ensure_notice(workspace: Path, hold: dict, card_entry: Optional[str] = None,
-                   now: Optional[float] = None) -> bool:
+                   now: Optional[float] = None, card_surface: bool = False) -> bool:
     """Queue the hold's owed DM under its stable name, once, and present the core-model card
     with it when the launcher provides one. True when it is queued.
-    A retry rewrites the same name, so it cannot become a second message."""
+    A retry rewrites the same name, so it cannot become a second message. With `card_surface`
+    the monitor's recovery card is this incident's one surface, so no text notice is sent."""
     if hold.get("notice_queued"):
         return False
+    if card_surface:
+        hold["notice_queued"], hold["notice_surface"] = True, "card"
+        return True
     from local_record import write_text_whole
     card = bool(card_entry) and Path(card_entry).is_file()
     body = _notice_body(hold, card)
@@ -521,29 +569,34 @@ class Decision:
 
 def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
            projects_dir: Optional[Path] = None, launch_model: Optional[str] = None,
-           launch_account: Optional[str] = None, card_entry: Optional[str] = None) -> Decision:
-    """Launch, or hold and say why. The one writer of the hold record."""
+           launch_account: Optional[str] = None, card_entry: Optional[str] = None,
+           evidence: tuple = (), seat: Optional[str] = None, seat_label: Optional[str] = None,
+           card_surface: bool = False) -> Decision:
+    """Launch, or hold and say why. The one writer of the hold record.
+    `evidence` adds limits the caller observed itself, such as a live core's limit screen. A worker
+    `seat` has its own record, and only that evidence: the provider record and status are the core's."""
     now = time.time() if now is None else now
     workspace = Path(workspace)
-    hold = read_hold(workspace)
+    hold = read_hold(workspace, seat)
     if hold and hold.get("status") == "held":
         admitted = _admit_arrivals(workspace, hold)
         if admitted is not hold:
             hold = admitted
-            _write_hold(workspace, hold)
-    if active_hold(workspace, now) and _binds(hold, launch_model, launch_account):
-        if _ensure_notice(workspace, hold, card_entry, now):
-            _write_hold(workspace, hold)
+            _write_hold(workspace, hold, seat)
+    if active_hold(workspace, now, seat) and _binds(hold, launch_model, launch_account):
+        if _ensure_notice(workspace, hold, card_entry, now, card_surface):
+            _write_hold(workspace, hold, seat)
         return Decision(False, hold, status_line(hold))
     # Who ran last: the record's account, else the launcher a released legacy hold remembered.
     last = (hold or {}).get("account") or (hold or {}).get("launch_account")
     switched = bool(launch_account and last and last != launch_account)
     since = now if switched else (hold or {}).get("account_at")
-    if quota is None:
+    if quota is None and not seat:
         rec = qa.read_quota_record(workspace, now)
         quota = rec.payload if rec else None
-    found = [lim for lim in (record_evidence(quota, now), transcript_evidence(projects_dir, now))
-             if _relevant(lim, launch_model, since)]
+    own = () if seat else (record_evidence(qa.trusted_record(quota), now, launch_account),
+                           transcript_evidence(projects_dir, now))
+    found = [lim for lim in (*own, *evidence) if _relevant(lim, launch_model, since)]
     limit = max(found, key=lambda lim: lim.at) if found else None
     seen = hold.get("evidence_at") if hold else None
     if limit is not None and (not isinstance(seen, (int, float)) or limit.at > seen):
@@ -560,6 +613,10 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
             "until": _hold_until(limit, strikes, now), "strikes": strikes,
             "account": launch_account, "account_at": since,
         }
+        if not launch_account:
+            new["account_unread"] = True
+        if seat:
+            new.update(seat=seat, seat_label=seat_label or seat)
         new["reason"] = status_line(new)
         # An incident runs until the core is let out; a hold after a release is a new one.
         if hold and hold.get("status") == "held" and hold.get("notice"):
@@ -576,9 +633,10 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
             new["notice_queued"] = False
             new["held_tasks"] = carried
             new["present_at_hold"] = [t for t in live if t not in carried][-HELD_TASKS_MAX:]
-        _ensure_notice(workspace, new, card_entry, now)
-        _write_hold(workspace, new)
-        _mirror_core_status(workspace, "paused", new["reason"], now)
+        _ensure_notice(workspace, new, card_entry, now, card_surface)
+        _write_hold(workspace, new, seat)
+        if not seat:
+            _mirror_core_status(workspace, "paused", new["reason"], now)
         return Decision(False, new, new["reason"])
     was_held = bool(hold and hold.get("status") == "held")
     if was_held:
@@ -594,23 +652,72 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
     if first_sight:
         hold = dict(hold or {"status": "none"}, account=launch_account)
     if was_held or switched or first_sight:
-        _write_hold(workspace, hold)
-    if was_held:
+        _write_hold(workspace, hold, seat)
+    if was_held and not seat:
         _mirror_core_status(workspace, "starting", "resuming after a provider limit", now)
     return Decision(True, hold, "")
 
 
-def clear(workspace: Path, now: Optional[float] = None, by: Optional[str] = None) -> Optional[dict]:
-    """Lift the hold. Its evidence stays recorded, so only a new refusal re-arms it."""
-    hold = read_hold(workspace)
+def clear(workspace: Path, now: Optional[float] = None, by: Optional[str] = None,
+          mirror: bool = True, seat: Optional[str] = None) -> Optional[dict]:
+    """Lift the hold. Its evidence stays recorded, so only a new refusal re-arms it.
+    `mirror` False leaves core-status alone, for a core that is running and writes its own."""
+    hold = read_hold(workspace, seat)
     if not hold or hold.get("status") != "held":
         return hold
     hold = dict(_admit_arrivals(workspace, hold), status="cleared", released_at=time.time() if now is None else now)
     if by:
         hold["cleared_by"] = by
-    _write_hold(workspace, hold)
-    _mirror_core_status(workspace, "starting", "resuming after a provider limit", hold["released_at"])
+    _write_hold(workspace, hold, seat)
+    if mirror and not seat:
+        _mirror_core_status(workspace, "starting", "resuming after a provider limit", hold["released_at"])
     return hold
+
+
+def reinstate(workspace: Path, now: Optional[float] = None, by: Optional[str] = None,
+              mirror: bool = True, seat: Optional[str] = None) -> Optional[dict]:
+    """Put back the hold `clear(by=by)` lifted for a restart that did not happen, in force long
+    enough for the owner's next "retry now" to count. Any other record is left as it is."""
+    at = time.time() if now is None else now
+    hold = read_hold(workspace, seat)
+    if not hold or hold.get("status") != "cleared" or hold.get("cleared_by") != by:
+        return hold
+    back = {k: v for k, v in hold.items() if k not in ("released_at", "cleared_by")}
+    until = hold.get("until") if isinstance(hold.get("until"), (int, float)) else 0.0
+    back.update(status="held", until=max(float(until), at + BACKOFF_BASE_S), reinstated_at=at)
+    _write_hold(workspace, back, seat)
+    if mirror and not seat:
+        _mirror_core_status(workspace, "paused", back.get("reason") or status_line(back), at)
+    return back
+
+
+def hold_while_wedged(workspace: Path, text: Optional[str], now: Optional[float] = None,
+                      seat: Optional[str] = None, seat_label: Optional[str] = None,
+                      card_surface: bool = False) -> Optional[dict]:
+    """The hold in force for a live core (or worker `seat`) stuck at a provider-limit screen,
+    recorded from that screen's text when none is, so the owner gets the notice (or, with
+    `card_surface`, the monitor's card alone) and a bare reply counts. Else None."""
+    now = time.time() if now is None else now
+    workspace = Path(workspace)
+    hold = read_hold(workspace, seat) or {}
+    released = hold.get("released_at")
+    if hold.get("status") != "held" and isinstance(released, (int, float)) and 0 <= now - released < REARM_GRACE_S:
+        return None
+    model, account = (None, None) if seat else launch_identity(workspace)
+    # The caller has judged the screen a limit; text that names none is still this core's limit.
+    limit = classify_text(text or "", now, model, PANE_SOURCE) or Limit("usage-limit", now, None, model, PANE_SOURCE)
+    decide(workspace, now, evidence=(limit,), launch_model=limit.model or model, launch_account=account,
+           seat=seat, seat_label=seat_label, card_surface=card_surface)
+    return active_hold(workspace, now, seat)
+
+
+def release_pane_hold(workspace: Path, now: Optional[float] = None,
+                      seat: Optional[str] = None) -> Optional[dict]:
+    """Lift a hold a live core's limit screen caused, once that core is idle or working again."""
+    hold = read_hold(workspace, seat)
+    if not hold or hold.get("status") != "held" or hold.get("source") != PANE_SOURCE:
+        return None
+    return clear(workspace, now, by=PANE_SOURCE, mirror=False, seat=seat)
 
 
 # ---- the owner's way out while the core is down -----------------------------
@@ -630,9 +737,19 @@ def _quotes_notice(reply: dict, hold: dict, agent: Optional[str]) -> bool:
     return flat(first) in flat(reply.get("body") or "")
 
 
-def _owner_action(path: Path, workspace: Path, hold: Optional[dict] = None) -> Optional[tuple]:
+def _quotes_seat(reply: dict, hold: dict, agent: Optional[str]) -> bool:
+    """Whether a quoted message is from the agent and names this hold's worker seat (its card)."""
+    seat = hold.get("seat")
+    if not seat or not agent or str(reply.get("sender") or "").strip() != agent.strip():
+        return False
+    return seat in str(reply.get("body") or "")
+
+
+def _owner_action(path: Path, workspace: Path, hold: Optional[dict] = None,
+                  sole: bool = True) -> Optional[tuple]:
     """("switch", model) or ("retry", None) for an owner's bare reply, else None.
-    Given `hold`, a quoted reply counts only when it quotes that hold's notice, from the agent."""
+    Given `hold`, a quoted reply counts only when it quotes that hold's notice (or a worker's
+    card), from the agent; an unquoted one only when `sole`, no other hold being in force."""
     from local_task_protocol import canonical_access_tier, reply_action_text, sender_words, split_reply_context
     from policy.egress.result import resolve_access_tier
     from task_envelope import attested_task_headers
@@ -650,13 +767,83 @@ def _owner_action(path: Path, workspace: Path, hold: Optional[dict] = None) -> O
     words = sender_words(parsed)
     if hold is not None:
         reply = split_reply_context(words)[0]
-        if reply is not None and not _quotes_notice(reply, hold, parsed.headers.get("receiving_instance")):
+        agent = parsed.headers.get("receiving_instance")
+        if reply is None and not sole:
+            return None
+        if reply is not None and not (_quotes_notice(reply, hold, agent) or _quotes_seat(reply, hold, agent)):
             return None
     body = reply_action_text(words)
     m = _SWITCH.match(body)
     if m:
         return ("switch", m.group(1).lower())
     return ("retry", None) if _RETRY.match(body) else None
+
+
+def _refusal(path: Path, workspace: Path, hold: dict, sole: bool) -> Optional[str]:
+    """Why an exact "switch"/"retry" reply is not this seat's to act on: "not-owner" or
+    "ambiguous" (unquoted while several holds are in force); None for any other message."""
+    from local_task_protocol import canonical_access_tier, reply_action_text, sender_words, split_reply_context
+    from policy.egress.result import resolve_access_tier
+    from task_envelope import attested_task_headers
+    try:
+        parsed = attested_task_headers(path.read_text(encoding="utf-8", errors="replace"), workspace)
+    except OSError:
+        return None
+    words = sender_words(parsed)
+    body = reply_action_text(words)
+    if not (_SWITCH.match(body) or _RETRY.match(body)):
+        return None
+    if resolve_access_tier(path) != "owner" or (
+            (parsed.headers.get("task_layout") or "").strip() == "mid"
+            and canonical_access_tier(parsed.headers.get("access_tier") or "") != "owner"):
+        return "not-owner"
+    return "ambiguous" if split_reply_context(words)[0] is None and not sole else None
+
+
+def _task_time(path: Path) -> Optional[float]:
+    from datetime import datetime
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("timestamp:"):
+                return datetime.fromisoformat(line.split(":", 1)[1].strip().replace("Z", "+00:00")).timestamp()
+            if line.startswith("task:"):
+                break
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _audit(workspace: Path, path: Path, seat: Optional[str], action, result: str, now: float) -> None:
+    """One line per action or refusal in <workspace>/logs: who, what, which seat, what came of it.
+    Ids only: the sender's id and tier, never the message text."""
+    from task_envelope import attested_task_headers
+    try:
+        head = attested_task_headers(path.read_text(encoding="utf-8", errors="replace"), workspace).headers
+    except (OSError, ValueError):
+        head = {}
+    kind, model = action if action else (None, None)
+    rec = {"at": int(now), "task": path.stem, "who": head.get("sender_id") or head.get("user_id") or None,
+           "tier": head.get("access_tier") or None, "seat": seat or "core", "action": kind,
+           "model": model, "result": result}
+    try:
+        logs = Path(workspace) / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        with open(logs / AUDIT_LOG, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def _acted(workspace: Path) -> list:
+    try:
+        data = json.loads(status_read_path(ACTED_FILE, Path(workspace)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [t for t in data.get("tasks") or [] if isinstance(t, str)] if isinstance(data, dict) else []
+
+
+def _record_acted(workspace: Path, task: str) -> None:
+    write_status(ACTED_FILE, {"tasks": (_acted(workspace) + [task])[-ACTED_MAX:]}, workspace=Path(workspace))
 
 
 def _recorded_actions(hold: Optional[dict]) -> list:
@@ -667,20 +854,31 @@ def _recorded_actions(hold: Optional[dict]) -> list:
 _STEPS = ("answered", "lifted", "archived")
 
 
-def _mark(workspace: Path, task: str, step: str) -> None:
+#: A dispatched restart whose child has not said it started by then never started.
+DISPATCH_GRACE_S = 60.0
+
+
+def _done(entry: dict) -> bool:
+    """Every step of a recorded action has landed; a relaunch is done once its outcome is recorded."""
+    return all(entry.get(step) for step in _STEPS) and ("relaunch" not in entry or "relaunched" in entry)
+
+
+def _mark(workspace: Path, task: str, step: str, seat: Optional[str] = None, value=True) -> None:
     """Persist one finished step of a recorded action; the record, not a file, says it is done."""
-    hold = read_hold(workspace)
+    hold = read_hold(workspace, seat)
     acts = _recorded_actions(hold)
     for act in acts:
         if act["task"] == task:
-            act[step] = True
+            act[step] = value
     if hold is not None:
-        _write_hold(workspace, dict(hold, actions=acts))
+        _write_hold(workspace, dict(hold, actions=acts), seat)
 
 
-def _finish(workspace: Path, entry: dict, now: float) -> None:
-    """Complete a recorded action from its record alone: answer, lift, archive, each marked
-    done in the record as it lands, so a replay skips it and never answers a second time."""
+def _finish(workspace: Path, entry: dict, now: float, relaunch: Optional[dict] = None,
+            seat: Optional[str] = None) -> None:
+    """Complete a recorded action from its record alone: answer, lift, archive, relaunch, each
+    marked done in the record as it lands, so a replay skips it and never answers a second time.
+    Without `relaunch` (the launcher's gate) the core is starting anyway, so none is spawned."""
     import local_record
     from local_task_protocol import find_result
     task = entry["task"]
@@ -688,59 +886,227 @@ def _finish(workspace: Path, entry: dict, now: float) -> None:
         # Unmarked means a crash may have hit after the write: a copy live or archived is that write.
         if find_result(workspace / "results", task) is None:
             local_record.write_text_whole(workspace / "results" / f"{task}.txt", entry["reply"] + "\n")
-        _mark(workspace, task, "answered")
+        _mark(workspace, task, "answered", seat)
     if not entry.get("lifted"):
-        hold = read_hold(workspace)
-        if entry.get("ok") and hold and hold.get("status") == "held":
-            clear(workspace, now, by=task)
-        _mark(workspace, task, "lifted")
+        hold = read_hold(workspace, seat)
+        # A relaunch keeps the hold: a switch's restart stays held, and a retry's child lifts it
+        # itself, so a restart that never happens leaves the pause in force.
+        keep = "relaunch" in entry
+        if entry.get("ok") and not keep and hold and hold.get("status") == "held":
+            clear(workspace, now, by=task, seat=seat)
+        _mark(workspace, task, "lifted", seat)
     if not entry.get("archived"):
         live = workspace / "tasks" / f"{task}.txt"
         if live.exists():
             _archive_task(workspace, live)
-        _mark(workspace, task, "archived")
+        _mark(workspace, task, "archived", seat)
+    if "relaunch" in entry and "relaunched" not in entry:
+        model = entry["relaunch"].get("model")
+        if not relaunch:
+            # The launcher's gate: the core is starting anyway, so a retry only lifts the hold.
+            if entry.get("ok") and not model:
+                clear(workspace, now, by=task, seat=seat)
+            _mark(workspace, task, "relaunched", seat)
+        elif entry.get("dispatched_at") is None:
+            # The intent is recorded before the child exists; only the child records the outcome.
+            _mark(workspace, task, "dispatched_at", seat, value=now)
+            if not _spawn_relaunch(workspace, relaunch, model, task, seat):
+                _relaunch_not_started(workspace, task, seat)
+        elif not entry.get("launch_started") and now - float(entry["dispatched_at"]) > DISPATCH_GRACE_S:
+            _relaunch_not_started(workspace, task, seat)
+
+
+def _relaunch_not_started(workspace: Path, task: str, seat: Optional[str]) -> None:
+    _mark(workspace, task, "relaunched", seat, value=False)
+    _tell_owner(workspace, 'I could not start the restart, so it is still paused. Send "retry now" to try again.')
+
+
+def _spawn_relaunch(workspace: Path, relaunch: dict, model: Optional[str], task: Optional[str] = None,
+                    seat: Optional[str] = None) -> bool:
+    """Start `relaunch` detached, so it outlives the monitor whose core it restarts."""
+    import subprocess
+    cmd = [sys.executable, str(Path(__file__).resolve()), "relaunch", "--workspace", str(workspace)]
+    if task:
+        cmd += ["--task", task] + (["--seat", seat] if seat else [])
+    if relaunch.get("command"):
+        cmd += ["--", *relaunch["command"]]
+    else:
+        cmd += ["--launcher", relaunch["launcher"]]
+        if model:
+            cmd += ["--model", model, "--switch-entry", relaunch["switch"]]
+    # The monitor inherits the launcher's in-session marker, but it runs outside the core session.
+    env = {k: v for k, v in os.environ.items() if k != "SUTANDO_CORE_SESSION"}
+    try:
+        subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return False
+    return True
+
+
+def relaunch_core(workspace: Path, launcher: Optional[str], model: Optional[str] = None,
+                  switch_entry: Optional[str] = None, run=None, command: Optional[list] = None,
+                  task: Optional[str] = None, seat: Optional[str] = None) -> bool:
+    """Restart a live core from outside it; with `model`, the restart is held by the hold still in
+    force and the switch then writes the model and starts the core. A worker seat's restart is the
+    `command` its pool injected. For a recorded action (`task`), a retry lifts the hold just before
+    its restart and puts it back when the restart fails, and the outcome is recorded on the action.
+    The owner hears of a failure."""
+    import subprocess
+    run = run or subprocess.run
+    workspace = Path(workspace)
+    lifted = False
+    if task:
+        _mark(workspace, task, "launch_started", seat, value=time.time())
+        hold = read_hold(workspace, seat)
+        if not model and hold and hold.get("status") == "held":
+            clear(workspace, by=task, seat=seat)
+            lifted = True
+    ok = _relaunch(workspace, launcher, model, switch_entry, run, command)
+    if task:
+        if not ok and lifted:
+            reinstate(workspace, by=task, seat=seat)
+        _mark(workspace, task, "relaunched", seat, value=ok)
+    return ok
+
+
+def _relaunch(workspace: Path, launcher: Optional[str], model: Optional[str], switch_entry: Optional[str],
+              run, command: Optional[list]) -> bool:
+    import subprocess
+
+    def rc(cmd):
+        try:
+            return run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                       timeout=RELAUNCH_TIMEOUT_S).returncode
+        except (OSError, subprocess.SubprocessError):
+            return None
+    if command:
+        ok = rc(list(command)) == 0
+        if not ok:
+            _tell_owner(workspace, 'I could not restart the worker, so it is still paused. Send "retry now" to try again.')
+        return ok
+    first = rc(["bash", launcher, "--restart"])
+    ok = first == 0 if not model else first in (0, HOLD_EXIT)
+    if ok and model:
+        ok = bool(switch_entry) and rc(["bash", switch_entry, model]) == 0
+    if not ok:
+        _tell_owner(workspace, f"I could not restart the core{' on ' + model if model else ''}, so it is "
+                    "still paused. Pick a model in the core-model card under Agent Settings, Runtime, "
+                    'Model, or send "retry now" to try again.')
+    return ok
+
+
+def _tell_owner(workspace: Path, text: str) -> None:
+    from local_record import write_text_whole
+    from proactive_routing import proactive_filename
+    try:
+        write_text_whole(Path(workspace) / "results" / proactive_filename(f"core-limit-relaunch-{int(time.time() * 1000)}"),
+                         "[dm-only]\n" + text + "\n")
+    except OSError:
+        pass
 
 
 def handle_owner_actions(workspace: Path, now: Optional[float] = None, *,
-                         switch_cmd: Optional[str] = None) -> list:
+                         switch_cmd: Optional[str] = None, relaunch: Optional[dict] = None,
+                         seat: Optional[str] = None) -> list:
     """Act on the owner's "switch to <model>" / "retry now" replies while a hold is in force.
-    Each reply is answered in its own conversation and acted on once; returns their ids."""
+    Each reply is answered in its own conversation and acted on once; returns their ids.
+    `relaunch` ({"launcher", "switch"}, or a worker seat's {"command"}) is given for a live seat:
+    each action restarts it, and a reply older than REPLY_TTL_S is refused. Every action and
+    refusal is audited."""
     import subprocess
     now = time.time() if now is None else now
     workspace = Path(workspace)
-    for entry in _recorded_actions(read_hold(workspace)):
-        if not all(entry.get(step) for step in _STEPS):
-            _finish(workspace, entry, now)
+    for entry in _recorded_actions(read_hold(workspace, seat)):
+        if not _done(entry):
+            _finish(workspace, entry, now, relaunch, seat)
     done = []
     for path in sorted((workspace / "tasks").glob("task-*.txt")):
-        hold = active_hold(workspace, now)
+        hold = active_hold(workspace, now, seat)
         if not hold:
             break
         # A message that predates this hold was about an earlier one; it waits for the core.
         if path.stem in set(hold.get("present_at_hold") or []) or _task_predates(path, hold.get("started_at")):
             continue
-        action = _owner_action(path, workspace, hold)
+        sole = [s_ for s_, _h in _active_holds(workspace, now)] == [seat]
+        action = _owner_action(path, workspace, hold, sole)
         if action is None:
+            why = _refusal(path, workspace, hold, sole)
+            if why and path.stem not in (hold.get("refused") or []):
+                _audit(workspace, path, seat, None, f"refused: {why}", now)
+                _write_hold(workspace, dict(hold, refused=((hold.get("refused") or []) + [path.stem])[-HELD_TASKS_MAX:]), seat)
+                if why == "ambiguous" and _find_result_for(workspace, path.stem) is None:
+                    _answer_and_archive(workspace, path, "Several of my seats are paused, so I did not act on that. "
+                                        "Reply to the pause message of the one you mean.")
             continue
-        if (workspace / "results" / path.name).exists():
+        if (path.stem in {a["task"] for a in _recorded_actions(hold)} or path.stem in _acted(workspace)
+                or _find_result_for(workspace, path.stem)):
+            _audit(workspace, path, seat, action, "refused: replay", now)
             _archive_task(workspace, path)
             continue
+        # Every path (the live monitor and the launcher's startup sweep) goes through the one gate:
+        # fresh, and claimed durably before anything runs.
+        import recovery_gate
+        key = f"reply:{seat or 'core'}:{path.stem}"
+        admitted = recovery_gate.admit(workspace, key, _task_time(path), now, REPLY_TTL_S)
+        if not admitted.ok:
+            _audit(workspace, path, seat, action, f"refused: {admitted.why}", now)
+            _answer_and_archive(workspace, path, _GATE_REFUSALS.get(admitted.why, _GATE_REFUSALS["replay"]))
+            continue
         kind, model = action
-        if kind == "retry":
+        who = (hold.get("seat_label") or seat) if seat else None
+        if relaunch and seat:
+            ok = kind == "retry" and bool(relaunch.get("command"))
+            reply = (f"Retrying now: I am restarting {who}. If the limit is still in force it pauses again and I will tell you."
+                     if ok else f'{_seat_model_locked()} Send "retry now" to restart {who}.')
+        elif relaunch:
+            ok = kind == "retry" or bool(relaunch.get("switch"))
+            reply = ("Retrying now: I am restarting the core. If the limit is still in force it pauses again and I will tell you."
+                     if kind == "retry" else
+                     f"Switching the core to {model}: I am restarting it on {model} now, and it answers your waiting "
+                     "messages once it is up. If that fails I will tell you here."
+                     if ok else "I could not switch the model from here; use the core-model card under Agent Settings.")
+        elif kind == "retry":
             ok, reply = True, "Retrying now: the core is starting. If the limit is still in force it pauses again and I will tell you."
         elif not switch_cmd:
             ok, reply = False, "I could not switch the model from here; use the core-model card under Agent Settings."
         else:
-            # A crash before the record below re-runs this switch: the same model written twice.
+            # Admitted above: a crash from here on reports this reply interrupted, never runs it again.
             run = subprocess.run(["bash", switch_cmd, model, "--offline"], capture_output=True, text=True, timeout=60)
             ok = run.returncode == 0
             reply = (f"Switched the core to {model}. It is starting now and will answer your waiting messages."
                      if ok else f"I could not switch the core to {model}; it stays paused. Try the core-model card under Agent Settings.")
         entry = {"task": path.stem, "kind": kind, "model": model, "ok": ok, "reply": reply, "at": now}
-        _write_hold(workspace, dict(hold, actions=_recorded_actions(hold) + [entry]))
-        _finish(workspace, entry, now)
+        if relaunch and ok:
+            entry["relaunch"] = {"model": model}
+        _write_hold(workspace, dict(hold, actions=_recorded_actions(hold) + [entry]), seat)
+        _record_acted(workspace, path.stem)
+        _audit(workspace, path, seat, action, "done" if ok else "refused: unsupported", now)
+        _finish(workspace, entry, now, relaunch, seat)
+        recovery_gate.finish(workspace, key, "done" if ok else "refused", now)
         done.append(path.stem)
     return done
+
+
+_GATE_REFUSALS = {
+    "stale": "That reply is more than 10 minutes old, so I did not act on it. Send it again if you still want it.",
+    "interrupted": "I was interrupted while acting on that reply, so I did not do it again. Check the core's state, "
+                   "then send it again if you still want it.",
+    "replay": "I already acted on that reply.",
+}
+
+
+def _find_result_for(workspace: Path, task: str):
+    from local_task_protocol import find_result
+    return find_result(Path(workspace) / "results", task)
+
+
+def _answer_and_archive(workspace: Path, path: Path, text: str) -> None:
+    import local_record
+    if _find_result_for(workspace, path.stem) is None:
+        local_record.write_text_whole(Path(workspace) / "results" / f"{path.stem}.txt", text + "\n")
+    if path.exists():
+        _archive_task(workspace, path)
 
 
 def _archive_task(workspace: Path, path: Path) -> None:
@@ -769,7 +1135,22 @@ def main(argv=None) -> int:
     held = sub.add_parser("held", help="exit 0 and print the reason while a hold is in force")
     held.add_argument("--workspace", default="", help="the workspace to read (default: the resolved one)")
     sub.add_parser("clear", help="lift the hold now")
+    rel = sub.add_parser("relaunch", help="restart a live core from outside it (the monitor's action)")
+    rel.add_argument("--workspace", required=True)
+    rel.add_argument("--launcher", default="", help="the core launcher (start-cli.sh)")
+    rel.add_argument("--model", default="", help="restart on this model")
+    rel.add_argument("--switch-entry", default="", help="the model-switch entry")
+    rel.add_argument("--task", default="", help="the recorded action this restart carries out")
+    rel.add_argument("--seat", default="", help="the worker seat whose hold that action is on")
+    rel.add_argument("command", nargs=argparse.REMAINDER, help="after --: a worker seat's injected restart")
     args = ap.parse_args(argv)
+    if args.cmd == "relaunch":
+        command = args.command[1:] if args.command[:1] == ["--"] else args.command
+        if not command and not args.launcher:
+            ap.error("relaunch needs --launcher or a command after --")
+        return 0 if relaunch_core(Path(args.workspace), args.launcher or None, args.model or None,
+                                  args.switch_entry or None, command=command, task=args.task or None,
+                                  seat=args.seat or None) else 1
     if args.cmd == "held":
         hold = active_hold(Path(args.workspace) if args.workspace else resolve_workspace())
         if hold:
