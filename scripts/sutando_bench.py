@@ -110,7 +110,9 @@ def _validate_expectation(expected: Any, prefix: str) -> None:
     if "json_equals" in expected:
         try:
             _validate_json_value(expected["json_equals"], set())
-        except (ValueError, RecursionError) as exc:
+        except RecursionError as exc:
+            raise ValueError(f"{prefix}: expect.json_equals exceeds supported nesting") from exc
+        except ValueError as exc:
             raise ValueError(f"{prefix}: invalid expect.json_equals: {exc}") from exc
 
 
@@ -154,17 +156,26 @@ def _finite_json_float(value: str) -> float:
 
 
 def _json_values_equal(actual: Any, wanted: Any) -> bool:
-    if type(actual) in (int, float) and type(wanted) in (int, float):
-        return actual == wanted
-    if type(actual) is not type(wanted):
-        return False
-    if isinstance(actual, list):
-        return len(actual) == len(wanted) and all(
-            _json_values_equal(item, other) for item, other in zip(actual, wanted))
-    if isinstance(actual, dict):
-        return actual.keys() == wanted.keys() and all(
-            _json_values_equal(item, wanted[key]) for key, item in actual.items())
-    return actual == wanted
+    pending = [(actual, wanted)]
+    while pending:
+        actual, wanted = pending.pop()
+        if type(actual) in (int, float) and type(wanted) in (int, float):
+            if actual != wanted:
+                return False
+            continue
+        if type(actual) is not type(wanted):
+            return False
+        if isinstance(actual, list):
+            if len(actual) != len(wanted):
+                return False
+            pending.extend(zip(actual, wanted))
+        elif isinstance(actual, dict):
+            if actual.keys() != wanted.keys():
+                return False
+            pending.extend((item, wanted[key]) for key, item in actual.items())
+        elif actual != wanted:
+            return False
+    return True
 
 
 def score_response(response: str, expected: Dict[str, Any]) -> Tuple[bool, List[Dict[str, Any]]]:

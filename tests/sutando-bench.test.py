@@ -236,6 +236,32 @@ class BenchTests(unittest.TestCase):
                 self.assertEqual(checks, [{"kind": "json_equals", "expected": wanted,
                                            "passed": True}])
 
+    def test_json_equals_compares_accepted_deep_arrays_objects_and_mixed_values(self):
+        depth = sys.getrecursionlimit() * 2 // 3
+        for shape in ["arrays", "objects", "mixed"]:
+            with self.subTest(shape=shape, depth=depth), tempfile.TemporaryDirectory() as td:
+                wanted = {"leaf": [True, 1, 2], "number": 1}
+                responses = ['{"number":1.0,"leaf":[true,1.0,2]}',
+                             '{"number":1.0,"leaf":[1,true,2]}',
+                             '{"number":1.0,"leaf":[true,2,1]}']
+                for level in range(depth):
+                    if shape == "arrays" or (shape == "mixed" and level % 2 == 0):
+                        wanted = [wanted]
+                        responses = ["[" + response + "]" for response in responses]
+                    else:
+                        wanted = {"nested": wanted}
+                        responses = ['{"nested":' + response + "}" for response in responses]
+                path = Path(td) / "suite.json"
+                path.write_text(json.dumps({"schema": 1, "name": "deep", "cases": [
+                    {"id": "one", "prompt": "p", "expect": {"json_equals": wanted}}]}))
+                loaded = bench.load_suite(path)
+                expected = loaded["cases"][0]["expect"]
+                passed, checks = bench.score_response(responses[0], expected)
+                self.assertTrue(passed)
+                self.assertIs(checks[0]["expected"], expected["json_equals"])
+                for response in responses[1:]:
+                    self.assertFalse(bench.score_response(response, expected)[0])
+
     def test_json_equals_preserves_types_and_array_order(self):
         for response, wanted in [
             ("true", 1), ("1", True), ("false", 0), ("0.0", False),
@@ -368,17 +394,55 @@ class BenchTests(unittest.TestCase):
                 stderr = io.StringIO()
                 with mock.patch.object(bench, "probe_runtime") as probe, \
                         mock.patch.object(bench, "_submit") as submit, \
+                        mock.patch.object(bench, "_wait_for_result", side_effect=AssertionError(
+                            "invalid suite reached result waiting")) as wait, \
                         contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
                     rc = bench.main(["run", "--workspace", str(ws), "--suite", str(suite),
-                                     "--output", str(root / "output")])
+                                     "--output", str(root / "output"), "--timeout", "0.1", "--poll", "0.001"])
                 self.assertEqual(rc, 2)
                 self.assertIn("case 2", stderr.getvalue())
                 self.assertIn("json_equals", stderr.getvalue())
                 self.assertIn("fix the suite", stderr.getvalue())
                 probe.assert_not_called()
                 submit.assert_not_called()
+                wait.assert_not_called()
                 self.assertEqual(list((ws / "tasks").iterdir()), [])
                 self.assertFalse((root / "output").exists())
+
+    def test_main_reports_supported_nesting_from_expected_validator(self):
+        nested = None
+        for _ in range(sys.getrecursionlimit() + 100):
+            nested = [nested]
+        data = {"schema": 1, "name": "deep", "cases": [
+            {"id": "one", "prompt": "p", "expect": {"json_equals": nested}}]}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = workspace(root / "ws")
+            suite = root / "suite.json"
+            suite.write_text("{}")
+            stderr = io.StringIO()
+            with mock.patch.object(bench.json, "loads", return_value=data) as decode, \
+                    mock.patch.object(bench, "probe_runtime") as probe, \
+                    mock.patch.object(bench, "_submit") as submit, \
+                    mock.patch.object(bench, "_wait_for_result", side_effect=AssertionError(
+                        "invalid suite reached result waiting")) as wait, \
+                    contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                rc = bench.main(["run", "--workspace", str(ws), "--suite", str(suite),
+                                 "--output", str(root / "output"), "--timeout", "0.1", "--poll", "0.001"])
+            self.assertEqual(rc, 2)
+            self.assertIn("case 1", stderr.getvalue())
+            self.assertIn("json_equals", stderr.getvalue())
+            self.assertIn("supported nesting", stderr.getvalue())
+            self.assertIn("fix the suite", stderr.getvalue())
+            decode.assert_called_once()
+            probe.assert_not_called()
+            submit.assert_not_called()
+            wait.assert_not_called()
+            self.assertEqual(list((ws / "tasks").iterdir()), [])
+            self.assertFalse((root / "output").exists())
+        with self.assertRaisesRegex(ValueError, "case 1.*json_equals.*supported nesting") as error:
+            bench.validate_suite(data)
+        self.assertIsInstance(error.exception.__cause__, RecursionError)
 
     def test_main_saves_json_equals_checks_from_disposable_responder(self):
         cases = [
