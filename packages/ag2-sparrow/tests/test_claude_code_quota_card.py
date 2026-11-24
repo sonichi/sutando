@@ -410,6 +410,13 @@ class LimitMenu(NoticeBase):
         self.assertEqual(tick(STARTUP_MENU, 1.0, "s2"), "quota-card")
         # A caller that names no session sets nothing aside.
         self.assertFalse(quota_card._history(self.root, LIMITED, 0.0, ""))
+        # What it keeps is a file the launcher knows: any other name in state/ refuses the next start, as
+        # "state/quota-seen.json is not this adapter's state" did on a test machine.
+        kept = sorted(p.name for p in (Path(self.root) / "state").iterdir() if p.name.startswith("quota-"))
+        self.assertIn(quota_card.SEEN_FILE, kept)
+        from ag2_sparrow import task_lifecycle
+        self.assertEqual([name for name in kept if name not in task_lifecycle.LOCAL_FEATURE_FILES], [])
+        self.assertIsNone(task_lifecycle.prepare_work_dir(self.root, check_only=True), "the next start is not refused")
 
     def test_a_message_from_another_room_or_before_the_unasked_card_gets_its_own_card(self):
         self.assertTrue(quota_card._just_carded({"qid": "q", "queued": 100.0}, DM, DM, 130.0), "queued, not yet posted")
