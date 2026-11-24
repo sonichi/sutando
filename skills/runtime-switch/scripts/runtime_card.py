@@ -418,17 +418,19 @@ def begin_switch(ws: Path, room: str, rt: str, current: str, t: float, *, event:
            f"I'll confirm here when it is back. {CARRIES}")
     posted = _answer(ws, room, event, "pending", "Switching", say, f"runtime-card:{attempt}:switching",
                      reply_to=event, core=core or None, execute=execute)
+    # The card that says "Switching" now, whether the tapped one edited in place or a new one posted
+    # because it could not be: the worker's outcome and any correction go to that card.
+    says = str(posted.get("event_id") or "")
     try:
-        pid = start_switch(ws, room, rt, attempt, popen, card=event if posted.get("edited") else "")
+        pid = start_switch(ws, room, rt, attempt, popen, card=says)
     except OSError as e:
         release(ws, rec)
         out = {"status": "failed", "say": FAILED_TO_START, "why": f"{type(e).__name__}: {e}"}
-        if posted.get("event_id"):
-            out["event_id"] = posted["event_id"]    # the card that now says "Switching", edited or newly posted
+        if says:
+            out["event_id"] = says
         if tell_failure:    # the card just said "Switching": it must not go on saying so
-            out["told"] = _answer(ws, room, event if posted.get("edited") else "", "error", "Not switched",
-                                  FAILED_TO_START, f"runtime-card:{attempt}:not-started", core=core or None,
-                                  execute=execute)["status"]
+            out["told"] = _answer(ws, room, says, "error", "Not switched", FAILED_TO_START,
+                                  f"runtime-card:{attempt}:not-started", core=core or None, execute=execute)["status"]
         return out
     out = {"status": "started", "attempt": attempt, "pid": pid, "runtime": rt, "say": say}
     out.update({"event_id": posted["event_id"]} if posted.get("event_id") else {"card_why": posted.get("why", "")})
