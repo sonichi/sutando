@@ -476,37 +476,134 @@ class AwaitSignIn(Base):
         rc, out = self.run_(["status"])
         self.assertEqual((rc, out["runtime"]), (0, "codex"), "a resume that fails is never in the card's way")
 
-    def stopped_after_claiming(self, phase):
+    def stopped_after_claiming(self, phase, **noted):
         """A waiter that claimed `phase` and was killed before doing it: what it leaves on record."""
         mine = {"attempt": self.attempt, "runtime": "claude", "room": DM}
-        self.assertTrue(rtc.claim_wait(self.ws, mine, phase))
+        self.assertTrue(rtc.claim_wait(self.ws, mine, phase, **noted))
         rec = json.loads(self.ws.joinpath(*rtc.WAITING).read_text())
         self.assertEqual((rec["phase"], rec["attempt"], rec["card"]), (phase, self.attempt, "$card2"))
         return rec
 
+    def admitted(self, attempt):
+        self.ws.joinpath(*rtc.RUNNING).write_text(json.dumps(
+            {"attempt": attempt, "runtime": "claude", "room": DM, "ts": self.clock.t}))
+
+    def test_the_switchs_own_id_is_put_on_record_with_the_claim_before_anything_is_admitted(self):
+        seen = {}
+        real = rtc.begin_switch
+
+        def begin(ws, room, rt, current, t, **kw):
+            seen.update(json.loads(self.ws.joinpath(*rtc.WAITING).read_text()), given=kw["attempt"])
+            return real(ws, room, rt, current, t, **kw)
+        self.claude_json = {"loggedIn": True}
+        with mock.patch.object(rtc, "begin_switch", begin):
+            rc, out = self.wait()
+        self.assertEqual((seen["phase"], seen["switch"]), ("switching", seen["given"]))
+        self.assertEqual((out["status"], out["attempt"]), ("started", seen["given"]), "admitted under that id")
+
     def test_a_waiter_stopped_between_claiming_the_sign_in_and_admitting_the_switch_is_finished_by_the_next(self):
-        self.stopped_after_claiming("switching")
+        self.stopped_after_claiming("switching", switch="7-abc")
         # The core's start hook: the wait is still on record, so a waiter is started for it again.
         self.assertEqual(self.run_(["resume"])[1]["status"], "resumed")
         self.launch.calls.clear()
         self.claude_json = {"loggedIn": False}      # it does not ask again: the sign-in was already seen in time
         self.clock.sleep(rtc.SIGN_IN_WAIT_S * 2)    # nor does a deadline that passed meanwhile undo it
         rc, out = self.wait()
-        self.assertEqual((rc, out["status"], out["after_sign_in"]), (0, "started", True))
+        self.assertEqual((rc, out["status"], out["after_sign_in"], out["attempt"]), (0, "started", True, "7-abc"))
         self.assertIn("switch", self.launch.calls[0][0])
         self.assertEqual(self.fake.edits()[-1][0], "$card2")
-        self.assertTrue(self.ws.joinpath(*rtc.RUNNING).exists())
-        self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists(), "removed only once the switch was admitted")
+        self.assertEqual(json.loads(self.ws.joinpath(*rtc.RUNNING).read_text())["attempt"], "7-abc")
+        self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists(), "removed only once the worker was launched")
 
-    def test_a_waiter_stopped_after_the_switch_was_admitted_does_not_start_a_second_one(self):
-        self.stopped_after_claiming("switching")
-        self.ws.joinpath(*rtc.RUNNING).write_text(json.dumps(
-            {"attempt": "7-abc", "runtime": "claude", "room": DM, "ts": self.clock.t}))
-        cards = len(self.fake.calls)
+    def test_a_waiter_stopped_after_admission_and_before_the_worker_was_launched_gets_it_launched(self):
+        self.stopped_after_claiming("switching", switch="7-abc")
+        self.admitted("7-abc")                      # admitted; killed before the spawn: no worker holds the lock
+        said = len(self.fake.calls)
         rc, out = self.wait()
-        self.assertEqual((rc, out["status"]), (0, "handed_off"))
-        self.assertEqual((self.launch.calls, len(self.fake.calls)), ([], cards), "nothing started, nothing said twice")
+        self.assertEqual((rc, out["status"], out["attempt"], out["relaunched"]), (0, "started", "7-abc", True))
+        (argv, kw), = self.launch.calls
+        self.assertEqual((argv[argv.index("--workspace") + 2], argv[argv.index("--attempt") + 1],
+                          argv[argv.index("--card") + 1]), ("switch", "7-abc", "$card2"))
+        self.assertEqual(len(self.fake.calls), said, "the card is not told a second time that it is switching")
         self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists())
+        # A worker that cannot be launched leaves the claim on record for the next waiter.
+        self.stopped_after_claiming_again = rtc.set_wait(self.ws, {
+            "attempt": self.attempt, "runtime": "claude", "room": DM, "ts": self.clock.t, "card": "$card2"})
+        self.stopped_after_claiming("switching", switch="7-abc")
+        self.launch.fail = OSError("no fork")
+        rc, out = self.wait()
+        self.assertEqual((rc, out["status"], out["kept"]), (1, "failed", "switching"))
+        self.assertEqual(json.loads(self.ws.joinpath(*rtc.WAITING).read_text())["phase"], "switching")
+
+    def test_a_waiter_stopped_after_its_worker_was_launched_starts_nothing_more(self):
+        from file_lock import try_lock_fd, unlock_fd
+        self.stopped_after_claiming("switching", switch="7-abc")
+        self.admitted("7-abc")
+        lock = self.ws.joinpath(*rtc.EXEC_LOCK)
+        fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
+        self.assertTrue(try_lock_fd(fd))            # its worker is running: it holds the execution lock
+        try:
+            said = len(self.fake.calls)
+            rc, out = self.wait()
+        finally:
+            unlock_fd(fd)
+            os.close(fd)
+        self.assertEqual((rc, out["status"]), (0, "handed_off"))
+        self.assertEqual((self.launch.calls, len(self.fake.calls)), ([], said), "nothing started, nothing said twice")
+        self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists())
+
+    def test_a_worker_that_already_finished_is_not_run_again_and_another_switchs_admission_is_not_ours(self):
+        # Its worker ran and finished (nothing is admitted now, the core is on Claude Code): done, not redone.
+        self.stopped_after_claiming("switching", switch="7-abc")
+        self.current = self.selected = "claude"
+        rc, out = self.wait()
+        self.assertEqual((out["status"], self.launch.calls, self.restarts), ("handed_off", [], []))
+        # Another switch is admitted (not this one): this one is not taken for launched; it is told it is busy.
+        self.current = self.selected = "codex"
+        rtc.set_wait(self.ws, {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": self.clock.t,
+                               "card": "$card2"})
+        self.stopped_after_claiming("switching", switch="7-abc")
+        self.admitted("9-other")
+        rc, out = self.wait()
+        self.assertEqual((rc, out["status"], out["say"], self.launch.calls), (1, "say", rtc.BUSY, []))
+        self.assertEqual(json.loads(self.ws.joinpath(*rtc.RUNNING).read_text())["attempt"], "9-other")
+
+    def test_a_switch_whose_worker_cannot_be_started_does_not_leave_the_card_saying_switching(self):
+        self.claude_json = {"loggedIn": True}
+        self.launch.fail = OSError("no fork")
+        rc, out = self.tap("Switch the core to Claude Code")
+        self.assertEqual((out["status"], out["say"], out["told"]), ("failed", rtc.FAILED_TO_START, "posted"))
+        words = [w for _, w in self.fake.edits()]
+        self.assertIn("Switching the core from Codex to Claude Code", words[-2])
+        self.assertEqual(words[-1], "Core runtime: " + rtc.FAILED_TO_START)
+        self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists(), "released: she can tap again")
+
+    def test_last_words_that_could_not_be_delivered_keep_the_phase_and_are_said_by_the_next_waiter(self):
+        for phase, status in (("expired", "gave_up"), ("already", "already")):
+            with self.subTest(phase=phase):
+                rtc.set_wait(self.ws, {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": self.clock.t,
+                                       "card": "$card2"})
+                self.stopped_after_claiming(phase)
+                ops = []
+
+                def offline(action, arguments, *, operation_id, room_id):
+                    ops.append(operation_id)
+                    raise ac.CardError("offline")
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = rtc.main(["--workspace", str(self.ws), "await-sign-in", "--room", DM, "--runtime", "claude",
+                                   "--attempt", self.attempt], core=CORE, popen=self.launch, run=self.claude_run,
+                                  execute=offline, codex_read=self.codex_read, restart=self.restart,
+                                  sleep=self.clock.sleep, clock=self.clock)
+                first = json.loads(out.getvalue())
+                self.assertEqual((rc, first["status"], first["kept"]), (1, status, phase))
+                self.assertEqual(json.loads(self.ws.joinpath(*rtc.WAITING).read_text())["phase"], phase, "not delivered: kept")
+                self.assertGreaterEqual(len(ops), rtc.POST_TRIES, "it tried more than once before leaving it")
+                rc, again = self.wait()             # the next waiter, with the room reachable
+                self.assertEqual(again["status"], status)
+                self.assertEqual(self.fake.edits()[-1][0], "$card2")
+                self.assertIn(self.fake.calls[-1][2], ops, "the same operation id as the failed delivery")
+                self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists())
 
     def test_a_waiter_stopped_before_its_last_words_leaves_them_for_the_next_to_say(self):
         for phase, status, said in (("expired", "gave_up", "I stopped waiting for the Claude Code sign-in"),
