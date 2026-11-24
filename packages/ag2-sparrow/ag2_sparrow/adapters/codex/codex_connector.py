@@ -309,8 +309,9 @@ class Connector:
         # The sign-in the running server started with (a fingerprint; None until auth.json reads): an account
         # switched under it (the card, the desktop's Settings) restarts the server between turns.
         home = signin_watch.codex_home()
-        self.signin = signin_watch.SigninWatch(os.path.join(home, signin_watch.CODEX_AUTH),
-                                               lambda: signin_watch.codex_identity(home))
+        self.signin = signin_watch.SigninWatch(
+            [os.path.join(home, signin_watch.CODEX_AUTH), os.path.join(home, signin_watch.MARKER)],
+            lambda: signin_watch.codex_identity(home))
         self.signin_started = self.signin_mark()
 
     @property

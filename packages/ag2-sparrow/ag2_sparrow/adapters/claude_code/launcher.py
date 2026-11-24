@@ -408,9 +408,12 @@ class Launcher:
         self.opaque = card.opaque_install(task_io.install_id(), self.root)
         # The account the pane's claude started with is recorded (as a fingerprint, with that consumer) in
         # the supervisor record; another one in `.claude.json` restarts the session once its turn ends.
-        conf = trust.config_file(cfg.get("CLAUDE_CONFIG_DIR", ""),
-                                 home=(os.environ if environ is None else environ).get("HOME", ""))
-        self.signin = signin_watch.SigninWatch(conf, lambda: signin_watch.claude_identity(conf))
+        home = (os.environ if environ is None else environ).get("HOME", "")
+        conf = trust.config_file(cfg.get("CLAUDE_CONFIG_DIR", ""), home=home)
+        # The desktop's switch may change only the Keychain item, so its marker in the config dir counts too.
+        marker_dir = signin_watch.claude_config_dir(cfg.get("CLAUDE_CONFIG_DIR", ""), home)
+        self.signin = signin_watch.SigninWatch([conf, os.path.join(marker_dir, signin_watch.MARKER)],
+                                               lambda: signin_watch.claude_identity(conf, marker_dir))
         self.signin_next, self.signin_waiting = 0.0, False
 
     # ── the record, always under the supervisor lock ─────────────────────────

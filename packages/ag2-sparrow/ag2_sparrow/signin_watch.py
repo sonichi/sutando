@@ -6,8 +6,14 @@ Only non-secret identity fields are read and kept: Codex's `auth.json` account i
 its id token, Claude Code's `.claude.json` `oauthAccount` uuid and email. No token is returned, kept or
 logged; what a supervisor records is `fingerprint()`, a short hash of the identity.
 
-An identity is `(account, email)`; `SIGNED_OUT` when the file is absent or names no account; None when
-the file could not be read (refused, mid-write, not JSON), which never counts as a change. Stdlib.
+The desktop's account switch can change only the Keychain item (Claude Code's `.claude.json` then keeps
+the old email), so it also writes a marker, `.ag2-signin-changed` (the new email and a time, no secret),
+in the CLI's config dir (CODEX_HOME, CLAUDE_CONFIG_DIR) on every switch; the marker's content hash and
+mtime are part of the identity, so a rewritten marker is a change.
+
+An identity is `(account, email, marker)`; account and email are `SIGNED_OUT` when the file is absent or
+names no account, the marker '' when there is none; None when the sign-in file or the marker could not be
+read (refused, mid-write, not JSON), which never counts as a change. Stdlib.
 """
 from __future__ import annotations
 
@@ -20,13 +26,37 @@ from .bounded_file_read import read_regular
 
 SIGNED_OUT = ("", "")
 CODEX_AUTH = "auth.json"
+MARKER = ".ag2-signin-changed"
+MARKER_MAX = 4096
 CLAUDE_CONFIG_MAX = 32 << 20     # `.claude.json` holds every project's history; still a bounded read
 
 
 def fingerprint(identity) -> str:
     """A short, stable hash of an identity: what is recorded and compared, never the fields themselves."""
-    account, email = identity
-    return hashlib.sha256(("%s\0%s" % (account, email.lower())).encode("utf-8")).hexdigest()[:16]
+    fields = list(identity)
+    fields[1] = fields[1].lower()
+    return hashlib.sha256("\0".join(fields).encode("utf-8")).hexdigest()[:16]
+
+
+def marker(config_dir: str):
+    """The desktop's switch marker in `config_dir`: '<mtime_ns>:<content hash>', '' when there is none,
+    None when it cannot be read. Its content is hashed, never kept or logged."""
+    path = os.path.join(config_dir, MARKER)
+    try:
+        mtime = os.stat(path).st_mtime_ns
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return None
+    text, why = read_regular(path, MARKER_MAX)
+    if text is None:
+        return "" if not why else None
+    return "%d:%s" % (mtime, hashlib.sha256(text.encode("utf-8")).hexdigest()[:16])
+
+
+def _with_marker(identity, config_dir: str):
+    mark = marker(config_dir) if identity is not None else None
+    return None if mark is None else tuple(identity) + (mark,)
 
 
 def _load(path: str, limit: int):
@@ -63,8 +93,12 @@ def codex_home(environ=None) -> str:
 
 
 def codex_identity(home: str):
-    """Codex's account from `<CODEX_HOME>/auth.json`: its ChatGPT account id and email; an API-key login
-    reads as ('api-key', '') without the key being looked at."""
+    """Codex's account from `<CODEX_HOME>/auth.json` (its ChatGPT account id and email; an API-key login
+    reads as ('api-key', '') without the key being looked at) and the switch marker beside it."""
+    return _with_marker(_codex_account(home), home)
+
+
+def _codex_account(home: str):
     data = _load(os.path.join(home, CODEX_AUTH), 1 << 20)
     if data is None:
         return None
@@ -78,9 +112,18 @@ def codex_identity(home: str):
     return ("api-key", "") if data.get("OPENAI_API_KEY") else SIGNED_OUT
 
 
-def claude_identity(config_file: str):
-    """Claude Code's account from its global config (`.claude.json`): `oauthAccount`'s uuid and email.
-    The credential itself is in the Keychain, which is never read here."""
+def claude_config_dir(claude_config_dir: str = "", home: str = "") -> str:
+    """Where the desktop writes Claude Code's switch marker: CLAUDE_CONFIG_DIR, else ~/.claude."""
+    return claude_config_dir or os.path.join(home or os.path.expanduser("~"), ".claude")
+
+
+def claude_identity(config_file: str, config_dir: str):
+    """Claude Code's account from its global config (`.claude.json`: `oauthAccount`'s uuid and email) and
+    the switch marker in its config dir. The credential itself is in the Keychain, never read here."""
+    return _with_marker(_claude_account(config_file), config_dir)
+
+
+def _claude_account(config_file: str):
     data = _load(config_file, CLAUDE_CONFIG_MAX)
     if data is None:
         return None
@@ -92,19 +135,23 @@ def claude_identity(config_file: str):
 
 
 class SigninWatch:
-    """One sign-in file, re-read only when its stat changes (`.claude.json` is rewritten often and can be
-    large). `current()` is the identity now on disk, None when unreadable."""
+    """A sign-in file and the switch marker, re-read only when one's stat changes (`.claude.json` is
+    rewritten often and can be large). `current()` is the identity now on disk, None when unreadable."""
 
-    def __init__(self, path: str, read, stat=os.stat):
-        self.path, self.read, self.stat = path, read, stat
+    def __init__(self, paths, read, stat=os.stat):
+        self.paths = [paths] if isinstance(paths, str) else list(paths)
+        self.read, self.stat = read, stat
         self._sig, self._seen = object(), None
 
-    def current(self):
+    def _stat(self, path):
         try:
-            st = self.stat(self.path)
-            sig = (st.st_mtime_ns, st.st_size, st.st_ino)
+            st = self.stat(path)
+            return st.st_mtime_ns, st.st_size, st.st_ino
         except OSError:
-            sig = None
+            return None
+
+    def current(self):
+        sig = tuple(self._stat(p) for p in self.paths)
         if sig != self._sig:
             seen = self.read()
             if seen is None:

@@ -52,23 +52,35 @@ class Readers(unittest.TestCase):
     def test_codex_reads_the_account_and_email_and_never_a_token(self):
         write(self.d / "auth.json", codex_auth("acct-1", "a@x.org"))
         got = signin_watch.codex_identity(str(self.d))
-        self.assertEqual(got, ("acct-1", "a@x.org"))
+        self.assertEqual(got, ("acct-1", "a@x.org", ""))
         self.assertNotIn("SECRET", repr(got) + signin_watch.fingerprint(got))
         write(self.d / "auth.json", {"OPENAI_API_KEY": "sk-SECRET"})
-        self.assertEqual(signin_watch.codex_identity(str(self.d)), ("api-key", ""))
+        self.assertEqual(signin_watch.codex_identity(str(self.d)), ("api-key", "", ""))
         os.unlink(self.d / "auth.json")
-        self.assertEqual(signin_watch.codex_identity(str(self.d)), signin_watch.SIGNED_OUT)
+        self.assertEqual(signin_watch.codex_identity(str(self.d)), signin_watch.SIGNED_OUT + ("",))
         write(self.d / "auth.json", "{not json")
+        self.assertIsNone(signin_watch.codex_identity(str(self.d)))
+
+    def test_the_switch_marker_is_part_of_the_identity_without_its_content(self):
+        write(self.d / "auth.json", codex_auth("acct-1", "a@x.org"))
+        before = signin_watch.codex_identity(str(self.d))
+        write(self.d / signin_watch.MARKER, '{"email": "b@x.org", "at": 1}')
+        after = signin_watch.codex_identity(str(self.d))
+        self.assertEqual(after[:2], before[:2])
+        self.assertNotEqual(signin_watch.fingerprint(after), signin_watch.fingerprint(before))
+        self.assertNotIn("b@x.org", repr(after))
+        os.unlink(self.d / signin_watch.MARKER)
+        os.mkdir(self.d / signin_watch.MARKER)                # refused: the whole identity is unreadable
         self.assertIsNone(signin_watch.codex_identity(str(self.d)))
 
     def test_claude_reads_oauth_account_only(self):
         f = self.d / ".claude.json"
         write(f, claude_conf("u-1", "a@x.org"))
-        self.assertEqual(signin_watch.claude_identity(str(f)), ("u-1", "a@x.org"))
+        self.assertEqual(signin_watch.claude_identity(str(f), str(self.d)), ("u-1", "a@x.org", ""))
         write(f, {"projects": {}})
-        self.assertEqual(signin_watch.claude_identity(str(f)), signin_watch.SIGNED_OUT)
+        self.assertEqual(signin_watch.claude_identity(str(f), str(self.d)), signin_watch.SIGNED_OUT + ("",))
         write(f, '{"oauthAccount": {"accountUu')       # caught mid-write
-        self.assertIsNone(signin_watch.claude_identity(str(f)))
+        self.assertIsNone(signin_watch.claude_identity(str(f), str(self.d)))
 
 
 # ── Codex ────────────────────────────────────────────────────────────────────
@@ -133,6 +145,18 @@ class CodexRestart(unittest.TestCase):
             self.c.serve()
         self.assertEqual(order[:2], ["check", "tasks"])
 
+    def test_a_switch_marker_restarts_once_unless_the_server_is_already_on_it(self):
+        # The desktop swapped auth.json and wrote its marker: the old server still answers the old email.
+        write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
+        write(self.home / signin_watch.MARKER, "b@x.org 1")
+        self.assertTrue(self.c.signin_check())
+        self.assertFalse(self.c.signin_check())
+        # A marker rewritten while the server already runs on that account: kept.
+        write(self.home / signin_watch.MARKER, "b@x.org 2")
+        self.assertFalse(self.c.signin_check())
+        self.assertFalse(self.c.signin_check())
+        self.assertEqual(self.restarts.call_count, 1)
+
     def test_the_same_account_restarts_nothing(self):
         write(self.home / "auth.json", codex_auth("acct-1", "a@x.org"))       # rewritten (a token refresh)
         for _ in range(3):
@@ -179,7 +203,9 @@ class ClaudeRestart(unittest.TestCase):
         lc.logs, lc.now, lc.stops, lc.keys, lc.pane = [], 1000.0, [], [], "❯ "
         lc.log, lc.sleep, lc.clock = lc.logs.append, lambda s: None, lambda: lc.now
         lc.tm = types.SimpleNamespace(capture=lambda pane_id, styled=False: lc.pane, sock="/s", tmux="tmux")
-        lc.signin = signin_watch.SigninWatch(str(self.conf), lambda: signin_watch.claude_identity(str(self.conf)))
+        self.marker = Path(d.name) / signin_watch.MARKER
+        lc.signin = signin_watch.SigninWatch([str(self.conf), str(self.marker)],
+                                             lambda: signin_watch.claude_identity(str(self.conf), d.name))
         lc.signin_next, lc.signin_waiting, lc.observation = 0.0, False, {"task": None}
         lc.rec = {"generation": GEN, "title_token": "tok", "consumer": CONSUMER}
         lc.rec["signin"] = lc.signin_mark(CONSUMER)        # what create() records
@@ -215,6 +241,29 @@ class ClaudeRestart(unittest.TestCase):
         for _ in range(3):
             self.assertFalse(self.check())
         self.assertEqual(len(lc.stops), 1)
+
+    def test_a_keychain_only_switch_restarts_once_through_the_marker(self):
+        # The desktop changed only the Keychain item: .claude.json keeps the old email, the marker moves.
+        lc = self.lc
+        lc.observation = {"task": "task-1"}
+        write(self.marker, '{"email": "b@x.org", "at": 1}')
+        self.assertFalse(self.check())
+        lc.observation = {"task": None}
+        self.assertTrue(self.check())
+        self.assertEqual(len(lc.stops), 1)
+        lc.rec = dict(lc.rec, generation=GEN, consumer={"pid": 12, "start": "t"})
+        lc.rec["signin"] = lc.signin_mark(lc.rec["consumer"])
+        for _ in range(3):
+            self.assertFalse(self.check())
+        self.assertEqual(len(lc.stops), 1)
+
+    def test_a_marker_seen_after_the_desktop_restarted_claude_restarts_nothing(self):
+        lc = self.lc
+        write(self.marker, '{"email": "b@x.org", "at": 1}')
+        lc.rec = dict(lc.rec, consumer={"pid": 13, "start": "u"})      # already restarted on the new account
+        self.assertFalse(self.check())
+        self.assertFalse(self.check())
+        self.assertEqual(lc.stops, [])
 
     def test_a_usage_limit_menu_is_dismissed_and_does_not_wait_for_the_turn(self):
         lc = self.lc
