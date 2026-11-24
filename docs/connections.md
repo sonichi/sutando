@@ -654,9 +654,11 @@ the question records that agent (`asked_by`, the row's `Asked by`, via
 `connections.proactive_author_agent`). Its text names that worker, not the core
 (`connections.proactive_author_phrase`: "<name> (a worker on <host>)", with the agent's display
 name, else the worker's roster label; else just "a worker on <host>". The name never stands alone;
-it is bounded and stripped of format characters, and one that reads as the core is dropped). A decision card stays the core's: only a core lane issues
-and verifies cards, so a question asked by card records no asker, and its fallback text, if the
-card cannot be stored, is the core's too. A skill writing a proactive file itself still publishes
+it is bounded and stripped of format characters, and one that reads as the core is dropped). A decision card it asks is its own
+too: the card records the worker (`subject.by_worker`) and its title names it, and only that worker's
+lane posts it (`proactive_routing.lane_claims_card`, the gateway's `CARD_CLAIM`), in its own DM, where
+the owner's click comes back to it; its fallback text, and the pointer for a card never posted, go
+through that lane as well. The core's cards stay the primary lane's. A skill writing a proactive file itself still publishes
 the name it gives.
 
 The seat's `s-space` MCP proxy (the desktop app's `ag2-mcp-proxy.mjs`) mints its access token

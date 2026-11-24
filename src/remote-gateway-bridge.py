@@ -45,7 +45,7 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
         sys.path.insert(0, _p)
 
 from proactive_routing import (BRIDGE_CHANNELS, body_target_channel,  # noqa: E402
-                               lane_claims_proactive, proactive_destination,
+                               lane_claims_card, lane_claims_proactive, proactive_destination,
                                should_claim_proactive)
 from workspace_default import resolve_workspace  # noqa: E402
 import worker_lane  # noqa: E402
@@ -581,6 +581,16 @@ def _install_worker_lane(worker: str) -> None:
 _LANE_WORKER = _lane_worker() if GATEWAY_INSTANCE else ""  # noqa: F821
 if _LANE_WORKER:
     _install_worker_lane(_LANE_WORKER)
+
+
+def _ag2space_card_claim(req) -> bool:
+    """A card a worker's session asked is its own lane's to post; any other card the primary's."""
+    subject = getattr(req, "subject", None)
+    by_worker = subject.get("by_worker") if isinstance(subject, dict) else None
+    return lane_claims_card(by_worker, _LANE_WORKER, primary=owns_unaddressed())  # noqa: F821
+
+
+CARD_CLAIM = _ag2space_card_claim
 STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821
                    and not gateway_credential_sources.is_seat(os.environ) else None)  # noqa: F821
 
