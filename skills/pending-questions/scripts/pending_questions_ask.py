@@ -374,10 +374,11 @@ def destination_from_task(text: str, workspace: Optional[Path] = None) -> Destin
 
 def proactive_body(question: str, context: Optional[str], host: str,
                    dest: Destination, link: Optional[str] = None, intro: Optional[str] = None,
-                   asker: Optional[str] = None):
+                   asker: Optional[str] = None, choices=(), reason: Optional[str] = None):
     """(body, routed): routed is True when a `[channel:]` redirect leads the body.
-    `link` is where the owner can also answer, when the store knows it; `intro` is one
-    extra paragraph the store adds the first time; `asker` names who asks (default the core)."""
+    `link` is the row's address, kept out of the body (it unfurls as a card); `intro` is one
+    extra paragraph the store adds the first time; `asker` names who asks (default the core).
+    `choices` are the (label, what) pairs a card would have offered, listed so a text ask is whole."""
     routed = dest.bridge in _ROOM_MARKER_BRIDGES and bool(dest.channel)
     who = neutralize_markers(asker) if asker else f"the {host} core"
     lines = [f"[channel: {dest.channel}]" if routed else "[dm-only]",
@@ -385,8 +386,12 @@ def proactive_body(question: str, context: Optional[str], host: str,
              neutralize_markers(question).strip()]
     if context and context.strip():
         lines += ["", neutralize_markers(context).strip()]
-    if link:
-        lines += ["", f"Reply here, or set its Status on the row: {neutralize_markers(link)}"]
+    if choices:
+        if reason and reason.strip():
+            lines += ["", f"Why {neutralize_markers(choices[0][0])}: {neutralize_markers(reason).strip()}"]
+        lines += [""] + [f"- {neutralize_markers(label)}: {neutralize_markers(what)}" if what
+                         else f"- {neutralize_markers(label)}" for label, what in choices]
+        lines += ["", "Reply here with the one you choose."]
     else:
         lines += ["", "Reply here."]
     body = "\n".join(lines) + "\n"
@@ -591,7 +596,11 @@ def _ask_by_text(out: dict, question, context, host, dest, link, intro, as_sessi
             who = speaker(ws, name, host)
     except Exception as e:  # noqa: BLE001 — the question is still recorded
         err = f"{type(e).__name__}: {e}"
-    body, routed = proactive_body(question, context, host, dest, link, intro, who)
+    q = out.get("question") or {}
+    default_action, options = q.get("default_action"), q.get("options") or ()
+    choices = card_choices(default_action, options) if wants_card(default_action, options) else []
+    reason = q.get("reason") if (default_action or "").strip() else None
+    body, routed = proactive_body(question, context, host, dest, link, intro, who, choices, reason)
     out["bridge"], out["channel"] = dest.bridge, dest.channel if routed else None
     out["where"] = (f"{dest.bridge} {dest.channel}" if routed else
                     f"{dest.bridge} owner-dm" if dest.bridge else "owner-dm (last-active bridge)")
