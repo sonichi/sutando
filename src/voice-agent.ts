@@ -60,7 +60,7 @@ function assertMacOS() {
 	}
 }
 import { voiceTaskRows, workTool, submitWorkTask, captureWorkOrigin, voiceTaskStore, resetNoteViewingDebounce, logConversationAsync, logSessionBoundaryAsync, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, endVoiceClientSession, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile, submitVoiceSessionEndTask, voiceTaskResultText } from './task-bridge.js';
-import { createCallEndReporter, sessionEndTask } from './voice-session-end.js';
+import { callEndInstruction, createCallEndReporter, sessionEndTask } from './voice-session-end.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { createAudioHealthLedger } from './voice-audio-health.js';
@@ -1050,7 +1050,7 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 		sessionId: SESSION_ID,
 		items: () => sessionRef?.conversationContext.items ?? [],
 		onEnded: async (ended) => {
-			const { summary, transcript } = sessionEndTask(ended);
+			const { summary, transcript } = sessionEndTask(ended, callEndInstruction());
 			await submitVoiceSessionEndTask(summary, transcript);
 		},
 		log: (m) => console.log(`${ts()} ${m}`),

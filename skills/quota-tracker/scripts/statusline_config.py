@@ -6,6 +6,7 @@ Config (skills/MANIFEST.md precedence, env > manifest `config` > state file):
 - QUOTA_STATUSLINE_PASSTHROUGH: a status line command to pipe the input to and print.
   Unset, the foreign status line the installer replaced, kept beside that config dir's
   settings as `quota-statusline-passthrough.json`, is the one used.
+- CREDENTIAL_PROXY_ENABLED: off is the owner's explicit "keep the proxy off" (default on).
 """
 from __future__ import annotations
 
@@ -48,6 +49,13 @@ def config(key: str, manifest: Path = MANIFEST) -> Any:
 
 def enabled(manifest: Path = MANIFEST) -> bool:
     value = config("QUOTA_STATUSLINE_ENABLED", manifest)
+    if value is None or value == "":
+        return True
+    return str(value).strip().lower() not in OFF
+
+
+def proxy_allowed(manifest: Path = MANIFEST) -> bool:
+    value = config("CREDENTIAL_PROXY_ENABLED", manifest)
     if value is None or value == "":
         return True
     return str(value).strip().lower() not in OFF

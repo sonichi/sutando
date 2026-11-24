@@ -8,10 +8,14 @@ declarers. The contract a hook relies on:
 
 - run as `<python> <script> --config-dir <dir>` for a `.py`, `bash <script> --config-dir <dir>`
   for a `.sh`; any other suffix is never run;
+- with `--route`, the scripts declared as `on_session_route` run the same way with no arguments,
+  before the launcher decides the session's API routing;
 - in its own process group, stdin from the null device, output to this process's stderr,
-  waited on for at most HOOK_SECONDS each; past that the whole group is killed and reaped, so
+  waited on for at most HOOK_SECONDS each (ROUTE_HOOK_SECONDS for a route hook, which may wait out
+  a config hook's work); past that the whole group is killed and reaped, so
   nothing it started writes after the launch continues; its exit status is reported, never fatal;
-- the launch waits at most TOTAL_SECONDS for all of them, and never fails because of one.
+- the launch waits at most TOTAL_SECONDS (ROUTE_TOTAL_SECONDS for the route phase) for all of
+  them, and never fails because of one.
 """
 from __future__ import annotations
 
@@ -22,12 +26,15 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 FIELD = "on_session_config"
+ROUTE_FIELD = "on_session_route"
 SUFFIXES = (".py", ".sh")
 HOOK_SECONDS = 10.0
 TOTAL_SECONDS = 20.0
+ROUTE_HOOK_SECONDS = 40.0
+ROUTE_TOTAL_SECONDS = 45.0
 DISCOVERY_SECONDS = 5.0
 WINDOWS = os.name == "nt"
 
@@ -46,8 +53,8 @@ def _kill_group(proc: subprocess.Popen) -> None:
         pass
 
 
-def run(hooks: Iterable[Tuple[str, Path]], config_dir: str, python: str,
-        deadline: float, env=None) -> list:
+def run(hooks: Iterable[Tuple[str, Path]], config_dir: Optional[str], python: str,
+        deadline: float, env=None, hook_seconds: Optional[float] = None) -> list:
     """Run each injected (skill name, script); returns (name, exit code or None on timeout)."""
     out = []
     for name, script in hooks:
@@ -59,7 +66,9 @@ def run(hooks: Iterable[Tuple[str, Path]], config_dir: str, python: str,
         if left <= 0:
             print(f"session-config-hooks: {name}: not run (launch budget spent)", file=sys.stderr)
             continue
-        argv = ([python] if suffix == ".py" else ["bash"]) + [str(script), "--config-dir", config_dir]
+        argv = ([python] if suffix == ".py" else ["bash"]) + [str(script)]
+        if config_dir is not None:
+            argv += ["--config-dir", config_dir]
         group = ({"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)} if WINDOWS
                  else {"start_new_session": True})
         try:
@@ -69,7 +78,7 @@ def run(hooks: Iterable[Tuple[str, Path]], config_dir: str, python: str,
             print(f"session-config-hooks: {name}: not run ({type(exc).__name__})", file=sys.stderr)
             continue
         try:
-            rc = proc.wait(min(HOOK_SECONDS, left))
+            rc = proc.wait(min(HOOK_SECONDS if hook_seconds is None else hook_seconds, left))
         except subprocess.TimeoutExpired:
             rc = None
         finally:
@@ -81,25 +90,30 @@ def run(hooks: Iterable[Tuple[str, Path]], config_dir: str, python: str,
     return out
 
 
-def _discover(found: List) -> None:
+def _discover(found: List, field: str = FIELD) -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
         import skill_roots
         from workspace_default import resolve_workspace
         roots = skill_roots.skill_roots(resolve_workspace(migrate=False))
-        found.extend(skill_roots.declared_scripts(FIELD, roots, SUFFIXES))
+        found.extend(skill_roots.declared_scripts(field, roots, SUFFIXES))
         found.append(None)
     except Exception as exc:  # noqa: BLE001 — a launch never fails on a hook
         print(f"session-config-hooks: none run ({type(exc).__name__})", file=sys.stderr)
 
 
 def main(argv: list) -> int:
-    if len(argv) != 2 or argv[0] != "--config-dir" or not argv[1]:
-        print("usage: session_config_hooks.py --config-dir <dir>", file=sys.stderr)
+    if argv == ["--route"]:
+        field, config_dir = ROUTE_FIELD, None
+    elif len(argv) == 2 and argv[0] == "--config-dir" and argv[1]:
+        field, config_dir = FIELD, argv[1]
+    else:
+        print("usage: session_config_hooks.py --config-dir <dir> | --route", file=sys.stderr)
         return 0
-    deadline = time.monotonic() + TOTAL_SECONDS
+    route = field == ROUTE_FIELD
+    deadline = time.monotonic() + (ROUTE_TOTAL_SECONDS if route else TOTAL_SECONDS)
     found: List = []
-    t = threading.Thread(target=_discover, args=(found,), daemon=True)
+    t = threading.Thread(target=_discover, args=(found, field), daemon=True)
     t.start()
     t.join(DISCOVERY_SECONDS)
     if not found or found[-1] is not None:
@@ -107,7 +121,7 @@ def main(argv: list) -> int:
             print("session-config-hooks: none run (discovery timed out)", file=sys.stderr)
         return 0
     # Hooks run on this thread, so no hook outlives this process's return.
-    run(found[:-1], argv[1], sys.executable, deadline)
+    run(found[:-1], config_dir, sys.executable, deadline, hook_seconds=ROUTE_HOOK_SECONDS if route else None)
     return 0
 
 

@@ -131,6 +131,72 @@ class ProjectHitl(unittest.TestCase):
         self.assertEqual(B._project_hitl(log=lambda *a: None), 0)
         self.assertEqual(B._HITL_BACKOFF["delay"], 0.0, "an idle pulse must reset the backoff")
 
+    def _claimed(self, worker=""):
+        req = self._requirement(guard=f"g-{worker or 'core'}")
+        if worker:
+            req.subject = {"by_worker": worker}
+            self.manager.store.save(req)
+        return req
+
+    def test_a_secondary_lane_without_a_claim_hook_posts_nothing(self):
+        self._claimed()
+        with mock.patch.object(B, "owns_unaddressed", return_value=False), \
+                mock.patch.object(B, "CARD_CLAIM", None):
+            self.assertEqual(B._project_hitl(log=lambda *a: None), 0)
+        self.assertEqual(self.calls, [])
+
+    def test_a_lane_posts_only_the_cards_its_claim_hook_names(self):
+        core, mine = self._claimed(), self._claimed("w1")
+        claim = lambda req: (req.subject or {}).get("by_worker") == "w1"  # noqa: E731
+        with mock.patch.object(B, "owns_unaddressed", return_value=False), \
+                mock.patch.object(B, "CARD_CLAIM", claim):
+            self.assertEqual(B._project_hitl(log=lambda *a: None), 1)
+        posted = [payload["dedupe_key"] for _, _, payload in self.calls]
+        self.assertEqual(posted, [f"hitl:{mine.id}:{mine.revision}"])
+        self.assertTrue(self.manager.needs_projection(core.id))
+
+    def test_a_secondary_lane_never_drives_the_claude_local_store(self):
+        with mock.patch.object(B, "owns_unaddressed", return_value=False), \
+                mock.patch.object(B, "CARD_CLAIM", lambda req: True), \
+                mock.patch.object(B, "_project_claude_local") as local:
+            B._project_hitl(log=lambda *a: None)
+        local.assert_not_called()
+
+    def test_a_claim_check_that_raises_leaves_the_card_unposted(self):
+        self._claimed("w1")
+
+        def boom(req):
+            raise RuntimeError("no roster")
+        with mock.patch.object(B, "CARD_CLAIM", boom):
+            self.assertEqual(B._project_hitl(log=lambda *a: None), 0)
+        self.assertEqual(self.calls, [])
+
+    def test_a_healthy_primary_pulse_never_clears_a_lanes_archive_failure(self):
+        req = self._claimed("w1")
+        self.manager.cancel(req.id)
+        self.manager.record_projection(req.id, self.manager.store.load(req.id).revision, "$card")
+        claim = lambda r: (r.subject or {}).get("by_worker") == "w1"  # noqa: E731
+        with mock.patch.object(B, "owns_unaddressed", return_value=False), \
+                mock.patch.object(B, "CARD_CLAIM", claim), mock.patch.object(B, "GATEWAY_INSTANCE", "Lane_W1"), \
+                mock.patch.object(B._hitl_modules()[0].HitlStore, "archive", side_effect=OSError("disk full")):
+            B._project_hitl(log=lambda *a: None)
+        root = hm.default_store(self.ws)
+        self.assertTrue(hm.archive_status_path(root, "lane-w1").exists(), "the lane reports under its own scope")
+        with mock.patch.object(B, "CARD_CLAIM", lambda r: not (r.subject or {}).get("by_worker")):
+            B._project_hitl(log=lambda *a: None)  # the primary: nothing of its own fails
+        health = hm.archive_health(root)
+        self.assertEqual(health["failures"], 1, health)
+        self.assertIn("disk full", health["error"])
+
+    def test_a_lane_status_with_no_failures_is_ignored_even_when_stale(self):
+        root = hm.default_store(self.ws)
+        root.mkdir(parents=True, exist_ok=True)
+        hm.archive_status_path(root, "gone-lane").write_text('{"failures": 0, "error": "", "updated_at": 1}')
+        health = hm.archive_health(root)
+        self.assertEqual((health["failures"], health["stale"]), (0, False))
+        with self.assertRaises(ValueError):
+            hm.archive_status_path(root, "../escape")
+
     def test_no_proactive_room_posts_nothing(self):
         self._requirement()
         B.PROACTIVE_ROOM = ""

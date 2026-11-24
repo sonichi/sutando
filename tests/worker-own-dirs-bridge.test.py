@@ -109,12 +109,12 @@ class TheFolderContract(Own):
 
     def test_a_second_worker_row_naming_the_agent_refuses_own_folders(self):
         import json
+        C.set_worker_dirs(W, False, workspace=self.ws)
         path = C.record_path(self.ws)
         rec = json.loads(path.read_text())
         mine = next(r for r in rec["connections"] if r.get("worker") == W)
         rec["connections"].append(dict(mine, worker=OTHER, instance="alpha-fixture-net-8d811f22",
                                        token_ref="AG2_REMOTE_TOKEN_TWIN", server="beta-fixture.net"))
-        mine.pop("dirs", None)
         path.write_text(json.dumps(rec))
         with self.assertRaises(C.ConnectionsError) as caught:
             C.set_worker_dirs(W, True, workspace=self.ws)

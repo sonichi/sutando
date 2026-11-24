@@ -55,9 +55,9 @@ count (`python3 src/pending_questions_reader.py summary`).
   Discord, Slack or Telegram, which deliver it themselves), so that worker's own lane asks as its
   agent, the row's `Asked by` names that agent, and the text says it is from that worker
   ("<name> (a worker on <host>)", with its agent's display name, else its roster label; else just
-  "a worker on <host>"). A decision card is still the core's: only the
-  core's lane issues and verifies cards, so a question asked by card has no `Asked by`, and its
-  fallback text, if the card cannot be stored, is the core's too.
+  "a worker on <host>"). A decision card it asks is its own too: the card
+  names the worker, only that worker's lane posts it (in its own DM, where the click comes back),
+  the row's `Asked by` names its agent, and its fallback text and pointer go through that lane.
 - `list` is READ-ONLY — it writes no file, not even the history marker — and lists each ask
   id in exactly one bucket, by precedence: a terminal or locally closed row is done; a
   complete open row waits; an open row whose body has not landed is stood in for by its held
