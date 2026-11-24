@@ -40,6 +40,30 @@ class ErrorLineTest(unittest.TestCase):
                      "prompt is too long: 215000 tokens > 200000 maximum"):
             self.assertEqual(turn_error.error_line(kept), kept)
 
+    def test_password_like_names_are_always_redacted_and_kept_words_are_short(self):
+        for message, want in {
+            "password=letmein": "password=[REDACTED]",
+            "secret: swordfish": "secret: [REDACTED]",
+            "private_key=abcdef": "private_key=[REDACTED]",
+            "Cookie: abc": "Cookie: [REDACTED]",
+            "session: expired": "session: [REDACTED]",
+            "token: abcdefghijklmnopqrstu": "token: [REDACTED]",
+            "token: correct-horse-battery-staple": "token: [REDACTED]",
+        }.items():
+            self.assertEqual(turn_error.error_line(message), want, message)
+        for kept in ("Token: expired", "token: invalid_grant", "token: abcdefghijklmnopqrst"):
+            self.assertEqual(turn_error.error_line(kept), kept)
+
+    def test_the_input_is_capped_before_any_pass(self):
+        # Dense `://` text with no whitespace once made the URL-credential pass quadratic; now it is cut first.
+        self.assertEqual(turn_error.error_line("://a" * 12500), "")
+        self.assertEqual(turn_error.error_line("://" + "a:" * 100000), "")
+        line = turn_error.error_line(("://a" * 400 + " ") * 30)
+        self.assertLessEqual(len(line), turn_error.LIMIT)
+        self.assertEqual(len(turn_error.error_line("word " * 1000)), turn_error.LIMIT)
+        cut = "x " * (turn_error.INPUT_CAP // 2 - 5) + "token=" + "s3cr3tvalue" * 20
+        self.assertNotIn("s3cr3t", turn_error.error_line(cut, limit=10 ** 6))
+
     def test_the_second_review_leftovers_are_removed(self):
         cases = {
             "file:/Users/alice/a.txt": "<path>",

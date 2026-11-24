@@ -17,6 +17,8 @@ from .chat_secret_filter import filter_chat_secrets
 from .result_markers import neutralize_markers
 
 LIMIT = 300
+# Every pass below runs on at most this much of the message, so no pattern's cost grows with its length.
+INPUT_CAP = 2000
 # Terminal escape sequences (CSI, OSC, and two-character escapes), dropped whole before any other pass.
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])")
 _SECRET_NAME = (r"""(?<![\w-])["']?[\w-]*?(?:key|token|secret|passw(?:or)?d|pass|pwd|auth(?:orization)?"""
@@ -26,8 +28,11 @@ _SECRET_NAME = (r"""(?<![\w-])["']?[\w-]*?(?:key|token|secret|passw(?:or)?d|pass
 _KEY_QUOTED = re.compile(r"(%s)([\"'])(.*?)\2" % _SECRET_NAME, re.IGNORECASE)
 _KEY_BARE = re.compile(r"(%s)((?:(?:Bearer|Basic)[\s:]+)?(?:[^\s\"'&,;}\]]|,(?=\S))+)" % _SECRET_NAME,
                        re.IGNORECASE)
-# A value that is one plain lowercase word (`expired`, `invalid_grant`) says why, not what: it is kept.
-_PLAIN_WORD = re.compile(r"[a-z]{1,20}(?:[_-][a-z]{1,20}){0,3}")
+# A value that is one plain lowercase word of at most 20 characters (`expired`, `invalid_grant`) says why,
+# not what: it is kept, except after a name whose value is a password, secret, cookie or session.
+_PLAIN_WORD = re.compile(r"[a-z]+(?:[_-][a-z]+)*")
+_PLAIN_WORD_MAX = 20
+_ALWAYS_SECRET = re.compile(r"pass|pwd|secret|private|cookie|session|credential", re.IGNORECASE)
 _USERINFO = re.compile(r"(?<=://)[^\s/@]*(?::[^\s@]*)?@")
 _BEARER = re.compile(r"\b(Bearer|Basic)\s+(?=[A-Za-z0-9._~+/=-]*[\d.])[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
 _PATH_START = (r"file:/+|(?<![\w./\\$%])(?:~|\$\{?HOME\}?(?=[/\\])|%\w+%(?=[/\\])|[A-Za-z]:[\\/]|\\\\"
@@ -48,7 +53,8 @@ def owner_reason(access_tier, channel_kind, message, limit: int = LIMIT) -> str:
 
 def _value(match, quoted=False) -> str:
     value = match.group(3) if quoted else match.group(2)
-    if _PLAIN_WORD.fullmatch(value):
+    plain = len(value) <= _PLAIN_WORD_MAX and _PLAIN_WORD.fullmatch(value)
+    if plain and not _ALWAYS_SECRET.search(match.group(1)):
         return match.group(0)
     return match.group(1) + (match.group(2) + "[REDACTED]" + match.group(2) if quoted else "[REDACTED]")
 
@@ -57,7 +63,13 @@ def error_line(message, limit: int = LIMIT) -> str:
     """`message` made safe for its reader: one line, at most `limit` characters; "" when nothing usable is left."""
     if not isinstance(message, str):
         return ""
-    text = _ANSI.sub("", message)
+    text = message
+    if len(text) > INPUT_CAP:
+        # Cut back to whitespace too, so a secret the cut splits is dropped whole, never left as a prefix;
+        # an over-long run with no whitespace is dropped entirely.
+        head = text[:INPUT_CAP].split()
+        text = " ".join(head[:-1]) if len(head) > 1 else ""
+    text = _ANSI.sub("", text)
     text = "".join(" " if ch.isspace() else "" if unicodedata.category(ch) in ("Cc", "Cf") else ch for ch in text)
     text = _KEY_QUOTED.sub(lambda m: _value(m, quoted=True), text)
     text = _KEY_BARE.sub(_value, text)
