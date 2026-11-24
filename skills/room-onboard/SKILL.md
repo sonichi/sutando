@@ -34,8 +34,12 @@ Write `[no-send]` as the result and stop when any of these holds:
 3. **Greet once**, as the task result (top level, short, in the room's language):
    - "I'm <your name>, <owner's display name>'s agent; <inviter> just invited me."
      `<your name>` is what `python3 src/agent_display_name.py --room <channel_id>` prints: your
-     s.space display name, never a persona or Stand name. If it prints nothing, say "I'm
-     <owner's display name>'s agent" with no name; never make one from your user id.
+     s.space display name, never a persona or Stand name.
+     `<owner's display name>` is how this room shows your owner: `ag2.whoami`'s
+     `runtime.owner_id`, matched in `room_members` / `room.inspect`. The inviter is your owner
+     only when their id is that one.
+     Without a name, say "I'm <owner's display name>'s agent"; without an owner, "I'm <your
+     name>, an agent"; without either, "I'm an agent". Never make a name from a user id.
    - What you understand the room is for (or your guess, flagged as one).
    - 2-3 concrete offers that fit that purpose, e.g. summarize the thread so far, keep a task
      tracker page in Room Commons, draft the doc the room is discussing.

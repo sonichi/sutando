@@ -153,6 +153,14 @@ test('the call greeting speaks the display name, and the server uses it', () => 
 	assert.ok(!cs.includes('Hi, this is Sutando'));
 });
 
+test('with no name the call greeting and name answer are unnamed', () => {
+	const unnamed = { agentName: '' };
+	assert.strictEqual(cfg.buildCallGreeting({ isMeeting: false, purpose: null }, unnamed),
+		'[Speak this greeting to the caller now]: Hi, this is an AI agent. How can I help?');
+	assert.strictEqual(cfg.buildCallGreeting({ isMeeting: false, purpose: 'book a table' }, unnamed),
+		'[Speak this greeting to the caller now]: Hi, this is an AI agent calling.');
+});
+
 test('tryFastPath tripwire unchanged', () => {
 	assert.deepStrictEqual(anchors.regions, expected.regions);
 });

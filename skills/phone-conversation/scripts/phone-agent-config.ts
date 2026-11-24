@@ -102,8 +102,8 @@ export function buildCallGreeting(callSession: Pick<CallSessionShape, 'isMeeting
 	return callSession.isMeeting
 		? ''  // No greeting for meetings — listen to IVR first
 		: !callSession.purpose
-		? `[Speak this greeting to the caller now]: Hi, this is ${phoneIntroName(overrides)}. How can I help?`
-		: `[Speak this greeting to the caller now]: Hi, this is ${phoneIntroName(overrides)} calling.`;
+		? `[Speak this greeting to the caller now]: Hi, this is ${phoneIntroName(overrides) || 'an AI agent'}. How can I help?`
+		: `[Speak this greeting to the caller now]: Hi, this is ${phoneIntroName(overrides) || 'an AI agent'} calling.`;
 }
 
 function standIdLine(overrides?: PhoneInstructionDeps['overrides']): string {
@@ -116,7 +116,8 @@ function standIdLine(overrides?: PhoneInstructionDeps['overrides']): string {
 		if (si.name) stand = `Your Stand name is ${si.name}.`;
 	} catch { /* no Stand name */ }
 	const name = phoneIntroName(overrides);
-	const ask = name ? `When asked your name, say "I'm ${name}."` : '';
+	const ask = name ? `When asked your name, say "I'm ${name}."`
+		: 'When asked your name, say you do not have one to share; never make one up.';
 	return [stand, ask].filter(Boolean).join(' ');
 }
 
