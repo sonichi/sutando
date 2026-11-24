@@ -1,0 +1,34 @@
+{
+  "runtime_profile": {
+    "v": 1,
+    "reported_at": 1789999995,
+    "received_at": 1790000000,
+    "age_s": 30,
+    "model": {"id": "claude-opus-5-5", "display_name": "Claude Opus 5.5", "runtime": "claude"},
+    "switch_options": [
+      {"token": "opus", "display_name": "Claude Opus 5.5"},
+      {"token": "sonnet", "display_name": "Claude Sonnet 5"},
+      {"token": "haiku", "display_name": "Claude Haiku 5"}
+    ],
+    "plan": {"name": "Claude Max"},
+    "workers": [
+      {
+        "worker_id": "w-research",
+        "model": {"id": "claude-sonnet-5", "display_name": "Claude Sonnet 5", "runtime": "claude"},
+        "switch_options": [
+          {"token": "sonnet", "display_name": "Claude Sonnet 5"},
+          {"token": "haiku", "display_name": "Claude Haiku 5"}
+        ],
+        "plan": null
+      },
+      {
+        "worker_id": "w-review",
+        "model": {"id": "gpt-5.5", "display_name": "GPT-5.5 (Codex)", "runtime": "codex"},
+        "switch_options": [
+          {"token": "gpt-5.5", "display_name": "GPT-5.5 (Codex)"}
+        ],
+        "plan": {"name": "ChatGPT Pro"}
+      }
+    ]
+  }
+}

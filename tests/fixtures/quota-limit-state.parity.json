@@ -167,6 +167,108 @@
    "expect": "rejected"
   },
   {
+   "name": "a newer 429 sent with another account does not end an overage",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "rejected",
+     "anthropic-ratelimit-unified-7d-status": "rejected",
+     "anthropic-ratelimit-unified-7d-utilization": "1.0",
+     "anthropic-ratelimit-unified-5h-status": "allowed",
+     "anthropic-ratelimit-unified-5h-utilization": "0.2",
+     "anthropic-ratelimit-unified-overage-status": "allowed"
+    },
+    "recent_rejections": [
+     {
+      "ts": "2026-10-09T12:00:05.000Z",
+      "status": 429,
+      "path": "/v1/messages",
+      "snippet": "",
+      "account": "acct_aaaaaa"
+     }
+    ],
+    "last_checked": "2026-10-09T12:00:00.000Z",
+    "account": "acct_bbbbbb"
+   },
+   "expect": "overage"
+  },
+  {
+   "name": "a newer 429 sent with the record's own account ends an overage",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "rejected",
+     "anthropic-ratelimit-unified-7d-status": "rejected",
+     "anthropic-ratelimit-unified-7d-utilization": "1.0",
+     "anthropic-ratelimit-unified-5h-status": "allowed",
+     "anthropic-ratelimit-unified-5h-utilization": "0.2",
+     "anthropic-ratelimit-unified-overage-status": "allowed"
+    },
+    "recent_rejections": [
+     {
+      "ts": "2026-10-09T12:00:05.000Z",
+      "status": 429,
+      "path": "/v1/messages",
+      "snippet": "",
+      "account": "acct_aaaaaa"
+     }
+    ],
+    "last_checked": "2026-10-09T12:00:00.000Z",
+    "account": "acct_aaaaaa"
+   },
+   "expect": "rejected"
+  },
+  {
+   "name": "an unbound 429 does not end a labeled record's overage",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "rejected",
+     "anthropic-ratelimit-unified-7d-status": "rejected",
+     "anthropic-ratelimit-unified-7d-utilization": "1.0",
+     "anthropic-ratelimit-unified-5h-status": "allowed",
+     "anthropic-ratelimit-unified-5h-utilization": "0.2",
+     "anthropic-ratelimit-unified-overage-status": "allowed"
+    },
+    "recent_rejections": [
+     {
+      "ts": "2026-10-09T12:00:05.000Z",
+      "status": 429,
+      "path": "/v1/messages",
+      "snippet": ""
+     }
+    ],
+    "last_checked": "2026-10-09T12:00:00.000Z",
+    "account": "acct_bbbbbb"
+   },
+   "expect": "overage"
+  },
+  {
+   "name": "a labeled 429 does not end an unlabeled record's overage",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "rejected",
+     "anthropic-ratelimit-unified-7d-status": "rejected",
+     "anthropic-ratelimit-unified-7d-utilization": "1.0",
+     "anthropic-ratelimit-unified-5h-status": "allowed",
+     "anthropic-ratelimit-unified-5h-utilization": "0.2",
+     "anthropic-ratelimit-unified-overage-status": "allowed"
+    },
+    "recent_rejections": [
+     {
+      "ts": "2026-10-09T12:00:05.000Z",
+      "status": 429,
+      "path": "/v1/messages",
+      "snippet": "",
+      "account": "acct_aaaaaa"
+     }
+    ],
+    "last_checked": "2026-10-09T12:00:00.000Z"
+   },
+   "expect": "overage"
+  },
+  {
    "name": "overage allowed and a 429 at the same instant",
    "record": {
     "available": true,

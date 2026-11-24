@@ -209,6 +209,15 @@ class RoomConnectionError(RuntimeError):
     """The room's server has no usable connection on this install; never another server's token."""
 
 
+# The task this process's posts answer (room_ops `--task-file`); None is no task, "" a missing one.
+_TASK_FILE = None
+
+
+def set_task_file(path):
+    global _TASK_FILE
+    _TASK_FILE = path
+
+
 def _room_credential(room_id):
     """(gateway_url, token) the core's `connections.room_credential` names for `room_id`, or None
     to keep the single-connection chain below. Raises RoomConnectionError on its refusal."""
@@ -219,7 +228,7 @@ def _room_credential(room_id):
     except Exception:
         return None
     try:
-        return connections.room_credential(room_id)
+        return connections.room_credential(room_id, task_file=_TASK_FILE)
     except connections.ConnectionsError as e:
         raise RoomConnectionError(str(e)) from None
 
