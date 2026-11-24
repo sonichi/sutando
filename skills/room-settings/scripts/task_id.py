@@ -5,6 +5,7 @@
 
 Exit 0 prints the id. Exit 2: the task is not the owner's. Exit 3: the file carries no
 attested `task_id:` header, so this connection cannot name the task the server checks.
+Exit 4: the file could not be read.
 Headers are read the attested way, so body text can neither claim nor hide them.
 """
 from __future__ import annotations
@@ -18,7 +19,7 @@ sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 from ag2_sparrow import task_io  # noqa: E402
 from ag2_sparrow.local_task_protocol import canonical_access_tier  # noqa: E402
 
-NOT_OWNER, NO_TASK = 2, 3
+NOT_OWNER, NO_TASK, UNREADABLE = 2, 3, 4
 
 
 def wire_task_id(text: str) -> "tuple[int, str]":
@@ -39,7 +40,7 @@ def main(argv: "list[str]") -> int:
         text = Path(argv[1]).read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         print(f"cannot read task file: {exc.strerror}", file=sys.stderr)
-        return NO_TASK
+        return UNREADABLE
     code, out = wire_task_id(text)
     print(out, file=sys.stdout if code == 0 else sys.stderr)
     return code

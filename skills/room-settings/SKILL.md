@@ -24,6 +24,8 @@ setting changed when the Action did not succeed.
 - Exit 3 means the way you are connected doesn't give you the task id the change needs. Say
   you can't change your settings from here yet, and that your owner can change them in the
   room's settings in the app. Don't ask them to send it again.
+- Any other exit (4: the task file could not be read, 64, an error): change nothing, tell your
+  owner you couldn't check the request, and don't try again.
 - If the change is refused because of the task, ask them to send it to you directly: in your
   DM, as a reply to you, or by mentioning you. Typing your name without a mention, or editing
   an earlier message, does not count. If they already did that and it is refused again, say
@@ -85,12 +87,15 @@ your owner asks for it, say so, and change nothing.
   don't mention you, both must be set: every message for what reaches you and for when you
   answer. If your owner asks for that and only one is set, change both, and say so. Members
   with Guest access must still address you either way: ask before changing their access.
-- Guest access only lets you research, explain and draft for them, once your owner allows
+- Guest access only lets you answer, explain and draft for them, once your owner allows
   each message. It never lets them have you change files or anything outside the room.
 - Mentioning your owner never lets in someone who is not listed or has no access.
 - Team access is for the whole room: it can let members who could not reach you before
   start working with you, so say that when your owner asks for it. You can't give it to one
-  person, and it still keeps out anyone blocked or not on a "specific people" list.
+  person, and it still keeps out anyone blocked or not on a "specific people" list. Say too
+  what Team means here: Team members can have you use your owner's workspace, tools,
+  connected accounts, saved keys and network, and the only check is on what you send back.
+  It is for rooms whose members your owner trusts with all of that.
   It also needs your owner to have made you able to work with a Team; if the change is
   refused as `CONFLICT` for that, say so.
 - Turning the secrets check off only matters with Team access, and only for members you
@@ -102,7 +107,9 @@ your owner asks for it, say so, and change nothing.
   arrives as a task that must answer `[no-send]`, which leaves no turn to send the change.
   - Asked with `room.question.ask`: their answer comes back to this same task, so send the
     change with the same `task_id`. It only works while the task is open and within 10
-    minutes of their first message; if the answer comes later, ask them to ask again.
+    minutes of their first message; if the answer comes later, ask them to ask again. If no
+    answer comes back to this task at all (not every connection sends one), ask in your reply
+    instead.
   - Asked in your reply: that reply ends this task, and their answer is a new message. Send
     the change with that new message's `task_id`, never the first one's (that is refused as
     closed).

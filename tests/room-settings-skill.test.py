@@ -109,7 +109,7 @@ class TestMain(unittest.TestCase):
     def test_unreadable_file(self):
         with tempfile.TemporaryDirectory() as d:
             code, out, err = self.run_main(["task_id.py", str(Path(d) / "missing.txt")])
-        self.assertEqual((code, out), (task_id.NO_TASK, ""))
+        self.assertEqual((code, out), (task_id.UNREADABLE, ""))
         self.assertIn("cannot read task file", err)
 
     def test_each_exit(self):
@@ -193,6 +193,23 @@ class TestSkillRules(unittest.TestCase):
         self.assertIn("reaches you marked as such only with \"Others who mention your owner\" on", settings)
         self.assertIn("With it off, such a message reaches you only as an ordinary message", settings)
         self.assertNotIn("whatever the settings say", settings)
+
+    def test_other_exits_change_nothing(self):
+        owner = " ".join(section(self.text, "Only your owner").split())
+        self.assertIn("Any other exit (4: the task file could not be read, 64, an error): change nothing, "
+                      "tell your owner you couldn't check the request, and don't try again.", owner)
+
+    def test_no_wake_falls_back_to_the_reply(self):
+        settings = " ".join(section(self.text, "The settings").split())
+        self.assertIn("If no answer comes back to this task at all (not every connection sends one), "
+                      "ask in your reply instead.", settings)
+
+    def test_team_says_what_it_reaches_and_guest_has_no_research(self):
+        settings = " ".join(section(self.text, "The settings").split())
+        self.assertIn("your owner's workspace, tools, connected accounts, saved keys and network, and the "
+                      "only check is on what you send back", settings)
+        self.assertIn("Guest access only lets you answer, explain and draft for them", settings)
+        self.assertNotIn("research", settings)
 
     def test_old_or_closed_task_asks_again(self):
         back = " ".join(section(self.text, "What comes back").split())
