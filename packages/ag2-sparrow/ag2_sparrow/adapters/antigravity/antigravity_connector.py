@@ -537,14 +537,33 @@ def tier_block_lines(operator_lines):
     return out
 
 
+# How this Session reads what was said before: the core's own step (a shell command on a file of its
+# skills folder) is never passed on, and this is what agy has instead.
+ROOM_HISTORY = ("When the message refers to something said earlier in the room and you do not have it, read the "
+                "room's recent messages with room_action_read (the server's room.action.read): Action "
+                "room.context.read, room_id %s. Answer from what you read, not from a guess.")
+
+
+def core_steps_removed(message):
+    """The sender's message with any bridge-written core steps taken out. A task that is not `task_layout:
+    mid` has no separate bridge lines: the gateway's prelude and tier block, when there, arrive inside the
+    body. They are then treated as `session_lines` and `tier_block_lines` treat them: the prelude's shell and
+    results-file steps go, the tier block's result steps become "your final message". Nothing is added, and a
+    message with neither header is returned as it is."""
+    text = message or ""
+    if PRELUDE_HEADER not in text and TIER_BLOCK_HEADER not in text:
+        return message
+    return "\n".join(tier_block_lines(session_lines(text.split("\n"))))
+
+
 def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_NOTE, shell_web=False,
                 readable=(), kind=None):
     """The turn's prompt. `cwd` is the working directory the turn may read and edit, None for an isolated turn;
     `shell_web` also grants commands and the web; `readable`, an isolated turn's copies of the sender's own
     attachments, the only files it may read."""
     event, _ = trigger_of(headers)
-    out = acp_host.task_framing(task_id, headers, message, tier_block_lines(session_lines(operator_lines)),
-                                "post in your final message", note)
+    out = acp_host.task_framing(task_id, headers, core_steps_removed(message),
+                                tier_block_lines(session_lines(operator_lines)), "post in your final message", note)
     out.append("Answer through Sparrow, exactly once for this task: your final message in this turn is what Sparrow "
                "posts%s. Write it as the post itself, with no preamble about tools or steps. To post nothing (an "
                "acknowledgement, thanks or FYI that needs no answer, or an event whose body asks for no post), make "
@@ -555,6 +574,9 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
                    "room_action_execute (the server's room.action.execute; find Actions with room_actions_search and "
                    "room_actions_describe) to create or edit Room Commons pages and for other room actions, and put "
                    "the page link in your reply." % mcp_auth.SERVER_NAME)
+        room = (headers.get("channel_id") or "").strip()
+        if room:
+            out.append(ROOM_HISTORY % room)
     if shell_web:
         out.append("You may run shell commands and fetch and search the web. You may read and edit files under %s." % cwd)
     else:

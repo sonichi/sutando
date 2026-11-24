@@ -1248,6 +1248,47 @@ class ConnectorTest(unittest.TestCase):
         for gone in ("SKILL INSTRUCTIONS", "room_ops.py", "results/task-1.txt"):
             self.assertNotIn(gone, sent)
 
+    def test_no_task_layout_or_tier_puts_a_core_only_step_in_agys_prompt(self):
+        """Every way a task reaches the prompt: the bridge's lines apart (mid) or inside the body (any other
+        layout), for each tier's block. agy is never told to run room_ops.py or to write a results file."""
+        from ag2_sparrow.team_guardrail import ag2space_tier_lines
+        tid, room = "task-a~task-b", "!room:s.space"
+        prelude = render_skill_prelude(room, "ag2space", tid)
+        for tier, collaborator in (("owner", False), ("team", True), ("team", False), ("guest", False)):
+            block = ag2space_tier_lines(tier, collaborator, "results/%s.txt" % tid)
+            bridge = [ln for part in (prelude if tier == "owner" else [], block) for ln in "\n".join(part).split("\n")]
+            headers = {"access_tier": tier, "collaborator": "true" if collaborator else "false",
+                       "channel_id": room, "user_id": "@chi:s.space"}
+            said = "What did Susan decide above?"
+            for layout, message, operator in (("mid", said, [ln for ln in bridge if ln.strip()]),
+                                              ("body", "\n".join([said] + bridge), [])):
+                with self.subTest(tier=tier, collaborator=collaborator, layout=layout):
+                    prompt = gc.wake_prompt(tid, headers, message, operator, "/work")
+                    self.assertIn(said, prompt, "the sender's own words are kept")
+                    for gone in ("room_ops.py", "channel-env.sh", "results/%s.txt" % tid, "SKILL INSTRUCTIONS",
+                                 "CONTEXT-FIRST", "codex exec"):
+                        self.assertNotIn(gone, prompt)
+                    self.assertNotRegex(prompt, r"(?i)write[^\n]*results/", "no instruction to write a results file")
+                    if block:
+                        self.assertIn("SUTANDO SYSTEM INSTRUCTIONS", prompt, "the tier's rules themselves are kept")
+
+    def test_a_message_with_no_bridge_block_is_passed_on_untouched_even_when_it_names_those_files(self):
+        said = "Why does room_ops.py write results/task-9.txt?\n1. first reason\n2. second reason"
+        self.assertEqual(gc.core_steps_removed(said), said)
+        self.assertIsNone(gc.core_steps_removed(None))
+        prompt = gc.wake_prompt("task-9", {"access_tier": "owner", "channel_id": "!r:s.space"}, said, [], "/work")
+        self.assertIn(said, prompt)
+
+    def test_an_owner_turn_with_the_room_tools_is_told_how_to_read_the_rooms_earlier_messages(self):
+        owner = {"access_tier": "owner", "channel_id": "!room:s.space", "user_id": "@chi:s.space"}
+        prompt = gc.wake_prompt("task-1", owner, "as I said above", [], "/work")
+        self.assertIn("room_action_read (the server's room.action.read): Action room.context.read, room_id !room:s.space",
+                      prompt)
+        self.assertIn("room.action.read", gc.mcp_auth.OWNER_TOOLS, "a tool the owner's turn is already granted")
+        guest = dict(owner, access_tier="guest")
+        self.assertNotIn("room.context.read", gc.wake_prompt("task-1", guest, "hi", [], None), "a guest has no room tools")
+        self.assertNotIn("room.context.read", gc.wake_prompt("task-1", dict(owner, channel_id=""), "hi", [], "/work"))
+
     def test_only_the_preludes_shell_and_results_file_steps_are_dropped(self):
         prelude = [x for x in render_skill_prelude("!room:s.space", "ag2space", "task-1", "@bob:s.space") if x]
         kept = gc.session_lines(["a bridge note"] + prelude + ["a later note", "1. a later numbered line"])
