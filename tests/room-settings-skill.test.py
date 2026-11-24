@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """room-settings: the task id helper and the rules the skill must keep.
 
-The server gates room.agent_policy.set (owner only, the owner's own open task picked up
+The server gates room.agent_policy.set (owner only, the owner's own open task first served
 under 10 minutes ago and under 24 hours old, closed choices, approval for a change that
 opens access, filter-off included). These pin the
 skill's side of each rule, and the helper that names the task id it passes.
@@ -163,7 +163,8 @@ class TestSkillRules(unittest.TestCase):
         settings = " ".join(section(self.text, "The settings").split())
         self.assertIn("s.space holds it for your owner's approval on a card in their DM with you", settings)
         self.assertIn("Don't ask them to confirm first, in words or with a card of your own", settings)
-        self.assertIn("the card waiting in your DM is where they approve it", settings)
+        self.assertIn("When it comes back waiting for approval, say what turning it off means and that the "
+                      "card waiting in your DM is where they approve it.", settings)
         for gone in ("room.question.ask", "answered_by", "ask-owner.py", "Choose how to ask",
                      "ask your owner to confirm before you send the change"):
             self.assertNotIn(gone, settings)
@@ -199,7 +200,10 @@ class TestSkillRules(unittest.TestCase):
                        "ask them to open a DM with you and then ask again",
                        "they approve it on the card in your DM with them",
                        "your owner first has to make you able to work with a Team",
-                       "If it is refused again, tell your owner you couldn't make the change"):
+                       "If it is refused again, tell your owner you couldn't make the change and that "
+                       "they can make it in the room's settings in the app.",
+                       "Say you can't make this change from here, and that your owner can change it in "
+                       "the room's settings in the app, or ask a room admin to."):
             self.assertIn(phrase, back)
         tail = " ".join(self.text.rsplit("## What comes back", 1)[1].split())
         self.assertIn("Tell your owner every refusal in plain words, with the one thing they can do next.", tail)
@@ -233,7 +237,8 @@ class TestSkillRules(unittest.TestCase):
         for reason in ("not_owner", "no_task", "no_origin", "task_not_yours",
                        "task_closed", "task_expired"):
             self.assertIn(f"`{reason}`", back)
-        self.assertIn("within 10 minutes of when you picked their message up", back)
+        self.assertIn("within 10 minutes of when their message was first sent to you (of the message "
+                      "itself, if it never was)", back)
         self.assertIn("never more than 24 hours after they sent it", back)
         self.assertNotIn("10 minutes of their message", back)
 
@@ -273,8 +278,9 @@ class TestSkillRules(unittest.TestCase):
         settings = " ".join(section(self.text, "The settings").split())
         back = " ".join(section(self.text, "What comes back").split())
         self.assertIn("Copy each id exactly as `room.members.list` gives it, never typed from a name", settings)
-        self.assertIn("A listed user id that is not exactly an id `room.members.list` gave is refused this way",
-                      back)
+        self.assertIn("A listed user id must be a plain id like `@name:s.space`: a name, extra symbols or "
+                      "formatting are refused this way.", back)
+        self.assertIn("if that id is refused too, ask your owner who they meant.", back)
 
     def test_mixed_request_is_held_whole(self):
         change = " ".join(section(self.text, "Change").split())
@@ -291,6 +297,7 @@ class TestSkillRules(unittest.TestCase):
     def test_filter_off_is_an_approval_required_change(self):
         back = " ".join(section(self.text, "What comes back").split())
         self.assertIn("or turning the secrets check off), so your owner must approve it", back)
+        self.assertIn("the card shows each setting as it is now and as it would be.", back)
 
     def test_approval_required_is_waiting_never_done(self):
         back = section(self.text, "What comes back")

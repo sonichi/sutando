@@ -106,8 +106,9 @@ your owner asks for it, say so, and change nothing.
   change: one already waiting keeps the old setting.
 - Turning the secrets check off opens access, so s.space holds it for your owner's approval
   on a card in their DM with you, like any other change that opens access. Don't ask them to
-  confirm first, in words or with a card of your own: send the change on their message, then
-  say what turning it off means and that the card waiting in your DM is where they approve it.
+  confirm first, in words or with a card of your own: send the change on their message. When
+  it comes back waiting for approval, say what turning it off means and that the card waiting
+  in your DM is where they approve it. Any other answer is handled as below.
 - "What reaches you" is about which messages are sent to you to answer. It does not hide the
   room's history from you, so never promise your owner that you can't read other messages.
 - Before you list people, check each one is in the room: `room.action.read` with action
@@ -144,9 +145,11 @@ own first; then read again and send the ones that open access.
 - **`INVALID_INPUT`** for a change that changes nothing: tell your owner it is already set
   that way.
 - **`approval_required`:** the change opens access (for example answering everyone, a
-  higher access level, or turning the secrets check off), so your owner must approve it on a card in their DM with you. Nothing
-  has changed yet. Say it is waiting for their approval, and that they approve it on the card
-  in your DM with them. Never say it is done. Don't call again. Keep the `approval_id` and `operation_id` it gives.
+  higher access level, or turning the secrets check off), so your owner must approve it on a
+  card in their DM with you; the card shows each setting as it is now and as it would be.
+  Nothing has changed yet. Say it is waiting for their approval, and that they approve it on
+  the card in your DM with them. Never say it is done. Don't call again. Keep the
+  `approval_id` and `operation_id` it gives.
   Nothing tells you when they decide. When they ask: `approval.inspect` with the
   `approval_id` says how they decided; `operation.inspect` with the `operation_id` says
   whether the change then ran or failed (an approved change can still fail if the settings
@@ -163,8 +166,8 @@ own first; then read again and send the ones that open access.
     owner to you. Ask them to send it to you directly: in your DM, as a reply to you, or by
     mentioning you.
   - `task_closed`, `task_expired`: the request is too old. A change must be sent within 10
-    minutes of when you picked their message up, while you are still on it, and never more
-    than 24 hours after they sent it. Ask them to ask you again.
+    minutes of when their message was first sent to you (of the message itself, if it never
+    was), while you are still on it, and never more than 24 hours after they sent it. Ask them to ask you again.
   - When its message says your owner must join the room first (a change that opens access,
     in a room they are not in): nothing was held. Ask them to join the room, then ask you
     again.
@@ -177,9 +180,10 @@ own first; then read again and send the ones that open access.
   Don't try again until you have a DM with them. If
   it says the write may or may not have happened, read again with `room.agent_policy.read`
   and tell your owner what is stored.
-- **`INVALID_INPUT`:** fix the arguments and try once more. A listed user id that is not
-  exactly an id `room.members.list` gave is refused this way: copy it from there again. `room.actions.describe` with the
-  action shows the schema. If it is refused again, tell your owner you couldn't make the change
+- **`INVALID_INPUT`:** fix the arguments and try once more. `room.actions.describe` with the
+  action shows the schema. A listed user id must be a plain id like `@name:s.space`: a name,
+  extra symbols or formatting are refused this way. Take it again from `room.members.list`;
+  if that id is refused too, ask your owner who they meant. If it is refused again, tell your owner you couldn't make the change
   and that they can make it in the room's settings in the app.
 
 Tell your owner every refusal in plain words, with the one thing they can do next. Never show
