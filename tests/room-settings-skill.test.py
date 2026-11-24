@@ -160,6 +160,8 @@ class TestSkillRules(unittest.TestCase):
 
     def test_filter_off_confirmation_uses_the_new_task(self):
         settings = " ".join(section(self.text, "The settings").split())
+        self.assertIn("Your reply ends this task, so send the change with that new message's `task_id`, "
+                      "never the first one's (that is refused as closed).", settings)
 
     def test_task_id_is_the_asking_message(self):
         owner = " ".join(section(self.text, "Only your owner").split())
