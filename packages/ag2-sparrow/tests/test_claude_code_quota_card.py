@@ -137,16 +137,23 @@ class Notice(Base):
 
         def down(payload):
             raise OSError("no route")
-        self.sweep(born + 30, down)
         self.assertEqual(self.tick(LIMITED, 30.0), "", "still in the outbox: waiting, not told")
         self.assertFalse(quota_card.load(self.root).get("told"))
-        # The bridge could not post it and drops it past MAX_QUEUED_S: its own sweep records that.
+        # No bridge ran until past MAX_QUEUED_S, so no send was ever tried: its sweep records a drop.
         self.assertEqual(self.sweep(born + connector_cards.MAX_QUEUED_S + 1), [])
         self.assertEqual((connector_cards.outcome(self.bridge, qid), self.queued()), ("dropped", []))
         self.assertEqual(self.tick(LIMITED, 5.0), "quota-card-dropped", "seen well inside the deadline: the record decides")
-        self.assertEqual(self.tick(LIMITED, 1.0), "quota-card")
+        self.assertEqual(self.tick(LIMITED, quota_card.RETRY_S), "quota-card")
         second = quota_card.load(self.root)["qid"]
         self.assertNotEqual(second, qid)
+        # This one's send fails (it may have gone through) and it expires: unsure, so the same card again.
+        self.sweep(self.queued_at(second) + 1, down)
+        self.sweep(self.queued_at(second) + connector_cards.MAX_QUEUED_S + 1)
+        self.assertEqual(connector_cards.outcome(self.bridge, second), "unsure")
+        self.assertEqual(self.tick(LIMITED, 5.0), "quota-card-unsure")
+        self.assertEqual(self.tick(LIMITED, quota_card.RETRY_S), "quota-card")
+        self.assertEqual(quota_card.load(self.root)["qid"], second, "the same queue id: one message at the server")
+        self.assertNotIn("again", quota_card.load(self.root))
         # The second is posted by a real sweep: told, once.
         (sent,) = self.sweep(self.queued_at(second) + 1)
         self.assertEqual(sent["room_id"], DM)

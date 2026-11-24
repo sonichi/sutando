@@ -202,14 +202,56 @@ class ConnectorCards(unittest.TestCase):
         cc._settle(self.state, "3" * 32, "posted")
         self.assertEqual((cc.outcome(self.state, aged), cc.outcome(self.state, posted)), ("", "posted"))
 
+    def test_a_card_posted_before_a_local_failure_is_never_expired_as_dropped(self):
+        outbox = self.state.joinpath(*cc.OUTBOX)
+        late = lambda: 1000.0 + cc.MAX_QUEUED_S + 60  # noqa: E731
+        # Posted and its receipt written; then recording the outcome fails, and the entry stays queued.
+        qid = cc.queue(self.state, ROOM, *model_card(), now=1000.0)
+        with mock.patch.object(cc, "_settle", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.poster().sweep()
+        self.assertEqual((len(self.sent), cc.outcome(self.state, qid)), (1, ""))
+        self.assertEqual(self.poster(clock=late).sweep(), 0, "past the deadline: not posted again, not dropped")
+        self.assertEqual((len(self.sent), cc.outcome(self.state, qid), list(outbox.iterdir())), (1, "posted", []))
+        # The outcome was recorded but the entry could not be removed: the next sweep, late, keeps it posted.
+        qid = cc.queue(self.state, ROOM, *model_card(), now=1000.0)
+        with mock.patch.object(Path, "unlink", side_effect=OSError("busy")):
+            with self.assertRaises(OSError):
+                self.poster().sweep()
+        cc.absorb(self.state, self.root)
+        self.assertEqual(self.poster(clock=late).sweep(), 0)
+        self.assertEqual((len(self.sent), cc.outcome(self.state, qid), list(outbox.iterdir())), (2, "posted", []))
+
+    def test_an_expiry_after_a_send_that_failed_is_unsure_and_only_that_may_be_queued_again_under_its_key(self):
+        late = lambda: 1000.0 + cc.MAX_QUEUED_S + 60  # noqa: E731
+        body, card = model_card()
+        keyed = dict(key="k1", at_ns=5)
+        qid = cc.queue(self.state, ROOM, body, card, now=1000.0, **keyed)
+        self.assertEqual(self.poster(OSError("timed out")).sweep(), 0)     # it may have reached the server
+        self.assertEqual(self.poster(clock=late).sweep(), 0)
+        self.assertEqual(cc.outcome(self.state, qid), "unsure", "not a confirmed drop")
+        self.assertEqual(cc.queue(self.state, ROOM, body, card, **keyed), qid)
+        self.assertEqual(list(self.state.joinpath(*cc.OUTBOX).iterdir()), [], "a plain repeat is still one card")
+        self.assertEqual(cc.queue(self.state, ROOM, body, card, again=True, **keyed), qid, "the same id: the same dedupe key")
+        self.assertEqual(cc.outcome(self.state, qid), "")
+        self.sent.clear()
+        self.assertEqual(self.poster(clock=__import__("time").time).sweep(), 1)
+        self.assertEqual((self.sent[0]["dedupe_key"], cc.outcome(self.state, qid)), ("agent-card:" + qid, "posted"))
+        self.assertEqual(cc.queue(self.state, ROOM, body, card, again=True, **keyed), qid)
+        self.assertEqual(list(self.state.joinpath(*cc.OUTBOX).iterdir()), [], "a posted card is not queued again")
+        # Never tried at all (the bridge was not running): a confirmed drop.
+        idle = cc.queue(self.state, ROOM, body, card, now=1000.0, key="k2", at_ns=6)
+        self.assertEqual(self.poster(clock=late).sweep(), 0)
+        self.assertEqual(cc.outcome(self.state, idle), "dropped")
+
     def test_an_outcome_that_cannot_be_recorded_leaves_the_card_queued(self):
         qid = cc.queue(self.state, ROOM, *model_card(), now=1000.0)
         with mock.patch.object(cc, "_settle", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 self.poster().sweep()
         self.assertTrue((self.state.joinpath(*cc.OUTBOX) / (qid + ".json")).is_file(), "never gone without a reason")
-        self.assertEqual(self.poster().sweep(), 1)
-        self.assertEqual(cc.outcome(self.state, qid), "posted")
+        self.assertEqual(self.poster().sweep(), 0, "its receipt is there: settled, not posted a second time")
+        self.assertEqual((cc.outcome(self.state, qid), len(self.sent)), ("posted", 1))
 
     def test_a_card_that_would_not_render_or_has_no_room_is_refused_at_the_queue(self):
         body, card = model_card()

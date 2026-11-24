@@ -12,9 +12,10 @@ one and the supervisor only the incident's, so neither can undo the other's writ
 been seen no card can be sent, and the launcher's own stall card still reaches the owner.
 
 Queued is not told. The bridge records what became of each queued card (connector_cards.outcome), and
-only that record decides: `posted` is told, `dropped` (the bridge could not post it within
-connector_cards.MAX_QUEUED_S) is queued again as a new card. A card with no record and no file left
-is not known to be either, so it is never sent again: that could tell the owner twice. Nothing here
+only that record decides: `posted` is told; `dropped` (expired with no send tried) is queued again as
+a new card; `unsure` (expired after a send that may have gone through) is queued again under its own
+key, which the server takes for the same message. A card with no record and no file left is not known
+to be any of these, so it is never sent again: that could tell the owner twice. Nothing here
 types into the session or changes an account.
 """
 from __future__ import annotations
@@ -107,7 +108,7 @@ def words(limited: list, text: str, using: str) -> str:
 
 
 def delivery(bridge, rec: dict, at: float) -> str:
-    """What became of the card `rec` queued: 'posted' or 'dropped' as the bridge recorded it, 'pending'
+    """What became of the card `rec` queued: 'posted', 'dropped' or 'unsure' as the bridge recorded it, 'pending'
     while it is in the outbox or the bridge may still be settling it, 'unknown' when UNKNOWN_S later
     there is still neither a record nor a file. Absence is never read as either outcome."""
     qid = str(rec.get("qid") or "")
@@ -124,6 +125,7 @@ def delivery(bridge, rec: dict, at: float) -> str:
 def notice(root, cfg: dict, names, text: str, log, now=time.time) -> str:
     """One tick's reading of the pane: `names` are the banner families on it. What was done: 'quota-card'
     (queued for the owner's DM), 'quota-card-posted', 'quota-card-dropped' (queued again later),
+    'quota-card-unsure' (queued again later under the same key),
     'quota-card-unknown' (no outcome was ever recorded: not sent again), 'quota-no-room',
     'quota-not-posted' (tried again later), 'quota-cleared', or '' for nothing."""
     limited = [n for n in names or [] if n in PROVIDER_LIMIT_PATTERNS]
@@ -154,7 +156,10 @@ def notice(root, cfg: dict, names, text: str, log, now=time.time) -> str:
         if fate == "unknown":   # it may have been posted: a second card would tell the owner twice
             save(root, dict(rec, told=True, unknown=True))
             return "quota-card-unknown"
-        rec = {k: v for k, v in rec.items() if k not in ("qid", "key", "at", "queued", "tried")}
+        if fate == "unsure":    # the same key and time: the same queue id, one message at the server
+            save(root, dict({k: v for k, v in rec.items() if k not in ("qid", "queued", "tried")}, again=True))
+            return "quota-card-unsure"
+        rec = {k: v for k, v in rec.items() if k not in ("qid", "key", "at", "queued", "tried", "again")}
         save(root, rec)
         return "quota-card-dropped"
     if at - float(rec.get("tried") or 0) < RETRY_S:
@@ -172,9 +177,9 @@ def notice(root, cfg: dict, names, text: str, log, now=time.time) -> str:
     card = account_card.AccountCard(root, cfg, lambda result_file, body: None, log)
     built = card.card("pending", words(limited, text, card.using()), ask=True)
     try:
-        qid = connector_cards.queue(bridge, to, *built, key=rec["key"], at_ns=rec["at"])
+        qid = connector_cards.queue(bridge, to, *built, key=rec["key"], at_ns=rec["at"], again=bool(rec.get("again")))
     except (OSError, ValueError) as e:
         log("quota card not queued:", "%s: %s" % (type(e).__name__, e))
         return "quota-not-posted"
-    save(root, dict(rec, qid=qid, queued=at))
+    save(root, dict({k: v for k, v in rec.items() if k != "again"}, qid=qid, queued=at))
     return "quota-card"
