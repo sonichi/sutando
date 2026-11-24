@@ -400,13 +400,25 @@ def start_waiter(ws: Path, wait: dict, popen=subprocess.Popen) -> int:
 FAILED_TO_START = "I couldn't start the switch. Nothing changed."
 
 
+def say_switching(ws: Path, room: str, rt: str, current: str, attempt: str, event: str, *, core=None,
+                  execute=None) -> tuple:
+    """Put "Switching…" on the card at `event`, or on a new card when that one cannot be edited:
+    (words, what was posted). One operation id per attempt, so asking again returns the same card."""
+    say = (f"Switching the core from {name(current)} to {name(rt)}. It restarts once this turn has finished; "
+           f"I'll confirm here when it is back. {CARRIES}")
+    return say, _answer(ws, room, event, "pending", "Switching", say, f"runtime-card:{attempt}:switching",
+                        reply_to=event, core=core or None, execute=execute)
+
+
 def begin_switch(ws: Path, room: str, rt: str, current: str, t: float, *, event: str = "", core=None,
-                 execute=None, popen=subprocess.Popen, attempt: str = "", tell_failure: bool = True) -> dict:
+                 execute=None, popen=subprocess.Popen, attempt: str = "", tell_failure: bool = True,
+                 says_on=None) -> dict:
     """Admit one switch to `rt`, say so in the room, and start it detached. What a tap on a signed-in
     runtime does, and what the sign-in waiter does once the sign-in is there. `event` is the card the
     tap answered: it is edited to say so, and the outcome edits it again. `attempt` is the id the caller
     already put on record for it (the waiter's hand-off); one is made otherwise. The waiter also passes
-    `tell_failure` False: it records a failed launch itself before the card hears of it."""
+    `tell_failure` False: it records a failed launch itself before the card hears of it; and `says_on`,
+    called with the card that says "Switching" before the worker is started, so it can put that on record."""
     attempt = attempt or f"{int(t)}-{secrets.token_hex(4)}"
     rec = {"attempt": attempt, "runtime": rt, "room": room, "ts": t}
     try:
@@ -414,13 +426,12 @@ def begin_switch(ws: Path, room: str, rt: str, current: str, t: float, *, event:
             return {"status": "say", "say": BUSY}
     except OSError as e:
         return {"status": "failed", "say": FAILED_TO_START, "why": type(e).__name__}
-    say = (f"Switching the core from {name(current)} to {name(rt)}. It restarts once this turn has finished; "
-           f"I'll confirm here when it is back. {CARRIES}")
-    posted = _answer(ws, room, event, "pending", "Switching", say, f"runtime-card:{attempt}:switching",
-                     reply_to=event, core=core or None, execute=execute)
+    say, posted = say_switching(ws, room, rt, current, attempt, event, core=core, execute=execute)
     # The card that says "Switching" now, whether the tapped one edited in place or a new one posted
     # because it could not be: the worker's outcome and any correction go to that card.
     says = str(posted.get("event_id") or "")
+    if says and says_on is not None:
+        says_on(says)
     try:
         pid = start_switch(ws, room, rt, attempt, popen, card=says)
     except OSError as e:
@@ -573,6 +584,13 @@ def _await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, r
         rec = _read_json(ws.joinpath(*WAITING))
         return rec if {k: rec.get(k) for k in mine} == mine else None
 
+    def note_card(event: str) -> None:
+        """The card this attempt now speaks on goes on record with the wait, for whoever resumes it."""
+        try:
+            keep_wait_card(ws, mine, event)
+        except OSError:
+            pass
+
     def refuse(card_event: str, words: str, out: dict) -> int:
         """The switch is not happening, in `words`, which are already on record with the `refused` phase:
         deliver exactly those, under one operation id, and remove the wait on a delivery receipt."""
@@ -622,7 +640,12 @@ def _await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, r
                 finish_wait(ws, mine)       # its worker is running
                 return _emit({"status": "handed_off", "runtime": args.runtime, "after_sign_in": True})
             if admitted:
-                # Admitted, and no worker holds the execution lock: it was never launched, or died. Launch it.
+                # Admitted, and no worker holds the execution lock: it was never launched, or died. Ask for
+                # "Switching" again under the attempt's id, which returns the card that already says it.
+                _, posted = say_switching(ws, args.room, args.runtime, runtime(), switch, card_event, core=core,
+                                          execute=execute)
+                card_event = str(posted.get("event_id") or card_event)
+                note_card(card_event)
                 try:
                     pid = start_switch(ws, args.room, args.runtime, switch, popen, card=card_event)
                 except OSError as e:
@@ -635,7 +658,7 @@ def _await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, r
                 finish_wait(ws, mine)       # not admitted any more because its worker ran and finished
                 return _emit({"status": "handed_off", "runtime": args.runtime, "after_sign_in": True})
         out = begin_switch(ws, args.room, args.runtime, runtime(), clock(), event=card_event, core=core,
-                           execute=execute, popen=popen, attempt=switch, tell_failure=False)
+                           execute=execute, popen=popen, attempt=switch, tell_failure=False, says_on=note_card)
         out["after_sign_in"] = True
         if out["status"] == "started":
             finish_wait(ws, mine)
