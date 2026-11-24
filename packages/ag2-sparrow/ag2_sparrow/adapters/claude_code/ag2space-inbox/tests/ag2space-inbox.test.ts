@@ -44,7 +44,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   const progress: any[] = []
   const dirs = new Set(['/in', '/out', '.'])
   // The CLI's live session id: every read sees the current value, as $.session.id() does.
-  const live = { sid: (opts.sessionIds ?? ['sid-1'])[0], promptId: 'p-0' }
+  const live = { sid: (opts.sessionIds ?? ['sid-1'])[0] }
   let rejectLeft = opts.rejectSubmits ?? 0
   let progressFailLeft = opts.progressFails ?? 0
   let failVerb = ''
@@ -95,7 +95,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   on('turn.start', (_: any, e: any) => ({ turnId: e.turnId }))
   on('turn.complete', (_: any, e: any) => ({ text: String(e.answer ?? e.text ?? '') }))
   on('classic.StopFailure', () => ({}))
-  on('session.info', () => ({ value: { transcriptPath: '', promptId: live.promptId } }))
+  on('classic.UserPromptSubmit', () => ({}))
   on('tool.register', () => ({ value: { tool: 'x' } }))
   on('ui.log', (_: any, e: any) => { logs.push(String(e?.message ?? e?.text ?? JSON.stringify(e))); return { value: undefined } })
   mock.env(on, opts.env ?? { AG2_RESULTS_DIR: '/out' })
@@ -325,7 +325,6 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     submitted.push(e.text); return { text: e.text }
   })
   return { files, submitted, runs, claims, progress, clock, hash, interruptAt, logs, stuck, publishes: () => publishes, setSid: (sid: string) => { live.sid = sid },
-    setPrompt: (id: string) => { live.promptId = id },
     failProgress: (n: number) => { progressFailLeft = n },
     failAt: (verb: string) => { failVerb = verb },
     refuseUnstuck: (n: number) => { unstuckFailsLeft = n }, hardUnstuck: (n: number) => { unstuckHardLeft = n }, refusePark: () => { parkRefused = true },
@@ -499,6 +498,8 @@ test('a completed or aborted turn without a reply parks as an explicit protocol 
 
 // As a session: an API error ends the turn with an empty answer; StopFailure carries the error's words, and
 // its prompt_id names the prompt the failed turn ran under.
+// As a session: each prompt's UserPromptSubmit carries the prompt id its turns and their StopFailure share.
+const prompted = ($: any, id: string) => $.classic.UserPromptSubmit({ session_id: 'sid-1', prompt: 'p', prompt_id: id } as any)
 const fails = (prompt: string, extra: any = {}) =>
   ({ session_id: 'sid-1', prompt_id: prompt, error: 'billing_error', error_details: 'Credit balance is too low', ...extra }) as any
 
@@ -507,7 +508,7 @@ test('a turn an API error ended parks with the words its StopFailure carried, ra
   h.files['/in/task-e1.txt'] = TASK('task-e1')
   await arm($, h)
   await h.clock.advance(1000)
-  h.setPrompt('p-e1')
+  await prompted($, 'p-e1')
   await $.turn.start({ text: h.submitted[0], turnId: 't-e1' })
   await $.classic.StopFailure(fails('p-e1'))
   await $.turn.complete({ turnId: 't-e1', reason: 'error', answer: '' } as any)
@@ -516,7 +517,7 @@ test('a turn an API error ended parks with the words its StopFailure carried, ra
   h.files['/in/task-e2.txt'] = TASK('task-e2')
   await h.clock.advance(3000)
   expect(h.submitted[1]).toContain('task-e2')
-  h.setPrompt('p-e2')
+  await prompted($, 'p-e2')
   await $.turn.start({ text: h.submitted[1], turnId: 't-e2' })
   await $.turn.complete({ turnId: 't-e2', reason: 'error', answer: '' } as any)
   expect(h.files['/out/task-e2.txt']).toBeUndefined()
@@ -527,7 +528,7 @@ test('a turn an API error ended parks with the words its StopFailure carried, ra
   h.files['/in/task-e3.txt'] = TASK('task-e3')
   await h.clock.advance(3000)
   expect(h.submitted[2]).toContain('task-e3')
-  h.setPrompt('p-e3')
+  await prompted($, 'p-e3')
   await $.turn.start({ text: h.submitted[2], turnId: 't-e3' })
   await $.turn.complete({ turnId: 't-e3', reason: 'error', answer: '' } as any)
   await h.clock.advance(1000)
@@ -539,7 +540,7 @@ test("an error turn's words are error_details, else the classifier word; never i
   h.files['/in/task-y1.txt'] = TASK('task-y1')
   await arm($, h)
   await h.clock.advance(1000)
-  h.setPrompt('p-y1')
+  await prompted($, 'p-y1')
   await $.turn.start({ text: h.submitted[0], turnId: 't-y1' })
   await $.classic.StopFailure(fails('p-y1', { error: 'server_error', error_details: 'API Error: Overloaded',
                                                last_assistant_message: 'Let me look at the owner notes first.' }))
@@ -549,7 +550,7 @@ test("an error turn's words are error_details, else the classifier word; never i
 
   h.files['/in/task-y2.txt'] = TASK('task-y2')
   await h.clock.advance(3000)
-  h.setPrompt('p-y2')
+  await prompted($, 'p-y2')
   await $.turn.start({ text: h.submitted[1], turnId: 't-y2' })
   await $.classic.StopFailure(fails('p-y2', { error_details: undefined, last_assistant_message: 'Credit balance is too low' }))
   await $.turn.complete({ turnId: 't-y2', reason: 'error', answer: 'Let me look at the owner notes first.' } as any)
@@ -564,10 +565,10 @@ test('a StopFailure is applied only to the one turn its prompt_id names: another
   await arm($, h)
   await h.clock.advance(1000)
   // A manual turn A errors; the task's turn B starts; A's StopFailure lands only after B started.
-  h.setPrompt('p-a')
+  await prompted($, 'p-a')
   await $.turn.start({ text: 'the owner typed something else', turnId: 't-a' })
   await $.turn.complete({ turnId: 't-a', reason: 'error', answer: '' } as any)
-  h.setPrompt('p-b')
+  await prompted($, 'p-b')
   await $.turn.start({ text: h.submitted[0], turnId: 't-b' })
   await $.classic.StopFailure(fails('p-a', { error_details: 'TURN A WORDS' }))
   await $.turn.complete({ turnId: 't-b', reason: 'error', answer: '' } as any)
@@ -584,7 +585,7 @@ test('a StopFailure is applied only to the one turn its prompt_id names: another
     h.files[`/in/${task}.txt`] = TASK(task)
     await h.clock.advance(3000)
     const at = h.submitted.findIndex((t: string) => t.includes(task))
-    h.setPrompt(`p-${task.slice(5)}`)
+    await prompted($, `p-${task.slice(5)}`)
     await $.turn.start({ text: h.submitted[at], turnId: `t-${task}` })
     await $.classic.StopFailure(event)
     await $.turn.complete({ turnId: `t-${task}`, reason: 'error', answer: '' } as any)
@@ -596,7 +597,7 @@ test('a StopFailure is applied only to the one turn its prompt_id names: another
   h.files['/in/task-x5.txt'] = TASK('task-x5')
   await h.clock.advance(3000)
   const at = h.submitted.findIndex((t: string) => t.includes('task-x5'))
-  h.setPrompt('p-shared')
+  await prompted($, 'p-shared')
   await $.turn.start({ text: 'a continuation', turnId: 't-cont' })
   await $.turn.complete({ turnId: 't-cont', reason: 'answer', answer: 'ok' } as any)
   await $.turn.start({ text: h.submitted[at], turnId: 't-x5' })

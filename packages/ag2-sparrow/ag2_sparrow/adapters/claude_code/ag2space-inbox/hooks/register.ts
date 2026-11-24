@@ -100,7 +100,9 @@ type State = {
   cleanup: Map<string, Cleanup>
   intake: 'open' | 'closed'
   intakeReason: string
-  // Main-loop turn id -> the prompt id it ran under (recent turns only): what a StopFailure is matched by.
+  // The main loop's last UserPromptSubmit prompt id, and turn id -> the prompt id it ran under (recent
+  // turns only): what a StopFailure is matched by.
+  promptId: string
   prompts: Map<string, string>
   // Turn id -> the API error words its StopFailure carried, until that turn completes.
   apiErrors: Map<string, string>
@@ -128,11 +130,9 @@ async function cli($: any, s: State, args: string[], stdin?: string): Promise<Cl
   return { ok: r.exitCode === 0, hard, data }
 }
 
-// The prompt id the session is on as a main-loop turn starts, kept for the last few turns; none known, none kept.
-async function rememberPrompt($: any, s: State, turnId: string) {
-  let promptId = ''
-  try { promptId = String((await $.session.info())?.promptId ?? '') } catch { promptId = '' }
-  if (promptId) s.prompts.set(turnId, promptId)
+// The prompt id the main loop is on as a turn starts, kept for the last few turns; none known, none kept.
+function rememberPrompt(s: State, turnId: string) {
+  if (s.promptId) s.prompts.set(turnId, s.promptId)
   for (const t of [...s.prompts.keys()].slice(0, Math.max(0, s.prompts.size - PROMPTS_KEPT))) s.prompts.delete(t)
   for (const t of [...s.apiErrors.keys()]) if (!s.prompts.has(t)) s.apiErrors.delete(t)
 }
@@ -483,7 +483,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
 
 export const register: Register = (on) => {
   const s: State = { seen: new Set(), answered: new Set(), offers: new Map(), pending: null, stale: new Map(),
-    armedResults: '', stop: null, sessionId: '', stoppedFor: '', tick: 0, retry: new Map(), cleanup: new Map(), authorizing: new Map(), intake: 'open', intakeReason: '', prompts: new Map(), apiErrors: new Map() }
+    armedResults: '', stop: null, sessionId: '', stoppedFor: '', tick: 0, retry: new Map(), cleanup: new Map(), authorizing: new Map(), intake: 'open', intakeReason: '', promptId: '', prompts: new Map(), apiErrors: new Map() }
 
   on('session.start', async ($, e, next) => {
     await $.tool.register({
@@ -534,7 +534,7 @@ export const register: Register = (on) => {
   })
 
   on('turn.start', async ($, e, next) => {
-    if (!e.agentId) await rememberPrompt($, s, String(e.turnId))
+    if (!e.agentId) rememberPrompt(s, String(e.turnId))
     await witness($, s, 'turn.start')
     const offer = s.pending
     const at = offer ? submittedAt(String(e.text ?? ''), offer.msg) : -1
@@ -549,6 +549,12 @@ export const register: Register = (on) => {
       }
       // An unrelated manual turn: ours is still queued behind it; nothing changes.
     }
+    return next(e)
+  })
+
+  // prompt_id correlates a prompt with every event until the next one: StopFailure carries it too.
+  on('classic.UserPromptSubmit', async ($, e, next) => {
+    if (!e.agent_id) s.promptId = typeof e.prompt_id === 'string' ? e.prompt_id : ''
     return next(e)
   })
 
