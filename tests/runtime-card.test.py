@@ -136,6 +136,10 @@ class Base(unittest.TestCase):
             patch = mock.patch.object(target, attr, value)
             patch.start()
             self.addCleanup(patch.stop)
+        # The gateway step has its own tests, which put the real one back (gateway_ctl).
+        self.no_gateway = mock.patch.object(rtc, "restore_desktop_gateway", lambda run=None: "")
+        self.no_gateway.start()
+        self.addCleanup(mock.patch.stopall)
 
     # fakes ------------------------------------------------------------------------------------------
     def claude_run(self, argv, **kw):
@@ -765,6 +769,9 @@ class Switch(Base):
 
     def gateway_ctl(self, rc=0, raises=None):
         """A desktop's control script beside the engine; `calls` gets each run of it."""
+        if self.no_gateway is not None:
+            self.no_gateway.stop()
+            self.no_gateway = None
         ctl = self.ws / "sutando-ctl.sh"
         ctl.write_text("#!/bin/bash\n")
         patch = mock.patch.object(rtc, "DESKTOP_CTL", ctl)
@@ -815,15 +822,21 @@ class Switch(Base):
                 self.ws.joinpath(*rtc.RUNNING).write_text(json.dumps(
                     {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": 1e12}))
 
-    def test_the_gateway_is_left_alone_with_no_desktop_no_control_script_or_no_restart_of_ours(self):
+    def test_a_desktop_whose_control_script_is_missing_is_not_a_recovered_gateway_and_the_card_says_so(self):
+        ctl, calls = self.gateway_ctl()
+        ctl.unlink()
+        rc, out = self.switch_with(self.gateway_run)
+        self.assertEqual((calls, out["outcome"], out["gateway"]), ([], "info", "the desktop's control script is missing"))
+        self.assertIn("The core is now running on Claude Code", out["say"])
+        self.assertIn("its gateway did not come back (the desktop's control script is missing).", out["say"])
+        self.assertEqual(self.fake.edits()[-1], ("$card1", "Core runtime: " + out["say"]))
+
+    def test_the_gateway_is_left_alone_with_no_desktop_or_no_restart_of_ours(self):
         ctl, calls = self.gateway_ctl()
         self.desktop = False
         rc, out = self.switch_with(self.gateway_run)                    # not hosted by a desktop
         self.assertEqual((calls, "gateway" in out), ([], False))
         self.desktop = True
-        ctl.unlink()                                                    # an engine with no desktop script beside it
-        self.assertEqual(rtc.restore_desktop_gateway(self.gateway_run), "")
-        ctl.write_text("#!/bin/bash\n")
         self.ws.joinpath(*rtc.RUNNING).write_text(json.dumps(
             {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": 1e12}))
         self.current = self.selected = "codex"

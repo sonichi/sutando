@@ -687,9 +687,12 @@ def restart_left(ws: Path, rid: str) -> str:
 
 def restore_desktop_gateway(run=subprocess.run) -> str:
     """After a restart on a desktop-hosted engine, have the desktop recreate its gateway window: "" where
-    no desktop hosts the engine, "restored", or why it failed. Without it the restarted core is deaf."""
-    if not desktop_hosted() or not DESKTOP_CTL.is_file():
+    no desktop hosts the engine, "restored", or why it was not (its control script missing included).
+    Without it the restarted core is deaf."""
+    if not desktop_hosted():
         return ""
+    if not DESKTOP_CTL.is_file():
+        return "the desktop's control script is missing"
     try:
         rc = run(["bash", str(DESKTOP_CTL), "restart-gateway"], cwd=str(DESKTOP_CTL.parent), env=detached_env(),
                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
