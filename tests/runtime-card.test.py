@@ -654,6 +654,27 @@ class Switch(Base):
         self.assertEqual(len(self.fake.cards()), 1, "one card throughout")
         self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists())
 
+    def test_the_other_restart_already_made_the_switch_so_nothing_is_restarted_again(self):
+        lock = self.ws.joinpath(*rtc.RESTART_LOCK)
+        lock.mkdir(parents=True)
+        self.restart_rc = rtc.DEFERRED
+        real = self.clock.sleep
+
+        def sleep(s):
+            real(s)
+            if lock.exists():
+                # The restart that was in the way was itself a switch to Claude Code (the desktop's, say).
+                self.record("claude", self.clock.t)
+                self.current = self.selected = "claude"
+                lock.rmdir()
+        self.clock.sleep = sleep
+        rc, out = self.carded()
+        self.assertEqual((rc, out["outcome"], out["restart"], out["rc"]), (0, "done", "requested", 0))
+        self.assertEqual(self.restarts, ["claude"], "the confirmed core is not restarted a second time")
+        said = [words for event, words in self.fake.edits() if event == "$card1"]
+        self.assertIn("Waiting for another restart to finish", said[-2])
+        self.assertIn("Switched. The core is now running on Claude Code", said[-1])
+
     def test_a_restart_still_in_the_way_after_the_wait_is_not_asked_again_and_the_card_says_so(self):
         lock = self.ws.joinpath(*rtc.RESTART_LOCK)
         lock.mkdir(parents=True)

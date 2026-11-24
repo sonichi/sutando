@@ -738,8 +738,12 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
                         f"The core is still on {name(was)}.",
                         f"runtime-card:{args.attempt}:waiting", core=core, execute=execute)
                 if restart_lock_clears(ws, sleep=sleep, clock=clock):
-                    was, started = configured_runtime(), clock()
-                    rc = restart(args.runtime)
+                    seen = check(ws, args.runtime, started)
+                    if seen["core"] and seen["selected"]:
+                        rc = 0      # the other restart already brought it up on this runtime: nothing to restart
+                    else:
+                        was, started = configured_runtime(), clock()
+                        rc = restart(args.runtime)
             if rc in NOT_RESTARTED:
                 reason = RESTART_REASONS[rc]
                 words = (f"I could not switch to {name(args.runtime)}. The core is still on {name(was)}. "

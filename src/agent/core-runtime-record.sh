@@ -2,6 +2,7 @@
 # Called only after the adapter confirms its named core is present.
 record_confirmed_core_runtime() {
   local runtime="$1" py="$2" ws started
+  release_restart_lock_of_this_launch
   persist_confirmed_desktop_selection "$runtime"
   [ -z "${SUTANDO_INSTANCE_ID:-}" ] || return 0
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
@@ -20,6 +21,20 @@ record_confirmed_core_runtime() {
   # The writer itself confirms the panes run this runtime's CLI and says why when not.
   "$py" "$REPO/src/core_runtime_record.py" "$ws" "$runtime" "$SESSION" "$started" \
     --socket "$TMUX_SOCKET" || true
+}
+
+# graceful-restart.sh exec's the launcher still holding its lock (GR_RID names it). A confirmed core is
+# the end of that restart: the lock goes now, not when it ages out, or the next restart is put off.
+release_restart_lock_of_this_launch() {
+  [ -n "${GR_RID:-}" ] || return 0
+  local ws lock rid="$GR_RID"
+  unset GR_RID
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  [ -n "$ws" ] || return 0
+  lock="$ws/state/locks/graceful-restart.lock"
+  # Only this run's own lock: one a later restart took (after reaping ours) is left alone.
+  [ "$(cat "$lock/rid" 2>/dev/null)" = "$rid" ] && rm -rf "$lock"
+  return 0
 }
 
 # The dispatcher sets SUTANDO_DESKTOP_RUNTIME_SELECT for an explicit switch on the desktop's
