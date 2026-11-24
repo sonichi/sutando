@@ -100,6 +100,7 @@ RESTART_REASONS = {3: "the core could not get ready to restart",
                    4: "another restart was under way or the core was busy, so the restart was put off",
                    5: "the restart was only rehearsed"}
 POST_TRIES, POST_PAUSE_S = 4, 15
+CARD_TRIES = 20
 # A tap on a runtime that is not signed in: the card carries the account controls (the same marker the
 # account cards use, naming the runtime to sign in to) and the tap is kept while a waiter watches for it.
 CONTROLS = "account_controls"
@@ -417,12 +418,14 @@ def say_switching(ws: Path, room: str, rt: str, current: str, attempt: str, even
             return say, {"status": "failed", "why": "the new card's route could not be recorded"}
         body, card = notice_card("pending", "Switching", say)
         out = _post(ws, room, body, card, op, reply_to=event, core=core or None, execute=execute)
+        if out["status"] != "posted":
+            out = dict(out, unknown=True)   # sent with no answer: it may be in the room
     return say, out
 
 
 def begin_switch(ws: Path, room: str, rt: str, current: str, t: float, *, event: str = "", core=None,
                  execute=None, popen=subprocess.Popen, attempt: str = "", tell_failure: bool = True,
-                 says_on=None, new_card: bool = False, before_new_card=None) -> dict:
+                 says_on=None, new_card: bool = False, before_new_card=None, hold_unknown: bool = False) -> dict:
     """Admit one switch to `rt`, say so in the room, and start it detached. What a tap on a signed-in
     runtime does, and what the sign-in waiter does once the sign-in is there. `event` is the card the
     tap answered: it is edited to say so, and the outcome edits it again. `attempt` is the id the caller
@@ -443,6 +446,10 @@ def begin_switch(ws: Path, room: str, rt: str, current: str, t: float, *, event:
     says = str(posted.get("event_id") or "")
     if says and says_on is not None:
         says_on(says)
+    if hold_unknown and posted.get("unknown"):
+        # A new card may be out with no id known for it. The attempt stays admitted and nothing is
+        # started: the caller asks for that same post until it has the card.
+        return {"status": "pending", "attempt": attempt, "runtime": rt, "say": say}
     try:
         pid = start_switch(ws, room, rt, attempt, popen, card=says)
     except OSError as e:
@@ -665,18 +672,22 @@ def _await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, r
                 # "Switching" again under the attempt's id, which returns the card that already says it.
                 if says:
                     card_event = says       # the card that says it is on record: used as it is, nothing re-sent
-                else:
+                for tried in range(0 if says else CARD_TRIES):
                     _, posted = say_switching(ws, args.room, args.runtime, runtime(), switch, card_event, core=core,
                                               execute=execute, new_card=new_card,
                                               before_new_card=note_new_card_route)
                     if posted.get("event_id"):
                         card_event = str(posted["event_id"])
                         note_card(card_event)
-                    elif new_card:
-                        # A new card may be out there and this try did not learn which: the worker is not
-                        # started on a guess. The claim stays, and the next waiter asks for the same post.
+                        break
+                    new_card = new_card or bool(posted.get("unknown"))
+                    if not new_card:
+                        break               # nothing was posted: the worker speaks for itself
+                    if tried + 1 == CARD_TRIES:
+                        # A new card may be out there with no id known: no worker is started on a guess.
                         return _emit({"status": "failed", "runtime": args.runtime, "kept": "switching",
                                       "why": "the card that says Switching is not confirmed yet"}, 1)
+                    sleep(POST_PAUSE_S)
                 try:
                     pid = start_switch(ws, args.room, args.runtime, switch, popen, card=card_event)
                 except OSError as e:
@@ -690,7 +701,10 @@ def _await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, r
                 return _emit({"status": "handed_off", "runtime": args.runtime, "after_sign_in": True})
         out = begin_switch(ws, args.room, args.runtime, runtime(), clock(), event=card_event, core=core,
                            execute=execute, popen=popen, attempt=switch, tell_failure=False, says_on=note_card,
-                           new_card=new_card, before_new_card=note_new_card_route)
+                           new_card=new_card, before_new_card=note_new_card_route, hold_unknown=True)
+        if out["status"] == "pending":
+            # Admitted, the route on record, the card not known yet: go on as a resumed waiter would.
+            return conclude("switching", card_event, switch, resumed=True, new_card=True)
         out["after_sign_in"] = True
         if out["status"] == "started":
             finish_wait(ws, mine)
