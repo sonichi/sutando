@@ -107,6 +107,21 @@ def saved_threads(work):
     return sorted(p.name for p in (Path(work) / "state" / "threads").iterdir())
 
 
+
+def taps(card):
+    """[(model name, reply)] of a model card: its buttons, or with more models than buttons, each row's
+    taps (a row per family, its levels the taps; "Use" for a model with no level)."""
+    out = [(b["label"], b["reply"]) for b in card.get("buttons") or []]
+    for group in card.get("groups") or []:
+        for row in group["rows"]:
+            for a in row.get("actions") or []:
+                out.append((row["title"] if a["label"] == "Use" else "%s (%s)" % (row["title"], a["label"]), a["reply"]))
+    return out
+
+
+def tap(card, name):
+    return next(reply for label, reply in taps(card) if label == name)
+
 class NonOwnerNoteTest(unittest.TestCase):
     def test_the_note_is_the_shared_owners_and_unchanged(self):
         self.assertIs(cc.NON_OWNER_NOTE, task_io.NON_OWNER_NOTE)
@@ -775,7 +790,7 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         tag = name.replace(" ", "") + event.strip("$")
         self.assertEqual(self.serve("task-ask-" + tag, "/model"), "[no-send] the model card answers\n")
         ((_, card),) = self.posted(event)
-        said = next(b["reply"] for b in card["buttons"] if b["label"] == name)
+        said = tap(card, name)
         return self.serve("task-tap-" + tag, said, reply_to=event, click=said)
 
     def test_the_owners_tap_runs_the_next_turn_on_the_pick_and_a_card_says_it_switched(self):
@@ -783,15 +798,17 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         self.assertEqual((metrics(self.work)[0]["card"], "thread" in metrics(self.work)[0]), ("model-card", False),
                          "/model never reaches Codex")
         ((room, card),) = self.posted()
-        self.assertEqual((room, card["state"], [b["label"] for b in card["buttons"]]),
-                         (self.DM, "pending", ["Stub Model", "Stub Large", "Stub Broken", "Stub Moved", "Stub 5", "Stub 6"]))
-        self.assertEqual(card["text"], "Now using Stub Model. Also: Stub 7, Stub 8 (send /model and the name).")
-        said = card["buttons"][1]["reply"]
+        self.assertEqual((room, card["state"], [label for label, _ in taps(card)]),
+                         (self.DM, "pending", ["Stub Model", "Stub Large", "Stub Broken", "Stub Moved", "Stub 5", "Stub 6",
+                                               "Stub 7", "Stub 8"]), "every model one tap away, none to type")
+        self.assertEqual(card["text"], "I'm using Stub Model. Pick a model to switch to.")
+        self.assertEqual([r["tag"] if "tag" in r else "" for r in card["groups"][0]["rows"]][:2], ["In use", ""])
+        said = tap(card, "Stub Large")
         self.assertEqual(self.serve("task-2", said, reply_to="$card1", click=said), "[no-send] the model card answers\n")
         self.assertEqual((self.state()["wanted"], metrics(self.work)[-1]["card"]), ("gpt-6-sol", "model-picked"))
         ((_, coming),) = self.posted("$card2")
-        self.assertEqual((coming["state"], "buttons" in coming), ("info", False))
-        self.assertIn("Switching to Stub Large on your next message", coming["text"])
+        self.assertEqual((coming["state"], "buttons" in coming), ("pending", False))
+        self.assertIn("Saved, not switched yet: I'll use Stub Large from your next message", coming["text"])
         # The next turn on a kept thread, in any room, carries the pick; the owner is told in the DM.
         self.assertIn("model=gpt-6-sol", self.serve("task-3", "hello", channel="!room:s.space", kind="room"))
         self.assertEqual((metrics(self.work)[-1]["model"], metrics(self.work)[-1]["model_switch"]), ("gpt-6-sol", "switched"))
@@ -885,7 +902,7 @@ class ModelCardTest(CardWorld, unittest.TestCase):
     def test_only_a_model_on_the_allowlist_that_codex_lists_is_offered_or_taken(self):
         self.assertEqual(self.serve("task-1", "/model"), "[no-send] the model card answers\n")
         ((_, card),) = self.posted()
-        self.assertNotIn("Stub Unlisted", [b["label"] for b in card["buttons"]] + [card["text"]])
+        self.assertNotIn("Stub Unlisted", [label for label, _ in taps(card)] + [card["text"]])
         for tid, said in (("task-2", "/model stub unlisted"), ("task-3", "/model stub-unlisted")):
             self.assertEqual(self.serve(tid, said).strip(), model_switch.NOT_USABLE, "Codex lists it; the code does not")
         self.assertEqual(self.posted(), [])
@@ -912,17 +929,18 @@ class ModelCardTest(CardWorld, unittest.TestCase):
     def test_a_pending_pick_is_shown_as_pending_and_a_failed_switch_names_the_model_really_in_use(self):
         self.pick("Stub Broken")
         ((_, coming),) = self.posted("$card2")
-        self.assertIn("Switching to Stub Broken on your next message", coming["text"])
+        self.assertIn("Saved, not switched yet: I'll use Stub Broken from your next message", coming["text"])
         # Reopened before any turn: the model in use is still Codex's own, and the pick is pending.
         self.assertEqual(self.serve("task-again", "/model"), "[no-send] the model card answers\n")
         ((_, menu),) = self.posted("$card3")
-        self.assertTrue(menu["text"].startswith("Now using Stub Model. Pending: Stub Broken, on your next message."))
+        self.assertEqual(menu["text"], "I'm using Stub Model. Pick a model to switch to. Saved, not switched yet: "
+                                       "Stub Broken, from your next message.")
         self.assertEqual(self.state()["current"], "gpt-5.6-sol")
-        said = next(b["reply"] for b in menu["buttons"] if b["label"] == "Stub Broken")
+        said = tap(menu, "Stub Broken")
         self.assertEqual(self.serve("task-repeat", said, reply_to="$card3", click=said), "[no-send] the model card answers\n")
         ((_, still),) = self.posted("$card4")
-        self.assertEqual((still["state"], metrics(self.work)[-1]["card"]), ("info", "model-pending"))
-        self.assertIn("Switching to Stub Broken on your next message", still["text"])
+        self.assertEqual((still["state"], metrics(self.work)[-1]["card"]), ("pending", "model-pending"))
+        self.assertIn("Saved, not switched yet: I'll use Stub Broken from your next message", still["text"])
         self.serve("task-turn", "hello")
         ((_, failed),) = self.posted("$card5")
         self.assertEqual(failed["text"], "I could not switch to Stub Broken. I'm still using Stub Model. Send /model "
@@ -1000,7 +1018,7 @@ class ModelCardTest(CardWorld, unittest.TestCase):
             with listed:
                 self.assertEqual(c.desk.task(str(self.work / "tasks" / "task-3.txt"), str(self.work / "o.txt")),
                                  "model-picked")
-        self.assertIn("Switching to Stub 5 on your next message", (self.work / "o.txt").read_text())
+        self.assertIn("Saved, not switched yet: I'll use Stub 5 from your next message", (self.work / "o.txt").read_text())
         # An owed outcome that cannot be built is said in words once, then dropped.
         c.models.save(untold={"picked": "gpt-5.6-terra", "ran": "", "room": self.DM})
         with mock.patch.object(model_switch.ModelSwitch, "card", side_effect=ValueError("bad name")):
@@ -1017,7 +1035,7 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(text.count("Switched. I'm now using Stub"), 1, "the outcome, in words, not swallowed by the menu")
         self.assertNotIn("[no-send]", text)
         ((_, menu),) = self.posted()
-        self.assertEqual((menu["state"], menu["text"].startswith("Now using Stub Large.")), ("pending", True))
+        self.assertEqual((menu["state"], menu["text"].startswith("I'm using Stub Large. Pick a model to switch to.")), ("pending", True))
         self.assertEqual((self.state()["current"], self.state()["untold"], metrics(self.work)[-1]["model_switch"]),
                          ("gpt-6-sol", [], "switched"))
         self.assertNotIn("Switched", self.serve("task-2", "again"), "told once")
@@ -1025,7 +1043,7 @@ class ModelCardTest(CardWorld, unittest.TestCase):
     def test_a_pick_and_its_outcome_replace_the_tapped_menu_and_a_later_tap_on_it_gets_a_fresh_menu_in_place(self):
         self.assertEqual(self.serve("task-1", "/model"), "[no-send] the model card answers\n")
         ((_, menu),) = self.posted("$card1")
-        large = next(b["reply"] for b in menu["buttons"] if b["label"] == "Stub Large")
+        large = tap(menu, "Stub Large")
         self.serve("task-2", large, reply_to="$card1", click=large)
         ((_, coming),) = self.posted("$card2")
         self.assertEqual(self.ops(), [("edit", "$card1")], "the answer is shown in place of the menu, not as a second card")
@@ -1035,7 +1053,7 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         self.assertEqual((coming["id"], done["id"], done["state"]), (model_switch.NOTE, model_switch.NOTE, "done"))
         # The menu's buttons are gone from that card: a tap from a client still showing them switches
         # nothing and shows a fresh menu in the same place.
-        five = next(b["reply"] for b in menu["buttons"] if b["label"] == "Stub 5")
+        five = tap(menu, "Stub 5")
         self.assertEqual(self.serve("task-4", five, reply_to="$card1", click=five), "[no-send] the model card answers\n")
         self.assertEqual((metrics(self.work)[-1]["card"], self.state()["wanted"]), ("model-card-expired", "gpt-6-sol"))
         ((room, fresh),) = self.posted("$card4")

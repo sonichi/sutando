@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 import uuid
 
@@ -26,6 +27,9 @@ NOTE = "model-switch-status"
 EXPIRED = "That card has expired, so nothing changed. Here's a new one."
 EXPIRED_NO_CARD = "That card has expired, so nothing changed. Send /model for a new one."
 BUTTONS = 6          # the card's button limit
+ROW_TAPS = 4         # a row's action limit
+NOTE_TEXT = "A switch takes effect on your next message."
+_LEVEL = re.compile(r"^(?P<family>.+?)\s*\((?P<level>[^()]{1,24})\)$")
 UNTOLD_KEEP = 5      # outcome notices kept while their cards cannot be queued
 
 # How the owner asks in their own words: the runtime answers with the mark alone, and the card is shown.
@@ -40,6 +44,12 @@ UNLISTED = "I could not get my list of models just now. Send /model again in a m
 NOT_USABLE = "That model is not one I can use now. Send /model for the current list."
 ANSWERED = "[no-send] the model card answers\n"
 NOT_POSTED = "I could not post the model card. Try again in a moment."
+
+
+def split_name(name: str) -> tuple:
+    """("Gemini 4 Neon", "High") for "Gemini 4 Neon (High)"; (name, "") for a name with no level."""
+    m = _LEVEL.match(name)
+    return (m.group("family"), m.group("level")) if m else (name, "")
 
 
 def model_verb(model_id: str) -> str:
@@ -138,18 +148,44 @@ class ModelSwitch:
             return agent_card.build(NOTE, kind, title="Model", body=body, text=text, **({"status": status} if status else {}))
         names = {m["id"]: m["name"] for m in self.offered(state)}
         now, coming = state.get("current") or "", self.pending(state)
-        buttons = [agent_card.button(name, "reply", reply="Use %s" % name,
-                                     command=agent_card.reply("model", "agent", model_verb(mid)))
-                   for mid, name in list(names.items())[:BUTTONS]]
-        more = list(names.values())[BUTTONS:]
-        text = "Now using %s." % names.get(now, now or "the default model")
+        text = "I'm using %s. Pick a model to switch to." % names.get(now, now or "the default model")
         if coming:
-            text += " Pending: %s, on your next message." % names.get(coming, coming)
-        if more:
-            text += " Also: %s (send /model and the name)." % ", ".join(more)
+            text += " Saved, not switched yet: %s, from your next message." % names.get(coming, coming)
+        menu = dict(buttons=self.buttons(agent_card, names, now)) if len(names) <= BUTTONS else \
+            dict(groups=self.groups(agent_card, names, now))
         # The menu says when it stops acting (the time its record is kept), so the app can show it expired.
         return agent_card.build(CARD, "pending", title="Model", body="Pick a model for %s" % self.name,
-                                text=text, buttons=buttons, expires_at_ms=int((time.time() + issued_cards.TTL_S) * 1000))
+                                text=text, note=NOTE_TEXT, note_tone="dim",
+                                expires_at_ms=int((time.time() + issued_cards.TTL_S) * 1000), **menu)
+
+    @staticmethod
+    def choice(agent_card, label, mid, name, now):
+        """One model's tap: the one in use stands out, as on the core's card."""
+        return agent_card.button(label, "reply", style="primary" if mid == now else "secondary",
+                                 reply="Use %s" % name, command=agent_card.reply("model", "agent", model_verb(mid)))
+
+    def buttons(self, agent_card, names: dict, now: str) -> list:
+        return [self.choice(agent_card, name, mid, name, now) for mid, name in names.items()]
+
+    def groups(self, agent_card, names: dict, now: str) -> list:
+        """More models than buttons: a row per family ("Gemini 4 Neon"), its levels ("High", "Low") the
+        row's taps, so every model is one tap away and none is left to be typed."""
+        families, order = {}, []
+        for mid, name in names.items():
+            family, level = split_name(name)
+            if family not in families:
+                families[family] = []
+                order.append(family)
+            families[family].append((mid, name, level))
+        rows = []
+        for family in order:
+            picks = families[family]
+            for i in range(0, len(picks), ROW_TAPS):
+                part = picks[i:i + ROW_TAPS]
+                rows.append(agent_card.row(family, tag="In use" if any(m == now for m, _, _ in part) else "",
+                                           actions=[self.choice(agent_card, level or "Use", mid, name, now)
+                                                    for mid, name, level in part]))
+        return [agent_card.group("Models", rows)]
 
     def parts(self, state, picked, ran, same):
         """(kind, body, text, status) of the card after a pick."""
@@ -158,8 +194,9 @@ class ModelSwitch:
         if same:
             return "done", "Model: already %s" % name, "I'm already using %s. Nothing changed." % name, ""
         if ran is None:
-            return ("info", "Model: switching to %s" % name,
-                    "Switching to %s on your next message. I'll confirm here once it has switched." % name, "")
+            return ("pending", "Model: switching to %s" % name,
+                    "Saved, not switched yet: I'll use %s from your next message. I'll confirm here once it "
+                    "has switched." % name, "Saved")
         if ran == picked:
             return "done", "Model: now %s" % name, "Switched. I'm now using %s." % name, "Switched"
         return ("error", "Model: could not switch to %s" % name,

@@ -191,7 +191,7 @@ class ConnectorTest(unittest.TestCase):
         (sent,) = self.post_queued()
         card = sent["extra_content"]["space.ag2.card"]
         self.assertEqual((sent["room_id"], card["text"], [b["label"] for b in card["buttons"]]),
-                         (self.DM, "Now using Gemini 3.8 Flash.", ["Gemini 3.8 Flash", "Claude Opus 4.6"]))
+                         (self.DM, "I'm using Gemini 3.8 Flash. Pick a model to switch to.", ["Gemini 3.8 Flash", "Claude Opus 4.6"]))
         # The menu carries the time it stops acting: three days, as long as its record is kept.
         left_s = card["expires_at"] / 1000 - gc.time.time()
         self.assertTrue(3 * 86400 - 60 < left_s <= 3 * 86400, left_s)
@@ -203,8 +203,8 @@ class ConnectorTest(unittest.TestCase):
                          "claude-opus-4-6-thinking")
         (coming,) = self.post_queued("$card2")
         waiting = coming["extra_content"]["space.ag2.card"]
-        self.assertEqual((waiting["state"], "buttons" in waiting), ("info", False))
-        self.assertIn("Switching to Claude Opus 4.6 on your next message", waiting["text"])
+        self.assertEqual((waiting["state"], "buttons" in waiting), ("pending", False))
+        self.assertIn("Saved, not switched yet: I'll use Claude Opus 4.6 from your next message", waiting["text"])
         self.assertEqual(self.w.methods().count("session/prompt"), 1, "the tap never reaches agy either")
         # The next turn, in any room, switches; the owner is then told in the DM the pick was made in.
         self.w.task("task-4", "STUB:TEXT again")
@@ -241,7 +241,7 @@ class ConnectorTest(unittest.TestCase):
         self.assertEqual(json.loads((self.w.root / "state" / "model.json").read_text())["wanted"], "gemini-3.8-flash-medium")
         (back,) = self.post_queued("$card5")
         self.assertEqual((back["op"], back["event_id"]), ("edit", "$card1"))
-        self.assertIn("Switching to Gemini 3.8 Flash on your next message", back["extra_content"]["space.ag2.card"]["text"])
+        self.assertIn("Saved, not switched yet: I'll use Gemini 3.8 Flash from your next message", back["extra_content"]["space.ag2.card"]["text"])
         # A newer menu is a new card; with the bridge down a tap on the old one is answered in words, and
         # another sender's tap is refused as before and gets no card.
         self.dm_task("task-7", "/model")
@@ -396,7 +396,7 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         outcome, menu = [p["extra_content"]["space.ag2.card"] for p in self.post_queued("$card3")]
         self.assertEqual((outcome["state"], menu["state"], "buttons" in menu), ("done", "pending", True))
-        self.assertEqual(menu["text"], "Now using Claude Opus 4.6.")
+        self.assertEqual(menu["text"], "I'm using Claude Opus 4.6. Pick a model to switch to.")
         back = menu["buttons"][0]["reply"]
         self.dm_task("task-5", back, reply_to="$card3", click=back)
         self.w.serve()
@@ -419,10 +419,10 @@ class ConnectorTest(unittest.TestCase):
             return answer["extra_content"]["space.ag2.card"], self.w.metrics()[-1]["card"]
 
         first, outcome = tap_opus(1, "$c1")
-        self.assertEqual((first["state"], outcome), ("info", "model-picked"))
+        self.assertEqual((first["state"], outcome), ("pending", "model-picked"))
         again, outcome = tap_opus(2, "$c2")
-        self.assertEqual((again["state"], outcome), ("info", "model-pending"), "no turn has run on it yet")
-        self.assertIn("Switching to Claude Opus 4.6 on your next message", again["text"])
+        self.assertEqual((again["state"], outcome), ("pending", "model-pending"), "no turn has run on it yet")
+        self.assertIn("Saved, not switched yet: I'll use Claude Opus 4.6 from your next message", again["text"])
         self.assertEqual(self.set_model_calls(), [])
         self.w.task("task-5", "STUB:TEXT again")
         self.w.serve()
@@ -719,7 +719,7 @@ class ConnectorTest(unittest.TestCase):
         with mock.patch.object(connector_cards, "queue", side_effect=ValueError("no room")):
             self.dm_task("task-5", said, reply_to="$card1", click=said)
             self.w.serve()
-        self.assertIn("Switching to Claude Opus 4.6 on your next message", self.w.result("task-5"))
+        self.assertIn("Saved, not switched yet: I'll use Claude Opus 4.6 from your next message", self.w.result("task-5"))
         self.assertEqual(json.loads(state.read_text())["wanted"], "claude-opus-4-6-thinking")
 
     def test_a_model_switch_that_times_out_or_loses_agy_ends_the_turn_as_any_call_would(self):
