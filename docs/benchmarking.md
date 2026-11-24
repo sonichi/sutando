@@ -124,6 +124,9 @@ continues and records a `json_equals` check with its expected value and
 verdict. Other assertions may be combined with it and must also pass.
 Expected values must contain only JSON types, string object keys and finite
 numbers; invalid values are rejected before runtime probing or task submission.
+Suite files also reject duplicate object keys at every level, including nested
+expectations and escaped spellings of the same key. The earlier decoder kept
+only the last value; remove conflicting duplicate entries before retrying.
 Interpreter nesting and integer-decoding limits apply; exceeding them fails
 the check. This assertion does not impose a response-size or scoring-time budget.
 

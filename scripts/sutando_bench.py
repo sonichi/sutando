@@ -46,7 +46,7 @@ def percentile(values: Iterable[float], quantile: float) -> Optional[float]:
 
 def load_suite(path: Path) -> Dict[str, Any]:
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(), object_pairs_hook=_unique_json_object)
     except RecursionError as exc:
         raise ValueError("suite JSON exceeds supported nesting") from exc
     validate_suite(data)

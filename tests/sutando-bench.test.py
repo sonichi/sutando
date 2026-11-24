@@ -41,6 +41,35 @@ def runtime_snapshot(ws: Path, **kwargs):
     return bench.runtime_identity(runtime_descriptor(ws, **kwargs), ws)
 
 
+def duplicate_key_suites():
+    prefix = '{"schema":1,"name":"duplicates","cases":[{"id":"one","prompt":"reply","expect":'
+    suffix = '}]}'
+    suites = [(label, prefix + expected + suffix) for label, expected in [
+        ("expected conflict", '{"json_equals":{"ok":true,"ok":false}}'),
+        ("expected repeated value", '{"json_equals":{"ok":false,"ok":false}}'),
+        ("expected escaped key", '{"json_equals":{"ok":true,"\\u006fk":false}}'),
+        ("expected nested array", '{"json_equals":[{"ok":true,"ok":false}]}'),
+        ("expected nested escaped key", '{"json_equals":{"nested":[{"ok":true,"\\u006fk":false}]}}'),
+        ("expected overwritten invalid value", '{"json_equals":{"ok":NaN,"ok":false}}'),
+        ("assertion", '{"json_equals":true,"json_equals":false}'),
+        ("escaped assertion", '{"json_equals":true,"json_\\u0065quals":false}'),
+        ("text assertion", '{"equals":"RIGHT","equals":"false"}'),
+    ]]
+    valid = prefix + '{"json_equals":false}' + suffix
+    for label, old, new in [
+        ("suite schema", '"schema":1', '"schema":1,"schema":1'),
+        ("suite name", '"name":"duplicates"', '"name":"first","name":"duplicates"'),
+        ("escaped suite name", '"name":"duplicates"', '"name":"first","na\\u006de":"duplicates"'),
+        ("suite cases", '"cases":[', '"cases":[],"cases":['),
+        ("case id", '"id":"one"', '"id":"first","id":"one"'),
+        ("case prompt", '"prompt":"reply"', '"prompt":"first","prompt":"reply"'),
+        ("case expect", '"expect":', '"expect":{"equals":"WRONG"},"expect":'),
+        ("other nested object", '"cases":[', '"metadata":{"tag":1,"tag":2},"cases":['),
+    ]:
+        suites.append((label, valid.replace(old, new)))
+    return suites
+
+
 def example_run(label="subject", passed=True, latency=10.0, no_response=0):
     rows = [{
         "case_id": "one", "category": "test", "repetition": 1,
@@ -110,6 +139,75 @@ class BenchTests(unittest.TestCase):
                 path.write_text(json.dumps(bad))
                 with self.assertRaises(ValueError):
                     bench.load_suite(path)
+
+    def test_load_suite_rejects_duplicate_suite_keys(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "suite.json"
+            for label, body in duplicate_key_suites():
+                with self.subTest(label=label):
+                    path.write_text(body)
+                    with self.assertRaisesRegex(ValueError, "duplicate JSON object key"):
+                        bench.load_suite(path)
+
+    def test_main_rejects_duplicate_suite_keys_before_probe_or_dispatch(self):
+        for label, body in duplicate_key_suites():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                ws = workspace(root / "ws")
+                suite = root / "suite.json"
+                suite.write_text(body)
+                stderr = io.StringIO()
+                with Responder(ws, {"reply": "false"}), \
+                        mock.patch.object(bench, "probe_runtime", return_value=runtime_snapshot(ws)) as probe, \
+                        mock.patch.object(bench, "_submit", wraps=bench._submit) as submit, \
+                        contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                    rc = bench.main(["run", "--workspace", str(ws), "--suite", str(suite),
+                                     "--output", str(root / "output"), "--timeout", "0.1", "--poll", "0.001"])
+                self.assertEqual(rc, 2)
+                self.assertIn("invalid suite", stderr.getvalue())
+                self.assertIn("duplicate JSON object key", stderr.getvalue())
+                self.assertIn("fix the suite", stderr.getvalue())
+                probe.assert_not_called()
+                submit.assert_not_called()
+                self.assertEqual(list((ws / "tasks").iterdir()), [])
+                self.assertEqual(list((ws / "results").iterdir()), [])
+                self.assertFalse((root / "output").exists())
+
+    def test_unique_suite_keys_preserve_text_and_json_controller_semantics(self):
+        cases = [
+            {"id": "text", "prompt": "text reply", "expect": {
+                "equals": "Paris", "contains": "PARIS", "regex": "^paris$", "max_chars": 5}},
+            {"id": "text mismatch", "prompt": "wrong text", "expect": {"equals": "Paris"}},
+            {"id": "json", "prompt": "json reply", "expect": {"json_equals": {
+                "first": {"ok": True}, "second": {"ok": False}, "number": 1}}},
+            {"id": "json mismatch", "prompt": "wrong json", "expect": {"json_equals": True}},
+        ]
+        responses = {"text reply": "Paris\n", "wrong text": "Rome",
+                     "json reply": '{"number":1.0,"second":{"ok":false},"first":{"ok":true}}',
+                     "wrong json": "1"}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = workspace(root / "ws")
+            suite = root / "suite.json"
+            data = {"schema": 1, "name": "unique keys", "cases": cases}
+            suite.write_text(json.dumps(data))
+            self.assertEqual(bench.load_suite(suite), data)
+            with Responder(ws, responses), \
+                    mock.patch.object(bench, "probe_runtime", return_value=runtime_snapshot(ws)) as probe, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rc = bench.main(["run", "--workspace", str(ws), "--suite", str(suite),
+                                 "--output", str(root / "output"), "--timeout", "1", "--poll", "0.001"])
+            self.assertEqual(rc, 1)
+            self.assertEqual(probe.call_count, 2)
+            run = bench._load_run(root / "output")
+            self.assertEqual([row["passed"] for row in run["cases"]], [True, False, True, False])
+            self.assertEqual(run["summary"]["passed"], 2)
+            self.assertEqual(run["summary"]["no_response"], 0)
+            self.assertEqual([check["kind"] for check in run["cases"][0]["checks"]],
+                             ["equals", "contains", "regex", "max_chars"])
+            self.assertEqual(run["cases"][2]["checks"], [{"kind": "json_equals",
+                                                         "expected": cases[2]["expect"]["json_equals"],
+                                                         "passed": True}])
 
     def test_score_response(self):
         passed, checks = bench.score_response("  Hello Paris  ", {
