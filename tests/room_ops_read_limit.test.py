@@ -257,13 +257,15 @@ class ReadLimitCountsMessages(unittest.TestCase):
     def test_read_output_marks_the_edited_message_and_only_it(self):
         items = [{"event_id": "$2", "sender": HS, "ts": 2, "body": "fixed", "edited": True,
                   "edit_event_id": "$edit"},
-                 {"event_id": "$1", "sender": HS, "ts": 1, "body": "untouched"}]
+                 {"event_id": "$1", "sender": HS, "ts": 1, "body": "untouched",
+                  "msgtype": "m.notice"}]
         body = (200, json.dumps({"messages": items}).encode(), {})
         with mock.patch.object(rd, "http_request", return_value=body):
             res = rd.read_room(ROOM, HS, limit=2, gate=None)
         self.assertEqual([(m["event_id"], m.get("edited"), m.get("edit_event_id"))
                           for m in res["messages"]],
                          [("$2", True, "$edit"), ("$1", None, None)])
+        self.assertEqual([m.get("msgtype") for m in res["messages"]], [None, "m.notice"])
 
 
 class NormalizeMediaRefTests(unittest.TestCase):
@@ -320,7 +322,7 @@ class NormalizeEditMarkTests(unittest.TestCase):
                                "edit_event_id": "$edit"})
 
     def test_unedited_shapes_grow_no_key(self):
-        # Text, notice and emote arrive untyped and alike; none of them is marked.
+        # An untyped, unmarked item grows neither an edit mark nor a type.
         for item in ({}, {"edited": False}, {"edited": None}, {"edit_event_id": None},
                      {"edit_event_id": ""}, {"body": "* a bullet, not an edit"}):
             with self.subTest(item=item):
@@ -354,6 +356,50 @@ class NormalizeEditMarkTests(unittest.TestCase):
         out = self._one(in_reply_to="$q", thread_root="$root", edited=True, edit_event_id="$edit")
         self.assertEqual((out["in_reply_to"], out["thread_root"], out["edit_event_id"]),
                          ("$q", "$root", "$edit"))
+
+
+class NormalizeMessageTypeTests(unittest.TestCase):
+    """The type rides every message whose gateway item carries one, so a reader can tell a
+    notice or an emote from text; an item without one says nothing about its type."""
+
+    BASE = {"sender": HS, "ts": 1, "body": "hi", "event_id": "$e", "reactions": []}
+
+    def _one(self, **item):
+        return rd._normalize([{"event_id": "$e", "sender": HS, "ts": 1, "body": "hi", **item}])[0]
+
+    def test_text_notice_and_emote_keep_their_type(self):
+        for mt in ("m.text", "m.notice", "m.emote"):
+            with self.subTest(msgtype=mt):
+                self.assertEqual(self._one(msgtype=mt), {**self.BASE, "msgtype": mt})
+
+    def test_item_without_a_type_grows_no_key(self):
+        for item in ({}, {"msgtype": None}, {"msgtype": ""}):
+            with self.subTest(item=item):
+                self.assertEqual(self._one(**item), self.BASE)
+
+    def test_type_that_is_not_a_string_is_dropped(self):
+        for mt in (7, True, ["m.text"], {"msgtype": "m.text"}):
+            with self.subTest(msgtype=mt):
+                self.assertEqual(self._one(msgtype=mt), self.BASE)
+                self.assertNotIn("msgtype", self._one(msgtype=mt, mxc="mxc://hs/abc123"))
+
+    def test_type_is_never_inferred_from_the_body_or_content(self):
+        for item in ({"body": "* waves"}, {"content": {"msgtype": "m.notice"}}):
+            with self.subTest(item=item):
+                self.assertNotIn("msgtype", self._one(**item))
+
+    def test_attachment_is_unchanged_and_mimetype_stays_with_it(self):
+        out = self._one(body="pic.png", msgtype="m.image", mxc="mxc://hs/abc123",
+                        mimetype="image/png")
+        self.assertEqual(out, {**self.BASE, "body": "pic.png", "media_ref": "mxc://hs/abc123",
+                               "msgtype": "m.image", "mimetype": "image/png"})
+        self.assertEqual(self._one(msgtype="m.text", mimetype="text/plain"),
+                         {**self.BASE, "msgtype": "m.text"})
+
+    def test_edited_notice_carries_type_and_edit_mark(self):
+        out = self._one(msgtype="m.notice", edited=True, edit_event_id="$edit")
+        self.assertEqual(out, {**self.BASE, "msgtype": "m.notice", "edited": True,
+                               "edit_event_id": "$edit"})
 
 
 if __name__ == "__main__":
