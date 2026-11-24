@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Print the s.space task id of an owner's task file, for room.agent_policy.set.
+"""Print the broker task id of an owner's task file, for room.agent_policy.set.
 
     python3 skills/room-settings/scripts/task_id.py <task-file>
 
-Exit 0 prints the id. Exit 2: the task is not the owner's. Exit 3: the file names no
-s.space task id (a local chat task, or another channel). Headers are read the attested
-way, so body text can neither claim them nor hide a valid task.
+Exit 0 prints the id. Exit 2: the task is not the owner's. Exit 3: the file carries no
+attested `task_id:` header, so this connection cannot name the task the server checks.
+Headers are read the attested way, so body text can neither claim nor hide them.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
-from ag2_sparrow import gateway_instance, task_io  # noqa: E402
+from ag2_sparrow import task_io  # noqa: E402
 from ag2_sparrow.local_task_protocol import canonical_access_tier  # noqa: E402
 
 NOT_OWNER, NO_TASK = 2, 3
@@ -26,21 +26,9 @@ def wire_task_id(text: str) -> "tuple[int, str]":
     headers = task_io.attested_headers(text).headers
     if canonical_access_tier(headers.get("access_tier")) != "owner":
         return NOT_OWNER, "not the owner's task"
+    # A local `id:` is never the broker's id for certain, so only the bridge's header counts.
     tid = (headers.get("task_id") or "").strip()
-    if tid:
-        return 0, tid
-    local = (headers.get("id") or "").strip()
-    if not local:
-        return NO_TASK, "no task id"
-    room = (headers.get("source_room_id") or headers.get("channel_id") or "").strip()
-    if not room.startswith("!"):
-        return NO_TASK, "not an s.space room task"
-    # A requeue's synthetic `id:` is left to the server, which refuses it as not this agent's.
-
-    # A named instance's local id is `task-<instance>~<broker id>`; the primary's has no `~`.
-    base = gateway_instance.first_run(local)
-    instance = base[len("task-"):base.index("~")] if base.startswith("task-") and "~" in base else ""
-    return 0, gateway_instance.broker_tid(local, instance)
+    return (0, tid) if tid else (NO_TASK, "no task_id header")
 
 
 def main(argv: "list[str]") -> int:

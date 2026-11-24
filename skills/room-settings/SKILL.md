@@ -17,12 +17,17 @@ setting changed when the Action did not succeed.
   anyone else asks, say only your owner can change how you work here, and change nothing.
   Don't call the Action for them.
 - The change must come from your owner's own message to you: pass the task id of the very
-  message that asks for it as `task_id`, never an earlier message's. For a task file, `python3 skills/room-settings/scripts/task_id.py <task file>`
-  prints it; don't work it out from the file yourself. Exit 2 means the task is not your
-  owner's: change nothing. On an MCP event, use the event's `task_id`. If there is none
-  (exit 3), or the change is refused because of the task, ask them to send it to you
-  directly: in your DM, as a reply to you, or by mentioning you. Typing your name without a
-  mention, or editing an earlier message, does not count.
+  message that asks for it as `task_id`, never an earlier message's. For a task file,
+  `python3 skills/room-settings/scripts/task_id.py <task file>` prints it; don't work it out
+  from the file yourself. Exit 2 means the task is not your owner's: change nothing. On an
+  MCP event, use the event's `task_id`.
+- Exit 3 means the way you are connected doesn't give you the task id the change needs. Say
+  you can't change your settings from here yet, and that your owner can change them in the
+  room's settings in the app. Don't ask them to send it again.
+- If the change is refused because of the task, ask them to send it to you directly: in your
+  DM, as a reply to you, or by mentioning you. Typing your name without a mention, or editing
+  an earlier message, does not count. If they already did that and it is refused again, say
+  you can't change your settings from here yet, as for exit 3.
 - You can only change your own settings, never another agent's. For another agent, your
   owner changes it in the room's settings in the app.
 
@@ -70,8 +75,12 @@ your owner asks for it, say so, and change nothing.
   (`mention`), not What reaches you: What reaches you and When you answer others are about other
   people.
 - "Mention" means addressing you: a mention of you, or a reply to one of your messages. Say
-  so when your owner asks for "only when I mention you". A message that mentions only your
-  owner is not addressed to you, whatever the settings say.
+  so when your owner asks for "only when I mention you".
+- A message that mentions only your owner reaches you marked as such only with "Others who
+  mention your owner" on. Then it is not addressed to you: don't answer it in the room, tell
+  your owner in your DM. With it off, such a message reaches you only as an ordinary message
+  (when what reaches you and when you answer others are both every message), and you answer
+  it as you would any other.
 - What reaches you and when you answer others work together. To answer others' messages that
   don't mention you, both must be set: every message for what reaches you and for when you
   answer. If your owner asks for that and only one is set, change both, and say so. Members
@@ -87,9 +96,16 @@ your owner asks for it, say so, and change nothing.
 - The secrets check only matters with Team access, and only for members you work with as
   your Team. Turning it off lets a secret in your answer to them be posted: say that, and
   ask your owner to confirm before you send the change. It changes nothing for your owner or
-  Guests, and only for messages that arrive after the change: one already waiting keeps the old setting.
-  Your question ends the first message's task, so send the change with the `task_id` of
-  their new message that confirms it, never the first one's (that is refused as closed).
+  Guests, and only for messages that arrive after the change: one already waiting keeps the
+  old setting.
+- Ask that confirmation in plain words, never with an `ask-owner.py` card: a click on a card
+  arrives as a task that must answer `[no-send]`, which leaves no turn to send the change.
+  - Asked with `room.question.ask`: their answer comes back to this same task, so send the
+    change with the same `task_id`. It only works while the task is open and within 10
+    minutes of their first message; if the answer comes later, ask them to ask again.
+  - Asked in your reply: that reply ends this task, and their answer is a new message. Send
+    the change with that new message's `task_id`, never the first one's (that is refused as
+    closed).
 - "What reaches you" is about which messages are sent to you to answer. It does not hide the
   room's history from you, so never promise your owner that you can't read other messages.
 - Before you list people, check each one is in the room: `room.action.read` with action

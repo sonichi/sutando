@@ -4,7 +4,7 @@
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "experimental",
-  "description": "Read and change the agent's own s.space room settings when its owner asks, through the room.agent_policy Actions on the s.space MCP.",
+  "description": "Read and change the agent's own room settings when its owner asks, through the room.agent_policy room Actions.",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   }
