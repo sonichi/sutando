@@ -54,9 +54,11 @@ const BOARD = [
   { id: 'c', name: 'Claim', type: 'text' }, { id: 'r', name: 'Result', type: 'text' },
 ];
 
-function room(name, props) {
+const UNSURE = 'Not confirmed by the room. If someone else took it too, this page will say so.';
+
+function room(name, props, opts) {
   const clock = createClock();
-  const fake = createFakeRoom({ clock });
+  const fake = createFakeRoom(Object.assign({ clock }, opts));
   const db = fake.addDatabase(name, props);
   return { clock, fake, db };
 }
@@ -169,24 +171,36 @@ test('board: a person adds a task, an agent takes it, works and marks it done; b
   await bot.button('Take it').click(); await settle();
   assert.equal(ana.items()[0], 'Draft the release noteBot (agent) is on it10 min left');
   assert.equal(ana.button('Take it'), undefined);
-  assert.equal(bot.items()[0], 'Draft the release noteYou are on it10 min leftMark doneLet go');
+  assert.equal(bot.items()[0], 'Draft the release noteYou are on it10 min left' + UNSURE + 'Mark doneLet go');
 
   await bot.button('Mark done').click(); await settle();
   for (const page of [ana, bot]) assert.deepEqual(page.items(), ['Draft the release noteDoneDone by Bot (agent)']);
   assert.deepEqual([fake.rows(db)[0].cells.Status, fake.rows(db)[0].cells.Claim], ['Done', '']);
 });
 
-test('board: two take one task at once; one holds it and the other is told who got it', async () => {
+test('board: two take one task at once; a hold is shown as unsettled, and the one who lost it is told', async () => {
   const { fake, db } = room('Board — Tasks', BOARD);
   fake.serverAddRow(db, { Task: 'One', Status: 'Open' });
   const ana = await open('board.html', fake.client({ id: 'u-ana', name: 'Ana' }).artifact);
   const bot = await open('board.html', fake.client({ id: 'u-bot', name: 'Bot', kind: 'agent' }).artifact);
   await Promise.all([ana.button('Take it').click(), bot.button('Take it').click()]);
   await settle();
-  assert.equal(ana.$('status').textContent, 'Bot (agent) got there first.');
+  assert.equal(ana.$('status').textContent, 'Bot (agent) took "One" at the same moment.');
   assert.equal(ana.items()[0], 'OneBot (agent) is on it10 min left');
   assert.equal(bot.$('status').hidden, true);
-  assert.match(bot.items()[0], /^OneYou are on it/);
+  assert.equal(bot.items()[0], 'OneYou are on it10 min left' + UNSURE + 'Mark doneLet go');
+});
+
+test('board, conditional writes: the room settles a tie at once, and a hold it confirmed carries no warning', async () => {
+  const { fake, db } = room('Board — Tasks', BOARD, { versions: true, conditional: true });
+  fake.serverAddRow(db, { Task: 'One', Status: 'Open' });
+  const ana = await open('board.html', fake.client({ id: 'u-ana', name: 'Ana' }).artifact);
+  const bot = await open('board.html', fake.client({ id: 'u-bot', name: 'Bot', kind: 'agent' }).artifact);
+  await Promise.all([ana.button('Take it').click(), bot.button('Take it').click()]);
+  await settle();
+  assert.equal(ana.items()[0], 'OneYou are on it10 min leftMark doneLet go');
+  assert.equal(bot.$('status').textContent, 'Ana got there first.');
+  assert.equal(bot.items()[0], 'OneAna is on it10 min left');
 });
 
 test('board: letting go, and a hold that runs out, both open the task again', async () => {

@@ -18,7 +18,8 @@ async function settle(turns) {
 }
 
 function createFakeRoom(options) {
-  const clock = (options && options.clock) || createClock();
+  const opt = options || {};
+  const clock = opt.clock || createClock();
   const dbs = new Map();
   const clients = [];
   const posts = [];
@@ -28,7 +29,12 @@ function createFakeRoom(options) {
   const dirty = new Set();
   const nextId = (p) => p + String(ids += 1).padStart(4, '0');
 
-  const snapshot = (db) => copy({ id: db.id, name: db.name, props: db.props, rows: db.rows });
+  // `versions` and `conditional` are the two host switches; both are off unless a test turns them on.
+  const snapshot = (db) => {
+    const snap = copy({ id: db.id, name: db.name, props: db.props, rows: db.rows });
+    if (opt.versions) snap.version = db.version;
+    return snap;
+  };
 
   function deliver() {
     scheduled = false;
@@ -36,7 +42,7 @@ function createFakeRoom(options) {
     dirty.clear();
     for (const c of clients) {
       for (const id of now) {
-        if (!c.watchers.has(id)) continue;
+        if (c.manual || !c.watchers.has(id)) continue;
         if (c.paused) c.missed.add(id);
         else c.watchers.get(id)(dbs.has(id) ? snapshot(dbs.get(id)) : null);
       }
@@ -45,6 +51,7 @@ function createFakeRoom(options) {
 
   // Changes are coalesced: one snapshot per database per turn, to every watcher, the writer too.
   function changed(id) {
+    if (dbs.has(id)) dbs.get(id).version += 1;
     dirty.add(id);
     if (!scheduled) { scheduled = true; setImmediate(deliver); }
   }
@@ -63,8 +70,8 @@ function createFakeRoom(options) {
 
   const propName = (db, name) => db.props.find((p) => p.name === name || p.id === name).name;
 
-  function addRow(db, cells, account) {
-    const row = { id: nextId('r'), cells: {} };
+  function addRow(db, cells, account, rowId) {
+    const row = { id: rowId || nextId('r'), cells: {} };
     for (const [k, v] of Object.entries(cells)) row.cells[propName(db, k)] = copy(v);
     const stamp = db.props.find((p) => p.type === 'created_by');
     if (stamp && account) row.cells[stamp.name] = [account];
@@ -78,7 +85,7 @@ function createFakeRoom(options) {
 
     /** Adds a database the way an agent would through Actions. Returns its id. */
     addDatabase(name, props, rows) {
-      const db = { id: nextId('d'), name, props: copy(props), rows: [] };
+      const db = { id: nextId('d'), name, props: copy(props), rows: [], version: 0 };
       dbs.set(db.id, db);
       for (const cells of rows || []) addRow(db, cells, null);
       return db.id;
@@ -97,6 +104,13 @@ function createFakeRoom(options) {
 
     serverAddRow(id, cells, account) { return addRow(dbs.get(id), cells, account || null); },
 
+    /** An agent deleting a row through Actions: something a page cannot do. */
+    serverDeleteRow(id, rowId) {
+      const db = dbs.get(id);
+      db.rows = db.rows.filter((r) => r.id !== rowId);
+      changed(id);
+    },
+
     /** The agent's side of an experimental request. */
     answerRequest(requestId, state, outcome) {
       const r = requests.find((x) => x.requestId === requestId);
@@ -104,8 +118,8 @@ function createFakeRoom(options) {
       for (const sub of requestSubs) sub();
     },
 
-    /** A page opened by one viewer. opts: {id, name, kind, consent: 'granted'|'unasked'|'denied',
-     *  app, agents: [{id, name, kind, userId?}], inRoom: false to leave the viewer out of members}. */
+    /** A page opened by one viewer. opts: {id, name, kind, consent: 'granted'|'unasked'|'denied', app, agents,
+     *  inRoom: false, sync: 'manual' (plain writes stay in this page's own copy until `sync()`)}. */
     client(opts) {
       const o = Object.assign({ kind: 'human', consent: 'granted', agents: [] }, opts);
       const c = {
@@ -113,6 +127,7 @@ function createFakeRoom(options) {
         consent: o.consent, watchers: new Map(), paused: false, missed: new Set(),
         writes: [], reads: [], asks: [], postTimes: [], calls: [], dialogs: [], sent: [], keys: new Map(),
         dialog: 'yes', failNext: null, inRoom: o.inRoom !== false,
+        manual: o.sync === 'manual', local: new Map(), queue: [], loseAnswer: false,
       };
       clients.push(c);
       let isReady = false;
@@ -136,6 +151,23 @@ function createFakeRoom(options) {
         return null;
       };
       const joined = () => clients.filter((x) => x.inRoom);
+      // A manual page reads and plainly writes its own copy; any other page sees the room at once.
+      const pull = () => { c.local.clear(); for (const [id, db] of dbs) c.local.set(id, copy(db)); };
+      const view = (id) => (c.manual ? c.local.get(id) : dbs.get(id));
+      const tell = (id) => { if (c.watchers.has(id)) c.watchers.get(id)(view(id) ? snapshot(view(id)) : null); };
+      const exactly = (opts) => !!opts && 'ifVersion' in opts;
+      const unfit = (opts) => {
+        if (!opt.conditional) return 'conditional writes are not available here';
+        return Number.isInteger(opts.ifVersion) && opts.ifVersion >= 0 ? null : 'invalid request';
+      };
+      const moved = (db, opts) => (db.version === opts.ifVersion ? null : 'version changed');
+      // A conditional write that landed can still lose its answer on the way back.
+      const answer = (extra) => {
+        if (!c.loseAnswer) return Object.assign({ ok: true }, extra);
+        c.loseAnswer = false;
+        return { ok: false, reason: 'no answer from the room' };
+      };
+      if (c.manual) pull();
 
       const artifact = {
         ready: new Promise((ok) => setImmediate(() => { isReady = true; ok(); })),
@@ -146,27 +178,43 @@ function createFakeRoom(options) {
           read: async (id) => {
             call('db.read', id);
             if (!within(c.reads, 20)) throw new Error('rate limit: too many reads');
-            if (!dbs.has(id)) throw new Error('database not found');
-            return snapshot(dbs.get(id));
+            if (!view(id)) throw new Error('database not found');
+            return snapshot(view(id));
           },
-          write: async (id, rowId, prop, value) => {
-            call('db.write', id, rowId, prop, value);
-            const db = dbs.get(id), row = db && db.rows.find((r) => r.id === rowId);
+          write: async (id, rowId, prop, value, opts) => {
+            call('db.write', id, rowId, prop, value, ...(opts ? [opts] : []));
+            const exact = exactly(opts), db = exact ? dbs.get(id) : view(id);
+            const row = db && db.rows.find((r) => r.id === rowId);
             if (!row) return { ok: false, reason: 'row not found' };
-            const reason = writeGate(value) || fits(db, prop, value);
+            const reason = (exact && unfit(opts)) || writeGate(value) || fits(db, prop, value) || (exact && moved(db, opts));
             if (reason) return { ok: false, reason };
             row.cells[propName(db, prop)] = copy(value);
+            if (c.manual && !exact) {
+              c.queue.push({ id, rowId, prop, value: copy(value) });
+              setImmediate(() => tell(id));
+              return { ok: true };
+            }
             changed(id);
-            return { ok: true };
+            return exact ? answer() : { ok: true };
           },
-          createRow: async (id, cells) => {
-            call('db.createRow', id, cells);
-            const db = dbs.get(id);
+          createRow: async (id, cells, opts) => {
+            call('db.createRow', id, cells, ...(opts ? [opts] : []));
+            const exact = exactly(opts), db = exact ? dbs.get(id) : view(id);
             if (!db) return { ok: false, reason: 'database not found' };
-            let reason = writeGate(cells);
+            let reason = (exact && unfit(opts)) || writeGate(cells);
             for (const [k, v] of Object.entries(cells)) reason = reason || fits(db, k, v);
+            reason = reason || (exact && moved(db, opts));
             if (reason) return { ok: false, reason };
-            return { ok: true, rowId: addRow(db, cells, c.account) };
+            if (c.manual && !exact) {
+              const row = { id: nextId('r'), cells: {} };
+              for (const [k, v] of Object.entries(cells)) row.cells[propName(db, k)] = copy(v);
+              db.rows.push(row);
+              c.queue.push({ id, rowId: row.id, cells: copy(cells) });
+              setImmediate(() => tell(id));
+              return { ok: true, rowId: row.id };
+            }
+            const rowId = addRow(dbs.get(id), cells, c.account);
+            return exact ? answer({ rowId }) : { ok: true, rowId };
           },
           onChange: (id, fn) => {
             call('db.onChange', id);
@@ -224,6 +272,17 @@ function createFakeRoom(options) {
         artifact,
         /** The viewer answers the access question. */
         answer(yes) { c.consent = yes ? 'granted' : 'denied'; },
+        /** A manual page meets the room: its queued writes land in order, then it takes the room's state. */
+        sync() {
+          for (const op of c.queue.splice(0)) {
+            const db = dbs.get(op.id), row = db && db.rows.find((r) => r.id === op.rowId);
+            if (db && op.cells) addRow(db, op.cells, c.account, op.rowId);
+            else if (row) { row.cells[propName(db, op.prop)] = copy(op.value); changed(op.id); }
+          }
+          const watched = Array.from(c.watchers.keys());
+          pull();
+          for (const id of watched) tell(id);
+        },
         /** Hold this page's snapshots back, as a slow connection would. */
         pause() { c.paused = true; },
         resume() {

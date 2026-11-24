@@ -1,8 +1,9 @@
 /*! commons-sdk 0.1.0: a small client library for Room Commons apps. No dependencies. */
 (function (root, factory) {
   const api = factory();
+  // The global is always set: a page's other inlined script may define a `module` of its own.
+  if (root) root.Commons = api;
   if (typeof module === 'object' && module && module.exports) module.exports = api;
-  else root.Commons = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
@@ -21,12 +22,13 @@
     }
   }
 
-  /* The one place bridge reason text is matched: REASONS and refusal(). Callers read `code` only. */
+  /* Reason text is matched in one place, refusal(): over REASONS, the strings GUIDE.md quotes,
+     and at most one more table that a caller names. Callers read `code` only. */
   const REASONS = [
     [/waiting for the viewer/i, 'CONSENT_PENDING'],
     [/not allowed by the viewer/i, 'CONSENT_DENIED'],
-    [/page permission required|^consent_required$/i, 'CONSENT_REQUIRED'],
-    [/rate limit|too many|^rate(_page|_agent)?$/i, 'RATE_LIMITED'],
+    [/page permission required/i, 'CONSENT_REQUIRED'],
+    [/rate limit|too many/i, 'RATE_LIMITED'],
     [/^declined$/i, 'DECLINED'],
     [/agent not owned or unavailable/i, 'AGENT_UNAVAILABLE'],
     [/another request is in progress/i, 'BUSY'],
@@ -34,9 +36,16 @@
     [/mention is not a joined member|cannot mention a group/i, 'BAD_MENTION'],
   ];
 
-  function refusal(reason, fallback) {
+  /* A conditional write's reasons, as the host's page API words them. GUIDE.md does not quote them yet. */
+  const CONDITIONAL = [
+    [/version changed/i, 'VERSION_CHANGED'],
+    [/conditional writes are not available|invalid request/i, 'CONDITIONAL_UNAVAILABLE'],
+    [/no answer from the room/i, 'NO_ANSWER'],
+  ];
+
+  function refusal(reason, fallback, extra) {
     const text = String(reason == null ? '' : reason);
-    const hit = REASONS.find(([re]) => re.test(text));
+    const hit = (extra || []).concat(REASONS).find(([re]) => re.test(text));
     return new CommonsError(hit ? hit[1] : fallback || 'REFUSED', text || 'The room refused the call.', text);
   }
 
@@ -63,6 +72,9 @@
     return { cells: () => ({ [m.prop]: m.value }), hides: (cells) => cells[m.prop] === m.value };
   };
 
+  /* The one place a map key is "deleted": its value cell is emptied, and the row stays. */
+  const cleared = { json: '', is: (v) => v === undefined || v === null || v === '' };
+
   const toPlayer = (m) => {
     const p = { id: m.id, name: m.name, kind: m.kind === 'agent' ? 'agent' : 'person' };
     if (m.avatar) p.avatar = m.avatar;
@@ -75,6 +87,7 @@
       this.room = room; this.id = id;
       this.props = []; this.rows = [];
       this.gen = 0; this.gone = false;
+      this.version = null; this.floor = null; this.plain = false;
       this.listeners = new Set();
       this.tail = Promise.resolve();
     }
@@ -83,7 +96,13 @@
       const db = this.room.art.db;
       // Subscribe, then read: no edit is missed in between.
       this.stop = db.onChange(this.id, (snap) => this.ingest(snap));
-      this.ingest(await this.read());
+      try { this.ingest(await this.read()); } catch (e) { this.close(); throw e; }
+    }
+
+    close() {
+      if (typeof this.stop === 'function') this.stop();
+      this.stop = null;
+      this.listeners.clear();
     }
 
     async read() {
@@ -91,6 +110,10 @@
     }
 
     ingest(snap) {
+      const version = snap && typeof snap.version === 'number' ? snap.version : null;
+      // A snapshot no newer than a write the room accepted was taken before that write.
+      if (version !== null && this.floor !== null && version <= this.floor) return;
+      this.version = version;
       this.gen += 1;
       this.gone = !snap;
       if (snap) this.props = snap.props || [];
@@ -145,6 +168,65 @@
       const r = await this.room.send(() => this.room.art.db.createRow(this.id, cells));
       if (!this.row(r.rowId)) this.rows.push({ id: r.rowId, cells: Object.assign({}, cells) });
       return r.rowId;
+    }
+
+    /* One conditional attempt at the version this page last saw: the bridge's answer, or the
+       word for what to do next. The host never queues it, so a lost answer means "read again". */
+    async cas(call) {
+      const at = this.version;
+      try {
+        const r = await this.room.send(() => call({ ifVersion: at }), CONDITIONAL);
+        this.floor = at;
+        return r;
+      } catch (e) {
+        if (e.code === 'VERSION_CHANGED') return 'changed';
+        if (e.code === 'NO_ANSWER') return 'unknown';
+        if (e.code !== 'CONDITIONAL_UNAVAILABLE') throw e;
+        this.plain = true;
+        return 'plain';
+      }
+    }
+
+    /* Runs `step()` until its write lands. "room": the room took it at the version this page had
+       seen. "local": a plain write. `null`: step() declined. "contended": the database kept moving. */
+    async change(step) {
+      for (let tries = 0; tries < 5; tries += 1) {
+        this.check();
+        const s = step();
+        if (!s) return null;
+        if (this.version === null || this.plain) {
+          const gen = this.gen, r = await this.room.send(() => s.call());
+          s.done(r, gen === this.gen);
+          return 'local';
+        }
+        const at = this.version, r = await this.cas(s.call);
+        if (r === 'plain') continue;
+        if (r !== 'changed' && r !== 'unknown') { s.done(r, this.version <= at); return 'room'; }
+        this.ingest(await this.read());
+        if (r === 'unknown' && s.landed()) return 'room';
+      }
+      return 'contended';
+    }
+
+    /* A step for change(): write one cell. `make()` builds the value anew for every attempt. */
+    cell(rowId, prop, make) {
+      const db = this.room.art.db;
+      let value;
+      return {
+        call: (o) => { value = make(); return o ? db.write(this.id, rowId, prop, value, o) : db.write(this.id, rowId, prop, value); },
+        done: (_r, fresh) => { const row = this.row(rowId); if (row && fresh) row.cells[prop] = value; },
+        landed: () => { const row = this.row(rowId); return !!row && same(row.cells[prop], value); },
+      };
+    }
+
+    /* A step for change(): create one row. */
+    fresh(cells) {
+      const db = this.room.art.db;
+      return {
+        call: (o) => (o ? db.createRow(this.id, cells, o) : db.createRow(this.id, cells)),
+        done: (r) => { if (!this.row(r.rowId)) this.rows.push({ id: r.rowId, cells: Object.assign({}, cells) }); },
+        landed: () => this.rows.some((row) => Object.keys(cells).every((k) => same(row.cells[k], cells[k]))),
+      };
     }
   }
 
@@ -215,8 +297,8 @@
         if (!cur || r.id < cur.id) rows.set(k, r);
       }
       const out = new Map();
-      for (const [k, r] of rows) if (!empty(r.cells[this.valueProp])) out.set(k, decode(r.cells[this.valueProp]));
-      for (const op of this.ops) { if (op.json === '') out.delete(op.key); else out.set(op.key, JSON.parse(op.json)); }
+      for (const [k, r] of rows) if (!cleared.is(r.cells[this.valueProp])) out.set(k, decode(r.cells[this.valueProp]));
+      for (const op of this.ops) { if (cleared.is(op.json)) out.delete(op.key); else out.set(op.key, JSON.parse(op.json)); }
       return out;
     }
 
@@ -251,15 +333,37 @@
     }
 
     /** Deletes a key by emptying its value cell. The row stays: a page cannot delete rows. */
-    async delete(key) { return this.put(key, ''); }
+    async delete(key) { return this.put(key, cleared.json); }
+
+    /** Read-modify-write of one key: `fn(current)` gives the new value and may run more than once. Not shown
+     *  before the room answers. @returns {Promise<{value: *, mode: 'exact'|'best-effort'}>} see the README */
+    async update(key, fn) {
+      this.checkKey(key);
+      let value;
+      const step = () => {
+        const row = this.rowFor(key), cell = row && row.cells[this.valueProp];
+        value = fn(cleared.is(cell) ? undefined : decode(cell));
+        const json = JSON.stringify(value);
+        if (json === undefined) throw bad('A map value must be JSON.');
+        const cells = { [this.keyProp]: key, [this.valueProp]: json };
+        checkSize(cells);
+        return row ? this.t.cell(row.id, this.valueProp, () => json) : this.t.fresh(cells);
+      };
+      let mode;
+      try { mode = await this.t.enqueue(() => this.t.change(step)); } finally { this.t.emit('local'); }
+      if (mode === 'contended') throw new CommonsError('CONTENDED', 'The database kept changing. Try again.');
+      return { value, mode: mode === 'room' ? 'exact' : 'best-effort' };
+    }
+
+    checkKey(key) { if (typeof key !== 'string' || key === '') throw bad('A map key is a non-empty string.'); }
 
     async put(key, json) {
-      if (typeof key !== 'string' || key === '') throw bad('A map key is a non-empty string.');
+      this.checkKey(key);
       checkSize({ [this.keyProp]: key, [this.valueProp]: json });
       await this.t.optimistic(this.ops, [{ key, json }], async () => {
         const row = this.rowFor(key);
         if (row) await this.t.write(row.id, this.valueProp, json);
-        else if (json !== '') await this.t.create({ [this.keyProp]: key, [this.valueProp]: json });
+        else if (!cleared.is(json)) await this.t.create({ [this.keyProp]: key, [this.valueProp]: json });
       });
     }
   }
@@ -274,6 +378,7 @@
       this.removed = removal(o.removed);
       this.claimProp = o.claimProp || 'Claim';
       this.held = new Map();
+      this.busy = new Set();
       this.start();
     }
 
@@ -310,15 +415,30 @@
       return changes;
     }
 
-    /* A claim this page held that now shows another token was taken over. */
     after(origin) {
       if (origin !== 'remote') return;
-      for (const [id, mine] of Array.from(this.held)) {
-        const raw = this.rawClaim(id);
-        if (raw && raw.n === mine.token) continue;
-        this.held.delete(id);
-        if (mine.until > this.t.room.now() && mine.onLost) mine.onLost(this.claimOf(id));
-      }
+      for (const id of Array.from(this.held.keys())) this.settle(id);
+    }
+
+    /* A claim this page held that now shows another token was taken over. Not judged while this
+       page's own write to that cell is in flight. */
+    settle(id) {
+      const mine = this.held.get(id);
+      if (!mine || this.busy.has(id)) return;
+      const raw = this.claimIn(this.t.row(id));
+      if (raw && raw.n === mine.token) return;
+      this.held.delete(id);
+      if (mine.until > this.t.room.now() && mine.onLost) mine.onLost(this.claimOf(id));
+    }
+
+    /* Changes a claim cell with loss tracking paused. A refusal leaves the earlier claim tracked. */
+    async guarded(id, op, step) {
+      this.busy.add(id);
+      try { return await this.t.optimistic(this.ops, [op], () => this.t.change(step)); } catch (e) {
+        this.busy.delete(id);
+        this.settle(id);
+        throw e;
+      } finally { this.busy.delete(id); }
     }
 
     /** @returns {Array<{id: string, cells: object}>} the rows, in order */
@@ -358,11 +478,12 @@
     /** Hides a row from the list by writing the removal marker. @returns {Promise<void>} */
     async remove(id) { return this.update(id, this.removed.cells()); }
 
-    rawClaim(id) {
-      const row = this.get(id);
+    claimIn(row) {
       const raw = row && decode(row.cells[this.claimProp]);
       return raw && typeof raw === 'object' && typeof raw.by === 'string' && Number.isFinite(raw.until) ? raw : null;
     }
+
+    rawClaim(id) { return this.claimIn(this.get(id)); }
 
     /** Who holds a row now: `{id, name, kind, until, mine}`, or null when free or expired.
      *  The holder is what the claimer wrote about itself: the room does not attest it. */
@@ -373,36 +494,51 @@
       return { id: raw.by, name: String(raw.name || ''), kind: raw.kind === 'agent' ? 'agent' : 'person', until: raw.until, mine: !!me && raw.by === me.id };
     }
 
-    /** Claims a row for `opts.ttl` ms (default 60000); the last claim to reach the room wins. Resolves
-     *  `{ok, holder, confirmed}`; a later loss calls `opts.onLost(holder)`. The README has the race rule. */
+    /** Claims a row for `opts.ttl` ms (default 60000). Resolves `{ok, holder, certainty, reason?}`: "room" when
+     *  the room took a conditional write, else "local". A later loss calls `opts.onLost(holder)`. See the README. */
     async claim(id, opts) {
       const o = opts || {}, ttl = o.ttl === undefined ? 60000 : o.ttl;
       if (!(ttl > 0) || !Number.isFinite(ttl)) throw bad('ttl is a positive number of milliseconds.');
       this.t.need(this.claimProp);
       if (!this.get(id)) throw new CommonsError('NOT_FOUND', 'No row with id "' + id + '".');
+      const early = this.claimOf(id);
+      if (early && !early.mine) return { ok: false, reason: 'held', holder: early, certainty: 'local' };
+      const room = this.t.room, me = room.me(), op = { id, prop: this.claimProp, value: '' };
+      let token, until;
+      // Stamped anew for every attempt: a write can wait on the viewer for longer than the ttl.
+      const stamp = () => {
+        token = nonce(); until = room.now() + ttl;
+        return (op.value = JSON.stringify({ by: me.id, name: me.name, kind: me.kind, until, n: token }));
+      };
+      stamp();
+      const step = () => {
+        const raw = this.claimIn(this.t.row(id));
+        return raw && raw.by !== me.id && raw.until > room.now() ? null : this.t.cell(id, this.claimProp, stamp);
+      };
+      const mode = await this.guarded(id, op, step);
+      const raw = this.claimIn(this.t.row(id));
+      const won = (mode === 'room' || mode === 'local') && !!raw && raw.n === token;
+      if (won && until > room.now()) {
+        this.held.set(id, { token, until, onLost: o.onLost });
+        return { ok: true, holder: this.claimOf(id), certainty: mode };
+      }
+      this.settle(id);
       const holder = this.claimOf(id);
-      if (holder && !holder.mine) return { ok: false, holder, confirmed: true };
-      const room = this.t.room, me = room.me(), token = nonce(), until = room.now() + ttl;
-      const json = JSON.stringify({ by: me.id, name: me.name, kind: me.kind, until, n: token });
-      this.held.delete(id);
-      let confirmed = true;
-      await this.t.optimistic(this.ops, [{ id, prop: this.claimProp, value: json }], async () => {
-        await this.t.write(id, this.claimProp, json);
-        try { this.t.ingest(await this.t.read()); } catch (_e) { confirmed = false; }
-      });
-      const raw = this.rawClaim(id);
-      const ok = !!raw && raw.n === token;
-      if (ok) this.held.set(id, { token, until, onLost: o.onLost });
-      return { ok, holder: this.claimOf(id), confirmed };
+      return { ok: false, reason: won ? 'expired' : holder && !holder.mine ? 'held' : 'contended', holder, certainty: 'local' };
     }
 
     /** Gives up a claim this page holds, by emptying the claim cell.
-     *  @returns {Promise<boolean>} false when this page did not hold it */
+     *  @returns {Promise<boolean>} false when this page did not hold it, or could not let it go */
     async release(id) {
-      const holder = this.claimOf(id);
+      const holder = this.claimOf(id), me = this.t.room.me();
+      if (!holder || !holder.mine) { this.held.delete(id); return false; }
+      const step = () => {
+        const raw = this.claimIn(this.t.row(id));
+        return raw && raw.by === me.id ? this.t.cell(id, this.claimProp, () => '') : null;
+      };
+      const mode = await this.guarded(id, { id, prop: this.claimProp, value: '' }, step);
+      if (mode !== 'room' && mode !== 'local') { this.settle(id); return false; }
       this.held.delete(id);
-      if (!holder || !holder.mine) return false;
-      await this.t.optimistic(this.ops, [{ id, prop: this.claimProp, value: '' }], () => this.t.write(id, this.claimProp, ''));
       return true;
     }
   }
@@ -411,6 +547,8 @@
      Lists pass through untouched: `state` and `outcome` are the bridge's own, as plain text. */
   function requestsAdapter(art) {
     const a = art.agent;
+    // That design's own reason codes. Nothing built documents them, so they stay out of REASONS.
+    const codes = [[/^consent_required$/i, 'CONSENT_REQUIRED'], [/^rate(_page|_agent)?$/i, 'RATE_LIMITED']];
     if (!a || typeof a.requestable !== 'function' || typeof a.request !== 'function' || typeof a.requests !== 'function') return null;
     return {
       /** @returns {Promise<Array<{id: string, name: string, actions: string[]}>>} */
@@ -418,7 +556,7 @@
       /** @returns {Promise<{requestId: string, duplicate: boolean}>} */
       send: async (request) => {
         const r = await a.request(request);
-        if (!r || !r.ok) throw refusal(r && r.reason, 'REQUEST_REFUSED');
+        if (!r || !r.ok) throw refusal(r && r.reason, 'REQUEST_REFUSED', codes);
         return { requestId: r.requestId, duplicate: !!r.duplicate };
       },
       /** Calls `cb(wholeList)` now and on every change, with the bridge's list as given. */
@@ -484,12 +622,12 @@
     }
 
     /* The guide's write loop: retry while the viewer has not answered or the page is rate-limited. */
-    async send(call) {
+    async send(call, extra) {
       const until = this.now() + this.opts.retryFor;
       for (;;) {
         const r = await call();
         if (r && r.ok) return r;
-        const err = refusal(r && r.reason);
+        const err = refusal(r && r.reason, undefined, extra);
         if ((err.code !== 'CONSENT_PENDING' && err.code !== 'RATE_LIMITED') || this.now() >= until) throw err;
         for (const cb of Array.from(this.waiting)) cb(err.code);
         await this.sleep(this.opts.retryEvery);
@@ -554,7 +692,7 @@
 
     /** Stops every watch this room handle started. */
     close() {
-      for (const p of this.tables.values()) p.then((t) => { if (typeof t.stop === 'function') t.stop(); t.listeners.clear(); }, () => {});
+      for (const p of this.tables.values()) p.then((t) => t.close(), () => {});
       this.tables.clear();
     }
   }

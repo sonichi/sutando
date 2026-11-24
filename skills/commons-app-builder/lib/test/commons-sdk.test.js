@@ -17,7 +17,7 @@ const TASK_PROPS = [
 async function setup(opts) {
   const o = opts || {};
   const clock = createClock();
-  const fake = createFakeRoom({ clock });
+  const fake = createFakeRoom(Object.assign({ clock }, o.room));
   const mapDb = fake.addDatabase('App — State', MAP_PROPS);
   const taskDb = fake.addDatabase('App — Tasks', TASK_PROPS, o.rows);
   const hooks = { now: clock.now, sleep: async (ms) => { clock.advance(ms); } };
@@ -407,8 +407,8 @@ test('players: before the viewer allows the page they reject with CONSENT_REQUIR
 
 /* claims */
 
-async function board() {
-  const s = await setup({ rows: [{ Task: 'One', Status: 'Open' }, { Task: 'Two', Status: 'Open' }] });
+async function board(opts) {
+  const s = await setup(Object.assign({ rows: [{ Task: 'One', Status: 'Open' }, { Task: 'Two', Status: 'Open' }] }, opts));
   s.la = await s.a.list('App — Tasks');
   s.lb = await s.b.list('App — Tasks');
   [s.one, s.two] = s.la.toArray().map((r) => r.id);
@@ -420,25 +420,23 @@ test('claim: a free row is claimed, the other page sees who holds it, and may no
   assert.equal(la.claimOf(one), null);
   const mine = await la.claim(one, { ttl: 30000 });
   assert.equal(mine.ok, true);
-  assert.equal(mine.confirmed, true);
+  assert.equal(mine.certainty, 'local');
   assert.deepEqual(mine.holder, { id: 'u-ana', name: 'Ana', kind: 'person', until: clock.now() + 30000, mine: true });
   await settle();
   assert.deepEqual(lb.claimOf(one), { id: 'u-ana', name: 'Ana', kind: 'person', until: clock.now() + 30000, mine: false });
   const writes = pb.calls.filter((c) => c[0] === 'db.write').length;
   const theirs = await lb.claim(one);
-  assert.equal(theirs.ok, false);
-  assert.equal(theirs.holder.id, 'u-ana');
+  assert.deepEqual([theirs.ok, theirs.reason, theirs.holder.id], [false, 'held', 'u-ana']);
   assert.equal(pb.calls.filter((c) => c[0] === 'db.write').length, writes);
 });
 
-test('claim race: two claim at once; the last write wins and the loser is told by its own claim', async () => {
+test('claim race, plain writes: both are told ok as "local"; the last write stays and the other hears onLost', async () => {
   const { la, lb, one } = await board();
-  const [ra, rb] = await Promise.all([la.claim(one), lb.claim(one)]);
+  const lost = [];
+  const [ra, rb] = await Promise.all([la.claim(one, { onLost: (h) => lost.push(h.id) }), lb.claim(one)]);
+  assert.deepEqual([ra.ok, ra.certainty, rb.ok, rb.certainty], [true, 'local', true, 'local']);
   await settle();
-  assert.equal(ra.ok, false);
-  assert.equal(ra.holder.id, 'u-bot');
-  assert.equal(ra.holder.kind, 'agent');
-  assert.equal(rb.ok, true);
+  assert.deepEqual(lost, ['u-bot']);
   assert.equal(la.claimOf(one).id, 'u-bot');
   assert.equal(lb.claimOf(one).mine, true);
 });
@@ -511,13 +509,145 @@ test('claim: an agent that writes the claim cell through Actions is a holder lik
   assert.equal(la.claimOf(one), null);
 });
 
-test('claim: when the read-back fails the answer is marked unconfirmed', async () => {
+test('claim: a plain claim spends no read; the page\'s own copy could not confirm it anyway', async () => {
   const { la, one, pa } = await board();
-  for (let i = 0; i < 20; i += 1) await pa.artifact.db.read('nope').catch(() => {});
+  const reads = pa.calls.filter((c) => c[0] === 'db.read').length;
   const r = await la.claim(one);
-  assert.equal(r.ok, true);
-  assert.equal(r.confirmed, false);
-  assert.equal(r.holder.mine, true);
+  assert.deepEqual([r.ok, r.certainty, r.holder.mine], [true, 'local', true]);
+  assert.equal(pa.calls.filter((c) => c[0] === 'db.read').length, reads);
+});
+
+test('claim: the expiry is stamped by the attempt the room accepts, not when claim was called', async () => {
+  const { clock, pa } = await setup({ rows: [{ Task: 'One' }], a: { consent: 'unasked' } });
+  const start = clock.now();
+  const sleep = async (ms) => { clock.advance(ms); if (clock.now() - start >= 63000) pa.answer(true); };
+  const list = await (await Commons.connect({ artifact: pa.artifact, now: clock.now, sleep })).list('App — Tasks');
+  const r = await list.claim(list.toArray()[0].id);
+  assert.ok(clock.now() - start >= 63000);
+  assert.deepEqual([r.ok, r.holder && r.holder.until], [true, clock.now() + 60000]);
+});
+
+test('claim: a write that outlives its ttl is reported as expired, never as ok', async () => {
+  const { la, one, pa, clock } = await board();
+  const write = pa.artifact.db.write;
+  pa.artifact.db.write = async (...args) => { const r = await write(...args); clock.advance(5001); return r; };
+  const r = await la.claim(one, { ttl: 5000 });
+  assert.deepEqual([r.ok, r.reason, r.holder], [false, 'expired', null]);
+});
+
+test('claim: a refused release and a refused renewal keep the earlier claim tracked for onLost', async () => {
+  for (const act of ['release', 'claim']) {
+    const { la, one, pa, fake, taskDb, clock } = await board();
+    const lost = [];
+    assert.equal((await la.claim(one, { onLost: (h) => lost.push(h && h.id) })).ok, true);
+    pa.failNext = 'the room said no';
+    await assert.rejects(la[act](one), code('REFUSED'));
+    assert.equal(la.claimOf(one).mine, true);
+    fake.serverWrite(taskDb, one, 'Claim', JSON.stringify({ by: 'runner', name: 'Runner', kind: 'agent', until: clock.now() + 60000 }));
+    await settle();
+    assert.deepEqual(lost, ['runner'], act);
+  }
+});
+
+/* claims when a page has its own copy, and conditional writes */
+
+const EXACT = { versions: true, conditional: true };
+const MANUAL = { a: { sync: 'manual' }, b: { sync: 'manual' } };
+const exactWrites = (page) => page.calls.filter((c) => c[0] === 'db.write' && c[5] && 'ifVersion' in c[5]);
+
+test('claim, own copies and plain writes: both pages get ok as "local", never as "room"; sync settles it through onLost', async () => {
+  const { la, lb, one, pa, pb } = await board(MANUAL);
+  const lost = [];
+  const ra = await la.claim(one, { onLost: (h) => lost.push(h.id) }), rb = await lb.claim(one);
+  assert.deepEqual([ra.ok, ra.certainty, rb.ok, rb.certainty], [true, 'local', true, 'local']);
+  assert.equal(la.claimOf(one).mine && lb.claimOf(one).mine, true);
+  pa.sync(); pb.sync(); pa.sync();
+  assert.deepEqual(lost, ['u-bot']);
+  assert.equal(la.claimOf(one).id, 'u-bot');
+});
+
+test('claim, conditional writes: one of two simultaneous claims is taken by the room; the other is told who holds it', async () => {
+  const { la, lb, one, pa, pb } = await board({ room: EXACT });
+  const [ra, rb] = await Promise.all([la.claim(one), lb.claim(one)]);
+  assert.deepEqual([ra.ok, ra.certainty], [true, 'room']);
+  assert.deepEqual([rb.ok, rb.reason, rb.holder.id, rb.certainty], [false, 'held', 'u-ana', 'local']);
+  assert.equal(exactWrites(pa).length, 1);
+  assert.equal(exactWrites(pb).length, 1);
+  assert.equal(pb.calls.filter((c) => c[0] === 'db.write').length, 1);
+});
+
+test('claim, conditional writes and own copies: two pages cannot both be told ok; a stale copy raises no false onLost', async () => {
+  const { la, lb, one, two, pb } = await board(Object.assign({ room: EXACT }, MANUAL));
+  const lost = [];
+  const ra = await la.claim(one, { onLost: (h) => lost.push(h) });
+  assert.deepEqual([ra.ok, ra.certainty], [true, 'room']);
+  const rb = await lb.claim(one);
+  assert.deepEqual([rb.ok, rb.reason, rb.certainty], [false, 'contended', 'local']);
+  pb.sync();
+  assert.deepEqual([(await lb.claim(one)).reason, lb.claimOf(one).id], ['held', 'u-ana']);
+  await la.update(two, { Result: 'x' }); await settle();
+  assert.equal(la.claimOf(one).mine, true);
+  assert.deepEqual(lost, []);
+});
+
+test('conditional writes: the version comes from the read and from each snapshot', async () => {
+  const { la, one, two, pa, fake, taskDb } = await board({ room: EXACT });
+  assert.equal((await la.claim(one)).certainty, 'room');
+  fake.serverWrite(taskDb, two, 'Result', 'moved'); await settle();
+  assert.equal((await la.claim(two)).certainty, 'room');
+  const sent = exactWrites(pa).map((c) => c[5].ifVersion);
+  assert.equal(sent.length, 2);
+  assert.ok(sent[1] > sent[0]);
+  assert.equal(pa.calls.filter((c) => c[0] === 'db.read').length, 1);
+});
+
+test('conditional writes: "not available here" and "invalid request" fall back to a plain write, once and for good', async () => {
+  const off = await board({ room: { versions: true } });
+  assert.deepEqual([(await off.la.claim(off.one)).certainty, (await off.la.claim(off.two)).certainty], ['local', 'local']);
+  assert.equal(exactWrites(off.pa).length, 1);
+  const odd = await board({ room: EXACT });
+  odd.pa.failNext = 'invalid request';
+  const r = await odd.la.claim(odd.one);
+  assert.deepEqual([r.ok, r.certainty], [true, 'local']);
+});
+
+test('conditional writes: without a version the write is plain and no ifVersion is sent', async () => {
+  const { la, one, pa } = await board({ room: { conditional: true } });
+  assert.equal((await la.claim(one)).certainty, 'local');
+  assert.equal(exactWrites(pa).length, 0);
+});
+
+test('conditional writes: a lost answer means read again, never refused', async () => {
+  const landed = await board({ room: EXACT });
+  landed.pa.loseAnswer = true;
+  assert.deepEqual([(await landed.la.claim(landed.one)).certainty, exactWrites(landed.pa).length], ['room', 1]);
+  const dropped = await board({ room: EXACT });
+  dropped.pa.failNext = 'no answer from the room';
+  const r = await dropped.la.claim(dropped.one);
+  assert.deepEqual([r.ok, r.certainty, exactWrites(dropped.pa).length], [true, 'room', 2]);
+});
+
+test('claim: a renewal whose own write shows up before it returns raises no false onLost', async () => {
+  const { la, one, pa } = await board({ room: EXACT });
+  const lost = [];
+  await la.claim(one, { onLost: (h) => lost.push(h) });
+  pa.loseAnswer = true;
+  const again = await la.claim(one, { onLost: (h) => lost.push(h) });
+  await settle();
+  assert.deepEqual([again.ok, again.certainty, lost.length], [true, 'room', 0]);
+});
+
+test('release, conditional writes: a release does not wipe a claim someone else took meanwhile', async () => {
+  const { la, one, pa, fake, taskDb, clock } = await board(Object.assign({ room: EXACT }, { a: { sync: 'manual' } }));
+  const lost = [];
+  await la.claim(one, { onLost: (h) => lost.push(h && h.id) });
+  const theirs = JSON.stringify({ by: 'runner', name: 'Runner', kind: 'agent', until: clock.now() + 60000 });
+  fake.serverWrite(taskDb, one, 'Claim', theirs);
+  assert.equal(await la.release(one), false);
+  assert.equal(fake.rows(taskDb)[0].cells.Claim, theirs);
+  pa.sync();
+  assert.equal(await la.release(one), false);
+  assert.deepEqual(lost, ['runner']);
 });
 
 test('claim: bad ttl, unknown row, missing claim column and a refused write are errors', async () => {
@@ -643,12 +773,92 @@ test('experimental requests: the list reaches the page as the bridge gave it, ou
   assert.deepEqual(given, [{ requestId: 'q1', state: 'working' }]);
 });
 
-test('the removal marker and the reason matching each live in one place in the library', () => {
+test('the removal marker, map deletion and the reason matching each live in one place in the library', () => {
   const src = require('node:fs').readFileSync(require.resolve('../commons-sdk.js'), 'utf8');
   assert.equal(src.match(/'Removed'/g).length, 1);
   assert.equal(src.match(/\bremoval\(/g).length, 1);
-  assert.equal(src.match(/\bREASONS\b/g).length, 3);
-  assert.equal(src.match(/\.test\(/g).length, 3);
+  assert.equal(src.match(/re\.test\(text\)/g).length, 1);
+  assert.doesNotMatch(src, /json [!=]== ''/);
+  const table = src.slice(src.indexOf('const REASONS = ['), src.indexOf('const CONDITIONAL = ['));
+  assert.doesNotMatch(table, /consent_required|rate\(|version changed|no answer/);
+});
+
+test('reason codes of the unbuilt request design map only inside the experimental adapter', async () => {
+  const { a, pa } = await setup();
+  const l = await a.list('App — Tasks');
+  for (const reason of ['consent_required', 'rate_page', 'rate']) {
+    pa.failNext = reason;
+    await assert.rejects(l.push({ Task: 'x' }), (e) => e.code === 'REFUSED' && e.reason === reason);
+  }
+});
+
+test('a failed first read frees its watch: a retry works, and close leaves no watcher', async () => {
+  const { a, pa, taskDb, clock } = await setup({ rows: [{ Task: 'One' }] });
+  for (let i = 0; i < 20; i += 1) await pa.artifact.db.read(taskDb);
+  await assert.rejects(a.list('App — Tasks'), code('RATE_LIMITED'));
+  assert.equal(pa.watchers.size, 0);
+  clock.advance(61000);
+  assert.equal((await a.list('App — Tasks')).length, 1);
+  assert.equal(pa.watchers.size, 1);
+  a.close(); await settle();
+  assert.equal(pa.watchers.size, 0);
+});
+
+test('map.update, conditional writes: two pages count together and lose nothing; a new key gets one row', async () => {
+  const { a, b, fake, mapDb } = await setup({ room: EXACT });
+  const ma = await a.map('App — State'), mb = await b.map('App — State');
+  const inc = (n) => (n || 0) + 1;
+  const done = await Promise.all([ma.update('n', inc), mb.update('n', inc), ma.update('n', inc), mb.update('n', inc)]);
+  await settle();
+  assert.deepEqual(done.map((r) => r.mode), ['exact', 'exact', 'exact', 'exact']);
+  assert.deepEqual(done.map((r) => r.value).sort(), [1, 2, 3, 4]);
+  assert.deepEqual([ma.get('n'), mb.get('n'), fake.rows(mapDb).length], [4, 4, 1]);
+});
+
+test('map.update, plain writes: it says "best-effort", and two pages at once lose a step and make two rows', async () => {
+  const { a, b, fake, mapDb } = await setup();
+  const ma = await a.map('App — State'), mb = await b.map('App — State');
+  const inc = (n) => (n || 0) + 1;
+  assert.deepEqual(await ma.update('solo', inc), { value: 1, mode: 'best-effort' });
+  await settle();
+  assert.deepEqual(await mb.update('solo', inc), { value: 2, mode: 'best-effort' });
+  await Promise.all([ma.update('n', inc), mb.update('n', inc)]);
+  await settle();
+  assert.deepEqual([ma.get('n'), mb.get('n')], [1, 1]);
+  assert.equal(fake.rows(mapDb).filter((r) => r.cells.Key === 'n').length, 2);
+});
+
+test('map.update: bad keys and values are refused, and a copy that never catches up ends as CONTENDED', async () => {
+  const { a, b, pa } = await setup({ room: EXACT, a: { sync: 'manual' } });
+  const ma = await a.map('App — State'), mb = await b.map('App — State');
+  await assert.rejects(ma.update('', () => 1), code('BAD_ARGUMENT'));
+  await assert.rejects(ma.update('k', () => undefined), code('BAD_ARGUMENT'));
+  await mb.set('other', 1);
+  await assert.rejects(ma.update('k', () => 1), code('CONTENDED'));
+  pa.sync();
+  assert.deepEqual(await ma.update('k', () => 1), { value: 1, mode: 'exact' });
+});
+
+test('map: with two rows for one key, delete empties the lowest; if that row is removed the other value returns', async () => {
+  const { a, fake, mapDb } = await setup();
+  const low = fake.serverAddRow(mapDb, { Key: 'k', Value: '1' });
+  fake.serverAddRow(mapDb, { Key: 'k', Value: '2' });
+  const m = await a.map('App — State');
+  assert.equal(m.get('k'), 1);
+  await m.delete('k'); await settle();
+  assert.equal(m.has('k'), false);
+  assert.deepEqual(fake.rows(mapDb).map((r) => r.cells.Value), ['', '2']);
+  fake.serverDeleteRow(mapDb, low); await settle();
+  assert.equal(m.get('k'), 2);
+});
+
+test('the file defines the global Commons even when another script defined a module', () => {
+  const src = require('node:fs').readFileSync(require.resolve('../commons-sdk.js'), 'utf8');
+  for (const foreign of [{}, { exports: {} }]) {
+    const page = require('node:vm').createContext({ module: foreign });
+    require('node:vm').runInContext(src, page);
+    assert.equal(typeof page.Commons.connect, 'function');
+  }
 });
 
 test('the module exports its limits, its error class and a version', () => {
