@@ -329,6 +329,9 @@ class UndoUnits(ConnectBase):
         self.assertEqual(p.wait(timeout=10), 0, "the shim's 0, which SuccessfulExit=false does not restart")
 
 
+REISSUED = "rot.code-QQQQ7777"     # the code s.space re-issues for an agent that exists
+
+
 class ConnectCode(UndoSeams, AgentRootBase):
     """`connect --base --code`: preflight before the code is spent, one redemption, the seat written by its
     owner, then install's own path with the seat's .env; the bearer never in argv, output, unit or config."""
@@ -1607,6 +1610,34 @@ class ConnectCode(UndoSeams, AgentRootBase):
         self.assertEqual(rc, 0, err)
         self.assertIn("warning: a code on the command line is kept by ps and shell history", err)
 
+    def test_a_reissued_code_is_redeemed_through_the_same_poll(self):
+        self.relay.unlink()
+        backend = Backend(answer={"relay_url": RELAY, "bearer": BEARER, "agent_id": AGENT, "intent": "rotate"})
+        rc, out, err = self.connect(backend, stdin=io.StringIO(REISSUED + "\n"))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(backend.calls, [(BASE + "/connect/poll", {"device_code": REISSUED}, "POST")])
+        self.assertEqual((self.seat() / "token").read_text(), f"{RELAY}|{BEARER}\n")
+        self.assertEqual(self.cfg()["AGENT_ID"], AGENT)
+        self.assertNotIn(BEARER, out + err)
+
+    def test_a_malformed_reissued_code_is_refused_unspent(self):
+        for code in ("rot.", "rot", "rot. code", "ROT.code-1", "xrot.code-1", "rot-code-1"):
+            with self.subTest(code=code):
+                backend = Backend()
+                rc, _out, err = self.connect(backend, stdin=io.StringIO(code + "\n"))
+                self.assert_code_unspent(backend, rc, err)
+                self.assertIn("the code is not an agent code (it starts with acp. or rot.)", err)
+
+    def test_a_reissued_code_for_another_agent_writes_no_seat(self):
+        other = "@other.agent:ag2.space"
+        backend = Backend(answer={"relay_url": RELAY, "bearer": BEARER, "agent_id": other})
+        rc, out, err = self.connect(backend, stdin=io.StringIO(REISSUED + "\n"))
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertEqual(len(backend.calls), 1)
+        self.assertIn(f"the code is for {other}, not {AGENT}; the code is spent and nothing was written", err)
+        self.assertFalse(self.seat().exists())
+        self.assertNotIn(BEARER, out + err)
+
     def test_no_code_prompts_on_a_terminal_and_is_refused_without_one(self):
         class Tty(io.StringIO):
             def isatty(self):
@@ -1859,6 +1890,14 @@ class RedeemEdges(unittest.TestCase):
         teapot = lambda req, timeout=None: (_ for _ in ()).throw(
             urllib.error.HTTPError(req.full_url, 418, "x", {}, io.BytesIO(b"")))
         self.assertEqual(cm.redeem_code(BASE, CODE, opener=teapot)[1], "s.space refused the code (HTTP 418)")
+
+    def test_only_a_new_or_reissued_agent_code_passes_the_shape_check(self):
+        for code in (CODE, REISSUED, "acp.x", "rot.x"):
+            self.assertEqual(cm.code_problem(BASE, code), "", code)
+        for code in ("", None, "acp.", "rot.", "acp. x", "rot.x\t", "vfy.code-1", "web.code-1", "Rot.code-1", " rot.code-1"):
+            with self.subTest(code=code):
+                self.assertIn("not an agent code", cm.code_problem(BASE, code))
+        self.assertIn("--base is not https", cm.code_problem("http://backend.example/api", REISSUED))
 
     def test_a_relay_must_be_on_the_bases_host_or_under_it_never_a_sibling_under_a_public_suffix(self):
         ok = (("https://api.example.co.uk/api", "https://api.example.co.uk/relay"),

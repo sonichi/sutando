@@ -2411,7 +2411,9 @@ def _uninstall_locked(shape: Shape, before_free=None, token_file=None, cleanup=N
 
 # ── connect --code: redeem a one-time code for the agent's relay credential ─────
 
-CODE_PREFIX = "acp."        # what AG2 Space issues for an agent run by a local CLI
+# What s.space issues for an agent run by a local CLI: a new agent's code, and one re-issued for an
+# agent that exists. Both are redeemed at REDEEM_PATH for the same three fields.
+CODE_PREFIXES = ("acp.", "rot.")
 REDEEM_PATH = "/connect/poll"
 REDEEM_TIMEOUT_S = 15
 REDEEM_BACKOFF_S = (1, 2, 4, 8, 16)     # one wait per 503 or 202 before the next attempt
@@ -2458,8 +2460,11 @@ def code_problem(base: str, code: str) -> str:
     why = endpoint_problem(base, "--base")
     if why:
         return why
-    if not (code or "").startswith(CODE_PREFIX) or len(code) <= len(CODE_PREFIX) or any(c.isspace() for c in code):
-        return f"the code is not an agent code (it starts with {CODE_PREFIX}); copy it from s.space again"
+    code = code or ""
+    prefix = next((p for p in CODE_PREFIXES if code.startswith(p)), "")
+    if not prefix or len(code) <= len(prefix) or any(c.isspace() for c in code):
+        starts = " or ".join(CODE_PREFIXES)
+        return f"the code is not an agent code (it starts with {starts}); copy it from s.space again"
     return ""
 
 

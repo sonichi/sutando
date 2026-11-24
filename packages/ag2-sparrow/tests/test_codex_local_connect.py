@@ -1094,6 +1094,7 @@ class FakeCodexWrapper(unittest.TestCase):
 AGENT = "@probe.agent:ag2.space"
 BASE = "https://backend.example/api"
 CODE = "acp.code-MMMM3333"
+REISSUED = "rot.code-QQQQ7777"     # the code s.space re-issues for an agent that exists
 BEARER = "redeemed-bearer-NNNN4444"
 RELAY = "https://relay.backend.example/relay"  # on a host under BASE's
 # The agent-root installs below run the agent's own job, and its own bridge.
@@ -1355,6 +1356,30 @@ class ConnectCode(UndoSeams, Base):
         rc, _out, err = self.connect(Backend(), None, code_args=("--code", CODE))
         self.assertEqual(rc, 0, err)
         self.assertIn("warning: a code on the command line is kept by ps and shell history", err)
+
+    def test_a_reissued_code_is_redeemed_through_the_same_poll(self):
+        self.relay.unlink()
+        backend = Backend()
+        rc, out, err = self.connect(backend, stdin=io.StringIO(REISSUED + "\n"))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(backend.calls, [(BASE + "/connect/poll", {"device_code": REISSUED}, "POST")])
+        self.assertEqual((self.seat() / "token").read_text(), f"{RELAY}|{BEARER}\n")
+        self.assertNotIn(BEARER, out + err)
+
+    def test_a_malformed_or_misdirected_reissued_code_is_refused(self):
+        for code in ("rot.", "rot. code", "ROT.code-1"):
+            with self.subTest(code=code):
+                backend = Backend()
+                rc, _out, err = self.connect(backend, stdin=io.StringIO(code + "\n"))
+                self.assert_code_unspent(backend, rc, err)
+                self.assertIn("the code is not an agent code (it starts with acp. or rot.)", err)
+        other = "@other.agent:ag2.space"
+        backend = Backend(answer={"relay_url": RELAY, "bearer": BEARER, "agent_id": other})
+        rc, out, err = self.connect(backend, stdin=io.StringIO(REISSUED + "\n"))
+        self.assertEqual((rc, len(backend.calls)), (cli.EXIT_UNUSABLE, 1))
+        self.assertIn(f"the code is for {other}, not {AGENT}; the code is spent and nothing was written", err)
+        self.assertFalse(self.seat().exists())
+        self.assertEqual(self.bearer_files(), [])
 
     def test_an_http_base_or_a_malformed_code_is_refused_before_anything_runs(self):
         for kw in ({"base": "http://backend.example/api"}, {"base": "ftp://backend.example"},

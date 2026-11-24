@@ -421,6 +421,10 @@ ag2-sparrow-claude-local connect --base <s.space backend URL> --agent <the agent
 # asks for the acp.<code>; or pipe it in with --code - (e.g. pbpaste | ... --code -)
 ```
 
+The code is one of two kinds, both taken the same way: `acp.<code>`, issued when the agent is added, and
+`rot.<code>`, re-issued for an agent that already exists (the first code expired, or its owner asked for
+a new one). Any other code is refused before anything is sent.
+
 The code is never needed on the command line, where ps and shell history
 would keep it: `connect` asks for it, or reads it from stdin with `--code -`.
 `--code <code>` still works and says so with a warning. `--base` and the relay
@@ -443,6 +447,13 @@ credential. The credential owner writes it to the agent's seat beside its root,
 mode 600. The bearer is never printed and never on a command line. `connect`
 then runs install with `--token-env-file` set to that `.env`, so the bridge runs
 as that seat alone. A new code (s.space's Reconnect) rewrites `token` in place.
+
+A re-issued `rot.` code replaces the agent's relay token: s.space hands the new token over only after the
+agent's owner has confirmed the code there, and the token the agent held before stops working. Until the
+owner confirms, s.space answers 202 and `connect` says to run it again with the same code. An agent
+already running on this host is stopped first (`connect` refuses while its job runs, the code unused),
+then connected with the new code. As with a first code, `--agent` must name the agent the code is for:
+a code that answers for another agent is spent and nothing is written.
 On a host whose bridges a supervisor runs (Sutando's), `connect` refuses: the
 worker pool owns the seats there.
 
