@@ -98,6 +98,8 @@ type State = {
   cleanup: Map<string, Cleanup>
   intake: 'open' | 'closed'
   intakeReason: string
+  // The API error a main-loop StopFailure reported for the turn now ending ('' when none).
+  apiError: string
 }
 
 type CliOut = { ok: boolean; hard: boolean; data: any }
@@ -237,6 +239,7 @@ async function confirmOffer($: any, s: State, offer: Offer): Promise<boolean> {
   if (r.ok || (r.hard && r.data?.turn_id)) {
     offer.turnId = c.turnId
     offer.phase = 'TURN_CONFIRMED'
+    if (c.completed === 'error' && !c.completedError) { offer.parkPending = 'error'; offer.parkError = ''; return r.hard }
     return (c.completed ? (await parkOffer($, s, offer, c.completed, c.completedError)).hard : false) || r.hard
   }
   await $.ui.log(`${PLUGIN}: ${offer.rid} turn not confirmed: ${r.data?.refused ?? ''}; held until the next start answers it`, {})
@@ -467,7 +470,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
 
 export const register: Register = (on) => {
   const s: State = { seen: new Set(), answered: new Set(), offers: new Map(), pending: null, stale: new Map(),
-    armedResults: '', stop: null, sessionId: '', stoppedFor: '', tick: 0, retry: new Map(), cleanup: new Map(), authorizing: new Map(), intake: 'open', intakeReason: '' }
+    armedResults: '', stop: null, sessionId: '', stoppedFor: '', tick: 0, retry: new Map(), cleanup: new Map(), authorizing: new Map(), intake: 'open', intakeReason: '', apiError: '' }
 
   on('session.start', async ($, e, next) => {
     await $.tool.register({
@@ -518,6 +521,7 @@ export const register: Register = (on) => {
   })
 
   on('turn.start', async ($, e, next) => {
+    if (!e.agentId) s.apiError = ''
     await witness($, s, 'turn.start')
     const offer = s.pending
     const at = offer ? submittedAt(String(e.text ?? ''), offer.msg) : -1
@@ -535,15 +539,27 @@ export const register: Register = (on) => {
     return next(e)
   })
 
+  // An API error that ends a turn leaves turn.complete's answer empty; StopFailure carries its words.
+  on('classic.StopFailure', async ($, e, next) => {
+    if (!e.agent_id) {
+      s.apiError = String(e.last_assistant_message || e.error_details || e.error || '')
+      // A turn already ended on this error waits one scan tick for these words (see turn.complete).
+      for (const o of s.offers.values()) if (o.parkPending === 'error' && !o.parkError) o.parkError = s.apiError
+    }
+    return next(e)
+  })
+
   on('turn.complete', async ($, e, next) => {
-    // On an API error the turn's last visible text is the error message itself.
-    const error = e.reason === 'error' ? String(e.answer ?? '') : ''
+    const error = e.reason === 'error' ? String(e.answer || (e.agentId ? '' : s.apiError)) : ''
+    if (!e.agentId) s.apiError = ''
     for (const offer of [...s.offers.values()]) {
       // Its confirmation still pending: parked once it lands, so the turn's end is never lost.
       if (offer.confirming?.turnId === e.turnId) {
         offer.confirming.completed = String(e.reason); offer.confirming.completedError = error; continue
       }
       if (offer.turnId === e.turnId && (offer.phase === 'TURN_CONFIRMED' || offer.phase === 'RESULT_STAGED')) {
+        // No words yet: the scan parks it, so a StopFailure raised after the turn's end still names the cause.
+        if (e.reason === 'error' && !error) { offer.parkPending = 'error'; offer.parkError = ''; continue }
         await parkOffer($, s, offer, String(e.reason), error)
       }
     }

@@ -94,6 +94,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   on('session.end', (_: any, e: any) => ({ sessionId: e.sessionId }))
   on('turn.start', (_: any, e: any) => ({ turnId: e.turnId }))
   on('turn.complete', (_: any, e: any) => ({ text: String(e.answer ?? e.text ?? '') }))
+  on('classic.StopFailure', () => ({}))
   on('tool.register', () => ({ value: { tool: 'x' } }))
   on('ui.log', (_: any, e: any) => { logs.push(String(e?.message ?? e?.text ?? JSON.stringify(e))); return { value: undefined } })
   mock.env(on, opts.env ?? { AG2_RESULTS_DIR: '/out' })
@@ -494,20 +495,36 @@ test('a completed or aborted turn without a reply parks as an explicit protocol 
   expect(h.submitted.length).toBe(1)
 })
 
-test('a turn an API error ended parks with the error it showed; without one, the generic line', async ($, on) => {
+// As a session: an API error ends the turn with an empty answer; StopFailure carries the error's words.
+const BILLING = { error: 'billing_error', last_assistant_message: 'Credit balance is too low' } as any
+
+test('a turn an API error ended parks with the words its StopFailure carried, raised before or after the turn ended; without one, the generic line', async ($, on) => {
   const h = host(on)
   h.files['/in/task-e1.txt'] = TASK('task-e1')
   await arm($, h)
   await h.clock.advance(1000)
   await $.turn.start({ text: h.submitted[0], turnId: 't-e1' })
-  await $.turn.complete({ turnId: 't-e1', reason: 'error', answer: 'Credit balance is too low' } as any)
+  await $.classic.StopFailure(BILLING)
+  await $.turn.complete({ turnId: 't-e1', reason: 'error', answer: '' } as any)
   expect(h.files['/out/task-e1.txt']).toContain('ended without a reply (turn error: Credit balance is too low)')
+
   h.files['/in/task-e2.txt'] = TASK('task-e2')
   await h.clock.advance(3000)
   expect(h.submitted[1]).toContain('task-e2')
   await $.turn.start({ text: h.submitted[1], turnId: 't-e2' })
   await $.turn.complete({ turnId: 't-e2', reason: 'error', answer: '' } as any)
-  expect(h.files['/out/task-e2.txt']).toContain('ended without a reply (turn error without a reply)')
+  expect(h.files['/out/task-e2.txt']).toBeUndefined()
+  await $.classic.StopFailure(BILLING)
+  await h.clock.advance(1000)
+  expect(h.files['/out/task-e2.txt']).toContain('ended without a reply (turn error: Credit balance is too low)')
+
+  h.files['/in/task-e3.txt'] = TASK('task-e3')
+  await h.clock.advance(3000)
+  expect(h.submitted[2]).toContain('task-e3')
+  await $.turn.start({ text: h.submitted[2], turnId: 't-e3' })
+  await $.turn.complete({ turnId: 't-e3', reason: 'error', answer: '' } as any)
+  await h.clock.advance(1000)
+  expect(h.files['/out/task-e3.txt']).toContain('ended without a reply (turn error without a reply)')
 })
 
 test('a rejected submit spends the authorization: never resubmitted, no second authorize', async ($, on) => {
