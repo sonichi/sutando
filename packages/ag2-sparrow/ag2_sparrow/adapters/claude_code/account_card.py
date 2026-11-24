@@ -6,7 +6,8 @@ a sign-in code never travels as a chat message. The card carries `account_contro
 the computer that runs the agent, the owner switches account right in the card (the app runs the agent's own
 sign-in, `ag2-sparrow-claude-local account --start`, and takes the code in the card's own box, never sent to
 the chat). "Switch account", for a client without those controls, starts nothing here and says where to open
-the card. English only.
+the card, in place of the card tapped (no second card), which keeps the controls for when it is opened
+there. English only.
 
 Asked by "/account" or "/login" in the owner's DM, a tap on this card, or the session answering the owner
 with the card's mark. The account is Claude Code's own answer for the agent's config dir
@@ -18,7 +19,7 @@ import json
 import os
 import subprocess
 
-from ... import account_switch, connect_bridge as cb, claude_local_records as records
+from ... import account_switch, card_desk, connect_bridge as cb, claude_local_records as records
 from ...acp_host import quoted
 
 NAME = "Claude Code"
@@ -71,11 +72,13 @@ class AccountCard(account_switch.AccountSwitch):
         self.ASK = ask
 
     def tapped(self, verb, sent, result_file) -> str:
-        """"Switch account": where to switch it, in a card of its own. Nothing is started here."""
+        """"Switch account": where to switch it, shown in place of the card tapped and still carrying the
+        controls, so opened on the agent's computer it is the account card again. Nothing is started here."""
         if verb != "switch":
             self.publish(result_file, self.quoted(account_switch.EXPIRED_NO_CARD) + "\n")
             return "account-unknown"
-        self.say(sent.get("channel_id"), self.card("info", WHERE), result_file)
+        self.say(sent.get("channel_id"), account_switch.with_controls(self.card("info", WHERE), self.runtime),
+                 result_file, card_desk.tapped_event(sent))
         return "account-where"
 
 
