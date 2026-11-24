@@ -22,6 +22,7 @@ import os
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -464,7 +465,7 @@ class Restart(Base):
         execv.assert_called_once()
         argv = execv.call_args[0][1]
         self.assertEqual(argv[:3], [sys.executable, CR.RECORDER, "start-cli"])
-        self.assertEqual(argv[argv.index("--start-cli") + 1:], ["/x/stub", "--", "--visible"])
+        self.assertEqual(argv[argv.index("--start-cli") + 1:], ["/x/stub", "--foreground", "--", "--visible"])
 
     def test_start_cli_writes_one_intent_and_one_outcome_for_an_automatic_restart(self):
         run = Run(rc=0)
@@ -504,7 +505,7 @@ class Restart(Base):
     def test_a_launcher_past_the_recorders_deadline_is_killed_reaped_and_recorded(self):
         script = self._launcher("exec sleep 60")
         began = time.monotonic()
-        rc = CR.run_start_cli(self.ws, "health-check --recover-core", start_cli=str(script), deadline_s=1)
+        rc = CR.run_start_cli(self.ws, "health-check --recover-core", start_cli=str(script), deadline_s=4)
         self.assertLess(time.monotonic() - began, 20)
         self.assertEqual(rc, 1)
         self.assertTrue(self._launcher_gone(), "the launcher outlived the recorder's deadline")
@@ -550,13 +551,74 @@ class Restart(Base):
         argv, _via = CR.route(self.clone, {}, Run(), workspace=self.ws, caller="c")
         self.assertNotIn("--deadline-s", argv)
         run = Run(rc=0)
-        CR.run_start_cli(self.ws, "c", start_cli="/x/stub", runner=run, deadline_s=7)
+        CR.run_start_cli(self.ws, "c", start_cli="/x/stub", runner=run, deadline_s=8, clock=lambda: 50.0)
         CR.run_start_cli(self.ws, "c", start_cli="/x/stub", runner=run)
-        self.assertEqual([kw["timeout"] for _argv, kw in run.calls], [7, None])
+        self.assertEqual([kw["timeout"] for _argv, kw in run.calls], [6, None],
+                         "the launcher leaves a quarter of a short budget for the outcome line")
         with mock.patch.object(CR, "run_start_cli", return_value=0) as sc, mock.patch.object(CR, "_cancel_on_signal"):
             CR.main(["start-cli", "--workspace", "/w", "--caller", "c", "--via", "start-cli",
                      "--start-cli", "/s", "--deadline-s", "100"])
         self.assertEqual(sc.call_args.kwargs["deadline_s"], 100)
+
+    def test_a_held_audit_lock_cannot_outlast_the_recorders_deadline(self):
+        from file_lock import locked_file
+        from hitl import recovery
+        lock = recovery.recovery_dir(self.ws) / recovery.AUDIT_LOCK
+        run, err, done = Run(rc=0), io.StringIO(), []
+
+        def record():
+            with mock.patch.object(sys, "stderr", err):
+                done.append(CR.run_start_cli(self.ws, "health-check --recover-core", start_cli="/x/stub",
+                                             runner=run, deadline_s=2))
+        with locked_file(lock):  # another process appending, stalled
+            began = time.monotonic()
+            worker = threading.Thread(target=record, daemon=True)
+            worker.start()
+            worker.join(15)
+            waited = time.monotonic() - began
+            self.assertFalse(worker.is_alive(), "the recorder waited on the audit lock past its deadline")
+        self.assertLess(waited, 2 + 1, "both lines and the launcher fit one budget")
+        self.assertEqual(done, [0], "the restart itself still ran and its code is returned")
+        self.assertEqual(len(run.calls), 1)
+        self.assertEqual(self.audit(), [])
+        self.assertIn("audit intent line not written", err.getvalue())
+        self.assertIn("audit outcome line not written", err.getvalue())
+        self.assertTrue(recovery.audit(self.ws, {"event": "after"}, wait_s=1), "the lock was left free")
+
+    def test_an_unbounded_recorder_still_bounds_each_audit_line(self):
+        run = Run(rc=0)
+        with mock.patch.object(CR, "_audit", return_value=True) as audit:
+            CR.run_start_cli(self.ws, "graceful-restart", start_cli="/x/stub", runner=run)
+        self.assertEqual([c.kwargs["wait_s"] for c in audit.call_args_list], [CR.AUDIT_LOCK_WAIT_S] * 2)
+        from hitl import recovery
+        with mock.patch.object(recovery, "audit", return_value=True) as written:
+            CR.run_ctl(self.ctl, self.ws, "recovery-card", runner=run)
+        self.assertEqual([c.kwargs["wait_s"] for c in written.call_args_list], [CR.AUDIT_LOCK_WAIT_S] * 2)
+
+    def test_a_foreground_restart_keeps_the_terminal_and_an_unattended_one_does_not(self):
+        import pty
+        script = self._launcher('if [ -t 0 ]; then echo terminal; else echo detached; fi > "$0.stdin"')
+        seen = Path(str(script) + ".stdin")
+        for foreground, want in ((True, "terminal"), (False, "detached")):
+            argv = CR.recorded_start_cli_argv(REPO, self.ws, "graceful-restart", via=CR.VIA_START_CLI,
+                                              start_cli=str(script), foreground=foreground)
+            master, slave = pty.openpty()
+            try:
+                self.assertEqual(subprocess.run(argv, stdin=slave, stdout=subprocess.DEVNULL,
+                                                stderr=subprocess.DEVNULL, timeout=30).returncode, 0)
+            finally:
+                os.close(master)
+                os.close(slave)
+            self.assertEqual(seen.read_text().strip(), want)
+        run = Run(rc=0)
+        CR.run_start_cli(self.ws, "c", start_cli="/x/stub", runner=run, foreground=True)
+        CR.run_start_cli(self.ws, "c", start_cli="/x/stub", runner=run)
+        self.assertEqual([kw["stdin"] for _argv, kw in run.calls], [None, subprocess.DEVNULL])
+        execv = mock.Mock()
+        CR.restart(self.ws, "graceful-restart", repo=self.clone, start_cli="/x/stub", runner=Run(), execv=execv)
+        self.assertIn("--foreground", execv.call_args[0][1], "only the foreground verb asks for the terminal")
+        argv, _via = CR.route(self.clone, {}, Run(), workspace=self.ws, caller="health-check --recover-core")
+        self.assertNotIn("--foreground", argv)
 
     def test_overlapping_attempts_pair_their_own_intent_and_outcome(self):
         def nested(argv, **kw):
@@ -575,8 +637,8 @@ class Restart(Base):
         from hitl import recovery
         real, err = recovery.audit, io.StringIO()
 
-        def intent_fails(workspace, entry):
-            return False if entry["phase"] == "intent" else real(workspace, entry)
+        def intent_fails(workspace, entry, **kw):
+            return False if entry["phase"] == "intent" else real(workspace, entry, **kw)
         with mock.patch.object(recovery, "audit", side_effect=intent_fails), mock.patch.object(sys, "stderr", err):
             self.assertEqual(CR.run_start_cli(self.ws, "c", start_cli="/x/stub", runner=Run(rc=0)), 0)
             self.assertEqual(CR.run_ctl(self.ctl, self.ws, "c", runner=Run(rc=0)), 0)
@@ -599,7 +661,7 @@ class Restart(Base):
         CR.restart(self.ws, "switch-model", repo=self.clone, start_cli="/x/L", runner=Run(), execv=execv, start=True)
         argv = execv.call_args[0][1]
         self.assertEqual(argv[:3], [sys.executable, CR.RECORDER, "start-cli"])
-        self.assertEqual(argv[argv.index("--start-cli") + 1:], ["/x/L", "--start"])
+        self.assertEqual(argv[argv.index("--start-cli") + 1:], ["/x/L", "--start", "--foreground"])
         run = Run(rc=0)
         CR.run_start_cli(self.ws, "switch-model", start_cli="/x/L", runner=run, start=True)
         self.assertEqual(run.argvs(), [["bash", "/x/L"]])
@@ -632,7 +694,7 @@ class Restart(Base):
                                       "--revision", "2", "--runtime", "codex", "--", "--visible"]), 7)
         sc.assert_called_once_with(Path("/w"), "c", via="start-cli-fallback", hitl_id="h", revision=2,
                                    runtime="codex", extra=["--visible"], start_cli="/s", start=False,
-                                   deadline_s=None)
+                                   deadline_s=None, foreground=False)
         with mock.patch.object(CR, "restart", return_value=0) as r:
             self.assertEqual(CR.main(["restart", "--workspace", "/w", "--caller", "g", "--repo", "/r",
                                       "--start-cli", "/s", "--", "--visible"]), 0)

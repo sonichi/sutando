@@ -180,8 +180,13 @@ written carries `intent_recorded: false`. A caller that bounds its restart (the 
 paused core's relaunch, a card's detached restart) passes that bound to the route; the standalone
 recorder then ends its launcher 20 seconds earlier, and also when it is itself told to stop
 (SIGTERM, SIGHUP, SIGINT). In both cases the launcher is killed and reaped before the outcome is
-written: `failed` with `reason: deadline` or `reason: cancelled` and no `rc`. A foreground
-`core_restart.py restart` passes no bound, because its launcher may stay attached to a terminal.
+written: `failed` with `reason: deadline` or `reason: cancelled` and no `rc`. That deadline is one
+budget for the intent line, the launcher and the outcome line: each line waits at most 5 seconds
+for the audit lock (less on a short budget), and a line that waits longer is reported as not
+written. The recorder kills the launcher process itself, not commands the launcher had already
+started. A foreground `core_restart.py restart` passes no bound, because its launcher may stay
+attached to a terminal, and it alone leaves the launcher its stdin (`--foreground`); every other
+route gives the launcher no stdin.
 When the ctl exits 12 (another launcher run held the app's launch lock; nothing was killed or
 started), the receipt is `failed`, the card says the core is already being restarted and to try
 again shortly, any hold it lifted returns, and nothing is retried automatically.
