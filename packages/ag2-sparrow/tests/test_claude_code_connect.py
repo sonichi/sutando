@@ -1514,6 +1514,49 @@ class ConnectCode(UndoSeams, AgentRootBase):
         self.assertEqual((self.seat() / "token").read_bytes(), before)
         self.assert_job_runs(fake, pid)
 
+    def other_agents_seat(self):
+        """Another agent's seat on this host, with its files' bytes."""
+        home = cli.bridge_home(self.root.parent / "other.agent_ag2.space")
+        self.assertEqual(cm._sources.write_seat_credentials(home, agent_id="@other.agent:ag2.space", instance="d" * 32,
+                                                     tier="owner", relay_url=RELAY, bearer="other-bearer-PPPP6666"), "")
+        return home, {p.name: p.read_bytes() for p in sorted(home.rglob("*")) if p.is_file() and p.name != ".lock"}
+
+    def test_a_pending_reissued_code_leaves_the_stopped_seat_and_its_200_replaces_only_that_seat(self):
+        fake = self.running_job()
+        fake.runner.stop_session()
+        other, other_before = self.other_agents_seat()
+        before = {p.name: p.read_bytes() for p in sorted(self.seat().iterdir())}
+        pending = [(202, {"status": "pending"})] * (len(cm.REDEEM_BACKOFF_S) + 1)
+        backend = Backend(*pending, answer={"relay_url": RELAY, "bearer": "rotated-bearer-OOOO5555", "agent_id": AGENT})
+        sleeps = []
+        rc, out, err = self.connect(backend, fake, sleeps=sleeps, stdin=io.StringIO(REISSUED + "\n"))
+        self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
+        self.assertIn("s.space is still redeeming the code; run connect again with the same code", err)
+        self.assertEqual((len(backend.calls), sleeps), (len(pending), list(cm.REDEEM_BACKOFF_S)))
+        self.assertEqual({p.name: p.read_bytes() for p in sorted(self.seat().iterdir())}, before, "byte-identical")
+        self.assertIsNone(fake.runner.pid(), "nothing was started on the old token")
+        rc, out, err = self.connect(backend, fake, stdin=io.StringIO(REISSUED + "\n"))
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual({body["device_code"] for _url, body, _method in backend.calls}, {REISSUED}, "the same code")
+        self.assertEqual((self.seat() / "token").read_text(), f"{RELAY}|rotated-bearer-OOOO5555\n")
+        self.assertEqual((self.seat() / ".env").read_bytes(), before[".env"], "same instance, same seat")
+        other_after = {p.name: p.read_bytes() for p in sorted(other.rglob("*")) if p.is_file() and p.name != ".lock"}
+        self.assertEqual(other_after, other_before, "another agent's seat is untouched")
+        self.assert_job_runs(fake)
+
+    def test_a_running_job_refuses_a_reissued_code_before_it_is_read_or_polled(self):
+        fake = self.running_job()
+        pid, before = fake.runner.pid(), {p.name: p.read_bytes() for p in sorted(self.seat().iterdir())}
+        backend, stdin = Backend(), io.StringIO(REISSUED + "\n")
+        rc, out, err = self.connect(backend, fake, stdin=stdin)
+        self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
+        self.assertIn(f"{cm.job_name(LA)} is running for {self.root}; stop it first (systemctl --user stop "
+                      f"{LA.service_name}), then connect again; the code was not used", err)
+        self.assertEqual((backend.calls, stdin.tell()), ([], 0), "never polled, never read")
+        self.assertNotIn("stopped:", out)
+        self.assertEqual({p.name: p.read_bytes() for p in sorted(self.seat().iterdir())}, before)
+        self.assert_job_runs(fake, pid)
+
     def test_an_unreadable_job_state_refuses_connect_before_the_code_is_spent(self):
         backend = Backend()
         with mock.patch.object(cm, "manager_state", return_value="unknown"):
