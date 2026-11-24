@@ -88,7 +88,7 @@ AUDIT_LOCK_WAIT_S = 5
 #: The recorder's stderr line for an audit line it could not write, and how many a caller relays.
 AUDIT_DIAGNOSTIC = re.compile(r"core_restart: audit (?:intent|outcome) line not written \(attempt att_[0-9a-f]{12}\)")
 MAX_AUDIT_DIAGNOSTICS = 4
-#: The launchers' restart trace under the workspace's logs/, where a relayed diagnostic is kept.
+#: The launchers' restart trace file, in the directory the caller keeps its logs in.
 RESTART_TRACE = "restart-attempts.log"
 CANCEL_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 
@@ -206,10 +206,11 @@ def audit_diagnostics(stderr) -> List[str]:
     return [line for line in lines if AUDIT_DIAGNOSTIC.fullmatch(line)][:MAX_AUDIT_DIAGNOSTICS]
 
 
-def report_audit_diagnostics(workspace: Path, caller: str, stderr, err=None,
+def report_audit_diagnostics(trace: Path, caller: str, stderr, err=None,
                              now: Callable[[], float] = time.time) -> List[str]:
     """For a caller that captures the restart's stderr and reads only its exit code: say the
-    recorder's audit-failure lines on `err` and keep them in the restart trace, on success too."""
+    recorder's audit-failure lines on `err` and keep them in the caller's restart trace file
+    `trace`, on success too."""
     lines = audit_diagnostics(stderr)
     if not lines:
         return lines
@@ -217,7 +218,7 @@ def report_audit_diagnostics(workspace: Path, caller: str, stderr, err=None,
         print(f"{caller}: {line}", file=err or sys.stderr)
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now()))
     try:
-        trace = Path(workspace) / "logs" / RESTART_TRACE
+        trace = Path(trace)
         trace.parent.mkdir(parents=True, exist_ok=True)
         with open(trace, "a") as f:
             f.writelines(f"{stamp} [audit] {caller}: {line}\n" for line in lines)

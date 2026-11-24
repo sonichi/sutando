@@ -810,11 +810,12 @@ class RecoverCore(Base):
         for other in (None, "", "core_restart: audit intent line not written (attempt att_1) and more",
                       "x core_restart: audit outcome line not written (attempt att_0123456789ab)"):
             self.assertEqual(CR.audit_diagnostics(other), [])
-        self.assertEqual(CR.report_audit_diagnostics(self.ws, "c", "launcher noise"), [])
+        trace = self.ws / "logs" / CR.RESTART_TRACE
+        self.assertEqual(CR.report_audit_diagnostics(trace, "c", "launcher noise"), [])
         self.assertFalse((self.ws / "logs").exists(), "nothing is written when there is nothing to relay")
         (self.ws / "logs").write_text("not a directory")
         err = io.StringIO()
-        self.assertEqual(CR.report_audit_diagnostics(self.ws, "c", LOST[0], err=err), [LOST[0]])
+        self.assertEqual(CR.report_audit_diagnostics(trace, "c", LOST[0], err=err), [LOST[0]])
         self.assertEqual(err.getvalue(), f"c: {LOST[0]}\n", "an unwritable trace still leaves the stderr report")
 
     def test_elsewhere_it_is_start_cli(self):

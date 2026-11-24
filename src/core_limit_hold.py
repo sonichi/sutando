@@ -991,7 +991,8 @@ def _relaunch(workspace: Path, launcher: Optional[str], model: Optional[str], sw
                        timeout=RELAUNCH_TIMEOUT_S, env=env)
         except (OSError, subprocess.SubprocessError):
             return None
-        core_restart.report_audit_diagnostics(workspace, RELAUNCH_CALLER, getattr(proc, "stderr", None))
+        core_restart.report_audit_diagnostics(Path(workspace) / "logs" / core_restart.RESTART_TRACE,
+                                              RELAUNCH_CALLER, getattr(proc, "stderr", None))
         return proc.returncode
     if command:
         ok = rc(list(command)) == 0
