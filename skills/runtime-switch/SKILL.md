@@ -58,3 +58,7 @@ runtime because it was switched another way, to say so). Where an edit is refuse
 posted as a card, as before.
 
 Its log is `<workspace>/logs/runtime-card.log`.
+
+The sign-in waiter runs in a session of its own and holds a lock for as long as it lives. If something
+stops it anyway (a restart that kills every process of the core, a reboot), `runtime_card.py resume`
+starts one again for the sign-in still waited for; `post` and `status` do the same on their way.

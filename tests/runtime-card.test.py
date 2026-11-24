@@ -420,6 +420,57 @@ class AwaitSignIn(Base):
         self.assertTrue(self.ws.joinpath(*rtc.RUNNING).exists(), "the one switch under way")
         self.assertEqual(self.restarts, [], "the waiter restarts nothing itself")
 
+    def test_a_waiter_holds_its_lease_while_it_runs_and_a_second_one_for_the_attempt_stops(self):
+        seen = []
+        real = self.clock.sleep
+
+        def sleep(s):
+            if not seen:
+                seen.append(rtc.waiter_alive(self.ws, self.attempt))
+                rc, dup = self.wait()                                   # started again while the first runs
+                seen.append((rc, dup["status"]))
+                seen.append(self.run_(["resume"])[1]["status"])
+            real(s)
+        self.clock.sleep = sleep
+        self.assertFalse(rtc.waiter_alive(self.ws, self.attempt), "nothing runs yet")
+        rc, out = self.wait()
+        self.assertEqual(seen, [True, (0, "duplicate"), "waiting"])
+        self.assertEqual(out["status"], "gave_up", "the first went on to its own end")
+        self.assertEqual(self.launch.calls, [], "neither the duplicate nor the resume started anything")
+        self.assertFalse(rtc.waiter_alive(self.ws, self.attempt))
+        self.assertEqual(list(self.ws.joinpath("state").glob("runtime-card-signin.*.alive")), [], "its lease is gone")
+        self.assertEqual(self.wait(attempt="../x")[0], 2, "an attempt id is all a lease file is ever named by")
+
+    def test_a_wait_whose_waiter_is_gone_is_given_a_new_one_by_resume_and_by_posting_the_card(self):
+        # The waiter died with a core restart: the record is there, nobody holds its lease.
+        rc, out = self.run_(["resume"])
+        self.assertEqual((rc, out["status"], out["attempt"]), (0, "resumed", self.attempt))
+        argv, kw = self.launch.calls[0]
+        self.assertEqual((argv[argv.index("--workspace") + 2], argv[argv.index("--attempt") + 1],
+                          argv[argv.index("--runtime") + 1], argv[argv.index("--room") + 1], kw["start_new_session"]),
+                         ("await-sign-in", self.attempt, "claude", DM, True))
+        # Asking for the card, or its status, brings it back too.
+        self.launch.calls.clear()
+        self.post()
+        self.run_(["status"])
+        self.assertEqual([c[0][c[0].index("--attempt") + 1] for c in self.launch.calls], [self.attempt] * 2)
+        # Resumed past the deadline, the waiter says it stopped waiting on the card that promised the switch.
+        self.clock.sleep(rtc.SIGN_IN_WAIT_S + 1)
+        self.claude_json = {"loggedIn": True}
+        rc, late = self.wait()
+        self.assertEqual((late["status"], self.restarts), ("gave_up", []))
+        self.assertEqual(self.fake.edits()[-1][0], "$card2")
+        # Nothing waited for, a record that names no attempt, and a launch that fails.
+        self.launch.calls.clear()
+        self.assertEqual(self.run_(["resume"])[1], {"status": "none"})
+        self.ws.joinpath(*rtc.WAITING).write_text(json.dumps({"attempt": "../../x", "runtime": "claude", "room": DM}))
+        self.assertEqual((self.run_(["resume"])[1], self.launch.calls), ({"status": "none"}, []))
+        self.ws.joinpath(*rtc.WAITING).write_text(json.dumps({"attempt": "5-ab", "runtime": "claude", "room": DM, "ts": 1}))
+        self.launch.fail = OSError("no fork")
+        self.assertEqual(self.run_(["resume"])[1], {"status": "failed", "attempt": "5-ab", "why": "OSError"})
+        rc, out = self.run_(["status"])
+        self.assertEqual((rc, out["runtime"]), (0, "codex"), "a resume that fails is never in the card's way")
+
     def test_no_sign_in_within_the_wait_says_so_and_changes_nothing(self):
         rc, out = self.wait()
         self.assertEqual((rc, out["status"], out["posted"]), (1, "gave_up", "posted"))

@@ -6,6 +6,7 @@
     python3 runtime_card.py [--workspace WS] switch --room ROOM --runtime RT --attempt ID
     python3 runtime_card.py [--workspace WS] settle --room ROOM --runtime RT --since EPOCH [--attempt ID]
     python3 runtime_card.py [--workspace WS] status
+    python3 runtime_card.py [--workspace WS] resume     # restart the sign-in waiter if it is gone
 
 `post` sends the menu to the owner's checked DM and records it (src/issued_cards.py), so only the
 owner's tap on it, in that DM, acts (agent_card.click_verdict). It has two buttons, "Codex" and
@@ -46,8 +47,10 @@ object. Exit 0 done, 1 a negative answer, 2 refused. Stdlib only.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -443,8 +446,80 @@ def claim_wait(ws: Path, mine: Optional[dict]) -> bool:
         return True
 
 
+_ATTEMPT = re.compile(r"^[0-9A-Za-z][0-9A-Za-z-]{0,63}$")     # names a file: no dot, no slash
+
+
+def _lease_path(ws: Path, attempt: str) -> Path:
+    return ws / "state" / f"runtime-card-signin.{attempt}.alive"
+
+
+@contextlib.contextmanager
+def waiter_lease(ws: Path, attempt: str):
+    """A waiter's proof of life: a lock on its attempt's own file, held until it exits however it exits
+    (the lock dies with the process). Yields False when another waiter for this attempt holds it."""
+    from file_lock import try_lock_fd, unlock_fd
+    path = _lease_path(ws, attempt)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if not try_lock_fd(fd):
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            path.unlink(missing_ok=True)
+            unlock_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def waiter_alive(ws: Path, attempt: str) -> bool:
+    """Whether a waiter for `attempt` is running: its lease file is there and locked."""
+    from file_lock import try_lock_fd, unlock_fd
+    try:
+        fd = os.open(_lease_path(ws, attempt), os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        if try_lock_fd(fd):
+            unlock_fd(fd)
+            return False
+        return True
+    finally:
+        os.close(fd)
+
+
+def resume_wait(ws: Path, popen=subprocess.Popen) -> dict:
+    """Start a waiter again for a sign-in still waited for whose waiter is gone (a restart that took it
+    down with the core, a reboot). Past its deadline too: that waiter says it stopped waiting, in place,
+    so the card never goes on promising a switch nobody is watching for."""
+    rec = _read_json(ws.joinpath(*WAITING))
+    attempt = str(rec.get("attempt") or "")
+    if not _ATTEMPT.match(attempt) or rec.get("runtime") not in NAMES or not rec.get("room"):
+        return {"status": "none"}
+    if waiter_alive(ws, attempt):
+        return {"status": "waiting", "attempt": attempt}
+    try:
+        return {"status": "resumed", "attempt": attempt, "pid": start_waiter(ws, rec, popen)}
+    except OSError as e:
+        return {"status": "failed", "attempt": attempt, "why": type(e).__name__}
+
+
 def cmd_await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, run=subprocess.run,
               codex_read=None, sleep=time.sleep, clock=time.time) -> int:
+    """One waiter per attempt (waiter_lease): a second one started for it stops at once."""
+    if not _ATTEMPT.match(args.attempt):
+        return _emit({"status": "refused", "why": "not an attempt id"}, 2)
+    with waiter_lease(ws, args.attempt) as mine:
+        if not mine:
+            return _emit({"status": "duplicate", "runtime": args.runtime})
+        return _await(ws, args, core=core, execute=execute, popen=popen, run=run, codex_read=codex_read,
+                      sleep=sleep, clock=clock)
+
+
+def _await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, run=subprocess.run,
+           codex_read=None, sleep=time.sleep, clock=time.time) -> int:
     """Wait for the sign-in a "Sign in first" card asked for, then switch as the tap wanted. It acts only
     after claiming the wait as its own (claim_wait), which it does after the sign-in probe, not before:
     one a newer tap replaced while it was probing stops without a word. It says so in the room when the
@@ -682,12 +757,20 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, run=subp
     t.add_argument("--attempt", default="")
     t.add_argument("--card", default="")
     sub.add_parser("status")
+    sub.add_parser("resume")
     args = p.parse_args(argv)
     if args.workspace:
         ws = Path(args.workspace)
     else:
         from workspace_default import resolve_workspace
         ws = Path(resolve_workspace())
+    if args.cmd == "resume":
+        return _emit(resume_wait(ws, popen))
+    if args.cmd in ("post", "status"):
+        try:
+            resume_wait(ws, popen)      # a waiter a restart took down is back before the card is looked at
+        except Exception:  # noqa: BLE001 - never in the way of the card itself
+            pass
     if args.cmd == "post":
         return cmd_post(ws, args, core=core, execute=execute)
     if args.cmd == "reply":
