@@ -31,8 +31,9 @@ was run in a real room.
 | 21 | One watch per database. | All handles on one database share one watch and one write queue. What the bridge does on a second watch is not stated; the fake throws, to catch misuse. |
 | 22 | `db.list()`: does it count as a read? | Not stated. The library calls it once per `map()` or `list()` call. |
 | 23 | Versions and conditional writes. | The guide does not describe them. The source is `docs/commons-html-page-api.md` in the web client (cinny-webclient) repository, section "Database versions and conditional writes": the number in `version` on what `db.read` and `db.onChange` give, `{ifVersion}` as the last argument of `db.write` and `db.createRow`, and the refusal reasons. That document owns the contract and it is not copied here. The library feature-detects: a missing `version` means the plain path. |
-| 24 | A snapshot that is older than an accepted conditional write. | Ignored: after the room accepts a write at version `v`, a snapshot with a version of `v` or lower was taken before it. This assumes the version only grows. |
-| 25 | Reasons the guide does not quote. | "This write is waiting for approval" and "no answer from the room; read again before deciding" are worded in that same section; an offline page is not. For plain writes the library gives none of them a code: they come back as `REFUSED` with the text. On a conditional write, "no answer from the room" means "read again". |
+| 24 | Which version is the basis for the next conditional write? | The one the room's answer carries (`{ok: true, version}`); the page API document says it is there "when the server returns it", so both shapes are handled. With it, the library moves its basis and its own rows forward at once and ignores any snapshot older than it. Without it, the basis stays where it was and the next conditional write waits for the page's copy to catch up. |
+| 25 | Reasons the guide does not quote. | "This write is waiting for approval", "offline" and "no answer from the room; read again before deciding" are worded in that same section, for conditional writes. There they get the codes `APPROVAL_PENDING`, `OFFLINE` and, for no answer, the handling in choice 26. For plain writes none of them has a code: they come back as `REFUSED` with the text. |
+| 26 | A conditional write with no answer. | The outcome is unknown and the document names no key to resend it and no receipt. `map.update` rejects with `OUTCOME_UNKNOWN` and what the page sees; it never infers success from an equal value and never reruns the function. A claim goes on, because its token is its own proof. |
 
 ## Real-room checklist
 
@@ -61,7 +62,7 @@ Each item is an assumption. Check it with two people (and one agent) in a real r
 21. An agent writing the `Claim`, `Status` or `Result` cell through Actions does not trigger an unwanted summon on that row.
 22. `agent.sendTask` with a repeated `key` returns the first receipt and shows no second dialog.
 23. `room.post` and `agent.sendTask` reasons match the guide's wording exactly.
-24. The inlined library (about 31 KB) plus a page stays well under the 196,608-byte page limit, and runs in the sandbox with no blocked call. (The guide's static pre-flight, `check_page.py`, passes on both examples.)
+24. The inlined library (about 33 KB) plus a page stays well under the 196,608-byte page limit, and runs in the sandbox with no blocked call. (The guide's static pre-flight, `check_page.py`, passes on both examples.)
 25. Each "version changed" answer costs one `db.read`; check that is affordable in a busy app: 20 reads a minute per page.
 26. Phone layout of the two examples at about 390px, light and dark. Not rendered here: the checks run without a browser.
 27. The room you ship to has the switches on: `db.read` and `db.onChange` snapshots carry a number in `version`. A document cannot tell you that about a given room.

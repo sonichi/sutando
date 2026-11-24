@@ -15,7 +15,7 @@ a real room or a browser. See [`NOTES.md`](NOTES.md) for what a real room must s
   rollback. A page that needs none of that is simpler without it.
 - **It must be inlined.** A page runs in a sandbox with no network, so it cannot load a script
   from anywhere. Copy `commons-sdk.js` into a `<script>` in the page. `examples/inline.js` shows
-  one way to do that between two marker comments. The file is about 31 KB; a page body is at most
+  one way to do that between two marker comments. The file is about 33 KB; a page body is at most
   196,608 bytes. Once it has run, the global `Commons` exists, whatever other scripts the page
   carries (it also sets `module.exports` when a `module` with `exports` is there, as in Node).
 - **The bridge is not ours.** The library is built on the page API (`window.artifact`). The host
@@ -40,7 +40,7 @@ The shipped templates do not use the library today. The two examples here are se
 Ask an agent to create a database named `Counter — State` with a text column `Value`. Then:
 
 ```html
-<button id="up">+1</button> <output id="n"></output>
+<button id="up">+1</button> <output id="n"></output> <p id="msg"></p>
 <script>/* paste commons-sdk.js here */</script>
 <script>
 (async () => {
@@ -48,7 +48,14 @@ Ask an agent to create a database named `Counter — State` with a text column `
   const state = await room.map('Counter — State');
   const draw = () => { document.getElementById('n').textContent = state.get('count') ?? 0; };
   state.observe(draw); draw();
-  document.getElementById('up').onclick = () => state.update('count', (n) => (n ?? 0) + 1);
+  const msg = document.getElementById('msg');
+  document.getElementById('up').onclick = async () => {
+    try { await state.update('count', (n) => (n ?? 0) + 1); msg.textContent = ''; } catch (e) {
+      msg.textContent = e.code === 'OUTCOME_UNKNOWN'
+        ? 'Not sure that press was saved. Check the number, and press again if it is missing.'
+        : 'Not saved: ' + e.message;
+    }
+  };
 })();
 </script>
 ```
@@ -59,8 +66,12 @@ row through Actions.
 `update` reads the value, runs your function on it and writes the result back. It resolves to
 `{value, mode}`. Where the room offers conditional writes, `mode` is `"exact"` and no press is
 lost. Where it does not, `mode` is `"best-effort"`: two people who press at the same moment both
-write the same new number and one press is lost. See "Conditional writes". For a count that must
-not lose a press in any room, push one row per press into a list and show `list.length`.
+write the same new number and one press is lost. See "Conditional writes".
+
+One case the page must show, as above: `OUTCOME_UNKNOWN`. The room gave no answer, so the press
+may or may not have been saved, and the library does not guess or press again on its own. Tell
+the person, let them look at the number and decide. For a count that must not lose a press in
+any room, push one row per press into a list and show `list.length`.
 
 ## What you need in the room
 
@@ -173,7 +184,9 @@ words when there are any.
 | `RATE_LIMITED` | Too many writes, reads, asks or posts in a minute |
 | `DECLINED` | The viewer cancelled an ask or a post |
 | `AGENT_UNAVAILABLE` | The agent is not the viewer's, or cannot be reached |
-| `BUSY`, `OUTCOME_UNKNOWN` | Another ask is open; or the ask's fate is unknown (send again with the same key) |
+| `BUSY` | Another ask is open |
+| `OUTCOME_UNKNOWN` | No answer came back. For an ask: send again with the same key. For `map.update`: the write may or may not have landed; `value` (and `version`, when there is one) hold what this page sees now. Show it and let the person decide; do not repeat it blindly |
+| `OFFLINE`, `APPROVAL_PENDING` | A conditional write was not sent because the page is offline, or is held for an approval and has not landed yet |
 | `BAD_MENTION` | A mention names someone who is not a joined member, or a group |
 | `UNSUPPORTED` | This bridge does not have the call |
 | `CONTENDED` | `map.update` gave up: the database kept changing between its read and its write |
@@ -249,8 +262,20 @@ them at run time:
   the host answers that the version changed, the library reads again and decides again, at most
   five times. If it answers that conditional writes are not available, or that the request is
   invalid, the library writes plainly from then on.
-- No answer to a conditional write means "read again", never "refused". The library reads, and
-  if its value is there, the write counts as made.
+- A successful answer carries the database's new version when the server returns it. The
+  library builds its next write on that version and on the value it just wrote, so several
+  updates in a row work even while the page's own copy is behind. A snapshot older than that
+  version is ignored; a newer one wins. If the answer has no version, the next write waits for
+  the page's copy to catch up (and ends as `CONTENDED` if it does not).
+- No answer to a conditional write means the outcome is unknown: it may have landed. The host
+  offers no key to resend the same write safely and no receipt to look it up, so:
+  - `map.update` rejects with `OUTCOME_UNKNOWN`. It does not treat an equal value as proof (a
+    peer can write the same number) and does not run your function a second time.
+  - `claim` and `release` read again and go on, because a claim carries its own proof: each
+    attempt writes a fresh token, and "the cell holds a token this call wrote" cannot be
+    someone else's doing.
+- `"exact"` therefore means: the room accepted this write at the version this page had read,
+  and said so.
 
 Three things differ from a plain write, by the host's design:
 
@@ -397,6 +422,7 @@ Each line is something the documented bridge does not let a library do.
 14. **A way to see the remaining write and read budget.** Each "version changed" answer costs one of 20 reads a minute.
 15. **A shared text or document type for apps,** and a way to pass Yjs updates through the bridge. Needed for real Yjs apps.
 16. **Offline writes.** There is no local store in the sandbox and no queue on the bridge.
+17. **An idempotency key or a write receipt for conditional writes.** After "no answer from the room" a page cannot resend the same write safely or ask whether it landed, so `map.update` has to report `OUTCOME_UNKNOWN`.
 
 ## Files
 
