@@ -12,7 +12,8 @@ The app may store the item as base64 JSON `{"tag": ..., "value": "<key>"}`; a ba
 Restricted (guest) turns run with `--gemini-dir <tmp>` and never get the owner's key: they stay on the sign-in.
 `AG2_AGY_GEMINI_KEY=0` (or off/false/no) in the connector's environment turns this off. macOS only. The key
 is read with `/usr/bin/security` (bounded), sent only inside the `authenticate` request on agy's stdin, never
-put in agy's argv or environment, and never logged.
+put in agy's argv or environment, and never logged: agy's own stderr is stored through the client's
+redaction, which is given the key before agy is.
 """
 from __future__ import annotations
 
@@ -104,6 +105,10 @@ def authenticate_with_app_key(client, init, timeout, argv, agent_id="", log=lamb
     key = (key_source or gemini_api_key_from_app)(agent_id)
     if not key:
         return False
+    # Before the key leaves this process: whatever agy writes to stderr from here on is stored without it.
+    redact = getattr(client, "redact", None)
+    if callable(redact):
+        redact(key)
     try:
         client.call("authenticate", {"methodId": METHOD_ID, "_meta": {"apiKey": key}}, timeout)
     except Exception as e:  # noqa: BLE001 - the sign-in still works; never fail the turn over the key

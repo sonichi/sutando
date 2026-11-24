@@ -177,11 +177,13 @@ RECORDED = (("ACP_COMMAND", "acp_command", str), ("CWD", "cwd", str),
             ("MCP_PROXY_COMMAND", "mcp_proxy_command", str))
 
 
-def signed_in_problem(args, acp: str) -> str:
-    """'' when the agent answers and is signed in (checked once per install), else why not."""
+def signed_in_problem(args, acp: str, agent_id: str = "") -> str:
+    """'' when the agent answers and is signed in (checked once per install), else why not. `agent_id` is
+    the agent being installed: with it the check also counts a Gemini API key saved for that agent in the
+    app, as `verify` and every turn do, so an agent with a key and no Google sign-in can be installed."""
     if getattr(args, "signed_in", False):
         return ""
-    _said, problem = probe({"ACP_COMMAND": acp})
+    _said, problem = probe({"ACP_COMMAND": acp, "AGENT_ID": agent_id or ""})
     args.signed_in = not problem
     return problem
 
@@ -189,7 +191,8 @@ def signed_in_problem(args, acp: str) -> str:
 def preflight(args) -> str:
     """'' when this host can run the agent, checked before the token is written; else why not."""
     acp, problem = acp_command(args.acp_command)
-    return cb.host_problem(COMMAND) or problem or signed_in_problem(args, acp)
+    # --token-stdin names its agent with --agent; the seat it then makes is checked against that id.
+    return cb.host_problem(COMMAND) or problem or signed_in_problem(args, acp, getattr(args, "agent", None) or "")
 
 
 def install(args) -> int:
@@ -197,10 +200,11 @@ def install(args) -> int:
         return cb.install_token_stdin(args, LOCAL, lambda: preflight(args), install, COMMAND, work=None)
     problem = cb.recorded_install_args(args, LOCAL, RECORDED)
     acp, why = ("", problem) if problem else acp_command(args.acp_command)
-    why = why or signed_in_problem(args, acp)
+    # The agent's identity first: the sign-in check needs it to see a key saved for this agent.
     where, why = ({}, why) if why else resolve_root(args)
     if not why:
         why = cb.agent_arg_problem(getattr(args, "agent", None), where["agent_id"])
+    why = why or signed_in_problem(args, acp, where["agent_id"])
     proxy, proxy_why = mcp_proxy_command(getattr(args, "mcp_proxy_command", None))
     why = why or proxy_why
     cwd = str(Path(args.cwd).expanduser().resolve()) if args.cwd else ""
