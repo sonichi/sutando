@@ -12,8 +12,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-PKG_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PKG_ROOT))
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+isolate_os_environ()
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ag2_sparrow import connect_common as cm  # noqa: E402
 
 claude, codex, agy, openclaw = (importlib.import_module("ag2_sparrow.adapters." + name) for name in (
