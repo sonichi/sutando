@@ -567,6 +567,44 @@ class AwaitSignIn(Base):
         rc, out = self.wait()
         self.assertEqual((rc, out["status"], out["say"], self.launch.calls), (1, "say", rtc.BUSY, []))
         self.assertEqual(json.loads(self.ws.joinpath(*rtc.RUNNING).read_text())["attempt"], "9-other")
+        # Its output goes to a log, so the card it was to switch from is told, and only then is the wait gone.
+        self.assertEqual((out["told"], self.fake.edits()[-1]), ("posted", ("$card2", "Core runtime: " + rtc.BUSY)))
+        self.assertEqual(self.fake.calls[-1][2], f"runtime-card:signin:{self.attempt}:not-switched-edit")
+        self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists())
+
+    def offline_wait(self):
+        ops = []
+
+        def offline(action, arguments, *, operation_id, room_id):
+            ops.append(operation_id)
+            raise ac.CardError("offline")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = rtc.main(["--workspace", str(self.ws), "await-sign-in", "--room", DM, "--runtime", "claude",
+                           "--attempt", self.attempt], core=CORE, popen=self.launch, run=self.claude_run,
+                          execute=offline, codex_read=self.codex_read, restart=self.restart,
+                          sleep=self.clock.sleep, clock=self.clock)
+        return rc, json.loads(out.getvalue()), ops
+
+    def test_a_hand_off_that_did_not_start_and_could_not_be_said_stays_on_record_until_it_is(self):
+        # Another switch is admitted, and the room is unreachable: the refusal is not delivered.
+        self.stopped_after_claiming("switching", switch="7-abc")
+        self.admitted("9-other")
+        rc, out, ops = self.offline_wait()
+        self.assertEqual((rc, out["status"], out["told"], out["kept"]), (1, "say", "failed", "switching"))
+        self.assertEqual(json.loads(self.ws.joinpath(*rtc.WAITING).read_text())["phase"], "switching")
+        # The worker cannot be spawned, and neither the "Switching" edit nor its correction gets through.
+        self.ws.joinpath(*rtc.RUNNING).unlink()
+        self.launch.fail = OSError("no fork")
+        rc, out, ops = self.offline_wait()
+        self.assertEqual((rc, out["status"], out["told"], out["kept"]), (1, "failed", "failed", "switching"))
+        self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists(), "the attempt is released")
+        self.assertEqual(json.loads(self.ws.joinpath(*rtc.WAITING).read_text())["switch"], "7-abc")
+        # The next waiter, with the room back and a worker that starts: the same attempt goes through.
+        self.launch.fail = None
+        rc, out = self.wait()
+        self.assertEqual((rc, out["status"], out["attempt"]), (0, "started", "7-abc"))
+        self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists())
 
     def test_a_switch_whose_worker_cannot_be_started_does_not_leave_the_card_saying_switching(self):
         self.claude_json = {"loggedIn": True}

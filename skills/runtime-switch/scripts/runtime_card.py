@@ -615,8 +615,20 @@ def _await(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, r
                 return _emit({"status": "handed_off", "runtime": args.runtime, "after_sign_in": True})
         out = begin_switch(ws, args.room, args.runtime, runtime(), clock(), event=card_event, core=core,
                            execute=execute, popen=popen, attempt=switch)
+        out["after_sign_in"] = True
+        if out["status"] == "started":
+            finish_wait(ws, mine)
+            return _emit(out)
+        # Not started (another switch under way, or it could not be admitted or launched): this waiter's
+        # output goes to a log, so the card is told, and the claim stays until it has been.
+        if out.get("told") != "posted":
+            out["told"] = _answer(ws, args.room, card_event, "error", "Not switched", out["say"],
+                                  f"runtime-card:signin:{args.attempt}:not-switched", core=core, execute=execute,
+                                  tries=POST_TRIES, sleep=sleep)["status"]
+        if out["told"] != "posted":
+            return _emit(dict(out, kept="switching"), 1)
         finish_wait(ws, mine)
-        return _emit(dict(out, after_sign_in=True), 0 if out["status"] == "started" else 1)
+        return _emit(out, 1)
 
     while True:
         rec = waited()
