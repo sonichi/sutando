@@ -15,7 +15,7 @@ import proxy_retire  # noqa: E402
 import statusline_config as cfg  # noqa: E402
 
 LISTEN_WAIT_S = 8.0
-LOCK_WAIT_S = 8.0
+LOCK_WAIT_S = 25.0  # a retirement holding it runs in a config hook killed after 10 s
 
 
 def listening(runner: Callable = proxy_retire._run) -> bool:
@@ -29,7 +29,11 @@ def main(runner: Callable = proxy_retire._run, wait_s: float = LISTEN_WAIT_S, sl
         if cfg.enabled():
             return 0
         # Held through the port wait, so no retirement boots it out after it reads as ready.
-        with proxy_retire.proxy_lock(LOCK_WAIT_S, sleep):
+        with proxy_retire.proxy_lock(LOCK_WAIT_S, sleep) as held:
+            if not held:
+                print("quota-tracker: credential proxy launch agent: not started (proxy lock not taken); "
+                      "the launcher's port check decides routing", file=sys.stderr)
+                return 0
             said = proxy_retire.ensure_running(cfg.workspace(), runner=runner, install=install)
             if said in ("restored", "started", "installed", "already loaded"):
                 deadline = time.monotonic() + wait_s

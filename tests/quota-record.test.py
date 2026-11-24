@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -768,6 +769,56 @@ class ProxyRetire(Base):
             mod.main(runner=opt_out_runner, wait_s=0.05, sleep=lambda s: None, install=self.no_install)
         self.assertEqual(len(seen), 1)
         self.assertIn("holds the proxy lock", seen[0])
+
+    def _route_mod(self):
+        util = __import__("importlib.util").util
+        spec = util.spec_from_file_location("route_proxy_reverse", SCRIPTS / "route-proxy.py")
+        mod = util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _route(self, mod, run, err):
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false"}), \
+                mock.patch.object(pr.cfg, "workspace", return_value=self.ws), \
+                mock.patch.object(pr, "plist_path", return_value=self._plist()), \
+                mock.patch.object(pr.sys, "platform", "darwin"), mock.patch.object(sys, "stderr", err):
+            return mod.main(runner=run, wait_s=0.05, sleep=time.sleep, install=self.no_install)
+
+    def test_restore_waits_for_a_retirement_holding_the_lock_then_loads_the_job(self):
+        import fcntl
+        import threading
+        mod, run, err = self._route_mod(), FakeRun(loaded=True), io.StringIO()
+        self.intent.parent.mkdir(parents=True, exist_ok=True)
+        held, go = open(pr.lock_path(), "a"), threading.Event()
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+
+        def retirement():  # finishes its bootout while the opt-out waits
+            go.wait(5)
+            time.sleep(0.3)
+            run.loaded = False
+            pr.write_intent("retired")
+            fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+            held.close()
+        t = threading.Thread(target=retirement)
+        t.start()
+        go.set()
+        self._route(mod, run, err)
+        t.join(5)
+        self.assertTrue(run.loaded)
+        self.assertTrue(any(a[:2] == ["launchctl", "bootstrap"] for a in run.calls))
+        self.assertIn("restored", err.getvalue())
+        self.assertEqual(pr.read_intent()["status"], "restored")
+
+    def test_restore_without_the_lock_starts_nothing_and_claims_nothing(self):
+        mod, run, err = self._route_mod(), FakeRun(loaded=False), io.StringIO()
+        self.intent.parent.mkdir(parents=True, exist_ok=True)
+        self.intent.parent.rmdir()
+        self.intent.parent.write_text("not a dir")  # the lock file cannot be opened
+        self._route(mod, run, err)
+        self.assertIn("not started (proxy lock not taken)", err.getvalue())
+        self.assertNotIn("listening", err.getvalue())
+        self.assertEqual(run.calls, [])
+        self.intent.parent.unlink()
 
     def test_tracking_turned_off_after_the_evidence_keeps_it(self):
         def flip():

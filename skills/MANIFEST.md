@@ -247,7 +247,9 @@ skill. The contract:
 `"on_session_route": "scripts/<hook>.py"` (or `.sh`) declares a script run the same way, with no
 arguments, by `apply_skill_session_route` (`session_config_hooks.py --route`) just before the
 launcher decides the session's API routing (`resolve_claude_credential_proxy`), in both launchers.
-The launchers' env-printing probes (`--print-core-env`, `--print-env`) skip it.
+The launchers' env-printing probes (`--print-core-env`, `--print-env`) skip it. A route hook gets
+a longer budget than a config hook (`ROUTE_HOOK_SECONDS`, 40 s; the phase `ROUTE_TOTAL_SECONDS`, 45 s), since it may wait out
+work a config hook holds; it is still killed past that, and the launch continues.
 
 ## Stop handler (`on_stop_requested`)
 

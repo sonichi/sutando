@@ -187,9 +187,14 @@ class SessionConfigHooks(Tmp):
         calls = []
         hooks = [("s", self.d / "s.py")]
         with mock.patch.object(sch, "_discover", side_effect=lambda f, *a: f.extend([*hooks, None])), \
-                mock.patch.object(sch, "run", side_effect=lambda h, c, py, dl: calls.append((h, c))):
+                mock.patch.object(sch, "run", side_effect=lambda h, c, py, dl, hook_seconds=None:
+                                  calls.append((h, c, hook_seconds, round(dl - time.monotonic())))):
             self.assertEqual(sch.main(["--config-dir", str(self.core)]), 0)
-        self.assertEqual(calls, [(hooks, str(self.core))])
+            self.assertEqual(sch.main(["--route"]), 0)
+        self.assertEqual(calls, [(hooks, str(self.core), None, round(sch.TOTAL_SECONDS)),
+                                 (hooks, None, sch.ROUTE_HOOK_SECONDS, round(sch.ROUTE_TOTAL_SECONDS))])
+        # A route hook may wait out a config hook (killed at HOOK_SECONDS) and still bootstrap and wait.
+        self.assertGreater(sch.ROUTE_HOOK_SECONDS, sch.HOOK_SECONDS + 25)
         calls.clear()
         with mock.patch.object(sch, "_discover", side_effect=lambda f, *a: time.sleep(1)), \
                 mock.patch.object(sch, "DISCOVERY_SECONDS", 0.1), \
