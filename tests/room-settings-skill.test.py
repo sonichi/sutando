@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """room-settings: the task id helper and the rules the skill must keep.
 
-The server gates room.agent_policy.set (owner only, the owner's own open task under 10
-minutes old, closed choices, approval for a change that opens access). These pin the
+The server gates room.agent_policy.set (owner only, the owner's own open task picked up
+under 10 minutes ago and under 24 hours old, closed choices, approval for a change that
+opens access, filter-off included). These pin the
 skill's side of each rule, and the helper that names the task id it passes.
 
 Run: python3 tests/room-settings-skill.test.py
@@ -156,12 +157,16 @@ class TestSkillRules(unittest.TestCase):
         back = " ".join(section(self.text, "What comes back").split())
         self.assertIn("**`CONFLICT`** for a stale revision", back)
         self.assertIn("try once more. Any other `CONFLICT`", back)
-        self.assertIn("tell your owner what its message says, and don't try again.", back)
+        self.assertIn("tell your owner what its message says, in plain words, and don't try again.", back)
 
-    def test_filter_off_confirmation_uses_the_new_task(self):
+    def test_filter_off_is_confirmed_on_the_approval_card(self):
         settings = " ".join(section(self.text, "The settings").split())
-        self.assertIn("Your reply ends this task, so send the change with that new message's `task_id`, "
-                      "never the first one's (that is refused as closed).", settings)
+        self.assertIn("s.space holds it for your owner's approval on a card in their DM with you", settings)
+        self.assertIn("Don't ask them to confirm first, in words or with a card of your own", settings)
+        self.assertIn("the card waiting in your DM is where they approve it", settings)
+        for gone in ("room.question.ask", "answered_by", "ask-owner.py", "Choose how to ask",
+                     "ask your owner to confirm before you send the change"):
+            self.assertNotIn(gone, settings)
 
     def test_task_id_is_the_asking_message(self):
         owner = " ".join(section(self.text, "Only your owner").split())
@@ -170,7 +175,7 @@ class TestSkillRules(unittest.TestCase):
 
     def test_refusals_in_plain_words(self):
         tail = " ".join(self.text.rsplit("## What comes back", 1)[1].split())
-        self.assertIn("Tell your owner every refusal in plain words.", tail)
+        self.assertIn("Tell your owner every refusal in plain words, with the one thing they can do next.", tail)
         self.assertIn("Never show them the error codes or reasons", tail)
 
     def test_exit_3_says_this_connection_cannot_yet(self):
@@ -180,28 +185,24 @@ class TestSkillRules(unittest.TestCase):
         self.assertIn("If they already did that and it is refused again, say you can't change your "
                       "settings from here yet", owner)
 
-    def test_confirmation_by_room_question_keeps_the_task_id(self):
-        settings = " ".join(section(self.text, "The settings").split())
-        self.assertIn("never with an `ask-owner.py` card", settings)
-        self.assertIn("Choose how to ask before you ask", settings)
-        self.assertIn("Use `room.question.ask` only when this task's own instructions tell you to ask that way", settings)
-        self.assertIn("Send the change with the same `task_id`, while the task is open and within 10 minutes "
-                      "of their first message", settings)
-        self.assertIn("Otherwise ask in your reply", settings)
-        self.assertIn("send the change with that new message's `task_id`, never the first one's", settings)
-
-    def test_room_question_answer_must_come_from_the_owner(self):
-        settings = " ".join(section(self.text, "The settings").split())
-        self.assertIn("first check that `answered_by` is your owner. If anyone else answered, change nothing "
-                      "and ask your owner to confirm themselves.", settings)
-
-    def test_confirmation_names_the_setting_and_the_room(self):
-        settings = " ".join(section(self.text, "The settings").split())
-        self.assertIn("your question names the secrets check and the room", settings)
-        self.assertIn("Their answer must clearly confirm turning it off in that room: a yes in reply to that "
-                      "question, or a message that names both.", settings)
-        self.assertIn("A bare \"yes\" that answers something else, or that leaves the room unclear, doesn't "
-                      "count: leave the check on and ask again.", settings)
+    def test_every_refusal_names_the_next_step(self):
+        owner = " ".join(section(self.text, "Only your owner").split())
+        back = " ".join(section(self.text, "What comes back").split())
+        self.assertIn("Exit 2 means the task is not your owner's: change nothing, and say only your owner "
+                      "can change how you work here.", owner)
+        self.assertIn("Say they can ask you again in a little while, or change it themselves in the room's "
+                      "settings in the app.", owner)
+        for phrase in ("say only your owner can change how you work here",
+                       "Ask them to send it to you directly: in your DM, as a reply to you, or by mentioning you.",
+                       "Ask them to ask you again.",
+                       "Any other reason (for example `approver_below_level`): change nothing.",
+                       "ask them to open a DM with you and then ask again",
+                       "they approve it on the card in your DM with them",
+                       "your owner first has to make you able to work with a Team",
+                       "If it is refused again, tell your owner you couldn't make the change"):
+            self.assertIn(phrase, back)
+        tail = " ".join(self.text.rsplit("## What comes back", 1)[1].split())
+        self.assertIn("Tell your owner every refusal in plain words, with the one thing they can do next.", tail)
 
     def test_owner_mention_handling_depends_on_the_setting(self):
         settings = " ".join(section(self.text, "The settings").split())
@@ -232,7 +233,9 @@ class TestSkillRules(unittest.TestCase):
         for reason in ("not_owner", "no_task", "no_origin", "task_not_yours",
                        "task_closed", "task_expired"):
             self.assertIn(f"`{reason}`", back)
-        self.assertIn("within 10 minutes", back)
+        self.assertIn("within 10 minutes of when you picked their message up", back)
+        self.assertIn("never more than 24 hours after they sent it", back)
+        self.assertNotIn("10 minutes of their message", back)
 
     def test_closed_choices_only(self):
         settings = section(self.text, "The settings")
@@ -259,13 +262,35 @@ class TestSkillRules(unittest.TestCase):
         self.assertIn("Guests' answers are still scanned", settings)
         self.assertIn("only for messages that arrive after the change", settings)
         self.assertIn("sending to another room or attaching a file outside the task is still refused", settings)
-        self.assertIn("ask your owner to confirm before you send the change", settings)
         self.assertIn("It changes nothing for your owner or Guests,", settings)
 
     def test_listed_people_are_joined_members(self):
         settings = section(self.text, "The settings")
         self.assertIn("people joined to the room", settings)
         self.assertIn("`room.members.list`", settings)
+
+    def test_user_ids_are_copied_from_the_member_list(self):
+        settings = " ".join(section(self.text, "The settings").split())
+        back = " ".join(section(self.text, "What comes back").split())
+        self.assertIn("Copy each id exactly as `room.members.list` gives it, never typed from a name", settings)
+        self.assertIn("A listed user id that is not exactly an id `room.members.list` gave is refused this way",
+                      back)
+
+    def test_mixed_request_is_held_whole(self):
+        change = " ".join(section(self.text, "Change").split())
+        self.assertIn("s.space holds the whole request for approval, the closing ones too.", change)
+        self.assertIn("send them on their own first; then read again and send the ones that open access.",
+                      change)
+
+    def test_owner_not_in_room_holds_nothing(self):
+        back = " ".join(section(self.text, "What comes back").split())
+        self.assertIn("When its message says your owner must join the room first", back)
+        self.assertIn("nothing was held. Ask them to join the room, then ask you again.", back)
+        self.assertLess(back.index("must join the room first"), back.index("Any other reason"))
+
+    def test_filter_off_is_an_approval_required_change(self):
+        back = " ".join(section(self.text, "What comes back").split())
+        self.assertIn("or turning the secrets check off), so your owner must approve it", back)
 
     def test_approval_required_is_waiting_never_done(self):
         back = section(self.text, "What comes back")

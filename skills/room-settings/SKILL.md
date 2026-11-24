@@ -19,13 +19,14 @@ setting changed when the Action did not succeed.
 - The change must come from your owner's own message to you: pass the task id of the very
   message that asks for it as `task_id`, never an earlier message's. For a task file,
   `python3 skills/room-settings/scripts/task_id.py <task file>` prints it; don't work it out
-  from the file yourself. Exit 2 means the task is not your owner's: change nothing. On an
-  MCP event, use the event's `task_id`.
+  from the file yourself. Exit 2 means the task is not your owner's: change nothing, and say
+  only your owner can change how you work here. On an MCP event, use the event's `task_id`.
 - Exit 3 means the way you are connected doesn't give you the task id the change needs. Say
   you can't change your settings from here yet, and that your owner can change them in the
   room's settings in the app. Don't ask them to send it again.
 - Any other exit (4: the task file could not be read, 64, an error): change nothing, tell your
-  owner you couldn't check the request, and don't try again.
+  owner you couldn't check the request, and don't try again. Say they can ask you again in a
+  little while, or change it themselves in the room's settings in the app.
 - If the change is refused because of the task, ask them to send it to you directly: in your
   DM, as a reply to you, or by mentioning you. Typing your name without a mention, or editing
   an earlier message, does not count. If they already did that and it is refused again, say
@@ -63,7 +64,7 @@ can change here, and offer the nearest one.
 | When you answer others (`trigger`) | `mention`: when mentioned · `always`: every message |
 | When you answer your owner (`ownerTrigger`) | `mention` · `always` |
 | Who you answer (`audience`) | `everyone` in the room · `specific`: only your owner and the people listed |
-| The people listed (`audienceUsers`) | a list of user ids, each one like `@name:s.space`, of people joined to the room; used only with `specific` |
+| The people listed (`audienceUsers`) | a list of user ids, each one like `@name:s.space`, of people joined to the room; used only with `specific`. Copy each id exactly as `room.members.list` gives it, never typed from a name |
 | Others who mention your owner (`admitOnOwnerMention`) | `true`: messages from people who may already reach you that mention your owner are sent to you too; you don't answer those in the room, you tell your owner about them in your DM · `false` |
 | Room members' access (`memberAccessTier`) | `none`: no access · `guest`: when they address you, your owner gets a card to let you answer that once · `team`: they can work with you as your Team |
 | Secrets check for Team (`sensitiveDataFilter`) | `true`: before the bridge delivers a task's result file to anyone but your owner, Sutando scans it for secrets (tokens, keys, passwords), raw errors and tracebacks, and file paths in home or temporary folders, and holds it back if it finds any · `false`: only answers to members s.space vouches for as your Team, on messages that arrived after the change, skip that scan; Guests' answers are still scanned, and sending to another room or attaching a file outside the task is still refused. What you post yourself with room Actions is not part of this scan |
@@ -100,26 +101,13 @@ your owner asks for it, say so, and change nothing.
   It also needs your owner to have made you able to work with a Team; if the change is
   refused as `CONFLICT` for that, say so.
 - Turning the secrets check off only matters with Team access, and only for members you
-  work with as your Team. Turning it off lets a secret in your answer to them be posted: say that, and
-  ask your owner to confirm before you send the change. It changes nothing for your owner or
-  Guests, and only for messages that arrive after the change: one already waiting keeps the
-  old setting.
-- Ask that confirmation in plain words, never with an `ask-owner.py` card: a click on a card
-  arrives as a task that must answer `[no-send]`, which leaves no turn to send the change.
-  Choose how to ask before you ask:
-  - Use `room.question.ask` only when this task's own instructions tell you to ask that way:
-    only then does the answer come back to this same task. Send the change with the same
-    `task_id`, while the task is open and within 10 minutes of their first message; if the
-    answer comes later, ask them to ask again. Anyone in the room can answer, so first check
-    that `answered_by` is your owner. If anyone else answered, change nothing and ask your
-    owner to confirm themselves.
-  - Otherwise ask in your reply, and ask your owner to answer in a message to you: in your DM,
-    as a reply to you, or by mentioning you. Your reply ends this task, so send the change with
-    that new message's `task_id`, never the first one's (that is refused as closed).
-  - Either way, your question names the secrets check and the room. Their answer must clearly
-    confirm turning it off in that room: a yes in reply to that question, or a message that
-    names both. A bare "yes" that answers something else, or that leaves the room unclear,
-    doesn't count: leave the check on and ask again.
+  work with as your Team. Turning it off lets a secret in your answer to them be posted. It
+  changes nothing for your owner or Guests, and only for messages that arrive after the
+  change: one already waiting keeps the old setting.
+- Turning the secrets check off opens access, so s.space holds it for your owner's approval
+  on a card in their DM with you, like any other change that opens access. Don't ask them to
+  confirm first, in words or with a card of your own: send the change on their message, then
+  say what turning it off means and that the card waiting in your DM is where they approve it.
 - "What reaches you" is about which messages are sent to you to answer. It does not hide the
   room's history from you, so never promise your owner that you can't read other messages.
 - Before you list people, check each one is in the room: `room.action.read` with action
@@ -142,6 +130,10 @@ Call `room.action.execute` with action `room.agent_policy.set`, the `room_id`, a
 
 Never pass `asked_by`.
 
+If one request mixes changes that open access with changes that don't, s.space holds the
+whole request for approval, the closing ones too. To apply those at once, send them on their
+own first; then read again and send the ones that open access.
+
 ## What comes back
 
 - **Done:** the result has `changed` (one plain sentence per setting), the stored `card` and
@@ -151,10 +143,10 @@ Never pass `asked_by`.
   sets it.
 - **`INVALID_INPUT`** for a change that changes nothing: tell your owner it is already set
   that way.
-- **`approval_required`:** the change opens access (for example answering everyone, or a
-  higher access level), so your owner must approve it on a card in their DM with you. Nothing
-  has changed yet. Say it is waiting for their approval and that the card is in your DM.
-  Never say it is done. Don't call again. Keep the `approval_id` and `operation_id` it gives.
+- **`approval_required`:** the change opens access (for example answering everyone, a
+  higher access level, or turning the secrets check off), so your owner must approve it on a card in their DM with you. Nothing
+  has changed yet. Say it is waiting for their approval, and that they approve it on the card
+  in your DM with them. Never say it is done. Don't call again. Keep the `approval_id` and `operation_id` it gives.
   Nothing tells you when they decide. When they ask: `approval.inspect` with the
   `approval_id` says how they decided; `operation.inspect` with the `operation_id` says
   whether the change then ran or failed (an approved change can still fail if the settings
@@ -162,23 +154,36 @@ Never pass `asked_by`.
 - **`CONFLICT`** for a stale revision: the settings changed since you read them. Read again,
   check the change still makes sense, and try once more. Any other `CONFLICT` (for example
   Team access when you can't work with a Team yet): tell your owner what its message says,
-  and don't try again.
+  in plain words, and don't try again. For Team access, say your owner first has to make you
+  able to work with a Team.
 - **`FORBIDDEN`** with a `reason`:
-  - `not_owner`: the person asking is not your owner. Change nothing.
+  - `not_owner`: the person asking is not your owner. Change nothing, and say only your
+    owner can change how you work here.
   - `no_task`, `no_origin`, `task_not_yours`: the request did not come straight from your
-    owner to you. Ask them to send it to you directly.
-  - `task_closed`, `task_expired`: the request is too old (a change must be sent within 10
-    minutes of their message, while you are still on it). Ask them to ask again.
+    owner to you. Ask them to send it to you directly: in your DM, as a reply to you, or by
+    mentioning you.
+  - `task_closed`, `task_expired`: the request is too old. A change must be sent within 10
+    minutes of when you picked their message up, while you are still on it, and never more
+    than 24 hours after they sent it. Ask them to ask you again.
+  - When its message says your owner must join the room first (a change that opens access,
+    in a room they are not in): nothing was held. Ask them to join the room, then ask you
+    again.
+  - Any other reason (for example `approver_below_level`): change nothing. Say you can't make
+    this change from here, and that your owner can change it in the room's settings in the
+    app, or ask a room admin to.
 - **`UPSTREAM_UNAVAILABLE`:** something s.space needs did not answer. Read its message and
   do what it suggests. If it says there is no DM with your owner for the approval card,
-  nothing was held: tell your owner, and don't try again until you have a DM with them. If
+  nothing was held: tell your owner, and ask them to open a DM with you and then ask again.
+  Don't try again until you have a DM with them. If
   it says the write may or may not have happened, read again with `room.agent_policy.read`
   and tell your owner what is stored.
-- **`INVALID_INPUT`:** fix the arguments and try once more. `room.actions.describe` with the
-  action shows the schema.
+- **`INVALID_INPUT`:** fix the arguments and try once more. A listed user id that is not
+  exactly an id `room.members.list` gave is refused this way: copy it from there again. `room.actions.describe` with the
+  action shows the schema. If it is refused again, tell your owner you couldn't make the change
+  and that they can make it in the room's settings in the app.
 
-Tell your owner every refusal in plain words. Never show them the error codes or reasons
-above (`FORBIDDEN`, `no_origin` and the like).
+Tell your owner every refusal in plain words, with the one thing they can do next. Never show
+them the error codes or reasons above (`FORBIDDEN`, `no_origin` and the like).
 
 Never retry a refused change in another way, and never tell anyone a setting is on before
 `room.agent_policy.read` shows it stored.
