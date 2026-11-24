@@ -14,7 +14,7 @@ questions, and only the first one lives here:
 
 ``src/check-pending-tasks.sh`` answers the first question in shell because a
 Stop hook must run without an interpreter. This module is the Python answer to
-the same question, and ``tests/worker-delivery-matches-the-hook.test.py`` pins
+the same question, and ``tests/skills/worker-pool/worker-delivery-matches-the-hook.test.py`` pins
 the two to the same suffix set so they cannot drift apart silently.
 """
 from __future__ import annotations
