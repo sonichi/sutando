@@ -674,7 +674,7 @@ it is bounded and stripped of format characters, and one that reads as the core 
 too: the card records the worker (`subject.by_worker`) and its title names it, and only that worker's
 lane posts it (`proactive_routing.lane_claims_card`, the gateway's `CARD_CLAIM`), in its own DM, where
 the owner's click comes back to it; its fallback text, and the pointer for a card never posted, go
-through that lane as well. The core's cards stay the primary lane's. A skill writing a proactive file itself still publishes
+through that lane as well. With identities on several servers exactly one of its lanes posts a card (`worker_lane.card_lane`): the one on its room's server, else, for the owner's DM, the one on the primary's server, else the lowest instance. A card whose room no serving lane reaches is refused at the ask (asked as text, the note naming why) and logged undeliverable by the lane. The core's cards stay the primary lane's. A skill writing a proactive file itself still publishes
 the name it gives.
 
 The seat's `s-space` MCP proxy (the desktop app's `ag2-mcp-proxy.mjs`) mints its access token

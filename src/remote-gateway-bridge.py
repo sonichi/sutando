@@ -590,7 +590,28 @@ def _ag2space_card_claim(req) -> bool:
     by_worker = subject.get("by_worker") if isinstance(subject, dict) else None
     if not lane_claims_card(by_worker, _LANE_WORKER, primary=owns_unaddressed()):  # noqa: F821
         return False
-    return not _LANE_WORKER or worker_lane.is_worker_card_lane(GATEWAY_INSTANCE, _LANE_WORKER, WS)  # noqa: F821
+    if not _LANE_WORKER:
+        return True
+    room = getattr(req, "room", "")
+    room = room if isinstance(room, str) else ""
+    if worker_lane.is_worker_card_lane(GATEWAY_INSTANCE, _LANE_WORKER, WS, room):  # noqa: F821
+        return True
+    if worker_lane.card_lane(_LANE_WORKER, room, WS) is None:  # noqa: F821
+        _card_undeliverable(req, room)
+    return False
+
+
+_CARDS_TOLD_UNDELIVERABLE: set = set()
+
+
+def _card_undeliverable(req, room: str) -> None:
+    """A worker's card no lane of it can post (none serves its room's server): said once per card."""
+    rid = str(getattr(req, "id", "") or "")
+    if rid in _CARDS_TOLD_UNDELIVERABLE:
+        return
+    _CARDS_TOLD_UNDELIVERABLE.add(rid)
+    _log(f"ERROR: lane {GATEWAY_INSTANCE}: decision card {rid} of worker {_LANE_WORKER} is undeliverable: "  # noqa: F821
+         f"no serving lane of it reaches {room or 'the owner DM'}")
 
 
 CARD_CLAIM = _ag2space_card_claim

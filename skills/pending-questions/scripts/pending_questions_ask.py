@@ -463,6 +463,12 @@ def card_asker(ws: Path, ask_id: str, dest: Destination, host: str) -> tuple:
     return speaker(ws, name, host), worker, asked_by(ws, name)
 
 
+def card_has_lane(worker: str, room: str, ws: Path) -> bool:
+    """Whether one of `worker`'s serving lanes posts its card bound for `room` (`worker_lane.card_lane`)."""
+    from worker_lane import card_lane, card_lane_unchecked  # noqa: PLC0415
+    return card_lane_unchecked(worker, ws) or card_lane(worker, room, ws) is not None
+
+
 def build_card(ask_id: str, question: str, context: Optional[str], host: str,
                default_action: Optional[str], reason: Optional[str], options,
                link: Optional[str] = None, intro: Optional[str] = None, room: str = "",
@@ -536,6 +542,9 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
     if wants_card(default_action, options) and card_reaches_owner(dest, ws):
         try:
             who, by_worker, agent = card_asker(ws, ask_id, dest, host)
+            if by_worker and not card_has_lane(by_worker, card_room(dest), ws):
+                raise LookupError(f"no serving lane of worker {by_worker} reaches "
+                                  f"{card_room(dest) or 'the owner DM'}, so no lane would post it")
             if by_worker:
                 out["question"]["asked_by"] = agent
             card = build_card(ask_id, question, context, host, default_action, reason, options, link, intro,

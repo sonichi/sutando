@@ -138,10 +138,57 @@ class ActingIdentity(Base):
         self.assertTrue(L.is_worker_card_lane(self.lanes['alpha.example'], W, self.ws))
         self.assertFalse(L.is_worker_card_lane(self.lanes['beta.example'], W, self.ws))
 
+    def test_a_room_addressed_card_is_its_rooms_servers_lane_alone(self):
+        alpha, beta = self.lanes['alpha.example'], self.lanes['beta.example']
+        for room, poster in (('!dm:beta.example', beta), ('!dm:alpha.example', alpha), ('', alpha)):
+            with self.subTest(room=room):
+                self.assertEqual([i for i in (alpha, beta) if L.is_worker_card_lane(i, W, self.ws, room)], [poster])
+
     def test_a_second_agent_is_refused_on_the_same_server_only(self):
         with self.assertRaises(C.WorkerIdentityExists):
             C.require_no_worker_identity(W, 'beta.example', self.ws)
         C.require_no_worker_identity(W, 'gamma.example', self.ws)
+
+
+class NoneOnThePrimary(Base):
+    """Two serving identities, neither on the core's primary server (gamma)."""
+
+    def setUp(self):
+        super().setUp()
+        path = C.record_path(self.ws)
+        data = json.loads(path.read_text())
+        for row in data['connections']:
+            row['primary'] = False
+        data['connections'].append(dict(server='gamma.example', gateway_url='https://gamma.example',
+                                        added_by='owner', added_at='2026-11-01T00:00:00Z', verified=True,
+                                        server_source='identity', instance='gamma-example',
+                                        token_ref=C.token_ref_for('gamma-example'), primary=True,
+                                        agent_mxid='@core:gamma.example'))
+        path.write_text(json.dumps(data))
+        self.both = (self.lanes['alpha.example'], self.lanes['beta.example'])
+
+    def posters(self, room):
+        return [i for i in self.both if L.is_worker_card_lane(i, W, self.ws, room)]
+
+    def test_the_card_is_posted_exactly_once_by_the_lane_its_destination_names(self):
+        self.assertIsNone(L.primary_identity(W, self.ws))
+        self.assertEqual(self.posters('!dm:beta.example'), [self.lanes['beta.example']])
+        self.assertEqual(self.posters('!dm:alpha.example'), [self.lanes['alpha.example']])
+        self.assertEqual(len(self.posters('')), 1, "the owner's DM: one lane, never none")
+        self.assertEqual(L.card_lane(W, '', self.ws)['instance'], min(self.both))
+
+    def test_a_destination_no_lane_reaches_has_no_poster_and_is_refused_at_the_ask(self):
+        import importlib.util
+        self.assertIsNone(L.card_lane(W, '!dm:gamma.example', self.ws))
+        self.assertEqual(self.posters('!dm:gamma.example'), [])
+        spec = importlib.util.spec_from_file_location(
+            'pq_ask', ROOT / 'skills/pending-questions/scripts/pending_questions_ask.py')
+        sys.path.insert(0, str(ROOT / 'skills/pending-questions/scripts'))
+        ask = sys.modules['pq_ask'] = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ask)
+        self.assertFalse(ask.card_has_lane(W, '!dm:gamma.example', self.ws))
+        self.assertTrue(ask.card_has_lane(W, '!dm:beta.example', self.ws))
+        self.assertTrue(ask.card_has_lane(W, '', self.ws))
 
 
 if __name__ == '__main__':

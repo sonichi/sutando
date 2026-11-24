@@ -186,6 +186,35 @@ class TheGatewayHost(unittest.TestCase):
                     with self.subTest(lane=lane, primary=primary, subject=card.subject):
                         self.assertIs(rgb.CARD_CLAIM(card), mine)
 
+    def test_a_workers_card_no_lane_can_reach_is_logged_undeliverable_once(self):
+        import connections as C
+        rgb = self.rgb
+        base = dict(gateway_url="https://x", added_by="owner", added_at="2026-11-01T00:00:00Z", verified=True,
+                    server_source="identity", primary=False)
+        rows = [dict(base, server="gamma.example", instance="gamma", token_ref=C.token_ref_for("gamma"),
+                     primary=True, agent_mxid="@core:gamma.example")]
+        lanes = {}
+        for server in ("alpha.example", "beta.example"):
+            lanes[server] = inst = C.worker_instance_for(server, W)
+            rows.append(dict(base, server=server, instance=inst, token_ref=C.token_ref_for(inst), worker=W,
+                             agent_mxid="@worker:" + server))
+        C.record_path(self.tmp).write_text(json.dumps({"schema_version": C.SCHEMA_VERSION, "connections": rows}))
+        lines = []
+        saved = (rgb._LANE_WORKER, rgb.GATEWAY_INSTANCE)
+        self.addCleanup(lambda: (setattr(rgb, "_LANE_WORKER", saved[0]), setattr(rgb, "GATEWAY_INSTANCE", saved[1])))
+        rgb._LANE_WORKER, rgb._log = W, lines.append
+        to_beta = mock.Mock(subject={"by_worker": W}, room="!dm:beta.example", id="c1")
+        stranded = mock.Mock(subject={"by_worker": W}, room="!dm:gamma.example", id="c2")
+        with mock.patch.object(rgb, "owns_unaddressed", return_value=False):
+            claims = {}
+            for server, inst in lanes.items():
+                rgb.GATEWAY_INSTANCE = inst
+                claims[server] = (rgb.CARD_CLAIM(to_beta), rgb.CARD_CLAIM(stranded), rgb.CARD_CLAIM(stranded))
+        self.assertEqual(claims, {"alpha.example": (False, False, False), "beta.example": (True, False, False)})
+        told = [line for line in lines if "c2" in line]
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("undeliverable", told[0])
+
     def test_the_drain_hands_an_owner_directed_file_to_the_lane_that_names_it_its_own(self):
         rgb = self.rgb
         rgb.OWNS_UNADDRESSED = lambda: False
