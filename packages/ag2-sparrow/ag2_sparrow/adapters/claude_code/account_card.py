@@ -59,8 +59,7 @@ def label(cfg: dict, env=None, run=None) -> str:
         raise RuntimeError("claude auth status gave no answer")
     if not st["signed_in"]:
         return ""
-    who = st["account"] or "an Anthropic account"
-    return "%s (%s)" % (who, st["plan"]) if st["plan"] else who
+    return st["account"] or "an Anthropic account"  # the account only, never "(max)"/"(pro)" (owner 2026-11-24)
 
 
 class AccountCard(account_switch.AccountSwitch):

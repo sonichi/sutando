@@ -430,12 +430,12 @@ class Account(Base):
         cards = [q["card"] for q in self.queued()]
         self.assertEqual(len(cards), 2)
         text = cards[0]["text"]
-        self.assertIn("I'm signed in as s\u2026@example.com (max).", text)
+        self.assertIn("I'm using sarah@example.com.", text)
         self.assertTrue(text.endswith(account_card.account_switch.BELOW), text)
         self.assertNotIn("Settings", text, "never sent elsewhere")
         self.assertEqual(cards[0]["account_controls"], {"runtime": "claude"})
         self.assertFalse(re.search(r"[\u4e00-\u9fff]", json.dumps(cards, ensure_ascii=False)), "English only")
-        self.assertNotIn("sarah@", json.dumps(cards))
+        self.assertNotIn("(max)", json.dumps(cards), "the full email (owner 2026-11-24), never a plan")
         self.assertEqual([b["label"] for b in cards[0]["buttons"]], ["Switch account"])
         argv, config = self.runs[0]
         self.assertEqual(argv[-3:], ["auth", "status", "--json"])
@@ -481,7 +481,12 @@ class Account(Base):
         self.assertEqual(account_card.label(cfg), "an Anthropic account")
         self.assertIn("credential proxy", account_card.label(cfg, env={"ANTHROPIC_BASE_URL": "http://localhost:7846"}))
         self.answer = {"loggedIn": True, "email": "sarah@example.com"}
-        self.assertEqual(account_card.label(cfg), "s\u2026@example.com")
+        self.assertEqual(account_card.label(cfg), "sarah@example.com")
+        for plan in ("max", "pro", "team"):  # owner 2026-11-24: an account card never shows a plan suffix
+            self.answer = {"loggedIn": True, "email": "sarah@example.com", "subscriptionType": plan}
+            self.assertEqual(account_card.label(cfg), "sarah@example.com", plan)
+        self.answer = {"loggedIn": True, "subscriptionType": "max"}
+        self.assertEqual(account_card.label(cfg), "an Anthropic account")
         card = account_card.AccountCard(self.root, cfg, lambda *a: None, print)
         self.answer = {"loggedIn": False}
         self.assertEqual(card.using(), "I'm not signed in.")
@@ -519,7 +524,7 @@ class Marks(Account):
         t = self.task("task-q", "can you switch account?")
         self.assertTrue(inbox.marked(self.root, t, b"  [account-card]  ").startswith(b"[no-send]"))
         card, = [q["card"] for q in self.queued()]
-        self.assertIn("I'm signed in as s\u2026@example.com (max).", card["text"])
+        self.assertIn("I'm using sarah@example.com.", card["text"])
 
     def test_any_other_answer_or_sender_is_staged_as_written(self):
         t = self.task("task-x", "hi")
