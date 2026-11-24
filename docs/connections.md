@@ -594,6 +594,13 @@ answers before the rule above:
   envelope (`task_envelope.verify_text`; unsigned, invalid or unverifiable is refused), the worker to hold
   it (in its own tasks folder, or in `tasks/` with the pool's delivery sentinel naming it) and the
   task to be neither answered nor archived (`task_disposition`); it posts as that agent's core row.
+  A sentinel carries a lease, `{"delivered_at", "ttl_s"}`, written by the router
+  (`WORKER_POOL_DELIVERY_TTL_S`, default 4 h). A lapsed, missing or unreadable lease is logged
+  (`pool_delegation_not_current`) and still allowed. `WORKER_POOL_DELIVERY_EXPIRY=enforce`, which
+  would refuse it, is unavailable: `pool_delivery.ENFORCE_AVAILABLE` is False, so a configured
+  `enforce` reads as `warn` and logs `pool_delegation_enforce_unavailable`. It stays off until a
+  hand-back or renewal path lands, because a refused reply leaves the task in neither lane (the
+  review gap raised on #6760).
   A mismatch is refused, never answered as another identity;
 - a post with no task is the worker's own: its row on the room's server, with the token its vault
   key holds and its `agent_mxid`; with no room or a domainless one, its only enabled row. A core
@@ -647,9 +654,11 @@ the question records that agent (`asked_by`, the row's `Asked by`, via
 `connections.proactive_author_agent`). Its text names that worker, not the core
 (`connections.proactive_author_phrase`: "<name> (a worker on <host>)", with the agent's display
 name, else the worker's roster label; else just "a worker on <host>". The name never stands alone;
-it is bounded and stripped of format characters, and one that reads as the core is dropped). A decision card stays the core's: only a core lane issues
-and verifies cards, so a question asked by card records no asker, and its fallback text, if the
-card cannot be stored, is the core's too. A skill writing a proactive file itself still publishes
+it is bounded and stripped of format characters, and one that reads as the core is dropped). A decision card it asks is its own
+too: the card records the worker (`subject.by_worker`) and its title names it, and only that worker's
+lane posts it (`proactive_routing.lane_claims_card`, the gateway's `CARD_CLAIM`), in its own DM, where
+the owner's click comes back to it; its fallback text, and the pointer for a card never posted, go
+through that lane as well. The core's cards stay the primary lane's. A skill writing a proactive file itself still publishes
 the name it gives.
 
 The seat's `s-space` MCP proxy (the desktop app's `ag2-mcp-proxy.mjs`) mints its access token

@@ -11,7 +11,7 @@ pure: it folds the records other modules already keep into one small dict.
     state/core-supervisor.json           core-input-watch.py (the monitor)
     state/core-limit-hold.json           core_limit_hold.py
     state/supervisor-status.json         the desktop's backend supervisor
-    state/quota-state.json               the credential proxy
+    state/quota-state.json               the credential proxy (only a record of the core's account)
     the pane's abnormal text             cli_wedge.frame_abnormal
     state/session-starts.log             the core launchers (restarts in the last 10 min)
     state/core-revive.json               the desktop app's core revive loop (it gave up), bound to its app session
@@ -104,7 +104,6 @@ _LOGIN_KINDS = frozenset({"login"})
 # The provider's own words for an exhausted prepaid balance, as opposed to a plan's usage window.
 _CREDIT_TEXT = re.compile(r"\bout of (?:usage )?credits?\b|\bcredit balance\b|\binsufficient[_ ](?:credits?|quota)\b"
                           r"|\bbilling\b", re.I)
-_HEX = re.compile(r"^[0-9a-f]{6,64}$")
 #: The documented shape of each identifier the record carries; a value of any other shape is dropped.
 MODEL_NAMES = ("opus", "sonnet", "haiku", "fable", "default")
 _SHAPES = {"incident": re.compile(r"inc_[0-9a-f]{8}"), "account": re.compile(r"acct_[0-9a-f]{6}"),
@@ -208,8 +207,12 @@ def _family(model: Optional[str]) -> Optional[str]:
 
 
 def _account(hold: Optional[dict]) -> Optional[str]:
-    acct = hold.get("account") if isinstance(hold, dict) else None
-    return f"acct_{acct[:6]}" if isinstance(acct, str) and _HEX.fullmatch(acct) else None
+    return account_label(hold.get("account") if isinstance(hold, dict) else None)
+
+
+def account_label(digest: Any) -> Optional[str]:
+    """The `acct_` label a client may see for an account digest, else None."""
+    return qa.account_label(digest)
 
 
 def _wedge_names(wedge: Any) -> tuple:
@@ -218,10 +221,7 @@ def _wedge_names(wedge: Any) -> tuple:
 
 
 def _quota_says_credits(quota: Any, now: float) -> bool:
-    ledger = quota.get("recent_rejections") if isinstance(quota, dict) else None
-    for rej in ledger if isinstance(ledger, list) else []:
-        if not isinstance(rej, dict):
-            continue
+    for rej in qa.record_rejections(quota):
         at = qa._parse_when(rej.get("ts"))
         if isinstance(at, (int, float)) and 0 <= now - at <= QUOTA_EVIDENCE_WINDOW_S \
                 and _CREDIT_TEXT.search(str(rej.get("snippet") or "")):
@@ -493,9 +493,14 @@ def codex_tail(pane: str) -> str:
 
 def recorded_runtime(workspace: Path) -> Optional[str]:
     """The runtime the launcher last confirmed (state/core-runtime.json), for a session that is gone."""
+    rec = recorded_launch(workspace)
+    return rec["runtime"] if rec else None
+
+
+def recorded_launch(workspace: Path) -> Optional[dict]:
+    """state/core-runtime.json when it names a runtime, else None."""
     rec = _read_json(status_read_path("core-runtime.json", Path(workspace)))
-    value = rec.get("runtime") if rec else None
-    return value if value in RUNTIMES else None
+    return rec if rec and rec.get("runtime") in RUNTIMES else None
 
 
 #: The supervisor rewrites its heartbeat every few seconds; an older one means its app is gone.
@@ -548,12 +553,12 @@ def gather(workspace: Path, supervisor: Optional[dict], *, now: float, runtime: 
     """The record for this tick, from the files the other modules keep. Read-only."""
     workspace = Path(workspace)
     runtime = runtime if runtime in RUNTIMES else recorded_runtime(workspace)
-    model = None
+    model = account = None
     if runtime != "codex":
         try:
-            model = core_limit_hold.launch_identity(workspace)[0]
+            model, account = core_limit_hold.launch_identity(workspace)
         except Exception:  # noqa: BLE001 -- an unreadable identity is an unknown model, not a failure
-            model = None
+            model = account = None
     if pane and runtime == "codex":
         pane = codex_tail(pane)
     hold = core_limit_hold.read_hold(workspace)
@@ -562,7 +567,7 @@ def gather(workspace: Path, supervisor: Optional[dict], *, now: float, runtime: 
     return derive(
         supervisor, hold,
         _read_json(status_read_path("supervisor-status.json", workspace)),
-        _read_json(status_read_path("quota-state.json", workspace)),
+        qa.record_for_account(qa.trusted_record(_read_json(status_read_path("quota-state.json", workspace))), account),
         cli_wedge.frame_abnormal(pane) if pane else None,
         now=now, prev=read(workspace, now), runtime=runtime, model=model,
         waiting_tasks=core_gate_notice.queued_count(workspace),

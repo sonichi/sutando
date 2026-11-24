@@ -352,7 +352,7 @@ class EveryRefusalNamesItsReason(TaskCase):
 
     def test_a_holder_that_cannot_be_read(self):
         core = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
-        with mock.patch("pool_holder.pool_holder", side_effect=PermissionError("deliveries")):
+        with mock.patch("pool_holder.pool_delegation", side_effect=PermissionError("deliveries")):
             self.assertIn("cannot be read", self.refused(ROOM, core))
 
     def test_paths_that_cannot_be_compared_are_not_the_same_file(self):
@@ -368,6 +368,108 @@ class EveryRefusalNamesItsReason(TaskCase):
                 contextlib.redirect_stdout(io.StringIO()):
             room_ops._run(["say", ROOM, "hi", "--task-file", str(core)])
         self.assertEqual(seen, [str(core)])
+
+
+class TheDelegationMustBeCurrent(TaskCase):
+    """A delivery sentinel's lease bounds how long the worker may answer a still-pending task as the core."""
+
+    MODE = "WORKER_POOL_DELIVERY_EXPIRY"
+
+    def setUp(self):
+        super().setUp()
+        scripts = str(ROOT / "skills" / "worker-pool" / "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import pool_delivery
+        # Enforce is gated off in the product; these tests exercise the refusal it will turn on.
+        gate = mock.patch.object(pool_delivery, "ENFORCE_AVAILABLE", True)
+        gate.start()
+        self.addCleanup(gate.stop)
+
+    def leased(self, tid, delivered_at, ttl_s=3600):
+        scripts = str(ROOT / "skills" / "worker-pool" / "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import pool_delivery as pd
+        path = write_task(self.ws, tid, ROOM, CORE_AGENT)
+        self.deliver(tid)
+        (self.ws / "deliveries" / W / f"{tid}.txt").write_bytes(pd.lease_body(delivered_at, ttl_s))
+        return path
+
+    def answer(self, task, mode, now):
+        import task_disposition as td
+        self.assertEqual(td.task_disposition(self.ws, task.stem), td.PENDING)
+        with mock.patch.dict("os.environ", {self.MODE: mode}), mock.patch("time.time", return_value=now), \
+                self.assertLogs("connections", "WARNING") as logs:
+            try:
+                got = self.via(ROOM, SEAT, task)
+            except C.NoConnectionForRoom as e:
+                got = e
+        events = [json.loads(m.split(" not current ", 1)[1]) for m in logs.output if "not current" in m]
+        return got, events
+
+    def test_the_same_delegation_is_allowed_before_expiry_and_refused_after_in_enforce(self):
+        task = self.leased("task-abc123", 1_000_000.0)
+        with mock.patch.dict("os.environ", {self.MODE: "enforce"}), mock.patch("time.time", return_value=1_000_060.0):
+            self.assertEqual(self.via(ROOM, SEAT, task), "alpha")
+        got, events = self.answer(task, "enforce", 1_003_601.0)
+        self.assertIsInstance(got, C.NoConnectionForRoom)
+        self.assertIn("delegation to this worker is not current (expired", str(got))
+        self.assertEqual([(e["verdict"], e["mode"], e["allowed"]) for e in events], [("expired", "enforce", False)])
+
+    def test_warn_mode_allows_an_expired_delegation_and_logs_it(self):
+        task = self.leased("task-abc123", 1_000_000.0)
+        got, events = self.answer(task, "warn", 1_003_601.0)
+        self.assertEqual(got, "alpha")
+        self.assertEqual([(e["event"], e["task_id"], e["worker"], e["verdict"], e["allowed"]) for e in events],
+                         [("pool_delegation_not_current", "task-abc123", W, "expired", True)])
+
+    def test_a_legacy_empty_sentinel_is_allowed_with_a_warning_and_refused_in_enforce(self):
+        task = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+        self.deliver("task-abc123")
+        got, events = self.answer(task, "warn", 1_000_000.0)
+        self.assertEqual((got, [e["verdict"] for e in events]), ("alpha", ["legacy"]))
+        got, events = self.answer(task, "enforce", 1_000_000.0)
+        self.assertIsInstance(got, C.NoConnectionForRoom)
+        self.assertEqual([e["verdict"] for e in events], ["legacy"])
+
+    def test_an_unreadable_lease_is_not_current(self):
+        task = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+        self.deliver("task-abc123")
+        (self.ws / "deliveries" / W / "task-abc123.txt").write_text("{not json")
+        got, events = self.answer(task, "enforce", 1_000_000.0)
+        self.assertIsInstance(got, C.NoConnectionForRoom)
+        self.assertEqual([e["verdict"] for e in events], ["unreadable"])
+
+    def test_a_lease_no_parser_can_trust_is_logged_in_warn_and_refused_in_enforce(self):
+        huge = "1" + "0" * 400
+        for body in ('{"delivered_at": Infinity, "ttl_s": 3600}', '{"delivered_at": 1000000, "ttl_s": NaN}',
+                     '{"delivered_at": 1000000, "ttl_s": 1e400}', '{"delivered_at": %s, "ttl_s": 3600}' % huge,
+                     '{"delivered_at": 1000000, "ttl_s": -5}', '{"delivered_at": "1000000", "ttl_s": true}'):
+            with self.subTest(body=body[:60]):
+                task = write_task(self.ws, "task-abc123", ROOM, CORE_AGENT)
+                self.deliver("task-abc123")
+                (self.ws / "deliveries" / W / "task-abc123.txt").write_text(body)
+                got, events = self.answer(task, "warn", 1_000_100.0)
+                self.assertEqual((got, [e["verdict"] for e in events]), ("alpha", ["unreadable"]))
+                got, events = self.answer(task, "enforce", 1_000_100.0)
+                self.assertIsInstance(got, C.NoConnectionForRoom)
+                self.assertEqual([e["verdict"] for e in events], ["unreadable"])
+
+    def test_without_the_gate_enforce_still_allows_and_says_why(self):
+        import pool_delivery
+        task = self.leased("task-abc123", 1_000_000.0)
+        with mock.patch.object(pool_delivery, "ENFORCE_AVAILABLE", False), \
+                self.assertLogs("pool_delivery", "WARNING") as gate:
+            got, events = self.answer(task, "enforce", 1_003_601.0)
+        self.assertEqual(got, "alpha")
+        self.assertEqual([(e["verdict"], e["mode"], e["allowed"]) for e in events], [("expired", "warn", True)])
+        self.assertIn("pool_delegation_enforce_unavailable", gate.output[0])
+
+    def test_the_mode_defaults_to_warn(self):
+        task = self.leased("task-abc123", 1_000_000.0)
+        with mock.patch("time.time", return_value=1_003_601.0), self.assertLogs("connections", "WARNING"):
+            self.assertEqual(self.via(ROOM, SEAT, task), "alpha")
 
 
 class TheCoresOwnerDM(Base):
