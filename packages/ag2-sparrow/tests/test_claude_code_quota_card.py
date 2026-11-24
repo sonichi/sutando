@@ -326,7 +326,9 @@ class LimitMenu(NoticeBase):
             self.assertEqual(q["card"]["id"], account_switch.CARD)
             self.assertEqual(q["card"][account_switch.CONTROLS], {"runtime": "claude"}, "the switch dropdown")
             self.assertTrue(self.text_of(q).startswith(
-                "s…@example.com (Claude Code) has hit its usage limit; resets Nov 28, 1pm."), self.text_of(q))
+                "s…@example.com (Claude Code) has hit its usage limit; resets Nov 28, 1pm. I can't answer until "
+                "then: switch to another account below to go on now."), self.text_of(q))
+            self.assertNotIn("or an API key to go on", self.text_of(q), "Claude Code is not offered an API key")
             self.assertNotIn("usage credits", self.text_of(q))
         self.assertEqual(quota_card.room(self.root), DM)
         # The messages stay queued for the session once the account is switched: none was answered here.

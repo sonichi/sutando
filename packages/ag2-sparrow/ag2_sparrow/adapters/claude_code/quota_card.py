@@ -127,7 +127,7 @@ def words(limited: list, text: str, using: str, who: str = "") -> str:
     what = "is out of credits" if "out-of-credits" in limited else "has hit its usage limit"
     when = reset_words(text) or "it does not say when that resets"
     lead = "%s (%s)" % (who, account_card.NAME) if who else account_card.NAME
-    return "%s %s; %s. I can't answer until then: switch to another account or an API key to go on now.%s" % (
+    return "%s %s; %s. I can't answer until then: switch to another account below to go on now.%s" % (
         lead, what, when, "" if who else " " + using)
 
 
