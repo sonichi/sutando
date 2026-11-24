@@ -1,8 +1,14 @@
 #!/bin/bash
 # Called only after the adapter confirms its named core is present.
 record_confirmed_core_runtime() {
-  local runtime="$1" py="$2" ws started
+  # The lock goes last, on every path: whoever was waiting for it then reads what was published here,
+  # the selection and the confirmed core, and never the state from before this launch.
+  publish_confirmed_core_runtime "$@"
   release_restart_lock_of_this_launch
+}
+
+publish_confirmed_core_runtime() {
+  local runtime="$1" py="$2" ws started
   persist_confirmed_desktop_selection "$runtime"
   [ -z "${SUTANDO_INSTANCE_ID:-}" ] || return 0
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0

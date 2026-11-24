@@ -33,6 +33,40 @@ record_confirmed_core_runtime codex "" 2>/dev/null
 rm -rf "$LOCK"; GR_RID=rid-9
 release_restart_lock_of_this_launch && ok "5 no lock at all is not an error" || fail "5 failed with no lock"
 
+# Order: the selection and the confirmed-core record are both published while the lock is still held,
+# so a switch waiting on the lock reads this launch's result, not the state before it.
+SEEN="$T/seen"; : > "$SEEN"
+cat > "$REPO/scripts/sutando-config.sh" <<CFG
+#!/bin/bash
+case "\$1" in
+  workspace) echo "$WS" ;;
+  desktop-runtime-select) [ -d "$LOCK" ] && echo "selection:held" >> "$SEEN" || echo "selection:released" >> "$SEEN"; echo updated ;;
+esac
+CFG
+cat > "$T/py" <<PYSTUB
+#!/bin/bash
+[ -d "$LOCK" ] && echo "record:held" >> "$SEEN" || echo "record:released" >> "$SEEN"
+exit \${PY_RC:-0}
+PYSTUB
+chmod +x "$T/py"
+tmux() { echo 1700000000; }
+TMUX_SOCKET="$T/sock"; SESSION=sutando-core
+hold rid-7; GR_RID=rid-7; SUTANDO_DESKTOP_RUNTIME_SELECT=claude
+record_confirmed_core_runtime claude "$T/py" 2>/dev/null
+[ "$(tr '\n' ' ' < "$SEEN")" = "selection:held record:held " ] && [ ! -e "$LOCK" ] \
+  && ok "7 the selection and the record are published before the lock is released" || fail "7 order was: $(tr '\n' ' ' < "$SEEN")"
+
+# A record that could not be written still ends the restart: the lock is released, after the attempt.
+: > "$SEEN"; hold rid-8; GR_RID=rid-8
+PY_RC=1 record_confirmed_core_runtime claude "$T/py" 2>/dev/null
+[ "$(cat "$SEEN")" = "record:held" ] && [ ! -e "$LOCK" ] && ok "8 a failed record is attempted first, then the lock goes" || fail "8 $(cat "$SEEN")"
+
+# No session creation time: nothing is recorded, and the lock still goes last.
+tmux() { echo ""; }
+: > "$SEEN"; hold rid-9; GR_RID=rid-9
+record_confirmed_core_runtime claude "$T/py" 2>/dev/null
+[ ! -s "$SEEN" ] && [ ! -e "$LOCK" ] && ok "9 an early return still releases the lock" || fail "9"
+
 printf '#!/bin/bash\nexit 1\n' > "$REPO/scripts/sutando-config.sh"
 hold rid-5; GR_RID=rid-5
 release_restart_lock_of_this_launch && [ -d "$LOCK" ] && ok "6 no workspace: nothing removed, nothing fails" || fail "6"
