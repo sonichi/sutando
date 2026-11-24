@@ -85,6 +85,7 @@ CONFIRM_TIMEOUT_S, CONFIRM_POLL_S = 180, 5
 # A restart put off because another one holds graceful-restart.sh's lock: the switch waits for that
 # lock to go, this long at most, and then asks once more.
 RESTART_LOCK = ("state", "locks", "graceful-restart.lock")
+RESTART_RESULT = ("state", "graceful-restart-result.json")     # the launcher's, written before its lock goes
 DEFERRED = 4
 DEFER_WAIT_S, DEFER_POLL_S = 600, 10
 RUNNING_STALE_S = 2 * RESTART_TIMEOUT_S + DEFER_WAIT_S + CONFIRM_TIMEOUT_S + 600
@@ -651,16 +652,33 @@ def restart_core(rt: str, run=subprocess.run) -> int:
         return 127
 
 
-def restart_lock_clears(ws: Path, *, sleep=time.sleep, clock=time.time) -> bool:
+def restart_lock_clears(ws: Path, *, sleep=time.sleep, clock=time.time) -> Optional[str]:
     """Wait until graceful-restart.sh's lock is gone (the other restart ended), DEFER_WAIT_S at most.
-    True when it is gone; False when it is still held at the end, and then nothing is asked again."""
+    The id of the restart that held it ("" when it was gone before it could be read); None when it is
+    still held at the end, and then nothing is asked again."""
     lock = ws.joinpath(*RESTART_LOCK)
-    deadline = clock() + DEFER_WAIT_S
+    deadline, rid = clock() + DEFER_WAIT_S, ""
     while lock.exists():
+        try:
+            rid = lock.joinpath("rid").read_text(encoding="utf-8").strip() or rid
+        except OSError:
+            pass
         if clock() >= deadline:
-            return False
+            return None
         sleep(DEFER_POLL_S)
-    return True
+    return rid
+
+
+def restart_left(ws: Path, rid: str, since: float) -> str:
+    """What the restart that was in the way came to, from the result its launcher leaves under its id:
+    the runtime it confirmed and published, or "" for anything less (no result, another restart's, a
+    publication that failed). With no id read off the lock, only a result left since `since` is its."""
+    res = _read_json(ws.joinpath(*RESTART_RESULT))
+    at = res.get("at")
+    mine = res.get("rid") == rid if rid else (isinstance(at, (int, float)) and not isinstance(at, bool) and at >= int(since))
+    if not mine or res.get("published") is not True or res.get("runtime") not in NAMES:
+        return ""
+    return str(res["runtime"])
 
 
 def check(ws: Path, rt: str, since: float) -> dict:
@@ -737,13 +755,14 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
                         f"Waiting for another restart to finish, then I'll switch to {name(args.runtime)}. "
                         f"The core is still on {name(was)}.",
                         f"runtime-card:{args.attempt}:waiting", core=core, execute=execute)
-                if restart_lock_clears(ws, sleep=sleep, clock=clock):
-                    # What the restart that was in the way left, by the record its launcher publishes before
-                    # it lets the lock go. No time bound: its session may be older than this request.
-                    now_on = confirmed_record(ws)
-                    if now_on.get("runtime") == args.runtime:
+                held_by = restart_lock_clears(ws, sleep=sleep, clock=clock)
+                if held_by is not None:
+                    # Only what that very restart published counts: an older record says nothing about
+                    # the core it left, and one it could not publish is not known either.
+                    left, now_on = restart_left(ws, held_by, started), confirmed_record(ws)
+                    if left == args.runtime and now_on.get("runtime") == args.runtime:
                         rc, started = 0, float(now_on["started_at"])    # already there: nothing to restart
-                    elif now_on:
+                    elif left and left != args.runtime:
                         was, started = configured_runtime(), clock()    # confirmed on another runtime
                         rc = restart(args.runtime)
                     else:

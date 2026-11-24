@@ -615,6 +615,8 @@ class Switch(Base):
 
     def test_a_restart_that_did_not_happen_says_still_on_the_old_runtime(self):
         self.record("codex", T0 - 500)
+        self.ws.joinpath(*rtc.RESTART_RESULT).write_text(json.dumps(
+            {"rid": "grp-9-9", "runtime": "codex", "published": True, "at": T0 + 10 ** 6}))
         for code in rtc.NOT_RESTARTED:
             with self.subTest(rc=code):
                 self.restart_rc = code
@@ -627,10 +629,24 @@ class Switch(Base):
     def carded(self):
         return self.run_(["switch", "--room", DM, "--runtime", "claude", "--attempt", self.attempt, "--card", "$card1"])
 
-    def test_a_restart_put_off_waits_for_the_other_restart_then_switches_on_the_same_card(self):
+    def held(self, rid="grp-1-77"):
+        """Another restart holds graceful-restart.sh's lock, under its id."""
         lock = self.ws.joinpath(*rtc.RESTART_LOCK)
-        lock.mkdir(parents=True)
-        self.record("codex", T0 - 500)          # what the restart in the way leaves: still Codex
+        lock.mkdir(parents=True, exist_ok=True)
+        lock.joinpath("rid").write_text(rid)
+        return lock
+
+    def ends(self, lock, runtime, published=True, rid="grp-1-77", record=None):
+        """That restart's launcher: the record (when it can publish), its result under its id, then the lock goes."""
+        if published:
+            self.record(runtime, T0 - 60 if record is None else record)     # its session predates this card's request
+        self.ws.joinpath(*rtc.RESTART_RESULT).write_text(json.dumps(
+            {"rid": rid, "runtime": runtime, "published": published, "at": int(self.clock.t)}))
+        lock.joinpath("rid").unlink(missing_ok=True)
+        lock.rmdir()
+
+    def test_a_restart_put_off_waits_for_the_other_restart_then_switches_on_the_same_card(self):
+        lock = self.held()
         self.restart_rc = rtc.DEFERRED
         polls, real, first = [], self.clock.sleep, self.restart
 
@@ -644,7 +660,7 @@ class Switch(Base):
             polls.append(s)
             real(s)
             if len(polls) == 3:
-                lock.rmdir()                # the other restart ended
+                self.ends(lock, "codex")    # the other restart ended: the core is confirmed on Codex still
         self.clock.sleep = sleep
         rc, out = self.carded()
         self.assertEqual((rc, out["outcome"], out["event_id"]), (0, "done", "$card1"))
@@ -657,8 +673,7 @@ class Switch(Base):
         self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists())
 
     def test_the_other_restart_already_made_the_switch_so_nothing_is_restarted_again(self):
-        lock = self.ws.joinpath(*rtc.RESTART_LOCK)
-        lock.mkdir(parents=True)
+        lock = self.held()
         self.restart_rc = rtc.DEFERRED
         real = self.clock.sleep
 
@@ -666,10 +681,8 @@ class Switch(Base):
             real(s)
             if lock.exists():
                 # The restart that was in the way was itself a switch to Claude Code (the desktop's, say).
-                # Its session was created before this card's request; it published and let go only now.
-                self.record("claude", T0 - 60)
                 self.current = self.selected = "claude"
-                lock.rmdir()
+                self.ends(lock, "claude")
         self.clock.sleep = sleep
         rc, out = self.carded()
         self.assertEqual((rc, out["outcome"], out["restart"], out["rc"]), (0, "done", "requested", 0))
@@ -678,17 +691,39 @@ class Switch(Base):
         self.assertIn("Waiting for another restart to finish", said[-2])
         self.assertIn("Switched. The core is now running on Claude Code", said[-1])
 
-    def test_with_no_readable_record_after_the_other_restart_nothing_is_restarted_and_the_card_says_so(self):
-        for left in (None, "{not json", json.dumps({"runtime": "claude"})):     # none, unreadable, incomplete
-            with self.subTest(left=left):
+    def test_what_the_other_restart_did_not_publish_is_not_known_and_nothing_is_restarted_blindly(self):
+        def claude_came_up_unpublished(lock):
+            self.ends(lock, "claude", published=False)      # Claude started; the record still says Codex
+
+        def stale_target_record(lock):
+            self.record("claude", T0 - 9000)                # an old record names the target; no result at all
+            lock.joinpath("rid").unlink()
+            lock.rmdir()
+
+        def another_restarts_result(lock):
+            self.ends(lock, "codex", rid="grp-0-11")        # a result, but not of the restart that held the lock
+
+        def unreadable(lock):
+            self.ws.joinpath(*rtc.RECORD).write_text("{not json")
+            self.ws.joinpath(*rtc.RESTART_RESULT).write_text("{not json")
+            lock.joinpath("rid").unlink()
+            lock.rmdir()
+
+        for leaves in (claude_came_up_unpublished, stale_target_record, another_restarts_result, unreadable):
+            with self.subTest(leaves=leaves.__name__):
                 self.restarts.clear()
+                self.ws.joinpath(*rtc.RESTART_RESULT).unlink(missing_ok=True)
+                self.record("codex", T0 - 500)              # a valid record from before, left unchanged
                 self.restart_rc = rtc.DEFERRED
-                record = self.ws.joinpath(*rtc.RECORD)
-                record.unlink(missing_ok=True)
-                if left is not None:
-                    record.parent.mkdir(parents=True, exist_ok=True)
-                    record.write_text(left)
+                lock, real = self.held(), self.clock.sleep
+
+                def sleep(s, lock=lock, leaves=leaves, real=real):
+                    real(s)
+                    if lock.exists():
+                        leaves(lock)
+                self.clock.sleep = sleep
                 rc, out = self.carded()
+                self.clock.sleep = real
                 self.assertEqual((rc, out["outcome"], out["restart"], out["why"]), (1, "error", "not-restarted", "inconclusive"))
                 self.assertEqual(self.restarts, ["claude"], "not restarted blindly")
                 self.assertIn("I could not read which runtime the core is on now, so I did not restart it again", out["say"])
@@ -698,8 +733,7 @@ class Switch(Base):
                     {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": 1e12}))
 
     def test_a_restart_still_in_the_way_after_the_wait_is_not_asked_again_and_the_card_says_so(self):
-        lock = self.ws.joinpath(*rtc.RESTART_LOCK)
-        lock.mkdir(parents=True)
+        self.held()
         self.restart_rc = rtc.DEFERRED
         began = self.clock.t
         rc, out = self.carded()
@@ -710,16 +744,27 @@ class Switch(Base):
         self.assertIn("The core is still on Codex. Ask me for the runtime card to try again.", out["say"])
         self.assertEqual(self.fake.edits()[-1], ("$card1", "Core runtime: " + out["say"]))
         self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists(), "the attempt is released: she can tap again")
-        # Put off twice with the lock gone both times (a lost lease): asked once more, then the same words.
-        lock.rmdir()
+        self.assertGreater(rtc.RUNNING_STALE_S, 2 * rtc.RESTART_TIMEOUT_S + rtc.DEFER_WAIT_S)
+
+    def test_a_lock_gone_before_it_could_be_read_is_tied_by_a_result_left_since_this_switch_began(self):
+        # Put off, and the other restart ended before its lock was looked at: no id was read. Its result,
+        # left after this switch began, says Codex: asked once more; put off again: the same card says so.
+        self.restart_rc = rtc.DEFERRED
         self.record("codex", T0 - 500)
-        self.restarts.clear()
-        self.ws.joinpath(*rtc.RUNNING).write_text(json.dumps(
-            {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": 1e12}))
+        self.ws.joinpath(*rtc.RESTART_RESULT).parent.mkdir(parents=True, exist_ok=True)
+        self.ws.joinpath(*rtc.RESTART_RESULT).write_text(json.dumps(
+            {"rid": "grp-9-9", "runtime": "codex", "published": True, "at": int(self.clock.t) + 5}))
         rc, out = self.carded()
         self.assertEqual((self.restarts, out["rc"]), (["claude", "claude"], rtc.DEFERRED))
         self.assertIn("Still busy", out["say"])
-        self.assertGreater(rtc.RUNNING_STALE_S, 2 * rtc.RESTART_TIMEOUT_S + rtc.DEFER_WAIT_S)
+        # The same result from before this switch began is not that restart's: nothing is asked again.
+        self.restarts.clear()
+        self.ws.joinpath(*rtc.RESTART_RESULT).write_text(json.dumps(
+            {"rid": "grp-9-9", "runtime": "codex", "published": True, "at": int(self.clock.t) - 5000}))
+        self.ws.joinpath(*rtc.RUNNING).write_text(json.dumps(
+            {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": 1e12}))
+        rc, out = self.carded()
+        self.assertEqual((self.restarts, out["why"]), (["claude"], "inconclusive"))
 
     def test_an_unclean_restart_still_confirms_what_it_can(self):
         self.restart_rc, self.launcher_confirms, self.launcher_selects = 1, False, False
