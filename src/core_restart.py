@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -84,6 +85,11 @@ DEADLINE_MARGIN_S = 20
 REASON_DEADLINE, REASON_CANCELLED = "deadline", "cancelled"
 #: The longest one audit line waits for the audit lock; a line that waits longer is reported, not written.
 AUDIT_LOCK_WAIT_S = 5
+#: The recorder's stderr line for an audit line it could not write, and how many a caller relays.
+AUDIT_DIAGNOSTIC = re.compile(r"core_restart: audit (?:intent|outcome) line not written \(attempt att_[0-9a-f]{12}\)")
+MAX_AUDIT_DIAGNOSTICS = 4
+#: The launchers' restart trace under the workspace's logs/, where a relayed diagnostic is kept.
+RESTART_TRACE = "restart-attempts.log"
 CANCEL_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 
 
@@ -191,6 +197,33 @@ def _audit(workspace: Path, entry: Dict, err=None, wait_s: float = AUDIT_LOCK_WA
         print(f"core_restart: audit {entry.get('phase')} line not written (attempt {entry.get('attempt')})",
               file=err or sys.stderr)
     return written
+
+
+def audit_diagnostics(stderr) -> List[str]:
+    """The recorder's audit-failure lines in a captured stderr, at most MAX_AUDIT_DIAGNOSTICS;
+    anything else there (the launcher's own output) is never returned."""
+    lines = [line.strip() for line in str(stderr or "").splitlines()]
+    return [line for line in lines if AUDIT_DIAGNOSTIC.fullmatch(line)][:MAX_AUDIT_DIAGNOSTICS]
+
+
+def report_audit_diagnostics(workspace: Path, caller: str, stderr, err=None,
+                             now: Callable[[], float] = time.time) -> List[str]:
+    """For a caller that captures the restart's stderr and reads only its exit code: say the
+    recorder's audit-failure lines on `err` and keep them in the restart trace, on success too."""
+    lines = audit_diagnostics(stderr)
+    if not lines:
+        return lines
+    for line in lines:
+        print(f"{caller}: {line}", file=err or sys.stderr)
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now()))
+    try:
+        trace = Path(workspace) / "logs" / RESTART_TRACE
+        trace.parent.mkdir(parents=True, exist_ok=True)
+        with open(trace, "a") as f:
+            f.writelines(f"{stamp} [audit] {caller}: {line}\n" for line in lines)
+    except OSError:
+        pass  # stderr above already said it
+    return lines
 
 
 def _audit_outcome(workspace: Path, base: Dict, intent_written: bool, at: int, outcome: str,

@@ -183,8 +183,10 @@ recorder then ends its launcher 20 seconds earlier, and also when it is itself t
 written: `failed` with `reason: deadline` or `reason: cancelled` and no `rc`. That deadline is one
 budget for the intent line, the launcher and the outcome line: each line waits at most 5 seconds
 for the audit lock (less on a short budget), and a line that waits longer is reported as not
-written. The recorder kills the launcher process itself, not commands the launcher had already
-started. A foreground `core_restart.py restart` passes no bound, because its launcher may stay
+written. The watchdog and the paused core's relaunch capture the recorder's stderr and read only
+its exit code, so they relay those reports (at most 4, on a successful restart too) to their own
+stderr and to `logs/restart-attempts.log` as `[audit]` lines. The recorder kills the launcher
+process itself, not commands the launcher had already started. A foreground `core_restart.py restart` passes no bound, because its launcher may stay
 attached to a terminal, and it alone leaves the launcher its stdin (`--foreground`); every other
 route gives the launcher no stdin.
 When the ctl exits 12 (another launcher run held the app's launch lock; nothing was killed or

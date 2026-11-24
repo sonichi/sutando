@@ -58,6 +58,21 @@ class Run:
         return [a for a, _kw in self.calls]
 
 
+#: What the recorder says on stderr when both of an attempt's audit lines could not be written.
+LOST = ["core_restart: audit intent line not written (attempt att_0123456789ab)",
+        "core_restart: audit outcome line not written (attempt att_0123456789ab)"]
+
+
+class LostAudit(Run):
+    """A restart whose recorder lost both audit lines, with the launcher's own output around them."""
+
+    def __call__(self, argv, **kw):
+        done = super().__call__(argv, **kw)
+        if argv[-1] != "capabilities":
+            done.stderr = "launcher noise\n" + "\n".join(LOST) + "\nmore launcher noise\n"
+        return done
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -583,6 +598,7 @@ class Restart(Base):
         self.assertEqual(self.audit(), [])
         self.assertIn("audit intent line not written", err.getvalue())
         self.assertIn("audit outcome line not written", err.getvalue())
+        self.assertEqual(len(CR.audit_diagnostics(err.getvalue())), 2, "a caller can pick both reports out")
         self.assertTrue(recovery.audit(self.ws, {"event": "after"}, wait_s=1), "the lock was left free")
 
     def test_an_unbounded_recorder_still_bounds_each_audit_line(self):
@@ -733,6 +749,16 @@ class LimitHoldRetry(Base):
         [body] = self.told()
         self.assertIn("Restart the core from the desktop app", body)
 
+    def test_a_relaunch_that_succeeds_with_its_audit_lines_lost_says_so(self):
+        run = LostAudit(rc=0)
+        err = io.StringIO()
+        with mock.patch.object(clh, "_REPO", self.clone), mock.patch.object(sys, "stderr", err):
+            self.assertTrue(clh.relaunch_core(self.ws, "L", run=run))
+        self.assertEqual(err.getvalue().splitlines(), [f"{clh.RELAUNCH_CALLER}: {line}" for line in LOST])
+        trace = (self.ws / "logs" / CR.RESTART_TRACE).read_text().splitlines()
+        self.assertEqual([line.split(" ", 1)[1] for line in trace],
+                         [f"[audit] {clh.RELAUNCH_CALLER}: {line}" for line in LOST])
+
     def test_elsewhere_the_given_launcher_restarts(self):
         run = Run(rc=0)
         with mock.patch.object(clh, "_REPO", self.clone):
@@ -767,6 +793,29 @@ class RecoverCore(Base):
         with mock.patch("sys.stderr", io.StringIO()):
             self.assertFalse(HC._default_core_restart(run=run))
         self.assertEqual(run.calls, [])
+
+    def test_a_recovery_that_succeeds_with_its_audit_lines_lost_says_so(self):
+        self.patched(self.clone)
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err):
+            self.assertTrue(HC._default_core_restart(run=LostAudit(rc=0)))
+        self.assertEqual(err.getvalue().splitlines(), [f"{HC.RECOVER_CALLER}: {line}" for line in LOST])
+        trace = (self.ws / "logs" / CR.RESTART_TRACE).read_text()
+        self.assertEqual(trace.count("[audit] "), 2)
+        self.assertNotIn("launcher noise", trace + err.getvalue())
+
+    def test_only_the_recorders_own_reports_are_relayed_and_at_most_a_few(self):
+        many = "\n".join(f"core_restart: audit intent line not written (attempt att_{i:012x})" for i in range(9))
+        self.assertEqual(len(CR.audit_diagnostics(many)), CR.MAX_AUDIT_DIAGNOSTICS)
+        for other in (None, "", "core_restart: audit intent line not written (attempt att_1) and more",
+                      "x core_restart: audit outcome line not written (attempt att_0123456789ab)"):
+            self.assertEqual(CR.audit_diagnostics(other), [])
+        self.assertEqual(CR.report_audit_diagnostics(self.ws, "c", "launcher noise"), [])
+        self.assertFalse((self.ws / "logs").exists(), "nothing is written when there is nothing to relay")
+        (self.ws / "logs").write_text("not a directory")
+        err = io.StringIO()
+        self.assertEqual(CR.report_audit_diagnostics(self.ws, "c", LOST[0], err=err), [LOST[0]])
+        self.assertEqual(err.getvalue(), f"c: {LOST[0]}\n", "an unwritable trace still leaves the stderr report")
 
     def test_elsewhere_it_is_start_cli(self):
         self.patched(self.clone)

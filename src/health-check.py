@@ -14810,6 +14810,7 @@ def _default_core_restart(run=None) -> bool:
             print(f"  recover-core: refused ({via}): restart the core from the desktop app", file=sys.stderr)
             return False
         proc = run(argv, env=env, capture_output=True, text=True, timeout=RECOVER_RESTART_TIMEOUT_S)
+        core_restart.report_audit_diagnostics(WORKSPACE_DIR, RECOVER_CALLER, getattr(proc, "stderr", None))
         return proc.returncode == 0
     except Exception:
         return False

@@ -981,21 +981,23 @@ def relaunch_core(workspace: Path, launcher: Optional[str], model: Optional[str]
 def _relaunch(workspace: Path, launcher: Optional[str], model: Optional[str], switch_entry: Optional[str],
               run, command: Optional[list]) -> bool:
     import subprocess
+    import core_restart
 
     env = dict(os.environ)
 
     def rc(cmd):
         try:
-            return run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                       timeout=RELAUNCH_TIMEOUT_S, env=env).returncode
+            proc = run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                       timeout=RELAUNCH_TIMEOUT_S, env=env)
         except (OSError, subprocess.SubprocessError):
             return None
+        core_restart.report_audit_diagnostics(workspace, RELAUNCH_CALLER, getattr(proc, "stderr", None))
+        return proc.returncode
     if command:
         ok = rc(list(command)) == 0
         if not ok:
             _tell_owner(workspace, 'I could not restart the worker, so it is still paused. Send "retry now" to try again.')
         return ok
-    import core_restart
     restart, _via = core_restart.route(_REPO, env, run, workspace=workspace, caller=RELAUNCH_CALLER,
                                        start_cli=launcher, caller_deadline_s=RELAUNCH_TIMEOUT_S)
     if restart is None:
