@@ -154,6 +154,12 @@ def _normalize(items):
             norm["in_reply_to"] = reply
         if thread:
             norm["thread_root"] = thread
+        # The gateway folds an edit into the message it changed, so these are the only mark.
+        if m.get("edited") is True:
+            norm["edited"] = True
+        edit_id = m.get("edit_event_id")
+        if isinstance(edit_id, str) and edit_id:
+            norm["edit_event_id"] = edit_id
         out.append(norm)
     return out
 
