@@ -75,6 +75,15 @@ class ProjectHitl(unittest.TestCase):
         self.assertEqual(payload["extra_content"][hs.WIRE_FIELD]["id"], req.id)
         self.assertIn("answer me", payload["body"], "the plain-text fallback carries the message")
 
+    def test_the_packaged_store_reads_a_requirement_with_its_ledger_in_one_snapshot(self):
+        req = self._requirement()
+        self.manager.record_projection(req.id, req.revision, "$card")
+        store = B._hitl_modules()[0].HitlStore(hm.default_store(self.ws))
+        got, ledger = store.snapshot(req.id)
+        self.assertEqual((got.id, got.revision, ledger["revision"], ledger["event_id"]),
+                         (req.id, req.revision, req.revision, "$card"))
+        self.assertIsNone(store.snapshot("hitl_missing"))
+
     def test_a_second_pulse_re_sends_nothing(self):
         """The driver runs on EVERY outbound pulse; without the ledger holding,
         one card would become one card per pulse forever."""

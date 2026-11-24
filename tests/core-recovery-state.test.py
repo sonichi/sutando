@@ -575,6 +575,24 @@ class Writer(unittest.TestCase):
         # A hold-based incident id outlives the crash loop: the same id in another state names no crash card.
         self.assertIsNone(crs.recovery_card(self.ws, "sutando-core", {}, {**looping, "state": "paused_limit"}))
 
+    def test_the_card_is_read_without_the_store_lock_so_a_stalled_holder_cannot_stop_the_tick(self):
+        req = self._crash_card("inc_0123abcd")
+        looping = {"v": 1, "state": "crash_loop", "incident": "inc_0123abcd"}
+        with mock.patch("hitl.manager.HitlStore.locked", side_effect=AssertionError("the tick took the lock")):
+            card = crs.recovery_card(self.ws, "sutando-core", {}, looping)
+        self.assertEqual(card, {"hitl_id": req.id, "revision": 1, "event_id": "$crash:example.test"})
+
+    def test_a_record_archived_or_closed_between_the_listing_and_its_read_names_no_card(self):
+        req = self._crash_card("inc_0123abcd")
+        looping = {"v": 1, "state": "crash_loop", "incident": "inc_0123abcd"}
+        with mock.patch("hitl.manager.HitlStore.snapshot", return_value=None):
+            self.assertIsNone(crs.recovery_card(self.ws, "sutando-core", {}, looping))
+        self.assertIsNone(HitlStore(default_store(self.ws)).snapshot("hitl_missing"))
+        closed = HitlManager(HitlStore(default_store(self.ws))).get(req.id)
+        closed.status = "resolved"
+        with mock.patch("hitl.manager.HitlStore.snapshot", return_value=(closed, {"revision": 1, "event_id": "$crash:example.test"})):
+            self.assertIsNone(crs.recovery_card(self.ws, "sutando-core", {}, looping))
+
     def test_an_unreadable_hitl_store_names_no_card_and_keeps_the_record(self):
         self._crash_card("inc_0123abcd")
         looping = {"v": 1, "state": "crash_loop", "incident": "inc_0123abcd"}
