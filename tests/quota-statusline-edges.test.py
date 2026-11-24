@@ -417,6 +417,14 @@ class ProxyRetire(Tmp):
         self.assertIsNone(pr._run([str(self.d / "missing-binary")]))
         self.assertEqual(pr.plist_path().name, f"{pr.LABEL}.plist")
 
+    def test_an_unopenable_lock_keeps_the_proxy(self):
+        blocker = self.d / "user"
+        blocker.parent.mkdir(parents=True, exist_ok=True)
+        blocker.write_text("not a dir")  # the lock's folder cannot be made
+        run = Run(lsof=self.clear)
+        self.assertIn("holds the proxy lock", pr.retire(self.ws, runner=run, lock_wait_s=0.01))
+        self.assertFalse(any(a[:2] == ["launchctl", "bootout"] for a in run.calls))
+
     def test_intent_is_per_user_not_per_workspace(self):
         self.intent_patch.stop()
         try:

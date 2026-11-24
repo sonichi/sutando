@@ -737,6 +737,65 @@ class ProxyRetire(Base):
         self.assertIn("process list unreadable", self.retire(run))
         self.assertFalse(run.booted_out())
 
+    def test_an_opt_out_holding_the_lock_keeps_the_proxy(self):
+        import fcntl
+        self.intent.parent.mkdir(parents=True, exist_ok=True)
+        with open(pr.lock_path(), "a") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+            run = FakeRun()
+            said = pr.retire(self.ws, runner=run, wait_s=0.2, sleep=lambda s: None, lock_wait_s=0.05)
+        self.assertIn("holds the proxy lock", said)
+        self.assertFalse(run.booted_out())
+        self.assertTrue(self.retire(FakeRun()).startswith("turned off"))  # released: retires as before
+
+    def test_the_route_hook_holds_the_lock_through_its_port_wait(self):
+        route = __import__("importlib.util").util
+        spec = route.spec_from_file_location("route_proxy_lock", SCRIPTS / "route-proxy.py")
+        mod = route.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        seen, runs = [], FakeRun(loaded=False)
+
+        def opt_out_runner(argv):
+            if argv[0] == "lsof" and "-sTCP:LISTEN" in argv and not seen:
+                with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "true"}):
+                    seen.append(pr.retire(self.ws, runner=FakeRun(), wait_s=0.2, sleep=lambda s: None,
+                                          lock_wait_s=0.05))
+            return runs(argv)
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false"}), \
+                mock.patch.object(pr.cfg, "workspace", return_value=self.ws), \
+                mock.patch.object(pr, "plist_path", return_value=self._plist()), \
+                mock.patch.object(pr.sys, "platform", "darwin"), mock.patch.object(sys, "stderr", io.StringIO()):
+            mod.main(runner=opt_out_runner, wait_s=0.05, sleep=lambda s: None, install=self.no_install)
+        self.assertEqual(len(seen), 1)
+        self.assertIn("holds the proxy lock", seen[0])
+
+    def test_tracking_turned_off_after_the_evidence_keeps_it(self):
+        def flip():
+            os.environ["QUOTA_STATUSLINE_ENABLED"] = "false"
+        run = FakeRun()
+        with mock.patch.object(pr, "core_record_fresh", side_effect=lambda ws: (flip(), True)[1]):
+            said = self.retire(run)
+        self.assertIn("tracking is off", said)
+        self.assertFalse(run.booted_out())
+
+    def test_unexpected_exits_of_inspection_are_unknown(self):
+        R = __import__("types").SimpleNamespace
+        for rc in (2, -9, 127):
+            out = R(returncode=rc, stdout="", stderr="")
+            with self.subTest(rc=rc):
+                self.assertIsNone(pr.proxy_connections(lambda argv, out=out: out))
+                self.assertIsNone(pr.listening(lambda argv, out=out: out))
+                ps = FakeRun(ps_rc=rc)
+                self.assertIn("process list unreadable", self.retire(ps))
+                self.assertFalse(ps.booted_out())
+        self.assertIsNone(pr.proxy_connections(lambda argv: None))  # a timeout or a failed start
+        self.assertIsNone(pr.listening(lambda argv: None))
+        self.assertEqual(pr.proxy_connections(lambda argv: R(returncode=1, stdout="", stderr="")), [])
+        self.assertIs(pr.listening(lambda argv: R(returncode=1, stdout="", stderr="")), False)
+        run = FakeRun(lsof_rc=2)
+        self.assertIn("could not be read", self.retire(run))
+        self.assertFalse(run.booted_out())
+
     def _plist(self):
         plist = Path(self._tmp.name) / "LaunchAgents" / f"{pr.LABEL}.plist"
         plist.parent.mkdir(exist_ok=True)

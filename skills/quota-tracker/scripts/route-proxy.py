@@ -15,6 +15,7 @@ import proxy_retire  # noqa: E402
 import statusline_config as cfg  # noqa: E402
 
 LISTEN_WAIT_S = 8.0
+LOCK_WAIT_S = 8.0
 
 
 def listening(runner: Callable = proxy_retire._run) -> bool:
@@ -27,12 +28,14 @@ def main(runner: Callable = proxy_retire._run, wait_s: float = LISTEN_WAIT_S, sl
     try:
         if cfg.enabled():
             return 0
-        said = proxy_retire.ensure_running(cfg.workspace(), runner=runner, install=install)
-        if said in ("restored", "started", "installed", "already loaded"):
-            deadline = time.monotonic() + wait_s
-            while not listening(runner) and time.monotonic() < deadline:
-                sleep(0.25)
-            said += ", listening" if listening(runner) else ", not listening yet"
+        # Held through the port wait, so no retirement boots it out after it reads as ready.
+        with proxy_retire.proxy_lock(LOCK_WAIT_S, sleep):
+            said = proxy_retire.ensure_running(cfg.workspace(), runner=runner, install=install)
+            if said in ("restored", "started", "installed", "already loaded"):
+                deadline = time.monotonic() + wait_s
+                while not listening(runner) and time.monotonic() < deadline:
+                    sleep(0.25)
+                said += ", listening" if listening(runner) else ", not listening yet"
         print(f"quota-tracker: credential proxy launch agent: {said}", file=sys.stderr)
     except Exception as exc:  # noqa: BLE001 — a launch never fails on this
         print(f"quota-tracker: credential proxy restore skipped ({type(exc).__name__})", file=sys.stderr)

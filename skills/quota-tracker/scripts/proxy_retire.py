@@ -8,7 +8,8 @@ ANTHROPIC_BASE_URL, nor does `env` in the settings a live Claude process runs un
 dir's, its project's); a clean read of the proxy port shows no established connection; and a
 fresh status-line record exists for the core's account. Anything unread or ambiguous keeps it.
 
-The job is per user, so the intent is too: `intent_path()` records `retiring` before
+Retirement and restoration share one per-user lock (`lock_path()`); a retirement that cannot
+take it within LOCK_WAIT_S keeps the proxy. The job is per user, so the intent is too: `intent_path()` records `retiring` before
 `launchctl bootout` (the plist is kept) and `retired` once the port stops listening. Nothing is
 signalled by PID; a run that finds `retiring` reconciles it against the job and the port. Each
 decision is also logged in `<workspace>/state/quota-proxy-retire.json` with its reason.
@@ -20,6 +21,8 @@ runs it by hand.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import subprocess
@@ -35,6 +38,7 @@ LABEL = "com.sutando.credential-proxy"
 PORT = 7846
 RECORD = "quota-proxy-retire.json"
 TIMEOUT_S = 5
+LOCK_WAIT_S = 3.0
 INSTALL_TIMEOUT_S = 30
 
 
@@ -55,6 +59,37 @@ def plist_path() -> Path:
 
 def intent_path() -> Path:
     return Path.home() / "Library" / "Application Support" / "Sutando" / "credential-proxy-retire.json"
+
+
+def lock_path() -> Path:
+    return intent_path().with_name("credential-proxy-retire.lock")
+
+
+@contextlib.contextmanager
+def proxy_lock(wait_s: float, sleep: Callable = time.sleep):
+    """The per-user lock retirement and restoration share; yields whether it is held."""
+    try:
+        lock_path().parent.mkdir(parents=True, exist_ok=True)
+        fh = open(lock_path(), "a")
+    except OSError:
+        yield False
+        return
+    held, deadline = False, time.monotonic() + wait_s
+    with fh:
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    break
+                sleep(0.05)
+        try:
+            yield held
+        finally:
+            if held:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
 def read_intent() -> dict:
@@ -85,7 +120,12 @@ def listening(runner: Callable = _run) -> Optional[bool]:
         return None
     if out.returncode == 0:
         return True
-    return False if not (out.stdout or "").strip() else None
+    return False if _no_match(out) else None
+
+
+def _no_match(out) -> bool:
+    """lsof's own "nothing matched": exit 1, silent. Any other exit, a signal or a timeout is unknown."""
+    return out.returncode == 1 and not (out.stdout or "").strip() and not _diagnostics(out)
 
 
 def job_loaded(runner: Callable = _run) -> bool:
@@ -174,7 +214,7 @@ def proxy_connections(runner: Callable = _run) -> Optional[List[str]]:
         return None
     lines = (out.stdout or "").splitlines()
     if out.returncode != 0:
-        return [] if not lines else None  # lsof exits 1, silently, when nothing matches
+        return [] if _no_match(out) else None
     if not lines or not lines[0].startswith("COMMAND"):
         return None
     rows = []
@@ -246,8 +286,19 @@ def reconcile(workspace, runner: Callable = _run) -> Optional[str]:
 
 
 def retire(workspace, runner: Callable = _run, dry_run: bool = False, wait_s: float = 3.0,
-           sleep: Callable = time.sleep) -> str:
+           sleep: Callable = time.sleep, lock_wait_s: float = LOCK_WAIT_S) -> str:
     """Turn the launch agent off if it is verifiably unused; returns what happened."""
+    if dry_run:
+        return _retire_locked(workspace, runner, True, wait_s, sleep)
+    with proxy_lock(lock_wait_s, sleep) as held:
+        if not held:
+            why = "another launch holds the proxy lock; kept for this launch"
+            _record(workspace, status="kept", reason=why)
+            return f"kept: {why}"
+        return _retire_locked(workspace, runner, False, wait_s, sleep)
+
+
+def _retire_locked(workspace, runner: Callable, dry_run: bool, wait_s: float, sleep: Callable) -> str:
     settled = None if dry_run else reconcile(workspace, runner)
     if not job_loaded(runner):
         if settled == "unconfirmed":
@@ -261,6 +312,9 @@ def retire(workspace, runner: Callable = _run, dry_run: bool = False, wait_s: fl
         return f"kept: {why}"
     if dry_run:
         return "would turn off: unused"
+    if not cfg.enabled():  # an opt-out between the evidence and here wins
+        _record(workspace, status="kept", reason="status line tracking turned off")
+        return "kept: status line tracking is off"
     if not write_intent("retiring"):
         _record(workspace, status="kept", reason="could not record the retirement intent")
         return "kept: could not record the retirement intent"
