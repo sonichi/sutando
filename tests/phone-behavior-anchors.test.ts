@@ -161,6 +161,18 @@ test('with no name the call greeting and name answer are unnamed', () => {
 		'[Speak this greeting to the caller now]: Hi, this is an AI agent calling.');
 });
 
+test('with no name every phone prompt introduces the agent unnamed', () => {
+	const unnamed = { ...DEPS, overrides: { ...DEPS.overrides, agentName: '' } };
+	const rule = 'When asked your name, say you do not have one to share; never make one up.';
+	for (const name of ['child_call', 'inbound_owner', 'inbound_verified', 'inbound_unverified']) {
+		const text = cfg.buildPhoneInstructions(VARIANTS[name], unnamed);
+		assert.ok(text.includes('an AI agent'), name);
+		assert.ok(text.includes(rule), name);
+		assert.ok(!/(this is|yourself as) [.,]/.test(text), name);
+		assert.ok(!text.includes(SHOWN) && !text.includes('When asked your name, say "'), name);
+	}
+});
+
 test('tryFastPath tripwire unchanged', () => {
 	assert.deepStrictEqual(anchors.regions, expected.regions);
 });
