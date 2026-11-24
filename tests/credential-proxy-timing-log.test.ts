@@ -200,7 +200,96 @@ test('client closing mid-stream logs client_closed_during_response with the upst
 
 test('formatTimingLine drops the query string and renders missing durations as -', () => {
 	const l = formatTimingLine({ id: 7, method: 'GET', path: '/v1/models?key=secret', attempt: 0, totalMs: 12.6, status: 0, outcome: 'client_closed_before_response' });
-	assert.equal(l, '[Proxy] id=7 timing method=GET path=/v1/models attempt=0 dispatch_ms=- socket_ms=- reused=- connect_ms=- tls_ms=- inflight=- ttfb_ms=- total_ms=13 status=- outcome=client_closed_before_response');
+	assert.equal(l, '[Proxy] id=7 timing method=GET path=/v1/models attempt=0 body_ms=- cred_ms=- dispatch_ms=- first_attempt_ms=- socket_ms=- reused=- connect_ms=- tls_ms=- inflight=- sent_ms=- ttfb_ms=- last_byte_ms=- bytes=- total_ms=13 status=- outcome=client_closed_before_response');
+});
+
+test('formatTimingLine masks caller text in the path and method', () => {
+	const l = formatTimingLine({ id: 1, method: 'GET x=1', path: '/v1/a b\nstatus=200 outcome=ok', attempt: 0, totalMs: 1, status: 0, outcome: 'ok' });
+	assert.equal(field(l, 'path'), '/v1/a_b_status_200_outcome_ok');
+	assert.equal(field(l, 'method'), '-');
+	assert.equal(l.match(/outcome=/g)?.length, 1);
+});
+
+test('a completed request stamps body, credential, sent and last-byte times and the upstream byte count', async () => {
+	const lines: string[] = [];
+	const up = await startUpstream((req, res) => {
+		req.resume();
+		req.on('end', () => { res.writeHead(200); res.write('abc'); setTimeout(() => res.end('defg'), 30); });
+	});
+	const port = await startProxy(up, lines);
+	assert.equal((await call(port)).body, 'abcdefg');
+	await waitFor(() => lines.length === 1);
+	const l = lines[0];
+	for (const k of ['body_ms', 'cred_ms', 'sent_ms', 'ttfb_ms', 'last_byte_ms']) assert.match(field(l, k), /^\d+$/, k);
+	assert.equal(field(l, 'bytes'), '7');
+	assert.ok(Number(field(l, 'last_byte_ms')) >= Number(field(l, 'ttfb_ms')) + 20, l);
+	assert.equal(field(l, 'first_attempt_ms'), '-');
+});
+
+test('an upstream that dies mid-stream logs upstream_aborted and ends the client response', async () => {
+	const lines: string[] = [];
+	const up = await startUpstream((_req, res) => {
+		res.writeHead(200, { 'content-type': 'text/event-stream' });
+		res.write('data: 1\n\n');
+		setTimeout(() => res.socket?.destroy(), 30);
+	});
+	const port = await startProxy(up, lines);
+	const err = captureConsoleError();
+	let ended: string;
+	try {
+		ended = await new Promise<string>((resolve) => {
+			const timer = setTimeout(() => resolve('hung'), 3000);
+			const req = httpRequest({ hostname: '127.0.0.1', port, path: '/v1/messages', method: 'POST', agent: false, headers: { authorization: 'Bearer c' } }, (res) => {
+				res.on('data', () => {});
+				res.on('error', () => {});
+				res.on('close', () => { clearTimeout(timer); resolve('closed'); });
+			});
+			req.on('error', () => { clearTimeout(timer); resolve('closed'); });
+			req.end('{}');
+		});
+		await waitFor(() => lines.length === 1);
+	} finally { err.restore(); }
+	assert.equal(ended, 'closed', 'the client must not be left waiting');
+	assert.equal(field(lines[0], 'outcome'), 'upstream_aborted');
+	assert.equal(field(lines[0], 'status'), '200');
+	assert.equal(field(lines[0], 'last_byte_ms'), '-');
+	const id = field(lines[0], 'id');
+	assert.ok(err.lines.some((e) => e.includes(`[Proxy] id=${id} Upstream aborted mid-response`)), err.lines.join('\n'));
+});
+
+test('a response the proxy makes itself logs proxy_reject, not ok', async () => {
+	const lines: string[] = [];
+	const up = await startUpstream((_req, res) => { res.writeHead(200); res.end('{}'); });
+	const port = await startProxy(up, lines, { readCredCandidates: () => [] });
+	const r = await new Promise<number>((resolve, reject) => {
+		const req = httpRequest({ hostname: '127.0.0.1', port, path: '/v1/messages', method: 'POST', agent: false }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode ?? 0)); });
+		req.on('error', reject);
+		req.end('{}');
+	});
+	assert.equal(r, 502);
+	await waitFor(() => lines.length === 1);
+	assert.equal(field(lines[0], 'outcome'), 'proxy_reject');
+	assert.equal(field(lines[0], 'status'), '502');
+	assert.equal(field(lines[0], 'dispatch_ms'), '-');
+});
+
+test('a 401 retry keeps how long the first attempt took', async () => {
+	const lines: string[] = [];
+	let n = 0;
+	const up = await startUpstream((req, res) => {
+		req.resume();
+		n += 1;
+		if (n === 1) { res.writeHead(401); res.end('{}'); } else { res.writeHead(200); res.end('{}'); }
+	});
+	let reads = 0;
+	const port = await startProxy(up, lines, {
+		readCredCandidates: () => [{ service: 's', oauth: { accessToken: reads++ === 0 ? 'stored-secret-token-zzzz' : 'stored-secret-token-yyyy', expiresAt: Date.now() + 3600_000 } }],
+	});
+	const err = captureConsoleError();
+	try { assert.equal((await call(port)).status, 200); } finally { err.restore(); }
+	await waitFor(() => lines.length === 1);
+	assert.equal(field(lines[0], 'attempt'), '1');
+	assert.match(field(lines[0], 'first_attempt_ms'), /^\d+$/);
 });
 
 test('inflight counts the other proxied requests open when a request was dispatched', async () => {
