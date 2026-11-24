@@ -218,7 +218,7 @@ class TierPolicyTest(unittest.TestCase):
             write_task(d, "task-chat-g", "guest asks", tier="guest", mtime=now - 20)
             write_task(d, "task-chat-o", "owner asks", tier="owner", mtime=now - 10)
             self.assertEqual(run_connector(d, once=2, extra=["--sandbox", "danger-full-access", "--allow-non-owner"]), 0)
-            self.assertIn("[sandbox=read-only ephemeral=True cwd=", result(d, "task-chat-g"))
+            self.assertIn("[sandbox=None ephemeral=True cwd=", result(d, "task-chat-g"))
             self.assertIn("[sandbox=danger-full-access ephemeral=False cwd=", result(d, "task-chat-o"))
             self.assertEqual([m["tier"] for m in metrics(d)], ["guest", "owner"])
             self.assertEqual(saved_threads(d), [cc.channel_key("local-chat")], "only the owner thread is saved")
@@ -235,7 +235,7 @@ class TierPolicyTest(unittest.TestCase):
             self.assertEqual(ids[0], ids[2], "a room keeps its thread")
             self.assertEqual(saved_threads(d), sorted(cc.channel_key(c) for c in ("!a:ag2.space", "!b:ag2.space")))
             saved = (Path(d) / "state" / "threads" / cc.channel_key("!a:ag2.space")).read_text().splitlines()
-            self.assertEqual(saved, [ids[0], "!a:ag2.space"], "the id, then the readable channel")
+            self.assertEqual(saved, [ids[0], "!a:ag2.space", cc.SHARED], "the id, the readable channel, its class")
 
     def test_a_guest_never_reuses_any_thread(self):
         with tempfile.TemporaryDirectory() as d:
@@ -335,7 +335,7 @@ class TierPolicyTest(unittest.TestCase):
             self.assertFalse(os.path.exists(scratch), "removed after the turn")
             self.assertIn("cwd=%s]" % os.path.abspath(d), run_owner_echo(d))
 
-    def test_a_collaborator_runs_read_only_ephemeral_with_the_note_and_no_owner_thread(self):
+    def test_a_collaborator_gets_the_owners_sandbox_cwd_and_kept_thread_with_the_note(self):
         tid = "task-1792100000003"
         with tempfile.TemporaryDirectory() as d:
             write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True))
@@ -344,9 +344,96 @@ class TierPolicyTest(unittest.TestCase):
             self.assertEqual((spy.call_args.args[1]["access_tier"], spy.call_args.args[1]["collaborator"]),
                              ("team", "true"))
             self.assertEqual(spy.call_args.args[4], cc.NON_OWNER_NOTE)
-            self.assertIn("[sandbox=read-only ephemeral=True cwd=", result(d, tid))
-            self.assertEqual(saved_threads(d), [], "no owner thread is opened or saved")
+            self.assertIn("The sender is not your owner. " + cc.NON_OWNER_NOTE, cc.wrap_untrusted(*spy.call_args.args))
+            self.assertIn("[sandbox=danger-full-access ephemeral=False cwd=%s]" % os.path.abspath(d), result(d, tid))
+            self.assertEqual(saved_threads(d), [cc.channel_key("!room:ag2.space")], "the room's kept thread")
             self.assertNotIn("[dm-only]", result(d, tid))
+
+    def test_a_collaborator_never_continues_the_owners_carried_dm_conversation(self):
+        tid = "task-1792100000005"
+        with tempfile.TemporaryDirectory() as d:
+            write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True).replace(
+                "task_layout: mid", "channel_kind: dm\ntask_layout: mid"))
+            self.assertEqual(run_connector(d, once=1, extra=["--resume-thread", "owner-conv"]), 0)
+            self.assertNotIn("owner-conv", result(d, tid))
+            self.assertFalse((Path(d) / "state" / cc.RESUME_MARKER).exists(), "left for the owner's DM")
+
+    def test_a_collaborator_never_joins_a_thread_bound_to_the_owner_even_after_a_restart(self):
+        room = "!room:ag2.space"
+        bind = ["--thread-id", room + "=owner-bound-0001"]
+        with tempfile.TemporaryDirectory() as d:
+            write_task(d, "task-chat-o", "owner in the room", channel=room)
+            self.assertEqual(run_connector(d, once=1, extra=bind), 0)
+            for n, extra in ((1, bind), (2, [])):   # a restart, then one without the binding flag
+                tid = "task-179210000001%d" % n
+                write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True))
+                self.assertEqual(run_connector(d, once=1, extra=extra), 0)
+                self.assertNotEqual(metrics(d)[-1]["thread"], "owner-bound-0001", extra)
+                self.assertNotIn("ephemeral=True", result(d, tid))
+            ids = [m["thread"] for m in metrics(d)]
+            self.assertEqual(ids[0], "owner-bound-0001")
+            self.assertEqual(ids[1], ids[2], "the collaborator's shared thread is kept across the restart")
+            self.assertEqual(saved_threads(d), sorted([cc.channel_key(room), cc.channel_key(room) + cc.SHARED_SUFFIX]))
+            write_task(d, "task-chat-o2", "owner again", channel=room)
+            self.assertEqual(run_connector(d, once=1, extra=bind), 0)
+            self.assertEqual(metrics(d)[-1]["thread"], "owner-bound-0001", "the owner keeps the bound thread")
+
+    def test_a_collaborator_in_a_channel_that_carried_the_owners_conversation_gets_its_own_thread(self):
+        room = "!room:ag2.space"
+        for legacy in (False, True):
+            with self.subTest(legacy_thread_file=legacy), tempfile.TemporaryDirectory() as d:
+                write_task(d, "task-chat-d", "owner in the DM", channel=room, kind="dm")
+                self.assertEqual(run_connector(d, once=1, extra=["--resume-thread", "owner-conv"]), 0)
+                saved = Path(d) / "state" / "threads" / cc.channel_key(room)
+                self.assertEqual(saved.read_text().splitlines(), ["owner-conv", room, cc.OWNER_ONLY])
+                if legacy:   # written before the owner-only line existed
+                    saved.write_text("owner-conv\n%s\n" % room)
+                tid = "task-1792100000021"
+                write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True))
+                self.assertEqual(run_connector(d, once=1, extra=["--resume-thread", "owner-conv"]), 0)
+                self.assertNotEqual(metrics(d)[-1]["thread"], "owner-conv")
+                self.assertNotIn("owner-conv", result(d, tid))
+
+    def test_a_collaborator_joins_the_owners_room_thread_only_when_its_record_says_shared(self):
+        room = "!room:ag2.space"
+        with tempfile.TemporaryDirectory() as d:
+            write_task(d, "task-chat-o", "owner in the room", channel=room)
+            self.assertEqual(run_connector(d, once=1), 0)
+            tid = "task-1792100000031"
+            write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True))
+            self.assertEqual(run_connector(d, once=1), 0)
+            ids = [m["thread"] for m in metrics(d)]
+            self.assertEqual(ids[0], ids[1], "a shared room thread is shared with a collaborator")
+            self.assertEqual(saved_threads(d), [cc.channel_key(room)])
+
+    def test_a_pre_upgrade_thread_record_of_unknown_provenance_is_kept_from_a_collaborator(self):
+        room = "!room:ag2.space"
+        with tempfile.TemporaryDirectory() as d:
+            # The older two-line format, e.g. left by a --thread-id binding no longer in the launch flags.
+            threads = Path(d) / "state" / "threads"
+            threads.mkdir(parents=True)
+            (threads / cc.channel_key(room)).write_text("owner-bound-legacy\n%s\n" % room)
+            for n in (1, 2):   # and again after a restart
+                tid = "task-179210000004%d" % n
+                write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True))
+                self.assertEqual(run_connector(d, once=1), 0)
+                self.assertNotEqual(metrics(d)[-1]["thread"], "owner-bound-legacy")
+            self.assertEqual(metrics(d)[0]["thread"], metrics(d)[1]["thread"])
+            self.assertEqual((threads / cc.channel_key(room)).read_text(), "owner-bound-legacy\n%s\n" % room,
+                             "the unknown record is left as it was")
+            write_task(d, "task-chat-o", "owner in the room", channel=room)
+            self.assertEqual(run_connector(d, once=1), 0)
+            self.assertEqual(metrics(d)[-1]["thread"], "owner-bound-legacy", "the owner still resumes it")
+            self.assertEqual((threads / cc.channel_key(room)).read_text().splitlines()[2:], [],
+                             "resuming does not classify it")
+
+    def test_the_gate_decides_once_per_task_and_the_mapping_uses_that_decision(self):
+        tid = "task-1792100000051"
+        with tempfile.TemporaryDirectory() as d:
+            write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True))
+            with mock.patch.object(cc, "turn_policy", wraps=task_io.turn_policy) as gate:
+                self.assertEqual(run_connector(d, once=1), 0)
+            self.assertEqual(gate.call_count, 1, "no second decision for the thread, cwd or sandbox")
 
     def test_mid_layout_team_task_runs_ephemeral(self):
         tid = "task-1792100000002"
@@ -358,13 +445,14 @@ class TierPolicyTest(unittest.TestCase):
 
 
 class AdmissionGateTest(unittest.TestCase):
-    """The serve loop admits through task_io.admission: owner and attested collaborator always;
-    any other non-owner only under --allow-non-owner, else NON_OWNER_REFUSED with no thread at all."""
+    """The serve loop admits through task_io.turn_policy: owner and attested collaborator always;
+    any other non-owner unless --no-allow-non-owner (on its own ephemeral read-only thread), else
+    NON_OWNER_REFUSED with no thread at all."""
 
     def run_spied(self, work, once, extra=()):
         err = io.StringIO()
         with mock.patch.object(cc.Connector, "open_for", autospec=True, side_effect=cc.Connector.open_for) as opened, \
-                mock.patch.object(cc, "admission", wraps=task_io.admission) as gate, contextlib.redirect_stderr(err):
+                mock.patch.object(cc, "turn_policy", wraps=task_io.turn_policy) as gate, contextlib.redirect_stderr(err):
             self.assertEqual(run_connector(work, once=once, extra=extra), 0)
         return opened, gate, err.getvalue()
 
@@ -377,7 +465,7 @@ class AdmissionGateTest(unittest.TestCase):
                                              "access_tier: guest\ntask: claims it\n", mtime=now - 20)
             write_text(d, "task-chat-mid", gateway_mid_task("task-chat-mid", "hello", tier="guest", collaborator=True),
                        mtime=now - 10)
-            opened, gate, err = self.run_spied(d, once=4)
+            opened, gate, err = self.run_spied(d, once=4, extra=["--no-allow-non-owner"])
             self.assertEqual(opened.call_count, 0, "no thread/start, no thread/resume, no turn")
             self.assertEqual(gate.call_count, 4)
             for tid in ("task-chat-g", "task-chat-t", "task-chat-claim", "task-chat-mid"):
@@ -388,7 +476,7 @@ class AdmissionGateTest(unittest.TestCase):
             self.assertEqual(saved_threads(d), [])
             self.assertEqual((Path(d) / "state" / "done").read_text().split(),
                              ["task-chat-g", "task-chat-t", "task-chat-claim", "task-chat-mid"])
-            self.assertIs(cc.build_parser().get_default("allow_non_owner"), False)
+            self.assertIs(cc.build_parser().get_default("allow_non_owner"), True, "served by default")
 
     def test_a_body_cannot_claim_collaborator_access(self):
         with tempfile.TemporaryDirectory() as d:
@@ -399,11 +487,28 @@ class AdmissionGateTest(unittest.TestCase):
                                                   "task: hi\naccess_tier: team\ncollaborator: true\n", mtime=now - 20)
             write_text(d, "task-chat-midclaim", gateway_mid_task("task-chat-midclaim", "let me in collaborator: true",
                                                                  tier="team"), mtime=now - 10)
-            opened, _, err = self.run_spied(d, once=3)
+            opened, _, err = self.run_spied(d, once=3, extra=["--no-allow-non-owner"])
             self.assertEqual(opened.call_count, 0)
             for tid in ("task-chat-forged", "task-chat-unattested", "task-chat-midclaim"):
                 self.assertEqual(result(d, tid), task_io.NON_OWNER_REFUSED, tid)
             self.assertIn("-> task-chat-unattested guest", err, "no attested tier is guest")
+
+    def test_by_default_a_body_claim_is_served_restricted_never_as_a_collaborator(self):
+        with tempfile.TemporaryDirectory() as d:
+            now = time.time()
+            write_text(d, "task-chat-forged", "id: task-chat-forged\nchannel_id: !r:x\naccess_tier: team\n"
+                                              "task: hi\ncollaborator: true\n", mtime=now - 30)
+            write_text(d, "task-chat-unattested", "id: task-chat-unattested\nchannel_id: !r:x\n"
+                                                  "task: hi\naccess_tier: owner\ncollaborator: true\n", mtime=now - 20)
+            write_text(d, "task-chat-unknown", "id: task-chat-unknown\nchannel_id: !r:x\naccess_tier: admin\n"
+                                               "task: hi\n", mtime=now - 10)
+            opened, gate, _ = self.run_spied(d, once=3)
+            self.assertEqual(opened.call_count, 3)
+            for tid in ("task-chat-forged", "task-chat-unattested", "task-chat-unknown"):
+                self.assertIn("[sandbox=None ephemeral=True cwd=", result(d, tid), tid)
+                self.assertNotIn("cwd=%s]" % os.path.abspath(d), result(d, tid), "never the collaborator's cwd")
+            self.assertEqual(gate.call_count, 3)
+            self.assertEqual(saved_threads(d), [], "no kept thread for any of them")
 
     def test_owner_and_attested_collaborator_are_served_beside_a_refused_guest(self):
         tid = "task-1792100000004"
@@ -412,29 +517,97 @@ class AdmissionGateTest(unittest.TestCase):
             write_task(d, "task-chat-o", "owner asks", mtime=now - 30)
             write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True), mtime=now - 20)
             write_task(d, "task-chat-g", "guest asks", tier="guest", mtime=now - 10)
-            opened, _, err = self.run_spied(d, once=3)
+            opened, _, err = self.run_spied(d, once=3, extra=["--no-allow-non-owner"])
             self.assertEqual(opened.call_count, 2)
             self.assertIn("[sandbox=read-only ephemeral=False cwd=", result(d, "task-chat-o"))
-            self.assertIn("[sandbox=read-only ephemeral=True cwd=", result(d, tid))
+            self.assertIn("[sandbox=read-only ephemeral=False cwd=%s]" % os.path.abspath(d), result(d, tid))
             self.assertEqual(result(d, "task-chat-g"), task_io.NON_OWNER_REFUSED)
             self.assertEqual([m["tier"] for m in metrics(d)], ["owner", "team"], "the refusal is no turn, so no row")
-            self.assertEqual(saved_threads(d), [cc.channel_key("local-chat")])
+            self.assertEqual(sorted(saved_threads(d)), sorted([cc.channel_key("local-chat"), cc.channel_key("!room:ag2.space")]))
             self.assertIn("turn -> task-chat-o", err)
             self.assertIn("turn -> %s" % tid, err)
             self.assertNotIn("turn -> task-chat-g", err)
 
-    def test_allow_non_owner_admits_guests_on_the_ephemeral_thread(self):
+    def test_guests_and_plain_team_are_served_on_the_ephemeral_thread_by_default_and_under_the_old_flag(self):
+        for extra in ((), ("--allow-non-owner",)):
+            with tempfile.TemporaryDirectory() as d:
+                now = time.time()
+                write_task(d, "task-chat-g", "guest asks", tier="guest", mtime=now - 20)
+                write_task(d, "task-chat-t", "team without the flag", tier="team", mtime=now - 10)
+                opened, _, err = self.run_spied(d, once=2, extra=extra)
+                self.assertEqual(opened.call_count, 2, extra)
+                for tid in ("task-chat-g", "task-chat-t"):
+                    self.assertIn("[sandbox=None ephemeral=True cwd=", result(d, tid))
+                self.assertNotIn("refused", err)
+                self.assertEqual(saved_threads(d), [])
+
+
+
+class NoIntegrationsTest(unittest.TestCase):
+    """A restricted thread starts with every configured MCP server disabled by name, Codex's web search off and
+    the owner's connectors, plugins, hooks and memories off; the owner's and a collaborator's threads get no
+    override. (Measured on a real codex 0.167 app-server: an empty `mcp_servers` override removes nothing.)"""
+
+    def config_of(self, text):
+        return json.loads(text.split(" config=", 1)[1])
+
+    def test_a_restricted_thread_disables_mcp_web_search_and_connectors(self):
         with tempfile.TemporaryDirectory() as d:
             now = time.time()
-            write_task(d, "task-chat-g", "guest asks", tier="guest", mtime=now - 20)
-            write_task(d, "task-chat-t", "team without the flag", tier="team", mtime=now - 10)
-            opened, _, err = self.run_spied(d, once=2, extra=["--allow-non-owner"])
-            self.assertEqual(opened.call_count, 2)
-            for tid in ("task-chat-g", "task-chat-t"):
-                self.assertIn("[sandbox=read-only ephemeral=True cwd=", result(d, tid))
-            self.assertNotIn("refused", err)
-            self.assertEqual(saved_threads(d), [])
+            write_task(d, "task-chat-g", "[[config]] guest", tier="guest", mtime=now - 30)
+            write_task(d, "task-chat-t", "[[config]] plain team", tier="team", mtime=now - 20)
+            write_task(d, "task-chat-x", "[[config]] unknown", tier="admin", mtime=now - 10)
+            self.assertEqual(run_connector(d, once=3), 0)
+            for tid in ("task-chat-g", "task-chat-t", "task-chat-x"):
+                cfg = self.config_of(result(d, tid))
+                self.assertEqual(cfg["mcp_servers"], {"owner-mcp": {"enabled": False}}, tid)
+                self.assertEqual(cfg["web_search"], "disabled", tid)
+                self.assertEqual({k for k, on in cfg["features"].items() if on is not False}, set(), tid)
+                for feature in ("apps", "plugins", "hooks", "memories"):
+                    self.assertIs(cfg["features"][feature], False, (tid, feature))
 
+    def test_the_owner_and_a_collaborator_keep_their_integrations(self):
+        tid = "task-1792100000009"
+        with tempfile.TemporaryDirectory() as d:
+            now = time.time()
+            write_task(d, "task-chat-o", "[[config]] owner", mtime=now - 20)
+            write_text(d, tid, gateway_mid_task(tid, "[[config]] collab", tier="team", collaborator=True),
+                       mtime=now - 10)
+            self.assertEqual(run_connector(d, once=2), 0)
+            for t in ("task-chat-o", tid):
+                self.assertTrue(result(d, t).rstrip().endswith(" config=null"), result(d, t))
+
+    def connector(self, answer):
+        class Rpc:
+            def request(self, method, params=None, timeout=120):
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+        c = cc.Connector(FakeRpc, cc.build_parser().parse_args(["--work", "w"]), note="n")
+        c.rpc = Rpc()
+        return c
+
+    def test_an_unreadable_config_fails_the_turn_closed_and_a_dead_server_raises(self):
+        # A server list that cannot be read is never taken as "no servers": that would leave the owner's on.
+        for answer in (RuntimeError('config/read: {"code": -32601}'), {"config": {"mcp_servers": ["x"]}},
+                       {}, {"config": None}, {"config": {}}, {"config": {"mcp_servers": None}},
+                       {"config": {"mcp_servers": ""}}, {"config": ["mcp_servers"]}, None, []):
+            with self.assertRaises(cc.IntegrationsUnknown, msg=repr(answer)):
+                self.connector(answer).no_integrations("/tmp")
+        with self.assertRaises(RuntimeError) as raised:
+            self.connector(RuntimeError("config/read: server pipe closed (x)")).no_integrations("/tmp")
+        self.assertNotIsInstance(raised.exception, cc.IntegrationsUnknown)
+        self.assertEqual(self.connector({"config": {"mcp_servers": {}}}).no_integrations("/tmp")["mcp_servers"], {},
+                         "what Codex sends when there are none (measured, codex-cli 0.167.0)")
+        self.assertEqual(self.connector({"config": {"mcp_servers": {"a": {"enabled": True}}}}).no_integrations("/tmp")
+                         ["mcp_servers"], {"a": {"enabled": False}})
+        c = self.connector({})
+        with mock.patch.object(c, "open_for", side_effect=cc.IntegrationsUnknown("refused")), \
+                mock.patch.object(c, "run_turn") as turn:
+            status, text, err = c.run_task({"access_tier": "guest"}, "p", task_io.turn_policy({}, True).capabilities)
+        self.assertEqual((status, text), ("failed", ""))
+        self.assertIn("could not be read to switch them off (refused)", err)
+        turn.assert_not_called()
 
 class EndToEndStubTest(unittest.TestCase):
     def test_tasks_run_in_mtime_order_not_name_order(self):
@@ -578,7 +751,7 @@ class EdgePathTest(unittest.TestCase):
             args.cwd = d
             c = cc.Connector(lambda: rpc, args, note="n")
             c.handshake()
-            c.start_thread(True, False)
+            c.start_thread(task_io.OWNER_CAPABILITIES, False)
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 self.assertFalse(c.start())
@@ -633,6 +806,185 @@ class EdgePathTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             c.run_turn("hello")
         self.assertEqual(c.rpc.calls, ["turn/start", "turn/interrupt"])
+
+    def test_a_turn_without_a_message_says_what_it_did_instead(self):
+        # An owner asked for something, Codex ran commands, was refused one, and ended with no text:
+        # the room got only "[no reply] Codex completed the turn without a message."
+        class Scripted(FakeRpc):
+            def __init__(self):
+                super().__init__()
+                self.answers = []
+
+            def respond(self, rid, result):
+                self.answers.append((rid, result))
+
+        args = cc.build_parser().parse_args(["--work", "w"])
+        c = cc.Connector(Scripted, args, note="n")
+        c.thread_id = "th1"
+        c.declined, c.turn_items = ["item/fileChange/requestApproval"], {"commandExecution": 9}   # an earlier turn's
+
+        def item(kind, turn="t1", status="completed"):
+            body = {"type": kind} if status is None else {"type": kind, "status": status}
+            return {"method": "item/completed", "params": {"threadId": "th1", "turnId": turn, "item": body}}
+
+        def asks(rid, method, thread="th1", turn="t1"):
+            return {"id": rid, "method": method, "params": {"threadId": thread, "turnId": turn, "itemId": "i"}}
+
+        for m in (item("reasoning", status=None), item("commandExecution"), item("commandExecution"),
+                  item("webSearch", status=None), item("commandExecution", turn="another-turn"),
+                  # What did not happen is not said to have happened.
+                  item("commandExecution", status="failed"), item("commandExecution", status="declined"),
+                  item("fileChange", status="failed"), item("fileChange", status="declined"),
+                  item("mcpToolCall", status="failed"), item("mcpToolCall", status="inProgress"),
+                  asks(7, "item/commandExecution/requestApproval"),
+                  # Declined all the same, but not this turn's: another turn, another thread, and the
+                  # older methods, which name neither.
+                  asks(8, "item/fileChange/requestApproval", turn="another-turn"),
+                  asks(9, "item/commandExecution/requestApproval", thread="another-thread"),
+                  {"id": 10, "method": "execCommandApproval", "params": {"conversationId": "th1", "callId": "c"}},
+                  {"id": 11, "method": "item/permissions/requestApproval", "params": None},
+                  {"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "completed"}}}):
+            c.rpc.events.put(m)
+        status, text, err = c.run_turn("do it")
+        self.assertEqual((status, text), ("completed", ""))
+        self.assertEqual(c.rpc.answers, [(n, {"decision": "decline"}) for n in (7, 8, 9, 10, 11)], "every one is declined")
+        self.assertEqual(c.result_body(status, text, err),
+                         "[no reply] Codex completed the turn without a message: 1 command was not approved; "
+                         "it ran 2 commands, ran 1 web search; 1 command failed; 1 file change failed; "
+                         "1 tool call failed.")
+        self.assertEqual(c.turn_items, {"reasoning": 1, "commandExecution": 2, "webSearch": 1,
+                                        "commandExecution:failed": 1, "fileChange:failed": 1, "mcpToolCall:failed": 1})
+        self.assertEqual(c.turn_declined, ["item/commandExecution/requestApproval"])
+        self.assertEqual(len(c.declined), 6, "the task's metrics row still lists every decline")
+        # A request that arrives when no turn is running is declined and counted for no turn.
+        c.turn_id, c.turn_declined = None, []
+        c.handle_server_request({"id": 12, "method": "item/fileChange/requestApproval",
+                                 "params": {"threadId": "th1", "turnId": None}})
+        self.assertEqual((c.turn_declined, c.rpc.answers[-1]), ([], (12, {"decision": "decline"})))
+
+    def test_the_line_for_a_turn_without_a_message_is_fixed_words_and_counts(self):
+        why = cc.no_message_why
+        self.assertEqual(why([], {}), "")
+        self.assertEqual(why([], {"reasoning": 3, "agentMessage": 1, "userMessage": 1}), "", "nothing countable")
+        self.assertEqual(why(["applyPatchApproval", "item/fileChange/requestApproval", "execCommandApproval"], {}),
+                         "1 command was not approved; 2 file changes were not approved")
+        self.assertEqual(why(["item/permissions/requestApproval"], {"fileChange": 1, "mcpToolCall": 2, "webSearch": 2}),
+                         "1 permission request was not approved; it made 1 file change, made 2 tool calls, "
+                         "ran 2 web searches")
+        self.assertEqual(why(["some/new/requestApproval"], {"<script>": 4}), "", "an unknown name is never echoed")
+        self.assertEqual(why([], {"commandExecution:failed": 2, "fileChange:failed": 1}),
+                         "2 commands failed; 1 file change failed")
+        self.assertEqual(why([], {"webSearch:failed": 1, "<x>:failed": 2}), "", "only the failures it has words for")
+        outcome = cc.item_outcome
+        self.assertEqual([outcome({"type": "fileChange", "status": s}) for s in ("completed", "failed", "declined", "inProgress", "new")],
+                         ["fileChange", "fileChange:failed", "", "", ""])
+        self.assertEqual([outcome({"type": "webSearch"}), outcome({"type": 3}), outcome({})], ["webSearch", "", ""])
+
+    def test_a_restricted_thread_is_confined_to_its_own_folder_not_merely_read_only(self):
+        # Codex's read-only sandbox stops writes, not reads: a guest's turn could read the owner's files.
+        with tempfile.TemporaryDirectory() as d:
+            write_task(d, "task-chat-g", "[[config]] what is in my home?", tier="guest")
+            write_task(d, "task-chat-o", "[[config]] mine", tier="owner")
+            self.assertEqual(run_connector(d, once=2, extra=("--allow-non-owner",)), 0)
+            guest, owner = result(d, "task-chat-g"), result(d, "task-chat-o")
+            self.assertIn("[sandbox=None ephemeral=True cwd=", guest, "a sandbox beside the profile would win")
+            config = json.loads(guest.split(" config=", 1)[1])
+            self.assertEqual(config["default_permissions"], cc.CONFINED_PROFILE)
+            rules = config["permissions"][cc.CONFINED_PROFILE]["filesystem"]
+            self.assertEqual(rules[":minimal"], "read")
+            self.assertEqual(rules[":project_roots"], {".": "read"})
+            self.assertNotIn("write", json.dumps(rules))
+            self.assertIn("owner-mcp", config["mcp_servers"], "the integrations override is kept beside it")
+            self.assertIn("config=null", owner, "an owner's thread is not given the profile")
+
+    def test_a_restricted_turn_is_handed_copies_of_its_own_attachments_and_nothing_else_of_the_folder(self):
+        class Confined(FakeRpc):
+            def request(self, method, params=None, timeout=120):
+                self.calls.append(method)
+                if method == "config/read":
+                    return {"config": {"mcp_servers": {}}}
+                return {"thread": {"id": "th1"}, "turn": {"id": "t1"}, "activePermissionProfile": {"id": cc.CONFINED_PROFILE}}
+
+        with tempfile.TemporaryDirectory() as d:
+            media = Path(d).resolve() / "remote-media"
+            media.mkdir()
+            (media / "mine.png").write_bytes(b"PARROT-7391")
+            (media / "someone-elses.png").write_bytes(b"not this task's")
+            outside = Path(d).resolve() / "outside.txt"
+            outside.write_text("the owner's")
+            args = cc.build_parser().parse_args(["--work", "w", "--media-root", str(media)])
+            c = cc.Connector(Confined, args, note="n")
+            guest = {"access_tier": "guest", "collaborator": "false", "channel_id": "c",
+                     "attachments": json.dumps([{"locator": str(media / "mine.png")}, {"locator": str(outside)}])}
+            seen = []
+
+            def turn(prompt, model=None, cwd=None):
+                names = sorted(os.listdir(cwd)) if cwd == c.scratch_cwd else []
+                seen.append((prompt, cwd, names, [Path(cwd, n).read_bytes() for n in names]))
+                return "completed", "ok", None
+
+            c.run_turn = turn
+            said = "[Photo attached: %s] and %s and %s" % (media / "mine.png", outside, media / "someone-elses.png")
+            self.assertEqual(c.run_task(guest, said, cc.turn_policy(guest, True).capabilities)[:2], ("completed", "ok"))
+            (prompt, cwd, names, contents), = seen
+            self.assertEqual((names, contents), (["1-mine.png"], [b"PARROT-7391"]))
+            self.assertIn("[Photo attached: %s]" % os.path.join(cwd, "1-mine.png"), prompt)
+            self.assertNotIn(str(media / "mine.png"), prompt, "the turn is pointed at its copy")
+            self.assertIn(str(outside), prompt, "a path that was not staged is left as text; the profile refuses it")
+            c.drop_scratch()
+            owner = {"access_tier": "owner", "channel_id": "c", "attachments": guest["attachments"]}
+            c.open_owner_thread = lambda *a, **k: None
+            c.run_task(owner, said, cc.turn_policy(owner, True).capabilities)
+            self.assertEqual(seen[-1][0], said, "an owner's turn reads the files where they are")
+
+    def test_a_restricted_turn_is_not_run_when_the_thread_is_not_confined(self):
+        class Answers(FakeRpc):
+            answer = {"thread": {"id": "th1"}, "activePermissionProfile": None}
+
+            def request(self, method, params=None, timeout=120):
+                self.calls.append(method)
+                if method == "config/read":
+                    return {"config": {"mcp_servers": {}}}
+                if isinstance(self.answer, Exception):
+                    raise self.answer
+                return self.answer
+
+        args = cc.build_parser().parse_args(["--work", "w"])
+        guest = {"access_tier": "guest", "collaborator": "false", "channel_id": "c"}
+        for answer, said in ((Answers.answer, "permission profile None"),
+                             ({"thread": {"id": "th1"}, "activePermissionProfile": {"id": ":workspace"}}, "':workspace'"),
+                             (RuntimeError("thread/start: fs sandbox helper failed"), "fs sandbox helper failed")):
+            c = cc.Connector(Answers, args, note="n")
+            c.rpc.answer = answer
+            status, text, err = c.run_task(guest, "read my files", cc.turn_policy(guest, True).capabilities)
+            self.assertEqual((status, text), ("failed", ""), said)
+            self.assertIn("could not be confined to its own folder", err)
+            self.assertIn(said, err)
+            self.assertNotIn("turn/start", c.rpc.calls, "nothing was sent to a thread that is not confined")
+            c.drop_scratch()
+
+    def test_the_profile_names_what_codex_needs_to_start_itself_and_nothing_wider(self):
+        with tempfile.TemporaryDirectory() as d:
+            real = Path(d).resolve() / "store" / "releases" / "1.0" / "bin"
+            real.mkdir(parents=True)
+            (real / "codex").write_text("#!/bin/sh\n")
+            (real / "codex").chmod(0o755)
+            (Path(d).resolve() / "store" / "current").symlink_to("releases/1.0")
+            shim = Path(d).resolve() / "cli" / "bin"
+            shim.mkdir(parents=True)
+            (shim / "codex").symlink_to(Path(d).resolve() / "store" / "current" / "bin" / "codex")
+            folders = cc.link_folders(str(shim / "codex"))
+            self.assertEqual(folders, [str(shim), str(Path(d).resolve() / "store"), str(real)])
+            self.assertEqual(cc.link_folders(str(real / "codex")), [str(real)], "no link: its own folder only")
+            mac = cc.confined_permissions(str(shim / "codex"), "darwin")["permissions"][cc.CONFINED_PROFILE]["filesystem"]
+            self.assertEqual({k: v for k, v in mac.items() if v == "deny"}, {"/tmp": "deny", os.path.realpath("/tmp"): "deny"})
+            self.assertEqual(sorted(k for k, v in mac.items() if v == "read"), sorted([":minimal"] + folders))
+            linux = cc.confined_permissions(str(shim / "codex"), "linux")["permissions"][cc.CONFINED_PROFILE]["filesystem"]
+            self.assertNotIn("/tmp", linux, "a Linux turn's scratch dir is under /tmp")
+            # A name that resolves to nothing adds no folder: against the cwd it would open the work root.
+            for unknown in ("no-such-codex-anywhere", None, ""):
+                rules = cc.confined_permissions(unknown, "linux")["permissions"][cc.CONFINED_PROFILE]["filesystem"]
+                self.assertEqual(rules, {":minimal": "read", ":project_roots": {".": "read"}}, unknown)
 
     def test_result_bodies_are_plain_text(self):
         args = cc.build_parser().parse_args(["--work", "w"])
@@ -747,8 +1099,8 @@ class TurnCwdTest(unittest.TestCase):
             c.rpc, c.thread_id, c.scratch_cwd = Rpc(), "th", "/scratch"
             with mock.patch.object(c, "wait_turn", return_value=("completed", "ok", None)), \
                     mock.patch.object(cc.os, "getcwd", return_value="/now/here"):
-                c.run_turn("hi", None, c.turn_cwd(True))
-                c.run_turn("hi", "m", c.turn_cwd(False))
+                c.run_turn("hi", None, c.turn_cwd(task_io.OWNER_CAPABILITIES))
+                c.run_turn("hi", "m", c.turn_cwd(task_io.RESTRICTED_CAPABILITIES))
         self.assertEqual([(m, p.get("cwd"), p.get("model")) for m, p in calls],
                          [("turn/start", "/now/here", None), ("turn/start", "/scratch", "m")])
 

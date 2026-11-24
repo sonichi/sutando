@@ -21,16 +21,23 @@ from task_envelope import attested_task_headers  # noqa: E402
 # The channels a person types or speaks into. Machine writers (cron, health-check, the runtime API,
 # connectors, workstream grouping) use other sources and keep the turn-end path.
 HUMAN_SOURCES = frozenset({"ag2space", "discord", "telegram", "slack", "voice", "phone", "chat"})
+# What a bridge on a human channel writes on its own account, not for something the person said.
+MACHINE_INTERACTIONS = frozenset({"system_event"})
 # The envelope HMAC covers the whole file, so it is read whole; a larger file is not a mid-turn candidate.
 MAX_BYTES = 262_144
 
 
 def is_human_owner(text: str, workspace: Path) -> bool:
-    """Owner tier, a human channel, and a sender that is not an agent, from headers a body cannot forge."""
+    """Owner tier, a human channel, something the person said (not the bridge's own event), and a sender
+    that is not an agent, from headers a body cannot forge."""
     headers = attested_task_headers(text, workspace).headers
     if canonical_access_tier(headers.get("access_tier")) != "owner":
         return False
     if (headers.get("source") or "").strip().lower() not in HUMAN_SOURCES:
+        return False
+    # A human channel also carries what its bridge writes by itself (a call's end-of-session task):
+    # the bridge marks that `interaction_type: system_event`, above `task:`, where a body cannot.
+    if (headers.get("interaction_type") or "").strip().lower() in MACHINE_INTERACTIONS:
         return False
     return ".agent:" not in (headers.get("user_id") or "")
 

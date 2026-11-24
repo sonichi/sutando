@@ -80,6 +80,15 @@ case "$OUT" in
   *) bad "core does not block on a task delegated to a worker" "got: ${OUT:0:160}" ;;
 esac
 
+# 1b. The router writes a lease into the sentinel; its name, not its content, is the hold.
+printf '{"delivered_at":1789600000.0,"ttl_s":14400}' > "$WS/deliveries/$WORKER/$PROBE.txt"
+record_delivery
+OUT="$(bash "$HOOK" 2>&1)"
+case "$OUT" in
+  '{}') ok "core does not block on a delegation whose sentinel carries a lease" ;;
+  *) bad "core does not block on a delegation whose sentinel carries a lease" "got: ${OUT:0:160}" ;;
+esac
+
 # 2. ...same, but the worker has ACCEPTED it (.accepted suffix) — still not
 #    the core's to report.
 rm -f "$WS/deliveries/$WORKER/$PROBE.txt"

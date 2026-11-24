@@ -1,0 +1,16 @@
+#!/bin/bash
+# A Codex seat's tmux command (SUTANDO_CODEX_APP_SERVER=1): runs seat.py in place of the Codex TUI.
+# The launchers recognise the seat's window by this file's name, as they recognise a TUI by `codex`.
+set -euo pipefail
+case "$0" in
+  */*) _self_dir="${0%/*}" ;;
+  *)   _self_dir="." ;;
+esac
+REPO="$(cd "$_self_dir/../../../.." && pwd)"
+PY="${SUTANDO_PY:-}"
+if [ -z "$PY" ]; then
+  # shellcheck source=../../../../scripts/python-binary.sh
+  . "$REPO/scripts/python-binary.sh"
+  PY="$(require_python "$REPO" "run the Codex app-server seat")" || exit 1
+fi
+exec "$PY" "$REPO/src/agent/codex/app-server/seat.py" run "$@"
