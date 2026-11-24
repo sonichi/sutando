@@ -348,9 +348,25 @@ class LimitMenu(NoticeBase):
         quota_card.remember_room(self.root, DM)
         self.assertEqual(self.tick(TURN_MENU), "quota-card")
         quota_card.save(self.root, dict(quota_card.load(self.root), told=True))
+        # A message already waiting is known a moment after the limit: the card just posted answers it. Each
+        # limit used to put two identical cards in the owner's DM, the unasked one and this message's.
         self.task("task-t1", "hello?")
-        self.assertEqual(self.tick(TURN_MENU, 30.0), "quota-task-card x1")
+        self.assertEqual(self.tick(TURN_MENU, 30.0), "")
+        self.assertEqual(len(self.queued()), 1)
+        self.assertEqual(self.tick(TURN_MENU, 600.0), "", "and it is not told later either")
+        # A message long after that card is answered with its own.
+        self.task("task-t2", "still limited?")
+        self.assertEqual(self.tick(TURN_MENU, 5.0), "quota-task-card x1")
         self.assertEqual(len(self.queued()), 2)
+
+    def test_a_message_from_another_room_or_before_the_unasked_card_gets_its_own_card(self):
+        self.assertTrue(quota_card._just_carded({"qid": "q", "queued": 100.0}, DM, DM, 130.0), "queued, not yet posted")
+        for rec, to, at, why in (({"told": True, "queued": 100.0}, "!other:s.space", 130.0, "another room"),
+                                 ({"told": True, "queued": 100.0}, DM, 100.0 + quota_card.SAME_CARD_S, "long after"),
+                                 ({"told": True, "by_tasks": True}, DM, 130.0, "no unasked card was sent"),
+                                 ({"told": True, "unknown": True, "queued": 100.0}, DM, 130.0, "it may never have shown"),
+                                 ({}, DM, 130.0, "nothing sent yet")):
+            self.assertFalse(quota_card._just_carded(rec, to, DM, at), why)
 
     def test_a_new_session_is_a_new_incident(self):
         quota_card.remember_room(self.root, DM)

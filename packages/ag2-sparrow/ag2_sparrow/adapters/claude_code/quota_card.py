@@ -42,6 +42,7 @@ FILE = "quota-card.json"        # the incident: the supervisor's alone
 ROOM_FILE = "quota-room.json"   # the owner's DM room: the claim's alone
 
 CLEAR_S = 600.0         # the banner gone this long: the limit is over, and a later one is a new card
+SAME_CARD_S = 120.0     # a message known this soon after the unasked card is answered by that card
 RETRY_S = 60.0          # a card that could not be queued is tried again no sooner than this
 UNKNOWN_S = 2 * connector_cards.MAX_QUEUED_S
 TAIL_LINES = 8          # a banner this near the bottom is the limit the session sits at, not old scrollback
@@ -190,6 +191,13 @@ def current(text: str) -> bool:
     return any(rx.match(ln) for ln in tail for rx in _LIMIT)
 
 
+def _just_carded(rec: dict, to: str, dm: str, at: float) -> bool:
+    """Whether the incident's own unasked card went to this room a moment ago: a message that was already
+    waiting is known just after the limit is, and a second, identical card under the first helps nobody."""
+    sent = (rec.get("qid") or rec.get("told")) and not rec.get("by_tasks") and not rec.get("unknown")
+    return bool(sent) and to == dm and at - float(rec.get("queued") or 0) < SAME_CARD_S
+
+
 def _tell_tasks(root, cfg: dict, bridge: str, limited: list, text: str, log, rec: dict, at: float) -> "tuple[dict, list]":
     """Each owner task with no answer gets the card once: (the incident record with its `tasks` entries,
     what was done for each task this tick). An entry keeps its card's key and queue id; a card the bridge
@@ -222,6 +230,9 @@ def _tell_tasks(root, cfg: dict, bridge: str, limited: list, text: str, log, rec
             continue
         if not to:
             done.append("quota-no-room")
+            continue
+        if _just_carded(rec, to, room(root), at):
+            tasks[task_id] = {"skip": True}     # the incident's card, just put in this room, answers it
             continue
         if not card_desk.usable(bridge):
             done.append("quota-not-posted")
