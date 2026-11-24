@@ -104,12 +104,16 @@ PYEOF
   [ "${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}" = "$SOCK" ] || export SUTANDO_TMUX_SOCKET="$SOCK"
   [ "${SUTANDO_TMUX_SESSION:-sutando-core}" = "$SESSION" ] || export SUTANDO_TMUX_SESSION="$SESSION"
   LOG="$STATE_DIR/.model-switch-launch.log"
-  # core_restart: the app's ctl under its launch lock in the desktop bundle, else the launcher (13: refused).
+  # core_restart: start-if-down under the app's launch lock in the desktop bundle, else the launcher (13: refused).
   "$PY" "$REPO/src/core_restart.py" restart --start --workspace "$(dirname "$STATE_DIR")" --caller switch-model \
     --repo "$REPO" --start-cli "$LAUNCHER" < /dev/null > "$LOG" 2>&1; LRC=$?
   if [ "$LRC" = 0 ]; then
     echo "switched: model=$MODEL (was ${OUT#OK }); the core was paused for a provider limit, so it is starting on $MODEL now; record: $STATE_DIR/model-switch.json"
     exit 0
+  fi
+  if [ "$LRC" = 14 ]; then
+    echo "switch-model: set model=$MODEL for the next launch, but a core started meanwhile and was left running; run the switch again to apply it live." >&2
+    exit 11
   fi
   WHY="$(grep -m1 'not launched' "$LOG" 2>/dev/null | sed 's/.*not launched — //')"
   echo "switch-model: set model=$MODEL for the next launch, but the core did not start (launcher rc=$LRC${WHY:+: $WHY}); log: $LOG" >&2

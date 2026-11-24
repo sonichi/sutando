@@ -14,7 +14,7 @@ gateway's session. Anywhere else the restart is `src/agent/start-cli.sh --restar
                                         [--start] [--start-cli PATH] [-- START_CLI_ARGS...]
         resolve and run a restart in the foreground; exits with its code, or REFUSED_EXIT
     python3 src/core_restart.py ctl --ctl PATH --workspace W --caller NAME
-                                    [--hitl-id ID --revision N] [--runtime R]
+                                    [--hitl-id ID --revision N] [--runtime R] [--start]
         run the ctl's restart-core between its intent and outcome lines; exits with the ctl's code
     python3 src/core_restart.py start-cli --start-cli PATH --workspace W --caller NAME
                                     [--hitl-id ID --revision N] [--runtime R] [-- ARGS...]
@@ -23,7 +23,10 @@ gateway's session. Anywhere else the restart is `src/agent/start-cli.sh --restar
 A runtime switch through the ctl takes the app's launch lock itself (the ctl then skips it), makes
 the runtime the desktop's selection (the app's launcher reads it), runs the ctl, and when the ctl
 does not exit 0 puts the previous selection back (none, if there was none) unless a newer choice
-replaced it meanwhile; all of it under that one hold.
+replaced it meanwhile; all of it under that one hold. A lock that cannot be opened refuses before
+anything is written. `--start` (a paused core started again) takes the same lock, reads the ctl's
+`status` under it and runs the app's `launch-sutando.sh` only when the core is down; a core that is
+running is left alone (ALREADY_RUNNING_EXIT), so a start never stops anything.
 """
 from __future__ import annotations
 
@@ -53,6 +56,11 @@ DESKTOP_CTL = "sutando-ctl.sh"
 CTL_LAUNCH_LOCK_BUSY = 12
 #: This module's exit when it refused before anything ran; no launcher or ctl code uses it.
 REFUSED_EXIT = 13
+#: A `start` that found the core already running under the launch lock: nothing was stopped or started.
+ALREADY_RUNNING_EXIT = 14
+#: The app's own ensure-running launcher beside the ctl, and the ctl's read-only status probe.
+DESKTOP_LAUNCHER = "launch-sutando.sh"
+CTL_STATUS_TIMEOUT_S = 15
 #: Set by an app launcher run that holds the lock; a restart requested from here never inherits it.
 LOCK_MARKER = "SUTANDO_ENGINE_LAUNCH_LOCK_HELD"
 #: The app's launch lock under its app-support dir, and how long the ctl waits for it.
@@ -98,7 +106,7 @@ def route(repo: Path, env: Dict, runner: Runner, *, workspace: Path, caller: str
           start: bool = False) -> Tuple[Optional[List[str]], str]:
     """(argv, via) for one core restart; argv None when nothing may run. `env` is the restart's
     environment and is updated for the ctl. Only the ctl's capability probe runs here. `start`
-    starts a core that is down: start-cli with no flag, or the ctl's restart-core in the bundle."""
+    starts a core that is down: start-cli with no flag, or `ctl --start` (start-if-down) in the bundle."""
     app_support = sutando_config.desktop_app_support(repo)
     if app_support is None:
         via = VIA_START_CLI
@@ -124,6 +132,8 @@ def route(repo: Path, env: Dict, runner: Runner, *, workspace: Path, caller: str
         argv += ["--hitl-id", hitl_id, "--revision", str(int(revision or 0))]
     if runtime:
         argv += ["--runtime", runtime]
+    if start:
+        argv += ["--start"]
     return argv, VIA_CTL
 
 
@@ -175,28 +185,65 @@ def take_launch_lock(lock: Path, wait_s: float, sleep: Callable[[float], None] =
             sleep(0.2)
 
 
+def _core_state(ctl: Path, env: Dict, runner: Runner) -> str:
+    """`running`, `stopped` or "" (unknown) from the ctl's read-only `status` line."""
+    try:
+        run = runner(["bash", str(ctl), "status"], capture_output=True, text=True,
+                     timeout=CTL_STATUS_TIMEOUT_S, env=env, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if run.returncode != 0:
+        return ""
+    states = [t[len("core="):] for t in (run.stdout or "").split() if t.startswith("core=")]
+    return states[0] if states and states[0] in ("running", "stopped") else ""
+
+
 def run_ctl(ctl: Path, workspace: Path, caller: str, *, hitl_id: str = "", revision: Optional[int] = None,
             runtime: Optional[str] = None, runner: Runner = subprocess.run, env: Optional[Dict] = None,
             repo: Path = REPO, now: Callable[[], float] = time.time,
-            lock_wait_s: Optional[float] = None) -> int:
+            lock_wait_s: Optional[float] = None, start: bool = False) -> int:
     """Run the ctl's restart-core between one intent and one outcome audit line; its exit code.
-    A runtime switch writes, restarts and rolls back under one hold of the app's launch lock."""
+    A runtime switch writes, restarts and rolls back under one hold of the app's launch lock, and a
+    `start` reads the core's state under that hold and launches only a core that is down."""
     base = _audit_base(VIA_CTL, caller, hitl_id, revision, runtime)
+    if start:
+        base["start"] = True
     _audit(workspace, dict(base, phase=INTENT, at=int(now())))
     env = dict(os.environ if env is None else env)
     env.pop(LOCK_MARKER, None)
+
+    def end(outcome: str, rc: Optional[int], reason: str = "") -> int:
+        line = dict(base, phase=OUTCOME, at=int(now()), outcome=outcome)
+        if rc is not None:
+            line["rc"] = rc
+        if reason:
+            line["reason"] = reason
+        _audit(workspace, line)
+        return 1 if rc is None else rc
+
     held = None
     try:
-        if runtime:
+        if runtime or start:
             app = env.get("SUTANDO_APP_SUPPORT") or str(sutando_config.desktop_app_support(repo) or "")
             env["SUTANDO_APP_SUPPORT"] = app
             lock = os.path.join(app, "run", LAUNCH_LOCK_FILE)
             wait = float(env.get(LOCK_WAIT_ENV) or DEFAULT_LOCK_WAIT_S) if lock_wait_s is None else lock_wait_s
             held, state = take_launch_lock(Path(lock), wait)
             if state == LOCK_BUSY:
-                _audit(workspace, dict(base, phase=OUTCOME, at=int(now()), outcome="failed",
-                                       rc=CTL_LAUNCH_LOCK_BUSY, reason="launch-lock-busy"))
-                return CTL_LAUNCH_LOCK_BUSY
+                return end("failed", CTL_LAUNCH_LOCK_BUSY, "launch-lock-busy")
+            if held is None:
+                return end("refused", REFUSED_EXIT, "launch-lock-unavailable")  # nothing was changed
+        if start:
+            # Read under the hold: a core that came up while the lock was awaited is never restarted.
+            core = _core_state(ctl, env, runner)
+            if core == "running":
+                return end("skipped", ALREADY_RUNNING_EXIT, "core-already-running")
+            launcher = Path(ctl).parent / DESKTOP_LAUNCHER
+            if core != "stopped" or not launcher.is_file():
+                return end("refused", REFUSED_EXIT, "core-state-unknown" if core != "stopped" else "launcher-missing")
+            argv = ["bash", str(launcher)]
+        else:
+            argv = ["bash", str(ctl), "restart-core"]
             if held is not None:
                 env[LOCK_MARKER] = lock  # the ctl skips the lock this process already holds
         rc, changed, previous = None, False, ""
@@ -205,11 +252,9 @@ def run_ctl(ctl: Path, workspace: Path, caller: str, *, hitl_id: str = "", revis
             try:
                 changed = sutando_config.persist_desktop_runtime_selection(runtime, repo) == "updated"
             except (OSError, ValueError):
-                _audit(workspace, dict(base, phase=OUTCOME, at=int(now()), outcome="refused",
-                                       reason="runtime-not-selectable"))
-                return REFUSED_EXIT
+                return end("refused", REFUSED_EXIT, "runtime-not-selectable")
         try:
-            rc = runner(["bash", str(ctl), "restart-core"], env=env, stdin=subprocess.DEVNULL).returncode
+            rc = runner(argv, env=env, stdin=subprocess.DEVNULL).returncode
         except (OSError, subprocess.SubprocessError):
             rc = None
         if rc != 0 and changed:
@@ -220,11 +265,7 @@ def run_ctl(ctl: Path, workspace: Path, caller: str, *, hitl_id: str = "", revis
     finally:
         if held is not None:
             held.close()
-    outcome = dict(base, phase=OUTCOME, at=int(now()), outcome="done" if rc == 0 else "failed")
-    if rc is not None:
-        outcome["rc"] = rc
-    _audit(workspace, outcome)
-    return 1 if rc is None else rc
+    return end("done" if rc == 0 else "failed", rc)
 
 
 def run_start_cli(workspace: Path, caller: str, *, via: str = VIA_START_CLI,
@@ -264,7 +305,7 @@ def restart(workspace: Path, caller: str, *, runtime: Optional[str] = None, extr
         execv(argv[0], argv, env)
         return 1  # execvpe only returns in a test double
     ctl = Path(argv[argv.index("--ctl") + 1])
-    return run_ctl(ctl, workspace, caller, runtime=runtime, runner=runner, env=env, repo=repo)
+    return run_ctl(ctl, workspace, caller, runtime=runtime, runner=runner, env=env, repo=repo, start=start)
 
 
 def main(argv=None) -> int:
@@ -285,6 +326,7 @@ def main(argv=None) -> int:
     c.add_argument("--hitl-id", default="")
     c.add_argument("--revision", type=int, default=None)
     c.add_argument("--runtime", default=None)
+    c.add_argument("--start", action="store_true", help="start the core only if it is down; never stops one")
     s = sub.add_parser("start-cli")
     s.add_argument("--workspace", required=True)
     s.add_argument("--caller", required=True)
@@ -298,7 +340,7 @@ def main(argv=None) -> int:
     a = p.parse_args(argv)
     if a.cmd == "ctl":
         return run_ctl(Path(a.ctl), Path(a.workspace), a.caller, hitl_id=a.hitl_id,
-                       revision=a.revision, runtime=a.runtime)
+                       revision=a.revision, runtime=a.runtime, start=a.start)
     if a.cmd == "start-cli":
         extra = a.extra[1:] if a.extra[:1] == ["--"] else a.extra
         return run_start_cli(Path(a.workspace), a.caller, via=a.via, hitl_id=a.hitl_id,

@@ -109,7 +109,8 @@ class Route(Base):
     def test_a_start_in_the_bundle_is_the_ctl_like_a_restart(self):
         self.desktop()
         argv, via = self.route(self.bundle, start=True, start_cli="/x/L")
-        self.assertEqual((via, argv[2]), (CR.VIA_CTL, "ctl"))
+        self.assertEqual((via, argv[2], argv[-1]), (CR.VIA_CTL, "ctl", "--start"))
+        self.assertNotIn("--start", self.route(self.bundle)[0])
 
     def test_a_given_launcher_is_kept_outside_the_app(self):
         argv, _via = self.route(self.clone, start_cli="/x/L")
@@ -295,13 +296,20 @@ class RunCtl(Base):
                        repo=self.bundle)
         self.assertEqual(take.call_args[0][1], 7.0)
 
-    def test_a_lock_that_cannot_be_opened_is_left_to_the_ctl(self):
+    def test_a_lock_that_cannot_be_opened_refuses_before_the_selection_or_the_ctl_changes(self):
         self.desktop()
-        (self.app / "runtime.json").write_text(json.dumps({"coreRuntime": "claude"}))
+        selection = self.app / "runtime.json"
+        before = json.dumps({"coreRuntime": "claude", "other": 1})
+        selection.write_text(before)
         (self.app / "run").write_text("a file where the run dir would be")
         run = Run(rc=0)
-        self.assertEqual(CR.run_ctl(self.ctl, self.ws, "x", runtime="codex", runner=run, env={}, repo=self.bundle), 0)
-        self.assertNotIn(CR.LOCK_MARKER, run.calls[-1][1]["env"], "the ctl takes the lock itself, as it would")
+        with mock.patch.object(sutando_config, "persist_desktop_runtime_selection") as persist:
+            rc = CR.run_ctl(self.ctl, self.ws, "x", runtime="codex", runner=run, env={}, repo=self.bundle)
+        self.assertEqual((rc, run.calls), (CR.REFUSED_EXIT, []), "the controller never ran")
+        persist.assert_not_called()
+        self.assertEqual(selection.read_text(), before, "the selection is byte-for-byte what it was")
+        last = self.audit()[-1]
+        self.assertEqual((last["outcome"], last["reason"]), ("refused", "launch-lock-unavailable"))
 
 
     def test_an_unselectable_runtime_is_refused_before_the_ctl_runs(self):
@@ -311,6 +319,105 @@ class RunCtl(Base):
         rc = CR.run_ctl(self.ctl, self.ws, "x", runtime="codex", runner=run, env={}, repo=self.bundle)
         self.assertEqual((rc, run.calls), (CR.REFUSED_EXIT, []))
         self.assertEqual((self.audit()[-1]["outcome"], self.audit()[-1]["reason"]), ("refused", "runtime-not-selectable"))
+
+
+class StartIfDown(Base):
+    """A start (a paused core started again) never stops anything: under the launch lock it reads the
+    ctl's status, and only a core that is down is started, by the app's launcher."""
+
+    def setUp(self):
+        super().setUp()
+        self.desktop()
+        self.launcher = self.app / "engine" / CR.DESKTOP_LAUNCHER
+        self.launcher.write_text("#!/bin/bash\n")
+        self.core = "stopped"
+        self.calls = []
+        self.launch_rc = 0
+
+    def fake(self, argv, **kw):
+        self.calls.append((list(argv), kw))
+        if argv[-1] == "status":
+            return subprocess.CompletedProcess(argv, 0, stdout=f"core={self.core} gateway=running availability=x\n")
+        return subprocess.CompletedProcess(argv, self.launch_rc, stdout="")
+
+    def start(self, **kw):
+        return CR.run_ctl(self.ctl, self.ws, "switch-model", start=True, runner=lambda argv, **kw: self.fake(argv, **kw), env={},
+                          repo=self.bundle, **kw)
+
+    def test_a_core_that_is_down_is_started_by_the_launcher_under_the_lock(self):
+        import fcntl
+        lock = self.app / "run" / CR.LAUNCH_LOCK_FILE
+        held = []
+        real = self.fake
+
+        def run(argv, **kw):
+            with open(lock, "a") as probe:
+                try:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    held.append(False)
+                except OSError:
+                    held.append(True)
+            return real(argv, **kw)
+        self.fake = run
+        self.assertEqual(self.start(), 0)
+        self.assertEqual([a for a, _kw in self.calls],
+                         [["bash", str(self.ctl), "status"], ["bash", str(self.launcher)]])
+        self.assertEqual(held, [True, True], "the status read and the launch are inside one hold")
+        self.assertNotIn(CR.LOCK_MARKER, self.calls[-1][1]["env"], "the launcher's children never inherit the marker")
+        self.assertEqual([(r["phase"], r.get("outcome")) for r in self.audit()], [("intent", None), ("outcome", "done")])
+
+    def test_a_core_that_came_up_while_the_lock_was_awaited_is_left_running(self):
+        # The caller saw no core; one starts while this waits for the launch lock.
+        real = CR.take_launch_lock
+
+        def take(lock, wait):
+            self.core = "running"
+            return real(lock, wait)
+        with mock.patch.object(CR, "take_launch_lock", side_effect=take):
+            rc = self.start()
+        self.assertEqual(rc, CR.ALREADY_RUNNING_EXIT)
+        self.assertEqual([a[-1] for a, _kw in self.calls], ["status"], "nothing was stopped or started")
+        last = self.audit()[-1]
+        self.assertEqual((last["outcome"], last["reason"]), ("skipped", "core-already-running"))
+
+    def test_the_launchers_exit_code_is_the_outcome(self):
+        self.launch_rc = 75
+        self.assertEqual(self.start(), 75)
+        self.assertEqual((self.audit()[-1]["outcome"], self.audit()[-1]["rc"]), ("failed", 75))
+
+    def test_an_unreadable_status_starts_nothing(self):
+        for name, runner in (("no token", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, stdout="?\n")),
+                             ("fails", lambda argv, **kw: subprocess.CompletedProcess(argv, 1, stdout="core=stopped")),
+                             ("hangs", mock.Mock(side_effect=subprocess.TimeoutExpired("x", 5)))):
+            with self.subTest(name):
+                calls = []
+
+                def run(argv, _r=runner, **kw):
+                    calls.append(argv[-1])
+                    return _r(argv, **kw)
+                rc = CR.run_ctl(self.ctl, self.ws, "x", start=True, runner=run, env={}, repo=self.bundle)
+                self.assertEqual((rc, calls), (CR.REFUSED_EXIT, ["status"]))
+                self.assertEqual(self.audit()[-1]["reason"], "core-state-unknown")
+
+    def test_without_the_apps_launcher_nothing_runs_after_the_status_read(self):
+        self.launcher.unlink()
+        self.assertEqual(self.start(), CR.REFUSED_EXIT)
+        self.assertEqual([a[-1] for a, _kw in self.calls], ["status"])
+        self.assertEqual(self.audit()[-1]["reason"], "launcher-missing")
+
+    def test_a_busy_or_unopenable_lock_reads_and_starts_nothing(self):
+        import fcntl
+        lock = self.app / "run" / CR.LAUNCH_LOCK_FILE
+        lock.parent.mkdir(parents=True)
+        with open(lock, "a") as other:
+            fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(self.start(lock_wait_s=0), CR.CTL_LAUNCH_LOCK_BUSY)
+        lock.unlink()
+        lock.parent.rmdir()
+        (self.app / "run").write_text("a file where the run dir would be")
+        self.assertEqual(self.start(), CR.REFUSED_EXIT)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.audit()[-1]["reason"], "launch-lock-unavailable")
 
 
 class RestoreSelection(Base):
@@ -402,11 +509,20 @@ class Restart(Base):
         self.assertEqual(run.argvs()[-1], ["bash", str(self.ctl), "restart-core"])
         self.assertEqual([r["phase"] for r in self.audit()], ["intent", "outcome"])
 
+    def test_a_start_in_the_bundle_is_a_start_if_down_not_a_restart(self):
+        self.desktop()
+        with mock.patch.object(CR, "run_ctl", return_value=CR.ALREADY_RUNNING_EXIT) as rc_:
+            rc = CR.restart(self.ws, "switch-model", repo=self.bundle, runner=Run(), execv=mock.Mock(), start=True)
+        self.assertEqual(rc, CR.ALREADY_RUNNING_EXIT)
+        self.assertTrue(rc_.call_args.kwargs["start"])
+
     def test_the_cli_dispatches_each_verb(self):
         with mock.patch.object(CR, "run_ctl", return_value=12) as rc_:
             self.assertEqual(CR.main(["ctl", "--ctl", "/c", "--workspace", "/w", "--caller", "c",
                                       "--hitl-id", "h", "--revision", "2", "--runtime", "codex"]), 12)
-        rc_.assert_called_once_with(Path("/c"), Path("/w"), "c", hitl_id="h", revision=2, runtime="codex")
+            CR.main(["ctl", "--ctl", "/c", "--workspace", "/w", "--caller", "c", "--start"])
+        rc_.assert_any_call(Path("/c"), Path("/w"), "c", hitl_id="h", revision=2, runtime="codex", start=False)
+        self.assertTrue(rc_.call_args.kwargs["start"])
         with mock.patch.object(CR, "run_start_cli", return_value=7) as sc:
             self.assertEqual(CR.main(["start-cli", "--workspace", "/w", "--caller", "c", "--via",
                                       "start-cli-fallback", "--start-cli", "/s", "--hitl-id", "h",

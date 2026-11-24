@@ -155,7 +155,8 @@ restart never overlaps the app's own launcher. A standalone clone, even with
 restart was used and the audit adds `via_reason: not-bundle`. The audit line's `via` says which:
 `ctl`, `ctl-missing`, `ctl-no-lock`, `start-cli` or `start-cli-fallback`. Switch runtime takes
 the same route. Through the ctl it takes the app's launch lock itself (`SUTANDO_CTL_LAUNCH_LOCK_WAIT_S`,
-default 60 s; busy is `rc: 12`, nothing changed), writes the runtime as the desktop's selection (the
+default 60 s; busy is `rc: 12`, and a lock file that cannot be opened is refused, `rc: 13`; nothing
+changed either way), writes the runtime as the desktop's selection (the
 app's launcher reads it), runs the ctl inside that hold, and if the ctl does not exit 0 puts the
 previous selection back (removes it when there was none) unless a newer choice replaced it
 meanwhile. Elsewhere it runs `start-cli.sh --runtime <r> --restart`.
@@ -164,7 +165,9 @@ That route is `src/core_restart.py`, and every engine core restart takes it: the
 paused core's retry (`core_limit_hold` relaunch), `src/agent/graceful-restart.sh` (exit 13 when
 refused; a restart that did not happen releases its restart lock), `health-check.py --recover-core`
 and `switch-model.sh` starting a core paused for a provider limit (`core_restart.py restart --start`:
-the launcher with no flag outside the bundle, the ctl's restart-core in it). `tests/core-restart-callers.test.py` fails on any
+the launcher with no flag outside the bundle; in it, under the launch lock, the ctl's `status` is
+read and the app's `launch-sutando.sh` runs only when the core is down, while a core that is running
+is left alone, `outcome: skipped`, `rc: 14`). `tests/core-restart-callers.test.py` fails on any
 other `start-cli.sh --restart` caller, and on any other direct `start-cli.sh` / `launch-sutando.sh`
 invocation. Both the ctl and standalone launcher run inside a
 `core_restart.py` recorder, which appends two `state/recovery/audit.jsonl` lines:
