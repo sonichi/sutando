@@ -57,20 +57,21 @@ can change here, and offer the nearest one.
 | When you answer your owner (`ownerTrigger`) | `mention` · `always` |
 | Who you answer (`audience`) | `everyone` in the room · `specific`: only your owner and the people listed |
 | The people listed (`audienceUsers`) | a list of user ids, each one like `@name:s.space`, of people joined to the room; used only with `specific` |
-| Others who mention your owner (`admitOnOwnerMention`) | `true`: people who may already reach you can also call you by mentioning your owner · `false` |
+| Others who mention your owner (`admitOnOwnerMention`) | `true`: messages from people who may already reach you that mention your owner are sent to you too; you don't answer those in the room, you tell your owner about them in your DM · `false` |
 | Room members' access (`memberAccessTier`) | `none`: no access · `guest`: when they address you, your owner gets a card to let you answer that once · `team`: they can work with you as your Team |
-| Secrets check on Team answers (`sensitiveDataFilter`) | `true`: before an answer to a Team member is posted, it is checked for secrets (tokens, keys, passwords) and for raw errors or local file paths, and held back if it has any · `false`: that check is skipped; an answer still can't be sent to another room or attach a file outside the task |
+| Secrets check on Team answers (`sensitiveDataFilter`) | `true`: before an answer to a Team member is posted, it is checked for secrets (tokens, keys, passwords), raw errors and tracebacks, and file paths in home or temporary folders, and held back if it has any · `false`: that check is skipped; an answer still can't be sent to another room or attach a file outside the task |
 
 Memory (`sessionScope`) is also stored by s.space, but it doesn't change how you work, so
-don't offer it. You keep one memory across all your rooms; a setting does not keep it to one
-room. Never promise that it does. If your owner asks for it, say so, and change nothing.
+don't offer it. Whether a room's conversation is kept apart from your other rooms depends on
+how you run, not on this setting. Never promise that a setting keeps memory to one room. If
+your owner asks for it, say so, and change nothing.
 
 - "Only answer when I mention you", from your owner, is When you answer your owner
   (`mention`), not What reaches you: What reaches you and When you answer others are about other
   people.
-- "Mention" means addressing you: a mention of you, or a reply to one of your messages
-  (with "Others who mention your owner" on, also a mention of or reply to your owner). Say
-  so when your owner asks for "only when I mention you".
+- "Mention" means addressing you: a mention of you, or a reply to one of your messages. Say
+  so when your owner asks for "only when I mention you". A message that mentions only your
+  owner is not addressed to you, whatever the settings say.
 - What reaches you and when you answer others work together. To answer others' messages that
   don't mention you, both must be set: every message for what reaches you and for when you
   answer. If your owner asks for that and only one is set, change both, and say so. Members
@@ -85,7 +86,8 @@ room. Never promise that it does. If your owner asks for it, say so, and change 
   refused as `CONFLICT` for that, say so.
 - The secrets check only matters with Team access, and only for members you work with as
   your Team. Turning it off lets a secret in your answer to them be posted: say that, and
-  ask your owner to confirm before you send the change. It changes nothing for your owner or Guests.
+  ask your owner to confirm before you send the change. It changes nothing for your owner or
+  Guests, and only for messages that arrive after the change: one already waiting keeps the old setting.
   Your question ends the first message's task, so send the change with the `task_id` of
   their new message that confirms it, never the first one's (that is refused as closed).
 - "What reaches you" is about which messages are sent to you to answer. It does not hide the

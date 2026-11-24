@@ -26,8 +26,8 @@ task_id = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(task_id)
 
 
-def task(*headers: str, body: str = "only answer when I mention you") -> str:
-    return "\n".join(headers) + f"\ntask: {body}\n"
+def task(*headers: str, body: str = "only answer when I mention you", room: str = "channel_id: !r:s.space") -> str:
+    return "\n".join((room,) + headers) + f"\ntask: {body}\n"
 
 
 def section(text: str, heading: str) -> str:
@@ -70,6 +70,21 @@ class TestTaskId(unittest.TestCase):
 
     def test_no_id_is_its_own_exit(self):
         self.assertEqual(task_id.wire_task_id(task("access_tier: owner"))[0], task_id.NO_TASK)
+
+    def test_local_chat_and_other_channels_have_no_id(self):
+        chat = task("id: task-chat-1", "source: chat", "access_tier: owner", room="")
+        self.assertEqual(task_id.wire_task_id(chat)[0], task_id.NO_TASK)
+        discord = task("id: task-1", "source: discord", "access_tier: owner", room="channel_id: 1234")
+        self.assertEqual(task_id.wire_task_id(discord)[0], task_id.NO_TASK)
+        by_room = task("id: task-1", "access_tier: owner", room="source_room_id: !r:s.space")
+        self.assertEqual(task_id.wire_task_id(by_room), (0, "task-1"))
+
+    def test_requeued_copy_has_no_id_unless_the_header_names_it(self):
+        requeued = task("id: task-1-requeue-1", "access_tier: owner", body="hi\ndedup_requeue_count: 1")
+        self.assertEqual(task_id.wire_task_id(requeued)[0], task_id.NO_TASK)
+        kept = task("id: task-1-requeue-1", "task_id: task-1", "access_tier: owner",
+                    body="hi\ndedup_requeue_count: 1")
+        self.assertEqual(task_id.wire_task_id(kept), (0, "task-1"))
 
     def test_cli_exit_codes(self):
         with tempfile.TemporaryDirectory() as d:
@@ -146,19 +161,21 @@ class TestSkillRules(unittest.TestCase):
         self.assertIn("Offer only these choices.", settings)
 
     def test_session_scope_is_not_offered(self):
-        settings = section(self.text, "The settings")
-        self.assertNotRegex(settings, r"(?m)^\|.*sessionScope")
+        settings = " ".join(section(self.text, "The settings").split())
+        self.assertNotRegex(section(self.text, "The settings"), r"(?m)^\|.*sessionScope")
         self.assertIn("don't offer it", settings)
-        self.assertIn("You keep one memory across all your rooms", settings)
+        self.assertIn("depends on how you run, not on this setting", settings)
+        self.assertIn("Never promise that a setting keeps memory to one room.", settings)
 
     def test_secrets_check_says_what_off_does(self):
         """Off skips only the Team scan (secrets, raw errors, local paths); the redirect and
         attach refusals stay (policy/egress/result.py scan_team_result)."""
         settings = " ".join(section(self.text, "The settings").split())
-        self.assertIn("checked for secrets (tokens, keys, passwords) and for raw errors or local file paths", settings)
+        self.assertIn("checked for secrets (tokens, keys, passwords), raw errors and tracebacks, and file paths in home or temporary folders", settings)
+        self.assertIn("only for messages that arrive after the change", settings)
         self.assertIn("still can't be sent to another room or attach a file outside the task", settings)
         self.assertIn("ask your owner to confirm before you send the change", settings)
-        self.assertIn("It changes nothing for your owner or Guests.", settings)
+        self.assertIn("It changes nothing for your owner or Guests,", settings)
 
     def test_listed_people_are_joined_members(self):
         settings = section(self.text, "The settings")
@@ -189,6 +206,8 @@ class TestSkillRules(unittest.TestCase):
         self.assertIn("You can't give it to one person", settings)
         self.assertIn("Members with Guest access must still address you either way", settings)
         self.assertIn("a reply to one of your messages", settings)
+        self.assertIn("A message that mentions only your owner is not addressed to you", settings)
+        self.assertIn("you don't answer those in the room, you tell your owner about them in your DM", settings)
 
     def test_sutando_tool_names(self):
         self.assertNotIn("s_space_", self.text)
