@@ -14,6 +14,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+isolate_os_environ()
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ag2_sparrow import signin_watch  # noqa: E402
