@@ -17,7 +17,9 @@ What became of a queued card outlives both files: the bridge leaves `outcomes/<q
 did not answer, which may have gone through), kept as long as a key's marker. A connector that looks
 after the receipt was absorbed still reads a fact (`outcome`) and never infers one from a file's
 absence. An `unsure` card may be queued again under its own key (`again`): the same queue id, so the
-same dedupe key at the server, which makes the repeat one message.
+same dedupe key at the server, which makes the repeat one message. Only the bridge writes or replaces
+an outcome; a connector never removes one, so it cannot erase what a sweep has just recorded. A
+requeued entry stays `attempted`: `unsure` stands until the bridge records `posted`.
 
 Queue and posted files live under the bridge's state dir (`agent-cards/outbox`, `agent-cards/posted`);
 the bridge never writes into the work root. Standard library only, plus the bundled card modules.
@@ -100,15 +102,13 @@ def queue(bridge_state, room: str, body: str, card: dict, *, now=None, key: str 
     else:
         qid = "%016x%s" % (int(at_ns) & 0xFFFFFFFFFFFFFFFF, hashlib.sha256(key.encode("utf-8")).hexdigest()[:16])
         marker = Path(bridge_state).joinpath(*KEYS) / qid
-        if marker.exists() and not (again and outcome(bridge_state, qid) == "unsure"):
+        entry = Path(bridge_state).joinpath(*OUTBOX) / (qid + ".json")
+        requeue = marker.exists() and again and outcome(bridge_state, qid) == "unsure" and not entry.is_file()
+        if marker.exists() and not requeue:
             return qid
     _write(Path(bridge_state).joinpath(*OUTBOX) / (qid + ".json"),
            dict({"room": room, "body": body, "card": card, "queued_at": time.time() if now is None else now},
-                **({"edit": edit} if edit else {})))
-    if key and again:
-        # Retired only once the replacement is on disk: a stop before this leaves `unsure`, and the same
-        # call again writes the entry over and gets here; the sweep's own outcome replaces it otherwise.
-        (Path(bridge_state).joinpath(*OUTCOMES) / qid).unlink(missing_ok=True)
+                **({"edit": edit} if edit else {}), **({"attempted": True} if key and requeue else {})))
     if key:
         # The marker follows the card: a stop between the two queues it once more, never drops it.
         marker.parent.mkdir(parents=True, exist_ok=True)

@@ -157,6 +157,8 @@ class Notice(Base):
         self.assertEqual((connector_cards.outcome(self.bridge, second), self.queued()), ("unsure", []))
         self.assertEqual(self.tick(LIMITED, quota_card.RETRY_S), "quota-card")
         self.assertEqual(len(self.queued()), 1)
+        self.assertEqual(connector_cards.outcome(self.bridge, second), "unsure", "stands until the bridge settles it")
+        self.assertEqual(self.tick(LIMITED, 30.0), "", "queued again: waiting, not asked for a third time")
         self.assertEqual(quota_card.load(self.root)["qid"], second, "the same queue id: one message at the server")
         self.assertNotIn("again", quota_card.load(self.root))
         # The second is posted by a real sweep: told, once.

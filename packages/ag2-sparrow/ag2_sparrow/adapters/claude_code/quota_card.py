@@ -113,12 +113,13 @@ def delivery(bridge, rec: dict, at: float) -> str:
     there is still neither a record nor a file. Absence is never read as either outcome."""
     qid = str(rec.get("qid") or "")
     said = connector_cards.outcome(bridge, qid)
-    if said:
-        return said
-    if Path(bridge).joinpath(*connector_cards.POSTED, qid + ".json").is_file():
+    if said == "posted" or Path(bridge).joinpath(*connector_cards.POSTED, qid + ".json").is_file():
         return "posted"
+    # Queued (again) and not settled since: an earlier `unsure` stays on record until the bridge replaces it.
     if Path(bridge).joinpath(*connector_cards.OUTBOX, qid + ".json").is_file():
         return "pending"
+    if said:
+        return said
     return "pending" if at - float(rec.get("queued") or 0) <= UNKNOWN_S else "unknown"
 
 

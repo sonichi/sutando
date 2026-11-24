@@ -237,19 +237,24 @@ class ConnectorCards(unittest.TestCase):
             with self.assertRaises(OSError):
                 cc.queue(self.state, ROOM, body, card, again=True, **keyed)
         self.assertEqual((cc.outcome(self.state, qid), list(self.state.joinpath(*cc.OUTBOX).iterdir())), ("unsure", []))
-        # Written, and stopped before the record was retired: both files exist. The sweep does not expire
-        # or lose it, and the same call again leaves one entry and retires the record.
-        with mock.patch.object(Path, "unlink", side_effect=OSError("stopped here")):
-            with self.assertRaises(OSError):
-                cc.queue(self.state, ROOM, body, card, again=True, **keyed)
-        self.assertEqual((cc.outcome(self.state, qid), len(list(self.state.joinpath(*cc.OUTBOX).iterdir()))), ("unsure", 1))
-        self.assertEqual(cc.queue(self.state, ROOM, body, card, again=True, **keyed), qid, "the same id: the same dedupe key")
-        self.assertEqual(cc.outcome(self.state, qid), "")
+        self.assertEqual(cc.queue(self.state, ROOM, body, card, again=True, now=5000.0, **keyed), qid, "the same id: the same dedupe key")
+        entry = self.state.joinpath(*cc.OUTBOX) / (qid + ".json")
+        # The connector retires nothing: `unsure` stands, and the entry remembers a send was tried.
+        self.assertEqual((cc.outcome(self.state, qid), json.loads(entry.read_text())["attempted"]), ("unsure", True))
+        # Asked again while it is queued: the entry is not rewritten, so its age is not reset.
+        cc.queue(self.state, ROOM, body, card, again=True, now=9000.0, **keyed)
+        self.assertEqual(json.loads(entry.read_text())["queued_at"], 5000.0)
+        # It expires before any new send: still unsure, never a false drop.
+        self.assertEqual(self.poster(clock=lambda: 5000.0 + cc.MAX_QUEUED_S + 1).sweep(), 0)
+        self.assertEqual((cc.outcome(self.state, qid), entry.exists()), ("unsure", False))
+        # Queued once more and posted. The bridge's `posted` is the last word: nothing the connector
+        # does after the sweep (a late repeat of the same call) can take it back or queue it again.
+        cc.queue(self.state, ROOM, body, card, again=True, now=1000.0, **keyed)
         self.sent.clear()
-        self.assertEqual(self.poster(clock=__import__("time").time).sweep(), 1)
+        self.assertEqual(self.poster().sweep(), 1)
         self.assertEqual((self.sent[0]["dedupe_key"], cc.outcome(self.state, qid)), ("agent-card:" + qid, "posted"))
         self.assertEqual(cc.queue(self.state, ROOM, body, card, again=True, **keyed), qid)
-        self.assertEqual(list(self.state.joinpath(*cc.OUTBOX).iterdir()), [], "a posted card is not queued again")
+        self.assertEqual((cc.outcome(self.state, qid), list(self.state.joinpath(*cc.OUTBOX).iterdir())), ("posted", []))
         # Never tried at all (the bridge was not running): a confirmed drop.
         idle = cc.queue(self.state, ROOM, body, card, now=1000.0, key="k2", at_ns=6)
         self.assertEqual(self.poster(clock=late).sweep(), 0)
