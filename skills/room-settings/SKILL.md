@@ -116,6 +116,10 @@ your owner asks for it, say so, and change nothing.
   - Otherwise ask in your reply, and ask your owner to answer in a message to you: in your DM,
     as a reply to you, or by mentioning you. Your reply ends this task, so send the change with
     that new message's `task_id`, never the first one's (that is refused as closed).
+  - Either way, your question names the secrets check and the room. Their answer must clearly
+    confirm turning it off in that room: a yes in reply to that question, or a message that
+    names both. A bare "yes" that answers something else, or that leaves the room unclear,
+    doesn't count: leave the check on and ask again.
 - "What reaches you" is about which messages are sent to you to answer. It does not hide the
   room's history from you, so never promise your owner that you can't read other messages.
 - Before you list people, check each one is in the room: `room.action.read` with action

@@ -193,6 +193,14 @@ class TestSkillRules(unittest.TestCase):
         self.assertIn("first check that `answered_by` is your owner. If anyone else answered, change nothing "
                       "and ask your owner to confirm themselves.", settings)
 
+    def test_confirmation_names_the_setting_and_the_room(self):
+        settings = " ".join(section(self.text, "The settings").split())
+        self.assertIn("your question names the secrets check and the room", settings)
+        self.assertIn("Their answer must clearly confirm turning it off in that room: a yes in reply to that "
+                      "question, or a message that names both.", settings)
+        self.assertIn("A bare \"yes\" that answers something else, or that leaves the room unclear, doesn't "
+                      "count: leave the check on and ask again.", settings)
+
     def test_owner_mention_handling_depends_on_the_setting(self):
         settings = " ".join(section(self.text, "The settings").split())
         self.assertIn("reaches you marked as such only with \"Others who mention your owner\" on", settings)
