@@ -235,19 +235,56 @@ def still_using(ws: Path, alias: str) -> str:
     return current_model(ws)["name"]
 
 
+ROW_TAPS = 4         # a row's action limit
+OFFERED_MAX = 60     # the most models one card offers (rows of up to ROW_TAPS)
+_LEVEL = re.compile(r"^(?P<family>.+?)\s*\((?P<level>[^()]{1,24})\)$")
+
+
+def split_title(title: str) -> tuple:
+    """("GPT-6 Sol", "High") for "GPT-6 Sol (High)"; (title, "") for a title with no level."""
+    m = _LEVEL.match(title)
+    return (m.group("family"), m.group("level")) if m else (title, "")
+
+
+def offered(picks: list) -> list:
+    """The choices the card carries: every one up to OFFERED_MAX, so none is left to be typed."""
+    return picks[:OFFERED_MAX]
+
+
 def menu_card(model: Optional[str], picks: list) -> tuple:
-    """(body, card): one reply button per choice in `picks`, the one in use (by exact id) marked. A
-    card holds six buttons; with more choices the first six are shown and the text says to ask."""
-    limit = MENU_BUTTONS
-    buttons = [ac.button(title, "reply", style="primary" if choice == model else "secondary",
+    """(body, card): every choice one tap away, the one in use (by exact id) marked, laid out like the
+    connectors' model card. Up to six are buttons; more are a row per family ("GPT-6 Sol") with its
+    levels ("High", "Low") that row's taps."""
+    picks = offered(picks)
+
+    def tap(label, choice, title, slug):
+        return ac.button(label, "reply", style="primary" if choice == model else "secondary",
                          reply=f"Switch the core to {title}", command=ac.reply(KIND, TARGET, slug))
-               for choice, title, slug in picks[:limit]]
+
+    menu = {}
+    if len(picks) <= MENU_BUTTONS:
+        menu["buttons"] = [tap(title, choice, title, slug) for choice, title, slug in picks]
+    else:
+        families, order = {}, []
+        for choice, title, slug in picks:
+            family, level = split_title(title)
+            if family not in families:
+                families[family] = []
+                order.append(family)
+            families[family].append((choice, title, slug, level))
+        rows = []
+        for family in order:
+            items = families[family]
+            for i in range(0, len(items), ROW_TAPS):
+                part = items[i:i + ROW_TAPS]
+                rows.append(ac.row(family, tag="In use" if any(c == model for c, _, _, _ in part) else "",
+                                   actions=[tap(level or "Use", c, t, sl) for c, t, sl, level in part]))
+        menu["groups"] = [ac.group("Models", rows)]
     using = f"I'm using {name_of(model, picks)}."
-    more = " For a model that is not on a button, tell me its name." if len(picks) > limit else ""
     return ac.build(CARD_ID, "info", title="Core model", avatar_=ac.avatar(initial="M"),
-                    text=f"{using} Pick a model to switch to.{more}", buttons=buttons,
+                    text=f"{using} Pick a model to switch to.",
                     note="A switch takes effect after the core finishes its current turn.", note_tone="dim",
-                    body=f"{using} Reply with a model to switch.")
+                    body=f"{using} Reply with a model to switch.", **menu)
 
 
 def switching_words(alias: str) -> str:
@@ -428,7 +465,7 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time) -> int:
     delivered = deliver_owed(ws, core=core, execute=execute, now=now())
     if delivered:
         body, card = menu_card(current_model(ws)["model"], picks)
-    shown = picks[:MENU_BUTTONS]
+    shown = offered(picks)
     out = _post(ws, args.room, body, card, f"model-card:menu:{int(now())}:{issuance(shown)}",
                 reply_to=args.reply_to or "", core=core, execute=execute)
     if out.get("event_id"):

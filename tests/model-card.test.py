@@ -763,15 +763,31 @@ class Manifest(Base):
         self.assertEqual((len(kept), "$m0" in kept, "$m1" in kept, f"$m{mc.ISSUED_KEPT + 1}" in kept),
                          (mc.ISSUED_KEPT, False, False, True))
 
-    def test_more_choices_than_a_card_holds_shows_the_first_six_and_says_to_ask(self):
+    def test_more_choices_than_buttons_are_a_row_per_family_and_every_one_acts(self):
         self.choose(";".join(f"m{c}=Model {c.upper()}" for c in "abcdefgh"))
         rc, out = self.run_(["post", "--room", DM])
         card = self.fake.cards()[0]
-        self.assertEqual((rc, [b["label"] for b in card["buttons"]]), (0, [f"Model {c}" for c in "ABCDEF"]))
+        self.assertNotIn("buttons", card)
+        rows = card["groups"][0]["rows"]
+        self.assertEqual((rc, [r["title"] for r in rows]), (0, [f"Model {c}" for c in "ABCDEFGH"]))
         self.assertIsNone(ac.problem(card))
-        self.assertEqual(card["text"], "I'm using the default model. Pick a model to switch to. "
-                                       "For a model that is not on a button, tell me its name.")
-        self.assertNotIn("Switch the core to Model G", mc.issued_cards.live(self.ws, "$card1")["offers"])
+        self.assertEqual(card["text"], "I'm using the default model. Pick a model to switch to.")
+        self.assertIn("Switch the core to Model H", mc.issued_cards.live(self.ws, "$card1")["offers"])
+
+    def test_levels_of_one_family_share_a_row_and_the_one_in_use_stands_out(self):
+        self.choose("gpt-6-sol-high=GPT-6 Sol (High);gpt-6-sol-low=GPT-6 Sol (Low);gpt-6-luna-high=GPT-6 Luna (High);"
+                    "gpt-6-luna-medium=GPT-6 Luna (Medium);gpt-6-luna-low=GPT-6 Luna (Low);gpt-6-terra=GPT-6 Terra;"
+                    "gpt-5-astra=GPT-5 Astra")
+        _, card = mc.menu_card("gpt-6-luna-medium", mc.choices())
+        self.assertIsNone(ac.problem(card))
+        rows = card["groups"][0]["rows"]
+        self.assertEqual([(r["title"], [a["label"] for a in r["actions"]]) for r in rows],
+                         [("GPT-6 Sol", ["High", "Low"]), ("GPT-6 Luna", ["High", "Medium", "Low"]),
+                          ("GPT-6 Terra", ["Use"]), ("GPT-5 Astra", ["Use"])])
+        luna = rows[1]
+        self.assertEqual((luna.get("tag"), [a["style"] for a in luna["actions"]]),
+                         ("In use", ["secondary", "primary", "secondary"]))
+        self.assertEqual(luna["actions"][0]["reply"], "Switch the core to GPT-6 Luna (High)")
 
 
 class Edges(Base):

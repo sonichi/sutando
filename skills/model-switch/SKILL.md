@@ -109,8 +109,8 @@ names, and it acts only while the list still has that id. An entry whose id is n
 starting with `-`, say) or whose title is too long for a button is left out. The card names the model in
 use, read only from `<workspace>/state/model-switch.json` and matched by exact id (an id the list
 lacks is named as recorded and no button is marked); with no record it says "the default model". A
-card holds six buttons: with a longer list the first six are shown and the text says to ask for the
-others by name. With no readable list the menu is not posted (`{"status": "failed", "why": …}`: say
+card shows up to six models as buttons; a longer list (up to 60) is a row per family ("GPT-6 Sol"),
+its levels ("High", "Low") the row's taps, the family in use tagged "In use", so every model is one tap. With no readable list the menu is not posted (`{"status": "failed", "why": …}`: say
 the `why`). It goes only to the owner's checked DM. `status` prints the same reading as JSON.
 
 A tap is matched by the core's one command (CLAUDE.md, "Card clicks"); when it prints `run:
