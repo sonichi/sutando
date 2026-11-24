@@ -62,22 +62,27 @@ ACTION_TTL_S = 600.0
 #: A recovery card accepted this long ago with no action file, claim or receipt lost its click.
 ORPHAN_CLICK_S = 120.0
 CLAIM_SUFFIX = ".claimed"
-AUDIT_FILE = "audit.jsonl"
-AUDIT_KEEP = 500
+AUDIT_FILE = recovery.AUDIT_FILE
 #: Change billing or the signed-in identity: refused until the confirmed, re-authenticated flow.
 STEP_UP = frozenset({recovery.BUY_CREDITS, recovery.ADD_ACCOUNT, recovery.SWITCH_ACCOUNT})
 CONTINUE = ("continue", "Enter")
 _NAMED_CAP = re.compile(r"\breached your ([A-Za-z][\w.-]{0,24}) limit\b", re.I)
 
 
-def current_model(workspace: Path) -> Optional[str]:
-    """The model the core was last switched to (state/model-switch.json), else the launch's."""
+_READ = object()
+
+
+def current_model(workspace: Path, launch_model=_READ) -> Optional[str]:
+    """The model the core was last switched to (state/model-switch.json), else the launch's
+    (`launch_model` when the caller already read it)."""
     try:
         data = json.loads(status_read_path("model-switch.json", Path(workspace)).read_text())
         if isinstance(data, dict) and data.get("model"):
             return str(data["model"])
     except (OSError, ValueError):
         pass
+    if launch_model is not _READ:
+        return launch_model
     try:
         import core_limit_hold
         return core_limit_hold.launch_identity(Path(workspace))[0]
@@ -91,13 +96,14 @@ def model_names(workspace: Path, runtime: Optional[str]) -> Dict[str, str]:
 
 
 def switch_offer(workspace: Path, runtime: Optional[str], avoid: Optional[str] = None,
-                 seat: bool = False) -> List[str]:
+                 seat: bool = False, launch_model=_READ) -> List[str]:
     """The rows of the runtime's own model list a card may offer (runtime_models.offer): none for
     Codex (its model is a launch argument) and none for a worker seat (it shares the core's config
     dir, where /model saves the default for every session)."""
     if runtime == "codex" or seat:
         return []
-    return [e["key"] for e in runtime_models.offer(workspace, runtime, current_model(workspace), avoid)]
+    current = current_model(workspace, launch_model)
+    return [e["key"] for e in runtime_models.offer(workspace, runtime, current, avoid)]
 
 
 def models_line(workspace: Path, runtime: Optional[str], prompt: Optional[str] = None,
@@ -670,20 +676,7 @@ def _restart_failed(manager, workspace: Path, req_id: str, check: Dict, done, no
     _supersede(manager, req_id)
 
 
-def audit(workspace: Path, entry: Dict) -> None:
-    """One line per action or refusal, bounded; ids and outcomes only, never message text."""
-    path = recovery.recovery_dir(workspace) / AUDIT_FILE
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a") as f:
-            f.write(json.dumps(entry, sort_keys=True) + "\n")
-        lines = path.read_text().splitlines()
-        if len(lines) > 2 * AUDIT_KEEP:
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text("\n".join(lines[-AUDIT_KEEP:]) + "\n")
-            os.replace(tmp, path)
-    except OSError:
-        pass  # the receipt and the card are the record of the outcome
+audit = recovery.audit
 
 
 def _settle(manager, target: Target, data: Dict, req, outcome: str, reason, line: str,

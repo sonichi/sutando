@@ -445,7 +445,8 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
         (r / ".claude").mkdir(parents=True)
         (r / "src" / "install-claude-hooks.sh").write_text(self.installer_src)
         handoff = f'bash {r}/src/session-handoff.sh "$TRANSCRIPT_PATH"'
-        (r / ".claude" / "settings.json").write_text(json.dumps({"hooks": {
+        block = {"command": f"bash {r}/src/core-block-hook.sh claude"}
+        hooks = {
             # Must track the installer's CURRENT archive shape: a literal here made
             # all three over-trigger controls fail on the shape change itself.
             "PreCompact": [{"hooks": [
@@ -454,10 +455,13 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
                 {"command": handoff}]}],
             "SessionEnd": [{"hooks": [{"command": handoff}]}],
             "Stop": [{"hooks": [{"command": stop_command.format(
-                p=f"{r}/src/check-pending-tasks.sh")}]}],
+                p=f"{r}/src/check-pending-tasks.sh")}, block]}],
             "UserPromptSubmit": [{"hooks": [
-                {"command": f"bash {r}/src/turn-start.sh"}]}],
-        }}))
+                {"command": f"bash {r}/src/turn-start.sh"}, block]}],
+        }
+        for ev in ("Notification", "PermissionRequest", "PreToolUse", "PostToolUse", "PostToolUseFailure"):
+            hooks[ev] = [{"hooks": [block]}]
+        (r / ".claude" / "settings.json").write_text(json.dumps({"hooks": hooks}))
         return r
 
     def _assert_probe_read_the_fixture(self, r: Path):
@@ -477,7 +481,7 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
         r = self._repo("bash {p}")
         out = self.hc.check_claude_hook_registration(repo_dir=r)
         self.assertEqual(out["status"], "ok", out["detail"])
-        self.assertIn("5", out["detail"])
+        self.assertIn("all 12 owned hooks", out["detail"])
         self._assert_probe_read_the_fixture(r)
 
     def test_decoys_are_rejected_on_the_REAL_installer_shape(self):

@@ -7,11 +7,13 @@
 # `~/.claude/settings.json` — they only fire when Claude runs in this project
 # context, not in unrelated sessions.
 #
-# Hooks installed (4):
+# Hooks installed (static; skill-declared ones are added below):
 #   PreCompact  → src/archive-transcript.sh ~/Desktop/sutando-conversations/
 #   PreCompact  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
 #   SessionEnd  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
 #   Stop        → bash src/check-pending-tasks.sh
+#   Notification, PermissionRequest, Pre/PostToolUse(+Failure), UserPromptSubmit, Stop
+#               → bash src/core-block-hook.sh claude
 #
 # The SessionEnd → session-handoff.sh hook fires session-state.md on a clean
 # exit (⌘Q / crash) too, not just on PreCompact — so the last session's tail
@@ -108,6 +110,15 @@ HOOKS=(
   # Without this the Stop gate spends its one reminder and never re-arms:
   # begin_turn is the only reset and nothing else in the lifecycle calls it.
   "UserPromptSubmit|src/turn-start.sh|bash $(shq "$REPO_DIR/src/turn-start.sh")"
+  # The core supervisor's block signal (src/core_block_signal.py CLAUDE_EVENTS): a dialog
+  # opened, or the turn moved on.
+  "Notification|src/core-block-hook.sh|bash $(shq "$REPO_DIR/src/core-block-hook.sh") claude"
+  "PermissionRequest|src/core-block-hook.sh|bash $(shq "$REPO_DIR/src/core-block-hook.sh") claude"
+  "PreToolUse|src/core-block-hook.sh|bash $(shq "$REPO_DIR/src/core-block-hook.sh") claude"
+  "PostToolUse|src/core-block-hook.sh|bash $(shq "$REPO_DIR/src/core-block-hook.sh") claude"
+  "PostToolUseFailure|src/core-block-hook.sh|bash $(shq "$REPO_DIR/src/core-block-hook.sh") claude"
+  "UserPromptSubmit|src/core-block-hook.sh|bash $(shq "$REPO_DIR/src/core-block-hook.sh") claude"
+  "Stop|src/core-block-hook.sh|bash $(shq "$REPO_DIR/src/core-block-hook.sh") claude"
 )
 
 # The transcript archiver writes to ~/Desktop, OUTSIDE the vault carrier set.

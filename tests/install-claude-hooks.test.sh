@@ -124,6 +124,11 @@ ok "exactly one SessionEnd handoff hook (no old+new double-fire)" \
 ok "exactly one Stop pending-tasks hook" \
    "$([ "$(cmds Stop | grep -c check-pending-tasks)" = 1 ] && echo 0 || echo 1)"
 
+for ev in Notification PermissionRequest PreToolUse PostToolUse PostToolUseFailure UserPromptSubmit Stop; do
+  ok "exactly one core block-signal hook on $ev" \
+     "$([ "$(cmds "$ev" | grep -c 'core-block-hook\.sh.* claude$')" = 1 ] && echo 0 || echo 1)"
+done
+
 # --- 5. re-run is idempotent ------------------------------------------------
 BEFORE="$(cat "$SETTINGS")"
 OUT2="$(bash "$REPO/src/install-claude-hooks.sh" 2>&1)"
@@ -685,14 +690,15 @@ rm -rf "$VROOT"
 
 # ---- hooks registered by an OLDER install tree that still exists on disk ----
 # A dead path is pruned elsewhere; a live one used to be kept beside ours (skill hooks)
-# so both fired. Each owned hook must be rewritten to this checkout and counted as updated.
+# so both fired. Each owned hook must be rewritten to this checkout and counted as updated:
+# 12 static (installer HOOKS) + 1 skill hook.
 XROOT="$(cd "$(mktemp -d)" && pwd -P)"
 for t in old new; do
   d="$XROOT/$t app/engine/sutando"
   mkdir -p "$d/src" "$d/scripts" "$d/.claude" "$d/skills/demo/hooks"
   cp "$INSTALLER" "$HERE/../src/skill_hooks.py" "$d/src/"
   cp "$HERE/../scripts/python-binary.sh" "$d/scripts/"
-  for s in session-handoff check-pending-tasks turn-start archive-transcript; do
+  for s in session-handoff check-pending-tasks turn-start archive-transcript core-block-hook; do
     printf '#!/bin/bash\n:\n' > "$d/src/$s.sh"
   done
   printf '{"name":"demo","hooks":[{"event":"SessionStart","command":"./hooks/g.py"}]}\n' > "$d/skills/demo/manifest.json"
@@ -711,12 +717,12 @@ ok "older tree: the skill hook is registered exactly once, on this checkout" \
 ok "older tree: exactly one Stop pending-tasks hook, on this checkout" \
    "$([ "$(xcmds | grep -c check-pending-tasks)" = 1 ] && xcmds | grep check-pending-tasks | grep -qF "new app/" && echo 0 || echo 1)"
 ok "older tree: rewrites are counted as updated, not added" \
-   "$(echo "$X_OUT" | grep -q 'added=0 skipped=0 updated=6 removed=0' && echo 0 || echo 1)"
+   "$(echo "$X_OUT" | grep -q 'added=0 skipped=0 updated=13 removed=0' && echo 0 || echo 1)"
 ok "older tree: a foreign non-Sutando hook is untouched" \
    "$(xcmds | grep -qx 'echo not-sutando' && echo 0 || echo 1)"
 X_OUT2="$(HOME="$XROOT" bash "$XNEW/src/install-claude-hooks.sh" 2>&1)"
 ok "older tree: hooks already on this checkout are skipped on re-run" \
-   "$(echo "$X_OUT2" | grep -q 'added=0 skipped=6 updated=0 removed=0' && echo 0 || echo 1)"
+   "$(echo "$X_OUT2" | grep -q 'added=0 skipped=13 updated=0 removed=0' && echo 0 || echo 1)"
 rm -rf "$XROOT"
 
 rm -rf "$ROOT"

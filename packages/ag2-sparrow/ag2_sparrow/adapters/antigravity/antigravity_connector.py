@@ -310,6 +310,7 @@ def declares_http_mcp(init):
 
 class AcpClient(_SharedClient):
     client_info = {"name": "ag2-sparrow-antigravity", "version": "0.1.0"}
+    redact_stderr = True    # agy may be handed the owner's Gemini API key (gemini_key): never into its log
 
 
 def log(*a):

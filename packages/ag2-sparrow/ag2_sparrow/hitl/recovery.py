@@ -10,7 +10,9 @@ show a purchase (iOS) can drop exactly it; no other action or card text names a 
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import math
 import os
 import re
@@ -43,6 +45,14 @@ _ACCOUNT_ID = re.compile(r"^acct_[0-9a-f]{6}$")
 CORE_ONLY = frozenset({RESTART_CORE, SWITCH_RUNTIME})
 OUTCOMES = ("done", "refused", "stale", "failed")
 RECEIPT_VERSION = 1
+AUDIT_FILE = "audit.jsonl"
+AUDIT_KEEP = 500
+#: Every audit writer (bridge and executor, src and vendored) holds this sidecar's flock.
+AUDIT_LOCK = "audit.lock"
+#: A non-owner's tap: recorded once per (card, actor), never run.
+NOT_OWNER = "not_owner"
+#: What audit_not_owner did: wrote the row, found it already there, or could not write.
+RECORDED, DUPLICATE, NOT_RECORDED = "recorded", "duplicate", "not_recorded"
 
 # The one sentence every surface uses about a worker's model (card, notice, reply, refusal).
 SEAT_MODEL_LOCKED = "Its model can't be switched yet: workers share the core's model setting."
@@ -171,6 +181,73 @@ def read_receipt(workspace: Path, hitl_id: str) -> Optional[Dict[str, Any]]:
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def _audit_locked(path: Path):
+    """The platform-aware lock, imported here so importing this module never needs it."""
+    try:
+        from ..file_lock import locked_file   # the vendored package layout
+    except ImportError:
+        from file_lock import locked_file     # the repo's src/ on sys.path
+    return locked_file(path.with_name(AUDIT_LOCK))
+
+
+def _append(path: Path, entry: Dict[str, Any]) -> None:
+    """Append one row, then trim to the newest AUDIT_KEEP past twice that; the caller holds the lock.
+    A failed trim leaves the appended row in place and is only logged."""
+    with open(path, "a") as f:
+        f.write(json.dumps(entry, sort_keys=True) + "\n")
+    tmp = path.with_suffix(".tmp")
+    try:
+        lines = path.read_text().splitlines()
+        if len(lines) > 2 * AUDIT_KEEP:
+            tmp.write_text("\n".join(lines[-AUDIT_KEEP:]) + "\n")
+            os.replace(tmp, path)
+    except (OSError, ValueError) as e:
+        logging.getLogger(__name__).warning("recovery audit not trimmed: %s", e)
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
+def audit(workspace: Path, entry: Dict[str, Any]) -> bool:
+    """One line per action or refusal, bounded; ids and outcomes only, never message text.
+    True when the line was written; a failure is swallowed (the receipt and card are the record)."""
+    path = recovery_dir(workspace) / AUDIT_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _audit_locked(path):
+            _append(path, entry)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def audit_not_owner(workspace: Path, hitl_id: str, action_id: str, sender: str, room: str,
+                    at: Optional[float] = None) -> str:
+    """Record a non-owner's tap on a card, in the card's room, as `refused`/`not_owner`, once per
+    (hitl_id, sender). -> RECORDED, DUPLICATE (a repeated tap adds no line) or NOT_RECORDED."""
+    path = recovery_dir(workspace) / AUDIT_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _audit_locked(path):
+            try:
+                lines = path.read_text().splitlines()
+            except FileNotFoundError:
+                lines = []
+            for line in lines:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(row, dict) and row.get("reason") == NOT_OWNER
+                        and row.get("hitl_id") == hitl_id and row.get("sender") == sender):
+                    return DUPLICATE
+            _append(path, {"at": int(time.time() if at is None else at), "hitl_id": hitl_id,
+                           "action_id": action_id, "outcome": "refused", "reason": NOT_OWNER,
+                           "sender": sender, "room": room})
+        return RECORDED
+    except (OSError, ValueError):
+        return NOT_RECORDED
 
 
 def _safe(hitl_id: str) -> str:
