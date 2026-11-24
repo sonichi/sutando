@@ -15,7 +15,7 @@ a real room or a browser. See [`NOTES.md`](NOTES.md) for what a real room must s
   rollback. A page that needs none of that is simpler without it.
 - **It must be inlined.** A page runs in a sandbox with no network, so it cannot load a script
   from anywhere. Copy `commons-sdk.js` into a `<script>` in the page. `examples/inline.js` shows
-  one way to do that between two marker comments. The file is about 35 KB; a page body is at most
+  one way to do that between two marker comments. The file is about 36 KB; a page body is at most
   196,608 bytes. Once it has run, the global `Commons` exists, whatever other scripts the page
   carries (it also sets `module.exports` when a `module` with `exports` is there, as in Node).
 - **The bridge is not ours.** The library is built on the page API (`window.artifact`). The host
@@ -241,7 +241,13 @@ This is not a CRDT. The rules below are what the library does on top of the brid
   `claim` and `release`, show on this page before the room answers. If the room refuses, the
   change is undone and `observe` fires again. Two exceptions: a list's `push` and a map's
   `update` show when the bridge answers.
-- **Writes from one page run in order,** one at a time per database.
+- **Writes from one page run in order,** one at a time per database. A write decides (which
+  row, what `fn` gets, whether a claim is there) when its turn comes, from what the bridge has
+  answered for by then, not from what the page is showing early.
+- **A plain write can be missing for a moment.** If an older snapshot arrives while a plain
+  write is in flight, the page trusts the snapshot and shows the write again with the next one.
+- **Do not mix the two kinds on one cell.** A plain write (`set`) still on its way to the server
+  can land after a later conditional write (`update`) from the same page and replace it.
 - **Nothing is ever deleted.** A page cannot delete a row. `map.delete` empties the value;
   `list.remove` writes a marker and hides the row.
 - **Everything is readable and editable by the room.** A page is a convenience, not a
@@ -276,16 +282,16 @@ them at run time:
     writes a fresh token, and "the cell holds a token this call wrote" cannot be someone
     else's doing. If it still cannot tell, it resolves `ok: false, reason: "unknown"`.
   - `release` writes an empty cell, which carries no proof of who emptied it. It is pinned to
-    the exact claim it saw when called. After reading again: an empty cell counts as released;
+    the exact claim it found when its turn came. After reading again: an empty cell counts as released;
     the same claim still there is tried again, conditionally; any other value, even a renewal
     by the same viewer from another tab, is left alone and `release` resolves `false`. If the
     page cannot tell, it rejects with `OUTCOME_UNKNOWN`.
 - `"exact"` therefore means: the room accepted this write at the version this page had read,
   and said so.
-- An acknowledged write is shown on top of the page's last snapshot until a snapshot new enough
-  to hold it arrives, then the snapshot rules. If the acknowledgement arrives after such a
-  snapshot (the row was changed or deleted since), it adds nothing. A snapshot older than the
-  last one is dropped. The orderings the library handles are listed in `NOTES.md`.
+- The page's view is its newest snapshot plus its own writes, applied in the order it issued
+  them. An acknowledged write stays on top until a snapshot new enough to hold it arrives; if
+  the answer arrives after such a snapshot (the row was changed or deleted since), it adds
+  nothing. A snapshot older than the last one is dropped. `NOTES.md` has the whole model.
 
 Three things differ from a plain write, by the host's design:
 
@@ -358,7 +364,9 @@ optional), reads the row back, and treats the claim as its own only if its value
    `null`, and anyone may claim. No event fires when a claim runs out: redraw on a timer if you
    show it.
 7. Claiming a row you hold renews it. `release` empties the cell, and only while the cell still
-   holds the exact claim this page saw when `release` was called. With conditional writes the
+   holds the exact claim it found when its turn came. A release issued while this page's own
+   claim is still pending waits for that claim; if the claim lost, it writes nothing and
+   resolves `false`. With conditional writes the
    room checks that too, so a release never clears a newer claim. With plain writes it cannot:
    a release can clear a claim made elsewhere that this page has not seen yet.
 8. Two tabs of one viewer are two pages. A claim from the second tab replaces the first tab's
@@ -447,7 +455,7 @@ Each line is something the documented bridge does not let a library do.
 | `commons-sdk.js` | The library. Inline it in a page, or `require` it in Node |
 | `test/fake-room.js` | A fake bridge: several pages share one store, with consent, limits and a clock you move |
 | `test/commons-sdk.test.js` | The library's tests |
-| `test/interleavings.test.js` | 300 seeded orderings of answers and snapshots, checked against invariants |
+| `test/interleavings.test.js` | 1,000 seeded orderings of answers and snapshots, checked against invariants |
 | `examples/signup.html` | A sign-up sheet: a form and a live list |
 | `examples/board.html` | A task board: a person or an agent takes a task, works, marks it done |
 | `examples/_head.css` | The styles both examples share |

@@ -35,35 +35,55 @@ was run in a real room.
 | 25 | Reasons the guide does not quote. | "This write is waiting for approval", "offline" and "no answer from the room; read again before deciding" are worded in that same section, for conditional writes. There they get the codes `APPROVAL_PENDING`, `OFFLINE` and, for no answer, the handling in choice 26. For plain writes none of them has a code: they come back as `REFUSED` with the text. |
 | 26 | A conditional write with no answer. | The outcome is unknown and the document names no key to resend it and no receipt. `map.update` rejects with `OUTCOME_UNKNOWN` and what the page sees; it never infers success from an equal value and never reruns the function. A claim goes on, because its token is its own proof. |
 
-## Orderings: what the library does
+## One model for every ordering
 
 A write has an answer; the room also sends snapshots; and some calls show their change early.
-These can arrive in any order. "Conditional" means `claim`, `release` and `map.update` where a
-snapshot carries a `version`; everything else is a plain write.
+These can arrive in any order. The library keeps one model per database and reads everything
+from it:
 
-| Operation | Answer before the snapshot | Answer after a newer snapshot | No answer | Same viewer's other tab acts in between | Retried |
-| --- | --- | --- | --- | --- | --- |
-| `map.set`, `map.delete`, `list.update`, `list.remove` (plain) | The value is kept on the page's copy | The snapshot is trusted; the answer adds nothing | Cannot happen: the host queues a plain write | Last write to reach the room wins | Only while the viewer has not answered or the page is rate-limited; nothing was written before |
-| `list.push`, a new key in `map.set` (plain create) | The row is added | The snapshot is trusted: a row it lacks is not added back | Cannot happen | Two rows; for a map key the lowest id is used | As above |
-| `map.update` (conditional) | Shown on top of the snapshot until a snapshot at the answer's version or later arrives | Adds nothing: that snapshot has the write, or what became of it | Rejects `OUTCOME_UNKNOWN`; no guess from the value, `fn` not run again | The other tab's write changes the version: read again, run `fn` on the new value | Only after a definite "version changed" (five tries, then `CONTENDED`) |
-| `claim`, renew (conditional) | As `map.update`; the result is `certainty: "room"` | As `map.update` | Read again; a token this call wrote in the cell is proof; else try again; else `reason: "unknown"` | A claim by the other tab is a different token: this tab's `onLost` is called | Each try writes a new token and a new expiry |
-| `release` (conditional) | The cell shows empty | As `map.update` | Read again; empty means released; the pinned claim still there is tried again; anything else is left alone; else rejects `OUTCOME_UNKNOWN` | A renewal by the other tab is not the pinned claim: left alone, resolves `false` | Only against the pinned claim |
-| `claim`, renew, `release` (plain) | Kept on the page's copy; `certainty: "local"` | The snapshot is trusted | Cannot happen | Not visible until the copies meet; a plain release can clear a claim it has not seen | As the first row |
+1. **State** is `base` (the newest snapshot, with its version if it has one) plus one list of
+   this page's own writes, in the order the page issued them. Nothing else holds view state.
+2. **One function** computes a view: start from `base`, apply the list in order. A cell written
+   on a row that an earlier entry created lands on that entry's row.
+3. **Two views** come from that function. The *displayed* view applies every entry except quiet
+   pending ones (`push` and `map.update` are quiet: they show when answered). The *sure* view
+   applies only entries the bridge has answered for.
+4. **Every decision** a write makes reads the sure view, when the write's turn comes: which row a
+   `set` writes, the value `fn` gets in `map.update`, whether a row is held, whether a `release`
+   is the viewer's and which exact claim it is pinned to. Display (`get`, `has`, `toArray`,
+   `claimOf`) reads the displayed view.
+5. **Writes on one database run one at a time, in call order.** A release issued while this
+   page's claim is pending waits for the claim. If the claim lost, the release writes nothing.
 
-Rules that hold for every row:
+An entry leaves the list by one rule, in one place:
 
-- A snapshot older than the last one is dropped, so the version a page builds on never goes back.
-- A snapshot without a `version`, after ones that had it, is taken as it is: acknowledged writes
-  on top of it are dropped and the page writes plainly until a version returns.
-- An answer cannot arrive twice: each call has one answer.
-- While a claim or release is in flight, the page does not judge that row's claim as lost.
+| Entry | Leaves when |
+| --- | --- |
+| Pending | Never, until it is answered |
+| Refused, declined, or outcome unknown | At once. That is the rollback |
+| Acknowledged conditional write, answer has a version | The snapshot's version reaches it. If it already has when the answer arrives, the entry leaves at once: the snapshot holds the write, or what became of it |
+| Acknowledged conditional write, answer has no version | A snapshot newer than the version the write was sent at arrives |
+| Plain write | The first snapshot after its answer arrives. If a snapshot arrived while it was in flight (counted from the attempt the bridge accepted), it leaves at its answer: the snapshot is trusted |
+| Plain cell write on a row that only an earlier entry supplies | Together with that entry |
 
-`test/interleavings.test.js` runs 300 seeded orderings of answers and snapshots across two viewers
-and a second tab of the first, and checks: no page shows a row or value the room lacks once the
-newest snapshot is in; versions never go back or ahead of the room; a counter ends between its
-definite successes and those plus its unknown outcomes; a claim called `"room"` is one the room
-took, over nobody else's live claim; a conditional release clears only the claim it was pinned
-to; a page tracks no claim the room does not hold.
+Also: a snapshot older than the last one is dropped, so the version a page builds on never goes
+back. A snapshot without a `version`, after ones that had it, is taken as it is and acknowledged
+entries leave. A lost answer is never guessed: see choice 26.
+
+What this cannot do with plain writes only (the README says each in one sentence): a plain
+release cannot see what it overwrites; a plain write can be missing for a moment if an older
+snapshot arrives while it is in flight; a plain write still on its way to the server can land
+after a later conditional write from the same page.
+
+`test/interleavings.test.js` runs 1,000 seeded orderings of answers and snapshots across two
+viewers and a second tab of the first, with calls issued back to back and calls issued while an
+earlier one is pending. It checks: right after a definite success the page shows that write or
+something newer; the sure view never goes back to an older value of a cell; no page shows a row
+or value the room lacks once the newest snapshot is in; versions never go back or ahead of the
+room; a counter ends between its definite successes and those plus its unknown outcomes; a claim
+called `"room"` is one the room took; no conditional claim overwrites another viewer's live
+claim and no conditional release clears a claim that is not the viewer's; a page tracks no claim
+the room does not hold.
 
 ## Real-room checklist
 
@@ -92,7 +112,7 @@ Each item is an assumption. Check it with two people (and one agent) in a real r
 21. An agent writing the `Claim`, `Status` or `Result` cell through Actions does not trigger an unwanted summon on that row.
 22. `agent.sendTask` with a repeated `key` returns the first receipt and shows no second dialog.
 23. `room.post` and `agent.sendTask` reasons match the guide's wording exactly.
-24. The inlined library (about 35 KB) plus a page stays well under the 196,608-byte page limit, and runs in the sandbox with no blocked call. (The guide's static pre-flight, `check_page.py`, passes on both examples.)
+24. The inlined library (about 36 KB) plus a page stays well under the 196,608-byte page limit, and runs in the sandbox with no blocked call. (The guide's static pre-flight, `check_page.py`, passes on both examples.)
 25. Each "version changed" answer costs one `db.read`; check that is affordable in a busy app: 20 reads a minute per page.
 26. Phone layout of the two examples at about 390px, light and dark. Not rendered here: the checks run without a browser.
 27. The s.space deployment you ship to has versions and conditional writes turned on: `db.read` and `db.onChange` snapshots carry a number in `version`. This is a deployment setting, not a per-room one; a page still feature-detects on each read.
