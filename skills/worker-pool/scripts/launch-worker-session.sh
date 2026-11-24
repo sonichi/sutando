@@ -156,6 +156,7 @@ if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
 fi
 forward_skill_manifest_config
 ENV_ARGS+=(${SKILL_MANIFEST_ENV_ARGS[@]+"${SKILL_MANIFEST_ENV_ARGS[@]}"})
+case "${1:-}" in --print-env|--print-surface-args) ;; *) apply_skill_session_route ;; esac
 resolve_claude_credential_proxy
 if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
   ENV_ARGS+=(-e "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL")
