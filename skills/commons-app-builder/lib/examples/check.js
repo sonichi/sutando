@@ -21,7 +21,7 @@ class El {
 }
 
 /** Opens an example page for one viewer. `artifact` may be undefined: a page outside a room. */
-async function open(file, artifact) {
+async function open(file, artifact, longWaits) {
   const html = fs.readFileSync(path.join(__dirname, file), 'utf8');
   const byId = new Map();
   for (const m of html.matchAll(/<(\w+)[^>]*\bid="([^"]+)"/g)) byId.set(m[2], new El(m[1]));
@@ -29,8 +29,8 @@ async function open(file, artifact) {
   const page = {
     document: { getElementById: (id) => byId.get(id), createElement: (tag) => new El(tag) },
     setInterval: (fn) => ticks.push(fn), console,
-    // A short wait (a retry) passes at once; a long one (the limit on one bridge call) never fires here.
-    setTimeout: (fn, ms) => { const t = { live: true }; if (!(ms >= 5000)) setImmediate(() => t.live && fn()); return t; },
+    // A short wait (a retry) passes at once; a long one (the limit on one bridge call) fires only when asked.
+    setTimeout: (fn, ms) => { const t = { live: true }; if (!(ms >= 5000) || longWaits) setImmediate(() => t.live && fn()); return t; },
     clearTimeout: (t) => { if (t) t.live = false; },
   };
   page.window = page;
@@ -224,6 +224,17 @@ test('board: a claim held for an approval says so, and not that it failed', asyn
   client.failNext = 'this write is waiting for approval';
   await ana.button('Take it').click(); await settle();
   assert.equal(ana.$('status').textContent, 'Waiting for an approval. "One" may show as yours later.');
+  assert.deepEqual(ana.items(), ['OneOpenTake it']);
+});
+
+test('board: a claim that gets no answer says the outcome is unknown, not that taking it failed', async () => {
+  const { fake, db } = room('Board — Tasks', BOARD);
+  fake.serverAddRow(db, { Task: 'One', Status: 'Open' });
+  const client = fake.client({ id: 'u-ana', name: 'Ana' });
+  const ana = await open('board.html', client.artifact, 'fire');
+  client.artifact.db.write = () => new Promise(() => {});
+  await ana.button('Take it').click(); await settle();
+  assert.equal(ana.$('status').textContent, 'No answer from the room. The task may be held for you for a while; look again in a moment.');
   assert.deepEqual(ana.items(), ['OneOpenTake it']);
 });
 

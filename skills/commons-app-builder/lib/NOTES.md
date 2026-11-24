@@ -112,7 +112,7 @@ Each item is an assumption. Check it with two people (and one agent) in a real r
 21. An agent writing the `Claim`, `Status` or `Result` cell through Actions does not trigger an unwanted summon on that row.
 22. `agent.sendTask` with a repeated `key` returns the first receipt and shows no second dialog.
 23. `room.post` and `agent.sendTask` reasons match the guide's wording exactly.
-24. The inlined library (about 38 KB) plus a page stays well under the 196,608-byte page limit, and runs in the sandbox with no blocked call. (The guide's static pre-flight, `check_page.py`, passes on both examples.)
+24. The inlined library (about 39 KB) plus a page stays well under the 196,608-byte page limit, and runs in the sandbox with no blocked call. (The guide's static pre-flight, `check_page.py`, passes on both examples.)
 25. Each "version changed" answer costs one `db.read`; check that is affordable in a busy app: 20 reads a minute per page.
 26. Phone layout of the two examples at about 390px, light and dark. Not rendered here: the checks run without a browser.
 27. The s.space deployment you ship to has versions and conditional writes turned on: `db.read` and `db.onChange` snapshots carry a number in `version`. This is a deployment setting, not a per-room one; a page still feature-detects on each read.
@@ -123,7 +123,7 @@ Each item is an assumption. Check it with two people (and one agent) in a real r
 32. A plain write made while the page is offline or waiting for an approval: whether it stays in the page's own copy. (The library reports `REFUSED` and undoes its own early display.)
 33. A snapshot's rows can be ahead of its `version` for a moment (the document says the version lands just after the change it counts). Check that a conditional write based on such a snapshot is refused with "version changed", and that the next snapshot carries the new version.
 34. Two tabs of one viewer: the same `me.id` in both, and a claim from one calls `onLost` in the other.
-35. Every bridge call settles: `db.read`, `db.write` and `db.createRow` always answer or reject, also when the page goes offline or the room is slow. Note the host's own time limit for a conditional write; the library's 30 seconds per call should be longer than it, so the host's "no answer from the room" comes first.
+35. Every bridge call settles: `db.read`, `db.write` and `db.createRow` always answer or reject, also when the page goes offline or the room is slow. Note the host's own time limit for a conditional write; the library's 30 seconds per call (`callTimeout`) should be longer than it, so the host's "no answer from the room" comes first. If the host's limit is longer, the page gives up first, its read can miss a write that lands later, and it reports `OUTCOME_UNKNOWN` where the host would have answered.
 
 ## Not tested here
 

@@ -15,7 +15,7 @@ a real room or a browser. See [`NOTES.md`](NOTES.md) for what a real room must s
   rollback. A page that needs none of that is simpler without it.
 - **It must be inlined.** A page runs in a sandbox with no network, so it cannot load a script
   from anywhere. Copy `commons-sdk.js` into a `<script>` in the page. `examples/inline.js` shows
-  one way to do that between two marker comments. The file is about 38 KB; a page body is at most
+  one way to do that between two marker comments. The file is about 39 KB; a page body is at most
   196,608 bytes. Once it has run, the global `Commons` exists, whatever other scripts the page
   carries (it also sets `module.exports` when a `module` with `exports` is there, as in Node).
 - **The bridge is not ours.** The library is built on the page API (`window.artifact`). The host
@@ -203,7 +203,12 @@ The library waits at most 30 seconds for the answer to one bridge call (`callTim
 A plain write that got no answer rejects with `OUTCOME_UNKNOWN`, not `REFUSED`, because it may
 still land later. A conditional write that got no answer is treated like any lost answer. A late
 answer is ignored; if the write did land, the snapshot that carries it updates the page as usual.
-The limit is per call, so waiting for the viewer is not cut off: each of those calls is answered.
+A read that gets no answer rejects `REFUSED`; try again. A `claim` that gets no answer resolves
+`{ok: false, reason: "unknown"}`, as after any lost answer. The limit is per call, so waiting
+for the viewer is not cut off: each of those calls is answered. Set `callTimeout` above the
+host's own no-answer limit for a conditional write once that is known: if the host's limit is
+longer, the page gives up first, its read can miss a write that lands later, and it reports
+`OUTCOME_UNKNOWN` where the host would have answered.
 
 Writes retry on their own while the viewer has not answered or the page is rate-limited: every
 1.5 seconds, for up to 2 minutes. Use `room.onWaiting` to show a hint such as "Allow this page to
@@ -354,7 +359,7 @@ optional), reads the row back, and treats the claim as its own only if its value
 | `ok: false, reason: "held"` | Someone else holds the row and this page can see it. `holder` says who. Nothing was written, or the room refused the write |
 | `ok: false, reason: "expired"` | The write was accepted, but so late that the claim had already run out |
 | `ok: false, reason: "contended"` | The database kept changing, or this page's copy is behind and it cannot see who holds the row. Try again |
-| `ok: false, reason: "unknown"` | The room gave no answer and the page could not tell afterwards. The claim may be in the room until it runs out |
+| `ok: false, reason: "unknown"` | The room gave no answer (lost, or not in time) and the page could not tell afterwards. The claim may be in the room, now or later, until it runs out. A first claim is then not tracked: it shows as yours, `onLost` will not fire, `release` works. A renewal keeps the earlier claim tracked, and takes over quietly if it lands |
 
 `certainty` is `"local"` on every `ok: false`: the answer rests on what this page can see.
 

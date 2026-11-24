@@ -83,7 +83,8 @@
   /* Every function the page hands in (observe, onLost, onWaiting, watch) is called through here: its
      error is reported later, outside the library, and never changes what a write does. */
   const guard = (room, fn, ...args) => {
-    try { return fn(...args); } catch (err) { room.report(err); }
+    // A reporter that throws is itself only logged: nothing here may reach a write.
+    try { return fn(...args); } catch (err) { try { room.report(err); } catch (worse) { console.error(err, worse); } }
   };
 
   const toPlayer = (m) => {
@@ -489,6 +490,7 @@
       if (!mine || this.busy.get(id)) return;
       const raw = this.parse(this.t.cell(id, this.claimProp));
       if (raw && raw.n === mine.token) return;
+      if (raw && mine.also && mine.also.has(raw.n)) return void Object.assign(mine, { token: raw.n, until: raw.until, also: null });
       this.held.delete(id);
       const now = this.holder(raw);
       // An empty cell after a release whose answer was lost is what the page asked for: no alarm.
@@ -590,11 +592,19 @@
         if (raw && raw.by !== me.id && raw.until > room.now()) return null;
         return (opt) => t.call('write', id, prop, (e.value = stamp()))(opt);
       };
-      const mode = await this.guarded(id, e, step), won = mode !== null && mine();
+      // No answer in time is an outcome of a claim, like a lost answer: it resolves, it does not reject.
+      const mode = await this.guarded(id, e, step).catch((err) => {
+        if (err.code !== 'OUTCOME_UNKNOWN') throw err;
+        return 'unknown';
+      });
+      const won = mode !== null && mine();
       if (won && won.until > room.now()) {
         this.held.set(id, { token: won.n, until: won.until, onLost: o.onLost });
-        return { ok: true, holder: this.holder(won), certainty: mode === 'local' ? 'local' : 'room' };
+        // "room" only where the write was conditional: a token seen after a plain write is this page's own copy.
+        return { ok: true, holder: this.holder(won), certainty: mode === 'local' || t.version === null || t.plain ? 'local' : 'room' };
       }
+      // A renewal whose fate is unknown may land later: its tokens are then this page's claim, not a loss.
+      if (mode === 'unknown' && this.held.has(id)) this.held.get(id).also = tokens;
       this.settle(id);
       const holder = this.holder(this.parse(t.cell(id, prop)));
       const reason = won ? 'expired' : holder && !holder.mine ? 'held' : mode === 'unknown' ? 'unknown' : 'contended';
@@ -706,7 +716,6 @@
       return () => this.waiting.delete(cb);
     }
 
-    /* The guide's write loop: retry while the viewer has not answered or the page is rate-limited. */
     /* Bounds one bridge call: a call that never settles would stall its database for good. A late
        answer finds the promise settled and changes nothing; the snapshots still tell what happened. */
     bounded(promise) {
@@ -716,6 +725,7 @@
       });
     }
 
+    /* The guide's write loop: retry while the viewer has not answered or the page is rate-limited. */
     async send(call, extra) {
       const until = this.now() + this.opts.retryFor;
       for (;;) {

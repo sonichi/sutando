@@ -772,7 +772,7 @@ async function patient(opts) {
       return new Promise((ok) => { answer = ok; });
     };
   };
-  s.land = async () => { answer(await real(...args)); await settle(); };
+  s.land = async (unanswered) => { const r = await real(...args); if (!unanswered) answer(r); await settle(); };
   return s;
 }
 
@@ -821,6 +821,48 @@ test('a conditional write that gets no answer: OUTCOME_UNKNOWN; when it lands la
   const version = m.t.version;
   await land();
   assert.deepEqual([m.get('n'), fake.rows(mapDb)[0].cells.Value, m.t.entries.length, m.t.version > version], [2, '2', 0, true]);
+});
+
+test('a plain claim that gets no answer resolves reason "unknown", untracked; if it lands later it shows as the viewer\'s and can be released', async () => {
+  const { room, silence, giveUp, land, fake, taskDb } = await patient({ rows: [{ Task: 'One' }] });
+  const l = await room.list('App — Tasks'), one = l.toArray()[0].id, lost = [];
+  silence('write');
+  const claiming = l.claim(one, { onLost: (h) => lost.push(h) });
+  assert.equal(l.claimOf(one).mine, true, 'shown while it waits');
+  await settle();
+  const [r] = await Promise.all([claiming, giveUp()]);
+  assert.deepEqual([r.ok, r.reason, r.holder, r.certainty, l.claimOf(one), l.held.has(one), l.t.entries.length], [false, 'unknown', null, 'local', null, false, 0]);
+  await land();
+  assert.deepEqual([l.claimOf(one).mine, l.held.has(one), JSON.parse(fake.rows(taskDb)[0].cells.Claim).by], [true, false, 'u-ana']);
+  assert.deepEqual([await l.release(one), fake.rows(taskDb)[0].cells.Claim, lost], [true, '', []]);
+});
+
+test('a plain claim whose answer never comes but whose snapshot does is ok, and "local": the page saw only its own copy', async () => {
+  const { room, silence, giveUp, land, timers } = await patient({ rows: [{ Task: 'One' }] });
+  const l = await room.list('App — Tasks'), one = l.toArray()[0].id;
+  silence('write');
+  const claiming = l.claim(one);
+  await settle();
+  await land(true);
+  assert.equal(timers.length, 1, 'still waiting for the answer');
+  const [r] = await Promise.all([claiming, giveUp()]);
+  assert.deepEqual([r.ok, r.certainty, l.held.has(one)], [true, 'local', true]);
+});
+
+test('a renewal that gets no answer resolves "unknown" and keeps the earlier claim tracked; if it lands later it takes over quietly', async () => {
+  const { room, silence, giveUp, land, fake, taskDb, clock } = await patient({ rows: [{ Task: 'One' }] });
+  const l = await room.list('App — Tasks'), one = l.toArray()[0].id, lost = [];
+  assert.equal((await l.claim(one, { ttl: 60000, onLost: (h) => lost.push(h && h.id) })).ok, true);
+  const first = l.held.get(one).token;
+  clock.advance(1000);
+  silence('write');
+  const [r] = await Promise.all([l.claim(one, { ttl: 60000 }), settle().then(giveUp)]);
+  assert.deepEqual([r.ok, r.reason, r.holder.mine, l.held.get(one).token], [false, 'unknown', true, first]);
+  await land();
+  assert.deepEqual([lost, l.held.get(one).token !== first, l.held.get(one).until], [[], true, clock.now() + 60000]);
+  fake.serverWrite(taskDb, one, 'Claim', JSON.stringify({ by: 'runner', name: 'Runner', kind: 'agent', until: clock.now() + 60000 }));
+  await settle();
+  assert.deepEqual(lost, ['runner']);
 });
 
 test('waiting for the viewer for longer than the per-call timeout is not cut off: each call was answered', async () => {
@@ -887,6 +929,17 @@ test('onLost, onWaiting and an experimental watch that throw are reported and ch
   pa.enableRequests([]);
   const rq = (await Commons.connect({ artifact: pa.artifact, report: (e) => reported.push(e.message) })).experimental.requests;
   assert.deepEqual([await rq.watch({ database: taskDb }, boom), reported.length], [[], 3]);
+});
+
+test('a report hook that throws cannot change a write either: the error is logged and the write saves', async () => {
+  const { pa, hooks, fake, taskDb } = await setup({ rows: [{ Task: 'One' }] });
+  const room = await Commons.connect(Object.assign({ artifact: pa.artifact, report: () => { throw new Error('the reporter broke'); } }, hooks));
+  const l = await room.list('App — Tasks'), logged = [], error = console.error;
+  l.observe(boom);
+  console.error = (...args) => logged.push(args.map((e) => e.message));
+  try { await l.update(l.toArray()[0].id, { Result: 'saved' }); } finally { console.error = error; }
+  assert.equal(fake.rows(taskDb)[0].cells.Result, 'saved');
+  assert.deepEqual(logged[0], ['the page broke', 'the reporter broke']);
 });
 
 test('fn in map.update is part of the operation: when it throws, nothing is written and nothing is shown', async () => {
