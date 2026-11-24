@@ -475,7 +475,7 @@ class Launcher:
         # A task's own words on the pane ("... hit its usage limit ...") are not a banner, and no stall.
         self.observation = detector.derive(self.observation, text, plugin, self.clock(),
                                            own=quota_card.own_ui(self.root, text))
-        self.quota(text)
+        self.quota(text, str((gen or {}).get("nonce") or ""))
         stall = self.observation["stall"]
         if (rec.get("stall") or None) != stall:
             if rec.get("stall"):
@@ -490,13 +490,14 @@ class Launcher:
         except Exception as e:  # noqa: BLE001 - advisory
             self.log("quota: new session not recorded (%s: %s)" % (type(e).__name__, str(e)[:120]))
 
-    def quota(self, text: str) -> None:
+    def quota(self, text: str, session: str = "") -> None:
         """The usage-limit banner or Claude Code's limit menu on the pane: the owner is told, with the account
         card, once per limit and on each of their messages left unanswered (quota_card).
         A notice that cannot be sent never stops the supervisor."""
         try:
             done = quota_card.notice(self.root, self.cfg, detector.abnormal_names(text), text,
-                                     lambda *parts: self.log(" ".join(str(p) for p in parts)), now=self.clock)
+                                     lambda *parts: self.log(" ".join(str(p) for p in parts)), now=self.clock,
+                                     session=session)
         except Exception as e:  # noqa: BLE001 - advisory
             done = "quota-failed (%s: %s)" % (type(e).__name__, str(e)[:120])
         if done and done != self.quota_said:

@@ -162,12 +162,11 @@ def _card_words(card, limited: list, text: str, log) -> str:
     return words(limited, text, "" if who else card.using(), who)
 
 
-def new_session(root, now=None) -> None:
+def new_session(root) -> None:
     """A session was just created (an account switch restarts it): what was told was about the session
     before, so a limit on this one is a new incident, told again. The DM room is the claim's and stays."""
     if load(root):
         save(root, {})
-    _write(root, SEEN_FILE, {"since": (now or time.time)(), "lines": []})
 
 
 def _limit_lines(text: str) -> list:
@@ -175,13 +174,16 @@ def _limit_lines(text: str) -> list:
     return [ln for ln in lines if any(rx.match(ln) for rx in _LIMIT)]
 
 
-def _history(root, text: str, at: float) -> bool:
+def _history(root, text: str, at: float, session: str) -> bool:
     """Whether the limit lines on the pane are only what a new session drew of the conversation before it: Claude
     Code shows the old transcript again, its banner included. They stay history until another limit line joins
-    them; the limit menu, which only a live limit opens, is never history."""
-    seen = _read(root, SEEN_FILE)
-    if not seen or detector.LIMIT_MENU.search(str(text or "")):
+    them; the limit menu, which only a live limit opens, is never history. `session` names the session the pane
+    belongs to ('' when the caller cannot say: then nothing is history)."""
+    if not session or detector.LIMIT_MENU.search(str(text or "")):
         return False
+    seen = _read(root, SEEN_FILE)
+    if seen.get("session") != session:      # the first read of this session's pane
+        seen = {"session": session, "since": at, "lines": None}
     lines = _limit_lines(text)
     if at - float(seen.get("since") or 0) < SETTLE_S:
         if lines != seen.get("lines"):
@@ -312,7 +314,7 @@ def _tell_tasks(root, cfg: dict, bridge: str, limited: list, text: str, log, rec
     return rec, done
 
 
-def notice(root, cfg: dict, names, text: str, log, now=time.time) -> str:
+def notice(root, cfg: dict, names, text: str, log, now=time.time, session: str = "") -> str:
     """One tick's reading of the pane: `names` are the banner families on it. What was done: 'quota-card'
     (queued for the owner's DM), 'quota-card-posted', 'quota-card-dropped' (queued again later),
     'quota-card-unsure' (queued again later under the same key),
@@ -325,7 +327,7 @@ def notice(root, cfg: dict, names, text: str, log, now=time.time) -> str:
         text = own_ui(root, text)
         limited = [n for n in detector.abnormal_names(text) if n in PROVIDER_LIMIT_PATTERNS]
     rec, at = load(root), now()
-    if limited and _history(root, text, at):
+    if limited and _history(root, text, at, str(session or "")):
         limited = []
     if not limited:
         if rec.get("since") is None:

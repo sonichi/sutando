@@ -394,18 +394,22 @@ class LimitMenu(NoticeBase):
     def test_a_banner_a_new_session_redraws_from_the_conversation_before_is_history(self):
         # After a restart Claude Code shows the old transcript, its limit banner included: the card fired again.
         quota_card.remember_room(self.root, DM)
-        quota_card.new_session(self.root, now=lambda: self.at[0])
-        self.assertEqual(self.tick(QUIET), "")                 # nothing drawn yet
+
+        def tick(text, advance, session):
+            self.at[0] += advance
+            return quota_card.notice(self.root, self.cfg, detector.abnormal_names(text), text, lambda *parts: None,
+                                     now=lambda: self.at[0], session=session)
+        self.assertEqual(tick(QUIET, 0.0, "s1"), "")                 # nothing drawn yet
         for later in (5.0, 60.0, 600.0):
-            self.assertEqual(self.tick(LIMITED, later), "", "the banner was on the pane when the session started")
+            self.assertEqual(tick(LIMITED, later, "s1"), "", "the banner was on the pane when the session started")
         self.assertEqual(self.queued(), [])
         # The same banner again under it is a limit now.
-        self.assertEqual(self.tick(LIMITED + "● next answer\n" + LIMITED, 5.0), "quota-card")
-        # And the limit menu is never history, however early.
-        quota_card.new_session(self.root, now=lambda: self.at[0])
-        self.assertEqual(self.tick(STARTUP_MENU, 1.0), "quota-card")
-        # A session that never restarted has no history to set aside.
-        self.assertFalse(quota_card._history(str(self.root) + "-other", LIMITED, 0.0))
+        self.assertEqual(tick(LIMITED + "● next answer\n" + LIMITED, 5.0, "s1"), "quota-card")
+        # The limit menu is never history, however early in a session.
+        quota_card.new_session(self.root)
+        self.assertEqual(tick(STARTUP_MENU, 1.0, "s2"), "quota-card")
+        # A caller that names no session sets nothing aside.
+        self.assertFalse(quota_card._history(self.root, LIMITED, 0.0, ""))
 
     def test_a_message_from_another_room_or_before_the_unasked_card_gets_its_own_card(self):
         self.assertTrue(quota_card._just_carded({"qid": "q", "queued": 100.0}, DM, DM, 130.0), "queued, not yet posted")
@@ -536,11 +540,11 @@ class Supervisor(unittest.TestCase):
     def test_each_outcome_is_logged_once_and_a_failure_never_raises(self):
         lc, logs = self.lc()
         seen = []
-        with mock.patch.object(quota_card, "notice", side_effect=lambda root, cfg, names, text, log, now: (
-                seen.append(names), log("a", 1), "quota-card")[-1]):
+        with mock.patch.object(quota_card, "notice", side_effect=lambda root, cfg, names, text, log, now, session: (
+                seen.append((names, session)), log("a", 1), "quota-card")[-1]):
+            launcher.Launcher.quota(lc, LIMITED, "nonce-1")
             launcher.Launcher.quota(lc, LIMITED)
-            launcher.Launcher.quota(lc, LIMITED)
-        self.assertEqual(seen[0], ["quota-limit"])
+        self.assertEqual(seen, [(["quota-limit"], "nonce-1"), (["quota-limit"], "")], "the session it reads is named")
         self.assertEqual(logs, ["a 1", "quota: quota-card", "a 1"])
         with mock.patch.object(quota_card, "notice", side_effect=RuntimeError("broken")):
             launcher.Launcher.quota(lc, LIMITED)
@@ -563,7 +567,7 @@ class Supervisor(unittest.TestCase):
 
     def test_the_ticks_observation_calls_it_with_the_pane(self):
         source = Path(launcher.__file__).read_text()
-        self.assertIn("own=quota_card.own_ui(self.root, text))\n        self.quota(text)", source)
+        self.assertIn("own=quota_card.own_ui(self.root, text))\n        self.quota(text, ", source)
 
 
 if __name__ == "__main__":
