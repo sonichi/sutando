@@ -866,6 +866,39 @@ class AwaitSignIn(Base):
         self.assertEqual(len([c for c in self.fake.calls if c[0] == "room.message.send" and c[2].endswith(":switching")]), 1,
                          "the same operation id: the room returns the card it already posted")
 
+    def test_the_original_card_editable_again_after_the_fallback_post_does_not_hide_the_fallback_card(self):
+        class Killed(BaseException):
+            """The waiter's process ending right after the fallback post: its receipt was never saved."""
+
+        refused = {"$card2"}
+        seen = {}
+
+        def room(action, arguments, *, operation_id, room_id):
+            if action == "room.message.edit" and arguments["event_id"] in refused:
+                raise ac.CardError("briefly unavailable")
+            if operation_id not in seen:
+                seen[operation_id] = self.fake.execute(action, arguments, operation_id=operation_id, room_id=room_id)
+            if action == "room.message.send" and operation_id.endswith(":switching") and not died:
+                died.append(1)
+                raise Killed()                  # posted; the answer never reached the waiter
+            return seen[operation_id]
+        died = []
+        self.claude_json = {"loggedIn": True}
+        with self.assertRaises(Killed), contextlib.redirect_stdout(io.StringIO()):
+            self.wait_with(room)
+        kept = json.loads(self.ws.joinpath(*rtc.WAITING).read_text())
+        self.assertEqual((kept["phase"], kept["route"], kept["card"]), ("switching", "post", "$card2"),
+                         "the route is on record before the post; the new card's id never was")
+        fallback = [v for k, v in seen.items() if k.endswith(":switching")][0]["result"]["event_id"]
+        # By the resume the original card can be edited again. The recorded route wins: the same post is
+        # asked for, its card recovered, and the worker is handed that card.
+        refused.clear()
+        rc, out = self.wait_with(room)
+        argv = self.launch.calls[-1][0]
+        self.assertEqual((out["status"], argv[argv.index("--card") + 1]), ("started", fallback))
+        self.assertEqual([e for e, _ in self.fake.edits() if e == "$card2"], [], "the old card is not made to say Switching")
+        self.assertEqual(len([c for c in self.fake.calls if c[0] == "room.message.send" and c[2].endswith(":switching")]), 1)
+
     def test_a_waiter_stopped_before_its_last_words_leaves_them_for_the_next_to_say(self):
         for phase, status, said in (("expired", "gave_up", "I stopped waiting for the Claude Code sign-in"),
                                     ("already", "already", "The core is now running on Claude Code")):
