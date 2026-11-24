@@ -64,7 +64,7 @@ can change here, and offer the nearest one.
 | The people listed (`audienceUsers`) | a list of user ids, each one like `@name:s.space`, of people joined to the room; used only with `specific` |
 | Others who mention your owner (`admitOnOwnerMention`) | `true`: messages from people who may already reach you that mention your owner are sent to you too; you don't answer those in the room, you tell your owner about them in your DM · `false` |
 | Room members' access (`memberAccessTier`) | `none`: no access · `guest`: when they address you, your owner gets a card to let you answer that once · `team`: they can work with you as your Team |
-| Secrets check on Team answers (`sensitiveDataFilter`) | `true`: before an answer to a Team member is posted, it is checked for secrets (tokens, keys, passwords), raw errors and tracebacks, and file paths in home or temporary folders, and held back if it has any · `false`: that check is skipped; an answer still can't be sent to another room or attach a file outside the task |
+| Secrets check for Team (`sensitiveDataFilter`) | `true`: before the bridge delivers your answer to anyone but your owner, Sutando scans it for secrets (tokens, keys, passwords), raw errors and tracebacks, and file paths in home or temporary folders, and holds it back if it finds any · `false`: only answers to members s.space vouches for as your Team, on messages that arrived after the change, skip that scan; Guests' answers are still scanned, and sending to another room or attaching a file outside the task is still refused |
 
 Memory (`sessionScope`) is also stored by s.space, but it doesn't change how you work, so
 don't offer it. Whether a room's conversation is kept apart from your other rooms depends on
@@ -93,8 +93,8 @@ your owner asks for it, say so, and change nothing.
   person, and it still keeps out anyone blocked or not on a "specific people" list.
   It also needs your owner to have made you able to work with a Team; if the change is
   refused as `CONFLICT` for that, say so.
-- The secrets check only matters with Team access, and only for members you work with as
-  your Team. Turning it off lets a secret in your answer to them be posted: say that, and
+- Turning the secrets check off only matters with Team access, and only for members you
+  work with as your Team. Turning it off lets a secret in your answer to them be posted: say that, and
   ask your owner to confirm before you send the change. It changes nothing for your owner or
   Guests, and only for messages that arrive after the change: one already waiting keeps the
   old setting.

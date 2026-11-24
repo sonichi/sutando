@@ -9,7 +9,9 @@ Run: python3 tests/room-settings-skill.test.py
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import re
 import subprocess
 import sys
@@ -88,6 +90,38 @@ class TestTaskId(unittest.TestCase):
             p.write_text(task("id: task-1", "task_id: t1", "access_tier: team"))
             r = subprocess.run([sys.executable, str(SCRIPT), str(p)], capture_output=True, text=True)
             self.assertEqual((r.returncode, r.stdout), (task_id.NOT_OWNER, ""))
+
+
+class TestMain(unittest.TestCase):
+    """In-process, so coverage sees the CLI paths the subprocess test also runs."""
+
+    def run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = task_id.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_usage(self):
+        code, out, err = self.run_main(["task_id.py"])
+        self.assertEqual((code, out), (64, ""))
+        self.assertIn("task_id.py <task-file>", err)
+
+    def test_unreadable_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            code, out, err = self.run_main(["task_id.py", str(Path(d) / "missing.txt")])
+        self.assertEqual((code, out), (task_id.NO_TASK, ""))
+        self.assertIn("cannot read task file", err)
+
+    def test_each_exit(self):
+        cases = ((task("task_id: t1", "access_tier: owner"), 0, "t1\n", ""),
+                 (task("task_id: t1", "access_tier: guest"), task_id.NOT_OWNER, "", "not the owner's task\n"),
+                 (task("access_tier: owner"), task_id.NO_TASK, "", "no task_id header\n"))
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "task-1.txt"
+            for text, code, out, err in cases:
+                with self.subTest(code=code):
+                    p.write_text(text)
+                    self.assertEqual(self.run_main(["task_id.py", str(p)]), (code, out, err))
 
 
 class TestSkillRules(unittest.TestCase):
@@ -185,9 +219,12 @@ class TestSkillRules(unittest.TestCase):
         """Off skips only the Team scan (secrets, raw errors, local paths); the redirect and
         attach refusals stay (policy/egress/result.py scan_team_result)."""
         settings = " ".join(section(self.text, "The settings").split())
-        self.assertIn("checked for secrets (tokens, keys, passwords), raw errors and tracebacks, and file paths in home or temporary folders", settings)
+        self.assertIn("before the bridge delivers your answer to anyone but your owner, Sutando scans it", settings)
+        self.assertIn("only answers to members s.space vouches for as your Team, on messages that arrived after "
+                      "the change, skip that scan", settings)
+        self.assertIn("Guests' answers are still scanned", settings)
         self.assertIn("only for messages that arrive after the change", settings)
-        self.assertIn("still can't be sent to another room or attach a file outside the task", settings)
+        self.assertIn("sending to another room or attaching a file outside the task is still refused", settings)
         self.assertIn("ask your owner to confirm before you send the change", settings)
         self.assertIn("It changes nothing for your owner or Guests,", settings)
 
