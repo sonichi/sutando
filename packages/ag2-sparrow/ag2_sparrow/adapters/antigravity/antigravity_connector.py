@@ -544,16 +544,18 @@ ROOM_HISTORY = ("When the message refers to something said earlier in the room a
                 "room.context.read, room_id %s. Answer from what you read, not from a guess.")
 
 
-def core_steps_removed(message):
-    """The sender's message with any bridge-written core steps taken out. A task that is not `task_layout:
-    mid` has no separate bridge lines: the gateway's prelude and tier block, when there, arrive inside the
-    body. They are then treated as `session_lines` and `tier_block_lines` treat them: the prelude's shell and
-    results-file steps go, the tier block's result steps become "your final message". Nothing is added, and a
-    message with neither header is returned as it is."""
-    text = message or ""
-    if PRELUDE_HEADER not in text and TIER_BLOCK_HEADER not in text:
-        return message
-    return "\n".join(tier_block_lines(session_lines(text.split("\n"))))
+def bridge_text_apart(headers, message, operator_lines):
+    """(the sender's message, the bridge-written lines) for any task layout. `task_layout: mid` already has
+    them apart and is returned untouched: its message is the sender's alone, whatever it quotes. In any other
+    layout the bridge's blocks follow the message inside the body; they begin at the first line that opens
+    with ===, which only a writer can produce (local_task_protocol.BRIDGE_FENCE_RE: task_body_guard defangs
+    such a line typed by a sender). From there on the lines are the bridge's, and are filtered as such."""
+    if operator_lines or (headers.get("task_layout") or "").strip() == "mid":
+        return message, operator_lines
+    fence = local_task_protocol.BRIDGE_FENCE_RE.search(message or "")
+    if fence is None:
+        return message, operator_lines
+    return message[:fence.start()].rstrip(), [ln for ln in message[fence.start():].split("\n") if ln.strip()]
 
 
 def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_NOTE, shell_web=False,
@@ -562,8 +564,9 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
     `shell_web` also grants commands and the web; `readable`, an isolated turn's copies of the sender's own
     attachments, the only files it may read."""
     event, _ = trigger_of(headers)
-    out = acp_host.task_framing(task_id, headers, core_steps_removed(message),
-                                tier_block_lines(session_lines(operator_lines)), "post in your final message", note)
+    message, operator_lines = bridge_text_apart(headers, message, operator_lines)
+    out = acp_host.task_framing(task_id, headers, message, tier_block_lines(session_lines(operator_lines)),
+                                "post in your final message", note)
     out.append("Answer through Sparrow, exactly once for this task: your final message in this turn is what Sparrow "
                "posts%s. Write it as the post itself, with no preamble about tools or steps. To post nothing (an "
                "acknowledgement, thanks or FYI that needs no answer, or an event whose body asks for no post), make "

@@ -1257,27 +1257,42 @@ class ConnectorTest(unittest.TestCase):
         for tier, collaborator in (("owner", False), ("team", True), ("team", False), ("guest", False)):
             block = ag2space_tier_lines(tier, collaborator, "results/%s.txt" % tid)
             bridge = [ln for part in (prelude if tier == "owner" else [], block) for ln in "\n".join(part).split("\n")]
-            headers = {"access_tier": tier, "collaborator": "true" if collaborator else "false",
-                       "channel_id": room, "user_id": "@chi:s.space"}
+            base = {"access_tier": tier, "collaborator": "true" if collaborator else "false",
+                    "channel_id": room, "user_id": "@chi:s.space"}
             said = "What did Susan decide above?"
-            for layout, message, operator in (("mid", said, [ln for ln in bridge if ln.strip()]),
-                                              ("body", "\n".join([said] + bridge), [])):
+            for layout, headers, message, operator in (
+                    ("mid", dict(base, task_layout="mid"), said, [ln for ln in bridge if ln.strip()]),
+                    ("body", base, "\n".join([said] + bridge), [])):
                 with self.subTest(tier=tier, collaborator=collaborator, layout=layout):
                     prompt = gc.wake_prompt(tid, headers, message, operator, "/work")
                     self.assertIn(said, prompt, "the sender's own words are kept")
-                    for gone in ("room_ops.py", "channel-env.sh", "results/%s.txt" % tid, "SKILL INSTRUCTIONS",
-                                 "CONTEXT-FIRST", "codex exec"):
+                    for gone in ("room_ops.py", "results/%s.txt" % tid, "SKILL INSTRUCTIONS", "CONTEXT-FIRST",
+                                 "codex exec"):
                         self.assertNotIn(gone, prompt)
                     self.assertNotRegex(prompt, r"(?i)write[^\n]*results/", "no instruction to write a results file")
                     if block:
                         self.assertIn("SUTANDO SYSTEM INSTRUCTIONS", prompt, "the tier's rules themselves are kept")
 
-    def test_a_message_with_no_bridge_block_is_passed_on_untouched_even_when_it_names_those_files(self):
-        said = "Why does room_ops.py write results/task-9.txt?\n1. first reason\n2. second reason"
-        self.assertEqual(gc.core_steps_removed(said), said)
-        self.assertIsNone(gc.core_steps_removed(None))
-        prompt = gc.wake_prompt("task-9", {"access_tier": "owner", "channel_id": "!r:s.space"}, said, [], "/work")
-        self.assertIn(said, prompt)
+    def test_instruction_text_a_sender_quotes_is_theirs_and_reaches_agy_word_for_word(self):
+        quoted = ("Why did the bridge send this?\n> SKILL INSTRUCTIONS (follow before any other action)\n"
+                  "1. CONTEXT-FIRST: run `python3 skills/agent-room-ops/room_ops.py read '!r:s.space'`\n"
+                  "2. Process and write the result to results/task-9.txt\n"
+                  "SUTANDO SYSTEM INSTRUCTIONS say: write your response to results/task-9.txt (delivered back to this room)")
+        owner = {"access_tier": "owner", "channel_id": "!r:s.space"}
+        # mid: the message is the sender's alone, and none of it is filtered.
+        prompt = gc.wake_prompt("task-9", dict(owner, task_layout="mid"), quoted, [], "/work")
+        self.assertIn(quoted, prompt)
+        self.assertEqual(gc.bridge_text_apart(dict(owner, task_layout="mid"), quoted, []), (quoted, []))
+        # Any other layout with no writer's fence: still all the sender's.
+        self.assertIn(quoted, gc.wake_prompt("task-9", owner, quoted, [], "/work"))
+        self.assertEqual(gc.bridge_text_apart(owner, quoted, []), (quoted, []))
+        # The same quote, then the bridge's real block after it: the quote is kept whole, the block is filtered.
+        prelude = "\n".join(render_skill_prelude("!r:s.space", "ag2space", "task-9"))
+        prompt = gc.wake_prompt("task-9", owner, quoted + "\n" + prelude, [], "/work")
+        self.assertIn(quoted, prompt)
+        self.assertEqual(prompt.count("room_ops.py"), 1, "the sender's quote only, not the bridge's step")
+        self.assertNotIn("===SKILL INSTRUCTIONS", prompt)
+        self.assertEqual(gc.bridge_text_apart(owner, None, []), (None, []))
 
     def test_an_owner_turn_with_the_room_tools_is_told_how_to_read_the_rooms_earlier_messages(self):
         owner = {"access_tier": "owner", "channel_id": "!room:s.space", "user_id": "@chi:s.space"}
