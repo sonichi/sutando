@@ -93,7 +93,9 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   on('session.cwd', () => ({ value: '/w/tasks' }))
   on('session.end', (_: any, e: any) => ({ sessionId: e.sessionId }))
   on('turn.start', (_: any, e: any) => ({ turnId: e.turnId }))
-  on('turn.complete', (_: any, e: any) => ({ text: e.text }))
+  on('turn.complete', (_: any, e: any) => ({ text: String(e.answer ?? e.text ?? '') }))
+  on('classic.StopFailure', () => ({}))
+  on('classic.UserPromptSubmit', () => ({}))
   on('tool.register', () => ({ value: { tool: 'x' } }))
   on('ui.log', (_: any, e: any) => { logs.push(String(e?.message ?? e?.text ?? JSON.stringify(e))); return { value: undefined } })
   mock.env(on, opts.env ?? { AG2_RESULTS_DIR: '/out' })
@@ -309,7 +311,9 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
         c.phase = 'SETTLED'; c.body = c.staged; files[`/out/${task}.txt`] = c.body; publishes++
         return out(0, { outcome: 'settled', parked: false })
       }
-      c.phase = 'SETTLED'; c.body = `[s.space] The session's turn ended without a reply (${argv[argv.indexOf('--detail') + 1]})`
+      // As the CLI: the session's error words, when sent, name the cause in place of the detail.
+      const why = argv.includes('--error-stdin') ? `turn error: ${e.init.stdin}` : argv[argv.indexOf('--detail') + 1]
+      c.phase = 'SETTLED'; c.body = `[s.space] The session's turn ended without a reply (${why})`
       files[`/out/${task}.txt`] = c.body; publishes++
       return out(0, { outcome: 'settled', parked: argv[argv.indexOf('--detail') + 1] })
     }
@@ -490,6 +494,117 @@ test('a completed or aborted turn without a reply parks as an explicit protocol 
   expect(late.isError).toBe(true)
   await h.clock.advance(3000)
   expect(h.submitted.length).toBe(1)
+})
+
+// As a session: an API error ends the turn with an empty answer; StopFailure carries the error's words, and
+// its prompt_id names the prompt the failed turn ran under.
+// As a session: each prompt's UserPromptSubmit carries the prompt id its turns and their StopFailure share.
+const prompted = ($: any, id: string) => $.classic.UserPromptSubmit({ session_id: 'sid-1', prompt: 'p', prompt_id: id } as any)
+const fails = (prompt: string, extra: any = {}) =>
+  ({ session_id: 'sid-1', prompt_id: prompt, error: 'billing_error', error_details: 'Credit balance is too low', ...extra }) as any
+
+test('a turn an API error ended parks with the words its StopFailure carried, raised before or after the turn ended; without one, the generic line', async ($, on) => {
+  const h = host(on)
+  h.files['/in/task-e1.txt'] = TASK('task-e1')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await prompted($, 'p-e1')
+  await $.turn.start({ text: h.submitted[0], turnId: 't-e1' })
+  await $.classic.StopFailure(fails('p-e1'))
+  await $.turn.complete({ turnId: 't-e1', reason: 'error', answer: '' } as any)
+  expect(h.files['/out/task-e1.txt']).toContain('ended without a reply (turn error: Credit balance is too low)')
+
+  h.files['/in/task-e2.txt'] = TASK('task-e2')
+  await h.clock.advance(3000)
+  expect(h.submitted[1]).toContain('task-e2')
+  await prompted($, 'p-e2')
+  await $.turn.start({ text: h.submitted[1], turnId: 't-e2' })
+  await $.turn.complete({ turnId: 't-e2', reason: 'error', answer: '' } as any)
+  expect(h.files['/out/task-e2.txt']).toBeUndefined()
+  await $.classic.StopFailure(fails('p-e2'))
+  await h.clock.advance(1000)
+  expect(h.files['/out/task-e2.txt']).toContain('ended without a reply (turn error: Credit balance is too low)')
+
+  h.files['/in/task-e3.txt'] = TASK('task-e3')
+  await h.clock.advance(3000)
+  expect(h.submitted[2]).toContain('task-e3')
+  await prompted($, 'p-e3')
+  await $.turn.start({ text: h.submitted[2], turnId: 't-e3' })
+  await $.turn.complete({ turnId: 't-e3', reason: 'error', answer: '' } as any)
+  await h.clock.advance(1000)
+  expect(h.files['/out/task-e3.txt']).toContain('ended without a reply (turn error without a reply)')
+})
+
+test("an error turn's words are error_details, else the classifier word; never its answer or last_assistant_message", async ($, on) => {
+  const h = host(on)
+  h.files['/in/task-y1.txt'] = TASK('task-y1')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await prompted($, 'p-y1')
+  await $.turn.start({ text: h.submitted[0], turnId: 't-y1' })
+  await $.classic.StopFailure(fails('p-y1', { error: 'server_error', error_details: 'API Error: Overloaded',
+                                               last_assistant_message: 'Let me look at the owner notes first.' }))
+  await $.turn.complete({ turnId: 't-y1', reason: 'error', answer: 'Let me look at the owner notes first.' } as any)
+  expect(h.files['/out/task-y1.txt']).toContain('(turn error: API Error: Overloaded)')
+  expect(h.files['/out/task-y1.txt']).not.toContain('owner notes')
+
+  h.files['/in/task-y2.txt'] = TASK('task-y2')
+  await h.clock.advance(3000)
+  await prompted($, 'p-y2')
+  await $.turn.start({ text: h.submitted[1], turnId: 't-y2' })
+  await $.classic.StopFailure(fails('p-y2', { error_details: undefined, last_assistant_message: 'Credit balance is too low' }))
+  await $.turn.complete({ turnId: 't-y2', reason: 'error', answer: 'Let me look at the owner notes first.' } as any)
+  expect(h.files['/out/task-y2.txt']).toContain('(turn error: billing_error)')
+  expect(h.files['/out/task-y2.txt']).not.toContain('owner notes')
+})
+
+test('a StopFailure is applied only to the one turn its prompt_id names: another turn, session or no prompt gets the generic line', async ($, on) => {
+  const h = host(on)
+  const generic = '(turn error without a reply)'
+  h.files['/in/task-x1.txt'] = TASK('task-x1')
+  await arm($, h)
+  await h.clock.advance(1000)
+  // A manual turn A errors; the task's turn B starts; A's StopFailure lands only after B started.
+  await prompted($, 'p-a')
+  await $.turn.start({ text: 'the owner typed something else', turnId: 't-a' })
+  await $.turn.complete({ turnId: 't-a', reason: 'error', answer: '' } as any)
+  await prompted($, 'p-b')
+  await $.turn.start({ text: h.submitted[0], turnId: 't-b' })
+  await $.classic.StopFailure(fails('p-a', { error_details: 'TURN A WORDS' }))
+  await $.turn.complete({ turnId: 't-b', reason: 'error', answer: '' } as any)
+  await h.clock.advance(1000)
+  expect(h.files['/out/task-x1.txt']).toContain(generic)
+  expect(h.files['/out/task-x1.txt']).not.toContain('TURN A WORDS')
+
+  const cases: [string, any][] = [
+    ['task-x2', fails('p-x2', { session_id: 'sid-elsewhere', error_details: 'OTHER SESSION WORDS' })],
+    ['task-x3', fails('', { error_details: 'NO PROMPT WORDS' })],
+    ['task-x4', fails('p-x4', { agent_id: 'a1', error_details: 'SUBAGENT WORDS' })],
+  ]
+  for (const [task, event] of cases) {
+    h.files[`/in/${task}.txt`] = TASK(task)
+    await h.clock.advance(3000)
+    const at = h.submitted.findIndex((t: string) => t.includes(task))
+    await prompted($, `p-${task.slice(5)}`)
+    await $.turn.start({ text: h.submitted[at], turnId: `t-${task}` })
+    await $.classic.StopFailure(event)
+    await $.turn.complete({ turnId: `t-${task}`, reason: 'error', answer: '' } as any)
+    await h.clock.advance(1000)
+    expect(h.files[`/out/${task}.txt`]).toContain(generic)
+  }
+
+  // Two turns under one prompt: the event cannot say which, so neither is named.
+  h.files['/in/task-x5.txt'] = TASK('task-x5')
+  await h.clock.advance(3000)
+  const at = h.submitted.findIndex((t: string) => t.includes('task-x5'))
+  await prompted($, 'p-shared')
+  await $.turn.start({ text: 'a continuation', turnId: 't-cont' })
+  await $.turn.complete({ turnId: 't-cont', reason: 'answer', answer: 'ok' } as any)
+  await $.turn.start({ text: h.submitted[at], turnId: 't-x5' })
+  await $.classic.StopFailure(fails('p-shared'))
+  await $.turn.complete({ turnId: 't-x5', reason: 'error', answer: '' } as any)
+  await h.clock.advance(1000)
+  expect(h.files['/out/task-x5.txt']).toContain(generic)
 })
 
 test('a rejected submit spends the authorization: never resubmitted, no second authorize', async ($, on) => {
@@ -1147,6 +1262,20 @@ test('a turn that ends while its confirmation is pending is parked once the conf
   await h.clock.advance(1000)
   expect(h.claims['task-p'].phase).toBe('SETTLED')
   expect(h.files['/out/task-p.txt']).toContain('without a reply')
+})
+
+test("an error turn's StopFailure raised while its confirmation is pending names the cause once the confirmation lands", async ($, on) => {
+  const h = host(on, { lockFailsOnce: ['confirm'] })
+  h.files['/in/task-pe.txt'] = TASK('task-pe')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await prompted($, 'p-pe')
+  await $.turn.start({ text: h.submitted[0], turnId: 't-pe' })
+  await $.turn.complete({ turnId: 't-pe', reason: 'error', answer: '' } as any)
+  await $.classic.StopFailure(fails('p-pe'))
+  await h.clock.advance(3000)
+  expect(h.claims['task-pe'].phase).toBe('SETTLED')
+  expect(h.files['/out/task-pe.txt']).toContain('ended without a reply (turn error: Credit balance is too low)')
 })
 
 test('a transient stage failure tells the session to reply again; the second reply publishes once', async ($, on) => {

@@ -2,6 +2,8 @@ import type { Register } from 'claude-code'
 
 const PLUGIN = 'ag2space-inbox'
 const POLL_MS = 1000
+// Recent turns whose prompt id a late StopFailure may still name.
+const PROMPTS_KEPT = 8
 const STALE_TICKS = 30
 // An interrupted answer that did not land: retried after 1, 2, 4 ... ticks, capped; marked stuck in the
 // record (verify and the card name it) once it has failed for STUCK_TICKS.
@@ -76,8 +78,8 @@ function submittedAt(turnText: string, msg: string): number {
 
 // One lifecycle claim as the Mod sees it: the phase is the CLI's answer, never a shadow machine.
 type Offer = { file: string; rid: string; attempt: number; msg: string; hash: string; token: string; turnId: string; phase: string
-                confirming?: { turnId: string; hash: string; completed?: string }; stagedText?: string
-                parkPending?: string; unconfirmed?: boolean }
+                confirming?: { turnId: string; hash: string; completed?: string; completedError?: string }; stagedText?: string
+                parkPending?: string; parkError?: string; unconfirmed?: boolean }
 
 // One session's inbox state: what was seen and answered, the offers in flight, the live watch, the
 // session-id witness and whether intake is open.
@@ -98,6 +100,12 @@ type State = {
   cleanup: Map<string, Cleanup>
   intake: 'open' | 'closed'
   intakeReason: string
+  // The main loop's last UserPromptSubmit prompt id, and turn id -> the prompt id it ran under (recent
+  // turns only): what a StopFailure is matched by.
+  promptId: string
+  prompts: Map<string, string>
+  // Turn id -> the API error words its StopFailure carried, until that turn completes.
+  apiErrors: Map<string, string>
 }
 
 type CliOut = { ok: boolean; hard: boolean; data: any }
@@ -120,6 +128,13 @@ async function cli($: any, s: State, args: string[], stdin?: string): Promise<Cl
   const hard = r.exitCode === EXIT_PROGRESS
   if (hard) closeIntake($, s, `progress record not durable: ${data.error ?? r.stderr ?? 'unknown'}`)
   return { ok: r.exitCode === 0, hard, data }
+}
+
+// The prompt id the main loop is on as a turn starts, kept for the last few turns; none known, none kept.
+function rememberPrompt(s: State, turnId: string) {
+  if (s.promptId) s.prompts.set(turnId, s.promptId)
+  for (const t of [...s.prompts.keys()].slice(0, Math.max(0, s.prompts.size - PROMPTS_KEPT))) s.prompts.delete(t)
+  for (const t of [...s.apiErrors.keys()]) if (!s.prompts.has(t)) s.apiErrors.delete(t)
 }
 
 function closeIntake($: any, s: State, reason: string) {
@@ -198,7 +213,9 @@ async function releaseOffer($: any, s: State, offer: Offer, why: string): Promis
 
 // The turn ended: an accepted answer is delivered as it is, else the protocol failure. why is '' once delivered,
 // else why not (kept, retried by the scan behind the backoff); hard: a write closed intake (the scan ends).
-async function parkOffer($: any, s: State, offer: Offer, reason: string): Promise<{ why: string; hard: boolean }> {
+// error: the session's own words for an API error that ended the turn; the CLI scrubs it into the room's line.
+async function parkOffer($: any, s: State, offer: Offer, reason: string, error: string = offer.parkError ?? ''): Promise<{ why: string; hard: boolean }> {
+  offer.parkError = error
   if (offer.stagedText !== undefined && offer.phase === 'TURN_CONFIRMED') {
     const st = await cli($, s, ['stage', offer.rid, offer.turnId], offer.stagedText + '\n')
     if (st.ok || (st.hard && st.data?.outcome === 'staged')) offer.phase = 'RESULT_STAGED'
@@ -209,7 +226,8 @@ async function parkOffer($: any, s: State, offer: Offer, reason: string): Promis
     }
   }
   const r = offer.phase === 'RESULT_STAGED' ? await cli($, s, ['publish', offer.rid])
-    : await cli($, s, ['park', offer.rid, offer.turnId, '--detail', `turn ${reason} without a reply`])
+    : await cli($, s, ['park', offer.rid, offer.turnId, '--detail', `turn ${reason} without a reply`, ...(error ? ['--error-stdin'] : [])],
+                error || undefined)
   if (!(r.ok || (r.hard && r.data?.outcome === 'settled'))) {
     offer.parkPending = reason
     return { why: String(r.data?.refused ?? r.data?.error ?? 'not published'), hard: r.hard }
@@ -217,6 +235,7 @@ async function parkOffer($: any, s: State, offer: Offer, reason: string): Promis
   await $.ui.log(`${PLUGIN}: ${offer.rid} delivered at the turn's end (${offer.stagedText !== undefined || r.data?.parked === false ? 'the accepted answer' : 'the protocol failure'})`, {})
   s.answered.add(offer.rid)
   offer.parkPending = undefined
+  offer.parkError = undefined
   const hard = await releaseOffer($, s, offer, "delivered at the turn's end")
   return { why: '', hard: hard || r.hard }
 }
@@ -230,10 +249,16 @@ async function confirmOffer($: any, s: State, offer: Offer): Promise<boolean> {
   if (!r.ok && !r.hard && r.data?.retry) return false
   offer.confirming = undefined
   if (s.pending === offer) s.pending = null
+  // A StopFailure raised after the turn's end but before this landed was kept under the turn's id.
+  if (c.completed === 'error' && !c.completedError) {
+    c.completedError = s.apiErrors.get(c.turnId) ?? ''
+    s.apiErrors.delete(c.turnId)
+  }
   if (r.ok || (r.hard && r.data?.turn_id)) {
     offer.turnId = c.turnId
     offer.phase = 'TURN_CONFIRMED'
-    return (c.completed ? (await parkOffer($, s, offer, c.completed)).hard : false) || r.hard
+    if (c.completed === 'error' && !c.completedError) { offer.parkPending = 'error'; offer.parkError = ''; return r.hard }
+    return (c.completed ? (await parkOffer($, s, offer, c.completed, c.completedError)).hard : false) || r.hard
   }
   await $.ui.log(`${PLUGIN}: ${offer.rid} turn not confirmed: ${r.data?.refused ?? ''}; held until the next start answers it`, {})
   // The claim stays CALLING with no answer and the CLI refuses to claim it again: the offer is kept, never
@@ -463,7 +488,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
 
 export const register: Register = (on) => {
   const s: State = { seen: new Set(), answered: new Set(), offers: new Map(), pending: null, stale: new Map(),
-    armedResults: '', stop: null, sessionId: '', stoppedFor: '', tick: 0, retry: new Map(), cleanup: new Map(), authorizing: new Map(), intake: 'open', intakeReason: '' }
+    armedResults: '', stop: null, sessionId: '', stoppedFor: '', tick: 0, retry: new Map(), cleanup: new Map(), authorizing: new Map(), intake: 'open', intakeReason: '', promptId: '', prompts: new Map(), apiErrors: new Map() }
 
   on('session.start', async ($, e, next) => {
     await $.tool.register({
@@ -514,6 +539,7 @@ export const register: Register = (on) => {
   })
 
   on('turn.start', async ($, e, next) => {
+    if (!e.agentId) rememberPrompt(s, String(e.turnId))
     await witness($, s, 'turn.start')
     const offer = s.pending
     const at = offer ? submittedAt(String(e.text ?? ''), offer.msg) : -1
@@ -531,12 +557,43 @@ export const register: Register = (on) => {
     return next(e)
   })
 
+  // prompt_id correlates a prompt with every event until the next one: StopFailure carries it too.
+  on('classic.UserPromptSubmit', async ($, e, next) => {
+    if (!e.agent_id) s.promptId = typeof e.prompt_id === 'string' ? e.prompt_id : ''
+    return next(e)
+  })
+
+  // An API error's words come from StopFailure alone, and only for the one turn its prompt_id names;
+  // turn.complete's answer and last_assistant_message are session text, never the error.
+  on('classic.StopFailure', async ($, e, next) => {
+    const sameSession = !e.session_id || !s.sessionId || e.session_id === s.sessionId
+    const turns = e.prompt_id ? [...s.prompts].filter(([, p]) => p === e.prompt_id).map(([t]) => t) : []
+    const text = [e.error_details, e.error].find((v) => typeof v === 'string' && v.trim())
+    if (!e.agent_id && sameSession && turns.length === 1 && text) {
+      const turnId = turns[0]
+      let waiting = false
+      // A turn that already ended on an error waits one scan tick for its own words (see turn.complete).
+      for (const o of s.offers.values()) {
+        if (o.parkPending === 'error' && !o.parkError && o.turnId === turnId) { o.parkError = text; waiting = true }
+      }
+      if (!waiting) s.apiErrors.set(turnId, text)
+    }
+    return next(e)
+  })
+
   on('turn.complete', async ($, e, next) => {
+    const own = e.agentId ? '' : s.apiErrors.get(String(e.turnId)) ?? ''
+    s.apiErrors.delete(String(e.turnId))
+    const error = e.reason === 'error' ? own : ''
     for (const offer of [...s.offers.values()]) {
       // Its confirmation still pending: parked once it lands, so the turn's end is never lost.
-      if (offer.confirming?.turnId === e.turnId) { offer.confirming.completed = String(e.reason); continue }
+      if (offer.confirming?.turnId === e.turnId) {
+        offer.confirming.completed = String(e.reason); offer.confirming.completedError = error; continue
+      }
       if (offer.turnId === e.turnId && (offer.phase === 'TURN_CONFIRMED' || offer.phase === 'RESULT_STAGED')) {
-        await parkOffer($, s, offer, String(e.reason))
+        // No words yet: the scan parks it, so a StopFailure raised after the turn's end still names the cause.
+        if (e.reason === 'error' && !error) { offer.parkPending = 'error'; offer.parkError = ''; continue }
+        await parkOffer($, s, offer, String(e.reason), error)
       }
     }
     return next(e)

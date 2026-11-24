@@ -19,7 +19,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from ... import connect_bridge as cb, connect_common as cm, task_io, task_lifecycle as lifecycle
+from ... import connect_bridge as cb, connect_common as cm, task_io, task_lifecycle as lifecycle, turn_error
 from ... import claude_local_records as records, collaborator_turn as isolated, relay_loop
 from . import hmac_policy
 from .shape import LOCAL
@@ -28,6 +28,17 @@ EXIT_OK, EXIT_REFUSED, EXIT_USAGE, EXIT_PROGRESS = 0, 1, 2, 3
 INTERRUPTED_BODY = ("[s.space] This attempt was interrupted before the session answered; send the request "
                     "again if it is still wanted.")
 PROTOCOL_FAILURE = "[s.space] The session's turn ended without a reply (%s); send the request again if still wanted."
+# The CLI's StopFailure `error` codes (SDKAssistantMessageError) a person can act on; any other code is shown as-is.
+STOP_FAILURE_REASONS = {
+    "billing_error": "your Claude account is out of credits",
+    "authentication_failed": "Claude is signed out on this computer; sign in again",
+    "oauth_org_not_allowed": "your organization does not allow this Claude sign-in; use an API key or ask your admin",
+    "account_on_hold": "your Claude account is on hold",
+    "cloud_credential_error": "the cloud credentials Claude uses are unavailable; check or refresh them",
+    "rate_limit": "Claude's usage limit was reached; try again later",
+    "overloaded": "Claude's service is busy; try again shortly",
+    "server_error": "Claude's service is unavailable right now; try again shortly",
+}
 ROOT_VAR = "AG2_SPARROW_ROOT"
 CONFIG_DIR_VAR = "AG2_SPARROW_CONFIG_DIR"
 ALLOW_NON_OWNER = "ALLOW_NON_OWNER"
@@ -599,13 +610,27 @@ def publish(root, task_id) -> dict:
     return _mirror(root, task_id, None, {"task_id": task_id, "outcome": outcome})
 
 
-def park(root, task_id, turn_id, detail) -> dict:
+def _audience(root, task_id) -> "tuple[str | None, str | None]":
+    """The task file's attested sender tier (parse_task maps unknown to guest) and its room's channel_kind;
+    (None, None) when it cannot be read."""
+    try:
+        headers = task_io.parse_task(os.path.join(root, "tasks", task_id + ".txt"))[0]
+    except (OSError, ValueError):
+        return None, None
+    return headers["access_tier"], headers.get("channel_kind")
+
+
+def park(root, task_id, turn_id, detail, error="") -> dict:
     """A completed or aborted turn with nothing staged: the explicit protocol failure, published once.
     A turn whose answer was already accepted (its descriptor recorded) publishes that answer instead.
     The identical park again after one that settled but whose reply was lost answers settled, naming
-    the protocol failure only when that is what it delivered; nothing is published twice."""
+    the protocol failure only when that is what it delivered; nothing is published twice.
+    `error`: what the session said ended the turn, a known CLI error code read as its plain reason; its
+    scrubbed line replaces `detail` in the room's line only when the task's attested sender is the owner and its room is a DM."""
     rec = _lifecycle(root).claims.load(task_id)
-    body = (PROTOCOL_FAILURE % detail).encode("utf-8")
+    error = STOP_FAILURE_REASONS.get(error.strip(), error) if error else ""
+    why = turn_error.owner_reason(*_audience(root, task_id), error) if error else ""
+    body = (PROTOCOL_FAILURE % ("turn error: " + why if why else detail)).encode("utf-8")
     if rec and rec.get("staged") and rec["phase"] in (lifecycle.TURN_CONFIRMED, lifecycle.RESULT_STAGED, lifecycle.SETTLED):
         # `parked` names what the recorded descriptor delivers: this park's failure line, or an accepted answer.
         failure = rec["staged"].get("sha256") == hashlib.sha256(body).hexdigest()
@@ -671,7 +696,8 @@ def main(args) -> int:
         elif verb == "publish":
             out = publish(root, args.task_id)
         elif verb == "park":
-            out = park(root, args.task_id, args.turn_id, args.detail)
+            out = park(root, args.task_id, args.turn_id, args.detail,
+                       sys.stdin.read() if args.error_stdin else "")
         elif verb == "progress":
             gen = task_io.holder_consumer(root) if args.bind_generation else None
             out = progress(root, args.session_id, args.nonce, args.intake, args.reason,
@@ -719,6 +745,7 @@ def add_parser(sub) -> None:
     s = v.add_parser("stage"); s.add_argument("task_id"); s.add_argument("turn_id")
     u = v.add_parser("publish"); u.add_argument("task_id")
     k = v.add_parser("park"); k.add_argument("task_id"); k.add_argument("turn_id"); k.add_argument("--detail", default="no result")
+    k.add_argument("--error-stdin", action="store_true")
     g = v.add_parser("progress")
     g.add_argument("--session-id"); g.add_argument("--nonce"); g.add_argument("--intake", choices=("open", "stopped"))
     g.add_argument("--reason"); g.add_argument("--bind-generation", action="store_true")

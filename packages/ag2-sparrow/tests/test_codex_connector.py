@@ -20,7 +20,7 @@ from unittest import mock
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import local_task_protocol, task_io, team_guardrail  # noqa: E402
+from ag2_sparrow import local_task_protocol, task_io, team_guardrail, turn_error  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
 
 # The note as it was pinned before it moved to the shared owner: proves the move changed no byte.
@@ -993,7 +993,49 @@ class EdgePathTest(unittest.TestCase):
         self.assertEqual(c.result_body("completed", "", None), cc.NO_REPLY)
         self.assertEqual(c.result_body("timeout", "part", "interrupted after 1s"),
                          "Codex did not finish this task in time (interrupted after 1s).\n\nPartial reply:\npart")
-        self.assertEqual(c.result_body("failed", "", {"message": "x"}), "Codex ended this task with status failed.")
+        self.assertEqual(c.result_body("failed", "", {"message": "Quota exceeded."}, "owner", "dm"),
+                         "Codex ended this task with status failed: Quota exceeded.")
+        for no_message in (None, {}, {"message": ""}, {"message": "  \n "}, "boom"):
+            self.assertEqual(c.result_body("failed", "", no_message, "owner", "dm"), "Codex ended this task with status failed.",
+                             no_message)
+        said = c.result_body("failed", "part", {"message": "denied for /Users/o/.codex/auth.json\n" + "y" * 400},
+                             "owner", "dm")
+        line = said.split("\n")[0]
+        self.assertNotIn("/Users/o", line)
+        self.assertLessEqual(len(line), len("Codex ended this task with status failed: .") + turn_error.LIMIT)
+        self.assertTrue(said.endswith("\n\nPartial reply:\npart"))
+        self.assertTrue(line.startswith("Codex ended this task with status failed: denied for <path>"), line)
+
+    def test_a_failure_reason_reaches_only_the_owner_in_a_dm(self):
+        args = cc.build_parser().parse_args(["--work", "w"])
+        c = cc.Connector(FakeRpc, args, note="n")
+        quota = {"message": "Credit balance is too low"}
+        plain = "Codex ended this task with status failed."
+        self.assertEqual(c.result_body("failed", "", quota, "owner", "dm"),
+                         "Codex ended this task with status failed: Credit balance is too low.")
+        for kind in ("room", None, ""):
+            self.assertEqual(c.result_body("failed", "", quota, "owner", kind), plain, kind)
+        for tier in ("team", "guest", None, "", "unknown"):
+            self.assertEqual(c.result_body("failed", "", quota, tier, "dm"), plain, tier)
+        self.assertEqual(c.result_body("failed", "", quota), plain, "unknown fails closed")
+
+    def test_serve_passes_the_attested_tier_and_room_kind_to_the_failure_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            now = time.time()
+            write_task(d, "task-chat-od", "owner in dm", tier="owner", kind="dm", mtime=now - 50)
+            write_task(d, "task-chat-or", "owner in a room", tier="owner", kind="room", mtime=now - 40)
+            write_task(d, "task-chat-ou", "owner, room kind unknown", tier="owner", mtime=now - 30)
+            write_task(d, "task-chat-t", "team in dm", tier="team", kind="dm", mtime=now - 20)
+            write_text(d, "task-chat-n", "id: task-chat-n\nchannel_id: !r:x\nchannel_kind: dm\ntask: no tier\n",
+                       mtime=now - 10)
+            failed = ("failed", "", {"message": "Credit balance is too low"})
+            with mock.patch.object(cc.Connector, "run_task", return_value=failed), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(run_connector(d, once=5), 0)
+            self.assertEqual(result(d, "task-chat-od").strip(),
+                             "Codex ended this task with status failed: Credit balance is too low.")
+            for tid in ("task-chat-or", "task-chat-ou", "task-chat-t", "task-chat-n"):
+                self.assertEqual(result(d, tid).strip(), "Codex ended this task with status failed.", tid)
 
     def test_done_list_is_bounded_and_deduplicated(self):
         with tempfile.TemporaryDirectory() as d:
