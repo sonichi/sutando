@@ -376,6 +376,48 @@ class LimitMenu(NoticeBase):
         self.assertEqual(self.tick(STARTUP_MENU, 5.0), "")
         self.assertEqual(len(self.queued()), 1)
 
+    def test_an_account_that_cannot_be_read_is_named_as_claude_code_and_said_so(self):
+        quota_card.remember_room(self.root, DM)
+        self.task("task-u", "hello")
+        with mock.patch.object(account_card, "label", side_effect=RuntimeError("no answer")):
+            self.assertEqual(self.tick(STARTUP_MENU), "quota-task-card x1")
+        text = self.text_of(self.queued()[0])
+        self.assertTrue(text.startswith("Claude Code has hit its usage limit; resets Nov 28, 1pm."), text)
+        self.assertIn("I could not read which account I'm signed in with.", text)
+
+    def test_a_task_that_cannot_be_read_or_sent_is_not_told_and_tried_again_later(self):
+        (self.inbox / "task-dir.txt").mkdir()       # unreadable: never told, never retried
+        self.task("task-r", "from a room", kind="room")
+        self.assertEqual(self.tick(STARTUP_MENU), "quota-no-room", "no DM room known: nowhere to tell it")
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(quota_card.load(self.root)["tasks"], {"task-dir": {"skip": True}})
+        quota_card.remember_room(self.root, DM)
+        gone = self.bridge.with_name("bridge-gone")
+        self.bridge.rename(gone)
+        self.assertEqual(self.tick(STARTUP_MENU, quota_card.RETRY_S), "quota-not-posted", "no bridge to post it")
+        gone.rename(self.bridge)
+        with mock.patch.object(quota_card.records, "write_durable", side_effect=quota_card.records.RecordError("ro")):
+            self.assertEqual(self.tick(STARTUP_MENU, quota_card.RETRY_S), "quota-not-posted", "its key not kept: not sent")
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(self.tick(STARTUP_MENU, quota_card.RETRY_S), "quota-task-card x1")
+        self.assertEqual(self.tick(STARTUP_MENU, 1.0), "")
+        self.assertEqual(len(self.queued()), 1)
+
+    def test_a_task_card_whose_send_was_unsure_is_queued_again_under_its_own_id(self):
+        quota_card.remember_room(self.root, DM)
+        self.task("task-n", "hello")
+        self.assertEqual(self.tick(STARTUP_MENU), "quota-task-card x1")
+        qid = quota_card.load(self.root)["tasks"]["task-n"]["qid"]
+
+        def down(payload):
+            raise OSError("no route")
+        self.sweep(self.queued_at(qid) + 1, down)
+        self.sweep(self.queued_at(qid) + connector_cards.MAX_QUEUED_S + 1)
+        self.assertEqual((connector_cards.outcome(self.bridge, qid), self.queued()), ("unsure", []))
+        self.assertEqual(self.tick(STARTUP_MENU, 5.0), "quota-task-card x1")
+        self.assertEqual(quota_card.load(self.root)["tasks"]["task-n"]["qid"], qid, "one message at the server")
+        self.assertEqual(len(self.queued()), 1)
+
     def test_a_root_with_no_tasks_folder_has_nothing_unanswered(self):
         self.assertEqual(launcher.inbox.unanswered(str(Path(self.root) / "missing")), [])
         (self.inbox / ".task-tmp.txt").write_text("x")
@@ -413,6 +455,8 @@ class LimitMenu(NoticeBase):
             self.assertEqual(self.tick(STARTUP_MENU), "quota-not-posted")
         self.assertEqual(self.queued(), [])
         key = quota_card.load(self.root)["tasks"]["task-k"]["key"]
+        self.assertEqual(self.tick(STARTUP_MENU, 1.0), "", "tried again no sooner than a minute")
+        self.assertEqual(self.queued(), [])
         self.assertEqual(self.tick(STARTUP_MENU, quota_card.RETRY_S), "quota-task-card x1")
         self.assertEqual(quota_card.load(self.root)["tasks"]["task-k"]["key"], key)
         self.assertEqual(len(self.queued()), 1)
