@@ -1247,7 +1247,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub = ap.add_subparsers(dest="command", required=True)
     r = sub.add_parser("render", help="print the page's HTML")
     r.add_argument("--name", required=True,
-                   help="the agent's own name; auto: its s.space display name, else \"your agent\"")
+                   help="the agent's own name; auto: its display name, else \"your agent\"")
     r.add_argument("--agent-mxid", help="with --name auto: this agent's mxid (default $AGENT_MXID or the "
                                         "channel env file's)")
     r.add_argument("--audience", choices=AUDIENCES, default="dm",
@@ -1299,7 +1299,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "render":
         agent = (args.agent_mxid or agent_mxid() or "").strip()
         try:
-            name = clean_name(resolve_name(args.name, agent) or "your agent")
+            name = resolve_name(args.name, agent)
+            name = clean_name(name or "your agent" if args.name == "auto" else name)
             features, listed = resolve_list(args.feature_list, lambda s: print(s, file=sys.stderr))
             prompts = load_prompts(args.prompts, tour_page.prompt_slots(features))
             core = detect_core() if args.core == "auto" else args.core

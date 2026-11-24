@@ -923,9 +923,10 @@ class MainTest(unittest.TestCase):
         self.assertNotIn("Kai Blue", out)
 
     def test_bad_name_exits_2(self):
-        code, _, err = self.main("render", "--name", " ")
-        self.assertEqual(code, 2)
-        self.assertIn("1-64 characters", err)
+        for bad in ("", " "):
+            code, _, err = self.main("render", "--name", bad)
+            self.assertEqual(code, 2)
+            self.assertIn("1-64 characters", err)
 
     def test_plan_reads_the_marker(self):
         code, out, _ = self.main("plan", "--room", self.ROOM)

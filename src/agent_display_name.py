@@ -170,7 +170,7 @@ def _main(argv) -> int:
     else:
         print(name)
     if not name:
-        print("agent_display_name: your s.space display name could not be read. Do not state a name, "
+        print("agent_display_name: your display name could not be read. Do not state a name, "
               "and never make one from your user id.", file=sys.stderr)
     return 0
 
