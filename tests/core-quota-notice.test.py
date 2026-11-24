@@ -137,7 +137,7 @@ class Sender(Base):
             return mock.Mock(stdout='{"status": "posted", "event_id": "$e"}\n', returncode=0)
         send = cqn.card_sender(["py", "card.py"], self.ws, log=lambda *a: None, run=run)
         self.assertTrue(send("Codex has reached its usage limit"))
-        self.assertEqual(calls, [["py", "card.py", "--workspace", str(self.ws), "post", "--owner-dm", "--lead",
+        self.assertEqual(calls, [["py", "card.py", "--workspace", str(self.ws), "post", "--owner-dm", "--retry", "--lead",
                                   "Codex has reached its usage limit"]])
 
     def test_a_failed_or_hung_command_is_not_posted(self):

@@ -18,7 +18,8 @@ python3 skills/account-switch/scripts/account_card.py status                    
 
 `post --owner-dm --lead <words>` posts the same card, unasked, to the core's checked owner DM with
 `<words>` opening it: the core's quota notice (`src/core_quota_notice.py`) sends it once per usage
-limit, from the Codex seat and the Claude Code core's monitor. Never post it that way yourself.
+limit, from the Codex seat and the Claude Code core's monitor, with `--retry` adding a Retry button
+that sends the owner's "retry now" (the limit hold acts on it). Never post it that way yourself.
 
 Never start a sign-in yourself, and never ask for, accept or repeat a sign-in code, link code or
 token in chat. If the owner pastes one, do not use it; tell them to paste it in Settings, in the
