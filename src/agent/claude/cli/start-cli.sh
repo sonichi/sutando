@@ -470,6 +470,16 @@ ensure_core_heartbeat() {
     || echo "  ⚠ core heartbeat --ensure failed; cron-runner fires stay held until it runs" >&2
 }
 
+# A sign-in a runtime card is waiting for gets its waiter back: a restart can take it down with the core.
+resume_runtime_sign_in_wait() {
+  local ws card="$REPO/skills/runtime-switch/scripts/runtime_card.py"
+  { [ -n "$PY" ] && [ -f "$card" ]; } || return 0
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  { [ -n "$ws" ] && [ -f "$ws/state/runtime-card-signin.json" ]; } || return 0
+  mkdir -p "$ws/logs" 2>/dev/null || return 0
+  ( "$PY" "$card" --workspace "$ws" resume >> "$ws/logs/runtime-card.log" 2>&1 & )
+}
+
 # Core-only: a pool worker is never the subject of the Agent Shepherd monitor.
 ensure_core_monitor() {
   local ws mon_out relay_pid_file relay_state
@@ -736,6 +746,7 @@ if [ -t 1 ]; then
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_task_notifier   # the supervisor needs the core session to exist first
   ensure_core_heartbeat
+  resume_runtime_sign_in_wait
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
   # Verify the core actually came up before reporting success. Without this a
@@ -755,6 +766,7 @@ else
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
   ensure_task_notifier
   ensure_core_heartbeat
+  resume_runtime_sign_in_wait
   if [ "$VISIBLE" = 1 ]; then
     open_visible_terminal
     echo "Started $SESSION detached — opened a Terminal window attached to it."

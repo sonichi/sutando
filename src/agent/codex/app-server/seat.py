@@ -916,6 +916,19 @@ class Seat:
         self.lock_fd = fd
         return True
 
+    def resume_runtime_wait(self, popen=None) -> None:
+        """The core is up: a sign-in a runtime card is waiting for gets its waiter back (a restart can
+        take it down with the core). Detached, core only, and never in the seat's way."""
+        script = REPO / "skills" / "runtime-switch" / "scripts" / "runtime_card.py"
+        if self.worker or not script.is_file() or not (self.workspace / "state" / "runtime-card-signin.json").is_file():
+            return
+        try:
+            (popen or subprocess.Popen)(
+                [sys.executable, str(script), "--workspace", str(self.workspace), "resume"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            log(f"the runtime card's sign-in wait was not resumed ({type(e).__name__})")
+
     def serve(self, once: bool = False, watcher: Optional[Watcher] = None) -> int:
         if not self.lock():
             log(f"another seat already serves {self.host.state}; not starting a second one")
@@ -929,6 +942,7 @@ class Seat:
             tmp = ready.with_name("ready.tmp")
             tmp.write_text(f"{os.getpid()}\n", encoding="utf-8")
             os.replace(tmp, ready)
+            self.resume_runtime_wait()
             self.watcher = watcher
             while not self.stopping:
                 if watcher is not None:

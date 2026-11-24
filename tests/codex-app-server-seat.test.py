@@ -898,6 +898,34 @@ class CoreModelSwitch(SeatCase):
     def record(self):
         return json.loads((self.ws / "state" / "model-switch.json").read_text())
 
+    def test_a_core_seat_that_is_up_resumes_a_runtime_cards_sign_in_wait_and_a_worker_or_no_wait_does_not(self):
+        s = self.launched(1, model="gpt-old")
+        calls = []
+        record = Path(s.workspace) / "state" / "runtime-card-signin.json"
+        s.resume_runtime_wait(lambda argv, **kw: calls.append((argv, kw)))
+        self.assertEqual(calls, [], "nothing is waited for")
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text("{}")
+        s.resume_runtime_wait(lambda argv, **kw: calls.append((argv, kw)))
+        (argv, kw), = calls
+        self.assertEqual(argv[1:], [str(seat_mod.REPO / "skills/runtime-switch/scripts/runtime_card.py"),
+                                    "--workspace", str(s.workspace), "resume"])
+        self.assertTrue(kw["start_new_session"], "detached: it does not wait on the card")
+        s.worker, real = "w1", s.worker
+        s.resume_runtime_wait(lambda argv, **kw: calls.append((argv, kw)))
+        s.worker = real
+        self.assertEqual(len(calls), 1, "a worker is not the core")
+
+        def refuses(argv, **kw):
+            raise OSError("no fork")
+        s.resume_runtime_wait(refuses)          # logged, never raised
+        # The seat calls it once it is ready.
+        with mock.patch.object(type(s), "resume_runtime_wait", autospec=True) as resumed:
+            self.task("task-1.txt")
+            self.assertEqual(s.serve(once=True), 0)
+        resumed.assert_called_once()
+
+
     def launched(self, rev, **kw):
         """A seat whose launcher read the record at revision `rev` (SUTANDO_CORE_MODEL_REV)."""
         with mock.patch.dict(os.environ, {"SUTANDO_CORE_MODEL_REV": str(rev)}):
