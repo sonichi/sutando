@@ -90,6 +90,7 @@ SETTINGS = ("Settings → Connections → the Sutando (on this computer) row →
             "A sign-in opens there; paste the code only into that box in the app, never in this chat.")
 NO_CODE = "Never send me a sign-in code or token here."
 SIGNED_OUT = "Codex isn't signed in anymore."
+RETRY_WORDS = "retry now"  # core_limit_hold's bare owner reply
 GONE = "That account is no longer on my list. Ask me for the account card again."
 BUSY = "An account switch is already under way. I'll confirm here when it has finished."
 NOT_CODEX = "Saved accounts are kept only for a core on Codex. Add the account in Settings instead."
@@ -320,10 +321,12 @@ def in_use_words(cur: dict) -> str:
 
 # ── the card ──────────────────────────────────────────────────────────────────────────────────────
 
-def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "") -> tuple:
+def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "", retry: bool = False) -> tuple:
     """(body, card): a "Use" button per other saved account (up to five), then "Add another account".
     `lead`, when given, opens the card's words and its fallback line. `signed_out`: the core's login was
-    refused, so the card drops the account in use and, with no `lead`, opens with SIGNED_OUT."""
+    refused, so the card drops the account in use and, with no `lead`, opens with SIGNED_OUT. `retry`
+    (the quota card) adds a Retry button whose words are the owner's own "retry now", which the limit
+    hold already acts on."""
     buttons = []
     for s in others[:USE_BUTTONS]:
         label = ("Use " + masked_label(s["label"]))[: ac.LIMITS["label"]]
@@ -331,17 +334,20 @@ def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "")
                                  command=ac.reply(KIND, TARGET, s["key"])))
     buttons.append(ac.button("Add another account", "reply", style="primary", reply="Add another account",
                              command=ac.reply(KIND, TARGET, ADD)))
+    if retry:
+        buttons.append(ac.button("Retry", "reply", style="secondary", reply=RETRY_WORDS))
     if signed_out:
         lead = lead or SIGNED_OUT
     if cur["runtime"] == "codex":
         more = (" Pick a saved account to switch to; the core restarts on it." if others else
                 " No other account is saved on this computer yet.")
     else:
-        more = " To use another Anthropic account, add it in Settings."
+        more = ""
     note = NO_CODE
     lead = ac.md_escape(lead)[:1000]
     using = "" if signed_out else in_use_words(cur)
     words = " ".join(w for w in (lead, using, more.strip()) if w)
+    words = words or "Pick an account below."
     return ac.build(CARD_ID, "info", title="Core account", avatar_=ac.avatar(initial="A"),
                     text=words, buttons=buttons, note=note, note_tone="dim",
                     body=" ".join(w for w in (lead, using, 'Reply "switch account" for options.') if w))
@@ -427,7 +433,8 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time, run=subp
             pass  # the card still names the account; only the copy for switching back is missing
     others = [s for s in saved(store, cur["key"]) if not s["current"]]
     try:
-        body, card = menu_card(cur, others, signed_out=args.signed_out, lead=args.lead or "")
+        body, card = menu_card(cur, others, signed_out=args.signed_out, lead=args.lead or "",
+                               retry=args.retry)
     except ac.CardError as e:
         return _emit({"status": "failed", "why": str(e)}, 1)
     if args.print:
@@ -772,6 +779,7 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, run=subp
                     help="the core lane's checked owner DM (the default when --room is not given)")
     s.add_argument("--reply-to", default="")
     s.add_argument("--lead", default="", help="a line that opens the card's words")
+    s.add_argument("--retry", action="store_true", help="add a Retry button (the quota card)")
     s.add_argument("--print", action="store_true")
     s.add_argument("--signed-out", action="store_true", help="the core's login was refused: say so first")
     r = sub.add_parser("reply")

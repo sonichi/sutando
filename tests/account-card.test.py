@@ -243,6 +243,16 @@ class CodexCard(Base):
         self.assertIsNone(ac.problem(card))
         self.assertTrue(card["text"].startswith(lead + " You're on a…@example.com"))
         self.assertNotIn("Settings", card["note"])
+        self.assertNotIn("Retry", [b["label"] for b in card["buttons"]])
+        acc_card = acc.menu_card({"runtime": "codex", "signed_in": True, "shown": "a…@example.com", "key": ""},
+                                 [], lead, retry=True)[1]
+        retry = [b for b in acc_card["buttons"] if b["label"] == "Retry"]
+        self.assertEqual(len(retry), 1)
+        self.assertEqual((retry[0]["reply"], retry[0].get("command")), ("retry now", None))
+        rc, out = self.run_(["post", "--owner-dm", "--retry", "--lead", lead])
+        self.assertEqual((rc, out["status"]), (0, "posted"))
+        self.assertIsNone(ac.problem(self.fake.cards()[-1]))
+        self.assertIn("Retry", [b["label"] for b in self.fake.cards()[-1]["buttons"]])
         self.assertTrue(self.fake.calls[0][1]["body"].startswith(lead))
         self.assertEqual(card["buttons"][-1]["label"], "Add another account")
 

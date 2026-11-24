@@ -66,7 +66,7 @@ def card_sender(argv: Sequence[str], workspace, log: Callable[..., None] = print
                 run=subprocess.run) -> Callable[[str], bool]:
     """send(text) -> posted: runs the injected account card command with `text` leading the card."""
     def send(text: str) -> bool:
-        cmd = [*argv, "--workspace", str(workspace), "post", "--owner-dm", "--lead", text]
+        cmd = [*argv, "--workspace", str(workspace), "post", "--owner-dm", "--retry", "--lead", text]
         try:
             r = run(cmd, capture_output=True, text=True, timeout=SEND_TIMEOUT_S, stdin=subprocess.DEVNULL)
             out = json.loads((r.stdout or "").strip().splitlines()[-1])
