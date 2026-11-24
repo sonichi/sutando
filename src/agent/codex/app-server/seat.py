@@ -24,6 +24,7 @@ import fcntl
 import json
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -38,7 +39,10 @@ for _p in (str(REPO / "src"), str(Path(__file__).resolve().parent)):
         sys.path.insert(0, _p)
 
 import codex_core_model  # noqa: E402
+import core_account_health  # noqa: E402
+import core_quota_notice  # noqa: E402
 import supervised_host  # noqa: E402
+from cli_wedge_patterns import ABNORMAL_PATTERNS, PROVIDER_LIMIT_PATTERNS  # noqa: E402
 from codex_rpc import Rpc  # noqa: E402,F401
 from delivery.task_dispatch import (has_ready_result, owned_task_ids,  # noqa: E402
                                     pending_candidates)
@@ -56,6 +60,17 @@ STOP_RULING_SUFFIX = ".ruling.json"
 CLAIMS_DIR = ("state", "task-event-handler-claims")
 WATCHER = REPO / "src" / "watch-tasks-stream.sh"
 WORKSTREAMS = REPO / "skills" / "task-workstream-grouping" / "scripts" / "workstreams.py"
+ACCOUNT_CARD = REPO / "skills" / "account-switch" / "scripts" / "account_card.py"
+# What a refused turn's error says (TurnError.codexErrorInfo, else its message): one kind each, never both.
+UNAUTHORIZED = "unauthorized"
+# The app-server's word for a turn refused on the account's usage; its message is read too, by the CLI's
+# own limit banners.
+USAGE_LIMIT_INFO = "usagelimitexceeded"
+_LIMIT_WORDS = tuple(rx for name, rx in ABNORMAL_PATTERNS if name in PROVIDER_LIMIT_PATTERNS)
+# A turn refused because the login no longer works (its refresh token revoked when another sign-in rotated
+# it); the message is read too, for a server that sends no codexErrorInfo.
+_UNAUTH_WORDS = re.compile(r"refresh token (was|has been) revoked|access token could not be refreshed|"
+                           r"log out and sign in again|\b401 unauthorized\b", re.IGNORECASE)
 STOPPED = "stopped"
 WITHDRAWN = "withdrawn"
 SETTLE_ATTEMPTS = 5
@@ -70,6 +85,54 @@ DECLINES = {
     "execCommandApproval": {"decision": "denied"},
     "applyPatchApproval": {"decision": "denied"},
 }
+
+
+def error_kind(error) -> Optional[str]:
+    """USAGE_LIMIT_INFO, UNAUTHORIZED or None for a turn's error (a TurnError, an `error` notification's,
+    or a bare message). codexErrorInfo decides when it names either; otherwise the message, a limit banner
+    first: out of usage is not fixed by a restart, so it is never taken for a refused login."""
+    if isinstance(error, str):
+        message = error
+    elif isinstance(error, dict):
+        info = error.get("codexErrorInfo", error.get("codex_error_info"))
+        names = {re.sub(r"[^a-z]", "", str(n).lower())
+                 for n in (list(info) if isinstance(info, dict) else [info]) if n}
+        for kind in (USAGE_LIMIT_INFO, UNAUTHORIZED):
+            if kind in names:
+                return kind
+        message = str(error.get("message") or "")
+    else:
+        return None
+    if any(rx.search(message) for rx in _LIMIT_WORDS):
+        return USAGE_LIMIT_INFO
+    if _UNAUTH_WORDS.search(message):
+        return UNAUTHORIZED
+    return None
+
+
+def usage_limit(error) -> bool:
+    """Whether a turn's error (a TurnError, or an `error` notification's) says the account is out of usage."""
+    return isinstance(error, dict) and error_kind(error) == USAGE_LIMIT_INFO
+
+
+def unauthorized(error) -> bool:
+    """Whether a turn's error (its `error` object, or a message) says the login no longer works."""
+    return error_kind(error) == UNAUTHORIZED
+
+
+def limit_reset(snapshot) -> Optional[float]:
+    """From an `account/rateLimits` snapshot: when a used-up window resets (epoch seconds, the latest of
+    several); None when none is used up or it does not say."""
+    if not isinstance(snapshot, dict):
+        return None
+    found = []
+    for name in ("primary", "secondary"):
+        window = snapshot.get(name)
+        if isinstance(window, dict):
+            used, at = window.get("usedPercent"), window.get("resetsAt")
+            if isinstance(used, (int, float)) and used >= 100 and isinstance(at, (int, float)) and at > 0:
+                found.append(float(at))
+    return max(found) if found else None
 
 
 class SeatFatal(RuntimeError):
@@ -126,6 +189,23 @@ def log(*parts) -> None:
                 f.write(time.strftime("%Y-%m-%d ") + line + "\n")
         except OSError:
             pass
+
+
+def auth_file() -> str:
+    """The login file of the Codex home the app-server child runs on (CODEX_HOME, else ~/.codex)."""
+    home = os.environ.get("CODEX_HOME") or os.path.join(os.environ.get("HOME") or os.path.expanduser("~"), ".codex")
+    return os.path.join(home, "auth.json")
+
+
+def auth_print(path: Optional[str] = None) -> Optional[tuple]:
+    """What identifies the login on disk now (the file it resolves to, its inode, size and mtime), never its
+    contents; None when there is none. A sign-in, an account switch, an API key set or a logout changes it."""
+    path = path or auth_file()
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return os.path.realpath(path), st.st_ino, st.st_size, st.st_mtime_ns
 
 
 def one_line(text, limit: int = 160) -> str:
@@ -223,7 +303,8 @@ class Seat:
                  instructions: str = "", poll_s: float = 2.0, retry_s: float = 30.0,
                  hold_s: float = 900.0, max_attempts: int = 2, backoff_s: float = 2.0,
                  turn_timeout: float = 0.0, interrupt_grace: float = 30.0,
-                 context: Optional[Callable[[str], str]] = None, clock: Callable[[], float] = time.time):
+                 context: Optional[Callable[[str], str]] = None, clock: Callable[[], float] = time.time,
+                 quota: Optional["core_quota_notice.QuotaNotice"] = None):
         self.host, self.workspace, self.seat, self.worker = host, Path(workspace), seat, worker
         # `-c` before the subcommand: the desktop app counts a core alive only when the program
         # it reads up to the first flag is `codex`, and `codex app-server -c` reads as `codex app-server`.
@@ -233,6 +314,9 @@ class Seat:
         self.poll_s, self.retry_s, self.hold_s, self.max_attempts = poll_s, retry_s, hold_s, max_attempts
         self.backoff_s, self.turn_timeout, self.interrupt_grace = backoff_s, turn_timeout, interrupt_grace
         self.context, self.clock = context, clock
+        self.quota = quota            # the core's quota notice; a worker's seat has none
+        self.rate_limits: dict = {}   # the last `account/rateLimits/updated` snapshot
+        self.turn_limit: Optional[dict] = None  # the current turn's error when it said out of usage
         # The switch revision this seat's launch model came from; a later one is the next turn's.
         self.model_rev = self.launch_rev()
         # (model, rev, the model to restore, sent on turn/start) until Codex settles it
@@ -255,6 +339,13 @@ class Seat:
         self.declined: List[str] = []
         self.idle_logged = False
         self.lock_fd: Optional[int] = None
+        self.auth_seen: Optional[tuple] = None  # the login on disk when the running child was started
+        self.turn_unauth = False  # the current turn was refused because the login no longer works
+        self.told_signed_out: Optional[tuple] = None  # the login the owner was last shown the card for
+        self.health_auth: Optional[tuple] = None  # the login on disk when the core's health went bad
+        # Shows the owner the core's account card when its login is refused even after a restart.
+        self.card_argv = [sys.executable, str(ACCOUNT_CARD), "--workspace", str(self.workspace), "post",
+                          "--signed-out"]
 
     # ---- the app-server child and the seat's one thread ----
 
@@ -270,6 +361,7 @@ class Seat:
         return p
 
     def start_server(self) -> None:
+        self.auth_seen = auth_print()  # read before the child reads it: a change during the start is seen
         self.rpc = Rpc(self.argv, cwd=self.cwd)  # from an unreadable cwd it drops every -c
         self.thread_id = None
         init = self.rpc.request("initialize", {"clientInfo": CLIENT, "capabilities": {"experimentalApi": True}})
@@ -316,6 +408,74 @@ class Seat:
                 self.close_server()
                 self.server_failed(f"app-server did not start: {one_line(e, 200)}")
         return started
+
+    def fresh_auth(self) -> None:
+        """Before a task: the child runs on the login on disk. It reads its tokens once, at start, and a
+        sign-in or account switch since (the desktop's Settings, the account card) revoked their refresh
+        token, so a changed login file closes it and the next ensure_server starts it on the new one."""
+        if self.rpc is not None and auth_print() != self.auth_seen:
+            log("login changed on disk; restarting the app-server before the turn")
+            self.close_server()
+            self.release_limit_hold()
+        self.health_auth_check()
+
+    # ---- the core's account health (core_account_health), for Settings and the profile tab ----
+
+    def health(self, state: str, resets_at=None) -> None:
+        """Record the core seat's account health; a worker's seat shares the core's login and says nothing."""
+        if self.worker:
+            return
+        try:
+            account = core_account_health.codex_email(auth_file())
+            if state == "ok":
+                changed = core_account_health.mark_ok(self.workspace, "codex", account, log=log)
+                self.health_auth = None
+            else:
+                changed = core_account_health.mark(self.workspace, state, "codex", account, resets_at, log=log)
+                self.health_auth = auth_print()
+        except Exception as e:  # noqa: BLE001 - advisory: the record never stops the seat
+            log(f"account health not kept ({type(e).__name__})")
+            return
+        if changed:
+            log(f"account health: {state}")
+
+    def health_auth_check(self) -> None:
+        """The login on disk changed since the health went bad (a sign-in or account switch): back to ok,
+        without waiting for a task. The next turn says otherwise if the new login is refused too."""
+        if self.health_auth is not None and auth_print() != self.health_auth:
+            self.health("ok")
+            self.release_limit_hold()
+
+    def release_limit_hold(self) -> None:
+        """A sign-in or account switch on the core: a limit hold seen under the old login no longer
+        applies (a limit is the account's), so it is lifted. Core seat only; never fatal."""
+        if self.worker:
+            return
+        try:
+            import core_limit_hold
+            if (core_limit_hold.read_hold(self.workspace) or {}).get("status") == "held":
+                core_limit_hold.clear(self.workspace, by="account-change", mirror=False)
+                log("limit hold lifted: the login on disk changed")
+        except Exception as e:  # noqa: BLE001 - advisory
+            log(f"limit hold not lifted ({type(e).__name__})")
+
+    def signed_out(self, filename: str) -> None:
+        """The login was refused even on a restarted child: the core seat shows the owner the account card
+        in their DM, once per login on disk. A worker's seat shares the core's login and says nothing."""
+        now = auth_print()
+        if self.worker or self.told_signed_out == now:
+            return
+        try:
+            done = subprocess.run(self.card_argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                  timeout=120)
+            ok, why = done.returncode == 0, one_line(done.stdout or done.stderr, 200)
+        except (OSError, subprocess.SubprocessError) as e:
+            ok, why = False, one_line(e, 200)
+        if ok:
+            self.told_signed_out = now
+            log(f"task {filename}: Codex isn't signed in anymore; the account card was sent to the owner")
+        else:
+            log(f"task {filename}: Codex isn't signed in anymore; the account card was not sent ({why})")
 
     def server_failed(self, why: str) -> None:
         self.failures += 1
@@ -675,7 +835,8 @@ class Seat:
 
     def run_turn(self, filename: str, prompt: str) -> Tuple[str, str]:
         """(status, detail) once the turn is over: completed | failed | interrupted | stopped |
-        timeout | server-exited | seat-stopping."""
+        timeout | server-exited | seat-stopping. `turn_unauth` says whether the login was refused."""
+        self.turn_unauth = False
         try:
             return self._run_turn(filename, prompt)
         finally:
@@ -683,6 +844,7 @@ class Seat:
                 self.abandon_trial()
 
     def _run_turn(self, filename: str, prompt: str) -> Tuple[str, str]:
+        self.turn_limit = None
         params = {"threadId": self.thread_id, "cwd": self.cwd, "input": [{"type": "text", "text": prompt}]}
         model = self.turn_model()
         if model:
@@ -706,6 +868,7 @@ class Seat:
             turn_id = res["turn"]["id"]
             sent_model = params.get("model")
         except (RuntimeError, KeyError, TypeError) as e:
+            self.turn_unauth = unauthorized(str(e))
             return ("server-exited" if not self.rpc.alive() else "failed"), one_line(e, 240)
         log(f"task {filename}: turn started ({turn_id})")
         started = time.monotonic()
@@ -723,11 +886,19 @@ class Seat:
                 self.answer_server_request(m)
             elif m:
                 method, params = m.get("method"), m.get("params") or {}
+                if method == "account/rateLimits/updated" and isinstance(params.get("rateLimits"), dict):
+                    self.rate_limits = params["rateLimits"]
+                elif method == "error" and params.get("turnId") in (None, turn_id) and usage_limit(params.get("error")):
+                    self.turn_limit = params["error"]
                 if params.get("threadId") in (None, self.thread_id):
                     turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
                     if method == "turn/completed" and turn.get("id") == turn_id:
                         status = turn.get("status") or "failed"
                         error = (turn.get("error") or {}).get("message") or ""
+                        if usage_limit(turn.get("error")):
+                            self.turn_limit = turn["error"]
+                        elif status != "completed" and unauthorized(turn.get("error")):
+                            self.turn_unauth = True
                         if status == "completed":
                             self.settle_model(True)
                             if self.restore is not None and sent_model == self.restore:
@@ -735,6 +906,8 @@ class Seat:
                         if interrupted and status == "interrupted":
                             return interrupted, error
                         return status, error
+                    if method == "error" and unauthorized(params.get("error")):
+                        self.turn_unauth = True
                     self.show(method, params)
             if interrupted:
                 if time.monotonic() - interrupt_at > self.interrupt_grace:
@@ -843,6 +1016,7 @@ class Seat:
         prompt = self.prompt_for(filename, copy)
         started = time.monotonic()
         status, detail = "server-exited", ""
+        self.fresh_auth()
         for attempt in (1, 2):
             self.ensure_server()
             if self.stop_requested(filename):
@@ -853,6 +1027,12 @@ class Seat:
                 status, detail = WITHDRAWN, "answered, no longer this seat's, or not the file that was admitted"
                 break
             status, detail = self.run_turn(filename, prompt)
+            if (self.turn_unauth and status != "completed" and attempt == 1
+                    and not has_ready_result(results, filename)):
+                log(f"task {filename}: turn refused as unauthorized; restarting the app-server on the login "
+                    "on disk and retrying once")
+                self.close_server()
+                continue
             if status != "server-exited" or has_ready_result(results, filename):
                 break
             self.close_server()
@@ -861,6 +1041,9 @@ class Seat:
         took = f"{time.monotonic() - started:.1f}s"
         if status == "completed":
             self.failures = 0
+            if self.turn_limit is None:
+                self.health("ok")
+        self.quota_step(status, filename, payload)
         if has_ready_result(results, filename):
             if not self.still_admitted(filename, payload, picked):
                 aside = self.set_result_aside(filename)
@@ -882,6 +1065,10 @@ class Seat:
             log(f"task {filename}: stopped by Stop after {took} ({detail or 'turn interrupted'}); no result, "
                 "the task stays pending and is not started again")
             return status
+        if self.turn_unauth and status != "completed":
+            status = UNAUTHORIZED
+            self.health("signed_out")
+            self.signed_out(filename)
         outcome = "no-result" if status == "completed" else status
         rec = self.write_record(filename, payload, outcome, detail)
         wait = self.retry_s if rec["attempts"] < self.max_attempts else self.hold_s
@@ -889,6 +1076,28 @@ class Seat:
         log(f"task {filename}: turn {what} {results}/{filename} after {took}; the task stays pending "
             f"(attempt {rec['attempts']}, next try in {wait:g}s)")
         return outcome
+
+    def quota_step(self, status: str, filename: str = "", payload: Optional[Path] = None) -> None:
+        """Out of usage: the owner gets the account card once per limit (core_quota_notice); a turn
+        that completed ends the limit. A notice that cannot be sent never stops the seat. The limit is
+        recorded in the core's account health first, card or no card."""
+        if self.turn_limit is not None:
+            self.health("quota", limit_reset(self.rate_limits))
+        if self.quota is None:
+            return
+        try:
+            if self.turn_limit is not None:
+                at = limit_reset(self.rate_limits)
+                reset = (core_quota_notice.reset_from_epoch(at) if at else
+                         core_quota_notice.reset_from_text(self.turn_limit.get("message")))
+                owner = payload is not None and core_quota_notice.is_owner_task(payload)
+                done = self.quota.hit(reset, at, tasks=[filename[:-4]] if owner and filename else ())
+            else:
+                done = self.quota.cleared() if status == "completed" else ""
+        except Exception as e:  # noqa: BLE001 - advisory
+            done = f"quota-failed ({type(e).__name__})"
+        if done:
+            log(f"quota: {done}")
 
     # ---- the loop ----
 
@@ -954,6 +1163,7 @@ class Seat:
                 if not self.idle_logged:
                     log("idle: waiting for tasks")
                     self.idle_logged = True
+                self.health_auth_check()
                 self.wake.wait(self.poll_s)
                 self.wake.clear()
         except SeatFatal as e:
@@ -1063,7 +1273,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 sandbox=a.sandbox, instructions=a.instructions, context=workstream_context,
                 poll_s=_number("SUTANDO_SEAT_POLL_S", 2.0), retry_s=_number("SUTANDO_SEAT_RETRY_S", 30.0),
                 hold_s=_number("SUTANDO_SEAT_HOLD_S", 900.0), backoff_s=_number("SUTANDO_SEAT_BACKOFF_S", 2.0),
-                turn_timeout=_number("SUTANDO_SEAT_TURN_TIMEOUT", 0.0))
+                turn_timeout=_number("SUTANDO_SEAT_TURN_TIMEOUT", 0.0),
+                quota=None if a.worker or not ACCOUNT_CARD.is_file() else core_quota_notice.QuotaNotice(
+                    workspace, "Codex", core_quota_notice.card_sender([sys.executable, str(ACCOUNT_CARD)], workspace, log),
+                    log))
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, seat.request_stop)
     watcher = Watcher(host.inbox, seat.wake) if a.watcher else None

@@ -490,6 +490,7 @@ ensure_core_monitor() {
   if [ -n "$PY" ] && ! pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET}( |$)" > /dev/null 2>&1; then
     "$PY" "$REPO/src/core-input-watch.py" \
       --socket "$TMUX_SOCKET" --session "$SESSION" --out "$mon_out" \
+      --quota-card-script "$REPO/skills/account-switch/scripts/account_card.py" \
       > /tmp/core-input-watch.log 2>&1 &
   fi
   # Communicator relay (PR #2101): the monitor only WRITES core-supervisor.json;
