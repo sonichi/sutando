@@ -1133,11 +1133,25 @@ def limit_reset(text, now=None):
     """(words, epoch or None): when the limit banner's own line says it resets; ('', None) when it does
     not. No other line of the pane is read: none of it may reach the DM."""
     now = time.time() if now is None else now
-    for line in reversed(str(text or "").splitlines()):
+    lines = str(text or "").splitlines()
+    for line in reversed(lines):
         if any(rx.search(line) for rx in _LIMIT_LINE):
             at = core_limit_hold.parse_reset(line, now)
-            return (core_quota_notice.reset_from_epoch(at, now) if at else core_quota_notice.reset_from_text(line)), at
+            words = core_quota_notice.reset_from_epoch(at, now) if at else core_quota_notice.reset_from_text(line)
+            if words:
+                return words, at
+            break
+    # The limit menu's own option names the time when the banner does not:
+    # "Wait here, then continue automatically at Nov 28 at 1pm".
+    for line in reversed(lines):
+        if _MENU_RESUME.search(line):
+            at = core_limit_hold.parse_reset(line, now)
+            if at:
+                return core_quota_notice.reset_from_epoch(at, now), at
     return "", None
+
+
+_MENU_RESUME = re.compile(r"\bcontinue automatically at\b", re.I)
 
 
 def quota_step(quota, limited, text, now=None):
@@ -1152,6 +1166,28 @@ def quota_step(quota, limited, text, now=None):
         done = f"quota-failed ({type(exc).__name__})"
     if done:
         print(f"quota: {done}", file=_sys.stderr, flush=True)
+    return done
+
+
+def is_signed_out(state, kind):
+    """A settled reading of the core signed out: its login refused, or Claude's login menu on screen."""
+    return state == "logged-out" or (state in ("blocked-human", "blocked-known") and kind == "login")
+
+
+def signed_out_step(quota, state, kind, runtime, now=None):
+    """While the core (Claude Code) stands signed out, the owner gets the account card the way a usage
+    limit sends it: once when it starts, then once for each owner message that arrives meanwhile
+    (core_quota_notice, why SIGNED_OUT). The episode ends where a limit's does: the pane idle or
+    working again (limit_reply_step). Returns what was done, or ''."""
+    if quota is None or runtime not in (None, "claude") or not is_signed_out(state, kind):
+        return ""
+    try:
+        done = quota.hit(tasks=core_quota_notice.owner_waiting(quota.workspace),
+                         why=core_quota_notice.SIGNED_OUT)
+    except Exception as exc:  # noqa: BLE001 - never let the card take down the monitor
+        done = f"signed-out-card-failed ({type(exc).__name__})"
+    if done:
+        print(f"signed out: {done}", file=_sys.stderr, flush=True)
     return done
 
 
@@ -1198,6 +1234,7 @@ def limit_reply_step(workspace, settled, seen, pane, runtime, now=None, repo=_RE
             return core_limit_hold.handle_owner_actions(workspace, now, relaunch=relaunch, seat=seat)
         seen_state, seen_kind, seen_prompt = seen
         if pane and pane.strip() and not (seen_state == "blocked-human" and is_usage_limit(seen_kind, seen_prompt)) \
+                and not is_signed_out(seen_state, seen_kind) \
                 and ((_is_idle_ready(pane, runtime) and refused_turn(pane) is None) or cli_wedge.frame_working(pane)):
             core_limit_hold.release_pane_hold(workspace, now, seat=seat)
             if not seat:
@@ -1362,6 +1399,8 @@ def main():
                              pane, runtime, seat=a.session if a.seat else None, label=a.seat or None,
                              retry_cmd=shlex.split(a.retry_cmd) if a.retry_cmd else None,
                              card_surface=a.chat_escalation, quota=quota)
+            if not a.seat:
+                signed_out_step(quota, state, kind, runtime)
 
         # The actor: only a settled, allowlisted gate is typed at, once per instance.
         key = answer_step(state, kind, prompt, answered_prompt, a.auto_answer)
@@ -1423,8 +1462,11 @@ def main():
                             socket=a.socket, seat=a.seat or None,
                             retry_cmd=shlex.split(a.retry_cmd) if a.retry_cmd else None)
             verdict, idle_ticks = card_step(bool(pane and pane.strip()), state, idle_ticks, a.stable, settling)
-            if verdict == "escalate" and not a.seat and card_replaces_notice(quota, kind, prompt):
-                pass  # the account card is this limit's one message (limit_reply_step)
+            if verdict == "escalate" and not a.seat and (
+                    card_replaces_notice(quota, kind, prompt)
+                    or (is_signed_out(state, kind) and quota is not None
+                        and quota.carded(core_quota_notice.SIGNED_OUT))):
+                pass  # the account card is this limit's (or sign-out's) one message
             elif verdict == "escalate":
                 drive_escalations(hitl, a.session, prompt, state,
                                   lambda k: send_keys(a.socket, a.session, k))

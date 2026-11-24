@@ -30,7 +30,8 @@ CARDED_KEEP = 100   # the owner messages already answered with the card, this ep
 SEND_TIMEOUT_S = 90.0
 # The runtime's own words for when the limit ends ("try again at 3:05 PM", "resets in 2 hours"); only
 # time-like characters of them are kept, so nothing else of the error reaches the DM.
-_RESET = re.compile(r"\b(?:resets?(?: after| at| in| on)?|try again (?:at|in|after)|retry (?:at|in|after))\s+"
+_RESET = re.compile(r"\b(?:resets?(?: after| at| in| on)?|try again (?:at|in|after)|retry (?:at|in|after)"
+                    r"|continue automatically at)\s+"
                     r"([\w :,./+-]{1,40})", re.IGNORECASE)
 _TIMEISH = re.compile(r"[^\w :,./+-]")
 
@@ -60,16 +61,23 @@ def reset_from_epoch(at, now: Optional[float] = None) -> str:
     return "%s %d, %s" % (time.strftime("%b", when), when.tm_mday, clock)
 
 
-def words(name: str, reset: str) -> str:
+SIGNED_OUT = "signed_out"   # `why` of a signed-out core: the same card, every owner message, its own words
+
+
+def words(name: str, reset: str, why: str = "quota") -> str:
+    if why == SIGNED_OUT:
+        return "%s is signed out, so I can't answer until it's signed in again. Sign in or pick an account below." % name
     return "%s has reached its usage limit%s, so I can't answer until then. Switch to another account to go on now." % (
         name, " (resets %s)" % reset if reset else " (it does not say when that resets)")
 
 
 def card_sender(argv: Sequence[str], workspace, log: Callable[..., None] = print,
                 run=subprocess.run) -> Callable[[str], bool]:
-    """send(text) -> posted: runs the injected account card command with `text` leading the card."""
-    def send(text: str) -> bool:
-        cmd = [*argv, "--workspace", str(workspace), "post", "--owner-dm", "--retry", "--lead", text]
+    """send(text) -> posted: runs the injected account card command with `text` leading the card.
+    `signed_out`: the core is signed out, so the card offers sign-in, not Retry."""
+    def send(text: str, signed_out: bool = False) -> bool:
+        cmd = [*argv, "--workspace", str(workspace), "post", "--owner-dm",
+               "--signed-out" if signed_out else "--retry", "--lead", text]
         try:
             r = run(cmd, capture_output=True, text=True, timeout=SEND_TIMEOUT_S, stdin=subprocess.DEVNULL)
             out = json.loads((r.stdout or "").strip().splitlines()[-1])
@@ -127,10 +135,11 @@ class QuotaNotice:
             self.log("quota record not kept:", type(e).__name__)
             return False
 
-    def carded(self) -> bool:
-        """Whether this limit's notice is the account card, posted."""
+    def carded(self, why: str = "quota") -> bool:
+        """Whether this limit's (or, with `why` SIGNED_OUT, this sign-out's) notice is the account card, posted."""
         rec = self.load()
-        return bool(rec.get("since") and rec.get("told") and rec.get("via") != "notice")
+        return bool(rec.get("since") and rec.get("told") and rec.get("via") != "notice"
+                    and (rec.get("why") or "quota") == why)
 
     def yield_to_notice(self) -> None:
         """The card could not be posted and the caller's own notice tells this limit instead: no
@@ -147,24 +156,32 @@ class QuotaNotice:
         self.health("ok")
         return "quota-cleared"
 
-    def hit(self, reset: str = "", reset_at=None, tasks: Sequence[str] = ()) -> str:
-        """The runtime said it is out of usage. 'quota-card' (posted to the owner's DM), 'quota-not-posted'
+    def _send(self, rec: dict) -> bool:
+        why = rec.get("why") or "quota"
+        text = words(self.name, str(rec.get("reset") or ""), why)
+        return bool(self.send(text, signed_out=True) if why == SIGNED_OUT else self.send(text))
+
+    def hit(self, reset: str = "", reset_at=None, tasks: Sequence[str] = (), why: str = "quota") -> str:
+        """The runtime said it is out of usage (`why` SIGNED_OUT: it is signed out, told the same way). 'quota-card' (posted to the owner's DM), 'quota-not-posted'
         (tried again later), or '' (told already this episode, or tried too recently). `tasks`: the
         owner's messages now waiting on the limit; each gets the card once ('quota-card-again')."""
         rec, at = self.load(), self.now()
         if rec.get("name") and rec.get("name") != self.name:
             rec = {}                     # another runtime's limit (the core switched): this one is new
+        if rec.get("since") and (rec.get("why") or "quota") != why:
+            rec = {}                     # signed out after a limit, or the other way: a new episode
         until = rec.get("reset_at")
         if rec.get("told") and until is not None and at >= float(until):
             rec = {}                     # the earlier limit reset and this is a new one
         if not rec.get("since"):
             rec = {"since": at}
         rec["name"] = self.name
+        rec["why"] = why
         if reset_at is not None:
             rec["reset_at"] = float(reset_at)
         if reset and not rec.get("reset"):
             rec["reset"] = reset[:60]
-        self.health("quota", rec.get("reset_at"))
+        self.health(SIGNED_OUT if why == SIGNED_OUT else "quota", rec.get("reset_at"))
         if rec.get("told"):
             return self.again(rec, [str(t) for t in tasks if t])
         if at - float(rec.get("tried") or 0) < RETRY_S:
@@ -175,7 +192,7 @@ class QuotaNotice:
         if not self.save(rec):
             return "quota-not-posted"
         try:
-            posted = bool(self.send(words(self.name, str(rec.get("reset") or ""))))
+            posted = self._send(rec)
         except Exception as e:  # noqa: BLE001 - a notice that cannot be sent never stops the core's adapter
             self.log("quota card not sent:", type(e).__name__)
             posted = False
@@ -195,7 +212,7 @@ class QuotaNotice:
         # Recorded before the send: a stop mid-send never posts it twice for the same message.
         self.save(dict(rec, carded=(carded + fresh)[-CARDED_KEEP:]))
         try:
-            posted = bool(self.send(words(self.name, str(rec.get("reset") or ""))))
+            posted = self._send(rec)
         except Exception as e:  # noqa: BLE001 - a notice that cannot be sent never stops the core's adapter
             self.log("quota card not sent:", type(e).__name__)
             posted = False

@@ -194,6 +194,64 @@ class ClaudeCoreMonitor(Base):
         self.assertTrue((REPO / "skills" / "account-switch" / "scripts" / "account_card.py").is_file())
 
 
+class LimitMenuReset(Base):
+    def test_the_menus_continue_at_time_is_the_reset_when_the_banner_has_none(self):
+        pane = ("You've hit your weekly limit\n  1. Wait here, then continue automatically at Nov 28 at 1pm\n"
+                "  2. Switch to usage credits\n")
+        words, at = M.limit_reset(pane, 1_000_000.0)
+        self.assertIsNotNone(at)
+        self.assertEqual(words, cqn.reset_from_epoch(at, 1_000_000.0))
+        self.assertIsNotNone(clh.parse_reset("Wait here, then continue automatically at Nov 28 at 1pm", 1_000_000.0))
+
+
+class SignedOut(Base):
+    """A signed-out Claude core: the account card (sign-in, no Retry), once, then once per owner message."""
+
+    def send(self, text, signed_out=False):
+        self.cards.append((text, signed_out))
+        return self.posted
+
+    def owner_task(self, name):
+        (self.ws / "tasks" / f"{name}.txt").write_text(f"id: {name}\ntask: hi\naccess_tier: owner\n")
+
+    def test_signed_out_cards_once_then_each_owner_message(self):
+        q = self.notice("Claude Code")
+        self.assertEqual(M.signed_out_step(q, "blocked-human", "login", "claude"), "quota-card")
+        self.assertEqual(M.signed_out_step(q, "blocked-human", "login", "claude"), "")
+        self.owner_task("task-hi")
+        self.assertEqual(M.signed_out_step(q, "logged-out", None, "claude"), "quota-card-again")
+        self.assertEqual(M.signed_out_step(q, "logged-out", None, "claude"), "")
+        self.assertEqual(len(self.cards), 2)
+        text, signed_out = self.cards[0]
+        self.assertTrue(signed_out)
+        self.assertTrue(text.startswith("Claude Code is signed out"))
+        self.assertTrue(q.carded(cqn.SIGNED_OUT))
+        self.assertFalse(q.carded())
+
+    def test_not_signed_out_or_not_claude_sends_none(self):
+        q = self.notice("Claude Code")
+        self.assertEqual(M.signed_out_step(q, "running", None, "claude"), "")
+        self.assertEqual(M.signed_out_step(q, "blocked-human", "usage-limit", "claude"), "")
+        self.assertEqual(M.signed_out_step(q, "logged-out", None, "codex"), "")
+        self.assertEqual(self.cards, [])
+
+    def test_a_limit_after_signing_out_is_a_new_card(self):
+        q = self.notice("Claude Code")
+        M.signed_out_step(q, "logged-out", None, "claude")
+        q.hit("3 PM")
+        self.assertEqual([c[1] for c in self.cards], [True, False])
+
+    def test_the_sender_asks_for_the_signed_out_card(self):
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            return mock.Mock(stdout='{"status": "posted"}\n', returncode=0)
+        cqn.card_sender(["py", "card.py"], self.ws, log=lambda *a: None, run=run)("t", signed_out=True)
+        self.assertIn("--signed-out", calls[0])
+        self.assertNotIn("--retry", calls[0])
+
+
 CARD_SCRIPT = str(REPO / "skills" / "account-switch" / "scripts" / "account_card.py")
 
 

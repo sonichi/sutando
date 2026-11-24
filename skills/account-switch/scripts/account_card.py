@@ -90,6 +90,7 @@ SETTINGS = ("Settings → Connections → the Sutando (on this computer) row →
             "A sign-in opens there; paste the code only into that box in the app, never in this chat.")
 NO_CODE = "Never send me a sign-in code or token here."
 SIGNED_OUT = "Codex isn't signed in anymore."
+CONTROLS = "account_controls"  # the desktop draws the core's account controls in a card carrying it
 RETRY_WORDS = "retry now"  # core_limit_hold's bare owner reply
 GONE = "That account is no longer on my list. Ask me for the account card again."
 BUSY = "An account switch is already under way. I'll confirm here when it has finished."
@@ -347,9 +348,12 @@ def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "",
     using = "" if signed_out else in_use_words(cur)
     words = " ".join(w for w in (lead, using, more.strip()) if w)
     words = words or "Pick an account below."
-    return ac.build(CARD_ID, "info", title="Core account", avatar_=ac.avatar(initial="A"),
-                    text=words, buttons=buttons, note=note, note_tone="dim",
-                    body=" ".join(w for w in (lead, using, 'Reply "switch account" for options.') if w))
+    body, card = ac.build(CARD_ID, "info", title="Core account", avatar_=ac.avatar(initial="A"),
+                          text=words, buttons=buttons, note=note, note_tone="dim",
+                          body=" ".join(w for w in (lead, using, 'Reply "switch account" for options.') if w))
+    # The marker by which the desktop app, on the computer that runs the core, draws the core's own
+    # account controls in the card (its saved accounts, Add account…), as Settings has them.
+    return body, dict(card, **{CONTROLS: {"runtime": cur["runtime"], "core": True}})
 
 
 def notice_card(state: str, status: str, words: str) -> tuple:

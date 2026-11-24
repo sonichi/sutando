@@ -108,7 +108,8 @@ _RATE = re.compile(r"\brate_limit_error\b|\brate[ -]?limit(?:ed)?\b|\btoo many r
                    r"|\b(?:API ?Error|HTTP(?:/[\d.]+)?|status(?:_?code)?)\"?\s*[:=]?\s*429\b", re.I)
 
 _RESET_EPOCH = re.compile(r"\|(\d{10})\b")
-_RESET_CLOCK = re.compile(r"\bresets?\s+(?:at\s+|on\s+)?(?:([A-Z][a-z]{2})[a-z]*\.?\s+(\d{1,2}),?\s+(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b(?:\s*\(([A-Za-z_]+(?:/[A-Za-z0-9_+-]+)*)\))?", re.I)
+# "resets 3pm" / "resets Nov 28 at 1pm", and the limit menu's "continue automatically at Nov 28 at 1pm".
+_RESET_CLOCK = re.compile(r"\b(?:resets?|continue automatically)\s+(?:at\s+|on\s+)?(?:([A-Z][a-z]{2})[a-z]*\.?\s+(\d{1,2}),?\s+(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b(?:\s*\(([A-Za-z_]+(?:/[A-Za-z0-9_+-]+)*)\))?", re.I)
 _MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
 _RESET_IN = re.compile(r"\bresets?\s+in\s+(\d+)\s*(h|hours?|m|mins?|minutes?)\b", re.I)
 _RETRY_AFTER = re.compile(r"\bretry[- ]after\D{0,3}(\d+)\b", re.I)

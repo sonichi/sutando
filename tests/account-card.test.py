@@ -244,6 +244,8 @@ class CodexCard(Base):
         self.assertTrue(card["text"].startswith(lead + " You're on a…@example.com"))
         self.assertNotIn("Settings", card["note"])
         self.assertNotIn("Retry", [b["label"] for b in card["buttons"]])
+        # The desktop draws the core's own account controls (saved accounts, Add account…) in it.
+        self.assertEqual(card["account_controls"], {"runtime": "codex", "core": True})
         acc_card = acc.menu_card({"runtime": "codex", "signed_in": True, "shown": "a…@example.com", "key": ""},
                                  [], lead, retry=True)[1]
         retry = [b for b in acc_card["buttons"] if b["label"] == "Retry"]
