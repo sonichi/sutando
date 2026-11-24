@@ -1264,6 +1264,20 @@ test('a turn that ends while its confirmation is pending is parked once the conf
   expect(h.files['/out/task-p.txt']).toContain('without a reply')
 })
 
+test("an error turn's StopFailure raised while its confirmation is pending names the cause once the confirmation lands", async ($, on) => {
+  const h = host(on, { lockFailsOnce: ['confirm'] })
+  h.files['/in/task-pe.txt'] = TASK('task-pe')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await prompted($, 'p-pe')
+  await $.turn.start({ text: h.submitted[0], turnId: 't-pe' })
+  await $.turn.complete({ turnId: 't-pe', reason: 'error', answer: '' } as any)
+  await $.classic.StopFailure(fails('p-pe'))
+  await h.clock.advance(3000)
+  expect(h.claims['task-pe'].phase).toBe('SETTLED')
+  expect(h.files['/out/task-pe.txt']).toContain('ended without a reply (turn error: Credit balance is too low)')
+})
+
 test('a transient stage failure tells the session to reply again; the second reply publishes once', async ($, on) => {
   const h = host(on, { lockFailsOnce: ['stage'] })
   h.files['/in/task-st.txt'] = TASK('task-st')

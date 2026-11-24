@@ -249,6 +249,11 @@ async function confirmOffer($: any, s: State, offer: Offer): Promise<boolean> {
   if (!r.ok && !r.hard && r.data?.retry) return false
   offer.confirming = undefined
   if (s.pending === offer) s.pending = null
+  // A StopFailure raised after the turn's end but before this landed was kept under the turn's id.
+  if (c.completed === 'error' && !c.completedError) {
+    c.completedError = s.apiErrors.get(c.turnId) ?? ''
+    s.apiErrors.delete(c.turnId)
+  }
   if (r.ok || (r.hard && r.data?.turn_id)) {
     offer.turnId = c.turnId
     offer.phase = 'TURN_CONFIRMED'
