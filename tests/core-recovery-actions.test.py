@@ -1762,7 +1762,7 @@ class DesktopRestart(Base):
         with mock.patch.object(RA, "REPO", clone):
             self._restart()
         command = self.spawned.command()
-        self.assertEqual(command[:3], [sys.executable, str(clone / "src" / "core_restart.py"), "start-cli"])
+        self.assertEqual(command[:3], [sys.executable, str(SRC / "core_restart.py"), "start-cli"])
         self.assertEqual(command[command.index("--start-cli") + 1],
                          str(clone / "src" / "agent" / "start-cli.sh"))
         self.assertEqual(self.audit()[-1]["via"], RA.VIA_FALLBACK)

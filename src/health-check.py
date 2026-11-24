@@ -14804,11 +14804,12 @@ def _default_core_restart(run=None) -> bool:
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         import core_restart
-        argv, via = core_restart.route(REPO_DIR, env, run, workspace=WORKSPACE_DIR, caller=RECOVER_CALLER)
+        argv, via = core_restart.route(REPO_DIR, env, run, workspace=WORKSPACE_DIR, caller=RECOVER_CALLER,
+                                       caller_deadline_s=RECOVER_RESTART_TIMEOUT_S)
         if argv is None:
             print(f"  recover-core: refused ({via}): restart the core from the desktop app", file=sys.stderr)
             return False
-        proc = run(argv, env=env, capture_output=True, text=True, timeout=120)
+        proc = run(argv, env=env, capture_output=True, text=True, timeout=RECOVER_RESTART_TIMEOUT_S)
         return proc.returncode == 0
     except Exception:
         return False
@@ -14816,6 +14817,8 @@ def _default_core_restart(run=None) -> bool:
 
 #: The caller name a ctl restart from the watchdog records (core_restart's intent/outcome lines).
 RECOVER_CALLER = "health-check --recover-core"
+#: How long the watchdog waits for one restart; the route's recorder ends its launcher before this.
+RECOVER_RESTART_TIMEOUT_S = 120
 
 
 def _recovery_metric(event: str, **properties) -> None:

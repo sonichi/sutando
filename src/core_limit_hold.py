@@ -997,7 +997,7 @@ def _relaunch(workspace: Path, launcher: Optional[str], model: Optional[str], sw
         return ok
     import core_restart
     restart, _via = core_restart.route(_REPO, env, run, workspace=workspace, caller=RELAUNCH_CALLER,
-                                       start_cli=launcher)
+                                       start_cli=launcher, caller_deadline_s=RELAUNCH_TIMEOUT_S)
     if restart is None:
         _tell_owner(workspace, "This core runs inside the desktop app, which has to restart it, so it is still "
                     "paused. Restart the core from the desktop app.")

@@ -173,7 +173,15 @@ invocation. Both the ctl and standalone launcher run inside a
 `core_restart.py` recorder, which appends two `state/recovery/audit.jsonl` lines:
 `event: core_restart` with `phase: intent` before the command and `phase: outcome` (`done` or
 `failed`, with its `rc`) after it. Each carries `caller`; a card's restart adds its `hitl_id` and
-`revision`, while every automatic restart carries `actor: host-supervisor`.
+`revision`, while every automatic restart carries `actor: host-supervisor`. The two lines of one
+attempt share an `attempt` id (`att_` and 12 hex digits), so overlapping attempts pair up. A line
+that cannot be written is reported on the recorder's stderr, and an outcome whose intent was not
+written carries `intent_recorded: false`. A caller that bounds its restart (the watchdog, the
+paused core's relaunch, a card's detached restart) passes that bound to the route; the standalone
+recorder then ends its launcher 20 seconds earlier, and also when it is itself told to stop
+(SIGTERM, SIGHUP, SIGINT). In both cases the launcher is killed and reaped before the outcome is
+written: `failed` with `reason: deadline` or `reason: cancelled` and no `rc`. A foreground
+`core_restart.py restart` passes no bound, because its launcher may stay attached to a terminal.
 When the ctl exits 12 (another launcher run held the app's launch lock; nothing was killed or
 started), the receipt is `failed`, the card says the core is already being restarted and to try
 again shortly, any hold it lifted returns, and nothing is retried automatically.

@@ -17,8 +17,10 @@ gateway's session. Anywhere else the restart is `src/agent/start-cli.sh --restar
                                     [--hitl-id ID --revision N] [--runtime R] [--start]
         run the ctl's restart-core between its intent and outcome lines; exits with the ctl's code
     python3 src/core_restart.py start-cli --start-cli PATH --workspace W --caller NAME
-                                    [--hitl-id ID --revision N] [--runtime R] [-- ARGS...]
-        run start-cli --restart between the same two lines; exits with the launcher's code
+                                    [--hitl-id ID --revision N] [--runtime R] [--deadline-s S] [-- ARGS...]
+        run start-cli --restart between the same two lines; exits with the launcher's code. With
+        --deadline-s, or when this process is told to stop, the launcher is ended and reaped first
+        and the outcome line says `deadline` or `cancelled`
 
 A runtime switch through the ctl takes the app's launch lock itself (the ctl then skips it), makes
 the runtime the desktop's selection (the app's launcher reads it), runs the ctl, and when the ctl
@@ -32,9 +34,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -70,6 +74,22 @@ LOCK_LOCKED, LOCK_BUSY, LOCK_UNAVAILABLE = "locked", "busy", "unavailable"
 AUDIT_EVENT = "core_restart"
 AUTOMATIC_ACTOR = "host-supervisor"
 INTENT, OUTCOME = "intent", "outcome"
+#: This module's own file: the recorder runs from here, whichever checkout's launcher it records.
+RECORDER = str(Path(__file__).resolve())
+#: A caller that bounds its restart hands the recorder that bound less this margin, so the recorder
+#: ends the launcher and writes the outcome before the caller stops waiting for it.
+DEADLINE_MARGIN_S = 20
+REASON_DEADLINE, REASON_CANCELLED = "deadline", "cancelled"
+CANCEL_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+
+
+class Cancelled(Exception):
+    """This recorder was told to stop while its launcher ran."""
+
+
+def new_attempt() -> str:
+    """One id shared by an attempt's intent and outcome lines, so overlapping attempts pair up."""
+    return "att_" + uuid.uuid4().hex[:12]
 
 Runner = Callable[..., subprocess.CompletedProcess]
 
@@ -85,8 +105,9 @@ def start_cli_argv(repo: Path, runtime: Optional[str] = None, extra: Sequence[st
 def recorded_start_cli_argv(repo: Path, workspace: Path, caller: str, *, via: str,
                             runtime: Optional[str] = None, hitl_id: str = "",
                             revision: Optional[int] = None, extra: Sequence[str] = (),
-                            start_cli: Optional[str] = None, start: bool = False) -> List[str]:
-    argv = [sys.executable, str(Path(repo) / "src" / "core_restart.py"), "start-cli",
+                            start_cli: Optional[str] = None, start: bool = False,
+                            deadline_s: Optional[float] = None) -> List[str]:
+    argv = [sys.executable, RECORDER, "start-cli",
             "--workspace", str(workspace), "--caller", caller, "--via", via,
             "--start-cli", start_cli or str(Path(repo) / "src" / "agent" / "start-cli.sh")]
     if hitl_id:
@@ -95,6 +116,8 @@ def recorded_start_cli_argv(repo: Path, workspace: Path, caller: str, *, via: st
         argv += ["--runtime", runtime]
     if start:
         argv += ["--start"]
+    if deadline_s is not None:
+        argv += ["--deadline-s", str(max(1, int(deadline_s)))]
     if extra:
         argv += ["--", *extra]
     return argv
@@ -103,22 +126,25 @@ def recorded_start_cli_argv(repo: Path, workspace: Path, caller: str, *, via: st
 def route(repo: Path, env: Dict, runner: Runner, *, workspace: Path, caller: str,
           runtime: Optional[str] = None, hitl_id: str = "", revision: Optional[int] = None,
           extra: Sequence[str] = (), start_cli: Optional[str] = None,
-          start: bool = False) -> Tuple[Optional[List[str]], str]:
+          start: bool = False, caller_deadline_s: Optional[float] = None) -> Tuple[Optional[List[str]], str]:
     """(argv, via) for one core restart; argv None when nothing may run. `env` is the restart's
     environment and is updated for the ctl. Only the ctl's capability probe runs here. `start`
-    starts a core that is down: start-cli with no flag, or `ctl --start` (start-if-down) in the bundle."""
+    starts a core that is down: start-cli with no flag, or `ctl --start` (start-if-down) in the bundle.
+    `caller_deadline_s` is how long the caller itself waits: the standalone recorder ends its
+    launcher DEADLINE_MARGIN_S before that. Without it the launcher is not bounded here."""
+    deadline_s = None if caller_deadline_s is None else caller_deadline_s - DEADLINE_MARGIN_S
     app_support = sutando_config.desktop_app_support(repo)
     if app_support is None:
         via = VIA_START_CLI
         return recorded_start_cli_argv(repo, workspace, caller, via=via, runtime=runtime,
                                        hitl_id=hitl_id, revision=revision, extra=extra,
-                                       start_cli=start_cli, start=start), via
+                                       start_cli=start_cli, start=start, deadline_s=deadline_s), via
     resolved = Path(repo).resolve()
     if resolved.parent.name != "engine" or resolved.parent.parent != Path(app_support).resolve():
         via = VIA_FALLBACK
         return recorded_start_cli_argv(repo, workspace, caller, via=via, runtime=runtime,
                                        hitl_id=hitl_id, revision=revision, extra=extra,
-                                       start_cli=start_cli, start=start), via
+                                       start_cli=start_cli, start=start, deadline_s=deadline_s), via
     ctl = Path(repo).parent / DESKTOP_CTL
     if not ctl.is_file():
         return None, VIA_NO_CTL
@@ -146,14 +172,31 @@ def ctl_has_launch_lock(ctl: Path, env: Dict, runner: Runner) -> bool:
     return run.returncode == 0 and LAUNCH_LOCK_CAPABILITY in (run.stdout or "").split()
 
 
-def _audit(workspace: Path, entry: Dict) -> None:
+def _audit(workspace: Path, entry: Dict, err=None) -> bool:
+    """Append one audit line; a line that could not be written is said on stderr, never dropped silently."""
     from hitl import recovery
-    recovery.audit(Path(workspace), entry)
+    written = recovery.audit(Path(workspace), entry)
+    if not written:
+        print(f"core_restart: audit {entry.get('phase')} line not written (attempt {entry.get('attempt')})",
+              file=err or sys.stderr)
+    return written
+
+
+def _audit_outcome(workspace: Path, base: Dict, intent_written: bool, at: int, outcome: str,
+                   rc: Optional[int], reason: str = "") -> None:
+    line = dict(base, phase=OUTCOME, at=at, outcome=outcome)
+    if rc is not None:
+        line["rc"] = rc
+    if reason:
+        line["reason"] = reason
+    if not intent_written:
+        line["intent_recorded"] = False  # this outcome has no intent line to pair with
+    _audit(workspace, line)
 
 
 def _audit_base(via: str, caller: str, hitl_id: str = "",
                 revision: Optional[int] = None, runtime: Optional[str] = None) -> Dict:
-    base = {"event": AUDIT_EVENT, "via": via, "caller": caller}
+    base = {"event": AUDIT_EVENT, "via": via, "caller": caller, "attempt": new_attempt()}
     if hitl_id:
         base.update(hitl_id=hitl_id, revision=int(revision or 0))
     else:
@@ -208,17 +251,12 @@ def run_ctl(ctl: Path, workspace: Path, caller: str, *, hitl_id: str = "", revis
     base = _audit_base(VIA_CTL, caller, hitl_id, revision, runtime)
     if start:
         base["start"] = True
-    _audit(workspace, dict(base, phase=INTENT, at=int(now())))
+    intent_written = _audit(workspace, dict(base, phase=INTENT, at=int(now())))
     env = dict(os.environ if env is None else env)
     env.pop(LOCK_MARKER, None)
 
     def end(outcome: str, rc: Optional[int], reason: str = "") -> int:
-        line = dict(base, phase=OUTCOME, at=int(now()), outcome=outcome)
-        if rc is not None:
-            line["rc"] = rc
-        if reason:
-            line["reason"] = reason
-        _audit(workspace, line)
+        _audit_outcome(workspace, base, intent_written, int(now()), outcome, rc, reason)
         return 1 if rc is None else rc
 
     held = None
@@ -272,20 +310,36 @@ def run_start_cli(workspace: Path, caller: str, *, via: str = VIA_START_CLI,
                   hitl_id: str = "", revision: Optional[int] = None,
                   runtime: Optional[str] = None, extra: Sequence[str] = (),
                   start_cli: str, runner: Runner = subprocess.run,
-                  now: Callable[[], float] = time.time, start: bool = False) -> int:
-    """Run the standalone launcher between the shared restart intent and outcome lines."""
+                  now: Callable[[], float] = time.time, start: bool = False,
+                  deadline_s: Optional[float] = None) -> int:
+    """Run the standalone launcher between the shared restart intent and outcome lines. Past
+    `deadline_s`, or when this process is cancelled, the launcher is killed and reaped before the
+    outcome (`failed`, reason `deadline` or `cancelled`) is written: no attempt ends without one."""
     base = _audit_base(via, caller, hitl_id, revision, runtime)
-    _audit(workspace, dict(base, phase=INTENT, at=int(now())))
+    if start:
+        base["start"] = True
+    intent_written = _audit(workspace, dict(base, phase=INTENT, at=int(now())))
+    rc, reason = None, ""
     try:
+        # subprocess.run kills and reaps its child when the timeout or any other exception ends the wait.
         rc = runner(start_cli_argv(REPO, runtime, extra, start_cli, start),
-                    stdin=subprocess.DEVNULL).returncode
+                    stdin=subprocess.DEVNULL, timeout=deadline_s).returncode
+    except subprocess.TimeoutExpired:
+        reason = REASON_DEADLINE
+    except Cancelled:
+        reason = REASON_CANCELLED
     except (OSError, subprocess.SubprocessError):
-        rc = None
-    outcome = dict(base, phase=OUTCOME, at=int(now()), outcome="done" if rc == 0 else "failed")
-    if rc is not None:
-        outcome["rc"] = rc
-    _audit(workspace, outcome)
+        pass
+    _audit_outcome(workspace, base, intent_written, int(now()), "done" if rc == 0 else "failed", rc, reason)
     return 1 if rc is None else rc
+
+
+def _cancel_on_signal(signals: Sequence[int] = CANCEL_SIGNALS, install: Callable = signal.signal) -> None:
+    """A stop signal becomes Cancelled in the main thread, so the wait on the launcher unwinds."""
+    def cancel(signum, _frame):
+        raise Cancelled(signum)
+    for sig in signals:
+        install(sig, cancel)
 
 
 def restart(workspace: Path, caller: str, *, runtime: Optional[str] = None, extra: Sequence[str] = (),
@@ -336,6 +390,7 @@ def main(argv=None) -> int:
     s.add_argument("--revision", type=int, default=None)
     s.add_argument("--runtime", default=None)
     s.add_argument("--start", action="store_true", help="start a core that is down (start-cli without --restart)")
+    s.add_argument("--deadline-s", type=float, default=None, help="end the launcher after this long")
     s.add_argument("extra", nargs=argparse.REMAINDER)
     a = p.parse_args(argv)
     if a.cmd == "ctl":
@@ -343,9 +398,10 @@ def main(argv=None) -> int:
                        revision=a.revision, runtime=a.runtime, start=a.start)
     if a.cmd == "start-cli":
         extra = a.extra[1:] if a.extra[:1] == ["--"] else a.extra
+        _cancel_on_signal()
         return run_start_cli(Path(a.workspace), a.caller, via=a.via, hitl_id=a.hitl_id,
                              revision=a.revision, runtime=a.runtime, extra=extra,
-                             start_cli=a.start_cli, start=a.start)
+                             start_cli=a.start_cli, start=a.start, deadline_s=a.deadline_s)
     extra = a.extra[1:] if a.extra[:1] == ["--"] else a.extra
     return restart(Path(a.workspace), a.caller, runtime=a.runtime, extra=extra, start_cli=a.start_cli,
                    repo=Path(a.repo), start=a.start)
