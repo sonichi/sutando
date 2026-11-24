@@ -216,7 +216,7 @@ class ConnectorTest(unittest.TestCase):
         (told,) = self.post_queued("$card3")
         done = told["extra_content"]["space.ag2.card"]
         self.assertEqual((told["room_id"], done["state"], done["text"]),
-                         (self.DM, "done", "Switched. I'm now using Claude Opus 4.6."))
+                         (self.DM, "done", "Switched to Claude Opus 4.6 ✓"))
         self.w.task("task-4b", "STUB:TEXT once more")
         self.w.serve()
         self.assertEqual(self.post_queued(), [], "told once")
@@ -280,7 +280,7 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         self.assertEqual([c["modelId"] for c in self.set_model_calls()], ["claude-opus-4-6-thinking"])
         (told,) = self.post_queued("$card3")
-        self.assertEqual(told["extra_content"]["space.ag2.card"]["text"], "Switched. I'm now using Claude Opus 4.6.")
+        self.assertEqual(told["extra_content"]["space.ag2.card"]["text"], "Switched to Claude Opus 4.6 ✓")
 
     def test_picking_the_model_already_in_use_says_so_at_once_and_nothing_is_switched_or_confirmed(self):
         (self.w.home / "models").write_text("")
@@ -295,7 +295,7 @@ class ConnectorTest(unittest.TestCase):
         (same,) = self.post_queued("$card2")
         card = same["extra_content"]["space.ag2.card"]
         self.assertEqual((card["state"], card["text"], "buttons" in card, self.w.metrics()[-1]["card"]),
-                         ("done", "I'm already using Gemini 3.8 Flash. Nothing changed.", False, "model-same"))
+                         ("done", "Already using Gemini 3.8 Flash — nothing to change.", False, "model-same"))
         self.assertFalse(json.loads((self.w.root / "state" / "model.json").read_text()).get("wanted"))
         self.w.task("task-4", "STUB:TEXT again")
         self.w.serve()
@@ -375,7 +375,7 @@ class ConnectorTest(unittest.TestCase):
         self.w.task("task-5", "STUB:TEXT once more")
         self.w.serve()
         (told,) = self.post_queued("$card3")
-        self.assertEqual(told["extra_content"]["space.ag2.card"]["text"], "Switched. I'm now using Claude Opus 4.6.")
+        self.assertEqual(told["extra_content"]["space.ag2.card"]["text"], "Switched to Claude Opus 4.6 ✓")
         kept = json.loads(state.read_text())
         self.assertEqual((kept["told"], kept["current"], kept["untold"]),
                          ("claude-opus-4-6-thinking", "claude-opus-4-6-thinking", []))
@@ -427,9 +427,9 @@ class ConnectorTest(unittest.TestCase):
         self.w.task("task-5", "STUB:TEXT again")
         self.w.serve()
         (told,) = self.post_queued("$c3")
-        self.assertEqual(told["extra_content"]["space.ag2.card"]["text"], "Switched. I'm now using Claude Opus 4.6.")
+        self.assertEqual(told["extra_content"]["space.ag2.card"]["text"], "Switched to Claude Opus 4.6 ✓")
         used, outcome = tap_opus(3, "$c4")
-        self.assertEqual((used["text"], outcome), ("I'm already using Claude Opus 4.6. Nothing changed.", "model-same"))
+        self.assertEqual((used["text"], outcome), ("Already using Claude Opus 4.6 — nothing to change.", "model-same"))
 
     def test_a_tap_that_is_not_the_owners_on_a_card_this_agent_posted_in_its_dm_changes_nothing(self):
         (self.w.home / "models").write_text("")
@@ -624,7 +624,7 @@ class ConnectorTest(unittest.TestCase):
         first, second = [p["extra_content"]["space.ag2.card"] for p in self.post_queued()]
         self.assertEqual((first["state"], second["state"]), ("done", "error"), "told oldest first")
         self.assertIn("Claude Opus 4.6", first["text"])
-        self.assertIn("could not switch to no-such-model", second["text"])
+        self.assertIn("Couldn't switch to no-such-model", second["text"])
         self.assertEqual(json.loads(state.read_text())["untold"], [])
         # A notice that can never be drawn is dropped; the list is bounded.
         state.write_text(json.dumps(dict(json.loads(state.read_text()),
@@ -636,7 +636,7 @@ class ConnectorTest(unittest.TestCase):
             self.dm_task("task-5b", "STUB:TEXT fifth")
             self.w.serve()
         self.assertEqual(json.loads(state.read_text())["untold"], [])
-        self.assertEqual(self.w.result("task-5b").count("I could not switch to a."), 3, "said in words, in the DM")
+        self.assertEqual(self.w.result("task-5b").count("Couldn't switch to a:"), 3, "said in words, in the DM")
         with mock.patch.object(connector_cards, "queue", side_effect=OSError("disk full")):
             state.write_text(json.dumps(dict(json.loads(state.read_text()),
                                              untold=[{"picked": "a", "ran": "b", "room": self.DM}] * 9)))
@@ -659,7 +659,8 @@ class ConnectorTest(unittest.TestCase):
         (told,) = self.post_queued()
         failed = told["extra_content"]["space.ag2.card"]
         self.assertEqual((told["room_id"], failed["state"], failed["text"]), (self.DM, "error",
-                         "I could not switch to Claude Opus 4.6. I'm still using Gemini 3.8 Flash. Send /model to try again."))
+                         "Couldn't switch to Claude Opus 4.6: my next turn did not run on it. I'm still using Gemini 3.8 Flash. "
+                         "Send /model to try again."))
         self.w.task("task-2", "STUB:TEXT again")
         self.w.serve()
         self.assertEqual((len(self.set_model_calls()), self.post_queued()), (1, []), "not retried, not repeated")

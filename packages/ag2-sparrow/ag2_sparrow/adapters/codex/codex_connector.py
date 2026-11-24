@@ -347,8 +347,7 @@ class Connector:
         if acct.get("type") != "chatgpt":
             return {"apiKey": "an API key", "amazonBedrock": "Amazon Bedrock",
                     "gcp": "Google Cloud"}.get(acct.get("type"), "an account I can't name")
-        who, plan = account_switch.masked(acct.get("email") or "") or "a ChatGPT account", acct.get("planType")
-        return "%s (%s)" % (who, plan) if isinstance(plan, str) and plan else who
+        return account_switch.masked(acct.get("email") or "") or "a ChatGPT account"  # the email, never a plan
 
     def begin_login(self) -> dict:
         """Start a ChatGPT sign-in on the server: its id, and the page the owner finishes it on."""

@@ -813,7 +813,7 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         self.assertIn("model=gpt-6-sol", self.serve("task-3", "hello", channel="!room:s.space", kind="room"))
         self.assertEqual((metrics(self.work)[-1]["model"], metrics(self.work)[-1]["model_switch"]), ("gpt-6-sol", "switched"))
         ((room, done),) = self.posted("$card3")
-        self.assertEqual((room, done["state"], done["text"]), (self.DM, "done", "Switched. I'm now using Stub Large."))
+        self.assertEqual((room, done["state"], done["text"]), (self.DM, "done", "Switched to Stub Large ✓"))
         self.assertIn("model=gpt-6-sol", self.serve("task-4", "again"), "the pick stays")
         self.assertEqual(self.posted(), [], "told once")
         self.assertNotIn("model_switch", metrics(self.work)[-1])
@@ -821,7 +821,7 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(self.pick("Stub Large", "$card4"), "[no-send] the model card answers\n")
         ((_, same),) = self.posted("$card5")
         self.assertEqual((same["text"], metrics(self.work)[-1]["card"]),
-                         ("I'm already using Stub Large. Nothing changed.", "model-same"))
+                         ("Already using Stub Large — nothing to change.", "model-same"))
 
     def test_a_model_past_the_buttons_is_picked_by_name_and_an_unknown_name_is_refused(self):
         self.assertEqual(self.serve("task-1", "/model stub 7"), "[no-send] the model card answers\n")
@@ -838,7 +838,7 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(metrics(self.work)[-1]["model_switch"], "not-switched")
         ((room, card),) = self.posted("$card3")
         self.assertEqual((room, card["state"], card["text"]),
-                         (self.DM, "error", "I could not switch to Stub Broken. I'm still using Stub Model. Send /model "
+                         (self.DM, "error", "Couldn't switch to Stub Broken: my next turn did not run on it. I'm still using Stub Model. Send /model "
                                             "to try again."))
         self.assertEqual(self.state()["wanted"], "")
         self.assertNotIn("model=", self.serve("task-4", "again"), "no pick of the owner's took: Codex's own model")
@@ -848,7 +848,7 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         self.posted("$card2")
         self.assertIn("model=gpt-6-luna", self.serve("task-3", "hello"))
         ((_, card),) = self.posted("$card3")
-        self.assertEqual(card["text"], "I could not switch to Stub Moved. I'm still using Stub Model. Send /model to try again.")
+        self.assertEqual(card["text"], "Couldn't switch to Stub Moved: my next turn did not run on it. I'm still using Stub Model. Send /model to try again.")
         self.assertEqual((self.state()["wanted"], metrics(self.work)[-1]["model_switch"]), ("", "not-switched"))
 
     def test_asking_in_ones_own_words_shows_the_card_and_only_the_owners_ask_in_their_dm_does(self):
@@ -943,7 +943,7 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         self.assertIn("Saved, not switched yet: I'll use Stub Broken from your next message", still["text"])
         self.serve("task-turn", "hello")
         ((_, failed),) = self.posted("$card5")
-        self.assertEqual(failed["text"], "I could not switch to Stub Broken. I'm still using Stub Model. Send /model "
+        self.assertEqual(failed["text"], "Couldn't switch to Stub Broken: my next turn did not run on it. I'm still using Stub Model. Send /model "
                                          "to try again.")
         # A switch that took is the model in use from then on, and stays so when a later pick fails.
         self.pick("Stub Large", "$card6")
@@ -967,7 +967,7 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         self.assertNotIn("model=", self.serve("task-3", "hello"), "the refused switch is not asked for again")
         ((_, card),) = self.posted("$card3")
         self.assertEqual((card["state"], metrics(self.work)[-1]["model_switch"]), ("error", "not-switched"))
-        self.assertIn("I could not switch to Stub Broken. I'm still using Stub Model.", card["text"])
+        self.assertIn("Couldn't switch to Stub Broken: my next turn did not run on it. I'm still using Stub Model.", card["text"])
         self.serve("task-4", "again")
         self.assertEqual((self.posted(), self.state().get("untold")), ([], []), "told once")
 
@@ -1007,7 +1007,7 @@ class ModelCardTest(CardWorld, unittest.TestCase):
                          (["gpt-6-sol"], "gpt-6-sol"), "settled, and kept owed")
         self.assertIn("task-0", (self.work / "state" / "done").read_text(), "answered, so the turn is not run again")
         text = self.serve("task-1", "hello")
-        self.assertIn("Switched. I'm now using Stub", text, "the outcome, in words, in the DM")
+        self.assertIn("Switched to Stub", text, "the outcome, in words, in the DM")
         self.assertEqual((self.posted(), metrics(self.work)[-1]["model_switch"], self.state()["untold"]),
                          ([], "switched", []))
         self.assertNotIn("Switched", self.serve("task-2", "again"), "said once")
@@ -1023,7 +1023,7 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         c.models.save(untold={"picked": "gpt-5.6-terra", "ran": "", "room": self.DM})
         with mock.patch.object(model_switch.ModelSwitch, "card", side_effect=ValueError("bad name")):
             self.assertEqual(c.models.tell(True, "", self.DM), "not-switched")
-        self.assertIn("I could not switch to Stub 5", c.models.unsaid())
+        self.assertIn("Couldn't switch to Stub 5", c.models.unsaid())
         self.assertEqual((c.models.state().get("untold"), c.models.unsaid()), ([], ""))
 
     def test_a_turn_that_settles_a_pick_and_asks_for_the_menu_says_the_outcome_once_and_shows_the_settled_model(self):
@@ -1032,7 +1032,7 @@ class ModelCardTest(CardWorld, unittest.TestCase):
             "available": [{"id": "gpt-5.6-sol", "name": "Stub Model"}, {"id": "gpt-6-sol", "name": "Stub\nLarge"}],
             "current": "gpt-5.6-sol", "wanted": "gpt-6-sol", "asked_in": self.DM, "told": ""}))
         text = self.serve("task-1", "[[askmodel]] which models do you have")
-        self.assertEqual(text.count("Switched. I'm now using Stub"), 1, "the outcome, in words, not swallowed by the menu")
+        self.assertEqual(text.count("Switched to Stub"), 1, "the outcome, in words, not swallowed by the menu")
         self.assertNotIn("[no-send]", text)
         ((_, menu),) = self.posted()
         self.assertEqual((menu["state"], menu["text"].startswith("I'm using Stub Large. Pick a model to switch to.")), ("pending", True))
@@ -1086,7 +1086,7 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         self.assertIn("model=gpt-6-sol", self.serve("task-o", "the owner again"))
         ((_, told),) = self.posted("$card3")
         self.assertEqual((told["text"], metrics(self.work)[-1]["model_switch"]),
-                         ("Switched. I'm now using Stub Large.", "switched"))
+                         ("Switched to Stub Large ✓", "switched"))
         # After the switch a collaborator's turn still runs on Codex's own model, never the owner's pick.
         (self.work / "tasks" / "task-c2.txt").write_text(gateway_mid_task("task-c2", "again", "team", True))
         self.assertEqual(run_connector(self.work, once=1), 0)
@@ -1134,7 +1134,7 @@ class AccountCardTest(CardWorld, unittest.TestCase):
     def test_the_card_names_the_account_and_a_tap_signs_in_and_says_which_account_is_used_now(self):
         (self.home / "stub-login").write_text("success bob@example.org")
         card = self.tap()
-        self.assertEqual(card["text"], "I'm signed in as a…@example.com (pro).")
+        self.assertEqual(card["text"], "I'm using alice@example.com.")
         self.assertEqual(result(self.work, "task-tap"), "[no-send] the account card answers\n")
         self.assertEqual(self.opened, ["https://stub.invalid/sign-in?id=login-1"], "the page is shown on this computer")
         (_, started), (room, done) = self.posted("$card2")
@@ -1143,9 +1143,9 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.assertEqual((started["state"], [(b["kind"], b["url"]) for b in started["buttons"]]),
                          ("info", [("url", "https://stub.invalid/sign-in?id=login-1")]))
         self.assertEqual(started["text"], "I opened the sign-in page in the browser on the computer I run on. Finish "
-                                          "signing in there; I'll confirm here. Until then: I'm signed in as "
-                                          "a…@example.com (pro).")
-        self.assertEqual((room, done["state"], done["text"]), (self.DM, "done", "Signed in. I'm signed in as b…@example.org (pro)."))
+                                          "signing in there; I'll confirm here. Until then: I'm using "
+                                          "alice@example.com.")
+        self.assertEqual((room, done["state"], done["text"]), (self.DM, "done", "Signed in. I'm using bob@example.org."))
         self.assertEqual(json.loads((self.work / "state" / "account.json").read_text()), {})
         self.assertTrue(result(self.work, "task-next").startswith("STUB echo:"), "the turn it arrived in is answered as usual")
         self.assertEqual([m.get("card") for m in metrics(self.work)], ["account-card", "account-started", None])
@@ -1155,12 +1155,12 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.tap(extra_task=False)       # nothing else to do: the report arrives while the connector idles
         (_, _started), (_, failed) = self.posted("$card2")
         self.assertEqual((failed["state"], failed["text"]),
-                         ("error", "The sign-in did not finish (access_denied). I'm signed in as a…@example.com (pro)."))
+                         ("error", "The sign-in did not finish (access_denied). I'm using alice@example.com."))
         (self.home / "stub-login").write_text("refuse")
         self.again("$card3")
         ((_, refused),) = self.posted("$card4")
         self.assertEqual((refused["state"], refused["text"], metrics(self.work)[-1]["card"]),
-                         ("error", "I could not start a sign-in. I'm signed in as a…@example.com (pro).", "account-not-started"))
+                         ("error", "I could not start a sign-in. I'm using alice@example.com.", "account-not-started"))
 
     def test_a_sign_in_nobody_finishes_is_given_up_after_ten_minutes_and_a_new_tap_gives_up_the_old_one(self):
         with mock.patch.object(cc, "open_page", return_value=False):
@@ -1176,8 +1176,8 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.assertTrue(self.serve("task-later", "hello").startswith("STUB echo:"))
         ((room, gone),) = self.posted("$card5")
         self.assertEqual((room, gone["state"]), (self.DM, "error"))
-        self.assertEqual(gone["text"], "The sign-in was not finished in 10 minutes, so I stopped waiting. I'm signed in "
-                                       "as a…@example.com (pro). Send /account to try again.")
+        self.assertEqual(gone["text"], "The sign-in was not finished in 10 minutes, so I stopped waiting. I'm using "
+                                       "alice@example.com. Send /account to try again.")
         self.assertEqual(len((self.home / "stub-cancelled").read_text().split()), 2)
         self.assertEqual(json.loads((self.work / "state" / "account.json").read_text()), {})
 
@@ -1225,7 +1225,7 @@ class AccountCardTest(CardWorld, unittest.TestCase):
             "available": [{"id": "gpt-5.6-sol", "name": "Stub Model"}, {"id": "gpt-6-sol", "name": "Stub\nLarge"}],
             "current": "gpt-5.6-sol", "wanted": "gpt-6-sol", "asked_in": self.DM, "told": ""}))
         text = self.serve("task-1", "[[askaccount]] switch account")
-        self.assertEqual(text.count("Switched. I'm now using Stub"), 1, "the outcome, in words, with the account card")
+        self.assertEqual(text.count("Switched to Stub"), 1, "the outcome, in words, with the account card")
         self.assertNotIn("[no-send]", text)
         ((_, card),) = self.posted()
         self.assertEqual(card["buttons"][0]["label"][:6], "Switch")
@@ -1343,7 +1343,7 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         c.accounts.keep({})
         self.assertTrue(self.serve("task-later", "hello again").startswith("STUB echo:"))
         ((room, done),) = self.posted("$card3")
-        self.assertEqual((room, done["state"], done["text"]), (self.DM, "done", "Signed in. I'm signed in as b…@example.org (pro)."))
+        self.assertEqual((room, done["state"], done["text"]), (self.DM, "done", "Signed in. I'm using bob@example.org."))
         self.assertEqual(json.loads((self.work / "state" / "account.json").read_text()), {})
 
     def test_a_card_that_cannot_be_drawn_is_answered_in_words_and_the_task_is_done(self):
@@ -1357,7 +1357,7 @@ class AccountCardTest(CardWorld, unittest.TestCase):
 
     def test_the_account_is_named_without_its_address_and_what_cannot_be_read_is_not_called_signed_out(self):
         self.assertEqual([account_switch.masked(e) for e in ("alice@example.com", "", "no-at-sign", "@x.org")],
-                         ["a…@example.com", "", "", ""])
+                         ["alice@example.com", "", "", ""])
         args = cc.build_parser().parse_args(["--work", str(self.work)])
         args.state, args.bridge_state = str(self.work / "state"), str(self.bridge)
         (self.work / "state").mkdir(parents=True)

@@ -211,6 +211,25 @@ def configured_tmux(cfg: dict, environ=None, job: "cm.Shape | None" = None) -> "
     return (found[0], "") if found else ("", "the config records no TMUX and no tmux was found; run %s" % install)
 
 
+
+# Claude Code's usage-limit screen (its banner, or the menu only a plan's limit opens) and when it lifts.
+_LIMIT_SCREEN = re.compile(r"\b(?:hit|reached) your (?:[\w.-]+ )?limit\b|\busage limit\b|\bweekly limit\b"
+                           r"|\bwait for (?:the |your )?(?:session |usage |weekly )?limit to reset\b"
+                           r"|\bswitch to usage credits\b", re.I)
+_LIMIT_RESET = re.compile(r"\b(?:resets?(?: at| on| in)?|continue automatically at)\s+([\w :,./+-]{1,40})", re.I)
+
+
+def out_of_quota(pane: str):
+    """None when the pane shows no usage limit; else when it resets, in its own words ('' when unsaid)."""
+    lines = [ln for ln in (pane or "").splitlines()[-40:] if ln.strip()]
+    if not any(_LIMIT_SCREEN.search(ln) for ln in lines):
+        return None
+    for ln in lines:
+        m = _LIMIT_RESET.search(ln)
+        if m:
+            return " ".join(m.group(1).split()).rstrip(" ,:./+-")[:40]
+    return ""
+
 class Tmux:
     """The adapter's own server on its own socket; every probe bounded, every outcome explicit."""
 
@@ -633,6 +652,11 @@ class Launcher:
         if not gen or self.tm.has_session() is not True:
             return False, "no running session to switch; nothing sent"
         styled = self.tm.capture(gen["pane_id"], styled=True)
+        limited = out_of_quota(self.tm.capture(gen["pane_id"]) or "")
+        if limited is not None:
+            # The limit screen replaces the input box; a model switch cannot get past it, an account can.
+            return False, "refused: this account is out of quota%s. Switch account first." % (
+                " (resets %s)" % limited if limited else "")
         draft = composer_text(styled)
         # An empty reading counts only inside the box's frame: a bare prompt row may be a cut box.
         if draft is None or not composer_boxed(styled):

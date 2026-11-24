@@ -139,7 +139,7 @@ class AccountCardTest(unittest.TestCase):
     def test_the_card_is_english_and_carries_the_marker_for_the_in_card_controls(self):
         card = self.menu()
         self.assertEqual(card["account_controls"], {"runtime": "antigravity", "agent": AGENT})
-        self.assertEqual(card["header"]["title"], "Antigravity account")
+        self.assertEqual(card["header"]["title"], "Account")
         self.assertTrue(card["text"].endswith(agy_account.BELOW), card["text"])
         self.assertEqual(agy_account.elsewhere("Antigravity"),
                          "Open this on the computer that runs Antigravity to switch account.")
@@ -191,14 +191,14 @@ class AccountCardTest(unittest.TestCase):
         (self.w.home / "account").write_text("bob@example.com")
         self.dm("task-2", "STUB:TEXT hi")
         self.serve()
-        self.assertTrue(self.w.result("task-2").startswith(gc.quoted("(Switched to the b…@example.com account.)").strip()))
+        self.assertTrue(self.w.result("task-2").startswith(gc.quoted("(Switched to bob@example.com. New conversations use it ✓)").strip()))
         self.assertIn("hello from agy-stub", self.w.result("task-2"))
         self.dm("task-3", "STUB:TEXT hi")
         self.serve()
         self.assertEqual(self.w.result("task-3"), "hello from agy-stub\n")
         card = self.menu()
-        self.assertIn("b…@example.com", card["text"])
-        self.assertNotIn("bob@example.com", self.state_text())
+        self.assertIn("bob@example.com", card["text"])
+        # The full email, as every account card shows it (owner 2026-11-24); kept only in this agent's own state.
 
     def test_a_tap_that_is_not_the_owners_changes_nothing(self):
         self.keychain["saved"] = True
@@ -273,13 +273,13 @@ class AccountCardTest(unittest.TestCase):
         self.assertNotIn("Switched to the", self.w.result("task-dm"), "no line in the answer")
         (done,) = self.posted("$y")
         self.assertEqual([(p["op"], p.get("event_id")) for p in self.sent], [("edit", "$menu")])
-        self.assertEqual((done["state"], done["text"].startswith("Switched to the b…@example.com account.")), ("done", True))
+        self.assertEqual((done["state"], done["text"].startswith("Switched to bob@example.com.")), ("done", True))
         self.assertIn("account_controls", done)
         # Said once: a later change, with no card waiting, is said in the answer as before.
         (self.w.home / "account").write_text("carol@example.com")
         self.dm("task-dm2", "STUB:TEXT hi")
         self.serve()
-        self.assertIn("Switched to the c…@example.com account", self.w.result("task-dm2"))
+        self.assertIn("Switched to carol@example.com", self.w.result("task-dm2"))
         self.assertEqual(self.posted("$z"), [])
 
     def test_the_switch_notice_is_said_only_in_the_owners_dm(self):
@@ -295,7 +295,7 @@ class AccountCardTest(unittest.TestCase):
         self.assertNotIn("Switched to the", self.w.result("task-collab"))
         self.dm("task-dm", "STUB:TEXT hi")
         self.serve()
-        self.assertIn("Switched to the b…@example.com account", self.w.result("task-dm"), "the DM is told once it is back there")
+        self.assertIn("Switched to bob@example.com", self.w.result("task-dm"), "the DM is told once it is back there")
         self.assertEqual(self.posted("$x"), [], "and no card goes anywhere")
 
     # ── A4 ──
@@ -372,7 +372,7 @@ class PartsTest(unittest.TestCase):
             Path(d, "acp-server-1-42.log").write_text("x\nI1 server_oauth.go:221] applyAuthResult: email=bob@example.com, "
                                                        "authMethod=consumer, quotaProject=\n")
             Path(d, "acp-server-1-43.log").write_text("applyAuthResult: email=eve@example.com, authMethod=consumer\n")
-            self.assertEqual(agy_account.signed_in_as(d, 42), "b…@example.com")
+            self.assertEqual(agy_account.signed_in_as(d, 42), "bob@example.com")
             self.assertEqual(agy_account.signed_in_as(d, 44), "")
             self.assertEqual(agy_account.signed_in_as(os.path.join(d, "none"), 42), "")
 

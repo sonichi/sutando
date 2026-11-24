@@ -11,7 +11,7 @@ tap in their DM acts.
 One card, updated in place: what a tap comes to is shown in place of the card tapped (connector_cards'
 edit), never as a second card; the "where to open this" answers keep the account controls, so the same
 card opened on the agent's computer draws them. When agy then signs in as another account, that card
-says so ("Switched to the … account.") instead of a line in the next reply.
+says so ("Switched to … New conversations use it ✓") instead of a line in the next reply.
 
 No secret is ever taken in chat: every card reply and card input in the web client is sent as a room
 message, so neither a sign-in code nor a key may travel that way.
@@ -176,7 +176,7 @@ class AgyAccount:
         if url:
             buttons.append(agent_card.button("Open sign-in page", "url", url=url))
         body, built = agent_card.build(account_switch.CARD if menu else account_switch.NOTE, state,
-                                       title="Antigravity account", body="Account of %s" % self.name, text=text,
+                                       title="Account", body="Account of %s" % self.name, text=text,
                                        **({"buttons": buttons} if buttons else {}))
         if menu or controls:
             # The marker the desktop app draws this agent's account controls from; older clients ignore it.
@@ -267,11 +267,11 @@ class AgyAccount:
         self.keep(account=who)
         if not before:
             return ""
-        if tapped and room and self.post(room, self.card("done", "Switched to the %s account. %s" % (who, BELOW),
+        if tapped and room and self.post(room, self.card("done", "Switched to %s. New conversations use it ✓" % who,
                                                          controls=True), tapped):
             self.keep(card="", card_room="")
             return ""
-        return "(Switched to the %s account.)" % who
+        return "(Switched to %s. New conversations use it ✓)" % who
 
     # ── out of quota (quota_notice posts it) ──
     def quota_card(self, text):

@@ -192,15 +192,15 @@ class ModelSwitch:
         names = {m["id"]: m["name"] for m in self.offered(state)}
         name = names.get(picked, picked)
         if same:
-            return "done", "Model: already %s" % name, "I'm already using %s. Nothing changed." % name, ""
+            return "done", "Model: already %s" % name, "Already using %s — nothing to change." % name, ""
         if ran is None:
             return ("pending", "Model: switching to %s" % name,
                     "Saved, not switched yet: I'll use %s from your next message. I'll confirm here once it "
                     "has switched." % name, "Saved")
         if ran == picked:
-            return "done", "Model: now %s" % name, "Switched. I'm now using %s." % name, "Switched"
+            return "done", "Model: now %s" % name, "Switched to %s ✓" % name, "Switched"
         return ("error", "Model: could not switch to %s" % name,
-                "I could not switch to %s. I'm still using %s. Send /model to try again."
+                "Couldn't switch to %s: my next turn did not run on it. I'm still using %s. Send /model to try again."
                 % (name, names.get(ran, ran or "my default model")), "")
 
     def usable(self) -> bool:
