@@ -282,10 +282,55 @@ def test_notification_and_macos_display_delegate() -> None:
        f"got code={handler._response_code}")
 
 
+def test_capture_video_start_spawns_and_registers() -> None:
+    """action=start spawns `screencapture -v`, registers the active recording
+    before the watchdog can fire, and creates the clip dir as 0700."""
+    proc = unittest.mock.MagicMock(name="proc")
+    timers: list = []
+
+    class _FakeTimer:
+        def __init__(self, delay, fn):
+            timers.append((delay, fn))
+            self.daemon = False
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+    handler = _FakeHandler("/capture-video?action=start&max=5&silent=true", "secret-token")
+    try:
+        with unittest.mock.patch.object(sc, "CAPTURE_TOKEN", "secret-token"), \
+             unittest.mock.patch.object(sc, "screen_capture_permitted", return_value=True), \
+             unittest.mock.patch.object(sc, "_signal_seeing"), \
+             unittest.mock.patch.object(sc, "_notify_capture"), \
+             unittest.mock.patch.object(sc, "_post_recording_state"), \
+             unittest.mock.patch.object(sc.threading, "Timer", _FakeTimer), \
+             unittest.mock.patch.object(sc.subprocess, "Popen", return_value=proc) as popen, \
+             unittest.mock.patch("os.makedirs") as makedirs:
+            handler._handle_capture_video()
+    finally:
+        sc._active_recording = None
+    body = json.loads(handler._buf.getvalue() or b"{}")
+    ok("capture-video start returns the recording status",
+       handler._response_code == 200 and body.get("status") == "recording",
+       f"got code={handler._response_code} body={handler._buf.getvalue()!r}")
+    ok("the clip directory is created private",
+       makedirs.call_args.kwargs.get("mode") == 0o700,
+       f"got makedirs call={makedirs.call_args!r}")
+    ok("the watchdog is armed at the requested cap",
+       timers and timers[0][0] == 5, f"got timers={timers!r}")
+    ok("screencapture is spawned against the clip path",
+       popen.call_args.args[0][-1].endswith(".mov"),
+       f"got cmd={popen.call_args.args[0]!r}")
+
+
 test_downscale_delegates_with_bounds()
 test_downscale_failure_only_allows_small_original()
 test_capture_downscale_options_and_failure_are_visible()
 test_notification_and_macos_display_delegate()
+test_capture_video_start_spawns_and_registers()
 
 # ---------------------------------------------------------------------------
 # Summary

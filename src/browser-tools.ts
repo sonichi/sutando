@@ -21,6 +21,7 @@ import { readCaptureToken } from './util_paths.js';
 import { meetingHoldsModel } from './meeting-input-hold.js';
 import { setupHint, scrollOutcome } from './osascript-setup-hint.js';
 import { withScheme } from './url-scheme.js';
+import { verifyCaptureArtifact } from './capture-artifact.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -490,7 +491,7 @@ export const describeScreenTool: ToolDefinition = {
 			if (captureData.status !== 'ok' || !captureData.path) {
 				return { error: `Could not capture screen: ${captureData.error || 'unknown'}` };
 			}
-			const paths = captureData.all_paths || [captureData.path];
+			const paths = (captureData.all_paths || [captureData.path]).map(path => verifyCaptureArtifact(path));
 			const descriptions: string[] = [];
 			for (let i = 0; i < paths.length; i++) {
 				const label = paths.length > 1 ? `Display ${i + 1}: ` : '';
@@ -619,11 +620,12 @@ export const pointAtTool: ToolDefinition = {
 			if (!capRes.ok) return { error: `point_at capture HTTP ${capRes.status}` };
 			const cap = await capRes.json() as { status: string; path?: string; error?: string };
 			if (cap.status !== 'ok' || !cap.path) return { error: `point_at capture failed: ${cap.error || 'unknown'}` };
+			const capturePath = verifyCaptureArtifact(cap.path);
 			// Aspect-preserving downscale keeps 0–1 normalized coords valid on the display.
 			// Per-invocation temp path so a failed resize can never feed a stale frame.
 			const small = join(tmpdir(), `pointer-shot-${process.pid}-${Date.now()}.jpg`);
-			const resized = resizeImage(cap.path, small, 1568);
-			const imgPath = resized ? small : cap.path;
+			const resized = resizeImage(capturePath, small, 1568);
+			const imgPath = resized ? small : capturePath;
 			const imageData = readFileSync(imgPath).toString('base64');
 			if (resized) { try { unlinkSync(small); } catch { /* best-effort cleanup */ } }
 

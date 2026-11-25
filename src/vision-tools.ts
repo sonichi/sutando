@@ -16,7 +16,7 @@
  * realtime_input.video slot accepts single-frame images.
  */
 
-import { readFileSync, writeFileSync, unlinkSync, mkdtempSync, mkdirSync, openSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, openSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { readCaptureToken } from './util_paths.js';
@@ -31,6 +31,8 @@ import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 import { meetingHoldsModel } from './meeting-input-hold.js';
+import { isLoopbackOrigin, bearerMatches, localApiToken } from './local-api-gate.js';
+import { takeCaptureArtifact } from './capture-artifact.js';
 
 const execFileAsync = promisify(execFile);
 // UTC, matching voice-agent's ts() — these logs interleave in the same file,
@@ -288,13 +290,7 @@ const screenSource: VisionSource = {
 		if (data.status !== 'ok' || !data.path) {
 			throw new Error(`screen-capture-server: ${data.error || 'no path'}`);
 		}
-		const buf = readFileSync(data.path);
-		// Drop the on-disk copy — we've already uploaded the bytes.
-		try {
-			unlinkSync(data.path);
-		} catch (err) {
-			console.warn(`${ts()} [Vision] failed to unlink ${data.path}: ${(err as Error)?.message ?? err}`);
-		}
+		const buf = takeCaptureArtifact(data.path);
 		return { data: buf, mimeType: 'image/jpeg' };
 	},
 };
@@ -1177,10 +1173,24 @@ export function startVisionControlServer(port: number = DEFAULT_CONTROL_PORT): S
 			res.writeHead(status, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify(body));
 		};
+		const authorizeControl = (): boolean => {
+			const originHeader = req.headers.origin;
+			const origin = Array.isArray(originHeader) ? originHeader[0] : originHeader;
+			if (origin && !isLoopbackOrigin(origin)) {
+				respond(403, { status: 'failed', error: 'cross-origin request refused' });
+				return false;
+			}
+			if (!bearerMatches(req.headers.authorization, localApiToken())) {
+				respond(401, { status: 'failed', error: 'unauthorized: vision control requires the local API bearer (SUTANDO_API_TOKEN or state/agent-api.token)' });
+				return false;
+			}
+			return true;
+		};
 		if (url.pathname === '/vision/state' && req.method === 'GET') {
 			return respond(200, getVisionState());
 		}
 		if (url.pathname === '/vision/start' && req.method === 'POST') {
+			if (!authorizeControl()) return;
 			const body = await readJsonBody(req);
 			const source = typeof body.source === 'string' ? body.source : undefined;
 			const fps = typeof body.fps === 'number' ? body.fps : undefined;
@@ -1189,9 +1199,11 @@ export function startVisionControlServer(port: number = DEFAULT_CONTROL_PORT): S
 			return respond(r.status === 'failed' ? 409 : 200, r);
 		}
 		if (url.pathname === '/vision/stop' && req.method === 'POST') {
+			if (!authorizeControl()) return;
 			return respond(200, stopStreaming());
 		}
 		if (url.pathname === '/vision/frame' && req.method === 'POST') {
+			if (!authorizeControl()) return;
 			// Cap the body BEFORE buffering it. The egress gate rejects an
 			// oversized frame, but only after the whole request is already in
 			// memory — and this listener binds 0.0.0.0 by default.
