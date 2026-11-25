@@ -853,7 +853,9 @@ class Connector:
             signin = "sign-in-card" if self.accounts.post(headers.get("channel_id"), self.accounts.signed_out_card()) \
                 else "sign-in-card-not-queued"
             if signin == "sign-in-card":
-                body = account_switch.ANSWERED
+                # Only the error line gives way to the card: what this turn settled about a model or account stays.
+                kept = "\n".join(x for x in (quoted(switched).strip() if switched else "", unsaid) if x)
+                body = kept + "\n" if kept else account_switch.ANSWERED
         reason = ""
         if self.launch is not None:
             launches = LaunchLog(self.args.session_store)

@@ -23,7 +23,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_antigravity_adapter as ta  # noqa: E402  (its hermetic env and Work)
 
-from ag2_sparrow import account_switch, connector_cards  # noqa: E402
+from ag2_sparrow import account_switch, connector_cards, model_switch  # noqa: E402
 from ag2_sparrow.adapters.antigravity import agy_account, antigravity_connector as gc, gemini_key as gk  # noqa: E402
 
 CODE = "4/0A" + "d" * 40                # shaped like a Google sign-in code; not a real one
@@ -323,6 +323,18 @@ class AccountCardTest(unittest.TestCase):
         self.assertNotIn("agy acp --login", card["text"], "no terminal command in the card")
         self.assertIn("not signed in", queued["body"], "the one-line fallback for a client without cards")
         self.assertNotIn("session/prompt", self.w.methods())
+
+    def test_signed_out_keeps_the_model_outcome_this_turn_settled_beside_the_card(self):
+        # Review of #6802: the card's answer replaced the whole body, and the line saying a pick did not take was lost.
+        (self.w.home / "signed-in").unlink()
+        self.dm("task-so", "STUB:TEXT hi")
+        with mock.patch.object(model_switch.ModelSwitch, "unsaid", lambda self: "Couldn't switch to Opus."):
+            self.serve()
+        said = self.w.result("task-so")
+        self.assertIn("Couldn't switch to Opus.", said)
+        self.assertNotIn("not signed in on this computer", said, "the error line still gives way to the card")
+        self.assertFalse(said.startswith("[no-send]"), "the kept line is sent")
+        self.assertEqual(len(self.outbox()), 1, "and the sign-in card is still queued")
 
     def test_signed_out_outside_the_owner_dm_keeps_the_words_and_queues_no_card(self):
         (self.w.home / "signed-in").unlink()
