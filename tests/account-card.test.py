@@ -246,6 +246,10 @@ class CodexCard(Base):
         self.assertNotIn("Retry", [b["label"] for b in card["buttons"]])
         # The desktop draws the core's own account controls (saved accounts, Add account…) in it.
         self.assertEqual(card["account_controls"], {"runtime": "codex", "core": True})
+        # A signed-out core says so in the marker: the client leads with "Sign in again" (owner 2026-11-24).
+        out_card = acc.menu_card({"runtime": "codex", "signed_in": False, "shown": "", "key": ""}, [],
+                                 signed_out=True)[1]
+        self.assertEqual(out_card["account_controls"], {"runtime": "codex", "core": True, "signed_out": True})
         acc_card = acc.menu_card({"runtime": "codex", "signed_in": True, "shown": "alice@example.com", "key": ""},
                                  [], lead, retry=True)[1]
         retry = [b for b in acc_card["buttons"] if b["label"] == "Retry"]
