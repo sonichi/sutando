@@ -127,10 +127,10 @@ def record(workspace: Path, event_id: str, card: Mapping[str, object], *, room: 
         # An event the platform hands back for a retried send is no newer card: a superseded or settled one
         # stays retired (a settled card's buttons never act twice), and a live one replaces nothing.
         if edited:
-            was = live_cards.pop(event_id, None)
+            was = live_cards.pop(event_id, None) or retired.get(event_id) or {}
             retired.pop(event_id, None)
             if not (payloads or picker):    # the edit has no buttons: the ones it replaced never act again
-                retired[event_id] = _retire(was, "settled", now)
+                retired[event_id] = _retire(dict(was, room=room or was.get("room")), "settled", now)
         elif event_id in retired:
             return False
         cards = dict(live_cards)
@@ -199,14 +199,15 @@ def live(workspace: Path, event_id: str, *, now: Optional[float] = None) -> Opti
 
 
 def issued(workspace: Path, event_id: str, room: str = "", *, now: Optional[float] = None) -> bool:
-    """Whether this agent's ledger knows `event_id` as a card it posted (in `room`, when the record says
-    where): live, or retired and not yet forgotten. An id it does not know may be anyone's message."""
+    """Whether this agent's ledger knows `event_id` as a card it posted, in `room` when one is given: live,
+    or retired and not yet forgotten. A record that names no room vouches for none; an id it does not know
+    may be anyone's message."""
     now = time.time() if now is None else now
     path = ledger_path(workspace)
     entry = _read(path).get(str(event_id or ""))
     if not (isinstance(entry, dict) and float(entry.get("expires_at") or 0) > now):
         entry = _retired(path, now).get(str(event_id or ""))
-    return isinstance(entry, dict) and (not room or str(entry.get("room") or room) == room)
+    return isinstance(entry, dict) and (not room or str(entry.get("room") or "") == room)
 
 
 def main(argv=None) -> int:

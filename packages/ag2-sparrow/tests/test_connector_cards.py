@@ -175,6 +175,50 @@ class ConnectorCards(unittest.TestCase):
         posted = sorted((self.state / "agent-cards" / "posted").iterdir())
         self.assertEqual([json.loads(p.read_text())["event_id"] for p in posted], ["$new1", "$new2"])
 
+    def test_an_edit_answered_without_its_event_id_is_not_applied_and_stays_queued(self):
+        ac, _ = cc._core()
+        body, card = ac.build("model-switch-status", "done", title="Model", body="Model: now Opus", text="Switched.")
+        cc.queue(self.state, ROOM, body, card, edit="$card1")
+        calls = []
+        ok_only = cc.Poster(self.state, lambda p: calls.append(p["op"]) or {"ok": True}, log=self.logs.append,
+                            clock=lambda: 1000.0)
+        self.assertEqual(ok_only.sweep(), 0, "success-shaped, no receipt: neither applied nor posted again")
+        self.assertEqual(calls, ["edit"])
+        self.assertEqual(list((self.state / "agent-cards" / "posted").glob("*.json")), [])
+        self.assertEqual(len(list((self.state / "agent-cards" / "outbox").glob("*.json"))), 1)
+        # A refusal that also carries an id is a refusal: the card is posted as a new one.
+        calls.clear()
+        refusing = cc.Poster(self.state, lambda p: calls.append(p["op"]) or (
+            {"ok": False, "error": "refused", "event_id": "$diagnostic"} if p["op"] == "edit" else {"ok": True, "event_id": "$new"}),
+            log=self.logs.append, clock=lambda: 1000.0)
+        self.assertEqual((refusing.sweep(), calls), (1, ["edit", "message"]))
+        (receipt,) = (self.state / "agent-cards" / "posted").glob("*.json")
+        self.assertEqual((json.loads(receipt.read_text())["event_id"], "edited" in json.loads(receipt.read_text())), ("$new", False))
+
+    def test_an_edit_waits_behind_an_earlier_edit_of_the_same_event_whatever_card_each_carries(self):
+        ac, _ = cc._core()
+        status = ac.build("model-switch-status", "done", title="Model", body="Model: now Opus", text="Switched.")
+        menu = model_card()
+        cc.queue(self.state, ROOM, *status, edit="$card1")
+        cc.queue(self.state, ROOM, *menu, edit="$card1")
+        cc.queue(self.state, ROOM, *menu, edit="$card2")
+        sent = []
+
+        def post(payload):
+            if payload["event_id"] == "$card1" and not any(p["event_id"] == "$card1" for p in sent):
+                sent.append(payload)
+                raise OSError("down")       # the older status edit fails once
+            sent.append(payload)
+            return {"ok": True, "event_id": "$e%d" % len(sent)}
+
+        poster = cc.Poster(self.state, post, log=self.logs.append, clock=lambda: 1000.0)
+        self.assertEqual(poster.sweep(), 1, "only the edit of the other event goes out")
+        self.assertEqual([(p["event_id"], p["extra_content"]["space.ag2.card"]["id"]) for p in sent],
+                         [("$card1", "model-switch-status"), ("$card2", menu[1]["id"])])
+        self.assertEqual(poster.sweep(), 2)
+        self.assertEqual([(p["event_id"], p["extra_content"]["space.ag2.card"]["id"]) for p in sent[2:]],
+                         [("$card1", "model-switch-status"), ("$card1", menu[1]["id"])], "in the order they were queued")
+
     def test_a_card_that_would_not_render_or_has_no_room_is_refused_at_the_queue(self):
         body, card = model_card()
         for room, line, bad in (("", body, card), ("not-a-room", body, card), (ROOM, "", card),
