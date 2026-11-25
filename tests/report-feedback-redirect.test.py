@@ -158,7 +158,7 @@ class TestReference(unittest.TestCase):
         rf.post_feedback(f"{self.base}/api/feedback", {"title": "x"}, "tok", receipt=receipt)
         self.assertEqual(receipt["id"], "after-the-hop")
 
-    def test_an_answer_without_a_usable_id_is_still_a_filed_report(self):
+    def test_a_reply_without_a_reference_keeps_the_http_acknowledgment(self):
         for answer in (b'{"ok":true}', b"not json", b'{"ok":true,"id":42}', b"[]", b""):
             Handler.answer = answer
             receipt: dict = {}
