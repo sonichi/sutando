@@ -450,6 +450,42 @@ class HandshakeAndThread(SeatCase):
         self.assertEqual(self.make(decl).serve(once=True), seat_mod.EXIT_LOCKED)
         self.assertEqual(self.sent(), [], "the second seat started no app-server")
 
+    def test_a_restarted_seat_drops_the_copies_the_seat_before_it_left(self):
+        """A copy in a state dir whose lock is held reads as "a running seat took this task". The
+        launcher reuses the state dir, so a replacement seat must not hold the lock over a copy only
+        the interrupted seat had taken: it is gone before the new seat serves anything."""
+        decl = self.declaration()
+        left = decl.parent / "payloads" / "task-1.txt"
+        left.parent.mkdir(parents=True)
+        left.write_text("task: taken by the seat that was interrupted\n", encoding="utf-8")
+        replacement = self.make(decl)
+        self.assertTrue(replacement.lock())
+        self.addCleanup(os.close, replacement.lock_fd)
+        self.assertFalse(left.exists(), "no inherited copy under the replacement's lock")
+        self.assertEqual(self.sent(), [], "and it was dropped before any app-server was started")
+
+    def test_a_seat_refused_the_lock_leaves_the_running_seats_copies_alone(self):
+        decl = self.declaration()
+        running = self.make(decl)
+        self.assertTrue(running.lock())
+        self.addCleanup(os.close, running.lock_fd)
+        copy = decl.parent / "payloads" / "task-1.txt"
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        copy.write_text("task: the running seat's turn\n", encoding="utf-8")
+        self.assertEqual(self.make(decl).serve(once=True), seat_mod.EXIT_LOCKED)
+        self.assertTrue(copy.exists())
+
+    def test_a_copy_that_cannot_be_removed_is_logged_and_the_seat_still_starts(self):
+        decl = self.declaration()
+        left = decl.parent / "payloads" / "task-1.txt"
+        left.parent.mkdir(parents=True)
+        left.write_text("task\n", encoding="utf-8")
+        s = self.make(decl)
+        with mock.patch.object(seat_mod.Path, "unlink", side_effect=OSError("denied")):
+            self.assertTrue(s.lock())
+        self.addCleanup(os.close, s.lock_fd)
+        self.assertIn("could not be removed: task-1.txt", self.out.getvalue())
+
 
 class Turns(SeatCase):
     def test_one_turn_per_task_in_dispatch_order(self):

@@ -1300,7 +1300,21 @@ class Seat:
             os.close(fd)
             return False
         self.lock_fd = fd
+        self.drop_inherited_snapshots()
         return True
+
+    def drop_inherited_snapshots(self) -> None:
+        """Called with the lock just taken: copies an earlier seat left in this state dir are removed, so
+        the lock this seat now holds never vouches for a task only the earlier seat had taken."""
+        try:
+            left = list((Path(self.host.state) / "payloads").iterdir())
+        except OSError:
+            return
+        for path in left:
+            try:
+                path.unlink()
+            except OSError:
+                log(f"a task copy an earlier seat left could not be removed: {path.name}")
 
     def resume_runtime_wait(self, popen=None) -> None:
         """The core is up: a sign-in a runtime card is waiting for gets its waiter back (a restart can
