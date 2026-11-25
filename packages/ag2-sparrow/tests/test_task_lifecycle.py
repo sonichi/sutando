@@ -2103,7 +2103,7 @@ class BoundaryGuardTest(SpyMixin, unittest.TestCase):
                          {"state", "results", "tasks", "results/<task>.txt",
                           "results/.<task>.txt.<tmp>", "state/done", "state/.done.<tmp>", "state/threads",
                           "state/threads/<key>", "state/threads/.<key>.<tmp>", "state/metrics.jsonl",
-                          "state/app-server-stub.stderr"})
+                          "state/app-server-stub.stderr", "state/live-view.log"})
 
     def strings(self, tree):
         doc = tree.body[0].value if tree.body and isinstance(tree.body[0], ast.Expr) else None
