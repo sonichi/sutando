@@ -800,12 +800,12 @@ class Connector:
         durable = caps.session == "durable"
         for attempt in (1, 2):
             try:
-                turn_prompt = self.open_turn(headers, caps, prompt)
+                turn = self.open_turn(headers, caps, prompt)
             except IntegrationsUnknown as e:
                 return "failed", "", "the configured integrations could not be read to switch them off (%s)" % e
             except Unconfined as e:
                 return "failed", "", "the turn could not be confined to its own folder (%s)" % e
-            status, text, err = self.run_turn(turn_prompt, self.turn_model(caps), self.turn_cwd(caps))
+            status, text, err = self.run_turn(*turn)     # nothing is read from disk between the check and the send
             if status == "server-exited":
                 self.restart_server()
                 if durable and attempt == 1:
@@ -817,15 +817,16 @@ class Connector:
             return status, text, err
         return status, text, err
 
-    def open_turn(self, headers, caps, prompt) -> str:
-        """Make a turn ready to send, and return its prompt. This is the one place a turn is dispatched
-        from, for the first server, a replaced one and one restarted after a crash, and it holds one
-        guarantee: the prompt is sent on a server started on the sign-in that is on disk when it is sent.
-        The sign-in is read again as the last step, after the thread is open (opening one is a round trip
-        to the server, and the account can change during it); a change there replaces the server and
-        opens the thread again on the new one. Nothing was sent on the thread left behind, and it ends
-        with the server that held it. What is left is the instant between that last read of the file and
-        the write of `turn/start` to the server's pipe.
+    def open_turn(self, headers, caps, prompt) -> tuple:
+        """Make a turn ready to send: (its prompt, its model, its working directory), as `run_turn` takes
+        them. This is the one place a turn is dispatched from, for the first server, a replaced one and
+        one restarted after a crash, and it holds one guarantee: the prompt is sent on a server started
+        on the sign-in that is on disk when it is sent. Everything the send needs is made ready first
+        (the thread, which is a round trip to the server; the prompt; the model, which is read from
+        disk; the working directory), and the sign-in is read again after all of it. A change there
+        replaces the server and makes the turn ready again on the new one. Nothing was sent on the
+        thread left behind, and it ends with the server that held it. What is left after that read is
+        `run_turn` putting the request together in memory and writing `turn/start` to the server's pipe.
 
         Two exceptions, both said in the log, serve on the last server that works rather than hold the
         task: a replacement that cannot start (the running server serves), and a sign-in that changes
@@ -840,11 +841,12 @@ class Connector:
                 # The turn reads its own folder only: this task's own attachments are copied into it.
                 staged = stage_own_attachments(headers, self.scratch_cwd, getattr(self.args, "media_root", None))
                 turn_prompt = with_staged_paths(prompt, staged)
+            turn = turn_prompt, self.turn_model(caps), self.turn_cwd(caps)
             if not self.signin_stale() or self.signin_failed:
-                return turn_prompt      # current; or the replacement cannot start and the running server serves
+                return turn             # current; or the replacement cannot start and the running server serves
             if left <= 0:
                 log("sign-in kept changing while the turn was made ready; sending on the last server started")
-                return turn_prompt
+                return turn
 
     def result_body(self, status, text, err):
         if status == "completed":

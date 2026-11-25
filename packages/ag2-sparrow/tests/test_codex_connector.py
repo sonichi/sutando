@@ -1456,13 +1456,14 @@ class EdgePathTest(unittest.TestCase):
     def signin_world(self, d, home, script):
         """Serve the tasks in `d` on the stub with CODEX_HOME `home`. `script(event, n)` is called at
         'spawned' (the n-th server has been made), 'initialized' (the n-th handshake returned),
-        'polled' (the inbox was listed) and 'thread' (the n-th thread was opened) and may rewrite auth.json or raise. Returns (rc, turns, logs):
+        'polled' (the inbox was listed), 'thread' (the n-th thread was opened) and 'model' (a turn's model is
+        about to be resolved, for the n-th time) and may rewrite auth.json or raise. Returns (rc, turns, logs):
         one row per turn dispatched, (the server it went to, the sign-in that server was started on,
         the sign-in on disk at that moment)."""
         from ag2_sparrow import signin_watch
         real, handshake, run_turn, pending = cc.Rpc, cc.Connector.handshake, cc.Connector.run_turn, cc.Connector.pending_tasks
-        open_for = cc.Connector.open_for
-        made, shakes, turns, opens = [], [], [], []
+        open_for, turn_model = cc.Connector.open_for, cc.Connector.turn_model
+        made, shakes, turns, opens, models = [], [], [], [], []
         self.opens = opens
 
         def rpc(*a, **k):
@@ -1482,6 +1483,11 @@ class EdgePathTest(unittest.TestCase):
             script("thread", len(opens))
             return out
 
+        def resolved(connector, *a, **k):
+            models.append(1)
+            script("model", len(models))
+            return turn_model(connector, *a, **k)
+
         def polled(connector, seen):
             names = pending(connector, seen)
             script("polled", len(made))
@@ -1496,6 +1502,7 @@ class EdgePathTest(unittest.TestCase):
                 mock.patch.object(cc.Connector, "handshake", shaken), \
                 mock.patch.object(cc.Connector, "pending_tasks", polled), \
                 mock.patch.object(cc.Connector, "open_for", opened), \
+                mock.patch.object(cc.Connector, "turn_model", resolved), \
                 mock.patch.object(cc.Connector, "run_turn", dispatched), \
                 mock.patch.object(cc, "log", wraps=cc.log) as spy:
             rc = run_connector(d, once=len([n for n in os.listdir(os.path.join(d, "tasks"))]))
@@ -1600,6 +1607,43 @@ class EdgePathTest(unittest.TestCase):
                 # The folder of the thread left behind is removed when the thread is opened again.
                 self.assertEqual(len(scratch), 2 if tier == "guest" else 0)
                 self.assertEqual([os.path.isdir(p) for p in scratch[:-1]], [False] * len(scratch[:-1]))
+
+    def test_a_switch_while_the_turns_model_is_resolved_is_caught_before_the_send(self):
+        """Follow-up to #6782: the sign-in was read before the model (read from disk) and the working
+        directory were resolved, so a switch during that still sent the prompt on the earlier server."""
+        for name, flips in (("once", {("model", 1): "acct-2"}),
+                            ("on a replacement too", {("initialized", 1): "acct-2", ("model", 1): "acct-3"}),
+                            ("twice in a row", {("model", 1): "acct-2", ("model", 2): "acct-3"})):
+            with self.subTest(name), tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
+                self.signed_in(home, "acct-1")
+                left = dict(flips)
+
+                def script(event, n, left=left, home=home):
+                    account = left.pop((event, n), None)
+                    if account:
+                        self.signed_in(home, account)
+
+                write_task(d, "task-chat-1", "sent once")
+                rc, turns, _ = self.signin_world(d, home, script)
+                self.assertEqual((rc, left, len(turns)), (0, {}, 1), "every switch happened; one prompt was sent")
+                self.assert_every_turn_ran_on_the_sign_in_on_disk(turns)
+                self.assertEqual(result(d, "task-chat-1").count("STUB echo:"), 1)
+
+    def test_nothing_is_read_from_disk_between_the_last_sign_in_check_and_the_send(self):
+        """The order itself: thread, model and working directory are all settled before the last read
+        of the sign-in, and `run_turn` is handed them, so it resolves nothing on its way to the pipe."""
+        order = []
+        args = cc.build_parser().parse_args(["--work", "w"])
+        c = cc.Connector(FakeRpc, args, note="n")
+        c.signin_settle = lambda left=0: order.append("settle") or 0
+        c.open_for = lambda headers, caps: order.append("thread")
+        c.turn_model = lambda caps: order.append("model") or "m"
+        c.turn_cwd = lambda caps: order.append("cwd") or "/w"
+        c.signin_stale = lambda: order.append("sign-in read") or False
+        c.run_turn = lambda prompt, model, cwd: order.append(("send", prompt, model, cwd)) or ("completed", "ok", None)
+        headers = {"access_tier": "owner", "channel_id": "!dm:s.space", "channel_kind": "dm"}
+        self.assertEqual(c.run_task(headers, "the prompt", task_io.OWNER_CAPABILITIES), ("completed", "ok", None))
+        self.assertEqual(order, ["settle", "thread", "model", "cwd", "sign-in read", ("send", "the prompt", "m", "/w")])
 
     def test_a_replacement_that_cannot_start_while_the_thread_opens_still_sends_on_the_running_server(self):
         with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
