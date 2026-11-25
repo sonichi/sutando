@@ -525,8 +525,40 @@ class HandshakeAndThread(SeatCase):
         other = os.open(decl.parent / "taking.lock", os.O_RDWR | os.O_CREAT, 0o600)
         self.addCleanup(os.close, other)
         fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        s = self.start(decl)
+        with mock.patch.object(seat_mod.Seat, "CLAIM_WAIT_S", 0.001), \
+                mock.patch.object(seat_mod.time, "sleep") as slept:
+            s = self.start(decl)
         self.assertIsNone(s.claim_fd)
+        self.assertEqual(slept.call_count, seat_mod.Seat.CLAIM_TRIES - 1, "asked a bounded number of times")
+        self.assertIn("taking.lock could not be taken", self.out.getvalue())
+        with mock.patch.object(seat_mod.fcntl, "flock", side_effect=OSError("no locks here")), \
+                mock.patch.object(seat_mod.time, "sleep") as slept:
+            self.assertIsNone(self.make(decl).claim_copies())
+        slept.assert_not_called()       # not contention: nothing to wait for
+
+    def test_the_bridges_probe_holding_the_lock_as_the_seat_starts_does_not_cost_the_claim(self):
+        """The bridge reads `taking.lock` by taking it shared for an instant. A seat that asks for it
+        in that instant is refused once; it asks again, so it still ends up vouching for its copies."""
+        decl = self.declaration()
+        decl.parent.mkdir(parents=True, exist_ok=True)
+        (decl.parent / "taking.lock").touch()
+        probe = os.open(decl.parent / "taking.lock", os.O_RDONLY)     # as _seat_lock_held opens it
+        fcntl.flock(probe, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        refused = []
+        real = seat_mod.time.sleep
+
+        def sleep(seconds):
+            refused.append(seconds)
+            if len(refused) == 2:               # the probe ends while the seat is waiting
+                fcntl.flock(probe, fcntl.LOCK_UN)
+                os.close(probe)
+            real(0)
+
+        with mock.patch.object(seat_mod.time, "sleep", sleep):
+            s = self.start(decl)
+        self.assertEqual(len(refused), 2, "refused while the probe held it, then taken")
+        self.assertIsNotNone(s.claim_fd)
+        self.assertTrue(self.taking(decl), "the bridge now reads a running seat")
 
     def test_a_seat_stopping_gives_up_the_claim_with_the_lock(self):
         decl = self.declaration()

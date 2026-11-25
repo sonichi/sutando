@@ -1304,6 +1304,8 @@ class Seat:
         self.claim_fd = self.claim_copies()
         return True
 
+    CLAIM_TRIES, CLAIM_WAIT_S = 40, 0.05
+
     def claim_copies(self) -> Optional[int]:
         """Called with the seat lock just taken. Copies an earlier seat left in this state dir are
         removed, and only then is `taking.lock` taken: that second lock, not the seat lock, is what
@@ -1325,12 +1327,20 @@ class Seat:
                     "this seat's copies are not shown as taken")
                 return None
         fd = os.open(os.path.join(self.host.state, "taking.lock"), os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            os.close(fd)
-            return None
-        return fd
+        # No other seat can hold it under the seat lock: a refusal is the bridge's probe, which holds
+        # the lock shared for an instant, so it is asked again for a bounded time.
+        for attempt in range(self.CLAIM_TRIES):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                if attempt + 1 < self.CLAIM_TRIES:
+                    time.sleep(self.CLAIM_WAIT_S)
+            except OSError:
+                break
+        os.close(fd)
+        log("taking.lock could not be taken; this seat's copies are not shown as taken")
+        return None
 
     def resume_runtime_wait(self, popen=None) -> None:
         """The core is up: a sign-in a runtime card is waiting for gets its waiter back (a restart can
