@@ -45,6 +45,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 
 ## Fixed
 
+- ag2-sparrow (bridge): a second bridge for an agent that is already being served on the same computer, from another folder or install, no longer polls: it says which process and folder hold the agent, reports it in the gateway status, and stands down. Two bridges polling as one agent each took tasks the other never saw.
 - Cards: the account, model and runtime card sent in answer to an owner's message is now posted under an operation id derived from that message, not the current second, so a task retried after the card went out but before its result was written (a watcher restart) gets the earlier post back from s.space instead of a second card. A card answering nothing (the quota card) still posts anew each time.
 - ag2-sparrow (antigravity-local): a message with another site's `?code=` link (a GitHub device-login link) or a path like `docs/4/...` is no longer refused as a sign-in code; an answer that opens with the term ("RESOURCE_EXHAUSTED is the gRPC code...") and another site's 429 in a failed turn's error are no longer taken for agy's usage limit; a collaborator who asks while agy is at its limit is told so, where they got no reply.
 - Workers with identities on several connections share one stable task/result folder. Only the primary connection’s worker lane adopts shared results; room-addressed notes use the matching server’s lane, and stay undelivered when no identity serves that server. Changing the primary leaves the inbox in place. ([#6384])
