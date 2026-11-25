@@ -61,17 +61,21 @@ KEY_IN_CHAT = ("This message looks like it has a sign-in code or an API key, so 
 QUOTA_RE = re.compile(r"RESOURCE_EXHAUSTED|Individual quota reached|quota (?:exceeded|exhausted|reached)"
                       r"|exceeded your (?:current )?quota|\b429\b.{0,40}\b(?:Too Many Requests|quota|rate.?limit)"
                       r"|(?:status|code|HTTP)\W{0,3}429\b", re.I)
+# A completed answer is the limit only when it opens with agy's own error, not when it mentions one.
+QUOTA_ANSWER_RE = re.compile(r"\s*(?:(?:error|session/prompt)\W{1,3})*(?:RESOURCE_EXHAUSTED|Individual quota reached"
+                             r"|(?:HTTP\W{0,3})?429\W{1,3}Too Many Requests|you(?:'ve| have) exceeded your (?:current )?quota)",
+                             re.I)
 _SIGN_IN_CODE = re.compile(r"(?<![A-Za-z0-9])4/[0-9A-Za-z_\-]{20,}")
 _CODE_URL = re.compile(r"https?://\S*[?&]code=[^&\s]{8,}")
 _AUTH_LINE = re.compile(r"applyAuthResult: email=([^,\s]+@[^,\s]+)")
 
 
 def quota_error(status, text, detail) -> bool:
-    """Whether a turn ended on agy's quota: a failed turn whose error says so, or a completed one whose whole
-    (short) answer is that error, as agy has answered it."""
+    """Whether a turn ended on agy's quota: a failed turn whose error says so, or a completed one whose
+    (short) answer opens with that error, as agy has answered it. An answer that only mentions one is not."""
     if status == "completed":
         said = (text or "").strip()
-        return 0 < len(said) <= QUOTA_TEXT_MAX and bool(QUOTA_RE.search(said))
+        return 0 < len(said) <= QUOTA_TEXT_MAX and bool(QUOTA_ANSWER_RE.match(said))
     return status in ("failed", "refused") and bool(QUOTA_RE.search("%s %s" % (text or "", detail or "")))
 
 

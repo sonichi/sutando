@@ -311,9 +311,14 @@ class AccountCardTest(unittest.TestCase):
     def test_what_reads_as_agys_quota_error(self):
         yes = (("failed", "", "session/prompt: RESOURCE_EXHAUSTED: Individual quota reached."),
                ("failed", "", "HTTP 429 Too Many Requests"), ("failed", "", "status: 429"),
-               ("completed", "RESOURCE_EXHAUSTED: quota exceeded", "end_turn"))
+               ("completed", "RESOURCE_EXHAUSTED: quota exceeded", "end_turn"),
+               ("completed", "Error: HTTP 429 Too Many Requests", "end_turn"),
+               ("completed", "You have exceeded your current quota.", "end_turn"))
+        # An ordinary answer that mentions a limit is the answer: it was replaced by the limit text, with a card.
         no = (("failed", "", "internal error"), ("completed", "Your quota exceeded talk: " + "x" * 500, "end_turn"),
-              ("failed", "", "port 4290 refused"), ("completed", "", "end_turn"))
+              ("failed", "", "port 4290 refused"), ("completed", "", "end_turn"),
+              ("completed", "Done. I added a retry for status 429 in fetch.py.", "end_turn"),
+              ("completed", "The API returns RESOURCE_EXHAUSTED when the quota exceeded; I handle it.", "end_turn"))
         self.assertEqual([agy_account.quota_error(*t) for t in yes], [True] * len(yes))
         self.assertEqual([agy_account.quota_error(*t) for t in no], [False] * len(no))
 
