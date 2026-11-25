@@ -624,6 +624,8 @@ class Issued(unittest.TestCase):
         issued_cards.record(self.ws, "$b", self.card, room=DM, now=1005.0)
         self.assertEqual([issued_cards.issued(self.ws, e, now=1006.0) for e in ("$a", "$b", "$other", "")],
                          [True, True, False, False])
+        self.assertEqual([issued_cards.issued(self.ws, e, ROOM, now=1006.0) for e in ("$a", "$b")], [False, False],
+                         "a card posted in one room is not this agent's card in another")
 
     def test_a_card_meant_before_a_live_one_of_its_id_is_retired_not_recorded(self):
         cards = lambda: sorted(json.loads(issued_cards.ledger_path(self.ws).read_text())["cards"])

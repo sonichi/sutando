@@ -519,16 +519,16 @@ class ConnectorTest(unittest.TestCase):
             self.w.serve()
             self.assertIn("couldn't match that button", self.w.result(tid), tid)
             self.assertEqual(self.post_queued(), [], tid)
-        # The owner's tap in another DM, or in reply to another event: a fresh card in place of the one
-        # tapped (where that edit is refused, the bridge posts it as a new card).
-        for tid, over, room, event in (("task-5", dict(channel="!other:s.space"), "!other:s.space", "$card1"),
-                                       ("task-6", dict(reply_to="$other"), self.DM, "$other")):
+        # The owner's tap in another DM, or in reply to another event: a fresh card there, as a new message,
+        # since the place tapped is not a card this agent posted in that room.
+        for tid, over, room in (("task-5", dict(channel="!other:s.space"), "!other:s.space"),
+                                ("task-6", dict(reply_to="$other"), self.DM)):
             self.dm_task(tid, said, **dict(dict(reply_to="$card1", click=said), **over))
             self.w.serve()
             self.assertEqual(self.w.result(tid), "[no-send] the model card answers\n", tid)
             (fresh,) = self.post_queued("$f-" + tid)
-            self.assertEqual((fresh["room_id"], fresh["op"], fresh["event_id"]), (room, "edit", event), tid)
-        self.dm_task("task-7", said, reply_to="$other")
+            self.assertEqual((fresh["room_id"], fresh["op"], fresh.get("event_id")), (room, "message", None), tid)
+        self.dm_task("task-7", said, reply_to="$f-task-6")
         self.w.serve()
         self.assertIn("didn't arrive as a tap", self.w.result("task-7"))
         self.assertNotIn("wanted", json.loads((self.w.root / "state" / "model.json").read_text()))

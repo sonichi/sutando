@@ -40,7 +40,7 @@ class Desk:
             # The owner tapped a card this agent no longer keeps (a newer one replaced it, it is past its
             # time, or an earlier install posted it): its kind says so and shows the current one.
             tapped = (agent_card.card_click(sent) or {}).get("card_id")
-            if not issued_cards.issued(Path(self.root), tapped_event(sent)):
+            if not issued_cards.issued(Path(self.root), tapped_event(sent), str(sent.get("channel_id") or "")):
                 # Not a card this agent is known to have posted: the fresh card is a new message, never an edit.
                 sent = dict(sent, reply_to_event="")
             for card in self.cards:
