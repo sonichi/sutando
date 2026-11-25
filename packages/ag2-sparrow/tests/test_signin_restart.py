@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+"""A local agent restarts its CLI when its own sign-in changes (an account switch from the card or the
+desktop's Settings), once the turn in progress is over, and only then: the same account, or a sign-in
+file that cannot be read, restarts nothing. No tmux, no codex: the pane, the record and the server are
+stood in."""
+import base64
+import json
+import os
+import sys
+import tempfile
+import time
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+isolate_os_environ()
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from ag2_sparrow import signin_watch  # noqa: E402
+from ag2_sparrow.adapters.claude_code import launcher  # noqa: E402
+
+from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
+
+
+def id_token(email):
+    payload = base64.urlsafe_b64encode(json.dumps({"email": email}).encode()).decode().rstrip("=")
+    return "h.%s.s" % payload
+
+
+def write(path, data, bump=[0]):
+    """Write `data` (JSON, or raw text) and move the mtime on, so a same-second rewrite is still seen."""
+    Path(path).write_text(data if isinstance(data, str) else json.dumps(data))
+    bump[0] += 1
+    t = time.time() + bump[0]
+    os.utime(path, (t, t))
+
+
+def codex_auth(account, email):
+    return {"OPENAI_API_KEY": None, "tokens": {"account_id": account, "id_token": id_token(email),
+                                               "access_token": "SECRET-A", "refresh_token": "SECRET-R"}}
+
+
+def claude_conf(uuid, email):
+    return {"projects": {}, "oauthAccount": {"accountUuid": uuid, "emailAddress": email}}
+
+
+class Readers(unittest.TestCase):
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.d = Path(d.name)
+
+    def test_codex_reads_the_account_and_email_and_never_a_token(self):
+        write(self.d / "auth.json", codex_auth("acct-1", "a@x.org"))
+        got = signin_watch.codex_identity(str(self.d))
+        self.assertEqual(got, ("acct-1", "a@x.org", None))
+        self.assertNotIn("SECRET", repr(got) + signin_watch.fingerprint(got))
+        write(self.d / "auth.json", {"OPENAI_API_KEY": "sk-SECRET"})
+        self.assertEqual(signin_watch.codex_identity(str(self.d)), ("api-key", "", None))
+        os.unlink(self.d / "auth.json")
+        self.assertEqual(signin_watch.codex_identity(str(self.d)), signin_watch.SIGNED_OUT + (None,))
+        write(self.d / "auth.json", "{not json")
+        self.assertIsNone(signin_watch.codex_identity(str(self.d)))
+
+    def test_the_switch_marker_reads_exactly_email_and_at(self):
+        write(self.d / "auth.json", codex_auth("acct-1", "a@x.org"))
+        write(self.d / signin_watch.MARKER, {"email": "b@x.org", "at": 1, "other": "ignored"})
+        self.assertEqual(signin_watch.codex_identity(str(self.d))[2], "b@x.org|1")
+        for bad in ("{torn", [], {"email": "b@x.org"}, {"at": 2}, {"email": "", "at": 2},
+                    {"email": "b@x.org", "at": "2"}, {"email": "b@x.org", "at": True}):
+            write(self.d / signin_watch.MARKER, bad)
+            self.assertIsNone(signin_watch.codex_identity(str(self.d))[2], bad)
+
+    def test_a_missing_or_malformed_marker_keeps_the_last_one(self):
+        write(self.d / "auth.json", codex_auth("acct-1", "a@x.org"))
+        w = signin_watch.SigninWatch([str(self.d / "auth.json"), str(self.d / signin_watch.MARKER)],
+                                     lambda: signin_watch.codex_identity(str(self.d)))
+        self.assertEqual(w.current(), ("acct-1", "a@x.org", ""))
+        write(self.d / signin_watch.MARKER, {"email": "b@x.org", "at": 1})
+        first = w.current()
+        self.assertEqual(first[2], "b@x.org|1")
+        write(self.d / signin_watch.MARKER, "{torn")
+        self.assertEqual(w.current(), first)
+        os.unlink(self.d / signin_watch.MARKER)
+        self.assertEqual(w.current(), first)
+        write(self.d / signin_watch.MARKER, {"email": "b@x.org", "at": 2})       # same email, new switch
+        self.assertNotEqual(w.current(), first)
+
+    def test_claude_reads_oauth_account_only(self):
+        f = self.d / ".claude.json"
+        write(f, claude_conf("u-1", "a@x.org"))
+        self.assertEqual(signin_watch.claude_identity(str(f), str(self.d)), ("u-1", "a@x.org", None))
+        write(f, {"projects": {}})
+        self.assertEqual(signin_watch.claude_identity(str(f), str(self.d)), signin_watch.SIGNED_OUT + (None,))
+        write(f, '{"oauthAccount": {"accountUu')       # caught mid-write
+        self.assertIsNone(signin_watch.claude_identity(str(f), str(self.d)))
+
+
+# ── Codex ────────────────────────────────────────────────────────────────────
+
+class Server:
+    """The app-server, as far as the sign-in check talks to it: `account/read` names its account."""
+
+    def __init__(self, email):
+        self.email, self.events, self.p = email, None, types.SimpleNamespace(pid=1)
+
+    def request(self, method, params=None, timeout=120):
+        assert method == "account/read", method
+        return {"account": {"type": "chatgpt", "email": self.email}}
+
+    def notify(self, method, params=None):
+        pass
+
+    def close(self):
+        pass
+
+
+class CodexRestart(unittest.TestCase):
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.home = Path(d.name)
+        write(self.home / "auth.json", codex_auth("acct-1", "a@x.org"))
+        self.servers = []
+
+        def factory():
+            # A new server signs in with whatever auth.json holds when it starts.
+            now = signin_watch.codex_identity(str(self.home)) or ("", "")
+            self.servers.append(Server(now[1]))
+            return self.servers[-1]
+
+        args = cc.build_parser().parse_args(["--work", str(self.home / "w")])
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home)}):
+            self.c = cc.Connector(factory, args, note="n")
+        self.c.handshake = lambda: None
+        self.restarts = mock.patch.object(self.c, "replace_server", wraps=self.c.replace_server).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def test_an_account_switch_restarts_the_server_exactly_once(self):
+        self.assertFalse(self.c.signin_check())
+        write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))      # the desktop switched account
+        self.assertTrue(self.c.signin_check())
+        self.assertEqual(self.servers[-1].email, "b@x.org", "the new server is on the new account")
+        for _ in range(3):
+            self.assertFalse(self.c.signin_check())
+        self.assertEqual(self.restarts.call_count, 1)
+
+    def test_the_check_runs_between_turns_in_serve_so_the_next_task_meets_the_new_account(self):
+        order = []
+        self.c.signin_check = lambda: order.append("check") or False
+        self.c.pending_tasks = lambda seen: order.append("tasks") or []
+        self.c.args.idle_exit, self.c.args.poll = 0.0001, 0.0001
+        self.c.args.state, self.c.args.bridge_state = str(self.home / "state"), None
+        os.makedirs(self.c.args.state)
+        self.c.rpc.events = __import__("queue").Queue()
+        with mock.patch.object(cc.connector_cards, "absorb"), mock.patch.object(type(self.c), "accounts",
+                                                                                  mock.PropertyMock()):
+            self.c.serve()
+        self.assertEqual(order[:2], ["check", "tasks"])
+
+    def test_a_switch_marker_restarts_once_unless_the_server_is_already_on_it(self):
+        # The desktop swapped auth.json and wrote its marker: the old server still answers the old email.
+        write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
+        write(self.home / signin_watch.MARKER, {"email": "b@x.org", "at": 1})
+        self.assertTrue(self.c.signin_check())
+        self.assertFalse(self.c.signin_check())
+        # A marker rewritten while the server already runs on that account: kept.
+        write(self.home / signin_watch.MARKER, {"email": "b@x.org", "at": 2})
+        self.assertFalse(self.c.signin_check())
+        self.assertFalse(self.c.signin_check())
+        self.assertEqual(self.restarts.call_count, 1)
+
+    def test_the_same_account_restarts_nothing(self):
+        write(self.home / "auth.json", codex_auth("acct-1", "a@x.org"))       # rewritten (a token refresh)
+        for _ in range(3):
+            self.assertFalse(self.c.signin_check())
+        self.restarts.assert_not_called()
+
+    def test_an_unreadable_file_restarts_nothing(self):
+        write(self.home / "auth.json", "{torn")
+        self.assertFalse(self.c.signin_check())
+        os.unlink(self.home / "auth.json")
+        os.mkdir(self.home / "auth.json")                    # not a regular file: refused, not read
+        self.assertFalse(self.c.signin_check())
+        self.restarts.assert_not_called()
+
+    def test_a_sign_in_the_server_made_itself_is_moved_to_like_any_other(self):
+        """The card's own sign-in: the server wrote auth.json and says it is on that email. Neither is taken
+        as proof it runs on what the file holds now (the file can change again at once), so it is replaced."""
+        write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
+        self.servers[-1].email = "b@x.org"
+        with mock.patch.object(type(self.c), "accounts", mock.PropertyMock()):
+            self.c.login_over({"loginId": "l-1", "success": True})
+        self.assertTrue(self.c.signin_check())
+        self.assertFalse(self.c.signin_check())
+        self.assertEqual(self.restarts.call_count, 1)
+
+    def test_a_second_switch_while_the_new_server_starts_is_not_lost(self):
+        """Reviewer, ea50b768: A -> B -> C. The replacement started on B, the file changed to C during
+        `initialize`, and C was recorded as what the server runs on: the move to C never happened."""
+        for during in ("the spawn", "initialize", "the old server's close"):
+            with self.subTest(during=during):
+                write(self.home / "auth.json", codex_auth("acct-1", "a@x.org"))
+                while self.c.signin_check():
+                    pass                                         # settled on A
+                spawn, flipped = self.c.rpc_factory, []
+
+                def to_c():
+                    if not flipped:
+                        flipped.append(1)
+                        write(self.home / "auth.json", codex_auth("acct-3", "c@x.org"))
+
+                def factory():
+                    server = spawn()                             # it read B
+                    if during == "the spawn":
+                        to_c()
+                    if during == "the old server's close":
+                        self.c.rpc.close = to_c
+                    return server
+
+                self.c.rpc_factory = factory
+                self.c.handshake = to_c if during == "initialize" else (lambda: None)
+                write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
+                self.assertTrue(self.c.signin_check())
+                self.assertEqual(self.servers[-1].email, "b@x.org", "the replacement is on B")
+                self.assertNotEqual(self.c.signin_started, signin_watch.fingerprint(self.c.signin.current()),
+                                    "C is not recorded as what it runs on")
+                self.assertTrue(self.c.signin_check(), "the next check moves on to C")
+                self.assertEqual(self.servers[-1].email, "c@x.org")
+                self.assertFalse(self.c.signin_check())
+                self.c.rpc_factory, self.c.handshake = spawn, (lambda: None)
+
+    def test_two_switches_between_two_checks_end_on_the_last(self):
+        write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
+        write(self.home / "auth.json", codex_auth("acct-3", "c@x.org"))
+        self.assertTrue(self.c.signin_check())
+        self.assertEqual((self.servers[-1].email, self.restarts.call_count), ("c@x.org", 1))
+        self.assertFalse(self.c.signin_check())
+
+    def test_a_server_started_while_the_file_could_not_be_read_is_replaced_once_it_can_be(self):
+        """What it started on is unknown, so the account the file names later is never taken for its own."""
+        write(self.home / "auth.json", "{torn")
+        self.c.restart_server()                                  # a crash restart, mid-write
+        self.assertIsNone(self.c.signin_started)
+        self.assertFalse(self.c.signin_check(), "still unreadable: nothing to act on")
+        write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
+        self.assertTrue(self.c.signin_check())
+        self.assertEqual(self.servers[-1].email, "b@x.org")
+        self.assertFalse(self.c.signin_check())
+
+    def test_a_crash_restart_records_what_was_read_before_the_spawn(self):
+        spawn = self.c.rpc_factory
+
+        def factory():
+            server = spawn()                                     # it read A
+            write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
+            return server
+
+        self.c.rpc_factory = factory
+        self.c.restart_server()
+        self.c.rpc_factory = spawn
+        self.assertEqual(self.servers[-1].email, "a@x.org")
+        self.assertTrue(self.c.signin_check(), "B arrived after the spawn: still a change")
+        self.assertEqual(self.servers[-1].email, "b@x.org")
+
+    def test_another_account_with_the_same_email_restarts_the_server(self):
+        """Reviewer, 47209797: a different account id under the same email (another workspace of one
+        sign-in, switched outside the server) skipped the restart on the email alone, and the baseline
+        moved, so the old server kept the old login for good."""
+        write(self.home / "auth.json", codex_auth("acct-2", "a@x.org"))
+        self.assertEqual(self.servers[-1].email, "a@x.org", "the old server answers the very same email")
+        self.assertTrue(self.c.signin_check())
+        self.assertEqual((self.restarts.call_count, len(self.servers)), (1, 2))
+        self.assertFalse(self.c.signin_check())
+        # The same through the desktop's marker, and back again.
+        write(self.home / "auth.json", codex_auth("acct-1", "a@x.org"))
+        write(self.home / signin_watch.MARKER, {"email": "a@x.org", "at": 5})
+        self.assertTrue(self.c.signin_check())
+        self.assertEqual(self.restarts.call_count, 2)
+
+    def test_a_restart_that_fails_is_tried_again_and_never_stops_task_service(self):
+        """Second reviewer: serve() called the check outside its guard, so a failed restart ended the connector."""
+        write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
+        self.restarts.side_effect = RuntimeError("codex did not start")
+        with self.assertRaises(RuntimeError):
+            self.c.signin_check()
+        order = []
+        self.c.pending_tasks = lambda seen: order.append("tasks") or []
+        self.c.args.idle_exit, self.c.args.poll = 0.0001, 0.0001
+        self.c.args.state, self.c.args.bridge_state = str(self.home / "state"), None
+        os.makedirs(self.c.args.state)
+        self.c.rpc.events = __import__("queue").Queue()
+        logs = []
+        with mock.patch.object(cc.connector_cards, "absorb"), mock.patch.object(cc, "log", lambda *a: logs.append(a)), \
+                mock.patch.object(type(self.c), "accounts", mock.PropertyMock()):
+            self.c.serve()                                   # returns on idle-exit; the failure did not escape
+            self.c.serve()                                   # the next polls fail the same way
+        self.assertIn("tasks", order, "tasks are still looked for")
+        self.assertEqual(sum(a[0].startswith("sign-in check failed") for a in logs), 1, "said once, not on every poll")
+        self.assertGreaterEqual(self.restarts.call_count, 3, "and the restart is tried again")
+        self.restarts.side_effect = None
+        self.assertTrue(self.c.signin_check(), "once it can start, it restarts on the new account")
+
+    def test_the_running_server_is_kept_until_the_new_one_has_answered(self):
+        """Reviewer, 2a02e558: the old server was closed before the new one was made, so a new one that
+        could not start left a closed server to take the next task."""
+        closed = []
+        old = self.c.rpc
+        old.close = lambda: closed.append("old")
+        write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
+        for broken in ("the factory", "the handshake"):
+            made = []
+
+            def factory(broken=broken, made=made):
+                if broken == "the factory":
+                    raise OSError("codex did not start")
+                made.append(Server("b@x.org"))
+                made[-1].close = lambda: closed.append("new")
+                return made[-1]
+
+            def handshake():
+                if self.c.rpc is not old:
+                    raise RuntimeError("no answer to initialize")
+
+            self.c.rpc_factory, self.c.handshake = factory, handshake
+            with self.subTest(broken), self.assertRaises((OSError, RuntimeError)):
+                self.c.signin_check()
+            self.assertIs(self.c.rpc, old, "still the running server")
+            self.assertNotIn("old", closed)
+            self.assertEqual(closed.count("new"), len(made), "a server that never answered is closed")
+            closed.clear()
+        # Once a new one answers, it takes over and only then is the old one closed.
+        order = []
+        self.c.rpc_factory = lambda: order.append("made") or Server("b@x.org")
+        self.c.handshake = lambda: order.append("answered")
+        old.close = lambda: order.append("old closed")
+        self.assertTrue(self.c.signin_check())
+        self.assertEqual(order, ["made", "answered", "old closed"])
+        self.assertIsNot(self.c.rpc, old)
+        self.assertFalse(self.c.signin_check())
+        # An old server that will not close does not undo the move.
+        write(self.home / "auth.json", codex_auth("acct-3", "c@x.org"))
+        self.c.rpc.close = mock.Mock(side_effect=OSError("already gone"))
+        self.assertTrue(self.c.signin_check())
+
+    def test_the_shared_daemon_is_never_restarted(self):
+        self.c.args.server = "proxy"
+        write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
+        self.assertFalse(self.c.signin_check())
+        self.restarts.assert_not_called()
+
+
+# ── Claude Code ──────────────────────────────────────────────────────────────
+
+GEN = {"nonce": "a" * 32, "pane_pid": 7, "session_id": "$1", "session_created": 5, "pane_id": "%1"}
+CONSUMER = {"pid": 11, "start": "s"}
+# The usage-limit menu as Claude Code draws it, under the turn that hit the limit.
+LIMIT = ("> summarize the thread\n"
+         "  \u23bf  You've hit your weekly limit \u00b7 resets Nov 28 at 1pm\n"
+         "\n"
+         " What do you want to do?\n"
+         "\n"
+         " \u276f 1. Stop and wait for limit to reset\n"
+         "   2. Wait here, then continue automatically at Nov 28 at 1pm\n"
+         "   3. Switch to usage credits\n"
+         "\n"
+         " Enter to confirm \u00b7 Esc to cancel\n")
+
+
+RULE = "\u2500" * 40
+
+
+def box(*rows):
+    """Claude Code's input box as it is on screen: a rule, the prompt row and any draft rows, a rule, the footer."""
+    first, rest = (rows + ("",))[0], rows[1:]
+    return "\n".join([RULE, "\u276f " + first, *rest, RULE, "  \u23f5\u23f5 bypass permissions on"])
+
+
+STRAY_OPTION = "\u23fa Your options:\n  1. Stop and wait for limit to reset\n"     # prose that reads like a row
+
+
+class LimitMenu(unittest.TestCase):
+    def test_only_the_whole_menu_at_the_foot_of_the_pane_is_the_menu(self):
+        self.assertTrue(launcher.limit_menu(LIMIT))
+        two = (" What do you want to do?\n   1. Stop and wait for limit to reset\n \u276f 2. Switch to extra usage\n"
+               " Enter to confirm \u00b7 Esc to cancel")
+        self.assertTrue(launcher.limit_menu(two), "two options, the selector on the second")
+        rows = LIMIT.splitlines()
+        for why, pane in (
+                ("nothing", ""), ("nothing", None), ("an empty box", box()),
+                ("one stray row over an empty box", STRAY_OPTION + box()),
+                ("one stray row at the very foot", STRAY_OPTION.rstrip("\n")),
+                ("every row, as prose over an empty box", "\n".join(rows[3:8]) + "\n" + box()),
+                ("words about a limit", "\u23fa The usage limit resets at 3pm; wait for limit to reset.\n" + box()),
+                ("no question above the rows", "\n".join(rows[4:])),
+                ("no key hint below them", "\n".join(rows[:8])),
+                ("one row only", "\n".join(rows[:6] + rows[8:])),
+                ("no selector", LIMIT.replace("\u276f", " ")),
+                ("two selectors", LIMIT.replace("   2.", " \u276f 2.")),
+                ("rows out of order", LIMIT.replace("3. Switch", "4. Switch")),
+                ("another dialog's rows", LIMIT.replace("Stop and wait for limit to reset", "Yes, proceed")),
+                ("the menu scrolled away", LIMIT + "\n".join("line %d" % i for i in range(launcher.LIMIT_MENU_LINES)))):
+            with self.subTest(why):
+                self.assertFalse(launcher.limit_menu(pane))
+
+
+class ClaudeRestart(unittest.TestCase):
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.conf = Path(d.name) / ".claude.json"
+        write(self.conf, claude_conf("u-1", "a@x.org"))
+        lc = launcher.Launcher.__new__(launcher.Launcher)
+        lc.logs, lc.now, lc.stops, lc.keys, lc.pane = [], 1000.0, [], [], box()
+        lc.log, lc.sleep, lc.clock = lc.logs.append, lambda s: None, lambda: lc.now
+        lc.tm = types.SimpleNamespace(capture=lambda pane_id, styled=False: lc.pane, sock="/s", tmux="tmux")
+        self.marker = Path(d.name) / signin_watch.MARKER
+        lc.signin = signin_watch.SigninWatch([str(self.conf), str(self.marker)],
+                                             lambda: signin_watch.claude_identity(str(self.conf), d.name))
+        lc.signin_next, lc.signin_waiting, lc.observation = 0.0, False, {"task": None}
+        lc.rec = {"generation": GEN, "title_token": "tok", "consumer": CONSUMER}
+        lc.rec["signin"] = lc.signin_mark(CONSUMER)        # what create() records
+
+        def with_record(mutate):
+            lc.rec = mutate(lc.rec) or lc.rec
+            return lc.rec
+        lc._with_record = with_record
+        lc.stop_session = lambda rec, why: lc.stops.append(why) or "stopped"
+        self.after_escape = box()        # what the pane shows once the limit menu is dismissed
+
+        def send_keys(gen, title, *names):
+            lc.keys.append(names)
+            if names == ("Escape",):
+                lc.pane = self.after_escape
+            return 0
+        lc.send_keys = send_keys
+        self.lc = lc
+
+    def check(self):
+        self.lc.now += launcher.SIGNIN_CHECK_S
+        restarted, self.lc.rec = self.lc.signin_check(self.lc.rec)
+        return restarted
+
+    def test_an_account_switch_restarts_once_after_the_turn(self):
+        lc = self.lc
+        lc.observation = {"task": "task-1"}                  # a turn is running
+        write(self.conf, claude_conf("u-2", "b@x.org"))
+        self.assertFalse(self.check())
+        self.assertFalse(self.check())
+        self.assertEqual(lc.stops, [], "never in the middle of a turn")
+        self.assertEqual(sum("once the current turn ends" in l for l in lc.logs), 1)
+        lc.observation = {"task": None}                      # the turn ended
+        self.assertTrue(self.check())
+        self.assertEqual(len(lc.stops), 1)
+        self.assertIsNone(lc.rec["generation"], "the next tick creates the new session")
+        # The new session (create() marks it) runs on the new account: nothing more.
+        lc.rec = dict(lc.rec, generation=GEN, consumer={"pid": 12, "start": "t"})
+        lc.rec["signin"] = lc.signin_mark(lc.rec["consumer"])
+        for _ in range(3):
+            self.assertFalse(self.check())
+        self.assertEqual(len(lc.stops), 1)
+
+    def test_a_keychain_only_switch_restarts_once_through_the_marker(self):
+        # The desktop changed only the Keychain item: .claude.json keeps the old email, the marker moves.
+        lc = self.lc
+        lc.observation = {"task": "task-1"}
+        write(self.marker, {"email": "b@x.org", "at": 1})
+        self.assertFalse(self.check())
+        lc.observation = {"task": None}
+        self.assertTrue(self.check())
+        self.assertEqual(len(lc.stops), 1)
+        lc.rec = dict(lc.rec, generation=GEN, consumer={"pid": 12, "start": "t"})
+        lc.rec["signin"] = lc.signin_mark(lc.rec["consumer"])
+        for _ in range(3):
+            self.assertFalse(self.check())
+        self.assertEqual(len(lc.stops), 1)
+
+    def test_a_marker_seen_after_the_desktop_restarted_claude_restarts_nothing(self):
+        lc = self.lc
+        write(self.marker, {"email": "b@x.org", "at": 1})
+        lc.rec = dict(lc.rec, consumer={"pid": 13, "start": "u"})      # already restarted on the new account
+        self.assertFalse(self.check())
+        self.assertFalse(self.check())
+        self.assertEqual(lc.stops, [])
+
+    def test_a_usage_limit_menu_is_dismissed_and_does_not_wait_for_the_turn(self):
+        lc = self.lc
+        lc.observation, lc.pane = {"task": "task-1"}, LIMIT  # the turn is stuck behind the limit
+        write(self.conf, claude_conf("u-2", "b@x.org"))
+        self.assertTrue(self.check())
+        self.assertEqual((lc.keys, len(lc.stops)), ([("Escape",)], 1))
+
+    def test_words_about_a_usage_limit_on_screen_never_stop_a_running_turn(self):
+        """Reviewer, 47209797: ordinary pane text containing "usage limit" read as the limit screen, and
+        the session was stopped in the middle of a task."""
+        lc = self.lc
+        lc.observation = {"task": "task-1"}
+        lc.pane = "\u23fa You asked about the usage limit: it resets weekly. You've hit your limit on retries.\n" + box()
+        write(self.conf, claude_conf("u-2", "b@x.org"))
+        self.assertFalse(self.check())
+        self.assertFalse(self.check())
+        self.assertEqual((lc.keys, lc.stops), ([], []), "no key and no stop while the turn runs")
+        lc.observation = {"task": None}
+        self.assertTrue(self.check())
+        self.assertEqual((lc.keys, len(lc.stops)), ([], 1), "after the turn, and with no Escape: there was no menu")
+
+    def test_one_line_that_reads_like_a_menu_option_never_stops_a_running_turn(self):
+        """Reviewer, 2a02e558: one ordinary numbered line matching a quota option near the foot of the
+        pane, over an empty input box, was enough to press Escape and stop an active task."""
+        lc = self.lc
+        lc.observation = {"task": "task-1"}
+        write(self.conf, claude_conf("u-2", "b@x.org"))
+        for pane in (STRAY_OPTION + box(), "  1. Wait for limit to reset\n  2. Switch to usage credits\n" + box(),
+                     "\n".join(LIMIT.splitlines()[3:8]) + "\n" + box()):
+            lc.pane = pane
+            self.assertFalse(self.check())
+        self.assertEqual((lc.keys, lc.stops), ([], []), "no Escape, no stop: the turn is running")
+        self.assertEqual(sum("once the current turn ends" in l for l in lc.logs), 1)
+
+    def test_an_unsent_draft_is_never_typed_over(self):
+        """Reviewer, 47209797: with no task running the stop typed /exit and Enter over the owner's draft."""
+        lc = self.lc
+        write(self.conf, claude_conf("u-2", "b@x.org"))
+        for shown in (box("half a message"), box("", "  a second line"), "\u276f ", ""):
+            lc.pane = shown
+            self.assertFalse(self.check(), shown)
+        self.assertEqual((lc.keys, lc.stops), ([], []), "nothing is sent into a box that holds text or cannot be read")
+        self.assertEqual(sum("input box is empty and readable" in l for l in lc.logs), 1, "said once")
+        self.assertIsNotNone(lc.rec["generation"])
+        lc.pane = box()                                      # the owner sent or cleared it
+        self.assertTrue(self.check())
+        self.assertEqual(len(lc.stops), 1)
+
+    def test_a_draft_under_the_dismissed_limit_menu_holds_the_restart_too(self):
+        lc = self.lc
+        lc.observation, lc.pane, self.after_escape = {"task": "task-1"}, LIMIT, box("my unsent words")
+        write(self.conf, claude_conf("u-2", "b@x.org"))
+        self.assertFalse(self.check())
+        self.assertEqual((lc.keys, lc.stops), ([("Escape",)], []), "the menu is dismissed, the draft is left alone")
+
+    def test_a_card_raised_for_the_stuck_session_does_not_hold_the_restart_back(self):
+        # The limit menu left up is a stall and raises a card; with one pending the account switch never restarted.
+        lc, retired = self.lc, []
+        lc.retire_card = lambda: retired.append(1)
+        lc.observation, lc.pane = {"task": "task-1"}, LIMIT
+        lc.rec["hitl"] = {"id": "hitl-1", "store_root": "/store"}
+        self.assertFalse(self.check())
+        self.assertEqual((lc.stops, retired), ([], []), "the same account: the card stays, nothing restarts")
+        write(self.conf, claude_conf("u-2", "b@x.org"))
+        self.assertTrue(self.check())
+        self.assertEqual((lc.keys, len(lc.stops), retired), ([("Escape",)], 1, [1]))
+
+    def test_the_same_account_restarts_nothing(self):
+        write(self.conf, dict(claude_conf("u-1", "a@x.org"), numStartups=9))   # the CLI rewrote its config
+        for _ in range(3):
+            self.assertFalse(self.check())
+        self.assertEqual(self.lc.stops, [])
+
+    def test_an_unreadable_file_restarts_nothing(self):
+        write(self.conf, '{"oauthAccount": {"accountUuid": "u-2", "emailAdd')
+        self.assertFalse(self.check())
+        os.unlink(self.conf)
+        os.mkdir(self.conf)                                  # not a regular file: refused, not read
+        self.assertFalse(self.check())
+        self.assertEqual(self.lc.stops, [])
+
+    def test_a_consumer_already_restarted_elsewhere_is_marked_not_restarted(self):
+        # The desktop restarted claude on the new account: a consumer this mark was not made for.
+        lc = self.lc
+        write(self.conf, claude_conf("u-2", "b@x.org"))
+        lc.rec = dict(lc.rec, consumer={"pid": 13, "start": "u"})
+        self.assertFalse(self.check())
+        self.assertFalse(self.check())
+        self.assertEqual(lc.stops, [])
+        self.assertEqual(lc.rec["signin"]["consumer"], {"pid": 13, "start": "u"})
+
+    def test_a_failed_stop_is_retried_and_counts_once(self):
+        lc = self.lc
+        busy = "busy: another pane-key sender holds the guard"
+        outcomes = iter([busy, busy, busy, "stopped"])
+        lc.stop_session = lambda rec, why: lc.stops.append(why) or next(outcomes)
+        write(self.conf, claude_conf("u-2", "b@x.org"))
+        for _ in range(3):
+            self.assertFalse(self.check())
+        self.assertIsNotNone(lc.rec["generation"])
+        self.assertEqual(sum("restart not done" in l for l in lc.logs), 1, "said once, not every check")
+        self.assertTrue(self.check())
+        self.assertEqual(len(lc.stops), 4)
+
+
+if __name__ == "__main__":
+    unittest.main()

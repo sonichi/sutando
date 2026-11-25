@@ -31,7 +31,7 @@ import threading
 import time
 import uuid
 
-from ... import account_switch, card_desk, connector_cards, held_start, live_view, model_switch, quota_notice
+from ... import account_switch, card_desk, connector_cards, held_start, live_view, model_switch, quota_notice, signin_watch
 from ...acp_host import quoted
 from ...collaborator_turn import TIER_BLOCK_END, TIER_BLOCK_HEADER, TIER_REWRITES, stage_own_attachments, with_staged_paths
 from ...relay_loop import count_arg
@@ -206,26 +206,9 @@ def unauthorized(error) -> bool:
     return error_info(error, UNAUTHORIZED_INFO)
 
 
-def auth_file() -> str:
-    """The login file of the Codex home the app-server is started with (child_env's CODEX_HOME, else ~/.codex)."""
-    home = os.environ.get("CODEX_HOME") or os.path.join(os.environ.get("HOME") or os.path.expanduser("~"), ".codex")
-    return os.path.join(home, "auth.json")
-
-
-def auth_print(path=None):
-    """What identifies the login on disk, without opening it: the file it resolves to and that file's inode,
-    size and mtime; None when there is none (signed out). A sign-in, an API key set or a logout changes it."""
-    path = path or auth_file()
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    return os.path.realpath(path), st.st_ino, st.st_size, st.st_mtime_ns
-
-
-def shared_login(path=None) -> bool:
+def shared_login(home=None) -> bool:
     """Whether the login file is a link to another home's (a desktop install shares the core's login)."""
-    return os.path.islink(path or auth_file())
+    return os.path.islink(os.path.join(home or signin_watch.codex_home(), signin_watch.CODEX_AUTH))
 
 
 def limit_reset(snapshot, now=None) -> "float | None":
@@ -407,9 +390,20 @@ def wrap_untrusted(task_id, headers, message, operator_lines=(), note=NON_OWNER_
     )
 
 
+SIGNIN_SETTLE_TRIES = 3   # replacements one dispatch (or one idle poll) may make
+
+
 class Connector:
     def __init__(self, rpc_factory, args, note=None):
         self.rpc_factory = rpc_factory
+        # The sign-in each server starts with is read before it is spawned (a fingerprint; None when
+        # auth.json could not be read): a change it may not have seen is then never taken for its own.
+        home = signin_watch.codex_home()
+        self.signin = signin_watch.SigninWatch(
+            [os.path.join(home, signin_watch.CODEX_AUTH), os.path.join(home, signin_watch.MARKER)],
+            lambda: signin_watch.codex_identity(home))
+        self.signin_started, self.signin_account = self.signin_mark()
+        self.signin_failed = ""   # why the last restart for a changed sign-in failed ('' when none did)
         self.rpc = rpc_factory()
         self.args = args
         self.note = note if note is not None else non_owner_note()
@@ -431,10 +425,7 @@ class Connector:
         # The current turn's error when it said the account is out of usage, or its login no longer works.
         self.turn_limit = self.turn_unauth = None
         self.turn_worked = False
-        # A sign-in finished: the running server may still hold the tokens it started with.
-        self.auth_stale = False
-        self.auth_seen = auth_print()
-        self.auth_note = ""
+        self.auth_note = ""       # what was done about the login for the current task, for its metrics row
 
     @property
     def root(self):
@@ -515,14 +506,11 @@ class Connector:
         return {"id": res["loginId"], "url": res["authUrl"]}
 
     def login_over(self, params):
-        """The server said a sign-in ended (`account/login/completed`): the account card tells the owner. One
-        that took leaves the running server on the tokens it started with, so it is restarted before the
-        next turn (fresh_auth)."""
+        """The server said a sign-in ended (`account/login/completed`): the account card tells the owner. The
+        server is moved to the new account by the sign-in check (signin_settle), not here."""
         note = SHARED_LOGIN if shared_login() else ""
         outcome = self.accounts.finished(params.get("loginId"), bool(params.get("success")), params.get("error") or "",
                                          note=note)
-        if outcome == "account-switched":
-            self.auth_stale = True
         if outcome:
             log("account ->", outcome + (" (login shared with the core)" if note else ""))
 
@@ -534,35 +522,6 @@ class Connector:
             self.login_over(m.get("params") or {})
         elif m.get("method") == "account/rateLimits/updated":
             self.saw_rate_limits(m.get("params") or {})
-
-    def fresh_auth(self) -> str:
-        """Before a turn: the server runs on the login on disk. Events already queued are read first (a
-        sign-in that finished while a card was answered); after a sign-in, or when the login file changed
-        (an API key set, a logout, a sign-in elsewhere), the server is restarted so it reads it again.
-        Not while a sign-in is in progress on it, which a restart would end; nor the shared daemon
-        (--server proxy), which is not ours to restart."""
-        while True:
-            try:
-                m = self.rpc.events.get_nowait()
-            except queue.Empty:
-                break
-            if m is None:                  # the server is gone: the turn finds out, and restarts it
-                self.rpc.events.put(None)
-                break
-            self.idle_event(m)
-        why = "a sign-in finished" if self.auth_stale else ("the login file changed" if auth_print() != self.auth_seen
-                                                            else "")
-        if not why:
-            return ""
-        if getattr(self.args, "server", "stdio") == "proxy":
-            self.auth_stale, self.auth_seen = False, auth_print()
-            return ""
-        if self.accounts.pending():
-            return "deferred"              # looked at again before the next turn
-        log("login changed (%s); restarting app-server before the turn" % why)
-        self.auth_stale = False
-        self.restart_server()
-        return "reloaded"
 
     def list_models(self) -> bool:
         """Ask the server which models it offers (`model/list`), for the card; False when it would not say."""
@@ -789,11 +748,95 @@ class Connector:
         """Replace the app-server process; owner threads are re-resumed on next use."""
         log("restarting app-server; old pid", self.rpc.p.pid)
         self.rpc.close()
+        started = self.signin_mark()         # read before the spawn: what the new server can at least see
         self.rpc = self.rpc_factory()
-        self.auth_seen = auth_print()
         self.live = {}
         self.thread_id = None
+        self.signin_started, self.signin_account = started
         self.handshake()
+
+    def replace_server(self):
+        """Start a new app-server and move to it only once it has answered: until then, and when it
+        cannot be started, the running one keeps serving tasks. Then the old one is closed. The sign-in
+        recorded for the new server is the one read before it was spawned, never one read afterwards:
+        an account switched while it starts is then still a change, and the next check acts on it."""
+        old = self.rpc
+        log("starting a new app-server for the changed sign-in; old pid", old.p.pid)
+        started = self.signin_mark()
+        new = self.rpc_factory()
+        self.rpc = new
+        try:
+            self.handshake()
+        except BaseException:
+            self.rpc = old
+            try:
+                new.close()
+            except Exception:  # noqa: BLE001 - it never served; the failure that matters is raised below
+                pass
+            raise
+        self.live = {}
+        self.thread_id = None
+        self.signin_started, self.signin_account = started
+        try:
+            old.close()
+        except Exception as e:  # noqa: BLE001 - the new server serves; the old one is only left to exit
+            log("the old app-server did not close cleanly:", type(e).__name__)
+
+    def signin_mark(self):
+        """(the fingerprint of the sign-in now in auth.json, the fingerprint of its account alone: the
+        account id and email, without the switch marker); (None, None) when it cannot be read."""
+        now = self.signin.current()
+        if now is None:
+            return None, None
+        return signin_watch.fingerprint(now), signin_watch.fingerprint(now[:2])
+
+    def signin_stale(self) -> bool:
+        """Whether auth.json now names another account than the one the serving server was started on.
+        An unreadable file changes nothing now; the shared daemon (proxy) is not ours to restart. The
+        server is current only when the file is what was read before it was spawned, or the account
+        itself (its id and email) is that one and just the switch marker moved. Nothing else vouches
+        for it: not its email (another account or workspace can carry the same one), not a sign-in of
+        its own (the file may have changed again since); a server started while the file could not be
+        read is stale once it can be."""
+        if self.args.server == "proxy":
+            return False
+        now = self.signin.current()
+        if now is None:
+            return False
+        mark, account = signin_watch.fingerprint(now), signin_watch.fingerprint(now[:2])
+        if mark == self.signin_started:
+            return False
+        if now[0] and self.signin_account is not None and account == self.signin_account:
+            self.signin_started = mark
+            return False
+        return True
+
+    def signin_check(self) -> bool:
+        """Move to a new server when the serving one is stale (signin_stale); True when it did. Raises
+        with the old server still serving when the new one cannot start; the next check tries again."""
+        if not self.signin_stale():
+            return False
+        if not self.signin_failed:
+            log("sign-in changed in auth.json; restarting Codex on the new account")
+        self.replace_server()
+        self.signin_failed = ""
+        return True
+
+    def signin_settle(self, tries: int = SIGNIN_SETTLE_TRIES) -> int:
+        """Bring the serving server onto the sign-in now on disk, replacing it again while the file keeps
+        changing under a starting server, `tries` times at most; the replacements made. Never raises: a
+        replacement that fails is said once per reason and tried again later, and the running server
+        serves."""
+        made = 0
+        try:
+            while made < tries and self.signin_check():
+                made += 1
+        except Exception as e:  # noqa: BLE001 - task service goes on, on the server that runs
+            why = "%s: %s" % (type(e).__name__, e)
+            if why != self.signin_failed:
+                log("sign-in check failed; the running server keeps serving, and it is tried again:", why)
+            self.signin_failed = why
+        return made
 
     def wait_turn(self, turn_id, timeout):
         """Consume events until this turn completes; returns (status, text, error) or None
@@ -896,25 +939,19 @@ class Connector:
     def run_task(self, headers, prompt, caps=None):
         """One task end to end: pick its thread, run the turn, recover from a dead server
         (durable: retry once on the resumed thread; ephemeral: fail plainly), retry an empty reply once. The
-        server runs on the login on disk (fresh_auth). A turn refused as unauthorized before it said or did
-        anything restarts the server and is tried once more; one that had started work is never run again."""
+        server runs on the sign-in on disk (open_turn). A turn still refused as unauthorized before it said or
+        did anything restarts the server and is tried once more; one that had started work is never run again."""
         caps = caps or capabilities(headers)    # the gate's decision, when the caller has it
         durable = caps.session == "durable"
         self.turn_limit = self.turn_unauth = None
-        self.auth_note = self.fresh_auth()
+        self.auth_note = ""
         for attempt in (1, 2):
             try:
-                self.open_for(headers, caps)
+                turn_prompt = self.open_turn(headers, caps, prompt)
             except IntegrationsUnknown as e:
                 return "failed", "", "the configured integrations could not be read to switch them off (%s)" % e
             except Unconfined as e:
                 return "failed", "", "the turn could not be confined to its own folder (%s)" % e
-            self.last_thread = self.thread_id
-            turn_prompt = prompt
-            if caps.workspace == "isolated":
-                # The turn reads its own folder only: this task's own attachments are copied into it.
-                staged = stage_own_attachments(headers, self.scratch_cwd, getattr(self.args, "media_root", None))
-                turn_prompt = with_staged_paths(prompt, staged)
             status, text, err = self.run_turn(turn_prompt, self.turn_model(caps), self.turn_cwd(caps))
             if status == "server-exited":
                 self.restart_server()
@@ -923,13 +960,14 @@ class Connector:
                 return status, "", "Codex stopped before answering" + ("" if durable else "; not retried for a non-owner task")
             if status != "completed" and self.turn_unauth is not None:
                 own = getattr(self.args, "server", "stdio") != "proxy"
-                if attempt == 1 and own and not self.turn_worked and not self.accounts.pending():
-                    log("turn refused as unauthorized; restarting app-server on the login on disk, retrying once")
+                if attempt == 1 and own and not self.accounts.pending():
+                    # Same account, tokens rotated under the server: it reads the login again. Only a turn
+                    # that had not started is sent again.
+                    log("turn refused as unauthorized; restarting app-server on the login on disk")
                     self.restart_server()
                     self.auth_note = "restarted-unauthorized"
-                    continue
-                # No restart was tried for a turn that had started: the next turn gets one first.
-                self.auth_stale = own and attempt == 1
+                    if not self.turn_worked:
+                        continue
                 return status, text, err
             if status == "completed" and not (text or "").strip() and attempt == 1:
                 log("empty reply; retrying once")
@@ -951,6 +989,35 @@ class Connector:
                 log("signed-out card not shown:", "%s: %s" % (type(e).__name__, str(e)[:200]))
         self.card_answer(result_path, quoted(SIGNED_OUT_ELSEWHERE).rstrip("\n") + "\n")
         return "signed-out"
+
+    def open_turn(self, headers, caps, prompt) -> str:
+        """Make a turn ready to send, and return its prompt. This is the one place a turn is dispatched
+        from, for the first server, a replaced one and one restarted after a crash, and it holds one
+        guarantee: the prompt is sent on a server started on the sign-in that is on disk when it is sent.
+        The sign-in is read again as the last step, after the thread is open (opening one is a round trip
+        to the server, and the account can change during it); a change there replaces the server and
+        opens the thread again on the new one. Nothing was sent on the thread left behind, and it ends
+        with the server that held it. What is left is the instant between that last read of the file and
+        the write of `turn/start` to the server's pipe.
+
+        Two exceptions, both said in the log, serve on the last server that works rather than hold the
+        task: a replacement that cannot start (the running server serves), and a sign-in that changes
+        again under each new server until SIGNIN_SETTLE_TRIES replacements were made for this dispatch."""
+        left = SIGNIN_SETTLE_TRIES      # replacements this one dispatch may make, however they fall
+        while True:
+            left -= self.signin_settle(left)
+            self.open_for(headers, caps)
+            self.last_thread = self.thread_id
+            turn_prompt = prompt
+            if caps.workspace == "isolated":
+                # The turn reads its own folder only: this task's own attachments are copied into it.
+                staged = stage_own_attachments(headers, self.scratch_cwd, getattr(self.args, "media_root", None))
+                turn_prompt = with_staged_paths(prompt, staged)
+            if not self.signin_stale() or self.signin_failed:
+                return turn_prompt      # current; or the replacement cannot start and the running server serves
+            if left <= 0:
+                log("sign-in kept changing while the turn was made ready; sending on the last server started")
+                return turn_prompt
 
     def result_body(self, status, text, err):
         if status == "completed":
@@ -988,6 +1055,7 @@ class Connector:
                 self.quota.tick()
             except Exception as e:  # noqa: BLE001
                 log("card upkeep failed:", "%s: %s" % (type(e).__name__, e))
+            self.signin_settle()        # here no turn runs: an idle agent moves to the new account too
             names = self.pending_tasks(seen)
             if not names:
                 if self.args.once and done >= self.args.once:
