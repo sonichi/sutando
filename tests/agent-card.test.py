@@ -607,6 +607,20 @@ class Issued(unittest.TestCase):
         self.assertTrue(issued_cards.record(self.ws, "$c", self.card, room=DM, now=1006.0))
         self.assertEqual(cards(), ["$c"])
 
+    def test_an_edit_replaces_what_its_event_shows_even_after_that_event_was_settled(self):
+        cards = lambda: sorted(json.loads(issued_cards.ledger_path(self.ws).read_text())["cards"])
+        done = a_card(state="done")[1]
+        issued_cards.record(self.ws, "$a", self.card, room=DM, now=1000.0)
+        # Edited to a card with no buttons: the buttons it replaced stop acting, and a replay cannot revive them.
+        self.assertFalse(issued_cards.record(self.ws, "$a", done, room=DM, now=1001.0, edited=True))
+        self.assertEqual(cards(), [])
+        self.forged(reply_to_event="$a", now=1001.5)
+        self.assertFalse(issued_cards.record(self.ws, "$a", self.card, room=DM, now=1002.0), "a replay is no edit")
+        # Edited again, to a card with buttons: they act at that same event.
+        self.assertTrue(issued_cards.record(self.ws, "$a", self.card, room=DM, now=1003.0, edited=True))
+        self.assertEqual(cards(), ["$a"])
+        self.assertIsNotNone(issued_cards.live(self.ws, "$a", now=1004.0))
+
     def test_a_card_meant_before_a_live_one_of_its_id_is_retired_not_recorded(self):
         cards = lambda: sorted(json.loads(issued_cards.ledger_path(self.ws).read_text())["cards"])
         first = issued_cards.intend(self.ws, "op-a", now=1000.0)

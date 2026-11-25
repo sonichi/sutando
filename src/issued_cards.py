@@ -106,11 +106,13 @@ def intend(workspace: Path, operation_id: str, *, now: Optional[float] = None) -
 
 def record(workspace: Path, event_id: str, card: Mapping[str, object], *, room: str = "", lane: str = "",
            handler: str = "", now: Optional[float] = None, ttl_s: float = TTL_S,
-           issued_at: Optional[float] = None) -> bool:
+           issued_at: Optional[float] = None, edited: bool = False) -> bool:
     """Remember that this agent posted `card` as `event_id` in `room` on connection `lane`; `handler` is
     the script that runs its commands. Older records of the same card id in that room are dropped; a card
-    issued before a live one of its id (`issued_at`, from intend()) is retired instead. False when the
-    card offers no reply to remember, or was not kept."""
+    issued before a live one of its id (`issued_at`, from intend()) is retired instead. With `edited`,
+    `card` is what `event_id` shows now (an accepted edit of a card this agent posted there): that event's
+    earlier record, live or retired, gives way to it. False when the card offers no reply to remember, or
+    was not kept."""
     if not (isinstance(event_id, str) and event_id.startswith("$")):
         return False
     payloads, picker, card_id = offered(card), has_picker(card), str(card.get("id") or "")
@@ -124,7 +126,12 @@ def record(workspace: Path, event_id: str, card: Mapping[str, object], *, room: 
         retired = _retired(path, now)
         # An event the platform hands back for a retried send is no newer card: a superseded or settled one
         # stays retired (a settled card's buttons never act twice), and a live one replaces nothing.
-        if event_id in retired:
+        if edited:
+            was = live_cards.pop(event_id, None)
+            retired.pop(event_id, None)
+            if not (payloads or picker):    # the edit has no buttons: the ones it replaced never act again
+                retired[event_id] = {"why": "settled", "expires_at": _retire_until(was, now)}
+        elif event_id in retired:
             return False
         cards = dict(live_cards)
         order = now if issued_at is None else float(issued_at)
