@@ -1494,8 +1494,9 @@ class EdgePathTest(unittest.TestCase):
             return names
 
         def dispatched(connector, *a, **k):
+            on_disk = signin_watch.codex_identity(home)
             turns.append((made.index(connector.rpc) + 1, connector.signin_started,
-                          signin_watch.fingerprint(signin_watch.codex_identity(home))))
+                          signin_watch.fingerprint(on_disk) if on_disk is not None else None))
             return run_turn(connector, *a, **k)
 
         with mock.patch.dict(os.environ, {"CODEX_HOME": home}), mock.patch.object(cc, "Rpc", rpc), \
@@ -1654,7 +1655,7 @@ class EdgePathTest(unittest.TestCase):
         c.open_for = lambda headers, caps: order.append("thread")
         c.turn_model = lambda caps: order.append("model") or "m"
         c.turn_cwd = lambda caps: order.append("cwd") or "/w"
-        c.signin_stale = lambda: order.append("sign-in read") or False
+        c.signin_ready = lambda: order.append("sign-in read") or cc.CURRENT
         c.run_turn = lambda prompt, model, cwd: order.append(("send", prompt, model, cwd)) or ("completed", "ok", None)
         headers = {"access_tier": "owner", "channel_id": "!dm:s.space", "channel_kind": "dm"}
         self.assertEqual(c.run_task(headers, "the prompt", task_io.OWNER_CAPABILITIES), ("completed", "ok", None))
@@ -1662,9 +1663,22 @@ class EdgePathTest(unittest.TestCase):
                                  ("send", "the prompt", "m", "/w")])
         # Stale and not to be had: nothing is opened and nothing is sent.
         del order[:]
-        c.signin_stale = lambda: order.append("sign-in read") or True
+        c.signin_ready = lambda: order.append("sign-in read") or cc.STALE
         self.assertEqual(c.run_task(headers, "the prompt", task_io.OWNER_CAPABILITIES)[0], cc.NOT_READY)
         self.assertEqual(order, ["settle", "sign-in read"])
+        # Unreadable after a switch: the same, as a wait while it is fresh and as a told result once it is not.
+        c.signin_ready = lambda: cc.UNKNOWN
+        c.signin_unknown_since = time.time()
+        self.assertEqual(c.run_task(headers, "the prompt", task_io.OWNER_CAPABILITIES)[0], cc.WAITING)
+        c.signin_unknown_since = time.time() - cc.SIGNIN_UNKNOWN_SAY_S - 1
+        self.assertEqual(c.run_task(headers, "the prompt", task_io.OWNER_CAPABILITIES)[0], cc.NOT_READY)
+        # It turns unreadable, or stale past the bound, after the thread was opened: still nothing is sent.
+        for last, want in ((cc.UNKNOWN, cc.NOT_READY), (cc.STALE, cc.NOT_READY)):
+            reads = iter([cc.CURRENT] + [last] * 9)
+            c.signin_ready = lambda: next(reads)
+            del order[:]
+            self.assertEqual(c.run_task(headers, "the prompt", task_io.OWNER_CAPABILITIES)[0], want)
+            self.assertFalse([o for o in order if isinstance(o, tuple)], "no send")
 
     def test_a_replacement_that_cannot_start_while_the_thread_opens_sends_nothing(self):
         for tier in ("owner", "guest"):
@@ -1714,6 +1728,73 @@ class EdgePathTest(unittest.TestCase):
             self.assertEqual(turns[0][0], 1)
             self.assertEqual(turns[1][0], 3, "not the restarted server, which started on the earlier sign-in")
             self.assert_every_turn_ran_on_the_sign_in_on_disk(turns)
+
+    def test_an_unreadable_sign_in_after_a_switch_holds_the_task_until_a_read_matches(self):
+        """Code-owner review of 5336fa91: once a switch was seen, an unreadable read made the server
+        look ready again, released waiting work and let a turn through. Unreadable is unknown, never a
+        match: the task waits unanswered, and is served only after a clean read matches the server."""
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
+            self.signed_in(home, "acct-1")
+            at = {"torn": False, "polls": 0}
+            answered_while_torn = []
+
+            def script(event, n):
+                if (event, n) == ("initialized", 1):
+                    self.signed_in(home, "acct-2")           # the switch, seen at the first poll
+                if (event, n) == ("spawned", 2):
+                    (Path(home) / "auth.json").write_text('{"tokens": {"account_id": "ac')   # mid-write
+                    at["torn"] = True
+                if event == "polled" and at["torn"]:
+                    at["polls"] += 1
+                    answered_while_torn.append(os.path.exists(os.path.join(d, "results", "task-chat-1.txt")))
+                    if at["polls"] == 4:
+                        self.signed_in(home, "acct-2")       # the write ends: the account the replacement read
+                        at["torn"] = False
+
+            write_task(d, "task-chat-1", "held, then answered")
+            with mock.patch.object(cc, "SIGNIN_UNKNOWN_WAIT_S", 0.0):
+                rc, turns, logged = self.signin_world(d, home, script)
+            self.assertEqual((rc, at["polls"]), (0, 4), "it was polled four times while the file could not be read")
+            self.assertEqual(answered_while_torn, [False] * 4, "no result while it waited, and none said to send again")
+            self.assertEqual(len(turns), 1, "sent once, after the file read again")
+            self.assertEqual(turns[0][0], 2, "on the replacement, never on the server of the earlier account")
+            self.assert_every_turn_ran_on_the_sign_in_on_disk(turns)
+            self.assertTrue(result(d, "task-chat-1").startswith("STUB echo:"))
+            self.assertEqual(len([l for l in logged if "cannot be read after an account change" in l]), 1)
+
+    def test_after_a_replacement_a_clean_read_confirmed_an_unreadable_read_is_ordinary_again(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
+            self.signed_in(home, "acct-1")
+
+            def script(event, n):
+                if (event, n) == ("initialized", 1):
+                    self.signed_in(home, "acct-2")
+                if (event, n) == ("thread", 1):              # the replacement was read as a match before this
+                    (Path(home) / "auth.json").write_text("{torn")
+
+            write_task(d, "task-chat-1", "ordinary work on the new account")
+            with mock.patch.object(cc, "SIGNIN_UNKNOWN_WAIT_S", 0.0):
+                rc, turns, _ = self.signin_world(d, home, script)
+            self.assertEqual((rc, [t[0] for t in turns]), (0, [2]), "served on the confirmed replacement")
+
+    def test_an_unreadable_sign_in_with_no_switch_seen_does_not_stall_ordinary_work(self):
+        """A read that fails while nothing has changed (the file caught mid-write with the same content,
+        or never readable yet) is no evidence of a switch: the task is served on the running server."""
+        for name, start in (("mid-write later", "acct-1"), ("never readable yet", None)):
+            with self.subTest(name), tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
+                if start:
+                    self.signed_in(home, start)
+                else:
+                    (Path(home) / "auth.json").write_text("")
+
+                def script(event, n, home=home):
+                    if (event, n) == ("initialized", 1):
+                        (Path(home) / "auth.json").write_text("{torn")
+
+                write_task(d, "task-chat-1", "ordinary work")
+                rc, turns, _ = self.signin_world(d, home, script)
+                self.assertEqual((rc, [t[0] for t in turns]), (0, [1]))
+                self.assertTrue(result(d, "task-chat-1").startswith("STUB echo:"))
 
     def test_a_sign_in_that_never_settles_sends_nothing_and_says_so_once(self):
         with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:

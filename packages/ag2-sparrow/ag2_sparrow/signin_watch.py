@@ -60,12 +60,13 @@ def _with_marker(identity, config_dir: str):
 
 
 def _load(path: str, limit: int):
-    """The file's JSON object, {} when it is absent, None when it cannot be read as one."""
+    """The file's JSON object, {} when it is absent, None when it cannot be read as one: refused, not
+    JSON, not an object, or there but empty (a file caught between its truncation and its write)."""
     text, why = read_regular(path, limit)
     if text is None:
         return {} if not why else None
     try:
-        data = json.loads(text) if text.strip() else {}
+        data = json.loads(text) if text.strip() else None
     except ValueError:
         return None
     return data if isinstance(data, dict) else None
