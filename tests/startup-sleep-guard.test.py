@@ -1,53 +1,57 @@
 #!/usr/bin/env python3
-"""Pin startup.sh's sleep-guard check: only a caffeinate holding -s satisfies it.
+"""Pin the sleep-guard match startup.sh relies on: only a long-lived caffeinate holding -s counts.
 
-A bare `pgrep -q caffeinate` was satisfied by the short `caffeinate -i -t 300`
-processes worker sessions spawn, so startup skipped the -s guard and a lid-closed
-Mac on AC really slept once they exited. This test uses the REAL pattern line
-from src/startup.sh, both against argv strings and against live processes it
+A bare `pgrep -q caffeinate` was satisfied by short `caffeinate -i -t 300` processes, so startup
+skipped the -s guard and a lid-closed Mac on AC slept once they exited. A `-s` caffeinate with
+`-t`, `-w` or a wrapped command also ends by itself, so it must not count either. Uses the real
+src/sleep_guard.py (which startup.sh calls), against argv strings and against live processes it
 spawns itself (matched by pid, so other caffeinates on the host do not count).
 """
 import pathlib
-import re
 import shutil
 import subprocess
 import sys
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 STARTUP = REPO / "src" / "startup.sh"
+sys.path.insert(0, str(REPO / "src"))
+import sleep_guard  # noqa: E402
 
 
-def _pattern() -> str:
-    lines = [ln.strip() for ln in STARTUP.read_text().splitlines()
-             if ln.strip().startswith("SLEEP_GUARD_PATTERN=")]
-    assert len(lines) == 1, f"expected one SLEEP_GUARD_PATTERN line in src/startup.sh, found {len(lines)}"
-    out = subprocess.run(["bash", "-c", f'{lines[0]}; printf %s "$SLEEP_GUARD_PATTERN"'],
-                         capture_output=True, text=True, check=True)
-    return out.stdout
-
-
-def _argv_cases(pat: str) -> list[str]:
-    rx = re.compile(pat)
-    held = ["caffeinate -s", "caffeinate -d -i -s", "caffeinate -dims", "/usr/bin/caffeinate -s -w 123",
-            "caffeinate -s -t 30"]
-    not_held = ["caffeinate -i -t 300", "caffeinate -d", "caffeinate -i", "caffeinate", "mycaffeinate -s",
-                "grep caffeinate -s"]
-    fails = [f"should hold: {a!r}" for a in held if not rx.search(a)]
-    fails += [f"should NOT hold: {a!r}" for a in not_held if rx.search(a)]
+def _startup_delegates() -> list[str]:
+    text = STARTUP.read_text()
+    fails = []
+    if 'src/sleep_guard.py" ensure' not in text:
+        fails.append("src/startup.sh no longer calls sleep_guard.py ensure")
+    if "caffeinate" in text:
+        fails.append("src/startup.sh names caffeinate itself instead of leaving it to sleep_guard.py")
     return fails
 
 
-def _live_cases(pat: str) -> list[str]:
+def _argv_cases() -> list[str]:
+    held = ["caffeinate -s", "caffeinate -d -i -s", "caffeinate -dims", "/usr/bin/caffeinate -s", "caffeinate -dis"]
+    not_held = ["caffeinate -i -t 300", "caffeinate -d", "caffeinate -i", "caffeinate", "mycaffeinate -s",
+                "grep caffeinate -s", "caffeinate -s -t 30", "/usr/bin/caffeinate -s -w 123",
+                "caffeinate -i -s make build", "caffeinate make -s", "caffeinate -st 60"]
+    fails = [f"should hold: {a!r}" for a in held if not sleep_guard.holds(a)]
+    fails += [f"should NOT hold: {a!r}" for a in not_held if sleep_guard.holds(a)]
+    return fails
+
+
+def _live_cases() -> list[str]:
     if sys.platform != "darwin" or not shutil.which("caffeinate"):
         print("skip live cases: no caffeinate on this host")
         return []
+    from sutando_platform import process_snapshot
     fails = []
-    for args, expect in ((["-i", "-t", "20"], False), (["-s", "-t", "20"], True)):
+    for args, expect in ((["-i", "-t", "20"], False), (["-s", "-t", "20"], False), (["-s"], True)):
         p = subprocess.Popen(["caffeinate", *args])
         try:
-            listed = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True).stdout.split()
-            if (str(p.pid) in listed) != expect:
-                fails.append(f"live caffeinate {' '.join(args)}: matched={str(p.pid) in listed}, want {expect}")
+            rows = [r.split(None, 2) for r in (process_snapshot() or "").splitlines()]
+            mine = [r[2] for r in rows if len(r) == 3 and r[0] == str(p.pid)]
+            got = bool(mine) and sleep_guard.holds(mine[0])
+            if got != expect:
+                fails.append(f"live caffeinate {' '.join(args)}: held={got}, want {expect}")
         finally:
             p.terminate()
             p.wait()
@@ -55,8 +59,7 @@ def _live_cases(pat: str) -> list[str]:
 
 
 def main() -> int:
-    pat = _pattern()
-    fails = _argv_cases(pat) + _live_cases(pat)
+    fails = _startup_delegates() + _argv_cases() + _live_cases()
     for f in fails:
         print("FAIL", f)
     print("all passed" if not fails else f"{len(fails)} failed")
