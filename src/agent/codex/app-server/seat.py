@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import queue
@@ -219,14 +220,14 @@ def auth_file() -> str:
 
 
 def auth_print(path: Optional[str] = None) -> Optional[tuple]:
-    """What identifies the login on disk now (the file it resolves to, its inode, size and mtime), never its
-    contents; None when there is none. A sign-in, an account switch, an API key set or a logout changes it."""
+    """What identifies the login on disk now (the file it resolves to and a digest of its bytes), never its
+    contents; None when there is none. A new login changes it; the same login rewritten does not."""
     path = path or auth_file()
     try:
-        st = os.stat(path)
+        data = Path(path).read_bytes()
     except OSError:
         return None
-    return os.path.realpath(path), st.st_ino, st.st_size, st.st_mtime_ns
+    return os.path.realpath(path), hashlib.sha256(data).hexdigest()
 
 
 def one_line(text, limit: int = 160) -> str:
@@ -329,6 +330,7 @@ class Seat:
         self.host, self.workspace, self.seat, self.worker = host, Path(workspace), seat, worker
         # `-c` before the subcommand: the desktop app counts a core alive only when the program
         # it reads up to the first flag is `codex`, and `codex app-server -c` reads as `codex app-server`.
+        self.codex = codex
         self.argv = [codex, *[a for c in (config or []) for a in ("-c", c)], "app-server",
                      "--listen", "stdio://"]
         self.model, self.sandbox, self.instructions = model, sandbox, instructions
@@ -366,7 +368,8 @@ class Seat:
         self.told_model_missing: List[str] = []  # the owner's tasks already shown the model card
         self.told_signed_out: Optional[tuple] = None  # the login the owner was last shown the card for
         self.told_limit = False  # the owner was shown a limit card this episode
-        self.health_auth: Optional[tuple] = None  # the login on disk when the core's health went bad
+        self.health_auth: Optional[tuple] = None  # the login on disk when the core's health went bad, or last re-checked
+        self.health_bad: Optional[str] = None  # the core's bad health state ("signed_out", "quota"), else None
         # Shows the owner the core's account card when its login is refused even after a restart.
         self.card_argv = [sys.executable, str(ACCOUNT_CARD), "--workspace", str(self.workspace), "post",
                           "--signed-out"]
@@ -453,10 +456,10 @@ class Seat:
             account = core_account_health.codex_email(auth_file())
             if state == "ok":
                 changed = core_account_health.mark_ok(self.workspace, "codex", account, log=log)
-                self.health_auth = None
+                self.health_auth, self.health_bad = None, None
             else:
                 changed = core_account_health.mark(self.workspace, state, "codex", account, resets_at, log=log)
-                self.health_auth = auth_print()
+                self.health_auth, self.health_bad = auth_print(), state
         except Exception as e:  # noqa: BLE001 - advisory: the record never stops the seat
             log(f"account health not kept ({type(e).__name__})")
             return
@@ -467,9 +470,8 @@ class Seat:
 
     def back_signed_in(self, account: str) -> None:
         """Back to ok after the owner was shown a sign-in or limit card: they are told it worked, so that
-        card's red line is not the last word (VM 2026-11-24 06:25: signed in and answered, the card
-        still said 'Sign-in expired' and the old usage limit). Once per recovery; never when no card
-        was shown (a first start, a recovery nobody was told about)."""
+        card's red line is not the last word. Once per recovery; never when no card was shown (a first
+        start, a recovery nobody was told about)."""
         if not (self.told_signed_out is not None or getattr(self, "told_limit", False)):
             return
         self.told_signed_out = None
@@ -480,11 +482,30 @@ class Seat:
         log(f"account health: back to ok; the owner was told ({model})")
 
     def health_auth_check(self) -> None:
-        """The login on disk changed since the health went bad (a sign-in or account switch): back to ok,
-        without waiting for a task. The next turn says otherwise if the new login is refused too."""
-        if self.health_auth is not None and auth_print() != self.health_auth:
+        """A new login on disk since the health went bad is re-checked once, never taken as proof: signed
+        out, back to ok only when Codex's own account read names a signed-in account; a limit, only when a
+        turn completes. No login on disk is not signed in."""
+        if self.health_bad is None:
+            return
+        now = auth_print()
+        if now == self.health_auth:
+            return
+        self.health_auth = now
+        if now is None:
+            return
+        self.release_limit_hold()
+        if self.health_bad == "signed_out" and self.signed_in_confirmed():
             self.health("ok")
-            self.release_limit_hold()
+
+    def signed_in_confirmed(self) -> bool:
+        """Codex itself (account/read) names a signed-in account for the login on disk; never raises."""
+        try:
+            import codex_account
+            acct = codex_account.read(Path(auth_file()).parent, self.codex)
+        except Exception as e:  # noqa: BLE001 - no answer is no proof
+            log(f"account read failed ({type(e).__name__})")
+            return False
+        return bool(acct and acct.get("kind") and acct.get("verified"))
 
     def release_limit_hold(self) -> None:
         """A sign-in or account switch on the core: a limit hold seen under the old login no longer

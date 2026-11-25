@@ -220,6 +220,9 @@ for line in sys.stdin:
             out({"id": rid, "result": models})
         else:
             out({"id": rid, "result": {"data": models, "nextCursor": None}})
+    elif method == "account/read":
+        signed_in = TOKEN and not revoked() and not TOKEN.startswith("unreadable")
+        out({"id": rid, "result": {"account": {"type": "chatgpt", "email": "owner@example.com"} if signed_in else None}})
     elif method == "turn/interrupt":
         if os.path.exists(os.path.join(D, "die-on-interrupt")):
             os._exit(8)
@@ -1049,8 +1052,7 @@ class AccountSwitch(SeatCase):
         self.assertEqual(health(self.ws)["state"], "ok")
         self.assertIn("account health: ok", self.out.getvalue())
 
-    def test_back_signed_in_the_owner_is_told_once_after_the_card(self):
-        """VM 2026-11-24 06:25: signed in and answered, but the card's 'Sign-in expired' was the last word."""
+    def signed_out_after_the_card(self):
         self.sign_in("tok-a", revoke="tok-a")
         self.task("task-1.txt")
         s = self.make(retry_s=3600, max_attempts=3)
@@ -1058,15 +1060,59 @@ class AccountSwitch(SeatCase):
         s.ensure_server()
         self.assertEqual(s.step(), seat_mod.UNAUTHORIZED)
         self.assertIsNotNone(s.told_signed_out, "the card was shown")
-        self.assertEqual(list(self.results.glob("proactive-model-signed-in-*.txt")), [])
+        return s
+
+    def signed_in_notices(self):
+        return list(self.results.glob("proactive-model-signed-in-*.txt"))
+
+    def test_back_signed_in_the_owner_is_told_once_after_the_card(self):
+        """Signed in again after the card: told once, only after Codex's own account read confirms it."""
+        s = self.signed_out_after_the_card()
+        self.assertEqual(self.signed_in_notices(), [])
         self.sign_in("tok-b")
         s.health_auth_check()
-        notice, = self.results.glob("proactive-model-signed-in-*.txt")
+        notice, = self.signed_in_notices()
         self.assertIn("Signed in as", notice.read_text())
         self.assertIn("I'm back on gpt-5.6-terra.", notice.read_text())
+        s.health_auth_check()
         s.health("quota")
         s.health("ok")                         # a recovery nobody was shown a card for: no notice
-        self.assertEqual(len(list(self.results.glob("proactive-model-signed-in-*.txt"))), 1)
+        self.assertEqual(len(self.signed_in_notices()), 1)
+
+    def test_a_deleted_login_after_the_card_is_not_signed_in(self):
+        s = self.signed_out_after_the_card()
+        (self.codex_home / "auth.json").unlink()
+        s.health_auth_check()
+        self.assertEqual(self.signed_in_notices(), [])
+        self.assertEqual(health(self.ws)["state"], "signed_out")
+        self.sign_in("unreadable-login")       # a new file Codex names no account for
+        s.health_auth_check()
+        self.assertEqual(self.signed_in_notices(), [])
+        self.assertEqual(health(self.ws)["state"], "signed_out")
+
+    def test_the_same_login_rewritten_while_limited_is_no_recovery(self):
+        import core_limit_hold
+        held = {"status": "held", "kind": "usage-limit", "model": None, "evidence_at": 1, "set_at": 1,
+                "until": 4102444800, "strikes": 1, "reason": "paused"}
+        core_limit_hold._write_hold(self.ws, held)
+        self.sign_in("tok-a")
+        self.plan("limit")
+        self.task("task-1.txt")
+        s = self.make(retry_s=3600, max_attempts=3)
+        s.model = "gpt-5.6-terra"
+        s.ensure_server()
+        s.step()
+        self.assertEqual(health(self.ws)["state"], "quota")
+        s.told_limit = True                    # the owner saw the limit card
+        starts = self.starts()
+        self.sign_in("tok-a")                  # the same token written again
+        s.health_auth_check()
+        s.fresh_auth()
+        self.assertEqual(self.signed_in_notices(), [])
+        self.assertEqual(health(self.ws)["state"], "quota")
+        self.assertEqual(core_limit_hold.read_hold(self.ws)["status"], "held", "the hold was lifted")
+        self.assertEqual(self.starts(), starts, "the app-server was restarted on the same login")
+        self.assertNotIn("login changed on disk", self.out.getvalue())
 
     def test_back_after_a_limit_card_the_owner_is_told(self):
         s = self.make()
