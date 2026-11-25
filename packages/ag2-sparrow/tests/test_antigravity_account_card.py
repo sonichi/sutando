@@ -130,6 +130,24 @@ class AccountCardTest(unittest.TestCase):
             self.assertEqual([b["label"] for b in card["buttons"]], ["Switch account", "Use API key"], ask)
         self.assertEqual(self.prompts(), [], "asking for the card never reaches agy")
 
+    def test_asking_which_account_shows_the_card_and_a_card_that_cannot_be_built_is_said_once_in_words(self):
+        for n, ask in enumerate(("agy account, can you see it?", "which account are you using?", "你用的哪个账号")):
+            self.dm("task-w%d" % n, ask)
+            self.serve()
+            self.assertEqual(self.w.result("task-w%d" % n), account_switch.ANSWERED, ask)
+            self.assertEqual(len(self.posted("$w%d" % n)), 1, ask)
+        # The ask goes through the card desk, as every card's does: a card the rules refuse to build is
+        # answered once in words, and the task is not failed or handed to agy.
+        with mock.patch.object(agy_account.AgyAccount, "offer", side_effect=ValueError("a name the card rules refuse")):
+            self.dm("task-refused", "which account are you using?")
+            self.serve()
+        self.assertIn("I could not show the account card", self.w.result("task-refused"))
+        self.assertEqual(self.posted("$none"), [])
+        # Another account is agy's to answer.
+        self.dm("task-other", "create an account on github")
+        self.serve()
+        self.assertEqual(len(self.prompts()), 1, "only that one reached agy")
+
     def test_the_card_is_english_and_carries_the_marker_for_the_in_card_controls(self):
         card = self.menu()
         self.assertEqual(card["account_controls"], {"runtime": "antigravity", "agent": AGENT})
