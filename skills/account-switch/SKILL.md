@@ -23,7 +23,7 @@ that card leads with "Codex isn't signed in anymore." and offers the same switch
 `post --owner-dm --lead <words>` posts the same card, unasked, to the core's checked owner DM with
 `<words>` opening it: the core's quota notice (`src/core_quota_notice.py`) sends it once per usage
 limit, from the Codex seat and the Claude Code core's monitor, with `--retry` adding a Retry button
-that sends the owner's "retry now" (the limit hold acts on it). Never post it that way yourself.
+that sends the owner's "retry now" (the Claude core's limit hold acts on it; a Codex core's card has none). Never post it that way yourself.
 `--owner-dm` and leaving out `--room` go to the same DM; with `--signed-out`, `--lead` replaces the
 "isn't signed in anymore" line.
 

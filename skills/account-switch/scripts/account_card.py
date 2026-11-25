@@ -327,8 +327,8 @@ def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "",
     """(body, card): a "Use" button per other saved account (up to five), then "Add another account".
     `lead`, when given, opens the card's words and its fallback line. `signed_out`: the core's login was
     refused, so the card drops the account in use and, with no `lead`, opens with SIGNED_OUT. `retry`
-    (the quota card) adds a Retry button whose words are the owner's own "retry now", which the limit
-    hold already acts on."""
+    (the quota card) adds a Retry button whose words are the owner's own "retry now", which the Claude
+    core's limit hold acts on; a Codex core has no such hold, so its card carries none."""
     buttons = []
     for s in others[:USE_BUTTONS]:
         label = ("Use " + masked_label(s["label"]))[: ac.LIMITS["label"]]
@@ -336,7 +336,7 @@ def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "",
                                  command=ac.reply(KIND, TARGET, s["key"])))
     buttons.append(ac.button("Add another account", "reply", style="primary", reply="Add another account",
                              command=ac.reply(KIND, TARGET, ADD)))
-    if retry:
+    if retry and cur["runtime"] != "codex":
         buttons.append(ac.button("Retry", "reply", style="secondary", reply=RETRY_WORDS))
     if signed_out:
         lead = lead or SIGNED_OUT

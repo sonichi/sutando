@@ -246,19 +246,21 @@ class CodexCard(Base):
         self.assertNotIn("Retry", [b["label"] for b in card["buttons"]])
         # The desktop draws the core's own account controls (saved accounts, Add account…) in it.
         self.assertEqual(card["account_controls"], {"runtime": "codex", "core": True})
-        # A signed-out core says so in the marker: the client leads with "Sign in again" (owner 2026-11-24).
+        # A signed-out core says so in the marker: the client leads with "Sign in again".
         out_card = acc.menu_card({"runtime": "codex", "signed_in": False, "shown": "", "key": ""}, [],
                                  signed_out=True)[1]
         self.assertEqual(out_card["account_controls"], {"runtime": "codex", "core": True, "signed_out": True})
-        acc_card = acc.menu_card({"runtime": "codex", "signed_in": True, "shown": "alice@example.com", "key": ""},
-                                 [], lead, retry=True)[1]
-        retry = [b for b in acc_card["buttons"] if b["label"] == "Retry"]
-        self.assertEqual(len(retry), 1)
-        self.assertEqual((retry[0]["reply"], retry[0].get("command")), ("retry now", None))
+        # Only the Claude core's limit hold acts on "retry now": a Codex core's card offers no Retry.
+        for runtime, offered in (("claude", 1), ("codex", 0)):
+            acc_card = acc.menu_card({"runtime": runtime, "signed_in": True, "shown": "alice@example.com",
+                                      "key": ""}, [], lead, retry=True)[1]
+            retry = [b for b in acc_card["buttons"] if b["label"] == "Retry"]
+            self.assertEqual(len(retry), offered, runtime)
+            self.assertEqual([(b["reply"], b.get("command")) for b in retry], [("retry now", None)] * offered)
         rc, out = self.run_(["post", "--owner-dm", "--retry", "--lead", lead])
         self.assertEqual((rc, out["status"]), (0, "posted"))
         self.assertIsNone(ac.problem(self.fake.cards()[-1]))
-        self.assertIn("Retry", [b["label"] for b in self.fake.cards()[-1]["buttons"]])
+        self.assertNotIn("Retry", [b["label"] for b in self.fake.cards()[-1]["buttons"]])
         self.assertTrue(self.fake.calls[0][1]["body"].startswith(lead))
         self.assertEqual(card["buttons"][-1]["label"], "Add another account")
 
