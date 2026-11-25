@@ -201,6 +201,88 @@ class Edges(Base):
         self.assertEqual(json.loads(self.runtime_json.read_text()), {"coreRuntime": "codex"})
         self.assertEqual(sorted(p.name for p in self.runtime_json.parent.iterdir()), ["engine", "runtime.json", "runtime.json.lock"])
 
+class ConcurrentWriter(Base):
+    """A writer that skips runtime.json.lock (the desktop's own) lands between the engine's read
+    and its replace: the engine re-reads and merges, so neither key is dropped."""
+
+    def external_write(self, path: Path, body: dict) -> None:
+        tmp = path.with_name(path.name + ".desktop")
+        tmp.write_text(json.dumps(body))
+        os.replace(tmp, path)
+
+    def interleave_once(self, path: Path, body: dict):
+        """_parse_json_object, with the external write made right after the engine's first read."""
+        real, done = sutando_config._parse_json_object, []
+
+        def parse(p, raw):
+            out = real(p, raw)
+            if not done:
+                done.append(1)
+                self.external_write(path, body)
+            return out
+        return patch.object(sutando_config, "_parse_json_object", side_effect=parse)
+
+    def test_a_desktop_write_between_read_and_replace_survives_the_engine_write(self):
+        self.runtime_json.write_text(json.dumps({"coreRuntime": "codex"}))
+        with self.interleave_once(self.runtime_json, {"coreRuntime": "codex", "corePath": "/x"}):
+            self.assertEqual(sutando_config.persist_codex_app_server(False, self.repo)[0], "updated")
+        self.assertEqual(json.loads(self.runtime_json.read_text()),
+                         {"coreRuntime": "codex", "corePath": "/x", "codexAppServer": False})
+
+    def test_a_desktop_toggle_between_read_and_replace_is_seen_by_the_runtime_switch(self):
+        self.runtime_json.write_text(json.dumps({"coreRuntime": "claude"}))
+        with self.interleave_once(self.runtime_json, {"coreRuntime": "claude", "codexAppServer": False}):
+            self.assertEqual(sutando_config.persist_desktop_runtime_selection("codex", self.repo), "updated")
+        self.assertEqual(json.loads(self.runtime_json.read_text()),
+                         {"coreRuntime": "codex", "codexAppServer": False})
+
+    def test_a_write_landing_inside_the_engines_merge_keeps_both_keys(self):
+        self.runtime_json.write_text(json.dumps({"coreRuntime": "codex"}))
+        calls = []
+
+        def mutate(body):
+            if not calls:
+                self.external_write(self.runtime_json, {"coreRuntime": "codex", "codexAppServer": False})
+            calls.append(dict(body))
+            body["corePath"] = "/x"
+            return True
+        self.assertEqual(sutando_config.update_desktop_runtime_json(self.runtime_json, mutate), "updated")
+        self.assertEqual(json.loads(self.runtime_json.read_text()),
+                         {"coreRuntime": "codex", "codexAppServer": False, "corePath": "/x"})
+        self.assertEqual(len(calls), 2, "the engine re-read the changed file and merged again")
+
+    def test_a_file_that_keeps_changing_is_refused_not_overwritten(self):
+        self.runtime_json.write_text(json.dumps({"coreRuntime": "codex"}))
+        n = [0]
+
+        def mutate(body):
+            n[0] += 1
+            self.external_write(self.runtime_json, {"coreRuntime": "codex", "n": n[0]})
+            body["codexAppServer"] = True
+            return True
+        with self.assertRaisesRegex(ValueError, "kept changing"):
+            sutando_config.update_desktop_runtime_json(self.runtime_json, mutate)
+        self.assertEqual(json.loads(self.runtime_json.read_text()), {"coreRuntime": "codex", "n": n[0]})
+        self.assertFalse([p for p in self.runtime_json.parent.iterdir() if ".tmp." in p.name])
+
+    def test_a_check_writes_nothing_not_even_the_lock_file(self):
+        self.runtime_json.write_text(json.dumps({"coreRuntime": "claude"}))
+        self.assertEqual(sutando_config.persist_desktop_runtime_selection("codex", self.repo, check=True),
+                         "would-update")
+        self.assertEqual(sorted(p.name for p in self.runtime_json.parent.iterdir()), ["engine", "runtime.json"])
+
+    def test_the_workspace_layer_is_written_under_its_lock_and_keeps_a_concurrent_key(self):
+        layer = self.workspace / "sutando.config.local.json"
+        self.layer({"core": {"runtime": "codex"}})
+        with patch.object(sutando_config, "desktop_runtime_selection_path", return_value=None), \
+                self.interleave_once(layer, {"core": {"runtime": "codex"}, "voice": {"on": True}}):
+            outcome, written = sutando_config.persist_codex_app_server(False, self.repo)
+        self.assertEqual((outcome, written.resolve()), ("updated", layer.resolve()))
+        self.assertEqual(json.loads(layer.read_text()),
+                         {"core": {"runtime": "codex", "codex_app_server": False}, "voice": {"on": True}})
+        self.assertTrue((self.workspace / "sutando.config.local.json.lock").exists())
+
+
 class Cli(unittest.TestCase):
     """The subcommands in a copied checkout, with no desktop: the workspace layer."""
 

@@ -120,6 +120,22 @@ _a = sd.mark_if_absent("x"); sd.clear_shutdown(); _b = sd.mark_if_absent("x")
 check("two stops with the same reason in the same second still differ", _a != _b)
 sd.clear_shutdown()
 
+# `token` names the stop in place now, so a launch can later lift exactly that one.
+check("token is empty with no stop in place", sd.current_token() == "")
+_out = io.StringIO()
+with contextlib.redirect_stdout(_out):
+    _rc = sd.main(["shutdown.py", "token"])
+check("main('token') with no stop prints nothing", _rc == 0 and _out.getvalue() == "")
+sd.mark_shutdown("in place at launch")
+_out = io.StringIO()
+with contextlib.redirect_stdout(_out):
+    sd.main(["shutdown.py", "token"])
+_at_launch = _out.getvalue().strip()
+check("main('token') prints the token clear-if accepts", _at_launch == sd._token(_tmp))
+sd.mark_shutdown("a drain written meanwhile")
+check("a drain written after the token was read survives clear-if", sd.clear_if(_at_launch) is False and sd.is_shutting_down())
+sd.clear_shutdown()
+
 print()
 if failures:
     print(f"FAIL — {len(failures)}: {failures}")

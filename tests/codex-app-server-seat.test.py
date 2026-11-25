@@ -373,6 +373,7 @@ class HandshakeAndThread(SeatCase):
         self.assertEqual(s.serve(once=True), seat_mod.EXIT_FATAL)
         self.assertEqual(len([r for r in self.sent() if "argv" in r]), 2)
         self.assertIn("FATAL", self.out.getvalue())
+        self.assertIn("codex-app-server-select off", self.out.getvalue(), "it names the way back to the TUI")
         self.assertEqual(list(task_dispatch.pending_candidates(self.tasks, self.results)), ["task-1.txt"])
 
     def test_a_server_that_dies_during_resume_is_a_start_failure_not_a_new_thread(self):
