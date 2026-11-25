@@ -70,6 +70,21 @@ B = auth("bob@work.io", "pro", "acct-b", SECRET_B)
 C = auth("carol@example.org", "team", "acct-c", SECRET_C)
 
 
+def worker_on_record(record: Path, alive: bool) -> None:
+    """The record's attempt, with a worker that still runs (this process) or one that has exited."""
+    import subprocess as sp
+    import holder_lock
+    if alive:
+        pid = os.getpid()
+    else:
+        proc = sp.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        pid = proc.pid
+    attempt = json.loads(record.read_text())["attempt"]
+    record.with_name(record.stem + ".worker.json").write_text(json.dumps(
+        {"attempt": attempt, "pid": pid, "start": holder_lock.start_time(os.getpid())}))
+
+
 def key_of(account_id: str) -> str:
     return hashlib.sha256(account_id.encode()).hexdigest()[:16]
 
@@ -104,10 +119,11 @@ class Launch:
 
 
 def codex_read_from(home_holder):
-    """codex_account.read as a stand-in: the account named by the home's auth.json, no app-server."""
+    """codex_account.read as a stand-in: Codex confirms the account the home's auth.json names."""
     def read(home):
         import codex_account
-        return codex_account.from_auth_file(home)
+        got = codex_account.from_auth_file(home)
+        return dict(got, verified=True) if got else got
     return read
 
 
@@ -371,6 +387,24 @@ class Taps(Base):
         self.assertEqual(self.fake.cards()[-1]["state"], "pending")
         self.assertEqual(self.live(), A, "nothing is swapped before the detached step")
 
+    def test_saved_accounts_that_mask_alike_get_a_button_each(self):
+        alike = {"acct-a1": auth("alma@example.net", "plus", "acct-a1", SECRET_C),
+                 "acct-a2": auth("adam@example.net", "plus", "acct-a2", SECRET_C)}
+        for text in alike.values():
+            self.keep(text)
+        self.post()
+        by_key = {b["command"].rsplit(":", 1)[1]: b["label"] for b in self.fake.cards()[-1]["buttons"]}
+        first, second = sorted(key_of(a) for a in alike)
+        self.assertEqual((by_key[first], by_key[second]), ("Use alma@example.net", "Use adam@example.net"))
+        for key in (first, second):
+            with self.subTest(key=key):
+                self.ws.joinpath(*acc.RUNNING).unlink(missing_ok=True)
+                rc, out = self.tap(by_key[key], event="$card2")
+                self.assertEqual((rc, out["status"]), (0, "started"), out)
+                argv = self.launch.calls[-1][0]
+                self.assertEqual(argv[argv.index("--key") + 1], key)
+                self.assertIn(by_key[key][len("Use "):], out["say"])
+
     def test_someone_else_or_another_room_starts_nothing(self):
         for kw in ({"user": "@guest:s.space", "tier": "guest"}, {"kind": "group", "room": ROOM}):
             rc, out = self.tap(self.use_b, **kw)
@@ -396,6 +430,19 @@ class Taps(Base):
         rc, out = self.tap(self.use_b)
         self.assertEqual(out["say"], acc.BUSY)
         self.assertEqual(len(self.launch.calls), 1)
+
+    def test_a_switch_whose_worker_died_no_longer_blocks_a_tap(self):
+        self.tap(self.use_b)
+        record = self.ws.joinpath(*acc.RUNNING)
+        worker_on_record(record, alive=True)
+        self.assertEqual(self.tap(self.use_b)[1]["say"], acc.BUSY, "a running worker still holds the switch")
+        worker_on_record(record, alive=False)
+        before = json.loads(record.read_text())["attempt"]
+        rc, out = self.tap(self.use_b)
+        self.assertEqual((rc, out["status"]), (0, "started"))
+        self.assertTrue(out["say"].startswith(acc.STOPPED + " I'm using alice@example.com."), out["say"])
+        self.assertIn("Switching the core to bob@work.io", out["say"])
+        self.assertNotEqual(json.loads(record.read_text())["attempt"], before, "the dead attempt's record is replaced")
 
 
 class Switch(Base):
@@ -640,7 +687,7 @@ class Edges(Base):
         (self.home / "auth.json").write_text("{}")
         with mock.patch.object(acc, "codex_home", side_effect=codex_account.NoHome("refused")), \
                 mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home)}), \
-                mock.patch.object(codex_account, "read", return_value={"kind": "chatgpt", "email": "a@example.com"}):
+                mock.patch.object(codex_account, "read", return_value={"kind": "chatgpt", "email": "a@example.com", "verified": True}):
             cur = acc.current("codex")
             self.assertEqual((cur["signed_in"], cur["shown"]), (True, "a@example.com"))
         with mock.patch.object(acc, "codex_home", side_effect=codex_account.NoHome("refused")), \

@@ -11,7 +11,7 @@ kept in the core's switch record instead (`model-switch.json` in the state folde
 - the core's app-server seat (`src/agent/codex/app-server/seat.py`, no `--worker`) launches on
   `working`, the last model Codex took, and passes a pending pick as `model` on a `turn/start`. It
   is `accepted` once Codex runs that turn and `rejected` when Codex refuses that model; any other
-  failure leaves it pending for the next turn.
+  failure leaves it pending for the next turn, and `unconfirmed` once the seat stops trying it.
 
 Pool workers read none of this: their model is their own.
 
@@ -44,6 +44,7 @@ _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
 _CLAUDE = re.compile(r"(default|opus|sonnet|haiku|fable|claude-.*)(\[1m\])?", re.I)
 APPLIED = ("next-turn", "next-start")
 LOCK = ".model-switch.lock"  # switch-model.sh holds the same lock while it saves
+NOT_TAKEN = ("rejected", "unconfirmed")  # settled without Codex taking it: the core stays on `working`
 
 
 def valid(name: str) -> bool:
@@ -107,7 +108,7 @@ def current(state_dir) -> str:
     """The model the Codex core is to use, '' for none: the last pick, or, once Codex refused it,
     the last model Codex took."""
     rec = read_record(state_dir)
-    if rec.get("status") == "rejected":
+    if rec.get("status") in NOT_TAKEN:
         return working(rec)
     return rec.get("model") or ""
 
@@ -121,7 +122,7 @@ def launch(state_dir) -> tuple:
     """(rev, model, working) read in one go: the pick a TUI launch takes, and the last model Codex
     took, which a seat launches on while a pick is still pending."""
     rec = read_record(state_dir)
-    model = working(rec) if rec.get("status") == "rejected" else (rec.get("model") or "")
+    model = working(rec) if rec.get("status") in NOT_TAKEN else (rec.get("model") or "")
     verified = model if rec.get("status") in (None, "accepted") else working(rec)
     return _rev(rec), model, verified
 
@@ -207,6 +208,19 @@ def resolve(state_dir, rev: int, accepted: bool, reason: str = "") -> Optional[d
             rec["confirmed_rev"] = max(rev, _rev(rec, "confirmed_rev"))
         else:
             rec["rejected_reason"] = " ".join(str(reason).split())[:240]
+        _write(state_dir, rec)
+        return rec
+
+
+def unconfirmed(state_dir, rev: int, reason: str = "") -> Optional[dict]:
+    """Settle the pending pick `rev` as `unconfirmed`: tried without a verdict until the seat gave up.
+    Not a refusal; the core stays on `working`. None when the record has moved on or is not pending."""
+    with _locked(state_dir):
+        rec = read_record(state_dir)
+        if not rec or _rev(rec) != rev or rec.get("status") != "pending":
+            return None
+        rec["status"], rec["accepted"] = "unconfirmed", False
+        rec["unconfirmed_reason"] = " ".join(str(reason).split())[:240]
         _write(state_dir, rec)
         return rec
 

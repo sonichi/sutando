@@ -30,6 +30,7 @@ end, then `start-cli.sh --restart --runtime <rt>`). The launcher writes the desk
 run that CLI. `settle` then confirms from both, never from a heartbeat alone: the record names the
 target runtime with a session created after the switch began, and the runtime the launcher would
 pick next (desktop selection, else config) is the target too. It posts the outcome in the same DM.
+A restart that leaves no core on the target is followed by one back onto the previous runtime.
 The workspace, tasks, results, state and memory are shared by both runtimes; only the live
 conversation does not carry over, and the cards say so.
 
@@ -117,6 +118,9 @@ SIGN_IN_GAVE_UP = ("I stopped waiting for the {name} sign-in after {minutes} min
 CARRIES = "Tasks, memory and the workspace carry over; our current conversation does not."
 GONE = "That choice is no longer on my card. Ask me for the runtime card again."
 BUSY = "A runtime switch is already under way. I'll confirm here when it has finished."
+# admit()'s answer when the attempt on record had lost its worker: that record is replaced.
+RECOVERED = "recovered"
+STOPPED = "The previous switch stopped before it finished."
 
 
 def _emit(payload: dict, code: int = 0) -> int:
@@ -351,14 +355,18 @@ def executing(ws: Path) -> bool:
 
 
 def admit(ws: Path, rec: dict, now: float) -> bool:
-    """Record `rec` as the one attempt under way; False when another is running."""
+    """Record `rec` as the one attempt under way; False when another is running, RECOVERED when the one
+    on record had a dead worker."""
     from file_lock import locked_file
     from local_record import write_whole
+    import switch_worker
     with locked_file(ws.joinpath(*RUNNING_LOCK), create_mode=0o600):
-        if running(ws, now) or executing(ws):
+        prev, busy = running(ws, now), executing(ws)
+        recovered = bool(prev) and not busy and switch_worker.dead(ws.joinpath(*RUNNING), prev["attempt"])
+        if (prev or busy) and not recovered:
             return False
         write_whole(ws.joinpath(*RUNNING), rec)
-    return True
+    return RECOVERED if recovered else True
 
 
 def is_recorded(ws: Path, rec: dict) -> bool:
@@ -402,13 +410,13 @@ FAILED_TO_START = "I couldn't start the switch. Nothing changed."
 
 
 def say_switching(ws: Path, room: str, rt: str, current: str, attempt: str, event: str, *, core=None,
-                  execute=None, new_card: bool = False, before_new_card=None) -> tuple:
+                  execute=None, new_card: bool = False, before_new_card=None, before: str = "") -> tuple:
     """Put "Switching…" on the card at `event`, or on a new card when that one cannot be edited:
     (words, what was posted). One operation id per attempt and route, so asking again returns the same
     card. `before_new_card` is called before the new card is posted, for a caller that puts the route on
     record: when it answers False the route is not on record and nothing is posted. `new_card` goes
     straight to that route, as a caller that finds it on record does."""
-    say = (f"Switching the core from {name(current)} to {name(rt)}. It restarts once this turn has finished; "
+    say = before + (f"Switching the core from {name(current)} to {name(rt)}. It restarts once this turn has finished; "
            f"I'll confirm here when it is back. {CARRIES}")
     op, out = f"runtime-card:{attempt}:switching", {"status": "failed"}
     if event and not new_card:
@@ -435,12 +443,14 @@ def begin_switch(ws: Path, room: str, rt: str, current: str, t: float, *, event:
     attempt = attempt or f"{int(t)}-{secrets.token_hex(4)}"
     rec = {"attempt": attempt, "runtime": rt, "room": room, "ts": t}
     try:
-        if not admit(ws, rec, t):
+        admitted = admit(ws, rec, t)
+        if not admitted:
             return {"status": "say", "say": BUSY}
     except OSError as e:
         return {"status": "failed", "say": FAILED_TO_START, "why": type(e).__name__}
     say, posted = say_switching(ws, room, rt, current, attempt, event, core=core, execute=execute,
-                                new_card=new_card, before_new_card=before_new_card)
+                                new_card=new_card, before_new_card=before_new_card,
+                                before=f"{STOPPED} The core is on {name(current)}. " if admitted == RECOVERED else "")
     # The card that says "Switching" now, whether the tapped one edited in place or a new one posted
     # because it could not be: the worker's outcome and any correction go to that card.
     says = str(posted.get("event_id") or "")
@@ -752,6 +762,8 @@ def start_switch(ws: Path, room: str, rt: str, attempt: str, popen=subprocess.Po
         fh.flush()
         proc = popen(argv, cwd=str(_REPO), stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
                      start_new_session=True, env=detached_env())
+    import switch_worker
+    switch_worker.note(ws.joinpath(*RUNNING), attempt, int(proc.pid))
     return int(proc.pid)
 
 
@@ -914,8 +926,8 @@ def outcome(rt: str, was: str, got: dict, rc: int = 0) -> tuple:
 
 def settle_and_tell(ws: Path, room: str, rt: str, was: str, since: float, attempt: str, *, rc: int = 0,
                     card: str = "", core=None, execute=None, sleep=time.sleep, clock=time.time,
-                    gateway: str = "") -> dict:
-    got = confirm(ws, rt, since, sleep=sleep, clock=clock)
+                    gateway: str = "", got: Optional[dict] = None) -> dict:
+    got = got if got is not None else confirm(ws, rt, since, sleep=sleep, clock=clock)
     state, words = outcome(rt, was, got, rc)
     if gateway not in ("", "restored"):
         # Not a clean success any more: the tick goes, the warning follows.
@@ -926,6 +938,45 @@ def settle_and_tell(ws: Path, room: str, rt: str, was: str, since: float, attemp
                   execute=execute, tries=POST_TRIES, sleep=sleep)
     return {**out, "outcome": state, "say": words, "core_confirmed": got["core"],
             "selection_confirmed": got["selected"]}
+
+
+def why_not(rt: str, got: dict, rc: int) -> str:
+    """Why a restart onto `rt` did not leave a confirmed core on it."""
+    if rc:
+        return f"the restart did not finish cleanly (exit {rc})"
+    rec = got["record"]
+    seen = (f"the last confirmed core runs {name(rec['runtime'])}" if rec else "no core has been confirmed since")
+    return f"I could not confirm it is running on {name(rt)}: {seen}"
+
+
+def fall_back(ws: Path, room: str, rt: str, was: str, attempt: str, got: dict, rc: int, before: Optional[str], *,
+              card: str = "", restart=restart_core, run=subprocess.run, core=None, execute=None,
+              sleep=time.sleep, clock=time.time) -> dict:
+    """The switch to `rt` left no confirmed core: put back the record of `was`, start `was` again the same
+    way, and say on the card what came of both. Said from here: a core that is down cannot answer."""
+    if before is not None:
+        from local_record import write_text_whole
+        write_text_whole(ws.joinpath(*RECORD), before)
+    since = clock()
+    back_rc = restart(was)
+    gateway = restore_desktop_gateway(run) if back_rc not in NOT_RESTARTED else ""
+    back = confirm(ws, was, since, sleep=sleep, clock=clock)
+    lead = f"Couldn't switch to {name(rt)}: {why_not(rt, got, rc)}."
+    import account_card
+    if back_rc in NOT_RESTARTED and not back["core"] and account_card.fresh_beat(ws, since):
+        words = f"{lead} The core is still on {name(was)}."   # stopped nothing, and the core still beats
+    elif back["core"]:
+        words = f"{lead} I started {name(was)} again, and the core is running on it."
+    else:
+        where = ("Quit and reopen the app on the computer that runs the core." if desktop_hosted() else
+                 "On the computer that runs the core, run src/restart.sh in the engine folder.")
+        words = f"{lead} Starting {name(was)} again did not come back either, so the core may be down. {where}"
+    if gateway not in ("", "restored"):
+        words = f"{words} {GATEWAY_LOST.format(why=gateway)}"
+    out = _answer(ws, room, card, "error", "Not switched", words, f"runtime-card:{attempt}:outcome", core=core,
+                  execute=execute, tries=POST_TRIES, sleep=sleep)
+    return {**out, "outcome": "error", "say": words, "core_confirmed": False, "selection_confirmed": False,
+            "fell_back": was, "fell_back_rc": back_rc, "fell_back_confirmed": back["core"]}
 
 
 def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core, sleep=time.sleep,
@@ -944,6 +995,10 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
             if not is_recorded(ws, rec):
                 return _emit({"status": "refused", "why": "that attempt is not the one under way"}, 2)
             was = configured_runtime()
+            try:
+                before = ws.joinpath(*RECORD).read_text(encoding="utf-8")
+            except OSError:
+                before = None
             started = clock()
             rc = restart(args.runtime)
             restarted = rc not in NOT_RESTARTED
@@ -988,8 +1043,17 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
                 return _emit({**out, "outcome": "error", "say": words, "restart": "not-restarted", "rc": rc}, 1)
             # This switch's own restart replaced the session: the desktop's gateway window went with it.
             gateway = restore_desktop_gateway(run) if restarted else ""
-            told = settle_and_tell(ws, args.room, args.runtime, was, started, args.attempt, rc=rc, card=args.card,
-                                   core=core, execute=execute, sleep=sleep, clock=clock, gateway=gateway)
+            got = confirm(ws, args.runtime, started, sleep=sleep, clock=clock)
+            import account_card
+            # Rolled back only on a failed restart or a core seen gone: an unconfirmed but beating core is kept.
+            gone = rc != 0 or not account_card.fresh_beat(ws, started)
+            if not got["core"] and restarted and gone and was in NAMES and was != args.runtime:
+                told = fall_back(ws, args.room, args.runtime, was, args.attempt, got, rc, before, card=args.card,
+                                 restart=restart, run=run, core=core, execute=execute, sleep=sleep, clock=clock)
+            else:
+                told = settle_and_tell(ws, args.room, args.runtime, was, started, args.attempt, rc=rc,
+                                       card=args.card, core=core, execute=execute, sleep=sleep, clock=clock,
+                                       gateway=gateway, got=got)
             told = dict(told, **({"gateway": gateway} if gateway else {}))
         finally:
             release(ws, rec)

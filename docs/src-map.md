@@ -291,6 +291,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`sutando_config.ts`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`sutando_platform.py`** — Cross-platform OS abstraction for Sutando Python services.
 - **`switch_card_intercept.py`** — The owner's bare "switch account / model / core" request answered with its card, in code.
+- **`switch_worker.py`** — The detached worker a card's switch starts: its pid on record, and whether it has died before finishing.
 - **`system_load.py`** — Sustained system load: one reading per health-check pass, a warning only when the last K passes all ran above a ratio of the core count, the top CPU users, and their cause.
 - **`task-bridge.ts`** — Voice → Claude Code session bridge.
 - **`task-delegation.ts`** — TaskDelegationService — step 4 of the interaction-planes refactor (issue #1947, built under the architecture names per design R3).

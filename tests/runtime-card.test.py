@@ -112,6 +112,21 @@ class Clock:
         self.t += s
 
 
+def worker_on_record(record: Path, alive: bool) -> None:
+    """The record's attempt, with a worker that still runs (this process) or one that has exited."""
+    import subprocess as sp
+    import holder_lock
+    if alive:
+        pid = os.getpid()
+    else:
+        proc = sp.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        pid = proc.pid
+    attempt = json.loads(record.read_text())["attempt"]
+    record.with_name(record.stem + ".worker.json").write_text(json.dumps(
+        {"attempt": attempt, "pid": pid, "start": holder_lock.start_time(os.getpid())}))
+
+
 class Base(unittest.TestCase):
     RUNTIME = "codex"
 
@@ -148,8 +163,10 @@ class Base(unittest.TestCase):
         return mock.Mock(stdout=out, returncode=0)
 
     def codex_read(self, home):
+        """Codex confirms the account the home's auth.json names."""
         import codex_account
-        return codex_account.from_auth_file(home)
+        got = codex_account.from_auth_file(home)
+        return dict(got, verified=True) if got else got
 
     def restart(self, rt):
         """graceful-restart + launcher: on success the launcher records the confirmed core and selection."""
@@ -348,6 +365,49 @@ class Taps(Base):
         self.assertEqual([c[0][c[0].index("--workspace") + 2] for c in self.launch.calls], ["await-sign-in", "switch"])
         self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists(), "a tap that goes ahead ends the wait")
 
+    def app_server(self, account):
+        """codex_account.read itself, with only the app-server child replaced: it answers `account`."""
+        import codex_account
+        import codex_rpc
+
+        class Child:
+            def __init__(self, argv, **kw):
+                self.p = mock.Mock()
+
+            def call(self, method, params, timeout=None):
+                return {"id": 1, "result": {"account": account} if method == "account/read" else {}}
+
+            def send(self, msg):
+                pass
+
+            def close(self):
+                pass
+        patch = mock.patch.object(codex_rpc, "Rpc", Child)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.codex_read = codex_account.read
+
+    def test_a_saved_codex_token_codex_does_not_confirm_is_not_a_sign_in(self):
+        # auth.json still decodes, but Codex itself names no account: the file's claims are not a sign-in.
+        self.current = self.selected = "claude"
+        (self.home / "auth.json").write_text(CODEX_AUTH)
+        self.app_server(None)
+        rc, out = self.tap("Switch the core to Codex")
+        self.assertEqual((rc, out["status"]), (1, "needs_sign_in"))
+        self.assertIn("could not confirm Codex is signed in", out["say"])
+        self.assertEqual(self.fake.cards()[-1]["header"]["status"]["label"], "Sign in first")
+        self.assertEqual([c[0][c[0].index("--workspace") + 2] for c in self.launch.calls], ["await-sign-in"])
+        self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists())
+        self.assertEqual(self.restarts, [])
+
+    def test_a_codex_sign_in_codex_confirms_is_switched_to(self):
+        self.current = self.selected = "claude"
+        (self.home / "auth.json").write_text(CODEX_AUTH)
+        self.app_server({"type": "chatgpt", "email": "alice@example.com", "planType": "plus"})
+        rc, out = self.tap("Switch the core to Codex")
+        self.assertEqual((rc, out["status"]), (0, "started"))
+        self.assertEqual([c[0][c[0].index("--workspace") + 2] for c in self.launch.calls], ["switch"])
+
     def test_the_runtime_in_use_changes_nothing(self):
         rc, out = self.tap("Switch the core to Codex")
         self.assertEqual(out["status"], "say")
@@ -386,6 +446,19 @@ class Taps(Base):
         self.assertEqual(out["say"], rtc.BUSY)
         self.assertEqual(len(self.launch.calls), 1)
 
+    def test_a_switch_whose_worker_died_no_longer_blocks_a_tap(self):
+        self.tap("Switch the core to Claude Code")
+        record = self.ws.joinpath(*rtc.RUNNING)
+        worker_on_record(record, alive=True)
+        self.assertEqual(self.tap("Switch the core to Claude Code")[1]["say"], rtc.BUSY)
+        worker_on_record(record, alive=False)
+        before = json.loads(record.read_text())["attempt"]
+        rc, out = self.tap("Switch the core to Claude Code")
+        self.assertEqual((rc, out["status"]), (0, "started"))
+        self.assertTrue(out["say"].startswith(rtc.STOPPED + " The core is on Codex. Switching the core from Codex"),
+                        out["say"])
+        self.assertEqual(self.fake.edits()[-1], ("$card1", "Runtime: " + out["say"]))
+        self.assertNotEqual(json.loads(record.read_text())["attempt"], before, "the dead attempt's record is replaced")
 
 
 class AwaitSignIn(Base):
@@ -1189,6 +1262,70 @@ class Switch(Base):
         rc, out = self.switch()
         self.assertEqual(out["outcome"], "info")
         self.assertIn("config still names Codex", out["say"])
+
+    def failing_switch(self, back_ok, back_rc=None):
+        """The restart onto Claude Code fails and leaves no core; the relaunch of Codex comes back or not."""
+        self.record("codex", T0 - 600)
+        before = self.ws.joinpath(*rtc.RECORD).read_text()
+        seen = []
+
+        def restart(rt):
+            self.restarts.append(rt)
+            self.clock.t += 30
+            if rt == "claude":
+                self.ws.joinpath(*rtc.RECORD).unlink()
+                return 1
+            seen.append(self.ws.joinpath(*rtc.RECORD).read_text())
+            if back_ok:
+                self.record("codex", self.clock.t - 5)
+                self.current = self.selected = "codex"
+            return back_rc if back_rc is not None else (0 if back_ok else 1)
+        self.restart = restart
+        rc, out = self.carded()
+        self.assertEqual(seen, [before], "the previous runtime's record is put back before it is relaunched")
+        self.assertEqual(self.restarts, ["claude", "codex"])
+        self.assertEqual((rc, out["outcome"], out["fell_back"]), (1, "error", "codex"))
+        self.assertEqual(self.fake.edits()[-1], ("$card1", "Runtime: " + out["say"]))
+        self.assertNotIn("runtime card", out["say"])
+        return out
+
+    def test_a_failed_restart_relaunches_the_previous_runtime_and_says_so_on_the_card(self):
+        out = self.failing_switch(back_ok=True)
+        self.assertEqual(out["say"], "Couldn't switch to Claude Code: the restart did not finish cleanly (exit 1). "
+                                     "I started Codex again, and the core is running on it.")
+        self.assertTrue(out["fell_back_confirmed"])
+
+    def test_a_relaunch_that_stopped_nothing_says_the_core_is_still_on_the_old_runtime(self):
+        for code in rtc.NOT_RESTARTED:
+            with self.subTest(rc=code):
+                self.restarts.clear()
+                self.ws.joinpath(*rtc.RUNNING).write_text(json.dumps(
+                    {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": self.clock.t}))
+                with mock.patch.object(account_card, "fresh_beat", lambda ws, since: since > T0):
+                    out = self.failing_switch(back_ok=False, back_rc=code)
+                self.assertTrue(out["say"].endswith("The core is still on Codex."), out["say"])
+                self.assertNotIn("may be down", out["say"])
+
+    def test_a_put_off_relaunch_with_no_heartbeat_says_the_core_may_be_down(self):
+        # The forward launch ended the old session and failed; the relaunch was put off: nothing runs.
+        out = self.failing_switch(back_ok=False, back_rc=rtc.DEFERRED)
+        self.assertIn("Starting Codex again did not come back either, so the core may be down.", out["say"])
+        self.assertNotIn("still on Codex", out["say"])
+
+    def test_an_unconfirmed_switch_on_a_beating_core_is_not_rolled_back(self):
+        self.launcher_confirms = self.launcher_selects = False
+        with mock.patch.object(account_card, "fresh_beat", lambda ws, since: True):
+            rc, out = self.carded()
+        self.assertEqual(self.restarts, ["claude"], "a core that is alive is not restarted again")
+        self.assertEqual((rc, out["outcome"]), (1, "error"))
+        self.assertNotIn("fell_back", out)
+        self.assertIn("could not confirm it is running on Claude Code", out["say"])
+
+    def test_a_relaunch_that_fails_too_names_what_to_do_outside_chat(self):
+        out = self.failing_switch(back_ok=False)
+        self.assertIn("Starting Codex again did not come back either, so the core may be down.", out["say"])
+        self.assertIn("Quit and reopen the app", out["say"])
+        self.assertFalse(out["fell_back_confirmed"])
 
     def test_a_restart_that_did_not_happen_says_still_on_the_old_runtime(self):
         # 3 and 5 end here at once; 4 (put off) has its own tests below.

@@ -1010,6 +1010,11 @@ class CodexCore(Base):
         self.using("gpt-b", runtime="codex", status="rejected", working="gpt-a", accepted=False, rev=2)
         self.assertEqual(mc.current_model(self.ws)["name"], "GPT A")
 
+    def test_an_unconfirmed_pick_names_the_working_model_in_use(self):
+        self.using("gpt-b", runtime="codex", status="unconfirmed", working="gpt-a", accepted=False, rev=2)
+        self.assertEqual(mc.current_model(self.ws)["name"], "GPT A")
+        self.assertEqual(mc.still_using(self.ws, "gpt-b"), "GPT A")
+
     def test_saved_for_the_next_start_is_said_as_such(self):
         self.using("gpt-a", runtime="codex", accepted=True)
         self.using("gpt-b", runtime="codex", accepted=False, previous="gpt-a")

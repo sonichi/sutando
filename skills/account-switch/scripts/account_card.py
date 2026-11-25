@@ -94,6 +94,9 @@ CONTROLS = "account_controls"  # the desktop draws the core's account controls i
 RETRY_WORDS = "retry now"  # core_limit_hold's bare owner reply
 GONE = "That account is no longer on my list. Ask me for the account card again."
 BUSY = "An account switch is already under way. I'll confirm here when it has finished."
+# admit()'s answer when the attempt on record had lost its worker: that record is replaced.
+RECOVERED = "recovered"
+STOPPED = "The previous switch stopped before it finished."
 NOT_CODEX = "Saved accounts are kept only for a core on Codex. Add the account in Settings instead."
 # graceful-restart.sh's exit codes, as one short reason the owner reads.
 RESTART_REASONS = {3: "the core could not get ready to restart",
@@ -244,6 +247,15 @@ def saved(store: Optional[Path], current_key: str = "") -> list:
     return sorted(out, key=lambda s: s["label"])
 
 
+def shown_names(entries: list) -> dict:
+    """{key: masked label}; labels that mask alike get " #1", " #2"… by saved-key order, so each names one key."""
+    groups = {}
+    for s in sorted(entries, key=lambda s: s["key"]):
+        groups.setdefault(masked_label(s["label"]), []).append(s["key"])
+    return {k: name + (f" #{i}" if len(keys) > 1 else "")
+            for name, keys in groups.items() for i, k in enumerate(keys, 1)}
+
+
 def _saved_auth(store: Path, key: str) -> Optional[str]:
     try:
         auth = json.loads((store / f"{key}.json").read_text(encoding="utf-8")).get("auth")
@@ -288,12 +300,14 @@ def current(rt: str, *, run=subprocess.run, codex_read=None) -> dict:
             import codex_account
             codex_read = codex_account.read
         acct = codex_read(home) or {}
+        # A sign-in counts only once Codex itself confirms it (`verified`); auth.json alone may hold a dead one.
+        signed = True if acct.get("verified") is True else (None if acct.get("kind") else False)
         if acct.get("kind") == "apiKey":
-            return {"runtime": rt, "signed_in": True, "shown": "an OpenAI API key", "key": ""}
+            return {"runtime": rt, "signed_in": signed, "shown": "an OpenAI API key", "key": ""}
         if not acct.get("kind") and ident is None:
             return {"runtime": rt, "signed_in": False, "shown": "", "key": ""}
         email = masked(str(acct.get("email") or "")) or (masked_label(ident[1]) if ident else "")
-        return {"runtime": rt, "signed_in": True, "shown": email or "a ChatGPT account",
+        return {"runtime": rt, "signed_in": signed, "shown": email or "a ChatGPT account",
                 "key": ident[0] if ident else ""}
     st = claude_status(run)
     shown = masked(st["email"]) or "an Anthropic account"  # the email only: the owner reads no plan name
@@ -323,15 +337,19 @@ def in_use_words(cur: dict) -> str:
 
 # ── the card ──────────────────────────────────────────────────────────────────────────────────────
 
-def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "", retry: bool = False) -> tuple:
+def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "", retry: bool = False,
+              names: Optional[dict] = None) -> tuple:
     """(body, card): a "Use" button per other saved account (up to five), then "Add another account".
     `lead`, when given, opens the card's words and its fallback line. `signed_out`: the core's login was
     refused, so the card drops the account in use and, with no `lead`, opens with SIGNED_OUT. `retry`
     (the quota card) adds a Retry button whose words are the owner's own "retry now", which the Claude
     core's limit hold acts on; a Codex core has no such hold, so its card carries none."""
     buttons = []
+    names = names if names is not None else shown_names(others)
     for s in others[:USE_BUTTONS]:
-        label = ("Use " + masked_label(s["label"]))[: ac.LIMITS["label"]]
+        name = names.get(s["key"]) or masked_label(s["label"])
+        tag = name[len(masked_label(s["label"])):]   # the " #N" kept whole when the label is cut
+        label = ("Use " + name[: len(name) - len(tag)])[: ac.LIMITS["label"] - len(tag)] + tag
         buttons.append(ac.button(label, "reply", style="secondary", reply=label,
                                  command=ac.reply(KIND, TARGET, s["key"])))
     buttons.append(ac.button("Add another account", "reply", style="primary", reply="Add another account",
@@ -437,10 +455,11 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time, run=subp
             save_current(store, _live_auth(codex_home()))
         except (OSError, codex_account.NoHome):
             pass  # the card still names the account; only the copy for switching back is missing
-    others = [s for s in saved(store, cur["key"]) if not s["current"]]
+    every = saved(store, cur["key"])
+    others = [s for s in every if not s["current"]]
     try:
         body, card = menu_card(cur, others, signed_out=args.signed_out, lead=args.lead or "",
-                               retry=args.retry)
+                               retry=args.retry, names=shown_names(every))
     except ac.CardError as e:
         return _emit({"status": "failed", "why": str(e)}, 1)
     if args.print:
@@ -490,15 +509,18 @@ def executing(ws: Path) -> bool:
 
 
 def admit(ws: Path, rec: dict, now: float) -> bool:
-    """Record `rec` as the one attempt under way; False when another is running. Check and write are
-    one transaction under the record's lock."""
+    """Record `rec` as the one attempt under way; False when another is running, RECOVERED when the one
+    on record had a dead worker. Check and write are one transaction under the record's lock."""
     from file_lock import locked_file
     from local_record import write_whole
+    import switch_worker
     with locked_file(ws.joinpath(*RUNNING_LOCK), create_mode=0o600):
-        if running(ws, now) or executing(ws):
+        prev, busy = running(ws, now), executing(ws)
+        recovered = bool(prev) and not busy and switch_worker.dead(ws.joinpath(*RUNNING), prev["attempt"])
+        if (prev or busy) and not recovered:
             return False
         write_whole(ws.joinpath(*RUNNING), rec)
-    return True
+    return RECOVERED if recovered else True
 
 
 def is_recorded(ws: Path, rec: dict) -> bool:
@@ -526,6 +548,8 @@ def start_switch(ws: Path, room: str, key: str, attempt: str, popen=subprocess.P
         fh.flush()
         proc = popen(argv, cwd=str(_REPO), stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
                      start_new_session=True)
+    import switch_worker
+    switch_worker.note(ws.joinpath(*RUNNING), attempt, int(proc.pid))
     return int(proc.pid)
 
 
@@ -560,20 +584,21 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
             or _saved_auth(store, verb) is None:
         return _emit({"status": "refused", "say": GONE}, 2)
     cur = current("codex", run=run, codex_read=codex_read)
-    label = masked_label(next((s["label"] for s in saved(store) if s["key"] == verb), "that account"))
+    label = shown_names(saved(store)).get(verb) or "that account"
     if cur["key"] == verb:
         return _emit({"status": "say", "say": f"Already using {label} — nothing to change."})
     t = now()
     attempt = f"{int(t)}-{secrets.token_hex(4)}"
     rec = {"attempt": attempt, "key": verb, "room": room, "ts": t}
     try:
-        if not admit(ws, rec, t):
+        admitted = admit(ws, rec, t)
+        if not admitted:
             return _emit({"status": "say", "say": BUSY})
     except OSError as e:
         return _emit({"status": "failed", "say": "I couldn't start the switch. Nothing changed.",
                       "why": type(e).__name__}, 1)
-    say = (f"Switching the core to {label}. It restarts once this turn has finished; "
-           "I'll confirm here when it is back.")
+    say = (f"{STOPPED} {in_use_words(cur)} " if admitted == RECOVERED else "") + (
+        f"Switching the core to {label}. It restarts once this turn has finished; I'll confirm here when it is back.")
     body, card = notice_card("pending", "Switching", say)
     posted = _post(ws, room, body, card, f"account-card:{attempt}:switching", reply_to=event, core=core or None,
                    execute=execute)
