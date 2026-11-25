@@ -102,7 +102,7 @@ seat_wait_ready() {
     i=$(( i + 1 ))
   done
   [ -f "$SEAT_READY" ] && return 0
-  echo "  ⚠ the Codex app-server seat did not report ready (see logs/codex-seat.log); sentinel NOT cleared." >&2
+  echo "  ⚠ the Codex app-server seat did not report ready (see logs/codex-seat.log); sentinel NOT cleared. To run the Codex TUI instead: bash scripts/sutando-config.sh codex-app-server-select off (or SUTANDO_CODEX_APP_SERVER=0 for one launch)." >&2
   return 1
 }
 
@@ -284,7 +284,7 @@ seat_heal_core_window() {
 # seat_core_overrides: with the flag on, the core launcher's own steps act on the seat's window.
 seat_core_overrides() {
   if ! tmux_available; then
-    echo "start-cli: SUTANDO_CODEX_APP_SERVER=1 needs tmux; unset it to run the Codex TUI directly" >&2
+    echo "start-cli: the Codex app-server seat needs tmux; to run the Codex TUI instead: bash scripts/sutando-config.sh codex-app-server-select off (or SUTANDO_CODEX_APP_SERVER=0 for one launch)" >&2
     exit 1
   fi
   codex_core_live() {

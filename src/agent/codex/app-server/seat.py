@@ -955,7 +955,8 @@ class Seat:
                 self.wake.wait(self.poll_s)
                 self.wake.clear()
         except SeatFatal as e:
-            log(f"FATAL: {e}")
+            log(f"FATAL: {e}. To run the Codex TUI instead: bash scripts/sutando-config.sh codex-app-server-select off"
+                " (or SUTANDO_CODEX_APP_SERVER=0 for one launch)")
             return EXIT_FATAL
         finally:
             ready.unlink(missing_ok=True)

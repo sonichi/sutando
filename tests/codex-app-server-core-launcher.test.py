@@ -424,6 +424,7 @@ class PersistedChoice(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertRegex(f.calls(), r"new-session -d -s sutando-core .*codex-seat --host ")
         self.assertIn("did not report ready", result.stderr)
+        self.assertIn("codex-app-server-select off", result.stderr, "it names the way back to the TUI")
         self.assertTrue(sentinel.exists(), "intake is not reopened before the seat is ready")
         self.assertIn("kill-session -t $7", f.calls(), "the exact seat started is torn down, by its id")
         self.assertNotIn("kill-session -t =sutando-core", f.calls())
