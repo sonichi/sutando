@@ -1,6 +1,9 @@
 #!/bin/bash
 # Preconditions on the core's tmux socket, checked by the dispatcher before any launcher runs.
 
+# start-cli's exit code for a guard refusal; 3-10 and 12 already mean launcher prerequisite failures.
+SUTANDO_EXIT_SOCKET_REFUSED=11
+
 # Returns 0 when <tmux> sees no server on <socket> or the server is its own version, 2 when it
 # reaches a server of another version, 1 when it cannot; sets _SUTANDO_TMUX_PROBLEM on non-zero.
 _sutando_tmux_probe() {
@@ -23,8 +26,8 @@ _sutando_tmux_probe() {
   fi
 }
 
-# Refuses (returns 1) when no tmux can reach the server that owns <socket>, or when <socket> is a
-# desktop install's and <repo> is not that install's engine checkout.
+# Refuses (returns 1, one "start-cli: refusing to launch:" stderr line) when no tmux can reach the
+# server that owns <socket>, or when <socket> is a desktop install's and <repo> is not its engine.
 sutando_tmux_socket_guard() {
   local socket="$1" repo="$2" path_tmux exported bin rc chosen="" reachable="" mismatch=""
   local run_dir app_dir engine cands=()
@@ -52,12 +55,10 @@ sutando_tmux_socket_guard() {
       export PATH
     fi
   elif [ "${#cands[@]}" -gt 0 ]; then
-    echo "start-cli: $_SUTANDO_TMUX_PROBLEM." >&2
-    echo "start-cli: refusing to launch; a client that cannot reach the server reads a live core as absent. Put the tmux that owns that server on PATH." >&2
+    echo "start-cli: refusing to launch: $_SUTANDO_TMUX_PROBLEM; a client that cannot reach the server reads a live core as absent. Put the tmux that owns that server on PATH." >&2
     return 1
   elif [ -S "$socket" ]; then
-    echo "start-cli: a tmux server may own $socket, but no tmux is on PATH." >&2
-    echo "start-cli: put the tmux that created it on PATH; installing another build would start a second, incompatible server." >&2
+    echo "start-cli: refusing to launch: a tmux server may own $socket, but no tmux is on PATH. Put the tmux that created it on PATH; installing another build would start a second, incompatible server." >&2
     return 1
   fi
   run_dir="$(dirname "$socket")"
@@ -66,7 +67,6 @@ sutando_tmux_socket_guard() {
   [ "${run_dir##*/}" = run ] && [ -d "$engine" ] || return 0
   [ "$(cd "$engine" && pwd -P)" = "$(cd "$repo" && pwd -P)" ] && return 0
   [ "${SUTANDO_ALLOW_FOREIGN_CORE_CHECKOUT:-}" = 1 ] && return 0
-  echo "start-cli: $socket belongs to the desktop engine at $engine, not this checkout ($repo)." >&2
-  echo "start-cli: set SUTANDO_ALLOW_FOREIGN_CORE_CHECKOUT=1 to replace the desktop's core with this checkout on purpose." >&2
+  echo "start-cli: refusing to launch: $socket belongs to the desktop engine at $engine, not this checkout ($repo). Set SUTANDO_ALLOW_FOREIGN_CORE_CHECKOUT=1 to replace the desktop's core with this checkout on purpose." >&2
   return 1
 }

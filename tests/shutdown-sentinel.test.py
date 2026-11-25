@@ -104,6 +104,38 @@ sd.clear_shutdown()
 check("after clear on boot — task intake resumes (no permanent suppression)",
       _intake_accepts_new_task() is True)
 
+# Compare-and-clear: a stop is cleared only by the token of the write that made it.
+sd.clear_shutdown()
+_tok = sd.mark_if_absent("codex-seat-not-ready")
+check("mark-if-absent writes a stop and returns its token", bool(_tok) and sd.is_shutting_down())
+check("mark-if-absent leaves an existing stop alone and returns no token", sd.mark_if_absent("other") == "")
+sd.mark_shutdown("a newer drain")
+check("clear-if with the old token leaves a newer stop in place", sd.clear_if(_tok) is False and sd.is_shutting_down())
+_tok2 = sd._token(_tmp)
+check("clear-if with the current token clears it", sd.clear_if(_tok2) is True and not sd.is_shutting_down())
+check("clear-if with no token clears nothing", sd.clear_if("") is False)
+with contextlib.redirect_stdout(io.StringIO()):
+    check("the clear-if CLI says 'not mine' with exit 3, not an error", sd.main(["shutdown.py", "clear-if", "bogus"]) == 3)
+_a = sd.mark_if_absent("x"); sd.clear_shutdown(); _b = sd.mark_if_absent("x")
+check("two stops with the same reason in the same second still differ", _a != _b)
+sd.clear_shutdown()
+
+# `token` names the stop in place now, so a launch can later lift exactly that one.
+check("token is empty with no stop in place", sd.current_token() == "")
+_out = io.StringIO()
+with contextlib.redirect_stdout(_out):
+    _rc = sd.main(["shutdown.py", "token"])
+check("main('token') with no stop prints nothing", _rc == 0 and _out.getvalue() == "")
+sd.mark_shutdown("in place at launch")
+_out = io.StringIO()
+with contextlib.redirect_stdout(_out):
+    sd.main(["shutdown.py", "token"])
+_at_launch = _out.getvalue().strip()
+check("main('token') prints the token clear-if accepts", _at_launch == sd._token(_tmp))
+sd.mark_shutdown("a drain written meanwhile")
+check("a drain written after the token was read survives clear-if", sd.clear_if(_at_launch) is False and sd.is_shutting_down())
+sd.clear_shutdown()
+
 print()
 if failures:
     print(f"FAIL — {len(failures)}: {failures}")

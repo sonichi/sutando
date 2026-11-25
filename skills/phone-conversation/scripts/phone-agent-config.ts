@@ -96,14 +96,21 @@ export function phoneIntroName(overrides?: PhoneInstructionDeps['overrides']): s
 	return overrides?.agentName !== undefined ? overrides.agentName : agentDisplayName();
 }
 
+/** The name the phone speaks: the display name, or "an AI agent" when there is none. */
+export function phoneSpokenName(overrides?: PhoneInstructionDeps['overrides']): string {
+	return phoneIntroName(overrides) || 'an AI agent';
+}
+
+const NO_NAME_ANSWER = 'When asked your name, say you do not have one to share; never make one up.';
+
 /** The line bodhi injects to make Gemini speak first; none for a meeting (the IVR comes first). */
 export function buildCallGreeting(callSession: Pick<CallSessionShape, 'isMeeting' | 'purpose'>,
 	overrides?: PhoneInstructionDeps['overrides']): string {
 	return callSession.isMeeting
 		? ''  // No greeting for meetings — listen to IVR first
 		: !callSession.purpose
-		? `[Speak this greeting to the caller now]: Hi, this is ${phoneIntroName(overrides)}. How can I help?`
-		: `[Speak this greeting to the caller now]: Hi, this is ${phoneIntroName(overrides)} calling.`;
+		? `[Speak this greeting to the caller now]: Hi, this is ${phoneSpokenName(overrides)}. How can I help?`
+		: `[Speak this greeting to the caller now]: Hi, this is ${phoneSpokenName(overrides)} calling.`;
 }
 
 function standIdLine(overrides?: PhoneInstructionDeps['overrides']): string {
@@ -116,7 +123,8 @@ function standIdLine(overrides?: PhoneInstructionDeps['overrides']): string {
 		if (si.name) stand = `Your Stand name is ${si.name}.`;
 	} catch { /* no Stand name */ }
 	const name = phoneIntroName(overrides);
-	const ask = name ? `When asked your name, say "I'm ${name}."` : '';
+	const ask = name ? `When asked your name, say "I'm ${name}."`
+		: NO_NAME_ANSWER;
 	return [stand, ask].filter(Boolean).join(' ');
 }
 
@@ -152,7 +160,8 @@ export function buildPhoneInstructions(callSession: CallSessionShape, deps: Phon
 		const availableTools = deps.availableToolNames;
 		instructions = [
 			`You are Sutando, a personal AI assistant. You are making a phone call on behalf of ${OWNER_NAME || 'your owner'}.`,
-			`You are Sutando — NOT the person you are calling. When the person picks up, introduce yourself as ${phoneIntroName(deps.overrides)}.`,
+			`You are Sutando — NOT the person you are calling. When the person picks up, introduce yourself as ${phoneSpokenName(deps.overrides)}.`,
+			phoneIntroName(deps.overrides) ? '' : NO_NAME_ANSWER,
 			callSession.purpose ? `Purpose of this call: "${callSession.purpose}"` : '',
 			'Be natural, warm, and conversational. Have a full conversation — do NOT rush to hang up.',
 			'Ask follow-up questions to get complete information.',
@@ -173,11 +182,11 @@ export function buildPhoneInstructions(callSession: CallSessionShape, deps: Phon
 			'You run entirely on the owner\'s local Mac — not in the cloud. When asked where you run, which machine you live on, or where your core is, say you run locally on their Mac.',
 			// Identity & greeting — based on owner vs verified vs unverified
 			isInbound && callSession.isOwner
-				? `Your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''} is calling you. YOU are Sutando — the AI assistant. The person on the phone is your OWNER, a human. Do NOT confuse yourself with the caller. You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks. Say exactly: "Hi, this is ${phoneIntroName(deps.overrides)}. How can I help?" then WAIT for them to speak. Do NOT say anything else before they talk. Do NOT make up tasks, scenarios, or pretend you were doing something.${safeCtx ? `\n\nRecent voice conversation (for context — do NOT repeat or bring up unless asked):\n${safeCtx}` : ''}`
+				? `Your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''} is calling you. YOU are Sutando — the AI assistant. The person on the phone is your OWNER, a human. Do NOT confuse yourself with the caller. You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks. Say exactly: "Hi, this is ${phoneSpokenName(deps.overrides)}. How can I help?" then WAIT for them to speak. Do NOT say anything else before they talk. Do NOT make up tasks, scenarios, or pretend you were doing something.${safeCtx ? `\n\nRecent voice conversation (for context — do NOT repeat or bring up unless asked):\n${safeCtx}` : ''}`
 				: isInbound && callSession.callerVerified
-				? `A verified caller is calling you. Be helpful and conversational. You can look up meeting IDs and check the time. You CAN answer general knowledge questions, do translations, and have conversations. You cannot access files, control the screen, or delegate tasks. Say "Hello, this is ${phoneIntroName(deps.overrides)}. How can I help?"`
+				? `A verified caller is calling you. Be helpful and conversational. You can look up meeting IDs and check the time. You CAN answer general knowledge questions, do translations, and have conversations. You cannot access files, control the screen, or delegate tasks. Say "Hello, this is ${phoneSpokenName(deps.overrides)}. How can I help?"`
 				: isInbound
-				? `Someone is calling you. Be helpful and conversational. You CAN answer general knowledge questions, do translations, and have conversations — but you cannot access files, control the screen, or delegate tasks. Greet them with "Hello, this is ${phoneIntroName(deps.overrides)}. How can I help?"`
+				? `Someone is calling you. Be helpful and conversational. You CAN answer general knowledge questions, do translations, and have conversations — but you cannot access files, control the screen, or delegate tasks. Greet them with "Hello, this is ${phoneSpokenName(deps.overrides)}. How can I help?"`
 				: callSession.isOwner
 				? `You are calling your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''}. The person who picks up IS your owner. You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks. After delivering your message, ask if there is anything else you can help with.${safeCtx ? `\n\nRecent voice conversation (for context — do NOT repeat or bring up unless asked):\n${safeCtx}` : ''}`
 				: 'You initiated this call on behalf of your owner.',
