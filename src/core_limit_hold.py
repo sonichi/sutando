@@ -754,16 +754,19 @@ def hold_while_wedged(workspace: Path, text: Optional[str], now: Optional[float]
 
 
 def release_on_account_change(workspace: Path, now: Optional[float] = None, account: Optional[str] = None,
-                              seat: Optional[str] = None) -> Optional[dict]:
-    """Lift a hold seen under one account once the core is signed in to another: a limit is the
-    account's, and the owner switched to go on (VM 2026-11-23: the core stayed paused after a switch to
-    an account with quota). `account` is the account now in use (default: the launch's). A hold that
-    recorded no account, or an account that cannot be read now, is left as it is."""
+                              seat: Optional[str] = None, live: bool = False) -> Optional[dict]:
+    """Lift a hold seen under one account once the core is on another: a limit is the account's.
+    `account` is the account now in use. By default it is the one the next launch would use; with
+    `live` (a core is running), the one that core was launched with, so a config naming another
+    account does not release a core still running on the held one. A hold that recorded no account,
+    or an account that cannot be read now, is left as it is."""
     hold = read_hold(workspace, seat)
     if not hold or hold.get("status") != "held":
         return None
     held = hold.get("account")
-    now_on = launch_identity(workspace)[1] if account is None else account
+    if account is None:
+        account = (running_account(workspace) if live and not seat else None) or launch_identity(workspace)[1]
+    now_on = account
     if not held or not now_on or held == now_on:
         return None
     return clear(workspace, now, by="account-change", seat=seat)

@@ -525,6 +525,28 @@ class HoldFromTheScreen(_Base):
         self.assertEqual(M.compose_state(FOOTER, "paused", gateway_alive=True)[0], "blocked-known")
 
 
+class ConfigNamesAnotherAccount(_Base):
+    def test_a_config_switch_does_not_release_the_core_still_running_on_the_held_account(self):
+        """The config names account B while the running core (account A) stands at A's limit: the
+        hold stays for every tick, one notice; once the core relaunches on B it is released."""
+        clh.record_launch_account(self.ws, "acct-A")
+        state, _d, prompt, kind = M.compose_state(USAGE_LIMIT, "idle", gateway_alive=True, runtime="claude")
+        settled = (state, kind, prompt)
+        start = time.time()
+        with mock.patch.object(clh, "launch_identity", lambda ws, config_dir=None: ("claude-opus-5-5", "acct-B")):
+            for step in range(0, 15 * 60, 2):
+                at = start + step
+                M.limit_reply_step(self.ws, settled, settled, USAGE_LIMIT, "claude", now=at)
+                hold = clh.read_hold(self.ws)
+                self.assertEqual((hold["status"], hold["account"]), ("held", "acct-A"), f"released at +{step}s")
+            self.assertEqual(len(self.notices()), 1, "the hold flapped and told the owner again")
+            clh.record_launch_account(self.ws, "acct-B")   # the core restarted on B
+            quiet = ("idle", None, "")
+            M.limit_reply_step(self.ws, quiet, quiet, "", "claude", now=start + 15 * 60)
+        hold = clh.read_hold(self.ws)
+        self.assertEqual((hold["status"], hold.get("cleared_by")), ("cleared", "account-change"))
+
+
 class Relaunch(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()

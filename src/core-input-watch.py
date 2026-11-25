@@ -1218,7 +1218,7 @@ def limit_reply_step(workspace, settled, seen, pane, runtime, now=None, repo=_RE
                 {"launcher": str(repo / "src" / "agent" / "start-cli.sh"),
                  "switch": str(repo / "scripts" / "switch-model.sh")})
     try:
-        if not seat and core_limit_hold.release_on_account_change(workspace, now):
+        if not seat and core_limit_hold.release_on_account_change(workspace, now, live=True):
             print("limit hold lifted: the core is signed in to another account", file=_sys.stderr, flush=True)
         state, kind, prompt = settled
         if state == "blocked-human" and is_usage_limit(kind, prompt):
