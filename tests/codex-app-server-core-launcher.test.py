@@ -527,6 +527,8 @@ class PersistedChoice(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn("does not say which stop holds intake", result.stderr)
         self.assertIn("rm '", result.stderr, "it says how an operator clears it")
+        self.assertIn("shutdown.py clear-if", result.stderr, "reopening is the conditional clear")
+        self.assertNotRegex(result.stderr, r"shutdown\.py clear\b(?!-)", "never an unconditional clear")
         self.assertTrue(held.exists(), "an unknown marker is never cleared automatically")
 
     def test_a_stop_already_in_place_is_never_cleared_by_the_reattach(self):

@@ -171,7 +171,7 @@ seat_reattach() {
   case "$token" in
     external) rm -f "$held"; return 0 ;;
     ""|unknown)
-      echo "  ✗ $held does not say which stop holds intake (it could not be recorded) — keeping it; not accepting the seat. Once you have checked intake, remove it by hand: rm '$held' (and python3 src/shutdown.py clear if intake should reopen)." >&2
+      echo "  ✗ $held does not say which stop holds intake (it could not be recorded) — keeping it; not accepting the seat. Inspect the stop in place first (cat \"\$(python3 src/shutdown.py path)\" and python3 src/shutdown.py token); only if it is this seat's codex-seat-not-ready stop and intake should reopen, run python3 src/shutdown.py clear-if <that token>. Then remove the marker: rm '$held'." >&2
       return 1 ;;
   esac
   rc=1
