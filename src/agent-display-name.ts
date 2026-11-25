@@ -5,7 +5,7 @@
  * name); this module only runs it and caches the answer. A prompt build never waits on the
  * homeserver: the first call resolves with `--offline`, and a live resolve runs in the background
  * (again at most every LIVE_REFRESH_MS), so later builds pick up the live name and any rename.
- * When python or the resolver is unavailable, the name is the resolver's own fallback, "Sutando".
+ * '' means no name: the prompts then introduce the agent unnamed, never by a fallback or the id.
  */
 import { execFile, execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
@@ -14,7 +14,6 @@ import { fileURLToPath } from 'node:url';
 import { resolvePython } from './python-binary.js';
 import { repoSrcScriptPath } from './sutando_config.js';
 
-export const FALLBACK_AGENT_NAME = 'Sutando';
 /** The resolver script for a module running from `moduleDir` (src/ in dev, dist/ when bundled). */
 export function agentDisplayNameScriptPath(moduleDir: string = dirname(fileURLToPath(import.meta.url))): string {
 	return repoSrcScriptPath('agent_display_name.py', moduleDir);
@@ -36,7 +35,7 @@ const warned = new Set<string>();
 function warnOnce(cause: string, sink: (msg: string) => void): void {
 	if (warned.has(cause)) return;
 	warned.add(cause);
-	sink(`[agent-display-name] ${cause}; using the last known name or "${FALLBACK_AGENT_NAME}"`);
+	sink(`[agent-display-name] ${cause}; using the last known name, or none`);
 }
 
 function failureCause(err: unknown): string {
@@ -76,12 +75,17 @@ export function resolverRunner(script: string = SCRIPT, sink: (msg: string) => v
 
 const defaultRunner = resolverRunner();
 
-/** The `name` of the resolver's `--json` line, or '' for anything else. */
-export function nameFromJson(stdout: string | null): string {
+/** The `name` of the resolver's `--json` line ('' when it found none), or null for anything else. */
+export function answerFromJson(stdout: string | null): string | null {
 	try {
 		const name = JSON.parse((stdout ?? '').trim()).name;
-		return typeof name === 'string' ? name.trim() : '';
-	} catch { return ''; }
+		return typeof name === 'string' ? name.trim() : null;
+	} catch { return null; }
+}
+
+/** The `name` of the resolver's `--json` line, or '' for anything else. */
+export function nameFromJson(stdout: string | null): string {
+	return answerFromJson(stdout) ?? '';
 }
 
 let cached: string | undefined;
@@ -91,13 +95,13 @@ export function agentDisplayName(runner: NameRunner = defaultRunner, now: number
 	if (now - liveStartedAt >= LIVE_REFRESH_MS) {
 		liveStartedAt = now;
 		try {
-			runner.async(['--json'], (stdout) => { const name = nameFromJson(stdout); if (name) cached = name; });
+			runner.async(['--json'], (stdout) => { const name = answerFromJson(stdout); if (name !== null) cached = name; });
 		} catch { /* the offline answer stands */ }
 	}
 	if (cached === undefined) {
 		let name = '';
-		try { name = nameFromJson(runner.sync(['--offline', '--json'])); } catch { /* fallback below */ }
-		cached = name || FALLBACK_AGENT_NAME;
+		try { name = nameFromJson(runner.sync(['--offline', '--json'])); } catch { /* no name */ }
+		cached = name;
 	}
 	return cached;
 }

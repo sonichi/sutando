@@ -48,6 +48,7 @@ from quota_availability import (  # noqa: E402
     PROXY_SCHEME as _PROXY_SCHEME,
     availability_decision,
     points_at_credential_proxy,
+    trusted_record,
     resolve_available as _resolve_available,
 )
 try:
@@ -258,6 +259,9 @@ def resolve_available(status: str, proxy_available) -> bool:
 
 def main():
     data = json.loads(QUOTA_FILE.read_text())
+    if trusted_record(data) is None:
+        print("quota-state.json holds another login's status line record, not this core's. Nothing guessed.")
+        sys.exit(1)
     headers = data.get("headers", {})
 
     # Staleness guard: the proxy rewrites this file on every API response, so

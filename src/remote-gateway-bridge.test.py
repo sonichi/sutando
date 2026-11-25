@@ -955,6 +955,88 @@ def main() -> int:
         _wl.lane_dirs = _lane_dirs
     check(_wrtc._CORE_RECOVERY_READER is None and rtc._CORE_RECOVERY_READER is not None,
           "a pool worker's lane carries no core recovery record; the core's lane does")
+    check(_wrtc._RUNTIME_PROFILE_READER is None and rtc._RUNTIME_PROFILE_READER is not None,
+          "a pool worker's lane carries no runtime profile; the core's lane does")
+
+    # runtime_profile.v1: the adapter injects src/runtime_profile.read; a Codex core whose model
+    # list marks the current row rides as runtime_profile, and with no readable runtime none does.
+    _st = rtc.WS / "state"
+    (_st / "core-runtime.json").write_text(json.dumps({"runtime": "codex", "session": "s", "started_at": 1}))
+    (_st / "runtime-models.codex.json").write_text(json.dumps({"v": 1, "runtime": "codex", "at": 1, "entries": [
+        {"key": "o0123456789ab", "label": "gpt-5.5", "model": "gpt-5.5", "arg": None, "current": True}]}))
+    STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
+    rtc._post_heartbeat(set(), force=True)
+    hbp = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    _prof = hbp.get("runtime_profile") or {}
+    check(_prof.get("model") == {"id": "gpt-5.5", "display_name": "GPT-5.5", "runtime": "codex"}
+          and _prof.get("plan") is None and _prof.get("workers") == []
+          and "runtime_profile.v1" in hbp.get("capabilities", []),
+          "the adapter's reader puts the core's runtime profile on the heartbeat with its capability")
+    (_st / "runtime-models.codex.json").write_text("{ not json")
+    STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
+    check(rtc._post_heartbeat(set(), force=True), "a malformed model list never costs the heartbeat")
+    hbp = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    check("runtime_profile" not in hbp and "runtime_profile.v1" not in hbp.get("capabilities", []),
+          "an unknown core model -> no runtime_profile and no capability")
+    for _f in ("core-runtime.json", "runtime-models.codex.json"):
+        (_st / _f).unlink()
+    check(_wrtc._QUOTA_STATUS_READER is None and rtc._QUOTA_STATUS_READER is not None,
+          "quota-tracker's switch is on by default; a pool worker's lane carries no core quota")
+    # A proxy record speaks for the core only with the core's own acct_ label (none while unread).
+    import core_limit_hold as _clh
+    import quota_availability as _qa
+    _qlabel = _qa.account_label(_clh.launch_identity(rtc.WS)[1])
+    (rtc.WS / "state" / "quota-state.json").write_text(json.dumps({
+        "utilization_5h": 0.42, "resets_at_5h": "2026-11-20T16:00:00.000Z", "limit_state": "allowed",
+        "last_checked": "2026-11-20T12:00:00.000Z", "accounts": {"acct-x": {}},
+        **({"account": _qlabel} if _qlabel else {})}))
+    STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
+    rtc._post_heartbeat(set(), force=True)
+    hbq = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    check((hbq.get("health") or {}).get("quota", {}).get("five_hour", {}).get("used_pct") == 42.0
+          and "quota_status.v1" in hbq.get("capabilities", [])
+          and "account" not in hbq["health"]["quota"],
+          "the adapter's reader puts the core's quota on the heartbeat as health.quota, no account")
+    (rtc.WS / "state" / "quota-state.json").write_text(json.dumps({
+        "utilization_5h": 0.42, "limit_state": "allowed", "account": "acct_0f0f0f"}))
+    STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
+    rtc._post_heartbeat(set(), force=True)
+    hbq = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    check(_qlabel != "acct_0f0f0f" and "quota" not in (hbq.get("health") or {}),
+          "a proxy record labeled with another login puts no health.quota on the heartbeat")
+    (rtc.WS / "state" / "quota-state.json").unlink()
+    os.environ["QUOTA_STATUS_PUBLISH"] = "false"
+    try:
+        _qspec = importlib.util.spec_from_file_location("rtc_quota_off", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _qrtc = importlib.util.module_from_spec(_qspec)
+        _qspec.loader.exec_module(_qrtc)
+    finally:
+        del os.environ["QUOTA_STATUS_PUBLISH"]
+    check(_qrtc._QUOTA_STATUS_READER is None, "QUOTA_STATUS_PUBLISH=false: no quota reader")
+    _saved_qs = sys.modules.get("quota_status")
+    sys.modules["quota_status"] = None  # the next import raises ImportError
+    import io as _qio
+    from contextlib import redirect_stderr as _qredirect
+    _qerr = _qio.StringIO()
+    try:
+        with _qredirect(_qerr):
+            _bspec = importlib.util.spec_from_file_location("rtc_quota_broken", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+            _brtc = importlib.util.module_from_spec(_bspec)
+            _bspec.loader.exec_module(_brtc)
+    finally:
+        if _saved_qs is None:
+            sys.modules.pop("quota_status", None)
+        else:
+            sys.modules["quota_status"] = _saved_qs
+    check(_brtc._QUOTA_STATUS_READER is None and callable(getattr(_brtc, "_post_heartbeat", None))
+          and _qerr.getvalue().count("quota status off: ModuleNotFoundError") == 1,
+          "a broken quota module: the bridge still loads, logs once, and sends no quota block")
+    _brtc._last_heartbeat_at = 0.0
+    STATE["heartbeats"].clear()
+    _brtc._post_heartbeat(set(), force=True)
+    _hbb = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    check(bool(STATE["heartbeats"]) and "quota" not in (_hbb.get("health") or {}),
+          "a broken quota module: the heartbeat still goes out, without health.quota")
 
     # SECURITY / robustness: core-status.json is written by another process and
     # may be malformed. _read_core_status runs in the main loop BEFORE the poll,
@@ -1865,7 +1947,11 @@ def main() -> int:
     _real_resolve, _asked = rtc.resolve_destination, []
     rtc.resolve_destination = lambda audience, **kw: _asked.append(audience) or ""
     rtc.OWNS_UNADDRESSED = lambda: False
-    check(rtc._project_hitl() == 0 and not _asked, "a bridge that is not the primary projects no cards")
+    _claim, rtc.CARD_CLAIM = rtc.CARD_CLAIM, None
+    check(rtc._project_hitl() == 0 and not _asked, "without a card claim, a bridge that is not the primary projects no cards")
+    rtc.CARD_CLAIM = _claim
+    check(rtc._project_hitl() == 0, "a core lane that is not the primary claims none of the core's cards")
+    _asked.clear()
     rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = "dev", lambda: True
     check(rtc._project_hitl() == 0 and _asked == [rtc.OWNER_PRIVATE], "a named primary looks for the owner DM to project cards")
     rtc.resolve_destination, rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = _real_resolve, _inst, _saved_owns

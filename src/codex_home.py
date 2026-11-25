@@ -50,29 +50,21 @@ def _check(value, repo, home):
         return f"error: {exc}"
 
 
-def prepare(repo, home, environ=None):
-    """Return (env, value, effective home); create the home only when permitted.
-
-    Raises Refused when it must not be created or written.
-    """
-    environ = os.environ if environ is None else environ
+def _plan(repo, home, environ):
+    """(env, value, effective home, verdict) without creating anything; verdict is None off a desktop host."""
     env, value = configured(repo)
     if "\n" in env or "\n" in value:
         raise Refused("the configured Codex home holds a newline")
     if codex_host_instructions.host_instructions(repo) is None:
-        if env and value:
-            os.makedirs(value, exist_ok=True)
         current = value if env == "CODEX_HOME" and value else environ.get("CODEX_HOME", "")
-        return env, value, current or os.path.join(os.fspath(home), ".codex")
+        return env, value, current or os.path.join(os.fspath(home), ".codex"), None
     if env != "CODEX_HOME" or not value:
         raise Refused(f"the configured Codex home ({env or 'no env'}={value or 'unset'}) "
                       "is not a CODEX_HOME, the only name Codex reads")
-    verdict = _check(value, repo, home)
-    if verdict in PERMITTED:
-        try:
-            verdict = codex_host_instructions.create_home(value, home)
-        except Exception as exc:  # noqa: BLE001 - a failed create refuses, never falls back
-            verdict = f"error: {exc}"
+    return env, value, value, _check(value, repo, home)
+
+
+def _refuse(verdict, value):
     if verdict == "owner-home":
         raise Refused(f"CODEX_HOME={value} is, or leads into, the owner's own Codex home")
     if verdict == "invalid-home":
@@ -80,7 +72,39 @@ def prepare(repo, home, environ=None):
                       "non-directory component")
     if verdict not in PERMITTED:
         raise Refused(f"CODEX_HOME={value} could not be checked ({verdict or 'no answer'})")
+
+
+def prepare(repo, home, environ=None):
+    """Return (env, value, effective home); create the home only when permitted.
+
+    Raises Refused when it must not be created or written.
+    """
+    environ = os.environ if environ is None else environ
+    env, value, path, verdict = _plan(repo, home, environ)
+    if verdict is None:
+        if env and value:
+            os.makedirs(value, exist_ok=True)
+        return env, value, path
+    if verdict in PERMITTED:
+        try:
+            verdict = codex_host_instructions.create_home(value, home)
+        except Exception as exc:  # noqa: BLE001 - a failed create refuses, never falls back
+            verdict = f"error: {exc}"
+    _refuse(verdict, value)
     return env, value, value
+
+
+def effective(repo, home, environ=None):
+    """The home `prepare` would hand the launcher, checked the same way but never created or changed.
+
+    Raises Refused where `prepare` would.
+    """
+    environ = os.environ if environ is None else environ
+    _env, value, path, verdict = _plan(repo, home, environ)
+    if verdict is not None:
+        _refuse(verdict, value)
+    # The launcher runs from the repo, so a relative home is the repo's; a desktop host refuses one.
+    return os.path.normpath(os.path.join(os.fspath(repo), os.path.expanduser(path)))
 
 
 def child(repo, path, name, home):

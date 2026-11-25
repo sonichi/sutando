@@ -760,6 +760,13 @@ class TestMovingTurnIsNotHung(unittest.TestCase):
         st, *_ = compose_state(_TURN_A, "unknown", True, prev_pane=_TURN_A)
         self.assertEqual(st, "hung")
 
+    def test_a_turn_drawn_as_its_spinner_alone_is_in_flight(self):
+        # Claude Code 2.1.322 prints no "esc to interrupt" while a turn runs.
+        a, b = (t.replace(" · esc to interrupt", "") for t in (_TURN_A, _TURN_B))
+        self.assertFalse(_mod.cli_wedge.frame_working(b))
+        self.assertEqual(compose_state(b, "unknown", True, prev_pane=a)[0], "running")
+        self.assertEqual(compose_state(a, "unknown", True, prev_pane=a)[0], "hung")
+
     def test_the_first_poll_has_no_motion_to_see(self):
         st, *_ = compose_state(_TURN_A, "unknown", True)
         self.assertEqual(st, "hung")
@@ -858,7 +865,7 @@ class TestMovingTurnIsNotHung(unittest.TestCase):
                 patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
                 patch.object(_mod.time, "monotonic", lambda: now[0]), \
                 patch.object(_mod.time, "time", lambda: wall_now[0]), \
-                patch.object(_mod.time, "sleep", _sleep), \
+                patch.object(_mod, "_sleep", _sleep), \
                 patch.object(sys, "argv", argv), self.assertRaises(_Stop):
             main()
         return states
@@ -1514,7 +1521,7 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
                 patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
                 patch.object(_mod, "send_keys",
                              lambda s, sess, k: sent.append((s, sess, k)) or k not in fail_keys), \
-                patch.object(_mod.time, "sleep", fake_sleep), \
+                patch.object(_mod, "_sleep", fake_sleep), \
                 patch.object(sys, "argv", argv):
             try:
                 main()

@@ -154,6 +154,13 @@ def lane_claims_proactive(name, lane_worker: str = "") -> bool:
     return (proactive_worker(name) or "") == (lane_worker or "")
 
 
+def lane_claims_card(by_worker, lane_worker: str = "", primary: bool = False) -> bool:
+    """Which lane posts a decision card: one a worker's session asked (`by_worker`) is that worker's own
+    lane's alone; any other is the primary lane's, as before."""
+    by = by_worker if isinstance(by_worker, str) else ""
+    return by == (lane_worker or "") and (bool(by) or primary)
+
+
 # A message about one task (a named instance's id included) names it: proactive-about-<task id>--<ts>
 # [.by-<worker>][.to-<channel>].txt. The gateway threads it in that task's conversation and re-checks the task first.
 _ABOUT_TASK_RE = re.compile(r"\Aproactive-about-(task-[A-Za-z0-9._~-]+)--(\d+)(?:\.by-[a-z0-9-]+)?(?:\.to-[a-z0-9_-]+)?\.txt\Z")

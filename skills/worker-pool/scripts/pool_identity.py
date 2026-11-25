@@ -6,12 +6,16 @@ connection row naming the worker (src/connections.py, "a pool worker's own ident
 of its own that answers only what is addressed to that agent, hands every task it queues to the
 worker, and posts nothing proactively. Retiring the worker (pool_manage retire) takes it away.
 
-    python3 pool_identity.py [--workspace WS] add <worker> --repo REPO --logs-dir DIR [TOKEN|-] [--yes --expected-server NAME]
-    python3 pool_identity.py [--workspace WS] add <worker> --device-flow --label LABEL [--display-name TEXT] [--lane INSTANCE]
-    python3 pool_identity.py [--workspace WS] show <worker>
-    python3 pool_identity.py [--workspace WS] rotate <worker> --repo REPO --logs-dir DIR [TOKEN|-]
+A worker holds at most one agent per server, so it can have one on each homeserver the core is
+connected to: `--device-flow --lane INSTANCE` adds it on that core lane's server. `show` lists them
+all; `rotate` and `remove` act on the one on `--server`, which may be left out while there is one.
+
+    python3 pool_identity.py [--workspace WS] add <worker> --repo REPO --logs-dir DIR [TOKEN|-] [--yes --expected-server NAME] [--shared-dirs]
+    python3 pool_identity.py [--workspace WS] add <worker> --device-flow --label LABEL [--display-name TEXT] [--lane INSTANCE] [--shared-dirs]
+    python3 pool_identity.py [--workspace WS] show <worker> [--server SERVER]
+    python3 pool_identity.py [--workspace WS] rotate <worker> --repo REPO --logs-dir DIR [TOKEN|-] [--server SERVER]
     python3 pool_identity.py [--workspace WS] rotate <worker> --device-flow --label LABEL [--lane INSTANCE]
-    python3 pool_identity.py [--workspace WS] remove <worker>
+    python3 pool_identity.py [--workspace WS] remove <worker> [--server SERVER]
     python3 pool_identity.py [--workspace WS] provision-begin <worker> [--role ROLE] [--lane INSTANCE]
     python3 pool_identity.py [--workspace WS] provision-wait <worker> --operation-id ID --name NAME
                                               [--display-name TEXT] [--role TEXT] [--timeout SECONDS] [--lane INSTANCE]
@@ -28,6 +32,13 @@ worker, and posts nothing proactively. Retiring the worker (pool_manage retire) 
 TOKEN is the agent's access token from its settings page in AG2 Space. Leave it out to type it
 at a hidden prompt, or pass '-' to read it from stdin; it is stored in the secret vault, never in
 a file, and never printed. `add` shows what the token's gateway says before anything is saved.
+
+A worker's first agent (`add`, pasted or `--device-flow`) also moves the worker onto that agent's own task
+and result folders before its lane starts, as `worker_lane.py migrate-dirs --apply` does: work already
+delivered to it moves or is handed back, and the output says `dirs`. `--shared-dirs` keeps it on the shared
+folders: use it only when something still reads this worker's work from the shared `tasks/` and `results/`
+(`migrate-dirs --apply` switches it later). `rotate` never changes a worker's folders. `provision-*` does
+not switch them either; run `migrate-dirs --apply` after it.
 
 `--device-flow` needs no pasted token either (pool_device_connect.py): the core starts s.space's
 device-connect flow for agent LABEL, sends the owner the approval link in their DM, waits until they
@@ -115,6 +126,14 @@ def reseat_after_add(ws: Path, repo, wid: str) -> dict:
     return out
 
 
+def dirs_said(wid: str, dirs: dict) -> str:
+    """A first agent's folder state ("own", "migrating", "shared"); one that stopped says how to finish it."""
+    if dirs.get("why"):
+        print(f"worker {wid}'s folders: {dirs['why']}; finish with: worker_lane.py migrate-dirs "
+              f"--worker {wid} --apply", file=sys.stderr)
+    return str(dirs.get("state") or ("own" if dirs.get("own") else "shared"))
+
+
 def cmd_device_flow(args, ws: Path, *, rotate: bool) -> int:
     """The device flow; a resend attempt (--resend-id) that ends without a new card says why and frees its button."""
     resend_id = getattr(args, "resend_id", None) or ""
@@ -146,7 +165,8 @@ def _device_flow(args, ws: Path, *, rotate: bool) -> tuple:
         out = pool_device_connect.connect(
             wid, label=args.label, display_name=args.display_name or "", worker_label=label, rotate=rotate,
             workspace=ws, lane=args.lane, base=args.base or "", repo=args.repo, logs_dir=args.logs_dir,
-            start_lane=start_lane, say=lambda text: print(text, file=sys.stderr, flush=True))
+            start_lane=start_lane, say=lambda text: print(text, file=sys.stderr, flush=True),
+            own_dirs=not getattr(args, "shared_dirs", False) and not rotate)
     except pool_device_connect.DeviceConnectError as e:
         print(f"pool_identity: {e}", file=sys.stderr)
         print(json.dumps({"status": e.status}, sort_keys=True))
@@ -157,6 +177,8 @@ def _device_flow(args, ws: Path, *, rotate: bool) -> tuple:
         print(f"lane {out['row']['instance']} not started: {launch.get('reason')}", file=sys.stderr)
     status = out["status"] if started else "stored_lane_not_started"
     line = {"agent_id": out["agent_id"], "status": status}
+    if "dirs" in out:
+        line["dirs"] = dirs_said(wid, out["dirs"])
     if not rotate and not args.no_start:
         line["seat"] = reseat_after_add(ws, args.repo, wid).get("result")
     print(json.dumps(line, sort_keys=True))
@@ -180,11 +202,20 @@ def cmd_add(args, ws: Path) -> int:
             print("not saved")
             return 1
         expected = str(preview.get("server") or "")
-    row, created = connections.add_worker_identity(wid, token, expected_server=expected, preview=preview,
-                                                   workspace=ws)
-    print(f"{'added' if created else 'already present:'} {row['instance']}: worker {wid} runs as "
-          f"{row.get('agent_mxid') or '?'} (token in the vault as {row['token_ref']})")
-    launch = connections.start_added(row, repo=args.repo, logs_dir=args.logs_dir, workspace=ws)
+    first = not connections.worker_identities(wid, ws)
+    try:
+        with pool_device_connect.fenced(wid, ws):
+            row, created = connections.add_worker_identity(wid, token, expected_server=expected, preview=preview,
+                                                           workspace=ws)
+        print(f"{'added' if created else 'already present:'} {row['instance']}: worker {wid} runs as "
+              f"{row.get('agent_mxid') or '?'} (token in the vault as {row['token_ref']})")
+        if created and first and not args.shared_dirs:
+            print(f"dirs: {dirs_said(wid, pool_device_connect.switch_to_own_dirs(wid, ws))}")
+        with pool_device_connect.fenced(wid, ws):
+            launch = connections.start_added(row, repo=args.repo, logs_dir=args.logs_dir, workspace=ws)
+    except pool_device_connect.DeviceConnectError:
+        print(f"pool_identity: worker {wid} was retired; no lane was started for it", file=sys.stderr)
+        return 1
     if created:
         print(f"seat: {reseat_after_add(ws, args.repo, wid).get('result')}")
     if launch is not None and not launch.get("ok"):
@@ -195,21 +226,27 @@ def cmd_add(args, ws: Path) -> int:
 
 
 def cmd_show(args, ws: Path) -> int:
-    row = connections.worker_identity(live_worker(ws, args.worker), ws)
-    if row is None:
-        print(f"{args.worker} has no agent of its own; it answers through the core's")
+    wid = live_worker(ws, args.worker)
+    rows = [connections.worker_identity(wid, ws, server=args.server)] if args.server \
+        else connections.worker_identities(wid, ws)
+    rows = [r for r in rows if r is not None]
+    if not rows:
+        print(f"{args.worker} has no agent of its own{' on ' + args.server if args.server else ''}; "
+              "it answers through the core's")
         return 1
     keep = ("instance", "server", "agent_mxid", "agent_display_name", "token_ref", "added_by", "added_at", "disabled")
-    print(json.dumps({k: row.get(k) for k in keep}, indent=2, sort_keys=True))
+    shown = [{k: r.get(k) for k in keep} for r in rows]
+    print(json.dumps(shown[0] if len(shown) == 1 else shown, indent=2, sort_keys=True))
     return 0
 
 
 def cmd_rotate(args, ws: Path) -> int:
     if args.device_flow:
         return cmd_device_flow(args, ws, rotate=True)
-    row = connections.worker_identity(live_worker(ws, args.worker), ws)
+    row = connections.worker_identity(live_worker(ws, args.worker), ws, server=args.server)
     if row is None:
-        print(f"pool_identity: {args.worker} has no agent of its own to rotate", file=sys.stderr)
+        print(f"pool_identity: {args.worker} has no agent of its own to rotate"
+              f"{' on ' + args.server if args.server else ''}", file=sys.stderr)
         return 1
     token = read_token(args.token, f"New access token for {args.worker}'s own agent (hidden): ")
     out = connections.update_token(str(row["instance"]), token, repo=args.repo, logs_dir=args.logs_dir, workspace=ws)
@@ -220,9 +257,9 @@ def cmd_rotate(args, ws: Path) -> int:
 def cmd_remove(args, ws: Path) -> int:
     roster = pr.load_roster(ws) or {}
     wid = pr.resolve_label(roster, args.worker)
-    row = connections.retire_worker_identity(wid, workspace=ws)
+    row = connections.remove_worker_identity(wid, server=args.server, workspace=ws)
     if row is None:
-        print(f"{args.worker} has no agent of its own")
+        print(f"{args.worker} has no agent of its own{' on ' + args.server if args.server else ''}")
         return 0
     print(f"removed {row['instance']} ({row.get('agent_mxid') or '?'}): lane stopped, row and vault secret gone; "
           "the agent stays on its server until the owner deletes it there")
@@ -354,8 +391,11 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--yes", action="store_true"); a.add_argument("--expected-server", default=None)
     a.set_defaults(fn=cmd_add)
     s = sub.add_parser("show"); s.add_argument("worker"); s.set_defaults(fn=cmd_show)
+    s.add_argument("--server", default=None, help="only the agent on this server (default: every one)")
     r = sub.add_parser("rotate"); r.add_argument("worker"); r.add_argument("token", nargs="?", default=None)
     r.set_defaults(fn=cmd_rotate)
+    r.add_argument("--server", default=None, help="the agent on this server, for a worker with several "
+                   "(--device-flow takes the server of --lane)")
     for s in (a, r):
         # A pasted token needs --repo and --logs-dir; --device-flow defaults them.
         s.add_argument("--repo", type=Path, default=None); s.add_argument("--logs-dir", type=Path, default=None)
@@ -363,7 +403,11 @@ def build_parser() -> argparse.ArgumentParser:
         s.add_argument("--display-name", default=None); s.add_argument("--lane", default=None)
         s.add_argument("--base", default=None, help=argparse.SUPPRESS); s.add_argument("--no-start", action="store_true")
         s.add_argument("--resend-id", default=None, help=argparse.SUPPRESS)
+    a.add_argument("--shared-dirs", action="store_true",
+                   help="keep the worker on the shared tasks/ and results/ (only while something still reads "
+                        "its work there; worker_lane.py migrate-dirs --apply switches it later)")
     s = sub.add_parser("remove"); s.add_argument("worker"); s.set_defaults(fn=cmd_remove)
+    s.add_argument("--server", default=None, help="the agent on this server, for a worker with several")
     s = sub.add_parser("provision-begin"); s.add_argument("worker"); s.add_argument("--role", default=None)
     s.add_argument("--lane", default=None); s.set_defaults(fn=cmd_provision_begin)
     s = sub.add_parser("provision-wait"); s.add_argument("worker"); s.add_argument("--operation-id", required=True)

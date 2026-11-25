@@ -168,6 +168,9 @@ def get_quota_status() -> dict:
         return {"available": True}
     try:
         data = json.loads(quota_file.read_text())
+        from quota_availability import trusted_record
+        if trusted_record(data) is None:  # another login's numbers are not this core's
+            return {"available": True}
         headers = data.get("headers", {})
         # Parse reset timestamps PER WINDOW: one malformed value degrades
         # its own tile to unknown, never the sibling or the whole panel.
