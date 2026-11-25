@@ -69,8 +69,13 @@ class Fake:
     def __init__(self):
         self.calls = []
 
+    replay = False  # True: a reused operation id gets its first event back, as the platform answers
+
     def execute(self, action, arguments, *, operation_id, room_id):
         self.calls.append((action, arguments, operation_id, room_id))
+        if self.replay:
+            self.__dict__.setdefault("given", {}).setdefault(operation_id, f"$card{len(self.calls)}")
+            return {"result": {"event_id": self.given[operation_id]}}
         return {"result": {"event_id": f"$card{len(self.calls)}"}}
 
     def cards(self):
@@ -189,6 +194,22 @@ class Menu(Base):
                          (mc.CARD_ID, DM, "s_dspace", "skills/model-switch/scripts/model_card.py reply"))
         self.assertRegex(entry["handler"], ac._HANDLER_RE)
         self.assertEqual(entry["offers"][SAID["fable"]], "card:model:core:fable")
+
+    def test_a_replayed_answer_to_an_older_message_keeps_the_newer_cards_buttons(self):
+        # A for $a, then B for $b, then A retried: the platform hands back A's event; B must still act.
+        import argparse
+        import issued_cards
+        self.fake.replay = True
+        import time
+        t = time.time()
+        for at, ask in ((t, "$a"), (t + 1, "$b"), (t + 2, "$a")):
+            args = argparse.Namespace(room=DM, owner_dm=False, reply_to=ask, print=False, lead="")
+            with contextlib.redirect_stdout(io.StringIO()):
+                mc.cmd_post(self.ws, args, core=CORE, execute=self.fake.execute, now=lambda at=at: at)
+        events = [self.fake.given[c[2]] for c in self.fake.calls if c[0] == "room.message.send"]
+        self.assertEqual((events[0] == events[2], events[0] == events[1]), (True, False))
+        self.assertIsNotNone(issued_cards.live(self.ws, events[1]), "the newer card's buttons still act")
+        self.assertIsNotNone(issued_cards.live(self.ws, events[0]))
 
     def test_a_retried_answer_reuses_its_id_and_gets_the_earlier_post_back_even_if_edited(self):
         # A reused id returns the earlier post, even if that card was since edited to its outcome; the retry

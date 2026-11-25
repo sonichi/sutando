@@ -5,7 +5,8 @@ reply text as the owner. So a click acts only when it names a card recorded here
 agent posted it), in the room it was posted in, replies to that card's own event, and carries a text
 that card offered. One JSON file per workspace: event id -> {card id, room, lane, handler, offered reply
 text -> its command ("" for plain words), picker, expiry}. A newer card with the same id in the same
-room replaces the older record, so a settled card's buttons stop acting. The caller passes the
+room replaces the older record, so a settled card's buttons stop acting; a retried send the platform
+answers with an event it already gave replaces nothing. The caller passes the
 workspace; nothing here resolves it. Standard library only, plus file_lock and local_record.
 """
 from __future__ import annotations
@@ -62,13 +63,24 @@ def has_picker(card: Mapping[str, object]) -> bool:
     return any(b.get("kind") == "connect_picker" for b in _actions(card))
 
 
-def _read(path: Path) -> dict:
+def _load(path: Path) -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    cards = data.get("cards") if isinstance(data, dict) else None
+    return data if isinstance(data, dict) else {}
+
+
+def _read(path: Path) -> dict:
+    cards = _load(path).get("cards")
     return cards if isinstance(cards, dict) else {}
+
+
+def _retired(path: Path, now: float) -> dict:
+    """{event id: {"why": "replaced" | "settled", "expires_at"}} of cards no longer live, unexpired."""
+    got = _load(path).get("retired")
+    return {k: v for k, v in (got.items() if isinstance(got, dict) else ())
+            if isinstance(v, dict) and float(v.get("expires_at") or 0) > now}
 
 
 def record(workspace: Path, event_id: str, card: Mapping[str, object], *, room: str = "", lane: str = "",
@@ -84,14 +96,26 @@ def record(workspace: Path, event_id: str, card: Mapping[str, object], *, room: 
     now = time.time() if now is None else now
     path = ledger_path(workspace)
     with locked_file(path.with_name(path.name + ".lock")):
-        cards = {k: v for k, v in _read(path).items()
-                 if isinstance(v, dict) and float(v.get("expires_at") or 0) > now
-                 and not (v.get("card_id") == card_id and str(v.get("room") or "") == room)}
+        live_cards = {k: v for k, v in _read(path).items()
+                      if isinstance(v, dict) and float(v.get("expires_at") or 0) > now}
+        retired = _retired(path, now)
+        # A send the platform answered with an event it already gave (a retried operation id) is no newer card.
+        replay = event_id in live_cards or event_id in retired
+        if retired.get(event_id, {}).get("why") == "settled":
+            return False
+        cards = dict(live_cards)
+        if not replay:
+            for k, v in live_cards.items():
+                if v.get("card_id") == card_id and str(v.get("room") or "") == room:
+                    cards.pop(k)
+                    retired[k] = {"why": "replaced", "expires_at": v.get("expires_at")}
+        retired.pop(event_id, None)
         if payloads or picker:
             cards[event_id] = {"card_id": card_id, "offers": payloads, "picker": picker, "room": room,
                                "lane": lane, "handler": handler, "expires_at": now + ttl_s}
         newest = sorted(cards.items(), key=lambda kv: kv[1]["expires_at"])[-MAX_CARDS:]
-        write_whole(path, {"cards": dict(newest)})
+        old = sorted(retired.items(), key=lambda kv: float(kv[1].get("expires_at") or 0))[-MAX_CARDS:]
+        write_whole(path, {"cards": dict(newest), "retired": dict(old)})
     return bool(payloads or picker)
 
 
@@ -101,10 +125,13 @@ def settle(workspace: Path, event_id: str) -> bool:
     from local_record import write_whole
     path = ledger_path(workspace)
     with locked_file(path.with_name(path.name + ".lock")):
-        cards = _read(path)
-        if cards.pop(str(event_id or ""), None) is None:
+        cards, retired = _read(path), _retired(path, time.time())
+        entry = cards.pop(str(event_id or ""), None)
+        if entry is None:
             return False
-        write_whole(path, {"cards": cards})
+        until = entry.get("expires_at") if isinstance(entry, dict) else 0
+        retired[str(event_id)] = {"why": "settled", "expires_at": until}
+        write_whole(path, {"cards": cards, "retired": retired})
     return True
 
 
