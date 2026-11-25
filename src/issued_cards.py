@@ -77,7 +77,7 @@ def _read(path: Path) -> dict:
 
 
 def _retired(path: Path, now: float) -> dict:
-    """{event id: {"why": "replaced" | "settled", "expires_at"}} of cards no longer live, unexpired."""
+    """{event id: {"why": "replaced", "expires_at"}}: cards a newer one of the same id replaced, unexpired."""
     got = _load(path).get("retired")
     return {k: v for k, v in (got.items() if isinstance(got, dict) else ())
             if isinstance(v, dict) and float(v.get("expires_at") or 0) > now}
@@ -99,8 +99,8 @@ def record(workspace: Path, event_id: str, card: Mapping[str, object], *, room: 
         live_cards = {k: v for k, v in _read(path).items()
                       if isinstance(v, dict) and float(v.get("expires_at") or 0) > now}
         retired = _retired(path, now)
-        # An event the platform hands back for a retried send is no newer card: a superseded or settled one
-        # stays retired, and a live one replaces nothing.
+        # An event the platform hands back for a retried send is no newer card: a superseded one stays
+        # retired, and a live one replaces nothing.
         if event_id in retired:
             return False
         cards = dict(live_cards)
@@ -124,13 +124,10 @@ def settle(workspace: Path, event_id: str) -> bool:
     from local_record import write_whole
     path = ledger_path(workspace)
     with locked_file(path.with_name(path.name + ".lock")):
-        cards, retired = _read(path), _retired(path, time.time())
-        entry = cards.pop(str(event_id or ""), None)
-        if entry is None:
+        cards = _read(path)
+        if cards.pop(str(event_id or ""), None) is None:
             return False
-        until = entry.get("expires_at") if isinstance(entry, dict) else 0
-        retired[str(event_id)] = {"why": "settled", "expires_at": until}
-        write_whole(path, {"cards": cards, "retired": retired})
+        write_whole(path, {"cards": cards, "retired": _load(path).get("retired") or {}})
     return True
 
 
