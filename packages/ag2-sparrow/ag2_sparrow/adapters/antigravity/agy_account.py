@@ -73,10 +73,12 @@ _AUTH_LINE = re.compile(r"applyAuthResult: email=([^,\s]+@[^,\s]+)")
 def quota_error(status, text, detail) -> bool:
     """Whether a turn ended on agy's quota: a failed turn whose error says so, or a completed one whose
     (short) answer opens with that error, as agy has answered it. An answer that only mentions one is not."""
+    said = (text or "").strip()
+    answered = 0 < len(said) <= QUOTA_TEXT_MAX and bool(QUOTA_ANSWER_RE.match(said))
     if status == "completed":
-        said = (text or "").strip()
-        return 0 < len(said) <= QUOTA_TEXT_MAX and bool(QUOTA_ANSWER_RE.match(said))
-    return status in ("failed", "refused") and bool(QUOTA_RE.search("%s %s" % (text or "", detail or "")))
+        return answered
+    # A failed turn's partial answer is judged as an answer too: only the error itself is searched.
+    return status in ("failed", "refused") and (answered or bool(QUOTA_RE.search(detail or "")))
 
 
 def asks_for_card(text) -> bool:
