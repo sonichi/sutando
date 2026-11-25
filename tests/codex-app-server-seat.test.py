@@ -191,6 +191,12 @@ for line in sys.stdin:
                                 "when using Codex with a ChatGPT account.", "codexErrorInfo": "modelNotFound"}
             out({"method": "error", "params": {"threadId": thread, "turnId": turn, "error": error}})
             finish("failed", error)
+        elif step == "model-missing-at-start":
+            error = {"message": "The 'gpt-6-1-terra' model is not supported when using Codex with a ChatGPT account.",
+                     "codexErrorInfo": "modelNotFound"}
+            out({"method": "thread/status/changed", "params": {"threadId": thread, "status": {"type": "systemError"}}})
+            out({"method": "error", "params": {"threadId": thread, "turnId": "another-turn-id", "error": error}})
+            finish("failed", None)
         elif step == "fail-other":
             finish("failed", {"message": "stream disconnected before completion",
                               "codexErrorInfo": "responseStreamDisconnected"})
@@ -1460,6 +1466,21 @@ class ModelNotAvailable(SeatCase):
         self.assertIn("post --owner-dm --lead gpt-6.1-terra isn't available on this Codex account", calls[0])
         self.assertFalse((self.results / "task-1.txt").exists(), "no result: it stays pending for the pick")
         self.assertEqual(list(self.results.glob("proactive-model-*.txt")), [])
+
+    def test_a_refusal_at_turn_start_with_another_turn_id_gets_the_card_too(self):
+        """VM 2026-11-24 05:38: refused straight at turn start (systemError, no compaction), the error naming
+        another turn id and the turn's own error empty; no card followed."""
+        self.task("task-1.txt")
+        self.plan("model-missing-at-start")
+        s = self.make(retry_s=30, max_attempts=3)
+        s.model = "gpt-6-1-terra"
+        s.ensure_server()
+        with self.fake_card():
+            self.assertNotEqual(s.step(), "done")
+        calls = self.card_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--lead gpt-6-1-terra isn't available on this Codex account", calls[0])
+        self.assertIn("model card posted", self.out.getvalue())
 
     def test_the_card_is_shown_once_per_refused_model(self):
         self.task("task-1.txt")
