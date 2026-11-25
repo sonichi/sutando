@@ -419,9 +419,11 @@ class PartsTest(unittest.TestCase):
             self.assertEqual(agy_account.signed_in_as(os.path.join(d, "none"), 42), "")
 
     def test_asks_for_card_only_for_short_asks(self):
-        for ask in ("换账号", "帮我切换账号", "Switch account.", "use an API key", "/account"):
+        for ask in ("换账号", "帮我切换账号", "Switch account.", "use an API key", "/account",
+                    "agy account, can you see it?", "which account are you using?", "你用的哪个账号"):
             self.assertTrue(agy_account.asks_for_card(ask), ask)
         self.assertFalse(agy_account.asks_for_card("write a script that can switch account for my users"))
+        self.assertFalse(agy_account.asks_for_card("create an account on github"))
 
     def test_key_saved_asks_for_attributes_only_and_clear_names_this_agents_item(self):
         calls = []
