@@ -11,6 +11,7 @@ import os
 import queue
 import re
 import subprocess
+import shutil
 import sys
 import tempfile
 import time
@@ -20,7 +21,7 @@ from unittest import mock
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import local_task_protocol, task_io, team_guardrail  # noqa: E402
+from ag2_sparrow import connector_cards, local_task_protocol, model_switch, task_io, team_guardrail  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
 
 # The note as it was pinned before it moved to the shared owner: proves the move changed no byte.
@@ -717,6 +718,372 @@ class EndToEndStubTest(unittest.TestCase):
             self.assertEqual(result(d, "task-chat-o").strip(), "STUB second try", "owner retry on the same thread")
             self.assertEqual(result(d, "task-chat-g").strip(), cc.NO_REPLY, "a fresh ephemeral thread is empty again")
             self.assertEqual([m["status"] for m in metrics(d)], ["completed", "completed"])
+
+
+class ModelCardTest(unittest.TestCase):
+    """The owner's model card (model_switch): asked for in their DM, tapped, and confirmed there."""
+
+    DM = "!dm:s.space"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.work = Path(self.tmp.name) / "work"
+        self.bridge = Path(str(self.work) + ".bridge") / "state"
+        self.bridge.mkdir(parents=True)        # the agent's own bridge, as `install` makes it
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def dm(self, tid, body, reply_to="", click="", tier="owner", kind="dm", channel=None):
+        lines = ["id: " + tid, "timestamp: 2026-11-14T00:00:00Z", "source: ag2space",
+                 "channel_id: " + (channel or self.DM), "channel_kind: " + kind, "source_message_id: $m-" + tid,
+                 "user_id: @alice:s.space", "access_tier: " + tier]
+        if reply_to:
+            lines.append("reply_to_event: " + reply_to)
+        if click:
+            lines.append("card_click: " + json.dumps({"card_id": "model-switch", "action": click}))
+        write_text(self.work, tid, "\n".join(lines + ["task: " + body]) + "\n")
+
+    def serve(self, tid, body, extra=(), **kw):
+        self.dm(tid, body, **kw)
+        self.assertEqual(run_connector(self.work, once=1, extra=extra), 0)
+        return result(self.work, tid)
+
+    def posted(self, event="$card1"):
+        """What the bridge does: post each queued card, and say which event it became."""
+        sent = []
+        connector_cards.Poster(self.bridge, lambda p: sent.append(p) or {"ok": True, "event_id": event},
+                               log=lambda line: None).sweep()
+        return [(p["room_id"], p["extra_content"]["space.ag2.card"]) for p in sent]
+
+    def state(self):
+        return json.loads((self.work / "state" / "model.json").read_text())
+
+    def pick(self, name, event="$card1"):
+        """Ask for the card, have the bridge post it, and tap the button named `name`."""
+        tag = name.replace(" ", "") + event.strip("$")
+        self.assertEqual(self.serve("task-ask-" + tag, "/model"), "[no-send] the model card answers\n")
+        ((_, card),) = self.posted(event)
+        said = next(b["reply"] for b in card["buttons"] if b["label"] == name)
+        return self.serve("task-tap-" + tag, said, reply_to=event, click=said)
+
+    def test_the_owners_tap_runs_the_next_turn_on_the_pick_and_a_card_says_it_switched(self):
+        self.assertEqual(self.serve("task-1", "/model"), "[no-send] the model card answers\n")
+        self.assertEqual((metrics(self.work)[0]["card"], "thread" in metrics(self.work)[0]), ("model-card", False),
+                         "/model never reaches Codex")
+        ((room, card),) = self.posted()
+        self.assertEqual((room, card["state"], [b["label"] for b in card["buttons"]]),
+                         (self.DM, "pending", ["Stub Model", "Stub Large", "Stub Broken", "Stub Moved", "Stub 5", "Stub 6"]))
+        self.assertEqual(card["text"], "Now using Stub Model. Also: Stub 7, Stub 8 (send /model and the name).")
+        said = card["buttons"][1]["reply"]
+        self.assertEqual(self.serve("task-2", said, reply_to="$card1", click=said), "[no-send] the model card answers\n")
+        self.assertEqual((self.state()["wanted"], metrics(self.work)[-1]["card"]), ("gpt-6-sol", "model-picked"))
+        ((_, coming),) = self.posted("$card2")
+        self.assertEqual((coming["state"], "buttons" in coming), ("info", False))
+        self.assertIn("Switching to Stub Large on your next message", coming["text"])
+        # The next turn on a kept thread, in any room, carries the pick; the owner is told in the DM.
+        self.assertIn("model=gpt-6-sol", self.serve("task-3", "hello", channel="!room:s.space", kind="room"))
+        self.assertEqual((metrics(self.work)[-1]["model"], metrics(self.work)[-1]["model_switch"]), ("gpt-6-sol", "switched"))
+        ((room, done),) = self.posted("$card3")
+        self.assertEqual((room, done["state"], done["text"]), (self.DM, "done", "Switched. I'm now using Stub Large."))
+        self.assertIn("model=gpt-6-sol", self.serve("task-4", "again"), "the pick stays")
+        self.assertEqual(self.posted(), [], "told once")
+        self.assertNotIn("model_switch", metrics(self.work)[-1])
+        # Asked again, the card names the pick as the model in use; tapping it changes and confirms nothing.
+        self.assertEqual(self.pick("Stub Large", "$card4"), "[no-send] the model card answers\n")
+        ((_, same),) = self.posted("$card5")
+        self.assertEqual((same["text"], metrics(self.work)[-1]["card"]),
+                         ("I'm already using Stub Large. Nothing changed.", "model-same"))
+
+    def test_a_model_past_the_buttons_is_picked_by_name_and_an_unknown_name_is_refused(self):
+        self.assertEqual(self.serve("task-1", "/model stub 7"), "[no-send] the model card answers\n")
+        self.assertEqual((self.state()["wanted"], metrics(self.work)[-1]["card"]), ("gpt-5.5", "model-picked"))
+        self.assertIn("not one I can use now", self.serve("task-2", "/model gpt-6-hidden"))
+        self.assertIn("not one I can use now", self.serve("task-3", "/model no such model"))
+        self.assertEqual(self.state()["wanted"], "gpt-5.5")
+
+    def test_a_turn_that_fails_on_the_pick_says_so_and_the_pick_is_dropped(self):
+        self.pick("Stub Broken")
+        self.posted("$card2")
+        text = self.serve("task-3", "hello")
+        self.assertIn("Codex ended this task with status failed", text)
+        self.assertEqual(metrics(self.work)[-1]["model_switch"], "not-switched")
+        ((room, card),) = self.posted("$card3")
+        self.assertEqual((room, card["state"], card["text"]),
+                         (self.DM, "error", "I could not switch to Stub Broken. I'm still using Stub Model. Send /model "
+                                            "to try again."))
+        self.assertEqual(self.state()["wanted"], "")
+        self.assertNotIn("model=", self.serve("task-4", "again"), "no pick of the owner's took: Codex's own model")
+
+    def test_a_turn_codex_moved_to_another_model_is_not_called_switched(self):
+        self.pick("Stub Moved")
+        self.posted("$card2")
+        self.assertIn("model=gpt-6-luna", self.serve("task-3", "hello"))
+        ((_, card),) = self.posted("$card3")
+        self.assertEqual(card["text"], "I could not switch to Stub Moved. I'm still using Stub Model. Send /model to try again.")
+        self.assertEqual((self.state()["wanted"], metrics(self.work)[-1]["model_switch"]), ("", "not-switched"))
+
+    def test_asking_in_ones_own_words_shows_the_card_and_only_the_owners_ask_in_their_dm_does(self):
+        self.assertEqual(self.serve("task-1", "[[askmodel]] can you change model"), "[no-send] the model card answers\n")
+        self.assertEqual((metrics(self.work)[-1]["card"], len(self.posted())), ("model-card", 1))
+        self.assertEqual(self.serve("task-2", "[[askmodel]] change model", channel="!room:s.space", kind="room").strip(),
+                         model_switch.IN_DM)
+        self.assertEqual(metrics(self.work)[-1]["card"], "model-card-elsewhere")
+        # A team sender's turn is not told about the mark; if Codex says it anyway, it is ordinary text.
+        self.dm("task-3", "[[askmodel]] change model", tier="team", channel="!room:s.space", kind="room")
+        (self.work / "tasks" / "task-3.txt").write_text(gateway_mid_task("task-3", "[[askmodel]] change model", "team", True))
+        self.assertEqual(run_connector(self.work, once=1), 0)
+        self.assertEqual((result(self.work, "task-3").strip(), "card" in metrics(self.work)[-1]), ("[model-card]", False))
+        self.assertEqual(self.posted(), [])
+
+    def test_a_guests_turn_runs_on_the_owners_pick_and_its_outcome_goes_to_the_dm(self):
+        self.pick("Stub Large")
+        self.posted("$card2")
+        guest = self.serve("task-3", "hi", extra=["--allow-non-owner"], tier="guest", channel="!room:s.space", kind="room")
+        self.assertIn("model=gpt-6-sol", guest)
+        self.assertNotIn("Switched", guest, "never in the room's answer")
+        ((room, told),) = self.posted("$card3")
+        self.assertEqual((room, told["text"], metrics(self.work)[-1]["model_switch"]),
+                         (self.DM, "Switched. I'm now using Stub Large.", "switched"))
+        self.assertEqual((self.state()["wanted"], self.state()["confirmed"]), ("gpt-6-sol", "gpt-6-sol"), "the pick is kept")
+        self.assertIn("model=gpt-6-sol", self.serve("task-4", "hello"))
+        self.assertEqual(self.posted(), [], "told once")
+
+    def test_without_the_agents_own_bridge_there_is_no_card_and_model_is_an_ordinary_message(self):
+        shutil.rmtree(self.bridge.parent)
+        self.assertTrue(self.serve("task-1", "/model").startswith("STUB echo:"))
+        self.assertFalse((self.work / "state" / "model.json").exists())
+        self.assertEqual(self.serve("task-2", "[[askmodel]] change model").strip(),
+                         "I could not post the model card. Try again in a moment.")
+
+    def connector(self, listed=None):
+        """A connector on a fake server whose `model/list` answers `listed` (None: it refuses)."""
+        args = cc.build_parser().parse_args(["--work", str(self.work)])
+        args.state, args.bridge_state = str(self.work / "state"), str(self.bridge)
+        (self.work / "state").mkdir(parents=True, exist_ok=True)
+        c = cc.Connector(FakeRpc, args, note="n")
+        refusal = RuntimeError("model/list: refused")
+        answer = (lambda *a, **k: {"data": listed}) if listed is not None else mock.Mock(side_effect=refusal)
+        return c, mock.patch.object(c.rpc, "request", answer, create=True)
+
+    def test_a_model_list_codex_refuses_and_a_ledger_that_cannot_be_read_stop_nothing(self):
+        c, refused = self.connector()
+        c.models.seen([("gpt-5.5", "One")], "gpt-5.5")
+        with refused:
+            self.assertFalse(c.list_models())
+        self.assertEqual(c.models.state()["available"], [{"id": "gpt-5.5", "name": "One"}], "the last list is kept")
+        with mock.patch.object(cc.connector_cards, "absorb", side_effect=ValueError("bad ledger")):
+            self.assertTrue(self.serve("task-1", "hello").startswith("STUB echo: Sutando task task-1 (source=ag2space"))
+
+    def test_only_a_model_on_the_allowlist_that_codex_lists_is_offered_or_taken(self):
+        self.assertEqual(self.serve("task-1", "/model"), "[no-send] the model card answers\n")
+        ((_, card),) = self.posted()
+        self.assertNotIn("Stub Unlisted", [b["label"] for b in card["buttons"]] + [card["text"]])
+        for tid, said in (("task-2", "/model stub unlisted"), ("task-3", "/model stub-unlisted")):
+            self.assertEqual(self.serve(tid, said).strip(), model_switch.NOT_USABLE, "Codex lists it; the code does not")
+        self.assertEqual(self.posted(), [])
+        # A ledger naming a model off the list never puts a turn on it.
+        (self.work / "state" / "model.json").write_text(json.dumps({"wanted": "stub-unlisted", "told": "stub-unlisted",
+                                                                     "current": "stub-unlisted"}))
+        self.assertNotIn("model=", self.serve("task-4", "hello"))
+        sent, rf = {"channel_id": self.DM}, str(self.work / "out.txt")
+        # On the allowlist, but not listed by Codex now: refused.
+        c, listed = self.connector([{"id": "gpt-5.2", "displayName": "Two"}])
+        c.models.save(available=[{"id": "gpt-5.5", "name": "One"}])
+        with listed:
+            self.assertEqual(c.models.pick("gpt-5.5", sent, rf), "model-unknown")
+        self.assertEqual(Path(rf).read_text().strip(), model_switch.NOT_USABLE)
+        # Codex's list unavailable: nothing is offered and nothing is taken, even a model listed before.
+        c, refused = self.connector()
+        c.models.save(available=[{"id": "gpt-5.5", "name": "One"}], wanted="")
+        with refused:
+            self.assertEqual((c.models.pick("gpt-5.5", sent, rf), c.models.offer(sent, rf)),
+                             ("model-unlisted", "model-unlisted"))
+        self.assertEqual((Path(rf).read_text().strip(), c.models.wanted()), (model_switch.UNLISTED, None))
+        self.assertEqual(self.posted(), [])
+
+    def test_a_pending_pick_is_shown_as_pending_and_a_failed_switch_names_the_model_really_in_use(self):
+        self.pick("Stub Broken")
+        ((_, coming),) = self.posted("$card2")
+        self.assertIn("Switching to Stub Broken on your next message", coming["text"])
+        # Reopened before any turn: the model in use is still Codex's own, and the pick is pending.
+        self.assertEqual(self.serve("task-again", "/model"), "[no-send] the model card answers\n")
+        ((_, menu),) = self.posted("$card3")
+        self.assertTrue(menu["text"].startswith("Now using Stub Model. Pending: Stub Broken, on your next message."))
+        self.assertEqual(self.state()["current"], "gpt-5.6-sol")
+        said = next(b["reply"] for b in menu["buttons"] if b["label"] == "Stub Broken")
+        self.assertEqual(self.serve("task-repeat", said, reply_to="$card3", click=said), "[no-send] the model card answers\n")
+        ((_, still),) = self.posted("$card4")
+        self.assertEqual((still["state"], metrics(self.work)[-1]["card"]), ("info", "model-pending"))
+        self.assertIn("Switching to Stub Broken on your next message", still["text"])
+        self.serve("task-turn", "hello")
+        ((_, failed),) = self.posted("$card5")
+        self.assertEqual(failed["text"], "I could not switch to Stub Broken. I'm still using Stub Model. Send /model "
+                                         "to try again.")
+        # A switch that took is the model in use from then on, and stays so when a later pick fails.
+        self.pick("Stub Large", "$card6")
+        self.posted("$card7")
+        self.serve("task-on-large", "hello")
+        self.posted("$card8")
+        self.pick("Stub Broken", "$card9")
+        self.posted("$card10")
+        self.serve("task-fails", "hello")
+        ((_, failed),) = self.posted("$card11")
+        self.assertIn("I'm still using Stub Large.", failed["text"])
+        self.assertIn("model=gpt-6-sol", self.serve("task-after", "again"), "the model that took is kept")
+
+    def test_an_outcome_that_could_not_be_queued_is_settled_at_once_and_told_after_the_next_turn(self):
+        self.pick("Stub Broken")
+        self.posted("$card2")
+        with mock.patch.object(model_switch.connector_cards, "queue", side_effect=OSError("disk full")):
+            c, _ = self.connector()
+            self.assertEqual(c.models.tell(True, "gpt-5.6-sol"), "untold")
+        self.assertEqual((self.state()["wanted"], self.state()["current"]), ("", "gpt-5.6-sol"), "the refused pick is dropped")
+        self.assertNotIn("model=", self.serve("task-3", "hello"), "the refused switch is not asked for again")
+        ((_, card),) = self.posted("$card3")
+        self.assertEqual((card["state"], metrics(self.work)[-1]["model_switch"]), ("error", "not-switched"))
+        self.assertIn("I could not switch to Stub Broken. I'm still using Stub Model.", card["text"])
+        self.serve("task-4", "again")
+        self.assertEqual((self.posted(), self.state().get("untold")), ([], []), "told once")
+
+
+    def test_a_model_codex_moved_the_turn_to_is_never_taken_for_the_owners_pick(self):
+        self.pick("Stub Moved")
+        self.posted("$card2")
+        self.serve("task-3", "hello")                   # Codex moves it to its default
+        self.posted("$card3")
+        self.assertEqual((self.state()["current"], self.state().get("confirmed")), ("gpt-5.6-sol", None))
+        self.assertNotIn("model=", self.serve("task-4", "again"), "the model Codex moved to is not pinned")
+        # After a pick that took, a moved one leaves that pick in use, not where Codex moved the turn.
+        self.pick("Stub Large", "$card5")
+        self.posted("$card6")
+        self.serve("task-on-large", "hello")
+        self.posted("$card7")
+        self.pick("Stub Moved", "$card8")
+        self.posted("$card9")
+        self.serve("task-moved", "hello")
+        ((_, card),) = self.posted("$card10")
+        self.assertIn("I'm still using Stub Large.", card["text"])
+        self.assertEqual(self.state()["current"], "gpt-6-sol")
+        self.assertIn("model=gpt-6-sol", self.serve("task-after", "again"))
+
+    def test_a_name_with_a_newline_is_one_line_and_a_card_that_cannot_be_built_is_said_in_words_once(self):
+        c, _ = self.connector()
+        c.models.seen([("gpt-5.5", "Five\nPoint  Five"), ("gpt-5.2", " \n ")], "gpt-5.5")
+        self.assertEqual([m["name"] for m in c.models.state()["available"]], ["Five Point Five", "gpt-5.2"])
+        # A ledger written before that (or a name the card rules refuse) never raises out of a turn.
+        (self.work / "state" / "model.json").write_text(json.dumps({
+            "available": [{"id": "gpt-5.6-sol", "name": "Stub Model"}, {"id": "gpt-6-sol", "name": "Stub\nLarge"}],
+            "current": "gpt-5.6-sol", "wanted": "gpt-6-sol", "asked_in": self.DM, "told": ""}))
+        room = self.serve("task-0", "hello", channel="!room:s.space", kind="room")
+        self.assertIn("model=gpt-6-sol", room)
+        self.assertNotIn("Switched", room, "words for the owner's DM never go to a shared room")
+        self.assertEqual(([o["picked"] for o in self.state()["untold"]], self.state()["confirmed"]),
+                         (["gpt-6-sol"], "gpt-6-sol"), "settled, and kept owed")
+        self.assertIn("task-0", (self.work / "state" / "done").read_text(), "answered, so the turn is not run again")
+        text = self.serve("task-1", "hello")
+        self.assertIn("Switched. I'm now using Stub", text, "the outcome, in words, in the DM")
+        self.assertEqual((self.posted(), metrics(self.work)[-1]["model_switch"], self.state()["untold"]),
+                         ([], "switched", []))
+        self.assertNotIn("Switched", self.serve("task-2", "again"), "said once")
+        # A pick whose card cannot be built is answered in words.
+        self.dm("task-3", "/model stub 5")
+        with mock.patch.object(model_switch.ModelSwitch, "card", side_effect=ValueError("bad name")):
+            c, listed = self.connector([{"id": "gpt-5.6-terra", "displayName": "Stub 5"}])
+            with listed:
+                self.assertEqual(c.models.card_task(str(self.work / "tasks" / "task-3.txt"), str(self.work / "o.txt")),
+                                 "model-picked")
+        self.assertIn("Switching to Stub 5 on your next message", (self.work / "o.txt").read_text())
+        # An owed outcome that cannot be built is said in words once, then dropped.
+        c.models.save(untold={"picked": "gpt-5.6-terra", "ran": "", "room": self.DM})
+        with mock.patch.object(model_switch.ModelSwitch, "card", side_effect=ValueError("bad name")):
+            self.assertEqual(c.models.tell(True, "", self.DM), "not-switched")
+        self.assertIn("I could not switch to Stub 5", c.models.unsaid())
+        self.assertEqual((c.models.state().get("untold"), c.models.unsaid()), ([], ""))
+
+
+    def test_a_turn_that_settles_a_pick_and_asks_for_the_menu_says_the_outcome_once_and_shows_the_settled_model(self):
+        (self.work / "state").mkdir(parents=True)
+        (self.work / "state" / "model.json").write_text(json.dumps({
+            "available": [{"id": "gpt-5.6-sol", "name": "Stub Model"}, {"id": "gpt-6-sol", "name": "Stub\nLarge"}],
+            "current": "gpt-5.6-sol", "wanted": "gpt-6-sol", "asked_in": self.DM, "told": ""}))
+        text = self.serve("task-1", "[[askmodel]] which models do you have")
+        self.assertEqual(text.count("Switched. I'm now using Stub"), 1, "the outcome, in words, not swallowed by the menu")
+        self.assertNotIn("[no-send]", text)
+        ((_, menu),) = self.posted()
+        self.assertEqual((menu["state"], menu["text"].startswith("Now using Stub Large.")), ("pending", True))
+        self.assertEqual((self.state()["current"], self.state()["untold"], metrics(self.work)[-1]["model_switch"]),
+                         ("gpt-6-sol", [], "switched"))
+        self.assertNotIn("Switched", self.serve("task-2", "again"), "told once")
+
+
+    def test_the_menu_still_acts_after_a_pick_and_a_tap_on_an_expired_card_gets_a_new_one(self):
+        self.assertEqual(self.serve("task-1", "/model"), "[no-send] the model card answers\n")
+        ((_, menu),) = self.posted("$card1")
+        large = next(b["reply"] for b in menu["buttons"] if b["label"] == "Stub Large")
+        self.serve("task-2", large, reply_to="$card1", click=large)
+        ((_, coming),) = self.posted("$card2")
+        self.serve("task-3", "hello")
+        ((_, done),) = self.posted("$card3")
+        # The cards saying what a pick came to are not the menu, and do not retire it.
+        self.assertEqual((menu["id"], coming["id"], done["id"]), (model_switch.CARD, model_switch.NOTE, model_switch.NOTE))
+        five = next(b["reply"] for b in menu["buttons"] if b["label"] == "Stub 5")
+        self.assertEqual(self.serve("task-4", five, reply_to="$card1", click=five), "[no-send] the model card answers\n")
+        self.assertEqual((metrics(self.work)[-1]["card"], self.state()["wanted"]), ("model-picked", "gpt-5.6-terra"))
+        self.posted("$card4")
+        # A newer menu retires the older one: a tap on it says so, shows the current one, and switches nothing.
+        self.serve("task-5", "/model")
+        self.posted("$card5")
+        text = self.serve("task-6", large, reply_to="$card1", click=large)
+        self.assertEqual((text.strip(), metrics(self.work)[-1]["card"]), (model_switch.EXPIRED, "model-card-expired"))
+        ((room, fresh),) = self.posted("$card6")
+        self.assertEqual((room, fresh["id"], self.state()["wanted"]), (self.DM, model_switch.CARD, "gpt-5.6-terra"))
+        # With the bridge gone the words say how to get one; anyone else's tap is refused as before.
+        self.dm("task-7", large, reply_to="$card1", click=large)
+        c, _ = self.connector()
+        shutil.rmtree(self.bridge)
+        self.assertEqual(c.models.card_task(str(self.work / "tasks" / "task-7.txt"), str(self.work / "o.txt")),
+                         "model-card-expired")
+        self.assertEqual((self.work / "o.txt").read_text().strip(), model_switch.EXPIRED_NO_CARD)
+        (self.work / "tasks" / "task-7.txt").unlink()      # answered here, not by the served connector
+        self.bridge.mkdir(parents=True)
+        self.assertIn("couldn't match that button",
+                      self.serve("task-8", large, reply_to="$card1", click=large, tier="team", channel="!room:s.space",
+                                 kind="room"))
+        self.assertEqual((self.posted(), metrics(self.work)[-1]["card"]), ([], "card-refused"))
+
+
+    def test_the_owners_pick_runs_on_a_collaborators_turn_and_is_told_only_in_the_dm(self):
+        self.pick("Stub Large")
+        self.posted("$card2")
+        # A collaborator writes first, in a room: their turn runs on the pick, and the outcome goes to the DM.
+        (self.work / "tasks" / "task-c.txt").write_text(gateway_mid_task("task-c", "from a collaborator", "team", True))
+        self.assertEqual(run_connector(self.work, once=1), 0)
+        self.assertIn("model=gpt-6-sol", result(self.work, "task-c"))
+        self.assertNotIn("Switched", result(self.work, "task-c"), "never in the room's answer")
+        ((room, told),) = self.posted("$card3")
+        self.assertEqual((room, told["text"], metrics(self.work)[-1]["model_switch"]),
+                         (self.DM, "Switched. I'm now using Stub Large.", "switched"))
+        # A guest's turn and the owner's next turn are on it as well, and nothing more is told.
+        self.assertIn("model=gpt-6-sol", self.serve("task-g", "hi", extra=["--allow-non-owner"], tier="guest",
+                                                    channel="!room:s.space", kind="room"))
+        self.assertIn("model=gpt-6-sol", self.serve("task-o", "the owner again"))
+        self.assertEqual(self.posted(), [])
+
+    def test_a_failure_on_a_guests_or_a_collaborators_turn_keeps_the_owners_pick_for_the_owners_turn(self):
+        self.pick("Stub Broken")
+        self.posted("$card2")
+        self.serve("task-g", "hi", extra=["--allow-non-owner"], tier="guest", channel="!room:s.space", kind="room")
+        (self.work / "tasks" / "task-c.txt").write_text(gateway_mid_task("task-c", "from a collaborator", "team", True))
+        self.assertEqual(run_connector(self.work, once=1), 0)
+        # Neither runtime's failure is the owner's: the pick stays pending, and nothing is told.
+        self.assertEqual((self.state()["wanted"], self.state().get("told"), self.posted()), ("gpt-6-astra", "", []))
+        self.assertNotIn("model_switch", metrics(self.work)[-1])
+        # The owner's own turn tries it, and its outcome is told in the DM.
+        self.assertIn("status failed", self.serve("task-o", "the owner"))
+        ((room, told),) = self.posted("$card3")
+        self.assertEqual((room, told["state"], metrics(self.work)[-1]["model_switch"], self.state()["wanted"]),
+                         (self.DM, "error", "not-switched", ""))
 
 
 class FakeRpc:

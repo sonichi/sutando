@@ -27,7 +27,18 @@ def thread_obj(tid):
             "name": None, "canAcceptDirectInput": True, "cliVersion": "stub"}
 
 
-def finish_turn(tid, turn_id, item_id, reply):
+# What `model/list` answers when asked with a limit (the model card's call): more than a card's six
+# buttons, one hidden, one off the connector's allowlist, one whose turns fail and one Codex moves turns from.
+MODELS = ([{"id": "gpt-5.6-sol", "displayName": "Stub Model", "isDefault": True},
+           {"id": "gpt-6-sol", "displayName": "Stub Large"}, {"id": "gpt-6-hidden", "displayName": "Hidden", "hidden": True},
+           {"id": "stub-unlisted", "displayName": "Stub Unlisted"},
+           {"id": "gpt-6-astra", "displayName": "Stub Broken"}, {"id": "gpt-6-luna", "displayName": "Stub Moved"}]
+          + [{"id": mid, "displayName": "Stub %d" % n} for n, mid in
+             ((5, "gpt-5.6-terra"), (6, "gpt-5.6-luna"), (7, "gpt-5.5"), (8, "gpt-5.2"))])
+BROKEN, MOVED = "gpt-6-astra", "gpt-6-luna"
+
+
+def finish_turn(tid, turn_id, item_id, reply, status="completed", error=None):
     # Noise a real server also emits: another thread's event and a non-message item.
     send({"jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": "other-thread", "turn": {"id": "x"}}})
     send({"jsonrpc": "2.0", "method": "item/completed",
@@ -40,7 +51,7 @@ def finish_turn(tid, turn_id, item_id, reply):
           "params": {"threadId": tid, "turnId": turn_id, "completedAtMs": int(time.time() * 1000),
                      "item": {"type": "agentMessage", "id": item_id, "text": reply, "phase": "final"}}})
     send({"jsonrpc": "2.0", "method": "turn/completed",
-          "params": {"threadId": tid, "turn": {"id": turn_id, "status": "completed", "items": [], "error": None}}})
+          "params": {"threadId": tid, "turn": {"id": turn_id, "status": status, "items": [], "error": error}}})
 
 
 for line in sys.stdin:
@@ -63,7 +74,8 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": rid, "result": {"config": {"mcp_servers": {"owner-mcp": {"command": "x"}},
                                                                  "web_search": None}, "origins": {}}})
     elif meth == "model/list":
-        send({"jsonrpc": "2.0", "id": rid, "result": {"data": [{"id": "stub-model", "isDefault": True}], "nextCursor": None}})
+        listed = MODELS if p.get("limit") else [{"id": "stub-model", "isDefault": True}]
+        send({"jsonrpc": "2.0", "id": rid, "result": {"data": listed, "nextCursor": None}})
     elif meth in ("thread/start", "thread/resume"):
         tid = p.get("threadId") or str(uuid.uuid4())
         if meth == "thread/resume" and tid.startswith("stale-"):
@@ -94,6 +106,10 @@ for line in sys.stdin:
         # turn's own when the turn carries one (the turn/start override), else the thread's.
         reply = "STUB echo: " + (text.strip().split("\n")[0][:80]) + " [sandbox=%s ephemeral=%s cwd=%s]" % (
             tp.get("sandbox"), tp.get("ephemeral"), p.get("cwd", tp.get("cwd")))
+        if p.get("model"):
+            reply += " model=%s" % p["model"]
+        if "[[askmodel]]" in text:
+            reply = "[model-card]"
         if "[[config]]" in text:      # what the thread was started with, for a test to pin its overrides
             reply += " config=" + json.dumps(tp.get("config"), sort_keys=True)
         if "[[empty]]" in text:
@@ -117,7 +133,13 @@ for line in sys.stdin:
             PENDING[REQ_ID] = (tid, turn_id, item_id, reply)
             send({"jsonrpc": "2.0", "id": REQ_ID, "method": "item/commandExecution/requestApproval",
                   "params": {"threadId": tid, "turnId": turn_id, "itemId": item_id, "command": ["rm", "-rf", "x"]}})
+        elif p.get("model") == BROKEN:
+            finish_turn(tid, turn_id, item_id, "", "failed", {"message": "the model is not available"})
         else:
+            if p.get("model") == MOVED:
+                send({"jsonrpc": "2.0", "method": "model/rerouted",
+                      "params": {"threadId": tid, "turnId": turn_id, "fromModel": MOVED, "toModel": "gpt-5.6-sol",
+                                 "reason": "highRiskCyberActivity"}})
             finish_turn(tid, turn_id, item_id, reply)
     elif meth == "turn/interrupt":
         late = STALLED.get(p.get("turnId"), (None, None))[1] == "late"

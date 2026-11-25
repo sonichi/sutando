@@ -30,10 +30,11 @@ import threading
 import time
 import uuid
 
-from ... import held_start
+from ... import connector_cards, held_start, model_switch
+from ...acp_host import quoted
 from ...collaborator_turn import stage_own_attachments, with_staged_paths
 from ...relay_loop import count_arg
-from ...task_io import (AUDIENCE_RULE, DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER_CAPABILITIES,  # noqa: F401
+from ...task_io import (AUDIENCE_RULE, DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, OWNER_CAPABILITIES,  # noqa: F401
                         LockRefused, acquire_lock, attested_headers, exit_on_sigterm, holder_consumer, load_done,
                         make_dirs, non_owner_note, parse_task, pid_alive, exit_code, record_done, release_lock,
                         root_path, start_time, stop_requested, turn_policy, write_atomic)
@@ -42,6 +43,9 @@ CLIENT = {"name": "ag2-sparrow-codex", "version": "0.1.0"}
 APPROVAL_REQUESTS = ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
                      "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval")
 NON_OWNER_SANDBOX = "read-only"
+# The only models the card offers or accepts, and only while `model/list` names them; anything else is refused.
+MODEL_ALLOWLIST = ("gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+                   "gpt-5.5", "gpt-5.2")
 # A turn without integrations (turn_policy's restricted kind): Codex's own web search and the owner's
 # connectors, plugins, hooks and memories off; each configured MCP server is disabled by name in start_thread.
 NO_INTEGRATIONS = {"web_search": "disabled",
@@ -300,6 +304,63 @@ class Connector:
         self.turn_id = None       # the turn now running, once turn/start has named it
         self.turn_declined = []   # approvals declined for that turn (requests that name it)
         self.turn_items = {}
+        self.rerouted = ""        # the model Codex moved the current turn to, when it said so
+        self._models = None
+
+    @property
+    def root(self):
+        return os.path.dirname(self.args.state) or "."
+
+    @property
+    def models(self):
+        """The model card's state and rules; made on first use, once main has named the state dir."""
+        if self._models is None:
+            self._models = model_switch.ModelSwitch(self.args.state, self.root, getattr(self.args, "bridge_state", None),
+                                                    "Codex", write_atomic, quoted, log, refresh=self.list_models,
+                                                    allowed=MODEL_ALLOWLIST)
+        return self._models
+
+    def list_models(self) -> bool:
+        """Ask the server which models it offers (`model/list`), for the card; False when it would not say."""
+        try:
+            offered = [m for m in self.rpc.request("model/list", {"limit": 100}).get("data") or []
+                       if isinstance(m, dict) and not m.get("hidden")]
+        except (RuntimeError, TimeoutError) as e:
+            log("model/list failed:", str(e)[:200])
+            return False
+        default = next((m.get("id") for m in offered if m.get("isDefault")), "")
+        # The model in use is the one a turn last ran on; a pending pick is not it yet.
+        self.models.seen([(m.get("id"), m.get("displayName")) for m in offered],
+                         self.models.state().get("current") or self.args.model or default)
+        return True
+
+    def turn_model(self, caps):
+        """The model every turn runs on, whoever sends it: the owner's pick, or the last pick of theirs that
+        took; else --model (None: Codex's own)."""
+        if not getattr(self.args, "state", None):
+            return self.args.model
+        kept = str(self.models.state().get("confirmed") or "")
+        return self.models.wanted() or (kept if self.models.ok(kept) else None) or self.args.model
+
+    def card_task(self, task_id, headers, path, result_path):
+        """The metrics row of a task that was a card matter (a tap, or the owner's /model), else None."""
+        outcome = self.models.card_task(path, result_path)
+        if not outcome:
+            return None
+        log("card ->", task_id, outcome)
+        return {"task": task_id, "status": "completed", "tier": headers["access_tier"], "card": outcome}
+
+    def tell_model(self, status, caps, room=None, owner=True) -> str:
+        """After any turn: tell the owner once, in their DM, whether their pick took. Codex names no model
+        per turn, so a completed turn ran on the pick unless Codex said it moved the turn; a failed one did not.
+        A moved turn's model is Codex's choice, not the owner's: the model in use stays the one before."""
+        if status not in ("completed", "failed"):
+            return ""
+        wanted = self.models.wanted()
+        before = str(self.models.state().get("current") or "")
+        took = status == "completed" and not (self.rerouted and self.rerouted != wanted)
+        ran = wanted if took else (before if before != wanted else "")
+        return self.models.tell(True, ran, room, may_fail=owner)
 
     def handle_server_request(self, m):
         """No human is attached, so approvals are declined (the turn continues)."""
@@ -519,6 +580,8 @@ class Connector:
                     self.turn_items[counted] = self.turn_items.get(counted, 0) + 1
                 if kind == "agentMessage":
                     text = item.get("text")       # last agentMessage of the turn wins
+            elif meth == "model/rerouted" and p.get("turnId") == turn_id:
+                self.rerouted = str(p.get("toModel") or "")
             elif meth == "turn/completed" and p.get("turn", {}).get("id") == turn_id:
                 turn = p["turn"]
                 return turn.get("status"), (text if text is not None else "".join(deltas)), turn.get("error")
@@ -532,6 +595,7 @@ class Connector:
         the turn's working directory (the 0.160.1 turn/start override), never the
         thread's remembered one."""
         params = {"threadId": self.thread_id, "input": [{"type": "text", "text": prompt}]}
+        self.rerouted = ""
         if model:
             params["model"] = model
         if cwd:
@@ -576,7 +640,7 @@ class Connector:
                 # The turn reads its own folder only: this task's own attachments are copied into it.
                 staged = stage_own_attachments(headers, self.scratch_cwd, getattr(self.args, "media_root", None))
                 turn_prompt = with_staged_paths(prompt, staged)
-            status, text, err = self.run_turn(turn_prompt, self.args.model, self.turn_cwd(caps))
+            status, text, err = self.run_turn(turn_prompt, self.turn_model(caps), self.turn_cwd(caps))
             if status == "server-exited":
                 self.restart_server()
                 if durable and attempt == 1:
@@ -618,6 +682,10 @@ class Connector:
         idle_since = time.time()
         metrics_path = os.path.join(self.args.state, "metrics.jsonl")
         while not stop_requested():
+            try:    # a card's ledger entry never stops task service
+                connector_cards.absorb(self.args.bridge_state, self.root)
+            except Exception as e:  # noqa: BLE001
+                log("card ledger not updated:", "%s: %s" % (type(e).__name__, e))
             names = self.pending_tasks(seen)
             if not names:
                 if self.args.once and done >= self.args.once:
@@ -647,18 +715,34 @@ class Connector:
                 done += 1
                 idle_since = time.time()
                 continue
+            result_path = os.path.join(self.args.results, name)
+            carded = self.card_task(task_id, headers, path, result_path)
+            if carded:
+                record_done(done_path, task_id)
+                with open(metrics_path, "a") as f:
+                    f.write(json.dumps(carded) + "\n")
+                done += 1
+                idle_since = time.time()
+                continue
             prompt = wrap_untrusted(task_id, headers, message, operator_lines, self.note, caps=policy.capabilities)
+            if headers["access_tier"] == "owner" and self.models.usable():
+                prompt += "\n\n" + model_switch.HINT
             log("turn ->", task_id, headers["access_tier"], repr(message[:60]))
             t_sent = time.time()
             status, text, err = self.run_task(headers, prompt, policy.capabilities)
             t_done = time.time()
             out = self.result_body(status, text, err)
-            t_result = write_atomic(os.path.join(self.args.results, name), out.rstrip("\n") + "\n")
+            # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
+            told = self.tell_model(status, policy.capabilities, headers.get("channel_id"), policy.kind == OWNER)
+            asked = self.models.asked(headers["access_tier"], path, status, text, result_path)
+            out = "\n\n".join(x for x in (out.rstrip("\n"), quoted(self.models.unsaid()).strip()) if x)
+            t_result = os.stat(result_path).st_mtime if asked else write_atomic(result_path, out.rstrip("\n") + "\n")
             record_done(done_path, task_id)
             rec = {"task": task_id, "status": status, "chars": len(out), "tier": headers["access_tier"],
                    "detect_s": round(t_seen - t_mtime, 3), "turn_s": round(t_done - t_sent, 3),
                    "file_to_file_s": round(t_result - t_mtime, 3), "thread": self.last_thread,
-                   "declined": list(self.declined)}
+                   "declined": list(self.declined), **({"card": asked} if asked else {}),
+                   **({"model": self.models.wanted(), "model_switch": told} if told else {})}
             self.declined = []
             if policy.capabilities.session != "durable":
                 self.thread_id = None         # the ephemeral thread is never reused
@@ -714,6 +798,8 @@ def build_parser():
     ap.add_argument("--codex", default="codex", help="the codex executable the app-server is started from (default: "
                                                      "codex on PATH; a launcher passes the exact path it checked)")
     ap.add_argument("--model", default=None)
+    ap.add_argument("--bridge-state", default=None, help="the bridge's state dir, where the model card is queued for "
+                                                         "posting (default: <work>.bridge/state)")
     ap.add_argument("--sandbox", default=NON_OWNER_SANDBOX, choices=["read-only", "workspace-write", "danger-full-access"],
                     help="sandbox for owner and attested-collaborator threads; a restricted turn is always read-only")
     no = ap.add_mutually_exclusive_group()
@@ -752,6 +838,8 @@ def main(argv=None):
         build_parser().error("--work is required unless --push is given")
     cwd_given = args.cwd
     args.work = os.path.abspath(args.work)
+    args.bridge_state = os.path.abspath(os.path.expanduser(
+        args.bridge_state or os.path.join(args.work.rstrip(os.sep) + ".bridge", "state")))
     exit_on_sigterm()
     if args.held:
         if args.root_fd is None:
