@@ -21,8 +21,8 @@ from unittest import mock
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import (account_switch, connector_cards, local_task_protocol, model_switch, task_io,  # noqa: E402
-                         team_guardrail)
+from ag2_sparrow import (account_switch, connector_cards, local_task_protocol, model_switch, quota_notice,  # noqa: E402
+                         result_markers, task_io, team_guardrail)
 from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
 
 # The note as it was pinned before it moved to the shared owner: proves the move changed no byte.
@@ -177,7 +177,17 @@ class WrapperTest(unittest.TestCase):
         self.assertIn("<%s>\ndo x\n</%s>\n" % (tag, tag), text)
         self.assertIn("Act on it as the user's request", text)
         self.assertNotIn("The sender is not your owner", text)
-        self.assertIn("results/task-chat-7.txt", text)
+        self.assertNotIn("results/", text.replace(cc.REPLY_RULE, ""), "the connector writes the result, never Codex")
+        self.assertTrue(text.endswith(cc.REPLY_RULE))
+
+    def test_no_bridge_written_step_tells_codex_to_write_the_results_file(self):
+        """A result file Codex writes itself is delivered raw by the bridge before the card desk sees it."""
+        prelude = result_markers.render_skill_prelude("!dm:s.space", "lane", "task-9")
+        lines = [l for l in prelude if l] + team_guardrail.ag2space_tier_lines("team", True, "results/task-9.txt")
+        self.assertTrue(any("results/task-9.txt" in l for l in lines), "the gateway's lines do name the file")
+        text = cc.wrap_untrusted("task-9", {"access_tier": "owner"}, "hi", lines)
+        self.assertNotIn("results/task-9.txt", text)
+        self.assertIn(cc.PRELUDE_RESULT, text)
 
     def test_non_owner_wrapper_carries_the_note_and_collaborator(self):
         for tier in ("team", "guest", "other", "ambient"):
@@ -582,6 +592,8 @@ class NoIntegrationsTest(unittest.TestCase):
 
     def connector(self, answer):
         class Rpc:
+            events = queue.Queue()      # nothing queued between turns
+
             def request(self, method, params=None, timeout=120):
                 if isinstance(answer, Exception):
                     raise answer
@@ -846,6 +858,23 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(run_connector(self.work, once=1), 0)
         self.assertEqual((result(self.work, "task-3").strip(), "card" in metrics(self.work)[-1]), ("[model-card]", False))
         self.assertEqual(self.posted(), [])
+
+    def test_the_task_archived_during_the_turn_still_shows_the_card(self):
+        """A task the bridge archived while the turn ran (Codex wrote its result file itself) is not opened
+        again: the card step reads the text kept from before the turn."""
+        real = cc.Connector.run_task
+
+        def archived_mid_turn(conn, headers, prompt, caps):
+            out = real(conn, headers, prompt, caps)
+            src = self.work / "tasks" / "task-1.txt"
+            (self.work / "tasks" / "archive").mkdir(exist_ok=True)
+            src.rename(self.work / "tasks" / "archive" / "task-1.txt")
+            return out
+
+        with mock.patch.object(cc.Connector, "run_task", archived_mid_turn):
+            self.assertEqual(self.serve("task-1", "[[askmodel]] can you switch model"),
+                             "[no-send] the model card answers\n")
+        self.assertEqual((metrics(self.work)[-1]["card"], len(self.posted())), ("model-card", 1))
 
     def test_a_guests_turn_runs_on_the_owners_pick_and_its_outcome_goes_to_the_dm(self):
         self.pick("Stub Large")
@@ -1133,33 +1162,95 @@ class AccountCardTest(CardWorld, unittest.TestCase):
     def test_the_card_names_the_account_and_a_tap_signs_in_and_says_which_account_is_used_now(self):
         (self.home / "stub-login").write_text("success bob@example.org")
         card = self.tap()
-        self.assertEqual(card["text"], "I'm signed in as a…@example.com (pro).")
+        self.assertEqual(card["text"], "I'm using alice@example.com. Switch this agent's account below.")
+        # The marker the desktop app draws this agent's account controls from, in the card itself.
+        self.assertEqual(card["account_controls"], {"runtime": "codex"})
+        self.assertFalse(re.search(r"[\u4e00-\u9fff]", json.dumps(card, ensure_ascii=False)), "English only")
         self.assertEqual(result(self.work, "task-tap"), "[no-send] the account card answers\n")
         self.assertEqual(self.opened, ["https://stub.invalid/sign-in?id=login-1"], "the page is shown on this computer")
         (_, started), (room, done) = self.posted("$card2")
         # One card: the sign-in page, then how it ended, are each shown in place of the card tapped.
         self.assertEqual(self.ops(), [("edit", "$card1"), ("edit", "$card1")])
+        self.assertNotIn("account_controls", started, "a notice is not the account card")
         self.assertEqual((started["state"], [(b["kind"], b["url"]) for b in started["buttons"]]),
                          ("info", [("url", "https://stub.invalid/sign-in?id=login-1")]))
         self.assertEqual(started["text"], "I opened the sign-in page in the browser on the computer I run on. Finish "
-                                          "signing in there; I'll confirm here. Until then: I'm signed in as "
-                                          "a…@example.com (pro).")
-        self.assertEqual((room, done["state"], done["text"]), (self.DM, "done", "Signed in. I'm signed in as b…@example.org (pro)."))
+                                          "signing in there; I'll confirm here. Until then: I'm using "
+                                          "alice@example.com.")
+        self.assertEqual((room, done["state"], done["text"]), (self.DM, "done", "Signed in. I'm using bob@example.org."))
         self.assertEqual(json.loads((self.work / "state" / "account.json").read_text()), {})
         self.assertTrue(result(self.work, "task-next").startswith("STUB echo:"), "the turn it arrived in is answered as usual")
         self.assertEqual([m.get("card") for m in metrics(self.work)], ["account-card", "account-started", None])
+
+    def test_a_switch_restarts_the_app_server_before_the_next_turn(self):
+        # The server holds the token it started with; the sign-in revokes it, so the next turn needs a restart.
+        (self.home / "stub-token").write_text("tok-a")
+        (self.home / "stub-login").write_text("success bob@example.org")
+        self.tap()
+        self.assertEqual((self.home / "stub-revoked").read_text().split(), ["tok-a"])
+        self.assertTrue(result(self.work, "task-next").startswith("STUB echo:"), result(self.work, "task-next"))
+        self.assertEqual(metrics(self.work)[-1].get("auth"), "reloaded", "restarted before the turn, not after a failure")
+        (_, _started), (_, done) = self.posted("$card2")
+        self.assertEqual(done["text"], "Signed in. I'm using bob@example.org.", "no shared login here")
+
+    def test_a_switch_on_a_login_shared_with_the_core_says_the_core_takes_it_at_its_next_restart(self):
+        core = Path(self.tmp.name) / "core-home"
+        core.mkdir()
+        (core / "auth.json").write_text("{}")
+        os.symlink(core / "auth.json", self.home / "auth.json")
+        (self.home / "stub-login").write_text("success bob@example.org")
+        self.tap(extra_task=False)
+        (_, _started), (_, done) = self.posted("$card2")
+        self.assertEqual(done["text"], "Signed in. I'm using bob@example.org. " + cc.SHARED_LOGIN)
+
+    def test_an_unauthorized_turn_restarts_once_and_a_login_rotated_meanwhile_answers(self):
+        (self.home / "stub-token").write_text("tok-a")
+        self.assertTrue(self.serve("task-1", "[[rotate]] hello").startswith("STUB echo:"))
+        self.assertEqual((metrics(self.work)[-1]["status"], metrics(self.work)[-1]["auth"]),
+                         ("completed", "restarted-unauthorized"))
+
+    def test_still_unauthorized_after_the_restart_shows_the_owner_the_account_card(self):
+        (self.home / "stub-token").write_text("tok-a")
+        (self.home / "stub-revoked").write_text("tok-a\n")     # revoked, and no new sign-in on disk
+        self.assertEqual(self.serve("task-1", "hello"), account_switch.ANSWERED)
+        ((room, card),) = self.posted()
+        self.assertEqual((room, card["state"], card["text"], [b["label"] for b in card["buttons"]]),
+                         (self.DM, "pending", cc.SIGNED_OUT + " " + account_switch.BELOW, ["Switch account"]))
+        self.assertEqual(card["account_controls"], {"runtime": "codex", "signed_out": True})
+        rec = metrics(self.work)[-1]
+        self.assertEqual((rec["status"], rec["card"], rec["auth"]), ("unauthorized", "signed-out-card", "restarted-unauthorized"))
+        # Anywhere but the owner's DM: the line, never the bare status, and no card.
+        said = self.serve("task-2", "hello", channel="!room:s.space", kind="room")
+        self.assertEqual(said, cc.quoted(cc.SIGNED_OUT_ELSEWHERE).rstrip("\n") + "\n")
+        self.assertNotIn("status failed", said)
+        self.assertEqual(self.posted("$card2"), [])
+
+    def test_a_turn_that_had_started_work_is_never_run_again_after_an_unauthorized_end(self):
+        (self.home / "stub-token").write_text("tok-a")
+        said = self.serve("task-1", "[[rotate]] [[worked]] hello")
+        self.assertEqual(said, "Codex ended this task with status failed.\n\nPartial reply:\npartial answer\n\n"
+                         + cc.quoted(cc.SIGNED_OUT_ELSEWHERE).strip() + "\n")
+        rec = metrics(self.work)[-1]
+        self.assertEqual((rec["status"], rec.get("auth"), rec.get("card")), ("unauthorized", None, None))
+        self.assertEqual(self.posted(), [], "no card over a turn that was not refused outright")
+        self.assertEqual(len((self.work / "state" / "metrics.jsonl").read_text().splitlines()), 1, "one turn, no replay")
+
+    def test_the_account_record_is_readable_by_its_owner_only(self):
+        (self.home / "stub-login").write_text("page https://stub.invalid/p")
+        self.tap(extra_task=False)
+        self.assertEqual(os.stat(self.work / "state" / "account.json").st_mode & 0o777, 0o600)
 
     def test_a_sign_in_that_fails_or_cannot_start_says_so_and_names_the_account_still_in_use(self):
         (self.home / "stub-login").write_text("fail")
         self.tap(extra_task=False)       # nothing else to do: the report arrives while the connector idles
         (_, _started), (_, failed) = self.posted("$card2")
         self.assertEqual((failed["state"], failed["text"]),
-                         ("error", "The sign-in did not finish (access_denied). I'm signed in as a…@example.com (pro)."))
+                         ("error", "The sign-in did not finish (access_denied). I'm using alice@example.com."))
         (self.home / "stub-login").write_text("refuse")
         self.again("$card3")
         ((_, refused),) = self.posted("$card4")
         self.assertEqual((refused["state"], refused["text"], metrics(self.work)[-1]["card"]),
-                         ("error", "I could not start a sign-in. I'm signed in as a…@example.com (pro).", "account-not-started"))
+                         ("error", "I could not start a sign-in. I'm using alice@example.com.", "account-not-started"))
 
     def test_a_sign_in_nobody_finishes_is_given_up_after_ten_minutes_and_a_new_tap_gives_up_the_old_one(self):
         with mock.patch.object(cc, "open_page", return_value=False):
@@ -1175,8 +1266,8 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.assertTrue(self.serve("task-later", "hello").startswith("STUB echo:"))
         ((room, gone),) = self.posted("$card5")
         self.assertEqual((room, gone["state"]), (self.DM, "error"))
-        self.assertEqual(gone["text"], "The sign-in was not finished in 10 minutes, so I stopped waiting. I'm signed in "
-                                       "as a…@example.com (pro). Send /account to try again.")
+        self.assertEqual(gone["text"], "The sign-in was not finished in 10 minutes, so I stopped waiting. I'm using "
+                                       "alice@example.com. Send /account to try again.")
         self.assertEqual(len((self.home / "stub-cancelled").read_text().split()), 2)
         self.assertEqual(json.loads((self.work / "state" / "account.json").read_text()), {})
 
@@ -1188,7 +1279,7 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         (self.home / "stub-account").write_text("")
         self.serve("task-3", "/account")
         ((_, card),) = self.posted()
-        self.assertEqual(card["text"], "I'm not signed in.")
+        self.assertEqual(card["text"], "I'm not signed in. " + account_switch.BELOW)
 
     def test_a_sign_in_page_that_is_not_an_https_address_is_never_opened_and_the_sign_in_is_given_up(self):
         for n, page in enumerate(("-a/Applications/Calculator.app", "file:///etc/hosts", "http://stub.invalid/x",
@@ -1342,7 +1433,7 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         c.accounts.keep({})
         self.assertTrue(self.serve("task-later", "hello again").startswith("STUB echo:"))
         ((room, done),) = self.posted("$card3")
-        self.assertEqual((room, done["state"], done["text"]), (self.DM, "done", "Signed in. I'm signed in as b…@example.org (pro)."))
+        self.assertEqual((room, done["state"], done["text"]), (self.DM, "done", "Signed in. I'm using bob@example.org."))
         self.assertEqual(json.loads((self.work / "state" / "account.json").read_text()), {})
 
     def test_a_card_that_cannot_be_drawn_is_answered_in_words_and_the_task_is_done(self):
@@ -1354,18 +1445,28 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.assertEqual([m["card"] for m in metrics(self.work)], ["account-card-failed"] * 2)
         self.assertEqual((self.work / "state" / "done").read_text().split(), ["task-1", "task-2"])
 
-    def test_the_account_is_named_without_its_address_and_what_cannot_be_read_is_not_called_signed_out(self):
-        self.assertEqual([account_switch.masked(e) for e in ("alice@example.com", "", "no-at-sign", "@x.org")],
-                         ["a…@example.com", "", "", ""])
+    def test_the_account_is_named_by_its_full_email_and_what_cannot_be_read_is_not_called_signed_out(self):
+        self.assertEqual([account_switch.shown(e) for e in ("alice@example.com", " bob@x.org ", "", "no-at-sign", "@x.org",
+                                                            "a b@x.org")],
+                         ["alice@example.com", "bob@x.org", "", "", "", ""])
+        self.assertEqual(account_switch.masked("alice@example.com"), "a…@example.com", "the short form is kept for its users")
         args = cc.build_parser().parse_args(["--work", str(self.work)])
         args.state, args.bridge_state = str(self.work / "state"), str(self.bridge)
         (self.work / "state").mkdir(parents=True)
         c = cc.Connector(FakeRpc, args, note="n")
         for account, label in (({"type": "apiKey"}, "an API key"), ({"type": "amazonBedrock"}, "Amazon Bedrock"),
                                ({"type": "new-kind"}, "an account I can't name"), (None, ""),
-                               ({"type": "chatgpt", "email": None, "planType": None}, "a ChatGPT account")):
+                               ({"type": "chatgpt", "email": None, "planType": None}, "a ChatGPT account"),
+                               # An account card never shows a plan suffix like "(pro)" or "(plus)".
+                               ({"type": "chatgpt", "email": "alice@example.com", "planType": "pro"}, "alice@example.com"),
+                               ({"type": "chatgpt", "email": "bob@example.org", "planType": "plus"}, "bob@example.org"),
+                               ({"type": "chatgpt", "email": None, "planType": "max"}, "a ChatGPT account")):
             with mock.patch.object(c.rpc, "request", return_value={"account": account}, create=True):
                 self.assertEqual(c.account_label(), label, account)
+        with mock.patch.object(c.rpc, "request", return_value={"account": {"type": "chatgpt", "email": "alice@example.com",
+                                                                           "planType": "pro"}}, create=True):
+            self.assertEqual(c.accounts.using(), "I'm using alice@example.com.")
+        self.assertEqual(account_switch.BELOW, "Switch this agent's account below.")
         with mock.patch.object(c.rpc, "request", side_effect=RuntimeError("account/read: timed out"), create=True):
             self.assertEqual(c.accounts.using(), "I could not read which account I'm signed in with.")
             # A cancel the server refuses still clears the pending sign-in; one this card did not start is ignored.
@@ -1405,6 +1506,77 @@ class FakeRpc:
 
     def notify(self, method, params=None):
         pass
+
+
+class AuthReloadTest(unittest.TestCase):
+    """The app-server runs on the login on disk: after a sign-in, an API key set or a logout it is restarted
+    before the next turn; the shared daemon is not."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patch = mock.patch.dict(os.environ, {"CODEX_HOME": self.tmp.name})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.auth = Path(self.tmp.name) / "auth.json"
+
+    def connector(self, server="stdio"):
+        args = cc.build_parser().parse_args(["--server", server, "--work", "w"])
+        args.state, args.bridge_state = self.tmp.name, None
+        c = cc.Connector(FakeRpc, args, note="n")
+        c.restarts = 0
+
+        def restart():
+            c.restarts += 1
+            c.auth_seen = cc.auth_print()
+        c.restart_server = restart
+        return c
+
+    def test_a_changed_login_file_or_a_finished_sign_in_restarts_the_server_once(self):
+        c = self.connector()
+        self.assertEqual((c.fresh_auth(), c.restarts), ("", 0), "nothing changed")
+        self.auth.write_text('{"OPENAI_API_KEY": "sk-x"}')            # an API key set
+        self.assertEqual((c.fresh_auth(), c.restarts), ("reloaded", 1))
+        self.assertEqual((c.fresh_auth(), c.restarts), ("", 1), "once per change")
+        self.auth.unlink()                                             # a logout
+        self.assertEqual((c.fresh_auth(), c.restarts), ("reloaded", 2))
+        c.accounts.keep({"id": "login-1", "room": "!dm:s.space", "at": time.time()})
+        c.rpc.events.put({"jsonrpc": "2.0", "method": "account/login/completed",
+                          "params": {"loginId": "login-1", "success": True}})
+        self.assertEqual((c.fresh_auth(), c.restarts), ("reloaded", 3), "a queued sign-in report is read first")
+
+    def test_a_sign_in_in_progress_is_not_ended_by_a_restart(self):
+        c = self.connector()
+        c.accounts.keep({"id": "login-1", "room": "!dm:s.space", "at": time.time()})
+        self.auth.write_text("{}")                                     # the login file changed meanwhile
+        self.assertEqual((c.fresh_auth(), c.restarts), ("deferred", 0), "the server holds the pending sign-in")
+        c.accounts.keep({})
+        self.assertEqual((c.fresh_auth(), c.restarts), ("reloaded", 1), "done once the sign-in is over")
+
+    def test_a_restart_that_fails_is_not_swallowed(self):
+        """The connector stops with the error, and its service manager starts it again: it never goes on
+        serving tasks on a server that is gone."""
+        c = self.connector()
+        c.auth_stale = True
+        c.restart_server = mock.Mock(side_effect=RuntimeError("server pipe closed"))
+        with self.assertRaises(RuntimeError):
+            c.fresh_auth()
+
+    def test_the_shared_daemon_is_never_restarted(self):
+        c = self.connector("proxy")
+        self.auth.write_text("{}")
+        c.auth_stale = True
+        self.assertEqual((c.fresh_auth(), c.restarts), ("", 0))
+
+    def test_what_reads_as_unauthorized(self):
+        yes = ({"codexErrorInfo": "unauthorized"}, {"codex_error_info": {"unauthorized": {}}})
+        # Only the server's own name for it: an error's words (a tool's "401 unauthorized") never decide.
+        no = (None, "unauthorized", {"codexErrorInfo": "usageLimitExceeded"}, {"message": "stream disconnected"},
+              {"message": "Your refresh token was revoked. Please log out and sign in again."},
+              {"codexErrorInfo": "other", "message": "401 unauthorized"})
+        self.assertEqual([cc.unauthorized(e) for e in yes], [True] * len(yes))
+        self.assertEqual([cc.unauthorized(e) for e in no], [False] * len(no))
+        self.assertTrue(cc.shared_login(str(self.auth)) is False)
 
 
 class EdgePathTest(unittest.TestCase):
@@ -1788,6 +1960,143 @@ class HeldRootRefusalTest(unittest.TestCase):
                 rc = cc.main(["--server", "stub", "--work", d])
         self.assertEqual((rc, err.getvalue().strip()), (2, "refusing to start: gone"))
         release.assert_called_once()
+
+
+class QuotaCardTest(CardWorld, unittest.TestCase):
+    """Out of usage: the connector itself queues the account card in the owner's DM, once per limit."""
+
+    def setUp(self):
+        super().setUp()
+        self.home = Path(self.tmp.name) / "codex-home"
+        self.home.mkdir()
+        (self.home / "stub-account").write_text("alice@example.com")
+        patch = mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home)})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def outbox(self):
+        folder = self.bridge / "agent-cards" / "outbox"
+        return [json.loads(p.read_text()) for p in sorted(folder.iterdir())] if folder.is_dir() else []
+
+    def test_a_limit_queues_one_account_card_to_the_owner_dm_and_a_second_limit_tick_nothing(self):
+        self.assertEqual(self.serve("task-1", "[[limit]] hello"), cc.LIMITED_NO_SEND)
+        (queued,) = self.outbox()
+        card = queued["card"]
+        self.assertEqual((queued["room"], card["id"], card["state"]), (self.DM, account_switch.CARD, "pending"))
+        self.assertEqual(card["account_controls"], {"runtime": "codex"})
+        self.assertRegex(card["text"], r"^Codex has reached its usage limit \(resets \d{1,2}:\d\d [AP]M\), so I can't "
+                                       r"answer until then\. Switch to another account or an API key to go on now\. "
+                                       r"I'm using alice@example\.com\. " + re.escape(account_switch.BELOW) + "$")
+        self.assertEqual(metrics(self.work)[-1]["quota"], "quota-card")
+        # Another message while still limited: no second card, and no error line in the room either.
+        self.assertEqual(self.serve("task-2", "[[limit]] again"), cc.LIMITED_NO_SEND)
+        self.assertEqual(len(self.outbox()), 1)
+        ((room, _),) = self.posted()
+        self.assertEqual(room, self.DM)
+        self.serve("task-3", "[[limit-bare]] and again", channel="!room:s.space", kind="room")
+        self.assertEqual((self.outbox(), self.posted()), ([], []), "nothing more once the card is posted")
+        self.assertEqual(json.loads((self.work / "state" / quota_notice.FILE).read_text())["told"], True)
+
+    def test_a_turn_that_answers_clears_the_limit_and_a_later_limit_is_a_new_card(self):
+        self.serve("task-1", "[[limit-bare]] hello")
+        ((_, first),) = self.posted()
+        self.assertIn("(resets 3:05 PM)", first["text"], "the reset time in the error's own words")
+        self.assertTrue(self.serve("task-2", "hello").startswith("STUB echo"))
+        self.assertEqual(metrics(self.work)[-1]["quota"], "quota-cleared")
+        self.serve("task-3", "[[limit-bare]] hello")
+        self.assertEqual(len(self.posted("$card2")), 1, "the limit came back: a second card")
+
+    def test_another_error_queues_no_card(self):
+        self.assertEqual(self.serve("task-1", "[[fail]] hello"), "Codex ended this task with status failed.\n")
+        self.assertEqual(self.outbox(), [])
+        self.assertNotIn("quota", metrics(self.work)[-1])
+
+    def test_an_error_that_only_speaks_of_a_usage_limit_queues_no_card(self):
+        self.serve("task-0", "hello")           # the owner's DM is known
+        self.assertEqual(self.serve("task-1", "[[limit-words]] hello"), "Codex ended this task with status failed.\n")
+        self.assertEqual(self.outbox(), [])
+        self.assertNotIn("quota", metrics(self.work)[-1])
+
+    def test_a_limit_is_not_called_the_models_failure(self):
+        """The owner's pending model pick is not settled as failed by a turn the account refused."""
+        (self.work / "state").mkdir(parents=True, exist_ok=True)
+        self.serve("task-0", "hello")
+        (self.work / "state" / "model.json").write_text(json.dumps({"wanted": "gpt-6-sol", "room": self.DM}))
+        self.serve("task-1", "[[limit-bare]] hello")
+        rec = metrics(self.work)[-1]
+        self.assertEqual((rec["status"], "model_switch" in rec), ("usage-limit", False))
+        self.assertEqual(json.loads((self.work / "state" / "model.json").read_text()).get("wanted"), "gpt-6-sol")
+
+    def test_an_expired_window_kept_from_an_earlier_limit_opens_no_second_incident(self):
+        (self.work / "state").mkdir(parents=True)
+        args = cc.build_parser().parse_args(["--work", str(self.work)])
+        args.state, args.bridge_state = str(self.work / "state"), str(self.bridge)
+        c = cc.Connector(FakeRpc, args, note="n")
+        c.rpc.request = lambda method, params=None, timeout=0: {"account": {"type": "apiKey"}}
+        (self.work / "state" / quota_notice.ROOM_FILE).write_text(json.dumps({"room": self.DM}))
+        c.rate_limits = {"primary": {"usedPercent": 100, "resetsAt": time.time() - 60}}     # kept from before its reset
+        self.assertEqual(c.saw_rate_limits({"rateLimits": c.rate_limits}), "", "a stale window is no limit")
+        error = {"codexErrorInfo": "usageLimitExceeded", "message": "You've hit your usage limit."}
+        self.assertEqual(c.quota_hit(error), "quota-card")
+        self.assertNotIn("reset_at", json.loads((self.work / "state" / quota_notice.FILE).read_text()))
+        self.assertEqual(len(self.posted()), 1)
+        self.assertEqual([c.quota_hit(error) for _ in range(3)], ["quota-card-posted", "", ""])
+        self.assertEqual(self.outbox(), [], "refusals after it queue no further card")
+
+    def test_with_no_owner_dm_seen_no_card_is_sent_and_the_room_gets_the_limit_in_words(self):
+        said = self.serve("task-1", "[[limit-bare]] hi", channel="!room:s.space", kind="room")
+        self.assertEqual(self.outbox(), [])
+        self.assertIn("Codex has reached its usage limit", said)
+        self.assertNotIn("signed in", said)
+        self.assertEqual(metrics(self.work)[-1]["quota"], "quota-no-room")
+
+    def test_a_dropped_card_is_queued_again_and_a_used_up_window_while_idle_is_a_limit(self):
+        (self.work / "state").mkdir(parents=True)
+        args = cc.build_parser().parse_args(["--work", str(self.work)])
+        args.state, args.bridge_state = str(self.work / "state"), str(self.bridge)
+        c = cc.Connector(FakeRpc, args, note="n")
+        c.rpc.request = lambda method, params=None, timeout=0: {"account": {"type": "apiKey"}}
+        (self.work / "state" / quota_notice.ROOM_FILE).write_text(json.dumps({"room": self.DM}))
+        at = time.time() + 7200
+        self.assertEqual(c.saw_rate_limits({"rateLimits": {"primary": {"usedPercent": 40, "resetsAt": at}}}), "")
+        self.assertEqual(c.saw_rate_limits({"rateLimits": {"secondary": {"usedPercent": 100, "resetsAt": at}}}),
+                         "quota-card")
+        self.assertIn("I'm using an API key.", self.outbox()[0]["card"]["text"])
+        for p in (self.bridge / "agent-cards" / "outbox").iterdir():
+            p.unlink()                                   # the bridge dropped it
+        rec = json.loads((self.work / "state" / quota_notice.FILE).read_text())
+        rec["queued"] = time.time() - connector_cards.MAX_QUEUED_S - 1
+        (self.work / "state" / quota_notice.FILE).write_text(json.dumps(rec))
+        self.assertEqual(c.quota.tick(), "quota-card-dropped")
+        self.assertEqual(c.quota.tick(), "quota-card")
+        self.assertEqual(len(self.outbox()), 1)
+        # Past the reset the runtime gave, a limit is a new one.
+        self.assertEqual(len(self.posted()), 1)
+        with mock.patch.object(c.quota, "now", return_value=at + 1):
+            self.assertEqual(c.quota.tick(), "quota-card-posted")
+            self.assertEqual(c.quota.hit(), "quota-card")
+
+    def test_what_reads_as_a_usage_limit(self):
+        yes = ({"codexErrorInfo": "usageLimitExceeded"}, {"codex_error_info": "usage_limit_exceeded"},
+               {"codexErrorInfo": {"usageLimitExceeded": {}}})
+        # Only the server's own name for it: words that speak of a usage limit never decide.
+        no = (None, "usage limit", {"codexErrorInfo": "unauthorized", "message": "401"},
+              {"message": "You've hit your usage limit."},
+              {"codexErrorInfo": "other", "message": "You've hit your usage limit."},
+              {"codexErrorInfo": "serverOverloaded", "message": "try again later"}, {"message": "rate limited by MCP tool"})
+        self.assertEqual([cc.usage_limit(e) for e in yes], [True] * len(yes))
+        self.assertEqual([cc.usage_limit(e) for e in no], [False] * len(no))
+        self.assertEqual(quota_notice.reset_from_text("You've hit your usage limit. Try again at 3:05 PM."), "3:05 PM")
+        self.assertEqual(quota_notice.reset_from_text("Limit reached; try again in 2 days 3 hours or upgrade."),
+                         "2 days 3 hours")
+        self.assertEqual(quota_notice.reset_from_text("no time here"), "")
+        self.assertIsNone(cc.limit_reset({"primary": {"usedPercent": 99.9, "resetsAt": 5}}, now=1))
+        self.assertEqual(cc.limit_reset({"primary": {"usedPercent": 100, "resetsAt": 5},
+                                         "secondary": {"usedPercent": 100, "resetsAt": 9}}, now=1), 9.0)
+        # A window whose reset has passed is a snapshot from before it: no evidence of a limit now.
+        self.assertIsNone(cc.limit_reset({"primary": {"usedPercent": 100, "resetsAt": 5}}, now=6))
+        self.assertEqual(cc.limit_reset({"primary": {"usedPercent": 100, "resetsAt": 5},
+                                         "secondary": {"usedPercent": 100, "resetsAt": 9}}, now=6), 9.0)
 
 
 if __name__ == "__main__":

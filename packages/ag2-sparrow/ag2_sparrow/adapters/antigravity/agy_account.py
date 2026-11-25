@@ -36,15 +36,10 @@ SWITCH, KEY, UNKEY = "switch", "key", "unkey"
 LABELS = {SWITCH: "Switch account", KEY: "Use API key", UNKEY: "Stop using API key"}
 SHARED = ("Note: every Antigravity agent on this Mac shares one Google sign-in, so switching moves them all to "
           "the new account.")
-# The card's own words and its marker (the same as the Codex account card's, account_switch on #6685).
+# The card's own words; its marker and the line for another computer are the shared account card's.
 BELOW = "Switch this agent's account or API key below."
-CONTROLS = "account_controls"
+CONTROLS, elsewhere = account_switch.CONTROLS, account_switch.elsewhere
 _MXID_RE = re.compile(r"^@[^\s:]+:\S+$")
-
-
-def elsewhere(name: str) -> str:
-    """Where the account controls are, for a place that cannot draw them."""
-    return "Open this on the computer that runs %s to switch account." % (name or "this agent")
 
 
 STATE_NAME = "agy-account.json"
