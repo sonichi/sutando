@@ -103,6 +103,26 @@ class HeldInbox(unittest.TestCase):
         self.assertEqual(self.inbox().step(), "launched")
 
 
+class SameGateAsTheLauncher(HeldInbox):
+    def test_a_hold_on_another_model_family_launches_like_the_launcher_does(self):
+        from unittest import mock
+        self.hold(model="claude-haiku-4-5")
+        self.task("task-a")
+        with mock.patch.object(clh, "launch_identity", lambda ws, config_dir=None: ("claude-opus-5-5", None)):
+            self.assertIsNone(clh.binding_hold(self.ws, self.t), "the launcher would start the core")
+            self.assertEqual(self.inbox().step(), "launched")
+        self.assertEqual((self.intercepted, self.quota.hits), ([], []), "no limit card for another model")
+        self.assertEqual(len(self.launches), 1)
+
+    def test_a_hold_on_the_same_family_still_holds(self):
+        from unittest import mock
+        self.hold(model="claude-haiku-4-5")
+        self.task("task-a")
+        with mock.patch.object(clh, "launch_identity", lambda ws, config_dir=None: ("claude-haiku-4-5", None)):
+            self.assertEqual(self.inbox().step(), "held")
+        self.assertEqual(self.launches, [])
+
+
 class Edges(HeldInbox):
     def test_launch_core_returns_start_clis_code_and_one_when_it_cannot_run(self):
         import subprocess

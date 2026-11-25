@@ -80,7 +80,8 @@ class HeldInbox:
         import core_quota_notice
         at = self.now()
         lifted = clh.release_on_account_change(self.ws, at)
-        hold = clh.active_hold(self.ws, at)
+        # The launcher's own predicate: a hold another model family or account set does not stop it.
+        hold = clh.binding_hold(self.ws, at, clh.launch_identity(self.ws))
         if hold:
             for path in self.pending():
                 if path.name in self.seen:
@@ -99,7 +100,7 @@ class HeldInbox:
                     self.log(f"quota: {done}")
             switch = self.repo / "scripts" / "switch-model.sh"
             clh.handle_owner_actions(self.ws, at, switch_cmd=str(switch) if switch.is_file() else None)
-            hold = clh.active_hold(self.ws, at)
+            hold = clh.binding_hold(self.ws, at, clh.launch_identity(self.ws))
         if hold:
             return "held"
         if at - self.last_launch < LAUNCH_EVERY_S:
