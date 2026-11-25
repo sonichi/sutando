@@ -2,7 +2,7 @@
 
 A connector may offer several cards (the model, the account). Each is asked for the same three ways: a
 tap on a card this agent posted, a slash command in the owner's DM, or the runtime answering the owner
-with the card's mark alone. `Desk` reads the task once, as the core does, and hands it to the card it
+with the card's mark alone; a card may also claim the owner's own words (`asks`). `Desk` reads the task once, as the core does, and hands it to the card it
 names; a tap no card claims gets the fixed line, and never reaches the model.
 """
 from __future__ import annotations
@@ -61,6 +61,11 @@ class Desk:
             choice = named(said.strip()) if named and card.usable() else ""
             if choice:
                 return self.drawn(card, result_file, lambda: card.asked_for(choice, sent, result_file))
+        for card in self.cards:
+            # A card may also name the owner's own words that are its matter (`asks`), read here and
+            # never by the model: the account card's, for what the runtime cannot see of itself.
+            if getattr(card, "asks", None) and card.asks(said) and card.usable():
+                return self.drawn(card, result_file, lambda: card.offer(sent, result_file))
         return ""
 
     def drawn(self, card, result_file, act) -> str:

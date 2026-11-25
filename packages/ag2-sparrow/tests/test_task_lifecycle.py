@@ -418,6 +418,59 @@ class FreshDirTest(Base):
         self.assertIn("task-a", (self.work / "state" / "settled-ids").read_text())
         self.assertEqual(self.main()[0], 0, "this binary's own state restarts")
 
+    def test_a_temp_under_an_allowed_name_is_a_plain_file_and_the_released_fixed_temp_is_removed(self):
+        self.assertEqual(self.main()[0], 0)
+        state = self.work / "state"
+        # The fixed-name temp 0.11's model switch could leave: removed at a start, whatever its age.
+        (state / "model-switch.json.tmp").write_text('{"model": "ha')
+        self.assertEqual(self.main()[0], 0)
+        self.assertFalse((state / "model-switch.json.tmp").exists())
+        # A link under that name is refused, and what it points at is left alone.
+        target = self.work / "kept.txt"
+        target.write_text("kept")
+        (state / "model-switch.json.tmp").symlink_to(target)
+        rc, err = self.main()
+        self.assertEqual((rc == 0, "state/model-switch.json.tmp in" in err, target.read_text()), (False, True, "kept"), err)
+        (state / "model-switch.json.tmp").unlink()
+        # A directory under a fresh temp's name is refused at once, not accepted until the sweep trips on it.
+        (state / ".rate.jsonl.9.abcd.tmp").mkdir()
+        rc, err = self.main()
+        self.assertEqual((rc == 0, "state/.rate.jsonl.9.abcd.tmp in" in err and "not a plain file" in err), (False, True), err)
+        (state / ".rate.jsonl.9.abcd.tmp").rmdir()
+        self.assertEqual(self.main()[0], 0)
+        # A writer that renames its temp into place between the listing and the look is finishing, not
+        # breaking the layout: listed, then gone, is accepted in a check and in a start, fresh or not.
+        for copy in filter(None, (src_copy(), vendored)):
+            real_listdir = os.listdir
+            for gone in (".rate.jsonl.7.abcd.tmp", "model-switch.json.tmp"):
+                def listing(path, gone=gone):
+                    names = real_listdir(path)
+                    return names + [gone] if os.path.basename(str(path)) == "state" else names
+                with mock.patch.object(copy.os, "listdir", side_effect=listing):
+                    for check_only in (True, False):
+                        self.assertIsNone(copy.prepare_work_dir(str(self.work), check_only=check_only), gone)
+            # Removed by someone else between the look and the sweep: still not an error.
+            old = state / ".rate.jsonl.8.abcd.tmp"
+            old.write_text("")
+            os.utime(old, (1, 1))
+            with mock.patch.object(copy.os, "unlink", side_effect=FileNotFoundError()):
+                self.assertIsNone(copy.prepare_work_dir(str(self.work)))
+            old.unlink()
+        # The canonical copy answers the same, read by read (the package's is its copy).
+        for copy in filter(None, (src_copy(), vendored)):
+            (state / "model-switch.json.tmp").write_text("x")
+            self.assertIsNone(copy.prepare_work_dir(str(self.work), check_only=True))
+            self.assertTrue((state / "model-switch.json.tmp").exists(), "a check removes nothing")
+            self.assertIsNone(copy.prepare_work_dir(str(self.work)))
+            self.assertFalse((state / "model-switch.json.tmp").exists())
+            (state / "model-switch.json.tmp").mkdir()
+            (state / ".rate.jsonl.9.abcd.tmp").mkdir()
+            for check_only in (True, False):
+                self.assertIn("state/.rate.jsonl.9.abcd.tmp in", copy.prepare_work_dir(str(self.work), check_only=check_only))
+            (state / ".rate.jsonl.9.abcd.tmp").rmdir()
+            self.assertIn("state/model-switch.json.tmp in", copy.prepare_work_dir(str(self.work), check_only=True))
+            (state / "model-switch.json.tmp").rmdir()
+
     def test_with_the_marker_only_the_allowlist_is_accepted(self):
         self.assertEqual(self.main()[0], 0)
         for name in ("done", ".rate.jsonl.123.abcd.tmp", ".rate.jsonl.456.abcd.tmp"):
@@ -2103,7 +2156,7 @@ class BoundaryGuardTest(SpyMixin, unittest.TestCase):
                          {"state", "results", "tasks", "results/<task>.txt",
                           "results/.<task>.txt.<tmp>", "state/done", "state/.done.<tmp>", "state/threads",
                           "state/threads/<key>", "state/threads/.<key>.<tmp>", "state/metrics.jsonl",
-                          "state/app-server-stub.stderr"})
+                          "state/app-server-stub.stderr", "state/live-view.log"})
 
     def strings(self, tree):
         doc = tree.body[0].value if tree.body and isinstance(tree.body[0], ast.Expr) else None
