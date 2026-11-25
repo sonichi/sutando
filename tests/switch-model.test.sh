@@ -34,7 +34,7 @@ case " $* " in *" capture-pane "*)
   acc=""; i=0
   while [ "$i" -lt "$k" ]; do
     i=$((i+1)); sent="$(grep -- "-l /model" "$TMUX_LOG" | sed -n "${i}p" | sed 's/.*-l \/model //')"
-    name="${TMUX_ACCEPT_NAME:-$(disp "${TMUX_ACCEPT_AS:-$sent}")}"; case "${TMUX_ACCEPT_AS:-$sent}" in *'[1m]') name="$name (1M context)";; esac
+    name="${TMUX_ACCEPT_NAME:-$(disp "${TMUX_ACCEPT_AS:-$sent}")}"; case "${TMUX_ACCEPT_AS:-$sent}" in *'[1m]') [ -n "${TMUX_NO_SIZE:-}" ] || name="$name (1M context)";; esac
     acc="$acc  ⎿  Set model to $name and saved as your default\n"
     [ -n "${TMUX_PERSIST_SETTINGS:-}" ] && printf '{"model":"%s"}\n' "${TMUX_ACCEPT_AS:-$sent}" > "$TMUX_PERSIST_SETTINGS"
   done
@@ -63,7 +63,7 @@ touch "$T/statefile"; rc=$("$HERE/scripts/switch-model.sh" sonnet --state-dir "$
 [ "$rc" = 1 ] && grep -q "nothing changed" "$T/err" && settings_untouched && ok "9 unwritable state path: exit 1, 'nothing changed', settings untouched" || fail "9" "rc=$rc $(cat "$T/err")"
 rc=$(TMUX_PANE_TEXT='────\n❯ half-typed message\n────\n' run haiku); [ "$rc" = 5 ] && ! grep -q send-keys "$TMUX_LOG" && grep -q "half-typed" "$T/err" && ok "10 pending text in the input box: exit 5, nothing sent, text quoted" || fail "10" "rc=$rc $(cat "$T/err")"
 rc=$(TMUX_PANE_TEXT='✽ Thinking… (12s)\n────\n❯\xc2\xa0\n────\n' run haiku); [ "$rc" = 0 ] && grep -q "send-keys -t sutando-core -l /model haiku" "$TMUX_LOG" && ok "11 a clear prompt (nbsp, turn running) still sends — the CLI queues it" || fail "11" "rc=$rc $(cat "$T/err")"
-rc=$(SUTANDO_CORE_RUNTIME=codex run opus); [ "$rc" = 4 ] && ! grep -q send-keys "$TMUX_LOG" && grep -q "start-cli.sh --restart" "$T/err" && ok "12 codex runtime: exit 4, restart path named" || fail "12" "rc=$rc"
+rc=$(SUTANDO_CORE_RUNTIME=codex run opus); [ "$rc" = 2 ] && ! grep -q send-keys "$TMUX_LOG" && grep -q "not a Codex model" "$T/err" && ok "12 codex runtime: a Claude alias is refused (rc=2), nothing sent (tests/switch-model-codex.test.sh covers the Codex switch)" || fail "12" "rc=$rc"
 mkdir -p "$T/Brain With Spaces"; printf '{"model":"claude-opus-5"}\n' > "$T/Brain With Spaces/settings.json"
 printf '{"brain":"%s","socket":"/private/tmp/socket path/s.sock","session":"core name"}\n' "$T/Brain With Spaces" > "$T/desc.json"
 rc=$(env -u SUTANDO_TMUX_SOCKET -u SUTANDO_TMUX_SESSION "$HERE/scripts/switch-model.sh" haiku --dry-run --descriptor-file "$T/desc.json" --state-dir "$T/state" > "$T/out" 2> "$T/err"; echo $?)
@@ -263,4 +263,17 @@ else
   ok "59-62 skipped: no cc to build a process named claude"
 fi
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 64 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+# --- Claude Code 2.1.322 answers a [1m] switch without its size ("Set model to Sonnet 5.5 and saved as your
+# default for new sessions") and saves the pick: the saved setting is the other half of the evidence.
+mkdir -p "$T/cfg1m"; printf '{"model":"opus"}\n' > "$T/cfg1m/settings.json"; : > "$TMUX_LOG"; rm -f "$TMUX_LOG.caps"
+rc=$(TMUX_NO_SIZE=1 TMUX_PERSIST_SETTINGS="$T/cfg1m/settings.json" "$HERE/scripts/switch-model.sh" 'sonnet[1m]' --accept-timeout 3 --state-dir "$T/state" --brain "$T/cfg1m" > "$T/out" 2> "$T/err"; echo $?)
+R=$(python3 -c "import json;print(json.load(open('$T/state/model-switch.json'))['model'])")
+[ "$rc" = 0 ] && [ "$R" = "sonnet[1m]" ] && ok "65 a [1m] switch answered without its size, its pick saved: switched (rc=0)" || fail "65" "rc=$rc R=$R $(cat "$T/err")"
+printf '{"model":"opus"}\n' > "$T/cfg1m/settings.json"; : > "$TMUX_LOG"; rm -f "$TMUX_LOG.caps"
+rc=$(TMUX_NO_SIZE=1 "$HERE/scripts/switch-model.sh" 'sonnet[1m]' --accept-timeout 2 --state-dir "$T/state" --brain "$T/cfg1m" > "$T/out" 2> "$T/err"; echo $?)
+[ "$rc" = 8 ] && ok "66 the same line with the pick NOT saved stays unconfirmed (rc=8)" || fail "66" "rc=$rc $(cat "$T/err")"
+printf '{"model":"sonnet[1m]"}\n' > "$T/cfg1m/settings.json"; : > "$TMUX_LOG"; rm -f "$TMUX_LOG.caps"
+rc=$(TMUX_NO_SIZE=1 "$HERE/scripts/switch-model.sh" 'sonnet[1m]' --accept-timeout 2 --state-dir "$T/state" --brain "$T/cfg1m" > "$T/out" 2> "$T/err"; echo $?)
+[ "$rc" = 8 ] && ok "67 the pick saved BEFORE the send and not saved again confirms nothing (rc=8)" || fail "67" "rc=$rc $(cat "$T/err")"
+
+echo; [ $fails -eq 0 ] && echo "switch-model: all 67 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }

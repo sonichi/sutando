@@ -89,13 +89,26 @@ FABLE_TEXT = re.compile(r"reached your Fable limit|included Fable usage for this
 # The CLI's wait-for-the-reset banner ("Usage limit reached · …", "Continuing automatically at …"); near
 # the reset its second row reads "Continuing shortly · Esc to cancel", often captured without the first.
 LIMIT_WAIT = re.compile(r"Continuing automatically (?:at\b|shortly\b)|Continuing shortly\s*·\s*Esc to cancel"
-                        r"|\b(?:session|usage|weekly) limit reached\b", re.I)
+                        r"|\b(?:session|usage|weekly) limit reached\b"
+                        # The limit's own title row, "Weekly limit · resets Nov 28 at 1pm": at the row's start,
+                        # so a sentence that names a limit and a reset elsewhere is not one.
+                        r"|^[ \t⎿⚠]*(?:session|usage|weekly) limit\s*·\s*resets?\b", re.I | re.M)
+_LIMIT_NOUN = r"(?:session|usage|weekly) limit"
+_LIMIT_TITLE = re.compile(
+    rf"^[ \t⎿⚠]*(?:You(?:'ve| have) (?:hit|reached|used|exceeded) (?:all of )?your {_LIMIT_NOUN}"
+    rf"|{_LIMIT_NOUN} reached)[ \t]*(?:[.!]?[ \t]*$|·[ \t]*(?:limit )?resets?\b)"
+    rf"|^[ \t⎿⚠]*{_LIMIT_NOUN}[ \t]*·[ \t]*resets?\b"
+    r"|^[ \t⎿⚠]*Continuing (?:automatically at\b|shortly[ \t]*·[ \t]*Esc to cancel[ \t]*$)",
+    re.I | re.M)
 #: A turn this short (or with no duration) may be the CLI refusing it, not running it.
 TURN_SHORT = re.compile(r"[01]s")
 # A turn the CLI refuses outright is a FINISHED turn: the reason is its `⎿` result and the
 # pane returns to the idle footer, so no gate is on screen. Explicit list, extended by hand.
 LIMIT_REFUSAL = re.compile(
-    r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit", re.I)
+    r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit"
+    # The CLI's own line: "You've used your weekly limit · resets …" opening its row and ending its clause.
+    r"|(?:\A|(?<=\n)|(?<=⎿))[ \t⎿⚠]*You(?:'ve| have) (?:reached|used|exceeded) (?:all of )?your"
+    r" (?:session|usage|weekly) limit(?=[ \t]*(?:[·.!\n]|\Z))", re.I)
 REFUSAL = re.compile(
     LIMIT_REFUSAL.pattern
     # A bare "not logged in" is a refusal only as the CLI's own line-start `⎿` row.
@@ -141,8 +154,11 @@ def limit_standing(pane: Optional[str], runtime: Optional[str] = None, outrun: b
 
 _NUMBERED_ROW = re.compile(r"^\s*(?:❯\s*)?\d+\.\s")
 _CARET_ROW = re.compile(r"^\s*❯\s*\d+\.\s")
-# The limit menu's own choices: its title may be a "⎿" line, which the walk back skips as the turn.
-_LIMIT_MENU_ROW = re.compile(r"wait for (?:the )?limit to reset|usage credits|extra usage", re.I)
+# The CLI limit menu's own rows: its first option, and one of the others it always offers with it.
+_LIMIT_MENU_STOP = re.compile(r"^\s*(?:❯\s*)?1\.\s+Stop and wait for (?:the |your )?(?:session |usage |weekly )?"
+                              r"limit to reset\s*$", re.I)
+_LIMIT_MENU_MORE = re.compile(r"^\s*(?:❯\s*)?\d\.\s+(?:(?:Switch to|Add funds to continue with) (?:extra usage|usage "
+                              r"credits)|Wait here, then continue automatically\b)", re.I)
 
 
 def _dialog_names_limit(text: str) -> bool:
@@ -160,7 +176,8 @@ def _dialog_names_limit(text: str) -> bool:
         end += 1
     # Only a live dialog's rows (a caret on one): a numbered list in a reply is not a menu.
     live = any(_CARET_ROW.match(ln) for ln in lines[start:end + 1])
-    if live and any(_LIMIT_MENU_ROW.search(ln) for ln in lines[start:end + 1]):
+    menu = lines[start:end + 1]
+    if live and any(_LIMIT_MENU_STOP.match(ln) for ln in menu) and any(_LIMIT_MENU_MORE.match(ln) for ln in menu):
         return True
     for line in reversed(lines[:start]):
         core = line.strip()
@@ -168,7 +185,7 @@ def _dialog_names_limit(text: str) -> bool:
             continue
         if core[0] in "✻⎿●⏺" or (core.startswith("❯") and core.lstrip("❯").strip()):
             return False  # the turn above the dialog: its words are not the dialog's
-        if limit_line(core):
+        if _LIMIT_TITLE.search(core):
             return True
     return False
 
@@ -227,11 +244,13 @@ class RuntimeAdapter:
     # The runtime's dispatcher waits for idle-ready, so a draft holds every queued task.
     pending_blocks_dispatch: bool = False
     composer_requires_single_line: bool = False
+    # The CLI draws a running turn as a spinner row above the composer (turn_running reads it).
+    spinner_turns: bool = False
 
 
 CLAUDE = RuntimeAdapter(
     name="claude", glyph=CLAUDE_COMPOSER.glyph, idle_ready=CLAUDE_IDLE,
-    gate_signatures=tuple(CLAUDE_GATE_SIGNATURES),
+    gate_signatures=tuple(CLAUDE_GATE_SIGNATURES), spinner_turns=True,
 )
 # Codex's composer glyph varies by CLI version; its model row is the idle footer.
 CODEX_IDLE = re.compile(
@@ -241,7 +260,9 @@ CODEX_IDLE = re.compile(
 CODEX_PICKER_ROW = re.compile(r"[›»]\s*\d+\.")
 CODEX = RuntimeAdapter(
     name="codex", glyph="›", idle_ready=CODEX_IDLE,
-    gate_signatures=tuple(CLAUDE_GATE_SIGNATURES) + (("selection", CODEX_PICKER_ROW),),
+    gate_signatures=(("session-limit", _LIMIT_TITLE),) + tuple(
+        (kind, pattern) for kind, pattern in CLAUDE_GATE_SIGNATURES if kind not in LIMIT_GATES
+    ) + (("selection", CODEX_PICKER_ROW),),
     await_hint=re.compile(f"{AWAIT_HINT.pattern}|{CODEX_PICKER_ROW.pattern}", re.I),
     alternate_glyphs=("»",),
     idle_requires_prompt=True,
@@ -535,19 +556,31 @@ def _waiting_row(plain: str) -> bool:
     return bool(limit_line(plain) or _WAIT_TEXT.search(plain) or frame_abnormal(plain))
 
 
+def _live_spinner(capture: Optional[str]) -> Optional[List[str]]:
+    """Plain rows from the newest turn row above the composer down, when that row is a spinner
+    drawn at column 0, as the CLI draws its live one. Reply and tool text are indented."""
+    lines = (capture or "").splitlines()
+    rows = turn_status([_SGR.sub("", ln) for ln in lines[:len(lines) - len(_below_composer(capture))]])
+    return rows if rows and not rows[0][:1].isspace() else None
+
+
+def turn_running(capture: Optional[str], adapter: RuntimeAdapter = CLAUDE, waits: bool = True) -> bool:
+    """A turn is running: the newest turn row above the composer is a spinner, drawn from the
+    turn's first second (Claude Code 2.1.322 prints no "esc to interrupt" while a turn runs).
+    `waits` False: a spinner that names a limit, a retry or a wait is waiting, not running."""
+    rows = _live_spinner(capture) if adapter.spinner_turns else None
+    return rows is not None and (waits or not any(_waiting_row(r) for r in rows))
+
+
 def turn_in_flight(capture: Optional[str]) -> bool:
     """The newest turn row above the composer is a spinner that has run FLIGHT_MIN_S or more,
     and neither it nor a row under it names a limit, a retry or a wait: the seat is mid-turn,
     so a limit banner under the composer is from before it."""
-    lines = (capture or "").splitlines()
-    above = [_SGR.sub("", ln) for ln in lines[:len(lines) - len(_below_composer(capture))]]
-    for i in range(len(above) - 1, -1, -1):
-        if _TURN_ROW.search(above[i]):
-            if not _SPINNER_ROW.search(above[i]) or any(_waiting_row(r) for r in above[i:]):
-                return False
-            ran = spinner_elapsed(above[i])
-            return ran is not None and ran >= FLIGHT_MIN_S
-    return False
+    rows = _live_spinner(capture)
+    if rows is None or any(_waiting_row(r) for r in rows):
+        return False
+    ran = spinner_elapsed(rows[0])
+    return ran is not None and ran >= FLIGHT_MIN_S
 
 
 def strip_limit_banners(capture: str) -> str:
@@ -640,7 +673,7 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=Non
         return Verdict("busy", gate)
     if abn and not limit_is_stale(abn, workspace, socket, session, probe, capture=capture):
         return Verdict("abnormal", ",".join(abn.names))
-    if frame_working(tail):
+    if frame_working(tail) or turn_running(capture, adapter):
         return Verdict("busy", "working")
     if line is not None and line.text:
         return Verdict("pending", "text at the prompt", line.text)
@@ -659,7 +692,8 @@ def limit_holds(capture: Optional[str], adapter: RuntimeAdapter) -> bool:
     lines = _tail_lines(capture)
     tail = "\n".join(_SGR.sub("", ln) for ln in lines)
     abn = frame_abnormal(tail)
-    if (abn and abn.retrying) or frame_working(tail) or turn_in_flight(capture):
+    # Any age: a recovery line's own turn spins before any refusal returns.
+    if (abn and abn.retrying) or frame_working(tail) or turn_running(capture, adapter, waits=False):
         return False
     line = prompt_line(capture, adapter)
     if line is None or line.text:

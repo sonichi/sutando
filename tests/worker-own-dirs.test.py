@@ -155,6 +155,120 @@ class SetWorkerDirs(Base):
             C.set_worker_dirs(W, True, workspace=self.ws)
 
 
+class MultipleIdentityStorage(Base):
+    def identities(self, *, own=True):
+        alpha = row(WORKER_INST, worker=W, agent_mxid=WORKER_AGENT, **({"dirs": "own"} if own else {}))
+        beta = row(C.worker_instance_for("beta-fixture.net", W), worker=W,
+                   agent_mxid="@reviewer:beta-fixture.net", server="beta-fixture.net",
+                   gateway_url="https://chat.beta-fixture.net", owner_mxid="@owner:beta-fixture.net")
+        self.write(row("alpha-fixture-net", primary=True, agent_mxid=CORE_AGENT), beta, alpha)
+        return alpha, beta
+
+    def test_all_lanes_and_aliases_share_one_legacy_home(self):
+        alpha, beta = self.identities()
+        with C._transaction(self.ws) as record:
+            record["rows"][1]["launch_keys"] = ["AG2_REMOTE_TOKEN_REVIEWER_BETA"]
+        expected = (self.own_root() / "tasks", self.own_root() / "results")
+        self.assertEqual(C.worker_dirs(W, self.ws), expected)
+        self.assertEqual(C.own_worker_homes(self.ws),
+                         [{"worker": W, "tasks": expected[0], "results": expected[1]}])
+        for lane in (alpha["instance"], beta["instance"], "reviewer_beta"):
+            home = C.task_home(f"task-{lane}~abc", self.ws)
+            self.assertEqual((home["tasks"], home["results"], home["own"]), (*expected, True))
+
+    def test_primary_switch_identity_removal_and_rotation_keep_anchor(self):
+        alpha, beta = self.identities()
+        expected = C.worker_dirs(W, self.ws)
+        with C._transaction(self.ws) as record:
+            record["rows"].append(row("beta-fixture-net", server="beta-fixture.net"))
+        C.set_primary("beta-fixture-net", workspace=self.ws)
+        self.assertEqual(C.worker_dirs(W, self.ws), expected)
+        with C._transaction(self.ws) as record:
+            record["rows"] = [r for r in record["rows"] if r["instance"] != alpha["instance"]]
+            next(r for r in record["rows"] if r.get("worker") == W)["agent_mxid"] = "@replacement:beta-fixture.net"
+        self.assertEqual(C.worker_dirs(W, self.ws), expected)
+        self.assertEqual(C.worker_storage_root(W, self.ws), self.own_root())
+        self.assertEqual(C.task_home(f"task-{beta['instance']}~abc", self.ws)["tasks"], expected[0])
+
+    def test_removed_lane_tasks_still_resolve_in_the_workers_storage(self):
+        alpha, beta = self.identities()
+        tasks, results = C.ensure_worker_dirs(W, self.ws)
+        task_id = f"task-{alpha['instance']}~abc"
+        task = tasks / f"{task_id}.txt"
+        task.write_text("pending")
+        result = results / f"{task_id}.txt"
+        result.write_text("finished")
+        with C._transaction(self.ws) as record:
+            record["rows"] = [r for r in record["rows"] if r["instance"] != alpha["instance"]]
+        for location in (task, tasks / f"{task_id}.claimed-core-1.txt", tasks / "archive" / task.name):
+            if task != location:
+                task.rename(location)
+                task = location
+            with self.subTest(location=location.name):
+                home = C.task_home(task_id, self.ws)
+                self.assertEqual(home, {"lane": alpha["instance"], "worker": W, "tasks": tasks,
+                                        "results": results, "own": True})
+                self.assertEqual((home["results"] / result.name).read_text(), "finished")
+        self.assertFalse(C.task_home(f"task-{alpha['instance']}~missing", self.ws)["own"])
+
+    def test_one_toggle_controls_every_identity_and_preserves_other_home(self):
+        alpha, beta = self.identities()
+        C.set_worker_dirs(W, True, workspace=self.ws)
+        self.assertTrue(all(r.get("dirs") == "own" for r in C.worker_identities(W, self.ws)))
+        expected = C.worker_dirs(W, self.ws)
+        C.set_worker_dirs(W, False, workspace=self.ws)
+        self.assertIsNone(C.worker_dirs(W, self.ws))
+        self.assertTrue(all("dirs" not in r for r in C.worker_identities(W, self.ws)))
+        self.assertEqual(C.task_other_home(f"task-{beta['instance']}~abc", self.ws),
+                         {"tasks": expected[0], "results": expected[1]})
+        C.set_worker_dirs(W, True, workspace=self.ws)
+        self.assertEqual(C.worker_dirs(W, self.ws), expected)
+
+    def test_adding_an_identity_keeps_existing_files_in_the_same_inbox(self):
+        self.standard(dirs="own")
+        dirs = C.ensure_worker_dirs(W, self.ws)
+        task_id = "task-0123abcd"
+        (dirs[0] / f"{task_id}.txt").write_text("pending")
+        (dirs[1] / f"{task_id}.txt").write_text("finished")
+        before = C.record_path(self.ws).read_bytes()
+        self.assertEqual(C.worker_dirs(W, self.ws), dirs)
+        self.assertEqual(C.record_path(self.ws).read_bytes(), before, "folder reads do not write the record")
+        with C._transaction(self.ws) as record:
+            record["rows"].insert(0, row(C.worker_instance_for("beta-fixture.net", W), worker=W,
+                                       agent_mxid="@reviewer:beta-fixture.net", server="beta-fixture.net"))
+        self.assertEqual(C.worker_dirs(W, self.ws), dirs)
+        self.assertEqual(C.task_home(task_id, self.ws)["tasks"], dirs[0])
+        self.assertEqual((dirs[0] / f"{task_id}.txt").read_text(), "pending")
+        self.assertEqual((dirs[1] / f"{task_id}.txt").read_text(), "finished")
+
+    def test_multiple_shared_identities_do_not_require_a_server(self):
+        self.identities(own=False)
+        self.assertIsNone(C.worker_dirs(W, self.ws))
+        self.assertEqual(C.own_worker_homes(self.ws), [])
+
+    def test_storage_collision_is_refused_after_anchor_identity_is_removed(self):
+        alpha, beta = self.identities()
+        with C._transaction(self.ws) as record:
+            record["rows"] = [r for r in record["rows"] if r["instance"] != alpha["instance"]]
+            record["rows"].append(row("another-worker", worker=OTHER, agent_mxid=WORKER_AGENT))
+        C.set_worker_dirs(W, False, workspace=self.ws)
+        with self.assertRaises(C.ConnectionsError):
+            C.set_worker_dirs(W, True, workspace=self.ws)
+        with self.assertRaises(C.ConnectionsError):
+            C.set_worker_dirs(OTHER, True, workspace=self.ws)
+
+    def test_storage_schema_rejects_invalid_worker_anchor_and_setting(self):
+        self.standard(dirs="own")
+        path = C.record_path(self.ws)
+        base = json.loads(path.read_text())
+        for storage in ([], {"../worker": {"agent_mxid": WORKER_AGENT, "own": True}},
+                        {W: {"agent_mxid": "", "own": True}},
+                        {W: {"agent_mxid": WORKER_AGENT, "own": "own"}}):
+            path.write_text(json.dumps({**base, "worker_storage": storage}))
+            with self.assertRaises(C.SchemaError):
+                C._read_record(path)
+
+
 class RuntimeIdentity(Base):
     def test_shared_is_unchanged_and_own_differs(self):
         self.standard()

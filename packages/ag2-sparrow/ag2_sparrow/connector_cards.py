@@ -12,6 +12,7 @@ the bridge never writes into the work root. Standard library only, plus the bund
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,8 @@ import uuid
 from pathlib import Path
 
 OUTBOX, POSTED = ("agent-cards", "outbox"), ("agent-cards", "posted")
+KEYS = ("agent-cards", "keys")     # one marker per keyed card ever queued, so a repeat is not a second card
+KEYS_KEEP_S = 7 * 86400.0
 CARD_KEY = "space.ag2.card"
 MAX_QUEUED_S = 600.0
 _NAME_RE = re.compile(r"^[0-9a-f]{32}\.json$")
@@ -60,8 +63,12 @@ def _entries(folder: Path) -> list:
         return []
 
 
-def queue(bridge_state, room: str, body: str, card: dict, *, now=None) -> str:
-    """Queue `card` for `room`; the queue id. A card the client would not draw is refused here."""
+def queue(bridge_state, room: str, body: str, card: dict, *, now=None, key: str = "", at_ns: int = 0) -> str:
+    """Queue `card` for `room`; the queue id. A card the client would not draw is refused here.
+
+    With `key` (and the `at_ns` it was first decided at) the call may be repeated: the id is made of
+    those two, and a card already queued under it is not queued again, so a caller that saved its
+    intent, queued, and stopped before saving that it had, can simply queue again after a restart."""
     agent_card, _ = _core()
     found = agent_card.problem(card)
     if found:
@@ -69,10 +76,32 @@ def queue(bridge_state, room: str, body: str, card: dict, *, now=None) -> str:
     if not _ROOM_RE.match(room or "") or not body or "\n" in body:
         raise ValueError("a card needs a room id and a one-line body")
     # The clock leads the id, so two cards queued between sweeps are posted in the order they were queued.
-    qid = "%016x%s" % (time.time_ns(), uuid.uuid4().hex[:16])
+    if not key:
+        qid = "%016x%s" % (time.time_ns(), uuid.uuid4().hex[:16])
+    else:
+        qid = "%016x%s" % (int(at_ns) & 0xFFFFFFFFFFFFFFFF, hashlib.sha256(key.encode("utf-8")).hexdigest()[:16])
+        marker = Path(bridge_state).joinpath(*KEYS) / qid
+        if marker.exists():
+            return qid
     _write(Path(bridge_state).joinpath(*OUTBOX) / (qid + ".json"),
            {"room": room, "body": body, "card": card, "queued_at": time.time() if now is None else now})
+    if key:
+        # The marker follows the card: a stop between the two queues it once more, never drops it.
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("", encoding="utf-8")
+        _forget_old_keys(marker.parent)
     return qid
+
+
+def _forget_old_keys(folder: Path) -> None:
+    """Drop markers older than KEYS_KEEP_S: long past any restart that could repeat their card."""
+    horizon = time.time() - KEYS_KEEP_S
+    try:
+        for marker in folder.iterdir():
+            if marker.stat().st_mtime < horizon:
+                marker.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 class Poster:

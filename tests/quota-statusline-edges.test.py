@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Error and refusal paths of the status line quota recorder: the writer, the account
 helpers, the session-config hook runner, the installer, the recorder and StopFailure
-scripts. Everything runs in-process.
+scripts, and proxy retirement. Everything runs in-process.
 
 Run: python3 tests/quota-statusline-edges.test.py
 """
@@ -31,6 +31,7 @@ sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(ROOT / "src"))  # ahead of the skill's quota_availability shim
 
 import claude_account
+import proxy_retire as pr
 import quota_record as qr
 import session_config_hooks as sch
 import statusline_config as cfg
@@ -185,12 +186,17 @@ class SessionConfigHooks(Tmp):
         self.assertEqual(sch.main([]), 0)
         calls = []
         hooks = [("s", self.d / "s.py")]
-        with mock.patch.object(sch, "_discover", side_effect=lambda f: f.extend([*hooks, None])), \
-                mock.patch.object(sch, "run", side_effect=lambda h, c, py, dl: calls.append((h, c))):
+        with mock.patch.object(sch, "_discover", side_effect=lambda f, *a: f.extend([*hooks, None])), \
+                mock.patch.object(sch, "run", side_effect=lambda h, c, py, dl, hook_seconds=None:
+                                  calls.append((h, c, hook_seconds, round(dl - time.monotonic())))):
             self.assertEqual(sch.main(["--config-dir", str(self.core)]), 0)
-        self.assertEqual(calls, [(hooks, str(self.core))])
+            self.assertEqual(sch.main(["--route"]), 0)
+        self.assertEqual(calls, [(hooks, str(self.core), None, round(sch.TOTAL_SECONDS)),
+                                 (hooks, None, sch.ROUTE_HOOK_SECONDS, round(sch.ROUTE_TOTAL_SECONDS))])
+        # A route hook may wait out a config hook (killed at HOOK_SECONDS) and still bootstrap and wait.
+        self.assertGreater(sch.ROUTE_HOOK_SECONDS, sch.HOOK_SECONDS + 25)
         calls.clear()
-        with mock.patch.object(sch, "_discover", side_effect=lambda f: time.sleep(1)), \
+        with mock.patch.object(sch, "_discover", side_effect=lambda f, *a: time.sleep(1)), \
                 mock.patch.object(sch, "DISCOVERY_SECONDS", 0.1), \
                 mock.patch.object(sch, "run", side_effect=lambda *a: calls.append(a)):
             self.assertEqual(sch.main(["--config-dir", str(self.core)]), 0)
@@ -262,16 +268,219 @@ class Scripts(Tmp):
 
 
 class InstallHook(Tmp):
-    def test_main_installs_and_survives_a_failure(self):
+    def test_main_installs_retires_restores_and_survives_failures(self):
         mod = _load("install_statusline_edges", SCRIPTS / "install-statusline.py")
-        with mock.patch.object(sys, "stderr", io.StringIO()) as err, \
-                mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "true"}):
-            self.assertEqual(mod.main(["--config-dir", str(self.core)]), 0)
+        with mock.patch.object(cfg, "workspace", return_value=self.ws), \
+                mock.patch.object(pr, "retire", return_value="kept: test") as retire, \
+                mock.patch.object(pr, "ensure_running", return_value="already loaded") as restore, \
+                mock.patch.object(sys, "stderr", io.StringIO()) as err:
+            with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "true"}):
+                self.assertEqual(mod.main(["--config-dir", str(self.core)]), 0)
             self.assertIn("installed", err.getvalue())
+            retire.assert_called_once()
+            with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false"}):
+                self.assertEqual(mod.main(["--config-dir", str(self.core)]), 0)
+            restore.assert_not_called()  # route-proxy.py restores it, before routing
             with mock.patch.object(cfg, "install", side_effect=RuntimeError("boom")):
                 self.assertEqual(mod.main(["--config-dir", str(self.core)]), 0)
             self.assertIn("not installed", err.getvalue())
+            with mock.patch.object(cfg, "enabled", side_effect=[True, RuntimeError()]):
+                self.assertEqual(mod.main(["--config-dir", str(self.core)]), 0)
+            self.assertIn("check skipped", err.getvalue())
 
+
+class RouteHook(Tmp):
+    def setUp(self):
+        super().setUp()
+        self.mod = _load("route_proxy_edges", SCRIPTS / "route-proxy.py")
+        intent = mock.patch.object(pr, "intent_path", return_value=self.d / "user" / "intent.json")
+        intent.start()
+        self.addCleanup(intent.stop)
+        self.listen_after = 2
+        self.calls = []
+
+    def run_(self, argv):
+        self.calls.append(argv)
+        R = types.SimpleNamespace
+        if argv[:2] == ["launchctl", "print"]:
+            return R(returncode=0 if any(a[:2] == ["launchctl", "bootstrap"] for a in self.calls) else 113, stdout="")
+        if argv[:2] == ["launchctl", "bootstrap"]:
+            return R(returncode=0, stdout="")
+        if argv[0] == "lsof":
+            self.listen_after -= 1
+            return R(returncode=0 if self.listen_after <= 0 else 1, stdout="")
+        raise AssertionError(argv)
+
+    def test_opt_out_restores_and_waits_for_the_port_before_routing(self):
+        pr.write_intent("retired")
+        plist = self.d / "p.plist"
+        plist.write_text("<plist/>")
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false"}), \
+                mock.patch.object(cfg, "workspace", return_value=self.ws), \
+                mock.patch.object(pr, "plist_path", return_value=plist), mock.patch.object(sys, "stderr", err), \
+                mock.patch.object(pr.sys, "platform", "darwin"):
+            self.assertEqual(self.mod.main(runner=self.run_, sleep=lambda s: None), 0)
+        self.assertIn("restored, listening", err.getvalue())
+        boot = [i for i, a in enumerate(self.calls) if a[:2] == ["launchctl", "bootstrap"]]
+        listen = [i for i, a in enumerate(self.calls) if a[0] == "lsof"]
+        self.assertTrue(boot and listen and boot[0] < listen[0])
+
+    def test_port_that_never_listens_is_reported_and_tracking_on_does_nothing(self):
+        pr.write_intent("retired")
+        plist = self.d / "p.plist"
+        plist.write_text("<plist/>")
+        self.listen_after = 10 ** 6
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false"}), \
+                mock.patch.object(cfg, "workspace", return_value=self.ws), \
+                mock.patch.object(pr, "plist_path", return_value=plist), mock.patch.object(sys, "stderr", err), \
+                mock.patch.object(pr.sys, "platform", "darwin"):
+            self.mod.main(runner=self.run_, wait_s=0.05, sleep=lambda s: None)
+        self.assertIn("not listening yet", err.getvalue())
+        self.calls.clear()
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "true"}):
+            self.assertEqual(self.mod.main(runner=self.run_), 0)
+        self.assertEqual(self.calls, [])
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false"}), \
+                mock.patch.object(cfg, "workspace", side_effect=RuntimeError), mock.patch.object(sys, "stderr", err):
+            self.assertEqual(self.mod.main(runner=self.run_), 0)
+        self.assertIn("restore skipped", err.getvalue())
+
+    def test_first_opt_out_on_a_never_installed_host_installs_then_waits_for_the_port(self):
+        order, err = [], io.StringIO()
+        def install():
+            order.append("install")
+            self.calls.append(["launchctl", "bootstrap", "(installer)"])
+            return True
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false"}), \
+                mock.patch.object(cfg, "workspace", return_value=self.ws), \
+                mock.patch.object(pr, "plist_path", return_value=self.d / "absent.plist"), \
+                mock.patch.object(sys, "stderr", err), mock.patch.object(pr.sys, "platform", "darwin"):
+            self.assertEqual(self.mod.main(runner=lambda a: (order.append(a[0]), self.run_(a))[1],
+                                           sleep=lambda s: None, install=install), 0)
+        self.assertIn("installed, listening", err.getvalue())
+        self.assertLess(order.index("install"), order.index("lsof"))
+
+    def test_owner_off_starts_nothing(self):
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false", "CREDENTIAL_PROXY_ENABLED": "false"}), \
+                mock.patch.object(cfg, "workspace", return_value=self.ws), \
+                mock.patch.object(pr, "plist_path", return_value=self.d / "absent.plist"), \
+                mock.patch.object(sys, "stderr", err), mock.patch.object(pr.sys, "platform", "darwin"):
+            self.mod.main(runner=self.run_, sleep=lambda s: None, install=lambda: self.fail("installed"))
+        self.assertIn("left off", err.getvalue())
+        self.assertEqual(self.calls, [])
+
+    def test_route_phase_runs_route_declarers_without_a_config_dir(self):
+        hook = self.d / "r.py"
+        hook.write_text("import sys, pathlib; pathlib.Path(sys.argv[0]).with_suffix('.args').write_text(repr(sys.argv[1:]))\n")
+        seen = []
+        with mock.patch.object(sch, "_discover", side_effect=lambda f, field: (seen.append(field), f.extend([("x", hook), None]))):
+            self.assertEqual(sch.main(["--route"]), 0)
+        self.assertEqual(seen, [sch.ROUTE_FIELD])
+        self.assertEqual((self.d / "r.args").read_text(), "[]")
+        found = []
+        sch._discover(found, sch.ROUTE_FIELD)
+        self.assertIn("quota-tracker", [n for n, _p in found[:-1]])
+
+
+class Run:
+    def __init__(self, loaded=True, pid_line=True, bootout_rc=0, bootstrap_rc=0, lsof=None):
+        self.loaded, self.pid_line, self.bootout_rc, self.bootstrap_rc = loaded, pid_line, bootout_rc, bootstrap_rc
+        self.lsof, self.calls = lsof, []
+
+    def __call__(self, argv):
+        self.calls.append(argv)
+        R = types.SimpleNamespace
+        if argv[:2] == ["launchctl", "print"]:
+            return R(returncode=0 if self.loaded else 113,
+                     stdout="\tpid = 4242\n" if self.pid_line else "\tstate = waiting\n")
+        if argv[:2] == ["launchctl", "bootout"]:
+            return R(returncode=self.bootout_rc, stdout="")
+        if argv[:2] == ["launchctl", "bootstrap"]:
+            return R(returncode=self.bootstrap_rc, stdout="")
+        if argv[0] == "ps":
+            return R(returncode=0, stdout=" 1 /sbin/launchd HOME=/x\n")
+        if argv[0] == "lsof":
+            return self.lsof
+        raise AssertionError(argv)
+
+
+class ProxyRetire(Tmp):
+    def setUp(self):
+        super().setUp()
+        qr.record_statusline(self.ws, _status(), config_dir=str(self.core), core_dir=str(self.core))
+        self.intent_patch = mock.patch.object(pr, "intent_path", return_value=self.d / "user" / "intent.json")
+        for p in (mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "true"}), self.intent_patch):
+            p.start()
+            self.addCleanup(p.stop)
+        self.clear = types.SimpleNamespace(returncode=1, stdout="")
+
+    def test_run_and_paths(self):
+        self.assertEqual(pr._run([sys.executable, "-c", "print(1)"]).stdout.strip(), "1")
+        self.assertIsNone(pr._run([str(self.d / "missing-binary")]))
+        self.assertEqual(pr.plist_path().name, f"{pr.LABEL}.plist")
+
+    def test_an_unopenable_lock_keeps_the_proxy(self):
+        blocker = self.d / "user"
+        blocker.parent.mkdir(parents=True, exist_ok=True)
+        blocker.write_text("not a dir")  # the lock's folder cannot be made
+        run = Run(lsof=self.clear)
+        self.assertIn("holds the proxy lock", pr.retire(self.ws, runner=run, lock_wait_s=0.01))
+        self.assertFalse(any(a[:2] == ["launchctl", "bootout"] for a in run.calls))
+
+    def test_intent_is_per_user_not_per_workspace(self):
+        self.intent_patch.stop()
+        try:
+            path = pr.intent_path()
+        finally:
+            self.intent_patch.start()
+        self.assertEqual(path.parent, Path.home() / "Library" / "Application Support" / "Sutando")
+
+    def test_unreadable_connections_keep_it(self):
+        self.assertIsNone(pr.proxy_connections(lambda argv: None))
+        self.assertIn("could not be read", pr.retire(self.ws, runner=Run(lsof=None)))
+
+    def test_not_loaded_dry_run_and_failed_bootout(self):
+        self.assertEqual(pr.retire(self.ws, runner=Run(loaded=False)), "proxy launch agent not loaded")
+        self.assertEqual(pr.retire(self.ws, runner=Run(lsof=self.clear), dry_run=True), "would turn off: unused")
+        self.assertEqual(pr.retire(self.ws, runner=Run(lsof=self.clear, bootout_rc=5)),
+                         "kept: launchctl bootout failed")
+
+    def test_retires_without_signalling_and_listening_reads(self):
+        with mock.patch.object(os, "kill", side_effect=AssertionError("signalled")):
+            said = pr.retire(self.ws, runner=Run(lsof=self.clear), wait_s=0.1)
+        self.assertTrue(said.startswith("turned off"), said)
+        ns = types.SimpleNamespace
+        self.assertIsNone(pr.listening(lambda a: None))
+        self.assertIsNone(pr.listening(lambda a: ns(returncode=1, stdout="", stderr="lsof: WARNING")))
+        self.assertIsNone(pr.listening(lambda a: ns(returncode=1, stdout="junk")))
+        self.assertTrue(pr.listening(lambda a: ns(returncode=0, stdout="node 1")))
+        self.assertFalse(pr.listening(lambda a: ns(returncode=1, stdout="")))
+        self.assertEqual(pr.read_intent()["status"], "retired")
+        pr.intent_path().write_text("[1]")
+        self.assertEqual(pr.read_intent(), {})
+        with mock.patch.object(cfg, "_write_json", side_effect=OSError):
+            self.assertFalse(pr.write_intent("retiring"))
+
+    def test_ensure_running_refusals(self):
+        pr.write_intent("retired")
+        with mock.patch.object(pr.sys, "platform", "darwin"):
+            self.assertEqual(pr.ensure_running(self.ws, runner=Run(loaded=True)), "already loaded")
+            self.assertEqual(pr._read_record(self.ws)["status"], "restored")
+            plist = self.d / "p.plist"
+            plist.write_text("<plist/>")
+            with mock.patch.object(pr, "plist_path", return_value=plist):
+                self.assertIn("bootstrap failed",
+                              pr.ensure_running(self.ws, runner=Run(loaded=False, bootstrap_rc=1)))
+        with mock.patch.object(pr.sys, "platform", "linux"):
+            self.assertIn("launchd only", pr.ensure_running(self.ws, runner=Run(loaded=False)))
+        with mock.patch.object(pr.subprocess, "run", return_value=types.SimpleNamespace(returncode=0)) as ran:
+            self.assertTrue(pr._install())
+        self.assertEqual(ran.call_args[0][0][-1], "install")
+        with mock.patch.object(pr.subprocess, "run", side_effect=subprocess.TimeoutExpired("x", 1)):
+            self.assertFalse(pr._install())
 
 class SignedIn(Tmp):
     def setUp(self):
@@ -496,14 +705,18 @@ class SignedIn(Tmp):
 
     def test_routing_agrees_with_the_launch_predicate(self):
         launch = ('. "$1/scripts/python-binary.sh"; PY="$(resolve_python "$1")"; REPO="$1"; '
-                  '. "$1/src/skill-manifest-config.sh"; . "$1/src/claude_routing.sh"; claude_direct_routing')
+                  '. "$1/src/skill-manifest-config.sh"; . "$1/src/claude_routing.sh"; claude_routes_direct')
         for value in (None, "", "false", "off", "true", "1"):
-            with self.subTest(value=value), mock.patch.dict(os.environ):
-                os.environ.pop("QUOTA_STATUSLINE_ENABLED", None)
-                if value is not None:
-                    os.environ["QUOTA_STATUSLINE_ENABLED"] = value
-                rc = subprocess.run(["/bin/bash", "-c", launch, "bash", str(ROOT)]).returncode
-                self.assertIs(self.csi.direct_routing_on(), rc == 0)
+            for owner in (None, "false", "true"):
+                with self.subTest(value=value, owner=owner), mock.patch.dict(os.environ):
+                    for key, v in (("QUOTA_STATUSLINE_ENABLED", value), ("CREDENTIAL_PROXY_ENABLED", owner)):
+                        os.environ.pop(key, None)
+                        if v is not None:
+                            os.environ[key] = v
+                    rc = subprocess.run(["/bin/bash", "-c", launch, "bash", str(ROOT)]).returncode
+                    self.assertIs(self.csi.direct_routing_on(), rc == 0)
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false", "CREDENTIAL_PROXY_ENABLED": "false"}):
+            self.assertIs(self.csi.direct_routing_on(), True)  # the owner keeps the proxy off: direct
         with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": ""}):
             self.assertIs(self.csi.direct_routing_on(), False)  # set but empty: the proxy, as the launch does
 
@@ -597,6 +810,10 @@ class HealthCheck(Tmp):
                 mod.main()
         self.assertEqual(stop.exception.code, 1)
         self.assertIn("another login", out.getvalue())
+
+    def test_cwd_without_a_name_line_is_unknown(self):
+        R = types.SimpleNamespace
+        self.assertIsNone(pr._cwd("1", lambda argv: R(returncode=0, stdout="p1\n")))
 
     def test_statusline_freshness_with_an_unreadable_record(self):
         hc = self._hc()

@@ -66,9 +66,12 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`cli_wedge_patterns.py`** — The abnormal-banner table of the CLI progress detector: text on a pane that says the CLI is parked (a login prompt, a provider limit, a compaction, an error it sits on), as data.
 - **`client-frame-hub.ts`** — Client-frame hub: optional voice plugins register handlers; the host offers them every client JSON frame it does not own.
 - **`cloud_auth.py`** — Sutando Cloud session: find the owner's sutk_ bearer and call the cloud API.
+- **`codex_account.py`** — Which account a Codex home is signed in to: the email and plan, never a token.
+- **`codex_core_model.py`** — The Codex core's own model choice: core-only, never the shared Codex home's.
 - **`codex_home.py`** — Resolve, check and create the Codex core's home once, for every launcher that uses it.
 - **`codex_host_instructions.py`** — Give a Codex core the instructions its desktop host ships beside the checkout.
 - **`codex_project_trust.py`** — Record the Codex core's own checkout as a trusted project before launch.
+- **`codex_rpc.py`** — JSON-RPC 2.0 over a child's stdio, the client every Codex app-server caller uses (the seat, the account lookup): one JSON object per line, responses matched to requests by id.
 - **`connections.py`** — Connections: the install's directory of homeserver gateways, one row per bridge instance.
 - **`context-drop.sh`** — Sutando context drop — triggered by macOS hotkey via Automator Quick Action.
 - **`context_resume.py`** — Extract recent conversation turns from a Claude Code transcript (.jsonl).
@@ -79,12 +82,15 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`core-input-watch.py`** — core-input-watch.py — the core supervisor MONITOR (M1).
 - **`core-supervisor-gate.py`** — core-supervisor-gate.py — the RECOVER decision gate (sonichi#2401 prototype).
 - **`core-supervisor-relay.py`** — core-supervisor-relay.py — the COMMUNICATOR (outbound ESCALATE).
+- **`core_account_health.py`** — core_account_health.py — the core's account health, for Settings and the profile tab to show.
 - **`core_block_signal.py`** — The core CLI's own word on whether it is blocked on the owner, from its hook events.
 - **`core_crash_loop.py`** — core_crash_loop.py — a crash loop reaches the owner as one card per incident.
 - **`core_gate_notice.py`** — Tell each task waiting behind a blocked core why it is on hold.
 - **`core_heartbeat.py`** — Per-host heartbeat for sutando-core sessions.
+- **`core_held_inbox.py`** — The core's inbox while a provider limit keeps the core from launching at all.
 - **`core_limit_hold.py`** — Hold the core's relaunch while its provider refuses it for a limit.
 - **`core_lineage.py`** — Which conversation this host's core is having, and which it had before.
+- **`core_quota_notice.py`** — The core's quota notice: the account card, unasked, in the owner's DM once the core is out of usage.
 - **`core_recovery_state.py`** — The core's recovery record (`core_recovery.v1`): one derivation, one writer.
 - **`core_restart_intent.py`** — core_restart_intent.py — the owner's easy-restart intent file (sonichi#2401).
 - **`core_runtime_record.py`** — Atomic publication of a confirmed core launch observation shared by CLI adapters.
@@ -284,6 +290,8 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`sutando_config.py`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`sutando_config.ts`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`sutando_platform.py`** — Cross-platform OS abstraction for Sutando Python services.
+- **`switch_card_intercept.py`** — The owner's bare "switch account / model / core" request answered with its card, in code.
+- **`switch_worker.py`** — The detached worker a card's switch starts: its pid on record, and whether it has died before finishing.
 - **`system_load.py`** — Sustained system load: one reading per health-check pass, a warning only when the last K passes all ran above a ratio of the core count, the top CPU users, and their cause.
 - **`task-bridge.ts`** — Voice → Claude Code session bridge.
 - **`task-delegation.ts`** — TaskDelegationService — step 4 of the interaction-planes refactor (issue #1947, built under the architecture names per design R3).

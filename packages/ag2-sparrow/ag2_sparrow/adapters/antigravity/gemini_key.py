@@ -84,7 +84,7 @@ def opted_out(environ=None) -> bool:
 
 
 def gemini_api_key_from_app(agent_id: str = "", run=None, platform: str = None, environ=None,
-                            timeout: float = READ_TIMEOUT_S) -> "tuple[str, str]":
+                            timeout: float = READ_TIMEOUT_S) -> str:
     """This agent's Gemini API key saved in the app, or ''. macOS only, needs the agent id; never raises."""
     if not agent_id or (platform or sys.platform) != "darwin" or opted_out(environ):
         return ""
@@ -134,3 +134,47 @@ def authenticate_with_app_key(client, init, timeout, argv, agent_id="", log=lamb
         key = None
     log("using the Gemini API key saved in the app for this agent")
     return True
+
+
+def key_saved(agent_id: str = "", run=None, platform: str = None, environ=None,
+              timeout: float = READ_TIMEOUT_S) -> bool:
+    """Whether this agent has a Gemini API key saved in the app, without reading the key: `security` is asked
+    for the item's attributes only (no `-w`/`-g`), and what it prints is dropped. False off macOS, without the
+    agent id, when opted out, and on any failure."""
+    if not agent_id or (platform or sys.platform) != "darwin" or opted_out(environ):
+        return False
+    try:
+        done = (run or subprocess.run)([SECURITY, "find-generic-password", "-a", ACCOUNT, "-s", agent_service(agent_id)],
+                                       capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return getattr(done, "returncode", 1) == 0
+
+
+REMOVED, ABSENT, FAILED = "removed", "absent", "failed"
+NOT_FOUND = 44   # `security`'s exit when the item does not exist
+
+
+def clear_key(agent_id: str, run=None, platform: str = None, timeout: float = READ_TIMEOUT_S) -> str:
+    """Delete this agent's saved key ("Stop using the key"): REMOVED when `security` deleted it and it is gone,
+    ABSENT when there was none to delete, FAILED otherwise (off macOS, no agent id, `security` did not run,
+    failed, or the item is still there). Only this agent's own item is named, so no other agent's key, and not
+    the app's voice key, can be removed by it."""
+    if not agent_id or (platform or sys.platform) != "darwin":
+        return FAILED
+    try:
+        done = (run or subprocess.run)([SECURITY, "delete-generic-password", "-a", ACCOUNT, "-s", agent_service(agent_id)],
+                                       capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return FAILED
+    code = getattr(done, "returncode", 1)
+    if code == NOT_FOUND:
+        return ABSENT
+    if code != 0:
+        return FAILED
+    try:
+        still = (run or subprocess.run)([SECURITY, "find-generic-password", "-a", ACCOUNT, "-s", agent_service(agent_id)],
+                                        capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return FAILED
+    return REMOVED if getattr(still, "returncode", 0) == NOT_FOUND else FAILED

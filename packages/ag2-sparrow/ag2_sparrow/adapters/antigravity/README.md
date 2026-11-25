@@ -242,6 +242,37 @@ into that request on agy's stdin: never argv, environment or logs. Each saved Se
 resumed (resuming a sign-in Session still bills the Google account's quota), a new one is opened.
 `AG2_AGY_GEMINI_KEY=0` in the connector's environment turns this off. See `gemini_key.py`.
 
+## The account card
+
+In the owner's DM (Commons "switch account / API key", part A). The owner says "switch account" or "use
+API key" (in English or Chinese, or `/account`, or the turn answers with the card's mark) and gets a card
+with "Switch account" and "Use API key" (plus "Stop using API key" while a key is saved). Its words are
+English only. Only the owner's tap in their DM acts.
+
+No secret is taken in chat: in the web client every card reply and card input is sent as a room message.
+The card instead carries `account_controls` (`{"runtime": "antigravity", "agent": <mxid>}`): in the desktop
+app, on the computer that runs the agent, the owner's DM draws the agent's account controls (switch
+account with the code field, API key field) right in the card, and nothing typed there reaches the room.
+Anywhere else the client shows "Open this on the computer that runs <agent> to switch account."
+
+- **Switch account** (a client without the in-card controls) says to open the card on the computer that
+  runs the agent, where the desktop runs `agy acp --login` headless (`agent_account_switch`). agy keeps one
+  Google sign-in per Mac, so this moves every Antigravity agent here; the card says so.
+- **The turn after a switch says so.** Each owner turn reads the account agy authenticated as from agy's own
+  log (`~/.gemini/antigravity-cli/log/acp-server-*-<pid>.log`, `applyAuthResult: email=...`); when it differs
+  from the last one seen the answer starts with (Switched to the <a…@domain> account.). Only the shortened address is kept
+  (`state/agy-account.json`).
+- **Use API key** says the same for the key field (the Keychain item `gemini_key` reads).
+- **Stop using API key** deletes this agent's own Keychain item; the next turn opens a fresh Session on the sign-in.
+- **A code or key sent in chat** (a Google sign-in code `4/...`, an address with `code=`, a Gemini key, or the
+  bridge's `[REDACTED-Google API Key]`) is never passed to agy: the sender is asked to delete the message.
+- **Quota.** A turn that fails with `RESOURCE_EXHAUSTED` / "Individual quota reached" / a 429 makes the
+  connector itself post the account card (English, with the `account_controls` marker) in the owner's DM:
+  that the limit was reached, when it resets if agy said, and the account in use. One card per limit: the
+  next only after a turn answered and the limit came back (`quota_notice.py`). The DM is remembered from the
+  owner's own messages there; until one is seen no card is sent and the room gets the limit in words. While
+  the card is out, a refused turn posts no error line.
+
 ## S.space tools (Room Commons pages and room actions)
 
 The owner's turns and Team's (an attested collaborator: `access_tier: team` with `collaborator: true`, as
