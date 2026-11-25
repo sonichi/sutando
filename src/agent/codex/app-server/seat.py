@@ -365,6 +365,7 @@ class Seat:
         self.turn_model_missing = ""  # the current turn's model is not one this account may use: its message
         self.told_model_missing: List[str] = []  # the owner's tasks already shown the model card
         self.told_signed_out: Optional[tuple] = None  # the login the owner was last shown the card for
+        self.told_limit = False  # the owner was shown a limit card this episode
         self.health_auth: Optional[tuple] = None  # the login on disk when the core's health went bad
         # Shows the owner the core's account card when its login is refused even after a restart.
         self.card_argv = [sys.executable, str(ACCOUNT_CARD), "--workspace", str(self.workspace), "post",
@@ -461,6 +462,22 @@ class Seat:
             return
         if changed:
             log(f"account health: {state}")
+        if state == "ok" and changed:
+            self.back_signed_in(account)
+
+    def back_signed_in(self, account: str) -> None:
+        """Back to ok after the owner was shown a sign-in or limit card: they are told it worked, so that
+        card's red line is not the last word (VM 2026-11-24 06:25: signed in and answered, the card
+        still said 'Sign-in expired' and the old usage limit). Once per recovery; never when no card
+        was shown (a first start, a recovery nobody was told about)."""
+        if not (self.told_signed_out is not None or getattr(self, "told_limit", False)):
+            return
+        self.told_signed_out = None
+        self.told_limit = False
+        who = account or "your Codex account"
+        model = self.model or "the core model"
+        self.notify("signed-in", f"Signed in as {who}; I'm back on {model}.\n")
+        log(f"account health: back to ok; the owner was told ({model})")
 
     def health_auth_check(self) -> None:
         """The login on disk changed since the health went bad (a sign-in or account switch): back to ok,
@@ -1196,6 +1213,8 @@ class Seat:
                          core_quota_notice.reset_from_text(self.turn_limit.get("message")))
                 owner = payload is not None and core_quota_notice.is_owner_task(payload)
                 done = self.quota.hit(reset, at, tasks=[filename[:-4]] if owner and filename else ())
+                if str(done).startswith("quota-card"):
+                    self.told_limit = True  # the owner saw a limit card: told when it is over
             else:
                 done = self.quota.cleared() if status == "completed" else ""
         except Exception as e:  # noqa: BLE001 - advisory
