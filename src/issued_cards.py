@@ -20,6 +20,8 @@ from typing import Mapping, Optional
 LEDGER = ("state", "agent-cards", "issued.json")
 TTL_S = 3 * 86400
 MAX_CARDS = 500
+# Retired ids and send intents must outlive the live-card cap, or a replay under load finds neither.
+MAX_RETIRED = 10 * MAX_CARDS
 
 
 def ledger_path(workspace: Path) -> Path:
@@ -97,7 +99,7 @@ def intend(workspace: Path, operation_id: str, *, now: Optional[float] = None) -
                    if isinstance(v, (int, float)) and v > now - TTL_S}
         # Strictly after every earlier intent, so two sends in one clock tick still have an order.
         first = intents.setdefault(str(operation_id), max([now] + [v + 1e-6 for v in intents.values()]))
-        old = sorted(intents.items(), key=lambda kv: kv[1])[-MAX_CARDS:]
+        old = sorted(intents.items(), key=lambda kv: kv[1])[-MAX_RETIRED:]
         write_whole(path, {**doc, "intents": dict(old)})
     return float(first)
 
@@ -130,7 +132,7 @@ def record(workspace: Path, event_id: str, card: Mapping[str, object], *, room: 
             same = {k: v for k, v in live_cards.items()
                     if v.get("card_id") == card_id and str(v.get("room") or "") == room}
             if any(float(v.get("issued_at") or 0) > order for v in same.values()):
-                retired[event_id] = {"why": "replaced", "expires_at": now + ttl_s}
+                retired[event_id] = {"why": "replaced", "expires_at": _retire_until(None, now)}
                 _save(path, cards, retired)
                 return False
             for k, v in same.items():
@@ -147,7 +149,7 @@ def _save(path: Path, cards: dict, retired: dict) -> None:
     """Write the ledger under the caller's lock, keeping the send intents it holds."""
     from local_record import write_whole
     newest = sorted(cards.items(), key=lambda kv: kv[1]["expires_at"])[-MAX_CARDS:]
-    old = sorted(retired.items(), key=lambda kv: float(kv[1].get("expires_at") or 0))[-MAX_CARDS:]
+    old = sorted(retired.items(), key=lambda kv: float(kv[1].get("expires_at") or 0))[-MAX_RETIRED:]
     write_whole(path, {**_load(path), "cards": dict(newest), "retired": dict(old)})
 
 

@@ -634,6 +634,19 @@ class Issued(unittest.TestCase):
         self.assertIsNone(issued_cards.live(self.ws, "$A", now=2661.0))
         self.assertEqual(cards(), ["$B"])
 
+    def test_retired_ids_and_intents_are_not_trimmed_with_the_live_cards(self):
+        with mock.patch.object(issued_cards, "MAX_CARDS", 2):
+            for i in range(4):
+                issued_cards.intend(self.ws, f"op{i}", now=1000.0 + i)
+                issued_cards.record(self.ws, f"$r{i}", self.card, room=DM, now=1000.0 + i)
+            doc = json.loads(issued_cards.ledger_path(self.ws).read_text())
+            self.assertLessEqual({"$r0", "$r1", "$r2"}, set(doc["retired"]), "live cap of 2 evicts no retired id")
+            self.assertEqual(len(doc["intents"]), 4)
+            self.assertFalse(issued_cards.record(self.ws, "$r0", self.card, room=DM, now=1010.0))
+        with mock.patch.object(issued_cards, "MAX_RETIRED", 2):
+            issued_cards.record(self.ws, "$r9", self.card, room=DM, now=1011.0)
+            self.assertEqual(len(json.loads(issued_cards.ledger_path(self.ws).read_text())["retired"]), 2)
+
     def test_a_record_expires_and_the_ledger_keeps_only_live_cards(self):
         self.assertLessEqual(issued_cards.TTL_S, 3 * 86400)
         issued_cards.record(self.ws, "$later", {**self.card, "id": "later"}, now=1000.0 + issued_cards.TTL_S + 1)
