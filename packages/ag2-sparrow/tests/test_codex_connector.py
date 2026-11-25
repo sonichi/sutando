@@ -880,6 +880,27 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         self.assertEqual((self.state()["held"], self.state()["refused"]), ("", ""))
         self.assertEqual(self.posted(), [], "no second card for the same message")
 
+    def test_a_restart_between_the_release_and_the_answer_never_holds_the_message_again(self):
+        self.serve("task-1", "hello [[noaccess]]", wait=False)
+        self.assertEqual(len(self.posted()), 1)
+        # The owner writes on; the released message is taken up, and the connector dies before it is answered.
+        self.dm("task-2", "never mind")
+        with mock.patch.object(cc.Connector, "run_task", side_effect=KeyboardInterrupt("killed mid-turn")):
+            with self.assertRaises(KeyboardInterrupt):
+                run_connector(self.work, once=2)
+        state = self.state()
+        self.assertEqual((state["held"], state["released"], (self.work / "results" / "task-1.txt").exists()),
+                         ("", ["task-1"], False))
+        # Its replacement: the model is still refused, and the message is answered in words, not held again.
+        self.assertEqual(run_connector(self.work, once=2), 0)
+        self.assertEqual(result(self.work, "task-1"), "This account can't use the model this agent was set to. Send /model "
+                                                      "in our direct message to choose one it has.\n")
+        self.assertIn("STUB echo:", result(self.work, "task-2"))
+        state = self.state()
+        self.assertEqual((state["held"], state["released"], self.posted("$card2")), ("", [], []), "no second hold or card")
+        self.assertEqual([(m["task"], m["status"]) for m in metrics(self.work)[-2:]],
+                         [("task-1", "failed"), ("task-2", "completed")])
+
     def test_a_refusal_after_the_turn_started_work_or_outside_the_dm_holds_nothing(self):
         said = self.serve("task-1", "hello [[noaccess]] [[worked]]")
         self.assertEqual(said, "Codex ended this task with status failed.\n\nPartial reply:\npartial answer\n")
@@ -1261,14 +1282,15 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.assertTrue(result(self.work, "task-next").startswith("STUB echo:"), "the turn it arrived in is answered as usual")
         self.assertEqual([m.get("card") for m in metrics(self.work)], ["account-card", "account-started", None])
 
-    def test_a_switch_restarts_the_app_server_before_the_next_turn(self):
+    def test_a_sign_in_that_rotates_the_tokens_of_the_same_account_still_answers_the_next_turn(self):
         # The server holds the token it started with; the sign-in revokes it, so the next turn needs a restart.
         (self.home / "stub-token").write_text("tok-a")
         (self.home / "stub-login").write_text("success bob@example.org")
         self.tap()
         self.assertEqual((self.home / "stub-revoked").read_text().split(), ["tok-a"])
         self.assertTrue(result(self.work, "task-next").startswith("STUB echo:"), result(self.work, "task-next"))
-        self.assertEqual(metrics(self.work)[-1].get("auth"), "reloaded", "restarted before the turn, not after a failure")
+        # The same account id signed in again: the sign-in check sees no other account, so the refused turn restarts it.
+        self.assertEqual(metrics(self.work)[-1].get("auth"), "restarted-unauthorized")
         (_, _started), (_, done) = self.posted("$card2")
         self.assertEqual(done["text"], "Signed in. I'm using bob@example.org.", "no shared login here")
 
@@ -1310,7 +1332,8 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(said, "Codex ended this task with status failed.\n\nPartial reply:\npartial answer\n\n"
                          + cc.quoted(cc.SIGNED_OUT_ELSEWHERE).strip() + "\n")
         rec = metrics(self.work)[-1]
-        self.assertEqual((rec["status"], rec.get("auth"), rec.get("card")), ("unauthorized", None, None))
+        # The server is restarted for the turns to come; this one is not sent again.
+        self.assertEqual((rec["status"], rec.get("auth"), rec.get("card")), ("unauthorized", "restarted-unauthorized", None))
         self.assertEqual(self.posted(), [], "no card over a turn that was not refused outright")
         self.assertEqual(len((self.work / "state" / "metrics.jsonl").read_text().splitlines()), 1, "one turn, no replay")
 
@@ -1600,65 +1623,13 @@ class FakeRpc:
         pass
 
 
-class AuthReloadTest(unittest.TestCase):
-    """The app-server runs on the login on disk: after a sign-in, an API key set or a logout it is restarted
-    before the next turn; the shared daemon is not."""
+class AuthErrorTest(unittest.TestCase):
+    """What the connector reads as a sign-out, and where the login file is shared with the core."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        patch = mock.patch.dict(os.environ, {"CODEX_HOME": self.tmp.name})
-        patch.start()
-        self.addCleanup(patch.stop)
         self.auth = Path(self.tmp.name) / "auth.json"
-
-    def connector(self, server="stdio"):
-        args = cc.build_parser().parse_args(["--server", server, "--work", "w"])
-        args.state, args.bridge_state = self.tmp.name, None
-        c = cc.Connector(FakeRpc, args, note="n")
-        c.restarts = 0
-
-        def restart():
-            c.restarts += 1
-            c.auth_seen = cc.auth_print()
-        c.restart_server = restart
-        return c
-
-    def test_a_changed_login_file_or_a_finished_sign_in_restarts_the_server_once(self):
-        c = self.connector()
-        self.assertEqual((c.fresh_auth(), c.restarts), ("", 0), "nothing changed")
-        self.auth.write_text('{"OPENAI_API_KEY": "sk-x"}')            # an API key set
-        self.assertEqual((c.fresh_auth(), c.restarts), ("reloaded", 1))
-        self.assertEqual((c.fresh_auth(), c.restarts), ("", 1), "once per change")
-        self.auth.unlink()                                             # a logout
-        self.assertEqual((c.fresh_auth(), c.restarts), ("reloaded", 2))
-        c.accounts.keep({"id": "login-1", "room": "!dm:s.space", "at": time.time()})
-        c.rpc.events.put({"jsonrpc": "2.0", "method": "account/login/completed",
-                          "params": {"loginId": "login-1", "success": True}})
-        self.assertEqual((c.fresh_auth(), c.restarts), ("reloaded", 3), "a queued sign-in report is read first")
-
-    def test_a_sign_in_in_progress_is_not_ended_by_a_restart(self):
-        c = self.connector()
-        c.accounts.keep({"id": "login-1", "room": "!dm:s.space", "at": time.time()})
-        self.auth.write_text("{}")                                     # the login file changed meanwhile
-        self.assertEqual((c.fresh_auth(), c.restarts), ("deferred", 0), "the server holds the pending sign-in")
-        c.accounts.keep({})
-        self.assertEqual((c.fresh_auth(), c.restarts), ("reloaded", 1), "done once the sign-in is over")
-
-    def test_a_restart_that_fails_is_not_swallowed(self):
-        """The connector stops with the error, and its service manager starts it again: it never goes on
-        serving tasks on a server that is gone."""
-        c = self.connector()
-        c.auth_stale = True
-        c.restart_server = mock.Mock(side_effect=RuntimeError("server pipe closed"))
-        with self.assertRaises(RuntimeError):
-            c.fresh_auth()
-
-    def test_the_shared_daemon_is_never_restarted(self):
-        c = self.connector("proxy")
-        self.auth.write_text("{}")
-        c.auth_stale = True
-        self.assertEqual((c.fresh_auth(), c.restarts), ("", 0))
 
     def test_what_reads_as_unauthorized(self):
         yes = ({"codexErrorInfo": "unauthorized"}, {"codex_error_info": {"unauthorized": {}}})
@@ -1668,7 +1639,12 @@ class AuthReloadTest(unittest.TestCase):
               {"codexErrorInfo": "other", "message": "401 unauthorized"})
         self.assertEqual([cc.unauthorized(e) for e in yes], [True] * len(yes))
         self.assertEqual([cc.unauthorized(e) for e in no], [False] * len(no))
-        self.assertTrue(cc.shared_login(str(self.auth)) is False)
+        self.assertFalse(cc.shared_login(self.tmp.name))
+        core = Path(self.tmp.name) / "core"
+        core.mkdir()
+        (core / "auth.json").write_text("{}")
+        os.symlink(core / "auth.json", self.auth)
+        self.assertTrue(cc.shared_login(self.tmp.name))
 
 
 class EdgePathTest(unittest.TestCase):
@@ -1706,6 +1682,202 @@ class EdgePathTest(unittest.TestCase):
             self.assertTrue(result(d, "task-chat-2").startswith("STUB echo:"), "serve went on after the crash")
             spawned = [c for c in spy.call_args_list if c.args and c.args[0] == "spawned"]
             self.assertEqual(len(spawned), 3, "initial + one restart per attempt")
+
+    def signin_world(self, d, home, script):
+        """Serve the tasks in `d` on the stub with CODEX_HOME `home`. `script(event, n)` is called at
+        'spawned' (the n-th server has been made), 'initialized' (the n-th handshake returned),
+        'polled' (the inbox was listed) and 'thread' (the n-th thread was opened) and may rewrite auth.json or raise. Returns (rc, turns, logs):
+        one row per turn dispatched, (the server it went to, the sign-in that server was started on,
+        the sign-in on disk at that moment)."""
+        from ag2_sparrow import signin_watch
+        real, handshake, run_turn, pending = cc.Rpc, cc.Connector.handshake, cc.Connector.run_turn, cc.Connector.pending_tasks
+        open_for = cc.Connector.open_for
+        made, shakes, turns, opens = [], [], [], []
+        self.opens = opens
+
+        def rpc(*a, **k):
+            script("spawning", len(made) + 1)
+            made.append(real(*a, **k))
+            script("spawned", len(made))
+            return made[-1]
+
+        def shaken(connector):
+            handshake(connector)
+            shakes.append(1)
+            script("initialized", len(shakes))
+
+        def opened(connector, *a, **k):
+            out = open_for(connector, *a, **k)
+            opens.append(made.index(connector.rpc) + 1)
+            script("thread", len(opens))
+            return out
+
+        def polled(connector, seen):
+            names = pending(connector, seen)
+            script("polled", len(made))
+            return names
+
+        def dispatched(connector, *a, **k):
+            turns.append((made.index(connector.rpc) + 1, connector.signin_started,
+                          signin_watch.fingerprint(signin_watch.codex_identity(home))))
+            return run_turn(connector, *a, **k)
+
+        with mock.patch.dict(os.environ, {"CODEX_HOME": home}), mock.patch.object(cc, "Rpc", rpc), \
+                mock.patch.object(cc.Connector, "handshake", shaken), \
+                mock.patch.object(cc.Connector, "pending_tasks", polled), \
+                mock.patch.object(cc.Connector, "open_for", opened), \
+                mock.patch.object(cc.Connector, "run_turn", dispatched), \
+                mock.patch.object(cc, "log", wraps=cc.log) as spy:
+            rc = run_connector(d, once=len([n for n in os.listdir(os.path.join(d, "tasks"))]))
+        return rc, turns, [" ".join(map(str, c.args)) for c in spy.call_args_list]
+
+    @staticmethod
+    def signed_in(home, account):
+        (Path(home) / "auth.json").write_text(json.dumps({"tokens": {"account_id": account}}))
+
+    def assert_every_turn_ran_on_the_sign_in_on_disk(self, turns):
+        self.assertTrue(turns)
+        for server, started, on_disk in turns:
+            self.assertEqual(started, on_disk, "a turn went to server %d, started on another sign-in" % server)
+
+    def test_a_queued_task_is_served_when_the_restart_for_a_changed_sign_in_cannot_start(self):
+        """Reviewer, 2a02e558 (#6782): the restart closed the running server before making the new one;
+        when that could not start, the queued task went to the closed server, the error left serve()
+        and no result was written."""
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
+            self.signed_in(home, "acct-1")
+
+            def script(event, n):
+                if (event, n) == ("initialized", 1):
+                    self.signed_in(home, "acct-2")           # switched under the running server
+                if event == "spawning" and n > 1:
+                    raise OSError("codex did not start")
+
+            write_task(d, "task-chat-1", "still answered")
+            rc, turns, logged = self.signin_world(d, home, script)
+            self.assertEqual(rc, 0, "nothing escaped serve()")
+            self.assertTrue(result(d, "task-chat-1").startswith("STUB echo:"), "the running server served it")
+            self.assertEqual([t[0] for t in turns], [1])
+            failed = [l for l in logged if "sign-in check failed" in l]
+            self.assertEqual(len(failed), 1, "said once, though it was tried while idle and again at dispatch")
+            self.assertIn("codex did not start", failed[0])
+
+    def test_no_turn_is_dispatched_on_a_server_started_on_another_sign_in_than_the_one_on_disk(self):
+        """Reviewer, 00fd9b8d (#6782): A -> B -> C with C written during B's `initialize`. The queued task
+        still got its turn on B's server and completed under B; only the next poll moved to C. The same
+        holds wherever the change lands before the dispatch: for the first server, a replaced one, and
+        one restarted after a crash."""
+        cases = {
+            "the first server, switched after it started": {("initialized", 1): "acct-2"},
+            "a replacement, switched during its initialize": {("initialized", 1): "acct-2", ("initialized", 2): "acct-3"},
+            "a replacement, switched during its spawn": {("initialized", 1): "acct-2", ("spawned", 2): "acct-3"},
+            "switched between the poll and the dispatch": {("polled", 1): "acct-2"},
+            "switched while the turn's thread was being opened": {("thread", 1): "acct-2"},
+            "switched while the thread was opened, on a replacement too": {("initialized", 1): "acct-2", ("thread", 1): "acct-3"},
+            "switched during two thread openings in a row": {("thread", 1): "acct-2", ("thread", 2): "acct-3"},
+            "twice between the poll and the dispatch": {("polled", 1): "acct-3", ("initialized", 2): "acct-4"},
+        }
+        for name, flips in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
+                self.signed_in(home, "acct-1")
+                left = dict(flips)
+
+                def script(event, n, left=left, home=home):
+                    account = left.pop((event, n), None)
+                    if account:
+                        self.signed_in(home, account)
+
+                write_task(d, "task-chat-1", "which account ran this")
+                rc, turns, _ = self.signin_world(d, home, script)
+                self.assertEqual((rc, left), (0, {}), "every switch of the case happened")
+                self.assertTrue(result(d, "task-chat-1").startswith("STUB echo:"))
+                self.assert_every_turn_ran_on_the_sign_in_on_disk(turns)
+                self.assertGreater(turns[0][0], 1, "not on the server that was started on the earlier sign-in")
+
+    def test_a_switch_during_thread_start_reopens_the_thread_and_sends_the_prompt_once(self):
+        """Reviewer, 70b11b82 (#6782): the check ran before the thread was opened, and opening one is a
+        round trip: C written during it still sent the prompt on B. One ordinary switch was enough."""
+        for tier in ("owner", "guest"):
+            with self.subTest(tier), tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
+                self.signed_in(home, "acct-1")
+
+                def script(event, n, home=home):
+                    if (event, n) == ("thread", 1):
+                        self.signed_in(home, "acct-2")
+
+                write_task(d, "task-chat-1", "sent once", tier=tier)
+                extra = ["--allow-non-owner"] if tier == "guest" else []
+                scratch, mkdtemp = [], tempfile.mkdtemp
+
+                def made_dir(*a, **k):
+                    path = mkdtemp(*a, **k)
+                    if k.get("prefix") == "codex-nonowner-":
+                        scratch.append(path)
+                    return path
+
+                with mock.patch.object(cc.tempfile, "mkdtemp", made_dir), \
+                        mock.patch.object(sys.modules[__name__], "run_connector",
+                                       lambda work, once, extra_=extra: cc.main(
+                                           ["--server", "stub", "--work", str(work), "--once", str(once), "--idle-exit", "3",
+                                            "--poll", "0.05", "--turn-timeout", "10", "--interrupt-grace", "2"] + extra_)):
+                    rc, turns, _ = self.signin_world(d, home, script)
+                self.assertEqual(rc, 0)
+                self.assertEqual(len(turns), 1, "the prompt was sent once")
+                self.assertEqual(self.opens, [1, 2], "the thread was opened again, on the new server")
+                self.assertEqual(turns[0][0], 2)
+                self.assert_every_turn_ran_on_the_sign_in_on_disk(turns)
+                self.assertEqual(result(d, "task-chat-1").count("STUB echo:"), 1)
+                # The folder of the thread left behind is removed when the thread is opened again.
+                self.assertEqual(len(scratch), 2 if tier == "guest" else 0)
+                self.assertEqual([os.path.isdir(p) for p in scratch[:-1]], [False] * len(scratch[:-1]))
+
+    def test_a_replacement_that_cannot_start_while_the_thread_opens_still_sends_on_the_running_server(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
+            self.signed_in(home, "acct-1")
+
+            def script(event, n):
+                if (event, n) == ("thread", 1):
+                    self.signed_in(home, "acct-2")
+                if event == "spawning" and n > 1:
+                    raise OSError("codex did not start")
+
+            write_task(d, "task-chat-1", "still answered")
+            rc, turns, logged = self.signin_world(d, home, script)
+            self.assertEqual((rc, [t[0] for t in turns]), (0, [1]), "served once, on the running server")
+            self.assertTrue(result(d, "task-chat-1").startswith("STUB echo:"))
+            self.assertEqual(len([l for l in logged if "sign-in check failed" in l]), 1)
+
+    def test_a_retry_after_a_crash_is_dispatched_on_the_sign_in_on_disk_too(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
+            self.signed_in(home, "acct-1")
+
+            def script(event, n):
+                if (event, n) == ("spawned", 2):             # the crash restart's server has read acct-1
+                    self.signed_in(home, "acct-2")
+
+            write_task(d, "task-chat-1", "[[die]] server goes away")
+            rc, turns, _ = self.signin_world(d, home, script)
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(turns), 2, "the turn that died and its one retry")
+            self.assertEqual(turns[0][0], 1)
+            self.assertEqual(turns[1][0], 3, "not the restarted server, which started on the earlier sign-in")
+            self.assert_every_turn_ran_on_the_sign_in_on_disk(turns)
+
+    def test_a_sign_in_that_never_settles_does_not_hold_the_task_for_ever(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
+            self.signed_in(home, "acct-0")
+
+            def script(event, n):
+                if event == "initialized":
+                    self.signed_in(home, "acct-%d" % n)      # every server finds the file changed again
+
+            write_task(d, "task-chat-1", "answered all the same")
+            rc, turns, logged = self.signin_world(d, home, script)
+            self.assertEqual(rc, 0)
+            self.assertTrue(result(d, "task-chat-1").startswith("STUB echo:"))
+            self.assertEqual(len(turns), 1)
+            self.assertTrue(any("kept changing" in l for l in logged))
+            self.assertLessEqual(turns[0][0], 1 + 2 * cc.SIGNIN_SETTLE_TRIES, "a bounded number of replacements")
 
     def test_server_exit_mid_turn_guest_is_not_retried(self):
         with tempfile.TemporaryDirectory() as d:

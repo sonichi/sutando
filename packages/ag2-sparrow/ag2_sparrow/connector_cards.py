@@ -132,8 +132,11 @@ class Poster:
                 continue
             # A card waits behind an earlier one of the same card in the same room that is not posted
             # yet: posted out of order, the earlier one would arrive last and replace it.
-            same = (record["room"], str(card.get("id") or ""))
-            if same in held:
+            target = str(record.get("edit") or "")
+            target = target if _EVENT_RE.match(target) else ""
+            # So does an edit behind an earlier edit of the same event, whatever card each one carries.
+            same = {(record["room"], "card", str(card.get("id") or ""))} | ({(record["room"], "event", target)} if target else set())
+            if same & held:
                 continue
             if self.clock() - float(record.get("queued_at") or 0) > MAX_QUEUED_S:
                 self.log("agent-card: dropped a card queued over %d s ago" % MAX_QUEUED_S)
@@ -141,16 +144,15 @@ class Poster:
                 continue
             payload = {"op": "message", "room_id": record["room"], "body": str(record.get("body") or ""),
                        "extra_content": {CARD_KEY: card}, "dedupe_key": "agent-card:" + path.stem}
-            target = str(record.get("edit") or "")
             try:
-                _, event_id = self.send(payload, target if _EVENT_RE.match(target) else "")
+                _, event_id = self.send(payload, target)
             except Exception as e:  # noqa: BLE001 - stays queued, retried next sweep
                 self.log("agent-card: post failed (will retry): %s" % type(e).__name__)
-                held.add(same)
+                held |= same
                 continue
             if not event_id.startswith("$"):
                 self.log("agent-card: the post returned no event id (will retry)")
-                held.add(same)
+                held |= same
                 continue
             _write(self.state.joinpath(*POSTED) / path.name,
                    dict({"event_id": event_id, "room": record["room"], "card": card, "posted_at": self.clock()},
@@ -161,9 +163,9 @@ class Poster:
 
     def send(self, payload, target: str = ""):
         """(answer, event id the card now shows at). With `target` the card is sent as an edit of that
-        event, and stays recorded under it; an edit the server refuses (a 4xx: the event is not there, or not
-        this agent's; or an answer that is not a success) is posted as a new card instead, so the owner is
-        still told."""
+        event, and stays recorded under it, once the relay answers with the edit's own event id. An edit it
+        refuses (a 4xx, `ok: false`, an error) is posted as a new card; an answer that is neither raises,
+        so the edit stays queued under its key and is tried again."""
         if target:
             try:
                 answer = self.post(dict(payload, op="edit", event_id=target,
@@ -175,8 +177,12 @@ class Poster:
                     raise
                 self.log("agent-card: edit refused (%s), posted as a new card" % code)
             else:
-                if isinstance(answer, dict) and not answer.get("is_error") and (answer.get("ok") or answer.get("event_id")):
+                refused = not isinstance(answer, dict) or answer.get("ok") is False or any(
+                    answer.get(k) for k in ("is_error", "error", "errcode"))
+                if not refused and str(answer.get("event_id") or "").startswith("$"):
                     return answer, target
+                if not refused:
+                    raise RuntimeError("the edit's answer carries no event id")
                 self.log("agent-card: edit not accepted, posted as a new card")
         answer = self.post(payload)
         return answer, str((answer or {}).get("event_id") or "") if isinstance(answer, dict) else ""

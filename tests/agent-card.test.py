@@ -616,6 +616,8 @@ class Issued(unittest.TestCase):
         self.assertEqual(cards(), [])
         self.forged(reply_to_event="$a", now=1001.5)
         self.assertFalse(issued_cards.record(self.ws, "$a", self.card, room=DM, now=1002.0), "a replay is no edit")
+        self.assertFalse(issued_cards.record(self.ws, "$a", done, room=DM, now=1002.5, edited=True))
+        self.assertTrue(issued_cards.issued(self.ws, "$a", DM, now=1002.6), "edited twice, it is still this room's card")
         # Edited again, to a card with buttons: they act at that same event.
         self.assertTrue(issued_cards.record(self.ws, "$a", self.card, room=DM, now=1003.0, edited=True))
         self.assertEqual(cards(), ["$a"])
@@ -626,6 +628,10 @@ class Issued(unittest.TestCase):
                          [True, True, False, False])
         self.assertEqual([issued_cards.issued(self.ws, e, ROOM, now=1006.0) for e in ("$a", "$b")], [False, False],
                          "a card posted in one room is not this agent's card in another")
+        # A record that names no room (a ledger written before rooms were kept) vouches for no room.
+        issued_cards.record(self.ws, "$c", self.card, now=1007.0)
+        self.assertEqual((issued_cards.issued(self.ws, "$c", now=1008.0), issued_cards.issued(self.ws, "$c", DM, now=1008.0)),
+                         (True, False))
 
     def test_a_card_meant_before_a_live_one_of_its_id_is_retired_not_recorded(self):
         cards = lambda: sorted(json.loads(issued_cards.ledger_path(self.ws).read_text())["cards"])
