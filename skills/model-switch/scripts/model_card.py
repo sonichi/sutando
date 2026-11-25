@@ -260,7 +260,7 @@ def offered(picks: list) -> list:
     return picks[:OFFERED_MAX]
 
 
-def menu_card(model: Optional[str], picks: list) -> tuple:
+def menu_card(model: Optional[str], picks: list, lead: str = "") -> tuple:
     """(body, card): every choice one tap away, the one in use (by exact id) marked, laid out like the
     connectors' model card. Up to six are buttons; more are a row per family ("GPT-6 Sol") with its
     levels ("High", "Low") that row's taps."""
@@ -289,7 +289,8 @@ def menu_card(model: Optional[str], picks: list) -> tuple:
                 rows.append(ac.row(family, tag="In use" if any(c == model for c, _, _, _ in part) else "",
                                    actions=[tap(level or "Use", c, t, sl) for c, t, sl, level in part]))
         menu["groups"] = [ac.group("Models", rows)]
-    using = f"I'm using {name_of(model, picks)}."
+    # `lead`: why the card was sent unasked (the core seat: its model is not one the account may use).
+    using = lead if lead else f"I'm using {name_of(model, picks)}."
     return ac.build(CARD_ID, "info", title="Model", avatar_=ac.avatar(initial="M"),
                     text=f"{using} Pick a model to switch to.",
                     note="A switch takes effect after the core finishes its current turn.", note_tone="dim",
@@ -508,17 +509,27 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time) -> int:
     picks = choices()
     if not picks:
         return _emit({"status": "failed", "why": NO_CHOICES}, 1)
+    lead = (getattr(args, "lead", "") or "").strip()
     try:
-        body, card = menu_card(current_model(ws)["model"], picks)
+        body, card = menu_card(current_model(ws)["model"], picks, lead)
     except ac.CardError as e:
         return _emit({"status": "failed", "why": str(e)}, 1)
     if args.print:
         return _emit({"body": body, "card": card, "handler": HANDLER})
+    room = args.room
+    if not room and getattr(args, "owner_dm", False):
+        try:
+            core = core if core is not None else _core(ws)
+            room = _owner_dm(ws, core)
+        except Exception as e:  # noqa: BLE001 - no DM known: said, never guessed
+            return _emit({"status": "failed", "why": f"the owner's DM is not known ({type(e).__name__})"}, 1)
+        if not room:
+            return _emit({"status": "failed", "why": "the owner's DM is not known"}, 1)
     delivered = deliver_owed(ws, core=core, execute=execute, now=now())
     if delivered:
-        body, card = menu_card(current_model(ws)["model"], picks)
+        body, card = menu_card(current_model(ws)["model"], picks, lead)
     shown = offered(picks)
-    out = _post(ws, args.room, body, card, f"model-card:menu:{int(now())}:{issuance(shown)}",
+    out = _post(ws, room, body, card, f"model-card:menu:{int(now())}:{issuance(shown)}",
                 reply_to=args.reply_to or "", core=core, execute=execute)
     if out.get("event_id"):
         try:
@@ -608,9 +619,12 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, sleep=ti
     p.add_argument("--workspace", default=None)
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("post")
-    s.add_argument("--room", required=True)
+    where = s.add_mutually_exclusive_group(required=True)
+    where.add_argument("--room")
+    where.add_argument("--owner-dm", action="store_true", help="the owner's checked DM (the core seat uses it)")
     s.add_argument("--reply-to", default="")
     s.add_argument("--print", action="store_true")
+    s.add_argument("--lead", default="", help="a line opening the card, saying why it was sent unasked")
     r = sub.add_parser("reply")
     r.add_argument("--task-file", required=True)
     t = sub.add_parser("settle")

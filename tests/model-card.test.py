@@ -1033,5 +1033,25 @@ class Runtime(unittest.TestCase):
         home.assert_called_once_with(mc._REPO)
 
 
+class LeadAndOwnerDm(unittest.TestCase):
+    """The core seat's model card (its model is not one the account may use): a lead line, the owner's DM."""
+
+    def test_the_lead_replaces_the_in_use_line(self):
+        picks = [("gpt-5.5", "GPT-5.5", "gpt-5-5"), ("gpt-6", "GPT-6", "gpt-6")]
+        _body, card = mc.menu_card("gpt-6.1-terra", picks, "gpt-6.1-terra isn't available on this Codex account.")
+        self.assertTrue(card["text"].startswith("gpt-6.1-terra isn't available on this Codex account. Pick a model"))
+        _body, plain = mc.menu_card("gpt-5.5", picks)
+        self.assertTrue(plain["text"].startswith("I'm using GPT-5.5."))
+
+    def test_post_takes_the_owner_dm_or_a_room_not_both(self):
+        import contextlib
+        import io
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                mc.main(["--workspace", "/tmp", "post"])
+            with self.assertRaises(SystemExit):
+                mc.main(["--workspace", "/tmp", "post", "--room", "!r:s.space", "--owner-dm"])
+
+
 if __name__ == "__main__":
     unittest.main()
