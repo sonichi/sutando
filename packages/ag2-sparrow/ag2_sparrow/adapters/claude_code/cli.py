@@ -715,7 +715,7 @@ def sign_in_refused() -> str:
     return "" if sys.stdin.isatty() else NOT_AT_A_TERMINAL
 
 
-def read_code() -> str:
+def typed_code() -> str:
     """The code the sign-in page showed, typed at the terminal without being echoed (so it is in no
     scrollback or recording); from a stream that is not a terminal it is read as a line."""
     return getpass.getpass("") if sys.stdin.isatty() else sys.stdin.readline()
@@ -758,7 +758,7 @@ def account(args) -> int:
         return 0
     if args.switch or args.code:
         try:
-            ok, detail = (accounts.give_code(waiting, read_code()) if args.code else
+            ok, detail = (accounts.give_code(waiting, typed_code()) if args.code else
                           accounts.sign_in(cfg, env, console=args.console, others=others, state_dir=waiting))
         except accounts.Refused as e:
             ok, detail = False, str(e)
