@@ -13,11 +13,11 @@ anything else is refused before any write (exit 2).
 
 Order, under one lock per brain (`<workspace>/state/.model-switch.lock`, held across preflight, send,
 observation and record so overlapping switches linearize): (1) preflight through the shared sender
-(`scripts/tmux-send-line.sh --dry-run --refuse-if-pending`) — refuse on a Codex runtime (exit 4) or
+(`scripts/tmux-send-line.sh --dry-run --refuse-if-pending`) — refuse on an unresolved runtime (exit 4) or
 when the core's input box carries text (exit 5), nothing written; exit 3 when no live pane exists;
 (2) count the `Set model to` lines already on screen (`scripts/pane-observe.sh --count`), so a stale
 acceptance from an earlier switch cannot pass as this one; (3) `/model <model>` + Enter through the
-shared sender; (4) **wait for the CLI to accept**: a NEW `Set model to` line is the switch. A warm
+shared sender; (4) **wait for the CLI to accept**: a NEW `Set model to` line is the switch. A `[1m]` switch the CLI answers without naming the context size (Claude Code 2.1.322: "Set model to Sonnet 5.5 and saved as your default for new sessions") counts only when that line is new and the runtime's `settings.json` was saved after the send and names exactly that model (`pane-observe.sh --settings`); a line stating another size never counts. A warm
 core (cached conversation) first shows *"Yes, switch / No, go back"*; with `--confirm` — pass it on
 an owner instruction, the flag is the authorization — the helper answers Enter once and waits again;
 without it the dialog is cancelled (Escape) and the script exits 6 with nothing recorded. No
@@ -65,21 +65,57 @@ Python comes from `sutando-config.sh python-bin`, never bare `python3`. The core
 `scripts/switch-model.sh` only execs this script. An owner message like "switch model to opus" is
 handled by running it; the dashboard's Quota tile shows the model the proxy then sees.
 
+## A Codex core
+
+The runtime is resolved first (fail closed, exit 4), and on `codex` the name must be a Codex model
+slug (`src/codex_core_model.py check`: letters, digits, `.`, `_`, `-`; a Claude alias or `claude-*` id
+is exit 2). **Core and worker models are separate**: the pick is never written to the shared
+`CODEX_HOME`'s `config.toml`, which the pool's Codex workers read. It is recorded core-only in
+`<workspace>/state/model-switch.json` with `runtime: "codex"` (`{model, previous, previous_source,
+runtime, accepted, applied, ts, by}`; a record without `runtime` is a Claude core's and is never read
+as a Codex model). Nothing is typed into a pane. Under the same lock:
+
+- the core is an app-server seat (a live `codex-seat` window): `applied: next-turn`, `status: pending`,
+  **exit 12**: saved, not switched. Say it as pending ("I'll try X on my next task"), never as switched.
+  The task that tries it is on it from its start: the seat then sets `running` in the record, and
+  `python3 src/codex_core_model.py in-use --state-dir <workspace>/state` (what the model card reads)
+  names the pick for as long as that task runs. Asked which model you are on during that task, answer
+  with `in-use`, not with `working`: "I'm on X for this task; it is confirmed when the task completes".
+  The seat (`src/agent/codex/app-server/seat.py`, core seat only) always launches on `working`, the
+  last model Codex took. Before a turn it reads Codex's own `model/list`: a pick that is not in a
+  complete, well-formed list is `rejected` without being sent (a partial list is no verdict). No pick
+  is tried until the model to go back to is known (the launch model, or Codex's named default). Otherwise it passes the pick on that `turn/start`, and a completed
+  turn makes it `accepted`. Either verdict reaches the owner as a proactive notice. Nothing else
+  rejects a pick: an error answer, a failed turn, a timeout or an unreadable list is no verdict, the
+  turn reruns on the model before it (Codex's default named explicitly when the seat had none), and
+  the pick stays pending, tried at most twice per seat. After the second try it is `unconfirmed` (not
+  a refusal): the core stays on `working`, the owner is told once, and picking it again retries. An explicit `SUTANDO_CORE_MODEL` launch
+  outranks a pick saved before it (`SUTANDO_CORE_MODEL_REV`).
+- the core is a Codex TUI: `applied: next-start`, `accepted: false`, **exit 11** — saved, the running
+  TUI keeps its model until its next start (owner-gated `bash src/agent/codex/cli/start-cli.sh
+  --restart`).
+- no core runs: `applied: next-start`, `status: pending`, **exit 13**: saved, applies at the next core
+  start. Say it as saved, not switched.
+
+`src/agent/codex/cli/start-cli.sh` launches the core with `-m` from the record whenever this launch
+sets no `SUTANDO_CORE_MODEL` (an explicit one wins). The pool's worker launcher reads none of it.
+
 ## The model card (`scripts/model_card.py`)
 
 When the owner asks in their DM which model the core is on, or asks to change it without naming one,
 post the menu: `python3 skills/model-switch/scripts/model_card.py post --room <the DM's room id>
 [--reply-to <their message's event id>]` (`--print` shows it without posting). Its buttons are this
 skill's `MODEL_SWITCH_CHOICES` (`manifest.json`, the list the menu-bar app offers), in that order and
-under those titles; each carries a slug of its id (`sonnet-1m`), unique on the card, and the exact ids
+under those titles (a Codex core: `MODEL_SWITCH_CODEX_CHOICES` when set, else the models Codex
+itself lists in its home's `models_cache.json`, hidden ones left out, by Codex's priority); each carries a slug of its id (`sonnet-1m`), unique on the card, and the exact ids
 the card was built with are kept by its event id (`<workspace>/state/model-card-choices.json`). A tap
 is resolved through its own card's ids (`sonnet[1m]`), so it never changes the context size the list
 names, and it acts only while the list still has that id. An entry whose id is not a model name (one
 starting with `-`, say) or whose title is too long for a button is left out. The card names the model in
 use, read only from `<workspace>/state/model-switch.json` and matched by exact id (an id the list
 lacks is named as recorded and no button is marked); with no record it says "the default model". A
-card holds six buttons: with a longer list the first six are shown and the text says to ask for the
-others by name. With no readable list the menu is not posted (`{"status": "failed", "why": …}`: say
+card shows up to six models as buttons; a longer list (up to 60) is a row per family ("GPT-6 Sol"),
+its levels ("High", "Low") the row's taps, the family in use tagged "In use", so every model is one tap. With no readable list the menu is not posted (`{"status": "failed", "why": …}`: say
 the `why`). It goes only to the owner's checked DM. `status` prints the same reading as JSON.
 
 A tap is matched by the core's one command (CLAUDE.md, "Card clicks"); when it prints `run:
@@ -104,7 +140,9 @@ through `model_card.py turn --attempt <id> -- <the switch>`: switches run one at
 newest accepted attempt's switch runs, so two quick taps end on the model tapped last (an attempt the
 record no longer names is not run, and `settle` then posts nothing for it). It always ends in
 `model_card.py settle --room <DM> --model <model id> --attempt <id> --rc <the switch's exit code>`, which
-saves the outcome in `<workspace>/state/model-card-outcome.json` and then posts it in the same DM: "Switched. I'm now using X." on exit 0, else "I
+saves the outcome in `<workspace>/state/model-card-outcome.json` and then posts it in the same DM: "Switched to X ✓" on exit 0, a
+pending card ("Saved, not switched yet: I'll try X on my next task") on exit 12 (the seat's own notice
+follows once Codex has taken or refused it), else "I
 could not switch to X. I'm still using Y." and one short reason for the exit code (5 unsent text in the
 input box, 8 not accepted in time, 3 the core is not running, and so on; an unknown code is "the switch
 did not finish"). A post that fails is tried again a few times inside the detached step; an outcome
@@ -114,3 +152,9 @@ before its "switching" card; an untold outcome with a newer attempt after it is 
 in the record and never posted, so only the newest attempt's outcome stands for the card. The menu has its own card id: a newer menu retires an older one's
 buttons, while the "switching" answer and the outcome (another id) leave the menu acting, since its
 buttons stay on the owner's screen. Output of the detached line: `<workspace>/logs/model-card.log`.
+
+One card, updated in place: the "switching" answer is an edit of the tapped menu's own event
+(`room.message.edit`, so the event then shows "Model: Switching the core to X…" in place of the
+card), and the outcome edits that same event again. A tap adds no message. Only where the edit cannot
+be made (a tap with no card event, or the edit refused) are the "switching" answer and the outcome
+posted as cards of their own, as above.

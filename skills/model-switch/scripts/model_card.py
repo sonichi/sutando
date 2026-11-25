@@ -22,13 +22,21 @@ The detached line runs the switch through `turn`, one at a time and only for the
 (an older one started late is skipped, so the core is never left on a model the card does not
 show), and always ends in `settle` with the exit code and the attempt's id. `settle`
 saves the outcome in `<workspace>/state/model-card-outcome.json`, then posts it in the same DM:
-"Switched. I'm now using X." or "I could not switch to X. I'm still using Y. <reason>". A post that
+"Switched to X ✓", a pending "Saved, not switched yet" for a Codex seat's pick (exit 12),
+or "Couldn't switch to X: <reason>. I'm still using Y.". A post that
 fails is tried again a few times; an outcome still untold is posted by the next `post` or `reply`
 before its own work. An attempt's posts carry its id as their operation id, an outcome is told once,
 and no retry runs the switch again. `reply` records an attempt before its "switching" card, and an
 untold outcome with a newer attempt after it is marked `superseded` and never posted: only the newest
 attempt's outcome may stand for the card.
 The menu, the "switching" answer and the outcome share one card id, so the newest stands for the card.
+
+One card, updated in place (owner 2026-11-23): a tap edits the tapped menu's own event to the
+"switching" words (`room.message.edit`), and the outcome edits that same event again, so a tap adds
+no message. No Action carries a card in an edit, so the event then shows the words in place of the
+card. The edited event is kept with the attempt (`card`); where the edit cannot be made (no card
+event known, or the edit is refused) the "switching" answer and the outcome are posted as notice
+cards, as before.
 
 The model in use is read only from `<workspace>/state/model-switch.json`, the record switch-model.sh
 writes; with no record it is "the default model". Every command prints one JSON object.
@@ -45,6 +53,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -55,6 +64,7 @@ for _p in (str(_REPO / "src"), str(_REPO / "skills" / "worker-pool" / "scripts")
         sys.path.insert(0, _p)
 
 import agent_card as ac  # noqa: E402
+import codex_core_model  # noqa: E402
 import issued_cards  # noqa: E402
 
 CARD_ID, KIND, TARGET = "core-model-switch", "model", "core"
@@ -65,6 +75,8 @@ HANDLER = "skills/model-switch/scripts/model_card.py reply"
 SWITCH = _HERE / "switch-model.sh"
 MANIFEST = _HERE.parent / "manifest.json"
 CHOICES_KEY = "MODEL_SWITCH_CHOICES"
+# A Codex core's list: this key when set, else the models Codex itself lists (its models_cache.json).
+CODEX_CHOICES_KEY = "MODEL_SWITCH_CODEX_CHOICES"
 NO_CHOICES = "I can't read the list of models (skills/model-switch/manifest.json), so I have no menu to show."
 DEFAULT_NAME = "the default model"
 GONE = "That choice is no longer on my list. Ask me for the model card again."
@@ -88,7 +100,11 @@ REASONS = {1: "the switch could not be locked or recorded",
            7: "the command could not be sent to the core",
            8: "the core did not accept the switch in time",
            9: "the core is running, so its settings were left alone",
-           10: "the model is set for the next start, but the core did not start"}
+           10: "the model is set for the next start, but the core did not start",
+           11: "it is saved, and the core uses it from its next start"}
+# Exit 12: a Codex seat saved the pick; it is not switched until Codex runs a turn on it.
+# Exit 13: no core is running; the pick applies at the next core start.
+PENDING_RC, NEXT_START_RC = 12, 13
 # The detached line: the switch in its turn (`turn` runs it only for the newest attempt), then always
 # the outcome card with the exit code.
 DETACHED = ('"$5" "$6" --workspace "$7" turn --attempt "$9" -- '
@@ -105,12 +121,39 @@ def _emit(payload: dict, code: int = 0) -> int:
     return code
 
 
-def choices(manifest: Optional[Path] = None) -> list:
-    """[(id, title, slug)] from the skill manifest's MODEL_SWITCH_CHOICES, in its order; [] when it
-    cannot be read. The slug is the id as a card reply may carry it, numbered when another id has it.
-    Left out: an id that is not a model name or is listed twice, and a title no button can carry."""
+@lru_cache(maxsize=1)
+def core_runtime() -> str:
+    """The configured core runtime (`sutando-config.sh core-runtime`), 'claude' when it cannot be read."""
+    try:
+        r = subprocess.run(["bash", str(_REPO / "scripts" / "sutando-config.sh"), "core-runtime"],
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return "claude"
+    return (r.stdout or "").strip() if r.returncode == 0 and (r.stdout or "").strip() else "claude"
+
+
+def codex_home() -> Path:
+    """The Codex core's home (src/codex_core_model.py resolves it)."""
+    return codex_core_model.home(_REPO)
+
+
+def _raw_choices(manifest: Optional[Path]):
     from skill_config import manifest_config
-    raw = manifest_config(manifest or MANIFEST).get(CHOICES_KEY)
+    cfg = manifest_config(manifest or MANIFEST)
+    if core_runtime() != "codex":
+        return cfg.get(CHOICES_KEY)
+    raw = cfg.get(CODEX_CHOICES_KEY)
+    if isinstance(raw, str) and raw.strip():
+        return raw
+    return ";".join(f"{slug}={title}" for slug, title in codex_core_model.choices(codex_home()))
+
+
+def choices(manifest: Optional[Path] = None) -> list:
+    """[(id, title, slug)] from the skill manifest's MODEL_SWITCH_CHOICES (a Codex core: its
+    MODEL_SWITCH_CODEX_CHOICES, else the models Codex lists), in its order; [] when it cannot be read.
+    The slug is the id as a card reply may carry it, numbered when another id has it.
+    Left out: an id that is not a model name or is listed twice, and a title no button can carry."""
+    raw = _raw_choices(manifest)
     out: list = []
     for entry in raw.split(";") if isinstance(raw, str) else []:
         model, _, title = entry.partition("=")
@@ -175,18 +218,25 @@ def name_of(model: Optional[str], picks: Optional[list] = None) -> str:
 
 
 def record(ws: Path) -> dict:
-    """The last switch's record, {} when there is none or it cannot be read."""
+    """The last switch's record for this core's runtime, {} when there is none or it cannot be read.
+    A Codex core's record says `runtime: codex`; a Claude core's says none."""
     try:
         data = json.loads((ws / "state" / "model-switch.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    return data if (data.get("runtime") == "codex") == (core_runtime() == "codex") else {}
 
 
 def current_model(ws: Path) -> dict:
     """{model, name, source, ts}: the model in use by the switch record; model None without one."""
     rec = record(ws)
     model = rec.get("model") if isinstance(rec.get("model"), str) and rec.get("model") else None
+    if rec.get("runtime") == "codex" and rec.get("status") in ("pending", *codex_core_model.NOT_TAKEN):
+        # Not taken by Codex (yet): the core is on the model before it, unless the turn now running was
+        # started on the pick (the seat's `running` mark), in which case this very turn is on the pick.
+        model = codex_core_model.in_use(rec) or None
     return {"model": model, "name": name_of(model), "source": "model-switch.json" if model else None,
             "ts": rec.get("ts") if model else None}
 
@@ -195,24 +245,64 @@ def still_using(ws: Path, alias: str) -> str:
     """The model in use after a switch to `alias` failed. A record that names `alias` without the
     CLI's acceptance (the core was down) says what the next start uses, so the one before it stands."""
     rec = record(ws)
+    if rec.get("runtime") == "codex" and rec.get("model") == alias and rec.get("status") in ("pending", *codex_core_model.NOT_TAKEN):
+        return name_of(codex_core_model.working(rec) or None)
     if rec.get("model") == alias and rec.get("accepted") is False:
         return name_of(rec.get("previous") if isinstance(rec.get("previous"), str) else None)
     return current_model(ws)["name"]
 
 
-def menu_card(model: Optional[str], picks: list) -> tuple:
-    """(body, card): one reply button per choice in `picks`, the one in use (by exact id) marked. A
-    card holds six buttons; with more choices the first six are shown and the text says to ask."""
-    limit = MENU_BUTTONS
-    buttons = [ac.button(title, "reply", style="primary" if choice == model else "secondary",
+ROW_TAPS = 4         # a row's action limit
+OFFERED_MAX = 60     # the most models one card offers (rows of up to ROW_TAPS)
+_LEVEL = re.compile(r"^(?P<family>.+?)\s*\((?P<level>[^()]{1,24})\)$")
+
+
+def split_title(title: str) -> tuple:
+    """("GPT-6 Sol", "High") for "GPT-6 Sol (High)"; (title, "") for a title with no level."""
+    m = _LEVEL.match(title)
+    return (m.group("family"), m.group("level")) if m else (title, "")
+
+
+def offered(picks: list) -> list:
+    """The choices the card carries: every one up to OFFERED_MAX, so none is left to be typed."""
+    return picks[:OFFERED_MAX]
+
+
+def menu_card(model: Optional[str], picks: list, lead: str = "") -> tuple:
+    """(body, card): every choice one tap away, the one in use (by exact id) marked, laid out like the
+    connectors' model card. Up to six are buttons; more are a row per family ("GPT-6 Sol") with its
+    levels ("High", "Low") that row's taps."""
+    picks = offered(picks)
+
+    def tap(label, choice, title, slug):
+        return ac.button(label, "reply", style="primary" if choice == model else "secondary",
                          reply=f"Switch the core to {title}", command=ac.reply(KIND, TARGET, slug))
-               for choice, title, slug in picks[:limit]]
-    using = f"I'm using {name_of(model, picks)}."
-    more = " For a model that is not on a button, tell me its name." if len(picks) > limit else ""
-    return ac.build(CARD_ID, "info", title="Core model", avatar_=ac.avatar(initial="M"),
-                    text=f"{using} Pick a model to switch to.{more}", buttons=buttons,
+
+    menu = {}
+    if len(picks) <= MENU_BUTTONS:
+        menu["buttons"] = [tap(title, choice, title, slug) for choice, title, slug in picks]
+    else:
+        families, order = {}, []
+        for choice, title, slug in picks:
+            family, level = split_title(title)
+            if family not in families:
+                families[family] = []
+                order.append(family)
+            families[family].append((choice, title, slug, level))
+        rows = []
+        for family in order:
+            items = families[family]
+            for i in range(0, len(items), ROW_TAPS):
+                part = items[i:i + ROW_TAPS]
+                rows.append(ac.row(family, tag="In use" if any(c == model for c, _, _, _ in part) else "",
+                                   actions=[tap(level or "Use", c, t, sl) for c, t, sl, level in part]))
+        menu["groups"] = [ac.group("Models", rows)]
+    # `lead`: why the card was sent unasked (the core seat: its model is not one the account may use).
+    using = lead if lead else f"I'm using {name_of(model, picks)}."
+    return ac.build(CARD_ID, "info", title="Model", avatar_=ac.avatar(initial="M"),
+                    text=f"{using} Pick a model to switch to.",
                     note="A switch takes effect after the core finishes its current turn.", note_tone="dim",
-                    body=f"{using} Reply with a model to switch.")
+                    body=f"{using} Reply with a model to switch.", **menu)
 
 
 def switching_words(alias: str) -> str:
@@ -222,16 +312,29 @@ def switching_words(alias: str) -> str:
 
 def notice_card(state: str, status: str, words: str) -> tuple:
     """(body, card) with no buttons, under its own id: the "switching" answer or the outcome."""
-    return ac.build(NOTE_ID, state, title="Core model", avatar_=ac.avatar(initial="M"), status=status,
+    return ac.build(NOTE_ID, state, title="Model", avatar_=ac.avatar(initial="M"), status=status,
                     text=words, body=words)
 
 
 def outcome(ws: Path, alias: str, rc: int) -> tuple:
     """(state, words) for a switch to `alias` that exited `rc`."""
     if rc == 0:
-        return "done", f"Switched. I'm now using {name_of(alias)}."
+        return "done", f"Switched to {name_of(alias)} ✓"
+    if rc == NEXT_START_RC:
+        return "pending", (f"Saved; {name_of(alias)} applies at the next core start. No core is running "
+                           "now, so nothing has switched yet.")
+    if rc == PENDING_RC:
+        return "pending", (f"Saved, not switched yet: I'll try {name_of(alias)} on my next task. Until "
+                           f"Codex has run it I'm still using {still_using(ws, alias)}. I'll tell you "
+                           "here when it has switched, or why it could not.")
     reason = REASONS.get(rc, UNFINISHED)
-    return "error", f"I could not switch to {name_of(alias)}. I'm still using {still_using(ws, alias)}. {reason[:1].upper()}{reason[1:]}."
+    return "error", f"Couldn't switch to {name_of(alias)}: {refusal_reason(reason)}. I'm still using {still_using(ws, alias)}."
+
+
+def refusal_reason(reason: str) -> str:
+    """A reason as the one refusal pattern reads it: "Couldn't switch to X: <reason>."."""
+    reason = (reason or "").strip().rstrip(".")
+    return reason if reason[1:2].isupper() else reason[:1].lower() + reason[1:]  # "API key …" keeps its caps
 
 
 def _core(ws: Path) -> dict:
@@ -258,16 +361,53 @@ def _post(ws: Path, room: str, body: str, card: dict, operation_id: str, *, repl
         lane = str(core.get("instance") or "")
         dm = _owner_dm(ws, core)
         execute = execute if execute is not None else _execute(ws, lane or None)
+        issued = issued_cards.intend(ws, operation_id)  # unwritable ledger: no card, its buttons could not act
         eid = ac.send_card(execute, room, body, card, operation_id=operation_id, reply_to=reply_to, owner_dm=dm)
     except ac.CardError as e:
         return {"status": "failed", "why": str(e), "body": body}
     except Exception as e:  # noqa: BLE001 — no core lane or no credential: named, nothing posted
         return {"status": "failed", "why": f"{type(e).__name__}: {e}", "body": body}
     try:
-        issued_cards.record(ws, eid, card, room=dm, lane=lane, handler=HANDLER)
+        kept = issued_cards.record(ws, eid, card, room=dm, lane=lane, handler=HANDLER, issued_at=issued)
     except OSError as e:
         return {"status": "posted", "event_id": eid, "why": f"its buttons will not act ({type(e).__name__})"}
+    if not kept and (issued_cards.offered(card) or issued_cards.has_picker(card)):
+        return {"status": "posted", "event_id": eid, "why": "a newer card is the one that acts"}
     return {"status": "posted", "event_id": eid}
+
+
+def card_words(words: str) -> str:
+    """What an edited card says: the card is gone from the event, so the words name it."""
+    return f"Model: {words}"
+
+
+def _edit(ws: Path, room: str, event: str, words: str, operation_id: str, *, core=None, execute=None) -> dict:
+    """Show `words` in place of the card at `event` (the owner's checked DM only); {"status": "posted",
+    "event_id": event, "edited": True}, or {"status": "failed", "why"} when it cannot be edited."""
+    if not event:
+        return {"status": "failed", "why": "no card to edit"}
+    try:
+        core = core if core is not None else _core(ws)
+        lane = str(core.get("instance") or "")
+        if room != _owner_dm(ws, core):
+            return {"status": "failed", "why": "the card is not in the owner's DM"}
+        execute = execute if execute is not None else _execute(ws, lane or None)
+        answer = execute("room.message.edit", {"event_id": event, "body": card_words(words)},
+                         operation_id=operation_id, room_id=room)
+    except Exception as e:  # noqa: BLE001 — not edited: the caller posts the card instead
+        return {"status": "failed", "why": f"{type(e).__name__}: {e}"}
+    if not isinstance(answer, dict) or answer.get("is_error") or not ac._event_id(answer):
+        code = str(answer.get("code") or answer.get("error") or "") if isinstance(answer, dict) else ""
+        return {"status": "failed", "why": f"room.message.edit did not edit the card{f' ({code})' if code else ''}"}
+    return {"status": "posted", "event_id": event, "edited": True}
+
+
+def keep_card(ws: Path, attempt: str, event: str, now: float) -> None:
+    """Keep `event`, the card the attempt's "switching" words replaced, for its outcome to replace."""
+    with _outcome_book(ws, now) as rows:
+        for row in rows:
+            if row["attempt"] == attempt:
+                row["card"] = event
 
 
 def new_attempt(now: float) -> str:
@@ -318,7 +458,8 @@ def save_outcome(ws: Path, attempt: str, room: str, alias: str, rc: Optional[int
 
 
 def _outcome_post(ws: Path, attempt: str, room: str, state: str, words: str, core, execute) -> dict:
-    body, card = notice_card(state, "Switched" if state == "done" else "Not switched", words)
+    status = {"done": "Switched", "pending": "Pending"}.get(state, "Not switched")
+    body, card = notice_card(state, status, words)
     return _post(ws, room, body, card, f"model-card:{attempt}:outcome", core=core, execute=execute)
 
 
@@ -337,10 +478,13 @@ def tell(ws: Path, attempt: str, *, core=None, execute=None, now: float) -> dict
             if row.get("superseded") or at + 1 < len(rows):
                 row["superseded"] = True
                 return {"status": "superseded"}
-            if row.get("state") not in ("done", "error"):
+            if row.get("state") not in ("done", "error", "pending"):
                 return {"status": "failed", "why": "that attempt has no outcome yet"}
-            out = _outcome_post(ws, attempt, str(row.get("room") or ""), row["state"],
-                                str(row.get("words") or UNFINISHED), core, execute)
+            words = str(row.get("words") or UNFINISHED)
+            out = _edit(ws, str(row.get("room") or ""), str(row.get("card") or ""), words,
+                        f"model-card:{attempt}:outcome-edit", core=core, execute=execute)
+            if out["status"] != "posted":
+                out = _outcome_post(ws, attempt, str(row.get("room") or ""), row["state"], words, core, execute)
             if out["status"] == "posted":
                 row.update(told=True, event_id=out["event_id"])
             return out
@@ -352,7 +496,7 @@ def deliver_owed(ws: Path, *, core=None, execute=None, now: float) -> list:
     """Post the outcome not yet told, one try; the attempts now told. Older untold ones are marked
     superseded on the way and never posted."""
     owed = [str(r["attempt"]) for r in outcomes(ws)
-            if not r.get("told") and not r.get("superseded") and r.get("state") in ("done", "error")]
+            if not r.get("told") and not r.get("superseded") and r.get("state") in ("done", "error", "pending")]
     return [a for a in owed if tell(ws, a, core=core, execute=execute, now=now)["status"] == "posted"]
 
 
@@ -383,18 +527,29 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time) -> int:
     picks = choices()
     if not picks:
         return _emit({"status": "failed", "why": NO_CHOICES}, 1)
+    lead = (getattr(args, "lead", "") or "").strip()
     try:
-        body, card = menu_card(current_model(ws)["model"], picks)
+        body, card = menu_card(current_model(ws)["model"], picks, lead)
     except ac.CardError as e:
         return _emit({"status": "failed", "why": str(e)}, 1)
     if args.print:
         return _emit({"body": body, "card": card, "handler": HANDLER})
+    room = args.room
+    if not room and getattr(args, "owner_dm", False):
+        try:
+            core = core if core is not None else _core(ws)
+            room = _owner_dm(ws, core)
+        except Exception as e:  # noqa: BLE001 - no DM known: said, never guessed
+            return _emit({"status": "failed", "why": f"the owner's DM is not known ({type(e).__name__})"}, 1)
+        if not room:
+            return _emit({"status": "failed", "why": "the owner's DM is not known"}, 1)
     delivered = deliver_owed(ws, core=core, execute=execute, now=now())
     if delivered:
-        body, card = menu_card(current_model(ws)["model"], picks)
-    shown = picks[:MENU_BUTTONS]
-    out = _post(ws, args.room, body, card, f"model-card:menu:{int(now())}:{issuance(shown)}",
-                reply_to=args.reply_to or "", core=core, execute=execute)
+        body, card = menu_card(current_model(ws)["model"], picks, lead)
+    shown = offered(picks)
+    reply_to = args.reply_to or ""
+    out = _post(ws, room, body, card, f"model-card:menu:{ac.send_key(room, reply_to, now)}:{issuance(shown)}",
+                reply_to=reply_to, core=core, execute=execute)
     if out.get("event_id"):
         try:
             remember_choices(ws, out["event_id"], shown, now())
@@ -447,9 +602,17 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     if other is not None:
         return _emit({**other, **extra}, code)
     say = switching_words(alias)
-    body, card = notice_card("pending", "Switching", say)
-    posted = _post(ws, room, body, card, f"model-card:{attempt}:switching",
-                   reply_to=str(headers.get("reply_to_event") or ""), core=core or None, execute=execute)
+    tapped = str(headers.get("reply_to_event") or "")
+    posted = _edit(ws, room, tapped, say, f"model-card:{attempt}:switching-edit", core=core or None, execute=execute)
+    if posted["status"] == "posted":
+        try:
+            keep_card(ws, attempt, tapped, now())
+        except OSError:
+            pass  # the outcome is then posted as a card of its own
+    else:
+        body, card = notice_card("pending", "Switching", say)
+        posted = _post(ws, room, body, card, f"model-card:{attempt}:switching", reply_to=tapped,
+                       core=core or None, execute=execute)
     try:
         pid = start_switch(ws, alias, room, attempt, popen)
     except OSError as e:
@@ -503,9 +666,12 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, sleep=ti
     p.add_argument("--workspace", default=None)
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("post")
-    s.add_argument("--room", required=True)
+    where = s.add_mutually_exclusive_group(required=True)
+    where.add_argument("--room")
+    where.add_argument("--owner-dm", action="store_true", help="the owner's checked DM (the core seat uses it)")
     s.add_argument("--reply-to", default="")
     s.add_argument("--print", action="store_true")
+    s.add_argument("--lead", default="", help="a line opening the card, saying why it was sent unasked")
     r = sub.add_parser("reply")
     r.add_argument("--task-file", required=True)
     t = sub.add_parser("settle")

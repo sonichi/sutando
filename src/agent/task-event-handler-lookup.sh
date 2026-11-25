@@ -21,7 +21,7 @@ try:
         handler = (json.load(fh) or {}).get("handler")
 except (OSError, ValueError):
     sys.exit(1)
-if not isinstance(handler, str) or not handler or not os.access(handler, os.X_OK):
+if not isinstance(handler, str) or not handler or not os.path.isfile(handler) or not os.access(handler, os.X_OK):
     sys.exit(1)
 print(handler)
 ' "$cfg"
@@ -35,7 +35,7 @@ print(handler)
 task_event_handler() {
   local cfg="$1"
   if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
-    [ -x "$SUTANDO_TASK_EVENT_HANDLER" ] || return 1
+    [ -f "$SUTANDO_TASK_EVENT_HANDLER" ] && [ -x "$SUTANDO_TASK_EVENT_HANDLER" ] || return 1
     printf '%s\n' "$SUTANDO_TASK_EVENT_HANDLER"
     return 0
   fi

@@ -15,17 +15,21 @@ database, holds it in the workspace outbox while the room is unreachable, and re
 With --default and/or --option, a question bound for AG2 Space is asked as a decision card
 (one button per choice) instead of text; the owner's click comes back as a `hitl_click: true`
 task, and `python3 src/pending_questions_reader.py clicks` hands it to the core.
-Always exits 0 after a non-empty question: every failure is printed, never raised. With
+A question whose own text lists its choices ("1. … 2. …") without --option or --default is
+refused (exit 2, nothing sent): the owner would get text with nothing to press.
+Otherwise it exits 0 after a non-empty question: every failure is printed, never raised. With
 --unless-open, a question whose title matches one the store holds open is reported
 (`already open: [<id>]`) and not filed again, so a carried list can be filed without doubling rows.
 
 With no adapter this entry does only what core can: it queues the question to the
-owner's DM on the bridge he was last active on (the proactive path; --task-file and the
+owner's DM on the bridge he was last active on, listing any --default/--option choices as text
+(the proactive path; --task-file and the
 routing it implies need the skill) and keeps one generic local record of the ask under
 `<workspace>/state/ask-owner/`, which nothing lists, counts, closes or reminds — the
 report says so.
 """
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -40,6 +44,14 @@ from skill_roots import declared
 from util_paths import host_label
 
 RECORDS = "ask-owner"
+# A line that starts a listed choice: "1." "2)" "A)" "(b)" "Option A:".
+_CHOICE = re.compile(r"^\s*(?:\(?(?:\d{1,2}|[A-Za-z])[.)]|option\s+\w+\s*[:.)-])\s+\S", re.I)
+
+
+def listed_choices(question: str) -> int:
+    """How many lines of the question start a listed choice; --context is never counted, since
+    numbered reasons or evidence there offer no choice."""
+    return sum(1 for line in (question or "").splitlines() if _CHOICE.match(line))
 
 
 def _option(text: str):
@@ -65,7 +77,16 @@ def _speaker(name, ws: Path) -> str:
         return f"a worker on {host_label()}" if proactive_worker(name or "") else f"the {host_label()} core"
 
 
-def ask_without_store(question: str, context, ws: Path, why: str) -> list:
+def text_choices(default, options) -> list:
+    """(label, what) per choice a card would offer: Approve first carrying a proposed default."""
+    opts = [(a.strip(), b.strip()) for a, b in options or () if a.strip()]
+    if (default or "").strip():
+        opts = [("Approve", default.strip())] + [o for o in opts if o[0].lower() != "approve"]
+    return opts
+
+
+def ask_without_store(question: str, context, ws: Path, why: str, default=None, reason=None,
+                      options=()) -> list:
     """Core's part alone: the DM through the proactive path, then one generic local record.
     Returns the report lines; nothing raises past here."""
     from workspace_default import status_path  # noqa: PLC0415 — heavy loader
@@ -82,7 +103,15 @@ def ask_without_store(question: str, context, ws: Path, why: str) -> list:
            f"{neutralize_markers(question).strip()}\n"
     if context and context.strip():
         body += f"\n{neutralize_markers(context).strip()}\n"
-    body += "\nReply here.\n"
+    choices = text_choices(default, options)
+    if choices:
+        if (reason or "").strip() and (default or "").strip():
+            body += f"\nWhy Approve: {neutralize_markers(reason).strip()}\n"
+        body += "\n" + "".join(f"- {neutralize_markers(label)}: {neutralize_markers(what)}\n" if what
+                               else f"- {neutralize_markers(label)}\n" for label, what in choices)
+        body += "\nReply here with the one you choose.\n"
+    else:
+        body += "\nReply here.\n"
     if target is not None:
         try:
             asker = _asker(target.name, ws)
@@ -106,7 +135,7 @@ def ask_without_store(question: str, context, ws: Path, why: str) -> list:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Send a pending question to the owner and record it.")
     ap.add_argument("question")
-    ap.add_argument("--context", default=None, help="one or two lines of why / options")
+    ap.add_argument("--context", default=None, help="one or two lines of why; choices go in --option")
     ap.add_argument("--urgency", choices=("live", "durable"), default="live",
                     help="live also fires the macOS notification; durable sends and records only")
     ap.add_argument("--task-file", default=None,
@@ -126,6 +155,11 @@ def main(argv=None) -> int:
     if not args.question.strip():
         print("ask-owner: the question is empty", file=sys.stderr)
         return 2
+    if not args.default and not args.option and listed_choices(args.question) >= 2:
+        print("ask-owner: the question lists choices but gives none as --option, so the owner would get "
+              "text with nothing to press; pass each as --option 'Label=what it does' (and --default "
+              "for the one you propose). Nothing was sent.", file=sys.stderr)
+        return 2
     if args.workspace:
         ws = Path(args.workspace)
     else:
@@ -136,7 +170,8 @@ def main(argv=None) -> int:
         why = why if mod is None else f"adapter {why} has no ask_owner"
         print(f"ask-owner: NO STORE ({why}); the owner is asked, and nothing holds the question — "
               "ask by hand if he does not answer", file=sys.stderr)
-        print("\n".join(ask_without_store(args.question, args.context, ws, why)))
+        print("\n".join(ask_without_store(args.question, args.context, ws, why, args.default,
+                                           args.reason, args.option)))
         return 0
     dup = reader.open_duplicate(ws, args.question, mod) if args.unless_open else None
     if dup is not None:

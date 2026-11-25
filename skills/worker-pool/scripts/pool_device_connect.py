@@ -7,7 +7,8 @@ text note when no card can be posted), and asks again (`POST /api/connect/poll`)
 until the owner has approved it in a browser or the code expires. The answered bearer goes straight into
 the vault as the worker's connection, and only after the gateway confirms it is the agent the poll
 named, a new agent owned by the core's owner. `rotate=True` asks the same way for a new token of the
-worker's existing agent and replaces its secret in place.
+worker's existing agent and replaces its secret in place. A worker's first agent also puts it on that
+agent's own task and result folders (`switch_to_own_dirs`) before its lane starts, unless `own_dirs=False`.
 
 The device code and the bearer stay in this process and the vault: nothing here returns, prints, logs,
 writes or raises either; callers get the agent id and a status.
@@ -473,6 +474,9 @@ def resend(worker: str, *, workspace: Optional[Path] = None, spawn=None, clock=t
             argv += ["--display-name", str(rec["display_name"])]
         if rec.get("lane") is not None:
             argv += ["--lane", str(rec["lane"])]
+        # A record from before the folder switch has no `own_dirs`: it keeps the shared folders it asked for.
+        if rec.get("own_dirs") is not True and not rec.get("rotate"):
+            argv += ["--shared-dirs"]
         claimed = {**rec, "state": "resending", "resend_id": resend_id, "resend_at": now}
         claimed.pop("resend_pid", None)
         write_record(workspace, worker, claimed)
@@ -545,24 +549,33 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
             request=pp.http_json, preview=None, deliver: Optional[Callable[[str], object]] = None,
             cards: Optional[CardSink] = None, say: Callable[[str], None] = lambda text: None, sleep=time.sleep,
             clock=time.time, repo: Optional[Path] = None, logs_dir: Optional[Path] = None,
-            start_lane: Optional[Callable[[dict], Optional[dict]]] = None) -> dict:
+            start_lane: Optional[Callable[[dict], Optional[dict]]] = None, own_dirs: bool = True) -> dict:
     """Give `worker` its own agent, or with `rotate` a new token for the one it has: {agent_id, status, row}.
+    Unless `own_dirs` is False, a first agent's worker is switched onto its own folders once the token is
+    saved and before `start_lane` (`dirs`: {"own", "why"?}); a rotate never changes the worker's folders.
     The owner gets an approval card in their DM (`cards`; by default the core's own, unless `deliver` is
     given), and `deliver(text)` the text note when no card was posted. The token is saved only when
     the gateway confirms the agent the poll named, on the core's server and owned by the core's owner, and
-    the save and `start_lane(row)` run under `fenced`, so a worker retired during the wait gets neither."""
-    current = connections.worker_identity(worker, workspace)
-    if rotate and current is None:
-        raise DeviceConnectError(f"worker {worker} has no agent of its own to rotate")
-    if not rotate and current is not None:
-        raise DeviceConnectError(f"worker {worker} already has an agent of its own; rotate it instead")
+    the save and `start_lane(row)` each run under `fenced`, so a worker retired during the wait gets neither;
+    the folder switch between them runs outside it. A worker holds at most one agent per server: a second
+    on another server is added beside the first and leaves the worker's folders as they are."""
     core = pp.core_lane(workspace, lane)
+    server = str(core.get("server") or "")
+    first = not connections.worker_identities(worker, workspace)
+    current = connections.worker_identity(worker, workspace, server=server)
+    if rotate and current is None:
+        raise DeviceConnectError(f"worker {worker} has no agent of its own on {server} to rotate")
+    if not rotate:
+        try:
+            connections.require_no_worker_identity(worker, server, workspace)
+        except connections.ConnectionsError as e:
+            raise DeviceConnectError(str(e)) from None
     gateway = pp.origin_of(str(core["gateway_url"]))
     base = (base or gateway).rstrip("/")
     if base != gateway:
         raise DeviceConnectError("the connect base must be the core's own gateway origin, so the approval link "
                                  "cannot come from another host")
-    pending = start(base, label, display_name, server=str(core.get("server") or ""),
+    pending = start(base, label, display_name, server=server,
                     welcome_core="" if rotate else str(core.get("agent_mxid") or ""), request=request, clock=clock)
     known = [pending["device_code"]]
     who = worker_label or worker
@@ -574,7 +587,7 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
     op = f"{CARD_KIND}:{worker}:{secrets.token_hex(6)}"
     record = {"label": label, "display_name": display_name, "worker_label": who, "rotate": rotate,
               "lane": core.get("instance"), "server": server, "expires_at": pending["expires_at"],
-              "state": "pending"}
+              "state": "pending", **({} if rotate else {"own_dirs": bool(own_dirs)})}
     shown = ""
     if cards is not None:
         shown = cards.show(*approval_card(worker, who, label, pending["verify_url"], pending["expires_at"],
@@ -610,13 +623,17 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
     token = f"{got['relay_url']}|{got['bearer']}"
     try:
         with fenced(worker, workspace):
-            now = connections.worker_identity(worker, workspace)
+            now = connections.worker_identity(worker, workspace, server=server)
             if (now or {}).get("instance") != (current or {}).get("instance"):
                 raise DeviceConnectError(f"worker {worker}'s own identity changed while the approval was "
                                          "pending; nothing was saved", status="identity_changed")
             out = _save(worker, token, got["agent_id"], core, current, workspace=workspace, vault=vault,
                         preview=preview, repo=repo, logs_dir=logs_dir)
-            if start_lane is not None and not rotate:
+        # Outside the fence: its handler passes can take minutes. A retire meanwhile only finds less to move.
+        if own_dirs and not rotate and first:
+            out["dirs"] = switch_to_own_dirs(worker, workspace)
+        if start_lane is not None and not rotate:
+            with fenced(worker, workspace):
                 out["launch"] = start_lane(out["row"])
     except DeviceConnectError as e:
         if e.status == "worker_retired":
@@ -633,6 +650,21 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
     tell(done_card(worker, who, label, out["agent_id"], server=server, subtitle=subtitle, rotated=rotate),
          done_note(who, label, out["agent_id"], rotated=rotate), "done")
     return out
+
+
+def switch_to_own_dirs(worker: str, workspace: Optional[Path]) -> dict:
+    """Switch a worker that just got its first agent onto its own folders, as `migrate-dirs --apply` does:
+    {"state": "own" | "migrating" | "shared", "own": bool, "why"?}. Only "own" moves its lane and seat;
+    "migrating" keeps both on the shared folders until a re-run finishes. Never raises."""
+    import worker_lane
+    ws = Path(connections._workspace(workspace))
+    try:
+        _done, why = worker_lane.migrate_dirs(worker, ws)
+    except Exception as e:  # noqa: BLE001 - the identity is saved; the folders are reported, never raised
+        why = f"{type(e).__name__}: {e}"
+    state = connections.worker_dirs_state(worker, ws) or "shared"
+    out = {"state": state, "own": state == connections.WORKER_DIRS_OWN}
+    return {**out, "why": why[:300]} if why else out
 
 
 def _keep(workspace: Optional[Path], worker: str, record: dict) -> None:
@@ -665,9 +697,13 @@ def _save(worker, token, agent_id, core, current, *, workspace, vault, preview, 
                                        workspace=workspace, vault=vault)
         return {"agent_id": agent_id, "status": "rotated", "row": row}
     # A pasted-token add takes no roster lock, so one can still land after `fenced` looked.
-    row, created = connections.add_worker_identity(worker, token, expected_server=str(seen.get("server") or ""),
-                                                   source="agent_link", preview=seen, workspace=workspace,
-                                                   vault=vault)
+    try:
+        row, created = connections.add_worker_identity(worker, token, expected_server=str(seen.get("server") or ""),
+                                                       source="agent_link", preview=seen, workspace=workspace,
+                                                       vault=vault)
+    except connections.WorkerIdentityExists:
+        row, created = connections.worker_identity(worker, workspace, server=str(seen.get("server") or "")) or \
+            {"instance": "another agent's, since removed"}, False
     if not created:
         raise DeviceConnectError(f"worker {worker} already had a connection ({row['instance']}) by the time the "
                                  "approved token was saved; it was left as it is", status="identity_changed")

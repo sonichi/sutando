@@ -5,7 +5,8 @@
 device-connect flow as `pool_identity.py add <worker> --device-flow --label <label>`, as that
 command in a background process, and returns once the owner has been sent the approval link
 (or the start failed, or `wait_s` passed). The background process waits for the approval,
-saves the token and restarts the worker as its own agent, exactly as the command does alone.
+saves the token, puts the worker on its agent's own task and result folders and restarts it as its own
+agent, exactly as the command does alone.
 
 Nothing here fails the creation: every way the step cannot start is answered as
 {"status": "skipped", "why": ...}, and the worker answers through the core as before.
@@ -122,7 +123,11 @@ def _request(ws: Path, wid: str, worker_label: str, *, repo, lane, wait_s, spawn
     import connections
     import pool_device_connect as dc
     import pool_provision as pp
-    if connections.worker_identity(wid, ws) is not None:
+    try:
+        held = connections.worker_identity(wid, ws) is not None
+    except connections.AmbiguousWorkerIdentity:  # one on each of several servers
+        held = True
+    if held:
         return {"status": "skipped", "why": "the worker already has an agent of its own"}
     try:
         core = pp.core_lane(ws, lane)
