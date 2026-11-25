@@ -48,8 +48,8 @@ import time
 import uuid
 from pathlib import Path
 
-from ... import (acp_host, card_desk, connector_cards, held_start, local_task_protocol, mcp_auth, model_switch,
-                 quota_notice, result_labels, result_publish)
+from ... import (account_switch, acp_host, card_desk, connector_cards, held_start, local_task_protocol, mcp_auth,
+                 model_switch, quota_notice, result_labels, result_publish)
 from ...bounded_file_read import read_regular_bytes
 from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore, quoted, trigger_of  # noqa: F401
 from ...acp_client import AcpClient as _SharedClient
@@ -846,6 +846,16 @@ class Connector:
         if limited:
             body = LIMITED_NO_SEND if self.quota.limited() else quoted(quota_notice.words(
                 NAME, quota_notice.reset_from_text("%s %s" % (detail or "", text or "")), "")) + "\n"
+        signin = ""
+        if (owner_turn and not asked and agy_account.signed_out_error(status, detail) and acp_host.is_message(headers)
+                and self.in_owner_dm(path) and self.accounts.usable()):
+            # Signed out: the sign-in card in place of the error line; the line stays when it cannot be queued.
+            signin = "sign-in-card" if self.accounts.post(headers.get("channel_id"), self.accounts.signed_out_card()) \
+                else "sign-in-card-not-queued"
+            if signin == "sign-in-card":
+                # Only the error line gives way to the card: what this turn settled about a model or account stays.
+                kept = "\n".join(x for x in (quoted(switched).strip() if switched else "", unsaid) if x)
+                body = kept + "\n" if kept else account_switch.ANSWERED
         reason = ""
         if self.launch is not None:
             launches = LaunchLog(self.args.session_store)
@@ -865,7 +875,7 @@ class Connector:
                 "permissions": turn.decisions, "updates": dict(turn.updates), "answer_chars": len(text or ""),
                 "sspace_tools_down": reason,
                 "model": turn.model, **({"model_switch": told} if told else {}), **({"card": asked} if asked else {}),
-                **({"quota": quota} if quota else {})}
+                **({"quota": quota} if quota else {}), **({"sign_in": signin} if signin else {})}
 
     def pending_tasks(self, seen):
         now = time.time()

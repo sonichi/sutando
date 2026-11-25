@@ -70,6 +70,17 @@ _CODE_URL = re.compile(r"https?://\S*[?&]code=[^&\s]{8,}")
 _AUTH_LINE = re.compile(r"applyAuthResult: email=([^,\s]+@[^,\s]+)")
 
 
+SIGNED_OUT_MARK = "is not signed in on this computer"   # the connector's NOT_SIGNED_IN, for session/new's -32000
+SIGNED_OUT_TEXT = ("%s is not signed in on this computer, so I couldn't answer. Sign in below, then send your "
+                   "message again.")
+SIGNED_OUT_BODY = "%s is not signed in on this computer: open this DM in the desktop app there to sign in."
+
+
+def signed_out_error(status, detail) -> bool:
+    """Whether a turn failed because agy is not signed in (acp_host's not_signed_in on Authentication required)."""
+    return status == "failed" and SIGNED_OUT_MARK in (detail or "")
+
+
 def quota_error(status, text, detail) -> bool:
     """Whether a turn ended on agy's quota: a failed turn whose error says so, or a completed one whose
     (short) answer opens with that error, as agy has answered it. An answer that only mentions one is not."""
@@ -183,6 +194,17 @@ class AgyAccount:
                 marker["agent"] = self.agent_id
             built = dict(built, **{CONTROLS: marker})
         return body, built
+
+    def signed_out_card(self):
+        """The card for a turn agy refused as signed out: the desktop draws this agent's sign-in in it (the
+        `account_controls` marker, `signed_out` on); a client without it shows the text or the body."""
+        agent_card, _ = connector_cards._core()
+        body, built = agent_card.build(account_switch.NOTE, "pending", title="Antigravity account",
+                                       body=SIGNED_OUT_BODY % self.name, text=SIGNED_OUT_TEXT % self.name)
+        marker = {"runtime": "antigravity", "signed_out": True}
+        if _MXID_RE.match(self.agent_id):
+            marker["agent"] = self.agent_id
+        return body, dict(built, **{CONTROLS: marker})
 
     def menu(self, lead=""):
         keyed = self.keyed()
