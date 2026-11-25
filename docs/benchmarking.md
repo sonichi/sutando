@@ -78,6 +78,8 @@ Fingerprint maps must contain exactly the distinct case IDs in the saved rows,
 with valid digests. A present but malformed or incomplete map is an input error,
 including when the other run is legacy. Read errors and invalid run JSON also
 exit 2; an observed regression still exits 1 only with `--fail-on-regression`.
+Saved runs reject duplicate JSON object keys, including conflicting or escaped
+duplicate case IDs inside a fingerprint map, rather than keeping the last value.
 
 Historical runs without the field remain readable and comparable. JSON
 `suite_compatibility` and the Markdown report explicitly mark shared definitions

@@ -634,7 +634,7 @@ def write_run(run: Dict[str, Any], output: Path) -> Tuple[Path, Path]:
 def _load_run(path: Path) -> Dict[str, Any]:
     if path.is_dir():
         path = path / "run.json"
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(), object_pairs_hook=_unique_json_object)
     if data.get("kind") != "sutando-benchmark-run":
         raise ValueError(f"not a Sutando benchmark run: {path}")
     return data

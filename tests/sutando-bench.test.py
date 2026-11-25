@@ -1243,6 +1243,35 @@ class CaseDefinitionTests(unittest.TestCase):
                         self.assertEqual(bench.main(["compare", str(path), str(path)]), 2)
                     self.assertIn("cannot compare runs", stderr.getvalue())
 
+    def test_cli_rejects_duplicate_saved_definition_keys(self):
+        run = self.run_fixture()
+        body = json.dumps(run)
+        fingerprints = run["suite"]["case_fingerprints"]
+        mapping = json.dumps(fingerprints)
+        digest = json.dumps(fingerprints["one"])
+        bodies = [
+            body.replace(mapping, '{"one": "sha256:' + "0" * 64 + '", "one": ' + digest + '}'),
+            body.replace(mapping, '{"one": ' + digest + ', "\\u006fne": ' + digest + '}'),
+            body.replace('"case_fingerprints": ' + mapping,
+                         '"case_fingerprints": null, "case_fingerprints": ' + mapping),
+            body.replace('"suite": ', '"suite": {"name": "definitions"}, "suite": ', 1),
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            baseline, _ = bench.write_run(run, root / "baseline")
+            candidate = root / "candidate.json"
+            for invalid in bodies:
+                self.assertNotEqual(invalid, body)
+                candidate.write_text(invalid)
+                with self.subTest(body=invalid):
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                        rc = bench.main(["compare", str(baseline), str(candidate),
+                                         "--output", str(root / "comparison")])
+                    self.assertEqual(rc, 2)
+                    self.assertIn("duplicate JSON object key", stderr.getvalue())
+                    self.assertFalse((root / "comparison").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
