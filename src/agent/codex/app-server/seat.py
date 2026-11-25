@@ -803,6 +803,13 @@ class Seat:
         if self.restore is not None:
             return self.restore  # kept until Codex completes a turn on it (_run_turn)
         picked, rev = codex_core_model.pending(self.workspace / "state")
+        if picked and rev <= self.model_rev and picked == self.model and rev not in self.attempts:
+            # This launch already runs the pending pick (the restart named it): the first turn Codex
+            # completes on it settles the record, so the card and Settings name the same model
+            # (VM 2026-11-24 06:29: terra ran every turn, the record stayed 'pending, working luna').
+            self.attempts[rev] = 1
+            self.trial = (picked, rev, picked, False)
+            return ""
         if not picked or rev <= self.model_rev or self.attempts.get(rev, 0) >= TRIAL_ATTEMPTS:
             return ""
         cat = self.catalog()
