@@ -652,6 +652,10 @@ def attach(args) -> int:
     os.execv(tmux, [tmux, "-u", "-S", sock, "attach", "-t", "=%s" % SESSION_NAME])
 
 
+# What the app's settings page offers: the aliases Claude Code's /model takes (claude_model_switch.MODEL_RE).
+MODELS = (("default", "Default"), ("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku"), ("fable", "Fable"))
+
+
 def model(args) -> int:
     """Print the agent's model, or switch the running session's with Claude Code's own /model."""
     local = selected(args)
@@ -662,7 +666,11 @@ def model(args) -> int:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
     if not args.model:
-        print(json.dumps({"model": launcher.switched_model(cm.work_root(cfg)) or None}))
+        # `current` is the model Claude Code last said it switched to (none: the CLI's own default); every
+        # turn runs in the one session, whoever sends it, and a restart keeps it (hold.claude_argv).
+        now = launcher.switched_model(cm.work_root(cfg)) or None
+        print(json.dumps({"model": now, "current": now, "available": [{"id": m, "name": n} for m, n in MODELS],
+                          "pending": None}))
         return 0
     lc = launcher.Launcher(cfg, config_dir(local))
     switched, line = lc.switch_model(records.load_supervisor(cm.work_root(cfg)), args.model, confirm=args.confirm)
