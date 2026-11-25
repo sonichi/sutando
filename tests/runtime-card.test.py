@@ -348,6 +348,19 @@ class Taps(Base):
         self.assertEqual([c[0][c[0].index("--workspace") + 2] for c in self.launch.calls], ["await-sign-in", "switch"])
         self.assertFalse(self.ws.joinpath(*rtc.WAITING).exists(), "a tap that goes ahead ends the wait")
 
+    def test_a_saved_codex_token_codex_does_not_confirm_is_not_a_sign_in(self):
+        # An expired or revoked sign-in: auth.json still decodes, but Codex itself names no account.
+        self.current = self.selected = "claude"
+        (self.home / "auth.json").write_text(CODEX_AUTH)
+        self.codex_read = lambda home: {"kind": None, "verified": None}
+        rc, out = self.tap("Switch the core to Codex")
+        self.assertEqual((rc, out["status"]), (1, "needs_sign_in"))
+        self.assertIn("Codex is not signed in", out["say"])
+        self.assertEqual(self.fake.cards()[-1]["header"]["status"]["label"], "Sign in first")
+        self.assertEqual([c[0][c[0].index("--workspace") + 2] for c in self.launch.calls], ["await-sign-in"])
+        self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists())
+        self.assertEqual(self.restarts, [])
+
     def test_the_runtime_in_use_changes_nothing(self):
         rc, out = self.tap("Switch the core to Codex")
         self.assertEqual(out["status"], "say")

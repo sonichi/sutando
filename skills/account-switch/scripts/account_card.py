@@ -281,7 +281,8 @@ def current(rt: str, *, run=subprocess.run, codex_read=None) -> dict:
             return {"runtime": rt, "signed_in": False, "shown": "", "key": ""}
         email = masked(str(acct.get("email") or "")) or (masked_label(ident[1]) if ident else "")
         plan = f" ({acct['plan']})" if acct.get("plan") and acct.get("email") else ""
-        return {"runtime": rt, "signed_in": True, "shown": (email + plan) or "a ChatGPT account",
+        # Only Codex naming an account kind is a sign-in; a token left in auth.json may be expired or revoked.
+        return {"runtime": rt, "signed_in": bool(acct.get("kind")), "shown": (email + plan) or "a ChatGPT account",
                 "key": ident[0] if ident else ""}
     st = claude_status(run)
     shown = (masked(st["email"]) or "an Anthropic account") + (f" ({st['plan']})" if st["plan"] else "")
