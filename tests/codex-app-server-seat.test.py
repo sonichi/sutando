@@ -2541,5 +2541,63 @@ class HostDeclaration(unittest.TestCase):
         self.assertEqual(self.load(self.decl()).stage("task-1", "done", run=never), "")
 
 
+
+class AdvisoryFailures(SeatCase):
+    """The account-health, limit-hold, card and quota side paths never stop the seat when they fail."""
+
+    def test_limit_reset_of_no_snapshot_is_none(self):
+        self.assertIsNone(seat_mod.limit_reset(None))
+
+    def test_health_account_read_and_hold_failures_are_logged(self):
+        import codex_account
+        import core_limit_hold
+        s = self.make()
+        with mock.patch.object(seat_mod.core_account_health, "mark", side_effect=RuntimeError):
+            s.health("quota")
+        self.assertIsNone(s.health_bad, "a record not kept is no bad state")
+        with mock.patch.object(codex_account, "read", side_effect=RuntimeError):
+            self.assertFalse(s.signed_in_confirmed())
+        with mock.patch.object(core_limit_hold, "read_hold", side_effect=RuntimeError):
+            s.release_limit_hold()
+        out = self.out.getvalue()
+        for line in ("account health not kept (RuntimeError)", "account read failed (RuntimeError)",
+                     "limit hold not lifted (RuntimeError)"):
+            self.assertIn(line, out)
+
+    def test_a_card_command_that_cannot_run_is_not_sent(self):
+        (self.codex_home / "auth.json").write_text("tok-a")
+        s = self.make()
+        s.card_argv = [str(self.fake_dir / "no-such-card")]
+        s.signed_out("task-1.txt")
+        self.assertIsNone(s.told_signed_out)
+        self.assertIn("the account card was not sent", self.out.getvalue())
+
+    def test_a_refused_model_on_a_worker_or_an_unclosable_task_stays_pending(self):
+        import result_publish
+        s = self.make()
+        s.worker = "w1"
+        self.assertFalse(s.model_unavailable("task-1.txt"))
+        s.worker = ""
+        team = self.task("task-2.txt", "access_tier: team\ntask: do it\n")
+        with mock.patch.object(result_publish, "publish_text", side_effect=OSError("disk")):
+            self.assertFalse(s.model_unavailable("task-2.txt", team))
+        self.assertIn("could not be closed", self.out.getvalue())
+
+    def test_a_model_card_that_cannot_run_is_said_in_words(self):
+        s = self.make()
+        owner = self.task("task-3.txt", "access_tier: owner\ntask: do it\n")
+        with mock.patch.object(seat_mod.subprocess, "run", side_effect=OSError("no python")), \
+                mock.patch.object(s, "notify") as notify:
+            self.assertFalse(s.model_unavailable("task-3.txt", owner))
+        self.assertIn("model card failed", self.out.getvalue())
+        notify.assert_called_once()
+
+    def test_a_quota_notice_that_raises_is_logged(self):
+        s = self.make()
+        s.quota = mock.Mock(hit=mock.Mock(side_effect=RuntimeError))
+        s.turn_limit = {"message": "You've hit your usage limit."}
+        s.quota_step("failed", "task-4.txt")
+        self.assertIn("quota: quota-failed (RuntimeError)", self.out.getvalue())
+
 if __name__ == "__main__":
     unittest.main()

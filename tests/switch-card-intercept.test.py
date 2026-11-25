@@ -118,6 +118,63 @@ class Intercept(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
 
+class InterceptEdges(Intercept):
+    def test_a_non_message_or_a_voice_task_or_no_room_is_left(self):
+        base = task("switch account")
+        for old, new in (("interaction_type: message", "interaction_type: reaction"),
+                         ("channel_id: !dm:s.space", "channel_id: "),
+                         ("access_tier: owner", "access_tier: owner\ncontent_modalities: audio")):
+            with self.subTest(new=new):
+                text = task_envelope.stamp_text(base.replace(old, new), self.ws)
+                self.assertIsNone(sci.request(text, self.ws))
+
+    def test_a_post_that_cannot_run_or_says_nothing_readable_is_not_posted(self):
+        req = {"kind": "account", "room": "!dm:s.space", "reply_to": ""}
+
+        def raises(argv, **kw):
+            raise OSError("no python")
+        self.assertFalse(sci.post(req, self.ws, REPO, run=raises))
+        for out in ("", "not json\n"):
+            done = subprocess.CompletedProcess([], 0, stdout=out, stderr="")
+            self.assertFalse(sci.post(req, self.ws, REPO, run=lambda argv, **kw: done), out)
+        seen = []
+        ok = subprocess.CompletedProcess([], 0, stdout='{"status": "posted"}\n', stderr="")
+        self.assertTrue(sci.post(req, self.ws, REPO, run=lambda argv, **kw: seen.append(argv) or ok))
+        self.assertNotIn("--reply-to", seen[0])
+
+    def test_answer_counts_an_unconfirmed_publish_and_refuses_an_unwritable_one(self):
+        import result_publish
+        from unittest import mock
+        with mock.patch.object(result_publish, "publish_text", side_effect=result_publish.PublishedUnconfirmed("x")):
+            self.assertTrue(sci.answer(self.results, "task-abc.txt", "account"))
+        with mock.patch.object(result_publish, "publish_text", side_effect=OSError):
+            self.assertFalse(sci.answer(self.results, "task-abc.txt", "account"))
+
+    def test_an_unreadable_task_and_an_unwritten_result_are_logged(self):
+        from unittest import mock
+        logged = []
+        self.assertFalse(sci.intercept(self.ws / "missing.txt", self.ws, self.results, REPO, log=logged.append))
+        self.assertIn("not read (FileNotFoundError)", logged[-1])
+        with mock.patch.object(sci, "answer", return_value=False):
+            self.file.write_text(task_envelope.stamp_text(task("switch account"), self.ws))
+            ok = subprocess.CompletedProcess([], 0, stdout='{"status": "posted"}\n', stderr="")
+            self.assertTrue(sci.intercept(self.file, self.ws, self.results, REPO, run=lambda a, **k: ok,
+                                          log=logged.append))
+        self.assertIn("posted but the result was not written", logged[-1])
+
+    def test_main_prints_the_answered_word_only_when_it_answered(self):
+        import contextlib
+        import io
+        from unittest import mock
+        argv = [str(self.file), "--workspace", str(self.ws), "--results-dir", str(self.results)]
+        for answered, code, word in ((True, 0, sci.ANSWERED), (False, 1, "")):
+            with self.subTest(answered=answered), mock.patch.object(sci, "intercept", return_value=answered):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(sci.main(argv), code)
+                self.assertEqual(out.getvalue().strip(), word)
+
+
 class Watcher(unittest.TestCase):
     def test_the_watcher_asks_before_announcing(self):
         src = (REPO / "src" / "watch-tasks-stream.sh").read_text()

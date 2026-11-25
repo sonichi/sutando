@@ -825,6 +825,13 @@ class AccountChange(unittest.TestCase):
         self.assertEqual(self.gate(), 0, "the restart on B is not held by A's limit")
         self.assertNotEqual(clh.running_account(self.ws), a, "the gate keeps the account it launched (B)")
 
+    def test_a_launch_account_that_cannot_be_kept_or_read_is_none(self):
+        from unittest import mock
+        clh.record_launch_account(self.ws, "")
+        with mock.patch.object(clh, "write_status", side_effect=OSError):
+            clh.record_launch_account(self.ws, "acct-a", self.now)
+        self.assertIsNone(clh.running_account(self.ws))
+
     def test_with_no_launch_on_record_the_config_account_is_used_as_before(self):
         import os
         from unittest import mock

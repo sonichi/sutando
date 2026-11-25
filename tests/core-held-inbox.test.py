@@ -103,6 +103,73 @@ class HeldInbox(unittest.TestCase):
         self.assertEqual(self.inbox().step(), "launched")
 
 
+class Edges(HeldInbox):
+    def test_launch_core_returns_start_clis_code_and_one_when_it_cannot_run(self):
+        import subprocess
+        from unittest import mock
+        with mock.patch.object(chi.subprocess, "run", return_value=subprocess.CompletedProcess([], 75)) as run:
+            self.assertEqual(chi.launch_core(REPO), 75)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[-1], str(REPO / "src" / "agent" / "start-cli.sh"))
+        with mock.patch.object(chi.subprocess, "run", side_effect=OSError("no bash")), \
+                mock.patch.object(chi, "_log") as log:
+            self.assertEqual(chi.launch_core(REPO), 1)
+        log.assert_called_once()
+
+    def test_the_defaults_wire_the_quota_card_and_the_switch_intercept(self):
+        from unittest import mock
+        box = chi.HeldInbox(self.ws, REPO, launch=lambda r: 0, log=lambda *a: None)
+        self.assertEqual(box.quota.runtime, "claude")
+        with mock.patch("switch_card_intercept.intercept", return_value="no") as intercept:
+            box.intercept(self.ws / "tasks" / "task-a.txt")
+        self.assertEqual(intercept.call_args.args[1:3], (self.ws, self.ws / "results"))
+
+    def test_an_unreadable_queue_and_a_failing_intercept_keep_the_tick_going(self):
+        from unittest import mock
+        self.hold()
+        self.task("task-a")
+        logged = []
+        box = chi.HeldInbox(self.ws, REPO, now=lambda: self.t, launch=lambda r: 0, quota=self.quota,
+                            intercept=lambda p: 1 / 0, log=logged.append)
+        self.assertEqual(box.step(), "held")
+        self.assertIn("task-a.txt: switch card failed (ZeroDivisionError)", logged)
+        with mock.patch("task_queue.pending_files", side_effect=OSError):
+            self.assertEqual(box.pending(), [])
+
+    def test_a_failed_launch_is_logged_and_kept_watching(self):
+        self.rc = 2
+        self.assertEqual(self.inbox().step(), "failed")
+
+    def test_main_runs_one_tick_under_the_lock_and_a_second_loop_stands_down(self):
+        from unittest import mock
+        with mock.patch.object(chi.HeldInbox, "step", return_value="held") as step, \
+                mock.patch.object(chi, "_log"):
+            self.assertEqual(chi.main(["--workspace", str(self.ws), "--once"]), 0)
+            step.assert_called_once()
+            held = chi._lock(self.ws)
+            try:
+                self.assertEqual(chi.main(["--workspace", str(self.ws), "--once"]), 0)
+                step.assert_called_once()
+            finally:
+                held.close()
+
+    def test_main_outlives_a_bad_tick_and_ends_once_the_core_is_up(self):
+        from unittest import mock
+        ticks = iter([RuntimeError("bad tick"), "launched"])
+
+        def step(_self):
+            got = next(ticks)
+            if isinstance(got, Exception):
+                raise got
+            return got
+        with mock.patch.object(chi.HeldInbox, "step", step), mock.patch.object(chi, "_log") as log, \
+                mock.patch.object(chi.time, "sleep") as sleep, \
+                mock.patch("workspace_default.resolve_workspace", return_value=str(self.ws)):
+            self.assertEqual(chi.main([]), 0)
+        sleep.assert_called_once()
+        self.assertTrue(any("tick failed:" in c.args for c in log.call_args_list))
+
+
 class Launcher(unittest.TestCase):
     def test_start_cli_starts_it_on_a_held_refusal(self):
         src = (REPO / "src" / "agent" / "claude" / "cli" / "start-cli.sh").read_text()

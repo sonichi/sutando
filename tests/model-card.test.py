@@ -200,6 +200,17 @@ class Menu(Base):
         self.assertEqual((rc, json.loads(out.getvalue())["why"]), (1, "RuntimeError: no core lane"))
 
 
+    def test_post_to_the_owner_dm_finds_it_and_says_when_it_is_not_known(self):
+        rc, out = self.run_(["post", "--owner-dm"])
+        self.assertEqual((rc, out["status"]), (0, "posted"))
+        self.assertEqual(self.fake.calls[0][3], DM)
+        for found in (mock.Mock(side_effect=RuntimeError("no lane")), mock.Mock(return_value="")):
+            with self.subTest(found=found), mock.patch.object(mc, "_owner_dm", found):
+                rc, out = self.run_(["post", "--owner-dm"])
+                self.assertEqual((rc, out["status"]), (1, "failed"))
+                self.assertIn("the owner's DM is not known", out["why"])
+        self.assertEqual(len(self.fake.calls), 1)
+
 class Tap(Base):
     def setUp(self):
         super().setUp()

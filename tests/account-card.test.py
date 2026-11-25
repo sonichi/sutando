@@ -269,6 +269,13 @@ class CodexCard(Base):
         self.assertEqual((rc, out["status"]), (1, "failed"))
         self.assertEqual(self.fake.calls, [])
 
+    def test_the_quota_notice_with_no_core_lane_says_so_and_posts_nothing(self):
+        self.signed_in(A)
+        with mock.patch.object(acc, "_owner_dm", side_effect=RuntimeError("no core lane")):
+            rc, out = self.run_(["post", "--owner-dm", "--lead", "x"])
+        self.assertEqual((rc, out["status"], out["why"]), (1, "failed", "RuntimeError: no core lane"))
+        self.assertEqual(self.fake.calls, [])
+
     def test_the_card_goes_only_to_the_owner_dm(self):
         self.signed_in(A)
         rc, out = self.run_(["post", "--room", ROOM])
@@ -787,6 +794,8 @@ class Edges(Base):
             state, words = acc.do_switch(self.ws, key_of("acct-b"))
         self.assertIn("not usable", words)
         self.signed_in(A)
+        with mock.patch.object(acc, "_saved_auth", return_value=None):
+            self.assertIn("no longer saved here", acc.do_switch(self.ws, key_of("acct-b"))[1])
         self.keep(B)
         with mock.patch.object(acc, "save_current", return_value=False), \
                 mock.patch.object(acc, "_saved_auth", side_effect=lambda st, k: B if k == key_of("acct-b") else None):

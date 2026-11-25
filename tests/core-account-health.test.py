@@ -41,6 +41,16 @@ class Record(unittest.TestCase):
         self.assertTrue(h.mark(self.ws, "quota", "codex", "a@example.com", resets_at=950, now=400))
         self.assertEqual(h.read(self.ws)["since"], 300, "a later reset time is the same limit")
 
+    def test_an_unreadable_reset_is_dropped_and_an_unwritable_record_is_no_change(self):
+        from unittest import mock
+        import local_record
+        self.assertTrue(h.mark(self.ws, "quota", "codex", "", resets_at="soon", now=1))
+        self.assertNotIn("resets_at", h.read(self.ws))
+        logged = []
+        with mock.patch.object(local_record, "write_whole", side_effect=OSError):
+            self.assertFalse(h.mark(self.ws, "signed_out", "codex", "", now=2, log=lambda *a: logged.append(a)))
+        self.assertEqual(logged, [("account health not kept:", "OSError")])
+
     def test_ok_drops_resets_at_and_keeps_the_account(self):
         h.mark(self.ws, "quota", "claude", "", resets_at=900, now=1)
         self.assertIsNone(h.read(self.ws)["account"])

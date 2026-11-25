@@ -447,5 +447,65 @@ class RuntimeSwitch(Base):
         self.assertIn('"--quota-card-script", default=str(_REPO / "skills" / "account-switch"', src)
 
 
+
+class Edges(Base):
+    def test_no_reset_moment_reads_as_none(self):
+        self.assertEqual((cqn.reset_from_epoch(0), cqn.reset_from_epoch(-5), cqn.reset_from_epoch("x")), ("", "", ""))
+
+    def test_the_health_record_names_the_account_and_never_stops_the_notice(self):
+        import core_account_health
+        from unittest import mock
+        q = cqn.QuotaNotice(self.ws, "Codex", self.send, log=lambda *a: None, now=lambda: self.now[0],
+                            runtime="codex", account=lambda: "a@example.com")
+        with mock.patch.object(core_account_health, "mark") as mark:
+            q.health("quota", 5.0)
+        self.assertEqual(mark.call_args.args[1:5], ("quota", "codex", "a@example.com", 5.0))
+        logged = []
+        q.log = lambda *a: logged.append(a)
+        with mock.patch.object(core_account_health, "mark", side_effect=RuntimeError):
+            q.health("quota")
+        self.assertEqual(logged, [("account health not kept:", "RuntimeError")])
+
+    def test_a_record_that_cannot_be_kept_is_not_posted(self):
+        import local_record
+        from unittest import mock
+        logged = []
+        q = self.notice()
+        q.log = lambda *a: logged.append(a)
+        with mock.patch.object(local_record, "write_whole", side_effect=OSError):
+            self.assertEqual(q.hit("3pm"), "quota-not-posted")
+        self.assertEqual(self.cards, [])
+        self.assertIn(("quota record not kept:", "OSError"), logged)
+
+    def test_a_follow_up_card_that_raises_is_a_failure_tried_again(self):
+        q = self.notice()
+        self.assertEqual(q.hit("3pm", tasks=["task-1"]), "quota-card")
+
+        def boom(text, signed_out=False):
+            raise RuntimeError("down")
+        q.send = boom
+        self.assertEqual(q.hit("3pm", tasks=["task-2"]), "quota-not-posted")
+        self.assertEqual(self.record()["again_failed"]["n"], 1)
+
+    def test_owner_waiting_survives_an_unreadable_queue_and_task(self):
+        from unittest import mock
+        with mock.patch("task_queue.pending_files", side_effect=OSError):
+            self.assertEqual(cqn.owner_waiting(self.ws), [])
+        self.assertFalse(cqn.is_owner_task(self.ws / "tasks" / "missing.txt"))
+
+
+class MonitorSteps(Base):
+    def test_no_notice_and_a_raising_one_never_stop_the_monitor(self):
+        import contextlib
+        import io
+        from unittest import mock
+        self.assertEqual(M.quota_step(None, True, "x"), "")
+        boom = mock.Mock(workspace=self.ws, hit=mock.Mock(side_effect=RuntimeError), cleared=mock.Mock())
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(M.quota_step(boom, True, "You've hit your usage limit"), "quota-failed (RuntimeError)")
+            self.assertEqual(M.signed_out_step(boom, "logged-out", None, "claude"),
+                             "signed-out-card-failed (RuntimeError)")
+
+
 if __name__ == "__main__":
     unittest.main()
