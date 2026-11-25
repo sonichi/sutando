@@ -18,7 +18,9 @@ list is built in: with no readable choices the menu is not posted. `reply` handl
 (agent_card.click_verdict decides): it starts `switch-model.sh <id> --confirm` detached, because the
 core's CLI takes /model only after the current turn ends. Each tap is one attempt with its own id: the
 "switching" card is posted first, then the switch is started, so its outcome can only come after.
-The detached line always ends in `settle` with the switch's exit code and the attempt's id. `settle`
+The detached line runs the switch through `turn`, one at a time and only for the newest attempt
+(an older one started late is skipped, so the core is never left on a model the card does not
+show), and always ends in `settle` with the exit code and the attempt's id. `settle`
 saves the outcome in `<workspace>/state/model-card-outcome.json`, then posts it in the same DM:
 "Switched to X ✓", a pending "Saved, not switched yet" for a Codex seat's pick (exit 12),
 or "Couldn't switch to X: <reason>. I'm still using Y.". A post that
@@ -103,9 +105,15 @@ REASONS = {1: "the switch could not be locked or recorded",
 # Exit 12: a Codex seat saved the pick; it is not switched until Codex runs a turn on it.
 # Exit 13: no core is running; the pick applies at the next core start.
 PENDING_RC, NEXT_START_RC = 12, 13
-# The detached line: the switch, then always the outcome card with the switch's exit code.
-DETACHED = ('bash "$1" "$2" --confirm --accept-timeout "$3" --state-dir "$4"; '
+# The detached line: the switch in its turn (`turn` runs it only for the newest attempt), then always
+# the outcome card with the exit code.
+DETACHED = ('"$5" "$6" --workspace "$7" turn --attempt "$9" -- '
+            'bash "$1" "$2" --confirm --accept-timeout "$3" --state-dir "$4"; '
             '"$5" "$6" --workspace "$7" settle --room "$8" --model "$2" --attempt "$9" --rc $?')
+TURN_LOCK = ("state", "model-card-turn.lock")
+SKIPPED_RC = 75      # `turn` did not run the switch: a newer attempt had been accepted
+UNKNOWN_RC = 76      # `turn` did not run the switch: the record does not name the attempt
+NOT_RECORDED = "the attempt is not in the record, so no card is posted for it"
 
 
 def _emit(payload: dict, code: int = 0) -> int:
@@ -394,12 +402,33 @@ def _edit(ws: Path, room: str, event: str, words: str, operation_id: str, *, cor
     return {"status": "posted", "event_id": event, "edited": True}
 
 
-def keep_card(ws: Path, attempt: str, event: str, now: float) -> None:
-    """Keep `event`, the card the attempt's "switching" words replaced, for its outcome to replace."""
-    with _outcome_book(ws, now) as rows:
-        for row in rows:
-            if row["attempt"] == attempt:
-                row["card"] = event
+def show_switching(ws: Path, attempt: str, room: str, tapped: str, say: str, *, core=None, execute=None,
+                   now: float) -> dict:
+    """Show the attempt's "switching" words, in place of the tapped card or as a card of its own, under
+    the outcomes' lock and only while it is the newest attempt: an older tap's words arriving late
+    would replace the newer attempt's card, and nothing would correct them (its outcome is never told).
+    What was decided or shown stands when the record cannot be written afterwards."""
+    done = None
+    try:
+        with _outcome_book(ws, now) as rows:
+            at = next((i for i, r in enumerate(rows) if r["attempt"] == attempt), None)
+            if at is None or at + 1 < len(rows):
+                done = {"status": "superseded", "why": "a newer switch was accepted; its card stands"}
+                if at is not None:
+                    rows[at]["superseded"] = True
+                return done
+            done = _edit(ws, room, tapped, say, f"model-card:{attempt}:switching-edit", core=core, execute=execute)
+            if done["status"] == "posted":
+                rows[at]["card"] = tapped       # the card this attempt's outcome replaces
+                return done
+            body, card = notice_card("pending", "Switching", say)
+            done = _post(ws, room, body, card, f"model-card:{attempt}:switching", reply_to=tapped,
+                         core=core, execute=execute)
+            return done
+    except OSError as e:
+        if done is not None:
+            return done     # only the record's write failed: the decision, or the card shown, is not undone
+        return {"status": "failed", "why": f"the outcome record could not be used ({type(e).__name__})"}
 
 
 def new_attempt(now: float) -> str:
@@ -430,11 +459,15 @@ def _outcome_book(ws: Path, now: float):
         write_whole(path, {"outcomes": rows[-OUTCOMES_KEPT:]})
 
 
-def save_outcome(ws: Path, attempt: str, room: str, alias: str, rc: Optional[int], now: float) -> dict:
-    """The record of `attempt`, added as started when it is new; its outcome is written from `rc` once,
-    and not at all for `rc` None (the attempt has only begun)."""
+def save_outcome(ws: Path, attempt: str, room: str, alias: str, rc: Optional[int], now: float,
+                 add: bool = True) -> Optional[dict]:
+    """The record of `attempt`; its outcome is written from `rc` once, and not at all for `rc` None (the
+    attempt has only begun). A new attempt is added as started, which is what accepting a tap does;
+    with `add` False (finishing one) an attempt the record does not name stays out of it: None."""
     with _outcome_book(ws, now) as rows:
         row = next((r for r in rows if r["attempt"] == attempt), None)
+        if row is None and not add:
+            return None
         if row is None:
             row = {"attempt": attempt, "room": room, "model": alias, "state": "started", "words": "",
                    "told": False, "ts": now}
@@ -489,16 +522,19 @@ def deliver_owed(ws: Path, *, core=None, execute=None, now: float) -> list:
 
 
 def settle_attempt(ws: Path, attempt: str, room: str, alias: str, rc: int, *, core=None, execute=None,
-                   now=time.time, sleep=time.sleep, tries: int = 1, pause: float = 0) -> dict:
+                   now=time.time, sleep=time.sleep, tries: int = 1, pause: float = 0, add: bool = False) -> dict:
     """Save the outcome of `attempt`, then post it, trying again after `pause` up to `tries` times. One
-    superseded meanwhile is not posted. Nor is one that cannot be saved: without the record nothing
+    superseded meanwhile is not posted. Nor is one that cannot be saved, or that the record no longer
+    names (only accepting a tap adds an attempt, `add` aside): without its place in the record nothing
     shows whether a newer attempt came after it, and its card would replace that attempt's."""
     try:
-        row = save_outcome(ws, attempt, room, alias, rc, now())
+        row = save_outcome(ws, attempt, room, alias, rc, now(), add=add)
     except OSError as e:
         state, words = outcome(ws, alias, rc)
         return {"status": "failed", "attempt": attempt, "outcome": state, "say": words, "saved": False,
                 "why": f"the outcome could not be saved, so its card was not posted ({type(e).__name__})"}
+    if row is None:
+        return {"status": "skipped", "attempt": attempt, "why": NOT_RECORDED}
     out = tell(ws, attempt, core=core, execute=execute, now=now())
     for _ in range(max(tries, 1) - 1):
         if out["status"] != "failed":
@@ -588,20 +624,15 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
         return _emit({**other, **extra}, code)
     say = switching_words(alias)
     tapped = str(headers.get("reply_to_event") or "")
-    posted = _edit(ws, room, tapped, say, f"model-card:{attempt}:switching-edit", core=core or None, execute=execute)
-    if posted["status"] == "posted":
-        try:
-            keep_card(ws, attempt, tapped, now())
-        except OSError:
-            pass  # the outcome is then posted as a card of its own
-    else:
-        body, card = notice_card("pending", "Switching", say)
-        posted = _post(ws, room, body, card, f"model-card:{attempt}:switching", reply_to=tapped,
-                       core=core or None, execute=execute)
+    posted = show_switching(ws, attempt, room, tapped, say, core=core or None, execute=execute, now=now())
+    if posted["status"] == "superseded":
+        # A newer tap was accepted while this one waited: nothing is started and nothing is promised.
+        return _emit({"status": "superseded", "model": alias, "attempt": attempt, "why": posted["why"], **extra})
     try:
         pid = start_switch(ws, alias, room, attempt, popen)
     except OSError as e:
         told = settle_attempt(ws, attempt, room, alias, -1, core=core or None, execute=execute, now=now)
+        told.setdefault("say", outcome(ws, alias, -1)[1])
         return _emit({"status": "failed", "attempt": attempt, "say": told["say"], **extra,
                       "why": f"the switch could not be started ({type(e).__name__}: {e})"}, 1)
     out = {"status": "started", "model": alias, "attempt": attempt, "pid": pid, "say": say, **extra}
@@ -612,10 +643,37 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     return _emit(out)
 
 
+def cmd_turn(ws: Path, args, *, call=subprocess.call) -> int:
+    """Run an attempt's switch in its turn, one at a time, and only while it is the newest accepted
+    attempt. Two taps start two detached lines in no fixed order: without this the older switch could
+    run last, leaving the core on a model the card does not show (its outcome is superseded and
+    never posted). The command's exit code; SKIPPED_RC when a newer attempt was accepted; UNKNOWN_RC
+    when the record does not name this attempt (trimmed, or unreadable): nothing then shows it is
+    the newest, so its switch is not run either."""
+    from file_lock import locked_file
+    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    with locked_file(ws.joinpath(*TURN_LOCK)):
+        rows = outcomes(ws)
+        at = next((i for i, r in enumerate(rows) if r["attempt"] == args.attempt), None)
+        if at is None:
+            print(f"model-card: attempt {args.attempt} is not in the record; its switch is not run", flush=True)
+            return UNKNOWN_RC
+        if at + 1 < len(rows):
+            print(f"model-card: attempt {args.attempt} is not the newest; its switch is not run", flush=True)
+            return SKIPPED_RC
+        return int(call(command))
+
+
 def cmd_settle(ws: Path, args, *, core=None, execute=None, now=time.time, sleep=time.sleep) -> int:
+    if args.rc == UNKNOWN_RC:
+        # Settling would add the attempt to the record as the newest one, and post over a newer card.
+        return _emit({"status": "skipped", "attempt": args.attempt, "why": NOT_RECORDED}, 1)
+    # With no --attempt this is a settle by hand: a new attempt of its own. One that names an attempt
+    # only finishes it, and never adds it.
     out = settle_attempt(ws, args.attempt or new_attempt(now()), args.room, args.model, args.rc, core=core,
-                         execute=execute, now=now, sleep=sleep, tries=SETTLE_TRIES, pause=SETTLE_PAUSE_S)
-    return _emit(out, 1 if out["status"] == "failed" else 0)
+                         execute=execute, now=now, sleep=sleep, tries=SETTLE_TRIES, pause=SETTLE_PAUSE_S,
+                         add=not args.attempt)
+    return _emit(out, 1 if out["status"] in ("failed", "skipped") else 0)
 
 
 def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, sleep=time.sleep) -> int:
@@ -636,6 +694,9 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, sleep=ti
     t.add_argument("--model", required=True)
     t.add_argument("--rc", required=True, type=int)
     t.add_argument("--attempt", default="")
+    u = sub.add_parser("turn")
+    u.add_argument("--attempt", required=True)
+    u.add_argument("command", nargs=argparse.REMAINDER)
     sub.add_parser("status")
     args = p.parse_args(argv)
     if args.workspace:
@@ -649,6 +710,8 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, sleep=ti
         return cmd_reply(ws, args, core=core, execute=execute, popen=popen)
     if args.cmd == "settle":
         return cmd_settle(ws, args, core=core, execute=execute, sleep=sleep)
+    if args.cmd == "turn":
+        return cmd_turn(ws, args)
     return _emit(current_model(ws))
 
 

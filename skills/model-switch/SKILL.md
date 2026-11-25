@@ -125,6 +125,8 @@ skills/model-switch/scripts/model_card.py reply`, run that with `--task-file <ta
   --confirm --accept-timeout 180`; the CLI takes `/model` once this turn ends) and a card already says
   "Switching the core to X; it takes effect after this turn. I'll confirm here once it has switched.".
   Write `[no-send]` and end the turn. Without `event_id` the card could not be posted: send `say`.
+- `{"status": "superseded"}`: a newer tap was accepted while this one waited; nothing was started and
+  the card shows the newer one. There is no `say`: write `[no-send]` and end the turn.
 - `{"status": "failed", "say": …}`: the switch could not be started; the card already says so.
 - `{"status": "say", "say": …}`: the tapped model is the one in use ("I'm already using X. Nothing
   changed."); say that line.
@@ -135,7 +137,10 @@ skills/model-switch/scripts/model_card.py reply`, run that with `--task-file <ta
   `skills/agent-cards/SKILL.md`.
 
 Each tap is one attempt with its own id (`attempt` in the output): the "switching" card is posted
-before the switch is started, so the outcome can only follow it. The detached line always ends in
+before the switch is started, so the outcome can only follow it. The detached line runs the switch
+through `model_card.py turn --attempt <id> -- <the switch>`: switches run one at a time, and only the
+newest accepted attempt's switch runs, so two quick taps end on the model tapped last (an attempt the
+record no longer names is not run, and `settle` then posts nothing for it). It always ends in
 `model_card.py settle --room <DM> --model <model id> --attempt <id> --rc <the switch's exit code>`, which
 saves the outcome in `<workspace>/state/model-card-outcome.json` and then posts it in the same DM: "Switched to X ✓" on exit 0, a
 pending card ("Saved, not switched yet: I'll try X on my next task") on exit 12 (the seat's own notice

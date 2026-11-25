@@ -51,6 +51,10 @@ import connections  # noqa: E402
 DM, ROOM, OWNER = "!dm:s.space", "!team:s.space", "@owner:s.space"
 CORE = {"instance": "s_dspace", "owner_mxid": OWNER, "agent_mxid": "@owner-mini.agent:s.space"}
 SIMPLE = "opus=Opus;sonnet=Sonnet;fable=Fable;default=Default"
+# A stand-in for the interpreter in the detached line: `turn` runs the command after "--", as the
+# real one does when the attempt is the newest; any other call says what it was given.
+TURN_THEN_ECHO = ('#!/bin/sh\ncase " $* " in *" turn "*) echo "turn $6"; while [ "$1" != "--" ]; do shift; done; '
+                  'shift; exec "$@";; esac\necho "settle $*"\n')
 SHIPPED = "default=Default (auto-fallback);opus=Opus;sonnet[1m]=Sonnet (1M context);haiku=Haiku;fable[1m]=Fable (1M context)"
 SAID = {entry.split("=")[0]: "Switch the core to " + entry.split("=")[1] for entry in (SIMPLE + ";" + SHIPPED).split(";")}
 
@@ -343,13 +347,63 @@ class Tap(Base):
         fake_switch = self.ws / "switch.sh"
         fake_switch.write_text('echo "switch $*"; exit 8\n')
         fake_py = self.ws / "py.sh"
-        fake_py.write_text('#!/bin/sh\necho "settle $*"\n')
+        fake_py.write_text(TURN_THEN_ECHO)
         fake_py.chmod(0o755)
         got = subprocess.run(["bash", "-c", mc.DETACHED, "model-card", str(fake_switch), "fable", "180", "/st",
                               str(fake_py), "card.py", "/w s", DM, "17-ab"], capture_output=True, text=True, check=True)
         self.assertEqual(got.stdout.splitlines(),
-                         ["switch fable --confirm --accept-timeout 180 --state-dir /st",
+                         ["turn 17-ab",
+                          "switch fable --confirm --accept-timeout 180 --state-dir /st",
                           f"settle card.py --workspace /w s settle --room {DM} --model fable --attempt 17-ab --rc 8"])
+
+    def test_two_accepted_switches_run_one_at_a_time_and_an_older_one_started_last_is_not_run(self):
+        """Reverse start order, for real: the newer attempt's line gets its turn first; the older
+        one, starting after it, must not run its switch and leave the core on the older model."""
+        ran = self.ws / "ran.txt"
+        switch = self.ws / "switch.sh"
+        switch.write_text(f'echo "$1" >> "{ran}"; exit 0\n')
+        for attempt, alias in (("17-ab", "fable"), ("18-cd", "sonnet")):
+            mc.save_outcome(self.ws, attempt, DM, alias, None, mc.time.time())
+
+        def turn(attempt, alias):
+            return mc.main(["--workspace", str(self.ws), "turn", "--attempt", attempt, "--", "bash", str(switch), alias])
+
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            self.assertEqual((turn("18-cd", "sonnet"), turn("17-ab", "fable")), (0, mc.SKIPPED_RC))
+        self.assertEqual(ran.read_text().split(), ["sonnet"], "only the newest accepted switch ran")
+        self.assertIn("17-ab is not the newest", said.getvalue())
+        # The skipped attempt's outcome is superseded, never posted; the newest one's is.
+        sent = len(self.fake.calls)
+        def settle(attempt, rc, alias):
+            return self.run_(["settle", "--room", DM, "--model", alias, "--rc", str(rc), "--attempt", attempt])[1]
+
+        self.assertEqual(settle("17-ab", mc.SKIPPED_RC, "fable")["status"], "superseded")
+        self.assertEqual((settle("18-cd", 0, "sonnet")["status"], len(self.fake.calls)), ("posted", sent + 1))
+        # An attempt the record does not name is not run: nothing shows it is the newest. Settling it
+        # adds no record and posts no card, so it cannot become "the newest" by being settled.
+        kept, sent = mc.outcomes(self.ws), len(self.fake.calls)
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            self.assertEqual(turn("01-zz", "haiku"), mc.UNKNOWN_RC)
+        self.assertIn("01-zz is not in the record", said.getvalue())
+        rc, out = self.run_(["settle", "--room", DM, "--model", "haiku", "--rc", str(mc.UNKNOWN_RC), "--attempt", "01-zz"])
+        self.assertEqual((rc, out["status"], mc.outcomes(self.ws), len(self.fake.calls)), (1, "skipped", kept, sent))
+        # The same when the record cannot be read at all, even for the attempt that was the newest.
+        path = self.ws.joinpath(*mc.OUTCOMES)
+        good = path.read_text()
+        path.write_text("not json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(turn("18-cd", "sonnet"), mc.UNKNOWN_RC)
+        path.write_text(good)
+        self.assertEqual(ran.read_text().split(), ["sonnet"])
+        # While one switch holds its turn, the next one waits for it.
+        slow = self.ws / "slow.sh"
+        slow.write_text(f'echo "start $1" >> "{ran}"; sleep 1; echo "end $1" >> "{ran}"\n')
+        ran.write_text("")
+        procs = [subprocess.Popen([sys.executable, str(SCRIPT), "--workspace", str(self.ws), "turn", "--attempt", "18-cd",
+                                   "--", "bash", str(slow), name], stdout=subprocess.DEVNULL) for name in ("a", "b")]
+        self.assertEqual([p.wait(timeout=30) for p in procs], [0, 0])
+        lines = ran.read_text().splitlines()
+        self.assertEqual([ln.split()[0] for ln in lines], ["start", "end", "start", "end"], lines)
 
     def test_a_tap_that_is_not_the_owners_on_this_card_starts_nothing(self):
         for kw in ({"user": "@x:s.space"}, {"tier": "team"}, {"room": ROOM, "kind": "room"}, {"event": "$other"},
@@ -494,7 +548,10 @@ class Attempts(Base):
         self.using("opus")
         self.assertEqual(self.run_(["post", "--room", DM])[0], 0)
 
-    def settle(self, attempt, rc=8, alias="fable"):
+    def settle(self, attempt, rc=8, alias="fable", accepted=True):
+        """The detached step's `settle` for `attempt`, which a tap accepted (recorded) before it."""
+        if accepted and not any(r["attempt"] == attempt for r in mc.outcomes(self.ws)):
+            mc.save_outcome(self.ws, attempt, DM, alias, None, mc.time.time())
         return self.run_(["settle", "--room", DM, "--model", alias, "--rc", str(rc), "--attempt", attempt])
 
     def failing(self, times):
@@ -673,13 +730,29 @@ class Attempts(Base):
         import file_lock
         sent = len(self.fake.calls)
         with mock.patch.object(file_lock, "locked_file", side_effect=PermissionError("read-only")):
-            rc, out = self.settle("17-ab", 0)
+            rc, out = self.settle("17-ab", 0, accepted=False)
             self.assertEqual((rc, out), (1, {
                 "status": "failed", "attempt": "17-ab", "outcome": "done", "say": "Switched to Fable ✓",
                 "saved": False, "why": "the outcome could not be saved, so its card was not posted (PermissionError)"}))
             self.assertEqual(mc.tell(self.ws, "17-ab", core=CORE, execute=self.fake.execute, now=1.0),
                              {"status": "failed", "why": "the outcome record could not be used (PermissionError)"})
         self.assertEqual((len(self.fake.calls), self.sleeps), (sent, []), "the newer attempt's card is left as it is")
+
+    def test_an_attempt_the_record_dropped_before_settle_adds_no_row_and_posts_no_card(self):
+        """Only accepting a tap adds an attempt. One whose row is gone by the time its switch ends (the
+        record trimmed it, or `turn` skipped it and it was evicted) is not put back as the newest."""
+        mc.save_outcome(self.ws, "17-ab", DM, "fable", None, mc.time.time())
+        mc.save_outcome(self.ws, "18-cd", DM, "sonnet", None, mc.time.time())
+        path = self.ws.joinpath(*mc.OUTCOMES)
+        rows = [r for r in json.loads(path.read_text())["outcomes"] if r["attempt"] != "17-ab"]
+        path.write_text(json.dumps({"outcomes": rows}))
+        sent = len(self.fake.calls)
+        for code in (mc.SKIPPED_RC, 8, 0):
+            rc, out = self.settle("17-ab", code, accepted=False)
+            self.assertEqual((rc, out), (1, {"status": "skipped", "attempt": "17-ab", "why": mc.NOT_RECORDED}), code)
+        self.assertEqual(([r["attempt"] for r in mc.outcomes(self.ws)], len(self.fake.calls)), (["18-cd"], sent))
+        # The newer attempt, still in the record, is told as usual.
+        self.assertEqual((self.settle("18-cd", 0, alias="sonnet")[1]["status"], len(self.fake.calls)), ("posted", sent + 1))
 
     def test_settle_without_an_attempt_id_makes_one(self):
         rc, out = self.run_(["settle", "--room", DM, "--model", "fable", "--rc", "0"])
@@ -747,7 +820,8 @@ class Manifest(Base):
         fake_switch = self.ws / "switch.sh"
         fake_switch.write_text('echo "switch $1"; exit 0\n')
         fake_py = self.ws / "py.sh"
-        fake_py.write_text('#!/bin/sh\necho "settle $8"\n')
+        fake_py.write_text('#!/bin/sh\ncase " $* " in *" turn "*) while [ "$1" != "--" ]; do shift; done; shift; '
+                           'exec "$@";; esac\necho "settle $8"\n')
         fake_py.chmod(0o755)
         got = subprocess.run(["bash", "-c", mc.DETACHED, "model-card", str(fake_switch), "fable[1m]", "180", "/st",
                               str(fake_py), "card.py", str(self.ws), DM, "17-ab"], cwd=str(self.ws),
@@ -910,12 +984,98 @@ class Edges(Base):
         self.assertEqual(out, {"status": "failed", "why": "the card is not in the owner's DM"})
         self.assertEqual(self.fake.calls, [])
 
-    def test_a_switching_card_that_cannot_be_kept_still_starts_the_switch(self):
+    def test_a_switching_card_that_cannot_be_shown_still_starts_the_switch(self):
         self.using("opus")
         self.run_(["post", "--room", DM])
-        with mock.patch.object(mc, "keep_card", side_effect=OSError("ro")):
+        with mock.patch.object(mc, "_edit", side_effect=OSError("ro")):
             rc, out = self.tap("fable")
         self.assertEqual((rc, out["status"]), (0, "started"))
+        self.assertIn("could not be used", out["card_why"])
+
+    def test_an_older_taps_switching_words_arriving_late_never_replace_the_newer_attempts_card(self):
+        """Two taps on one card: the older reply pauses before its "switching" edit while the newer
+        one is accepted, shown and settled. `turn` skips the older switch and its outcome is never
+        told, so its words landing last would stay on the card for good: they are not sent."""
+        self.using("opus")
+        for attempt, alias in (("17-ab", "fable"), ("18-cd", "sonnet")):
+            mc.save_outcome(self.ws, attempt, DM, alias, None, mc.time.time())
+        run = lambda *a, **k: self.fake.execute(*a, **k)
+        show = lambda attempt: mc.show_switching(self.ws, attempt, DM, "$card1", "Switching", core=CORE,
+                                                 execute=run, now=mc.time.time())
+        self.assertEqual(show("18-cd")["status"], "posted")
+        sent = len(self.fake.calls)
+        self.assertEqual(show("17-ab")["status"], "superseded")
+        self.assertEqual(len(self.fake.calls), sent, "neither an edit nor a card of its own")
+        self.assertEqual(show("no-such")["status"], "superseded", "an attempt the record does not name shows nothing")
+        rows = {r["attempt"]: r for r in mc.outcomes(self.ws)}
+        self.assertEqual((rows["18-cd"].get("card"), rows["17-ab"].get("card")), ("$card1", None))
+
+    def test_an_older_tap_that_acts_after_a_newer_one_was_accepted_starts_nothing_and_promises_nothing(self):
+        """Reviewer, f55791d5: the card stayed on the newer outcome, but the older reply still answered
+        `started` with a `say` promising its switch, which the caller sends and which never comes true."""
+        self.using("opus")
+        self.run_(["post", "--room", DM])
+        owed, at = mc.deliver_owed, len(self.fake.calls)
+
+        def newer_tap_lands_first(ws, **kw):
+            # While this (older) reply is between recording its attempt and showing it, a newer tap is
+            # accepted, shown and settled on the same card.
+            mc.save_outcome(ws, "9999999999-newer", DM, "sonnet", 0, mc.time.time())
+            return owed(ws, **kw)
+
+        with mock.patch.object(mc, "deliver_owed", newer_tap_lands_first):
+            rc, out = self.tap("fable")
+        self.assertEqual((rc, out["status"], out["model"]), (0, "superseded", "fable"))
+        self.assertNotIn("say", out, "nothing for the caller to send")
+        self.assertNotIn("pid", out)
+        self.assertEqual(self.launch.calls, [], "no detached switch was launched")
+        sent = [c[2] for c in self.fake.calls[at:]]
+        self.assertFalse([op for op in sent if out["attempt"] in op], "no edit and no card for the older attempt")
+        rows = {r["attempt"]: r for r in mc.outcomes(self.ws)}
+        self.assertTrue(rows[out["attempt"]]["superseded"], "and it is never told later")
+        self.assertEqual(mc.deliver_owed(self.ws, core=CORE, execute=lambda *a, **k: self.fake.execute(*a, **k),
+                                         now=mc.time.time()), [], "nothing of it is owed")
+
+    def test_a_record_that_cannot_be_written_never_turns_a_superseded_tap_into_a_started_one(self):
+        """Reviewer, 3f90a1db: when writing the superseded mark raised, the answer became `failed`, and
+        the caller launched the switch and returned the stale "switching" words."""
+        self.using("opus")
+        self.run_(["post", "--room", DM])
+        owed, at = mc.deliver_owed, len(self.fake.calls)
+        from local_record import write_whole
+
+        def newer_tap_then_a_read_only_record(ws, **kw):
+            mc.save_outcome(ws, "9999999999-newer", DM, "sonnet", 0, mc.time.time())
+            out = owed(ws, **kw)
+            writes.start()                      # from here on the record cannot be written
+            return out
+
+        writes = mock.patch("local_record.write_whole", side_effect=PermissionError("read-only"))
+        self.addCleanup(mock.patch.stopall)
+        with mock.patch.object(mc, "deliver_owed", newer_tap_then_a_read_only_record):
+            rc, out = self.tap("fable")
+        writes.stop()
+        self.assertEqual((rc, out["status"]), (0, "superseded"))
+        self.assertNotIn("say", out)
+        self.assertEqual(self.launch.calls, [], "nothing was launched")
+        self.assertFalse([c[2] for c in self.fake.calls[at:] if out["attempt"] in c[2]], "nothing was shown for it")
+        self.assertTrue(callable(write_whole))
+
+    def test_a_switching_card_shown_stays_shown_when_its_record_cannot_be_written(self):
+        """The same slip the other way: the card was edited, the write that keeps it failed, and the
+        answer said the card could not be posted, so the caller sent the words a second time."""
+        self.using("opus")
+        self.run_(["post", "--room", DM])
+        mc.save_outcome(self.ws, "17-ab", DM, "fable", None, mc.time.time())
+        run = lambda *a, **k: self.fake.execute(*a, **k)
+        with mock.patch("local_record.write_whole", side_effect=PermissionError("read-only")):
+            shown = mc.show_switching(self.ws, "17-ab", DM, "$card1", "Switching", core=CORE, execute=run,
+                                      now=mc.time.time())
+        self.assertEqual((shown["status"], shown.get("event_id")), ("posted", "$card1"))
+        # A record that cannot even be read decides nothing: that is still `failed`.
+        with mock.patch.object(mc, "outcomes", side_effect=PermissionError("unreadable")):
+            self.assertEqual(mc.show_switching(self.ws, "17-ab", DM, "$card1", "Switching", core=CORE, execute=run,
+                                               now=mc.time.time())["status"], "failed")
 
     def test_a_card_whose_record_cannot_be_written_is_posted_and_says_its_buttons_will_not_act(self):
         with mock.patch.object(mc.issued_cards, "record", side_effect=PermissionError("read-only")) as record:
