@@ -6,6 +6,7 @@ revision or a repainted interaction's guard must raise, never execute.
 
 import sys
 import tempfile
+import json
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -75,16 +76,28 @@ class SchemaTests(unittest.TestCase):
         r.chosen_action = "allow"
         r.status = STATUS_IN_PROGRESS
         self.assertEqual(r.to_wire()["outcome"], {"state": "running"})
-        r.subject = {**(r.subject or {}), "driven_at": 1}
+        r.subject = {**(r.subject or {}), "driven_at": 1, "driven_settled": 2}
         r.status = STATUS_RESOLVED
-        self.assertEqual(r.to_wire()["outcome"], {"state": "done"}, "sent, and the runtime moved on")
-        r.subject.pop("driven_at")
-        self.assertEqual(r.to_wire()["outcome"], {"state": "closed"}, "no evidence: neutral, never success")
-        r.status, r.answer = STATUS_EXPIRED, {"note": "The answer did not take.  Open the terminal to finish it."}
+        self.assertEqual(r.to_wire()["outcome"], {"state": "done"}, "sent, and the runtime carried on")
+        r.subject.pop("driven_settled")
+        self.assertEqual(r.to_wire()["outcome"], {"state": "closed"},
+                         "sent, but nobody saw the runtime carry on: neutral, never success")
+        r.status, r.subject = STATUS_EXPIRED, {**r.subject, "driver_note": "The answer did not take.  Open the terminal to finish it."}
         self.assertEqual(r.to_wire()["outcome"],
                          {"state": "failed", "text": "The answer did not take. Open the terminal to finish it."})
         r.decided_by = "policy"
         self.assertNotIn("outcome", r.to_wire(), "a policy answer is never a card")
+
+    def test_what_the_human_submitted_is_never_the_result_line(self):
+        """`answer` holds the human's submitted payload (manager.apply_action); an expiry must not
+        publish it as if a driver had said it."""
+        from hitl.schema import STATUS_EXPIRED
+        r = make_req()
+        r.chosen_action, r.status = "allow", STATUS_EXPIRED
+        r.answer = {"note": "my token is hunter2", "text": "also private"}
+        wire = r.to_wire()
+        self.assertEqual(wire["outcome"], {"state": "closed"})
+        self.assertNotIn("hunter2", json.dumps(wire))
 
     def test_a_subject_with_no_card_field_leaves_no_subject_on_the_wire(self):
         self.assertNotIn("subject", make_req(subject={"claim": {"token": "t"}}).to_wire())

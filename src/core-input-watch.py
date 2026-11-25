@@ -1035,6 +1035,10 @@ def crash_loop_step(manager, workspace, session, runtime, last_pane, now):
         return []
 
 
+# The pane states that show the runtime carried on after a driven answer (a next dialog counts).
+_CARRIED_ON_STATES = ("idle-ready", "running", "blocked-human", "blocked-known")
+
+
 def settle_driven(manager, session, prompt, state):
     """Resolve each driven card whose dialog has left the screen: its keys took, so a later
     prompt, even an identical one, mints a new card instead of deduping onto the answered one."""
@@ -1051,6 +1055,13 @@ def settle_driven(manager, session, prompt, state):
                     or tui_gate.limit_card(r)):
                 continue
             if tui_gate.guard_for(session, prompt, state) != r.guard:
+                if state in _CARRIED_ON_STATES:
+                    # Only a runtime seen carrying on is success; a crash or a stall closes neutral.
+                    with manager.store.locked():
+                        cur = manager.get(r.id)
+                        if cur is not None:
+                            cur.subject = {**(cur.subject or {}), "driven_settled": time.time()}
+                            manager.store.save(cur)
                 manager.resolve(r.id)
                 done.append(r.id)
         return done
@@ -1075,6 +1086,8 @@ def drive_escalations(manager, session, prompt, state, send):
                 cur = manager.get(req_id)
                 if cur is not None:
                     cur.answer = {"note": note}
+                    # The driver's own words, apart from `answer`: the card's result line shows only these.
+                    cur.subject = {**(cur.subject or {}), "driver_note": note}
                     manager.store.save(cur)
             manager.expire(req_id)
 

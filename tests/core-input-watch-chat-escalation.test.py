@@ -545,6 +545,51 @@ class TestSequentialPrompts(unittest.TestCase):
         self.assertEqual(cards[0].status, "in_progress")
 
 
+class TestDrivenOutcome(unittest.TestCase):
+    """The card's result line is the driver's evidence: Done only when the runtime was seen
+    carrying on, the driver's own words when it gave up, neutral otherwise."""
+
+    def _driven(self):
+        m = _mgr()
+        r = M.escalate(m, "blocked-human", "awaiting user: permission", "permission", PERM, "s")
+        _click(m, r, "allow")
+        self.assertEqual(M.drive_escalations(m, "s", PERM, "blocked-human", lambda k: True), [(r.id, ["Enter"])])
+        self.assertEqual(m.get(r.id).to_wire()["outcome"], {"state": "running"})
+        return m, r
+
+    def test_a_driven_answer_is_done_once_the_runtime_is_seen_carrying_on(self):
+        for state in ("running", "idle-ready", "blocked-human"):
+            with self.subTest(state=state):
+                m, r = self._driven()
+                self.assertEqual(M.settle_driven(m, "s", None, state), [r.id])
+                cur = m.get(r.id)
+                self.assertEqual(cur.status, STATUS_RESOLVED)
+                self.assertTrue(cur.subject["driven_settled"])
+                self.assertEqual(cur.to_wire()["outcome"], {"state": "done"})
+
+    def test_a_driven_answer_whose_runtime_then_crashed_or_stalled_is_never_done(self):
+        """The dialog left the screen because the core died (a shell prompt in its pane), not
+        because the answer took: the card closes, and its result line stays neutral."""
+        for state in ("crashed", "hung", "logged-out"):
+            with self.subTest(state=state):
+                m, r = self._driven()
+                self.assertEqual(M.settle_driven(m, "s", "susan@mac ~ % ", state), [r.id])
+                cur = m.get(r.id)
+                self.assertEqual(cur.status, STATUS_RESOLVED)
+                self.assertNotIn("driven_settled", cur.subject)
+                self.assertEqual(cur.to_wire()["outcome"], {"state": "closed"})
+
+    def test_a_driver_that_gave_up_says_so_in_its_own_field(self):
+        m = _mgr()
+        r = M.escalate(m, "blocked-human", "awaiting user: permission", "permission", PERM, "s")
+        _click(m, r, "deny")
+        M.drive_escalations(m, "s", PERM, "blocked-human", lambda k: False)
+        cur = m.get(r.id)
+        self.assertEqual(cur.subject["driver_note"], "The answer did not take. Open the terminal to finish it.")
+        self.assertEqual(cur.to_wire()["outcome"],
+                         {"state": "failed", "text": "The answer did not take. Open the terminal to finish it."})
+
+
 class TestPartialSend(unittest.TestCase):
     """Reviewer P1: a key sequence that half-lands must never read as driven, and
     must never be finished later against a caret nobody can place."""

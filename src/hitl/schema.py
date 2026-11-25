@@ -178,18 +178,19 @@ class HumanRequirement:
     def wire_outcome(self) -> Optional[Dict[str, str]]:
         """What came of the human's answer, for the card's result line (the client reads `running`,
         `done`, `failed` and neutral `closed`): `running` once an answer was taken and is being applied;
-        `done` once a driver that sent it saw the runtime move on (`driven_at`, then resolved); `failed`
-        when a driver gave it up (expired with its note); `closed` when an answered card closed with no
-        such evidence, which is never read as success. None for a card nobody answered."""
+        `done` once the driver that sent it saw the runtime carry on (`subject.driven_settled`);
+        `failed` when a driver gave it up, with the driver's own words (`subject.driver_note`, never
+        `answer`, which holds what the human submitted); `closed` when an answered card closed with
+        no such evidence, which is never read as success. None for a card nobody answered."""
         if not self.chosen_action or self.decided_by == "policy":
             return None
         subject = self.subject or {}
         if self.status == STATUS_IN_PROGRESS:
             return dict(state="running")
-        note = self.answer.get("note") if isinstance(self.answer, dict) else None
+        note = subject.get("driver_note")
         if self.status == STATUS_EXPIRED and isinstance(note, str) and note.strip():
             return dict(state="failed", text=" ".join(note.split())[:200])
-        if self.status == STATUS_RESOLVED and subject.get("driven_at"):
+        if self.status == STATUS_RESOLVED and subject.get("driven_settled"):
             return dict(state="done")
         if self.terminal:
             return dict(state="closed")
