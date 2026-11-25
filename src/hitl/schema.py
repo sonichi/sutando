@@ -175,6 +175,26 @@ class HumanRequirement:
                 device["host"] = host
         return device
 
+    def wire_outcome(self) -> Optional[Dict[str, str]]:
+        """What came of the human's answer, for the card's result line (the client reads `running`,
+        `done`, `failed` and neutral `closed`): `running` once an answer was taken and is being applied;
+        `done` once a driver that sent it saw the runtime move on (`driven_at`, then resolved); `failed`
+        when a driver gave it up (expired with its note); `closed` when an answered card closed with no
+        such evidence, which is never read as success. None for a card nobody answered."""
+        if not self.chosen_action or self.decided_by == "policy":
+            return None
+        subject = self.subject or {}
+        if self.status == STATUS_IN_PROGRESS:
+            return {"state": "running"}
+        note = self.answer.get("note") if isinstance(self.answer, dict) else None
+        if self.status == STATUS_EXPIRED and isinstance(note, str) and note.strip():
+            return {"state": "failed", "text": " ".join(note.split())[:200]}
+        if self.status == STATUS_RESOLVED and subject.get("driven_at"):
+            return {"state": "done"}
+        if self.terminal:
+            return {"state": "closed"}
+        return None
+
     def to_wire(self) -> Dict[str, Any]:
         wire: Dict[str, Any] = {
             "id": self.id,
@@ -204,6 +224,9 @@ class HumanRequirement:
             subject["superseded"] = True  # closed for a fresh card: a done receipt here is not success
         if subject:
             wire["subject"] = subject
+        outcome = self.wire_outcome()
+        if outcome:
+            wire["outcome"] = outcome
         if self.expires_at is not None:
             wire["expires_at"] = self.expires_at
         if self.turn_on_action:

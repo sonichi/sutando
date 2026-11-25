@@ -67,6 +67,25 @@ class SchemaTests(unittest.TestCase):
                                                     "choices": {"a": "do a"}})
         self.assertIn("claim", req.subject, "the local record keeps every field")
 
+    def test_the_wire_says_what_came_of_the_answer(self):
+        """The card's result line (owner's PM 2026-11-24: neither client showed one)."""
+        from hitl.schema import STATUS_EXPIRED, STATUS_IN_PROGRESS, STATUS_RESOLVED
+        r = make_req()
+        self.assertNotIn("outcome", r.to_wire(), "nobody answered: no result line")
+        r.chosen_action = "allow"
+        r.status = STATUS_IN_PROGRESS
+        self.assertEqual(r.to_wire()["outcome"], {"state": "running"})
+        r.subject = {**(r.subject or {}), "driven_at": 1}
+        r.status = STATUS_RESOLVED
+        self.assertEqual(r.to_wire()["outcome"], {"state": "done"}, "sent, and the runtime moved on")
+        r.subject.pop("driven_at")
+        self.assertEqual(r.to_wire()["outcome"], {"state": "closed"}, "no evidence: neutral, never success")
+        r.status, r.answer = STATUS_EXPIRED, {"note": "The answer did not take.  Open the terminal to finish it."}
+        self.assertEqual(r.to_wire()["outcome"],
+                         {"state": "failed", "text": "The answer did not take. Open the terminal to finish it."})
+        r.decided_by = "policy"
+        self.assertNotIn("outcome", r.to_wire(), "a policy answer is never a card")
+
     def test_a_subject_with_no_card_field_leaves_no_subject_on_the_wire(self):
         self.assertNotIn("subject", make_req(subject={"claim": {"token": "t"}}).to_wire())
 
