@@ -66,9 +66,10 @@ run() {
     /bin/bash "$fix/src/agent/start-cli.sh" --runtime claude > "$TD/out" 2> "$TD/err" < /dev/null
   rc=$?
 }
-refused() {  # <label> <stderr phrase>
-  if [ "$rc" = 3 ] && ! grep -q LAUNCHER "$TD/log" && ! grep -q kill-session "$TD/log" \
-     && grep -q "$2" "$TD/err"; then
+refused() {  # <label> <stderr phrase>; the refusal's code and reason line are the desktop's contract
+  if [ "$rc" = 11 ] && ! grep -q LAUNCHER "$TD/log" && ! grep -q kill-session "$TD/log" \
+     && [ "$(grep -c '^start-cli: refusing to launch: ' "$TD/err")" = 1 ] \
+     && grep '^start-cli: refusing to launch: ' "$TD/err" | grep -q "$2"; then
     say PASS "$1: refused before any launcher or kill"
   else
     say FAIL "$1: rc=$rc err=$(tr '\n' '|' < "$TD/err") log=$(tr '\n' '|' < "$TD/log")"

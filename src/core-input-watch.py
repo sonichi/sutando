@@ -132,7 +132,7 @@ from delivery.pane_gate import (  # noqa: E402
     classify_pane as _pg_classify_pane, composer_text as _pg_composer_text, gate_evidence,
     slash_menu_gate_rows,
     is_usage_limit, limit_baseline, limit_step, live_tail,
-    prompt_line as _pg_prompt_line, refusal_line, strip_limit_banners,
+    prompt_line as _pg_prompt_line, refusal_line, strip_limit_banners, turn_running,
 )
 
 _FABLE_TEXT = FABLE_TEXT
@@ -517,7 +517,7 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
         return "blocked-known", _BASE_TO_STATE["paused"][1], None, None
     # A sign-in, refusal or limit (on screen, or a paused queue) outranks a held dialog.
     if (hook and hook[0] == core_block_signal.BLOCKED and pane
-            and not _is_idle_ready(pane, runtime) and not _turn_moving(pane, prev_pane, still_s)):
+            and not _is_idle_ready(pane, runtime) and not _turn_moving(pane, prev_pane, still_s, runtime)):
         kind = _HOOK_KIND.get(hook[1], "permission")
         tail = "\n".join([ln for ln in pane.splitlines() if ln.strip()][-14:])
         return "blocked-human", f"awaiting user: {kind} (hook)", tail or None, kind
@@ -535,7 +535,7 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
         # frozen) still reads hung, preserving genuine wedge detection.
         if pane and _is_idle_ready(pane, runtime, hook):
             return "idle-ready", _BASE_TO_STATE["idle"][1], None, None
-        if pane and _turn_moving(pane, prev_pane, still_s):
+        if pane and _turn_moving(pane, prev_pane, still_s, runtime):
             return "running", _BASE_TO_STATE["working"][1], None, None
         tail = "\n".join([ln for ln in (pane or "").splitlines() if ln.strip()][-14:])
         if process is None:  # no session observed = no wedge evidence; never RECOVER
@@ -550,10 +550,10 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
 FROZEN_TURN_S = cli_wedge.PROVISIONAL_THRESHOLDS["static_high_conf_s"]
 
 
-def _turn_moving(pane, prev_pane, still_s=None):
+def _turn_moving(pane, prev_pane, still_s=None, runtime=None):
     """A turn in flight whose pane changed since the last poll, or within FROZEN_TURN_S. Clocks
     and spinners are normalised away, so a frozen CLI whose timer still ticks is not motion."""
-    if not cli_wedge.frame_working(pane):
+    if not (cli_wedge.frame_working(pane) or turn_running(pane, ADAPTERS.get(runtime or "", CLAUDE))):
         return False
     if still_s is not None and still_s < FROZEN_TURN_S:
         return True

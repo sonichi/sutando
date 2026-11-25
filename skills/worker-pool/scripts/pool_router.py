@@ -21,6 +21,7 @@ import contextlib
 import fcntl
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -251,10 +252,11 @@ def deliver_one(workspace, recipient: str, task_id: str,
                               and not _own_lane_task(workspace, recipient, task_id)):
             return "fenced"
         try:
-            os.close(os.open(task_id + pd.PENDING_SUFFIX, os.O_CREAT | os.O_EXCL, 0o644, dir_fd=dfd))
+            fd = os.open(task_id + pd.PENDING_SUFFIX, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644, dir_fd=dfd)
         except FileExistsError:
             _attribute(workspace, recipient, task_id)
             return "already"
+        _write_lease(fd)
         if _between_sentinel_and_attribution:
             _between_sentinel_and_attribution()
         # Under the SAME lock as the sentinel: attribution and delivery are one
@@ -272,8 +274,19 @@ def _dirs_state(workspace, recipient: str) -> str:
 def _renew_sentinel(dfd: int, task_id: str) -> None:
     """A new inode renamed over the pending name: an event on that name and a fresh ctime and mtime."""
     tmp = f".{task_id}.renew"
-    os.close(os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o644, dir_fd=dfd))
+    _write_lease(os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o644, dir_fd=dfd))
     os.replace(tmp, task_id + pd.PENDING_SUFFIX, src_dir_fd=dfd, dst_dir_fd=dfd)
+
+
+def _write_lease(fd: int) -> None:
+    """Fill a new sentinel with its lease and close it. Its name, not its content, is the assignment,
+    so a failed write leaves a lease-less (legacy) sentinel rather than an undelivered task."""
+    try:
+        os.write(fd, pd.lease_body(time.time(), pd.lease_ttl_s()))
+    except OSError as e:
+        print(f"pool_router: sentinel lease not written ({type(e).__name__})", file=sys.stderr)
+    finally:
+        os.close(fd)
 
 
 def _admits(workspace, recipient: str) -> bool:

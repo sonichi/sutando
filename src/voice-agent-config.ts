@@ -78,7 +78,8 @@ function standIdentityLine(overrides?: ConfigOverrides): string {
 		if (si.name) stand = `Your Stand name is ${si.name}. Origin: ${si.nameOrigin || 'earned through use'}.`;
 	} catch { /* no Stand name */ }
 	const name = introName(overrides);
-	const ask = name ? `When asked your name or who you are, say "I\'m ${name}."` : '';
+	const ask = name ? `When asked your name or who you are, say "I\'m ${name}."`
+		: 'When asked your name, say you do not have one to share; never make one up.';
 	return [stand, ask].filter(Boolean).join(' ');
 }
 
@@ -205,7 +206,7 @@ export function buildGreeting(ctx: VoiceConfigContext, overrides?: ConfigOverrid
 	if (modeState.isMeeting) {
 		return `[System: MEETING MODE — the meeting is being transcribed into notes and you are not hearing it. Do NOT speak or produce any audio.]${modeState.marker}`;
 	}
-	return `[System: A user just connected. Say hi and introduce yourself as ${introName(overrides)} — their personal AI. Ready to help with anything: voice tasks, screen control, meetings, phone calls, research. Keep it brief — 1-2 natural sentences, no theatrics.${tutorialHint}${briefingHint}${insightHint}]${modeState.marker}`;
+	return `[System: A user just connected. Say hi and introduce yourself as ${introName(overrides) || 'their agent, with no name'} — their personal AI. Ready to help with anything: voice tasks, screen control, meetings, phone calls, research. Keep it brief — 1-2 natural sentences, no theatrics.${tutorialHint}${briefingHint}${insightHint}]${modeState.marker}`;
 }
 
 export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOverrides): string {

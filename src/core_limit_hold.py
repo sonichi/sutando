@@ -46,7 +46,6 @@ it holds nothing unless its text names a usage limit or a time to retry. The CLI
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -60,6 +59,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cli_wedge  # noqa: E402
 import quota_availability as qa  # noqa: E402
+from claude_account import account_digest, account_fingerprint, oauth_account  # noqa: E402,F401
 
 from workspace_default import resolve_workspace, status_read_path, write_status  # noqa: E402
 
@@ -205,14 +205,15 @@ def _record_reset(headers: dict, now: float) -> Optional[float]:
     return max(ahead) if ahead else None
 
 
-def record_evidence(payload, now: float) -> Optional[Limit]:
-    """A recent 429 in the proxy's record, unless the provider served since then."""
-    if not isinstance(payload, dict):
+def record_evidence(payload, now: float, account: Optional[str] = None) -> Optional[Limit]:
+    """A recent 429 in the proxy's record, unless the provider served since then.
+    With the seat's `account` digest known, only a record labeled with it is evidence."""
+    payload = qa.record_for_account(payload, account)
+    if payload is None:
         return None
-    ledger = payload.get("recent_rejections")
     newest = None
-    for rej in ledger if isinstance(ledger, list) else []:
-        if not isinstance(rej, dict) or rej.get("status") != 429:
+    for rej in qa.record_rejections(payload):
+        if rej.get("status") != 429:
             continue
         at = qa._parse_when(rej.get("ts"))
         if at is None or not (0 <= now - at <= EVIDENCE_WINDOW_S):
@@ -414,29 +415,15 @@ def _same_family(limited_model: Optional[str], launch_model: Optional[str]) -> b
     return not (mine and theirs and mine != theirs)
 
 
-def account_fingerprint(config_dir: Optional[str]) -> Optional[str]:
-    """A non-reversible digest of the account the CLI is signed in to, else None.
-    Only non-secret identity fields of `.claude.json` are read; tokens never are."""
-    if not config_dir:
-        return None
-    try:
-        acct = json.loads((Path(config_dir) / ".claude.json").read_text(encoding="utf-8")).get("oauthAccount")
-    except (OSError, ValueError, AttributeError):
-        return None
-    if not isinstance(acct, dict):
-        return None
-    ident = [str(acct.get(k) or "") for k in ("accountUuid", "organizationUuid", "emailAddress")]
-    if not any(ident):
-        return None
-    return hashlib.sha256("\0".join(ident).encode("utf-8")).hexdigest()[:16]
-
-
 def _same_account(held_account: Optional[str], launch_account: Optional[str]) -> bool:
     """A hold binds only the account it was seen under; an unknown side keeps it binding."""
     return not (held_account and launch_account and held_account != launch_account)
 
 
 def _binds(hold: dict, launch_model: Optional[str], launch_account: Optional[str]) -> bool:
+    # A hold set while the account was unreadable says nothing about an account read since.
+    if hold.get("account_unread") and launch_account:
+        return False
     return _same_family(hold.get("model"), launch_model) and _same_account(hold.get("account"), launch_account)
 
 
@@ -455,8 +442,7 @@ def _launch_config_dir() -> Optional[str]:
 def launch_identity(workspace: Path, config_dir: Optional[str] = None) -> tuple:
     """(model, account) the next launch would run as, read the way the gate reads them."""
     config_dir = _launch_config_dir() if config_dir is None else config_dir
-    model = qa.seat_model(qa.SeatEnv(True, None, config_dir), Path(workspace))
-    return model, account_fingerprint(config_dir)
+    return launch_model(workspace, config_dir), account_fingerprint(config_dir)
 
 
 # The account the running core was launched with, recorded when the gate lets it launch: a limit its
@@ -488,13 +474,19 @@ def running_account(workspace: Path) -> Optional[str]:
     return account if isinstance(account, str) and account else None
 
 
-def binding_hold(workspace: Path, now: Optional[float] = None) -> Optional[dict]:
+def launch_model(workspace: Path, config_dir: Optional[str]) -> Optional[str]:
+    return qa.seat_model(qa.SeatEnv(True, None, config_dir), Path(workspace))
+
+
+def binding_hold(workspace: Path, now: Optional[float] = None,
+                 identity: Optional[tuple] = None) -> Optional[dict]:
     """The hold in force that would stop the next launch, else None. Read-only.
-    A hold the owner switched away from (another model family or account) does not bind."""
+    A hold the owner switched away from (another model family or account) does not bind.
+    `identity` is a (model, account) the caller already read, as launch_identity returns it."""
     hold = active_hold(workspace, now)
     if hold is None:
         return None
-    model, account = launch_identity(workspace)
+    model, account = launch_identity(workspace) if identity is None else identity
     return hold if _binds(hold, model, account) else None
 
 
@@ -640,7 +632,8 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
     if quota is None and not seat:
         rec = qa.read_quota_record(workspace, now)
         quota = rec.payload if rec else None
-    own = () if seat else (record_evidence(quota, now), transcript_evidence(projects_dir, now))
+    own = () if seat else (record_evidence(qa.trusted_record(quota), now, launch_account),
+                           transcript_evidence(projects_dir, now))
     found = [lim for lim in (*own, *evidence) if _relevant(lim, launch_model, since)]
     limit = max(found, key=lambda lim: lim.at) if found else None
     seen = hold.get("evidence_at") if hold else None
@@ -658,6 +651,8 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
             "until": _hold_until(limit, strikes, now), "strikes": strikes,
             "account": launch_account, "account_at": since,
         }
+        if not launch_account:
+            new["account_unread"] = True
         if seat:
             new.update(seat=seat, seat_label=seat_label or seat)
         new["reason"] = status_line(new)

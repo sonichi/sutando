@@ -515,6 +515,19 @@ class EdgePaths(unittest.TestCase):
         lim = clh.record_evidence(rec, now)
         self.assertEqual((lim.kind, lim.reset_at), ("rate-limit", now - 1 + 90))
 
+    def test_a_late_429_from_another_account_is_not_this_seats_limit(self):
+        now, a, b = 1_800_000_000.0, "a" * 16, "b" * 16
+        rec = dict(limited_record(now), account=f"acct_{a[:6]}")
+        rec["recent_rejections"][0]["account"] = f"acct_{a[:6]}"
+        self.assertIsNotNone(clh.record_evidence(rec, now, a), "the record's own account")
+        self.assertIsNone(clh.record_evidence(rec, now, b), "A's 429 landed after the seat switched to B")
+        rec["account"] = f"acct_{b[:6]}"
+        self.assertIsNone(clh.record_evidence(rec, now), "B's record: A's late 429 is not in its ledger")
+        self.assertIsNone(clh.record_evidence(limited_record(now), now, b), "unbound: not this known seat's")
+        self.assertIsNotNone(clh.record_evidence(limited_record(now), now), "the seat's account unknown: as before")
+        rec["account"] = f"acct_{a[:6]}"
+        self.assertIsNone(clh.record_evidence(rec, now), "labeled, but the seat's account is unread: diagnostic only")
+
     def test_transcript_unreadable_and_odd_lines(self):
         now = time.time()
         proj = self.ws / "projects"
@@ -742,7 +755,15 @@ class AccountChange(unittest.TestCase):
         self.cfg = self.ws / "claude-config"
         self.cfg.mkdir()
         self.now = time.time()
-        (self.ws / "state" / "quota-state.json").write_text(json.dumps(limited_record(self.now)))
+        (self.ws / "state" / "quota-state.json").write_text(json.dumps(self.a_record(self.now)))
+
+    def a_record(self, now: float) -> dict:
+        """Account A's refusal, labeled by the proxy with the account its request was sent with."""
+        label = clh.qa.account_label(clh.account_digest(
+            {"accountUuid": "acct-a", "organizationUuid": "org-acct-a", "emailAddress": "a@example.com"}))
+        rec = dict(limited_record(now), account=label)
+        rec["recent_rejections"] = [dict(r, account=label) for r in rec["recent_rejections"]]
+        return rec
 
     def tearDown(self):
         self.td.cleanup()
@@ -836,7 +857,7 @@ class AccountChange(unittest.TestCase):
                          "a launch with no hold must still leave its account on record")
         self.assertIsNone(clh.active_hold(self.ws))
         self.assertIsNone(clh.binding_hold(self.ws))
-        quota.write_text(json.dumps(limited_record(time.time())))     # A is refused; the core dies
+        quota.write_text(json.dumps(self.a_record(time.time())))     # A is refused; the core dies
         self.sign_in("acct-b", "b@example.com")                       # the owner signs in to B
         self.assertEqual(self.gate(), 0, "account A's limit held account B, which had quota")
         self.assertIsNone(clh.active_hold(self.ws))
@@ -848,7 +869,7 @@ class AccountChange(unittest.TestCase):
         quota.unlink()
         self.sign_in("acct-a", "a@example.com")
         self.assertEqual(self.gate(), 0)
-        quota.write_text(json.dumps(limited_record(time.time())))
+        quota.write_text(json.dumps(self.a_record(time.time())))
         self.assertEqual(self.gate(), clh.HOLD_EXIT, "the account that hit the limit is the one held")
         self.assertEqual(clh.read_hold(self.ws)["account"], clh.account_fingerprint(str(self.cfg)))
 
@@ -922,9 +943,17 @@ class AccountChange(unittest.TestCase):
         (self.cfg / ".claude.json").write_text(json.dumps({"oauthAccount": {}}))
         self.assertEqual(self.gate(), clh.HOLD_EXIT)
 
-    def test_a_hold_without_an_account_still_binds(self):
-        self.assertFalse(clh.decide(self.ws, self.now).launch)
-        self.assertFalse(clh.decide(self.ws, self.now + 1, launch_account="abc").launch)
+    def test_a_hold_set_while_the_account_was_unread_binds_no_account_read_since(self):
+        t = self.now
+        self.assertTrue(clh.decide(self.ws, t, quota=self.a_record(t)).launch,
+                        "a labeled refusal is diagnostic only while the core's account is unread")
+        self.assertFalse(clh.decide(self.ws, t + 1, quota=limited_record(t)).launch, "an unlabeled one: as before")
+        self.assertTrue(clh.read_hold(self.ws)["account_unread"])
+        self.assertFalse(clh.decide(self.ws, t + 2, quota=limited_record(t)).launch, "still unread: still held")
+        b = clh.account_digest({"accountUuid": "acct-b", "organizationUuid": "org-acct-b", "emailAddress": "b@example.com"})
+        self.assertTrue(clh.decide(self.ws, t + 3, quota=limited_record(t), launch_account=b).launch,
+                        "an account read since is not held by a hold that never knew whose limit it was")
+        self.assertIsNone(clh.active_hold(self.ws, t + 4))
 
     def decide(self, at: float, evidence_at: float, account: str) -> "clh.Decision":
         return clh.decide(self.ws, at, quota=limited_record(at, ago=at - evidence_at), launch_account=account)
