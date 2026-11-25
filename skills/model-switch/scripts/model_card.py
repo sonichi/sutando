@@ -20,7 +20,8 @@ core's CLI takes /model only after the current turn ends. Each tap is one attemp
 "switching" card is posted first, then the switch is started, so its outcome can only come after.
 The detached line always ends in `settle` with the switch's exit code and the attempt's id. `settle`
 saves the outcome in `<workspace>/state/model-card-outcome.json`, then posts it in the same DM:
-"Switched. I'm now using X." or "I could not switch to X. I'm still using Y. <reason>". A post that
+"Switched. I'm now using X.", a pending "Saved, not switched yet" for a Codex seat's pick (exit 12),
+or "I could not switch to X. I'm still using Y. <reason>". A post that
 fails is tried again a few times; an outcome still untold is posted by the next `post` or `reply`
 before its own work. An attempt's posts carry its id as their operation id, an outcome is told once,
 and no retry runs the switch again. `reply` records an attempt before its "switching" card, and an
@@ -43,6 +44,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -53,6 +55,7 @@ for _p in (str(_REPO / "src"), str(_REPO / "skills" / "worker-pool" / "scripts")
         sys.path.insert(0, _p)
 
 import agent_card as ac  # noqa: E402
+import codex_core_model  # noqa: E402
 import issued_cards  # noqa: E402
 
 CARD_ID, KIND, TARGET = "core-model-switch", "model", "core"
@@ -63,6 +66,8 @@ HANDLER = "skills/model-switch/scripts/model_card.py reply"
 SWITCH = _HERE / "switch-model.sh"
 MANIFEST = _HERE.parent / "manifest.json"
 CHOICES_KEY = "MODEL_SWITCH_CHOICES"
+# A Codex core's list: this key when set, else the models Codex itself lists (its models_cache.json).
+CODEX_CHOICES_KEY = "MODEL_SWITCH_CODEX_CHOICES"
 NO_CHOICES = "I can't read the list of models (skills/model-switch/manifest.json), so I have no menu to show."
 DEFAULT_NAME = "the default model"
 GONE = "That choice is no longer on my list. Ask me for the model card again."
@@ -86,7 +91,11 @@ REASONS = {1: "the switch could not be locked or recorded",
            7: "the command could not be sent to the core",
            8: "the core did not accept the switch in time",
            9: "the core is running, so its settings were left alone",
-           10: "the model is set for the next start, but the core did not start"}
+           10: "the model is set for the next start, but the core did not start",
+           11: "it is saved, and the core uses it from its next start"}
+# Exit 12: a Codex seat saved the pick; it is not switched until Codex runs a turn on it.
+# Exit 13: no core is running; the pick applies at the next core start.
+PENDING_RC, NEXT_START_RC = 12, 13
 # The detached line: the switch, then always the outcome card with the switch's exit code.
 DETACHED = ('bash "$1" "$2" --confirm --accept-timeout "$3" --state-dir "$4"; '
             '"$5" "$6" --workspace "$7" settle --room "$8" --model "$2" --attempt "$9" --rc $?')
@@ -97,12 +106,39 @@ def _emit(payload: dict, code: int = 0) -> int:
     return code
 
 
-def choices(manifest: Optional[Path] = None) -> list:
-    """[(id, title, slug)] from the skill manifest's MODEL_SWITCH_CHOICES, in its order; [] when it
-    cannot be read. The slug is the id as a card reply may carry it, numbered when another id has it.
-    Left out: an id that is not a model name or is listed twice, and a title no button can carry."""
+@lru_cache(maxsize=1)
+def core_runtime() -> str:
+    """The configured core runtime (`sutando-config.sh core-runtime`), 'claude' when it cannot be read."""
+    try:
+        r = subprocess.run(["bash", str(_REPO / "scripts" / "sutando-config.sh"), "core-runtime"],
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return "claude"
+    return (r.stdout or "").strip() if r.returncode == 0 and (r.stdout or "").strip() else "claude"
+
+
+def codex_home() -> Path:
+    """The Codex core's home (src/codex_core_model.py resolves it)."""
+    return codex_core_model.home(_REPO)
+
+
+def _raw_choices(manifest: Optional[Path]):
     from skill_config import manifest_config
-    raw = manifest_config(manifest or MANIFEST).get(CHOICES_KEY)
+    cfg = manifest_config(manifest or MANIFEST)
+    if core_runtime() != "codex":
+        return cfg.get(CHOICES_KEY)
+    raw = cfg.get(CODEX_CHOICES_KEY)
+    if isinstance(raw, str) and raw.strip():
+        return raw
+    return ";".join(f"{slug}={title}" for slug, title in codex_core_model.choices(codex_home()))
+
+
+def choices(manifest: Optional[Path] = None) -> list:
+    """[(id, title, slug)] from the skill manifest's MODEL_SWITCH_CHOICES (a Codex core: its
+    MODEL_SWITCH_CODEX_CHOICES, else the models Codex lists), in its order; [] when it cannot be read.
+    The slug is the id as a card reply may carry it, numbered when another id has it.
+    Left out: an id that is not a model name or is listed twice, and a title no button can carry."""
+    raw = _raw_choices(manifest)
     out: list = []
     for entry in raw.split(";") if isinstance(raw, str) else []:
         model, _, title = entry.partition("=")
@@ -167,18 +203,23 @@ def name_of(model: Optional[str], picks: Optional[list] = None) -> str:
 
 
 def record(ws: Path) -> dict:
-    """The last switch's record, {} when there is none or it cannot be read."""
+    """The last switch's record for this core's runtime, {} when there is none or it cannot be read.
+    A Codex core's record says `runtime: codex`; a Claude core's says none."""
     try:
         data = json.loads((ws / "state" / "model-switch.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    return data if (data.get("runtime") == "codex") == (core_runtime() == "codex") else {}
 
 
 def current_model(ws: Path) -> dict:
     """{model, name, source, ts}: the model in use by the switch record; model None without one."""
     rec = record(ws)
     model = rec.get("model") if isinstance(rec.get("model"), str) and rec.get("model") else None
+    if rec.get("runtime") == "codex" and rec.get("status") in ("pending", *codex_core_model.NOT_TAKEN):
+        model = codex_core_model.working(rec) or None  # not taken by Codex (yet): the core is on this one
     return {"model": model, "name": name_of(model), "source": "model-switch.json" if model else None,
             "ts": rec.get("ts") if model else None}
 
@@ -187,6 +228,8 @@ def still_using(ws: Path, alias: str) -> str:
     """The model in use after a switch to `alias` failed. A record that names `alias` without the
     CLI's acceptance (the core was down) says what the next start uses, so the one before it stands."""
     rec = record(ws)
+    if rec.get("runtime") == "codex" and rec.get("model") == alias and rec.get("status") in ("pending", *codex_core_model.NOT_TAKEN):
+        return name_of(codex_core_model.working(rec) or None)
     if rec.get("model") == alias and rec.get("accepted") is False:
         return name_of(rec.get("previous") if isinstance(rec.get("previous"), str) else None)
     return current_model(ws)["name"]
@@ -222,6 +265,13 @@ def outcome(ws: Path, alias: str, rc: int) -> tuple:
     """(state, words) for a switch to `alias` that exited `rc`."""
     if rc == 0:
         return "done", f"Switched. I'm now using {name_of(alias)}."
+    if rc == NEXT_START_RC:
+        return "pending", (f"Saved; {name_of(alias)} applies at the next core start. No core is running "
+                           "now, so nothing has switched yet.")
+    if rc == PENDING_RC:
+        return "pending", (f"Saved, not switched yet: I'll try {name_of(alias)} on my next task. Until "
+                           f"Codex has run it I'm still using {still_using(ws, alias)}. I'll tell you "
+                           "here when it has switched, or why it could not.")
     reason = REASONS.get(rc, UNFINISHED)
     return "error", f"I could not switch to {name_of(alias)}. I'm still using {still_using(ws, alias)}. {reason[:1].upper()}{reason[1:]}."
 
@@ -306,7 +356,8 @@ def save_outcome(ws: Path, attempt: str, room: str, alias: str, rc: Optional[int
 
 
 def _outcome_post(ws: Path, attempt: str, room: str, state: str, words: str, core, execute) -> dict:
-    body, card = notice_card(state, "Switched" if state == "done" else "Not switched", words)
+    status = {"done": "Switched", "pending": "Pending"}.get(state, "Not switched")
+    body, card = notice_card(state, status, words)
     return _post(ws, room, body, card, f"model-card:{attempt}:outcome", core=core, execute=execute)
 
 
@@ -325,7 +376,7 @@ def tell(ws: Path, attempt: str, *, core=None, execute=None, now: float) -> dict
             if row.get("superseded") or at + 1 < len(rows):
                 row["superseded"] = True
                 return {"status": "superseded"}
-            if row.get("state") not in ("done", "error"):
+            if row.get("state") not in ("done", "error", "pending"):
                 return {"status": "failed", "why": "that attempt has no outcome yet"}
             out = _outcome_post(ws, attempt, str(row.get("room") or ""), row["state"],
                                 str(row.get("words") or UNFINISHED), core, execute)
@@ -340,7 +391,7 @@ def deliver_owed(ws: Path, *, core=None, execute=None, now: float) -> list:
     """Post the outcome not yet told, one try; the attempts now told. Older untold ones are marked
     superseded on the way and never posted."""
     owed = [str(r["attempt"]) for r in outcomes(ws)
-            if not r.get("told") and not r.get("superseded") and r.get("state") in ("done", "error")]
+            if not r.get("told") and not r.get("superseded") and r.get("state") in ("done", "error", "pending")]
     return [a for a in owed if tell(ws, a, core=core, execute=execute, now=now)["status"] == "posted"]
 
 

@@ -130,7 +130,6 @@ session_runtime() {
 # shell does not necessarily have on PATH: .zprofile is written with the
 # bundled git and python3 but not this one. Put the known install dir on PATH
 # ourselves rather than trusting what we inherited.
-CODEX_INSTALL_BIN="${CODEX_INSTALL_BIN:-$HOME/.npm-global/bin}"
 # `codex` is a node script (#!/usr/bin/env node) and a fresh Mac ships no
 # system node, so the app's bundled runtime must be reachable or every codex
 # invocation dies with "env: node: No such file or directory" (exit 127) —
@@ -138,7 +137,7 @@ CODEX_INSTALL_BIN="${CODEX_INSTALL_BIN:-$HOME/.npm-global/bin}"
 # launch-path.sh owns where the bundled runtime lives; it only appends, so an
 # operator's (or a test harness's) codex or node earlier on PATH keeps winning.
 . "$REPO/src/agent/launch-path.sh"
-sutando_append_launch_path "$REPO" "${CODEX_NODE_BIN:-$(sutando_bundled_node_dir "$REPO")}" "$CODEX_INSTALL_BIN"
+sutando_append_codex_launch_path "$REPO"
 
 # The core can be launched while the app is still installing Codex (observed:
 # engine unpacked at :25, codex landed at :32 of the following minute). Exiting
@@ -283,6 +282,29 @@ CODEX_ARGS=(
   # The checkout's AGENTS.md is larger than Codex's 32 KiB default, which drops its tail.
   -c project_doc_max_bytes=131072
 )
+# The Codex core's own pick (skills/model-switch, src/codex_core_model.py) when this launch sets no
+# SUTANDO_CORE_MODEL: core-only, so the pool's Codex workers, which share CODEX_HOME, keep theirs.
+# CODEX_CORE_MODEL_WORKING is the last model Codex took, which an app-server launch starts on.
+unset SUTANDO_CORE_MODEL_REV CODEX_CORE_MODEL_WORKING
+if [ -n "$(heartbeat_python)" ]; then
+  _model_ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
+  _model_line=""
+  if [ -n "$_model_ws" ]; then
+    _model_line="$("$(heartbeat_python)" "$REPO/src/codex_core_model.py" launch --state-dir "$_model_ws/state" 2>/dev/null || true)"
+  fi
+  if [[ "$_model_line" =~ ^([0-9]+)\ ([^ ]+)\ ([^ ]+)$ ]]; then
+    if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
+      SUTANDO_CORE_MODEL_REV="${BASH_REMATCH[1]}"  # an explicit model outranks a pick saved before it
+    else
+      [ "${BASH_REMATCH[3]}" = "-" ] && CODEX_CORE_MODEL_WORKING="" || CODEX_CORE_MODEL_WORKING="${BASH_REMATCH[3]}"
+      if [ "${BASH_REMATCH[2]}" != "-" ]; then
+        SUTANDO_CORE_MODEL="${BASH_REMATCH[2]}"
+        echo "  ✓ Codex core model: $SUTANDO_CORE_MODEL (the core's last switch, $_model_ws/state/model-switch.json)"
+      fi
+    fi
+  fi
+  unset _model_ws _model_line
+fi
 if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   CODEX_ARGS+=(-m "$SUTANDO_CORE_MODEL")
 fi
@@ -574,15 +596,31 @@ ensure_local_agent_api() {
 ensure_local_agent_api
 
 # >>> codex-app-server-seat
+# Unset for this launch, the persisted choice decides: on by default, off when the app's toggle,
+# `sutando-config.sh codex-app-server-select off` or core.codex_app_server=false says so. A set
+# value overrides it. Without tmux, without the seat's files, or when the choice cannot be read,
+# the TUI runs as before.
+# CODEX_SEAT_ON is this launch's resolved mode, never exported (unset first drops an inherited
+# export); SUTANDO_CODEX_APP_SERVER stays the caller's override only and is never assigned here.
+unset CODEX_SEAT_ON
+CODEX_SEAT_ON=""
+case "${SUTANDO_CODEX_APP_SERVER:-}" in
+  1) CODEX_SEAT_ON=1 ;;
+  "")
+    if tmux_available && [ -f "$REPO/src/agent/codex/app-server/seat-launch.sh" ] \
+       && [ "$(bash "$REPO/scripts/sutando-config.sh" codex-app-server 2>/dev/null)" = 1 ]; then
+      CODEX_SEAT_ON=1
+    fi ;;
+esac
 # A core last started as an app-server seat (its declaration exists): --restart replaces that
-# window too, whichever way SUTANDO_CODEX_APP_SERVER is set now.
+# window too, whichever mode this launch resolved.
 if [ "${1:-}" = "--restart" ] && tmux_available; then
   _seat_ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || _seat_ws=""
   if [ -n "$_seat_ws" ] && [ -f "$_seat_ws/state/codex-seat/$SESSION/host.json" ]; then
     for _win in $(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" all codex-seat 2>/dev/null); do
       tmux -S "$TMUX_SOCKET" kill-window -t "$_win" 2>/dev/null || true
     done
-    [ "${SUTANDO_CODEX_APP_SERVER:-}" = 1 ] || rm -f "$_seat_ws/state/codex-seat/$SESSION/host.json"
+    [ "$CODEX_SEAT_ON" = 1 ] || rm -f "$_seat_ws/state/codex-seat/$SESSION/host.json"
   fi
 fi
 # <<< codex-app-server-seat
@@ -629,10 +667,10 @@ codex_core_missing() {
 }
 
 # >>> codex-app-server-seat
-# SUTANDO_CODEX_APP_SERVER=1: the core is a seat on `codex app-server` (docs/codex-core.md), with
+# CODEX_SEAT_ON=1: the core is a seat on `codex app-server` (docs/codex-core.md), with
 # no notifier or observer session beside it. Unset, nothing below this block changes.
 SEAT_MODE=""
-if [ "${SUTANDO_CODEX_APP_SERVER:-}" = 1 ]; then
+if [ "$CODEX_SEAT_ON" = 1 ]; then
   SEAT_MODE=1
   . "$REPO/src/agent/codex/app-server/seat-launch.sh"
   seat_core_overrides

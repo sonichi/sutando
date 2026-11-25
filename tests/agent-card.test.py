@@ -553,6 +553,20 @@ class Issued(unittest.TestCase):
             self.assertEqual([owner_of(x) for x in ("s_dspace", "primary", "gone", "")],
                              ["@second:s.space", OWNER, "", "@fallback:s.space"])
 
+    def test_a_card_with_no_lane_is_the_legacy_connection_s_owner(self):
+        # A core on the env (legacy) connection has `instance: ""`, and its cards record no lane:
+        # a tap on one must reach that row's owner, also through `agent_card.py click` (no default).
+        rows = [{"instance": "", "owner_mxid": OWNER},
+                {"instance": "", "owner_mxid": "@worker-owner:s.space", "worker": "w1"},
+                {"instance": "s-space-1", "owner_mxid": "@other:s.space", "worker": "w2"}]
+        with mock.patch("connections.read_rows", lambda ws=None: rows):
+            self.assertEqual(ac.lane_owner(self.ws)(""), OWNER)
+            self.assertEqual(ac.lane_owner(self.ws, "@fallback:s.space")(""), OWNER)
+            self.assertEqual(ac.lane_owner(self.ws, "@fallback:s.space")("s-space-1"), "", "a worker row owns no card")
+        with mock.patch.dict(sys.modules, {"connections": None}):
+            self.assertEqual(ac.lane_owner(self.ws, "@fallback:s.space")(""), "@fallback:s.space")
+            self.assertEqual(ac.lane_owner(self.ws, "@fallback:s.space")("s_dspace"), "")
+
     def test_a_newer_card_with_the_same_id_replaces_the_older_record(self):
         done = a_card(state="done")[1]
         self.assertFalse(issued_cards.record(self.ws, "$done", done, room=DM, now=1002.0))
@@ -654,6 +668,25 @@ class Dispatch(Issued):
         self.assertEqual((rc, out["status"], out["say"]), (1, "forged_or_stale_click", ac.UNMATCHED_CLICK))
         rc, out = self.run_click(self.TEXT, user_id="@member:s.space")
         self.assertEqual((rc, out["status"]), (1, "forged_or_stale_click"))
+
+    def test_a_tap_on_a_card_posted_on_the_legacy_connection_is_its_command(self):
+        # 2026-11-22 VM: a Codex core on the env connection (instance "") posted the model card with
+        # lane ""; the owner's tap came back "I couldn't match that button" (owner not known).
+        issued_cards.record(self.ws, "$legacy", {**self.card, "id": "legacy"}, room=DM, lane="",
+                            handler=self.HANDLER, now=1000.0)
+        out = io.StringIO()
+        path = self.ws / "task.txt"
+        h = {"access_tier": "owner", "user_id": OWNER, "channel_kind": "dm", "channel_id": DM,
+             "reply_to_event": "$legacy"}
+        path.write_text("\n".join(["id: task-1", "task_layout: mid"] + [f"{k}: {v}" for k, v in h.items()]
+                                  + [f"card_click: {json.dumps({'card_id': 'legacy', 'action': self.TEXT})}",
+                                     f"task: {self.TEXT}", "source: ag2space"]) + "\n")
+        with contextlib.redirect_stdout(out), \
+                mock.patch("connections.read_rows", lambda ws=None: [{"instance": "", "owner_mxid": OWNER}]), \
+                mock.patch.object(issued_cards.time, "time", lambda: 1001.0):
+            rc = ac.main(["click", "--task-file", str(path), "--workspace", str(self.ws)])
+        self.assertEqual((rc, json.loads(out.getvalue())),
+                         (0, {"status": "command", "card": "worker-approval", "run": self.HANDLER}))
 
     def test_a_handler_that_is_not_a_skill_script_is_not_printed(self):
         issued_cards.record(self.ws, "$odd", {**self.card, "id": "odd"}, room=DM, lane="s_dspace",

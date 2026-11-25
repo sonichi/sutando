@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # switch-model.sh <model> [--dry-run] [--confirm] [--offline] [--accept-timeout S] [--picker-dismiss-after S] [--state-dir DIR] [--brain DIR] [--session NAME] [--socket PATH] [--launcher PATH]
-# Sends /model through the shared sender and records only after the CLI accepts THAT model; settings.json is the CLI's to write.
+# Claude core: sends /model through the shared sender and records only after the CLI accepts THAT model; settings.json is the CLI's to write.
+# Codex core: records the pick core-only (src/codex_core_model.py) for the seat's next turn or the TUI's next start; pool workers keep theirs.
 set -u
 MODEL=""; DRY=""; OFFLINE=""; STATE_DIR=""; BRAIN=""; DESCF=""; SESSION="${SUTANDO_TMUX_SESSION:-}"; SOCK="${SUTANDO_TMUX_SOCKET:-}"; CONFIRM=""; ACCEPT_TIMEOUT=20; DISMISS_AFTER=""; LAUNCHER=""; RELAUNCH=""
 while [ $# -gt 0 ]; do case "$1" in
@@ -13,10 +14,23 @@ esac; shift; done
 [ -n "$MODEL" ] || { echo "usage: switch-model.sh <model> [--dry-run]" >&2; exit 2; }
 REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
 PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin)"
-# The names /model may be given are src/claude_model_switch.py's, shared with ag2-sparrow's claude-local.
-NAMES="$("$PY" "$REPO/src/claude_model_switch.py" model-pattern)" || { echo "switch-model: the model rules could not be read" >&2; exit 2; }
-if ! printf '%s' "$MODEL" | grep -Eq -- "$NAMES"; then
-  echo "switch-model: refused '$MODEL' — not a model alias or claude-* id" >&2; exit 2
+# The runtime decides which names are models. Fail closed: a resolver that errors, prints
+# nothing or names a runtime this script does not know is neither — refuse before any record
+# or pane action.
+RUNTIME="$(bash "$REPO/scripts/sutando-config.sh" core-runtime 2>/dev/null)"; RRC=$?
+if [ $RRC -ne 0 ] || [ -z "$RUNTIME" ]; then echo "switch-model: refused — core runtime could not be resolved (rc=$RRC, value='$RUNTIME'); nothing changed" >&2; exit 4; fi
+case "$RUNTIME" in claude|codex) ;; *) echo "switch-model: refused — unrecognized core runtime '$RUNTIME'; nothing changed" >&2; exit 4;; esac
+if [ "$RUNTIME" = codex ]; then
+  # A Codex model slug, never a Claude alias or id: src/codex_core_model.py's rule.
+  if ! "$PY" "$REPO/src/codex_core_model.py" check "$MODEL"; then
+    echo "switch-model: refused '$MODEL' — not a Codex model name (the core runtime is codex)" >&2; exit 2
+  fi
+else
+  # The names /model may be given are src/claude_model_switch.py's, shared with ag2-sparrow's claude-local.
+  NAMES="$("$PY" "$REPO/src/claude_model_switch.py" model-pattern)" || { echo "switch-model: the model rules could not be read" >&2; exit 2; }
+  if ! printf '%s' "$MODEL" | grep -Eq -- "$NAMES"; then
+    echo "switch-model: refused '$MODEL' — not a model alias or claude-* id" >&2; exit 2
+  fi
 fi
 # Defaults come from the configured core's runtime descriptor (brain, socket,
 # session — runtime-authored, foreign-caller safe), never from ambient env.
@@ -35,6 +49,9 @@ CFG="$BRAIN/settings.json"
 [ -n "$SESSION" ] || SESSION="${DSESSION:-sutando-core}"
 [ -n "$STATE_DIR" ] || STATE_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)/state"
 [ -n "$LAUNCHER" ] || LAUNCHER="$REPO/src/agent/start-cli.sh"
+if [ -n "$DRY" ] && [ "$RUNTIME" = codex ]; then
+  echo "dry-run: would record model=$MODEL for the Codex core in $STATE_DIR/model-switch.json (core-only; the shared Codex home and the pool workers are untouched), seat/TUI looked up as tmux -S $SOCK -t $SESSION"; exit 0
+fi
 if [ -n "$DRY" ]; then
   echo "dry-run: would record $STATE_DIR/model-switch.json (previous read from $CFG), send '/model $MODEL' to tmux -S $SOCK -t $SESSION (python: $PY)"; exit 0
 fi
@@ -43,16 +60,31 @@ fi
 LOCK="$STATE_DIR/.model-switch.lock"; mkdir -p "$STATE_DIR" 2>/dev/null
 if ! { exec 9>"$LOCK"; } 2>/dev/null; then echo "switch-model: could not open the switch lock ($LOCK) — nothing changed" >&2; exit 1; fi
 "$PY" -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX)' || { echo "switch-model: could not take the switch lock — nothing changed" >&2; exit 1; }
-# Claude Code only: /model and the settings.json pin are its. The Codex core takes
-# its model at launch (codex -m from SUTANDO_CORE_MODEL), so the fix there is a restart.
-# Fail closed on the runtime gate: a resolver that errors, prints nothing or
-# names a runtime this script does not know is not "claude" — refuse before
-# any record or pane action.
-RUNTIME="$(bash "$REPO/scripts/sutando-config.sh" core-runtime 2>/dev/null)"; RRC=$?
-if [ $RRC -ne 0 ] || [ -z "$RUNTIME" ]; then echo "switch-model: refused — core runtime could not be resolved (rc=$RRC, value='$RUNTIME'); nothing changed" >&2; exit 4; fi
-case "$RUNTIME" in claude|codex) ;; *) echo "switch-model: refused — unrecognized core runtime '$RUNTIME'; nothing changed" >&2; exit 4;; esac
+# A Codex core: its pick is core-only, kept in the switch record (src/codex_core_model.py), never in
+# the shared CODEX_HOME's config.toml, which the pool's Codex workers read too. Who applies it:
+# - the core's app-server seat: passes it as `model` on its next turn/start (seat.py), so it holds
+#   from the next task; recorded pending until Codex runs that turn (exit 12: pending, not switched);
+# - the Codex TUI: nothing typed into it; its launcher starts it with `-m` from the record, so it
+#   holds from the core's next start (exit 11: saved, the running core keeps its model until then);
+# - no core running: the same, from its next launch (exit 13: saved, pending the next core start).
 if [ "$RUNTIME" = "codex" ]; then
-  echo "switch-model: refused — the configured core runtime is codex; its model is a launch argument: SUTANDO_CORE_MODEL=$MODEL bash src/agent/codex/cli/start-cli.sh --restart (owner-gated restart). Nothing changed." >&2; exit 4
+  # shellcheck source=../../../src/agent/core-window.sh
+  . "$REPO/src/agent/core-window.sh"
+  WHERE=down
+  if _ids="$(sutando_core_window_ids "$SOCK" "$SESSION" live codex-seat)" && [ -n "$_ids" ]; then WHERE=seat
+  elif _ids="$(sutando_core_window_ids "$SOCK" "$SESSION" live codex)" && [ -n "$_ids" ]; then WHERE=tui
+  fi
+  if [ "$WHERE" = seat ]; then
+    OUT="$("$PY" "$REPO/src/codex_core_model.py" save --state-dir "$STATE_DIR" --model "$MODEL" --applied next-turn)"
+  else
+    OUT="$("$PY" "$REPO/src/codex_core_model.py" save --state-dir "$STATE_DIR" --model "$MODEL" --applied next-start)"
+  fi
+  case "$OUT" in OK*) ;; *) echo "switch-model: could not record the Codex core's model ($STATE_DIR): ${OUT#FAILED }; nothing changed" >&2; exit 1;; esac
+  case "$WHERE" in
+    seat) echo "switch-model: pending model=$MODEL (was ${OUT#OK }): saved, not switched yet; the Codex core's app-server seat tries it on its next task and says when Codex has taken or refused it; until then it stays on ${OUT#OK }; pool workers keep their own model; record: $STATE_DIR/model-switch.json" >&2; exit 12;;
+    tui) echo "switch-model: saved model=$MODEL (was ${OUT#OK }) for the Codex core's next start; the running Codex TUI keeps its model until then (owner-gated restart: bash src/agent/codex/cli/start-cli.sh --restart); pool workers keep their own model; record: $STATE_DIR/model-switch.json" >&2; exit 11;;
+    *) echo "switch-model: saved model=$MODEL (was ${OUT#OK }); applies at the next core start (no Codex core is running), not switched yet; pool workers keep their own model; record: $STATE_DIR/model-switch.json" >&2; exit 13;;
+  esac
 fi
 # The launcher's own test for a running core: a `claude` process named for the session. A `pgrep -f`
 # also matched the tmux server, whose argv keeps the command that created the session.
@@ -146,7 +178,7 @@ print(f"{prev or ''}\t{src}")
 PYEOF
 )"; PREV="${PREVLINE%%	*}"; PREV_SRC="${PREVLINE#*	}"
 # Baseline the acceptance lines for THIS model already on screen, so a stale one cannot pass as new.
-BASE="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --count)"; BRC=$?
+BASE="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --count)"; BRC=$?
 case "$BRC:$BASE" in 0:[0-9]*) ;; *) echo "switch-model: could not read the core pane before sending (rc=$BRC, '$BASE'); nothing sent, nothing recorded" >&2; exit 7;; esac
 # Attribute any picker this send leaves on screen to us, so the supervisor may Esc it later (CLI > env > manifest).
 [ -n "$DISMISS_AFTER" ] || DISMISS_AFTER="${MODEL_SWITCH_PICKER_DISMISS_AFTER_S:-$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["config"]["MODEL_SWITCH_PICKER_DISMISS_AFTER_S"])' "$REPO/skills/model-switch/manifest.json" 2>/dev/null)}"
@@ -161,12 +193,12 @@ elif [ "$SEND_RC" != 0 ]; then
   "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION"; echo "switch-model: send failed; nothing recorded" >&2; exit 7
 fi
 CONFIRMED=false
-VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT")"
+VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT")"
 case "$VERDICT" in
   ACCEPTED) "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION";;
   DIALOG)
     if [ -n "$CONFIRM" ]; then
-      VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT" --answer-enter)"; ANSWER_RC=$?
+      VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT" --answer-enter)"; ANSWER_RC=$?
       case "$ANSWER_RC" in
         0|11) CONFIRMED=true;;
         125) "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"

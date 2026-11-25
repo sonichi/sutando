@@ -498,11 +498,12 @@ and started a second core beside the desktop's, both reading one task inbox. A
 switch aimed at any other socket is not the desktop's core, so it leaves the
 desktop's `coreRuntime` unchanged.
 
-## Running on `codex app-server` (experimental, off by default)
+## Running on `codex app-server` (the default)
 
-By default the Codex core and each Codex pool worker are a Codex TUI in tmux, and a notifier
-types every task into it. With `SUTANDO_CODEX_APP_SERVER=1` in the launcher's environment the
-same tmux session holds a seat process instead (`src/agent/codex/app-server/seat.py`). The seat:
+By default the Codex core and each Codex pool worker are a seat process on `codex app-server`
+(`src/agent/codex/app-server/seat.py`) in their tmux session. With the choice turned off (below)
+each is a Codex TUI in tmux instead, and a notifier types every task into it. A host without
+tmux, or a launch that cannot read the choice, runs the TUI. The seat:
 
 - owns one `codex -c … app-server --listen stdio://` child and one durable thread. The thread id is
   kept in `<workspace>/state/codex-seat/<tmux session>/thread`, and a restart resumes it.
@@ -575,8 +576,12 @@ Not supported under the flag yet:
 - Typing into the panel, and Codex slash commands. The panel is read-only.
 - Status and cards read from the pane: the runtime observation record, the core monitor's
   prompt classification, limit and sign-in cards, pool wedge detection.
-- Switching the model without a restart.
 - Delivering a task into a running turn (`turn/steer`). Tasks wait for the turn to end.
+
+Switching the core's model from the conversation (`skills/model-switch`) reaches the core seat
+without a restart: the seat passes the recorded model on its next `turn/start`. The pick is core-only
+(`<workspace>/state/model-switch.json`, `runtime: codex`), so pool workers keep their own model; a
+Codex TUI core takes it at its next start, when the launcher passes it as `-m`.
 
 The launch settings are carried over: `danger-full-access`, approvals `never`, the model, the
 working directory, and every `-c` override of the TUI launch, the worker's s-space MCP entry
@@ -584,15 +589,46 @@ included. `--search` becomes `-c web_search="live"`. `--add-dir` and the bootstr
 prompt have no counterpart; a worker's boot prompt becomes the thread's developer
 instructions. None of this has been run against a real Codex login yet.
 
-To turn it on, set `SUTANDO_CODEX_APP_SERVER=1` and restart from outside the core:
+It is on unless turned off. To change it for every later launch, record the choice and restart
+from outside the core:
 
 ```bash
-SUTANDO_CODEX_APP_SERVER=1 bash src/agent/start-cli.sh --restart
+bash scripts/sutando-config.sh codex-app-server-select off   # the interactive TUI; `on` to go back
+bash src/agent/start-cli.sh --restart
 ```
 
-To turn it off, run the same restart without the variable; the seat's window is replaced by
-the TUI and the notifier and observer sessions come back. A pool worker picks the flag up
-when it is spawned, from the environment of the process that spawns it.
+In the AG2 Space app the same choice is the "Run Codex as a background service (app-server)"
+toggle on the Sutando core's settings row, which restarts the core for you. The choice lives in
+the desktop's `runtime.json` (`codexAppServer`) on a desktop install, else in
+`core.codex_app_server` of `<workspace>/sutando.config.local.json`;
+`bash scripts/sutando-config.sh codex-app-server` prints the resolved `1` or `0`.
+`codex-app-server-select` prints `updated` when it wrote the key and `unchanged` when the stored key
+already held that value. It compares the stored key, not the resolved value: on an install with
+nothing stored, `select on` writes the key and prints `updated` even though the default was on.
+Engine writers of `runtime.json` take one cross-process lock (`runtime.json.lock`) around each
+read-merge-replace, and replace only while the file still holds what they read: a desktop write
+landing in between is re-read and merged rather than dropped. That narrows, but cannot close, the
+window against a writer that skips the lock, so the desktop's own writer should take the same lock
+file. The workspace layer (`sutando.config.local.json`) is written the same way under its own lock.
+Nothing recorded means on. `SUTANDO_CODEX_APP_SERVER` set non-empty overrides the choice for one
+launch (`1` on, anything else off): `SUTANDO_CODEX_APP_SERVER=0 bash src/agent/start-cli.sh --restart`
+starts the TUI once.
+
+Turned off, the next restart replaces the seat's window with the TUI and brings the notifier
+and observer sessions back. A pool worker reads the same choice, through the same resolver, when
+it is spawned, unless the environment of the process that spawns it sets the variable. A seat's
+session is marked `SUTANDO_CODEX_SEAT=1`, not with the variable, so a worker spawned by a running
+seat core follows the choice saved since, not the mode the core started in.
+
+A seat reopens task intake (clears the shutdown sentinel) only once `seat.py` reports ready, its
+app-server initialized and its thread open (`state/codex-seat/<session>/ready`). If that does not
+happen within `SUTANDO_SEAT_READY_TIMEOUT` seconds (60), or the seat exits first, the launcher
+stops that seat (its session, or the healed window), the launch fails and intake stays shut, so the
+next launch starts a seat and checks readiness again instead of finding a half-started one. The seat
+is stopped by the tmux id its creation returned, never a name or index. If that stop cannot be confirmed
+(the kill fails, or tmux cannot be read), the launch fails loudly and marks intake held for that seat
+(`intake-held`); a later launch that finds it running accepts it only once it reports ready, and only
+then reopens intake.
 
 ## Rollback
 

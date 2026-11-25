@@ -74,7 +74,10 @@ exit 0
                         "SUTANDO_PY": sys.executable, "DO_NOT_TRACK": "1",
                         "SUTANDO_TMUX_SOCKET": str(cls.socket), "SUTANDO_TMUX_SESSION": cls.session,
                         "SUTANDO_HOST_LABEL": "receipt-fixture", "TEST_TMUX_LOG": str(cls.tmux_log),
-                        "TEST_CORE_MARK": str(cls.core_mark)})
+                        "TEST_CORE_MARK": str(cls.core_mark),
+                        # The Codex TUI core these helpers serve; the app-server seat (on by
+                        # default) runs no notifier or observer for them to manage.
+                        "SUTANDO_CODEX_APP_SERVER": "0"})
 
     @classmethod
     def tearDownClass(cls):

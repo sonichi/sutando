@@ -416,10 +416,43 @@ place to point an owner who wants to switch by hand.
 Types `/model <name>` into the live `sutando-core` pane through the shared sender, waits for the CLI
 to accept it, and only then records `<workspace>/state/model-switch.json` (with the previous model).
 A warm core asks to confirm first; `--confirm` (on an owner instruction) answers it, otherwise the
-dialog is cancelled. Refuses when the input box carries text or on a Codex runtime. It never writes
-`settings.json`: Claude Code's `/model` persists the choice itself. Exit 2 = name refused; 3 = no live
-pane; 4 = Codex runtime; 5 = input box busy; 6 = confirm dialog not confirmed; 8 = no acceptance seen.
+dialog is cancelled. Refuses when the input box carries text. It never writes
+`settings.json`: Claude Code's `/model` persists the choice itself. On a Codex core the pick is
+recorded core-only (`runtime: codex` in the same record, never the shared Codex home's `config.toml`,
+so pool workers keep their own model): an app-server seat uses it from its next task, a Codex TUI from
+its next start (exit 11). Exit 2 = name refused (a Claude name on a Codex core too); 3 = no live
+pane; 4 = runtime unresolved; 5 = input box busy; 6 = confirm dialog not confirmed; 8 = no acceptance
+seen; 11 = Codex TUI, saved for its next start.
 The capability lives in `skills/model-switch/`.
+
+## Which account the core is on
+
+Triggers: "which account are you on", "what account is Codex signed in to", "whose login is this",
+and before saying an account switch took effect. `codex login status` only says "Logged in using
+ChatGPT"; do not answer from it. On a Codex core run:
+
+```bash
+python3 src/codex_account.py --task-file <task file>              # the core's Codex home: "signed in as <email>, <plan> plan"
+python3 src/codex_account.py --task-file <task file> --json       # {codex_home, email, plan, workspace, kind, source, verified}
+python3 src/codex_account.py --task-file <task file> --codex-home <dir>   # a worker's own Codex home, when it has one
+```
+
+Always pass the asking task's `--task-file`: the account is the owner's data, so it is looked up only
+for a task whose envelope verifies (`task_envelope`) and whose attested headers say the owner sent it from the owner's checked DM (the same test the
+owner's card taps pass). Anything else, including a task with no tier, a voice or local task, or one
+whose origin cannot be checked, exits 3: answer in the owner's DM instead, and post nothing about it in
+the room. The lookup runs Codex on a private copy of the home's sign-in, so the running core's home is
+never written. The home is the one the Codex core
+launcher uses, with the same checks; a home it would refuse is reported, not read. It asks Codex
+itself (`account/read` on a short-lived `codex app-server`); `verified` is true only when Codex names
+an account. Codex naming none proves nothing (the copy cannot reach a sign-in kept in the keyring), so
+it then reads the email and plan claims of the home's `auth.json` id_token, and `verified` is false:
+say the answer comes from the saved sign-in and was not confirmed. When neither names an account,
+`verified` is null and it exits 1: say you found no sign-in, not that Codex is signed out. Codex is
+found on the launcher's own PATH (`src/agent/launch-path.sh --codex-path`), so the desktop's
+`cli/codex/bin` copy is used. It prints only the email, plan, workspace and login kind, never a token,
+and never print or quote `auth.json` yourself. Pool Codex workers run under the core's home today, so
+the core's answer is theirs too.
 
 ## Check quota
 
