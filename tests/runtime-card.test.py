@@ -1652,5 +1652,191 @@ class Restart(unittest.TestCase):
                 self.assertTrue(rtc.desktop_hosted())
 
 
+
+class Readers(unittest.TestCase):
+    """The small readers on their own: each one's unreadable branch answers instead of raising."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = Path(tmp.name)
+        (self.ws / "state").mkdir()
+
+    def test_runtime_and_the_next_start_when_config_cannot_be_read(self):
+        import sutando_config
+        with mock.patch.object(sutando_config, "resolve_core_runtime", return_value="codex"):
+            self.assertEqual(rtc.runtime(), "codex")
+        with mock.patch.object(sutando_config, "resolve_core_runtime", side_effect=RuntimeError("x")), \
+                mock.patch.dict(os.environ, {"SUTANDO_CORE_RUNTIME": "claude"}):
+            self.assertEqual(rtc.runtime(), "claude")
+            self.assertEqual(rtc.configured_runtime(), "")
+            self.assertEqual(os.environ["SUTANDO_CORE_RUNTIME"], "claude", "the caller's own value is put back")
+        with mock.patch.object(sutando_config, "desktop_runtime_selection_path", side_effect=RuntimeError("x")):
+            self.assertFalse(rtc.desktop_hosted())
+
+    def test_a_confirmed_record_needs_a_known_runtime_and_a_numeric_start(self):
+        path = self.ws.joinpath(*rtc.RECORD)
+        for rec in ({"runtime": "gemini", "started_at": 1.0}, {"runtime": "codex", "started_at": True}):
+            path.write_text(json.dumps(rec))
+            self.assertEqual(rtc.confirmed_record(self.ws), {}, rec)
+
+    def test_a_sign_in_probe_that_breaks_proves_nothing(self):
+        with mock.patch.object(account_card, "current", side_effect=RuntimeError("x")):
+            self.assertIsNone(rtc.signed_in("codex"))
+
+    def test_the_core_lane_helpers(self):
+        pp = mock.Mock()
+        pp.core_lane.return_value = CORE
+        pp.core_actions.return_value = (mock.Mock(execute="EXEC"),)
+        with mock.patch.dict(sys.modules, {"pool_provision": pp}), \
+                mock.patch.object(connections, "owner_dm", return_value=DM):
+            self.assertEqual(rtc._core(self.ws), CORE)
+            self.assertEqual(rtc._execute(self.ws, "s_dspace"), "EXEC")
+            self.assertEqual(rtc._owner_dm(self.ws, CORE), DM)
+
+    def test_post_and_edit_name_why_nothing_went_out(self):
+        fake = Fake()
+        body, card = rtc.notice_card("info", "x", "words")
+        with mock.patch.object(rtc, "_owner_dm", side_effect=RuntimeError("no lane")):
+            out = rtc._post(self.ws, DM, body, card, "op", core=CORE, execute=fake.execute)
+        self.assertEqual(out, {"status": "failed", "why": "RuntimeError: no lane"})
+        with mock.patch.object(rtc, "_owner_dm", lambda ws, core: DM), \
+                mock.patch.object(rtc.issued_cards, "record", side_effect=OSError("ro")):
+            out = rtc._post(self.ws, DM, body, card, "op", core=CORE, execute=fake.execute)
+        self.assertEqual((out["status"], out["why"]), ("posted", "its buttons will not act (OSError)"))
+        self.assertEqual(rtc._edit(self.ws, DM, "", "w", "op", core=CORE, execute=fake.execute)["why"], "no card to edit")
+        with mock.patch.object(rtc, "_owner_dm", lambda ws, core: DM):
+            out = rtc._edit(self.ws, ROOM, "$e", "w", "op", core=CORE, execute=fake.execute)
+        self.assertEqual(out["why"], "the card is not in the owner's DM")
+
+    def test_a_menu_that_cannot_be_built_posts_nothing(self):
+        out = io.StringIO()
+        with mock.patch.object(rtc, "menu_card", side_effect=ac.CardError("too long")), \
+                contextlib.redirect_stdout(out):
+            rc = rtc.cmd_post(self.ws, mock.Mock(print=False, room=DM, reply_to=""), core=CORE)
+        self.assertEqual((rc, json.loads(out.getvalue())), (1, {"status": "failed", "why": "too long"}))
+
+    def test_a_lease_file_nobody_holds_is_no_waiter(self):
+        rtc._lease_path(self.ws, "a1").write_text("")
+        self.assertFalse(rtc.waiter_alive(self.ws, "a1"))
+
+    def test_restart_core_names_a_timeout_and_a_missing_shell(self):
+        self.assertEqual(rtc.restart_core("codex", run=mock.Mock(side_effect=subprocess.TimeoutExpired("bash", 1))), 124)
+        self.assertEqual(rtc.restart_core("codex", run=mock.Mock(side_effect=OSError("no bash"))), 127)
+
+    def test_a_lock_still_held_at_the_deadline_is_none_even_with_an_unreadable_id(self):
+        lock = self.ws.joinpath(*rtc.RESTART_LOCK)
+        lock.joinpath("rid").mkdir(parents=True)          # unreadable as text
+        ticks = iter([0.0, rtc.DEFER_WAIT_S + 1])
+        self.assertIsNone(rtc.restart_lock_clears(self.ws, sleep=lambda s: None, clock=lambda: next(ticks)))
+
+    def test_why_not_and_the_record_text_reader(self):
+        got = {"record": {"runtime": "codex", "started_at": 1.0}}
+        self.assertEqual(rtc.why_not("claude", got, 0),
+                         "I could not confirm it is running on Claude Code: the last confirmed core runs Codex")
+        self.assertEqual((rtc._record_names("{"), rtc._record_names("[]")), ("", ""))
+
+    def test_running_runtimes_reads_the_core_panes_or_nothing(self):
+        import core_runtime_record
+        with mock.patch.object(core_runtime_record, "pane_runtimes", return_value={"codex"}):
+            self.assertEqual(rtc.running_runtimes(), {"codex"})
+        with mock.patch.object(core_runtime_record, "pane_runtimes", side_effect=OSError("no tmux")):
+            self.assertEqual(rtc.running_runtimes(), set())
+
+    def test_status_without_a_workspace_flag_resolves_it_and_a_broken_resume_is_not_in_the_way(self):
+        import workspace_default
+        out = io.StringIO()
+        with mock.patch.object(workspace_default, "resolve_workspace", return_value=str(self.ws)), \
+                mock.patch.object(rtc, "resume_wait", side_effect=RuntimeError("x")), \
+                mock.patch.object(rtc, "runtime", lambda: "codex"), \
+                mock.patch.object(rtc, "configured_runtime", lambda: "codex"), \
+                mock.patch.object(rtc, "desktop_hosted", lambda: False), contextlib.redirect_stdout(out):
+            rc = rtc.main(["status"])
+        self.assertEqual((rc, json.loads(out.getvalue())["runtime"]), (0, "codex"))
+
+
+class TapEdges(Base):
+    def setUp(self):
+        super().setUp()
+        self.post()
+
+    def test_an_unreadable_task_file_is_refused(self):
+        rc, out = self.run_(["reply", "--task-file", str(self.ws / "missing.txt")])
+        self.assertEqual((rc, out["status"]), (2, "refused"))
+        self.assertIn("unreadable", out["why"])
+
+    def test_no_core_lane_still_reads_the_tap_and_a_foreign_target_is_gone(self):
+        verdict = mock.Mock(command=mock.Mock(target="elsewhere", verb="claude"))
+        path = self.ws / "task.txt"
+        path.write_text(task("Switch the core to Claude Code"))
+        out = io.StringIO()
+        with mock.patch.object(rtc, "_core", side_effect=RuntimeError("no lane")), \
+                mock.patch.object(rtc.ac, "click_verdict", return_value=verdict), \
+                mock.patch.object(rtc.ac, "click_answer", return_value=None), contextlib.redirect_stdout(out):
+            rc = rtc.cmd_reply(self.ws, mock.Mock(task_file=str(path)), popen=self.launch)
+        self.assertEqual((rc, json.loads(out.getvalue())), (2, {"status": "refused", "say": rtc.GONE}))
+
+    def test_a_sign_in_card_whose_event_cannot_be_kept_still_answers(self):
+        self.claude_json = {"loggedIn": False}
+        with mock.patch.object(rtc, "keep_wait_card", side_effect=OSError("ro")):
+            rc, out = self.tap("Switch the core to Claude Code")
+        self.assertEqual((rc, out["status"]), (1, "needs_sign_in"))
+
+    def test_a_started_switch_whose_old_wait_cannot_be_ended_still_starts(self):
+        with mock.patch.object(rtc, "claim_wait", side_effect=OSError("ro")):
+            rc, out = self.tap("Switch the core to Claude Code")
+        self.assertEqual((rc, out["status"]), (0, "started"))
+
+
+class SwitchEdges(Base):
+    def setUp(self):
+        super().setUp()
+        self.post()
+        self.tap("Switch the core to Claude Code")
+        argv = self.launch.calls[0][0]
+        self.attempt = argv[argv.index("--attempt") + 1]
+
+    def switch(self):
+        return self.run_(["switch", "--room", DM, "--runtime", "claude", "--attempt", self.attempt])
+
+    def test_a_switch_already_holding_the_execution_lock_is_not_run_twice(self):
+        from file_lock import try_lock_fd, unlock_fd
+        fd = os.open(str(self.ws.joinpath(*rtc.EXEC_LOCK)), os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, fd)
+        self.assertTrue(try_lock_fd(fd))
+        self.addCleanup(unlock_fd, fd)
+        rc, out = self.switch()
+        self.assertEqual((rc, out["why"]), (2, "another switch is running"))
+        self.assertEqual(self.restarts, [])
+
+    def test_an_attempt_replaced_while_it_waited_for_the_lock_does_nothing(self):
+        with mock.patch.object(rtc, "is_recorded", side_effect=[True, False]):
+            rc, out = self.switch()
+        self.assertEqual((rc, out["why"]), (2, "that attempt is not the one under way"))
+        self.assertEqual(self.restarts, [])
+
+    def test_a_rollback_whose_gateway_did_not_come_back_says_so(self):
+        self.record("codex", T0 - 600)
+
+        def restart(rt):
+            self.restarts.append(rt)
+            self.clock.t += 30
+            if rt == "codex":
+                self.record("codex", self.clock.t - 5)
+                return 0
+            return 1
+        self.restart = restart
+        with mock.patch.object(rtc, "restore_desktop_gateway", lambda run=None: "exit 1"):
+            rc, out = self.switch()
+        self.assertEqual(out["fell_back"], "codex")
+        self.assertIn(rtc.GATEWAY_LOST.format(why="exit 1"), out["say"])
+
+    def test_settle_on_its_own_tells_the_card(self):
+        self.record("claude", T0 + 10)
+        self.selected = "claude"
+        rc, out = self.run_(["settle", "--room", DM, "--runtime", "claude", "--since", str(T0)])
+        self.assertEqual((rc, out["outcome"]), (0, "done"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

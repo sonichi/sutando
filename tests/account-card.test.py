@@ -574,6 +574,38 @@ class Switch(Base):
 class Edges(Base):
     """The failure branches: each says what it could not do and changes nothing it should not."""
 
+    def test_a_use_tap_on_a_claude_core_keeps_no_saved_accounts(self):
+        self.signed_in(A)
+        self.keep(B)
+        self.post()
+        self.RUNTIME = "claude"
+        rc, out = self.tap("Use b…@work.io (pro)")
+        self.assertEqual((rc, out["say"]), (2, acc.NOT_CODEX))
+        self.assertEqual(self.launch.calls, [])
+
+    def test_a_key_no_longer_saved_and_a_restore_that_fails_after_a_failed_write(self):
+        self.signed_in(A)
+        state, words = acc.do_switch(self.ws, "0" * 16)
+        self.assertEqual((state, words), ("error", "I could not switch: that account is no longer saved here. Nothing changed."))
+        self.keep(B)
+        with mock.patch.object(acc, "save_current", side_effect=OSError("ro")), \
+                mock.patch.object(acc, "_restore", side_effect=OSError("ro")):
+            state, words = acc.do_switch(self.ws, key_of("acct-b"), restart=lambda: 0)
+        self.assertIn("could not be written (OSError)", words)
+        self.assertEqual(self.live(), A)
+
+    def test_an_attempt_replaced_while_it_waited_for_the_lock_does_nothing(self):
+        self.signed_in(A)
+        self.keep(B)
+        self.post()
+        self.tap("Use b…@work.io (pro)")
+        argv = self.launch.calls[0][0]
+        attempt = argv[argv.index("--attempt") + 1]
+        with mock.patch.object(acc, "is_recorded", side_effect=[True, False]):
+            rc, out = self.run_(["switch", "--room", DM, "--key", key_of("acct-b"), "--attempt", attempt])
+        self.assertEqual((rc, out["why"]), (2, "that attempt is not the one under way"))
+        self.assertEqual(self.restarts, [])
+
     def test_runtime_codex_home_and_store_resolve_from_config(self):
         import sutando_config
         import codex_account

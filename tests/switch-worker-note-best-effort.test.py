@@ -38,6 +38,14 @@ class NoteIsBestEffort(unittest.TestCase):
             switch_worker.note(rec, "a1", 4242)
         self.assertEqual(json.loads(switch_worker.path(rec).read_text())["pid"], 4242)
 
+    def test_a_worker_on_record_for_another_attempt_is_not_this_ones(self):
+        rec = self.ws / "state" / "x-running.json"
+        rec.parent.mkdir(parents=True)
+        switch_worker.path(rec).write_text(json.dumps({"attempt": "a0", "pid": 1, "start": "Mon 1"}))
+        self.assertFalse(switch_worker.dead(rec, "a1"))
+        switch_worker.path(rec).write_text("[]")
+        self.assertFalse(switch_worker.dead(rec, "a1"))
+
     def _start(self, mod, *args, **kw):
         with mock.patch.object(switch_worker.holder_lock, "start_time", return_value="Mon 1"), \
                 mock.patch.object(switch_worker, "write_whole", side_effect=OSError("disk full")):
