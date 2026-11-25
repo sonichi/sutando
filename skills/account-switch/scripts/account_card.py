@@ -85,6 +85,9 @@ SETTINGS = ("Settings → Connections → the Sutando (on this computer) row →
 NO_CODE = "Never send me a sign-in code or token here."
 GONE = "That account is no longer on my list. Ask me for the account card again."
 BUSY = "An account switch is already under way. I'll confirm here when it has finished."
+# admit()'s answer when the attempt on record had lost its worker: that record is replaced.
+RECOVERED = "recovered"
+STOPPED = "The previous switch stopped before it finished."
 NOT_CODEX = "Saved accounts are kept only for a core on Codex. Add the account in Settings instead."
 # graceful-restart.sh's exit codes, as one short reason the owner reads.
 RESTART_REASONS = {3: "the core could not get ready to restart",
@@ -453,15 +456,18 @@ def executing(ws: Path) -> bool:
 
 
 def admit(ws: Path, rec: dict, now: float) -> bool:
-    """Record `rec` as the one attempt under way; False when another is running. Check and write are
-    one transaction under the record's lock."""
+    """Record `rec` as the one attempt under way; False when another is running, RECOVERED when the one
+    on record had a dead worker. Check and write are one transaction under the record's lock."""
     from file_lock import locked_file
     from local_record import write_whole
+    import switch_worker
     with locked_file(ws.joinpath(*RUNNING_LOCK), create_mode=0o600):
-        if running(ws, now) or executing(ws):
+        prev, busy = running(ws, now), executing(ws)
+        recovered = bool(prev) and not busy and switch_worker.dead(ws.joinpath(*RUNNING), prev["attempt"])
+        if (prev or busy) and not recovered:
             return False
         write_whole(ws.joinpath(*RUNNING), rec)
-    return True
+    return RECOVERED if recovered else True
 
 
 def is_recorded(ws: Path, rec: dict) -> bool:
@@ -489,6 +495,8 @@ def start_switch(ws: Path, room: str, key: str, attempt: str, popen=subprocess.P
         fh.flush()
         proc = popen(argv, cwd=str(_REPO), stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
                      start_new_session=True)
+    import switch_worker
+    switch_worker.note(ws.joinpath(*RUNNING), attempt, int(proc.pid))
     return int(proc.pid)
 
 
@@ -530,13 +538,14 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     attempt = f"{int(t)}-{secrets.token_hex(4)}"
     rec = {"attempt": attempt, "key": verb, "room": room, "ts": t}
     try:
-        if not admit(ws, rec, t):
+        admitted = admit(ws, rec, t)
+        if not admitted:
             return _emit({"status": "say", "say": BUSY})
     except OSError as e:
         return _emit({"status": "failed", "say": "I couldn't start the switch. Nothing changed.",
                       "why": type(e).__name__}, 1)
-    say = (f"Switching the core to {label}. It restarts once this turn has finished; "
-           "I'll confirm here when it is back.")
+    say = (f"{STOPPED} {in_use_words(cur)} " if admitted == RECOVERED else "") + (
+        f"Switching the core to {label}. It restarts once this turn has finished; I'll confirm here when it is back.")
     body, card = notice_card("pending", "Switching", say)
     posted = _post(ws, room, body, card, f"account-card:{attempt}:switching", reply_to=event, core=core or None,
                    execute=execute)

@@ -117,6 +117,9 @@ SIGN_IN_GAVE_UP = ("I stopped waiting for the {name} sign-in after {minutes} min
 CARRIES = "Tasks, memory and the workspace carry over; our current conversation does not."
 GONE = "That choice is no longer on my card. Ask me for the runtime card again."
 BUSY = "A runtime switch is already under way. I'll confirm here when it has finished."
+# admit()'s answer when the attempt on record had lost its worker: that record is replaced.
+RECOVERED = "recovered"
+STOPPED = "The previous switch stopped before it finished."
 
 
 def _emit(payload: dict, code: int = 0) -> int:
@@ -351,14 +354,18 @@ def executing(ws: Path) -> bool:
 
 
 def admit(ws: Path, rec: dict, now: float) -> bool:
-    """Record `rec` as the one attempt under way; False when another is running."""
+    """Record `rec` as the one attempt under way; False when another is running, RECOVERED when the one
+    on record had a dead worker."""
     from file_lock import locked_file
     from local_record import write_whole
+    import switch_worker
     with locked_file(ws.joinpath(*RUNNING_LOCK), create_mode=0o600):
-        if running(ws, now) or executing(ws):
+        prev, busy = running(ws, now), executing(ws)
+        recovered = bool(prev) and not busy and switch_worker.dead(ws.joinpath(*RUNNING), prev["attempt"])
+        if (prev or busy) and not recovered:
             return False
         write_whole(ws.joinpath(*RUNNING), rec)
-    return True
+    return RECOVERED if recovered else True
 
 
 def is_recorded(ws: Path, rec: dict) -> bool:
@@ -402,13 +409,13 @@ FAILED_TO_START = "I couldn't start the switch. Nothing changed."
 
 
 def say_switching(ws: Path, room: str, rt: str, current: str, attempt: str, event: str, *, core=None,
-                  execute=None, new_card: bool = False, before_new_card=None) -> tuple:
+                  execute=None, new_card: bool = False, before_new_card=None, before: str = "") -> tuple:
     """Put "Switching…" on the card at `event`, or on a new card when that one cannot be edited:
     (words, what was posted). One operation id per attempt and route, so asking again returns the same
     card. `before_new_card` is called before the new card is posted, for a caller that puts the route on
     record: when it answers False the route is not on record and nothing is posted. `new_card` goes
     straight to that route, as a caller that finds it on record does."""
-    say = (f"Switching the core from {name(current)} to {name(rt)}. It restarts once this turn has finished; "
+    say = before + (f"Switching the core from {name(current)} to {name(rt)}. It restarts once this turn has finished; "
            f"I'll confirm here when it is back. {CARRIES}")
     op, out = f"runtime-card:{attempt}:switching", {"status": "failed"}
     if event and not new_card:
@@ -435,12 +442,14 @@ def begin_switch(ws: Path, room: str, rt: str, current: str, t: float, *, event:
     attempt = attempt or f"{int(t)}-{secrets.token_hex(4)}"
     rec = {"attempt": attempt, "runtime": rt, "room": room, "ts": t}
     try:
-        if not admit(ws, rec, t):
+        admitted = admit(ws, rec, t)
+        if not admitted:
             return {"status": "say", "say": BUSY}
     except OSError as e:
         return {"status": "failed", "say": FAILED_TO_START, "why": type(e).__name__}
     say, posted = say_switching(ws, room, rt, current, attempt, event, core=core, execute=execute,
-                                new_card=new_card, before_new_card=before_new_card)
+                                new_card=new_card, before_new_card=before_new_card,
+                                before=f"{STOPPED} The core is on {name(current)}. " if admitted == RECOVERED else "")
     # The card that says "Switching" now, whether the tapped one edited in place or a new one posted
     # because it could not be: the worker's outcome and any correction go to that card.
     says = str(posted.get("event_id") or "")
@@ -752,6 +761,8 @@ def start_switch(ws: Path, room: str, rt: str, attempt: str, popen=subprocess.Po
         fh.flush()
         proc = popen(argv, cwd=str(_REPO), stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
                      start_new_session=True, env=detached_env())
+    import switch_worker
+    switch_worker.note(ws.joinpath(*RUNNING), attempt, int(proc.pid))
     return int(proc.pid)
 
 

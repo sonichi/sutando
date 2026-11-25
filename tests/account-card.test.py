@@ -70,6 +70,21 @@ B = auth("bob@work.io", "pro", "acct-b", SECRET_B)
 C = auth("carol@example.org", "team", "acct-c", SECRET_C)
 
 
+def worker_on_record(record: Path, alive: bool) -> None:
+    """The record's attempt, with a worker that still runs (this process) or one that has exited."""
+    import subprocess as sp
+    import holder_lock
+    if alive:
+        pid = os.getpid()
+    else:
+        proc = sp.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        pid = proc.pid
+    attempt = json.loads(record.read_text())["attempt"]
+    record.with_name(record.stem + ".worker.json").write_text(json.dumps(
+        {"attempt": attempt, "pid": pid, "start": holder_lock.start_time(os.getpid())}))
+
+
 def key_of(account_id: str) -> str:
     return hashlib.sha256(account_id.encode()).hexdigest()[:16]
 
@@ -346,6 +361,19 @@ class Taps(Base):
         rc, out = self.tap(self.use_b)
         self.assertEqual(out["say"], acc.BUSY)
         self.assertEqual(len(self.launch.calls), 1)
+
+    def test_a_switch_whose_worker_died_no_longer_blocks_a_tap(self):
+        self.tap(self.use_b)
+        record = self.ws.joinpath(*acc.RUNNING)
+        worker_on_record(record, alive=True)
+        self.assertEqual(self.tap(self.use_b)[1]["say"], acc.BUSY, "a running worker still holds the switch")
+        worker_on_record(record, alive=False)
+        before = json.loads(record.read_text())["attempt"]
+        rc, out = self.tap(self.use_b)
+        self.assertEqual((rc, out["status"]), (0, "started"))
+        self.assertTrue(out["say"].startswith(acc.STOPPED + " The core (Codex) is signed in as a…@example.com"), out["say"])
+        self.assertIn("Switching the core to b…@work.io (pro)", out["say"])
+        self.assertNotEqual(json.loads(record.read_text())["attempt"], before, "the dead attempt's record is replaced")
 
 
 class Switch(Base):

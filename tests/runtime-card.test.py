@@ -112,6 +112,21 @@ class Clock:
         self.t += s
 
 
+def worker_on_record(record: Path, alive: bool) -> None:
+    """The record's attempt, with a worker that still runs (this process) or one that has exited."""
+    import subprocess as sp
+    import holder_lock
+    if alive:
+        pid = os.getpid()
+    else:
+        proc = sp.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        pid = proc.pid
+    attempt = json.loads(record.read_text())["attempt"]
+    record.with_name(record.stem + ".worker.json").write_text(json.dumps(
+        {"attempt": attempt, "pid": pid, "start": holder_lock.start_time(os.getpid())}))
+
+
 class Base(unittest.TestCase):
     RUNTIME = "codex"
 
@@ -399,6 +414,19 @@ class Taps(Base):
         self.assertEqual(out["say"], rtc.BUSY)
         self.assertEqual(len(self.launch.calls), 1)
 
+    def test_a_switch_whose_worker_died_no_longer_blocks_a_tap(self):
+        self.tap("Switch the core to Claude Code")
+        record = self.ws.joinpath(*rtc.RUNNING)
+        worker_on_record(record, alive=True)
+        self.assertEqual(self.tap("Switch the core to Claude Code")[1]["say"], rtc.BUSY)
+        worker_on_record(record, alive=False)
+        before = json.loads(record.read_text())["attempt"]
+        rc, out = self.tap("Switch the core to Claude Code")
+        self.assertEqual((rc, out["status"]), (0, "started"))
+        self.assertTrue(out["say"].startswith(rtc.STOPPED + " The core is on Codex. Switching the core from Codex"),
+                        out["say"])
+        self.assertEqual(self.fake.edits()[-1], ("$card1", "Runtime: " + out["say"]))
+        self.assertNotEqual(json.loads(record.read_text())["attempt"], before, "the dead attempt's record is replaced")
 
 
 class AwaitSignIn(Base):
