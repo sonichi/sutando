@@ -135,7 +135,7 @@ def record(workspace: Path, event_id: str, card: Mapping[str, object], *, room: 
                 return False
             for k, v in same.items():
                 cards.pop(k)
-                retired[k] = {"why": "replaced", "expires_at": v.get("expires_at")}
+                retired[k] = {"why": "replaced", "expires_at": _retire_until(v, now)}
         if payloads or picker:
             cards[event_id] = {"card_id": card_id, "offers": payloads, "picker": picker, "room": room,
                                "lane": lane, "handler": handler, "expires_at": now + ttl_s, "issued_at": order}
@@ -151,7 +151,14 @@ def _save(path: Path, cards: dict, retired: dict) -> None:
     write_whole(path, {**_load(path), "cards": dict(newest), "retired": dict(old)})
 
 
-def settle(workspace: Path, event_id: str) -> bool:
+def _retire_until(entry: object, now: float) -> float:
+    """How long a retired id stays known: a full TTL from now at least, past a short-lived card's own life,
+    so a send retried after the card expired still finds it retired."""
+    own = float(entry.get("expires_at") or 0) if isinstance(entry, dict) else 0.0
+    return max(own, now + TTL_S)
+
+
+def settle(workspace: Path, event_id: str, *, now: Optional[float] = None) -> bool:
     """Forget the card posted as `event_id`, so no button of it acts again; False when it was not known."""
     from file_lock import locked_file
     from local_record import write_whole
@@ -162,8 +169,8 @@ def settle(workspace: Path, event_id: str) -> bool:
         if entry is None:
             return False
         retired = _load(path).get("retired") or {}
-        until = entry.get("expires_at") if isinstance(entry, dict) else 0
-        retired[str(event_id)] = {"why": "settled", "expires_at": until}
+        retired[str(event_id)] = {"why": "settled",
+                                  "expires_at": _retire_until(entry, time.time() if now is None else now)}
         write_whole(path, {**_load(path), "cards": cards, "retired": retired})
     return True
 

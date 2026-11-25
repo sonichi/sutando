@@ -438,6 +438,22 @@ class Reply(Base):
             self.forged("", **yes)
         self.assertEqual(retired, ["w1"])
 
+    def test_a_replayed_ask_past_the_confirm_cards_life_does_not_revive_it(self):
+        # The same as above, but the ask is re-run 605 s later, after the 10-minute confirm card expired.
+        import pool_manage
+        import time as _time
+        retired, later = [], _time.time() + 605
+        with mock.patch.object(pool_manage, "retire", lambda ws, t, **k: retired.append(t) or {"result": "retired"}):
+            confirm, _ = self.first_click("workers", "w1", "retire", "Retire Pylon")
+            yes = dict(said="Yes, retire Pylon", card_id=confirm["id"], reply_to_event="$confirm")
+            self.assertEqual(self.reply("", **yes)[1]["status"], "done")
+            with mock.patch.object(cards.issued_cards.time, "time", return_value=later):
+                self.first_click("workers", "w1", "retire", "Retire Pylon")
+                self.assertIsNone(cards.issued_cards.live(self.ws, "$confirm", now=later))
+                rc, out = self.reply("", **yes)
+            self.assertNotEqual(out["status"], "done")
+        self.assertEqual(retired, ["w1"])
+
     def click_task(self, name, said, card_id):
         path = self.ws / name
         path.write_text(task(said, reply_to_event="$confirm", card_click=json.dumps({"card_id": card_id, "action": said})))

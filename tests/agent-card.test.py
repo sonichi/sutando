@@ -619,6 +619,21 @@ class Issued(unittest.TestCase):
         self.assertEqual(cards(), ["$b"])
         self.assertIsNotNone(json.loads(issued_cards.ledger_path(self.ws).read_text())["intents"].get("op-a"))
 
+    def test_a_retired_id_outlives_its_short_lived_card(self):
+        # A confirm card lives 10 minutes; its retirement must outlast that, or a later replay revives it.
+        cards = lambda: sorted(json.loads(issued_cards.ledger_path(self.ws).read_text())["cards"])
+        issued_cards.record(self.ws, "$yes", self.card, room=DM, now=1000.0, ttl_s=600)
+        self.assertTrue(issued_cards.settle(self.ws, "$yes", now=1001.0))
+        self.assertFalse(issued_cards.record(self.ws, "$yes", self.card, room=DM, now=1605.0, ttl_s=600))
+        self.assertIsNone(issued_cards.live(self.ws, "$yes", now=1606.0), "settled past its TTL stays settled")
+        # Replaced: A at 0, B at 540, a retry of A at 660 must leave B the live card.
+        issued_cards.record(self.ws, "$A", {**self.card, "id": "cf"}, room=DM, now=2000.0, ttl_s=600)
+        issued_cards.record(self.ws, "$B", {**self.card, "id": "cf"}, room=DM, now=2540.0, ttl_s=600)
+        self.assertFalse(issued_cards.record(self.ws, "$A", {**self.card, "id": "cf"}, room=DM, now=2660.0, ttl_s=600))
+        self.assertIsNotNone(issued_cards.live(self.ws, "$B", now=2661.0))
+        self.assertIsNone(issued_cards.live(self.ws, "$A", now=2661.0))
+        self.assertEqual(cards(), ["$B"])
+
     def test_a_record_expires_and_the_ledger_keeps_only_live_cards(self):
         self.assertLessEqual(issued_cards.TTL_S, 3 * 86400)
         issued_cards.record(self.ws, "$later", {**self.card, "id": "later"}, now=1000.0 + issued_cards.TTL_S + 1)
