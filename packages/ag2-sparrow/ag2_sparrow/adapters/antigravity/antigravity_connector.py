@@ -63,6 +63,7 @@ from ...task_io import (COLLABORATOR, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, 
 
 NAME = "Antigravity"
 LIMITED_NO_SEND = "[no-send] Antigravity is at its usage limit; the owner was sent the account card\n"
+LIMITED_FOR_OTHERS = "Antigravity has reached its usage limit, so I can't answer right now. Its owner has been told."
 DEFAULT_ACP_COMMAND = "agy acp"
 NO_REPLY = "NO_REPLY"
 HELD_WAIT_S = held_start.WAIT_S
@@ -843,8 +844,11 @@ class Connector:
         body = self.answer_body(headers, status, text, detail, turn) + (unsaid and unsaid + "\n")
         if owner_turn and switched and not body.startswith("[no-send]"):
             body = quoted(switched).strip() + "\n" + body
-        if limited:
-            body = LIMITED_NO_SEND if self.quota.limited() else quoted(quota_notice.words(
+        if limited and self.quota.limited():
+            # The card is the owner's notice; anyone else who asked is told why there is no answer.
+            body = LIMITED_NO_SEND if kind == OWNER else quoted(LIMITED_FOR_OTHERS) + "\n"
+        elif limited:
+            body = quoted(quota_notice.words(
                 NAME, quota_notice.reset_from_text("%s %s" % (detail or "", text or "")), "")) + "\n"
         reason = ""
         if self.launch is not None:
