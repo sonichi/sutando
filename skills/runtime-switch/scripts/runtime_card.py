@@ -949,12 +949,40 @@ def why_not(rt: str, got: dict, rc: int) -> str:
     return f"I could not confirm it is running on {name(rt)}: {seen}"
 
 
+def _record_names(text: str) -> str:
+    try:
+        rec = json.loads(text)
+    except ValueError:
+        return ""
+    return str(rec.get("runtime") or "") if isinstance(rec, dict) else ""
+
+
+def running_runtimes() -> set:
+    """The runtimes whose CLI runs in the core session's panes, by the launcher's own reader; empty when
+    nothing runs there or it cannot be read."""
+    try:
+        import core_runtime_record
+        from core_heartbeat import _socket_path, core_session
+        return set(core_runtime_record.pane_runtimes(_socket_path(), core_session()))
+    except Exception:  # noqa: BLE001 - unreadable: no runtime seen
+        return set()
+
+
+def ran_on(ws: Path) -> str:
+    """The runtime the core was running before a switch: the one its panes run, else the launcher's
+    confirmed record, never the next-launch selection; "" when neither says."""
+    live = running_runtimes()
+    if len(live) == 1:
+        return next(iter(live))
+    return str(confirmed_record(ws).get("runtime") or "")
+
+
 def fall_back(ws: Path, room: str, rt: str, was: str, attempt: str, got: dict, rc: int, before: Optional[str], *,
               card: str = "", restart=restart_core, run=subprocess.run, core=None, execute=None,
               sleep=time.sleep, clock=time.time) -> dict:
     """The switch to `rt` left no confirmed core: put back the record of `was`, start `was` again the same
     way, and say on the card what came of both. Said from here: a core that is down cannot answer."""
-    if before is not None:
+    if before is not None and _record_names(before) == was:
         from local_record import write_text_whole
         write_text_whole(ws.joinpath(*RECORD), before)
     since = clock()
@@ -962,9 +990,8 @@ def fall_back(ws: Path, room: str, rt: str, was: str, attempt: str, got: dict, r
     gateway = restore_desktop_gateway(run) if back_rc not in NOT_RESTARTED else ""
     back = confirm(ws, was, since, sleep=sleep, clock=clock)
     lead = f"Couldn't switch to {name(rt)}: {why_not(rt, got, rc)}."
-    import account_card
-    if back_rc in NOT_RESTARTED and not back["core"] and account_card.fresh_beat(ws, since):
-        words = f"{lead} The core is still on {name(was)}."   # stopped nothing, and the core still beats
+    if back_rc in NOT_RESTARTED and not back["core"] and running_runtimes() == {was}:
+        words = f"{lead} The core is still on {name(was)}."   # stopped nothing, and its panes still run it
     elif back["core"]:
         words = f"{lead} I started {name(was)} again, and the core is running on it."
     else:
@@ -994,7 +1021,7 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
         try:
             if not is_recorded(ws, rec):
                 return _emit({"status": "refused", "why": "that attempt is not the one under way"}, 2)
-            was = configured_runtime()
+            was, ran = configured_runtime(), ran_on(ws)
             try:
                 before = ws.joinpath(*RECORD).read_text(encoding="utf-8")
             except OSError:
@@ -1047,8 +1074,8 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
             import account_card
             # Rolled back only on a failed restart or a core seen gone: an unconfirmed but beating core is kept.
             gone = rc != 0 or not account_card.fresh_beat(ws, started)
-            if not got["core"] and restarted and gone and was in NAMES and was != args.runtime:
-                told = fall_back(ws, args.room, args.runtime, was, args.attempt, got, rc, before, card=args.card,
+            if not got["core"] and restarted and gone and ran in NAMES and ran != args.runtime:
+                told = fall_back(ws, args.room, args.runtime, ran, args.attempt, got, rc, before, card=args.card,
                                  restart=restart, run=run, core=core, execute=execute, sleep=sleep, clock=clock)
             else:
                 told = settle_and_tell(ws, args.room, args.runtime, was, started, args.attempt, rc=rc,
