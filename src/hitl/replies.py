@@ -30,7 +30,8 @@ except ImportError:
 
 from . import recovery
 from .manager import HitlManager
-from .schema import Action, ActionReply, HumanRequirement, MalformedActionError, StaleRequirementError, STATUS_IN_PROGRESS
+from .schema import (Action, ActionReply, HumanRequirement, MalformedActionError, StaleRequirementError,
+                     STATUS_IN_PROGRESS, device_id)
 
 REPLY_FIELD = "space.ag2.hitl.action"
 EVENT_TYPE = "message.created"
@@ -76,10 +77,9 @@ def write_driver_action(workspace: Path, req: HumanRequirement, action: Action) 
     """Atomically drop the driver's action file; the driver replaces it with a receipt."""
     d = actions_dir(workspace)
     d.mkdir(parents=True, exist_ok=True)
-    device = req.device or {}
     body = {
-        "session": str(device.get("id") or ""),
-        "socket": str(device.get("socket") or ""),
+        "session": device_id(req),
+        "socket": str((req.device or {}).get("socket") or ""),
         "guard": req.guard,
         "action_id": action.id,
         "hitl_id": req.id,
