@@ -185,14 +185,14 @@ class HumanRequirement:
             return None
         subject = self.subject or {}
         if self.status == STATUS_IN_PROGRESS:
-            return {"state": "running"}
+            return dict(state="running")
         note = self.answer.get("note") if isinstance(self.answer, dict) else None
         if self.status == STATUS_EXPIRED and isinstance(note, str) and note.strip():
-            return {"state": "failed", "text": " ".join(note.split())[:200]}
+            return dict(state="failed", text=" ".join(note.split())[:200])
         if self.status == STATUS_RESOLVED and subject.get("driven_at"):
-            return {"state": "done"}
+            return dict(state="done")
         if self.terminal:
-            return {"state": "closed"}
+            return dict(state="closed")
         return None
 
     def to_wire(self) -> Dict[str, Any]:
