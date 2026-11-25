@@ -287,6 +287,40 @@ class Card(Base):
         self.assertIsNotNone(issued_cards.live(self.ws, events[1]), "the newer card's buttons still act")
         self.assertIsNone(issued_cards.live(self.ws, events[0]), "the superseded card stays superseded")
 
+    def test_a_send_intent_that_cannot_be_noted_still_posts_the_card(self):
+        import argparse
+        import issued_cards
+        args = argparse.Namespace(room=DM, reply_to="$ask", print=False)
+        with mock.patch.object(issued_cards, "intend", side_effect=OSError("disk full")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = rtc.cmd_post(self.ws, args, core=CORE, execute=self.fake.execute, now=lambda: 100.0)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len([c for c in self.fake.calls if c[0] == "room.message.send"]), 1)
+
+    def test_a_replay_whose_first_record_was_lost_keeps_the_newer_cards_buttons(self):
+        # A's send lands but its record is lost; B is recorded; A retried gets A's event back: B must still act.
+        import argparse
+        import issued_cards
+        self.fake.replay = True
+        real, lost = issued_cards.record, []
+
+        def record(*a, **k):
+            if not lost:
+                lost.append(a[1])
+                raise OSError("disk full")
+            return real(*a, **k)
+        import time
+        t = time.time()
+        with mock.patch.object(issued_cards, "record", record):
+            for at, ask in ((t, "$a"), (t + 1, "$b"), (t + 2, "$a")):
+                args = argparse.Namespace(room=DM, reply_to=ask, print=False)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rtc.cmd_post(self.ws, args, core=CORE, execute=self.fake.execute, now=lambda at=at: at)
+        events = [self.fake.given[c[2]] for c in self.fake.calls if c[0] == "room.message.send"]
+        self.assertEqual((events[0] == events[2], events[0] == events[1]), (True, False))
+        self.assertIsNotNone(issued_cards.live(self.ws, events[1]), "the newer card's buttons still act")
+        self.assertIsNone(issued_cards.live(self.ws, events[0]), "the older card does not come back")
+
     def test_one_request_shown_codex_then_claude_then_codex_keeps_the_newest_card_live(self):
         # The third post reuses the first id; the platform hands back the first card, which must not displace the second.
         import argparse

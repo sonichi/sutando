@@ -344,6 +344,14 @@ def _owner_dm(ws: Path, core: dict) -> str:
     return connections.owner_dm(core, ws)
 
 
+def _intend(ws: Path, operation_id: str):
+    """When this send was first meant (issued_cards.intend); None when it cannot be noted."""
+    try:
+        return issued_cards.intend(ws, operation_id)
+    except OSError:
+        return None
+
+
 def _post(ws: Path, room: str, body: str, card: dict, operation_id: str, *, reply_to: str = "", core=None,
           execute=None) -> dict:
     """Post `card` in `room`, which must be the owner's checked DM, and record it for its taps; a newer
@@ -353,15 +361,18 @@ def _post(ws: Path, room: str, body: str, card: dict, operation_id: str, *, repl
         lane = str(core.get("instance") or "")
         dm = _owner_dm(ws, core)
         execute = execute if execute is not None else _execute(ws, lane or None)
+        issued = _intend(ws, operation_id)
         eid = ac.send_card(execute, room, body, card, operation_id=operation_id, reply_to=reply_to, owner_dm=dm)
     except ac.CardError as e:
         return {"status": "failed", "why": str(e), "body": body}
     except Exception as e:  # noqa: BLE001 — no core lane or no credential: named, nothing posted
         return {"status": "failed", "why": f"{type(e).__name__}: {e}", "body": body}
     try:
-        issued_cards.record(ws, eid, card, room=dm, lane=lane, handler=HANDLER)
+        kept = issued_cards.record(ws, eid, card, room=dm, lane=lane, handler=HANDLER, issued_at=issued)
     except OSError as e:
         return {"status": "posted", "event_id": eid, "why": f"its buttons will not act ({type(e).__name__})"}
+    if not kept and issued is not None and (issued_cards.offered(card) or issued_cards.has_picker(card)):
+        return {"status": "posted", "event_id": eid, "why": "a newer card is the one that acts"}
     return {"status": "posted", "event_id": eid}
 
 

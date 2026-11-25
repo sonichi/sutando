@@ -607,6 +607,18 @@ class Issued(unittest.TestCase):
         self.assertTrue(issued_cards.record(self.ws, "$c", self.card, room=DM, now=1006.0))
         self.assertEqual(cards(), ["$c"])
 
+    def test_a_card_meant_before_a_live_one_of_its_id_is_retired_not_recorded(self):
+        cards = lambda: sorted(json.loads(issued_cards.ledger_path(self.ws).read_text())["cards"])
+        first = issued_cards.intend(self.ws, "op-a", now=1000.0)
+        second = issued_cards.intend(self.ws, "op-b", now=1000.0)  # same clock tick: still after the first
+        self.assertEqual(issued_cards.intend(self.ws, "op-a", now=1009.0), first, "a retry keeps its first time")
+        self.assertLess(first, second)
+        self.assertTrue(issued_cards.record(self.ws, "$b", self.card, room=DM, now=1001.0, issued_at=second))
+        # $a's first record was lost; its replay arrives later but was meant earlier: $b stays the card.
+        self.assertFalse(issued_cards.record(self.ws, "$a", self.card, room=DM, now=1002.0, issued_at=first))
+        self.assertEqual(cards(), ["$b"])
+        self.assertIsNotNone(json.loads(issued_cards.ledger_path(self.ws).read_text())["intents"].get("op-a"))
+
     def test_a_record_expires_and_the_ledger_keeps_only_live_cards(self):
         self.assertLessEqual(issued_cards.TTL_S, 3 * 86400)
         issued_cards.record(self.ws, "$later", {**self.card, "id": "later"}, now=1000.0 + issued_cards.TTL_S + 1)
