@@ -172,6 +172,10 @@ for line in sys.stdin:
             PENDING[REQ_ID] = (tid, turn_id, item_id, reply)
             send({"jsonrpc": "2.0", "id": REQ_ID, "method": "item/commandExecution/requestApproval",
                   "params": {"threadId": tid, "turnId": turn_id, "itemId": item_id, "command": ["rm", "-rf", "x"]}})
+        elif "[[noaccess]]" in text and not p.get("model"):    # the account cannot run the thread's own model
+            finish_turn(tid, turn_id, item_id, "", "failed",
+                        {"message": "The 'stub-model' model is not supported when using Codex with a ChatGPT account.",
+                         "codexErrorInfo": "modelNotFound"})
         elif p.get("model") == BROKEN:
             finish_turn(tid, turn_id, item_id, "", "failed", {"message": "the model is not available"})
         else:

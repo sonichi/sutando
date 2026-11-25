@@ -29,6 +29,7 @@ EXPIRED_NO_CARD = "That card has expired, so nothing changed. Send /model for a 
 BUTTONS = 6          # the card's button limit
 ROW_TAPS = 4         # a row's action limit
 NOTE_TEXT = "A switch takes effect on your next message."
+HELD_TEXT = "I'll answer your last message on the model you pick."
 _LEVEL = re.compile(r"^(?P<family>.+?)\s*\((?P<level>[^()]{1,24})\)$")
 UNTOLD_KEEP = 5      # outcome notices kept while their cards cannot be queued
 
@@ -151,11 +152,15 @@ class ModelSwitch:
         text = "I'm using %s. Pick a model to switch to." % names.get(now, now or "the default model")
         if coming:
             text += " Saved, not switched yet: %s, from your next message." % names.get(coming, coming)
+        refused, note = str(state.get("refused") or ""), NOTE_TEXT
+        if refused:     # the account signed in cannot run it: it is named, and not offered
+            text = "%s isn't available on this account. Pick one it has." % names.pop(refused, refused)
+            note = HELD_TEXT if state.get("held") else note
         menu = dict(buttons=self.buttons(agent_card, names, now)) if len(names) <= BUTTONS else \
             dict(groups=self.family_rows(agent_card, names, now))
         # The menu says when it stops acting (the time its record is kept), so the app can show it expired.
         return agent_card.build(CARD, "pending", title="Model", body="Pick a model for %s" % self.name,
-                                text=text, note=NOTE_TEXT, note_tone="dim",
+                                text=text, note=note, note_tone="dim",
                                 expires_at_ms=int((time.time() + issued_cards.TTL_S) * 1000), **menu)
 
     @staticmethod
@@ -274,7 +279,7 @@ class ModelSwitch:
             # Only a model a turn has run on is "in use": a repeated pending pick is still coming.
             outcome = "model-pending" if self.pending(state) == picked else "model-same"
         else:
-            self.save(wanted=picked, asked_in=room, told="", card=tapped)
+            self.save(wanted=picked, asked_in=room, told="", card=tapped, refused="")
         same = outcome == "model-same"
         card = self.built(state, picked=picked, same=same)
         self.publish(result_file, ANSWERED if self.post(room, card, edit=tapped)

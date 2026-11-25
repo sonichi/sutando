@@ -58,6 +58,9 @@ NO_INTEGRATIONS = {"web_search": "disabled",
 _MODEL_REFUSED = re.compile(r"modelNotFound|model_not_found|\bmodel\b.{0,80}\bis not supported\b", re.I)
 
 
+REFUSED_UNNAMED = "The model I was set to"
+
+
 def model_refused(err) -> bool:
     return bool(err) and bool(_MODEL_REFUSED.search(err if isinstance(err, str) else json.dumps(err)))
 
@@ -325,7 +328,7 @@ class Connector:
         """The model card's state and rules; made on first use, once main has named the state dir."""
         if self._models is None:
             self._models = model_switch.ModelSwitch(self.args.state, self.root, getattr(self.args, "bridge_state", None),
-                                                    "Codex", write_atomic, quoted, log, refresh=self.list_models,
+                                                    "Codex", self.model_answer, quoted, log, refresh=self.list_models,
                                                     allowed=MODEL_ALLOWLIST)
         return self._models
 
@@ -679,8 +682,8 @@ class Connector:
         if caps is None:                        # else the gate's decision, which the caller has
             policy = turn_policy(headers, allow_non_owner=True)
             caps, kind = policy.capabilities, policy.kind
-        durable, fallback = caps.session == "durable", None
-        for attempt in (1, 2, 3):
+        durable = caps.session == "durable"
+        for attempt in (1, 2):
             try:
                 self.open_for(headers, caps)
             except IntegrationsUnknown as e:
@@ -693,17 +696,8 @@ class Connector:
                 # The turn reads its own folder only: this task's own attachments are copied into it.
                 staged = stage_own_attachments(headers, self.scratch_cwd, getattr(self.args, "media_root", None))
                 turn_prompt = with_staged_paths(prompt, staged)
-            self.turn_ran_on = fallback or self.turn_model(caps, kind)
+            self.turn_ran_on = self.turn_model(caps, kind)
             status, text, err = self.run_turn(turn_prompt, self.turn_ran_on, self.turn_cwd(caps))
-            if status == "failed" and model_refused(err) and fallback is None:
-                # A kept thread goes on with the model it last ran, whatever this turn passed: the account's own
-                # default is named outright, once, and kept as the owner's pick so the next turn runs on it too.
-                fallback = self.account_default_model(self.turn_ran_on)
-                if fallback:
-                    log("model refused for this account; running the turn again on its default", fallback)
-                    if kind == OWNER and durable and getattr(self.args, "state", None) and self.models.ok(fallback):
-                        self.models.save(wanted=fallback, confirmed="", told="")
-                    continue
             if status == "server-exited":
                 self.restart_server()
                 if durable and attempt == 1:
@@ -733,29 +727,64 @@ class Connector:
         partial = (text or "").strip()
         return head + ("\n\nPartial reply:\n" + partial if partial else "")
 
-    def account_default_model(self, refused) -> str:
-        """The model the signed-in account runs by default, as the server lists it now ('' when it will not say,
-        names none, or names the one just refused)."""
-        try:
-            offered = self.rpc.request("model/list", {"limit": 100}).get("data") or []
-        except (RuntimeError, TimeoutError) as e:
-            log("model/list failed:", str(e)[:200])
-            return ""
-        usable = (m for m in offered if isinstance(m, dict) and m.get("isDefault") and not m.get("hidden"))
-        default = str(next((m.get("id") for m in usable), "") or "")
-        return default if default != str(refused or "") else ""
-
     def model_refused_words(self) -> str:
-        """The account signed in cannot run the model the turn asked for (an account switched under a pick made
-        on another one): said plainly, and the owner's pick is dropped so the next message is not refused too."""
+        """The account signed in cannot run the model the turn asked for, where no card can be shown."""
         model = str(getattr(self, "turn_ran_on", None) or "")
-        named = "the model %s" % model if model else "the model this agent was set to"
-        dropped = bool(model) and model != self.args.model and bool(getattr(self.args, "state", None))
-        if dropped:
-            self.models.save(wanted="", confirmed="", told="")
-        return "This account can't use %s. %s" % (
-            named, "I've gone back to Codex's own default model; send /model to choose another." if dropped
-            else "Send /model to choose one this account has.")
+        return "This account can't use %s. Send /model in our direct message to choose one it has." % (
+            "the model %s" % model if model else "the model this agent was set to")
+
+    def model_answer(self, result_file, body):
+        """A model card's own answer. While a message refused for its model waits, it is kept back: that
+        message's answer, run on the pick, is published in its place (`answer_held`)."""
+        if self.models.state().get("held"):
+            self._kept = (result_file, body)
+            return None
+        return write_atomic(result_file, body)
+
+    def refused_card(self, task_id, path, status, err, result_path) -> str:
+        """The account signed in cannot run the turn's model (it was picked on another account): the owner
+        is shown the model card in their DM and the message waits for the pick. '' when it was not that,
+        or no card could be shown; the answer is then `model_refused_words`."""
+        if status != "failed" or not model_refused(err):
+            return ""
+        agent_card, _ = connector_cards._core()
+        with open(path, encoding="utf-8") as f:
+            sent, _ = agent_card.reply_words(f.read())
+        shown = agent_card.owner_may_act(sent) is None and self.models.usable() and self.list_models()
+        # The refused pick is dropped either way: it is not passed again, nor shown as the model in use.
+        refused = str(getattr(self, "turn_ran_on", None) or self.models.state().get("current") or REFUSED_UNNAMED)
+        self.models.save(wanted="", confirmed="", told="", refused=refused, held=task_id if shown else "")
+        state = self.models.state()
+        if not (shown and self.models.offered(state)
+                and self.models.post(sent.get("channel_id"), self.models.menu(state))):
+            self.models.save(held="")
+            return ""
+        write_atomic(result_path, model_switch.ANSWERED)
+        return "model-refused"
+
+    def answer_held(self, outcome, result_path) -> dict:
+        """After a card matter: the message that waited for a pick is answered on it, in the pick's own
+        answer. Any other model answer kept back meanwhile is published as it was."""
+        kept, self._kept = getattr(self, "_kept", None), None
+        if kept is None:
+            return {}
+        held = str(self.models.state().get("held") or "")
+        path = os.path.join(self.args.inbox, held + ".txt")
+        if outcome not in ("model-picked", "model-pending", "model-same") or not os.path.isfile(path):
+            write_atomic(*kept)
+            return {}
+        self.models.save(held="", refused="")
+        headers, message, operator_lines = parse_task(path)
+        policy = turn_policy(headers, self.args.allow_non_owner)
+        prompt = wrap_untrusted(held, headers, message, operator_lines, self.note, caps=policy.capabilities)
+        log("turn (held for a model pick) ->", held)
+        status, text, err = self.run_task(headers, prompt, policy.capabilities, policy.kind)
+        told = self.tell_model(status, policy.capabilities, headers.get("channel_id"), policy.kind)
+        said = "" if kept[1].startswith("[no-send]") else kept[1].strip()
+        out = "\n\n".join(x for x in (said, self.result_body(status, text, err).strip(),
+                                      quoted(self.models.unsaid()).strip()) if x)
+        write_atomic(result_path, out + "\n")
+        return {"answered": held, "status": status, **({"model_switch": told} if told else {})}
 
     def pending_tasks(self, seen):
         names = [n for n in os.listdir(self.args.inbox)
@@ -810,6 +839,7 @@ class Connector:
             result_path = os.path.join(self.args.results, name)
             carded = self.card_task(task_id, headers, path, result_path)
             if carded:
+                carded.update(self.answer_held(carded["card"], result_path))
                 record_done(done_path, task_id)
                 with open(metrics_path, "a") as f:
                     f.write(json.dumps(carded) + "\n")
@@ -820,13 +850,16 @@ class Connector:
             if headers["access_tier"] == "owner" and self.desk.hint():
                 prompt += "\n\n" + self.desk.hint()
             log("turn ->", task_id, headers["access_tier"], repr(message[:60]))
+            if self.models.state().get("held"):
+                self.models.save(held="")       # the owner wrote on instead of picking: nothing waits any more
             t_sent = time.time()
             status, text, err = self.run_task(headers, prompt, policy.capabilities, policy.kind)
             t_done = time.time()
             out = self.result_body(status, text, err)
             # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
             told = self.tell_model(status, policy.capabilities, headers.get("channel_id"), policy.kind)
-            asked = self.desk.marked(headers["access_tier"], path, status, text, result_path)
+            asked = self.refused_card(task_id, path, status, err, result_path) or \
+                self.desk.marked(headers["access_tier"], path, status, text, result_path)
             out = "\n\n".join(x for x in (out.rstrip("\n"), quoted(self.models.unsaid()).strip()) if x)
             t_result = os.stat(result_path).st_mtime if asked else write_atomic(result_path, out.rstrip("\n") + "\n")
             record_done(done_path, task_id)

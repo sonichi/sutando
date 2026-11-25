@@ -843,6 +843,43 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(self.state()["wanted"], "")
         self.assertNotIn("model=", self.serve("task-4", "again"), "no pick of the owner's took: Codex's own model")
 
+    def test_a_model_the_account_cannot_use_shows_the_card_and_the_message_is_answered_on_the_pick(self):
+        # Owner, 2026-11-24: the connector moved the turn to the account's default by itself. It must show the
+        # card, let her pick, and answer the message on the pick.
+        self.assertEqual(self.serve("task-1", "hello [[noaccess]]"), "[no-send] the model card answers\n")
+        self.assertEqual((metrics(self.work)[-1]["card"], self.state()["held"], self.state()["wanted"]),
+                         ("model-refused", "task-1", ""))
+        ((room, card),) = self.posted()
+        self.assertEqual((room, card["text"], card["note"]),
+                         (self.DM, "Stub Model isn't available on this account. Pick one it has.",
+                          "I'll answer your last message on the model you pick."))
+        self.assertNotIn("Stub Model", [label for label, _ in taps(card)], "the refused model is not offered")
+        said = tap(card, "Stub Large")
+        answer = self.serve("task-2", said, reply_to="$card1", click=said)
+        self.assertIn("STUB echo:", answer)
+        self.assertIn("model=gpt-6-sol", answer, "the message that waited ran on the pick")
+        row = metrics(self.work)[-1]
+        self.assertEqual((row["card"], row["answered"], row["status"], row["model_switch"]),
+                         ("model-picked", "task-1", "completed", "switched"))
+        self.assertEqual([c["text"][:8] for _, c in self.posted("$card2")], ["Saved, n", "Switched"])
+        self.assertEqual((self.state()["held"], self.state()["refused"], self.state()["wanted"]), ("", "", "gpt-6-sol"))
+        self.assertEqual(self.serve("task-3", "/model"), "[no-send] the model card answers\n", "nothing waits now")
+
+    def test_a_refused_message_waits_only_until_the_owner_writes_on_and_a_room_gets_the_words(self):
+        self.serve("task-1", "hello [[noaccess]]")
+        self.posted()
+        # While it waits, any other model answer is still published as it was.
+        self.assertEqual(self.serve("task-2", "/model"), "[no-send] the model card answers\n")
+        self.assertIn("not one I can use now", self.serve("task-3", "/model no such model"))
+        self.assertEqual(self.state()["held"], "task-1")
+        self.assertIn("STUB echo:", self.serve("task-4", "never mind"))
+        self.assertEqual(self.state()["held"], "", "she wrote on instead of picking")
+        self.posted()
+        # No card can be shown outside her DM: the words say where to pick.
+        text = self.serve("task-6", "hi [[noaccess]]", channel="!room:s.space", kind="room")
+        self.assertEqual((self.state()["held"], "card" in metrics(self.work)[-1]), ("", False))
+        self.assertIn("Send /model in our direct message to choose one it has.", text)
+
     def test_a_turn_codex_moved_to_another_model_is_not_called_switched(self):
         self.pick("Stub Moved")
         self.posted("$card2")
@@ -1666,55 +1703,20 @@ class EdgePathTest(unittest.TestCase):
                          "Codex did not finish this task in time (interrupted after 1s).\n\nPartial reply:\npart")
         self.assertEqual(c.result_body("failed", "", {"message": "x"}), "Codex ended this task with status failed.")
 
-    def test_a_model_the_signed_in_account_cannot_use_is_said_plainly_and_the_pick_is_dropped(self):
+    def test_a_model_the_signed_in_account_cannot_use_is_told_apart_and_said_plainly_where_no_card_can_be(self):
         # The owner switched accounts; the model picked on the old one was refused and all they were told was
         # "Codex ended this task with status failed."
-        with tempfile.TemporaryDirectory() as d:
-            args = cc.build_parser().parse_args(["--work", d])
-            args.state = os.path.join(d, "state")
-            os.makedirs(args.state)
-            c = cc.Connector(FakeRpc, args, note="n")
-            c.models.save(wanted="gpt-6-astra", confirmed="gpt-6-astra", told="gpt-6-astra")
-            c.turn_ran_on = "gpt-6-astra"
-            refused = {"message": "The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account.",
-                       "codexErrorInfo": "modelNotFound"}
-            self.assertEqual(c.result_body("failed", "", refused),
-                             "This account can't use the model gpt-6-astra. I've gone back to Codex's own default "
-                             "model; send /model to choose another.")
-            state = c.models.state()
-            self.assertEqual((state["wanted"], state["confirmed"]), ("", ""), "the next message is not refused too")
-            # The model the install fixed cannot be dropped here: the owner is told how to choose.
-            c.args.model, c.turn_ran_on = "gpt-6-astra", "gpt-6-astra"
-            self.assertEqual(c.result_body("failed", "", "model_not_found"),
-                             "This account can't use the model gpt-6-astra. Send /model to choose one this account has.")
-        for other in (None, "", {"message": "rate limited"}, {"message": "the model answered nothing"}):
-            self.assertFalse(cc.model_refused(other), other)
-
-    def test_a_refused_model_is_run_again_on_the_accounts_default_and_that_default_is_kept(self):
-        # The first fix passed no model and the kept thread went on with gpt-6-astra: every turn failed the same way.
         refused = {"message": "The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account.",
                    "codexErrorInfo": "modelNotFound"}
         with tempfile.TemporaryDirectory() as d:
-            args = cc.build_parser().parse_args(["--work", d])
-            args.state = os.path.join(d, "state")
-            os.makedirs(args.state)
-            c = cc.Connector(FakeRpc, args, note="n")
-            c.rpc = mock.Mock()
-            c.rpc.request.return_value = {"data": [{"id": "gpt-6-astra"}, {"id": "gpt-5.5", "isDefault": True}]}
-            ran = []
-            turns = iter([("failed", "", refused), ("completed", "hello", None)])
-            policy = cc.turn_policy({"access_tier": "owner"}, allow_non_owner=True)
-            with mock.patch.object(c, "open_for"), mock.patch.object(c, "turn_cwd", return_value=d), \
-                    mock.patch.object(c, "run_turn", side_effect=lambda p, model, cwd: (ran.append(model), next(turns))[1]):
-                c.thread_id = "t"
-                out = c.run_task({"access_tier": "owner"}, "hi", policy.capabilities, policy.kind)
-            self.assertEqual((out, ran), (("completed", "hello", None), [None, "gpt-5.5"]))
-            self.assertEqual(c.models.state().get("wanted"), "gpt-5.5" if c.models.ok("gpt-5.5") else None)
-            # The default refused too, or none named: said plainly, and the turn is not run a third time.
-            c.rpc.request.return_value = {"data": [{"id": "gpt-6-astra", "isDefault": True}]}
-            self.assertEqual(c.account_default_model("gpt-6-astra"), "")
-            c.rpc.request.side_effect = RuntimeError("model/list: refused")
-            self.assertEqual(c.account_default_model(""), "")
+            c = cc.Connector(FakeRpc, cc.build_parser().parse_args(["--work", d]), note="n")
+            c.turn_ran_on = "gpt-6-astra"
+            self.assertEqual(c.result_body("failed", "", refused), "This account can't use the model gpt-6-astra. "
+                             "Send /model in our direct message to choose one it has.")
+            c.turn_ran_on = None
+            self.assertIn("can't use the model this agent was set to.", c.result_body("failed", "", "model_not_found"))
+        for other in (None, "", {"message": "rate limited"}, {"message": "the model answered nothing"}):
+            self.assertFalse(cc.model_refused(other), other)
 
     def test_done_list_is_bounded_and_deduplicated(self):
         with tempfile.TemporaryDirectory() as d:
