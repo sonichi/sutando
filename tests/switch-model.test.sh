@@ -34,7 +34,7 @@ case " $* " in *" capture-pane "*)
   acc=""; i=0
   while [ "$i" -lt "$k" ]; do
     i=$((i+1)); sent="$(grep -- "-l /model" "$TMUX_LOG" | sed -n "${i}p" | sed 's/.*-l \/model //')"
-    name="${TMUX_ACCEPT_NAME:-$(disp "${TMUX_ACCEPT_AS:-$sent}")}"; case "${TMUX_ACCEPT_AS:-$sent}" in *'[1m]') name="$name (1M context)";; esac
+    name="${TMUX_ACCEPT_NAME:-$(disp "${TMUX_ACCEPT_AS:-$sent}")}"; case "${TMUX_ACCEPT_AS:-$sent}" in *'[1m]') [ -n "${TMUX_NO_SIZE:-}" ] || name="$name (1M context)";; esac
     acc="$acc  ⎿  Set model to $name and saved as your default\n"
     [ -n "${TMUX_PERSIST_SETTINGS:-}" ] && printf '{"model":"%s"}\n' "${TMUX_ACCEPT_AS:-$sent}" > "$TMUX_PERSIST_SETTINGS"
   done
@@ -263,4 +263,17 @@ else
   ok "59-62 skipped: no cc to build a process named claude"
 fi
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 64 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+# --- Claude Code 2.1.322 answers a [1m] switch without its size ("Set model to Sonnet 5.5 and saved as your
+# default for new sessions") and saves the pick: the saved setting is the other half of the evidence.
+mkdir -p "$T/cfg1m"; printf '{"model":"opus"}\n' > "$T/cfg1m/settings.json"; : > "$TMUX_LOG"; rm -f "$TMUX_LOG.caps"
+rc=$(TMUX_NO_SIZE=1 TMUX_PERSIST_SETTINGS="$T/cfg1m/settings.json" "$HERE/scripts/switch-model.sh" 'sonnet[1m]' --accept-timeout 3 --state-dir "$T/state" --brain "$T/cfg1m" > "$T/out" 2> "$T/err"; echo $?)
+R=$(python3 -c "import json;print(json.load(open('$T/state/model-switch.json'))['model'])")
+[ "$rc" = 0 ] && [ "$R" = "sonnet[1m]" ] && ok "65 a [1m] switch answered without its size, its pick saved: switched (rc=0)" || fail "65" "rc=$rc R=$R $(cat "$T/err")"
+printf '{"model":"opus"}\n' > "$T/cfg1m/settings.json"; : > "$TMUX_LOG"; rm -f "$TMUX_LOG.caps"
+rc=$(TMUX_NO_SIZE=1 "$HERE/scripts/switch-model.sh" 'sonnet[1m]' --accept-timeout 2 --state-dir "$T/state" --brain "$T/cfg1m" > "$T/out" 2> "$T/err"; echo $?)
+[ "$rc" = 8 ] && ok "66 the same line with the pick NOT saved stays unconfirmed (rc=8)" || fail "66" "rc=$rc $(cat "$T/err")"
+printf '{"model":"sonnet[1m]"}\n' > "$T/cfg1m/settings.json"; : > "$TMUX_LOG"; rm -f "$TMUX_LOG.caps"
+rc=$(TMUX_NO_SIZE=1 "$HERE/scripts/switch-model.sh" 'sonnet[1m]' --accept-timeout 2 --state-dir "$T/state" --brain "$T/cfg1m" > "$T/out" 2> "$T/err"; echo $?)
+[ "$rc" = 8 ] && ok "67 the pick saved BEFORE the send and not saved again confirms nothing (rc=8)" || fail "67" "rc=$rc $(cat "$T/err")"
+
+echo; [ $fails -eq 0 ] && echo "switch-model: all 67 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }

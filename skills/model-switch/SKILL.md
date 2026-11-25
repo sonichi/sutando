@@ -17,7 +17,7 @@ observation and record so overlapping switches linearize): (1) preflight through
 when the core's input box carries text (exit 5), nothing written; exit 3 when no live pane exists;
 (2) count the `Set model to` lines already on screen (`scripts/pane-observe.sh --count`), so a stale
 acceptance from an earlier switch cannot pass as this one; (3) `/model <model>` + Enter through the
-shared sender; (4) **wait for the CLI to accept**: a NEW `Set model to` line is the switch. A warm
+shared sender; (4) **wait for the CLI to accept**: a NEW `Set model to` line is the switch. A `[1m]` switch the CLI answers without naming the context size (Claude Code 2.1.322: "Set model to Sonnet 5.5 and saved as your default for new sessions") counts only when that line is new and the runtime's `settings.json` was saved after the send and names exactly that model (`pane-observe.sh --settings`); a line stating another size never counts. A warm
 core (cached conversation) first shows *"Yes, switch / No, go back"*; with `--confirm` — pass it on
 an owner instruction, the flag is the authorization — the helper answers Enter once and waits again;
 without it the dialog is cancelled (Escape) and the script exits 6 with nothing recorded. No
