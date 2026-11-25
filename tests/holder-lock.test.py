@@ -262,7 +262,8 @@ class HolderLockTest(unittest.TestCase):
         r = self.acquire()
         self.assertEqual((type(r).__name__, r.reason), ("Held", "live holder"))
         self.put(self.record(pid, start, host="another-host"))
-        self.assertEqual(self.acquire().reason, "unobserved")
+        with mock.patch.object(self.hl, "_HOST_NAME_DRIFTS", False):
+            self.assertEqual(self.acquire().reason, "unobserved")
         dpid, dstart = self.dead()
         self.put(self.record(dpid, dstart))
         owner = self.owned()
@@ -588,10 +589,28 @@ class HolderLockTest(unittest.TestCase):
         self.assertIs(self.hl.verify_lineage(me, "2001-01-01T00:00:00Z"), False, "a recycled pid")
         pid, dstart = self.dead()
         self.assertIs(self.hl.verify_lineage(pid, dstart), False)
-        self.assertIsNone(self.hl.verify_lineage(me, start, "another-host"))
+        with mock.patch.object(self.hl, "_HOST_NAME_DRIFTS", False):
+            self.assertIsNone(self.hl.verify_lineage(me, start, "another-host"))
         self.assertIsNone(self.hl.verify_lineage(me, None))
         with mock.patch.object(self.hl, "start_time", return_value=None):
             self.assertIsNone(self.hl.verify_lineage(me, start))
+
+    def test_a_holder_that_outlived_a_host_rename_is_still_read_on_macos(self):
+        # A Mac is `mac.lan` on one network and `<name>.local` on the next; its holders run through the change.
+        pid, start = self.proc()
+        dpid, dstart = self.dead()
+        with mock.patch.object(self.hl, "_HOST_NAME_DRIFTS", True):
+            self.assertIs(self.hl.verify_lineage(pid, start, "mac.lan"), True, "the very process, under the earlier name")
+            self.assertIs(self.hl.verify_lineage(pid, "2001-01-01T00:00:00Z", "mac.lan"), False, "a recycled pid")
+            self.assertIs(self.hl.verify_lineage(dpid, dstart, "mac.lan"), False)
+            self.put(self.record2(pid, start, host="mac.lan"))
+            self.assertEqual(self.hl.status(str(self.root))["holder_lineage"], True)
+            self.assertEqual(self.acquire().reason, "live holder")
+            # Its dead record no longer fences the root for good: the next holder takes it.
+            self.put(self.record2(dpid, dstart, host="mac.lan"))
+            self.assertEqual(self.hl.occupancy(str(self.root)), "free")
+            self.assertEqual(type(self.acquire()).__name__, "Acquired")
+        self.assertIs(self.hl._HOST_NAME_DRIFTS, sys.platform == "darwin", "only where the name follows the network")
 
     def test_start_time_ignores_locale_and_time_zone(self):
         base = self.hl.start_time(os.getpid())
@@ -2161,7 +2180,8 @@ class HolderLockTest(unittest.TestCase):
         r = self.acquire()
         self.assertEqual((type(r).__name__, r.reason), ("Held", "live consumer"), "a dead holder, a live consumer")
         self.put(self.record2(hpid, hstart, attached=(cpid, cstart), host="another-host"))
-        self.assertEqual(self.acquire().reason, "unobserved")
+        with mock.patch.object(self.hl, "_HOST_NAME_DRIFTS", False):
+            self.assertEqual(self.acquire().reason, "unobserved")
         self.put(self.record2(hpid, hstart, attached=(cpid, cstart)))
         with mock.patch.object(self.hl, "verify_lineage",
                                lambda pid, start, host=None: False if pid == hpid else None):
@@ -2438,7 +2458,8 @@ class HolderLockTest(unittest.TestCase):
         self.put(self.record2(hpid, hstart, attached=(cpid, cstart)))
         self.assertEqual(self.hl.occupancy(str(self.root)), "held", "a free flock, a live consumer: sticky")
         self.put(self.record2(hpid, hstart, attached=(cpid, cstart), host="another-host"))
-        self.assertEqual(self.hl.occupancy(str(self.root)), "unobserved")
+        with mock.patch.object(self.hl, "_HOST_NAME_DRIFTS", False):
+            self.assertEqual(self.hl.occupancy(str(self.root)), "unobserved")
         with mock.patch.object(self.hl, "verify_lineage", lambda pid, start, host=None: False if pid == hpid else None):
             self.put(self.record2(hpid, hstart, attached=(cpid, cstart)))
             self.assertEqual(self.hl.occupancy(str(self.root)), "unobserved", "an unverifiable consumer is never free")

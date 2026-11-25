@@ -277,10 +277,16 @@ def _pid_alive(pid: int) -> Optional[bool]:
     return True
 
 
+# macOS renames a machine as its network changes, and a record is only ever written on a local disk,
+# which one kernel serves: there a name that differs is this machine's earlier one, never another's.
+_HOST_NAME_DRIFTS = sys.platform == "darwin"
+
+
 def verify_lineage(pid: int, start: Optional[str], host: Optional[str] = None) -> Optional[bool]:
     """True: that very process runs here. False: gone, or the pid now names another process.
-    None: it cannot be observed (another host, no start to compare, or an unreadable start time)."""
-    if host is not None and host != _host():
+    None: it cannot be observed (another host, no start to compare, or an unreadable start time).
+    Where the host's name drifts (_HOST_NAME_DRIFTS) a record under another name is still read here."""
+    if host is not None and host != _host() and not _HOST_NAME_DRIFTS:
         return None
     alive = _pid_alive(pid)
     if alive is not True:
