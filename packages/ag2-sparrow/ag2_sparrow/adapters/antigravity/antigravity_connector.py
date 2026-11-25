@@ -640,9 +640,6 @@ class Connector:
         opening one when not given, where only reads of the staged attachments are granted."""
         if owner:
             cwd, tools = self.args.cwd, shell_web_on(self.args, headers, kind)
-            # The owner's pick is applied on the owner's own turn, never on a collaborator's, which
-            # shares this turn mode: "on your next message" is the owner's next message.
-            picked = self.models.wanted() if (kind or turn_for(headers)[0]) == OWNER else ""
             with acp_host.task_media(headers, readable=True, log=log) as media:
                 read_only = (media.folder,) if media.folder else ()
                 return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
@@ -651,7 +648,7 @@ class Connector:
                                                                                       read_only=read_only,
                                                                                       **self.mcp_grant(headers, kind)),
                                            self.store, STDERR_NAME, NOT_SIGNED_IN, log, media=media,
-                                           model=str(picked or "") or None,
+                                           model=self.models.wanted(),
                                            on_models=self.models_seen,
                                            mcp_servers=self.mcp_servers_for(headers, kind),
                                            on_initialized=self.use_app_gemini_key)
@@ -670,7 +667,7 @@ class Connector:
         with acp_host.task_media(own_attachment_headers(headers, message), readable=False) as media:
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt, decide,
                                        self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=turn,
-                                       media=acp_host.Media(images=media.images))
+                                       media=acp_host.Media(images=media.images), model=self.models.wanted())
 
     def use_app_gemini_key(self, client, init, argv):
         """Owner and collaborator turns only: agy on the Gemini API key saved in the app (gemini_key). The auth
@@ -809,7 +806,9 @@ class Connector:
                                      kind=kind)
                 status, text, detail, turn = self.run_turn(task_id, headers, prompt, False, pair, message=message)
         # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
-        told = self.models.tell(turn.live, turn.model, headers.get("channel_id")) if kind == OWNER else ""
+        # The owner's pick runs on every turn, whoever sends it; the outcome is told in the owner's DM only,
+        # and only the owner's own turn may settle it as failed (another runtime's refusal is not theirs).
+        told = self.models.tell(turn.live, turn.model, headers.get("channel_id"), may_fail=kind == OWNER)
         asked = self.desk.marked(headers.get("access_tier"), path, status, text, result_file)
         # Out of quota: the owner is told once, by the account card; the card is the notice, so the room gets
         # no error line while agy is out (or the limit's own words when no card could be sent).

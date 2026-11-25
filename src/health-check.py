@@ -1686,6 +1686,40 @@ def check_decision_card_clicks(workspace_dir: Optional[Path] = None) -> "dict | 
                        "`hitl_click: true` task (CLAUDE.md, Pending decisions)")}
 
 
+def check_task_event_handler(workspace_dir: Optional[Path] = None) -> "dict | None":
+    """DOWN when core's watcher would hold every task; mirrors read_handler_config_now's order."""
+    from util_paths import task_event_handler_config_path  # noqa: PLC0415
+    cfg = task_event_handler_config_path((Path(workspace_dir) if workspace_dir else WORKSPACE_DIR) / "state")
+    if not cfg.exists() and not cfg.is_symlink():
+        return None  # no declaration: the core takes every task, pin or not
+
+    def usable(path) -> bool:
+        return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+    try:
+        raw = cfg.read_bytes()
+    except OSError as exc:
+        why = f"{cfg.name} exists but cannot be read ({type(exc).__name__})"
+    else:
+        pin = os.environ.get("SUTANDO_TASK_EVENT_HANDLER", "")
+        if pin:
+            if usable(pin):
+                return None
+            why = f"the SUTANDO_TASK_EVENT_HANDLER override {pin!r} is not an executable file"
+        else:
+            try:
+                handler = (json.loads(raw) or {}).get("handler")
+            except (ValueError, AttributeError):
+                handler = None
+            if isinstance(handler, str) and usable(handler):
+                return None
+            why = f"{cfg.name} names a handler that is missing or not an executable file ({handler!r})"
+    return {"name": "task-event-handler", "status": "down",
+            "detail": (f"{why}; the core watcher holds every new task until it is fixed. Re-publish the "
+                       "handler from the checkout that should route, or remove the file to let the core "
+                       "take every task")}
+
+
 def check_connections_primary(workspace_dir: Optional[Path] = None) -> "dict | None":
     """WARN when the connections record has rows but no primary, or a primary whose bridge has no
     proactive room yet; otherwise say so when the legacy row is not primary. None when all is plain."""
@@ -5797,6 +5831,36 @@ def _agent_activity_age() -> "float | None":
         return None
 
 
+def _statusline_quota_freshness(check: dict) -> dict:
+    """A status line record is current only while replies land: warn when the core has
+    worked more than the gate's freshness window after the record's `last_checked`."""
+    from quota_availability import FRESH_SEC, read_quota_record  # src/ is on sys.path
+    rec = read_quota_record(WORKSPACE_DIR)
+    age = None if rec is None else rec.age_s
+    if age is None:
+        check["detail"] = "quota state from the Claude status line recorder (age unknown)"
+        return check
+    check["detail"] = f"quota state from the Claude status line recorder (updated {int(age / 60)}m ago)"
+    agent_age = _agent_activity_age()
+    if age > FRESH_SEC and agent_age is not None and agent_age < age - FRESH_SEC:
+        check["status"] = "warn"
+        check["detail"] = (
+            f"quota state from the Claude status line recorder is {int(age / 60)}m old while the "
+            f"core worked {int(agent_age / 60)}m ago — the core's replies are not reaching the "
+            "recorder. Check that the core's config-dir settings.json has the quota-tracker "
+            "statusLine (it is reinstalled at launch) and that a project statusLine does not hide it."
+        )
+    return check
+
+
+def check_claude_sign_in() -> dict:
+    """FAIL when the core's config dir is not signed in on its own while sessions go direct, and
+    queue one owner message per day with the sign-in step (src/claude_signed_in.py)."""
+    import claude_signed_in  # src/ is on sys.path
+    from claude_account import core_config_dir
+    return claude_signed_in.check(WORKSPACE_DIR, core_config_dir(), socket=_local_core_socket())
+
+
 def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
     """Warn when the credential proxy is up but producing no quota state.
 
@@ -5846,6 +5910,8 @@ def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
     # result depends on ambient host state is worse than the bug it guards -- and CI,
     # having no live core, would have stayed green while developer hosts failed.
     check = {"name": "quota-telemetry", "status": "ok"}
+    if _quota_record_from_statusline():
+        return _statusline_quota_freshness(check)
     # "stale" means listening but executing pre-deploy code -- still routing,
     # so gating it out here would mute this check exactly during a redeploy.
     if proxy_status not in ("ok", "stale"):
@@ -5997,6 +6063,10 @@ def check_core_request_rejections(window_sec: int = 900, sustained: int = 5,
         check["status"] = "warn"
         check["detail"] = "quota-state.json present but unreadable"
         return check
+    from quota_availability import trusted_record  # src/ is on sys.path
+    if isinstance(data, dict) and trusted_record(data) is None:
+        check["detail"] = "quota record is another login's status line record — not this core's"
+        return check
     ledger = data.get("recent_rejections") if isinstance(data, dict) else None
     if not isinstance(ledger, list) or not ledger:
         check["detail"] = "no upstream rejections recorded by the proxy"
@@ -6095,6 +6165,10 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
     if not isinstance(data, dict):
         check["status"] = "warn"
         check["detail"] = "quota-state.json is not a JSON object"
+        return check
+    from quota_availability import trusted_record  # src/ is on sys.path
+    if trusted_record(data) is None:
+        check["detail"] = "quota record is another login's status line record — not this core's"
         return check
     headers = data.get("headers")
     if not isinstance(headers, dict):
@@ -7197,6 +7271,102 @@ def check_gateway_bridge() -> "dict | None":
         served = ", ".join(_gateway_lane_label(ln) for ln, serving, _ in lanes if serving)
         return _gateway_ok_unless_lane_stalled(f"running + connected (lane {served})")
     return _gateway_ok_unless_lane_stalled("running")
+
+
+OWNER_DM_STALE_MIN_AGE_S = 1800.0
+# Grace for float/JSON round-trip imprecision only — not a real clock-skew budget.
+OWNER_DM_CLOCK_SKEW_TOLERANCE_S = 5.0
+
+
+def check_owner_dm_routing_stale(min_age_sec: float = OWNER_DM_STALE_MIN_AGE_S,
+                                  now: "float | None" = None) -> "dict | None":
+    """WARN once the owner/gateway DM-room mismatch has itself persisted past
+    `min_age_sec` — not how recently the owner spoke, which refreshes every message."""
+    name = "owner-dm-routing-stale"
+    state_file = WORKSPACE_DIR / "state" / "owner-dm-routing-stale.json"
+
+    def _clear_divergence():
+        try:
+            state_file.unlink()
+        except OSError:
+            pass
+
+    if not _gateway_configured():
+        # Not-configured is unobservable, same as every "ok" case below — clear
+        # the clock so it can't resume a stale duration once reconfigured.
+        _clear_divergence()
+        return None
+    import owner_room_access  # noqa: PLC0415
+    routing = owner_room_access.owner_routing(WORKSPACE_DIR)
+    current_dm = owner_room_access.owner_dm(routing)
+
+    if not current_dm:
+        _clear_divergence()
+        return {"name": name, "status": "ok", "detail": "no owner DM routing reading yet"}
+    try:
+        activity = json.loads(status_read_path("last-owner-activity.json", WORKSPACE_DIR)
+                              .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        _clear_divergence()
+        return {"name": name, "status": "ok", "detail": "no owner activity recorded yet"}
+    if not isinstance(activity, dict) or activity.get("channel") != "ag2space":
+        _clear_divergence()
+        return {"name": name, "status": "ok", "detail": "owner's last recorded activity is not on ag2space"}
+    last_room = str(activity.get("channel_id") or "").strip()
+    if not last_room or last_room == current_dm:
+        _clear_divergence()
+        return {"name": name, "status": "ok", "detail": "owner's last-active room matches proactive routing"}
+
+    now = time.time() if now is None else now
+    try:
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+    first_seen = _gateway_num(state.get("first_seen"), nonneg=True)
+    # A first_seen beyond now (clock skew, a tampered/corrupted file) can never age — discard it.
+    if first_seen is not None and first_seen > now + OWNER_DM_CLOCK_SKEW_TOLERANCE_S:
+        first_seen = None
+    measured = True
+    # A new or changed pair starts its own clock; the same pair keeps the one already running.
+    if state.get("last_room") != last_room or state.get("current_dm") != current_dm or not first_seen:
+        first_seen = now
+        tmp = None
+        try:
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", dir=state_file.parent,
+                                             prefix=".owner-dm-routing-stale-", delete=False) as out:
+                tmp = Path(out.name)
+                json.dump({"last_room": last_room, "current_dm": current_dm, "first_seen": first_seen}, out)
+            os.replace(tmp, state_file)
+        except OSError:
+            measured = False
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+    if not measured:
+        # Nothing was persisted, so first_seen is only in memory — reporting its
+        # age would lie ("0s old") forever. Say the divergence is real but unmeasured.
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": (f"routing mismatch ({last_room} vs {current_dm}) is real, but its duration "
+                       "could not be measured — the clock file could not be written"),
+        }
+    age = max(0.0, now - first_seen)
+    if age < min_age_sec:
+        return {"name": name, "status": "ok",
+                "detail": f"routing mismatch ({last_room} vs {current_dm}) is {int(age)}s old, within "
+                          f"the {int(min_age_sec)}s settle window — not yet sustained"}
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (f"owner's last {_gateway_where()} messages (for {int(age // 60)}m) still come from "
+                   f"{last_room}, but proactive messages keep routing to {current_dm} — the gateway's "
+                   "owner_dm_room may be stuck stale, and no agent/owner Action exists yet to redesignate "
+                   "it; this signal is heuristic, a shared-room message reads the same as a moved DM"),
+    }
 
 
 def _gateway_rows(workspace: "Path | None" = None) -> "list[dict]":
@@ -13239,6 +13409,16 @@ def _credential_proxy_wedge_from_quota_state(check: dict) -> None:
     )
 
 
+def _quota_record_from_statusline() -> bool:
+    """quota-state.json was last written by the status line recorder, which needs no proxy."""
+    try:
+        data = json.loads(status_read_path("quota-state.json", WORKSPACE_DIR).read_text())
+    except (OSError, ValueError):
+        return False
+    from quota_availability import from_statusline  # src/ is on sys.path
+    return from_statusline(data)
+
+
 def check_credential_proxy() -> dict:
     """Credential proxy (port 7846). probe=False: a forwarding proxy has no
     liveness endpoint, so an HTTP probe is forwarded and misread as wedged."""
@@ -13246,7 +13426,10 @@ def check_credential_proxy() -> dict:
     # Liveness, captured before staleness/pin rewrite `status`: a pinned proxy
     # still routes, so its consumers must not read the pin as "down".
     check["live"] = check["status"] == "ok"
-    if check["status"] == "down":
+    if check["status"] == "down" and _quota_record_from_statusline():
+        check["status"] = "ok"
+        check["detail"] = "not running — quota comes from the Claude status line recorder"
+    elif check["status"] == "down":
         check["status"] = "warn"
         check["detail"] = "not running (optional)"
     elif check["status"] == "ok":
@@ -13260,6 +13443,12 @@ def check_credential_proxy() -> dict:
                          else None),
         )
         _credential_proxy_wedge_from_quota_state(check)
+        import claude_signed_in  # src/ is on sys.path
+        if (check["status"] != "ok" and claude_signed_in.direct_routing_on() is True
+                and claude_signed_in.proxy_in_use() is False):
+            # Nothing routes through it, so its code or credential state affects no one.
+            check["status"] = "ok"
+            check["detail"] = f"unused, sessions route direct (info: {check.get('detail', '')})"
     # Pin verdicts resolve on EVERY branch: a healthy replacement or a down
     # service still owes any ORPHAN/MISMATCH/EXPIRED finding to the report.
     _, _pls = _proc_lstarts("credential-proxy")
@@ -13466,6 +13655,7 @@ def run_all_checks() -> list[dict]:
     # NOT carry_proxy_veto: this check's remedy relaunches the CORE, and a pin on
     # the proxy must not veto a different process's remedy.
     checks.append(check_quota_telemetry(proxy_live))
+    checks.append(check_claude_sign_in())
     # ...and WHOSE account those numbers describe. The check above answers
     # "fresh?"; this one answers "ours?" — a fresh file for a foreign account
     # passes every branch above (observed 2026-08-03).
@@ -13539,6 +13729,10 @@ def run_all_checks() -> list[dict]:
     _card_clicks = check_decision_card_clicks()
     if _card_clicks:
         checks.append(_card_clicks)
+
+    _handler = check_task_event_handler()
+    if _handler:
+        checks.append(_handler)
 
     _no_primary = check_connections_primary()
     if _no_primary:
@@ -13877,6 +14071,7 @@ def run_all_checks() -> list[dict]:
     # branches are unit-tested in tests/health-check-gateway-bridge.test.py; this
     # call site is exercised by the running health check, not that unit test.)
     checks += [c for c in (check_gateway_bridge(),) if c is not None]  # pragma: no cover
+    checks += [c for c in (check_owner_dm_routing_stale(),) if c is not None]  # pragma: no cover
     checks += [c for c in (check_sspace_migration(),) if c is not None]  # pragma: no cover
 
     # (External plugin probes moved out with their plugins in #1427 round ④ —

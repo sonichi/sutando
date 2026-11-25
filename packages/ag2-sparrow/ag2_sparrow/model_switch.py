@@ -256,15 +256,15 @@ class ModelSwitch:
             self.answer(result_file, self.quoted(NOT_POSTED) + "\n")
         return "model-card"
 
-    def tell(self, live, ran, room=None) -> str:
+    def tell(self, live, ran, room=None, may_fail=True) -> str:
         """After an owner turn that reached the runtime (`live`): settle the pick it ran with (`ran` is the
         model that turn ran on), then say in the DM each outcome not yet told, oldest first. The state is
         settled, and SAVED with the notice it owes, before any notice is queued, and each notice is queued
         under its own key: a connector that stops in between neither asks again for a refused model nor
         queues a notice twice. A notice whose card cannot be queued stays owed, the newest UNTOLD_KEEP of
         them; one that cannot be drawn is said in words once, in the answer of a turn in its own room
-        (`room`), never another's.
-        '' when there was nothing to settle or tell."""
+        (`room`), never another's. Without `may_fail` (a turn not the owner's own) a switch that did not
+        happen settles nothing: the pick stays pending for the next turn. '' when there was nothing to settle or tell."""
         state = self.state()
         kept = state.get("untold")
         owed = [o for o in (kept if isinstance(kept, list) else [kept]) if isinstance(o, dict)]
@@ -273,7 +273,7 @@ class ModelSwitch:
         for n, o in enumerate(unkeyed):
             o.update(key=uuid.uuid4().hex, at=time.time_ns() + n)
         wanted, outcome = str(state.get("wanted") or ""), ""
-        if wanted and state.get("told") != wanted and live:
+        if wanted and state.get("told") != wanted and live and (may_fail or (ran or "") == wanted):
             ran = ran or ""
             outcome = "switched" if ran == wanted else "not-switched"
             # Later than every notice already owed: the bridge posts in the order of this moment. Saved

@@ -1,0 +1,51 @@
+{
+  "_comment": "The proxy's quotaStateFromHeaders(prev, headers, model, now) output, and the status line input that names the same facts. tests/credential-proxy-record-shape.test.ts and tests/quota-record.test.py both read this file.",
+  "now": "2026-11-20T12:00:00.000Z",
+  "now_epoch": 1795176000,
+  "model": "claude-opus-5-5",
+  "prev": {
+    "recent_rejections": [
+      {"ts": "2026-11-20T11:00:00.000Z", "status": 429, "path": "/v1/messages", "snippet": ""}
+    ],
+    "credential_state": "ok",
+    "credential_state_detail": "",
+    "credential_state_at": "2026-11-19T08:00:00.000Z"
+  },
+  "headers": {
+    "anthropic-ratelimit-unified-status": "allowed",
+    "anthropic-ratelimit-unified-5h-utilization": "0.42",
+    "anthropic-ratelimit-unified-5h-reset": "1795190400",
+    "anthropic-ratelimit-unified-7d-utilization": "0.07",
+    "anthropic-ratelimit-unified-7d-reset": "1795600000"
+  },
+  "statusline": {
+    "model": {"id": "claude-opus-5-5", "display_name": "Opus"},
+    "rate_limits": {
+      "five_hour": {"used_percentage": 42, "resets_at": 1795190400},
+      "seven_day": {"used_percentage": 7, "resets_at": 1795600000}
+    }
+  },
+  "proxy_record": {
+    "available": true,
+    "last_checked": "2026-11-20T12:00:00.000Z",
+    "headers": {
+      "anthropic-ratelimit-unified-status": "allowed",
+      "anthropic-ratelimit-unified-5h-utilization": "0.42",
+      "anthropic-ratelimit-unified-5h-reset": "1795190400",
+      "anthropic-ratelimit-unified-7d-utilization": "0.07",
+      "anthropic-ratelimit-unified-7d-reset": "1795600000"
+    },
+    "recent_rejections": [
+      {"ts": "2026-11-20T11:00:00.000Z", "status": 429, "path": "/v1/messages", "snippet": ""}
+    ],
+    "last_request": {"model": "claude-opus-5-5", "at": "2026-11-20T12:00:00.000Z"},
+    "credential_state": "ok",
+    "credential_state_detail": "",
+    "credential_state_at": "2026-11-19T08:00:00.000Z",
+    "utilization_5h": 0.42,
+    "utilization_7d": 0.07,
+    "resets_at_5h": "2026-11-20T16:00:00.000Z",
+    "resets_at_7d": "2026-11-25T09:46:40.000Z",
+    "limit_state": "allowed"
+  }
+}

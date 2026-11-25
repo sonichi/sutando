@@ -38,11 +38,19 @@ def loop_body() -> str:
     """The `run:` script of the 'Run shell standalone tests' step, dedented.
     It delegates to scripts/run-shell-suites.sh, which the fixture carries too."""
     text = CI.read_text()
-    m = re.search(r"- name: Run shell standalone tests\n\s*run: \|\n(.*?)(?=\n {6}- name:|\n {2}\w|\Z)",
+    m = re.search(r"- name: Run shell standalone tests\n(?: +env:\n(?: {10}\w+: [^\n]*\n)+)?\s*run: \|\n(.*?)(?=\n {6}- name:|\n {2}\w|\Z)",
                   text, re.S)
     if not m:
         raise AssertionError("could not find the 'Run shell standalone tests' run: block in ci.yml")
     return textwrap.dedent(m.group(1))
+
+
+def lane_legs() -> int:
+    """How many matrix legs the lanes job has; each leg gets SHARD=1..n."""
+    job = CI.read_text().split("\n  shell-standalone-tests:\n", 1)[1]
+    job = re.split(r"\n  \w", job, maxsplit=1)[0]
+    m = re.search(r"^ {8}shard: \[([0-9, ]+)\]$", job, re.M)
+    return len(m.group(1).split(",")) if m else 1
 
 
 def run_fixture(tmp: Path, suites: dict[str, bool], listed: list[str]) -> subprocess.CompletedProcess:
@@ -60,6 +68,8 @@ def run_fixture(tmp: Path, suites: dict[str, bool], listed: list[str]) -> subpro
     (tmp / "scripts").mkdir(exist_ok=True)
     lane = REPO / "scripts" / "parallel-suite-lane.sh"
     (tmp / "scripts" / "parallel-suite-lane.sh").write_bytes(lane.read_bytes())
+    for rel in ("scripts/shard-by-cost.sh", "tests/shell-suite-costs.txt"):
+        (tmp / rel).write_bytes((REPO / rel).read_bytes())
     runner = REPO / "scripts" / "run-shell-suites.sh"
     (tmp / "scripts" / "run-shell-suites.sh").write_bytes(runner.read_bytes())
     (tmp / "scripts" / "run-shell-suites.sh").chmod(0o755)
@@ -78,9 +88,12 @@ def run_fixture(tmp: Path, suites: dict[str, bool], listed: list[str]) -> subpro
         'exec "$@"\n')
     (shim / "timeout").chmod(0o755)
 
-    env = dict(os.environ, PATH=f"{shim}:{os.environ['PATH']}")
-    return subprocess.run(["bash", "-c", loop_body()], cwd=tmp, env=env,
-                          capture_output=True, text=True)
+    # Every leg runs; the step as a whole fails when any leg does, and prints what each printed.
+    runs = [subprocess.run(["bash", "-c", loop_body()], cwd=tmp, capture_output=True, text=True,
+                           env=dict(os.environ, PATH=f"{shim}:{os.environ['PATH']}", SHARD=str(leg)))
+            for leg in range(1, lane_legs() + 1)]
+    return subprocess.CompletedProcess(runs[0].args, max(r.returncode for r in runs),
+                                       "".join(r.stdout for r in runs), "".join(r.stderr for r in runs))
 
 
 def case_a_unlisted_failure_gates() -> list[str]:

@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://s.space/contracts/runtime_profile.v1/schema.json",
+  "title": "runtime_profile.v1 heartbeat block",
+  "description": "The `runtime_profile` object a heartbeat carries when its capabilities list `runtime_profile.v1`. The core's own model, switch options and plan name, plus one entry per worker. Names are the runtime's own display names, never aliases. Usage and limit state are not here: the heartbeat's `health.quota` (`quota_status.v1`) is their one source.",
+  "type": "object",
+  "required": ["v", "reported_at", "model", "switch_options", "plan", "workers"],
+  "additionalProperties": false,
+  "properties": {
+    "v": {"const": 1},
+    "reported_at": {"$ref": "#/$defs/epoch"},
+    "model": {"$ref": "#/$defs/model"},
+    "switch_options": {"$ref": "#/$defs/switch_options"},
+    "plan": {"oneOf": [{"$ref": "#/$defs/plan"}, {"type": "null"}]},
+    "workers": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "required": ["worker_id"],
+        "additionalProperties": false,
+        "properties": {
+          "worker_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"},
+          "model": {"$ref": "#/$defs/model"},
+          "switch_options": {"$ref": "#/$defs/switch_options"},
+          "plan": {"oneOf": [{"$ref": "#/$defs/plan"}, {"type": "null"}]}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "epoch": {"type": "integer", "minimum": 0},
+    "label": {"type": "string", "minLength": 1, "maxLength": 64},
+    "model_id": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]*(\\[[A-Za-z0-9._-]+\\])?$"
+    },
+    "model": {
+      "type": "object",
+      "required": ["id", "display_name", "runtime"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"$ref": "#/$defs/model_id"},
+        "display_name": {"$ref": "#/$defs/label"},
+        "runtime": {"enum": ["claude", "codex"]}
+      }
+    },
+    "switch_options": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "required": ["token", "display_name"],
+        "additionalProperties": false,
+        "properties": {
+          "token": {"$ref": "#/$defs/model_id"},
+          "display_name": {"$ref": "#/$defs/label"}
+        }
+      }
+    },
+    "plan": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "account": {"type": "string", "pattern": "^acct_[A-Za-z0-9_-]{1,48}$"},
+        "name": {"$ref": "#/$defs/label"}
+      }
+    }
+  }
+}

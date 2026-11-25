@@ -43,6 +43,8 @@ src/agent/claude/
   startup's own environment and export `CLAUDE_CONFIG_DIR` for the bridges that launch after — it
   is not a separately-execed step.
 - **Credential proxy + quota** — `skills/quota-tracker/` (local proxy that injects/refreshes the
-  OAuth token and routes the core via `ANTHROPIC_BASE_URL=http://localhost:7846`, plus
-  `read-quota.py`). An optional, self-contained **skill** per `CLAUDE.md`'s architecture rules; the
-  core boots fine without it.
+  OAuth token, plus `read-quota.py`). With the skill's status line recorder on (its default,
+  `QUOTA_STATUSLINE_ENABLED`), the core and workers call Anthropic directly and the launchers drop
+  a local-proxy `ANTHROPIC_BASE_URL` (`src/claude_routing.sh`); off, they are routed via
+  `ANTHROPIC_BASE_URL=http://localhost:7846` as before. An optional, self-contained **skill** per
+  `CLAUDE.md`'s architecture rules; the core boots fine without it.

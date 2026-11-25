@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""`eslint over first-party TS + JS` is a REQUIRED check: a `paths:` filter would
-leave it unreported, so the skip lives in step guards and the job always runs."""
+"""ESLint runs inside the REQUIRED `repo lints` job: a `paths:` filter would leave it
+unreported, so the skip lives in step guards and the job always runs."""
 
 import os
 import re
@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-WORKFLOW = REPO / ".github" / "workflows" / "eslint.yml"
+WORKFLOW = REPO / ".github" / "workflows" / "lint.yml"
 TEXT = WORKFLOW.read_text()
 BASH = shutil.which("bash")
 if os.name == "nt" and (git := shutil.which("git")):
@@ -74,7 +74,7 @@ check("workflow carries no `paths:` filter (required check must always report)",
       not re.search(r"^\s*paths(-ignore)?:", TEXT, re.M))
 
 check("every npm step is gated on the scope output",
-      TEXT.count("if: steps.scope.outputs.run == 'true'") == 3)
+      TEXT.count("steps.scope.outputs.run == 'true'") == 3)
 
 if BASH:
     script = scope_script()
@@ -96,7 +96,7 @@ if BASH:
     check("an .npmrc change lints",
           run_gate(script, ".npmrc") == "run=true")
     check("an edit to this workflow lints",
-          run_gate(script, ".github/workflows/eslint.yml") == "run=true")
+          run_gate(script, ".github/workflows/lint.yml") == "run=true")
     # The two ways the probe can break must both fail toward doing the work,
     # never toward a silent pass.
     check("a failed `gh pr diff` lints rather than skipping",

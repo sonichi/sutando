@@ -32,17 +32,26 @@ export function worthATask(s: EndedSession): boolean {
 	return s.items.some((i) => i.role === 'user' && !!i.content?.trim() && !i.content.startsWith('[System:'));
 }
 
-/** The task body: the facts of the session, then its spoken lines. */
-export function sessionEndTask(s: EndedSession): { summary: string; transcript: string } {
+/** What the core is asked to do with an ended call, unless the host sets its own. */
+export const DEFAULT_CALL_END_INSTRUCTION =
+	`If the user asked for, or agreed to, something that was not finished on the call (a follow-up: something to look up, ` +
+	`send, write, remind them of, or do later), do it now, or schedule it if it has a time, and reply with what you did. ` +
+	`Keep any durable fact from the call (a preference, a commitment, a follow-up) in memory. ` +
+	`If the call leaves nothing to do, answer with [no-send].`;
+
+/** The host's end-of-call instruction (SUTANDO_VOICE_CALL_END_INSTRUCTION), or the default when unset or blank. */
+export function callEndInstruction(env: NodeJS.ProcessEnv = process.env): string {
+	return env.SUTANDO_VOICE_CALL_END_INSTRUCTION?.trim() || DEFAULT_CALL_END_INSTRUCTION;
+}
+
+/** The task body: the facts of the session, the instruction, then its spoken lines. */
+export function sessionEndTask(s: EndedSession, instruction: string = DEFAULT_CALL_END_INSTRUCTION): { summary: string; transcript: string } {
 	const mins = Math.round(s.durationMs / 60_000);
 	const summary =
 		`VOICE_SESSION_ENDED: the voice session ${s.sessionId} ended (${s.reason}). ` +
 		`${new Date(s.startedAt).toISOString()} to ${new Date(s.endedAt).toISOString()}, about ${mins} min, ` +
 		`${s.turnCount} turns, ${s.toolCallCount} tool calls. Read the spoken lines below. ` +
-		`If the user asked for, or agreed to, something that was not finished on the call (a follow-up: something to look up, ` +
-		`send, write, remind them of, or do later), do it now, or schedule it if it has a time, and reply with what you did. ` +
-		`Keep any durable fact from the call (a preference, a commitment, a follow-up) in memory. ` +
-		`If the call leaves nothing to do, answer with [no-send].`;
+		instruction;
 	let transcript = s.items
 		.filter((i) => (i.role === 'user' || i.role === 'assistant') && i.content?.trim())
 		.map((i) => `${i.role}: ${i.content.replace(/\s+/g, ' ').trim()}`)
