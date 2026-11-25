@@ -15,7 +15,7 @@ delivery sentinels naming `<payloads>/<task file>`), `results`, `state`, `stage_
                     [--stage-command ARG...]
     seat.py run --host FILE --workspace DIR --seat NAME [--worker ID] [--model M] [-c key=value]...
 
-Off unless a launcher starts it (`SUTANDO_CODEX_APP_SERVER=1`). Stdlib only.
+Started by the launchers unless the app-server choice is off (`sutando-config.sh codex-app-server`). Stdlib only.
 """
 from __future__ import annotations
 
@@ -842,8 +842,13 @@ class Seat:
             return EXIT_LOCKED
         mode = f"worker {self.worker}" if self.worker else "core"
         log(f"seat {self.seat} ({mode}) on codex app-server; inbox {self.host.inbox}; this panel is a read-only log")
+        ready = Path(self.host.state) / "ready"
         try:
             self.ensure_server()
+            # The launcher opens task intake only once this exists: app-server up, thread open.
+            tmp = ready.with_name("ready.tmp")
+            tmp.write_text(f"{os.getpid()}\n", encoding="utf-8")
+            os.replace(tmp, ready)
             self.watcher = watcher
             while not self.stopping:
                 if watcher is not None:
@@ -861,6 +866,7 @@ class Seat:
             log(f"FATAL: {e}")
             return EXIT_FATAL
         finally:
+            ready.unlink(missing_ok=True)
             if watcher is not None:
                 watcher.stop()
             self.close_server()

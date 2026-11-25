@@ -22,11 +22,16 @@ CLI:
   python3 src/shutdown.py mark [reason]   # write the sentinel
   python3 src/shutdown.py clear           # remove it (startup)
   python3 src/shutdown.py check           # exit 0 if shutting down, 1 if not
+  python3 src/shutdown.py mark-if-absent R  # write one only if none; print its token, else nothing
+  python3 src/shutdown.py clear-if TOKEN    # 0 removed; 3 not that stop (left alone); else an error
 """
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import os
+import secrets
 import sys
 import time
 from pathlib import Path
@@ -39,12 +44,53 @@ def _sentinel_path() -> Path:
     return resolve_workspace() / "state" / "shutdown.sentinel"
 
 
-def mark_shutdown(reason: str = "manual") -> Path:
-    """Write the shutdown sentinel. Idempotent — overwrites any prior one."""
+@contextlib.contextmanager
+def _locked():
+    """The sentinel's path, under an flock on `shutdown.sentinel.lock` shared by its writers here."""
+    import fcntl
     p = _sentinel_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"reason": reason, "ts": int(time.time())}) + "\n")
+    with open(p.with_name(p.name + ".lock"), "a") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield p
+
+
+def _write(p: Path, reason: str) -> None:
+    # `gen` makes every stop's bytes, and so its token, unique.
+    p.write_text(json.dumps({"reason": reason, "ts": int(time.time()), "gen": secrets.token_hex(8)}) + "\n")
+
+
+def _token(p: Path) -> str:
+    try:
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return ""
+
+
+def mark_shutdown(reason: str = "manual") -> Path:
+    """Write the shutdown sentinel. Idempotent — overwrites any prior one."""
+    with _locked() as p:
+        _write(p, reason)
     return p
+
+
+def mark_if_absent(reason: str) -> str:
+    """Write a sentinel only when none is present; its token (a later compare-and-clear names exactly
+    this stop), or '' when one was already there and is not this caller's."""
+    with _locked() as p:
+        if p.exists():
+            return ""
+        _write(p, reason)
+        return _token(p)
+
+
+def clear_if(token: str) -> bool:
+    """Remove the sentinel only while it is still the stop `token` names; a newer one survives."""
+    with _locked() as p:
+        if not token or _token(p) != token:
+            return False
+        p.unlink()
+        return True
 
 
 def clear_shutdown() -> None:
@@ -71,6 +117,9 @@ def shutdown_info() -> dict | None:
         return {"reason": "unknown", "ts": 0}
 
 
+NOT_MINE = 3  # clear-if: the stop in place is not the one named, a normal outcome, not an error
+
+
 def main(argv: list[str]) -> int:
     cmd = argv[1] if len(argv) > 1 else "check"
     if cmd == "mark":
@@ -80,6 +129,13 @@ def main(argv: list[str]) -> int:
     if cmd == "clear":
         clear_shutdown()
         return 0
+    if cmd == "mark-if-absent":
+        token = mark_if_absent(argv[2] if len(argv) > 2 else "manual")
+        if token:
+            print(token)
+        return 0
+    if cmd == "clear-if":
+        return 0 if clear_if(argv[2] if len(argv) > 2 else "") else NOT_MINE
     if cmd == "check":
         return 0 if is_shutting_down() else 1
     if cmd == "path":

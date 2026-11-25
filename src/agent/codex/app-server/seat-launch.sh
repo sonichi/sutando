@@ -7,6 +7,7 @@ SEAT_CLI="$REPO/src/agent/codex/app-server/$SEAT_NAME"
 SEAT_PY="$REPO/src/agent/codex/app-server/seat.py"
 SEAT_ARGS=()
 SEAT_ENV_ARGS=()
+SEAT_READY=""
 
 # seat_translate_args <the TUI's codex args>...: the same launch as seat.py flags, in SEAT_ARGS.
 # Every `-c key=value` is passed on to `codex app-server`; `--search` is config there, not a flag.
@@ -41,13 +42,14 @@ seat_core_prepare() {
   tasks="${tasks/#\~/$HOME}"
   results="${SUTANDO_RESULTS_DIR:-$ws/results}"
   state="$(seat_state_dir "$ws" "$SESSION")"
+  SEAT_READY="$state/ready"
   "$py" "$SEAT_PY" declare --out "$state/host.json" --inbox "$tasks" --results "$results" \
     --state "$state" --cwd "$WORKING_DIR" || return 1
   seat_translate_args "${CODEX_ARGS[@]}"
   SEAT_ARGS=(--host "$state/host.json" --workspace "$ws" --seat "$SESSION" --codex "$codex_bin"
              --log "$ws/logs/codex-seat.log" "${SEAT_ARGS[@]}")
   # The seat's standby watcher reads what the notifier session's watcher reads today.
-  SEAT_ENV_ARGS=(-e SUTANDO_CODEX_APP_SERVER=1 -e "SUTANDO_PY=$py" -e "PATH=$PATH"
+  SEAT_ENV_ARGS=(-e SUTANDO_CODEX_SEAT=1 -e "SUTANDO_PY=$py" -e "PATH=$PATH"
                  -e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION"
                  -e SUTANDO_STANDBY_MODE=type -e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}")
   local forwarded
@@ -67,12 +69,114 @@ seat_end_helper_sessions() {
   return 0
 }
 
+# seat_wait_ready: until the seat reports its app-server and thread up (seat.py writes $SEAT_READY),
+# its session ends, or SUTANDO_SEAT_READY_TIMEOUT seconds (60) pass. Intake stays shut on failure.
+seat_wait_ready() {
+  local limit="${SUTANDO_SEAT_READY_TIMEOUT:-60}" i=0
+  case "$limit" in ''|*[!0-9]*) limit=60 ;; esac
+  while [ "$i" -lt $(( limit * 5 )) ]; do
+    [ -f "$SEAT_READY" ] && return 0
+    session_exists "$SESSION" || break
+    sleep 0.2
+    i=$(( i + 1 ))
+  done
+  [ -f "$SEAT_READY" ] && return 0
+  echo "  ⚠ the Codex app-server seat did not report ready (see logs/codex-seat.log); sentinel NOT cleared." >&2
+  return 1
+}
+
+# seat_target_state <session|window> <tmux id>: alive, absent or unknown. A failed listing is unknown,
+# except with no tmux server socket at all, where nothing can be alive.
+seat_target_state() {
+  local kind="$1" target="$2" ids
+  if [ "$kind" = session ]; then
+    ids="$(tmux -S "$TMUX_SOCKET" list-sessions -F '#{session_id}' 2>/dev/null)"
+  else
+    ids="$(tmux -S "$TMUX_SOCKET" list-windows -a -F '#{window_id}' 2>/dev/null)"
+  fi || { [ -S "$TMUX_SOCKET" ] && echo unknown || echo absent; return 0; }
+  printf '%s\n' "$ids" | grep -qxF -- "$target" && echo alive || echo absent
+}
+
+# seat_hold_intake: shut intake for a seat that could not be stopped, and remember which stop is ours:
+# intake-held holds the token of a sentinel this launch wrote, `external` when another stop already
+# held it, `unknown` when writing the stop failed (who holds intake is not known).
+seat_hold_intake() {
+  local py token="" rc=1
+  [ -n "$SEAT_READY" ] || return 0
+  py="$(heartbeat_python)"
+  # Exit 0 with a token: this launch wrote the stop; 0 with none: one was already held; else failed.
+  [ -n "$py" ] && { token="$("$py" "$REPO/src/shutdown.py" mark-if-absent codex-seat-not-ready 2>/dev/null)" && rc=0 || rc=$?; }
+  if [ "$rc" != 0 ]; then
+    token=unknown
+    echo "  ✗ could not shut intake for the surviving seat (shutdown.py mark-if-absent: ${py:+exit $rc}${py:-no Python}) — task intake may still be open." >&2
+  fi
+  printf '%s\n' "${token:-external}" > "${SEAT_READY%/ready}/intake-held" 2>/dev/null \
+    || echo "  ✗ could not write ${SEAT_READY%/ready}/intake-held; a later launch will not know this seat failed." >&2
+}
+
+# seat_stop <session|window> <tmux id>: stop exactly the seat this launch started (its immutable tmux
+# id) and confirm it is gone; loud and nonzero when it is not, with intake marked held for this seat.
+seat_stop() {
+  local kind="$1" target="$2" state=unknown
+  if [ -n "$target" ]; then
+    tmux -S "$TMUX_SOCKET" "kill-$kind" -t "$target" 2>/dev/null || true
+    state="$(seat_target_state "$kind" "$target")"
+    [ "$state" = absent ] && return 0
+  fi
+  seat_hold_intake
+  echo "  ✗ could not stop the unready Codex app-server seat ($kind ${target:-of unknown id}: $state) — intake stays shut; stop it by hand (tmux -S $TMUX_SOCKET kill-$kind -t ${target:-=$SESSION}) before the next launch." >&2
+  return 1
+}
+
+# seat_reattach: a launch that finds the seat running accepts it as before, unless this launcher held
+# intake shut for that seat (intake-held: its teardown failed). Then it must report ready first, and
+# only the stop this launcher wrote is cleared (compare-and-clear on its token); a newer one stays.
+seat_reattach() {
+  local ws held py token rc
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || ws=""
+  [ -n "$ws" ] || return 0
+  SEAT_READY="$(seat_state_dir "$ws" "$SESSION")/ready"
+  held="${SEAT_READY%/ready}/intake-held"
+  [ -f "$held" ] || return 0
+  if ! seat_wait_ready; then
+    echo "  ✗ the running Codex app-server seat in $SESSION is not ready — not accepting it; intake left shut. Restart it from outside the core: bash src/agent/start-cli.sh --restart" >&2
+    return 1
+  fi
+  py="$(heartbeat_python)"
+  if [ ! -r "$held" ] || ! token="$(head -n1 -- "$held" 2>/dev/null)"; then
+    echo "  ✗ could not read $held — keeping it; not accepting the seat." >&2
+    return 1
+  fi
+  case "$token" in
+    external) rm -f "$held"; return 0 ;;
+    ""|unknown)
+      echo "  ✗ $held does not say which stop holds intake (it could not be recorded) — keeping it; not accepting the seat. Once you have checked intake, remove it by hand: rm '$held' (and python3 src/shutdown.py clear if intake should reopen)." >&2
+      return 1 ;;
+  esac
+  rc=1
+  [ -n "$py" ] && { "$py" "$REPO/src/shutdown.py" clear-if "$token" >/dev/null 2>&1 && rc=0 || rc=$?; }
+  case "$rc" in
+    0) ;;
+    3) echo "  · the Codex app-server seat is ready; a newer stop holds intake, so it stays shut." >&2 ;;
+    *) echo "  ✗ the Codex app-server seat is ready, but the intake held for it could not be reopened (shutdown.py clear-if: ${py:+exit }${py:+$rc}${py:-no Python}) — keeping $held; not accepting the seat." >&2
+       return 1 ;;
+  esac
+  rm -f "$held"
+}
+
 seat_start_core_session_and_helpers() {
+  local seat_id
   seat_core_prepare || return 1
   prepare_codex_home
-  tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" "${SEAT_ENV_ARGS[@]}" \
-    "$SEAT_CLI" "${SEAT_ARGS[@]}"
+  rm -f "$SEAT_READY" "${SEAT_READY%/ready}/intake-held"
+  seat_id="$(tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" "${SEAT_ENV_ARGS[@]}" \
+    -P -F '#{session_id}' "$SEAT_CLI" "${SEAT_ARGS[@]}")" || seat_id=""
   wait_core_up "$SESSION" session_exists "$SESSION" || return 1
+  if ! seat_wait_ready; then
+    # Torn down, not left starting: a later launch would find it live and skip this readiness check.
+    seat_stop session "$seat_id"
+    return 1
+  fi
   log_session_start
   record_confirmed_core_runtime codex "$(heartbeat_python)"
   clear_shutdown_sentinel
@@ -94,8 +198,16 @@ seat_heal_core_window() {
     tmux -S "$TMUX_SOCKET" kill-window -t "$_win" 2>/dev/null || true
   done
   prepare_codex_home
-  if ! idx="$(sutando_new_core_window "$TMUX_SOCKET" "$SESSION" "${CORE_ENV_ARGS[@]}" "${SEAT_ENV_ARGS[@]}" -c "$REPO" "$SEAT_CLI" "${SEAT_ARGS[@]}")" \
-     || [ -z "$idx" ]; then
+  rm -f "$SEAT_READY" "${SEAT_READY%/ready}/intake-held"
+  local created win_id
+  # The window's immutable id comes back from the call that creates it, with its index.
+  created="$(tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_id} #{window_index}' -t "$SESSION:0" \
+      "${CORE_ENV_ARGS[@]}" "${SEAT_ENV_ARGS[@]}" -c "$REPO" "$SEAT_CLI" "${SEAT_ARGS[@]}" 2>/dev/null \
+    || tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_id} #{window_index}' -t "$SESSION" \
+      "${CORE_ENV_ARGS[@]}" "${SEAT_ENV_ARGS[@]}" -c "$REPO" "$SEAT_CLI" "${SEAT_ARGS[@]}")" || created=""
+  win_id="${created%% *}"
+  idx="${created#* }"
+  if [ -z "$created" ] || [ -z "$win_id" ] || [ "$idx" = "$created" ]; then
     echo "  ⚠ could not create a seat window in $SESSION — sentinel NOT cleared, no core is serving." >&2
     return 1
   fi
@@ -106,6 +218,10 @@ seat_heal_core_window() {
   tmux -S "$TMUX_SOCKET" select-window -t "=$SESSION:$idx" 2>/dev/null || true
   tmux -S "$TMUX_SOCKET" set-environment -t "=$SESSION" SUTANDO_CORE_RUNTIME codex 2>/dev/null || true
   wait_core_up "the healed seat window" codex_core_live || return 1
+  if ! seat_wait_ready; then
+    seat_stop window "$win_id"
+    return 1
+  fi
   log_session_start
   record_confirmed_core_runtime codex "$(heartbeat_python)"
   clear_shutdown_sentinel
@@ -128,7 +244,8 @@ seat_core_overrides() {
     local ids
     ids="$(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" live "$SEAT_NAME")" && [ -z "$ids" ]
   }
-  ensure_task_notifier() { seat_end_helper_sessions; }
+  # Called only on the launcher's already-running path while a seat is the core.
+  ensure_task_notifier() { seat_end_helper_sessions; seat_reattach || exit 1; }
   ensure_codex_observer() { :; }
   # The supervisor's block hooks read a TUI pane, and the seat draws none.
   add_codex_block_hooks() { :; }

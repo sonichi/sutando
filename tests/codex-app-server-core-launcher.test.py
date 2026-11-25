@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The Codex core launcher's SUTANDO_CODEX_APP_SERVER switch, in the fixture of
-tests/codex-core-launcher.test.py: with the flag unset the launcher issues the tmux calls it
-issued before the switch existed; with it set the core session holds the seat and no helper."""
+tests/codex-core-launcher.test.py (which runs with the switch at 0): turned off the launcher
+issues the tmux calls it issued before the switch existed; on (the default) the core session
+holds the seat and no helper."""
 from __future__ import annotations
 
 import importlib.util
@@ -28,25 +29,39 @@ SEAT_TMUX = r'''#!/bin/bash
 printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 S="$TMUX_STATE"
+seat_ready() {  # the seat's ready file, as seat.py writes it once its app-server and thread are up
+  [ -n "${FAKE_SEAT_INIT_FAILS:-}" ] && return 0
+  local prev=""
+  for a in "$@"; do [ "$prev" = --host ] && echo $$ > "${a%/*}/ready"; prev="$a"; done
+}
 case "${1:-}" in
   new-session)
     if [ "${4:-}" = sutando-core ]; then
       kind=codex
       for a in "$@"; do case "$a" in */codex-seat) kind=seat ;; esac; done
       echo "$kind" > "$S.core"
+      [ "$kind" = seat ] && seat_ready "$@"
+      for a in "$@"; do [ "$a" = "#{session_id}" ] && echo '$7'; done
     fi
     [ "${4:-}" = sutando-core-watcher ] && touch "$S.watcher"
     exit 0 ;;
-  new-window) echo seat > "$S.core"; echo 0; exit 0 ;;
+  new-window)
+    echo seat > "$S.core"; seat_ready "$@"
+    for a in "$@"; do [ "$a" = "#{window_id} #{window_index}" ] && { echo "@9 0"; exit 0; }; done
+    echo 0; exit 0 ;;
+  list-sessions)
+    [ -n "${FAKE_INSPECT_FAILS:-}" ] && exit 1
+    [ -f "$S.core" ] && echo '$7'; exit 0 ;;
   has-session)
-    [ "${3:-}" = =sutando-core ] && [ -f "$S.core" ] && exit 0
+    case "${3:-}" in =sutando-core|'$7') [ -f "$S.core" ] && exit 0 ;; esac
     [ "${3:-}" = =sutando-core-watcher ] && [ -f "$S.watcher" ] && exit 0
     exit 1 ;;
   kill-session)
-    [ "${3:-}" = =sutando-core ] && rm -f "$S.core"
+    [ -n "${FAKE_KILL_FAILS:-}" ] && exit 1
+    case "${3:-}" in =sutando-core|'$7') rm -f "$S.core" ;; esac
     [ "${3:-}" = =sutando-core-watcher ] && rm -f "$S.watcher"
     exit 0 ;;
-  kill-window) rm -f "$S.core"; exit 0 ;;
+  kill-window) [ -n "${FAKE_KILL_FAILS:-}" ] && exit 1; rm -f "$S.core"; exit 0 ;;
   list-panes)
     [ -f "$S.core" ] || exit 1
     kind="$(cat "$S.core")"
@@ -56,9 +71,13 @@ case "${1:-}" in
     for a in "$@"; do case "$a" in *'|'*) echo "@0|0|main|$cmd --arg"; exit 0 ;; esac; done
     echo "@0 0 $cmd --arg"
     exit 0 ;;
-  list-windows) echo 0; exit 0 ;;
+  list-windows)
+    for a in "$@"; do [ "$a" = "#{window_id}" ] && { [ -n "${FAKE_INSPECT_FAILS:-}" ] && exit 1; [ -f "$S.core" ] && echo @9; exit 0; }; done
+    echo 0; exit 0 ;;
   show-environment) echo "SUTANDO_CORE_RUNTIME=codex"; exit 0 ;;
-  display-message) echo 123; exit 0 ;;
+  display-message)
+    for a in "$@"; do [ "$a" = "#{window_id}" ] && { echo @9; exit 0; }; done
+    echo 123; exit 0 ;;
 esac
 exit 0
 '''
@@ -113,7 +132,8 @@ class Fixture:
 
 
 class FlagOff(unittest.TestCase):
-    """Unset, empty or 0, the launcher's tmux calls are those of the launcher without the switch."""
+    """Off (0, or any value but 1), the launcher's tmux calls are those of the launcher without
+    the switch. The fixture runs with 0."""
 
     def compare(self, *args, **env):
         current = Fixture(self)
@@ -138,8 +158,8 @@ class FlagOff(unittest.TestCase):
         self.assertIn("new-session -d -s sutando-core-watcher", calls)
         self.assertNotIn("codex-seat", calls)
 
-    def test_empty_and_zero_are_off(self):
-        for value in ("", "0"):
+    def test_any_value_but_one_is_off(self):
+        for value in ("0", "false", "no"):
             with self.subTest(value=value):
                 self.assertNotIn("codex-seat", self.compare(SUTANDO_CODEX_APP_SERVER=value))
 
@@ -168,7 +188,7 @@ class FlagOn(unittest.TestCase):
         self.assertIn(f"--workspace {f.workspace.resolve()} --seat sutando-core --codex {f.h.bin}/codex ".replace(str(f.tmp), "<TMP>"), line)
         self.assertIn('-c web_search="live" -c check_for_update_on_startup=false -c project_doc_max_bytes=131072 '
                       "--model gpt-test --watcher", line)
-        for env in ("-e SUTANDO_CODEX_APP_SERVER=1", "-e SUTANDO_STANDBY_MODE=type", "-e SUTANDO_STOP_INTERRUPT=1",
+        for env in ("-e SUTANDO_CODEX_SEAT=1", "-e SUTANDO_STANDBY_MODE=type", "-e SUTANDO_STOP_INTERRUPT=1",
                     "-e SUTANDO_TMUX_SESSION=sutando-core", "-e SUTANDO_CORE_MODEL=gpt-test", "-e CODEX_HOME="):
             self.assertIn(env, line)
         self.assertNotIn("READY", calls, "no bootstrap prompt is typed into a seat")
@@ -219,7 +239,7 @@ class FlagOn(unittest.TestCase):
         self.assertIn("healing the core window", result.stderr)
         window = [ln for ln in f.calls().splitlines() if " new-window " in ln]
         self.assertEqual(len(window), 1)
-        self.assertRegex(window[0], r"-e SUTANDO_CODEX_APP_SERVER=1 .* \S+/codex-seat --host ")
+        self.assertRegex(window[0], r"-e SUTANDO_CODEX_SEAT=1 .* \S+/codex-seat --host ")
         self.assertNotIn("new-session", f.calls())
 
     def test_restart_moves_a_tui_core_onto_the_seat(self):
@@ -258,6 +278,242 @@ class FlagOn(unittest.TestCase):
         self.assertRegex(f.calls(), r"new-session -d -s sutando-core .*codex-seat --host ")
         self.assertTrue(f.declaration().exists())
 
+
+
+class PersistedChoice(unittest.TestCase):
+    """`core.codex_app_server` (what `sutando-config.sh codex-app-server-select` writes without a
+    desktop) decides every launch that does not set the variable (on when nothing is chosen); a
+    set variable overrides it. An empty variable is unset."""
+
+    UNSET = {"SUTANDO_CODEX_APP_SERVER": ""}
+
+    def test_with_nothing_chosen_the_core_is_a_seat(self):
+        f = Fixture(self, seat_tmux=True)
+        result = f.run(**self.UNSET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(f.calls(), r"new-session -d -s sutando-core .*-e SUTANDO_CODEX_SEAT=1 .*codex-seat --host ")
+        self.assertNotIn("new-session -d -s sutando-core-watcher", f.calls())
+
+    def test_chosen_off_the_core_is_the_tui(self):
+        f = Fixture(self, seat_tmux=True)
+        self.choose(f, False)
+        result = f.run(**self.UNSET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("codex-seat", f.calls())
+        self.assertIn("new-session -d -s sutando-core-watcher", f.calls())
+        self.assertFalse(f.declaration().exists())
+
+    def choose(self, f: Fixture, on: bool) -> None:
+        (f.workspace / "sutando.config.local.json").write_text(json.dumps({"core": {"codex_app_server": on}}))
+
+    def test_a_launch_without_the_variable_follows_the_persisted_choice(self):
+        f = Fixture(self, seat_tmux=True)
+        self.choose(f, True)
+        result = f.run(**self.UNSET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(f.calls(), r"new-session -d -s sutando-core .*-e SUTANDO_CODEX_SEAT=1 .*codex-seat --host ")
+        self.assertTrue(f.declaration().exists())
+
+    def test_a_set_variable_overrides_the_persisted_choice(self):
+        f = Fixture(self, seat_tmux=True)
+        self.choose(f, True)
+        result = f.run(SUTANDO_CODEX_APP_SERVER="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("codex-seat", f.calls())
+        self.assertIn("new-session -d -s sutando-core-watcher", f.calls())
+
+    def test_a_seat_whose_app_server_never_comes_up_leaves_intake_shut(self):
+        f = Fixture(self, seat_tmux=True)
+        sentinel = f.workspace / "state" / "shutdown.sentinel"
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text('{"reason": "test", "ts": 0}\n')
+        result = f.run(FAKE_SEAT_INIT_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(f.calls(), r"new-session -d -s sutando-core .*codex-seat --host ")
+        self.assertIn("did not report ready", result.stderr)
+        self.assertTrue(sentinel.exists(), "intake is not reopened before the seat is ready")
+        self.assertIn("kill-session -t $7", f.calls(), "the exact seat started is torn down, by its id")
+        self.assertNotIn("kill-session -t =sutando-core", f.calls())
+        # The next launch therefore starts a seat and checks readiness again, not a fast return.
+        f.h.log.unlink()
+        result = f.run(**self.UNSET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("already running", result.stdout)
+        self.assertRegex(f.calls(), r"new-session -d -s sutando-core .*codex-seat --host ")
+        self.assertFalse(sentinel.exists())
+
+    def test_a_healed_seat_window_that_never_comes_up_is_removed_and_intake_stays_shut(self):
+        f = Fixture(self, seat_tmux=True)
+        f.core("gone")
+        sentinel = f.workspace / "state" / "shutdown.sentinel"
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text('{"reason": "test", "ts": 0}\n')
+        result = f.run(FAKE_SEAT_INIT_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("new-window", f.calls())
+        self.assertIn("kill-window -t @9", f.calls(), "the healed window is stopped by its id")
+        self.assertTrue(sentinel.exists())
+
+    def held_launch(self):
+        """A seat that never reports ready and cannot be stopped: the launch holds intake for it."""
+        f = Fixture(self, seat_tmux=True)
+        sentinel = f.workspace / "state" / "shutdown.sentinel"
+        result = f.run(FAKE_SEAT_INIT_FAILS="1", FAKE_KILL_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not stop the unready Codex app-server seat (session $7: alive)", result.stderr)
+        self.assertTrue(sentinel.exists(), "this launch shut intake itself")
+        held = f.declaration().parent / "intake-held"
+        self.assertTrue(held.read_text().strip(), "the token of the stop this launch wrote")
+        return f, sentinel, held
+
+    def test_a_seat_that_cannot_be_stopped_fails_the_launch_loudly_with_intake_shut(self):
+        f, sentinel, held = self.held_launch()
+        # The surviving seat is not accepted by the next launch until it reports ready...
+        result = f.run(FAKE_SEAT_INIT_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("is not ready — not accepting it", result.stderr)
+        self.assertTrue(sentinel.exists())
+        # ...and once it is, the stop this launcher wrote is cleared.
+        (f.declaration().parent / "ready").write_text("1\n")
+        result = f.run(**self.UNSET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already running", result.stdout)
+        self.assertFalse(sentinel.exists())
+        self.assertFalse(held.exists())
+
+    def test_a_newer_drain_survives_the_ready_reattach(self):
+        f, sentinel, held = self.held_launch()
+        sentinel.write_text('{"reason": "drain", "ts": 1, "gen": "newer"}\n')  # someone else's stop since
+        (f.declaration().parent / "ready").write_text("1\n")
+        result = f.run(**self.UNSET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"newer"', sentinel.read_text(), "only the stop this launch wrote is cleared")
+        self.assertIn("a newer stop holds intake", result.stderr)
+        self.assertFalse(held.exists(), "a newer drain is a normal 'not mine': the marker is done")
+
+    def test_a_reattach_whose_clear_cannot_run_keeps_the_marker_and_fails(self):
+        f, sentinel, held = self.held_launch()
+        (f.declaration().parent / "ready").write_text("1\n")
+        lock = sentinel.with_name("shutdown.sentinel.lock")
+        lock.unlink(missing_ok=True)
+        lock.mkdir()  # the compare-and-clear cannot take its lock: an operational error
+        result = f.run(**self.UNSET)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not be reopened", result.stderr)
+        self.assertTrue(held.exists(), "the recovery marker is kept for the next try")
+        self.assertTrue(sentinel.exists())
+        lock.rmdir()
+        self.assertEqual(f.run(**self.UNSET).returncode, 0)
+        self.assertFalse(sentinel.exists())
+        self.assertFalse(held.exists())
+
+    def test_an_unreadable_marker_is_kept_and_the_reattach_fails(self):
+        f, sentinel, held = self.held_launch()
+        (f.declaration().parent / "ready").write_text("1\n")
+        held.chmod(0)
+        self.addCleanup(lambda: held.exists() and held.chmod(0o600))
+        result = f.run(**self.UNSET)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not read", result.stderr)
+        self.assertTrue(held.exists())
+        self.assertTrue(sentinel.exists())
+
+    def test_a_stop_that_cannot_be_written_is_reported_not_taken_for_already_held(self):
+        f = Fixture(self, seat_tmux=True)
+        lock = f.workspace / "state" / "shutdown.sentinel.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.mkdir()  # mark-if-absent cannot take its lock
+        result = f.run(FAKE_SEAT_INIT_FAILS="1", FAKE_KILL_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not shut intake for the surviving seat", result.stderr)
+        held = f.declaration().parent / "intake-held"
+        self.assertEqual(held.read_text().strip(), "unknown", "not the same as a confirmed external stop")
+        lock.rmdir()
+        (f.declaration().parent / "ready").write_text("1\n")
+        result = f.run(**self.UNSET)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("does not say which stop holds intake", result.stderr)
+        self.assertIn("rm '", result.stderr, "it says how an operator clears it")
+        self.assertTrue(held.exists(), "an unknown marker is never cleared automatically")
+
+    def test_a_stop_already_in_place_is_never_cleared_by_the_reattach(self):
+        f = Fixture(self, seat_tmux=True)
+        sentinel = f.workspace / "state" / "shutdown.sentinel"
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text('{"reason": "drain", "ts": 0}\n')
+        result = f.run(FAKE_SEAT_INIT_FAILS="1", FAKE_KILL_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
+        self.assertNotIn("could not shut intake", result.stderr, "already held is a success, not a failure")
+        held = f.declaration().parent / "intake-held"
+        self.assertEqual(held.read_text().strip(), "external", "not this launch's stop")
+        (f.declaration().parent / "ready").write_text("1\n")
+        self.assertEqual(f.run(**self.UNSET).returncode, 0)
+        self.assertTrue(sentinel.exists())
+
+    def test_a_seat_whose_state_cannot_be_read_after_the_kill_is_unknown_not_gone(self):
+        f = Fixture(self, seat_tmux=True)
+        (f.tmp / "tmux.sock").unlink(missing_ok=True)
+        import socket as _s
+        sock = _s.socket(_s.AF_UNIX)
+        sock.bind(str(f.tmp / "tmux.sock"))
+        self.addCleanup(sock.close)
+        result = f.run(FAKE_SEAT_INIT_FAILS="1", FAKE_INSPECT_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("(session $7: unknown)", result.stderr)
+
+    def test_a_ready_seat_found_running_is_accepted_without_touching_intake(self):
+        f = Fixture(self, seat_tmux=True)
+        self.assertEqual(f.run(**self.UNSET).returncode, 0)
+        sentinel = f.workspace / "state" / "shutdown.sentinel"
+        sentinel.write_text('{"reason": "drain", "ts": 0}\n')
+        result = f.run(**self.UNSET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already running", result.stdout)
+        self.assertTrue(sentinel.exists(), "a shutdown someone else set is not this launcher's to lift")
+
+    def test_a_healed_window_that_cannot_be_stopped_fails_loudly(self):
+        f = Fixture(self, seat_tmux=True)
+        f.core("gone")
+        result = f.run(FAKE_SEAT_INIT_FAILS="1", FAKE_KILL_FAILS="1", SUTANDO_SEAT_READY_TIMEOUT="1", **self.UNSET)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not stop the unready Codex app-server seat (window @9: alive)", result.stderr)
+
+    def test_a_ready_seat_reopens_intake(self):
+        f = Fixture(self, seat_tmux=True)
+        sentinel = f.workspace / "state" / "shutdown.sentinel"
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text('{"reason": "test", "ts": 0}\n')
+        result = f.run(**self.UNSET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(sentinel.exists())
+
+    def test_an_inherited_export_of_the_resolved_mode_does_not_override_the_choice(self):
+        # What a running seat's children inherit is no override: the saved Off decides.
+        f = Fixture(self, seat_tmux=True)
+        self.choose(f, False)
+        result = f.run(CODEX_SEAT_ON="1", SUTANDO_CODEX_SEAT="1", **self.UNSET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("codex-seat", f.calls())
+
+    def test_the_seat_session_is_marked_without_the_override_variable(self):
+        f = Fixture(self, seat_tmux=True)
+        self.assertEqual(f.run(**self.UNSET).returncode, 0)
+        line, = re.findall(r"new-session -d -s sutando-core .*", f.calls())
+        self.assertIn("-e SUTANDO_CODEX_SEAT=1", line)
+        self.assertNotIn("SUTANDO_CODEX_APP_SERVER=", line, "workers spawned by the seat resolve the saved choice")
+
+    def test_restart_after_turning_it_off_replaces_the_seat_with_the_tui(self):
+        f = Fixture(self, seat_tmux=True)
+        self.choose(f, True)
+        self.assertEqual(f.run(**self.UNSET).returncode, 0)
+        self.assertTrue(f.declaration().exists())
+        self.choose(f, False)
+        f.h.log.unlink()
+        result = f.run("--restart", **self.UNSET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        launch = re.findall(r"new-session -d -s sutando-core .*", f.calls())
+        self.assertEqual(len(launch), 1)
+        self.assertNotIn("codex-seat", launch[0])
+        self.assertFalse(f.declaration().exists())
 
 if __name__ == "__main__":
     unittest.main()
