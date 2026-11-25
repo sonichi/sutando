@@ -417,6 +417,26 @@ class ASpinnerRowAloneIsATurnRunning(unittest.TestCase):
         later = self.REAL.replace(f"{self.TIP}\n", f"{self.TIP}\n⏺ Done.\n✻ Cooked for 2m 3s\n")
         self.assertEqual(self.verdict(later), ("idle-ready", "idle footer or empty composer"))
 
+    def idle_after(self, reply):
+        """The capture's frame after a short turn whose reply is `reply`, with no completion row."""
+        return self.REAL.replace(f"{self.SPINNER}\n{self.TIP}\n", reply)
+
+    def test_a_spinner_quoted_in_a_finished_reply_is_not_a_turn(self):
+        # Reply and tool text are indented; the CLI draws its live spinner at column 0.
+        quoted = "⏺ The worker pane reads:\n  ✳ Moonwalking… ({}s · ↓ 12 tokens)\n  so it was busy then.\n"
+        fenced = ("⏺ The worker pane reads:\n  ```\n  ✳ Moonwalking… ({}s · ↓ 12 tokens)\n"
+                  "  ```\n")
+        for name, reply in (("indented", quoted), ("fenced", fenced)):
+            with self.subTest(quote=name):
+                pane = self.idle_after(reply.format(3))
+                self.assertIsNotNone(pg.turn_status(pane.splitlines()))  # the row reads as a spinner
+                self.assertEqual(self.verdict(pane), ("idle-ready", "idle footer or empty composer"))
+                self.assertFalse(pg.turn_in_flight(self.idle_after(reply.format(30))))
+
+    def test_control_a_reply_whose_bullet_row_quotes_a_spinner_is_idle(self):
+        pane = self.idle_after("⏺ ✳ Moonwalking… (3s · ↓ 12 tokens) was the worker pane.\n")
+        self.assertEqual(self.verdict(pane), ("idle-ready", "idle footer or empty composer"))
+
     def test_control_a_dialog_under_the_spinner_still_holds_its_gate(self):
         rows = self.REAL.splitlines()
         at = rows.index(self.TIP) + 1
