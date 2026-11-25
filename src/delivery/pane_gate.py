@@ -99,7 +99,8 @@ TURN_SHORT = re.compile(r"[01]s")
 # pane returns to the idle footer, so no gate is on screen. Explicit list, extended by hand.
 LIMIT_REFUSAL = re.compile(
     r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit"
-    r"|(?:reached|used|exceeded) (?:all of )?your (?:session|usage|weekly) limit", re.I)
+    # The limit phrase must end its clause, so "used your weekly limit for uploads" is not one.
+    r"|(?:reached|used|exceeded) (?:all of )?your (?:session|usage|weekly) limit(?=[ \t]*(?:[·.!\n]|\Z))", re.I)
 REFUSAL = re.compile(
     LIMIT_REFUSAL.pattern
     # A bare "not logged in" is a refusal only as the CLI's own line-start `⎿` row.

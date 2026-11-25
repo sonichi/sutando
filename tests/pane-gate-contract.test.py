@@ -1824,6 +1824,12 @@ class WeeklyLimit(unittest.TestCase):
         self.assertEqual(kind, "selection")
         self.assertTrue(pg.limit_line("  ⎿  Weekly limit · resets Nov 28 at 1pm"))
 
+    def test_a_line_that_used_a_limit_on_something_else_is_no_refusal(self):
+        line = "  ⎿  You've used your weekly limit for uploads; it resets on Monday"
+        self.assertFalse(pg.limit_line(line))
+        self.assertFalse(pg.is_usage_limit("turn-rejected", line))
+        self.assertTrue(pg.is_usage_limit("turn-rejected", "  ⎿  You've used your weekly limit\n❯ "))
+
 
 if __name__ == "__main__":
     unittest.main()
