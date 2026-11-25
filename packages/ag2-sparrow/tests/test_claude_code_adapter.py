@@ -2664,6 +2664,11 @@ class LocalCommands(ConnectBase):
         seen[0] = seen[0][1:]
         self.assertEqual(seen[0][1:], ["-u", "-S", str(launcher.socket_path(cli.config_dir())), "attach", "-t", "=claude-local"])
         self.assertNotIn("sutando-tmux", seen[0][3])
+        # --view is the same attach as a read-only client: tmux, not the caller, refuses its keys.
+        with mock.patch.object(os, "execv", lambda f, argv: seen.append(argv)):
+            self.main("attach", "--view")
+        self.assertEqual(seen[1][1:], ["-u", "-S", str(launcher.socket_path(cli.config_dir())), "attach",
+                                       "-f", "read-only,ignore-size", "-t", "=claude-local"])
         help_text = subprocess.run([sys.executable, "-c", covered_code("import sys; sys.path.insert(0, %r); from ag2_sparrow.adapters."
                                     "claude_code.cli import main; main(['attach', '--help'])" % str(PKG))],
                                    capture_output=True, text=True).stdout
