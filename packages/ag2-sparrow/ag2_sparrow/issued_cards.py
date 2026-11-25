@@ -193,6 +193,17 @@ def live(workspace: Path, event_id: str, *, now: Optional[float] = None) -> Opti
     return entry if isinstance(entry.get("offers"), dict) else None
 
 
+def issued(workspace: Path, event_id: str, *, now: Optional[float] = None) -> bool:
+    """Whether this agent's ledger knows `event_id` as a card it posted: live, or retired and not yet
+    forgotten. An id it does not know may be anyone's message."""
+    now = time.time() if now is None else now
+    path = ledger_path(workspace)
+    entry = _read(path).get(str(event_id or ""))
+    if isinstance(entry, dict) and float(entry.get("expires_at") or 0) > now:
+        return True
+    return str(event_id or "") in _retired(path, now)
+
+
 def main(argv=None) -> int:
     """`record --workspace W --event-id $E [--room R --lane L --handler H]` with the posted card (or its room.message.send payload) on stdin."""
     import argparse

@@ -505,11 +505,11 @@ class ConnectorTest(unittest.TestCase):
         said = "Use Claude Opus 4.6"
         self.dm_task("task-2", said, reply_to="$never-posted", click=said)
         self.w.serve()
-        # The owner's own tap on a card this agent does not keep (an earlier install's, say) gets the
-        # current card in its place; it still picks nothing.
+        # The owner's own tap on a card this agent has no record of posting (an earlier install's, say) gets
+        # the current card as a new message, never as an edit of a message it cannot vouch for; it picks nothing.
         self.assertEqual(self.w.result("task-2"), "[no-send] the model card answers\n")
         (fresh,) = self.post_queued("$fresh")
-        self.assertEqual((fresh["op"], fresh["event_id"]), ("edit", "$never-posted"))
+        self.assertEqual((fresh["op"], fresh.get("event_id")), ("message", None))
         self.dm_task("task-3", "/model")
         self.w.serve()
         self.post_queued()

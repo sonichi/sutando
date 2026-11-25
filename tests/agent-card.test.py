@@ -620,6 +620,10 @@ class Issued(unittest.TestCase):
         self.assertTrue(issued_cards.record(self.ws, "$a", self.card, room=DM, now=1003.0, edited=True))
         self.assertEqual(cards(), ["$a"])
         self.assertIsNotNone(issued_cards.live(self.ws, "$a", now=1004.0))
+        # The ledger knows the events it posted, live or retired, and no other.
+        issued_cards.record(self.ws, "$b", self.card, room=DM, now=1005.0)
+        self.assertEqual([issued_cards.issued(self.ws, e, now=1006.0) for e in ("$a", "$b", "$other", "")],
+                         [True, True, False, False])
 
     def test_a_card_meant_before_a_live_one_of_its_id_is_retired_not_recorded(self):
         cards = lambda: sorted(json.loads(issued_cards.ledger_path(self.ws).read_text())["cards"])

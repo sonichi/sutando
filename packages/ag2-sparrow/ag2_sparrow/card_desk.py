@@ -8,6 +8,7 @@ names; a tap no card claims gets the fixed line, and never reaches the model.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from . import connector_cards
 
@@ -26,7 +27,7 @@ class Desk:
     def task(self, path, result_file) -> str:
         """What a task that was a card matter came to (a tap, or the owner's slash command in their DM),
         else ''."""
-        agent_card, _ = connector_cards._core()
+        agent_card, issued_cards = connector_cards._core()
         # The card rules read the task as the core does (the trusted header parse), not the connector's.
         with open(path, encoding="utf-8") as f:
             sent, said = agent_card.reply_words(f.read())
@@ -39,6 +40,9 @@ class Desk:
             # The owner tapped a card this agent no longer keeps (a newer one replaced it, it is past its
             # time, or an earlier install posted it): its kind says so and shows the current one.
             tapped = (agent_card.card_click(sent) or {}).get("card_id")
+            if not issued_cards.issued(Path(self.root), tapped_event(sent)):
+                # Not a card this agent is known to have posted: the fresh card is a new message, never an edit.
+                sent = dict(sent, reply_to_event="")
             for card in self.cards:
                 if tapped == card.CARD_ID:
                     return self.drawn(card, result_file, lambda: card.expired(sent, result_file))
