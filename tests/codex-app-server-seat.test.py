@@ -1049,6 +1049,35 @@ class AccountSwitch(SeatCase):
         self.assertEqual(health(self.ws)["state"], "ok")
         self.assertIn("account health: ok", self.out.getvalue())
 
+    def test_back_signed_in_the_owner_is_told_once_after_the_card(self):
+        """VM 2026-11-24 06:25: signed in and answered, but the card's 'Sign-in expired' was the last word."""
+        self.sign_in("tok-a", revoke="tok-a")
+        self.task("task-1.txt")
+        s = self.make(retry_s=3600, max_attempts=3)
+        s.model = "gpt-5.6-terra"
+        s.ensure_server()
+        self.assertEqual(s.step(), seat_mod.UNAUTHORIZED)
+        self.assertIsNotNone(s.told_signed_out, "the card was shown")
+        self.assertEqual(list(self.results.glob("proactive-model-signed-in-*.txt")), [])
+        self.sign_in("tok-b")
+        s.health_auth_check()
+        notice, = self.results.glob("proactive-model-signed-in-*.txt")
+        self.assertIn("Signed in as", notice.read_text())
+        self.assertIn("I'm back on gpt-5.6-terra.", notice.read_text())
+        s.health("quota")
+        s.health("ok")                         # a recovery nobody was shown a card for: no notice
+        self.assertEqual(len(list(self.results.glob("proactive-model-signed-in-*.txt"))), 1)
+
+    def test_back_after_a_limit_card_the_owner_is_told(self):
+        s = self.make()
+        s.model = "gpt-5.6-terra"
+        s.health("quota")
+        s.told_limit = True
+        s.health("ok")
+        notice, = self.results.glob("proactive-model-signed-in-*.txt")
+        self.assertIn("I'm back on gpt-5.6-terra.", notice.read_text())
+        self.assertFalse(s.told_limit)
+
     def test_a_card_that_could_not_be_sent_is_tried_again(self):
         self.sign_in("tok-a", revoke="tok-a")
         self.task("task-1.txt")
