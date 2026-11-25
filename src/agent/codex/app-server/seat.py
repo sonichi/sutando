@@ -896,6 +896,7 @@ class Seat:
         if model:
             # turn/start's model holds for this turn and the thread's later ones.
             params["model"] = model
+        self.turn_sent_model = model or self.model or ""   # the model this turn asks for (a pick or the seat's)
         try:
             try:
                 res = self.rpc.request("turn/start", params)
@@ -916,6 +917,8 @@ class Seat:
             self.mark_running()
         except (RuntimeError, KeyError, TypeError) as e:
             self.turn_unauth = unauthorized(str(e))
+            if model_missing(str(e)):
+                self.turn_model_missing = one_line(e, 200)
             return ("server-exited" if not self.rpc.alive() else "failed"), one_line(e, 240)
         log(f"task {filename}: turn started ({turn_id})")
         started = time.monotonic()
@@ -937,7 +940,10 @@ class Seat:
                     self.rate_limits = params["rateLimits"]
                 elif method == "error" and params.get("turnId") in (None, turn_id) and usage_limit(params.get("error")):
                     self.turn_limit = params["error"]
-                elif method == "error" and params.get("turnId") in (None, turn_id) and model_missing(params.get("error")):
+                if (method == "error" and params.get("threadId") in (None, self.thread_id)
+                        and model_missing(params.get("error"))):
+                    # A model refusal is the thread's, whatever turn id the event names (VM 2026-11-24:
+                    # refused at turn start, no compaction, and the card never followed).
                     self.turn_model_missing = one_line((params.get("error") or {}).get("message") or "", 200)
                 if params.get("threadId") in (None, self.thread_id):
                     turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
@@ -1135,7 +1141,7 @@ class Seat:
         Codex lists for this account), once per refused model, and the task stays pending, so it is
         answered on the pick once they make it (owner 2026-11-24: a card, never a silent switch). A card
         that cannot be posted is said in words instead, so a failed turn is never silent."""
-        refused = self.model or "the core model"
+        refused = getattr(self, "turn_sent_model", "") or self.model or "the core model"
         if self.worker or self.told_model_missing == refused:
             return
         lead = f"{refused} isn't available on this Codex account, so I couldn't answer."
@@ -1148,10 +1154,10 @@ class Seat:
             ok, why = False, one_line(e, 200)
         self.told_model_missing = refused
         if ok:
-            log(f"task {filename}: {refused} is not available to this account ({self.turn_model_missing}); "
-                "the model card was sent to the owner")
+            log(f"task {filename}: model card posted ({refused} is not available to this account: "
+                f"{self.turn_model_missing})")
             return
-        log(f"task {filename}: {refused} is not available to this account; the model card was not sent ({why})")
+        log(f"task {filename}: model card failed: {why} ({refused} is not available to this account); said in words")
         self.notify("refused", f"I couldn't answer: {refused} isn't available on this Codex account. "
                                "Send /model to pick one it can use.\n")
 
