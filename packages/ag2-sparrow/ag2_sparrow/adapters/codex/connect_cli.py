@@ -26,7 +26,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ... import _dirs, connect_bridge as cb, connect_common as cm, live_view, task_io
+from ... import _dirs, connect_bridge as cb, connect_common as cm, live_view, model_settings, task_io
 from ...connect_bridge import EXTERNAL, UNIT
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, RUN_TIMEOUT_S, Shape, _v
 from . import codex_connector
@@ -163,6 +163,7 @@ RECORDED = (("CODEX", "codex", str), ("CODEX_HOME", "codex_home", str), ("SANDBO
 
 
 def install(args) -> int:
+    cm.take_over(args)
     if getattr(args, "token_stdin", False):
         return cb.install_token_stdin(args, LOCAL, lambda: connect_preflight(args, login=False), install, COMMAND,
                                       work=None)
@@ -401,6 +402,18 @@ def list_cmd(_args) -> int:
     return cm.list_jobs(LOCAL)
 
 
+def model(args) -> int:
+    """The app's settings page: the agent's model, and the owner's pick (`--set`), in the state the
+    model card keeps, within the card's allowlist; every next turn runs on the pick (model_settings)."""
+    local, problem = selected(args)
+    cfg, problem = (None, problem) if problem else load_config(local)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    return model_settings.command(Path(cm.work_root(cfg)) / "state", args.set,
+                                  allowed=codex_connector.MODEL_ALLOWLIST)
+
+
 def session_options(p) -> None:
     """The connector's options, shared by install and connect."""
     p.add_argument("--codex", default="codex", help="the codex executable (default: codex on PATH)")
@@ -430,6 +443,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("install", help="record the settings, write the unit, have the manager start the connector "
                        "(a reinstall stops the old one first)")
+    cm.replace_option(p)
     p.add_argument("--work", help="an explicit work root, fed by a bridge you run: Sparrow's tasks/ and results/ must "
                    "be <work>/tasks and <work>/results")
     tok = p.add_mutually_exclusive_group()
@@ -474,6 +488,10 @@ def main(argv=None) -> int:
                  ).set_defaults(func=uninstall)
     sub.add_parser("list", help="each job installed here: its agent, the manager's state, its work root and the "
                    "selector that names it").set_defaults(func=list_cmd)
+    m = agent_option(sub.add_parser("model", help="print the agent's model as JSON (current, available, pending), "
+                                                  "or pick the one every next turn runs on (--set)"))
+    m.add_argument("--set", metavar="ID", help="a model id on the card's allowlist")
+    m.set_defaults(func=model)
     args = ap.parse_args(argv)
     args.argv = list(sys.argv[1:] if argv is None else argv)
     return args.func(args)

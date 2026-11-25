@@ -77,7 +77,20 @@ sutando_prepend_default_dir() {
   export PATH _SUTANDO_LAUNCH_PATH_ADDED="${_SUTANDO_LAUNCH_PATH_ADDED:+$_SUTANDO_LAUNCH_PATH_ADDED:}$d"
 }
 
+# sutando_append_codex_launch_path <repo>: the Codex launch PATH: the bundled node and the Codex
+# install dir ahead of the defaults (`codex` is a node script; ~/.npm-global/bin is its npm home).
+sutando_append_codex_launch_path() {
+  CODEX_INSTALL_BIN="${CODEX_INSTALL_BIN:-$HOME/.npm-global/bin}"
+  sutando_append_launch_path "$1" "${CODEX_NODE_BIN:-$(sutando_bundled_node_dir "$1")}" "$CODEX_INSTALL_BIN"
+}
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  if [ "${1:-}" = --codex-path ]; then
+    [ -n "${2:-}" ] || { echo "usage: launch-path.sh --codex-path <repo>" >&2; exit 2; }
+    sutando_append_codex_launch_path "$2"
+    printf '%s\n' "$PATH"
+    exit 0
+  fi
   [ -n "${1:-}" ] || { echo "usage: launch-path.sh <repo>" >&2; exit 2; }
   sutando_launch_path_dirs "$1"
 fi

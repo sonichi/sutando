@@ -30,7 +30,8 @@ WORKER_SESSION="$SUTANDO_TMUX_SESSION"
 # deliveries: it gets no notifier, which could only type into the seat's log.
 if [ "${1:-}" != "--print-command" ] \
    && [ -f "${SUTANDO_WORKSPACE_DIR:-}/state/codex-seat/$WORKER_SESSION/host.json" ] \
-   && [ "$(tmux -S "$SOCK" show-environment -t "=$WORKER_SESSION" SUTANDO_CODEX_APP_SERVER 2>/dev/null)" = "SUTANDO_CODEX_APP_SERVER=1" ]; then
+   && { [ "$(tmux -S "$SOCK" show-environment -t "=$WORKER_SESSION" SUTANDO_CODEX_SEAT 2>/dev/null)" = "SUTANDO_CODEX_SEAT=1" ] \
+        || [ "$(tmux -S "$SOCK" show-environment -t "=$WORKER_SESSION" SUTANDO_CODEX_APP_SERVER 2>/dev/null)" = "SUTANDO_CODEX_APP_SERVER=1" ]; }; then
   echo "worker-watcher-supervisor: $WORKER_SESSION is a Codex app-server seat; it needs no notifier"
   exit 0
 fi

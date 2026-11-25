@@ -2103,7 +2103,7 @@ class BoundaryGuardTest(SpyMixin, unittest.TestCase):
                          {"state", "results", "tasks", "results/<task>.txt",
                           "results/.<task>.txt.<tmp>", "state/done", "state/.done.<tmp>", "state/threads",
                           "state/threads/<key>", "state/threads/.<key>.<tmp>", "state/metrics.jsonl",
-                          "state/app-server-stub.stderr"})
+                          "state/app-server-stub.stderr", "state/live-view.log"})
 
     def strings(self, tree):
         doc = tree.body[0].value if tree.body and isinstance(tree.body[0], ast.Expr) else None
@@ -3303,7 +3303,7 @@ class BridgeEntryTest(Base):
         src = (PKG_ROOT / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
         for pin in ('_LOG_DIR = _STATE.parent / "logs"', '_LOG_FILE = _LOG_DIR / "gateway-bridge.log"',
                     '_LOCK_ROLE = f"gateway-bridge{_INST_SUFFIX}"', "_LOCK_WS = _STATE.parent",
-                    "manager = HitlManager(HitlStore(default_store(workspace)))", '_LOG_FILE.with_suffix(".log.1")'):
+                    "store = HitlStore(default_store(workspace))", '_LOG_FILE.with_suffix(".log.1")'):
             self.assertIn(pin, src, "the bridge's layout moved: update task_lifecycle's BRIDGE_* names")
         self.assertEqual(workspace_lock.acquire("gateway-bridge", Path(work)).status, "acquired")
         workspace_lock.acquire("gateway-bridge.second", Path(work))
