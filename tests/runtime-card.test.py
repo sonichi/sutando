@@ -1412,6 +1412,39 @@ class Switch(Base):
         self.assertEqual(len(self.fake.cards()), 1, "one card throughout")
         self.assertFalse(self.ws.joinpath(*rtc.RUNNING).exists())
 
+    def test_a_retry_after_a_put_off_restart_rolls_back_to_what_that_restart_left(self):
+        # Codex runs when the switch to Codex begins (the card was read on Claude Code); another restart
+        # then brings up Claude Code; the retry to Codex stops it and fails: Claude Code is put back.
+        self.ws.joinpath(*rtc.RUNNING).write_text(json.dumps(
+            {"attempt": "9-retry", "runtime": "codex", "room": DM, "ts": self.clock.t}))
+        self.record("codex", T0 - 600)
+        self.panes, self.selected = ("codex",), "codex"
+        lock, real = self.held(), self.clock.sleep
+
+        def sleep(s):
+            real(s)
+            if lock.exists():
+                self.panes, self.selected = ("claude",), "claude"
+                self.ends(lock, "claude")
+        self.clock.sleep = sleep
+
+        def restart(rt):
+            self.restarts.append(rt)
+            self.clock.t += 30
+            if len(self.restarts) == 1:
+                return rtc.DEFERRED
+            if rt == "codex":
+                self.panes = ()
+                return 1
+            self.record(rt, self.clock.t - 5)
+            self.panes, self.current, self.selected = (rt,), rt, rt
+            return 0
+        self.restart = restart
+        rc, out = self.run_(["switch", "--room", DM, "--runtime", "codex", "--attempt", "9-retry", "--card", "$card1"])
+        self.assertEqual(self.restarts, ["codex", "codex", "claude"])
+        self.assertEqual((rc, out["fell_back"], out["fell_back_confirmed"]), (1, "claude", True))
+        self.assertIn("I started Claude Code again, and the core is running on it.", out["say"])
+
     def test_the_other_restart_already_made_the_switch_so_nothing_is_restarted_again(self):
         lock = self.held()
         self.restart_rc = rtc.DEFERRED
