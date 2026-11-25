@@ -1199,6 +1199,19 @@ class CoreModelSwitch(SeatCase):
         self.assertEqual([("model" in r["params"]) for r in self.sent("turn/start")], [False])
         self.assertEqual(self.record()["status"], "pending")
 
+    def test_a_launch_that_already_runs_the_pending_pick_settles_it_on_the_first_completed_turn(self):
+        """VM 2026-11-24 06:29: the restart named terra, every turn ran on it, and the record stayed
+        'pending, working luna', so the model card named luna while Settings named terra."""
+        self.switch("gpt-6-luna", accepted=True)
+        self.switch("gpt-6.1-terra")                       # rev 2, pending
+        s = self.launched(2, model="gpt-6.1-terra")        # the restart named it
+        self.task("task-1.txt")
+        self.assertEqual(s.serve(once=True), 0)
+        self.assertEqual([("model" in r["params"]) for r in self.sent("turn/start")], [False], "no switch sent")
+        rec = self.record()
+        self.assertEqual((rec["status"], rec["working"], rec["confirmed"]),
+                         ("accepted", "gpt-6.1-terra", "gpt-6.1-terra"))
+
     def test_while_the_turn_runs_on_the_pick_the_record_says_so_and_it_is_confirmed_only_at_the_turns_end(self):
         # VM 2026-11-23: the turn that applied the pick ran on it, read the record mid-turn, and answered
         # "currently <the old model>; <the pick> pending". The record only changed at the turn's end.
