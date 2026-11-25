@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.parse
 import uuid
@@ -37,6 +38,37 @@ IN_DM = "I can switch accounts from our direct message. Ask me there."
 # agent's saved accounts and sign-in below them; one that does not shows the text and the button.
 BELOW = "Switch this agent's account below."
 CONTROLS = "account_controls"
+# The owner's own words that ask for the card, as a whole short message: to switch the account, or which
+# one the agent is on. The runtime cannot see its own sign-in, so these never go to the model.
+ASK_MAX = 80
+_YOU = r"(?:you|u|agy|antigravity|codex|claude(?: code)?|this agent|the agent)"
+_IN = r"(?:signed|logged) ?in"
+_END = r"\s*[。.!！?？]*\s*$"
+ASK_RES = tuple(re.compile(r"^\s*(?:hey|hi|ok|okay|so|and|请问|那)?[,，\s]*" + body + _END, re.I) for body in (
+    r"/account",
+    # switch it
+    r"(?:请|帮我|我要|我想)?(?:切换|换|更换)(?:一下|个)?账[号户]",
+    r"(?:please )?(?:switch|change)(?: the| your| my)? accounts?(?: please)?",
+    # which one: "which account", "what account are you on", "what's your account", "which account is this"
+    r"(?:which|what)(?:'s| is)?(?: the| your)? (?:account|e-?mail)"
+    r"(?: (?:are|r|is) " + _YOU + r"(?: (?:using|on|in|" + _IN + r"(?: (?:with|to|as))?))?"
+    r"| is (?:this|that|it)| (?:do|does) " + _YOU + r" use| " + _YOU + r"(?:'re| are| is) (?:using|on|" + _IN + r"(?: (?:with|to|as))?))?",
+    r"who (?:are|r|is) " + _YOU + r" " + _IN + r" as",
+    r"(?:can|could|do) " + _YOU + r" (?:see|tell me|show(?: me)?) (?:your|the|which|what|" + _YOU + r"(?:'s)?) ?account"
+    r"(?: (?:you(?:'re| are) (?:on|using)|it is|is it))?",
+    r"(?:" + _YOU + r"(?:'s)?|your) account[,:;]? ?(?:can you see it|which one(?: is it)?|what is it|which is it)",
+    # 哪个账号 / 你用的是什么账号 / 账号是什么 / 能看到你的账号吗
+    r"(?:你|您)?(?:现在|目前|当前)?(?:用的|在用的?|使用的|登录的|登的)?是?(?:哪个|哪一个|什么|啥)账[号户](?:啊|呢|呀)?",
+    r"(?:你的?|您的?)?(?:现在的?|目前的?|当前的?)?(?:登录的?)?账[号户]是(?:什么|哪个|哪一个|啥|谁)(?:啊|呢|呀)?",
+    r"(?:你|您)?(?:能|可以|能不能)?看(?:到|见|得到|得见)(?:你的?|自己的?)?账[号户]吗",
+))
+
+
+def asks_for_card(text) -> bool:
+    """Whether a message, whole and short, asks to switch the account or which one the agent is on. A
+    longer message, or one about some other account ("create an account on GitHub"), is the model's."""
+    said = text or ""
+    return len(said) <= ASK_MAX and any(r.match(said) for r in ASK_RES)
 ANSWERED = "[no-send] the account card answers\n"
 
 
@@ -78,6 +110,7 @@ def shown(email: str) -> str:
 class AccountSwitch:
     KIND, ASK, MARK, HINT, IN_DM = "account", "/account", MARK, HINT, IN_DM
     CARD_ID = CARD
+    asks = staticmethod(asks_for_card)
 
     def __init__(self, state_dir, bridge_state, name, publish, quoted, log, read, begin, cancel, opener, runtime=""):
         self.state_dir, self.bridge_state, self.name, self.runtime = state_dir, bridge_state, name, runtime
