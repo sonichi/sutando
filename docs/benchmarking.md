@@ -85,6 +85,7 @@ by comparisons and reports. Non-object documents, missing reader fields,
 wrong field types and excessive JSON nesting are comparison input errors,
 rather than regression exits or tracebacks. Optional runtime provenance and
 unknown metadata remain supported for historical runs.
+Decoder nesting limits vary by interpreter; this adds no fixed depth limit.
 `report` uses the same loader and returns a diagnostic with exit 2 for unreadable
 or invalid saved runs, without printing a partial report.
 

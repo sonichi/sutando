@@ -1335,7 +1335,7 @@ class CaseDefinitionTests(unittest.TestCase):
                         self.assertTrue(all(p.read_text() == "keep existing artifact"
                                             for p in output.iterdir()))
 
-    def test_saved_run_nesting_limit_is_an_input_error(self):
+    def test_deep_saved_run_is_an_input_error_without_assuming_parser_depth(self):
         depth = sys.getrecursionlimit() * 10
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1345,8 +1345,21 @@ class CaseDefinitionTests(unittest.TestCase):
             with contextlib.redirect_stderr(stderr):
                 rc = bench.main(["compare", str(path), str(path), "--output", str(root / "output")])
             self.assertEqual(rc, 2)
-            self.assertIn("saved-run JSON exceeds supported nesting", stderr.getvalue())
+            self.assertIn("cannot compare runs", stderr.getvalue())
             self.assertFalse((root / "output").exists())
+
+    def test_saved_run_parser_recursion_error_becomes_a_value_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "run.json"
+            path.write_text("{}")
+            with mock.patch.object(bench.json, "loads", side_effect=RecursionError):
+                with self.assertRaisesRegex(ValueError, "saved-run JSON exceeds supported nesting"):
+                    bench._load_run(path)
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    rc = bench.main(["compare", str(path), str(path)])
+                self.assertEqual(rc, 2)
+                self.assertIn("saved-run JSON exceeds supported nesting", stderr.getvalue())
 
     def test_valid_legacy_optional_identity_and_unknown_fields_remain_readable(self):
         for runtime in (None, {}, {"code": {}}):
@@ -1368,10 +1381,12 @@ class CaseDefinitionTests(unittest.TestCase):
                 self.assertIn("Sutando benchmark report", stdout.getvalue())
 
     def test_report_input_errors_return_two_without_partial_output(self):
+        bad_map = self.run_fixture()
+        bad_map["suite"]["case_fingerprints"] = {}
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "run.json"
             for body in (None, "not JSON", "[]", '{"kind":"sutando-benchmark-run"}',
-                         '{"kind":"other","kind":"sutando-benchmark-run"}'):
+                         '{"kind":"other","kind":"sutando-benchmark-run"}', json.dumps(bad_map)):
                 with self.subTest(body=body):
                     if body is not None:
                         path.write_text(body)
