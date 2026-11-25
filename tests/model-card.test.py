@@ -190,6 +190,17 @@ class Menu(Base):
         self.assertRegex(entry["handler"], ac._HANDLER_RE)
         self.assertEqual(entry["offers"][SAID["fable"]], "card:model:core:fable")
 
+    def test_a_retried_answer_to_one_message_reuses_its_operation_id(self):
+        # The same task again after a watcher restart, seconds later: the platform gets the same id.
+        import argparse
+        for at, ask in ((100.0, "$ask1"), (107.0, "$ask1"), (107.0, "$ask2"), (108.0, ""), (109.0, "")):
+            args = argparse.Namespace(room=DM, owner_dm=False, reply_to=ask, print=False, lead="")
+            with contextlib.redirect_stdout(io.StringIO()):
+                mc.cmd_post(self.ws, args, core=CORE, execute=self.fake.execute, now=lambda at=at: at)
+        ops = [c[2] for c in self.fake.calls if c[0] == "room.message.send"]
+        self.assertEqual(ops[0], ops[1])
+        self.assertEqual(len(set(ops[1:])), 4, "another message, or none to answer, is a new card")
+
     def test_post_refuses_any_room_but_the_owner_dm_and_names_a_missing_core(self):
         rc, out = self.run_(["post", "--room", ROOM])
         self.assertEqual((rc, out["status"]), (1, "failed"))

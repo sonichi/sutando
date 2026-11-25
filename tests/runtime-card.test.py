@@ -255,6 +255,17 @@ class Card(Base):
         self.assertEqual((rc, out["handler"]), (0, rtc.HANDLER))
         self.assertEqual(self.fake.calls, [])
 
+    def test_a_retried_answer_to_one_message_reuses_its_operation_id(self):
+        # The same task again after a watcher restart, seconds later: the platform gets the same id.
+        import argparse
+        for at, ask in ((T0, "$ask1"), (T0 + 7, "$ask1"), (T0 + 7, "$ask2"), (T0 + 8, ""), (T0 + 9, "")):
+            args = argparse.Namespace(room=DM, reply_to=ask, print=False)
+            with contextlib.redirect_stdout(io.StringIO()):
+                rtc.cmd_post(self.ws, args, core=CORE, execute=self.fake.execute, now=lambda at=at: at)
+        ops = [c[2] for c in self.fake.calls]
+        self.assertEqual(ops[0], ops[1])
+        self.assertEqual(len(set(ops[1:])), 4, "another message, or none to answer, is a new card")
+
     def test_status(self):
         self.record("codex", T0)
         rc, out = self.run_(["status"])

@@ -341,6 +341,12 @@ class Send(unittest.TestCase):
         ac.send_card(fake.execute, DM, body, card, operation_id="op-2", thread_root="$root")
         self.assertEqual(fake.calls[1][1]["thread_root"], "$root")
 
+    def test_send_key_names_an_answer_by_its_message_and_anything_else_by_the_second(self):
+        key = ac.send_key(DM, "$ask", lambda: 1.0)
+        self.assertEqual(key, ac.send_key(DM, "$ask", lambda: 99.0), "a retry of one answer: one id")
+        self.assertEqual(len({key, ac.send_key(DM, "$other", lambda: 1.0), ac.send_key(ROOM, "$ask", lambda: 1.0)}), 3)
+        self.assertEqual((ac.send_key(DM, "", lambda: 7.9), ac.send_key(DM, "", lambda: 8.0)), ("7", "8"))
+
     def test_a_private_card_goes_only_to_the_owner_dm(self):
         body, card = a_card()
         fake = FakeActions()

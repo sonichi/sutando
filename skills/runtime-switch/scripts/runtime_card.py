@@ -327,8 +327,9 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time) -> int:
         return _emit({"status": "failed", "why": str(e)}, 1)
     if args.print:
         return _emit({"body": body, "card": card, "handler": HANDLER})
-    out = _post(ws, args.room, body, card, f"runtime-card:menu:{int(now())}", reply_to=args.reply_to or "",
-                core=core, execute=execute)
+    reply_to = args.reply_to or ""
+    out = _post(ws, args.room, body, card, f"runtime-card:menu:{ac.send_key(args.room, reply_to, now)}",
+                reply_to=reply_to, core=core, execute=execute)
     return _emit(out, 0 if out["status"] == "posted" else 1)
 
 

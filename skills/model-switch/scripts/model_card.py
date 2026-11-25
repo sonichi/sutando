@@ -529,8 +529,9 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time) -> int:
     if delivered:
         body, card = menu_card(current_model(ws)["model"], picks, lead)
     shown = offered(picks)
-    out = _post(ws, room, body, card, f"model-card:menu:{int(now())}:{issuance(shown)}",
-                reply_to=args.reply_to or "", core=core, execute=execute)
+    reply_to = args.reply_to or ""
+    out = _post(ws, room, body, card, f"model-card:menu:{ac.send_key(room, reply_to, now)}:{issuance(shown)}",
+                reply_to=reply_to, core=core, execute=execute)
     if out.get("event_id"):
         try:
             remember_choices(ws, out["event_id"], shown, now())

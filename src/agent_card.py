@@ -16,6 +16,7 @@ the command. Standard library only, plus local_task_protocol, issued_cards and c
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import sys
 from dataclasses import dataclass
@@ -404,6 +405,15 @@ def _event_id(answer: Mapping[str, object]) -> str:
         if isinstance(eid, str) and eid.startswith("$"):
             return eid
     return ""
+
+
+def send_key(room_id: str, answering: str, now: Callable[[], float]) -> str:
+    """The part of a card's `room.message.send` operation id that names the send. A card answering a
+    message (`answering`: its event id) gets a key derived from room and message, so a retry of that
+    answer reuses the id and the platform returns the earlier post; with nothing to answer, the second."""
+    if not answering:
+        return str(int(now()))
+    return hashlib.sha256(f"{room_id}|{answering}".encode()).hexdigest()[:16]
 
 
 def send_card(execute: Execute, room_id: str, body: str, card: dict, *, operation_id: str,

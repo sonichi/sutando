@@ -343,6 +343,19 @@ class ClaudeCard(Base):
         self.assertEqual([b["label"] for b in card["buttons"]], ["Add another account"])
         self.assertFalse(self.store.exists())
 
+    def test_a_retried_answer_to_one_message_reuses_its_operation_id(self):
+        # The same task again after a watcher restart, seconds later: the platform gets the same id.
+        import argparse
+        for at, ask in ((100.0, "$ask1"), (107.0, "$ask1"), (107.0, "$ask2"), (108.0, ""), (109.0, "")):
+            args = argparse.Namespace(room=DM, owner_dm=False, reply_to=ask, print=False, lead="", retry=False,
+                                      signed_out=False)
+            with contextlib.redirect_stdout(io.StringIO()):
+                acc.cmd_post(self.ws, args, core=CORE, execute=self.fake.execute, now=lambda at=at: at,
+                             run=self.claude_run)
+        ops = [c[2] for c in self.fake.calls]
+        self.assertEqual(ops[0], ops[1])
+        self.assertEqual(len(set(ops[1:])), 4, "another message, or none to answer, is a new card")
+
     def test_signed_out_and_unreadable(self):
         self.claude_json = {"loggedIn": False}
         self.post()
@@ -374,6 +387,12 @@ class Taps(Base):
         self.assertIn("never in this chat", out["say"])
         self.assertEqual(self.launch.calls, [])
         self.assertEqual(self.fake.cards()[-1]["id"], acc.NOTE_ID)
+
+    def test_add_answers_each_tap_once_however_often_it_is_retried(self):
+        for msg in ("$tap1", "$tap1", "$tap2"):
+            self.tap("Add another account", source_message_id=msg)
+        ops = [c[2] for c in self.fake.calls[1:]]
+        self.assertEqual((ops[0] == ops[1], ops[1] == ops[2]), (True, False))
 
     def test_the_owners_use_tap_starts_the_detached_switch(self):
         rc, out = self.tap(self.use_b)

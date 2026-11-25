@@ -117,6 +117,16 @@ class Intercept(unittest.TestCase):
         self.assertFalse(self.run_with("what's on my calendar"))
         self.assertEqual(self.calls, [])
 
+    def test_a_task_retried_before_its_result_is_written_posts_with_the_same_message(self):
+        # The card script names its send for this message, so the platform returns the first post.
+        from unittest import mock
+        with mock.patch.object(sci, "answer", return_value=False):
+            self.assertTrue(self.run_with("switch account"))
+        self.assertTrue(self.run_with("switch account"))
+        first, again = (argv[argv.index("post") + 1:] for argv in self.calls)
+        self.assertEqual(first, again)
+        self.assertEqual(first[first.index("--reply-to") + 1], "$evt")
+
 
 class InterceptEdges(Intercept):
     def test_a_non_message_or_a_voice_task_or_no_room_is_left(self):
