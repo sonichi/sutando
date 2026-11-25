@@ -101,6 +101,14 @@ class Classifier(unittest.TestCase):
                      "fetch failed", "The core exited with status 1"):
             self.assertIsNone(clh.classify_text(text, now), text)
 
+    def test_the_limit_menu_alone_is_a_usage_limit(self):
+        # 2026-11-24 08:26 UTC on the VM: the hold took the bare menu as a rate limit, so no quota card.
+        menu = ("❯ /rate-limit-options\nWhat do you want to do?\n❯ 1. Stop and wait for limit to reset\n"
+                "  2. Wait here, then continue automatically at Nov 28 at 1pm\n  3. Switch to usage credits\n"
+                "Enter to confirm · Esc to cancel\n")
+        self.assertEqual(clh.classify_text(menu, time.time()).kind, "usage-limit")
+        self.assertEqual(clh.classify_text("API Error: 429 rate limited", time.time()).kind, "rate-limit")
+
     def test_reset_from_cli_text(self):
         at = datetime(2026, 10, 17, 10, 0, tzinfo=timezone.utc).timestamp()
         lim = clh.classify_text("5-hour limit reached ∙ resets 3pm (UTC)", at)
@@ -322,6 +330,8 @@ class Launcher(unittest.TestCase):
             "ANTHROPIC_BASE_URL": "http://127.0.0.1:9", "SUTANDO_TEST_MODE": "1",
             "SUTANDO_WORKSPACE": str(self.ws), "SUTANDO_RESTART_GRACE_S": "1",
             "SUTANDO_TMUX_SOCKET": str(td / "run" / "tmux.sock"),
+            # The held inbox would outlive the test and run the real launcher (core_held_inbox.py).
+            "SUTANDO_NO_HELD_INBOX": "1",
         }
 
     def tearDown(self):
@@ -780,6 +790,65 @@ class AccountChange(unittest.TestCase):
         self.assertEqual(self.gate(), 0, "a hold on account A kept a core signed in to account B down")
         self.assertIsNone(clh.active_hold(self.ws))
         self.assertEqual(self.gate(), 0, "the old account's evidence re-armed the hold")
+
+    def test_a_live_core_held_under_one_account_is_released_once_it_is_on_another(self):
+        """VM 2026-11-23: the core stayed paused after the owner switched to an account with quota.
+        The monitor lifts the hold as soon as the account in use is not the one the hold was seen under."""
+        import os
+        from unittest import mock
+        self.sign_in("acct-a", "a@example.com")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}):
+            clh.hold_while_wedged(self.ws, "You've hit your usage limit · resets 3pm", self.now)
+            self.assertEqual(clh.read_hold(self.ws)["status"], "held")
+            self.assertIsNone(clh.release_on_account_change(self.ws, self.now + 1), "the same account stays held")
+            self.sign_in("acct-b", "b@example.com")
+            released = clh.release_on_account_change(self.ws, self.now + 2)
+        self.assertEqual((released["status"], released["cleared_by"]), ("cleared", "account-change"))
+
+    def test_a_limit_on_screen_is_the_running_cores_account_not_the_config_switched_to(self):
+        """VM 2026-11-24: the desktop wrote account B into the config (no restart yet); the core still
+        running on A hit A's limit on screen; the hold was recorded under B, and every launch on B was
+        refused. The screen's limit belongs to the account the core was launched with."""
+        import os
+        from unittest import mock
+        self.sign_in("acct-a", "a@example.com")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}):
+            a = clh.launch_identity(self.ws)[1]
+        clh.record_launch_account(self.ws, a, self.now)   # the core was launched on A
+        self.assertEqual(clh.running_account(self.ws), a)
+        self.sign_in("acct-b", "b@example.com")       # the config names B; the core still runs A
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}):
+            clh.hold_while_wedged(self.ws, "You've hit your weekly limit · resets Nov 28 at 1pm (UTC)", self.now)
+            hold = clh.read_hold(self.ws)
+            self.assertEqual((hold["status"], hold["account"]), ("held", a), "A's limit, recorded under A")
+            self.assertNotEqual(hold["account"], clh.launch_identity(self.ws)[1])
+        self.assertEqual(self.gate(), 0, "the restart on B is not held by A's limit")
+        self.assertNotEqual(clh.running_account(self.ws), a, "the gate keeps the account it launched (B)")
+
+    def test_a_launch_account_that_cannot_be_kept_or_read_is_none(self):
+        from unittest import mock
+        clh.record_launch_account(self.ws, "")
+        with mock.patch.object(clh, "write_status", side_effect=OSError):
+            clh.record_launch_account(self.ws, "acct-a", self.now)
+        self.assertIsNone(clh.running_account(self.ws))
+
+    def test_with_no_launch_on_record_the_config_account_is_used_as_before(self):
+        import os
+        from unittest import mock
+        self.sign_in("acct-a", "a@example.com")
+        self.assertIsNone(clh.running_account(self.ws))
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}):
+            clh.hold_while_wedged(self.ws, "You've hit your usage limit · resets 3pm", self.now)
+            self.assertEqual(clh.read_hold(self.ws)["account"], clh.launch_identity(self.ws)[1])
+
+    def test_a_hold_with_no_account_or_an_unreadable_one_now_is_left_alone(self):
+        t = self.now
+        clh._write_hold(self.ws, {"status": "held", "kind": "usage-limit", "model": None, "evidence_at": t,
+                                  "set_at": t, "until": t + 600, "strikes": 1, "reason": "paused"})
+        self.assertIsNone(clh.release_on_account_change(self.ws, t, account="B"))
+        clh._write_hold(self.ws, dict(clh.read_hold(self.ws), account="A"))
+        self.assertIsNone(clh.release_on_account_change(self.ws, t, account=""))
+        self.assertEqual(clh.read_hold(self.ws)["status"], "held")
 
     def test_a_limit_hit_before_any_hold_is_not_pinned_on_the_account_signed_in_next(self):
         """The owner's report: account A ran with no hold on record, hit its limit and the core

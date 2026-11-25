@@ -262,6 +262,14 @@ PY
   fi
 }
 
+# Runs the skills' `on_session_route` scripts before this launch decides its API routing
+# (resolve_claude_credential_proxy). Bounded and fail-open, like the config hooks below.
+apply_skill_session_route() {
+  [ -n "${PY:-}" ] && [ -f "$REPO/src/session_config_hooks.py" ] || return 0
+  "$PY" "$REPO/src/session_config_hooks.py" --route \
+    || echo "session-launch: session-route hooks failed (rc=$?) — launch continues" >&2
+}
+
 # Runs the skills' `on_session_config` scripts against this session's CLAUDE_CONFIG_DIR
 # (src/session_config_hooks.py names no skill). Bounded and fail-open.
 apply_skill_session_config() {
@@ -397,11 +405,15 @@ apply_claude_obs_metering() {
 resolve_claude_credential_proxy() {
   CLAUDE_ROUTE_PREFIX=()
   [ -r "$REPO/src/claude_routing.sh" ] && . "$REPO/src/claude_routing.sh"
-  if declare -F claude_direct_routing > /dev/null && claude_direct_routing; then
+  if declare -F claude_routes_direct > /dev/null && claude_routes_direct; then
     claude_unset_local_proxy
     # tmux hands a new session its server's environment, which may still carry the proxy.
     CLAUDE_ROUTE_PREFIX=(sh -c '. "$1"; shift; claude_unset_local_proxy; exec "$@"' sh "$REPO/src/claude_routing.sh")
-    echo "  ✓ Claude calls Anthropic directly (quota from the status line recorder)"
+    if claude_direct_routing; then
+      echo "  ✓ Claude calls Anthropic directly (quota from the status line recorder)"
+    else
+      echo "  ✓ Claude calls Anthropic directly (CREDENTIAL_PROXY_ENABLED is off; no quota tracking)"
+    fi
     return 0
   fi
   _proxy_listener_up() {

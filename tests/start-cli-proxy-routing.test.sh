@@ -198,6 +198,31 @@ check $? "recorder on, config dir not signed in: the launch still goes direct (n
 [ ! -e "$TMP/probe-calls" ]
 check $? "the launch path never runs the sign-in probe"
 
+# 16. Tracking off and the owner keeps the proxy off: a live proxy is not wired, an inherited
+#     local URL is dropped, a custom one is kept, and the session's own environment is cleaned too.
+out="$(run_direct "$TMP/live-bin" QUOTA_STATUSLINE_ENABLED=false CREDENTIAL_PROXY_ENABLED=false)"
+echo "$out" | grep -q "ANTHROPIC_BASE_URL"
+[ $? -ne 0 ]
+check $? "owner off: a live proxy listener is not forwarded"
+for u in http://localhost:7846 "http://[::1]:7846"; do
+  out="$(run_direct "$TMP/live-bin" QUOTA_STATUSLINE_ENABLED=false CREDENTIAL_PROXY_ENABLED=false ANTHROPIC_BASE_URL="$u")"
+  echo "$out" | grep -q "ANTHROPIC_BASE_URL"
+  [ $? -ne 0 ]
+  check $? "owner off: inherited $u is dropped"
+done
+out="$(run_direct "$TMP/live-bin" QUOTA_STATUSLINE_ENABLED=false CREDENTIAL_PROXY_ENABLED=false ANTHROPIC_BASE_URL=http://example.test:1)"
+echo "$out" | grep -qx "ANTHROPIC_BASE_URL=http://example.test:1"
+check $? "owner off: a custom ANTHROPIC_BASE_URL is kept"
+resolve="$(awk '/^resolve_claude_credential_proxy\(\) \{/,/^\}/' "$REPO/src/agent/claude/cli/session-launch.sh")"
+prefix="$(env -i PATH="$TMP/live-bin:/usr/bin:/bin" QUOTA_STATUSLINE_ENABLED=false CREDENTIAL_PROXY_ENABLED=false \
+  ANTHROPIC_BASE_URL=http://localhost:7846 REPO="$REPO" bash -c "$resolve"'
+resolve_claude_credential_proxy >/dev/null; echo "${#CLAUDE_ROUTE_PREFIX[@]} ${ANTHROPIC_BASE_URL-unset}"')"
+[ "$prefix" = "5 unset" ]
+check $? "owner off: the session is wrapped to drop a tmux-inherited proxy URL (got: $prefix)"
+out="$(run_direct "$TMP/live-bin" QUOTA_STATUSLINE_ENABLED=false CREDENTIAL_PROXY_ENABLED=true)"
+echo "$out" | grep -qx "ANTHROPIC_BASE_URL=http://localhost:7846"
+check $? "owner on, tracking off: the proxy is wired as before"
+
 # 13. The session itself drops a proxy URL its tmux server environment carries.
 . "$REPO/src/claude_routing.sh"
 got="$(ANTHROPIC_BASE_URL=http://localhost:7846 sh -c '. "$1"; shift; claude_unset_local_proxy; exec "$@"' sh "$REPO/src/claude_routing.sh" sh -c 'echo "${ANTHROPIC_BASE_URL-unset}"')"

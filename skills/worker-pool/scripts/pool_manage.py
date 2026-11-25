@@ -252,11 +252,28 @@ AGENT_REMOVAL_OWNER_STEP = ("the server cannot delete a live agent for us yet: d
                             "(your agents list), or it stays there with no worker behind it")
 
 
-def agent_removal_note(worker_label: str, agent: str) -> str:
+def agent_removal_note(worker_label: str, agent: str, withdrawn=(), withdraw_error: str = "") -> str:
     """The owner's DM once a retired worker's agent is cut loose here but still exists on s.space."""
-    return (f"[dm-only]\n**Delete agent `{agent}` in the app**\n\nYour worker {worker_label} was retired: "
+    note = (f"[dm-only]\n**Delete agent `{agent}` in the app**\n\nYour worker {worker_label} was retired: "
             "it no longer uses that agent, and its token is gone from this computer. The server cannot delete "
             "a live agent for me yet, so it stays in your agents list until you delete it there.")
+    if withdrawn:
+        note += (f"\n\nIts {len(withdrawn)} open decision card(s) were withdrawn, since nothing can answer them "
+                 "now; a click on one does nothing. The questions stay open in Pending questions:\n"
+                 + "\n".join(f"- {w}" for w in withdrawn))
+    if withdraw_error:
+        note += (f"\n\nIts open decision cards could not be withdrawn ({withdraw_error}). Nothing can answer them "
+                 "now; resolve each in Pending questions.")
+    return note
+
+
+def _withdraw_cards(ws: Path, wid: str) -> dict:
+    """The retiring worker's open decision cards, cancelled: no other lane may post or answer them."""
+    try:
+        from hitl.cards import withdraw_worker_cards
+        return {"cards_withdrawn": withdraw_worker_cards(wid, ws)}
+    except Exception as e:  # noqa: BLE001 — reported with the retirement, never blocks it
+        return {"cards_withdrawn": [], "cards_error": f"{type(e).__name__}: {e}"}
 
 
 def _tell_owner(workspace, text: str) -> bool:
@@ -279,13 +296,13 @@ def _withdraw_approval(workspace, wid: str, tell=None) -> dict:
 
 
 def _retire_identity(workspace, wid: str, hand_off: bool = False, tell=None) -> dict:
-    """The worker's own agent, if it has one, goes with it: its lane is stopped and its row marked retiring
-    (`connections.begin_worker_retirement`), the tasks it owes in its own folder are handed to the core under
-    its switch lock (`hand_off`; else they refuse), and only then its row and vault secret go
-    (`connections.retire_worker_identity`). Anything short of that is "failed" with the row kept."""
+    """The worker's own agents, one per server, go with it: every lane is stopped and every row marked
+    retiring (`connections.begin_worker_retirement`), the tasks it owes in its own folder are handed to the
+    core under its switch lock (`hand_off`; else they refuse), and only then its rows and vault secrets go
+    (`connections.retire_worker_identity`). Anything short of that is "failed" with the rows kept."""
     import connections
     ws = Path(workspace)
-    if connections.worker_identity(wid, ws) is None:
+    if not connections.worker_identities(wid, ws):
         return {"result": "none"}
     try:
         connections.begin_worker_retirement(wid, workspace=ws)
@@ -307,13 +324,16 @@ def _retire_identity(workspace, wid: str, hand_off: bool = False, tell=None) -> 
                 "why": f"{len(got['kept'])} task(s) in its own folder could not be handed off (a task of that name "
                        "is already in the shared tasks/)"}
     try:
-        row = connections.retire_worker_identity(wid, workspace=ws) or {}
+        rows = connections.retire_worker_identity(wid, workspace=ws)
     except connections.ConnectionsError as e:
         return {"result": "failed", **got, "why": f"{type(e).__name__}: {e}"}
-    agent = row.get("agent_mxid") or ""
+    # Only once the identity is gone: a failed retirement keeps the worker, and its cards with it.
+    got.update(_withdraw_cards(ws, wid))
+    agent = ", ".join(str(r.get("agent_mxid") or "") for r in rows if r.get("agent_mxid"))
     label = str(((pr.load_roster(workspace) or {}).get("workers") or {}).get(wid, {}).get("label") or wid)
-    told = (tell or (lambda text: _tell_owner(workspace, text)))(agent_removal_note(label, agent or "?"))
-    return {"result": "removed", "instance": row.get("instance"), "agent": agent,
+    told = (tell or (lambda text: _tell_owner(workspace, text)))(
+        agent_removal_note(label, agent or "?", got["cards_withdrawn"], got.get("cards_error", "")))
+    return {"result": "removed", "instance": ", ".join(str(r["instance"]) for r in rows), "agent": agent,
             "agent_removal": "owner_step", "owner_told": bool(told),
             "note": AGENT_REMOVAL_OWNER_STEP, **got}
 
@@ -335,12 +355,14 @@ def _enable(workspace, repo, wid, *, start, runner, spawn) -> dict:
            "paused": False}
     if connections.worker_retiring(wid, Path(workspace)):
         # A retire that stopped part-way kept the agent's row: this takes it back, lane and all.
-        lane = connections.end_worker_retirement(wid, workspace=Path(workspace)) or {}
-        try:
-            out["lane"] = connections.start_added(lane, repo=Path(repo), logs_dir=Path(workspace) / "logs",
-                                                  workspace=Path(workspace))
-        except connections.ConnectionsError as e:
-            out["lane"] = {"ok": False, "reason": str(e)}
+        lanes = []
+        for lane in connections.end_worker_retirement(wid, workspace=Path(workspace)) or []:
+            try:
+                lanes.append(connections.start_added(lane, repo=Path(repo), logs_dir=Path(workspace) / "logs",
+                                                     workspace=Path(workspace)))
+            except connections.ConnectionsError as e:
+                lanes.append({"ok": False, "reason": str(e)})
+        out["lane"] = lanes[0] if len(lanes) == 1 else lanes
     if start:
         restarted = rem.restart(workspace, repo, wid, runner=runner, spawn=spawn)
         out["start"] = {"result": restarted["result"], "detail": restarted["detail"]}

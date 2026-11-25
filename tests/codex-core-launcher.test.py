@@ -130,6 +130,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/core_block_signal.py",
             "src/codex_host_instructions.py",
             "src/codex_home.py",
+            "src/codex_core_model.py",
             "src/agent/codex/codex-home.sh",
             "src/toml_fallback.py",
             "src/result_publish.py",
@@ -434,6 +435,9 @@ exit 0
             "SUTANDO_CODEX_SCHEDULER_SCRIPT": str(self.root / "fake-codex-scheduler.py"),
             "SUTANDO_HOST_LABEL": "test-host",
             "SUTANDO_CORE_SESSION_WAIT_S": "0",
+            # The TUI core this suite is about; the app-server seat (on by default) has its own,
+            # tests/codex-app-server-core-launcher.test.py.
+            "SUTANDO_CODEX_APP_SERVER": "0",
         })
         env.update(env_extra or {})
         result = subprocess.run(
@@ -470,6 +474,9 @@ exit 0
             "AGENT_API_LOG": str(Path(self.tmp.name) / "agent-api.log"),
             "SUTANDO_HOST_LABEL": "test-host",
             "SUTANDO_CORE_SESSION_WAIT_S": "0",
+            # The TUI core this suite is about; the app-server seat (on by default) has its own,
+            # tests/codex-app-server-core-launcher.test.py.
+            "SUTANDO_CODEX_APP_SERVER": "0",
         })
         env.update(env_extra or {})
         master, slave = pty.openpty()

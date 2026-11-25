@@ -123,7 +123,11 @@ def _request(ws: Path, wid: str, worker_label: str, *, repo, lane, wait_s, spawn
     import connections
     import pool_device_connect as dc
     import pool_provision as pp
-    if connections.worker_identity(wid, ws) is not None:
+    try:
+        held = connections.worker_identity(wid, ws) is not None
+    except connections.AmbiguousWorkerIdentity:  # one on each of several servers
+        held = True
+    if held:
         return {"status": "skipped", "why": "the worker already has an agent of its own"}
     try:
         core = pp.core_lane(ws, lane)
