@@ -59,7 +59,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cli_wedge  # noqa: E402
 import quota_availability as qa  # noqa: E402
-from claude_account import account_fingerprint  # noqa: E402
+from claude_account import account_digest, account_fingerprint, oauth_account  # noqa: E402,F401
 
 from workspace_default import resolve_workspace, status_read_path, write_status  # noqa: E402
 
@@ -96,6 +96,10 @@ _CLI_LIMIT = tuple(rx for name, rx in cli_wedge.ABNORMAL_PATTERNS
 # limit."), and the API's own words for a refusal.
 _USAGE_EXTRA = re.compile(r"\b\d+-hour limit (?:reached|exceeded|hit)\b|\bquota\b.{0,20}\b(?:exceeded|exhausted)\b"
                           r"|\binsufficient_quota\b", re.I)
+# Claude Code's /rate-limit-options menu, which only a plan's usage limit opens; its command name alone
+# would read as a rate limit when the "You've hit your ... limit" line above has scrolled away.
+_LIMIT_MENU = re.compile(r"\bwait for (?:the |your )?(?:session |usage |weekly )?limit to reset\b"
+                         r"|\bswitch to usage credits\b", re.I)
 _NAMED_CAP = re.compile(r"\breached your ([A-Za-z][\w.-]{0,24}) limit\b", re.I)
 # The CLI's words for a 429 the account's quota did not cause: the server is throttling.
 _NOT_A_LIMIT = re.compile(r"\bnot your usage limit\b", re.I)
@@ -104,7 +108,8 @@ _RATE = re.compile(r"\brate_limit_error\b|\brate[ -]?limit(?:ed)?\b|\btoo many r
                    r"|\b(?:API ?Error|HTTP(?:/[\d.]+)?|status(?:_?code)?)\"?\s*[:=]?\s*429\b", re.I)
 
 _RESET_EPOCH = re.compile(r"\|(\d{10})\b")
-_RESET_CLOCK = re.compile(r"\bresets?\s+(?:at\s+|on\s+)?(?:([A-Z][a-z]{2})[a-z]*\.?\s+(\d{1,2}),?\s+(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b(?:\s*\(([A-Za-z_]+(?:/[A-Za-z0-9_+-]+)*)\))?", re.I)
+# "resets 3pm" / "resets Nov 28 at 1pm", and the limit menu's "continue automatically at Nov 28 at 1pm".
+_RESET_CLOCK = re.compile(r"\b(?:resets?|continue automatically)\s+(?:at\s+|on\s+)?(?:([A-Z][a-z]{2})[a-z]*\.?\s+(\d{1,2}),?\s+(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b(?:\s*\(([A-Za-z_]+(?:/[A-Za-z0-9_+-]+)*)\))?", re.I)
 _MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
 _RESET_IN = re.compile(r"\bresets?\s+in\s+(\d+)\s*(h|hours?|m|mins?|minutes?)\b", re.I)
 _RETRY_AFTER = re.compile(r"\bretry[- ]after\D{0,3}(\d+)\b", re.I)
@@ -172,7 +177,7 @@ def classify_text(text: str, at: float, model: Optional[str] = None,
     if named:
         # The banner names the capped model; an earlier turn may have run another one.
         model = qa._model_family(named.group(1).lower()) or model
-    if named or any(rx.search(text) for rx in _CLI_LIMIT) or _USAGE_EXTRA.search(text):
+    if named or any(rx.search(text) for rx in _CLI_LIMIT) or _USAGE_EXTRA.search(text) or _LIMIT_MENU.search(text):
         kind = "usage-limit"
     elif _RATE.search(text):
         kind = "rate-limit"
@@ -200,14 +205,15 @@ def _record_reset(headers: dict, now: float) -> Optional[float]:
     return max(ahead) if ahead else None
 
 
-def record_evidence(payload, now: float) -> Optional[Limit]:
-    """A recent 429 in the proxy's record, unless the provider served since then."""
-    if not isinstance(payload, dict):
+def record_evidence(payload, now: float, account: Optional[str] = None) -> Optional[Limit]:
+    """A recent 429 in the proxy's record, unless the provider served since then.
+    With the seat's `account` digest known, only a record labeled with it is evidence."""
+    payload = qa.record_for_account(payload, account)
+    if payload is None:
         return None
-    ledger = payload.get("recent_rejections")
     newest = None
-    for rej in ledger if isinstance(ledger, list) else []:
-        if not isinstance(rej, dict) or rej.get("status") != 429:
+    for rej in qa.record_rejections(payload):
+        if rej.get("status") != 429:
             continue
         at = qa._parse_when(rej.get("ts"))
         if at is None or not (0 <= now - at <= EVIDENCE_WINDOW_S):
@@ -415,6 +421,9 @@ def _same_account(held_account: Optional[str], launch_account: Optional[str]) ->
 
 
 def _binds(hold: dict, launch_model: Optional[str], launch_account: Optional[str]) -> bool:
+    # A hold set while the account was unreadable says nothing about an account read since.
+    if hold.get("account_unread") and launch_account:
+        return False
     return _same_family(hold.get("model"), launch_model) and _same_account(hold.get("account"), launch_account)
 
 
@@ -433,17 +442,48 @@ def _launch_config_dir() -> Optional[str]:
 def launch_identity(workspace: Path, config_dir: Optional[str] = None) -> tuple:
     """(model, account) the next launch would run as, read the way the gate reads them."""
     config_dir = _launch_config_dir() if config_dir is None else config_dir
-    model = qa.seat_model(qa.SeatEnv(True, None, config_dir), Path(workspace))
-    return model, account_fingerprint(config_dir)
+    return launch_model(workspace, config_dir), account_fingerprint(config_dir)
 
 
-def binding_hold(workspace: Path, now: Optional[float] = None) -> Optional[dict]:
+def launch_model(workspace: Path, config_dir: Optional[str]) -> Optional[str]:
+    return qa.seat_model(qa.SeatEnv(True, None, config_dir), Path(workspace))
+
+
+# The account the running core was launched with, recorded when the gate lets it launch: a limit its
+# screen shows is that account's, even after the config names another one before a restart.
+LAUNCH_ACCOUNT_FILE = "core-launch-account.json"
+
+
+def record_launch_account(workspace: Path, account: Optional[str], now: Optional[float] = None) -> None:
+    """Keep the account the core is being launched with; nothing when it cannot be read. Never raises."""
+    if not account:
+        return
+    try:
+        write_status(LAUNCH_ACCOUNT_FILE, {"account": account, "at": time.time() if now is None else now},
+                     workspace=Path(workspace))
+    except OSError:
+        pass
+
+
+def running_account(workspace: Path) -> Optional[str]:
+    """The account the running core was launched with (record_launch_account), else None."""
+    try:
+        data = json.loads(status_read_path(LAUNCH_ACCOUNT_FILE, Path(workspace)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    account = data.get("account") if isinstance(data, dict) else None
+    return account if isinstance(account, str) and account else None
+
+
+def binding_hold(workspace: Path, now: Optional[float] = None,
+                 identity: Optional[tuple] = None) -> Optional[dict]:
     """The hold in force that would stop the next launch, else None. Read-only.
-    A hold the owner switched away from (another model family or account) does not bind."""
+    A hold the owner switched away from (another model family or account) does not bind.
+    `identity` is a (model, account) the caller already read, as launch_identity returns it."""
     hold = active_hold(workspace, now)
     if hold is None:
         return None
-    model, account = launch_identity(workspace)
+    model, account = launch_identity(workspace) if identity is None else identity
     return hold if _binds(hold, model, account) else None
 
 
@@ -519,13 +559,17 @@ def _present_card(hold: dict, card_entry: str, now: float) -> bool:
 
 
 def _ensure_notice(workspace: Path, hold: dict, card_entry: Optional[str] = None,
-                   now: Optional[float] = None, card_surface: bool = False) -> bool:
+                   now: Optional[float] = None, card_surface: bool = False, account_card: bool = False) -> bool:
     """Queue the hold's owed DM under its stable name, once, and present the core-model card
     with it when the launcher provides one. True when it is queued.
     A retry rewrites the same name, so it cannot become a second message. With `card_surface`
-    the monitor's recovery card is this incident's one surface, so no text notice is sent."""
+    the monitor's recovery card is this incident's one surface, so no text notice is sent; with
+    `account_card` the core's quota card, already posted, is it (core_quota_notice)."""
     if hold.get("notice_queued"):
         return False
+    if account_card:
+        hold["notice_queued"], hold["notice_surface"] = True, "account-card"
+        return True
     if card_surface:
         hold["notice_queued"], hold["notice_surface"] = True, "card"
         return True
@@ -562,7 +606,7 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
            projects_dir: Optional[Path] = None, launch_model: Optional[str] = None,
            launch_account: Optional[str] = None, card_entry: Optional[str] = None,
            evidence: tuple = (), seat: Optional[str] = None, seat_label: Optional[str] = None,
-           card_surface: bool = False) -> Decision:
+           card_surface: bool = False, account_card: bool = False) -> Decision:
     """Launch, or hold and say why. The one writer of the hold record.
     `evidence` adds limits the caller observed itself, such as a live core's limit screen. A worker
     `seat` has its own record, and only that evidence: the provider record and status are the core's."""
@@ -575,7 +619,7 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
             hold = admitted
             _write_hold(workspace, hold, seat)
     if active_hold(workspace, now, seat) and _binds(hold, launch_model, launch_account):
-        if _ensure_notice(workspace, hold, card_entry, now, card_surface):
+        if _ensure_notice(workspace, hold, card_entry, now, card_surface, account_card):
             _write_hold(workspace, hold, seat)
         return Decision(False, hold, status_line(hold))
     # Who ran last: the record's account, else the launcher a released legacy hold remembered.
@@ -585,7 +629,8 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
     if quota is None and not seat:
         rec = qa.read_quota_record(workspace, now)
         quota = rec.payload if rec else None
-    own = () if seat else (record_evidence(qa.trusted_record(quota), now), transcript_evidence(projects_dir, now))
+    own = () if seat else (record_evidence(qa.trusted_record(quota), now, launch_account),
+                           transcript_evidence(projects_dir, now))
     found = [lim for lim in (*own, *evidence) if _relevant(lim, launch_model, since)]
     limit = max(found, key=lambda lim: lim.at) if found else None
     seen = hold.get("evidence_at") if hold else None
@@ -603,6 +648,8 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
             "until": _hold_until(limit, strikes, now), "strikes": strikes,
             "account": launch_account, "account_at": since,
         }
+        if not launch_account:
+            new["account_unread"] = True
         if seat:
             new.update(seat=seat, seat_label=seat_label or seat)
         new["reason"] = status_line(new)
@@ -621,7 +668,7 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
             new["notice_queued"] = False
             new["held_tasks"] = carried
             new["present_at_hold"] = [t for t in live if t not in carried][-HELD_TASKS_MAX:]
-        _ensure_notice(workspace, new, card_entry, now, card_surface)
+        _ensure_notice(workspace, new, card_entry, now, card_surface, account_card)
         _write_hold(workspace, new, seat)
         if not seat:
             _mirror_core_status(workspace, "paused", new["reason"], now)
@@ -681,10 +728,11 @@ def reinstate(workspace: Path, now: Optional[float] = None, by: Optional[str] = 
 
 def hold_while_wedged(workspace: Path, text: Optional[str], now: Optional[float] = None,
                       seat: Optional[str] = None, seat_label: Optional[str] = None,
-                      card_surface: bool = False) -> Optional[dict]:
+                      card_surface: bool = False, account_card: bool = False) -> Optional[dict]:
     """The hold in force for a live core (or worker `seat`) stuck at a provider-limit screen,
     recorded from that screen's text when none is, so the owner gets the notice (or, with
-    `card_surface`, the monitor's card alone) and a bare reply counts. Else None."""
+    `card_surface`, the monitor's card alone; with `account_card`, the quota card already posted)
+    and a bare reply counts. Else None."""
     now = time.time() if now is None else now
     workspace = Path(workspace)
     hold = read_hold(workspace, seat) or {}
@@ -692,11 +740,33 @@ def hold_while_wedged(workspace: Path, text: Optional[str], now: Optional[float]
     if hold.get("status") != "held" and isinstance(released, (int, float)) and 0 <= now - released < REARM_GRACE_S:
         return None
     model, account = (None, None) if seat else launch_identity(workspace)
+    # The screen is the running core's: its limit is the account it was launched with, not the one the
+    # config may name since (a switch not yet restarted on). Unknown: the config's, as before.
+    account = (running_account(workspace) or account) if not seat else account
     # The caller has judged the screen a limit; text that names none is still this core's limit.
     limit = classify_text(text or "", now, model, PANE_SOURCE) or Limit("usage-limit", now, None, model, PANE_SOURCE)
     decide(workspace, now, evidence=(limit,), launch_model=limit.model or model, launch_account=account,
-           seat=seat, seat_label=seat_label, card_surface=card_surface)
+           seat=seat, seat_label=seat_label, card_surface=card_surface, account_card=account_card)
     return active_hold(workspace, now, seat)
+
+
+def release_on_account_change(workspace: Path, now: Optional[float] = None, account: Optional[str] = None,
+                              seat: Optional[str] = None, live: bool = False) -> Optional[dict]:
+    """Lift a hold seen under one account once the core is on another: a limit is the account's.
+    `account` is the account now in use. By default it is the one the next launch would use; with
+    `live` (a core is running), the one that core was launched with, so a config naming another
+    account does not release a core still running on the held one. A hold that recorded no account,
+    or an account that cannot be read now, is left as it is."""
+    hold = read_hold(workspace, seat)
+    if not hold or hold.get("status") != "held":
+        return None
+    held = hold.get("account")
+    if account is None:
+        account = (running_account(workspace) if live and not seat else None) or launch_identity(workspace)[1]
+    now_on = account
+    if not held or not now_on or held == now_on:
+        return None
+    return clear(workspace, now, by="account-change", seat=seat)
 
 
 def release_pane_hold(workspace: Path, now: Optional[float] = None,
@@ -1158,6 +1228,7 @@ def main(argv=None) -> int:
     decision = decide(workspace, projects_dir=_projects_dir(args.cwd), launch_model=model,
                       launch_account=account, card_entry=args.card_entry or None)
     if decision.launch:
+        record_launch_account(workspace, account)
         return 0
     print(decision.line)
     return HOLD_EXIT

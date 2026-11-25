@@ -16,6 +16,7 @@ the command. Standard library only, plus local_task_protocol, issued_cards and c
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import sys
 from dataclasses import dataclass
@@ -406,6 +407,15 @@ def _event_id(answer: Mapping[str, object]) -> str:
     return ""
 
 
+def send_key(room_id: str, answering: str, now: Callable[[], float]) -> str:
+    """The part of a card's `room.message.send` operation id that names the send. A card answering a
+    message (`answering`: its event id) gets a key derived from room and message, so a retry of that
+    answer reuses the id and the platform returns the earlier post; with nothing to answer, the second."""
+    if not answering:
+        return str(int(now()))
+    return hashlib.sha256(f"{room_id}|{answering}".encode()).hexdigest()[:16]
+
+
 def send_card(execute: Execute, room_id: str, body: str, card: dict, *, operation_id: str,
               reply_to: str = "", thread_root: str = "", owner_dm: Optional[str] = None) -> str:
     """Post `card` in `room_id` with `room.message.send`; the new event's id. With `owner_dm` (the
@@ -546,13 +556,17 @@ class Click:
 
 
 def lane_owner(workspace, default: str = "") -> Callable[[str], str]:
-    """lane -> its owner's mxid, from this machine's core connections; `default` for a card with no lane."""
+    """lane -> its owner's mxid, from this machine's core connections. A card with no lane was posted on
+    the legacy connection (the core row whose `instance` is ""), so it is that row's owner; `default`
+    when this machine has no such row or that row names no owner."""
     def owner(lane: str) -> str:
-        if not lane:
-            return default
-        import connections
-        return next((str(r.get("owner_mxid") or "") for r in connections.read_rows(workspace)
-                     if r.get("instance") == lane and not r.get("worker")), "")
+        try:
+            import connections
+        except ImportError:  # a copy without the core's connection record (ag2-sparrow's bundle)
+            return "" if lane else default
+        found = next((str(r.get("owner_mxid") or "") for r in connections.read_rows(workspace)
+                      if r.get("instance") == lane and not r.get("worker")), "")
+        return found or ("" if lane else default)
     return owner
 
 

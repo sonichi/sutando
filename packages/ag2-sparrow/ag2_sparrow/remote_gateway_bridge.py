@@ -1933,6 +1933,30 @@ def _project_claude_local(mods, room: str, log=print):
                                   describe=_http_error_body)
 
 
+class _ClaimedStore:
+    """A HITL store seen through CARD_CLAIM: this lane drives, archives and re-notifies only its own cards."""
+
+    def __init__(self, store, claims, log=print, scope: str = ""):
+        self._store, self._claims, self._log, self._scope = store, claims, log, scope
+
+    def __getattr__(self, name):
+        return getattr(self._store, name)
+
+    def report_archive_failures(self, failures, now):
+        # Under its lane's own scope: this view archives only its cards, so it must not clear another's.
+        return self._store.report_archive_failures(failures, now, scope=self._scope)
+
+    def all(self):
+        mine = []
+        for req in self._store.all():
+            try:
+                if self._claims(req):
+                    mine.append(req)
+            except Exception as e:  # noqa: BLE001 - an unanswerable claim leaves the card to its lane
+                _log_backoff(("card-claim", type(e).__name__), f"card claim check failed ({diagnostics.describe(e)})")
+        return mine
+
+
 def _project_hitl(log=print) -> int:
     """Push every un-projected HITL requirement out as a card, or 0 when
     `src/hitl` is absent (standalone sparrow) — same optional tier as the
@@ -1942,7 +1966,8 @@ def _project_hitl(log=print) -> int:
     calling this every pulse re-sends nothing; it is the driver that was
     missing, not the machinery.
     """
-    if not owns_unaddressed():
+    primary = owns_unaddressed()
+    if not primary and CARD_CLAIM is None:
         return 0  # only the primary gateway projects the owner's cards
     room = resolve_destination(OWNER_PRIVATE)  # a runtime prompt is the owner's, whatever room raised it
     if not room:
@@ -1961,11 +1986,16 @@ def _project_hitl(log=print) -> int:
         log(f"hitl: projector unavailable ({diagnostics.describe(e)}); cards will not be delivered")
         return 0
     workspace = _STATE.parent
-    manager = HitlManager(HitlStore(default_store(workspace)))
+    store = HitlStore(default_store(workspace))
+    scope = "" if primary else (re.sub(r"[^a-z0-9-]", "-", (GATEWAY_INSTANCE or "").lower())[:64].strip("-")
+                                or "lane")
+    manager = HitlManager(_ClaimedStore(store, CARD_CLAIM, log, scope) if CARD_CLAIM is not None else store)
     done, refused, gave_up, failed, raised = [], [], [], False, None
     # Each store gets its pass: a stuck card in one never holds back the other's.
     for drive in ("default", "claude-local"):
         try:
+            if drive == "claude-local" and not primary:
+                continue
             if drive == "claude-local":
                 got = _project_claude_local(mods, room, log)
             elif pending_ids(manager):
@@ -2295,6 +2325,8 @@ OWNS_UNADDRESSED: Callable[[], bool] | None = None
 # Host-injected (path) -> bool: an owner-directed file this lane delivers although it owns no
 # unaddressed ones (a worker's lane, its worker's files). None: only `owns_unaddressed` decides.
 PROACTIVE_OWN_FILE: Callable[[Path], bool] | None = None
+# Host hook: whether this lane posts a decision card (a HumanRequirement). None: the primary posts every card.
+CARD_CLAIM: Callable[[object], bool] | None = None
 # Host-injected () -> the worker every task this lane queues is addressed to (`requested_worker`),
 # or "". None (standalone default) leaves each task's field as the gateway sent it.
 TASK_ADDRESSEE: Callable[[], str] | None = None
@@ -4597,6 +4629,31 @@ def _with_recovery(health: "dict | None") -> "dict | None":
     return {**(health or {"alive": None, "motion": "unknown"}), "recovery": rec}
 
 
+# The core's runtime profile (runtime_profile.v1): model, switch options, plan. Read by the
+# adapter's injected reader; a standalone sparrow and a pool worker's lane send none.
+_RUNTIME_PROFILE_READER = globals().get("_SUTANDO_RUNTIME_PROFILE_READER")
+RUNTIME_PROFILE_CAPABILITY = "runtime_profile.v1"
+RUNTIME_PROFILE_MAX_BYTES = 8192
+# Between beats the profile is re-read this often; a change sends the beat early.
+RUNTIME_PROFILE_CHECK_S = 15.0
+_runtime_profile_refused_until = 0.0
+_runtime_profile_checked_at = 0.0
+_runtime_profile_sent = None
+
+
+def _runtime_profile() -> "dict | None":
+    """The adapter's profile when it has one and it fits the bound, else None. Never raises."""
+    if not callable(_RUNTIME_PROFILE_READER) or time.time() < _runtime_profile_refused_until:
+        return None
+    try:
+        block = _RUNTIME_PROFILE_READER()
+        if isinstance(block, dict) and len(json.dumps(block)) <= RUNTIME_PROFILE_MAX_BYTES:
+            return block
+    except Exception:  # noqa: BLE001 -- the profile is advisory; the beat goes out without it
+        pass
+    return None
+
+
 # The core's Claude quota (quota_status.v1) for the agent sidebar, through the adapter's injected
 # reader, which debounces it; like the recovery block, absent on a standalone sparrow.
 _QUOTA_STATUS_READER = globals().get("_SUTANDO_QUOTA_STATUS_READER")
@@ -4618,6 +4675,42 @@ def _quota_status() -> "dict | None":
     return None
 
 
+def _profile_key(profile: "dict | None") -> "str | None":
+    return None if profile is None else json.dumps({k: v for k, v in profile.items() if k != "reported_at"},
+                                                   sort_keys=True)
+
+
+def _send_heartbeat(payload: dict, base: "dict | None") -> tuple:
+    """POST the beat; a 400/422 drops the profile first, then the recovery and quota blocks."""
+    global _core_recovery_refused_until, _runtime_profile_refused_until, _quota_status_refused_until
+    while True:
+        try:
+            return _req("POST", "/v1/heartbeat", payload, timeout=10), payload
+        except urllib.error.HTTPError as e:
+            extra = [k for k in ("recovery", "quota") if k in (payload.get("health") or {})]
+            if e.code not in (400, 422):
+                raise
+            if "runtime_profile" in payload:
+                _runtime_profile_refused_until = time.time() + CORE_RECOVERY_REFUSED_BACKOFF_S
+                _log(f"heartbeat refused with {RUNTIME_PROFILE_CAPABILITY}: HTTP {e.code} — sending without it")
+                payload = {k: v for k, v in payload.items() if k != "runtime_profile"}
+                payload["capabilities"] = [c for c in payload["capabilities"] if c != RUNTIME_PROFILE_CAPABILITY]
+            elif extra:
+                if "recovery" in extra:
+                    _core_recovery_refused_until = time.time() + CORE_RECOVERY_REFUSED_BACKOFF_S
+                if "quota" in extra:
+                    _quota_status_refused_until = time.time() + CORE_RECOVERY_REFUSED_BACKOFF_S
+                _log(f"heartbeat refused with the {' and '.join(extra)} block: HTTP {e.code} — sending without it")
+                drop = ({CORE_RECOVERY_CAPABILITY, QUOTA_STATUS_CAPABILITY}
+                        | (set() if base is not None else {"worker_health.v1"}))
+                payload = {k: v for k, v in payload.items() if k != "health"}
+                payload["capabilities"] = [c for c in payload["capabilities"] if c not in drop]
+                if base is not None:
+                    payload["health"] = base
+            else:
+                raise
+
+
 def _with_quota(health: "dict | None") -> "dict | None":
     block = _quota_status()
     if block is None:
@@ -4629,7 +4722,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
     global _heartbeat_retry_at, _heartbeat_backoff, _last_heartbeat_at, _last_core_health
-    global _core_recovery_refused_until, _quota_status_refused_until
+    global _runtime_profile_checked_at, _runtime_profile_sent
     now = time.time()
     # Ahead of every early return: a Stop reaches a running task only through these beats.
     _post_task_beats(inflight, force=force)
@@ -4642,7 +4735,12 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     base = _diagnostic_health(health)
     health = _with_quota(_with_recovery(base))
     changed = health is not None and health != _last_core_health
-    if not force and not changed and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
+    due = force or changed or now - _last_heartbeat_at >= HEARTBEAT_INTERVAL
+    if not due and now - _runtime_profile_checked_at < RUNTIME_PROFILE_CHECK_S:
+        return False
+    _runtime_profile_checked_at = now
+    profile = _runtime_profile()
+    if not due and _profile_key(profile) == _runtime_profile_sent:
         return False
     _last_heartbeat_at = now
     _last_core_health = health
@@ -4672,24 +4770,11 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
                 payload["capabilities"].append(CORE_RECOVERY_CAPABILITY)
             if "quota" in health:
                 payload["capabilities"].append(QUOTA_STATUS_CAPABILITY)
-        try:
-            reply = _req("POST", "/v1/heartbeat", payload, timeout=10)
-        except urllib.error.HTTPError as e:
-            extra = [k for k in ("recovery", "quota") if k in (payload.get("health") or {})]
-            if e.code not in (400, 422) or not extra:
-                raise
-            if "recovery" in extra:
-                _core_recovery_refused_until = time.time() + CORE_RECOVERY_REFUSED_BACKOFF_S
-            if "quota" in extra:
-                _quota_status_refused_until = time.time() + CORE_RECOVERY_REFUSED_BACKOFF_S
-            _log(f"heartbeat refused with the {' and '.join(extra)} block: HTTP {e.code} — sending without it")
-            drop = ({CORE_RECOVERY_CAPABILITY, QUOTA_STATUS_CAPABILITY}
-                    | (set() if base is not None else {"worker_health.v1"}))
-            payload = {k: v for k, v in payload.items() if k != "health"}
-            payload["capabilities"] = [c for c in payload["capabilities"] if c not in drop]
-            if base is not None:
-                payload["health"] = base
-            reply = _req("POST", "/v1/heartbeat", payload, timeout=10)
+        if profile is not None:
+            payload["runtime_profile"] = profile
+            payload["capabilities"].append(RUNTIME_PROFILE_CAPABILITY)
+        reply, payload = _send_heartbeat(payload, base)
+        _runtime_profile_sent = _profile_key(payload.get("runtime_profile"))
         _log_recovery_sent(payload)
         _heartbeat_retry_at, _heartbeat_backoff = 0.0, 0.0
         _record_setup_hint(reply)

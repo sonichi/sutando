@@ -377,6 +377,83 @@ class QuotedDialogAboveTheTurnIsTranscript(unittest.TestCase):
         self.assertEqual(pg.live_tail(["a", "b"]), ["a", "b"])
 
 
+class ASpinnerRowAloneIsATurnRunning(unittest.TestCase):
+    """Claude Code 2.1.322 draws a running turn as its spinner row alone, with no "esc to
+    interrupt" anywhere on the pane. A live -e capture (tool rows made generic): 19m into a turn.
+    The fixture spells ESC as the text \\x1b, since `gh pr diff` refuses raw escape bytes."""
+
+    REAL = (Path(__file__).resolve().parent / "fixtures" / "pane-claude-turn-in-flight-spinner-only.txt"
+            ).read_text(encoding="utf-8").replace("\\x1b", "\x1b")
+    SPINNER = next(ln for ln in REAL.splitlines() if "Shimmying" in ln)
+    TIP = next(ln for ln in REAL.splitlines() if "Tip:" in ln)
+    PERMISSION = "⏺ Bash(rm -rf build)\n  Do you want to proceed?\n  Allow this action\n  Esc to cancel\n"
+
+    def verdict(self, pane, adapter=pg.CLAUDE):
+        v = pg.classify_pane(pane, adapter)
+        return v.state, v.reason
+
+    def test_a_live_turn_without_the_busy_marker_is_working(self):
+        self.assertFalse(wedge.frame_working(self.REAL))
+        self.assertEqual(self.verdict(self.REAL), ("busy", "working"))
+        self.assertTrue(pg.accepts_input(pg.classify_pane(self.REAL, pg.CLAUDE)))
+
+    def test_a_turn_seconds_old_is_working_from_its_first_second(self):
+        fresh = self.REAL.replace("19m 30s", "2s")
+        self.assertNotEqual(fresh, self.REAL)
+        self.assertFalse(pg.turn_in_flight(fresh))  # the limit-outrun threshold is unchanged
+        self.assertEqual(self.verdict(fresh), ("busy", "working"))
+
+    def test_a_turn_retrying_with_no_limit_on_screen_is_still_working(self):
+        retry = self.REAL.replace("(19m 30s", "(retrying in 30s · attempt 3/10 · 19m 30s")
+        self.assertNotEqual(retry, self.REAL)
+        self.assertEqual(self.verdict(retry), ("busy", "working"))
+
+    def test_control_a_finished_turn_is_idle_ready(self):
+        done = self.REAL.replace(f"{self.SPINNER}\n{self.TIP}\n", "✻ Cooked for 2m 3s\n")
+        self.assertNotIn("Shimmying", done)
+        self.assertEqual(self.verdict(done), ("idle-ready", "idle footer or empty composer"))
+
+    def test_control_a_spinner_under_a_later_finished_turn_is_history(self):
+        later = self.REAL.replace(f"{self.TIP}\n", f"{self.TIP}\n⏺ Done.\n✻ Cooked for 2m 3s\n")
+        self.assertEqual(self.verdict(later), ("idle-ready", "idle footer or empty composer"))
+
+    def idle_after(self, reply):
+        """The capture's frame after a short turn whose reply is `reply`, with no completion row."""
+        return self.REAL.replace(f"{self.SPINNER}\n{self.TIP}\n", reply)
+
+    def test_a_spinner_quoted_in_a_finished_reply_is_not_a_turn(self):
+        # Reply and tool text are indented; the CLI draws its live spinner at column 0.
+        quoted = "⏺ The worker pane reads:\n  ✳ Moonwalking… ({}s · ↓ 12 tokens)\n  so it was busy then.\n"
+        fenced = ("⏺ The worker pane reads:\n  ```\n  ✳ Moonwalking… ({}s · ↓ 12 tokens)\n"
+                  "  ```\n")
+        for name, reply in (("indented", quoted), ("fenced", fenced)):
+            with self.subTest(quote=name):
+                pane = self.idle_after(reply.format(3))
+                self.assertIsNotNone(pg.turn_status(pane.splitlines()))  # the row reads as a spinner
+                self.assertEqual(self.verdict(pane), ("idle-ready", "idle footer or empty composer"))
+                self.assertFalse(pg.turn_in_flight(self.idle_after(reply.format(30))))
+
+    def test_control_a_reply_whose_bullet_row_quotes_a_spinner_is_idle(self):
+        pane = self.idle_after("⏺ ✳ Moonwalking… (3s · ↓ 12 tokens) was the worker pane.\n")
+        self.assertEqual(self.verdict(pane), ("idle-ready", "idle footer or empty composer"))
+
+    def test_control_a_dialog_under_the_spinner_still_holds_its_gate(self):
+        rows = self.REAL.splitlines()
+        at = rows.index(self.TIP) + 1
+        pane = "\n".join(rows[:at]) + "\n" + self.PERMISSION + rows[-1] + "\n"
+        self.assertEqual(self.verdict(pane), ("busy", "permission"))
+
+    def test_control_a_codex_pane_quoting_a_claude_spinner_stays_idle(self):
+        # Column 0 too: Codex draws no such row, so the adapter, not the indent, is what refuses it.
+        row = pg.SGR_STRIP.sub("", self.SPINNER)
+        for indent in ("    ", ""):
+            with self.subTest(indent=len(indent)):
+                quoted = (f"• Ran tmux capture-pane -p -t worker\n  └ ⏺ Waiting for CI\n"
+                          f"{indent}{row}\n\n{CODEX_IDLE}")
+                self.assertIsNotNone(pg.turn_status(quoted.splitlines()))  # the row reads as a spinner
+                self.assertEqual(self.verdict(quoted, pg.CODEX)[0], "idle-ready")
+
+
 class GateSignaturesNeedACurrentAffordance(unittest.TestCase):
     """A finished turn's prose above the runtime's empty composer is history; only a dialog that
     shows how to answer it (caret on a numbered row, an Enter/Esc hint) holds the pane."""
@@ -393,6 +470,15 @@ class GateSignaturesNeedACurrentAffordance(unittest.TestCase):
         approval = ("Would you like to run the following command?\n  $ rm -rf build\n"
                     "› 1. Yes, proceed\n  2. No, and tell Codex what to do differently (esc)\n")
         self.assertEqual(pg.classify_pane(approval, pg.CODEX).state, "busy")
+
+    def test_a_codex_picker_quoting_a_limit_still_asks_for_a_selection(self):
+        dialog = ("The export says you hit your usage limit. What should it do?\n"
+                  "› 1. Retry\n  2. Exit\n  Press enter to confirm or esc to go back\n")
+        v = pg.classify_pane(dialog, pg.CODEX)
+        self.assertEqual((v.state, v.reason), ("busy", "selection"))
+        self.assertFalse(pg.is_usage_limit(v.reason, dialog))
+        banner = "You've hit your weekly limit · resets at 3pm\n" + dialog
+        self.assertEqual(pg.classify_pane(banner, pg.CODEX).reason, "session-limit")
 
     def test_select_prose_above_the_claude_composer_is_idle_ready_and_a_row_picker_is_busy(self):
         self.assertEqual(state(f"● Select the best file for the user.\n{CLAUDE_IDLE}", "claude"), "idle-ready")
@@ -1693,11 +1779,77 @@ class LimitHolds(unittest.TestCase):
             with self.subTest(capture=capture):
                 self.assertFalse(self.holds(capture))
 
+    REFUSED = "  ⎿  You've hit your weekly limit · resets 2pm (UTC)\n"
+
+    def test_a_turn_seconds_old_refuses_without_the_busy_marker(self):
+        # A recovery line's own turn shows a spinner before any refusal: a second send doubles it.
+        self.assertFalse(self.holds(self.REFUSED + "✳ Moonwalking… (3s · ↓ 12 tokens)\n❯ \n"))
+
+    def test_control_a_spinner_waiting_on_a_retry_still_holds(self):
+        self.assertTrue(self.holds(self.REFUSED + "✳ Moonwalking… (retrying in 30s · attempt 3/10 · 2m 37s)\n❯ \n"))
+
     def test_cli_exit_codes(self):
         for capture, code in ((self.GATE, 0), ("❯ \n", pg.EXIT_UNSAFE)):
             with mock.patch.object(sys, "stdin", io.StringIO(capture)), \
                     contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(pg.main(["limit-holds", "--runtime", "claude"]), code)
+
+
+class WeeklyLimit(unittest.TestCase):
+    """The weekly limit's screen and its /rate-limit-options menu are a usage limit, not a plain
+    selection, so the core's quota card is posted for it."""
+
+    MENU = ("  ⎿  You've used your weekly limit · resets Nov 28 at 1pm (UTC)\n"
+            "❯ /rate-limit-options\n"
+            "What do you want to do?\n"
+            "❯ 1. Stop and wait for the weekly limit to reset\n"
+            "  2. Add funds to continue with usage credits\n"
+            "Enter to confirm · Esc to cancel\n")
+
+    def test_the_weekly_menu_and_its_title_are_a_usage_limit(self):
+        self.assertTrue(pg.is_usage_limit("selection", self.MENU))
+        self.assertTrue(pg.limit_line("Weekly limit · resets Nov 28 at 1pm"))
+        self.assertTrue(pg.limit_line("You've reached your weekly limit."))
+        self.assertTrue(pg.is_usage_limit("turn-rejected", "⎿  You've used your weekly limit · resets Nov 28"))
+
+    def test_the_vms_own_weekly_screen_is_a_usage_limit(self):
+        vm = ("  ⎿  You've hit your weekly limit · resets Nov 28 at 1pm (UTC)\n❯ /rate-limit-options\n"
+              "What do you want to do?\n❯ 1. Stop and wait for limit to reset\n"
+              "  2. Wait here, then continue automatically at Nov 28 at 1pm\n  3. Switch to usage credits\n"
+              "Enter to confirm · Esc to cancel\n")
+        self.assertTrue(pg.is_usage_limit("selection", vm))
+
+    def test_an_ordinary_menu_or_reply_is_not(self):
+        menu = "Pick one\n❯ 1. Keep the weekly report\n  2. Drop it\nEnter to confirm · Esc to cancel\n"
+        self.assertFalse(pg.is_usage_limit("selection", menu))
+        self.assertFalse(pg.limit_line("The weekly report resets the counters."))
+
+    def test_an_option_naming_a_limit_and_a_reset_is_not(self):
+        option = "your weekly limit for uploads resets on Monday"
+        menu = f"Pick one\n❯ 1. Upload now\n  2. {option}\nEnter to confirm · Esc to cancel\n"
+        self.assertFalse(pg.limit_line(option))
+        self.assertFalse(pg.is_usage_limit("selection", menu))
+        kind = next((k for k, rx in pg.CLAUDE_GATE_SIGNATURES if rx.search(menu)), None)
+        self.assertEqual(kind, "selection")
+        self.assertTrue(pg.limit_line("  ⎿  Weekly limit · resets Nov 28 at 1pm"))
+
+    def test_an_ordinary_dialog_that_names_a_limit_is_not_the_limit(self):
+        question = ("Pick one\nDo you want to retry the upload now that the team reached your usage limit.\n"
+                    "❯ 1. Retry\n  2. Cancel\nEnter to confirm · Esc to cancel\n")
+        option = ("Pick one\nThe export is paused.\n❯ 1. Wait for the limit to reset\n  2. Cancel the export\n"
+                  "Enter to confirm · Esc to cancel\n")
+        for dialog in (question, option):
+            with self.subTest(dialog=dialog):
+                self.assertFalse(pg.is_usage_limit("selection", dialog))
+                self.assertFalse(pg.is_usage_limit("unknown", dialog))
+                self.assertFalse(any(pg.limit_line(ln) for ln in dialog.splitlines()))
+        self.assertTrue(pg.is_usage_limit("selection", self.MENU), "the CLI's own menu still is")
+
+    def test_a_line_that_used_a_limit_on_something_else_is_no_refusal(self):
+        line = "  ⎿  You've used your weekly limit for uploads; it resets on Monday"
+        self.assertFalse(pg.limit_line(line))
+        self.assertFalse(pg.is_usage_limit("turn-rejected", line))
+        self.assertTrue(pg.is_usage_limit("turn-rejected", "  ⎿  You've used your weekly limit\n❯ "))
 
 
 if __name__ == "__main__":

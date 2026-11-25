@@ -13,17 +13,34 @@ claude_proxy_url_is_local() {
   return 1
 }
 
-# Reads REPO and PY when the switch is not in the environment (manifest config, before forwarding).
-claude_direct_routing() {
-  _cdr_v="${QUOTA_STATUSLINE_ENABLED-}"
-  if [ -z "${QUOTA_STATUSLINE_ENABLED+x}" ] && command -v skill_manifest_config_pending > /dev/null 2>&1; then
-    _cdr_v="$(skill_manifest_config_pending "${REPO:-}" "${PY:-}" 2>/dev/null | tr '\0' '\n' \
-      | sed -n 's/^QUOTA_STATUSLINE_ENABLED=//p' | head -n 1)"
+# Prints switch $1: env first, else manifest config (reads REPO and PY; before forwarding).
+claude_routing_switch() {
+  if eval "[ -n \"\${$1+x}\" ]"; then
+    eval "printf '%s' \"\${$1}\""
+  elif command -v skill_manifest_config_pending > /dev/null 2>&1; then
+    skill_manifest_config_pending "${REPO:-}" "${PY:-}" 2>/dev/null | tr '\0' '\n' \
+      | sed -n "s/^$1=//p" | head -n 1
   fi
-  case "$_cdr_v" in
-    ""|0|false|False|FALSE|no|No|NO|off|Off|OFF) return 1 ;;
-  esac
-  return 0
+}
+
+claude_routing_is_off() {
+  case "$1" in 0|false|False|FALSE|no|No|NO|off|Off|OFF) return 0 ;; esac
+  return 1
+}
+
+claude_direct_routing() {
+  _cdr_v="$(claude_routing_switch QUOTA_STATUSLINE_ENABLED)"
+  [ -n "$_cdr_v" ] && ! claude_routing_is_off "$_cdr_v"
+}
+
+# The owner's explicit "keep the proxy off"; unset or empty means the proxy is allowed.
+claude_proxy_owner_off() {
+  claude_routing_is_off "$(claude_routing_switch CREDENTIAL_PROXY_ENABLED)"
+}
+
+# Whether a session goes direct: tracking on, or the owner keeps the proxy off.
+claude_routes_direct() {
+  claude_direct_routing || claude_proxy_owner_off
 }
 
 # In the session's own environment (which tmux may take from its server, not the launcher).

@@ -48,17 +48,39 @@ if [ -f "$REPO/.env" ]; then
   unset _codex_reset_was_set _codex_reset_ambient
 fi
 
-# `--runtime <name>` names the runtime for THIS launch (leading arg only). A
-# caller that recorded one must not get the core's config substituted for it.
+# `--runtime <name>` (or `--runtime=<name>`) names the runtime for THIS launch,
+# wherever it appears: graceful-restart.sh relays its args after `--restart`, so
+# a leading-only parse silently dropped the switch. A caller that recorded one
+# must not get the core's config substituted for it.
 requested_runtime=""
-if [ "${1:-}" = "--runtime" ]; then
-  requested_runtime="${2:-}"
-  if [ -z "$requested_runtime" ]; then
-    echo "start-cli: --runtime needs a value" >&2
-    exit 2
-  fi
-  shift 2
-fi
+_rest=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --runtime)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "start-cli: --runtime needs a value" >&2
+        exit 2
+      fi
+      requested_runtime="$2"
+      shift 2
+      ;;
+    --runtime=*)
+      requested_runtime="${1#--runtime=}"
+      if [ -z "$requested_runtime" ]; then
+        echo "start-cli: --runtime needs a value" >&2
+        exit 2
+      fi
+      shift
+      ;;
+    *)
+      _rest+=("$1")
+      shift
+      ;;
+  esac
+done
+# The `+` guard keeps an empty array valid under `set -u` on bash 3.2.
+set -- ${_rest[@]+"${_rest[@]}"}
+unset _rest
 
 if [ -n "$requested_runtime" ]; then
   runtime="$requested_runtime"
@@ -123,7 +145,7 @@ fi
 tmux_socket="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 session="${SUTANDO_TMUX_SESSION:-sutando-core}"
 . "$REPO/src/agent/tmux-socket-guard.sh"
-sutando_tmux_socket_guard "$tmux_socket" "$REPO" || exit 3
+sutando_tmux_socket_guard "$tmux_socket" "$REPO" || exit "$SUTANDO_EXIT_SOCKET_REFUSED"
 active_runtime=""
 if command -v tmux >/dev/null 2>&1 && tmux -S "$tmux_socket" has-session -t "=$session" 2>/dev/null; then
   active_runtime="$(tmux -S "$tmux_socket" show-environment -t "=$session" SUTANDO_CORE_RUNTIME 2>/dev/null | sed 's/^SUTANDO_CORE_RUNTIME=//' || true)"

@@ -52,7 +52,13 @@ def _sentinel_present(path: Path) -> bool:
 
 
 def holder_of(workspace: Path, task_id: str) -> str | None:
-    """The recipient id holding ``task_id``, or None when nobody does.
+    """The recipient id holding ``task_id``, or None when nobody does (see ``sentinel_of``)."""
+    found = sentinel_of(workspace, task_id)
+    return found.parent.name if found is not None else None
+
+
+def sentinel_of(workspace: Path, task_id: str) -> Path | None:
+    """The sentinel holding ``task_id``, or None when nobody holds it.
 
     An unreadable deliveries/ is NOT "nobody holds it" — that is the reading
     that hands a worker's task to the core — so only a genuinely absent
@@ -68,5 +74,5 @@ def holder_of(workspace: Path, task_id: str) -> str | None:
     for recipient in recipients:
         for suffix in SENTINEL_SUFFIXES:
             if _sentinel_present(recipient / f"{task_id}{suffix}"):
-                return recipient.name
+                return recipient / f"{task_id}{suffix}"
     return None

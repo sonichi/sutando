@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -30,6 +31,7 @@ import claude_account
 import quota_availability as qa
 import quota_record as qr
 import session_config_hooks as sch
+import proxy_retire as pr
 import statusline_config as cfg
 
 FX = json.loads((ROOT / "tests" / "fixtures" / "quota-record-shape.parity.json").read_text())
@@ -278,6 +280,21 @@ class Writer(Base):
         Path(self.core, ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "acct-C"}}))
         self.assertEqual(crs.gather(self.ws, sup, now=_t.time(), runtime="claude")["state"], "paused_limit")
 
+    def test_the_core_logins_status_line_429_is_evidence_for_its_own_account(self):
+        import core_limit_hold as clh
+        import time as _t
+        self.sl(_status(five=40), now=None)
+        self.rl(detail="usage limit reached")
+        rec = self.rec()
+        self.assertEqual(len(qa.record_rejections(rec)), 1)
+        digest = claude_account.account_fingerprint(self.core)
+        self.assertIs(qa.record_for_account(rec, digest), rec)
+        self.assertIsNotNone(clh.record_evidence(qa.trusted_record(rec), _t.time(), digest))
+        Path(self.core, ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "acct-C"}}))
+        other = claude_account.account_fingerprint(self.core)
+        self.assertIsNone(qa.record_for_account(rec, other))
+        self.assertIsNone(clh.record_evidence(rec, _t.time(), other))
+
     def test_promotion_keeps_the_accounts_existing_evidence(self):
         self.sl(_status(five=40), now=T0)
         self.sl(_status(five=70), now=T0 + 10, cd=self.other)
@@ -498,6 +515,391 @@ class SessionConfigHooks(Base):
         __import__("time").sleep(3)
         self.assertFalse(late.exists())
         self.assertFalse(Path(f"{late}.2").exists())
+
+
+class FakeRun:
+    """Answers launchctl / ps / lsof from a table; records every argv."""
+
+    def __init__(self, ps=" 1 /sbin/launchd HOME=/x\n", lsof_rc=1, lsof_out="", loaded=True, pid=4242, bootout_rc=0,
+                 cwd=None, ps_rc=0, listen_rc=1, on_bootout=None):
+        self.calls, self.ps, self.lsof_rc, self.lsof_out = [], ps, lsof_rc, lsof_out
+        self.loaded, self.pid, self.bootout_rc, self.cwd, self.ps_rc = loaded, pid, bootout_rc, cwd, ps_rc
+        self.listen_rc, self.on_bootout = listen_rc, on_bootout
+
+    def __call__(self, argv):
+        self.calls.append(argv)
+        R = __import__("types").SimpleNamespace
+        if argv[:2] == ["launchctl", "print"]:
+            return R(returncode=0 if self.loaded else 113,
+                     stdout=f"\tstate = running\n\tpid = {self.pid}\n" if self.loaded else "")
+        if argv[:2] == ["launchctl", "bootout"]:
+            if self.on_bootout:
+                self.on_bootout()
+            self.loaded = self.loaded and self.bootout_rc != 0
+            return R(returncode=self.bootout_rc, stdout="")
+        if argv[:2] == ["launchctl", "bootstrap"]:
+            self.loaded = True
+            return R(returncode=0, stdout="")
+        if argv[0] == "ps":
+            return R(returncode=self.ps_rc, stdout=self.ps)
+        if argv[0] == "lsof" and "cwd" in argv:
+            return R(returncode=0, stdout=f"p{argv[3]}\nn{self.cwd}\n") if self.cwd else R(returncode=1, stdout="")
+        if argv[0] == "lsof" and "-sTCP:LISTEN" in argv:
+            return R(returncode=self.listen_rc, stdout="node 4242 u 20u IPv4\n" if self.listen_rc == 0 else "")
+        if argv[0] == "lsof":
+            return R(returncode=self.lsof_rc, stdout=self.lsof_out)
+        raise AssertionError(argv)
+
+    def booted_out(self):
+        return any(a[:2] == ["launchctl", "bootout"] for a in self.calls)
+
+
+class ProxyRetire(Base):
+    def setUp(self):
+        super().setUp()
+        self.sl(_status(), now=None)  # a fresh core record
+        p = [mock.patch.object(claude_account, "core_config_dir", return_value=self.core),
+             mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "true"})]
+        self.intent = Path(self._tmp.name) / "user" / "credential-proxy-retire.json"
+        p.append(mock.patch.object(pr, "intent_path", return_value=self.intent))
+        p.append(mock.patch.object(os, "kill", side_effect=AssertionError("a PID was signalled")))
+        for x in p:
+            x.start()
+            self.addCleanup(x.stop)
+
+    def retire(self, run):
+        return pr.retire(self.ws, runner=run, wait_s=0.2, sleep=lambda s: None)
+
+    def test_kept_while_a_session_env_points_at_the_proxy(self):
+        ps = (f" 101 /opt/bin/claude --name sutando-core CLAUDE_CONFIG_DIR={self.core} "
+              "ANTHROPIC_BASE_URL=http://localhost:7846\n 102 /bin/zsh ANTHROPIC_BASE_URL=http://localhost:7846\n")
+        run = FakeRun(ps=ps)
+        said = self.retire(run)
+        self.assertIn("pid 101", said)
+        self.assertIn("pid 102 zsh", said)  # any process of this user, not only claude
+        self.assertFalse(run.booted_out())
+        rec = json.loads((self.ws / "state" / pr.RECORD).read_text())
+        self.assertEqual(rec["status"], "kept")
+        self.assertIn("pid 101", rec["reason"])
+
+    def test_kept_while_launch_settings_point_at_the_proxy(self):
+        Path(self.core, "settings.json").write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:7846"}}))
+        run = FakeRun()
+        self.assertIn("settings", self.retire(run))
+        self.assertFalse(run.booted_out())
+
+    def test_a_non_claude_process_pointing_at_the_proxy_keeps_it(self):
+        ps = " 301 /usr/local/bin/node /srv/agent-sdk.js ANTHROPIC_BASE_URL=http://127.0.0.1:7846/ HOME=/h\n"
+        run = FakeRun(ps=ps)
+        said = self.retire(run)  # an idle SDK client: no connection open at this instant
+        self.assertIn("pid 301 node", said)
+        self.assertFalse(run.booted_out())
+        unreadable = FakeRun(ps=" 302 /usr/local/bin/node /srv/agent-sdk.js\n")
+        self.assertIn("pid 302 node (environment unreadable)", self.retire(unreadable))
+        ps_argv = [a for a in run.calls if a[0] == "ps"][0]
+        self.assertEqual(ps_argv[ps_argv.index("-U") + 1], str(os.getuid()))
+
+    def test_a_failed_process_list_keeps_it(self):
+        run = FakeRun(ps_rc=1)
+        self.assertIn("process list unreadable", self.retire(run))
+        self.assertFalse(run.booted_out())
+
+    def test_an_unreadable_session_config_keeps_it(self):
+        Path(self.core, "settings.json").write_text("{not json")
+        run = FakeRun()
+        self.assertIn("unreadable", self.retire(run))
+        self.assertFalse(run.booted_out())
+
+    def test_an_idle_session_still_pointing_at_the_proxy_keeps_it(self):
+        proj = Path(self._tmp.name) / "proj"
+        (proj / ".claude").mkdir(parents=True)
+        (proj / ".claude" / "settings.local.json").write_text(
+            json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://localhost:7846"}}))
+        run = FakeRun(ps=f" 101 /opt/bin/claude --name w CLAUDE_CONFIG_DIR={self.same}\n", cwd=str(proj))
+        said = self.retire(run)  # no connection open: idle, yet still configured for the proxy
+        self.assertIn("settings.local.json", said)
+        self.assertFalse(run.booted_out())
+
+    def test_an_unknown_session_keeps_it(self):
+        run = FakeRun(ps=" 101 /opt/bin/claude --name w\n")
+        self.assertIn("environment unreadable", self.retire(run))
+        run = FakeRun(ps=f" 102 /opt/bin/claude --name w CLAUDE_CONFIG_DIR={self.same}\n")
+        self.assertIn("working folder unreadable", self.retire(run))
+        self.assertFalse(run.booted_out())
+
+    def test_kept_while_a_connection_is_open(self):
+        out = ("COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"
+               "node 4242 u 20u IPv4 0x1 0t0 TCP 127.0.0.1:7846->127.0.0.1:50000 (ESTABLISHED)\n"
+               "curl 999 u 3u IPv4 0x2 0t0 TCP 127.0.0.1:50000->127.0.0.1:7846 (ESTABLISHED)\n")
+        run = FakeRun(lsof_rc=0, lsof_out=out)
+        said = self.retire(run)
+        self.assertIn("curl 999", said)
+        self.assertFalse(run.booted_out())
+
+    def test_kept_without_a_fresh_core_record(self):
+        self.path.unlink()
+        run = FakeRun()
+        self.assertIn("no fresh status line record", self.retire(run))
+        self.assertFalse(run.booted_out())
+
+    def test_turned_off_when_everything_is_clear_and_reenabled_on_opt_out(self):
+        proj = Path(self._tmp.name) / "proj"
+        proj.mkdir()
+        run = FakeRun(ps=" 101 /opt/bin/claude --name sutando-core ANTHROPIC_BASE_URL=http://example.test:1\n",
+                      cwd=str(proj))
+        said = self.retire(run)
+        self.assertTrue(said.startswith("turned off"), said)
+        self.assertTrue(run.booted_out())
+        self.assertEqual(pr.read_intent()["status"], "retired")
+        rec = json.loads((self.ws / "state" / pr.RECORD).read_text())
+        self.assertEqual((rec["status"], rec["by"]), ("retired", "quota-tracker"))
+        plist = Path(self._tmp.name) / "LaunchAgents" / f"{pr.LABEL}.plist"
+        plist.parent.mkdir()
+        plist.write_text("<plist/>")
+        with mock.patch.object(pr, "plist_path", return_value=plist), mock.patch.object(pr.sys, "platform", "darwin"):
+            self.assertEqual(pr.ensure_running(self.ws, runner=run, install=self.no_install), "restored")
+        boot = [a for a in run.calls if a[:2] == ["launchctl", "bootstrap"]]
+        self.assertEqual(boot[0][-1], str(plist))
+        self.assertEqual(json.loads((self.ws / "state" / pr.RECORD).read_text())["status"], "restored")
+
+    def test_the_intent_is_recorded_before_the_bootout(self):
+        seen = []
+        run = FakeRun(on_bootout=lambda: seen.append(pr.read_intent().get("status")))
+        self.assertTrue(self.retire(run).startswith("turned off"))
+        self.assertEqual(seen, ["retiring"])
+        self.assertTrue(str(self.intent).startswith(self._tmp.name) and "ws" not in self.intent.parts)
+
+    def test_a_port_still_served_after_bootout_is_left_unconfirmed_and_never_signalled(self):
+        run = FakeRun(listen_rc=0)
+        said = self.retire(run)
+        self.assertIn("unconfirmed", said)
+        self.assertEqual(pr.read_intent()["status"], "retiring")
+        self.assertEqual(json.loads((self.ws / "state" / pr.RECORD).read_text())["status"], "unconfirmed")
+        # The next run finds the job gone; once the port stops listening it confirms.
+        self.assertIn("unconfirmed", self.retire(run))
+        run.listen_rc = 1
+        self.assertEqual(self.retire(run), "proxy launch agent not loaded")
+        self.assertEqual(pr.read_intent()["status"], "retired")
+
+    def test_a_run_that_died_before_the_bootout_is_reconciled(self):
+        pr.write_intent("retiring")
+        run = FakeRun(ps_rc=1)  # job still loaded: the bootout never happened
+        self.assertIn("process list unreadable", self.retire(run))
+        self.assertEqual(pr.read_intent()["status"], "kept")
+        self.assertFalse(run.booted_out())
+
+    def test_a_run_that_died_after_the_bootout_is_reconciled(self):
+        pr.write_intent("retiring")
+        run = FakeRun(loaded=False)
+        self.assertEqual(self.retire(run), "proxy launch agent not loaded")
+        self.assertEqual(pr.read_intent()["status"], "retired")
+        with mock.patch.object(pr, "plist_path", return_value=self._plist()), mock.patch.object(pr.sys, "platform", "darwin"):
+            self.assertEqual(pr.ensure_running(self.ws, runner=run, install=self.no_install), "restored")
+        self.assertEqual(pr.read_intent()["status"], "restored")
+
+    def test_no_bootout_without_a_recorded_intent(self):
+        run = FakeRun()
+        with mock.patch.object(pr, "write_intent", return_value=False):
+            self.assertIn("could not record the retirement intent", self.retire(run))
+        self.assertFalse(run.booted_out())
+
+    def test_a_failed_bootout_resets_the_intent(self):
+        run = FakeRun(bootout_rc=5)
+        self.assertIn("bootout failed", self.retire(run))
+        self.assertEqual(pr.read_intent()["status"], "kept")
+
+    def test_inspection_diagnostics_and_ambiguous_rows_keep_it(self):
+        R = __import__("types").SimpleNamespace
+        cases = {
+            "process list returned diagnostics": R(returncode=0, stdout=" 1 /sbin/launchd HOME=/x\n", stderr="ps: warning"),
+            "process list empty": R(returncode=0, stdout="", stderr=""),
+            "ambiguous process row": R(returncode=0, stdout="abc /bin/x HOME=/x\n 77\n", stderr=""),
+        }
+        for why, ps_out in cases.items():
+            with self.subTest(why=why):
+                run = FakeRun()
+                real = run.__call__
+                run_ = lambda argv, real=real, ps_out=ps_out: (run.calls.append(argv), ps_out)[1] if argv[0] == "ps" else real(argv)
+                said = pr.retire(self.ws, runner=run_, wait_s=0.2, sleep=lambda s: None)
+                self.assertIn(why, said)
+                self.assertFalse(run.booted_out())
+
+    def test_connections_read_with_diagnostics_or_malformed_rows_are_unknown(self):
+        R = __import__("types").SimpleNamespace
+        for out in (R(returncode=1, stdout="", stderr="lsof: WARNING: can't stat()"),
+                    R(returncode=0, stdout="", stderr=""),
+                    R(returncode=0, stdout="node 4242\n", stderr=""),
+                    R(returncode=0, stdout="COMMAND PID\nnode x\n", stderr=""),
+                    R(returncode=1, stdout="garbage\n", stderr="")):
+            with self.subTest(out=out):
+                self.assertIsNone(pr.proxy_connections(lambda argv, out=out: out))
+        self.assertEqual(pr.proxy_connections(lambda argv: R(returncode=1, stdout="", stderr="")), [])
+        run = FakeRun(ps_rc=1, lsof_rc=1, lsof_out="")  # empty connections cannot outweigh a failed process read
+        self.assertIn("process list unreadable", self.retire(run))
+        self.assertFalse(run.booted_out())
+
+    def test_an_opt_out_holding_the_lock_keeps_the_proxy(self):
+        import fcntl
+        self.intent.parent.mkdir(parents=True, exist_ok=True)
+        with open(pr.lock_path(), "a") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+            run = FakeRun()
+            said = pr.retire(self.ws, runner=run, wait_s=0.2, sleep=lambda s: None, lock_wait_s=0.05)
+        self.assertIn("holds the proxy lock", said)
+        self.assertFalse(run.booted_out())
+        self.assertTrue(self.retire(FakeRun()).startswith("turned off"))  # released: retires as before
+
+    def test_the_route_hook_holds_the_lock_through_its_port_wait(self):
+        route = __import__("importlib.util").util
+        spec = route.spec_from_file_location("route_proxy_lock", SCRIPTS / "route-proxy.py")
+        mod = route.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        seen, runs = [], FakeRun(loaded=False)
+
+        def opt_out_runner(argv):
+            if argv[0] == "lsof" and "-sTCP:LISTEN" in argv and not seen:
+                with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "true"}):
+                    seen.append(pr.retire(self.ws, runner=FakeRun(), wait_s=0.2, sleep=lambda s: None,
+                                          lock_wait_s=0.05))
+            return runs(argv)
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false"}), \
+                mock.patch.object(pr.cfg, "workspace", return_value=self.ws), \
+                mock.patch.object(pr, "plist_path", return_value=self._plist()), \
+                mock.patch.object(pr.sys, "platform", "darwin"), mock.patch.object(sys, "stderr", io.StringIO()):
+            mod.main(runner=opt_out_runner, wait_s=0.05, sleep=lambda s: None, install=self.no_install)
+        self.assertEqual(len(seen), 1)
+        self.assertIn("holds the proxy lock", seen[0])
+
+    def _route_mod(self):
+        util = __import__("importlib.util").util
+        spec = util.spec_from_file_location("route_proxy_reverse", SCRIPTS / "route-proxy.py")
+        mod = util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _route(self, mod, run, err):
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false"}), \
+                mock.patch.object(pr.cfg, "workspace", return_value=self.ws), \
+                mock.patch.object(pr, "plist_path", return_value=self._plist()), \
+                mock.patch.object(pr.sys, "platform", "darwin"), mock.patch.object(sys, "stderr", err):
+            return mod.main(runner=run, wait_s=0.05, sleep=time.sleep, install=self.no_install)
+
+    def test_restore_waits_for_a_retirement_holding_the_lock_then_loads_the_job(self):
+        import fcntl
+        import threading
+        mod, run, err = self._route_mod(), FakeRun(loaded=True), io.StringIO()
+        self.intent.parent.mkdir(parents=True, exist_ok=True)
+        held, go = open(pr.lock_path(), "a"), threading.Event()
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+
+        def retirement():  # finishes its bootout while the opt-out waits
+            go.wait(5)
+            time.sleep(0.3)
+            run.loaded = False
+            pr.write_intent("retired")
+            fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+            held.close()
+        t = threading.Thread(target=retirement)
+        t.start()
+        go.set()
+        self._route(mod, run, err)
+        t.join(5)
+        self.assertTrue(run.loaded)
+        self.assertTrue(any(a[:2] == ["launchctl", "bootstrap"] for a in run.calls))
+        self.assertIn("restored", err.getvalue())
+        self.assertEqual(pr.read_intent()["status"], "restored")
+
+    def test_restore_without_the_lock_starts_nothing_and_claims_nothing(self):
+        mod, run, err = self._route_mod(), FakeRun(loaded=False), io.StringIO()
+        self.intent.parent.mkdir(parents=True, exist_ok=True)
+        self.intent.parent.rmdir()
+        self.intent.parent.write_text("not a dir")  # the lock file cannot be opened
+        self._route(mod, run, err)
+        self.assertIn("not started (proxy lock not taken)", err.getvalue())
+        self.assertNotIn("listening", err.getvalue())
+        self.assertEqual(run.calls, [])
+        self.intent.parent.unlink()
+
+    def test_tracking_turned_off_after_the_evidence_keeps_it(self):
+        def flip():
+            os.environ["QUOTA_STATUSLINE_ENABLED"] = "false"
+        run = FakeRun()
+        with mock.patch.object(pr, "core_record_fresh", side_effect=lambda ws: (flip(), True)[1]):
+            said = self.retire(run)
+        self.assertIn("tracking is off", said)
+        self.assertFalse(run.booted_out())
+
+    def test_unexpected_exits_of_inspection_are_unknown(self):
+        R = __import__("types").SimpleNamespace
+        for rc in (2, -9, 127):
+            out = R(returncode=rc, stdout="", stderr="")
+            with self.subTest(rc=rc):
+                self.assertIsNone(pr.proxy_connections(lambda argv, out=out: out))
+                self.assertIsNone(pr.listening(lambda argv, out=out: out))
+                ps = FakeRun(ps_rc=rc)
+                self.assertIn("process list unreadable", self.retire(ps))
+                self.assertFalse(ps.booted_out())
+        self.assertIsNone(pr.proxy_connections(lambda argv: None))  # a timeout or a failed start
+        self.assertIsNone(pr.listening(lambda argv: None))
+        self.assertEqual(pr.proxy_connections(lambda argv: R(returncode=1, stdout="", stderr="")), [])
+        self.assertIs(pr.listening(lambda argv: R(returncode=1, stdout="", stderr="")), False)
+        run = FakeRun(lsof_rc=2)
+        self.assertIn("could not be read", self.retire(run))
+        self.assertFalse(run.booted_out())
+
+    def _plist(self):
+        plist = Path(self._tmp.name) / "LaunchAgents" / f"{pr.LABEL}.plist"
+        plist.parent.mkdir(exist_ok=True)
+        plist.write_text("<plist/>")
+        return plist
+
+    def no_install(self):
+        raise AssertionError("installer run")
+
+    def _ensure(self, run, plist_exists=True, env=None, install=None):
+        plist = Path(self._tmp.name) / "LaunchAgents" / f"{pr.LABEL}.plist"
+        if plist_exists:
+            plist.parent.mkdir(exist_ok=True)
+            plist.write_text("<plist/>")
+        with mock.patch.object(pr, "plist_path", return_value=plist), mock.patch.object(pr.sys, "platform", "darwin"), \
+                mock.patch.dict(os.environ, env or {}):
+            return pr.ensure_running(self.ws, runner=run, install=install or self.no_install)
+
+    def test_opt_out_after_a_stop_only_or_manual_bootout_starts_it_again(self):
+        run = FakeRun(loaded=False)  # plist kept, job unloaded, no retire record
+        self.assertEqual(self._ensure(run), "started")
+        self.assertTrue(any(a[:2] == ["launchctl", "bootstrap"] for a in run.calls))
+        self.assertFalse((self.ws / "state" / pr.RECORD).exists())
+        self.assertFalse(self.intent.exists())
+
+    def test_opt_out_on_a_host_that_never_installed_it_installs_it(self):
+        run, ran = FakeRun(loaded=False), []
+        self.assertEqual(self._ensure(run, plist_exists=False, install=lambda: ran.append(1) or True), "installed")
+        self.assertEqual(ran, [1])
+        self.assertEqual(self._ensure(FakeRun(loaded=False), plist_exists=False, install=lambda: False),
+                         "not installed: the installer failed")
+
+    def test_owner_off_is_left_alone(self):
+        for plist_exists in (True, False):
+            run = FakeRun(loaded=False)
+            said = self._ensure(run, plist_exists=plist_exists, env={"CREDENTIAL_PROXY_ENABLED": "false"})
+            self.assertIn("CREDENTIAL_PROXY_ENABLED is off", said)
+            self.assertFalse(any(a[:2] == ["launchctl", "bootstrap"] for a in run.calls))
+        pr.write_intent("retired")
+        run = FakeRun(loaded=False)
+        self.assertIn("is off", self._ensure(run, env={"CREDENTIAL_PROXY_ENABLED": "off"}))
+        self.assertFalse(any(a[:2] == ["launchctl", "bootstrap"] for a in run.calls))
+
+    def test_already_loaded_is_left_running(self):
+        run = FakeRun(loaded=True)
+        self.assertEqual(self._ensure(run), "already loaded")
+        self.assertFalse(any(a[:2] == ["launchctl", "bootstrap"] for a in run.calls))
+
+    def test_switch_off_keeps_the_proxy(self):
+        run = FakeRun()
+        with mock.patch.dict(os.environ, {"QUOTA_STATUSLINE_ENABLED": "false"}):
+            self.assertIn("tracking is off", self.retire(run))
+        self.assertFalse(run.booted_out())
 
 
 class HealthCheck(Base):
