@@ -17,6 +17,7 @@ card. The relay token stays in Sparrow's env file, the Claude login in its confi
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -714,6 +715,12 @@ def sign_in_refused() -> str:
     return "" if sys.stdin.isatty() else NOT_AT_A_TERMINAL
 
 
+def read_code() -> str:
+    """The code the sign-in page showed, typed at the terminal without being echoed (so it is in no
+    scrollback or recording); from a stream that is not a terminal it is read as a line."""
+    return getpass.getpass("") if sys.stdin.isatty() else sys.stdin.readline()
+
+
 START_SAY = ("Open this link and sign in, then enter the code the page shows where you started this (the link "
              "works for 10 minutes, the code once): %s")
 
@@ -751,7 +758,7 @@ def account(args) -> int:
         return 0
     if args.switch or args.code:
         try:
-            ok, detail = (accounts.give_code(waiting, sys.stdin.readline()) if args.code else
+            ok, detail = (accounts.give_code(waiting, read_code()) if args.code else
                           accounts.sign_in(cfg, env, console=args.console, others=others, state_dir=waiting))
         except accounts.Refused as e:
             ok, detail = False, str(e)

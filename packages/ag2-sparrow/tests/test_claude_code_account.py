@@ -319,6 +319,14 @@ class AtATerminalOnly(Base):
         self.assertIn("never into a chat", cli.NOT_AT_A_TERMINAL)
         self.assertFalse(hasattr(inbox, "open_turns"), "no path reads whose turn it is: there is no agent path")
 
+    def test_the_code_typed_at_a_terminal_is_not_echoed(self):
+        with mock.patch.object(cli.sys, "stdin", mock.Mock(isatty=lambda: True)), \
+                mock.patch.object(cli.getpass, "getpass", return_value="good-code#s1") as hidden:
+            self.assertEqual(cli.read_code(), "good-code#s1")
+        hidden.assert_called_once_with("")
+        with mock.patch.object(cli.sys, "stdin", io.StringIO("piped-code\n")):
+            self.assertEqual(cli.read_code(), "piped-code\n")
+
     def test_the_command_refuses_a_sign_in_with_no_terminal_and_still_reads_and_cancels(self):
         cmd = Command("run_")
         cmd.cfg, cmd.env, cmd.dir = self.cfg, self.env, self.dir
