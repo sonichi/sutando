@@ -723,7 +723,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 2
         return 0 if diagnostics["live_cores"] else 1
     if args.command == "report":
-        print(render_run(_load_run(args.run)), end="")
+        try:
+            report = render_run(_load_run(args.run))
+        except (OSError, ValueError) as exc:
+            print(f"sutando-bench: cannot report run: {exc}", file=sys.stderr)
+            return 2
+        print(report, end="")
         return 0
     if args.command == "compare":
         try:

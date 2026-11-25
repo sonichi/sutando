@@ -1367,6 +1367,22 @@ class CaseDefinitionTests(unittest.TestCase):
                     self.assertEqual(bench.main(["report", str(path)]), 0)
                 self.assertIn("Sutando benchmark report", stdout.getvalue())
 
+    def test_report_input_errors_return_two_without_partial_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "run.json"
+            for body in (None, "not JSON", "[]", '{"kind":"sutando-benchmark-run"}',
+                         '{"kind":"other","kind":"sutando-benchmark-run"}'):
+                with self.subTest(body=body):
+                    if body is not None:
+                        path.write_text(body)
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        rc = bench.main(["report", str(path)])
+                    self.assertEqual(rc, 2)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertIn("cannot report run", stderr.getvalue())
+                    self.assertNotIn("Traceback", stderr.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

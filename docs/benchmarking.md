@@ -85,6 +85,8 @@ by comparisons and reports. Non-object documents, missing reader fields,
 wrong field types and excessive JSON nesting are comparison input errors,
 rather than regression exits or tracebacks. Optional runtime provenance and
 unknown metadata remain supported for historical runs.
+`report` uses the same loader and returns a diagnostic with exit 2 for unreadable
+or invalid saved runs, without printing a partial report.
 
 Historical runs without the field remain readable and comparable. JSON
 `suite_compatibility` and the Markdown report explicitly mark shared definitions
