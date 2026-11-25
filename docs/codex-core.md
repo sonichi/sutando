@@ -483,7 +483,7 @@ the `tmux` on PATH, then the host's declared client (`SUTANDO_TMUX_BIN`, which t
 desktop exports), preferring the first whose version matches the server on the
 core's socket. When neither matches but one still reaches the server, it warns on
 stderr naming both versions and launches with that client. The chosen client is
-put first on PATH for the launch. It refuses (exit 3) when no client can query the
+put first on PATH for the launch. It refuses (exit 11) when no client can query the
 server, or when no tmux is on PATH while the socket exists: either would make a
 live core read as absent, or replace the server with an incompatible build. It
 also refuses to launch another checkout's core on a desktop install's socket
