@@ -19,10 +19,14 @@ def path(record: Path) -> Path:
 
 
 def note(record: Path, attempt: str, pid: int) -> None:
-    """Record `pid` as the worker of `attempt`; nothing when its start time cannot be read."""
-    start = holder_lock.start_time(pid)
-    if start:
-        write_whole(path(record), {"attempt": attempt, "pid": int(pid), "start": start})
+    """Record `pid` as the worker of `attempt`; nothing when its start time cannot be read or kept.
+    Best-effort: the worker is already running, so a failed write must not read as a failed launch."""
+    try:
+        start = holder_lock.start_time(pid)
+        if start:
+            write_whole(path(record), {"attempt": attempt, "pid": int(pid), "start": start})
+    except Exception:
+        pass
 
 
 def dead(record: Path, attempt: str) -> bool:
