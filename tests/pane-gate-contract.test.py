@@ -423,7 +423,9 @@ class ASpinnerRowAloneIsATurnRunning(unittest.TestCase):
         self.assertEqual(self.verdict(pane), ("busy", "permission"))
 
     def test_control_a_codex_pane_quoting_a_claude_spinner_stays_idle(self):
-        quoted = f"  ⎿  {pg.SGR_STRIP.sub('', self.SPINNER)}\n{CODEX_IDLE}"
+        quoted = (f"• Ran tmux capture-pane -p -t worker\n  └ ⏺ Waiting for CI\n"
+                  f"    {pg.SGR_STRIP.sub('', self.SPINNER)}\n\n{CODEX_IDLE}")
+        self.assertIsNotNone(pg.turn_status(quoted.splitlines()))  # the row reads as a spinner
         self.assertEqual(self.verdict(quoted, pg.CODEX)[0], "idle-ready")
 
 
