@@ -837,6 +837,19 @@ class Manifest(Base):
 class Edges(Base):
     """What a card says when the ledger, the card itself or the core's own row cannot be had."""
 
+    def test_a_card_outside_the_owner_dm_is_not_edited(self):
+        out = mc._edit(self.ws, "!elsewhere:s.space", "$e", "w", "op", core=CORE,
+                       execute=lambda *a, **k: self.fake.execute(*a, **k))
+        self.assertEqual(out, {"status": "failed", "why": "the card is not in the owner's DM"})
+        self.assertEqual(self.fake.calls, [])
+
+    def test_a_switching_card_that_cannot_be_kept_still_starts_the_switch(self):
+        self.using("opus")
+        self.run_(["post", "--room", DM])
+        with mock.patch.object(mc, "keep_card", side_effect=OSError("ro")):
+            rc, out = self.tap("fable")
+        self.assertEqual((rc, out["status"]), (0, "started"))
+
     def test_a_card_whose_record_cannot_be_written_is_posted_and_says_its_buttons_will_not_act(self):
         with mock.patch.object(mc.issued_cards, "record", side_effect=PermissionError("read-only")) as record:
             rc, out = self.run_(["post", "--room", DM])

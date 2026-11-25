@@ -176,7 +176,7 @@ for line in sys.stdin:
         elif step == "unauth":
             out({"method": "error", "params": {"threadId": thread, "error": UNAUTH}})
             finish("failed", UNAUTH)
-        elif step in ("limit", "limit-bare"):
+        elif step in ("limit", "limit-bare", "limit-retried", "limit-retry-other"):
             error = {"message": "You've hit your usage limit. Upgrade to Pro or try again at 3:05 PM.",
                      "codexErrorInfo": "usageLimitExceeded", "additionalDetails": None}
             if step == "limit":
@@ -184,8 +184,14 @@ for line in sys.stdin:
                     "limitId": "codex", "primary": {"usedPercent": 100, "windowDurationMins": 300,
                                                     "resetsAt": 4102444800}}}})
             out({"method": "error", "params": {"threadId": thread, "turnId": turn, "error": error,
-                                               "willRetry": False}})
-            finish("failed", error)
+                                               "willRetry": step.startswith("limit-retr")}})
+            if step == "limit-retried":
+                write_result(prompt)
+                finish()
+            elif step == "limit-retry-other":
+                finish("failed", {"message": "stream disconnected"})
+            else:
+                finish("failed", error)
         elif step == "model-missing":
             error = {"message": "Error running remote compact task: The 'gpt-6.1-terra' model is not supported "
                                 "when using Codex with a ChatGPT account.", "codexErrorInfo": "modelNotFound"}
@@ -1024,6 +1030,19 @@ class AccountSwitch(SeatCase):
         self.assertEqual(len(self.posted()), 1)
         self.assertEqual(health(self.ws)["state"], "ok")
 
+    def test_a_missing_login_shows_one_sign_in_card_and_can_recover(self):
+        self.task("task-1.txt")
+        self.plan("unauth", "unauth", "unauth", "unauth")
+        s = self.make(retry_s=0)
+        self.assertFalse((self.codex_home / "auth.json").exists())
+        self.assertEqual(s.step(), seat_mod.UNAUTHORIZED)
+        self.assertEqual(s.step(), seat_mod.UNAUTHORIZED)
+        self.assertEqual(self.posted(), [f"--workspace {self.ws} post --signed-out"])
+        self.sign_in("tok-a")
+        s.health_auth_check()
+        self.assertEqual(health(self.ws)["state"], "ok")
+        self.assertEqual(len(self.signed_in_notices()), 1)
+
     def test_a_login_change_lifts_the_cores_limit_hold_but_a_workers_seat_leaves_it(self):
         import core_limit_hold
         held = {"status": "held", "kind": "usage-limit", "model": None, "evidence_at": 1, "set_at": 1,
@@ -1705,6 +1724,16 @@ class QuotaCard(SeatCase):
         s = self.make(quota=self.quota())
         s.ensure_server()
         self.assertEqual(s.step(), "failed")
+        self.assertEqual(self.cards, [])
+
+    def test_retryable_quota_noise_does_not_override_the_outcome(self):
+        self.task("task-1.txt")
+        self.plan("limit-retry-other", "limit-retried")
+        s = self.make(quota=self.quota(), retry_s=0)
+        self.assertEqual(s.step(), "failed")
+        self.assertNotEqual(health(self.ws).get("state"), "quota")
+        self.assertEqual(s.step(), "done")
+        self.assertEqual(health(self.ws)["state"], "ok")
         self.assertEqual(self.cards, [])
 
     def test_a_completed_turn_ends_the_limit_and_a_later_one_is_a_new_card(self):

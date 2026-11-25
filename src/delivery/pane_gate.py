@@ -93,6 +93,13 @@ LIMIT_WAIT = re.compile(r"Continuing automatically (?:at\b|shortly\b)|Continuing
                         # The limit's own title row, "Weekly limit · resets Nov 28 at 1pm": at the row's start,
                         # so a sentence that names a limit and a reset elsewhere is not one.
                         r"|^[ \t⎿⚠]*(?:session|usage|weekly) limit\s*·\s*resets?\b", re.I | re.M)
+_LIMIT_NOUN = r"(?:session|usage|weekly) limit"
+_LIMIT_TITLE = re.compile(
+    rf"^[ \t⎿⚠]*(?:You(?:'ve| have) (?:hit|reached|used|exceeded) (?:all of )?your {_LIMIT_NOUN}"
+    rf"|{_LIMIT_NOUN} reached)[ \t]*(?:[.!]?[ \t]*$|·[ \t]*(?:limit )?resets?\b)"
+    rf"|^[ \t⎿⚠]*{_LIMIT_NOUN}[ \t]*·[ \t]*resets?\b"
+    r"|^[ \t⎿⚠]*Continuing (?:automatically at\b|shortly[ \t]*·[ \t]*Esc to cancel[ \t]*$)",
+    re.I | re.M)
 #: A turn this short (or with no duration) may be the CLI refusing it, not running it.
 TURN_SHORT = re.compile(r"[01]s")
 # A turn the CLI refuses outright is a FINISHED turn: the reason is its `⎿` result and the
@@ -178,7 +185,7 @@ def _dialog_names_limit(text: str) -> bool:
             continue
         if core[0] in "✻⎿●⏺" or (core.startswith("❯") and core.lstrip("❯").strip()):
             return False  # the turn above the dialog: its words are not the dialog's
-        if limit_line(core):
+        if _LIMIT_TITLE.search(core):
             return True
     return False
 
@@ -253,7 +260,9 @@ CODEX_IDLE = re.compile(
 CODEX_PICKER_ROW = re.compile(r"[›»]\s*\d+\.")
 CODEX = RuntimeAdapter(
     name="codex", glyph="›", idle_ready=CODEX_IDLE,
-    gate_signatures=tuple(CLAUDE_GATE_SIGNATURES) + (("selection", CODEX_PICKER_ROW),),
+    gate_signatures=(("session-limit", _LIMIT_TITLE),) + tuple(
+        (kind, pattern) for kind, pattern in CLAUDE_GATE_SIGNATURES if kind not in LIMIT_GATES
+    ) + (("selection", CODEX_PICKER_ROW),),
     await_hint=re.compile(f"{AWAIT_HINT.pattern}|{CODEX_PICKER_ROW.pattern}", re.I),
     alternate_glyphs=("»",),
     idle_requires_prompt=True,

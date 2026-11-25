@@ -977,6 +977,15 @@ def ran_on(ws: Path) -> str:
     return str(confirmed_record(ws).get("runtime") or "")
 
 
+def rollback_point(ws: Path) -> tuple:
+    """(runtime, record text) a failed restart rolls back to: what runs now and its saved record."""
+    try:
+        before = ws.joinpath(*RECORD).read_text(encoding="utf-8")
+    except OSError:
+        before = None
+    return ran_on(ws), before
+
+
 def fall_back(ws: Path, room: str, rt: str, was: str, attempt: str, got: dict, rc: int, before: Optional[str], *,
               card: str = "", restart=restart_core, run=subprocess.run, core=None, execute=None,
               sleep=time.sleep, clock=time.time) -> dict:
@@ -1021,11 +1030,8 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
         try:
             if not is_recorded(ws, rec):
                 return _emit({"status": "refused", "why": "that attempt is not the one under way"}, 2)
-            was, ran = configured_runtime(), ran_on(ws)
-            try:
-                before = ws.joinpath(*RECORD).read_text(encoding="utf-8")
-            except OSError:
-                before = None
+            was = configured_runtime()
+            ran, before = rollback_point(ws)
             started = clock()
             rc = restart(args.runtime)
             restarted = rc not in NOT_RESTARTED
@@ -1046,6 +1052,7 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
                         rc, started = 0, float(now_on["started_at"])    # already there: nothing to restart
                     elif left and left != args.runtime:
                         was, started = configured_runtime(), clock()    # confirmed on another runtime
+                        ran, before = rollback_point(ws)                # the rollback is to that one now
                         rc = restart(args.runtime)
                         restarted = rc not in NOT_RESTARTED
                     else:

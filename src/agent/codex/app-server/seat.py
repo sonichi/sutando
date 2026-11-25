@@ -530,7 +530,7 @@ class Seat:
     def signed_out(self, filename: str) -> None:
         """The login was refused even on a restarted child: the core seat shows the owner the account card
         in their DM, once per login on disk. A worker's seat shares the core's login and says nothing."""
-        now = auth_print()
+        now = auth_print() or ()  # None means no card was sent, not a missing login file.
         if self.worker or self.told_signed_out == now:
             return
         try:
@@ -1009,7 +1009,9 @@ class Seat:
                 method, params = m.get("method"), m.get("params") or {}
                 if method == "account/rateLimits/updated" and isinstance(params.get("rateLimits"), dict):
                     self.rate_limits = params["rateLimits"]
-                elif method == "error" and params.get("turnId") in (None, turn_id) and usage_limit(params.get("error")):
+                elif (method == "error" and params.get("threadId") in (None, self.thread_id)
+                      and params.get("turnId") in (None, turn_id) and not params.get("willRetry")
+                      and usage_limit(params.get("error"))):
                     self.turn_limit = params["error"]
                 if (method == "error" and params.get("threadId") in (None, self.thread_id)
                         and model_missing(params.get("error"))):
@@ -1169,8 +1171,7 @@ class Seat:
         took = f"{time.monotonic() - started:.1f}s"
         if status == "completed":
             self.failures = 0
-            if self.turn_limit is None:
-                self.health("ok")
+            self.health("ok")
         self.quota_step(status, filename, payload)
         if has_ready_result(results, filename):
             if not self.still_admitted(filename, payload, picked):
@@ -1245,15 +1246,16 @@ class Seat:
         """Out of usage: the owner gets the account card once per limit (core_quota_notice); a turn
         that completed ends the limit. A notice that cannot be sent never stops the seat. The limit is
         recorded in the core's account health first, card or no card."""
-        if self.turn_limit is not None:
+        limit = self.turn_limit if status == "failed" else None
+        if limit is not None:
             self.health("quota", limit_reset(self.rate_limits))
         if self.quota is None:
             return
         try:
-            if self.turn_limit is not None:
+            if limit is not None:
                 at = limit_reset(self.rate_limits)
                 reset = (core_quota_notice.reset_from_epoch(at) if at else
-                         core_quota_notice.reset_from_text(self.turn_limit.get("message")))
+                         core_quota_notice.reset_from_text(limit.get("message")))
                 owner = payload is not None and core_quota_notice.is_owner_task(payload)
                 done = self.quota.hit(reset, at, tasks=[filename[:-4]] if owner and filename else ())
                 if str(done).startswith("quota-card"):

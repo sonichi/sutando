@@ -471,6 +471,15 @@ class GateSignaturesNeedACurrentAffordance(unittest.TestCase):
                     "› 1. Yes, proceed\n  2. No, and tell Codex what to do differently (esc)\n")
         self.assertEqual(pg.classify_pane(approval, pg.CODEX).state, "busy")
 
+    def test_a_codex_picker_quoting_a_limit_still_asks_for_a_selection(self):
+        dialog = ("The export says you hit your usage limit. What should it do?\n"
+                  "› 1. Retry\n  2. Exit\n  Press enter to confirm or esc to go back\n")
+        v = pg.classify_pane(dialog, pg.CODEX)
+        self.assertEqual((v.state, v.reason), ("busy", "selection"))
+        self.assertFalse(pg.is_usage_limit(v.reason, dialog))
+        banner = "You've hit your weekly limit · resets at 3pm\n" + dialog
+        self.assertEqual(pg.classify_pane(banner, pg.CODEX).reason, "session-limit")
+
     def test_select_prose_above_the_claude_composer_is_idle_ready_and_a_row_picker_is_busy(self):
         self.assertEqual(state(f"● Select the best file for the user.\n{CLAUDE_IDLE}", "claude"), "idle-ready")
         self.assertEqual(state("● Select the best file.\n❯ 1. main.py\n  2. util.py\n", "claude"), "busy")
