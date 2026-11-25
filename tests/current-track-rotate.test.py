@@ -389,6 +389,68 @@ class PinnedEntries(unittest.TestCase):
         self.assertNotIn("newest", r.archived)
         self.assertIn("oldest", r.archived)
 
+    def test_one_out_of_order_entry_does_not_flip_an_otherwise_consistent_file(self):
+        """A single entry recorded out of place must not out-vote the file's real trend.
+
+        Reproduces a live incident on current-track.md: entries run oldest-to-newest
+        (newest-last) except one mid-file entry landed ahead of an earlier-dated one
+        (an in-place edit appended where it left, not where its heading date would
+        sort it). Endpoints shared a date-only stamp and tied, so the old
+        first-decisive-pair scan fell through to adjacent pairs in file order and
+        hit that single inversion first -- calling the whole file newest-first and
+        archiving the real newest entry instead of the old ones.
+        """
+        E = lambda st, n: f"## {st} — {n}\n" + ("x" * 900) + "\n\n"
+        entries = ct.split(
+            E("2026-10-15", "a") + E("2026-10-15", "b") + E("2026-10-15", "out-of-order")
+            + E("2026-10-13", "c") + E("2026-10-14", "d") + E("2026-10-14", "e")
+            + E("2026-10-15", "newest")
+        )[1]
+        self.assertIs(ct._orientation(entries), False)
+        text = "# t\n\n" + "".join(entries)
+        r = ct.plan(text, 1200)
+        self.assertIn("newest", r.head)
+        self.assertNotIn("newest", r.archived)
+
+    def test_a_newer_stamped_pin_at_the_top_does_not_flip_history_orientation(self):
+        """Issue #4222: a PINNED heading stamped newer than all history must not read
+        as "newest-first" just because it wins the endpoint comparison.
+
+        History runs oldest-to-newest (newest-last); a pin block sits at the top with
+        its own fresher stamp (by construction, since it describes "state as of now").
+        The endpoints-only check compared the pin against the last history entry, saw
+        the pin was newer, and called the whole file newest-first -- archiving the
+        newest two history entries while keeping the oldest. The majority vote treats
+        that one pin-vs-history pair as a single outvoted signal against the run of
+        adjacent history pairs, which all agree on newest-last.
+        """
+        E = lambda st, n: f"## {st} — {n}\n" + ("x" * 900) + "\n\n"
+        text = ("# t\n\n" + E("2026-09-12T18:15Z", "PINNED - state as of")
+                + E("2026-09-04T10:00Z", "h1") + E("2026-09-04T12:00Z", "h2")
+                + E("2026-09-11T07:57Z", "h3") + E("2026-09-12T18:11Z", "h4-newest"))
+        _, entries = ct.split(text)
+        self.assertIs(ct._orientation(entries), False)
+        r = ct.plan(text, 1200)
+        self.assertIn("h4-newest", r.head)
+        self.assertNotIn("h4-newest", r.archived)
+
+    def test_a_newer_stamped_pin_still_does_not_flip_with_only_three_history_entries(self):
+        """Regression for the gap the majority vote itself had: with the endpoint
+        comparison counted as a second vote, the pin's direction only lost once 3+
+        history-only adjacent pairs opposed it (4+ history entries). Three history
+        entries -- one fewer than the original #4222 regression test above -- used
+        to still flip to newest-first, archiving the newest history entry.
+        """
+        E = lambda st, n: f"## {st} — {n}\n" + ("x" * 900) + "\n\n"
+        text = ("# t\n\n" + E("2026-09-12T18:15Z", "PINNED - state as of")
+                + E("2026-09-04T10:00Z", "h1") + E("2026-09-04T12:00Z", "h2")
+                + E("2026-09-11T07:57Z", "h3-newest"))
+        _, entries = ct.split(text)
+        self.assertIs(ct._orientation(entries), False)
+        r = ct.plan(text, 1200)
+        self.assertIn("h3-newest", r.head)
+        self.assertNotIn("h3-newest", r.archived)
+
     def test_the_over_budget_exit_says_it_wrote_and_how_much(self):
         """rc=3 next to 'nothing was archived' read as a no-op while 213 KB moved."""
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
