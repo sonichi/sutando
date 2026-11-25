@@ -227,11 +227,13 @@ class RuntimeAdapter:
     # The runtime's dispatcher waits for idle-ready, so a draft holds every queued task.
     pending_blocks_dispatch: bool = False
     composer_requires_single_line: bool = False
+    # The CLI draws a running turn as a spinner row above the composer (turn_running reads it).
+    spinner_turns: bool = False
 
 
 CLAUDE = RuntimeAdapter(
     name="claude", glyph=CLAUDE_COMPOSER.glyph, idle_ready=CLAUDE_IDLE,
-    gate_signatures=tuple(CLAUDE_GATE_SIGNATURES),
+    gate_signatures=tuple(CLAUDE_GATE_SIGNATURES), spinner_turns=True,
 )
 # Codex's composer glyph varies by CLI version; its model row is the idle footer.
 CODEX_IDLE = re.compile(
@@ -535,19 +537,29 @@ def _waiting_row(plain: str) -> bool:
     return bool(limit_line(plain) or _WAIT_TEXT.search(plain) or frame_abnormal(plain))
 
 
+def _live_spinner(capture: Optional[str]) -> Optional[List[str]]:
+    """Plain rows from the newest turn row above the composer down, when that row is a spinner."""
+    lines = (capture or "").splitlines()
+    return turn_status([_SGR.sub("", ln) for ln in lines[:len(lines) - len(_below_composer(capture))]])
+
+
+def turn_running(capture: Optional[str], adapter: RuntimeAdapter = CLAUDE, waits: bool = True) -> bool:
+    """A turn is running: the newest turn row above the composer is a spinner, drawn from the
+    turn's first second (Claude Code 2.1.322 prints no "esc to interrupt" while a turn runs).
+    `waits` False: a spinner that names a limit, a retry or a wait is waiting, not running."""
+    rows = _live_spinner(capture) if adapter.spinner_turns else None
+    return rows is not None and (waits or not any(_waiting_row(r) for r in rows))
+
+
 def turn_in_flight(capture: Optional[str]) -> bool:
     """The newest turn row above the composer is a spinner that has run FLIGHT_MIN_S or more,
     and neither it nor a row under it names a limit, a retry or a wait: the seat is mid-turn,
     so a limit banner under the composer is from before it."""
-    lines = (capture or "").splitlines()
-    above = [_SGR.sub("", ln) for ln in lines[:len(lines) - len(_below_composer(capture))]]
-    for i in range(len(above) - 1, -1, -1):
-        if _TURN_ROW.search(above[i]):
-            if not _SPINNER_ROW.search(above[i]) or any(_waiting_row(r) for r in above[i:]):
-                return False
-            ran = spinner_elapsed(above[i])
-            return ran is not None and ran >= FLIGHT_MIN_S
-    return False
+    rows = _live_spinner(capture)
+    if rows is None or any(_waiting_row(r) for r in rows):
+        return False
+    ran = spinner_elapsed(rows[0])
+    return ran is not None and ran >= FLIGHT_MIN_S
 
 
 def strip_limit_banners(capture: str) -> str:
@@ -640,7 +652,7 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=Non
         return Verdict("busy", gate)
     if abn and not limit_is_stale(abn, workspace, socket, session, probe, capture=capture):
         return Verdict("abnormal", ",".join(abn.names))
-    if frame_working(tail):
+    if frame_working(tail) or turn_running(capture, adapter):
         return Verdict("busy", "working")
     if line is not None and line.text:
         return Verdict("pending", "text at the prompt", line.text)
@@ -659,7 +671,8 @@ def limit_holds(capture: Optional[str], adapter: RuntimeAdapter) -> bool:
     lines = _tail_lines(capture)
     tail = "\n".join(_SGR.sub("", ln) for ln in lines)
     abn = frame_abnormal(tail)
-    if (abn and abn.retrying) or frame_working(tail) or turn_in_flight(capture):
+    # Any age: a recovery line's own turn spins before any refusal returns.
+    if (abn and abn.retrying) or frame_working(tail) or turn_running(capture, adapter, waits=False):
         return False
     line = prompt_line(capture, adapter)
     if line is None or line.text:

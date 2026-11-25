@@ -402,6 +402,11 @@ class ASpinnerRowAloneIsATurnRunning(unittest.TestCase):
         self.assertFalse(pg.turn_in_flight(fresh))  # the limit-outrun threshold is unchanged
         self.assertEqual(self.verdict(fresh), ("busy", "working"))
 
+    def test_a_turn_retrying_with_no_limit_on_screen_is_still_working(self):
+        retry = self.REAL.replace("(19m 30s", "(retrying in 30s · attempt 3/10 · 19m 30s")
+        self.assertNotEqual(retry, self.REAL)
+        self.assertEqual(self.verdict(retry), ("busy", "working"))
+
     def test_control_a_finished_turn_is_idle_ready(self):
         done = self.REAL.replace(f"{self.SPINNER}\n{self.TIP}\n", "✻ Cooked for 2m 3s\n")
         self.assertNotIn("Shimmying", done)
