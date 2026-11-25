@@ -1263,7 +1263,7 @@ class Switch(Base):
         self.assertEqual(out["outcome"], "info")
         self.assertIn("config still names Codex", out["say"])
 
-    def failing_switch(self, back_ok):
+    def failing_switch(self, back_ok, back_rc=None):
         """The restart onto Claude Code fails and leaves no core; the relaunch of Codex comes back or not."""
         self.record("codex", T0 - 600)
         before = self.ws.joinpath(*rtc.RECORD).read_text()
@@ -1279,7 +1279,7 @@ class Switch(Base):
             if back_ok:
                 self.record("codex", self.clock.t - 5)
                 self.current = self.selected = "codex"
-            return 0 if back_ok else 1
+            return back_rc if back_rc is not None else (0 if back_ok else 1)
         self.restart = restart
         rc, out = self.carded()
         self.assertEqual(seen, [before], "the previous runtime's record is put back before it is relaunched")
@@ -1294,6 +1294,16 @@ class Switch(Base):
         self.assertEqual(out["say"], "Couldn't switch to Claude Code: the restart did not finish cleanly (exit 1). "
                                      "I started Codex again, and the core is running on it.")
         self.assertTrue(out["fell_back_confirmed"])
+
+    def test_a_relaunch_that_stopped_nothing_says_the_core_is_still_on_the_old_runtime(self):
+        for code in rtc.NOT_RESTARTED:
+            with self.subTest(rc=code):
+                self.restarts.clear()
+                self.ws.joinpath(*rtc.RUNNING).write_text(json.dumps(
+                    {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": self.clock.t}))
+                out = self.failing_switch(back_ok=False, back_rc=code)
+                self.assertTrue(out["say"].endswith("The core is still on Codex."), out["say"])
+                self.assertNotIn("may be down", out["say"])
 
     def test_a_relaunch_that_fails_too_names_what_to_do_outside_chat(self):
         out = self.failing_switch(back_ok=False)

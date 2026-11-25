@@ -962,7 +962,9 @@ def fall_back(ws: Path, room: str, rt: str, was: str, attempt: str, got: dict, r
     gateway = restore_desktop_gateway(run) if back_rc not in NOT_RESTARTED else ""
     back = confirm(ws, was, since, sleep=sleep, clock=clock)
     lead = f"Couldn't switch to {name(rt)}: {why_not(rt, got, rc)}."
-    if back["core"]:
+    if back_rc in NOT_RESTARTED and not back["core"]:
+        words = f"{lead} The core is still on {name(was)}."   # that restart stopped nothing
+    elif back["core"]:
         words = f"{lead} I started {name(was)} again, and the core is running on it."
     else:
         where = ("Quit and reopen the app on the computer that runs the core." if desktop_hosted() else
