@@ -984,12 +984,31 @@ class Edges(Base):
         self.assertEqual(out, {"status": "failed", "why": "the card is not in the owner's DM"})
         self.assertEqual(self.fake.calls, [])
 
-    def test_a_switching_card_that_cannot_be_kept_still_starts_the_switch(self):
+    def test_a_switching_card_that_cannot_be_shown_still_starts_the_switch(self):
         self.using("opus")
         self.run_(["post", "--room", DM])
-        with mock.patch.object(mc, "keep_card", side_effect=OSError("ro")):
+        with mock.patch.object(mc, "_edit", side_effect=OSError("ro")):
             rc, out = self.tap("fable")
         self.assertEqual((rc, out["status"]), (0, "started"))
+        self.assertIn("could not be used", out["card_why"])
+
+    def test_an_older_taps_switching_words_arriving_late_never_replace_the_newer_attempts_card(self):
+        """Two taps on one card: the older reply pauses before its "switching" edit while the newer
+        one is accepted, shown and settled. `turn` skips the older switch and its outcome is never
+        told, so its words landing last would stay on the card for good: they are not sent."""
+        self.using("opus")
+        for attempt, alias in (("17-ab", "fable"), ("18-cd", "sonnet")):
+            mc.save_outcome(self.ws, attempt, DM, alias, None, mc.time.time())
+        run = lambda *a, **k: self.fake.execute(*a, **k)
+        show = lambda attempt: mc.show_switching(self.ws, attempt, DM, "$card1", "Switching", core=CORE,
+                                                 execute=run, now=mc.time.time())
+        self.assertEqual(show("18-cd")["status"], "posted")
+        sent = len(self.fake.calls)
+        self.assertEqual(show("17-ab")["status"], "superseded")
+        self.assertEqual(len(self.fake.calls), sent, "neither an edit nor a card of its own")
+        self.assertEqual(show("no-such")["status"], "superseded", "an attempt the record does not name shows nothing")
+        rows = {r["attempt"]: r for r in mc.outcomes(self.ws)}
+        self.assertEqual((rows["18-cd"].get("card"), rows["17-ab"].get("card")), ("$card1", None))
 
     def test_a_card_whose_record_cannot_be_written_is_posted_and_says_its_buttons_will_not_act(self):
         with mock.patch.object(mc.issued_cards, "record", side_effect=PermissionError("read-only")) as record:

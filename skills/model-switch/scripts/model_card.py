@@ -402,12 +402,25 @@ def _edit(ws: Path, room: str, event: str, words: str, operation_id: str, *, cor
     return {"status": "posted", "event_id": event, "edited": True}
 
 
-def keep_card(ws: Path, attempt: str, event: str, now: float) -> None:
-    """Keep `event`, the card the attempt's "switching" words replaced, for its outcome to replace."""
-    with _outcome_book(ws, now) as rows:
-        for row in rows:
-            if row["attempt"] == attempt:
-                row["card"] = event
+def show_switching(ws: Path, attempt: str, room: str, tapped: str, say: str, *, core=None, execute=None,
+                   now: float) -> dict:
+    """Show the attempt's "switching" words, in place of the tapped card or as a card of its own, under
+    the outcomes' lock and only while it is the newest attempt: an older tap's words arriving late
+    would replace the newer attempt's card, and nothing would correct them (its outcome is never told)."""
+    try:
+        with _outcome_book(ws, now) as rows:
+            at = next((i for i, r in enumerate(rows) if r["attempt"] == attempt), None)
+            if at is None or at + 1 < len(rows):
+                return {"status": "superseded", "why": "a newer switch was accepted; its card stands"}
+            posted = _edit(ws, room, tapped, say, f"model-card:{attempt}:switching-edit", core=core, execute=execute)
+            if posted["status"] == "posted":
+                rows[at]["card"] = tapped       # the card this attempt's outcome replaces
+                return posted
+            body, card = notice_card("pending", "Switching", say)
+            return _post(ws, room, body, card, f"model-card:{attempt}:switching", reply_to=tapped,
+                         core=core, execute=execute)
+    except OSError as e:
+        return {"status": "failed", "why": f"the outcome record could not be used ({type(e).__name__})"}
 
 
 def new_attempt(now: float) -> str:
@@ -603,16 +616,7 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
         return _emit({**other, **extra}, code)
     say = switching_words(alias)
     tapped = str(headers.get("reply_to_event") or "")
-    posted = _edit(ws, room, tapped, say, f"model-card:{attempt}:switching-edit", core=core or None, execute=execute)
-    if posted["status"] == "posted":
-        try:
-            keep_card(ws, attempt, tapped, now())
-        except OSError:
-            pass  # the outcome is then posted as a card of its own
-    else:
-        body, card = notice_card("pending", "Switching", say)
-        posted = _post(ws, room, body, card, f"model-card:{attempt}:switching", reply_to=tapped,
-                       core=core or None, execute=execute)
+    posted = show_switching(ws, attempt, room, tapped, say, core=core or None, execute=execute, now=now())
     try:
         pid = start_switch(ws, alias, room, attempt, popen)
     except OSError as e:
