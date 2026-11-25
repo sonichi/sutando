@@ -308,6 +308,42 @@ class AccountCardTest(unittest.TestCase):
         self.assertEqual(self.outbox(), [])
         self.assertIn("Antigravity has reached its usage limit", self.w.result("task-q"))
 
+    # ── signed out: a card with the sign-in, not a line of words ──
+    def test_signed_out_in_the_owner_dm_posts_the_sign_in_card_instead_of_the_error_line(self):
+        (self.w.home / "signed-in").unlink()
+        self.dm("task-so", "STUB:TEXT hi")
+        self.serve()
+        self.assertEqual(self.w.result("task-so"), account_switch.ANSWERED, "the card answers: no error line")
+        (queued,) = self.outbox()
+        card = queued["card"]
+        self.assertEqual(queued["room"], DM)
+        self.assertEqual(card["account_controls"], {"runtime": "antigravity", "agent": AGENT, "signed_out": True})
+        self.assertIn("not signed in on this computer", card["text"])
+        self.assertIn("Sign in", card["text"])
+        self.assertNotIn("agy acp --login", card["text"], "no terminal command in the card")
+        self.assertIn("not signed in", queued["body"], "the one-line fallback for a client without cards")
+        self.assertNotIn("session/prompt", self.w.methods())
+
+    def test_signed_out_outside_the_owner_dm_keeps_the_words_and_queues_no_card(self):
+        (self.w.home / "signed-in").unlink()
+        self.dm("task-so", "STUB:TEXT hi", kind="room")
+        self.serve()
+        self.assertEqual(self.outbox(), [])
+        self.assertIn("Antigravity is not signed in on this computer", self.w.result("task-so"))
+
+    def test_signed_out_when_the_card_cannot_be_queued_keeps_the_words(self):
+        (self.w.home / "signed-in").unlink()
+        self.dm("task-so", "STUB:TEXT hi")
+        with mock.patch.object(agy_account.AgyAccount, "post", lambda *a, **kw: False):
+            self.serve()
+        self.assertIn("Antigravity is not signed in on this computer", self.w.result("task-so"))
+
+    def test_what_reads_as_signed_out(self):
+        auth = gc.NOT_SIGNED_IN % "session/new: Authentication required"
+        self.assertTrue(agy_account.signed_out_error("failed", auth))
+        self.assertFalse(agy_account.signed_out_error("failed", "internal error"))
+        self.assertFalse(agy_account.signed_out_error("completed", gc.NOT_SIGNED_IN % "x"))
+
     def test_what_reads_as_agys_quota_error(self):
         yes = (("failed", "", "session/prompt: RESOURCE_EXHAUSTED: Individual quota reached."),
                ("failed", "", "HTTP 429 Too Many Requests"), ("failed", "", "status: 429"),
