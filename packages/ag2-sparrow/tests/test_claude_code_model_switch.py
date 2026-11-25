@@ -270,7 +270,8 @@ class ModelCommand(unittest.TestCase):
 
     def test_it_prints_the_recorded_model_or_switches_and_says_how_it_went(self):
         rc, out, _, made = self.run_model()
-        self.assertEqual((rc, json.loads(out), made), (0, {"model": "sonnet"}, []))
+        shown = json.loads(out)
+        self.assertEqual((rc, shown["model"], shown["current"], shown["pending"], made), (0, "sonnet", "sonnet", None, []))
         rc, out, _, made = self.run_model("opus", "--confirm")
         self.assertEqual((rc, json.loads(out)), (0, {"switched": True, "model": "opus", "detail": "switched to opus"}))
         self.assertEqual(made, [({"ROOT": "/w"}, "/c"), ({"r": 1}, "opus", True)])

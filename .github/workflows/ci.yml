@@ -349,10 +349,15 @@ jobs:
           timeout -k 5 120 "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" plugin test task-watch-mod
 
   shell-standalone-tests:
-    name: shell tests (lanes)
+    name: shell tests (lanes ${{ matrix.shard }}/2)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
+    # Two runners, each a cost-balanced half of the lanes, run as a parallel pool.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -384,20 +389,22 @@ jobs:
       # *.test.py and *.test.ts). Emit full output on failure so debugging
       # info isn't lost.
       - name: Run shell standalone tests
+        env:
+          SHARD: ${{ matrix.shard }}
         run: |
-          bash scripts/run-shell-suites.sh lanes
+          bash scripts/run-shell-suites.sh lanes 2 "$SHARD"
 
   shell-tail-tests:
-    name: shell tests (serial tail ${{ matrix.shard }}/3)
+    name: shell tests (serial tail ${{ matrix.shard }}/6)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
-    # The process-table suites run one at a time per runner: three runners, each
-    # a cost-balanced third of the tail, so the tail is no longer the longest job.
+    # The process-table suites run one at a time per runner: six runners, each
+    # a cost-balanced sixth of the tail, so the tail is no longer the longest job.
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4, 5, 6]
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -405,15 +412,19 @@ jobs:
       - name: Install Python test deps
         run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
       - name: Run shell standalone tests (serial tail)
-        run: bash scripts/run-shell-suites.sh tail 3 ${{ matrix.shard }}
+        run: bash scripts/run-shell-suites.sh tail 6 ${{ matrix.shard }}
 
-  # The gate the ag2-sparrow tag publish runs, on the same 3.11, its suites in parallel. On a PR it runs
+  # The gate the ag2-sparrow tag publish runs, on the same 3.11, as three cost-balanced legs. On a PR it runs
   # only when `changes` says the diff reaches it; required-tests reads that skip as a pass.
   sparrow-publish-gate:
-    name: ag2-sparrow publish gate (python 3.11)
+    name: ag2-sparrow publish gate (python 3.11, ${{ matrix.shard }}/3)
     needs: changes
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.sparrow == 'true'
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -425,19 +436,19 @@ jobs:
           python-version: '3.11'
 
       - name: Test before publish (package suites + src-drift guard)
-        run: bash packages/ag2-sparrow/tools/publish_gate.sh
+        run: bash packages/ag2-sparrow/tools/publish_gate.sh 3 ${{ matrix.shard }}
 
   python-standalone-tests:
-    name: python standalone tests (${{ matrix.shard }}/15)
+    name: python standalone tests (${{ matrix.shard }}/18)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
-    # Legs 1-13 share the files by measured cost; legs 14-15 run the load-sensitive
+    # Legs 1-16 share the files by measured cost; legs 17-18 run the load-sensitive
     # suites (see the step). The coverage-gate job combines every leg's data.
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
     # Split out of `tsc + tests` so the three suites run beside each other rather
     # than one after another. Same environment, same commands — only sequencing.
     # 20, not 15: the suite now runs under coverage instrumentation (the only
@@ -511,7 +522,7 @@ jobs:
           # Records are collected per file and replayed below in the leg's own
           # order (heaviest first), so `failed_files` keeps that order.
           # Cost-shared legs; the matrix is these plus the load-sensitive pair after them.
-          SHARED_LEGS=13
+          SHARED_LEGS=16
           failed=0
           failed_files=()
           WORKERS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
