@@ -116,6 +116,23 @@ class IdentityLockTest(unittest.TestCase):
         identity_lock.release(name)
         self.assertFalse(lock.exists())
 
+    def test_the_bridges_own_lock_heartbeat_and_exit_carry_the_identity_lock(self):
+        self.assertTrue(rgb._acquire_singleton())
+        self.assertTrue(rgb._acquire_identity())
+        name = rgb._IDENTITY_LOCK["name"]
+        lock = identity_lock.place() / "state" / "locks" / (name + ".lock")
+        self.assertTrue(rgb._heartbeat_singleton())
+        with mock.patch.object(identity_lock, "beat", lambda name: False):
+            self.assertFalse(rgb._heartbeat_singleton(), "the identity went to another bridge: stop polling")
+        self.assertTrue(rgb._LOCK_LOST.is_set())
+        rgb._LOCK_LOST.clear()
+        with mock.patch.object(identity_lock, "release", side_effect=OSError("disk")):
+            rgb._release_singleton()             # a release that fails never stops the exit
+        self.assertTrue(lock.exists())
+        self.assertTrue(rgb._acquire_singleton())
+        rgb._release_singleton()
+        self.assertFalse(lock.exists(), "the exit lets the next bridge for this agent in at once")
+
     def test_an_agent_not_known_yet_takes_the_lock_at_the_first_heartbeat_that_knows_it(self):
         with mock.patch.object(rgb, "_reenroll_identity", lambda: ""):
             self.assertTrue(rgb._acquire_identity(), "no identity yet: fail-open")
@@ -138,6 +155,8 @@ class IdentityLockTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"SUTANDO_BRIDGE_LOCK": "0"}):
             self.assertTrue(rgb._acquire_identity())
         with mock.patch.object(gateway_instance, "binding_key_path", side_effect=OSError("no home")):
+            self.assertEqual(identity_lock.take(AGENT, URL)[0], identity_lock.UNKNOWN)
+        with mock.patch.object(identity_lock.workspace_lock, "acquire", side_effect=OSError("read-only")):
             self.assertEqual(identity_lock.take(AGENT, URL)[0], identity_lock.UNKNOWN)
         self.assertTrue(identity_lock.beat(""))
         identity_lock.release("")
