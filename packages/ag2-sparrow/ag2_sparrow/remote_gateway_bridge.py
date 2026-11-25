@@ -5160,15 +5160,46 @@ def _end_unpublished_claims(wire_tid: str) -> bool:
         return open_
 
 
-def _seat_took(tid: str) -> bool:
-    """A Codex app-server seat has taken this run up: it works on its own copy of the admitted file
-    (<state>/codex-seat/<session>/payloads/<tid>.txt) and writes no agent-activity rows, so the
-    activity test alone reads its task as untaken and withdraws the inbox file mid-turn. The seat
-    then finds its admitted file neither in the inbox nor archived and settles nothing."""
+def _seat_took(tid: str, since: float) -> bool:
+    """A live Codex app-server seat is running this generation of the task: it works on its own copy
+    (<state>/codex-seat/<session>/payloads/<tid>.txt) and writes no agent-activity rows, so the activity
+    test alone would withdraw the inbox file mid-turn. Evidence is a copy written no earlier than the inbox
+    file (`since`, its mtime) in a seat folder whose `lock` its running seat still holds; a copy an exited
+    seat left behind, or one of an older generation, takes nothing."""
     try:
-        return any((_STATE / "codex-seat").glob(f"*/payloads/{glob.escape(tid)}.txt"))
+        copies = list((_STATE / "codex-seat").glob(f"*/payloads/{glob.escape(tid)}.txt"))
     except OSError:
         return False
+    for copy in copies:
+        try:
+            if copy.stat().st_mtime >= since and _seat_lock_held(copy.parent.parent / "lock"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _seat_lock_held(path: Path) -> bool:
+    """Whether a running seat holds its folder's lock (seat.py takes it exclusively for its whole life)."""
+    try:
+        import fcntl
+    except ImportError:
+        return False
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
 
 
 def _stop_run(t, run: "str | None", why: str) -> bool:
@@ -5181,10 +5212,10 @@ def _stop_run(t, run: "str | None", why: str) -> bool:
     if answered or _own_copy_exists(run):
         return True
     activity = task_attempts.last_activity(_STATE, run)
-    seat = _seat_took(run)
     for path in [TASKS_DIR / f"{run}.txt", *TASKS_DIR.glob(f"{glob.escape(run)}.assigned-*")]:
         try:
-            if seat or (activity is not None and activity >= path.stat().st_mtime):
+            mtime = path.stat().st_mtime
+            if (activity is not None and activity >= mtime) or _seat_took(run, mtime):
                 break                           # the core's turn has touched it: taken
             path.unlink()
         except FileNotFoundError:
@@ -5510,10 +5541,10 @@ def _withdraw_closed(t, why: str) -> None:
         return
     queued = [TASKS_DIR / f"{tid}.txt", *TASKS_DIR.glob(f"{glob.escape(tid)}.assigned-*")]
     activity = task_attempts.last_activity(_STATE, tid)
-    seat = _seat_took(tid)
     for path in queued:
         try:
-            if seat or (activity is not None and activity >= path.stat().st_mtime):
+            mtime = path.stat().st_mtime
+            if (activity is not None and activity >= mtime) or _seat_took(tid, mtime):
                 break                           # the core's turn has touched it: taken
             path.unlink()
         except FileNotFoundError:

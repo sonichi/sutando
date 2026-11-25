@@ -806,10 +806,10 @@ class Crash(SeatCase):
         self.assertEqual(len(list((Path(s.host.state) / "unsettled-results").iterdir())), 1)
         self.assertEqual([name for name, _ in s.pending()], ["task-1.txt"])
 
-    def test_a_result_the_bridge_took_while_the_inbox_file_was_withdrawn_is_logged_as_the_bridges(self):
+    def test_a_result_gone_while_the_inbox_file_was_withdrawn_is_logged_as_gone(self):
         """VM 2026-11-22 22:42:16: the broker closed the task, the bridge withdrew its inbox file
         and archived the result between the seat's two reads, and the seat logged "the result is
-        kept at " with no path. It now says the bridge settles it."""
+        kept at " with no path. It now says the result was gone, and names no one as settling it."""
         first = self.task("task-1.txt")
         s = self.make()
         s.ensure_server()
@@ -826,7 +826,8 @@ class Crash(SeatCase):
 
         s.run_turn, s.set_result_aside = withdrawn_mid_turn, bridge_took_it_first
         self.assertEqual(s.step(), seat_mod.WITHDRAWN)
-        self.assertIn("already taken by the bridge", self.out.getvalue())
+        self.assertIn("then gone from the results folder", self.out.getvalue())
+        self.assertNotIn("bridge", self.out.getvalue())
         self.assertNotIn("the result is kept at", self.out.getvalue())
 
     def test_a_result_that_cannot_be_set_aside_says_so(self):

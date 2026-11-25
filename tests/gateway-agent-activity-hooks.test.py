@@ -1335,23 +1335,55 @@ class Hooks(unittest.TestCase):
         self.assertTrue(gw._deliver_result_payload(tid, tid, "late"))
         self.assertEqual(fake.posted("/v1/results"), [])
 
+    def seat_copy(self, tid, *, live=True, age=0.0):
+        """The copy a seat named sutando-core made of `tid`, `age` seconds older than now; with `live`, the
+        seat's lock is held as its running process holds it."""
+        import fcntl
+        seat = gw._STATE / "codex-seat" / "sutando-core"
+        copy = seat / "payloads" / f"{tid}.txt"
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        copy.write_text("task")
+        self.addCleanup(lambda: copy.unlink(missing_ok=True))
+        if age:
+            os.utime(copy, (time.time() - age, time.time() - age))
+        if live:
+            fd = os.open(seat / "lock", os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.addCleanup(os.close, fd)
+        return copy
+
     def test_a_closed_task_a_codex_seat_is_running_is_stopped_not_withdrawn(self):
         """VM 2026-11-22: an app-server seat works on its own copy and writes no activity rows, so
         the activity test alone withdrew its inbox file mid-turn and the seat settled nothing."""
         tid = "task-closed-seat"
         self.assertTrue(gw._take_served_task(_task(tid), set(), []))
         seed_ack(tid, _ack(tid, 1))
-        copy = gw._STATE / "codex-seat" / "sutando-core" / "payloads" / f"{tid}.txt"
-        copy.parent.mkdir(parents=True, exist_ok=True)
-        copy.write_text("task")
-        self.addCleanup(lambda: copy.unlink(missing_ok=True))
+        self.seat_copy(tid)
         self.closed_by_beat(tid, reason="max_queued_age_exceeded")
         self.assertTrue((gw.TASKS_DIR / f"{tid}.txt").exists(), "a file the seat is on stays")
         self.assertEqual(len(self.controls(tid)), 1, "the seat is asked to stop")
 
+    def test_a_copy_an_exited_seat_left_behind_takes_nothing(self):
+        tid = "task-closed-stale-seat"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        seed_ack(tid, _ack(tid, 1))
+        self.seat_copy(tid, live=False)
+        self.closed_by_beat(tid, reason="max_queued_age_exceeded")
+        self.assertFalse((gw.TASKS_DIR / f"{tid}.txt").exists(), "no running seat: withdrawn")
+        self.assertEqual(self.controls(tid), [])
+
+    def test_a_copy_of_an_older_generation_takes_nothing(self):
+        tid = "task-closed-old-copy"
+        self.seat_copy(tid, age=3600)
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        seed_ack(tid, _ack(tid, 1))
+        self.closed_by_beat(tid, reason="max_queued_age_exceeded")
+        self.assertFalse((gw.TASKS_DIR / f"{tid}.txt").exists(), "the copy predates this file: withdrawn")
+        self.assertEqual(self.controls(tid), [])
+
     def test_a_seat_folder_that_cannot_be_read_takes_nothing(self):
         with mock.patch.object(gw.Path, "glob", side_effect=OSError("denied")):
-            self.assertFalse(gw._seat_took("task-unreadable-seat"))
+            self.assertFalse(gw._seat_took("task-unreadable-seat", 0.0))
 
     def test_a_closed_task_the_core_claimed_first_is_stopped(self):
         tid = "task-closed-claimed"

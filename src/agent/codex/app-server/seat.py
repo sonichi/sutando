@@ -788,9 +788,10 @@ class Seat:
                     log(f"task {filename}: turn {status} in {took}; result written, but the admitted file is "
                         f"neither in the inbox nor archived, so nothing is settled; the result is kept at {aside}")
                 elif not (Path(results) / filename).exists():
-                    # The bridge took the result between the two reads: it settles it, not this seat.
-                    log(f"task {filename}: turn {status} in {took}; result written and already taken by the "
-                        "bridge, which settles it; the admitted file had left the inbox")
+                    # Gone between the two reads; who took it is not known here, so nothing is claimed.
+                    log(f"task {filename}: turn {status} in {took}; result written, then gone from the results "
+                        "folder before it could be set aside; the admitted file had left the inbox, so this "
+                        "seat settles nothing")
                 else:
                     log(f"task {filename}: turn {status} in {took}; result written, but the admitted file is "
                         "neither in the inbox nor archived and the result could not be set aside")
