@@ -379,10 +379,11 @@ class QuotedDialogAboveTheTurnIsTranscript(unittest.TestCase):
 
 class ASpinnerRowAloneIsATurnRunning(unittest.TestCase):
     """Claude Code 2.1.322 draws a running turn as its spinner row alone, with no "esc to
-    interrupt" anywhere on the pane. A live capture (tool rows made generic): 19m into a turn."""
+    interrupt" anywhere on the pane. A live -e capture (tool rows made generic): 19m into a turn.
+    The fixture spells ESC as the text \\x1b, since `gh pr diff` refuses raw escape bytes."""
 
-    REAL = (Path(__file__).resolve().parent / "fixtures"
-            / "pane-claude-turn-in-flight-spinner-only.txt").read_text(encoding="utf-8")
+    REAL = (Path(__file__).resolve().parent / "fixtures" / "pane-claude-turn-in-flight-spinner-only.txt"
+            ).read_text(encoding="utf-8").replace("\\x1b", "\x1b")
     SPINNER = next(ln for ln in REAL.splitlines() if "Shimmying" in ln)
     TIP = next(ln for ln in REAL.splitlines() if "Tip:" in ln)
     PERMISSION = "⏺ Bash(rm -rf build)\n  Do you want to proceed?\n  Allow this action\n  Esc to cancel\n"

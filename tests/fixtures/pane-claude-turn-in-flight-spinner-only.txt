@@ -1,13 +1,13 @@
-[38;5;246m⏺[39m Waiting for CI after a rerun[38;5;246m · 4m 7s[39m
-[38;5;246m  ⎿  $ python3 tools/ci-wait.py example/repo 123 2>&1 | tail -4 (4m 6s)[39m
-     [38;5;246m(ctrl+b ctrl+b (twice) to run in background)[39m
+\x1b[38;5;246m⏺\x1b[39m Waiting for CI after a rerun\x1b[38;5;246m · 4m 7s\x1b[39m
+\x1b[38;5;246m  ⎿  $ python3 tools/ci-wait.py example/repo 123 2>&1 | tail -4 (4m 6s)\x1b[39m
+     \x1b[38;5;246m(ctrl+b ctrl+b (twice) to run in background)\x1b[39m
 
-[38;5;174m✽[39m [38;5;180mShimmying…[38;5;174m [38;5;246m(19m 30s · ↓[39m [38;5;246m21.7k tokens)[39m
-[38;5;246m  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's current work[39m
-Sutando: using a tool                                                                                                  [38;5;246m[-][39m
+\x1b[38;5;174m✽\x1b[39m \x1b[38;5;180mShimmying…\x1b[38;5;174m \x1b[38;5;246m(19m 30s · ↓\x1b[39m \x1b[38;5;246m21.7k tokens)\x1b[39m
+\x1b[38;5;246m  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's current work\x1b[39m
+Sutando: using a tool                                                                                                  \x1b[38;5;246m[-]\x1b[39m
 
-[38;5;244m───────────────────────────────────────────────────────────────────────── sutando-worker-00000000000000000000000000000000 ─
-[38;5;246m❯ [39m
-[38;5;244m───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-[39m  [38;5;246mOpus 5.5 · 7d 66%[39m
-  [38;5;211m⏵⏵ bypass permissions on[38;5;246m · [38;5;44m1 shell[39m
+\x1b[38;5;244m───────────────────────────────────────────────────────────────────────── sutando-worker-00000000000000000000000000000000 ─
+\x1b[38;5;246m❯ \x1b[39m
+\x1b[38;5;244m───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+\x1b[39m  \x1b[38;5;246mOpus 5.5 · 7d 66%\x1b[39m
+  \x1b[38;5;211m⏵⏵ bypass permissions on\x1b[38;5;246m · \x1b[38;5;44m1 shell\x1b[39m
