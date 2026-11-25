@@ -1036,6 +1036,47 @@ class Edges(Base):
         self.assertEqual(mc.deliver_owed(self.ws, core=CORE, execute=lambda *a, **k: self.fake.execute(*a, **k),
                                          now=mc.time.time()), [], "nothing of it is owed")
 
+    def test_a_record_that_cannot_be_written_never_turns_a_superseded_tap_into_a_started_one(self):
+        """Reviewer, 3f90a1db: when writing the superseded mark raised, the answer became `failed`, and
+        the caller launched the switch and returned the stale "switching" words."""
+        self.using("opus")
+        self.run_(["post", "--room", DM])
+        owed, at = mc.deliver_owed, len(self.fake.calls)
+        from local_record import write_whole
+
+        def newer_tap_then_a_read_only_record(ws, **kw):
+            mc.save_outcome(ws, "9999999999-newer", DM, "sonnet", 0, mc.time.time())
+            out = owed(ws, **kw)
+            writes.start()                      # from here on the record cannot be written
+            return out
+
+        writes = mock.patch("local_record.write_whole", side_effect=PermissionError("read-only"))
+        self.addCleanup(mock.patch.stopall)
+        with mock.patch.object(mc, "deliver_owed", newer_tap_then_a_read_only_record):
+            rc, out = self.tap("fable")
+        writes.stop()
+        self.assertEqual((rc, out["status"]), (0, "superseded"))
+        self.assertNotIn("say", out)
+        self.assertEqual(self.launch.calls, [], "nothing was launched")
+        self.assertFalse([c[2] for c in self.fake.calls[at:] if out["attempt"] in c[2]], "nothing was shown for it")
+        self.assertTrue(callable(write_whole))
+
+    def test_a_switching_card_shown_stays_shown_when_its_record_cannot_be_written(self):
+        """The same slip the other way: the card was edited, the write that keeps it failed, and the
+        answer said the card could not be posted, so the caller sent the words a second time."""
+        self.using("opus")
+        self.run_(["post", "--room", DM])
+        mc.save_outcome(self.ws, "17-ab", DM, "fable", None, mc.time.time())
+        run = lambda *a, **k: self.fake.execute(*a, **k)
+        with mock.patch("local_record.write_whole", side_effect=PermissionError("read-only")):
+            shown = mc.show_switching(self.ws, "17-ab", DM, "$card1", "Switching", core=CORE, execute=run,
+                                      now=mc.time.time())
+        self.assertEqual((shown["status"], shown.get("event_id")), ("posted", "$card1"))
+        # A record that cannot even be read decides nothing: that is still `failed`.
+        with mock.patch.object(mc, "outcomes", side_effect=PermissionError("unreadable")):
+            self.assertEqual(mc.show_switching(self.ws, "17-ab", DM, "$card1", "Switching", core=CORE, execute=run,
+                                               now=mc.time.time())["status"], "failed")
+
     def test_a_card_whose_record_cannot_be_written_is_posted_and_says_its_buttons_will_not_act(self):
         with mock.patch.object(mc.issued_cards, "record", side_effect=PermissionError("read-only")) as record:
             rc, out = self.run_(["post", "--room", DM])

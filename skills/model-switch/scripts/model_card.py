@@ -406,22 +406,28 @@ def show_switching(ws: Path, attempt: str, room: str, tapped: str, say: str, *, 
                    now: float) -> dict:
     """Show the attempt's "switching" words, in place of the tapped card or as a card of its own, under
     the outcomes' lock and only while it is the newest attempt: an older tap's words arriving late
-    would replace the newer attempt's card, and nothing would correct them (its outcome is never told)."""
+    would replace the newer attempt's card, and nothing would correct them (its outcome is never told).
+    What was decided or shown stands when the record cannot be written afterwards."""
+    done = None
     try:
         with _outcome_book(ws, now) as rows:
             at = next((i for i, r in enumerate(rows) if r["attempt"] == attempt), None)
             if at is None or at + 1 < len(rows):
+                done = {"status": "superseded", "why": "a newer switch was accepted; its card stands"}
                 if at is not None:
                     rows[at]["superseded"] = True
-                return {"status": "superseded", "why": "a newer switch was accepted; its card stands"}
-            posted = _edit(ws, room, tapped, say, f"model-card:{attempt}:switching-edit", core=core, execute=execute)
-            if posted["status"] == "posted":
+                return done
+            done = _edit(ws, room, tapped, say, f"model-card:{attempt}:switching-edit", core=core, execute=execute)
+            if done["status"] == "posted":
                 rows[at]["card"] = tapped       # the card this attempt's outcome replaces
-                return posted
+                return done
             body, card = notice_card("pending", "Switching", say)
-            return _post(ws, room, body, card, f"model-card:{attempt}:switching", reply_to=tapped,
+            done = _post(ws, room, body, card, f"model-card:{attempt}:switching", reply_to=tapped,
                          core=core, execute=execute)
+            return done
     except OSError as e:
+        if done is not None:
+            return done     # only the record's write failed: the decision, or the card shown, is not undone
         return {"status": "failed", "why": f"the outcome record could not be used ({type(e).__name__})"}
 
 
