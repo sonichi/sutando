@@ -107,6 +107,9 @@ class ModelSwitch:
         seen = {"available": [{"id": str(mid)[:200], "name": " ".join(str(name or mid).split())[:80] or str(mid)[:80]}
                               for mid, name in offered if self.ok(mid)],
                 "current": str(current or "")[:200]}
+        # With a pick, the turn is moved off the model its Session opened on: `tell` records what it ran on.
+        if self.wanted():
+            del seen["current"]
         if {k: self.state().get(k) for k in seen} != seen:
             self.save(**seen)
 
@@ -309,6 +312,8 @@ class ModelSwitch:
                                                    else {"wanted": ""}))
         elif unkeyed:
             self.save(untold=owed)
+        if live and ran and wanted and not outcome and ran != state.get("current"):
+            self.save(current=ran)      # a settled pick the runtime no longer runs: what it ran on is shown
         told, words = "", []
         while owed:
             first = {"picked": str(owed[0].get("picked") or ""), "ran": str(owed[0].get("ran") or "")}

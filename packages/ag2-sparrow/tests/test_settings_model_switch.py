@@ -68,6 +68,26 @@ class AntigravityTest(unittest.TestCase):
         self.assertEqual(list((Path(str(self.w.root) + ".bridge") / "state").rglob("*.json")), [])
         self.assertEqual(json.loads((self.w.root / "state" / "model.json").read_text())["untold"], [])
 
+    def test_the_model_in_use_is_still_the_pick_once_a_later_session_opens(self):
+        """A new Session opens on agy's own default before `session/set_model` moves it: that opening
+        report is not the model the turn runs on, and the page must not go back to showing it."""
+        page(agy_cli.main, self.w.root, "--set", OPUS)
+        for n, room in ((2, "!room:s.space"), (3, "!other:s.space")):
+            self.w.task("task-%d" % n, "STUB:TEXT again", channel=room)
+            self.w.serve()
+            self.assertEqual(self.w.metrics()[-1]["model"], OPUS)
+            _, shown = page(agy_cli.main, self.w.root)
+            self.assertEqual((shown["current"], shown["pending"]), (OPUS, None), "after turn %d" % n)
+
+    def test_a_turn_the_runtime_ran_on_another_model_shows_that_model(self):
+        page(agy_cli.main, self.w.root, "--set", OPUS)
+        self.w.task("task-2", "STUB:TEXT again")
+        self.w.serve()
+        (self.w.home / "set-model-fails").write_text("")
+        self.w.task("task-3", "STUB:TEXT again", channel="!other:s.space")
+        self.w.serve()
+        self.assertEqual(page(agy_cli.main, self.w.root)[1]["current"], "gemini-3.8-flash-medium")
+
     def test_a_collaborators_turn_runs_on_the_owners_page_pick(self):
         page(agy_cli.main, self.w.root, "--set", OPUS)
         (self.w.root / "tasks" / "task-2.txt").write_text(
