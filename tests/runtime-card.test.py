@@ -76,8 +76,13 @@ class Fake:
     def __init__(self):
         self.calls = []
 
+    replay = False  # True: a reused operation id gets its first event back, as the platform answers
+
     def execute(self, action, arguments, *, operation_id, room_id):
         self.calls.append((action, arguments, operation_id, room_id))
+        if self.replay:
+            self.__dict__.setdefault("given", {}).setdefault(operation_id, f"$card{len(self.calls)}")
+            return {"result": {"event_id": self.given[operation_id]}}
         return {"result": {"event_id": f"$card{len(self.calls)}"}}
 
     def cards(self):
@@ -254,6 +259,95 @@ class Card(Base):
         rc, out = self.run_(["post", "--room", DM, "--print"])
         self.assertEqual((rc, out["handler"]), (0, rtc.HANDLER))
         self.assertEqual(self.fake.calls, [])
+
+    def test_a_retry_after_the_runtime_changed_is_a_new_card(self):
+        import argparse
+        for shown in ("claude", "codex"):
+            args = argparse.Namespace(room=DM, reply_to="$ask1", print=False)
+            with mock.patch.object(rtc, "runtime", return_value=shown), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rtc.cmd_post(self.ws, args, core=CORE, execute=self.fake.execute, now=lambda: T0)
+        ops = [c[2] for c in self.fake.calls]
+        self.assertEqual(len(ops), 2)
+        self.assertNotEqual(ops[0], ops[1], "the same message, another runtime shown: not the old card")
+
+    def test_a_replayed_answer_to_an_older_message_keeps_the_newer_cards_buttons(self):
+        # A for $a, then B for $b, then A retried: the platform hands back A's event; B must still act.
+        import argparse
+        import issued_cards
+        self.fake.replay = True
+        import time
+        t = time.time()
+        for at, ask in ((t, "$a"), (t + 1, "$b"), (t + 2, "$a")):
+            args = argparse.Namespace(room=DM, reply_to=ask, print=False)
+            with contextlib.redirect_stdout(io.StringIO()):
+                rtc.cmd_post(self.ws, args, core=CORE, execute=self.fake.execute, now=lambda at=at: at)
+        events = [self.fake.given[c[2]] for c in self.fake.calls if c[0] == "room.message.send"]
+        self.assertEqual((events[0] == events[2], events[0] == events[1]), (True, False))
+        self.assertIsNotNone(issued_cards.live(self.ws, events[1]), "the newer card's buttons still act")
+        self.assertIsNone(issued_cards.live(self.ws, events[0]), "the superseded card stays superseded")
+
+    def test_a_send_intent_that_cannot_be_noted_posts_nothing(self):
+        import argparse
+        import issued_cards
+        args = argparse.Namespace(room=DM, reply_to="$ask", print=False)
+        with mock.patch.object(issued_cards, "intend", side_effect=OSError("disk full")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = rtc.cmd_post(self.ws, args, core=CORE, execute=self.fake.execute, now=lambda: 100.0)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual([c for c in self.fake.calls if c[0] == "room.message.send"], [])
+
+    def test_a_replay_whose_first_record_was_lost_keeps_the_newer_cards_buttons(self):
+        # A's send lands but its record is lost; B is recorded; A retried gets A's event back: B must still act.
+        import argparse
+        import issued_cards
+        self.fake.replay = True
+        real, lost = issued_cards.record, []
+
+        def record(*a, **k):
+            if not lost:
+                lost.append(a[1])
+                raise OSError("disk full")
+            return real(*a, **k)
+        import time
+        t = time.time()
+        with mock.patch.object(issued_cards, "record", record):
+            for at, ask in ((t, "$a"), (t + 1, "$b"), (t + 2, "$a")):
+                args = argparse.Namespace(room=DM, reply_to=ask, print=False)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rtc.cmd_post(self.ws, args, core=CORE, execute=self.fake.execute, now=lambda at=at: at)
+        events = [self.fake.given[c[2]] for c in self.fake.calls if c[0] == "room.message.send"]
+        self.assertEqual((events[0] == events[2], events[0] == events[1]), (True, False))
+        self.assertIsNotNone(issued_cards.live(self.ws, events[1]), "the newer card's buttons still act")
+        self.assertIsNone(issued_cards.live(self.ws, events[0]), "the older card does not come back")
+
+    def test_one_request_shown_codex_then_claude_then_codex_keeps_the_newest_card_live(self):
+        # The third post reuses the first id; the platform hands back the first card, which must not displace the second.
+        import argparse
+        import issued_cards
+        import time
+        self.fake.replay = True
+        for shown in ("codex", "claude", "codex"):
+            args = argparse.Namespace(room=DM, reply_to="$ask1", print=False)
+            with mock.patch.object(rtc, "runtime", return_value=shown), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rtc.cmd_post(self.ws, args, core=CORE, execute=self.fake.execute, now=time.time)
+        events = [self.fake.given[c[2]] for c in self.fake.calls if c[0] == "room.message.send"]
+        self.assertEqual((events[0] == events[2], events[0] == events[1]), (True, False))
+        self.assertIsNotNone(issued_cards.live(self.ws, events[1]), "the newest card's buttons still act")
+        self.assertIsNone(issued_cards.live(self.ws, events[0]))
+
+    def test_a_retried_answer_reuses_its_id_and_gets_the_earlier_post_back_even_if_edited(self):
+        # A reused id returns the earlier post, even if that card was since edited to its outcome; the retry
+        # then records that event as its card. Intended: never a second card for one message.
+        import argparse
+        for at, ask in ((T0, "$ask1"), (T0 + 7, "$ask1"), (T0 + 7, "$ask2"), (T0 + 8, ""), (T0 + 9, "")):
+            args = argparse.Namespace(room=DM, reply_to=ask, print=False)
+            with contextlib.redirect_stdout(io.StringIO()):
+                rtc.cmd_post(self.ws, args, core=CORE, execute=self.fake.execute, now=lambda at=at: at)
+        ops = [c[2] for c in self.fake.calls]
+        self.assertEqual(ops[0], ops[1])
+        self.assertEqual(len(set(ops[1:])), 4, "another message, or none to answer, is a new card")
 
     def test_status(self):
         self.record("codex", T0)

@@ -101,8 +101,13 @@ class Fake:
     def __init__(self):
         self.calls = []
 
+    replay = False  # True: a reused operation id gets its first event back, as the platform answers
+
     def execute(self, action, arguments, *, operation_id, room_id):
         self.calls.append((action, arguments, operation_id, room_id))
+        if self.replay:
+            self.__dict__.setdefault("given", {}).setdefault(operation_id, f"$card{len(self.calls)}")
+            return {"result": {"event_id": self.given[operation_id]}}
         return {"result": {"event_id": f"$card{len(self.calls)}"}}
 
     def cards(self):
@@ -343,6 +348,76 @@ class ClaudeCard(Base):
         self.assertEqual([b["label"] for b in card["buttons"]], ["Add another account"])
         self.assertFalse(self.store.exists())
 
+    def test_a_replayed_answer_to_an_older_message_keeps_the_newer_cards_buttons(self):
+        # A for $a, then B for $b, then A retried: the platform hands back A's event; B must still act.
+        import argparse
+        import issued_cards
+        self.fake.replay = True
+        import time
+        t = time.time()
+        for at, ask in ((t, "$a"), (t + 1, "$b"), (t + 2, "$a")):
+            args = argparse.Namespace(room=DM, owner_dm=False, reply_to=ask, print=False, lead="", retry=False,
+                                      signed_out=False)
+            with contextlib.redirect_stdout(io.StringIO()):
+                acc.cmd_post(self.ws, args, core=CORE, execute=self.fake.execute, now=lambda at=at: at,
+                             run=self.claude_run)
+        events = [self.fake.given[c[2]] for c in self.fake.calls if c[0] == "room.message.send"]
+        self.assertEqual((events[0] == events[2], events[0] == events[1]), (True, False))
+        self.assertIsNotNone(issued_cards.live(self.ws, events[1]), "the newer card's buttons still act")
+        self.assertIsNone(issued_cards.live(self.ws, events[0]), "the superseded card stays superseded")
+
+    def test_a_send_intent_that_cannot_be_noted_posts_nothing(self):
+        import argparse
+        import issued_cards
+        args = argparse.Namespace(room=DM, owner_dm=False, reply_to="$ask", print=False, lead="", retry=False,
+                                  signed_out=False)
+        with mock.patch.object(issued_cards, "intend", side_effect=OSError("disk full")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = acc.cmd_post(self.ws, args, core=CORE, execute=self.fake.execute, now=lambda: 100.0,
+                             run=self.claude_run)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual([c for c in self.fake.calls if c[0] == "room.message.send"], [])
+
+    def test_a_replay_whose_first_record_was_lost_keeps_the_newer_cards_buttons(self):
+        # A's send lands but its record is lost; B is recorded; A retried gets A's event back: B must still act.
+        import argparse
+        import issued_cards
+        self.fake.replay = True
+        real, lost = issued_cards.record, []
+
+        def record(*a, **k):
+            if not lost:
+                lost.append(a[1])
+                raise OSError("disk full")
+            return real(*a, **k)
+        import time
+        t = time.time()
+        with mock.patch.object(issued_cards, "record", record):
+            for at, ask in ((t, "$a"), (t + 1, "$b"), (t + 2, "$a")):
+                args = argparse.Namespace(room=DM, owner_dm=False, reply_to=ask, print=False, lead="", retry=False,
+                                  signed_out=False)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    acc.cmd_post(self.ws, args, core=CORE, execute=self.fake.execute, now=lambda at=at: at,
+                                 run=self.claude_run)
+        events = [self.fake.given[c[2]] for c in self.fake.calls if c[0] == "room.message.send"]
+        self.assertEqual((events[0] == events[2], events[0] == events[1]), (True, False))
+        self.assertIsNotNone(issued_cards.live(self.ws, events[1]), "the newer card's buttons still act")
+        self.assertIsNone(issued_cards.live(self.ws, events[0]), "the older card does not come back")
+
+    def test_a_retried_answer_reuses_its_id_and_gets_the_earlier_post_back_even_if_edited(self):
+        # A reused id returns the earlier post, even if that card was since edited to its outcome; the retry
+        # then records that event as its card. Intended: never a second card for one message.
+        import argparse
+        for at, ask in ((100.0, "$ask1"), (107.0, "$ask1"), (107.0, "$ask2"), (108.0, ""), (109.0, "")):
+            args = argparse.Namespace(room=DM, owner_dm=False, reply_to=ask, print=False, lead="", retry=False,
+                                      signed_out=False)
+            with contextlib.redirect_stdout(io.StringIO()):
+                acc.cmd_post(self.ws, args, core=CORE, execute=self.fake.execute, now=lambda at=at: at,
+                             run=self.claude_run)
+        ops = [c[2] for c in self.fake.calls]
+        self.assertEqual(ops[0], ops[1])
+        self.assertEqual(len(set(ops[1:])), 4, "another message, or none to answer, is a new card")
+
     def test_signed_out_and_unreadable(self):
         self.claude_json = {"loggedIn": False}
         self.post()
@@ -374,6 +449,12 @@ class Taps(Base):
         self.assertIn("never in this chat", out["say"])
         self.assertEqual(self.launch.calls, [])
         self.assertEqual(self.fake.cards()[-1]["id"], acc.NOTE_ID)
+
+    def test_add_answers_each_tap_once_however_often_it_is_retried(self):
+        for msg in ("$tap1", "$tap1", "$tap2"):
+            self.tap("Add another account", source_message_id=msg)
+        ops = [c[2] for c in self.fake.calls[1:]]
+        self.assertEqual((ops[0] == ops[1], ops[1] == ops[2]), (True, False))
 
     def test_the_owners_use_tap_starts_the_detached_switch(self):
         rc, out = self.tap(self.use_b)

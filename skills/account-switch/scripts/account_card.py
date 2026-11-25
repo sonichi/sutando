@@ -405,15 +405,18 @@ def _post(ws: Path, room: str, body: str, card: dict, operation_id: str, *, repl
         lane = str(core.get("instance") or "")
         dm = _owner_dm(ws, core)
         execute = execute if execute is not None else _execute(ws, lane or None)
+        issued = issued_cards.intend(ws, operation_id)  # unwritable ledger: no card, its buttons could not act
         eid = ac.send_card(execute, room, body, card, operation_id=operation_id, reply_to=reply_to, owner_dm=dm)
     except ac.CardError as e:
         return {"status": "failed", "why": str(e)}
     except Exception as e:  # noqa: BLE001 - no core lane or no credential: named, nothing posted
         return {"status": "failed", "why": f"{type(e).__name__}: {e}"}
     try:
-        issued_cards.record(ws, eid, card, room=dm, lane=lane, handler=HANDLER)
+        kept = issued_cards.record(ws, eid, card, room=dm, lane=lane, handler=HANDLER, issued_at=issued)
     except OSError as e:
         return {"status": "posted", "event_id": eid, "why": f"its buttons will not act ({type(e).__name__})"}
+    if not kept and (issued_cards.offered(card) or issued_cards.has_picker(card)):
+        return {"status": "posted", "event_id": eid, "why": "a newer card is the one that acts"}
     return {"status": "posted", "event_id": eid}
 
 
@@ -476,8 +479,9 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time, run=subp
     shown = [s["key"] for s in others[:USE_BUTTONS]]
     tag = hashlib.sha256(",".join(shown).encode()).hexdigest()[:12]
     kind = "signed-out" if args.signed_out else "menu"
-    out = _post(ws, room, body, card, f"account-card:{kind}:{int(now())}:{tag}", reply_to=args.reply_to or "",
-                core=core, execute=execute)
+    reply_to = args.reply_to or ""
+    out = _post(ws, room, body, card, f"account-card:{kind}:{ac.send_key(room, reply_to, now)}:{tag}",
+                reply_to=reply_to, core=core, execute=execute)
     if out.get("event_id"):
         try:
             remember_keys(ws, out["event_id"], shown, now())
@@ -574,7 +578,8 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     if verb == ADD:
         words = f"To add an account, open {SETTINGS} Then ask me for the account card again."
         body, card = notice_card("info", "In Settings", words)
-        posted = _post(ws, room, body, card, f"account-card:add:{int(now())}", reply_to=event, core=core or None,
+        op = f"account-card:add:{ac.send_key(room, str(headers.get('source_message_id') or ''), now)}"
+        posted = _post(ws, room, body, card, op, reply_to=event, core=core or None,
                        execute=execute)
         return _emit({"status": "say", "say": words, **({"event_id": posted["event_id"]} if posted.get("event_id") else {})})
     if runtime() != "codex":

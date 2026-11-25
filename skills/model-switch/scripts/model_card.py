@@ -353,15 +353,18 @@ def _post(ws: Path, room: str, body: str, card: dict, operation_id: str, *, repl
         lane = str(core.get("instance") or "")
         dm = _owner_dm(ws, core)
         execute = execute if execute is not None else _execute(ws, lane or None)
+        issued = issued_cards.intend(ws, operation_id)  # unwritable ledger: no card, its buttons could not act
         eid = ac.send_card(execute, room, body, card, operation_id=operation_id, reply_to=reply_to, owner_dm=dm)
     except ac.CardError as e:
         return {"status": "failed", "why": str(e), "body": body}
     except Exception as e:  # noqa: BLE001 — no core lane or no credential: named, nothing posted
         return {"status": "failed", "why": f"{type(e).__name__}: {e}", "body": body}
     try:
-        issued_cards.record(ws, eid, card, room=dm, lane=lane, handler=HANDLER)
+        kept = issued_cards.record(ws, eid, card, room=dm, lane=lane, handler=HANDLER, issued_at=issued)
     except OSError as e:
         return {"status": "posted", "event_id": eid, "why": f"its buttons will not act ({type(e).__name__})"}
+    if not kept and (issued_cards.offered(card) or issued_cards.has_picker(card)):
+        return {"status": "posted", "event_id": eid, "why": "a newer card is the one that acts"}
     return {"status": "posted", "event_id": eid}
 
 
@@ -529,8 +532,9 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time) -> int:
     if delivered:
         body, card = menu_card(current_model(ws)["model"], picks, lead)
     shown = offered(picks)
-    out = _post(ws, room, body, card, f"model-card:menu:{int(now())}:{issuance(shown)}",
-                reply_to=args.reply_to or "", core=core, execute=execute)
+    reply_to = args.reply_to or ""
+    out = _post(ws, room, body, card, f"model-card:menu:{ac.send_key(room, reply_to, now)}:{issuance(shown)}",
+                reply_to=reply_to, core=core, execute=execute)
     if out.get("event_id"):
         try:
             remember_choices(ws, out["event_id"], shown, now())
