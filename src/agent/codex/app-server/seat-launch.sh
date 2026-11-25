@@ -222,9 +222,9 @@ seat_heal_core_window() {
   rm -f "$SEAT_READY" "${SEAT_READY%/ready}/intake-held"
   local created win_id
   # The window's immutable id comes back from the call that creates it, with its index.
-  created="$(tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_id} #{window_index}' -t "$SESSION:0" \
+  created="$(tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_id} #{window_index}' -t "=$SESSION:0" \
       "${CORE_ENV_ARGS[@]}" "${SEAT_ENV_ARGS[@]}" -c "$REPO" "$SEAT_CLI" "${SEAT_ARGS[@]}" 2>/dev/null \
-    || tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_id} #{window_index}' -t "$SESSION" \
+    || tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_id} #{window_index}' -t "=$SESSION:" \
       "${CORE_ENV_ARGS[@]}" "${SEAT_ENV_ARGS[@]}" -c "$REPO" "$SEAT_CLI" "${SEAT_ARGS[@]}")" || created=""
   win_id="${created%% *}"
   idx="${created#* }"
