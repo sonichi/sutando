@@ -15,6 +15,7 @@ import json
 import tempfile
 import types
 import unittest
+import unittest.mock
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -358,6 +359,56 @@ class PriorArtTest(unittest.TestCase):
         head = pf.prior_art_block("1", pf.PriorArt(True, few, []))[0]
         self.assertIn(f"({pf.PRIOR_ART_SHOWN})", head)
         self.assertNotIn("showing last", head)
+
+
+class WhichRepoThePrIsReadFrom(unittest.TestCase):
+    """A bare number from another repo's PR was read against this checkout's
+    remote, and nothing in the output said so: the "stale" verdicts were a
+    different PR with the same number."""
+
+    URL = "https://github.com/ag2-space/ag2space-backend/pull/2662"
+
+    def _render(self, argv, env=None):
+        asked = []
+        with tempfile.TemporaryDirectory() as td, \
+                unittest.mock.patch.dict(pf.os.environ, env or {}, clear=env is not None), \
+                unittest.mock.patch.object(pf, "prior_art",
+                                           lambda pr, repo=None: asked.append((pr, repo)) or pf.PriorArt(True, [], [])), \
+                unittest.mock.patch.object(pf, "stale_approvals", lambda pr, repo=None: []):
+            g = Path(td) / "REVIEW.md"
+            g.write_text(GUIDE)
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = pf.main(argv + ["--guide", str(g)])
+        return code, out.getvalue(), err.getvalue(), asked
+
+    def test_a_pr_url_sets_both_the_number_and_the_repo(self):
+        for url in (self.URL, self.URL + "/files", self.URL + "#pullrequestreview-1"):
+            with self.subTest(url=url):
+                self.assertEqual(pf.split_pr(url, None), ("2662", "ag2-space/ag2space-backend"))
+        self.assertEqual(pf.split_pr("2662", "a/b"), ("2662", "a/b"))
+
+    def test_a_url_is_looked_up_in_its_own_repo_and_the_header_names_it(self):
+        code, out, _, asked = self._render([self.URL])
+        self.assertEqual(code, 0)
+        self.assertEqual(asked, [("2662", "ag2-space/ag2space-backend")])
+        self.assertIn("Reviewing PR #2662", out)
+        self.assertIn("Repo: ag2-space/ag2space-backend", out)
+
+    def test_an_inferred_repo_says_it_was_inferred(self):
+        _, out, _, _ = self._render(["2662"], env={})
+        self.assertIn("inferred from this checkout's git remote", out)
+        self.assertIn("pass its URL or --repo", out)
+
+    def test_an_explicit_repo_is_named(self):
+        _, out, _, _ = self._render(["7", "--repo", "a/b"], env={})
+        self.assertIn("Repo: a/b", out)
+
+    def test_a_url_and_a_different_repo_are_refused_not_guessed(self):
+        code, out, err, asked = self._render([self.URL, "--repo", "sonichi/sutando"])
+        self.assertEqual(code, 2)
+        self.assertIn("names ag2-space/ag2space-backend but --repo names sonichi/sutando", err)
+        self.assertEqual((out, asked), ("", []))
 
 
 class RepoResolution(unittest.TestCase):

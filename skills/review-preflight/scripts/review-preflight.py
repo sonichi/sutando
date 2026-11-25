@@ -103,6 +103,30 @@ def resolve_repo(explicit: "str | None" = None, env: "dict | None" = None) -> st
     return environ.get("SUTANDO_REVIEW_REPO") or "{owner}/{repo}"
 
 
+PR_URL = re.compile(r"^https?://github\.com/(?P<repo>[^/\s]+/[^/\s]+)/pull/(?P<n>\d+)(?:[/?#]\S*)?$")
+
+
+def split_pr(pr: "str | None", repo: "str | None") -> "tuple[str | None, str | None]":
+    """(number, repo) for a PR number or a github.com PR URL. A URL names its own
+    repo, so a bare number from another repo's PR cannot be read against this one's.
+    Raises ValueError when the URL and `repo` name different repos."""
+    m = PR_URL.match(pr or "")
+    if not m:
+        return pr, repo
+    if repo and repo != m["repo"]:
+        raise ValueError(f"the PR URL names {m['repo']} but --repo names {repo}")
+    return m["n"], m["repo"]
+
+
+def repo_line(repo: "str | None") -> str:
+    """Which repo the PR lookups ask, so a number read against the wrong one shows."""
+    resolved = repo or resolve_repo()
+    if resolved == "{owner}/{repo}":
+        return ("Repo: inferred from this checkout's git remote. For a PR in another "
+                "repo, pass its URL or --repo owner/name.")
+    return f"Repo: {resolved}"
+
+
 DECISIVE = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
 
 
@@ -315,7 +339,8 @@ def render(guide: Path, pr: str | None, repo: "str | None" = None) -> str:
     checks = extract_section(text, CHECKS_HEADING)
     out = [f"review-preflight: criteria from {guide}", ""]
     if pr:
-        out += [f"Reviewing PR #{pr}. Every lesson below is a criterion, not a suggestion.", ""]
+        out += [f"Reviewing PR #{pr}. Every lesson below is a criterion, not a suggestion.",
+                repo_line(repo), ""]
         art = prior_art(pr, repo=repo)
         out += verdict_block(art) + prior_art_block(pr, art, repo=repo) + [""]
         out += stale_approval_block(pr, stale_approvals(pr, repo=repo)) + [""]
@@ -333,11 +358,16 @@ def render(guide: Path, pr: str | None, repo: "str | None" = None) -> str:
 
 def main(argv: "list[str] | None" = None) -> int:
     ap = argparse.ArgumentParser(description="Print review criteria before reviewing a PR.")
-    ap.add_argument("pr", nargs="?", help="PR number, for the header line only")
+    ap.add_argument("pr", nargs="?", help="PR number, or its github.com URL (which also sets the repo)")
     ap.add_argument("--guide", help="path to the review guide (default <repo>/REVIEW.md)")
     ap.add_argument("--repo", help="owner/name for the prior-art lookup; "
                     "defaults to $SUTANDO_REVIEW_REPO, then the git remote")
     args = ap.parse_args(argv)
+    try:
+        args.pr, args.repo = split_pr(args.pr, args.repo)
+    except ValueError as exc:
+        print(f"review-preflight: {exc}", file=sys.stderr)
+        return 2
 
     guide = resolve_guide(args.guide)
     if not guide.is_file():
