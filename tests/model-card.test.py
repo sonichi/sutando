@@ -1010,6 +1010,32 @@ class Edges(Base):
         rows = {r["attempt"]: r for r in mc.outcomes(self.ws)}
         self.assertEqual((rows["18-cd"].get("card"), rows["17-ab"].get("card")), ("$card1", None))
 
+    def test_an_older_tap_that_acts_after_a_newer_one_was_accepted_starts_nothing_and_promises_nothing(self):
+        """Reviewer, f55791d5: the card stayed on the newer outcome, but the older reply still answered
+        `started` with a `say` promising its switch, which the caller sends and which never comes true."""
+        self.using("opus")
+        self.run_(["post", "--room", DM])
+        owed, at = mc.deliver_owed, len(self.fake.calls)
+
+        def newer_tap_lands_first(ws, **kw):
+            # While this (older) reply is between recording its attempt and showing it, a newer tap is
+            # accepted, shown and settled on the same card.
+            mc.save_outcome(ws, "9999999999-newer", DM, "sonnet", 0, mc.time.time())
+            return owed(ws, **kw)
+
+        with mock.patch.object(mc, "deliver_owed", newer_tap_lands_first):
+            rc, out = self.tap("fable")
+        self.assertEqual((rc, out["status"], out["model"]), (0, "superseded", "fable"))
+        self.assertNotIn("say", out, "nothing for the caller to send")
+        self.assertNotIn("pid", out)
+        self.assertEqual(self.launch.calls, [], "no detached switch was launched")
+        sent = [c[2] for c in self.fake.calls[at:]]
+        self.assertFalse([op for op in sent if out["attempt"] in op], "no edit and no card for the older attempt")
+        rows = {r["attempt"]: r for r in mc.outcomes(self.ws)}
+        self.assertTrue(rows[out["attempt"]]["superseded"], "and it is never told later")
+        self.assertEqual(mc.deliver_owed(self.ws, core=CORE, execute=lambda *a, **k: self.fake.execute(*a, **k),
+                                         now=mc.time.time()), [], "nothing of it is owed")
+
     def test_a_card_whose_record_cannot_be_written_is_posted_and_says_its_buttons_will_not_act(self):
         with mock.patch.object(mc.issued_cards, "record", side_effect=PermissionError("read-only")) as record:
             rc, out = self.run_(["post", "--room", DM])

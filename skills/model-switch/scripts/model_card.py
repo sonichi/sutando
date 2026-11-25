@@ -411,6 +411,8 @@ def show_switching(ws: Path, attempt: str, room: str, tapped: str, say: str, *, 
         with _outcome_book(ws, now) as rows:
             at = next((i for i, r in enumerate(rows) if r["attempt"] == attempt), None)
             if at is None or at + 1 < len(rows):
+                if at is not None:
+                    rows[at]["superseded"] = True
                 return {"status": "superseded", "why": "a newer switch was accepted; its card stands"}
             posted = _edit(ws, room, tapped, say, f"model-card:{attempt}:switching-edit", core=core, execute=execute)
             if posted["status"] == "posted":
@@ -617,6 +619,9 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     say = switching_words(alias)
     tapped = str(headers.get("reply_to_event") or "")
     posted = show_switching(ws, attempt, room, tapped, say, core=core or None, execute=execute, now=now())
+    if posted["status"] == "superseded":
+        # A newer tap was accepted while this one waited: nothing is started and nothing is promised.
+        return _emit({"status": "superseded", "model": alias, "attempt": attempt, "why": posted["why"], **extra})
     try:
         pid = start_switch(ws, alias, room, attempt, popen)
     except OSError as e:
