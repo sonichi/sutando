@@ -784,6 +784,35 @@ class AccountChange(unittest.TestCase):
             released = clh.release_on_account_change(self.ws, self.now + 2)
         self.assertEqual((released["status"], released["cleared_by"]), ("cleared", "account-change"))
 
+    def test_a_limit_on_screen_is_the_running_cores_account_not_the_config_switched_to(self):
+        """VM 2026-11-24: the desktop wrote account B into the config (no restart yet); the core still
+        running on A hit A's limit on screen; the hold was recorded under B, and every launch on B was
+        refused. The screen's limit belongs to the account the core was launched with."""
+        import os
+        from unittest import mock
+        self.sign_in("acct-a", "a@example.com")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}):
+            a = clh.launch_identity(self.ws)[1]
+        clh.record_launch_account(self.ws, a, self.now)   # the core was launched on A
+        self.assertEqual(clh.running_account(self.ws), a)
+        self.sign_in("acct-b", "b@example.com")       # the config names B; the core still runs A
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}):
+            clh.hold_while_wedged(self.ws, "You've hit your weekly limit · resets Nov 28 at 1pm (UTC)", self.now)
+            hold = clh.read_hold(self.ws)
+            self.assertEqual((hold["status"], hold["account"]), ("held", a), "A's limit, recorded under A")
+            self.assertNotEqual(hold["account"], clh.launch_identity(self.ws)[1])
+        self.assertEqual(self.gate(), 0, "the restart on B is not held by A's limit")
+        self.assertNotEqual(clh.running_account(self.ws), a, "the gate keeps the account it launched (B)")
+
+    def test_with_no_launch_on_record_the_config_account_is_used_as_before(self):
+        import os
+        from unittest import mock
+        self.sign_in("acct-a", "a@example.com")
+        self.assertIsNone(clh.running_account(self.ws))
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}):
+            clh.hold_while_wedged(self.ws, "You've hit your usage limit · resets 3pm", self.now)
+            self.assertEqual(clh.read_hold(self.ws)["account"], clh.launch_identity(self.ws)[1])
+
     def test_a_hold_with_no_account_or_an_unreadable_one_now_is_left_alone(self):
         t = self.now
         clh._write_hold(self.ws, {"status": "held", "kind": "usage-limit", "model": None, "evidence_at": t,

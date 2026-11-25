@@ -459,6 +459,35 @@ def launch_identity(workspace: Path, config_dir: Optional[str] = None) -> tuple:
     return model, account_fingerprint(config_dir)
 
 
+# The account the running core was launched with, recorded when the gate lets it launch: a limit its
+# screen shows is that account's, even after the config names another one before a restart (VM
+# 2026-11-24: the desktop wrote account-b into .claude.json at 16:48, the still-running account-a core hit
+# its weekly limit at 16:51, the hold was recorded under account-b, and every launch on account-b was
+# refused).
+LAUNCH_ACCOUNT_FILE = "core-launch-account.json"
+
+
+def record_launch_account(workspace: Path, account: Optional[str], now: Optional[float] = None) -> None:
+    """Keep the account the core is being launched with; nothing when it cannot be read. Never raises."""
+    if not account:
+        return
+    try:
+        write_status(LAUNCH_ACCOUNT_FILE, {"account": account, "at": time.time() if now is None else now},
+                     workspace=Path(workspace))
+    except OSError:
+        pass
+
+
+def running_account(workspace: Path) -> Optional[str]:
+    """The account the running core was launched with (record_launch_account), else None."""
+    try:
+        data = json.loads(status_read_path(LAUNCH_ACCOUNT_FILE, Path(workspace)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    account = data.get("account") if isinstance(data, dict) else None
+    return account if isinstance(account, str) and account else None
+
+
 def binding_hold(workspace: Path, now: Optional[float] = None) -> Optional[dict]:
     """The hold in force that would stop the next launch, else None. Read-only.
     A hold the owner switched away from (another model family or account) does not bind."""
@@ -719,6 +748,9 @@ def hold_while_wedged(workspace: Path, text: Optional[str], now: Optional[float]
     if hold.get("status") != "held" and isinstance(released, (int, float)) and 0 <= now - released < REARM_GRACE_S:
         return None
     model, account = (None, None) if seat else launch_identity(workspace)
+    # The screen is the running core's: its limit is the account it was launched with, not the one the
+    # config may name since (a switch not yet restarted on). Unknown: the config's, as before.
+    account = (running_account(workspace) or account) if not seat else account
     # The caller has judged the screen a limit; text that names none is still this core's limit.
     limit = classify_text(text or "", now, model, PANE_SOURCE) or Limit("usage-limit", now, None, model, PANE_SOURCE)
     decide(workspace, now, evidence=(limit,), launch_model=limit.model or model, launch_account=account,
@@ -1201,6 +1233,7 @@ def main(argv=None) -> int:
     decision = decide(workspace, projects_dir=_projects_dir(args.cwd), launch_model=model,
                       launch_account=account, card_entry=args.card_entry or None)
     if decision.launch:
+        record_launch_account(workspace, account)
         return 0
     print(decision.line)
     return HOLD_EXIT
