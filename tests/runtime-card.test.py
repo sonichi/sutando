@@ -1301,9 +1301,16 @@ class Switch(Base):
                 self.restarts.clear()
                 self.ws.joinpath(*rtc.RUNNING).write_text(json.dumps(
                     {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": self.clock.t}))
-                out = self.failing_switch(back_ok=False, back_rc=code)
+                with mock.patch.object(account_card, "fresh_beat", lambda ws, since: since > T0):
+                    out = self.failing_switch(back_ok=False, back_rc=code)
                 self.assertTrue(out["say"].endswith("The core is still on Codex."), out["say"])
                 self.assertNotIn("may be down", out["say"])
+
+    def test_a_put_off_relaunch_with_no_heartbeat_says_the_core_may_be_down(self):
+        # The forward launch ended the old session and failed; the relaunch was put off: nothing runs.
+        out = self.failing_switch(back_ok=False, back_rc=rtc.DEFERRED)
+        self.assertIn("Starting Codex again did not come back either, so the core may be down.", out["say"])
+        self.assertNotIn("still on Codex", out["say"])
 
     def test_an_unconfirmed_switch_on_a_beating_core_is_not_rolled_back(self):
         self.launcher_confirms = self.launcher_selects = False
