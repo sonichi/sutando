@@ -472,6 +472,16 @@ ensure_core_heartbeat() {
     || echo "  ⚠ core heartbeat --ensure failed; cron-runner fires stay held until it runs" >&2
 }
 
+# A sign-in a runtime card is waiting for gets its waiter back: a restart can take it down with the core.
+resume_runtime_sign_in_wait() {
+  local ws card="$REPO/skills/runtime-switch/scripts/runtime_card.py"
+  { [ -n "$PY" ] && [ -f "$card" ]; } || return 0
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  { [ -n "$ws" ] && [ -f "$ws/state/runtime-card-signin.json" ]; } || return 0
+  mkdir -p "$ws/logs" 2>/dev/null || return 0
+  ( "$PY" "$card" --workspace "$ws" resume >> "$ws/logs/runtime-card.log" 2>&1 & )
+}
+
 # Core-only: a pool worker is never the subject of the Agent Shepherd monitor.
 ensure_core_monitor() {
   local ws mon_out relay_pid_file relay_state
@@ -482,6 +492,7 @@ ensure_core_monitor() {
   if [ -n "$PY" ] && ! pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET}( |$)" > /dev/null 2>&1; then
     "$PY" "$REPO/src/core-input-watch.py" \
       --socket "$TMUX_SOCKET" --session "$SESSION" --out "$mon_out" \
+      --quota-card-script "$REPO/skills/account-switch/scripts/account_card.py" \
       > /tmp/core-input-watch.log 2>&1 &
   fi
   # Communicator relay (PR #2101): the monitor only WRITES core-supervisor.json;
@@ -594,6 +605,12 @@ if [ -n "$PY" ] && [ -f "$REPO/src/core_limit_hold.py" ]; then
     [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "held: ${_hold_line:-provider limit}"
     # No core window will exist, so a notifier left running would type into a sibling.
     tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+    # Nothing else reads tasks/ now: the held inbox posts the owner's cards, acts on "retry now" /
+    # "switch to <model>", and launches the core once the hold lifts (src/core_held_inbox.py, one per workspace).
+    if [ -f "$REPO/src/core_held_inbox.py" ] && [ -z "${SUTANDO_NO_HELD_INBOX:-}" ] \
+       && [ "${SUTANDO_TEST_MODE:-}" != 1 ]; then
+      nohup "$PY" "$REPO/src/core_held_inbox.py" --repo "$REPO" >> /tmp/core-held-inbox.log 2>&1 < /dev/null &
+    fi
     release_orchestrator_lock
     exit 75
   fi
@@ -738,6 +755,7 @@ if [ -t 1 ]; then
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_task_notifier   # the supervisor needs the core session to exist first
   ensure_core_heartbeat
+  resume_runtime_sign_in_wait
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
   # Verify the core actually came up before reporting success. Without this a
@@ -757,6 +775,7 @@ else
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
   ensure_task_notifier
   ensure_core_heartbeat
+  resume_runtime_sign_in_wait
   if [ "$VISIBLE" = 1 ]; then
     open_visible_terminal
     echo "Started $SESSION detached — opened a Terminal window attached to it."

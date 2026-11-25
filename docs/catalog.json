@@ -617,7 +617,7 @@
    ],
    "status": "canonical",
    "canonical_for": "the core recovery record state/core-recovery.json: its states, fields, bounds, runtimes, single writer and the core_recovery.v1 contract fixtures",
-   "last_verified": "2026-11-22"
+   "last_verified": "2026-11-24"
   }
  }
 }
