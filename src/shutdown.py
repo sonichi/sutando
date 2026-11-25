@@ -24,6 +24,7 @@ CLI:
   python3 src/shutdown.py check           # exit 0 if shutting down, 1 if not
   python3 src/shutdown.py mark-if-absent R  # write one only if none; print its token, else nothing
   python3 src/shutdown.py clear-if TOKEN    # 0 removed; 3 not that stop (left alone); else an error
+  python3 src/shutdown.py token             # the token of the stop in place, else nothing
 """
 from __future__ import annotations
 
@@ -93,6 +94,12 @@ def clear_if(token: str) -> bool:
         return True
 
 
+def current_token() -> str:
+    """The token of the stop in place now ('' when none), for a later clear_if of exactly that stop."""
+    with _locked() as p:
+        return _token(p)
+
+
 def clear_shutdown() -> None:
     """Remove the sentinel (called on boot). Never raises if it's absent."""
     try:
@@ -136,6 +143,11 @@ def main(argv: list[str]) -> int:
         return 0
     if cmd == "clear-if":
         return 0 if clear_if(argv[2] if len(argv) > 2 else "") else NOT_MINE
+    if cmd == "token":
+        token = current_token()
+        if token:
+            print(token)
+        return 0
     if cmd == "check":
         return 0 if is_shutting_down() else 1
     if cmd == "path":
@@ -143,7 +155,7 @@ def main(argv: list[str]) -> int:
         # launch; they must not re-derive this path and drift from it.
         print(_sentinel_path())
         return 0
-    print(f"usage: {argv[0]} mark|clear|check|path [reason]", file=sys.stderr)
+    print(f"usage: {argv[0]} mark|clear|check|path|token|mark-if-absent|clear-if [arg]", file=sys.stderr)
     return 2
 
 

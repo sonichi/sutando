@@ -30,6 +30,8 @@ printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 S="$TMUX_STATE"
 seat_ready() {  # the seat's ready file, as seat.py writes it once its app-server and thread are up
+  # Another actor's drain, written while the launcher waits for the seat to report ready.
+  [ -n "${FAKE_DRAIN_FILE:-}" ] && printf '%s\n' '{"reason": "drain", "ts": 1, "gen": "during-start"}' > "$FAKE_DRAIN_FILE"
   [ -n "${FAKE_SEAT_INIT_FAILS:-}" ] && return 0
   local prev=""
   for a in "$@"; do [ "$prev" = --host ] && echo $$ > "${a%/*}/ready"; prev="$a"; done
@@ -575,6 +577,46 @@ class PersistedChoice(unittest.TestCase):
         sentinel.write_text('{"reason": "test", "ts": 0}\n')
         result = f.run(**self.UNSET)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(sentinel.exists())
+
+    def test_a_drain_written_while_a_fresh_seat_starts_survives_its_ready(self):
+        f = Fixture(self, seat_tmux=True)
+        sentinel = f.workspace / "state" / "shutdown.sentinel"
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text('{"reason": "restart", "ts": 0}\n')
+        result = f.run(FAKE_DRAIN_FILE=str(sentinel), **self.UNSET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(f.calls(), r"new-session -d -s sutando-core .*codex-seat --host ")
+        self.assertIn('"during-start"', sentinel.read_text(), "only the stop in place at launch is lifted")
+        self.assertIn("stays shut", result.stderr)
+
+    def test_a_drain_written_while_a_fresh_seat_starts_with_none_before_survives(self):
+        f = Fixture(self, seat_tmux=True)
+        sentinel = f.workspace / "state" / "shutdown.sentinel"
+        result = f.run(FAKE_DRAIN_FILE=str(sentinel), **self.UNSET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(sentinel.exists(), "no stop at launch: nothing is this launch's to lift")
+
+    def test_a_drain_written_while_a_healed_seat_window_starts_survives_its_ready(self):
+        f = Fixture(self, seat_tmux=True)
+        f.core("gone")
+        sentinel = f.workspace / "state" / "shutdown.sentinel"
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text('{"reason": "restart", "ts": 0}\n')
+        result = f.run(FAKE_DRAIN_FILE=str(sentinel), **self.UNSET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("new-window", f.calls())
+        self.assertIn('"during-start"', sentinel.read_text())
+
+    def test_a_healed_seat_window_lifts_the_stop_in_place_at_launch(self):
+        f = Fixture(self, seat_tmux=True)
+        f.core("gone")
+        sentinel = f.workspace / "state" / "shutdown.sentinel"
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text('{"reason": "restart", "ts": 0}\n')
+        result = f.run(**self.UNSET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("new-window", f.calls())
         self.assertFalse(sentinel.exists())
 
     def test_an_inherited_export_of_the_resolved_mode_does_not_override_the_choice(self):

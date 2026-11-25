@@ -185,8 +185,37 @@ seat_reattach() {
   rm -f "$held"
 }
 
+# seat_note_stop: the token of the stop in place as this launch begins (SEAT_STOP_AT_START: empty for
+# none, `unknown` when unreadable). Only that stop is lifted once the seat is ready; a later one stays.
+seat_note_stop() {
+  local py
+  SEAT_STOP_AT_START=unknown
+  py="$(heartbeat_python)"
+  [ -n "$py" ] && SEAT_STOP_AT_START="$("$py" "$REPO/src/shutdown.py" token 2>/dev/null)" || SEAT_STOP_AT_START=unknown
+}
+
+# seat_lift_stop: compare-and-clear of the stop seat_note_stop saw; a drain written since is kept.
+seat_lift_stop() {
+  local py rc=1
+  case "${SEAT_STOP_AT_START-unknown}" in
+    "") return 0 ;;
+    unknown)
+      echo "  ⚠ could not read the stop in place when this launch began — sentinel NOT cleared; inspect it (python3 src/shutdown.py path) before reopening intake." >&2
+      return 0 ;;
+  esac
+  py="$(heartbeat_python)"
+  [ -n "$py" ] && { "$py" "$REPO/src/shutdown.py" clear-if "$SEAT_STOP_AT_START" >/dev/null 2>&1 && rc=0 || rc=$?; }
+  case "$rc" in
+    0) ;;
+    3) echo "  · a stop written while the seat started holds intake, so it stays shut." >&2 ;;
+    *) echo "  ⚠ shutdown.py clear-if failed (${py:+exit $rc}${py:-no Python}) — the intake gate may hold tasks." >&2 ;;
+  esac
+  return 0
+}
+
 seat_start_core_session_and_helpers() {
   local seat_id
+  seat_note_stop
   seat_core_prepare || return 1
   prepare_codex_home
   rm -f "$SEAT_READY" "${SEAT_READY%/ready}/intake-held"
@@ -200,7 +229,7 @@ seat_start_core_session_and_helpers() {
   fi
   log_session_start
   record_confirmed_core_runtime codex "$(heartbeat_python)"
-  clear_shutdown_sentinel
+  seat_lift_stop
   seat_end_helper_sessions
   ensure_core_monitor
   ensure_core_heartbeat
@@ -209,6 +238,7 @@ seat_start_core_session_and_helpers() {
 # The session outlived its seat window: recreate it as the lowest window, siblings untouched.
 seat_heal_core_window() {
   local idx low others
+  seat_note_stop
   if others="$(sutando_unidentified_live_windows "$TMUX_SOCKET" "$SESSION" "$SEAT_NAME")" && [ -n "$others" ]; then
     echo "  ⚠ $SESSION has live windows ($(echo $others)) that are not the Codex app-server seat — not healing, a second core would double-poll. To move a running core onto the seat, run this launcher with --restart from outside the core." >&2
     return 3
@@ -245,7 +275,7 @@ seat_heal_core_window() {
   fi
   log_session_start
   record_confirmed_core_runtime codex "$(heartbeat_python)"
-  clear_shutdown_sentinel
+  seat_lift_stop
   seat_end_helper_sessions
   ensure_core_monitor
   ensure_core_heartbeat
