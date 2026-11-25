@@ -599,46 +599,66 @@ class HolderLockTest(unittest.TestCase):
         # A Mac is `mac.lan` on one network and `<name>.local` on the next; its holders run through the change.
         pid, start = self.proc()
         dpid, dstart = self.dead()
-        with mock.patch.object(self.hl, "_HOST_NAME_DRIFTS", True):
-            self.assertIs(self.hl.verify_lineage(pid, start, "mac.lan"), True, "the very process, under the earlier name")
-            self.assertIs(self.hl.verify_lineage(pid, "2001-01-01T00:00:00Z", "mac.lan"), False, "a recycled pid")
-            self.assertIs(self.hl.verify_lineage(dpid, dstart, "mac.lan"), False)
+        with mock.patch.object(self.hl, "_HOST_NAME_DRIFTS", True), \
+                mock.patch.object(self.hl, "_statfs_type", return_value="apfs"):
             self.put(self.record2(pid, start, host="mac.lan"))
-            self.assertEqual(self.hl.status(str(self.root))["holder_lineage"], True)
+            here = str(self.ldir())
+            self.assertIsNone(self.hl._host_read_here("mac.lan", here), "read as this machine's")
+            self.assertEqual(self.hl._host_read_here(self.hl._host(), here), self.hl._host())
+            self.assertIsNone(self.hl._host_read_here(None, here))
+            self.assertEqual(self.hl.status(str(self.root))["holder_lineage"], True, "the very process, under the earlier name")
             self.assertEqual(self.acquire().reason, "live holder")
+            self.put(self.record2(pid, "2001-01-01T00:00:00Z", host="mac.lan"))
+            self.assertEqual(self.hl.status(str(self.root))["holder_lineage"], False, "a recycled pid")
             # Its dead record no longer fences the root for good: the next holder takes it.
             self.put(self.record2(dpid, dstart, host="mac.lan"))
             self.assertEqual(self.hl.occupancy(str(self.root)), "free")
+            self.assertTrue(self.hl._proven_dead({"owner_pid": dpid, "owner_start": dstart, "host": "mac.lan",
+                                                  "consumer": {"pid": dpid, "start": dstart}}, here))
             self.assertEqual(type(self.acquire()).__name__, "Acquired")
         self.assertIs(self.hl._HOST_NAME_DRIFTS, sys.platform == "darwin", "only where the name follows the network")
+        with mock.patch.object(self.hl, "_HOST_NAME_DRIFTS", False), \
+                mock.patch.object(self.hl, "_statfs_type", return_value="ext4"):
+            self.assertEqual(self.hl._host_read_here("another-host", str(self.ldir())), "another-host")
+        self.assertIsNone(self.hl.verify_lineage(pid, start, "mac.lan"), "the bare check never relaxes a name")
 
-    def test_a_renamed_host_is_read_only_on_a_disk_known_to_be_local(self):
-        """Without positive evidence that the records sit on a local disk, a record under another name
-        may be another machine's: it stays unobserved, alive or dead, and keeps fencing the root."""
+    def test_a_renamed_host_is_read_only_when_the_records_own_directory_is_known_to_be_local(self):
+        """The record lives in the root's own lock directory, which can be on another filesystem than
+        the directory all lock dirs share. Without positive evidence about that very directory a record
+        under another name may be another machine's: it stays unobserved, alive or dead, keeps fencing
+        the root, and is never tombstoned."""
         pid, start = self.proc()
         dpid, dstart = self.dead()
+        self.put(self.record2(dpid, dstart, host="mac.lan"))
+        (self.ldir() / self.hl.LOCK_NAME).touch()     # the lock a past holder left, now free
+        own = os.path.realpath(str(self.ldir()))
         for why, fstype in (("the probe failed", None), ("a network mount", "nfs"), ("not MNT_LOCAL", "nonlocal:apfs")):
+            seen = []
+
+            def probe(path, fstype=fstype, seen=seen):
+                seen.append(os.path.realpath(path))
+                return fstype if os.path.realpath(path) == own else "apfs"      # every other directory is local
+
             with self.subTest(why), mock.patch.object(self.hl, "_HOST_NAME_DRIFTS", True), \
-                    mock.patch.object(self.hl, "_statfs_type", return_value=fstype):
-                self.assertFalse(self.hl._records_are_local())
-                self.assertIsNone(self.hl.verify_lineage(pid, start, "mac.lan"))
-                self.assertIsNone(self.hl.verify_lineage(dpid, dstart, "mac.lan"))
+                    mock.patch.object(self.hl, "_statfs_type", side_effect=probe):
+                self.assertFalse(self.hl._record_is_local(str(self.ldir())))
+                self.assertTrue(self.hl._record_is_local(str(self.ldir().parent)), "its local parent proves nothing")
+                self.assertEqual(self.hl._host_read_here("mac.lan", str(self.ldir())), "mac.lan")
                 self.put(self.record2(dpid, dstart, host="mac.lan"))
-                (self.ldir() / self.hl.LOCK_NAME).touch()     # the lock a past holder left, now free
                 self.assertEqual(self.hl.occupancy(str(self.root)), "unobserved", "the dead record still fences")
                 self.assertEqual(self.hl.status(str(self.root))["holder_lineage"], None)
                 self.assertFalse(self.hl._proven_dead({"owner_pid": dpid, "owner_start": dstart, "host": "mac.lan",
-                                                       "consumer": {"pid": dpid, "start": dstart}}),
+                                                       "consumer": {"pid": dpid, "start": dstart}}, str(self.ldir())),
                                  "and is never tombstoned")
-        with mock.patch.object(self.hl, "_statfs_type", side_effect=OSError("denied")):
-            self.assertFalse(self.hl._records_are_local())
-        with mock.patch.object(self.hl, "_statfs_type", return_value="apfs") as probe:
-            self.assertTrue(self.hl._records_are_local())
-        probe.assert_called_once_with(self.hl._locks_home())
-        with mock.patch.object(self.hl, "_locks_home", return_value=str(self.root / "not" / "made" / "yet")), \
-                mock.patch.object(self.hl, "_statfs_type", return_value="apfs") as probe:
-            self.assertTrue(self.hl._records_are_local())
-        probe.assert_called_once_with(str(self.root))
+                self.put(self.record2(pid, start, host="mac.lan"))
+                self.assertEqual(self.hl.status(str(self.root))["holder_lineage"], None, "alive is not shown either")
+                self.assertIn(own, seen, "the record's own directory is the one asked about")
+        with mock.patch.object(self.hl, "_HOST_NAME_DRIFTS", True):
+            with mock.patch.object(self.hl, "_statfs_type", side_effect=OSError("denied")):
+                self.assertFalse(self.hl._record_is_local(str(self.ldir())), "a failed check is not local")
+            for unknown in (None, 7):       # no directory given, or a descriptor: nothing to ask about
+                self.assertFalse(self.hl._record_is_local(unknown))
+                self.assertEqual(self.hl._host_read_here("mac.lan", unknown), "mac.lan")
 
     def test_start_time_ignores_locale_and_time_zone(self):
         base = self.hl.start_time(os.getpid())
@@ -2392,7 +2412,7 @@ class HolderLockTest(unittest.TestCase):
                                                        (directory / "lock").touch())),
                            ("the directory", lambda: (os.rename(directory, str(directory) + ".aside"),
                                                       os.mkdir(directory)))):
-            def swap_after_the_proof(rec, swap=swap):
+            def swap_after_the_proof(rec, directory=None, swap=swap):
                 swap()
                 return True
             with mock.patch.object(self.hl, "_proven_dead", swap_after_the_proof), \
