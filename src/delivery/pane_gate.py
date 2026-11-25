@@ -89,13 +89,26 @@ FABLE_TEXT = re.compile(r"reached your Fable limit|included Fable usage for this
 # The CLI's wait-for-the-reset banner ("Usage limit reached · …", "Continuing automatically at …"); near
 # the reset its second row reads "Continuing shortly · Esc to cancel", often captured without the first.
 LIMIT_WAIT = re.compile(r"Continuing automatically (?:at\b|shortly\b)|Continuing shortly\s*·\s*Esc to cancel"
-                        r"|\b(?:session|usage|weekly) limit reached\b", re.I)
+                        r"|\b(?:session|usage|weekly) limit reached\b"
+                        # The limit's own title row, "Weekly limit · resets Nov 28 at 1pm": at the row's start,
+                        # so a sentence that names a limit and a reset elsewhere is not one.
+                        r"|^[ \t⎿⚠]*(?:session|usage|weekly) limit\s*·\s*resets?\b", re.I | re.M)
+_LIMIT_NOUN = r"(?:session|usage|weekly) limit"
+_LIMIT_TITLE = re.compile(
+    rf"^[ \t⎿⚠]*(?:You(?:'ve| have) (?:hit|reached|used|exceeded) (?:all of )?your {_LIMIT_NOUN}"
+    rf"|{_LIMIT_NOUN} reached)[ \t]*(?:[.!]?[ \t]*$|·[ \t]*(?:limit )?resets?\b)"
+    rf"|^[ \t⎿⚠]*{_LIMIT_NOUN}[ \t]*·[ \t]*resets?\b"
+    r"|^[ \t⎿⚠]*Continuing (?:automatically at\b|shortly[ \t]*·[ \t]*Esc to cancel[ \t]*$)",
+    re.I | re.M)
 #: A turn this short (or with no duration) may be the CLI refusing it, not running it.
 TURN_SHORT = re.compile(r"[01]s")
 # A turn the CLI refuses outright is a FINISHED turn: the reason is its `⎿` result and the
 # pane returns to the idle footer, so no gate is on screen. Explicit list, extended by hand.
 LIMIT_REFUSAL = re.compile(
-    r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit", re.I)
+    r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit"
+    # The CLI's own line: "You've used your weekly limit · resets …" opening its row and ending its clause.
+    r"|(?:\A|(?<=\n)|(?<=⎿))[ \t⎿⚠]*You(?:'ve| have) (?:reached|used|exceeded) (?:all of )?your"
+    r" (?:session|usage|weekly) limit(?=[ \t]*(?:[·.!\n]|\Z))", re.I)
 REFUSAL = re.compile(
     LIMIT_REFUSAL.pattern
     # A bare "not logged in" is a refusal only as the CLI's own line-start `⎿` row.
@@ -141,8 +154,11 @@ def limit_standing(pane: Optional[str], runtime: Optional[str] = None, outrun: b
 
 _NUMBERED_ROW = re.compile(r"^\s*(?:❯\s*)?\d+\.\s")
 _CARET_ROW = re.compile(r"^\s*❯\s*\d+\.\s")
-# The limit menu's own choices: its title may be a "⎿" line, which the walk back skips as the turn.
-_LIMIT_MENU_ROW = re.compile(r"wait for (?:the )?limit to reset|usage credits|extra usage", re.I)
+# The CLI limit menu's own rows: its first option, and one of the others it always offers with it.
+_LIMIT_MENU_STOP = re.compile(r"^\s*(?:❯\s*)?1\.\s+Stop and wait for (?:the |your )?(?:session |usage |weekly )?"
+                              r"limit to reset\s*$", re.I)
+_LIMIT_MENU_MORE = re.compile(r"^\s*(?:❯\s*)?\d\.\s+(?:(?:Switch to|Add funds to continue with) (?:extra usage|usage "
+                              r"credits)|Wait here, then continue automatically\b)", re.I)
 
 
 def _dialog_names_limit(text: str) -> bool:
@@ -160,7 +176,8 @@ def _dialog_names_limit(text: str) -> bool:
         end += 1
     # Only a live dialog's rows (a caret on one): a numbered list in a reply is not a menu.
     live = any(_CARET_ROW.match(ln) for ln in lines[start:end + 1])
-    if live and any(_LIMIT_MENU_ROW.search(ln) for ln in lines[start:end + 1]):
+    menu = lines[start:end + 1]
+    if live and any(_LIMIT_MENU_STOP.match(ln) for ln in menu) and any(_LIMIT_MENU_MORE.match(ln) for ln in menu):
         return True
     for line in reversed(lines[:start]):
         core = line.strip()
@@ -168,7 +185,7 @@ def _dialog_names_limit(text: str) -> bool:
             continue
         if core[0] in "✻⎿●⏺" or (core.startswith("❯") and core.lstrip("❯").strip()):
             return False  # the turn above the dialog: its words are not the dialog's
-        if limit_line(core):
+        if _LIMIT_TITLE.search(core):
             return True
     return False
 
@@ -243,7 +260,9 @@ CODEX_IDLE = re.compile(
 CODEX_PICKER_ROW = re.compile(r"[›»]\s*\d+\.")
 CODEX = RuntimeAdapter(
     name="codex", glyph="›", idle_ready=CODEX_IDLE,
-    gate_signatures=tuple(CLAUDE_GATE_SIGNATURES) + (("selection", CODEX_PICKER_ROW),),
+    gate_signatures=(("session-limit", _LIMIT_TITLE),) + tuple(
+        (kind, pattern) for kind, pattern in CLAUDE_GATE_SIGNATURES if kind not in LIMIT_GATES
+    ) + (("selection", CODEX_PICKER_ROW),),
     await_hint=re.compile(f"{AWAIT_HINT.pattern}|{CODEX_PICKER_ROW.pattern}", re.I),
     alternate_glyphs=("»",),
     idle_requires_prompt=True,

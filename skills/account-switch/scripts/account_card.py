@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """A card in the owner's DM that says which account the core is signed in to and switches it.
 
-    python3 account_card.py [--workspace WS] post --room ROOM [--reply-to EVENT] [--print]
+    python3 account_card.py [--workspace WS] post [--room ROOM | --owner-dm] [--reply-to EVENT] [--print]
+                                              [--signed-out] [--lead TEXT]
     python3 account_card.py [--workspace WS] reply --task-file PATH
     python3 account_card.py [--workspace WS] switch --room ROOM --key KEY --attempt ID
     python3 account_card.py [--workspace WS] status
 
 `post` sends the card to the owner's checked DM and records it (src/issued_cards.py), so only the
-owner's tap on it acts (agent_card.click_verdict). It names the account in use: on a Codex core
+owner's tap on it acts (agent_card.click_verdict); without `--room` it goes to that DM. `--signed-out`
+(the Codex seat, when the core's login is refused even after a restart) leads with "Codex isn't signed
+in anymore." instead of the account in use. It names the account in use: on a Codex core
 (TUI or app-server seat) from src/codex_account.py, on a Claude core from `claude auth status --json`
-under the core's config dir. Addresses are shown masked (first letter and domain).
+under the core's config dir. Addresses are shown masked (first letter and domain). `--owner-dm`
+names that same DM explicitly (the core's quota notice, src/core_quota_notice.py, uses it), and
+`--lead` puts a line before the card's words, saying why it was sent unasked; with `--signed-out` it
+replaces the "isn't signed in anymore" line.
 
 Saved accounts are the desktop's store for the Sutando core on Codex
 (`<app support>/accounts/codex/<key>.json`, {label, auth}, folder 0700, files 0600; desktop
@@ -83,6 +89,9 @@ USE_BUTTONS = ac.LIMITS["buttons"] - 1          # one place is "Add another acco
 SETTINGS = ("Settings → Connections → the Sutando (on this computer) row → \"Switch account\". "
             "A sign-in opens there; paste the code only into that box in the app, never in this chat.")
 NO_CODE = "Never send me a sign-in code or token here."
+SIGNED_OUT = "Codex isn't signed in anymore."
+CONTROLS = "account_controls"  # the desktop draws the core's account controls in a card carrying it
+RETRY_WORDS = "retry now"  # core_limit_hold's bare owner reply
 GONE = "That account is no longer on my list. Ask me for the account card again."
 BUSY = "An account switch is already under way. I'll confirm here when it has finished."
 # admit()'s answer when the attempt on record had lost its worker: that record is replaced.
@@ -101,14 +110,16 @@ def _emit(payload: dict, code: int = 0) -> int:
 
 
 def masked(email: str) -> str:
-    """An address shortened to what tells two accounts apart: its first letter and its domain."""
-    name, at, domain = (email or "").partition("@")
-    return "%s…@%s" % (name[:1], domain) if name and at and domain else ""
+    """An address as the owner reads it in their own DM: in full (one way to show an
+    account everywhere: the full email, no plan); "" when it is not an address."""
+    name, at, domain = (email or "").strip().partition("@")
+    return f"{name}@{domain}" if name and at and domain and " " not in name + domain else ""
 
 
 def masked_label(label: str) -> str:
-    """A desktop store label ("me@example.com (plus)") with its address masked."""
-    return re.sub(r"[^\s()@]+@[^\s()@]+", lambda m: masked(m.group(0)) or m.group(0), label or "")
+    """A desktop store label ("me@example.com (plus)") as the owner reads it: the address alone, no plan."""
+    label = (label or "").strip()
+    return re.sub(r"\s*\([^()]*\)$", "", label) if "@" in label else label
 
 
 # ── the core and its sign-in ──────────────────────────────────────────────────────────────────────
@@ -171,7 +182,7 @@ def identity(auth_text: str) -> Optional[tuple]:
         return None
     email = claims.get("email") if isinstance(claims.get("email"), str) else ""
     plan = auth_claims.get("chatgpt_plan_type") if isinstance(auth_claims.get("chatgpt_plan_type"), str) else ""
-    label = f"{email} ({plan})" if email and plan else email or (f"ChatGPT account ({plan})" if plan else "ChatGPT account")
+    label = email or "ChatGPT account"  # the email only: no plan name
     return hashlib.sha256(ident.encode("utf-8")).hexdigest()[:16], label
 
 
@@ -281,7 +292,9 @@ def current(rt: str, *, run=subprocess.run, codex_read=None) -> dict:
         try:
             home = codex_home()
         except codex_account.NoHome:
-            return {"runtime": rt, "signed_in": None, "shown": "", "key": ""}
+            home = _seat_home()
+            if home is None:
+                return {"runtime": rt, "signed_in": None, "shown": "", "key": ""}
         ident = identity(_live_auth(home) or "")
         if codex_read is None:
             import codex_account
@@ -294,27 +307,43 @@ def current(rt: str, *, run=subprocess.run, codex_read=None) -> dict:
         if not acct.get("kind") and ident is None:
             return {"runtime": rt, "signed_in": False, "shown": "", "key": ""}
         email = masked(str(acct.get("email") or "")) or (masked_label(ident[1]) if ident else "")
-        plan = f" ({acct['plan']})" if acct.get("plan") and acct.get("email") else ""
-        return {"runtime": rt, "signed_in": signed, "shown": (email + plan) or "a ChatGPT account",
+        return {"runtime": rt, "signed_in": signed, "shown": email or "a ChatGPT account",
                 "key": ident[0] if ident else ""}
     st = claude_status(run)
-    shown = (masked(st["email"]) or "an Anthropic account") + (f" ({st['plan']})" if st["plan"] else "")
+    shown = masked(st["email"]) or "an Anthropic account"  # the email only: the owner reads no plan name
     return {"runtime": rt, "signed_in": st["signed_in"], "shown": shown if st["signed_in"] else "", "key": ""}
 
 
+def _seat_home() -> Optional[Path]:
+    """The Codex home the running seat was started with (its own CODEX_HOME), when the launcher's
+    resolution is refused from here: an absolute directory holding a sign-in file, else None. Read only."""
+    raw = os.environ.get("CODEX_HOME", "").strip()
+    if not raw or not os.path.isabs(raw):
+        return None
+    path = Path(raw)
+    return path if (path / "auth.json").is_file() else None
+
+
 def in_use_words(cur: dict) -> str:
+    """The sentence naming the core's account; empty when it cannot be read, so the card's own
+    account controls (which the desktop fills) are never contradicted."""
     cli = "Codex" if cur["runtime"] == "codex" else "Claude Code"
     if cur["signed_in"] is None:
-        return f"I could not read which account the core ({cli}) is signed in to."
+        return ""
     if not cur["signed_in"]:
         return f"The core ({cli}) is not signed in."
-    return f"The core ({cli}) is signed in as {ac.md_escape(cur['shown'])}."
+    return f"I'm using {ac.md_escape(cur['shown'])}."
 
 
 # ── the card ──────────────────────────────────────────────────────────────────────────────────────
 
-def menu_card(cur: dict, others: list, names: Optional[dict] = None) -> tuple:
-    """(body, card): a "Use" button per other saved account (up to five), then "Add another account"."""
+def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "", retry: bool = False,
+              names: Optional[dict] = None) -> tuple:
+    """(body, card): a "Use" button per other saved account (up to five), then "Add another account".
+    `lead`, when given, opens the card's words and its fallback line. `signed_out`: the core's login was
+    refused, so the card drops the account in use and, with no `lead`, opens with SIGNED_OUT. `retry`
+    (the quota card) adds a Retry button whose words are the owner's own "retry now", which the Claude
+    core's limit hold acts on; a Codex core has no such hold, so its card carries none."""
     buttons = []
     names = names if names is not None else shown_names(others)
     for s in others[:USE_BUTTONS]:
@@ -325,19 +354,31 @@ def menu_card(cur: dict, others: list, names: Optional[dict] = None) -> tuple:
                                  command=ac.reply(KIND, TARGET, s["key"])))
     buttons.append(ac.button("Add another account", "reply", style="primary", reply="Add another account",
                              command=ac.reply(KIND, TARGET, ADD)))
-    using = in_use_words(cur)
+    if retry and cur["runtime"] != "codex":
+        buttons.append(ac.button("Retry", "reply", style="secondary", reply=RETRY_WORDS))
+    if signed_out:
+        lead = lead or SIGNED_OUT
     if cur["runtime"] == "codex":
-        more = (" Pick a saved account to switch to; the core restarts on it." if others else
+        more = (" Pick an account to switch to; the core restarts on it." if others else
                 " No other account is saved on this computer yet.")
     else:
-        more = " To use another Anthropic account, add it in Settings."
-    note = f"{NO_CODE} Adding an account happens in Settings, where the app takes the code."
-    return ac.build(CARD_ID, "info", title="Core account", avatar_=ac.avatar(initial="A"), text=using + more,
-                    buttons=buttons, note=note, note_tone="dim", body=f"{using} Reply \"switch account\" for options.")
+        more = ""
+    note = NO_CODE
+    lead = ac.md_escape(lead)[:1000]
+    using = "" if signed_out else in_use_words(cur)
+    words = " ".join(w for w in (lead, using, more.strip()) if w)
+    words = words or "Pick an account below."
+    body, card = ac.build(CARD_ID, "info", title="Account", avatar_=ac.avatar(initial="A"),
+                          text=words, buttons=buttons, note=note, note_tone="dim",
+                          body=" ".join(w for w in (lead, using, 'Reply "switch account" for options.') if w))
+    # The marker by which the desktop app on the core's computer draws the core's own account controls;
+    # `signed_out` makes it lead with "Sign in again" for this account, above the account dropdown.
+    marker = {"runtime": cur["runtime"], "core": True, **({"signed_out": True} if signed_out else {})}
+    return body, dict(card, **{CONTROLS: marker})
 
 
 def notice_card(state: str, status: str, words: str) -> tuple:
-    return ac.build(NOTE_ID, state, title="Core account", avatar_=ac.avatar(initial="A"), status=status,
+    return ac.build(NOTE_ID, state, title="Account", avatar_=ac.avatar(initial="A"), status=status,
                     text=words, body=words)
 
 
@@ -417,14 +458,25 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time, run=subp
     every = saved(store, cur["key"])
     others = [s for s in every if not s["current"]]
     try:
-        body, card = menu_card(cur, others, shown_names(every))
+        body, card = menu_card(cur, others, signed_out=args.signed_out, lead=args.lead or "",
+                               retry=args.retry, names=shown_names(every))
     except ac.CardError as e:
         return _emit({"status": "failed", "why": str(e)}, 1)
     if args.print:
         return _emit({"body": body, "card": card, "handler": HANDLER})
+    room = args.room
+    if not room:
+        try:
+            core = core if core is not None else _core(ws)
+            room = _owner_dm(ws, core)
+        except Exception as e:  # noqa: BLE001 - no core lane: named, nothing posted
+            return _emit({"status": "failed", "why": f"{type(e).__name__}: {e}"}, 1)
+        if not room:
+            return _emit({"status": "failed", "why": "the owner's DM is not known"}, 1)
     shown = [s["key"] for s in others[:USE_BUTTONS]]
     tag = hashlib.sha256(",".join(shown).encode()).hexdigest()[:12]
-    out = _post(ws, args.room, body, card, f"account-card:menu:{int(now())}:{tag}", reply_to=args.reply_to or "",
+    kind = "signed-out" if args.signed_out else "menu"
+    out = _post(ws, room, body, card, f"account-card:{kind}:{int(now())}:{tag}", reply_to=args.reply_to or "",
                 core=core, execute=execute)
     if out.get("event_id"):
         try:
@@ -534,7 +586,7 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     cur = current("codex", run=run, codex_read=codex_read)
     label = shown_names(saved(store)).get(verb) or "that account"
     if cur["key"] == verb:
-        return _emit({"status": "say", "say": f"The core is already signed in as {label}. Nothing changed."})
+        return _emit({"status": "say", "say": f"Already using {label} — nothing to change."})
     t = now()
     attempt = f"{int(t)}-{secrets.token_hex(4)}"
     rec = {"attempt": attempt, "key": verb, "room": room, "ts": t}
@@ -648,18 +700,18 @@ def do_switch(ws: Path, key: str, *, restart=restart_core, ready=core_ready, liv
     try:
         home = codex_home()
     except codex_account.NoHome as e:
-        return "error", f"I could not switch: the core's Codex home is not usable ({e}). Nothing changed."
+        return "error", f"Couldn't switch: the core's Codex home is not usable ({e}). Nothing changed."
     want = _saved_auth(store, key) if store else None
     if want is None:
-        return "error", "I could not switch: that account is no longer saved here. Nothing changed."
+        return "error", "Couldn't switch: that account is no longer saved here. Nothing changed."
     label = masked_label(identity(want)[1])
     try:
         before = _previous_auth(home)
     except Unreadable as e:
-        return "error", (f"I could not switch to {label}: the core's current sign-in could not be read ({e}), "
+        return "error", (f"Couldn't switch to {label}: the core's current sign-in could not be read ({e}), "
                          "so I left it in place. Nothing changed.")
     if before is not None and identity(before) is None:
-        return "error", (f"I could not switch to {label}: the core's current sign-in is not one I can save to "
+        return "error", (f"Couldn't switch to {label}: the core's current sign-in is not one I can save to "
                          "switch back to (an API key or an unreadable file), so I left it in place. Nothing changed.")
     was = masked_label(identity(before)[1]) if before else "no account"
     try:
@@ -672,7 +724,7 @@ def do_switch(ws: Path, key: str, *, restart=restart_core, ready=core_ready, liv
             _restore(home, before)
         except OSError:
             pass
-        return "error", f"I could not switch to {label}. I'm still signed in as {was}. The sign-in could not be written ({type(e).__name__})."
+        return "error", f"Couldn't switch to {label}: the sign-in could not be written ({type(e).__name__}). I'm still signed in as {was}."
     started = clock()
     rc = restart()
     if rc in NOT_RESTARTED:
@@ -682,7 +734,7 @@ def do_switch(ws: Path, key: str, *, restart=restart_core, ready=core_ready, liv
             return "error", (f"The core did not restart ({RESTART_REASONS.get(rc, 'the restart failed')}), and the "
                              f"previous sign-in could not be put back: the core uses {label} from its next start.")
         reason = RESTART_REASONS.get(rc, "the restart failed")
-        return "error", f"I could not switch to {label}. I'm still signed in as {was}. {reason[:1].upper()}{reason[1:]}."
+        return "error", f"Couldn't switch to {label}: {reason}. I'm still signed in as {was}."
     if rc != 0:
         return "error", (f"The restart did not finish cleanly (exit {rc}), so I can't tell which account the core "
                          f"is on. Its saved sign-in is now {label}. Ask me for the account card to check.")
@@ -696,12 +748,12 @@ def do_switch(ws: Path, key: str, *, restart=restart_core, ready=core_ready, liv
     want_email = _email(want).lower()
     if now_ident and now_ident[0] == key and acct.get("kind") == "chatgpt" and \
             (not want_email or str(acct.get("email") or "").lower() == want_email):
+        # Not "Switched … ✓": only the saved sign-in is verified, never the running core's own account.
         return ("done" if beat else "info"), f"{asked} Saved sign-in verified: Codex confirms it is {label}. {unconfirmed}"
     if not acct:
         return "error", f"{asked} Codex did not confirm the saved sign-in. Ask me for the account card to check."
     shown = masked(str(acct.get("email") or ""))
-    shown = (shown + (f" ({acct['plan']})" if acct.get("plan") else "")) if shown else \
-        ("no ChatGPT account" if not acct.get("kind") else "another account")
+    shown = shown or ("no ChatGPT account" if not acct.get("kind") else "another account")
     return "error", f"{asked} But its saved sign-in is {shown}, not {label}. Ask me for the account card to try again."
 
 
@@ -752,9 +804,15 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, run=subp
     p.add_argument("--workspace", default=None)
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("post")
-    s.add_argument("--room", required=True)
+    to = s.add_mutually_exclusive_group()
+    to.add_argument("--room", default="", help="the owner's DM (default: the core's checked owner DM)")
+    to.add_argument("--owner-dm", action="store_true",
+                    help="the core lane's checked owner DM (the default when --room is not given)")
     s.add_argument("--reply-to", default="")
+    s.add_argument("--lead", default="", help="a line that opens the card's words")
+    s.add_argument("--retry", action="store_true", help="add a Retry button (the quota card)")
     s.add_argument("--print", action="store_true")
+    s.add_argument("--signed-out", action="store_true", help="the core's login was refused: say so first")
     r = sub.add_parser("reply")
     r.add_argument("--task-file", required=True)
     w = sub.add_parser("switch")
