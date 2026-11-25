@@ -1787,8 +1787,8 @@ class LimitHolds(unittest.TestCase):
 
 
 class WeeklyLimit(unittest.TestCase):
-    """VM 2026-11-23: the weekly limit's screen and its /rate-limit-options menu read as a plain
-    selection, so the core's quota card was never posted for it."""
+    """The weekly limit's screen and its /rate-limit-options menu are a usage limit, not a plain
+    selection, so the core's quota card is posted for it."""
 
     MENU = ("  ⎿  You've used your weekly limit · resets Nov 28 at 1pm (UTC)\n"
             "❯ /rate-limit-options\n"
@@ -1814,6 +1814,15 @@ class WeeklyLimit(unittest.TestCase):
         menu = "Pick one\n❯ 1. Keep the weekly report\n  2. Drop it\nEnter to confirm · Esc to cancel\n"
         self.assertFalse(pg.is_usage_limit("selection", menu))
         self.assertFalse(pg.limit_line("The weekly report resets the counters."))
+
+    def test_an_option_naming_a_limit_and_a_reset_is_not(self):
+        option = "your weekly limit for uploads resets on Monday"
+        menu = f"Pick one\n❯ 1. Upload now\n  2. {option}\nEnter to confirm · Esc to cancel\n"
+        self.assertFalse(pg.limit_line(option))
+        self.assertFalse(pg.is_usage_limit("selection", menu))
+        kind = next((k for k, rx in pg.CLAUDE_GATE_SIGNATURES if rx.search(menu)), None)
+        self.assertEqual(kind, "selection")
+        self.assertTrue(pg.limit_line("  ⎿  Weekly limit · resets Nov 28 at 1pm"))
 
 
 if __name__ == "__main__":

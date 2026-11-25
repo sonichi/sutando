@@ -90,9 +90,9 @@ FABLE_TEXT = re.compile(r"reached your Fable limit|included Fable usage for this
 # the reset its second row reads "Continuing shortly · Esc to cancel", often captured without the first.
 LIMIT_WAIT = re.compile(r"Continuing automatically (?:at\b|shortly\b)|Continuing shortly\s*·\s*Esc to cancel"
                         r"|\b(?:session|usage|weekly) limit reached\b"
-                        # The weekly limit's own title: "Weekly limit · resets Nov 28 at 1pm", "You've used
-                        # your weekly limit … resets …" (VM 2026-11-23: its /rate-limit-options menu was missed).
-                        r"|\b(?:session|usage|weekly) limit\b[^\n]{0,60}\bresets?\b", re.I)
+                        # The limit's own title row, "Weekly limit · resets Nov 28 at 1pm": at the row's start,
+                        # so a sentence that names a limit and a reset elsewhere is not one.
+                        r"|^[ \t⎿⚠]*(?:session|usage|weekly) limit\s*·\s*resets?\b", re.I | re.M)
 #: A turn this short (or with no duration) may be the CLI refusing it, not running it.
 TURN_SHORT = re.compile(r"[01]s")
 # A turn the CLI refuses outright is a FINISHED turn: the reason is its `⎿` result and the
