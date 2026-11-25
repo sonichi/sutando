@@ -41,6 +41,14 @@ OUTCOMES = ("agent-cards", "outcomes")     # what became of each queued card: po
 KEYS_KEEP_S = 7 * 86400.0
 CARD_KEY = "space.ag2.card"
 MAX_QUEUED_S = 600.0
+RETRY_BASE_S, RETRY_MAX_S = 5.0, 60.0     # the wait before a send with no verdict is tried again, doubling
+# The statuses that refuse one edit for good: its target is not there or not this agent's, or its payload is bad.
+EDIT_REFUSED = frozenset({400, 403, 404, 410, 413, 422})
+THROTTLED = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+class NoVerdict(Exception):
+    """The relay answered an edit without accepting or refusing it."""
 _NAME_RE = re.compile(r"^[0-9a-f]{32}\.json$")
 # A room id with its server, or the newer kind that has none (room version 12).
 _ROOM_RE = re.compile(r"^![^\s:]+(:\S+)?$")
@@ -169,8 +177,11 @@ class Poster:
                 continue
             # A card waits behind an earlier one of the same card in the same room that is not posted
             # yet: posted out of order, the earlier one would arrive last and replace it.
-            same = (record["room"], str(card.get("id") or ""))
-            if same in held:
+            target = str(record.get("edit") or "")
+            target = target if _EVENT_RE.match(target) else ""
+            # So does an edit behind an earlier edit of the same event, whatever card each one carries.
+            same = {(record["room"], "card", str(card.get("id") or ""))} | ({(record["room"], "event", target)} if target else set())
+            if same & held:
                 continue
             # Already posted, by a sweep that then failed to finish: that stands, whatever its age now.
             if outcome(self.state, path.stem) == "posted" or (self.state.joinpath(*POSTED) / path.name).is_file():
@@ -182,20 +193,28 @@ class Poster:
                 _settle(self.state, path.stem, "unsure" if record.get("attempted") else "dropped")
                 path.unlink(missing_ok=True)
                 continue
+            if self.clock() < float(record.get("not_before") or 0):
+                held |= same            # backing off after a send with no verdict: nothing overtakes it
+                continue
             if not record.get("attempted"):     # saved before the send: an expiry after it is never a clean drop
-                _write(path, dict(record, attempted=True))
+                record = dict(record, attempted=True)
+                _write(path, record)
             payload = {"op": "message", "room_id": record["room"], "body": str(record.get("body") or ""),
                        "extra_content": {CARD_KEY: card}, "dedupe_key": "agent-card:" + path.stem}
-            target = str(record.get("edit") or "")
             try:
-                _, event_id = self.send(payload, target if _EVENT_RE.match(target) else "")
-            except Exception as e:  # noqa: BLE001 - stays queued, retried next sweep
+                _, event_id = self.send(payload, target)
+            except Exception as e:  # noqa: BLE001 - stays queued, retried under the same key
                 self.log("agent-card: post failed (will retry): %s" % type(e).__name__)
-                held.add(same)
+                code = getattr(e, "code", None)
+                if isinstance(e, NoVerdict) or (code if isinstance(code, int) else getattr(e, "status", None)) in THROTTLED:
+                    # Told to come back later, or answered with no verdict: the next try waits, doubling.
+                    tries = int(record.get("tries") or 0) + 1
+                    _write(path, dict(record, tries=tries, not_before=self.clock() + min(RETRY_MAX_S, RETRY_BASE_S * 2 ** (tries - 1))))
+                held |= same
                 continue
             if not event_id.startswith("$"):
                 self.log("agent-card: the post returned no event id (will retry)")
-                held.add(same)
+                held |= same
                 continue
             _write(self.state.joinpath(*POSTED) / path.name,
                    dict({"event_id": event_id, "room": record["room"], "card": card, "posted_at": self.clock()},
@@ -207,25 +226,43 @@ class Poster:
 
     def send(self, payload, target: str = ""):
         """(answer, event id the card now shows at). With `target` the card is sent as an edit of that
-        event, and stays recorded under it; an edit the server refuses (a 4xx: the event is not there, or not
-        this agent's; or an answer that is not a success) is posted as a new card instead, so the owner is
-        still told."""
+        event, and stays recorded under it, once the relay answers with the edit's own event id. Only an
+        edit the relay refuses for good (EDIT_REFUSED, or an answer saying so) is posted as a new card. A
+        throttled, timed-out or unreadable answer raises: the edit is tried again under its own key."""
         if target:
             try:
                 answer = self.post(dict(payload, op="edit", event_id=target,
                                         dedupe_key="agent-card-edit:" + payload["dedupe_key"].split(":", 1)[1]))
-            except Exception as e:  # noqa: BLE001 - only a refusal falls back; anything else is retried
+            except Exception as e:  # noqa: BLE001 - only a refusal for good falls back
                 code = getattr(e, "code", None)
                 code = code if isinstance(code, int) else getattr(e, "status", None)
-                if not (isinstance(code, int) and 400 <= code < 500):
+                if code not in EDIT_REFUSED:
                     raise
                 self.log("agent-card: edit refused (%s), posted as a new card" % code)
             else:
-                if isinstance(answer, dict) and not answer.get("is_error") and (answer.get("ok") or answer.get("event_id")):
+                verdict = edit_verdict(answer)
+                if verdict == "accepted":
                     return answer, target
+                if verdict != "refused":
+                    raise NoVerdict("the edit has no verdict yet (%s)" % verdict)
                 self.log("agent-card: edit not accepted, posted as a new card")
         answer = self.post(payload)
         return answer, str((answer or {}).get("event_id") or "") if isinstance(answer, dict) else ""
+
+
+def edit_verdict(answer) -> str:
+    """What the relay's answer to an edit says: 'accepted' (not a refusal, and it carries the edit's own
+    event id), 'refused' (ok false or an error, for good), 'throttled' (told to come back later) or
+    'unknown' (success-shaped with no event id, or nothing readable). Only 'refused' may become a new card."""
+    if not isinstance(answer, dict):
+        return "unknown"
+    limited = str(answer.get("errcode") or answer.get("error") or "")
+    if any(k in answer for k in ("retry_after_ms", "retry_after")) or "LIMIT_EXCEEDED" in limited.upper() \
+            or answer.get("status") in THROTTLED:
+        return "throttled"
+    if answer.get("ok") is False or any(answer.get(k) for k in ("is_error", "error", "errcode")):
+        return "refused"
+    return "accepted" if str(answer.get("event_id") or "").startswith("$") else "unknown"
 
 
 def absorb(bridge_state, work_root, handler: str = "") -> int:

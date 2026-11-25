@@ -43,6 +43,7 @@ FILE = "quota-card.json"        # the incident: the supervisor's alone
 ROOM_FILE = "quota-room.json"   # the owner's DM room: the claim's alone
 
 CLEAR_S = 600.0         # the banner gone this long: the limit is over, and a later one is a new card
+COVERS_KEEP = 20        # the task cards of one incident whose fate is still followed
 SAME_CARD_S = 120.0     # a message known this soon after the unasked card is answered by that card
 
 ECHO_TASKS, ECHO_BYTES, ECHO_MIN = 40, 200_000, 8    # the task files a pane line is checked against
@@ -256,6 +257,19 @@ def _just_carded(rec: dict, to: str, dm: str, at: float) -> bool:
     return bool(sent) and to == dm and at - float(rec.get("queued") or 0) < SAME_CARD_S
 
 
+def _covered(bridge: str, rec: dict, at: float) -> "tuple[str, list]":
+    """What became of the cards queued for the owner's own messages this incident (`covers`): ('posted',
+    []) once one is posted, ('pending', the ones not settled) while any may still be, ('unknown', []) when
+    one may have gone through and none is pending, ('', []) when every one was dropped or none was queued."""
+    fates = [(delivery(bridge, c, at), c) for c in rec.get("covers") or [] if isinstance(c, dict)]
+    if any(f == "posted" for f, _ in fates):
+        return "posted", []
+    waiting = [c for f, c in fates if f == "pending"]
+    if waiting:
+        return "pending", [c for f, c in fates if f != "dropped"]
+    return ("unknown" if any(f in ("unsure", "unknown") for f, _ in fates) else ""), []
+
+
 def _tell_tasks(root, cfg: dict, bridge: str, limited: list, text: str, log, rec: dict, at: float) -> "tuple[dict, list]":
     """Each owner task with no answer gets the card once: (the incident record with its `tasks` entries,
     what was done for each task this tick). An entry keeps its card's key and queue id; a card the bridge
@@ -290,8 +304,9 @@ def _tell_tasks(root, cfg: dict, bridge: str, limited: list, text: str, log, rec
             done.append("quota-no-room")
             continue
         if _just_carded(rec, to, room(root), at):
-            tasks[task_id] = {"skip": True}     # the incident's card, just put in this room, answers it
-            continue
+            if rec.get("told"):
+                tasks[task_id] = {"skip": True}     # the incident's card, posted in this room, answers it
+            continue        # only queued so far: no second card yet, and none skipped for good until it is posted
         if not card_desk.usable(bridge):
             done.append("quota-not-posted")
             continue
@@ -313,6 +328,10 @@ def _tell_tasks(root, cfg: dict, bridge: str, limited: list, text: str, log, rec
             done.append("quota-not-posted")
             continue
         tasks[task_id] = dict({k: v for k, v in entry.items() if k != "again"}, qid=qid, queued=at)
+        # Kept with the incident, not the task: the card's fate still counts once the task is answered.
+        covers = ([c for c in rec.get("covers") or [] if isinstance(c, dict) and c.get("qid") != qid]
+                  + [{"qid": qid, "queued": at}])[-COVERS_KEEP:]
+        rec = dict(rec, covers=covers)
         done.append("quota-task-card")
     rec = dict(rec, tasks=tasks)
     save(root, rec)
@@ -362,10 +381,19 @@ def notice(root, cfg: dict, names, text: str, log, now=time.time, session: str =
 
 def _tell_incident(root, cfg: dict, bridge: str, limited: list, text: str, log, rec: dict, at: float) -> str:
     """The one unasked card of the incident, in the owner's DM."""
-    if not rec.get("told") and not rec.get("qid") and any(e.get("qid") for e in (rec.get("tasks") or {}).values()):
-        # The owner's own messages carry the card already: an unasked one besides would be the same card twice.
-        save(root, dict(rec, told=True, by_tasks=True))
-        return ""
+    if not rec.get("told") and not rec.get("qid") and rec.get("covers"):
+        # The owner's own messages carry the card: an unasked one besides would be the same card twice. That
+        # holds once one of them is posted; while they are only queued this waits, and after a drop it sends.
+        fate, waiting = _covered(bridge, rec, at)
+        if fate == "pending":
+            if waiting != rec.get("covers"):
+                save(root, dict(rec, covers=waiting))
+            return ""
+        rec = {k: v for k, v in rec.items() if k != "covers"}
+        if fate:
+            save(root, dict(rec, told=True, by_tasks=True, **({"unknown": True} if fate == "unknown" else {})))
+            return ""
+        save(root, rec)
     if rec.get("told"):
         return ""
     if rec.get("qid"):

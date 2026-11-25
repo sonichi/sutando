@@ -394,10 +394,11 @@ def prepare_work_dir(work, check_only=False):
                 continue
             if name.endswith(".tmp") and name[:-4] in LOCAL_FEATURE_FILES:
                 # A feature record's own temp (`<name>.tmp`, then replaced): a live writer's, or one left by a crash.
-                if not _is_type(os.path.join(state, name), "file"):
+                seen = _temp_seen(os.path.join(state, name))
+                if seen is False:
                     return "refusing to start: state/%s in %s is not a plain file" % (name, state)
-                if not check_only and time.time() - os.lstat(os.path.join(state, name)).st_mtime > TEMP_SWEEP_AFTER:
-                    os.unlink(os.path.join(state, name))
+                if seen is not None and not check_only and time.time() - seen > TEMP_SWEEP_AFTER:
+                    _unlink_if_there(os.path.join(state, name))
                 continue
             if name in LEGACY_TEMPS:
                 seen = _temp_seen(os.path.join(state, name))

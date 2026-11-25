@@ -442,7 +442,7 @@ class FreshDirTest(Base):
         # breaking the layout: listed, then gone, is accepted in a check and in a start, fresh or not.
         for copy in filter(None, (src_copy(), vendored)):
             real_listdir = os.listdir
-            for gone in (".rate.jsonl.7.abcd.tmp", "model-switch.json.tmp"):
+            for gone in (".rate.jsonl.7.abcd.tmp", "model-switch.json.tmp", "model.json.tmp", "account.json.tmp"):
                 def listing(path, gone=gone):
                     names = real_listdir(path)
                     return names + [gone] if os.path.basename(str(path)) == "state" else names
@@ -456,6 +456,13 @@ class FreshDirTest(Base):
             with mock.patch.object(copy.os, "unlink", side_effect=FileNotFoundError()):
                 self.assertIsNone(copy.prepare_work_dir(str(self.work)))
             old.unlink()
+            # The same for a card record's own temp, swept by another start between the look and the unlink.
+            card_temp = state / "model.json.tmp"
+            card_temp.write_text("")
+            os.utime(card_temp, (1, 1))
+            with mock.patch.object(copy.os, "unlink", side_effect=FileNotFoundError()):
+                self.assertIsNone(copy.prepare_work_dir(str(self.work)))
+            card_temp.unlink()
         # The canonical copy answers the same, read by read (the package's is its copy).
         for copy in filter(None, (src_copy(), vendored)):
             (state / "model-switch.json.tmp").write_text("x")

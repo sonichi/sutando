@@ -557,6 +557,34 @@ class LimitMenu(NoticeBase):
         self.assertEqual(self.tick(STARTUP_MENU, 5.0), "")
         self.assertEqual(self.queued(), [])
 
+    def test_a_queued_card_covers_nothing_until_it_is_posted_and_a_drop_restores_the_notice(self):
+        quota_card.remember_room(self.root, DM)
+        # A message's card is queued, the message is answered, then the bridge drops the card unposted:
+        # nothing reached the owner, so the incident's own card is sent.
+        self.task("task-g", "hello")
+        self.assertEqual(self.tick(STARTUP_MENU), "quota-task-card x1")
+        first = quota_card.load(self.root)["tasks"]["task-g"]["qid"]
+        (Path(self.root) / "tasks" / "task-g.txt").unlink()
+        self.assertEqual(self.tick(STARTUP_MENU, 5.0), "", "queued, not posted: it waits, and is not told")
+        self.assertFalse(quota_card.load(self.root).get("told"))
+        self.assertEqual(self.sweep(self.queued_at(first) + connector_cards.MAX_QUEUED_S + 1), [])
+        self.assertEqual(connector_cards.outcome(self.bridge, first), "dropped")
+        self.assertEqual(self.tick(STARTUP_MENU, quota_card.RETRY_S), "quota-card", "the drop restores the notice")
+        own = quota_card.load(self.root)["qid"]
+        # A message that arrives while the incident's card is only queued is not skipped for good: when that
+        # card is dropped too, the message still gets its card.
+        self.task("task-h", "anyone there?")
+        self.assertEqual(self.tick(STARTUP_MENU, 5.0), "")
+        self.assertNotIn("skip", quota_card.load(self.root).get("tasks", {}).get("task-h", {}))
+        self.assertEqual(self.sweep(self.queued_at(own) + connector_cards.MAX_QUEUED_S + 1), [])
+        self.assertEqual(self.tick(STARTUP_MENU, connector_cards.MAX_QUEUED_S), "quota-card-dropped; quota-task-card x1")
+        # Posted, it covers the incident: no unasked card besides.
+        (sent,) = self.sweep(self.queued_at(quota_card.load(self.root)["tasks"]["task-h"]["qid"]) + 1)
+        self.assertEqual(self.tick(STARTUP_MENU, 5.0), "")
+        rec = quota_card.load(self.root)
+        self.assertEqual((rec.get("told"), rec.get("by_tasks"), "covers" in rec), (True, True, False))
+        self.assertEqual(self.queued(), [])
+
     def test_a_restarted_supervisor_never_tells_a_message_twice(self):
         quota_card.remember_room(self.root, DM)
         self.task("task-k", "hello")
