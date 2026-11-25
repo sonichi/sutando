@@ -112,9 +112,8 @@ def error_kind(error) -> Optional[str]:
     return None
 
 
-# A turn refused because the model it runs on is not one this account may use (VM 2026-11-24: the
-# core's gpt-6.1-terra under a ChatGPT account: "The 'gpt-6.1-terra' model is not supported when using
-# Codex with a ChatGPT account.", codexErrorInfo modelNotFound). The turn failed and the owner saw nothing.
+# A turn refused because the model it runs on is not one this account may use ("The '<model>' model is
+# not supported when using Codex with a ChatGPT account.", codexErrorInfo modelNotFound).
 MODEL_NOT_FOUND_INFO = "modelnotfound"
 _MODEL_MISSING_WORDS = re.compile(r"\bmodel is not supported\b|\bmodel (?:was )?not found\b", re.IGNORECASE)
 
@@ -337,9 +336,10 @@ class Seat:
         self.poll_s, self.retry_s, self.hold_s, self.max_attempts = poll_s, retry_s, hold_s, max_attempts
         self.backoff_s, self.turn_timeout, self.interrupt_grace = backoff_s, turn_timeout, interrupt_grace
         self.context, self.clock = context, clock
-        self.quota = quota            # the core's quota notice; a worker's seat has none
-        self.rate_limits: dict = {}   # the last `account/rateLimits/updated` snapshot
-        self.turn_limit: Optional[dict] = None  # the current turn's error when it said out of usage
+        self.quota = quota  # the core's quota notice; a worker's seat has none
+        # The last `account/rateLimits/updated` snapshot, and the current turn's error when it said out of usage.
+        self.rate_limits: dict = {}
+        self.turn_limit: Optional[dict] = None
         # The switch revision this seat's launch model came from; a later one is the next turn's.
         self.model_rev = self.launch_rev()
         # (model, rev, the model to restore, sent on turn/start) until Codex settles it
@@ -362,14 +362,20 @@ class Seat:
         self.declined: List[str] = []
         self.idle_logged = False
         self.lock_fd: Optional[int] = None
-        self.auth_seen: Optional[tuple] = None  # the login on disk when the running child was started
-        self.turn_unauth = False  # the current turn was refused because the login no longer works
-        self.turn_model_missing = ""  # the current turn's model is not one this account may use: its message
-        self.told_model_missing: List[str] = []  # the owner's tasks already shown the model card
-        self.told_signed_out: Optional[tuple] = None  # the login the owner was last shown the card for
-        self.told_limit = False  # the owner was shown a limit card this episode
-        self.health_auth: Optional[tuple] = None  # the login on disk when the core's health went bad, or last re-checked
-        self.health_bad: Optional[str] = None  # the core's bad health state ("signed_out", "quota"), else None
+        # The login on disk when the running child was started, and whether the current turn was refused
+        # because that login no longer works.
+        self.auth_seen: Optional[tuple] = None
+        self.turn_unauth = False
+        # The current turn's refusal message when its model is not one this account may use, and the
+        # owner's tasks already shown the model card.
+        self.turn_model_missing = ""
+        self.told_model_missing: List[str] = []
+        # The login the owner was last shown the sign-in card for, and whether a limit card was shown.
+        self.told_signed_out: Optional[tuple] = None
+        self.told_limit = False
+        # The login on disk when the core's health went bad (or was last re-checked), and that bad state.
+        self.health_auth: Optional[tuple] = None
+        self.health_bad: Optional[str] = None
         # Shows the owner the core's account card when its login is refused even after a restart.
         self.card_argv = [sys.executable, str(ACCOUNT_CARD), "--workspace", str(self.workspace), "post",
                           "--signed-out"]
@@ -826,8 +832,7 @@ class Seat:
         picked, rev = codex_core_model.pending(self.workspace / "state")
         if picked and rev <= self.model_rev and picked == self.model and rev not in self.attempts:
             # This launch already runs the pending pick (the restart named it): the first turn Codex
-            # completes on it settles the record, so the card and Settings name the same model
-            # (VM 2026-11-24 06:29: terra ran every turn, the record stayed 'pending, working luna').
+            # completes on it settles the record, so the card and Settings name the same model.
             self.attempts[rev] = 1
             self.trial = (picked, rev, picked, False)
             return ""
@@ -987,8 +992,8 @@ class Seat:
                     self.turn_limit = params["error"]
                 if (method == "error" and params.get("threadId") in (None, self.thread_id)
                         and model_missing(params.get("error"))):
-                    # A model refusal is the thread's, whatever turn id the event names (VM 2026-11-24:
-                    # refused at turn start, no compaction, and the card never followed).
+                    # A model refusal is the thread's, whatever turn id the event names (it can be
+                    # refused at turn start, before any turn of ours exists).
                     self.turn_model_missing = one_line((params.get("error") or {}).get("message") or "", 200)
                 if params.get("threadId") in (None, self.thread_id):
                     turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
@@ -1185,7 +1190,7 @@ class Seat:
         return outcome
 
     def model_unavailable(self, filename: str, payload: Optional[Path] = None) -> bool:
-        """The turn's model is not one this account may use (owner 2026-11-24: a card, never a silent
+        """The turn's model is not one this account may use (a card, never a silent
         switch, and every refused message answered). The owner's message gets the model card (the models
         Codex lists for this account), once per message however often it is retried, and stays pending,
         answered on the pick. Any other task (a cron's, a team member's) is not retried on a refused

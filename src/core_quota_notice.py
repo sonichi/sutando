@@ -29,6 +29,7 @@ RETRY_S = 60.0
 CARDED_KEEP = 100   # the owner messages already answered with the card, this episode
 SEND_TIMEOUT_S = 90.0
 AGAIN_TRIES = 5     # a follow-up card that failed is tried this many times in all, RETRY_S doubling between
+
 # The runtime's own words for when the limit ends ("try again at 3:05 PM", "resets in 2 hours"); only
 # time-like characters of them are kept, so nothing else of the error reaches the DM.
 _RESET = re.compile(r"\b(?:resets?(?: after| at| in| on)?|try again (?:at|in|after)|retry (?:at|in|after)"
@@ -66,8 +67,7 @@ SIGNED_OUT = "signed_out"   # `why` of a signed-out core: the same card, every o
 
 
 # The plan's limit is reached but the account can go on with usage credits, which cost money: said, never
-# chosen here (the recovery card keeps purchases behind its step-up). VM 2026-11-24: the card read
-# as "no quota" for an account that had credits.
+# chosen here (the recovery card keeps purchases behind its step-up).
 CREDITS_LINE = ("This account still has usage credits: to use them, choose \"Switch to usage credits\" in the "
                 "core's terminal on that computer.")
 _CREDITS_MENU = re.compile(r"\bswitch to usage credits\b", re.I)

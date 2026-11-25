@@ -107,8 +107,8 @@ def _emit(payload: dict, code: int = 0) -> int:
 
 
 def masked(email: str) -> str:
-    """An address as the owner reads it in their own DM: in full (owner 2026-11-24: one way to show an
-    account everywhere, the full email, no plan); "" when it is not an address."""
+    """An address as the owner reads it in their own DM: in full (one way to show an
+    account everywhere: the full email, no plan); "" when it is not an address."""
     name, at, domain = (email or "").strip().partition("@")
     return f"{name}@{domain}" if name and at and domain and " " not in name + domain else ""
 
@@ -353,10 +353,8 @@ def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "",
     body, card = ac.build(CARD_ID, "info", title="Account", avatar_=ac.avatar(initial="A"),
                           text=words, buttons=buttons, note=note, note_tone="dim",
                           body=" ".join(w for w in (lead, using, 'Reply "switch account" for options.') if w))
-    # The marker by which the desktop app, on the computer that runs the core, draws the core's own
-    # account controls in the card (its saved accounts, Add account…), as Settings has them.
-    # `signed_out`: the client leads with "Sign in again" for this account, the dropdown below it (owner
-    # 2026-11-24: a signed-out core's card showed only the dropdown).
+    # The marker by which the desktop app on the core's computer draws the core's own account controls;
+    # `signed_out` makes it lead with "Sign in again" for this account, above the account dropdown.
     marker = {"runtime": cur["runtime"], "core": True, **({"signed_out": True} if signed_out else {})}
     return body, dict(card, **{CONTROLS: marker})
 

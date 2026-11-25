@@ -450,10 +450,7 @@ def launch_model(workspace: Path, config_dir: Optional[str]) -> Optional[str]:
 
 
 # The account the running core was launched with, recorded when the gate lets it launch: a limit its
-# screen shows is that account's, even after the config names another one before a restart (VM
-# 2026-11-24: the desktop wrote account-b into .claude.json at 16:48, the still-running account-a core hit
-# its weekly limit at 16:51, the hold was recorded under account-b, and every launch on account-b was
-# refused).
+# screen shows is that account's, even after the config names another one before a restart.
 LAUNCH_ACCOUNT_FILE = "core-launch-account.json"
 
 
