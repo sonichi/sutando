@@ -1186,10 +1186,7 @@ class Seat:
             self.health("signed_out")
             self.signed_out(filename)
         elif self.turn_model_missing and status != "completed":
-            if self.model_unavailable(filename, payload) and has_ready_result(results, filename):
-                self.settle(filename, "done")
-                self.clear_record(filename)
-                return "done"
+            self.model_unavailable(filename, payload)
         outcome = "no-result" if status == "completed" else status
         rec = self.write_record(filename, payload, outcome, detail)
         wait = self.retry_s if rec["attempts"] < self.max_attempts else self.hold_s
@@ -1198,23 +1195,23 @@ class Seat:
             f"(attempt {rec['attempts']}, next try in {wait:g}s)")
         return outcome
 
-    def model_unavailable(self, filename: str, payload: Optional[Path] = None) -> bool:
+    def model_unavailable(self, filename: str, payload: Optional[Path] = None) -> None:
         """The turn's model is not one this account may use (a card, never a silent
         switch, and every refused message answered). The owner's message gets the model card (the models
         Codex lists for this account), once per message however often it is retried, and stays pending,
         answered on the pick. Any other task (a cron's, a team member's) gets no card and waits, pending,
-        until the core's model changes (eligible). True when this answered the task; a card that cannot be
-        posted is said in words instead, so a failed turn is never silent."""
+        until the core's model changes (eligible). A card that cannot be posted is
+        said in words instead, so a failed turn is never silent."""
         if self.worker:
-            return False
+            return
         refused = getattr(self, "turn_sent_model", "") or self.model or "the core model"
         if payload is not None and not core_quota_notice.is_owner_task(payload):
             self.model_wait[filename] = self.model_key()
             log(f"task {filename}: {refused} is not available to this account; not the owner's task, it "
                 "stays pending until the core's model changes")
-            return False
+            return
         if filename in self.told_model_missing:
-            return False
+            return
         lead = f"{refused} isn't available on this Codex account, so I couldn't answer."
         argv = [sys.executable, str(MODEL_CARD), "--workspace", str(self.workspace), "post", "--owner-dm",
                 "--lead", lead]
@@ -1227,11 +1224,10 @@ class Seat:
         if ok:
             log(f"task {filename}: model card posted ({refused} is not available to this account: "
                 f"{self.turn_model_missing})")
-            return False
+            return
         log(f"task {filename}: model card failed: {why} ({refused} is not available to this account); said in words")
         self.notify("refused", f"I couldn't answer: {refused} isn't available on this Codex account. "
                                "Send /model to pick one it can use.\n")
-        return False
 
     def quota_step(self, status: str, filename: str = "", payload: Optional[Path] = None) -> None:
         """Out of usage: the owner gets the account card once per limit (core_quota_notice); a turn

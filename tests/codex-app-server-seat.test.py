@@ -2582,14 +2582,15 @@ class AdvisoryFailures(SeatCase):
     def test_a_refused_model_on_a_worker_seat_is_not_its_concern(self):
         s = self.make()
         s.worker = "w1"
-        self.assertFalse(s.model_unavailable("task-1.txt"))
+        s.model_unavailable("task-1.txt")
+        self.assertEqual(s.model_wait, {})
 
     def test_a_model_card_that_cannot_run_is_said_in_words(self):
         s = self.make()
         owner = self.task("task-3.txt", "access_tier: owner\ntask: do it\n")
         with mock.patch.object(seat_mod.subprocess, "run", side_effect=OSError("no python")), \
                 mock.patch.object(s, "notify") as notify:
-            self.assertFalse(s.model_unavailable("task-3.txt", owner))
+            s.model_unavailable("task-3.txt", owner)
         self.assertIn("model card failed", self.out.getvalue())
         notify.assert_called_once()
 
