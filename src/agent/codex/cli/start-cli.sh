@@ -498,6 +498,18 @@ ensure_core_heartbeat() {
     || echo "WARN core heartbeat --ensure failed; cron-runner fires will stay suppressed" >&2
 }
 
+# A sign-in a runtime card is waiting for gets its waiter back: a restart can take it down with the core.
+# TUI core only: an app-server core resumes it itself once its thread is up.
+resume_runtime_sign_in_wait() {
+  local ws py card="$REPO/skills/runtime-switch/scripts/runtime_card.py"
+  py="$(heartbeat_python)"
+  { [ -n "$py" ] && [ -f "$card" ]; } || return 0
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  { [ -n "$ws" ] && [ -f "$ws/state/runtime-card-signin.json" ]; } || return 0
+  mkdir -p "$ws/logs" 2>/dev/null || return 0
+  ( "$py" "$card" --workspace "$ws" resume >> "$ws/logs/runtime-card.log" 2>&1 & )
+}
+
 ensure_durable_schedules() {
   # Codex has no session CronCreate surface. Reconcile ordinary scheduled
   # prompts onto the existing OS runner before the core session is reused or
@@ -831,6 +843,7 @@ heal_core_window() {
   ensure_codex_observer
   ensure_core_monitor
   ensure_core_heartbeat
+  resume_runtime_sign_in_wait
 }
 
 if session_exists "$SESSION"; then
@@ -859,6 +872,7 @@ start_core_session_and_helpers() {
   ensure_codex_observer
   ensure_core_monitor
   ensure_core_heartbeat
+  resume_runtime_sign_in_wait
 }
 
 if [ -t 1 ] && [ -z "${TMUX:-}" ]; then

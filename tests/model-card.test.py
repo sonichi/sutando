@@ -13,6 +13,8 @@
   saved before it is posted, a failed post is tried again, an outcome still untold is posted first by
   the next `post` or `reply`, an outcome is told once, and no retry starts the switch again.
 - An untold outcome with a newer attempt after it is marked superseded and never posted.
+- One card, updated in place: the switching words and the outcome edit the tapped menu's own event;
+  only a card that cannot be edited is answered with notice cards, as before.
 - A tap is resolved through the ids its own card was built with and acts only while the list still has
   that id; slugs are unique on a card; an id that is not a model name or a title too long is left out.
 
@@ -72,7 +74,11 @@ class Fake:
         return {"result": {"event_id": f"$card{len(self.calls)}"}}
 
     def cards(self):
-        return [c[1]["extra_content"][ac.CARD_KEY] for c in self.calls]
+        return [c[1]["extra_content"][ac.CARD_KEY] for c in self.calls if c[0] == "room.message.send"]
+
+    def edits(self):
+        """(edited event, words) for every edit, in order."""
+        return [(c[1]["event_id"], c[1]["body"]) for c in self.calls if c[0] == "room.message.edit"]
 
 
 class Launch:
@@ -206,27 +212,53 @@ class Tap(Base):
         attempt = out.pop("attempt")
         self.assertRegex(attempt, r"^[0-9]+-[0-9a-f]{8}$")
         self.assertEqual((rc, out), (0, {"status": "started", "model": "fable", "pid": 4242, "say": say,
-                                         "event_id": "$card2"}))
+                                         "event_id": "$card1"}))
         (argv, kw), = self.launch.calls
         self.assertEqual(argv[:3], ["nohup", "bash", "-c"])
         self.assertEqual(argv[4:], ["model-card", str(mc.SWITCH), "fable", "180", str(self.ws / "state"),
                                     sys.executable, str(SCRIPT), str(self.ws), DM, attempt])
-        self.assertEqual(self.fake.calls[1][2], f"model-card:{attempt}:switching")
+        self.assertEqual(self.fake.calls[1][2], f"model-card:{attempt}:switching-edit")
         self.assertTrue(mc.SWITCH.is_file())
         self.assertIn('bash "$1" "$2" --confirm --accept-timeout "$3" --state-dir "$4"; ', argv[3])
         self.assertTrue(argv[3].endswith('"$5" "$6" --workspace "$7" settle --room "$8" --model "$2" --attempt "$9" --rc $?'))
         self.assertNotIn("&&", argv[3], "the outcome is posted whatever the switch's exit code")
         self.assertTrue(kw["start_new_session"])
         self.assertEqual(kw["stdin"], subprocess.DEVNULL)
+        # One card, updated in place: the tapped menu's own event now says it, and no message is added.
+        self.assertEqual(self.fake.edits(), [("$card1", "Core model: " + say)])
+        self.assertEqual(self.fake.calls[1][3], DM)
+        self.assertEqual(len(self.fake.cards()), 1, "only the menu was ever posted")
+        self.assertEqual([r.get("card") for r in mc.outcomes(self.ws)], ["$card1"])
+        self.assertIn("switch to fable", (self.ws / "logs" / "model-card.log").read_text())
+        # Its outcome edits the same event again.
+        self.using("fable")
+        rc, told = self.run_(["settle", "--room", DM, "--model", "fable", "--attempt", attempt, "--rc", "0"])
+        self.assertEqual((rc, told["status"], told["event_id"]), (0, "posted", "$card1"))
+        self.assertEqual(self.fake.calls[-1][2], f"model-card:{attempt}:outcome-edit")
+        self.assertEqual(self.fake.edits()[-1], ("$card1", "Core model: Switched. I'm now using Fable."))
+        self.assertEqual(len(self.fake.cards()), 1, "the outcome adds no message either")
+
+    def test_a_card_that_cannot_be_edited_is_answered_with_cards_as_before(self):
+        real = self.fake.execute
+
+        def execute(action, arguments, **kw):
+            if action == "room.message.edit":
+                return {"is_error": True, "code": "M_FORBIDDEN"}
+            return real(action, arguments, **kw)
+        self.fake.execute = execute
+        rc, out = self.tap("fable")
+        attempt = out["attempt"]
+        self.assertEqual((rc, out["status"], out["event_id"]), (0, "started", "$card2"))
         card = self.fake.cards()[1]
-        self.assertEqual((card["id"], card["state"], card["text"]), (mc.NOTE_ID, "pending", say))
+        self.assertEqual((card["id"], card["state"], card["text"]), (mc.NOTE_ID, "pending", mc.switching_words("fable")))
         self.assertNotIn("buttons", card)
         self.assertEqual(self.fake.calls[1][1]["reply_to"], "$card1")
-        self.assertIn("switch to fable", (self.ws / "logs" / "model-card.log").read_text())
-        # The menu is still on the owner's screen after the card that answered it, and still acts.
-        self.assertIsNotNone(mc.issued_cards.live(self.ws, "$card1"), "the answered menu keeps acting")
-        self.assertEqual(self.tap("sonnet")[1]["status"], "started")
-        self.assertEqual(len(self.launch.calls), 2)
+        self.assertEqual([r.get("card") for r in mc.outcomes(self.ws)], [None])
+        self.assertIsNotNone(mc.issued_cards.live(self.ws, "$card1"), "the menu, still on screen, keeps acting")
+        rc, told = self.run_(["settle", "--room", DM, "--model", "fable", "--attempt", attempt, "--rc", "8"])
+        self.assertEqual((rc, told["status"]), (0, "posted"))
+        self.assertEqual(self.fake.calls[-1][2], f"model-card:{attempt}:outcome")
+        self.assertEqual(self.fake.cards()[-1]["state"], "error")
 
     def test_the_detached_line_passes_the_switch_exit_code_to_settle(self):
         """The line itself, run for real against stand-in scripts: `settle` gets the switch's own code."""
@@ -285,11 +317,11 @@ class Tap(Base):
         self.assertEqual((rc, got["status"]), (1, "failed"))
         self.assertIn("no nohup", got["why"])
         self.assertEqual(got["say"], "I could not switch to Fable. I'm still using Opus. The switch did not finish.")
-        self.assertEqual([(c["state"], c["text"]) for c in self.fake.cards()[1:]],
-                         [("pending", mc.switching_words("fable")), ("error", got["say"])],
-                         "the switching card is followed at once by what happened")
+        self.assertEqual(self.fake.edits(),
+                         [("$card1", "Core model: " + mc.switching_words("fable")), ("$card1", "Core model: " + got["say"])],
+                         "the switching words are followed at once by what happened, in the same card")
         self.assertEqual([c[2] for c in self.fake.calls[1:]],
-                         [f"model-card:{got['attempt']}:switching", f"model-card:{got['attempt']}:outcome"])
+                         [f"model-card:{got['attempt']}:switching-edit", f"model-card:{got['attempt']}:outcome-edit"])
         self.assertEqual(self.owed(), [])
         self.assertEqual(self.run_(["post", "--room", DM])[0], 0)
         self.fake.execute = lambda *a, **k: {"is_error": True, "code": "M_LIMIT"}
@@ -404,7 +436,7 @@ class Attempts(Base):
         self.fake.execute = lambda *a, **k: order.append("card " + k["operation_id"].rsplit(":", 1)[-1]) or real(*a, **k)
         self.launch = lambda argv, **kw: order.append("start") or mock.Mock(pid=7)
         rc, out = self.tap("fable")
-        self.assertEqual((rc, out["status"], order), (0, "started", ["card switching", "start"]))
+        self.assertEqual((rc, out["status"], order), (0, "started", ["card switching-edit", "start"]))
 
     def test_a_quick_refusal_is_posted_after_the_switching_card_under_the_attempts_ids(self):
         settled = []
@@ -420,9 +452,9 @@ class Attempts(Base):
         attempt = out["attempt"]
         self.assertEqual((rc, out["status"], settled), (0, "started", [0]))
         self.assertEqual([c[2] for c in self.fake.calls[1:]],
-                         [f"model-card:{attempt}:switching", f"model-card:{attempt}:outcome"])
-        self.assertEqual([c["state"] for c in self.fake.cards()[1:]], ["pending", "error"])
-        self.assertIn("unsent text in the core's input box", self.fake.cards()[-1]["text"])
+                         [f"model-card:{attempt}:switching-edit", f"model-card:{attempt}:outcome-edit"])
+        self.assertEqual([e for e, _ in self.fake.edits()], ["$card1", "$card1"])
+        self.assertIn("unsent text in the core's input box", self.fake.edits()[-1][1])
         self.assertEqual([(r["attempt"], r["told"], r["room"], r["model"], r["state"]) for r in mc.outcomes(self.ws)],
                          [(attempt, True, DM, "fable", "error")])
 
@@ -471,7 +503,7 @@ class Attempts(Base):
         newer = out["attempt"]
         self.assertEqual((rc, out["status"]), (0, "started"))
         self.assertNotIn("delivered", out)
-        self.assertEqual([c[2] for c in self.fake.calls[1:]], [f"model-card:{newer}:switching"])
+        self.assertEqual([c[2] for c in self.fake.calls[1:]], [f"model-card:{newer}:switching-edit"])
         self.assertEqual((self.owed(), self.superseded()), ([], ["17-ab"]))
         self.assertEqual([(r["attempt"], r["state"]) for r in mc.outcomes(self.ws)], [("17-ab", "error"), (newer, "started")])
         rc, out = self.run_(["post", "--room", DM])
@@ -515,7 +547,8 @@ class Attempts(Base):
         self.assertEqual(mc.tell(self.ws, out["attempt"], core=CORE, execute=self.fake.execute, now=mc.time.time()),
                          {"status": "failed", "why": "that attempt has no outcome yet"})
         self.assertEqual(self.run_(["post", "--room", DM])[1], {"status": "posted", "event_id": "$card3"})
-        self.assertEqual([c["state"] for c in self.fake.cards()], ["info", "pending", "info"])
+        self.assertEqual([c["state"] for c in self.fake.cards()], ["info", "info"])
+        self.assertEqual(len(self.fake.edits()), 1)
 
     def test_a_tap_whose_attempt_cannot_be_recorded_starts_nothing(self):
         import file_lock
@@ -623,11 +656,11 @@ class Manifest(Base):
         self.assertEqual((rc, out["status"], out["model"], out["say"]), (0, "started", "sonnet[1m]", say))
         argv = self.launch.calls[0][0]
         self.assertEqual((argv[6], argv[13]), ("sonnet[1m]", out["attempt"]))
-        self.assertEqual(self.fake.cards()[1]["text"], say)
+        self.assertEqual(self.fake.edits()[0][1], "Core model: " + say)
         rc, told = self.run_(["settle", "--room", DM, "--model", argv[6], "--attempt", argv[13], "--rc", "8"])
         self.assertEqual(told["say"], "I could not switch to Sonnet (1M context). I'm still using Fable (1M context). "
                                       "The core did not accept the switch in time.")
-        self.assertEqual(self.fake.cards()[2]["text"], told["say"])
+        self.assertEqual(self.fake.edits()[1][1], "Core model: " + told["say"])
         self.using("sonnet[1m]")
         self.assertEqual(self.run_(["settle", "--room", DM, "--model", "sonnet[1m]", "--rc", "0"])[1]["say"],
                          "Switched. I'm now using Sonnet (1M context).")
@@ -777,6 +810,19 @@ class Manifest(Base):
 class Edges(Base):
     """What a card says when the ledger, the card itself or the core's own row cannot be had."""
 
+    def test_a_card_outside_the_owner_dm_is_not_edited(self):
+        out = mc._edit(self.ws, "!elsewhere:s.space", "$e", "w", "op", core=CORE,
+                       execute=lambda *a, **k: self.fake.execute(*a, **k))
+        self.assertEqual(out, {"status": "failed", "why": "the card is not in the owner's DM"})
+        self.assertEqual(self.fake.calls, [])
+
+    def test_a_switching_card_that_cannot_be_kept_still_starts_the_switch(self):
+        self.using("opus")
+        self.run_(["post", "--room", DM])
+        with mock.patch.object(mc, "keep_card", side_effect=OSError("ro")):
+            rc, out = self.tap("fable")
+        self.assertEqual((rc, out["status"]), (0, "started"))
+
     def test_a_card_whose_record_cannot_be_written_is_posted_and_says_its_buttons_will_not_act(self):
         with mock.patch.object(mc.issued_cards, "record", side_effect=PermissionError("read-only")) as record:
             rc, out = self.run_(["post", "--room", DM])
@@ -815,7 +861,7 @@ class Edges(Base):
         rc, out, looked = reply()
         self.assertEqual((rc, out["status"], out["model"]), (0, "started", "fable"))
         self.assertEqual(len(self.launch.calls), 1)
-        self.assertEqual((looked, out["card_why"]), (2, "RuntimeError: no core lane"))
+        self.assertEqual((looked, out["card_why"]), (3, "RuntimeError: no core lane"))
         self.assertNotIn("event_id", out)
         self.assertEqual(len(self.fake.calls), 1, "no card is posted as a core that cannot be found")
 
@@ -926,6 +972,15 @@ class CodexCore(Base):
         self.assertIn("not switched yet", words)
         self.assertIn("I'm still using GPT A", words)
         self.assertEqual(mc.current_model(self.ws)["name"], "GPT A", "the menu marks the working model")
+        # Once the seat started a turn on the pick, that turn is on it: asked "which model", it says the pick.
+        import time as _time
+        self.using("gpt-b", runtime="codex", status="pending", working="gpt-a", accepted=False, rev=2,
+                   running={"model": "gpt-b", "rev": 2, "ts": _time.time()})
+        self.assertEqual(mc.current_model(self.ws)["name"], "GPT B")
+        self.using("gpt-b", runtime="codex", status="pending", working="gpt-a", accepted=False, rev=2,
+                   running={"model": "gpt-b", "rev": 2, "ts": _time.time() - 3 * 3600})
+        self.assertEqual(mc.current_model(self.ws)["name"], "GPT A", "a mark left hours ago is not a running turn")
+        self.using("gpt-b", runtime="codex", status="pending", working="gpt-a", accepted=False, rev=2)
         body, card = mc.notice_card(state, "Pending", words)
         self.assertEqual((card["state"], card["header"]["status"]["label"]), ("pending", "Pending"))
 

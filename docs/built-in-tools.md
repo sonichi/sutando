@@ -410,7 +410,12 @@ bash scripts/switch-model.sh opus --confirm         # a warm core asks to confir
 CLI…`); a non-zero exit is reported with its meaning from the list below, never as a switch. The
 current model is `model` in `<workspace>/state/model-switch.json` (`previous`, `ts` beside it);
 no file means no switch was recorded from here, so say the model is the runtime's default rather
-than guessing. The desktop's `core-model` local card (`agent-settings:core-runtime#model`) is the
+than guessing. **On a Codex core, do not read that file's `model` for "which model are you on":** a
+pick stays `pending` until a task has completed on it. Ask
+`python3 src/codex_core_model.py in-use --state-dir <workspace>/state`, which names the model the
+core is on right now: the pick itself while the task now running was started on it (the record's
+`running` mark), else the last model Codex took (`working`). If the record is still `pending` and
+`in-use` names the pick, say "I'm on <pick> for this task; it is confirmed when the task completes". The desktop's `core-model` local card (`agent-settings:core-runtime#model`) is the
 place to point an owner who wants to switch by hand.
 
 Types `/model <name>` into the live `sutando-core` pane through the shared sender, waits for the CLI
@@ -453,6 +458,41 @@ found on the launcher's own PATH (`src/agent/launch-path.sh --codex-path`), so t
 `cli/codex/bin` copy is used. It prints only the email, plan, workspace and login kind, never a token,
 and never print or quote `auth.json` yourself. Pool Codex workers run under the core's home today, so
 the core's answer is theirs too.
+
+## Switch the core's account
+
+Triggers, from the **owner in their DM only**: "switch account", "use my other account", "sign in
+with another account", "add an account", or a tap on the core account card. Post the card; never
+start a sign-in yourself and never take a sign-in code or token in chat (if the owner pastes one,
+do not use it: tell them to paste it in Settings, in the app's own box).
+
+```bash
+python3 skills/account-switch/scripts/account_card.py post --room <owner DM>   # the card
+python3 skills/account-switch/scripts/account_card.py status                   # the same facts as JSON
+```
+
+The card names the account in use (masked) and, on a Codex core, a "Use" button for each account
+saved on this Mac (the desktop's store), plus "Add another account", which points to Settings →
+Connections → the Sutando core's row → "Switch account". A tap on it reaches
+`account_card.py reply` through `src/agent_card.py click`; a "Use" tap restarts the core on the
+saved account and the card confirms the outcome in the DM. Details: `skills/account-switch/SKILL.md`.
+
+## Switch the core's runtime (Codex / Claude Code)
+
+Triggers, from the **owner in their DM only**: "switch to Claude Code", "use Codex", "run on Codex",
+"换成 Claude Code", "切到 Codex", or a tap on the core runtime card. Post the card; never run
+`start-cli.sh --runtime` or `--restart` from inside the core.
+
+```bash
+python3 skills/runtime-switch/scripts/runtime_card.py post --room <owner DM>   # the card
+python3 skills/runtime-switch/scripts/runtime_card.py status                   # the same facts as JSON
+```
+
+The card marks the runtime in use and offers "Codex" and "Claude Code". A tap checks the target is
+signed in before anything stops (otherwise it answers "Sign in first" with that runtime's sign-in
+controls in the card, keeps the tap, and switches by itself once the sign-in is there), then restarts the core onto it after the current turn and confirms in the DM from
+`state/core-runtime.json` and the desktop's selection. Tasks, memory and the workspace carry over; the
+live conversation does not. Details: `skills/runtime-switch/SKILL.md`.
 
 ## Check quota
 

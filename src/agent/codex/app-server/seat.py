@@ -633,6 +633,7 @@ class Seat:
         self.trial = None
         if sent and before:
             self.restore = before
+        self.unmark_running(rev)
         left = TRIAL_ATTEMPTS - self.attempts.get(rev, 0)
         if left > 0:
             log(f"model: no verdict on {picked} this turn; it stays pending ({left} more try)")
@@ -648,6 +649,25 @@ class Seat:
             self.notify("unconfirmed", f"I could not confirm the switch to {picked}: Codex did not finish a task on it in "
                                        f"{TRIAL_ATTEMPTS} tries, so I stopped trying it. The core stays on "
                                        f"{before or 'its default model'}; pick {picked} again to retry.\n")
+
+    def mark_running(self) -> None:
+        """Codex took turn/start with the pick: the record says this turn runs on it, so whatever the
+        turn itself reads about the core's model names the pick, not the model before it."""
+        if self.trial is None or not self.trial[3]:
+            return
+        picked, rev = self.trial[0], self.trial[1]
+        try:
+            codex_core_model.started(self.workspace / "state", picked, rev)
+        except OSError as e:
+            log(f"model: the switch record could not say the turn runs on {picked} ({one_line(e, 120)})")
+
+    def unmark_running(self, rev: Optional[int] = None) -> None:
+        if self.worker:
+            return
+        try:
+            codex_core_model.stopped(self.workspace / "state", rev)
+        except OSError as e:
+            log(f"model: the switch record's running mark could not be cleared ({one_line(e, 120)})")
 
     def notify(self, kind: str, text: str) -> None:
         try:
@@ -665,6 +685,7 @@ class Seat:
             return
         picked, rev, before, sent = self.trial
         self.trial = None
+        self.unmark_running(rev)    # this turn is over, whether or not its pick is still the newest
         try:
             if accepted:  # recorded even when a newer pick is pending: a restart then starts on it
                 codex_core_model.confirm(self.workspace / "state", picked, rev)
@@ -717,6 +738,7 @@ class Seat:
                 res = self.rpc.request("turn/start", params)
             turn_id = res["turn"]["id"]
             sent_model = params.get("model")
+            self.mark_running()
         except (RuntimeError, KeyError, TypeError) as e:
             return ("server-exited" if not self.rpc.alive() else "failed"), one_line(e, 240)
         log(f"task {filename}: turn started ({turn_id})")
@@ -928,12 +950,26 @@ class Seat:
         self.lock_fd = fd
         return True
 
+    def resume_runtime_wait(self, popen=None) -> None:
+        """The core is up: a sign-in a runtime card is waiting for gets its waiter back (a restart can
+        take it down with the core). Detached, core only, and never in the seat's way."""
+        script = REPO / "skills" / "runtime-switch" / "scripts" / "runtime_card.py"
+        if self.worker or not script.is_file() or not (self.workspace / "state" / "runtime-card-signin.json").is_file():
+            return
+        try:
+            (popen or subprocess.Popen)(
+                [sys.executable, str(script), "--workspace", str(self.workspace), "resume"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            log(f"the runtime card's sign-in wait was not resumed ({type(e).__name__})")
+
     def serve(self, once: bool = False, watcher: Optional[Watcher] = None) -> int:
         if not self.lock():
             log(f"another seat already serves {self.host.state}; not starting a second one")
             return EXIT_LOCKED
         mode = f"worker {self.worker}" if self.worker else "core"
         log(f"seat {self.seat} ({mode}) on codex app-server; inbox {self.host.inbox}; this panel is a read-only log")
+        self.unmark_running()   # a mark left by a seat that died mid-turn: no turn of this one is running
         ready = Path(self.host.state) / "ready"
         try:
             self.ensure_server()
@@ -941,6 +977,7 @@ class Seat:
             tmp = ready.with_name("ready.tmp")
             tmp.write_text(f"{os.getpid()}\n", encoding="utf-8")
             os.replace(tmp, ready)
+            self.resume_runtime_wait()
             self.watcher = watcher
             while not self.stopping:
                 if watcher is not None:
