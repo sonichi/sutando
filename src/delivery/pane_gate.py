@@ -99,8 +99,9 @@ TURN_SHORT = re.compile(r"[01]s")
 # pane returns to the idle footer, so no gate is on screen. Explicit list, extended by hand.
 LIMIT_REFUSAL = re.compile(
     r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit"
-    # The limit phrase must end its clause, so "used your weekly limit for uploads" is not one.
-    r"|(?:reached|used|exceeded) (?:all of )?your (?:session|usage|weekly) limit(?=[ \t]*(?:[·.!\n]|\Z))", re.I)
+    # The CLI's own line: "You've used your weekly limit · resets …" opening its row and ending its clause.
+    r"|(?:\A|(?<=\n)|(?<=⎿))[ \t⎿⚠]*You(?:'ve| have) (?:reached|used|exceeded) (?:all of )?your"
+    r" (?:session|usage|weekly) limit(?=[ \t]*(?:[·.!\n]|\Z))", re.I)
 REFUSAL = re.compile(
     LIMIT_REFUSAL.pattern
     # A bare "not logged in" is a refusal only as the CLI's own line-start `⎿` row.
@@ -146,9 +147,11 @@ def limit_standing(pane: Optional[str], runtime: Optional[str] = None, outrun: b
 
 _NUMBERED_ROW = re.compile(r"^\s*(?:❯\s*)?\d+\.\s")
 _CARET_ROW = re.compile(r"^\s*❯\s*\d+\.\s")
-# The limit menu's own choices: its title may be a "⎿" line, which the walk back skips as the turn.
-_LIMIT_MENU_ROW = re.compile(r"wait for (?:the |your )?(?:session |usage |weekly )?limit to reset|usage credits"
-                             r"|extra usage", re.I)
+# The CLI limit menu's own rows: its first option, and one of the others it always offers with it.
+_LIMIT_MENU_STOP = re.compile(r"^\s*(?:❯\s*)?1\.\s+Stop and wait for (?:the |your )?(?:session |usage |weekly )?"
+                              r"limit to reset\s*$", re.I)
+_LIMIT_MENU_MORE = re.compile(r"^\s*(?:❯\s*)?\d\.\s+(?:(?:Switch to|Add funds to continue with) (?:extra usage|usage "
+                              r"credits)|Wait here, then continue automatically\b)", re.I)
 
 
 def _dialog_names_limit(text: str) -> bool:
@@ -166,7 +169,8 @@ def _dialog_names_limit(text: str) -> bool:
         end += 1
     # Only a live dialog's rows (a caret on one): a numbered list in a reply is not a menu.
     live = any(_CARET_ROW.match(ln) for ln in lines[start:end + 1])
-    if live and any(_LIMIT_MENU_ROW.search(ln) for ln in lines[start:end + 1]):
+    menu = lines[start:end + 1]
+    if live and any(_LIMIT_MENU_STOP.match(ln) for ln in menu) and any(_LIMIT_MENU_MORE.match(ln) for ln in menu):
         return True
     for line in reversed(lines[:start]):
         core = line.strip()

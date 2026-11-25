@@ -1824,6 +1824,18 @@ class WeeklyLimit(unittest.TestCase):
         self.assertEqual(kind, "selection")
         self.assertTrue(pg.limit_line("  ⎿  Weekly limit · resets Nov 28 at 1pm"))
 
+    def test_an_ordinary_dialog_that_names_a_limit_is_not_the_limit(self):
+        question = ("Pick one\nDo you want to retry the upload now that the team reached your usage limit.\n"
+                    "❯ 1. Retry\n  2. Cancel\nEnter to confirm · Esc to cancel\n")
+        option = ("Pick one\nThe export is paused.\n❯ 1. Wait for the limit to reset\n  2. Cancel the export\n"
+                  "Enter to confirm · Esc to cancel\n")
+        for dialog in (question, option):
+            with self.subTest(dialog=dialog):
+                self.assertFalse(pg.is_usage_limit("selection", dialog))
+                self.assertFalse(pg.is_usage_limit("unknown", dialog))
+                self.assertFalse(any(pg.limit_line(ln) for ln in dialog.splitlines()))
+        self.assertTrue(pg.is_usage_limit("selection", self.MENU), "the CLI's own menu still is")
+
     def test_a_line_that_used_a_limit_on_something_else_is_no_refusal(self):
         line = "  ⎿  You've used your weekly limit for uploads; it resets on Monday"
         self.assertFalse(pg.limit_line(line))
