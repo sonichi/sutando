@@ -451,6 +451,101 @@ class KeyedChildStderr(unittest.TestCase):
                                                      key_source=lambda agent_id: SENTINEL))
 
 
+
+NOISY_AGY = r"""
+import json, os, sys
+err = sys.stderr.buffer
+for line in sys.stdin:
+    m = json.loads(line)
+    if m.get("method") == "initialize":
+        result = {"protocolVersion": 1, "authMethods": [{"id": "gemini-api-key"}]}
+    elif m.get("method") == "authenticate":
+        key = m["params"]["_meta"]["apiKey"].encode()
+        err.write(b"\xff\xfe not utf-8 \xc3\x28\n"); err.flush()
+        err.write(b"bad lead \xe2" + key + b"\xff tail\n"); err.flush()
+        err.write(b"split \x80" + key[:11]); err.flush()         # the key straddles two writes
+        err.write(key[11:] + b"\xf0\x9f end\n"); err.flush()
+        for n in range(4000):                                    # well past any pipe buffer
+            err.write(b"filler %05d \xff " % n + b"x" * 80 + b"\n")
+        err.write(b"after the flood " + key + b"\n"); err.flush()
+        result = {}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": result}), flush=True)
+"""
+
+
+class StderrThatIsNotUtf8(unittest.TestCase):
+    """Bytes that are not UTF-8 on the agent's stderr: the client keeps reading, so the agent is never
+    left blocked on a full pipe, and the key is still replaced before anything is stored."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="agy-noisy-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.script = self.tmp / "noisy_agy.py"
+        self.script.write_text(NOISY_AGY)
+        self.log = self.tmp / "agy.stderr.log"
+
+    def client(self):
+        return gc.AcpClient([sys.executable, str(self.script)], cwd=str(self.tmp), env=isolated_child_env(),
+                            stderr_path=str(self.log))
+
+    def test_the_agent_answers_after_writing_more_than_a_pipe_of_undecodable_stderr(self):
+        client = self.client()
+        try:
+            # The answer comes after ~400 KB of stderr: an agent blocked on the pipe would time out here.
+            keyed = gk.authenticate_with_app_key(client, client.initialize(10), 20, ["agy", "acp"],
+                                                 agent_id=AGENT, key_source=lambda agent_id: SENTINEL)
+            self.assertTrue(client._stderr_pump.is_alive(), "still reading while the agent lives")
+        finally:
+            client.close(5.0)
+        self.assertTrue(keyed)
+        raw = self.log.read_bytes()
+        stored = raw.decode("utf-8")                 # what is stored is valid UTF-8
+        self.assertNotIn(SENTINEL, stored)
+        self.assertNotIn(SENTINEL[:11], stored, "neither half of the key split across two writes")
+        self.assertNotIn(SENTINEL[11:], stored)
+        self.assertEqual(stored.count("[redacted]"), 3)
+        lines = stored.splitlines()
+        self.assertEqual(lines[1], "bad lead �[redacted]� tail")
+        self.assertEqual(lines[2], "split �[redacted]� end")
+        self.assertEqual(len([ln for ln in lines if ln.startswith("filler ")]), 4000, "nothing dropped")
+        self.assertEqual(lines[-1], "after the flood [redacted]")
+
+    def test_a_log_that_stops_taking_writes_does_not_stop_the_reading(self):
+        client = self.client()
+        try:
+            init = client.initialize(10)
+            client.err.close()                       # every later write to the log raises
+            keyed = gk.authenticate_with_app_key(client, init, 20, ["agy", "acp"], agent_id=AGENT,
+                                                 key_source=lambda agent_id: SENTINEL)
+        finally:
+            client.close(5.0)
+        self.assertTrue(keyed, "the agent wrote its whole flood and answered")
+        self.assertNotIn(SENTINEL.encode(), self.log.read_bytes())
+
+    def test_a_text_stream_and_a_closed_pipe(self):
+        class Lines:
+            def __init__(self, items):
+                self.items = list(items)
+
+            def readline(self):
+                item = self.items.pop(0)
+                if isinstance(item, BaseException):
+                    raise item
+                return item
+
+        def pumped(items):
+            client = gc.AcpClient.__new__(gc.AcpClient)
+            client.secrets, client.err = [SENTINEL], io.BytesIO()
+            client.p = mock.Mock(stderr=Lines(items))
+            client._pump_stderr()
+            return client.err.getvalue().decode("utf-8")
+
+        self.assertEqual(pumped(["key %s\n" % SENTINEL, ""]), "key [redacted]\n")
+        self.assertEqual(pumped([b"one\n", ValueError("read of closed file"), b"never\n"]), "one\n")
+
+
 class KeychainItem(unittest.TestCase):
     def test_unwraps_the_apps_base64_json(self):
         self.assertEqual(gk.unwrap(wrapped(DUMMY_KEY)), DUMMY_KEY)

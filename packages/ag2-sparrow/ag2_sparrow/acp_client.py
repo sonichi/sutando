@@ -80,16 +80,33 @@ class AcpClient:
         if secret:
             self.secrets.append(str(secret))
 
-    def scrubbed(self, text):
+    def _scrubbed_line(self, raw):
+        # Secrets are replaced on the bytes, before decoding: a byte that is not UTF-8 cannot hide one.
         for secret in list(self.secrets):
-            text = text.replace(secret, self.REDACTED)
-        return text
+            raw = raw.replace(secret.encode("utf-8"), self.REDACTED.encode("utf-8"))
+        return raw.decode("utf-8", "replace").encode("utf-8")
 
     def _pump_stderr(self):
-        with contextlib.suppress(OSError, ValueError):
-            for line in self.p.stderr:
-                self.err.write(self.scrubbed(line).encode("utf-8", "replace"))
+        # Reads bytes until the agent closes stderr: a line that will not decode or store is not a
+        # reason to stop, because an unread pipe fills and blocks the agent.
+        stream = getattr(self.p.stderr, "buffer", self.p.stderr)
+        storing = True
+        while True:
+            try:
+                raw = stream.readline()
+            except (OSError, ValueError):
+                return                    # the pipe itself is closed: nothing is left to drain
+            if not raw:
+                return
+            if isinstance(raw, str):
+                raw = raw.encode("utf-8", "replace")
+            if not storing:
+                continue
+            try:
+                self.err.write(self._scrubbed_line(raw))
                 self.err.flush()
+            except (OSError, ValueError):
+                storing = False           # the log is gone; keep reading so the agent never blocks
 
     def _reader(self):
         try:
