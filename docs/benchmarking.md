@@ -80,6 +80,11 @@ including when the other run is legacy. Read errors and invalid run JSON also
 exit 2; an observed regression still exits 1 only with `--fail-on-regression`.
 Saved runs reject duplicate JSON object keys, including conflicting or escaped
 duplicate case IDs inside a fingerprint map, rather than keeping the last value.
+The loader also validates the objects, numeric metrics and result rows needed
+by comparisons and reports. Non-object documents, missing reader fields,
+wrong field types and excessive JSON nesting are comparison input errors,
+rather than regression exits or tracebacks. Optional runtime provenance and
+unknown metadata remain supported for historical runs.
 
 Historical runs without the field remain readable and comparable. JSON
 `suite_compatibility` and the Markdown report explicitly mark shared definitions

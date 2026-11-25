@@ -1272,6 +1272,101 @@ class CaseDefinitionTests(unittest.TestCase):
                     self.assertIn("duplicate JSON object key", stderr.getvalue())
                     self.assertFalse((root / "comparison").exists())
 
+    def test_wrong_shaped_saved_runs_are_input_errors_without_artifact_changes(self):
+        invalid = [None, [], True, 0, "run", {}, {"kind": "sutando-benchmark-run"}]
+        for path, values in [
+            (("suite",), [None, []]), (("suite", "name"), [None, 0]),
+            (("subject",), [None, []]), (("subject", "label"), [None, []]),
+            (("subject", "runtime"), [False, [], "runtime"]),
+            (("subject", "runtime", "code"), [None, [], "code"]),
+            (("summary",), [None, []]),
+            (("summary", "attempts"), [None, True, -1, 1.5]),
+            (("summary", "passed"), [None, True, -1]),
+            (("summary", "no_response"), [None, False, -1]),
+            (("summary", "pass_rate"), [None, True, "1", -1, 1.1, 10 ** 400]),
+            (("summary", "latency_ms"), [None, []]),
+            (("summary", "latency_ms", "p50"), [False, "1", -1]),
+            (("summary", "latency_ms", "p95"), [True, "1", -1]),
+            (("summary", "latency_ms", "max"), [False, "1", -1]),
+            (("cases",), [None, {}, [None], [[]]]),
+            (("cases", 0, "case_id"), [None, []]),
+            (("cases", 0, "status"), [None, 1]),
+            (("cases", 0, "passed"), [None, 1, "true"]),
+            (("cases", 0, "repetition"), [None, True, 0]),
+            (("cases", 0, "latency_ms"), [None, True, -1, "10"]),
+        ]:
+            for value in values:
+                run = example_run()
+                target = run
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                invalid.append(run)
+        for path in [("suite",), ("summary",), ("subject",), ("cases",),
+                     ("summary", "latency_ms", "p50"), ("cases", 0, "status")]:
+            run = example_run()
+            target = run
+            for key in path[:-1]:
+                target = target[key]
+            del target[path[-1]]
+            invalid.append(run)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            baseline, _ = bench.write_run(example_run(), root / "baseline")
+            candidate = root / "candidate.json"
+            output = root / "comparison"
+            output.mkdir()
+            for name in ("comparison.json", "comparison.md"):
+                (output / name).write_text("keep existing artifact")
+            for value in invalid:
+                candidate.write_text(json.dumps(value))
+                with self.subTest(value=value):
+                    with self.assertRaises(ValueError):
+                        bench._load_run(candidate)
+                    for flags in ([], ["--fail-on-regression"]):
+                        stdout, stderr = io.StringIO(), io.StringIO()
+                        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                            rc = bench.main(["compare", str(baseline), str(candidate),
+                                             "--output", str(output)] + flags)
+                        self.assertEqual(rc, 2)
+                        self.assertEqual(stdout.getvalue(), "")
+                        self.assertIn("cannot compare runs", stderr.getvalue())
+                        self.assertNotIn("Traceback", stderr.getvalue())
+                        self.assertTrue(all(p.read_text() == "keep existing artifact"
+                                            for p in output.iterdir()))
+
+    def test_saved_run_nesting_limit_is_an_input_error(self):
+        depth = sys.getrecursionlimit() * 10
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "run.json"
+            path.write_text('[' * depth + '0' + ']' * depth)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                rc = bench.main(["compare", str(path), str(path), "--output", str(root / "output")])
+            self.assertEqual(rc, 2)
+            self.assertIn("saved-run JSON exceeds supported nesting", stderr.getvalue())
+            self.assertFalse((root / "output").exists())
+
+    def test_valid_legacy_optional_identity_and_unknown_fields_remain_readable(self):
+        for runtime in (None, {}, {"code": {}}):
+            with self.subTest(runtime=runtime), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                run = example_run()
+                run["subject"]["runtime"] = runtime
+                run["summary"]["latency_ms"] = {"p50": None, "p95": None, "max": None}
+                run["extra"] = {"metadata": [False, None, "future field"]}
+                path, _ = bench.write_run(run, root / "run")
+                loaded = bench._load_run(path)
+                self.assertEqual(loaded, run)
+                data, report = bench.compare_runs(loaded, loaded)
+                self.assertFalse(data["suite_compatibility"]["shared_case_definitions_verified"])
+                self.assertIn("baseline_case_definitions_unknown", report)
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    self.assertEqual(bench.main(["report", str(path)]), 0)
+                self.assertIn("Sutando benchmark report", stdout.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

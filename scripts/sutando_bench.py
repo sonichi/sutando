@@ -631,12 +631,61 @@ def write_run(run: Dict[str, Any], output: Path) -> Tuple[Path, Path]:
     return json_path, report_path
 
 
+def _validate_saved_run(data: Any) -> None:
+    if not isinstance(data, dict) or data.get("kind") != "sutando-benchmark-run":
+        raise ValueError("expected a Sutando benchmark run object")
+
+    def require(condition: bool, field: str) -> None:
+        if not condition:
+            raise ValueError(f"invalid benchmark run field: {field}")
+
+    def number(value: Any, field: str) -> None:
+        try:
+            valid = type(value) in (int, float) and math.isfinite(value) and value >= 0
+        except OverflowError:
+            valid = False
+        require(valid, field)
+
+    for field in ("suite", "subject", "summary"):
+        require(isinstance(data.get(field), dict), field)
+    require(isinstance(data["suite"].get("name"), str), "suite.name")
+    require(isinstance(data["subject"].get("label"), str), "subject.label")
+    runtime = data["subject"].get("runtime")
+    if runtime is not None:
+        require(isinstance(runtime, dict), "subject.runtime")
+        require(isinstance(runtime.get("code", {}), dict), "subject.runtime.code")
+    summary = data["summary"]
+    for field in ("attempts", "passed", "no_response"):
+        value = summary.get(field)
+        require(type(value) is int and value >= 0, "summary." + field)
+    number(summary.get("pass_rate"), "summary.pass_rate")
+    require(summary["pass_rate"] <= 1, "summary.pass_rate")
+    require(isinstance(summary.get("latency_ms"), dict), "summary.latency_ms")
+    for field in ("p50", "p95", "max"):
+        latency = summary["latency_ms"]
+        require(field in latency, "summary.latency_ms." + field)
+        if latency[field] is not None:
+            number(latency[field], "summary.latency_ms." + field)
+    require(isinstance(data.get("cases"), list), "cases")
+    for index, row in enumerate(data["cases"]):
+        prefix = f"cases[{index}]"
+        require(isinstance(row, dict), prefix)
+        for field in ("case_id", "status"):
+            require(isinstance(row.get(field), str), prefix + "." + field)
+        require(type(row.get("passed")) is bool, prefix + ".passed")
+        require(type(row.get("repetition")) is int and row["repetition"] > 0, prefix + ".repetition")
+        number(row.get("latency_ms"), prefix + ".latency_ms")
+    _read_case_fingerprints(data, {row["case_id"] for row in data["cases"]}, "saved run")
+
+
 def _load_run(path: Path) -> Dict[str, Any]:
     if path.is_dir():
         path = path / "run.json"
-    data = json.loads(path.read_text(), object_pairs_hook=_unique_json_object)
-    if data.get("kind") != "sutando-benchmark-run":
-        raise ValueError(f"not a Sutando benchmark run: {path}")
+    try:
+        data = json.loads(path.read_text(), object_pairs_hook=_unique_json_object)
+    except RecursionError as exc:
+        raise ValueError("saved-run JSON exceeds supported nesting") from exc
+    _validate_saved_run(data)
     return data
 
 
