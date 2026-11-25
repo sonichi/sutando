@@ -202,17 +202,32 @@ def configured_tmux(cfg: dict, environ=None, job: "cm.Shape | None" = None) -> "
     return (found[0], "") if found else ("", "the config records no TMUX and no tmux was found; run %s" % install)
 
 
-# Claude Code's usage-limit menu, by one of its own option rows at the foot of the pane. Words about a
-# limit anywhere else (an answer, a log line, the task's own text) are not the menu.
-_LIMIT_MENU_ROW = re.compile(r"^\s*[\u276f>]?\s*\d+\.\s+(?:wait for (?:the |your )?(?:[\w-]+ )?limit to reset"
-                             r"|switch to usage credits)\b", re.I)
+# Claude Code's usage-limit menu, whole and at the foot of the pane: its question, its option rows in
+# order (the first is the wait, one carries the selector) and its key hint. A line that reads like one of
+# its options (an answer, a list in the task's own text) is not the menu.
+_MENU_HEAD = re.compile(r"^\s*What do you want to do\?\s*$")
+_MENU_ROW = re.compile(r"^\s*(?P<sel>[\u276f>])?\s*(?P<n>\d+)\.\s+(?P<text>\S.*)$")
+_MENU_WAIT = re.compile(r"^(?:stop and )?wait for (?:the |your )?(?:[\w-]+ )?limit to reset\b", re.I)
+_MENU_FOOT = re.compile(r"\bEsc to cancel\b")
 LIMIT_MENU_LINES = 12
 
 
 def limit_menu(pane) -> bool:
-    """Whether the pane's last lines are the usage-limit menu: the dialog no turn gets past."""
+    """Whether the pane ends in the usage-limit menu, the dialog no turn gets past."""
     lines = [ln for ln in (pane or "").splitlines() if ln.strip()][-LIMIT_MENU_LINES:]
-    return any(_LIMIT_MENU_ROW.match(ln) for ln in lines)
+    if len(lines) < 4 or not _MENU_FOOT.search(lines[-1]):
+        return False
+    at, rows = len(lines) - 2, []
+    while at >= 0:
+        row = _MENU_ROW.match(lines[at])
+        if not row:
+            break
+        rows.insert(0, row)
+        at -= 1
+    if at < 0 or not _MENU_HEAD.match(lines[at]) or len(rows) < 2:
+        return False
+    return ([int(r.group("n")) for r in rows] == list(range(1, len(rows) + 1))
+            and sum(1 for r in rows if r.group("sel")) == 1 and bool(_MENU_WAIT.match(rows[0].group("text"))))
 
 
 class Tmux:
@@ -750,7 +765,7 @@ class Launcher:
             return False, rec
         outcome = self.stop_session(rec, "the account it is signed in with changed")
         if outcome != "stopped":
-            self.log("sign-in: restart not done (%s); trying again" % outcome)
+            self.signin_wait("restart not done (%s); trying again" % outcome)    # said once per reason
             return False, rec
         self.signin_waiting = False
         if rec.get("hitl"):

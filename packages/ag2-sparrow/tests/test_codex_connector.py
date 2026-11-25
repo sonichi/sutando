@@ -1440,6 +1440,36 @@ class EdgePathTest(unittest.TestCase):
             spawned = [c for c in spy.call_args_list if c.args and c.args[0] == "spawned"]
             self.assertEqual(len(spawned), 3, "initial + one restart per attempt")
 
+    def test_a_queued_task_is_served_when_the_restart_for_a_changed_sign_in_cannot_start(self):
+        """Reviewer, 2a02e558 (#6782): the restart closed the running server before making the new one;
+        when that could not start, the queued task went to the closed server, the error left serve()
+        and no result was written."""
+        real, made = cc.Rpc, []
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
+            auth = Path(home) / "auth.json"
+            auth.write_text(json.dumps({"tokens": {"account_id": "acct-1"}}))
+
+            def rpc(*a, **k):
+                if made:
+                    raise OSError("codex did not start")
+                made.append(real(*a, **k))
+                return made[0]
+
+            handshake = cc.Connector.handshake
+
+            def started(connector):
+                handshake(connector)
+                auth.write_text(json.dumps({"tokens": {"account_id": "acct-2"}}))   # switched under the running server
+
+            write_task(d, "task-chat-1", "still answered")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": home}), mock.patch.object(cc, "Rpc", rpc), \
+                    mock.patch.object(cc.Connector, "handshake", started), \
+                    mock.patch.object(cc, "log", wraps=cc.log) as spy:
+                self.assertEqual(run_connector(d, once=1), 0, "nothing escaped serve()")
+            self.assertTrue(result(d, "task-chat-1").startswith("STUB echo:"), "the running server served it")
+            logged = [" ".join(map(str, c.args)) for c in spy.call_args_list]
+            self.assertTrue(any("sign-in check failed" in l and "codex did not start" in l for l in logged), logged[-6:])
+
     def test_server_exit_mid_turn_guest_is_not_retried(self):
         with tempfile.TemporaryDirectory() as d:
             write_task(d, "task-chat-1", "[[die]] guest", tier="guest")

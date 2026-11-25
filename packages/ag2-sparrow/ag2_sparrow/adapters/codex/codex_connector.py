@@ -314,6 +314,7 @@ class Connector:
             lambda: signin_watch.codex_identity(home))
         self.signin_started, self.signin_account = self.signin_mark()
         self.signin_own = None    # the account (its fingerprint) the server's own finished sign-in wrote
+        self.signin_failed = ""   # why the last restart for a changed sign-in failed ('' when none did)
 
     @property
     def root(self):
@@ -604,6 +605,30 @@ class Connector:
         (self.signin_started, self.signin_account), self.signin_own = self.signin_mark(), None
         self.handshake()
 
+    def replace_server(self):
+        """Start a new app-server and move to it only once it has answered: until then, and when it
+        cannot be started, the running one keeps serving tasks. Then the old one is closed."""
+        old = self.rpc
+        log("starting a new app-server for the changed sign-in; old pid", old.p.pid)
+        new = self.rpc_factory()
+        self.rpc = new
+        try:
+            self.handshake()
+        except BaseException:
+            self.rpc = old
+            try:
+                new.close()
+            except Exception:  # noqa: BLE001 - it never served; the failure that matters is raised below
+                pass
+            raise
+        self.live = {}
+        self.thread_id = None
+        (self.signin_started, self.signin_account), self.signin_own = self.signin_mark(), None
+        try:
+            old.close()
+        except Exception as e:  # noqa: BLE001 - the new server serves; the old one is only left to exit
+            log("the old app-server did not close cleanly:", type(e).__name__)
+
     def signin_mark(self):
         """(the fingerprint of the sign-in now in auth.json, the fingerprint of its account alone: the
         account id and email, without the switch marker); (None, None) when it cannot be read."""
@@ -645,13 +670,10 @@ class Connector:
         if own == account and email and self.server_email().lower() == email.lower():
             self.signin_started, self.signin_account = mark, account
             return False
-        log("sign-in changed in auth.json; restarting Codex on the new account")
-        before = self.signin_started, self.signin_account
-        try:
-            self.restart_server()
-        except Exception:
-            self.signin_started, self.signin_account = before     # not restarted: the next check tries again
-            raise
+        if not self.signin_failed:
+            log("sign-in changed in auth.json; restarting Codex on the new account")
+        self.replace_server()       # raises with the old server still serving; the next check tries again
+        self.signin_failed = ""
         return True
 
     def wait_turn(self, turn_id, timeout):
@@ -796,7 +818,10 @@ class Connector:
             try:
                 self.signin_check()     # here no turn runs: the next task starts on the new account
             except Exception as e:  # noqa: BLE001 - a restart that failed is tried again; tasks are still served
-                log("sign-in check failed:", "%s: %s" % (type(e).__name__, e))
+                why = "%s: %s" % (type(e).__name__, e)
+                if why != self.signin_failed:       # said once per reason, not on every poll
+                    log("sign-in check failed; the running server keeps serving, and it is tried again:", why)
+                self.signin_failed = why
             names = self.pending_tasks(seen)
             if not names:
                 if self.args.once and done >= self.args.once:

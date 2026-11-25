@@ -137,7 +137,7 @@ class CodexRestart(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home)}):
             self.c = cc.Connector(factory, args, note="n")
         self.c.handshake = lambda: None
-        self.restarts = mock.patch.object(self.c, "restart_server", wraps=self.c.restart_server).start()
+        self.restarts = mock.patch.object(self.c, "replace_server", wraps=self.c.replace_server).start()
         self.addCleanup(mock.patch.stopall)
 
     def test_an_account_switch_restarts_the_server_exactly_once(self):
@@ -252,11 +252,54 @@ class CodexRestart(unittest.TestCase):
         with mock.patch.object(cc.connector_cards, "absorb"), mock.patch.object(cc, "log", lambda *a: logs.append(a)), \
                 mock.patch.object(type(self.c), "accounts", mock.PropertyMock()):
             self.c.serve()                                   # returns on idle-exit; the failure did not escape
+            self.c.serve()                                   # the next polls fail the same way
         self.assertIn("tasks", order, "tasks are still looked for")
-        self.assertTrue(any(a[0] == "sign-in check failed:" for a in logs))
-        self.assertGreaterEqual(self.restarts.call_count, 2, "and the restart is tried again")
+        self.assertEqual(sum(a[0].startswith("sign-in check failed") for a in logs), 1, "said once, not on every poll")
+        self.assertGreaterEqual(self.restarts.call_count, 3, "and the restart is tried again")
         self.restarts.side_effect = None
         self.assertTrue(self.c.signin_check(), "once it can start, it restarts on the new account")
+
+    def test_the_running_server_is_kept_until_the_new_one_has_answered(self):
+        """Reviewer, 2a02e558: the old server was closed before the new one was made, so a new one that
+        could not start left a closed server to take the next task."""
+        closed = []
+        old = self.c.rpc
+        old.close = lambda: closed.append("old")
+        write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
+        for broken in ("the factory", "the handshake"):
+            made = []
+
+            def factory(broken=broken, made=made):
+                if broken == "the factory":
+                    raise OSError("codex did not start")
+                made.append(Server("b@x.org"))
+                made[-1].close = lambda: closed.append("new")
+                return made[-1]
+
+            def handshake():
+                if self.c.rpc is not old:
+                    raise RuntimeError("no answer to initialize")
+
+            self.c.rpc_factory, self.c.handshake = factory, handshake
+            with self.subTest(broken), self.assertRaises((OSError, RuntimeError)):
+                self.c.signin_check()
+            self.assertIs(self.c.rpc, old, "still the running server")
+            self.assertNotIn("old", closed)
+            self.assertEqual(closed.count("new"), len(made), "a server that never answered is closed")
+            closed.clear()
+        # Once a new one answers, it takes over and only then is the old one closed.
+        order = []
+        self.c.rpc_factory = lambda: order.append("made") or Server("b@x.org")
+        self.c.handshake = lambda: order.append("answered")
+        old.close = lambda: order.append("old closed")
+        self.assertTrue(self.c.signin_check())
+        self.assertEqual(order, ["made", "answered", "old closed"])
+        self.assertIsNot(self.c.rpc, old)
+        self.assertFalse(self.c.signin_check())
+        # An old server that will not close does not undo the move.
+        write(self.home / "auth.json", codex_auth("acct-3", "c@x.org"))
+        self.c.rpc.close = mock.Mock(side_effect=OSError("already gone"))
+        self.assertTrue(self.c.signin_check())
 
     def test_the_shared_daemon_is_never_restarted(self):
         self.c.args.server = "proxy"
@@ -269,7 +312,17 @@ class CodexRestart(unittest.TestCase):
 
 GEN = {"nonce": "a" * 32, "pane_pid": 7, "session_id": "$1", "session_created": 5, "pane_id": "%1"}
 CONSUMER = {"pid": 11, "start": "s"}
-LIMIT = "You've hit your limit · resets 3pm\n❯ 1. Wait for limit to reset\n  2. Switch to usage credits"
+# The usage-limit menu as Claude Code draws it, under the turn that hit the limit.
+LIMIT = ("> summarize the thread\n"
+         "  \u23bf  You've hit your weekly limit \u00b7 resets Nov 28 at 1pm\n"
+         "\n"
+         " What do you want to do?\n"
+         "\n"
+         " \u276f 1. Stop and wait for limit to reset\n"
+         "   2. Wait here, then continue automatically at Nov 28 at 1pm\n"
+         "   3. Switch to usage credits\n"
+         "\n"
+         " Enter to confirm \u00b7 Esc to cancel\n")
 
 
 RULE = "\u2500" * 40
@@ -281,15 +334,32 @@ def box(*rows):
     return "\n".join([RULE, "\u276f " + first, *rest, RULE, "  \u23f5\u23f5 bypass permissions on"])
 
 
+STRAY_OPTION = "\u23fa Your options:\n  1. Stop and wait for limit to reset\n"     # prose that reads like a row
+
+
 class LimitMenu(unittest.TestCase):
-    def test_only_the_menus_own_option_rows_at_the_foot_of_the_pane_are_the_menu(self):
+    def test_only_the_whole_menu_at_the_foot_of_the_pane_is_the_menu(self):
         self.assertTrue(launcher.limit_menu(LIMIT))
-        self.assertTrue(launcher.limit_menu("  1. Wait for your weekly limit to reset\n\u276f 2. Switch to usage credits"))
-        for pane in ("", None, box(), "You've hit your usage limit, said the log line\n" + box(),
-                     "\u23fa The usage limit resets at 3pm; wait for limit to reset or switch to usage credits.\n" + box(),
-                     "\u276f write docs about the weekly limit and the usage limit\n" + box("usage limit"),
-                     LIMIT + "\n" + "\n".join("line %d" % i for i in range(launcher.LIMIT_MENU_LINES))):
-            self.assertFalse(launcher.limit_menu(pane), pane)
+        two = (" What do you want to do?\n   1. Stop and wait for limit to reset\n \u276f 2. Switch to extra usage\n"
+               " Enter to confirm \u00b7 Esc to cancel")
+        self.assertTrue(launcher.limit_menu(two), "two options, the selector on the second")
+        rows = LIMIT.splitlines()
+        for why, pane in (
+                ("nothing", ""), ("nothing", None), ("an empty box", box()),
+                ("one stray row over an empty box", STRAY_OPTION + box()),
+                ("one stray row at the very foot", STRAY_OPTION.rstrip("\n")),
+                ("every row, as prose over an empty box", "\n".join(rows[3:8]) + "\n" + box()),
+                ("words about a limit", "\u23fa The usage limit resets at 3pm; wait for limit to reset.\n" + box()),
+                ("no question above the rows", "\n".join(rows[4:])),
+                ("no key hint below them", "\n".join(rows[:8])),
+                ("one row only", "\n".join(rows[:6] + rows[8:])),
+                ("no selector", LIMIT.replace("\u276f", " ")),
+                ("two selectors", LIMIT.replace("   2.", " \u276f 2.")),
+                ("rows out of order", LIMIT.replace("3. Switch", "4. Switch")),
+                ("another dialog's rows", LIMIT.replace("Stop and wait for limit to reset", "Yes, proceed")),
+                ("the menu scrolled away", LIMIT + "\n".join("line %d" % i for i in range(launcher.LIMIT_MENU_LINES)))):
+            with self.subTest(why):
+                self.assertFalse(launcher.limit_menu(pane))
 
 
 class ClaudeRestart(unittest.TestCase):
@@ -392,6 +462,19 @@ class ClaudeRestart(unittest.TestCase):
         self.assertTrue(self.check())
         self.assertEqual((lc.keys, len(lc.stops)), ([], 1), "after the turn, and with no Escape: there was no menu")
 
+    def test_one_line_that_reads_like_a_menu_option_never_stops_a_running_turn(self):
+        """Reviewer, 2a02e558: one ordinary numbered line matching a quota option near the foot of the
+        pane, over an empty input box, was enough to press Escape and stop an active task."""
+        lc = self.lc
+        lc.observation = {"task": "task-1"}
+        write(self.conf, claude_conf("u-2", "b@x.org"))
+        for pane in (STRAY_OPTION + box(), "  1. Wait for limit to reset\n  2. Switch to usage credits\n" + box(),
+                     "\n".join(LIMIT.splitlines()[3:8]) + "\n" + box()):
+            lc.pane = pane
+            self.assertFalse(self.check())
+        self.assertEqual((lc.keys, lc.stops), ([], []), "no Escape, no stop: the turn is running")
+        self.assertEqual(sum("once the current turn ends" in l for l in lc.logs), 1)
+
     def test_an_unsent_draft_is_never_typed_over(self):
         """Reviewer, 47209797: with no task running the stop typed /exit and Enter over the owner's draft."""
         lc = self.lc
@@ -451,13 +534,16 @@ class ClaudeRestart(unittest.TestCase):
 
     def test_a_failed_stop_is_retried_and_counts_once(self):
         lc = self.lc
-        outcomes = iter(["busy: another pane-key sender holds the guard", "stopped"])
+        busy = "busy: another pane-key sender holds the guard"
+        outcomes = iter([busy, busy, busy, "stopped"])
         lc.stop_session = lambda rec, why: lc.stops.append(why) or next(outcomes)
         write(self.conf, claude_conf("u-2", "b@x.org"))
-        self.assertFalse(self.check())
+        for _ in range(3):
+            self.assertFalse(self.check())
         self.assertIsNotNone(lc.rec["generation"])
+        self.assertEqual(sum("restart not done" in l for l in lc.logs), 1, "said once, not every check")
         self.assertTrue(self.check())
-        self.assertEqual(len(lc.stops), 2)
+        self.assertEqual(len(lc.stops), 4)
 
 
 if __name__ == "__main__":
