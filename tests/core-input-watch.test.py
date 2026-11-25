@@ -760,6 +760,13 @@ class TestMovingTurnIsNotHung(unittest.TestCase):
         st, *_ = compose_state(_TURN_A, "unknown", True, prev_pane=_TURN_A)
         self.assertEqual(st, "hung")
 
+    def test_a_turn_drawn_as_its_spinner_alone_is_in_flight(self):
+        # Claude Code 2.1.322 prints no "esc to interrupt" while a turn runs.
+        a, b = (t.replace(" · esc to interrupt", "") for t in (_TURN_A, _TURN_B))
+        self.assertFalse(_mod.cli_wedge.frame_working(b))
+        self.assertEqual(compose_state(b, "unknown", True, prev_pane=a)[0], "running")
+        self.assertEqual(compose_state(a, "unknown", True, prev_pane=a)[0], "hung")
+
     def test_the_first_poll_has_no_motion_to_see(self):
         st, *_ = compose_state(_TURN_A, "unknown", True)
         self.assertEqual(st, "hung")

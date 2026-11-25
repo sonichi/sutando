@@ -377,6 +377,51 @@ class QuotedDialogAboveTheTurnIsTranscript(unittest.TestCase):
         self.assertEqual(pg.live_tail(["a", "b"]), ["a", "b"])
 
 
+class ASpinnerRowAloneIsATurnRunning(unittest.TestCase):
+    """Claude Code 2.1.322 draws a running turn as its spinner row alone, with no "esc to
+    interrupt" anywhere on the pane. A live capture (tool rows made generic): 19m into a turn."""
+
+    REAL = (Path(__file__).resolve().parent / "fixtures"
+            / "pane-claude-turn-in-flight-spinner-only.txt").read_text(encoding="utf-8")
+    SPINNER = next(ln for ln in REAL.splitlines() if "Shimmying" in ln)
+    TIP = next(ln for ln in REAL.splitlines() if "Tip:" in ln)
+    PERMISSION = "⏺ Bash(rm -rf build)\n  Do you want to proceed?\n  Allow this action\n  Esc to cancel\n"
+
+    def verdict(self, pane, adapter=pg.CLAUDE):
+        v = pg.classify_pane(pane, adapter)
+        return v.state, v.reason
+
+    def test_a_live_turn_without_the_busy_marker_is_working(self):
+        self.assertFalse(wedge.frame_working(self.REAL))
+        self.assertEqual(self.verdict(self.REAL), ("busy", "working"))
+        self.assertTrue(pg.accepts_input(pg.classify_pane(self.REAL, pg.CLAUDE)))
+
+    def test_a_turn_seconds_old_is_working_from_its_first_second(self):
+        fresh = self.REAL.replace("19m 30s", "2s")
+        self.assertNotEqual(fresh, self.REAL)
+        self.assertFalse(pg.turn_in_flight(fresh))  # the limit-outrun threshold is unchanged
+        self.assertEqual(self.verdict(fresh), ("busy", "working"))
+
+    def test_control_a_finished_turn_is_idle_ready(self):
+        done = self.REAL.replace(f"{self.SPINNER}\n{self.TIP}\n", "✻ Cooked for 2m 3s\n")
+        self.assertNotIn("Shimmying", done)
+        self.assertEqual(self.verdict(done), ("idle-ready", "idle footer or empty composer"))
+
+    def test_control_a_spinner_under_a_later_finished_turn_is_history(self):
+        later = self.REAL.replace(f"{self.TIP}\n", f"{self.TIP}\n⏺ Done.\n✻ Cooked for 2m 3s\n")
+        self.assertEqual(self.verdict(later), ("idle-ready", "idle footer or empty composer"))
+
+    def test_control_a_dialog_under_the_spinner_still_holds_its_gate(self):
+        rows = self.REAL.splitlines()
+        at = rows.index(self.TIP) + 1
+        pane = "\n".join(rows[:at]) + "\n" + self.PERMISSION + rows[-1] + "\n"
+        self.assertEqual(self.verdict(pane), ("busy", "permission"))
+
+    def test_control_a_codex_pane_quoting_a_claude_spinner_stays_idle(self):
+        quoted = f"  ⎿  {pg.SGR_STRIP.sub('', self.SPINNER)}\n{CODEX_IDLE}"
+        self.assertEqual(self.verdict(quoted, pg.CODEX)[0], "idle-ready")
+
+
 class GateSignaturesNeedACurrentAffordance(unittest.TestCase):
     """A finished turn's prose above the runtime's empty composer is history; only a dialog that
     shows how to answer it (caret on a numbered row, an Enter/Esc hint) holds the pane."""
@@ -1692,6 +1737,15 @@ class LimitHolds(unittest.TestCase):
                         "──────── seat-1 ─\n❯ \n────────\n  ⚠ Usage limit reached · limit resets Oct 13 at 11pm\n"):
             with self.subTest(capture=capture):
                 self.assertFalse(self.holds(capture))
+
+    REFUSED = "  ⎿  You've hit your weekly limit · resets 2pm (UTC)\n"
+
+    def test_a_turn_seconds_old_refuses_without_the_busy_marker(self):
+        # A recovery line's own turn shows a spinner before any refusal: a second send doubles it.
+        self.assertFalse(self.holds(self.REFUSED + "✳ Moonwalking… (3s · ↓ 12 tokens)\n❯ \n"))
+
+    def test_control_a_spinner_waiting_on_a_retry_still_holds(self):
+        self.assertTrue(self.holds(self.REFUSED + "✳ Moonwalking… (retrying in 30s · attempt 3/10 · 2m 37s)\n❯ \n"))
 
     def test_cli_exit_codes(self):
         for capture, code in ((self.GATE, 0), ("❯ \n", pg.EXIT_UNSAFE)):
