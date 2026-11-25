@@ -9,7 +9,11 @@ import argparse
 import contextlib
 import importlib
 import io
+import json
+import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -20,7 +24,7 @@ from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
 isolate_os_environ()
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from ag2_sparrow import connect_common as cm  # noqa: E402
+from ag2_sparrow import connect_common as cm, holder_lock, task_io  # noqa: E402
 
 claude, codex, agy, openclaw = (importlib.import_module("ag2_sparrow.adapters." + name) for name in (
     "claude_code.cli", "codex.connect_cli", "antigravity.cli", "openclaw.cli"))
@@ -94,6 +98,71 @@ class ReplaceInstall(unittest.TestCase):
                     with self.assertRaises(RuntimeError):
                         mod.main(["install", "--agent", "@helper:s.example", "--replace-install"])
                 self.assertIs(read.call_args.args[0].replace_install, True)
+
+
+class AfterTheHostWasRenamed(unittest.TestCase):
+    """The state an updated app found: the agent's own job, up through a network change, holds its own folder
+    under the name the Mac had when it started; install --agent for that agent runs from the newer environment."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(os.path.realpath(tmp.name))
+        self.root = self.home / "agents" / "helper"
+        self.root.mkdir(parents=True)
+        for target, name, value in ((holder_lock, "_home", lambda: str(self.home)), (holder_lock, "_HOST_NAME_DRIFTS", True)):
+            patch = mock.patch.object(target, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(cm.take_over, argparse.Namespace())
+        cm.take_over(argparse.Namespace(replace_install=True))
+
+    def session(self, adapter, host="mac.lan"):
+        """A live process recorded as `adapter`'s holder of the root by the 0.11.0 environment, under `host`."""
+        proc = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(proc.wait, 30)
+        self.addCleanup(proc.kill)
+        start = holder_lock.start_time(proc.pid)
+        rec = {"schema": 2, "adapter": adapter, "pid": proc.pid, "start": start, "host": host, "install_id": OLD,
+               "lock": {"dev": 1, "ino": 2}, "acquired_at": 1.5, "owner_pid": proc.pid, "owner_start": start,
+               "consumer": None, "tombstone": None}
+        directory = Path(holder_lock.lock_dir(str(self.root)))
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / holder_lock.HOLDER_NAME).write_text(json.dumps(rec))
+        return proc
+
+    def held(self, shape, job):
+        """_managed_here over the real record: the job records the root and the manager runs it as pid `job`."""
+        with contextlib.ExitStack() as stack:
+            for name, value in (("owned_config", ({"ROOT": str(self.root)}, "")), ("install_id", NEW), ("manager_pid", job),
+                                ("_parent_pid", 1), ("_spawning_launcher", None)):
+                stack.enter_context(mock.patch.object(cm, name, return_value=value))
+            return cm._managed_here(shape, str(self.root))
+
+    def test_the_agents_own_job_is_taken_over_on_every_local_adapter(self):
+        self.assertNotEqual(holder_lock._host(), "mac.lan")
+        for mod in (agy, claude, codex):
+            with self.subTest(adapter=mod.COMMAND):
+                proc = self.session(mod.LOCAL.name)
+                self.assertIs(task_io.lock_holder(str(self.root))["live"], True)
+                self.assertEqual(self.held(mod.LOCAL, job=proc.pid), "")
+
+    def test_a_different_holder_is_still_refused(self):
+        shape = agy.LOCAL
+        proc = self.session(shape.name)
+        self.assertIn("is not the process", self.held(shape, job=proc.pid + 1), "a session the job does not run")
+        self.session(codex.LOCAL.name)
+        self.assertIn(f"is held by {codex.LOCAL.name} pid", self.held(shape, job=proc.pid), "another adapter's session")
+        proc = self.session(shape.name)
+        proc.kill()
+        proc.wait(30)
+        self.assertIn("a holder with no live record", self.held(shape, job=proc.pid), "a dead session's record")
+
+    def test_where_a_name_identifies_the_machine_another_hosts_record_is_refused(self):
+        shape = agy.LOCAL
+        proc = self.session(shape.name)
+        with mock.patch.object(holder_lock, "_HOST_NAME_DRIFTS", False):
+            self.assertIn("a holder with no live record", self.held(shape, job=proc.pid))
 
 
 if __name__ == "__main__":
