@@ -35,7 +35,7 @@ from ...acp_host import (MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStor
 from ...relay_loop import count_arg
 from ...task_io import (NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock, turn_policy, exit_code,
                         exit_on_sigterm, holder_consumer, load_done, make_dirs, parse_task, record_done,
-                        release_lock, root_path, stop_requested)
+                        refusal_body, release_lock, root_path, stop_requested)
 from .acp_client import AcpClient
 
 ANSWERED_DIR = "openclaw-answered"     # under state/: one O_EXCL claim per answered task
@@ -243,7 +243,8 @@ class Connector:
         if not policy.served or policy.capabilities.workspace != "owner":
             log("refused (non-owner%s) ->" % ("" if policy.served else ", " + policy.unlock + " not set"),
                 task_id, headers["access_tier"])
-            answer_once(self.args.state, task_id, os.path.join(self.args.results, name), NON_OWNER_REFUSED)
+            answer_once(self.args.state, task_id, os.path.join(self.args.results, name),
+                        refusal_body(headers, self.args.state))
             return {"task": task_id, "status": "refused", "tier": headers["access_tier"]}
         prompt = wake_prompt(task_id, headers, message, operator_lines, result_file, self.args.reply_command,
                              self.note)

@@ -53,7 +53,7 @@
    ],
    "status": "canonical",
    "canonical_for": "running, attributing, reporting, and comparing black-box Sutando benchmarks",
-   "last_verified": "2026-11-19"
+   "last_verified": "2026-11-24"
   },
   "docs/benchmark-reports/2026-08-24-3a73e03.md": {
    "title": "Sutando comprehensive benchmark — 2026-08-24",
@@ -106,7 +106,7 @@
    ],
    "status": "active",
    "canonical_for": "Codex core setup, earned-reset policy, and rollback",
-   "last_verified": "2026-11-22"
+   "last_verified": "2026-11-24"
   },
   "docs/community-use-cases/README.md": {
    "title": "Community use cases",
@@ -617,7 +617,7 @@
    ],
    "status": "canonical",
    "canonical_for": "the core recovery record state/core-recovery.json: its states, fields, bounds, runtimes, single writer and the core_recovery.v1 contract fixtures",
-   "last_verified": "2026-11-22"
+   "last_verified": "2026-11-24"
   }
  }
 }

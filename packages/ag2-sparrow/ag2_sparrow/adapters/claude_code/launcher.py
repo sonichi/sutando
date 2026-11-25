@@ -46,18 +46,8 @@ MODEL_ACCEPT_S = 20.0
 MODEL_RE, MODEL_SET, MODEL_CONFIRM = claude_model_switch.MODEL_RE, claude_model_switch.MODEL_SET, claude_model_switch.MODEL_CONFIRM
 composer_text, accepted_count = claude_model_switch.composer_text, claude_model_switch.accepted_count
 composer_boxed, composer_typed = claude_model_switch.composer_boxed, claude_model_switch.composer_typed
-MODEL_RECORD = ("state", "model-switch.json")
-
-
-def switched_model(root) -> str:
-    """The model the last switch through `switch_model` landed on, '' when there has been none. The
-    session's own settings live in Claude Code's config dir, which this adapter does not read."""
-    try:
-        with open(Path(root).joinpath(*MODEL_RECORD), encoding="utf-8") as f:
-            record = json.load(f)
-    except (OSError, ValueError):
-        return ""
-    return str(record.get("model") or "") if isinstance(record, dict) else ""
+MODEL_RECORD = hold.MODEL_RECORD
+switched_model = hold.switched_model
 FIELD_SEP = "|:ag2:|"
 START_COMMAND_RE = re.compile(r'^"?ag2-sparrow-claude-local hold --generation=[0-9a-f]{32} --"?$')
 TMUX_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
@@ -661,11 +651,11 @@ class Launcher:
             text = self.tm.capture(gen["pane_id"]) or ""
             if accepted_count(model, text) > before:
                 self.log("model: switched to %s" % model)
-                with contextlib.suppress(OSError):   # the switch happened whether or not it is recorded
-                    path = Path(self.root).joinpath(*MODEL_RECORD)
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.with_name(path.name + ".tmp").write_text(json.dumps({"model": model, "at": self.clock()}))
-                    os.replace(path.with_name(path.name + ".tmp"), path)
+                # The switch happened whether or not it is recorded. The writer's private temp is named as
+                # the start check knows one, so a stop mid-write is swept.
+                with contextlib.suppress(OSError, records.RecordError):
+                    records.write_durable(Path(self.root).joinpath(*MODEL_RECORD),
+                                          json.dumps({"model": model, "at": self.clock()}).encode())
                 return True, "switched to %s" % model
             if text.count(MODEL_CONFIRM) > asked and not answered:
                 if not confirm:

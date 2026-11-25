@@ -107,6 +107,29 @@ class ConnectorCards(unittest.TestCase):
         self.assertEqual(cc.Poster(self.state, lambda p: {"ok": True}, log=self.logs.append, clock=lambda: 1000.0).sweep(), 0)
         self.assertEqual(len(list((self.state / "agent-cards" / "outbox").iterdir())), 2)
 
+    def test_a_keyed_card_queued_again_is_one_card_before_and_after_it_is_posted(self):
+        body, card = model_card()
+        first = cc.queue(self.state, ROOM, body, card, key="notice-1", at_ns=1234)
+        self.assertEqual(cc.queue(self.state, ROOM, body, card, key="notice-1", at_ns=1234), first)
+        self.assertEqual(len(list((self.state / "agent-cards" / "outbox").iterdir())), 1, "queued once")
+        self.assertEqual(self.poster().sweep(), 1)
+        self.assertEqual(cc.absorb(self.state, self.root), 1)
+        # After it was posted and recorded, the same call is still not a second card.
+        self.assertEqual(cc.queue(self.state, ROOM, body, card, key="notice-1", at_ns=1234), first)
+        self.assertEqual((self.poster().sweep(), len(self.sent)), (0, 1))
+        # Another key is another card, and keyed cards keep the order of the moment they were decided.
+        later = cc.queue(self.state, ROOM, body, card, key="notice-2", at_ns=5000)
+        earlier = cc.queue(self.state, ROOM, body, card, key="notice-0", at_ns=100)
+        self.assertLess(earlier, later)
+        self.assertEqual(self.poster().sweep(), 2)
+        # A marker older than a week is forgotten the next time a keyed card is queued.
+        old = self.state / "agent-cards" / "keys" / first
+        os.utime(old, (1.0, 1.0))
+        cc.queue(self.state, ROOM, body, card, key="notice-3", at_ns=6000)
+        self.assertFalse(old.exists())
+        with mock.patch.object(Path, "iterdir", side_effect=OSError("gone")):
+            cc._forget_old_keys(self.state / "agent-cards" / "keys")
+
     def test_a_card_that_would_not_render_or_has_no_room_is_refused_at_the_queue(self):
         body, card = model_card()
         for room, line, bad in (("", body, card), ("not-a-room", body, card), (ROOM, "", card),

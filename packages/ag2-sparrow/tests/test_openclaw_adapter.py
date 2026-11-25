@@ -265,9 +265,14 @@ class ConnectorTest(unittest.TestCase):
     def test_a_restricted_turn_is_refused_under_allow_non_owner_without_waking_openclaw(self):
         for tier in ("guest", "team"):
             with self.subTest(tier=tier):
-                self.w.task("task-" + tier, "STUB:OUTSIDE go", tier=tier)
+                self.w.task("task-" + tier, "STUB:OUTSIDE go", tier=tier, user="@%s:s.space" % tier)
                 self.w.serve(allow_non_owner=True)
                 self.assertEqual(self.w.result("task-" + tier), task_io.NON_OWNER_REFUSED)
+        # The same sender in the same room again, and another agent: answered, with nothing posted.
+        for tid, user in (("task-again", "@guest:s.space"), ("task-agent", "@blue.agent:s.space")):
+            self.w.task(tid, "STUB:OUTSIDE go", tier="guest", user=user)
+            self.w.serve(allow_non_owner=True)
+            self.assertEqual(self.w.result(tid), task_io.REFUSED_QUIETLY, tid)
         self.assertEqual(self.w.methods(), [], "no ACP process, working directory or Session is used")
         self.assertFalse((self.w.root / "state" / "sessions.json").exists())
 
