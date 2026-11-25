@@ -400,13 +400,14 @@ class Connector:
         self.turn_items = {}
         self.rerouted = ""        # the model Codex moved the current turn to, when it said so
         self._models = self._accounts = self._quota = None
-        self.rate_limits = {}     # the last `account/rateLimits/updated` snapshot
-        self.turn_limit = None    # the current turn's error, when it said the account is out of usage
-        self.turn_unauth = None   # the current turn's error, when it said the login no longer works
-        self.turn_worked = False  # the current turn said or did something before it ended
-        self.auth_stale = False   # a sign-in finished: the running server may still hold the old tokens
-        self.auth_seen = auth_print()   # the login on disk when the running server was started
-        self.auth_note = ""       # what was done about the login for the current task, for its metrics row
+        self.rate_limits = {}
+        # The current turn's error when it said the account is out of usage, or its login no longer works.
+        self.turn_limit = self.turn_unauth = None
+        self.turn_worked = False
+        # A sign-in finished: the running server may still hold the tokens it started with.
+        self.auth_stale = False
+        self.auth_seen = auth_print()
+        self.auth_note = ""
 
     @property
     def root(self):
