@@ -85,7 +85,9 @@ for dependency in codex tmux fswatch; do
   fi
 done
 if ! codex login status >/dev/null 2>&1; then
-  echo "launch-codex-worker-session: Codex is not authenticated" >&2
+  # The home codex itself read, which may differ from a signed-in ~/.codex.
+  checked_home="${CODEX_HOME:-$HOME/.codex}"
+  echo "launch-codex-worker-session: Codex is not authenticated in $checked_home (Sutando's Codex home). Sign in with: CODEX_HOME=\"$checked_home\" codex login" >&2
   exit 1
 fi
 if tmux -S "$SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
