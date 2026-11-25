@@ -1264,7 +1264,7 @@ class Switch(Base):
         self.assertEqual(out["outcome"], "info")
         self.assertIn("config still names Codex", out["say"])
 
-    def failing_switch(self, back_ok, back_rc=None):
+    def failing_switch(self, back_ok, back_rc=None, panes_after=None):
         """The restart onto Claude Code fails and leaves no core; the relaunch of Codex comes back or not."""
         self.record("codex", T0 - 600)
         before = self.ws.joinpath(*rtc.RECORD).read_text()
@@ -1275,6 +1275,7 @@ class Switch(Base):
             self.clock.t += 30
             if rt == "claude":
                 self.ws.joinpath(*rtc.RECORD).unlink()
+                self.panes = self.panes if panes_after is None else panes_after
                 return 1
             seen.append(self.ws.joinpath(*rtc.RECORD).read_text())
             if back_ok:
@@ -1320,10 +1321,18 @@ class Switch(Base):
                 self.restarts.clear()
                 self.ws.joinpath(*rtc.RUNNING).write_text(json.dumps(
                     {"attempt": self.attempt, "runtime": "claude", "room": DM, "ts": self.clock.t}))
-                with mock.patch.object(account_card, "fresh_beat", lambda ws, since: since > T0):
-                    out = self.failing_switch(back_ok=False, back_rc=code)
+                self.panes = ("codex",)
+                out = self.failing_switch(back_ok=False, back_rc=code)
                 self.assertTrue(out["say"].endswith("The core is still on Codex."), out["say"])
                 self.assertNotIn("may be down", out["say"])
+
+    def test_a_beating_core_on_another_runtime_is_not_the_old_runtime_still_running(self):
+        # Codex ran before the switch; afterwards a beating core runs Claude Code, not Codex.
+        self.panes = ("codex",)
+        with mock.patch.object(account_card, "fresh_beat", lambda ws, since: True):
+            out = self.failing_switch(back_ok=False, back_rc=rtc.DEFERRED, panes_after=("claude",))
+        self.assertNotIn("still on Codex", out["say"])
+        self.assertIn("may be down", out["say"])
 
     def test_a_put_off_relaunch_with_no_heartbeat_says_the_core_may_be_down(self):
         # The forward launch ended the old session and failed; the relaunch was put off: nothing runs.

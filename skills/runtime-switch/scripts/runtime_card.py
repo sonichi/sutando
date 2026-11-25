@@ -990,9 +990,8 @@ def fall_back(ws: Path, room: str, rt: str, was: str, attempt: str, got: dict, r
     gateway = restore_desktop_gateway(run) if back_rc not in NOT_RESTARTED else ""
     back = confirm(ws, was, since, sleep=sleep, clock=clock)
     lead = f"Couldn't switch to {name(rt)}: {why_not(rt, got, rc)}."
-    import account_card
-    if back_rc in NOT_RESTARTED and not back["core"] and account_card.fresh_beat(ws, since):
-        words = f"{lead} The core is still on {name(was)}."   # stopped nothing, and the core still beats
+    if back_rc in NOT_RESTARTED and not back["core"] and running_runtimes() == {was}:
+        words = f"{lead} The core is still on {name(was)}."   # stopped nothing, and its panes still run it
     elif back["core"]:
         words = f"{lead} I started {name(was)} again, and the core is running on it."
     else:
