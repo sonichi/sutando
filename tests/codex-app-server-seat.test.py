@@ -519,6 +519,15 @@ class HandshakeAndThread(SeatCase):
             self.assertIsNone(self.make(decl).claim_copies())
         self.assertIn("could not be listed", self.out.getvalue())
 
+    def test_a_seat_that_cannot_take_the_second_lock_serves_without_it(self):
+        decl = self.declaration()
+        decl.parent.mkdir(parents=True, exist_ok=True)
+        other = os.open(decl.parent / "taking.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, other)
+        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        s = self.start(decl)
+        self.assertIsNone(s.claim_fd)
+
     def test_a_seat_stopping_gives_up_the_claim_with_the_lock(self):
         decl = self.declaration()
         s = self.make(decl)

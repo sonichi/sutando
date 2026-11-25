@@ -1397,6 +1397,20 @@ class Hooks(unittest.TestCase):
         with mock.patch.object(gw.Path, "glob", side_effect=OSError("denied")):
             self.assertFalse(gw._seat_took("task-unreadable-seat", 0.0))
 
+    def test_a_copy_or_a_lock_that_cannot_be_examined_takes_nothing(self):
+        gone = mock.Mock(stat=mock.Mock(side_effect=OSError("vanished")))
+        with mock.patch.object(gw.Path, "glob", return_value=[gone]):
+            self.assertFalse(gw._seat_took("task-vanished-copy", 0.0), "a copy removed between listing and stat")
+        tid = "task-unexaminable-lock"
+        lock = self.seat_copy(tid).parent.parent / "taking.lock"
+        self.assertTrue(gw._seat_lock_held(lock))
+        self.assertFalse(gw._seat_lock_held(lock.with_name("no-such.lock")), "no lock file: no seat")
+        import fcntl
+        with mock.patch.object(fcntl, "flock", side_effect=OSError("io error")):
+            self.assertFalse(gw._seat_lock_held(lock), "a lock that cannot be probed proves nothing")
+        with mock.patch.dict(sys.modules, {"fcntl": None}):
+            self.assertFalse(gw._seat_lock_held(lock), "no flock on this platform: nothing is vouched for")
+
     def test_a_closed_task_the_core_claimed_first_is_stopped(self):
         tid = "task-closed-claimed"
         self.assertTrue(gw._take_served_task(_task(tid), set(), []))
