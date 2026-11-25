@@ -471,6 +471,15 @@ class GateSignaturesNeedACurrentAffordance(unittest.TestCase):
                     "› 1. Yes, proceed\n  2. No, and tell Codex what to do differently (esc)\n")
         self.assertEqual(pg.classify_pane(approval, pg.CODEX).state, "busy")
 
+    def test_a_codex_picker_quoting_a_limit_still_asks_for_a_selection(self):
+        dialog = ("The export says you hit your usage limit. What should it do?\n"
+                  "› 1. Retry\n  2. Exit\n  Press enter to confirm or esc to go back\n")
+        v = pg.classify_pane(dialog, pg.CODEX)
+        self.assertEqual((v.state, v.reason), ("busy", "selection"))
+        self.assertFalse(pg.is_usage_limit(v.reason, dialog))
+        banner = "You've hit your weekly limit · resets at 3pm\n" + dialog
+        self.assertEqual(pg.classify_pane(banner, pg.CODEX).reason, "session-limit")
+
     def test_select_prose_above_the_claude_composer_is_idle_ready_and_a_row_picker_is_busy(self):
         self.assertEqual(state(f"● Select the best file for the user.\n{CLAUDE_IDLE}", "claude"), "idle-ready")
         self.assertEqual(state("● Select the best file.\n❯ 1. main.py\n  2. util.py\n", "claude"), "busy")
@@ -1784,6 +1793,63 @@ class LimitHolds(unittest.TestCase):
             with mock.patch.object(sys, "stdin", io.StringIO(capture)), \
                     contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(pg.main(["limit-holds", "--runtime", "claude"]), code)
+
+
+class WeeklyLimit(unittest.TestCase):
+    """The weekly limit's screen and its /rate-limit-options menu are a usage limit, not a plain
+    selection, so the core's quota card is posted for it."""
+
+    MENU = ("  ⎿  You've used your weekly limit · resets Nov 28 at 1pm (UTC)\n"
+            "❯ /rate-limit-options\n"
+            "What do you want to do?\n"
+            "❯ 1. Stop and wait for the weekly limit to reset\n"
+            "  2. Add funds to continue with usage credits\n"
+            "Enter to confirm · Esc to cancel\n")
+
+    def test_the_weekly_menu_and_its_title_are_a_usage_limit(self):
+        self.assertTrue(pg.is_usage_limit("selection", self.MENU))
+        self.assertTrue(pg.limit_line("Weekly limit · resets Nov 28 at 1pm"))
+        self.assertTrue(pg.limit_line("You've reached your weekly limit."))
+        self.assertTrue(pg.is_usage_limit("turn-rejected", "⎿  You've used your weekly limit · resets Nov 28"))
+
+    def test_the_vms_own_weekly_screen_is_a_usage_limit(self):
+        vm = ("  ⎿  You've hit your weekly limit · resets Nov 28 at 1pm (UTC)\n❯ /rate-limit-options\n"
+              "What do you want to do?\n❯ 1. Stop and wait for limit to reset\n"
+              "  2. Wait here, then continue automatically at Nov 28 at 1pm\n  3. Switch to usage credits\n"
+              "Enter to confirm · Esc to cancel\n")
+        self.assertTrue(pg.is_usage_limit("selection", vm))
+
+    def test_an_ordinary_menu_or_reply_is_not(self):
+        menu = "Pick one\n❯ 1. Keep the weekly report\n  2. Drop it\nEnter to confirm · Esc to cancel\n"
+        self.assertFalse(pg.is_usage_limit("selection", menu))
+        self.assertFalse(pg.limit_line("The weekly report resets the counters."))
+
+    def test_an_option_naming_a_limit_and_a_reset_is_not(self):
+        option = "your weekly limit for uploads resets on Monday"
+        menu = f"Pick one\n❯ 1. Upload now\n  2. {option}\nEnter to confirm · Esc to cancel\n"
+        self.assertFalse(pg.limit_line(option))
+        self.assertFalse(pg.is_usage_limit("selection", menu))
+        kind = next((k for k, rx in pg.CLAUDE_GATE_SIGNATURES if rx.search(menu)), None)
+        self.assertEqual(kind, "selection")
+        self.assertTrue(pg.limit_line("  ⎿  Weekly limit · resets Nov 28 at 1pm"))
+
+    def test_an_ordinary_dialog_that_names_a_limit_is_not_the_limit(self):
+        question = ("Pick one\nDo you want to retry the upload now that the team reached your usage limit.\n"
+                    "❯ 1. Retry\n  2. Cancel\nEnter to confirm · Esc to cancel\n")
+        option = ("Pick one\nThe export is paused.\n❯ 1. Wait for the limit to reset\n  2. Cancel the export\n"
+                  "Enter to confirm · Esc to cancel\n")
+        for dialog in (question, option):
+            with self.subTest(dialog=dialog):
+                self.assertFalse(pg.is_usage_limit("selection", dialog))
+                self.assertFalse(pg.is_usage_limit("unknown", dialog))
+                self.assertFalse(any(pg.limit_line(ln) for ln in dialog.splitlines()))
+        self.assertTrue(pg.is_usage_limit("selection", self.MENU), "the CLI's own menu still is")
+
+    def test_a_line_that_used_a_limit_on_something_else_is_no_refusal(self):
+        line = "  ⎿  You've used your weekly limit for uploads; it resets on Monday"
+        self.assertFalse(pg.limit_line(line))
+        self.assertFalse(pg.is_usage_limit("turn-rejected", line))
+        self.assertTrue(pg.is_usage_limit("turn-rejected", "  ⎿  You've used your weekly limit\n❯ "))
 
 
 if __name__ == "__main__":

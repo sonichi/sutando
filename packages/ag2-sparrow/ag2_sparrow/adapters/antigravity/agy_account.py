@@ -49,10 +49,8 @@ def elsewhere(name: str) -> str:
 
 STATE_NAME = "agy-account.json"
 QUOTA_TEXT_MAX = 400     # a completed turn's text counts as agy's quota error only when it is this short
-# Words that ask for the card, on their own (short messages only, so a long request is the model's).
-ASK_RE = re.compile(r"^\s*(?:/account|(?:请|帮我|我要|我想)?(?:切换|换|更换)(?:一下|个)?账号|switch(?: the)? accounts?|"
-                    r"change(?: the)? accounts?|(?:改)?用\s*api\s*key|use (?:an |a |the )?(?:gemini )?api key)"
-                    r"\s*[。.!！?？]?\s*$", re.I)
+# Words that ask for this card beyond the shared ones (account_switch.asks_for_card): the API key's.
+ASK_RE = re.compile(r"^\s*(?:(?:改)?用\s*api\s*key|use (?:an |a |the )?(?:gemini )?api key)\s*[。.!！?？]?\s*$", re.I)
 KEY_RE = re.compile(r"AIza[0-9A-Za-z_\-]{35}")
 REDACTED_KEY = "[REDACTED-Google API Key]"
 KEY_IN_CHAT = ("This message looks like it has a sign-in code or an API key, so I did not pass it to Antigravity "
@@ -95,7 +93,7 @@ def quota_error(status, text, detail) -> bool:
 
 
 def asks_for_card(text) -> bool:
-    return bool(ASK_RE.match(text or "")) and len(text or "") <= 60
+    return account_switch.asks_for_card(text) or (bool(ASK_RE.match(text or "")) and len(text or "") <= 60)
 
 
 def carries_key(text) -> bool:
@@ -136,6 +134,7 @@ def agy_log_dir(env) -> str:
 
 class AgyAccount:
     KIND, ASK, MARK, HINT, IN_DM = "account", "/account", account_switch.MARK, account_switch.HINT, account_switch.IN_DM
+    asks = staticmethod(lambda text: asks_for_card(text))
     CARD_ID = account_switch.CARD
 
     def __init__(self, state_dir, bridge_state, name, agent_id, publish, quoted, log, saved=None, clear=None):
