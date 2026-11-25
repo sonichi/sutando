@@ -110,6 +110,26 @@ def error_kind(error) -> Optional[str]:
     return None
 
 
+# A turn refused because the model it runs on is not one this account may use (VM 2026-11-24: the
+# core's gpt-6.1-terra under a ChatGPT account: "The 'gpt-6.1-terra' model is not supported when using
+# Codex with a ChatGPT account.", codexErrorInfo modelNotFound). The turn failed and the owner saw nothing.
+MODEL_NOT_FOUND_INFO = "modelnotfound"
+_MODEL_MISSING_WORDS = re.compile(r"\bmodel is not supported\b|\bmodel (?:was )?not found\b", re.IGNORECASE)
+
+
+def model_missing(error) -> bool:
+    """Whether a turn's error (a TurnError, an `error` notification's, or a message) says its model is
+    not one this account may use."""
+    if isinstance(error, dict):
+        info = error.get("codexErrorInfo", error.get("codex_error_info"))
+        names = {re.sub(r"[^a-z]", "", str(n).lower())
+                 for n in (list(info) if isinstance(info, dict) else [info]) if n}
+        if MODEL_NOT_FOUND_INFO in names:
+            return True
+        error = str(error.get("message") or "")
+    return isinstance(error, str) and bool(_MODEL_MISSING_WORDS.search(error))
+
+
 def usage_limit(error) -> bool:
     """Whether a turn's error (a TurnError, or an `error` notification's) says the account is out of usage."""
     return isinstance(error, dict) and error_kind(error) == USAGE_LIMIT_INFO
@@ -341,6 +361,7 @@ class Seat:
         self.lock_fd: Optional[int] = None
         self.auth_seen: Optional[tuple] = None  # the login on disk when the running child was started
         self.turn_unauth = False  # the current turn was refused because the login no longer works
+        self.turn_model_missing = ""  # the current turn's model is not one this account may use: its message
         self.told_signed_out: Optional[tuple] = None  # the login the owner was last shown the card for
         self.health_auth: Optional[tuple] = None  # the login on disk when the core's health went bad
         # Shows the owner the core's account card when its login is refused even after a restart.
@@ -856,8 +877,10 @@ class Seat:
 
     def run_turn(self, filename: str, prompt: str) -> Tuple[str, str]:
         """(status, detail) once the turn is over: completed | failed | interrupted | stopped |
-        timeout | server-exited | seat-stopping. `turn_unauth` says whether the login was refused."""
+        timeout | server-exited | seat-stopping. `turn_unauth` says whether the login was refused,
+        `turn_model_missing` whether its model is not one this account may use."""
         self.turn_unauth = False
+        self.turn_model_missing = ""
         try:
             return self._run_turn(filename, prompt)
         finally:
@@ -912,6 +935,8 @@ class Seat:
                     self.rate_limits = params["rateLimits"]
                 elif method == "error" and params.get("turnId") in (None, turn_id) and usage_limit(params.get("error")):
                     self.turn_limit = params["error"]
+                elif method == "error" and params.get("turnId") in (None, turn_id) and model_missing(params.get("error")):
+                    self.turn_model_missing = one_line((params.get("error") or {}).get("message") or "", 200)
                 if params.get("threadId") in (None, self.thread_id):
                     turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
                     if method == "turn/completed" and turn.get("id") == turn_id:
@@ -921,6 +946,8 @@ class Seat:
                             self.turn_limit = turn["error"]
                         elif status != "completed" and unauthorized(turn.get("error")):
                             self.turn_unauth = True
+                        elif status != "completed" and model_missing(turn.get("error")):
+                            self.turn_model_missing = one_line(error, 200)
                         if status == "completed":
                             self.settle_model(True)
                             if self.restore is not None and sent_model == self.restore:
@@ -1055,6 +1082,10 @@ class Seat:
                     "on disk and retrying once")
                 self.close_server()
                 continue
+            if (self.turn_model_missing and status != "completed" and attempt == 1
+                    and not has_ready_result(results, filename) and self.fall_back_model()):
+                log(f"task {filename}: retrying once on {self.model}")
+                continue
             if status != "server-exited" or has_ready_result(results, filename):
                 break
             self.close_server()
@@ -1091,6 +1122,8 @@ class Seat:
             status = UNAUTHORIZED
             self.health("signed_out")
             self.signed_out(filename)
+        elif self.turn_model_missing and status != "completed":
+            self.model_unavailable()
         outcome = "no-result" if status == "completed" else status
         rec = self.write_record(filename, payload, outcome, detail)
         wait = self.retry_s if rec["attempts"] < self.max_attempts else self.hold_s
@@ -1098,6 +1131,31 @@ class Seat:
         log(f"task {filename}: turn {what} {results}/{filename} after {took}; the task stays pending "
             f"(attempt {rec['attempts']}, next try in {wait:g}s)")
         return outcome
+
+    def fall_back_model(self) -> bool:
+        """The turn's model is not one this account may use: the seat moves to the model Codex names as
+        this account's default (its `model/list`), tells the owner, and the turn is run again. False
+        when Codex names no default, or the default is the model that was refused."""
+        if self.worker:
+            return False
+        refused = self.model or ""
+        cat = self.catalog()
+        default = cat[1] if cat else ""
+        if not default or default == refused:
+            return False
+        self.model, self.restore = default, default   # the retried turn, and the thread after it, run on it
+        log(f"model: {refused or 'the model'} is not available to this account ({self.turn_model_missing}); "
+            f"moving to Codex's default for it, {default}")
+        self.notify("switched", f"{refused or 'The core model'} isn't available on this Codex account, so I "
+                                f"switched the core to {default} and answered on it.\n")
+        return True
+
+    def model_unavailable(self) -> None:
+        """The turn's model is not one this account may use and no other could be run: the owner is told,
+        so a failed turn is never silent."""
+        log(f"model: the turn's model is not available to this account ({self.turn_model_missing}); owner told")
+        self.notify("refused", f"I couldn't answer: {self.model or 'the core model'} isn't available on this "
+                               "Codex account. Send /model to pick one it can use.\n")
 
     def quota_step(self, status: str, filename: str = "", payload: Optional[Path] = None) -> None:
         """Out of usage: the owner gets the account card once per limit (core_quota_notice); a turn

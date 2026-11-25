@@ -186,6 +186,11 @@ for line in sys.stdin:
             out({"method": "error", "params": {"threadId": thread, "turnId": turn, "error": error,
                                                "willRetry": False}})
             finish("failed", error)
+        elif step == "model-missing":
+            error = {"message": "Error running remote compact task: The 'gpt-6.1-terra' model is not supported "
+                                "when using Codex with a ChatGPT account.", "codexErrorInfo": "modelNotFound"}
+            out({"method": "error", "params": {"threadId": thread, "turnId": turn, "error": error}})
+            finish("failed", error)
         elif step == "fail-other":
             finish("failed", {"message": "stream disconnected before completion",
                               "codexErrorInfo": "responseStreamDisconnected"})
@@ -1410,6 +1415,51 @@ class CoreModelSwitch(SeatCase):
         (self.ws / "state" / "model-switch.json").write_text(json.dumps({"model": "opus", "accepted": True}))
         s = self.launched(0)
         self.assertEqual(s.turn_model(), "")
+
+
+class ModelNotAvailable(SeatCase):
+    """VM 2026-11-24: the core's gpt-6.1-terra is not available under the ChatGPT account it was switched to
+    (modelNotFound, raised during compaction); the turn failed twice and the owner saw "thinking" forever."""
+
+    def catalog(self, *models, default=None):
+        rows = [{"id": m, "model": m, "isDefault": m == default} for m in models]
+        (self.fake_dir / "models.json").write_text(json.dumps(rows))
+
+    def test_what_reads_as_a_missing_model(self):
+        yes = ({"codexErrorInfo": "modelNotFound"}, {"codex_error_info": {"modelNotFound": {}}},
+               {"message": "The 'gpt-6.1-terra' model is not supported when using Codex with a ChatGPT account."},
+               "model not found")
+        no = ({"codexErrorInfo": "usageLimitExceeded"}, {"message": "stream disconnected"}, None, "")
+        self.assertEqual([seat_mod.model_missing(e) for e in yes], [True] * len(yes))
+        self.assertEqual([seat_mod.model_missing(e) for e in no], [False] * len(no))
+
+    def test_it_moves_to_the_accounts_default_answers_and_says_so(self):
+        self.catalog("gpt-6.1-terra", "gpt-5.5", default="gpt-5.5")
+        self.task("task-1.txt")
+        self.plan("model-missing", "result")
+        s = self.make()
+        s.model = "gpt-6.1-terra"
+        s.ensure_server()
+        self.assertEqual(s.step(), "done")
+        self.assertEqual([r["params"].get("model") for r in self.sent("turn/start")][-1], "gpt-5.5",
+                         "retried on the account's default")
+        self.assertEqual(s.model, "gpt-5.5")
+        notes = [f.read_text() for f in self.results.glob("proactive-model-switched-*.txt")]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("gpt-6.1-terra isn't available", notes[0])
+        self.assertIn("gpt-5.5", notes[0])
+
+    def test_with_no_default_to_move_to_the_owner_is_told_not_left_waiting(self):
+        self.task("task-1.txt")                    # no models.json: Codex names no default
+        self.plan("model-missing")
+        s = self.make(retry_s=30, max_attempts=3)
+        s.model = "gpt-6.1-terra"
+        s.ensure_server()
+        self.assertNotEqual(s.step(), "done")
+        self.assertEqual(len(self.sent("turn/start")), 1, "not retried with nothing else to run on")
+        notes = [f.read_text() for f in self.results.glob("proactive-model-refused-*.txt")]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("isn't available on this Codex account", notes[0])
 
 
 class QuotaCard(SeatCase):
