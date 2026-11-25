@@ -204,6 +204,42 @@ class LimitMenuReset(Base):
         self.assertIsNotNone(clh.parse_reset("Wait here, then continue automatically at Nov 28 at 1pm", 1_000_000.0))
 
 
+class UsageCredits(Base):
+    """VM 2026-11-24: account-b@example.com hit the plan's weekly limit but had usage credits; the card read as
+    "no quota". The card now says how to go on with credits; it never chooses them (they cost money)."""
+
+    PANE = ("You've hit your weekly limit · resets Nov 28 at 1pm (UTC)\n"
+            "/rate-limit-options\n"
+            "> 1. Stop and wait for limit to reset\n"
+            "  2. Wait here, then continue automatically at Nov 28 at 1pm\n"
+            "  3. Switch to usage credits\n")
+
+    def test_the_limit_menu_offering_credits_is_seen(self):
+        self.assertTrue(cqn.credits_offered(self.PANE))
+        self.assertFalse(cqn.credits_offered("You've hit your weekly limit\n  1. Stop and wait for limit to reset\n"))
+
+    def test_the_providers_upgrade_paths_say_overage(self):
+        state = self.ws / "state" / "quota-state.json"
+        self.assertFalse(cqn.credits_offered("", self.ws), "no record")
+        state.write_text(json.dumps({"headers": {"anthropic-ratelimit-unified-upgrade-paths": "overage"}}))
+        self.assertTrue(cqn.credits_offered("", self.ws))
+        state.write_text(json.dumps({"headers": {"anthropic-ratelimit-unified-upgrade-paths": "plan"}}))
+        self.assertFalse(cqn.credits_offered("", self.ws))
+        state.write_text("not json")
+        self.assertFalse(cqn.credits_offered("", self.ws))
+
+    def test_the_card_says_how_to_use_them_and_only_then(self):
+        q = self.notice("Claude Code")
+        self.assertEqual(q.hit(*M.limit_reset(self.PANE, self.now[0]), credits=cqn.credits_offered(self.PANE)),
+                         "quota-card")
+        self.assertIn(cqn.CREDITS_LINE, self.cards[-1])
+        self.assertIn("has reached its usage limit", self.cards[-1])
+        plain = cqn.words("Codex", "Nov 28, 1:00 PM")
+        self.assertNotIn("usage credits", plain)
+        self.assertIn(cqn.CREDITS_LINE, cqn.words("Codex", "", credits=True))
+        self.assertNotIn("usage credits", cqn.words("Codex", "", why=cqn.SIGNED_OUT, credits=True))
+
+
 class SignedOut(Base):
     """A signed-out Claude core: the account card (sign-in, no Retry), once, then once per owner message."""
 

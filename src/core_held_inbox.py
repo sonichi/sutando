@@ -93,7 +93,8 @@ class HeldInbox:
             if hold.get("kind") == "usage-limit":
                 reset_at = hold.get("reset_at")
                 reset = core_quota_notice.reset_from_epoch(reset_at, at) if reset_at else ""
-                done = self.quota.hit(reset, reset_at, tasks=core_quota_notice.owner_waiting(self.ws))
+                done = self.quota.hit(reset, reset_at, tasks=core_quota_notice.owner_waiting(self.ws),
+                                      credits=core_quota_notice.credits_offered("", self.ws))
                 if done:
                     self.log(f"quota: {done}")
             switch = self.repo / "scripts" / "switch-model.sh"

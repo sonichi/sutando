@@ -1160,7 +1160,8 @@ def quota_step(quota, limited, text, now=None):
     if quota is None:
         return ""
     try:
-        done = quota.hit(*limit_reset(text, now), tasks=core_quota_notice.owner_waiting(quota.workspace)) \
+        done = quota.hit(*limit_reset(text, now), tasks=core_quota_notice.owner_waiting(quota.workspace),
+                         credits=core_quota_notice.credits_offered(text, quota.workspace)) \
             if limited else quota.cleared()
     except Exception as exc:  # noqa: BLE001
         done = f"quota-failed ({type(exc).__name__})"
