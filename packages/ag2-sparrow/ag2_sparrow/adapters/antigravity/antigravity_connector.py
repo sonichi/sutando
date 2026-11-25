@@ -536,12 +536,34 @@ def tier_block_lines(operator_lines):
     return out
 
 
+# How this Session reads what was said before: the core's own step (a shell command on a file of its
+# skills folder) is never passed on, and this is what agy has instead.
+ROOM_HISTORY = ("When the message refers to something said earlier in the room and you do not have it, read the "
+                "room's recent messages with room_action_read (the server's room.action.read): Action "
+                "room.context.read, room_id %s. Answer from what you read, not from a guess.")
+
+
+def bridge_text_apart(headers, message, operator_lines):
+    """(the sender's message, the bridge-written lines) for any task layout. `task_layout: mid` already has
+    them apart and is returned untouched: its message is the sender's alone, whatever it quotes. In any other
+    layout the bridge's blocks follow the message inside the body; they begin at the first line that opens
+    with ===, which only a writer can produce (local_task_protocol.BRIDGE_FENCE_RE: task_body_guard defangs
+    such a line typed by a sender). From there on the lines are the bridge's, and are filtered as such."""
+    if operator_lines or (headers.get("task_layout") or "").strip() == "mid":
+        return message, operator_lines
+    fence = local_task_protocol.BRIDGE_FENCE_RE.search(message or "")
+    if fence is None:
+        return message, operator_lines
+    return message[:fence.start()].rstrip(), [ln for ln in message[fence.start():].split("\n") if ln.strip()]
+
+
 def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_NOTE, shell_web=False,
                 readable=(), kind=None):
     """The turn's prompt. `cwd` is the working directory the turn may read and edit, None for an isolated turn;
     `shell_web` also grants commands and the web; `readable`, an isolated turn's copies of the sender's own
     attachments, the only files it may read."""
     event, _ = trigger_of(headers)
+    message, operator_lines = bridge_text_apart(headers, message, operator_lines)
     out = acp_host.task_framing(task_id, headers, message, tier_block_lines(session_lines(operator_lines)),
                                 "post in your final message", note)
     out.append("Answer through Sparrow, exactly once for this task: your final message in this turn is what Sparrow "
@@ -554,6 +576,9 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
                    "room_action_execute (the server's room.action.execute; find Actions with room_actions_search and "
                    "room_actions_describe) to create or edit Room Commons pages and for other room actions, and put "
                    "the page link in your reply." % mcp_auth.SERVER_NAME)
+        room = (headers.get("channel_id") or "").strip()
+        if room:
+            out.append(ROOM_HISTORY % room)
     if shell_web:
         out.append("You may run shell commands and fetch and search the web. You may read and edit files under %s." % cwd)
     else:
