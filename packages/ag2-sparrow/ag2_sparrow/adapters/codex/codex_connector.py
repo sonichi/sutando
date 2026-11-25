@@ -313,7 +313,7 @@ class Connector:
             [os.path.join(home, signin_watch.CODEX_AUTH), os.path.join(home, signin_watch.MARKER)],
             lambda: signin_watch.codex_identity(home))
         self.signin_started, self.signin_account = self.signin_mark()
-        self.signin_own = False   # the server finished a sign-in of its own since the mark was taken
+        self.signin_own = None    # the account (its fingerprint) the server's own finished sign-in wrote
 
     @property
     def root(self):
@@ -366,7 +366,8 @@ class Connector:
     def login_over(self, params):
         """The server said a sign-in ended (`account/login/completed`): the account card tells the owner."""
         if params.get("success"):
-            self.signin_own = True       # the auth.json it wrote names the account this server now runs on
+            # The auth.json the server just wrote names the account it now runs on: that account, no other.
+            self.signin_own = self.signin_mark()[1]
         outcome = self.accounts.finished(params.get("loginId"), bool(params.get("success")), params.get("error") or "")
         if outcome:
             log("account ->", outcome)
@@ -600,7 +601,7 @@ class Connector:
         self.live = {}
         self.thread_id = None
         # A new server reads auth.json afresh.
-        (self.signin_started, self.signin_account), self.signin_own = self.signin_mark(), False
+        (self.signin_started, self.signin_account), self.signin_own = self.signin_mark(), None
         self.handshake()
 
     def signin_mark(self):
@@ -624,8 +625,8 @@ class Connector:
         """Between turns: restart the server once when auth.json names another account than the one it
         started with; True when it did. An unreadable file changes nothing; the shared daemon (proxy) is
         not ours to restart. The server is kept in two cases only: the account itself (its id and email)
-        is the one it started with and only the switch marker moved; or the server finished a sign-in of
-        its own since (so it wrote the file) and says it is on that email. An email alone proves nothing:
+        is the one it started with and only the switch marker moved; or the account on disk is the very
+        one the server's own finished sign-in wrote, and the server says it is on that email. An email alone proves nothing:
         another account, or another workspace of one sign-in, can carry the same one."""
         if self.args.server == "proxy":
             return False
@@ -640,8 +641,9 @@ class Connector:
             self.signin_started = mark
             return False
         email = now[1]
-        if self.signin_own and email and self.server_email().lower() == email.lower():
-            self.signin_started, self.signin_account, self.signin_own = mark, account, False
+        own, self.signin_own = self.signin_own, None      # that proof is for one account, and is used once
+        if own == account and email and self.server_email().lower() == email.lower():
+            self.signin_started, self.signin_account = mark, account
             return False
         log("sign-in changed in auth.json; restarting Codex on the new account")
         before = self.signin_started, self.signin_account

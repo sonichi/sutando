@@ -194,7 +194,7 @@ class CodexRestart(unittest.TestCase):
         self.servers[-1].email = "b@x.org"
         with mock.patch.object(type(self.c), "accounts", mock.PropertyMock()):
             self.c.login_over({"loginId": "l-1", "success": False, "error": "cancelled"})
-            self.assertFalse(self.c.signin_own, "a sign-in that failed proves nothing")
+            self.assertIsNone(self.c.signin_own, "a sign-in that failed proves nothing")
             self.c.login_over({"loginId": "l-2", "success": True})
         self.assertFalse(self.c.signin_check())
         self.assertFalse(self.c.signin_check())
@@ -202,6 +202,24 @@ class CodexRestart(unittest.TestCase):
         # That proof is used once: a later change by someone else restarts, whatever the server answers.
         write(self.home / "auth.json", codex_auth("acct-3", "b@x.org"))
         self.assertTrue(self.c.signin_check())
+
+    def test_a_finished_sign_in_vouches_only_for_the_account_it_wrote(self):
+        """Reviewer, ea5dc6b1: a sign-in that left the account unchanged still set the flag, and a later
+        change by someone else to another account under the same email reused it and skipped the restart."""
+        with mock.patch.object(type(self.c), "accounts", mock.PropertyMock()):
+            self.c.login_over({"loginId": "l-1", "success": True})       # signed in again to the same account
+        self.assertFalse(self.c.signin_check())
+        write(self.home / signin_watch.MARKER, {"email": "a@x.org", "at": 3})
+        self.assertFalse(self.c.signin_check(), "only the marker moved")
+        write(self.home / "auth.json", codex_auth("acct-9", "a@x.org"))   # someone else, later, same email
+        self.assertTrue(self.c.signin_check())
+        self.assertEqual(self.restarts.call_count, 1)
+        # And with the proof still unspent when the other account arrives: it names acct-1, not acct-9.
+        with mock.patch.object(type(self.c), "accounts", mock.PropertyMock()):
+            self.c.login_over({"loginId": "l-2", "success": True})
+        write(self.home / "auth.json", codex_auth("acct-1", "a@x.org"))
+        self.assertTrue(self.c.signin_check())
+        self.assertIsNone(self.c.signin_own)
 
     def test_another_account_with_the_same_email_restarts_the_server(self):
         """Reviewer, 47209797: a different account id under the same email (another workspace of one
