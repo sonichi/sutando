@@ -303,6 +303,24 @@ class Taps(Base):
         self.assertEqual(self.fake.cards()[-1]["state"], "pending")
         self.assertEqual(self.live(), A, "nothing is swapped before the detached step")
 
+    def test_saved_accounts_that_mask_alike_get_a_button_each(self):
+        alike = {"acct-a1": auth("alma@example.net", "plus", "acct-a1", SECRET_C),
+                 "acct-a2": auth("adam@example.net", "plus", "acct-a2", SECRET_C)}
+        for text in alike.values():
+            self.keep(text)
+        self.post()
+        by_key = {b["command"].rsplit(":", 1)[1]: b["label"] for b in self.fake.cards()[-1]["buttons"]}
+        first, second = sorted(key_of(a) for a in alike)
+        self.assertEqual((by_key[first], by_key[second]), ("Use a…@example.net (plus) #1", "Use a…@example.net (plus) #2"))
+        for key in (first, second):
+            with self.subTest(key=key):
+                self.ws.joinpath(*acc.RUNNING).unlink(missing_ok=True)
+                rc, out = self.tap(by_key[key], event="$card2")
+                self.assertEqual((rc, out["status"]), (0, "started"), out)
+                argv = self.launch.calls[-1][0]
+                self.assertEqual(argv[argv.index("--key") + 1], key)
+                self.assertIn(by_key[key][len("Use "):], out["say"])
+
     def test_someone_else_or_another_room_starts_nothing(self):
         for kw in ({"user": "@guest:s.space", "tier": "guest"}, {"kind": "group", "room": ROOM}):
             rc, out = self.tap(self.use_b, **kw)

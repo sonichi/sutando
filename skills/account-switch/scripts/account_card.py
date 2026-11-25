@@ -233,6 +233,15 @@ def saved(store: Optional[Path], current_key: str = "") -> list:
     return sorted(out, key=lambda s: s["label"])
 
 
+def shown_names(entries: list) -> dict:
+    """{key: masked label}; labels that mask alike get " #1", " #2"… by saved-key order, so each names one key."""
+    groups = {}
+    for s in sorted(entries, key=lambda s: s["key"]):
+        groups.setdefault(masked_label(s["label"]), []).append(s["key"])
+    return {k: name + (f" #{i}" if len(keys) > 1 else "")
+            for name, keys in groups.items() for i, k in enumerate(keys, 1)}
+
+
 def _saved_auth(store: Path, key: str) -> Optional[str]:
     try:
         auth = json.loads((store / f"{key}.json").read_text(encoding="utf-8")).get("auth")
@@ -300,11 +309,14 @@ def in_use_words(cur: dict) -> str:
 
 # ── the card ──────────────────────────────────────────────────────────────────────────────────────
 
-def menu_card(cur: dict, others: list) -> tuple:
+def menu_card(cur: dict, others: list, names: Optional[dict] = None) -> tuple:
     """(body, card): a "Use" button per other saved account (up to five), then "Add another account"."""
     buttons = []
+    names = names if names is not None else shown_names(others)
     for s in others[:USE_BUTTONS]:
-        label = ("Use " + masked_label(s["label"]))[: ac.LIMITS["label"]]
+        name = names.get(s["key"]) or masked_label(s["label"])
+        tag = name[len(masked_label(s["label"])):]   # the " #N" kept whole when the label is cut
+        label = ("Use " + name[: len(name) - len(tag)])[: ac.LIMITS["label"] - len(tag)] + tag
         buttons.append(ac.button(label, "reply", style="secondary", reply=label,
                                  command=ac.reply(KIND, TARGET, s["key"])))
     buttons.append(ac.button("Add another account", "reply", style="primary", reply="Add another account",
@@ -398,9 +410,10 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time, run=subp
             save_current(store, _live_auth(codex_home()))
         except (OSError, codex_account.NoHome):
             pass  # the card still names the account; only the copy for switching back is missing
-    others = [s for s in saved(store, cur["key"]) if not s["current"]]
+    every = saved(store, cur["key"])
+    others = [s for s in every if not s["current"]]
     try:
-        body, card = menu_card(cur, others)
+        body, card = menu_card(cur, others, shown_names(every))
     except ac.CardError as e:
         return _emit({"status": "failed", "why": str(e)}, 1)
     if args.print:
@@ -510,7 +523,7 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
             or _saved_auth(store, verb) is None:
         return _emit({"status": "refused", "say": GONE}, 2)
     cur = current("codex", run=run, codex_read=codex_read)
-    label = masked_label(next((s["label"] for s in saved(store) if s["key"] == verb), "that account"))
+    label = shown_names(saved(store)).get(verb) or "that account"
     if cur["key"] == verb:
         return _emit({"status": "say", "say": f"The core is already signed in as {label}. Nothing changed."})
     t = now()
