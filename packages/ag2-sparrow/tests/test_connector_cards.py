@@ -190,10 +190,56 @@ class ConnectorCards(unittest.TestCase):
         calls.clear()
         refusing = cc.Poster(self.state, lambda p: calls.append(p["op"]) or (
             {"ok": False, "error": "refused", "event_id": "$diagnostic"} if p["op"] == "edit" else {"ok": True, "event_id": "$new"}),
-            log=self.logs.append, clock=lambda: 1000.0)
+            log=self.logs.append, clock=lambda: 1000.0 + cc.RETRY_MAX_S)
         self.assertEqual((refusing.sweep(), calls), (1, ["edit", "message"]))
         (receipt,) = (self.state / "agent-cards" / "posted").glob("*.json")
         self.assertEqual((json.loads(receipt.read_text())["event_id"], "edited" in json.loads(receipt.read_text())), ("$new", False))
+
+    def test_a_throttled_or_ambiguous_edit_is_retried_under_its_own_key_and_only_a_refusal_is_a_new_card(self):
+        ac, _ = cc._core()
+        body, card = ac.build("model-switch-status", "done", title="Model", body="Model: now Opus", text="Switched.")
+
+        class Status(Exception):
+            def __init__(self, code):
+                self.code = code
+
+        answers = [Status(429), {"errcode": "M_LIMIT_EXCEEDED", "retry_after_ms": 2000}, TimeoutError("slow"), Status(503),
+                   {"ok": True}, {"ok": True, "event_id": "$edit9"}]
+        sent, now = [], [1000.0]
+
+        def post(payload):
+            sent.append(payload)
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        qid = cc.queue(self.state, ROOM, body, card, edit="$card1", now=1000.0)
+        poster = cc.Poster(self.state, post, log=self.logs.append, clock=lambda: now[0])
+        self.assertEqual(poster.sweep(), 0)
+        self.assertEqual(poster.sweep(), 0, "backing off: not sent again at once")
+        self.assertEqual(len(sent), 1)
+        for _ in range(5):
+            now[0] += cc.RETRY_MAX_S
+            poster.sweep()
+        self.assertEqual([(p["op"], p["event_id"], p["dedupe_key"]) for p in sent],
+                         [("edit", "$card1", "agent-card-edit:" + qid)] * 6, "one edit, the same key every time, no new message")
+        (receipt,) = (self.state / "agent-cards" / "posted").glob("*.json")
+        self.assertEqual((json.loads(receipt.read_text())["event_id"], json.loads(receipt.read_text())["edited"]), ("$card1", True))
+        self.assertEqual([cc.edit_verdict(a) for a in ({"ok": True, "event_id": "$e"}, {"ok": False}, {"error": "refused", "event_id": "$d"},
+                                                       {"status": 429}, {"ok": True}, None)],
+                         ["accepted", "refused", "refused", "throttled", "unknown", "unknown"])
+        # A refusal for good is one new card.
+        receipt.unlink()
+        cc.queue(self.state, ROOM, body, card, edit="$card1", now=now[0])
+        calls = []
+
+        def refuse(payload):
+            calls.append(payload["op"])
+            if payload["op"] == "edit":
+                raise Status(404)
+            return {"ok": True, "event_id": "$new"}
+        self.assertEqual((cc.Poster(self.state, refuse, log=self.logs.append, clock=lambda: now[0]).sweep(), calls), (1, ["edit", "message"]))
 
     def test_an_edit_waits_behind_an_earlier_edit_of_the_same_event_whatever_card_each_carries(self):
         ac, _ = cc._core()
