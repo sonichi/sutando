@@ -110,6 +110,9 @@ class ModelSwitch:
         seen = {"available": [{"id": str(mid)[:200], "name": " ".join(str(name or mid).split())[:80] or str(mid)[:80]}
                               for mid, name in offered if self.ok(mid)],
                 "current": str(current or "")[:200]}
+        # With a pick, the turn is moved off the model its Session opened on: `tell` records what it ran on.
+        if self.wanted():
+            del seen["current"]
         if {k: self.state().get(k) for k in seen} != seen:
             self.save(**seen)
 
@@ -285,11 +288,17 @@ class ModelSwitch:
                                                    else {"wanted": ""}))
         elif unkeyed:
             self.save(untold=owed)
+        if live and ran and wanted and not outcome and ran != state.get("current"):
+            self.save(current=ran)      # a settled pick the runtime no longer runs: what it ran on is shown
         told, words = "", []
         while owed:
             first = {"picked": str(owed[0].get("picked") or ""), "ran": str(owed[0].get("ran") or "")}
-            card = self.built(state, **first)
-            if card is None:
+            # A pick made on the app's settings page names no room: the page reads the outcome from
+            # this state (model_settings), so it is settled without a card in any DM.
+            card = self.built(state, **first) if owed[0].get("room") else False
+            if card is False:
+                pass
+            elif card is None:
                 if room is None or str(owed[0].get("room") or "") != str(room):
                     break           # its words wait for a turn in the room the card was for
                 words.append(self.words(state, **first))

@@ -22,7 +22,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from ... import _dirs, connect_bridge as cb, connect_common as cm, task_io
+from ... import _dirs, connect_bridge as cb, connect_common as cm, model_settings, task_io
 from ...acp_client import AUTH_REQUIRED, AcpError
 from ...connect_bridge import EXTERNAL, UNIT
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, Shape
@@ -366,6 +366,17 @@ def list_cmd(_args) -> int:
     return cm.list_jobs(LOCAL)
 
 
+def model(args) -> int:
+    """The app's settings page: the agent's model, and the owner's pick (`--set`), in the state the
+    model card keeps; every next turn runs on the pick, whoever sends it (model_settings)."""
+    local, problem = selected(args)
+    cfg, problem = (None, problem) if problem else load_config(local)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    return model_settings.command(Path(cm.work_root(cfg)) / "state", args.set)
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def session_options(p) -> None:
@@ -417,6 +428,10 @@ def main(argv=None) -> int:
     cm.job_options(sub.add_parser("uninstall", help="stop the job, then remove what install wrote (config last)")
                    ).set_defaults(func=uninstall)
     sub.add_parser("list", help="each job installed here").set_defaults(func=list_cmd)
+    m = cm.job_options(sub.add_parser("model", help="print the agent's model as JSON (current, available, pending), "
+                                                    "or pick the one every next turn runs on (--set)"))
+    m.add_argument("--set", metavar="ID", help="a model id agy listed")
+    m.set_defaults(func=model)
     args = ap.parse_args(argv)
     args.argv = list(sys.argv[1:] if argv is None else argv)
     return args.func(args)
