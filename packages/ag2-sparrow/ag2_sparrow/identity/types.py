@@ -1,0 +1,124 @@
+"""The five delivery identities, as distinct validated value types.
+
+Semantics are frozen in docs/sparrow-delivery-identity.md (B slice 1); this
+module gives each identity a type so a task_id cannot silently flow where a
+delivery_id is required. Values are opaque strings under one shared grammar:
+printable ASCII (0x21-0x7E), no whitespace, no path separators (ids become
+filenames and record keys), bounded length — plus a per-kind namespace shape.
+The constructors in derive.py, the parsers in serialization.py, and these
+types all enforce the SAME grammar: a typed value that cannot be re-parsed
+cannot be constructed.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import ClassVar, Optional
+
+from .escape import is_canonical_component
+
+_MAX_LEN = 200
+
+# One component: safe chars or fixed-width %XX escapes (uppercase hex),
+# at least one unit — empty components are constructor-impossible.
+_COMPONENT = r"(?:[^%@#+~:/\\]|%[0-9A-F]{2})+"
+_DELIVERY_BASE = rf"(?:d|legacy):{_COMPONENT}@{_COMPONENT}(?:\+r[1-9][0-9]*)*"
+_DELIVERY_PARTS = re.compile(rf"(?:d|legacy):({_COMPONENT})@({_COMPONENT})(?:\+r[1-9][0-9]*)*")
+_ORDINAL = r"(?:0|[1-9][0-9]*)"
+# delivery_core's shipped key <item_id>#<epoch>: OPAQUE, any item_id the
+# formatter accepted ("" included), one canonical epoch spelling.
+_LEGACY_KEY = rf".*#{_ORDINAL}"
+
+
+def _validate(value: str, kind: str, *, charset: bool = True,
+              bounded: bool = True) -> None:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{kind} must be a non-empty string")
+    if bounded and len(value) > _MAX_LEN:
+        raise ValueError(f"{kind} exceeds {_MAX_LEN} chars")
+    if not charset:
+        return
+    for ch in value:
+        if not 0x21 <= ord(ch) <= 0x7E or ch in "/\\":
+            raise ValueError(f"{kind} contains forbidden character {ch!r}")
+
+
+@dataclass(frozen=True)
+class _Identity:
+    value: str
+
+    _PATTERN: ClassVar[Optional[re.Pattern]] = None
+    # Bytes an earlier release already shipped byte-for-byte: neither the
+    # charset nor the length rule may apply — narrowing strands live deliveries.
+    _OPAQUE: ClassVar[Optional[re.Pattern]] = None
+
+    def __post_init__(self) -> None:
+        kind = type(self).__name__
+        opaque = type(self)._OPAQUE
+        is_opaque = bool(opaque is not None and isinstance(self.value, str)
+                         and opaque.fullmatch(self.value))
+        _validate(self.value, kind, charset=not is_opaque, bounded=not is_opaque)
+        if is_opaque:
+            return
+        pattern = type(self)._PATTERN
+        if pattern is not None and not pattern.fullmatch(self.value):
+            raise ValueError(f"{kind} grammar rejects {self.value!r}")
+        # The grammar admits any %XX; only a constructor's own output is
+        # canonical, so `%41` for a safe 'A' or `%FF` must not parse.
+        for comp in self._components():
+            if not is_canonical_component(comp):
+                raise ValueError(f"{kind} component is not canonical: {comp!r}")
+
+    def _components(self) -> "tuple[str, ...]":
+        return ()
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class DeliveryId(_Identity):
+    """One object crossing one boundary, once. Sparrow-owned."""
+
+    _PATTERN = re.compile(_DELIVERY_BASE)
+
+    def _components(self):
+        return _DELIVERY_PARTS.fullmatch(self.value).groups()
+
+
+class TaskId(_Identity):
+    """One logical unit of Sutando work. Sutando-owned; Sparrow never mints
+    it for its own accounting."""
+
+    _PATTERN = re.compile(r"task-.+")
+
+
+class AttemptId(_Identity):
+    """One physical try at one delivery. Ordered per delivery, never reused."""
+
+    _PATTERN = re.compile(rf"{_DELIVERY_BASE}#a[1-9][0-9]*")
+
+    def _components(self):
+        return _DELIVERY_PARTS.fullmatch(self.value.rsplit("#a", 1)[0]).groups()
+
+
+class IdempotencyKey(_Identity):
+    """One external side-effect, deduplicated. Epoch 0 is stable across
+    retries; a re-send epoch n carries the +r<n> suffix and is a new effect.
+    Two admissible shapes: the canonical e:<task>@<boundary>[+r<n>], and the
+    pre-B provider key <item_id>#<epoch> that legacy_idempotency_key preserves."""
+
+    _PATTERN = re.compile(rf"e:({_COMPONENT})@({_COMPONENT})(?:\+r[1-9][0-9]*)?")
+    _OPAQUE = re.compile(_LEGACY_KEY, re.DOTALL)  # an item_id may hold newlines
+
+    def _components(self):
+        return self._PATTERN.fullmatch(self.value).groups()
+
+
+class IncarnationId(_Identity):
+    """One process lifetime. Attribution only: names who performed an
+    attempt, never the work itself (ratchet R1)."""
+
+    _PATTERN = re.compile(rf"({_COMPONENT}):{_ORDINAL}:{_ORDINAL}")
+
+    def _components(self):
+        return self._PATTERN.fullmatch(self.value).groups()
