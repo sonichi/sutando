@@ -32,7 +32,7 @@ class FakeQuota:
     def __init__(self):
         self.hits = []
 
-    def hit(self, reset="", reset_at=None, tasks=()):
+    def hit(self, reset="", reset_at=None, tasks=(), credits=False):
         self.hits.append(list(tasks))
         return "quota-card"
 

@@ -64,11 +64,38 @@ def reset_from_epoch(at, now: Optional[float] = None) -> str:
 SIGNED_OUT = "signed_out"   # `why` of a signed-out core: the same card, every owner message, its own words
 
 
-def words(name: str, reset: str, why: str = "quota") -> str:
+# The plan's limit is reached but the account can go on with usage credits, which cost money: said, never
+# chosen here (Qingyun's recovery card keeps purchases behind its step-up). VM 2026-11-24: the card read
+# as "no quota" for an account that had credits.
+CREDITS_LINE = ("This account still has usage credits: to use them, choose \"Switch to usage credits\" in the "
+                "core's terminal on that computer.")
+_CREDITS_MENU = re.compile(r"\bswitch to usage credits\b", re.I)
+
+
+def credits_offered(pane: str = "", workspace=None) -> bool:
+    """Whether the account can go on with usage credits: the CLI's limit menu offers "Switch to usage
+    credits", or the provider's last answer (state/quota-state.json) lists `overage` among its upgrade
+    paths. Read only; never raises."""
+    if _CREDITS_MENU.search(pane or ""):
+        return True
+    if workspace is None:
+        return False
+    try:
+        from workspace_default import status_read_path
+        data = json.loads(status_read_path("quota-state.json", Path(workspace)).read_text(encoding="utf-8"))
+    except (OSError, ValueError, ImportError):
+        return False
+    headers = data.get("headers") if isinstance(data, dict) and isinstance(data.get("headers"), dict) else {}
+    paths = str(headers.get("anthropic-ratelimit-unified-upgrade-paths") or "")
+    return "overage" in [p.strip().lower() for p in paths.split(",")]
+
+
+def words(name: str, reset: str, why: str = "quota", credits: bool = False) -> str:
     if why == SIGNED_OUT:
         return "%s is signed out, so I can't answer until it's signed in again. Sign in or pick an account below." % name
-    return "%s has reached its usage limit%s, so I can't answer until then. Switch to another account to go on now." % (
+    said = "%s has reached its usage limit%s, so I can't answer until then. Switch to another account to go on now." % (
         name, " (resets %s)" % reset if reset else " (it does not say when that resets)")
+    return said + (" " + CREDITS_LINE if credits else "")
 
 
 def card_sender(argv: Sequence[str], workspace, log: Callable[..., None] = print,
@@ -158,10 +185,11 @@ class QuotaNotice:
 
     def _send(self, rec: dict) -> bool:
         why = rec.get("why") or "quota"
-        text = words(self.name, str(rec.get("reset") or ""), why)
+        text = words(self.name, str(rec.get("reset") or ""), why, bool(rec.get("credits")))
         return bool(self.send(text, signed_out=True) if why == SIGNED_OUT else self.send(text))
 
-    def hit(self, reset: str = "", reset_at=None, tasks: Sequence[str] = (), why: str = "quota") -> str:
+    def hit(self, reset: str = "", reset_at=None, tasks: Sequence[str] = (), why: str = "quota",
+            credits: bool = False) -> str:
         """The runtime said it is out of usage (`why` SIGNED_OUT: it is signed out, told the same way). 'quota-card' (posted to the owner's DM), 'quota-not-posted'
         (tried again later), or '' (told already this episode, or tried too recently). `tasks`: the
         owner's messages now waiting on the limit; each gets the card once ('quota-card-again')."""
@@ -181,6 +209,8 @@ class QuotaNotice:
             rec["reset_at"] = float(reset_at)
         if reset and not rec.get("reset"):
             rec["reset"] = reset[:60]
+        if credits:
+            rec["credits"] = True        # the account can go on with usage credits: the card says how
         self.health(SIGNED_OUT if why == SIGNED_OUT else "quota", rec.get("reset_at"))
         if rec.get("told"):
             return self.again(rec, [str(t) for t in tasks if t])
