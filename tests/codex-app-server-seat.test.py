@@ -1144,7 +1144,29 @@ class CoreModelSwitch(SeatCase):
             self.assertEqual(s.turn_model(), "gpt-old", "the thread is moved back off the untried pick")
             s.restore = None  # a turn completed on it
         self.assertEqual(s.turn_model(), "")
-        self.assertEqual(self.record()["status"], "pending")
+        self.assertEqual(self.record()["status"], "unconfirmed")
+
+    def test_a_pick_with_no_verdict_after_the_last_try_is_unconfirmed_not_refused_and_the_owner_told_once(self):
+        self.catalog("gpt-old", "gpt-new")
+        self.switch("gpt-old", accepted=True)
+        s = self.launched(1, model="gpt-old")
+        s.ensure_server()
+        self.switch("gpt-new")
+        for _ in range(seat_mod.TRIAL_ATTEMPTS):
+            self.assertEqual(s.turn_model(), "gpt-new")
+            s.abandon_trial()
+            s.restore = None
+        rec = self.record()
+        self.assertEqual((rec["status"], rec["accepted"], rec["working"]), ("unconfirmed", False, "gpt-old"))
+        self.assertNotIn("rejected_reason", rec, "no verdict is not a refusal")
+        self.assertEqual(seat_mod.codex_core_model.pending(self.ws / "state"), ("", 2))
+        self.assertEqual(seat_mod.codex_core_model.current(self.ws / "state"), "gpt-old")
+        self.assertEqual(seat_mod.codex_core_model.launch(self.ws / "state"), (2, "gpt-old", "gpt-old"))
+        self.assertEqual((s.model, s.turn_model()), ("gpt-old", ""))
+        s.abandon_trial()  # nothing under trial: no second notice
+        notice, = self.results.glob("proactive-model-*.txt")
+        self.assertTrue(notice.name.startswith("proactive-model-unconfirmed-"))
+        self.assertIn("stays on gpt-old", notice.read_text())
 
     def test_the_restore_holds_until_codex_completes_a_turn_on_it(self):
         self.catalog("gpt-old", "gpt-new")
