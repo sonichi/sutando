@@ -26,6 +26,8 @@ NOTE = "model-switch-status"
 EXPIRED = "That card has expired, so nothing changed. Here's a new one."
 EXPIRED_NO_CARD = "That card has expired, so nothing changed. Send /model for a new one."
 BUTTONS = 6          # the card's button limit
+HELD_TEXT = "I'll answer your last message on the model you pick."
+REFUSED_UNNAMED = "The model I was set to"
 UNTOLD_KEEP = 5      # outcome notices kept while their cards cannot be queued
 
 # How the owner asks in their own words: the runtime answers with the mark alone, and the card is shown.
@@ -141,18 +143,23 @@ class ModelSwitch:
             return agent_card.build(NOTE, kind, title="Model", body=body, text=text, **({"status": status} if status else {}))
         names = {m["id"]: m["name"] for m in self.offered(state)}
         now, coming = state.get("current") or "", self.pending(state)
+        refused = str(state.get("refused") or "")
+        gone = names.pop(refused, refused)      # the account signed in cannot run it: named, not offered
         buttons = [agent_card.button(name, "reply", reply="Use %s" % name,
                                      command=agent_card.reply("model", "agent", model_verb(mid)))
                    for mid, name in list(names.items())[:BUTTONS]]
         more = list(names.values())[BUTTONS:]
-        text = "Now using %s." % names.get(now, now or "the default model")
+        text = "%s isn't available on this account. Pick one it has." % gone if refused else \
+            "Now using %s." % names.get(now, now or "the default model")
         if coming:
             text += " Pending: %s, on your next message." % names.get(coming, coming)
         if more:
             text += " Also: %s (send /model and the name)." % ", ".join(more)
+        waits = {"note": HELD_TEXT, "note_tone": "dim"} if refused and state.get("held") else {}
         # The menu says when it stops acting (the time its record is kept), so the app can show it expired.
         return agent_card.build(CARD, "pending", title="Model", body="Pick a model for %s" % self.name,
-                                text=text, buttons=buttons, expires_at_ms=int((time.time() + issued_cards.TTL_S) * 1000))
+                                text=text, buttons=buttons, expires_at_ms=int((time.time() + issued_cards.TTL_S) * 1000),
+                                **waits)
 
     def parts(self, state, picked, ran, same):
         """(kind, body, text, status) of the card after a pick."""
@@ -240,7 +247,7 @@ class ModelSwitch:
             # Only a model a turn has run on is "in use": a repeated pending pick is still coming.
             outcome = "model-pending" if self.pending(state) == picked else "model-same"
         else:
-            self.save(wanted=picked, asked_in=room, told="", card=tapped)
+            self.save(wanted=picked, asked_in=room, told="", card=tapped, refused="")
         same = outcome == "model-same"
         card = self.built(state, picked=picked, same=same)
         self.publish(result_file, ANSWERED if self.post(room, card, edit=tapped)

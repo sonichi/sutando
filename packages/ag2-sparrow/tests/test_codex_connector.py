@@ -758,10 +758,10 @@ class CardWorld:
             lines.append("card_click: " + json.dumps({"card_id": self.CARD, "action": click}))
         write_text(self.work, tid, "\n".join(lines + ["task: " + body]) + "\n")
 
-    def serve(self, tid, body, extra=(), **kw):
+    def serve(self, tid, body, extra=(), wait=True, **kw):
         self.dm(tid, body, **kw)
         self.assertEqual(run_connector(self.work, once=1, extra=extra), 0)
-        return result(self.work, tid)
+        return result(self.work, tid) if wait else None
 
     def posted(self, event="$card1"):
         """What the bridge does: post each queued card, and say which event it became."""
@@ -837,6 +837,81 @@ class ModelCardTest(CardWorld, unittest.TestCase):
                                             "to try again."))
         self.assertEqual(self.state()["wanted"], "")
         self.assertNotIn("model=", self.serve("task-4", "again"), "no pick of the owner's took: Codex's own model")
+
+    def test_a_model_the_account_cannot_use_shows_the_card_and_the_message_is_answered_on_the_pick(self):
+        self.serve("task-1", "hello [[noaccess]]", wait=False)
+        self.assertFalse((self.work / "results" / "task-1.txt").exists(), "the message waits: no result yet")
+        row, state = metrics(self.work)[-1], self.state()
+        self.assertEqual((row["status"], row["card"], state["held"], state["held_room"], state["wanted"]),
+                         ("held", "model-refused", "task-1", self.DM, ""))
+        ((room, card),) = self.posted()
+        self.assertEqual((room, card["note"]), (self.DM, model_switch.HELD_TEXT))
+        self.assertTrue(card["text"].startswith("Stub Model isn't available on this account. Pick one it has."), card["text"])
+        self.assertNotIn("Stub Model", [b["label"] for b in card["buttons"]], "the refused model is not offered")
+        said = next(b["reply"] for b in card["buttons"] if b["label"] == "Stub Large")
+        # The tap is answered by its own card; the message that waited is then answered itself, on the pick.
+        self.assertEqual(self.serve("task-2", said, reply_to="$card1", click=said), "[no-send] the model card answers\n")
+        answer = result(self.work, "task-1")
+        self.assertIn("STUB echo: Sutando task task-1", answer)
+        self.assertIn("model=gpt-6-sol", answer, "the message that waited ran on the pick")
+        rows = metrics(self.work)
+        self.assertEqual((rows[-2]["card"], rows[-2]["answering"]), ("model-picked", "task-1"))
+        self.assertEqual((rows[-1]["task"], rows[-1]["status"], rows[-1]["model_switch"]), ("task-1", "completed", "switched"))
+        state = self.state()
+        self.assertEqual((state["held"], state["refused"], state["wanted"]), ("", "", "gpt-6-sol"))
+
+    def test_a_waiting_message_is_released_only_by_the_owner_in_that_dm_and_is_never_held_twice(self):
+        self.serve("task-1", "hello [[noaccess]]", wait=False)
+        self.posted()
+        # Someone else's task, and the owner's in another room, leave it waiting.
+        self.dm("task-2", "hi", tier="team", channel="!room:s.space", kind="room")
+        (self.work / "tasks" / "task-2.txt").write_text(gateway_mid_task("task-2", "hi", "team", True))
+        self.assertEqual(run_connector(self.work, once=1), 0)
+        self.assertIn("STUB echo:", self.serve("task-3", "hi", channel="!room:s.space", kind="room"))
+        self.assertEqual((self.state()["held"], (self.work / "results" / "task-1.txt").exists()), ("task-1", False))
+        # A model answer that is not a pick leaves it waiting too.
+        self.assertIn("not one I can use now", self.serve("task-4", "/model no such model"))
+        self.assertEqual(self.state()["held"], "task-1")
+        # The owner writes on in that DM: the waiting message goes first, refused again, and now says so in words.
+        self.assertIn("STUB echo:", self.serve("task-5", "never mind"))
+        self.assertEqual(result(self.work, "task-1"), "This account can't use the model this agent was set to. Send /model "
+                                                      "in our direct message to choose one it has.\n")
+        self.assertEqual([m["task"] for m in metrics(self.work)[-2:]], ["task-1", "task-5"])
+        self.assertEqual((self.state()["held"], self.state()["refused"]), ("", ""))
+        self.assertEqual(self.posted(), [], "no second card for the same message")
+
+    def test_a_refusal_after_the_turn_started_work_or_outside_the_dm_holds_nothing(self):
+        said = self.serve("task-1", "hello [[noaccess]] [[worked]]")
+        self.assertEqual(said, "Codex ended this task with status failed.\n\nPartial reply:\npartial answer\n")
+        self.assertEqual(((self.work / "state" / "model.json").exists(), self.posted()), (False, []))
+        text = self.serve("task-2", "hi [[noaccess]]", channel="!room:s.space", kind="room")
+        self.assertIn("Send /model in our direct message to choose one it has.", text)
+        self.assertEqual(((self.work / "state" / "model.json").exists(), "card" in metrics(self.work)[-1], self.posted()),
+                         (False, False, []))
+
+    def test_a_message_nobody_picked_for_is_answered_in_words_after_ten_minutes(self):
+        self.serve("task-1", "hello [[noaccess]]", wait=False)
+        state = self.state()
+        (self.work / "state" / "model.json").write_text(json.dumps(dict(state, held_at=time.time() - cc.HOLD_S - 1)))
+        self.assertEqual(cc.main(["--server", "stub", "--work", str(self.work), "--idle-exit", "0.3", "--poll", "0.05"]), 0)
+        self.assertIn("Send /model in our direct message to choose one it has.", result(self.work, "task-1"))
+        self.assertEqual(self.state()["held"], "")
+        self.assertIn("task-1", (self.work / "state" / "done").read_text().split())
+
+    def test_a_model_state_that_cannot_be_saved_does_not_swallow_the_reply(self):
+        with mock.patch.object(model_switch.ModelSwitch, "save", side_effect=OSError("disk full")):
+            said = self.serve("task-1", "hello [[noaccess]]")
+        self.assertIn("Send /model in our direct message to choose one it has.", said)
+        self.assertEqual(self.posted(), [])
+
+    def test_what_reads_as_a_model_the_account_cannot_use(self):
+        yes = ({"codexErrorInfo": "modelNotFound"}, {"codex_error_info": "model_not_found"},
+               {"codexErrorInfo": "other",
+                "message": "The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account."})
+        no = (None, "", "model_not_found", {"message": "rate limited"}, {"message": "the model answered nothing"},
+              {"codexErrorInfo": "usageLimitExceeded"})
+        self.assertEqual([cc.model_refused(e) for e in yes], [True] * len(yes))
+        self.assertEqual([cc.model_refused(e) for e in no], [False] * len(no))
 
     def test_a_turn_codex_moved_to_another_model_is_not_called_switched(self):
         self.pick("Stub Moved")

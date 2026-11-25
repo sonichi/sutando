@@ -182,6 +182,21 @@ def unauthorized(error) -> bool:
     return error_info(error, UNAUTHORIZED_INFO)
 
 
+# Codex's refusal of a model the signed-in account has no access to: its own name for it where it gives one,
+# else its own sentence. Read only from the error of a turn that ended before it did anything.
+MODEL_REFUSED_INFO = "modelnotfound"
+_MODEL_REFUSED = re.compile(r"\bmodel\b.{0,80}\bis not supported\b", re.IGNORECASE)
+PICKED = ("model-picked", "model-pending", "model-same")
+HOLD_S = 600.0       # a message waiting for a model pick is answered in words after this long
+
+
+def model_refused(error) -> bool:
+    """Whether a turn's error says the account cannot run the turn's model."""
+    if not isinstance(error, dict):
+        return False
+    return error_info(error, MODEL_REFUSED_INFO) or bool(_MODEL_REFUSED.search(str(error.get("message") or "")))
+
+
 def auth_file() -> str:
     """The login file of the Codex home the app-server is started with (child_env's CODEX_HOME, else ~/.codex)."""
     home = os.environ.get("CODEX_HOME") or os.path.join(os.environ.get("HOME") or os.path.expanduser("~"), ".codex")
@@ -408,6 +423,8 @@ class Connector:
         self.auth_stale = False
         self.auth_seen = auth_print()
         self.auth_note = ""
+        self.turn_ran_on = None   # the model the current turn was asked to run on (None: the thread's own)
+        self.released = set()     # tasks that waited for a model pick once: never held again
 
     @property
     def root(self):
@@ -883,7 +900,8 @@ class Connector:
                 # The turn reads its own folder only: this task's own attachments are copied into it.
                 staged = stage_own_attachments(headers, self.scratch_cwd, getattr(self.args, "media_root", None))
                 turn_prompt = with_staged_paths(prompt, staged)
-            status, text, err = self.run_turn(turn_prompt, self.turn_model(caps), self.turn_cwd(caps))
+            self.turn_ran_on = self.turn_model(caps)
+            status, text, err = self.run_turn(turn_prompt, self.turn_ran_on, self.turn_cwd(caps))
             if status == "server-exited":
                 self.restart_server()
                 if durable and attempt == 1:
@@ -931,14 +949,85 @@ class Connector:
             head = "Codex did not finish this task in time (%s)." % err
         elif status == "server-exited":
             head = "Codex stopped before this task finished (%s)." % err
+        elif status == "failed" and not self.turn_worked and model_refused(err):
+            head = self.model_refused_words()
         else:
             head = "Codex ended this task with status %s." % status
         partial = (text or "").strip()
         return head + ("\n\nPartial reply:\n" + partial if partial else "")
 
+    def model_refused_words(self) -> str:
+        """The account signed in cannot run the model the turn asked for, where no card can be shown."""
+        model = str(self.turn_ran_on or "")
+        return "This account can't use %s. Send /model in our direct message to choose one it has." % (
+            "the model %s" % model if model else "the model this agent was set to")
+
+    def held(self) -> dict:
+        """The message waiting for the owner's model pick: its task, the DM it came in and since when; {}."""
+        state = self.models.state() if getattr(self.args, "state", None) else {}
+        return {"task": str(state["held"]), "room": str(state.get("held_room") or ""),
+                "at": float(state.get("held_at") or 0)} if state.get("held") else {}
+
+    def hold_for_pick(self, task_id, task_text, status, err) -> bool:
+        """The account signed in refused the turn's model before the turn did anything: the owner, in their
+        DM, is shown the model card, and the message waits for the pick (no result is written for it yet).
+        False when it was not that, or no card could be shown: the answer is then `model_refused_words`."""
+        if status != "failed" or self.turn_worked or not model_refused(err) or task_id in self.released:
+            return False
+        agent_card, _ = connector_cards._core()
+        sent, _ = agent_card.reply_words(task_text or "")
+        room = str(sent.get("channel_id") or "")
+        if agent_card.owner_may_act(sent) is not None or not self.models.usable():
+            return False
+        try:
+            if not self.list_models():
+                return False
+            refused = str(self.turn_ran_on or self.models.state().get("current") or "")
+            # The refused pick is dropped: it is not passed again, nor shown as the model in use.
+            self.models.save(wanted="", confirmed="", told="", refused=refused or model_switch.REFUSED_UNNAMED,
+                             held=task_id, held_room=room, held_at=time.time())
+            state = self.models.state()
+            shown = bool(self.models.offered(state)) and self.models.post(room, self.models.menu(state))
+            if not shown:
+                self.models.save(held="", held_room="", held_at=0)
+        except OSError as e:   # the reply never depends on this record: the words still go out
+            log("model state not saved:", "%s: %s" % (type(e).__name__, e))
+            return False
+        return shown
+
+    def release_held(self, seen) -> str:
+        """The message that waited is served next (it is the oldest), once, on whatever model is now in force."""
+        task = self.held().get("task", "")
+        if task:
+            self.models.save(held="", held_room="", held_at=0)
+            self.released.add(task)
+            seen.discard(task)
+        return task
+
+    def expire_held(self, done_path, now=None) -> str:
+        """A message nobody picked a model for within HOLD_S is answered in words, so it never waits forever."""
+        held = self.held()
+        if not held or (time.time() if now is None else now) - held["at"] < HOLD_S:
+            return ""
+        self.models.save(held="", held_room="", held_at=0)
+        name = held["task"] + ".txt"
+        if os.path.isfile(os.path.join(self.args.inbox, name)) and not os.path.exists(os.path.join(self.args.results, name)):
+            self.turn_ran_on = None
+            write_atomic(os.path.join(self.args.results, name), quoted(self.model_refused_words()).rstrip("\n") + "\n")
+            record_done(done_path, held["task"])
+        return held["task"]
+
+    def forget_refused(self) -> None:
+        """A turn answered: the card no longer leads with the model that was refused."""
+        try:
+            self.models.save(refused="")
+        except OSError as e:
+            log("model state not saved:", "%s: %s" % (type(e).__name__, e))
+
     def pending_tasks(self, seen):
+        waiting = self.held().get("task", "")
         names = [n for n in os.listdir(self.args.inbox)
-                 if n.startswith("task-") and n.endswith(".txt") and n[:-4] not in seen
+                 if n.startswith("task-") and n.endswith(".txt") and n[:-4] not in seen and n[:-4] != waiting
                  and not os.path.exists(os.path.join(self.args.results, n))]
         names.sort(key=lambda n: (os.stat(os.path.join(self.args.inbox, n)).st_mtime, n))
         return names
@@ -954,6 +1043,7 @@ class Connector:
                 connector_cards.absorb(self.args.bridge_state, self.root)
                 self.accounts.expire()
                 self.quota.tick()
+                self.expire_held(done_path)
             except Exception as e:  # noqa: BLE001
                 log("card upkeep failed:", "%s: %s" % (type(e).__name__, e))
             names = self.pending_tasks(seen)
@@ -991,11 +1081,19 @@ class Connector:
             result_path = os.path.join(self.args.results, name)
             carded = self.card_task(task_id, headers, path, result_path)
             if carded:
+                # The owner picked in the DM the waiting message came in: it is answered next, on the pick.
+                if carded["card"] in PICKED and headers.get("channel_id") == self.held().get("room"):
+                    carded["answering"] = self.release_held(seen)
                 record_done(done_path, task_id)
                 with open(metrics_path, "a") as f:
                     f.write(json.dumps(carded) + "\n")
                 done += 1
                 idle_since = time.time()
+                continue
+            if policy.kind == OWNER and self.held() and headers.get("channel_id") == self.held()["room"]:
+                # The owner wrote on in that DM instead of picking: the waiting message goes first, then this one.
+                log("released (the owner wrote on) ->", self.release_held(seen))
+                seen.discard(task_id)
                 continue
             prompt = wrap_untrusted(task_id, headers, message, operator_lines, self.note, caps=policy.capabilities)
             if headers["access_tier"] == "owner" and self.desk.hint():
@@ -1020,7 +1118,17 @@ class Connector:
                 status = "usage-limit" if limit is not None else "unauthorized"
             # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
             told = self.tell_model(status, policy.capabilities, headers.get("channel_id"), policy.kind == OWNER)
+            if self.hold_for_pick(task_id, task_text, status, err):
+                rec = {"task": task_id, "status": "held", "tier": headers["access_tier"], "card": "model-refused"}
+                with open(metrics_path, "a") as f:
+                    f.write(json.dumps(rec) + "\n")
+                log("held for a model pick <-", json.dumps(rec))
+                done += 1
+                idle_since = time.time()
+                continue
             asked = self.desk.marked(headers["access_tier"], path, status, text, result_path, task_text=task_text)
+            if status == "completed" and self.models.state().get("refused"):
+                self.forget_refused()
             if signed_out and not self.turn_worked:
                 asked = self.signed_out(task_text, result_path)
             out = "\n\n".join(x for x in (out.rstrip("\n"), quoted(self.models.unsaid()).strip()) if x)
