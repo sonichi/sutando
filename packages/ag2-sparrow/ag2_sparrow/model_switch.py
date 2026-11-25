@@ -59,6 +59,9 @@ class ModelSwitch:
     before a card or a pick and returns False when the runtime would not list them. With `allowed`, only
     those ids are ever offered or accepted, and only while the runtime lists them."""
 
+    KIND, ASK, MARK, HINT, IN_DM = "model", ASK, MARK, HINT, IN_DM      # what card_desk routes by
+    CARD_ID = CARD
+
     def __init__(self, state_dir, root, bridge_state, name, publish, quoted, log, refresh=None, allowed=None):
         self.state_dir, self.root, self.bridge_state, self.name = state_dir, root, bridge_state, name
         self.publish, self.quoted, self.log, self.refresh = publish, quoted, log, refresh
@@ -186,31 +189,17 @@ class ModelSwitch:
             self.log("model card not queued:", "%s: %s" % (type(e).__name__, e))
             return False
 
-    def card_task(self, path, result_file) -> str:
-        """What a task that was a card matter came to (a tap, or the owner's /model in their DM), else
-        '': a tap never reaches the model, and a tap this agent cannot match gets the fixed line."""
-        agent_card, _ = connector_cards._core()
-        # The card rules read the task as the core does (the trusted header parse), not the connector's.
-        with open(path, encoding="utf-8") as f:
-            sent, said = agent_card.reply_words(f.read())
-        verdict = connector_cards.click(sent, said, self.root)
-        if verdict.verdict == agent_card.COMMAND and verdict.command.kind == "model":
-            return self.pick(verdict.command.verb, sent, result_file, by_verb=True)
-        if (verdict.verdict == agent_card.FORGED and agent_card.owner_may_act(sent) is None
-                and (agent_card.card_click(sent) or {}).get("card_id") == CARD):
-            # The owner tapped a model card this agent no longer keeps (a newer one replaced it, it is
-            # past its time, or an earlier install posted it): say so and show the current one.
-            return self.expired_card(sent, self.state(), result_file)
-        if verdict.verdict in (agent_card.COMMAND, agent_card.FORGED):
-            self.publish(result_file, self.quoted(verdict.say) + "\n")
-            return "card-refused"
-        ask, _, named = said.strip().partition(" ")
-        if ask.lower() != ASK or agent_card.owner_may_act(sent) is not None or not self.usable():
-            return ""
-        if not named.strip():
-            return self.offer(sent, result_file)
-        # "/model <name>": the way to a model the card has no button for.
-        return self.pick(named.strip().lower(), sent, result_file, by_name=True)
+    def tapped(self, verb, sent, result_file) -> str:
+        """A tap on one of this card's buttons, as the desk hands it over."""
+        return self.pick(verb, sent, result_file, by_verb=True)
+
+    def asked_for(self, named, sent, result_file) -> str:
+        """The owner's "/model" (the card) or "/model <name>" (the way to a model with no button)."""
+        return self.pick(named.lower(), sent, result_file, by_name=True) if named else self.offer(sent, result_file)
+
+    def expired(self, sent, result_file) -> str:
+        """A tap on a card of this kind that no longer acts, as the desk hands it over."""
+        return self.expired_card(sent, self.state(), result_file)
 
     def expired_card(self, sent, state, result_file) -> str:
         """Answer a tap on a model card that no longer acts: the words, and a fresh card when one can be shown."""
@@ -269,19 +258,6 @@ class ModelSwitch:
         else:
             self.answer(result_file, self.quoted(NOT_POSTED) + "\n")
         return "model-card"
-
-    def asked(self, tier, path, status, text, result_file) -> str:
-        """The runtime answered the owner with the mark alone: show the card in their DM, or say where to
-        ask. '' for any other answer, and for any sender but the owner, whose mark is then ordinary text."""
-        if status != "completed" or (text or "").strip() != MARK or tier != "owner":
-            return ""
-        agent_card, _ = connector_cards._core()
-        with open(path, encoding="utf-8") as f:
-            sent, _ = agent_card.reply_words(f.read())
-        if agent_card.owner_may_act(sent) is None:
-            return self.offer(sent, result_file)
-        self.answer(result_file, self.quoted(IN_DM) + "\n")
-        return "model-card-elsewhere"
 
     def tell(self, live, ran, room=None, may_fail=True) -> str:
         """After an owner turn that reached the runtime (`live`): settle the pick it ran with (`ran` is the

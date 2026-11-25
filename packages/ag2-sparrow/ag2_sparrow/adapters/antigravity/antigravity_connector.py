@@ -48,18 +48,21 @@ import time
 import uuid
 from pathlib import Path
 
-from ... import (acp_host, connector_cards, held_start, local_task_protocol, mcp_auth, model_switch,
-                 result_labels, result_publish)
+from ... import (acp_host, card_desk, connector_cards, held_start, local_task_protocol, mcp_auth, model_switch,
+                 quota_notice, result_labels, result_publish)
 from ...bounded_file_read import read_regular_bytes
 from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore, quoted, trigger_of  # noqa: F401
 from ...acp_client import AcpClient as _SharedClient
 from ...relay_loop import count_arg
+from .gemini_key import API_KEY_AUTH, authenticate_with_app_key
+from . import agy_account
 from ...team_guardrail import SANDBOXED_DELEGATION_CODEX
 from ...task_io import (COLLABORATOR, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, RESTRICTED, LockRefused,
                         acquire_lock, exit_code, exit_on_sigterm, holder_consumer, load_done, make_dirs, parse_task,
                         record_done, release_lock, root_path, stop_requested, turn_policy)
 
 NAME = "Antigravity"
+LIMITED_NO_SEND = "[no-send] Antigravity is at its usage limit; the owner was sent the account card\n"
 DEFAULT_ACP_COMMAND = "agy acp"
 NO_REPLY = "NO_REPLY"
 HELD_WAIT_S = held_start.WAIT_S
@@ -606,6 +609,15 @@ class Connector:
         self.retry_at = {}
         self.models = model_switch.ModelSwitch(args.state, self.root, getattr(args, "bridge_state", None), NAME,
                                                publish, quoted, log)
+        self.accounts = agy_account.AgyAccount(
+            args.state, getattr(args, "bridge_state", None), NAME, getattr(args, "agent_id", None) or "", publish,
+            quoted, log)
+        self.agy_pid = None   # the owner turn's agy process, whose own log names the account it used
+        # Out of quota: the account card, unasked, in the owner's DM, once per limit (quota_notice).
+        self.quota = quota_notice.QuotaNotice(args.state, getattr(args, "bridge_state", None), NAME,
+                                              self.accounts.quota_card, self.accounts.using, log)
+        self.desk = card_desk.Desk(self.root, card_desk.led(publish, self.models.unsaid, quoted), quoted,
+                                   [self.models, self.accounts])
 
     def models_seen(self, models: dict):
         """Remember what a Session offered (ACP `models`), for the card."""
@@ -614,7 +626,7 @@ class Connector:
 
     def card_task(self, task_id, headers, path, result_file):
         """The record of a task that was a card matter (a tap, or the owner's /model in their DM), else None."""
-        outcome = self.models.card_task(path, result_file)
+        outcome = self.desk.task(path, result_file)
         if not outcome:
             return None
         log("card ->", task_id, outcome)
@@ -663,7 +675,8 @@ class Connector:
                                            self.store, STDERR_NAME, NOT_SIGNED_IN, log, media=media,
                                            model=self.models.wanted(),
                                            on_models=self.models_seen,
-                                           mcp_servers=self.mcp_servers_for(headers, kind))
+                                           mcp_servers=self.mcp_servers_for(headers, kind),
+                                           on_initialized=self.use_app_gemini_key)
         if isolated is None:
             with guest_turn(self.args, headers, message) as pair:
                 return self.run_turn(task_id, headers, prompt, False, pair, message=message)
@@ -680,6 +693,67 @@ class Connector:
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt, decide,
                                        self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=turn,
                                        media=acp_host.Media(images=media.images), model=self.models.wanted())
+
+    def use_app_gemini_key(self, client, init, argv):
+        """Owner and collaborator turns only: agy on the Gemini API key saved in the app (gemini_key). The auth
+        mode is saved with the Session: a Session opened on the Google sign-in is not resumed on the key (its
+        session/load still bills that account's quota), nor the other way round."""
+        self.agy_pid = getattr(getattr(client, "p", None), "pid", None)
+        keyed = authenticate_with_app_key(client, init, self.args.rpc_timeout, argv,
+                                  agent_id=getattr(self.args, "agent_id", None) or "", log=log)
+        return API_KEY_AUTH if keyed else acp_host.SIGNED_IN_AUTH
+
+    @staticmethod
+    def in_owner_dm(path) -> bool:
+        """Whether the task is the owner's own, in their DM (the card rules' owner_may_act): the only place an
+        account notice is said. Elsewhere it is not said, and not marked seen, so the DM is told later."""
+        agent_card, _ = connector_cards._core()
+        try:
+            with open(path, encoding="utf-8") as f:
+                sent, _ = agent_card.reply_words(f.read())
+        except (OSError, ValueError):
+            return False
+        return agent_card.owner_may_act(sent) is None
+
+    def account_seen(self) -> str:
+        """Which account this owner turn's agy authenticated as (its own log's applyAuthResult): the line
+        saying so when it changed since the last turn (agy_account.saw), else ''. Best effort."""
+        try:
+            who = agy_account.signed_in_as(agy_account.agy_log_dir(getattr(self.args, "child_env", None)),
+                                           self.agy_pid) if self.agy_pid else ""
+            return self.accounts.saw(who)
+        except Exception as e:  # noqa: BLE001 - never fails the turn
+            log("account not read:", type(e).__name__)
+            return ""
+
+    def quota_hit(self, text, detail) -> str:
+        """agy is out of quota: tell the owner once (quota_notice), with the reset time when agy said one."""
+        try:
+            done = self.quota.hit(quota_notice.reset_from_text("%s %s" % (detail or "", text or "")))
+        except Exception as e:  # noqa: BLE001 - a notice that cannot be sent never stops task service
+            done = "quota-failed (%s: %s)" % (type(e).__name__, str(e)[:120])
+        if done:
+            log("quota:", done)
+        return done
+
+    def account_task(self, task_id, headers, path, status_kind, result_file):
+        """A message that is the account card's (agy_account), else None: the owner's words asking for the card
+        in their DM, or anyone's message carrying a sign-in code, an API key or its redaction marker, which is
+        never passed to agy (no secret is taken in chat)."""
+        agent_card, _ = connector_cards._core()
+        with open(path, encoding="utf-8") as f:
+            sent, said = agent_card.reply_words(f.read())
+        row = {"task": task_id, "status": "completed", "tier": headers["access_tier"], "policy": status_kind}
+        if agent_card.owner_may_act(sent) is None and not agent_card.click_tagged(sent) \
+                and agy_account.asks_for_card(said) and self.accounts.usable():
+            outcome = self.accounts.offer(sent, result_file)
+            log("card ->", task_id, outcome)
+            return dict(row, detail=outcome, card=outcome)
+        if agy_account.carries_secret(said):
+            log("not passed on ->", task_id, "(it carries a sign-in code, an API key or its redaction marker)")
+            publish(result_file, quoted(agy_account.KEY_IN_CHAT) + "\n")
+            return dict(row, status="refused", detail="api-key-in-chat")
+        return None
 
     @staticmethod
     def mcp_grant(headers, kind=None):
@@ -723,12 +797,16 @@ class Connector:
         path = os.path.join(self.args.inbox, name)
         result_file = os.path.join(self.args.results, name)
         headers, message, operator_lines = parse_task(path)
+        self.quota.remember(path=path)     # the owner's DM, where a quota notice goes
         kind, turn_kind = turn_for(headers)
         if turn_kind is None:
             log("refused (non-owner) ->", task_id, headers["access_tier"])
             publish(result_file, NON_OWNER_REFUSED)
             return {"task": task_id, "status": "refused", "tier": headers["access_tier"], "policy": kind}
         owner_turn = turn_kind == OWNER_TURN
+        owned = self.account_task(task_id, headers, path, status_kind=kind, result_file=result_file)
+        if owned:
+            return owned
         carded = self.card_task(task_id, headers, path, result_file)
         if carded:
             return carded
@@ -736,12 +814,17 @@ class Connector:
         log("wake ->", task_id, headers["access_tier"], event or "message")
         t0 = time.time()
         self.launch = None
+        switched = ""
         if owner_turn:
             prompt = wake_prompt(task_id, headers, message, operator_lines, self.args.cwd, self.note,
                                  shell_web=shell_web_on(self.args, headers, kind), kind=kind)
             if headers.get("access_tier") == "owner" and self.models.usable():
                 prompt += "\n\n" + model_switch.HINT
+            if headers.get("access_tier") == "owner" and self.accounts.usable():
+                prompt += "\n\n" + self.accounts.HINT
+            self.agy_pid = None
             status, text, detail, turn = self.run_turn(task_id, headers, prompt, True, kind=kind)
+            switched = self.account_seen() if kind == OWNER and self.in_owner_dm(path) else ""
         else:
             with guest_turn(self.args, headers, message) as pair:
                 prompt = wake_prompt(task_id, headers, message, operator_lines, None, self.note, readable=pair[1],
@@ -751,9 +834,18 @@ class Connector:
         # The owner's pick runs on every turn, whoever sends it; the outcome is told in the owner's DM only,
         # and only the owner's own turn may settle it as failed (another runtime's refusal is not theirs).
         told = self.models.tell(turn.live, turn.model, headers.get("channel_id"), may_fail=kind == OWNER)
-        asked = self.models.asked(headers.get("access_tier"), path, status, text, result_file)
+        asked = self.desk.marked(headers.get("access_tier"), path, status, text, result_file)
+        # Out of quota: the owner is told once, by the account card; the card is the notice, so the room gets
+        # no error line while agy is out (or the limit's own words when no card could be sent).
+        limited = not asked and agy_account.quota_error(status, text, detail)
+        quota = self.quota_hit(text, detail) if limited else (self.quota.cleared() if status == "completed" else "")
         unsaid = "" if asked else quoted(self.models.unsaid()).strip()
         body = self.answer_body(headers, status, text, detail, turn) + (unsaid and unsaid + "\n")
+        if owner_turn and switched and not body.startswith("[no-send]"):
+            body = quoted(switched).strip() + "\n" + body
+        if limited:
+            body = LIMITED_NO_SEND if self.quota.limited() else quoted(quota_notice.words(
+                NAME, quota_notice.reset_from_text("%s %s" % (detail or "", text or "")), "")) + "\n"
         reason = ""
         if self.launch is not None:
             launches = LaunchLog(self.args.session_store)
@@ -772,7 +864,8 @@ class Connector:
                 "tier": headers["access_tier"], "policy": kind, "isolated": not owner_turn, "turn_s": round(time.time() - t0, 3),
                 "permissions": turn.decisions, "updates": dict(turn.updates), "answer_chars": len(text or ""),
                 "sspace_tools_down": reason,
-                "model": turn.model, **({"model_switch": told} if told else {}), **({"card": asked} if asked else {})}
+                "model": turn.model, **({"model_switch": told} if told else {}), **({"card": asked} if asked else {}),
+                **({"quota": quota} if quota else {})}
 
     def pending_tasks(self, seen):
         now = time.time()
@@ -791,6 +884,8 @@ class Connector:
         while not stop_requested():
             with contextlib.suppress(Exception):   # a card's ledger entry never stops task service
                 connector_cards.absorb(self.args.bridge_state, self.root)
+            with contextlib.suppress(Exception):   # a quota card the bridge dropped is queued again
+                self.quota.tick()
             names = self.pending_tasks(seen)
             if not names:
                 if self.args.once and done >= self.args.once:

@@ -7,6 +7,7 @@ request first and echoes the decision; `[[stall]]` never completes until
 `turn/interrupt`; `[[stall-hard]]` ignores the interrupt too.
 """
 import json
+import os
 import sys
 import time
 import uuid
@@ -36,6 +37,22 @@ MODELS = ([{"id": "gpt-5.6-sol", "displayName": "Stub Model", "isDefault": True}
           + [{"id": mid, "displayName": "Stub %d" % n} for n, mid in
              ((5, "gpt-5.6-terra"), (6, "gpt-5.6-luna"), (7, "gpt-5.5"), (8, "gpt-5.2"))])
 BROKEN, MOVED = "gpt-6-astra", "gpt-6-luna"
+
+
+def home_file(name, text=None):
+    """A sign-in stand-in under CODEX_HOME: `stub-account` holds the address signed in, `stub-login` says
+    how the next sign-in ends ("success <address>", "fail", "refuse", "page <address of its page>";
+    absent: it never ends)."""
+    path = os.path.join(os.environ.get("CODEX_HOME") or ".", name)
+    if text is not None:
+        with open(path, "a") as f:
+            f.write(text)
+        return text
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
 
 
 def finish_turn(tid, turn_id, item_id, reply, status="completed", error=None):
@@ -69,6 +86,26 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": rid, "result": {"userAgent": "stub-app-server/0", "codexVersion": "stub"}})
     elif meth == "initialized":
         pass
+    elif meth == "account/read":
+        who = home_file("stub-account").split("\n")[-1]
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "account": {"type": "chatgpt", "email": who, "planType": "pro"} if who else None, "requiresOpenaiAuth": True}})
+    elif meth == "account/login/start":
+        plan = home_file("stub-login").split()
+        if plan[:1] == ["refuse"]:
+            send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": "login server could not start"}})
+            continue
+        page = plan[1] if plan[:1] == ["page"] else "https://stub.invalid/sign-in?id=login-1"
+        send({"jsonrpc": "2.0", "id": rid, "result": {"type": "chatgpt", "loginId": "login-1", "authUrl": page}})
+        if plan[:1] == ["success"]:
+            home_file("stub-account", "\n" + plan[1])
+        if plan and plan[0] != "page":
+            send({"jsonrpc": "2.0", "method": "account/login/completed",
+                  "params": {"loginId": "login-1", "success": plan[0] == "success",
+                             "error": None if plan[0] == "success" else "access_denied"}})
+    elif meth == "account/login/cancel":
+        home_file("stub-cancelled", p.get("loginId", "") + "\n")
+        send({"jsonrpc": "2.0", "id": rid, "result": {}})
     elif meth == "config/read":
         # The owner's config as the real server reports it: one MCP server a restricted thread must disable.
         send({"jsonrpc": "2.0", "id": rid, "result": {"config": {"mcp_servers": {"owner-mcp": {"command": "x"}},
@@ -110,6 +147,8 @@ for line in sys.stdin:
             reply += " model=%s" % p["model"]
         if "[[askmodel]]" in text:
             reply = "[model-card]"
+        if "[[askaccount]]" in text:
+            reply = "[account-card]"
         if "[[config]]" in text:      # what the thread was started with, for a test to pin its overrides
             reply += " config=" + json.dumps(tp.get("config"), sort_keys=True)
         if "[[empty]]" in text:

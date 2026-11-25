@@ -66,6 +66,9 @@ def session_key(headers, task_id):
     return room, tier
 
 
+SIGNED_IN_AUTH = "sign-in"   # a saved Session's `auth` when it names none: opened on the agent's own sign-in
+
+
 class SessionStore:
     def __init__(self, path):
         self.path = Path(path)
@@ -84,7 +87,7 @@ class SessionStore:
     def get(self, key):
         return self._read().get(tuple(key))
 
-    def remember(self, key, session_id, cwd, turns):
+    def remember(self, key, session_id, cwd, turns, auth=None):
         """Read, change and write the file under its lock: agent-connect may share this store, and a
         write that read before another's landed would drop that one's session."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -92,6 +95,8 @@ class SessionStore:
             rows = self._read()
             rows[tuple(key)] = {"room": key[0], "access_tier": key[1], "session_id": session_id, "cwd": cwd,
                                 "turns": turns, "updated_at": time.time()}
+            if auth:
+                rows[tuple(key)]["auth"] = auth
             payload = {"version": 1, "sessions": [rows[k] for k in sorted(rows)]}
             tmp = self.path.with_name(".%s.%d.%d.tmp" % (self.path.name, os.getpid(), threading.get_ident()))
             tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -647,7 +652,7 @@ def use_model(client, session_id, wanted, models, on_models, timeout, log):
 
 
 def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, stderr_name, not_signed_in, log,
-               isolated=None, model=None, on_models=None, media=None, mcp_servers=None):
+               isolated=None, model=None, on_models=None, media=None, mcp_servers=None, on_initialized=None):
     """One task's turn: spawn `args.acp_argv`, `initialize`, resume the task's Session (else open one), send one
     `session/prompt` and wait for it to stop. `decide(params) -> (allowed, reason, result)` answers each
     permission request. (status, text, detail, turn): status is completed | cancelled | timeout | gone | failed
@@ -656,7 +661,10 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
     `Media`), the prompt carries its image blocks when the agent declares `promptCapabilities.image`, the
     Session gets its folder in `additionalDirectories` when the agent declares that, and a paragraph says what
     was attached and where it may be read. `mcp_servers(init)` names the ACP `McpServer`s the Session gets from
-    the `initialize` result (none without it)."""
+    the `initialize` result (none without it). `on_initialized(client, init, argv)` runs right after
+    `initialize`, before any Session is opened (an adapter's own `authenticate` step); a str it returns names
+    how this process is authenticated, is saved with the Session, and a saved Session opened under another one
+    (a missing `auth` counts as SIGNED_IN_AUTH) is not resumed: a new one is opened."""
     turn = Turn()
     cwd = isolated.cwd if isolated else args.cwd
     argv = isolated.argv if isolated else args.acp_argv
@@ -677,6 +685,7 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
         return "failed", "", "the ACP command did not start (%s)" % e, turn
     try:
         init = client.initialize(args.rpc_timeout)
+        auth = on_initialized(client, init, argv) if on_initialized is not None else None
         caps = init.get("agentCapabilities") if isinstance(init.get("agentCapabilities"), dict) else {}
         loadable = bool(caps.get("loadSession"))
         prompt_caps = caps.get("promptCapabilities") if isinstance(caps.get("promptCapabilities"), dict) else {}
@@ -688,6 +697,10 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
         rec = None if isolated else store.get(key)
         servers = list(mcp_servers(init) or []) if mcp_servers is not None else []
         session_id, turns, opened = None, 0, None
+        if rec and auth and (rec.get("auth") or SIGNED_IN_AUTH) != auth:
+            log("not resuming session", rec.get("session_id"), "for", key, "- it was opened under",
+                rec.get("auth") or SIGNED_IN_AUTH, "and this turn runs on", auth)
+            rec = None
         if rec and rec.get("cwd") == cwd and loadable:
             try:
                 opened = client.call("session/load", dict({"sessionId": rec["session_id"], "cwd": cwd,
@@ -712,7 +725,7 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
                     log("isolated turn refused:", refused)
                     return "refused", "", isolated.refused % refused, turn
         if not isolated:
-            store.remember(key, session_id, cwd, turns + 1)
+            store.remember(key, session_id, cwd, turns + 1, auth=auth)
         turn.model = use_model(client, session_id, model, (opened or {}).get("models"), on_models,
                                args.rpc_timeout, log)
         turn.live = True

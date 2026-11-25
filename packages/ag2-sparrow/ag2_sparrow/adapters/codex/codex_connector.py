@@ -30,7 +30,7 @@ import threading
 import time
 import uuid
 
-from ... import connector_cards, held_start, model_switch
+from ... import account_switch, card_desk, connector_cards, held_start, model_switch
 from ...acp_host import quoted
 from ...collaborator_turn import stage_own_attachments, with_staged_paths
 from ...relay_loop import count_arg
@@ -305,7 +305,7 @@ class Connector:
         self.turn_declined = []   # approvals declined for that turn (requests that name it)
         self.turn_items = {}
         self.rerouted = ""        # the model Codex moved the current turn to, when it said so
-        self._models = None
+        self._models = self._accounts = None
 
     @property
     def root(self):
@@ -319,6 +319,47 @@ class Connector:
                                                     "Codex", write_atomic, quoted, log, refresh=self.list_models,
                                                     allowed=MODEL_ALLOWLIST)
         return self._models
+
+    @property
+    def accounts(self):
+        """The account card; made on first use, as `models` is."""
+        if self._accounts is None:
+            self._accounts = account_switch.AccountSwitch(
+                self.args.state, getattr(self.args, "bridge_state", None), "Codex", self.card_answer, quoted, log,
+                read=self.account_label, begin=self.begin_login,
+                cancel=lambda login: self.rpc.request("account/login/cancel", {"loginId": login}),
+                opener=lambda url: open_page(url))
+        return self._accounts
+
+    @property
+    def desk(self):
+        return card_desk.Desk(self.root, self.card_answer, quoted, [self.models, self.accounts])
+
+    def card_answer(self, result_file, body):
+        """A card matter's answer, led by a model outcome this turn could only say in words."""
+        return card_desk.led(write_atomic, self.models.unsaid, quoted)(result_file, body)
+
+    def account_label(self) -> str:
+        """The account the server is signed in with, as the card names it; '' when it is signed out."""
+        acct = (self.rpc.request("account/read", {"refreshToken": False}) or {}).get("account")
+        if not isinstance(acct, dict):
+            return ""
+        if acct.get("type") != "chatgpt":
+            return {"apiKey": "an API key", "amazonBedrock": "Amazon Bedrock",
+                    "gcp": "Google Cloud"}.get(acct.get("type"), "an account I can't name")
+        who, plan = account_switch.masked(acct.get("email") or "") or "a ChatGPT account", acct.get("planType")
+        return "%s (%s)" % (who, plan) if isinstance(plan, str) and plan else who
+
+    def begin_login(self) -> dict:
+        """Start a ChatGPT sign-in on the server: its id, and the page the owner finishes it on."""
+        res = self.rpc.request("account/login/start", {"type": "chatgpt"})
+        return {"id": res["loginId"], "url": res["authUrl"]}
+
+    def login_over(self, params):
+        """The server said a sign-in ended (`account/login/completed`): the account card tells the owner."""
+        outcome = self.accounts.finished(params.get("loginId"), bool(params.get("success")), params.get("error") or "")
+        if outcome:
+            log("account ->", outcome)
 
     def list_models(self) -> bool:
         """Ask the server which models it offers (`model/list`), for the card; False when it would not say."""
@@ -343,8 +384,8 @@ class Connector:
         return self.models.wanted() or (kept if self.models.ok(kept) else None) or self.args.model
 
     def card_task(self, task_id, headers, path, result_path):
-        """The metrics row of a task that was a card matter (a tap, or the owner's /model), else None."""
-        outcome = self.models.card_task(path, result_path)
+        """The metrics row of a task that was a card matter (a tap, or the owner's /model or /account), else None."""
+        outcome = self.desk.task(path, result_path)
         if not outcome:
             return None
         log("card ->", task_id, outcome)
@@ -580,6 +621,8 @@ class Connector:
                     self.turn_items[counted] = self.turn_items.get(counted, 0) + 1
                 if kind == "agentMessage":
                     text = item.get("text")       # last agentMessage of the turn wins
+            elif meth == "account/login/completed":
+                self.login_over(p)
             elif meth == "model/rerouted" and p.get("turnId") == turn_id:
                 self.rerouted = str(p.get("toModel") or "")
             elif meth == "turn/completed" and p.get("turn", {}).get("id") == turn_id:
@@ -682,10 +725,11 @@ class Connector:
         idle_since = time.time()
         metrics_path = os.path.join(self.args.state, "metrics.jsonl")
         while not stop_requested():
-            try:    # a card's ledger entry never stops task service
+            try:    # a card's ledger entry, or a sign-in given up, never stops task service
                 connector_cards.absorb(self.args.bridge_state, self.root)
+                self.accounts.expire()
             except Exception as e:  # noqa: BLE001
-                log("card ledger not updated:", "%s: %s" % (type(e).__name__, e))
+                log("card upkeep failed:", "%s: %s" % (type(e).__name__, e))
             names = self.pending_tasks(seen)
             if not names:
                 if self.args.once and done >= self.args.once:
@@ -697,6 +741,8 @@ class Connector:
                     m = self.rpc.events.get(timeout=self.args.poll)
                     if m is not None and "id" in m:
                         self.handle_server_request(m)
+                    elif m is not None and m.get("method") == "account/login/completed":
+                        self.login_over(m.get("params") or {})
                 except queue.Empty:
                     pass
                 continue
@@ -725,8 +771,8 @@ class Connector:
                 idle_since = time.time()
                 continue
             prompt = wrap_untrusted(task_id, headers, message, operator_lines, self.note, caps=policy.capabilities)
-            if headers["access_tier"] == "owner" and self.models.usable():
-                prompt += "\n\n" + model_switch.HINT
+            if headers["access_tier"] == "owner" and self.desk.hint():
+                prompt += "\n\n" + self.desk.hint()
             log("turn ->", task_id, headers["access_tier"], repr(message[:60]))
             t_sent = time.time()
             status, text, err = self.run_task(headers, prompt, policy.capabilities)
@@ -734,7 +780,7 @@ class Connector:
             out = self.result_body(status, text, err)
             # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
             told = self.tell_model(status, policy.capabilities, headers.get("channel_id"), policy.kind == OWNER)
-            asked = self.models.asked(headers["access_tier"], path, status, text, result_path)
+            asked = self.desk.marked(headers["access_tier"], path, status, text, result_path)
             out = "\n\n".join(x for x in (out.rstrip("\n"), quoted(self.models.unsaid()).strip()) if x)
             t_result = os.stat(result_path).st_mtime if asked else write_atomic(result_path, out.rstrip("\n") + "\n")
             record_done(done_path, task_id)
@@ -752,6 +798,18 @@ class Connector:
             log("result <-", json.dumps(rec))
             done += 1
             idle_since = time.time()
+
+
+def open_page(url, run=subprocess.run):
+    """Show `url` in this computer's browser; False where there is no way to, or it did not work."""
+    opener = "open" if sys.platform == "darwin" else shutil.which("xdg-open")
+    if not opener:
+        return False
+    try:
+        return run([opener, url], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   timeout=15).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def server_argv(server, codex="codex"):
