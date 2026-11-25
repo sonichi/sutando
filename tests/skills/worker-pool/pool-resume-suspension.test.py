@@ -5,6 +5,14 @@ Run with the disposable runtime's environment.json loaded into the environment.
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env, runtime_harness
+
+isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
+
 import json
 import os
 import shlex
@@ -73,13 +81,11 @@ def product_child(mode, journal, barrier, argv):
 class ResumeSuspensionLifecycle(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        socket = os.environ.get("SUTANDO_RUNTIME_SOCKET")
-        if not socket or not (Path(socket).parent / "environment.json").is_file():
+        environment, cls.supplied = runtime_harness()
+        if environment is None:
             raise unittest.SkipTest("requires the supplied disposable runtime environment")
-        cls.runtime = Path(socket).parent
-        cls.supplied = json.loads((cls.runtime / "environment.json").read_text())
-        cls.env_base = {**os.environ, **cls.supplied, "PYTHONDONTWRITEBYTECODE": "1",
-                        "SUTANDO_TELEMETRY": "0"}
+        cls.runtime = environment.parent
+        cls.env_base = isolated_child_env(**cls.supplied, PYTHONDONTWRITEBYTECODE="1", SUTANDO_TELEMETRY="0")
         cls.scratch = tempfile.TemporaryDirectory(prefix="resume-", dir=cls.runtime)
         cls.addClassCleanup(cls.scratch.cleanup)
         cls.root = Path(cls.scratch.name)

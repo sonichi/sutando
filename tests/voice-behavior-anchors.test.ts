@@ -190,6 +190,15 @@ test('self-introduction uses the display name; only the name changes', () => {
 	assert.strictEqual(g, cfg.buildGreeting(ctx(), OVERRIDES).replace('as Sutando — AnchorStand —', 'as Display Name X —'));
 });
 
+test('with no name the agent introduces itself unnamed and never makes one up', () => {
+	const unnamed = { ...OVERRIDES, agentName: '' };
+	const inst = cfg.buildInstructions(ctx(), unnamed);
+	assert.ok(inst.includes('When asked your name, say you do not have one to share; never make one up.'));
+	assert.ok(!inst.includes('say "I\'m'));
+	const g = cfg.buildGreeting(ctx(), unnamed);
+	assert.strictEqual(g, cfg.buildGreeting(ctx(), OVERRIDES).replace('as Sutando — AnchorStand —', 'as their agent, with no name —'));
+});
+
 test('the name answer is given with or without a Stand name; only the Stand line is gated', () => {
 	const ask = 'When asked your name or who you are, say "I\'m Display Name X."';
 	for (const [standIdentityJson, named] of [['{}', false], ['not json', false], ['{"name":"AnchorStand","nameOrigin":"fixture"}', true]] as const) {

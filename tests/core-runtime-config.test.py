@@ -96,7 +96,7 @@ class CoreRuntimeConfigTests(unittest.TestCase):
             before = selection.stat().st_mtime_ns
             self.assertEqual(sutando_config.persist_desktop_runtime_selection("claude", repo), "unchanged")
             self.assertEqual(selection.stat().st_mtime_ns, before)
-            self.assertEqual([p.name for p in app.iterdir() if p.is_file()], ["runtime.json"])
+            self.assertEqual([p.name for p in app.iterdir() if p.is_file() and p.name != "runtime.json.lock"], ["runtime.json"])
 
     def test_persist_creates_a_missing_selection(self):
         app = self.repo / "app"
@@ -154,7 +154,7 @@ class CoreRuntimeConfigTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 sutando_config.persist_desktop_runtime_selection("claude", self.repo)
         self.assertEqual(json.loads(selection.read_text()), {"coreRuntime": "codex"})
-        self.assertEqual([p.name for p in app.iterdir()], ["runtime.json"])
+        self.assertEqual([p.name for p in app.iterdir() if p.name != "runtime.json.lock"], ["runtime.json"])  # the lock file stays
 
     def test_rejects_unknown_runtime(self):
         self.write({"core": {"runtime": "other"}})

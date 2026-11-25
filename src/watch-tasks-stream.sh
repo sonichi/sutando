@@ -1005,6 +1005,17 @@ dispatch_task() {
   # This decision is its own read: a fresh snapshot, parsed here, used here.
   [ -z "$HELD_NAMES" ] || HELD_NAMES="$(printf '%s' "$HELD_NAMES" | grep -vxF -- "$filename")
 "
+  # The owner's bare "switch account / model / core" gets its card in code, not from the core
+  # (src/switch_card_intercept.py): the core missed it in words and cannot answer at its limit.
+  # Anything it does not post, or any failure, falls through to the core unchanged.
+  if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ ! -e "$CLAIMS_DIR/$filename" ] \
+     && [ "$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/switch_card_intercept.py" "$task_path" \
+          --workspace "$WORKSPACE_DIR" --results-dir "$RESULTS_DIR" --repo "$__REPO_ROOT")" = switch-card-answered ]; then
+    DECISION_IDENTITY="$identity"
+    dispatch_note "$filename" "the owner's switch request got its card in code; not announced"
+    record_admission
+    return 0
+  fi
   read_handler_config_now
   reconcile_dead_claims hold
   if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ "$HANDLER_STATE" = "broken" ]; then

@@ -3,7 +3,7 @@
 
 A test agent whose display name differs from its internal persona (Stand) name must introduce
 itself by the display name on every greeting path; with no display name the documented fallback
-order applies (connection record, configured name, mxid localpart, "Sutando")."""
+order applies (connection record, configured name, then none); a name is never made from the mxid."""
 from __future__ import annotations
 
 import contextlib
@@ -87,16 +87,40 @@ class ResolveTest(Fixture):
         with self.rows(), mock.patch.dict(os.environ, {"AGENT_DISPLAY_NAME": "Second"}):
             self.assertEqual(adn.resolve(MXID, fetch=profile(None)), ("Second", "configured"))
 
-    def test_then_the_localpart_then_sutando_and_never_the_persona(self):
+    def test_then_no_name_never_one_made_from_the_mxid_or_the_persona(self):
         with self.rows():
-            self.assertEqual(adn.resolve(MXID, fetch=profile(None)), ("Blue Fox", "localpart"))
-            self.assertEqual(adn.resolve(MXID, fetch=profile("   ")), ("Blue Fox", "localpart"))
-            self.assertEqual(adn.resolve("", fetch=profile(None)), ("Sutando", "fallback"))
-            self.assertEqual(adn.resolve("not-an-mxid", fetch=profile(DISPLAY)), ("Sutando", "fallback"))
+            self.assertEqual(adn.resolve(MXID, fetch=profile(None)), ("", "none"))
+            self.assertEqual(adn.resolve(MXID, fetch=profile("   ")), ("", "none"))
+            self.assertEqual(adn.resolve("", fetch=profile(None)), ("", "none"))
+            self.assertEqual(adn.resolve("not-an-mxid", fetch=profile(DISPLAY)), ("", "none"))
+        self.assertFalse(hasattr(adn, "localpart_name"))
+
+    def test_a_name_that_is_only_the_id_or_its_localpart_is_no_name(self):
+        local = MXID[1:].split(":")[0]
+        with self.rows():
+            for echoed in (MXID, MXID[1:], local, local.upper(), local.removesuffix(".agent")):
+                self.assertEqual(adn.resolve(MXID, fetch=profile(echoed)), ("", "none"), echoed)
+            self.assertEqual(adn.resolve(MXID, fetch=profile(DISPLAY)), (DISPLAY, "profile"))
+        with self.rows(), mock.patch.dict(os.environ, {"SUTANDO_DISPLAY_NAME": "blue-fox"}):
+            self.assertEqual(adn.resolve("", fetch=profile(None)), ("blue-fox", "configured"))
+            self.assertEqual(adn.resolve("not-an-mxid", fetch=profile(None)), ("blue-fox", "configured"))
+        long_mxid = "@" + "a-very-long-agent-handle-" * 4 + "x.agent:example.invalid"
+        with self.rows():
+            for echoed in (long_mxid, long_mxid[1:], long_mxid[1:].split(":")[0]):
+                self.assertEqual(adn.resolve(long_mxid, fetch=profile(echoed)), ("", "none"), echoed)
+
+    def test_the_cli_prints_no_name_and_says_not_to_state_one(self):
+        out, err = io.StringIO(), io.StringIO()
+        with self.rows(), mock.patch.object(adn, "profile_name", return_value=""), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(adn._main(["--agent-mxid", "@sky-lark-vm-stand.agent:example.invalid"]), 0)
+        self.assertEqual(out.getvalue(), "\n")
+        self.assertNotIn("Sky Lark", out.getvalue() + err.getvalue())
+        self.assertIn("Do not state a name", err.getvalue())
 
     def test_an_unreadable_connection_record_falls_through(self):
         with mock.patch("connections.read_rows", side_effect=RuntimeError("boom")):
-            self.assertEqual(adn.resolve(MXID, fetch=profile(None))[1], "localpart")
+            self.assertEqual(adn.resolve(MXID, fetch=profile(None))[1], "none")
 
 
 class EntryTest(Fixture):
@@ -117,13 +141,13 @@ class EntryTest(Fixture):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 adn._main(["--agent-mxid", MXID, "--offline", "--json"])
-            self.assertEqual(json.loads(out.getvalue())["source"], "localpart")
+            self.assertEqual(json.loads(out.getvalue())["source"], "none")
 
     def test_resolve_reads_the_agent_mxid_and_survives_none(self):
         with self.rows(), mock.patch.dict(os.environ, {"AGENT_MXID": MXID}):
             self.assertEqual(adn.resolve(fetch=profile(DISPLAY)), (DISPLAY, "profile"))
         with self.rows(), mock.patch.object(adn, "agent_mxid", side_effect=RuntimeError("no identity")):
-            self.assertEqual(adn.resolve(fetch=profile(DISPLAY)), ("Sutando", "fallback"))
+            self.assertEqual(adn.resolve(fetch=profile(DISPLAY)), ("", "none"))
 
     def test_cli_uses_the_room_agent_then_the_given_mxid_then_its_own(self):
         with self.rows({"agent_mxid": MXID, "agent_display_name": DISPLAY}):
@@ -135,7 +159,7 @@ class EntryTest(Fixture):
                     mock.patch.object(adn, "agent_mxid", return_value=MXID):
                 self.assertEqual(self.main("--room", "!r:example.invalid").strip(), DISPLAY)
             with mock.patch.object(adn, "agent_mxid", side_effect=RuntimeError("no identity")):
-                self.assertEqual(json.loads(self.main("--json"))["name"], "Sutando")
+                self.assertEqual(json.loads(self.main("--json"))["name"], "")
 
 
 class OtherServerRoomTest(Fixture):
@@ -153,16 +177,16 @@ class OtherServerRoomTest(Fixture):
 
     def test_a_room_whose_connection_names_no_identity(self):
         self.assertEqual(self.greet(return_value=""),
-                         {"name": "Sutando", "source": "fallback", "agent_mxid": ""})
+                         {"name": "", "source": "none", "agent_mxid": ""})
 
     def test_a_room_no_connection_serves(self):
         import connections
         got = self.greet(side_effect=connections.NoConnectionForRoom("no row for other.invalid"))
-        self.assertEqual(got, {"name": "Sutando", "source": "fallback", "agent_mxid": ""})
+        self.assertEqual(got, {"name": "", "source": "none", "agent_mxid": ""})
 
     def test_a_failing_tier_never_fails_the_resolver(self):
         with self.rows(), mock.patch.object(adn, "configured_name", side_effect=ImportError("gone")):
-            self.assertEqual(adn.resolve(MXID, fetch=profile(None)), ("Blue Fox", "localpart"))
+            self.assertEqual(adn.resolve(MXID, fetch=profile(None)), ("", "none"))
 
 
 class GreetingPathsTest(Fixture):

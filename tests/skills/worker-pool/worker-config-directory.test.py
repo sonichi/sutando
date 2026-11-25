@@ -19,17 +19,18 @@ import time
 import unittest
 from datetime import datetime, timezone
 
-REPO = Path(__file__).resolve().parents[3]
-SCRIPTS = REPO / "skills/worker-pool/scripts"
-sys.path.insert(0, str(REPO / "tests"))
-from _helpers.hermetic_env import hermetic_env  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ, runtime_harness  # noqa: E402
+
+isolate_os_environ()
+
 from _helpers.process_group import has_exited  # noqa: E402
 
-socket_setting = os.environ.get("SUTANDO_RUNTIME_SOCKET")
-environment_file = Path(socket_setting).parent / "environment.json" if socket_setting else None
-SUPPLIED = (json.loads(environment_file.read_text())
-            if environment_file is not None and environment_file.is_file() else {})
-RUNTIME_ROOT = environment_file.parent if SUPPLIED else None
+REPO = Path(__file__).resolve().parents[3]
+SCRIPTS = REPO / "skills/worker-pool/scripts"
+
+environment_file, SUPPLIED = runtime_harness()
+RUNTIME_ROOT = environment_file.parent if environment_file is not None else None
 
 # Outside the disposable runner, use the same minimal process boundary.
 ENDPOINT = r"""
