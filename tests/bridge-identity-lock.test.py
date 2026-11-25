@@ -36,6 +36,15 @@ from ag2_sparrow import gateway_instance, identity_lock  # noqa: E402
 
 AGENT, URL = "@probe.agent:s.space", "https://gateway.example/relay"
 
+
+def _main_loop_harness():
+    """The main-loop harness of the poll-stall suite: main() with its network and file work stubbed."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("poll_stall_loop", REPO / "tests" / "gateway-poll-stall-loop.test.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module._Loop
+
 # Another bridge for the same agent: its own folder, the same per-install key. It holds the lock until told to go.
 OTHER = """
 import sys, time
@@ -60,6 +69,7 @@ class IdentityLockTest(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
         rgb._IDENTITY_LOCK["name"] = ""
+        rgb._IDENTITY_TAKEN.clear()
         self.logs = []
         log = mock.patch.object(rgb, "_log", self.logs.append)
         log.start()
@@ -69,9 +79,9 @@ class IdentityLockTest(unittest.TestCase):
         emit.start()
         self.addCleanup(emit.stop)
 
-    def other_bridge(self, agent=AGENT):
+    def other_bridge(self, agent=AGENT, url=URL):
         child = subprocess.Popen([sys.executable, "-c", OTHER, str(REPO / "packages" / "ag2-sparrow"), str(self.home),
-                                  agent, URL], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                                  agent, url], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
                                  env=isolated_child_env())
         self.addCleanup(lambda: (child.poll() is None and child.kill(), child.wait(), child.stdout.close(),
                                  child.stdin.close()))
@@ -139,6 +149,31 @@ class IdentityLockTest(unittest.TestCase):
             self.assertEqual(rgb._IDENTITY_LOCK["name"], "")
         self.other_bridge()
         self.assertFalse(rgb._heartbeat_identity(), "known now, and already served: stop polling")
+        self.assertTrue(rgb._IDENTITY_TAKEN.is_set())
+
+    def test_a_live_duplicate_found_after_the_start_ends_main_with_the_stand_down_code_not_a_restart(self):
+        # Review of #6816: it left with 70, which tells the supervisor to relaunch a bridge that must not run.
+        known = iter(["", AGENT, AGENT, AGENT])                  # unknown at the start, known by the first heartbeat
+        other = self.other_bridge(url="http://relay.invalid")
+        with _main_loop_harness()(rgb, polls=[], alive=[]) as loop, \
+                mock.patch.object(rgb, "_reenroll_identity", lambda: next(known, AGENT)):
+            real_beat, real_acquire = loop._saved["_heartbeat_singleton"], loop._saved["_acquire_singleton"]
+            self.assertTrue(real_acquire())                      # this bridge's own folder lock, really held
+            self.addCleanup(loop._saved["_ws_release"] if "_ws_release" in loop._saved else rgb._ws_release,
+                            rgb._LOCK_ROLE, rgb._LOCK_WS)
+            rgb._heartbeat_singleton = real_beat
+            code = loop.run()
+            said = " ".join(loop.logs)
+        self.assertEqual(code, rgb.STAND_DOWN_EXIT_CODE, said)
+        self.assertEqual(loop.poll_count, 0, "it never polled as the agent another bridge serves")
+        self.assertIn("pid %d" % other.pid, said)
+        # A lock this bridge held and then lost is still a restart: the successor is the one that took it.
+        other.stdin.close()
+        other.wait(timeout=10)
+        rgb._IDENTITY_TAKEN.clear()
+        with _main_loop_harness()(rgb, polls=[], alive=[]) as loop:
+            self.assertIsNone(loop.run(), "the harness reads LOCK_LOST_EXIT_CODE as None")
+        self.addCleanup(identity_lock.release, rgb._IDENTITY_LOCK["name"])
 
     def test_no_key_a_lock_error_or_the_kill_switch_never_stop_the_bridge(self):
         with mock.patch.object(gateway_instance, "binding_key_path", lambda: self.home / "none" / "binding.key"):
