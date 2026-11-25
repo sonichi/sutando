@@ -1305,6 +1305,15 @@ class Switch(Base):
                 self.assertTrue(out["say"].endswith("The core is still on Codex."), out["say"])
                 self.assertNotIn("may be down", out["say"])
 
+    def test_an_unconfirmed_switch_on_a_beating_core_is_not_rolled_back(self):
+        self.launcher_confirms = self.launcher_selects = False
+        with mock.patch.object(account_card, "fresh_beat", lambda ws, since: True):
+            rc, out = self.carded()
+        self.assertEqual(self.restarts, ["claude"], "a core that is alive is not restarted again")
+        self.assertEqual((rc, out["outcome"]), (1, "error"))
+        self.assertNotIn("fell_back", out)
+        self.assertIn("could not confirm it is running on Claude Code", out["say"])
+
     def test_a_relaunch_that_fails_too_names_what_to_do_outside_chat(self):
         out = self.failing_switch(back_ok=False)
         self.assertIn("Starting Codex again did not come back either, so the core may be down.", out["say"])

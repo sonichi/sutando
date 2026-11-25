@@ -1043,7 +1043,10 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
             # This switch's own restart replaced the session: the desktop's gateway window went with it.
             gateway = restore_desktop_gateway(run) if restarted else ""
             got = confirm(ws, args.runtime, started, sleep=sleep, clock=clock)
-            if not got["core"] and restarted and was in NAMES and was != args.runtime:
+            import account_card
+            # Rolled back only on a failed restart or a core seen gone: an unconfirmed but beating core is kept.
+            gone = rc != 0 or not account_card.fresh_beat(ws, started)
+            if not got["core"] and restarted and gone and was in NAMES and was != args.runtime:
                 told = fall_back(ws, args.room, args.runtime, was, args.attempt, got, rc, before, card=args.card,
                                  restart=restart, run=run, core=core, execute=execute, sleep=sleep, clock=clock)
             else:
