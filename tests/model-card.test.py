@@ -190,8 +190,9 @@ class Menu(Base):
         self.assertRegex(entry["handler"], ac._HANDLER_RE)
         self.assertEqual(entry["offers"][SAID["fable"]], "card:model:core:fable")
 
-    def test_a_retried_answer_to_one_message_reuses_its_operation_id(self):
-        # The same task again after a watcher restart, seconds later: the platform gets the same id.
+    def test_a_retried_answer_reuses_its_id_and_gets_the_earlier_post_back_even_if_edited(self):
+        # A reused id returns the earlier post, even if that card was since edited to its outcome; the retry
+        # then records that event as its card. Intended: never a second card for one message.
         import argparse
         for at, ask in ((100.0, "$ask1"), (107.0, "$ask1"), (107.0, "$ask2"), (108.0, ""), (109.0, "")):
             args = argparse.Namespace(room=DM, owner_dm=False, reply_to=ask, print=False, lead="")

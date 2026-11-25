@@ -255,8 +255,20 @@ class Card(Base):
         self.assertEqual((rc, out["handler"]), (0, rtc.HANDLER))
         self.assertEqual(self.fake.calls, [])
 
-    def test_a_retried_answer_to_one_message_reuses_its_operation_id(self):
-        # The same task again after a watcher restart, seconds later: the platform gets the same id.
+    def test_a_retry_after_the_runtime_changed_is_a_new_card(self):
+        import argparse
+        for shown in ("claude", "codex"):
+            args = argparse.Namespace(room=DM, reply_to="$ask1", print=False)
+            with mock.patch.object(rtc, "runtime", return_value=shown), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rtc.cmd_post(self.ws, args, core=CORE, execute=self.fake.execute, now=lambda: T0)
+        ops = [c[2] for c in self.fake.calls]
+        self.assertEqual(len(ops), 2)
+        self.assertNotEqual(ops[0], ops[1], "the same message, another runtime shown: not the old card")
+
+    def test_a_retried_answer_reuses_its_id_and_gets_the_earlier_post_back_even_if_edited(self):
+        # A reused id returns the earlier post, even if that card was since edited to its outcome; the retry
+        # then records that event as its card. Intended: never a second card for one message.
         import argparse
         for at, ask in ((T0, "$ask1"), (T0 + 7, "$ask1"), (T0 + 7, "$ask2"), (T0 + 8, ""), (T0 + 9, "")):
             args = argparse.Namespace(room=DM, reply_to=ask, print=False)
