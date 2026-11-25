@@ -538,9 +538,11 @@ def _waiting_row(plain: str) -> bool:
 
 
 def _live_spinner(capture: Optional[str]) -> Optional[List[str]]:
-    """Plain rows from the newest turn row above the composer down, when that row is a spinner."""
+    """Plain rows from the newest turn row above the composer down, when that row is a spinner
+    drawn at column 0, as the CLI draws its live one. Reply and tool text are indented."""
     lines = (capture or "").splitlines()
-    return turn_status([_SGR.sub("", ln) for ln in lines[:len(lines) - len(_below_composer(capture))]])
+    rows = turn_status([_SGR.sub("", ln) for ln in lines[:len(lines) - len(_below_composer(capture))]])
+    return rows if rows and not rows[0][:1].isspace() else None
 
 
 def turn_running(capture: Optional[str], adapter: RuntimeAdapter = CLAUDE, waits: bool = True) -> bool:
