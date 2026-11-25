@@ -612,6 +612,34 @@ class HolderLockTest(unittest.TestCase):
             self.assertEqual(type(self.acquire()).__name__, "Acquired")
         self.assertIs(self.hl._HOST_NAME_DRIFTS, sys.platform == "darwin", "only where the name follows the network")
 
+    def test_a_renamed_host_is_read_only_on_a_disk_known_to_be_local(self):
+        """Without positive evidence that the records sit on a local disk, a record under another name
+        may be another machine's: it stays unobserved, alive or dead, and keeps fencing the root."""
+        pid, start = self.proc()
+        dpid, dstart = self.dead()
+        for why, fstype in (("the probe failed", None), ("a network mount", "nfs"), ("not MNT_LOCAL", "nonlocal:apfs")):
+            with self.subTest(why), mock.patch.object(self.hl, "_HOST_NAME_DRIFTS", True), \
+                    mock.patch.object(self.hl, "_statfs_type", return_value=fstype):
+                self.assertFalse(self.hl._records_are_local())
+                self.assertIsNone(self.hl.verify_lineage(pid, start, "mac.lan"))
+                self.assertIsNone(self.hl.verify_lineage(dpid, dstart, "mac.lan"))
+                self.put(self.record2(dpid, dstart, host="mac.lan"))
+                (self.ldir() / self.hl.LOCK_NAME).touch()     # the lock a past holder left, now free
+                self.assertEqual(self.hl.occupancy(str(self.root)), "unobserved", "the dead record still fences")
+                self.assertEqual(self.hl.status(str(self.root))["holder_lineage"], None)
+                self.assertFalse(self.hl._proven_dead({"owner_pid": dpid, "owner_start": dstart, "host": "mac.lan",
+                                                       "consumer": {"pid": dpid, "start": dstart}}),
+                                 "and is never tombstoned")
+        with mock.patch.object(self.hl, "_statfs_type", side_effect=OSError("denied")):
+            self.assertFalse(self.hl._records_are_local())
+        with mock.patch.object(self.hl, "_statfs_type", return_value="apfs") as probe:
+            self.assertTrue(self.hl._records_are_local())
+        probe.assert_called_once_with(self.hl._locks_home())
+        with mock.patch.object(self.hl, "_locks_home", return_value=str(self.root / "not" / "made" / "yet")), \
+                mock.patch.object(self.hl, "_statfs_type", return_value="apfs") as probe:
+            self.assertTrue(self.hl._records_are_local())
+        probe.assert_called_once_with(str(self.root))
+
     def test_start_time_ignores_locale_and_time_zone(self):
         base = self.hl.start_time(os.getpid())
         self.assertRegex(base, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")

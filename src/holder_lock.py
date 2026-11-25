@@ -218,9 +218,13 @@ def lock_dir(root) -> str:
     return _lock_dir_of(os.stat(os.path.abspath(os.path.normpath(os.fspath(root)))))
 
 
+def _locks_home() -> str:
+    return os.path.join(_home(), ".local", "state", "ag2-sparrow", "locks")
+
+
 def _lock_dir_of(st) -> str:
     digest = hashlib.sha256(("%d:%d" % (st.st_dev, st.st_ino)).encode("ascii")).hexdigest()[:16]
-    return os.path.join(_home(), ".local", "state", "ag2-sparrow", "locks", digest)
+    return os.path.join(_locks_home(), digest)
 
 
 def install_id() -> str:
@@ -277,16 +281,31 @@ def _pid_alive(pid: int) -> Optional[bool]:
     return True
 
 
-# macOS renames a machine as its network changes, and a record is only ever written on a local disk,
-# which one kernel serves: there a name that differs is this machine's earlier one, never another's.
+# macOS renames a machine as its network changes. A record on a disk only this kernel serves was
+# written here, so there a name that differs is this machine's earlier one, never another's.
 _HOST_NAME_DRIFTS = sys.platform == "darwin"
+
+
+def _records_are_local() -> bool:
+    """Positive evidence that every record is this machine's own: the directory all lock dirs live in
+    (its nearest existing ancestor, before any record exists) is on a filesystem that names its type,
+    and the type is not a network one. An unreadable or unknown filesystem is not evidence."""
+    try:
+        where = _locks_home()
+        while not os.path.isdir(where) and os.path.dirname(where) != where:
+            where = os.path.dirname(where)
+        fstype = _statfs_type(where)
+    except (LockError, OSError):
+        return False
+    return bool(fstype) and not _is_network(fstype)
 
 
 def verify_lineage(pid: int, start: Optional[str], host: Optional[str] = None) -> Optional[bool]:
     """True: that very process runs here. False: gone, or the pid now names another process.
     None: it cannot be observed (another host, no start to compare, or an unreadable start time).
-    Where the host's name drifts (_HOST_NAME_DRIFTS) a record under another name is still read here."""
-    if host is not None and host != _host() and not _HOST_NAME_DRIFTS:
+    Where the host's name drifts (_HOST_NAME_DRIFTS) a record under another name is still read here,
+    but only while the records are known to be on a local disk (_records_are_local)."""
+    if host is not None and host != _host() and not (_HOST_NAME_DRIFTS and _records_are_local()):
         return None
     alive = _pid_alive(pid)
     if alive is not True:
