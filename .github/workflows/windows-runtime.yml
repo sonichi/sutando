@@ -132,6 +132,8 @@ jobs:
         run: |
           pwsh -NoProfile -File tests/windows-workspace-encoding.test.ps1
           if ($LASTEXITCODE -ne 0) { throw 'windows-workspace-encoding.test.ps1 failed' }
+          pwsh -NoProfile -File tests/windows-watcher-live.test.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'windows-watcher-live.test.ps1 failed' }
           pwsh -NoProfile -File tests/windows-startup.test.ps1
           if ($LASTEXITCODE -ne 0) { throw 'windows-startup.test.ps1 failed' }
           pwsh -NoProfile -File tests/windows-launch-hooks.test.ps1
