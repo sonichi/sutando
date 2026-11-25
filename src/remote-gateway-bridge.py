@@ -45,7 +45,7 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
         sys.path.insert(0, _p)
 
 from proactive_routing import (BRIDGE_CHANNELS, body_target_channel,  # noqa: E402
-                               lane_claims_proactive, proactive_destination,
+                               lane_claims_card, lane_claims_proactive, proactive_destination,
                                should_claim_proactive)
 from workspace_default import resolve_workspace  # noqa: E402
 import worker_lane  # noqa: E402
@@ -124,6 +124,43 @@ def _sutando_core_recovery():
 
 # The core's record rides the core's lanes' heartbeats; a pool worker's lane is not the core.
 _SUTANDO_CORE_RECOVERY_READER = None if _OWN_DIRS else _sutando_core_recovery
+
+
+def _sutando_runtime_profile():
+    """The core's runtime_profile.v1 block through its one owner (src/runtime_profile.py)."""
+    import runtime_profile
+    return runtime_profile.read(WS)
+
+
+# Like the recovery record: the core's lanes carry the core's profile, a pool worker's lane none.
+_SUTANDO_RUNTIME_PROFILE_READER = None if _OWN_DIRS else _sutando_runtime_profile
+
+_QUOTA_TRACKER_MANIFEST = _REPO / "skills" / "quota-tracker" / "manifest.json"
+
+
+def _sutando_quota_status():
+    """The core's quota block (src/quota_status.py); a Codex core has none."""
+    import core_recovery_state
+    import quota_status
+    return quota_status.read(WS, runtime=core_recovery_state.recorded_runtime(WS))
+
+
+def _sutando_quota_status_reader():
+    """The debounced reader, or None; a broken quota module costs the block, never the start."""
+    try:
+        import skill_config
+        if _OWN_DIRS or not skill_config.enabled("QUOTA_STATUS_PUBLISH", _QUOTA_TRACKER_MANIFEST):
+            return None
+        import quota_status
+        return quota_status.Debounced(_sutando_quota_status)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[remote-gateway-bridge] quota status off: {type(exc).__name__}: {exc}",
+              file=sys.stderr, flush=True)
+        return None
+
+
+# Like the recovery record, the core's lanes only; off without quota-tracker or with its switch off.
+_SUTANDO_QUOTA_STATUS_READER = _sutando_quota_status_reader()
 
 # Logged recovery commands name the workspace through its resolver, never its absolute path.
 _SUTANDO_WORKSPACE_RESOLVER = "bash scripts/sutando-config.sh workspace"
@@ -544,6 +581,40 @@ def _install_worker_lane(worker: str) -> None:
 _LANE_WORKER = _lane_worker() if GATEWAY_INSTANCE else ""  # noqa: F821
 if _LANE_WORKER:
     _install_worker_lane(_LANE_WORKER)
+
+
+def _ag2space_card_claim(req) -> bool:
+    """A card a worker's session asked is its own lane's to post (one lane of a worker with agents on
+    several servers: `worker_lane.is_worker_card_lane`); any other card the primary's."""
+    subject = getattr(req, "subject", None)
+    by_worker = subject.get("by_worker") if isinstance(subject, dict) else None
+    if not lane_claims_card(by_worker, _LANE_WORKER, primary=owns_unaddressed()):  # noqa: F821
+        return False
+    if not _LANE_WORKER:
+        return True
+    room = getattr(req, "room", "")
+    room = room if isinstance(room, str) else ""
+    if worker_lane.is_worker_card_lane(GATEWAY_INSTANCE, _LANE_WORKER, WS, room):  # noqa: F821
+        return True
+    if worker_lane.card_lane(_LANE_WORKER, room, WS) is None:  # noqa: F821
+        _card_undeliverable(req, room)
+    return False
+
+
+_CARDS_TOLD_UNDELIVERABLE: set = set()
+
+
+def _card_undeliverable(req, room: str) -> None:
+    """A worker's card no lane of it can post (none serves its room's server): said once per card."""
+    rid = str(getattr(req, "id", "") or "")
+    if rid in _CARDS_TOLD_UNDELIVERABLE:
+        return
+    _CARDS_TOLD_UNDELIVERABLE.add(rid)
+    _log(f"ERROR: lane {GATEWAY_INSTANCE}: decision card {rid} of worker {_LANE_WORKER} is undeliverable: "  # noqa: F821
+         f"no serving lane of it reaches {room or 'the owner DM'}")
+
+
+CARD_CLAIM = _ag2space_card_claim
 STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821
                    and not gateway_credential_sources.is_seat(os.environ) else None)  # noqa: F821
 

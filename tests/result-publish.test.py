@@ -239,6 +239,19 @@ class RelativePathAnchoring(unittest.TestCase):
                 finally:
                     os.chdir(cwd)
 
+    def test_cli_refuses_a_relative_path_outside_results(self):
+        for mod in self.MODULES:
+            for rel in ("workspace/results/task-1.txt", "task-1.txt", "results/sub/task-1.txt",
+                        "results/../task-1.txt", "results/.."):
+                with self.subTest(mod=mod.__file__, rel=rel), tempfile.TemporaryDirectory() as td:
+                    err = io.StringIO()
+                    with mock.patch("workspace_default.resolve_workspace", return_value=Path(td)), \
+                            mock.patch.object(mod.sys, "stdin", io.StringIO("x")), \
+                            mock.patch.object(mod.sys, "stderr", err):
+                        self.assertEqual(mod.main(["result_publish.py", rel]), 2)
+                    self.assertIn("is not results/<name>", err.getvalue())
+                    self.assertEqual(list(Path(td).rglob("*.txt")), [], "nothing was written anywhere")
+
 
 class PublisherFailurePaths(unittest.TestCase):
     """Run against src and the vendored ag2-sparrow copy: the bridge imports the latter."""
@@ -496,8 +509,6 @@ _SH_ASSIGN = re.compile(r"^\s*(?:local\s+|export\s+|readonly\s+)?([A-Za-z_]\w*)=
 _TS_ASSIGN = re.compile(r"\b(?:const|let|var)\s+(\w+)\s*(?::[^=;]+)?=\s*([^;]+);")
 _TS_WRITE = re.compile(r"\b(?:writeFileSync|appendFileSync|writeFile|createWriteStream)\(\s*([^,)]+)")
 _TS_RESULTS = re.compile(r"""['"`]results['"`/]|/results/|\bRESULTS?_DIR\b|\bresultsDir\b|\bresultDir\b""")
-# Not result bodies a drain delivers: a smoke test's backdated fixture.
-_SCAN_EXEMPT = {"skills/self-diagnose/scripts/test-gather.sh"}
 
 
 def shell_results_writes(text: str) -> list:
@@ -531,7 +542,7 @@ def scan_results_writes(root: Path = REPO) -> list:
     for top in ("src", "skills", "scripts"):
         for p in sorted((root / top).rglob("*")):
             rel = p.relative_to(root).as_posix()
-            if not p.is_file() or "node_modules" in p.parts or ".test." in p.name or rel in _SCAN_EXEMPT:
+            if not p.is_file() or "node_modules" in p.parts or ".test." in p.name:
                 continue
             if p.suffix in (".sh", ".bash"):
                 found = shell_results_writes(p.read_text(encoding="utf-8", errors="replace"))

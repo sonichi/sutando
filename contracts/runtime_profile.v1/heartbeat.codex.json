@@ -1,0 +1,25 @@
+{
+  "client": "sutando-gateway-client",
+  "protocol_version": 1,
+  "provider": "remote-gateway",
+  "tier": "owner",
+  "inflight": 0,
+  "status": "idle",
+  "capabilities": [
+    "task-ack",
+    "heartbeat",
+    "core-status",
+    "runtime_profile.v1"
+  ],
+  "runtime_profile": {
+    "v": 1,
+    "reported_at": 1789999990,
+    "model": {"id": "gpt-5.5", "display_name": "GPT-5.5", "runtime": "codex"},
+    "switch_options": [
+      {"token": "gpt-5.5", "display_name": "GPT-5.5"},
+      {"token": "gpt-5.5-mini", "display_name": "GPT-5.5 mini"}
+    ],
+    "plan": {"name": "ChatGPT Pro"},
+    "workers": []
+  }
+}
