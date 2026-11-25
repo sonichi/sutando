@@ -84,13 +84,14 @@ def own_dir(cfg: dict, others=()) -> str:
     return cfg["CLAUDE_CONFIG_DIR"]
 
 
-def status(cfg: dict, env: dict, run=subprocess.run) -> dict:
+def status(cfg: dict, env: dict, run=subprocess.run, show=None, wait_s: float = STATUS_WAIT_S) -> dict:
     """{signed_in, method, account, plan, proxy}: the account of the agent's config dir, as Claude Code
     reports it. `account` is masked. `proxy` says the session's requests go through the credential
-    proxy, whose own sign-in is then the one in use. Unknown reads as signed_in None, never as signed out."""
+    proxy, whose own sign-in is then the one in use. Unknown reads as signed_in None, never as signed out.
+    `show` shortens the address in place of `masked` (the account card's own rule for the owner's DM)."""
     out = {"signed_in": None, "method": "", "account": "", "plan": "", "proxy": bool(env.get(PROXY_VAR))}
     try:
-        r = run([cfg["CLAUDE"], "auth", "status", "--json"], capture_output=True, text=True, timeout=STATUS_WAIT_S,
+        r = run([cfg["CLAUDE"], "auth", "status", "--json"], capture_output=True, text=True, timeout=wait_s,
                 env=env, stdin=subprocess.DEVNULL)
         data = json.loads(r.stdout or "")
     except (OSError, subprocess.SubprocessError, ValueError) as e:
@@ -98,7 +99,7 @@ def status(cfg: dict, env: dict, run=subprocess.run) -> dict:
     if not isinstance(data, dict) or not isinstance(data.get("loggedIn"), bool):
         return dict(out, detail="claude auth status gave no answer this understands")
     method = str(data.get("authMethod") or "")
-    return dict(out, signed_in=data["loggedIn"], method=method, account=masked(data.get("email")),
+    return dict(out, signed_in=data["loggedIn"], method=method, account=(show or masked)(str(data.get("email") or "")),
                 plan=str(data.get("subscriptionType") or ""))
 
 

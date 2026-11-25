@@ -33,6 +33,23 @@ HINT = ("If the person asks to switch, change or sign in to another account for 
         "use, reply with exactly %s and nothing else: they are then shown a card for it. Do not start a "
         "sign-in yourself." % MARK)
 IN_DM = "I can switch accounts from our direct message. Ask me there."
+# The account card's words, English only. On the agent's own computer the desktop app draws the account
+# controls below them (from the `account_controls` marker); elsewhere the client says where to open it.
+BELOW = "Switch this agent's account below."
+CONTROLS = "account_controls"
+
+
+def elsewhere(name: str) -> str:
+    """Where the account controls are, for a place that cannot draw them."""
+    return "Open this on the computer that runs %s to switch account." % (name or "this agent")
+
+
+def with_controls(built, runtime: str = "", agent: str = ""):
+    """`built` (body, card) marked as an account card: a client that knows the marker draws the agent's
+    account controls in it, nothing typed there reaching the room; one that does not shows the text."""
+    body, card = built
+    marker = {k: v for k, v in (("runtime", runtime), ("agent", agent)) if v}
+    return body, dict(card, **{CONTROLS: marker})
 ANSWERED = "[no-send] the account card answers\n"
 
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import re
 
+from ... import pane_composer
 from ...cli_wedge_patterns import ABNORMAL_PATTERNS
 from . import trust
 
@@ -21,6 +22,8 @@ STALL_MIN_S = 600.0
 ABNORMAL_MIN_S = 60.0
 INFLIGHT_PHASES = frozenset(("CALLING", "TURN_CONFIRMED"))
 _DECOR = re.compile(r"^[\s>·─-╿✓✗✻✳⏵⎿⣀-⣿]+")
+# Claude Code's own limit menu (startup or mid-turn) is a limit by itself; nothing here answers it.
+limit_menu = pane_composer.limit_menu
 
 
 def frame_hash(text: str) -> str:
@@ -31,8 +34,10 @@ def abnormal_names(text: str) -> list:
     """The banner families whose pattern leads a line of the capture (prose mid-line never counts)."""
     lines = [_DECOR.sub("", ln) for ln in text.splitlines()]
     waiting = trust.dialog(text)
-    return [name for name, rx in ABNORMAL_PATTERNS if any(rx.match(ln) for ln in lines)] + (
-        ["dialog:" + waiting] if waiting else [])
+    names = [name for name, rx in ABNORMAL_PATTERNS if any(rx.match(ln) for ln in lines)]
+    if "quota-limit" not in names and limit_menu(text):
+        names.insert(0, "quota-limit")
+    return names + (["dialog:" + waiting] if waiting else [])
 
 
 def inflight_task(plugin: dict) -> "str | None":
@@ -51,11 +56,12 @@ def stuck_answers(plugin: dict) -> dict:
 
 
 def derive(previous: dict, text: str, plugin: dict, now: float, stall_min_s: float = STALL_MIN_S,
-           abnormal_min_s: float = ABNORMAL_MIN_S) -> dict:
+           abnormal_min_s: float = ABNORMAL_MIN_S, own: "str | None" = None) -> dict:
     """The next observation: {frame_hash, static_since, task, abnormal, stall}. `stall` is None or
     {reason, since, frame_hash, task, checks, lines}: `static` once the pane has not changed for
     stall_min_s with an offer in flight, `abnormal:<names>` once abnormal text has shown for
-    abnormal_min_s. Any change of frame, task or banner set resets the clock and clears the stall."""
+    abnormal_min_s. Any change of frame, task or banner set resets the clock and clears the stall.
+    `own` is the pane without what only repeats a task's text: banners are read there when given."""
     h = frame_hash(text)
     alarm = plugin.get("progress_unwritable") or {}
     if alarm:
@@ -75,7 +81,7 @@ def derive(previous: dict, text: str, plugin: dict, now: float, stall_min_s: flo
                           "checks": "tasks without an answer: %s" % ", ".join(
                               "%s (%s)" % (i, stuck[i].get("detail") or "no detail") for i in ids), "lines": []}}
     task = inflight_task(plugin)
-    names = abnormal_names(text)
+    names = abnormal_names(text if own is None else own)
     same = previous.get("frame_hash") == h and previous.get("task") == task
     static_since = previous["static_since"] if same and previous.get("static_since") is not None else now
     abnormal_since = (previous["abnormal_since"] if names and previous.get("abnormal") == names

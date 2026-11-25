@@ -175,6 +175,100 @@ class ConnectorCards(unittest.TestCase):
         posted = sorted((self.state / "agent-cards" / "posted").iterdir())
         self.assertEqual([json.loads(p.read_text())["event_id"] for p in posted], ["$new1", "$new2"])
 
+    def test_what_became_of_a_queued_card_is_recorded_and_outlives_its_receipt(self):
+        outbox = self.state.joinpath(*cc.OUTBOX)
+        posted = cc.queue(self.state, ROOM, *model_card(), now=1000.0)
+        self.assertEqual(cc.outcome(self.state, posted), "", "queued is not an outcome")
+        self.assertEqual(self.poster(OSError("down")).sweep(), 0)
+        self.assertEqual(cc.outcome(self.state, posted), "", "nor is a post that failed")
+        self.assertEqual(self.poster().sweep(), 1)
+        self.assertEqual(cc.outcome(self.state, posted), "posted")
+        self.assertEqual(cc.absorb(self.state, self.root), 1)
+        self.assertEqual(cc.outcome(self.state, posted), "posted", "the receipt is consumed; the outcome stays")
+        # Dropped for age, and dropped for being unreadable: both are recorded before the entry goes.
+        aged = cc.queue(self.state, ROOM, *model_card(), now=1000.0)
+        self.assertEqual(self.poster(clock=lambda: 1000.0 + cc.MAX_QUEUED_S + 1).sweep(), 0)
+        broken = "0" * 31 + "f"
+        outbox.joinpath(broken + ".json").write_text("{not json", encoding="utf-8")
+        self.assertEqual(self.poster().sweep(), 0)
+        self.assertEqual((cc.outcome(self.state, aged), cc.outcome(self.state, broken), list(outbox.iterdir())),
+                         ("dropped", "dropped", []))
+        # Only a queue id is looked up, only the two words are an outcome, and an old one is forgotten.
+        folder = self.state.joinpath(*cc.OUTCOMES)
+        folder.joinpath("1" * 32).write_text("maybe", encoding="utf-8")
+        self.assertEqual([cc.outcome(self.state, q) for q in ("1" * 32, "2" * 32, "../keys/x", "", None)], [""] * 5)
+        os.utime(folder / aged, (0, 0))
+        self.poster().sweep()
+        cc._settle(self.state, "3" * 32, "posted")
+        self.assertEqual((cc.outcome(self.state, aged), cc.outcome(self.state, posted)), ("", "posted"))
+
+    def test_a_card_posted_before_a_local_failure_is_never_expired_as_dropped(self):
+        outbox = self.state.joinpath(*cc.OUTBOX)
+        late = lambda: 1000.0 + cc.MAX_QUEUED_S + 60  # noqa: E731
+        # Posted and its receipt written; then recording the outcome fails, and the entry stays queued.
+        qid = cc.queue(self.state, ROOM, *model_card(), now=1000.0)
+        with mock.patch.object(cc, "_settle", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.poster().sweep()
+        self.assertEqual((len(self.sent), cc.outcome(self.state, qid)), (1, ""))
+        self.assertEqual(self.poster(clock=late).sweep(), 0, "past the deadline: not posted again, not dropped")
+        self.assertEqual((len(self.sent), cc.outcome(self.state, qid), list(outbox.iterdir())), (1, "posted", []))
+        # The outcome was recorded but the entry could not be removed: the next sweep, late, keeps it posted.
+        qid = cc.queue(self.state, ROOM, *model_card(), now=1000.0)
+        with mock.patch.object(Path, "unlink", side_effect=OSError("busy")):
+            with self.assertRaises(OSError):
+                self.poster().sweep()
+        cc.absorb(self.state, self.root)
+        self.assertEqual(self.poster(clock=late).sweep(), 0)
+        self.assertEqual((len(self.sent), cc.outcome(self.state, qid), list(outbox.iterdir())), (2, "posted", []))
+
+    def test_an_expiry_after_a_send_that_failed_is_unsure_and_only_that_may_be_queued_again_under_its_key(self):
+        late = lambda: 1000.0 + cc.MAX_QUEUED_S + 60  # noqa: E731
+        body, card = model_card()
+        keyed = dict(key="k1", at_ns=5)
+        qid = cc.queue(self.state, ROOM, body, card, now=1000.0, **keyed)
+        self.assertEqual(self.poster(OSError("timed out")).sweep(), 0)     # it may have reached the server
+        self.assertEqual(self.poster(clock=late).sweep(), 0)
+        self.assertEqual(cc.outcome(self.state, qid), "unsure", "not a confirmed drop")
+        self.assertEqual(cc.queue(self.state, ROOM, body, card, **keyed), qid)
+        self.assertEqual(list(self.state.joinpath(*cc.OUTBOX).iterdir()), [], "a plain repeat is still one card")
+        # The replacement cannot be written: the unsure record is still there, so a restart can try again.
+        with mock.patch.object(cc, "_write", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                cc.queue(self.state, ROOM, body, card, again=True, **keyed)
+        self.assertEqual((cc.outcome(self.state, qid), list(self.state.joinpath(*cc.OUTBOX).iterdir())), ("unsure", []))
+        self.assertEqual(cc.queue(self.state, ROOM, body, card, again=True, now=5000.0, **keyed), qid, "the same id: the same dedupe key")
+        entry = self.state.joinpath(*cc.OUTBOX) / (qid + ".json")
+        # The connector retires nothing: `unsure` stands, and the entry remembers a send was tried.
+        self.assertEqual((cc.outcome(self.state, qid), json.loads(entry.read_text())["attempted"]), ("unsure", True))
+        # Asked again while it is queued: the entry is not rewritten, so its age is not reset.
+        cc.queue(self.state, ROOM, body, card, again=True, now=9000.0, **keyed)
+        self.assertEqual(json.loads(entry.read_text())["queued_at"], 5000.0)
+        # It expires before any new send: still unsure, never a false drop.
+        self.assertEqual(self.poster(clock=lambda: 5000.0 + cc.MAX_QUEUED_S + 1).sweep(), 0)
+        self.assertEqual((cc.outcome(self.state, qid), entry.exists()), ("unsure", False))
+        # Queued once more and posted. The bridge's `posted` is the last word: nothing the connector
+        # does after the sweep (a late repeat of the same call) can take it back or queue it again.
+        cc.queue(self.state, ROOM, body, card, again=True, now=1000.0, **keyed)
+        self.sent.clear()
+        self.assertEqual(self.poster().sweep(), 1)
+        self.assertEqual((self.sent[0]["dedupe_key"], cc.outcome(self.state, qid)), ("agent-card:" + qid, "posted"))
+        self.assertEqual(cc.queue(self.state, ROOM, body, card, again=True, **keyed), qid)
+        self.assertEqual((cc.outcome(self.state, qid), list(self.state.joinpath(*cc.OUTBOX).iterdir())), ("posted", []))
+        # Never tried at all (the bridge was not running): a confirmed drop.
+        idle = cc.queue(self.state, ROOM, body, card, now=1000.0, key="k2", at_ns=6)
+        self.assertEqual(self.poster(clock=late).sweep(), 0)
+        self.assertEqual(cc.outcome(self.state, idle), "dropped")
+
+    def test_an_outcome_that_cannot_be_recorded_leaves_the_card_queued(self):
+        qid = cc.queue(self.state, ROOM, *model_card(), now=1000.0)
+        with mock.patch.object(cc, "_settle", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.poster().sweep()
+        self.assertTrue((self.state.joinpath(*cc.OUTBOX) / (qid + ".json")).is_file(), "never gone without a reason")
+        self.assertEqual(self.poster().sweep(), 0, "its receipt is there: settled, not posted a second time")
+        self.assertEqual((cc.outcome(self.state, qid), len(self.sent)), ("posted", 1))
+
     def test_a_card_that_would_not_render_or_has_no_room_is_refused_at_the_queue(self):
         body, card = model_card()
         for room, line, bad in (("", body, card), ("not-a-room", body, card), (ROOM, "", card),
