@@ -58,15 +58,17 @@ REDACTED_KEY = "[REDACTED-Google API Key]"
 KEY_IN_CHAT = ("This message looks like it has a sign-in code or an API key, so I did not pass it to Antigravity "
                "and did not keep it. Please delete it from the chat. Send /account instead: on the computer that "
                "runs me, the account card takes the code or the key without sending it to the chat.")
-QUOTA_RE = re.compile(r"RESOURCE_EXHAUSTED|Individual quota reached|quota (?:exceeded|exhausted|reached)"
-                      r"|exceeded your (?:current )?quota|\b429\b.{0,40}\b(?:Too Many Requests|quota|rate.?limit)"
-                      r"|(?:status|code|HTTP)\W{0,3}429\b", re.I)
-# A completed answer is the limit only when it opens with agy's own error, not when it mentions one.
-QUOTA_ANSWER_RE = re.compile(r"\s*(?:(?:error|session/prompt)\W{1,3})*(?:RESOURCE_EXHAUSTED|Individual quota reached"
-                             r"|(?:HTTP\W{0,3})?429\W{1,3}Too Many Requests|you(?:'ve| have) exceeded your (?:current )?quota)",
-                             re.I)
-_SIGN_IN_CODE = re.compile(r"(?<![A-Za-z0-9])4/[0-9A-Za-z_\-]{20,}")
-_CODE_URL = re.compile(r"https?://\S*[?&]code=[^&\s]{8,}")
+# agy's own error, at the opening of an answer or of a failed turn's error (after the request's name): the
+# code or sentence, then its end or its detail. A sentence about one ("429 Too Many Requests is what...") is not it.
+_QUOTA_ERROR = (r"(?:RESOURCE_EXHAUSTED(?=\s*(?:[:(\[.,]|$))|Individual quota reached(?=\s*(?:[:.!]|$))"
+                r"|(?:HTTP\W{0,3})?429\W{1,3}Too Many Requests(?=\s*(?:[:.(]|$))|(?:status|code)\W{0,3}429(?=\s*(?:[:.,)]|$))"
+                r"|you(?:'ve| have) exceeded your (?:current )?quota(?=\s*(?:[:.,!]|$)))")
+QUOTA_ANSWER_RE = re.compile(r"\s*(?:error\W{1,3})?" + _QUOTA_ERROR, re.I)
+QUOTA_DETAIL_RE = re.compile(r"\s*(?:session/\w+:\s*)?(?:error\W{1,3})?" + _QUOTA_ERROR, re.I)
+# Google's sign-in code (4/0...), alone (a full stop may end it) or as a `code=` value, plain or %2F, with or
+# without an address around it; not a path ("docs/4/...") nor another site's code.
+_SIGN_IN_CODE = re.compile(r"(?<![\w/.\-])4/0[0-9A-Za-z_\-]{20,}(?![\w/]|\.\w)")
+_CODE_URL = re.compile(r"(?:^|[?&\s])code=4(?:/|%2F)0[^&\s]{4,}", re.I)
 _AUTH_LINE = re.compile(r"applyAuthResult: email=([^,\s]+@[^,\s]+)")
 
 
@@ -89,7 +91,7 @@ def quota_error(status, text, detail) -> bool:
     if status == "completed":
         return answered
     # A failed turn's partial answer is judged as an answer too: only the error itself is searched.
-    return status in ("failed", "refused") and (answered or bool(QUOTA_RE.search(detail or "")))
+    return status in ("failed", "refused") and (answered or bool(QUOTA_DETAIL_RE.match(detail or "")))
 
 
 def asks_for_card(text) -> bool:
@@ -115,7 +117,7 @@ def signed_in_as(log_dir, pid) -> str:
         names = [n for n in os.listdir(log_dir) if n.startswith("acp-server-") and n.endswith("-%d.log" % int(pid))]
     except (OSError, TypeError, ValueError):
         return ""
-    for name in sorted(names, reverse=True):
+    for name in sorted(names, reverse=True)[:1]:    # the newest only: an older log of a reused pid is another process
         try:
             with open(os.path.join(log_dir, name), encoding="utf-8", errors="replace") as f:
                 found = [m.group(1) for m in (_AUTH_LINE.search(line) for line in f) if m]

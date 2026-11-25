@@ -77,7 +77,7 @@ def opted_out(environ=None) -> bool:
 
 
 def gemini_api_key_from_app(agent_id: str = "", run=None, platform: str = None, environ=None,
-                            timeout: float = READ_TIMEOUT_S) -> "tuple[str, str]":
+                            timeout: float = READ_TIMEOUT_S) -> str:
     """This agent's Gemini API key saved in the app, or ''. macOS only, needs the agent id; never raises."""
     if not agent_id or (platform or sys.platform) != "darwin" or opted_out(environ):
         return ""

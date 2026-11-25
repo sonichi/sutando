@@ -284,6 +284,16 @@ class AccountCardTest(unittest.TestCase):
         self.assertEqual((self.outbox(), self.posted("$q3")), ([], []), "nothing more once the card is posted")
         self.assertEqual(self.w.result("task-q3"), gc.LIMITED_NO_SEND)
 
+    def test_a_collaborator_who_asks_while_agy_is_at_its_limit_is_told_why_there_is_no_answer(self):
+        # Review of #6713: once the owner's card was queued, anyone else who asked got no reply at all.
+        self.dm("task-q1", "STUB:QUOTA hi")
+        self.serve()
+        self.posted("$q1")
+        self.dm("task-c", "STUB:QUOTA a collaborator asks", tier="team", collaborator=True, kind="room")
+        self.serve()
+        self.assertEqual(self.w.result("task-c").strip(), gc.LIMITED_FOR_OTHERS)
+        self.assertEqual(self.outbox(), [], "and no second card")
+
     def test_a_turn_that_answers_clears_the_limit_and_a_later_limit_is_a_new_card(self):
         self.dm("task-q1", "STUB:LIMIT429 hi")
         self.serve()
@@ -362,14 +372,20 @@ class AccountCardTest(unittest.TestCase):
                ("completed", "RESOURCE_EXHAUSTED: quota exceeded", "end_turn"),
                ("completed", "Error: HTTP 429 Too Many Requests", "end_turn"),
                ("completed", "You have exceeded your current quota.", "end_turn"),
-               ("completed", "HTTP 429 Too Many Requests: quota for this project is used up.", "end_turn"))
+               ("completed", "HTTP 429 Too Many Requests: quota for this project is used up.", "end_turn"),
+               ("failed", "", "session/prompt: HTTP 429 Too Many Requests: retry in 2h"))
         # An ordinary answer that mentions a limit is the answer: it was replaced by the limit text, with a card.
         no = (("failed", "", "internal error"), ("completed", "Your quota exceeded talk: " + "x" * 500, "end_turn"),
               ("failed", "", "port 4290 refused"), ("completed", "", "end_turn"),
               ("completed", "Done. I added a retry for status 429 in fetch.py.", "end_turn"),
               ("completed", "The API returns RESOURCE_EXHAUSTED when the quota exceeded; I handle it.", "end_turn"),
               ("completed", "A 429 Too Many Requests means the quota is exceeded; back off.", "end_turn"),
-              ("failed", "I retried after HTTP 429 Too Many Requests.", "internal error: stream reset"))
+              ("failed", "I retried after HTTP 429 Too Many Requests.", "internal error: stream reset"),
+              # Review of #6713: an answer about the term, and another site's 429 in a failed turn's error.
+              ("completed", "RESOURCE_EXHAUSTED is the gRPC code for a spent quota.", "end_turn"),
+              ("completed", "429 Too Many Requests is what a server says when it throttles you.", "end_turn"),
+              ("failed", "", "tool fetch returned HTTP 429 from example.com"),
+              ("failed", "", "session/prompt: the page said quota exceeded"))
         self.assertEqual([agy_account.quota_error(*t) for t in yes], [True] * len(yes))
         self.assertEqual([agy_account.quota_error(*t) for t in no], [False] * len(no))
 
@@ -379,8 +395,16 @@ class PartsTest(unittest.TestCase):
         for said in (CODE, "here " + CODE, "http://localhost:1/cb?code=4/0Ab12345&state=x", "k " + DUMMY_KEY,
                      "[REDACTED-Google API Key]"):
             self.assertTrue(agy_account.carries_secret(said), said)
-        for said in ("hello there", "4/5 of the tests pass", "http://example.com/no-code", "switch account"):
+        for said in ("hello there", "4/5 of the tests pass", "http://example.com/no-code", "switch account",
+                     # Review of #6713: these were refused, so the sender got no answer.
+                     "https://github.com/login/device?code=ABCD-1234", "https://example.com/cb?code=abcdefgh12345678",
+                     "see docs/4/introduction_to_the_new_api_design.md", "v4/0123456789012345678901234567"):
             self.assertFalse(agy_account.carries_secret(said), said)
+        # Review of #6803: a code that ends a sentence, and the encoded form outside an http(s) address.
+        for said in ("https://x.test/cb?state=s&code=4%2F0A" + "d" * 30, "code: %s." % CODE, "it is %s. Thanks" % CODE,
+                     "code=4%2F0A" + "d" * 30, "localhost:8085/?code=4%2F0A" + "d" * 30, "state=s&code=4/0Ab12345"):
+            self.assertTrue(agy_account.carries_secret(said), said)
+        self.assertFalse(agy_account.carries_secret("see docs/4/0_introduction_to_the_new_api.md and barcode=4/0abcdef"))
 
     def test_signed_in_as_reads_only_this_processes_log(self):
         with tempfile.TemporaryDirectory() as d:
@@ -389,6 +413,9 @@ class PartsTest(unittest.TestCase):
             Path(d, "acp-server-1-43.log").write_text("applyAuthResult: email=eve@example.com, authMethod=consumer\n")
             self.assertEqual(agy_account.signed_in_as(d, 42), "b…@example.com")
             self.assertEqual(agy_account.signed_in_as(d, 44), "")
+            # A newer log of the same pid that names no account: the older one is another process's.
+            Path(d, "acp-server-2-42.log").write_text("started\n")
+            self.assertEqual(agy_account.signed_in_as(d, 42), "")
             self.assertEqual(agy_account.signed_in_as(os.path.join(d, "none"), 42), "")
 
     def test_asks_for_card_only_for_short_asks(self):
