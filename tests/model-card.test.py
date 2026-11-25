@@ -209,7 +209,7 @@ class Menu(Base):
         events = [self.fake.given[c[2]] for c in self.fake.calls if c[0] == "room.message.send"]
         self.assertEqual((events[0] == events[2], events[0] == events[1]), (True, False))
         self.assertIsNotNone(issued_cards.live(self.ws, events[1]), "the newer card's buttons still act")
-        self.assertIsNotNone(issued_cards.live(self.ws, events[0]))
+        self.assertIsNone(issued_cards.live(self.ws, events[0]), "the superseded card stays superseded")
 
     def test_a_retried_answer_reuses_its_id_and_gets_the_earlier_post_back_even_if_edited(self):
         # A reused id returns the earlier post, even if that card was since edited to its outcome; the retry

@@ -5,8 +5,8 @@ reply text as the owner. So a click acts only when it names a card recorded here
 agent posted it), in the room it was posted in, replies to that card's own event, and carries a text
 that card offered. One JSON file per workspace: event id -> {card id, room, lane, handler, offered reply
 text -> its command ("" for plain words), picker, expiry}. A newer card with the same id in the same
-room replaces the older record, so a settled card's buttons stop acting; a retried send the platform
-answers with an event it already gave replaces nothing. The caller passes the
+room replaces the older record, so a settled card's buttons stop acting; the replaced event is kept as
+retired, so a retried send the platform answers with it is a no-op and never displaces the newer card. The caller passes the
 workspace; nothing here resolves it. Standard library only, plus file_lock and local_record.
 """
 from __future__ import annotations
@@ -99,17 +99,16 @@ def record(workspace: Path, event_id: str, card: Mapping[str, object], *, room: 
         live_cards = {k: v for k, v in _read(path).items()
                       if isinstance(v, dict) and float(v.get("expires_at") or 0) > now}
         retired = _retired(path, now)
-        # A send the platform answered with an event it already gave (a retried operation id) is no newer card.
-        replay = event_id in live_cards or event_id in retired
-        if retired.get(event_id, {}).get("why") == "settled":
+        # An event the platform hands back for a retried send is no newer card: a superseded or settled one
+        # stays retired, and a live one replaces nothing.
+        if event_id in retired:
             return False
         cards = dict(live_cards)
-        if not replay:
+        if event_id not in live_cards:
             for k, v in live_cards.items():
                 if v.get("card_id") == card_id and str(v.get("room") or "") == room:
                     cards.pop(k)
                     retired[k] = {"why": "replaced", "expires_at": v.get("expires_at")}
-        retired.pop(event_id, None)
         if payloads or picker:
             cards[event_id] = {"card_id": card_id, "offers": payloads, "picker": picker, "room": room,
                                "lane": lane, "handler": handler, "expires_at": now + ttl_s}

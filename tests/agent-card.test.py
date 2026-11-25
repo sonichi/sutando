@@ -589,17 +589,21 @@ class Issued(unittest.TestCase):
         issued_cards.record(self.ws, "$a", self.card, room=DM, now=1000.0)
         issued_cards.record(self.ws, "$b", self.card, room=DM, now=1001.0)
         self.assertEqual(cards(), ["$b"])
-        # The platform hands back $a for a retried send: $b keeps acting and $a is recorded again.
-        self.assertTrue(issued_cards.record(self.ws, "$a", self.card, room=DM, now=1002.0))
-        self.assertEqual(cards(), ["$a", "$b"])
-        self.assertTrue(issued_cards.record(self.ws, "$a", self.card, room=DM, now=1003.0))
-        self.assertEqual(cards(), ["$a", "$b"])
-        # A settled card handed back again does not come back to life, and replaces nothing.
+        # The platform hands back the superseded $a for a retried send: a no-op, $b keeps acting.
+        self.assertFalse(issued_cards.record(self.ws, "$a", self.card, room=DM, now=1002.0))
+        self.assertEqual(cards(), ["$b"])
+        self.forged(reply_to_event="$a", now=1002.5)  # a tap on the superseded card is refused as stale
+        # A live card handed back again stays, and replaces nothing.
+        self.assertTrue(issued_cards.record(self.ws, "$b", self.card, room=DM, now=1003.0))
+        self.assertEqual(cards(), ["$b"])
+        # A settled card handed back again does not come back to life.
         self.assertTrue(issued_cards.settle(self.ws, "$b"))
         self.assertFalse(issued_cards.record(self.ws, "$b", self.card, room=DM, now=1004.0))
-        self.assertEqual(cards(), ["$a"])
-        # A card never seen before still replaces the older record of its id.
-        issued_cards.record(self.ws, "$c", self.card, room=DM, now=1005.0)
+        self.assertEqual(cards(), [])
+        # A card whose first record never landed (a replay of an event this ledger never saw) is recorded.
+        self.assertTrue(issued_cards.record(self.ws, "$c", self.card, room=DM, now=1005.0))
+        self.assertEqual(cards(), ["$c"])
+        self.assertTrue(issued_cards.record(self.ws, "$c", self.card, room=DM, now=1006.0))
         self.assertEqual(cards(), ["$c"])
 
     def test_a_record_expires_and_the_ledger_keeps_only_live_cards(self):

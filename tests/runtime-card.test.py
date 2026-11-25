@@ -285,7 +285,23 @@ class Card(Base):
         events = [self.fake.given[c[2]] for c in self.fake.calls if c[0] == "room.message.send"]
         self.assertEqual((events[0] == events[2], events[0] == events[1]), (True, False))
         self.assertIsNotNone(issued_cards.live(self.ws, events[1]), "the newer card's buttons still act")
-        self.assertIsNotNone(issued_cards.live(self.ws, events[0]))
+        self.assertIsNone(issued_cards.live(self.ws, events[0]), "the superseded card stays superseded")
+
+    def test_one_request_shown_codex_then_claude_then_codex_keeps_the_newest_card_live(self):
+        # The third post reuses the first id; the platform hands back the first card, which must not displace the second.
+        import argparse
+        import issued_cards
+        import time
+        self.fake.replay = True
+        for shown in ("codex", "claude", "codex"):
+            args = argparse.Namespace(room=DM, reply_to="$ask1", print=False)
+            with mock.patch.object(rtc, "runtime", return_value=shown), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rtc.cmd_post(self.ws, args, core=CORE, execute=self.fake.execute, now=time.time)
+        events = [self.fake.given[c[2]] for c in self.fake.calls if c[0] == "room.message.send"]
+        self.assertEqual((events[0] == events[2], events[0] == events[1]), (True, False))
+        self.assertIsNotNone(issued_cards.live(self.ws, events[1]), "the newest card's buttons still act")
+        self.assertIsNone(issued_cards.live(self.ws, events[0]))
 
     def test_a_retried_answer_reuses_its_id_and_gets_the_earlier_post_back_even_if_edited(self):
         # A reused id returns the earlier post, even if that card was since edited to its outcome; the retry
