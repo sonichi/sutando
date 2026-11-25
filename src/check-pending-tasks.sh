@@ -254,8 +254,35 @@ $(cat "$f")
   fi
 else
   # Core mode: the queue is tasks/, minus anything the router already handed
-  # to a worker.
-  for f in "$TASKS_DIR"/*.txt; do
+  # to a worker. The owner's own messages (src/task_watch_owner.py) are listed
+  # first, in task_priority's order; the rest keep glob order, which used to put
+  # every task-cron-* file ahead of the person. Order only: the loop below still
+  # decides what is listed. Any failure, or an answer that is not the same
+  # number of files, leaves glob order.
+  QUEUE_FILES=()
+  for f in "$TASKS_DIR"/*.txt; do QUEUE_FILES+=("$f"); done
+  if [ "${#QUEUE_FILES[@]}" -gt 1 ] && [ -n "$PYBIN" ]; then
+    OWNER_FIRST=()
+    while IFS= read -r -d '' f; do
+      OWNER_FIRST+=("$f")
+    done < <(SUTANDO_SRC="$REPO_DIR/src" SUTANDO_WS="$WORKSPACE" "$PYBIN" -c 'import os, sys
+from pathlib import Path
+sys.path.insert(0, os.environ["SUTANDO_SRC"])
+from task_priority import sort_tasks_by_priority
+from task_watch_owner import MAX_BYTES, is_human_owner
+ws = Path(os.environ["SUTANDO_WS"])
+def own(p):
+    try:
+        return p.stat().st_size <= MAX_BYTES and is_human_owner(p.read_text(encoding="utf-8", errors="replace"), ws)
+    except Exception:
+        return False
+paths = [Path(a) for a in sys.argv[1:]]
+first = [p for p in paths if own(p)]
+rest = [p for p in paths if p not in first]
+sys.stdout.write("".join(str(p) + "\0" for p in sort_tasks_by_priority(first) + rest))' "${QUEUE_FILES[@]}" 2>/dev/null)
+    [ "${#OWNER_FIRST[@]}" -eq "${#QUEUE_FILES[@]}" ] && QUEUE_FILES=("${OWNER_FIRST[@]}")
+  fi
+  for f in ${QUEUE_FILES[@]+"${QUEUE_FILES[@]}"}; do
     BASENAME=$(basename "$f")
     TASK_ID="${BASENAME%.txt}"
     held_elsewhere "$TASK_ID" "$f" && continue

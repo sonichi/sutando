@@ -1285,6 +1285,19 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         ((_, card),) = self.posted()
         self.assertEqual(card["text"], "I'm not signed in. " + account_switch.BELOW)
 
+    def test_asking_which_account_is_answered_by_the_card_without_a_turn(self):
+        """Codex cannot see its own sign-in: asked which account it is on, the model said it could not tell."""
+        for n, said in enumerate(("which account are you using?", "你用的哪个账号", "Codex account, can you see it?")):
+            self.assertEqual(self.serve("task-w%d" % n, said), "[no-send] the account card answers\n", said)
+            self.assertEqual(metrics(self.work)[-1]["card"], "account-card")
+        self.assertEqual(len(self.posted()), 3)
+        # Another account, or the same words outside the owner's DM, is an ordinary turn.
+        self.assertNotIn("account card", self.serve("task-other", "create an account on github"))
+        self.assertNotIn("card", metrics(self.work)[-1])
+        self.serve("task-room", "which account are you using?", channel="!room:s.space", kind="room")
+        self.assertNotIn("card", metrics(self.work)[-1])
+        self.assertEqual(self.posted(), [], "no card for either")
+
     def test_a_sign_in_page_that_is_not_an_https_address_is_never_opened_and_the_sign_in_is_given_up(self):
         for n, page in enumerate(("-a/Applications/Calculator.app", "file:///etc/hosts", "http://stub.invalid/x",
                                   "https://user@stub.invalid/x")):

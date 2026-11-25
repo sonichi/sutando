@@ -201,7 +201,8 @@
     ],
     "threads/399018430ff5719137a663e0cda47dc121bbf5daac5a6922e327159d694a11b8": "<id>\n!other:ag2.space\nshared\n",
     "threads/default": "<id>\n\nshared\n",
-    "threads/f6d979d233f2529d143247a7476fdd48553e7e5f9180511c2ff6b1265dc0a2b9": "<id>\n!room:ag2.space\nshared\n"
+    "threads/f6d979d233f2529d143247a7476fdd48553e7e5f9180511c2ff6b1265dc0a2b9": "<id>\n!room:ag2.space\nshared\n",
+    "live-view.log": "\n── <hh:mm:ss> owner, owner ──\n> first owner task\nSTUB echo: Sutando task task-1700000000001 (source=ag2space, channel_id=!room:ag2.space, ac [sandbox=read-only ephemeral=False cwd=<base>/basic]\n── turn completed ──\n\n── <hh:mm:ss> guest, restricted ──\n> a guest task\nSTUB echo: Sutando task task-1700000000002 (source=ag2space, channel_id=!room:ag2.space, ac [sandbox=None ephemeral=True cwd=<tmp>]\n── turn completed ──\n\n── <hh:mm:ss> owner, owner ──\n> no room here\nSTUB echo: Sutando task task-1700000000003 (source=ag2space, channel_id=?, access_tier=owne [sandbox=read-only ephemeral=False cwd=<base>/basic]\n── turn completed ──\n\n── <hh:mm:ss> owner, owner ──\n> second owner task\nSTUB echo: Sutando task task-1700000000004 (source=ag2space, channel_id=!other:ag2.space, a [sandbox=read-only ephemeral=False cwd=<base>/basic]\n── turn completed ──\n"
    }
   },
   "pre-existing result": {
@@ -268,7 +269,8 @@
       "turn_s": "<n>"
      }
     ],
-    "threads/399018430ff5719137a663e0cda47dc121bbf5daac5a6922e327159d694a11b8": "<id>\n!other:ag2.space\nshared\n"
+    "threads/399018430ff5719137a663e0cda47dc121bbf5daac5a6922e327159d694a11b8": "<id>\n!other:ag2.space\nshared\n",
+    "live-view.log": "\n── <hh:mm:ss> owner, owner ──\n> second owner task\nSTUB echo: Sutando task task-1700000000004 (source=ag2space, channel_id=!other:ag2.space, a [sandbox=read-only ephemeral=False cwd=<base>/pre-existing result]\n── turn completed ──\n"
    }
   },
   "restart": {
@@ -385,7 +387,8 @@
       "turn_s": "<n>"
      }
     ],
-    "threads/f6d979d233f2529d143247a7476fdd48553e7e5f9180511c2ff6b1265dc0a2b9": "<id>\n!room:ag2.space\nshared\n"
+    "threads/f6d979d233f2529d143247a7476fdd48553e7e5f9180511c2ff6b1265dc0a2b9": "<id>\n!room:ag2.space\nshared\n",
+    "live-view.log": "\n── <hh:mm:ss> owner, owner ──\n> first owner task\nSTUB echo: Sutando task task-1700000000001 (source=ag2space, channel_id=!room:ag2.space, ac [sandbox=read-only ephemeral=False cwd=<base>/restart]\n── turn completed ──\n\n── <hh:mm:ss> owner, owner ──\n> a follow-up in the same room\nSTUB echo: Sutando task task-1700000000005 (source=ag2space, channel_id=!room:ag2.space, ac [sandbox=read-only ephemeral=None cwd=<base>/restart]\n── turn completed ──\n"
    }
   },
   "turn timeout": {
@@ -458,12 +461,13 @@
       "turn_s": "<n>"
      }
     ],
-    "threads/f6d979d233f2529d143247a7476fdd48553e7e5f9180511c2ff6b1265dc0a2b9": "<id>\n!room:ag2.space\nshared\n"
+    "threads/f6d979d233f2529d143247a7476fdd48553e7e5f9180511c2ff6b1265dc0a2b9": "<id>\n!room:ag2.space\nshared\n",
+    "live-view.log": "\n── <hh:mm:ss> owner, owner ──\n> [[stall]] slow\n── turn timeout ──\n"
    }
   }
  },
  "merge_base": "e36e6fb7c391580dedce73908b5d090a95137aa4",
- "recorded_because": "lock refusal text changed by the single-flock contract (lock note v6 \u00a71.2 lines); chars compared by value; routine and Codex behaviour otherwise unchanged",
+ "recorded_because": "lock refusal text changed by the single-flock contract (lock note v6 §1.2 lines); chars compared by value; routine and Codex behaviour otherwise unchanged",
  "routine": {
   "429 then ok": {
    "provider": [
