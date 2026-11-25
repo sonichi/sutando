@@ -20,13 +20,15 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-FILE = ("state", "core-account-health.json")
+from workspace_default import status_path
+
+FILE = "core-account-health.json"
 STATES = ("ok", "signed_out", "quota")
 RUNTIMES = ("codex", "claude")
 
 
 def path(workspace) -> Path:
-    return Path(workspace).joinpath(*FILE)
+    return status_path(FILE, Path(workspace))
 
 
 def read(workspace) -> dict:
