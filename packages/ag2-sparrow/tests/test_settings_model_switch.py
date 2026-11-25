@@ -20,6 +20,7 @@ import test_codex_connector as codex_t  # noqa: E402  (its stub app-server runne
 
 from ag2_sparrow import model_settings  # noqa: E402
 from ag2_sparrow.adapters.antigravity import cli as agy_cli  # noqa: E402
+
 from ag2_sparrow.adapters.claude_code import cli as claude_cli, hold  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector, connect_cli as codex_cli  # noqa: E402
 
