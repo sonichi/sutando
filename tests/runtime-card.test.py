@@ -141,11 +141,12 @@ class Base(unittest.TestCase):
         self.current, self.selected, self.desktop = self.RUNTIME, self.RUNTIME, True
         self.claude_json = {"loggedIn": True, "email": "susan@example.com", "subscriptionType": "max"}
         self.restarts, self.restart_rc, self.launcher_confirms, self.launcher_selects = [], 0, True, True
-        self.outputs = []
+        self.outputs, self.panes = [], ()
         for target, attr, value in ((rtc, "_owner_dm", lambda ws, core: DM),
                                     (rtc, "runtime", lambda: self.current),
                                     (rtc, "configured_runtime", lambda: self.selected),
                                     (rtc, "desktop_hosted", lambda: self.desktop),
+                                    (rtc, "running_runtimes", lambda: set(self.panes)),
                                     (account_card, "codex_home", lambda: self.home),
                                     (connections, "read_rows", lambda ws=None: [CORE])):
             patch = mock.patch.object(target, attr, value)
@@ -1294,6 +1295,24 @@ class Switch(Base):
         self.assertEqual(out["say"], "Couldn't switch to Claude Code: the restart did not finish cleanly (exit 1). "
                                      "I started Codex again, and the core is running on it.")
         self.assertTrue(out["fell_back_confirmed"])
+
+    def test_the_rollback_restarts_the_runtime_that_was_running_not_the_saved_selection(self):
+        # The selection and the saved record already name Claude Code, while the panes run Codex.
+        self.record("claude", T0 - 9000)
+        self.selected, self.panes = "claude", ("codex",)
+
+        def restart(rt):
+            self.restarts.append(rt)
+            self.clock.t += 30
+            if rt == "codex":
+                self.record("codex", self.clock.t - 5)
+                return 0
+            return 1
+        self.restart = restart
+        rc, out = self.carded()
+        self.assertEqual(self.restarts, ["claude", "codex"])
+        self.assertEqual(out["fell_back"], "codex")
+        self.assertIn("I started Codex again, and the core is running on it.", out["say"])
 
     def test_a_relaunch_that_stopped_nothing_says_the_core_is_still_on_the_old_runtime(self):
         for code in rtc.NOT_RESTARTED:
