@@ -322,10 +322,15 @@ CURRENT, STALE, UNKNOWN = "current", "stale", "unknown"     # signin_state's ans
 SIGNIN_UNKNOWN_READS = 5        # reads of a sign-in that cannot be read, within one dispatch
 SIGNIN_UNKNOWN_WAIT_S = 0.2     # between them: a file mid-write is whole a moment later
 
-SIGNIN_UNKNOWN_SAY_S = 30.0     # unreadable this long after a switch: the sender is told, once
+SIGNIN_HELD_SAY_S = 30.0        # a task waits this long for the selected account, then its sender is told
 NOT_READY_SAY = ("I couldn't start on the account that was just selected for me, so I haven't run this, and "
                  "nothing was sent under the earlier account. I'll keep trying to start on it. Please send "
                  "this again in a moment.")
+
+
+def held_clock() -> float:
+    """The clock a waiting task's deadline is read on."""
+    return time.monotonic()
 
 
 class SigninNotReady(Exception):
@@ -910,14 +915,12 @@ class Connector:
                 self.signin_sendable(state)     # raises: the thread just opened gets no prompt
 
     def signin_sendable(self, state: str) -> None:
-        """Raise unless `state` is CURRENT: SigninUnknown while an unreadable sign-in is still fresh (the
-        turn waits, unanswered), else SigninNotReady (the sender is told, once)."""
+        """Raise unless `state` is CURRENT: SigninUnknown for a sign-in that cannot be read with a switch
+        pending, SigninNotReady when no server could be brought onto the one that reads."""
         if state == CURRENT:
             return
         if state == UNKNOWN:
-            waited = time.time() - (self.signin_unknown_since or time.time())
-            why = "the sign-in file could not be read after the account changed"
-            raise (SigninNotReady if waited >= SIGNIN_UNKNOWN_SAY_S else SigninUnknown)(why)
+            raise SigninUnknown("the sign-in file could not be read after the account changed")
         raise SigninNotReady(self.signin_failed or "the sign-in kept changing while Codex restarted")
 
     def result_body(self, status, text, err):
@@ -951,7 +954,7 @@ class Connector:
         done = 0
         idle_since = time.time()
         metrics_path = os.path.join(self.args.state, "metrics.jsonl")
-        held = set()    # tasks waiting, unanswered, for a server on the selected account
+        held = {}       # task id -> (since when, its file's name, its tier): waiting for the selected account
         while not stop_requested():
             try:    # a card's ledger entry, or a sign-in given up, never stops task service
                 connector_cards.absorb(self.args.bridge_state, self.root)
@@ -961,11 +964,25 @@ class Connector:
             self.signin_settle()        # here no turn runs: an idle agent moves to the new account too
             if held and self.signin_state() == CURRENT:
                 held.clear()            # a clean read matches the server: what waited for it is served now
+            for task_id, (since, name, tier) in list(held.items()):
+                if held_clock() - since < SIGNIN_HELD_SAY_S:
+                    continue
+                # Nobody waits in silence: at its deadline the task gets the plain words, and no prompt.
+                del held[task_id]
+                seen.add(task_id)
+                write_atomic(os.path.join(self.args.results, name), NOT_READY_SAY + "\n")
+                record_done(done_path, task_id)
+                rec = {"task": task_id, "status": NOT_READY, "tier": tier, "held_s": round(held_clock() - since, 1)}
+                with open(metrics_path, "a") as f:
+                    f.write(json.dumps(rec) + "\n")
+                log("result <-", json.dumps(rec))
+                done += 1
+                idle_since = time.time()
             names = [n for n in self.pending_tasks(seen) if n[:-4] not in held]
             if not names:
                 if self.args.once and done >= self.args.once:
                     return
-                if self.args.idle_exit and time.time() - idle_since > self.args.idle_exit:
+                if self.args.idle_exit and not held and time.time() - idle_since > self.args.idle_exit:
                     log("idle-exit")
                     return
                 try:
@@ -1014,9 +1031,9 @@ class Connector:
             if self.view:
                 self.view.done(status)
             if status == WAITING or (status == NOT_READY and self.signin_told):
-                # Said once already: this one waits in the inbox, unanswered, and is served when the
-                # account is ready. Cards and what comes after it are not kept waiting behind it.
-                held.add(task_id)
+                # It waits in the inbox, behind no card and no later task: served when the account is
+                # ready, or told at its own deadline (SIGNIN_HELD_SAY_S) by the poll above.
+                held[task_id] = (held_clock(), name, headers["access_tier"])
                 seen.discard(task_id)
                 continue
             if status == NOT_READY:

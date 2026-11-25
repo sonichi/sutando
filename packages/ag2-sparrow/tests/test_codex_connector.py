@@ -1666,14 +1666,11 @@ class EdgePathTest(unittest.TestCase):
         c.signin_ready = lambda: order.append("sign-in read") or cc.STALE
         self.assertEqual(c.run_task(headers, "the prompt", task_io.OWNER_CAPABILITIES)[0], cc.NOT_READY)
         self.assertEqual(order, ["settle", "sign-in read"])
-        # Unreadable after a switch: the same, as a wait while it is fresh and as a told result once it is not.
+        # Unreadable after a switch: the same, as a wait.
         c.signin_ready = lambda: cc.UNKNOWN
-        c.signin_unknown_since = time.time()
         self.assertEqual(c.run_task(headers, "the prompt", task_io.OWNER_CAPABILITIES)[0], cc.WAITING)
-        c.signin_unknown_since = time.time() - cc.SIGNIN_UNKNOWN_SAY_S - 1
-        self.assertEqual(c.run_task(headers, "the prompt", task_io.OWNER_CAPABILITIES)[0], cc.NOT_READY)
         # It turns unreadable, or stale past the bound, after the thread was opened: still nothing is sent.
-        for last, want in ((cc.UNKNOWN, cc.NOT_READY), (cc.STALE, cc.NOT_READY)):
+        for last, want in ((cc.UNKNOWN, cc.WAITING), (cc.STALE, cc.NOT_READY)):
             reads = iter([cc.CURRENT] + [last] * 9)
             c.signin_ready = lambda: next(reads)
             del order[:]
@@ -1761,6 +1758,81 @@ class EdgePathTest(unittest.TestCase):
             self.assert_every_turn_ran_on_the_sign_in_on_disk(turns)
             self.assertTrue(result(d, "task-chat-1").startswith("STUB echo:"))
             self.assertEqual(len([l for l in logged if "cannot be read after an account change" in l]), 1)
+
+    def test_a_task_that_waits_is_told_at_its_own_deadline_with_no_further_message(self):
+        """Code-owner review of 32c9bbd4: the notice at 30 s depended on someone sending another message.
+        The connector's own poll now gives each waiting task its result at its deadline, and no prompt."""
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
+            self.signed_in(home, "acct-1")
+            clock = {"now": 1000.0, "torn": False, "polls": 0}
+            answered = []
+
+            def script(event, n):
+                if (event, n) == ("initialized", 1):
+                    self.signed_in(home, "acct-2")           # the switch
+                if (event, n) == ("spawned", 2):
+                    (Path(home) / "auth.json").write_text('{"tokens": {"account_id": "ac')   # and it stays mid-write
+                    clock["torn"] = True
+                if event != "polled" or not clock["torn"]:
+                    return
+                clock["polls"] += 1
+                answered.append(os.path.exists(os.path.join(d, "results", "task-chat-1.txt")))
+                if clock["polls"] == 3:
+                    clock["now"] += cc.SIGNIN_HELD_SAY_S - 1     # nearly there: still waiting
+                if clock["polls"] == 5:
+                    clock["now"] += 2                            # the deadline passes, with nobody writing
+                if clock["polls"] == 8:
+                    self.signed_in(home, "acct-2")               # later the file reads, and matches the replacement
+                    clock["torn"] = False
+                    write_task(d, "task-chat-2", "after it was ready")
+
+            write_task(d, "task-chat-1", "waits, then is told")
+            with mock.patch.object(cc, "SIGNIN_UNKNOWN_WAIT_S", 0.0), \
+                    mock.patch.object(cc, "held_clock", lambda: clock["now"]), \
+                    mock.patch.object(sys.modules[__name__], "run_connector",
+                                      lambda work, once: cc.main(["--server", "stub", "--work", str(work), "--once", "2",
+                                                                  "--idle-exit", "3", "--poll", "0.05", "--turn-timeout", "10",
+                                                                  "--interrupt-grace", "2"])):
+                rc, turns, _ = self.signin_world(d, home, script)
+            self.assertEqual(rc, 0)
+            self.assertEqual(answered[:5], [False] * 5, "nothing before the deadline, also one second short of it")
+            self.assertEqual(answered[5:], [True] * len(answered[5:]), "told at the first poll past it")
+            self.assertEqual(result(d, "task-chat-1").strip(), cc.NOT_READY_SAY)
+            rows = metrics(d)
+            self.assertEqual([(r["task"], r["status"]) for r in rows],
+                             [("task-chat-1", cc.NOT_READY), ("task-chat-2", "completed")], "one result each, once")
+            self.assertGreaterEqual(rows[0]["held_s"], cc.SIGNIN_HELD_SAY_S)
+            self.assertEqual([t[0] for t in turns], [2], "the only prompt: the later task, on the replacement")
+            self.assert_every_turn_ran_on_the_sign_in_on_disk(turns)
+            self.assertTrue(result(d, "task-chat-2").startswith("STUB echo:"))
+
+    def test_tasks_waiting_on_a_server_that_cannot_start_are_told_at_their_deadline_too(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
+            self.signed_in(home, "acct-1")
+            clock = {"now": 50.0, "polls": 0}
+
+            def script(event, n):
+                if (event, n) == ("initialized", 1):
+                    self.signed_in(home, "acct-2")
+                if event == "spawning" and n > 1:
+                    raise OSError("codex did not start")
+                if event == "polled":
+                    clock["polls"] += 1
+                    if clock["polls"] == 6:
+                        clock["now"] += cc.SIGNIN_HELD_SAY_S + 1
+
+            now = time.time()
+            for n in (1, 2):
+                write_task(d, "task-chat-%d" % n, "message %d" % n, mtime=now - 30 + n)
+            with mock.patch.object(cc, "held_clock", lambda: clock["now"]):
+                rc, turns, _ = self.signin_world(d, home, script)
+            self.assertEqual((rc, turns), (0, []), "no prompt at all: the account never became startable")
+            for n in (1, 2):
+                self.assertEqual(result(d, "task-chat-%d" % n).strip(), cc.NOT_READY_SAY)
+            rows = metrics(d)
+            self.assertEqual([r["task"] for r in rows], ["task-chat-1", "task-chat-2"], "each told once")
+            self.assertNotIn("held_s", rows[0], "the first sender was told at once")
+            self.assertGreaterEqual(rows[1]["held_s"], cc.SIGNIN_HELD_SAY_S, "the second at its own deadline")
 
     def test_after_a_replacement_a_clean_read_confirmed_an_unreadable_read_is_ordinary_again(self):
         with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
