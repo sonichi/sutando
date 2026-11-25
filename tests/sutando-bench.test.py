@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit and controller-path tests for scripts/sutando_bench.py."""
 import contextlib
+import copy
 import io
 import json
 import os
@@ -1070,6 +1071,177 @@ class BenchTests(unittest.TestCase):
                 rc = bench.main(["run", "--workspace", str(ws)])
             self.assertEqual(rc, 2)
             self.assertIn("cannot attribute runtime version", stderr.getvalue())
+
+
+class CaseDefinitionTests(unittest.TestCase):
+    def suite(self):
+        return {"schema": 1, "name": "definitions", "cases": [
+            {"id": "one", "prompt": "Reply OK", "expect": {"equals": "OK"}},
+        ]}
+
+    def run_fixture(self, suite=None, repeat=1):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(bench, "_submit"), \
+                mock.patch.object(bench, "_wait_for_result", return_value=("OK", None, 1)):
+            return bench.run_suite(Path(td), suite or self.suite(), repeat, 1, .001, "fixture")
+
+    def test_changed_prompts_and_grading_cannot_be_called_regressions(self):
+        baseline = self.run_fixture()
+        for field, value in [
+            ("prompt", "Reply OTHER"), ("expect", {"equals": "OTHER"}),
+            ("expect", {"contains": "OK"}), ("expect", {"max_chars": 0}),
+            ("expect", {}), ("expect", {"json_equals": "OK"}),
+        ]:
+            with self.subTest(field=field, value=value):
+                changed = self.suite()
+                changed["cases"][0][field] = value
+                with self.assertRaisesRegex(ValueError, "case definitions differ.*'one'"):
+                    bench.compare_runs(baseline, self.run_fixture(changed))
+
+    def test_canonical_objects_metadata_order_and_repetitions_preserve_identity(self):
+        suite = self.suite()
+        suite["cases"][0]["expect"] = {"json_equals": {"a": [1, {"b": True}], "c": None}}
+        suite["cases"].append({"id": "two", "prompt": "é\ud800", "expect": {}})
+        changed = copy.deepcopy(suite)
+        changed["description"] = "new description"
+        changed["cases"][0]["category"] = "new category"
+        changed["cases"][0]["expect"] = {"json_equals": {"c": None, "a": [1, {"b": True}]}}
+        changed["cases"].reverse()
+        baseline = self.run_fixture(suite)
+        candidate = self.run_fixture(changed, repeat=2)
+        data, report = bench.compare_runs(baseline, candidate)
+        self.assertTrue(data["suite_compatibility"]["shared_case_definitions_verified"])
+        self.assertEqual(data["suite_compatibility"]["warnings"], [])
+        self.assertIn("Shared case definitions verified: yes", report)
+        self.assertEqual(baseline["suite"]["case_fingerprints"], candidate["suite"]["case_fingerprints"])
+
+    def test_omitted_expectation_and_empty_object_have_same_identity(self):
+        suite = self.suite()
+        suite["cases"][0].pop("expect")
+        baseline = self.run_fixture(suite)
+        suite["cases"][0]["expect"] = {}
+        data, _ = bench.compare_runs(baseline, self.run_fixture(suite))
+        self.assertTrue(data["suite_compatibility"]["shared_case_definitions_verified"])
+
+    def test_definition_identity_is_conservative_about_equivalent_assertions(self):
+        for first, second in [
+            ({"json_equals": 1}, {"json_equals": 1.0}),
+            ({"contains": "OK"}, {"contains": ["OK"]}),
+        ]:
+            with self.subTest(first=first, second=second):
+                suite = self.suite()
+                suite["cases"][0]["expect"] = first
+                baseline = self.run_fixture(suite)
+                suite["cases"][0]["expect"] = second
+                with self.assertRaisesRegex(ValueError, "case definitions differ"):
+                    bench.compare_runs(baseline, self.run_fixture(suite))
+
+    def test_saved_run_contains_fingerprints_without_adding_raw_prompts(self):
+        suite = self.suite()
+        suite["cases"][0]["prompt"] = "fictional prompt not for saved artifacts"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = workspace(root / "ws")
+            with Responder(ws, {suite["cases"][0]["prompt"]: "OK"}):
+                run = bench.run_suite(ws, suite, 2, 1, .001, "saved")
+            json_path, _ = bench.write_run(run, root / "output")
+            saved = bench._load_run(json_path)
+            self.assertEqual(set(saved["suite"]["case_fingerprints"]), {"one"})
+            self.assertRegex(saved["suite"]["case_fingerprints"]["one"], r"\Asha256:[0-9a-f]{64}\Z")
+            self.assertNotIn(suite["cases"][0]["prompt"], json_path.read_text())
+            self.assertEqual(saved["summary"]["passed"], 2)
+            self.assertEqual(len(list((ws / "tasks").iterdir())), 2)
+
+    def test_legacy_and_mixed_runs_explicitly_report_unknown_definitions(self):
+        known = self.run_fixture()
+        legacy = copy.deepcopy(known)
+        legacy["suite"].pop("case_fingerprints")
+        for baseline, candidate, warnings in [
+            (legacy, known, ["baseline_case_definitions_unknown"]),
+            (known, legacy, ["candidate_case_definitions_unknown"]),
+            (legacy, legacy, ["baseline_case_definitions_unknown", "candidate_case_definitions_unknown"]),
+        ]:
+            with self.subTest(warnings=warnings):
+                data, report = bench.compare_runs(baseline, candidate)
+                self.assertEqual(data["suite_compatibility"], {
+                    "shared_case_definitions_verified": False, "warnings": warnings})
+                self.assertIn("Shared case definitions verified: no", report)
+                self.assertIn("Suite warnings: " + ", ".join(warnings), report)
+                self.assertEqual(data["cases"]["transitions"]["pass_to_pass"], 1)
+
+    def test_invalid_maps_are_not_treated_as_legacy_on_either_side(self):
+        known = self.run_fixture()
+        legacy = copy.deepcopy(known)
+        legacy["suite"].pop("case_fingerprints")
+        digest = known["suite"]["case_fingerprints"]["one"]
+        for value in [None, [], "", {}, {"other": digest}, {"one": digest, "extra": digest},
+                      {"one": None}, {"one": 7}, {"one": "a" * 64},
+                      {"one": "sha256:" + "A" * 64}, {"one": "sha256:" + "g" * 64},
+                      {"one": digest + "\n"}, {"one": digest[:-1]}]:
+            malformed = copy.deepcopy(known)
+            malformed["suite"]["case_fingerprints"] = value
+            for other in (legacy, known):
+                for baseline, candidate in ((malformed, other), (other, malformed)):
+                    with self.subTest(value=value, legacy=other is legacy,
+                                      malformed_baseline=baseline is malformed):
+                        with self.assertRaisesRegex(ValueError, "invalid suite.case_fingerprints"):
+                            bench.compare_runs(baseline, candidate)
+
+    def test_case_additions_and_removals_keep_shared_definition_checks(self):
+        suite = self.suite()
+        baseline = self.run_fixture(suite)
+        suite["cases"].append({"id": "two", "prompt": "second"})
+        candidate = self.run_fixture(suite)
+        data, _ = bench.compare_runs(baseline, candidate)
+        self.assertTrue(data["suite_compatibility"]["shared_case_definitions_verified"])
+        self.assertEqual(data["suite_compatibility"]["warnings"], ["case_set_changed"])
+        self.assertEqual(data["cases"]["only_in_candidate"], ["two"])
+        suite["cases"] = suite["cases"][1:]
+        data, _ = bench.compare_runs(baseline, self.run_fixture(suite))
+        self.assertFalse(data["suite_compatibility"]["shared_case_definitions_verified"])
+        self.assertEqual(data["cases"]["only_in_baseline"], ["one"])
+        self.assertEqual(data["cases"]["only_in_candidate"], ["two"])
+        suite["cases"].insert(0, {"id": "one", "prompt": "changed"})
+        with self.assertRaisesRegex(ValueError, "case definitions differ"):
+            bench.compare_runs(baseline, self.run_fixture(suite))
+
+    def test_cli_refuses_incompatible_runs_without_writing_artifacts(self):
+        baseline = self.run_fixture()
+        suite = self.suite()
+        suite["cases"][0]["prompt"] += " changed"
+        candidate = self.run_fixture(suite)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base_path, _ = bench.write_run(baseline, root / "baseline")
+            cand_path, _ = bench.write_run(candidate, root / "candidate")
+            for flags in ([], ["--fail-on-regression"]):
+                output = root / "comparison"
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    rc = bench.main(["compare", str(base_path), str(cand_path),
+                                     "--output", str(output)] + flags)
+                self.assertEqual(rc, 2)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn("rerun with matching prompts and expectations", stderr.getvalue())
+                self.assertFalse(output.exists())
+            output.mkdir()
+            for name in ("comparison.json", "comparison.md"):
+                (output / name).write_text("keep existing artifact")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(bench.main(["compare", str(base_path), str(cand_path),
+                                             "--output", str(output)]), 2)
+            self.assertTrue(all(p.read_text() == "keep existing artifact" for p in output.iterdir()))
+
+    def test_cli_input_errors_are_not_regressions(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "input.json"
+            for body in (None, "not JSON", '{"kind":"other"}'):
+                with self.subTest(body=body):
+                    if body is not None:
+                        path.write_text(body)
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stderr(stderr):
+                        self.assertEqual(bench.main(["compare", str(path), str(path)]), 2)
+                    self.assertIn("cannot compare runs", stderr.getvalue())
 
 
 if __name__ == "__main__":
