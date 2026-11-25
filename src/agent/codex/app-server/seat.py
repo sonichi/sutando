@@ -626,7 +626,7 @@ class Seat:
     def abandon_trial(self) -> None:
         """A turn that ended with no verdict on the pick (an error, a timeout, an exit): it stays
         pending. The thread goes back to the model before it, and a later turn tries it again, at
-        most TRIAL_ATTEMPTS times in this seat."""
+        most TRIAL_ATTEMPTS times in this seat; after the last, the pick is settled `unconfirmed`."""
         if self.trial is None:
             return
         picked, rev, before, sent = self.trial
@@ -634,8 +634,20 @@ class Seat:
         if sent and before:
             self.restore = before
         left = TRIAL_ATTEMPTS - self.attempts.get(rev, 0)
-        log(f"model: no verdict on {picked} this turn; it stays pending"
-            + (f" ({left} more try)" if left > 0 else "; this seat does not try it again"))
+        if left > 0:
+            log(f"model: no verdict on {picked} this turn; it stays pending ({left} more try)")
+            return
+        log(f"model: no verdict on {picked} after {TRIAL_ATTEMPTS} tries; staying on {before or 'the default'}")
+        try:
+            settled = codex_core_model.unconfirmed(self.workspace / "state", rev,
+                                                   f"no verdict from Codex after {TRIAL_ATTEMPTS} tries")
+        except OSError as e:
+            settled = None
+            log(f"model: the switch record could not be settled ({one_line(e, 120)})")
+        if settled is not None:
+            self.notify("unconfirmed", f"I could not confirm the switch to {picked}: Codex did not finish a task on it in "
+                                       f"{TRIAL_ATTEMPTS} tries, so I stopped trying it. The core stays on "
+                                       f"{before or 'its default model'}; pick {picked} again to retry.\n")
 
     def notify(self, kind: str, text: str) -> None:
         try:

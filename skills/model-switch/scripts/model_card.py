@@ -218,7 +218,7 @@ def current_model(ws: Path) -> dict:
     """{model, name, source, ts}: the model in use by the switch record; model None without one."""
     rec = record(ws)
     model = rec.get("model") if isinstance(rec.get("model"), str) and rec.get("model") else None
-    if rec.get("runtime") == "codex" and rec.get("status") in ("rejected", "pending"):
+    if rec.get("runtime") == "codex" and rec.get("status") in ("pending", *codex_core_model.NOT_TAKEN):
         model = codex_core_model.working(rec) or None  # not taken by Codex (yet): the core is on this one
     return {"model": model, "name": name_of(model), "source": "model-switch.json" if model else None,
             "ts": rec.get("ts") if model else None}
@@ -228,7 +228,7 @@ def still_using(ws: Path, alias: str) -> str:
     """The model in use after a switch to `alias` failed. A record that names `alias` without the
     CLI's acceptance (the core was down) says what the next start uses, so the one before it stands."""
     rec = record(ws)
-    if rec.get("runtime") == "codex" and rec.get("model") == alias and rec.get("status") in ("pending", "rejected"):
+    if rec.get("runtime") == "codex" and rec.get("model") == alias and rec.get("status") in ("pending", *codex_core_model.NOT_TAKEN):
         return name_of(codex_core_model.working(rec) or None)
     if rec.get("model") == alias and rec.get("accepted") is False:
         return name_of(rec.get("previous") if isinstance(rec.get("previous"), str) else None)

@@ -79,6 +79,18 @@ class Record(Case):
         nxt = ccm.save(self.state, "gpt-c", applied="next-turn", accepted=False)
         self.assertEqual((nxt["previous"], nxt["working"], nxt["rev"]), ("gpt-a", "gpt-a", 3))
 
+    def test_an_unconfirmed_pick_is_not_a_refusal_and_leaves_the_working_model_in_use(self):
+        ccm.save(self.state, "gpt-a", applied="next-turn", accepted=True)
+        ccm.save(self.state, "gpt-b", applied="next-turn", accepted=False)
+        self.assertIsNone(ccm.unconfirmed(self.state, 1, "stale"), "rev 1 is no longer the record's")
+        rec = ccm.unconfirmed(self.state, 2, "no verdict")
+        self.assertEqual((rec["status"], rec["accepted"], rec["unconfirmed_reason"]), ("unconfirmed", False, "no verdict"))
+        self.assertNotIn("rejected_reason", rec)
+        self.assertEqual((ccm.current(self.state), ccm.launch(self.state), ccm.pending(self.state)),
+                         ("gpt-a", (2, "gpt-a", "gpt-a"), ("", 2)))
+        self.assertIsNone(ccm.resolve(self.state, 2, True), "a settled pick stays settled")
+        self.assertEqual(ccm.save(self.state, "gpt-b", applied="next-turn", accepted=False)["previous"], "gpt-a")
+
     def test_an_accepted_pick_is_the_working_model_and_a_moved_on_record_is_never_settled(self):
         ccm.save(self.state, "gpt-a", applied="next-turn", accepted=False)
         ccm.save(self.state, "gpt-b", applied="next-turn", accepted=False)

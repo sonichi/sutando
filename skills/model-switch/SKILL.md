@@ -84,7 +84,8 @@ as a Codex model). Nothing is typed into a pane. Under the same lock:
   turn makes it `accepted`. Either verdict reaches the owner as a proactive notice. Nothing else
   rejects a pick: an error answer, a failed turn, a timeout or an unreadable list is no verdict, the
   turn reruns on the model before it (Codex's default named explicitly when the seat had none), and
-  the pick stays pending, tried at most twice per seat. An explicit `SUTANDO_CORE_MODEL` launch
+  the pick stays pending, tried at most twice per seat. After the second try it is `unconfirmed` (not
+  a refusal): the core stays on `working`, the owner is told once, and picking it again retries. An explicit `SUTANDO_CORE_MODEL` launch
   outranks a pick saved before it (`SUTANDO_CORE_MODEL_REV`).
 - the core is a Codex TUI: `applied: next-start`, `accepted: false`, **exit 11** — saved, the running
   TUI keeps its model until its next start (owner-gated `bash src/agent/codex/cli/start-cli.sh
