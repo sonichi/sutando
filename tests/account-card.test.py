@@ -119,10 +119,11 @@ class Launch:
 
 
 def codex_read_from(home_holder):
-    """codex_account.read as a stand-in: the account named by the home's auth.json, no app-server."""
+    """codex_account.read as a stand-in: Codex confirms the account the home's auth.json names."""
     def read(home):
         import codex_account
-        return codex_account.from_auth_file(home)
+        got = codex_account.from_auth_file(home)
+        return dict(got, verified=True) if got else got
     return read
 
 

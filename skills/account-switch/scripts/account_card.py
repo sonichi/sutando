@@ -287,14 +287,15 @@ def current(rt: str, *, run=subprocess.run, codex_read=None) -> dict:
             import codex_account
             codex_read = codex_account.read
         acct = codex_read(home) or {}
+        # A sign-in counts only once Codex itself confirms it (`verified`); auth.json alone may hold a dead one.
+        signed = True if acct.get("verified") is True else (None if acct.get("kind") else False)
         if acct.get("kind") == "apiKey":
-            return {"runtime": rt, "signed_in": True, "shown": "an OpenAI API key", "key": ""}
+            return {"runtime": rt, "signed_in": signed, "shown": "an OpenAI API key", "key": ""}
         if not acct.get("kind") and ident is None:
             return {"runtime": rt, "signed_in": False, "shown": "", "key": ""}
         email = masked(str(acct.get("email") or "")) or (masked_label(ident[1]) if ident else "")
         plan = f" ({acct['plan']})" if acct.get("plan") and acct.get("email") else ""
-        # Only Codex naming an account kind is a sign-in; a token left in auth.json may be expired or revoked.
-        return {"runtime": rt, "signed_in": bool(acct.get("kind")), "shown": (email + plan) or "a ChatGPT account",
+        return {"runtime": rt, "signed_in": signed, "shown": (email + plan) or "a ChatGPT account",
                 "key": ident[0] if ident else ""}
     st = claude_status(run)
     shown = (masked(st["email"]) or "an Anthropic account") + (f" ({st['plan']})" if st["plan"] else "")
