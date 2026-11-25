@@ -584,7 +584,7 @@ class Issued(unittest.TestCase):
         self.assertFalse(issued_cards.settle(self.ws, "$a"))
         self.forged(reply_to_event="$a", now=1005.0)
 
-    def test_a_replayed_event_replaces_nothing_and_settling_keeps_the_superseded_retired(self):
+    def test_a_replayed_event_replaces_nothing_and_a_settled_one_stays_settled(self):
         cards = lambda: sorted(json.loads(issued_cards.ledger_path(self.ws).read_text())["cards"])
         issued_cards.record(self.ws, "$a", self.card, room=DM, now=1000.0)
         issued_cards.record(self.ws, "$b", self.card, room=DM, now=1001.0)
@@ -596,8 +596,9 @@ class Issued(unittest.TestCase):
         # A live card handed back again stays, and replaces nothing.
         self.assertTrue(issued_cards.record(self.ws, "$b", self.card, room=DM, now=1003.0))
         self.assertEqual(cards(), ["$b"])
-        # Settling keeps the retired set: the superseded $a still cannot come back.
+        # A settled card handed back again stays settled, and the superseded $a still cannot come back.
         self.assertTrue(issued_cards.settle(self.ws, "$b"))
+        self.assertFalse(issued_cards.record(self.ws, "$b", self.card, room=DM, now=1004.0))
         self.assertFalse(issued_cards.record(self.ws, "$a", self.card, room=DM, now=1004.0))
         self.assertEqual(cards(), [])
         # A card whose first record never landed (a replay of an event this ledger never saw) is recorded.

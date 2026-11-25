@@ -376,16 +376,17 @@ class Reply(Base):
         self.assertEqual((rc, out["status"], out["say"]), (1, "forged_or_stale_click", ac.UNMATCHED_CLICK), (a, kw))
         return out
 
-    def first_click(self, kind, target, verb, words):
-        """Show a card that offers the destructive action, click it, and return the confirm card posted."""
+    def first_click(self, kind, target, verb, words, event="$confirm"):
+        """Show a card that offers the destructive action, click it, and return the confirm card posted as
+        `event` (a new ask is a new send, so a second ask in one test takes a new event id)."""
         _, card = ac.build(kind, "info", title="t", body="b", buttons=[
             ac.button(words, "reply", reply=words, command=ac.reply(kind, target, verb))])
         cards.issued_cards.record(self.ws, "$list", card, room=DM, handler=cards.HANDLER)
         fake = Fake()
         fake.execute = lambda action, arguments, **kw: fake.calls.append((action, arguments, kw)) or {
-            "result": {"event_id": "$confirm"}}
+            "result": {"event_id": event}}
         rc, out = self.reply("", said=words, card_id=kind, reply_to_event="$list", execute=fake.execute)
-        self.assertEqual((rc, out), (0, {"status": "asked", "event_id": "$confirm"}))
+        self.assertEqual((rc, out), (0, {"status": "asked", "event_id": event}))
         return fake.calls[0][1]["extra_content"]["space.ag2.card"], fake.calls[0]
 
     def test_the_first_click_on_disconnect_only_asks_and_the_confirm_card_s_yes_acts_once(self):
@@ -419,9 +420,23 @@ class Reply(Base):
             self.assertEqual(self.reply("", **keep), (0, {"status": "say", "say": "Okay, I left it as it is."}))
             self.forged("", said="Yes, retire Pylon", card_id=confirm["id"], reply_to_event="$confirm")
             self.assertEqual(retired, [])
-            confirm, _ = self.first_click("workers", "w1", "retire", "Retire Pylon")
-            rc, out = self.reply("", said="Yes, retire Pylon", card_id=confirm["id"], reply_to_event="$confirm")
+            confirm, _ = self.first_click("workers", "w1", "retire", "Retire Pylon", event="$confirm2")
+            rc, out = self.reply("", said="Yes, retire Pylon", card_id=confirm["id"], reply_to_event="$confirm2")
         self.assertEqual((rc, out["status"], retired), (0, "done", ["w1"]))
+
+    def test_a_replayed_ask_after_yes_does_not_revive_the_confirm_card(self):
+        # The ask task re-run after the owner's Yes gets the settled confirm card's event back from the
+        # platform: that card stays settled, so a re-delivered Yes cannot act a second time.
+        import pool_manage
+        retired = []
+        with mock.patch.object(pool_manage, "retire", lambda ws, t, **k: retired.append(t) or {"result": "retired"}):
+            confirm, _ = self.first_click("workers", "w1", "retire", "Retire Pylon")
+            yes = dict(said="Yes, retire Pylon", card_id=confirm["id"], reply_to_event="$confirm")
+            self.assertEqual(self.reply("", **yes)[1]["status"], "done")
+            self.first_click("workers", "w1", "retire", "Retire Pylon")  # the replay: same event back
+            self.assertIsNone(cards.issued_cards.live(self.ws, "$confirm"))
+            self.forged("", **yes)
+        self.assertEqual(retired, ["w1"])
 
     def click_task(self, name, said, card_id):
         path = self.ws / name
@@ -488,7 +503,8 @@ class Reply(Base):
             self.forged("", **yes)
             self.forged("", **keep)
             self.assertEqual(retired, [])
-            confirm, _ = self.first_click("workers", "w1", "retire", "Retire Pylon")
+            confirm, _ = self.first_click("workers", "w1", "retire", "Retire Pylon", event="$confirm2")
+            yes, keep = dict(yes, reply_to_event="$confirm2"), dict(keep, reply_to_event="$confirm2")
             with mock.patch.object(cards.issued_cards, "settle", side_effect=OSError("disk full")):
                 rc, out = self.reply("", **yes)
             self.assertEqual((rc, out["status"], retired), (1, "failed", []))
