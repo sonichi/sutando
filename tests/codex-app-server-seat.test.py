@@ -77,6 +77,22 @@ def write_result(prompt):
 
 
 rec({"argv": sys.argv[1:], "pid": os.getpid(), "cwd": os.getcwd()})
+# Like Codex, the login is read once, at start; a later sign-in revokes it (D/revoked) and writes a new one.
+try:
+    TOKEN = open(os.path.join(os.environ["CODEX_HOME"], "auth.json")).read().strip()
+except (KeyError, OSError):
+    TOKEN = ""
+
+
+def revoked():
+    try:
+        return TOKEN in open(os.path.join(D, "revoked")).read().split()
+    except OSError:
+        return False
+
+
+UNAUTH = {"message": "Your access token could not be refreshed because your refresh token was revoked. "
+                     "Please log out and sign in again.", "codexErrorInfo": "unauthorized"}
 if os.path.exists(os.path.join(D, "exit-at-start")):
     sys.exit(3)
 sys.stdout.write("this line is not JSON\n[1]\n")
@@ -130,7 +146,7 @@ for line in sys.stdin:
         if refused and p.get("model") == refused:
             out({"id": rid, "error": {"code": -32602, "message": "model %s is not supported" % refused}})
             continue
-        step = plan()
+        step = "unauth" if TOKEN and revoked() else plan()
         if step == "refuse":
             out({"id": rid, "error": {"code": -32000, "message": "thread is busy"}})
             continue
@@ -157,6 +173,33 @@ for line in sys.stdin:
         elif step == "fail":
             out({"method": "error", "params": {"threadId": thread, "error": {"message": "usage limit reached"}}})
             finish("failed", {"message": "usage limit reached"})
+        elif step == "unauth":
+            out({"method": "error", "params": {"threadId": thread, "error": UNAUTH}})
+            finish("failed", UNAUTH)
+        elif step in ("limit", "limit-bare"):
+            error = {"message": "You've hit your usage limit. Upgrade to Pro or try again at 3:05 PM.",
+                     "codexErrorInfo": "usageLimitExceeded", "additionalDetails": None}
+            if step == "limit":
+                out({"method": "account/rateLimits/updated", "params": {"rateLimits": {
+                    "limitId": "codex", "primary": {"usedPercent": 100, "windowDurationMins": 300,
+                                                    "resetsAt": 4102444800}}}})
+            out({"method": "error", "params": {"threadId": thread, "turnId": turn, "error": error,
+                                               "willRetry": False}})
+            finish("failed", error)
+        elif step == "model-missing":
+            error = {"message": "Error running remote compact task: The 'gpt-6.1-terra' model is not supported "
+                                "when using Codex with a ChatGPT account.", "codexErrorInfo": "modelNotFound"}
+            out({"method": "error", "params": {"threadId": thread, "turnId": turn, "error": error}})
+            finish("failed", error)
+        elif step == "model-missing-at-start":
+            error = {"message": "The 'gpt-6-1-terra' model is not supported when using Codex with a ChatGPT account.",
+                     "codexErrorInfo": "modelNotFound"}
+            out({"method": "thread/status/changed", "params": {"threadId": thread, "status": {"type": "systemError"}}})
+            out({"method": "error", "params": {"threadId": thread, "turnId": "another-turn-id", "error": error}})
+            finish("failed", None)
+        elif step == "fail-other":
+            finish("failed", {"message": "stream disconnected before completion",
+                              "codexErrorInfo": "responseStreamDisconnected"})
         elif step == "die":
             os._exit(7)
         elif step == "die_after_result":
@@ -227,7 +270,10 @@ class SeatCase(unittest.TestCase):
         self.stage_log = root / "stage.log"
         self.hook = root / "stage-hook.py"
         self.hook.write_text(STAGE_HOOK, encoding="utf-8")
-        env = mock.patch.dict(os.environ, {"FAKE_DIR": str(self.fake_dir), "STAGE_LOG": str(self.stage_log)})
+        self.codex_home = root / "codex-home"
+        self.codex_home.mkdir()
+        env = mock.patch.dict(os.environ, {"FAKE_DIR": str(self.fake_dir), "STAGE_LOG": str(self.stage_log),
+                                           "CODEX_HOME": str(self.codex_home)})
         env.start()
         self.addCleanup(env.stop)
         for name in ("SUTANDO_POOL_DELIVERY_SCRIPT", "FAKE_PROBE", "STAGE_REAL"):
@@ -888,6 +934,190 @@ class Crash(SeatCase):
         self.assertEqual(len(self.sent("thread/resume")), 1)
 
 
+
+def health(ws):
+    """The core's account health record (core_account_health), {} when none."""
+    try:
+        return json.loads((Path(ws) / "state" / "core-account-health.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+class AccountSwitch(SeatCase):
+    """The child reads its login once, at start; a sign-in or account switch since revoked that login's refresh
+    token (VM 11-22: the first turn after a switch failed with "refresh token was revoked"). A changed login
+    file restarts the child before the next turn; a turn refused as unauthorized restarts it and is tried once
+    more; refused again, the core seat shows the owner the account card."""
+
+    def make(self, decl=None, **kw):
+        s = super().make(decl, **kw)
+        self.cards = self.fake_dir / "cards.log"
+        script = self.fake_dir / "card.py"
+        script.write_text("import sys\nopen(sys.argv[1], 'a').write(' '.join(sys.argv[2:]) + '\\n')\n")
+        s.card_argv = [sys.executable, str(script), str(self.cards), *s.card_argv[2:]]
+        return s
+
+    def sign_in(self, token, revoke=None):
+        """A sign-in: the new login on disk, the one it replaced revoked."""
+        if revoke:
+            with open(self.fake_dir / "revoked", "a") as f:
+                f.write(revoke + "\n")
+        (self.codex_home / "auth.json").write_text(token)
+
+    def starts(self):
+        return len([r for r in self.sent() if "argv" in r])
+
+    def posted(self):
+        return self.cards.read_text().splitlines() if self.cards.exists() else []
+
+    def test_a_switch_restarts_the_app_server_before_the_next_turn(self):
+        self.sign_in("tok-a")
+        s = self.make()
+        s.ensure_server()
+        self.sign_in("tok-b", revoke="tok-a")
+        self.task("task-1.txt")
+        self.assertEqual(s.step(), "done")
+        self.assertEqual((self.starts(), len(self.sent("turn/start"))), (2, 1), "restarted before the turn, not after a failure")
+        self.assertEqual([r["params"]["threadId"] for r in self.sent("thread/resume")], ["thr-1"], "on the same thread")
+        self.assertIn("login changed on disk", self.out.getvalue())
+        self.task("task-2.txt")
+        self.assertEqual(s.step(), "done")
+        self.assertEqual(self.starts(), 2, "once per change")
+        self.assertEqual(self.posted(), [])
+
+    def test_an_unauthorized_turn_restarts_once_and_a_login_rotated_meanwhile_answers(self):
+        self.sign_in("tok-a")
+        self.task("task-1.txt")
+        self.plan("unauth", "result")
+        s = self.make()
+        s.ensure_server()
+        self.assertEqual(s.step(), "done")
+        self.assertEqual((self.starts(), len(self.sent("turn/start"))), (2, 2))
+        self.assertEqual(s.failures, 0, "a refused login is not a server failure")
+        self.assertIn("turn refused as unauthorized", self.out.getvalue())
+        self.assertEqual(self.posted(), [])
+
+    def test_still_unauthorized_after_the_restart_shows_the_owner_the_account_card_once(self):
+        self.sign_in("tok-a", revoke="tok-a")     # revoked, and no new sign-in on disk
+        self.task("task-1.txt")
+        s = self.make(retry_s=30, max_attempts=3)
+        s.ensure_server()
+        self.assertEqual(s.step(), seat_mod.UNAUTHORIZED)
+        self.assertEqual((self.starts(), len(self.sent("turn/start"))), (2, 2), "restarted and tried once more")
+        self.assertEqual(self.posted(), [f"--workspace {self.ws} post --signed-out"])
+        self.assertEqual((health(self.ws)["state"], health(self.ws)["runtime"]), ("signed_out", "codex"))
+        since = health(self.ws)["since"]
+        rec = json.loads(s.record_file("task-1.txt").read_text())
+        self.assertEqual(rec["outcome"], seat_mod.UNAUTHORIZED)
+        self.assertEqual(list(task_dispatch.pending_candidates(self.tasks, self.results)), ["task-1.txt"])
+        self.now[0] += 31
+        self.assertEqual(s.step(), seat_mod.UNAUTHORIZED)
+        self.assertEqual(len(self.posted()), 1, "once per login on disk")
+        self.assertEqual(health(self.ws)["since"], since, "rewritten only when it changes")
+        self.sign_in("tok-b")                       # the owner switches from the card
+        self.now[0] += 31
+        self.assertEqual(s.step(), "done")
+        self.assertEqual(len(self.posted()), 1)
+        self.assertEqual(health(self.ws)["state"], "ok")
+
+    def test_a_login_change_lifts_the_cores_limit_hold_but_a_workers_seat_leaves_it(self):
+        import core_limit_hold
+        held = {"status": "held", "kind": "usage-limit", "model": None, "evidence_at": 1, "set_at": 1,
+                "until": 4102444800, "strikes": 1, "reason": "paused"}
+        self.sign_in("tok-a")
+        for worker, lifted in (("w1", False), ("", True)):
+            with self.subTest(worker=worker):
+                core_limit_hold._write_hold(self.ws, held)
+                s = self.make()
+                s.worker = worker
+                s.ensure_server()
+                self.sign_in("tok-b" + worker)
+                s.fresh_auth()
+                self.assertEqual(core_limit_hold.read_hold(self.ws)["status"], "cleared" if lifted else "held")
+                s.close_server()
+
+    def test_a_sign_in_while_idle_puts_the_health_back_to_ok_without_a_task(self):
+        self.sign_in("tok-a", revoke="tok-a")
+        self.task("task-1.txt")
+        s = self.make(retry_s=3600, max_attempts=3)
+        s.ensure_server()
+        self.assertEqual(s.step(), seat_mod.UNAUTHORIZED)
+        s.health_auth_check()
+        self.assertEqual(health(self.ws)["state"], "signed_out", "the same login: still signed out")
+        self.sign_in("tok-b")
+        s.health_auth_check()
+        self.assertEqual(health(self.ws)["state"], "ok")
+        self.assertIn("account health: ok", self.out.getvalue())
+
+    def test_back_signed_in_the_owner_is_told_once_after_the_card(self):
+        """VM 2026-11-24 06:25: signed in and answered, but the card's 'Sign-in expired' was the last word."""
+        self.sign_in("tok-a", revoke="tok-a")
+        self.task("task-1.txt")
+        s = self.make(retry_s=3600, max_attempts=3)
+        s.model = "gpt-5.6-terra"
+        s.ensure_server()
+        self.assertEqual(s.step(), seat_mod.UNAUTHORIZED)
+        self.assertIsNotNone(s.told_signed_out, "the card was shown")
+        self.assertEqual(list(self.results.glob("proactive-model-signed-in-*.txt")), [])
+        self.sign_in("tok-b")
+        s.health_auth_check()
+        notice, = self.results.glob("proactive-model-signed-in-*.txt")
+        self.assertIn("Signed in as", notice.read_text())
+        self.assertIn("I'm back on gpt-5.6-terra.", notice.read_text())
+        s.health("quota")
+        s.health("ok")                         # a recovery nobody was shown a card for: no notice
+        self.assertEqual(len(list(self.results.glob("proactive-model-signed-in-*.txt"))), 1)
+
+    def test_back_after_a_limit_card_the_owner_is_told(self):
+        s = self.make()
+        s.model = "gpt-5.6-terra"
+        s.health("quota")
+        s.told_limit = True
+        s.health("ok")
+        notice, = self.results.glob("proactive-model-signed-in-*.txt")
+        self.assertIn("I'm back on gpt-5.6-terra.", notice.read_text())
+        self.assertFalse(s.told_limit)
+
+    def test_a_card_that_could_not_be_sent_is_tried_again(self):
+        self.sign_in("tok-a", revoke="tok-a")
+        self.task("task-1.txt")
+        s = self.make(retry_s=30, max_attempts=3)
+        s.card_argv = [sys.executable, "-c", "import sys; print('no core lane'); sys.exit(1)"]
+        s.ensure_server()
+        self.assertEqual(s.step(), seat_mod.UNAUTHORIZED)
+        self.assertIn("the account card was not sent (no core lane)", self.out.getvalue())
+        self.assertIsNone(s.told_signed_out)
+
+    def test_a_worker_seat_restarts_on_the_shared_login_but_sends_no_card(self):
+        self.sign_in("tok-a", revoke="tok-a")
+        self.task("task-1.txt")
+        s = self.make()
+        s.worker = "w1"
+        s.ensure_server()
+        self.assertEqual(s.step(), seat_mod.UNAUTHORIZED)
+        self.assertEqual(self.starts(), 2)
+        self.assertEqual(self.posted(), [])
+        self.assertEqual(health(self.ws), {}, "a worker never writes the core's health")
+
+    def test_what_reads_as_unauthorized(self):
+        yes = ({"codexErrorInfo": "unauthorized"}, {"codex_error_info": {"unauthorized": {}}},
+               {"message": "Your access token could not be refreshed because your refresh token was revoked. "
+                           "Please log out and sign in again."}, "turn/start: {'message': '401 Unauthorized'}")
+        no = (None, {"codexErrorInfo": "usageLimitExceeded"}, {"message": "stream disconnected"}, "thread is busy")
+        self.assertEqual([seat_mod.unauthorized(e) for e in yes], [True] * len(yes))
+        self.assertEqual([seat_mod.unauthorized(e) for e in no], [False] * len(no))
+
+    def test_the_login_print_names_the_file_never_its_contents(self):
+        path = self.codex_home / "auth.json"
+        self.assertIsNone(seat_mod.auth_print())
+        path.write_text("tok-SECRET")
+        printed = seat_mod.auth_print()
+        self.assertEqual(printed[0], os.path.realpath(path))
+        self.assertNotIn("tok-SECRET", repr(printed))
+        path.write_text("tok-SECRET-longer")
+        self.assertNotEqual(seat_mod.auth_print(), printed)
+
+
 class CoreModelSwitch(SeatCase):
     """The Codex core's switch (switch-model.sh, src/codex_core_model.py) reaches the core seat's next
     turn; it is core-only, so a worker's seat never reads it (TestWorker below)."""
@@ -968,6 +1198,19 @@ class CoreModelSwitch(SeatCase):
         self.assertEqual(s.serve(once=True), 0)
         self.assertEqual([("model" in r["params"]) for r in self.sent("turn/start")], [False])
         self.assertEqual(self.record()["status"], "pending")
+
+    def test_a_launch_that_already_runs_the_pending_pick_settles_it_on_the_first_completed_turn(self):
+        """VM 2026-11-24 06:29: the restart named terra, every turn ran on it, and the record stayed
+        'pending, working luna', so the model card named luna while Settings named terra."""
+        self.switch("gpt-6-luna", accepted=True)
+        self.switch("gpt-6.1-terra")                       # rev 2, pending
+        s = self.launched(2, model="gpt-6.1-terra")        # the restart named it
+        self.task("task-1.txt")
+        self.assertEqual(s.serve(once=True), 0)
+        self.assertEqual([("model" in r["params"]) for r in self.sent("turn/start")], [False], "no switch sent")
+        rec = self.record()
+        self.assertEqual((rec["status"], rec["working"], rec["confirmed"]),
+                         ("accepted", "gpt-6.1-terra", "gpt-6.1-terra"))
 
     def test_while_the_turn_runs_on_the_pick_the_record_says_so_and_it_is_confirmed_only_at_the_turns_end(self):
         # VM 2026-11-23: the turn that applied the pick ran on it, read the record mid-turn, and answered
@@ -1220,6 +1463,244 @@ class CoreModelSwitch(SeatCase):
         (self.ws / "state" / "model-switch.json").write_text(json.dumps({"model": "opus", "accepted": True}))
         s = self.launched(0)
         self.assertEqual(s.turn_model(), "")
+
+
+OWNER = "task: hi\naccess_tier: owner\n"
+
+
+class ModelNotAvailable(SeatCase):
+    """VM 2026-11-24: the core's gpt-6.1-terra is not available under the ChatGPT account it was switched to
+    (modelNotFound, raised during compaction); the turn failed twice and the owner saw "thinking" forever."""
+
+    def catalog(self, *models, default=None):
+        rows = [{"id": m, "model": m, "isDefault": m == default} for m in models]
+        (self.fake_dir / "models.json").write_text(json.dumps(rows))
+
+    def test_what_reads_as_a_missing_model(self):
+        yes = ({"codexErrorInfo": "modelNotFound"}, {"codex_error_info": {"modelNotFound": {}}},
+               {"message": "The 'gpt-6.1-terra' model is not supported when using Codex with a ChatGPT account."},
+               "model not found")
+        no = ({"codexErrorInfo": "usageLimitExceeded"}, {"message": "stream disconnected"}, None, "")
+        self.assertEqual([seat_mod.model_missing(e) for e in yes], [True] * len(yes))
+        self.assertEqual([seat_mod.model_missing(e) for e in no], [False] * len(no))
+
+    def card_calls(self):
+        log = self.ws / "model-card-calls.txt"
+        return log.read_text().splitlines() if log.exists() else []
+
+    def fake_card(self, rc=0):
+        """MODEL_CARD replaced by a script that records its arguments and answers `rc`."""
+        script = self.ws / "fake_model_card.py"
+        script.write_text("import sys\nopen(%r, 'a').write(' '.join(sys.argv[1:]) + '\\n')\nsys.exit(%d)\n"
+                          % (str(self.ws / "model-card-calls.txt"), rc))
+        return mock.patch.object(seat_mod, "MODEL_CARD", script)
+
+    def test_it_shows_the_owner_the_model_card_and_leaves_the_task_pending(self):
+        """Owner 2026-11-24: a card listing the models this account can use, never a silent switch."""
+        self.task("task-1.txt", OWNER)
+        self.plan("model-missing")
+        s = self.make(retry_s=30, max_attempts=3)
+        s.model = "gpt-6.1-terra"
+        s.ensure_server()
+        with self.fake_card():
+            self.assertNotEqual(s.step(), "done")
+        self.assertEqual(len(self.sent("turn/start")), 1, "no silent retry on another model")
+        self.assertEqual(s.model, "gpt-6.1-terra", "the model is not switched by the seat")
+        calls = self.card_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("post --owner-dm --lead gpt-6.1-terra isn't available on this Codex account", calls[0])
+        self.assertFalse((self.results / "task-1.txt").exists(), "no result: it stays pending for the pick")
+        self.assertEqual(list(self.results.glob("proactive-model-*.txt")), [])
+
+    def test_a_refusal_at_turn_start_with_another_turn_id_gets_the_card_too(self):
+        """VM 2026-11-24 05:38: refused straight at turn start (systemError, no compaction), the error naming
+        another turn id and the turn's own error empty; no card followed."""
+        self.task("task-1.txt", OWNER)
+        self.plan("model-missing-at-start")
+        s = self.make(retry_s=30, max_attempts=3)
+        s.model = "gpt-6-1-terra"
+        s.ensure_server()
+        with self.fake_card():
+            self.assertNotEqual(s.step(), "done")
+        calls = self.card_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--lead gpt-6-1-terra isn't available on this Codex account", calls[0])
+        self.assertIn("model card posted", self.out.getvalue())
+
+    def test_each_refused_owner_message_gets_the_card_once(self):
+        """VM 2026-11-24 06:13-06:16: one card, then every later message refused with no reply."""
+        self.task("task-1.txt", OWNER)
+        self.plan("model-missing", "model-missing", "model-missing")
+        s = self.make(retry_s=0, max_attempts=5)
+        s.model = "gpt-6.1-terra"
+        s.ensure_server()
+        with self.fake_card():
+            s.step()
+            s.deferred.clear()
+            s.step()                               # the same message retried: no second card
+            self.assertEqual(len(self.card_calls()), 1)
+            (self.results / "task-1.txt").write_text("answered on the pick\n")  # the first one is done
+            s.step()
+            self.task("task-2.txt", OWNER)         # a new message: its own card
+            s.deferred.clear()
+            s.step()
+        self.assertEqual(len(self.card_calls()), 2)
+
+    def test_a_task_not_the_owners_is_closed_not_retried_on_a_refused_model(self):
+        """A cron's task (main-loop, sync-workspace) failed the same way, silently and again and again."""
+        self.task("task-cron.txt", "task: run the main loop\naccess_tier: internal\n")
+        self.plan("model-missing")
+        s = self.make(retry_s=0, max_attempts=5)
+        s.model = "gpt-6.1-terra"
+        s.ensure_server()
+        with self.fake_card():
+            self.assertEqual(s.step(), "done")
+        self.assertEqual(self.card_calls(), [], "no card for it")
+        self.assertTrue((self.results / "task-cron.txt").read_text().startswith("[no-send]"))
+
+    def test_a_card_that_cannot_be_posted_is_said_in_words(self):
+        self.task("task-1.txt", OWNER)
+        self.plan("model-missing")
+        s = self.make(retry_s=30, max_attempts=3)
+        s.model = "gpt-6.1-terra"
+        s.ensure_server()
+        with self.fake_card(rc=1):
+            s.step()
+        notes = [f.read_text() for f in self.results.glob("proactive-model-refused-*.txt")]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("isn't available on this Codex account", notes[0])
+
+
+class QuotaCard(SeatCase):
+    """Out of usage, the core seat sends the owner the account card once per limit (core_quota_notice)."""
+
+    def quota(self, posted=True):
+        import core_quota_notice
+        self.cards = []
+
+        def send(text):
+            self.cards.append(text)
+            return posted
+        return core_quota_notice.QuotaNotice(self.ws, "Codex", send, log=lambda *a: None, now=lambda: self.now[0])
+
+    def test_a_limit_sends_one_card_with_the_reset_and_a_second_limit_sends_none(self):
+        self.task("task-1.txt")
+        self.plan("limit", "limit")
+        s = self.make(quota=self.quota())
+        s.ensure_server()
+        self.assertEqual(s.step(), "failed")
+        self.assertEqual(len(self.cards), 1)
+        import core_quota_notice
+        self.assertIn("Codex has reached its usage limit (resets %s)" % core_quota_notice.reset_from_epoch(4102444800),
+                      self.cards[0])
+        self.assertTrue(json.loads((self.ws / "state" / "core-quota-card.json").read_text())["told"])
+        self.assertEqual({k: health(self.ws).get(k) for k in ("state", "runtime", "resets_at")},
+                         {"state": "quota", "runtime": "codex", "resets_at": 4102444800.0})
+        self.now[0] += 3600
+        self.assertEqual(s.step(), "failed")
+        self.assertEqual(len(self.cards), 1, "a second card for the same limit")
+        self.assertIn("quota: quota-card", self.out.getvalue())
+
+    def test_every_owner_message_during_the_limit_gets_the_card_once(self):
+        self.task("task-1.txt", "access_tier: owner\ntask: hi\n")
+        self.plan("limit", "limit", "limit", "limit")
+        s = self.make(quota=self.quota(), retry_s=3600.0, hold_s=3600.0)
+        s.ensure_server()
+        self.assertEqual(s.step(), "failed")
+        self.assertEqual(len(self.cards), 1)
+        self.task("task-2.txt", "access_tier: owner\ntask: are you there?\n")
+        self.task("task-3.txt", "access_tier: team\ntask: a collaborator\n")
+        self.assertEqual([s.step(), s.step()], ["failed", "failed"])
+        self.now[0] += 3601
+        s.step()                                    # task-1 again
+        self.assertEqual(len(self.cards), 2, "task-2 gets its card; task-1 again and a collaborator do not")
+
+    def test_the_errors_own_words_give_the_reset_when_no_window_says(self):
+        self.task("task-1.txt")
+        self.plan("limit-bare")
+        s = self.make(quota=self.quota())
+        s.ensure_server()
+        s.step()
+        self.assertIn("(resets 3:05 PM)", self.cards[0])
+
+    def test_another_error_sends_no_card(self):
+        self.task("task-1.txt")
+        self.plan("fail-other")
+        s = self.make(quota=self.quota())
+        s.ensure_server()
+        self.assertEqual(s.step(), "failed")
+        self.assertEqual(self.cards, [])
+
+    def test_a_completed_turn_ends_the_limit_and_a_later_one_is_a_new_card(self):
+        self.task("task-1.txt")
+        self.plan("limit", "result", "limit")
+        s = self.make(quota=self.quota(), retry_s=0.0)
+        s.ensure_server()
+        s.step()
+        self.assertEqual(health(self.ws)["state"], "quota")
+        self.assertEqual(s.step(), "done")
+        self.assertFalse(json.loads((self.ws / "state" / "core-quota-card.json").read_text()))
+        self.assertEqual(health(self.ws)["state"], "ok")
+        self.assertNotIn("resets_at", health(self.ws))
+        self.task("task-2.txt")
+        s.step()
+        self.assertEqual(len(self.cards), 2)
+
+    def test_a_card_that_was_not_posted_is_tried_again_later_not_every_turn(self):
+        self.task("task-1.txt")
+        self.plan("limit", "limit", "limit")
+        s = self.make(quota=self.quota(posted=False), retry_s=0.0, hold_s=0.0)
+        s.ensure_server()
+        s.step()
+        s.step()
+        self.assertEqual(len(self.cards), 1, "tried again inside the retry interval")
+        self.now[0] += 61
+        s.step()
+        self.assertEqual(len(self.cards), 2)
+
+    def test_a_seat_without_a_notice_sends_nothing_and_the_core_seat_names_the_account_card(self):
+        self.task("task-1.txt")
+        self.plan("limit")
+        s = self.make()
+        s.ensure_server()
+        self.assertEqual(s.step(), "failed")
+        self.assertFalse((self.ws / "state" / "core-quota-card.json").exists())
+        self.assertTrue(seat_mod.ACCOUNT_CARD.is_file())
+
+    def test_a_limit_is_not_a_refused_login_and_a_refused_login_is_not_a_limit(self):
+        self.task("task-1.txt")
+        self.plan("limit")
+        s = self.make(quota=self.quota())
+        s.ensure_server()
+        self.assertEqual(s.step(), "failed", "out of usage is not `unauthorized`")
+        self.assertEqual(len([r for r in self.sent() if "argv" in r]), 1, "no restart for a limit")
+        self.assertNotIn("turn refused as unauthorized", self.out.getvalue())
+        self.assertEqual(len(self.cards), 1)
+        self.task("task-2.txt")
+        self.plan("unauth", "unauth")
+        s.card_argv = [sys.executable, "-c", "pass"]
+        self.assertEqual(s.step(), seat_mod.UNAUTHORIZED)
+        self.assertEqual(len(self.cards), 1, "a refused login sends no quota card")
+
+    def test_the_two_kinds_never_collide(self):
+        limit = ({"codexErrorInfo": "usageLimitExceeded", "message": "401 Unauthorized"},
+                 {"message": "You've hit your usage limit. Log out and sign in again."}, "usage limit reached")
+        unauth = ({"codexErrorInfo": "unauthorized", "message": "You've hit your usage limit."},
+                  {"message": "refresh token was revoked"})
+        for e in limit:
+            self.assertEqual((seat_mod.error_kind(e), seat_mod.unauthorized(e)), (seat_mod.USAGE_LIMIT_INFO, False), e)
+        for e in unauth:
+            self.assertEqual((seat_mod.error_kind(e), seat_mod.usage_limit(e)), (seat_mod.UNAUTHORIZED, False), e)
+
+    def test_usage_limit_and_limit_reset(self):
+        self.assertTrue(seat_mod.usage_limit({"codexErrorInfo": "usageLimitExceeded"}))
+        self.assertTrue(seat_mod.usage_limit({"codexErrorInfo": {"usage_limit_exceeded": {}}}))
+        self.assertTrue(seat_mod.usage_limit({"message": "You've hit your usage limit."}))
+        self.assertFalse(seat_mod.usage_limit({"message": "stream disconnected", "codexErrorInfo": "other"}))
+        self.assertFalse(seat_mod.usage_limit(None))
+        self.assertEqual(seat_mod.limit_reset({"primary": {"usedPercent": 100, "resetsAt": 10},
+                                               "secondary": {"usedPercent": 100, "resetsAt": 20}}), 20.0)
+        self.assertIsNone(seat_mod.limit_reset({"primary": {"usedPercent": 99, "resetsAt": 10}}))
 
 
 class CoreQueue(SeatCase):

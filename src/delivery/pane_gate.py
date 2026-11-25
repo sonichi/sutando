@@ -89,13 +89,17 @@ FABLE_TEXT = re.compile(r"reached your Fable limit|included Fable usage for this
 # The CLI's wait-for-the-reset banner ("Usage limit reached · …", "Continuing automatically at …"); near
 # the reset its second row reads "Continuing shortly · Esc to cancel", often captured without the first.
 LIMIT_WAIT = re.compile(r"Continuing automatically (?:at\b|shortly\b)|Continuing shortly\s*·\s*Esc to cancel"
-                        r"|\b(?:session|usage|weekly) limit reached\b", re.I)
+                        r"|\b(?:session|usage|weekly) limit reached\b"
+                        # The weekly limit's own title: "Weekly limit · resets Nov 28 at 1pm", "You've used
+                        # your weekly limit … resets …" (VM 2026-11-23: its /rate-limit-options menu was missed).
+                        r"|\b(?:session|usage|weekly) limit\b[^\n]{0,60}\bresets?\b", re.I)
 #: A turn this short (or with no duration) may be the CLI refusing it, not running it.
 TURN_SHORT = re.compile(r"[01]s")
 # A turn the CLI refuses outright is a FINISHED turn: the reason is its `⎿` result and the
 # pane returns to the idle footer, so no gate is on screen. Explicit list, extended by hand.
 LIMIT_REFUSAL = re.compile(
-    r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit", re.I)
+    r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit"
+    r"|(?:reached|used|exceeded) (?:all of )?your (?:session|usage|weekly) limit", re.I)
 REFUSAL = re.compile(
     LIMIT_REFUSAL.pattern
     # A bare "not logged in" is a refusal only as the CLI's own line-start `⎿` row.
@@ -142,7 +146,8 @@ def limit_standing(pane: Optional[str], runtime: Optional[str] = None, outrun: b
 _NUMBERED_ROW = re.compile(r"^\s*(?:❯\s*)?\d+\.\s")
 _CARET_ROW = re.compile(r"^\s*❯\s*\d+\.\s")
 # The limit menu's own choices: its title may be a "⎿" line, which the walk back skips as the turn.
-_LIMIT_MENU_ROW = re.compile(r"wait for (?:the )?limit to reset|usage credits|extra usage", re.I)
+_LIMIT_MENU_ROW = re.compile(r"wait for (?:the |your )?(?:session |usage |weekly )?limit to reset|usage credits"
+                             r"|extra usage", re.I)
 
 
 def _dialog_names_limit(text: str) -> bool:

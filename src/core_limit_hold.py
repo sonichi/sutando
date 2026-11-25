@@ -96,6 +96,10 @@ _CLI_LIMIT = tuple(rx for name, rx in cli_wedge.ABNORMAL_PATTERNS
 # limit."), and the API's own words for a refusal.
 _USAGE_EXTRA = re.compile(r"\b\d+-hour limit (?:reached|exceeded|hit)\b|\bquota\b.{0,20}\b(?:exceeded|exhausted)\b"
                           r"|\binsufficient_quota\b", re.I)
+# Claude Code's /rate-limit-options menu, which only a plan's usage limit opens; its command name alone
+# would read as a rate limit when the "You've hit your ... limit" line above has scrolled away.
+_LIMIT_MENU = re.compile(r"\bwait for (?:the |your )?(?:session |usage |weekly )?limit to reset\b"
+                         r"|\bswitch to usage credits\b", re.I)
 _NAMED_CAP = re.compile(r"\breached your ([A-Za-z][\w.-]{0,24}) limit\b", re.I)
 # The CLI's words for a 429 the account's quota did not cause: the server is throttling.
 _NOT_A_LIMIT = re.compile(r"\bnot your usage limit\b", re.I)
@@ -104,7 +108,8 @@ _RATE = re.compile(r"\brate_limit_error\b|\brate[ -]?limit(?:ed)?\b|\btoo many r
                    r"|\b(?:API ?Error|HTTP(?:/[\d.]+)?|status(?:_?code)?)\"?\s*[:=]?\s*429\b", re.I)
 
 _RESET_EPOCH = re.compile(r"\|(\d{10})\b")
-_RESET_CLOCK = re.compile(r"\bresets?\s+(?:at\s+|on\s+)?(?:([A-Z][a-z]{2})[a-z]*\.?\s+(\d{1,2}),?\s+(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b(?:\s*\(([A-Za-z_]+(?:/[A-Za-z0-9_+-]+)*)\))?", re.I)
+# "resets 3pm" / "resets Nov 28 at 1pm", and the limit menu's "continue automatically at Nov 28 at 1pm".
+_RESET_CLOCK = re.compile(r"\b(?:resets?|continue automatically)\s+(?:at\s+|on\s+)?(?:([A-Z][a-z]{2})[a-z]*\.?\s+(\d{1,2}),?\s+(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b(?:\s*\(([A-Za-z_]+(?:/[A-Za-z0-9_+-]+)*)\))?", re.I)
 _MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
 _RESET_IN = re.compile(r"\bresets?\s+in\s+(\d+)\s*(h|hours?|m|mins?|minutes?)\b", re.I)
 _RETRY_AFTER = re.compile(r"\bretry[- ]after\D{0,3}(\d+)\b", re.I)
@@ -172,7 +177,7 @@ def classify_text(text: str, at: float, model: Optional[str] = None,
     if named:
         # The banner names the capped model; an earlier turn may have run another one.
         model = qa._model_family(named.group(1).lower()) or model
-    if named or any(rx.search(text) for rx in _CLI_LIMIT) or _USAGE_EXTRA.search(text):
+    if named or any(rx.search(text) for rx in _CLI_LIMIT) or _USAGE_EXTRA.search(text) or _LIMIT_MENU.search(text):
         kind = "usage-limit"
     elif _RATE.search(text):
         kind = "rate-limit"
@@ -444,6 +449,35 @@ def launch_model(workspace: Path, config_dir: Optional[str]) -> Optional[str]:
     return qa.seat_model(qa.SeatEnv(True, None, config_dir), Path(workspace))
 
 
+# The account the running core was launched with, recorded when the gate lets it launch: a limit its
+# screen shows is that account's, even after the config names another one before a restart (VM
+# 2026-11-24: the desktop wrote account-b into .claude.json at 16:48, the still-running account-a core hit
+# its weekly limit at 16:51, the hold was recorded under account-b, and every launch on account-b was
+# refused).
+LAUNCH_ACCOUNT_FILE = "core-launch-account.json"
+
+
+def record_launch_account(workspace: Path, account: Optional[str], now: Optional[float] = None) -> None:
+    """Keep the account the core is being launched with; nothing when it cannot be read. Never raises."""
+    if not account:
+        return
+    try:
+        write_status(LAUNCH_ACCOUNT_FILE, {"account": account, "at": time.time() if now is None else now},
+                     workspace=Path(workspace))
+    except OSError:
+        pass
+
+
+def running_account(workspace: Path) -> Optional[str]:
+    """The account the running core was launched with (record_launch_account), else None."""
+    try:
+        data = json.loads(status_read_path(LAUNCH_ACCOUNT_FILE, Path(workspace)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    account = data.get("account") if isinstance(data, dict) else None
+    return account if isinstance(account, str) and account else None
+
+
 def binding_hold(workspace: Path, now: Optional[float] = None,
                  identity: Optional[tuple] = None) -> Optional[dict]:
     """The hold in force that would stop the next launch, else None. Read-only.
@@ -528,13 +562,17 @@ def _present_card(hold: dict, card_entry: str, now: float) -> bool:
 
 
 def _ensure_notice(workspace: Path, hold: dict, card_entry: Optional[str] = None,
-                   now: Optional[float] = None, card_surface: bool = False) -> bool:
+                   now: Optional[float] = None, card_surface: bool = False, account_card: bool = False) -> bool:
     """Queue the hold's owed DM under its stable name, once, and present the core-model card
     with it when the launcher provides one. True when it is queued.
     A retry rewrites the same name, so it cannot become a second message. With `card_surface`
-    the monitor's recovery card is this incident's one surface, so no text notice is sent."""
+    the monitor's recovery card is this incident's one surface, so no text notice is sent; with
+    `account_card` the core's quota card, already posted, is it (core_quota_notice)."""
     if hold.get("notice_queued"):
         return False
+    if account_card:
+        hold["notice_queued"], hold["notice_surface"] = True, "account-card"
+        return True
     if card_surface:
         hold["notice_queued"], hold["notice_surface"] = True, "card"
         return True
@@ -571,7 +609,7 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
            projects_dir: Optional[Path] = None, launch_model: Optional[str] = None,
            launch_account: Optional[str] = None, card_entry: Optional[str] = None,
            evidence: tuple = (), seat: Optional[str] = None, seat_label: Optional[str] = None,
-           card_surface: bool = False) -> Decision:
+           card_surface: bool = False, account_card: bool = False) -> Decision:
     """Launch, or hold and say why. The one writer of the hold record.
     `evidence` adds limits the caller observed itself, such as a live core's limit screen. A worker
     `seat` has its own record, and only that evidence: the provider record and status are the core's."""
@@ -584,7 +622,7 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
             hold = admitted
             _write_hold(workspace, hold, seat)
     if active_hold(workspace, now, seat) and _binds(hold, launch_model, launch_account):
-        if _ensure_notice(workspace, hold, card_entry, now, card_surface):
+        if _ensure_notice(workspace, hold, card_entry, now, card_surface, account_card):
             _write_hold(workspace, hold, seat)
         return Decision(False, hold, status_line(hold))
     # Who ran last: the record's account, else the launcher a released legacy hold remembered.
@@ -633,7 +671,7 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
             new["notice_queued"] = False
             new["held_tasks"] = carried
             new["present_at_hold"] = [t for t in live if t not in carried][-HELD_TASKS_MAX:]
-        _ensure_notice(workspace, new, card_entry, now, card_surface)
+        _ensure_notice(workspace, new, card_entry, now, card_surface, account_card)
         _write_hold(workspace, new, seat)
         if not seat:
             _mirror_core_status(workspace, "paused", new["reason"], now)
@@ -693,10 +731,11 @@ def reinstate(workspace: Path, now: Optional[float] = None, by: Optional[str] = 
 
 def hold_while_wedged(workspace: Path, text: Optional[str], now: Optional[float] = None,
                       seat: Optional[str] = None, seat_label: Optional[str] = None,
-                      card_surface: bool = False) -> Optional[dict]:
+                      card_surface: bool = False, account_card: bool = False) -> Optional[dict]:
     """The hold in force for a live core (or worker `seat`) stuck at a provider-limit screen,
     recorded from that screen's text when none is, so the owner gets the notice (or, with
-    `card_surface`, the monitor's card alone) and a bare reply counts. Else None."""
+    `card_surface`, the monitor's card alone; with `account_card`, the quota card already posted)
+    and a bare reply counts. Else None."""
     now = time.time() if now is None else now
     workspace = Path(workspace)
     hold = read_hold(workspace, seat) or {}
@@ -704,11 +743,30 @@ def hold_while_wedged(workspace: Path, text: Optional[str], now: Optional[float]
     if hold.get("status") != "held" and isinstance(released, (int, float)) and 0 <= now - released < REARM_GRACE_S:
         return None
     model, account = (None, None) if seat else launch_identity(workspace)
+    # The screen is the running core's: its limit is the account it was launched with, not the one the
+    # config may name since (a switch not yet restarted on). Unknown: the config's, as before.
+    account = (running_account(workspace) or account) if not seat else account
     # The caller has judged the screen a limit; text that names none is still this core's limit.
     limit = classify_text(text or "", now, model, PANE_SOURCE) or Limit("usage-limit", now, None, model, PANE_SOURCE)
     decide(workspace, now, evidence=(limit,), launch_model=limit.model or model, launch_account=account,
-           seat=seat, seat_label=seat_label, card_surface=card_surface)
+           seat=seat, seat_label=seat_label, card_surface=card_surface, account_card=account_card)
     return active_hold(workspace, now, seat)
+
+
+def release_on_account_change(workspace: Path, now: Optional[float] = None, account: Optional[str] = None,
+                              seat: Optional[str] = None) -> Optional[dict]:
+    """Lift a hold seen under one account once the core is signed in to another: a limit is the
+    account's, and the owner switched to go on (VM 2026-11-23: the core stayed paused after a switch to
+    an account with quota). `account` is the account now in use (default: the launch's). A hold that
+    recorded no account, or an account that cannot be read now, is left as it is."""
+    hold = read_hold(workspace, seat)
+    if not hold or hold.get("status") != "held":
+        return None
+    held = hold.get("account")
+    now_on = launch_identity(workspace)[1] if account is None else account
+    if not held or not now_on or held == now_on:
+        return None
+    return clear(workspace, now, by="account-change", seat=seat)
 
 
 def release_pane_hold(workspace: Path, now: Optional[float] = None,
@@ -1170,6 +1228,7 @@ def main(argv=None) -> int:
     decision = decide(workspace, projects_dir=_projects_dir(args.cwd), launch_model=model,
                       launch_account=account, card_entry=args.card_entry or None)
     if decision.launch:
+        record_launch_account(workspace, account)
         return 0
     print(decision.line)
     return HOLD_EXIT

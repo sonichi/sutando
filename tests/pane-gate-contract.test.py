@@ -1786,5 +1786,35 @@ class LimitHolds(unittest.TestCase):
                 self.assertEqual(pg.main(["limit-holds", "--runtime", "claude"]), code)
 
 
+class WeeklyLimit(unittest.TestCase):
+    """VM 2026-11-23: the weekly limit's screen and its /rate-limit-options menu read as a plain
+    selection, so the core's quota card was never posted for it."""
+
+    MENU = ("  ⎿  You've used your weekly limit · resets Nov 28 at 1pm (UTC)\n"
+            "❯ /rate-limit-options\n"
+            "What do you want to do?\n"
+            "❯ 1. Stop and wait for the weekly limit to reset\n"
+            "  2. Add funds to continue with usage credits\n"
+            "Enter to confirm · Esc to cancel\n")
+
+    def test_the_weekly_menu_and_its_title_are_a_usage_limit(self):
+        self.assertTrue(pg.is_usage_limit("selection", self.MENU))
+        self.assertTrue(pg.limit_line("Weekly limit · resets Nov 28 at 1pm"))
+        self.assertTrue(pg.limit_line("You've reached your weekly limit."))
+        self.assertTrue(pg.is_usage_limit("turn-rejected", "⎿  You've used your weekly limit · resets Nov 28"))
+
+    def test_the_vms_own_weekly_screen_is_a_usage_limit(self):
+        vm = ("  ⎿  You've hit your weekly limit · resets Nov 28 at 1pm (UTC)\n❯ /rate-limit-options\n"
+              "What do you want to do?\n❯ 1. Stop and wait for limit to reset\n"
+              "  2. Wait here, then continue automatically at Nov 28 at 1pm\n  3. Switch to usage credits\n"
+              "Enter to confirm · Esc to cancel\n")
+        self.assertTrue(pg.is_usage_limit("selection", vm))
+
+    def test_an_ordinary_menu_or_reply_is_not(self):
+        menu = "Pick one\n❯ 1. Keep the weekly report\n  2. Drop it\nEnter to confirm · Esc to cancel\n"
+        self.assertFalse(pg.is_usage_limit("selection", menu))
+        self.assertFalse(pg.limit_line("The weekly report resets the counters."))
+
+
 if __name__ == "__main__":
     unittest.main()
