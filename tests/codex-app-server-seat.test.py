@@ -123,6 +123,13 @@ for line in sys.stdin:
         else:
             out({"id": rid, "error": {"code": -32600, "message": "no rollout found"}})
     elif method == "turn/start":
+        try:
+            refused = open(os.path.join(D, "refuse-model")).read().strip()
+        except OSError:
+            refused = ""
+        if refused and p.get("model") == refused:
+            out({"id": rid, "error": {"code": -32602, "message": "model %s is not supported" % refused}})
+            continue
         step = plan()
         if step == "refuse":
             out({"id": rid, "error": {"code": -32000, "message": "thread is busy"}})
@@ -160,6 +167,16 @@ for line in sys.stdin:
             state["after"] = lambda prompt=prompt: (write_result(prompt), finish())
             for i, name in enumerate(SERVER_REQUESTS):
                 out({"id": "srv-%d" % i, "method": name, "params": {"threadId": thread}})
+    elif method == "model/list":
+        try:
+            models = json.load(open(os.path.join(D, "models.json")))
+        except (OSError, ValueError):
+            out({"id": rid, "error": {"code": -32601, "message": "method not found"}})
+            continue
+        if isinstance(models, dict):
+            out({"id": rid, "result": models})
+        else:
+            out({"id": rid, "result": {"data": models, "nextCursor": None}})
     elif method == "turn/interrupt":
         if os.path.exists(os.path.join(D, "die-on-interrupt")):
             os._exit(8)
@@ -871,6 +888,207 @@ class Crash(SeatCase):
         self.assertEqual(len(self.sent("thread/resume")), 1)
 
 
+class CoreModelSwitch(SeatCase):
+    """The Codex core's switch (switch-model.sh, src/codex_core_model.py) reaches the core seat's next
+    turn; it is core-only, so a worker's seat never reads it (TestWorker below)."""
+
+    def switch(self, model, accepted=False):
+        return seat_mod.codex_core_model.save(self.ws / "state", model, applied="next-turn", accepted=accepted)
+
+    def record(self):
+        return json.loads((self.ws / "state" / "model-switch.json").read_text())
+
+    def launched(self, rev, **kw):
+        """A seat whose launcher read the record at revision `rev` (SUTANDO_CORE_MODEL_REV)."""
+        with mock.patch.dict(os.environ, {"SUTANDO_CORE_MODEL_REV": str(rev)}):
+            return self.make(**kw)
+
+    def test_a_pick_after_the_launch_is_the_next_turns_model_and_codex_taking_it_settles_it(self):
+        self.switch("gpt-old", accepted=True)
+        s = self.launched(1, model="gpt-old")
+        self.switch("gpt-new")
+        self.task("task-1.txt")
+        self.assertEqual(s.serve(once=True), 0)
+        self.assertEqual([r["params"].get("model") for r in self.sent("turn/start")], ["gpt-new"])
+        self.assertEqual(s.model, "gpt-new", "a restarted child resumes the thread on it too")
+        self.assertEqual(s.thread_params()["model"], "gpt-new")
+        self.assertEqual((self.record()["status"], self.record()["working"]), ("accepted", "gpt-new"))
+
+    def test_a_pick_saved_between_the_launchers_read_and_the_seats_start_is_not_dropped(self):
+        self.switch("gpt-launched", accepted=True)  # rev 1: what the launcher read and passed as --model
+        self.switch("gpt-during-startup")           # rev 2: saved before the seat came up
+        s = self.launched(1, model="gpt-launched")
+        self.task("task-1.txt")
+        self.assertEqual(s.serve(once=True), 0)
+        self.assertEqual([r["params"].get("model") for r in self.sent("turn/start")], ["gpt-during-startup"])
+
+    def test_a_pick_pending_at_launch_starts_on_the_working_model_and_is_tried_on_the_first_turn(self):
+        self.switch("gpt-old", accepted=True)
+        self.switch("gpt-new")
+        s = self.launched(0, model="gpt-old")  # the launcher passes the working model, never the pick
+        self.assertEqual(s.thread_params()["model"], "gpt-old")
+        self.task("task-1.txt")
+        self.assertEqual(s.serve(once=True), 0)
+        self.assertEqual([r["params"].get("model") for r in self.sent("thread/start")], ["gpt-old"])
+        self.assertEqual([r["params"].get("model") for r in self.sent("turn/start")], ["gpt-new"])
+        self.assertEqual((self.record()["status"], s.model), ("accepted", "gpt-new"))
+
+    def test_an_explicit_launch_model_outranks_a_pick_saved_before_it(self):
+        self.switch("gpt-new")
+        s = self.launched(1, model="gpt-explicit")
+        self.task("task-1.txt")
+        self.assertEqual(s.serve(once=True), 0)
+        self.assertEqual([("model" in r["params"]) for r in self.sent("turn/start")], [False])
+        self.assertEqual(self.record()["status"], "pending")
+
+    def test_a_refusal_that_is_not_about_the_model_leaves_the_pick_pending_and_the_seat_on_its_model(self):
+        self.switch("gpt-old", accepted=True)
+        self.switch("gpt-new")
+        s = self.launched(0, model="gpt-old")
+        s.ensure_server()
+        (self.fake_dir / "plan.json").write_text(json.dumps(["refuse", "none"]))  # "thread is busy"
+        status, detail = s.run_turn("task-1.txt", "hello")
+        self.assertEqual(status, "completed", "the turn reran without the pick")
+        self.assertEqual([r["params"].get("model") for r in self.sent("turn/start")], ["gpt-new", "gpt-old"])
+        self.assertEqual(self.record()["status"], "pending", "a busy thread is no verdict on the model")
+        self.assertEqual((s.model, s.thread_params()["model"], s.trial), ("gpt-old", "gpt-old", None),
+                         "a restarted child resumes on the working model, not the untried pick")
+        self.assertEqual(s.turn_model(), "gpt-new", "the next turn tries it again")
+        self.assertEqual(list(self.results.glob("proactive-model-*.txt")), [])
+
+    def catalog(self, *models, default=None):
+        rows = [{"id": m, "model": m, "isDefault": m == default} for m in models]
+        (self.fake_dir / "models.json").write_text(json.dumps(rows))
+
+    def test_a_pick_not_in_codexs_model_list_is_refused_without_sending_it_and_the_owner_told(self):
+        self.catalog("gpt-old", "gpt-new")
+        self.switch("gpt-old", accepted=True)
+        s = self.launched(1, model="gpt-old")
+        self.switch("gpt-bad")
+        self.task("task-1.txt")
+        self.assertEqual(s.serve(once=True), 0)
+        self.assertEqual([("model" in r["params"]) for r in self.sent("turn/start")], [False],
+                         "the refused pick is never sent; the task runs on the working model")
+        self.assertTrue((self.results / "task-1.txt").exists())
+        rec = self.record()
+        self.assertEqual((rec["status"], rec["working"]), ("rejected", "gpt-old"))
+        self.assertIn("not in the model list", rec["rejected_reason"])
+        self.assertEqual(seat_mod.codex_core_model.current(self.ws / "state"), "gpt-old")
+        notice, = self.results.glob("proactive-model-refused-*.txt")
+        self.assertIn("stays on gpt-old", notice.read_text())
+
+    def test_an_error_answer_to_the_pick_is_no_verdict_the_task_runs_on_the_model_before_it(self):
+        # No structured code says "unknown model", so an error answer to turn/start never rejects.
+        self.catalog("gpt-old", "gpt-new")
+        self.switch("gpt-old", accepted=True)
+        s = self.launched(1, model="gpt-old")
+        self.switch("gpt-new")
+        (self.fake_dir / "refuse-model").write_text("gpt-new")
+        self.task("task-1.txt")
+        self.assertEqual(s.serve(once=True), 0)
+        self.assertEqual([r["params"].get("model") for r in self.sent("turn/start")], ["gpt-new", "gpt-old"])
+        self.assertTrue((self.results / "task-1.txt").exists())
+        self.assertEqual(self.record()["status"], "pending")
+        self.assertEqual(list(self.results.glob("proactive-model-*.txt")), [])
+
+    def test_an_implicit_default_is_named_from_codexs_list_and_restored_explicitly(self):
+        self.catalog("gpt-default", "gpt-new", default="gpt-default")
+        s = self.launched(0)  # no launch model: Codex's default
+        self.switch("gpt-new")
+        (self.fake_dir / "refuse-model").write_text("gpt-new")
+        self.task("task-1.txt")
+        self.assertEqual(s.serve(once=True), 0)
+        self.assertEqual([r["params"].get("model") for r in self.sent("turn/start")], ["gpt-new", "gpt-default"])
+
+    def test_a_pick_without_a_verdict_is_tried_at_most_twice_by_one_seat(self):
+        self.catalog("gpt-old", "gpt-new")
+        s = self.launched(0, model="gpt-old")
+        s.ensure_server()
+        self.switch("gpt-new")
+        for _ in range(seat_mod.TRIAL_ATTEMPTS):
+            self.assertEqual(s.turn_model(), "gpt-new")
+            s.abandon_trial()
+            self.assertEqual(s.turn_model(), "gpt-old", "the thread is moved back off the untried pick")
+            s.restore = None  # a turn completed on it
+        self.assertEqual(s.turn_model(), "")
+        self.assertEqual(self.record()["status"], "pending")
+
+    def test_the_restore_holds_until_codex_completes_a_turn_on_it(self):
+        self.catalog("gpt-old", "gpt-new")
+        s = self.launched(0, model="gpt-old")
+        s.ensure_server()
+        self.switch("gpt-new")
+        self.assertEqual(s.turn_model(), "gpt-new")
+        s.abandon_trial()  # no verdict: the thread may be on gpt-new, so it must go back
+        (self.fake_dir / "plan.json").write_text(json.dumps(["fail", "none"]))
+        self.assertEqual(s.run_turn("task-1.txt", "hello")[0], "failed")
+        self.assertEqual(s.restore, "gpt-old", "a failed turn on the restore keeps the intent")
+        self.assertEqual(s.run_turn("task-2.txt", "hello")[0], "completed")
+        self.assertIsNone(s.restore)
+        self.assertEqual([r["params"].get("model") for r in self.sent("turn/start")], ["gpt-old", "gpt-old"])
+
+    def test_a_pick_codex_ran_while_a_newer_one_was_saved_is_still_the_confirmed_model(self):
+        self.catalog("gpt-old", "gpt-new", "gpt-bad-later")
+        self.switch("gpt-old", accepted=True)
+        s = self.launched(1, model="gpt-old")
+        self.switch("gpt-new")                      # rev 2: tried on the next turn
+        s.ensure_server()
+        self.assertEqual(s.turn_model(), "gpt-new")
+        self.switch("gpt-bad-later")                # rev 3 saved while that turn runs
+        s.settle_model(True)                         # Codex completed the turn on gpt-new
+        rec = self.record()
+        self.assertEqual((rec["status"], rec["rev"], rec["confirmed"], rec["confirmed_rev"]),
+                         ("pending", 3, "gpt-new", 2), "rev 3 is not settled by rev 2's turn")
+        seat_mod.codex_core_model.resolve(self.ws / "state", 3, False, "refused")
+        self.assertEqual(seat_mod.codex_core_model.launch(self.ws / "state")[2], "gpt-new",
+                         "a restart after the newer pick fails starts on what Codex last ran")
+
+    def test_codex_taking_the_pick_tells_the_owner(self):
+        self.catalog("gpt-old", "gpt-new")
+        self.switch("gpt-old", accepted=True)
+        s = self.launched(1, model="gpt-old")
+        self.switch("gpt-new")
+        self.task("task-1.txt")
+        self.assertEqual(s.serve(once=True), 0)
+        notice, = self.results.glob("proactive-model-switched-*.txt")
+        self.assertIn("gpt-new", notice.read_text())
+
+    def test_an_incomplete_or_malformed_model_list_is_no_verdict(self):
+        for listing in ({"data": [{"id": "gpt-old", "model": "gpt-old"}], "nextCursor": "more"},
+                        [{"id": "gpt-old", "model": "gpt-old"}, {"id": "gpt-x"}],
+                        [{"id": "gpt-old", "model": "gpt-old"}, "not a row"]):
+            with self.subTest(listing=listing):
+                (self.fake_dir / "models.json").write_text(json.dumps(listing))
+                s = self.launched(0, model="gpt-old")
+                s.ensure_server()
+                self.switch("gpt-new")
+                self.assertEqual(s.turn_model(), "gpt-new", "tried, never refused, on a partial list")
+                self.assertEqual(self.record()["status"], "pending")
+                s.close_server()
+
+    def test_no_trial_until_the_model_to_go_back_to_is_known(self):
+        self.catalog("gpt-new", "gpt-other")  # complete, but names no default
+        s = self.launched(0)                 # and the seat has no launch model
+        s.ensure_server()
+        self.switch("gpt-new")
+        self.assertEqual(s.turn_model(), "")
+        self.assertIsNone(s.trial)
+        self.assertEqual(self.record()["status"], "pending")
+        self.assertIn("the model to go back to is unknown", self.out.getvalue())
+
+    def test_an_unreadable_model_list_is_no_verdict(self):
+        self.switch("gpt-new")  # no models.json: model/list errors
+        s = self.launched(0, model="gpt-old")
+        s.ensure_server()
+        self.assertEqual(s.turn_model(), "gpt-new")
+        self.assertEqual(self.record()["status"], "pending")
+
+    def test_a_claude_cores_record_is_never_a_codex_model(self):
+        (self.ws / "state" / "model-switch.json").write_text(json.dumps({"model": "opus", "accepted": True}))
+        s = self.launched(0)
+        self.assertEqual(s.turn_model(), "")
+
+
 class CoreQueue(SeatCase):
     def test_the_core_leaves_worker_held_and_claimed_tasks_alone(self):
         self.task("task-mine.txt")
@@ -911,6 +1129,20 @@ class Worker(SeatCase):
     def worker_seat(self, stage=None, **kw):
         decl = self.declaration(inbox=self.inbox, payloads=self.tasks, stage=stage or self.pool_stage())
         return self.make(decl, **kw)
+
+    def test_a_core_model_switch_leaves_a_workers_model_alone(self):
+        # Core and worker models are separate: the core's switch record is never a worker's model.
+        self.deliver("task-1")
+        s = self.worker_seat(stage=[sys.executable, str(self.hook)], model="gpt-worker")
+        seat_mod.codex_core_model.save(self.ws / "state", "gpt-core", applied="next-turn", accepted=False)
+        s.ensure_server()
+        self.assertEqual(s.step(), "done")
+        self.assertEqual([("model" in r["params"]) for r in self.sent("turn/start")], [False])
+        self.assertEqual(s.model, "gpt-worker")
+        self.assertEqual([r["params"].get("model") for r in self.sent("thread/start")], ["gpt-worker"])
+        launcher = (POOL / "launch-codex-worker-session.sh").read_text(encoding="utf-8")
+        for core_only in ("codex_core_model", "model-switch.json", "SUTANDO_CORE_MODEL"):
+            self.assertNotIn(core_only, launcher, "a worker launch never reads the core's model")
 
     def test_a_delivery_is_staged_pending_before_its_turn_and_done_only_after_the_result(self):
         self.deliver("task-1")

@@ -37,6 +37,7 @@ for _p in (str(REPO / "src"), str(Path(__file__).resolve().parent)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import codex_core_model  # noqa: E402
 import supervised_host  # noqa: E402
 from codex_rpc import Rpc  # noqa: E402,F401
 from delivery.task_dispatch import (has_ready_result, owned_task_ids,  # noqa: E402
@@ -212,6 +213,10 @@ class Watcher:
             self.p.kill()
 
 
+# A pending pick is tried at most this many times by one seat without a verdict, then left pending.
+TRIAL_ATTEMPTS = 2
+
+
 class Seat:
     def __init__(self, host, workspace, seat: str, worker: str = "", codex: str = "codex",
                  config: Optional[List[str]] = None, model: str = "", sandbox: str = SANDBOX,
@@ -228,6 +233,12 @@ class Seat:
         self.poll_s, self.retry_s, self.hold_s, self.max_attempts = poll_s, retry_s, hold_s, max_attempts
         self.backoff_s, self.turn_timeout, self.interrupt_grace = backoff_s, turn_timeout, interrupt_grace
         self.context, self.clock = context, clock
+        # The switch revision this seat's launch model came from; a later one is the next turn's.
+        self.model_rev = self.launch_rev()
+        # (model, rev, the model to restore, sent on turn/start) until Codex settles it
+        self.trial: Optional[tuple] = None
+        self.restore: Optional[str] = None  # passed explicitly on every turn until one completes on it
+        self.attempts: dict = {}
         self.cwd = host.cwd or str(self.workspace)
         self.rpc: Optional[Rpc] = None
         self.thread_id: Optional[str] = None
@@ -543,13 +554,157 @@ class Seat:
         elif method == "thread/status/changed" and (params.get("status") or {}).get("type") == "systemError":
             log("  thread status: systemError")
 
+    def launch_rev(self) -> int:
+        """Pending picks at or below this revision are not tried: SUTANDO_CORE_MODEL_REV, which the
+        launcher sets only when this launch named its model explicitly. 0 otherwise."""
+        if self.worker:
+            return 0
+        value = os.environ.get("SUTANDO_CORE_MODEL_REV", "")
+        return int(value) if value.isdigit() else 0
+
+    def catalog(self) -> Optional[Tuple[set, str]]:
+        """(model ids, Codex's default) from the app-server's own `model/list`, hidden ones included;
+        None unless the whole list was read and every row is well formed. Only a complete list is
+        evidence that a pick is refused (it is not in it)."""
+        ids, default, cursor = set(), "", None
+        try:
+            for _ in range(20):
+                params: dict = {"includeHidden": True}
+                if cursor:
+                    params["cursor"] = cursor
+                res = self.rpc.request("model/list", params, timeout=30)
+                rows = res.get("data") if isinstance(res, dict) else None
+                if not isinstance(rows, list):
+                    raise TypeError("model/list answered without a data list")
+                for m in rows:
+                    names = [m.get(k) for k in ("model", "id")] if isinstance(m, dict) else []
+                    if not names or not all(isinstance(n, str) and n for n in names):
+                        raise TypeError(f"a malformed model/list row: {one_line(m, 80)}")
+                    ids.update(names)
+                    if m.get("isDefault") is True and not default:
+                        default = names[0]
+                cursor = res.get("nextCursor")
+                if not cursor:
+                    break
+            else:
+                raise TypeError("model/list has more pages than this seat reads")
+        except (RuntimeError, AttributeError, TypeError) as e:
+            log(f"model: Codex's model list is not complete ({one_line(e, 120)}); no verdict from it")
+            return None
+        return (ids, default) if ids else None
+
+    def turn_model(self) -> str:
+        """The core's model for the next turn, '' to leave the thread's as it is. Only the core seat
+        reads the core's switch record (src/codex_core_model.py). The seat starts on the verified
+        working model; a pending pick is checked against Codex's model list, tried on a turn, and
+        becomes the seat's model only once Codex runs that turn. A worker's seat never reads it."""
+        if self.worker:
+            return ""
+        if self.restore is not None:
+            return self.restore  # kept until Codex completes a turn on it (_run_turn)
+        picked, rev = codex_core_model.pending(self.workspace / "state")
+        if not picked or rev <= self.model_rev or self.attempts.get(rev, 0) >= TRIAL_ATTEMPTS:
+            return ""
+        cat = self.catalog()
+        before = self.model or (cat[1] if cat else "")  # an implicit default, named so it can be restored
+        if not before:
+            log(f"model: {picked} stays pending: the model to go back to is unknown (no launch model, "
+                "and Codex names no default)")
+            return ""
+        if cat is not None and picked not in cat[0]:
+            self.trial = (picked, rev, before, False)
+            self.settle_model(False, f"{picked} is not in the model list Codex gives this account")
+            return ""
+        self.attempts[rev] = self.attempts.get(rev, 0) + 1
+        if picked == self.model:
+            self.trial = (picked, rev, before, False)
+            return ""
+        self.trial = (picked, rev, before, True)
+        log(f"model: trying {picked} from the core's switch (on {before or 'the default'} until Codex takes it)")
+        return picked
+
+    def abandon_trial(self) -> None:
+        """A turn that ended with no verdict on the pick (an error, a timeout, an exit): it stays
+        pending. The thread goes back to the model before it, and a later turn tries it again, at
+        most TRIAL_ATTEMPTS times in this seat."""
+        if self.trial is None:
+            return
+        picked, rev, before, sent = self.trial
+        self.trial = None
+        if sent and before:
+            self.restore = before
+        left = TRIAL_ATTEMPTS - self.attempts.get(rev, 0)
+        log(f"model: no verdict on {picked} this turn; it stays pending"
+            + (f" ({left} more try)" if left > 0 else "; this seat does not try it again"))
+
+    def notify(self, kind: str, text: str) -> None:
+        try:
+            out = Path(self.host.results) / f"proactive-model-{kind}-{int(time.time() * 1000)}.txt"
+            tmp = out.with_name("." + out.name + ".tmp")
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, out)
+        except OSError as e:
+            log(f"model: the {kind} notice could not be written ({one_line(e, 120)})")
+
+    def settle_model(self, accepted: bool, reason: str = "") -> None:
+        """Record whether Codex took the pick under trial, and tell the owner either way; a refused
+        one leaves the seat on the model before it."""
+        if self.trial is None:
+            return
+        picked, rev, before, sent = self.trial
+        self.trial = None
+        try:
+            if accepted:  # recorded even when a newer pick is pending: a restart then starts on it
+                codex_core_model.confirm(self.workspace / "state", picked, rev)
+            settled = codex_core_model.resolve(self.workspace / "state", rev, accepted, reason)
+        except OSError as e:
+            settled = None
+            log(f"model: the switch record could not be settled ({one_line(e, 120)})")
+        if accepted:
+            self.model = picked  # a restarted child's thread/resume keeps it too
+            log(f"model: {picked} taken by Codex; it holds from now on")
+            if settled is not None:
+                self.notify("switched", f"Switched: Codex ran my last task on {picked}, and the core uses it from now on.\n")
+            return
+        if sent and before:
+            self.restore = before
+        log(f"model: Codex refused {picked} ({one_line(reason, 160)}); staying on {before or 'the default'}")
+        if settled is not None:
+            self.notify("refused", f"I could not switch the core to {picked}: {one_line(reason, 160)}. "
+                                   f"The core stays on {before or 'its default model'}.\n")
+
     def run_turn(self, filename: str, prompt: str) -> Tuple[str, str]:
         """(status, detail) once the turn is over: completed | failed | interrupted | stopped |
         timeout | server-exited | seat-stopping."""
         try:
-            res = self.rpc.request("turn/start", {"threadId": self.thread_id, "cwd": self.cwd,
-                                                  "input": [{"type": "text", "text": prompt}]})
+            return self._run_turn(filename, prompt)
+        finally:
+            if self.trial is not None:
+                self.abandon_trial()
+
+    def _run_turn(self, filename: str, prompt: str) -> Tuple[str, str]:
+        params = {"threadId": self.thread_id, "cwd": self.cwd, "input": [{"type": "text", "text": prompt}]}
+        model = self.turn_model()
+        if model:
+            # turn/start's model holds for this turn and the thread's later ones.
+            params["model"] = model
+        try:
+            try:
+                res = self.rpc.request("turn/start", params)
+            except RuntimeError as e:
+                # Codex answered the turn with the pick: no verdict on the model (nothing structured
+                # says why), so the task runs on the model before it and the pick stays pending.
+                if not (model and self.trial and self.trial[3] and str(e).startswith("turn/start: {")
+                        and self.rpc.alive()):
+                    raise
+                before = self.trial[2]
+                self.abandon_trial()
+                params.pop("model")
+                if before:
+                    params["model"] = before
+                res = self.rpc.request("turn/start", params)
             turn_id = res["turn"]["id"]
+            sent_model = params.get("model")
         except (RuntimeError, KeyError, TypeError) as e:
             return ("server-exited" if not self.rpc.alive() else "failed"), one_line(e, 240)
         log(f"task {filename}: turn started ({turn_id})")
@@ -573,6 +728,10 @@ class Seat:
                     if method == "turn/completed" and turn.get("id") == turn_id:
                         status = turn.get("status") or "failed"
                         error = (turn.get("error") or {}).get("message") or ""
+                        if status == "completed":
+                            self.settle_model(True)
+                            if self.restore is not None and sent_model == self.restore:
+                                self.restore = None
                         if interrupted and status == "interrupted":
                             return interrupted, error
                         return status, error

@@ -26,6 +26,17 @@ seat_translate_args() {
   [ "${SUTANDO_SEAT_WATCHER:-1}" = 0 ] || SEAT_ARGS+=(--watcher)
 }
 
+# seat_set_model <model or empty>: SEAT_ARGS with its --model replaced (or dropped when empty).
+seat_set_model() {
+  local out=() i=0
+  while [ "$i" -lt "${#SEAT_ARGS[@]}" ]; do
+    if [ "${SEAT_ARGS[$i]}" = --model ]; then i=$(( i + 2 )); continue; fi
+    out+=("${SEAT_ARGS[$i]}"); i=$(( i + 1 ))
+  done
+  [ -n "$1" ] && out+=(--model "$1")
+  SEAT_ARGS=("${out[@]}")
+}
+
 # The path of a seat's host declaration: <workspace>/state/codex-seat/<tmux session>/host.json.
 seat_state_dir() { printf '%s/state/codex-seat/%s' "$1" "$2"; }
 
@@ -46,6 +57,13 @@ seat_core_prepare() {
   "$py" "$SEAT_PY" declare --out "$state/host.json" --inbox "$tasks" --results "$results" \
     --state "$state" --cwd "$WORKING_DIR" || return 1
   seat_translate_args "${CODEX_ARGS[@]}"
+  # A pick not yet verified is never the seat's launch model: it starts on the working one and
+  # tries the pick on a turn (seat.py turn_model).
+  local core_model="${SUTANDO_CORE_MODEL:-}"
+  if [ -n "${CODEX_CORE_MODEL_WORKING+x}" ]; then
+    core_model="$CODEX_CORE_MODEL_WORKING"
+    seat_set_model "$core_model"
+  fi
   SEAT_ARGS=(--host "$state/host.json" --workspace "$ws" --seat "$SESSION" --codex "$codex_bin"
              --log "$ws/logs/codex-seat.log" "${SEAT_ARGS[@]}")
   # The seat's standby watcher reads what the notifier session's watcher reads today.
@@ -53,10 +71,13 @@ seat_core_prepare() {
                  -e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION"
                  -e SUTANDO_STANDBY_MODE=type -e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}")
   local forwarded
-  for forwarded in SUTANDO_TASK_EVENT_HANDLER SUTANDO_ISOLATED_WORKING_DIR SUTANDO_CORE_MODEL \
+  for forwarded in SUTANDO_TASK_EVENT_HANDLER SUTANDO_ISOLATED_WORKING_DIR SUTANDO_CORE_MODEL_REV \
                    SUTANDO_TASKS_DIR SUTANDO_RESULTS_DIR; do
     [ -n "${!forwarded:-}" ] && SEAT_ENV_ARGS+=(-e "$forwarded=${!forwarded}")
   done
+  # Only an explicit launch model is pinned in the session; one read from the record is not, so a
+  # restart from inside the core reads the record again.
+  [ -z "${CODEX_CORE_MODEL_WORKING+x}" ] && [ -n "$core_model" ] && SEAT_ENV_ARGS+=(-e "SUTANDO_CORE_MODEL=$core_model")
   return 0
 }
 

@@ -282,6 +282,29 @@ CODEX_ARGS=(
   # The checkout's AGENTS.md is larger than Codex's 32 KiB default, which drops its tail.
   -c project_doc_max_bytes=131072
 )
+# The Codex core's own pick (skills/model-switch, src/codex_core_model.py) when this launch sets no
+# SUTANDO_CORE_MODEL: core-only, so the pool's Codex workers, which share CODEX_HOME, keep theirs.
+# CODEX_CORE_MODEL_WORKING is the last model Codex took, which an app-server launch starts on.
+unset SUTANDO_CORE_MODEL_REV CODEX_CORE_MODEL_WORKING
+if [ -n "$(heartbeat_python)" ]; then
+  _model_ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
+  _model_line=""
+  if [ -n "$_model_ws" ]; then
+    _model_line="$("$(heartbeat_python)" "$REPO/src/codex_core_model.py" launch --state-dir "$_model_ws/state" 2>/dev/null || true)"
+  fi
+  if [[ "$_model_line" =~ ^([0-9]+)\ ([^ ]+)\ ([^ ]+)$ ]]; then
+    if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
+      SUTANDO_CORE_MODEL_REV="${BASH_REMATCH[1]}"  # an explicit model outranks a pick saved before it
+    else
+      [ "${BASH_REMATCH[3]}" = "-" ] && CODEX_CORE_MODEL_WORKING="" || CODEX_CORE_MODEL_WORKING="${BASH_REMATCH[3]}"
+      if [ "${BASH_REMATCH[2]}" != "-" ]; then
+        SUTANDO_CORE_MODEL="${BASH_REMATCH[2]}"
+        echo "  ✓ Codex core model: $SUTANDO_CORE_MODEL (the core's last switch, $_model_ws/state/model-switch.json)"
+      fi
+    fi
+  fi
+  unset _model_ws _model_line
+fi
 if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   CODEX_ARGS+=(-m "$SUTANDO_CORE_MODEL")
 fi

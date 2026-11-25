@@ -416,9 +416,13 @@ place to point an owner who wants to switch by hand.
 Types `/model <name>` into the live `sutando-core` pane through the shared sender, waits for the CLI
 to accept it, and only then records `<workspace>/state/model-switch.json` (with the previous model).
 A warm core asks to confirm first; `--confirm` (on an owner instruction) answers it, otherwise the
-dialog is cancelled. Refuses when the input box carries text or on a Codex runtime. It never writes
-`settings.json`: Claude Code's `/model` persists the choice itself. Exit 2 = name refused; 3 = no live
-pane; 4 = Codex runtime; 5 = input box busy; 6 = confirm dialog not confirmed; 8 = no acceptance seen.
+dialog is cancelled. Refuses when the input box carries text. It never writes
+`settings.json`: Claude Code's `/model` persists the choice itself. On a Codex core the pick is
+recorded core-only (`runtime: codex` in the same record, never the shared Codex home's `config.toml`,
+so pool workers keep their own model): an app-server seat uses it from its next task, a Codex TUI from
+its next start (exit 11). Exit 2 = name refused (a Claude name on a Codex core too); 3 = no live
+pane; 4 = runtime unresolved; 5 = input box busy; 6 = confirm dialog not confirmed; 8 = no acceptance
+seen; 11 = Codex TUI, saved for its next start.
 The capability lives in `skills/model-switch/`.
 
 ## Which account the core is on

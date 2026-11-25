@@ -576,8 +576,12 @@ Not supported under the flag yet:
 - Typing into the panel, and Codex slash commands. The panel is read-only.
 - Status and cards read from the pane: the runtime observation record, the core monitor's
   prompt classification, limit and sign-in cards, pool wedge detection.
-- Switching the model without a restart.
 - Delivering a task into a running turn (`turn/steer`). Tasks wait for the turn to end.
+
+Switching the core's model from the conversation (`skills/model-switch`) reaches the core seat
+without a restart: the seat passes the recorded model on its next `turn/start`. The pick is core-only
+(`<workspace>/state/model-switch.json`, `runtime: codex`), so pool workers keep their own model; a
+Codex TUI core takes it at its next start, when the launcher passes it as `-m`.
 
 The launch settings are carried over: `danger-full-access`, approvals `never`, the model, the
 working directory, and every `-c` override of the TUI launch, the worker's s-space MCP entry

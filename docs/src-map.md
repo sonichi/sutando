@@ -67,6 +67,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`client-frame-hub.ts`** — Client-frame hub: optional voice plugins register handlers; the host offers them every client JSON frame it does not own.
 - **`cloud_auth.py`** — Sutando Cloud session: find the owner's sutk_ bearer and call the cloud API.
 - **`codex_account.py`** — Which account a Codex home is signed in to: the email and plan, never a token.
+- **`codex_core_model.py`** — The Codex core's own model choice: core-only, never the shared Codex home's.
 - **`codex_home.py`** — Resolve, check and create the Codex core's home once, for every launcher that uses it.
 - **`codex_host_instructions.py`** — Give a Codex core the instructions its desktop host ships beside the checkout.
 - **`codex_project_trust.py`** — Record the Codex core's own checkout as a trusted project before launch.
