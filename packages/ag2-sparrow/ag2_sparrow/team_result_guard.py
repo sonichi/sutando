@@ -373,7 +373,7 @@ def _bounded_context(context) -> dict:
         return {}
     keys = (
         "source", "channel_id", "room_name", "reply_to_event",
-        "source_message_id", "user_id",
+        "source_message_id", "thread_root", "user_id",
     )
     return {key: str(context.get(key) or "")[:512] for key in keys}
 

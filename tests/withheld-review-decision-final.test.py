@@ -2915,6 +2915,36 @@ check(len(edits) == bridge._RECONCILE_GIVE_UP_AFTER and len(gave_up) == 1,
       f"a failing reconcile is bounded: {len(edits)} card edits, {len(gave_up)} give-up line")
 bridge._STATE = root / "state"
 
+
+
+def released_post(label, context):
+    """Release a review raised under `context` and return its one shared-room post."""
+    task_id = f"task-{label}"
+    guard.materialize_withheld_verdict(
+        leak, f"BODY-{label}", bridge._STATE, task_id,
+        {"source": "ag2space", "channel_id": SHARED, "user_id": "@team:example", **context},
+        "@agent:example", now=1000)
+    path = guard.withheld_review_path(bridge._STATE, task_id)
+    bridge._route_withheld_review(path)
+    rid = json.loads(path.read_text())["review_id"]
+    before = len(shared_posts())
+    bridge._handle_review_decision(decision("No", rid, f"{label}-no"))
+    posts = shared_posts()[before:]
+    check(len(posts) == 1, f"{label}: the release posts once ({len(posts)})")
+    return posts[0] if posts else {}
+
+
+# A released result replies to the ask it answers, in the ask's thread when there is one.
+post = released_post("release-replies", {"source_message_id": "$ask", "thread_root": "$root"})
+check(post.get("reply_to") == "$ask" and post.get("thread_root") == "$root",
+      f"a release replies to its ask in its thread: {post}")
+post = released_post("release-replies-top", {"source_message_id": "$ask-top"})
+check(post.get("reply_to") == "$ask-top" and "thread_root" not in post,
+      f"a top-level ask gets a top-level reply: {post}")
+post = released_post("release-no-ask", {"source_message_id": "not-an-event"})
+check("reply_to" not in post and "thread_root" not in post,
+      f"an unusable ask id is left out, the release still posts: {post}")
+
 builtins.open, io.open, os.open = _real_open, _real_io_open, _real_os_open
 check(bridge.TOKEN == "dummy-test-token", "the bridge took the test token, not a host one")
 check(sentinel_seen, "the host-path spy records an open under the real home")

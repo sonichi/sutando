@@ -236,14 +236,20 @@ class AG2SpaceRoomMessageProvider:
             message = json.loads(payload.decode("utf-8"))
             room, body = message["room_id"], message["body"]
             thread_root = message.get("thread_root")
+            reply_to = message.get("reply_to")
         except (UnicodeDecodeError, ValueError, KeyError, TypeError, AttributeError) as e:
             raise ProviderPermanentRefused(f"malformed room message for {item_id}: {e}") from e
         if thread_root is not None and not (isinstance(thread_root, str) and thread_root.startswith("$")
                                             and len(thread_root.strip()) > 1):
             raise ProviderPermanentRefused(f"malformed thread root for {item_id}")
+        if reply_to is not None and not (isinstance(reply_to, str) and reply_to.startswith("$")
+                                         and len(reply_to.strip()) > 1):
+            raise ProviderPermanentRefused(f"malformed reply target for {item_id}")
+        # Senders that predate reply_to are still called with their old arguments.
+        extra = {"reply_to": reply_to} if reply_to else {}
         try:
-            resp = (self._send(room, body, idempotency_key, thread_root) if thread_root
-                    else self._send(room, body, idempotency_key))
+            resp = (self._send(room, body, idempotency_key, thread_root, **extra) if thread_root
+                    else self._send(room, body, idempotency_key, **extra))
         except urllib.error.HTTPError as e:
             if 500 <= e.code <= 599:
                 raise ProviderIndeterminate(f"gateway error for {item_id}: HTTP {e.code}") from e

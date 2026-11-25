@@ -1093,12 +1093,13 @@ _DEFINITE_PUBLISH_FAILURES = ("permanent-refusal", "max-attempts", "retry-window
 
 
 def _post_room_message(room: str, body: str, dedupe_key: str, thread_root: "str | None" = None,
-                       deadline: "float | None" = None) -> dict:
+                       deadline: "float | None" = None, reply_to: "str | None" = None) -> dict:
     """The room-message send for an outbox provider: one /v1/room message POST, done by
     `deadline` (time.monotonic()) when one is given."""
     return _req("POST", "/v1/room", {"op": "message", "room_id": room, "body": body,
                                      "dedupe_key": dedupe_key,
-                                     **({"thread_root": thread_root} if thread_root else {})},
+                                     **({"thread_root": thread_root} if thread_root else {}),
+                                     **({"reply_to": reply_to} if reply_to else {})},
                 timeout=_ROOM_POST_TIMEOUT_S, **({"deadline": deadline} if deadline is not None else {}))
 
 
@@ -1109,6 +1110,17 @@ def _record_release_receipt(item_id: str, event_id: str) -> None:
     path = _STATE / team_result_guard.WITHHELD_RESULT_DIR / f"{review_id}.json"
     if not team_result_guard.record_release_receipt(path, claim, event_id):
         raise OSError(f"release receipt for {review_id} not recorded")
+
+
+def _release_relations(context: dict) -> dict:
+    """A released result answers its ask the way an unheld one does: a reply to the ask's
+    message, in its thread when it was asked in one. An unusable id is left out, not fatal."""
+    out = {}
+    for field, key in (("reply_to", "source_message_id"), ("thread_root", "thread_root")):
+        value = str(context.get(key) or "").strip()
+        if value.startswith("$") and len(value) > 1:
+            out[field] = value
+    return out
 
 
 def _withheld_outbox() -> DeliveryCore:
@@ -1139,7 +1151,8 @@ def _publish_review(path: Path, record: dict) -> bool:
         # A recorded event id proves the release landed: settle, never send it again.
         _settle_landed_release(core, item_id, room)
         return _commit_landed(path, record, landed)
-    payload = json.dumps({"room_id": room, "body": body}, sort_keys=True).encode("utf-8")
+    payload = json.dumps({"room_id": room, "body": body, **_release_relations(context)},
+                         sort_keys=True).encode("utf-8")
     core.backend.publish(item_id, payload)  # once per claim; the outbox owns every retry
     if (read_item(core.backend.root, item_id) or {}).get("status") not in core.backend.TERMINAL:
         core.deliver_one(item_id, payload)
@@ -1807,7 +1820,7 @@ def _guarded_result_body(tid: str, body: str):
                 tfile.read_text(encoding="utf-8", errors="replace")).headers
             context = {key: headers.get(key, "") for key in (
                 "source", "channel_id", "room_name", "reply_to_event",
-                "source_message_id", "user_id")}
+                "source_message_id", "thread_root", "user_id")}
         except OSError:
             pass
     root = _team_task_media_root(tid, tier)
@@ -9447,7 +9460,7 @@ def _delivery_core(lane: str = "result") -> DeliveryCore:
         # Late-bound senders, so token rotation and a test's _req double reach them mid-process.
         # A relay result's room send is the broker's, with its own dead letter: its accept is
         # final here, or a send the broker dead-letters would be retried with no ceiling.
-        provider = (AG2SpaceRoomMessageProvider(lambda *a: _post_room_message(*a),
+        provider = (AG2SpaceRoomMessageProvider(lambda *a, **k: _post_room_message(*a, **k),
                                                 lambda *a: _record_release_receipt(*a)) if withheld
                     else AG2SpaceRoomMessageProvider(lambda *a: _post_proactive_message(*a),
                                                      lambda *a: _record_proactive_receipt(*a))
