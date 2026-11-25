@@ -1423,6 +1423,9 @@ class CoreModelSwitch(SeatCase):
         self.assertEqual(s.turn_model(), "")
 
 
+OWNER = "task: hi\naccess_tier: owner\n"
+
+
 class ModelNotAvailable(SeatCase):
     """VM 2026-11-24: the core's gpt-6.1-terra is not available under the ChatGPT account it was switched to
     (modelNotFound, raised during compaction); the turn failed twice and the owner saw "thinking" forever."""
@@ -1452,7 +1455,7 @@ class ModelNotAvailable(SeatCase):
 
     def test_it_shows_the_owner_the_model_card_and_leaves_the_task_pending(self):
         """Owner 2026-11-24: a card listing the models this account can use, never a silent switch."""
-        self.task("task-1.txt")
+        self.task("task-1.txt", OWNER)
         self.plan("model-missing")
         s = self.make(retry_s=30, max_attempts=3)
         s.model = "gpt-6.1-terra"
@@ -1470,7 +1473,7 @@ class ModelNotAvailable(SeatCase):
     def test_a_refusal_at_turn_start_with_another_turn_id_gets_the_card_too(self):
         """VM 2026-11-24 05:38: refused straight at turn start (systemError, no compaction), the error naming
         another turn id and the turn's own error empty; no card followed."""
-        self.task("task-1.txt")
+        self.task("task-1.txt", OWNER)
         self.plan("model-missing-at-start")
         s = self.make(retry_s=30, max_attempts=3)
         s.model = "gpt-6-1-terra"
@@ -1482,20 +1485,39 @@ class ModelNotAvailable(SeatCase):
         self.assertIn("--lead gpt-6-1-terra isn't available on this Codex account", calls[0])
         self.assertIn("model card posted", self.out.getvalue())
 
-    def test_the_card_is_shown_once_per_refused_model(self):
-        self.task("task-1.txt")
-        self.plan("model-missing", "model-missing")
+    def test_each_refused_owner_message_gets_the_card_once(self):
+        """VM 2026-11-24 06:13-06:16: one card, then every later message refused with no reply."""
+        self.task("task-1.txt", OWNER)
+        self.plan("model-missing", "model-missing", "model-missing")
         s = self.make(retry_s=0, max_attempts=5)
         s.model = "gpt-6.1-terra"
         s.ensure_server()
         with self.fake_card():
             s.step()
             s.deferred.clear()
+            s.step()                               # the same message retried: no second card
+            self.assertEqual(len(self.card_calls()), 1)
+            (self.results / "task-1.txt").write_text("answered on the pick\n")  # the first one is done
             s.step()
-        self.assertEqual(len(self.card_calls()), 1)
+            self.task("task-2.txt", OWNER)         # a new message: its own card
+            s.deferred.clear()
+            s.step()
+        self.assertEqual(len(self.card_calls()), 2)
+
+    def test_a_task_not_the_owners_is_closed_not_retried_on_a_refused_model(self):
+        """A cron's task (main-loop, sync-workspace) failed the same way, silently and again and again."""
+        self.task("task-cron.txt", "task: run the main loop\naccess_tier: internal\n")
+        self.plan("model-missing")
+        s = self.make(retry_s=0, max_attempts=5)
+        s.model = "gpt-6.1-terra"
+        s.ensure_server()
+        with self.fake_card():
+            self.assertEqual(s.step(), "done")
+        self.assertEqual(self.card_calls(), [], "no card for it")
+        self.assertTrue((self.results / "task-cron.txt").read_text().startswith("[no-send]"))
 
     def test_a_card_that_cannot_be_posted_is_said_in_words(self):
-        self.task("task-1.txt")
+        self.task("task-1.txt", OWNER)
         self.plan("model-missing")
         s = self.make(retry_s=30, max_attempts=3)
         s.model = "gpt-6.1-terra"

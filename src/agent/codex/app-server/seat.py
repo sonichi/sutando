@@ -363,7 +363,7 @@ class Seat:
         self.auth_seen: Optional[tuple] = None  # the login on disk when the running child was started
         self.turn_unauth = False  # the current turn was refused because the login no longer works
         self.turn_model_missing = ""  # the current turn's model is not one this account may use: its message
-        self.told_model_missing = ""  # the refused model the owner was last shown the model card for
+        self.told_model_missing: List[str] = []  # the owner's tasks already shown the model card
         self.told_signed_out: Optional[tuple] = None  # the login the owner was last shown the card for
         self.health_auth: Optional[tuple] = None  # the login on disk when the core's health went bad
         # Shows the owner the core's account card when its login is refused even after a restart.
@@ -1127,7 +1127,10 @@ class Seat:
             self.health("signed_out")
             self.signed_out(filename)
         elif self.turn_model_missing and status != "completed":
-            self.model_unavailable(filename)
+            if self.model_unavailable(filename, payload) and has_ready_result(results, filename):
+                self.settle(filename, "done")
+                self.clear_record(filename)
+                return "done"
         outcome = "no-result" if status == "completed" else status
         rec = self.write_record(filename, payload, outcome, detail)
         wait = self.retry_s if rec["attempts"] < self.max_attempts else self.hold_s
@@ -1136,14 +1139,30 @@ class Seat:
             f"(attempt {rec['attempts']}, next try in {wait:g}s)")
         return outcome
 
-    def model_unavailable(self, filename: str) -> None:
-        """The turn's model is not one this account may use: the owner gets the model card (the models
-        Codex lists for this account), once per refused model, and the task stays pending, so it is
-        answered on the pick once they make it (owner 2026-11-24: a card, never a silent switch). A card
-        that cannot be posted is said in words instead, so a failed turn is never silent."""
+    def model_unavailable(self, filename: str, payload: Optional[Path] = None) -> bool:
+        """The turn's model is not one this account may use (owner 2026-11-24: a card, never a silent
+        switch, and every refused message answered). The owner's message gets the model card (the models
+        Codex lists for this account), once per message however often it is retried, and stays pending,
+        answered on the pick. Any other task (a cron's, a team member's) is not retried on a refused
+        model: it is closed with no reply. True when this answered the task; a card that cannot be
+        posted is said in words instead, so a failed turn is never silent."""
+        if self.worker:
+            return False
         refused = getattr(self, "turn_sent_model", "") or self.model or "the core model"
-        if self.worker or self.told_model_missing == refused:
-            return
+        if payload is not None and not core_quota_notice.is_owner_task(payload):
+            try:
+                import result_publish
+                result_publish.publish_text(Path(self.host.results) / filename,
+                                            f"[no-send] skipped: {refused} isn't available on this Codex account\n")
+            except Exception as e:  # noqa: BLE001 - left pending, retried as before
+                log(f"task {filename}: {refused} is not available; not the owner's task, but it could not be "
+                    f"closed ({one_line(e, 120)})")
+                return False
+            log(f"task {filename}: {refused} is not available to this account; not the owner's task, closed "
+                "with no reply")
+            return True
+        if filename in self.told_model_missing:
+            return False
         lead = f"{refused} isn't available on this Codex account, so I couldn't answer."
         argv = [sys.executable, str(MODEL_CARD), "--workspace", str(self.workspace), "post", "--owner-dm",
                 "--lead", lead]
@@ -1152,14 +1171,15 @@ class Seat:
             ok, why = done.returncode == 0, one_line(done.stdout or done.stderr, 200)
         except (OSError, subprocess.SubprocessError) as e:
             ok, why = False, one_line(e, 200)
-        self.told_model_missing = refused
+        self.told_model_missing = (self.told_model_missing + [filename])[-50:]
         if ok:
             log(f"task {filename}: model card posted ({refused} is not available to this account: "
                 f"{self.turn_model_missing})")
-            return
+            return False
         log(f"task {filename}: model card failed: {why} ({refused} is not available to this account); said in words")
         self.notify("refused", f"I couldn't answer: {refused} isn't available on this Codex account. "
                                "Send /model to pick one it can use.\n")
+        return False
 
     def quota_step(self, status: str, filename: str = "", payload: Optional[Path] = None) -> None:
         """Out of usage: the owner gets the account card once per limit (core_quota_notice); a turn
