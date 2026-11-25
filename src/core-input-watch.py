@@ -1035,8 +1035,9 @@ def crash_loop_step(manager, workspace, session, runtime, last_pane, now):
         return []
 
 
-# The pane states that show the runtime carried on after a driven answer (a next dialog counts).
-_CARRIED_ON_STATES = ("idle-ready", "running", "blocked-human", "blocked-known")
+# The pane states that show the runtime carried on after a driven answer. A blocked state is not
+# one: it is also a refused turn, a usage limit and a paused queue, so it closes the card neutral.
+_CARRIED_ON_STATES = ("idle-ready", "running")
 
 
 def settle_driven(manager, session, prompt, state):

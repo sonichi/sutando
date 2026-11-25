@@ -558,7 +558,7 @@ class TestDrivenOutcome(unittest.TestCase):
         return m, r
 
     def test_a_driven_answer_is_done_once_the_runtime_is_seen_carrying_on(self):
-        for state in ("running", "idle-ready", "blocked-human"):
+        for state in ("running", "idle-ready"):
             with self.subTest(state=state):
                 m, r = self._driven()
                 self.assertEqual(M.settle_driven(m, "s", None, state), [r.id])
@@ -570,10 +570,12 @@ class TestDrivenOutcome(unittest.TestCase):
     def test_a_driven_answer_whose_runtime_then_crashed_or_stalled_is_never_done(self):
         """The dialog left the screen because the core died (a shell prompt in its pane), not
         because the answer took: the card closes, and its result line stays neutral."""
-        for state in ("crashed", "hung", "logged-out"):
+        for state, pane in (("crashed", "user@host ~ % "), ("hung", "user@host ~ % "), ("logged-out", None),
+                            # blocked is also a refused turn, a usage limit, a paused queue: no proof it took
+                            ("blocked-human", "You've hit your limit"), ("blocked-known", None)):
             with self.subTest(state=state):
                 m, r = self._driven()
-                self.assertEqual(M.settle_driven(m, "s", "susan@mac ~ % ", state), [r.id])
+                self.assertEqual(M.settle_driven(m, "s", pane, state), [r.id])
                 cur = m.get(r.id)
                 self.assertEqual(cur.status, STATUS_RESOLVED)
                 self.assertNotIn("driven_settled", cur.subject)
