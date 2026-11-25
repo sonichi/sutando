@@ -7,6 +7,7 @@ request first and echoes the decision; `[[stall]]` never completes until
 `turn/interrupt`; `[[stall-hard]]` ignores the interrupt too.
 """
 import json
+import os
 import sys
 import time
 import uuid
@@ -27,7 +28,34 @@ def thread_obj(tid):
             "name": None, "canAcceptDirectInput": True, "cliVersion": "stub"}
 
 
-def finish_turn(tid, turn_id, item_id, reply):
+# What `model/list` answers when asked with a limit (the model card's call): more than a card's six
+# buttons, one hidden, one off the connector's allowlist, one whose turns fail and one Codex moves turns from.
+MODELS = ([{"id": "gpt-5.6-sol", "displayName": "Stub Model", "isDefault": True},
+           {"id": "gpt-6-sol", "displayName": "Stub Large"}, {"id": "gpt-6-hidden", "displayName": "Hidden", "hidden": True},
+           {"id": "stub-unlisted", "displayName": "Stub Unlisted"},
+           {"id": "gpt-6-astra", "displayName": "Stub Broken"}, {"id": "gpt-6-luna", "displayName": "Stub Moved"}]
+          + [{"id": mid, "displayName": "Stub %d" % n} for n, mid in
+             ((5, "gpt-5.6-terra"), (6, "gpt-5.6-luna"), (7, "gpt-5.5"), (8, "gpt-5.2"))])
+BROKEN, MOVED = "gpt-6-astra", "gpt-6-luna"
+
+
+def home_file(name, text=None):
+    """A sign-in stand-in under CODEX_HOME: `stub-account` holds the address signed in, `stub-login` says
+    how the next sign-in ends ("success <address>", "fail", "refuse", "page <address of its page>";
+    absent: it never ends)."""
+    path = os.path.join(os.environ.get("CODEX_HOME") or ".", name)
+    if text is not None:
+        with open(path, "a") as f:
+            f.write(text)
+        return text
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def finish_turn(tid, turn_id, item_id, reply, status="completed", error=None):
     # Noise a real server also emits: another thread's event and a non-message item.
     send({"jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": "other-thread", "turn": {"id": "x"}}})
     send({"jsonrpc": "2.0", "method": "item/completed",
@@ -40,7 +68,7 @@ def finish_turn(tid, turn_id, item_id, reply):
           "params": {"threadId": tid, "turnId": turn_id, "completedAtMs": int(time.time() * 1000),
                      "item": {"type": "agentMessage", "id": item_id, "text": reply, "phase": "final"}}})
     send({"jsonrpc": "2.0", "method": "turn/completed",
-          "params": {"threadId": tid, "turn": {"id": turn_id, "status": "completed", "items": [], "error": None}}})
+          "params": {"threadId": tid, "turn": {"id": turn_id, "status": status, "items": [], "error": error}}})
 
 
 for line in sys.stdin:
@@ -58,8 +86,33 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": rid, "result": {"userAgent": "stub-app-server/0", "codexVersion": "stub"}})
     elif meth == "initialized":
         pass
+    elif meth == "account/read":
+        who = home_file("stub-account").split("\n")[-1]
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "account": {"type": "chatgpt", "email": who, "planType": "pro"} if who else None, "requiresOpenaiAuth": True}})
+    elif meth == "account/login/start":
+        plan = home_file("stub-login").split()
+        if plan[:1] == ["refuse"]:
+            send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": "login server could not start"}})
+            continue
+        page = plan[1] if plan[:1] == ["page"] else "https://stub.invalid/sign-in?id=login-1"
+        send({"jsonrpc": "2.0", "id": rid, "result": {"type": "chatgpt", "loginId": "login-1", "authUrl": page}})
+        if plan[:1] == ["success"]:
+            home_file("stub-account", "\n" + plan[1])
+        if plan and plan[0] != "page":
+            send({"jsonrpc": "2.0", "method": "account/login/completed",
+                  "params": {"loginId": "login-1", "success": plan[0] == "success",
+                             "error": None if plan[0] == "success" else "access_denied"}})
+    elif meth == "account/login/cancel":
+        home_file("stub-cancelled", p.get("loginId", "") + "\n")
+        send({"jsonrpc": "2.0", "id": rid, "result": {}})
+    elif meth == "config/read":
+        # The owner's config as the real server reports it: one MCP server a restricted thread must disable.
+        send({"jsonrpc": "2.0", "id": rid, "result": {"config": {"mcp_servers": {"owner-mcp": {"command": "x"}},
+                                                                 "web_search": None}, "origins": {}}})
     elif meth == "model/list":
-        send({"jsonrpc": "2.0", "id": rid, "result": {"data": [{"id": "stub-model", "isDefault": True}], "nextCursor": None}})
+        listed = MODELS if p.get("limit") else [{"id": "stub-model", "isDefault": True}]
+        send({"jsonrpc": "2.0", "id": rid, "result": {"data": listed, "nextCursor": None}})
     elif meth in ("thread/start", "thread/resume"):
         tid = p.get("threadId") or str(uuid.uuid4())
         if meth == "thread/resume" and tid.startswith("stale-"):
@@ -70,7 +123,12 @@ for line in sys.stdin:
         THREADS[tid] = {"cwd": p.get("cwd", "/"), "params": p, "emptied": THREADS.get(tid, {}).get("emptied")}
         send({"jsonrpc": "2.0", "id": rid, "result": {"thread": thread_obj(tid), "model": p.get("model") or "stub-model",
                                                       "modelProvider": "stub", "cwd": THREADS[tid]["cwd"],
-                                                      "approvalPolicy": "never", "sandbox": "read-only", "approvalsReviewer": None}})
+                                                      "approvalPolicy": "never", "sandbox": "read-only", "approvalsReviewer": None,
+                                                      # As 0.167.0: the profile is active only with no `sandbox` param.
+                                                      "activePermissionProfile": (
+                                                          {"id": (p.get("config") or {}).get("default_permissions"), "extends": None}
+                                                          if (p.get("config") or {}).get("default_permissions")
+                                                          and "sandbox" not in p else None)}})
         send({"jsonrpc": "2.0", "method": "thread/started", "params": {"thread": thread_obj(tid)}})
     elif meth == "thread/loaded/list":
         send({"jsonrpc": "2.0", "id": rid, "result": {"data": list(THREADS), "nextCursor": None}})
@@ -85,6 +143,14 @@ for line in sys.stdin:
         # turn's own when the turn carries one (the turn/start override), else the thread's.
         reply = "STUB echo: " + (text.strip().split("\n")[0][:80]) + " [sandbox=%s ephemeral=%s cwd=%s]" % (
             tp.get("sandbox"), tp.get("ephemeral"), p.get("cwd", tp.get("cwd")))
+        if p.get("model"):
+            reply += " model=%s" % p["model"]
+        if "[[askmodel]]" in text:
+            reply = "[model-card]"
+        if "[[askaccount]]" in text:
+            reply = "[account-card]"
+        if "[[config]]" in text:      # what the thread was started with, for a test to pin its overrides
+            reply += " config=" + json.dumps(tp.get("config"), sort_keys=True)
         if "[[empty]]" in text:
             reply = "" if not THREADS[tid].get("emptied") else "STUB second try"
             THREADS[tid]["emptied"] = True
@@ -106,7 +172,13 @@ for line in sys.stdin:
             PENDING[REQ_ID] = (tid, turn_id, item_id, reply)
             send({"jsonrpc": "2.0", "id": REQ_ID, "method": "item/commandExecution/requestApproval",
                   "params": {"threadId": tid, "turnId": turn_id, "itemId": item_id, "command": ["rm", "-rf", "x"]}})
+        elif p.get("model") == BROKEN:
+            finish_turn(tid, turn_id, item_id, "", "failed", {"message": "the model is not available"})
         else:
+            if p.get("model") == MOVED:
+                send({"jsonrpc": "2.0", "method": "model/rerouted",
+                      "params": {"threadId": tid, "turnId": turn_id, "fromModel": MOVED, "toModel": "gpt-5.6-sol",
+                                 "reason": "highRiskCyberActivity"}})
             finish_turn(tid, turn_id, item_id, reply)
     elif meth == "turn/interrupt":
         late = STALLED.get(p.get("turnId"), (None, None))[1] == "late"

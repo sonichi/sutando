@@ -76,6 +76,90 @@ class Who(Base):
         self.assertFalse(rows[pr.CORE]["me"])
 
 
+class WhoAgentIds(Base):
+    def _write(self, rows):
+        import json as _json
+        import connections
+        path = connections.record_path(self.ws)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_json.dumps({"schema_version": connections.SCHEMA_VERSION, "connections": rows,
+                                     "removed_env": [], "legacy_parked": False, "relaunch_pending": {}}))
+
+    def _row(self, **kw):
+        inst = kw.pop("instance")
+        row = {"server": "fixture.net", "instance": inst, "gateway_url": "https://fixture.net",
+               "token_ref": f"AG2_REMOTE_TOKEN_FIXTURE_{inst.upper().replace('-', '_') or 'CORE'}", "primary": False, "added_by": "agent_link",
+               "added_at": "2026-01-01T00:00:00Z", "verified": True, "server_source": "identity"}
+        row.update(kw)
+        return row
+
+    def test_each_row_carries_its_agent_id_or_none(self):
+        self._write([self._row(instance="", primary=True, agent_mxid="@core-agent:fixture.net"),
+                     self._row(instance="alpha-lane", worker=self.alpha, agent_mxid="@alpha-agent:fixture.net")])
+        by = {r["id"]: r for r in pa.who(self.ws, runner=Tmux())}
+        self.assertEqual(by[pr.CORE]["agent_mxid"], "@core-agent:fixture.net")
+        self.assertEqual(by[self.alpha]["agent_mxid"], "@alpha-agent:fixture.net")
+        self.assertIsNone(by[self.beta]["agent_mxid"], "a worker with no identity row has none")
+
+    def test_two_rows_for_one_worker_show_the_session_identity(self):
+        import connections
+        self._write([self._row(instance="alpha-lane", worker=self.alpha, agent_mxid="@alpha-agent:fixture.net"),
+                     self._row(instance="alpha-lane-2", worker=self.alpha, server="other.net",
+                               gateway_url="https://other.net", agent_mxid="@alpha-other:other.net")])
+        by = {r["id"]: r for r in pa.who(self.ws, runner=Tmux())}
+        want = connections.worker_identity(self.alpha, self.ws, server="fixture.net")["agent_mxid"]
+        self.assertEqual(by[self.alpha]["agent_mxid"], want)
+        self.assertEqual(want, "@alpha-agent:fixture.net")
+
+    def test_a_parked_second_row_does_not_override(self):
+        self._write([self._row(instance="alpha-lane", worker=self.alpha, agent_mxid="@alpha-agent:fixture.net"),
+                     self._row(instance="alpha-lane-2", worker=self.alpha, server="other.net",
+                               gateway_url="https://other.net", agent_mxid="@alpha-parked:other.net",
+                               parked=True)])
+        by = {r["id"]: r for r in pa.who(self.ws, runner=Tmux())}
+        self.assertEqual(by[self.alpha]["agent_mxid"], "@alpha-agent:fixture.net")
+
+    def test_text_output_shows_agent_ids_and_none(self):
+        self._write([self._row(instance="alpha-lane", worker=self.alpha, agent_mxid="@alpha-agent:fixture.net")])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(pa.main(["--workspace", str(self.ws), "--who"]), 0)
+        lines = out.getvalue().splitlines()
+        self.assertTrue(any(self.alpha in ln and "agent=@alpha-agent:fixture.net" in ln for ln in lines))
+        self.assertTrue(any(self.beta in ln and "agent=(none)" in ln for ln in lines))
+
+    def test_json_output_has_agent_mxid(self):
+        self._write([self._row(instance="alpha-lane", worker=self.alpha, agent_mxid="@alpha-agent:fixture.net")])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(pa.main(["--workspace", str(self.ws), "--who", "--json"]), 0)
+        import json as _json
+        by = {r["id"]: r for r in _json.loads(out.getvalue())}
+        self.assertEqual(by[self.alpha]["agent_mxid"], "@alpha-agent:fixture.net")
+        self.assertIsNone(by[self.beta]["agent_mxid"])
+
+    def test_an_unreadable_record_still_lists_everyone(self):
+        import connections
+        path = connections.record_path(self.ws)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json")
+        rows = pa.who(self.ws, runner=Tmux())
+        self.assertEqual({r["id"] for r in rows}, {pr.CORE, self.alpha, self.beta})
+        self.assertTrue(all(r["agent_mxid"] == pa.IDS_UNAVAILABLE for r in rows))
+
+    def test_a_failing_identity_read_still_lists_everyone(self):
+        import connections
+        from unittest import mock
+        with mock.patch.object(connections, "agent_ids", side_effect=RuntimeError("boom")):
+            rows = pa.who(self.ws, runner=Tmux())
+        self.assertEqual({r["id"] for r in rows}, {pr.CORE, self.alpha, self.beta})
+        self.assertTrue(all(r["agent_mxid"] == pa.IDS_UNAVAILABLE for r in rows))
+
+    def test_no_record_means_no_ids(self):
+        rows = pa.who(self.ws, runner=Tmux())
+        self.assertTrue(all(r["agent_mxid"] is None for r in rows))
+
+
 class Asking(Base):
     def test_an_ask_to_a_worker_is_a_task_file_routed_to_its_inbox(self):
         out = pa.ask(self.ws, "alpha", "what is the status of #1?")

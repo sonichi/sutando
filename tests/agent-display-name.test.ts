@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const mod = await import('../src/agent-display-name.js');
-const { agentDisplayName, agentDisplayNameScriptPath, resolverRunner, resetAgentDisplayNameForTests, nameFromJson, LIVE_REFRESH_MS, FALLBACK_AGENT_NAME } = mod;
+const { agentDisplayName, agentDisplayNameScriptPath, resolverRunner, resetAgentDisplayNameForTests, nameFromJson, answerFromJson, LIVE_REFRESH_MS } = mod;
 const REPO = join(fileURLToPath(new URL('.', import.meta.url)), '..');
 
 function runner(offline: string | Error, live: string | null) {
@@ -48,9 +48,9 @@ test('the live resolve reruns after the refresh window, so a rename is picked up
 	assert.strictEqual(agentDisplayName(r, LIVE_REFRESH_MS + 1), 'Renamed');
 });
 
-test('a failed resolver falls back to the resolver\'s own last tier; a failed live run keeps the offline name', () => {
+test('a failed resolver gives no name; a failed live run keeps the offline name', () => {
 	const broken = runner(new Error('python unavailable'), null);
-	assert.strictEqual(agentDisplayName(broken, 0), FALLBACK_AGENT_NAME);
+	assert.strictEqual(agentDisplayName(broken, 0), '');
 	resetAgentDisplayNameForTests();
 	const r = runner(json('Recorded Name'), null);
 	agentDisplayName(r, 0);
@@ -61,7 +61,20 @@ test('a failed resolver falls back to the resolver\'s own last tier; a failed li
 	assert.strictEqual(agentDisplayName(throwing, 0), 'Offline');
 });
 
+test('a cold start with no name gives none, never a fallback', () => {
+	assert.strictEqual(agentDisplayName(runner(json(''), null), 0), '');
+});
+
+test('a live answer with no name clears a stale cached name', () => {
+	const r = runner(json('Old Name'), json(''));
+	assert.strictEqual(agentDisplayName(r, 0), 'Old Name');
+	r.land();
+	assert.strictEqual(agentDisplayName(r, 1), '');
+});
+
 test('only a JSON name is accepted', () => {
+	assert.strictEqual(answerFromJson(json('')), '');
+	for (const bad of [null, '', 'not json', '{"name": 3}', '{}']) assert.strictEqual(answerFromJson(bad), null);
 	assert.strictEqual(nameFromJson(json('  A Name ')), 'A Name');
 	for (const bad of [null, '', 'not json', '{"name": 3}', '{}']) assert.strictEqual(nameFromJson(bad), '');
 });
@@ -87,10 +100,10 @@ test('the bundled layout (module in dist/) finds the resolver in src/', () => {
 	assert.strictEqual(agentDisplayNameScriptPath(join(REPO, 'src')), script);
 });
 
-test('a missing resolver script is warned about once, by cause, and falls back', () => {
+test('a missing resolver script is warned about once, by cause, and gives no name', () => {
 	const warnings: string[] = [];
 	const r = resolverRunner(join(REPO, 'dist', 'agent_display_name.py'), (m: string) => warnings.push(m));
-	assert.strictEqual(agentDisplayName(r, 0), FALLBACK_AGENT_NAME);
+	assert.strictEqual(agentDisplayName(r, 0), '');
 	agentDisplayName(r, LIVE_REFRESH_MS);
 	agentDisplayName(r, 2 * LIVE_REFRESH_MS);
 	assert.strictEqual(warnings.length, 1, warnings.join('\n'));
@@ -106,7 +119,7 @@ test('a failing resolver is warned about once per distinct cause', () => {
 		const r = resolverRunner(script, (m: string) => warnings.push(m));
 		assert.throws(() => r.sync(['--offline', '--json']));
 		assert.throws(() => r.sync(['--offline', '--json']));
-		assert.deepStrictEqual(warnings, ['[agent-display-name] resolver exited with status 3; using the last known name or "Sutando"']);
+		assert.deepStrictEqual(warnings, ['[agent-display-name] resolver exited with status 3; using the last known name, or none']);
 	} finally {
 		rmSync(tmp, { recursive: true, force: true });
 	}

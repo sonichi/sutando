@@ -26,7 +26,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ... import _dirs, connect_bridge as cb, connect_common as cm, task_io
+from ... import _dirs, connect_bridge as cb, connect_common as cm, model_settings, task_io
 from ...connect_bridge import EXTERNAL, UNIT
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, RUN_TIMEOUT_S, Shape, _v
 from . import codex_connector
@@ -85,9 +85,10 @@ def connector_argv(cfg: dict, root: str, root_fd: int) -> list:
     --ephemeral, --developer-instructions, nor the stub or proxy server, none of which belong under a
     manager."""
     argv = [sys.executable, "-m", codex_connector.__name__, "--work", root, "--held", "--root-fd", str(root_fd),
-            "--codex", cfg["CODEX"], "--server", "stdio", "--sandbox", cfg.get("SANDBOX") or "read-only"]
-    if cfg.get("ALLOW_NON_OWNER") == "1":
-        argv.append("--allow-non-owner")
+            "--codex", cfg["CODEX"], "--server", "stdio", "--sandbox", cfg.get("SANDBOX") or "read-only",
+            "--media-root", str(cb.bridge_state(cfg) / "remote-media")]
+    if cfg.get("ALLOW_NON_OWNER") == "0":
+        argv.append("--no-allow-non-owner")
     if cfg.get("MODEL"):
         argv += ["--model", cfg["MODEL"]]
     if cfg.get("RESUME_THREAD"):
@@ -157,11 +158,12 @@ def resolve_root(args) -> "tuple[dict, str]":
 
 # What a repair `install <selector>` takes from the job's recorded config: (key, option, value).
 RECORDED = (("CODEX", "codex", str), ("CODEX_HOME", "codex_home", str), ("SANDBOX", "sandbox", str),
-            ("ALLOW_NON_OWNER", "allow_non_owner", lambda v: v == "1"), ("MODEL", "model", str),
+            ("ALLOW_NON_OWNER", "non_owner", lambda v: "0" if v == "0" else ""), ("MODEL", "model", str),
             ("RESUME_THREAD", "resume_thread", str))
 
 
 def install(args) -> int:
+    cm.take_over(args)
     if getattr(args, "token_stdin", False):
         return cb.install_token_stdin(args, LOCAL, lambda: connect_preflight(args, login=False), install, COMMAND,
                                       work=None)
@@ -198,7 +200,7 @@ def install(args) -> int:
     values = {"CODEX": os.path.abspath(codex), "INBOX_DIR": str(Path(root) / "tasks"),
               "RESULTS_DIR": str(Path(root) / "results"),
               "CODEX_HOME": str(Path(args.codex_home).expanduser().resolve()) if args.codex_home else "",
-              "SANDBOX": args.sandbox, "ALLOW_NON_OWNER": "1" if args.allow_non_owner else "",
+              "SANDBOX": args.sandbox, "ALLOW_NON_OWNER": "0" if args.non_owner == "0" else "1",
               "MODEL": args.model or "", "RESUME_THREAD": resume, "AGENT_ID": where["agent_id"], "BRIDGE": mode if mode != EXTERNAL else "",
               "TOKEN_ENV_FILE": where["token_file"], "TOKEN_VAULT_KEY": "",
               "BRIDGE_STATE_DIR": str(cb.bridge_home(root) / "state") if mode != EXTERNAL else ""}
@@ -359,7 +361,7 @@ def verify(args) -> int:
     for key in ("INBOX_DIR", "RESULTS_DIR"):
         cm.check(results, Path(cfg[key]).is_dir(), key.lower().replace("_dir", ""), cfg[key])
     print(f"INFO sandbox: {cfg.get('SANDBOX') or 'read-only'} for owner turns; non-owner turns are always read-only")
-    print(f"INFO non-owner: {'served read-only (--allow-non-owner)' if cfg.get('ALLOW_NON_OWNER') == '1' else 'refused unless attested collaborator'}")
+    print(f"INFO non-owner: {'refused unless attested collaborator (--no-allow-non-owner)' if cfg.get('ALLOW_NON_OWNER') == '0' else 'served read-only, ephemeral, in an empty temp dir (the default; --no-allow-non-owner opts out)'}")
     if cb.bridge_mode(cfg) != EXTERNAL:
         print(f"INFO agent: {cfg.get('AGENT_ID')}")
         problem = cb.bridge_problem(cfg, COMMAND, bridge)
@@ -385,14 +387,30 @@ def list_cmd(_args) -> int:
     return cm.list_jobs(LOCAL)
 
 
+def model(args) -> int:
+    """The app's settings page: the agent's model, and the owner's pick (`--set`), in the state the
+    model card keeps, within the card's allowlist; every next turn runs on the pick (model_settings)."""
+    local, problem = selected(args)
+    cfg, problem = (None, problem) if problem else load_config(local)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    return model_settings.command(Path(cm.work_root(cfg)) / "state", args.set,
+                                  allowed=codex_connector.MODEL_ALLOWLIST)
+
+
 def session_options(p) -> None:
     """The connector's options, shared by install and connect."""
     p.add_argument("--codex", default="codex", help="the codex executable (default: codex on PATH)")
     p.add_argument("--codex-home", help="CODEX_HOME holding the login the connector uses (default: the CLI's own)")
     p.add_argument("--sandbox", choices=SANDBOXES, default="read-only",
                    help="the owner threads' sandbox (default read-only; non-owner turns are always read-only)")
-    p.add_argument("--allow-non-owner", action="store_true",
-                   help="serve non-owner senders without collaborator access too, on an ephemeral read-only thread")
+    no = p.add_mutually_exclusive_group()
+    no.add_argument("--allow-non-owner", dest="non_owner", action="store_const", const="1",
+                    help="serve non-owner senders without collaborator access too, on an ephemeral read-only thread "
+                         "(the default; kept so older install lines still work)")
+    no.add_argument("--no-allow-non-owner", dest="non_owner", action="store_const", const="0",
+                    help="refuse those senders with a plain line instead")
     p.add_argument("--model", help="the model for every turn (default: the connector's)")
     # Codex names its rollouts in lowercase: the id is matched and resumed as such.
     p.add_argument("--resume-thread", metavar="UUID", type=str.lower,
@@ -410,6 +428,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("install", help="record the settings, write the unit, have the manager start the connector "
                        "(a reinstall stops the old one first)")
+    cm.replace_option(p)
     p.add_argument("--work", help="an explicit work root, fed by a bridge you run: Sparrow's tasks/ and results/ must "
                    "be <work>/tasks and <work>/results")
     tok = p.add_mutually_exclusive_group()
@@ -451,6 +470,10 @@ def main(argv=None) -> int:
                  ).set_defaults(func=uninstall)
     sub.add_parser("list", help="each job installed here: its agent, the manager's state, its work root and the "
                    "selector that names it").set_defaults(func=list_cmd)
+    m = agent_option(sub.add_parser("model", help="print the agent's model as JSON (current, available, pending), "
+                                                  "or pick the one every next turn runs on (--set)"))
+    m.add_argument("--set", metavar="ID", help="a model id on the card's allowlist")
+    m.set_defaults(func=model)
     args = ap.parse_args(argv)
     args.argv = list(sys.argv[1:] if argv is None else argv)
     return args.func(args)

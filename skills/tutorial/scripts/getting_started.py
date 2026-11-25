@@ -39,10 +39,10 @@ upload leaves that asset inlined from its small fallback file; `--no-upload` upl
 over an upload; it too is recorded and reused there.
 
 The page records the list's revision in its ownership tag. `publish` rewrites a page whose text
-differs from what it would write (a new name, core, list or prompts), unless someone edited the page
+differs from what it would write (for example, from a new feature list), unless someone edited it
 since it was last written: that page is kept (action "kept", a line on stderr) and its entry stands.
 With --if-newer it rewrites a complete page only when the list's revision is newer than the page's,
-reusing the prompts and roles the page was last built with, so a pass after an engine update
+using generic content, so a pass after an engine update
 refreshes stale pages and leaves current ones alone. A page built before lists had a revision counts
 as older than any list. A rewrite is journalled as `updating` before its first write: the target
 page, the page before it, the page after each call, and the entry before it. The next run settles
@@ -64,15 +64,13 @@ One page per room, created once. <workspace>/state/tutorial/getting-started.json
 room's entry under a lock: `creating` with an operation_id before the page is made through
 `room.commons.pages.create` (a retry with the same id returns the same page and writes its body at
 most once), `pending` with its kind until every piece is written, then `complete`. A rerun resumes
-whatever it finds. With no entry, a listed "Getting started" page is reused only when its text
-carries this agent's ownership marker; more than one such page, or no agent id to check with,
-stops the run. The page holds the agent's name and fixed text only; nothing read from the
-owner's accounts goes on it.
+only journals produced by the generic publisher. With no entry, a listed "Getting started" page is
+reused only when its text carries this agent's ownership marker; more than one such page, or no agent id to check with,
+stops the run. Published pages hold generic examples, not personal display names, roles or prompts.
 
 Inputs the setup app saved: <workspace>/state/onboarding/tutorial-inputs.json (`room`, `owner`,
-`agent_mxid`, `roles`) fills what the command line leaves out, so `publish` alone works in the owner's
-DM. `owner` and `roles` apply only in that file's own room; a missing, unreadable or malformed file,
-or a field of the wrong shape, is ignored. `--name` defaults to auto.
+`agent_mxid`, `roles`) supplies routing defaults in the recorded room but never proves its
+current audience. The publish command ignores personal render options.
 
 Exit codes: 0 done, 2 bad arguments, 3 the room-commons skill is not installed, 4 a room-commons
 call failed, ownership was unclear, or the page is too large for one call (the marker
@@ -102,18 +100,20 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "src"))
 import agent_display_name  # noqa: E402
-from agent_display_name import FALLBACK_NAME, MXID, agent_mxid, localpart_name  # noqa: E402,F401
+from agent_display_name import MXID, agent_mxid  # noqa: E402,F401
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tour_page  # noqa: E402,F401
 from tour_page import (  # noqa: E402,F401  (the page lives in tour_page; these names are this CLI's API)
     AUDIENCES, CONNECT_PROMPT, PROMPT_SLOTS, clean_prompts, owner_marker, CORES, NAME_MAX, PAGE_TITLE, SECTIONS, clean_name,
     render_page, sections_for, FeatureList, LIST_PATH, clean_media, load_list, newer, parse_list, read_marker,
-    role_labels, LIST_MAX_BYTES, read_regular, page_digest_ok, page_shape_ok, strip_digest,
+    LIST_MAX_BYTES, read_regular, page_digest_ok, page_shape_ok, strip_digest,
 )
 
 SUMMON_CONTEXT = "A short tour of s.space, with one thing to try in each part."
 CREATE_ACTION = "room.commons.pages.create"
+GENERIC_NAME = "your agent"
+PUBLISH_PRIVACY = "generic-tutorial-v1"
 SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSWORD|KEY", re.I)
 SECRET_SHAPE = re.compile(r"(\bBearer\s+)\S+|\bhttps?://\S+\|\S+", re.I)
 # A piece of a create or an append: under Room Commons' 196,608-byte write.
@@ -212,7 +212,7 @@ def room_agent_mxid(room: Optional[str]) -> Optional[str]:
 
 def resolve_name(name: str, mxid: Optional[str] = None,
                  fetch: Optional[Callable[[str], bytes]] = None) -> str:
-    """`name` itself, or for `auto` the name agent_display_name.resolve gives this agent."""
+    """`name` itself, or for `auto` the name agent_display_name.resolve gives this agent ('' for none)."""
     if name != "auto":
         return name
     mxid = mxid if mxid is not None else agent_mxid()  # callers that resolved the identity pass it
@@ -364,15 +364,13 @@ def load_inputs(path: Path) -> Dict[str, str]:
 
 
 def with_inputs(args: argparse.Namespace, inputs: Mapping[str, str]) -> argparse.Namespace:
-    """`args` with what the command line left out taken from `inputs`. The owner and roles belong
-    to the inputs' own room, so they apply only when publishing there."""
+    """Recover routing defaults only; the saved setup does not authorize personal page content."""
     room = args.room or inputs.get("room")
     same_room = bool(room) and room == inputs.get("room")
     return argparse.Namespace(**{
         **vars(args), "room": room,
         "owner": args.owner or (inputs.get("owner") if same_room else None),
-        "roles": args.roles or (inputs.get("roles", "") if same_room else ""),
-        "agent_mxid": args.agent_mxid or inputs.get("agent_mxid"),
+        "agent_mxid": args.agent_mxid or (inputs.get("agent_mxid") if same_room else None),
     })
 
 
@@ -639,15 +637,14 @@ def _record(marker: Path, rooms: Dict[str, dict], room: str, entry: dict) -> Non
         raise PublishError(f"could not record {entry.get('kind') or entry['state']} in {marker}: {exc}") from None
 
 
-def _entry(kind: Optional[str], page: str, features: FeatureList, prompts: Dict[str, str], roles: object,
-           media: Dict[str, str], audience: str) -> dict:
+def _entry(kind: Optional[str], page: str, features: FeatureList,
+           media: Dict[str, str], audience: str, native_dm: bool) -> dict:
     """A room's complete entry for `page` and the inputs it was built from."""
     entry = {"kind": kind, "state": "complete", "hash": content_hash(page),
-             "revision": (read_marker(page) or (None, features.revision))[1], "audience": audience}
-    if prompts:
-        entry["prompts"] = prompts
-    if role_labels(roles):
-        entry["roles"] = ", ".join(role_labels(roles))
+             "revision": (read_marker(page) or (None, features.revision))[1], "audience": audience,
+             "privacy": PUBLISH_PRIVACY}
+    if native_dm:
+        entry["layout"] = "compact"
     if media:
         entry["media"] = media
     return entry
@@ -656,7 +653,7 @@ def _entry(kind: Optional[str], page: str, features: FeatureList, prompts: Dict[
 # What a journal (an `updating` rewrite, or a `creating`/`pending` create) carries beyond the
 # complete entry it becomes; `done` is the number of calls that ran, `mode` fill or rewrite.
 JOURNAL_KEYS = ("target", "before", "source", "steps", "done", "previous", "mode", "whole", "piece", "name", "core",
-                "agent")
+                "agent", "rollback_safe", "privacy_migration")
 
 
 def _steps(journal: dict) -> List[tuple]:
@@ -671,8 +668,11 @@ def _journal(entry: dict, current: str, page: str, previous: Optional[dict], nam
              env: Optional[Mapping[str, str]] = None) -> dict:
     journal = {**entry, "state": "updating", "target": page, "before": current, "source": content_hash(current),
                "done": 0, "mode": mode, "whole": mode == "rewrite" and one_call(current, page, env),
-               "piece": piece_limit(env), "previous": previous or None, "name": name, "core": core,
-               "audience": audience, "agent": agent}
+               "piece": piece_limit(env),
+               "previous": {k: v for k, v in (previous or {}).items() if k not in ("roles", "prompts")} or None,
+               "name": name, "core": core,
+               "audience": audience, "agent": agent,
+               "rollback_safe": mode == "fill" or (previous or {}).get("privacy") == PUBLISH_PRIVACY}
     journal["steps"] = [content_hash(text) for _, _, text in _steps(journal)]
     return journal
 
@@ -754,7 +754,8 @@ def _advance(commons: Commons, marker: Path, rooms: Dict[str, dict], room: str) 
                 if now != expected[i + 1]:
                     # Someone wrote outside the needle meanwhile: this call is taken back when it can
                     # be, and the page is theirs, as it stands, with how far the undo got noted.
-                    undo = _undo(commons, kind, steps[i])
+                    undo = (_undo(commons, kind, steps[i])
+                            if cmd == "append" or journal.get("rollback_safe") else "unfit")
                     _stand_aside(marker, rooms, room, journal,
                                  now if undo == "unfit" else content_hash(commons.read(kind)), undo)
                     return "edited"
@@ -773,6 +774,8 @@ def _settle(commons: Commons, marker: Path, rooms: Dict[str, dict], room: str) -
     target (written here, call by call, when the page is where the journal left it), `untouched`
     when a rewrite never ran, `edited` when the page is in no state of the journal."""
     journal = rooms[room]
+    if journal.get("privacy_migration"):
+        return _advance_migration(commons, marker, rooms)
     kind, target, before = journal["kind"], journal.get("target"), journal.get("before")
     if not isinstance(target, str) or content_hash(target) != journal.get("hash") \
             or not isinstance(before, str) or content_hash(before) != journal.get("source"):
@@ -790,13 +793,19 @@ def _settle(commons: Commons, marker: Path, rooms: Dict[str, dict], room: str) -
     return _advance(commons, marker, rooms, room)
 
 
-def _recover(commons: Commons, marker: Path, rooms: Dict[str, dict], owner: Optional[str]) -> Optional[dict]:
+def _recover(commons: Commons, marker: Path, rooms: Dict[str, dict], owner: Optional[str],
+             *, defer_legacy: bool = False) -> Optional[dict]:
     """Settle this room's journal, if any, from the journal, the room and the identity alone, before
     anything of a run's own request is read or rendered. The result of a run that settled one, or
     None when there is nothing to settle (a journal whose page is gone is dropped)."""
     journal = rooms.get(commons.room, {})
-    if journal.get("state") not in ("updating", "pending", "creating") or "target" not in journal:
+    if journal.get("state") not in ("updating", "pending", "creating"):
         return None
+    if journal.get("privacy") != PUBLISH_PRIVACY or "target" not in journal:
+        if defer_legacy and journal.get("privacy") != PUBLISH_PRIVACY:
+            return None
+        return {"ok": True, "action": "skipped", "kind": journal.get("kind"), "summoned": False,
+                "reason": "saved tutorial write predates the privacy guard; not replayed"}
     pages = commons.listed_pages()
     if journal["state"] == "creating":
         # The create may have landed and its answer been lost: a page this agent tagged is that page.
@@ -806,6 +815,9 @@ def _recover(commons: Commons, marker: Path, rooms: Dict[str, dict], owner: Opti
         journal = {**journal, "kind": found, "state": "pending"}
         _record(marker, rooms, commons.room, journal)
     elif journal["kind"] not in [p.get("kind") for p in pages]:
+        if journal.get("privacy_migration"):
+            return {"ok": True, "action": "skipped", "kind": journal["kind"], "summoned": False,
+                    "reason": "migration page no longer listed"}
         if journal.get("previous"):
             _restore(marker, rooms, commons.room, journal["previous"])
         else:
@@ -836,11 +848,109 @@ def _recover(commons: Commons, marker: Path, rooms: Dict[str, dict], owner: Opti
     return result
 
 
-def recover(commons: Commons, marker: Path, owner: Optional[str] = None) -> Optional[dict]:
+def recover(commons: Commons, marker: Path, owner: Optional[str] = None,
+            *, defer_legacy: bool = False) -> Optional[dict]:
     """`publish`'s first step on its own: finish or stand aside from a run cut short in this room.
     Needs nothing of a request but the room and the owner to summon."""
     with _locked(marker):
-        return _recover(commons, marker, load_marker(marker), owner)
+        return _recover(commons, marker, load_marker(marker), owner, defer_legacy=defer_legacy)
+
+
+def _needs_privacy_migration(entry: dict) -> bool:
+    if entry.get("privacy") == PUBLISH_PRIVACY:
+        return False
+    state = entry.get("state")
+    return state in ("creating", "pending", "updating") or (
+        bool(entry) and not entry.get("foreign") and state in (None, "complete")
+        and entry.get("audience") != "room")
+
+
+def _legacy_hashes(entry: dict) -> set:
+    if entry.get("state") not in ("creating", "pending", "updating"):
+        return {entry.get("hash")} if isinstance(entry.get("hash"), str) else set()
+    before, target, listed = entry.get("before"), entry.get("target"), entry.get("steps")
+    if (not isinstance(before, str) or content_hash(before) != entry.get("source")
+            or not isinstance(target, str) or content_hash(target) != entry.get("hash")
+            or not isinstance(listed, list) or not all(isinstance(h, str) for h in listed)):
+        return set()
+    try:
+        calculated = [content_hash(text) for _, _, text in _steps(entry)]
+    except (TypeError, ValueError):
+        return set()
+    return {entry["source"], *listed} if listed == calculated else set()
+
+
+def _advance_migration(commons: Commons, marker: Path, rooms: Dict[str, dict]) -> str:
+    room = commons.room
+    journal = rooms[room]
+    kind, target = journal["kind"], journal["target"]
+    if not isinstance(target, str) or content_hash(target) != journal.get("hash"):
+        raise PublishError("legacy migration target failed verification")
+    try:
+        current = commons.read(kind)
+        if current != target and content_hash(current) == journal["source"]:
+            if not one_call(current, target, commons.env):
+                raise PublishError("legacy migration no longer fits one call")
+            try:
+                commons.run("replace", room, current, target, kind=kind)
+            except PublishError:
+                current = commons.read(kind)
+                if content_hash(current) == journal["source"]:
+                    raise
+            else:
+                current = commons.read(kind)
+    except PublishError:
+        raise PublishError("legacy migration could not finish; its generic target stays recorded") from None
+    if current != target:
+        _stand_aside(marker, rooms, room, journal, content_hash(current))
+        return "edited"
+    _record(marker, rooms, room, _complete(journal))
+    return "finished"
+
+
+def _migrate_legacy(commons: Commons, marker: Path, rooms: Dict[str, dict], entry: dict,
+                    audience: Optional[str], core: str, agent: Optional[str], features: FeatureList) -> dict:
+    """Use old bytes only as an exact-match preimage, never a write target."""
+    room, kind = commons.room, entry.get("kind")
+
+    def skipped(reason: str) -> dict:
+        return {"ok": True, "action": "skipped", "kind": kind, "summoned": False, "reason": reason}
+
+    if not audience:
+        return skipped("audience unknown")
+    hashes = _legacy_hashes(entry)
+    if not agent or not hashes or entry.get("foreign") or (entry.get("agent") or agent) != agent:
+        return skipped("publisher ownership not verified")
+    found = []
+    for row in candidates(commons.listed_pages()):
+        if kind is not None and row["kind"] != kind:
+            continue
+        current = commons.read(row["kind"])
+        if content_hash(current) in hashes and owned(row, current, agent):
+            found.append((row["kind"], current))
+    if len(found) != 1:
+        return skipped("legacy page missing, edited or ambiguous")
+    kind, current = found[0]
+    tag = read_marker(current)
+    if tag and tag[1] and newer(tag[1], features.revision):
+        return skipped("legacy page uses a newer guide version")
+    native_dm = audience == "dm"
+    recorded = clean_media(entry.get("media"), features)
+    page = render_page(GENERIC_NAME, core, audience, agent, features=features, media=recorded, native_dm=native_dm)
+    complete = _entry(kind, page, features, recorded, audience, native_dm)
+    if current == page:
+        _record(marker, rooms, room, complete)
+        return {"ok": True, "action": "unchanged", "kind": kind, "summoned": False, "migrated": True}
+    if not one_call(current, page, commons.env):
+        return skipped("legacy page exceeds a single exact replacement")
+    journal = {**complete, "state": "updating", "privacy_migration": True,
+               "source": content_hash(current), "target": page, "name": GENERIC_NAME,
+               "core": core, "agent": agent}
+    _record(marker, rooms, room, journal)
+    if _advance_migration(commons, marker, rooms) != "finished":
+        return skipped("owner edit detected during migration")
+    return {"ok": True, "action": "updated", "kind": kind, "summoned": False, "migrated": True,
+            "revision": features.revision, "media": sorted(recorded)}
 
 
 def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = None,
@@ -850,15 +960,22 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             media: object = None, dm_room: Optional[str] = None, had_entry: bool = False,
             aliases: Iterable[str] = (), upload: bool = True) -> dict:
     """`audience` None means the room's recorded one; a refresh skips a page it can't place, and
-    never creates one: only an explicit publish does. `had_entry`: the room had one before recovery."""
+    never creates one: only an explicit publish does. `had_entry`: the room had one before recovery.
+    Legacy name, prompt and role arguments are accepted for compatibility and are not published."""
     features = features or tour_page.FEATURES
-    slots = tour_page.prompt_slots(features)
+    # The page actions cannot bind a write or a later read to a private audience.
+    name = GENERIC_NAME
     with _locked(marker):
         rooms = load_marker(marker)
-        settled = _recover(commons, marker, rooms, owner)
+        settled = _recover(commons, marker, rooms, owner, defer_legacy=True)
         if settled:
             return settled
         known = rooms.get(commons.room, {})
+        if _needs_privacy_migration(known):
+            saved_audience = known.get("audience")
+            migration_audience = (saved_audience if saved_audience in AUDIENCES else
+                                  "dm" if commons.room == dm_room else audience)
+            return _migrate_legacy(commons, marker, rooms, known, migration_audience, core, agent, features)
 
         def skipped(reason: str) -> dict:
             return {"ok": True, "action": "skipped", "reason": reason, "kind": known.get("kind"),
@@ -869,23 +986,20 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             # page is compared as a DM's but never rewritten under that guess.
             audience = known.get("audience") if known.get("audience") in AUDIENCES else "dm"
             unplaced = if_newer and bool(known) and known.get("audience") not in AUDIENCES and commons.room != dm_room
-        if if_newer and not clean_prompts(prompts, slots):
-            # No one is in the loop to pass the owner's prompts again: keep the page's own.
-            prompts = rooms.get(commons.room, {}).get("prompts")
-        if if_newer and not role_labels(roles):
-            roles = rooms.get(commons.room, {}).get("roles")
-        prompts = clean_prompts(prompts, slots)
+        native_dm = audience == "dm" and (commons.room == dm_room or known.get("layout") == "compact")
         # A refresh of a room whose record is current writes nothing, so it uploads nothing either.
         current = (if_newer and known.get("state") == "complete" and bool(known.get("revision"))
                    and not newer(features.revision, known["revision"]))
-        no_upload = "--no-upload" if not upload else "record current" if current else None
+        no_upload = ("--no-upload" if not upload else "compact owner guide" if native_dm
+                     else "record current" if current else None)
         recorded, explicit = known.get("media"), media
 
         def render(skip: Optional[str]) -> tuple:
             """(record, upload report, media shown, page); uploads only when `skip` is None."""
             record, report = upload_media(commons, features, recorded, explicit, skip)
             shown = clean_media(record, features)
-            return record, report, shown, render_page(name, core, audience, agent, prompts, roles, features, shown)
+            return record, report, shown, render_page(
+                name, core, audience, agent, features=features, media=shown, native_dm=native_dm)
 
         # Until a page is about to be written it is rendered from the media already recorded or
         # given: a run that skips, keeps the page or stops on its size uploads nothing.
@@ -918,7 +1032,7 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
         kind = step["kind"]
         if step["action"] in ("create", "resume"):
             record, uploads, media, page = render(no_upload)
-            entry = _entry(None, page, features, prompts, roles, record, audience)
+            entry = _entry(None, page, features, record, audience, native_dm)
             op = step.get("operation_id") or f"tutorial-{uuid.uuid4().hex}"
             first, earlier = chunks(page, piece_limit(commons.env))[0], rooms.get(commons.room, {}).get("before")
             journal = _journal(entry, first, page, None, name, core, audience, agent, mode="fill")
@@ -968,14 +1082,14 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             else:
                 # Every call of the rewrite checks the page it expects and is read back; a run cut
                 # short finishes or stands aside from the call the journal recorded.
-                entry = _entry(kind, page, features, prompts, roles, record, audience)
+                entry = _entry(kind, page, features, record, audience, native_dm)
                 _record(marker, rooms, commons.room,
                         _journal(entry, current, page, known, name, core, audience, agent, env=commons.env))
                 action = "updated" if _advance(commons, marker, rooms, commons.room) == "finished" else "kept"
         # A page equal to this run's render records its inputs (a revision-only bump catches up);
         # a gated unchanged or kept run records nothing: inputs that were not applied stay out.
         if action in ("created", "updated") or action == "unchanged" and current == page:
-            _record(marker, rooms, commons.room, _entry(kind, page, features, prompts, roles, record, audience))
+            _record(marker, rooms, commons.room, _entry(kind, page, features, record, audience, native_dm))
     result = {"ok": True, "action": action, "kind": kind, "summoned": False, "revision": features.revision,
               "media": sorted(media), "upload": uploads}
     if adopted:
@@ -1076,11 +1190,11 @@ def _workspace() -> Path:
     return resolve_workspace()
 
 
-def _personal_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--prompts", type=Path, help="JSON object of tailored prompts by slot ("
-                        + ", ".join(PROMPT_SLOTS) + "); bad or missing entries keep the default")
-    parser.add_argument("--roles", default="", help="the first-contact \"I picked: ...\" payload as given, "
-                        "e.g. \"Founder, Product Manager.\" (labels, or slugs)")
+def _personal_args(parser: argparse.ArgumentParser, *, local: bool = True) -> None:
+    parser.add_argument("--prompts", type=Path, help=("JSON object of local preview prompts by slot: "
+                        + ", ".join(PROMPT_SLOTS)) if local else "legacy option; ignored when publishing")
+    parser.add_argument("--roles", default="", help="optional role labels for a local preview"
+                        if local else "legacy option; ignored when publishing")
     parser.add_argument("--media", type=Path, metavar="PATH",
                         help="JSON object {asset name: \"mxc://...\"}: the room media to point those "
                              "screenshots at, over any upload; an asset not mapped is inlined from its "
@@ -1102,8 +1216,8 @@ def publish_all_rooms(args: argparse.Namespace, raw: List[str]) -> int:
     features, _ = resolve_list(args.feature_list, lambda s: print(s, file=sys.stderr))
     results, worst = {}, 0
     for room, entry in sorted(load_marker(marker_path(_workspace())).items()):
-        if entry.get("state") == "complete" and entry.get("revision") and not newer(features.revision,
-                                                                                     entry["revision"]):
+        if (not _needs_privacy_migration(entry) and entry.get("state") == "complete"
+                and entry.get("revision") and not newer(features.revision, entry["revision"])):
             # Current by its record: nothing a run could write, so no room call is made.
             results[room] = {"code": 0, "ok": True, "action": "unchanged", "kind": entry.get("kind"),
                              "revision": features.revision, "checked": "marker"}
@@ -1133,7 +1247,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub = ap.add_subparsers(dest="command", required=True)
     r = sub.add_parser("render", help="print the page's HTML")
     r.add_argument("--name", required=True,
-                   help="the agent's own name; auto: its Matrix profile name, else its mxid's localpart")
+                   help="the agent's own name; auto: its display name, else \"your agent\"")
     r.add_argument("--agent-mxid", help="with --name auto: this agent's mxid (default $AGENT_MXID or the "
                                         "channel env file's)")
     r.add_argument("--audience", choices=AUDIENCES, default="dm",
@@ -1146,10 +1260,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--room", required=True)
     u = sub.add_parser("publish", help="create the page in this room, or refresh the one already there")
     u.add_argument("--room", help="the owner's DM room id (default: the setup app's saved inputs)")
-    u.add_argument("--name", default="auto",
-                   help="the agent's own name; auto (default): its Matrix profile name, else its mxid's "
-                        "localpart")
-    u.add_argument("--agent-mxid", help="with --name auto: this agent's mxid")
+    u.add_argument("--name", default="auto", help="legacy option; published pages remain generic")
+    u.add_argument("--agent-mxid", help="this agent's mxid, for the page ownership marker")
     u.add_argument("--owner", help="the owner's mxid; summoned to the page when it is created")
     u.add_argument("--core", choices=CORES + ("auto",), default="auto",
                    help="the Sutando core (default auto: what the engine resolves); a step naming a "
@@ -1157,14 +1269,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     u.add_argument("--audience", choices=AUDIENCES, default=None,
                    help="dm: the owner's DM; room: any other room, where the page says \"your agent\" "
                         "(default: the audience recorded for the room, else dm)")
-    _personal_args(u)
+    _personal_args(u, local=False)
     u.add_argument("--summon", action="store_true", help="summon the owner on a refresh too")
     u.add_argument("--no-upload", action="store_true",
                    help="upload no screenshot to the room's media: an asset the room has no recorded "
                         "media for is inlined from its fallback file")
     u.add_argument("--if-newer", action="store_true",
                    help="rewrite a complete page only when the feature list's revision is newer than the "
-                        "page's (a pass after an engine update); the prompts it was built with are kept")
+                        "page's (a pass after an engine update); the body remains generic")
     u.add_argument("--all-rooms", action="store_true",
                    help="with --if-newer: run once in every room the marker has an entry for (the pass "
                         "after an engine update)")
@@ -1187,7 +1299,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "render":
         agent = (args.agent_mxid or agent_mxid() or "").strip()
         try:
-            name = clean_name(resolve_name(args.name, agent))
+            name = resolve_name(args.name, agent)
+            name = clean_name(name or "your agent" if args.name == "auto" else name)
             features, listed = resolve_list(args.feature_list, lambda s: print(s, file=sys.stderr))
             prompts = load_prompts(args.prompts, tour_page.prompt_slots(features))
             core = detect_core() if args.core == "auto" else args.core
@@ -1226,31 +1339,33 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 4
     commons, marker = Commons(script, args.room, env), marker_path(_workspace())
     had_entry = args.room in load_marker(marker)
+    dm_room = inputs.get("room")
+    if not had_entry and (args.owner or args.audience == "dm"):
+        dm_room = args.room
     try:
         # A run cut short in this room is settled first, before this run's name, list, prompts or
         # media are even looked at; settling it is then this run's whole work.
-        result = recover(commons, marker, args.owner)
+        result = recover(commons, marker, args.owner, defer_legacy=True)
     except (PublishError, ValueError) as exc:
         print(json.dumps({"ok": False, "reason": redact(str(exc), env)}))
         return 4
     if result is None:
         try:
-            name = clean_name(resolve_name(args.name, agent))
             features, listed = resolve_list(args.feature_list, lambda s: print(s, file=sys.stderr))
-            prompts = load_prompts(args.prompts, tour_page.prompt_slots(features))
             media = load_media(args.media)
         except ValueError as exc:
             print(f"getting_started: {exc}", file=sys.stderr)
             return 2
         try:
-            result = publish(commons, marker, name, args.owner, args.summon,
+            result = publish(commons, marker, GENERIC_NAME, args.owner, args.summon,
                              detect_core() if args.core == "auto" else args.core, args.audience,
-                             agent, prompts, args.roles, features, args.if_newer, media, inputs.get("room"),
-                             had_entry, aliases=aliases, upload=not args.no_upload)
+                             agent, features=features, if_newer=args.if_newer, media=media,
+                             dm_room=dm_room, had_entry=had_entry,
+                             aliases=aliases, upload=not args.no_upload)
         except (PublishError, ValueError) as exc:
             print(json.dumps({"ok": False, "reason": redact(str(exc), env)}))
             return 4
-        result = {**result, "name": name, "list": listed}
+        result = {**result, "name": GENERIC_NAME, "list": listed}
     if result["action"] == "resumed":
         print(f"getting_started: finished the rewrite of {result['kind']} in {args.room} that an earlier run "
               "left cut short, from its record; this run's own inputs were not applied; run again to apply them",

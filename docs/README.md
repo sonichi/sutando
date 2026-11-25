@@ -79,6 +79,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Workspace two-space model](workspace-design.md)
 - [Core health verdict + severity gate](design-core-health-verdict.md)
 - [Health snapshot: `GET /health`](health-snapshot.md)
+- [Core recovery record (`core_recovery.v1`)](core-recovery-record.md)
 - [Pointer Teacher design](pointer-teacher-design.md)
 - [Credential resolution by capability (G8)](design-credential-capability-resolver.md)
 - [holder_lock: the one flock-and-holder primitive](design-holder-lock.md)

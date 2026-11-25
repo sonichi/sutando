@@ -72,8 +72,13 @@ def unattributed_429(now: float, ago: float = 1) -> dict:
     return rec
 
 
+# The clock a test class runs on: an owner's reply is stamped "now" on it, as the gateway stamps it.
+_STAMP = [None]
+
+
 def owner_task(tasks: Path, name: str, body: str, tier: str = "owner",
-               stamp: str = "2099-01-01T00:00:00Z") -> Path:
+               stamp: str = None) -> Path:
+    stamp = stamp or iso(_STAMP[0] if _STAMP[0] is not None else time.time())
     path = tasks / f"{name}.txt"
     path.write_text(f"id: {name}\nsource: ag2space\ntimestamp: {stamp}\naccess_tier: {tier}\ntask: {body}\n")
     return path
@@ -95,6 +100,14 @@ class Classifier(unittest.TestCase):
         for text in ("", "API Error: 500 internal server error", "Segmentation fault",
                      "fetch failed", "The core exited with status 1"):
             self.assertIsNone(clh.classify_text(text, now), text)
+
+    def test_the_limit_menu_alone_is_a_usage_limit(self):
+        # 2026-11-24 08:26 UTC on the VM: the hold took the bare menu as a rate limit, so no quota card.
+        menu = ("❯ /rate-limit-options\nWhat do you want to do?\n❯ 1. Stop and wait for limit to reset\n"
+                "  2. Wait here, then continue automatically at Nov 28 at 1pm\n  3. Switch to usage credits\n"
+                "Enter to confirm · Esc to cancel\n")
+        self.assertEqual(clh.classify_text(menu, time.time()).kind, "usage-limit")
+        self.assertEqual(clh.classify_text("API Error: 429 rate limited", time.time()).kind, "rate-limit")
 
     def test_reset_from_cli_text(self):
         at = datetime(2026, 10, 17, 10, 0, tzinfo=timezone.utc).timestamp()
@@ -317,6 +330,8 @@ class Launcher(unittest.TestCase):
             "ANTHROPIC_BASE_URL": "http://127.0.0.1:9", "SUTANDO_TEST_MODE": "1",
             "SUTANDO_WORKSPACE": str(self.ws), "SUTANDO_RESTART_GRACE_S": "1",
             "SUTANDO_TMUX_SOCKET": str(td / "run" / "tmux.sock"),
+            # The held inbox would outlive the test and run the real launcher (core_held_inbox.py).
+            "SUTANDO_NO_HELD_INBOX": "1",
         }
 
     def tearDown(self):
@@ -500,6 +515,19 @@ class EdgePaths(unittest.TestCase):
         lim = clh.record_evidence(rec, now)
         self.assertEqual((lim.kind, lim.reset_at), ("rate-limit", now - 1 + 90))
 
+    def test_a_late_429_from_another_account_is_not_this_seats_limit(self):
+        now, a, b = 1_800_000_000.0, "a" * 16, "b" * 16
+        rec = dict(limited_record(now), account=f"acct_{a[:6]}")
+        rec["recent_rejections"][0]["account"] = f"acct_{a[:6]}"
+        self.assertIsNotNone(clh.record_evidence(rec, now, a), "the record's own account")
+        self.assertIsNone(clh.record_evidence(rec, now, b), "A's 429 landed after the seat switched to B")
+        rec["account"] = f"acct_{b[:6]}"
+        self.assertIsNone(clh.record_evidence(rec, now), "B's record: A's late 429 is not in its ledger")
+        self.assertIsNone(clh.record_evidence(limited_record(now), now, b), "unbound: not this known seat's")
+        self.assertIsNotNone(clh.record_evidence(limited_record(now), now), "the seat's account unknown: as before")
+        rec["account"] = f"acct_{a[:6]}"
+        self.assertIsNone(clh.record_evidence(rec, now), "labeled, but the seat's account is unread: diagnostic only")
+
     def test_transcript_unreadable_and_odd_lines(self):
         now = time.time()
         proj = self.ws / "projects"
@@ -629,6 +657,8 @@ class OwnerRecovery(unittest.TestCase):
         self.switch.write_text(f'#!/bin/bash\necho "$@" >> {self.calls}\nexit 0\n')
         self.switch.chmod(0o755)
         self.now = 1_800_000_000.0
+        _STAMP[0] = self.now
+        self.addCleanup(_STAMP.__setitem__, 0, None)
         clh.decide(self.ws, self.now, quota=limited_record(self.now))
 
     def tearDown(self):
@@ -725,7 +755,15 @@ class AccountChange(unittest.TestCase):
         self.cfg = self.ws / "claude-config"
         self.cfg.mkdir()
         self.now = time.time()
-        (self.ws / "state" / "quota-state.json").write_text(json.dumps(limited_record(self.now)))
+        (self.ws / "state" / "quota-state.json").write_text(json.dumps(self.a_record(self.now)))
+
+    def a_record(self, now: float) -> dict:
+        """Account A's refusal, labeled by the proxy with the account its request was sent with."""
+        label = clh.qa.account_label(clh.account_digest(
+            {"accountUuid": "acct-a", "organizationUuid": "org-acct-a", "emailAddress": "a@example.com"}))
+        rec = dict(limited_record(now), account=label)
+        rec["recent_rejections"] = [dict(r, account=label) for r in rec["recent_rejections"]]
+        return rec
 
     def tearDown(self):
         self.td.cleanup()
@@ -753,6 +791,65 @@ class AccountChange(unittest.TestCase):
         self.assertIsNone(clh.active_hold(self.ws))
         self.assertEqual(self.gate(), 0, "the old account's evidence re-armed the hold")
 
+    def test_a_live_core_held_under_one_account_is_released_once_it_is_on_another(self):
+        """VM 2026-11-23: the core stayed paused after the owner switched to an account with quota.
+        The monitor lifts the hold as soon as the account in use is not the one the hold was seen under."""
+        import os
+        from unittest import mock
+        self.sign_in("acct-a", "a@example.com")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}):
+            clh.hold_while_wedged(self.ws, "You've hit your usage limit · resets 3pm", self.now)
+            self.assertEqual(clh.read_hold(self.ws)["status"], "held")
+            self.assertIsNone(clh.release_on_account_change(self.ws, self.now + 1), "the same account stays held")
+            self.sign_in("acct-b", "b@example.com")
+            released = clh.release_on_account_change(self.ws, self.now + 2)
+        self.assertEqual((released["status"], released["cleared_by"]), ("cleared", "account-change"))
+
+    def test_a_limit_on_screen_is_the_running_cores_account_not_the_config_switched_to(self):
+        """VM 2026-11-24: the desktop wrote account B into the config (no restart yet); the core still
+        running on A hit A's limit on screen; the hold was recorded under B, and every launch on B was
+        refused. The screen's limit belongs to the account the core was launched with."""
+        import os
+        from unittest import mock
+        self.sign_in("acct-a", "a@example.com")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}):
+            a = clh.launch_identity(self.ws)[1]
+        clh.record_launch_account(self.ws, a, self.now)   # the core was launched on A
+        self.assertEqual(clh.running_account(self.ws), a)
+        self.sign_in("acct-b", "b@example.com")       # the config names B; the core still runs A
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}):
+            clh.hold_while_wedged(self.ws, "You've hit your weekly limit · resets Nov 28 at 1pm (UTC)", self.now)
+            hold = clh.read_hold(self.ws)
+            self.assertEqual((hold["status"], hold["account"]), ("held", a), "A's limit, recorded under A")
+            self.assertNotEqual(hold["account"], clh.launch_identity(self.ws)[1])
+        self.assertEqual(self.gate(), 0, "the restart on B is not held by A's limit")
+        self.assertNotEqual(clh.running_account(self.ws), a, "the gate keeps the account it launched (B)")
+
+    def test_a_launch_account_that_cannot_be_kept_or_read_is_none(self):
+        from unittest import mock
+        clh.record_launch_account(self.ws, "")
+        with mock.patch.object(clh, "write_status", side_effect=OSError):
+            clh.record_launch_account(self.ws, "acct-a", self.now)
+        self.assertIsNone(clh.running_account(self.ws))
+
+    def test_with_no_launch_on_record_the_config_account_is_used_as_before(self):
+        import os
+        from unittest import mock
+        self.sign_in("acct-a", "a@example.com")
+        self.assertIsNone(clh.running_account(self.ws))
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}):
+            clh.hold_while_wedged(self.ws, "You've hit your usage limit · resets 3pm", self.now)
+            self.assertEqual(clh.read_hold(self.ws)["account"], clh.launch_identity(self.ws)[1])
+
+    def test_a_hold_with_no_account_or_an_unreadable_one_now_is_left_alone(self):
+        t = self.now
+        clh._write_hold(self.ws, {"status": "held", "kind": "usage-limit", "model": None, "evidence_at": t,
+                                  "set_at": t, "until": t + 600, "strikes": 1, "reason": "paused"})
+        self.assertIsNone(clh.release_on_account_change(self.ws, t, account="B"))
+        clh._write_hold(self.ws, dict(clh.read_hold(self.ws), account="A"))
+        self.assertIsNone(clh.release_on_account_change(self.ws, t, account=""))
+        self.assertEqual(clh.read_hold(self.ws)["status"], "held")
+
     def test_a_limit_hit_before_any_hold_is_not_pinned_on_the_account_signed_in_next(self):
         """The owner's report: account A ran with no hold on record, hit its limit and the core
         died; the owner signed in to account B before the next launch. The gate had never
@@ -767,7 +864,7 @@ class AccountChange(unittest.TestCase):
                          "a launch with no hold must still leave its account on record")
         self.assertIsNone(clh.active_hold(self.ws))
         self.assertIsNone(clh.binding_hold(self.ws))
-        quota.write_text(json.dumps(limited_record(time.time())))     # A is refused; the core dies
+        quota.write_text(json.dumps(self.a_record(time.time())))     # A is refused; the core dies
         self.sign_in("acct-b", "b@example.com")                       # the owner signs in to B
         self.assertEqual(self.gate(), 0, "account A's limit held account B, which had quota")
         self.assertIsNone(clh.active_hold(self.ws))
@@ -779,7 +876,7 @@ class AccountChange(unittest.TestCase):
         quota.unlink()
         self.sign_in("acct-a", "a@example.com")
         self.assertEqual(self.gate(), 0)
-        quota.write_text(json.dumps(limited_record(time.time())))
+        quota.write_text(json.dumps(self.a_record(time.time())))
         self.assertEqual(self.gate(), clh.HOLD_EXIT, "the account that hit the limit is the one held")
         self.assertEqual(clh.read_hold(self.ws)["account"], clh.account_fingerprint(str(self.cfg)))
 
@@ -853,9 +950,17 @@ class AccountChange(unittest.TestCase):
         (self.cfg / ".claude.json").write_text(json.dumps({"oauthAccount": {}}))
         self.assertEqual(self.gate(), clh.HOLD_EXIT)
 
-    def test_a_hold_without_an_account_still_binds(self):
-        self.assertFalse(clh.decide(self.ws, self.now).launch)
-        self.assertFalse(clh.decide(self.ws, self.now + 1, launch_account="abc").launch)
+    def test_a_hold_set_while_the_account_was_unread_binds_no_account_read_since(self):
+        t = self.now
+        self.assertTrue(clh.decide(self.ws, t, quota=self.a_record(t)).launch,
+                        "a labeled refusal is diagnostic only while the core's account is unread")
+        self.assertFalse(clh.decide(self.ws, t + 1, quota=limited_record(t)).launch, "an unlabeled one: as before")
+        self.assertTrue(clh.read_hold(self.ws)["account_unread"])
+        self.assertFalse(clh.decide(self.ws, t + 2, quota=limited_record(t)).launch, "still unread: still held")
+        b = clh.account_digest({"accountUuid": "acct-b", "organizationUuid": "org-acct-b", "emailAddress": "b@example.com"})
+        self.assertTrue(clh.decide(self.ws, t + 3, quota=limited_record(t), launch_account=b).launch,
+                        "an account read since is not held by a hold that never knew whose limit it was")
+        self.assertIsNone(clh.active_hold(self.ws, t + 4))
 
     def decide(self, at: float, evidence_at: float, account: str) -> "clh.Decision":
         return clh.decide(self.ws, at, quota=limited_record(at, ago=at - evidence_at), launch_account=account)
@@ -923,6 +1028,8 @@ class OwnerActionCrash(unittest.TestCase):
         self.switch.write_text(f'#!/bin/bash\necho "$@" >> {self.calls}\nexit 0\n')
         self.switch.chmod(0o755)
         self.now = 1_800_000_000.0
+        _STAMP[0] = self.now
+        self.addCleanup(_STAMP.__setitem__, 0, None)
         self.rec = limited_record(self.now)
         clh.decide(self.ws, self.now, quota=self.rec)
 
@@ -944,10 +1051,10 @@ class OwnerActionCrash(unittest.TestCase):
             raise Crash()
         real_record = clh._write_hold
 
-        def record_crashing(ws, hold):
+        def record_crashing(ws, hold, seat=None):
             if hold.get("actions"):
                 raise Crash()
-            return real_record(ws, hold)
+            return real_record(ws, hold, seat)
         patch = {"answer": mock.patch.object(local_record, "write_text_whole", side_effect=write_crashing),
                  "clear": mock.patch.object(clh, "clear", side_effect=clear_crashing),
                  "record": mock.patch.object(clh, "_write_hold", side_effect=record_crashing)}[point]
@@ -990,10 +1097,10 @@ class OwnerActionCrash(unittest.TestCase):
         owner_task(self.ws / "tasks", "task-9", "retry now")
         real_mark = clh._mark
 
-        def mark_crashing(ws, task, step):
+        def mark_crashing(ws, task, step, seat=None):
             if step == "answered":
                 raise Crash()
-            return real_mark(ws, task, step)
+            return real_mark(ws, task, step, seat)
         with mock.patch.object(clh, "_mark", side_effect=mark_crashing), self.assertRaises(Crash):
             clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=None)
         month = self.ws / "results" / "archive" / "2026-10"
@@ -1006,11 +1113,33 @@ class OwnerActionCrash(unittest.TestCase):
         self.assertFalse((self.ws / "tasks" / "task-9.txt").exists())
 
     def test_crash_after_the_switch_before_the_record(self):
-        # Nothing durable says the switch ran, so the next pass runs it again: the same model,
-        # written to the same settings key, which is harmless. The owner still gets one answer.
-        text = self._crash_then_revive("switch to sonnet", "record")
-        self.assertIn("sonnet", text)
-        self.assertEqual(self.calls.read_text().split(), ["sonnet", "--offline"] * 2)
+        # The reply was claimed durably before the switch ran (recovery_gate), so a crash before
+        # its record is an interruption: the next passes say so, and the switch never runs twice.
+        from unittest import mock
+        owner_task(self.ws / "tasks", "task-9", "switch to sonnet")
+        real_record = clh._write_hold
+
+        def record_crashing(ws, hold, seat=None):
+            if hold.get("actions"):
+                raise Crash()
+            return real_record(ws, hold, seat)
+        with mock.patch.object(clh, "_write_hold", side_effect=record_crashing), self.assertRaises(Crash):
+            clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=str(self.switch))
+        for minute in (2, 4):
+            clh.handle_owner_actions(self.ws, self.now + minute * 60, switch_cmd=str(self.switch))
+        self.assertEqual(self.calls.read_text().split(), ["sonnet", "--offline"], "at most one execution")
+        text = (self.ws / "results" / "task-9.txt").read_text()
+        self.assertIn("interrupted", text)
+        self.assertFalse((self.ws / "tasks" / "task-9.txt").exists(), "the core would act on it again")
+
+    def test_an_expired_reply_after_startup_runs_nothing(self):
+        # The launcher's startup sweep goes through the same gate as the live monitor.
+        owner_task(self.ws / "tasks", "task-12", "switch to sonnet", stamp=iso(self.now + 1))
+        later = self.now + 20 * 60
+        self.assertIsNotNone(clh.active_hold(self.ws, later), "the hold still stands when the core starts")
+        self.assertEqual(clh.handle_owner_actions(self.ws, later, switch_cmd=str(self.switch)), [])
+        self.assertFalse(self.calls.exists() and self.calls.read_text().strip(), "an expired reply ran")
+        self.assertIn("more than 10 minutes old", (self.ws / "results" / "task-12.txt").read_text())
 
 
 class NoticeRetry(unittest.TestCase):
@@ -1278,6 +1407,8 @@ class WitnessFindings(unittest.TestCase):
         self.switch.write_text(f'#!/bin/bash\necho "$@" >> {self.calls}\nexit 0\n')
         self.switch.chmod(0o755)
         self.now = 1_800_000_000.0
+        _STAMP[0] = self.now
+        self.addCleanup(_STAMP.__setitem__, 0, None)
         clh.decide(self.ws, self.now, quota=limited_record(self.now))
 
     def tearDown(self):
@@ -1518,6 +1649,8 @@ class QuotaAllowed(unittest.TestCase):
         self.ws = Path(self.td.name)
         (self.ws / "state").mkdir()
         self.now = 1_800_000_000.0
+        _STAMP[0] = self.now
+        self.addCleanup(_STAMP.__setitem__, 0, None)
 
     def tearDown(self):
         self.td.cleanup()

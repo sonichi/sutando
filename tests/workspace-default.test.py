@@ -331,23 +331,6 @@ class TestInRepoNotesMigration(unittest.TestCase):
         self.assertTrue(moved_1)
         self.assertFalse(moved_2)  # second run finds in-repo notes/ empty (file moved)
 
-    @unittest.skip(
-        "#1169: auto-migration disabled from resolve_workspace(). "
-        "_migrate_inrepo_notes function itself is still tested directly "
-        "above; the auto-dispatch is now opt-in via the sutando-migrate CLI "
-        "(follow-up PR)."
-    )
-    def test_resolve_workspace_runs_inrepo_notes_migration_when_env_set(self):
-        # End-to-end: resolve_workspace called with env-set workspace, in-repo
-        # has notes, migration runs on the way through.
-        self._seed_inrepo_notes("e2e.md")
-        with patch.object(workspace_default, "_legacy_repo_root", return_value=self.repo_root):
-            ws = resolve_workspace(migrate=True)
-        self.assertEqual(ws, self.workspace)
-        self.assertTrue((self.workspace / "notes" / "e2e.md").exists())
-        self.assertFalse((self.repo_root / "notes" / "e2e.md").exists())
-
-
 class TestInRepoBuildLogMigration(unittest.TestCase):
     """Tests for `_migrate_inrepo_build_log` — moves build_log.md from repo
     root to workspace (parallel to _migrate_inrepo_notes but single-file)."""
@@ -412,79 +395,6 @@ class TestInRepoBuildLogMigration(unittest.TestCase):
         self.assertFalse(moved_2)
         # Workspace still has the FIRST content (second run skipped via sentinel).
         self.assertEqual((self.workspace / "build_log.md").read_text(), "once")
-
-    @unittest.skip(
-        "#1169: auto-migration disabled from resolve_workspace(). "
-        "_migrate_inrepo_build_log function itself is still tested directly "
-        "above; the auto-dispatch is now opt-in via the sutando-migrate CLI "
-        "(follow-up PR)."
-    )
-    def test_resolve_workspace_runs_build_log_migration_when_env_set(self):
-        (self.repo_root / "build_log.md").write_text("e2e content")
-        with patch.object(workspace_default, "_legacy_repo_root", return_value=self.repo_root):
-            ws = resolve_workspace(migrate=True)
-        self.assertEqual(ws, self.workspace)
-        self.assertTrue((self.workspace / "build_log.md").exists())
-        self.assertFalse((self.repo_root / "build_log.md").exists())
-
-    @unittest.skip(
-        "#1169: auto-migration disabled from resolve_workspace(). "
-        "_migrate_from_legacy + _migrate_inrepo_build_log are still tested "
-        "directly above; the env-unset auto-dispatch is now opt-in via "
-        "sutando-migrate CLI (follow-up PR)."
-    )
-    def test_legacy_install_env_unset_build_log_migrates_after_dirs(self):
-        """Corner case Mini flagged in PR #859 review:
-          - Legacy install: repo has tasks/, results/, state/ with content
-          - env SUTANDO_WORKSPACE unset
-          - New default doesn't yet exist
-          - build_log.md ALSO at repo root
-
-        Expected sequence inside resolve_workspace():
-          1. _migrate_from_legacy fires (env unset + target absent + runtime
-             evidence) → moves tasks/results/state to target.
-          2. _migrate_inrepo_build_log fires after (env-unset path also calls it,
-             per v4 of _migrate_inrepo_build_log) → sees workspace now exists,
-             workspace has no build_log.md yet, repo has one → migrates it.
-
-        Mini's concern was that step-2 might "skip (collision)" because step-1
-        created the target dir. This test pins the actual behavior: build_log
-        DOES migrate (target check is against the FILE workspace/build_log.md,
-        not the dir).
-        """
-        # Drop env so the unset-branch of resolve_workspace executes.
-        self._saved_env = os.environ.pop("SUTANDO_WORKSPACE", None)
-        try:
-            legacy = Path(tempfile.mkdtemp(prefix="ws-mini-nit-legacy-"))
-            target = Path(tempfile.mkdtemp(prefix="ws-mini-nit-target-"))
-            target.rmdir()  # _migrate_from_legacy bails if target exists+nonempty
-            # Seed legacy: runtime dirs with content + build_log at root.
-            (legacy / "tasks").mkdir()
-            (legacy / "tasks" / "task-1.txt").write_text("legacy task")
-            (legacy / "results").mkdir()
-            (legacy / "results" / "task-1.txt").write_text("legacy result")
-            (legacy / "state").mkdir()
-            (legacy / "state" / "x.json").write_text("{}")
-            (legacy / "build_log.md").write_text("# legacy build log\nimportant\n")
-            with patch.object(workspace_default, "_legacy_repo_root", return_value=legacy), \
-                 patch.object(workspace_default, "default_workspace_dir", return_value=target):
-                ws = resolve_workspace(migrate=True)
-            self.assertEqual(ws, target)
-            # Runtime dirs landed at target.
-            self.assertTrue((target / "tasks" / "task-1.txt").exists())
-            self.assertTrue((target / "results" / "task-1.txt").exists())
-            self.assertTrue((target / "state" / "x.json").exists())
-            # AND build_log.md ALSO migrated — not stranded.
-            self.assertTrue((target / "build_log.md").is_file())
-            self.assertEqual(
-                (target / "build_log.md").read_text(),
-                "# legacy build log\nimportant\n",
-            )
-            self.assertFalse((legacy / "build_log.md").exists())
-        finally:
-            shutil.rmtree(legacy, ignore_errors=True)
-            shutil.rmtree(target, ignore_errors=True)
-
 
 class TestStatusPathHelpers(unittest.TestCase):
     """Tests for `status_path` (write location) and `status_read_path`
@@ -617,49 +527,12 @@ class TestConversationLogMigration(unittest.TestCase):
         self.assertTrue((self.workspace / ".conversation-log-migrated").exists())
 
 
-class TestResolveWorkspaceRunsNewMigrators(unittest.TestCase):
-    """End-to-end: resolve_workspace sweeps root status files + conversation.log
-    on the way through, for both the env-set and default branches."""
-
-    def setUp(self):
-        self._saved_env = os.environ.get("SUTANDO_WORKSPACE")
-        self.workspace = Path(tempfile.mkdtemp(prefix="ws-e2e-"))
-        os.environ["SUTANDO_WORKSPACE"] = str(self.workspace)
-
-    def tearDown(self):
-        if self._saved_env is not None:
-            os.environ["SUTANDO_WORKSPACE"] = self._saved_env
-        elif "SUTANDO_WORKSPACE" in os.environ:
-            del os.environ["SUTANDO_WORKSPACE"]
-        shutil.rmtree(self.workspace, ignore_errors=True)
-
-    @unittest.skip(
-        "#1169: auto-migration disabled from resolve_workspace(). "
-        "_migrate_root_status + _migrate_conversation_log are still tested "
-        "directly above; the auto-dispatch is now opt-in via the "
-        "sutando-migrate CLI (follow-up PR)."
-    )
-    def test_env_set_resolve_runs_status_and_convlog_migration(self):
-        (self.workspace / "core-status.json").write_text('{"status":"idle"}')
-        (self.workspace / "conversation.log").write_text("a turn\n")
-        # Avoid the in-repo notes/build_log migrators touching the real repo.
-        with patch.object(workspace_default, "_legacy_repo_root", return_value=self.workspace):
-            ws = resolve_workspace(migrate=True)
-        self.assertEqual(ws, self.workspace)
-        self.assertTrue((self.workspace / "state" / "core-status.json").is_file())
-        self.assertFalse((self.workspace / "core-status.json").exists())
-        self.assertTrue((self.workspace / "logs" / "conversation.log").is_file())
-        self.assertFalse((self.workspace / "conversation.log").exists())
-
-
 class TestPostMigrationDisableBehavior(unittest.TestCase):
     """Positive assertions on the post-#1169 contract: resolve_workspace()
     leaves legacy sources untouched, emits the notice once when called with
     migrate=True, and stays fully pure (no scan, no stderr) with migrate=False.
 
-    These replace the auto-dispatch tests above. The skipped ones are kept
-    for one release as ratchet documentation; this class is the canonical
-    assertion of the new behavior."""
+    This class is the canonical assertion of the post-#1169 behavior."""
 
     def setUp(self):
         self._saved_env = os.environ.get("SUTANDO_WORKSPACE")

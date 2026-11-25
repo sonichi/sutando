@@ -12,6 +12,8 @@ same fence, then the server's own exit. Stdlib.
 """
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import re
 import shutil
@@ -22,7 +24,8 @@ import sys
 import time
 from pathlib import Path
 
-from ... import connect_common as cm, task_io, tmux_pane_keys, tmux_probe
+from ... import claude_model_switch, connect_common as cm, task_io, tmux_pane_keys, tmux_probe
+from ...file_lock import locked_file
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
 from . import detector, hmac_policy, hold, inbox, trust
 from .shape import (AUTOARM_VAR, HITL_ID_PREFIX, LAUNCHER_LOCK, LOCAL, MIN_TMUX, SESSION_NAME, SOCKET_NAME,
@@ -37,6 +40,14 @@ SERVER_EXIT_S = 20.0
 CONSUMER_WAIT_S = 30.0
 INNER_STOP_S = 120.0
 TITLE_CHANGED = "title changed"
+MODEL_ACCEPT_S = 20.0
+# The names that may be typed, Claude Code's two texts and its input-box check are the core's
+# (src/claude_model_switch.py, bundled verbatim): one source for the skill and for this adapter.
+MODEL_RE, MODEL_SET, MODEL_CONFIRM = claude_model_switch.MODEL_RE, claude_model_switch.MODEL_SET, claude_model_switch.MODEL_CONFIRM
+composer_text, accepted_count = claude_model_switch.composer_text, claude_model_switch.accepted_count
+composer_boxed, composer_typed = claude_model_switch.composer_boxed, claude_model_switch.composer_typed
+MODEL_RECORD = hold.MODEL_RECORD
+switched_model = hold.switched_model
 FIELD_SEP = "|:ag2:|"
 START_COMMAND_RE = re.compile(r'^"?ag2-sparrow-claude-local hold --generation=[0-9a-f]{32} --"?$')
 TMUX_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
@@ -223,8 +234,8 @@ class Tmux:
         except ValueError:
             return None
 
-    def capture(self, pane_id) -> "str | None":
-        r = self.run("capture-pane", "-p", "-t", pane_id, "-S", "-50")
+    def capture(self, pane_id, styled=False) -> "str | None":
+        r = self.run("capture-pane", "-p", *(("-e",) if styled else ()), "-t", pane_id, "-S", "-50")
         return r.stdout if r is not None and r.returncode == 0 else None
 
 
@@ -595,6 +606,72 @@ class Launcher:
         if self.tm.has_session() is True:
             return "kill-session sent but the session still answers after %d s" % SERVER_EXIT_S
         return self.stopped(started)
+
+    def switch_model(self, rec: dict, model: str, confirm=False, wait_s=MODEL_ACCEPT_S) -> "tuple[bool, str]":
+        """`/model <model>` through the fence, then (switched, one line): switched only when the pane
+        shows a NEW "Set model to" line naming this model. A warm session asks first; that dialog is
+        answered once with `confirm`, else cancelled. Nothing is sent to a session whose tuple changed,
+        nor to one whose input box holds a draft or cannot be read: Enter would send the draft."""
+        if not MODEL_RE.match(model or ""):
+            return False, "refused: %r is not a model alias or a claude-* id; nothing sent" % model
+        # One switch at a time per agent: two would read each other's lines as their own.
+        with locked_file(Path(self.root) / "state" / "model-switch.lock"):
+            return self._switch_model(rec, model, confirm, wait_s)
+
+    def _switch_model(self, rec: dict, model: str, confirm, wait_s) -> "tuple[bool, str]":
+        gen, title = rec.get("generation"), rec.get("title_token") or ""
+        if not gen or self.tm.has_session() is not True:
+            return False, "no running session to switch; nothing sent"
+        styled = self.tm.capture(gen["pane_id"], styled=True)
+        draft = composer_text(styled)
+        # An empty reading counts only inside the box's frame: a bare prompt row may be a cut box.
+        if draft is None or not composer_boxed(styled):
+            return False, ("refused: the session does not show its whole input box, so the box cannot be read; "
+                           "nothing sent")
+        # The whole-box reading takes hint wording for a hint; only its styling shows it is one.
+        if draft or composer_typed(styled) != "":
+            return False, "refused: the session's input box holds unsent text; nothing sent"
+        shown = self.tm.capture(gen["pane_id"]) or ""
+        before, other, asked = accepted_count(model, shown), shown.count(MODEL_SET), shown.count(MODEL_CONFIRM)
+
+        def keys(*names):
+            pred = tmux_pane_keys.predicate(gen["nonce"], gen["pane_pid"], gen["session_id"], gen["session_created"],
+                                            title_token=title or None)
+            argv = tmux_pane_keys.fence_keys_argv(self.tm.sock, gen["pane_id"], pred, *names, tmux=self.tm.tmux)
+            try:
+                return self.run(argv, capture_output=True, text=True, timeout=tmux_pane_keys.TIMEOUT_S + 5).returncode
+            except (OSError, subprocess.SubprocessError):
+                return tmux_pane_keys.UNCERTAIN
+
+        rc = keys("/model", "Space", model, "Enter")
+        if rc != 0:
+            return False, self.unsent(gen, title, rc, "/model") or "the session ended before /model; nothing switched"
+        answered, deadline, text = False, time.monotonic() + wait_s, shown
+        while time.monotonic() < deadline:
+            text = self.tm.capture(gen["pane_id"]) or ""
+            if accepted_count(model, text) > before:
+                self.log("model: switched to %s" % model)
+                with contextlib.suppress(OSError):   # the switch happened whether or not it is recorded
+                    path = Path(self.root).joinpath(*MODEL_RECORD)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.with_name(path.name + ".tmp").write_text(json.dumps({"model": model, "at": self.clock()}))
+                    os.replace(path.with_name(path.name + ".tmp"), path)
+                return True, "switched to %s" % model
+            if text.count(MODEL_CONFIRM) > asked and not answered:
+                if not confirm:
+                    left = "" if keys("Escape") == 0 else " Its question may still be on the session's screen."
+                    return False, ("not switched: Claude Code asks to confirm a switch in a running conversation; "
+                                   "repeat with --confirm.%s" % left)
+                # One attempt only: a second Enter after an uncertain one could act on whatever came next.
+                answered, rc = True, keys("Enter")
+                if rc != 0:
+                    return False, (self.unsent(gen, title, rc, "the confirmation")
+                                   or "unconfirmed: the session ended at the confirmation; not known to have switched")
+            self.sleep(0.5)
+        if text.count(MODEL_SET) > other:
+            return False, ("unconfirmed: /model %s was sent but Claude Code reported a different model; "
+                           "nothing recorded" % model)
+        return False, "unconfirmed: /model %s was sent but Claude Code did not report the switch in %d s" % (model, wait_s)
 
     def stopped(self, started) -> str:
         self.log("stopped in %.1f s" % (self.clock() - started))

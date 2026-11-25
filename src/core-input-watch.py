@@ -37,6 +37,9 @@ idle / wedged":
     (any, + gateway down)   →   gateway-down       (gateway probe is bundled-specific)
     (any, + active gate)    →   blocked-known / blocked-human   (net-new: pane classify)
     (idle, + refused turn)  →   blocked-human (turn-rejected)   (net-new: refused_turn)
+    (any, + hook record)    →   a fresh hook "clear" voids only an ambiguous pane reading (unknown,
+                                or a selection with no focused row); a hook "blocked" is
+                                blocked-human (src/core_block_signal.py)
 
 runtime-health.json stays the Console's coarse view (unchanged, its consumers
 untouched); core-supervisor.json is the escalation-facing refinement of the same
@@ -69,7 +72,11 @@ _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
 from gateway_serving import read_verdict as read_gateway_verdict, status_path as gateway_status_path  # noqa: E402
 from worker_auth_state import authenticated_turn, idle_since_sign_in, login_expired, refusal_answered  # noqa: E402
 import cli_wedge  # noqa: E402
+import core_block_signal  # noqa: E402
 import core_gate_notice  # noqa: E402
+import core_limit_hold  # noqa: E402
+import core_quota_notice  # noqa: E402
+import core_recovery_state  # noqa: E402
 import self_opened_gate  # noqa: E402
 import tmux_probe  # noqa: E402
 
@@ -79,6 +86,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -122,8 +130,9 @@ from delivery.pane_gate import (  # noqa: E402
     ADAPTERS, AWAIT_HINT, BORDER_LINE, CLAUDE, CLAUDE_GATE_SIGNATURES, CLAUDE_IDLE,
     COMPOSER_PLACEHOLDER, FABLE_TEXT, SGR_STRIP as _ANSI_SGR, TURN_DONE, TURN_SHORT,
     classify_pane as _pg_classify_pane, composer_text as _pg_composer_text, gate_evidence,
+    slash_menu_gate_rows,
     is_usage_limit, limit_baseline, limit_step, live_tail,
-    prompt_line as _pg_prompt_line, refusal_line, strip_limit_banners,
+    prompt_line as _pg_prompt_line, refusal_line, strip_limit_banners, turn_running,
 )
 
 _FABLE_TEXT = FABLE_TEXT
@@ -164,6 +173,11 @@ _TURN_WINDOW = 40
 # session-limit is a spend/wait decision: never auto-answered, never a login.
 _HUMAN_GATES = {"login", "selection", "permission", "session-limit", "usage-limit", "fable-limit-unfocused",
                 "turn-rejected", "unknown"}
+
+#: A selection is positively identified only by a focused numbered row (Claude's ❯, Codex's ›/»);
+#: a bare "Select" word under a key hint is a guess, like "unknown".
+_FOCUSED_ROW = re.compile(r"^\s*[❯›»]\s*\d+\.\s", re.M)
+_HOOK_KIND = {"permission": "permission", "question": "selection"}
 
 # --- M4 AUTO-ANSWER (Layer 2): the safe key per gate; `answer_step` in the loop sends it
 # once per prompt instance (`--no-auto-answer` disables). Unlisted → None → ESCALATE.
@@ -234,13 +248,9 @@ def auto_answer(kind):
     return _AUTO_ANSWER.get(kind)
 
 
-def classify(pane: str, styled_pane: "str | None" = None):
-    """Return (kind, excerpt) if the pane is awaiting user input, else None.
-
-    `styled_pane` supplies placeholder evidence to the shared filter. It must be
-    the SAME capture as `pane` (e.g. `pane = _ANSI_SGR.sub("", styled_pane)`),
-    so stripping never shifts a line out of the window the two share.
-    Only rows below the last turn spinner / completion line are read (pane_gate.live_tail)."""
+def _live_tails(pane: str, styled_pane: "str | None" = None):
+    """(plain, styled) text of the rows `classify()` reads: the last 14 non-empty rows below
+    the last turn spinner or completion line, the styled one from the same capture."""
     plain_lines = pane.splitlines()
     kept = [i for i, ln in enumerate(plain_lines) if ln.strip()][-14:]
     kept = kept[len(kept) - len(live_tail([plain_lines[i] for i in kept])):]
@@ -249,9 +259,22 @@ def classify(pane: str, styled_pane: "str | None" = None):
     styled_tail = ("\n".join(styled_lines[i] for i in kept)
                    if styled_lines is not None and kept and max(kept) < len(styled_lines)
                    else tail)
+    return tail, styled_tail
+
+
+def classify(pane: str, styled_pane: "str | None" = None):
+    """Return (kind, excerpt) if the pane is awaiting user input, else None.
+
+    `styled_pane` supplies placeholder evidence to the shared filter. It must be
+    the SAME capture as `pane` (e.g. `pane = _ANSI_SGR.sub("", styled_pane)`),
+    so stripping never shifts a line out of the window the two share.
+    Only rows below the last turn spinner / completion line are read (pane_gate.live_tail)."""
+    tail, styled_tail = _live_tails(pane, styled_pane)
+    menu_gates = slash_menu_gate_rows(tail, styled_tail, CLAUDE)
     tail = gate_evidence(tail, styled_tail, CLAUDE)
     if not _AWAIT_HINT.search(tail):
-        return None
+        # Phrase text inside a completion list may be help text: a human looks, no key is sent.
+        return ("unknown", "\n".join(menu_gates)) if menu_gates else None
     # Two gates in one pane (one in scrollback): the live one is nearest the bottom.
     hits = [(m.start(), i, kind) for i, (kind, rx) in enumerate(_SIGNATURES)
             for m in [max(rx.finditer(tail), key=lambda m: m.start(), default=None)] if m]
@@ -274,7 +297,23 @@ def classify(pane: str, styled_pane: "str | None" = None):
     return "unknown", tail
 
 
-def _is_idle_ready(pane: str, runtime: "str | None" = None) -> bool:
+def _ambiguous_gate(kind: str, excerpt: str) -> bool:
+    """A reading the screen only guesses: no named gate, or a selection with no focused row."""
+    return kind == "unknown" or (kind == "selection" and not _FOCUSED_ROW.search(excerpt or ""))
+
+
+def _live_gate(pane: str, styled_pane: "str | None" = None, hook=None):
+    """`classify()`, less a guess the CLI's hooks have just said is not a dialog. A gate the
+    screen names (signature and key hint) stands whatever the hooks say, and so does gate text
+    under a completion-menu row, which classify() sends to a human on purpose."""
+    hit = classify(pane, styled_pane)
+    if hit and hook and hook[0] == core_block_signal.CLEAR and _ambiguous_gate(*hit) \
+            and not slash_menu_gate_rows(*_live_tails(pane, styled_pane), CLAUDE):
+        return None
+    return hit
+
+
+def _is_idle_ready(pane: str, runtime: "str | None" = None, hook=None) -> bool:
     """True when the pane POSITIVELY shows the idle-ready prompt (the bypass /
     for-agents footer) and no gate signature — the core is sitting ready for a
     task. Distinct from `classify(pane) is None`, which is ALSO None for a
@@ -290,7 +329,7 @@ def _is_idle_ready(pane: str, runtime: "str | None" = None) -> bool:
     if adapter is not None and adapter is not CLAUDE:
         state = _pg_classify_pane(pane, adapter).state
         return state == "idle-ready" or (state == "pending" and bool(adapter.idle_ready.search(tail)))
-    return bool(_IDLE.search(tail)) and classify(pane) is None
+    return bool(_IDLE.search(tail)) and _live_gate(pane, hook=hook) is None
 
 
 def _composer_is_empty(pane: str) -> bool:
@@ -399,7 +438,7 @@ def refused_turn(pane: str):
 # runtime-health health string → supervisor state, for the non-gate branches.
 _BASE_TO_STATE = {
     "offline": ("crashed", "core process/session not found"),
-    "needs_login": ("logged-out", "core not authenticated (needs /login)"),
+    "needs_login": ("logged-out", "core not authenticated (needs a sign-in)"),
     "idle": ("idle-ready", "ready for a task"),
     "working": ("running", "actively processing"),
     # Queued tasks held by the pane (a draft, an abnormal frame): visible, never a restart.
@@ -423,7 +462,7 @@ def owes_work(seat, workspace):
 
 
 def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None, runtime=None,
-                  styled_pane: "str | None" = None, limit_stale=False, still_s=None):
+                  styled_pane: "str | None" = None, limit_stale=False, still_s=None, hook=None):
     """Refine runtime-health's coarse `base_health` into a supervisor state.
 
     `base_health` ∈ {offline, needs_login, working, idle, unknown} comes from
@@ -439,18 +478,18 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
     (see `classify()`); omitted it changes nothing else here.
     `limit_stale` (from `limit_step`) drops a limit banner the seat has outrun.
     `still_s` is how long the normalised pane has been unchanged (see `still_step`).
+    `hook` is `core_block_signal.verdict()` for this pane: ("blocked", reason), ("clear", None),
+    or None when no fresh hook record speaks for it (then the pane alone decides, as before).
     """
     if limit_stale and pane:
         pane = strip_limit_banners(pane)
     if base_health == "offline":
         return "crashed", _BASE_TO_STATE["offline"][1], None, None
-    if base_health == "paused":
-        return "blocked-known", _BASE_TO_STATE["paused"][1], None, None
     # An ACTIVE interactive gate in the pane is the finest signal — it distinguishes
     # "sitting at a prompt waiting for input" from the coarse health (e.g. the live
     # /login MENU, which runtime-health's needs_login markers don't match). Check it
     # first so we carry the prompt text + kind for ESCALATE / AUTO-ANSWER.
-    hit = classify(pane, styled_pane) if pane else None
+    hit = _live_gate(pane, styled_pane, hook) if pane else None
     if hit:
         kind, excerpt = hit
         if kind in _HUMAN_GATES:
@@ -473,6 +512,15 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
     if refused:
         kind, line = refused
         return "blocked-human", f"awaiting user: {kind}", line, kind
+    # After the pane: a live core held at its limit screen still shows that screen.
+    if base_health == "paused":
+        return "blocked-known", _BASE_TO_STATE["paused"][1], None, None
+    # A sign-in, refusal or limit (on screen, or a paused queue) outranks a held dialog.
+    if (hook and hook[0] == core_block_signal.BLOCKED and pane
+            and not _is_idle_ready(pane, runtime) and not _turn_moving(pane, prev_pane, still_s, runtime)):
+        kind = _HOOK_KIND.get(hook[1], "permission")
+        tail = "\n".join([ln for ln in pane.splitlines() if ln.strip()][-14:])
+        return "blocked-human", f"awaiting user: {kind} (hook)", tail or None, kind
     if not gateway_alive:
         return "gateway-down", "core up but relay gateway not running", None, None
     state, detail = _BASE_TO_STATE.get(base_health, _BASE_TO_STATE["unknown"])
@@ -485,9 +533,9 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
         # direct evidence over the stale status file: it's idle, not wedged. Only
         # a positive idle match overrides — a no-affordance pane (mid-work or truly
         # frozen) still reads hung, preserving genuine wedge detection.
-        if pane and _is_idle_ready(pane, runtime):
+        if pane and _is_idle_ready(pane, runtime, hook):
             return "idle-ready", _BASE_TO_STATE["idle"][1], None, None
-        if pane and _turn_moving(pane, prev_pane, still_s):
+        if pane and _turn_moving(pane, prev_pane, still_s, runtime):
             return "running", _BASE_TO_STATE["working"][1], None, None
         tail = "\n".join([ln for ln in (pane or "").splitlines() if ln.strip()][-14:])
         if process is None:  # no session observed = no wedge evidence; never RECOVER
@@ -502,10 +550,10 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
 FROZEN_TURN_S = cli_wedge.PROVISIONAL_THRESHOLDS["static_high_conf_s"]
 
 
-def _turn_moving(pane, prev_pane, still_s=None):
+def _turn_moving(pane, prev_pane, still_s=None, runtime=None):
     """A turn in flight whose pane changed since the last poll, or within FROZEN_TURN_S. Clocks
     and spinners are normalised away, so a frozen CLI whose timer still ticks is not motion."""
-    if not cli_wedge.frame_working(pane):
+    if not (cli_wedge.frame_working(pane) or turn_running(pane, ADAPTERS.get(runtime or "", CLAUDE))):
         return False
     if still_s is not None and still_s < FROZEN_TURN_S:
         return True
@@ -632,6 +680,19 @@ def session_runtime(socket, session):
     return out.split("=", 1)[1].strip() or None if out.startswith("SUTANDO_CORE_RUNTIME=") else None
 
 
+def hook_verdict(socket, session, state_dir, now):
+    """`core_block_signal.verdict()` for the core pane, or None when no record speaks for it.
+    With no record for this tmux server (no hooks installed) it makes no tmux call at all."""
+    if not core_block_signal.has_records(state_dir, socket):
+        return None
+    target = cli_wedge.core_target(socket, session)
+    ident = core_block_signal.pane_identity(socket, target) if target else None
+    if ident is None:
+        return None
+    _, pane_id, pane_pid = ident
+    return core_block_signal.verdict(core_block_signal.read(state_dir, socket, pane_id), pane_pid, now)
+
+
 def capture(socket, session):
     """Plain capture. Kept for its own direct tests; the main loop now calls
     `capture_styled()` once and derives this text from it instead (below)."""
@@ -719,7 +780,7 @@ AUTO_ANSWER_CARRY_S = 120.0
 
 # ESCALATE (Layer 3): a blocked core IS a HumanRequirement, so it goes through
 # `src/hitl` — the Manager dedups, the projector renders the card.
-_CHAT_ESCALATE_STATES = {"blocked-human", "logged-out"}
+from hitl.core_card import CARD_STATES as _CHAT_ESCALATE_STATES  # noqa: E402  (read by the relay too)
 #: How long a signed-out reading must hold before it is carded. A refusal or 401 banner
 #: the CLI recovers from on its own (a token refresh, a boot race) clears well inside it.
 LOGIN_CONFIRM_S = 60.0
@@ -732,23 +793,31 @@ DRIVE_SETTLE_S = 15.0
 from prompt_excerpt import prompt_excerpt  # noqa: E402  (shared with core-supervisor-relay)
 
 
-def escalation_message(state, detail, kind, prompt, session=None, runtime=None):
+def escalation_message(state, detail, kind, prompt, session=None, runtime=None, controls=None):
     """The card body. The core is blocked, so this is the only thing that will
-    reach the owner until they act."""
+    reach the owner until they act. `controls`: the recovery ids the card carries, so the
+    copy names those buttons instead of a terminal; a limit's screen is then not quoted, since
+    the CLI's own text there names commands and a purchase the card offers as its own button."""
     head = ("I am blocked and cannot continue without you."
             if state == "blocked-human" else
             "I am signed out and cannot continue without you.")
     lines = [head, "", f"State: {state} — {detail}"]
     if kind and kind != "unknown":
         lines.append(f"Gate: {kind}")
-    excerpt = prompt_excerpt(prompt) if prompt else []
+    limit = is_usage_limit(kind, prompt)
+    excerpt = prompt_excerpt(prompt) if prompt and not (limit and controls) else []
     if excerpt:
         # Plain lines, not a code fence: the card renders text, and the prompt is what the owner
         # needs to read, not the pane's chrome around it.
         lines += ["", "What the terminal is showing:"] + [f"  {ln}" for ln in excerpt]
-    if is_usage_limit(kind, prompt):
-        from hitl.tui_gate import limit_unblock
-        lines += ["", limit_unblock(session, runtime)]
+    if limit:
+        from hitl.tui_gate import limit_unblock, parse_options, safe_limit_options
+        options, caret = parse_options(prompt)
+        menu = bool(controls is not None and caret is not None and safe_limit_options(options))
+        lines += ["", limit_unblock(session, runtime, controls=controls, menu=menu)]
+    elif controls and "restart_core" in controls:
+        lines += ["", "Tap Restart core to start it fresh. To answer the prompt itself, use the "
+                      "Runtime panel in the s.space app on the Mac it runs on."]
     else:
         lines += ["", "Open the Runtime panel (or the core's terminal) and answer it. "
                       "Nothing else I do can clear this one."]
@@ -780,28 +849,47 @@ def _name_seat(req, session, seat):
     req.message = f"{seat} (tmux session {session})\n\n{req.message}"
     req.device = {"id": session, "name": seat}
     req.subject = {**(req.subject or {}), "seat": seat}
+    if (req.subject or {}).get("recovery"):
+        from hitl.recovery import SEAT_MODEL_LOCKED
+        from hitl.tui_gate import RETRY_LINE, RETRY_SEAT_LINE
+        req.message = f"{req.message.replace(RETRY_LINE, RETRY_SEAT_LINE)} {SEAT_MODEL_LOCKED}"
     req.actions = [Action(id=a.id, kind=a.kind, label=f"Open terminal ({session})")
                    if a.kind == "open_terminal" else a for a in req.actions]
     return req
 
 
-def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0, runtime=None):
+def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0, runtime=None,
+             workspace=None):
     """Raise ONE requirement per episode. The Manager dedups on
     (runtime, kind, device) + guard, so the prompt IS the episode key: the same
     prompt returns the same record, a different one mints a new card. A usage
     limit is keyed on the session instead, whatever its screen shows.
+    With `workspace`, the card carries recovery buttons for its session (core or seat).
 
     Returns the requirement, or None when nothing could be raised.
     """
     if manager is None:
         return None
     try:
-        from hitl import tui_gate
-        limit = is_usage_limit(kind, prompt)
+        from hitl import core_card, tui_gate
+        limit = core_card.is_limit_episode(kind, prompt)
+        controls = None
+        if workspace is not None:
+            import recovery_actions
+            controls = recovery_actions.card_controls(workspace, runtime, seat=bool(seat), kind=kind,
+                                                      prompt=prompt, limit=limit)
         req = tui_gate.requirement_for(state, kind, prompt, session, detail,
-                                       escalation_message(state, detail, kind, prompt, session, runtime),
+                                       escalation_message(state, detail, kind, prompt, session, runtime,
+                                                          controls=controls),
                                        runtime=runtime,
-                                       episode=tui_gate.LIMIT_EPISODE if limit else None)
+                                       episode=tui_gate.LIMIT_EPISODE if limit else None,
+                                       guard=core_card.episode_guard(session, state, kind, prompt),
+                                       controls=controls,
+                                       model_names=recovery_actions.model_names(workspace, runtime) if controls else None)
+        if controls and limit and not seat:
+            line = recovery_actions.models_line(workspace, runtime, prompt)
+            if line:
+                req.message = f"{req.message}\n\n{line}"
         if queued:
             req.message = f"{req.message}\n\n{core_gate_notice.card_line(queued)}"
         if seat:
@@ -834,7 +922,7 @@ def card_step(pane_present, state, idle_ticks, stable, settling=False):
     return ("resolve" if idle_ticks >= max(1, int(stable)) else "hold"), idle_ticks
 
 
-def resolve_escalations(manager, session, pane=None, runtime=None):
+def resolve_escalations(manager, session, pane=None, runtime=None, workspace=None):
     """Clear THIS session's requirements once its core is no longer blocked —
     the card says answered because the core moved, not because anyone clicked.
 
@@ -843,7 +931,8 @@ def resolve_escalations(manager, session, pane=None, runtime=None):
     a turn that ran, or output after the refusal (worker_auth_state). A newer prompt, a
     spinner, an empty capture or a health verdict read off another session's status
     file is not "Sutando has continued its work". A usage-limit card clears only once
-    `tui_gate.limit_card_holds` says the limit no longer holds the pane.
+    `tui_gate.limit_card_holds` says the limit no longer holds the pane. A recovery click
+    still owed its receipt is the executor's to close (recovery_actions).
     """
     if manager is None:
         return []
@@ -860,11 +949,89 @@ def resolve_escalations(manager, session, pane=None, runtime=None):
                 continue
             if limit_card_holds(r, pane, runtime):
                 continue
+            if workspace is not None and _awaiting_recovery(workspace, r):
+                continue
             manager.resolve(r.id)   # returns blocked task ids, not a verdict
             done.append(r.id)
         return done
     except Exception as exc:  # noqa: BLE001
         print(f"hitl resolve failed: {exc}", file=_sys.stderr)
+        return []
+
+
+def _awaiting_recovery(workspace, req):
+    import recovery_actions
+    return recovery_actions.awaiting_executor(workspace, req)
+
+
+def recovery_step(manager, workspace, socket, session, runtime, seat, enabled=True, retry_cmd=None):
+    """Run each accepted recovery tap on this session's cards; the core's monitor also keeps the
+    paused card. Returns the keys owed once the pane is idle, or None. Never fatal."""
+    if manager is None or not enabled:
+        return None
+    try:
+        import recovery_actions
+        pending = recovery_actions.has_pending(workspace)
+        brain = recovery_actions.session_env(socket, session, "CLAUDE_CONFIG_DIR") if seat and pending else None
+        target = recovery_actions.Target(workspace, socket, session, seat=seat or None,
+                                         send_key=lambda k: send_keys(socket, session, k), brain=brain,
+                                         retry_cmd=retry_cmd)
+        owed = []
+        recovery_actions.run_pending(manager, target, follow_ups=owed)
+        if not seat:
+            recovery_actions.hold_card_step(manager, workspace, session, runtime,
+                                            queued=core_gate_notice.queued_count(workspace) or 0)
+        return owed[-1] if owed else None
+    except Exception as exc:  # noqa: BLE001
+        print(f"recovery actions failed: {exc}", file=_sys.stderr)
+        return None
+
+
+def models_step(manager, workspace, socket, session, runtime, seat, state, kind, prompt, pane):
+    """Read the runtime's own model list off its picker (runtime_models), opening it once on a
+    core a limit refused, and give the open limit card its model buttons. Never fatal."""
+    try:
+        import recovery_actions
+        import runtime_models
+        got = runtime_models.probe_step(workspace, session, runtime, bool(seat), state,
+                                        is_usage_limit(kind, prompt) and kind == "turn-rejected", pane,
+                                        lambda k: send_keys(socket, session, k))
+        if got in ("ours", "read") and not seat and manager is not None:
+            recovery_actions.refresh_limit_card(manager, workspace, session, runtime)
+        return got
+    except Exception as exc:  # noqa: BLE001
+        print(f"runtime model list failed: {exc}", file=_sys.stderr)
+        return ""
+
+
+#: A session in one of these still needs the owner; anything else is the block having lifted.
+_BLOCKED_STATES = ("blocked-human", "blocked-known", "logged-out", "hung")
+
+
+def verify_step(manager, workspace, session, blocked, state=None, socket=None, seat=None, retry_cmd=None):
+    """After a recovery action, the same card says whether the session is working again (and the
+    waiting work resumed) or still blocked (recovery_actions.verify_step); never a new card. A
+    worker seat passes its pool's `retry_cmd`, the restart an Escape that did not unblock falls back to.
+    Never fatal."""
+    if manager is None:
+        return []
+    try:
+        import recovery_actions
+        target = (recovery_actions.Target(workspace, socket, session, seat=seat, retry_cmd=retry_cmd)
+                  if seat and retry_cmd and socket else None)
+        return recovery_actions.verify_step(manager, workspace, session, blocked, state=state, target=target)
+    except Exception as exc:  # noqa: BLE001
+        print(f"recovery verify failed: {exc}", file=_sys.stderr)
+        return []
+
+
+def crash_loop_step(manager, workspace, session, runtime, last_pane, now):
+    """The core's crash-loop card (core_crash_loop); never fatal to the monitor."""
+    try:
+        import core_crash_loop
+        return core_crash_loop.step(manager, workspace, session, runtime, last_pane, now)
+    except Exception as exc:  # noqa: BLE001
+        print(f"crash-loop card failed: {exc}", file=_sys.stderr)
         return []
 
 
@@ -899,7 +1066,7 @@ def drive_escalations(manager, session, prompt, state, send):
         return []
     acted = []
     try:
-        from hitl import tui_gate
+        from hitl import recovery, tui_gate
         from hitl.manager import POLICY_DECIDER
         from hitl.schema import STATUS_IN_PROGRESS
 
@@ -915,8 +1082,8 @@ def drive_escalations(manager, session, prompt, state, send):
             subj = r.subject or {}
             if (subj.get("source") != _TUI_SOURCE or subj.get("session") != session
                     or r.status != STATUS_IN_PROGRESS or not r.chosen_action
-                    or r.decided_by == POLICY_DECIDER):
-                continue
+                    or r.decided_by == POLICY_DECIDER or recovery.is_recovery(r.chosen_action)):
+                continue  # a recovery click is no keystroke: recovery_step runs it
             keys = tui_gate.keys_for(r, prompt, state)
             if subj.get("driven_at"):
                 # Still the same dialog after the settle window: the keys did not take.
@@ -956,6 +1123,128 @@ def drive_escalations(manager, session, prompt, state, send):
     return acted
 
 
+_REPO = _Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
+
+
+_LIMIT_LINE = tuple(rx for name, rx in cli_wedge.ABNORMAL_PATTERNS if name in cli_wedge.PROVIDER_LIMIT_PATTERNS)
+
+
+def limit_reset(text, now=None):
+    """(words, epoch or None): when the limit banner's own line says it resets; ('', None) when it does
+    not. No other line of the pane is read: none of it may reach the DM."""
+    now = time.time() if now is None else now
+    lines = str(text or "").splitlines()
+    for line in reversed(lines):
+        if any(rx.search(line) for rx in _LIMIT_LINE):
+            at = core_limit_hold.parse_reset(line, now)
+            words = core_quota_notice.reset_from_epoch(at, now) if at else core_quota_notice.reset_from_text(line)
+            if words:
+                return words, at
+            break
+    # The limit menu's own option names the time when the banner does not:
+    # "Wait here, then continue automatically at Nov 28 at 1pm".
+    for line in reversed(lines):
+        if _MENU_RESUME.search(line):
+            at = core_limit_hold.parse_reset(line, now)
+            if at:
+                return core_quota_notice.reset_from_epoch(at, now), at
+    return "", None
+
+
+_MENU_RESUME = re.compile(r"\bcontinue automatically at\b", re.I)
+
+
+def quota_step(quota, limited, text, now=None):
+    """The core's quota notice (core_quota_notice): the account card once per limit, cleared once the
+    pane shows the core idle or working again. Never fatal to the monitor."""
+    if quota is None:
+        return ""
+    try:
+        done = quota.hit(*limit_reset(text, now), tasks=core_quota_notice.owner_waiting(quota.workspace),
+                         credits=core_quota_notice.credits_offered(text, quota.workspace)) \
+            if limited else quota.cleared()
+    except Exception as exc:  # noqa: BLE001
+        done = f"quota-failed ({type(exc).__name__})"
+    if done:
+        print(f"quota: {done}", file=_sys.stderr, flush=True)
+    return done
+
+
+def is_signed_out(state, kind):
+    """A settled reading of the core signed out: its login refused, or Claude's login menu on screen."""
+    return state == "logged-out" or (state in ("blocked-human", "blocked-known") and kind == "login")
+
+
+def signed_out_step(quota, state, kind, runtime, now=None):
+    """While the core (Claude Code) stands signed out, the owner gets the account card the way a usage
+    limit sends it: once when it starts, then once for each owner message that arrives meanwhile
+    (core_quota_notice, why SIGNED_OUT). The episode ends where a limit's does: the pane idle or
+    working again (limit_reply_step). Returns what was done, or ''."""
+    if quota is None or runtime not in (None, "claude") or not is_signed_out(state, kind):
+        return ""
+    try:
+        done = quota.hit(tasks=core_quota_notice.owner_waiting(quota.workspace),
+                         why=core_quota_notice.SIGNED_OUT)
+    except Exception as exc:  # noqa: BLE001 - never let the card take down the monitor
+        done = f"signed-out-card-failed ({type(exc).__name__})"
+    if done:
+        print(f"signed out: {done}", file=_sys.stderr, flush=True)
+    return done
+
+
+def card_replaces_notice(quota, kind, prompt, now=None):
+    """Whether the core's usage-limit screen is told by the account card, posted, in place of the
+    paused notice and the monitor's limit card. A rate limit keeps its notice."""
+    if quota is None or not is_usage_limit(kind, prompt):
+        return False
+    limit = core_limit_hold.classify_text(prompt or "", time.time() if now is None else now)
+    return (limit is None or limit.kind == "usage-limit") and quota.carded()
+
+
+def limit_reply_step(workspace, settled, seen, pane, runtime, now=None, repo=_REPO,
+                     seat=None, label=None, retry_cmd=None, card_surface=False, quota=None):
+    """While a live seat stands at a provider-limit screen, hold it and act on the owner's bare
+    "switch to <model>" / "retry now" replies (core_limit_hold). Once its pane shows it idle or
+    working again, a hold that screen caused is lifted. `settled` and `seen` are (state, kind,
+    prompt) after and before the debounce. The core's seat is `seat` None; a worker seat (its tmux
+    session) acts only with the `retry_cmd` argv its pool injected. The core's `quota` notice, when
+    given, sends the account card for a usage limit in place of the paused notice; a card that cannot
+    be posted leaves the notice to tell it. Returns the reply ids acted on."""
+    if runtime not in (None, "claude"):
+        return []  # the hold, its replies and the model aliases are Claude Code's
+    if seat and not retry_cmd:
+        return []
+    relaunch = ({"command": list(retry_cmd)} if seat else
+                {"launcher": str(repo / "src" / "agent" / "start-cli.sh"),
+                 "switch": str(repo / "scripts" / "switch-model.sh")})
+    try:
+        if not seat and core_limit_hold.release_on_account_change(workspace, now, live=True):
+            print("limit hold lifted: the core is signed in to another account", file=_sys.stderr, flush=True)
+        state, kind, prompt = settled
+        if state == "blocked-human" and is_usage_limit(kind, prompt):
+            carded = False
+            limit = core_limit_hold.classify_text(prompt or "", time.time() if now is None else now)
+            if not seat and quota is not None and (limit is None or limit.kind == "usage-limit"):
+                quota_step(quota, True, prompt, now)
+                carded = card_replaces_notice(quota, kind, prompt, now)
+                if not carded:
+                    quota.yield_to_notice()
+            if core_limit_hold.hold_while_wedged(workspace, prompt, now, seat=seat, seat_label=label,
+                                                 card_surface=card_surface, account_card=carded) is None:
+                return []
+            return core_limit_hold.handle_owner_actions(workspace, now, relaunch=relaunch, seat=seat)
+        seen_state, seen_kind, seen_prompt = seen
+        if pane and pane.strip() and not (seen_state == "blocked-human" and is_usage_limit(seen_kind, seen_prompt)) \
+                and not is_signed_out(seen_state, seen_kind) \
+                and ((_is_idle_ready(pane, runtime) and refused_turn(pane) is None) or cli_wedge.frame_working(pane)):
+            core_limit_hold.release_pane_hold(workspace, now, seat=seat)
+            if not seat:
+                quota_step(quota, False, "", now)
+    except Exception as exc:  # noqa: BLE001 — never let the hold take down the monitor
+        print(f"limit reply step failed: {exc}", file=_sys.stderr)
+    return []
+
+
 def notice_queued(manager, req, workspace, state, kind):
     """Tell each queued task why it is on hold (core_gate_notice); never fatal to the monitor."""
     try:
@@ -971,6 +1260,11 @@ def _atomic_write(path, payload):
     with open(tmp, "w") as f:
         json.dump(payload, f, indent=2)
     os.replace(tmp, path)
+
+
+def _sleep(seconds):
+    """The loop's own wait. A test stubs this one, not time.sleep: libraries the loop calls sleep too."""
+    time.sleep(seconds)
 
 
 def main():
@@ -992,6 +1286,13 @@ def main():
     ap.add_argument("--seat", default="",
                     help="who this pane is, named on every card it raises (default: none)")
     ap.add_argument("--helper-receipt-dir", help="publish an external-helper startup receipt")
+    ap.add_argument("--retry-cmd", default="",
+                    help="a worker seat's restart, as one shell-quoted argv its pool injects; with it "
+                         "the owner's \"retry now\" reply to the seat's limit pause restarts that seat")
+    ap.add_argument("--quota-card-script", default=str(_REPO / "skills" / "account-switch" / "scripts" / "account_card.py"),
+                    help="the core's account card script (default: this checkout's), so a usage-limit "
+                         "screen sends the owner that card whichever launcher started this monitor (one "
+                         "started while the core ran on Codex outlives a switch to Claude Code); '' for none")
     a = ap.parse_args()
     if a.helper_receipt_dir:
         from external_core_helpers import publish
@@ -1028,9 +1329,24 @@ def main():
     banner_baseline = None
     clock = (None, None, None)
     last_runtime = None  # a failed tmux read keeps the last runtime, not "claude"
+    last_live_pane = None
     state_dir = os.path.dirname(os.path.abspath(a.out))
     workspace = _Path(os.path.dirname(state_dir))
+    quota = None
+    if a.quota_card_script and not a.seat and os.path.isfile(a.quota_card_script):
+        def _log(*parts):
+            print(*parts, file=_sys.stderr, flush=True)
+        quota = core_quota_notice.QuotaNotice(
+            workspace, "Claude Code",
+            core_quota_notice.card_sender([_sys.executable, a.quota_card_script], workspace, _log), _log,
+            runtime="claude")
     while True:
+        # Before the capture, so this tick reads the pane a recovery action left.
+        if a.chat_escalation:
+            owed = recovery_step(hitl, workspace, a.socket, a.session, last_runtime, a.seat,
+                                 retry_cmd=shlex.split(a.retry_cmd) if a.retry_cmd else None)
+            if owed:
+                follow_up = {"key": owed, "at": time.time()}
         # One capture, not two: deriving `pane` from `styled_pane` guarantees
         # both views describe the exact same frame (no plain/styled race).
         styled_pane = capture_styled(a.socket, a.session)
@@ -1045,10 +1361,22 @@ def main():
             pane or "", base.get("health", "unknown"),
             gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
             process=(base.get("signals") or {}).get("process", True), prev_pane=prev_pane,
-            runtime=runtime, styled_pane=styled_pane, limit_stale=limit_stale, still_s=still_s)
+            runtime=runtime, styled_pane=styled_pane, limit_stale=limit_stale, still_s=still_s,
+            hook=hook_verdict(a.socket, a.session, state_dir, time.time()))
         prev_pane = pane
+        if pane and pane.strip():
+            last_live_pane = pane
+        if a.chat_escalation and a.auto_answer and models_step(hitl, workspace, a.socket, a.session, runtime,
+                                                               a.seat, state, kind, prompt, pane) == "ours":
+            # The model picker on screen is the one read for the card's model list; it is no gate.
+            if a.once:
+                return
+            _sleep(a.interval)  # pragma: no cover - daemon heartbeat (tests use --once)
+            continue
+        if a.chat_escalation and not a.seat:
+            crash_loop_step(hitl, workspace, a.session, runtime, last_live_pane, time.time())
         clock = gate_clock(clock, state, prompt, time.time())
-        seen_state, seen_prompt = state, prompt  # before the debounce masks a new dialog
+        seen_state, seen_prompt, seen_kind = state, prompt, kind  # before the debounce masks a new dialog
 
         # Debounce prompt escalation: only surface once the SAME prompt persists
         # (not a menu the core is actively navigating through).
@@ -1071,6 +1399,14 @@ def main():
             state, detail, prompt, kind = "running", "processing (sign-in check settling)", None, None
         if state != "blocked-known":
             answered_prompt = None
+        # A passive monitor acts on nothing; a worker seat acts only with its pool's restart.
+        if a.auto_answer:
+            limit_reply_step(workspace, (state, kind, prompt), (seen_state, seen_kind, seen_prompt),
+                             pane, runtime, seat=a.session if a.seat else None, label=a.seat or None,
+                             retry_cmd=shlex.split(a.retry_cmd) if a.retry_cmd else None,
+                             card_surface=a.chat_escalation, quota=quota)
+            if not a.seat:
+                signed_out_step(quota, state, kind, runtime)
 
         # The actor: only a settled, allowlisted gate is typed at, once per instance.
         key = answer_step(state, kind, prompt, answered_prompt, a.auto_answer)
@@ -1116,6 +1452,10 @@ def main():
                 payload["auto_answered"] = last_answered
             _atomic_write(a.out, payload)
             last_sig = sig
+        # The core's own recovery record; a worker seat's state is the pool's to report.
+        if not a.seat:
+            core_recovery_state.update(workspace, {"state": state, "kind": kind, "prompt": prompt},
+                                       runtime=runtime, pane=pane)
 
         # The Manager owns per-episode dedup; leaving the blocked set resolves
         # the card, so the owner sees it close without clicking anything.
@@ -1124,25 +1464,34 @@ def main():
             # emptied pane returns, and it must not resolve a card nobody answered.
             if pane and pane.strip():
                 settle_driven(hitl, a.session, seen_prompt, seen_state)
+                verify_step(hitl, workspace, a.session, seen_state in _BLOCKED_STATES, seen_state,
+                            socket=a.socket, seat=a.seat or None,
+                            retry_cmd=shlex.split(a.retry_cmd) if a.retry_cmd else None)
             verdict, idle_ticks = card_step(bool(pane and pane.strip()), state, idle_ticks, a.stable, settling)
-            if verdict == "escalate":
+            if verdict == "escalate" and not a.seat and (
+                    card_replaces_notice(quota, kind, prompt)
+                    or (is_signed_out(state, kind) and quota is not None
+                        and quota.carded(core_quota_notice.SIGNED_OUT))):
+                pass  # the account card is this limit's (or sign-out's) one message
+            elif verdict == "escalate":
                 drive_escalations(hitl, a.session, prompt, state,
                                   lambda k: send_keys(a.socket, a.session, k))
                 # Only the core's own seat owns tasks/; a worker's queue lives elsewhere.
                 queued = 0 if a.seat else (core_gate_notice.queued_count(workspace) or 0)
                 req = escalate(hitl, state, detail, kind, prompt, a.session, seat=a.seat or None,
-                               queued=queued, runtime=runtime)
+                               queued=queued, runtime=runtime, workspace=workspace)
                 if not a.seat:
                     notice_queued(hitl, req, workspace, state, kind)
             elif verdict == "resolve":
                 # A banner judged outrun is not standing evidence, for the card as for the state.
                 resolve_escalations(hitl, a.session,
-                                    strip_limit_banners(pane) if limit_stale and pane else pane, runtime)
+                                    strip_limit_banners(pane) if limit_stale and pane else pane, runtime,
+                                    workspace=workspace)
                 if not a.seat:
                     core_gate_notice.end_outage(workspace)
         if a.once:
             return
-        time.sleep(a.interval)  # pragma: no cover - daemon heartbeat (tests use --once)
+        _sleep(a.interval)  # pragma: no cover - daemon heartbeat (tests use --once)
 
 
 if __name__ == "__main__":

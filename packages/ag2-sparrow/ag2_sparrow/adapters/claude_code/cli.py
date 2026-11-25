@@ -17,6 +17,7 @@ card. The relay token stays in Sparrow's env file, the Claude login in its confi
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -200,7 +201,7 @@ RECORDED = (("CLAUDE", "claude", str), ("PLUGIN_DIR", "plugin_dir", lambda v: v 
             ("CLAUDE_CONFIG_DIR", "claude_config_dir", str),
             ("HMAC_KEY_FILE", "hmac_key_file", str), ("PERMISSION_MODE", "permission_mode", str), ("TMUX", "tmux", str),
             ("HMAC_STRICT", "no_hmac_strict", lambda v: v == hmac_policy.OPT_OUT),
-            (inbox.ALLOW_NON_OWNER, "allow_non_owner", lambda v: v == "1"),
+            (inbox.ALLOW_NON_OWNER, "non_owner", lambda v: "0" if v == "0" else ""),
             (inbox.ALLOW_COLLABORATOR, "collaborator", lambda v: "0" if v == "0" else ""))
 
 
@@ -227,6 +228,7 @@ def install(args) -> int:
 
 
 def _install(args) -> int:
+    cm.take_over(args)
     if getattr(args, "token_stdin", False):
         return cb.install_token_stdin(args, LOCAL, lambda: connect_preflight(args, login=False), _install, COMMAND,
                                       work=None, inbox=None, bridge_state_dir=None)
@@ -283,7 +285,7 @@ def _install(args) -> int:
               "CLAUDE_CONFIG_DIR": str(Path(args.claude_config_dir).expanduser().resolve()) if args.claude_config_dir else "",
               "HMAC_KEY_FILE": key_file, "HMAC_STRICT": "1" if strict else hmac_policy.OPT_OUT if args.no_hmac_strict else "",
               "PERMISSION_MODE": args.permission_mode, "SESSION_ID": "", "HITL_STORE": str(card.store_root(state)),
-              inbox.ALLOW_NON_OWNER: "1" if args.allow_non_owner else "",
+              inbox.ALLOW_NON_OWNER: "0" if args.non_owner == "0" else "1",
               inbox.ALLOW_COLLABORATOR: "0" if args.collaborator == "0" else "1", "AGENT_ID": agent_id, "BRIDGE": mode,
               "TOKEN_ENV_FILE": where["token_file"],
               "TOKEN_VAULT_KEY": vault_key(segment) if mode not in (UNIT, EXTERNAL) and not where["token_file"] else "",
@@ -541,9 +543,9 @@ def verify(args) -> int:
     if hmac_policy.legacy_opt_out(cfg):
         print("WARN hmac mode: legacy opt-out (HMAC_STRICT recorded empty by an older install --no-hmac-strict): not "
               "strict; unsigned and unverifiable envelopes are submitted. Reinstall without --no-hmac-strict for strict")
-    print("INFO non-owner tasks: " + ("refused: a restricted turn must be isolated and read-only, and this adapter "
-                                      "runs every turn in the owner's session (--allow-non-owner is recorded, not "
-                                      "honoured)" if cfg.get(inbox.ALLOW_NON_OWNER) == "1" else "refused (owner only)"))
+    print("INFO non-owner tasks: " + ("refused (--no-allow-non-owner)" if cfg.get(inbox.ALLOW_NON_OWNER) == "0"
+                                      else "answered on an isolated read-only `claude -p` turn, never this session "
+                                           "(the default; --no-allow-non-owner opts out)"))
     print("INFO collaborator tasks: " + ("refused (--no-allow-collaborator)" if cfg.get(inbox.ALLOW_COLLABORATOR) == "0"
                                          else "submitted into this session with the non-owner note (the default; "
                                               "--no-allow-collaborator opts out)"))
@@ -650,6 +652,32 @@ def attach(args) -> int:
     os.execv(tmux, [tmux, "-u", "-S", sock, "attach", "-t", "=%s" % SESSION_NAME])
 
 
+# What the app's settings page offers: the aliases Claude Code's /model takes (claude_model_switch.MODEL_RE).
+MODELS = (("default", "Default"), ("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku"), ("fable", "Fable"))
+
+
+def model(args) -> int:
+    """Print the agent's model, or switch the running session's with Claude Code's own /model."""
+    local = selected(args)
+    if local is None:
+        return EXIT_UNUSABLE
+    cfg, problem = load_config(local)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    if not args.model:
+        # `current` is the model Claude Code last said it switched to (none: the CLI's own default); every
+        # turn runs in the one session, whoever sends it, and a restart keeps it (hold.claude_argv).
+        now = launcher.switched_model(cm.work_root(cfg)) or None
+        print(json.dumps({"model": now, "current": now, "available": [{"id": m, "name": n} for m, n in MODELS],
+                          "pending": None}))
+        return 0
+    lc = launcher.Launcher(cfg, config_dir(local))
+    switched, line = lc.switch_model(records.load_supervisor(cm.work_root(cfg)), args.model, confirm=args.confirm)
+    print(json.dumps({"switched": switched, "model": args.model, "detail": line}))
+    return 0 if switched else 1
+
+
 def stop(args) -> int:
     """The local confirmation of an open stall card, through the one accepter; the launcher applies it."""
     if not args.confirm:
@@ -687,11 +715,15 @@ def session_options(p) -> None:
                     "--hmac-key-file)")
     hm.add_argument("--no-hmac-strict", action="store_true", help="with --hmac-key-file, also submit unsigned and "
                     "unverifiable envelopes")
-    p.add_argument("--allow-non-owner", action="store_true", help="recorded but not honoured here: senders "
-                   "without collaborator access (guests, and any collaborator claim the broker did not attest) get "
-                   "a restricted turn, which must be isolated and read-only, and this adapter only runs turns in the "
-                   "owner's session, so they always get the owner-only refusal. An attested collaborator is not "
-                   "covered by it: see --no-allow-collaborator")
+    no = p.add_mutually_exclusive_group()
+    no.add_argument("--allow-non-owner", dest="non_owner", action="store_const", const="1", help="answer senders "
+                    "without collaborator access (guests, plain team, and any collaborator claim the broker did not "
+                    "attest) on an isolated read-only turn, never this session: a fresh `claude -p` on the agent's "
+                    "login with the three read tools in an empty directory, no connector, MCP server, plugin, hook or "
+                    "history, never saved (the default; kept so older install lines still work). An attested "
+                    "collaborator is not covered by it: see --no-allow-collaborator")
+    no.add_argument("--no-allow-non-owner", dest="non_owner", action="store_const", const="0", help="refuse those "
+                    "senders with the owner-only line instead of answering them on the isolated turn")
     co = p.add_mutually_exclusive_group()
     co.add_argument("--allow-collaborator", dest="collaborator", action="store_const", const="1", help="submit attested collaborators' (Team) tasks "
                     "into this session with the non-owner note (the default; kept so older install lines still work). "
@@ -723,6 +755,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("install", help="record the paths, mint the session id, write the unit, have the manager "
                        "start the session (a reinstall stops the old one first)")
+    cm.replace_option(p)
     p.add_argument("--work", help="an explicit work root, served by a bridge you run (default: the agent's own "
                    "root, <agents dir>/<agent id>, whose bridge install wires)")
     p.add_argument("--inbox", help="an explicit work root by its <work>/tasks, as your bridge's task dir; the "
@@ -773,6 +806,12 @@ def main(argv=None) -> int:
     s.add_argument("--confirm", action="store_true")
     s.set_defaults(func=stop)
     agent_option(sub.add_parser("verify", help="check every part")).set_defaults(func=verify)
+    m = agent_option(sub.add_parser("model", help="print the agent's model, or switch the running session's without "
+                                                   "a restart (Claude Code's own /model, typed for you)"))
+    m.add_argument("model", nargs="?", help="default, opus, sonnet, haiku, fable or a claude-* id; omit to print")
+    m.add_argument("--confirm", action="store_true", help="answer Claude Code's confirm dialog (a switch inside a "
+                                                           "running conversation)")
+    m.set_defaults(func=model)
     agent_option(sub.add_parser("uninstall", help="stop the job and the session, then remove what install wrote "
                                 "(config last)")).set_defaults(func=uninstall)
     sub.add_parser("list", help="each job installed here: its agent, the manager's state, its work root and the "

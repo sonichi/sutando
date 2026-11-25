@@ -53,7 +53,7 @@
    ],
    "status": "canonical",
    "canonical_for": "running, attributing, reporting, and comparing black-box Sutando benchmarks",
-   "last_verified": "2026-11-18"
+   "last_verified": "2026-11-24"
   },
   "docs/benchmark-reports/2026-08-24-3a73e03.md": {
    "title": "Sutando comprehensive benchmark — 2026-08-24",
@@ -106,7 +106,7 @@
    ],
    "status": "active",
    "canonical_for": "Codex core setup, earned-reset policy, and rollback",
-   "last_verified": "2026-11-10"
+   "last_verified": "2026-11-24"
   },
   "docs/community-use-cases/README.md": {
    "title": "Community use cases",
@@ -135,7 +135,7 @@
    ],
    "status": "active",
    "canonical_for": "the state/connections.json record, preview-then-confirm add, primary and state semantics, and the startup launch plan for multi-gateway bridges",
-   "last_verified": "2026-11-16"
+   "last_verified": "2026-11-23"
   },
   "docs/delivery-protocol.md": {
    "title": "The file delivery protocol as a formal state machine",
@@ -267,7 +267,7 @@
    ],
    "status": "canonical",
    "canonical_for": "remote gateway wire protocol",
-   "last_verified": "2026-11-16"
+   "last_verified": "2026-11-22"
   },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",
@@ -360,7 +360,7 @@
    ],
    "status": "canonical",
    "canonical_for": "test coverage policy",
-   "last_verified": "2026-11-17"
+   "last_verified": "2026-11-22"
   },
   "docs/tutorial-delivery.md": {
    "title": "Tutorial delivery",
@@ -391,7 +391,7 @@
    ],
    "status": "canonical",
    "canonical_for": "workspace configuration and resolver APIs",
-   "last_verified": "2026-11-03"
+   "last_verified": "2026-11-22"
   },
   "docs/workspace-contract.md": {
    "title": "Workspace contract",
@@ -514,7 +514,7 @@
    ],
    "status": "draft",
    "canonical_for": "the v1 worker pool: durable worker identities and run history, zero-byte delivery sentinels under deliveries/<recipient>/ with the payload immutable in tasks/, the router as the core watcher's task-event handler over an owner-declared, core-compiled roster (unknown targets go to the core; liveness never routes), residue-based recovery, and the Phase 1 / Phase 2 split",
-   "last_verified": "2026-11-15"
+   "last_verified": "2026-11-23"
   },
   "docs/worker-pool-design-notes.md": {
    "title": "Worker pool — design notes",
@@ -608,6 +608,16 @@
    "status": "canonical",
    "canonical_for": "agent-native design rules: Action parity under the same authority, controls instead of prose for known actions, card and click trust rules, and the contributor and reviewer checklist",
    "last_verified": "2026-11-11"
+  },
+  "docs/core-recovery-record.md": {
+   "title": "Core recovery record (core_recovery.v1)",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "the core recovery record state/core-recovery.json: its states, fields, bounds, runtimes, single writer and the core_recovery.v1 contract fixtures",
+   "last_verified": "2026-11-24"
   }
  }
 }
