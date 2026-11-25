@@ -202,23 +202,17 @@ def configured_tmux(cfg: dict, environ=None, job: "cm.Shape | None" = None) -> "
     return (found[0], "") if found else ("", "the config records no TMUX and no tmux was found; run %s" % install)
 
 
-# Claude Code's usage-limit screen (its banner, or the menu only a plan's limit opens) and when it lifts.
-_LIMIT_SCREEN = re.compile(r"\b(?:hit|reached) your (?:[\w.-]+ )?limit\b|\busage limit\b|\bweekly limit\b"
-                           r"|\bwait for (?:the |your )?(?:session |usage |weekly )?limit to reset\b"
-                           r"|\bswitch to usage credits\b", re.I)
-_LIMIT_RESET = re.compile(r"\b(?:resets?(?: at| on| in)?|continue automatically at)\s+([\w :,./+-]{1,40})", re.I)
+# Claude Code's usage-limit menu, by one of its own option rows at the foot of the pane. Words about a
+# limit anywhere else (an answer, a log line, the task's own text) are not the menu.
+_LIMIT_MENU_ROW = re.compile(r"^\s*[\u276f>]?\s*\d+\.\s+(?:wait for (?:the |your )?(?:[\w-]+ )?limit to reset"
+                             r"|switch to usage credits)\b", re.I)
+LIMIT_MENU_LINES = 12
 
 
-def out_of_quota(pane: str):
-    """None when the pane shows no usage limit; else when it resets, in its own words ('' when unsaid)."""
-    lines = [ln for ln in (pane or "").splitlines()[-40:] if ln.strip()]
-    if not any(_LIMIT_SCREEN.search(ln) for ln in lines):
-        return None
-    for ln in lines:
-        m = _LIMIT_RESET.search(ln)
-        if m:
-            return " ".join(m.group(1).split()).rstrip(" ,:./+-")[:40]
-    return ""
+def limit_menu(pane) -> bool:
+    """Whether the pane's last lines are the usage-limit menu: the dialog no turn gets past."""
+    lines = [ln for ln in (pane or "").splitlines() if ln.strip()][-LIMIT_MENU_LINES:]
+    return any(_LIMIT_MENU_ROW.match(ln) for ln in lines)
 
 
 class Tmux:
@@ -720,9 +714,9 @@ class Launcher:
 
     def signin_check(self, rec: dict) -> "tuple[bool, dict]":
         """(restarted, record). When `.claude.json` names another account than the one this consumer started
-        with, the session is stopped once its turn is over (a usage-limit menu, which no turn gets past, is
-        dismissed first) and the next tick starts a new one on the new account, which then takes the queued
-        tasks. An unreadable file changes nothing; a consumer this record has no mark for (a new start, a
+        with, the session is stopped once its turn is over (the usage-limit menu itself, which no turn gets
+        past, is dismissed first) and its input box is seen empty, and the next tick starts a new one on the
+        new account, which then takes the queued tasks. An unreadable file changes nothing; a consumer this record has no mark for (a new start, a
         launcher from before this) is marked with the account now on disk and not restarted. A card raised for
         the session (a limit menu left up is a stall, and raises one) does not hold the restart back: the new
         session answers what the card asked, and the card is retired with the old one."""
@@ -741,15 +735,19 @@ class Launcher:
             self.signin_waiting = False
             return False, rec
         gen, title = rec["generation"], rec.get("title_token") or ""
-        limited = out_of_quota(self.tm.capture(gen["pane_id"]) or "") is not None
-        if not limited and self.observation.get("task") is not None:
-            if not self.signin_waiting:
-                self.log("sign-in: the account changed; restarting once the current turn ends")
-                self.signin_waiting = True
+        menu = limit_menu(self.tm.capture(gen["pane_id"]))
+        if not menu and self.observation.get("task") is not None:
+            self.signin_wait("restarting once the current turn ends")
             return False, rec
-        if limited:
+        if menu:
             self.send_keys(gen, title, "Escape")     # the limit menu holds the input box /exit is typed into
             self.sleep(0.5)
+        # /exit and Enter go into the input box: never over text the owner has not sent, nor into a box
+        # that cannot be read. Read afresh, after the menu is gone.
+        styled = self.tm.capture(gen["pane_id"], styled=True)
+        if composer_text(styled) != "" or not composer_boxed(styled) or composer_typed(styled) != "":
+            self.signin_wait("restarting once its input box is empty and readable")
+            return False, rec
         outcome = self.stop_session(rec, "the account it is signed in with changed")
         if outcome != "stopped":
             self.log("sign-in: restart not done (%s); trying again" % outcome)
@@ -758,6 +756,12 @@ class Launcher:
         if rec.get("hitl"):
             self.retire_card()
         return True, self._with_record(lambda r: dict(r, generation=None, signin=None, stall=None, deadline=None))
+
+    def signin_wait(self, what: str) -> None:
+        """Say once why the restart for a changed account is not done yet."""
+        if self.signin_waiting != what:
+            self.log("sign-in: the account changed; " + what)
+            self.signin_waiting = what
 
     def stopped(self, started) -> str:
         self.log("stopped in %.1f s" % (self.clock() - started))

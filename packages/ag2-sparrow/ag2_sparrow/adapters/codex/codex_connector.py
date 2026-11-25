@@ -312,7 +312,8 @@ class Connector:
         self.signin = signin_watch.SigninWatch(
             [os.path.join(home, signin_watch.CODEX_AUTH), os.path.join(home, signin_watch.MARKER)],
             lambda: signin_watch.codex_identity(home))
-        self.signin_started = self.signin_mark()
+        self.signin_started, self.signin_account = self.signin_mark()
+        self.signin_own = False   # the server finished a sign-in of its own since the mark was taken
 
     @property
     def root(self):
@@ -364,6 +365,8 @@ class Connector:
 
     def login_over(self, params):
         """The server said a sign-in ended (`account/login/completed`): the account card tells the owner."""
+        if params.get("success"):
+            self.signin_own = True       # the auth.json it wrote names the account this server now runs on
         outcome = self.accounts.finished(params.get("loginId"), bool(params.get("success")), params.get("error") or "")
         if outcome:
             log("account ->", outcome)
@@ -596,13 +599,17 @@ class Connector:
         self.rpc = self.rpc_factory()
         self.live = {}
         self.thread_id = None
-        self.signin_started = self.signin_mark()     # a new server reads auth.json afresh
+        # A new server reads auth.json afresh.
+        (self.signin_started, self.signin_account), self.signin_own = self.signin_mark(), False
         self.handshake()
 
     def signin_mark(self):
-        """The fingerprint of the sign-in now in auth.json, None when it cannot be read."""
+        """(the fingerprint of the sign-in now in auth.json, the fingerprint of its account alone: the
+        account id and email, without the switch marker); (None, None) when it cannot be read."""
         now = self.signin.current()
-        return signin_watch.fingerprint(now) if now is not None else None
+        if now is None:
+            return None, None
+        return signin_watch.fingerprint(now), signin_watch.fingerprint(now[:2])
 
     def server_email(self) -> str:
         """The email the running server is signed in with ('' when it cannot or will not say)."""
@@ -615,23 +622,34 @@ class Connector:
 
     def signin_check(self) -> bool:
         """Between turns: restart the server once when auth.json names another account than the one it
-        started with; True when it did. An unreadable file changes nothing; a server already on the new
-        account (its own sign-in wrote the file) is kept; the shared daemon (proxy) is not ours to restart."""
+        started with; True when it did. An unreadable file changes nothing; the shared daemon (proxy) is
+        not ours to restart. The server is kept in two cases only: the account itself (its id and email)
+        is the one it started with and only the switch marker moved; or the server finished a sign-in of
+        its own since (so it wrote the file) and says it is on that email. An email alone proves nothing:
+        another account, or another workspace of one sign-in, can carry the same one."""
         if self.args.server == "proxy":
             return False
         now = self.signin.current()
         if now is None:
             return False
-        mark = signin_watch.fingerprint(now)
+        mark, account = signin_watch.fingerprint(now), signin_watch.fingerprint(now[:2])
         if self.signin_started is None or mark == self.signin_started:
+            self.signin_started, self.signin_account = mark, account
+            return False
+        if now[0] and account == self.signin_account:
             self.signin_started = mark
             return False
         email = now[1]
-        if email and self.server_email().lower() == email.lower():
-            self.signin_started = mark
+        if self.signin_own and email and self.server_email().lower() == email.lower():
+            self.signin_started, self.signin_account, self.signin_own = mark, account, False
             return False
         log("sign-in changed in auth.json; restarting Codex on the new account")
-        self.restart_server()
+        before = self.signin_started, self.signin_account
+        try:
+            self.restart_server()
+        except Exception:
+            self.signin_started, self.signin_account = before     # not restarted: the next check tries again
+            raise
         return True
 
     def wait_turn(self, turn_id, timeout):
@@ -773,7 +791,10 @@ class Connector:
                 self.accounts.expire()
             except Exception as e:  # noqa: BLE001
                 log("card upkeep failed:", "%s: %s" % (type(e).__name__, e))
-            self.signin_check()     # here no turn runs: the next task starts on the new account
+            try:
+                self.signin_check()     # here no turn runs: the next task starts on the new account
+            except Exception as e:  # noqa: BLE001 - a restart that failed is tried again; tasks are still served
+                log("sign-in check failed:", "%s: %s" % (type(e).__name__, e))
             names = self.pending_tasks(seen)
             if not names:
                 if self.args.once and done >= self.args.once:

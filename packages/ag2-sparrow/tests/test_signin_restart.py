@@ -188,13 +188,57 @@ class CodexRestart(unittest.TestCase):
         self.assertFalse(self.c.signin_check())
         self.restarts.assert_not_called()
 
-    def test_a_server_already_on_the_new_account_is_kept(self):
-        # The card's own sign-in: the server wrote auth.json itself and already runs on it.
+    def test_a_server_that_signed_in_itself_is_kept(self):
+        # The card's own sign-in: the server wrote auth.json itself, said so, and already runs on it.
         write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
         self.servers[-1].email = "b@x.org"
+        with mock.patch.object(type(self.c), "accounts", mock.PropertyMock()):
+            self.c.login_over({"loginId": "l-1", "success": False, "error": "cancelled"})
+            self.assertFalse(self.c.signin_own, "a sign-in that failed proves nothing")
+            self.c.login_over({"loginId": "l-2", "success": True})
         self.assertFalse(self.c.signin_check())
         self.assertFalse(self.c.signin_check())
         self.restarts.assert_not_called()
+        # That proof is used once: a later change by someone else restarts, whatever the server answers.
+        write(self.home / "auth.json", codex_auth("acct-3", "b@x.org"))
+        self.assertTrue(self.c.signin_check())
+
+    def test_another_account_with_the_same_email_restarts_the_server(self):
+        """Reviewer, 47209797: a different account id under the same email (another workspace of one
+        sign-in, switched outside the server) skipped the restart on the email alone, and the baseline
+        moved, so the old server kept the old login for good."""
+        write(self.home / "auth.json", codex_auth("acct-2", "a@x.org"))
+        self.assertEqual(self.servers[-1].email, "a@x.org", "the old server answers the very same email")
+        self.assertTrue(self.c.signin_check())
+        self.assertEqual((self.restarts.call_count, len(self.servers)), (1, 2))
+        self.assertFalse(self.c.signin_check())
+        # The same through the desktop's marker, and back again.
+        write(self.home / "auth.json", codex_auth("acct-1", "a@x.org"))
+        write(self.home / signin_watch.MARKER, {"email": "a@x.org", "at": 5})
+        self.assertTrue(self.c.signin_check())
+        self.assertEqual(self.restarts.call_count, 2)
+
+    def test_a_restart_that_fails_is_tried_again_and_never_stops_task_service(self):
+        """Second reviewer: serve() called the check outside its guard, so a failed restart ended the connector."""
+        write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
+        self.restarts.side_effect = RuntimeError("codex did not start")
+        with self.assertRaises(RuntimeError):
+            self.c.signin_check()
+        order = []
+        self.c.pending_tasks = lambda seen: order.append("tasks") or []
+        self.c.args.idle_exit, self.c.args.poll = 0.0001, 0.0001
+        self.c.args.state, self.c.args.bridge_state = str(self.home / "state"), None
+        os.makedirs(self.c.args.state)
+        self.c.rpc.events = __import__("queue").Queue()
+        logs = []
+        with mock.patch.object(cc.connector_cards, "absorb"), mock.patch.object(cc, "log", lambda *a: logs.append(a)), \
+                mock.patch.object(type(self.c), "accounts", mock.PropertyMock()):
+            self.c.serve()                                   # returns on idle-exit; the failure did not escape
+        self.assertIn("tasks", order, "tasks are still looked for")
+        self.assertTrue(any(a[0] == "sign-in check failed:" for a in logs))
+        self.assertGreaterEqual(self.restarts.call_count, 2, "and the restart is tried again")
+        self.restarts.side_effect = None
+        self.assertTrue(self.c.signin_check(), "once it can start, it restarts on the new account")
 
     def test_the_shared_daemon_is_never_restarted(self):
         self.c.args.server = "proxy"
@@ -210,12 +254,24 @@ CONSUMER = {"pid": 11, "start": "s"}
 LIMIT = "You've hit your limit · resets 3pm\n❯ 1. Wait for limit to reset\n  2. Switch to usage credits"
 
 
-class LimitScreen(unittest.TestCase):
-    def test_the_usage_limit_screen_is_told_from_an_ordinary_pane_and_its_reset_read(self):
-        self.assertEqual(launcher.out_of_quota(LIMIT), "3pm")
-        self.assertEqual(launcher.out_of_quota("❯ 1. Wait for limit to reset\n  2. Switch to usage credits"), "")
-        for pane in ("", None, "❯ run the tests\n⏵⏵ accept edits on", "the limit of this approach is speed"):
-            self.assertIsNone(launcher.out_of_quota(pane), pane)
+RULE = "\u2500" * 40
+
+
+def box(*rows):
+    """Claude Code's input box as it is on screen: a rule, the prompt row and any draft rows, a rule, the footer."""
+    first, rest = (rows + ("",))[0], rows[1:]
+    return "\n".join([RULE, "\u276f " + first, *rest, RULE, "  \u23f5\u23f5 bypass permissions on"])
+
+
+class LimitMenu(unittest.TestCase):
+    def test_only_the_menus_own_option_rows_at_the_foot_of_the_pane_are_the_menu(self):
+        self.assertTrue(launcher.limit_menu(LIMIT))
+        self.assertTrue(launcher.limit_menu("  1. Wait for your weekly limit to reset\n\u276f 2. Switch to usage credits"))
+        for pane in ("", None, box(), "You've hit your usage limit, said the log line\n" + box(),
+                     "\u23fa The usage limit resets at 3pm; wait for limit to reset or switch to usage credits.\n" + box(),
+                     "\u276f write docs about the weekly limit and the usage limit\n" + box("usage limit"),
+                     LIMIT + "\n" + "\n".join("line %d" % i for i in range(launcher.LIMIT_MENU_LINES))):
+            self.assertFalse(launcher.limit_menu(pane), pane)
 
 
 class ClaudeRestart(unittest.TestCase):
@@ -225,7 +281,7 @@ class ClaudeRestart(unittest.TestCase):
         self.conf = Path(d.name) / ".claude.json"
         write(self.conf, claude_conf("u-1", "a@x.org"))
         lc = launcher.Launcher.__new__(launcher.Launcher)
-        lc.logs, lc.now, lc.stops, lc.keys, lc.pane = [], 1000.0, [], [], "❯ "
+        lc.logs, lc.now, lc.stops, lc.keys, lc.pane = [], 1000.0, [], [], box()
         lc.log, lc.sleep, lc.clock = lc.logs.append, lambda s: None, lambda: lc.now
         lc.tm = types.SimpleNamespace(capture=lambda pane_id, styled=False: lc.pane, sock="/s", tmux="tmux")
         self.marker = Path(d.name) / signin_watch.MARKER
@@ -240,7 +296,14 @@ class ClaudeRestart(unittest.TestCase):
             return lc.rec
         lc._with_record = with_record
         lc.stop_session = lambda rec, why: lc.stops.append(why) or "stopped"
-        lc.send_keys = lambda gen, title, *names: lc.keys.append(names) or 0
+        self.after_escape = box()        # what the pane shows once the limit menu is dismissed
+
+        def send_keys(gen, title, *names):
+            lc.keys.append(names)
+            if names == ("Escape",):
+                lc.pane = self.after_escape
+            return 0
+        lc.send_keys = send_keys
         self.lc = lc
 
     def check(self):
@@ -296,6 +359,41 @@ class ClaudeRestart(unittest.TestCase):
         write(self.conf, claude_conf("u-2", "b@x.org"))
         self.assertTrue(self.check())
         self.assertEqual((lc.keys, len(lc.stops)), ([("Escape",)], 1))
+
+    def test_words_about_a_usage_limit_on_screen_never_stop_a_running_turn(self):
+        """Reviewer, 47209797: ordinary pane text containing "usage limit" read as the limit screen, and
+        the session was stopped in the middle of a task."""
+        lc = self.lc
+        lc.observation = {"task": "task-1"}
+        lc.pane = "\u23fa You asked about the usage limit: it resets weekly. You've hit your limit on retries.\n" + box()
+        write(self.conf, claude_conf("u-2", "b@x.org"))
+        self.assertFalse(self.check())
+        self.assertFalse(self.check())
+        self.assertEqual((lc.keys, lc.stops), ([], []), "no key and no stop while the turn runs")
+        lc.observation = {"task": None}
+        self.assertTrue(self.check())
+        self.assertEqual((lc.keys, len(lc.stops)), ([], 1), "after the turn, and with no Escape: there was no menu")
+
+    def test_an_unsent_draft_is_never_typed_over(self):
+        """Reviewer, 47209797: with no task running the stop typed /exit and Enter over the owner's draft."""
+        lc = self.lc
+        write(self.conf, claude_conf("u-2", "b@x.org"))
+        for shown in (box("half a message"), box("", "  a second line"), "\u276f ", ""):
+            lc.pane = shown
+            self.assertFalse(self.check(), shown)
+        self.assertEqual((lc.keys, lc.stops), ([], []), "nothing is sent into a box that holds text or cannot be read")
+        self.assertEqual(sum("input box is empty and readable" in l for l in lc.logs), 1, "said once")
+        self.assertIsNotNone(lc.rec["generation"])
+        lc.pane = box()                                      # the owner sent or cleared it
+        self.assertTrue(self.check())
+        self.assertEqual(len(lc.stops), 1)
+
+    def test_a_draft_under_the_dismissed_limit_menu_holds_the_restart_too(self):
+        lc = self.lc
+        lc.observation, lc.pane, self.after_escape = {"task": "task-1"}, LIMIT, box("my unsent words")
+        write(self.conf, claude_conf("u-2", "b@x.org"))
+        self.assertFalse(self.check())
+        self.assertEqual((lc.keys, lc.stops), ([("Escape",)], []), "the menu is dismissed, the draft is left alone")
 
     def test_a_card_raised_for_the_stuck_session_does_not_hold_the_restart_back(self):
         # The limit menu left up is a stall and raises a card; with one pending the account switch never restarted.
