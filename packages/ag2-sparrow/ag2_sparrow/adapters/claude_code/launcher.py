@@ -202,9 +202,8 @@ def configured_tmux(cfg: dict, environ=None, job: "cm.Shape | None" = None) -> "
     return (found[0], "") if found else ("", "the config records no TMUX and no tmux was found; run %s" % install)
 
 
-# Claude Code's usage-limit menu, whole and at the foot of the pane: its question, its option rows in
-# order (the first is the wait, one carries the selector) and its key hint. A line that reads like one of
-# its options (an answer, a list in the task's own text) is not the menu.
+# Claude Code's usage-limit menu, whole and at the foot of the pane: its question, its option rows in order
+# (the first is the wait, one is selected) and its key hint. One line that reads like an option is not it.
 _MENU_HEAD = re.compile(r"^\s*What do you want to do\?\s*$")
 _MENU_ROW = re.compile(r"^\s*(?P<sel>[\u276f>])?\s*(?P<n>\d+)\.\s+(?P<text>\S.*)$")
 _MENU_WAIT = re.compile(r"^(?:stop and )?wait for (?:the |your )?(?:[\w-]+ )?limit to reset\b", re.I)

@@ -292,6 +292,14 @@ def wrap_untrusted(task_id, headers, message, operator_lines=(), note=NON_OWNER_
 class Connector:
     def __init__(self, rpc_factory, args, note=None):
         self.rpc_factory = rpc_factory
+        # The sign-in each server starts with is read before it is spawned (a fingerprint; None when
+        # auth.json could not be read): a change it may not have seen is then never taken for its own.
+        home = signin_watch.codex_home()
+        self.signin = signin_watch.SigninWatch(
+            [os.path.join(home, signin_watch.CODEX_AUTH), os.path.join(home, signin_watch.MARKER)],
+            lambda: signin_watch.codex_identity(home))
+        self.signin_started, self.signin_account = self.signin_mark()
+        self.signin_failed = ""   # why the last restart for a changed sign-in failed ('' when none did)
         self.rpc = rpc_factory()
         self.args = args
         self.note = note if note is not None else non_owner_note()
@@ -306,15 +314,6 @@ class Connector:
         self.turn_items = {}
         self.rerouted = ""        # the model Codex moved the current turn to, when it said so
         self._models = self._accounts = None
-        # The sign-in the running server started with (a fingerprint; None until auth.json reads): an account
-        # switched under it (the card, the desktop's Settings) restarts the server between turns.
-        home = signin_watch.codex_home()
-        self.signin = signin_watch.SigninWatch(
-            [os.path.join(home, signin_watch.CODEX_AUTH), os.path.join(home, signin_watch.MARKER)],
-            lambda: signin_watch.codex_identity(home))
-        self.signin_started, self.signin_account = self.signin_mark()
-        self.signin_own = None    # the account (its fingerprint) the server's own finished sign-in wrote
-        self.signin_failed = ""   # why the last restart for a changed sign-in failed ('' when none did)
 
     @property
     def root(self):
@@ -366,9 +365,6 @@ class Connector:
 
     def login_over(self, params):
         """The server said a sign-in ended (`account/login/completed`): the account card tells the owner."""
-        if params.get("success"):
-            # The auth.json the server just wrote names the account it now runs on: that account, no other.
-            self.signin_own = self.signin_mark()[1]
         outcome = self.accounts.finished(params.get("loginId"), bool(params.get("success")), params.get("error") or "")
         if outcome:
             log("account ->", outcome)
@@ -598,18 +594,21 @@ class Connector:
         """Replace the app-server process; owner threads are re-resumed on next use."""
         log("restarting app-server; old pid", self.rpc.p.pid)
         self.rpc.close()
+        started = self.signin_mark()         # read before the spawn: what the new server can at least see
         self.rpc = self.rpc_factory()
         self.live = {}
         self.thread_id = None
-        # A new server reads auth.json afresh.
-        (self.signin_started, self.signin_account), self.signin_own = self.signin_mark(), None
+        self.signin_started, self.signin_account = started
         self.handshake()
 
     def replace_server(self):
         """Start a new app-server and move to it only once it has answered: until then, and when it
-        cannot be started, the running one keeps serving tasks. Then the old one is closed."""
+        cannot be started, the running one keeps serving tasks. Then the old one is closed. The sign-in
+        recorded for the new server is the one read before it was spawned, never one read afterwards:
+        an account switched while it starts is then still a change, and the next check acts on it."""
         old = self.rpc
         log("starting a new app-server for the changed sign-in; old pid", old.p.pid)
+        started = self.signin_mark()
         new = self.rpc_factory()
         self.rpc = new
         try:
@@ -623,7 +622,7 @@ class Connector:
             raise
         self.live = {}
         self.thread_id = None
-        (self.signin_started, self.signin_account), self.signin_own = self.signin_mark(), None
+        self.signin_started, self.signin_account = started
         try:
             old.close()
         except Exception as e:  # noqa: BLE001 - the new server serves; the old one is only left to exit
@@ -637,38 +636,24 @@ class Connector:
             return None, None
         return signin_watch.fingerprint(now), signin_watch.fingerprint(now[:2])
 
-    def server_email(self) -> str:
-        """The email the running server is signed in with ('' when it cannot or will not say)."""
-        try:
-            acct = (self.rpc.request("account/read", {"refreshToken": False}, timeout=10) or {}).get("account")
-        except Exception:  # noqa: BLE001 - unknown reads as not confirmed, so the server is restarted
-            return ""
-        email = acct.get("email") if isinstance(acct, dict) else ""
-        return email if isinstance(email, str) else ""
-
     def signin_check(self) -> bool:
-        """Between turns: restart the server once when auth.json names another account than the one it
-        started with; True when it did. An unreadable file changes nothing; the shared daemon (proxy) is
-        not ours to restart. The server is kept in two cases only: the account itself (its id and email)
-        is the one it started with and only the switch marker moved; or the account on disk is the very
-        one the server's own finished sign-in wrote, and the server says it is on that email. An email alone proves nothing:
-        another account, or another workspace of one sign-in, can carry the same one."""
+        """Between turns: move to a new server when auth.json names another account than the one the
+        running server was started on; True when it did. An unreadable file changes nothing now; the
+        shared daemon (proxy) is not ours to restart. The server is kept only when the account itself
+        (its id and email) is the one it started on and just the switch marker moved. Nothing else
+        vouches for it: not its email (another account or workspace can carry the same one), not a
+        sign-in of its own (the file may have changed again since), and a server started while the
+        file could not be read is replaced once it can be."""
         if self.args.server == "proxy":
             return False
         now = self.signin.current()
         if now is None:
             return False
         mark, account = signin_watch.fingerprint(now), signin_watch.fingerprint(now[:2])
-        if self.signin_started is None or mark == self.signin_started:
-            self.signin_started, self.signin_account = mark, account
+        if mark == self.signin_started:
             return False
-        if now[0] and account == self.signin_account:
+        if now[0] and self.signin_account is not None and account == self.signin_account:
             self.signin_started = mark
-            return False
-        email = now[1]
-        own, self.signin_own = self.signin_own, None      # that proof is for one account, and is used once
-        if own == account and email and self.server_email().lower() == email.lower():
-            self.signin_started, self.signin_account = mark, account
             return False
         if not self.signin_failed:
             log("sign-in changed in auth.json; restarting Codex on the new account")

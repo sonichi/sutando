@@ -188,38 +188,84 @@ class CodexRestart(unittest.TestCase):
         self.assertFalse(self.c.signin_check())
         self.restarts.assert_not_called()
 
-    def test_a_server_that_signed_in_itself_is_kept(self):
-        # The card's own sign-in: the server wrote auth.json itself, said so, and already runs on it.
+    def test_a_sign_in_the_server_made_itself_is_moved_to_like_any_other(self):
+        """The card's own sign-in: the server wrote auth.json and says it is on that email. Neither is taken
+        as proof it runs on what the file holds now (the file can change again at once), so it is replaced."""
         write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
         self.servers[-1].email = "b@x.org"
         with mock.patch.object(type(self.c), "accounts", mock.PropertyMock()):
-            self.c.login_over({"loginId": "l-1", "success": False, "error": "cancelled"})
-            self.assertIsNone(self.c.signin_own, "a sign-in that failed proves nothing")
-            self.c.login_over({"loginId": "l-2", "success": True})
-        self.assertFalse(self.c.signin_check())
-        self.assertFalse(self.c.signin_check())
-        self.restarts.assert_not_called()
-        # That proof is used once: a later change by someone else restarts, whatever the server answers.
-        write(self.home / "auth.json", codex_auth("acct-3", "b@x.org"))
+            self.c.login_over({"loginId": "l-1", "success": True})
         self.assertTrue(self.c.signin_check())
-
-    def test_a_finished_sign_in_vouches_only_for_the_account_it_wrote(self):
-        """Reviewer, ea5dc6b1: a sign-in that left the account unchanged still set the flag, and a later
-        change by someone else to another account under the same email reused it and skipped the restart."""
-        with mock.patch.object(type(self.c), "accounts", mock.PropertyMock()):
-            self.c.login_over({"loginId": "l-1", "success": True})       # signed in again to the same account
         self.assertFalse(self.c.signin_check())
-        write(self.home / signin_watch.MARKER, {"email": "a@x.org", "at": 3})
-        self.assertFalse(self.c.signin_check(), "only the marker moved")
-        write(self.home / "auth.json", codex_auth("acct-9", "a@x.org"))   # someone else, later, same email
-        self.assertTrue(self.c.signin_check())
         self.assertEqual(self.restarts.call_count, 1)
-        # And with the proof still unspent when the other account arrives: it names acct-1, not acct-9.
-        with mock.patch.object(type(self.c), "accounts", mock.PropertyMock()):
-            self.c.login_over({"loginId": "l-2", "success": True})
-        write(self.home / "auth.json", codex_auth("acct-1", "a@x.org"))
+
+    def test_a_second_switch_while_the_new_server_starts_is_not_lost(self):
+        """Reviewer, ea50b768: A -> B -> C. The replacement started on B, the file changed to C during
+        `initialize`, and C was recorded as what the server runs on: the move to C never happened."""
+        for during in ("the spawn", "initialize", "the old server's close"):
+            with self.subTest(during=during):
+                write(self.home / "auth.json", codex_auth("acct-1", "a@x.org"))
+                while self.c.signin_check():
+                    pass                                         # settled on A
+                spawn, flipped = self.c.rpc_factory, []
+
+                def to_c():
+                    if not flipped:
+                        flipped.append(1)
+                        write(self.home / "auth.json", codex_auth("acct-3", "c@x.org"))
+
+                def factory():
+                    server = spawn()                             # it read B
+                    if during == "the spawn":
+                        to_c()
+                    if during == "the old server's close":
+                        self.c.rpc.close = to_c
+                    return server
+
+                self.c.rpc_factory = factory
+                self.c.handshake = to_c if during == "initialize" else (lambda: None)
+                write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
+                self.assertTrue(self.c.signin_check())
+                self.assertEqual(self.servers[-1].email, "b@x.org", "the replacement is on B")
+                self.assertNotEqual(self.c.signin_started, signin_watch.fingerprint(self.c.signin.current()),
+                                    "C is not recorded as what it runs on")
+                self.assertTrue(self.c.signin_check(), "the next check moves on to C")
+                self.assertEqual(self.servers[-1].email, "c@x.org")
+                self.assertFalse(self.c.signin_check())
+                self.c.rpc_factory, self.c.handshake = spawn, (lambda: None)
+
+    def test_two_switches_between_two_checks_end_on_the_last(self):
+        write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
+        write(self.home / "auth.json", codex_auth("acct-3", "c@x.org"))
         self.assertTrue(self.c.signin_check())
-        self.assertIsNone(self.c.signin_own)
+        self.assertEqual((self.servers[-1].email, self.restarts.call_count), ("c@x.org", 1))
+        self.assertFalse(self.c.signin_check())
+
+    def test_a_server_started_while_the_file_could_not_be_read_is_replaced_once_it_can_be(self):
+        """What it started on is unknown, so the account the file names later is never taken for its own."""
+        write(self.home / "auth.json", "{torn")
+        self.c.restart_server()                                  # a crash restart, mid-write
+        self.assertIsNone(self.c.signin_started)
+        self.assertFalse(self.c.signin_check(), "still unreadable: nothing to act on")
+        write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
+        self.assertTrue(self.c.signin_check())
+        self.assertEqual(self.servers[-1].email, "b@x.org")
+        self.assertFalse(self.c.signin_check())
+
+    def test_a_crash_restart_records_what_was_read_before_the_spawn(self):
+        spawn = self.c.rpc_factory
+
+        def factory():
+            server = spawn()                                     # it read A
+            write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
+            return server
+
+        self.c.rpc_factory = factory
+        self.c.restart_server()
+        self.c.rpc_factory = spawn
+        self.assertEqual(self.servers[-1].email, "a@x.org")
+        self.assertTrue(self.c.signin_check(), "B arrived after the spawn: still a change")
+        self.assertEqual(self.servers[-1].email, "b@x.org")
 
     def test_another_account_with_the_same_email_restarts_the_server(self):
         """Reviewer, 47209797: a different account id under the same email (another workspace of one
