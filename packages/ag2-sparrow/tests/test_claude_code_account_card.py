@@ -118,6 +118,15 @@ class Account(Base):
         self.assertEqual(argv[-3:], ["auth", "status", "--json"])
         self.assertEqual(config, cli.read_config(cli.config_path()).get("CLAUDE_CONFIG_DIR") or None)
 
+    def test_which_account_asked_in_the_owners_own_words_is_the_card_and_never_reaches_the_session(self):
+        rc, out = self.claim(self.task("task-w", "which account are you on?"))
+        self.assertEqual(rc, 1)
+        self.assertIn("answered by its card (account-card)", out["refused"])
+        card, = [q["card"] for q in self.queued()]
+        self.assertIn(SHOWN + ".", card["text"])
+        rc, out = self.claim(self.task("task-g", "create an account on GitHub for the demo and tell me which one"))
+        self.assertEqual((rc, len(self.queued())), (0, 1), "a longer message about some other account is the session's")
+
     def test_switch_account_points_to_the_app_and_starts_nothing(self):
         self.account_menu()
         said = "Switch account"

@@ -226,6 +226,11 @@ def card_matter(root, task_id, environ=None) -> "tuple[str, str]":
         return "", ""
 
 
+def refusal_body(root, headers) -> str:
+    """The refusal a task that is not admitted is answered with (task_io.refusal_body, this root's state)."""
+    return task_io.refusal_body(headers, os.path.join(root, "state"))
+
+
 def isolated_prompt(root, task_id) -> "tuple[str, dict]":
     """(text, attested headers) of the isolated turn: the routine and cloud-session adapters' payload (attested
     routing fields, the non-owner note, the untrusted body between nonce markers), with the gateway's tier
@@ -430,7 +435,7 @@ def claim(root, task_id) -> dict:
         if verdict == "call":
             kind, headers, why = admit(root, task_id, allow_non_owner(), allow_collaborator())
             if kind is None:
-                outcome = lc.complete_without_call(task_id, task_io.NON_OWNER_REFUSED, why)
+                outcome = lc.complete_without_call(task_id, refusal_body(root, headers), why)
                 raise Refused("%s not admitted (%s); the owner-only refusal is %s" % (task_id, why, outcome))
             carded, body = card_matter(root, task_id)
             if carded:
@@ -582,9 +587,9 @@ def interrupt(root, task_id, detail) -> dict:
             elif phase != lifecycle.SETTLED:
                 verdict, state = lc.decide(task_id)
                 if verdict == "call":
-                    kind, _headers, refusal = admit(root, task_id, allow_non_owner(), allow_collaborator())
+                    kind, headers, refusal = admit(root, task_id, allow_non_owner(), allow_collaborator())
                     body, reason = (INTERRUPTED_BODY, "intake stopped: %s" % detail) if kind else (
-                        task_io.NON_OWNER_REFUSED, refusal)
+                        refusal_body(root, headers), refusal)
                     answered = lc.complete_without_call(task_id, body, reason) == "settled"
                 else:
                     why = "the result is %s" % state
