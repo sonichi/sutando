@@ -1,9 +1,5 @@
 """The account card of a connector: the owner asks, in their DM with the agent, which account it is
 signed in with, taps "Switch account", signs in in the browser, and is told in that DM how it ended.
-One card, updated in place: what a tap comes to (the sign-in page, then how the sign-in ended) is shown
-in place of the card that was tapped (connector_cards' edit), never as a second card. A card asked for
-in words (/account, the card's mark) is a new card; a sign-in that ends with no card waiting for it
-(the desktop app switched the account itself) posts nothing.
 
 The connector supplies the runtime's part: `read()` names the account in use ('' when signed out),
 `begin()` starts a sign-in and gives its id and page, `cancel(id)` gives one up, `opener(url)` shows the
@@ -46,10 +42,9 @@ def page_ok(url) -> bool:
 
 
 def masked(email: str) -> str:
-    """An address as the owner reads it in their DM with the agent: in full (owner 2026-11-24: one way to
-    show an account everywhere, the full email, never a plan); "" when it is not an address."""
-    name, at, domain = (email or "").strip().partition("@")
-    return "%s@%s" % (name, domain) if name and at and domain and " " not in name + domain else ""
+    """An address shortened to what tells two accounts apart: its first letter and its domain."""
+    name, at, domain = (email or "").partition("@")
+    return "%s…@%s" % (name[:1], domain) if name and at and domain else ""
 
 
 class AccountSwitch:
@@ -91,8 +86,8 @@ class AccountSwitch:
     def usable(self) -> bool:
         return card_desk.usable(self.bridge_state)
 
-    def post(self, room, built, key: str = "", at_ns: int = 0, edit: str = "") -> bool:
-        return card_desk.post(self.bridge_state, room, built, self.log, key, at_ns, edit)
+    def post(self, room, built, key: str = "", at_ns: int = 0) -> bool:
+        return card_desk.post(self.bridge_state, room, built, self.log, key, at_ns)
 
     def using(self) -> str:
         """The account in use, in words; a runtime that cannot say reads as unknown, never as signed out."""
@@ -101,7 +96,7 @@ class AccountSwitch:
         except Exception as e:  # noqa: BLE001 - the card still says what it can
             self.log("account not read:", "%s: %s" % (type(e).__name__, str(e)[:200]))
             return "I could not read which account I'm signed in with."
-        return "I'm using %s." % label if label else "I'm not signed in."
+        return "I'm signed in as %s." % label if label else "I'm not signed in."
 
     def card(self, state: str, text: str, url: str = "", ask: bool = False):
         agent_card, _ = connector_cards._core()
@@ -114,10 +109,9 @@ class AccountSwitch:
         return agent_card.build(CARD if ask else NOTE, state, title="Account", body="Account of %s" % self.name, text=text,
                                 **({"buttons": buttons} if buttons else {}))
 
-    def say(self, room, built, result_file=None, edit: str = "") -> None:
-        """Post the card (in place of the card `edit` names, when given); where it cannot be posted, a
-        task's result carries its words instead."""
-        posted = self.post(room, built, edit=edit)
+    def say(self, room, built, result_file=None) -> None:
+        """Post the card; where it cannot be posted, a task's result carries its words instead."""
+        posted = self.post(room, built)
         if result_file:
             self.publish(result_file, ANSWERED if posted else self.quoted(built[1]["text"]) + "\n")
 
@@ -129,18 +123,17 @@ class AccountSwitch:
         return self.offer(sent, result_file)
 
     def expired(self, sent, result_file) -> str:
-        """A tap on an account card that no longer acts: a fresh card in its place when one can be shown,
-        else the words. No sign-in is started by it."""
-        fresh = self.post(sent.get("channel_id"), self.card("pending", self.using(), ask=True),
-                          edit=card_desk.tapped_event(sent))
-        self.publish(result_file, ANSWERED if fresh else self.quoted(EXPIRED_NO_CARD) + "\n")
+        """A tap on an account card that no longer acts: the words, and a fresh card when one can be shown.
+        No sign-in is started by it."""
+        fresh = self.post(sent.get("channel_id"), self.card("pending", self.using(), ask=True))
+        self.publish(result_file, self.quoted(EXPIRED if fresh else EXPIRED_NO_CARD) + "\n")
         return "account-card-expired"
 
     def tapped(self, verb, sent, result_file) -> str:
         """The owner tapped "Switch account": start a sign-in, show its page here, and say so. The page
         is checked, and its card built, before anything is opened or kept: a page that is not a plain
         https address is given up at once, so a retry cannot open a browser again and again."""
-        room, tapped = str(sent.get("channel_id") or ""), card_desk.tapped_event(sent)
+        room = str(sent.get("channel_id") or "")
         if verb != "switch":
             self.publish(result_file, self.quoted("I couldn't match that button. Send /account for a new card.") + "\n")
             return "account-unknown"
@@ -153,7 +146,7 @@ class AccountSwitch:
             login, url = str(started["id"]), str(started["url"])
         except Exception as e:  # noqa: BLE001 - whatever the runtime refused with, the owner is told
             self.log("sign-in not started:", "%s: %s" % (type(e).__name__, str(e)[:200]))
-            self.say(room, self.card("error", "I could not start a sign-in. %s" % before), result_file, tapped)
+            self.say(room, self.card("error", "I could not start a sign-in. %s" % before), result_file)
             return "account-not-started"
         try:
             if not page_ok(url):
@@ -164,13 +157,13 @@ class AccountSwitch:
             self.log("sign-in page refused:", str(e)[:200])
             self.give_up({"id": login})
             self.say(room, self.card("error", "I could not start a sign-in: the page I was given for it is not one "
-                                              "I can show. %s" % before), result_file, tapped)
+                                              "I can show. %s" % before), result_file)
             return "account-not-started"
-        self.keep(dict({"id": login, "room": room, "at": time.time()}, **({"card": tapped} if tapped else {})))
+        self.keep({"id": login, "room": room, "at": time.time()})
         if self.opener(url):
             link = self.card("info", "I opened the sign-in page in the browser on the computer I run on. Finish "
                                      "signing in there; I'll confirm here. Until then: %s" % before, url=url)
-        self.say(room, link, result_file, tapped)
+        self.say(room, link, result_file)
         return "account-started"
 
     def give_up(self, waiting) -> None:
@@ -186,10 +179,8 @@ class AccountSwitch:
         owed = self.keyed(self.owed())
         # Later than every result already owed: the bridge posts in the order of this moment.
         at = max([time.time_ns()] + [int(o.get("at") or 0) + 1 for o in owed])
-        # Shown in place of the card that was tapped, when there was one.
-        self.keep({}, owed + [dict({"room": waiting.get("room"), "state": state, "text": text,
-                                    "key": uuid.uuid4().hex, "at": at},
-                                   **({"edit": waiting["card"]} if waiting.get("card") else {}))])
+        self.keep({}, owed + [{"room": waiting.get("room"), "state": state, "text": text,
+                               "key": uuid.uuid4().hex, "at": at}])
         return not self.tell()
 
     @staticmethod
@@ -211,7 +202,7 @@ class AccountSwitch:
         if any(not o.get("key") for o in owed):
             self.keep(self.pending(), self.keyed(owed))
         while owed and self.post(owed[0].get("room"), self.card(str(owed[0].get("state")), str(owed[0].get("text"))),
-                                 str(owed[0].get("key") or ""), int(owed[0].get("at") or 0), str(owed[0].get("edit") or "")):
+                                 str(owed[0].get("key") or ""), int(owed[0].get("at") or 0)):
             owed.pop(0)
             self.keep(self.pending(), owed)
         if len(owed) > OWED_KEEP:

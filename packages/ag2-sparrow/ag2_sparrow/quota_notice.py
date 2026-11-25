@@ -28,8 +28,7 @@ from pathlib import Path
 
 from . import card_desk, connector_cards
 
-FILE = "quota-card.json"        # the incident
-ROOM_FILE = "quota-room.json"   # the owner's DM room
+FILE, ROOM_FILE = "quota-card.json", "quota-room.json"   # the incident; the owner's DM room
 RETRY_S = 60.0                  # a card that could not be queued is tried again no sooner than this
 _ROOM = re.compile(r"^![^\s:]+(:\S+)?$")
 # When a runtime's own error text says the limit ends: "resets 3pm", "try again in 2 days 3 hours",

@@ -23,7 +23,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_antigravity_adapter as ta  # noqa: E402  (its hermetic env and Work)
 
-from ag2_sparrow import account_switch, connector_cards  # noqa: E402
+from ag2_sparrow import account_switch, connector_cards, model_switch  # noqa: E402
 from ag2_sparrow.adapters.antigravity import agy_account, antigravity_connector as gc, gemini_key as gk  # noqa: E402
 
 CODE = "4/0A" + "d" * 40                # shaped like a Google sign-in code; not a real one
@@ -92,21 +92,15 @@ class AccountCardTest(unittest.TestCase):
                                                             encoding="utf-8")
 
     def posted(self, event="$card1"):
-        sent = self.sent = []
+        sent = []
         connector_cards.Poster(Path(str(self.w.root) + ".bridge") / "state",
                                lambda p: sent.append(p) or {"ok": True, "event_id": event}, log=lambda line: None).sweep()
         return [s["extra_content"]["space.ag2.card"] for s in sent]
 
-    def older_menu(self, **kw):
-        """A card as sent before 2026-11-23, when the menu still offered "Stop using API key"."""
-        from unittest import mock
-        with mock.patch.object(agy_account, "MENU_VERBS", (agy_account.SWITCH, agy_account.KEY, agy_account.UNKEY)):
-            return self.menu(**kw)
-
-    def menu(self, ask="换账号", event="$card1", tid="task-ask"):
-        self.dm(tid, ask)
+    def menu(self, ask="换账号", event="$card1"):
+        self.dm("task-ask", ask)
         self.serve()
-        self.assertEqual(self.w.result(tid), account_switch.ANSWERED)
+        self.assertEqual(self.w.result("task-ask"), account_switch.ANSWERED)
         (card,) = self.posted(event)
         return card
 
@@ -139,17 +133,13 @@ class AccountCardTest(unittest.TestCase):
     def test_the_card_is_english_and_carries_the_marker_for_the_in_card_controls(self):
         card = self.menu()
         self.assertEqual(card["account_controls"], {"runtime": "antigravity", "agent": AGENT})
-        self.assertEqual(card["header"]["title"], "Account")
+        self.assertEqual(card["header"]["title"], "Antigravity account")
         self.assertTrue(card["text"].endswith(agy_account.BELOW), card["text"])
         self.assertEqual(agy_account.elsewhere("Antigravity"),
                          "Open this on the computer that runs Antigravity to switch account.")
         self.tap("task-key", card, "Use API key")
         (info,) = self.posted("$card2")
-        # The answer replaces the card tapped, and keeps the controls: opened on the agent's computer, the
-        # same card draws them. It is not the menu, so it retires no account card.
-        self.assertEqual([(p["op"], p.get("event_id")) for p in self.sent], [("edit", "$card1")])
-        self.assertEqual((info["account_controls"], info["id"]),
-                         ({"runtime": "antigravity", "agent": AGENT}, account_switch.NOTE))
+        self.assertNotIn("account_controls", info, "a notice is not the account card")
         for said in (card, info):
             self.assertFalse(re.search(r"[\u4e00-\u9fff]", json.dumps(said, ensure_ascii=False)), said)
 
@@ -162,7 +152,6 @@ class AccountCardTest(unittest.TestCase):
         self.assertIn(agy_account.elsewhere(gc.NAME), info["text"])
         self.assertNotIn("Settings", info["text"])
         self.assertIn("Never send a sign-in code in this chat", info["text"])
-        self.assertEqual([(p["op"], p.get("event_id")) for p in self.sent], [("edit", "$card1")])
         self.assertIn(agy_account.SHARED, info["text"])
         self.assertFalse(info.get("buttons"), "no input box and no link: no secret travels through the card")
         self.assertEqual(self.prompts(), [])
@@ -191,18 +180,18 @@ class AccountCardTest(unittest.TestCase):
         (self.w.home / "account").write_text("bob@example.com")
         self.dm("task-2", "STUB:TEXT hi")
         self.serve()
-        self.assertTrue(self.w.result("task-2").startswith(gc.quoted("(Switched to bob@example.com. New conversations use it ✓)").strip()))
+        self.assertTrue(self.w.result("task-2").startswith(gc.quoted("(Switched to the b…@example.com account.)").strip()))
         self.assertIn("hello from agy-stub", self.w.result("task-2"))
         self.dm("task-3", "STUB:TEXT hi")
         self.serve()
         self.assertEqual(self.w.result("task-3"), "hello from agy-stub\n")
         card = self.menu()
-        self.assertIn("bob@example.com", card["text"])
-        # The full email, as every account card shows it (owner 2026-11-24); kept only in this agent's own state.
+        self.assertIn("b…@example.com", card["text"])
+        self.assertNotIn("bob@example.com", self.state_text())
 
     def test_a_tap_that_is_not_the_owners_changes_nothing(self):
         self.keychain["saved"] = True
-        card = self.older_menu()
+        card = self.menu()
         self.tap("task-team", card, "Stop using API key", tier="team", collaborator=True)
         self.assertIn("couldn't match that button", self.w.result("task-team"))
         self.tap("task-guest", card, "Switch account", tier="guest")
@@ -221,15 +210,11 @@ class AccountCardTest(unittest.TestCase):
         self.assertEqual(self.prompts(), [])
         self.assertNotIn(DUMMY_KEY, "\n".join(self.logs) + json.dumps(self.w.metrics()))
 
-    def test_a_new_card_offers_no_stop_using_api_key_even_with_a_saved_key(self):
-        self.keychain["saved"] = True
-        card = self.menu()
-        self.assertEqual([b["label"] for b in card["buttons"]], ["Switch account", "Use API key"])
-
     def test_with_a_saved_key_stop_removes_only_this_agents_item(self):
         self.keychain["saved"] = True
-        card = self.older_menu()
+        card = self.menu()
         self.assertIn("Gemini API key", card["text"])
+        self.assertEqual([b["label"] for b in card["buttons"]], ["Switch account", "Use API key", "Stop using API key"])
         self.tap("task-stop", card, "Stop using API key")
         self.assertEqual(self.cleared, [AGENT])
         (done,) = self.posted("$card2")
@@ -237,7 +222,7 @@ class AccountCardTest(unittest.TestCase):
 
     def test_a_keychain_failure_is_said_as_one_never_as_removed(self):
         self.keychain.update(saved=True, broken=True)
-        card = self.older_menu()
+        card = self.menu()
         self.tap("task-stop", card, "Stop using API key")
         (said,) = self.posted("$card2")
         self.assertEqual(said["state"], "error")
@@ -247,40 +232,14 @@ class AccountCardTest(unittest.TestCase):
 
     def test_stop_on_an_older_card_after_the_key_is_gone_changes_nothing_and_says_so(self):
         self.keychain["saved"] = True
-        card = self.older_menu()
+        card = self.menu()
         self.tap("task-stop1", card, "Stop using API key")
         self.posted("$card2")
-        # Another older card (the one tapped now shows the answer, its buttons gone).
-        other = self.older_menu(event="$card3", tid="task-ask2")
-        self.tap("task-stop2", other, "Stop using API key", event="$card3")
-        (said,) = self.posted("$card4")
-        self.assertEqual([(p["op"], p.get("event_id")) for p in self.sent], [("edit", "$card3")])
+        self.tap("task-stop2", card, "Stop using API key")
+        (said,) = self.posted("$card3")
         self.assertIn("has no saved API key", said["text"])
         self.assertNotIn("Stopped using the API key", said["text"])
         self.assertEqual(self.w.metrics()[-1]["card"], "account-key-absent")
-
-    def test_after_a_switch_tap_the_new_account_is_said_in_that_card_not_in_the_answer(self):
-        (self.w.home / "account").write_text("alice@example.com")
-        self.dm("task-1", "STUB:TEXT hi")
-        self.serve()
-        card = self.menu(event="$menu")
-        self.tap("task-switch", card, "Switch account", event="$menu")
-        self.posted("$x")
-        # The desktop app (or anything else) signs agy in as another account; the next owner turn sees it.
-        (self.w.home / "account").write_text("bob@example.com")
-        self.dm("task-dm", "STUB:TEXT hi")
-        self.serve()
-        self.assertNotIn("Switched to the", self.w.result("task-dm"), "no line in the answer")
-        (done,) = self.posted("$y")
-        self.assertEqual([(p["op"], p.get("event_id")) for p in self.sent], [("edit", "$menu")])
-        self.assertEqual((done["state"], done["text"].startswith("Switched to bob@example.com.")), ("done", True))
-        self.assertIn("account_controls", done)
-        # Said once: a later change, with no card waiting, is said in the answer as before.
-        (self.w.home / "account").write_text("carol@example.com")
-        self.dm("task-dm2", "STUB:TEXT hi")
-        self.serve()
-        self.assertIn("Switched to carol@example.com", self.w.result("task-dm2"))
-        self.assertEqual(self.posted("$z"), [])
 
     def test_the_switch_notice_is_said_only_in_the_owners_dm(self):
         (self.w.home / "account").write_text("alice@example.com")
@@ -295,7 +254,7 @@ class AccountCardTest(unittest.TestCase):
         self.assertNotIn("Switched to the", self.w.result("task-collab"))
         self.dm("task-dm", "STUB:TEXT hi")
         self.serve()
-        self.assertIn("Switched to bob@example.com", self.w.result("task-dm"), "the DM is told once it is back there")
+        self.assertIn("Switched to the b…@example.com account", self.w.result("task-dm"), "the DM is told once it is back there")
         self.assertEqual(self.posted("$x"), [], "and no card goes anywhere")
 
     # ── A4 ──
@@ -325,6 +284,16 @@ class AccountCardTest(unittest.TestCase):
         self.assertEqual((self.outbox(), self.posted("$q3")), ([], []), "nothing more once the card is posted")
         self.assertEqual(self.w.result("task-q3"), gc.LIMITED_NO_SEND)
 
+    def test_a_collaborator_who_asks_while_agy_is_at_its_limit_is_told_why_there_is_no_answer(self):
+        # Review of #6713: once the owner's card was queued, anyone else who asked got no reply at all.
+        self.dm("task-q1", "STUB:QUOTA hi")
+        self.serve()
+        self.posted("$q1")
+        self.dm("task-c", "STUB:QUOTA a collaborator asks", tier="team", collaborator=True, kind="room")
+        self.serve()
+        self.assertEqual(self.w.result("task-c").strip(), gc.LIMITED_FOR_OTHERS)
+        self.assertEqual(self.outbox(), [], "and no second card")
+
     def test_a_turn_that_answers_clears_the_limit_and_a_later_limit_is_a_new_card(self):
         self.dm("task-q1", "STUB:LIMIT429 hi")
         self.serve()
@@ -349,12 +318,74 @@ class AccountCardTest(unittest.TestCase):
         self.assertEqual(self.outbox(), [])
         self.assertIn("Antigravity has reached its usage limit", self.w.result("task-q"))
 
+    # ── signed out: a card with the sign-in, not a line of words ──
+    def test_signed_out_in_the_owner_dm_posts_the_sign_in_card_instead_of_the_error_line(self):
+        (self.w.home / "signed-in").unlink()
+        self.dm("task-so", "STUB:TEXT hi")
+        self.serve()
+        self.assertEqual(self.w.result("task-so"), account_switch.ANSWERED, "the card answers: no error line")
+        (queued,) = self.outbox()
+        card = queued["card"]
+        self.assertEqual(queued["room"], DM)
+        self.assertEqual(card["account_controls"], {"runtime": "antigravity", "agent": AGENT, "signed_out": True})
+        self.assertIn("not signed in on this computer", card["text"])
+        self.assertIn("Sign in", card["text"])
+        self.assertNotIn("agy acp --login", card["text"], "no terminal command in the card")
+        self.assertIn("not signed in", queued["body"], "the one-line fallback for a client without cards")
+        self.assertNotIn("session/prompt", self.w.methods())
+
+    def test_signed_out_keeps_the_model_outcome_this_turn_settled_beside_the_card(self):
+        # Review of #6802: the card's answer replaced the whole body, and the line saying a pick did not take was lost.
+        (self.w.home / "signed-in").unlink()
+        self.dm("task-so", "STUB:TEXT hi")
+        with mock.patch.object(model_switch.ModelSwitch, "unsaid", lambda self: "Couldn't switch to Opus."):
+            self.serve()
+        said = self.w.result("task-so")
+        self.assertIn("Couldn't switch to Opus.", said)
+        self.assertNotIn("not signed in on this computer", said, "the error line still gives way to the card")
+        self.assertFalse(said.startswith("[no-send]"), "the kept line is sent")
+        self.assertEqual(len(self.outbox()), 1, "and the sign-in card is still queued")
+
+    def test_signed_out_outside_the_owner_dm_keeps_the_words_and_queues_no_card(self):
+        (self.w.home / "signed-in").unlink()
+        self.dm("task-so", "STUB:TEXT hi", kind="room")
+        self.serve()
+        self.assertEqual(self.outbox(), [])
+        self.assertIn("Antigravity is not signed in on this computer", self.w.result("task-so"))
+
+    def test_signed_out_when_the_card_cannot_be_queued_keeps_the_words(self):
+        (self.w.home / "signed-in").unlink()
+        self.dm("task-so", "STUB:TEXT hi")
+        with mock.patch.object(agy_account.AgyAccount, "post", lambda *a, **kw: False):
+            self.serve()
+        self.assertIn("Antigravity is not signed in on this computer", self.w.result("task-so"))
+
+    def test_what_reads_as_signed_out(self):
+        auth = gc.NOT_SIGNED_IN % "session/new: Authentication required"
+        self.assertTrue(agy_account.signed_out_error("failed", auth))
+        self.assertFalse(agy_account.signed_out_error("failed", "internal error"))
+        self.assertFalse(agy_account.signed_out_error("completed", gc.NOT_SIGNED_IN % "x"))
+
     def test_what_reads_as_agys_quota_error(self):
         yes = (("failed", "", "session/prompt: RESOURCE_EXHAUSTED: Individual quota reached."),
                ("failed", "", "HTTP 429 Too Many Requests"), ("failed", "", "status: 429"),
-               ("completed", "RESOURCE_EXHAUSTED: quota exceeded", "end_turn"))
+               ("completed", "RESOURCE_EXHAUSTED: quota exceeded", "end_turn"),
+               ("completed", "Error: HTTP 429 Too Many Requests", "end_turn"),
+               ("completed", "You have exceeded your current quota.", "end_turn"),
+               ("completed", "HTTP 429 Too Many Requests: quota for this project is used up.", "end_turn"),
+               ("failed", "", "session/prompt: HTTP 429 Too Many Requests: retry in 2h"))
+        # An ordinary answer that mentions a limit is the answer: it was replaced by the limit text, with a card.
         no = (("failed", "", "internal error"), ("completed", "Your quota exceeded talk: " + "x" * 500, "end_turn"),
-              ("failed", "", "port 4290 refused"), ("completed", "", "end_turn"))
+              ("failed", "", "port 4290 refused"), ("completed", "", "end_turn"),
+              ("completed", "Done. I added a retry for status 429 in fetch.py.", "end_turn"),
+              ("completed", "The API returns RESOURCE_EXHAUSTED when the quota exceeded; I handle it.", "end_turn"),
+              ("completed", "A 429 Too Many Requests means the quota is exceeded; back off.", "end_turn"),
+              ("failed", "I retried after HTTP 429 Too Many Requests.", "internal error: stream reset"),
+              # Review of #6713: an answer about the term, and another site's 429 in a failed turn's error.
+              ("completed", "RESOURCE_EXHAUSTED is the gRPC code for a spent quota.", "end_turn"),
+              ("completed", "429 Too Many Requests is what a server says when it throttles you.", "end_turn"),
+              ("failed", "", "tool fetch returned HTTP 429 from example.com"),
+              ("failed", "", "session/prompt: the page said quota exceeded"))
         self.assertEqual([agy_account.quota_error(*t) for t in yes], [True] * len(yes))
         self.assertEqual([agy_account.quota_error(*t) for t in no], [False] * len(no))
 
@@ -364,16 +395,27 @@ class PartsTest(unittest.TestCase):
         for said in (CODE, "here " + CODE, "http://localhost:1/cb?code=4/0Ab12345&state=x", "k " + DUMMY_KEY,
                      "[REDACTED-Google API Key]"):
             self.assertTrue(agy_account.carries_secret(said), said)
-        for said in ("hello there", "4/5 of the tests pass", "http://example.com/no-code", "switch account"):
+        for said in ("hello there", "4/5 of the tests pass", "http://example.com/no-code", "switch account",
+                     # Review of #6713: these were refused, so the sender got no answer.
+                     "https://github.com/login/device?code=ABCD-1234", "https://example.com/cb?code=abcdefgh12345678",
+                     "see docs/4/introduction_to_the_new_api_design.md", "v4/0123456789012345678901234567"):
             self.assertFalse(agy_account.carries_secret(said), said)
+        # Review of #6803: a code that ends a sentence, and the encoded form outside an http(s) address.
+        for said in ("https://x.test/cb?state=s&code=4%2F0A" + "d" * 30, "code: %s." % CODE, "it is %s. Thanks" % CODE,
+                     "code=4%2F0A" + "d" * 30, "localhost:8085/?code=4%2F0A" + "d" * 30, "state=s&code=4/0Ab12345"):
+            self.assertTrue(agy_account.carries_secret(said), said)
+        self.assertFalse(agy_account.carries_secret("see docs/4/0_introduction_to_the_new_api.md and barcode=4/0abcdef"))
 
     def test_signed_in_as_reads_only_this_processes_log(self):
         with tempfile.TemporaryDirectory() as d:
             Path(d, "acp-server-1-42.log").write_text("x\nI1 server_oauth.go:221] applyAuthResult: email=bob@example.com, "
                                                        "authMethod=consumer, quotaProject=\n")
             Path(d, "acp-server-1-43.log").write_text("applyAuthResult: email=eve@example.com, authMethod=consumer\n")
-            self.assertEqual(agy_account.signed_in_as(d, 42), "bob@example.com")
+            self.assertEqual(agy_account.signed_in_as(d, 42), "b…@example.com")
             self.assertEqual(agy_account.signed_in_as(d, 44), "")
+            # A newer log of the same pid that names no account: the older one is another process's.
+            Path(d, "acp-server-2-42.log").write_text("started\n")
+            self.assertEqual(agy_account.signed_in_as(d, 42), "")
             self.assertEqual(agy_account.signed_in_as(os.path.join(d, "none"), 42), "")
 
     def test_asks_for_card_only_for_short_asks(self):

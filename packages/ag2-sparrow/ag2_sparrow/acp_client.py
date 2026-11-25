@@ -45,26 +45,17 @@ class AcpClient:
     reader thread, so they must not block on this client. An adapter names itself with `client_info`."""
 
     client_info = CLIENT_INFO
-    # An adapter that hands its agent a secret sets this: the agent's stderr then reaches its log file
-    # only through `redact`, a whole line at a time, so a secret the agent prints is never stored.
-    redact_stderr = False
-    REDACTED = "[redacted]"
 
     def __init__(self, argv, cwd=None, env=None, stderr_path=None, on_permission=None, on_update=None,
                  popen=subprocess.Popen):
         self.err = open(stderr_path, "ab") if stderr_path else subprocess.DEVNULL
-        self.secrets, self._stderr_pump = [], None
-        piped = self.redact_stderr and self.err is not subprocess.DEVNULL
         try:
-            self.p = popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE if piped else self.err, cwd=cwd, env=env, text=True, bufsize=1)
+            self.p = popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.err, cwd=cwd,
+                           env=env, text=True, bufsize=1)
         except OSError:
             if self.err is not subprocess.DEVNULL:
                 self.err.close()
             raise
-        if piped:
-            self._stderr_pump = threading.Thread(target=self._pump_stderr, daemon=True)
-            self._stderr_pump.start()
         self.on_permission = on_permission
         self.on_update = on_update
         self.pending = {}
@@ -73,23 +64,6 @@ class AcpClient:
         self.gone = threading.Event()
         self.unhandled = collections.Counter()
         threading.Thread(target=self._reader, daemon=True).start()
-
-    def redact(self, secret):
-        """From now on `secret` is replaced in what the agent writes to stderr before it is stored. Called
-        before the secret is sent to the agent. Without `redact_stderr` there is no pipe to filter."""
-        if secret:
-            self.secrets.append(str(secret))
-
-    def scrubbed(self, text):
-        for secret in list(self.secrets):
-            text = text.replace(secret, self.REDACTED)
-        return text
-
-    def _pump_stderr(self):
-        with contextlib.suppress(OSError, ValueError):
-            for line in self.p.stderr:
-                self.err.write(self.scrubbed(line).encode("utf-8", "replace"))
-                self.err.flush()
 
     def _reader(self):
         try:
@@ -188,7 +162,5 @@ class AcpClient:
             except subprocess.TimeoutExpired:
                 self.p.kill()
                 self.p.wait()
-        if self._stderr_pump is not None:
-            self._stderr_pump.join(timeout=grace)   # the agent has exited: its last lines, then the file closes
         if self.err is not subprocess.DEVNULL:
             self.err.close()

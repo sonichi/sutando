@@ -47,18 +47,8 @@ SIGNIN_CHECK_S = 5.0       # how often the sign-in file's stat is looked at
 MODEL_RE, MODEL_SET, MODEL_CONFIRM = claude_model_switch.MODEL_RE, claude_model_switch.MODEL_SET, claude_model_switch.MODEL_CONFIRM
 composer_text, accepted_count = claude_model_switch.composer_text, claude_model_switch.accepted_count
 composer_boxed, composer_typed = claude_model_switch.composer_boxed, claude_model_switch.composer_typed
-MODEL_RECORD = ("state", "model-switch.json")
-
-
-def switched_model(root) -> str:
-    """The model the last switch through `switch_model` landed on, '' when there has been none. The
-    session's own settings live in Claude Code's config dir, which this adapter does not read."""
-    try:
-        with open(Path(root).joinpath(*MODEL_RECORD), encoding="utf-8") as f:
-            record = json.load(f)
-    except (OSError, ValueError):
-        return ""
-    return str(record.get("model") or "") if isinstance(record, dict) else ""
+MODEL_RECORD = hold.MODEL_RECORD
+switched_model = hold.switched_model
 FIELD_SEP = "|:ag2:|"
 START_COMMAND_RE = re.compile(r'^"?ag2-sparrow-claude-local hold --generation=[0-9a-f]{32} --"?$')
 TMUX_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
@@ -212,7 +202,6 @@ def configured_tmux(cfg: dict, environ=None, job: "cm.Shape | None" = None) -> "
     return (found[0], "") if found else ("", "the config records no TMUX and no tmux was found; run %s" % install)
 
 
-
 # Claude Code's usage-limit screen (its banner, or the menu only a plan's limit opens) and when it lifts.
 _LIMIT_SCREEN = re.compile(r"\b(?:hit|reached) your (?:[\w.-]+ )?limit\b|\busage limit\b|\bweekly limit\b"
                            r"|\bwait for (?:the |your )?(?:session |usage |weekly )?limit to reset\b"
@@ -230,6 +219,7 @@ def out_of_quota(pane: str):
         if m:
             return " ".join(m.group(1).split()).rstrip(" ,:./+-")[:40]
     return ""
+
 
 class Tmux:
     """The adapter's own server on its own socket; every probe bounded, every outcome explicit."""
@@ -662,11 +652,6 @@ class Launcher:
         if not gen or self.tm.has_session() is not True:
             return False, "no running session to switch; nothing sent"
         styled = self.tm.capture(gen["pane_id"], styled=True)
-        limited = out_of_quota(self.tm.capture(gen["pane_id"]) or "")
-        if limited is not None:
-            # The limit screen replaces the input box; a model switch cannot get past it, an account can.
-            return False, "refused: this account is out of quota%s. Switch account first." % (
-                " (resets %s)" % limited if limited else "")
         draft = composer_text(styled)
         # An empty reading counts only inside the box's frame: a bare prompt row may be a cut box.
         if draft is None or not composer_boxed(styled):

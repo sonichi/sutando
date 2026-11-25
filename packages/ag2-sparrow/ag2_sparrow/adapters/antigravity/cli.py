@@ -22,7 +22,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from ... import _dirs, connect_bridge as cb, connect_common as cm, task_io
+from ... import _dirs, connect_bridge as cb, connect_common as cm, model_settings, task_io
 from ...acp_client import AUTH_REQUIRED, AcpError
 from ...connect_bridge import EXTERNAL, UNIT
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, Shape
@@ -177,13 +177,11 @@ RECORDED = (("ACP_COMMAND", "acp_command", str), ("CWD", "cwd", str),
             ("MCP_PROXY_COMMAND", "mcp_proxy_command", str))
 
 
-def signed_in_problem(args, acp: str, agent_id: str = "") -> str:
-    """'' when the agent answers and is signed in (checked once per install), else why not. `agent_id` is
-    the agent being installed: with it the check also counts a Gemini API key saved for that agent in the
-    app, as `verify` and every turn do, so an agent with a key and no Google sign-in can be installed."""
+def signed_in_problem(args, acp: str) -> str:
+    """'' when the agent answers and is signed in (checked once per install), else why not."""
     if getattr(args, "signed_in", False):
         return ""
-    _said, problem = probe({"ACP_COMMAND": acp, "AGENT_ID": agent_id or ""})
+    _said, problem = probe({"ACP_COMMAND": acp})
     args.signed_in = not problem
     return problem
 
@@ -191,20 +189,19 @@ def signed_in_problem(args, acp: str, agent_id: str = "") -> str:
 def preflight(args) -> str:
     """'' when this host can run the agent, checked before the token is written; else why not."""
     acp, problem = acp_command(args.acp_command)
-    # --token-stdin names its agent with --agent; the seat it then makes is checked against that id.
-    return cb.host_problem(COMMAND) or problem or signed_in_problem(args, acp, getattr(args, "agent", None) or "")
+    return cb.host_problem(COMMAND) or problem or signed_in_problem(args, acp)
 
 
 def install(args) -> int:
+    cm.take_over(args)
     if getattr(args, "token_stdin", False):
         return cb.install_token_stdin(args, LOCAL, lambda: preflight(args), install, COMMAND, work=None)
     problem = cb.recorded_install_args(args, LOCAL, RECORDED)
     acp, why = ("", problem) if problem else acp_command(args.acp_command)
-    # The agent's identity first: the sign-in check needs it to see a key saved for this agent.
+    why = why or signed_in_problem(args, acp)
     where, why = ({}, why) if why else resolve_root(args)
     if not why:
         why = cb.agent_arg_problem(getattr(args, "agent", None), where["agent_id"])
-    why = why or signed_in_problem(args, acp, where["agent_id"])
     proxy, proxy_why = mcp_proxy_command(getattr(args, "mcp_proxy_command", None))
     why = why or proxy_why
     cwd = str(Path(args.cwd).expanduser().resolve()) if args.cwd else ""
@@ -369,6 +366,17 @@ def list_cmd(_args) -> int:
     return cm.list_jobs(LOCAL)
 
 
+def model(args) -> int:
+    """The app's settings page: the agent's model, and the owner's pick (`--set`), in the state the
+    model card keeps; every next turn runs on the pick, whoever sends it (model_settings)."""
+    local, problem = selected(args)
+    cfg, problem = (None, problem) if problem else load_config(local)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    return model_settings.command(Path(cm.work_root(cfg)) / "state", args.set)
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def session_options(p) -> None:
@@ -394,6 +402,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("install", help="check the sign-in, record the settings, write the unit, have the manager "
                        "start the connector")
+    cm.replace_option(p)
     p.add_argument("--work", help="an explicit work root, fed by a bridge you run (<work>/tasks, <work>/results)")
     tok = p.add_mutually_exclusive_group()
     tok.add_argument("--token-env-file", help="instead of --work: the agent's 0600 env file; the root is the "
@@ -419,6 +428,10 @@ def main(argv=None) -> int:
     cm.job_options(sub.add_parser("uninstall", help="stop the job, then remove what install wrote (config last)")
                    ).set_defaults(func=uninstall)
     sub.add_parser("list", help="each job installed here").set_defaults(func=list_cmd)
+    m = cm.job_options(sub.add_parser("model", help="print the agent's model as JSON (current, available, pending), "
+                                                    "or pick the one every next turn runs on (--set)"))
+    m.add_argument("--set", metavar="ID", help="a model id agy listed")
+    m.set_defaults(func=model)
     args = ap.parse_args(argv)
     args.argv = list(sys.argv[1:] if argv is None else argv)
     return args.func(args)

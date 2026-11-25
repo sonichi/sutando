@@ -9,7 +9,6 @@ connector's owner and guest turns, and the setup probe, with a fake ACP client a
 Run:
     python3 -m pytest -q packages/ag2-sparrow/tests/test_antigravity_gemini_key.py
 """
-import argparse
 import base64
 import contextlib
 import io
@@ -29,7 +28,7 @@ isolate_os_environ()
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import acp_client, acp_host  # noqa: E402
+from ag2_sparrow import acp_host  # noqa: E402
 from ag2_sparrow.adapters.antigravity import antigravity_connector as gc, cli, gemini_key as gk  # noqa: E402
 
 DUMMY_KEY = "AIzaDUMMY-test-key-0123456789abcdef"
@@ -190,38 +189,6 @@ class OwnerTurns(Base):
         self.assertNotIn(DUMMY_KEY, logs)
 
 
-    def test_an_unanswered_authenticate_stops_the_turn_and_no_session_is_opened_or_recorded(self):
-        self.keychain.items[gk.agent_service(AGENT)] = wrapped(DUMMY_KEY)
-        for boom in (acp_client.AcpTimeout("authenticate: no response in 30s"),     # a delayed acknowledgement
-                     acp_client.AcpGone("authenticate: the ACP agent exited before answering"),
-                     BrokenPipeError("stdin closed")):                               # it could not be sent
-            with self.subTest(error=type(boom).__name__):
-                FakeAgy.spawned = []
-                shutil.rmtree(self.tmp / "work", True)      # each case starts with no saved Session
-                conn = gc.Connector(self.args())
-                status, detail, logs = self.owner_turn(conn, factory=lambda *a, **k: FakeAgy(*a, auth_error=boom, **k))
-                self.assertNotEqual(status, "completed", "not run on a process whose account is unknown")
-                (agy,) = FakeAgy.spawned
-                self.assertEqual(agy.methods_called(), ["initialize", "authenticate"], "no Session on it")
-                self.assertIsNone(conn.store.get(("!r:s.space", "owner")), "and none recorded, under any mode")
-                self.assertIn("this agy is not used", logs)
-                self.assertNotIn(DUMMY_KEY, logs + str(detail))
-                # The next turn is a fresh agy that answers: it runs on the key and records that.
-                status, _, _ = self.owner_turn(conn, task="task-2")
-                self.assertEqual(status, "completed")
-                self.assertEqual(conn.store.get(("!r:s.space", "owner"))["auth"], gk.API_KEY_AUTH)
-                self.assertEqual(len(FakeAgy.spawned), 2, "a new process, not the one left in doubt")
-
-    def test_the_setup_check_reports_an_unanswered_authenticate_instead_of_calling_it_signed_in(self):
-        self.keychain.items[gk.agent_service(AGENT)] = wrapped(DUMMY_KEY)
-        boom = acp_client.AcpTimeout("authenticate: no response in 30s")
-        said, why = cli.probe({"ACP_COMMAND": "/opt/agy/bin/agy acp", "AGENT_ID": AGENT},
-                              factory=lambda *a, **k: FakeAgy(*a, auth_error=boom, **k))
-        self.assertEqual(said, "")
-        self.assertIn("did not answer", why)
-        self.assertNotIn("session/new", FakeAgy.spawned[0].methods_called())
-
-
 class SessionsKeepTheirAuth(Base):
     """A Session opened on the Google sign-in still bills that account's quota when resumed (session/load)
     under the key ("Individual quota reached"): the auth mode is saved with the Session and a mismatch opens a
@@ -288,167 +255,6 @@ class Probe(Base):
         self.assertIn("on the Gemini API key saved in the app", said)
         (agy,) = FakeAgy.spawned
         self.assertEqual(agy.methods_called(), ["initialize", "authenticate", "session/new"])
-
-
-class KeyOnlyAgy(FakeAgy):
-    """agy with no Google sign-in: `session/new` is refused until `authenticate` gemini-api-key was accepted."""
-
-    def call(self, method, params, timeout):
-        if method == "session/new" and "authenticate" not in self.methods_called():
-            self.calls.append((method, params))
-            raise acp_client.AcpError("session/new: Authentication required", acp_client.AUTH_REQUIRED)
-        return super().call(method, params, timeout)
-
-
-class InstallChecksTheAgentsOwnKey(Base):
-    """The install entry points, not only `probe`: an agent with a saved key and no Google sign-in installs."""
-
-    def setUp(self):
-        super().setUp()
-        real = cli.probe
-        for target, name, value in (
-                (cli, "probe", lambda cfg: real(cfg, factory=KeyOnlyAgy)),
-                (cli, "acp_command", lambda acp: ("/opt/agy/bin/agy acp", "")),
-                (cli.cb, "host_problem", lambda command: ""),
-                (cli.cb, "recorded_install_args", lambda args, local, recorded: ""),
-                (cli, "resolve_root", lambda args: ({"root": str(self.tmp / "root"), "mode": cli.UNIT,
-                                                     "agent_id": AGENT, "token_file": "/seat/.env"}, "")),
-                # The install stops right after its checks: what is under test is which of them refuse.
-                (cli.cm, "agent_job", lambda local, agent_id: (local, "stopped after the checks"))):
-            p = mock.patch.object(target, name, value)
-            p.start()
-            self.addCleanup(p.stop)
-
-    def install_args(self, **over):
-        base = dict(work=None, token_env_file="/seat/.env", token_stdin=False, agent=None, key=None, single=False,
-                    acp_command=None, cwd=None, session_store=None, allow_non_owner=False, mcp_proxy_command=None,
-                    argv=[], parser=None)
-        return argparse.Namespace(**dict(base, **over))
-
-    def run_install(self, args):
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            rc = cli.install(args)
-        return rc, err.getvalue()
-
-    def test_install_passes_the_sign_in_check_on_the_key_saved_for_the_agent_it_resolved(self):
-        self.keychain.items[gk.agent_service(AGENT)] = wrapped(DUMMY_KEY)
-        args = self.install_args()
-        rc, err = self.run_install(args)
-        self.assertIn("stopped after the checks", err, "it got past the sign-in check")
-        self.assertNotIn("not signed in", err)
-        self.assertTrue(args.signed_in)
-        (agy,) = FakeAgy.spawned
-        self.assertEqual(agy.methods_called(), ["initialize", "authenticate", "session/new"])
-        self.assertEqual(self.authenticates(agy)[0]["_meta"]["apiKey"], DUMMY_KEY)
-        self.assertEqual([service for _, service, _ in self.keychain.asked], [gk.agent_service(AGENT)],
-                         "this agent's item and no other")
-
-    def test_install_still_refuses_an_agent_with_no_key_and_no_sign_in(self):
-        rc, err = self.run_install(self.install_args())
-        self.assertEqual(rc, cli.EXIT_UNUSABLE)
-        self.assertIn("not signed in", err)
-        self.assertNotIn("stopped after the checks", err)
-        # Another agent's key is not this agent's.
-        FakeAgy.spawned = []
-        self.keychain.items[gk.agent_service("@someone-else:s.space")] = wrapped(DUMMY_KEY)
-        rc, err = self.run_install(self.install_args())
-        self.assertIn("not signed in", err)
-        self.assertEqual(self.authenticates(FakeAgy.spawned[0]), [])
-
-    def test_a_pasted_token_install_checks_the_key_of_the_agent_it_names_before_the_token_is_written(self):
-        self.keychain.items[gk.agent_service(AGENT)] = wrapped(DUMMY_KEY)
-        seen = {}
-        args = self.install_args(token_env_file=None, token_stdin=True, agent=AGENT)
-        with mock.patch.object(cli.cb, "install_token_stdin",
-                               lambda a, shape, pre, inst, cmd, **k: (seen.update(pre=pre()), 0)[1]):
-            self.assertEqual(cli.install(args), 0)
-        self.assertEqual(seen["pre"], "", "the preflight counts the key saved for --agent")
-        self.assertTrue(args.signed_in, "and the install that follows does not start agy again")
-        self.assertEqual(self.authenticates(FakeAgy.spawned[0])[0]["_meta"]["apiKey"], DUMMY_KEY)
-        # With no --agent key the preflight refuses before any token is written.
-        FakeAgy.spawned = []
-        args = self.install_args(token_env_file=None, token_stdin=True, agent="@no-key:s.space")
-        with mock.patch.object(cli.cb, "install_token_stdin",
-                               lambda a, shape, pre, inst, cmd, **k: (seen.update(pre=pre()), 1)[1]):
-            cli.install(args)
-        self.assertIn("not signed in", seen["pre"])
-
-
-# A stand-in agy that leaks: it answers `authenticate` and writes the key it was given to its stderr, the
-# way a crashing or verbose CLI might, with an ordinary line before and after.
-LEAKY_AGY = r"""
-import json, sys
-print("starting up", file=sys.stderr, flush=True)
-for line in sys.stdin:
-    m = json.loads(line)
-    if m.get("method") == "initialize":
-        result = {"protocolVersion": 1, "authMethods": [{"id": "gemini-api-key"}]}
-    elif m.get("method") == "authenticate":
-        key = m["params"]["_meta"]["apiKey"]
-        print("auth debug: apiKey=%s (len %d)" % (key, len(key)), file=sys.stderr, flush=True)
-        sys.stderr.write("partial " + key)          # no newline yet: the rest comes later
-        sys.stderr.flush()
-        print(" end; again " + key + key, file=sys.stderr, flush=True)
-        result = {}
-    else:
-        result = {}
-    print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": result}), flush=True)
-print("bye", file=sys.stderr, flush=True)
-"""
-SENTINEL = "AIzaSENTINEL-not-a-real-key-ZZZZ9999"
-
-
-class KeyedChildStderr(unittest.TestCase):
-    """The real client against a real child process: what the child writes to stderr is what gets stored."""
-
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="agy-stderr-"))
-        self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.script = self.tmp / "leaky_agy.py"
-        self.script.write_text(LEAKY_AGY)
-        self.log = self.tmp / "agy.stderr.log"
-
-    def run_keyed(self, factory):
-        client = factory([sys.executable, str(self.script)], cwd=str(self.tmp), env=isolated_child_env(),
-                         stderr_path=str(self.log))
-        try:
-            init = client.initialize(10)
-            keyed = gk.authenticate_with_app_key(client, init, 10, ["agy", "acp"], agent_id=AGENT,
-                                                 key_source=lambda agent_id: SENTINEL)
-        finally:
-            client.close(5.0)
-        return keyed, self.log.read_text()
-
-    def test_the_key_the_agent_prints_never_reaches_its_log_file(self):
-        keyed, stored = self.run_keyed(gc.AcpClient)
-        self.assertTrue(keyed)
-        self.assertNotIn(SENTINEL, stored)
-        self.assertNotIn(SENTINEL[:20], stored, "not a piece of it either")
-        self.assertEqual(stored.count("[redacted]"), 4, "every occurrence, the one split across two writes too")
-        # The rest of the diagnostics is kept, in order, so the log is still useful.
-        self.assertEqual([ln for ln in stored.splitlines()],
-                         ["starting up", "auth debug: apiKey=[redacted] (len %d)" % len(SENTINEL),
-                          "partial [redacted] end; again [redacted][redacted]", "bye"])
-
-    def test_the_antigravity_client_asks_for_redaction_and_the_shared_default_is_unchanged(self):
-        self.assertTrue(gc.AcpClient.redact_stderr)
-        self.assertFalse(acp_client.AcpClient.redact_stderr, "other adapters keep the direct file handle")
-        # The shared client without it writes the child's stderr as it comes: this is what the flag prevents.
-        keyed, stored = self.run_keyed(acp_client.AcpClient)
-        self.assertIn(SENTINEL, stored)
-
-    def test_no_log_file_no_pipe_and_a_client_without_redact_is_still_authenticated(self):
-        client = gc.AcpClient([sys.executable, str(self.script)], cwd=str(self.tmp), env=isolated_child_env())
-        try:
-            self.assertIsNone(client._stderr_pump, "nothing is stored, so nothing is filtered")
-            client.redact("")
-            self.assertEqual(client.secrets, [], "an empty secret is not a pattern")
-        finally:
-            client.close(5.0)
-        agy = FakeAgy(["agy", "acp"])        # the fake has no `redact`: the helper must not need one
-        self.assertTrue(gk.authenticate_with_app_key(agy, agy.initialize(1), 1, ["agy", "acp"], agent_id=AGENT,
-                                                     key_source=lambda agent_id: SENTINEL))
 
 
 class KeychainItem(unittest.TestCase):

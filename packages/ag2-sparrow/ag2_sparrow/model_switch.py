@@ -4,21 +4,16 @@ taps one on a card, and is told in that DM whether the switch happened.
 One card for every runtime: a connector gives `ModelSwitch` the models its runtime offers (`seen`),
 asks it whether a task is a card matter (`card_task`), runs the next owner turn on `wanted()`, and
 reports the model that turn ran on (`tell`). What is kept, in `state/model.json`, is ids and names only.
-
-One card, updated in place: a tap's answer ("Switching to X", "already X") and then the outcome
-("Switched", "could not switch") are shown in place of the card that was tapped (connector_cards'
-edit), never as a second card. A pick in words ("/model <name>") has no card to update and gets a new one.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import os
-import re
 import time
 import uuid
 
-from . import card_desk, connector_cards
+from . import connector_cards
 
 FILE, CARD, ASK = "model.json", "model-switch", "/model"
 # What a pick came to is a card of its own: recorded under the menu's id it would retire the menu
@@ -27,9 +22,6 @@ NOTE = "model-switch-status"
 EXPIRED = "That card has expired, so nothing changed. Here's a new one."
 EXPIRED_NO_CARD = "That card has expired, so nothing changed. Send /model for a new one."
 BUTTONS = 6          # the card's button limit
-ROW_TAPS = 4         # a row's action limit
-NOTE_TEXT = "A switch takes effect on your next message."
-_LEVEL = re.compile(r"^(?P<family>.+?)\s*\((?P<level>[^()]{1,24})\)$")
 UNTOLD_KEEP = 5      # outcome notices kept while their cards cannot be queued
 
 # How the owner asks in their own words: the runtime answers with the mark alone, and the card is shown.
@@ -44,12 +36,6 @@ UNLISTED = "I could not get my list of models just now. Send /model again in a m
 NOT_USABLE = "That model is not one I can use now. Send /model for the current list."
 ANSWERED = "[no-send] the model card answers\n"
 NOT_POSTED = "I could not post the model card. Try again in a moment."
-
-
-def split_name(name: str) -> tuple:
-    """("Gemini 4 Neon", "High") for "Gemini 4 Neon (High)"; (name, "") for a name with no level."""
-    m = _LEVEL.match(name)
-    return (m.group("family"), m.group("level")) if m else (name, "")
 
 
 def model_verb(model_id: str) -> str:
@@ -124,6 +110,9 @@ class ModelSwitch:
         seen = {"available": [{"id": str(mid)[:200], "name": " ".join(str(name or mid).split())[:80] or str(mid)[:80]}
                               for mid, name in offered if self.ok(mid)],
                 "current": str(current or "")[:200]}
+        # With a pick, the turn is moved off the model its Session opened on: `tell` records what it ran on.
+        if self.wanted():
+            del seen["current"]
         if {k: self.state().get(k) for k in seen} != seen:
             self.save(**seen)
 
@@ -148,59 +137,32 @@ class ModelSwitch:
             return agent_card.build(NOTE, kind, title="Model", body=body, text=text, **({"status": status} if status else {}))
         names = {m["id"]: m["name"] for m in self.offered(state)}
         now, coming = state.get("current") or "", self.pending(state)
-        text = "I'm using %s. Pick a model to switch to." % names.get(now, now or "the default model")
+        buttons = [agent_card.button(name, "reply", reply="Use %s" % name,
+                                     command=agent_card.reply("model", "agent", model_verb(mid)))
+                   for mid, name in list(names.items())[:BUTTONS]]
+        more = list(names.values())[BUTTONS:]
+        text = "Now using %s." % names.get(now, now or "the default model")
         if coming:
-            text += " Saved, not switched yet: %s, from your next message." % names.get(coming, coming)
-        menu = dict(buttons=self.buttons(agent_card, names, now)) if len(names) <= BUTTONS else \
-            dict(groups=self.family_rows(agent_card, names, now))
+            text += " Pending: %s, on your next message." % names.get(coming, coming)
+        if more:
+            text += " Also: %s (send /model and the name)." % ", ".join(more)
         # The menu says when it stops acting (the time its record is kept), so the app can show it expired.
         return agent_card.build(CARD, "pending", title="Model", body="Pick a model for %s" % self.name,
-                                text=text, note=NOTE_TEXT, note_tone="dim",
-                                expires_at_ms=int((time.time() + issued_cards.TTL_S) * 1000), **menu)
-
-    @staticmethod
-    def choice(agent_card, label, mid, name, now):
-        """One model's tap: the one in use stands out, as on the core's card."""
-        return agent_card.button(label, "reply", style="primary" if mid == now else "secondary",
-                                 reply="Use %s" % name, command=agent_card.reply("model", "agent", model_verb(mid)))
-
-    def buttons(self, agent_card, names: dict, now: str) -> list:
-        return [self.choice(agent_card, name, mid, name, now) for mid, name in names.items()]
-
-    def family_rows(self, agent_card, names: dict, now: str) -> list:
-        """More models than buttons: a row per family ("Gemini 4 Neon"), its levels ("High", "Low") the
-        row's taps, so every model is one tap away and none is left to be typed."""
-        families, order = {}, []
-        for mid, name in names.items():
-            family, level = split_name(name)
-            if family not in families:
-                families[family] = []
-                order.append(family)
-            families[family].append((mid, name, level))
-        rows = []
-        for family in order:
-            picks = families[family]
-            for i in range(0, len(picks), ROW_TAPS):
-                part = picks[i:i + ROW_TAPS]
-                rows.append(agent_card.row(family, tag="In use" if any(m == now for m, _, _ in part) else "",
-                                           actions=[self.choice(agent_card, level or "Use", mid, name, now)
-                                                    for mid, name, level in part]))
-        return [agent_card.group("Models", rows)]
+                                text=text, buttons=buttons, expires_at_ms=int((time.time() + issued_cards.TTL_S) * 1000))
 
     def parts(self, state, picked, ran, same):
         """(kind, body, text, status) of the card after a pick."""
         names = {m["id"]: m["name"] for m in self.offered(state)}
         name = names.get(picked, picked)
         if same:
-            return "done", "Model: already %s" % name, "Already using %s — nothing to change." % name, ""
+            return "done", "Model: already %s" % name, "I'm already using %s. Nothing changed." % name, ""
         if ran is None:
-            return ("pending", "Model: switching to %s" % name,
-                    "Saved, not switched yet: I'll use %s from your next message. I'll confirm here once it "
-                    "has switched." % name, "Saved")
+            return ("info", "Model: switching to %s" % name,
+                    "Switching to %s on your next message. I'll confirm here once it has switched." % name, "")
         if ran == picked:
-            return "done", "Model: now %s" % name, "Switched to %s ✓" % name, "Switched"
+            return "done", "Model: now %s" % name, "Switched. I'm now using %s." % name, "Switched"
         return ("error", "Model: could not switch to %s" % name,
-                "Couldn't switch to %s: my next turn did not run on it. I'm still using %s. Send /model to try again."
+                "I could not switch to %s. I'm still using %s. Send /model to try again."
                 % (name, names.get(ran, ran or "my default model")), "")
 
     def usable(self) -> bool:
@@ -217,12 +179,11 @@ class ModelSwitch:
             self.log("model card not built:", str(e)[:200])
             return None
 
-    def post(self, room, built, key: str = "", at_ns: int = 0, edit: str = "") -> bool:
+    def post(self, room, built, key: str = "", at_ns: int = 0) -> bool:
         if built is None or not self.usable():
             return False
         try:
-            connector_cards.queue(self.bridge_state, str(room or ""), *built, key=key, at_ns=at_ns,
-                                  edit=edit if str(edit or "").startswith("$") else "")
+            connector_cards.queue(self.bridge_state, str(room or ""), *built, key=key, at_ns=at_ns)
             return True
         except (OSError, ValueError) as e:
             self.log("model card not queued:", "%s: %s" % (type(e).__name__, e))
@@ -241,11 +202,9 @@ class ModelSwitch:
         return self.expired_card(sent, self.state(), result_file)
 
     def expired_card(self, sent, state, result_file) -> str:
-        """Answer a tap on a model card that no longer acts: a fresh card in its place when one can be
-        shown, else the words."""
-        fresh = bool(self.offered(state)) and self.post(sent.get("channel_id"), self.menu(state),
-                                                        edit=card_desk.tapped_event(sent))
-        self.publish(result_file, ANSWERED if fresh else self.quoted(EXPIRED_NO_CARD) + "\n")
+        """Answer a tap on a model card that no longer acts: the words, and a fresh card when one can be shown."""
+        fresh = bool(self.offered(state)) and self.post(sent.get("channel_id"), self.menu(state))
+        self.publish(result_file, self.quoted(EXPIRED if fresh else EXPIRED_NO_CARD) + "\n")
         return "model-card-expired"
 
     def listed(self, result_file) -> "dict | None":
@@ -258,8 +217,6 @@ class ModelSwitch:
     def pick(self, picked, sent, result_file, by_name=False, by_verb=False) -> str:
         """The owner chose `picked` (a tap or "/model <name>"): the next turn runs on it, and a card says so."""
         state, room = self.listed(result_file), str(sent.get("channel_id") or "")
-        # A tap is answered in place of the card tapped; a pick in words has none.
-        tapped = card_desk.tapped_event(sent) if by_verb else ""
         if state is None:
             return "model-unlisted"
         keys = (lambda m: (m["id"].lower(), m["name"].lower())) if by_name else (
@@ -274,10 +231,10 @@ class ModelSwitch:
             # Only a model a turn has run on is "in use": a repeated pending pick is still coming.
             outcome = "model-pending" if self.pending(state) == picked else "model-same"
         else:
-            self.save(wanted=picked, asked_in=room, told="", card=tapped)
+            self.save(wanted=picked, asked_in=room, told="")
         same = outcome == "model-same"
         card = self.built(state, picked=picked, same=same)
-        self.publish(result_file, ANSWERED if self.post(room, card, edit=tapped)
+        self.publish(result_file, ANSWERED if self.post(room, card)
                      else self.quoted(self.words(state, picked=picked, same=same)) + "\n")
         return outcome
 
@@ -302,15 +259,15 @@ class ModelSwitch:
             self.answer(result_file, self.quoted(NOT_POSTED) + "\n")
         return "model-card"
 
-    def tell(self, live, ran, room=None) -> str:
+    def tell(self, live, ran, room=None, may_fail=True) -> str:
         """After an owner turn that reached the runtime (`live`): settle the pick it ran with (`ran` is the
         model that turn ran on), then say in the DM each outcome not yet told, oldest first. The state is
         settled, and SAVED with the notice it owes, before any notice is queued, and each notice is queued
         under its own key: a connector that stops in between neither asks again for a refused model nor
         queues a notice twice. A notice whose card cannot be queued stays owed, the newest UNTOLD_KEEP of
         them; one that cannot be drawn is said in words once, in the answer of a turn in its own room
-        (`room`), never another's.
-        '' when there was nothing to settle or tell."""
+        (`room`), never another's. Without `may_fail` (a turn not the owner's own) a switch that did not
+        happen settles nothing: the pick stays pending for the next turn. '' when there was nothing to settle or tell."""
         state = self.state()
         kept = state.get("untold")
         owed = [o for o in (kept if isinstance(kept, list) else [kept]) if isinstance(o, dict)]
@@ -319,29 +276,33 @@ class ModelSwitch:
         for n, o in enumerate(unkeyed):
             o.update(key=uuid.uuid4().hex, at=time.time_ns() + n)
         wanted, outcome = str(state.get("wanted") or ""), ""
-        if wanted and state.get("told") != wanted and live:
+        if wanted and state.get("told") != wanted and live and (may_fail or (ran or "") == wanted):
             ran = ran or ""
             outcome = "switched" if ran == wanted else "not-switched"
             # Later than every notice already owed: the bridge posts in the order of this moment. Saved
             # whole: the cap is for what is still undeliverable after this turn's drain, below.
             at = max([time.time_ns()] + [int(o.get("at") or 0) + 1 for o in owed])
-            owed.append(dict({"picked": wanted, "ran": ran, "room": state.get("asked_in"), "key": uuid.uuid4().hex,
-                              "at": at}, **({"edit": state["card"]} if state.get("card") else {})))
+            owed.append({"picked": wanted, "ran": ran, "room": state.get("asked_in"), "key": uuid.uuid4().hex, "at": at})
             # Only a confirmed pick becomes the model in use: a model the runtime moved the turn to was never picked.
             self.save(untold=owed, told=wanted, **({"current": wanted, "confirmed": wanted} if outcome == "switched"
                                                    else {"wanted": ""}))
         elif unkeyed:
             self.save(untold=owed)
+        if live and ran and wanted and not outcome and ran != state.get("current"):
+            self.save(current=ran)      # a settled pick the runtime no longer runs: what it ran on is shown
         told, words = "", []
         while owed:
             first = {"picked": str(owed[0].get("picked") or ""), "ran": str(owed[0].get("ran") or "")}
-            card = self.built(state, **first)
-            if card is None:
+            # A pick made on the app's settings page names no room: the page reads the outcome from
+            # this state (model_settings), so it is settled without a card in any DM.
+            card = self.built(state, **first) if owed[0].get("room") else False
+            if card is False:
+                pass
+            elif card is None:
                 if room is None or str(owed[0].get("room") or "") != str(room):
                     break           # its words wait for a turn in the room the card was for
                 words.append(self.words(state, **first))
-            elif not self.post(owed[0].get("room"), card, str(owed[0].get("key") or ""), int(owed[0].get("at") or 0),
-                               str(owed[0].get("edit") or "")):
+            elif not self.post(owed[0].get("room"), card, str(owed[0].get("key") or ""), int(owed[0].get("at") or 0)):
                 break
             owed.pop(0)
             self.save(untold=list(owed))

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the package-canonical model card layout suite under repository coverage."""
+"""Run the package-canonical install --replace-install suite under repository coverage."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 if os.name == "nt":
-    print("ok - package model-card-layout suite is covered by the Linux coverage job")
+    print("ok - package install-replaces-other-install suite is covered by the Linux coverage job")
     raise SystemExit(0)
 
 TARGET = (
@@ -17,7 +17,7 @@ TARGET = (
     / "packages"
     / "ag2-sparrow"
     / "tests"
-    / "test_model_card_layout.py"
+    / "test_install_replaces_other_install.py"
 )
 
 try:

@@ -1947,7 +1947,11 @@ def main() -> int:
     _real_resolve, _asked = rtc.resolve_destination, []
     rtc.resolve_destination = lambda audience, **kw: _asked.append(audience) or ""
     rtc.OWNS_UNADDRESSED = lambda: False
-    check(rtc._project_hitl() == 0 and not _asked, "a bridge that is not the primary projects no cards")
+    _claim, rtc.CARD_CLAIM = rtc.CARD_CLAIM, None
+    check(rtc._project_hitl() == 0 and not _asked, "without a card claim, a bridge that is not the primary projects no cards")
+    rtc.CARD_CLAIM = _claim
+    check(rtc._project_hitl() == 0, "a core lane that is not the primary claims none of the core's cards")
+    _asked.clear()
     rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = "dev", lambda: True
     check(rtc._project_hitl() == 0 and _asked == [rtc.OWNER_PRIVATE], "a named primary looks for the owner DM to project cards")
     rtc.resolve_destination, rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = _real_resolve, _inst, _saved_owns

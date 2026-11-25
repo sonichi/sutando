@@ -232,6 +232,15 @@ classify = getattr(sup, "classify_pane_text", None)
 for label, (text, want) in PANES.items():
     check(f"pane: {label}", classify(text, workspace=ws) if classify else "missing", want)
 
+# Claude Code 2.1.322 draws a live turn as its spinner row alone, with no "esc to interrupt".
+# The fixture spells ESC as the text \x1b: `gh pr diff` refuses raw escape bytes.
+LIVE = (REPO / "tests" / "fixtures" / "pane-claude-turn-in-flight-spinner-only.txt"
+        ).read_text(encoding="utf-8").replace("\\x1b", "\x1b")
+check("pane: a live turn drawn as its spinner alone", classify(LIVE, workspace=ws), WORK)
+got, _ = run([obs(classify(f, workspace=ws), sup.frame_id(f))
+              for f in (LIVE.replace("19m 30s", f"{19 + i}m 30s") for i in range(6))])
+check("a 30-minute tool call under a live spinner is not an undelivered task", got, [N] * 6)
+
 
 # --- a stale limit banner over a session that is still progressing -----------------
 # After a re-login the CLI can leave its limit banner painted under a live session.

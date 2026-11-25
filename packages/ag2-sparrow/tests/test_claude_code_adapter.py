@@ -2630,6 +2630,11 @@ class LocalCommands(ConnectBase):
         seen[0] = seen[0][1:]
         self.assertEqual(seen[0][1:], ["-u", "-S", str(launcher.socket_path(cli.config_dir())), "attach", "-t", "=claude-local"])
         self.assertNotIn("sutando-tmux", seen[0][3])
+        # --view is the same attach as a read-only client: tmux, not the caller, refuses its keys.
+        with mock.patch.object(os, "execv", lambda f, argv: seen.append(argv)):
+            self.main("attach", "--view")
+        self.assertEqual(seen[1][1:], ["-u", "-S", str(launcher.socket_path(cli.config_dir())), "attach",
+                                       "-f", "read-only,ignore-size", "-t", "=claude-local"])
         help_text = subprocess.run([sys.executable, "-c", covered_code("import sys; sys.path.insert(0, %r); from ag2_sparrow.adapters."
                                     "claude_code.cli import main; main(['attach', '--help'])" % str(PKG))],
                                    capture_output=True, text=True).stdout
@@ -2640,13 +2645,15 @@ class LocalCommands(ConnectBase):
         self.configure()
         record = Path(cm.work_root(cli.load_config()[0])).joinpath(*launcher.MODEL_RECORD)
         record.unlink(missing_ok=True)
-        self.assertEqual(json.loads(self.main("model")[1]), {"model": None}, "no switch has been made here")
+        printed = lambda: {k: json.loads(self.main("model")[1])[k] for k in ("model", "current", "pending")}  # noqa: E731
+        self.assertEqual(printed(), {"model": None, "current": None, "pending": None}, "no switch has been made here")
         record.parent.mkdir(parents=True, exist_ok=True)
         record.write_text(json.dumps({"model": "opus"}))
         self.addCleanup(record.unlink, True)
-        self.assertEqual(json.loads(self.main("model")[1]), {"model": "opus"})
+        self.assertEqual(printed(), {"model": "opus", "current": "opus", "pending": None})
+        self.assertIn({"id": "opus", "name": "Opus"}, json.loads(self.main("model")[1])["available"])
         record.write_text("[")
-        self.assertEqual(json.loads(self.main("model")[1]), {"model": None}, "an unreadable record is not a model")
+        self.assertEqual(printed()["model"], None, "an unreadable record is not a model")
         rc, out, _ = self.main("model", "gpt-5")
         self.assertEqual((rc, json.loads(out)["switched"], "nothing sent" in json.loads(out)["detail"]), (1, False, True))
         rc, out, _ = self.main("model", "opus")

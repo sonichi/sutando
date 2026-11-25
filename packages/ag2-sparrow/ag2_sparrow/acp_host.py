@@ -726,8 +726,8 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
                     return "refused", "", isolated.refused % refused, turn
         if not isolated:
             store.remember(key, session_id, cwd, turns + 1, auth=auth)
-            turn.model = use_model(client, session_id, model, (opened or {}).get("models"), on_models,
-                                   args.rpc_timeout, log)
+        turn.model = use_model(client, session_id, model, (opened or {}).get("models"), on_models,
+                               args.rpc_timeout, log)
         turn.live = True
         note = media.note(bool(images)) if media else ""
         params = {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt}] + images

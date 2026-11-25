@@ -210,6 +210,14 @@ CONSUMER = {"pid": 11, "start": "s"}
 LIMIT = "You've hit your limit · resets 3pm\n❯ 1. Wait for limit to reset\n  2. Switch to usage credits"
 
 
+class LimitScreen(unittest.TestCase):
+    def test_the_usage_limit_screen_is_told_from_an_ordinary_pane_and_its_reset_read(self):
+        self.assertEqual(launcher.out_of_quota(LIMIT), "3pm")
+        self.assertEqual(launcher.out_of_quota("❯ 1. Wait for limit to reset\n  2. Switch to usage credits"), "")
+        for pane in ("", None, "❯ run the tests\n⏵⏵ accept edits on", "the limit of this approach is speed"):
+            self.assertIsNone(launcher.out_of_quota(pane), pane)
+
+
 class ClaudeRestart(unittest.TestCase):
     def setUp(self):
         d = tempfile.TemporaryDirectory()

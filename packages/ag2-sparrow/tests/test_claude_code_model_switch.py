@@ -167,20 +167,6 @@ class SwitchModel(unittest.TestCase):
         self.assertEqual([launcher.composer_boxed(t) for t in (None, box(), "\u276f ", coloured)], [False, True, False, True])
         self.assertIs(launcher.claude_model_switch.pane_composer.composer_text.__module__ == "ag2_sparrow.pane_composer", True)
 
-    def test_an_account_out_of_quota_is_told_to_switch_account_first(self):
-        # The limit screen stands where the input box was: no keys, and words the owner can act on.
-        for shown, said in (("You've hit your weekly limit \u00b7 resets Nov 28 at 1pm\n"
-                             "\u276f 1. Wait for limit to reset\n  2. Switch to usage credits",
-                             "refused: this account is out of quota (resets Nov 28 at 1pm). Switch account first."),
-                            ("  1. Wait here, then continue automatically at Nov 28 at 1pm\n  2. Switch to usage credits",
-                             "refused: this account is out of quota (resets Nov 28 at 1pm). Switch account first."),
-                            ("You've hit your usage limit\n\u276f 1. Stop and wait for limit to reset",
-                             "refused: this account is out of quota. Switch account first.")):
-            pane = Pane(says)
-            pane.text = shown
-            self.assertEqual(lc_for(pane, self.root).switch_model(REC, "opus"), (False, said), shown)
-            self.assertEqual(pane.sent, [], shown)
-
     def test_only_a_line_naming_the_model_asked_for_is_the_switch(self):
         def other(keys, pane):
             pane.text += "\n  \u23bf  Set model to Sonnet 4.6 and saved as your default"
@@ -284,7 +270,8 @@ class ModelCommand(unittest.TestCase):
 
     def test_it_prints_the_recorded_model_or_switches_and_says_how_it_went(self):
         rc, out, _, made = self.run_model()
-        self.assertEqual((rc, json.loads(out), made), (0, {"model": "sonnet"}, []))
+        shown = json.loads(out)
+        self.assertEqual((rc, shown["model"], shown["current"], shown["pending"], made), (0, "sonnet", "sonnet", None, []))
         rc, out, _, made = self.run_model("opus", "--confirm")
         self.assertEqual((rc, json.loads(out)), (0, {"switched": True, "model": "opus", "detail": "switched to opus"}))
         self.assertEqual(made, [({"ROOT": "/w"}, "/c"), ({"r": 1}, "opus", True)])

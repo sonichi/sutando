@@ -260,7 +260,7 @@ Anywhere else the client shows "Open this on the computer that runs <agent> to s
   Google sign-in per Mac, so this moves every Antigravity agent here; the card says so.
 - **The turn after a switch says so.** Each owner turn reads the account agy authenticated as from agy's own
   log (`~/.gemini/antigravity-cli/log/acp-server-*-<pid>.log`, `applyAuthResult: email=...`); when it differs
-  from the last one seen the answer starts with (Switched to <email>. New conversations use it ✓). Only the address is kept
+  from the last one seen the answer starts with (Switched to the <a…@domain> account.). Only the shortened address is kept
   (`state/agy-account.json`).
 - **Use API key** says the same for the key field (the Keychain item `gemini_key` reads).
 - **Stop using API key** deletes this agent's own Keychain item; the next turn opens a fresh Session on the sign-in.

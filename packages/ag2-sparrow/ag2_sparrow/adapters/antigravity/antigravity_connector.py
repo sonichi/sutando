@@ -48,8 +48,8 @@ import time
 import uuid
 from pathlib import Path
 
-from ... import (acp_host, card_desk, connector_cards, held_start, local_task_protocol, mcp_auth, model_switch,
-                 quota_notice, result_labels, result_publish)
+from ... import (account_switch, acp_host, card_desk, connector_cards, held_start, local_task_protocol, mcp_auth,
+                 model_switch, quota_notice, result_labels, result_publish)
 from ...bounded_file_read import read_regular_bytes
 from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore, quoted, trigger_of  # noqa: F401
 from ...acp_client import AcpClient as _SharedClient
@@ -63,6 +63,7 @@ from ...task_io import (COLLABORATOR, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, 
 
 NAME = "Antigravity"
 LIMITED_NO_SEND = "[no-send] Antigravity is at its usage limit; the owner was sent the account card\n"
+LIMITED_FOR_OTHERS = "Antigravity has reached its usage limit, so I can't answer right now. Its owner has been told."
 DEFAULT_ACP_COMMAND = "agy acp"
 NO_REPLY = "NO_REPLY"
 HELD_WAIT_S = held_start.WAIT_S
@@ -310,7 +311,6 @@ def declares_http_mcp(init):
 
 class AcpClient(_SharedClient):
     client_info = {"name": "ag2-sparrow-antigravity", "version": "0.1.0"}
-    redact_stderr = True    # agy may be handed the owner's Gemini API key (gemini_key): never into its log
 
 
 def log(*a):
@@ -540,12 +540,34 @@ def tier_block_lines(operator_lines):
     return out
 
 
+# How this Session reads what was said before: the core's own step (a shell command on a file of its
+# skills folder) is never passed on, and this is what agy has instead.
+ROOM_HISTORY = ("When the message refers to something said earlier in the room and you do not have it, read the "
+                "room's recent messages with room_action_read (the server's room.action.read): Action "
+                "room.context.read, room_id %s. Answer from what you read, not from a guess.")
+
+
+def bridge_text_apart(headers, message, operator_lines):
+    """(the sender's message, the bridge-written lines) for any task layout. `task_layout: mid` already has
+    them apart and is returned untouched: its message is the sender's alone, whatever it quotes. In any other
+    layout the bridge's blocks follow the message inside the body; they begin at the first line that opens
+    with ===, which only a writer can produce (local_task_protocol.BRIDGE_FENCE_RE: task_body_guard defangs
+    such a line typed by a sender). From there on the lines are the bridge's, and are filtered as such."""
+    if operator_lines or (headers.get("task_layout") or "").strip() == "mid":
+        return message, operator_lines
+    fence = local_task_protocol.BRIDGE_FENCE_RE.search(message or "")
+    if fence is None:
+        return message, operator_lines
+    return message[:fence.start()].rstrip(), [ln for ln in message[fence.start():].split("\n") if ln.strip()]
+
+
 def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_NOTE, shell_web=False,
                 readable=(), kind=None):
     """The turn's prompt. `cwd` is the working directory the turn may read and edit, None for an isolated turn;
     `shell_web` also grants commands and the web; `readable`, an isolated turn's copies of the sender's own
     attachments, the only files it may read."""
     event, _ = trigger_of(headers)
+    message, operator_lines = bridge_text_apart(headers, message, operator_lines)
     out = acp_host.task_framing(task_id, headers, message, tier_block_lines(session_lines(operator_lines)),
                                 "post in your final message", note)
     out.append("Answer through Sparrow, exactly once for this task: your final message in this turn is what Sparrow "
@@ -558,6 +580,9 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
                    "room_action_execute (the server's room.action.execute; find Actions with room_actions_search and "
                    "room_actions_describe) to create or edit Room Commons pages and for other room actions, and put "
                    "the page link in your reply." % mcp_auth.SERVER_NAME)
+        room = (headers.get("channel_id") or "").strip()
+        if room:
+            out.append(ROOM_HISTORY % room)
     if shell_web:
         out.append("You may run shell commands and fetch and search the web. You may read and edit files under %s." % cwd)
     else:
@@ -641,9 +666,6 @@ class Connector:
         opening one when not given, where only reads of the staged attachments are granted."""
         if owner:
             cwd, tools = self.args.cwd, shell_web_on(self.args, headers, kind)
-            # The owner's pick is applied on the owner's own turn, never on a collaborator's, which
-            # shares this turn mode: "on your next message" is the owner's next message.
-            picked = self.models.wanted() if (kind or turn_for(headers)[0]) == OWNER else ""
             with acp_host.task_media(headers, readable=True, log=log) as media:
                 read_only = (media.folder,) if media.folder else ()
                 return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
@@ -652,7 +674,7 @@ class Connector:
                                                                                       read_only=read_only,
                                                                                       **self.mcp_grant(headers, kind)),
                                            self.store, STDERR_NAME, NOT_SIGNED_IN, log, media=media,
-                                           model=str(picked or "") or None,
+                                           model=self.models.wanted(),
                                            on_models=self.models_seen,
                                            mcp_servers=self.mcp_servers_for(headers, kind),
                                            on_initialized=self.use_app_gemini_key)
@@ -671,7 +693,7 @@ class Connector:
         with acp_host.task_media(own_attachment_headers(headers, message), readable=False) as media:
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt, decide,
                                        self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=turn,
-                                       media=acp_host.Media(images=media.images))
+                                       media=acp_host.Media(images=media.images), model=self.models.wanted())
 
     def use_app_gemini_key(self, client, init, argv):
         """Owner and collaborator turns only: agy on the Gemini API key saved in the app (gemini_key). The auth
@@ -810,7 +832,9 @@ class Connector:
                                      kind=kind)
                 status, text, detail, turn = self.run_turn(task_id, headers, prompt, False, pair, message=message)
         # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
-        told = self.models.tell(turn.live, turn.model, headers.get("channel_id")) if kind == OWNER else ""
+        # The owner's pick runs on every turn, whoever sends it; the outcome is told in the owner's DM only,
+        # and only the owner's own turn may settle it as failed (another runtime's refusal is not theirs).
+        told = self.models.tell(turn.live, turn.model, headers.get("channel_id"), may_fail=kind == OWNER)
         asked = self.desk.marked(headers.get("access_tier"), path, status, text, result_file)
         # Out of quota: the owner is told once, by the account card; the card is the notice, so the room gets
         # no error line while agy is out (or the limit's own words when no card could be sent).
@@ -820,9 +844,22 @@ class Connector:
         body = self.answer_body(headers, status, text, detail, turn) + (unsaid and unsaid + "\n")
         if owner_turn and switched and not body.startswith("[no-send]"):
             body = quoted(switched).strip() + "\n" + body
-        if limited:
-            body = LIMITED_NO_SEND if self.quota.limited() else quoted(quota_notice.words(
+        if limited and self.quota.limited():
+            # The card is the owner's notice; anyone else who asked is told why there is no answer.
+            body = LIMITED_NO_SEND if kind == OWNER else quoted(LIMITED_FOR_OTHERS) + "\n"
+        elif limited:
+            body = quoted(quota_notice.words(
                 NAME, quota_notice.reset_from_text("%s %s" % (detail or "", text or "")), "")) + "\n"
+        signin = ""
+        if (owner_turn and not asked and agy_account.signed_out_error(status, detail) and acp_host.is_message(headers)
+                and self.in_owner_dm(path) and self.accounts.usable()):
+            # Signed out: the sign-in card in place of the error line; the line stays when it cannot be queued.
+            signin = "sign-in-card" if self.accounts.post(headers.get("channel_id"), self.accounts.signed_out_card()) \
+                else "sign-in-card-not-queued"
+            if signin == "sign-in-card":
+                # Only the error line gives way to the card: what this turn settled about a model or account stays.
+                kept = "\n".join(x for x in (quoted(switched).strip() if switched else "", unsaid) if x)
+                body = kept + "\n" if kept else account_switch.ANSWERED
         reason = ""
         if self.launch is not None:
             launches = LaunchLog(self.args.session_store)
@@ -842,7 +879,7 @@ class Connector:
                 "permissions": turn.decisions, "updates": dict(turn.updates), "answer_chars": len(text or ""),
                 "sspace_tools_down": reason,
                 "model": turn.model, **({"model_switch": told} if told else {}), **({"card": asked} if asked else {}),
-                **({"quota": quota} if quota else {})}
+                **({"quota": quota} if quota else {}), **({"sign_in": signin} if signin else {})}
 
     def pending_tasks(self, seen):
         now = time.time()
