@@ -281,7 +281,7 @@ def preflight(workspace, get_key, vault=None) -> int:
             print(f"ok: {decl['name']} (gateway from its seat's token file)")
             continue
         if decl is not None and decl.get("worker"):
-            why = worker_lane.credential(decl["worker"], workspace, None, vault)[1]
+            why = worker_lane.credential(decl["worker"], workspace, None, vault, instance=decl["instance"])[1]
             if not why:
                 print(f"ok: {decl['name']} (worker {decl['worker']}'s token, from its connection row)")
                 continue
@@ -325,7 +325,7 @@ def main(argv=None, workspace=None, get_key=None, run=runpy.run_module, vault=No
         return 2
     token, url = "", ""
     if decl.get("worker"):
-        token, problem = worker_lane.credential(decl["worker"], workspace, None, vault)
+        token, problem = worker_lane.credential(decl["worker"], workspace, None, vault, instance=decl["instance"])
         if problem:
             print(f"sparrow-agent-bridge: not starting: {problem}", file=sys.stderr)
             return 1

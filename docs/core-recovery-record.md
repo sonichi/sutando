@@ -111,14 +111,17 @@ the recovery actions for its state, picked by `recovery_actions.card_controls`:
 
 | Card | Buttons |
 |---|---|
-| Limit, refused turn (core) | Switch to <model> for each row of the runtime's own model list but the one in use and the capped one, Switch runtime, Retry now, Add another account, Refresh options, Restart core |
-| Limit, refused turn (worker seat) | Retry now, Add another account, Refresh options; no model switch (below) |
-| Limit menu (`/rate-limit-options`) | every choice the menu shows, in its own words, but a purchase or a model switch (keystrokes), Add another account, Refresh options; the core also gets Restart core |
-| Paused by the relaunch hold | Retry now, Switch to <model>, Switch runtime, Add another account, Refresh options |
+| Limit, refused turn (core) | Switch to <model> for each row of the runtime's own model list but the one in use and the capped one, Switch runtime, Retry now, Refresh options, Restart core |
+| Limit, refused turn (worker seat) | Retry now, Refresh options; no model switch (below) |
+| Limit menu (`/rate-limit-options`) | every choice the menu shows, in its own words, but a purchase or a model switch (keystrokes), Refresh options; the core also gets Restart core |
+| Paused by the relaunch hold | Retry now, Switch to <model>, Switch runtime, Refresh options |
 | Other blocked prompt (core) | Refresh options, Restart core |
 | Crash loop (`core_crash_loop`) | the core: Restart core (titled "Can't recover: core", as a new card, once the app's revive loop gives up); a stopped service: Start <service> again when the supervisor marks its terminal state `resettable` with an incident id, else none (only an app restart clears it) |
 
-No card offers a purchase. `Open terminal` stays last, as the client-local action.
+No card offers a purchase or an account change: a step-up id (`buy_credits`, `add_account`,
+`switch_account`) is offered only once its confirmed flow exists (`recovery_actions.STEP_UP_READY`,
+empty today), and the card copy names only the buttons it carries. `Open terminal` stays last, as
+the client-local action.
 
 **The runtime's own options.** The model buttons are the rows of the runtime's own model picker
 (`src/runtime_models.py`): Claude Code's `/model` menu or Codex's model list, read whenever it is
@@ -145,7 +148,9 @@ to `state/recovery/actions/<hitl_id>.json`. The monitor watching that card's ses
 (`src/recovery_actions.py`): once, within 10 minutes, only an id the card offered and the
 runtime carries out, with fixed argv, never what a subprocess printed. It writes the receipt to
 `state/recovery/receipts/<hitl_id>.json`, one line to `state/recovery/audit.jsonl` (who, what,
-session, outcome) and edits the card in place. `reset_service:<service>` is bound to the stop its card was raised on: the card keeps the
+session, outcome) and edits the card in place. A tap on `add_account` or `switch_account` (from
+a card posted before they were withheld) is refused until the confirmed, re-authenticated sign-in
+flow exists; a worker seat's card never runs `switch_model`, `restart_core` or `switch_runtime`. `reset_service:<service>` is bound to the stop its card was raised on: the card keeps the
 supervisor's app session and the stop's incident id, and the executor writes a request only while
 the fresh status still reports exactly that stop (a newer session or a newer trip makes the tap
 `stale`). The request is `state/control/services/req-<id>.json`

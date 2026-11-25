@@ -23,7 +23,7 @@ a click supplies is an id the card itself offered:
                         (core_crash_loop.request_reset); a card for an older session or trip is stale.
                         Its outcome is the supervisor's answer (settle_service_resets), or a timeout
     buy_credits, add_account, switch_account:<id>
-                        never run here: each needs a confirmed, re-authenticated step (P1)
+                        never offered or run here: each needs a confirmed, re-authenticated step (P1)
 
 then writes a C3 receipt to `state/recovery/receipts/<hitl_id>.json`, appends an audit line to
 `state/recovery/audit.jsonl`, and edits the same card with the outcome (the projector sends the
@@ -69,6 +69,8 @@ CLAIM_SUFFIX = ".claimed"
 AUDIT_FILE = recovery.AUDIT_FILE
 #: Change billing or the signed-in identity: refused until the confirmed, re-authenticated flow.
 STEP_UP = frozenset({recovery.BUY_CREDITS, recovery.ADD_ACCOUNT, recovery.SWITCH_ACCOUNT})
+#: The step-up ids whose confirmed flow exists, so a card may offer them; none yet.
+STEP_UP_READY: frozenset = frozenset()
 CONTINUE = ("continue", "Enter")
 _NAMED_CAP = re.compile(r"\breached your ([A-Za-z][\w.-]{0,24}) limit\b", re.I)
 
@@ -189,10 +191,15 @@ def card_controls(workspace: Path, runtime: Optional[str], *, seat: bool, kind: 
 
 def runtime_carries(ids: List[str], runtime: Optional[str]) -> List[str]:
     """The ids `runtime`'s host side carries out (core_recovery_state.RUNTIME_ACTIONS), so a card
-    never offers a button its executor refuses; a step-up id stays, since its refusal is the answer."""
+    never offers a button its executor refuses; a step-up id only once its flow is STEP_UP_READY."""
     import core_recovery_state
-    return [i for i in ids if recovery.parse(i) and (recovery.parse(i)[0] in STEP_UP
-            or core_recovery_state.parse_action_id(i, runtime or "claude") is not None)]
+
+    def offered(aid: str) -> bool:
+        verb = recovery.parse(aid)[0]
+        if verb in STEP_UP:
+            return verb in STEP_UP_READY
+        return core_recovery_state.parse_action_id(aid, runtime or "claude") is not None
+    return [i for i in ids if recovery.parse(i) and offered(i)]
 
 
 def incident_for(req) -> str:

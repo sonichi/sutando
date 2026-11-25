@@ -374,10 +374,11 @@ def destination_from_task(text: str, workspace: Optional[Path] = None) -> Destin
 
 def proactive_body(question: str, context: Optional[str], host: str,
                    dest: Destination, link: Optional[str] = None, intro: Optional[str] = None,
-                   asker: Optional[str] = None):
+                   asker: Optional[str] = None, choices=(), reason: Optional[str] = None):
     """(body, routed): routed is True when a `[channel:]` redirect leads the body.
-    `link` is where the owner can also answer, when the store knows it; `intro` is one
-    extra paragraph the store adds the first time; `asker` names who asks (default the core)."""
+    `link` is the row's address, kept out of the body (it unfurls as a card); `intro` is one
+    extra paragraph the store adds the first time; `asker` names who asks (default the core).
+    `choices` are the (label, what) pairs a card would have offered, listed so a text ask is whole."""
     routed = dest.bridge in _ROOM_MARKER_BRIDGES and bool(dest.channel)
     who = neutralize_markers(asker) if asker else f"the {host} core"
     lines = [f"[channel: {dest.channel}]" if routed else "[dm-only]",
@@ -385,8 +386,12 @@ def proactive_body(question: str, context: Optional[str], host: str,
              neutralize_markers(question).strip()]
     if context and context.strip():
         lines += ["", neutralize_markers(context).strip()]
-    if link:
-        lines += ["", f"Reply here, or set its Status on the row: {neutralize_markers(link)}"]
+    if choices:
+        if reason and reason.strip():
+            lines += ["", f"Why {neutralize_markers(choices[0][0])}: {neutralize_markers(reason).strip()}"]
+        lines += [""] + [f"- {neutralize_markers(label)}: {neutralize_markers(what)}" if what
+                         else f"- {neutralize_markers(label)}" for label, what in choices]
+        lines += ["", "Reply here with the one you choose."]
     else:
         lines += ["", "Reply here."]
     body = "\n".join(lines) + "\n"
@@ -463,6 +468,18 @@ def card_asker(ws: Path, ask_id: str, dest: Destination, host: str) -> tuple:
     return speaker(ws, name, host), worker, asked_by(ws, name)
 
 
+def card_has_lane(worker: str, room: str, ws: Path) -> bool:
+    """Whether one of `worker`'s serving lanes posts its card bound for `room` (`worker_lane.card_lane`)."""
+    from worker_lane import card_lane  # noqa: PLC0415
+    return card_lane(worker, room, ws) is not None
+
+
+def note_has_lane(worker: str, room: str, ws: Path) -> bool:
+    """Whether one of `worker`'s serving lanes claims its text note bound for `room` (`worker_lane.note_lane`)."""
+    from worker_lane import note_lane  # noqa: PLC0415
+    return note_lane(worker, room, ws) is not None
+
+
 def build_card(ask_id: str, question: str, context: Optional[str], host: str,
                default_action: Optional[str], reason: Optional[str], options,
                link: Optional[str] = None, intro: Optional[str] = None, room: str = "",
@@ -524,7 +541,7 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
     out = {"ask_id": ask_id, "heading": entry_heading(question, now), "workspace": str(ws), "host": host,
            "bridge": None, "channel": None, "where": None, "proactive_file": None, "send_error": None,
            "card": None, "card_error": None,
-           "sent_line": None, "outbox": None, "outbox_error": None,
+           "sent_line": None, "undeliverable": None, "outbox": None, "outbox_error": None,
            "question": question_dict(ask_id, question, context, now, default_action, reason, options, priority)}
     dest = Destination()
     if task_file:
@@ -536,6 +553,9 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
     if wants_card(default_action, options) and card_reaches_owner(dest, ws):
         try:
             who, by_worker, agent = card_asker(ws, ask_id, dest, host)
+            if by_worker and not card_has_lane(by_worker, card_room(dest), ws):
+                raise LookupError(f"no serving lane of worker {by_worker} reaches "
+                                  f"{card_room(dest) or 'the owner DM'}, so no lane would post it")
             if by_worker:
                 out["question"]["asked_by"] = agent
             card = build_card(ask_id, question, context, host, default_action, reason, options, link, intro,
@@ -566,6 +586,7 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
 
 def _ask_by_text(out: dict, question, context, host, dest, link, intro, as_session: bool = True) -> None:
     """`as_session` False keeps the core's name: a question first asked by the core's card stays the core's."""
+    from proactive_routing import proactive_worker  # noqa: PLC0415
     ws, name, who, err = Path(out["workspace"]), None, None, None
     try:
         name = proactive_filename(out["ask_id"], dest.bridge)
@@ -575,11 +596,22 @@ def _ask_by_text(out: dict, question, context, host, dest, link, intro, as_sessi
             who = speaker(ws, name, host)
     except Exception as e:  # noqa: BLE001 — the question is still recorded
         err = f"{type(e).__name__}: {e}"
-    body, routed = proactive_body(question, context, host, dest, link, intro, who)
+    q = out.get("question") or {}
+    default_action, options = q.get("default_action"), q.get("options") or ()
+    choices = card_choices(default_action, options) if wants_card(default_action, options) else []
+    reason = q.get("reason") if (default_action or "").strip() else None
+    body, routed = proactive_body(question, context, host, dest, link, intro, who, choices, reason)
     out["bridge"], out["channel"] = dest.bridge, dest.channel if routed else None
     out["where"] = (f"{dest.bridge} {dest.channel}" if routed else
                     f"{dest.bridge} owner-dm" if dest.bridge else "owner-dm (last-active bridge)")
     out["card"] = None
+    worker = proactive_worker(name or "") if err is None and as_session else ""
+    if worker and not note_has_lane(worker, dest.channel if routed else "", ws):
+        # A note no lane claims would sit in results/ unsent: nothing is queued.
+        out["undeliverable"] = (f"no serving lane of worker {worker} reaches {out['where']}, "
+                                "so nothing was queued")
+        err = f"UNDELIVERABLE: {out['undeliverable']}"
+        print(f"pending_questions_ask: {out['ask_id']} {err}", file=sys.stderr)
     if err is None:
         try:
             write_proactive(ws / "results", name, body)
@@ -684,11 +716,15 @@ def report_lines(out: dict) -> list:
     elif out.get("proactive_file"):
         lines.append(f"sent: queued {out['where']} via results/{out['proactive_file']} "
                      "(a bridge drain delivers it; the reminder re-raises an undrained file)")
+    elif out.get("undeliverable"):
+        lines.append(f"sent: FAILED, UNDELIVERABLE — {out['undeliverable']} (the record stands; ask by hand)")
     else:
         lines.append(f"sent: FAILED — {out.get('send_error')} (the record stands; ask by hand)")
     if out.get("send_error") and (out.get("proactive_file") or out.get("card")):
         lines.append(f"note: {out['send_error']}")
-    if out.get("card_error"):
+    if out.get("card_error") and out.get("undeliverable"):
+        lines.append(f"note: decision card not used ({out['card_error']}); not asked as text either")
+    elif out.get("card_error"):
         lines.append(f"note: decision card not used ({out['card_error']}); asked as text instead")
     if out.get("card_note"):
         lines.append(f"note: {out['card_note']}; kept as the decision card, and no text was sent")

@@ -859,7 +859,7 @@ class RoundThree(Seated):
 
     def test_own_is_not_published_while_the_old_lane_has_not_stopped(self):
         with mock.patch.object(C, "bridge_pid", lambda instance, ws: 4242), \
-                mock.patch.object(worker_lane, "_declaration_for", lambda w, ws: (None, "")), \
+                mock.patch.object(worker_lane, "_declaration_for", lambda w, ws, **kw: (None, "")), \
                 mock.patch.object(C, "_stop_row", side_effect=C.BridgeStillRunning("lane", 4242)):
             out, why = self.migrate(handler=self.handler)
         self.assertIn("did not stop", why)

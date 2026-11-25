@@ -197,12 +197,13 @@ class CardButtons(Base):
         req = self.card()
         self.assertEqual([a.id for a in req.actions],
                          [sw(self.ws, "sonnet-5-1m-context"), sw(self.ws, "fable-5-1"), sw(self.ws, "haiku"),
-                          "retry_now", "add_account", "refresh_options", "restart_core", "open_terminal"],
-                         "the runtime's own list, minus the model in use; no purchase")
+                          "retry_now", "refresh_options", "restart_core", "open_terminal"],
+                         "the runtime's own list, minus the model in use; no purchase, no account step-up")
         kinds = {a.id: a.kind for a in req.actions}
         self.assertEqual({k for i, k in kinds.items() if i != "open_terminal"}, {recovery.ACTION_KIND})
         self.assertEqual(req.actions[-1].kind, "open_terminal", "the terminal stays last and host-only")
         self.assertIn("tap a model below", req.message, "no runtime button here (no codex CLI), so none named")
+        self.assertNotIn("Another account", req.message, "the card names no button it does not carry")
 
     def test_switch_buttons_skip_the_model_in_use_and_codex_offers_the_runtime_instead(self):
         (self.ws / "state" / "model-switch.json").write_text(json.dumps({"model": "claude-sonnet-5[1m]"}))
@@ -263,7 +264,7 @@ class CardButtons(Base):
     def test_live_seat_fable_refusal_card(self):
         req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED, seat=SEAT)
         ids = [a.id for a in req.actions]
-        self.assertEqual(ids, ["retry_now", "add_account", "refresh_options", "open_terminal"],
+        self.assertEqual(ids, ["retry_now", "refresh_options", "open_terminal"],
                          "a seat shares the core's config dir: no model switch, no core action, no purchase")
         self.assertIn(SEAT, req.title)
         self.assertIn(recovery.SEAT_MODEL_LOCKED, req.message, "the card says what the notice says")
@@ -416,14 +417,36 @@ class Executor(Base):
         [receipt] = self.run_pending(run)
         self.assertEqual((receipt["outcome"], run.calls), ("refused", []), "Codex has no model switch")
 
-    def test_step_up_actions_never_run(self):
-        self.assertNotIn("buy_credits", [a.id for a in self.card().actions], "a purchase is never offered")
+    def test_no_card_offers_a_step_up_until_its_flow_exists(self):
+        self.assertEqual(RA.STEP_UP_READY, frozenset())
+        cards = [self.card(), self.card(kind="turn-rejected", prompt=FABLE_REFUSED),
+                 self.card(kind="turn-rejected", prompt=FABLE_REFUSED, seat=SEAT),
+                 self.card(kind="selection", prompt=LIMIT_MENU, seat=SEAT),
+                 self.card(kind="selection", prompt=LIMIT_MENU), self.card(runtime="codex")]
+        for req in cards:
+            with self.subTest(gate=req.subject.get("gate"), seat=req.subject.get("seat")):
+                self.assertFalse([a.id for a in req.actions
+                                  if recovery.is_recovery(a.id) and recovery.parse(a.id)[0] in RA.STEP_UP])
+                self.assertNotIn("Another account", req.message)
+        step_ups = [recovery.BUY_CREDITS, recovery.ADD_ACCOUNT, "switch_account:acct_3f9a2b"]
+        for runtime in ("claude", "codex", None):
+            self.assertEqual(RA.runtime_carries(step_ups + ["refresh_options"], runtime), ["refresh_options"])
+
+    def test_a_step_up_tap_from_an_older_card_is_still_refused(self):
+        # A card posted before step-ups were withheld still carries the button; its tap runs nothing.
         req = self.card(prompt=LIMIT + "add_account")
-        self.click(req, "add_account")
+        with self.mgr.store.locked():
+            cur = self.mgr.get(req.id)
+            cur.actions = cur.actions[:-1] + [tui_gate.recovery_action(recovery.ADD_ACCOUNT)] + cur.actions[-1:]
+            self.mgr.store.save(cur)
+        self.click(self.mgr.get(req.id), "add_account")
         run = Run()
         [receipt] = self.run_pending(run)
-        self.assertEqual((receipt["outcome"], run.calls, self.keys), ("refused", [], []))
+        why = ("This changes billing or the signed-in account, so it needs a confirmed sign-in step "
+               "that is not available from here yet; nothing was changed.")
+        self.assertEqual((receipt["outcome"], receipt["reason"], run.calls, self.keys), ("refused", why, [], []))
         card = self.mgr.get(req.id)
+        self.assertTrue(card.message.endswith(why), "the card says why, in place")
         self.assertEqual((card.status, card.subject.get("superseded")), (STATUS_RESOLVED, True),
                          "a card takes one tap: it says why and is closed for a fresh one")
 
@@ -689,8 +712,9 @@ class PausedCard(Base):
         self.assertEqual(a.id, b.id)
         self.assertEqual([x.id for x in a.actions],
                          ["retry_now", sw(self.ws, "sonnet-5-1m-context"), sw(self.ws, "fable-5-1"),
-                          sw(self.ws, "haiku"), "add_account", "refresh_options"])
+                          sw(self.ws, "haiku"), "refresh_options"])
         self.assertIs(a.subject.get("remind"), False)
+        self.assertNotIn("Another account", a.message)
         for word in COMMANDS + PURCHASE_WORDS:
             self.assertNotIn(word, a.message)
         core_limit_hold.clear(self.ws)
@@ -882,7 +906,7 @@ class ExecutorEdges(Base):
     def test_refresh_leaves_a_tapped_card_and_a_card_that_already_has_the_list(self):
         req = self.card()
         self.assertEqual(RA.refresh_limit_card(self.mgr, self.ws, CORE, "claude"), [], "already the list")
-        self.click(req, "add_account")
+        self.click(req, "retry_now")
         (self.ws / "state" / "runtime-models.claude.json").unlink()
         record_list(self.ws, runtime_models.parse_picker(PICKER, "claude")[:3])
         self.assertEqual(RA.refresh_limit_card(self.mgr, self.ws, CORE, "claude"), [], "a tapped card is not edited")

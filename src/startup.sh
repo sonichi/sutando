@@ -742,15 +742,17 @@ fi
 # with the tree. The legacy bare-& launch below runs only when no launchd job
 # exists (older checkout without the template, or an install that refused).
 # The proxy keeps running either way; with the status line recorder on, sessions go direct.
+_sessions_go_direct() {
+  [ -r "$REPO/src/skill-manifest-config.sh" ] && [ -r "$REPO/src/claude_routing.sh" ] || return 1
+  . "$REPO/src/skill-manifest-config.sh"
+  . "$REPO/src/claude_routing.sh"
+  claude_direct_routing
+}
 _route_sessions_to_proxy() {
-  if [ -r "$REPO/src/skill-manifest-config.sh" ] && [ -r "$REPO/src/claude_routing.sh" ]; then
-    . "$REPO/src/skill-manifest-config.sh"
-    . "$REPO/src/claude_routing.sh"
-    if claude_direct_routing; then
-      claude_unset_local_proxy
-      echo "  ✓ Claude sessions call Anthropic directly (proxy left running, unused by them)"
-      return 0
-    fi
+  if _sessions_go_direct; then
+    claude_unset_local_proxy
+    echo "  ✓ Claude sessions call Anthropic directly (proxy left running, unused by them)"
+    return 0
   fi
   export ANTHROPIC_BASE_URL=http://localhost:7846
 }
@@ -759,6 +761,17 @@ start_credential_proxy() {
   local _PROXY_INSTALLER="$REPO/src/install-credential-proxy-launchd.sh"
   local _PROXY_SERVICE _PROXY_SCRIPT _state _exit
   _PROXY_SERVICE="gui/$(id -u)/$_PROXY_LABEL"
+  # Direct sessions need no proxy; a loaded job is left for proxy_retire.py to judge.
+  if _sessions_go_direct; then
+    claude_unset_local_proxy
+    echo "  ✓ Claude sessions call Anthropic directly; credential proxy not started"
+    return 0
+  fi
+  if claude_proxy_owner_off 2>/dev/null; then
+    claude_unset_local_proxy
+    echo "  credential proxy kept off (CREDENTIAL_PROXY_ENABLED is off); Claude will connect directly"
+    return 0
+  fi
   if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ]; then
     # An already-loaded job may carry a plist generated before the current pins existed;
     # the installer owns that comparison because it owns what the plist renders.
