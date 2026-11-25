@@ -47,7 +47,9 @@ is under way is refused.
 4. `settle` confirms from those two, never from a heartbeat alone: the record names the target with a
    session created after the switch began, and the runtime the launcher picks next is the target. It
    posts "Switched to Y. The core restarted on it ✓" or what could not be confirmed. When graceful-restart
-   did not stop the core (exit 3, 4, 5) it says the core is still on X.
+   did not stop the core (exit 3, 4, 5) it says the core is still on X. When it did and no core comes
+   back on Y, `switch` puts X's record back, restarts onto X the same way, and says on the card
+   whether X is running again or what to do outside chat: a core that is down cannot answer.
 
 One card, updated in place: the "switching" answer edits the tapped card's own event
 (`room.message.edit`, so it then shows "Runtime: Switching…" in place of the card), and the

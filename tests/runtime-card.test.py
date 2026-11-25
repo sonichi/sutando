@@ -1263,6 +1263,44 @@ class Switch(Base):
         self.assertEqual(out["outcome"], "info")
         self.assertIn("config still names Codex", out["say"])
 
+    def failing_switch(self, back_ok):
+        """The restart onto Claude Code fails and leaves no core; the relaunch of Codex comes back or not."""
+        self.record("codex", T0 - 600)
+        before = self.ws.joinpath(*rtc.RECORD).read_text()
+        seen = []
+
+        def restart(rt):
+            self.restarts.append(rt)
+            self.clock.t += 30
+            if rt == "claude":
+                self.ws.joinpath(*rtc.RECORD).unlink()
+                return 1
+            seen.append(self.ws.joinpath(*rtc.RECORD).read_text())
+            if back_ok:
+                self.record("codex", self.clock.t - 5)
+                self.current = self.selected = "codex"
+            return 0 if back_ok else 1
+        self.restart = restart
+        rc, out = self.carded()
+        self.assertEqual(seen, [before], "the previous runtime's record is put back before it is relaunched")
+        self.assertEqual(self.restarts, ["claude", "codex"])
+        self.assertEqual((rc, out["outcome"], out["fell_back"]), (1, "error", "codex"))
+        self.assertEqual(self.fake.edits()[-1], ("$card1", "Runtime: " + out["say"]))
+        self.assertNotIn("runtime card", out["say"])
+        return out
+
+    def test_a_failed_restart_relaunches_the_previous_runtime_and_says_so_on_the_card(self):
+        out = self.failing_switch(back_ok=True)
+        self.assertEqual(out["say"], "Couldn't switch to Claude Code: the restart did not finish cleanly (exit 1). "
+                                     "I started Codex again, and the core is running on it.")
+        self.assertTrue(out["fell_back_confirmed"])
+
+    def test_a_relaunch_that_fails_too_names_what_to_do_outside_chat(self):
+        out = self.failing_switch(back_ok=False)
+        self.assertIn("Starting Codex again did not come back either, so the core may be down.", out["say"])
+        self.assertIn("Quit and reopen the s.space app", out["say"])
+        self.assertFalse(out["fell_back_confirmed"])
+
     def test_a_restart_that_did_not_happen_says_still_on_the_old_runtime(self):
         # 3 and 5 end here at once; 4 (put off) has its own tests below.
         for code in (c for c in rtc.NOT_RESTARTED if c != rtc.DEFERRED):

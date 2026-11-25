@@ -30,6 +30,7 @@ end, then `start-cli.sh --restart --runtime <rt>`). The launcher writes the desk
 run that CLI. `settle` then confirms from both, never from a heartbeat alone: the record names the
 target runtime with a session created after the switch began, and the runtime the launcher would
 pick next (desktop selection, else config) is the target too. It posts the outcome in the same DM.
+A restart that leaves no core on the target is followed by one back onto the previous runtime.
 The workspace, tasks, results, state and memory are shared by both runtimes; only the live
 conversation does not carry over, and the cards say so.
 
@@ -925,8 +926,8 @@ def outcome(rt: str, was: str, got: dict, rc: int = 0) -> tuple:
 
 def settle_and_tell(ws: Path, room: str, rt: str, was: str, since: float, attempt: str, *, rc: int = 0,
                     card: str = "", core=None, execute=None, sleep=time.sleep, clock=time.time,
-                    gateway: str = "") -> dict:
-    got = confirm(ws, rt, since, sleep=sleep, clock=clock)
+                    gateway: str = "", got: Optional[dict] = None) -> dict:
+    got = got if got is not None else confirm(ws, rt, since, sleep=sleep, clock=clock)
     state, words = outcome(rt, was, got, rc)
     if gateway not in ("", "restored"):
         # Not a clean success any more: the tick goes, the warning follows.
@@ -937,6 +938,42 @@ def settle_and_tell(ws: Path, room: str, rt: str, was: str, since: float, attemp
                   execute=execute, tries=POST_TRIES, sleep=sleep)
     return {**out, "outcome": state, "say": words, "core_confirmed": got["core"],
             "selection_confirmed": got["selected"]}
+
+
+def why_not(rt: str, got: dict, rc: int) -> str:
+    """Why a restart onto `rt` did not leave a confirmed core on it."""
+    if rc:
+        return f"the restart did not finish cleanly (exit {rc})"
+    rec = got["record"]
+    seen = (f"the last confirmed core runs {name(rec['runtime'])}" if rec else "no core has been confirmed since")
+    return f"I could not confirm it is running on {name(rt)}: {seen}"
+
+
+def fall_back(ws: Path, room: str, rt: str, was: str, attempt: str, got: dict, rc: int, before: Optional[str], *,
+              card: str = "", restart=restart_core, run=subprocess.run, core=None, execute=None,
+              sleep=time.sleep, clock=time.time) -> dict:
+    """The switch to `rt` left no confirmed core: put back the record of `was`, start `was` again the same
+    way, and say on the card what came of both. Said from here: a core that is down cannot answer."""
+    if before is not None:
+        from local_record import write_text_whole
+        write_text_whole(ws.joinpath(*RECORD), before)
+    since = clock()
+    back_rc = restart(was)
+    gateway = restore_desktop_gateway(run) if back_rc not in NOT_RESTARTED else ""
+    back = confirm(ws, was, since, sleep=sleep, clock=clock)
+    lead = f"Couldn't switch to {name(rt)}: {why_not(rt, got, rc)}."
+    if back["core"]:
+        words = f"{lead} I started {name(was)} again, and the core is running on it."
+    else:
+        where = ("Quit and reopen the s.space app on the computer that runs the core." if desktop_hosted() else
+                 "On the computer that runs the core, run src/restart.sh in the engine folder.")
+        words = f"{lead} Starting {name(was)} again did not come back either, so the core may be down. {where}"
+    if gateway not in ("", "restored"):
+        words = f"{words} {GATEWAY_LOST.format(why=gateway)}"
+    out = _answer(ws, room, card, "error", "Not switched", words, f"runtime-card:{attempt}:outcome", core=core,
+                  execute=execute, tries=POST_TRIES, sleep=sleep)
+    return {**out, "outcome": "error", "say": words, "core_confirmed": False, "selection_confirmed": False,
+            "fell_back": was, "fell_back_rc": back_rc, "fell_back_confirmed": back["core"]}
 
 
 def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core, sleep=time.sleep,
@@ -955,6 +992,10 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
             if not is_recorded(ws, rec):
                 return _emit({"status": "refused", "why": "that attempt is not the one under way"}, 2)
             was = configured_runtime()
+            try:
+                before = ws.joinpath(*RECORD).read_text(encoding="utf-8")
+            except OSError:
+                before = None
             started = clock()
             rc = restart(args.runtime)
             restarted = rc not in NOT_RESTARTED
@@ -999,8 +1040,14 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
                 return _emit({**out, "outcome": "error", "say": words, "restart": "not-restarted", "rc": rc}, 1)
             # This switch's own restart replaced the session: the desktop's gateway window went with it.
             gateway = restore_desktop_gateway(run) if restarted else ""
-            told = settle_and_tell(ws, args.room, args.runtime, was, started, args.attempt, rc=rc, card=args.card,
-                                   core=core, execute=execute, sleep=sleep, clock=clock, gateway=gateway)
+            got = confirm(ws, args.runtime, started, sleep=sleep, clock=clock)
+            if not got["core"] and restarted and was in NAMES and was != args.runtime:
+                told = fall_back(ws, args.room, args.runtime, was, args.attempt, got, rc, before, card=args.card,
+                                 restart=restart, run=run, core=core, execute=execute, sleep=sleep, clock=clock)
+            else:
+                told = settle_and_tell(ws, args.room, args.runtime, was, started, args.attempt, rc=rc,
+                                       card=args.card, core=core, execute=execute, sleep=sleep, clock=clock,
+                                       gateway=gateway, got=got)
             told = dict(told, **({"gateway": gateway} if gateway else {}))
         finally:
             release(ws, rec)
