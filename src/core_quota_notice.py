@@ -28,6 +28,7 @@ FILE = ("state", "core-quota-card.json")
 RETRY_S = 60.0
 CARDED_KEEP = 100   # the owner messages already answered with the card, this episode
 SEND_TIMEOUT_S = 90.0
+AGAIN_TRIES = 5     # a follow-up card that failed is tried this many times in all, RETRY_S doubling between
 # The runtime's own words for when the limit ends ("try again at 3:05 PM", "resets in 2 hours"); only
 # time-like characters of them are kept, so nothing else of the error reaches the DM.
 _RESET = re.compile(r"\b(?:resets?(?: after| at| in| on)?|try again (?:at|in|after)|retry (?:at|in|after)"
@@ -236,17 +237,25 @@ class QuotaNotice:
         """The card once more for each owner message that arrived since: told, never left to wait."""
         carded = [t for t in rec.get("carded") or [] if isinstance(t, str)]
         fresh = [t for t in tasks if t not in carded]
-        if rec.get("via") == "notice" or not fresh:
+        failed = rec.get("again_failed") if isinstance(rec.get("again_failed"), dict) else {}
+        if rec.get("via") == "notice" or not fresh or self.now() < float(failed.get("next") or 0):
             self.save(rec)
             return ""
         # Recorded before the send: a stop mid-send never posts it twice for the same message.
-        self.save(dict(rec, carded=(carded + fresh)[-CARDED_KEEP:]))
+        done = dict(rec, carded=(carded + fresh)[-CARDED_KEEP:])
+        done.pop("again_failed", None)
+        self.save(done)
         try:
             posted = self._send(rec)
         except Exception as e:  # noqa: BLE001 - a notice that cannot be sent never stops the core's adapter
             self.log("quota card not sent:", type(e).__name__)
             posted = False
-        return "quota-card-again" if posted else "quota-not-posted"
+        if posted:
+            return "quota-card-again"
+        tries = int(failed.get("n") or 0) + 1
+        if tries < AGAIN_TRIES:   # a confirmed failure: the messages stay uncarded and are tried again later
+            self.save(dict(rec, again_failed={"n": tries, "next": self.now() + RETRY_S * 2 ** (tries - 1)}))
+        return "quota-not-posted"
 
 
 def owner_waiting(workspace) -> list:

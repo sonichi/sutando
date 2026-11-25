@@ -391,6 +391,30 @@ class EveryMessage(Base):
         q.cleared()
         self.assertEqual(q.hit("", tasks=["t3"]), "quota-card", "a new limit is a new episode")
 
+    def test_a_failed_follow_up_is_tried_again_after_its_backoff_then_not_resent(self):
+        q = self.notice()
+        self.assertEqual(q.hit("", tasks=["t1"]), "quota-card")
+        self.posted = False
+        self.assertEqual(q.hit("", tasks=["t1", "t2"]), "quota-not-posted")
+        self.posted = True
+        self.now[0] += cqn.RETRY_S - 1
+        self.assertEqual(q.hit("", tasks=["t1", "t2"]), "", "not before the backoff")
+        self.now[0] += 1
+        self.assertEqual(q.hit("", tasks=["t1", "t2"]), "quota-card-again")
+        self.assertEqual(q.hit("", tasks=["t1", "t2"]), "")
+        self.assertEqual(len(self.cards), 3)
+        self.assertNotIn("again_failed", self.record())
+
+    def test_a_follow_up_that_keeps_failing_stops_after_its_tries(self):
+        q = self.notice()
+        q.hit("", tasks=["t1"])
+        self.posted = False
+        for _ in range(cqn.AGAIN_TRIES):
+            self.assertEqual(q.hit("", tasks=["t1", "t2"]), "quota-not-posted")
+            self.now[0] += 10 ** 6
+        self.assertEqual(q.hit("", tasks=["t1", "t2"]), "")
+        self.assertEqual(len(self.cards), 1 + cqn.AGAIN_TRIES)
+
     def test_after_the_paused_notice_told_it_no_card_follows(self):
         self.posted = False
         q = self.notice()
