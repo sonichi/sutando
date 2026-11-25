@@ -1397,6 +1397,30 @@ class Hooks(unittest.TestCase):
         with mock.patch.object(gw.Path, "glob", side_effect=OSError("denied")):
             self.assertFalse(gw._seat_took("task-unreadable-seat", 0.0))
 
+    def test_a_seat_restarted_between_the_two_readings_takes_nothing(self):
+        """The copy is read, then the lock. A seat restarted in between has cleared the old copy and
+        holds the lock: the old reading must not be paired with the new seat's lock."""
+        tid = "task-restart-interleaved"
+        copy = self.seat_copy(tid)
+        real = gw._seat_lock_held
+
+        def restarted_then(act):
+            def held(path):
+                act()               # the replacement seat ran its cleanup, took the lock...
+                return real(path)
+            return held
+
+        def rewritten():            # ...and has by now written a copy of its own (a new file)
+            copy.unlink()
+            copy.write_text("task")
+
+        for what, act in (("cleared", copy.unlink), ("rewritten", rewritten)):
+            copy.write_text("task")
+            with self.subTest(what), mock.patch.object(gw, "_seat_lock_held", restarted_then(act)):
+                self.assertFalse(gw._seat_took(tid, 0.0))
+        copy.write_text("task")
+        self.assertTrue(gw._seat_took(tid, 0.0), "the same copy before and after the lock reading is taken")
+
     def test_a_copy_or_a_lock_that_cannot_be_examined_takes_nothing(self):
         gone = mock.Mock(stat=mock.Mock(side_effect=OSError("vanished")))
         with mock.patch.object(gw.Path, "glob", return_value=[gone]):

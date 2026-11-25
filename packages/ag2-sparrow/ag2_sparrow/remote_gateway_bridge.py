@@ -5293,10 +5293,16 @@ def _seat_took(tid: str, since: float) -> bool:
         return False
     for copy in copies:
         try:
-            if copy.stat().st_mtime >= since and _seat_lock_held(copy.parent.parent / "taking.lock"):
-                return True
+            seen = copy.stat()
+            if seen.st_mtime < since or not _seat_lock_held(copy.parent.parent / "taking.lock"):
+                continue
+            # The lock was read after the copy: a seat restarted in between holds it over a copy it did
+            # not write. The seat replaces a copy whole, so the same file still there is the holder's.
+            still = copy.stat()
         except OSError:
             continue
+        if (still.st_ino, still.st_mtime_ns) == (seen.st_ino, seen.st_mtime_ns):
+            return True
     return False
 
 
