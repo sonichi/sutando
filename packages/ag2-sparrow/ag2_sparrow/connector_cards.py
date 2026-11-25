@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import sys
 import time
 import uuid
@@ -206,8 +207,9 @@ class Poster:
             except Exception as e:  # noqa: BLE001 - stays queued, retried under the same key
                 self.log("agent-card: post failed (will retry): %s" % type(e).__name__)
                 code = getattr(e, "code", None)
-                if isinstance(e, NoVerdict) or (code if isinstance(code, int) else getattr(e, "status", None)) in THROTTLED:
-                    # Told to come back later, or answered with no verdict: the next try waits, doubling.
+                if isinstance(e, (NoVerdict, TimeoutError, socket.timeout)) or (
+                        code if isinstance(code, int) else getattr(e, "status", None)) in THROTTLED:
+                    # Told to come back later, timed out, or answered with no verdict: the next try waits, doubling.
                     tries = int(record.get("tries") or 0) + 1
                     _write(path, dict(record, tries=tries, not_before=self.clock() + min(RETRY_MAX_S, RETRY_BASE_S * 2 ** (tries - 1))))
                 held |= same

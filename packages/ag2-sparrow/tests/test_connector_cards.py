@@ -335,6 +335,30 @@ class ConnectorCards(unittest.TestCase):
             return {"ok": True, "event_id": "$new"}
         self.assertEqual((cc.Poster(self.state, refuse, log=self.logs.append, clock=lambda: now[0]).sweep(), calls), (1, ["edit", "message"]))
 
+    def test_a_send_that_times_out_waits_before_its_next_try_doubling_under_the_same_key(self):
+        import socket
+        body, card = model_card()
+        qid = cc.queue(self.state, ROOM, body, card, edit="$card1", now=1000.0)
+        sent, now = [], [1000.0]
+
+        def post(payload):
+            sent.append((payload["op"], payload["dedupe_key"]))
+            if len(sent) <= 3:
+                raise (TimeoutError("slow") if len(sent) != 2 else socket.timeout("slow"))
+            return {"ok": True, "event_id": "$edit1"}
+
+        poster = cc.Poster(self.state, post, log=self.logs.append, clock=lambda: now[0])
+        waits = []
+        for _ in range(3):
+            self.assertEqual(poster.sweep(), 0)
+            entry = json.loads((self.state / "agent-cards" / "outbox" / (qid + ".json")).read_text())
+            waits.append(entry["not_before"] - now[0])
+            self.assertEqual(poster.sweep(), 0, "not tried again before its wait is over")
+            now[0] = entry["not_before"]
+        self.assertEqual(waits, [cc.RETRY_BASE_S, 2 * cc.RETRY_BASE_S, 4 * cc.RETRY_BASE_S])
+        self.assertEqual(poster.sweep(), 1)
+        self.assertEqual(sent, [("edit", "agent-card-edit:" + qid)] * 4, "the same edit, the same key, no new message")
+
     def test_an_edit_waits_behind_an_earlier_edit_of_the_same_event_whatever_card_each_carries(self):
         ac, _ = cc._core()
         status = ac.build("model-switch-status", "done", title="Model", body="Model: now Opus", text="Switched.")
