@@ -130,7 +130,7 @@ def record(workspace: Path, event_id: str, card: Mapping[str, object], *, room: 
             was = live_cards.pop(event_id, None)
             retired.pop(event_id, None)
             if not (payloads or picker):    # the edit has no buttons: the ones it replaced never act again
-                retired[event_id] = {"why": "settled", "expires_at": _retire_until(was, now)}
+                retired[event_id] = _retire(was, "settled", now)
         elif event_id in retired:
             return False
         cards = dict(live_cards)
@@ -144,7 +144,7 @@ def record(workspace: Path, event_id: str, card: Mapping[str, object], *, room: 
                 return False
             for k, v in same.items():
                 cards.pop(k)
-                retired[k] = {"why": "replaced", "expires_at": _retire_until(v, now)}
+                retired[k] = _retire(v, "replaced", now)
         if payloads or picker:
             cards[event_id] = {"card_id": card_id, "offers": payloads, "picker": picker, "room": room,
                                "lane": lane, "handler": handler, "expires_at": now + ttl_s, "issued_at": order}
@@ -167,6 +167,12 @@ def _retire_until(entry: object, now: float) -> float:
     return max(own, now + TTL_S)
 
 
+def _retire(entry: object, why: str, now: float) -> dict:
+    """A retired id's record; it keeps the room its card was posted in, when that is known."""
+    room = str(entry.get("room") or "") if isinstance(entry, dict) else ""
+    return {"why": why, "expires_at": _retire_until(entry, now), **({"room": room} if room else {})}
+
+
 def settle(workspace: Path, event_id: str, *, now: Optional[float] = None) -> bool:
     """Forget the card posted as `event_id`, so no button of it acts again; False when it was not known."""
     from file_lock import locked_file
@@ -178,8 +184,7 @@ def settle(workspace: Path, event_id: str, *, now: Optional[float] = None) -> bo
         if entry is None:
             return False
         retired = _load(path).get("retired") or {}
-        retired[str(event_id)] = {"why": "settled",
-                                  "expires_at": _retire_until(entry, time.time() if now is None else now)}
+        retired[str(event_id)] = _retire(entry, "settled", time.time() if now is None else now)
         write_whole(path, {**_load(path), "cards": cards, "retired": retired})
     return True
 
@@ -191,6 +196,17 @@ def live(workspace: Path, event_id: str, *, now: Optional[float] = None) -> Opti
     if not isinstance(entry, dict) or float(entry.get("expires_at") or 0) <= now:
         return None
     return entry if isinstance(entry.get("offers"), dict) else None
+
+
+def issued(workspace: Path, event_id: str, room: str = "", *, now: Optional[float] = None) -> bool:
+    """Whether this agent's ledger knows `event_id` as a card it posted (in `room`, when the record says
+    where): live, or retired and not yet forgotten. An id it does not know may be anyone's message."""
+    now = time.time() if now is None else now
+    path = ledger_path(workspace)
+    entry = _read(path).get(str(event_id or ""))
+    if not (isinstance(entry, dict) and float(entry.get("expires_at") or 0) > now):
+        entry = _retired(path, now).get(str(event_id or ""))
+    return isinstance(entry, dict) and (not room or str(entry.get("room") or room) == room)
 
 
 def main(argv=None) -> int:

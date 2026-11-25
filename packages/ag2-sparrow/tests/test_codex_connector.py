@@ -1087,6 +1087,10 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         with mock.patch.object(connector_cards, "queue", side_effect=OSError("bridge down")):
             text = self.serve("task-8", large, reply_to="$card1", click=large)
         self.assertEqual(text.strip(), model_switch.EXPIRED_NO_CARD)
+        # A tap naming a message this agent never posted gets its fresh menu as a new message, never an edit.
+        self.serve("task-9", five, reply_to="$elsewhere", click=five)
+        self.posted("$card9")
+        self.assertEqual(self.ops(), [("message", None)])
 
     def test_the_owners_pick_runs_on_a_collaborators_turn_and_is_told_only_in_the_dm(self):
         self.pick("Stub Large")
