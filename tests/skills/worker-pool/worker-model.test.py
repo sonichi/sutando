@@ -24,6 +24,11 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO / "skills" / "worker-pool" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
