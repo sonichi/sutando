@@ -1455,13 +1455,15 @@ class EdgePathTest(unittest.TestCase):
 
     def signin_world(self, d, home, script):
         """Serve the tasks in `d` on the stub with CODEX_HOME `home`. `script(event, n)` is called at
-        'spawned' (the n-th server has been made), 'initialized' (the n-th handshake returned) and
-        'polled' (the inbox was listed) and may rewrite auth.json or raise. Returns (rc, turns, logs):
+        'spawned' (the n-th server has been made), 'initialized' (the n-th handshake returned),
+        'polled' (the inbox was listed) and 'thread' (the n-th thread was opened) and may rewrite auth.json or raise. Returns (rc, turns, logs):
         one row per turn dispatched, (the server it went to, the sign-in that server was started on,
         the sign-in on disk at that moment)."""
         from ag2_sparrow import signin_watch
         real, handshake, run_turn, pending = cc.Rpc, cc.Connector.handshake, cc.Connector.run_turn, cc.Connector.pending_tasks
-        made, shakes, turns = [], [], []
+        open_for = cc.Connector.open_for
+        made, shakes, turns, opens = [], [], [], []
+        self.opens = opens
 
         def rpc(*a, **k):
             script("spawning", len(made) + 1)
@@ -1473,6 +1475,12 @@ class EdgePathTest(unittest.TestCase):
             handshake(connector)
             shakes.append(1)
             script("initialized", len(shakes))
+
+        def opened(connector, *a, **k):
+            out = open_for(connector, *a, **k)
+            opens.append(made.index(connector.rpc) + 1)
+            script("thread", len(opens))
+            return out
 
         def polled(connector, seen):
             names = pending(connector, seen)
@@ -1487,6 +1495,7 @@ class EdgePathTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CODEX_HOME": home}), mock.patch.object(cc, "Rpc", rpc), \
                 mock.patch.object(cc.Connector, "handshake", shaken), \
                 mock.patch.object(cc.Connector, "pending_tasks", polled), \
+                mock.patch.object(cc.Connector, "open_for", opened), \
                 mock.patch.object(cc.Connector, "run_turn", dispatched), \
                 mock.patch.object(cc, "log", wraps=cc.log) as spy:
             rc = run_connector(d, once=len([n for n in os.listdir(os.path.join(d, "tasks"))]))
@@ -1533,6 +1542,9 @@ class EdgePathTest(unittest.TestCase):
             "a replacement, switched during its initialize": {("initialized", 1): "acct-2", ("initialized", 2): "acct-3"},
             "a replacement, switched during its spawn": {("initialized", 1): "acct-2", ("spawned", 2): "acct-3"},
             "switched between the poll and the dispatch": {("polled", 1): "acct-2"},
+            "switched while the turn's thread was being opened": {("thread", 1): "acct-2"},
+            "switched while the thread was opened, on a replacement too": {("initialized", 1): "acct-2", ("thread", 1): "acct-3"},
+            "switched during two thread openings in a row": {("thread", 1): "acct-2", ("thread", 2): "acct-3"},
             "twice between the poll and the dispatch": {("polled", 1): "acct-3", ("initialized", 2): "acct-4"},
         }
         for name, flips in cases.items():
@@ -1551,6 +1563,59 @@ class EdgePathTest(unittest.TestCase):
                 self.assertTrue(result(d, "task-chat-1").startswith("STUB echo:"))
                 self.assert_every_turn_ran_on_the_sign_in_on_disk(turns)
                 self.assertGreater(turns[0][0], 1, "not on the server that was started on the earlier sign-in")
+
+    def test_a_switch_during_thread_start_reopens_the_thread_and_sends_the_prompt_once(self):
+        """Reviewer, 70b11b82 (#6782): the check ran before the thread was opened, and opening one is a
+        round trip: C written during it still sent the prompt on B. One ordinary switch was enough."""
+        for tier in ("owner", "guest"):
+            with self.subTest(tier), tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
+                self.signed_in(home, "acct-1")
+
+                def script(event, n, home=home):
+                    if (event, n) == ("thread", 1):
+                        self.signed_in(home, "acct-2")
+
+                write_task(d, "task-chat-1", "sent once", tier=tier)
+                extra = ["--allow-non-owner"] if tier == "guest" else []
+                scratch, mkdtemp = [], tempfile.mkdtemp
+
+                def made_dir(*a, **k):
+                    path = mkdtemp(*a, **k)
+                    if k.get("prefix") == "codex-nonowner-":
+                        scratch.append(path)
+                    return path
+
+                with mock.patch.object(cc.tempfile, "mkdtemp", made_dir), \
+                        mock.patch.object(sys.modules[__name__], "run_connector",
+                                       lambda work, once, extra_=extra: cc.main(
+                                           ["--server", "stub", "--work", str(work), "--once", str(once), "--idle-exit", "3",
+                                            "--poll", "0.05", "--turn-timeout", "10", "--interrupt-grace", "2"] + extra_)):
+                    rc, turns, _ = self.signin_world(d, home, script)
+                self.assertEqual(rc, 0)
+                self.assertEqual(len(turns), 1, "the prompt was sent once")
+                self.assertEqual(self.opens, [1, 2], "the thread was opened again, on the new server")
+                self.assertEqual(turns[0][0], 2)
+                self.assert_every_turn_ran_on_the_sign_in_on_disk(turns)
+                self.assertEqual(result(d, "task-chat-1").count("STUB echo:"), 1)
+                # The folder of the thread left behind is removed when the thread is opened again.
+                self.assertEqual(len(scratch), 2 if tier == "guest" else 0)
+                self.assertEqual([os.path.isdir(p) for p in scratch[:-1]], [False] * len(scratch[:-1]))
+
+    def test_a_replacement_that_cannot_start_while_the_thread_opens_still_sends_on_the_running_server(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
+            self.signed_in(home, "acct-1")
+
+            def script(event, n):
+                if (event, n) == ("thread", 1):
+                    self.signed_in(home, "acct-2")
+                if event == "spawning" and n > 1:
+                    raise OSError("codex did not start")
+
+            write_task(d, "task-chat-1", "still answered")
+            rc, turns, logged = self.signin_world(d, home, script)
+            self.assertEqual((rc, [t[0] for t in turns]), (0, [1]), "served once, on the running server")
+            self.assertTrue(result(d, "task-chat-1").startswith("STUB echo:"))
+            self.assertEqual(len([l for l in logged if "sign-in check failed" in l]), 1)
 
     def test_a_retry_after_a_crash_is_dispatched_on_the_sign_in_on_disk_too(self):
         with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:

@@ -313,7 +313,7 @@ def wrap_untrusted(task_id, headers, message, operator_lines=(), note=NON_OWNER_
     )
 
 
-SIGNIN_SETTLE_TRIES = 3   # replacements in a row before a turn is dispatched on the last one
+SIGNIN_SETTLE_TRIES = 3   # replacements one dispatch (or one idle poll) may make
 
 
 class Connector:
@@ -666,14 +666,14 @@ class Connector:
             return None, None
         return signin_watch.fingerprint(now), signin_watch.fingerprint(now[:2])
 
-    def signin_check(self) -> bool:
-        """Between turns: move to a new server when auth.json names another account than the one the
-        running server was started on; True when it did. An unreadable file changes nothing now; the
-        shared daemon (proxy) is not ours to restart. The server is kept only when the account itself
-        (its id and email) is the one it started on and just the switch marker moved. Nothing else
-        vouches for it: not its email (another account or workspace can carry the same one), not a
-        sign-in of its own (the file may have changed again since), and a server started while the
-        file could not be read is replaced once it can be."""
+    def signin_stale(self) -> bool:
+        """Whether auth.json now names another account than the one the serving server was started on.
+        An unreadable file changes nothing now; the shared daemon (proxy) is not ours to restart. The
+        server is current only when the file is what was read before it was spawned, or the account
+        itself (its id and email) is that one and just the switch marker moved. Nothing else vouches
+        for it: not its email (another account or workspace can carry the same one), not a sign-in of
+        its own (the file may have changed again since); a server started while the file could not be
+        read is stale once it can be."""
         if self.args.server == "proxy":
             return False
         now = self.signin.current()
@@ -685,26 +685,34 @@ class Connector:
         if now[0] and self.signin_account is not None and account == self.signin_account:
             self.signin_started = mark
             return False
+        return True
+
+    def signin_check(self) -> bool:
+        """Move to a new server when the serving one is stale (signin_stale); True when it did. Raises
+        with the old server still serving when the new one cannot start; the next check tries again."""
+        if not self.signin_stale():
+            return False
         if not self.signin_failed:
             log("sign-in changed in auth.json; restarting Codex on the new account")
-        self.replace_server()       # raises with the old server still serving; the next check tries again
+        self.replace_server()
         self.signin_failed = ""
         return True
 
-    def signin_settle(self) -> None:
-        """Bring the serving server onto the sign-in now on disk: replaced again while the file keeps
-        changing under a starting server (SIGNIN_SETTLE_TRIES at most). Never raises: a replacement
-        that fails is said once per reason and tried again later, and the running server serves."""
+    def signin_settle(self, tries: int = SIGNIN_SETTLE_TRIES) -> int:
+        """Bring the serving server onto the sign-in now on disk, replacing it again while the file keeps
+        changing under a starting server, `tries` times at most; the replacements made. Never raises: a
+        replacement that fails is said once per reason and tried again later, and the running server
+        serves."""
+        made = 0
         try:
-            for _ in range(SIGNIN_SETTLE_TRIES):
-                if not self.signin_check():
-                    return
-            log("sign-in kept changing while Codex restarted; serving on the last server started")
+            while made < tries and self.signin_check():
+                made += 1
         except Exception as e:  # noqa: BLE001 - task service goes on, on the server that runs
             why = "%s: %s" % (type(e).__name__, e)
             if why != self.signin_failed:
                 log("sign-in check failed; the running server keeps serving, and it is tried again:", why)
             self.signin_failed = why
+        return made
 
     def wait_turn(self, turn_id, timeout):
         """Consume events until this turn completes; returns (status, text, error) or None
@@ -791,21 +799,12 @@ class Connector:
         caps = caps or capabilities(headers)    # the gate's decision, when the caller has it
         durable = caps.session == "durable"
         for attempt in (1, 2):
-            # The one place a turn is dispatched from: never on a server started on another sign-in
-            # than the one on disk now, whether it is the first server, a restarted or a replaced one.
-            self.signin_settle()
             try:
-                self.open_for(headers, caps)
+                turn_prompt = self.open_turn(headers, caps, prompt)
             except IntegrationsUnknown as e:
                 return "failed", "", "the configured integrations could not be read to switch them off (%s)" % e
             except Unconfined as e:
                 return "failed", "", "the turn could not be confined to its own folder (%s)" % e
-            self.last_thread = self.thread_id
-            turn_prompt = prompt
-            if caps.workspace == "isolated":
-                # The turn reads its own folder only: this task's own attachments are copied into it.
-                staged = stage_own_attachments(headers, self.scratch_cwd, getattr(self.args, "media_root", None))
-                turn_prompt = with_staged_paths(prompt, staged)
             status, text, err = self.run_turn(turn_prompt, self.turn_model(caps), self.turn_cwd(caps))
             if status == "server-exited":
                 self.restart_server()
@@ -817,6 +816,35 @@ class Connector:
                 continue
             return status, text, err
         return status, text, err
+
+    def open_turn(self, headers, caps, prompt) -> str:
+        """Make a turn ready to send, and return its prompt. This is the one place a turn is dispatched
+        from, for the first server, a replaced one and one restarted after a crash, and it holds one
+        guarantee: the prompt is sent on a server started on the sign-in that is on disk when it is sent.
+        The sign-in is read again as the last step, after the thread is open (opening one is a round trip
+        to the server, and the account can change during it); a change there replaces the server and
+        opens the thread again on the new one. Nothing was sent on the thread left behind, and it ends
+        with the server that held it. What is left is the instant between that last read of the file and
+        the write of `turn/start` to the server's pipe.
+
+        Two exceptions, both said in the log, serve on the last server that works rather than hold the
+        task: a replacement that cannot start (the running server serves), and a sign-in that changes
+        again under each new server until SIGNIN_SETTLE_TRIES replacements were made for this dispatch."""
+        left = SIGNIN_SETTLE_TRIES      # replacements this one dispatch may make, however they fall
+        while True:
+            left -= self.signin_settle(left)
+            self.open_for(headers, caps)
+            self.last_thread = self.thread_id
+            turn_prompt = prompt
+            if caps.workspace == "isolated":
+                # The turn reads its own folder only: this task's own attachments are copied into it.
+                staged = stage_own_attachments(headers, self.scratch_cwd, getattr(self.args, "media_root", None))
+                turn_prompt = with_staged_paths(prompt, staged)
+            if not self.signin_stale() or self.signin_failed:
+                return turn_prompt      # current; or the replacement cannot start and the running server serves
+            if left <= 0:
+                log("sign-in kept changing while the turn was made ready; sending on the last server started")
+                return turn_prompt
 
     def result_body(self, status, text, err):
         if status == "completed":
