@@ -1440,35 +1440,136 @@ class EdgePathTest(unittest.TestCase):
             spawned = [c for c in spy.call_args_list if c.args and c.args[0] == "spawned"]
             self.assertEqual(len(spawned), 3, "initial + one restart per attempt")
 
+    def signin_world(self, d, home, script):
+        """Serve the tasks in `d` on the stub with CODEX_HOME `home`. `script(event, n)` is called at
+        'spawned' (the n-th server has been made), 'initialized' (the n-th handshake returned) and
+        'polled' (the inbox was listed) and may rewrite auth.json or raise. Returns (rc, turns, logs):
+        one row per turn dispatched, (the server it went to, the sign-in that server was started on,
+        the sign-in on disk at that moment)."""
+        from ag2_sparrow import signin_watch
+        real, handshake, run_turn, pending = cc.Rpc, cc.Connector.handshake, cc.Connector.run_turn, cc.Connector.pending_tasks
+        made, shakes, turns = [], [], []
+
+        def rpc(*a, **k):
+            script("spawning", len(made) + 1)
+            made.append(real(*a, **k))
+            script("spawned", len(made))
+            return made[-1]
+
+        def shaken(connector):
+            handshake(connector)
+            shakes.append(1)
+            script("initialized", len(shakes))
+
+        def polled(connector, seen):
+            names = pending(connector, seen)
+            script("polled", len(made))
+            return names
+
+        def dispatched(connector, *a, **k):
+            turns.append((made.index(connector.rpc) + 1, connector.signin_started,
+                          signin_watch.fingerprint(signin_watch.codex_identity(home))))
+            return run_turn(connector, *a, **k)
+
+        with mock.patch.dict(os.environ, {"CODEX_HOME": home}), mock.patch.object(cc, "Rpc", rpc), \
+                mock.patch.object(cc.Connector, "handshake", shaken), \
+                mock.patch.object(cc.Connector, "pending_tasks", polled), \
+                mock.patch.object(cc.Connector, "run_turn", dispatched), \
+                mock.patch.object(cc, "log", wraps=cc.log) as spy:
+            rc = run_connector(d, once=len([n for n in os.listdir(os.path.join(d, "tasks"))]))
+        return rc, turns, [" ".join(map(str, c.args)) for c in spy.call_args_list]
+
+    @staticmethod
+    def signed_in(home, account):
+        (Path(home) / "auth.json").write_text(json.dumps({"tokens": {"account_id": account}}))
+
+    def assert_every_turn_ran_on_the_sign_in_on_disk(self, turns):
+        self.assertTrue(turns)
+        for server, started, on_disk in turns:
+            self.assertEqual(started, on_disk, "a turn went to server %d, started on another sign-in" % server)
+
     def test_a_queued_task_is_served_when_the_restart_for_a_changed_sign_in_cannot_start(self):
         """Reviewer, 2a02e558 (#6782): the restart closed the running server before making the new one;
         when that could not start, the queued task went to the closed server, the error left serve()
         and no result was written."""
-        real, made = cc.Rpc, []
         with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
-            auth = Path(home) / "auth.json"
-            auth.write_text(json.dumps({"tokens": {"account_id": "acct-1"}}))
+            self.signed_in(home, "acct-1")
 
-            def rpc(*a, **k):
-                if made:
+            def script(event, n):
+                if (event, n) == ("initialized", 1):
+                    self.signed_in(home, "acct-2")           # switched under the running server
+                if event == "spawning" and n > 1:
                     raise OSError("codex did not start")
-                made.append(real(*a, **k))
-                return made[0]
-
-            handshake = cc.Connector.handshake
-
-            def started(connector):
-                handshake(connector)
-                auth.write_text(json.dumps({"tokens": {"account_id": "acct-2"}}))   # switched under the running server
 
             write_task(d, "task-chat-1", "still answered")
-            with mock.patch.dict(os.environ, {"CODEX_HOME": home}), mock.patch.object(cc, "Rpc", rpc), \
-                    mock.patch.object(cc.Connector, "handshake", started), \
-                    mock.patch.object(cc, "log", wraps=cc.log) as spy:
-                self.assertEqual(run_connector(d, once=1), 0, "nothing escaped serve()")
+            rc, turns, logged = self.signin_world(d, home, script)
+            self.assertEqual(rc, 0, "nothing escaped serve()")
             self.assertTrue(result(d, "task-chat-1").startswith("STUB echo:"), "the running server served it")
-            logged = [" ".join(map(str, c.args)) for c in spy.call_args_list]
-            self.assertTrue(any("sign-in check failed" in l and "codex did not start" in l for l in logged), logged[-6:])
+            self.assertEqual([t[0] for t in turns], [1])
+            failed = [l for l in logged if "sign-in check failed" in l]
+            self.assertEqual(len(failed), 1, "said once, though it was tried while idle and again at dispatch")
+            self.assertIn("codex did not start", failed[0])
+
+    def test_no_turn_is_dispatched_on_a_server_started_on_another_sign_in_than_the_one_on_disk(self):
+        """Reviewer, 00fd9b8d (#6782): A -> B -> C with C written during B's `initialize`. The queued task
+        still got its turn on B's server and completed under B; only the next poll moved to C. The same
+        holds wherever the change lands before the dispatch: for the first server, a replaced one, and
+        one restarted after a crash."""
+        cases = {
+            "the first server, switched after it started": {("initialized", 1): "acct-2"},
+            "a replacement, switched during its initialize": {("initialized", 1): "acct-2", ("initialized", 2): "acct-3"},
+            "a replacement, switched during its spawn": {("initialized", 1): "acct-2", ("spawned", 2): "acct-3"},
+            "switched between the poll and the dispatch": {("polled", 1): "acct-2"},
+            "twice between the poll and the dispatch": {("polled", 1): "acct-3", ("initialized", 2): "acct-4"},
+        }
+        for name, flips in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
+                self.signed_in(home, "acct-1")
+                left = dict(flips)
+
+                def script(event, n, left=left, home=home):
+                    account = left.pop((event, n), None)
+                    if account:
+                        self.signed_in(home, account)
+
+                write_task(d, "task-chat-1", "which account ran this")
+                rc, turns, _ = self.signin_world(d, home, script)
+                self.assertEqual((rc, left), (0, {}), "every switch of the case happened")
+                self.assertTrue(result(d, "task-chat-1").startswith("STUB echo:"))
+                self.assert_every_turn_ran_on_the_sign_in_on_disk(turns)
+                self.assertGreater(turns[0][0], 1, "not on the server that was started on the earlier sign-in")
+
+    def test_a_retry_after_a_crash_is_dispatched_on_the_sign_in_on_disk_too(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
+            self.signed_in(home, "acct-1")
+
+            def script(event, n):
+                if (event, n) == ("spawned", 2):             # the crash restart's server has read acct-1
+                    self.signed_in(home, "acct-2")
+
+            write_task(d, "task-chat-1", "[[die]] server goes away")
+            rc, turns, _ = self.signin_world(d, home, script)
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(turns), 2, "the turn that died and its one retry")
+            self.assertEqual(turns[0][0], 1)
+            self.assertEqual(turns[1][0], 3, "not the restarted server, which started on the earlier sign-in")
+            self.assert_every_turn_ran_on_the_sign_in_on_disk(turns)
+
+    def test_a_sign_in_that_never_settles_does_not_hold_the_task_for_ever(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
+            self.signed_in(home, "acct-0")
+
+            def script(event, n):
+                if event == "initialized":
+                    self.signed_in(home, "acct-%d" % n)      # every server finds the file changed again
+
+            write_task(d, "task-chat-1", "answered all the same")
+            rc, turns, logged = self.signin_world(d, home, script)
+            self.assertEqual(rc, 0)
+            self.assertTrue(result(d, "task-chat-1").startswith("STUB echo:"))
+            self.assertEqual(len(turns), 1)
+            self.assertTrue(any("kept changing" in l for l in logged))
+            self.assertLessEqual(turns[0][0], 1 + 2 * cc.SIGNIN_SETTLE_TRIES, "a bounded number of replacements")
 
     def test_server_exit_mid_turn_guest_is_not_retried(self):
         with tempfile.TemporaryDirectory() as d:

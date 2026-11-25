@@ -312,6 +312,9 @@ def wrap_untrusted(task_id, headers, message, operator_lines=(), note=NON_OWNER_
     )
 
 
+SIGNIN_SETTLE_TRIES = 3   # replacements in a row before a turn is dispatched on the last one
+
+
 class Connector:
     def __init__(self, rpc_factory, args, note=None):
         self.rpc_factory = rpc_factory
@@ -687,6 +690,21 @@ class Connector:
         self.signin_failed = ""
         return True
 
+    def signin_settle(self) -> None:
+        """Bring the serving server onto the sign-in now on disk: replaced again while the file keeps
+        changing under a starting server (SIGNIN_SETTLE_TRIES at most). Never raises: a replacement
+        that fails is said once per reason and tried again later, and the running server serves."""
+        try:
+            for _ in range(SIGNIN_SETTLE_TRIES):
+                if not self.signin_check():
+                    return
+            log("sign-in kept changing while Codex restarted; serving on the last server started")
+        except Exception as e:  # noqa: BLE001 - task service goes on, on the server that runs
+            why = "%s: %s" % (type(e).__name__, e)
+            if why != self.signin_failed:
+                log("sign-in check failed; the running server keeps serving, and it is tried again:", why)
+            self.signin_failed = why
+
     def wait_turn(self, turn_id, timeout):
         """Consume events until this turn completes; returns (status, text, error) or None
         on timeout. Server requests are answered as they arrive."""
@@ -772,6 +790,9 @@ class Connector:
         caps = caps or capabilities(headers)    # the gate's decision, when the caller has it
         durable = caps.session == "durable"
         for attempt in (1, 2):
+            # The one place a turn is dispatched from: never on a server started on another sign-in
+            # than the one on disk now, whether it is the first server, a restarted or a replaced one.
+            self.signin_settle()
             try:
                 self.open_for(headers, caps)
             except IntegrationsUnknown as e:
@@ -831,13 +852,7 @@ class Connector:
                 self.accounts.expire()
             except Exception as e:  # noqa: BLE001
                 log("card upkeep failed:", "%s: %s" % (type(e).__name__, e))
-            try:
-                self.signin_check()     # here no turn runs: the next task starts on the new account
-            except Exception as e:  # noqa: BLE001 - a restart that failed is tried again; tasks are still served
-                why = "%s: %s" % (type(e).__name__, e)
-                if why != self.signin_failed:       # said once per reason, not on every poll
-                    log("sign-in check failed; the running server keeps serving, and it is tried again:", why)
-                self.signin_failed = why
+            self.signin_settle()        # here no turn runs: an idle agent moves to the new account too
             names = self.pending_tasks(seen)
             if not names:
                 if self.args.once and done >= self.args.once:
