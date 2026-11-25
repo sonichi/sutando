@@ -61,6 +61,15 @@ with tempfile.TemporaryDirectory() as d:
     check("a base change to an UNRELATED file does not fire", untouched == [], f"got {untouched}")
     check("no files -> no claim", acb.base_touched_since(d, "main", T_EARLY, []) == [])
 
+    # A PR filename is a literal path, never pathspec magic that can exclude another.
+    for magic in (":(exclude)shared.sh", ":!shared.sh", ":^shared.sh"):
+        got = acb.base_touched_since(d, "main", T_EARLY, ["shared.sh", magic])
+        check(f"a PR file named {magic!r} does not hide base changes to shared.sh",
+              got == ["shared.sh"], f"got {got}")
+    star = acb.base_touched_since(d, "main", T_EARLY, ["*.sh"])
+    check("a PR file named '*.sh' matches only itself, not every .sh file",
+          star == [], f"got {star}")
+
 # The fetch is the one call that fails toward "covered": a stale base has no
 # commits since any approval, so every row reads as covering.
 with tempfile.TemporaryDirectory() as d:

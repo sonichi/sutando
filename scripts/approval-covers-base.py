@@ -43,13 +43,27 @@ def base_touched_since(repo_dir: str, base_ref: str, since: str,
     """
     if not files:
         return []
-    out = subprocess.run(
-        ["git", "-C", repo_dir, "log", f"--since={since}", "--name-only",
-         "--pretty=format:", base_ref, "--"] + files,
+    # PR filenames are data: magic like ":(exclude)x" must not drop base history.
+    shas = subprocess.run(
+        ["git", "--literal-pathspecs", "-C", repo_dir, "log", f"--since={since}",
+         "--pretty=format:%H", base_ref, "--"] + files,
         capture_output=True, text=True)
-    if out.returncode != 0:
-        raise SystemExit(f"git log failed: {out.stderr.strip()[:200]}")
-    return sorted({ln.strip() for ln in out.stdout.splitlines() if ln.strip()})
+    if shas.returncode != 0:
+        raise SystemExit(f"git log failed: {shas.stderr.strip()[:200]}")
+    # diff-tree per commit emits only NUL-separated names, so a filename
+    # containing a newline stays verbatim instead of splitting or gluing.
+    moved: set[str] = set()
+    for sha in shas.stdout.splitlines():
+        if not sha:
+            continue
+        out = subprocess.run(
+            ["git", "--literal-pathspecs", "-C", repo_dir, "diff-tree",
+             "--no-commit-id", "-r", "-z", "--name-only", sha, "--"] + files,
+            capture_output=True, text=True)
+        if out.returncode != 0:
+            raise SystemExit(f"git diff-tree failed: {out.stderr.strip()[:200]}")
+        moved.update(n for n in out.stdout.split("\0") if n)
+    return sorted(moved)
 
 
 def main(argv: list[str] | None = None) -> int:
