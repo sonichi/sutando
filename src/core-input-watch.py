@@ -1262,6 +1262,11 @@ def _atomic_write(path, payload):
     os.replace(tmp, path)
 
 
+def _sleep(seconds):
+    """The loop's own wait. A test stubs this one, not time.sleep: libraries the loop calls sleep too."""
+    time.sleep(seconds)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--socket", required=True)
@@ -1366,7 +1371,7 @@ def main():
             # The model picker on screen is the one read for the card's model list; it is no gate.
             if a.once:
                 return
-            time.sleep(a.interval)  # pragma: no cover - daemon heartbeat (tests use --once)
+            _sleep(a.interval)  # pragma: no cover - daemon heartbeat (tests use --once)
             continue
         if a.chat_escalation and not a.seat:
             crash_loop_step(hitl, workspace, a.session, runtime, last_live_pane, time.time())
@@ -1486,7 +1491,7 @@ def main():
                     core_gate_notice.end_outage(workspace)
         if a.once:
             return
-        time.sleep(a.interval)  # pragma: no cover - daemon heartbeat (tests use --once)
+        _sleep(a.interval)  # pragma: no cover - daemon heartbeat (tests use --once)
 
 
 if __name__ == "__main__":

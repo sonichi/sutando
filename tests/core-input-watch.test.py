@@ -865,7 +865,7 @@ class TestMovingTurnIsNotHung(unittest.TestCase):
                 patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
                 patch.object(_mod.time, "monotonic", lambda: now[0]), \
                 patch.object(_mod.time, "time", lambda: wall_now[0]), \
-                patch.object(_mod.time, "sleep", _sleep), \
+                patch.object(_mod, "_sleep", _sleep), \
                 patch.object(sys, "argv", argv), self.assertRaises(_Stop):
             main()
         return states
@@ -1521,7 +1521,7 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
                 patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
                 patch.object(_mod, "send_keys",
                              lambda s, sess, k: sent.append((s, sess, k)) or k not in fail_keys), \
-                patch.object(_mod.time, "sleep", fake_sleep), \
+                patch.object(_mod, "_sleep", fake_sleep), \
                 patch.object(sys, "argv", argv):
             try:
                 main()
