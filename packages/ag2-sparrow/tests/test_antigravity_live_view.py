@@ -18,6 +18,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_antigravity_adapter as agy  # noqa: E402  (isolates os.environ and the lock home on import)
+
 from ag2_sparrow import acp_host, live_view  # noqa: E402
 from ag2_sparrow.adapters.antigravity import cli  # noqa: E402
 
