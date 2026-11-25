@@ -736,29 +736,41 @@ def persist_desktop_runtime_selection(runtime: str, repo_root: Optional[Path] = 
 
 
 @contextlib.contextmanager
-def _runtime_json_lock(path: Path):
-    """Exclusive flock on ``<runtime.json>.lock``, held across one read-merge-replace."""
+def _json_file_lock(path: Path):
+    """Exclusive flock on ``<path>.lock``, held across one read-merge-replace."""
     import fcntl
     with open(path.with_name(path.name + ".lock"), "a") as fh:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
         yield
 
 
+_UPDATE_ATTEMPTS = 5
+
+
+def _update_json_object(path: Path, mutate, check: bool = False) -> str:
+    """Read, ``mutate(body)`` (True when it changed something), atomic replace, under ``<path>.lock``.
+    The replace happens only while the file still holds the bytes that were read; a write landing
+    in between, even from a writer that skips the lock, is re-read and ``mutate`` applied again.
+    ``check`` reads without the lock and writes nothing, the lock file included."""
+    if check:
+        return "would-update" if mutate(_read_json_object(path)) else "unchanged"
+    with _json_file_lock(path):
+        for _ in range(_UPDATE_ATTEMPTS):
+            before = _read_bytes(path)
+            body = _parse_json_object(path, before)
+            if not mutate(body):
+                return "unchanged"
+            if _replace_json_atomically(path, body, expect=before):
+                return "updated"
+    raise ValueError(f"{path} kept changing under another writer; not written")
+
+
 def update_desktop_runtime_json(path: Path, mutate, check: bool = False) -> str:
-    """The engine's one writer of the desktop's ``runtime.json``: read, ``mutate(body)`` (True when
-    it changed something), atomic replace, all under one cross-process lock, so two engine
-    writers never drop each other's keys. Returns ``"updated"``, ``"unchanged"`` or, with
-    ``check``, ``"would-update"`` (nothing written). A file that is not a JSON object is refused.
-    The desktop's own writer (``core_runtime.rs`` ``update_runtime_json``) has to take the same
-    lock file for the desktop/engine pair to be serialized too."""
-    with _runtime_json_lock(path):
-        body = _read_json_object(path)
-        if not mutate(body):
-            return "unchanged"
-        if check:
-            return "would-update"
-        _replace_json_atomically(path, body)
-        return "updated"
+    """The engine's one writer of the desktop's ``runtime.json``: ``_update_json_object`` on it, so
+    engine writers are serialized by ``runtime.json.lock`` and a desktop write that lands between
+    the read and the replace is merged, not dropped. Returns ``"updated"``, ``"unchanged"`` or,
+    with ``check``, ``"would-update"`` (nothing written). A file that is not a JSON object is refused."""
+    return _update_json_object(path, mutate, check=check)
 
 
 def resolve_core_runtime(repo_root: Optional[Path] = None) -> str:
@@ -826,30 +838,52 @@ def resolve_codex_app_server(repo_root: Optional[Path] = None) -> bool:
     return val is not False
 
 
-def _replace_json_atomically(path: Path, body: Dict[str, Any]) -> None:
+_ANY = object()
+
+
+def _replace_json_atomically(path: Path, body: Dict[str, Any], expect: Any = _ANY) -> bool:
+    """Write ``body`` to a temp file and rename it over ``path``. With ``expect`` (the bytes read,
+    None for absent), nothing is replaced and False is returned once ``path`` no longer holds them."""
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
     try:
         with open(tmp, "w") as f:
             f.write(json.dumps(body, indent=2) + "\n")
             f.flush()
             os.fsync(f.fileno())
+        if expect is not _ANY and _read_bytes(path) != expect:
+            tmp.unlink(missing_ok=True)
+            return False
         os.replace(tmp, path)
+        return True
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
 
 
-def _read_json_object(path: Path) -> Dict[str, Any]:
-    """A file this module updates in place: missing is empty; anything but an object is refused."""
+def _read_bytes(path: Path) -> Optional[bytes]:
     try:
-        body = json.loads(path.read_text())
+        return path.read_bytes()
     except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError(f"cannot read {path}: {exc}") from exc
+
+
+def _parse_json_object(path: Path, raw: Optional[bytes]) -> Dict[str, Any]:
+    if raw is None:
         return {}
-    except (OSError, ValueError) as exc:
+    try:
+        body = json.loads(raw)
+    except ValueError as exc:
         raise ValueError(f"cannot read {path}: {exc}") from exc
     if not isinstance(body, dict):
         raise ValueError(f"{path} is not a JSON object")
     return body
+
+
+def _read_json_object(path: Path) -> Dict[str, Any]:
+    """A file this module updates in place: missing is empty; anything but an object is refused."""
+    return _parse_json_object(path, _read_bytes(path))
 
 
 def persist_codex_app_server(enabled: bool, repo_root: Optional[Path] = None) -> "tuple[str, Path]":
@@ -883,19 +917,23 @@ def persist_codex_app_server(enabled: bool, repo_root: Optional[Path] = None) ->
     path = _workspace_layer_path(repo_cfg, root)
     if not path.parent.is_dir():
         raise ValueError(f"workspace {path.parent} does not exist")
-    body = _read_json_object(path)
-    core = body.get("core")
-    if core is None:
-        core = body["core"] = {}
-    if not isinstance(core, dict):
-        raise ValueError(f"{path} key 'core' is not a JSON object")
-    if core.get("codex_app_server") is enabled:
-        return "unchanged", path
-    core["codex_app_server"] = enabled
-    _replace_json_atomically(path, body)
-    global _CACHE
-    _CACHE = None
-    return "updated", path
+
+    def mutate_layer(body: Dict[str, Any]) -> bool:
+        core = body.get("core")
+        if core is None:
+            core = body["core"] = {}
+        if not isinstance(core, dict):
+            raise ValueError(f"{path} key 'core' is not a JSON object")
+        if core.get("codex_app_server") is enabled:
+            return False
+        core["codex_app_server"] = enabled
+        return True
+
+    outcome = _update_json_object(path, mutate_layer)
+    if outcome == "updated":
+        global _CACHE
+        _CACHE = None
+    return outcome, path
 
 
 _DEFAULT_CLAUDE_SUTANDO_SUBDIR = ".claude-sutando"

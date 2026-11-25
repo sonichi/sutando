@@ -606,7 +606,10 @@ the desktop's `runtime.json` (`codexAppServer`) on a desktop install, else in
 already held that value. It compares the stored key, not the resolved value: on an install with
 nothing stored, `select on` writes the key and prints `updated` even though the default was on.
 Engine writers of `runtime.json` take one cross-process lock (`runtime.json.lock`) around each
-read-merge-replace; the desktop's own writer must take the same lock file to be serialized with them.
+read-merge-replace, and replace only while the file still holds what they read: a desktop write
+landing in between is re-read and merged rather than dropped. That narrows, but cannot close, the
+window against a writer that skips the lock, so the desktop's own writer should take the same lock
+file. The workspace layer (`sutando.config.local.json`) is written the same way under its own lock.
 Nothing recorded means on. `SUTANDO_CODEX_APP_SERVER` set non-empty overrides the choice for one
 launch (`1` on, anything else off): `SUTANDO_CODEX_APP_SERVER=0 bash src/agent/start-cli.sh --restart`
 starts the TUI once.
