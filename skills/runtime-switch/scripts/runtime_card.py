@@ -965,7 +965,7 @@ def fall_back(ws: Path, room: str, rt: str, was: str, attempt: str, got: dict, r
     if back["core"]:
         words = f"{lead} I started {name(was)} again, and the core is running on it."
     else:
-        where = ("Quit and reopen the s.space app on the computer that runs the core." if desktop_hosted() else
+        where = ("Quit and reopen the app on the computer that runs the core." if desktop_hosted() else
                  "On the computer that runs the core, run src/restart.sh in the engine folder.")
         words = f"{lead} Starting {name(was)} again did not come back either, so the core may be down. {where}"
     if gateway not in ("", "restored"):

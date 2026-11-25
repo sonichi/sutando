@@ -1298,7 +1298,7 @@ class Switch(Base):
     def test_a_relaunch_that_fails_too_names_what_to_do_outside_chat(self):
         out = self.failing_switch(back_ok=False)
         self.assertIn("Starting Codex again did not come back either, so the core may be down.", out["say"])
-        self.assertIn("Quit and reopen the s.space app", out["say"])
+        self.assertIn("Quit and reopen the app", out["say"])
         self.assertFalse(out["fell_back_confirmed"])
 
     def test_a_restart_that_did_not_happen_says_still_on_the_old_runtime(self):
