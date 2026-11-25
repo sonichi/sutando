@@ -1592,17 +1592,24 @@ class ModelNotAvailable(SeatCase):
             s.step()
         self.assertEqual(len(self.card_calls()), 2)
 
-    def test_a_task_not_the_owners_is_closed_not_retried_on_a_refused_model(self):
-        """A cron's task (main-loop, sync-workspace) failed the same way, silently and again and again."""
+    def test_a_task_not_the_owners_waits_for_a_model_change_and_then_runs(self):
+        """A collaborator's or a cron's task gets no card and is not discarded: it waits, without
+        a turn per retry, until the owner picks another model, and then runs on it."""
         self.task("task-cron.txt", "task: run the main loop\naccess_tier: internal\n")
         self.plan("model-missing")
         s = self.make(retry_s=0, max_attempts=5)
         s.model = "gpt-6.1-terra"
         s.ensure_server()
         with self.fake_card():
-            self.assertEqual(s.step(), "done")
+            self.assertNotEqual(s.step(), "done")
+            self.now[0] += 3600
+            self.assertIsNone(s.step(), "retried on the same refused model")
         self.assertEqual(self.card_calls(), [], "no card for it")
-        self.assertTrue((self.results / "task-cron.txt").read_text().startswith("[no-send]"))
+        self.assertEqual(len(self.sent("turn/start")), 1)
+        self.assertFalse((self.results / "task-cron.txt").exists(), "closed with no reply")
+        seat_mod.codex_core_model.save(self.ws / "state", "gpt-5.5", applied="next-turn", accepted=False)
+        self.assertEqual(s.step(), "done")
+        self.assertEqual(self.sent("turn/start")[-1]["params"].get("model"), "gpt-5.5")
 
     def test_a_card_that_cannot_be_posted_is_said_in_words(self):
         self.task("task-1.txt", OWNER)
@@ -2572,16 +2579,10 @@ class AdvisoryFailures(SeatCase):
         self.assertIsNone(s.told_signed_out)
         self.assertIn("the account card was not sent", self.out.getvalue())
 
-    def test_a_refused_model_on_a_worker_or_an_unclosable_task_stays_pending(self):
-        import result_publish
+    def test_a_refused_model_on_a_worker_seat_is_not_its_concern(self):
         s = self.make()
         s.worker = "w1"
         self.assertFalse(s.model_unavailable("task-1.txt"))
-        s.worker = ""
-        team = self.task("task-2.txt", "access_tier: team\ntask: do it\n")
-        with mock.patch.object(result_publish, "publish_text", side_effect=OSError("disk")):
-            self.assertFalse(s.model_unavailable("task-2.txt", team))
-        self.assertIn("could not be closed", self.out.getvalue())
 
     def test_a_model_card_that_cannot_run_is_said_in_words(self):
         s = self.make()

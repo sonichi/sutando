@@ -370,6 +370,7 @@ class Seat:
         # owner's tasks already shown the model card.
         self.turn_model_missing = ""
         self.told_model_missing: List[str] = []
+        self.model_wait: dict = {}  # other tasks refused on the model: the model_key they wait to see change
         # The login the owner was last shown the sign-in card for, and whether a limit card was shown.
         self.told_signed_out: Optional[tuple] = None
         self.told_limit = False
@@ -717,9 +718,13 @@ class Seat:
                 pass
 
     def eligible(self, filename: str, payload: Path) -> bool:
-        """False while a task waits out a retry delay, a failed stage, or a Stop."""
+        """False while a task waits out a retry delay, a failed stage, a Stop, or a model change."""
         if self.deferred.get(filename, 0) > self.clock():
             return False
+        if filename in self.model_wait:
+            if self.model_wait[filename] == self.model_key():
+                return False
+            del self.model_wait[filename]
         rec = self.record(filename)
         if not rec:
             return True
@@ -780,6 +785,10 @@ class Seat:
             log(f"  error: {one_line(json.dumps(params.get('error') or params), 240)}")
         elif method == "thread/status/changed" and (params.get("status") or {}).get("type") == "systemError":
             log("  thread status: systemError")
+
+    def model_key(self) -> tuple:
+        """What the next turn's model depends on: the seat's model and the core's latest pick."""
+        return self.model, codex_core_model.pending(self.workspace / "state")[1]
 
     def launch_rev(self) -> int:
         """Pending picks at or below this revision are not tried: SUTANDO_CORE_MODEL_REV, which the
@@ -1193,24 +1202,17 @@ class Seat:
         """The turn's model is not one this account may use (a card, never a silent
         switch, and every refused message answered). The owner's message gets the model card (the models
         Codex lists for this account), once per message however often it is retried, and stays pending,
-        answered on the pick. Any other task (a cron's, a team member's) is not retried on a refused
-        model: it is closed with no reply. True when this answered the task; a card that cannot be
+        answered on the pick. Any other task (a cron's, a team member's) gets no card and waits, pending,
+        until the core's model changes (eligible). True when this answered the task; a card that cannot be
         posted is said in words instead, so a failed turn is never silent."""
         if self.worker:
             return False
         refused = getattr(self, "turn_sent_model", "") or self.model or "the core model"
         if payload is not None and not core_quota_notice.is_owner_task(payload):
-            try:
-                import result_publish
-                result_publish.publish_text(Path(self.host.results) / filename,
-                                            f"[no-send] skipped: {refused} isn't available on this Codex account\n")
-            except Exception as e:  # noqa: BLE001 - left pending, retried as before
-                log(f"task {filename}: {refused} is not available; not the owner's task, but it could not be "
-                    f"closed ({one_line(e, 120)})")
-                return False
-            log(f"task {filename}: {refused} is not available to this account; not the owner's task, closed "
-                "with no reply")
-            return True
+            self.model_wait[filename] = self.model_key()
+            log(f"task {filename}: {refused} is not available to this account; not the owner's task, it "
+                "stays pending until the core's model changes")
+            return False
         if filename in self.told_model_missing:
             return False
         lead = f"{refused} isn't available on this Codex account, so I couldn't answer."
