@@ -61,6 +61,7 @@ CLAIMS_DIR = ("state", "task-event-handler-claims")
 WATCHER = REPO / "src" / "watch-tasks-stream.sh"
 WORKSTREAMS = REPO / "skills" / "task-workstream-grouping" / "scripts" / "workstreams.py"
 ACCOUNT_CARD = REPO / "skills" / "account-switch" / "scripts" / "account_card.py"
+MODEL_CARD = REPO / "skills" / "model-switch" / "scripts" / "model_card.py"
 # What a refused turn's error says (TurnError.codexErrorInfo, else its message): one kind each, never both.
 UNAUTHORIZED = "unauthorized"
 # The app-server's word for a turn refused on the account's usage; its message is read too, by the CLI's
@@ -362,6 +363,7 @@ class Seat:
         self.auth_seen: Optional[tuple] = None  # the login on disk when the running child was started
         self.turn_unauth = False  # the current turn was refused because the login no longer works
         self.turn_model_missing = ""  # the current turn's model is not one this account may use: its message
+        self.told_model_missing = ""  # the refused model the owner was last shown the model card for
         self.told_signed_out: Optional[tuple] = None  # the login the owner was last shown the card for
         self.health_auth: Optional[tuple] = None  # the login on disk when the core's health went bad
         # Shows the owner the core's account card when its login is refused even after a restart.
@@ -1082,10 +1084,6 @@ class Seat:
                     "on disk and retrying once")
                 self.close_server()
                 continue
-            if (self.turn_model_missing and status != "completed" and attempt == 1
-                    and not has_ready_result(results, filename) and self.fall_back_model()):
-                log(f"task {filename}: retrying once on {self.model}")
-                continue
             if status != "server-exited" or has_ready_result(results, filename):
                 break
             self.close_server()
@@ -1123,7 +1121,7 @@ class Seat:
             self.health("signed_out")
             self.signed_out(filename)
         elif self.turn_model_missing and status != "completed":
-            self.model_unavailable()
+            self.model_unavailable(filename)
         outcome = "no-result" if status == "completed" else status
         rec = self.write_record(filename, payload, outcome, detail)
         wait = self.retry_s if rec["attempts"] < self.max_attempts else self.hold_s
@@ -1132,30 +1130,30 @@ class Seat:
             f"(attempt {rec['attempts']}, next try in {wait:g}s)")
         return outcome
 
-    def fall_back_model(self) -> bool:
-        """The turn's model is not one this account may use: the seat moves to the model Codex names as
-        this account's default (its `model/list`), tells the owner, and the turn is run again. False
-        when Codex names no default, or the default is the model that was refused."""
-        if self.worker:
-            return False
-        refused = self.model or ""
-        cat = self.catalog()
-        default = cat[1] if cat else ""
-        if not default or default == refused:
-            return False
-        self.model, self.restore = default, default   # the retried turn, and the thread after it, run on it
-        log(f"model: {refused or 'the model'} is not available to this account ({self.turn_model_missing}); "
-            f"moving to Codex's default for it, {default}")
-        self.notify("switched", f"{refused or 'The core model'} isn't available on this Codex account, so I "
-                                f"switched the core to {default} and answered on it.\n")
-        return True
-
-    def model_unavailable(self) -> None:
-        """The turn's model is not one this account may use and no other could be run: the owner is told,
-        so a failed turn is never silent."""
-        log(f"model: the turn's model is not available to this account ({self.turn_model_missing}); owner told")
-        self.notify("refused", f"I couldn't answer: {self.model or 'the core model'} isn't available on this "
-                               "Codex account. Send /model to pick one it can use.\n")
+    def model_unavailable(self, filename: str) -> None:
+        """The turn's model is not one this account may use: the owner gets the model card (the models
+        Codex lists for this account), once per refused model, and the task stays pending, so it is
+        answered on the pick once they make it (owner 2026-11-24: a card, never a silent switch). A card
+        that cannot be posted is said in words instead, so a failed turn is never silent."""
+        refused = self.model or "the core model"
+        if self.worker or self.told_model_missing == refused:
+            return
+        lead = f"{refused} isn't available on this Codex account, so I couldn't answer."
+        argv = [sys.executable, str(MODEL_CARD), "--workspace", str(self.workspace), "post", "--owner-dm",
+                "--lead", lead]
+        try:
+            done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+            ok, why = done.returncode == 0, one_line(done.stdout or done.stderr, 200)
+        except (OSError, subprocess.SubprocessError) as e:
+            ok, why = False, one_line(e, 200)
+        self.told_model_missing = refused
+        if ok:
+            log(f"task {filename}: {refused} is not available to this account ({self.turn_model_missing}); "
+                "the model card was sent to the owner")
+            return
+        log(f"task {filename}: {refused} is not available to this account; the model card was not sent ({why})")
+        self.notify("refused", f"I couldn't answer: {refused} isn't available on this Codex account. "
+                               "Send /model to pick one it can use.\n")
 
     def quota_step(self, status: str, filename: str = "", payload: Optional[Path] = None) -> None:
         """Out of usage: the owner gets the account card once per limit (core_quota_notice); a turn

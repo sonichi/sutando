@@ -1433,30 +1433,54 @@ class ModelNotAvailable(SeatCase):
         self.assertEqual([seat_mod.model_missing(e) for e in yes], [True] * len(yes))
         self.assertEqual([seat_mod.model_missing(e) for e in no], [False] * len(no))
 
-    def test_it_moves_to_the_accounts_default_answers_and_says_so(self):
-        self.catalog("gpt-6.1-terra", "gpt-5.5", default="gpt-5.5")
-        self.task("task-1.txt")
-        self.plan("model-missing", "result")
-        s = self.make()
-        s.model = "gpt-6.1-terra"
-        s.ensure_server()
-        self.assertEqual(s.step(), "done")
-        self.assertEqual([r["params"].get("model") for r in self.sent("turn/start")][-1], "gpt-5.5",
-                         "retried on the account's default")
-        self.assertEqual(s.model, "gpt-5.5")
-        notes = [f.read_text() for f in self.results.glob("proactive-model-switched-*.txt")]
-        self.assertEqual(len(notes), 1)
-        self.assertIn("gpt-6.1-terra isn't available", notes[0])
-        self.assertIn("gpt-5.5", notes[0])
+    def card_calls(self):
+        log = self.ws / "model-card-calls.txt"
+        return log.read_text().splitlines() if log.exists() else []
 
-    def test_with_no_default_to_move_to_the_owner_is_told_not_left_waiting(self):
-        self.task("task-1.txt")                    # no models.json: Codex names no default
+    def fake_card(self, rc=0):
+        """MODEL_CARD replaced by a script that records its arguments and answers `rc`."""
+        script = self.ws / "fake_model_card.py"
+        script.write_text("import sys\nopen(%r, 'a').write(' '.join(sys.argv[1:]) + '\\n')\nsys.exit(%d)\n"
+                          % (str(self.ws / "model-card-calls.txt"), rc))
+        return mock.patch.object(seat_mod, "MODEL_CARD", script)
+
+    def test_it_shows_the_owner_the_model_card_and_leaves_the_task_pending(self):
+        """Owner 2026-11-24: a card listing the models this account can use, never a silent switch."""
+        self.task("task-1.txt")
         self.plan("model-missing")
         s = self.make(retry_s=30, max_attempts=3)
         s.model = "gpt-6.1-terra"
         s.ensure_server()
-        self.assertNotEqual(s.step(), "done")
-        self.assertEqual(len(self.sent("turn/start")), 1, "not retried with nothing else to run on")
+        with self.fake_card():
+            self.assertNotEqual(s.step(), "done")
+        self.assertEqual(len(self.sent("turn/start")), 1, "no silent retry on another model")
+        self.assertEqual(s.model, "gpt-6.1-terra", "the model is not switched by the seat")
+        calls = self.card_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("post --owner-dm --lead gpt-6.1-terra isn't available on this Codex account", calls[0])
+        self.assertFalse((self.results / "task-1.txt").exists(), "no result: it stays pending for the pick")
+        self.assertEqual(list(self.results.glob("proactive-model-*.txt")), [])
+
+    def test_the_card_is_shown_once_per_refused_model(self):
+        self.task("task-1.txt")
+        self.plan("model-missing", "model-missing")
+        s = self.make(retry_s=0, max_attempts=5)
+        s.model = "gpt-6.1-terra"
+        s.ensure_server()
+        with self.fake_card():
+            s.step()
+            s.deferred.clear()
+            s.step()
+        self.assertEqual(len(self.card_calls()), 1)
+
+    def test_a_card_that_cannot_be_posted_is_said_in_words(self):
+        self.task("task-1.txt")
+        self.plan("model-missing")
+        s = self.make(retry_s=30, max_attempts=3)
+        s.model = "gpt-6.1-terra"
+        s.ensure_server()
+        with self.fake_card(rc=1):
+            s.step()
         notes = [f.read_text() for f in self.results.glob("proactive-model-refused-*.txt")]
         self.assertEqual(len(notes), 1)
         self.assertIn("isn't available on this Codex account", notes[0])
