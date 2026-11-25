@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import fcntl
 import io
 import json
 import os
@@ -450,41 +451,79 @@ class HandshakeAndThread(SeatCase):
         self.assertEqual(self.make(decl).serve(once=True), seat_mod.EXIT_LOCKED)
         self.assertEqual(self.sent(), [], "the second seat started no app-server")
 
+    def taking(self, decl) -> bool:
+        """Whether a seat holds `taking.lock`, read as the bridge reads it."""
+        try:
+            fd = os.open(decl.parent / "taking.lock", os.O_RDONLY)
+        except OSError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)
+        return False
+
+    def start(self, decl):
+        s = self.make(decl)
+        self.assertTrue(s.lock())
+        self.addCleanup(os.close, s.lock_fd)
+        if s.claim_fd is not None:
+            self.addCleanup(os.close, s.claim_fd)
+        return s
+
     def test_a_restarted_seat_drops_the_copies_the_seat_before_it_left(self):
-        """A copy in a state dir whose lock is held reads as "a running seat took this task". The
-        launcher reuses the state dir, so a replacement seat must not hold the lock over a copy only
-        the interrupted seat had taken: it is gone before the new seat serves anything."""
+        """A copy under a held `taking.lock` reads as "a running seat took this task". The launcher
+        reuses the state dir, so a replacement seat clears what the interrupted seat left before it
+        takes that lock, and before it serves anything."""
         decl = self.declaration()
         left = decl.parent / "payloads" / "task-1.txt"
         left.parent.mkdir(parents=True)
         left.write_text("task: taken by the seat that was interrupted\n", encoding="utf-8")
-        replacement = self.make(decl)
-        self.assertTrue(replacement.lock())
-        self.addCleanup(os.close, replacement.lock_fd)
-        self.assertFalse(left.exists(), "no inherited copy under the replacement's lock")
-        self.assertEqual(self.sent(), [], "and it was dropped before any app-server was started")
+        seen = []
+        real = seat_mod.Path.unlink
+
+        def unlink(path, *a, **k):
+            seen.append(self.taking(decl))      # the seat lock is held here; is the copy vouched for?
+            return real(path, *a, **k)
+
+        with mock.patch.object(seat_mod.Path, "unlink", unlink):
+            self.start(decl)
+        self.assertEqual(seen, [False], "not while the inherited copy is still there")
+        self.assertFalse(left.exists())
+        self.assertTrue(self.taking(decl), "only once the folder is clear")
+        self.assertEqual(self.sent(), [], "and before any app-server was started")
 
     def test_a_seat_refused_the_lock_leaves_the_running_seats_copies_alone(self):
         decl = self.declaration()
-        running = self.make(decl)
-        self.assertTrue(running.lock())
-        self.addCleanup(os.close, running.lock_fd)
+        self.start(decl)
         copy = decl.parent / "payloads" / "task-1.txt"
         copy.parent.mkdir(parents=True, exist_ok=True)
         copy.write_text("task: the running seat's turn\n", encoding="utf-8")
         self.assertEqual(self.make(decl).serve(once=True), seat_mod.EXIT_LOCKED)
         self.assertTrue(copy.exists())
+        self.assertTrue(self.taking(decl))
 
-    def test_a_copy_that_cannot_be_removed_is_logged_and_the_seat_still_starts(self):
+    def test_a_seat_that_cannot_clear_the_folder_serves_without_vouching_for_any_copy(self):
         decl = self.declaration()
         left = decl.parent / "payloads" / "task-1.txt"
         left.parent.mkdir(parents=True)
         left.write_text("task\n", encoding="utf-8")
-        s = self.make(decl)
         with mock.patch.object(seat_mod.Path, "unlink", side_effect=OSError("denied")):
-            self.assertTrue(s.lock())
-        self.addCleanup(os.close, s.lock_fd)
+            s = self.start(decl)
+        self.assertIsNone(s.claim_fd)
+        self.assertFalse(self.taking(decl), "the inherited copy is still there: nothing is vouched for")
         self.assertIn("could not be removed: task-1.txt", self.out.getvalue())
+        with mock.patch.object(seat_mod.Path, "iterdir", side_effect=PermissionError("denied")):
+            self.assertIsNone(self.make(decl).claim_copies())
+        self.assertIn("could not be listed", self.out.getvalue())
+
+    def test_a_seat_stopping_gives_up_the_claim_with_the_lock(self):
+        decl = self.declaration()
+        s = self.make(decl)
+        self.assertEqual(s.serve(once=True), 0)
+        self.assertFalse(self.taking(decl))
 
 
 class Turns(SeatCase):

@@ -5284,15 +5284,16 @@ def _seat_took(tid: str, since: float) -> bool:
     """A live Codex app-server seat is running this generation of the task: it works on its own copy
     (<state>/codex-seat/<session>/payloads/<tid>.txt) and writes no agent-activity rows, so the activity
     test alone would withdraw the inbox file mid-turn. Evidence is a copy written no earlier than the inbox
-    file (`since`, its mtime) in a seat folder whose `lock` its running seat still holds; a copy an exited
-    seat left behind, or one of an older generation, takes nothing."""
+    file (`since`, its mtime) in a seat folder whose `taking.lock` a running seat holds. The seat takes
+    that lock only after clearing the copies an earlier seat left, so a copy an exited seat left behind,
+    one a restarted seat inherited, or one of an older generation, takes nothing."""
     try:
         copies = list((_STATE / "codex-seat").glob(f"*/payloads/{glob.escape(tid)}.txt"))
     except OSError:
         return False
     for copy in copies:
         try:
-            if copy.stat().st_mtime >= since and _seat_lock_held(copy.parent.parent / "lock"):
+            if copy.stat().st_mtime >= since and _seat_lock_held(copy.parent.parent / "taking.lock"):
                 return True
         except OSError:
             continue
@@ -5300,7 +5301,7 @@ def _seat_took(tid: str, since: float) -> bool:
 
 
 def _seat_lock_held(path: Path) -> bool:
-    """Whether a running seat holds its folder's lock (seat.py takes it exclusively for its whole life)."""
+    """Whether a running seat holds this lock (seat.py holds `taking.lock` exclusively once it serves)."""
     try:
         import fcntl
     except ImportError:

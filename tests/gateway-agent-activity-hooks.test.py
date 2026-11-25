@@ -1335,7 +1335,7 @@ class Hooks(unittest.TestCase):
         self.assertTrue(gw._deliver_result_payload(tid, tid, "late"))
         self.assertEqual(fake.posted("/v1/results"), [])
 
-    def seat_copy(self, tid, *, live=True, age=0.0):
+    def seat_copy(self, tid, *, live=True, age=0.0, lock="taking.lock"):
         """The copy a seat named sutando-core made of `tid`, `age` seconds older than now; with `live`, the
         seat's lock is held as its running process holds it."""
         import fcntl
@@ -1347,7 +1347,7 @@ class Hooks(unittest.TestCase):
         if age:
             os.utime(copy, (time.time() - age, time.time() - age))
         if live:
-            fd = os.open(seat / "lock", os.O_RDWR | os.O_CREAT, 0o600)
+            fd = os.open(seat / lock, os.O_RDWR | os.O_CREAT, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.addCleanup(os.close, fd)
         return copy
@@ -1370,6 +1370,18 @@ class Hooks(unittest.TestCase):
         self.seat_copy(tid, live=False)
         self.closed_by_beat(tid, reason="max_queued_age_exceeded")
         self.assertFalse((gw.TASKS_DIR / f"{tid}.txt").exists(), "no running seat: withdrawn")
+        self.assertEqual(self.controls(tid), [])
+
+    def test_a_copy_a_restarted_seat_inherited_takes_nothing(self):
+        """The replacement holds the seat lock from its first moment, over whatever the interrupted
+        seat left. It has not taken that task: only `taking.lock`, held after the folder was cleared,
+        vouches for a copy, so during the cleanup, or after one that failed, nothing is taken."""
+        tid = "task-closed-inherited-copy"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        seed_ack(tid, _ack(tid, 1))
+        self.seat_copy(tid, lock="lock")
+        self.closed_by_beat(tid, reason="max_queued_age_exceeded")
+        self.assertFalse((gw.TASKS_DIR / f"{tid}.txt").exists(), "the seat lock alone vouches for nothing")
         self.assertEqual(self.controls(tid), [])
 
     def test_a_copy_of_an_older_generation_takes_nothing(self):

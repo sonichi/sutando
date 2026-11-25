@@ -362,6 +362,7 @@ class Seat:
         self.declined: List[str] = []
         self.idle_logged = False
         self.lock_fd: Optional[int] = None
+        self.claim_fd: Optional[int] = None
         # The login on disk when the running child was started, and whether the current turn was refused
         # because that login no longer works.
         self.auth_seen: Optional[tuple] = None
@@ -1300,21 +1301,36 @@ class Seat:
             os.close(fd)
             return False
         self.lock_fd = fd
-        self.drop_inherited_snapshots()
+        self.claim_fd = self.claim_copies()
         return True
 
-    def drop_inherited_snapshots(self) -> None:
-        """Called with the lock just taken: copies an earlier seat left in this state dir are removed, so
-        the lock this seat now holds never vouches for a task only the earlier seat had taken."""
+    def claim_copies(self) -> Optional[int]:
+        """Called with the seat lock just taken. Copies an earlier seat left in this state dir are
+        removed, and only then is `taking.lock` taken: that second lock, not the seat lock, is what
+        tells the bridge a copy here is a running seat's. A seat that could not clear the folder
+        serves without it, so an inherited copy is never vouched for."""
         try:
             left = list((Path(self.host.state) / "payloads").iterdir())
-        except OSError:
-            return
+        except FileNotFoundError:
+            left = []
+        except OSError as e:
+            log(f"the task copies an earlier seat left could not be listed ({type(e).__name__}); "
+                "this seat's copies are not shown as taken")
+            return None
         for path in left:
             try:
                 path.unlink()
             except OSError:
-                log(f"a task copy an earlier seat left could not be removed: {path.name}")
+                log(f"a task copy an earlier seat left could not be removed: {path.name}; "
+                    "this seat's copies are not shown as taken")
+                return None
+        fd = os.open(os.path.join(self.host.state, "taking.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return None
+        return fd
 
     def resume_runtime_wait(self, popen=None) -> None:
         """The core is up: a sign-in a runtime card is waiting for gets its waiter back (a restart can
@@ -1367,6 +1383,8 @@ class Seat:
             if watcher is not None:
                 watcher.stop()
             self.close_server()
+            if self.claim_fd is not None:
+                os.close(self.claim_fd)
             os.close(self.lock_fd)
         log("seat stopped")
         return 0
