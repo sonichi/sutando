@@ -1070,6 +1070,21 @@ class ModelCardTest(unittest.TestCase):
         self.assertIn("model=gpt-6-sol", self.serve("task-o", "the owner again"))
         self.assertEqual(self.posted(), [])
 
+    def test_a_failure_on_a_guests_or_a_collaborators_turn_keeps_the_owners_pick_for_the_owners_turn(self):
+        self.pick("Stub Broken")
+        self.posted("$card2")
+        self.serve("task-g", "hi", extra=["--allow-non-owner"], tier="guest", channel="!room:s.space", kind="room")
+        (self.work / "tasks" / "task-c.txt").write_text(gateway_mid_task("task-c", "from a collaborator", "team", True))
+        self.assertEqual(run_connector(self.work, once=1), 0)
+        # Neither runtime's failure is the owner's: the pick stays pending, and nothing is told.
+        self.assertEqual((self.state()["wanted"], self.state().get("told"), self.posted()), ("gpt-6-astra", "", []))
+        self.assertNotIn("model_switch", metrics(self.work)[-1])
+        # The owner's own turn tries it, and its outcome is told in the DM.
+        self.assertIn("status failed", self.serve("task-o", "the owner"))
+        ((room, told),) = self.posted("$card3")
+        self.assertEqual((room, told["state"], metrics(self.work)[-1]["model_switch"], self.state()["wanted"]),
+                         (self.DM, "error", "not-switched", ""))
+
 
 class FakeRpc:
     """A server that accepts turn/start and then says nothing: the proxy branch cannot

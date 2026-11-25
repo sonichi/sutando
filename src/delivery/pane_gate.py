@@ -61,7 +61,9 @@ from pane_composer import (BORDER_LINE, CLAUDE_COMPOSER, CLAUDE_IDLE, COMPOSER_P
                            pending_text, prompt_line)
 from quota_availability import provider_allows_now  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
-from worker_auth_state import signed_in_since  # noqa: E402
+# The completed-turn grammar (TURN_DONE) is the sign-in reading's: one copy for both.
+from worker_auth_state import (TURN_DONE, VERB_MARKS, VERB_START, TurnPattern,  # noqa: E402,F401
+                               signed_in_since)
 
 REPO = _SRC.parent
 SEND_LINE = REPO / "scripts" / "tmux-send-line.sh"
@@ -88,9 +90,6 @@ FABLE_TEXT = re.compile(r"reached your Fable limit|included Fable usage for this
 # the reset its second row reads "Continuing shortly · Esc to cancel", often captured without the first.
 LIMIT_WAIT = re.compile(r"Continuing automatically (?:at\b|shortly\b)|Continuing shortly\s*·\s*Esc to cancel"
                         r"|\b(?:session|usage|weekly) limit reached\b", re.I)
-# A completed turn ("✻ Cooked for 1s · done 12:32 PM"); the spinner reuses the glyph and must not match.
-TURN_DONE = re.compile(
-    r"^\s*✻\s+[A-Za-z]+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?\s*$")
 #: A turn this short (or with no duration) may be the CLI refusing it, not running it.
 TURN_SHORT = re.compile(r"[01]s")
 # A turn the CLI refuses outright is a FINISHED turn: the reason is its `⎿` result and the
@@ -191,8 +190,8 @@ AWAIT_HINT = re.compile(
     r"|Continuing automatically|❯\s*\d+\.", re.I)
 # A turn's spinner ("✳ Moonwalking… (15s · …)") or completion line: transcript above, live dialog
 # below. Not "esc to interrupt": the busy footer carries it, under any live dialog.
-_SPINNER_ROW = re.compile(r"^\s*[·✢✳✶✻✽*]\s+[A-Za-z][\w-]*(?:…|\.\.\.)\s*\(")
-_TURN_ROW = re.compile(rf"{_SPINNER_ROW.pattern}|{TURN_DONE.pattern}")
+_SPINNER_ROW = TurnPattern(rf"^\s*[·✢✳✶✻✽*]\s+{VERB_START}(?:[\w-]|[{VERB_MARKS}])*(?:…|\.\.\.)\s*\(")
+_TURN_ROW = TurnPattern(rf"{_SPINNER_ROW.pattern}|{TURN_DONE.pattern}")
 
 
 def turn_status(lines: List[str]) -> Optional[List[str]]:
@@ -228,11 +227,13 @@ class RuntimeAdapter:
     # The runtime's dispatcher waits for idle-ready, so a draft holds every queued task.
     pending_blocks_dispatch: bool = False
     composer_requires_single_line: bool = False
+    # The CLI draws a running turn as a spinner row above the composer (turn_running reads it).
+    spinner_turns: bool = False
 
 
 CLAUDE = RuntimeAdapter(
     name="claude", glyph=CLAUDE_COMPOSER.glyph, idle_ready=CLAUDE_IDLE,
-    gate_signatures=tuple(CLAUDE_GATE_SIGNATURES),
+    gate_signatures=tuple(CLAUDE_GATE_SIGNATURES), spinner_turns=True,
 )
 # Codex's composer glyph varies by CLI version; its model row is the idle footer.
 CODEX_IDLE = re.compile(
@@ -297,10 +298,8 @@ def _slash_menu_rows(rows: List[str]) -> set:
     return out
 
 
-def gate_evidence(tail: str, styled_tail: Optional[str] = None,
-                  adapter: RuntimeAdapter = CLAUDE) -> str:
-    """Exclude idle chrome, verified ghost suggestions, completed conditional recaps and the
-    completion list a slash command in the composer opens."""
+def _slash_menu(tail: str, styled_tail: Optional[str], adapter: RuntimeAdapter):
+    """(rows, prompt line, composer index, completion-list row indexes) of `tail`."""
     rows = tail.splitlines()
     line = prompt_line(styled_tail if styled_tail is not None else tail, adapter)
     composer_i = next((i for i in range(len(rows) - 1, -1, -1)
@@ -308,6 +307,37 @@ def gate_evidence(tail: str, styled_tail: Optional[str] = None,
     menu = (_slash_menu_rows(rows[:composer_i])
             if composer_i is not None and line is not None and line.text.lstrip().startswith("/")
             else set())
+    return rows, line, composer_i, menu
+
+
+def slash_menu_gate_rows(tail: str, styled_tail: Optional[str] = None,
+                         adapter: RuntimeAdapter = CLAUDE) -> List[str]:
+    """Wrapped description lines of a completion list, per contiguous run, whose run holds a
+    gate signature and an await hint (on one line or split). Indentation cannot tell such a
+    run from a dialog's, so it is never an answerable gate: callers surface it to a human,
+    and never send a key for it."""
+    rows, _, _, menu = _slash_menu(tail, styled_tail, adapter)
+    runs: List[List[int]] = []
+    for i in sorted(menu):
+        if _SLASH_MENU_ROW.match(_SGR.sub("", rows[i])):
+            continue
+        if runs and runs[-1][-1] == i - 1:
+            runs[-1].append(i)
+        else:
+            runs.append([i])
+    out: List[str] = []
+    for run in runs:
+        text = "\n".join(rows[i] for i in run)
+        if adapter.await_hint.search(text) and any(rx.search(text) for _, rx in adapter.gate_signatures):
+            out.extend(rows[i] for i in run)
+    return out
+
+
+def gate_evidence(tail: str, styled_tail: Optional[str] = None,
+                  adapter: RuntimeAdapter = CLAUDE) -> str:
+    """Exclude idle chrome, verified ghost suggestions, completed conditional recaps and the
+    completion list a slash command in the composer opens."""
+    rows, line, composer_i, menu = _slash_menu(tail, styled_tail, adapter)
     completed = (composer_i is not None and line is not None and not line.text.strip()
                  and any(row.strip() == "Nothing needs you this round."
                          for row in rows[:composer_i]))
@@ -344,22 +374,25 @@ def _gate(capture: str, tail: str, line: Optional[PromptLine], adapter: RuntimeA
         footer_hits = list(adapter.idle_ready.finditer(tail))
         beyond_footer = tail[footer_hits[-1].end():] if footer_hits else ""
         newer = "\n".join(part for part in (following, beyond_footer) if part.strip())
+        menu_gates = slash_menu_gate_rows(newer, adapter=adapter)
         newer = gate_evidence(newer, adapter=adapter)
         if not newer or not adapter.await_hint.search(newer):
-            return None
+            return "unlisted" if menu_gates else None
         for kind, rx in adapter.gate_signatures:
             if rx.search(newer):
                 return kind
         # An await hint we cannot name is an UNRECOGNISED dialog, not the absence of one.
         # Falling through to "no gate" let a stale empty composer vouch for a live dialog.
         return "unlisted"
-    tail = gate_evidence(tail, "\n".join(_tail_lines(capture)), adapter)
+    styled = "\n".join(_tail_lines(capture))
+    menu_gates = slash_menu_gate_rows(tail, styled, adapter)
+    tail = gate_evidence(tail, styled, adapter)
     if not adapter.await_hint.search(tail):
-        return None
+        return "unlisted" if menu_gates else None
     for kind, rx in adapter.gate_signatures:
         if rx.search(tail):
             return kind
-    return None
+    return "unlisted" if menu_gates else None
 
 
 def automation_leftover(capture: Optional[str], adapter: RuntimeAdapter, workspace=None,
@@ -504,19 +537,31 @@ def _waiting_row(plain: str) -> bool:
     return bool(limit_line(plain) or _WAIT_TEXT.search(plain) or frame_abnormal(plain))
 
 
+def _live_spinner(capture: Optional[str]) -> Optional[List[str]]:
+    """Plain rows from the newest turn row above the composer down, when that row is a spinner
+    drawn at column 0, as the CLI draws its live one. Reply and tool text are indented."""
+    lines = (capture or "").splitlines()
+    rows = turn_status([_SGR.sub("", ln) for ln in lines[:len(lines) - len(_below_composer(capture))]])
+    return rows if rows and not rows[0][:1].isspace() else None
+
+
+def turn_running(capture: Optional[str], adapter: RuntimeAdapter = CLAUDE, waits: bool = True) -> bool:
+    """A turn is running: the newest turn row above the composer is a spinner, drawn from the
+    turn's first second (Claude Code 2.1.322 prints no "esc to interrupt" while a turn runs).
+    `waits` False: a spinner that names a limit, a retry or a wait is waiting, not running."""
+    rows = _live_spinner(capture) if adapter.spinner_turns else None
+    return rows is not None and (waits or not any(_waiting_row(r) for r in rows))
+
+
 def turn_in_flight(capture: Optional[str]) -> bool:
     """The newest turn row above the composer is a spinner that has run FLIGHT_MIN_S or more,
     and neither it nor a row under it names a limit, a retry or a wait: the seat is mid-turn,
     so a limit banner under the composer is from before it."""
-    lines = (capture or "").splitlines()
-    above = [_SGR.sub("", ln) for ln in lines[:len(lines) - len(_below_composer(capture))]]
-    for i in range(len(above) - 1, -1, -1):
-        if _TURN_ROW.search(above[i]):
-            if not _SPINNER_ROW.search(above[i]) or any(_waiting_row(r) for r in above[i:]):
-                return False
-            ran = spinner_elapsed(above[i])
-            return ran is not None and ran >= FLIGHT_MIN_S
-    return False
+    rows = _live_spinner(capture)
+    if rows is None or any(_waiting_row(r) for r in rows):
+        return False
+    ran = spinner_elapsed(rows[0])
+    return ran is not None and ran >= FLIGHT_MIN_S
 
 
 def strip_limit_banners(capture: str) -> str:
@@ -609,7 +654,7 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=Non
         return Verdict("busy", gate)
     if abn and not limit_is_stale(abn, workspace, socket, session, probe, capture=capture):
         return Verdict("abnormal", ",".join(abn.names))
-    if frame_working(tail):
+    if frame_working(tail) or turn_running(capture, adapter):
         return Verdict("busy", "working")
     if line is not None and line.text:
         return Verdict("pending", "text at the prompt", line.text)
@@ -628,7 +673,8 @@ def limit_holds(capture: Optional[str], adapter: RuntimeAdapter) -> bool:
     lines = _tail_lines(capture)
     tail = "\n".join(_SGR.sub("", ln) for ln in lines)
     abn = frame_abnormal(tail)
-    if (abn and abn.retrying) or frame_working(tail) or turn_in_flight(capture):
+    # Any age: a recovery line's own turn spins before any refusal returns.
+    if (abn and abn.retrying) or frame_working(tail) or turn_running(capture, adapter, waits=False):
         return False
     line = prompt_line(capture, adapter)
     if line is None or line.text:

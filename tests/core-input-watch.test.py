@@ -21,6 +21,7 @@ isolate_os_environ()
 import importlib.util
 import json
 import os
+import sys
 import unittest
 from pathlib import Path as _Path
 
@@ -555,6 +556,58 @@ class TestTheBusyFooterIsNotTheTurnRow(unittest.TestCase):
         self.assertEqual(self.verdicts(pane), (None, "running", "busy:working"))
 
 
+# A finished turn whose verb is not ASCII, under the agent's own reply quoting a key hint.
+_ACCENTED_DONE = "  ✻ Sautéed for 1m 4s · done 9:32 AM · 1 shell still running"
+_QUOTED_HINT_TAIL = (
+    '  Enter to accept the change", indented under a menu row. It checks that this line still raises'
+    " no alert today, so a\n"
+    "  later change in that behaviour will show up as a test failure.\n"
+    "  The fix itself is unchanged. All 10 tests in that file pass and the repo's review checks pass.\n"
+    + _ACCENTED_DONE + "\n")
+
+
+class TestNonAsciiTurnVerb(unittest.TestCase):
+    """The CLI's turn verb may carry any letter ("Sautéed", "Élucidating"): its row still
+    cuts the transcript above it off from the live region."""
+
+    def test_finished_turn_with_an_accented_verb_quoting_a_hint_is_idle(self):
+        pane = (_QUOTED_HINT_TAIL + _IDLE_FOOTER
+                + "\n  Sutando: idle                                                     [-]")
+        self.assertIsNone(classify(pane))
+
+    def test_accented_completion_row_is_a_finished_turn(self):
+        for row in (_ACCENTED_DONE, _ACCENTED_DONE.split(" · 1 shell")[0]):
+            with self.subTest(row=row):
+                m = _mod.TURN_DONE.search(row)
+                self.assertIsNotNone(m)
+                self.assertEqual(m.group("dur"), "1m 4s")
+
+    def test_accented_spinner_is_a_spinner_not_a_finished_turn(self):
+        pg = sys.modules["delivery.pane_gate"]
+        row = "✳ Élucidating… (5s · ↓ 237 tokens)"
+        self.assertTrue(pg._SPINNER_ROW.search(row))
+        self.assertFalse(_mod.TURN_DONE.search(row))
+        self.assertIsNotNone(pg.turn_status([row, "  ⏵⏵ bypass permissions on"]))
+
+    def test_decomposed_accents_and_combining_marks_read_as_letters(self):
+        # "Saute\u0301ed" composes under NFC; Cyrillic stress (U+0301) has no precomposed form.
+        for verb in ("Saute\u0301ed", "Ва\u0301рил"):
+            with self.subTest(verb=verb):
+                done = f"  ✻ {verb} for 1m 4s · done 9:32 AM · 1 shell still running"
+                pane = (_QUOTED_HINT_TAIL.replace(_ACCENTED_DONE, done) + _IDLE_FOOTER
+                        + "\n  Sutando: idle                                                     [-]")
+                self.assertIsNone(classify(pane))
+                self.assertEqual(_mod.TURN_DONE.match(done).group("dur"), "1m 4s")
+
+    def test_a_decomposed_spinner_is_still_the_live_turn(self):
+        pg = sys.modules["delivery.pane_gate"]
+        for verb in ("E\u0301lucidating", "Ва\u0301рю"):
+            row = f"✳ {verb}… (5s · ↓ 237 tokens)"
+            with self.subTest(verb=verb):
+                self.assertFalse(_mod.TURN_DONE.search(row))
+                self.assertIsNotNone(pg.turn_status(["✻ Worked for 2s", row, "  ⏵⏵ bypass permissions on"]))
+
+
 class TestUnobservedProbeIsNotHung(unittest.TestCase):
     """An unobserved process probe (tmux refused the client, binary missing) must
     hold, never become the RECOVER-facing `hung`; only a SEEN session with stale
@@ -706,6 +759,13 @@ class TestMovingTurnIsNotHung(unittest.TestCase):
     def test_a_frozen_working_pane_stays_hung(self):
         st, *_ = compose_state(_TURN_A, "unknown", True, prev_pane=_TURN_A)
         self.assertEqual(st, "hung")
+
+    def test_a_turn_drawn_as_its_spinner_alone_is_in_flight(self):
+        # Claude Code 2.1.322 prints no "esc to interrupt" while a turn runs.
+        a, b = (t.replace(" · esc to interrupt", "") for t in (_TURN_A, _TURN_B))
+        self.assertFalse(_mod.cli_wedge.frame_working(b))
+        self.assertEqual(compose_state(b, "unknown", True, prev_pane=a)[0], "running")
+        self.assertEqual(compose_state(a, "unknown", True, prev_pane=a)[0], "hung")
 
     def test_the_first_poll_has_no_motion_to_see(self):
         st, *_ = compose_state(_TURN_A, "unknown", True)

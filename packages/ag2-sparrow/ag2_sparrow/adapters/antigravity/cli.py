@@ -189,6 +189,7 @@ def preflight(args) -> str:
 
 
 def install(args) -> int:
+    cm.take_over(args)
     if getattr(args, "token_stdin", False):
         return cb.install_token_stdin(args, LOCAL, lambda: preflight(args), install, COMMAND, work=None)
     problem = cb.recorded_install_args(args, LOCAL, RECORDED)
@@ -397,6 +398,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("install", help="check the sign-in, record the settings, write the unit, have the manager "
                        "start the connector")
+    cm.replace_option(p)
     p.add_argument("--work", help="an explicit work root, fed by a bridge you run (<work>/tasks, <work>/results)")
     tok = p.add_mutually_exclusive_group()
     tok.add_argument("--token-env-file", help="instead of --work: the agent's 0600 env file; the root is the "

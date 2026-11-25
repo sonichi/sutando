@@ -108,6 +108,10 @@ class CodexTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.work = Path(self.tmp.name) / "work"
         (Path(str(self.work) + ".bridge") / "state").mkdir(parents=True)
+        # The stub runs untraced here: this module's isolated HOME hides the runner's own coverage install.
+        plain = mock.patch.object(codex_connector, "server_argv", codex_t.REAL_SERVER_ARGV)
+        plain.start()
+        self.addCleanup(plain.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
