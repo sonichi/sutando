@@ -44,6 +44,7 @@ ROOM_FILE = "quota-room.json"   # the owner's DM room: the claim's alone
 
 CLEAR_S = 600.0         # the banner gone this long: the limit is over, and a later one is a new card
 COVERS_KEEP = 20        # the task cards of one incident whose fate is still followed
+
 SAME_CARD_S = 120.0     # a message known this soon after the unasked card is answered by that card
 
 ECHO_TASKS, ECHO_BYTES, ECHO_MIN = 40, 200_000, 8    # the task files a pane line is checked against
