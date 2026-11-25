@@ -455,7 +455,9 @@ class Launcher:
             plugin = records.load_plugin(self.root)
         except records.RecordError:
             plugin = records.empty_plugin()     # a torn record still lets the alarm through
-        plugin = dict(plugin, stuck=inbox.unresolved_stuck(self.root, plugin.get("stuck")),
+        # An entry an earlier session left in the Mod's record is not a turn: it must not read as a stall.
+        plugin = dict(plugin, inflight=inbox.live_inflight(self.root, plugin.get("inflight")),
+                      stuck=inbox.unresolved_stuck(self.root, plugin.get("stuck")),
                       progress_unwritable=records.read_progress_alarm(self.config_dir))
         self.observation = detector.derive(self.observation, text, plugin, self.clock())
         stall = self.observation["stall"]
@@ -633,6 +635,9 @@ class Launcher:
             return False, "refused: the session's input box holds unsent text; nothing sent"
         shown = self.tm.capture(gen["pane_id"]) or ""
         before, other, asked = accepted_count(model, shown), shown.count(MODEL_SET), shown.count(MODEL_CONFIRM)
+        # The CLI's own settings file, for a [1m] switch answered without a context size (claude_model_switch.settled).
+        settings = os.path.join(self.cfg["CLAUDE_CONFIG_DIR"], "settings.json") if self.cfg.get("CLAUDE_CONFIG_DIR") else ""
+        base = claude_model_switch.baseline(model, shown, settings)
 
         def keys(*names):
             pred = tmux_pane_keys.predicate(gen["nonce"], gen["pane_pid"], gen["session_id"], gen["session_created"],
@@ -649,7 +654,7 @@ class Launcher:
         answered, deadline, text = False, time.monotonic() + wait_s, shown
         while time.monotonic() < deadline:
             text = self.tm.capture(gen["pane_id"]) or ""
-            if accepted_count(model, text) > before:
+            if accepted_count(model, text) > before or (settings and claude_model_switch.settled(model, text, settings, base)):
                 self.log("model: switched to %s" % model)
                 with contextlib.suppress(OSError):   # the switch happened whether or not it is recorded
                     path = Path(self.root).joinpath(*MODEL_RECORD)
