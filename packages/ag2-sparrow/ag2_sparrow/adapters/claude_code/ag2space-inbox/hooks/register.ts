@@ -658,6 +658,8 @@ export const register: Register = (on) => {
       if (hash === offer.hash) {
         // The turn is ours: CALLING -> TURN_CONFIRMED with the turn id, the nonce and the hash the claim recorded.
         offer.confirming = { turnId: e.turnId, hash }
+        // Any turn, fresh or taken back: a confirmation the CLI keeps deferring holds intake until then, no
+        // longer (the scan). The turn is not resubmitted or dropped, and the confirmation is still retried.
         offer.waitUntil = (await nowMs($)) + CONFIRM_MS
         await confirmOffer($, s, offer)
       }

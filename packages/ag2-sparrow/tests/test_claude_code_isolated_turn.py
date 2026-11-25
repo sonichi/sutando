@@ -416,6 +416,36 @@ class InflightVerb(ConnectBase):
         self.assertEqual(self.verb("publish", t)[0], 0)
         self.assertEqual(self.listed(), {}, "answered: nothing left to finish")
 
+    def verb_with(self, body, *args):
+        with mock.patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(body))):
+            return self.verb(*args)
+
+    def test_the_calls_a_reloaded_mod_makes_mid_turn_end_with_exactly_one_result(self):
+        """The real verbs, in the order the Mod calls them around a reload inside a running turn: the
+        claim is listed at the same attempt, is not handed out a second time, and whatever is tried after
+        the one reply (another reply, the turn's end, a claim, an interrupt) leaves that one result."""
+        t = "task-rl1"
+        (self.inbox / (t + ".txt")).write_text("id: %s\naccess_tier: owner\ntask: hi\n" % t)
+        rc, claimed = self.verb("claim", t)
+        self.assertEqual(rc, 0, claimed)
+        token = self.verb("authorize", t, str(claimed["attempt"]), "--text-hash", "h1")[1]["token"]
+        self.assertEqual(self.verb("confirm", t, "turn-1", token, "--text-hash", "h1")[0], 0)
+        # The reload: the Mod has only what it kept, and asks what is still in flight.
+        self.assertEqual(self.listed(), {t: {"phase": "TURN_CONFIRMED", "turn_id": "turn-1", "attempt": claimed["attempt"]}})
+        rc, again = self.verb("claim", t)
+        self.assertEqual((rc, again.get("retry"), "attempt" in again), (1, None, False), "no second attempt, no second turn")
+        self.assertEqual(self.verb_with(b"four\n", "stage", t, "turn-1")[1].get("outcome"), "staged")
+        self.assertEqual(self.verb("publish", t)[1].get("outcome"), "settled")
+        self.assertEqual(self.listed(), {})
+        self.assertEqual(self.verb_with(b"five\n", "stage", t, "turn-1")[0], 1, "a second reply is refused")
+        rc, parked = self.verb("park", t, "turn-1", "--detail", "turn answer without a reply")
+        self.assertEqual((rc, parked.get("parked")), (0, False), "the turn's end adds no protocol failure")
+        self.assertEqual(self.verb("claim", t)[0], 1)
+        self.assertEqual(self.verb("interrupt", t)[1].get("interrupted"), False)
+        results = sorted(p.name for p in self.results.rglob("*") if p.is_file() and not p.name.startswith("."))
+        self.assertEqual(results, [t + ".txt"], "exactly one result")
+        self.assertEqual((self.results / (t + ".txt")).read_text(), "four\n")
+
 
 if __name__ == "__main__":
     unittest.main()

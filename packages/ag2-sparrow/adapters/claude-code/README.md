@@ -121,7 +121,9 @@ waited for five minutes; after that intake goes on, the turn is still confirmed
 if it starts, and otherwise the next start answers it. A confirmation the CLI
 asked to retry is kept with the turn it is for (and that turn's end, once seen)
 and tried again after the reload; one the CLI keeps asking to retry holds intake
-for five minutes, after which intake goes on and the retry continues. An offer
+for five minutes, after which intake goes on and the retry continues (the same
+bound holds for a turn that was never reloaded; a turn whose confirmation went
+through holds intake until it ends). An offer
 intake stopped waiting for is still kept, so a second reload does not lose it or
 a confirmation that came late. The body handed to `stage` rides on the offer
 from before the CLI is asked until staging is settled, so every save made in

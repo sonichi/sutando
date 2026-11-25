@@ -2159,6 +2159,106 @@ const notTakenBack = async ($: any, on: any, opts: Record<string, unknown>) => {
   expect(String(r.text ?? r.result)).toContain('is not a task this session received')
 }
 
+// The five-minute bound on a confirmation is not a reload rule: it applies to any turn, and only while the
+// confirmation is unresolved. A fresh turn whose confirmation went through holds intake however long it runs.
+test('a fresh turn, never reloaded, that was confirmed holds intake past five minutes and past thirty: nothing is given up on', async ($, on) => {
+  const h = host(on)
+  const writes = seed(on, [])
+  h.files['/in/task-f1.txt'] = TASK('task-f1')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-f1' })
+  expect(h.claims['task-f1'].phase).toBe('TURN_CONFIRMED')
+  const kept = (writes[writes.length - 1] as any[]).find(o => o.rid === 'task-f1')
+  expect([kept.waitUntil, kept.endBy, kept.unconfirmed]).toEqual([undefined, undefined, undefined])
+  h.files['/in/task-f2.txt'] = TASK('task-f2')
+  await h.clock.advance(40 * 60 * 1000)
+  expect(h.submitted.length).toBe(1)                           // task-f2 waits for the running turn
+  expect(h.logs.some((l: string) => l.includes('still not through') || l.includes('did not end within'))).toBe(false)
+  expect(Object.keys(h.files).filter(f => f.startsWith('/out/'))).toEqual([])
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-f1', text: 'a long turn' })
+  expect(String(r.text ?? r.result)).toContain('Published /out/task-f1.txt')
+  await $.turn.complete({ turnId: 't-f1', reason: 'answer', text: 'x' })
+  await h.clock.advance(2000)
+  expect(h.submitted.length).toBe(2)
+  expect(h.publishes()).toBe(1)
+})
+
+test('a fresh turn, never reloaded, whose confirmation stays unresolved: both tasks are answered once each, neither is resubmitted', async ($, on) => {
+  const h = host(on, { lockFailsOnce: Array(320).fill('confirm') })
+  h.files['/in/task-f3.txt'] = TASK('task-f3')
+  await arm($, h)
+  await h.clock.advance(1000)
+  expect(verbs(h).includes('inflight')).toBe(false)             // not a reload: nothing was kept
+  await $.turn.start({ text: h.submitted[0], turnId: 't-f3' })
+  h.files['/in/task-f4.txt'] = TASK('task-f4')
+  await h.clock.advance(299 * 1000)
+  expect(h.submitted.length).toBe(1)                           // held for the whole five minutes
+  await h.clock.advance(3 * 1000)
+  expect(h.submitted.length).toBe(2)                           // then task-f4 is submitted behind the running turn
+  await h.clock.advance(30 * 1000)                             // the CLI answers: the first turn is confirmed late
+  expect(h.claims['task-f3'].phase).toBe('TURN_CONFIRMED')
+  const first = await $.tool.call({ tool: REPLY, task_id: 'task-f3', text: 'first' })
+  expect(String(first.text ?? first.result)).toContain('Published /out/task-f3.txt')
+  await $.turn.complete({ turnId: 't-f3', reason: 'answer', text: 'x' })
+  await $.turn.start({ text: h.submitted[1], turnId: 't-f4' })
+  const second = await $.tool.call({ tool: REPLY, task_id: 'task-f4', text: 'second' })
+  expect(String(second.text ?? second.result)).toContain('Published /out/task-f4.txt')
+  await $.turn.complete({ turnId: 't-f4', reason: 'answer', text: 'x' })
+  await h.clock.advance(5000)
+  expect(h.submitted.length).toBe(2)
+  expect(h.publishes()).toBe(2)
+  expect([h.files['/out/task-f3.txt'], h.files['/out/task-f4.txt']]).toEqual(['first\n', 'second\n'])
+  expect(Object.keys(h.files).filter(f => f.startsWith('/out/')).sort()).toEqual(['/out/task-f3.txt', '/out/task-f4.txt'])
+})
+
+// One reload, end to end, in two Mod instances: the second is given exactly what the first wrote to the
+// session's state and the same claim store, as a reload inside a live session leaves them.
+let carried: { kept: unknown[]; claims: Record<string, Claim>; submitted: string[]; turnId: string } | undefined
+
+test('one reload, before it: a fresh Mod serves the task into its running turn and keeps the offer', async ($, on) => {
+  const h = host(on)
+  const writes = seed(on, [])
+  h.files['/in/task-live.txt'] = TASK('task-live')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: FRAMED(h.submitted[0]), turnId: 'turn-live' })
+  expect(h.claims['task-live'].phase).toBe('TURN_CONFIRMED')
+  expect(h.publishes()).toBe(0)
+  carried = { kept: JSON.parse(JSON.stringify(writes[writes.length - 1])), claims: JSON.parse(JSON.stringify(h.claims)),
+              submitted: [...h.submitted], turnId: 'turn-live' }
+  expect((carried.kept as any[]).map(o => [o.rid, o.phase, o.turnId])).toEqual([['task-live', 'TURN_CONFIRMED', 'turn-live']])
+})
+
+test('one reload, after it: the turn that was running answers, and the reload ends with exactly one result', async ($, on) => {
+  expect(carried !== undefined).toBe(true)                     // the case above ran first, in this file's order
+  const h = host(on)
+  const writes = seed(on, carried!.kept)
+  Object.assign(h.claims, carried!.claims)
+  h.files['/in/task-live.txt'] = TASK('task-live')              // still in the inbox: the turn is not over
+  await arm($, h)
+  await h.clock.advance(5000)
+  expect(verbs(h).includes('claim')).toBe(false)                // never claimed a second time
+  expect(h.submitted.length).toBe(0)                            // never submitted a second time
+  expect(h.claims['task-live'].attempt).toBe(carried!.claims['task-live'].attempt)
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-live', text: 'the one answer' })
+  expect(String(r.text ?? r.result)).toContain('Published /out/task-live.txt')
+  const again = await $.tool.call({ tool: REPLY, task_id: 'task-live', text: 'another answer' })
+  expect(again.isError).toBe(true)
+  await $.turn.complete({ turnId: carried!.turnId, reason: 'answer', text: 'x' })
+  await $.turn.start({ text: 'an unrelated turn typed by the user', turnId: 'turn-next' })
+  await $.turn.complete({ turnId: 'turn-next', reason: 'answer', text: 'x' })
+  await h.clock.advance(31 * 60 * 1000)                         // past every bound a taken-back offer has
+  expect(h.publishes()).toBe(1)
+  expect(Object.keys(h.files).filter(f => f.startsWith('/out/'))).toEqual(['/out/task-live.txt'])
+  expect(h.files['/out/task-live.txt']).toBe('the one answer\n')
+  expect(h.claims['task-live'].phase).toBe('SETTLED')
+  expect(verbs(h).filter((v: string) => v === 'stage').length).toBe(1)
+  expect(verbs(h).includes('park')).toBe(false)                 // no protocol failure beside the answer
+  expect(h.submitted.length).toBe(0)
+  expect(writes[writes.length - 1]).toEqual([])                 // nothing left for a later reload to take back
+})
+
 test('a kept offer whose claim is another generation\'s is not taken back: the claim answers the lost turn as before', async ($, on) => {
   await notTakenBack($, on, { otherGeneration: ['task-r8'] })
 })
