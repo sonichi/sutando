@@ -27,10 +27,22 @@ resolve_tasks_dir() {
 canonical_tasks_dir() {
   (cd "$1" 2>/dev/null && pwd -P)
 }
-# The workspace an inbox belongs to: the one the launcher names, else the
-# physical inbox's parent. The watcher stamps under it; the supervisor reads there.
+# The workspace an inbox belongs to: SUTANDO_WORKSPACE_DIR when the inbox lies inside it or is
+# the one SUTANDO_TASKS_DIR names (the launcher named both); else the physical inbox's parent.
 workspace_dir_for_inbox() {
-  local abs
+  local abs ws_abs named=""
   abs="$(canonical_tasks_dir "$1")" || abs="$1"
-  printf '%s\n' "${SUTANDO_WORKSPACE_DIR:-$(dirname "$abs")}"
+  if [ -n "${SUTANDO_WORKSPACE_DIR:-}" ]; then
+    ws_abs="$(canonical_tasks_dir "$SUTANDO_WORKSPACE_DIR")" || ws_abs="$SUTANDO_WORKSPACE_DIR"
+    if [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
+      named="$(canonical_tasks_dir "${SUTANDO_TASKS_DIR/#\~/$HOME}")" || named="${SUTANDO_TASKS_DIR/#\~/$HOME}"
+    fi
+    if [ "$abs" = "$named" ]; then
+      printf '%s\n' "$SUTANDO_WORKSPACE_DIR"; return 0
+    fi
+    case "$abs" in
+      "${ws_abs%/}"/?*) printf '%s\n' "$SUTANDO_WORKSPACE_DIR"; return 0 ;;
+    esac
+  fi
+  dirname "$abs"
 }
