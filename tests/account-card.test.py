@@ -366,7 +366,7 @@ class ClaudeCard(Base):
         self.assertIsNotNone(issued_cards.live(self.ws, events[1]), "the newer card's buttons still act")
         self.assertIsNone(issued_cards.live(self.ws, events[0]), "the superseded card stays superseded")
 
-    def test_a_send_intent_that_cannot_be_noted_still_posts_the_card(self):
+    def test_a_send_intent_that_cannot_be_noted_posts_nothing(self):
         import argparse
         import issued_cards
         args = argparse.Namespace(room=DM, owner_dm=False, reply_to="$ask", print=False, lead="", retry=False,
@@ -375,8 +375,8 @@ class ClaudeCard(Base):
                 contextlib.redirect_stdout(io.StringIO()):
             rc = acc.cmd_post(self.ws, args, core=CORE, execute=self.fake.execute, now=lambda: 100.0,
                              run=self.claude_run)
-        self.assertEqual(rc, 0)
-        self.assertEqual(len([c for c in self.fake.calls if c[0] == "room.message.send"]), 1)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual([c for c in self.fake.calls if c[0] == "room.message.send"], [])
 
     def test_a_replay_whose_first_record_was_lost_keeps_the_newer_cards_buttons(self):
         # A's send lands but its record is lost; B is recorded; A retried gets A's event back: B must still act.
