@@ -83,6 +83,26 @@ def working(rec: dict) -> str:
     return w if isinstance(w, str) and valid(w) else ""
 
 
+RUNNING_STALE_S = 2 * 3600.0     # a `running` mark older than this is a seat that died mid-turn
+
+
+def in_use(rec: dict, now: Optional[float] = None) -> str:
+    """The model the core is on right now: the model of the turn that is running, when the seat
+    started it on a pick (`running`, set by `started` once Codex took the turn), else the last model
+    Codex took (`working`). What a reader that says "I'm using X" reports. It is an observation of
+    the turn, kept apart from the pending pick (a newer pick saved meanwhile does not change what
+    this turn runs on) and from `working`, which is what a restart launches on."""
+    run = rec.get("running")
+    if isinstance(run, dict) and valid(run.get("model") or "") and _rev(run) > 0:
+        try:
+            age = (time.time() if now is None else now) - float(run.get("ts") or 0)
+        except (TypeError, ValueError):
+            age = -1.0
+        if 0 <= age < RUNNING_STALE_S:
+            return run["model"]
+    return working(rec)
+
+
 def current(state_dir) -> str:
     """The model the Codex core is to use, '' for none: the last pick, or, once Codex refused it,
     the last model Codex took."""
@@ -145,6 +165,33 @@ def confirm(state_dir, model: str, rev: int) -> bool:
         return True
 
 
+def started(state_dir, model: str, rev: int, now: Optional[float] = None) -> bool:
+    """Record that a turn is running on `model`, the pick of revision `rev` (Codex took turn/start
+    with it): from here `in_use` names it. The turn is what is recorded, not the pick: a newer pick
+    saved while turn/start was being answered does not make this turn run on anything else, so the
+    mark is written whatever is pending now. False for no record, or a model or revision that is none."""
+    with _locked(state_dir):
+        rec = read_record(state_dir)
+        if not rec or not valid(model) or not isinstance(rev, int) or rev <= 0:
+            return False
+        rec["running"] = {"model": model, "rev": rev, "ts": time.time() if now is None else now}
+        _write(state_dir, rec)
+        return True
+
+
+def stopped(state_dir, rev: Optional[int] = None) -> bool:
+    """Forget the `running` mark (of revision `rev`, or any with None): the turn ended with no verdict,
+    or the seat is starting and no turn of its is running. The pick's own status is untouched."""
+    with _locked(state_dir):
+        rec = read_record(state_dir)
+        run = rec.get("running") if rec else None
+        if not isinstance(run, dict) or (rev is not None and run.get("rev") != rev):
+            return False
+        rec.pop("running")
+        _write(state_dir, rec)
+        return True
+
+
 def resolve(state_dir, rev: int, accepted: bool, reason: str = "") -> Optional[dict]:
     """Settle the pending pick `rev`: accepted (it becomes `working`) or rejected (the core stays on
     `working`). None when the record has moved on or is not pending; a newer pick is never touched."""
@@ -153,6 +200,8 @@ def resolve(state_dir, rev: int, accepted: bool, reason: str = "") -> Optional[d
         if not rec or _rev(rec) != rev or rec.get("status") != "pending":
             return None
         rec["status"], rec["accepted"] = ("accepted" if accepted else "rejected"), bool(accepted)
+        if isinstance(rec.get("running"), dict) and rec["running"].get("rev") == rev:
+            rec.pop("running")
         if accepted:
             rec["working"] = rec["confirmed"] = rec["model"]
             rec["confirmed_rev"] = max(rev, _rev(rec, "confirmed_rev"))
@@ -177,6 +226,8 @@ def save(state_dir, model: str, *, applied: str, accepted: bool, now: Optional[f
            "runtime": RUNTIME, "accepted": bool(accepted), "status": "accepted" if accepted else "pending",
            "working": model if accepted else (working(old) or None), "rev": _rev(old) + 1,
            "applied": applied, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "by": BY}
+    if isinstance(old.get("running"), dict):  # the turn now running is on it, whatever is picked next
+        rec["running"] = old["running"]
     if valid(old.get("confirmed") or "") and _rev(old, "confirmed_rev"):  # outlives later picks
         rec["confirmed"], rec["confirmed_rev"] = old["confirmed"], old["confirmed_rev"]
     if accepted:
@@ -234,6 +285,8 @@ def main(argv=None) -> int:
     cur.add_argument("--state-dir", required=True)
     la = sub.add_parser("launch")
     la.add_argument("--state-dir", required=True)
+    for verb in ("working", "in-use"):
+        sub.add_parser(verb).add_argument("--state-dir", required=True)
     s = sub.add_parser("save")
     s.add_argument("--state-dir", required=True)
     s.add_argument("--model", required=True)
@@ -246,6 +299,12 @@ def main(argv=None) -> int:
         return 0 if valid(a.model) else 2
     if a.cmd == "current":
         model = current(a.state_dir)
+        if model:
+            print(model)
+        return 0
+    if a.cmd in ("working", "in-use"):
+        rec = read_record(a.state_dir)
+        model = working(rec) if a.cmd == "working" else in_use(rec)
         if model:
             print(model)
         return 0

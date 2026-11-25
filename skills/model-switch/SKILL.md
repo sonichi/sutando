@@ -77,6 +77,10 @@ as a Codex model). Nothing is typed into a pane. Under the same lock:
 
 - the core is an app-server seat (a live `codex-seat` window): `applied: next-turn`, `status: pending`,
   **exit 12**: saved, not switched. Say it as pending ("I'll try X on my next task"), never as switched.
+  The task that tries it is on it from its start: the seat then sets `running` in the record, and
+  `python3 src/codex_core_model.py in-use --state-dir <workspace>/state` (what the model card reads)
+  names the pick for as long as that task runs. Asked which model you are on during that task, answer
+  with `in-use`, not with `working`: "I'm on X for this task; it is confirmed when the task completes".
   The seat (`src/agent/codex/app-server/seat.py`, core seat only) always launches on `working`, the
   last model Codex took. Before a turn it reads Codex's own `model/list`: a pick that is not in a
   complete, well-formed list is `rejected` without being sent (a partial list is no verdict). No pick
@@ -144,3 +148,9 @@ before its "switching" card; an untold outcome with a newer attempt after it is 
 in the record and never posted, so only the newest attempt's outcome stands for the card. The menu has its own card id: a newer menu retires an older one's
 buttons, while the "switching" answer and the outcome (another id) leave the menu acting, since its
 buttons stay on the owner's screen. Output of the detached line: `<workspace>/logs/model-card.log`.
+
+One card, updated in place: the "switching" answer is an edit of the tapped menu's own event
+(`room.message.edit`, so the event then shows "Core model: Switching the core to X…" in place of the
+card), and the outcome edits that same event again. A tap adds no message. Only where the edit cannot
+be made (a tap with no card event, or the edit refused) are the "switching" answer and the outcome
+posted as cards of their own, as above.

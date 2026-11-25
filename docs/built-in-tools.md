@@ -410,7 +410,12 @@ bash scripts/switch-model.sh opus --confirm         # a warm core asks to confir
 CLI…`); a non-zero exit is reported with its meaning from the list below, never as a switch. The
 current model is `model` in `<workspace>/state/model-switch.json` (`previous`, `ts` beside it);
 no file means no switch was recorded from here, so say the model is the runtime's default rather
-than guessing. The desktop's `core-model` local card (`agent-settings:core-runtime#model`) is the
+than guessing. **On a Codex core, do not read that file's `model` for "which model are you on":** a
+pick stays `pending` until a task has completed on it. Ask
+`python3 src/codex_core_model.py in-use --state-dir <workspace>/state`, which names the model the
+core is on right now: the pick itself while the task now running was started on it (the record's
+`running` mark), else the last model Codex took (`working`). If the record is still `pending` and
+`in-use` names the pick, say "I'm on <pick> for this task; it is confirmed when the task completes". The desktop's `core-model` local card (`agent-settings:core-runtime#model`) is the
 place to point an owner who wants to switch by hand.
 
 Types `/model <name>` into the live `sutando-core` pane through the shared sender, waits for the CLI
