@@ -147,6 +147,9 @@ def intercept(task_file: Path, workspace: Path, results_dir: Path, repo: Path = 
     return True
 
 
+ANSWERED = "switch-card-answered"
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("task_file")
@@ -154,7 +157,10 @@ def main(argv=None) -> int:
     ap.add_argument("--results-dir", required=True)
     ap.add_argument("--repo", default=str(_REPO))
     a = ap.parse_args(argv)
-    return 0 if intercept(Path(a.task_file), Path(a.workspace), Path(a.results_dir), Path(a.repo)) else 1
+    if not intercept(Path(a.task_file), Path(a.workspace), Path(a.results_dir), Path(a.repo)):
+        return 1
+    print(ANSWERED, flush=True)  # the watcher needs this word, so a stub interpreter never swallows a task
+    return 0
 
 
 if __name__ == "__main__":
