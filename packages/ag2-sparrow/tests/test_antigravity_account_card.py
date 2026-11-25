@@ -352,7 +352,11 @@ class PartsTest(unittest.TestCase):
                      "https://github.com/login/device?code=ABCD-1234", "https://example.com/cb?code=abcdefgh12345678",
                      "see docs/4/introduction_to_the_new_api_design.md", "v4/0123456789012345678901234567"):
             self.assertFalse(agy_account.carries_secret(said), said)
-        self.assertTrue(agy_account.carries_secret("https://x.test/cb?state=s&code=4%2F0A" + "d" * 30))
+        # Review of #6803: a code that ends a sentence, and the encoded form outside an http(s) address.
+        for said in ("https://x.test/cb?state=s&code=4%2F0A" + "d" * 30, "code: %s." % CODE, "it is %s. Thanks" % CODE,
+                     "code=4%2F0A" + "d" * 30, "localhost:8085/?code=4%2F0A" + "d" * 30, "state=s&code=4/0Ab12345"):
+            self.assertTrue(agy_account.carries_secret(said), said)
+        self.assertFalse(agy_account.carries_secret("see docs/4/0_introduction_to_the_new_api.md and barcode=4/0abcdef"))
 
     def test_signed_in_as_reads_only_this_processes_log(self):
         with tempfile.TemporaryDirectory() as d:

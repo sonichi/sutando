@@ -65,9 +65,10 @@ _QUOTA_ERROR = (r"(?:RESOURCE_EXHAUSTED(?=\s*(?:[:(\[.,]|$))|Individual quota re
                 r"|you(?:'ve| have) exceeded your (?:current )?quota(?=\s*(?:[:.,!]|$)))")
 QUOTA_ANSWER_RE = re.compile(r"\s*(?:error\W{1,3})?" + _QUOTA_ERROR, re.I)
 QUOTA_DETAIL_RE = re.compile(r"\s*(?:session/\w+:\s*)?(?:error\W{1,3})?" + _QUOTA_ERROR, re.I)
-# Google's sign-in code (4/0...), alone or as an address's `code`; not a path ("docs/4/...") nor another site's code.
-_SIGN_IN_CODE = re.compile(r"(?<![\w/.\-])4/0[0-9A-Za-z_\-]{20,}(?![\w/.])")
-_CODE_URL = re.compile(r"https?://\S*[?&]code=4(?:/|%2F)0[^&\s]{4,}", re.I)
+# Google's sign-in code (4/0...), alone (a full stop may end it) or as a `code=` value, plain or %2F, with or
+# without an address around it; not a path ("docs/4/...") nor another site's code.
+_SIGN_IN_CODE = re.compile(r"(?<![\w/.\-])4/0[0-9A-Za-z_\-]{20,}(?![\w/]|\.\w)")
+_CODE_URL = re.compile(r"(?:^|[?&\s])code=4(?:/|%2F)0[^&\s]{4,}", re.I)
 _AUTH_LINE = re.compile(r"applyAuthResult: email=([^,\s]+@[^,\s]+)")
 
 
