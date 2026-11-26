@@ -299,10 +299,14 @@ class CodexCard(Base):
                     self.assertNotIn("I'm using", said, (runtime, signed))
                 # The app lists it with what the core waits on: out of usage, not an account menu.
                 self.assertEqual(card["account_controls"], {"runtime": runtime, "core": True, "limit": True})
+                self.assertEqual(card["state"], "pending", "the bar lists pending/error cards only")
         # The account menu the owner asks for still names the account, or says plainly that none is signed in.
         menu = acc.menu_card({"runtime": "claude", "signed_in": False, "shown": "", "key": ""}, [])[1]
         self.assertIn("The core (Claude Code) is not signed in.", menu["text"])
         self.assertNotIn("limit", menu["account_controls"])
+        self.assertEqual(menu["state"], "info", "the owner's own menu waits on nobody")
+        self.assertEqual(acc.menu_card({"runtime": "codex", "signed_in": False, "shown": "", "key": ""}, [],
+                                       signed_out=True)[1]["state"], "pending")
 
     def test_the_quota_notice_with_no_owner_dm_posts_nothing(self):
         self.signed_in(A)

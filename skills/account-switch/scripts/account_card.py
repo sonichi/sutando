@@ -369,7 +369,9 @@ def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "",
     using = "" if signed_out or retry else in_use_words(cur)
     words = " ".join(w for w in (lead, using, more.strip()) if w)
     words = words or "Pick an account below."
-    body, card = ac.build(CARD_ID, "info", title="Account", avatar_=ac.avatar(initial="A"),
+    # Out of usage or signed out, the core waits on the owner: `pending`, as the app's needs-you bar lists it.
+    stuck = signed_out or retry
+    body, card = ac.build(CARD_ID, "pending" if stuck else "info", title="Account", avatar_=ac.avatar(initial="A"),
                           text=words, buttons=buttons, note=note, note_tone="dim",
                           body=" ".join(w for w in (lead, using, 'Reply "switch account" for options.') if w))
     # The marker by which the desktop app on the core's computer draws the core's own account controls;
