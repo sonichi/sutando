@@ -227,6 +227,11 @@ for line in sys.stdin:
             out({"id": rid, "result": models})
         else:
             out({"id": rid, "result": {"data": models, "nextCursor": None}})
+    elif method == "account/rateLimits/read":
+        try:
+            out({"id": rid, "result": json.load(open(os.path.join(D, "rate-limits.json")))})
+        except (OSError, ValueError):
+            out({"id": rid, "error": {"code": -32601, "message": "method not found"}})
     elif method == "account/read":
         signed_in = TOKEN and not revoked() and not TOKEN.startswith("unreadable")
         out({"id": rid, "result": {"account": {"type": "chatgpt", "email": "owner@example.com"} if signed_in else None}})
@@ -1880,6 +1885,50 @@ class QuotaCard(SeatCase):
         s.ensure_server()
         self.assertEqual(s.step(), "failed")
         self.assertEqual(self.cards, [])
+
+    def refused_model_with_usage(self, answer):
+        """One owner message whose turn Codex refuses for its model, on an account whose usage reads `answer`."""
+        self.task("task-1.txt", "access_tier: owner\ntask: hi\n")
+        self.plan("model-missing-at-start")
+        if answer is not None:
+            (self.fake_dir / "rate-limits.json").write_text(json.dumps(answer))
+        s = self.make(quota=self.quota(), retry_s=30, max_attempts=3)
+        s.model = "gpt-6-1-terra"
+        s.ensure_server()
+        calls = self.ws / "model-card-calls.txt"
+        script = self.ws / "fake_model_card.py"
+        script.write_text("import sys\nopen(%r, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n" % str(calls))
+        with mock.patch.object(seat_mod, "MODEL_CARD", script):
+            self.assertNotEqual(s.step(), "done")
+        return s, (calls.read_text().splitlines() if calls.exists() else [])
+
+    def test_a_refused_model_on_an_account_out_of_usage_says_the_limit_first(self):
+        """Owner 2026-11-26: told the model was not available, she picked another and only then met the
+        usage limit. Codex checks the model before usage, so the account is asked after a refused model."""
+        for answer in ({"ordinaryUsageAllowed": True, "rateLimits": {"limitId": "codex", "primary": {
+                            "usedPercent": 100, "windowDurationMins": 10080, "resetsAt": 4102444800}}},
+                       {"ordinaryUsageAllowed": False, "rateLimits": {"limitId": "codex", "primary": None}},
+                       {"ordinaryUsageAllowed": True, "rateLimits": {"rateLimitReachedType": "rate_limit_reached"}}):
+            with self.subTest(answer=answer):
+                self.setUp()
+                s, model_cards = self.refused_model_with_usage(answer)
+                self.assertEqual(model_cards, [], "no model card while the account is out of usage")
+                self.assertEqual(len(self.cards), 1)
+                self.assertIn("Codex has reached its usage limit", self.cards[0])
+                self.assertEqual(health(self.ws)["state"], "quota")
+                self.assertEqual(s.model, "gpt-6-1-terra", "the model is not switched by the seat")
+                self.assertIn("the limit is said first", self.out.getvalue())
+
+    def test_a_refused_model_on_an_account_with_usage_left_keeps_the_model_card(self):
+        for answer in ({"ordinaryUsageAllowed": True, "rateLimits": {"limitId": "codex", "primary": {
+                            "usedPercent": 40, "windowDurationMins": 10080, "resetsAt": 4102444800}}},
+                       None):   # None: this Codex cannot be asked
+            with self.subTest(answer=answer):
+                self.setUp()
+                _, model_cards = self.refused_model_with_usage(answer)
+                self.assertEqual(len(model_cards), 1)
+                self.assertEqual(self.cards, [], "no limit card for an account that is not out of usage")
+                self.assertNotEqual(health(self.ws).get("state"), "quota")
 
     def test_retryable_quota_noise_does_not_override_the_outcome(self):
         self.task("task-1.txt")

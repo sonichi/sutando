@@ -657,7 +657,9 @@ class Launcher:
             return "nothing to stop"
         started = self.clock()
         self.log("stopping (%s): /exit to pane %s" % (why, gen["pane_id"]))
-        rc = self.fenced(gen, title, "send-keys -t %s /exit Enter" % tmux_pane_keys.tmux_quote(gen["pane_id"]))
+        # A viewer's scroll can leave the pane in copy mode, where /exit would be swallowed: leave it first.
+        pane = tmux_pane_keys.tmux_quote(gen["pane_id"])
+        rc = self.fenced(gen, title, "copy-mode -q -t %s ; send-keys -t %s /exit Enter" % (pane, pane))
         if rc != 0:
             return self.unsent(gen, title, rc, "/exit") or self.stopped(started)
         deadline = time.monotonic() + CLAUDE_GRACE_S

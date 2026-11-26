@@ -516,13 +516,14 @@ class Connector:
         self.rate_limits = snap
         return self.quota_hit() if tell and limit_reset(snap) is not None else ""
 
-    def quota_hit(self, error=None) -> str:
-        """Codex is out of usage: tell the owner once (quota_notice), with the reset time when it said one."""
+    def quota_hit(self, error=None, task: str = "", task_text: str = "") -> str:
+        """Codex is out of usage: tell the owner (quota_notice), with the reset time when it said one: once
+        for the limit, and once more for each message of theirs (`task`) it refuses after that."""
         at = limit_reset(self.rate_limits)
         reset = quota_notice.reset_from_epoch(at) if at else \
             quota_notice.reset_from_text((error or {}).get("message") if isinstance(error, dict) else "")
         try:
-            done = self.quota.hit(reset, at)
+            done = self.quota.hit(reset, at, task=task, task_text=task_text)
         except Exception as e:  # noqa: BLE001 - a notice that cannot be sent never stops task service
             done = "quota-failed (%s: %s)" % (type(e).__name__, str(e)[:120])
         if done:
@@ -1359,13 +1360,14 @@ class Connector:
             t_sent = time.time()
             status, text, err = self.run_task(headers, prompt, policy.capabilities)
             t_done = time.time()
-            # Out of usage: the owner is told once, by the account card; the card is the notice, so the room
+            # Out of usage: the owner is told by the account card, on each message; the card is the notice, so the room
             # gets no error line while it is out (or the limit's own words when no card could be sent).
             limit = self.turn_limit if status != "completed" else None
             signed_out = status != "completed" and self.turn_unauth is not None
             if signed_out or status == "completed":
                 self.note_login_refused(signed_out)
-            quota = self.quota_hit(limit) if limit is not None else (self.quota.cleared() if status == "completed" else "")
+            quota = self.quota_hit(limit, task_id, task_text) if limit is not None else (
+                self.quota.cleared() if status == "completed" else "")
             if self.view:
                 self.view.done(status)
             if status == WAITING or (status == NOT_READY and self.signin_told):
