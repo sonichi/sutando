@@ -285,6 +285,25 @@ class CodexCard(Base):
         self.assertTrue(self.fake.calls[0][1]["body"].startswith(lead))
         self.assertEqual(card["buttons"][-1]["label"], "Add another account")
 
+    def test_the_quota_card_says_the_limit_alone_never_that_the_core_is_not_signed_in(self):
+        # 2026-11-25: at the limit the card read "... The core (Claude Code) is not signed in." over the account it
+        # showed below: a probe at the limit may read a signed-in core as signed out.
+        lead = "The core has reached its usage limit (resets 3:05 PM), so I can't answer until then."
+        for runtime in ("claude", "codex"):
+            for signed in (True, False, None):
+                cur = {"runtime": runtime, "signed_in": signed, "shown": "alice@example.com" if signed else "", "key": ""}
+                body, card = acc.menu_card(cur, [], lead=lead, retry=True)
+                self.assertTrue(card["text"].startswith(lead), (runtime, signed))
+                for said in (card["text"], body):
+                    self.assertNotIn("not signed in", said, (runtime, signed))
+                    self.assertNotIn("I'm using", said, (runtime, signed))
+                # The app lists it with what the core waits on: out of usage, not an account menu.
+                self.assertEqual(card["account_controls"], {"runtime": runtime, "core": True, "limit": True})
+        # The account menu the owner asks for still names the account, or says plainly that none is signed in.
+        menu = acc.menu_card({"runtime": "claude", "signed_in": False, "shown": "", "key": ""}, [])[1]
+        self.assertIn("The core (Claude Code) is not signed in.", menu["text"])
+        self.assertNotIn("limit", menu["account_controls"])
+
     def test_the_quota_notice_with_no_owner_dm_posts_nothing(self):
         self.signed_in(A)
         with mock.patch.object(acc, "_owner_dm", lambda ws, core: ""):
