@@ -2047,6 +2047,17 @@ class LauncherTmux(ConnectBase):
         (self.home / "claude-model-asked").unlink()
         self.assertEqual(lc.switch_model(rec, "sonnet", confirm=True), (True, "switched to sonnet"))
 
+    def test_exit_reaches_a_pane_a_viewer_left_in_copy_mode(self):
+        """2026-11-26 (review of ag2-space/ag2space-cinny-desktop#1317): the app's terminal tab now takes
+        typing, and a scroll there leaves the agent's pane in copy mode. /exit still ends claude."""
+        (self.home / "claude-exit-on-exit").write_text("1")
+        lc, rec = self.created()
+        pane = rec["generation"]["pane_id"]
+        self.tmux("copy-mode", "-t", pane)
+        self.assertEqual(self.tmux("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip(), "1")
+        self.assertEqual(lc.stop_session(rec, "test"), "stopped")
+        self.assertIs(lc.tm.has_session(), False, "claude took /exit: the server went with it")
+
     def test_a_claude_that_exits_on_exit_is_stopped_for_the_manager_uninstall_and_the_card(self):
         """The real stop path: /exit ends claude, hold and the server, so the fenced kill-session finds no
         server; the session is gone, which is stopped, not cancelled."""
