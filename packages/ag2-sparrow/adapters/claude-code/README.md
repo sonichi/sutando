@@ -106,8 +106,33 @@ on the result it finds. A park that
 settled but whose reply was lost (the lock's release failed and the claim
 could not be re-read) answers settled on the identical park again, naming the
 protocol failure only when that is what it delivered; nothing is published
-twice. A Mod that lost its offers inside one generation (a plugin reload, not
-a session restart) claims every listed task afresh, and a claim it already
+twice. A plugin reload inside a live session starts the Mod's variables over, so
+the Mod keeps its offers in flight in the session's state (`$.state`, which a
+reload leaves in place) and takes them back at its next start, but only those
+the CLI still lists as this generation's open claims at the same attempt
+(`inbox inflight`, read-only): a queued prompt can then still be confirmed by
+its own turn, a running turn can still answer with `ag2space_reply`, and an
+accepted answer is published at the next tick. A taken-back turn whose end the
+Mod did not see is closed with the protocol failure when the session's next
+main-loop turn starts, or after 30 minutes, so intake is never held for good.
+A queued prompt is never submitted a second time. One whose submit is not known
+to have reached the session is not waited for at all; one that did reach it is
+waited for five minutes; after that intake goes on, the turn is still confirmed
+if it starts, and otherwise the next start answers it. A confirmation the CLI
+asked to retry is kept with the turn it is for (and that turn's end, once seen)
+and tried again after the reload; one the CLI keeps asking to retry holds intake
+for five minutes, after which intake goes on and the retry continues (the same
+bound holds for a turn that was never reloaded; a turn whose confirmation went
+through holds intake until it ends). An offer
+intake stopped waiting for is still kept, so a second reload does not lose it or
+a confirmation that came late. The body handed to `stage` rides on the offer
+from before the CLI is asked until staging is settled, so every save made in
+between carries its bytes and a reload between the stage's steps still holds
+them: they are staged and published at the turn's end, and no other text is
+accepted.
+Whatever the Mod did not keep (an engine without `$.state`, a state that could
+not be written), or the CLI does not list, goes the way it always has: a Mod
+that lost its offers inside one generation claims every listed task afresh, and a claim it already
 drove past its call is one it can never finish: at TURN_CONFIRMED with an
 accepted answer the lifecycle's one decision for such a turn (`close_turn`,
 the same one generation recovery takes) applies: a descriptor whose blob

@@ -28,6 +28,7 @@ _HINT = re.compile(r"Esc to cancel|Enter to (confirm|select)|↑/↓|shift\+tab|
 _FOOTER = re.compile(r"^⏵|←\s*for agents|esc to interrupt|\? for shortcuts", re.I)
 _YES = re.compile(r"^\s*yes\b", re.I)
 _NO = re.compile(r"^\s*no\b", re.I)
+OPTION_LABEL_MAX = 80
 
 
 def guard_for(session: str, prompt: Optional[str], state: str) -> str:
@@ -187,6 +188,13 @@ def question(prompt: Optional[str], detail: str) -> str:
     return " ".join(kept[-3:]) if kept else detail
 
 
+def _option_label(option: str, short: str) -> str:
+    """A button's label as the terminal lists the option, spaces collapsed; `short` when it is
+    empty or too long for a button."""
+    text = " ".join((option or "").split())
+    return text if 0 < len(text) <= OPTION_LABEL_MAX else short
+
+
 def _open_terminal() -> Action:
     return Action(id="open_terminal", kind="open_terminal", label="Open terminal")
 
@@ -264,8 +272,10 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
         if yes is not None and no is not None:
             kind, title = "permission", "Agent needs your confirmation"
             option_for_action = {"deny": no, "allow": yes}
-            actions = [Action(id="deny", kind="reject_once", label="No"),
-                       Action(id="allow", kind="allow_once", label="Yes")]
+            # The terminal's own words, so a client can number each button by its row (owner's PM,
+            # 2026-11-24: "No" never matched "No, and tell Claude what to do differently (esc)").
+            actions = [Action(id="deny", kind="reject_once", label=_option_label(options[no], "No")),
+                       Action(id="allow", kind="allow_once", label=_option_label(options[yes], "Yes"))]
         else:
             kind, title = "choice", "Agent needs a decision"
             option_for_action = {f"opt{i + 1}": i for i in range(len(options))}
