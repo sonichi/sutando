@@ -301,7 +301,8 @@ class AccountCardTest(unittest.TestCase):
         # Asked in a room: the card goes to the DM, the room gets no error line.
         self.dm("task-q3", "STUB:QUOTA and again", kind="room")
         self.serve()
-        self.assertEqual([q["room"] for q in self.outbox()], [DM])
+        (there,) = self.outbox()
+        self.assertNotIn("I'm using", there["card"]["text"], "in a room the card names no account")
         self.assertEqual(self.w.result("task-q3"), gc.LIMITED_NO_SEND)
         # The owner asks for a card while out: the limit's card answers first, with the same words.
         self.posted("$q3")
@@ -339,11 +340,13 @@ class AccountCardTest(unittest.TestCase):
         self.assertIn("internal error", self.w.result("task-f"))
         self.assertNotIn("usage limit", self.w.result("task-f"))
 
-    def test_a_quota_error_with_no_owner_dm_seen_sends_no_card_and_says_the_limit_in_the_room(self):
+    def test_a_quota_error_with_no_owner_dm_seen_is_told_by_the_card_in_the_room_it_was_asked_in(self):
         self.dm("task-q", "STUB:QUOTA hi", kind="room")
         self.serve()
-        self.assertEqual(self.outbox(), [])
-        self.assertIn("Antigravity has reached its usage limit", self.w.result("task-q"))
+        (queued,) = self.outbox()
+        self.assertIn("Antigravity has reached its usage limit", queued["card"]["text"])
+        self.assertNotIn("I'm using", queued["card"]["text"])
+        self.assertEqual(self.w.result("task-q"), gc.LIMITED_NO_SEND)
 
     # ── signed out: a card with the sign-in, not a line of words ──
     def test_signed_out_in_the_owner_dm_posts_the_sign_in_card_instead_of_the_error_line(self):

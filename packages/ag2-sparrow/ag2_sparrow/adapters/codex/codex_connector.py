@@ -180,6 +180,7 @@ HELD_WAIT_S = held_start.WAIT_S
 # one refused because its login no longer works. Only these are read: an error's words never decide either.
 USAGE_LIMIT_INFO, UNAUTHORIZED_INFO = "usagelimitexceeded", "unauthorized"
 LIMITED_NO_SEND = "[no-send] Codex is at its usage limit; the owner was sent the account card\n"
+LIMITED_FOR_OTHERS = "Codex has reached its usage limit, so I can't answer right now. Its owner has been told."
 # Still refused after the app-server was restarted on the login on disk: the owner is shown the account card.
 SIGNED_OUT = account_switch.LAPSED
 SIGNED_OUT_ELSEWHERE = ("Codex's sign-in on this computer no longer works. My owner can sign in again by sending "
@@ -1389,8 +1390,10 @@ class Connector:
                 self.signin_told = True
             out = self.result_body(status, text, err)
             if limit is not None:
-                out = LIMITED_NO_SEND if self.quota.limited() else quoted(quota_notice.words(
+                out = LIMITED_NO_SEND if self.quota.limited() or self.quota.answered(task_id) else quoted(quota_notice.words(
                     "Codex", quota_notice.reset_from_text(limit.get("message") if isinstance(limit, dict) else ""), ""))
+                if policy.kind != OWNER and out == LIMITED_NO_SEND:
+                    out = quoted(LIMITED_FOR_OTHERS) + "\n"      # anyone else who asked is told why there is no answer
             elif signed_out and self.turn_worked:
                 out = out.rstrip("\n") + "\n\n" + quoted(SIGNED_OUT_ELSEWHERE).strip()
             # The account's refusal is not the model's failure: no pick is called failed over it.

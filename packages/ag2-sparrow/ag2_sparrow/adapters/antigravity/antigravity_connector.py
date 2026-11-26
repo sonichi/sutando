@@ -857,7 +857,7 @@ class Connector:
         body = self.answer_body(headers, status, text, detail, turn) + (unsaid and unsaid + "\n")
         if owner_turn and switched and not body.startswith("[no-send]"):
             body = quoted(switched).strip() + "\n" + body
-        if limited and self.quota.limited():
+        if limited and (self.quota.limited() or self.quota.answered(task_id)):
             # The card is the owner's notice; anyone else who asked is told why there is no answer.
             body = LIMITED_NO_SEND if kind == OWNER else quoted(LIMITED_FOR_OTHERS) + "\n"
         elif limited:

@@ -185,10 +185,14 @@ class QuotaNotice:
         owed = dict(rec.get("owed") or {})
         if task in told or task in owed or not rec.get("since"):
             return ""
-        if done == "quota-card":         # the card queued just now answers this message
+        # Asked in a room that is not the owner's DM: the card answers there, without the account's name.
+        seen = str(sent.get("channel_id") or "")
+        where = seen if agent_card.owner_may_act(sent) is not None and _ROOM.match(seen) else ""
+        if done == "quota-card" and not where:      # the card queued just now answers this message
             self.save(dict(rec, tasks=(told + [task])[-TASKS_KEEP:]))
             return ""
-        owed[task] = {"key": "quota-task:%s:%s" % (task, uuid.uuid4().hex), "at": time.time_ns()}
+        owed[task] = dict({"key": "quota-task:%s:%s" % (task, uuid.uuid4().hex), "at": time.time_ns()},
+                          **({"room": where} if where else {}))
         if not self.save(dict(rec, owed=owed)):
             return "quota-not-posted"
         return self._owed(self.now(), now_too=True)
@@ -197,29 +201,43 @@ class QuotaNotice:
         """Queue the card of each owner message still owed one; '' when none is, or it is too soon to retry."""
         rec = self.load()
         owed = {t: e for t, e in (rec.get("owed") or {}).items() if isinstance(e, dict) and e.get("key")}
-        if not owed or not (rec.get("told") or rec.get("qid")):
-            return ""                    # no card stands yet: the limit's own, once queued, answers them
+        if not (rec.get("told") or rec.get("qid")):
+            # No card stands in the DM yet: the limit's own, once queued, answers the messages sent there.
+            owed = {t: e for t, e in owed.items() if e.get("room")}
+        if not owed:
+            return ""
         if not now_too and at - float(rec.get("owed_tried") or 0) < RETRY_S:
             return ""
-        to, sent = self.room(), []
-        if to and card_desk.usable(self.bridge_state):
-            try:
-                using = self.using() or ""
-            except Exception as e:  # noqa: BLE001 - the card still says what it can
-                self.log("account not read:", "%s: %s" % (type(e).__name__, str(e)[:200]))
-                using = ""
-            built = account_switch.limited(self.build(words(self.name, str(rec.get("reset") or ""), using)))
+        dm, sent, built = self.room(), [], {}
+        if card_desk.usable(self.bridge_state):
             for task, entry in owed.items():
+                to, there = entry.get("room") or dm, bool(entry.get("room"))
+                if not to:
+                    continue
                 try:    # keyed: a card queued and not recorded is not queued a second time
-                    connector_cards.queue(str(self.bridge_state), to, *built, key=entry["key"], at_ns=entry["at"])
+                    if there not in built:
+                        built[there] = self._card(rec, named=not there)
+                    connector_cards.queue(str(self.bridge_state), to, *built[there], key=entry["key"], at_ns=entry["at"])
                 except (OSError, ValueError) as e:
                     self.log("quota card for %s not queued:" % task, "%s: %s" % (type(e).__name__, e))
                     continue
                 sent.append(task)
         told = [t for t in rec.get("tasks") or [] if isinstance(t, str)]
-        self.save(dict(rec, owed={t: e for t, e in owed.items() if t not in sent}, owed_tried=at,
+        rec = self.load()
+        self.save(dict(rec, owed={t: e for t, e in (rec.get("owed") or {}).items() if t not in sent}, owed_tried=at,
                        tasks=(told + sent)[-TASKS_KEEP:]))
-        return "quota-task-card" if sent else ("quota-not-posted" if to else "quota-no-room")
+        reachable = dm or any(e.get("room") for e in owed.values())
+        return "quota-task-card" if sent else ("quota-not-posted" if reachable else "quota-no-room")
+
+    def _card(self, rec: dict, named: bool = True):
+        """The limit's card; `named` says the account in use (the owner's DM only, never a shared room)."""
+        using = ""
+        if named:
+            try:
+                using = self.using() or ""
+            except Exception as e:  # noqa: BLE001 - the card still says what it can
+                self.log("account not read:", "%s: %s" % (type(e).__name__, str(e)[:200]))
+        return account_switch.limited(self.build(words(self.name, str(rec.get("reset") or ""), using)))
 
     def _hit(self, reset: str = "", reset_at=None) -> str:
         rec, at = self.load(), self.now()
@@ -279,16 +297,13 @@ class QuotaNotice:
         if not card_desk.usable(self.bridge_state):
             return "quota-not-posted"
         try:
-            using = self.using() or ""
-        except Exception as e:  # noqa: BLE001 - the card still says what it can
-            self.log("account not read:", "%s: %s" % (type(e).__name__, str(e)[:200]))
-            using = ""
-        try:
-            built = account_switch.limited(self.build(words(self.name, str(rec.get("reset") or ""), using)))
+            built = self._card(rec)
             qid = connector_cards.queue(str(self.bridge_state), to, *built, key=rec["key"], at_ns=rec["at"])
         except (OSError, ValueError) as e:
             self.log("quota card not queued:", "%s: %s" % (type(e).__name__, e))
             return "quota-not-posted"
-        told = [t for t in rec.get("tasks") or [] if isinstance(t, str)] + list(rec.get("owed") or {})
-        self.save(dict(rec, qid=qid, queued=at, owed={}, tasks=told[-TASKS_KEEP:]))    # this card answers them
+        owed = rec.get("owed") or {}
+        rooms = {t: e for t, e in owed.items() if isinstance(e, dict) and e.get("room")}   # theirs go to their rooms
+        told = [t for t in rec.get("tasks") or [] if isinstance(t, str)] + [t for t in owed if t not in rooms]
+        self.save(dict(rec, qid=qid, queued=at, owed=rooms, tasks=told[-TASKS_KEEP:]))    # this card answers the rest
         return "quota-card"

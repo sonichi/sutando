@@ -2575,11 +2575,14 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(metrics(self.work)[-1]["quota"], "quota-task-card")
         self.assertEqual([q["card"]["text"] for q in self.outbox()], [card["text"]] * 2)
         self.assertEqual([room for room, _ in self.posted()], [self.DM] * 2)
-        # And the next, asked in a room: the card goes to the DM, the room gets nothing.
+        # And the next, asked in a room: the card answers there, without the account's name; no error line.
         room = "!room:s.space"
         self.assertEqual(self.serve("task-3", "[[limit-bare]] and again", channel=room, kind="room"), cc.LIMITED_NO_SEND)
         self.assertIn("quota-task-card", metrics(self.work)[-1]["quota"])
-        self.assertEqual([r for r, _ in self.posted()], [self.DM])
+        ((to, there),) = self.posted()
+        self.assertEqual((to, there["account_controls"].get("limit")), (room, True))
+        self.assertNotIn("alice@example.com", there["text"])
+        self.assertIn("Codex has reached its usage limit (resets ", there["text"])
         rec = json.loads((self.work / "state" / quota_notice.FILE).read_text())
         self.assertEqual((rec["told"], rec["tasks"]), (True, ["task-1", "task-2", "task-3"]))
 
@@ -2612,6 +2615,13 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(switch.asked()[1]["text"], plain["text"])
         self.assertEqual(said, ["limit not read:"])
 
+    def test_someone_else_who_asks_while_out_of_usage_is_told_why_there_is_no_answer(self):
+        self.serve("task-1", "[[limit]] hello")
+        said = self.serve("task-c", "[[limit]] a collaborator asks", tier="team", channel="!room:s.space", kind="room",
+                          extra=["--allow-non-owner"])
+        self.assertEqual(said.strip(), cc.LIMITED_FOR_OTHERS)
+        self.assertEqual(len(self.outbox()), 1, "and no card of their own")
+
     def test_a_message_served_twice_or_not_the_owners_gets_no_card_of_its_own(self):
         self.serve("task-1", "[[limit]] hello")
         notice = quota_notice.QuotaNotice(self.work / "state", self.bridge, "Codex",
@@ -2641,7 +2651,7 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.assertEqual((notice.owed(), notice.answered("task-2")), ([], True))
         clock[0] += quota_notice.RETRY_S + 1
         self.assertEqual(notice.tick(), "")
-        self.assertEqual([room for room, _ in self.posted()], [self.DM], "one card, in the DM, none in the room")
+        self.assertEqual([room for room, _ in self.posted()], ["!room:s.space"], "one card, where it was asked")
 
     def test_a_later_messages_card_says_why_it_is_not_queued_and_never_stops_the_limits_own(self):
         self.serve("task-1", "[[limit]] hello")
@@ -2668,20 +2678,24 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.assertIn("quota card for the message not queued: RuntimeError: unreadable", said)
         # No DM room known: owed, and queued once one is; the account that cannot be read is left out.
         with mock.patch.object(notice, "room", return_value=""):
-            self.assertEqual(notice.hit(task="task-2", task_text=mine("task-2")), "quota-no-room")
+            self.assertEqual(notice._owed(clock[0], now_too=True), "")
+            rec = notice.load()
+            notice.save(dict(rec, owed={"task-2": {"key": "quota-task:task-2:k", "at": 1}}))
+            self.assertEqual(notice._owed(clock[0], now_too=True), "quota-no-room")
         clock[0] += quota_notice.RETRY_S + 1
         self.assertEqual(notice.tick(), "quota-task-card")
         self.assertIn("account not read: RuntimeError: no account file", said)
         self.assertEqual(len(self.posted()), 1)
 
-    def test_a_limit_hit_in_a_room_is_told_only_in_the_owners_dm_and_nothing_is_posted_in_the_room(self):
-        # Owner, 2026-11-25: usage limits and account switching belong to her DM; a room gets nothing about them.
+    def test_a_limit_hit_in_a_room_is_told_in_that_room_too_without_the_accounts_name(self):
+        # Owner, 2026-11-26: out of usage, whatever is sent is answered by the limit's card where it was sent.
         self.assertIn("STUB echo", self.serve("task-0", "hello"))
         room = "!room:s.space"
         self.assertEqual(self.serve("task-r", "[[limit]] in a room", channel=room, kind="room"), cc.LIMITED_NO_SEND)
-        (queued,) = self.outbox()
-        self.assertEqual((queued["room"], queued["card"]["account_controls"].get("limit")), (self.DM, True))
-        self.assertNotIn(room, [r for r, _ in self.posted()], "no card, no notice in the room")
+        cards = {q["room"]: q["card"] for q in self.outbox()}
+        self.assertEqual(sorted(cards), sorted([self.DM, room]), "the limit's own card in the DM, this message's here")
+        self.assertIn("alice@example.com", cards[self.DM]["text"])
+        self.assertNotIn("alice@example.com", cards[room]["text"])
 
     def test_a_turn_that_answers_clears_the_limit_and_a_later_limit_is_a_new_card(self):
         self.serve("task-1", "[[limit-bare]] hello")
@@ -2729,12 +2743,13 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.assertEqual([c.quota_hit(error) for _ in range(3)], ["quota-card-posted", "", ""])
         self.assertEqual(self.outbox(), [], "refusals after it queue no further card")
 
-    def test_with_no_owner_dm_seen_no_card_is_sent_and_the_room_gets_the_limit_in_words(self):
+    def test_with_no_owner_dm_seen_the_room_it_was_asked_in_still_gets_the_limits_card(self):
         said = self.serve("task-1", "[[limit-bare]] hi", channel="!room:s.space", kind="room")
-        self.assertEqual(self.outbox(), [])
-        self.assertIn("Codex has reached its usage limit", said)
-        self.assertNotIn("signed in", said)
-        self.assertEqual(metrics(self.work)[-1]["quota"], "quota-no-room")
+        (queued,) = self.outbox()
+        self.assertEqual(queued["room"], "!room:s.space")
+        self.assertIn("Codex has reached its usage limit", queued["card"]["text"])
+        self.assertEqual(said, cc.LIMITED_NO_SEND, "the card is the answer: no second line")
+        self.assertEqual(metrics(self.work)[-1]["quota"], "quota-no-room quota-task-card")
 
     def test_a_dropped_card_is_queued_again_and_a_used_up_window_while_idle_is_a_limit(self):
         (self.work / "state").mkdir(parents=True)
