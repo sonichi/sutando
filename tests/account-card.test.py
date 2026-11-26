@@ -599,6 +599,30 @@ class RemoteTaps(Base):
         self.tap(self.use_b, source_message_id="$t1")
         self.assertEqual([r["outcome"] for r in self.audited()], ["refused:gone"])
 
+    def test_a_key_the_card_did_not_offer_is_audited(self):
+        path = self.ws / "task.txt"
+        path.write_text(task("x", reply_to_event="$card1"))
+        with mock.patch.object(acc.ac, "click_verdict", return_value=acc.ac.Click(
+                acc.ac.COMMAND, acc.ac.parse_reply(acc.ac.reply(acc.KIND, acc.TARGET, "0" * 16)))):
+            rc, out = self.run_(["reply", "--task-file", str(path)])
+        self.assertEqual((rc, out["say"]), (2, acc.GONE))
+        self.assertEqual([r["outcome"] for r in self.audited()][-1], "refused:gone")
+        self.assertEqual(self.launch.calls, [])
+
+    def test_the_tap_ledger_and_audit_never_stop_a_tap(self):
+        with mock.patch("file_lock.locked_file", side_effect=OSError("ro")):
+            acc.release_tap(self.ws, "$t1")     # an unwritable ledger is left as it is
+        import builtins
+        real = builtins.__import__
+
+        def no_hitl(name, *a, **k):
+            if name == "hitl":
+                raise ImportError(name)
+            return real(name, *a, **k)
+        with mock.patch.object(builtins, "__import__", no_hitl):
+            acc.audit(self.ws, {}, "-", "started", 0)
+        self.assertEqual(self.audited(), [])
+
     def test_add_says_it_needs_the_computer_that_runs_the_core(self):
         rc, out = self.tap("Add another account")
         self.assertIn("needs the computer that runs the core", out["say"])
