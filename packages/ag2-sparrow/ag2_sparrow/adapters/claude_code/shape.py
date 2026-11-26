@@ -55,9 +55,16 @@ PLUGIN = Path(__file__).resolve().with_name("ag2space-inbox")      # package dat
 
 
 def shipped_plugin(path) -> bool:
-    """Whether `path` is the plugin an ag2-sparrow package ships, this one's or an older install's."""
-    parts = Path(path).parts[-4:]
-    return tuple(parts) == ("ag2_sparrow", "adapters", "claude_code", PLUGIN.name)
+    """Whether `path` is the plugin an installed ag2-sparrow ships (this one's or an older install's): under a
+    site-packages that holds an ag2_sparrow dist-info. A checkout or fork with the same folders is not."""
+    p = Path(path)
+    if p == PLUGIN:
+        return True
+    parts = p.parts
+    if tuple(parts[-4:]) != ("ag2_sparrow", "adapters", "claude_code", PLUGIN.name) or len(parts) < 5:
+        return False
+    site = p.parents[3]
+    return site.name == "site-packages" and any(site.glob("ag2_sparrow-*.dist-info"))
 
 
 def resolve_plugin_dir(recorded: str) -> tuple:

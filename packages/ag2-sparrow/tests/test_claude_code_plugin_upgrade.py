@@ -28,6 +28,7 @@ class PluginFollowsTheUpgrade(unittest.TestCase):
         self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
         site = self.tmp / "venvs" / "0.8.3-bcc3e498e49a" / "lib" / "python3.12" / "site-packages"
         self.old = plugin_at(site / "ag2_sparrow" / "adapters" / "claude_code" / "ag2space-inbox")
+        (site / "ag2_sparrow-0.8.3.dist-info").mkdir()
         self.own = plugin_at(self.tmp / "my-plugin")
         self.carried = dict((key, conv) for key, _, conv in cli.RECORDED)["PLUGIN_DIR"]
 
@@ -39,6 +40,16 @@ class PluginFollowsTheUpgrade(unittest.TestCase):
         self.assertEqual(self.carried(str(self.old)), "", "a repair install records this package's plugin")
         argv = hold.claude_argv({"CLAUDE": "claude", "PLUGIN_DIR": str(self.old)}, "sid")
         self.assertEqual(argv[1:3], ["--plugin-dir", str(shape.PLUGIN)], "the session starts on the new plugin")
+
+    def test_a_checkout_with_the_same_folders_is_the_owners_and_kept(self):
+        # A fork or source checkout given with --plugin-dir ends the same way: only pip's install moves.
+        for root in ("src/sutando/packages/ag2-sparrow", "venv/lib/python3.12/site-packages"):
+            mine = plugin_at(self.tmp / root / "ag2_sparrow" / "adapters" / "claude_code" / "ag2space-inbox")
+            with self.subTest(root=root):
+                self.assertFalse(shape.shipped_plugin(mine))
+                self.assertEqual(shape.resolve_plugin_dir(str(mine)), (mine, False))
+                self.assertEqual(self.carried(str(mine)), str(mine))
+        self.assertFalse(shape.shipped_plugin("ag2space-inbox"), "too short to be an install")
 
     def test_a_plugin_dir_the_owner_chose_is_kept_and_a_missing_one_falls_back(self):
         self.assertEqual(shape.resolve_plugin_dir(str(self.own)), (self.own, False))
