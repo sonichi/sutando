@@ -41,7 +41,7 @@ const OWNER_ACTIVITY_FILE = join(STATE_DIR, 'last-owner-activity.json');
 /** Record that the owner was active on <channel> right now. Atomic write
  * via tmp-then-rename. Read by the proactive-loop status-aware-pivot rule.
  * See notes/team-proposal-coord-loop-2026-04-20.md. */
-function writeOwnerActivity(channel: string, summary: string, channelId?: string): void {
+function writeOwnerActivity(channel: string, summary: string, docked?: VoiceSessionOrigin | null): void {
 	try {
 		mkdirSync(STATE_DIR, { recursive: true });
 		const payload: Record<string, unknown> = {
@@ -49,8 +49,8 @@ function writeOwnerActivity(channel: string, summary: string, channelId?: string
 			channel,
 			summary: summary.slice(0, 80),
 		};
-		// Where the session is docked: proactive routing reads the bridge off this address.
-		if (channelId) payload.channel_id = channelId;
+		// Where the session is docked: proactive routing follows `bridge`, never the address.
+		if (docked) { payload.bridge = docked.channel; payload.channel_id = docked.target; }
 		// Per-PID staging: last-owner-activity.json is written by five processes
 		// (this task-bridge + the sparrow/discord/slack/telegram bridges). A shared
 		// '.tmp' name lets two concurrent writers truncate and interleave the same
@@ -1296,7 +1296,7 @@ export const workTool: ToolDefinition = {
 		_pendingTasks.set(taskId, pendingEntry());
 		voiceTaskStore.add(taskId, task, undefined, lane);
 		// Record owner activity for status-aware-pivot in proactive loop
-		writeOwnerActivity('voice', task, origin?.target);
+		writeOwnerActivity('voice', task, origin);
 		console.log(`${ts()} [TaskBridge] Task ${taskId}${lane ? ` (${lane})` : ''}: ${task.slice(0, 100)}`);
 		_sendTaskStatus?.(taskId, 'working', task.slice(0, 60));
 		// The user's own voice tasks still open ahead of this one, from the relay agent's table.

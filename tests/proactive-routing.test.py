@@ -199,20 +199,30 @@ def test_sspace_voice_call_routes_to_ag2space():
 
 
 def test_voice_docked_in_a_room_routes_to_that_rooms_bridge():
-    """A local voice session docked in a room records the room as `channel_id`:
-    the address names the bridge. An undocked voice keeps the Discord default."""
+    """A local voice session docked in a room records the session's own bridge
+    as `bridge`; routing reads it and never parses the room address, so a
+    homeserver with a port routes the same. Undocked voice keeps the default."""
+    from proactive_routing import claims_unless_routed_elsewhere
 
     def run(state):
         assert should_claim_proactive(state, "ag2space") is True
         assert should_claim_proactive(state, "discord") is False
+        assert claims_unless_routed_elsewhere(
+            "proactive-1.txt", state, "ag2space", other_bridges_configured=True) is True
+        assert claims_unless_routed_elsewhere(
+            "proactive-1.txt", state, "slack", other_bridges_configured=False) is False
 
-    _with_state({"channel": "voice", "ts": 1, "channel_id": "!room:s.space"}, run)
+    for room in ("!room:s.space", "!fixture:host.example.org:8448"):
+        _with_state({"channel": "voice", "ts": 1, "bridge": "ag2space", "channel_id": room}, run)
 
-    def unknown(state):
+    def default(state):
         assert should_claim_proactive(state, "discord") is True
         assert should_claim_proactive(state, "ag2space") is False
 
-    _with_state({"channel": "voice", "ts": 1, "channel_id": "local-voice"}, unknown)
+    _with_state({"channel": "voice", "ts": 1, "channel_id": "local-voice"}, default)
+    _with_state({"channel": "voice", "ts": 1, "bridge": "not-a-bridge",
+                 "channel_id": "!room:s.space"}, default)
+    _with_state({"channel": "voice", "ts": 1, "bridge": ["ag2space"]}, default)
 
 
 def test_github_commits_channel_defaults_to_discord():

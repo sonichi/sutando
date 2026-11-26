@@ -45,7 +45,7 @@ ACTIVITY_BRIDGE = {"matrixrtc-voice": "ag2space"}
 
 def activity_bridge(data) -> "str | None":
     """The bridge an owner-activity record routes to, or None when it names none: a bridge
-    channel, a surface a bridge carries, else the bridge its `channel_id` is an address on."""
+    channel, a surface a bridge carries, else the `bridge` its writer was docked on."""
     if not isinstance(data, dict):
         return None
     channel = data.get("channel")
@@ -53,7 +53,10 @@ def activity_bridge(data) -> "str | None":
         return None
     if channel in BRIDGE_CHANNELS:
         return channel
-    return ACTIVITY_BRIDGE.get(channel) or target_channel_kind(data.get("channel_id"))
+    if channel in ACTIVITY_BRIDGE:
+        return ACTIVITY_BRIDGE[channel]
+    docked = data.get("bridge")
+    return docked if isinstance(docked, str) and docked in BRIDGE_CHANNELS else None
 
 
 def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
@@ -70,7 +73,7 @@ def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
 
           1. The record routes to a bridge (``activity_bridge``: a bridge
              channel, a surface a bridge carries such as an s.space voice
-             call, or a ``channel_id`` that is a bridge's address) → claim
+             call, or the ``bridge`` a docked voice session recorded) → claim
              only when that bridge is ``this_channel``. Owner was last
              there, follow-up goes there.
           2. State file missing / unreadable / malformed / no-channel

@@ -1,6 +1,7 @@
 import { after, afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { VoiceSessionOrigin } from '../src/task-bridge.js';
@@ -60,14 +61,28 @@ function assertRoom(id: string, target: string) {
 }
 
 describe('the relay agent keeps the room a request was made in', () => {
-	it('the owner-activity record carries the room the request was made in', { timeout: 5000 }, async () => {
-		setVoiceSessionOrigin(origin('!roomA:s.space'));
+	it('the owner-activity record carries the bridge and room the request was made in', { timeout: 5000 }, async () => {
+		// A homeserver with a port: routing must not depend on parsing this address.
+		const room = '!fixture:host.example.org:8448';
+		setVoiceSessionOrigin(origin(room));
 		const { relay, ids } = relayAgent();
 		void relay.invoke('', { task: 'note the docked room' });
 		await untilSubmitted(ids);
-		const activity = JSON.parse(readFileSync(join(workspace, 'state', 'last-owner-activity.json'), 'utf-8'));
+		const state = join(workspace, 'state', 'last-owner-activity.json');
+		const activity = JSON.parse(readFileSync(state, 'utf-8'));
 		assert.equal(activity.channel, 'voice');
-		assert.equal(activity.channel_id, '!roomA:s.space');
+		assert.equal(activity.bridge, 'fakechan');
+		assert.equal(activity.channel_id, room);
+		// The shared policy routes on the stamped bridge once it names a real one.
+		writeFileSync(state, JSON.stringify({ ...activity, bridge: 'ag2space' }));
+		const py = spawnSync('python3', ['-c', [
+			'import sys; sys.path.insert(0, "src")',
+			'from pathlib import Path',
+			'from proactive_routing import should_claim_proactive as c',
+			'p = Path(sys.argv[1]); print(c(p, "ag2space"), c(p, "discord"))',
+		].join('\n'), state], { cwd: process.cwd(), encoding: 'utf-8' });
+		assert.equal(py.status, 0, py.stderr);
+		assert.equal(py.stdout.trim(), 'True False');
 	});
 
 	it('a room switch while the call waits for the user to finish speaking', { timeout: 5000 }, async () => {
