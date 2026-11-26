@@ -631,6 +631,23 @@ class RoomLine(Base):
                                        run=lambda cmd, **kw: mock.Mock(stdout='{"status": "refused"}'))
         self.assertFalse(refused(ROOM_A, "$m", "$m", "op"))
 
+    def test_a_sender_that_cannot_run_or_answer_says_not_posted(self):
+        def broken(cmd, **kw):
+            raise OSError
+        for run in (broken, lambda cmd, **kw: mock.Mock(stdout=""), lambda cmd, **kw: mock.Mock(stdout="nope")):
+            self.assertFalse(cqn.room_line_sender(["py"], self.ws, log=lambda *a: None, run=run)(ROOM_A, "$m", "", "op"))
+
+    def test_odd_or_missing_task_ids_are_skipped(self):
+        self.assertEqual(cqn.room_asks(self.ws, ["../etc/passwd", "task-gone", self.task("task-1")]),
+                         [(ROOM_A, "$task-1", "$task-1")])
+
+    def test_an_unwritable_record_sends_no_line(self):
+        q = self.notice()
+        q.hit(tasks=[])
+        with mock.patch.object(q, "save", return_value=False):
+            self.assertEqual(q.tell_rooms([self.task("task-1")]), 0)
+        self.assertEqual(self.lines, [])
+
     def test_every_core_adapter_wires_the_room_line(self):
         for rel in ("src/core-input-watch.py", "src/core_held_inbox.py", "src/agent/codex/app-server/seat.py"):
             self.assertIn("room_send=core_quota_notice.room_line_sender(", (REPO / rel).read_text(), rel)

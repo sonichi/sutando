@@ -343,6 +343,18 @@ class CodexCard(Base):
         # No card rides along, and nothing of the account reaches the room.
         self.assertNotIn("alice", json.dumps(self.fake.calls))
 
+    def test_a_room_line_the_platform_did_not_post_is_a_failure(self):
+        argv = ["room-line", "--room", ROOM, "--reply-to", "$ask", "--operation-id", "op"]
+        for answer in ({"is_error": True, "code": "FORBIDDEN"}, RuntimeError("no credential")):
+            def execute(*a, answer=answer, **k):
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = acc.main(["--workspace", str(self.ws)] + argv, core=CORE, execute=execute)
+            self.assertEqual((rc, json.loads(out.getvalue())["status"]), (1, "failed"), answer)
+
     def test_the_room_line_refuses_the_owner_dm_and_ids_that_are_not_ids(self):
         for argv in (["--room", DM, "--reply-to", "$ask"], ["--room", ROOM, "--reply-to", "ask"],
                      ["--room", "team", "--reply-to", "$ask"],
