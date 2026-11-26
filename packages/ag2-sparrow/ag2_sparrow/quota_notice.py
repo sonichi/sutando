@@ -139,7 +139,8 @@ class QuotaNotice:
         """The limit in force, in words, for a card the owner asks for meanwhile; '' when none is, or its reset passed."""
         rec = self.load()
         until = rec.get("reset_at")
-        if not self.limited() or (until is not None and self.now() >= float(until)):
+        carded = self.limited() or bool(rec.get("since") and rec.get("tasks"))      # a room's card counts too
+        if not carded or (until is not None and self.now() >= float(until)):
             return ""
         return words(self.name, str(rec.get("reset") or ""), "")
 
@@ -284,15 +285,18 @@ class QuotaNotice:
                 return "quota-card-posted"
             self.save({k: v for k, v in rec.items() if k not in ("qid", "key", "at", "queued", "tried")})
             return "quota-card-dropped"
-        if at - float(rec.get("tried") or 0) < RETRY_S:
+        # A DM room first seen since the last try is tried at once: its owner is waiting there.
+        if at - float(rec.get("tried") or 0) < RETRY_S and not (rec.get("noroom") and self.room()):
             self.save(rec)
             return ""
+        rec = {k: v for k, v in rec.items() if k != "noroom"}
         # The card's key is saved before it is queued: a stop between the two queues the same card, not a second.
         rec = dict(rec, tried=at, key=rec.get("key") or uuid.uuid4().hex, at=rec.get("at") or time.time_ns())
         if not self.save(rec):
             return "quota-not-posted"
         to = self.room()
         if not to:
+            self.save(dict(rec, noroom=True))
             return "quota-no-room"
         if not card_desk.usable(self.bridge_state):
             return "quota-not-posted"

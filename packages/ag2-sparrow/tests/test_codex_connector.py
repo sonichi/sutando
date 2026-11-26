@@ -2750,6 +2750,12 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.assertIn("Codex has reached its usage limit", queued["card"]["text"])
         self.assertEqual(said, cc.LIMITED_NO_SEND, "the card is the answer: no second line")
         self.assertEqual(metrics(self.work)[-1]["quota"], "quota-no-room quota-task-card")
+        # Found on a really used-up account: the owner's next message, in their DM, gets the limit's card at
+        # once, and a card asked for after that is still answered by the limit's.
+        self.assertEqual(self.serve("task-2", "[[limit-bare]] hi"), cc.LIMITED_NO_SEND)
+        self.assertEqual(sorted(q["room"] for q in self.outbox()), [self.DM, "!room:s.space"])
+        self.serve("task-3", "/model")
+        self.assertEqual(metrics(self.work)[-1]["card"], "quota-card-asked")
 
     def test_a_dropped_card_is_queued_again_and_a_used_up_window_while_idle_is_a_limit(self):
         (self.work / "state").mkdir(parents=True)
