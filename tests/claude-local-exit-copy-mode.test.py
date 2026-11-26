@@ -22,7 +22,11 @@ spec.loader.exec_module(adapter_tests)
 
 
 def load_tests(loader, tests, pattern):
-    return unittest.TestSuite([adapter_tests.LauncherTmux("test_exit_reaches_a_pane_a_viewer_left_in_copy_mode")])
+    return unittest.TestSuite([adapter_tests.LauncherTmux(name) for name in (
+        "test_exit_reaches_a_pane_a_viewer_left_in_copy_mode",
+        # The plain stop: /exit, sent with copy-mode -q in front, still reaches the pane.
+        "test_stop_sends_exit_then_kills_the_session_through_the_fence_and_frees_the_root",
+    )])
 
 
 if __name__ == "__main__":
