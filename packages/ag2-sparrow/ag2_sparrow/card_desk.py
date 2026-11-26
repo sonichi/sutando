@@ -8,6 +8,7 @@ names; a tap no card claims gets the fixed line, and never reaches the model.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from . import connector_cards
 
@@ -26,7 +27,7 @@ class Desk:
     def task(self, path, result_file) -> str:
         """What a task that was a card matter came to (a tap, or the owner's slash command in their DM),
         else ''."""
-        agent_card, _ = connector_cards._core()
+        agent_card, issued_cards = connector_cards._core()
         # The card rules read the task as the core does (the trusted header parse), not the connector's.
         with open(path, encoding="utf-8") as f:
             sent, said = agent_card.reply_words(f.read())
@@ -39,6 +40,9 @@ class Desk:
             # The owner tapped a card this agent no longer keeps (a newer one replaced it, it is past its
             # time, or an earlier install posted it): its kind says so and shows the current one.
             tapped = (agent_card.card_click(sent) or {}).get("card_id")
+            if not issued_cards.issued(Path(self.root), tapped_event(sent), str(sent.get("channel_id") or "")):
+                # Not a card this agent is known to have posted: the fresh card is a new message, never an edit.
+                sent = dict(sent, reply_to_event="")
             for card in self.cards:
                 if tapped == card.CARD_ID:
                     return self.drawn(card, result_file, lambda: card.expired(sent, result_file))
@@ -99,19 +103,27 @@ def led(publish, pending, quoted):
     return write
 
 
+def tapped_event(sent) -> str:
+    """The event id of the card a tap answers ('' for none): its answer is shown in place of that card."""
+    event = str((sent or {}).get("reply_to_event") or "")
+    return event if event.startswith("$") and not any(c.isspace() for c in event) else ""
+
+
 def usable(bridge_state) -> bool:
     """Whether a card can reach the room: the agent's own bridge keeps a state dir (made at install).
     Without one (a bridge run elsewhere, a bare connector) nothing would post what is queued."""
     return bool(bridge_state) and os.path.isdir(bridge_state)
 
 
-def post(bridge_state, room, built, log, key: str = "", at_ns: int = 0) -> bool:
+def post(bridge_state, room, built, log, key: str = "", at_ns: int = 0, edit: str = "") -> bool:
     """Queue a built card for the bridge to post in `room`; False when it cannot be. With `key` the
-    call may be repeated after a restart without a second card (connector_cards.queue)."""
+    call may be repeated after a restart without a second card (connector_cards.queue). With `edit` (the
+    event id of the card being answered) it is shown in place of that card, not as a second one."""
     if not usable(bridge_state):
         return False
     try:
-        connector_cards.queue(bridge_state, str(room or ""), *built, key=key, at_ns=at_ns)
+        connector_cards.queue(bridge_state, str(room or ""), *built, key=key, at_ns=at_ns,
+                              edit=edit if str(edit or "").startswith("$") else "")
         return True
     except (OSError, ValueError) as e:
         log("card not queued:", "%s: %s" % (type(e).__name__, e))
