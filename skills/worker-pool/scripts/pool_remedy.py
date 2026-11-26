@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import importlib.util
 import json
 import os
@@ -451,9 +452,23 @@ REDELIVER_ASK = (
     "schedules. Reply [no-send] when they are handled.")
 
 
+def redeliver_task_id(worker_id: str, released_at: float) -> str:
+    """The one wake task for this seat's release: a retry after an unclear outcome finds it."""
+    digest = hashlib.sha256(f"{worker_id}|{released_at!r}".encode()).hexdigest()[:18]
+    return f"task-redeliver-{digest}"
+
+
 def redeliver(workspace, repo, worker_id, *, runner=None) -> dict:
     """Re-offer a seat's owed work after its limit hold lifted: one fresh task through pool_ask,
     which whichever watcher holds the inbox announces. Types nothing into the pane."""
+    import task_disposition as tdisp
+    released = sup.limit_released_at(workspace, worker_id)
+    if released is None:
+        return {"worker_id": worker_id, "outcome": "no-release"}
+    task_id = redeliver_task_id(worker_id, released)
+    served = {"worker_id": worker_id, "outcome": "redelivered", "task_id": task_id, "released_at": released}
+    if tdisp.task_disposition(workspace, task_id) != tdisp.MISSING:
+        return {**served, "already": True}
     if (sup.is_paused(workspace, worker_id)
             or worker_id not in sup.supervised_workers(workspace)
             or sup.work_outstanding(workspace, worker_id) is not True):
@@ -467,10 +482,10 @@ def redeliver(workspace, repo, worker_id, *, runner=None) -> dict:
                                               session=session) != ps.PANE_IDLE:
         return {"worker_id": worker_id, "outcome": "pane-not-idle"}
     try:
-        delivery = _sibling("pool_ask").ask(workspace, worker_id, REDELIVER_ASK, allow_handoff=False)
+        _sibling("pool_ask").ask(workspace, worker_id, REDELIVER_ASK, allow_handoff=False, task_id=task_id)
     except (OSError, ValueError) as exc:
         return {"worker_id": worker_id, "outcome": "delivery-failed", "why": str(exc)}
-    return {"worker_id": worker_id, "outcome": "redelivered", "task_id": delivery["task_id"]}
+    return served
 
 
 def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
@@ -507,6 +522,8 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
             rearms[worker_id] = ensure_supervisor(workspace, repo, worker_id,
                                                   runner=runner)
     sup.acknowledge_cards(workspace, [w for w, r in cards.items() if r.get("outcome") == "carded"])
+    sup.acknowledge_redelivered(workspace, {w: r["released_at"] for w, r in rearms.items()
+                                            if r.get("outcome") == "redelivered" and "released_at" in r})
     return {"recoveries": done,
             "rearms": rearms,
             "cards": cards,

@@ -117,7 +117,7 @@ class WorkerEvidence:
     limit_exhausted: bool = False
     limit_banner: str | None = None
     limit_reset_at: float | None = None
-    # The hold release already re-offered for: one redelivery per episode.
+    # The hold release whose wake task is queued: one redelivery per episode.
     redelivered_for: float | None = None
 
 
@@ -247,15 +247,22 @@ def _wedge_rung(ev: WorkerEvidence, obs: Observation, now: float, *,
     return ev, WEDGE_CARDS[kind]
 
 
-def _redeliver_rung(ev: WorkerEvidence, obs: Observation, now: float) -> tuple[WorkerEvidence, bool]:
-    """True once per hold release, for a seat idle again that still owes work under a live
-    watcher. A hold in force has no release, and a pane not idle (a limit, a gate, a turn) waits."""
+def _redeliver_rung(ev: WorkerEvidence, obs: Observation, now: float) -> bool:
+    """True while a hold release is unserved, for a seat idle again that still owes work under a
+    live watcher. A hold in force has no release, and a pane not idle (a limit, a gate, a turn) waits."""
     released = obs.limit_released_at
-    if (released is None or released == ev.redelivered_for or now - released > REDELIVER_WINDOW_S
-            or obs.session_alive is not True or obs.pane != PANE_IDLE
-            or obs.work_outstanding is not True or obs.watcher_beat != LIVE):
-        return ev, False
-    return replace(ev, redelivered_for=released), True
+    return not (released is None or released == ev.redelivered_for or now - released > REDELIVER_WINDOW_S
+                or obs.session_alive is not True or obs.pane != PANE_IDLE
+                or obs.work_outstanding is not True or obs.watcher_beat != LIVE)
+
+
+def acknowledge_redelivered(state: SupervisionState, served: dict) -> SupervisionState:
+    """Record {worker id: release} whose wake task is queued, so that release is not re-offered."""
+    workers = dict(state.workers)
+    for w, released in served.items():
+        if w in workers:
+            workers[w] = replace(workers[w], redelivered_for=released)
+    return replace(state, workers=workers)
 
 
 def acknowledge(state: SupervisionState, worker_ids) -> SupervisionState:
@@ -401,8 +408,8 @@ def evaluate(state: SupervisionState, observations: dict[str, Observation], now:
             ev, wedge = _wedge_rung(
                 ev, obs, now, sustained_ticks=sustained_ticks,
                 detect_after_s=detect_after_s)
-            # The redelivery takes this tick; an unacknowledged card is asked for again next tick.
-            ev, redeliver = _redeliver_rung(ev, obs, now)
+            # The redelivery takes this tick until its remedy queues the wake task; a card waits.
+            redeliver = _redeliver_rung(ev, obs, now)
             workers[worker_id] = ev
             decisions[worker_id] = (REDELIVER if redeliver
                                     else wedge if wedge != NOTHING else decision)

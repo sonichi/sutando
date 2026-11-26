@@ -5,10 +5,12 @@ A task watcher announces a payload once per watcher lifetime, so deliveries that
 seat while its provider refused every turn are never announced again after the limit lifts:
 the seat idles, owing them, until someone sends it something new. So:
 - the ladder reads "the seat's own hold was released, and it is idle, owing, watcher live"
-  as `redeliver`, once per release, and never while the hold is in force or the pane is not idle;
+  as `redeliver` until that release's wake task is queued, and never while the hold is in force
+  or the pane is not idle; a refused remedy leaves the release eligible;
 - the undelivered card still goes out on a later tick if the seat keeps idling;
 - the remedy writes one fresh task through pool_ask (the front door a watcher announces),
-  types nothing into the pane, and refuses a pane that is not idle.
+  types nothing into the pane, and refuses a pane that is not idle; one task id per release,
+  so a retry after an unclear outcome queues nothing twice.
 """
 import importlib.util
 import json
@@ -58,13 +60,16 @@ def obs(pane=ps.PANE_IDLE, owed=True, watcher=ps.LIVE, released=RELEASED, paused
     return ps.Observation(**fields)
 
 
-def run(observations, start=RELEASED + 60, state=None):
+def run(observations, start=RELEASED + 60, state=None, served=True):
+    """`served`: each redelivery's remedy queued its wake task, as the sweep's apply records it."""
     st, out, t = state or ps.SupervisionState(), [], start
     for o in observations:
         st, d = ps.evaluate(st, {"w": o}, t)
         out.append(d["w"])
         if d["w"] == ps.CARD_UNDELIVERED:
             st = ps.acknowledge(st, ["w"])
+        if d["w"] == REDELIVER and served:
+            st = ps.acknowledge_redelivered(st, {"w": o.limit_released_at})
         t += ps.SAMPLE_PERIOD_S
     return out, st
 
@@ -79,6 +84,8 @@ check("a saved ladder remembers the release it already served", REDELIVER in aga
 # A sample gap no longer than the sweep's period, so the tick is evidence and not a host resume.
 nxt, _ = run([obs(released=later - 30)], start=later, state=st)
 check("a later release is a new episode", nxt, [REDELIVER])
+check("a release whose remedy did not queue stays eligible", run([obs()] * 2, served=False)[0],
+      [REDELIVER, REDELIVER])
 
 check("no release on record: nothing", run([obs(released=None)])[0], [ps.NOTHING])
 check("a pane still at its limit is never redelivered to",
@@ -179,14 +186,14 @@ if callable(redeliver):
 
     def fake_ask(workspace, to, question, **kw):
         asked.append((to, kw.get("allow_handoff")))
-        return {"task_id": "task-fresh1", "to": to}
+        return {"task_id": kw.get("task_id"), "to": to}
 
     ask_mod = rem._sibling("pool_ask")
     with mock.patch.object(ask_mod, "ask", side_effect=fake_ask):
         t = Tmux(IDLE)
         out = redeliver(ws, REPO, WID, runner=t)
         check("an idle owing seat gets one fresh task", (out.get("outcome"), out.get("task_id")),
-              ("redelivered", "task-fresh1"))
+              ("redelivered", rem.redeliver_task_id(WID, RELEASED)))
         check("through pool_ask's folder path, to that worker", asked, [(WID, False)])
         check("and nothing is typed into the pane", [c for c in t.calls if any(a in c for a in Tmux.ACTING)], [])
 
@@ -214,6 +221,73 @@ if callable(redeliver):
             mock.patch.object(rem.sup, "acknowledge_cards"):
         acted = rem.apply(ws, REPO, {WID: REDELIVER})
     check("apply routes the decision to the remedy", (rd.call_count, WID in acted.get("rearms", {})), (1, True))
+
+# --- refusal, then idle: the release is served only once its wake task is queued -----------
+if callable(redeliver):
+    queued = []
+
+    def durable_ask(workspace, to, question, **kw):
+        tid = kw.get("task_id") or f"task-fresh{len(queued) + 1}"
+        (Path(workspace) / "tasks" / f"{tid}.txt").write_text(f"id: {tid}\ntask: wake\n")
+        queued.append(tid)
+        return {"task_id": tid, "to": to}
+
+    def sweep(pane_text, state):
+        """One tick as the sweep runs it: decide, persist, remedy, then read back what was kept."""
+        st, d = ps.evaluate(state, {WID: obs()}, state.last_sample_at + ps.SAMPLE_PERIOD_S
+                            if state.last_sample_at else RELEASED + 60)
+        sup.save_state(ws, st)
+        acted = rem.apply(ws, REPO, {WID: d[WID]}, runner=Tmux(pane_text)) if d[WID] == REDELIVER else {}
+        return d[WID], acted.get("rearms", {}).get(WID, {}).get("outcome"), sup.load_state(ws)
+
+    hold(ws, status="cleared", released_at=RELEASED, cleared_by="cli-pane")
+    sup.save_state(ws, ps.SupervisionState())
+    with mock.patch.object(ask_mod, "ask", side_effect=durable_ask):
+        first = sweep(LIMIT, ps.SupervisionState())
+        check("a refused remedy reports the refusal", first[:2], (REDELIVER, "pane-not-idle"))
+        second = sweep(IDLE, first[2])
+        check("the same release is decided again once the pane is idle", second[:2], (REDELIVER, "redelivered"))
+        check("and exactly one wake task is queued", len(queued), 1)
+        third = sweep(IDLE, second[2])
+        check("a served release is not decided again", third[0], ps.NOTHING)
+        again = redeliver(ws, REPO, WID, runner=Tmux(IDLE))
+        check("a second remedy for the same release queues nothing more",
+              (again.get("outcome"), len(queued)), ("redelivered", 1))
+
+    # An uncertain write: the task landed but the call raised. The retry finds it and asks no more.
+    for p in (ws / "tasks").glob("task-redeliver-*.txt"):
+        p.unlink()
+    queued.clear()
+    sup.save_state(ws, ps.SupervisionState())
+
+    def lands_then_fails(workspace, to, question, **kw):
+        durable_ask(workspace, to, question, **kw)
+        raise OSError("route failed after the write")
+
+    with mock.patch.object(ask_mod, "ask", side_effect=lands_then_fails):
+        first = sweep(IDLE, ps.SupervisionState())
+    check("an uncertain write is not marked served", first[:2], (REDELIVER, "delivery-failed"))
+    with mock.patch.object(ask_mod, "ask", side_effect=durable_ask):
+        second = sweep(IDLE, first[2])
+    check("its retry finds the queued wake task and asks no more", (second[1], len(queued)), ("redelivered", 1))
+    check("then the release is served", sweep(IDLE, second[2])[0], ps.NOTHING)
+
+    # The real pool_ask writes the wake task under the release's own id, and refuses a bad one.
+    try:
+        ask_mod.ask(ws, WID, "x", allow_handoff=False, task_id="not/a/task")
+        check("pool_ask refuses an id that is not a task id", "accepted", "refused")
+    except ValueError:
+        check("pool_ask refuses an id that is not a task id", "refused", "refused")
+    hold(ws, status="cleared", released_at=RELEASED + 7, cleared_by="cli-pane")
+    real = redeliver(ws, REPO, WID, runner=Tmux(IDLE))
+    wake = rem.redeliver_task_id(WID, RELEASED + 7)
+    check("end to end, the wake task is queued under that id",
+          (real.get("outcome"), real.get("task_id"), (ws / "tasks" / f"{wake}.txt").is_file()),
+          ("redelivered", wake, True))
+
+    with mock.patch.object(sup, "limit_released_at", return_value=None):
+        check("no release to serve: nothing is sent", redeliver(ws, REPO, WID, runner=Tmux(IDLE)).get("outcome"),
+              "no-release")
 
 if fails:
     print(f"\nFAIL: {len(fails)}")

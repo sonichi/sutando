@@ -514,6 +514,12 @@ def acknowledge_cards(workspace, worker_ids) -> None:
         save_state(workspace, ps.acknowledge(load_state(workspace), worker_ids))
 
 
+def acknowledge_redelivered(workspace, served: dict) -> None:
+    """Persist {worker id: release} whose wake task is queued; a refused one stays owed."""
+    if served:
+        save_state(workspace, ps.acknowledge_redelivered(load_state(workspace), served))
+
+
 def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
          persist: bool = True) -> dict:
     """Sample, decide, persist. Returns one decision per observed worker.
