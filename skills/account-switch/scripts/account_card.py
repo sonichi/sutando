@@ -233,24 +233,60 @@ def save_current(store: Path, auth_text: Optional[str]) -> bool:
     return True
 
 
-def saved(store: Optional[Path], current_key: str = "") -> list:
-    """[{key, label, current}] of the store, by label; labels as the store keeps them (unmasked)."""
+def _entries(store: Optional[Path]) -> list:
+    """[(file key, auth text, label)] of every readable store file, by file name."""
     out = []
     try:
-        entries = sorted(store.iterdir()) if store else []
+        files = sorted(store.iterdir()) if store else []
     except OSError:
-        entries = []
-    for entry in entries:
+        files = []
+    for entry in files:
         key = entry.name[:-5] if entry.name.endswith(".json") else ""
         if not KEY_RE.fullmatch(key):
             continue
         try:
-            label = json.loads(entry.read_text(encoding="utf-8")).get("label")
-        except (OSError, ValueError, AttributeError):
+            data = json.loads(entry.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
             continue
-        if isinstance(label, str) and label:
-            out.append({"key": key, "label": label, "current": key == current_key})
-    return sorted(out, key=lambda s: s["label"])
+        auth, label = (data.get("auth"), data.get("label")) if isinstance(data, dict) else (None, None)
+        if isinstance(auth, str) and isinstance(label, str) and label:
+            out.append((key, auth, label))
+    return out
+
+
+def _legacy_key(auth_text: str) -> Optional[str]:
+    """The key an earlier engine filed a sign-in under: the workspace id alone (else `sub`)."""
+    try:
+        tokens = json.loads(auth_text).get("tokens") or {}
+        raw = tokens.get("id_token")
+        raw = raw.get("raw_jwt") if isinstance(raw, dict) else raw
+        claims = _claims(raw) if isinstance(raw, str) else {}
+    except (AttributeError, TypeError, ValueError):
+        return None
+    auth_claims = claims.get("https://api.openai.com/auth") if isinstance(claims.get("https://api.openai.com/auth"), dict) else {}
+    ident = next((v for v in (tokens.get("account_id"), auth_claims.get("chatgpt_account_id"), claims.get("sub"))
+                  if isinstance(v, str) and v), "")
+    return hashlib.sha256(ident.encode("utf-8")).hexdigest()[:16] if ident else None
+
+
+def _canonical(file_key: str, auth: str) -> Optional[str]:
+    """The account's key now, for a file filed under it or under its earlier (workspace-only) key."""
+    ident = identity(auth)
+    if ident is None:
+        return None
+    return ident[0] if file_key in (ident[0], _legacy_key(auth)) else None
+
+
+def saved(store: Optional[Path], current_key: str = "") -> list:
+    """[{key, label, current}] of the store, one per account by its current key (a file an earlier
+    engine filed under the workspace-only key included), by label; labels as kept (unmasked)."""
+    seen = {}
+    for file_key, auth, label in _entries(store):
+        key = _canonical(file_key, auth)
+        if key and (key not in seen or file_key == key):
+            seen[key] = label
+    return sorted(({"key": k, "label": v, "current": k == current_key} for k, v in seen.items()),
+                  key=lambda s: s["label"])
 
 
 def shown_names(entries: list) -> dict:
@@ -300,11 +336,14 @@ def held_elsewhere(core_home: Path, key: str, homes=None) -> bool:
 
 
 def _saved_auth(store: Path, key: str) -> Optional[str]:
-    try:
-        auth = json.loads((store / f"{key}.json").read_text(encoding="utf-8")).get("auth")
-    except (OSError, ValueError, AttributeError):
-        return None
-    return auth if isinstance(auth, str) and identity(auth) and identity(auth)[0] == key else None
+    """The saved sign-in of the account `key` names: its current key, or the earlier workspace-only
+    key a card made before then carries. The file under the current key is preferred."""
+    found = sorted(_entries(store), key=lambda e: e[0] != key)
+    for file_key, auth, _ in found:
+        canonical = _canonical(file_key, auth)
+        if canonical and (canonical == key or file_key == key):
+            return auth
+    return None
 
 
 def claude_status(run=subprocess.run) -> dict:
@@ -628,9 +667,10 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     if runtime() != "codex":
         return _emit({"status": "refused", "say": NOT_CODEX}, 2)
     store = store_dir()
-    if not KEY_RE.fullmatch(verb) or verb not in offered_keys(ws, event) or store is None \
-            or _saved_auth(store, verb) is None:
+    picked = _saved_auth(store, verb) if store is not None and KEY_RE.fullmatch(verb) else None
+    if picked is None or verb not in offered_keys(ws, event):
         return _emit({"status": "refused", "say": GONE}, 2)
+    verb = identity(picked)[0]  # a card made before the key change carries the earlier key
     cur = current("codex", run=run, codex_read=codex_read)
     label = shown_names(saved(store)).get(verb) or "that account"
     if cur["key"] == verb:
@@ -752,6 +792,7 @@ def do_switch(ws: Path, key: str, *, restart=restart_core, ready=core_ready, liv
     want = _saved_auth(store, key) if store else None
     if want is None:
         return "error", "Couldn't switch: that account is no longer saved here. Nothing changed."
+    key = identity(want)[0]  # an earlier (workspace-only) key names the same account
     label = masked_label(identity(want)[1])
     if held(home, key):
         return "error", (f"Couldn't switch to {label}: another Codex on this computer is signed in with that "

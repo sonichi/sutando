@@ -534,6 +534,51 @@ class Taps(Base):
         self.assertNotEqual(json.loads(record.read_text())["attempt"], before, "the dead attempt's record is replaced")
 
 
+def legacy_key(account_id: str) -> str:
+    """The key an earlier engine filed an account under: the workspace id alone."""
+    return hashlib.sha256(account_id.encode()).hexdigest()[:16]
+
+
+class LegacyStore(Base):
+    """A store and a card made before the key followed the desktop's rule (workspace id and email)."""
+
+    def setUp(self):
+        super().setUp()
+        self.store.mkdir(parents=True)
+        for acct, text, label in (("acct-a", A, "alice@example.com"), ("acct-b", B, "bob@work.io")):
+            (self.store / f"{legacy_key(acct)}.json").write_text(json.dumps({"label": label, "auth": text}))
+        self.signed_in(A)
+
+    def test_a_legacy_saved_account_is_offered_once_under_its_current_key(self):
+        self.post()
+        buttons = {b["label"]: b["command"].rsplit(":", 1)[1] for b in self.fake.cards()[-1]["buttons"]
+                   if b["label"].startswith("Use ")}
+        self.assertEqual(buttons, {"Use bob@work.io": key_of("acct-b")}, "the account in use is not offered")
+        self.assertEqual([s["key"] for s in acc.saved(self.store, key_of("acct-a")) if s["current"]], [key_of("acct-a")])
+        self.assertEqual(len(acc.saved(self.store)), 2, "a legacy file and its new copy are one account")
+
+    def test_a_card_made_before_the_change_still_switches(self):
+        with mock.patch.object(acc, "saved", lambda store, current_key="": [
+                {"key": legacy_key("acct-b"), "label": "bob@work.io", "current": False}]):
+            self.post()
+        rc, out = self.tap("Use bob@work.io")
+        self.assertEqual((rc, out["status"]), (0, "started"), out)
+        argv = self.launch.calls[-1][0]
+        self.assertEqual(argv[argv.index("--key") + 1], key_of("acct-b"), "the switch runs on the current key")
+        state, words = acc.do_switch(self.ws, legacy_key("acct-b"), restart=self.restart, ready=self.ready,
+                                     live=self.live_account, held=lambda home, key: False)
+        self.assertEqual((state, self.live()), ("done", B), words)
+
+    def test_the_holder_check_applies_to_a_legacy_key(self):
+        agent = self.home.parent / "agent-home"
+        agent.mkdir()
+        (agent / "auth.json").write_text(B)
+        state, words = acc.do_switch(self.ws, legacy_key("acct-b"), restart=self.restart, ready=self.ready,
+                                     live=self.live_account, held=lambda home, key: acc.held_elsewhere(home, key, [agent]))
+        self.assertEqual((state, self.live(), self.restarts), ("error", A, []))
+        self.assertIn("another Codex on this computer is signed in with that account", words)
+
+
 class Switch(Base):
     def setUp(self):
         super().setUp()
