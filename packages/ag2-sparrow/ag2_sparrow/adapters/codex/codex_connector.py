@@ -495,7 +495,8 @@ class Connector:
                 self.args.state, getattr(self.args, "bridge_state", None), "Codex", self.card_answer, quoted, log,
                 read=self.account_label, begin=self.begin_login,
                 cancel=lambda login: self.rpc.request("account/login/cancel", {"loginId": login}),
-                opener=lambda url: open_page(url), runtime="codex", lapsed=self.login_refused)
+                opener=lambda url: open_page(url), runtime="codex", lapsed=self.login_refused,
+                limit=lambda: self.quota.says())
         return self._accounts
 
     @property

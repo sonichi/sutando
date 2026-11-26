@@ -135,6 +135,14 @@ class QuotaNotice:
         rec = self.load()
         return bool(rec.get("since")) and bool(rec.get("told") or rec.get("qid"))
 
+    def says(self) -> str:
+        """The limit in force, in words, for a card the owner asks for meanwhile; '' when none is, or its reset passed."""
+        rec = self.load()
+        until = rec.get("reset_at")
+        if not self.limited() or (until is not None and self.now() >= float(until)):
+            return ""
+        return words(self.name, str(rec.get("reset") or ""), "")
+
     def cleared(self) -> str:
         """The runtime answered: the limit is over, and a later one is a new card."""
         if not self.load().get("since"):

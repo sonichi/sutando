@@ -2583,6 +2583,27 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         rec = json.loads((self.work / "state" / quota_notice.FILE).read_text())
         self.assertEqual((rec["told"], rec["tasks"]), (True, ["task-1", "task-2", "task-3"]))
 
+    def test_an_account_card_asked_for_while_out_of_usage_says_the_limit_too(self):
+        self.serve("task-0", "what account are you using")
+        plain = self.outbox()[-1]["card"]
+        self.assertEqual(plain["text"], "I'm using alice@example.com. " + account_switch.BELOW)
+        self.assertEqual(plain["account_controls"], {"runtime": "codex"})
+        self.serve("task-1", "[[limit]] hello")
+        self.serve("task-2", "what account are you using")
+        limit, asked = [q["card"] for q in self.outbox()[-2:]]
+        self.assertEqual((asked["text"], asked["account_controls"]), (limit["text"], limit["account_controls"]))
+        # A limit whose words cannot be read never costs the owner the card they asked for.
+        notice = quota_notice.QuotaNotice(self.work / "state", self.bridge, "Codex", None, None, None)
+        self.assertTrue(notice.says().startswith("Codex has reached its usage limit"))
+        notice.now = lambda: time.time() + 10 ** 9
+        self.assertEqual(notice.says(), "", "past its reset: not said")
+        said = []
+        switch = account_switch.AccountSwitch(str(self.work / "state"), str(self.bridge), "Codex", None, None,
+                                              lambda *a: said.append(a[0]), lambda: "alice@example.com", None, None,
+                                              None, runtime="codex", limit=lambda: 1 / 0)
+        self.assertEqual(switch.asked()[1]["text"], plain["text"])
+        self.assertEqual(said, ["limit not read:"])
+
     def test_a_message_served_twice_or_not_the_owners_gets_no_card_of_its_own(self):
         self.serve("task-1", "[[limit]] hello")
         notice = quota_notice.QuotaNotice(self.work / "state", self.bridge, "Codex",
