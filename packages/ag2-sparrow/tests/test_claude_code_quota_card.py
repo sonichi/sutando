@@ -67,7 +67,9 @@ class Notice(NoticeBase):
         self.assertIn("sarah@example.com (Claude Code) has hit its usage limit; resets 3pm (America/Los_Angeles).", card["text"])
         self.assertTrue(card["text"].endswith(account_switch.BELOW), card["text"])
         self.assertEqual(account_switch.BELOW, "Switch this agent's account below.")
-        self.assertEqual(card[account_switch.CONTROLS], {"runtime": "claude"}, "the client draws the controls in it")
+        self.assertEqual(card[account_switch.CONTROLS], {"runtime": "claude", "limit": True},
+                         "the client draws the controls in it, and lists it as an agent out of usage")
+        self.assertEqual(account_switch.limited(("b", {"id": "x"})), ("b", {"id": "x"}), "no marker: unchanged")
         for later in (5.0, 120.0, 3600.0):
             self.assertEqual(self.tick(LIMITED, later), "", "one card per limit")
         self.assertEqual(len(self.queued()), 1)
@@ -337,7 +339,7 @@ class LimitMenu(NoticeBase):
         for q in queued:
             self.assertEqual(q["room"], DM)
             self.assertEqual(q["card"]["id"], account_switch.CARD)
-            self.assertEqual(q["card"][account_switch.CONTROLS], {"runtime": "claude"}, "the switch dropdown")
+            self.assertEqual(q["card"][account_switch.CONTROLS], {"runtime": "claude", "limit": True}, "the switch dropdown")
             # Said once where to switch: the card showed two sentences pointing below.
             self.assertEqual(self.text_of(q), "sarah@example.com (Claude Code) has hit its usage limit; resets Nov 28, "
                              "1pm. I can't answer until then. Switch this agent's account below.")

@@ -94,6 +94,17 @@ def with_controls(built, runtime: str = "", agent: str = "", **flags):
     return body, dict(card, **{CONTROLS: marker})
 
 
+def limited(built):
+    """An account card that is a usage-limit notice: its marker says so (`limit`), so the client lists it
+    with what the agent waits on, apart from an account menu the owner asked for. A card with no marker is
+    returned as it is."""
+    body, card = built
+    marker = card.get(CONTROLS) if isinstance(card, dict) else None
+    if not isinstance(marker, dict):
+        return built
+    return body, dict(card, **{CONTROLS: dict(marker, limit=True)})
+
+
 def masked(email: str) -> str:
     """An address shortened to what tells two accounts apart: its first letter and its domain."""
     name, at, domain = (email or "").partition("@")
