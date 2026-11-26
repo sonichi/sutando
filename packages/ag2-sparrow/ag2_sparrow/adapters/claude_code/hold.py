@@ -127,6 +127,39 @@ def switched_model(root) -> str:
     return model if claude_model_switch.MODEL_RE.match(model) else ""
 
 
+def wanted_model(root) -> str:
+    """A pick the settings page saved while the session could not take /model (`wanted`): the next start
+    runs on it. '' when none."""
+    try:
+        with open(Path(root or ".").joinpath(*MODEL_RECORD), encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    model = str(record.get("wanted") or "") if isinstance(record, dict) else ""
+    return model if claude_model_switch.MODEL_RE.match(model) else ""
+
+
+def write_model_record(root, record: dict) -> None:
+    path = Path(root or ".").joinpath(*MODEL_RECORD)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(record), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def settle_wanted(root, now=time.time) -> str:
+    """At a session's start: a waiting pick becomes the session's model (`--model` starts it on that one).
+    The pick, or '' when none waited or the record could not be written (the start then keeps the old model)."""
+    wanted = wanted_model(root)
+    if not wanted:
+        return ""
+    try:
+        write_model_record(root, {"model": wanted, "at": now()})
+    except OSError:
+        return ""
+    return wanted
+
+
 def claude_argv(cfg: dict, session_id: str) -> list:
     """`claude --plugin-dir … --permission-mode … --resume|--session-id <id> [--model <m>]`: resume when
     the transcript exists under the session's config dir, else start it under that id. A session the
@@ -231,6 +264,9 @@ def _held(root, cfg, session_id, nonce, env, popen, state) -> int:
         return "%d:%d" % (st.st_dev, st.st_ino), ""
 
     def spawn(inode):
+        picked = settle_wanted(cfg.get("ROOT"))
+        if picked:
+            print("hold: starting on %s, the model picked while the session could not switch" % picked, file=sys.stderr)
         child, pipe["go_w"] = spawn_shim(claude_argv(cfg, session_id), child_env(env, inode), popen)
         return child
 

@@ -49,6 +49,9 @@ composer_text, accepted_count = claude_model_switch.composer_text, claude_model_
 composer_boxed, composer_typed = claude_model_switch.composer_boxed, claude_model_switch.composer_typed
 MODEL_RECORD = hold.MODEL_RECORD
 switched_model = hold.switched_model
+wanted_model = hold.wanted_model
+MODEL_BOX_WAIT_S = 8.0     # a session that is starting shows its input box within this
+MODEL_PENDING = ("saved: the session cannot take /model right now (%s); it starts on %s the next time it starts")
 FIELD_SEP = "|:ag2:|"
 START_COMMAND_RE = re.compile(r'^"?ag2-sparrow-claude-local hold --generation=[0-9a-f]{32} --"?$')
 TMUX_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
@@ -672,27 +675,47 @@ class Launcher:
             return "kill-session sent but the session still answers after %d s" % SERVER_EXIT_S
         return self.stopped(started)
 
-    def switch_model(self, rec: dict, model: str, confirm=False, wait_s=MODEL_ACCEPT_S) -> "tuple[bool, str]":
+    def switch_model(self, rec: dict, model: str, confirm=False, wait_s=MODEL_ACCEPT_S,
+                     pend=False) -> "tuple[bool, str]":
         """`/model <model>` through the fence, then (switched, one line): switched only when the pane
         shows a NEW "Set model to" line naming this model. A warm session asks first; that dialog is
         answered once with `confirm`, else cancelled. Nothing is sent to a session whose tuple changed,
-        nor to one whose input box holds a draft or cannot be read: Enter would send the draft."""
+        nor to one whose input box holds a draft or cannot be read: Enter would send the draft. With `pend`
+        (the settings page), a session that is not there or shows no input box (a dialog, the limit menu, a
+        start or a stop under way) keeps the pick for its next start instead of refusing it."""
         if not MODEL_RE.match(model or ""):
             return False, "refused: %r is not a model alias or a claude-* id; nothing sent" % model
         # One switch at a time per agent: two would read each other's lines as their own.
         with locked_file(Path(self.root) / "state" / "model-switch.lock"):
-            return self._switch_model(rec, model, confirm, wait_s)
+            return self._switch_model(rec, model, confirm, wait_s, pend)
 
-    def _switch_model(self, rec: dict, model: str, confirm, wait_s) -> "tuple[bool, str]":
+    def pend_model(self, model: str, why: str, refusal: str) -> "tuple[bool, str]":
+        """Keep the pick for the session's next start (hold.settle_wanted); the refusal when it cannot be saved."""
+        record = {"model": switched_model(self.root), "wanted": model, "at": self.clock()}
+        try:
+            hold.write_model_record(self.root, {k: v for k, v in record.items() if v})
+        except OSError:
+            return False, refusal
+        self.log("model: %s kept for the next start (%s)" % (model, why))
+        return False, MODEL_PENDING % (why, model)
+
+    def _switch_model(self, rec: dict, model: str, confirm, wait_s, pend=False) -> "tuple[bool, str]":
         gen, title = rec.get("generation"), rec.get("title_token") or ""
         if not gen or self.tm.has_session() is not True:
-            return False, "no running session to switch; nothing sent"
+            refusal = "no running session to switch; nothing sent"
+            return self.pend_model(model, "no session is running", refusal) if pend else (False, refusal)
         styled = self.tm.capture(gen["pane_id"], styled=True)
         draft = composer_text(styled)
+        deadline = time.monotonic() + (MODEL_BOX_WAIT_S if pend else 0)
+        while (draft is None or not composer_boxed(styled)) and time.monotonic() < deadline:
+            self.sleep(0.5)
+            styled = self.tm.capture(gen["pane_id"], styled=True)
+            draft = composer_text(styled)
         # An empty reading counts only inside the box's frame: a bare prompt row may be a cut box.
         if draft is None or not composer_boxed(styled):
-            return False, ("refused: the session does not show its whole input box, so the box cannot be read; "
-                           "nothing sent")
+            refusal = ("refused: the session does not show its whole input box, so the box cannot be read; "
+                       "nothing sent")
+            return self.pend_model(model, "it shows no input box", refusal) if pend else (False, refusal)
         # The whole-box reading takes hint wording for a hint; only its styling shows it is one.
         if draft or composer_typed(styled) != "":
             return False, "refused: the session's input box holds unsent text; nothing sent"
