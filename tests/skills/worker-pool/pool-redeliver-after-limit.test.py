@@ -7,7 +7,7 @@ the seat idles, owing them, until someone sends it something new. So:
 - the ladder reads "the seat's own hold was released, and it is idle, owing, watcher live"
   as `redeliver` until that release's wake task is queued, and never while the hold is in force
   or the pane is not idle; a refused remedy leaves the release eligible;
-- the undelivered card still goes out on a later tick if the seat keeps idling;
+- a due undelivered card takes its tick first, even while the redelivery keeps failing;
 - the remedy writes one fresh task through pool_ask (the front door a watcher announces),
   types nothing into the pane, and refuses a pane that is not idle; one task id per release,
   so a retry after an unclear outcome queues nothing twice.
@@ -82,8 +82,9 @@ later = st.last_sample_at + ps.SAMPLE_PERIOD_S
 again, _ = run([obs()], start=later, state=st)
 check("a saved ladder remembers the release it already served", REDELIVER in again, False)
 # A sample gap no longer than the sweep's period, so the tick is evidence and not a host resume.
-nxt, _ = run([obs(released=later - 30)], start=later, state=st)
-check("a later release is a new episode", nxt, [REDELIVER])
+# By then the seat has idled owing past the card threshold, so its due card takes the first tick.
+nxt, _ = run([obs(released=later - 30)] * 2, start=later, state=st)
+check("a later release is a new episode", nxt, [ps.CARD_UNDELIVERED, REDELIVER])
 check("a release whose remedy did not queue stays eligible", run([obs()] * 2, served=False)[0],
       [REDELIVER, REDELIVER])
 
@@ -108,12 +109,12 @@ check("before the release the seat was carded as undelivered", ps.CARD_UNDELIVER
 post, st = run([obs()] * 2, state=st)
 check("an already-raised card does not stop the redelivery", post, [REDELIVER, ps.NOTHING])
 
-# Not carded yet: the redelivery comes first, and the card still follows if it does not help.
+# Not carded yet and the card is due: the card goes first, then the redelivery.
 pre, st = run([obs(released=None)] * ticks, start=RELEASED - ticks * ps.SAMPLE_PERIOD_S)
 check("not yet carded before the release", ps.CARD_UNDELIVERED in pre, False)
 post, st = run([obs()] * 2, state=st)
-check("redelivery takes the tick a card would have", post[0], REDELIVER)
-check("and the card goes out if the seat still idles owing", post[1], ps.CARD_UNDELIVERED)
+check("a due card takes the tick", post[0], ps.CARD_UNDELIVERED)
+check("and the redelivery follows on the next", post[1], REDELIVER)
 
 # --- the observation: the seat's own hold record ---------------------------------------------
 WID = "5d6e7f8091a2b3c4d5e6f708192a3b4c"
@@ -284,6 +285,45 @@ if callable(redeliver):
     check("end to end, the wake task is queued under that id",
           (real.get("outcome"), real.get("task_id"), (ws / "tasks" / f"{wake}.txt").is_file()),
           ("redelivered", wake, True))
+
+    # The queue write keeps failing and no card was raised before: the undelivered card still goes
+    # out at its normal threshold, and the keyed retries continue after it.
+    for p in (ws / "tasks").glob("task-redeliver-*.txt"):
+        p.unlink()
+    span = ticks + 4
+    baseline, _ = run([obs(released=None)] * span)
+    due = baseline.index(ps.CARD_UNDELIVERED) if ps.CARD_UNDELIVERED in baseline else None
+    hold(ws, status="cleared", released_at=RELEASED, cleared_by="cli-pane")
+    sup.save_state(ws, ps.SupervisionState())
+    queued.clear()
+    seen, state = [], ps.SupervisionState()
+    raised = []
+
+    def card(workspace, worker_id, which, **kw):
+        raised.append(which)
+        return {"worker_id": worker_id, "outcome": "carded"}
+
+    def write_fails(workspace, to, question, **kw):
+        raise OSError("queue write failed")
+
+    with mock.patch.object(ask_mod, "ask", side_effect=write_fails), \
+            mock.patch.object(wc, "raise_card", side_effect=card):
+        for _ in range(span):
+            st2, d = ps.evaluate(state, {WID: obs()}, state.last_sample_at + ps.SAMPLE_PERIOD_S
+                                 if state.last_sample_at else RELEASED + 60)
+            sup.save_state(ws, st2)
+            rem.apply(ws, REPO, {WID: d[WID]}, runner=Tmux(IDLE))
+            state = sup.load_state(ws)
+            seen.append(d[WID])
+    check("with the write failing, the card is raised on the tick it is due without a release",
+          (seen.index(ps.CARD_UNDELIVERED) if ps.CARD_UNDELIVERED in seen else None, due), (due, due))
+    check("and raised once", raised, [ps.CARD_UNDELIVERED])
+    after = seen[seen.index(ps.CARD_UNDELIVERED) + 1:] if ps.CARD_UNDELIVERED in seen else []
+    check("the keyed retries continue after the card", bool(after) and set(after) == {REDELIVER}, True)
+    with mock.patch.object(ask_mod, "ask", side_effect=durable_ask):
+        healed = sweep(IDLE, state)
+        check("once the write works, one wake task is queued", (healed[1], len(queued)), ("redelivered", 1))
+        check("and the release is served", sweep(IDLE, healed[2])[0], ps.NOTHING)
 
     with mock.patch.object(sup, "limit_released_at", return_value=None):
         check("no release to serve: nothing is sent", redeliver(ws, REPO, WID, runner=Tmux(IDLE)).get("outcome"),

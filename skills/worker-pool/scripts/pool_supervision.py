@@ -408,11 +408,11 @@ def evaluate(state: SupervisionState, observations: dict[str, Observation], now:
             ev, wedge = _wedge_rung(
                 ev, obs, now, sustained_ticks=sustained_ticks,
                 detect_after_s=detect_after_s)
-            # The redelivery takes this tick until its remedy queues the wake task; a card waits.
+            # A due card goes first, until acknowledged; the redelivery retries on every other tick.
             redeliver = _redeliver_rung(ev, obs, now)
             workers[worker_id] = ev
-            decisions[worker_id] = (REDELIVER if redeliver
-                                    else wedge if wedge != NOTHING else decision)
+            decisions[worker_id] = (wedge if wedge != NOTHING
+                                    else REDELIVER if redeliver else decision)
             continue
 
         if not _is_death_evidence(obs):
