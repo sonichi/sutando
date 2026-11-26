@@ -2,6 +2,7 @@
 """claude-local's quota notice: the account card sent to the owner's DM, unasked, when the session's pane
 shows Claude Code's usage-limit banner (quota_card)."""
 import json
+import os
 import sys
 import types
 import unittest
@@ -38,6 +39,12 @@ class NoticeBase(Base):
         p = mock.patch.object(account_card, "label", lambda cfg, env=None, run=None: "sarah@example.com")
         p.start()
         self.addCleanup(p.stop)
+
+    def task(self, task_id, *a, **kw):
+        """A task that arrives at the test's clock, as the notice reads it."""
+        made = super().task(task_id, *a, **kw)
+        os.utime(self.inbox / (task_id + ".txt"), (self.at[0], self.at[0]))
+        return made
 
     def tick(self, text, advance=0.0):
         self.at[0] += advance
@@ -427,12 +434,12 @@ class LimitMenu(NoticeBase):
         self.assertIsNone(task_lifecycle.prepare_work_dir(self.root, check_only=True), "the next start is not refused")
 
     def test_a_message_from_another_room_or_before_the_unasked_card_gets_its_own_card(self):
-        self.assertTrue(quota_card._just_carded({"qid": "q", "queued": 100.0}, DM, DM, 130.0), "queued, not yet posted")
-        for rec, to, at, why in (({"told": True, "queued": 100.0}, "!other:s.space", 130.0, "another room"),
-                                 ({"told": True, "queued": 100.0}, DM, 100.0 + quota_card.SAME_CARD_S, "long after"),
-                                 ({"told": True, "by_tasks": True}, DM, 130.0, "no unasked card was sent"),
-                                 ({"told": True, "unknown": True, "queued": 100.0}, DM, 130.0, "it may never have shown"),
-                                 ({}, DM, 130.0, "nothing sent yet")):
+        self.assertTrue(quota_card._just_carded({"qid": "q", "queued": 100.0}, DM, DM, 90.0), "it was already waiting")
+        for rec, to, at, why in (({"told": True, "queued": 100.0}, "!other:s.space", 90.0, "another room"),
+                                 ({"told": True, "queued": 100.0}, DM, 101.0, "it arrived after the card"),
+                                 ({"told": True, "by_tasks": True}, DM, 90.0, "no unasked card was sent"),
+                                 ({"told": True, "unknown": True, "queued": 100.0}, DM, 90.0, "it may never have shown"),
+                                 ({}, DM, 90.0, "nothing sent yet")):
             self.assertFalse(quota_card._just_carded(rec, to, DM, at), why)
 
     def test_a_new_session_is_a_new_incident(self):
@@ -471,7 +478,8 @@ class LimitMenu(NoticeBase):
     def test_a_task_that_cannot_be_read_or_sent_is_not_told_and_tried_again_later(self):
         (self.inbox / "task-dir.txt").mkdir()       # unreadable: never told, never retried
         self.task("task-r", "from a room", kind="room")
-        self.assertEqual(self.tick(STARTUP_MENU), "quota-no-room", "no DM room known: nowhere to tell it")
+        with mock.patch.object(quota_card, "_ROOM", quota_card.re.compile("^$")):
+            self.assertEqual(self.tick(STARTUP_MENU), "quota-no-room", "no room known: nowhere to tell it")
         self.assertEqual(self.queued(), [])
         self.assertEqual(quota_card.load(self.root)["tasks"], {"task-dir": {"skip": True}})
         quota_card.remember_room(self.root, DM)
@@ -482,9 +490,26 @@ class LimitMenu(NoticeBase):
         with mock.patch.object(quota_card.records, "write_durable", side_effect=quota_card.records.RecordError("ro")):
             self.assertEqual(self.tick(STARTUP_MENU, quota_card.RETRY_S), "quota-not-posted", "its key not kept: not sent")
         self.assertEqual(self.queued(), [])
+        # Asked in a room: the card answers there, and names no account.
         self.assertEqual(self.tick(STARTUP_MENU, quota_card.RETRY_S), "quota-task-card x1")
         self.assertEqual(self.tick(STARTUP_MENU, 1.0), "")
-        self.assertEqual(len(self.queued()), 1)
+        (there,) = self.queued()
+        self.assertEqual(there["card"]["text"].split(" ", 2)[:2], ["Claude", "Code"])
+        self.assertNotIn("sarah@example.com", there["card"]["text"])
+        # The owner asks for a card while out: the limit's card answers, not the model's or the plain account's.
+        quota_card.save(self.root, dict(quota_card.load(self.root), said="LIMIT WORDS"))
+        got = []
+        for sent in ({"channel_id": DM},):
+            self.assertEqual(quota_card.asked(self.root, self.cfg, sent, "r.txt", lambda f, b: got.append(b),
+                                              lambda *a: None), "quota-card-asked")
+        self.assertIn("LIMIT WORDS", self.queued()[-1]["card"]["text"])
+        from ag2_sparrow.adapters.claude_code import model_card
+        for n, ask in enumerate(("/model", "/account")):
+            self.task("task-ask%d" % n, ask)
+            self.assertEqual(model_card.card_matter(self.root, "task-ask%d" % n, self.cfg)[0], "quota-card-asked", ask)
+            self.assertIn("LIMIT WORDS", self.queued()[-1]["card"]["text"])
+        quota_card.save(self.root, {})
+        self.assertEqual(quota_card.asked(self.root, self.cfg, {"channel_id": DM}, "r.txt", None, None), "")
 
     def test_a_task_card_whose_send_was_unsure_is_queued_again_under_its_own_id(self):
         quota_card.remember_room(self.root, DM)
@@ -579,7 +604,8 @@ class LimitMenu(NoticeBase):
         self.assertEqual(self.tick(STARTUP_MENU, 5.0), "")
         self.assertNotIn("skip", quota_card.load(self.root).get("tasks", {}).get("task-h", {}))
         self.assertEqual(self.sweep(self.queued_at(own) + connector_cards.MAX_QUEUED_S + 1), [])
-        self.assertEqual(self.tick(STARTUP_MENU, connector_cards.MAX_QUEUED_S), "quota-card-dropped; quota-task-card x1")
+        self.assertEqual(self.tick(STARTUP_MENU, connector_cards.MAX_QUEUED_S), "quota-card-dropped")
+        self.assertEqual(self.tick(STARTUP_MENU, 1.0), "quota-task-card x1")
         # Posted, it covers the incident: no unasked card besides.
         (sent,) = self.sweep(self.queued_at(quota_card.load(self.root)["tasks"]["task-h"]["qid"]) + 1)
         self.assertEqual(self.tick(STARTUP_MENU, 5.0), "")

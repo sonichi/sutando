@@ -45,7 +45,6 @@ ROOM_FILE = "quota-room.json"   # the owner's DM room: the claim's alone
 CLEAR_S = 600.0         # the banner gone this long: the limit is over, and a later one is a new card
 COVERS_KEEP = 20        # the task cards of one incident whose fate is still followed
 
-SAME_CARD_S = 120.0     # a message known this soon after the unasked card is answered by that card
 
 ECHO_TASKS, ECHO_BYTES, ECHO_MIN = 40, 200_000, 8    # the task files a pane line is checked against
 _CUT = re.compile(r"\bresets?\b[\w ,]{0,24}$", re.IGNORECASE)
@@ -200,21 +199,27 @@ def _history(root, text: str, at: float, session: str) -> bool:
     return bool(lines) and all(n <= old[ln] for ln, n in collections.Counter(lines).items())
 
 
-def _owner_task(root, task_id: str) -> "str | None":
-    """The DM room an owner task's notice goes to: its own when it was sent in the owner's DM (kept as the
-    DM room too), else the DM room last seen. None for a task that is not the owner's own words (another
-    sender, a card tap) or that cannot be read; '' when no DM room is known yet."""
+def _owner_task(root, task_id: str) -> "tuple[str | None, float, bool]":
+    """(the room an owner task's notice goes to, when the task arrived, whether that room is the owner's DM,
+    where the card may name the account): the room it was sent in (the owner's
+    DM is kept as the DM room too), else the DM room last seen. None for a task that is not the owner's own
+    words (another sender, a card tap) or that cannot be read; '' when no room is known yet."""
     agent_card, _ = connector_cards._core()
+    path = Path(root) / "tasks" / (task_id + ".txt")
     try:
-        with open(Path(root) / "tasks" / (task_id + ".txt"), encoding="utf-8", errors="replace") as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             sent, _ = agent_card.reply_words(f.read())
+        arrived = path.stat().st_mtime
     except (OSError, ValueError):
-        return None
+        return None, 0.0, False
     if agent_card.owner_may_act(sent, dm_only=False) is not None or agent_card.click_tagged(sent):
-        return None
+        return None, 0.0, False
+    seen = str(sent.get("channel_id") or "")
     if agent_card.owner_may_act(sent) is None:
-        remember_room(root, sent.get("channel_id"))
-    return room(root)
+        remember_room(root, seen)
+    elif _ROOM.match(seen):
+        return seen, arrived, False     # asked in a room: the card answers there
+    return room(root), arrived, True
 
 
 def _flat(text: str) -> str:
@@ -251,11 +256,11 @@ def current(text: str) -> bool:
     return any(rx.match(ln) for ln in tail for rx in _LIMIT)
 
 
-def _just_carded(rec: dict, to: str, dm: str, at: float) -> bool:
-    """Whether the incident's own unasked card went to this room a moment ago: a message that was already
-    waiting is known just after the limit is, and a second, identical card under the first helps nobody."""
+def _just_carded(rec: dict, to: str, dm: str, arrived: float) -> bool:
+    """Whether the incident's own unasked card, sent to this room, answers this message: one that was already
+    waiting when the card was queued. A message that arrived after the card gets its own."""
     sent = (rec.get("qid") or rec.get("told")) and not rec.get("by_tasks") and not rec.get("unknown")
-    return bool(sent) and to == dm and at - float(rec.get("queued") or 0) < SAME_CARD_S
+    return bool(sent) and to == dm and arrived <= float(rec.get("queued") or 0)
 
 
 def _covered(bridge: str, rec: dict, at: float) -> "tuple[str, list]":
@@ -297,14 +302,14 @@ def _tell_tasks(root, cfg: dict, bridge: str, limited: list, text: str, log, rec
                 continue
         if at - float(entry.get("tried") or 0) < RETRY_S:
             continue
-        to = _owner_task(root, task_id)
+        to, arrived, in_dm = _owner_task(root, task_id)
         if to is None:
             tasks[task_id] = {"skip": True}     # not the owner's own words: no account card for it
             continue
         if not to:
             done.append("quota-no-room")
             continue
-        if _just_carded(rec, to, room(root), at):
+        if in_dm and _just_carded(rec, to, room(root), arrived):
             if rec.get("told"):
                 tasks[task_id] = {"skip": True}     # the incident's card, posted in this room, answers it
             continue        # only queued so far: no second card yet, and none skipped for good until it is posted
@@ -321,8 +326,11 @@ def _tell_tasks(root, cfg: dict, bridge: str, limited: list, text: str, log, rec
         if card is None:
             card = account_card.AccountCard(root, cfg, lambda result_file, body: None, log)
             said = _card_words(card, limited, text, log)
+            rec = dict(rec, said=said)
+        # In a room that is not the owner's DM the card names no account.
+        here = said if in_dm else words(limited, text, "", "").rstrip()
         try:
-            qid = connector_cards.queue(bridge, to, *account_switch.limited(card.card("pending", said, ask=True)),
+            qid = connector_cards.queue(bridge, to, *account_switch.limited(card.card("pending", here, ask=True)),
                                         key=entry["key"],
                                         at_ns=entry["at"], again=bool(entry.get("again")))
         except (OSError, ValueError) as e:
@@ -381,6 +389,18 @@ def notice(root, cfg: dict, names, text: str, log, now=time.time, session: str =
     return "; ".join(w for w in (_tell_incident(root, cfg, bridge, limited, text, log, rec, at), told_tasks) if w)
 
 
+def asked(root, cfg: dict, sent, result_file, publish, log) -> str:
+    """Out of usage, the owner's ask for a card is answered by the limit's card (the words last told); ''
+    when no limit is in force."""
+    rec = load(root)
+    if not rec.get("since") or rec.get("gone") is not None or not rec.get("said"):
+        return ""
+    card = account_card.AccountCard(root, cfg, publish, log)
+    card.say(sent.get("channel_id"), account_switch.limited(card.card("pending", str(rec["said"]), ask=True)),
+             result_file)
+    return "quota-card-asked"
+
+
 def _tell_incident(root, cfg: dict, bridge: str, limited: list, text: str, log, rec: dict, at: float) -> str:
     """The one unasked card of the incident, in the owner's DM."""
     if not rec.get("told") and not rec.get("qid") and rec.get("covers"):
@@ -427,7 +447,8 @@ def _tell_incident(root, cfg: dict, bridge: str, limited: list, text: str, log, 
     if not card_desk.usable(bridge):
         return "quota-not-posted"
     card = account_card.AccountCard(root, cfg, lambda result_file, body: None, log)
-    built = account_switch.limited(card.card("pending", _card_words(card, limited, text, log), ask=True))
+    rec = dict(rec, said=_card_words(card, limited, text, log))
+    built = account_switch.limited(card.card("pending", rec["said"], ask=True))
     try:
         qid = connector_cards.queue(bridge, to, *built, key=rec["key"], at_ns=rec["at"], again=bool(rec.get("again")))
     except (OSError, ValueError) as e:
