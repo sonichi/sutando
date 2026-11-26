@@ -79,9 +79,8 @@ def kind_of(words: str) -> Optional[str]:
     return None
 
 
-# A question in the owner's own words about what is in use. Only short questions that name the
-# account, the model or the core and ask which/what; anything asking why, about a failure, or naming
-# a choice ("to sonnet", "换成 opus") is left to the core.
+# A short which/what question naming the account, model or core; why/failure questions and named
+# choices ("to sonnet", "换成 opus") stay with the core.
 _ASKS = re.compile(r"\b(?:what|which|who)\b|\?|？|什么|哪个|哪一个|哪|吗|是不是|还是|在用|现在用|using|current|are you on", re.I)
 _NOT_A_LOOKUP = re.compile(r"\b(?:why|how come|fail(?:ed|s|ing)?|error|broken|switch(?:ed)? to|change(?:d)? to|"
                            r"to|into|and then)\b|为什么|怎么回事|怎么没|失败|报错|没切|切不|不能|换成|换到|切到|改成|"
