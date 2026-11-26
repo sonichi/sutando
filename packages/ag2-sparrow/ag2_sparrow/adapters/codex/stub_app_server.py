@@ -14,6 +14,8 @@ Tokens, as the real server holds them: `stub-token` under CODEX_HOME is read onc
 memory. A sign-in that succeeds writes a new one there and lists the old one in `stub-revoked`; a turn on a
 token listed there fails as `unauthorized`, as a server that kept the old login after a switch does.
 `[[rotate]]` does the same once, as a sign-in elsewhere; `stub-locked` refuses every turn that way.
+The login file is rewritten (a byte appended to `auth.json`), as an account switch does, by `[[touch-login]]`
+once a turn is sent, and on every thread start or resume while `stub-touch-on-thread` exists.
 """
 import json
 import os
@@ -145,6 +147,8 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": rid, "result": {"data": listed, "nextCursor": None}})
     elif meth in ("thread/start", "thread/resume"):
         tid = p.get("threadId") or str(uuid.uuid4())
+        if home_file("stub-touch-on-thread"):
+            home_file("auth.json", " ")      # the login switched while the turn was being made ready
         if meth == "thread/resume" and tid.startswith("stale-"):
             send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": "no rollout found for thread id " + tid}})
             continue
@@ -168,6 +172,8 @@ for line in sys.stdin:
         tid = p["threadId"]
         turn_id = str(uuid.uuid4())
         text = next((i.get("text", "") for i in p.get("input", []) if i.get("type") == "text"), "")
+        if "[[touch-login]]" in text:
+            home_file("auth.json", " ")          # the login switched after this turn was sent
         tp = THREADS[tid]["params"]
         # The echo names the thread's settings, so a test can pin sandbox and lifetime; the cwd is the
         # turn's own when the turn carries one (the turn/start override), else the thread's.
