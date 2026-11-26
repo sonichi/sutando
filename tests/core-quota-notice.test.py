@@ -74,6 +74,33 @@ class Episode(Base):
         self.assertEqual(self.cards, ["Codex has reached its usage limit (resets 3:05 PM), so I can't answer "
                                       "until then. Switch to another account to go on now."])
 
+    def test_a_message_waiting_from_a_room_is_told_the_limit_there_once_and_a_dm_message_is_not(self):
+        import activity_rows
+        head = "id: %s\nuser_id: @bob:s.space\nchannel_id: %s\nchannel_kind: %s\nsource_message_id: $e\naccess_tier: %s\ntask: hi\n"
+        (self.ws / "tasks" / "task-room.txt").write_text(head % ("task-room", "!room:s.space", "room", "team"))
+        (self.ws / "tasks" / "task-dm.txt").write_text(head % ("task-dm", "!dm:s.space", "dm", "owner"))
+        rows = []
+        with mock.patch.object(activity_rows, "append", lambda line, **kw: rows.append((line, kw)) or {}):
+            self.assertEqual(self.notice().hit("3:05 PM"), "quota-card")
+            self.now[0] += 120
+            self.notice().hit("3:05 PM")
+        ((line, kw),) = rows
+        self.assertEqual(line, "On hold: Codex has reached its usage limit (resets 3:05 PM), so I can't answer until "
+                               "then. Your request is kept. Accounts are switched in my owner's direct message, not here.")
+        self.assertEqual((kw["room"], kw["audience"], kw["task"]["id"], kw["pid"]),
+                         ("!room:s.space", "room", "task-room", "quota:1000000:task-room:on-hold"))
+        self.assertEqual(self.record()["roomed"], ["task-room"])
+        # A room that cannot be told never stops the card; a signed-out core tells no room a limit.
+        (self.ws / "state" / "core-quota-card.json").unlink()
+        with mock.patch.object(activity_rows, "append", side_effect=OSError("ro")):
+            self.assertEqual(self.notice().hit("3:05 PM"), "quota-card")
+        self.assertNotIn("roomed", self.record())
+        self.assertEqual(cqn.room_words("Codex", ""), "On hold: Codex has reached its usage limit (it does not say when "
+                         "that resets), so I can't answer until then. Your request is kept. Accounts are switched in "
+                         "my owner's direct message, not here.")
+        with mock.patch("task_queue.pending_files", side_effect=OSError("gone")):
+            self.assertEqual(cqn.room_tasks(self.ws), {})
+
     def test_no_reset_known_says_so(self):
         self.notice().hit()
         self.assertIn("(it does not say when that resets)", self.cards[0])
@@ -405,24 +432,28 @@ class EveryMessage(Base):
         self.assertEqual(len(self.cards), 3)
         self.assertNotIn("again_failed", self.record())
 
-    def test_a_follow_up_that_keeps_failing_stops_after_its_tries(self):
+    def test_a_follow_up_that_keeps_failing_is_tried_again_ever_later_and_sent_once_it_can_be(self):
         q = self.notice()
         q.hit("", tasks=["t1"])
         self.posted = False
-        for _ in range(cqn.AGAIN_TRIES):
+        for _ in range(cqn.AGAIN_TRIES + 2):
             self.assertEqual(q.hit("", tasks=["t1", "t2"]), "quota-not-posted")
-            self.now[0] += 10 ** 6
-        self.assertEqual(q.hit("", tasks=["t1", "t2"]), "")
-        self.assertEqual(len(self.cards), 1 + cqn.AGAIN_TRIES)
+            self.assertEqual(q.hit("", tasks=["t1", "t2"]), "", "not before its next try")
+            self.now[0] += cqn.RETRY_S * 2 ** (cqn.AGAIN_TRIES - 1)
+        # The message was never marked told: once a card can be posted, it gets one.
+        self.posted = True
+        self.assertEqual(q.hit("", tasks=["t1", "t2"]), "quota-card-again")
+        self.assertEqual(self.record()["carded"], ["t1", "t2"])
 
-    def test_after_the_paused_notice_told_it_no_card_follows(self):
+    def test_after_the_paused_notice_told_it_a_later_message_still_gets_the_card(self):
         self.posted = False
         q = self.notice()
         q.hit("", tasks=["t1"])
         q.yield_to_notice()
         self.posted = True
-        self.assertEqual(q.hit("", tasks=["t2"]), "")
-        self.assertEqual(self.cards, [self.cards[0]])
+        self.assertEqual(q.hit("", tasks=["t2"]), "quota-card-again")
+        self.assertEqual(len(self.cards), 2)
+        self.assertEqual(q.hit("", tasks=["t2"]), "", "once per message")
 
     def test_only_the_owners_waiting_messages_count(self):
         (self.ws / "tasks" / "task-a.txt").write_text("id: task-a\naccess_tier: owner\ntask: hi\n")
