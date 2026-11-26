@@ -61,12 +61,37 @@ class Desk:
             choice = named(said.strip()) if named and card.usable() else ""
             if choice:
                 return self.drawn(card, result_file, lambda: card.asked_for(choice, sent, result_file))
+        # A card may also name the owner's own words that are its matter (`asks`, card_ask), read here and
+        # never by the model. Asked about both ("which account and model"), both are shown.
+        asked: list = []
         for card in self.cards:
-            # A card may also name the owner's own words that are its matter (`asks`), read here and
-            # never by the model: the account card's, for what the runtime cannot see of itself.
-            if getattr(card, "asks", None) and card.asks(said) and card.usable():
-                return self.drawn(card, result_file, lambda: card.offer(sent, result_file))
-        return ""
+            if getattr(card, "asks", None) and card.KIND not in [c.KIND for c in asked] and card.asks(said) \
+                    and card.usable():
+                asked.append(card)
+        if len(asked) == 1:
+            return self.drawn(asked[0], result_file, lambda: asked[0].offer(sent, result_file))
+        return self.all_drawn(asked, sent, result_file) if asked else ""
+
+    def all_drawn(self, cards, sent, result_file) -> str:
+        """Each card offered, and one answer for the task: what any of them could only say in words, else
+        the first one's no-send line. A card's answer is caught on its way out, as it is the task's only one."""
+        bodies: list = []
+        outcomes = []
+        publish = self.publish
+        for card in cards:
+            own = card.__dict__.get("publish")
+            card.publish = self.publish = lambda path, body: bodies.append(body)
+            try:
+                outcomes.append(self.drawn(card, result_file, lambda: card.offer(sent, result_file)))
+            finally:
+                self.publish = publish
+                if own is None:
+                    del card.publish
+                else:
+                    card.publish = own
+        words = [b for b in bodies if not b.startswith("[no-send]")]
+        publish(result_file, "".join(words) if words else (bodies[0] if bodies else ANSWERED))
+        return "+".join(outcomes)
 
     def drawn(self, card, result_file, act) -> str:
         """`act()`, with a card that cannot be drawn (a name or a link the card rules refuse) answered in

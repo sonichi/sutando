@@ -17,7 +17,7 @@ import os
 import time
 import uuid
 
-from . import card_desk, connector_cards
+from . import card_ask, card_desk, connector_cards
 
 FILE, CARD, ASK = "model.json", "model-switch", "/model"
 # What a pick came to is a card of its own: recorded under the menu's id it would retire the menu
@@ -67,6 +67,7 @@ class ModelSwitch:
 
     KIND, ASK, MARK, HINT, IN_DM = "model", ASK, MARK, HINT, IN_DM      # what card_desk routes by
     CARD_ID = CARD
+    asks = staticmethod(card_ask.asks_model)     # "what model", "换模型": the card, not the model's guess
     # The card after a pick, before it is applied; a runtime that switches live says so (model_card).
     SWITCHING = "Switching to %s on your next message. I'll confirm here once it has switched."
 
