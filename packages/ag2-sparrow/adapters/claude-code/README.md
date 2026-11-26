@@ -106,8 +106,33 @@ on the result it finds. A park that
 settled but whose reply was lost (the lock's release failed and the claim
 could not be re-read) answers settled on the identical park again, naming the
 protocol failure only when that is what it delivered; nothing is published
-twice. A Mod that lost its offers inside one generation (a plugin reload, not
-a session restart) claims every listed task afresh, and a claim it already
+twice. A plugin reload inside a live session starts the Mod's variables over, so
+the Mod keeps its offers in flight in the session's state (`$.state`, which a
+reload leaves in place) and takes them back at its next start, but only those
+the CLI still lists as this generation's open claims at the same attempt
+(`inbox inflight`, read-only): a queued prompt can then still be confirmed by
+its own turn, a running turn can still answer with `ag2space_reply`, and an
+accepted answer is published at the next tick. A taken-back turn whose end the
+Mod did not see is closed with the protocol failure when the session's next
+main-loop turn starts, or after 30 minutes, so intake is never held for good.
+A queued prompt is never submitted a second time. One whose submit is not known
+to have reached the session is not waited for at all; one that did reach it is
+waited for five minutes; after that intake goes on, the turn is still confirmed
+if it starts, and otherwise the next start answers it. A confirmation the CLI
+asked to retry is kept with the turn it is for (and that turn's end, once seen)
+and tried again after the reload; one the CLI keeps asking to retry holds intake
+for five minutes, after which intake goes on and the retry continues (the same
+bound holds for a turn that was never reloaded; a turn whose confirmation went
+through holds intake until it ends). An offer
+intake stopped waiting for is still kept, so a second reload does not lose it or
+a confirmation that came late. The body handed to `stage` rides on the offer
+from before the CLI is asked until staging is settled, so every save made in
+between carries its bytes and a reload between the stage's steps still holds
+them: they are staged and published at the turn's end, and no other text is
+accepted.
+Whatever the Mod did not keep (an engine without `$.state`, a state that could
+not be written), or the CLI does not list, goes the way it always has: a Mod
+that lost its offers inside one generation claims every listed task afresh, and a claim it already
 drove past its call is one it can never finish: at TURN_CONFIRMED with an
 accepted answer the lifecycle's one decision for such a turn (`close_turn`,
 the same one generation recovery takes) applies: a descriptor whose blob
@@ -785,6 +810,20 @@ settings. Not measured against a real Claude Code here (the tests drive a stand-
 server); the two screen texts are the ones `skills/model-switch` waits for on the core. A `/model`
 typed while a turn is running is queued by Claude Code and applies when the turn ends, so the 20 s
 wait can report `unconfirmed` for a switch that lands later.
+
+**The model card.** The owner can also switch from their DM, with the same card Antigravity and local Codex use (`ag2_sparrow/model_switch.py`). `inbox claim` answers these before the session sees them (`adapters/claude_code/model_card.py`): `/model` in the DM posts the menu (the core's list: Default, Opus, Sonnet 1M, Haiku, Fable 1M), and a tap on it, or `/model <name>`, saves the pick and posts "switching". It then starts `python -m ag2_sparrow.adapters.claude_code.model_card apply` detached: this `model` switch with `--confirm`, sent only once the session is out of a task's turn (it polls for up to 5 minutes in all, retries included), then "Switched" or "could not switch (why)" in the DM (log: `state/model-apply.log`). Any tap but the owner's in their DM gets the fixed refusal. The isolated turn for a restricted sender runs on the same pick (`ANTHROPIC_MODEL`). The owner's frame tells the session that /model in the DM is the way to switch, never a terminal.
+
+**The account card.** `/account` or `/login` in the owner's DM, or a tap on the card, is also answered by `inbox claim` (`adapters/claude_code/account_card.py`, the shared `account_switch` card): the account Claude Code reports for the agent's own config dir (`claude auth status --json`; the address in full, no plan), and "Switch account". The card carries `account_controls` (`{"runtime": "claude"}`): in the desktop app, on the computer that runs the agent, the owner switches account right in the card (the app runs `account --start` and takes the code in the card's own box, never sent to the chat). The button starts nothing here: a sign-in code never travels as a chat message, so for a client without those controls it says "Open this on the computer that runs Claude Code to switch account." English only. The owner's frame says the same, so the session never sends the owner to Claude's connector settings or asks for a code in chat.
+
+**The quota notice.** A session at its usage limit cannot answer, so the launcher tells the owner instead. Each tick it already reads the pane; when Claude Code's own limit menu is the live dialog there ("Stop and wait for limit to reset" with the caret on one of its options, `pane_composer.limit_menu`, the same rows the core's pane gate reads), or its out-of-credits banner leads one of the last lines, `quota_card.notice` queues the account card for the owner's DM: that the agent has reached its limit, when it resets if the pane says, the account in use, and the account controls to switch with. A usage-limit banner with no menu, or words that only read like the menu (a reply, a quoted message), send nothing. Every owner message left unanswered behind the menu gets the card once. The reset time is the live menu's, else the newest banner's own, and only its time-like characters; no other line of the pane can reach the DM. One card per limit: the next is sent only once the banner has been gone for ten minutes and comes back; a card that could not be queued is tried again a minute later under the same key, so a restart in between is not a second card. Queued is not told: the bridge drops a card it could not post within ten minutes, so the limit counts as told only when the card left the outbox in time or its posted receipt is there, and a dropped one is queued again (the same card id, which replaces the earlier in the room). A connector is not told the owner's DM room: it is remembered (`state/quota-room.json`, written only at the claim; the incident is `state/quota-card.json`, written only by the supervisor) from the owner's own messages there, and until one has been seen nothing is sent and the launcher's stall card is what reaches the owner. Nothing is typed into the session and no account is changed by the notice.
+
+*The account card.** `/account` or `/login` in the owner's DM, or a tap on the card, is also answered by `inbox claim` (`adapters/claude_code/account_card.py`, the shared `account_switch` card): the account Claude Code reports for the agent's own config dir (`claude auth status --json`; the address in full, no plan), and "Switch account". The card carries `account_controls` (`{"runtime": "claude"}`): in the desktop app, on the computer that runs the agent, the owner switches account right in the card (the app runs `account --start` and takes the code in the card's own box, never sent to the chat). The button starts nothing here: a sign-in code never travels as a chat message, so for a client without those controls it says "Open this on the computer that runs Claude Code to switch account." English only. The owner's frame says the same, so the session never sends the owner to Claude's connector settings or asks for a code in chat.
+
+**The quota notice.** A session at its usage limit cannot answer, so the launcher tells the owner instead. Each tick it already reads the pane; when Claude Code's own limit menu is the live dialog there ("Stop and wait for limit to reset" with the caret on one of its options, `pane_composer.limit_menu`, the same rows the core's pane gate reads), or its out-of-credits banner leads one of the last lines, `quota_card.notice` queues the account card for the owner's DM: that the agent has reached its limit, when it resets if the pane says, the account in use, and the account controls to switch with. A usage-limit banner with no menu, or words that only read like the menu (a reply, a quoted message), send nothing. Every owner message left unanswered behind the menu gets the card once. The reset time is the live menu's, else the newest banner's own, and only its time-like characters; no other line of the pane can reach the DM. One card per limit: the next is sent only once the banner has been gone for ten minutes and comes back; a card that could not be queued is tried again a minute later under the same key, so a restart in between is not a second card. Queued is not told: the bridge drops a card it could not post within ten minutes, so the limit counts as told only when the card left the outbox in time or its posted receipt is there, and a dropped one is queued again (the same card id, which replaces the earlier in the room). A connector is not told the owner's DM room: it is remembered (`state/quota-room.json`, written only at the claim; the incident is `state/quota-card.json`, written only by the supervisor) from the owner's own messages there, and until one has been seen nothing is sent and the launcher's stall card is what reaches the owner. Nothing is typed into the session and no account is changed by the notice.
+
+**Asked in words.** The owner need not type a command: the owner's frame tells the session to answer a question about its model or its account with exactly `[model-card]` or `[account-card]`, and `inbox stage` turns that answer into the card in the DM (`model_card.marked_answer`, #6685's `Desk.marked`), staging the card's no-send line instead; the first answer is kept in `state/card-marks/`, so a staging retry stages the same bytes and shows no second card. A mark from anyone but the owner is published as written, and outside the DM the answer says where to ask.
+
+**Asked in words.** The owner need not type a command: the owner's frame tells the session to answer a question about its model or its account with exactly `[model-card]` or `[account-card]`, and `inbox stage` turns that answer into the card in the DM (`model_card.marked_answer`, the shared desk's `marked`), staging the card's no-send line instead; the first answer is kept in `state/card-marks/`, so a staging retry stages the same bytes and shows no second card. A mark from anyone but the owner is published as written, and outside the DM the answer says where to ask.
 
 `attach` is `tmux attach` on the adapter's own socket: the same session under the same lock, so a
 `/exit` typed there ends it and the launcher resumes it by id; `--help` states the limits.

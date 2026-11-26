@@ -24,10 +24,10 @@ import sys
 import time
 from pathlib import Path
 
-from ... import claude_model_switch, connect_common as cm, task_io, tmux_pane_keys, tmux_probe
+from ... import claude_model_switch, connect_common as cm, signin_watch, task_io, tmux_pane_keys, tmux_probe
 from ...file_lock import locked_file
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
-from . import detector, hmac_policy, hold, inbox, trust
+from . import detector, hmac_policy, hold, inbox, quota_card, trust
 from .shape import (AUTOARM_VAR, HITL_ID_PREFIX, LAUNCHER_LOCK, LOCAL, MIN_TMUX, SESSION_NAME, SOCKET_NAME,
                     SOCKET_PATH_MAX, SUPERVISOR_LOCK)
 
@@ -41,6 +41,7 @@ CONSUMER_WAIT_S = 30.0
 INNER_STOP_S = 120.0
 TITLE_CHANGED = "title changed"
 MODEL_ACCEPT_S = 20.0
+SIGNIN_CHECK_S = 5.0       # how often the sign-in file's stat is looked at
 # The names that may be typed, Claude Code's two texts and its input-box check are the core's
 # (src/claude_model_switch.py, bundled verbatim): one source for the skill and for this adapter.
 MODEL_RE, MODEL_SET, MODEL_CONFIRM = claude_model_switch.MODEL_RE, claude_model_switch.MODEL_SET, claude_model_switch.MODEL_CONFIRM
@@ -48,6 +49,9 @@ composer_text, accepted_count = claude_model_switch.composer_text, claude_model_
 composer_boxed, composer_typed = claude_model_switch.composer_boxed, claude_model_switch.composer_typed
 MODEL_RECORD = hold.MODEL_RECORD
 switched_model = hold.switched_model
+wanted_model = hold.wanted_model
+MODEL_BOX_WAIT_S = 8.0     # a session that is starting shows its input box within this
+MODEL_PENDING = ("saved: the session cannot take /model right now (%s); it starts on %s the next time it starts")
 FIELD_SEP = "|:ag2:|"
 START_COMMAND_RE = re.compile(r'^"?ag2-sparrow-claude-local hold --generation=[0-9a-f]{32} --"?$')
 TMUX_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
@@ -199,6 +203,33 @@ def configured_tmux(cfg: dict, environ=None, job: "cm.Shape | None" = None) -> "
                                                                     % (recorded, install))
     found = tmux_candidates("", environ)
     return (found[0], "") if found else ("", "the config records no TMUX and no tmux was found; run %s" % install)
+
+
+# Claude Code's usage-limit menu, whole and at the foot of the pane: its question, its option rows in order
+# (the first is the wait, one is selected) and its key hint. One line that reads like an option is not it.
+_MENU_HEAD = re.compile(r"^\s*What do you want to do\?\s*$")
+_MENU_ROW = re.compile(r"^\s*(?P<sel>[\u276f>])?\s*(?P<n>\d+)\.\s+(?P<text>\S.*)$")
+_MENU_WAIT = re.compile(r"^(?:stop and )?wait for (?:the |your )?(?:[\w-]+ )?limit to reset\b", re.I)
+_MENU_FOOT = re.compile(r"\bEsc to cancel\b")
+LIMIT_MENU_LINES = 12
+
+
+def limit_menu(pane) -> bool:
+    """Whether the pane ends in the usage-limit menu, the dialog no turn gets past."""
+    lines = [ln for ln in (pane or "").splitlines() if ln.strip()][-LIMIT_MENU_LINES:]
+    if len(lines) < 4 or not _MENU_FOOT.search(lines[-1]):
+        return False
+    at, rows = len(lines) - 2, []
+    while at >= 0:
+        row = _MENU_ROW.match(lines[at])
+        if not row:
+            break
+        rows.insert(0, row)
+        at -= 1
+    if at < 0 or not _MENU_HEAD.match(lines[at]) or len(rows) < 2:
+        return False
+    return ([int(r.group("n")) for r in rows] == list(range(1, len(rows) + 1))
+            and sum(1 for r in rows if r.group("sel")) == 1 and bool(_MENU_WAIT.match(rows[0].group("text"))))
 
 
 class Tmux:
@@ -370,12 +401,22 @@ class Launcher:
         self.tm = Tmux(socket_path(config_dir), tmux=found, run=run)
         self.state = cm.stop_state()
         self.observation: dict = {}
+        self.quota_said = ""
         self.created: "str | None" = None
         self.adopted = False
         self.refused = ""
         self.store_root = Path(cfg["HITL_STORE"]) if cfg.get("HITL_STORE") else None
         self.supervisor_lock = self.config_dir / SUPERVISOR_LOCK
         self.opaque = card.opaque_install(task_io.install_id(), self.root)
+        # The account the pane's claude started with is recorded (as a fingerprint, with that consumer) in
+        # the supervisor record; another one in `.claude.json` restarts the session once its turn ends.
+        home = (os.environ if environ is None else environ).get("HOME", "")
+        conf = trust.config_file(cfg.get("CLAUDE_CONFIG_DIR", ""), home=home)
+        # The desktop's switch may change only the Keychain item, so its marker in the config dir counts too.
+        marker_dir = signin_watch.claude_config_dir(cfg.get("CLAUDE_CONFIG_DIR", ""), home)
+        self.signin = signin_watch.SigninWatch([conf, os.path.join(marker_dir, signin_watch.MARKER)],
+                                               lambda: signin_watch.claude_identity(conf, marker_dir))
+        self.signin_next, self.signin_waiting = 0.0, False
 
     # ── the record, always under the supervisor lock ─────────────────────────
 
@@ -424,6 +465,7 @@ class Launcher:
         if problem:
             return False, problem
         rec = self.retire_card()
+        self.new_quota_incident()
         nonce = os.urandom(16).hex()
         generation, problem = create_session(self.tm, self.cfg, self.config_dir, self.root, nonce, self.environ, self.run)
         if generation is None:
@@ -436,7 +478,7 @@ class Launcher:
         consumer, title = await_consumer(self.tm, self.root, generation["pane_id"], sleep=self.sleep)
         if consumer is None:
             return False, "no consumer attached within %d s of the session's start" % CONSUMER_WAIT_S
-        self._with_record(lambda r: dict(r, consumer=consumer, title_token=title))
+        self._with_record(lambda r: dict(r, consumer=consumer, title_token=title, signin=self.signin_mark(consumer)))
         self.log("created session %s (pane %s, claude pid %d)" % (generation["session_id"], generation["pane_id"], consumer["pid"]))
         return True, ""
 
@@ -455,15 +497,41 @@ class Launcher:
             plugin = records.load_plugin(self.root)
         except records.RecordError:
             plugin = records.empty_plugin()     # a torn record still lets the alarm through
-        plugin = dict(plugin, stuck=inbox.unresolved_stuck(self.root, plugin.get("stuck")),
+        # An entry an earlier session left in the Mod's record is not a turn: it must not read as a stall.
+        plugin = dict(plugin, inflight=inbox.live_inflight(self.root, plugin.get("inflight")),
+                      stuck=inbox.unresolved_stuck(self.root, plugin.get("stuck")),
                       progress_unwritable=records.read_progress_alarm(self.config_dir))
-        self.observation = detector.derive(self.observation, text, plugin, self.clock())
+        # A task's own words on the pane ("... hit its usage limit ...") are not a banner, and no stall.
+        self.observation = detector.derive(self.observation, text, plugin, self.clock(),
+                                           own=quota_card.own_ui(self.root, text))
+        self.quota(text, str((gen or {}).get("nonce") or ""))
         stall = self.observation["stall"]
         if (rec.get("stall") or None) != stall:
             if rec.get("stall"):
                 self.log("progress: the stall %s" % ("cleared" if stall is None else "changed"))
             return self.clear_card(stall, plugin.get("session_id"))
         return rec
+
+    def new_quota_incident(self) -> None:
+        """A session being created (an account switch restarts it) may be on an account at its limit too."""
+        try:
+            quota_card.new_session(self.root)
+        except Exception as e:  # noqa: BLE001 - advisory
+            self.log("quota: new session not recorded (%s: %s)" % (type(e).__name__, str(e)[:120]))
+
+    def quota(self, text: str, session: str = "") -> None:
+        """The usage-limit banner or Claude Code's limit menu on the pane: the owner is told, with the account
+        card, once per limit and on each of their messages left unanswered (quota_card).
+        A notice that cannot be sent never stops the supervisor."""
+        try:
+            done = quota_card.notice(self.root, self.cfg, detector.abnormal_names(text), text,
+                                     lambda *parts: self.log(" ".join(str(p) for p in parts)), now=self.clock,
+                                     session=session)
+        except Exception as e:  # noqa: BLE001 - advisory
+            done = "quota-failed (%s: %s)" % (type(e).__name__, str(e)[:120])
+        if done and done != self.quota_said:
+            self.log("quota: %s" % done)
+        self.quota_said = done or self.quota_said
 
     def raise_card(self, rec: dict, kind: str, failed_check: str) -> dict:
         """One card per incident; the id lives in the supervisor record so a restart resumes it."""
@@ -607,32 +675,55 @@ class Launcher:
             return "kill-session sent but the session still answers after %d s" % SERVER_EXIT_S
         return self.stopped(started)
 
-    def switch_model(self, rec: dict, model: str, confirm=False, wait_s=MODEL_ACCEPT_S) -> "tuple[bool, str]":
+    def switch_model(self, rec: dict, model: str, confirm=False, wait_s=MODEL_ACCEPT_S,
+                     pend=False) -> "tuple[bool, str]":
         """`/model <model>` through the fence, then (switched, one line): switched only when the pane
         shows a NEW "Set model to" line naming this model. A warm session asks first; that dialog is
         answered once with `confirm`, else cancelled. Nothing is sent to a session whose tuple changed,
-        nor to one whose input box holds a draft or cannot be read: Enter would send the draft."""
+        nor to one whose input box holds a draft or cannot be read: Enter would send the draft. With `pend`
+        (the settings page), a session that is not there or shows no input box (a dialog, the limit menu, a
+        start or a stop under way) keeps the pick for its next start instead of refusing it."""
         if not MODEL_RE.match(model or ""):
             return False, "refused: %r is not a model alias or a claude-* id; nothing sent" % model
         # One switch at a time per agent: two would read each other's lines as their own.
-        with locked_file(Path(self.root) / "state" / "model-switch.lock"):
-            return self._switch_model(rec, model, confirm, wait_s)
+        with locked_file(Path(self.root).joinpath(*hold.MODEL_LOCK)):
+            return self._switch_model(rec, model, confirm, wait_s, pend)
 
-    def _switch_model(self, rec: dict, model: str, confirm, wait_s) -> "tuple[bool, str]":
+    def pend_model(self, model: str, why: str, refusal: str) -> "tuple[bool, str]":
+        """Keep the pick for the session's next start (hold.settle_wanted); the refusal when it cannot be saved."""
+        record = {"model": switched_model(self.root), "wanted": model, "at": self.clock()}
+        try:
+            hold.write_model_record(self.root, {k: v for k, v in record.items() if v})
+        except OSError:
+            return False, refusal
+        self.log("model: %s kept for the next start (%s)" % (model, why))
+        return False, MODEL_PENDING % (why, model)
+
+    def _switch_model(self, rec: dict, model: str, confirm, wait_s, pend=False) -> "tuple[bool, str]":
         gen, title = rec.get("generation"), rec.get("title_token") or ""
         if not gen or self.tm.has_session() is not True:
-            return False, "no running session to switch; nothing sent"
+            refusal = "no running session to switch; nothing sent"
+            return self.pend_model(model, "no session is running", refusal) if pend else (False, refusal)
         styled = self.tm.capture(gen["pane_id"], styled=True)
         draft = composer_text(styled)
+        deadline = time.monotonic() + (MODEL_BOX_WAIT_S if pend else 0)
+        while (draft is None or not composer_boxed(styled)) and time.monotonic() < deadline:
+            self.sleep(0.5)
+            styled = self.tm.capture(gen["pane_id"], styled=True)
+            draft = composer_text(styled)
         # An empty reading counts only inside the box's frame: a bare prompt row may be a cut box.
         if draft is None or not composer_boxed(styled):
-            return False, ("refused: the session does not show its whole input box, so the box cannot be read; "
-                           "nothing sent")
+            refusal = ("refused: the session does not show its whole input box, so the box cannot be read; "
+                       "nothing sent")
+            return self.pend_model(model, "it shows no input box", refusal) if pend else (False, refusal)
         # The whole-box reading takes hint wording for a hint; only its styling shows it is one.
         if draft or composer_typed(styled) != "":
             return False, "refused: the session's input box holds unsent text; nothing sent"
         shown = self.tm.capture(gen["pane_id"]) or ""
         before, other, asked = accepted_count(model, shown), shown.count(MODEL_SET), shown.count(MODEL_CONFIRM)
+        # The CLI's own settings file, for a [1m] switch answered without a context size (claude_model_switch.settled).
+        settings = os.path.join(self.cfg["CLAUDE_CONFIG_DIR"], "settings.json") if self.cfg.get("CLAUDE_CONFIG_DIR") else ""
+        base = claude_model_switch.baseline(model, shown, settings)
 
         def keys(*names):
             pred = tmux_pane_keys.predicate(gen["nonce"], gen["pane_pid"], gen["session_id"], gen["session_created"],
@@ -649,7 +740,7 @@ class Launcher:
         answered, deadline, text = False, time.monotonic() + wait_s, shown
         while time.monotonic() < deadline:
             text = self.tm.capture(gen["pane_id"]) or ""
-            if accepted_count(model, text) > before:
+            if accepted_count(model, text) > before or (settings and claude_model_switch.settled(model, text, settings, base)):
                 self.log("model: switched to %s" % model)
                 # The switch happened whether or not it is recorded. The writer's private temp is named as
                 # the start check knows one, so a stop mid-write is swept.
@@ -672,6 +763,73 @@ class Launcher:
             return False, ("unconfirmed: /model %s was sent but Claude Code reported a different model; "
                            "nothing recorded" % model)
         return False, "unconfirmed: /model %s was sent but Claude Code did not report the switch in %d s" % (model, wait_s)
+
+    # ── the sign-in: an account switched under the running claude ───────────
+
+    def signin_mark(self, consumer) -> "dict | None":
+        """What the supervisor record keeps of the sign-in a consumer started on; None when unreadable."""
+        now = self.signin.current()
+        return {"fp": signin_watch.fingerprint(now), "consumer": consumer} if now is not None else None
+
+    def send_keys(self, gen: dict, title: str, *names) -> int:
+        pred = tmux_pane_keys.predicate(gen["nonce"], gen["pane_pid"], gen["session_id"], gen["session_created"],
+                                        title_token=title or None)
+        argv = tmux_pane_keys.fence_keys_argv(self.tm.sock, gen["pane_id"], pred, *names, tmux=self.tm.tmux)
+        try:
+            return self.run(argv, capture_output=True, text=True, timeout=tmux_pane_keys.TIMEOUT_S + 5).returncode
+        except (OSError, subprocess.SubprocessError):
+            return tmux_pane_keys.UNCERTAIN
+
+    def signin_check(self, rec: dict) -> "tuple[bool, dict]":
+        """(restarted, record). When `.claude.json` names another account than the one this consumer started
+        with, the session is stopped once its turn is over (the usage-limit menu itself, which no turn gets
+        past, is dismissed first) and its input box is seen empty, and the next tick starts a new one on the
+        new account, which then takes the queued tasks. An unreadable file changes nothing; a consumer this record has no mark for (a new start, a
+        launcher from before this) is marked with the account now on disk and not restarted. A card raised for
+        the session (a limit menu left up is a stall, and raises one) does not hold the restart back: the new
+        session answers what the card asked, and the card is retired with the old one."""
+        now = self.clock()
+        if not rec.get("generation") or now < self.signin_next:
+            return False, rec
+        self.signin_next = now + SIGNIN_CHECK_S
+        mark = self.signin_mark(rec.get("consumer"))
+        if mark is None:
+            return False, rec
+        kept = rec.get("signin") or {}
+        if not kept.get("fp") or kept.get("consumer") != rec.get("consumer"):
+            self._with_record(lambda r: dict(r, signin=mark))
+            return False, dict(rec, signin=mark)       # this tick's observation (a stall) stays in hand
+        if kept["fp"] == mark["fp"]:
+            self.signin_waiting = False
+            return False, rec
+        gen, title = rec["generation"], rec.get("title_token") or ""
+        menu = limit_menu(self.tm.capture(gen["pane_id"]))
+        if not menu and self.observation.get("task") is not None:
+            self.signin_wait("restarting once the current turn ends")
+            return False, rec
+        if menu:
+            self.send_keys(gen, title, "Escape")     # the limit menu holds the input box /exit is typed into
+            self.sleep(0.5)
+        # /exit and Enter go into the input box: never over text the owner has not sent, nor into a box
+        # that cannot be read. Read afresh, after the menu is gone.
+        styled = self.tm.capture(gen["pane_id"], styled=True)
+        if composer_text(styled) != "" or not composer_boxed(styled) or composer_typed(styled) != "":
+            self.signin_wait("restarting once its input box is empty and readable")
+            return False, rec
+        outcome = self.stop_session(rec, "the account it is signed in with changed")
+        if outcome != "stopped":
+            self.signin_wait("restart not done (%s); trying again" % outcome)    # said once per reason
+            return False, rec
+        self.signin_waiting = False
+        if rec.get("hitl"):
+            self.retire_card()
+        return True, self._with_record(lambda r: dict(r, generation=None, signin=None, stall=None, deadline=None))
+
+    def signin_wait(self, what: str) -> None:
+        """Say once why the restart for a changed account is not done yet."""
+        if self.signin_waiting != what:
+            self.log("sign-in: the account changed; " + what)
+            self.signin_waiting = what
 
     def stopped(self, started) -> str:
         self.log("stopped in %.1f s" % (self.clock() - started))
@@ -733,6 +891,10 @@ class Launcher:
             rec = self._with_record(lambda r: dict(r, launcher=task_io.process_identity(), deadline=None))
             self.log("supervising session %s (pane %s)" % (rec["generation"]["session_id"], rec["generation"]["pane_id"]))
         rec = self.observe(rec)
+        restarted, rec = self.signin_check(rec)
+        if restarted:
+            self.adopted = False
+            return None, rec
         if rec.get("stall") and not rec.get("hitl"):
             rec = self.raise_card(rec, card.KIND_STALL, rec["stall"]["checks"])
         return None, self.apply_effects(rec)

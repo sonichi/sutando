@@ -53,7 +53,7 @@
    ],
    "status": "canonical",
    "canonical_for": "running, attributing, reporting, and comparing black-box Sutando benchmarks",
-   "last_verified": "2026-11-24"
+   "last_verified": "2026-11-25"
   },
   "docs/benchmark-reports/2026-08-24-3a73e03.md": {
    "title": "Sutando comprehensive benchmark — 2026-08-24",
@@ -95,8 +95,8 @@
     "contributors"
    ],
    "status": "active",
-   "canonical_for": "verbatim parking for relocated CLAUDE.md detail: marker-migration history, vault python bootstrap, liveness payload schema, PR checklists, chat-path task/result recipes, workspace resolution, vault recipes, per-channel pull namespace, voice session context",
-   "last_verified": "2026-10-10"
+   "canonical_for": "verbatim parking for relocated CLAUDE.md detail: marker-migration history, vault python bootstrap, liveness payload schema, PR checklists, chat-path task/result recipes, workspace resolution, vault recipes, per-channel pull namespace, session continuity and transcript resume limits, voice session context",
+   "last_verified": "2026-11-22"
   },
   "docs/codex-core.md": {
    "title": "Codex CLI as the Sutando core",
@@ -186,7 +186,7 @@
    ],
    "status": "draft",
    "canonical_for": "the shared flock-and-holder lock contract: acquire/wait results, the holder record, the work-root first-act rule and the install boundary that the adapter and notifier locks build on",
-   "last_verified": "2026-10-17"
+   "last_verified": "2026-11-25"
   },
   "docs/design-mediated-capability-layer.md": {
    "title": "Mediated capability layer",

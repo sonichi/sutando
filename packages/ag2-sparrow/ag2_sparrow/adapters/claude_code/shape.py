@@ -54,9 +54,27 @@ SOCKET_PATH_MAX = 100
 PLUGIN = Path(__file__).resolve().with_name("ag2space-inbox")      # package data, shipped in the wheel
 
 
+def shipped_plugin(path) -> bool:
+    """Whether `path` is the plugin of an ag2-sparrow the AG2 app installed and upgrades (this one's, or one in
+    the app's `sparrow/venvs/<version>`). A checkout, a fork or another pip install is the owner's choice."""
+    p = Path(path)
+    if p == PLUGIN:
+        return True
+    parts = p.parts
+    if tuple(parts[-4:]) != ("ag2_sparrow", "adapters", "claude_code", PLUGIN.name) or len(parts) < 10:
+        return False
+    site = p.parents[3]
+    venvs = site.parents[3]     # site-packages -> python3.x -> lib -> <version> -> venvs
+    return (site.name == "site-packages" and venvs.name == "venvs" and venvs.parent.name == "sparrow"
+            and any(site.glob("ag2_sparrow-*.dist-info")))
+
+
 def resolve_plugin_dir(recorded: str) -> tuple:
     """(dir, fell_back): the recorded PLUGIN_DIR when it holds a plugin, else the shipped one; an install
-    from before the plugin moved into the wheel recorded an in-repo dir that no longer exists."""
+    from before the plugin moved into the wheel recorded an in-repo dir that no longer exists. A plugin
+    another ag2-sparrow shipped is this one's: an upgrade must not leave the session on the old plugin."""
+    if recorded and shipped_plugin(recorded):
+        return PLUGIN, False
     if recorded and (Path(recorded) / ".claude-plugin" / "plugin.json").is_file():
         return Path(recorded), False
     return PLUGIN, True
