@@ -60,6 +60,18 @@ class TestRequirement(unittest.TestCase):
         self.assertEqual(r.subject["source"], G.SOURCE)
         self.assertEqual(r.device, {"id": "s", "name": "s"})
 
+    def test_the_yes_and_no_buttons_carry_the_terminals_own_words(self):
+        """A client numbers each button by its row; "No" never matched Claude Code's own row."""
+        prompt = PERM.replace("3. No", "3. No, and tell Claude what to do differently (esc)")
+        options = G.parse_options(prompt)[0]
+        self.assertEqual(options[2], "No, and tell Claude what to do differently (esc)")
+        r = req("permission", prompt)
+        self.assertEqual([a.label for a in r.actions][:2],
+                         ["No, and tell Claude what to do differently (esc)", "Yes"])
+        self.assertEqual([a.label for a in r.actions][:2], [options[2], options[0]],
+                         "each label is its row, as the terminal lists it")
+        self.assertEqual(G._option_label("x" * (G.OPTION_LABEL_MAX + 1), "No"), "No", "too long: the short word")
+
     def test_the_producer_leaves_the_host_to_the_wire(self):
         # One policy, in schema.wire_device: every producer (this gate, driver events,
         # the auth card) gets `host` there, so the gate itself must not add one.
@@ -84,6 +96,23 @@ class TestRequirement(unittest.TestCase):
             self.assertEqual(r.title, "Claude needs you to sign in again")
             self.assertEqual([a.kind for a in r.actions], ["authenticate", "open_terminal"])
             self.assertIsNone(G.keys_for(clicked(r, "authenticate"), LOGIN if gate else None, state))
+
+    def test_a_signed_out_codex_core_never_gets_a_claude_sign_in_card(self):
+        expired = "  ⎿  Login expired · Please run /login"
+        for gate, state, prompt in (("login", "blocked-human", LOGIN), (None, "logged-out", None),
+                                    ("login", "logged-out", expired)):
+            r = G.requirement_for(state, gate, prompt, "s", "d", FALLBACK, runtime="codex")
+            self.assertEqual(r.kind, "auth")
+            self.assertEqual(r.runtime, "codex")
+            text = " ".join([r.title or "", r.message] + [a.label for a in r.actions])
+            self.assertNotIn("Claude", text)
+            self.assertEqual(r.title, "Codex needs you to sign in again")
+            self.assertIn("codex login", r.message)
+
+    def test_an_unnamed_runtime_gets_a_generic_sign_in_card(self):
+        r = G.requirement_for("logged-out", None, None, "s", "d", FALLBACK, runtime="agy")
+        self.assertEqual(r.kind, "auth")
+        self.assertNotIn("Claude", " ".join([r.title or "", r.message] + [a.label for a in r.actions]))
 
     def test_press_enter_is_a_confirmation_that_continues(self):
         r = req("press-enter", PRESS)
@@ -112,6 +141,26 @@ class TestRequirement(unittest.TestCase):
         self.assertEqual(req("permission", PERM).guard, req("permission", PERM).guard)
         self.assertNotEqual(req("permission", PERM).guard, req("permission", PERM, session="t").guard)
         self.assertNotEqual(req("permission", PERM).guard, req("permission", SELECT).guard)
+
+    def test_the_guard_ignores_the_pane_repainting_around_the_dialog(self):
+        framed = "  ─────────\n" + PERM
+        for chrome in ("⏺ Running sleep 5 … · 3s\n", "Sutando: thinking [-]\n  ⎿  Churned for 9s\n"):
+            self.assertEqual(req("permission", chrome + framed).guard, req("permission", framed).guard)
+        self.assertEqual(req("permission", framed + "\n  ⏵⏵ bypass permissions on · 1 monitor").guard,
+                         req("permission", framed).guard)
+        self.assertEqual(req("permission", PERM_CARET_ON_NO).guard, req("permission", PERM).guard)
+
+    def test_everything_inside_the_dialog_still_keys_it(self):
+        edit = ("  ─────────\n  Edit file\n  ╭──────╮\n  │ - a = 1 │\n  │ + a = {} │\n  ╰──────╯\n"
+                "  Do you want to make this edit to a.py?\n  ❯ 1. Yes\n    2. No\n")
+        self.assertNotEqual(req("permission", edit.format(2)).guard, req("permission", edit.format(3)).guard)
+
+    def test_a_numbered_list_above_a_press_enter_gate_does_not_key_it(self):
+        for plan in ("Plan:\n 1. migrate db\n 2. deploy\n", "Pick one:\n ❯ 1. migrate db\n   2. deploy\n"):
+            run = req("press-enter", plan + "Press Enter to run migration\n")
+            delete = plan + "Press Enter to delete backups\n"
+            self.assertNotEqual(run.guard, req("press-enter", delete).guard)
+            self.assertIsNone(G.keys_for(clicked(run, "continue"), delete, "blocked-human"))
 
 
 class TestKeys(unittest.TestCase):
@@ -199,6 +248,21 @@ class TestNeverAOneClickOnATrustOrSpendGate(unittest.TestCase):
 
     def test_the_allowlist_is_the_only_way_in(self):
         self.assertEqual(G.SEMANTIC_GATES, {"permission", "selection", "press-enter", "login"})
+
+
+class TestNoCaretKeepsTheBlockedCard(unittest.TestCase):
+    """Without a caret keys_for can never answer, so the card must not offer a button."""
+
+    def test_options_without_a_caret_get_no_buttons(self):
+        flat = PERM.replace("  ❯ 1. Yes", "    1. Yes")
+        r = req("permission", flat)
+        self.assertEqual(r.kind, G.FALLBACK_KIND)
+        self.assertEqual([a.id for a in r.actions], ["open_terminal"])
+        self.assertEqual(r.message, FALLBACK)
+
+    def test_a_dashed_rule_is_frame_not_question(self):
+        dashed = "  " + "╌" * 40 + "\n  Do you want to proceed?\n  ❯ 1. Yes\n    2. No"
+        self.assertEqual(G.question(dashed, "d"), "Do you want to proceed?")
 
 
 if __name__ == "__main__":

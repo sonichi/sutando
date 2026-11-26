@@ -10,6 +10,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
@@ -104,11 +109,142 @@ class ReplyHandlerTests(unittest.TestCase):
         self.assertEqual((req.status, req.chosen_action), ("in_progress", "allow"))
         self.assertFalse(list(actions_dir(self.ws).glob("*.json")))  # a hook action needs no driver
 
+    def test_authorization_refusal_leaves_the_requirement_pending(self):
+        handler = HitlReplyHandler(
+            self.mgr, OWNER, workspace=self.ws,
+            authorize=lambda ev: "the click is not at owner tier",
+            log=self.logs.append)
+        handler.offer(event(reply_for(self.req, "allow")))
+        self.assertEqual(handler.last_outcome, "refused")
+        self.assertEqual(handler.last_reason, "the click is not at owner tier")
+        self.assertEqual(self.mgr.get(self.req.id).status, "pending")
+
+    def test_room_and_sender_are_bound_to_the_event_envelope(self):
+        req = self.mgr.create(HumanRequirement(
+            kind="permission", runtime="claude", message="Approve this action",
+            guard="hook:room", room="!allowed:x",
+            actions=[Action(id="allow", kind="allow_once", label="Allow")]))
+        payload = reply_for(req, "allow")
+        payload.update(room="!allowed:x", sender="@payload:x")
+        wrong_room = event(payload)
+        wrong_room.update(room_id="!other:x")
+        self.h.offer(wrong_room)
+        self.assertEqual(self.mgr.get(req.id).status, "pending")
+        self.assertEqual(self.h.last_outcome, "rejected")
+
+        seen = []
+        apply = self.mgr.apply_action
+        self.mgr.apply_action = lambda reply: (seen.append(reply), apply(reply))[1]
+        right_room = event(payload, eid="$right")
+        right_room.update(room_id="!allowed:x")
+        self.h.offer(right_room)
+        self.assertEqual(self.mgr.get(req.id).chosen_action, "allow")
+        self.assertEqual((seen[0].room, seen[0].sender), ("!allowed:x", OWNER))
+
     def test_non_owner_is_claimed_but_changes_nothing(self):
         out = self.h.offer(event(reply_for(self.req, "allow"), actor="@stranger:ag2.space"))
         self.assertEqual(out, ["$e1"])
         self.assertEqual(self.mgr.get(self.req.id).status, "pending")
         self.assertTrue(any("non-owner" in l for l in self.logs))
+
+    def _audit_rows(self):
+        path = self.ws / "state" / "recovery" / "audit.jsonl"
+        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+    def test_non_owner_tap_is_audited_as_refused_runs_nothing_and_leaves_the_card(self):
+        from hitl import recovery
+        req = self.mgr.create(HumanRequirement(
+            kind="choice", runtime="claude", message="The core is paused", guard="rec:1",
+            room="!dm:x", subject={"recovery": True},
+            actions=[Action(id=recovery.RETRY_NOW, kind=recovery.kind_of(recovery.RETRY_NOW),
+                            label="Retry now")]))
+        before = self.mgr.get(req.id)
+        ev = event(reply_for(req, recovery.RETRY_NOW), actor="@stranger:ag2.space")
+        ev["room_id"] = "!dm:x"
+        self.assertEqual(self.h.offer(ev), ["$e1"])
+        self.assertEqual(self.h.last_outcome, "ignored")
+        after = self.mgr.get(req.id)
+        self.assertEqual((after.status, after.revision, after.chosen_action, after.subject),
+                         (before.status, before.revision, before.chosen_action, before.subject))
+        self.assertFalse(list(recovery.actions_dir(self.ws).glob("*.json")), "nothing is run")
+        self.assertFalse(list(actions_dir(self.ws).glob("*.json")))
+        [row] = self._audit_rows()
+        self.assertEqual(sorted(row), ["action_id", "at", "hitl_id", "outcome", "reason", "room", "sender"])
+        self.assertEqual((row["hitl_id"], row["action_id"], row["outcome"], row["reason"], row["sender"],
+                          row["room"]),
+                         (req.id, recovery.RETRY_NOW, "refused", "not_owner", "@stranger:ag2.space", "!dm:x"))
+
+    def _stranger(self, action_id, eid="$e1", room="!card:x", actor="@stranger:ag2.space"):
+        ev = event(reply_for(self.req, action_id), actor=actor, eid=eid)
+        ev["room_id"] = room
+        return ev
+
+    def _project_card(self, room="!card:x"):
+        self.mgr.record_projection(self.req.id, self.req.revision, "$card", extra={"room_id": room})
+
+    def test_non_owner_tap_is_recorded_only_from_the_room_its_card_was_posted_in(self):
+        self.h.offer(self._stranger("allow"))
+        self.assertEqual(self._audit_rows(), [], "a card with no known room records no tap")
+        self._project_card()
+        self.h.offer(self._stranger("allow", eid="$o", room="!elsewhere:x"))
+        self.assertEqual(self._audit_rows(), [], "a tap from another room is not a tap on this card")
+        self.assertTrue(any("outside its card's room" in l for l in self.logs))
+        self.h.offer(self._stranger("allow", eid="$c"))
+        [row] = self._audit_rows()
+        self.assertEqual((row["hitl_id"], row["room"]), (self.req.id, "!card:x"))
+        self.assertEqual(self.mgr.get(self.req.id).status, "pending")
+
+    def test_a_non_owner_audit_the_writer_could_not_write_is_logged(self):
+        from unittest import mock
+        from hitl import recovery
+        self._project_card()
+        with mock.patch.object(recovery, "audit_not_owner", return_value=recovery.NOT_RECORDED):
+            self.h.offer(self._stranger("allow"))
+        self.assertTrue(any(f"non-owner audit not written for {self.req.id}" in l for l in self.logs))
+        self.assertEqual(self.mgr.get(self.req.id).status, "pending")
+
+    def test_non_owner_audit_is_one_row_per_card_and_actor(self):
+        self._project_card()
+        for i in range(50):
+            self.h.offer(self._stranger("allow" if i % 2 else "deny", eid=f"$f{i}"))
+        self.h.offer(self._stranger("allow", eid="$o", actor="@other:ag2.space"))
+        rows = self._audit_rows()
+        self.assertEqual(sorted(r["sender"] for r in rows), ["@other:ag2.space", "@stranger:ag2.space"])
+        self.assertEqual(self.mgr.get(self.req.id).status, "pending")
+
+    def test_non_owner_tap_on_an_unknown_card_or_unoffered_action_records_no_free_text(self):
+        self.h.offer(event({"hitl_id": "forged", "expected_revision": 1, "action_id": "allow", "guard": "g"},
+                           actor="@stranger:ag2.space"))
+        self.h.offer(event({"hitl_id": "../../x", "expected_revision": 1, "action_id": "allow", "guard": "g"},
+                           actor="@stranger:ag2.space", eid="$t"))
+        self.assertEqual(self._audit_rows(), [], "a card this store does not hold adds no line")
+        self._project_card()
+        self.h.offer(self._stranger("x" * 500, eid="$u"))
+        [row] = self._audit_rows()
+        self.assertEqual(row["action_id"], "", "only an id the card offered is recorded")
+
+    def test_owner_taps_add_no_not_owner_row(self):
+        self.h.offer(event(reply_for(self.req, "allow")))
+        self.assertEqual([r for r in self._audit_rows() if r.get("reason") == "not_owner"], [])
+
+    def test_non_owner_typed_label_is_a_message_and_is_not_audited(self):
+        self.mgr.record_projection(self.req.id, self.req.revision, "$card")
+        self.h.offer_task(self._task(user_id="@someone-else:ag2.space", reply_to_event="$card", task="Allow"))
+        self.assertEqual(self._audit_rows(), [])
+
+    def test_non_owner_payload_that_is_not_a_reply_is_not_audited(self):
+        self.h.offer(event({"hitl_id": self.req.id}, actor="@stranger:ag2.space"))
+        self.assertEqual(self._audit_rows(), [])
+        self.assertEqual(self.mgr.get(self.req.id).status, "pending")
+
+    def test_a_failed_non_owner_audit_is_logged_and_the_refusal_stands(self):
+        from unittest import mock
+        from hitl import recovery
+        self._project_card()
+        with mock.patch.object(recovery, "audit_not_owner", side_effect=RuntimeError("disk gone")):
+            self.assertEqual(self.h.offer(self._stranger("allow")), ["$e1"])
+        self.assertEqual(self.mgr.get(self.req.id).status, "pending")
+        self.assertTrue(any("non-owner audit not written" in l and "disk gone" in l for l in self.logs))
 
     def test_no_owner_configured_is_inert(self):
         h = HitlReplyHandler(self.mgr, None, workspace=self.ws, log=self.logs.append)
@@ -240,6 +376,12 @@ class ReplyHandlerTests(unittest.TestCase):
                 "> <@agent:ag2.space> Claude wants permission\n> Bash command\n\nDeny")
         self.assertEqual(self.h.offer_task(self._task(reply_to_event="$card", task=text)), "applied")
         self.assertEqual(self.mgr.get(self.req.id).chosen_action, "deny")
+
+    def test_task_event_carries_the_task_access_tier(self):
+        self.assertEqual(self.h.task_to_event(self._task(
+            access_tier="guest", hitl_action=reply_for(self.req, "allow")))["access_tier"], "guest")
+        self.assertNotIn("access_tier", self.h.task_to_event(
+            self._task(hitl_action=reply_for(self.req, "allow"))))
 
     def test_a_quoted_action_without_an_unquoted_answer_stays_a_message(self):
         self.mgr.record_projection(self.req.id, self.req.revision, "$card")

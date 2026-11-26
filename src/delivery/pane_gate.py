@@ -16,7 +16,8 @@ policy. A gate signature counts only while a current input affordance is on scre
 and no empty composer sits under it: a finished turn's prose may say "Select" or
 "Press Enter to continue", and above the runtime's own empty prompt it is history.
 The Claude constants live here and core-input-watch.py aliases them; the
-prompt-line parse lives here and scripts/tmux-send-line.sh calls it.
+prompt-line and composer parse is src/pane_composer.py's, re-exported here, and
+scripts/tmux-send-line.sh calls it through this file.
 
 Boundary: cli_wedge.py stays advisory — it reports idle/moving x healthy/abnormal
 and never decides "send". This gate decides, and only deliver() reaches the one
@@ -29,7 +30,8 @@ CLI:
     python3 src/delivery/pane_gate.py leftover --runtime codex < capture.txt   # exit 0 = clearable
     python3 src/delivery/pane_gate.py healthy --runtime claude < capture.txt   # exit 0 = accepts input
     python3 src/delivery/pane_gate.py deliver <session> <line> --runtime codex
-        [--socket PATH] [--refuse-if-pending] [--skip-if-queued WORD] [--dry-run]
+        [--socket PATH] [--refuse-if-pending] [--skip-if-queued WORD] [--require-limit] [--dry-run]
+    python3 src/delivery/pane_gate.py limit-holds --runtime claude < capture.txt   # exit 0 = limit alone
 """
 
 from __future__ import annotations
@@ -40,33 +42,35 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 _SRC = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_SRC))
-from cli_wedge import (PROVIDER_LIMIT_PATTERNS, capture_pane, core_target,  # noqa: E402
-                       frame_abnormal, frame_working)
+from cli_wedge import (PROVIDER_LIMIT_PATTERNS, FrameAbnormal, capture_pane,  # noqa: E402
+                       core_target, frame_abnormal, frame_working, needs_login_line, normalize,
+                       state_id)
+from file_lock import locked_file  # noqa: E402  (cross-platform; never fcntl directly)
+# The input-box parse is src/pane_composer.py's (bundled for claude-local); re-exported for importers.
+import pane_composer  # noqa: E402
+from pane_composer import (BORDER_LINE, CLAUDE_COMPOSER, CLAUDE_IDLE, COMPOSER_PLACEHOLDER,  # noqa: E402,F401
+                           SGR_STRIP, TIP_ROW, PromptLine, _GHOST, _SGR, _prompt_glyph, after_prompt,
+                           composer_boxed, composer_frame_visible, composer_text, frame_plain,
+                           pending_text, prompt_line)
 from quota_availability import provider_allows_now  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
+# The completed-turn grammar (TURN_DONE) is the sign-in reading's: one copy for both.
+from worker_auth_state import (TURN_DONE, VERB_MARKS, VERB_START, TurnPattern,  # noqa: E402,F401
+                               signed_in_since)
 
 REPO = _SRC.parent
 SEND_LINE = REPO / "scripts" / "tmux-send-line.sh"
 
 #: Non-blank lines a verdict reads — the same window core-input-watch.py reads.
 TAIL_LINES = 14
-
-#: A CSI SGR run (colon or semicolon params, newer tmux emits both) or an OSC
-#: hyperlink (BEL- or ST-terminated) -- anything else is left as real content.
-_SGR = re.compile(r"\x1b\[[0-9:;]*m|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
-#: Public alias for strip-to-plain outside this module (core-input-watch.py's
-#: own derivation) -- one pattern, not a second copy that can drift.
-SGR_STRIP = _SGR
-# Dim (SGR 2) or the 256-colour GREYSCALE RAMP (232-255): styled runs are hint/ghost
-# text only. 200-231 are colour-cube entries, so real coloured input must not match.
-_GHOST = re.compile(
-    r"\x1b\[(?:2|38;5;(?:23[2-9]|24[0-9]|25[0-5]))m.*?(?=\x1b\[(?:0|22|39)m|$)")
 
 STATES = ("idle-ready", "busy", "pending", "abnormal", "unknown")
 
@@ -81,33 +85,138 @@ def state_is_unsafe(state: str) -> bool:
     """True when `state` must not be typed into. Unrecognised states refuse too."""
     return state in UNSAFE_STATES or state not in STATES
 
-# ---- Claude Code pane text. core-input-watch.py imports these three; edit here only.
+# ---- Claude Code pane text. core-input-watch.py imports these (CLAUDE_IDLE is pane_composer's).
 FABLE_TEXT = re.compile(r"reached your Fable limit|included Fable usage for this week", re.I)
-CLAUDE_IDLE = re.compile(r"⏵⏵\s*bypass permissions on|←\s*for agents\b", re.I)
+# The CLI's wait-for-the-reset banner ("Usage limit reached · …", "Continuing automatically at …"); near
+# the reset its second row reads "Continuing shortly · Esc to cancel", often captured without the first.
+LIMIT_WAIT = re.compile(r"Continuing automatically (?:at\b|shortly\b)|Continuing shortly\s*·\s*Esc to cancel"
+                        r"|\b(?:session|usage|weekly) limit reached\b"
+                        # The limit's own title row, "Weekly limit · resets Nov 28 at 1pm": at the row's start,
+                        # so a sentence that names a limit and a reset elsewhere is not one.
+                        r"|^[ \t⎿⚠]*(?:session|usage|weekly) limit\s*·\s*resets?\b", re.I | re.M)
+_LIMIT_NOUN = r"(?:session|usage|weekly) limit"
+_LIMIT_TITLE = re.compile(
+    rf"^[ \t⎿⚠]*(?:You(?:'ve| have) (?:hit|reached|used|exceeded) (?:all of )?your {_LIMIT_NOUN}"
+    rf"|{_LIMIT_NOUN} reached)[ \t]*(?:[.!]?[ \t]*$|·[ \t]*(?:limit )?resets?\b)"
+    rf"|^[ \t⎿⚠]*{_LIMIT_NOUN}[ \t]*·[ \t]*resets?\b"
+    r"|^[ \t⎿⚠]*Continuing (?:automatically at\b|shortly[ \t]*·[ \t]*Esc to cancel[ \t]*$)",
+    re.I | re.M)
+#: A turn this short (or with no duration) may be the CLI refusing it, not running it.
+TURN_SHORT = re.compile(r"[01]s")
+# A turn the CLI refuses outright is a FINISHED turn: the reason is its `⎿` result and the
+# pane returns to the idle footer, so no gate is on screen. Explicit list, extended by hand.
+LIMIT_REFUSAL = re.compile(
+    r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit"
+    # The CLI's own line: "You've used your weekly limit · resets …" opening its row and ending its clause.
+    r"|(?:\A|(?<=\n)|(?<=⎿))[ \t⎿⚠]*You(?:'ve| have) (?:reached|used|exceeded) (?:all of )?your"
+    r" (?:session|usage|weekly) limit(?=[ \t]*(?:[·.!\n]|\Z))", re.I)
+REFUSAL = re.compile(
+    LIMIT_REFUSAL.pattern
+    # A bare "not logged in" is a refusal only as the CLI's own line-start `⎿` row.
+    + r"|^⎿?\s*(?:you(?:'re| are) )?not logged in\b", re.I)
+
+
+def refusal_line(line: str) -> bool:
+    """A limit refusal, or the CLI's needs-login line (cli_wedge's one grammar)."""
+    return bool(REFUSAL.search(line)) or needs_login_line(line)
 # First match classifies; the idle "❯ " prompt matches none of them.
 CLAUDE_GATE_SIGNATURES: List[Tuple[str, "re.Pattern[str]"]] = [
     ("fable-limit", re.compile(r"❯\s*Switch to .{1,80}? and continue", re.I)),
     ("fable-limit-unfocused", FABLE_TEXT),
     ("session-limit", re.compile(r"hit your (?:session|usage|weekly) limit", re.I)),
-    ("folder-trust", re.compile(r"trust the files in this folder|Do you trust", re.I)),
+    ("usage-limit", LIMIT_WAIT),
+    # Codex 0.160 asks "Trust this folder?"; Claude Code, "Do you trust the files in this folder?".
+    ("folder-trust", re.compile(r"trust the files in this folder|Do you trust|Trust this folder\?", re.I)),
     ("bypass-permissions", re.compile(r"Bypass Permissions mode|Yes, I accept", re.I)),
     ("login", re.compile(r"Select login method|Paste code here|Browser didn'?t open", re.I)),
     ("press-enter", re.compile(r"Press Enter to continue", re.I)),
     ("selection", re.compile(r"(❯\s*\d+\.|\bSelect\b).*", re.S)),
     ("permission", re.compile(r"Do you want to (proceed|allow)|Allow this action|permission to", re.I)),
 ]
+# The gate kinds above that are a usage limit (the wait banner, the limit menu).
+LIMIT_GATES = frozenset({"session-limit", "usage-limit"})
+
+
+def limit_line(line: str) -> bool:
+    """One line of the limit's own words: the wait banner, the menu title or a refusal."""
+    return bool(LIMIT_WAIT.search(line) or LIMIT_REFUSAL.search(line))
+
+
+def limit_standing(pane: Optional[str], runtime: Optional[str] = None, outrun: bool = False) -> bool:
+    """A limit line is on the pane and no turn did work after it. A delivery the limit
+    refuses repaints the pane without ending the episode; only work or no limit text does.
+    `outrun`: the caller judged the banner under the composer stale, so it is not evidence."""
+    if not (pane and pane.strip()):
+        return True  # no evidence either way: the episode stands
+    lines = (strip_limit_banners(pane) if outrun else pane).splitlines()
+    last = max((i for i, ln in enumerate(lines) if limit_line(ln)), default=None)
+    return last is not None and not signed_in_since("\n".join(lines[last + 1:]), runtime)
+
+
+_NUMBERED_ROW = re.compile(r"^\s*(?:❯\s*)?\d+\.\s")
+_CARET_ROW = re.compile(r"^\s*❯\s*\d+\.\s")
+# The CLI limit menu's own rows have one source, shared with claude-local (src/pane_composer.py).
+_LIMIT_MENU_STOP, _LIMIT_MENU_MORE = pane_composer.LIMIT_MENU_STOP, pane_composer.LIMIT_MENU_MORE
+
+
+def _dialog_names_limit(text: str) -> bool:
+    """The live numbered dialog's own text, back to the turn above it, names a limit."""
+    lines = (text or "").splitlines()
+    rows = [i for i, ln in enumerate(lines) if _CARET_ROW.match(ln)] or \
+        [i for i, ln in enumerate(lines) if _NUMBERED_ROW.match(ln)]
+    if not rows:
+        return False
+    start = rows[-1]
+    while start > 0 and _NUMBERED_ROW.match(lines[start - 1]):
+        start -= 1
+    end = rows[-1]
+    while end + 1 < len(lines) and _NUMBERED_ROW.match(lines[end + 1]):
+        end += 1
+    # Only a live dialog's rows (a caret on one): a numbered list in a reply is not a menu.
+    live = any(_CARET_ROW.match(ln) for ln in lines[start:end + 1])
+    menu = lines[start:end + 1]
+    if live and any(_LIMIT_MENU_STOP.match(ln) for ln in menu) and any(_LIMIT_MENU_MORE.match(ln) for ln in menu):
+        return True
+    for line in reversed(lines[:start]):
+        core = line.strip()
+        if not core:
+            continue
+        if core[0] in "✻⎿●⏺" or (core.startswith("❯") and core.lstrip("❯").strip()):
+            return False  # the turn above the dialog: its words are not the dialog's
+        if _LIMIT_TITLE.search(core):
+            return True
+    return False
+
+
+def is_usage_limit(kind: Optional[str], text: Optional[str]) -> bool:
+    """`kind` (a gate signature, or turn-rejected) on `text` waits on a usage limit: the
+    wait banner, the limit menu (classified `selection`, its caret row being lowest) or a
+    turn refused for a limit."""
+    if kind in LIMIT_GATES:
+        return True
+    if kind == "turn-rejected":
+        return bool(LIMIT_REFUSAL.search(text or ""))
+    return kind in ("selection", "unknown") and _dialog_names_limit(text or "")
+
+
 # A dialog that holds the input shows how to answer it: a caret on a numbered row or a key hint.
 AWAIT_HINT = re.compile(
     r"Esc to cancel|Enter to confirm|Enter to select|to navigate|Press Enter|Paste code|to accept"
     r"|Continuing automatically|❯\s*\d+\.", re.I)
-# The completed-turn line: "✻ Worked for 0s" / "✻ Cooked for 1s · done 12:32 PM". The spinner
-# reuses the glyph ("✻ Perambulating… (1m 46s · …)") and must not match.
-TURN_DONE = re.compile(
-    r"^\s*✻\s+[A-Za-z]+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?\s*$")
 # A turn's spinner ("✳ Moonwalking… (15s · …)") or completion line: transcript above, live dialog
 # below. Not "esc to interrupt": the busy footer carries it, under any live dialog.
-_SPINNER_ROW = re.compile(r"^\s*[·✢✳✶✻✽*]\s+[A-Za-z][\w-]*(?:…|\.\.\.)\s*\(")
-_TURN_ROW = re.compile(rf"{_SPINNER_ROW.pattern}|{TURN_DONE.pattern}")
+_SPINNER_ROW = TurnPattern(rf"^\s*[·✢✳✶✻✽*]\s+{VERB_START}(?:[\w-]|[{VERB_MARKS}])*(?:…|\.\.\.)\s*\(")
+_TURN_ROW = TurnPattern(rf"{_SPINNER_ROW.pattern}|{TURN_DONE.pattern}")
+
+
+def turn_status(lines: List[str]) -> Optional[List[str]]:
+    """The last turn row and the lines below it (its status line and footer) while that row is a
+    live spinner; None when the last turn row is a completion line or there is none."""
+    for i in range(len(lines) - 1, -1, -1):
+        row = _SGR.sub("", lines[i])
+        if _TURN_ROW.search(row):
+            return lines[i:] if _SPINNER_ROW.search(row) else None
+    return None
 
 
 def live_tail(lines: List[str]) -> List[str]:
@@ -132,11 +241,14 @@ class RuntimeAdapter:
     automation_leftovers: Tuple[str, ...] = ()
     # The runtime's dispatcher waits for idle-ready, so a draft holds every queued task.
     pending_blocks_dispatch: bool = False
+    composer_requires_single_line: bool = False
+    # The CLI draws a running turn as a spinner row above the composer (turn_running reads it).
+    spinner_turns: bool = False
 
 
 CLAUDE = RuntimeAdapter(
-    name="claude", glyph="❯", idle_ready=CLAUDE_IDLE,
-    gate_signatures=tuple(CLAUDE_GATE_SIGNATURES),
+    name="claude", glyph=CLAUDE_COMPOSER.glyph, idle_ready=CLAUDE_IDLE,
+    gate_signatures=tuple(CLAUDE_GATE_SIGNATURES), spinner_turns=True,
 )
 # Codex's composer glyph varies by CLI version; its model row is the idle footer.
 CODEX_IDLE = re.compile(
@@ -146,21 +258,18 @@ CODEX_IDLE = re.compile(
 CODEX_PICKER_ROW = re.compile(r"[›»]\s*\d+\.")
 CODEX = RuntimeAdapter(
     name="codex", glyph="›", idle_ready=CODEX_IDLE,
-    gate_signatures=tuple(CLAUDE_GATE_SIGNATURES) + (("selection", CODEX_PICKER_ROW),),
+    gate_signatures=(("session-limit", _LIMIT_TITLE),) + tuple(
+        (kind, pattern) for kind, pattern in CLAUDE_GATE_SIGNATURES if kind not in LIMIT_GATES
+    ) + (("selection", CODEX_PICKER_ROW),),
     await_hint=re.compile(f"{AWAIT_HINT.pattern}|{CODEX_PICKER_ROW.pattern}", re.I),
     alternate_glyphs=("»",),
     idle_requires_prompt=True,
     # Codex rejects Claude's /startup and leaves it in the composer.
     automation_leftovers=("/startup",),
     pending_blocks_dispatch=True,
+    composer_requires_single_line=True,
 )
 ADAPTERS = {CLAUDE.name: CLAUDE, CODEX.name: CODEX}
-
-
-@dataclass(frozen=True)
-class PromptLine:
-    text: str
-    placeholder: bool
 
 
 @dataclass(frozen=True)
@@ -180,186 +289,84 @@ class Outcome:
     message: str
 
 
-def _prompt_glyph(raw: str, adapter: RuntimeAdapter) -> Optional[str]:
-    plain = _SGR.sub("", raw).lstrip(" \t")
-    return next((glyph for glyph in (adapter.glyph, *adapter.alternate_glyphs)
-                 if plain.startswith(glyph)), None)
-
-
-def prompt_line(capture: str, adapter: RuntimeAdapter, width: int = 0) -> Optional[PromptLine]:
-    """The LAST line starting with the runtime's glyph (scrollback holds old ones):
-    its input is what follows the glyph and one optional space/nbsp, with any
-    styled hint (dim placeholder, grey ghost suggestion) dropped first -- typed
-    text is unstyled on both runtimes, so a styled run after the glyph is never
-    pending. None = no prompt seen."""
-    lines_ = capture.splitlines()
-    last_i, found = -1, None
-    for i, raw in enumerate(lines_):
-        glyph = _prompt_glyph(raw, adapter)
-        if glyph is None:
-            continue
-        rest_raw = raw[raw.find(glyph) + len(glyph):]
-        rest_ghostless, n = _GHOST.subn("", rest_raw)
-        rest = _SGR.sub("", rest_ghostless)
-        placeholder = n > 0
-        if rest[:1] in (" ", "\u00a0"):
-            rest = rest[1:]
-        last_i, found, last_raw = i, PromptLine(rest.rstrip(), placeholder), rest_raw
-    if found is None or width <= 0:
-        return found
-    raw_parts = [last_raw]
-    prev_full = len(_SGR.sub("", lines_[last_i])) >= width
-    for nxt in lines_[last_i + 1:]:
-        if not prev_full:
-            break
-        plain = _SGR.sub("", nxt)
-        if _prompt_glyph(nxt, adapter) is not None:
-            break
-        raw_parts.append(nxt)
-        prev_full = len(plain) >= width
-    # A ghost run opened on the prompt row stays open across the wrap, and its continuation
-    # rows carry no SGR of their own -- strip AFTER joining, or the tail reads as input.
-    joined_ghostless, n = _GHOST.subn("", "".join(raw_parts))
-    joined = _SGR.sub("", joined_ghostless)
-    if joined[:1] in (" ", " "):
-        joined = joined[1:]
-    return PromptLine(joined.rstrip(), n > 0)
-
-
-def pending_text(capture: str, adapter: RuntimeAdapter, width: int = 0) -> Optional[str]:
-    """Text typed at the current prompt; "" when the composer is empty; None when no prompt is seen."""
-    line = prompt_line(capture, adapter, width)
-    return None if line is None else line.text
-
-
-def after_prompt(capture: str, adapter: RuntimeAdapter, width: int = 0) -> str:
-    """Everything BELOW the current prompt line, colour stripped -- a fingerprint of the
-    rest of the pane. A prompt line matching a staged payload is not proof the composer
-    is still live: it can be a stale line from before a gate appeared beneath it. Callers
-    doing a delayed re-check (tmux-send-line.sh's Codex path) must also require this be
-    unchanged, not just the prompt text. "" when no prompt line was found at all."""
-    lines_ = capture.splitlines()
-    last_i = -1
-    for i, raw in enumerate(lines_):
-        if _prompt_glyph(raw, adapter) is not None:
-            last_i = i
-    if last_i < 0:
-        return ""
-    end = last_i
-    if width > 0:
-        # A wrapped composer continues onto rows with no glyph; they are input, not content
-        # below it, so the fingerprint must start after the last continuation row.
-        prev_full = len(_SGR.sub("", lines_[last_i])) >= width
-        for j in range(last_i + 1, len(lines_)):
-            if not prev_full:
-                break
-            plain = _SGR.sub("", lines_[j])
-            if _prompt_glyph(lines_[j], adapter) is not None:
-                break
-            end = j
-            prev_full = len(plain) >= width
-    return "\n".join(_SGR.sub("", x).strip() for x in lines_[end + 1:])
-
-
-#: A pane-border/rule row (box-drawing chars only) -- never legitimate composer text.
-BORDER_LINE = re.compile(r"^[\s─-╿]+$")
-# The CLI's hint in an EMPTY composer (`❯ Try "refactor <filepath>"`); it vanishes
-# on the first typed character, so it is never a draft. Plain capture loses its dimming.
-COMPOSER_PLACEHOLDER = re.compile(
-    r'^\s*❯\s*(?:Try "[^"\n]*"|Press up to edit queued messages)\s*$')
-# A single hint line the CLI prints below its own idle footer; only the fixed
-# "Tip:" lead-in is matched, since the tip text itself rotates release to release.
-TIP_ROW = re.compile(r"Tip:\s")
-
-
-def composer_text(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[str]:
-    """The composer's full typed content, dewrapped, or None with no <glyph> line
-    at all; "" for an empty composer. The ONE parser for task-notifier.sh's
-    EXACT-equality staging checks -- core-input-watch.py's `_composer_text`
-    aliases this rather than re-deriving it.
-
-    From the bottommost prompt line to the end of the capture. Below an editable
-    composer the CLI renders its own frame -- box rule(s), at most one idle-footer
-    row, at most one hint/tip row -- so the strip removes exactly those, once each,
-    from the back. It never re-classifies an interior row: an owner's own typed
-    line that happens to read one of those rows' words survives, because only the
-    LAST matching row of each kind is ever popped, and never a second time. The cut
-    at the closing rule follows the same rule: the LAST rule row, never an interior one.
-    """
-    lines = [ln for ln in capture.splitlines() if ln.strip()]
-    start = None
-    for i in range(len(lines) - 1, -1, -1):
-        if _prompt_glyph(lines[i], adapter) is not None:
-            start = i
-            break
-    if start is None:
-        return None
-    block = lines[start:]
-    # The CLI boxes the composer: everything past its closing rule is frame (footer, tip,
-    # "⧉ <artifact>" strip). The LAST rule is the closing one; an interior rule is typed text.
-    for i in range(len(block) - 1, 0, -1):
-        if BORDER_LINE.match(block[i]):
-            block = block[:i]
-            break
-
-    def _pop_borders():
-        while len(block) > 1 and BORDER_LINE.match(block[-1]):
-            block.pop()
-
-    _pop_borders()
-    # A tip row renders below the idle-footer row, so it is popped first --
-    # else the idle-footer check below never reaches its own trailing row.
-    if len(block) > 1 and TIP_ROW.search(block[-1]):
-        block.pop()
-    _pop_borders()
-    if len(block) > 1 and adapter.idle_ready.search(block[-1]):
-        block.pop()
-    _pop_borders()
-    if not block or (len(block) == 1 and COMPOSER_PLACEHOLDER.match(block[0])):
-        return ""
-    block[0] = prompt_line(block[0], adapter).text
-    return "".join(block)
-
-
-def composer_frame_visible(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[bool]:
-    """Whether the CLI's frame below the composer (its closing rule, the idle footer) is
-    on screen; None with no <glyph> line. False = the box is cut by the screen bottom, so
-    its last rows are unseen and no capture can show where the typed text ends."""
-    lines = [ln for ln in capture.splitlines() if ln.strip()]
-    start = None
-    for i in range(len(lines) - 1, -1, -1):
-        if _prompt_glyph(lines[i], adapter) is not None:
-            start = i
-            break
-    if start is None:
-        return None
-    for row in lines[start + 1:]:
-        if BORDER_LINE.match(row) or adapter.idle_ready.search(row):
-            return True
-    return False
-
-
 def _tail_lines(capture: str) -> List[str]:
     """The last TAIL_LINES non-blank lines, attributes kept (the composer parse needs them)."""
     return [ln for ln in capture.splitlines() if _SGR.sub("", ln).strip()][-TAIL_LINES:]
 
 
-def gate_evidence(tail: str, styled_tail: Optional[str] = None,
-                  adapter: RuntimeAdapter = CLAUDE) -> str:
-    """Exclude idle chrome, verified ghost suggestions and completed conditional recaps."""
+# One row of the composer's slash-command completion list ("❯ /model   Set the AI model…").
+_SLASH_MENU_ROW = re.compile(r"^\s*(?:[❯›]\s*)?/[\w:@.-]+\s{2,}(?=\S)")
+
+
+def _slash_menu_rows(rows: List[str]) -> set:
+    """Indexes of slash-command completion rows and their wrapped description lines: command
+    descriptions, never a dialog's words, though they may quote one ("…to accept it")."""
+    out, col = set(), None
+    for i, row in enumerate(rows):
+        plain = _SGR.sub("", row)
+        m = _SLASH_MENU_ROW.match(plain)
+        if m:
+            out.add(i)
+            col = m.end()
+        elif col is not None and plain.strip() and len(plain) - len(plain.lstrip(" ")) >= col:
+            out.add(i)
+        else:
+            col = None
+    return out
+
+
+def _slash_menu(tail: str, styled_tail: Optional[str], adapter: RuntimeAdapter):
+    """(rows, prompt line, composer index, completion-list row indexes) of `tail`."""
     rows = tail.splitlines()
     line = prompt_line(styled_tail if styled_tail is not None else tail, adapter)
     composer_i = next((i for i in range(len(rows) - 1, -1, -1)
                        if _prompt_glyph(rows[i], adapter) is not None), None)
+    menu = (_slash_menu_rows(rows[:composer_i])
+            if composer_i is not None and line is not None and line.text.lstrip().startswith("/")
+            else set())
+    return rows, line, composer_i, menu
+
+
+def slash_menu_gate_rows(tail: str, styled_tail: Optional[str] = None,
+                         adapter: RuntimeAdapter = CLAUDE) -> List[str]:
+    """Wrapped description lines of a completion list, per contiguous run, whose run holds a
+    gate signature and an await hint (on one line or split). Indentation cannot tell such a
+    run from a dialog's, so it is never an answerable gate: callers surface it to a human,
+    and never send a key for it."""
+    rows, _, _, menu = _slash_menu(tail, styled_tail, adapter)
+    runs: List[List[int]] = []
+    for i in sorted(menu):
+        if _SLASH_MENU_ROW.match(_SGR.sub("", rows[i])):
+            continue
+        if runs and runs[-1][-1] == i - 1:
+            runs[-1].append(i)
+        else:
+            runs.append([i])
+    out: List[str] = []
+    for run in runs:
+        text = "\n".join(rows[i] for i in run)
+        if adapter.await_hint.search(text) and any(rx.search(text) for _, rx in adapter.gate_signatures):
+            out.extend(rows[i] for i in run)
+    return out
+
+
+def gate_evidence(tail: str, styled_tail: Optional[str] = None,
+                  adapter: RuntimeAdapter = CLAUDE) -> str:
+    """Exclude idle chrome, verified ghost suggestions, completed conditional recaps and the
+    completion list a slash command in the composer opens."""
+    rows, line, composer_i, menu = _slash_menu(tail, styled_tail, adapter)
     completed = (composer_i is not None and line is not None and not line.text.strip()
                  and any(row.strip() == "Nothing needs you this round."
                          for row in rows[:composer_i]))
     kept = []
     for i, row in enumerate(rows):
+        if i in menu:
+            continue
         signatures = any(rx.search(row) for _, rx in adapter.gate_signatures)
         if adapter.idle_ready.search(row) and not signatures:
             continue
-        if i == composer_i and line and line.placeholder and not line.text.strip():
+        # A dialog's caret row styles its option number grey, which reads as a ghost composer.
+        if i == composer_i and line and line.placeholder and not line.text.strip() and not signatures:
             continue
         # A marker alone cannot distinguish a live instruction from completed output.
         if (completed and i < composer_i and not signatures
@@ -384,22 +391,25 @@ def _gate(capture: str, tail: str, line: Optional[PromptLine], adapter: RuntimeA
         footer_hits = list(adapter.idle_ready.finditer(tail))
         beyond_footer = tail[footer_hits[-1].end():] if footer_hits else ""
         newer = "\n".join(part for part in (following, beyond_footer) if part.strip())
+        menu_gates = slash_menu_gate_rows(newer, adapter=adapter)
         newer = gate_evidence(newer, adapter=adapter)
         if not newer or not adapter.await_hint.search(newer):
-            return None
+            return "unlisted" if menu_gates else None
         for kind, rx in adapter.gate_signatures:
             if rx.search(newer):
                 return kind
         # An await hint we cannot name is an UNRECOGNISED dialog, not the absence of one.
         # Falling through to "no gate" let a stale empty composer vouch for a live dialog.
         return "unlisted"
-    tail = gate_evidence(tail, "\n".join(_tail_lines(capture)), adapter)
+    styled = "\n".join(_tail_lines(capture))
+    menu_gates = slash_menu_gate_rows(tail, styled, adapter)
+    tail = gate_evidence(tail, styled, adapter)
     if not adapter.await_hint.search(tail):
-        return None
+        return "unlisted" if menu_gates else None
     for kind, rx in adapter.gate_signatures:
         if rx.search(tail):
             return kind
-    return None
+    return "unlisted" if menu_gates else None
 
 
 def automation_leftover(capture: Optional[str], adapter: RuntimeAdapter, workspace=None,
@@ -418,6 +428,16 @@ def automation_leftover(capture: Optional[str], adapter: RuntimeAdapter, workspa
     return v.pending if composer_text(capture, adapter) == v.pending else None
 
 
+# Dialogs only a person clears; a headless core shown one stays there, queued work or not.
+# Approvals and pickers are absent: the core's own turn raises and answers those.
+PERSON_ONLY_GATES = ("folder-trust", "bypass-permissions", "login")
+
+
+def waits_for_a_person(verdict: Verdict) -> bool:
+    """True when the pane is held by a dialog that no automation will answer."""
+    return verdict.state == "busy" and verdict.reason in PERSON_ONLY_GATES
+
+
 def blocks_dispatch(verdict: Verdict, adapter: RuntimeAdapter) -> bool:
     """True when this pane holds every queued task: an abnormal frame on any runtime, or a
     draft on a runtime whose dispatcher waits for idle-ready."""
@@ -433,21 +453,194 @@ def accepts_input(verdict: Verdict) -> bool:
     return verdict.state == "busy" and verdict.reason == "working"
 
 
-def _limit_is_stale(abn, workspace, socket, session, probe=False) -> bool:
-    """A quota-only banner beside a FRESH proxy record that says accepted, on a seat
-    whose own traffic is ROUTED through that proxy, is a line from before the reset:
-    scrollback, not a hold. Anything else keeps the hold -- another abnormal family,
-    an unrouted or unobserved seat, or a record absent, stale or rejected. A retry
-    never reaches here: classify_pane returns on it before any gate."""
-    if abn.kind != "provider-limit":
+def _turns(capture: str) -> List[Tuple[str, bool]]:
+    """(key, ran) per completed turn on screen, oldest first. `ran`: longer than 1s and no
+    refusal line in its output. Keyed by `✻ … done <time>` so a changing suffix is one turn."""
+    turns, refused = [], False
+    for ln in (capture or "").splitlines():
+        plain = _SGR.sub("", ln)
+        m = TURN_DONE.match(plain)
+        if not m:
+            # A prompt row starts the next turn; a refusal above it was the last one's.
+            refused = (refused and not plain.lstrip().startswith("❯")) or refusal_line(plain.strip())
+            continue
+        ran = bool(m.group("dur")) and not TURN_SHORT.fullmatch(m.group("dur")) and not refused
+        turns.append((re.sub(r"(\bdone\s+\S+(?:\s*[AP]M)?).*", r"\1", m.group(0).strip()), ran))
+        refused = False
+    return turns
+
+
+def finished_turns(capture: str) -> frozenset:
+    """The completed turns on screen that ran (see `_turns`)."""
+    return frozenset(key for key, ran in _turns(capture) if ran)
+
+
+def _below_composer(capture: str) -> List[str]:
+    """The rows under the last prompt row: where the CLI draws its status banners."""
+    lines = (capture or "").splitlines()
+    last = max((i for i, ln in enumerate(lines) if _SGR.sub("", ln).lstrip().startswith("❯")),
+               default=len(lines) - 1)
+    return lines[last + 1:]
+
+
+# What still moves on a waiting pane's finished turns: a status glyph the CLI cycles and a
+# bare count ("1 monitor still running"). cli_wedge keeps counts for its frozen-turn test.
+_STATUS_GLYPH = re.compile(r"^(\s*)[✻✶✳✢✽✺✹✷✸✦✧∗]\s+", re.MULTILINE)
+_COUNT = re.compile(r"\d+")
+
+
+def progress_id(capture: str) -> str:
+    """Identity of the work on screen: the rows above the composer, with clocks, durations,
+    spinners, status glyphs and bare counts normalised away. Status rows under it (footer
+    counters, a limit banner) are not work. Compared across ticks of a waiting pane, whose
+    rows above the composer are finished turns: text that advances is progress, a counter
+    that ticks is not."""
+    lines = (capture or "").splitlines()
+    above = normalize("\n".join(lines[:len(lines) - len(_below_composer(capture))]))
+    return state_id(_COUNT.sub("#", _STATUS_GLYPH.sub(r"\1<glyph> ", above)))
+
+
+def _limit_row(ln: str) -> bool:
+    plain = _SGR.sub("", ln)
+    abn = frame_abnormal(plain)
+    return limit_line(plain) or (
+        abn is not None and all(n in PROVIDER_LIMIT_PATTERNS for n in abn.names))
+
+
+def limit_banner(capture: str) -> Optional[FrameAbnormal]:
+    """The provider-limit verdict for the banner under the composer, else None. The CLI's
+    "Usage limit reached" banner is not one of cli_wedge's whole-line banners, so its own
+    signature vouches for the family here only; dispatch verdicts are unchanged."""
+    below = "\n".join(_below_composer(capture))
+    abn = frame_abnormal(below)
+    if abn is not None:
+        return abn if abn.kind == "provider-limit" else None
+    return FrameAbnormal("provider-limit", ("quota-limit",), False) if LIMIT_WAIT.search(below) else None
+
+
+@dataclass(frozen=True)
+class LimitBaseline:
+    banner: Tuple[str, ...]   # the banner rows, reset time included
+    seen: frozenset           # every completed turn on screen when that banner was first seen
+
+
+def limit_baseline(capture: str) -> LimitBaseline:
+    return LimitBaseline(tuple(_SGR.sub("", ln).strip() for ln in _below_composer(capture)
+                               if _limit_row(ln)),
+                         frozenset(key for key, _ in _turns(capture)))
+
+
+# A spinner's clock: its first `·` field that is only a duration ("2m 37s"), never a
+# suffix such as "thought for 4s".
+_CLOCK = re.compile(r"\d+[hms](?:\s+\d+[hms])*")
+_UNIT_S = {"h": 3600, "m": 60, "s": 1}
+
+
+def spinner_elapsed(row: str) -> Optional[int]:
+    """Seconds on a spinner row's own clock, else None."""
+    inner = row.partition("(")[2].rpartition(")")[0]
+    for field in inner.split("\u00b7"):
+        if _CLOCK.fullmatch(field.strip()):
+            return sum(int(t[:-1]) * _UNIT_S[t[-1]] for t in field.split())
+    return None
+#: A delivery the limit refuses ends within seconds; a turn running longer was served.
+FLIGHT_MIN_S = 10
+# A turn waiting rather than working: a limit, a retry or a cancellable wait on its rows.
+_WAIT_TEXT = re.compile(r"\bretry(?:ing)?\b|\brate[ -]?limit|\boverloaded\b|\battempt \d+"
+                        r"|esc to cancel|\b429\b", re.I)
+
+
+def _waiting_row(plain: str) -> bool:
+    return bool(limit_line(plain) or _WAIT_TEXT.search(plain) or frame_abnormal(plain))
+
+
+def _live_spinner(capture: Optional[str]) -> Optional[List[str]]:
+    """Plain rows from the newest turn row above the composer down, when that row is a spinner
+    drawn at column 0, as the CLI draws its live one. Reply and tool text are indented."""
+    lines = (capture or "").splitlines()
+    rows = turn_status([_SGR.sub("", ln) for ln in lines[:len(lines) - len(_below_composer(capture))]])
+    return rows if rows and not rows[0][:1].isspace() else None
+
+
+def turn_running(capture: Optional[str], adapter: RuntimeAdapter = CLAUDE, waits: bool = True) -> bool:
+    """A turn is running: the newest turn row above the composer is a spinner, drawn from the
+    turn's first second (Claude Code 2.1.322 prints no "esc to interrupt" while a turn runs).
+    `waits` False: a spinner that names a limit, a retry or a wait is waiting, not running."""
+    rows = _live_spinner(capture) if adapter.spinner_turns else None
+    return rows is not None and (waits or not any(_waiting_row(r) for r in rows))
+
+
+def turn_in_flight(capture: Optional[str]) -> bool:
+    """The newest turn row above the composer is a spinner that has run FLIGHT_MIN_S or more,
+    and neither it nor a row under it names a limit, a retry or a wait: the seat is mid-turn,
+    so a limit banner under the composer is from before it."""
+    rows = _live_spinner(capture)
+    if rows is None or any(_waiting_row(r) for r in rows):
+        return False
+    ran = spinner_elapsed(rows[0])
+    return ran is not None and ran >= FLIGHT_MIN_S
+
+
+def strip_limit_banners(capture: str) -> str:
+    """`capture` without the limit banner under its composer, for a caller that has judged
+    it stale. Rows inside turns (a refusal) are evidence and stay."""
+    lines = capture.splitlines()
+    first_below = len(lines) - len(_below_composer(capture))
+    return "\n".join(ln for i, ln in enumerate(lines) if i < first_below or not _limit_row(ln))
+
+
+def signed_in_after_limit(capture: Optional[str], runtime: Optional[str] = None) -> bool:
+    """The CLI signed in again ("Login successful", or work it did) after the pane's last
+    limit row: the limit belongs to the account /login replaced, not to the seat now."""
+    lines = [_SGR.sub("", ln) for ln in (capture or "").splitlines()]
+    last = max((i for i, ln in enumerate(lines) if _limit_row(ln)), default=None)
+    return last is not None and signed_in_since("\n".join(lines[last + 1:]), runtime)
+
+
+def limit_is_stale(abn, workspace, socket, session, probe=False, capture=None, baseline=None) -> bool:
+    """A quota-only banner is a line from before the reset, scrollback, not a hold, when
+    the seat shows it is not held: a turn is in flight above the composer, the CLI signed in
+    again after the limit (signed_in_after_limit), the newest turn
+    finished since `baseline` (limit_baseline of the first capture showing the banner) ran,
+    or a FRESH proxy record says accepted for a seat ROUTED through that proxy. A newest
+    turn that was refused holds whatever the record says. Anything else keeps the hold --
+    another abnormal family, no newer turn, an unrouted or unobserved seat, or a record
+    absent, stale or rejected. A retry never reaches here: classify_pane returns on it
+    before any gate."""
+    if abn is None or abn.kind != "provider-limit":
         return False
     if any(n not in PROVIDER_LIMIT_PATTERNS for n in abn.names):
         return False
+    if turn_in_flight(capture):
+        return True
+    if signed_in_after_limit(capture):
+        return True
+    if capture is not None and baseline is not None:
+        new = [ran for key, ran in _turns(capture) if key not in baseline.seen]
+        if new:
+            return new[-1]
     try:
         ws = workspace if workspace is not None else resolve_workspace()
         return provider_allows_now(ws, socket, session, probe=probe)
     except Exception:  # noqa: BLE001 -- an unreadable record is not permission
         return False
+
+
+def limit_step(pane, baseline, workspace=None, socket=None, session=None, owes_work=True):
+    """(stale, baseline) for this poll's limit banner. The baseline is taken when a banner
+    first shows, and again when its text changes; the newest turn since then decides.
+    A banner holds nothing on a seat that owes no work (`owes_work` False). An unknown
+    queue (None) holds like an owed one: a count that could not be read is not zero.
+    The seat monitor and the pool sweep both judge staleness here."""
+    abn = limit_banner(pane or "")
+    if abn is None:
+        return False, None
+    current = limit_baseline(pane)
+    if baseline is None or baseline.banner != current.banner:
+        baseline = current
+    if owes_work is False:
+        return True, baseline
+    return limit_is_stale(abn, workspace, socket, session, capture=pane, baseline=baseline), baseline
 
 
 def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=None,
@@ -472,11 +665,13 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=Non
     # _gate's after_prompt() must see the same capture line was found in, or
     # it computes "below" from a view that never contained that line at all.
     gate = _gate(capture, "\n".join(_SGR.sub("", ln) for ln in live_tail(lines)), line, adapter)
+    if gate in LIMIT_GATES and turn_in_flight(capture):
+        return Verdict("busy", "working")
     if gate:
         return Verdict("busy", gate)
-    if abn and not _limit_is_stale(abn, workspace, socket, session, probe):
+    if abn and not limit_is_stale(abn, workspace, socket, session, probe, capture=capture):
         return Verdict("abnormal", ",".join(abn.names))
-    if frame_working(tail):
+    if frame_working(tail) or turn_running(capture, adapter):
         return Verdict("busy", "working")
     if line is not None and line.text:
         return Verdict("pending", "text at the prompt", line.text)
@@ -485,6 +680,26 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=Non
             or (line is not None and line.placeholder)):
         return Verdict("idle-ready", "idle footer or empty composer", "" if line else None)
     return Verdict("unknown", "no idle affordance")
+
+
+def limit_holds(capture: Optional[str], adapter: RuntimeAdapter) -> bool:
+    """The pane waits on a provider limit and nothing else: an empty composer, no turn
+    running, no other dialog. The banner on screen is the evidence; no quota record is read."""
+    if not capture or not capture.strip():
+        return False
+    lines = _tail_lines(capture)
+    tail = "\n".join(_SGR.sub("", ln) for ln in lines)
+    abn = frame_abnormal(tail)
+    # Any age: a recovery line's own turn spins before any refusal returns.
+    if (abn and abn.retrying) or frame_working(tail) or turn_running(capture, adapter, waits=False):
+        return False
+    line = prompt_line(capture, adapter)
+    if line is None or line.text:
+        return False
+    gate = _gate(capture, "\n".join(_SGR.sub("", ln) for ln in live_tail(lines)), line, adapter)
+    if gate:
+        return gate in LIMIT_GATES
+    return abn is not None and abn.kind == "provider-limit"
 
 
 def observe(socket_path: str, session: str, adapter: RuntimeAdapter, tmux_bin: str = "tmux",
@@ -501,12 +716,14 @@ def observe(socket_path: str, session: str, adapter: RuntimeAdapter, tmux_bin: s
 
 
 # tmux-send-line.sh's contract; 2 is its own argument rejection.
-EXIT_STATUS = {0: "sent", 2: "rejected", 3: "no-session", 4: "no-tmux", 5: "pending", 6: "queued", 7: "unknown"}
+EXIT_STATUS = {0: "sent", 2: "rejected", 3: "no-session", 4: "no-tmux", 5: "pending", 6: "queued", 7: "unknown",
+               8: "not-limited"}
 
 
 def deliver(line: str, session: str, runtime: str, socket_path: Optional[str] = None,
             refuse_if_pending: bool = False, skip_if_queued: Optional[str] = None, dry_run: bool = False,
-            runner: Callable = subprocess.run, script: Path = SEND_LINE) -> Outcome:
+            runner: Callable = subprocess.run, script: Path = SEND_LINE,
+            require_limit: bool = False) -> Outcome:
     """Type one line + Enter into the core pane via the ONE sender, scripts/tmux-send-line.sh.
     The prompt read, the queued-input policy and the lock are its; this only maps its exit code."""
     if runtime not in ADAPTERS:
@@ -518,6 +735,8 @@ def deliver(line: str, session: str, runtime: str, socket_path: Optional[str] = 
         argv.append("--refuse-if-pending")
     if skip_if_queued:
         argv += ["--skip-if-queued", skip_if_queued]
+    if require_limit:
+        argv.append("--require-limit")
     if dry_run:
         argv.append("--dry-run")
     proc = runner(argv, capture_output=True, text=True, timeout=60)
@@ -532,6 +751,110 @@ def _read_stdin() -> str:
     except (AttributeError, ValueError):
         pass
     return sys.stdin.read()
+
+
+# A pane judged abnormal or not idle is kept for diagnosis: the live area a TUI
+# redraws (a retry banner, a dialog) is gone from scrollback once it clears.
+FRAMES_REL = Path("state") / "pane-frames"
+FRAMES_KEEP = 5
+_SEAT_NAME = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def save_frame(workspace, seat: str, kind: str, text: str, now: Optional[float] = None,
+               keep: int = FRAMES_KEEP) -> Optional[Path]:
+    """Write `text` to state/pane-frames/<seat>/<UTC stamp>-<kind>.txt and keep the newest
+    `keep` per seat. Best effort: None when nothing was written; filesystem errors are swallowed."""
+    if not text or not text.strip():
+        return None
+    seat_dir = _SEAT_NAME.sub("_", seat or "")
+    if seat_dir in ("", ".", ".."):
+        seat_dir = "unknown"
+    try:
+        d = Path(workspace) / FRAMES_REL / seat_dir
+        d.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
+        base = f"{stamp}-{_SEAT_NAME.sub('_', kind) or 'frame'}"
+        path, n = d / f"{base}.txt", 1
+        while path.exists():  # a second frame in the same second sits beside the first
+            path, n = d / f"{base}.{n}.txt", n + 1
+        _write_atomic(path, text)
+        frames = sorted(f for f in d.glob("*.txt") if f.is_file() and not f.is_symlink())
+        for old in frames[:-keep] if keep > 0 else frames:
+            old.unlink(missing_ok=True)
+        return path
+    except OSError:
+        return None
+
+
+# A notifier that times out waiting for idle restarts as a new process, so its rounds
+# are counted on disk; the third surfaces once, and an idle pane clears the record.
+STALLS_REL = Path("state") / "notifier-stalls"
+STALL_ROUNDS = 3
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def _stall_lock(path: Path):
+    """One writer per seat: the count is read, bumped and replaced (or cleared) under it."""
+    return locked_file(path.with_name(f".{path.name}.lock"))
+
+
+def _stall_path(workspace, seat: str) -> Path:
+    name = _SEAT_NAME.sub("_", seat or "")
+    return Path(workspace) / STALLS_REL / f"{name if name not in ('', '.', '..') else 'unknown'}.json"
+
+
+def note_idle_timeout(workspace, seat: str, now: Optional[float] = None) -> int:
+    """Count one more idle-wait timeout for `seat`; returns the rounds so far (0 if unwritable)."""
+    path = _stall_path(workspace, seat)
+    now = time.time() if now is None else now
+    try:
+        with _stall_lock(path):
+            try:
+                rec = json.loads(path.read_text(encoding="utf-8"))
+                rec = rec if isinstance(rec, dict) else {}
+            except (OSError, ValueError):
+                rec = {}
+            rec = {"seat": seat, "since": rec.get("since", now), "last": now,
+                   "rounds": int(rec.get("rounds", 0) or 0) + 1}
+            _write_atomic(path, json.dumps(rec))
+    except OSError:
+        return 0
+    return rec["rounds"]
+
+
+def clear_idle_timeouts(workspace, seat: str) -> bool:
+    path = _stall_path(workspace, seat)
+    if not path.exists():
+        return False
+    try:
+        with _stall_lock(path):
+            path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def idle_stalls(workspace) -> dict:
+    """{seat: record} for every seat whose notifier has timed out STALL_ROUNDS times or more."""
+    out = {}
+    for f in sorted((Path(workspace) / STALLS_REL).glob("*.json")):
+        try:
+            rec = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict) and int(rec.get("rounds", 0) or 0) >= STALL_ROUNDS:
+            out[str(rec.get("seat") or f.stem)] = rec
+    return out
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -564,6 +887,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     hp.add_argument("--socket", default=os.environ.get("SUTANDO_TMUX_SOCKET"))
     hp.add_argument("--session", default=None, help="the seat the record must vouch for")
     hp.add_argument("--probe", action="store_true", help="refresh a stale record through the proxy first")
+    lh = sub.add_parser("limit-holds")
+    lh.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
+    sf = sub.add_parser("save-frame")
+    sf.add_argument("--workspace", required=True)
+    sf.add_argument("--seat", required=True)
+    sf.add_argument("--kind", required=True)
+    for name in ("idle-timeout", "idle-ok"):
+        it = sub.add_parser(name)
+        it.add_argument("--workspace", required=True)
+        it.add_argument("--seat", required=True)
     d = sub.add_parser("deliver")
     d.add_argument("session")
     d.add_argument("line")
@@ -572,11 +905,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     d.add_argument("--refuse-if-pending", action="store_true")
     d.add_argument("--skip-if-queued", default=None)
     d.add_argument("--dry-run", action="store_true")
+    d.add_argument("--require-limit", action="store_true")
     a = ap.parse_args(argv)
     if a.cmd == "safe-states":
         # Emitting the SAFE set keeps a caller's membership test fail-closed: anything
         # absent -- a new state, a typo, an empty read -- refuses without being listed.
         print(" ".join(s for s in STATES if not state_is_unsafe(s)))
+        return 0
+    if a.cmd == "save-frame":
+        path = save_frame(a.workspace, a.seat, a.kind, _read_stdin())
+        print(path or "", end="\n" if path else "")
+        return 0 if path else 1
+    if a.cmd == "idle-timeout":
+        # "surface N" exactly once, on the round that reaches STALL_ROUNDS; later rounds stay quiet.
+        rounds = note_idle_timeout(a.workspace, a.seat)
+        print(f"surface {rounds}" if rounds == STALL_ROUNDS else str(rounds))
+        return 0
+    if a.cmd == "idle-ok":
+        clear_idle_timeouts(a.workspace, a.seat)
         return 0
     adapter = ADAPTERS[a.runtime]
     if a.cmd == "classify":
@@ -641,7 +987,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     if a.cmd == "after":
         print(after_prompt(_read_stdin(), adapter, getattr(a, "width", 0)))
         return 0
-    out = deliver(a.line, a.session, a.runtime, a.socket, a.refuse_if_pending, a.skip_if_queued, a.dry_run)
+    if a.cmd == "limit-holds":
+        if not limit_holds(_read_stdin(), adapter):
+            print("pane_gate: the pane does not wait on a usage limit alone", file=sys.stderr)
+            return EXIT_UNSAFE
+        return 0
+    out = deliver(a.line, a.session, a.runtime, a.socket, a.refuse_if_pending, a.skip_if_queued, a.dry_run,
+                  require_limit=a.require_limit)
     print(f"{out.status}: {out.message}" if out.message else out.status, file=sys.stderr if out.code else sys.stdout)
     return out.code
 

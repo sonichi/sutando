@@ -111,6 +111,71 @@ class HitlArchiveCheckTest(unittest.TestCase):
         self.assertEqual(out["status"], "warn")
         self.assertIn("1 settled record(s) failing to archive", out["detail"])
 
+    def test_a_card_that_could_not_be_projected_warns(self):
+        mgr = hm.HitlManager(hm.HitlStore(self.root))
+        req = mgr.create(schema.HumanRequirement(
+            kind="choice", runtime="claude", message="m", guard="g",
+            actions=[schema.Action(id="ok", kind="choose", label="OK")]))
+
+        def refuse(payload):
+            err = OSError("HTTP 400")
+            err.code = 400
+            raise err
+
+        self.addCleanup(projector._NO_ACCEPT_SINCE.clear)
+        for i in range(projector.PROJECTION_MAX_REFUSALS + 1):  # the first falls inside the grace
+            with self.assertRaises(OSError):  # a lone refusal is also re-raised for the caller's backoff
+                projector.project_pass(mgr, refuse, "!r", clock=lambda: time.time() + 10 ** 7 * (i + 1),
+                                       monotonic=lambda: time.monotonic() + 10 ** 7 * (i + 1))
+        out = hc.check_hitl_archive()
+        self.assertEqual(out["status"], "warn")
+        self.assertIn(f"1 card(s) could not be projected ({req.id})", out["detail"])
+
+    def test_cards_sharing_a_refused_defect_warn_once_the_grace_runs_out(self):
+        mgr = hm.HitlManager(hm.HitlStore(self.root))
+        reqs = [mgr.create(schema.HumanRequirement(
+            kind="choice", runtime="claude", message="m", guard=g,
+            actions=[schema.Action(id="ok", kind="choose", label="OK")])) for g in ("g1", "g2")]
+        self.addCleanup(projector._NO_ACCEPT_SINCE.clear)
+
+        def refuse(payload):
+            err = OSError("HTTP 400")
+            err.code = 400
+            raise err
+
+        for i in range(projector.PROJECTION_MAX_REFUSALS + 1):
+            with self.assertRaises(OSError):
+                projector.project_pass(mgr, refuse, "!r", clock=lambda: time.time() + 10 ** 7 * (i + 1),
+                                       monotonic=lambda: time.monotonic() + 10 ** 7 * (i + 1))
+        out = hc.check_hitl_archive()
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("2 card(s) could not be projected", out["detail"])
+        for req in reqs:
+            self.assertIn(req.id, out["detail"])
+
+    def test_a_failed_card_in_a_sibling_store_the_bridge_projects_warns(self):
+        self.fill(1)
+        sibling = self.root.with_name(self.root.name + "-claude-local")
+        mgr = hm.HitlManager(hm.HitlStore(sibling))
+        req = mgr.create(schema.HumanRequirement(
+            kind="choice", runtime="claude-local", message="m", guard="g",
+            actions=[schema.Action(id="ok", kind="choose", label="OK")]))
+
+        def refuse(payload):
+            err = OSError("HTTP 400")
+            err.code = 400
+            raise err
+
+        self.addCleanup(projector._NO_ACCEPT_SINCE.clear)
+        for i in range(projector.PROJECTION_MAX_REFUSALS + 1):  # the first falls inside the grace
+            with self.assertRaises(OSError):  # a lone refusal is also re-raised for the caller's backoff
+                projector.project_pass(mgr, refuse, "!r", clock=lambda: time.time() + 10 ** 7 * (i + 1),
+                                       monotonic=lambda: time.monotonic() + 10 ** 7 * (i + 1))
+        self.assertTrue(mgr.projection_failed(req.id))
+        out = hc.check_hitl_archive()
+        self.assertEqual(out["status"], "warn")
+        self.assertIn(req.id, out["detail"])
+
     def test_an_unreadable_status_file_degrades_to_the_live_count(self):
         self.fill(1)
         hm.archive_status_path(self.root).write_text("[not json")

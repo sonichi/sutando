@@ -77,10 +77,17 @@ class Harness:
         for k in ("SUTANDO_TASK_EVENT_HANDLER", "SUTANDO_INSTANCE_ID", "SUTANDO_TASKS_DIR",
                   "SUTANDO_WORKSPACE_DIR", "SUTANDO_INBOX_KIND"):
             env.pop(k, None)
+        self.err = self.tmp / "watcher.err"
         self.proc = popen_bound(
             ["bash", "src/watch-tasks-stream.sh", str(self.ws / "tasks"), "--role", "standby", "--inbox", str(self.ws / "tasks")],
             cwd=str(REPO), env=env, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True)
+            stderr=self.err.open("w"), text=True)
+
+    def stderr_tail(self) -> str:
+        try:
+            return " | ".join(self.err.read_text(errors="replace").splitlines()[-6:])
+        except OSError:
+            return ""
 
     def deliver_file_event(self, path: Path) -> None:
         with self.feed.open("a") as fh:
@@ -158,15 +165,20 @@ def test_eof_from_fswatch_relaunches_it_and_ends_the_watcher_only_past_the_budge
     tails = lambda: set(subprocess.run(tail, capture_output=True, text=True).stdout.split())
     try:
         h.start(SUTANDO_FSWATCH_RESTART_MAX="1")
-        time.sleep(1.0)
+        # The sentinel is stamped only once the watcher's own startup check of fswatch passed: a
+        # kill before that is a failed start (exit 1), not the EOF this test is about.
+        sentinel = h.ws / "state" / "watch-tasks-stream.pid"
+        started = lambda: sentinel.exists() and sentinel.read_text().strip() == str(h.proc.pid) and tails()
+        check("the watcher is up with its stubbed fswatch", wait_for(started, timeout=30.0), h.stderr_tail())
         first = tails()
         # The stub tails the feed; killing it closes the FIFO's write end.
         subprocess.run(["pkill", "-f", f"tail -n \\+1 -f {h.feed}"], check=False)
         check("EOF on the event stream relaunches fswatch, the watcher stays",
-              wait_for(lambda: tails() - first and h.proc.poll() is None, timeout=10.0))
+              wait_for(lambda: tails() - first and h.proc.poll() is None, timeout=30.0),
+              f"rc={h.proc.poll()} stderr: {h.stderr_tail()}")
         subprocess.run(["pkill", "-f", f"tail -n \\+1 -f {h.feed}"], check=False)
         check("a second EOF past the relaunch budget ends the watcher, status 1",
-              wait_for(lambda: h.proc.poll() == 1, timeout=10.0), f"rc={h.proc.poll()}")
+              wait_for(lambda: h.proc.poll() == 1, timeout=30.0), f"rc={h.proc.poll()} stderr: {h.stderr_tail()}")
     finally:
         h.cleanup()
 

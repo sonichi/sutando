@@ -90,7 +90,8 @@ class Snapshot(Base):
                 mock.patch.object(rgb, "HEALTH_TTL_S", 0.0):
             self.assertIsNone(rgb._health_snapshot())
             self.assertIsNone(rgb._health_snapshot())
-        self.assertEqual(logs, ["health snapshot unavailable: OSError: gone"])
+        self.assertEqual(len(logs), 1, logs)  # once per error, and only its type and location
+        self.assertRegex(logs[0], r"^health snapshot unavailable: OSError at [\w.-]+:\d+$")
 
 
 class Rows(unittest.TestCase):

@@ -1,0 +1,6 @@
+❯ /rate-limit-options
+What do you want to do?
+❯ 1. Stop and wait for limit to reset
+2. Wait here, then continue automatically at Nov 15 at 6am
+3. Add funds to continue with usage credits
+Enter to confirm · Esc to cancel

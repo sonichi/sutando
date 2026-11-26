@@ -36,6 +36,7 @@ schema.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -67,6 +68,7 @@ _KNOWN_TOP_LEVEL_KEYS = {
     "bridges",
     "stand",          # this instance's `Stand:` commit-trailer value
     "skills",
+    "notifications",
 }
 
 # Blocks every consumer reads with `.get()`. A scalar here is what the schema's
@@ -81,6 +83,7 @@ _OBJECT_TOP_LEVEL_KEYS = {
     "health_check",
     "bridges",
     "skills",
+    "notifications",
 }
 
 _SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
@@ -624,6 +627,25 @@ def resolve_skills_developer(repo_root: Optional[Path] = None) -> bool:
     return val is True
 
 
+def resolve_macos_notifications(repo_root: Optional[Path] = None) -> bool:
+    """``notifications.macos``: whether Sutando may post macOS desktop notifications.
+
+    Off by default. Only a real JSON ``true`` opts in; any other value, or a config
+    that cannot be read, is off, so no sender can fire a banner the owner did not ask for.
+    """
+    try:
+        val = (load_config(repo_root).get("notifications") or {}).get("macos")
+    except Exception as exc:  # noqa: BLE001 — a notification gate must never raise
+        print(f"sutando config: cannot read notifications.macos ({exc}); treated as false",
+              file=sys.stderr)
+        return False
+    if val is not None and not isinstance(val, bool):
+        print(f"sutando config: notifications.macos must be a JSON boolean, got {val!r}; "
+              f"treated as false", file=sys.stderr)
+        return False
+    return val is True
+
+
 def resolve_dotenv(repo_root: Optional[Path] = None,
                    workspace: Optional[Path] = None) -> Path:
     """Resolve the `.env` path through the canonical 2-tier fallback.
@@ -651,15 +673,120 @@ def resolve_dotenv(repo_root: Optional[Path] = None,
     return primary
 
 
+def desktop_runtime_selection_path(repo_root: Optional[Path] = None) -> Optional[Path]:
+    """The AG2 Space desktop's ``runtime.json``, when this engine is hosted by one.
+
+    The desktop owns that file. Its directory is ``$SUTANDO_APP_SUPPORT``, which the
+    desktop exports to engine processes, or the parent of the bundled engine tree
+    (``<app-support>/engine/<checkout>``) for jobs started without that environment.
+    """
+    app_support = os.environ.get("SUTANDO_APP_SUPPORT", "").strip()
+    if app_support:
+        return Path(app_support) / "runtime.json"
+    root = repo_root or _find_repo_root()
+    if root is None:
+        return None
+    root = Path(root).resolve()
+    if root.parent.name != "engine":
+        return None
+    return root.parent.parent / "runtime.json"
+
+
+def _desktop_selected_runtime(repo_root: Optional[Path]) -> str:
+    path = desktop_runtime_selection_path(repo_root)
+    if path is None:
+        return ""
+    try:
+        selected = json.loads(path.read_text()).get("coreRuntime")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return selected.strip() if isinstance(selected, str) else ""
+
+
+def persist_desktop_runtime_selection(runtime: str, repo_root: Optional[Path] = None,
+                                      check: bool = False) -> str:
+    """Make an explicit outside-core switch the desktop's durable selection too.
+
+    Returns ``"unchanged"`` when it already says ``runtime`` and ``"updated"`` after
+    writing it; ``"no-desktop"`` when no desktop hosts this engine. Otherwise the
+    desktop keeps relaunching and probing for the old runtime while the new one
+    owns the session (2026-10-22: the app read a live Claude core as absent).
+    ``check`` runs every validation but writes nothing, returning ``"would-update"``
+    where it would have written; the launcher writes only once the new core is confirmed.
+
+    Same contract as the desktop's own writer (``core_runtime.rs``
+    ``update_runtime_json``): every other key survives, and the file is replaced
+    atomically, because readers treat a partial or unparseable file as "never
+    chosen". A file that exists but is not a JSON object is refused rather than
+    replaced, which would drop the desktop's other keys.
+    """
+    if runtime not in _SUPPORTED_CORE_RUNTIMES:
+        raise ValueError(f"unsupported core runtime: {runtime!r}")
+    path = desktop_runtime_selection_path(repo_root)
+    if path is None or not path.parent.is_dir():
+        return "no-desktop"
+
+    def mutate(body: Dict[str, Any]) -> bool:
+        if body.get("coreRuntime") == runtime:
+            return False
+        body["coreRuntime"] = runtime
+        return True
+
+    return update_desktop_runtime_json(path, mutate, check=check)
+
+
+@contextlib.contextmanager
+def _json_file_lock(path: Path):
+    """Exclusive flock on ``<path>.lock``, held across one read-merge-replace."""
+    import fcntl
+    with open(path.with_name(path.name + ".lock"), "a") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+
+
+_UPDATE_ATTEMPTS = 5
+
+
+def _update_json_object(path: Path, mutate, check: bool = False) -> str:
+    """Read, ``mutate(body)`` (True when it changed something), atomic replace, under ``<path>.lock``.
+    The replace happens only while the file still holds the bytes that were read; a write landing
+    in between, even from a writer that skips the lock, is re-read and ``mutate`` applied again.
+    ``check`` reads without the lock and writes nothing, the lock file included."""
+    if check:
+        return "would-update" if mutate(_read_json_object(path)) else "unchanged"
+    with _json_file_lock(path):
+        for _ in range(_UPDATE_ATTEMPTS):
+            before = _read_bytes(path)
+            body = _parse_json_object(path, before)
+            if not mutate(body):
+                return "unchanged"
+            if _replace_json_atomically(path, body, expect=before):
+                return "updated"
+    raise ValueError(f"{path} kept changing under another writer; not written")
+
+
+def update_desktop_runtime_json(path: Path, mutate, check: bool = False) -> str:
+    """The engine's one writer of the desktop's ``runtime.json``: ``_update_json_object`` on it, so
+    engine writers are serialized by ``runtime.json.lock`` and a desktop write that lands between
+    the read and the replace is merged, not dropped. Returns ``"updated"``, ``"unchanged"`` or,
+    with ``check``, ``"would-update"`` (nothing written). A file that is not a JSON object is refused."""
+    return _update_json_object(path, mutate, check=check)
+
+
 def resolve_core_runtime(repo_root: Optional[Path] = None) -> str:
     """Return the selected persistent core CLI runtime.
 
-    ``SUTANDO_CORE_RUNTIME`` is an invocation-scoped launcher override.
-    Otherwise ``core.runtime`` is read from merged config. Claude remains the
-    default so upgrading does not change existing installations.
+    ``SUTANDO_CORE_RUNTIME`` is an invocation-scoped launcher override. Next is
+    the desktop's durable selection (``desktop_runtime_selection_path``), so
+    background jobs agree with the desktop launcher; a missing, unreadable or
+    unsupported selection is ignored. Then ``core.runtime`` from merged config.
+    Claude remains the default so upgrading does not change existing installations.
     """
     core = load_config(repo_root).get("core") or {}
     configured = str(core.get("runtime") or "claude").strip()
+    desktop = _desktop_selected_runtime(repo_root)
+    if desktop in _SUPPORTED_CORE_RUNTIMES:
+        configured = desktop
     runtime = os.environ.get("SUTANDO_CORE_RUNTIME", "").strip() or configured
     if runtime not in _SUPPORTED_CORE_RUNTIMES:
         supported = ", ".join(sorted(_SUPPORTED_CORE_RUNTIMES))
@@ -667,6 +794,146 @@ def resolve_core_runtime(repo_root: Optional[Path] = None) -> str:
             f"sutando config: unsupported core.runtime={runtime!r}; expected one of: {supported}"
         )
     return runtime
+
+
+def _strict_bool(val: Any) -> Optional[bool]:
+    return val if isinstance(val, bool) else None
+
+
+def _desktop_codex_app_server(repo_root: Optional[Path]) -> Optional[bool]:
+    path = desktop_runtime_selection_path(repo_root)
+    if path is None:
+        return None
+    try:
+        return _strict_bool(json.loads(path.read_text()).get("codexAppServer"))
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def resolve_codex_app_server(repo_root: Optional[Path] = None) -> bool:
+    """Whether a Codex core or Codex pool worker runs as a seat on ``codex app-server``.
+
+    On by default (owner decision 2026-11-22). ``SUTANDO_CODEX_APP_SERVER`` set non-empty is
+    an invocation-scoped override (``1`` on, anything else off). Next is the desktop's
+    durable choice, ``codexAppServer`` in its ``runtime.json`` (the app's toggle), then
+    ``core.codex_app_server`` from merged config (the workspace layer included). Only a
+    JSON ``true``/``false`` counts; a missing, unreadable or non-boolean value keeps the default.
+    """
+    env = os.environ.get("SUTANDO_CODEX_APP_SERVER", "").strip()
+    if env:
+        return env == "1"
+    desktop = _desktop_codex_app_server(repo_root)
+    if desktop is not None:
+        return desktop
+    try:
+        val = (load_config(repo_root).get("core") or {}).get("codex_app_server")
+    except (RuntimeError, AttributeError) as exc:
+        print(f"sutando config: cannot read core.codex_app_server ({exc}); keeping the default (on)",
+              file=sys.stderr)
+        return True
+    if val is not None and not isinstance(val, bool):
+        print(f"sutando config: core.codex_app_server must be a JSON boolean, got {val!r}; "
+              f"keeping the default (on)", file=sys.stderr)
+        return True
+    return val is not False
+
+
+_ANY = object()
+
+
+def _replace_json_atomically(path: Path, body: Dict[str, Any], expect: Any = _ANY) -> bool:
+    """Write ``body`` to a temp file and rename it over ``path``. With ``expect`` (the bytes read,
+    None for absent), nothing is replaced and False is returned once ``path`` no longer holds them."""
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        with open(tmp, "w") as f:
+            f.write(json.dumps(body, indent=2) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if expect is not _ANY and _read_bytes(path) != expect:
+            tmp.unlink(missing_ok=True)
+            return False
+        os.replace(tmp, path)
+        return True
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _read_bytes(path: Path) -> Optional[bytes]:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError(f"cannot read {path}: {exc}") from exc
+
+
+def _parse_json_object(path: Path, raw: Optional[bytes]) -> Dict[str, Any]:
+    if raw is None:
+        return {}
+    try:
+        body = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(body, dict):
+        raise ValueError(f"{path} is not a JSON object")
+    return body
+
+
+def _read_json_object(path: Path) -> Dict[str, Any]:
+    """A file this module updates in place: missing is empty; anything but an object is refused."""
+    return _parse_json_object(path, _read_bytes(path))
+
+
+def persist_codex_app_server(enabled: bool, repo_root: Optional[Path] = None) -> "tuple[str, Path]":
+    """Record the app-server choice where ``resolve_codex_app_server`` reads it first.
+
+    On a desktop install that is ``codexAppServer`` in the desktop's ``runtime.json`` (the
+    app's toggle writes the same key), else ``core.codex_app_server`` in
+    ``<workspace>/sutando.config.local.json``. Every other key survives and the file is
+    replaced atomically. Returns (``"updated"``|``"unchanged"``, the file): ``unchanged`` means
+    the stored key already held that value, not that the resolved value matched, so a
+    default-on install with no key reports ``updated`` for ``on``. It takes effect
+    on the next launch; a running core keeps its mode until restarted.
+    """
+    if not isinstance(enabled, bool):
+        raise ValueError(f"codex app-server choice must be a boolean, got {enabled!r}")
+    desktop = desktop_runtime_selection_path(repo_root)
+    if desktop is not None and desktop.parent.is_dir():
+        def mutate(body: Dict[str, Any]) -> bool:
+            if body.get("codexAppServer") is enabled:
+                return False
+            body["codexAppServer"] = enabled
+            return True
+
+        return update_desktop_runtime_json(desktop, mutate), desktop
+    root = repo_root or _find_repo_root()
+    if root is None:
+        raise ValueError("no Sutando checkout found to resolve the workspace")
+    root = Path(root)
+    repo_cfg = _expand_vars(_deep_merge(_load_json(root / _CONFIG_FILENAME),
+                                        _load_json(root / _LOCAL_FILENAME)), root)
+    path = _workspace_layer_path(repo_cfg, root)
+    if not path.parent.is_dir():
+        raise ValueError(f"workspace {path.parent} does not exist")
+
+    def mutate_layer(body: Dict[str, Any]) -> bool:
+        core = body.get("core")
+        if core is None:
+            core = body["core"] = {}
+        if not isinstance(core, dict):
+            raise ValueError(f"{path} key 'core' is not a JSON object")
+        if core.get("codex_app_server") is enabled:
+            return False
+        core["codex_app_server"] = enabled
+        return True
+
+    outcome = _update_json_object(path, mutate_layer)
+    if outcome == "updated":
+        global _CACHE
+        _CACHE = None
+    return outcome, path
 
 
 _DEFAULT_CLAUDE_SUTANDO_SUBDIR = ".claude-sutando"

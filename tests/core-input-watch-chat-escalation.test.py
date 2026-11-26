@@ -16,6 +16,7 @@ import os
 import pathlib
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -477,6 +478,120 @@ class TestDrive(unittest.TestCase):
         self.assertEqual(M.drive_escalations(None, "s", PERM, "blocked-human", lambda k: True), [])
 
 
+class TestSequentialPrompts(unittest.TestCase):
+    """#5544: a write the core asks about again after a card's Yes went in must get its own
+    card; deduping onto the answered card left the owner a stale card and the terminal."""
+
+    RUNNING = "✻ Writing… (2s · ↓ 120 tokens · esc to interrupt)\n"
+
+    def _run(self, panes, on_tick):
+        from unittest.mock import patch
+
+        class _Done(Exception):
+            pass
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "working"}
+        m, sent, tick = _mgr(), [], {"n": 0}
+
+        def sleep(_s):
+            on_tick(m, tick["n"])
+            tick["n"] += 1
+            if tick["n"] >= len(panes):
+                raise _Done()
+        out = os.path.join(tempfile.mkdtemp(), "state", "core-supervisor.json")
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out,
+                "--stable", "2", "--interval", "0", "--no-auto-answer"]
+        with patch.object(M, "capture_styled", lambda s, sess: panes[min(tick["n"], len(panes) - 1)]), \
+                patch.object(M, "_load_runtime_health", lambda: _RH()), \
+                patch.object(M, "gateway_alive", lambda *a: True), \
+                patch.object(M, "session_runtime", lambda *a: "claude"), \
+                patch.object(M, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(M, "_hitl_manager", lambda out_path: m), \
+                patch.object(M, "send_keys", lambda sock, sess, k: sent.append(k) or True), \
+                patch.object(M, "notice_queued", lambda *a, **k: None), \
+                patch.object(M.core_gate_notice, "queued_count", lambda ws: 0), \
+                patch.object(M.core_gate_notice, "end_outage", lambda ws: None), \
+                patch.object(M, "_sleep", sleep), \
+                patch.object(sys, "argv", argv):
+            with self.assertRaises(_Done):
+                M.main()
+        return m, sent
+
+    def test_the_same_prompt_asked_again_after_a_driven_yes_gets_a_new_card(self):
+        def click(m, n):
+            if n == 1:  # the card exists after the second (debounced) tick
+                _click(m, m.active()[0], "allow")
+        # card, click driven, the core runs one tick, then asks the identical question again
+        panes = [PERM, PERM, PERM, self.RUNNING, PERM, PERM]
+        m, sent = self._run(panes, click)
+        cards = sorted(m.store.all(), key=lambda r: r.created_at)
+        self.assertEqual(sent, ["Enter"])
+        self.assertEqual(len(cards), 2, [(c.id, c.status) for c in cards])
+        self.assertEqual(cards[0].status, STATUS_RESOLVED)
+        self.assertEqual(cards[1].status, "pending")
+        self.assertEqual([a.label for a in cards[1].actions], ["No", "Yes", "Open terminal"])
+
+    def test_a_driven_card_whose_dialog_is_still_up_is_not_resolved(self):
+        def click(m, n):
+            if n == 1:
+                _click(m, m.active()[0], "allow")
+        m, sent = self._run([PERM, PERM, PERM, PERM], click)
+        cards = m.store.all()
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0].status, "in_progress")
+
+
+class TestDrivenOutcome(unittest.TestCase):
+    """The card's result line is the driver's evidence: Done only when the runtime was seen
+    carrying on, the driver's own words when it gave up, neutral otherwise."""
+
+    def _driven(self):
+        m = _mgr()
+        r = M.escalate(m, "blocked-human", "awaiting user: permission", "permission", PERM, "s")
+        _click(m, r, "allow")
+        self.assertEqual(M.drive_escalations(m, "s", PERM, "blocked-human", lambda k: True), [(r.id, ["Enter"])])
+        self.assertEqual(m.get(r.id).to_wire()["outcome"], {"state": "running"})
+        return m, r
+
+    def test_a_driven_answer_is_done_once_the_runtime_is_seen_carrying_on(self):
+        for state in ("running", "idle-ready"):
+            with self.subTest(state=state):
+                m, r = self._driven()
+                self.assertEqual(M.settle_driven(m, "s", None, state), [r.id])
+                cur = m.get(r.id)
+                self.assertEqual(cur.status, STATUS_RESOLVED)
+                self.assertTrue(cur.subject["driven_settled"])
+                self.assertEqual(cur.to_wire()["outcome"], {"state": "done"})
+
+    def test_a_driven_answer_whose_runtime_then_crashed_or_stalled_is_never_done(self):
+        """The dialog left the screen because the core died (a shell prompt in its pane), not
+        because the answer took: the card closes, and its result line stays neutral."""
+        for state, pane in (("crashed", "user@host ~ % "), ("hung", "user@host ~ % "), ("logged-out", None),
+                            # blocked is also a refused turn, a usage limit, a paused queue: no proof it took
+                            ("blocked-human", "You've hit your limit"), ("blocked-known", None)):
+            with self.subTest(state=state):
+                m, r = self._driven()
+                self.assertEqual(M.settle_driven(m, "s", pane, state), [r.id])
+                cur = m.get(r.id)
+                self.assertEqual(cur.status, STATUS_RESOLVED)
+                self.assertNotIn("driven_settled", cur.subject)
+                self.assertEqual(cur.to_wire()["outcome"], {"state": "closed"})
+
+    def test_a_driver_that_gave_up_says_so_in_its_own_field(self):
+        m = _mgr()
+        r = M.escalate(m, "blocked-human", "awaiting user: permission", "permission", PERM, "s")
+        _click(m, r, "deny")
+        M.drive_escalations(m, "s", PERM, "blocked-human", lambda k: False)
+        cur = m.get(r.id)
+        self.assertEqual(cur.subject["driver_note"], "The answer did not take. Open the terminal to finish it.")
+        self.assertEqual(cur.to_wire()["outcome"],
+                         {"state": "failed", "text": "The answer did not take. Open the terminal to finish it."})
+
+
 class TestPartialSend(unittest.TestCase):
     """Reviewer P1: a key sequence that half-lands must never read as driven, and
     must never be finished later against a caret nobody can place."""
@@ -552,9 +667,9 @@ class TestSignedOutMustHold(unittest.TestCase):
     A signed-out reading is carded only once it has held, and clears on the first frame
     that shows the CLI signed in after it."""
 
-    def _run(self, frames, td, runtime="claude"):
+    def _run(self, frames, td, runtime="claude", library_sleeps=0):
         """main() over (t, pane) frames against a real store; returns the store and the
-        state written after each frame."""
+        state written after each frame. `library_sleeps`: time.sleep calls inside each tick."""
         from unittest.mock import patch
         out = os.path.join(td, "state", "core-supervisor.json")
         os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -574,14 +689,18 @@ class TestSignedOutMustHold(unittest.TestCase):
             if i["n"] >= len(frames):
                 raise _Done()
         argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out, "--interval", "0"]
-        with patch.object(M, "capture_styled", lambda s, sess: frames[i["n"]][1]), \
+        def capture(s, sess):
+            for _ in range(library_sleeps):
+                time.sleep(0)
+            return frames[i["n"]][1]
+        with patch.object(M, "capture_styled", capture), \
                 patch.object(M.time, "time", lambda: 1000.0 + frames[i["n"]][0]), \
                 patch.object(M, "_load_runtime_health", lambda: _RH()), \
                 patch.object(M, "gateway_alive", lambda *a: True), \
                 patch.object(M, "session_runtime", lambda *a: runtime), \
                 patch.object(M, "_ensure_tmux_on_path", lambda: None), \
                 patch.object(M.core_gate_notice, "queued_count", lambda ws: 0), \
-                patch.object(M.time, "sleep", sleep), \
+                patch.object(M, "_sleep", sleep), \
                 patch.object(sys, "argv", argv):
             with self.assertRaises(_Done):
                 M.main()
@@ -604,6 +723,15 @@ class TestSignedOutMustHold(unittest.TestCase):
             self.assertEqual(states.index("logged-out"), 20, "carded before the 60 s confirm")
             [card] = m.active()
             self.assertEqual(card.kind, "auth")
+
+    def test_a_library_sleeping_inside_a_tick_spends_no_frame(self):
+        """The account card's subprocess.run polls time.sleep while its child exits; only the
+        loop's own wait may advance the frames."""
+        frames = [(t, _LOGIN_REFUSED + _FOOTER) for t in range(0, 75, 3)]
+        with tempfile.TemporaryDirectory() as td:
+            _m, states = self._run(frames, td, library_sleeps=3)
+            self.assertEqual(len(states), len(frames))
+            self.assertEqual(states.index("logged-out"), 20)
 
     def test_the_card_clears_on_the_first_frame_signed_in_after_the_refusal(self):
         signed_in = _LOGIN_REFUSED + "❯ hi\n● Hello.\n✻ Perambulating… (4s)\n" + _FOOTER

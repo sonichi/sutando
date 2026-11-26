@@ -19,16 +19,18 @@ import time
 import unittest
 from datetime import datetime, timezone
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ, runtime_harness  # noqa: E402
+
+isolate_os_environ()
+
+from _helpers.process_group import has_exited  # noqa: E402
+
 REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO / "skills/worker-pool/scripts"
-sys.path.insert(0, str(REPO / "tests"))
-from _helpers.hermetic_env import hermetic_env  # noqa: E402
 
-socket_setting = os.environ.get("SUTANDO_RUNTIME_SOCKET")
-environment_file = Path(socket_setting).parent / "environment.json" if socket_setting else None
-SUPPLIED = (json.loads(environment_file.read_text())
-            if environment_file is not None and environment_file.is_file() else {})
-RUNTIME_ROOT = environment_file.parent if SUPPLIED else None
+environment_file, SUPPLIED = runtime_harness()
+RUNTIME_ROOT = environment_file.parent if environment_file is not None else None
 
 # Outside the disposable runner, use the same minimal process boundary.
 ENDPOINT = r"""
@@ -117,7 +119,7 @@ class WorkerConfigDirectoryTests(unittest.TestCase):
             "tmp.replace(tmp.with_suffix('.json'))\n"
             f"os.execv({str(self.endpoint)!r}, [{str(self.endpoint)!r}, *sys.argv[1:]])\n")
         self.executable(self.bin / "claude",
-                        "#!/bin/sh\nexec " + shlex.join([sys.executable, str(witness)]) + ' "$@"\n')
+                        "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nexec " + shlex.join([sys.executable, str(witness)]) + ' "$@"\n')
         (self.ws / "sutando.config.local.json").write_text(json.dumps({
             "core_config_dirs": [{"id": "test-claude", "type": "claude",
                                   "env_name": "CLAUDE_CONFIG_DIR", "synced": True,
@@ -342,11 +344,8 @@ class WorkerConfigDirectoryTests(unittest.TestCase):
 
     @staticmethod
     def pid_exists(pid):
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
+        # The fixture tmux server can miss a pane's SIGCHLD under load; an unreaped zombie has exited.
+        return not has_exited(pid)
 
     def descendants(self, pid):
         result = self.run_command(["pgrep", "-P", str(pid)], expected=None)

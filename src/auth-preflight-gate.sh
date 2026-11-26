@@ -60,7 +60,7 @@ echo "  before services launch (half-up core is worse than a loud stop; #2396)."
 echo "  Remedy: $_remedy" >&2
 echo "" >&2
 
-osascript -e "display notification \"CLI login required — startup aborted. $( printf '%s' "$_remedy" | head -c 120 )\" with title \"Sutando\"" 2>/dev/null
+bash "$REPO/src/macos-notify.sh" "CLI login required — startup aborted. $( printf '%s' "$_remedy" | head -c 120 )" || true
 
 _ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)"
 _host="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null)"

@@ -9,6 +9,7 @@
 # Usage:
 #   bash scripts/sutando-config.sh workspace     # print resolved workspace path
 #   bash scripts/sutando-config.sh vault-enabled # print "true" or "false"
+#   bash scripts/sutando-config.sh macos-notifications # print "true" or "false" (notifications.macos)
 #   bash scripts/sutando-config.sh vault-url     # print vault remote_url (may be empty)
 #   bash scripts/sutando-config.sh dump          # print full merged config as JSON
 #   bash scripts/sutando-config.sh subdirs       # print canonical workspace subdir list (one per line)
@@ -104,6 +105,15 @@ import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_vault
 print('true' if resolve_vault().get('enabled') else 'false', end='')
+"
+    ;;
+
+  macos-notifications)
+    py -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import resolve_macos_notifications
+print('true' if resolve_macos_notifications() else 'false', end='')
 "
     ;;
 
@@ -247,6 +257,60 @@ import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_core_runtime
 print(resolve_core_runtime(), end='')
+"
+    ;;
+
+  codex-app-server)
+    # 1 when the Codex core and Codex workers run as app-server seats, else 0:
+    # SUTANDO_CODEX_APP_SERVER (non-empty), the desktop's runtime.json, core.codex_app_server.
+    py -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import resolve_codex_app_server
+print('1' if resolve_codex_app_server() else '0', end='')
+"
+    ;;
+
+  codex-app-server-select)
+    # Persist the app-server choice for every later launch. Prints updated|unchanged (the stored key
+    # already held it, whatever the default) and the file; nonzero when unwritable. Takes effect at --restart.
+    case "${2:-}" in
+      on) _cas=True ;;
+      off) _cas=False ;;
+      *) echo "sutando-config: codex-app-server-select needs on or off" >&2; exit 2 ;;
+    esac
+    py -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import persist_codex_app_server
+try:
+    outcome, path = persist_codex_app_server($_cas)
+except (OSError, ValueError, RuntimeError) as exc:
+    sys.exit(f'sutando-config: codex app-server choice not written: {exc}')
+print(f'{outcome} {path}', end='')
+"
+    ;;
+
+  desktop-runtime-select)
+    # Persist an explicit --runtime switch as the desktop's coreRuntime. Prints
+    # updated|unchanged|no-desktop (--check: would-update, writing nothing); nonzero when unwritable.
+    case "${2:-}" in
+      claude|codex) ;;
+      *) echo "sutando-config: desktop-runtime-select needs claude or codex" >&2; exit 2 ;;
+    esac
+    case "${3:-}" in
+      '') _check=False ;;
+      --check) _check=True ;;
+      *) echo "sutando-config: desktop-runtime-select takes only --check after the runtime" >&2; exit 2 ;;
+    esac
+    py -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import persist_desktop_runtime_selection
+try:
+    print(persist_desktop_runtime_selection('$2', check=$_check), end='')
+except (OSError, ValueError) as exc:
+    sys.exit(f'sutando-config: desktop runtime selection not written: {exc}')
 "
     ;;
 
@@ -808,7 +872,7 @@ print(json.dumps({
     ;;
 
   *)
-    echo "usage: $0 {workspace|core-runtime|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|tmux-socket|run-dir|runtime-socket|runtime|dump|subdirs|bootstrap}" >&2
+    echo "usage: $0 {workspace|core-runtime|codex-app-server|codex-app-server-select <on|off>|vault-enabled|macos-notifications|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|tmux-socket|run-dir|runtime-socket|runtime|dump|subdirs|bootstrap}" >&2
     exit 2
     ;;
 esac

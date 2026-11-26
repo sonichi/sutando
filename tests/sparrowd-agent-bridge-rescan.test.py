@@ -36,6 +36,7 @@ for _p in (str(REPO / "src"), str(REPO / "packages" / "ag2-sparrow")):
         sys.path.insert(0, _p)
 
 import sparrow_agent_bridge as bridge  # noqa: E402
+from ag2_sparrow.control_socket import control_socket_path  # noqa: E402
 from ag2_sparrow.sparrowd import Supervisor, WorkerSpec, run  # noqa: E402
 
 from ag2_sparrow.adapters.claude_code import cli  # noqa: E402
@@ -220,7 +221,7 @@ class Reconcile(unittest.TestCase):
         self.addCleanup(shutil.rmtree, td, ignore_errors=True)
         passes = [[], [WorkerSpec("late", SLEEPER)], [WorkerSpec("late", SLEEPER)], []]
         seen = []
-        sock = td / "sparrowd.sock"
+        sock = control_socket_path(td)
 
         def rescan():
             want = passes.pop(0) if passes else []
@@ -249,7 +250,7 @@ class Reconcile(unittest.TestCase):
     def test_an_unavailable_rescan_keeps_the_running_workers_and_is_logged_once_per_episode(self):
         td = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, td, ignore_errors=True)
-        sock = td / "sparrowd.sock"
+        sock = control_socket_path(td)
         calls = []
         # two failing passes, one good, two failing, one good: two episodes
         script = ["fail", "fail", "ok", "fail", "fail", "ok"]
@@ -332,7 +333,7 @@ class Reconcile(unittest.TestCase):
             return WorkerSpec("agent", [sys.executable, "-c", code, str(live), label], revision=label)
         passes = [[spec("B")], [spec("C")]]
         calls, samples, peak = [], [], [0]
-        sock = td / "sparrowd.sock"
+        sock = control_socket_path(td)
 
         def rescan():
             calls.append(1)
@@ -378,7 +379,7 @@ class Reconcile(unittest.TestCase):
         self.addCleanup(shutil.rmtree, td, ignore_errors=True)
         holder = SingleInstance(td / "sparrowd.lock")
         self.assertTrue(holder.acquire())
-        sock = td / "sparrowd.sock"
+        sock = control_socket_path(td)
 
         def release_then_stop():
             time.sleep(0.5)
@@ -509,9 +510,9 @@ class VaultScan(unittest.TestCase):
             return want
 
         def stop_when_done():
-            wait_for(lambda: (td / "sparrowd.sock").exists() and len(counts) >= 2, 10)
+            wait_for(lambda: control_socket_path(td).exists() and len(counts) >= 2, 10)
             c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            c.connect(str(td / "sparrowd.sock"))
+            c.connect(str(control_socket_path(td)))
             c.sendall(b'{"op": "stop"}\n')
             c.makefile("r").readline()
             c.close()
@@ -575,12 +576,12 @@ class Launcher(unittest.TestCase):
             self.assertEqual(rescan(), [], "removed by uninstall: gone on the next pass")
         self.assertEqual(err.getvalue(), "")
 
-    def test_full_mode_keeps_the_gateway_bridge_first_and_rescans_only_the_declarations(self):
+    def test_full_mode_runs_no_gateway_bridge_and_rescans_only_the_declarations(self):
         self.declare()
         specs, _, rescan, rescan_s, _ = self.main([])
         self.assertEqual(rescan_s, 30.0)
         names = [s.name for s in specs]
-        self.assertEqual((names[0], names.count(cli.worker_name(SEG))), ("remote-gateway-bridge", 1))
+        self.assertEqual(names, [cli.worker_name(SEG)], "the gateway bridge is --core's worker")
         with contextlib.redirect_stderr(io.StringIO()):
             again = [s.name for s in rescan()]
         self.assertEqual(again, names, "the static workers are listed on every pass, so never dropped")
@@ -752,13 +753,15 @@ class Launcher(unittest.TestCase):
         self.assertEqual(specs, [])
         self.assertIn("sparrowd: not supervised — loop-x: no interpreter configured", err.getvalue())
 
-    def test_full_mode_still_refuses_a_gateway_bridge_supervised_elsewhere(self):
+    def test_full_mode_still_refuses_a_static_worker_supervised_elsewhere(self):
         err = io.StringIO()
-        with mock.patch.object(self.sd, "external_supervisor", side_effect=lambda m: "pid 7 (1 bash wrapper)"), \
+        loop = self.sd.WorkerSpec(name="loop-x", argv=["py", "/x/skills/x/loop.py"])
+        with mock.patch.object(self.sd, "_static_specs", return_value=([loop], [])), \
+                mock.patch.object(self.sd, "external_supervisor", side_effect=lambda m: "pid 7 (1 bash wrapper)"), \
                 mock.patch.object(self.sd, "run", return_value=0) as run_, contextlib.redirect_stderr(err):
             self.assertEqual(self.sd.main([]), 2)
         run_.assert_not_called()
-        self.assertIn("refusing to start — remote-gateway-bridge already supervised outside sparrowd", err.getvalue())
+        self.assertIn("refusing to start — loop-x already supervised outside sparrowd", err.getvalue())
 
 
 if __name__ == "__main__":

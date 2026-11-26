@@ -28,6 +28,7 @@ def _load(results_dir):
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     m.RESULTS_DIR = Path(results_dir)
+    m.resolve_macos_notifications = lambda: True  # the owner opted in; the gate is pinned elsewhere
     return m
 
 

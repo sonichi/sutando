@@ -8,6 +8,7 @@ a config dir holding channel .env files) and carries marked token, URL and insta
 agent identity values. An audit hook records every open, every environment handed to a
 grandchild, and the process's own environment at each gateway-module import and at exit;
 no sentinel file may be opened and no marked value may appear in any of them.
+The Hatch adapter suite's case runs from tests/hermetic-env-sentinels-hatch-adapter.test.py.
 """
 from __future__ import annotations
 
@@ -127,9 +128,6 @@ class Sentinels(unittest.TestCase):
 
     def test_the_relay_harness_hands_its_bridges_no_outer_selector(self):
         self.check(["tests/gateway-voice-outcome-contract.test.py"])
-
-    def test_the_hatch_adapter_suite_reads_no_outer_selector(self):
-        self.check(["packages/ag2-sparrow/tests/test_hatch_adapter.py"])
 
     def test_the_credential_owner_suite_reads_no_outer_selector(self):
         self.check(["tests/gateway-credential-sources.test.py"])

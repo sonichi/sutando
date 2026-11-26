@@ -191,7 +191,7 @@ async function geminiJson(opts: { apiKey: string; model: string; timeoutMs: numb
 				...checkRequestBody(opts.prompt),
 				// A thinking model spends the output budget on thinking and returns a cut-off "{"action":" (seen 2026-10-12):
 				// thinking off, JSON out.
-				generationConfig: { maxOutputTokens: 300, temperature: 0, responseMimeType: 'application/json', thinkingConfig: { thinkingBudget: 0 } },
+				generationConfig: { maxOutputTokens: 300, responseMimeType: 'application/json', thinkingConfig: { thinkingBudget: 0 } },
 			}),
 			signal: ctl.signal,
 		});

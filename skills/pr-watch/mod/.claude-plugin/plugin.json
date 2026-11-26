@@ -1,0 +1,6 @@
+{
+  "name": "pr-watch",
+  "version": "0.1.0",
+  "author": { "name": "Sutando" },
+  "description": "Turns GitHub pull request events from gh webhook forward into session turns, with no polling and no Monitor expiry"
+}

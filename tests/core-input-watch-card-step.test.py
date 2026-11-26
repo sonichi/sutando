@@ -76,7 +76,7 @@ class TestCardStep(unittest.TestCase):
                 patch.object(M, "escalate", lambda *a, **k: calls.append("escalate")), \
                 patch.object(M, "drive_escalations", lambda *a, **k: calls.append("drive")), \
                 patch.object(M, "resolve_escalations", lambda *a, **k: calls.append("resolve")), \
-                patch.object(M.time, "sleep", sleep), \
+                patch.object(M, "_sleep", sleep), \
                 patch.object(sys, "argv", argv):
             with self.assertRaises(_Done):
                 M.main()
@@ -135,7 +135,7 @@ class TestCardStep(unittest.TestCase):
                 patch.object(M, "drive_escalations", lambda *a, **k: None), \
                 patch.object(M, "notice_queued", lambda *a, **k: None), \
                 patch.object(M.core_gate_notice, "queued_count", lambda ws: 0), \
-                patch.object(M.time, "sleep", sleep), \
+                patch.object(M, "_sleep", sleep), \
                 patch.object(sys, "argv", argv):
             with self.assertRaises(_Done):
                 M.main()

@@ -6,6 +6,7 @@ revision or a repainted interaction's guard must raise, never execute.
 
 import sys
 import tempfile
+import json
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -55,6 +56,111 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(w["actions"][0], {"id": "reauth", "kind": "authenticate", "label": "Re-authenticate"})
         self.assertEqual(w["device"]["name"], "the owner's laptop")
         self.assertEqual(WIRE_FIELD, "space.ag2.hitl")
+
+    def test_the_wire_subject_carries_only_the_card_fields(self):
+        req = make_req(subject={"tool": "Bash", "input": "ls", "options": ["a", "b"],
+                                "choices": {"a": "do a"}, "ask_id": "ask-1",
+                                "claim": {"token": "t0k", "state": "handed", "handed_at": 1.5,
+                                          "lease": {"observed_at": 1.5, "elapsed": 0.25}},
+                                "claude-local": {"stall_token": "s"}, "session": "sess",
+                                "driven_at": 2.5, "option_for_action": {"a": 1}})
+        self.assertEqual(req.to_wire()["subject"], {"tool": "Bash", "input": "ls", "options": ["a", "b"],
+                                                    "choices": {"a": "do a"}})
+        self.assertIn("claim", req.subject, "the local record keeps every field")
+
+    def test_the_wire_says_what_came_of_the_answer(self):
+        """The card's result line (owner's PM 2026-11-24: neither client showed one)."""
+        from hitl.schema import STATUS_EXPIRED, STATUS_IN_PROGRESS, STATUS_RESOLVED
+        r = make_req()
+        self.assertNotIn("outcome", r.to_wire(), "nobody answered: no result line")
+        r.chosen_action = "allow"
+        r.status = STATUS_IN_PROGRESS
+        self.assertEqual(r.to_wire()["outcome"], {"state": "running"})
+        r.subject = {**(r.subject or {}), "driven_at": 1, "driven_settled": 2}
+        r.status = STATUS_RESOLVED
+        self.assertEqual(r.to_wire()["outcome"], {"state": "done"}, "sent, and the runtime carried on")
+        r.subject.pop("driven_settled")
+        self.assertEqual(r.to_wire()["outcome"], {"state": "closed"},
+                         "sent, but nobody saw the runtime carry on: neutral, never success")
+        r.status, r.subject = STATUS_EXPIRED, {**r.subject, "driver_note": "The answer did not take.  Open the terminal to finish it."}
+        self.assertEqual(r.to_wire()["outcome"],
+                         {"state": "failed", "text": "The answer did not take. Open the terminal to finish it."})
+        r.decided_by = "policy"
+        self.assertNotIn("outcome", r.to_wire(), "a policy answer is never a card")
+
+    def test_what_the_human_submitted_is_never_the_result_line(self):
+        """`answer` holds the human's submitted payload (manager.apply_action); an expiry must not
+        publish it as if a driver had said it."""
+        from hitl.schema import STATUS_EXPIRED
+        r = make_req()
+        r.chosen_action, r.status = "allow", STATUS_EXPIRED
+        r.answer = {"note": "my token is hunter2", "text": "also private"}
+        self.assertNotIn("hunter2", json.dumps(r.to_wire()))
+        r.subject = {**(r.subject or {}), "driven_at": 1}
+        wire = r.to_wire()
+        self.assertEqual(wire["outcome"], {"state": "closed"})
+        self.assertNotIn("hunter2", json.dumps(wire))
+
+    def test_an_ordinary_answered_card_carries_no_closing_outcome(self):
+        """A card no terminal driver handles (a question, an approval, a sign-in) closes as it always
+        has: its status says how, and no `outcome` is sent. The clients show `closed` as "Closed
+        without verification", which is a driver's word, never an ordinary card's."""
+        from hitl.schema import (STATUS_CANCELLED, STATUS_EXPIRED, STATUS_IN_PROGRESS, STATUS_PENDING,
+                                 STATUS_RESOLVED)
+        r = make_req()
+        base = r.to_wire()
+        self.assertEqual(sorted(base), ["actions", "guard", "id", "kind", "message", "revision", "runtime", "status"])
+        self.assertEqual(base["status"], STATUS_PENDING)
+        r.chosen_action, r.status = "reauth", STATUS_IN_PROGRESS
+        self.assertEqual(r.to_wire(), {**base, "status": "in_progress", "outcome": {"state": "running"}})
+        for status in (STATUS_RESOLVED, STATUS_EXPIRED, STATUS_CANCELLED):
+            r.status = status
+            self.assertEqual(r.to_wire(), {**base, "status": status}, "the wire of before `outcome` existed")
+        # What the human submitted, and a driver note nobody could have written here, change nothing.
+        r.status, r.answer = STATUS_RESOLVED, {"note": "typed by the human"}
+        self.assertEqual(r.to_wire(), {**base, "status": "resolved"})
+
+    def test_every_outcome_the_wire_can_carry(self):
+        """The whole table, as the web and iOS clients read it: `state` is one of four words, `text`
+        comes only with `failed`, and nothing else is ever in `outcome`."""
+        from hitl.schema import (STATUS_CANCELLED, STATUS_EXPIRED, STATUS_IN_PROGRESS, STATUS_PENDING,
+                                 STATUS_RESOLVED)
+        driven, settled, note = {"driven_at": 1}, {"driven_at": 1, "driven_settled": 2}, {"driver_note": "It did not take."}
+        table = [
+            # status, answered, subject, decided_by -> outcome
+            (STATUS_PENDING, False, {}, None, None),
+            (STATUS_PENDING, True, driven, None, None),
+            (STATUS_IN_PROGRESS, True, {}, None, {"state": "running"}),
+            (STATUS_IN_PROGRESS, True, driven, None, {"state": "running"}),
+            (STATUS_RESOLVED, True, settled, None, {"state": "done"}),
+            (STATUS_RESOLVED, True, driven, None, {"state": "closed"}),
+            (STATUS_RESOLVED, True, {}, None, None),
+            (STATUS_RESOLVED, False, settled, None, None),
+            (STATUS_EXPIRED, True, {**driven, **note}, None, {"state": "failed", "text": "It did not take."}),
+            (STATUS_EXPIRED, True, note, None, {"state": "failed", "text": "It did not take."}),
+            (STATUS_EXPIRED, True, {**driven, "driver_note": "  "}, None, {"state": "closed"}),
+            (STATUS_EXPIRED, True, driven, None, {"state": "closed"}),
+            (STATUS_EXPIRED, True, {}, None, None),
+            (STATUS_CANCELLED, True, driven, None, {"state": "closed"}),
+            (STATUS_CANCELLED, True, {}, None, None),
+            (STATUS_RESOLVED, True, settled, "policy", None),
+        ]
+        seen = set()
+        for status, answered, subject, decided_by, want in table:
+            r = make_req(subject=dict(subject))
+            r.status, r.chosen_action, r.decided_by = status, ("reauth" if answered else None), decided_by
+            wire = r.to_wire()
+            self.assertEqual(wire.get("outcome"), want, (status, answered, subject, decided_by))
+            self.assertNotIn("driven_at", json.dumps(wire), "the driver's bookkeeping stays on the host")
+            self.assertNotIn("driver_note", json.dumps(wire))
+            seen.add((want or {}).get("state"))
+        self.assertEqual(seen, {None, "running", "done", "failed", "closed"})
+        long = make_req(subject={"driver_note": "x" * 500})
+        long.status, long.chosen_action = STATUS_EXPIRED, "reauth"
+        self.assertEqual(long.to_wire()["outcome"], {"state": "failed", "text": "x" * 200})
+
+    def test_a_subject_with_no_card_field_leaves_no_subject_on_the_wire(self):
+        self.assertNotIn("subject", make_req(subject={"claim": {"token": "t"}}).to_wire())
 
     def test_every_card_names_the_host_at_the_wire(self):
         # The auth card (detector.auth_requirement) takes its device from a caller that

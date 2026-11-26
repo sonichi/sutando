@@ -10,7 +10,9 @@
 # Guards:
 #   - the tag MUST equal the packaged __version__ (fail loudly on mismatch);
 #   - the version MUST NOT already exist on PyPI (no silent re-upload);
-#   - the package test suites + src-drift guard run before any upload.
+#   - the package test suites + src-drift guard run before any upload, and in
+#     ci.yml (sparrow-publish-gate job) on every main push and every PR that
+#     reaches the package, on the same Python.
 #
 # One-time PyPI setup (owner): project ag2-sparrow → Publishing → add GitHub
 # Trusted Publisher (owner: sonichi, repo: sutando, workflow:
@@ -36,7 +38,7 @@ permissions:
 jobs:
   version-drift:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -53,7 +55,7 @@ jobs:
 
   publish:
     if: startsWith(github.ref, 'refs/tags/sparrow-v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: pypi
     permissions:
       id-token: write   # OIDC for PyPI Trusted Publishing
@@ -77,10 +79,7 @@ jobs:
             echo "::error::version $VER already on PyPI — bump __version__"; exit 1
           fi
       - name: Test before publish (package suites + src-drift guard)
-        run: |
-          set -e
-          for t in packages/ag2-sparrow/tests/test_*.py; do python3 "$t"; done
-          python3 packages/ag2-sparrow/tools/test_no_drift.py
+        run: bash packages/ag2-sparrow/tools/publish_gate.sh
       - name: Build sdist + wheel
         run: |
           python3 -m pip install --quiet build
@@ -111,7 +110,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"arch":"x86_64","runner":"ubuntu-latest"}]' || '[{"arch":"x86_64","runner":"ubuntu-latest"},{"arch":"arm64","runner":"ubuntu-24.04-arm"}]') }}
+        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"arch":"x86_64","runner":"ubuntu-24.04"}]' || '[{"arch":"x86_64","runner":"ubuntu-24.04"},{"arch":"arm64","runner":"ubuntu-24.04-arm"}]') }}
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -134,7 +133,7 @@ jobs:
   release-assets:
     if: startsWith(github.ref, 'refs/tags/sparrow-v')
     needs: [publish, linux-binary]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write   # create the GitHub Release and upload its assets
     steps:

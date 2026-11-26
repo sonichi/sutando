@@ -41,9 +41,21 @@ Every gate run posts a **sticky PR comment** (one comment, updated per push
 the whole-tree percentage, and the per-file uncovered-lines table on
 failure. The same content lands in the Actions job summary.
 
+The advisory **Not measured** section names changed Python files absent from
+coverage.py's JSON report. JSON retains repository-relative paths, so a reported
+`src/nested/shared.py` cannot hide an unmeasured `scripts/nested/shared.py` or
+`outside/nested/shared.py`. Discovered files with zero executed lines remain in
+the report and count as measured. XML is still used for the diff-coverage check.
+The job log and Markdown advisory preserve spaces and literal shell metacharacters
+in each emitted path; filenames are never expanded as shell patterns.
+If JSON generation fails, the gate reports that this diagnostic is unavailable
+and preserves the diff-coverage verdict without reading an older JSON report.
+To run the diagnostic directly, generate `python3 -m coverage json --quiet`, then
+run `python3 scripts/coverage_unmeasured.py origin/main coverage.json`.
+
 Mechanically this is one suite run and two jobs in `ci.yml`, then a second
 workflow. `python-standalone-tests` runs the suite once under `coverage run`,
-as nine matrix legs: legs 1-7 balanced by measured cost (`scripts/shard-by-cost.sh` over `tests/python-suite-costs.txt`, regenerated with `scripts/gen-suite-costs.sh` from job logs), heaviest suite first; leg 8 the load-sensitive suites, heaviest first, two at a time; leg 9 the ones tagged `serial`, alone. They
+as fifteen matrix legs: legs 1-13 balanced by measured cost (`scripts/shard-by-cost.sh` over `tests/python-suite-costs.txt`, regenerated with `scripts/gen-suite-costs.sh` from job logs), heaviest suite first; leg 14 the load-sensitive suites, heaviest first, two at a time; leg 15 the ones tagged `serial`, alone. They
 upload their combined data as `coverage-data-<shard>`; the `coverage-gate`
 job (`needs:` that job, `pull_request` only — where fork PRs get a read-only
 token) downloads every leg, combines the fragments into one `.coverage` +
@@ -55,6 +67,40 @@ fires on `workflow_run` of `CI` in the base-repo context with
 what keeps the write token safe. Note `workflow_run` executes the default
 branch's copy of the file, so the comment half activates once merged to
 main; until then the numbers are in the job summary.
+
+## Lane worktree isolation
+
+`scripts/parallel-suite-lane.sh` pins the caller's input commit once and runs each
+worker in its own disposable worktree. Between suites it restores that commit
+with detached HEAD and removes non-ignored untracked files. A suite's commits,
+revision checkouts, staged changes and unstaged changes are reset before the next
+suite starts. Recovery leaves a branch selected by a suite at its existing tip.
+Ignored files, coverage fragments and the shared `node_modules` link survive.
+The scheduler resolves the source repository before clearing Git's repository-local
+environment variables, so suite commands and recovery cannot use the caller's
+worktree or staged index through inherited Git selectors.
+
+If a worker cannot restore its worktree, it stops before taking another suite
+and the scheduler exits nonzero. Other workers finish their remaining work;
+the run must be fixed and repeated before treating its results as complete.
+Recovery validates each worker's original directory identity, canonical path and
+Git/index identity before destructive operations, refusing redirected Git metadata or a replaced
+worktree path. An identity mismatch retains the suspect worktree for inspection
+instead of removing it through redirected metadata. Checkout and clean run from
+the checked directory held as the current directory, so replacing its old pathname
+cannot redirect those commands. Each suite's owned process group is terminated
+and joined before recovery, including descendants left after normal suite exit.
+Interrupts defer exit through worktree creation and identity capture, and until
+newly launched workers and suites are registered. They then terminate owned
+process groups and wait before worktree cleanup.
+If descendant termination cannot be confirmed, the run fails and retains that
+worker and its registration for inspection.
+
+Worktrees are not an OS security sandbox: suites run with the caller's permissions
+and share repository objects and refs. These guards protect scheduler recovery;
+they do not prevent a suite from directly changing files outside its worktree.
+Processes deliberately escaping the scheduler's process groups are also outside
+its cancellation contract.
 
 ## What counts / doesn't count
 
@@ -83,7 +129,7 @@ legitimately cannot meet the bar (rare — e.g. a pure launchd-installer
 change), the owner can merge over a red gate; the gate is a required
 conversation, not an unappealable veto.
 
-### Load-sensitive suites (legs 8-9)
+### Load-sensitive suites (legs 14-15)
 
 `tests/python-load-sensitive-suites.txt` lists the suites CI keeps off the shared
 four-worker legs; `scripts/select-load-sensitive-suites.sh` is the only reader, and
@@ -95,8 +141,8 @@ before its suites: no receipt, or a list changed after selection, fails the leg 
 windows or timing margins under load: either a CI run where it failed that way while
 sharing a leg with heavier suites (cite the run id), or a tracked flake issue naming it
 (cite the number). A suite split out of an admitted one, sharing its harness, is admitted
-with it. A suite that fails in leg 8 itself, beside another listed suite, is tagged `serial`
-(cite that run) and runs alone in leg 9. Current entries and their evidence:
+with it. A suite that fails in leg 14 itself, beside another listed suite, is tagged `serial`
+(cite that run) and runs alone in leg 15. Current entries and their evidence:
 
 | suite | evidence |
 |---|---|
@@ -104,6 +150,7 @@ with it. A suite that fails in leg 8 itself, beside another listed suite, is tag
 | readiness-window-decision-instant | CI run 36888802147 attempt 2, PR #5000 at 7dee69d8c |
 | readiness-window-held-task-recovery, -unreadable-config | split with decision-instant from one suite (#4630), same harness |
 | config-hot-reload, inbox-and-workspace-env, malformed-roster-row, priority-sweep, sentinel-ownership | flake issue #4862 (failed together under host load) |
-| handler-terminal-rc (`serial`: leg 9, alone) | flake issue #4855; timed out on the two-worker leg (then leg 6 of a six-leg layout) in CI run 36914315349 |
+| handler-terminal-rc (`serial`: leg 15, alone) | flake issue #4855; timed out on the two-worker leg (then leg 6 of a six-leg layout) in CI run 36914315349 |
 | tests/codex-core-launcher.test.py | PR #5266 at 99fc2cb01: a leg-7 table reassignment (off the prior leg 5) failed `test_unassigned_notifier_task_bypasses_slow_history_scan`'s `elapsed < 2.5s` assertion twice at the same head sharing the leg with heavier suites (CI run 37875583615, attempts 1-2: 3.417s, 2.636s), against an unloaded control of 1.978-2.116s across three local runs; reviewed by kewei-red-ag2space |
+| tests/skills/worker-pool/worker-config-directory.test.py | `interrupt()` timed out waiting for the SIGINT'd runtime to exit (10s window) in CI run 40187362038 job 121152480033 (leg 3, beside a 152s and a 100s suite) and CI run 40212369441 jobs 121226210870 and 121228062989 (attempts 1-2, leg 1, beside a 121s and a 67s suite), each at a head that does not touch the suite; it ran 38-45s there against ~21s in three unloaded local runs |
 

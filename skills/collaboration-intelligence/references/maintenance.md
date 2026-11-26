@@ -41,13 +41,13 @@ Do not wait for the normal cadence when:
 - reconnect or recovery may have lost events
 - reported member count differs from stored membership
 - an unfamiliar participant affects trust or a sensitive action
-- a full AG2 Space roster or independent exhaustive query shows an agent without its expected owner; absence from a truncated task header is not evidence
+- a full s.space roster or independent exhaustive query shows an agent without its expected owner; absence from a truncated task header is not evidence
 - a recipient or owner must be resolved before sending
 - the latest context is too stale to coordinate safely
 
 ## Provider notes
 
-- **AG2 Space:** the **task-file stream (`tasks/` + `tasks/archive/`) is the observation source** — ingest each task's headers immediately; that is observation, not room enumeration. Drive the refresh from a **cursor over task arrival time** (the `id` epoch-ms or `timestamp:` header, never mtime) so each sweep processes only tasks newer than the last, never from scratch. Compare `len(room_members)` with `room_member_count`: equality is a full task-time snapshot; a smaller list is truncated/partial, with the true size taken from `room_member_count`. Use scheduled or on-demand reconciliation when an exhaustive roster is required.
+- **s.space:** the **task-file stream (`tasks/` + `tasks/archive/`) is the observation source** — ingest each task's headers immediately; that is observation, not room enumeration. Drive the refresh from a **cursor over task arrival time** (the `id` epoch-ms or `timestamp:` header, never mtime) so each sweep processes only tasks newer than the last, never from scratch. Compare `len(room_members)` with `room_member_count`: equality is a full task-time snapshot; a smaller list is truncated/partial, with the true size taken from `room_member_count`. Use scheduled or on-demand reconciliation when an exhaustive roster is required.
 - **Discord:** prefer channel/thread deltas. Do not repeatedly enumerate a large guild and call the result full when the bridge exposes only a partial roster.
 - **Telegram:** use observed deltas and context rollups; the current bridge cannot produce a Matrix-style exhaustive membership sweep.
 - **Slack:** use cursors and pagination; stagger channel sweeps and treat Slack Connect access scope carefully.

@@ -21,6 +21,11 @@ def read_file(path: str):
     return read_regular(path)
 
 
+def channel_env_files(env: Mapping[str, str]) -> "gateway_credential_sources.EnvFiles":
+    """The channel .env files a bridge given `env` reads, read by read_file, with any refusals."""
+    return gateway_credential_sources.env_files(env, read_file)
+
+
 def monorepo_src(marker: str, start: str = __file__) -> str:
     """The monorepo `src/` that holds `marker`, walking up from `start`; '' when ag2-sparrow
     runs standalone (pyproject install, no monorepo around it)."""

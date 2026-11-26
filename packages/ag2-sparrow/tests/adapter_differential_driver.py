@@ -61,10 +61,16 @@ def norm_text(base, text):
     return UUID.sub("<id>", text)
 
 
+# codex-local denies these on macOS only, where the platform's minimal read set leaves /tmp readable; the
+# recording is one for every host, so the two rules are left out of it and pinned in test_codex_connector.
+MACOS_ONLY_DENIES = ("/private/tmp", "/tmp")
+
+
 def norm(base, value):
     """Real values, with only the per-run parts replaced."""
     if isinstance(value, dict):
-        return {k: ("<n>" if k in TIMING_KEYS else norm(base, v)) for k, v in value.items()}
+        return {k: ("<n>" if k in TIMING_KEYS else norm(base, v)) for k, v in value.items()
+                if not (k in MACOS_ONLY_DENIES and v == "deny")}
     if isinstance(value, list):
         return [norm(base, v) for v in value]
     if isinstance(value, float) and value > 1e9:
@@ -87,6 +93,8 @@ def read_state(base, work):
             value = [norm(base, json.loads(line)) for line in text.splitlines()]
         else:
             value = norm_text(base, text)
+        if rel == "live-view.log":      # the owner's read-only view of the turns (#6732): its clock times are per run
+            value = re.sub(r"\b\d\d:\d\d:\d\d\b", "<hh:mm:ss>", value)
         out[rel] = value
     return out
 

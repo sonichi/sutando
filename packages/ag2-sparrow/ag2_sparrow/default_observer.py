@@ -7,6 +7,8 @@ import queue
 import threading
 import time
 
+from . import diagnostics
+
 # 👀 = "observed" — distinct from the task-intake ack the gateway emits
 # server-side, so a glance separates "seen" from "accepted as a task".
 OBSERVE_REACTION = "\U0001F440"
@@ -60,7 +62,7 @@ class ReactObserverHandler:
         try:
             self._maybe_react(event)
         except Exception as e:  # noqa: BLE001 — courtesy signal, never breaks the chain
-            self._log(f"react-observer: swallowed {e}")
+            self._log(f"react-observer: swallowed {diagnostics.describe(e)}")
         return self._inner.offer(event)
 
     # ---- the receipt itself
@@ -117,7 +119,7 @@ class ReactObserverHandler:
         # Duplicate-react rejections (a previous run already reacted) and
         # permission degrades are benign for a courtesy receipt.
         except Exception as e:  # noqa: BLE001 — the worker must never die
-            self._log(f"react-observer: error reacting to {msg_id}: {e} (ignored)")
+            self._log(f"react-observer: error reacting to {msg_id}: {diagnostics.describe(e)} (ignored)")
 
     def flush(self, timeout: float = 5.0) -> bool:
         """Wait until queued receipts are delivered (tests / graceful stops)."""

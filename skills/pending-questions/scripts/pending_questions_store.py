@@ -85,10 +85,15 @@ def neutralize(text: str) -> str:
 
 
 def ordered_options(default_action: Optional[str], options) -> list:
-    """(label, consequence) pairs with Approve first; Approve carries the default."""
+    """(label, consequence) pairs with Approve first; Approve carries the default.
+
+    An option named like the default is the same choice as Approve: it lends Approve its
+    consequence and is not shown again."""
     opts = [(str(a).strip(), str(b).strip()) for a, b in options or () if str(a).strip()]
-    approve = [o for o in opts if o[0].lower() == APPROVE.lower()]
-    rest = [o for o in opts if o[0].lower() != APPROVE.lower()]
+    default = (default_action or "").strip().lower()
+    same = [o for o in opts if o[0].lower() == APPROVE.lower() or (default and o[0].lower() == default)]
+    rest = [o for o in opts if o not in same]
+    approve = [o for o in same if o[0].lower() == APPROVE.lower()] or same
     if approve:
         lead = (APPROVE, approve[0][1] or (default_action or "").strip())
     else:
@@ -108,6 +113,7 @@ class Question:
     reason: Optional[str] = None
     options: tuple = ()
     priority: str = "Medium"
+    asked_by: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {**asdict(self), "options": [list(o) for o in self.options]}
@@ -116,7 +122,8 @@ class Question:
     def from_dict(cls, d: dict) -> "Question":
         return cls(str(d["ask_id"]), str(d["question"]), d.get("context"), float(d.get("asked_at") or 0),
                    d.get("default_action"), d.get("reason"),
-                   tuple(tuple(o) for o in d.get("options") or ()), d.get("priority") or "Medium")
+                   tuple(tuple(o) for o in d.get("options") or ()), d.get("priority") or "Medium",
+                   d.get("asked_by") or None)
 
 
 # ---- the room database ---------------------------------------------------------
@@ -138,6 +145,7 @@ DB_SCHEMA = {
                      _opt("low", "Low", "gray")]},
         {"id": "ask_id", "name": "Ask id", "type": "text"},
         {"id": "host", "name": "Host", "type": "text"},
+        {"id": "asked_by", "name": "Asked by", "type": "text"},
         {"id": "recovery", "name": "Recovery", "type": "text"},
         {"id": "closed", "name": "Closed", "type": "text"},
     ],
@@ -283,6 +291,17 @@ def _mark(cells: dict, prop: str) -> Optional[str]:
     return val if val and (tag or None) == (cells.get("host") or None) else None
 
 
+# A click claim's close leaves its token in the Recovery cell ("click:<token>@<host>") beside a
+# plain Closed mark, so a reader that predates tokens still reads the row as closed.
+CLICK_MARK = "click:"
+
+
+def click_token(cells: dict) -> Optional[str]:
+    """The click claim token this row's own host left in Recovery, or None."""
+    val = _mark(cells, "recovery") or ""
+    return val[len(CLICK_MARK):] or None if val.startswith(CLICK_MARK) else None
+
+
 def effective_status(cells: dict) -> str:
     """The owner's terminal Status wins; then the row's Closed mark; else Open."""
     closed = _mark(cells, "closed")
@@ -327,17 +346,25 @@ class RoomDbStore:
     def where(self, ask_id: str) -> str:
         return f"{DB_SCHEMA['name']} database in {self.label}, row {self._rid(ask_id)}"
 
-    def insert_raw(self, ask_id: str, title: str, body: str, priority: str = "Medium") -> dict:
+    def insert_raw(self, ask_id: str, title: str, body: str, priority: str = "Medium",
+                   asked_by: Optional[str] = None) -> dict:
         cells = {"name": one_line_title(title), "status": _option_id("status", "Open"),
                  "priority": _option_id("priority", priority), "ask_id": ask_id}
         if self.host:
             cells["host"] = self.host
+        if asked_by:
+            cells["asked_by"] = asked_by
         res = self.client.add_row(DB_SCHEMA, self._rid(ask_id), cells, body) or {}
         self.last_link = res.get("link")
         return res
 
     def insert(self, q: Question, sent_line: str) -> dict:
-        return self.insert_raw(q.ask_id, q.question, question_body(q, sent_line), q.priority)
+        return self.insert_raw(q.ask_id, q.question, question_body(q, sent_line), q.priority, q.asked_by)
+
+    def redeliver(self, q: Question, sent_line: str) -> None:
+        """Rewrite this row's body with a new delivery record, in one body write under `lock`."""
+        rid = self._rid(q.ask_id)
+        self._locked(lambda: self.client.set_body(DB_SCHEMA, rid, question_body(q, sent_line)))
 
     def complete(self, ask_id: str) -> bool:
         """The row is present, carries this exact ask id (and this host), has a body and no
@@ -379,11 +406,19 @@ class RoomDbStore:
     def _tag(self, value: str) -> str:
         return f"{value}@{self.host}" if self.host else value
 
-    def close(self, ask_id: str, to: str) -> None:
-        """Record a closure made by code in the Closed cell; Status stays the owner's."""
+    def close(self, ask_id: str, to: str, require_open: bool = False, token: Optional[str] = None) -> None:
+        """Record a closure made by code in the Closed cell; Status stays the owner's.
+        `require_open`: an owner's terminal Status refuses the close in the same guarded write.
+        `token`: the click claim closing it, left in Recovery in the same write (see CLICK_MARK)."""
         if to not in TERMINAL:
             raise StoreError(f"code only closes a row; {to!r} is not Answered or Resolved")
-        self._guarded(ask_id, {"closed": self._tag(to)}, {"closed": [None]})
+        expect = {"closed": [None], **({"status": OPEN_RAW} if require_open else {})}
+        cells = {"closed": self._tag(to), **({"recovery": self._tag(CLICK_MARK + token)} if token else {})}
+        self._guarded(ask_id, cells, expect)
+
+    def click_token_of(self, ask_id: str) -> Optional[str]:
+        r = self.client.row(DB_SCHEMA, self._rid(ask_id))
+        return click_token((r or {}).get("cells") or {})
 
     def clear(self, ask_id: str, props: list) -> None:
         """Remove stale code marks from this host's row; Status is not touched."""
@@ -426,8 +461,9 @@ class Outbox(HeldRecords):
         super().__init__(workspace)
         self.workspace = Path(workspace)
 
-    def save(self, q: Question, sent_line: str, now: Optional[float] = None) -> Path:  # type: ignore[override]
-        return super().save(q.to_dict(), sent_line, now)
+    def save(self, q: Question, sent_line: str, now: Optional[float] = None,  # type: ignore[override]
+             redeliver: bool = False) -> Path:
+        return super().save(q.to_dict(), sent_line, now, redeliver)
 
     def commit_history(self, ask_id: str) -> None:
         """The durable fact a confirmed row proves, committed before any local evidence goes."""
@@ -457,6 +493,8 @@ class Outbox(HeldRecords):
                 store.insert(q, e["sent"] or f"**Sent:** record not kept; held in the outbox since {e['saved_at']}")
                 if not store.complete(q.ask_id):
                     raise StoreError("the row is still incomplete after the replay")
+                if e.get("redeliver"):
+                    store.redeliver(q, e["sent"])  # a row born with an older record takes this one
                 self.commit_history(q.ask_id)
                 self.delete(q.ask_id)
                 flushed.append(q.ask_id)

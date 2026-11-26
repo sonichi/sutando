@@ -16,10 +16,14 @@ so the dispatcher stays path-free and tests compose tmp dirs.
 from __future__ import annotations
 
 import json
+import sys
 import time
 from pathlib import Path
 
-from state_records import read_beat, read_record
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE.parent))
+from entrance_links import enrolled_stand_id  # noqa: E402
+from state_records import read_beat, read_record  # noqa: E402
 
 from agents_view import ALIVE_MAX_AGE_S
 
@@ -28,8 +32,10 @@ class IdentityView:
     def __init__(self, state_dir: str | Path, actor_id: str,
                  channels_dir: str | Path | None = None,
                  host_label: str | None = None,
-                 instance: str | None = None):
+                 instance: str | None = None,
+                 environ=None):
         self.state_dir = Path(state_dir)
+        self.environ = environ
         self.actor_id = actor_id
         self.channels_dir = Path(channels_dir) if channels_dir else None
         self.host_label = host_label
@@ -180,18 +186,21 @@ class IdentityView:
         # no credential reads — nothing may claim more than unverified.
         out = []
         if self.channels_dir is not None and self.channels_dir.is_dir():
+            stand_id = self._enrolled().get("agent_id")
             for d in sorted(self.channels_dir.iterdir()):
                 if not d.is_dir():
                     continue
-                out.append(self._entrance(d, details))
+                out.append(self._entrance(d, stand_id, details))
         return {"channels": out}
 
-    def _entrance(self, d: Path, details: bool = False) -> dict:
+    def _entrance(self, d: Path, stand_id: "str | None",
+                  details: bool = False) -> dict:
         ent: dict = {"provider": d.name}
         links, store_corrupt = self._links_store()
-        link = next((lk for lk in links
-                     if lk.get("provider") == d.name
-                     and lk.get("status") == "active"), None)
+        active = [lk for lk in links
+                  if lk.get("provider") == d.name and lk.get("status") == "active"]
+        link = next((lk for lk in active
+                     if stand_id and lk.get("stand_id") == stand_id), None)
         evidence: dict = {}
         env = d / ".env"
         if env.is_file():
@@ -206,10 +215,8 @@ class IdentityView:
                     evidence["owner_id"] = payload["tofuOwner"]
             except (OSError, ValueError):
                 policy_invalid = True
-        if d.name == "ag2space":
-            enrolled = self._enrolled()
-            if enrolled.get("agent_id"):
-                evidence["subject_evidence"] = enrolled["agent_id"]
+        if d.name == "ag2space" and stand_id:
+            evidence["subject_evidence"] = stand_id
         if store_corrupt:
             # a broken links store must not read as "no binding" — that would
             # silently demote an authorized channel to configured_unverified
@@ -217,6 +224,11 @@ class IdentityView:
             ent["policy_error"] = "entrance-links store unreadable"
         elif policy_invalid:
             ent["status"] = "policy_invalid"
+        elif active and not link:
+            # a binding to another Stand, or with no Stand resolved, is never this card's channel
+            ent["status"] = "policy_invalid"
+            ent["policy_error"] = ("stand identity unresolved" if not stand_id
+                                   else "entrance link bound to a different Stand")
         elif link:
             # introspection proves credential->subject; ONLY an explicit
             # owner authorization on the link makes the Stand binding active
@@ -235,6 +247,9 @@ class IdentityView:
             ent["status"] = "configured_unverified"
         else:
             ent["status"] = "not_configured"
+        bound = (link or (active[0] if active else {})).get("stand_id")
+        if isinstance(bound, str) and bound:
+            ent["stand_id"] = bound  # the Stand the stored link records, never the card's
         if evidence:
             ent["evidence"] = evidence
         if details:
@@ -275,11 +290,8 @@ class IdentityView:
             return {}
 
     def _enrolled(self) -> dict:
-        try:
-            rec = json.loads((self.state_dir / "auth" / "ag2space.json").read_text())
-            return rec if isinstance(rec, dict) else {}
-        except (OSError, ValueError):
-            return {}
+        sid = enrolled_stand_id(self.state_dir, self.environ)
+        return {"agent_id": sid} if sid else {}
 
     def _channels(self):
         if self.channels_dir is None or not self.channels_dir.is_dir():

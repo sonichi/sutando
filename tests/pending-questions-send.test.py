@@ -143,6 +143,10 @@ class _Workspace(unittest.TestCase):
         patcher = mock.patch.object(skill_roots, "declared_script", return_value=ADAPTER)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The macOS cases below are the owner's opt-in (notifications.macos); default is off.
+        self.macos_opt_in = mock.patch.object(pqa, "resolve_macos_notifications", return_value=True)
+        self.macos_opt_in.start()
+        self.addCleanup(self.macos_opt_in.stop)
 
     def _osascript(self, rc):
         p = self.bin / "osascript"
@@ -485,6 +489,15 @@ class TestFailOpen(_Workspace):
         self.assertIn("osascript not found", r.stdout)
         self.assertIn("System Settings > Notifications", r.stdout)
 
+    def test_notifications_off_runs_no_osascript_and_reports_no_macos_line(self):
+        self.macos_opt_in.stop()
+        with mock.patch.object(pqa, "resolve_macos_notifications", return_value=False):
+            r = self._run("q?")
+        self.macos_opt_in.start()
+        self.assertNotIn("macos:", r.stdout)
+        self.assertFalse(self.calls.exists(), "osascript ran with macOS notifications off")
+        self.assertEqual(len(self._proactive()), 1, "the question still goes to the owner's DM")
+
     def test_live_notifies_and_durable_does_not(self):
         r = self._run("q?")
         self.assertIn("macos: notification sent", r.stdout)
@@ -701,6 +714,29 @@ class TestNoSkill(_Workspace):
         self.assertFalse(self.calls.exists())
         self.assertEqual(self._records(), [], "no outbox entry: the outbox is the skill's")
         self.assertTrue(reader.gather(self.ws, skill_roots.declared(reader.DECLARATION, roots=self.ws / "no-skills"))["unavailable"])
+
+    def test_explicit_options_are_listed_in_the_text_ask(self):
+        """No adapter, so no card: the text ask still names every choice and what it does."""
+        r = self._run("Roll out v2?", "--context", "CI is green", "--default", "start rollout",
+                      "--reason", "the canary held", "--option", "Hold=wait for review",
+                      "--option", "Ship=start the full rollout")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        [f] = self._proactive()
+        body = f.read_text()
+        self.assertIn("Roll out v2?\n\nCI is green\n", body)
+        self.assertIn("Why Approve: the canary held\n", body)
+        self.assertIn("- Approve: start rollout\n- Hold: wait for review\n- Ship: start the full rollout\n", body)
+        self.assertIn("Reply here with the one you choose.", body)
+        [(_, rec, _)] = local_record.RecordDir(self.ws / "state" / "ask-owner").entries()
+        self.assertEqual(rec["body"], body)
+
+    def test_options_without_a_default_are_listed_as_given(self):
+        r = self._run("Which draft?", "--option", "A=the short one", "--option", "B=the long one")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        [f] = self._proactive()
+        body = f.read_text()
+        self.assertIn("- A: the short one\n- B: the long one\n", body)
+        self.assertNotIn("Approve", body)
 
     def test_a_failed_send_is_in_the_record_and_a_failed_record_is_named(self):
         (self.ws / "results").rmdir()

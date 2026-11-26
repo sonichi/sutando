@@ -34,7 +34,8 @@
         "tasks/",
         "results/",
         "notes/generated/",
-        "notes/media/"
+        "notes/media/",
+        "state/ag2-mcp.d/"
       ]
     },
     "interval_seconds": 1800

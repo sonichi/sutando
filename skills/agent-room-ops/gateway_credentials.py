@@ -21,8 +21,9 @@ DNS policy) to leak into the shared module. This module is strictly pure:
 
 It also holds the masking contract: the secret registry (an object the caller
 owns), the renderings a secret can take, and what a log line, a status field
-or a gateway-supplied value may carry (code_field, redact_text, safe_status,
-describe).
+or a gateway-supplied value may carry (code_field, version_field, redact_text,
+safe_status, describe, scrub_exception). It is the only implementation: a
+consumer holds one registry for its sinks and calls these, never a copy.
 
 Consumers own those as runtime adapters and feed plain values in.
 
@@ -145,11 +146,12 @@ def fold(text: str) -> str:
     return str(text).casefold()
 
 
-def _utf8(s: str) -> bytes:
+def _utf8(s: str) -> "tuple[bytes, ...]":
     try:
-        return s.encode("utf-8", "surrogateescape")  # a non-UTF-8 environment byte, as its byte
+        return (s.encode("utf-8", "surrogateescape"),)  # a non-UTF-8 environment byte, as its byte
     except UnicodeEncodeError:
-        return s.encode("utf-8", "backslashreplace")
+        # A lone high surrogate: as its UTF-8 bytes, and escaped.
+        return s.encode("utf-8", "surrogatepass"), s.encode("utf-8", "backslashreplace")
 
 
 def forms(secret: str) -> "set[str]":
@@ -157,11 +159,10 @@ def forms(secret: str) -> "set[str]":
     unicode_escape render it, and percent-encoded or -decoded. Total over any str."""
     out = set()
     for s in {secret, urllib.parse.unquote(secret), urllib.parse.unquote_plus(secret)}:
-        raw = _utf8(s)
         out |= {s, repr(s)[1:-1], s.encode("unicode_escape").decode("ascii"),
-                ascii(s)[1:-1], s.encode("ascii", "backslashreplace").decode("ascii"),
-                urllib.parse.quote(raw, safe=""), urllib.parse.quote(raw, safe="/=&?#:@"),
-                urllib.parse.quote_plus(raw, safe=""), urllib.parse.quote_plus(raw, safe="/=&?#:@")}
+                ascii(s)[1:-1], s.encode("ascii", "backslashreplace").decode("ascii")}
+        out |= {quote(raw, safe=safe) for raw in _utf8(s) for quote in (urllib.parse.quote, urllib.parse.quote_plus)
+                for safe in ("", "/=&?#:@")}
     return {f for f in out if f}
 
 
@@ -363,20 +364,49 @@ def code_field(value: Any, registry: "SecretRegistry | None" = None, gateway_url
     return None if registry is not None and registry.holds_or_is_piece(value) else value
 
 
-def safe_status(value: Any, net: Callable[[str], str]) -> Any:
-    """`value` with every string value, at any depth, passed through `net`; keys through `net`
-    too. Finite numbers, booleans and None pass. Anything else is withheld, never str()-ed."""
+def safe_status(value: Any, net: Callable[[str], str], registry: "SecretRegistry | None" = None) -> Any:
+    """`value` with every string value, at any depth, passed through `net` and then `registry`'s
+    scrub; keys through `net` only, so a short token cannot turn the payload's own structure into
+    withheld keys. Finite numbers, booleans and None pass. Anything else is withheld, never str()-ed."""
     if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else WITHHELD
     if isinstance(value, str):
-        return net(value)
+        return registry.scrub(net(value)) if registry is not None else net(value)
     if isinstance(value, dict):
-        return {net(k) if isinstance(k, str) else WITHHELD: safe_status(v, net) for k, v in value.items()}
+        return {net(k) if isinstance(k, str) else WITHHELD: safe_status(v, net, registry)
+                for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [safe_status(v, net) for v in value]
+        return [safe_status(v, net, registry) for v in value]
     return WITHHELD
+
+
+# PEP 440's version pattern (packaging.version.VERSION_PATTERN), matched whole.
+_PEP440_RE = re.compile(r"""
+    v?(?:(?:[0-9]+)!)?[0-9]+(?:\.[0-9]+)*
+    (?:[-_.]?(?:a|b|c|rc|alpha|beta|pre|preview)[-_.]?[0-9]*)?
+    (?:-[0-9]+|[-_.]?(?:post|rev|r)[-_.]?[0-9]*)?
+    (?:[-_.]?dev[-_.]?[0-9]*)?
+    (?:\+[a-z0-9]+(?:[-_.][a-z0-9]+)*)?
+""", re.VERBOSE | re.IGNORECASE)
+
+
+def version_field(value: Any, registry: "SecretRegistry | None" = None) -> "str | None":
+    """A gateway-supplied version usable as a structured field: a PEP 440 version of at most
+    64 characters that holds no registered secret. None otherwise."""
+    if not isinstance(value, str) or len(value) > 64 or not _PEP440_RE.fullmatch(value):
+        return None
+    return None if registry is not None and registry.contains(value) else value
+
+
+def revision_field(value: Any, registry: "SecretRegistry | None" = None, gateway_url: str = "") -> "str | None":
+    """A gateway-supplied setup revision as a structured field: an integer (never a bool) is its
+    decimal text, and the text must pass code_field. None otherwise. The heartbeat hint and the
+    setup cache both spell a revision through this, so an integer served on one side matches the other."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = str(value)
+    return code_field(value, registry, gateway_url)
 
 
 _EAI = {v: k for k, v in vars(socket).items() if k.startswith("EAI_") and isinstance(v, int)}
@@ -390,10 +420,45 @@ def _errno_name(exc: BaseException) -> str:
     return _EAI.get(code, "") if isinstance(exc, socket.gaierror) else _errno.errorcode.get(code, "")
 
 
-def describe(exc: BaseException) -> str:
-    """`<Type>[(<reason type>/<ERRNO>)][ <ERRNO>][[<key>]][ (HTTP <n>)][ at <file>:<line>]`. Never
-    the exception's own text: a KeyError's key only when the failing code wrote it as a string
-    literal, a location only as the innermost frame's file name and line."""
+# Marks the classes scrub_exception makes; only they may name the gateway they contacted.
+_SCRUBBED = object()
+
+
+def scrub_exception(exc: BaseException, gateway_url: str) -> BaseException:
+    """`exc`, raised by a call that received the gateway URL, as an exception of a subclass of
+    its own type (so every `except` and attribute read still works) whose text is only
+    `<type> contacting <redacted gateway>`, plus the HTTP status when it has one. Nothing the
+    original text held, in any encoding, can reach a log or a status file through it."""
+    base = type(exc)
+    # The original is never reachable from it: no __context__ (set when raised in a handler).
+    safe = type(base.__name__, (base,), {
+        "__str__": lambda self: self.__dict__.get("_scrubbed", base.__name__),
+        "__repr__": lambda self: f"{base.__name__}({self.__dict__.get('_scrubbed', '')!r})",
+        "__context__": property(lambda self: None, lambda self, value: None),
+        "_scrubbed_mark": _SCRUBBED, "__module__": base.__module__, "__qualname__": base.__qualname__})
+    code = exc.__dict__.get("code")
+    text = f"{base.__name__} contacting {redact_url(gateway_url)}"
+    if isinstance(code, int):
+        text += f" (HTTP {code})"
+    out = safe.__new__(safe)
+    # Objects (an HTTPError's body and headers) and numbers stay; text and bytes never do.
+    out.__dict__.update({k: (text if isinstance(v, str) else b"" if isinstance(v, (bytes, bytearray))
+                             else scrub_exception(v, gateway_url) if isinstance(v, BaseException) else v)
+                         for k, v in exc.__dict__.items()})
+    if isinstance(exc, OSError):
+        out.errno = exc.errno
+    out.__dict__["_scrubbed"] = text
+    out.__dict__["_gateway"] = redact_url(gateway_url)
+    out.args = (text,)
+    out.__traceback__ = exc.__traceback__
+    return out
+
+
+def describe(exc: BaseException, registry: "SecretRegistry | None" = None) -> str:
+    """`<Type>[(<reason type>/<ERRNO>)][ <ERRNO>][[<key>]][ contacting <redacted gateway>][ (HTTP <n>)]
+    [ at <file>:<line>]`. Never the exception's own text: a KeyError's key only when the failing
+    code wrote it as a string literal, the gateway only for an exception scrub_exception made (through
+    `registry`'s scrub), a location only as the innermost frame's file name and line."""
     fields = getattr(exc, "__dict__", {})
     out = type(exc).__name__
     reason = fields.get("reason")
@@ -408,6 +473,9 @@ def describe(exc: BaseException) -> str:
     if isinstance(exc, KeyError) and len(exc.args) == 1 and isinstance(exc.args[0], str) \
             and tb is not None and exc.args[0] in tb.tb_frame.f_code.co_consts:
         out += f"[{exc.args[0]!r}]"
+    gateway = fields.get("_gateway") if type(exc).__dict__.get("_scrubbed_mark") is _SCRUBBED else None
+    if isinstance(gateway, str):
+        out += f" contacting {registry.scrub(gateway) if registry is not None else gateway}"
     status = fields.get("code")
     if isinstance(status, int) and not isinstance(status, bool):
         out += f" (HTTP {status})"

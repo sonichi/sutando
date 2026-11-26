@@ -10,6 +10,7 @@ This guard makes that gap self-detecting instead of silent. It failed to exist
 when five suites -- including the transport gate and the src/-vs-package drift
 guard -- had never run in CI.
 """
+import ast
 import glob
 import re
 import subprocess
@@ -259,6 +260,49 @@ def _named_in(workflow_text: str) -> set:
     return set(program_python_args("\n".join(_run_bodies(workflow_text))))
 
 
+PUBLISH_GATE = "packages/ag2-sparrow/tools/publish_gate.sh"
+
+
+def invokes_publish_gate(workflow_text: str) -> bool:
+    """True when a run body actively calls the ag2-sparrow publish gate (not in a comment)."""
+    body = _uncommented("\n".join(_run_bodies(workflow_text)))
+    return re.search(r"(^|[\s;&|])bash\s+" + re.escape(PUBLISH_GATE) + r"(\s|$)", body, re.M) is not None
+
+
+def _jobs(workflow_text: str) -> dict:
+    """Job id -> that job's text, cut at the two-space job keys under `jobs:`."""
+    body = workflow_text.split("\njobs:\n", 1)
+    if len(body) != 2:
+        return {}
+    parts = re.split(r"^  ([A-Za-z0-9_-]+):[ \t]*$", body[1], flags=re.M)
+    return dict(zip(parts[1::2], parts[2::2]))
+
+
+def gate_runs_in_required_ci(ci_text: str) -> bool:
+    """A job of the PR/main workflow calls the gate, and required-tests needs that job.
+
+    A tag-only release call does not count: it never runs before a merge."""
+    head = ci_text.split("\njobs:\n", 1)[0]
+    on = re.search(r"^on:\n((?:[ \t]+.*\n|\n)*)", head, re.M)
+    if not on or not re.search(r"^  pull_request:", on.group(1), re.M) or not re.search(r"^  push:", on.group(1), re.M):
+        return False
+    jobs = _jobs(ci_text)
+    needs = re.search(r"^    needs:\s*\[([^\]]*)\]", jobs.get("required-tests", ""), re.M)
+    required = {n.strip() for n in needs.group(1).split(",")} if needs else set()
+    return any(job in required and invokes_publish_gate(text) for job, text in jobs.items())
+
+
+def run_by_publish_gate() -> set:
+    """The suites the publish gate runs, asked of the gate itself, credited only while required PR/main CI runs it."""
+    if not gate_runs_in_required_ci(CI.read_text()):
+        return set()
+    out = subprocess.run(["bash", str(REPO / PUBLISH_GATE), "--list"], cwd=str(REPO),
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        raise AssertionError(f"publish_gate.sh --list failed rc={out.returncode}: {out.stderr.strip()}")
+    return {p for p in out.stdout.splitlines() if p}
+
+
 def test_looking_files():
     """Git-TRACKED test-looking files only.
 
@@ -292,11 +336,50 @@ def orphans_in(all_files, discovered, named):
     return sorted(set(all_files) - set(discovered) - set(named))
 
 
+def run_whole_by(delegator_text: str) -> set:
+    """Paths a discovered suite runs whole via `runpy.run_path(p, run_name="__main__")`.
+
+    The path must be spelled as adjacent string literals (`"src" / "x.test.py"`);
+    a docstring or an import-and-call-some-cases delegator credits nothing."""
+    try:
+        tree = ast.parse(delegator_text)
+    except SyntaxError:
+        return set()
+    runs_main = any(
+        isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "run_path"
+        and isinstance(n.func.value, ast.Name) and n.func.value.id == "runpy"
+        and any(k.arg == "run_name" and isinstance(k.value, ast.Constant) and k.value.value == "__main__"
+                for k in n.keywords)
+        for n in ast.walk(tree))
+    if not runs_main:
+        return set()
+    docs = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Expr)}
+    strs = sorted((n for n in ast.walk(tree) if isinstance(n, ast.Constant)
+                   and isinstance(n.value, str) and id(n) not in docs),
+                  key=lambda n: (n.lineno, n.col_offset))
+    parts = [part for n in strs for part in n.value.split("/")]
+    # Every suffix of adjacent parts ending in a .py basename is a candidate path.
+    return {"/".join(parts[i:j + 1]) for j, p in enumerate(parts) if p.endswith(".py")
+            for i in range(j + 1)}
+
+
+def delegated_by(discovered) -> set:
+    out = set()
+    for f in discovered:
+        try:
+            out |= run_whole_by((REPO / f).read_text(encoding="utf-8"))
+        except OSError:
+            continue
+    return out
+
+
 class TestCICoversEveryPythonTest(unittest.TestCase):
     def test_no_python_test_is_invisible_to_ci(self):
         import os
         os.chdir(REPO)
-        orphans = orphans_in(test_looking_files(), discovered_by_find(), named_in_workflows())
+        discovered = discovered_by_find()
+        orphans = orphans_in(test_looking_files(), discovered | delegated_by(discovered) | run_by_publish_gate(),
+                             named_in_workflows())
         self.assertEqual(
             orphans, [],
             "these test files are never executed by CI — either move them to "
@@ -317,6 +400,38 @@ class TestCICoversEveryPythonTest(unittest.TestCase):
 
     def test_a_discovered_file_is_not_an_orphan(self):
         self.assertEqual(orphans_in({"tests/x.test.py"}, {"tests/x.test.py"}, set()), [])
+
+    def test_a_file_a_discovered_suite_runs_whole_is_not_an_orphan(self):
+        text = 'import runpy\nT = R / "packages" / "p" / "tests" / "test_x.py"\nrunpy.run_path(str(T), run_name="__main__")\n'
+        self.assertIn("packages/p/tests/test_x.py", run_whole_by(text))
+
+    def test_a_docstring_or_partial_delegator_credits_nothing(self):
+        doc = '"""Runs packages/p/tests/test_x.py."""\nimport runpy\nrunpy.run_path(str(T), run_name="__main__")\n'
+        self.assertNotIn("packages/p/tests/test_x.py", run_whole_by(doc))
+        partial = 'import importlib.util\nS = R / "packages/p/tests/test_x.py"\nimportlib.util.spec_from_file_location("m", S)\n'
+        self.assertEqual(run_whole_by(partial), set())
+        not_main = 'import runpy\nT = R / "packages/p/tests/test_x.py"\nrunpy.run_path(str(T))\n'
+        self.assertEqual(run_whole_by(not_main), set())
+
+    def test_the_publish_gate_credits_only_when_a_workflow_calls_it(self):
+        self.assertTrue(invokes_publish_gate(f"steps:\n  - run: bash {PUBLISH_GATE}\n"))
+        self.assertFalse(invokes_publish_gate(f"steps:\n  - run: |\n      # bash {PUBLISH_GATE}\n      true\n"))
+        self.assertFalse(invokes_publish_gate(f"steps:\n  - run: echo bash-{PUBLISH_GATE}\n"))
+        self.assertIn("packages/ag2-sparrow/tests/test_hatch_adapter.py", run_by_publish_gate())
+
+    def test_only_a_required_pr_gate_job_credits_the_gate(self):
+        gate = f"bash {PUBLISH_GATE}"
+        ci = ("on:\n  pull_request:\n  push:\n    branches: [main]\n\njobs:\n"
+              f"  gate:\n    steps:\n      - run: {gate}\n"
+              "  required-tests:\n    needs: [changes, gate]\n    steps:\n      - run: true\n")
+        self.assertTrue(gate_runs_in_required_ci(ci))
+        self.assertFalse(gate_runs_in_required_ci(ci.replace("needs: [changes, gate]", "needs: [changes]")),
+                         "a gate job required-tests does not need gates nothing")
+        tag_only = ('on:\n  push:\n    tags: ["sparrow-v*"]\n\njobs:\n'
+                    f"  publish:\n    steps:\n      - run: {gate}\n"
+                    "  required-tests:\n    needs: [publish]\n")
+        self.assertFalse(gate_runs_in_required_ci(tag_only), "a tag-only release call runs after merge, not before")
+        self.assertTrue(gate_runs_in_required_ci(CI.read_text()), "ci.yml's required gate job must keep calling the gate")
 
     def test_a_workflow_named_file_is_not_an_orphan(self):
         self.assertEqual(orphans_in({"scripts/y.py"}, set(), {"scripts/y.py"}), [])

@@ -1,18 +1,22 @@
 """Print the routing fields of every open task file in a task dir as one JSON array.
 
 The Hatch hook script calls this so its wake payload carries structured fields read
-with Sparrow's own header parser, never prose scraped by the shell."""
+with Sparrow's own header parser, never prose scraped by the shell. A hook that tells its
+worker what `held: true` means runs this with HELD_AWARE_ENV=1; for any other hook (one
+registered before the held branch, which a package upgrade does not rewrite) a held task is
+left out of the list, so that hook never wakes a worker for it."""
 from __future__ import annotations
 
 import argparse
 import ipaddress
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
-from ... import gateway_instance, local_task_protocol
-from ...task_io import attested_headers
+from ... import agent_triggers, gateway_instance, local_task_protocol, task_hold
+from ...task_io import attested_headers, is_collaborator
 
 SNIPPET_MAX = 500
 REPLY_CONTEXT_MAX = 2000
@@ -22,6 +26,7 @@ _LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 MXID_RE = re.compile(r"@[A-Za-z0-9._=+/-]+:(?:\[(?P<ipv6>[0-9A-Fa-f:.]+)\]|"
                      rf"{_LABEL}(?:\.{_LABEL})*)(?::(?P<port>[0-9]{{1,5}}))?")
 EXIT_BAD_AGENT = 3
+HELD_AWARE_ENV = "HATCH_HOOK_HELD_AWARE"
 CHANNEL_KINDS = ("dm", "room")
 _SENDER_PREFIX = re.compile(r"\[AG2Space\s+[^\]]+\]\s*")
 # The gateway folds a message onto one line, so a reply fallback ("> <@sender> quoted"
@@ -78,6 +83,15 @@ def item_id(tid: str, instance: str = "") -> "str | None":
     return broker if local_task_protocol.valid_task_id(broker) else None
 
 
+def _recent_tasks(headers: dict) -> "list | None":
+    """The bridge's `recent_tasks` header as a list; None when absent or not one."""
+    try:
+        value = json.loads(headers.get("recent_tasks") or "null")
+    except ValueError:
+        return None
+    return value if isinstance(value, list) and value else None
+
+
 def task_fields(task_file: Path, result_dir: Path, instance: "str | None" = "") -> "dict | None":
     """`instance` None reads every instance's task."""
     tid = task_file.stem
@@ -101,19 +115,29 @@ def task_fields(task_file: Path, result_dir: Path, instance: "str | None" = "") 
         "channel_kind": kind if kind in CHANNEL_KINDS else None,
         "event_id": _field(h, "source_message_id"),
         "thread_root": _field(h, "thread_root"),
+        # Which AgentTrigger raised the task; None (no header) reads as a message.
+        "event_type": agent_triggers.event_type_value(_field(h, "event_type")),
+        # No skills tree here: only registry ids; the core still checks the manifest opt-in.
+        "playbook": agent_triggers.allowed_playbook_value(_field(h, "playbook")),
         "sender": _field(h, "user_id"),
         "sender_name": _field(h, "sender_name"),
         "access_tier": tier,
-        "collaborator": tier == "team" and (h.get("collaborator") or "").strip() == "true",
+        "collaborator": is_collaborator({"access_tier": tier, "collaborator": (h.get("collaborator") or "").strip()}),
         "snippet": snippet(message),
         "task_file": str(task_file),
         "result_file": str(result_dir / f"{tid}.txt"),
     }
+    recent = _recent_tasks(h)
+    if recent is not None:
+        item["recent_tasks"] = recent
     if reply is not None:
         label = reply["label"]
         item["reply_context"] = {"sender": reply["sender"][:SNIPPET_MAX],
                                  "body": reply["body"][:REPLY_CONTEXT_MAX],
                                  "label": label[:REPLY_CONTEXT_MAX] if label else None}
+    # A parked item is flagged on every wake, so a fresh worker session never answers it.
+    if task_hold.read(result_dir, tid) is not None:
+        item["held"] = True
     return item
 
 
@@ -148,7 +172,10 @@ def main(argv=None) -> int:
     if not args.task_dir.is_dir():
         print(f"task dir not found: {args.task_dir}", file=sys.stderr)
         return 2
-    json.dump(list_open_tasks(args.task_dir, args.result_dir, args.gateway_instance), sys.stdout)
+    items = list_open_tasks(args.task_dir, args.result_dir, args.gateway_instance)
+    if os.environ.get(HELD_AWARE_ENV) != "1":
+        items = [item for item in items if not item.get("held")]
+    json.dump(items, sys.stdout)
     sys.stdout.write("\n")
     return 0
 

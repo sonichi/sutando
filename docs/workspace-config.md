@@ -72,6 +72,16 @@ Known keys (`docs/sutando-config.schema.json` → `env.properties` is the refere
 | `SUTANDO_HEALTH_LOAD_PASSES` | `3` | health-check `system-load` | consecutive high passes before it warns |
 | `SUTANDO_HEALTH_LOAD_REAP` | `0` (unset is off) | health-check `system-load` | only exactly `1` lets every `--fix` run (the desktop app runs one every 30 min) reap leftover test processes automatically, at most once per episode; anything else is off |
 
+## macOS notifications (`notifications.macos`)
+
+Sutando posts no macOS desktop notifications unless you opt in:
+
+```json
+{ "notifications": { "macos": true } }
+```
+
+Off by default. Only a JSON `true` turns them on; any other value, or a config that cannot be read, leaves them off. Every macOS sender asks the one reader: `resolve_macos_notifications()` in `src/sutando_config.py` (TypeScript: `resolveMacosNotifications()` in `src/sutando_config.ts`; shell: `bash scripts/sutando-config.sh macos-notifications`, used by `src/macos-notify.sh`). With it off, pending questions, bridge restarts, the agent shepherd and health alerts still reach you through your DM or the core's task queue; a banner that only acknowledged your own action (a context drop, a screen recording) is simply not shown.
+
 ## Three common overrides
 
 ```json
@@ -127,13 +137,13 @@ The workspace must never end up in commits. Three layers enforce this:
 
 1. **`.gitignore`** — `workspace/*` with a `!workspace/.gitkeep` exception. Prevents `git add .` from picking up runtime files.
 2. **Local pre-commit hook** — `.githooks/pre-commit` refuses any commit whose staged files include `workspace/`-prefixed paths (except `.gitkeep`). Auto-installed by `src/startup.sh`; one-time manual install via `bash scripts/install-git-hooks.sh`.
-3. **CI workspace-leak check** — `.github/workflows/workspace-leak-check.yml` mirrors the hook on every PR + push to main. Catches anyone who bypassed the local hook.
+3. **CI workspace-leak check** — the `refuse workspace/ contents in commits` step of `.github/workflows/lint.yml` mirrors the hook on every PR + push to main. Catches anyone who bypassed the local hook.
 
 Escape hatch for the rare legitimate case (updating `.gitkeep` itself): `git commit --no-verify`.
 
 ## CI lint: forbid new direct resolution
 
-`.github/workflows/lint-workspace-resolution.yml` refuses PRs that introduce new code outside the loader reading `$SUTANDO_WORKSPACE` directly, hardcoding `~/.sutando/workspace`, or using the historic `Path(__file__).resolve().parent.parent` walk-up. Existing legacy offenders are not flagged (the CI uses `--diff` mode); they're migrated separately.
+The `refuse new direct workspace-path resolution` step of `.github/workflows/lint.yml` refuses PRs that introduce new code outside the loader reading `$SUTANDO_WORKSPACE` directly, hardcoding `~/.sutando/workspace`, or using the historic `Path(__file__).resolve().parent.parent` walk-up. Existing legacy offenders are not flagged (the CI uses `--diff` mode); they're migrated separately.
 
 ## Migrating from the old default
 

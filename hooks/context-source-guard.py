@@ -80,8 +80,8 @@ if WS is None:
 STATE = os.path.join(WS, "state", "active-serving-channel.json")
 API = "https://discord.com/api/v10"
 UA = "DiscordBot (https://github.com/sonichi/sutando, 1.0)"
-_TASK_RE = re.compile(r"task-\d+\.txt$")
-_TASKPATH_RE = re.compile(r"([^\s'\"]*task-\d+\.txt)")  # a task-file path inside a Bash command
+_TASK_RE = re.compile(r"task-[^\s/\\'\"]+\.txt$")
+_TASKPATH_RE = re.compile(r"([^\s'\"]*task-[^\s/\\'\"]+\.txt)")
 _CH_READ_RE = re.compile(r"channels/(\d+)/messages")
 _GUILD_CACHE = os.path.join(WS, "state", ".channel-guild-cache.json")
 

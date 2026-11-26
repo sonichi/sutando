@@ -33,6 +33,14 @@ entry. Autonomy pause and self-development settings do not exempt the health
 pass. These checks diagnose missing configuration; they do not recreate a driver
 or modify the host's schedules.
 
+The loop is also the one session cron that can never be made to yield to queued
+owner work: `/schedule-crons` registers every other `crons.json` entry that
+fires more than once a day behind the cron gate's check preamble (see that
+skill's "Defer crons" section; a daily-or-rarer entry is not gated unless it
+sets `"gate": true`) so a scheduled job stops when owner tasks are waiting, and
+the loop is exempt because it is what drains that queue — gating it would
+deadlock the owner's own messages.
+
 The archived rationale below predates this completion contract where it refers
 to ordinary `idle` as the final pass command.
 
@@ -64,7 +72,7 @@ If an interval is provided in ARGUMENTS (e.g. "5m", "10m", "30m"), use it. Other
 ## On activation
 
 1. Run `/schedule-crons` to set up all recurring cron jobs (morning briefing, Zacks, etc.)
-2. Start the streaming task watcher via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"'` (`$SUTANDO_TASKS_DIR` as the inbox when set; the tag is what the external standby supervisor recognises), `timeout_ms: 1800000`, `description: 'Streaming task watcher'`. The `Monitor` tool has no `persistent` option (passing one does not keep the command alive): `timeout_ms` (30 min at most; 5 min when omitted) is the command's lifetime, after which the tool kills it and sends one expiry notice, and the watcher must be re-armed on that notice. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive.
+2. If `$SUTANDO_TASK_WATCH_MOD` is `1` and `python3 src/watcher_rearm.py mod-ready --repo "$PWD" --workspace "$(bash scripts/sutando-config.sh workspace)"` prints `yes`, the task-watch Mod runs the streaming task watcher: nothing to start. Otherwise start it via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"'` (`$SUTANDO_TASKS_DIR` as the inbox when set; the tag is what the external standby supervisor recognises), `timeout_ms: 1800000`, `description: 'Streaming task watcher'`. The `Monitor` tool has no `persistent` option (passing one does not keep the command alive): `timeout_ms` (30 min at most; 5 min when omitted) is the command's lifetime, after which the tool kills it and sends one expiry notice, and the watcher must be re-armed on that notice. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive.
 
    **Windows:** the `Monitor` tool is unavailable, so `src/startup.ps1` starts
    `src/task-dispatcher.ps1`, an external `FileSystemWatcher` that invokes `claude --print` for each
@@ -238,7 +246,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    or a killed process tree, so the pass re-arms it: `connectors.py rearm` starts a waiter only for
    an unclaimed wait whose lock no live waiter holds, so running it every pass never doubles one.
 
-2. **Pending questions are not surfaced on a pass.** A question is sent to the owner once, when it is asked (`scripts/ask-owner.py`), and reminded only on demand (`python3 src/check-pending-questions.py --notify`); a per-pass voice file or macOS notification was a scheduled reminder under another name. The pass runs `python3 src/check-pending-questions.py` (flagless: reconcile and list, nothing sent) so anything the outbox holds is filed, and `python3 src/pending_questions_reader.py list` only when the owner asks what is waiting or the pass is blocked on an answer. These are core's public entries over the store an installed skill declares (`pending_questions_store` in its manifest); the loop names no skill's private CLI.
+2. **Pending questions are not surfaced on a pass.** A question is sent to the owner once, when it is asked (`scripts/ask-owner.py`), and reminded only on demand (`python3 src/check-pending-questions.py --notify`); a per-pass voice file or macOS notification was a scheduled reminder under another name. The pass runs `python3 src/check-pending-questions.py` (flagless: reconcile and list; the only send is the one pointer owed for a decision card the gateway never posted, which completes the ask rather than reminding) so anything the outbox holds is filed, and `python3 src/pending_questions_reader.py list` only when the owner asks what is waiting or the pass is blocked on an answer. These are core's public entries over the store an installed skill declares (`pending_questions_store` in its manifest); the loop names no skill's private CLI.
 
 3. **Check system health.** Run `python3 src/health-check.py`. If issues found, fix what you can (`--fix` flag), note what you can't.
 
@@ -418,6 +426,8 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
        --state "$WORKSPACE/state/idle-streak.json"
    # -> post <hash>   (changed set: surface it)   |   quiet <hash>  (unchanged)
 
+   # Check owner_channel.py --workspace "$WORKSPACE" before posting.
+   # A refusal means no send and no surface-hash commit.
    # 2. Post the message. THEN, and only then, stamp the set as surfaced:
    echo '[["3166","owner"],["3274","owner"]]' |
      python3 skills/proactive-loop/scripts/idle-surface-hash.py \
@@ -612,7 +622,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    a duplicate. Which rows may go is the owner's call (a pending question -> "MEMORY.md byte
    budget"); the guard's job is only to stop the write that would decide it by accident.
 
-8. **If blocked, ask.** `python3 scripts/ask-owner.py "<question>" [--context "<why / options>"] [--task-file <workspace>/tasks/<task>.txt]` — through the store an installed skill declares it records the question as a row of the owner's Pending questions database (held in `<workspace>/state/pending-questions-outbox/` while the room is unreachable), queues it to the owner and fires the macOS notification. Never hand-edit; the per-host `pending-questions.md` is read-only history. The new question is queued and held before room-database work; after its row is confirmed, older questions are reconciled within the same 90-second subprocess-operation budget. A failed write keeps the outbox entry for a later explicit reconcile. Read the output: a `FAILED` line is not an ask. Confirm with `python3 src/pending_questions_reader.py list --json` that the ask id is listed. Don't stop — apply the Pivot-on-block rule and pick another menu item.
+8. **If blocked, ask.** `python3 scripts/ask-owner.py "<question>" [--context "<why>"] [--option 'Label=what it does' ...] [--task-file <workspace>/tasks/<task>.txt]` — through the store an installed skill declares it records the question as a row of the owner's Pending questions database (held in `<workspace>/state/pending-questions-outbox/` while the room is unreachable), queues it to the owner and fires the macOS notification. Never hand-edit; the per-host `pending-questions.md` is read-only history. The new question is queued and held before room-database work; after its row is confirmed, older questions are reconciled within the same 90-second subprocess-operation budget. A failed write keeps the outbox entry for a later explicit reconcile. Read the output: a `FAILED` line is not an ask. Confirm with `python3 src/pending_questions_reader.py list --json` that the ask id is listed. Don't stop — apply the Pivot-on-block rule and pick another menu item.
 
 9. **Ensure the streaming watcher is running.** **Read the `task-watcher` probe from the `health-check.py` run you already did in step 3 — do not re-derive liveness here.** That probe is the authoritative signal: it enumerates real watcher process trees (`_watcher_trees()` in `src/health-check.py`) and reports which of four states holds. Act on the state it names:
 
@@ -716,3 +726,14 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    **Note**: contextual-chips refresh used to be step 11 in this loop. As of 2026-05-05 it is owned exclusively by Sutando.app's 120s timer (PR #600). The proactive-loop must NOT write `contextual-chips.json` — Sutando.app is the single writer. If a future case calls for chip-state the menu-bar app can't see (e.g. decision-state from the pending questions), surface it via a different file Sutando.app reads, not by competing as a writer.
 
    **Do NOT fall back to `results/proactive-*.txt` for heartbeats if `bot2bot-post` is not installed.** That legacy path is polled by both Discord and Telegram bridges and produces duplicate deliveries to the owner's DMs (9-per-heartbeat in practice on 2026-04-20). If the skill is missing, skip the heartbeat silently; fold the summary into the next task-reply instead.
+
+## Bound-room speech gate
+
+Recent owner activity identifies a destination, not who owns its voice.
+`src/owner_channel.py` consults the workspace bindings before the core posts:
+unbound rooms are allowed; a bound room is refused while its worker is alive
+or its liveness is unknown. Only a readable sentinel whose PID is positively
+dead releases the room for recovery. Missing or unreadable evidence is not
+proof of death. The supervisor relay uses the same policy after validating
+the destination. A refused proactive FYI must not commit its surface hash,
+because no message was sent.

@@ -423,10 +423,36 @@ enum SutandoConfig {
         return proc.terminationStatus == 0
     }
 
+    /// The desktop's `runtime.json` selection, mirroring
+    /// `src/sutando_config.py:desktop_runtime_selection_path`; "" when absent or unusable.
+    static func desktopSelectedRuntime(
+        repoRoot: String?,
+        environment: [String: String]
+    ) -> String {
+        var path: String?
+        let appSupport = (environment["SUTANDO_APP_SUPPORT"] ?? "")
+            .trimmingCharacters(in: .whitespaces)
+        if !appSupport.isEmpty {
+            path = (appSupport as NSString).appendingPathComponent("runtime.json")
+        } else if let root = repoRoot {
+            let engine = ((root as NSString).resolvingSymlinksInPath as NSString).deletingLastPathComponent
+            if (engine as NSString).lastPathComponent == "engine" {
+                path = ((engine as NSString).deletingLastPathComponent as NSString)
+                    .appendingPathComponent("runtime.json")
+            }
+        }
+        guard let p = path, let data = FileManager.default.contents(atPath: p),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let selected = obj["coreRuntime"] as? String else {
+            return ""
+        }
+        return selected.trimmingCharacters(in: .whitespaces)
+    }
+
     /// The selected persistent core CLI runtime, mirroring
     /// `src/sutando_config.py:resolve_core_runtime` and resolving from the same
     /// merged config this type already loads: `$SUTANDO_CORE_RUNTIME` first,
-    /// else `core.runtime`, else "claude".
+    /// else a supported desktop selection, else `core.runtime`, else "claude".
     ///
     /// An unrecognised value returns nil rather than raising: a caller choosing
     /// a pane parser must not send with a guessed runtime, and nil lets it fall
@@ -449,8 +475,10 @@ enum SutandoConfig {
                 return nil
             }
             let core = cfg["core"] as? [String: Any] ?? [:]
-            configured = ((core["runtime"] as? String) ?? "claude")
-                .trimmingCharacters(in: .whitespaces)
+            let desktop = desktopSelectedRuntime(
+                repoRoot: explicitRoot ?? cacheRepoRoot, environment: environment)
+            configured = supportedCoreRuntimes.contains(desktop) ? desktop
+                : ((core["runtime"] as? String) ?? "claude").trimmingCharacters(in: .whitespaces)
         }
         return supportedCoreRuntimes.contains(configured) ? configured : nil
     }

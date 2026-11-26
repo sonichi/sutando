@@ -96,7 +96,9 @@ export SUTANDO_ROOT="$REPO"
 # re-exec). A raw `npx tsx` call site silently fails to start its service on
 # such hosts (web-client outage 2026-07-17).
 _APP_NODE_DIR="$(bash "$REPO/scripts/sutando-config.sh" app-node-dir)"
-[ -d "$_APP_NODE_DIR" ] && case ":$PATH:" in *":$_APP_NODE_DIR:"*) ;; *) PATH="$_APP_NODE_DIR:$PATH"; export PATH ;; esac
+# Recorded as a launch default, so the core launcher exec'd at the end still puts CODEX_NODE_BIN first.
+. "$REPO/src/agent/launch-path.sh"
+sutando_prepend_default_dir "$_APP_NODE_DIR"
 # `|| true`: tsx-bin prints nothing AND returns nonzero on a bare bundled
 # runtime (no tsx anywhere) — under set -e that exited startup at this line
 # before the bundled-mode gate could run (Codex blocking finding #2).
@@ -160,7 +162,7 @@ if [ "$BUNDLED_MODE" = "1" ]; then
 fi
 if [ -n "${SUTANDO_NODE:-}" ]; then
   _SUTANDO_NODE_DIR="$(dirname "$SUTANDO_NODE")"
-  case ":$PATH:" in *":$_SUTANDO_NODE_DIR:"*) ;; *) PATH="$_SUTANDO_NODE_DIR:$PATH"; export PATH ;; esac
+  sutando_prepend_default_dir "$_SUTANDO_NODE_DIR"
 fi
 run_node_service() {
   # $1 = dist basename (build-bundle artifact), $2 = ts entry (as run_tsx
@@ -739,11 +741,37 @@ fi
 # a child of this tmux tree beside it races the wrapper for the port and dies
 # with the tree. The legacy bare-& launch below runs only when no launchd job
 # exists (older checkout without the template, or an install that refused).
+# The proxy keeps running either way; with the status line recorder on, sessions go direct.
+_sessions_go_direct() {
+  [ -r "$REPO/src/skill-manifest-config.sh" ] && [ -r "$REPO/src/claude_routing.sh" ] || return 1
+  . "$REPO/src/skill-manifest-config.sh"
+  . "$REPO/src/claude_routing.sh"
+  claude_direct_routing
+}
+_route_sessions_to_proxy() {
+  if _sessions_go_direct; then
+    claude_unset_local_proxy
+    echo "  ✓ Claude sessions call Anthropic directly (proxy left running, unused by them)"
+    return 0
+  fi
+  export ANTHROPIC_BASE_URL=http://localhost:7846
+}
 start_credential_proxy() {
   local _PROXY_LABEL="com.sutando.credential-proxy"
   local _PROXY_INSTALLER="$REPO/src/install-credential-proxy-launchd.sh"
   local _PROXY_SERVICE _PROXY_SCRIPT _state _exit
   _PROXY_SERVICE="gui/$(id -u)/$_PROXY_LABEL"
+  # Direct sessions need no proxy; a loaded job is left for proxy_retire.py to judge.
+  if _sessions_go_direct; then
+    claude_unset_local_proxy
+    echo "  ✓ Claude sessions call Anthropic directly; credential proxy not started"
+    return 0
+  fi
+  if claude_proxy_owner_off 2>/dev/null; then
+    claude_unset_local_proxy
+    echo "  credential proxy kept off (CREDENTIAL_PROXY_ENABLED is off); Claude will connect directly"
+    return 0
+  fi
   if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ]; then
     # An already-loaded job may carry a plist generated before the current pins existed;
     # the installer owns that comparison because it owns what the plist renders.
@@ -760,7 +788,7 @@ start_credential_proxy() {
   fi
   if lsof -i :7846 > /dev/null 2>&1; then
     echo "  ✓ credential proxy (already running)"
-    export ANTHROPIC_BASE_URL=http://localhost:7846
+    _route_sessions_to_proxy
     return 0
   fi
   if launchctl print "$_PROXY_SERVICE" > /dev/null 2>&1; then
@@ -769,7 +797,7 @@ start_credential_proxy() {
     for _ in $(seq 1 20); do lsof -i :7846 > /dev/null 2>&1 && break; sleep 0.5; done
     if lsof -i :7846 > /dev/null 2>&1; then
       echo "  ✓ credential proxy (launchd-supervised)"
-      export ANTHROPIC_BASE_URL=http://localhost:7846
+      _route_sessions_to_proxy
       return 0
     fi
     _state="$(launchctl print "$_PROXY_SERVICE" 2>/dev/null | awk -F' = ' '$1 ~ /^[[:space:]]*state$/ {print $2; exit}')"
@@ -794,7 +822,7 @@ start_credential_proxy() {
   sleep 1
   if lsof -i :7846 > /dev/null 2>&1; then
     echo "  ✓ credential proxy"
-    export ANTHROPIC_BASE_URL=http://localhost:7846
+    _route_sessions_to_proxy
   else
     echo "  ⚠ credential proxy failed — Claude will connect directly (check /tmp/credential-proxy.log)"
   fi
@@ -838,27 +866,8 @@ if obs_collector_enabled; then
 else
   echo "  ~ obs collector (disabled via SUTANDO_OBS_COLLECTOR=0)"
 fi
-# A port can LISTEN while the service never responds (single-threaded server
-# blocked on a silent connection, hung event loop). The lsof guards below only
-# check LISTEN, so a wedged service is "already running" forever — exactly how
-# the dashboard stayed unreachable for hours and voice-agent for 26h
-# (2026-06-10). Probe with a real HTTP request before each guard; on timeout,
-# kill the listener so the normal start path takes over. Any response byte
-# counts as alive (a 404 or a WS handshake rejection is fine — curl exits 28
-# only when nothing came back before the deadline). Probe path matches
-# health-check.py's check_port: a cheap unknown path, NOT "/" (dashboard's "/"
-# runs health-check.py as a subprocess — probing it from here would recurse).
-reap_wedged_listener() {
-  local port="$1" name="$2" rc=0
-  lsof -i :"$port" -sTCP:LISTEN > /dev/null 2>&1 || return 0
-  curl -s -o /dev/null -m 10 "http://127.0.0.1:$port/__liveness_probe__" || rc=$?
-  if [ "$rc" -eq 28 ]; then
-    echo "  ⚠ $name (port $port) listening but unresponsive — killing wedged listener"
-    lsof -ti :"$port" -sTCP:LISTEN | xargs kill 2>/dev/null || true
-    sleep 1
-  fi
-  return 0
-}
+# shellcheck source=local_services.sh
+source "$REPO/src/local_services.sh"
 
 # 1. Voice agent (Gemini Live on port 9900; optional)
 if [ "${SKIP_VOICE:-}" = "1" ]; then
@@ -972,18 +981,7 @@ else
 fi
 
 # 4. Agent API (port 7843)
-reap_wedged_listener 7843 agent-api
-if ! lsof -i :7843 > /dev/null 2>&1; then
-  echo "  Starting agent API (port 7843)..."
-  if [ -n "$PY" ]; then
-    "$PY" src/agent-api.py > "$LOGS_DIR/agent-api.log" 2>&1 &
-    echo "  ✓ agent API"
-  else
-    echo "  ~ agent API skipped (no runnable python3)"
-  fi
-else
-  echo "  ✓ agent API (already running)"
-fi
+ensure_agent_api "$REPO" "$PY" "$LOGS_DIR"
 
 # 5. Screen capture server (port 7845)
 # Skip when Screen Recording perm is missing — otherwise we'd start a server

@@ -99,12 +99,18 @@ SHIM = ("def launchd_exit", "def run_launchd", "signal.signal(sig, forward)")
 OWNED_STEPS = {"adapters/claude_code/hold.py": HOLDER_STEPS + WORDS + SHIM,
                "adapters/claude_code/cli.py": HOLDER_STEPS + WORDS + SHIM,
                "adapters/claude_code/launcher.py": HOLDER_STEPS + SHIM,
-               "adapters/codex/connect_cli.py": HOLDER_STEPS + WORDS + SHIM}
+               "adapters/codex/connect_cli.py": HOLDER_STEPS + WORDS + SHIM,
+               "adapters/openclaw/cli.py": HOLDER_STEPS + WORDS + SHIM,
+               "adapters/antigravity/cli.py": HOLDER_STEPS + WORDS + SHIM}
 LAUNCHER_SIDE = tuple(OWNED_STEPS)
 DELEGATES = {"adapters/claude_code/hold.py": ("cm.hold_and_supervise(", "cm.supervise_child("),
              "adapters/claude_code/cli.py": ("cm.holder_words(", "cm.occupancy_line(", "cm.run_child_argv("),
              "adapters/codex/connect_cli.py": ("cm.hold_and_supervise(", "cm.supervise_child(", "cm.holder_words(",
-                                               "cm.occupancy_line(", "cm.run_launchd(", "cm.run_child_argv(")}
+                                               "cm.occupancy_line(", "cm.run_launchd(", "cm.run_child_argv("),
+             "adapters/openclaw/cli.py": ("cm.hold_and_supervise(", "cm.supervise_child(", "cm.holder_words(",
+                                         "cm.occupancy_line(", "cm.run_launchd(", "cm.run_child_argv("),
+             "adapters/antigravity/cli.py": ("cm.hold_and_supervise(", "cm.supervise_child(", "cm.holder_words(",
+                                            "cm.occupancy_line(", "cm.run_launchd(", "cm.run_child_argv(")}
 
 
 def direct_imports(text, steps):
@@ -113,6 +119,92 @@ def direct_imports(text, steps):
     return sorted(a.name for n in ast.walk(ast.parse(text)) if isinstance(n, ast.ImportFrom)
                   and (n.module or "").split(".")[-1] in ("task_io", "connect_common")
                   for a in n.names if a.name in owned)
+
+
+# One owner, connect_bridge: the agent bridge's launch env, its unit or declaration, and connect's
+# redemption into the seat. Neither -local adapter builds any of them itself.
+BRIDGE_ADAPTERS = ("claude_code", "codex", "openclaw", "antigravity")
+BRIDGE_CALLS = {"seat_bridge_environ", "write_bridge_declaration", "remove_bridge_declaration", "render_supervisor",
+                "start_supervisor", "stop_supervisor", "write_seat_credentials", "write_seat", "redeem_code",
+                "read_code", "relay_problem", "code_problem"}
+BRIDGE_ENV_KEYS = {"AGENT_CONNECT_TASK_DIR", "AGENT_CONNECT_RESULT_DIR", "AGENT_CONNECT_STATE_DIR", "AG2_DEVICE_ENV",
+                   "REMOTE_TASK_SEAT", "REMOTE_TASK_TOKEN_FILE", "AGENT_MXID"}
+BRIDGE_DELEGATES = {"adapters/claude_code/cli.py": ("cb.wire_bridge(", "cb.wire_bridge_bound(", "cb.unwire_bridge(", "cb.redeem_into_seat(",
+                                                    "cb.host_problem(", "cb.agent_root("),
+                    "adapters/claude_code/shape.py": ("bridge_shape(LOCAL)",),
+                    "adapters/codex/connect_cli.py": ("cb.wire_bridge_bound(", "cb.unwire_bridge(", "cb.redeem_into_seat(",
+                                                      "cb.host_problem(", "cb.agent_root(", "cb.bridge_shape(LOCAL)"),
+                    "adapters/openclaw/cli.py": ("cb.wire_bridge_bound(", "cb.unwire_bridge(", "cb.host_problem(",
+                                                 "cb.agent_root(", "cb.bridge_shape(local)"),
+                    "adapters/antigravity/cli.py": ("cb.wire_bridge_bound(", "cb.unwire_bridge(", "cb.host_problem(",
+                                                    "cb.agent_root(", "cb.bridge_shape(local)")}
+
+
+def bridge_builders(tree):
+    """Calls of a bridge-building step and literal launch-env keys, as (kind, name)."""
+    found = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call):
+            name = n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", "")
+            if name in BRIDGE_CALLS:
+                found.append(("call", name))
+        elif isinstance(n, ast.Constant) and n.value in BRIDGE_ENV_KEYS:
+            found.append(("env key", n.value))
+    return found
+
+
+class SharedAgentBridge(unittest.TestCase):
+    def test_neither_local_adapter_builds_its_own_bridge_launch_env_or_redemption(self):
+        for adapter in BRIDGE_ADAPTERS:
+            for path in sorted((PKG_ROOT / PKG / "adapters" / adapter).rglob("*.py")):
+                with self.subTest(module=str(path.relative_to(PKG_ROOT))):
+                    self.assertEqual(bridge_builders(ast.parse(path.read_text(encoding="utf-8"))), [])
+
+    def test_both_delegate_to_connect_bridge(self):
+        for rel, calls in BRIDGE_DELEGATES.items():
+            text = (PKG_ROOT / PKG / rel).read_text(encoding="utf-8")
+            for call in calls:
+                with self.subTest(module=rel, call=call):
+                    self.assertIn(call, text)
+
+    def test_the_scan_catches_a_copy(self):
+        copy = 'env = {"AGENT_CONNECT_TASK_DIR": t}\nseat = _sources.seat_bridge_environ(p, read)\ncm.start_supervisor(B)\n'
+        self.assertEqual(sorted(bridge_builders(ast.parse(copy))), [("call", "seat_bridge_environ"),
+                                                                    ("call", "start_supervisor"),
+                                                                    ("env key", "AGENT_CONNECT_TASK_DIR")])
+
+
+# One owner, held_start: how a connector run --held under a launcher enters the held root and waits to be attached.
+HELD_CONNECTORS = ("adapters/codex/codex_connector.py", "adapters/openclaw/openclaw_connector.py",
+                   "adapters/antigravity/antigravity_connector.py")
+HELD_OWNED = ("os.fchdir(", "holder_consumer(", "start_time(os.getpid())")
+
+
+class SharedHeldStart(unittest.TestCase):
+    def test_both_connectors_delegate_the_held_start_and_keep_no_copy(self):
+        for rel in HELD_CONNECTORS:
+            text = (PKG_ROOT / PKG / rel).read_text(encoding="utf-8")
+            with self.subTest(module=rel):
+                self.assertIn("held_start.enter(args.root_fd, HELD_WAIT_S, holder_consumer)", text)
+                self.assertIn("HELD_WAIT_S = held_start.WAIT_S", text)
+                self.assertEqual([step for step in HELD_OWNED if step in text], [], "a copy of held_start's policy")
+
+
+# One owner, acp_host: the ACP turn, the Session store and the permission policy every ACP connector uses.
+ACP_CONNECTORS = ("adapters/openclaw/openclaw_connector.py",
+                  "adapters/antigravity/antigravity_connector.py")
+ACP_OWNED = ('"session/prompt"', '"session/new"', "class SessionStore", "class Turn", "def request_paths(",
+             "def at_or_above_home(", "def task_framing(")
+
+
+class SharedAcpHost(unittest.TestCase):
+    def test_both_acp_connectors_delegate_the_turn_and_the_policy_and_keep_no_copy(self):
+        for rel in ACP_CONNECTORS:
+            text = (PKG_ROOT / PKG / rel).read_text(encoding="utf-8")
+            with self.subTest(module=rel):
+                for call in ("acp_host.run_prompt(", "acp_host.decide_permission(", "acp_host.task_framing("):
+                    self.assertIn(call, text, "the delegation")
+                self.assertEqual([step for step in ACP_OWNED if step in text], [], "a copy of acp_host's policy")
 
 
 class BoundaryTest(unittest.TestCase):

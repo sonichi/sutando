@@ -51,6 +51,7 @@ Run: python3 tests/sparrow-outbox-claim-protocol.test.py
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -58,6 +59,8 @@ import sys
 import tempfile
 import threading
 import time
+import random
+import unicodedata
 from pathlib import Path
 from unittest.mock import mock_open, patch
 
@@ -758,6 +761,394 @@ def _c23():
         assert release(canonical, "task-fresh-proc", "D1") is True
         stripes = [f.name for f in (canonical / locks_dir).glob("stripe-*.lock")]
         assert stripes, "fresh-process disk read of a valid fence must stripe"
+
+
+# 24 --------------------------------------------------------------------------
+@contract("an out-of-range pid, birth token or claimed_at reads UNKNOWN, not pid reuse")
+def _c24():
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    read = need(m, "read_delivery_claim")
+    may = need(m, "may_reclaim_delivery")
+    claim_path = need(m, "_claim_path")
+    huge_pid = "9" * 5001                  # past CPython's int-parse digit limit
+    cases = {
+        "claimed_at=10**400": ("claimed_at", 10**400),
+        "claimed_at=-10**400": ("claimed_at", -10**400),
+        "claimed_at=1e400": ("claimed_at", "1e400"),
+        "claimed_at=true": ("claimed_at", True),
+        "pid=5001 digits": ("pid", huge_pid),
+        "pid=0": ("pid", 0),
+        "pid=2**31": ("pid", 2**31),
+        "pid=true": ("pid", True),
+        "pid=1.0": ("pid", 1.0),
+        "start_usec=-1, live pid": ("start_usec", -1),
+        "start_usec=10**400, live pid": ("start_usec", 10**400),
+        "start_usec=2**63, live pid": ("start_usec", 2**63),
+        "start_usec=1.5, live pid": ("start_usec", 1.5),
+        "start_usec=0, live pid": ("start_usec", 0),
+    }
+    bad: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for n, (label, (field, value)) in enumerate(cases.items()):
+            item = f"item-bound-{n}"
+            assert acquire(root, item, "d1") is True
+            p = claim_path(root, item)
+            rec = json.loads(p.read_text(encoding="utf-8"))
+            rec[field] = "@RAW@"
+            raw = value if isinstance(value, str) else json.dumps(value)
+            p.write_text(json.dumps(rec).replace('"@RAW@"', raw), encoding="utf-8")
+            try:                                # each case reports, even after a raise
+                state = getattr(read(root, item), "state", None)
+                reclaim = may(root, item, 0.0)
+            except Exception as exc:  # noqa: BLE001 - a raise is this case's defect
+                bad.append(f"{label}: raised {type(exc).__name__}")
+                continue
+            if state != "UNKNOWN" or reclaim is not False:
+                bad.append(f"{label}: state={state} may_reclaim(0)={reclaim}")
+        assert not bad, "; ".join(bad)
+        # The bounds are inclusive where real values live: these still read HELD.
+        assert acquire(root, "item-edge", "d1") is True
+        p = claim_path(root, "item-edge")
+        rec = json.loads(p.read_text(encoding="utf-8"))
+        rec.update(start_usec=1, claimed_at=2**53)
+        p.write_text(json.dumps(rec), encoding="utf-8")
+        got = read(root, "item-edge")
+        assert got is not None and got.state == "HELD", f"edge values must read HELD, got {got}"
+    # A record built in-process with an impossible token is not evidence of reuse.
+    reused = need(m, "_pid_was_reused")
+    ident = need(m, "process_identity")(os.getpid())
+    for bad in (0, -1, 10**400, 2**63):
+        rec = m.ClaimRecord("x", "d1", os.getpid(), bad, 0.0)
+        assert reused(rec, ident) is False, f"start_usec={bad} counted as pid reuse"
+
+
+# 25 --------------------------------------------------------------------------
+@contract("a malformed claim ages by file mtime to the full TTL, under the liveness rules; torn still sweeps")
+def _c25():
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    reclaim = need(m, "reclaim_delivery_claim")
+    claim_path = need(m, "_claim_path")
+    grace = need(m, "SWAP_GRACE_S")
+    ttl = 300.0
+
+    def plant(root, item, patch=None, text=None):
+        assert acquire(root, item, "owner") is True
+        p = claim_path(root, item)
+        if text is None:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+            rec.update(patch)
+            text = json.dumps(rec)
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def taken_at(root, item, p, age):
+        t = time.time() - age
+        os.utime(p, (t, t))
+        return reclaim(root, item, ttl, "thief")
+
+    bad: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        # Live owner, pid not a plausible pid: only the mtime TTL can release it.
+        p = plant(root, "unreadable-pid", {"pid": "abc", "claimed_at": 10**400})
+        for age, want in ((grace + 1, False), (ttl - 1, False), (ttl, True)):
+            if taken_at(root, "unreadable-pid", p, age) is not want:
+                bad.append(f"unreadable pid at {age}s: want taken={want}")
+        # Live readable pid, impossible token: the live owner is never displaced.
+        p = plant(root, "live-bad-token", {"start_usec": -1})
+        for age in (grace + 1, ttl - 1, ttl * 100):
+            if taken_at(root, "live-bad-token", p, age):
+                bad.append(f"live owner, start_usec=-1, taken at {age}s")
+        # Dead readable pid, impossible token: released at the TTL, not before.
+        p = plant(root, "dead-bad-token", {"pid": DEAD_PID, "start_usec": -1})
+        for age, want in ((grace + 1, False), (ttl - 1, False), (ttl, True)):
+            if taken_at(root, "dead-bad-token", p, age) is not want:
+                bad.append(f"dead owner, start_usec=-1 at {age}s: want taken={want}")
+        # A torn write keeps its grace-period sweep.
+        p = plant(root, "torn", text='{"item_id": "torn", "pi')
+        for age, want in ((grace - 1, False), (grace + 1, True)):
+            if taken_at(root, "torn", p, age) is not want:
+                bad.append(f"torn at {age}s: want taken={want}")
+    assert not bad, "; ".join(bad)
+
+
+# 26 --------------------------------------------------------------------------
+# (label, raw JSON for the pid, plausibly names a process)
+PID_FORMS = [
+    ("int", lambda pid: str(pid), True),
+    ("digit string", lambda pid: f'"{pid}"', True),
+    ("integral float", lambda pid: f"{pid}.0", True),
+    ("leading-zero string", lambda pid: f'"0{pid}"', True),
+    ("plus-sign string", lambda pid: f'"+{pid}"', True),
+    ("padded string", lambda pid: f'" {pid} "', True),
+    ("underscore string", lambda pid: f'"{str(pid)[:1]}_{str(pid)[1:]}"', True),
+    ("fractional float", lambda pid: f"{pid}.5", True),
+    ("negative string", lambda pid: '"-1"', False),
+    ("word string", lambda pid: '"abc"', False),
+    ("true", lambda pid: "true", True),
+    ("false", lambda pid: "false", False),
+    ("oversized", lambda pid: "9" * 5001, False),
+    ("2**31", lambda pid: str(2**31), False),
+]
+
+
+@contextlib.contextmanager
+def owner_stand_in(module, states):
+    """Pids a test cannot own (1, PID_MAX) get a patched liveness probe: {pid: alive}."""
+    real = module.process_identity
+
+    def probe(pid):
+        if pid in states:
+            return module.ProcessIdentity(pid, module.OwnerState.ALIVE if states[pid]
+                                          else module.OwnerState.DEAD)
+        return real(pid)
+    with patch.object(module, "process_identity", probe):
+        yield
+
+
+def pid1_stand_in(module, alive):
+    return owner_stand_in(module, {1: alive})
+
+
+PAD_LENGTHS = (1, 10, 32, 33, 64, 5000)
+# Every character int() reads as a digit, by value; [0] is every script's zero.
+DIGITS_BY_VALUE = [[] for _ in range(10)]
+for _cp in range(sys.maxunicode + 1):
+    _d = unicodedata.decimal(chr(_cp), None)
+    if _d is not None:
+        DIGITS_BY_VALUE[_d].append(chr(_cp))
+DECIMAL_ZEROS = DIGITS_BY_VALUE[0]
+FUZZ_NOISE = [" ", "\t", "\u3000", "\x1c", "\x1f", "+", "-", "_", "a", "\u00b2"]
+
+
+def fuzz_pid_string(rng):
+    """Whitespace, an optional sign, a run of mixed-script zeros, then a mixed-script
+    digit run, with noise characters spliced in at random."""
+    parts = [rng.choice(["", " ", "\u3000", "\x1c"]), rng.choice(["", "", "+", "-"])]
+    parts += [rng.choice(DECIMAL_ZEROS) for _ in range(rng.randint(0, 40))]
+    for _ in range(rng.randint(0, 12)):
+        parts.append(rng.choice(DIGITS_BY_VALUE[rng.randint(0, 9)]))
+        if rng.random() < 0.08:
+            parts.append(rng.choice(FUZZ_NOISE))
+    parts.append(rng.choice(["", " ", "\n"]))
+    return "".join(parts)
+
+
+def padded_pids(pid, length):
+    """Zero- and whitespace-padded forms of `pid`, at `length` chars or the pid's own."""
+    text = str(pid)
+    width = max(length, len(text))
+    left = (width - len(text)) // 2
+    return [("zero-padded", text.zfill(width)),
+            ("space-padded", " " * left + text + " " * (width - len(text) - left))]
+
+
+def rewrite_claim_pid(p, raw_pid):
+    """Keep the writer's record, put `raw_pid` in verbatim, and spoil claimed_at."""
+    rec = json.loads(p.read_text(encoding="utf-8"),
+                     parse_int=lambda s: s if len(s) > 20 else int(s))
+    rec.update(pid="@PID@", claimed_at="not-a-time")
+    p.write_text(json.dumps(rec).replace('"@PID@"', raw_pid), encoding="utf-8")
+
+
+@contract("a plausible live owner pid in any form blocks a takeover; only a strict one authorizes")
+def _c26():
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    may = need(m, "may_reclaim_delivery")
+    reclaim = need(m, "reclaim_delivery_claim")
+    claim_path = need(m, "_claim_path")
+    ttl = 300.0
+    bad: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        n = 0
+        for label, render, plausible in PID_FORMS:
+            for alive, pid in ((True, os.getpid()), (False, DEAD_PID)):
+                held = plausible and alive
+                ages = (ttl + 1, ttl * 100) if held else (ttl - 1, ttl)
+                for age in ages:
+                    n += 1
+                    item = f"pid-form-{n}"
+                    assert acquire(root, item, "owner") is True
+                    p = claim_path(root, item)
+                    rewrite_claim_pid(p, render(pid))
+                    t = time.time() - age
+                    os.utime(p, (t, t))
+                    want = (not held) and age >= ttl
+                    with pid1_stand_in(m, alive):
+                        got = (may(root, item, ttl), reclaim(root, item, ttl, "thief"))
+                    if got != (want, want):
+                        bad.append(f"{label} alive={alive} at {age}s: may/reclaim={got}, "
+                                   f"want {want}")
+    # Boundary sweep: a live pid padded to each length is still the live owner.
+    candidate = need(m, "_candidate_owner_pid")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for length in PAD_LENGTHS:
+            for kind, text in padded_pids(os.getpid(), length):
+                n += 1
+                if candidate(text) != os.getpid():
+                    bad.append(f"{kind} len={len(text)}: candidate {candidate(text)}")
+                item = f"pad-{n}"
+                assert acquire(root, item, "owner") is True
+                p = claim_path(root, item)
+                rewrite_claim_pid(p, json.dumps(text))
+                t = time.time() - (ttl + 1)
+                os.utime(p, (t, t))
+                if may(root, item, ttl) or reclaim(root, item, ttl, "thief"):
+                    bad.append(f"{kind} len={len(text)}: live owner reclaimed past the TTL")
+    for text, want in (("-5", None), ("+-5", None), ("1__2", None), ("_12", None),
+                       (" +0_0012 ", 12), ("0", None), ("9" * 11, None), ("0" * 40 + "7", 7)):
+        if candidate(text) != want:
+            bad.append(f"{text!r}: candidate {candidate(text)}, want {want}")
+    # Any script's decimal zeros pad a pid exactly as ASCII '0' does.
+    pid = str(os.getpid())
+    mixed = "".join(DECIMAL_ZEROS[i % len(DECIMAL_ZEROS)] for i in range(64))
+    for label, text in [("ten U+0660", "\u0660" * 10 + pid)] + [
+            (f"mixed-script zeros len={n}", mixed[:n - len(pid)] + pid) for n in (33, 64)]:
+        if candidate(text) != os.getpid():
+            bad.append(f"{label}: candidate {candidate(text)}, int() reads {int(text)}")
+    # Seeded agreement with valid_pid(int()) over padded, mixed-script digit strings.
+    rng = random.Random(5830)
+    for _ in range(20000):
+        text = fuzz_pid_string(rng)
+        try:
+            want = need(m, "valid_pid")(int(text))
+        except ValueError:
+            want = None
+        if candidate(text) != want:
+            bad.append(f"fuzz {text!r}: candidate {candidate(text)}, int() gives {want}")
+            break
+    assert not bad, "; ".join(bad)
+
+
+# 27 --------------------------------------------------------------------------
+@contract("torn vs malformed: decode errors sweep, other parse errors and a vanished file fail closed")
+def _c27():
+    m = outbox()
+    read_at = need(m, "_read_claim_at")
+    malformed = need(m, "_malformed_claim")
+    reclaimable = need(m, "_record_is_reclaimable")
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "c.claim"
+        p.write_text('{"item_id": "x", "pi', encoding="utf-8")
+        torn = read_at(p, "x")
+        assert (torn.state, torn.malformed) == ("UNKNOWN", False), f"decode error is torn: {torn}"
+        p.write_text('{"item_id": "x", "pid": ' + "9" * 5001 + "}", encoding="utf-8")
+        big = read_at(p, "fallback")
+        assert (big.state, big.malformed, big.item_id, big.pid) == ("UNKNOWN", True, "x", -1), (
+            f"an oversized pid spoils only the pid: {big}")
+        for exc in (ValueError("digits"), OverflowError("range")):
+            with patch.object(m.json, "loads", side_effect=exc):
+                rec = read_at(p, "fallback")
+            assert (rec.state, rec.malformed, rec.item_id) == ("UNKNOWN", True, "fallback"), (
+                f"{type(exc).__name__} must read malformed with the caller's id: {rec}")
+            assert reclaimable(rec, 0.0) is False, "a fresh malformed claim is not reclaimable"
+    gone = malformed(Path(tmp) / "vanished.claim", "x", {})
+    assert gone.file_mtime is None and reclaimable(gone, 0.0) is False, (
+        "a malformed claim with no readable mtime has no age, so it is never reclaimable")
+
+
+# 28 --------------------------------------------------------------------------
+def _int_oracle(m, text):
+    try:
+        return m.valid_pid(int(text))
+    except ValueError:
+        return None
+
+
+@contract("the pid reader agrees with int() for every JSON value type, and every code point as padding, separator or digit")
+def _c28():
+    m = outbox()
+    read = need(m, "_int_string_pid")
+    pid = str(os.getpid())
+    bad: list[str] = []
+    # Domain oracle: one representative of every JSON value type the reader can see.
+    candidate = need(m, "_candidate_owner_pid")
+    pid_max, live = 2**31 - 1, os.getpid()
+    domain = [True, False, None, [], {}, [live], {"pid": live}, 0, 1, live, pid_max, pid_max + 1,
+              DEAD_PID, str(DEAD_PID), float(DEAD_PID), "1", 1.0, str(pid_max), f"0{pid_max}",
+              -1, 10**400, 0.0, -0.0, 1.0, 1.5, float(live), live + 0.9, float(pid_max),
+              float(pid_max + 1), 1e308, -1e308, float("inf"), float("-inf"), float("nan"),
+              "", "0", "1", str(live), f" +{live} ", "abc", "-5", "\u0660" * 10 + str(live),
+              m._OVERSIZE]
+    for value in domain:
+        try:
+            want = m.valid_pid(int(value))
+        except (TypeError, ValueError, OverflowError):
+            want = None
+        if candidate(value) != want:
+            bad.append(f"domain {value!r}: candidate {candidate(value)}, int() oracle {want}")
+    for cp in range(sys.maxunicode + 1):
+        c = chr(cp)
+        for where, text in (("padding", c + pid + c), ("separator", pid[:1] + c + pid[1:]),
+                            ("leading digit", c + pid), ("trailing digit", pid + c),
+                            ("ten as padding", c * 10 + pid)):
+            got, want = read(text), _int_oracle(m, text)
+            if got != want:
+                bad.append(f"U+{cp:04X} as {where}: reader {got}, int() {want}")
+        if len(bad) > 10:
+            break
+    assert not bad, "; ".join(bad)
+    scanned = set()
+    for cp in range(sys.maxunicode + 1):
+        c = chr(cp)
+        try:
+            if int(c + "1" + c) == 1:
+                scanned.add(c)
+        except ValueError:
+            pass
+    whitespace = set(need(m, "_INT_WHITESPACE"))
+    assert scanned == whitespace, (
+        f"int() strips {sorted(hex(ord(c)) for c in scanned ^ whitespace)} differently "
+        f"from _INT_WHITESPACE")
+
+
+# 29 --------------------------------------------------------------------------
+@contract("a plausible but non-strict pid blocks a takeover and never proves pid reuse")
+def _c29():
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    may = need(m, "may_reclaim_delivery")
+    reclaim = need(m, "reclaim_delivery_claim")
+    release = need(m, "release_delivery_claim")
+    read = need(m, "read_delivery_claim")
+    claim_path = need(m, "_claim_path")
+    ttl = 300.0
+    bad: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for n, (label, raw_pid, strict) in enumerate((
+                ("leading-zero string", f'"0{os.getpid()}"', False),
+                ("padded string", f'" {os.getpid()} "', False),
+                ("strict int (control)", str(os.getpid()), True))):
+            for token_kind, shift in (("reused-looking token", 12345), ("dead-looking token", None)):
+                item = f"asym-{n}-{token_kind[:4]}"
+                assert acquire(root, item, "owner") is True
+                p = claim_path(root, item)
+                rec = json.loads(p.read_text(encoding="utf-8"))
+                rec.update(pid="@PID@", claimed_at="not-a-time",
+                           start_usec=1 if shift is None else rec["start_usec"] + shift)
+                p.write_text(json.dumps(rec).replace('"@PID@"', raw_pid), encoding="utf-8")
+                t = time.time() - ttl * 100
+                os.utime(p, (t, t))
+                got = read(root, item)
+                if strict:
+                    # The strict pid with a mismatched token is proven reuse: reclaimable.
+                    if not (may(root, item, ttl) and reclaim(root, item, ttl, "thief")):
+                        bad.append(f"{label}, {token_kind}: strict reuse proof was refused")
+                    continue
+                if got.pid != -1:
+                    bad.append(f"{label}: authorizing pid is {got.pid}, want -1 (not strict)")
+                if may(root, item, ttl) or reclaim(root, item, ttl, "thief"):
+                    bad.append(f"{label}, {token_kind}: taken as proven reuse of a live owner")
+                if release(root, item, "thief"):
+                    bad.append(f"{label}, {token_kind}: released by a drainer that is not its owner")
+    assert not bad, "; ".join(bad)
 
 
 def main() -> int:

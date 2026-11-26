@@ -32,33 +32,73 @@ pq = _load("pq_room_db_links", "skills/pending-questions/scripts/pending_questio
 
 
 class TestShapes(unittest.TestCase):
+    def test_app_origin_uses_registered_app_without_network(self):
+        with mock.patch.object(links.dotspace, "default_fetch", side_effect=AssertionError("network")):
+            for room, expected in (("!r:s.space", "https://chat.s.space"),
+                                   ("!r:ag2.space", "https://chat.ag2.space"),
+                                   ("#room:dev.s.space", "https://dev-chat.s.space"),
+                                   ("!r:unknown.example", "")):
+                with self.subTest(room=room):
+                    self.assertEqual(links.app_origin_for(room), expected)
+
+    def test_app_origin_delegates_to_dotspace_registry(self):
+        instance = links.dotspace.DotSpace(server="custom.example", operator="ag2",
+                                           gateway_host="relay.custom.example", app_origin="https://app.custom.example")
+        with mock.patch.object(links.dotspace, "dotspace_for", return_value=instance) as resolve:
+            self.assertEqual(links.app_origin_for("!r:custom.example"), "https://app.custom.example")
+        resolve.assert_called_once_with("custom.example", fetch=links.dotspace.NO_FETCH)
+
     def test_room_and_event_links_are_matrix_to_permalinks(self):
         self.assertEqual(links.room_link("!r:ag2.space"), "https://matrix.to/#/!r:ag2.space?via=ag2.space")
         self.assertEqual(links.room_link("!r:ag2.space", "$e"), "https://matrix.to/#/!r:ag2.space/$e?via=ag2.space")
         self.assertEqual(links.room_link("!r:ag2.space", via=""), "https://matrix.to/#/!r:ag2.space")
 
     def test_a_surface_link_is_the_home_route_with_the_room_encoded(self):
-        self.assertEqual(links.surface_link("https://chat.ag2.space/", "!abc:ag2.space", "doc", "readme"),
+        self.assertEqual(links.surface_link("!abc:ag2.space", "doc", "readme"),
                          "https://chat.ag2.space/home/!abc%3Aag2.space?surface=doc&page=readme")
-        self.assertEqual(links.surface_link("https://chat.ag2.space/relay", "#a/b:ag2.space", "database"),
+        self.assertEqual(links.surface_link("#a/b:ag2.space", "database"),
                          "https://chat.ag2.space/home/%23a%2Fb%3Aag2.space?surface=database")
 
     def test_a_surface_link_is_never_the_hash_room_route(self):
-        self.assertNotIn("#/room/", links.surface_link("https://chat.ag2.space", "!abc:ag2.space", "database"))
+        self.assertNotIn("#/room/", links.surface_link("!abc:ag2.space", "database"))
 
     def test_a_database_page_rides_only_in_the_shape_the_app_reads(self):
-        self.assertEqual(links.database_link("https://x.test", "!r:x.test", "d1ab"),
+        self.assertEqual(links.database_link("!r:x.test", "d1ab", origin="https://x.test"),
                          "https://x.test/home/!r%3Ax.test?surface=database&page=d1ab")
-        self.assertEqual(links.database_link("https://x.test", "!r:x.test", "pendingq"),
+        self.assertEqual(links.database_link("!r:x.test", "pendingq", origin="https://x.test"),
                          "https://x.test/home/!r%3Ax.test?surface=database&page=pendingq")
         for bad in ("a|b", "-x", "a/b", "x" * 65):
-            self.assertEqual(links.database_link("https://x.test", "!r:x.test", bad),
+            self.assertEqual(links.database_link("!r:x.test", bad, origin="https://x.test"),
                              "https://x.test/home/!r%3Ax.test?surface=database", bad)
 
     def test_an_unusable_origin_or_room_is_refused(self):
         for origin, room in (("chat.ag2.space", "!r:x"), ("https://x.test", "r:x"), ("https://x.test", "!r")):
             with self.assertRaises(ValueError):
-                links.surface_link(origin, room, "database")
+                links.surface_link(room, "database", origin=origin)
+
+
+class TestModuleSurface(unittest.TestCase):
+    def test_default_via_is_resolved_on_each_read_and_other_names_are_absent(self):
+        with mock.patch.object(links.dotspace, "default_link_via", return_value="v.test") as dlv:
+            self.assertEqual(links.DEFAULT_VIA, "v.test")
+            self.assertEqual(links.DEFAULT_VIA, "v.test")
+        self.assertEqual(dlv.call_count, 2)
+        with self.assertRaises(AttributeError):
+            links.NO_SUCH_NAME
+
+    def test_imported_by_file_path_without_src_on_the_path_it_finds_its_sibling_resolver(self):
+        src = (REPO / "src").resolve()
+        saved_path, saved_mod = sys.path[:], sys.modules.pop("dotspace", None)
+        try:
+            sys.path[:] = [p for p in sys.path if Path(p or ".").resolve() != src]
+            mod = _load("ag2space_links_by_path", "src/ag2space_links.py")
+            self.assertEqual(Path(mod.dotspace.__file__).resolve(), src / "dotspace.py")
+            self.assertEqual(mod.room_link("!r:s.space"), "https://matrix.to/#/!r:s.space?via=s.space")
+        finally:
+            sys.path[:] = saved_path
+            sys.modules.pop("dotspace", None)
+            if saved_mod is not None:
+                sys.modules["dotspace"] = saved_mod
 
 
 class TestCallersDelegate(unittest.TestCase):
@@ -70,15 +110,37 @@ class TestCallersDelegate(unittest.TestCase):
 
     def test_pending_questions_link_is_database_link(self):
         with mock.patch.object(pq, "database_link", return_value="L") as dl:
-            self.assertEqual(pq.db_link("https://x.test", "!r:x", "pendingq"), "L")
-        dl.assert_called_once_with("https://x.test", "!r:x", "pendingq")
-        self.assertIsNone(pq.db_link("not-a-url", "!r:x", "pendingq"))
+            self.assertEqual(pq.db_link("!r:x", "pendingq"), "L")
+        dl.assert_called_once_with("!r:x", "pendingq")
+        self.assertIsNone(pq.db_link("!r:x", "pendingq"))
+
+    def test_pending_questions_uses_room_registry_and_unknown_has_no_link(self):
+        for server, origin in (("s.space", "https://chat.s.space"),
+                               ("ag2.space", "https://chat.ag2.space"),
+                               ("dev.s.space", "https://dev-chat.s.space")):
+            with self.subTest(server=server):
+                self.assertEqual(pq.db_link(f"!room:{server}", "pendingq"),
+                                 f"{origin}/home/!room%3A{server}?surface=database&page=pendingq")
+        self.assertIsNone(pq.db_link("!room:unknown.example", "pendingq"))
+        with self.assertRaises(ValueError):
+            links.database_link("!room:unknown.example", "pendingq")
 
     def test_no_other_module_builds_an_app_link(self):
         rx = r"matrix\.to/#/|/#/room/|[?&]surface=|surface=db"
         out = subprocess.run(["git", "grep", "-lE", rx, "--", "src", "scripts", "skills", "packages",
                               ":!*.md"], cwd=REPO, capture_output=True, text=True).stdout.split()
         self.assertEqual([p for p in out if p != "src/ag2space_links.py"], [])
+
+
+class TestExplicitVia(unittest.TestCase):
+    def test_an_explicit_via_that_is_not_a_server_name_is_dropped(self):
+        import ag2space_links as links
+        self.assertEqual(links.room_link("!r:ag2.space", via="a&via=evil.example"), "https://matrix.to/#/!r:ag2.space")
+        self.assertEqual(links.room_link("!r:ag2.space", via="evil.example/x"), "https://matrix.to/#/!r:ag2.space")
+        self.assertEqual(links.room_link("!r:ag2.space", via="s.space"), "https://matrix.to/#/!r:ag2.space?via=s.space")
+        self.assertEqual(links.room_link("!r:ag2.space", via="localhost:8448"), "https://matrix.to/#/!r:ag2.space?via=localhost:8448")
+        self.assertEqual(links.room_link("!r:ag2.space", via=" S.Space "), "https://matrix.to/#/!r:ag2.space?via=s.space",
+                         "the normalised via is what goes out")
 
 
 if __name__ == "__main__":

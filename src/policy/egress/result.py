@@ -174,6 +174,63 @@ def sensitive_data_filter_enabled(task_file, tier=None) -> bool:
     return filter_values != ["false"] or collaborator_values != ["true"]
 
 
+def trusted_attach_root(root) -> str | None:
+    """Return a real, non-symlink task root or None."""
+    try:
+        absolute = os.path.abspath(os.fspath(root))
+        metadata = os.lstat(absolute)
+    except (OSError, TypeError, ValueError):
+        return None
+    if not stat.S_ISDIR(metadata.st_mode):
+        return None
+    real = os.path.realpath(absolute)
+    expected = os.path.join(
+        os.path.realpath(os.path.dirname(absolute)), os.path.basename(absolute))
+    return real if real == expected else None
+
+
+def open_confined_attachment(path, root) -> int:
+    """Open a regular file below a trusted root without following symlinks."""
+    trusted_root = trusted_attach_root(root)
+    if trusted_root is None:
+        raise ValueError("untrusted task media directory")
+    try:
+        absolute_path = os.path.normpath(os.path.abspath(os.fspath(path)))
+        absolute_root = os.path.normpath(os.path.abspath(os.fspath(root)))
+        relative = os.path.relpath(absolute_path, absolute_root)
+    except (OSError, TypeError, ValueError) as exc:
+        raise ValueError("invalid attachment path") from exc
+    if (os.path.isabs(relative) or relative in ("", ".", "..")
+            or relative.startswith(".." + os.sep)):
+        raise ValueError("attachment is outside the task media directory")
+    components = relative.split(os.sep)
+    if any(part in ("", ".", "..") for part in components):
+        raise ValueError("invalid attachment path")
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    root_fd = os.open(trusted_root, directory_flags)
+    current_fd = root_fd
+    try:
+        for component in components[:-1]:
+            next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        file_fd = os.open(
+            components[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current_fd)
+        try:
+            if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                raise OSError("attachment is not a regular file")
+        except BaseException:
+            os.close(file_fd)
+            raise
+        return file_fd
+    finally:
+        if current_fd != root_fd:
+            os.close(current_fd)
+        os.close(root_fd)
+
+
 def load_team_result_scanner(repo: Path):
     """Load and warm the full scanner graph before Team-controlled execution."""
     source_dir = str((Path(repo) / "src").resolve())
@@ -211,7 +268,8 @@ def attach_markers_confined(body: str, attach_roots) -> bool:
     it would resolve against a cwd or a home directory this policy cannot
     vouch for. An empty `attach_roots` confines nothing.
     """
-    roots = [os.path.realpath(str(r)) for r in (attach_roots or ()) if str(r).strip()]
+    roots = [trusted for r in (attach_roots or ())
+             if str(r).strip() and (trusted := trusted_attach_root(r))]
     if not roots:
         return False
     values = [a.value for a in parse_markers(body or "").actions if a.kind == "attach"]
@@ -441,8 +499,11 @@ def _record_directory(path: Path) -> Path:
 def _owns_its_id(path: Path, field: str) -> bool:
     """A live record may act only while its id is reserved to the body it holds
     and no decision for that id is archived; an archived decision is immutable."""
-    return (path.parent.name != "archive" and not present(_archived(path))
-            and _issued_to(path, field) == _record_digest(path, field))
+    if path.parent.name == "archive" or present(_archived(path)):
+        return False
+    issued = _issued_to(path, field)
+    # "unreadable" names no body, so a reservation holding it owns nothing, not even its twin.
+    return issued != "unreadable" and issued == _record_digest(path, field)
 
 
 def present(path: Path, kind: "int | None" = None) -> bool:
@@ -1235,3 +1296,33 @@ def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
         state_dir, task_id = suppress_journal
         journal_quarantined_attachment(body, state_dir, task_id)
     return verdict.body, verdict.reason
+
+
+def attachment_notice_name(path, tier) -> str:
+    """What a transport's attachment notice (denied, not found) may name for a reader at `tier`:
+    the path for the owner, only its file name for anyone else, so no local path reaches them."""
+    path = str(path or "")
+    if not is_guarded_tier(tier):
+        return path
+    return os.path.basename(path.rstrip("/\\").replace("\\", "/")) or "(unnamed file)"
+
+
+def redirect_destination(body: str) -> "str | None":
+    """The `[channel:]` target the shared parser executes for this body, or None."""
+    return next((a.value for a in parse_markers(body or "").actions if a.kind == "redirect"), None)
+
+
+def guard_proactive_for_destination(body: str, destination, owner_destination, destination_tier,
+                                    repo, secret_filter=None, scan_sensitive_data: bool = True):
+    """(body, None) to deliver an owner-authored proactive body as written, or
+    (notice, reason) to send `destination` the withheld notice instead.
+
+    A body the adapter routed to a destination other than the owner's conversation (None means
+    the owner's) is read by that audience, so the text it shows is guarded at `destination_tier`;
+    its markers stay the owner's to issue.
+    """
+    if destination is None or destination == owner_destination:
+        return body, None
+    safe, reason = guard_result_for_tier(parse_markers(body or "").body, destination_tier, repo,
+                                         secret_filter, scan_sensitive_data, honor_suppressions=False)
+    return (body, None) if reason is None else (safe, reason)

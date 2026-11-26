@@ -68,7 +68,7 @@ def grant_room(room_id: str, *, tiers: "dict | None" = None,
                revoke: bool = False, agent_mxid: "str | None" = None) -> dict:
     """Set (or revoke) the room's authoritative grant. Read-merge-write; returns
     a normalized result dict (never raises on a gateway/HTTP fault)."""
-    base, headers = gateway()
+    base, headers = gateway(room_id)
     if not base:
         return {"ok": False, "reason": "no gateway configured"}
     read_payload = {"op": "get_state", "room_id": room_id}

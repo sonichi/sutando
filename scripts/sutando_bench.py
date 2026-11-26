@@ -45,19 +45,137 @@ def percentile(values: Iterable[float], quantile: float) -> Optional[float]:
 
 
 def load_suite(path: Path) -> Dict[str, Any]:
-    data = json.loads(path.read_text())
-    if data.get("schema") != SCHEMA or not data.get("name"):
-        raise ValueError("suite must have schema=1 and a non-empty name")
+    try:
+        data = json.loads(path.read_text(), object_pairs_hook=_unique_json_object)
+    except RecursionError as exc:
+        raise ValueError("suite JSON exceeds supported nesting") from exc
+    validate_suite(data)
+    return data
+
+
+def validate_suite(data: Any) -> None:
+    if not isinstance(data, dict):
+        raise ValueError("suite must be a JSON object")
+    if type(data.get("schema")) is not int or data["schema"] != SCHEMA:
+        raise ValueError("suite must have schema=1")
+    if not isinstance(data.get("name"), str) or not data["name"].strip():
+        raise ValueError("suite name must be a non-empty string")
     cases = data.get("cases")
     if not isinstance(cases, list) or not cases:
-        raise ValueError("suite must contain at least one case")
+        raise ValueError("suite cases must be a non-empty list")
     seen = set()
-    for case in cases:
-        case_id = case.get("id") if isinstance(case, dict) else None
-        if not case_id or case_id in seen or not case.get("prompt"):
-            raise ValueError("every case needs a unique id and a prompt")
+    for index, case in enumerate(cases, 1):
+        prefix = f"case {index}"
+        if not isinstance(case, dict):
+            raise ValueError(f"{prefix} must be a JSON object")
+        for field in ("id", "prompt"):
+            if not isinstance(case.get(field), str) or not case[field].strip():
+                raise ValueError(f"{prefix}: {field} must be a non-empty string")
+        case_id = case["id"]
+        if case_id in seen:
+            raise ValueError(f"{prefix}: id must be unique")
         seen.add(case_id)
-    return data
+        _validate_expectation(case.get("expect", {}), prefix)
+
+
+def _validate_expectation(expected: Any, prefix: str) -> None:
+    if not isinstance(expected, dict):
+        raise ValueError(f"{prefix}: expect must be a JSON object")
+    unknown = set(expected) - {"equals", "contains", "regex", "max_chars", "json_equals"}
+    if unknown:
+        names = ", ".join(sorted(str(name) for name in unknown))
+        raise ValueError(f"{prefix}: unknown expect assertion(s): {names}; "
+                         "use equals, contains, regex, max_chars or json_equals")
+    for field in ("equals", "regex"):
+        if field in expected and not isinstance(expected[field], str):
+            raise ValueError(f"{prefix}: expect.{field} must be a string")
+    if "contains" in expected:
+        value = expected["contains"]
+        if not ((isinstance(value, str) and value) or (
+                isinstance(value, list) and value
+                and all(isinstance(item, str) and item for item in value))):
+            raise ValueError(f"{prefix}: expect.contains must be a non-empty string "
+                             "or a non-empty list of non-empty strings")
+    if "max_chars" in expected:
+        maximum = expected["max_chars"]
+        if type(maximum) is not int or maximum < 0:
+            raise ValueError(f"{prefix}: expect.max_chars must be a non-negative integer")
+    if "regex" in expected:
+        if not expected["regex"]:
+            raise ValueError(f"{prefix}: expect.regex must be a non-empty string")
+        try:
+            re.compile(expected["regex"], re.IGNORECASE | re.MULTILINE)
+        except (re.error, OverflowError, RecursionError) as exc:
+            raise ValueError(f"{prefix}: invalid expect.regex: {exc}") from exc
+    if "json_equals" in expected:
+        try:
+            _validate_json_value(expected["json_equals"], set())
+        except RecursionError as exc:
+            raise ValueError(f"{prefix}: expect.json_equals exceeds supported nesting") from exc
+        except ValueError as exc:
+            raise ValueError(f"{prefix}: invalid expect.json_equals: {exc}") from exc
+
+
+def _validate_json_value(value: Any, active: set) -> None:
+    kind = type(value)
+    if value is None or kind in (str, bool, int):
+        return
+    if kind is float:
+        if not math.isfinite(value):
+            raise ValueError("numbers must be finite")
+        return
+    if kind not in (list, dict):
+        raise ValueError("values must use plain JSON types")
+    if kind is dict and any(type(key) is not str for key in value):
+        raise ValueError("object keys must be strings")
+    identity = id(value)
+    if identity in active:
+        raise ValueError("cyclic values are not JSON")
+    active.add(identity)
+    try:
+        for item in value.values() if kind is dict else value:
+            _validate_json_value(item, active)
+    finally:
+        active.remove(identity)
+
+
+def _unique_json_object(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    value: Dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON object key")
+        value[key] = item
+    return value
+
+
+def _finite_json_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("JSON numbers must be finite")
+    return number
+
+
+def _json_values_equal(actual: Any, wanted: Any) -> bool:
+    pending = [(actual, wanted)]
+    while pending:
+        actual, wanted = pending.pop()
+        if type(actual) in (int, float) and type(wanted) in (int, float):
+            if actual != wanted:
+                return False
+            continue
+        if type(actual) is not type(wanted):
+            return False
+        if isinstance(actual, list):
+            if len(actual) != len(wanted):
+                return False
+            pending.extend(zip(actual, wanted))
+        elif isinstance(actual, dict):
+            if actual.keys() != wanted.keys():
+                return False
+            pending.extend((item, wanted[key]) for key, item in actual.items())
+        elif actual != wanted:
+            return False
+    return True
 
 
 def score_response(response: str, expected: Dict[str, Any]) -> Tuple[bool, List[Dict[str, Any]]]:
@@ -80,6 +198,15 @@ def score_response(response: str, expected: Dict[str, Any]) -> Tuple[bool, List[
     if "max_chars" in expected:
         maximum = int(expected["max_chars"])
         add("max_chars", maximum, len(response.strip()) <= maximum)
+    if "json_equals" in expected:
+        wanted = expected["json_equals"]
+        try:
+            actual = json.loads(response, object_pairs_hook=_unique_json_object,
+                                parse_float=_finite_json_float, parse_constant=_finite_json_float)
+            passed = _json_values_equal(actual, wanted)
+        except (ValueError, OverflowError, RecursionError):
+            passed = False
+        add("json_equals", wanted, passed)
     if not checks:
         add("nonempty", True, bool(response.strip()))
     return all(check["passed"] for check in checks), checks
@@ -251,13 +378,14 @@ def summarize(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 def run_suite(workspace: Path, suite: Dict[str, Any], repeat: int,
               timeout_s: float, poll_s: float, label: str,
               runtime: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    validate_suite(suite)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     rows: List[Dict[str, Any]] = []
     started_at = utc_now()
     for repetition in range(1, repeat + 1):
-        for case in suite["cases"]:
-            task_id = "task-bench-{}-{}-{}".format(
-                run_id, _safe_id(case["id"]), repetition)
+        for case_index, case in enumerate(suite["cases"], 1):
+            task_id = "task-bench-{}-{}-{}-{}".format(
+                run_id, case_index, _safe_id(case["id"]), repetition)
             submitted = time.perf_counter()
             _submit(workspace / "tasks", task_id, case["prompt"])
             response, result_path, wait_ms = _wait_for_result(
@@ -519,11 +647,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("sutando-bench: repeat, timeout, and poll must be positive", file=sys.stderr)
         return 2
     try:
+        suite = load_suite(args.suite)
+    except (OSError, ValueError) as exc:
+        print(f"sutando-bench: invalid suite: {exc}; fix the suite and retry", file=sys.stderr)
+        return 2
+    try:
         runtime_start = probe_runtime(args.sutando_config, args.workspace)
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"sutando-bench: cannot attribute runtime version: {exc}", file=sys.stderr)
         return 2
-    suite = load_suite(args.suite)
     run = run_suite(args.workspace, suite, args.repeat, args.timeout, args.poll,
                     args.label, runtime_start)
     try:

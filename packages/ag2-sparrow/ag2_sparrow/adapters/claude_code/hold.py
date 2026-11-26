@@ -9,6 +9,7 @@ then writes the go byte. A failed publish, attach or go write reaps the shim: no
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import signal
@@ -17,9 +18,10 @@ import sys
 import time
 from pathlib import Path
 
-from ... import connect_common as cm, task_io
+from ... import claude_local_records as records, claude_model_switch, connect_common as cm, task_io
+from ...file_lock import locked_file
 from . import inbox
-from .shape import LOCAL
+from .shape import LOCAL, resolve_plugin_dir
 
 GO = b"g"
 NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -58,22 +60,115 @@ def set_title(token: str, out=None) -> None:
     out.flush()
 
 
+def claude_home(config_dir: str) -> str:
+    """CLAUDE_CONFIG_DIR as the session runs it: the recorded one, else the CLI's default."""
+    return config_dir or os.path.join(os.path.expanduser("~"), ".claude")
+
+
+def transcript_path(config_dir: str, session_id: str) -> str:
+    """The session's transcript under any project folder of the config dir's projects tree, else ''.
+    `claude --resume <id>` finds it from any working directory, so the pane's own cwd needs no copy."""
+    base = os.path.join(claude_home(config_dir), "projects")
+    try:
+        projects = sorted(os.listdir(base))
+    except OSError:
+        return ""
+    return next((p for p in (os.path.join(base, d, session_id + ".jsonl") for d in projects) if os.path.isfile(p)), "")
+
+
 def transcript_exists(config_dir: str, session_id: str) -> bool:
     """Whether the session's transcript already lives under CLAUDE_CONFIG_DIR's projects tree."""
-    base = os.path.join(config_dir or os.path.join(os.path.expanduser("~"), ".claude"), "projects")
+    return bool(transcript_path(config_dir, session_id))
+
+
+def live_session_pid(config_dir: str, session_id: str) -> "int | None":
+    """The pid of a running Claude Code process that has `session_id` open, from the CLI's own
+    `sessions/<pid>.json` registry; None when none is recorded live."""
+    base = os.path.join(claude_home(config_dir), "sessions")
     try:
-        projects = os.listdir(base)
+        names = os.listdir(base)
     except OSError:
+        return None
+    for name in names:
+        if not re.match(r"^\d+\.json$", name):
+            continue
+        try:
+            with open(os.path.join(base, name), encoding="utf-8") as f:
+                rec = json.load(f)
+        except (OSError, ValueError):
+            continue
+        pid = rec.get("pid") if isinstance(rec, dict) else None
+        if rec and rec.get("sessionId") == session_id and isinstance(pid, int) and pid > 0 and _alive(pid):
+            return pid
+    return None
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
         return False
-    return any(os.path.isfile(os.path.join(base, p, session_id + ".jsonl")) for p in projects)
+    except PermissionError:
+        return True
+    return True
+
+
+MODEL_RECORD = ("state", "model-switch.json")
+MODEL_LOCK = ("state", "model-switch.lock")   # every read-then-write of MODEL_RECORD holds it
+
+
+def switched_model(root) -> str:
+    """The model the owner last switched the session to (`model`, the record the launcher writes once
+    Claude Code said "Set model to"), '' when none or one /model would not take."""
+    try:
+        with open(Path(root or ".").joinpath(*MODEL_RECORD), encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    model = str(record.get("model") or "") if isinstance(record, dict) else ""
+    return model if claude_model_switch.MODEL_RE.match(model) else ""
+
+
+def wanted_model(root) -> str:
+    """A pick the settings page saved while the session could not take /model (`wanted`): the next start
+    runs on it. '' when none."""
+    try:
+        with open(Path(root or ".").joinpath(*MODEL_RECORD), encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    model = str(record.get("wanted") or "") if isinstance(record, dict) else ""
+    return model if claude_model_switch.MODEL_RE.match(model) else ""
+
+
+def write_model_record(root, record: dict) -> None:
+    try:
+        records.write_durable(Path(root or ".").joinpath(*MODEL_RECORD), json.dumps(record).encode())
+    except records.RecordError as e:
+        raise OSError(str(e)) from e
+
+
+def settle_wanted(root, now=time.time) -> str:
+    """At a session's start: a waiting pick becomes the session's model (`--model` starts it on that one).
+    The pick, or '' when none waited or the record could not be written (the start then keeps the old model)."""
+    try:
+        with locked_file(Path(root or ".").joinpath(*MODEL_LOCK)):
+            wanted = wanted_model(root)
+            if wanted:
+                write_model_record(root, {"model": wanted, "at": now()})
+            return wanted
+    except OSError:
+        return ""
 
 
 def claude_argv(cfg: dict, session_id: str) -> list:
-    """`claude --plugin-dir … --permission-mode … --resume|--session-id <id>`: resume when the
-    transcript exists under the session's config dir, else start it under that id."""
+    """`claude --plugin-dir … --permission-mode … --resume|--session-id <id> [--model <m>]`: resume when
+    the transcript exists under the session's config dir, else start it under that id. A session the
+    owner switched starts again on that model: the pick outlives a restart, for every sender's turn."""
     flag = "--resume" if transcript_exists(cfg.get("CLAUDE_CONFIG_DIR", ""), session_id) else "--session-id"
-    return [cfg["CLAUDE"], "--plugin-dir", cfg["PLUGIN_DIR"], "--permission-mode",
-            cfg.get("PERMISSION_MODE") or "bypassPermissions", flag, session_id]
+    model = switched_model(cfg.get("ROOT"))
+    return [cfg["CLAUDE"], "--plugin-dir", str(resolve_plugin_dir(cfg["PLUGIN_DIR"])[0]), "--permission-mode",
+            cfg.get("PERMISSION_MODE") or "bypassPermissions", flag, session_id] + (["--model", model] if model else [])
 
 
 TITLE_OFF_VAR = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE"
@@ -170,6 +265,9 @@ def _held(root, cfg, session_id, nonce, env, popen, state) -> int:
         return "%d:%d" % (st.st_dev, st.st_ino), ""
 
     def spawn(inode):
+        picked = settle_wanted(cfg.get("ROOT"))
+        if picked:
+            print("hold: starting on %s, the model picked while the session could not switch" % picked, file=sys.stderr)
         child, pipe["go_w"] = spawn_shim(claude_argv(cfg, session_id), child_env(env, inode), popen)
         return child
 

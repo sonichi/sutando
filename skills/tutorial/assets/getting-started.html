@@ -1,0 +1,629 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>s.space Superpowers · Getting Started Guide</title>
+<style>
+#overview {
+  --display: "Avantt", "Avantt SemiBold", "Avenir Next", sans-serif;
+  --sans: "Haas Recast", "Haas Recast Dense", "Avenir Next", sans-serif;
+  --bg: #f4f4f4;
+  --card: #ffffff;
+  --ink: #1c1b1c;
+  --mute: #6b6661;
+  --line: #e2dfdb;
+  --acc: #b85f14;
+  --accbg: #fbefe3;
+  --soft: #f7f4ef;
+  --green: #1e7e48;
+  --greenbg: #e8f5ec;
+  --shadow: 0 1px 3px rgba(0,0,0,0.04), 0 8px 24px rgba(0,0,0,0.06);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) #overview {
+    --bg: #0e0e0f;
+    --card: #19191b;
+    --ink: #f1efec;
+    --mute: #aaa49e;
+    --line: #2c2c2f;
+    --acc: #f8a358;
+    --accbg: #2a1f15;
+    --soft: #222225;
+    --green: #34d399;
+    --greenbg: #132a1e;
+    --shadow: 0 1px 3px rgba(0,0,0,0.2), 0 8px 24px rgba(0,0,0,0.3);
+  }
+}
+:root[data-theme="dark"] #overview {
+  --bg: #0e0e0f;
+  --card: #19191b;
+  --ink: #f1efec;
+  --mute: #aaa49e;
+  --line: #2c2c2f;
+  --acc: #f8a358;
+  --accbg: #2a1f15;
+  --soft: #222225;
+  --green: #34d399;
+  --greenbg: #132a1e;
+  --shadow: 0 1px 3px rgba(0,0,0,0.2), 0 8px 24px rgba(0,0,0,0.3);
+}
+:root[data-theme="light"] #overview {
+  --bg: #f4f4f4;
+  --card: #ffffff;
+  --ink: #1c1b1c;
+  --mute: #6b6661;
+  --line: #e2dfdb;
+  --acc: #b85f14;
+  --accbg: #fbefe3;
+  --soft: #f7f4ef;
+  --green: #1e7e48;
+  --greenbg: #e8f5ec;
+  --shadow: 0 1px 3px rgba(0,0,0,0.04), 0 8px 24px rgba(0,0,0,0.06);
+}
+#overview * { box-sizing: border-box; margin: 0; padding: 0; }
+#overview {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.5 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  padding: 24px 16px 64px;
+}
+#overview .container { max-width: 880px; margin: 0 auto; }
+#overview .overview-hero {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 28px 24px;
+  box-shadow: var(--shadow);
+  margin-bottom: 20px;
+}
+#overview .tag-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--accbg);
+  color: var(--acc);
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 12px;
+}
+#overview h1 { font-size: 26px; font-weight: 700; line-height: 1.25; margin-bottom: 8px; }
+#overview .subtitle { color: var(--mute); font-size: 15px; line-height: 1.5; margin-bottom: 20px; }
+#overview .nav-tracker {
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px;
+}
+#overview .nav-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  padding: 0 2px;
+}
+#overview .nav-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--mute); }
+#overview .badge-status {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--acc);
+  background: var(--accbg);
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+#overview .steps-tabs {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  width: 100%;
+}
+#overview .tab-btn {
+  background: var(--card);
+  border: 1px solid var(--line);
+  color: var(--mute);
+  padding: 10px 8px;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+}
+#overview .tab-btn:hover { color: var(--ink); border-color: var(--acc); }
+#overview .tab-btn.active {
+  background: var(--card);
+  color: var(--acc);
+  border-color: var(--acc);
+  box-shadow: 0 0 0 1px var(--acc);
+}
+#overview .tab-num {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--line);
+  color: var(--mute);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+#overview .tab-btn.active .tab-num {
+  background: var(--acc);
+  color: #fff;
+}
+@media (max-width: 640px) {
+  #overview .steps-tabs { grid-template-columns: repeat(2, 1fr); }
+}
+#overview .tour-card {
+  display: none;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 28px 24px;
+  box-shadow: var(--shadow);
+  margin-top: 18px;
+}
+#overview .tour-card.active { display: block; }
+#overview .card-num {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--acc);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 4px;
+}
+#overview h2 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
+#overview .card-desc { color: var(--mute); font-size: 14.5px; margin-bottom: 20px; }
+#overview .feature-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+#overview .feature-box {
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px;
+}
+#overview .feature-box h4 {
+  font-size: 14px;
+  font-weight: 700;
+  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+#overview .feature-box p { font-size: 13.5px; color: var(--mute); line-height: 1.45; }
+#overview .callout {
+  background: var(--accbg);
+  border-left: 4px solid var(--acc);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin-bottom: 18px;
+}
+#overview .callout-title { font-weight: 700; font-size: 14px; color: var(--acc); margin-bottom: 4px; }
+#overview .callout p { font-size: 13.5px; color: var(--ink); margin: 0; }
+#overview .interactive-panel {
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 18px;
+}
+#overview .panel-title { font-weight: 700; font-size: 13.5px; margin-bottom: 10px; }
+#overview .interactive-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+#overview .sub-tab {
+  background: var(--card);
+  border: 1px solid var(--line);
+  color: var(--mute);
+  padding: 6px 12px;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+#overview .sub-tab:hover { color: var(--ink); }
+#overview .sub-tab.active { background: var(--acc); color: #fff; border-color: var(--acc); }
+#overview .panel-content {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px;
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+#overview .prompt-box {
+  background: var(--soft);
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  padding: 14px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+#overview .prompt-meta { font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--mute); margin-bottom: 2px; }
+#overview .prompt-text { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; color: var(--ink); }
+#overview .btn-copy {
+  background: var(--acc);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 12px;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: opacity 0.15s;
+}
+#overview .btn-copy:hover { opacity: 0.9; }
+#overview .card-nav {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+#overview .btn-nav {
+  background: var(--card);
+  border: 1px solid var(--line);
+  color: var(--ink);
+  padding: 8px 16px;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+#overview .btn-nav:hover { background: var(--soft); }
+#overview .btn-nav.primary {
+  background: var(--acc);
+  color: #fff;
+  border-color: var(--acc);
+}
+#overview .btn-nav.primary:hover { opacity: 0.95; }
+#overview h1, #overview h2 { font-family:var(--display); font-weight:600; }
+#overview .overview-hero { border-radius:26px; border-top:4px solid #f26a21; background:radial-gradient(ellipse at 110% -10%,#f9a75c 0,transparent 45%),var(--card); }
+#overview .tour-card { border-radius:22px; }
+#overview button { min-height:44px; max-width:100%; white-space:normal; overflow-wrap:anywhere; }
+#overview button:focus-visible { outline:3px solid var(--ink); outline-offset:3px; }
+#overview .feature-grid { grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr)); }
+#overview .prompt-text { overflow-wrap:anywhere; }
+@media(max-width:440px) { #overview .prompt-box, #overview .card-nav { flex-wrap:wrap; gap:8px; } #overview .overview-hero, #overview .tour-card { padding:22px 18px; } }
+@media(prefers-reduced-motion:reduce) { #overview * { transition:none!important; } }
+@media print { #overview .tour-card { display:block; } #overview .card-nav { display:none; } }
+</style>
+</head>
+<body style="margin:0">
+<div id="overview">
+<div class="container">
+<p class="subtitle">Interactive overview · Explore example connections, permissions and workflows.</p>
+  <header class="overview-hero">
+    <div class="tag-badge">s.space Guide &amp; Tour</div>
+    <h1>The Multiplayer AI Workspace</h1>
+    <p class="subtitle">Connect agents across providers, collaborate with teammates in multiplayer rooms, talk in live calls, and build durable artifacts in Room Commons.</p>
+    
+    <div class="nav-tracker">
+      <div class="nav-header">
+        <span class="nav-title">Explore four topics</span>
+        <div class="badge-status" id="progressStatus">Ecosystem</div>
+      </div>
+      <div class="steps-tabs">
+        <button class="tab-btn active" onclick="showStep(0)">
+          <span class="tab-num">1</span>
+          <span>Ecosystem</span>
+        </button>
+        <button class="tab-btn" onclick="showStep(1)">
+          <span class="tab-num">2</span>
+          <span>Multiplayer</span>
+        </button>
+        <button class="tab-btn" onclick="showStep(2)">
+          <span class="tab-num">3</span>
+          <span>Calls &amp; Local Tools</span>
+        </button>
+        <button class="tab-btn" onclick="showStep(3)">
+          <span class="tab-num">4</span>
+          <span>Commons &amp; Tasks</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Step 1: Cross-Provider AI Ecosystem -->
+  <section class="tour-card active" id="step-0">
+    <div class="card-num">Topic · Agent connections</div>
+    <h2>Bring your agents together</h2>
+    <p class="card-desc">Connect an agent from another app, run a local coding agent, or set up Sutando as your personal agent. Choose the connection that fits your work.</p>
+
+    <div class="feature-grid">
+      <div class="feature-box">
+        <h4>🖥️ Local agent (Sutando)</h4>
+        <p>Runs locally on your Mac. Can use local files and tools you authorize. Model requests and connected services may send data off the device.</p>
+      </div>
+      <div class="feature-box">
+        <h4>☁️ Frontier Cloud Agents</h4>
+        <p>Bring supported agents from the apps you use. Each connection has its own account, plan and available capabilities.</p>
+      </div>
+      <div class="feature-box">
+        <h4>🔌 Connected apps</h4>
+        <p>Manage connections in Settings → Apps → Connected apps. Your accounts stay under your control; ask your agent which tools are available.</p>
+      </div>
+    </div>
+
+    <div class="interactive-panel">
+      <div class="panel-title">Explore the connections</div>
+      <p style="font-size:13.5px;color:var(--mute);margin-bottom:12px">Choose an agent to see where it runs and how to connect it.</p>
+      <div class="interactive-tabs">
+        <button class="sub-tab active" onclick="setProvider('antigravity', this)">Antigravity</button>
+        <button class="sub-tab" onclick="setProvider('claudeCode', this)">Claude Code</button>
+        <button class="sub-tab" onclick="setProvider('claude', this)">Claude Duet</button>
+        <button class="sub-tab" onclick="setProvider('codex', this)">Codex</button>
+        <button class="sub-tab" onclick="setProvider('openai', this)">Dot</button>
+        <button class="sub-tab" onclick="setProvider('grok', this)">Grok Bot</button>
+        <button class="sub-tab" onclick="setProvider('muse', this)">Muse</button>
+        <button class="sub-tab" onclick="setProvider('sutando', this)">Sutando (Local Mac)</button>
+        <button class="sub-tab" onclick="setProvider('other', this)">Other apps</button>
+      </div>
+      <div class="panel-content" id="providerInfo">
+        <strong>Antigravity · on your computer:</strong> Connect Google’s Antigravity CLI using your Google sign-in, so it can reply in your s.space DMs and rooms. Install and sign in to the CLI yourself first. The setup option appears only in a desktop app whose host supports it; it is not offered by every web or desktop version.
+      </div>
+    </div>
+
+    <div class="prompt-box">
+      <div>
+        <div class="prompt-meta">Try in your DM with your agent:</div>
+        <div class="prompt-text" id="prompt-p1">"Help me connect an agent."</div>
+      </div>
+      <button class="btn-copy" onclick="copyText('prompt-p1', this)">Copy</button>
+    </div>
+
+    <div class="card-nav">
+      <span></span>
+      <button class="btn-nav primary" onclick="showStep(1)">Explore Multiplayer →</button>
+    </div>
+  </section>
+
+  <!-- Step 2: Multiplayer Collaboration in Rooms -->
+  <section class="tour-card" id="step-1">
+    <div class="card-num">Topic · Multiplayer collaboration</div>
+    <h2>Rooms Where People &amp; Personal Agents Collaborate</h2>
+    <p class="card-desc">People and their agents work together in a shared room. Each agent keeps its own owner, connections and permissions.</p>
+
+    <div class="feature-grid">
+      <div class="feature-box">
+        <h4>👥 Multi-Human &amp; Multi-Agent</h4>
+        <p>Invite colleagues and their agents into a shared room. Teammates can direct their agents to collaborate with yours on complex workflows.</p>
+      </div>
+      <div class="feature-box">
+        <h4>🤝 Agent-to-agent teamwork</h4>
+        <p>Ask one agent to work with another: for example, one prepares a patch and another reviews it. Collaboration depends on each agent’s access and owner authorization.</p>
+      </div>
+      <div class="feature-box">
+        <h4>🛡️ Granular Access Tiers</h4>
+        <p>Owners choose how other room members can work with their agents. Room permissions and agent settings keep collaboration within that scope.</p>
+      </div>
+    </div>
+
+    <div class="interactive-panel">
+      <div class="panel-title">Access settings explained (example only)</div>
+      <div class="interactive-tabs">
+        <button class="sub-tab active" onclick="setTier('collaborator', this)">Team — collaborator</button>
+        <button class="sub-tab" onclick="setTier('guest', this)">Guest — owner approves first</button>
+        <button class="sub-tab" onclick="setTier('none', this)">No access — other members cannot invoke</button>
+      </div>
+      <div class="panel-content" id="tierInfo">
+        <strong>Team — collaborator:</strong> Work with the agent in the shared workspace, within its owner’s permissions and tool-approval settings.
+      </div>
+    </div>
+
+    <div class="prompt-box">
+      <div>
+        <div class="prompt-meta">Try in a team room:</div>
+        <div class="prompt-text" id="prompt-p2">"Review the patch linked above and ask the other agent in this room to check the tests."</div>
+      </div>
+      <button class="btn-copy" onclick="copyText('prompt-p2', this)">Copy</button>
+    </div>
+
+    <div class="card-nav">
+      <button class="btn-nav" onclick="showStep(0)">← Previous topic</button>
+      <button class="btn-nav primary" onclick="showStep(2)">Explore Calls &amp; Local Tools →</button>
+    </div>
+  </section>
+
+  <!-- Step 3: Live Calls, Screen Sharing & Realtime Computer Use -->
+  <section class="tour-card" id="step-2">
+    <div class="card-num">Topic · Calls and local tools</div>
+    <h2>Talk through ideas and work live</h2>
+    <p class="card-desc">Talk with teammates and voice-enabled agents in an s.space call. For hands-on screen coaching or editing, use a supported local session with the access you approve.</p>
+
+    <div class="callout">
+      <div class="callout-title">🎙️ Bring an agent into the conversation</div>
+      <p>Use the headphone control (Start call) in the room header. In a room, choose an agent under “Bring an agent?” and select “Bring into call”. Ask aloud: <em>"Read the bug report in this room and help us decide what to try next."</em></p>
+    </div>
+
+    <div class="feature-grid">
+      <div class="feature-box">
+        <h4>⚡ Voice in the room</h4>
+        <p>In your DM, the agent can answer directly. In a room, explicitly bring it into the call. Voice must be enabled for that agent and allowed in that room.</p>
+      </div>
+      <div class="feature-box">
+        <h4>🖥️ Share context for the conversation</h4>
+        <p>Put relevant text or an artifact in the room for the agent to review. Room-call screen sharing is work in progress; agent screen access uses a separate, supported local session with your permission.</p>
+      </div>
+      <div class="feature-box">
+        <h4>🖱️ Local Mac Computer Use</h4>
+        <p>A configured Sutando session can inspect your Mac screen and use local apps with your device permissions and authorization.</p>
+      </div>
+    </div>
+
+    <div class="interactive-panel">
+      <div class="panel-title">Explore voice workflows</div>
+      <div class="interactive-tabs">
+        <button class="sub-tab active" onclick="setCallScenario('debug', this)">Discuss a bug report</button>
+        <button class="sub-tab" onclick="setCallScenario('design', this)">UI / Spec Review</button>
+        <button class="sub-tab" onclick="setCallScenario('triage', this)">Issue Triage</button>
+        <button class="sub-tab" onclick="setCallScenario('coach', this)">Live screen coach</button>
+        <button class="sub-tab" onclick="setCallScenario('writing', this)">Write &amp; edit by voice</button>
+      </div>
+      <div class="panel-content" id="callInfo">
+        <strong>Debug Scenario:</strong> Post the relevant error text in the room. Ask aloud: <em>"Read that error and suggest a way to reproduce it."</em> The agent can help diagnose the shared evidence.
+      </div>
+    </div>
+
+    <div class="card-nav">
+      <button class="btn-nav" onclick="showStep(1)">← Previous topic</button>
+      <button class="btn-nav primary" onclick="showStep(3)">Explore Commons &amp; Tasks →</button>
+    </div>
+  </section>
+
+  <!-- Step 4: Room Commons & Autonomous Background Tasks -->
+  <section class="tour-card" id="step-3">
+    <div class="card-num">Topic · Commons and follow-up</div>
+    <h2>Keep shared work in Commons</h2>
+    <p class="card-desc">Room Commons holds shared pages and other artifacts alongside the conversation. Open Commons in the room header and choose the surface for your work.</p>
+
+    <div class="feature-grid">
+      <div class="feature-box">
+        <h4>📄 Collaborative Docs &amp; Whiteboard</h4>
+        <p>Live multiplayer editing for specs, design notes, and system architecture sketches anchored right alongside chat.</p>
+      </div>
+      <div class="feature-box">
+        <h4>📊 Interactive Commons HTML</h4>
+        <p>Ask an agent to build interactive examples, charts and tools. Live data and account actions use supported integrations with your authorization.</p>
+      </div>
+      <div class="feature-box">
+        <h4>⏰ Scheduled follow-up work</h4>
+        <p>Ask your agent in a DM to schedule follow-up. Specify when, what to check and where to report, then confirm the schedule was created.</p>
+      </div>
+    </div>
+
+    <div class="interactive-panel">
+      <div class="panel-title">Commons surface examples</div>
+      <div class="interactive-tabs">
+        <button class="sub-tab active" onclick="setCommons('html', this)">Commons HTML App</button>
+        <button class="sub-tab" onclick="setCommons('doc', this)">Multiplayer Doc</button>
+        <button class="sub-tab" onclick="setCommons('board', this)">Whiteboard</button>
+      </div>
+      <div class="panel-content" id="commonsInfo">
+        <strong>Commons HTML Pages:</strong> Build interactive guides, charts and tools in Commons. Add live data or actions through supported, authorized integrations.
+      </div>
+    </div>
+
+    <div class="prompt-box">
+      <div>
+        <div class="prompt-meta">Ask your agent in the room:</div>
+        <div class="prompt-text" id="prompt-p4">"Create an HTML page in Commons summarizing our sprint decisions and open votes."</div>
+      </div>
+      <button class="btn-copy" onclick="copyText('prompt-p4', this)">Copy</button>
+    </div>
+
+    <div class="card-nav">
+      <button class="btn-nav" onclick="showStep(2)">← Previous topic</button>
+      <button class="btn-nav primary" onclick="showStep(0)">Return to Ecosystem ↺</button>
+    </div>
+  </section>
+</div>
+
+<script>
+const steps = document.querySelectorAll('.tour-card');
+const tabs = document.querySelectorAll('.tab-btn');
+const progressStatus = document.getElementById('progressStatus');
+const stepNames = ["Ecosystem", "Multiplayer", "Calls & Local Tools", "Commons & Tasks"];
+
+function showStep(idx) {
+  steps.forEach((step, i) => step.classList.toggle('active', i === idx));
+  tabs.forEach((tab, i) => { tab.classList.toggle('active', i === idx); tab.setAttribute('aria-current', i === idx ? 'true' : 'false'); });
+  const heading = steps[idx].querySelector('h2'); heading.tabIndex = -1; heading.focus();
+  if (progressStatus) progressStatus.textContent = stepNames[idx];
+}
+
+async function copyText(id, btn) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const text = el.innerText.replace(/^"|"$/g, '');
+  let copied = false;
+  try { await navigator.clipboard.writeText(text); copied = true; } catch (_) {}
+  if (!copied) {
+    const range = document.createRange(); range.selectNodeContents(el);
+    const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
+  }
+  btn.innerText = copied ? 'Copied!' : 'Selected: press Ctrl/⌘C';
+  setTimeout(() => { btn.innerText = 'Copy'; }, 2500);
+}
+
+function setProvider(p, btn) {
+  document.querySelectorAll('#step-0 .sub-tab').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  const info = document.getElementById('providerInfo');
+  const details = {
+    "antigravity": "<strong>Antigravity · on your computer:</strong> Connect Google’s Antigravity CLI using your Google sign-in, so it can reply in your s.space DMs and rooms. Install and sign in to the CLI yourself first. The setup option appears only in a desktop app whose host supports it; it is not offered by every web or desktop version.",
+    "claudeCode": "<strong>Claude Code · on your computer:</strong> Connect Anthropic’s coding agent with your Claude Code login. It runs locally through Sparrow and replies to mentions in s.space rooms and DMs. This is separate from Claude Duet and from setting up Sutando; follow the setup flow for your device and keep the local service running.",
+    "claude": "<strong>Claude Duet · from another app:</strong> Bring your personal agent from Claude into s.space. Start with Add an agent, choose Claude Duet, and complete the connection in Claude. It can then participate in rooms you add it to, subject to its owner’s permissions. This is not Claude Code running on your computer.",
+    "codex": "<strong>Codex · on your computer:</strong> Connect OpenAI’s coding agent with your Codex CLI login. It runs locally through Sparrow and replies in s.space DMs and rooms. This is separate from Dot and from setting up Sutando. Local file and command access depend on the setup and permissions you approve.",
+    "openai": "<strong>Dot · from ChatGPT:</strong> Bring your personal Dot into s.space using Add an agent → Dot and the connection instructions in ChatGPT. You keep the same assistant; it can participate in the s.space rooms you add it to. Connecting it does not automatically give other members access to your private apps or data.",
+    "grok": "<strong>Grok Bot · from Grok:</strong> Connect the agent you use in Grok through Add an agent → Grok Bot, then finish the connection in Grok. It can reply in your s.space rooms and DMs. Use the tools exposed by that connection rather than assuming every Grok capability is available here.",
+    "muse": "<strong>Muse · from another app:</strong> Connect your Muse agent through Add an agent → Muse and complete the setup in Muse. Linking is only the first step: its listener must start and the agent must reply in your DM before setup is confirmed.",
+    "sutando": "<strong>Sutando · your local personal agent:</strong> Set up your open-source personal agent in the Mac desktop app, using a supported core such as Claude Code or Codex. It works with your local files and apps and collaborates in s.space. This is a separate setup from connecting a standalone coding agent; local tools require your authorization.",
+    "other": "<strong>Other apps:</strong> You can also connect agents such as Hermes and OpenClaw. Choose their named option in Add an agent when available; use Other for a compatible app with connectors that is not listed. Follow that app’s setup instructions and confirm a real reply. A model name or API key alone is not an agent connection."
+};
+  info.innerHTML = details[p] || "";
+}
+
+function setTier(tier, btn) {
+  document.querySelectorAll('#step-1 .sub-tab').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  const info = document.getElementById('tierInfo');
+  const details = {
+    collaborator: "<strong>Team — collaborator:</strong> Work with the agent in the shared workspace, within its owner’s permissions and tool-approval settings.",
+    guest: "<strong>Guest:</strong> Ask the owner to approve your requests and enable the collaboration you need.",
+    none: "<strong>No access:</strong> The owner can still access and invoke the agent; other room members cannot."
+  };
+  info.innerHTML = details[tier] || "";
+}
+
+function setCallScenario(scen, btn) {
+  document.querySelectorAll('#step-2 .sub-tab').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  const info = document.getElementById('callInfo');
+  const details = {
+    debug: "<strong>Debug Scenario:</strong> Post the relevant error text in the room. Ask aloud: <em>\"Read that error and suggest a way to reproduce it.\"</em> The agent can help diagnose the shared evidence.",
+    design: "<strong>UI / Spec Review:</strong> Open a shared design artifact in Commons. Ask aloud: <em>\"Read the comments on this design and summarize the decisions we still need.\"</em> Confirm the agent can access the artifact.",
+    triage: "<strong>Issue Triage:</strong> Ask aloud: <em>\"Read the bug thread in this room and summarize the unresolved questions.\"</em> Add the relevant logs to the room for the agent to review.",
+    coach: "<strong>Live coach with a screen companion:</strong> In a supported, configured local session, enable screen access only for what you want to share. Ask aloud: <em>\"Look at this screen and coach me through the next step; let me do the clicking.\"</em> Confirm the relevant view is available through your approved local screen access.",
+    writing: "<strong>Live writing &amp; editing:</strong> Select a passage with your cursor, then ask aloud: <em>\"Rewrite only this selection to be clearer, keeping my meaning.\"</em> In a supported editor or local session, confirm the agent received the selection and authorize the edit, then review the result. If selection access is unavailable, paste the passage into the room."
+  };
+  info.innerHTML = details[scen] || "";
+}
+
+function setCommons(surf, btn) {
+  document.querySelectorAll('#step-3 .sub-tab').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  const info = document.getElementById('commonsInfo');
+  const details = {
+    html: "<strong>Commons HTML Pages:</strong> Build interactive guides, charts and tools in Commons. Add live data or actions through supported, authorized integrations.",
+    doc: "<strong>Multiplayer Docs:</strong> Shared documents for plans, meeting notes and test checklists. Edit the document or leave a comment for discussion.",
+    board: "<strong>Whiteboard:</strong> Sketch ideas and diagrams together on a shared visual canvas."
+  };
+  info.innerHTML = details[surf] || "";
+}
+</script>
+<noscript><style>#overview .tour-card{display:block}</style><p>This overview works as a reference without JavaScript. Select an example prompt to copy it.</p></noscript>
+</div>
+</body>
+</html>

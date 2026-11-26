@@ -65,7 +65,7 @@ and warnings for legacy, unstable, dirty, or otherwise inexact attribution.
 ## Suite format
 
 Suites are dependency-free JSON. Every case requires `id` and `prompt` and may
-use `equals`, `contains`, `regex`, and `max_chars` assertions:
+use `equals`, `contains`, `regex`, `max_chars`, and `json_equals` assertions:
 
 ```json
 {
@@ -80,6 +80,78 @@ use `equals`, `contains`, `regex`, and `max_chars` assertions:
   ]
 }
 ```
+
+The suite must be an object with integer `schema: 1`, a nonempty string `name`,
+and a nonempty `cases` list. Each case is an object with a unique nonempty
+string `id` and a nonempty string `prompt`; whitespace-only values are rejected.
+Optional metadata fields remain available.
+
+`expect` may be omitted or `{}` to require a nonempty response. When supplied,
+it must be an object containing only these assertions; all specified checks
+must pass:
+
+| Assertion | Value | Check |
+| --- | --- | --- |
+| `equals` | String, including empty | Exact match after stripping response whitespace |
+| `contains` | Nonempty string or nonempty list of nonempty strings | Every string occurs, ignoring case |
+| `regex` | Nonempty valid Python regex string | Search with ignore-case and multiline flags |
+| `max_chars` | Nonnegative integer, including zero | Stripped response length is at most this value |
+| `json_equals` | Any finite JSON value, including `null` | Complete response is equivalent JSON; object-key order and whitespace do not matter |
+
+Use `json_equals` to evaluate structured task answers, such as a plan or a
+tool-result summary, without requiring one particular JSON serialization:
+
+```json
+{
+  "id": "structured-summary",
+  "prompt": "Do not use tools or change state. Reply only with a JSON object whose ok is true and whose items is the array [1, 2].",
+  "expect": {"json_equals": {"ok": true, "items": [1, 2]}}
+}
+```
+
+Both `{"ok":true,"items":[1,2]}` and `{"items": [1, 2], "ok": true}` pass.
+Arrays keep their order; extra or missing object keys fail. Booleans differ
+from numbers, while decoded finite numbers compare by value (`1` and `1.0`
+match). Numeric decoding uses Python's integers and floating-point values;
+use `equals` when the exact numeric spelling or decimal precision matters.
+JSON strings remain case-sensitive. Scalars and empty objects/arrays are
+valid expected answers, including `false`, `0`, `""`, and `null`.
+
+The entire response must be JSON: Markdown fences, surrounding prose,
+trailing documents, duplicate object keys, and non-finite numbers (including
+overflow such as `1e400`) fail. A failed parse is a failed check, so the run
+continues and records a `json_equals` check with its expected value and
+verdict. Other assertions may be combined with it and must also pass.
+Expected values must contain only JSON types, string object keys and finite
+numbers; invalid values are rejected before runtime probing or task submission.
+Suite files also reject duplicate object keys at every level, including nested
+expectations and escaped spellings of the same key. The earlier decoder kept
+only the last value; remove conflicting duplicate entries before retrying.
+Interpreter nesting and integer-decoding limits apply; exceeding them fails
+the check. This assertion does not impose a response-size or scoring-time budget.
+
+The controller validates every case before probing the runtime or submitting
+any task. Unknown assertion names, invalid values, malformed JSON and unreadable
+suite files exit 2 with a diagnostic; fix the indicated field and retry. Direct
+`run_suite` callers receive `ValueError` before task submission. Text assertions
+are no longer implicitly converted from numbers or other types, and
+`max_chars` no longer accepts strings, floats or booleans: use the types above.
+Empty `contains` strings/list items and empty `regex` patterns are rejected;
+use `equals: ""` or `max_chars: 0` when an empty or whitespace-only response is
+the intended answer. To require zero characters, use `regex: "\\A\\Z"` in JSON.
+Regexes search the untrimmed response with multiline matching, so `^$` also
+matches an empty line in a nonempty response, such as `"WRONG\n"` or
+`"WRONG\n\nMORE"`; it does not require an empty response.
+Valid grading and saved-run schemas are unchanged. Validation checks regex
+compilation, not execution time: backtracking on an agent response can stall
+scoring, so suites remain trusted input. Permissive patterns such as `.*` are
+accepted and may pass every answer; choose a pattern that checks the intended
+response.
+
+Case IDs remain unchanged in saved results and comparisons. Task filenames
+include the run ID, case position, a filename-safe case label, and repetition,
+so distinct IDs such as `a/b` and `a b` cannot share a task or consume each
+other's results even though their filename-safe labels are identical.
 
 Exact assertions are deliberately the first scoring layer. Subjective quality,
 tool traces, filesystem fixtures, and automatic checkout/startup management

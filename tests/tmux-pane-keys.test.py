@@ -27,6 +27,50 @@ def run(*args, timeout=30):
 
 
 @unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
+class ServerPath(unittest.TestCase):
+    def test_guarded_send_with_missing_server_utilities(self):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("TMUX", "CLAUDE_CONFIG_DIR") and not k.startswith("SUTANDO_")}
+        tmux = shutil.which("tmux")
+        with tempfile.TemporaryDirectory(prefix="pane-path-", dir="/tmp") as directory:
+            socket = str(Path(directory) / "socket")
+            def server(*args):
+                return subprocess.run([tmux, "-f", os.devnull, "-S", socket, *args],
+                                      env=env, capture_output=True, text=True, timeout=10, check=True)
+            try:
+                server("new-session", "-d", "-s", "scratch", "cat")
+                self.assertEqual(server("display-message", "-p", "#{pane_in_mode}").stdout.strip(), "0")
+                mv_only = Path(directory) / "mv-only"
+                mv_only.mkdir()
+                (mv_only / "mv").symlink_to(shutil.which("mv"))
+                for index, path in enumerate((str(Path(directory) / "missing"), str(mv_only))):
+                    with self.subTest(path=index):
+                        server("set-environment", "-g", "PATH", path)
+                        marker = f"guarded-marker-{index}"
+                        result = subprocess.run(
+                            [sys.executable, str(REPO / "src/tmux_pane_keys.py"), "run", socket,
+                             "--python", sys.executable, "--tmux", tmux, "-S", socket,
+                             "-t", "scratch:0", "--", "-l", marker],
+                            env=env, capture_output=True, text=True, timeout=15)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        deadline = time.monotonic() + 3
+                        while marker not in server("capture-pane", "-p", "-t", "scratch:0").stdout:
+                            self.assertLess(time.monotonic(), deadline, "keys never reached scratch pane")
+                            time.sleep(0.05)
+                        self.assertEqual(tmux_pane_keys.fence_status(socket), "clear")
+                        refused = subprocess.run(
+                            tmux_pane_keys.fence_keys_argv(socket, "scratch:0", "0", "-l", "WITHHELD",
+                                                          tmux=tmux),
+                            env=env, capture_output=True, text=True, timeout=15)
+                        self.assertEqual(refused.returncode, tmux_pane_keys.WITHHELD, refused.stderr)
+                        self.assertNotIn("WITHHELD", server("capture-pane", "-p", "-t", "scratch:0").stdout)
+                        self.assertEqual(tmux_pane_keys.fence_status(socket), "clear")
+            finally:
+                subprocess.run([tmux, "-S", socket, "kill-server"], env=env,
+                               capture_output=True, timeout=10)
+
+
+@unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
 class RealTmux(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="pk", dir="/tmp")
@@ -66,6 +110,55 @@ class RealTmux(unittest.TestCase):
         while time.monotonic() < deadline and "Sutando task ready" not in self.tmux("capture-pane", "-p", "-t", "=core:0").stdout:
             time.sleep(0.1)
         self.assertIn("Sutando task ready", self.tmux("capture-pane", "-p", "-t", "=core:0").stdout)
+
+    def test_expected_pid_sends_only_to_same_process_outside_copy_mode(self):
+        pane = self.tmux("display-message", "-p", "-t", "=core:0", "#{pane_id}").stdout.strip()
+        pid = self.tmux("display-message", "-p", "-t", pane, "#{pane_pid}").stdout.strip()
+        self.tmux("copy-mode", "-t", pane)
+        landed = run("-S", self.sock, "-t", pane, "--expected-pid", pid, "--", "-l", "--", "EXPECTED-PID-POSITIVE")
+        self.assertEqual(landed.returncode, 0, landed.stderr)
+        self.assertEqual(self.in_mode(), "0")
+        refused = run("-S", self.sock, "-t", pane, "--expected-pid", str(int(pid)+1), "--", "-l", "--", "WRONG-PID-NEGATIVE")
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        captured = self.tmux("capture-pane", "-p", "-t", pane).stdout
+        self.assertIn("EXPECTED-PID-POSITIVE", captured)
+        self.assertNotIn("WRONG-PID-NEGATIVE", captured)
+
+    def test_expected_pid_withholds_if_hook_reenters_copy_mode(self):
+        pane = self.tmux("display-message", "-p", "-t", "=core:0", "#{pane_id}").stdout.strip()
+        pid = self.tmux("display-message", "-p", "-t", pane, "#{pane_pid}").stdout.strip()
+        self.tmux("set-hook", "-g", "after-copy-mode", "copy-mode -t " + pane)
+        refused = run("-S", self.sock, "-t", pane, "--expected-pid", pid, "--", "-l", "--", "MODE-NEGATIVE")
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertEqual(self.in_mode(), "1")
+        self.assertNotIn("MODE-NEGATIVE", self.tmux("capture-pane", "-p", "-t", pane).stdout)
+
+    def test_fenced_keys_land_only_while_the_predicate_holds_and_leave_copy_mode_first(self):
+        self.tmux("set-option", "-p", "-t", "=core:0", "@turn", "P1")
+        self.tmux("copy-mode", "-t", "=core:0")
+        argv = tmux_pane_keys.fence_keys_argv(self.sock, "=core:0", "#{==:#{@turn},P2}", "-l", "--", "wrong turn")
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, tmux_pane_keys.WITHHELD, r.stderr)
+        argv = tmux_pane_keys.fence_keys_argv(self.sock, "=core:0", "#{==:#{@turn},P1}", "-l", "--", "right turn")
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.in_mode(), "0")
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and "right turn" not in self.tmux("capture-pane", "-p", "-t", "=core:0").stdout:
+            time.sleep(0.1)
+        text = self.tmux("capture-pane", "-p", "-t", "=core:0").stdout
+        self.assertIn("right turn", text)
+        self.assertNotIn("wrong turn", text)
+        r = subprocess.run(argv[:argv.index("--")], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, "fenced keys need keys")
+
+    def test_a_false_fence_leaves_the_pane_exactly_as_it_was(self):
+        self.tmux("set-option", "-p", "-t", "=core:0", "@turn", "P1")
+        self.tmux("copy-mode", "-t", "=core:0")
+        argv = tmux_pane_keys.fence_keys_argv(self.sock, "=core:0", "#{==:#{@turn},P2}", "Escape")
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, tmux_pane_keys.WITHHELD, r.stderr)
+        self.assertEqual(self.in_mode(), "1", "a stale request never touches the pane, its mode included")
 
     def test_without_the_helper_the_same_send_blocks(self):
         # The control: plain send-keys into copy mode waits on "(jump to forward)".
@@ -521,7 +614,7 @@ echo "$*" >> '{log}'
             r = run("--tmux", str(fake), "-S", str(Path(d) / "s"), "-t", "=c:0", "--", "Enter")
             self.assertEqual(r.returncode, 3)
             [call] = log.read_text().splitlines()
-            self.assertRegex(call, rf"^-u -S {re.escape(str(Path(d) / 's'))} if-shell mv '([^']+/ticket)' '\1\.claimed' && "
+            self.assertRegex(call, rf"^-u -S {re.escape(str(Path(d) / 's'))} if-shell PATH=.*; export PATH; mv '([^']+/ticket)' '\1\.claimed' && "
                                    r'case "\$\(LC_ALL=C TZ=UTC ps -o lstart=,stat= -p \d+ 2>/dev/null\)" in ')
             self.assertIn(" copy-mode -q -t '=c:0' ; if-shell -F -t '=c:0' '#{pane_in_mode}' ", call)
             self.assertTrue(call.endswith("""'send-keys -t '"'"'=c:0'"'"' '"'"'Enter'"'"''"""), call)

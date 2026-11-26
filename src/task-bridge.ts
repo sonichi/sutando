@@ -18,6 +18,7 @@ import { renderItems } from './voice-conversation-summary.js';
 import type { WorkLane } from './work-request-check.js';
 import { resolveWorkspace } from './workspace_default.js';
 import { tryStampText } from './task_envelope.js';
+import { HEADER_KEYS } from './header_keys.js';
 import { localTimeValue } from './local_time.js';
 import { claudeHomePath } from './util_paths.js';
 import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, dedupTarget, stripVoiceControlLines, type TaskOrigin } from './skip_marker_ownership.js';
@@ -40,14 +41,16 @@ const OWNER_ACTIVITY_FILE = join(STATE_DIR, 'last-owner-activity.json');
 /** Record that the owner was active on <channel> right now. Atomic write
  * via tmp-then-rename. Read by the proactive-loop status-aware-pivot rule.
  * See notes/team-proposal-coord-loop-2026-04-20.md. */
-function writeOwnerActivity(channel: string, summary: string): void {
+function writeOwnerActivity(channel: string, summary: string, docked?: VoiceSessionOrigin | null): void {
 	try {
 		mkdirSync(STATE_DIR, { recursive: true });
-		const payload = {
+		const payload: Record<string, unknown> = {
 			ts: Math.floor(Date.now() / 1000),
 			channel,
 			summary: summary.slice(0, 80),
 		};
+		// Where the session is docked: proactive routing follows `bridge`, never the address.
+		if (docked) { payload.bridge = docked.channel; payload.channel_id = docked.target; }
 		// Per-PID staging: last-owner-activity.json is written by five processes
 		// (this task-bridge + the sparrow/discord/slack/telegram bridges). A shared
 		// '.tmp' name lets two concurrent writers truncate and interleave the same
@@ -89,27 +92,11 @@ function ts(): string { return new Date().toISOString().slice(11, 23); }
 
 /** U+200B — zero-width space; not whitespace, so it survives .trimStart(). */
 const _ZWSP = '​';
-// Kept in lockstep with local_task_protocol.KNOWN_HEADER_KEYS (the Python
-// guard's source of truth). TS can't import the Python tuple, so this list is
-// the mirror; injection-guard-sweep asserts parity so drift fails CI. Synced to
-// the full 38-key set on the 2026-07-13 main merge (main widened the Python side
-// from 14 → 38; the TS guard must defang the same keys or forged interaction_type:
-// / attachments: / media_form: lines slip through here).
-const _HEADER_KEYS = [
-	'id', 'timestamp', 'session_scope', 'task', 'source', 'access_tier', 'user_id',
-	'channel_id', 'priority', 'interaction_type', 'source_message_id',
-	'channel_name', 'guild_name', 'attempts', 'sender_name', 'room_name',
-	'parent_message_id', 'reply_chain_ids', 'reminder', 'author_name', 'author_id', 'chat_id',
-	'thread_ts', 'reply_thread_ts', 'reply_to_event', 'reply_to_me', 'reply_to_sender', 'addressed_to', 'callSid', 'caller',
-	'thread_root', 'source_room_id', 'channel_kind',
-	'receiving_instance',
-	'from', 'call_sid', 'hint', 'instructions', 'transcript',
-	'schedule_name', 'schedule_slot',
-	'content_modalities', 'media_form', 'attachments', 'platform_card',
-	'instance_id', 'collaborator', 'requested_worker', 'wire_source', 'picker_command', 'picker_args', 'hitl_click', 'owner_mentioned', 'task_layout', 'local_time',
-	'lane',
-];
-const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`, 'i');
+// Generated from local_task_protocol.KNOWN_HEADER_KEYS: a key the Python
+// reader accepts but this guard misses is a forged-header hole.
+const _HEADER_KEYS = HEADER_KEYS;
+// Exported so a test can prove the CONSTRUCTED guard covers every generated key.
+export const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`, 'i');
 const _FENCE_RE = /^={3,}/;
 // Every separator str.splitlines() / universal-newline readers treat as a
 // line boundary — fold ALL to '\n' so the guard's line-set matches the
@@ -934,11 +921,15 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
 	return lines.join('\n') + '\n';
 }
 
-/** Tells the core a voice session ended: its facts as the task line, its spoken lines below. Low priority. */
+/** Tells the core a voice session ended: its facts as the task line, its spoken lines below. Low priority.
+ *  `interaction_type: system_event`, as the phone call-end summary has: the call-end lifecycle wrote it, not
+ *  something the owner said, so readers that put the owner's own requests first (task_watch_owner.py) leave it. */
 export async function submitVoiceSessionEndTask(summary: string, transcript: string): Promise<string> {
 	const taskId = `task-${Date.now()}`;
 	const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
-	const header = buildVoiceTaskHeader(taskId, new Date().toISOString(), ownerId, null).replace('priority: urgent', 'priority: low');
+	const header = buildVoiceTaskHeader(taskId, new Date().toISOString(), ownerId, null)
+		.replace('interaction_type: realtime_audio', 'interaction_type: system_event')
+		.replace('priority: urgent', 'priority: low');
 	const body = transcript ? `\n\n--- the session's spoken lines (may contain ASR errors) ---\n${confineUserContent(transcript)}\n` : '\n';
 	await _delegation.submitTask(taskId, `${header}task: ${confineUserContent(summary)}${body}`);
 	console.log(`${ts()} [TaskBridge] Session-end task: ${taskId}`);
@@ -1305,7 +1296,7 @@ export const workTool: ToolDefinition = {
 		_pendingTasks.set(taskId, pendingEntry());
 		voiceTaskStore.add(taskId, task, undefined, lane);
 		// Record owner activity for status-aware-pivot in proactive loop
-		writeOwnerActivity('voice', task);
+		writeOwnerActivity('voice', task, origin);
 		console.log(`${ts()} [TaskBridge] Task ${taskId}${lane ? ` (${lane})` : ''}: ${task.slice(0, 100)}`);
 		_sendTaskStatus?.(taskId, 'working', task.slice(0, 60));
 		// The user's own voice tasks still open ahead of this one, from the relay agent's table.

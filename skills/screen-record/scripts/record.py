@@ -18,12 +18,30 @@ INDICATOR_PID_FILE = "/tmp/sutando-rec-indicator.pid"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def _show_indicator():
-    """Show a macOS notification and a persistent menu bar 'REC' indicator."""
+def _macos_notifications_on():
+    """The owner's notifications.macos opt-in; a checkout without the reader reads as off."""
+    src = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "..", "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    try:
+        from sutando_config import resolve_macos_notifications
+    except ImportError:
+        return False
+    return resolve_macos_notifications()
+
+
+def _notify(text):
+    if not _macos_notifications_on():
+        return
     subprocess.Popen(
-        ["osascript", "-e", 'display notification "Screen recording started" with title "Sutando"'],
+        ["osascript", "-e", f'display notification "{text}" with title "Sutando"'],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
+
+
+def _show_indicator():
+    """Show the persistent menu bar 'REC' indicator, and a macOS notification when opted in."""
+    _notify("Screen recording started")
     indicator_bin = os.path.join(SCRIPT_DIR, "rec-indicator")
     if os.path.exists(indicator_bin):
         proc = subprocess.Popen(
@@ -50,10 +68,7 @@ def _hide_indicator():
         os.remove(INDICATOR_PID_FILE)
     else:
         print(json.dumps({"_log": "rec_indicator_no_pid_file"}), file=sys.stderr)
-    subprocess.Popen(
-        ["osascript", "-e", 'display notification "Screen recording stopped" with title "Sutando"'],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+    _notify("Screen recording stopped")
 
 
 def _list_audio_devices():

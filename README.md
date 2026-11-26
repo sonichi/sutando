@@ -9,6 +9,8 @@ Voice, vision, screen, meetings, calls when I'm engaged. Learns my patterns, shi
 
 It belongs entirely to you.
 
+**Start here:** [Quick start](#quick-start) · [Getting started in s.space](#getting-started-in-sspace) · [Documentation](docs/README.md) · [Security](SECURITY.md)
+
 > 🛠 **Open source:** this repo — clone, build, run locally on your own Mac.
 > 🍎 **Native app preview:** [sutando.ai](https://sutando.ai) — packaged Mac app, request access.
 
@@ -39,6 +41,18 @@ https://github.com/user-attachments/assets/a86ec34e-3b26-4011-824c-d2d124753c25
 <!-- wire-list:end -->
 
 [@sutando-ai channel](https://www.youtube.com/@sutando-ai) · [Sutando WIRE playlist](https://www.youtube.com/playlist?list=PLoEaHbP1bU5FDWAyeLDL9J9i7Iblp3_m_)
+
+---
+
+## Getting started in s.space
+
+Sutando can work alongside people and their agents in [s.space](https://s.space). Your DM is for work for yourself; rooms are for shared work, and Room Commons holds the pages, plans and other artifacts your team creates.
+
+Once Sutando is connected, send `/tutorial` in your DM with Sutando to open the interactive **Getting started** guide. Explore agents, teamwork, calls and Commons alongside a guide to Sutando on your Mac. Open **Try it step by step** for the personalized checklist, including connected apps, activity and mobile access. You can return to it in that DM’s Commons.
+
+For a four-part product overview, open [the interactive s.space guide](skills/tutorial/assets/getting-started.html) locally in your browser. Its examples are demonstrations, not live controls for accounts, permissions or calls.
+
+The in-DM checklist is generated from the [release feature list](skills/tutorial/feature-list.json). See [Tutorial delivery](docs/tutorial-delivery.md) for rendering, publishing and refresh behavior. The s.space tour complements the local installation steps below; it does not install Sutando or connect accounts for you.
 
 ---
 
@@ -292,13 +306,13 @@ bash src/verify-setup.sh
 
 **Shutting down:**
 ```bash
-bash src/restart.sh    # stops all services (voice agent, web client, API, bridges, etc.)
+bash src/stop.sh       # stops background services without starting them again
 pkill -x Sutando # stop the menu bar app
 ```
-Exiting `startup.sh` alone does NOT stop background services. Always use `restart.sh` (or `kill-all.sh` if available) to cleanly shut everything down.
+Exiting `startup.sh` alone does NOT stop background services. Use `bash src/stop.sh` (equivalent to `bash src/restart.sh --stop-only`) to stop background services. Plain `bash src/restart.sh` starts them again; it is not a shutdown command. The core CLI session is managed separately.
 
 **Uninstalling:**
-1. Stop all services: `bash src/restart.sh && pkill -x Sutando`
+1. Stop background services: `bash src/stop.sh`; quit the core CLI session and the menu-bar app separately
 2. Remove the repo: `rm -rf ~/Desktop/sutando` (or wherever you cloned it)
 3. Remove config: `rm -rf $CLAUDE_CONFIG_DIR/projects/*sutando*`
 4. Remove npm packages (optional): the repo uses local `node_modules/` — deleted with the repo
@@ -390,7 +404,7 @@ When running, Sutando exposes these local ports:
 
 ## Keyboard shortcuts
 
-The optional Sutando menu bar app (`src/Sutando/`) provides global keyboard shortcuts. It is separate from the headless core and is never built or launched by `startup.sh`. **All shortcuts are configurable** — the bindings below are the shipped *defaults*, published at runtime to `<workspace>/state/hotkeys.json` (the source of truth); override any of them per-machine in `~/.config/sutando/hotkeys.json`.
+The optional Sutando menu bar app (`src/Sutando/`) provides global keyboard shortcuts. It is separate from the headless core: plain `bash src/startup.sh` does not build or launch it; `--with-app` opts in, and `./start.sh` includes that flag. **All shortcuts are configurable** — the bindings below are the shipped *defaults*, published at runtime to `<workspace>/state/hotkeys.json` (the source of truth); override any of them per-machine in `~/.config/sutando/hotkeys.json`.
 
 | Action | Default binding |
 |--------|-----------------|

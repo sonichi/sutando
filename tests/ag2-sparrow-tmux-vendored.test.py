@@ -235,7 +235,9 @@ class ScratchServer(unittest.TestCase):
             r = real(args, **k)
             work = Path(args[3])
             seen["cmd"] = (work / "cmd").read_text().rstrip("\n")
-            seen["orphan"] = "mv %s %s" % (vk.tmux_quote(work / "ticket.claimed"), vk.tmux_quote(work / "ticket.orphaned"))
+            seen["orphan"] = 'PATH="$PATH":%s; export PATH; mv %s %s' % (
+                vk.tmux_quote(os.environ["PATH"]), vk.tmux_quote(work / "ticket.claimed"),
+                vk.tmux_quote(work / "ticket.orphaned"))
             return r
         with mock.patch.object(vk.subprocess, "run", spy):
             rc, _ = self.run_fenced("display-message -p fenced")

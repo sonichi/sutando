@@ -1634,11 +1634,13 @@ _report_unmerged_conflicts() {
     [ -f "$script" ] || return 0
     command -v python3 >/dev/null 2>&1 || return 0
     local out
-    out="$(python3 "$script" "$WORKSPACE_DIR" 2>&1)" || true
+    # --daily: a full scan can outlast the 30-minute fire, so report at most once a day.
+    out="$(python3 "$script" --daily "$WORKSPACE_DIR" 2>&1)" || true
     # Only speak up when there is something to merge back; the clean case is
     # silent so a 30-minute cron does not grow a nag nobody reads.
     case "$out" in
         *"no unmerged peer content"*) log "_report_unmerged_conflicts: clean" ;;
+        "sync-conflicts: skipped"*) log "_report_unmerged_conflicts: $out" ;;
         "") : ;;
         *) log "_report_unmerged_conflicts: $out"; printf '%s\n' "$out" ;;
     esac

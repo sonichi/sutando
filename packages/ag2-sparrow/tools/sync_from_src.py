@@ -2,7 +2,7 @@
 """Regenerate the package modules from the canonical sutando src/ (single source).
 
 Everything in MAP below is bundled verbatim from sonichi/sutando `src/`, which is
-canonical for those modules — currently 38 of them, including outbox.py and its
+canonical for those modules — currently 49 of them, including outbox.py and its
 transport seam outbox_adapter.py. Only the modules NOT in MAP are package-canonical
 and intentionally diverge from src (remote_gateway_bridge, _dirs, send_allowlist:
 dir-interface, no workspace-resolution).
@@ -33,10 +33,14 @@ from pathlib import Path
 MAP = {
     "src/task_archive.py": "task_archive.py",
     "src/local_task_protocol.py": "local_task_protocol.py",
+    # AgentTrigger event vocabulary + playbook ids; the bridge sanitizes trigger headers through it
+    "src/agent_triggers.py": "agent_triggers.py",
     "src/result_markers.py": "result_markers.py",
     "src/delivery/readiness.py": "result_ready.py",
     # the one results/ publisher: the bridge stages and renames through it
     "src/result_publish.py": "result_publish.py",
+    # a result's Activity labels side file; the hatch and result_publish write it, the bridge reads it
+    "src/result_labels.py": "result_labels.py",
     # terminal disposal of a result file (claim / verify / quarantine / recover);
     # the gateway delegates, tests/gateway-disposal-delegation.test.py pins it
     "src/delivery/disposal.py": "result_disposal.py",
@@ -49,6 +53,8 @@ MAP = {
     "src/gateway_credential_sources.py": "gateway_credential_sources.py",
     # the non-blocking, bounded reader every adapter uses for a credential file
     "src/bounded_file_read.py": "bounded_file_read.py",
+    # which homeservers are DotSpaces; the bridge's IPv4 preference asks it per gateway host
+    "src/dotspace.py": "dotspace.py",
     "src/workspace_lock.py": "workspace_lock.py",
     "src/chat_secret_filter.py": "chat_secret_filter.py",
     "src/policy/egress/result.py": "team_result_guard.py",
@@ -70,6 +76,9 @@ MAP = {
     "src/proactive_routing.py": "proactive_routing.py",
     # task ordering (urgent > normal > low, FIFO within a tier) for every inbox consumer
     "src/task_priority.py": "task_priority.py",
+    "src/agent_turn.py": "agent_turn.py",
+    # the one reader of a number from untrusted JSON
+    "src/safe_number.py": "safe_number.py",
     # one adapter's task execution lifecycle: work-dir lock, classifier, claims, publication
     "src/task_lifecycle.py": "task_lifecycle.py",
     # worker-pool completion-record contract: the pool skill writes through it
@@ -80,6 +89,10 @@ MAP = {
     # the tmux tri-state probe and the guarded pane-key send with its two shell scripts
     "src/tmux_probe.py": "tmux_probe.py",
     "src/tmux_pane_keys.py": "tmux_pane_keys.py",
+    # what typing /model into Claude Code relies on, shared with the core's model-switch skill
+    "src/claude_model_switch.py": "claude_model_switch.py",
+    # the one reader of a CLI's input box (the core's pane gate re-exports it); claude_model_switch imports it
+    "src/pane_composer.py": "pane_composer.py",
     "src/tmux-pane-keys.sh": "tmux-pane-keys.sh",
     "src/bounded-wait.sh": "bounded-wait.sh",
     # the HITL decision domain and store (the claude-local card's CAS), imports relative-first
@@ -90,6 +103,11 @@ MAP = {
     "src/hitl/projector.py": "hitl/projector.py",
     "src/hitl/renotify.py": "hitl/renotify.py",
     "src/hitl/replies.py": "hitl/replies.py",
+    "src/hitl/recovery.py": "hitl/recovery.py",
+    # agent panel cards: connector_cards builds, records and judges clicks with the core's own code
+    "src/agent_card.py": "agent_card.py",
+    "src/issued_cards.py": "issued_cards.py",
+    "src/local_record.py": "local_record.py",
 }
 PKG_DIR = Path(__file__).resolve().parent.parent / "ag2_sparrow"
 REPO_ROOT = Path(__file__).resolve().parents[3]

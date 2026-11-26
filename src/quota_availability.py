@@ -51,6 +51,46 @@ def points_at_credential_proxy(base_url: "str | None") -> bool:
     )
 
 
+STATUSLINE_SOURCE = "statusline"
+
+
+_CURRENT = object()
+
+
+def from_statusline(record: Any, account: Any = _CURRENT) -> bool:
+    """Whether the record was written by Claude Code's own status line (src/quota_record.py) for
+    the account the core is signed in to now (`account`; default: read from its config dir).
+    Only then does it speak for the core whatever the seat's routing; otherwise it is advisory."""
+    if not isinstance(record, dict) or record.get("source") != STATUSLINE_SOURCE:
+        return False
+    if account is _CURRENT:
+        from claude_account import core_account
+        account = core_account()
+    return isinstance(account, str) and bool(account) and record.get("account") == account
+
+
+def trusted_record(record: Any, account: Any = _CURRENT) -> Optional[dict]:
+    """The record a decision may use: a proxy record as before; a status line record only
+    when it is the core's current login's (`from_statusline`); else None."""
+    if not isinstance(record, dict):
+        return None
+    if record.get("source") == STATUSLINE_SOURCE and not from_statusline(record, account):
+        return None
+    return record
+
+
+def _rejected_since_observed(record: dict) -> bool:
+    """A 429 at or after the record's own observation: only a later observation clears it."""
+    checked = _parse_when(record.get("last_checked"))
+    ledger = record.get("recent_rejections")
+    for rej in ledger if isinstance(ledger, list) else []:
+        if isinstance(rej, dict) and rej.get("status") == 429:
+            at = _parse_when(rej.get("ts"))
+            if checked is None or at is None or at >= checked:
+                return True
+    return False
+
+
 def quota_windows(headers: dict) -> dict:
     """Every window the proxy reported, keyed by window, as (utilization or None,
     that window's own status or None). A window is named by its `-utilization`
@@ -88,6 +128,37 @@ def limit_windows(headers: dict) -> dict:
 
 OVERAGE_STATUS = "anthropic-ratelimit-unified-overage-status"
 OVERAGE_OK = ("allowed", "allowed_warning")
+_DIGEST = re.compile(r"^[0-9a-f]{6,64}$")
+
+
+def account_label(digest: Any) -> Optional[str]:
+    """The `acct_` label of an account digest, as the proxy stamps a reading's account; else None."""
+    return f"acct_{digest[:6]}" if isinstance(digest, str) and _DIGEST.fullmatch(digest) else None
+
+
+def record_for_account(payload: Any, digest: Any) -> Optional[dict]:
+    """The proxy record when it may drive a decision for the core signed in as `digest`: labeled
+    with that account. With the account unknown, only an unlabeled record, as before labels existed."""
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("source") == STATUSLINE_SOURCE:  # bound to the core's login by its own rule
+        return trusted_record(payload)
+    label = account_label(digest)
+    return payload if payload.get("account") == label or (label is None and not payload.get("account")) else None
+
+
+def record_rejections(payload: Any) -> list:
+    """The ledger rejections sent with the record's own account; unlabeled matches only unlabeled.
+    The proxy's `boundRejections` implements the same rule."""
+    def acct(x: Any) -> Optional[str]:
+        value = x.get("account")
+        return value if isinstance(value, str) and value else None
+    payload = payload if isinstance(payload, dict) else {}
+    ledger = payload.get("recent_rejections")
+    if payload.get("source") == STATUSLINE_SOURCE:  # a status line entry holds one account's ledger
+        return [r for r in ledger if isinstance(r, dict)] if isinstance(ledger, list) else []
+    own = acct(payload)
+    return [r for r in ledger if isinstance(r, dict) and acct(r) == own] if isinstance(ledger, list) else []
 
 
 def classify_limit_state(record: Any) -> str:
@@ -105,9 +176,8 @@ def classify_limit_state(record: Any) -> str:
     if headers.get(OVERAGE_STATUS) not in OVERAGE_OK:
         return "rejected"
     checked = _parse_when(payload.get("last_checked"))
-    ledger = payload.get("recent_rejections")
-    for rej in ledger if isinstance(ledger, list) else []:
-        if not isinstance(rej, dict) or rej.get("status") != 429:
+    for rej in record_rejections(payload):
+        if rej.get("status") != 429:
             continue
         at = _parse_when(rej.get("ts"))
         # An unordered 429 (either stamp unreadable) is not known to be older.
@@ -146,12 +216,17 @@ def availability_decision(
 ) -> dict[str, Any]:
     """Return the one authoritative routed/fresh/accepted quota decision."""
     payload = quota if isinstance(quota, dict) else {}
+    statusline = payload.get("source") == STATUSLINE_SOURCE
+    verified = statusline and from_statusline(payload)
     headers = payload.get("headers")
     headers = headers if isinstance(headers, dict) else {}
     status = headers.get("anthropic-ratelimit-unified-status", "unknown")
-    routed = points_at_credential_proxy(base_url)
+    # A status line record speaks for its own login only, whatever the proxy URL says.
+    routed = verified if statusline else points_at_credential_proxy(base_url)
     limit_state = classify_limit_state(payload)
     accepted = resolve_available(str(status), payload.get("available"), headers, limit_state)
+    if verified and _rejected_since_observed(payload):
+        accepted = False
     available = accepted and routed and not stale
     return {
         "available": available,
@@ -402,11 +477,17 @@ def _model_family(value: Optional[str]) -> Optional[str]:
 
 def record_speaks_for_seat(quota: Any, env: SeatEnv, workspace) -> bool:
     """True only when the seat's model and the record's are both known and name
-    the same model, EXACTLY, or by family when the seat is a bare alias. A
-    record refreshed on another model may say allowed while THIS seat's model
-    is limited, and the proxy's headers carry no per-model window to catch
-    that (measured: status, 5h, 7d, overage -- nothing per model), so unknown
-    holds.
+    the same model (see `models_match`). A record refreshed on another model
+    may say allowed while THIS seat's model is limited, and the proxy's headers
+    carry no per-model window to catch that (measured: status, 5h, 7d,
+    overage -- nothing per model), so unknown holds."""
+    return models_match(seat_model(env, workspace), record_model(quota))
+
+
+def models_match(mine: Optional[str], theirs: Optional[str]) -> bool:
+    """True when the seat's model `mine` and a proxy-reported model `theirs`
+    are both known and name the same model, EXACTLY (after dropping a context
+    tag like `[1m]`), or by family when `mine` is a bare alias.
 
     A menu alias (`opus`, `sonnet[1m]`, ...) and the full id the proxy reports
     (`claude-opus-5-5`, `claude-sonnet-5`, ...) name the same model but are
@@ -418,7 +499,7 @@ def record_speaks_for_seat(quota: Any, env: SeatEnv, workspace) -> bool:
     `claude-opus-5-5` stays unknown, same as before this match existed, because
     per-model windows may differ within one family and an alias is the only
     name that cannot already identify its own exact pinned version."""
-    mine, theirs = seat_model(env, workspace), record_model(quota)
+    mine, theirs = _norm_model(mine), _norm_model(theirs)
     if mine is None or theirs is None:
         return False
     if mine == theirs:

@@ -2,6 +2,14 @@
 
 Reference for the bash/CLI tools every Sutando session can call directly. Linked from `CLAUDE.md` to keep the per-session context budget small — open this file when you need to know what's available rather than carrying it on every turn.
 
+**Voice room tools** — the optional `ag2space-voice` skill reads, searches and writes
+s.space rooms through the registered MCP connection. A `no_credential` or
+`credential_refused` answer means the owner must reconnect through Connect in the app;
+say that instead of saying the room is unavailable or does not exist. This applies to
+name lookup with an empty room index as well as direct reads and writes. These credential
+failures happen before dispatch. Other write failures can still return `outcome_unknown`
+with an operation ID: do not claim nothing ran or retry automatically.
+
 **Calendar** — the owner's calendar (Google Calendar, Outlook, …) comes from the Superpower Station
 connector tools, first:
 - `mcp__sutando-station__composio_find` `{"apps": ["google calendar"], "query": "list today's events"}`
@@ -189,7 +197,7 @@ python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py add "Call Bob
 python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py add "Fix bug" "2026-03-17" --owner-asked  # with due date
 python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py complete "Call Bob" --owner-asked  # mark done
 ```
-Use for "add a reminder", "what's on my todo list", "remind me to...", "mark X as done".
+Use for "add a reminder", "what's on my todo list", "remind me to...", "mark X as done". A message or job delivered at a set time in an s.space room or DM goes to the platform scheduler instead (see `CLAUDE.md`).
 
 **macOS GUI control** — click, type, scroll, press keys in any Mac app via `macos-use` MCP skill. Works in non-interactive mode (which is how the proactive loop runs), unlike Claude's built-in computer-use. Accessibility-tree based — no screenshots leave the machine.
 
@@ -271,7 +279,9 @@ npx tsx -e "import 'dotenv/config'; import { summonTool } from './skills/zoom/to
 - The voice agent delegates "call X" and "join my meeting" requests to core via `work`
 - Setup from the chat: `skills/phone-conversation/scripts/twilio-setup.py status|numbers|buy|set-webhook` buys the number and points its webhook here; only the Twilio sign-up + card are manual (SKILL.md "Setup from the chat")
 
-**Claude Code history import** — `/import-claude-context` (`skills/import-claude-context/`): index, extract and haiku-summarise the owner's stock `~/.claude/projects` transcripts into core memory (`claude_import.md` + a budget-guarded `MEMORY.md` row), `notes/claude-import/` and People payloads. Everything is staged first (`finalize.py --stage`, the default) and shown to the owner as a digest in their DM; it lands only when they reply "bring it in" (`--commit`), "bring in <slug>" for one project, or is dropped with "forget <slug>" (`--discard`). Sessions the summariser flags as personal are held back — the digest shows only their date and a generic reason, and "include <date>" / "hold <date>" / "forget <date>" are the owner's call; people the store already has get an appended section and merged identifiers, never a replaced dossier or a duplicate. Read-only on `~/.claude`, conversation text only (no tool I/O), secrets redacted before disk; the owner's transcripts are processed by Anthropic's Claude API (the haiku subagents), the provider the Sutando already runs on, which does not train on them. Nothing is uploaded to AG2 Space except the people the owner approves in the digest, which are saved to their People store, and nothing else leaves the machine without `--cloud`. Only after the onboarding Import button or an explicit "import my Claude history"; `--counts-only`/`--dry-run` for counts, `--new` to pick up new sessions, `--forget <slug>` (a known slug or a unique part of one — never a path) to undo one project: its note, roll-up, summaries, approved snapshot and its citations in the approved People export. The memory file and `overview.md` are rebuilt from per-project approved snapshots (`data/claude-import/approved/<slug>.json`), so committing one project never lands another's unreviewed roll-up — the digest names it "changed since approval — bring in <slug> to refresh".
+**Claude Code history import** — `/import-claude-context` (`skills/import-claude-context/`): index, extract and haiku-summarise the owner's stock `~/.claude/projects` transcripts into core memory (`claude_import.md` + a budget-guarded `MEMORY.md` row), `notes/claude-import/` and People payloads. Everything is staged first (`finalize.py --stage`, the default) and shown to the owner as a digest in their DM; it lands only when they reply "bring it in" (`--commit`), "bring in <slug>" for one project, or is dropped with "forget <slug>" (`--discard`). Sessions the summariser flags as personal are held back — the digest shows only their date and a generic reason, and "include <date>" / "hold <date>" / "forget <date>" are the owner's call; people the store already has get an appended section and merged identifiers, never a replaced dossier or a duplicate. Read-only on `~/.claude`, conversation text only (no tool I/O), secrets redacted before disk; the owner's transcripts are processed by Anthropic's Claude API (the haiku subagents), the provider the Sutando already runs on, which does not train on them. Nothing is uploaded to s.space except the people the owner approves in the digest, which are saved to their People store, and nothing else leaves the machine without `--cloud`. Only after the onboarding Import button or an explicit "import my Claude history"; `--counts-only`/`--dry-run` for counts, `--new` to pick up new sessions, `--forget <slug>` (a known slug or a unique part of one — never a path) to undo one project: its note, roll-up, summaries, approved snapshot and its citations in the approved People export. The memory file and `overview.md` are rebuilt from per-project approved snapshots (`data/claude-import/approved/<slug>.json`), so committing one project never lands another's unreviewed roll-up — the digest names it "changed since approval — bring in <slug> to refresh".
+
+**AG2 Space rooms over MCP (no desktop app)** — `skills/ag2-space-mcp/`: the hosted AG2 Space MCP runs every room Action server-side as the agent itself. `python3 skills/ag2-space-mcp/scripts/register.py --apply` registers an `ag2-space` http entry whose `headersHelper` is `ag2-sparrow-mcp headers`, which mints a short-lived token per connect from the agent credential in the ag2space channel env. Then `ag2.whoami` names the agent. Covers messages, thread replies and summons, reading Commons comments back, PDFs, publishing a page, media, Commons pages, databases, comments and folders (`room.commons.*`), and `commons.capabilities`. A Codex core uses `docs/codex-core.md` instead; the desktop app registers its own connector.
 
 **Local skills** — check `$CLAUDE_CONFIG_DIR/skills/` for user-installed skills (video processing, etc.). Always prefer a local skill over raw commands when one exists for the task.
 
@@ -332,7 +342,7 @@ python3 "$C" rearm                      # restart waiters of pending waits (star
 ```
 The skill's precheck hook adds a `connect-apps precheck:` line on your first touch of a task naming an
 app: which apps it needs, which are connected (from the cache), and the room kind from the task's
-`channel_kind:` header. The owner sees, switches and disconnects connected apps in AG2 Space →
+`channel_kind:` header. The owner sees, switches and disconnects connected apps in s.space →
 Settings → Integrations; `card --switch` (or `await --switch`) arms a wait that resumes only once the
 app is signed in with a new account.
 
@@ -400,16 +410,89 @@ bash scripts/switch-model.sh opus --confirm         # a warm core asks to confir
 CLI…`); a non-zero exit is reported with its meaning from the list below, never as a switch. The
 current model is `model` in `<workspace>/state/model-switch.json` (`previous`, `ts` beside it);
 no file means no switch was recorded from here, so say the model is the runtime's default rather
-than guessing. The desktop's `core-model` local card (`agent-settings:core-runtime#model`) is the
+than guessing. **On a Codex core, do not read that file's `model` for "which model are you on":** a
+pick stays `pending` until a task has completed on it. Ask
+`python3 src/codex_core_model.py in-use --state-dir <workspace>/state`, which names the model the
+core is on right now: the pick itself while the task now running was started on it (the record's
+`running` mark), else the last model Codex took (`working`). If the record is still `pending` and
+`in-use` names the pick, say "I'm on <pick> for this task; it is confirmed when the task completes". The desktop's `core-model` local card (`agent-settings:core-runtime#model`) is the
 place to point an owner who wants to switch by hand.
 
 Types `/model <name>` into the live `sutando-core` pane through the shared sender, waits for the CLI
 to accept it, and only then records `<workspace>/state/model-switch.json` (with the previous model).
 A warm core asks to confirm first; `--confirm` (on an owner instruction) answers it, otherwise the
-dialog is cancelled. Refuses when the input box carries text or on a Codex runtime. It never writes
-`settings.json`: Claude Code's `/model` persists the choice itself. Exit 2 = name refused; 3 = no live
-pane; 4 = Codex runtime; 5 = input box busy; 6 = confirm dialog not confirmed; 8 = no acceptance seen.
+dialog is cancelled. Refuses when the input box carries text. It never writes
+`settings.json`: Claude Code's `/model` persists the choice itself. On a Codex core the pick is
+recorded core-only (`runtime: codex` in the same record, never the shared Codex home's `config.toml`,
+so pool workers keep their own model): an app-server seat uses it from its next task, a Codex TUI from
+its next start (exit 11). Exit 2 = name refused (a Claude name on a Codex core too); 3 = no live
+pane; 4 = runtime unresolved; 5 = input box busy; 6 = confirm dialog not confirmed; 8 = no acceptance
+seen; 11 = Codex TUI, saved for its next start.
 The capability lives in `skills/model-switch/`.
+
+## Which account the core is on
+
+Triggers: "which account are you on", "what account is Codex signed in to", "whose login is this",
+and before saying an account switch took effect. `codex login status` only says "Logged in using
+ChatGPT"; do not answer from it. On a Codex core run:
+
+```bash
+python3 src/codex_account.py --task-file <task file>              # the core's Codex home: "signed in as <email>, <plan> plan"
+python3 src/codex_account.py --task-file <task file> --json       # {codex_home, email, plan, workspace, kind, source, verified}
+python3 src/codex_account.py --task-file <task file> --codex-home <dir>   # a worker's own Codex home, when it has one
+```
+
+Always pass the asking task's `--task-file`: the account is the owner's data, so it is looked up only
+for a task whose envelope verifies (`task_envelope`) and whose attested headers say the owner sent it from the owner's checked DM (the same test the
+owner's card taps pass). Anything else, including a task with no tier, a voice or local task, or one
+whose origin cannot be checked, exits 3: answer in the owner's DM instead, and post nothing about it in
+the room. The lookup runs Codex on a private copy of the home's sign-in, so the running core's home is
+never written. The home is the one the Codex core
+launcher uses, with the same checks; a home it would refuse is reported, not read. It asks Codex
+itself (`account/read` on a short-lived `codex app-server`); `verified` is true only when Codex names
+an account. Codex naming none proves nothing (the copy cannot reach a sign-in kept in the keyring), so
+it then reads the email and plan claims of the home's `auth.json` id_token, and `verified` is false:
+say the answer comes from the saved sign-in and was not confirmed. When neither names an account,
+`verified` is null and it exits 1: say you found no sign-in, not that Codex is signed out. Codex is
+found on the launcher's own PATH (`src/agent/launch-path.sh --codex-path`), so the desktop's
+`cli/codex/bin` copy is used. It prints only the email, plan, workspace and login kind, never a token,
+and never print or quote `auth.json` yourself. Pool Codex workers run under the core's home today, so
+the core's answer is theirs too.
+
+## Switch the core's account
+
+Triggers, from the **owner in their DM only**: "switch account", "use my other account", "sign in
+with another account", "add an account", or a tap on the core account card. Post the card; never
+start a sign-in yourself and never take a sign-in code or token in chat (if the owner pastes one,
+do not use it: tell them to paste it in Settings, in the app's own box).
+
+```bash
+python3 skills/account-switch/scripts/account_card.py post --room <owner DM>   # the card
+python3 skills/account-switch/scripts/account_card.py status                   # the same facts as JSON
+```
+
+The card names the account in use (masked) and, on a Codex core, a "Use" button for each account
+saved on this Mac (the desktop's store), plus "Add another account", which points to Settings →
+Connections → the Sutando core's row → "Switch account". A tap on it reaches
+`account_card.py reply` through `src/agent_card.py click`; a "Use" tap restarts the core on the
+saved account and the card confirms the outcome in the DM. Details: `skills/account-switch/SKILL.md`.
+
+## Switch the core's runtime (Codex / Claude Code)
+
+Triggers, from the **owner in their DM only**: "switch to Claude Code", "use Codex", "run on Codex",
+"换成 Claude Code", "切到 Codex", or a tap on the core runtime card. Post the card; never run
+`start-cli.sh --runtime` or `--restart` from inside the core.
+
+```bash
+python3 skills/runtime-switch/scripts/runtime_card.py post --room <owner DM>   # the card
+python3 skills/runtime-switch/scripts/runtime_card.py status                   # the same facts as JSON
+```
+
+The card marks the runtime in use and offers "Codex" and "Claude Code". A tap checks the target is
+signed in before anything stops (otherwise it answers "Sign in first" with that runtime's sign-in
+controls in the card, keeps the tap, and switches by itself once the sign-in is there), then restarts the core onto it after the current turn and confirms in the DM from
+`state/core-runtime.json` and the desktop's selection. Tasks, memory and the workspace carry over; the
+live conversation does not. Details: `skills/runtime-switch/SKILL.md`.
 
 ## Check quota
 
@@ -421,4 +504,15 @@ or refused core turn. Read `<workspace>/state/quota-state.json` (written by the 
 `python3 skills/quota-tracker/scripts/read-quota.py` prints the same with remaining percentages and
 `--gate` exits non-zero when the core is not routed through the proxy or the state is stale. A
 core paused on "usage limit reached" resumes on its own at `resets_at_5h`; switching to a smaller
-model (above) is the way to keep going before then.
+model (above) is the way to keep going before then. A core that died on a limit is not relaunched
+until the reset (or a backoff of 5 to 60 minutes when none is given), and the owner gets one DM
+saying so; on the desktop the same moment presents the `core-model` card. Picking a model there
+(Agent Settings, Runtime, Model) while the core is held writes it and starts the core on it at once;
+a hold binds only the model family it was seen on, so the watchdog revives a core switched away from
+it too. While it is held, the owner's bare reply "switch to <model>" sets the model for the next
+launch (`switch-model.sh --offline`) and lifts the hold; "retry now" lifts it as is; the next revive
+then starts the core. A hold binds only the Claude account it was seen under: after signing in to
+another account, the next restart launches the core at once. Signing in with `/login` in the running
+core's terminal resumes it in place: once the pane sits idle with nothing run since "Login successful",
+the core supervisor types `/startup` once, which re-arms the task watcher (unless the task-watch Mod already runs it) and crons. For engineers: `python3 src/core_limit_hold.py status` prints the hold and
+`... clear` lifts it.

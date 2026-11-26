@@ -301,7 +301,7 @@ class TestDiscoveryAndScriptClient(_Ws):
         self.assertEqual(where, ROOM)
         self.assertIn(AGENT, store.client.argv)
         self.assertEqual(store.lock, self.ws / "state" / "pending-questions-db.lock")
-        self.assertEqual(store.link, "https://collab.test.invalid/home/!ownerdm%3Atest.invalid?surface=database&page=pendingq")
+        self.assertIsNone(store.link, "an unknown server has no app link")
 
     def test_the_script_client_round_trips_through_the_adapter(self):
         _install_fake_capability(self.ws)
@@ -334,7 +334,7 @@ class TestDiscoveryAndScriptClient(_Ws):
         with mock.patch.dict(os.environ, env):
             store, _ = adapter.room_store(self.ws, environ=env)
             self.assertIn("--collab-url", store.client.argv)
-            self.assertTrue(store.link.startswith("https://unreachable.test.invalid/"))
+            self.assertIsNone(store.link, "a transport override never becomes an app link")
             out = self.ask("q?", store=store)
         self.assertIn("service refused the socket", out["db_error"])
         self.assertEqual(len(self.outbox()), 1)
@@ -405,7 +405,37 @@ class TestEdges(_Ws):
         self.assertIn("Label=what it does", err.getvalue())
 
 
+    def test_ask_owner_cli_refuses_choices_listed_in_the_question(self):
+        cli = str(REPO / "scripts" / "ask-owner.py")
+        with mock.patch.object(sys, "argv", [cli, "Which one?\n1. merge now\n2. hold"]), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit) as e:
+                runpy.run_path(cli, run_name="__main__")
+        self.assertEqual(e.exception.code, 2)
+        self.assertIn("--option", err.getvalue())
+        self.assertEqual(runpy.run_path(cli)["listed_choices"]("Merge #123 despite the absent CLA check?"), 0)
+
+    def test_ask_owner_cli_delivers_numbered_context(self):
+        """Numbered evidence in --context is not a choice list: the ask reaches delivery."""
+        cli = str(REPO / "scripts" / "ask-owner.py")
+        argv = [cli, "What caused the timeout?", "--context", "1. CI is red on main\n2. the branch is behind",
+                "--urgency", "durable", "--workspace", str(self.ws)]
+        with mock.patch.object(skill_roots, "declared_script", return_value=None), \
+                mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            with contextlib.suppress(SystemExit):
+                runpy.run_path(cli, run_name="__main__")
+        self.assertIn("sent: queued", out.getvalue())
+        self.assertTrue(list((self.ws / "results").glob("proactive-*.txt")))
+
+
 class TestAskOwner(_Ws):
+    def test_a_text_ask_with_a_default_says_why_approve(self):
+        out = self.ask("Merge #12?", store=self.db(), default_action="merge", reason="CI is green",
+                       options=[("Hold", "wait for review")])
+        body = (self.ws / "results" / out["proactive_file"]).read_text()
+        self.assertIn("Why Approve: CI is green\n\n- Approve: merge\n- Hold: wait for review\n", body)
+
     def test_the_row_is_born_with_its_record_and_the_outbox_entry_is_deleted(self):
         db = self.db()
         db.link = "https://db/page"
@@ -417,7 +447,9 @@ class TestAskOwner(_Ws):
         self.assertEqual(e["ask_id"], out["ask_id"])
         self.assertIn(f"via {out['proactive_file']} at", e["body"])
         body = (self.ws / "results" / out["proactive_file"]).read_text()
-        self.assertIn("set its Status on the row: https://db/page", body)
+        self.assertNotIn("https://db/page", body)
+        self.assertIn("- Approve: merge\n", body)
+        self.assertIn("Reply here with the one you choose.", body)
         self.assertIn("Pending questions database", body)
         self.assertEqual("\n".join(pqa.report_lines(out)).count("recorded:"), 1)
         self.assertIn("row: https://link/row", pqa.report_lines(out))
@@ -433,6 +465,21 @@ class TestAskOwner(_Ws):
         out = self.ask("q?", store=self.db(Watching()))
         self.assertEqual(seen["outbox_at_write"], [f"{out['ask_id']}.json"], "no temp file, the entry whole")
         self.assertEqual(self.outbox(), [])
+
+    def test_no_row_is_written_without_a_held_record(self):
+        class Counting(InProcClient):
+            writes = 0
+
+            def add_row(self, schema, row, cells, body):
+                Counting.writes += 1
+                return super().add_row(schema, row, cells, body)
+        db = self.db(Counting())
+        with mock.patch.object(pqa.Outbox, "save", side_effect=OSError("disk full")):
+            out = self.ask("q?", store=db)
+        self.assertEqual(Counting.writes, 0, "the room is not written when the question could not be held")
+        self.assertEqual(db.open_entries(), [])
+        self.assertIn("NOT written", out["db_error"])
+        self.assertIsNotNone(out["proactive_file"], "the owner is still asked")
 
     def test_a_database_failure_leaves_the_outbox_entry_and_says_so(self):
         out = self.ask("q?", store=self.db(InProcClient(fail="service refused")))
@@ -851,16 +898,11 @@ class TestDelegation(unittest.TestCase):
             self.assertNotRegex(self.src(rel), r"room[-_]collab|room[-_]commons", rel)
             self.assertNotRegex(self.src(rel), r"pending_questions_room_db|skills/pending-questions", rel)
 
-    def test_the_skills_ask_queues_then_holds_then_writes_the_row_and_only_with_a_held_record(self):
+    def test_the_skills_ask_writes_no_row_and_no_ledger_of_its_own(self):
+        # Ordering is pinned by behaviour: TestAskOwner's outbox-before-write and no-row tests,
+        # and decision-card's OrderAndSingleSurface.
         s = self.src(self.SKILL + "pending_questions_room_db.py")
-        self.assertIn("core_ask.queue_question(", s)
-        self.assertIn('if out["outbox"] is None:', s)
-        self.assertLess(s.index("core_ask.queue_question("), s.index('if out["outbox"] is None:'))
-        self.assertLess(s.index('if out["outbox"] is None:'), s.index("write_question(q, store, out[\"sent_line\"])"))
         self.assertNotRegex(s, r"\bledger\.|FileStore|pending-questions\.md")
-        core = self.src(self.SKILL + "pending_questions_ask.py")
-        self.assertIn("Outbox(ws).save(out[\"question\"], out[\"sent_line\"], now)", core)
-        self.assertLess(core.index("write_proactive(ws"), core.index("Outbox(ws).save("), "queue, then hold")
 
     def test_the_store_confirms_the_exact_ask_id_before_the_outbox_entry_goes(self):
         s = self.src(self.SKILL + "pending_questions_store.py")
