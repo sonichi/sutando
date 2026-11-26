@@ -407,6 +407,31 @@ def wrap_untrusted(task_id, headers, message, operator_lines=(), note=NON_OWNER_
 
 
 SIGNIN_SETTLE_TRIES = 3   # replacements one dispatch (or one idle poll) may make
+NOT_READY = "account-not-ready"     # a task's status when no server could be started on the selected account
+
+WAITING = "account-unknown"         # not a result: the task stays in the inbox until the sign-in reads again
+CURRENT, STALE, UNKNOWN = "current", "stale", "unknown"     # signin_state's answers
+
+SIGNIN_UNKNOWN_READS = 5        # reads of a sign-in that cannot be read, within one dispatch
+SIGNIN_UNKNOWN_WAIT_S = 0.2     # between them: a file mid-write is whole a moment later
+
+SIGNIN_HELD_SAY_S = 30.0        # a task waits this long for the selected account, then its sender is told
+NOT_READY_SAY = ("I couldn't start on the account that was just selected for me, so I haven't run this, and "
+                 "nothing was sent under the earlier account. I'll keep trying to start on it. Please send "
+                 "this again in a moment.")
+
+
+def held_clock() -> float:
+    """The clock a waiting task's deadline is read on."""
+    return time.monotonic()
+
+
+class SigninNotReady(Exception):
+    """No server runs on the sign-in now on disk, so no turn may be sent: why."""
+
+
+class SigninUnknown(SigninNotReady):
+    """An account switch was seen and the sign-in cannot be read just now: the turn waits, unanswered."""
 
 
 class Connector:
@@ -420,6 +445,9 @@ class Connector:
             lambda: signin_watch.codex_identity(home))
         self.signin_started, self.signin_account = self.signin_mark()
         self.signin_failed = ""   # why the last restart for a changed sign-in failed ('' when none did)
+        self.signin_told = False  # a sender was told the selected account is not ready, and it still is not
+
+        self.signin_pending, self.signin_unknown_since = False, None    # see signin_state
         self.rpc = rpc_factory()
         self.args = args
         self.note = note if note is not None else non_owner_note()
@@ -807,31 +835,60 @@ class Connector:
             return None, None
         return signin_watch.fingerprint(now), signin_watch.fingerprint(now[:2])
 
-    def signin_stale(self) -> bool:
-        """Whether auth.json now names another account than the one the serving server was started on.
-        An unreadable file changes nothing now; the shared daemon (proxy) is not ours to restart. The
-        server is current only when the file is what was read before it was spawned, or the account
-        itself (its id and email) is that one and just the switch marker moved. Nothing else vouches
-        for it: not its email (another account or workspace can carry the same one), not a sign-in of
-        its own (the file may have changed again since); a server started while the file could not be
-        read is stale once it can be."""
+    def signin_state(self) -> str:
+        """What auth.json says now of the serving server, one outcome per kind of read:
+
+        CURRENT  the file reads, and is what was read before the server was spawned; or its account (a
+                 non-empty id, and the email) is that one and only the switch marker moved.
+        STALE    the file reads and names anything else: another account, the same email under another
+                 id, signed out (no file, or one naming no account), an API key; or it reads at all
+                 while the server was started on a read that failed. A switch is now pending.
+        UNKNOWN  the file cannot be read (refused, mid-write, empty, not JSON, not an object, or the
+                 read raised) while a switch is pending: nothing vouches for the server, so nothing is
+                 sent and nothing waiting is released until a later read is CURRENT.
+        CURRENT  the same unreadable file while no switch is pending: a transient read during ordinary
+                 work says nothing has changed, and work goes on.
+
+        A pending switch ends only on a clean CURRENT read. The shared daemon (proxy) is not ours to
+        restart and is always CURRENT."""
         if self.args.server == "proxy":
-            return False
-        now = self.signin.current()
+            return CURRENT
+        try:
+            now = self.signin.current()
+        except Exception:  # noqa: BLE001 - a read that raised is a read that failed
+            now = None
         if now is None:
-            return False
+            if not self.signin_pending:
+                return CURRENT
+            if self.signin_unknown_since is None:
+                self.signin_unknown_since = time.time()
+                log("sign-in: auth.json cannot be read after an account change; turns wait until it can")
+            return UNKNOWN
+        self.signin_unknown_since = None
         mark, account = signin_watch.fingerprint(now), signin_watch.fingerprint(now[:2])
-        if mark == self.signin_started:
-            return False
-        if now[0] and self.signin_account is not None and account == self.signin_account:
+        if mark != self.signin_started:
+            if not (now[0] and self.signin_account is not None and account == self.signin_account):
+                self.signin_pending = True
+                return STALE
             self.signin_started = mark
-            return False
-        return True
+        self.signin_pending = False
+        return CURRENT
+
+    def signin_ready(self) -> str:
+        """signin_state, with an unreadable file read again a few times first (a write in progress)."""
+        for n in range(SIGNIN_UNKNOWN_READS):
+            state = self.signin_state()
+            if state != UNKNOWN:
+                return state
+            if n + 1 < SIGNIN_UNKNOWN_READS:
+                time.sleep(SIGNIN_UNKNOWN_WAIT_S)
+        return UNKNOWN
 
     def signin_check(self) -> bool:
-        """Move to a new server when the serving one is stale (signin_stale); True when it did. Raises
-        with the old server still serving when the new one cannot start; the next check tries again."""
-        if not self.signin_stale():
+        """Move to a new server when the serving one is STALE; True when it did. An UNKNOWN read moves
+        nothing: there is no account to move to. Raises with the old server still running when the new
+        one cannot start; the next check tries again."""
+        if self.signin_state() != STALE:
             return False
         if not self.signin_failed:
             log("sign-in changed in auth.json; restarting Codex on the new account")
@@ -842,8 +899,8 @@ class Connector:
     def signin_settle(self, tries: int = SIGNIN_SETTLE_TRIES) -> int:
         """Bring the serving server onto the sign-in now on disk, replacing it again while the file keeps
         changing under a starting server, `tries` times at most; the replacements made. Never raises: a
-        replacement that fails is said once per reason and tried again later, and the running server
-        serves."""
+        replacement that fails is logged once per reason and tried again later. The server that runs is
+        kept either way; whether it may be sent a prompt is `signin_state`'s answer, not this one's."""
         made = 0
         try:
             while made < tries and self.signin_check():
@@ -964,13 +1021,18 @@ class Connector:
         self.auth_note = ""
         for attempt in (1, 2):
             try:
-                turn_prompt = self.open_turn(headers, caps, prompt)
+                turn = self.open_turn(headers, caps, prompt)
             except IntegrationsUnknown as e:
                 return "failed", "", "the configured integrations could not be read to switch them off (%s)" % e
             except Unconfined as e:
                 return "failed", "", "the turn could not be confined to its own folder (%s)" % e
-            self.turn_ran_on = self.turn_model(caps)
-            status, text, err = self.run_turn(turn_prompt, self.turn_ran_on, self.turn_cwd(caps))
+            except SigninNotReady as e:
+                if not durable:
+                    self.thread_id = None       # a thread opened for this turn is never used
+                    self.drop_scratch()
+                return (WAITING if isinstance(e, SigninUnknown) else NOT_READY), "", str(e)
+            self.turn_ran_on = turn[1]      # the model this turn is sent with, as open_turn read it
+            status, text, err = self.run_turn(*turn)     # nothing is read from disk between the check and the send
             if status == "server-exited":
                 self.restart_server()
                 if durable and attempt == 1:
@@ -1008,22 +1070,26 @@ class Connector:
         self.card_answer(result_path, quoted(SIGNED_OUT_ELSEWHERE).rstrip("\n") + "\n")
         return "signed-out"
 
-    def open_turn(self, headers, caps, prompt) -> str:
-        """Make a turn ready to send, and return its prompt. This is the one place a turn is dispatched
-        from, for the first server, a replaced one and one restarted after a crash, and it holds one
-        guarantee: the prompt is sent on a server started on the sign-in that is on disk when it is sent.
-        The sign-in is read again as the last step, after the thread is open (opening one is a round trip
-        to the server, and the account can change during it); a change there replaces the server and
-        opens the thread again on the new one. Nothing was sent on the thread left behind, and it ends
-        with the server that held it. What is left is the instant between that last read of the file and
-        the write of `turn/start` to the server's pipe.
+    def open_turn(self, headers, caps, prompt) -> tuple:
+        """Make a turn ready to send: (its prompt, its model, its working directory), as `run_turn` takes
+        them. This is the one place a turn is dispatched from, for the first server, a replaced one and
+        one restarted after a crash, and it holds one rule with no exception: a prompt is only ever sent
+        on a server started on the sign-in that is on disk when it is sent. Everything the send needs is
+        made ready first (the thread, which is a round trip to the server; the prompt; the model, which
+        is read from disk; the working directory), and the sign-in is read again after all of it. A
+        change there replaces the server and makes the turn ready again on the new one. Nothing was sent
+        on the thread left behind, and it ends with the server that held it. What is left after that
+        read is `run_turn` putting the request together in memory and writing `turn/start` to the pipe.
 
-        Two exceptions, both said in the log, serve on the last server that works rather than hold the
-        task: a replacement that cannot start (the running server serves), and a sign-in that changes
-        again under each new server until SIGNIN_SETTLE_TRIES replacements were made for this dispatch."""
+        When no server can be brought onto the sign-in on disk, SigninNotReady is raised and nothing is
+        sent: the new server could not start, the sign-in changed again under each new server until
+        SIGNIN_SETTLE_TRIES replacements were made for this dispatch, or the file cannot be read while
+        a switch is pending (SigninUnknown: never a match; see signin_state). The server that runs is kept, so
+        cards and the next attempt still work, but it gets no prompt."""
         left = SIGNIN_SETTLE_TRIES      # replacements this one dispatch may make, however they fall
         while True:
             left -= self.signin_settle(left)
+            self.signin_sendable(self.signin_ready())
             self.open_for(headers, caps)
             self.last_thread = self.thread_id
             turn_prompt = prompt
@@ -1031,11 +1097,22 @@ class Connector:
                 # The turn reads its own folder only: this task's own attachments are copied into it.
                 staged = stage_own_attachments(headers, self.scratch_cwd, getattr(self.args, "media_root", None))
                 turn_prompt = with_staged_paths(prompt, staged)
-            if not self.signin_stale() or self.signin_failed:
-                return turn_prompt      # current; or the replacement cannot start and the running server serves
-            if left <= 0:
-                log("sign-in kept changing while the turn was made ready; sending on the last server started")
-                return turn_prompt
+            turn = turn_prompt, self.turn_model(caps), self.turn_cwd(caps)
+            state = self.signin_ready()
+            if state == CURRENT:
+                self.signin_told = False
+                return turn
+            if state == UNKNOWN or left <= 0:
+                self.signin_sendable(state)     # raises: the thread just opened gets no prompt
+
+    def signin_sendable(self, state: str) -> None:
+        """Raise unless `state` is CURRENT: SigninUnknown for a sign-in that cannot be read with a switch
+        pending, SigninNotReady when no server could be brought onto the one that reads."""
+        if state == CURRENT:
+            return
+        if state == UNKNOWN:
+            raise SigninUnknown("the sign-in file could not be read after the account changed")
+        raise SigninNotReady(self.signin_failed or "the sign-in kept changing while Codex restarted")
 
     def result_body(self, status, text, err):
         if status == "completed":
@@ -1044,6 +1121,8 @@ class Connector:
                 return said
             why = no_message_why(self.turn_declined, self.turn_items)
             return NO_REPLY[:-1] + ": " + why + "." if why else NO_REPLY
+        if status == NOT_READY:
+            return NOT_READY_SAY
         if status == "timeout":
             head = "Codex did not finish this task in time (%s)." % err
         elif status == "server-exited":
@@ -1152,6 +1231,7 @@ class Connector:
         done = 0
         idle_since = time.time()
         metrics_path = os.path.join(self.args.state, "metrics.jsonl")
+        held = {}       # task id -> (since when, its file's name, its tier): waiting for the selected account
         while not stop_requested():
             try:    # a card's ledger entry, or a sign-in given up, never stops task service
                 connector_cards.absorb(self.args.bridge_state, self.root)
@@ -1161,11 +1241,27 @@ class Connector:
             except Exception as e:  # noqa: BLE001
                 log("card upkeep failed:", "%s: %s" % (type(e).__name__, e))
             self.signin_settle()        # here no turn runs: an idle agent moves to the new account too
-            names = self.pending_tasks(seen)
+            if held and self.signin_state() == CURRENT:
+                held.clear()            # a clean read matches the server: what waited for it is served now
+            for task_id, (since, name, tier) in list(held.items()):
+                if held_clock() - since < SIGNIN_HELD_SAY_S:
+                    continue
+                # Nobody waits in silence: at its deadline the task gets the plain words, and no prompt.
+                del held[task_id]
+                seen.add(task_id)
+                write_atomic(os.path.join(self.args.results, name), NOT_READY_SAY + "\n")
+                record_done(done_path, task_id)
+                rec = {"task": task_id, "status": NOT_READY, "tier": tier, "held_s": round(held_clock() - since, 1)}
+                with open(metrics_path, "a") as f:
+                    f.write(json.dumps(rec) + "\n")
+                log("result <-", json.dumps(rec))
+                done += 1
+                idle_since = time.time()
+            names = [n for n in self.pending_tasks(seen) if n[:-4] not in held]
             if not names:
                 if self.args.once and done >= self.args.once:
                     return
-                if self.args.idle_exit and time.time() - idle_since > self.args.idle_exit:
+                if self.args.idle_exit and not held and time.time() - idle_since > self.args.idle_exit:
                     log("idle-exit")
                     return
                 try:
@@ -1227,6 +1323,15 @@ class Connector:
             quota = self.quota_hit(limit) if limit is not None else (self.quota.cleared() if status == "completed" else "")
             if self.view:
                 self.view.done(status)
+            if status == WAITING or (status == NOT_READY and self.signin_told):
+                # It waits in the inbox, behind no card and no later task: served when the account is
+                # ready, or told at its own deadline (SIGNIN_HELD_SAY_S) by the poll above.
+                held[task_id] = (held_clock(), name, headers["access_tier"])
+                seen.discard(task_id)
+                continue
+            if status == NOT_READY:
+                log("not sent ->", task_id, "(no server on the selected account: %s)" % err)
+                self.signin_told = True
             out = self.result_body(status, text, err)
             if limit is not None:
                 out = LIMITED_NO_SEND if self.quota.limited() else quoted(quota_notice.words(

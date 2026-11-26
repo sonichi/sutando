@@ -66,7 +66,7 @@ include = ["ag2_sparrow*"]
 "ag2_sparrow.adapters.claude_cloud_session" = ["*.md"]
 # the ag2space-inbox plugin claude-local loads by default (its harness tests stay in the repo)
 "ag2_sparrow.adapters.claude_code" = ["ag2space-inbox/.claude-plugin/plugin.json", "ag2space-inbox/hooks/*.json",
-                                      "ag2space-inbox/hooks/*.ts"]
+                                      "ag2space-inbox/hooks/*.ts", "ag2space-inbox/types/*.d.ts"]
 
 [tool.setuptools.dynamic]
 version = { attr = "ag2_sparrow.__version__" }

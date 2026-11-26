@@ -852,6 +852,12 @@ def contract_shape(expect: dict, rc: int, out: dict) -> str:
     bad += ["reason %r" % reason for k in ("reason_suffix",) if k in expect and not reason.endswith(expect[k])]
     bad += ["%s not marked" % k for k in expect.get("marked") or [] if k not in (out.get("stuck") or {})]
     bad += ["%s still marked" % k for k in expect.get("unmarked") or [] if k in (out.get("stuck") or {})]
+    tasks = out.get("tasks") or {}
+    for k, want in (expect.get("listed") or {}).items():
+        got_task = {f: (tasks.get(k) or {}).get(f) for f in want}
+        if got_task != want:
+            bad.append("%s listed as %r, not %r" % (k, tasks.get(k), want))
+    bad += ["%s still listed" % k for k in expect.get("unlisted") or [] if k in tasks]
     return "; ".join(bad)
 
 
