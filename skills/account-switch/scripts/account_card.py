@@ -19,8 +19,8 @@ replaces the "isn't signed in anymore" line.
 
 Saved accounts are the desktop's store for the Sutando core on Codex
 (`<app support>/accounts/codex/<key>.json`, {label, auth}, folder 0700, files 0600; desktop
-ag2space-cinny-desktop#1264). The key is 16 hex of the SHA-256 of Codex's account id, so a key on a
-button names no account. `post` first saves the signed-in account there, as the desktop does, so a
+ag2space-cinny-desktop#1264). The key is 16 hex of the SHA-256 of "<Codex account id>|<email>", so a
+key on a button names no account. `post` first saves the signed-in account there, as the desktop does, so a
 later sign-in never loses it. Each other saved account gets a "Use" button. A Claude core has no
 saved accounts (its sign-in is in the Keychain), so its card offers only "Add another account".
 
@@ -29,7 +29,9 @@ the Sutando core's row → "Switch account", where the sign-in terminal takes th
 own box. A sign-in code or token never goes in a message, a card or a log.
 
 A "Use" tap answers "switching" at once and starts `switch` detached, because the core restarts.
-`switch` keeps the current `auth.json` in memory and saves it to the store, puts the saved one in
+`switch` refuses a saved account another Codex here holds a login of its own for (held_elsewhere: two
+copies of one login end each other on refresh). Otherwise it keeps the current `auth.json` in memory and
+saves it to the store, puts the saved one in
 place (0600), and runs src/agent/graceful-restart.sh, which waits for the core to finish its turn.
 A sign-in that cannot be read or saved to switch back to is never replaced. One attempt runs at a
 time: admission and the switch each hold a lock, and only that attempt's record is cleared. After
@@ -163,8 +165,9 @@ def _claims(jwt: str) -> dict:
 
 def identity(auth_text: str) -> Optional[tuple]:
     """(store key, label) of a ChatGPT sign-in in a Codex `auth.json`, the desktop's rule: the id is
-    Codex's `tokens.account_id`, else the token's account id claim, else its `sub`; the label is
-    "email (plan)". None for an API key or anything unreadable. No token is returned."""
+    "<workspace>|<person>", the workspace Codex's `tokens.account_id` (else the token's account id
+    claim) and the person its email (else `sub`), either alone when the other is missing; the label
+    is the email. None for an API key or anything unreadable. No token is returned."""
     try:
         auth = json.loads(auth_text)
     except (TypeError, ValueError):
@@ -176,8 +179,11 @@ def identity(auth_text: str) -> Optional[tuple]:
     raw = raw.get("raw_jwt") if isinstance(raw, dict) else raw
     claims = _claims(raw) if isinstance(raw, str) else {}
     auth_claims = claims.get("https://api.openai.com/auth") if isinstance(claims.get("https://api.openai.com/auth"), dict) else {}
-    ident = next((v for v in (tokens.get("account_id"), auth_claims.get("chatgpt_account_id"), claims.get("sub"))
-                  if isinstance(v, str) and v), "")
+    workspace = next((v for v in (tokens.get("account_id"), auth_claims.get("chatgpt_account_id"))
+                      if isinstance(v, str) and v), "")
+    person = next((v for v in (claims.get("email"), claims.get("sub")) if isinstance(v, str) and v), "")
+    # One ChatGPT workspace id is shared by everyone in it, so the person is part of the key (desktop codex_identity).
+    ident = f"{workspace}|{person}" if workspace and person else (workspace or person)
     if not ident:
         return None
     email = claims.get("email") if isinstance(claims.get("email"), str) else ""
@@ -254,6 +260,43 @@ def shown_names(entries: list) -> dict:
         groups.setdefault(masked_label(s["label"]), []).append(s["key"])
     return {k: name + (f" #{i}" if len(keys) > 1 else "")
             for name, keys in groups.items() for i, k in enumerate(keys, 1)}
+
+
+def local_codex_homes(user_home: Optional[Path] = None) -> list:
+    """CODEX_HOME of every local Codex agent ag2-sparrow set up for this user (each `codex-local.conf`),
+    as the desktop reads them (sparrow_local::recorded_codex_homes)."""
+    root = (user_home or Path.home()) / ".config" / "ag2-sparrow"
+    try:
+        own = sorted(d / "codex-local.conf" for d in (root / "agents").iterdir())
+    except OSError:
+        own = []
+    homes = []
+    for conf in [root / "codex-local.conf", *own]:
+        try:
+            lines = conf.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+        raw = next((line[len("CODEX_HOME="):] for line in lines if line.startswith("CODEX_HOME=")), "").strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
+            raw = raw[1:-1]
+        if raw and os.path.isabs(raw):
+            homes.append(Path(raw))
+    return homes
+
+
+def held_elsewhere(core_home: Path, key: str, homes=None) -> bool:
+    """Whether another Codex home here keeps a login of its own for account `key`. A ChatGPT login's refresh
+    token is replaced on each refresh, so two homes holding one login end each other; a home whose
+    `auth.json` links to the core's own file shares it and is not another holder."""
+    own = os.path.realpath(core_home / "auth.json")
+    for home in (local_codex_homes() if homes is None else homes):
+        path = Path(home) / "auth.json"
+        if os.path.realpath(path) == own:
+            continue
+        ident = identity(_live_auth(Path(home)) or "")
+        if ident and ident[0] == key:
+            return True
+    return False
 
 
 def _saved_auth(store: Path, key: str) -> Optional[str]:
@@ -695,7 +738,7 @@ def _restore(home: Path, before: Optional[str]) -> None:
 
 
 def do_switch(ws: Path, key: str, *, restart=restart_core, ready=core_ready, live=live_account,
-              clock=time.time) -> tuple:
+              clock=time.time, held=held_elsewhere) -> tuple:
     """(state, words). The previous `auth.json` is kept in memory and saved in the store first; a
     sign-in that cannot be read or saved is never replaced. When the restart definitely did not
     happen, the previous state (absence included) is put back."""
@@ -710,6 +753,10 @@ def do_switch(ws: Path, key: str, *, restart=restart_core, ready=core_ready, liv
     if want is None:
         return "error", "Couldn't switch: that account is no longer saved here. Nothing changed."
     label = masked_label(identity(want)[1])
+    if held(home, key):
+        return "error", (f"Couldn't switch to {label}: another Codex on this computer is signed in with that "
+                         "account, and two copies of one sign-in end each other when either refreshes. Sign in to "
+                         "it here with \"Add another account\" instead. Nothing changed.")
     try:
         before = _previous_auth(home)
     except Unreadable as e:

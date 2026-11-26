@@ -41,7 +41,8 @@ app's own box.
   `$SUTANDO_APP_SUPPORT`, else the folder of the desktop's `runtime.json`). `post` saves the
   signed-in account there first, in the desktop's own format, so a later sign-in never loses it. Up to
   five other saved accounts get a "Use <account>" button. The key on a button is 16 hex of a hash of
-  Codex's account id; it names no account and carries no credential.
+  Codex's account id and the person's email (the desktop's `codex_identity`: one ChatGPT workspace id is
+  shared by everyone in it); it names no account and carries no credential.
 - **Add another account.** Answers with where to sign in: Settings → Connections → the Sutando (on this
   computer) row → "Switch account". The app's sign-in terminal shows the link and takes the code in its
   own box. Then the owner asks for the card again.
@@ -60,12 +61,18 @@ refused.
 A "Use" tap answers at once ("Switching the core to X. It restarts once this turn has finished…") and
 starts `account_card.py switch` detached, in its own session, because the core restarts. `switch`:
 
-1. refuses, changing nothing, when the current `auth.json` exists but cannot be read or cannot be saved
+1. refuses, changing nothing, when another Codex on this computer (a local Codex agent's `CODEX_HOME`,
+   from each `~/.config/ag2-sparrow/**/codex-local.conf`) keeps a login of its own for that account: a
+   ChatGPT login's refresh token is replaced on each refresh, so two copies of it end each other within
+   minutes ("Codex isn't signed in anymore"). An agent whose `auth.json` links to the core's own file
+   shares the core's login and is not another holder. The owner signs in to that account with "Add another
+   account" instead, which gives the core a login of its own;
+2. refuses, changing nothing, when the current `auth.json` exists but cannot be read or cannot be saved
    to switch back to (an API key, a broken file); otherwise keeps it in memory and saves it in the store;
-2. writes the saved one as the core's `<CODEX_HOME>/auth.json` (0600);
-3. runs `src/agent/graceful-restart.sh` (it waits for the core's turn to end, then
+3. writes the saved one as the core's `<CODEX_HOME>/auth.json` (0600);
+4. runs `src/agent/graceful-restart.sh` (it waits for the core's turn to end, then
    `start-cli.sh --restart`; a seat core is replaced as a seat);
-4. waits for a fresh heartbeat from the core session (its session and tmux socket), asks Codex's own
+5. waits for a fresh heartbeat from the core session (its session and tmux socket), asks Codex's own
    `account/read` which account the saved sign-in is, and posts the outcome in the same DM: **"I asked
    the core to restart with X's sign-in, and its heartbeat came back after the request (or: I haven't
    seen a heartbeat from the core session since). Saved sign-in verified: Codex confirms it is X. The
