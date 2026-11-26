@@ -2489,7 +2489,8 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         (queued,) = self.outbox()
         card = queued["card"]
         self.assertEqual((queued["room"], card["id"], card["state"]), (self.DM, account_switch.CARD, "pending"))
-        self.assertEqual(card["account_controls"], {"runtime": "codex"})
+        # `limit`: the app lists it with what the agent waits on, apart from an account menu the owner asked for.
+        self.assertEqual(card["account_controls"], {"runtime": "codex", "limit": True})
         self.assertRegex(card["text"], r"^Codex has reached its usage limit \(resets (?:[A-Z][a-z]{2} \d{1,2}, )?\d{1,2}:\d\d [AP]M\), so I can't "
                                        r"answer until then\. Switch to another account or an API key to go on now\. "
                                        r"I'm using alice@example\.com\. " + re.escape(account_switch.BELOW) + "$")
@@ -2502,6 +2503,15 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.serve("task-3", "[[limit-bare]] and again", channel="!room:s.space", kind="room")
         self.assertEqual((self.outbox(), self.posted()), ([], []), "nothing more once the card is posted")
         self.assertEqual(json.loads((self.work / "state" / quota_notice.FILE).read_text())["told"], True)
+
+    def test_a_limit_hit_in_a_room_is_told_only_in_the_owners_dm_and_nothing_is_posted_in_the_room(self):
+        # Owner, 2026-11-25: usage limits and account switching belong to her DM; a room gets nothing about them.
+        self.assertIn("STUB echo", self.serve("task-0", "hello"))
+        room = "!room:s.space"
+        self.assertEqual(self.serve("task-r", "[[limit]] in a room", channel=room, kind="room"), cc.LIMITED_NO_SEND)
+        (queued,) = self.outbox()
+        self.assertEqual((queued["room"], queued["card"]["account_controls"].get("limit")), (self.DM, True))
+        self.assertNotIn(room, [r for r, _ in self.posted()], "no card, no notice in the room")
 
     def test_a_turn_that_answers_clears_the_limit_and_a_later_limit_is_a_new_card(self):
         self.serve("task-1", "[[limit-bare]] hello")
