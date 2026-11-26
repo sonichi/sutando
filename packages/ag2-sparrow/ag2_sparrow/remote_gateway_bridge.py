@@ -2847,6 +2847,8 @@ _last_core_health: "dict | None" = None
 # Opaque, 1-256 chars as the ui_* tools accept it; no whitespace or control characters,
 # so it stays one header line. Anything else is dropped.
 _UI_ORIGIN_RE = re.compile(r"[^\s\x00-\x1f\x7f]{1,256}")
+# A full Matrix user id on one line: nothing else is written as a linked account.
+_LINKED_ACCOUNT_RE = re.compile(r"@[^\s:@\x00-\x1f\x7f]{1,200}:[^\s@\x00-\x1f\x7f]{1,200}")
 _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Both ahead of "task": the safe parser stops at the body, so a
                 # field written below it is invisible to every task-last reader.
@@ -2869,6 +2871,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Who asked a relay task; its user_id is the account it runs for. Above "task"
                 # so the strict parser reads it, and the dedup fold checks it.
                 "asked_by",
+                # The s.space account the broker says a bridged sender has linked (the task's
+                # bridge_origin). Above "task" so the strict parser reads it and a body cannot claim it.
+                "linked_account",
                 # Commons hook-fire / Summon contexts, each one JSON line. Above "task":
                 # the agent's safe parser must see which hook or row change it serves.
                 "hook",
@@ -6886,6 +6891,12 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
             elif click not in (None, ""):
                 # A click that cannot be used stays a click: the agent refuses it, never reads it as chat.
                 lines.append("card_click: invalid")
+        elif f == "linked_account":
+            # From the broker's structured stamp alone, never from the message's own text.
+            stamp = task.get("bridge_origin")
+            linked = stamp.get("linked_mxid") if isinstance(stamp, dict) else None
+            if isinstance(linked, str) and _LINKED_ACCOUNT_RE.fullmatch(linked):
+                lines.append(f"linked_account: {linked}")
         elif f == "owner_mentioned":
             if task.get(f) == "true":  # the broker's exact string only; nothing else is a claim
                 lines.append("owner_mentioned: true")

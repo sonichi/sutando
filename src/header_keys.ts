@@ -60,6 +60,7 @@ export const HEADER_KEYS: readonly string[] = [
 	'hitl_click',
 	'owner_mentioned',
 	'asked_by',
+	'linked_account',
 	'task_layout',
 	'hook',
 	'summon',

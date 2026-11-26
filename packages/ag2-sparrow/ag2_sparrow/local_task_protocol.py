@@ -231,6 +231,9 @@ KNOWN_HEADER_KEYS = (
     # Who asked a relay task, which its `user_id` (the account it runs for) does not say.
     # Bridge-written above task:, so the guard defangs a forged body copy.
     "asked_by",
+    # The account the broker says a bridged sender has linked. Bridge-written above task:
+    # from the broker's stamp, so the guard defangs a forged body copy. It grants no tier.
+    "linked_account",
     # Writer-declared layout, above task: so a body cannot claim it. `mid` = the body is
     # one line and every later line is the writer's; meaningful only under a verified envelope.
     "task_layout",
