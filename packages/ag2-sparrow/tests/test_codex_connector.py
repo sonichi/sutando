@@ -2505,9 +2505,8 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(json.loads((self.work / "state" / quota_notice.FILE).read_text())["told"], True)
 
     def test_a_limit_hit_in_a_room_is_told_only_in_the_owners_dm_and_nothing_is_posted_in_the_room(self):
-        # Owner, 2026-11-25: usage limits and account switching belong to her DM with the agent; a room the agent
-        # works in gets nothing about them.
-        self.assertIn("STUB echo", self.serve("task-0", "hello"))         # her DM, as the bridge remembers it
+        # Owner, 2026-11-25: usage limits and account switching belong to her DM; a room gets nothing about them.
+        self.assertIn("STUB echo", self.serve("task-0", "hello"))
         room = "!room:s.space"
         self.assertEqual(self.serve("task-r", "[[limit]] in a room", channel=room, kind="room"), cc.LIMITED_NO_SEND)
         (queued,) = self.outbox()
