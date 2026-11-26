@@ -66,6 +66,9 @@ _HINT = re.compile(r"/?usage-credits\b", re.I)    # the credits hint under a ban
 _MENU_WHEN = re.compile(r"^[\s>❯]*\d+\.\s+Wait here, then continue automatically (?:at|on)\s+(.{1,60})$", re.M | re.I)
 
 
+IN_DM = "To switch account, message me in our direct message."
+
+
 def _read(root, name) -> dict:
     try:
         rec = json.loads((records.state_dir(root) / name).read_text(encoding="utf-8"))
@@ -327,10 +330,11 @@ def _tell_tasks(root, cfg: dict, bridge: str, limited: list, text: str, log, rec
             card = account_card.AccountCard(root, cfg, lambda result_file, body: None, log)
             said = _card_words(card, limited, text, log)
             rec = dict(rec, said=said)
-        # In a room that is not the owner's DM the card names no account.
-        here = said if in_dm else words(limited, text, "", "").rstrip()
+        # In a room that is not the owner's DM the card names no account and switches none.
+        built = (account_switch.limited(card.card("pending", said, ask=True)) if in_dm else
+                 card.card("pending", words(limited, text, "", "").rstrip() + " " + IN_DM))
         try:
-            qid = connector_cards.queue(bridge, to, *account_switch.limited(card.card("pending", here, ask=True)),
+            qid = connector_cards.queue(bridge, to, *built,
                                         key=entry["key"],
                                         at_ns=entry["at"], again=bool(entry.get("again")))
         except (OSError, ValueError) as e:

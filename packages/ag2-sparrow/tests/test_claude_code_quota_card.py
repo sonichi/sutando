@@ -496,6 +496,8 @@ class LimitMenu(NoticeBase):
         (there,) = self.queued()
         self.assertEqual(there["card"]["text"].split(" ", 2)[:2], ["Claude", "Code"])
         self.assertNotIn("sarah@example.com", there["card"]["text"])
+        self.assertTrue(there["card"]["text"].endswith(quota_card.IN_DM))
+        self.assertEqual(("account_controls" in there["card"], there["card"].get("buttons")), (False, None))
         # The owner asks for a card while out: the limit's card answers, not the model's or the plain account's.
         quota_card.save(self.root, dict(quota_card.load(self.root), said="LIMIT WORDS"))
         got = []

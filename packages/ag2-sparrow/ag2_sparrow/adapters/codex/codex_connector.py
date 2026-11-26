@@ -506,7 +506,8 @@ class Connector:
         if self._quota is None:
             self._quota = quota_notice.QuotaNotice(
                 self.args.state, getattr(self.args, "bridge_state", None), "Codex",
-                lambda text: self.accounts.card("pending", text, ask=True), self.accounts.using, log)
+                lambda text: self.accounts.card("pending", text, ask=True), self.accounts.using, log,
+                note=lambda text: self.accounts.card("pending", text))
         return self._quota
 
     def saw_rate_limits(self, params, tell=True) -> str:

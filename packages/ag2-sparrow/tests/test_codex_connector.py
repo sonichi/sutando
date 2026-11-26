@@ -2580,9 +2580,11 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(self.serve("task-3", "[[limit-bare]] and again", channel=room, kind="room"), cc.LIMITED_NO_SEND)
         self.assertIn("quota-task-card", metrics(self.work)[-1]["quota"])
         ((to, there),) = self.posted()
-        self.assertEqual((to, there["account_controls"].get("limit")), (room, True))
-        self.assertNotIn("alice@example.com", there["text"])
-        self.assertIn("Codex has reached its usage limit (resets ", there["text"])
+        # In a room: the limit and its reset, no account named, and nothing that switches one.
+        self.assertEqual((to, there["id"], "account_controls" in there, there.get("buttons")),
+                         (room, account_switch.NOTE, False, None))
+        self.assertRegex(there["text"], r"^Codex has reached its usage limit \(resets [^)]+\), so I can't answer until "
+                                        r"then\. To switch account, message me in our direct message\.$")
         rec = json.loads((self.work / "state" / quota_notice.FILE).read_text())
         self.assertEqual((rec["told"], rec["tasks"]), (True, ["task-1", "task-2", "task-3"]))
 
@@ -2696,6 +2698,7 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(sorted(cards), sorted([self.DM, room]), "the limit's own card in the DM, this message's here")
         self.assertIn("alice@example.com", cards[self.DM]["text"])
         self.assertNotIn("alice@example.com", cards[room]["text"])
+        self.assertNotIn("account_controls", cards[room])
 
     def test_a_turn_that_answers_clears_the_limit_and_a_later_limit_is_a_new_card(self):
         self.serve("task-1", "[[limit-bare]] hello")

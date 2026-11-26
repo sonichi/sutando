@@ -74,13 +74,21 @@ def words(name: str, reset: str, using: str) -> str:
                                      " " + using if using else ""))
 
 
+def room_words(name: str, reset: str) -> str:
+    """The limit as said in a shared room: no account named, and nothing there switches one."""
+    return ("%s has reached its usage limit%s, so I can't answer until then. To switch account, message me in our "
+            "direct message." % (name, " (resets %s)" % reset if reset else " (it does not say when that resets)"))
+
+
 class QuotaNotice:
     """`build(text) -> (body, card)` is the connector's account card (its account_controls marker on), led by
     `text`; `using()` names the account in use in words ('' when it cannot say)."""
 
-    def __init__(self, state_dir, bridge_state, name, build, using, log, now=time.time):
+    def __init__(self, state_dir, bridge_state, name, build, using, log, now=time.time, note=None):
         self.state_dir, self.bridge_state, self.name = str(state_dir), bridge_state, name
         self.build, self.using, self.log, self.now = build, using, log, now
+        # `note(text) -> (body, card)`: a card with no account controls, for a room that is not the owner's DM.
+        self.note = note or build
 
     # ── records ──
     def _read(self, name) -> dict:
@@ -232,12 +240,13 @@ class QuotaNotice:
 
     def _card(self, rec: dict, named: bool = True):
         """The limit's card; `named` says the account in use (the owner's DM only, never a shared room)."""
-        using = ""
-        if named:
-            try:
-                using = self.using() or ""
-            except Exception as e:  # noqa: BLE001 - the card still says what it can
-                self.log("account not read:", "%s: %s" % (type(e).__name__, str(e)[:200]))
+        if not named:
+            return self.note(room_words(self.name, str(rec.get("reset") or "")))
+        try:
+            using = self.using() or ""
+        except Exception as e:  # noqa: BLE001 - the card still says what it can
+            self.log("account not read:", "%s: %s" % (type(e).__name__, str(e)[:200]))
+            using = ""
         return account_switch.limited(self.build(words(self.name, str(rec.get("reset") or ""), using)))
 
     def _hit(self, reset: str = "", reset_at=None) -> str:

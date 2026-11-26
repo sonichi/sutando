@@ -303,6 +303,8 @@ class AccountCardTest(unittest.TestCase):
         self.serve()
         (there,) = self.outbox()
         self.assertNotIn("I'm using", there["card"]["text"], "in a room the card names no account")
+        self.assertEqual(("account_controls" in there["card"], there["card"].get("buttons")), (False, None),
+                         "and switches none")
         self.assertEqual(self.w.result("task-q3"), gc.LIMITED_NO_SEND)
         # The owner asks for a card while out: the limit's card answers first, with the same words.
         self.posted("$q3")
