@@ -1,5 +1,9 @@
 """The account card of a connector: the owner asks, in their DM with the agent, which account it is
 signed in with, taps "Switch account", signs in in the browser, and is told in that DM how it ended.
+One card, updated in place: what a tap comes to (the sign-in page, then how the sign-in ended) is shown
+in place of the card that was tapped (connector_cards' edit), never as a second card. A card asked for
+in words (/account, the card's mark) is a new card; a sign-in that ends with no card waiting for it
+(the desktop app switched the account itself) posts nothing.
 
 The connector supplies the runtime's part: `read()` names the account in use ('' when signed out),
 `begin()` starts a sign-in and gives its id and page, `cancel(id)` gives one up, `opener(url)` shows the
@@ -30,6 +34,10 @@ HINT = ("If the person asks to switch, change or sign in to another account for 
         "use, reply with exactly %s and nothing else: they are then shown a card for it. Do not start a "
         "sign-in yourself." % MARK)
 IN_DM = "I can switch accounts from our direct message. Ask me there."
+# The account card's words, English only. A client that knows the `account_controls` marker draws the
+# agent's saved accounts and sign-in below them; one that does not shows the text and the button.
+BELOW = "Switch this agent's account below."
+CONTROLS = "account_controls"
 # The owner's own words that ask for the card, as a whole short message: to switch the account, or which
 # one the agent is on. The runtime cannot see its own sign-in, so these never go to the model.
 ASK_MAX = 80
@@ -73,10 +81,30 @@ def page_ok(url) -> bool:
     return parts.scheme == "https" and bool(parts.hostname) and "@" not in parts.netloc
 
 
+def elsewhere(name: str) -> str:
+    """Where the account controls are, for a place that cannot draw them."""
+    return "Open this on the computer that runs %s to switch account." % (name or "this agent")
+
+
+def with_controls(built, runtime: str = "", agent: str = "", **flags):
+    """`built` (body, card) marked as an account card: a client that knows the marker draws the agent's
+    account controls in it, nothing typed there reaching the room; one that does not shows the text."""
+    body, card = built
+    marker = {k: v for k, v in dict(flags, runtime=runtime, agent=agent).items() if v}
+    return body, dict(card, **{CONTROLS: marker})
+
+
 def masked(email: str) -> str:
     """An address shortened to what tells two accounts apart: its first letter and its domain."""
     name, at, domain = (email or "").partition("@")
     return "%s…@%s" % (name[:1], domain) if name and at and domain else ""
+
+
+def shown(email: str) -> str:
+    """An address as the owner reads it on the account card in their DM with the agent: in full, never
+    with a plan; "" when it is not an address."""
+    name, at, domain = (email or "").strip().partition("@")
+    return "%s@%s" % (name, domain) if name and at and domain and not any(c.isspace() for c in name + domain) else ""
 
 
 class AccountSwitch:
@@ -84,8 +112,8 @@ class AccountSwitch:
     CARD_ID = CARD
     asks = staticmethod(asks_for_card)
 
-    def __init__(self, state_dir, bridge_state, name, publish, quoted, log, read, begin, cancel, opener):
-        self.state_dir, self.bridge_state, self.name = state_dir, bridge_state, name
+    def __init__(self, state_dir, bridge_state, name, publish, quoted, log, read, begin, cancel, opener, runtime=""):
+        self.state_dir, self.bridge_state, self.name, self.runtime = state_dir, bridge_state, name, runtime
         self.publish, self.quoted, self.log = publish, quoted, log
         self.read, self.begin, self.cancel, self.opener = read, begin, cancel, opener
 
@@ -112,15 +140,17 @@ class AccountSwitch:
         owed = self.owed() if owed is None else owed
         state = dict(attempt, **({"owed": owed} if owed else {}))
         path = os.path.join(self.state_dir, FILE)
-        with open(path + ".tmp", "w", encoding="utf-8") as f:
+        # Owner-only: a result still to be told names the account's address.
+        with os.fdopen(os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+            os.chmod(path + ".tmp", 0o600)
             json.dump(state, f, sort_keys=True)
         os.replace(path + ".tmp", path)
 
     def usable(self) -> bool:
         return card_desk.usable(self.bridge_state)
 
-    def post(self, room, built, key: str = "", at_ns: int = 0) -> bool:
-        return card_desk.post(self.bridge_state, room, built, self.log, key, at_ns)
+    def post(self, room, built, key: str = "", at_ns: int = 0, edit: str = "") -> bool:
+        return card_desk.post(self.bridge_state, room, built, self.log, key, at_ns, edit)
 
     def using(self) -> str:
         """The account in use, in words; a runtime that cannot say reads as unknown, never as signed out."""
@@ -129,9 +159,9 @@ class AccountSwitch:
         except Exception as e:  # noqa: BLE001 - the card still says what it can
             self.log("account not read:", "%s: %s" % (type(e).__name__, str(e)[:200]))
             return "I could not read which account I'm signed in with."
-        return "I'm signed in as %s." % label if label else "I'm not signed in."
+        return "I'm using %s." % label if label else "I'm not signed in."
 
-    def card(self, state: str, text: str, url: str = "", ask: bool = False):
+    def card(self, state: str, text: str, url: str = "", ask: bool = False, signed_out: bool = False):
         agent_card, _ = connector_cards._core()
         buttons = []
         if ask:
@@ -139,12 +169,15 @@ class AccountSwitch:
                                              command=agent_card.reply("account", "agent", "switch")))
         if url:
             buttons.append(agent_card.button("Open sign-in page", "url", url=url))
-        return agent_card.build(CARD if ask else NOTE, state, title="Account", body="Account of %s" % self.name, text=text,
-                                **({"buttons": buttons} if buttons else {}))
+        built = agent_card.build(CARD if ask else NOTE, state, title="Account", body="Account of %s" % self.name,
+                                 text="%s %s" % (text, BELOW) if ask else text,
+                                 **({"buttons": buttons} if buttons else {}))
+        return with_controls(built, self.runtime, signed_out=signed_out) if ask else built
 
-    def say(self, room, built, result_file=None) -> None:
-        """Post the card; where it cannot be posted, a task's result carries its words instead."""
-        posted = self.post(room, built)
+    def say(self, room, built, result_file=None, edit: str = "") -> None:
+        """Post the card (in place of the card `edit` names, when given); where it cannot be posted, a
+        task's result carries its words instead."""
+        posted = self.post(room, built, edit=edit)
         if result_file:
             self.publish(result_file, ANSWERED if posted else self.quoted(built[1]["text"]) + "\n")
 
@@ -156,17 +189,18 @@ class AccountSwitch:
         return self.offer(sent, result_file)
 
     def expired(self, sent, result_file) -> str:
-        """A tap on an account card that no longer acts: the words, and a fresh card when one can be shown.
-        No sign-in is started by it."""
-        fresh = self.post(sent.get("channel_id"), self.card("pending", self.using(), ask=True))
-        self.publish(result_file, self.quoted(EXPIRED if fresh else EXPIRED_NO_CARD) + "\n")
+        """A tap on an account card that no longer acts: a fresh card in its place when one can be shown,
+        else the words. No sign-in is started by it."""
+        fresh = self.post(sent.get("channel_id"), self.card("pending", self.using(), ask=True),
+                          edit=card_desk.tapped_event(sent))
+        self.publish(result_file, ANSWERED if fresh else self.quoted(EXPIRED_NO_CARD) + "\n")
         return "account-card-expired"
 
     def tapped(self, verb, sent, result_file) -> str:
         """The owner tapped "Switch account": start a sign-in, show its page here, and say so. The page
         is checked, and its card built, before anything is opened or kept: a page that is not a plain
         https address is given up at once, so a retry cannot open a browser again and again."""
-        room = str(sent.get("channel_id") or "")
+        room, tapped = str(sent.get("channel_id") or ""), card_desk.tapped_event(sent)
         if verb != "switch":
             self.publish(result_file, self.quoted("I couldn't match that button. Send /account for a new card.") + "\n")
             return "account-unknown"
@@ -179,7 +213,7 @@ class AccountSwitch:
             login, url = str(started["id"]), str(started["url"])
         except Exception as e:  # noqa: BLE001 - whatever the runtime refused with, the owner is told
             self.log("sign-in not started:", "%s: %s" % (type(e).__name__, str(e)[:200]))
-            self.say(room, self.card("error", "I could not start a sign-in. %s" % before), result_file)
+            self.say(room, self.card("error", "I could not start a sign-in. %s" % before), result_file, tapped)
             return "account-not-started"
         try:
             if not page_ok(url):
@@ -190,13 +224,13 @@ class AccountSwitch:
             self.log("sign-in page refused:", str(e)[:200])
             self.give_up({"id": login})
             self.say(room, self.card("error", "I could not start a sign-in: the page I was given for it is not one "
-                                              "I can show. %s" % before), result_file)
+                                              "I can show. %s" % before), result_file, tapped)
             return "account-not-started"
-        self.keep({"id": login, "room": room, "at": time.time()})
+        self.keep(dict({"id": login, "room": room, "at": time.time()}, **({"card": tapped} if tapped else {})))
         if self.opener(url):
             link = self.card("info", "I opened the sign-in page in the browser on the computer I run on. Finish "
                                      "signing in there; I'll confirm here. Until then: %s" % before, url=url)
-        self.say(room, link, result_file)
+        self.say(room, link, result_file, tapped)
         return "account-started"
 
     def give_up(self, waiting) -> None:
@@ -212,8 +246,10 @@ class AccountSwitch:
         owed = self.keyed(self.owed())
         # Later than every result already owed: the bridge posts in the order of this moment.
         at = max([time.time_ns()] + [int(o.get("at") or 0) + 1 for o in owed])
-        self.keep({}, owed + [{"room": waiting.get("room"), "state": state, "text": text,
-                               "key": uuid.uuid4().hex, "at": at}])
+        # Shown in place of the card that was tapped, when there was one.
+        self.keep({}, owed + [dict({"room": waiting.get("room"), "state": state, "text": text,
+                                    "key": uuid.uuid4().hex, "at": at},
+                                   **({"edit": waiting["card"]} if waiting.get("card") else {}))])
         return not self.tell()
 
     @staticmethod
@@ -235,7 +271,7 @@ class AccountSwitch:
         if any(not o.get("key") for o in owed):
             self.keep(self.pending(), self.keyed(owed))
         while owed and self.post(owed[0].get("room"), self.card(str(owed[0].get("state")), str(owed[0].get("text"))),
-                                 str(owed[0].get("key") or ""), int(owed[0].get("at") or 0)):
+                                 str(owed[0].get("key") or ""), int(owed[0].get("at") or 0), str(owed[0].get("edit") or "")):
             owed.pop(0)
             self.keep(self.pending(), owed)
         if len(owed) > OWED_KEEP:
@@ -243,15 +279,16 @@ class AccountSwitch:
             self.keep(self.pending(), owed)
         return owed
 
-    def finished(self, login, success, error="") -> str:
+    def finished(self, login, success, error="", note="") -> str:
         """The runtime reported a sign-in over: tell the owner, in the DM it was asked in, how it ended
-        and which account is in use now. '' for any report that does not name the sign-in in progress:
-        one without an id could be another sign-in's, and must not end this one."""
+        and which account is in use now, and after one that took, the connector's `note`. '' for any
+        report that does not name the sign-in in progress: one without an id could be another
+        sign-in's, and must not end this one."""
         waiting = self.pending()
         if not waiting or not login or str(login) != waiting["id"]:
             return ""
         if success:
-            self.last_word(waiting, "done", "Signed in. %s" % self.using())
+            self.last_word(waiting, "done", " ".join(x for x in ("Signed in.", self.using(), note) if x))
             return "account-switched"
         why = " (%s)" % str(error)[:120] if error else ""
         self.last_word(waiting, "error", "The sign-in did not finish%s. %s" % (why, self.using()))

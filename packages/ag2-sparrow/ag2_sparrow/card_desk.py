@@ -8,6 +8,7 @@ names; a tap no card claims gets the fixed line, and never reaches the model.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from . import connector_cards
 
@@ -26,7 +27,7 @@ class Desk:
     def task(self, path, result_file) -> str:
         """What a task that was a card matter came to (a tap, or the owner's slash command in their DM),
         else ''."""
-        agent_card, _ = connector_cards._core()
+        agent_card, issued_cards = connector_cards._core()
         # The card rules read the task as the core does (the trusted header parse), not the connector's.
         with open(path, encoding="utf-8") as f:
             sent, said = agent_card.reply_words(f.read())
@@ -39,6 +40,9 @@ class Desk:
             # The owner tapped a card this agent no longer keeps (a newer one replaced it, it is past its
             # time, or an earlier install posted it): its kind says so and shows the current one.
             tapped = (agent_card.card_click(sent) or {}).get("card_id")
+            if not issued_cards.issued(Path(self.root), tapped_event(sent), str(sent.get("channel_id") or "")):
+                # Not a card this agent is known to have posted: the fresh card is a new message, never an edit.
+                sent = dict(sent, reply_to_event="")
             for card in self.cards:
                 if tapped == card.CARD_ID:
                     return self.drawn(card, result_file, lambda: card.expired(sent, result_file))
@@ -51,6 +55,12 @@ class Desk:
         for card in self.cards:
             if ask.lower() == card.ASK and card.usable():
                 return self.drawn(card, result_file, lambda: card.asked_for(words.strip(), sent, result_file))
+        # The owner's own words naming one choice ("switch to haiku"): picked as a tap would be, no menu.
+        for card in self.cards:
+            named = getattr(card, "named_in", None)
+            choice = named(said.strip()) if named and card.usable() else ""
+            if choice:
+                return self.drawn(card, result_file, lambda: card.asked_for(choice, sent, result_file))
         for card in self.cards:
             # A card may also name the owner's own words that are its matter (`asks`), read here and
             # never by the model: the account card's, for what the runtime cannot see of itself.
@@ -68,15 +78,16 @@ class Desk:
                                                   "own words." % card.KIND) + "\n")
             return "%s-card-failed" % card.KIND
 
-    def marked(self, tier, path, status, text, result_file) -> str:
+    def marked(self, tier, path, status, text, result_file, task_text=None) -> str:
         """The runtime answered the owner with a card's mark alone: show that card in their DM, or say
-        where to ask. '' for any other answer, and for any sender but the owner, whose mark is ordinary text."""
+        where to ask. '' for any other answer, and for any sender but the owner, whose mark is ordinary text.
+        With `task_text` (the task as read before the turn, `read_task`) the file at `path` is not opened:
+        by the end of the turn the bridge may have archived it."""
         card = next((c for c in self.cards if (text or "").strip() == c.MARK), None)
         if status != "completed" or tier != "owner" or card is None:
             return ""
         agent_card, _ = connector_cards._core()
-        with open(path, encoding="utf-8") as f:
-            sent, _ = agent_card.reply_words(f.read())
+        sent, _ = agent_card.reply_words(read_task(path) if task_text is None else task_text)
         if agent_card.owner_may_act(sent) is None:
             return self.drawn(card, result_file, lambda: card.offer(sent, result_file))
         self.publish(result_file, self.quoted(card.IN_DM) + "\n")
@@ -85,6 +96,15 @@ class Desk:
     def hint(self) -> str:
         """What an owner turn is told about the cards that can be shown, '' when none can."""
         return "\n\n".join(card.HINT for card in self.cards if card.usable())
+
+
+def read_task(path) -> str:
+    """The task file's text, read before the turn for `Desk.marked`; '' when it is already gone."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
 
 
 def led(publish, pending, quoted):
@@ -99,19 +119,27 @@ def led(publish, pending, quoted):
     return write
 
 
+def tapped_event(sent) -> str:
+    """The event id of the card a tap answers ('' for none): its answer is shown in place of that card."""
+    event = str((sent or {}).get("reply_to_event") or "")
+    return event if event.startswith("$") and not any(c.isspace() for c in event) else ""
+
+
 def usable(bridge_state) -> bool:
     """Whether a card can reach the room: the agent's own bridge keeps a state dir (made at install).
     Without one (a bridge run elsewhere, a bare connector) nothing would post what is queued."""
     return bool(bridge_state) and os.path.isdir(bridge_state)
 
 
-def post(bridge_state, room, built, log, key: str = "", at_ns: int = 0) -> bool:
+def post(bridge_state, room, built, log, key: str = "", at_ns: int = 0, edit: str = "") -> bool:
     """Queue a built card for the bridge to post in `room`; False when it cannot be. With `key` the
-    call may be repeated after a restart without a second card (connector_cards.queue)."""
+    call may be repeated after a restart without a second card (connector_cards.queue). With `edit` (the
+    event id of the card being answered) it is shown in place of that card, not as a second one."""
     if not usable(bridge_state):
         return False
     try:
-        connector_cards.queue(bridge_state, str(room or ""), *built, key=key, at_ns=at_ns)
+        connector_cards.queue(bridge_state, str(room or ""), *built, key=key, at_ns=at_ns,
+                              edit=edit if str(edit or "").startswith("$") else "")
         return True
     except (OSError, ValueError) as e:
         log("card not queued:", "%s: %s" % (type(e).__name__, e))

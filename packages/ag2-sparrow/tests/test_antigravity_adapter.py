@@ -221,36 +221,33 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         self.assertEqual(self.post_queued(), [], "told once")
         self.assertNotIn("model_switch", self.w.metrics()[-1])
-        # The menu is still on the owner's screen after the cards that answered it, and its buttons
-        # still act: the cards saying what a pick came to are not the menu, and do not retire it.
+        # One card: the answer to the tap and the outcome are each shown in place of the menu tapped.
+        self.assertEqual([(c["op"], c.get("event_id")) for c in (coming, told)], [("edit", "$card1")] * 2)
         self.assertEqual((waiting["id"], done["id"], card["id"]), (model_switch.NOTE, model_switch.NOTE, model_switch.CARD))
+        # The menu's buttons are gone from that card: a tap from a client still showing them switches
+        # nothing and shows a fresh menu in the same place, and that menu acts.
         again = card["buttons"][0]["reply"]
         self.dm_task("task-5", again, reply_to="$card1", click=again)
         self.w.serve()
         self.assertEqual((self.w.result("task-5"), self.w.metrics()[-1]["card"]),
-                         ("[no-send] the model card answers\n", "model-picked"))
-        self.assertEqual(json.loads((self.w.root / "state" / "model.json").read_text())["wanted"], "gemini-3.8-flash-medium")
-        (back,) = self.post_queued("$card4")
-        self.assertIn("Switching to Gemini 3.8 Flash on your next message", back["extra_content"]["space.ag2.card"]["text"])
-        # A newer menu does retire the older one.
-        self.dm_task("task-6", "/model")
-        self.w.serve()
-        self.post_queued("$card5")
-        self.dm_task("task-7", again, reply_to="$card1", click=again)
-        self.w.serve()
-        # A tap on a card that no longer acts says so and shows the current one; nothing is switched.
-        self.assertEqual((self.w.result("task-7").strip(), self.w.metrics()[-1]["card"]),
-                         (gc.quoted(model_switch.EXPIRED).strip(), "model-card-expired"))
-        (fresh,) = self.post_queued("$card6")
-        self.assertEqual((fresh["extra_content"]["space.ag2.card"]["id"], len(fresh["extra_content"]["space.ag2.card"]["buttons"])),
-                         (model_switch.CARD, 2))
-        self.assertEqual(json.loads((self.w.root / "state" / "model.json").read_text())["wanted"], "gemini-3.8-flash-medium")
-        # The fresh card acts; with the bridge down the words say how to get one; another sender's tap
-        # on an old card is refused as before and gets no card.
-        self.dm_task("task-8", said, reply_to="$card6", click=said)
+                         ("[no-send] the model card answers\n", "model-card-expired"))
+        (fresh,) = self.post_queued("$card4")
+        self.assertEqual(((fresh["op"], fresh["event_id"]), fresh["extra_content"]["space.ag2.card"]["id"],
+                          len(fresh["extra_content"]["space.ag2.card"]["buttons"])), (("edit", "$card1"), model_switch.CARD, 2))
+        self.assertEqual(json.loads((self.w.root / "state" / "model.json").read_text())["wanted"], "claude-opus-4-6-thinking")
+        self.dm_task("task-6", again, reply_to="$card1", click=again)
         self.w.serve()
         self.assertEqual(self.w.metrics()[-1]["card"], "model-picked")
-        self.post_queued("$card7")
+        self.assertEqual(json.loads((self.w.root / "state" / "model.json").read_text())["wanted"], "gemini-3.8-flash-medium")
+        (back,) = self.post_queued("$card5")
+        self.assertEqual((back["op"], back["event_id"]), ("edit", "$card1"))
+        self.assertIn("Switching to Gemini 3.8 Flash on your next message", back["extra_content"]["space.ag2.card"]["text"])
+        # A newer menu is a new card; with the bridge down a tap on the old one is answered in words, and
+        # another sender's tap is refused as before and gets no card.
+        self.dm_task("task-7", "/model")
+        self.w.serve()
+        (menu,) = self.post_queued("$card6")
+        self.assertEqual(menu["op"], "message")
         with mock.patch.object(connector_cards, "queue", side_effect=OSError("bridge down")):
             self.dm_task("task-9", again, reply_to="$card1", click=again)
             self.w.serve()
@@ -508,10 +505,11 @@ class ConnectorTest(unittest.TestCase):
         said = "Use Claude Opus 4.6"
         self.dm_task("task-2", said, reply_to="$never-posted", click=said)
         self.w.serve()
-        # The owner's own tap on a card this agent does not keep (an earlier install's, say) is told it
-        # expired and shown the current card; it still picks nothing.
-        self.assertEqual(self.w.result("task-2").strip(), gc.quoted(model_switch.EXPIRED).strip())
-        self.post_queued("$fresh")
+        # The owner's own tap on a card this agent has no record of posting (an earlier install's, say) gets
+        # the current card as a new message, never as an edit of a message it cannot vouch for; it picks nothing.
+        self.assertEqual(self.w.result("task-2"), "[no-send] the model card answers\n")
+        (fresh,) = self.post_queued("$fresh")
+        self.assertEqual((fresh["op"], fresh.get("event_id")), ("message", None))
         self.dm_task("task-3", "/model")
         self.w.serve()
         self.post_queued()
@@ -521,14 +519,15 @@ class ConnectorTest(unittest.TestCase):
             self.w.serve()
             self.assertIn("couldn't match that button", self.w.result(tid), tid)
             self.assertEqual(self.post_queued(), [], tid)
-        # The owner's tap in another DM, or in reply to another event: expired, with a fresh card there.
+        # The owner's tap in another DM, or in reply to another event: a fresh card there, as a new message,
+        # since the place tapped is not a card this agent posted in that room.
         for tid, over, room in (("task-5", dict(channel="!other:s.space"), "!other:s.space"),
                                 ("task-6", dict(reply_to="$other"), self.DM)):
             self.dm_task(tid, said, **dict(dict(reply_to="$card1", click=said), **over))
             self.w.serve()
-            self.assertEqual(self.w.result(tid).strip(), gc.quoted(model_switch.EXPIRED).strip(), tid)
+            self.assertEqual(self.w.result(tid), "[no-send] the model card answers\n", tid)
             (fresh,) = self.post_queued("$f-" + tid)
-            self.assertEqual(fresh["room_id"], room, tid)
+            self.assertEqual((fresh["room_id"], fresh["op"], fresh.get("event_id")), (room, "message", None), tid)
         self.dm_task("task-7", said, reply_to="$f-task-6")
         self.w.serve()
         self.assertIn("didn't arrive as a tap", self.w.result("task-7"))

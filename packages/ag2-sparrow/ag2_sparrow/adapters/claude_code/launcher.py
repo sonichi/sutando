@@ -27,7 +27,7 @@ from pathlib import Path
 from ... import claude_model_switch, connect_common as cm, signin_watch, task_io, tmux_pane_keys, tmux_probe
 from ...file_lock import locked_file
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
-from . import detector, hmac_policy, hold, inbox, trust
+from . import detector, hmac_policy, hold, inbox, quota_card, trust
 from .shape import (AUTOARM_VAR, HITL_ID_PREFIX, LAUNCHER_LOCK, LOCAL, MIN_TMUX, SESSION_NAME, SOCKET_NAME,
                     SOCKET_PATH_MAX, SUPERVISOR_LOCK)
 
@@ -398,6 +398,7 @@ class Launcher:
         self.tm = Tmux(socket_path(config_dir), tmux=found, run=run)
         self.state = cm.stop_state()
         self.observation: dict = {}
+        self.quota_said = ""
         self.created: "str | None" = None
         self.adopted = False
         self.refused = ""
@@ -461,6 +462,7 @@ class Launcher:
         if problem:
             return False, problem
         rec = self.retire_card()
+        self.new_quota_incident()
         nonce = os.urandom(16).hex()
         generation, problem = create_session(self.tm, self.cfg, self.config_dir, self.root, nonce, self.environ, self.run)
         if generation is None:
@@ -492,15 +494,41 @@ class Launcher:
             plugin = records.load_plugin(self.root)
         except records.RecordError:
             plugin = records.empty_plugin()     # a torn record still lets the alarm through
-        plugin = dict(plugin, stuck=inbox.unresolved_stuck(self.root, plugin.get("stuck")),
+        # An entry an earlier session left in the Mod's record is not a turn: it must not read as a stall.
+        plugin = dict(plugin, inflight=inbox.live_inflight(self.root, plugin.get("inflight")),
+                      stuck=inbox.unresolved_stuck(self.root, plugin.get("stuck")),
                       progress_unwritable=records.read_progress_alarm(self.config_dir))
-        self.observation = detector.derive(self.observation, text, plugin, self.clock())
+        # A task's own words on the pane ("... hit its usage limit ...") are not a banner, and no stall.
+        self.observation = detector.derive(self.observation, text, plugin, self.clock(),
+                                           own=quota_card.own_ui(self.root, text))
+        self.quota(text, str((gen or {}).get("nonce") or ""))
         stall = self.observation["stall"]
         if (rec.get("stall") or None) != stall:
             if rec.get("stall"):
                 self.log("progress: the stall %s" % ("cleared" if stall is None else "changed"))
             return self.clear_card(stall, plugin.get("session_id"))
         return rec
+
+    def new_quota_incident(self) -> None:
+        """A session being created (an account switch restarts it) may be on an account at its limit too."""
+        try:
+            quota_card.new_session(self.root)
+        except Exception as e:  # noqa: BLE001 - advisory
+            self.log("quota: new session not recorded (%s: %s)" % (type(e).__name__, str(e)[:120]))
+
+    def quota(self, text: str, session: str = "") -> None:
+        """The usage-limit banner or Claude Code's limit menu on the pane: the owner is told, with the account
+        card, once per limit and on each of their messages left unanswered (quota_card).
+        A notice that cannot be sent never stops the supervisor."""
+        try:
+            done = quota_card.notice(self.root, self.cfg, detector.abnormal_names(text), text,
+                                     lambda *parts: self.log(" ".join(str(p) for p in parts)), now=self.clock,
+                                     session=session)
+        except Exception as e:  # noqa: BLE001 - advisory
+            done = "quota-failed (%s: %s)" % (type(e).__name__, str(e)[:120])
+        if done and done != self.quota_said:
+            self.log("quota: %s" % done)
+        self.quota_said = done or self.quota_said
 
     def raise_card(self, rec: dict, kind: str, failed_check: str) -> dict:
         """One card per incident; the id lives in the supervisor record so a restart resumes it."""
@@ -670,6 +698,9 @@ class Launcher:
             return False, "refused: the session's input box holds unsent text; nothing sent"
         shown = self.tm.capture(gen["pane_id"]) or ""
         before, other, asked = accepted_count(model, shown), shown.count(MODEL_SET), shown.count(MODEL_CONFIRM)
+        # The CLI's own settings file, for a [1m] switch answered without a context size (claude_model_switch.settled).
+        settings = os.path.join(self.cfg["CLAUDE_CONFIG_DIR"], "settings.json") if self.cfg.get("CLAUDE_CONFIG_DIR") else ""
+        base = claude_model_switch.baseline(model, shown, settings)
 
         def keys(*names):
             pred = tmux_pane_keys.predicate(gen["nonce"], gen["pane_pid"], gen["session_id"], gen["session_created"],
@@ -686,7 +717,7 @@ class Launcher:
         answered, deadline, text = False, time.monotonic() + wait_s, shown
         while time.monotonic() < deadline:
             text = self.tm.capture(gen["pane_id"]) or ""
-            if accepted_count(model, text) > before:
+            if accepted_count(model, text) > before or (settings and claude_model_switch.settled(model, text, settings, base)):
                 self.log("model: switched to %s" % model)
                 # The switch happened whether or not it is recorded. The writer's private temp is named as
                 # the start check knows one, so a stop mid-write is swept.
