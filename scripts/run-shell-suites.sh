@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# usage: run-shell-suites.sh [lanes|all] | tail [<shards> <shard>] — lanes = the parallel pool, tail = the
-# process-table suites one at a time (one cost-balanced leg of them with <shards> <shard>); one copy for both jobs.
+# usage: run-shell-suites.sh all | lanes|tail [<shards> <shard>] — lanes = the parallel pool, tail = the
+# process-table suites one at a time; <shards> <shard> runs one cost-balanced leg of either. One copy for every job.
 set -euo pipefail
 PART="${1:-all}"
-usage() { echo "usage: $0 [lanes|all] | tail [<shards> <shard>]" >&2; exit 2; }
+usage() { echo "usage: $0 all | lanes|tail [<shards> <shard>]" >&2; exit 2; }
 case "$PART" in lanes|tail|all) ;; *) usage ;; esac
-TAIL_SHARDS="${2:-}"; TAIL_SHARD="${3:-}"
-if [ -n "$TAIL_SHARDS$TAIL_SHARD" ]; then
-  [ "$PART" = tail ] && [ -n "$TAIL_SHARDS" ] && [ -n "$TAIL_SHARD" ] || usage
+SHARDS="${2:-}"; SHARD="${3:-}"
+if [ -n "$SHARDS$SHARD" ]; then
+  [ "$PART" != all ] && [ -n "$SHARDS" ] && [ -n "$SHARD" ] || usage
 fi
 failed=0
 # Load the known-failures allowlist (suites that fail on ubuntu-latest
@@ -32,10 +32,16 @@ done < "$RECDIR/all"
 comm -23 "$RECDIR/all" "$RECDIR/serial" > "$RECDIR/files"
 # One leg of the tail: the sharder balances by measured cost; the leg is re-sorted
 # because the suites run one at a time, where order buys nothing.
-if [ -n "$TAIL_SHARDS" ]; then
-  bash scripts/shard-by-cost.sh "$TAIL_SHARDS" "$TAIL_SHARD" tests/shell-suite-costs.txt \
+if [ -n "$SHARDS" ] && [ "$PART" = tail ]; then
+  bash scripts/shard-by-cost.sh "$SHARDS" "$SHARD" tests/shell-suite-costs.txt \
     < "$RECDIR/serial" | sort > "$RECDIR/serial.leg"
   mv "$RECDIR/serial.leg" "$RECDIR/serial"
+fi
+# One leg of the lanes keeps the sharder's heaviest-first order, so the pool starts the long suites first.
+if [ -n "$SHARDS" ] && [ "$PART" = lanes ]; then
+  bash scripts/shard-by-cost.sh "$SHARDS" "$SHARD" tests/shell-suite-costs.txt \
+    < "$RECDIR/files" > "$RECDIR/files.leg"
+  mv "$RECDIR/files.leg" "$RECDIR/files"
 fi
 mkdir -p "$RECDIR/serial-rec"
 # Same scheduler as the Python suite: one SERIAL worker per worktree, so

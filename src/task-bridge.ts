@@ -41,14 +41,16 @@ const OWNER_ACTIVITY_FILE = join(STATE_DIR, 'last-owner-activity.json');
 /** Record that the owner was active on <channel> right now. Atomic write
  * via tmp-then-rename. Read by the proactive-loop status-aware-pivot rule.
  * See notes/team-proposal-coord-loop-2026-04-20.md. */
-function writeOwnerActivity(channel: string, summary: string): void {
+function writeOwnerActivity(channel: string, summary: string, docked?: VoiceSessionOrigin | null): void {
 	try {
 		mkdirSync(STATE_DIR, { recursive: true });
-		const payload = {
+		const payload: Record<string, unknown> = {
 			ts: Math.floor(Date.now() / 1000),
 			channel,
 			summary: summary.slice(0, 80),
 		};
+		// Where the session is docked: proactive routing follows `bridge`, never the address.
+		if (docked) { payload.bridge = docked.channel; payload.channel_id = docked.target; }
 		// Per-PID staging: last-owner-activity.json is written by five processes
 		// (this task-bridge + the sparrow/discord/slack/telegram bridges). A shared
 		// '.tmp' name lets two concurrent writers truncate and interleave the same
@@ -919,11 +921,15 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
 	return lines.join('\n') + '\n';
 }
 
-/** Tells the core a voice session ended: its facts as the task line, its spoken lines below. Low priority. */
+/** Tells the core a voice session ended: its facts as the task line, its spoken lines below. Low priority.
+ *  `interaction_type: system_event`, as the phone call-end summary has: the call-end lifecycle wrote it, not
+ *  something the owner said, so readers that put the owner's own requests first (task_watch_owner.py) leave it. */
 export async function submitVoiceSessionEndTask(summary: string, transcript: string): Promise<string> {
 	const taskId = `task-${Date.now()}`;
 	const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
-	const header = buildVoiceTaskHeader(taskId, new Date().toISOString(), ownerId, null).replace('priority: urgent', 'priority: low');
+	const header = buildVoiceTaskHeader(taskId, new Date().toISOString(), ownerId, null)
+		.replace('interaction_type: realtime_audio', 'interaction_type: system_event')
+		.replace('priority: urgent', 'priority: low');
 	const body = transcript ? `\n\n--- the session's spoken lines (may contain ASR errors) ---\n${confineUserContent(transcript)}\n` : '\n';
 	await _delegation.submitTask(taskId, `${header}task: ${confineUserContent(summary)}${body}`);
 	console.log(`${ts()} [TaskBridge] Session-end task: ${taskId}`);
@@ -1290,7 +1296,7 @@ export const workTool: ToolDefinition = {
 		_pendingTasks.set(taskId, pendingEntry());
 		voiceTaskStore.add(taskId, task, undefined, lane);
 		// Record owner activity for status-aware-pivot in proactive loop
-		writeOwnerActivity('voice', task);
+		writeOwnerActivity('voice', task, origin);
 		console.log(`${ts()} [TaskBridge] Task ${taskId}${lane ? ` (${lane})` : ''}: ${task.slice(0, 100)}`);
 		_sendTaskStatus?.(taskId, 'working', task.slice(0, 60));
 		// The user's own voice tasks still open ahead of this one, from the relay agent's table.

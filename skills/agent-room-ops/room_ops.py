@@ -290,9 +290,17 @@ def _run(argv):
     sub.add_parser("capabilities", help="print, as JSON, the subcommands and `say` flags this "
                                         "copy supports, so a caller can pick a capable copy")
 
+    for name in ("say", "send", "mention", "react", "unreact"):
+        sub.choices[name].add_argument(
+            "--task-file", dest="task_file", default=None,
+            help="the task this post answers: in a pool worker's session it posts as the agent "
+                 "the task was addressed to (its own, or the core's)")
+
     ap.add_argument("--strict", action="store_true",
                     help="exit 1 on ok:false; must precede the subcommand (default: always 0)")
     a = ap.parse_args(argv)
+    if getattr(a, "task_file", None) is not None:
+        _gateway.set_task_file(a.task_file)
     if a.cmd == "capabilities":
         say_flags = sorted(o for act in sub.choices["say"]._actions for o in act.option_strings
                            if o.startswith("--") and o != "--help")

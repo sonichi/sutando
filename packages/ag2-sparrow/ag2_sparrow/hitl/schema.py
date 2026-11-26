@@ -20,6 +20,8 @@ NOTICE_FIELD = "space.ag2.hitl_notice"
 # The subject fields a card may show. The rest of `subject` is the producer's own bookkeeping
 # (claims, tokens, leases, session keys) and never leaves the host.
 WIRE_SUBJECT_FIELDS = ("tool", "input", "options", "choices")
+# A recovery card also shows its tap's receipt outcome (hitl.recovery), so a client knows the answer.
+WIRE_RECEIPT_OUTCOMES = ("done", "refused", "stale", "failed")
 
 
 # Canonical JSON's integer range; a number outside it is refused like a float.
@@ -173,6 +175,28 @@ class HumanRequirement:
                 device["host"] = host
         return device
 
+    def wire_outcome(self) -> Optional[Dict[str, str]]:
+        """What came of the human's answer, for the card's result line (the client reads `running`,
+        `done`, `failed` and neutral `closed`): `running` once an answer was taken and is being applied;
+        `done` once the driver that sent it saw the runtime carry on (`subject.driven_settled`);
+        `failed` when a driver gave it up, with the driver's own words (`subject.driver_note`, never
+        `answer`, which holds what the human submitted); `closed` when a driver sent the answer
+        (`subject.driven_at`) and the card closed with no such evidence, which is never read as success.
+        None for a card nobody answered, and for a closed card no driver handled: its status says it."""
+        if not self.chosen_action or self.decided_by == "policy":
+            return None
+        subject = self.subject or {}
+        if self.status == STATUS_IN_PROGRESS:
+            return dict(state="running")
+        note = subject.get("driver_note")
+        if self.status == STATUS_EXPIRED and isinstance(note, str) and note.strip():
+            return dict(state="failed", text=" ".join(note.split())[:200])
+        if self.status == STATUS_RESOLVED and subject.get("driven_settled"):
+            return dict(state="done")
+        if self.terminal and subject.get("driven_at"):
+            return dict(state="closed")
+        return None
+
     def to_wire(self) -> Dict[str, Any]:
         wire: Dict[str, Any] = {
             "id": self.id,
@@ -191,8 +215,20 @@ class HumanRequirement:
         if self.actions:
             wire["actions"] = [a.to_wire() for a in self.actions]
         subject = {k: self.subject[k] for k in WIRE_SUBJECT_FIELDS if k in (self.subject or {})}
+        receipt = (self.subject or {}).get("receipt")
+        if isinstance(receipt, dict) and receipt.get("outcome") in WIRE_RECEIPT_OUTCOMES:
+            # A recovery tap's answer: its outcome and time only, the rest of the receipt stays on the host.
+            at = receipt.get("at")
+            subject["receipt"] = {"outcome": receipt["outcome"],
+                                  **({"at": at} if isinstance(at, int) and not isinstance(at, bool)
+                                     and 0 <= at <= WIRE_INT_MAX else {})}
+        if (self.subject or {}).get("superseded") is True:
+            subject["superseded"] = True  # closed for a fresh card: a done receipt here is not success
         if subject:
             wire["subject"] = subject
+        outcome = self.wire_outcome()
+        if outcome:
+            wire["outcome"] = outcome
         if self.expires_at is not None:
             wire["expires_at"] = self.expires_at
         if self.turn_on_action:

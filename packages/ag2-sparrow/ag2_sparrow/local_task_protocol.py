@@ -391,6 +391,31 @@ _QUOTED_BLOCK = re.compile(
 _JSON_DECODER = json.JSONDecoder()
 
 
+def quoted_block_spans(text: str) -> "tuple[int | None, tuple[int, int, dict, str] | None]":
+    """(where the message after the broker's quoted blocks starts, the reply-context
+    record's (start, end, decoded record, label) or None); (None, None) when a block is malformed."""
+    pos, reply = len(text) - len(text.lstrip()), None
+    for kind in ("room metadata", "reply context"):
+        m = _QUOTED_BLOCK.match(text, pos)
+        if m is None or m.group(1) != kind:
+            continue
+        try:
+            record, end = _JSON_DECODER.raw_decode(text, m.end())
+        except ValueError:
+            return None, None
+        tail = len(text) - len(text[end:].lstrip())
+        closer = next((f"[End {p} {kind}]" for p in _MARKER_PRODUCTS
+                       if text.startswith(f"[End {p} {kind}]", tail)), None)
+        if not isinstance(record, dict) or closer is None:
+            return None, None
+        pos = len(text) - len(text[tail + len(closer):].lstrip())
+        if kind == "reply context":
+            if not isinstance(record.get("sender"), str) or not isinstance(record.get("body"), str):
+                return None, None
+            reply = (m.end(), end, record, m.group(2))
+    return pos, reply
+
+
 def split_reply_context(text: str) -> "tuple[dict | None, str]":
     """({"sender", "body", "label"} of the message an ag2space task replies to, the
     message after the broker's quoted blocks), or (None, text) when there is no
@@ -399,27 +424,11 @@ def split_reply_context(text: str) -> "tuple[dict | None, str]":
     `label` is the broker's own wording from the opening tag, verbatim (None when
     empty). The JSON is decoded whole, so a closing marker inside the quoted body
     cannot end the block early."""
-    rest, reply = text.lstrip(), None
-    for kind in ("room metadata", "reply context"):
-        m = _QUOTED_BLOCK.match(rest)
-        if m is None or m.group(1) != kind:
-            continue
-        try:
-            record, end = _JSON_DECODER.raw_decode(rest, m.end())
-        except ValueError:
-            return None, text
-        tail = rest[end:].lstrip()
-        closer = next((f"[End {p} {kind}]" for p in _MARKER_PRODUCTS
-                       if tail.startswith(f"[End {p} {kind}]")), None)
-        if not isinstance(record, dict) or closer is None:
-            return None, text
-        rest = tail[len(closer):].lstrip()
-        if kind == "reply context":
-            sender, body = record.get("sender"), record.get("body")
-            if not isinstance(sender, str) or not isinstance(body, str):
-                return None, text
-            reply = {"sender": sender, "body": body, "label": m.group(2).strip() or None}
-    return (reply, rest) if reply is not None else (None, text)
+    pos, reply = quoted_block_spans(text)
+    if reply is None:
+        return None, text
+    record, label = reply[2], reply[3]
+    return {"sender": record["sender"], "body": record["body"], "label": label.strip() or None}, text[pos:]
 
 
 # A run of >=3 leading '=' opens a writer's ===SKILL …=== / ===SUTANDO …=== block;
@@ -890,12 +899,65 @@ def find_result(results_dir: Path, task_id: str) -> Path | None:
     return next(iter_result_candidates(results_dir, task_id), None)
 
 
+# Month-dir discovery is cached against the archive root's own mtime.
+_MONTH_DIRS_CACHE: dict[str, tuple[int, list[str]]] = {}
+_MONTH_DIRS_CACHE_MAX = 128
+
+
+def _month_partitions(archive_root: Path) -> list[str]:
+    """Ascending month-dir names under `archive_root`, cached per mtime.
+
+    The month list is derived data that changes only when the archive root's
+    own contents change, but discovering it costs a full root scandir — and
+    find_archived_task runs per candidate inside pollers (the Discord bridge
+    re-examines up to 25 orphaned results every second through
+    orphan_result_routes). Re-discovering the months on every call put that
+    scandir on the hot path: on a fixture sized like a long-lived host
+    (50k flat entries + 24 month dirs) the rediscovery was ~94% of every
+    orphan-scan tick — pure interpreter time re-matching month names that had
+    not changed, while the bridge busy-looped at ~100% of one core.
+
+    Entries are keyed by the root's st_mtime_ns so a hit can never go stale:
+    creating, removing or renaming anything directly under the root —
+    including a new YYYY-MM/ partition — bumps that mtime (filesystem mtime
+    granularity bounds the guarantee to per-timestamp, not per-call). A
+    scandir that FAILS is never cached, so "missing/unreadable archive is no
+    months" stays true call-to-call exactly as before the cache.
+
+    Dictionary ops are GIL-atomic; the worst races are a duplicate scan or a
+    briefly superseded entry, and every caller re-examines its candidates on
+    a later poll anyway.
+    """
+    mtime_ns = None
+    try:
+        mtime_ns = archive_root.stat().st_mtime_ns
+        hit = _MONTH_DIRS_CACHE.get(str(archive_root))
+        if hit is not None and hit[0] == mtime_ns:
+            return hit[1]
+    except OSError:
+        pass               # unstatable root: no cached answer; the scan decides
+    try:
+        with os.scandir(archive_root) as entries:
+            months = sorted(e.name for e in entries
+                            if _MONTH_DIR_RE.match(e.name) and e.is_dir())
+    except (OSError, ValueError):
+        return []          # missing/unreadable archive is "no months", not an error
+    if mtime_ns is not None:
+        if len(_MONTH_DIRS_CACHE) >= _MONTH_DIRS_CACHE_MAX:
+            _MONTH_DIRS_CACHE.clear()
+        _MONTH_DIRS_CACHE[str(archive_root)] = (mtime_ns, months)
+    return months
+
+
 def find_archived_task(tasks_dir: Path, task_id: str, *, include_live: bool = True) -> Path | None:
     """Locate a task file across the live dir, the legacy flat archive, and
     the month-partitioned archive — the same candidate set task-bridge's
     `_isVoiceTask` walks. Returns the first existing path or None. Rejects
     malformed ids rather than globbing with them (traversal gate).
     `include_live=False` skips the live dir: archives only.
+
+    The month scan is cached against the archive root's mtime — see
+    `_month_partitions`.
 
     The month scan uses `os.scandir` and filters on the NAME before asking
     whether the entry is a directory. The archive root holds one file per
@@ -923,12 +985,7 @@ def find_archived_task(tasks_dir: Path, task_id: str, *, include_live: bool = Tr
         return None
     dirs = ([tasks_dir] if include_live else []) + [tasks_dir / "processed", tasks_dir / "archive"]
     archive_root = tasks_dir / "archive"
-    try:
-        with os.scandir(archive_root) as entries:
-            months = sorted(e.name for e in entries
-                            if _MONTH_DIR_RE.match(e.name) and e.is_dir())
-    except (OSError, ValueError):
-        months = []          # missing/unreadable archive is "no months", not an error
+    months = _month_partitions(archive_root)
     dirs.extend(archive_root / m for m in months)
     for d in dirs:
         # Shared owner picks among collision suffixes: `<id>.txt` is the OLDEST

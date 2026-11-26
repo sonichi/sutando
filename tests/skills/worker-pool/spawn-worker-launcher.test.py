@@ -284,6 +284,118 @@ class TestSpawn(Base):
         for core_only in ("SUTANDO_CORE_ID", "SUTANDO_CORE_POOL_SIZE", "SUTANDO_WORKER_SEAT"):
             self.assertNotIn(core_only, env)
 
+    def test_the_launcher_is_told_the_run_it_starts(self):
+        """A Codex seat stamps this id on its declaration, so a later TUI run under the same
+        session name is not mistaken for the seat."""
+        t = FakeTmux()
+        got = sw.spawn(self.ws, REPO, runner=t, require_sentinel=False)
+        env = t.launches()[0]
+        (run,) = wi.incarnations(self.ws, got["worker_id"])
+        self.assertEqual(env["SUTANDO_WORKER_INCARNATION_ID"], run["incarnation_id"])
+
+    def test_a_codex_recovery_names_its_new_run_not_the_previous_one(self):
+        wid = "d" * 32
+        wi.create_worker(self.ws, runtime="codex", worker_id=wid, cwd=str(REPO))
+        (first,) = wi.incarnations(self.ws, wid)
+        wi.end_incarnation(self.ws, wid, first["incarnation_id"], "crashed")
+        t = FakeTmux(runtime="codex")
+        with mock.patch.object(sw.pr, "load_roster",
+                               return_value={"workers": {wid: {"runtime": "codex"}}}):
+            sw.spawn(self.ws, REPO, runtime="codex", existing_worker_id=wid,
+                     runner=t, require_sentinel=False)
+        env = t.launches()[0]
+        newest = wi.incarnations(self.ws, wid)[-1]
+        self.assertEqual(env["SUTANDO_WORKER_INCARNATION_ID"], newest["incarnation_id"])
+        self.assertNotEqual(newest["incarnation_id"], first["incarnation_id"])
+
+    def test_a_codex_recovery_that_loses_the_session_closes_its_run(self):
+        """A competing launch won the session name between the probe and the launcher: the
+        losing attempt's run is closed, so the open run stays the winner's (pool_sessions)."""
+        wid = "e" * 32
+        wi.create_worker(self.ws, runtime="codex", worker_id=wid, cwd=str(REPO))
+        (first,) = wi.incarnations(self.ws, wid)
+        wi.end_incarnation(self.ws, wid, first["incarnation_id"], "crashed")
+
+        class LosesTheName(FakeTmux):
+            def __call__(self, argv, **kw):
+                if argv[0] == "bash" and argv[1].endswith("launch-worker-session.sh"):
+                    self.calls.append(argv); self.envs.append(dict(kw.get("env") or {}))
+                    self.existing.add(kw["env"]["SUTANDO_TMUX_SESSION"])
+                    return subprocess.CompletedProcess(argv, sw.LAUNCH_LOST, "", "another launch holds it")
+                return super().__call__(argv, **kw)
+
+        t = LosesTheName(runtime="codex")
+        with mock.patch.object(sw.pr, "load_roster",
+                               return_value={"workers": {wid: {"runtime": "codex"}}}):
+            with self.assertRaisesRegex(sw.SpawnRefused, "another launch holds"):
+                sw.spawn(self.ws, REPO, runtime="codex", existing_worker_id=wid,
+                         runner=t, require_sentinel=False)
+        losing = wi.incarnations(self.ws, wid)[-1]
+        self.assertEqual(losing["incarnation_id"], t.launches()[0]["SUTANDO_WORKER_INCARNATION_ID"])
+        self.assertEqual(losing["end_reason"], "superseded")
+        self.assertTrue(wi.worker_dir(self.ws, wid).is_dir())
+
+    def test_a_lost_code_with_no_session_is_an_ordinary_failure(self):
+        class LostButNothingThere(FakeTmux):
+            def __call__(self, argv, **kw):
+                if argv[0] == "bash" and argv[1].endswith("launch-worker-session.sh"):
+                    self.calls.append(argv); self.envs.append(dict(kw.get("env") or {}))
+                    return subprocess.CompletedProcess(argv, sw.LAUNCH_LOST, "", "new-session failed")
+                return super().__call__(argv, **kw)
+
+        with self.assertRaisesRegex(sw.SpawnRefused, "the runtime launcher failed"):
+            sw.spawn(self.ws, REPO, runner=LostButNothingThere(), require_sentinel=False)
+
+    def test_two_competing_codex_launches_are_serialized(self):
+        """A second spawn of the same worker while the first is inside its launcher is refused
+        before it registers a run or reaches a launcher, so the open run is the first's."""
+        wid = "f" * 32
+        wi.create_worker(self.ws, runtime="codex", worker_id=wid, cwd=str(REPO))
+        (first,) = wi.incarnations(self.ws, wid)
+        wi.end_incarnation(self.ws, wid, first["incarnation_id"], "crashed")
+        roster = {"workers": {wid: {"runtime": "codex"}}}
+        ws, seen = self.ws, {}
+
+        class CompetesDuringLaunch(FakeTmux):
+            def __call__(self, argv, **kw):
+                if argv[0] == "bash" and argv[1].endswith("launch-worker-session.sh") and not seen:
+                    seen["rows"] = len(wi.incarnations(ws, wid))
+                    try:
+                        sw.spawn(ws, REPO, runtime="codex", existing_worker_id=wid,
+                                 runner=FakeTmux(runtime="codex"), require_sentinel=False)
+                    except sw.SpawnRefused as e:
+                        seen["refused"] = str(e)
+                    seen["rows_after"] = len(wi.incarnations(ws, wid))
+                return super().__call__(argv, **kw)
+
+        t = CompetesDuringLaunch(runtime="codex")
+        with mock.patch.object(sw.pr, "load_roster", return_value=roster):
+            sw.spawn(self.ws, REPO, runtime="codex", existing_worker_id=wid,
+                     runner=t, require_sentinel=False)
+        self.assertIn("is in progress", seen["refused"])
+        self.assertEqual(seen["rows_after"], seen["rows"])
+        self.assertEqual(len(t.launches()), 1)
+        open_runs = [r for r in wi.incarnations(self.ws, wid) if r["ended_at"] is None]
+        self.assertEqual([r["incarnation_id"] for r in open_runs],
+                         [t.launches()[0]["SUTANDO_WORKER_INCARNATION_ID"]])
+
+    def test_a_viewers_brief_shared_hold_is_waited_out(self):
+        import fcntl
+        import threading
+        name = "sutando-worker-" + "a" * 32
+        path = self.ws / "state" / "worker-launch" / f"{name}.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(path, "a+")
+        fcntl.flock(fh, fcntl.LOCK_SH)
+        threading.Timer(0.2, lambda: (fcntl.flock(fh, fcntl.LOCK_UN), fh.close())).start()
+        with sw.launch_lock(self.ws, name, wait=2.0):
+            pass
+
+    def test_the_launch_lock_is_released_after_a_spawn(self):
+        got = sw.spawn(self.ws, REPO, runner=FakeTmux(), require_sentinel=False)
+        with sw.launch_lock(self.ws, got["tmux"]["session_name"]):
+            pass
+
     def test_the_delivery_folder_matches_the_identity_record(self):
         """A record naming one id and a folder named another is a silent orphan."""
         got = sw.spawn(self.ws, REPO, runner=FakeTmux(), require_sentinel=False)
@@ -374,6 +486,22 @@ class TestRuntimeStartFailure(Base):
                          require_sentinel=False)
         finally:
             wi.new_worker_id = orig
+
+    def test_retained_guidance_uses_shared_formatter_without_changing_coordinates(self):
+        socket = "/tmp/worker's $literal socket"
+        wid = "8" * 32
+        with mock.patch.object(wi, "new_worker_id", return_value=wid), \
+                mock.patch.object(sw, "attach_command", return_value="formatted attach") as fmt:
+            with self.assertRaises(sw.SpawnRetained) as caught:
+                sw.spawn(self.ws, REPO, socket=socket, runner=FakeTmuxSlowStart(),
+                         require_sentinel=False)
+        name = wi.tmux_session_name(wid)
+        fmt.assert_called_once_with(socket, name)
+        self.assertIn("Attach with `formatted attach`", str(caught.exception))
+        self.assertEqual(caught.exception.tmux_socket, socket)
+        self.assertEqual(caught.exception.tmux_session, name)
+        self.assertEqual(caught.exception.worker_id, wid)
+        self.assertEqual(caught.exception.delivery_dir, str(self.ws / "deliveries" / wid))
 
 
     def test_an_unanswerable_tmux_probe_keeps_the_worker(self):

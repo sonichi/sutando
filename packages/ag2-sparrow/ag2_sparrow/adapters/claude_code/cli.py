@@ -17,6 +17,8 @@ card. The relay token stays in Sparrow's env file, the Claude login in its confi
 from __future__ import annotations
 
 import argparse
+import getpass
+import json
 import os
 import re
 import shutil
@@ -33,7 +35,7 @@ from ...connect_bridge import (DECLARATION, EXTERNAL, SEAT_ENV_KEEP, STATUS_MAX_
                                vault_key, worker_name)
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, Shape, _v  # noqa: F401
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
-from . import detector, hmac_policy, hold, inbox, launcher, trust
+from . import account as accounts, detector, hmac_policy, hold, inbox, launcher, trust
 from .shape import AUTOARM_VAR, BRIDGE, HITL_ROOT_NAME, LOCAL, PLUGIN, SESSION_NAME, resolve_plugin_dir  # noqa: F401
 
 SHAPE, COMMAND, MIN_CLI = LOCAL.name, LOCAL.command, LOCAL.min_version
@@ -196,11 +198,11 @@ def resolve_tmux(args, shape: Shape = LOCAL) -> "tuple[str, str]":
 
 
 # What a repair `install <selector>` takes from the job's recorded config: (key, option, value).
-RECORDED = (("CLAUDE", "claude", str), ("PLUGIN_DIR", "plugin_dir", lambda v: v if v and resolve_plugin_dir(v)[1] is False else ""),
+RECORDED = (("CLAUDE", "claude", str), ("PLUGIN_DIR", "plugin_dir", lambda v: v if v and resolve_plugin_dir(v) == (Path(v), False) else ""),
             ("CLAUDE_CONFIG_DIR", "claude_config_dir", str),
             ("HMAC_KEY_FILE", "hmac_key_file", str), ("PERMISSION_MODE", "permission_mode", str), ("TMUX", "tmux", str),
             ("HMAC_STRICT", "no_hmac_strict", lambda v: v == hmac_policy.OPT_OUT),
-            (inbox.ALLOW_NON_OWNER, "allow_non_owner", lambda v: v == "1"),
+            (inbox.ALLOW_NON_OWNER, "non_owner", lambda v: "0" if v == "0" else ""),
             (inbox.ALLOW_COLLABORATOR, "collaborator", lambda v: "0" if v == "0" else ""))
 
 
@@ -227,6 +229,7 @@ def install(args) -> int:
 
 
 def _install(args) -> int:
+    cm.take_over(args)
     if getattr(args, "token_stdin", False):
         return cb.install_token_stdin(args, LOCAL, lambda: connect_preflight(args, login=False), _install, COMMAND,
                                       work=None, inbox=None, bridge_state_dir=None)
@@ -283,7 +286,7 @@ def _install(args) -> int:
               "CLAUDE_CONFIG_DIR": str(Path(args.claude_config_dir).expanduser().resolve()) if args.claude_config_dir else "",
               "HMAC_KEY_FILE": key_file, "HMAC_STRICT": "1" if strict else hmac_policy.OPT_OUT if args.no_hmac_strict else "",
               "PERMISSION_MODE": args.permission_mode, "SESSION_ID": "", "HITL_STORE": str(card.store_root(state)),
-              inbox.ALLOW_NON_OWNER: "1" if args.allow_non_owner else "",
+              inbox.ALLOW_NON_OWNER: "0" if args.non_owner == "0" else "1",
               inbox.ALLOW_COLLABORATOR: "0" if args.collaborator == "0" else "1", "AGENT_ID": agent_id, "BRIDGE": mode,
               "TOKEN_ENV_FILE": where["token_file"],
               "TOKEN_VAULT_KEY": vault_key(segment) if mode not in (UNIT, EXTERNAL) and not where["token_file"] else "",
@@ -541,9 +544,9 @@ def verify(args) -> int:
     if hmac_policy.legacy_opt_out(cfg):
         print("WARN hmac mode: legacy opt-out (HMAC_STRICT recorded empty by an older install --no-hmac-strict): not "
               "strict; unsigned and unverifiable envelopes are submitted. Reinstall without --no-hmac-strict for strict")
-    print("INFO non-owner tasks: " + ("refused: a restricted turn must be isolated and read-only, and this adapter "
-                                      "runs every turn in the owner's session (--allow-non-owner is recorded, not "
-                                      "honoured)" if cfg.get(inbox.ALLOW_NON_OWNER) == "1" else "refused (owner only)"))
+    print("INFO non-owner tasks: " + ("refused (--no-allow-non-owner)" if cfg.get(inbox.ALLOW_NON_OWNER) == "0"
+                                      else "answered on an isolated read-only `claude -p` turn, never this session "
+                                           "(the default; --no-allow-non-owner opts out)"))
     print("INFO collaborator tasks: " + ("refused (--no-allow-collaborator)" if cfg.get(inbox.ALLOW_COLLABORATOR) == "0"
                                          else "submitted into this session with the non-owner note (the default; "
                                               "--no-allow-collaborator opts out)"))
@@ -634,7 +637,8 @@ def list_cmd(_args) -> int:
 
 def attach(args) -> int:
     """tmux attach on the job's socket: the same session, under the same lock; /exit ends it and
-    the launcher starts the next one by id."""
+    the launcher starts the next one by id. With --view the client is read-only: tmux itself takes
+    no key from it but detach, so a window that only shows the session cannot type into it."""
     local = selected(args)
     if local is None:
         return EXIT_UNUSABLE
@@ -647,7 +651,135 @@ def attach(args) -> int:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
     sock = str(launcher.socket_path(config_dir(local)))
-    os.execv(tmux, [tmux, "-u", "-S", sock, "attach", "-t", "=%s" % SESSION_NAME])
+    view = ["-f", "read-only,ignore-size"] if getattr(args, "view", False) else []
+    os.execv(tmux, [tmux, "-u", "-S", sock, "attach"] + view + ["-t", "=%s" % SESSION_NAME])
+
+
+# What the app's settings page offers: the aliases Claude Code's /model takes (claude_model_switch.MODEL_RE).
+MODELS = (("default", "Default"), ("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku"), ("fable", "Fable"))
+
+
+def model(args) -> int:
+    """Print the agent's model, or switch the running session's with Claude Code's own /model."""
+    local = selected(args)
+    if local is None:
+        return EXIT_UNUSABLE
+    cfg, problem = load_config(local)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    if not args.model:
+        # `current` is the model Claude Code last said it switched to (none: the CLI's own default); every
+        # turn runs in the one session, whoever sends it, and a restart keeps it (hold.claude_argv).
+        now = launcher.switched_model(cm.work_root(cfg)) or None
+        # `pending` is a pick kept for the session's next start: it could not be typed when it was made.
+        print(json.dumps({"model": now, "current": now, "available": [{"id": m, "name": n} for m, n in MODELS],
+                          "pending": launcher.wanted_model(cm.work_root(cfg)) or None}))
+        return 0
+    lc = launcher.Launcher(cfg, config_dir(local))
+    switched, line = lc.switch_model(records.load_supervisor(cm.work_root(cfg)), args.model, confirm=args.confirm,
+                                     pend=True)
+    pending = not switched and launcher.wanted_model(cm.work_root(cfg)) == args.model
+    print(json.dumps({"switched": switched, "model": args.model, "detail": line,
+                      **({"pending": args.model} if pending else {})}))
+    return 0 if switched or pending else 1
+
+
+ROUTE_NOTE = ("from here I cannot tell whether this agent's session goes through the credential proxy; if it does, "
+              "the proxy's sign-in decides its account and this one changes nothing. Ask the agent which account it is "
+              "on to check")
+NOT_AT_A_TERMINAL = ("a sign-in is started only at a terminal: in the app, open Settings, this agent's Connections "
+                     "card, Switch account (the code goes into the app's own box, never into a chat). Nothing was done")
+
+
+def account_env(cfg: dict, local) -> dict:
+    """What `claude auth` runs under for this agent: the allowlist of this command's own environment
+    and the agent's config dir. Run by the agent, that is its session's environment, proxy address
+    included. Run at a terminal it is the person's, which says nothing of the session's: the session's
+    environment is not read from outside it."""
+    return child_env(cfg)
+
+
+def other_agents_dirs(local) -> list:
+    """The Claude config dirs of every other installed job, for the "is this dir this agent's alone" check."""
+    mine, found = config_path(local), []
+    try:
+        paths = sorted(cm.config_root().rglob("*.conf"))
+    except OSError:
+        return found
+    for path in paths:
+        if path != mine:
+            found.append(cm.read_config_lenient(path).get("CLAUDE_CONFIG_DIR") or "")
+    return [d for d in found if d]
+
+
+def sign_in_refused() -> str:
+    """'' when this run may start or finish a sign-in, else why not: only with a terminal on its input.
+    That is a person at a terminal, or the app's settings, which run the command under one. An agent's
+    own shell has none, so no message in a room, whoever sent it, can have the agent sign in or hand a
+    sign-in link or code through a chat."""
+    return "" if sys.stdin.isatty() else NOT_AT_A_TERMINAL
+
+
+def typed_code() -> str:
+    """The code the sign-in page showed, typed at the terminal without being echoed (so it is in no
+    scrollback or recording); from a stream that is not a terminal it is read as a line."""
+    return getpass.getpass("") if sys.stdin.isatty() else sys.stdin.readline()
+
+
+START_SAY = ("Open this link and sign in, then enter the code the page shows where you started this (the link "
+             "works for 10 minutes, the code once): %s")
+
+
+def account(args) -> int:
+    """Print the Anthropic account of the agent's Claude config dir, or sign it in again in the browser
+    of this computer. A new sign-in applies when the session next starts."""
+    local = selected(args)
+    if local is None:
+        return EXIT_UNUSABLE
+    cfg, problem = load_config(local)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    env, changed = account_env(cfg, local), ""
+    # At a terminal a missing proxy address is not an answer: the session may still have one.
+    unknown_route = sys.stdin.isatty() and not env.get(accounts.PROXY_VAR)
+    waiting = config_dir(local) / "account-sign-in"
+    if args.cancel:
+        print(json.dumps({"changed": "", "cancelled": accounts.cancel(waiting)}))
+        return 0
+    if args.start or args.switch or args.code:
+        refused = sign_in_refused()
+        if refused:
+            print(json.dumps({"changed": "", "detail": refused, **accounts.status(cfg, env)}))
+            return 1
+    others = other_agents_dirs(local) if args.start or args.switch else ()
+    if args.start:
+        try:
+            link = accounts.start(cfg, env, waiting, console=args.console, others=others)
+        except accounts.Refused as e:
+            print(json.dumps({"changed": "", "detail": str(e), **accounts.status(cfg, env)}))
+            return 1
+        print(json.dumps({"changed": "", "link": link, "say": START_SAY % link}))
+        return 0
+    if args.switch or args.code:
+        try:
+            ok, detail = (accounts.give_code(waiting, typed_code()) if args.code else
+                          accounts.sign_in(cfg, env, console=args.console, others=others, state_dir=waiting))
+        except accounts.Refused as e:
+            ok, detail = False, str(e)
+        if not ok:
+            print(json.dumps({"changed": "", "detail": detail, **accounts.status(cfg, env)}))
+            return 1
+        changed = "account"
+    state = accounts.status(cfg, env)
+    out = {"changed": changed, **state, "say": accounts.words(state)}
+    if unknown_route:
+        out.update(proxy=None, **({"note": ROUTE_NOTE} if changed else {}))
+    if changed:
+        out["restart"] = "the running session keeps the sign-in it started with; the new one applies when it next starts"
+    print(json.dumps(out))
+    return 0
 
 
 def stop(args) -> int:
@@ -687,11 +819,15 @@ def session_options(p) -> None:
                     "--hmac-key-file)")
     hm.add_argument("--no-hmac-strict", action="store_true", help="with --hmac-key-file, also submit unsigned and "
                     "unverifiable envelopes")
-    p.add_argument("--allow-non-owner", action="store_true", help="recorded but not honoured here: senders "
-                   "without collaborator access (guests, and any collaborator claim the broker did not attest) get "
-                   "a restricted turn, which must be isolated and read-only, and this adapter only runs turns in the "
-                   "owner's session, so they always get the owner-only refusal. An attested collaborator is not "
-                   "covered by it: see --no-allow-collaborator")
+    no = p.add_mutually_exclusive_group()
+    no.add_argument("--allow-non-owner", dest="non_owner", action="store_const", const="1", help="answer senders "
+                    "without collaborator access (guests, plain team, and any collaborator claim the broker did not "
+                    "attest) on an isolated read-only turn, never this session: a fresh `claude -p` on the agent's "
+                    "login with the three read tools in an empty directory, no connector, MCP server, plugin, hook or "
+                    "history, never saved (the default; kept so older install lines still work). An attested "
+                    "collaborator is not covered by it: see --no-allow-collaborator")
+    no.add_argument("--no-allow-non-owner", dest="non_owner", action="store_const", const="0", help="refuse those "
+                    "senders with the owner-only line instead of answering them on the isolated turn")
     co = p.add_mutually_exclusive_group()
     co.add_argument("--allow-collaborator", dest="collaborator", action="store_const", const="1", help="submit attested collaborators' (Team) tasks "
                     "into this session with the non-owner note (the default; kept so older install lines still work). "
@@ -723,6 +859,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("install", help="record the paths, mint the session id, write the unit, have the manager "
                        "start the session (a reinstall stops the old one first)")
+    cm.replace_option(p)
     p.add_argument("--work", help="an explicit work root, served by a bridge you run (default: the agent's own "
                    "root, <agents dir>/<agent id>, whose bridge install wires)")
     p.add_argument("--inbox", help="an explicit work root by its <work>/tasks, as your bridge's task dir; the "
@@ -768,11 +905,34 @@ def main(argv=None) -> int:
                    "what you type is the session's (a /exit ends it and the launcher resumes it by id); /clear and "
                    "an in-pane /resume are not supported (the Mod stops intake on a session-id change: use "
                    "/compact or install --new-session); detach with the tmux prefix + d, never kill the server")
-    agent_option(sub.add_parser("attach", help=attach_help, description=attach_help)).set_defaults(func=attach)
+    at = agent_option(sub.add_parser("attach", help=attach_help, description=attach_help))
+    at.add_argument("--view", action="store_true", help="look without typing: a read-only tmux client, which takes "
+                    "no key but detach. Limit: while it is the only client the pane still takes its size")
+    at.set_defaults(func=attach)
     s = agent_option(sub.add_parser("stop", help="confirm the open stall card's Stop on this machine (requires --confirm)"))
     s.add_argument("--confirm", action="store_true")
     s.set_defaults(func=stop)
     agent_option(sub.add_parser("verify", help="check every part")).set_defaults(func=verify)
+    m = agent_option(sub.add_parser("model", help="print the agent's model, or switch the running session's without "
+                                                   "a restart (Claude Code's own /model, typed for you)"))
+    m.add_argument("model", nargs="?", help="default, opus, sonnet, haiku, fable or a claude-* id; omit to print")
+    m.add_argument("--confirm", action="store_true", help="answer Claude Code's confirm dialog (a switch inside a "
+                                                           "running conversation)")
+    m.set_defaults(func=model)
+    a = agent_option(sub.add_parser("account", help="print the Anthropic account of the agent's Claude config dir, or "
+                                    "sign it in again; a new sign-in applies when the session next starts"))
+    a.add_argument("--switch", action="store_true", help="sign in again: Claude Code's sign-in page opens in the browser "
+                   "of this computer, and the command waits until it is finished there. Refused for an agent behind "
+                   "the credential proxy, whose own sign-in decides the account")
+    a.add_argument("--start", action="store_true", help="sign in again from anywhere, step 1: print the link of the "
+                   "sign-in page and leave the sign-in waiting 10 minutes for its code. A sign-in (--start, --code, "
+                   "--switch) runs only with a terminal on its input: by hand, or from the app's settings")
+    a.add_argument("--code", action="store_true", help="step 2: read the code the sign-in page showed from standard "
+                   "input (never an argument) and finish the waiting sign-in")
+    a.add_argument("--cancel", action="store_true", help="end a waiting sign-in")
+    a.add_argument("--console", action="store_true", help="with --switch or --start: sign in with an Anthropic Console "
+                   "account in place of a Claude subscription")
+    a.set_defaults(func=account)
     agent_option(sub.add_parser("uninstall", help="stop the job and the session, then remove what install wrote "
                                 "(config last)")).set_defaults(func=uninstall)
     sub.add_parser("list", help="each job installed here: its agent, the manager's state, its work root and the "

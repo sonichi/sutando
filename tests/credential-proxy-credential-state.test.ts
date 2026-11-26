@@ -51,7 +51,7 @@ async function startUpstream(): Promise<number> {
 
 async function startProxy(upstreamPort: number): Promise<number> {
 	return listen(createProxyServer({
-		scopedService: null, // a plain install: not the runner's own CLAUDE_CONFIG_DIR
+		scopedItem: null, // a plain install: not the runner's own CLAUDE_CONFIG_DIR
 		configDir: '',
 		readCredCandidates: () =>
 			keychain ? [{ service: keychain.service, oauth: { ...keychain.oauth } }] : [],

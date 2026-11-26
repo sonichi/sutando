@@ -97,7 +97,7 @@ async function startProxy(extra: Partial<ProxyDeps> = {}): Promise<number> {
 	}));
 	return listen(createProxyServer({
 		readCredCandidates: () => readCredCandidates(keychainServiceCandidates(CORE_DIR), fakeSecurity),
-		scopedService: SCOPED,
+		scopedItem: SCOPED,
 		configDir: CORE_DIR,
 		// A refresh lands in the item it was read from, as the real writeCred does.
 		writeCred: (service, oauth) => { items[service] = JSON.stringify({ claudeAiOauth: oauth }); return true; },
@@ -208,7 +208,7 @@ test('no CLAUDE_CONFIG_DIR: the default item is the right one, not a fallback â€
 	items = { [DEFAULT]: item(SHARED_TOKEN) };
 	const port = await startProxy({
 		readCredCandidates: () => readCredCandidates(keychainServiceCandidates(''), fakeSecurity),
-		scopedService: null,
+		scopedItem: null,
 		configDir: '',
 	});
 
@@ -359,7 +359,7 @@ test('(e) no config dir: a rejected default token still recovers by refresh and 
 	upstreamHandler = rejecting(SHARED_TOKEN);
 	const port = await startProxy({
 		readCredCandidates: () => readCredCandidates(keychainServiceCandidates(''), fakeSecurity),
-		scopedService: null,
+		scopedItem: null,
 		configDir: '',
 	});
 
@@ -374,7 +374,7 @@ test('(e2) no config dir: recovery fails â†’ the upstream 401 is returned, the c
 	upstreamHandler = rejecting(SHARED_TOKEN);
 	const port = await startProxy({
 		readCredCandidates: () => readCredCandidates(keychainServiceCandidates(''), fakeSecurity),
-		scopedService: null,
+		scopedItem: null,
 		configDir: '',
 	});
 

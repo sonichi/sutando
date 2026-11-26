@@ -18,7 +18,8 @@ import sys
 import time
 from pathlib import Path
 
-from ... import connect_common as cm, task_io
+from ... import claude_local_records as records, claude_model_switch, connect_common as cm, task_io
+from ...file_lock import locked_file
 from . import inbox
 from .shape import LOCAL, resolve_plugin_dir
 
@@ -112,12 +113,62 @@ def _alive(pid: int) -> bool:
     return True
 
 
+MODEL_RECORD = ("state", "model-switch.json")
+MODEL_LOCK = ("state", "model-switch.lock")   # every read-then-write of MODEL_RECORD holds it
+
+
+def switched_model(root) -> str:
+    """The model the owner last switched the session to (`model`, the record the launcher writes once
+    Claude Code said "Set model to"), '' when none or one /model would not take."""
+    try:
+        with open(Path(root or ".").joinpath(*MODEL_RECORD), encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    model = str(record.get("model") or "") if isinstance(record, dict) else ""
+    return model if claude_model_switch.MODEL_RE.match(model) else ""
+
+
+def wanted_model(root) -> str:
+    """A pick the settings page saved while the session could not take /model (`wanted`): the next start
+    runs on it. '' when none."""
+    try:
+        with open(Path(root or ".").joinpath(*MODEL_RECORD), encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    model = str(record.get("wanted") or "") if isinstance(record, dict) else ""
+    return model if claude_model_switch.MODEL_RE.match(model) else ""
+
+
+def write_model_record(root, record: dict) -> None:
+    try:
+        records.write_durable(Path(root or ".").joinpath(*MODEL_RECORD), json.dumps(record).encode())
+    except records.RecordError as e:
+        raise OSError(str(e)) from e
+
+
+def settle_wanted(root, now=time.time) -> str:
+    """At a session's start: a waiting pick becomes the session's model (`--model` starts it on that one).
+    The pick, or '' when none waited or the record could not be written (the start then keeps the old model)."""
+    try:
+        with locked_file(Path(root or ".").joinpath(*MODEL_LOCK)):
+            wanted = wanted_model(root)
+            if wanted:
+                write_model_record(root, {"model": wanted, "at": now()})
+            return wanted
+    except OSError:
+        return ""
+
+
 def claude_argv(cfg: dict, session_id: str) -> list:
-    """`claude --plugin-dir … --permission-mode … --resume|--session-id <id>`: resume when the
-    transcript exists under the session's config dir, else start it under that id."""
+    """`claude --plugin-dir … --permission-mode … --resume|--session-id <id> [--model <m>]`: resume when
+    the transcript exists under the session's config dir, else start it under that id. A session the
+    owner switched starts again on that model: the pick outlives a restart, for every sender's turn."""
     flag = "--resume" if transcript_exists(cfg.get("CLAUDE_CONFIG_DIR", ""), session_id) else "--session-id"
+    model = switched_model(cfg.get("ROOT"))
     return [cfg["CLAUDE"], "--plugin-dir", str(resolve_plugin_dir(cfg["PLUGIN_DIR"])[0]), "--permission-mode",
-            cfg.get("PERMISSION_MODE") or "bypassPermissions", flag, session_id]
+            cfg.get("PERMISSION_MODE") or "bypassPermissions", flag, session_id] + (["--model", model] if model else [])
 
 
 TITLE_OFF_VAR = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE"
@@ -214,6 +265,9 @@ def _held(root, cfg, session_id, nonce, env, popen, state) -> int:
         return "%d:%d" % (st.st_dev, st.st_ino), ""
 
     def spawn(inode):
+        picked = settle_wanted(cfg.get("ROOT"))
+        if picked:
+            print("hold: starting on %s, the model picked while the session could not switch" % picked, file=sys.stderr)
         child, pipe["go_w"] = spawn_shim(claude_argv(cfg, session_id), child_env(env, inode), popen)
         return child
 

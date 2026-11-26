@@ -59,7 +59,7 @@ async function startUpstream(): Promise<number> {
 
 async function startProxy(upstreamPort: number, extra: Partial<ProxyDeps> = {}): Promise<number> {
 	return listen(createProxyServer({
-		scopedService: null, // a plain install: not the runner's own CLAUDE_CONFIG_DIR
+		scopedItem: null, // a plain install: not the runner's own CLAUDE_CONFIG_DIR
 		configDir: '',
 		readCredCandidates: () =>
 			[keychain, ...extraKeychainItems]
@@ -243,7 +243,7 @@ test('config dir set: a dead scoped item is NOT replaced by the default item —
 	extraKeychainItems = [{ service: 'default', oauth: { accessToken: 'fresh-default-login-token-bb', expiresAt: now + HOUR } }];
 	refreshResult = null;
 	upstreamHandler = (_req, res) => respond(res, 200, '{}');
-	const proxyPort = await startProxy(await startUpstream(), { scopedService: 'scoped', configDir: '/core' });
+	const proxyPort = await startProxy(await startUpstream(), { scopedItem: 'scoped', configDir: '/core' });
 
 	const r = await call(proxyPort, { authorization: 'Bearer client-token' });
 	assert.equal(r.status, 200);
@@ -258,7 +258,7 @@ test('config dir set: upstream 401 on the scoped token never recovers on the def
 		if (req.headers['authorization'] === 'Bearer client-token') { respond(res, 200, '{"own":true}'); return; }
 		respond(res, 401, '{"error":{"type":"authentication_error","message":"OAuth access token has expired"}}');
 	};
-	const proxyPort = await startProxy(await startUpstream(), { scopedService: 'scoped', configDir: '/core' });
+	const proxyPort = await startProxy(await startUpstream(), { scopedItem: 'scoped', configDir: '/core' });
 
 	for (let i = 0; i < 2; i++) {
 		const r = await call(proxyPort, { authorization: 'Bearer client-token' });

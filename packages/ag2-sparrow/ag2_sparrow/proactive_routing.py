@@ -39,6 +39,25 @@ from pathlib import Path
 # still routes to a default bridge rather than stranding the file.
 BRIDGE_CHANNELS = frozenset({"discord", "telegram", "ag2space", "slack"})
 
+# Activity surfaces a bridge carries: the owner on one is on that bridge.
+ACTIVITY_BRIDGE = {"matrixrtc-voice": "ag2space"}
+
+
+def activity_bridge(data) -> "str | None":
+    """The bridge an owner-activity record routes to, or None when it names none: a bridge
+    channel, a surface a bridge carries, else the `bridge` its writer was docked on."""
+    if not isinstance(data, dict):
+        return None
+    channel = data.get("channel")
+    if not isinstance(channel, str) or not channel:
+        return None
+    if channel in BRIDGE_CHANNELS:
+        return channel
+    if channel in ACTIVITY_BRIDGE:
+        return ACTIVITY_BRIDGE[channel]
+    docked = data.get("bridge")
+    return docked if isinstance(docked, str) and docked in BRIDGE_CHANNELS else None
+
 
 def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
     """Decide whether this bridge should claim `results/proactive-*.txt`.
@@ -52,13 +71,13 @@ def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
         ``True`` iff the calling bridge is the destination for proactive
         messages right now. The decision rule:
 
-          1. State file says ``data["channel"]`` is a known BRIDGE
-             channel (discord / telegram / ag2space / slack) → claim only when
-             ``last_channel == this_channel``. This is the message-
-             routing match — owner was last reading there, follow-up
-             goes there.
+          1. The record routes to a bridge (``activity_bridge``: a bridge
+             channel, a surface a bridge carries such as an s.space voice
+             call, or the ``bridge`` a docked voice session recorded) → claim
+             only when that bridge is ``this_channel``. Owner was last
+             there, follow-up goes there.
           2. State file missing / unreadable / malformed / no-channel
-             / channel-not-a-string / channel-not-a-bridge (e.g.
+             / channel-not-a-string / no bridge named (e.g. a local
              ``voice``, ``github-commits``) → default Discord. Owner
              messages must not get stranded when the last activity
              was on a non-bridge surface; Discord is the canonical
@@ -74,19 +93,11 @@ def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
     except (OSError, json.JSONDecodeError):
         return this_channel == "discord"
 
-    if not isinstance(data, dict):
-        return this_channel == "discord"
+    routed = activity_bridge(data)
+    if routed is not None:
+        return routed == this_channel
 
-    last_channel = data.get("channel", "")
-    if not isinstance(last_channel, str) or not last_channel:
-        return this_channel == "discord"
-
-    # If the last-active channel is a known bridge, match strictly so
-    # only that bridge claims.
-    if last_channel in BRIDGE_CHANNELS:
-        return last_channel == this_channel
-
-    # Non-bridge channel: the owner was last on a surface that delivers no DMs,
+    # No bridge named: the owner was last on a surface that delivers no DMs,
     # so default to Discord rather than strand the file.
     return this_channel == "discord"
 
@@ -152,6 +163,13 @@ def lane_claims_proactive(name, lane_worker: str = "") -> bool:
     session stamped is that worker's own lane's alone; an unstamped file is never a worker lane's.
     `lane_worker` is the worker the claiming lane runs as, "" for a core lane or any other bridge."""
     return (proactive_worker(name) or "") == (lane_worker or "")
+
+
+def lane_claims_card(by_worker, lane_worker: str = "", primary: bool = False) -> bool:
+    """Which lane posts a decision card: one a worker's session asked (`by_worker`) is that worker's own
+    lane's alone; any other is the primary lane's, as before."""
+    by = by_worker if isinstance(by_worker, str) else ""
+    return by == (lane_worker or "") and (bool(by) or primary)
 
 
 # A message about one task (a named instance's id included) names it: proactive-about-<task id>--<ts>
@@ -266,10 +284,10 @@ def claims_unless_routed_elsewhere(name, state_file_path: Path, this_channel: st
     try:
         with open(state_file_path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        last = data.get("channel") if isinstance(data, dict) else None
+        last = activity_bridge(data)
     except (OSError, ValueError, AttributeError):
         last = None
-    if isinstance(last, str) and last in BRIDGE_CHANNELS:
+    if last is not None:
         return last == this_channel
     return not other_bridges_configured
 

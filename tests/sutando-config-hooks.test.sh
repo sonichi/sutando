@@ -63,8 +63,8 @@ cat > "$T/old.json" << 'EOJ'
 EOJ
 echo '{}' > "$T/new.json"
 notice_out="$(bash "$SCRIPT" migration-notice "$T/old.json" "$T/new.json" 2>&1)"
-echo "$notice_out" | grep -q "third-party.sh"; report "$?" "migration-notice flags third-party hook"
-echo "$notice_out" | grep -qv "session-handoff.sh"; report "$?" "migration-notice filters out Sutando hook (session-handoff.sh)"
+grep -q "third-party.sh" <<<"$notice_out"; report "$?" "migration-notice flags third-party hook"
+grep -qv "session-handoff.sh" <<<"$notice_out"; report "$?" "migration-notice filters out Sutando hook (session-handoff.sh)"
 
 # Test 7: detect-missing on non-existent file returns 1
 bash "$SCRIPT" detect-missing "$T/does-not-exist.json" >/dev/null 2>&1
@@ -79,19 +79,19 @@ bash "$SCRIPT" bogus-subcommand >/dev/null 2>&1
 echo 'not valid json {{{' > "$T/malformed.json"
 err_out="$(bash "$SCRIPT" detect-missing "$T/malformed.json" 2>&1)"
 rc="$?"
-[ "$rc" = "1" ] && echo "$err_out" | grep -q "not valid JSON"
+[ "$rc" = "1" ] && grep -q "not valid JSON" <<<"$err_out"
 report "$?" "detect-missing emits explicit error + exit 1 on malformed JSON"
 
 # Test 10: malformed JSON in install — refuses to edit
 err_out2="$(bash "$SCRIPT" install "$T/malformed.json" 2>&1)"
 rc2="$?"
-[ "$rc2" = "1" ] && echo "$err_out2" | grep -q "not valid JSON"
+[ "$rc2" = "1" ] && grep -q "not valid JSON" <<<"$err_out2"
 report "$?" "install refuses to edit malformed JSON (exit 1)"
 
 # Test 11: malformed JSON in migration-notice — skip cleanly, exit 0
 err_out3="$(bash "$SCRIPT" migration-notice "$T/malformed.json" "$T/new.json" 2>&1)"
 rc3="$?"
-[ "$rc3" = "0" ] && echo "$err_out3" | grep -q "malformed"
+[ "$rc3" = "0" ] && grep -q "malformed" <<<"$err_out3"
 report "$?" "migration-notice skips malformed input cleanly (exit 0 + warn)"
 
 # Test 12: write-manifest + show-manifest round-trip
@@ -122,9 +122,9 @@ cat > "$T12/old.json" << 'EOJ'
 EOJ
 echo '{}' > "$T12/new.json"
 notice14="$(bash "$SCRIPT" migration-notice "$T12/old.json" "$T12/new.json" 2>&1)"
-echo "$notice14" | grep -q "unknown-third-party.sh"
+grep -q "unknown-third-party.sh" <<<"$notice14"
 report "$?" "migration-notice: manifest-registered hook flags unknown third-party"
-echo "$notice14" | grep -qv "custom-hook.sh"
+grep -qv "custom-hook.sh" <<<"$notice14"
 report "$?" "migration-notice: manifest-registered hook NOT flagged as dropped"
 unset CLAUDE_CONFIG_DIR
 rm -rf "$T12"
@@ -152,10 +152,10 @@ EOJ
 echo '{}' > "$T15/new.json"
 notice15="$(bash "$SCRIPT" migration-notice "$T15/old.json" "$T15/new.json" 2>&1)"
 # check-pending-tasks.sh IS in the hardcoded fallback — must NOT be flagged as dropped.
-echo "$notice15" | grep -qv "check-pending-tasks.sh"
+grep -qv "check-pending-tasks.sh" <<<"$notice15"
 report "$?" "migration-notice: partial-manifest preserves hardcoded fallback recognition"
 # random-corp-thing.sh IS NOT in either list — MUST be flagged.
-echo "$notice15" | grep -q "random-corp-thing.sh"
+grep -q "random-corp-thing.sh" <<<"$notice15"
 report "$?" "migration-notice: partial-manifest still flags real third-party"
 unset CLAUDE_CONFIG_DIR
 rm -rf "$T15"

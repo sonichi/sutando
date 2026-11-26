@@ -5,7 +5,8 @@ reply text as the owner. So a click acts only when it names a card recorded here
 agent posted it), in the room it was posted in, replies to that card's own event, and carries a text
 that card offered. One JSON file per workspace: event id -> {card id, room, lane, handler, offered reply
 text -> its command ("" for plain words), picker, expiry}. A newer card with the same id in the same
-room replaces the older record, so a settled card's buttons stop acting. The caller passes the
+room replaces the older record, so a settled card's buttons stop acting; the replaced event is kept as
+retired, so a retried send the platform answers with it is a no-op and never displaces the newer card. The caller passes the
 workspace; nothing here resolves it. Standard library only, plus file_lock and local_record.
 """
 from __future__ import annotations
@@ -19,6 +20,8 @@ from typing import Mapping, Optional
 LEDGER = ("state", "agent-cards", "issued.json")
 TTL_S = 3 * 86400
 MAX_CARDS = 500
+# Retired ids and send intents must outlive the live-card cap, or a replay under load finds neither.
+MAX_RETIRED = 10 * MAX_CARDS
 
 
 def ledger_path(workspace: Path) -> Path:
@@ -62,20 +65,54 @@ def has_picker(card: Mapping[str, object]) -> bool:
     return any(b.get("kind") == "connect_picker" for b in _actions(card))
 
 
-def _read(path: Path) -> dict:
+def _load(path: Path) -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    cards = data.get("cards") if isinstance(data, dict) else None
+    return data if isinstance(data, dict) else {}
+
+
+def _read(path: Path) -> dict:
+    cards = _load(path).get("cards")
     return cards if isinstance(cards, dict) else {}
 
 
+def _retired(path: Path, now: float) -> dict:
+    """{event id: {"why": "replaced" | "settled", "expires_at"}} of cards no longer live, unexpired."""
+    got = _load(path).get("retired")
+    return {k: v for k, v in (got.items() if isinstance(got, dict) else ())
+            if isinstance(v, dict) and float(v.get("expires_at") or 0) > now}
+
+
+def intend(workspace: Path, operation_id: str, *, now: Optional[float] = None) -> float:
+    """Note, before the send, when the card sent as `operation_id` was first meant; a retried send keeps
+    its first time. Pass the result to record() as `issued_at`, so a replayed older card never displaces
+    a newer one even when its first record was lost."""
+    from file_lock import locked_file
+    from local_record import write_whole
+    now = time.time() if now is None else now
+    path = ledger_path(workspace)
+    with locked_file(path.with_name(path.name + ".lock")):
+        doc = _load(path)
+        intents = {k: v for k, v in (doc.get("intents") or {}).items()
+                   if isinstance(v, (int, float)) and v > now - TTL_S}
+        # Strictly after every earlier intent, so two sends in one clock tick still have an order.
+        first = intents.setdefault(str(operation_id), max([now] + [v + 1e-6 for v in intents.values()]))
+        old = sorted(intents.items(), key=lambda kv: kv[1])[-MAX_RETIRED:]
+        write_whole(path, {**doc, "intents": dict(old)})
+    return float(first)
+
+
 def record(workspace: Path, event_id: str, card: Mapping[str, object], *, room: str = "", lane: str = "",
-           handler: str = "", now: Optional[float] = None, ttl_s: float = TTL_S) -> bool:
+           handler: str = "", now: Optional[float] = None, ttl_s: float = TTL_S,
+           issued_at: Optional[float] = None, edited: bool = False) -> bool:
     """Remember that this agent posted `card` as `event_id` in `room` on connection `lane`; `handler` is
-    the script that runs its commands. Older records of the same card id in that room are dropped
-    either way. False when the card offers no reply to remember."""
+    the script that runs its commands. Older records of the same card id in that room are dropped; a card
+    issued before a live one of its id (`issued_at`, from intend()) is retired instead. With `edited`,
+    `card` is what `event_id` shows now (an accepted edit of a card this agent posted there): that event's
+    earlier record, live or retired, gives way to it. False when the card offers no reply to remember, or
+    was not kept."""
     if not (isinstance(event_id, str) and event_id.startswith("$")):
         return False
     payloads, picker, card_id = offered(card), has_picker(card), str(card.get("id") or "")
@@ -84,27 +121,71 @@ def record(workspace: Path, event_id: str, card: Mapping[str, object], *, room: 
     now = time.time() if now is None else now
     path = ledger_path(workspace)
     with locked_file(path.with_name(path.name + ".lock")):
-        cards = {k: v for k, v in _read(path).items()
-                 if isinstance(v, dict) and float(v.get("expires_at") or 0) > now
-                 and not (v.get("card_id") == card_id and str(v.get("room") or "") == room)}
+        live_cards = {k: v for k, v in _read(path).items()
+                      if isinstance(v, dict) and float(v.get("expires_at") or 0) > now}
+        retired = _retired(path, now)
+        # An event the platform hands back for a retried send is no newer card: a superseded or settled one
+        # stays retired (a settled card's buttons never act twice), and a live one replaces nothing.
+        if edited:
+            was = live_cards.pop(event_id, None) or retired.get(event_id) or {}
+            retired.pop(event_id, None)
+            if not (payloads or picker):    # the edit has no buttons: the ones it replaced never act again
+                retired[event_id] = _retire(dict(was, room=room or was.get("room")), "settled", now)
+        elif event_id in retired:
+            return False
+        cards = dict(live_cards)
+        order = now if issued_at is None else float(issued_at)
+        if event_id not in live_cards:
+            same = {k: v for k, v in live_cards.items()
+                    if v.get("card_id") == card_id and str(v.get("room") or "") == room}
+            if any(float(v.get("issued_at") or 0) > order for v in same.values()):
+                retired[event_id] = {"why": "replaced", "expires_at": _retire_until(None, now)}
+                _save(path, cards, retired)
+                return False
+            for k, v in same.items():
+                cards.pop(k)
+                retired[k] = _retire(v, "replaced", now)
         if payloads or picker:
             cards[event_id] = {"card_id": card_id, "offers": payloads, "picker": picker, "room": room,
-                               "lane": lane, "handler": handler, "expires_at": now + ttl_s}
-        newest = sorted(cards.items(), key=lambda kv: kv[1]["expires_at"])[-MAX_CARDS:]
-        write_whole(path, {"cards": dict(newest)})
+                               "lane": lane, "handler": handler, "expires_at": now + ttl_s, "issued_at": order}
+        _save(path, cards, retired)
     return bool(payloads or picker)
 
 
-def settle(workspace: Path, event_id: str) -> bool:
+def _save(path: Path, cards: dict, retired: dict) -> None:
+    """Write the ledger under the caller's lock, keeping the send intents it holds."""
+    from local_record import write_whole
+    newest = sorted(cards.items(), key=lambda kv: kv[1]["expires_at"])[-MAX_CARDS:]
+    old = sorted(retired.items(), key=lambda kv: float(kv[1].get("expires_at") or 0))[-MAX_RETIRED:]
+    write_whole(path, {**_load(path), "cards": dict(newest), "retired": dict(old)})
+
+
+def _retire_until(entry: object, now: float) -> float:
+    """How long a retired id stays known: a full TTL from now at least, past a short-lived card's own life,
+    so a send retried after the card expired still finds it retired."""
+    own = float(entry.get("expires_at") or 0) if isinstance(entry, dict) else 0.0
+    return max(own, now + TTL_S)
+
+
+def _retire(entry: object, why: str, now: float) -> dict:
+    """A retired id's record; it keeps the room its card was posted in, when that is known."""
+    room = str(entry.get("room") or "") if isinstance(entry, dict) else ""
+    return {"why": why, "expires_at": _retire_until(entry, now), **({"room": room} if room else {})}
+
+
+def settle(workspace: Path, event_id: str, *, now: Optional[float] = None) -> bool:
     """Forget the card posted as `event_id`, so no button of it acts again; False when it was not known."""
     from file_lock import locked_file
     from local_record import write_whole
     path = ledger_path(workspace)
     with locked_file(path.with_name(path.name + ".lock")):
         cards = _read(path)
-        if cards.pop(str(event_id or ""), None) is None:
+        entry = cards.pop(str(event_id or ""), None)
+        if entry is None:
             return False
-        write_whole(path, {"cards": cards})
+        retired = _load(path).get("retired") or {}
+        retired[str(event_id)] = _retire(entry, "settled", time.time() if now is None else now)
+        write_whole(path, {**_load(path), "cards": cards, "retired": retired})
     return True
 
 
@@ -115,6 +196,18 @@ def live(workspace: Path, event_id: str, *, now: Optional[float] = None) -> Opti
     if not isinstance(entry, dict) or float(entry.get("expires_at") or 0) <= now:
         return None
     return entry if isinstance(entry.get("offers"), dict) else None
+
+
+def issued(workspace: Path, event_id: str, room: str = "", *, now: Optional[float] = None) -> bool:
+    """Whether this agent's ledger knows `event_id` as a card it posted, in `room` when one is given: live,
+    or retired and not yet forgotten. A record that names no room vouches for none; an id it does not know
+    may be anyone's message."""
+    now = time.time() if now is None else now
+    path = ledger_path(workspace)
+    entry = _read(path).get(str(event_id or ""))
+    if not (isinstance(entry, dict) and float(entry.get("expires_at") or 0) > now):
+        entry = _retired(path, now).get(str(event_id or ""))
+    return isinstance(entry, dict) and (not room or str(entry.get("room") or "") == room)
 
 
 def main(argv=None) -> int:

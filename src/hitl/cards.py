@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from .manager import HitlManager, HitlStore, default_store
-from .schema import Action, HumanRequirement
+from .schema import STATUS_CANCELLED, Action, HumanRequirement
 
 CHOICE_KIND = "choice"
 ACTION_KIND = "confirmation"
@@ -67,3 +67,25 @@ def create_choice(question: str, actions: Iterable[Any], guard: str, subject: Di
     req = choice_request(question, actions, guard, subject, runtime=runtime, title=title,
                          device=device, kind=kind, turn_on_action=turn_on_action)
     return (manager or manager_for(workspace)).create(req)
+
+
+def withdraw_worker_cards(worker: str, workspace: Optional[Path] = None, now: Optional[float] = None,
+                          manager: Optional[HitlManager] = None) -> list:
+    """Cancel every open card `worker`'s own agent asked (`subject.by_worker`), for a worker being retired:
+    its lane posts nothing more, so no lane could update or answer them. Each is recorded as current
+    without a post and archived. Returns their titles and messages, for the owner's notice."""
+    import time  # noqa: PLC0415
+    manager = manager or manager_for(workspace)
+    now = time.time() if now is None else now
+    withdrawn = []
+    for req in manager.store.all():
+        if req.terminal or (req.subject or {}).get("by_worker") != worker:
+            continue
+        manager.cancel(req.id)
+        done = manager.store.load(req.id)
+        if done is None or done.status != STATUS_CANCELLED:
+            continue  # answered or settled meanwhile: not withdrawn
+        manager.record_projection(done.id, done.revision, None)
+        manager.archive_if_settled(done.id, now)
+        withdrawn.append(req.message.splitlines()[0] if req.message else req.title)
+    return withdrawn

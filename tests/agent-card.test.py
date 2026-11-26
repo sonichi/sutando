@@ -341,6 +341,12 @@ class Send(unittest.TestCase):
         ac.send_card(fake.execute, DM, body, card, operation_id="op-2", thread_root="$root")
         self.assertEqual(fake.calls[1][1]["thread_root"], "$root")
 
+    def test_send_key_names_an_answer_by_its_message_and_anything_else_by_the_second(self):
+        key = ac.send_key(DM, "$ask", lambda: 1.0)
+        self.assertEqual(key, ac.send_key(DM, "$ask", lambda: 99.0), "a retry of one answer: one id")
+        self.assertEqual(len({key, ac.send_key(DM, "$other", lambda: 1.0), ac.send_key(ROOM, "$ask", lambda: 1.0)}), 3)
+        self.assertEqual((ac.send_key(DM, "", lambda: 7.9), ac.send_key(DM, "", lambda: 8.0)), ("7", "8"))
+
     def test_a_private_card_goes_only_to_the_owner_dm(self):
         body, card = a_card()
         fake = FakeActions()
@@ -553,6 +559,20 @@ class Issued(unittest.TestCase):
             self.assertEqual([owner_of(x) for x in ("s_dspace", "primary", "gone", "")],
                              ["@second:s.space", OWNER, "", "@fallback:s.space"])
 
+    def test_a_card_with_no_lane_is_the_legacy_connection_s_owner(self):
+        # A core on the env (legacy) connection has `instance: ""`, and its cards record no lane:
+        # a tap on one must reach that row's owner, also through `agent_card.py click` (no default).
+        rows = [{"instance": "", "owner_mxid": OWNER},
+                {"instance": "", "owner_mxid": "@worker-owner:s.space", "worker": "w1"},
+                {"instance": "s-space-1", "owner_mxid": "@other:s.space", "worker": "w2"}]
+        with mock.patch("connections.read_rows", lambda ws=None: rows):
+            self.assertEqual(ac.lane_owner(self.ws)(""), OWNER)
+            self.assertEqual(ac.lane_owner(self.ws, "@fallback:s.space")(""), OWNER)
+            self.assertEqual(ac.lane_owner(self.ws, "@fallback:s.space")("s-space-1"), "", "a worker row owns no card")
+        with mock.patch.dict(sys.modules, {"connections": None}):
+            self.assertEqual(ac.lane_owner(self.ws, "@fallback:s.space")(""), "@fallback:s.space")
+            self.assertEqual(ac.lane_owner(self.ws, "@fallback:s.space")("s_dspace"), "")
+
     def test_a_newer_card_with_the_same_id_replaces_the_older_record(self):
         done = a_card(state="done")[1]
         self.assertFalse(issued_cards.record(self.ws, "$done", done, room=DM, now=1002.0))
@@ -563,6 +583,95 @@ class Issued(unittest.TestCase):
         self.assertTrue(issued_cards.settle(self.ws, "$a"))
         self.assertFalse(issued_cards.settle(self.ws, "$a"))
         self.forged(reply_to_event="$a", now=1005.0)
+
+    def test_a_replayed_event_replaces_nothing_and_a_settled_one_stays_settled(self):
+        cards = lambda: sorted(json.loads(issued_cards.ledger_path(self.ws).read_text())["cards"])
+        issued_cards.record(self.ws, "$a", self.card, room=DM, now=1000.0)
+        issued_cards.record(self.ws, "$b", self.card, room=DM, now=1001.0)
+        self.assertEqual(cards(), ["$b"])
+        # The platform hands back the superseded $a for a retried send: a no-op, $b keeps acting.
+        self.assertFalse(issued_cards.record(self.ws, "$a", self.card, room=DM, now=1002.0))
+        self.assertEqual(cards(), ["$b"])
+        self.forged(reply_to_event="$a", now=1002.5)  # a tap on the superseded card is refused as stale
+        # A live card handed back again stays, and replaces nothing.
+        self.assertTrue(issued_cards.record(self.ws, "$b", self.card, room=DM, now=1003.0))
+        self.assertEqual(cards(), ["$b"])
+        # A settled card handed back again stays settled, and the superseded $a still cannot come back.
+        self.assertTrue(issued_cards.settle(self.ws, "$b"))
+        self.assertFalse(issued_cards.record(self.ws, "$b", self.card, room=DM, now=1004.0))
+        self.assertFalse(issued_cards.record(self.ws, "$a", self.card, room=DM, now=1004.0))
+        self.assertEqual(cards(), [])
+        # A card whose first record never landed (a replay of an event this ledger never saw) is recorded.
+        self.assertTrue(issued_cards.record(self.ws, "$c", self.card, room=DM, now=1005.0))
+        self.assertEqual(cards(), ["$c"])
+        self.assertTrue(issued_cards.record(self.ws, "$c", self.card, room=DM, now=1006.0))
+        self.assertEqual(cards(), ["$c"])
+
+    def test_an_edit_replaces_what_its_event_shows_even_after_that_event_was_settled(self):
+        cards = lambda: sorted(json.loads(issued_cards.ledger_path(self.ws).read_text())["cards"])
+        done = a_card(state="done")[1]
+        issued_cards.record(self.ws, "$a", self.card, room=DM, now=1000.0)
+        # Edited to a card with no buttons: the buttons it replaced stop acting, and a replay cannot revive them.
+        self.assertFalse(issued_cards.record(self.ws, "$a", done, room=DM, now=1001.0, edited=True))
+        self.assertEqual(cards(), [])
+        self.forged(reply_to_event="$a", now=1001.5)
+        self.assertFalse(issued_cards.record(self.ws, "$a", self.card, room=DM, now=1002.0), "a replay is no edit")
+        self.assertFalse(issued_cards.record(self.ws, "$a", done, room=DM, now=1002.5, edited=True))
+        self.assertTrue(issued_cards.issued(self.ws, "$a", DM, now=1002.6), "edited twice, it is still this room's card")
+        # Edited again, to a card with buttons: they act at that same event.
+        self.assertTrue(issued_cards.record(self.ws, "$a", self.card, room=DM, now=1003.0, edited=True))
+        self.assertEqual(cards(), ["$a"])
+        self.assertIsNotNone(issued_cards.live(self.ws, "$a", now=1004.0))
+        # The ledger knows the events it posted, live or retired, and no other.
+        issued_cards.record(self.ws, "$b", self.card, room=DM, now=1005.0)
+        self.assertEqual([issued_cards.issued(self.ws, e, now=1006.0) for e in ("$a", "$b", "$other", "")],
+                         [True, True, False, False])
+        self.assertEqual([issued_cards.issued(self.ws, e, ROOM, now=1006.0) for e in ("$a", "$b")], [False, False],
+                         "a card posted in one room is not this agent's card in another")
+        # A record that names no room (a ledger written before rooms were kept) vouches for no room.
+        issued_cards.record(self.ws, "$c", self.card, now=1007.0)
+        self.assertEqual((issued_cards.issued(self.ws, "$c", now=1008.0), issued_cards.issued(self.ws, "$c", DM, now=1008.0)),
+                         (True, False))
+
+    def test_a_card_meant_before_a_live_one_of_its_id_is_retired_not_recorded(self):
+        cards = lambda: sorted(json.loads(issued_cards.ledger_path(self.ws).read_text())["cards"])
+        first = issued_cards.intend(self.ws, "op-a", now=1000.0)
+        second = issued_cards.intend(self.ws, "op-b", now=1000.0)  # same clock tick: still after the first
+        self.assertEqual(issued_cards.intend(self.ws, "op-a", now=1009.0), first, "a retry keeps its first time")
+        self.assertLess(first, second)
+        self.assertTrue(issued_cards.record(self.ws, "$b", self.card, room=DM, now=1001.0, issued_at=second))
+        # $a's first record was lost; its replay arrives later but was meant earlier: $b stays the card.
+        self.assertFalse(issued_cards.record(self.ws, "$a", self.card, room=DM, now=1002.0, issued_at=first))
+        self.assertEqual(cards(), ["$b"])
+        self.assertIsNotNone(json.loads(issued_cards.ledger_path(self.ws).read_text())["intents"].get("op-a"))
+
+    def test_a_retired_id_outlives_its_short_lived_card(self):
+        # A confirm card lives 10 minutes; its retirement must outlast that, or a later replay revives it.
+        cards = lambda: sorted(json.loads(issued_cards.ledger_path(self.ws).read_text())["cards"])
+        issued_cards.record(self.ws, "$yes", self.card, room=DM, now=1000.0, ttl_s=600)
+        self.assertTrue(issued_cards.settle(self.ws, "$yes", now=1001.0))
+        self.assertFalse(issued_cards.record(self.ws, "$yes", self.card, room=DM, now=1605.0, ttl_s=600))
+        self.assertIsNone(issued_cards.live(self.ws, "$yes", now=1606.0), "settled past its TTL stays settled")
+        # Replaced: A at 0, B at 540, a retry of A at 660 must leave B the live card.
+        issued_cards.record(self.ws, "$A", {**self.card, "id": "cf"}, room=DM, now=2000.0, ttl_s=600)
+        issued_cards.record(self.ws, "$B", {**self.card, "id": "cf"}, room=DM, now=2540.0, ttl_s=600)
+        self.assertFalse(issued_cards.record(self.ws, "$A", {**self.card, "id": "cf"}, room=DM, now=2660.0, ttl_s=600))
+        self.assertIsNotNone(issued_cards.live(self.ws, "$B", now=2661.0))
+        self.assertIsNone(issued_cards.live(self.ws, "$A", now=2661.0))
+        self.assertEqual(cards(), ["$B"])
+
+    def test_retired_ids_and_intents_are_not_trimmed_with_the_live_cards(self):
+        with mock.patch.object(issued_cards, "MAX_CARDS", 2):
+            for i in range(4):
+                issued_cards.intend(self.ws, f"op{i}", now=1000.0 + i)
+                issued_cards.record(self.ws, f"$r{i}", self.card, room=DM, now=1000.0 + i)
+            doc = json.loads(issued_cards.ledger_path(self.ws).read_text())
+            self.assertLessEqual({"$r0", "$r1", "$r2"}, set(doc["retired"]), "live cap of 2 evicts no retired id")
+            self.assertEqual(len(doc["intents"]), 4)
+            self.assertFalse(issued_cards.record(self.ws, "$r0", self.card, room=DM, now=1010.0))
+        with mock.patch.object(issued_cards, "MAX_RETIRED", 2):
+            issued_cards.record(self.ws, "$r9", self.card, room=DM, now=1011.0)
+            self.assertEqual(len(json.loads(issued_cards.ledger_path(self.ws).read_text())["retired"]), 2)
 
     def test_a_record_expires_and_the_ledger_keeps_only_live_cards(self):
         self.assertLessEqual(issued_cards.TTL_S, 3 * 86400)
@@ -654,6 +763,25 @@ class Dispatch(Issued):
         self.assertEqual((rc, out["status"], out["say"]), (1, "forged_or_stale_click", ac.UNMATCHED_CLICK))
         rc, out = self.run_click(self.TEXT, user_id="@member:s.space")
         self.assertEqual((rc, out["status"]), (1, "forged_or_stale_click"))
+
+    def test_a_tap_on_a_card_posted_on_the_legacy_connection_is_its_command(self):
+        # 2026-11-22 VM: a Codex core on the env connection (instance "") posted the model card with
+        # lane ""; the owner's tap came back "I couldn't match that button" (owner not known).
+        issued_cards.record(self.ws, "$legacy", {**self.card, "id": "legacy"}, room=DM, lane="",
+                            handler=self.HANDLER, now=1000.0)
+        out = io.StringIO()
+        path = self.ws / "task.txt"
+        h = {"access_tier": "owner", "user_id": OWNER, "channel_kind": "dm", "channel_id": DM,
+             "reply_to_event": "$legacy"}
+        path.write_text("\n".join(["id: task-1", "task_layout: mid"] + [f"{k}: {v}" for k, v in h.items()]
+                                  + [f"card_click: {json.dumps({'card_id': 'legacy', 'action': self.TEXT})}",
+                                     f"task: {self.TEXT}", "source: ag2space"]) + "\n")
+        with contextlib.redirect_stdout(out), \
+                mock.patch("connections.read_rows", lambda ws=None: [{"instance": "", "owner_mxid": OWNER}]), \
+                mock.patch.object(issued_cards.time, "time", lambda: 1001.0):
+            rc = ac.main(["click", "--task-file", str(path), "--workspace", str(self.ws)])
+        self.assertEqual((rc, json.loads(out.getvalue())),
+                         (0, {"status": "command", "card": "worker-approval", "run": self.HANDLER}))
 
     def test_a_handler_that_is_not_a_skill_script_is_not_printed(self):
         issued_cards.record(self.ws, "$odd", {**self.card, "id": "odd"}, room=DM, lane="s_dspace",

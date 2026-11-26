@@ -1,0 +1,11 @@
+{
+  "name": "runtime-switch",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "The core's runtime card in the owner's DM: names the runtime the core runs on (Codex or Claude Code) and switches it by button. Checks the target runtime is signed in before stopping anything, restarts the core gracefully onto it, and confirms in the DM from the launcher's confirmed core record and the desktop's selection. Contributes no tools.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

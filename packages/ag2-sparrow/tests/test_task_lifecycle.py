@@ -418,6 +418,66 @@ class FreshDirTest(Base):
         self.assertIn("task-a", (self.work / "state" / "settled-ids").read_text())
         self.assertEqual(self.main()[0], 0, "this binary's own state restarts")
 
+    def test_a_temp_under_an_allowed_name_is_a_plain_file_and_the_released_fixed_temp_is_removed(self):
+        self.assertEqual(self.main()[0], 0)
+        state = self.work / "state"
+        # The fixed-name temp 0.11's model switch could leave: removed at a start, whatever its age.
+        (state / "model-switch.json.tmp").write_text('{"model": "ha')
+        self.assertEqual(self.main()[0], 0)
+        self.assertFalse((state / "model-switch.json.tmp").exists())
+        # A link under that name is refused, and what it points at is left alone.
+        target = self.work / "kept.txt"
+        target.write_text("kept")
+        (state / "model-switch.json.tmp").symlink_to(target)
+        rc, err = self.main()
+        self.assertEqual((rc == 0, "state/model-switch.json.tmp in" in err, target.read_text()), (False, True, "kept"), err)
+        (state / "model-switch.json.tmp").unlink()
+        # A directory under a fresh temp's name is refused at once, not accepted until the sweep trips on it.
+        (state / ".rate.jsonl.9.abcd.tmp").mkdir()
+        rc, err = self.main()
+        self.assertEqual((rc == 0, "state/.rate.jsonl.9.abcd.tmp in" in err and "not a plain file" in err), (False, True), err)
+        (state / ".rate.jsonl.9.abcd.tmp").rmdir()
+        self.assertEqual(self.main()[0], 0)
+        # A writer that renames its temp into place between the listing and the look is finishing, not
+        # breaking the layout: listed, then gone, is accepted in a check and in a start, fresh or not.
+        for copy in filter(None, (src_copy(), vendored)):
+            real_listdir = os.listdir
+            for gone in (".rate.jsonl.7.abcd.tmp", "model-switch.json.tmp", "model.json.tmp", "account.json.tmp"):
+                def listing(path, gone=gone):
+                    names = real_listdir(path)
+                    return names + [gone] if os.path.basename(str(path)) == "state" else names
+                with mock.patch.object(copy.os, "listdir", side_effect=listing):
+                    for check_only in (True, False):
+                        self.assertIsNone(copy.prepare_work_dir(str(self.work), check_only=check_only), gone)
+            # Removed by someone else between the look and the sweep: still not an error.
+            old = state / ".rate.jsonl.8.abcd.tmp"
+            old.write_text("")
+            os.utime(old, (1, 1))
+            with mock.patch.object(copy.os, "unlink", side_effect=FileNotFoundError()):
+                self.assertIsNone(copy.prepare_work_dir(str(self.work)))
+            old.unlink()
+            # The same for a card record's own temp, swept by another start between the look and the unlink.
+            card_temp = state / "model.json.tmp"
+            card_temp.write_text("")
+            os.utime(card_temp, (1, 1))
+            with mock.patch.object(copy.os, "unlink", side_effect=FileNotFoundError()):
+                self.assertIsNone(copy.prepare_work_dir(str(self.work)))
+            card_temp.unlink()
+        # The canonical copy answers the same, read by read (the package's is its copy).
+        for copy in filter(None, (src_copy(), vendored)):
+            (state / "model-switch.json.tmp").write_text("x")
+            self.assertIsNone(copy.prepare_work_dir(str(self.work), check_only=True))
+            self.assertTrue((state / "model-switch.json.tmp").exists(), "a check removes nothing")
+            self.assertIsNone(copy.prepare_work_dir(str(self.work)))
+            self.assertFalse((state / "model-switch.json.tmp").exists())
+            (state / "model-switch.json.tmp").mkdir()
+            (state / ".rate.jsonl.9.abcd.tmp").mkdir()
+            for check_only in (True, False):
+                self.assertIn("state/.rate.jsonl.9.abcd.tmp in", copy.prepare_work_dir(str(self.work), check_only=check_only))
+            (state / ".rate.jsonl.9.abcd.tmp").rmdir()
+            self.assertIn("state/model-switch.json.tmp in", copy.prepare_work_dir(str(self.work), check_only=True))
+            (state / "model-switch.json.tmp").rmdir()
+
     def test_with_the_marker_only_the_allowlist_is_accepted(self):
         self.assertEqual(self.main()[0], 0)
         for name in ("done", ".rate.jsonl.123.abcd.tmp", ".rate.jsonl.456.abcd.tmp"):
@@ -2103,7 +2163,7 @@ class BoundaryGuardTest(SpyMixin, unittest.TestCase):
                          {"state", "results", "tasks", "results/<task>.txt",
                           "results/.<task>.txt.<tmp>", "state/done", "state/.done.<tmp>", "state/threads",
                           "state/threads/<key>", "state/threads/.<key>.<tmp>", "state/metrics.jsonl",
-                          "state/app-server-stub.stderr"})
+                          "state/app-server-stub.stderr", "state/live-view.log"})
 
     def strings(self, tree):
         doc = tree.body[0].value if tree.body and isinstance(tree.body[0], ast.Expr) else None
@@ -3204,6 +3264,38 @@ class LocalClaimTest(Base):
         (self.work / "state" / "claims.lock").mkdir()
         self.assertIn("not a plain file", self.lc.prepare_work_dir(str(self.work)))
 
+    def test_a_work_dir_that_used_model_or_a_card_restarts(self):
+        # Live 2026-11-22: a claude-local root that had used `model` and the cards refused to start
+        # ("state/agent-cards is not this adapter's state").
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        state = self.work / "state"
+        for name in ("isolated-turns.json", "model-switch.json", "model-switch.lock", "model.json", "account.json",
+                     "model-apply.log", "model-apply.lock"):
+            (state / name).write_text("{}")
+        for name in ("agent-cards", "card-marks"):
+            (state / name).mkdir()
+            (state / name / "anything.json").write_text("{}")
+        (state / "model.json.tmp").write_text("{}")             # a record's own temp, mid-replace
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        self.assertTrue((state / "model.json.tmp").exists(), "a fresh temp is a live writer's")
+        old = time.time() - self.lc.TEMP_SWEEP_AFTER - 10
+        os.utime(state / "model.json.tmp", (old, old))
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        self.assertFalse((state / "model.json.tmp").exists(), "a stale one is swept")
+        (state / "model.json.tmp").mkdir()
+        self.assertIn("state/model.json.tmp", self.lc.prepare_work_dir(str(self.work)) or "", "a temp is a plain file")
+        (state / "model.json.tmp").rmdir()
+        (state / "model.json").unlink()
+        (state / "model.json").mkdir()
+        self.assertIn("not a plain file", self.lc.prepare_work_dir(str(self.work)))
+        (state / "model.json").rmdir()
+        shutil.rmtree(state / "card-marks")
+        (state / "card-marks").write_text("")
+        self.assertIn("not a plain directory", self.lc.prepare_work_dir(str(self.work)))
+        (state / "card-marks").unlink()
+        (state / "somebody-elses.json").write_text("{}")
+        self.assertIn("not this adapter's state", self.lc.prepare_work_dir(str(self.work)))
+
     def test_unmodified_main_refuses_the_fenced_work_dir_at_startup_with_everything_unchanged(self):
         old = main_lifecycle()
         self.assertEqual(old.FORMAT, "cloud-session/1")
@@ -3303,7 +3395,7 @@ class BridgeEntryTest(Base):
         src = (PKG_ROOT / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
         for pin in ('_LOG_DIR = _STATE.parent / "logs"', '_LOG_FILE = _LOG_DIR / "gateway-bridge.log"',
                     '_LOCK_ROLE = f"gateway-bridge{_INST_SUFFIX}"', "_LOCK_WS = _STATE.parent",
-                    "manager = HitlManager(HitlStore(default_store(workspace)))", '_LOG_FILE.with_suffix(".log.1")'):
+                    "store = HitlStore(default_store(workspace))", '_LOG_FILE.with_suffix(".log.1")'):
             self.assertIn(pin, src, "the bridge's layout moved: update task_lifecycle's BRIDGE_* names")
         self.assertEqual(workspace_lock.acquire("gateway-bridge", Path(work)).status, "acquired")
         workspace_lock.acquire("gateway-bridge.second", Path(work))

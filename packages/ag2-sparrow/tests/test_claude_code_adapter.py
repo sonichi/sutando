@@ -40,7 +40,7 @@ from claude_code_fixtures import (  # noqa: E402
     isolated_child_env, launcher, MOD, NONCE, OWNER_MXID, parse_task_headers, PKG, raises, ran, READY_PANE, real_ids,
     REAL_TMUX_VERSION, records, REGISTER, resolve_access_tier, ROOM, run_verifier, Runner, SESSION_ID, sm, SRC, STALL,
     stamp, STAMP, STUB_SH, StubTm, task_io, TMUX_DIR, tmux_pane_keys, tmux_probe, tree_bytes, trust, TRUST_PANE,
-    unhold, verify_py, wait_for, wait_gone, write_fake_claude,
+    unhold, verify_py, wait_for, wait_gone, write_fake_claude, write_isolated_stub, ISOLATED_REPLY,
 )
 
 
@@ -89,8 +89,11 @@ class PluginShape(unittest.TestCase):
         self.assertEqual(mod, task_io.AUDIENCE_RULE)
         frames = re.findall(r"`\[s\.space task \$\{rid\}; sender tier[^`]*`", src)
         self.assertEqual(len(frames), 2, frames)
-        for frame in frames:
-            self.assertTrue(frame.endswith(r"\n${AUDIENCE_RULE}\n`"), frame)
+        # The audience rule is in both; the owner's own frame then adds the two card rules.
+        owner, other = sorted(frames, key=lambda f: "untrusted room data" in f)
+        self.assertTrue(owner.endswith(r"\n${AUDIENCE_RULE}\n${MODEL_RULE}\n${ACCOUNT_RULE}\n`"), owner)
+        self.assertTrue(other.endswith(r"\n${AUDIENCE_RULE}\n`"), other)
+        self.assertNotIn("_RULE}", other.replace("${AUDIENCE_RULE}", ""))
 
 
 class VerifierMirrorsSparrow(unittest.TestCase):
@@ -250,11 +253,12 @@ class FakeClaudeWrapper(unittest.TestCase):
 
 class InboxCli(ConnectBase):
     """The Mod's lifecycle verbs, each one CLI call under claims.lock, bound to the live consumer
-    generation, mirrored into the progress record under progress.lock."""
+    generation, mirrored into the progress record under progress.lock. Installed with --no-allow-non-owner,
+    so a restricted task takes the refusal path these verbs settle; IsolatedRestrictedTurn covers the default."""
 
     def setUp(self):
         super().setUp()
-        self.configure()
+        self.configure(ALLOW_NON_OWNER="0")
         self.assertEqual(inbox.prepare_root(str(self.work)), "")
         self.holder, self.consumer = hold_consumer(self.work)
         self.addCleanup(unhold, self.holder)
@@ -288,7 +292,7 @@ class InboxCli(ConnectBase):
         self.assertIn("malformed: no access_tier header", self.verb("claim", self.task("task-n2", None))[1]["refused"])
 
     def test_claim_takes_its_tier_from_the_shared_turn_policy(self):
-        self.configure(ALLOW_COLLABORATOR="1")
+        self.configure(ALLOW_COLLABORATOR="1", ALLOW_NON_OWNER="0")
         with mock.patch.object(task_io, "turn_policy", wraps=task_io.turn_policy) as gate:
             rc, out = self.verb("claim", self.task("task-c", "team", "collaborator: true\n"))
         self.assertEqual((rc, out["admission"]), (0, "collaborator"))
@@ -362,7 +366,7 @@ class InboxCli(ConnectBase):
 
     def test_the_contract_set_pin_fails_on_a_dropped_or_an_extra_scenario(self):
         names = [sc["name"] for sc in contract_scenarios()]
-        self.assertEqual(len(names), 33)
+        self.assertEqual(len(names), 34)
         self.assertEqual(contract_set_problem(names), "")
         for i in (0, 17, len(names) - 1):
             self.assertIn("missing [%r]" % names[i], contract_set_problem(names[:i] + names[i + 1:]), i)
@@ -915,14 +919,14 @@ class InboxCli(ConnectBase):
         self.assertEqual(detector.stuck_answers({"stuck": {"a": {"since": "x"}, "b": 3}}), {})
         self.assertEqual(detector.stuck_answers({"stuck": ["a"]}), {})
 
-    def test_with_both_flags_a_collaborator_is_claimed_and_a_restricted_or_tierless_task_still_refused(self):
-        self.configure(ALLOW_NON_OWNER="1", ALLOW_COLLABORATOR="1")
+    def test_with_both_flags_a_collaborator_is_claimed_a_restricted_task_answered_isolated_and_a_tierless_refused(self):
+        self.configure(ALLOW_NON_OWNER="1", ALLOW_COLLABORATOR="1", CLAUDE=str(write_isolated_stub(self.home)))
         rc, out = self.verb("claim", self.task("task-c", "team", "collaborator: true\n"))
         self.assertEqual((rc, out["admission"], out["access_tier"]), (0, "collaborator", "team"))
         for t, tier in (("task-t", "team"), ("task-g", "guest")):
             rc, out = self.verb("claim", self.task(t, tier))
             self.assertEqual((rc, "isolated read-only turn" in out["refused"]), (1, True), t)
-            self.assertEqual((self.results / (t + ".txt")).read_text(), task_io.NON_OWNER_REFUSED, t)
+            self.assertEqual((self.results / (t + ".txt")).read_text(), ISOLATED_REPLY + "\n", t)
         rc, out = self.verb("claim", self.task("task-n", None))
         self.assertEqual((rc, "malformed" in out["refused"]), (1, True))
         self.assertEqual(self.verb("claim", self.task("task-o"))[1]["admission"], "owner", "owner tasks unchanged")
@@ -961,6 +965,40 @@ class InboxCli(ConnectBase):
         self.assertNotIn(t, records.load_plugin(self.root)["inflight"], "released at SETTLED")
         rc, out = self.verb("claim", t)
         self.assertEqual((rc, "LIVE_READY" in out["refused"]), (1, True), "only ABSENT may be submitted")
+
+    def test_inflight_lists_only_this_generations_open_claims_past_their_call_and_changes_nothing(self):
+        """What a reloaded Mod checks its kept offers against: a claim it may still finish."""
+        from ag2_sparrow import task_lifecycle as tl
+        self.assertEqual(self.verb("inflight"), (0, {"tasks": {}}))
+        calling, confirmed, staged, done, prepared = (self.task("task-" + n) for n in ("c", "t", "s", "d", "p"))
+        tokens = {}
+        for t in (calling, confirmed, staged, done):
+            self.verb("claim", t)
+            tokens[t] = self.verb("authorize", t, "1", "--text-hash", "h")[1]["token"]
+        self.verb("claim", prepared)
+        for t in (confirmed, staged, done):
+            self.verb("confirm", t, "turn-" + t, tokens[t], "--text-hash", "h")
+        for t in (staged, done):
+            self.verb("stage", t, "turn-" + t, stdin=b"ok\n")
+        self.verb("publish", done)
+        before = {p: p.read_bytes() for p in sorted((self.work / "state").rglob("*")) if p.is_file() and p.suffix != ".lock"}
+        rc, out = self.verb("inflight")
+        self.assertEqual((rc, out), (0, {"tasks": {
+            calling: {"phase": "CALLING", "turn_id": "", "attempt": 1},
+            confirmed: {"phase": "TURN_CONFIRMED", "turn_id": "turn-" + confirmed, "attempt": 1},
+            staged: {"phase": "RESULT_STAGED", "turn_id": "turn-" + staged, "attempt": 1}}}))
+        self.assertEqual({p: p.read_bytes() for p in before}, before, "read-only")
+        # A claim of another generation, and one that cannot be read, are not this Mod's to finish.
+        claim_path = self.work / "state" / "claims" / confirmed / "claim.json"
+        rec = json.loads(claim_path.read_text())
+        claim_path.write_text(json.dumps(dict(rec, generation={"pid": rec["generation"]["pid"] + 1, "start": "x"})))
+        (self.work / "state" / "claims" / staged / "claim.json").write_text("not json")
+        self.assertEqual(sorted(self.verb("inflight")[1]["tasks"]), [calling])
+        # Without a live consumer there is no generation to speak for.
+        unhold(self.holder)
+        rc, out = self.verb("inflight")
+        self.assertEqual((rc, "no live consumer" in out["refused"]), (1, True))
+        self.assertEqual(tl.CALLING, "CALLING")
 
     def test_claim_refuses_without_a_live_consumer_and_a_second_cli_gets_the_same_attempt_unchanged(self):
         from ag2_sparrow import task_lifecycle as tl
@@ -1956,7 +1994,7 @@ class LauncherTmux(ConnectBase):
 
         def fenced(gen, title, action):
             rc = real(gen, title, action)
-            if action.startswith("send-keys"):
+            if "/exit" in action:   # copy-mode -q, then the keys, in the one fenced command
                 seen.append((rc, self.tmux("capture-pane", "-p", "-t", gen["pane_id"]).stdout))
             return rc
         with mock.patch.object(lc, "fenced", fenced):
@@ -1967,6 +2005,58 @@ class LauncherTmux(ConnectBase):
         self.assertTrue(wait_for(lambda: task_io.occupancy(str(self.work)) == "free", 15), "hold released the root")
         self.assertEqual(launcher.classify(lc.tm, lc.record(), self.cfg, str(self.work))[0], "create",
                          "the next start creates and resumes by id")
+
+    def test_the_model_is_switched_by_typing_claude_codes_own_command_and_only_a_reported_switch_counts(self):
+        (self.home / "claude-exit-on-exit").write_text("1")
+        lc, rec = self.created()
+        pane = rec["generation"]["pane_id"]
+        self.assertEqual(launcher.switched_model(str(self.work)), "")
+        # Before Claude Code has drawn its prompt the input box cannot be read, and nothing is typed.
+        self.assertIn("cannot be read", lc.switch_model(dict(rec, generation=dict(rec["generation"], pane_id="%999")), "opus")[1])
+        wait_for(lambda: launcher.composer_text(lc.tm.capture(pane, styled=True)) == "")
+        self.assertEqual(lc.switch_model(rec, "opus"), (True, "switched to opus"))
+        self.assertIn("Set model to opus", self.tmux("capture-pane", "-p", "-t", pane).stdout)
+        self.assertEqual(launcher.switched_model(str(self.work)), "opus", "only a reported switch is recorded")
+        self.assertEqual(lc.switch_model(rec, "claude-fable-5-2[1m]")[0], True, "an id with a context tag")
+        for bad in ("", "gpt-5", "opus; rm -rf x", "Enter", "opus fable"):
+            switched, line = lc.switch_model(rec, bad)
+            self.assertEqual((switched, "nothing sent" in line), (False, True), bad)
+        self.assertEqual(self.tmux("capture-pane", "-p", "-t", pane).stdout.count("Set model to"), 2, "nothing more typed")
+        # A session that never reports the switch is not a switch.
+        (self.home / "claude-model-deaf").write_text("1")
+        switched, line = lc.switch_model(rec, "haiku", wait_s=2)
+        self.assertEqual((switched, line.startswith("unconfirmed")), (False, True), line)
+        self.assertEqual(launcher.switched_model(str(self.work)), "claude-fable-5-2[1m]", "an unreported one is not")
+        (self.home / "claude-model-deaf").unlink()
+        # The pane was replaced since the record: the fence withholds the keys.
+        stale = dict(rec, generation=dict(rec["generation"], nonce="0" * 32))
+        switched, line = lc.switch_model(stale, "sonnet")
+        self.assertEqual((switched, "nothing sent" in line), (False, True), line)
+        self.assertNotIn("sonnet", self.tmux("capture-pane", "-p", "-t", pane).stdout)
+        self.assertEqual(lc.switch_model({}, "opus"), (False, "no running session to switch; nothing sent"))
+
+    def test_a_switch_inside_a_running_conversation_needs_confirm_and_is_cancelled_without_it(self):
+        (self.home / "claude-exit-on-exit").write_text("1")
+        (self.home / "claude-model-asks").write_text("1")
+        lc, rec = self.created()
+        pane = rec["generation"]["pane_id"]
+        wait_for(lambda: launcher.composer_text(lc.tm.capture(pane, styled=True)) == "")
+        switched, line = lc.switch_model(rec, "opus")
+        self.assertEqual((switched, "--confirm" in line), (False, True), line)
+        self.assertNotIn("Set model to", self.tmux("capture-pane", "-p", "-t", pane).stdout)
+        (self.home / "claude-model-asked").unlink()
+        self.assertEqual(lc.switch_model(rec, "sonnet", confirm=True), (True, "switched to sonnet"))
+
+    def test_exit_reaches_a_pane_a_viewer_left_in_copy_mode(self):
+        """2026-11-26 (review of ag2-space/ag2space-cinny-desktop#1317): the app's terminal tab now takes
+        typing, and a scroll there leaves the agent's pane in copy mode. /exit still ends claude."""
+        (self.home / "claude-exit-on-exit").write_text("1")
+        lc, rec = self.created()
+        pane = rec["generation"]["pane_id"]
+        self.tmux("copy-mode", "-t", pane)
+        self.assertEqual(self.tmux("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip(), "1")
+        self.assertEqual(lc.stop_session(rec, "test"), "stopped")
+        self.assertIs(lc.tm.has_session(), False, "claude took /exit: the server went with it")
 
     def test_a_claude_that_exits_on_exit_is_stopped_for_the_manager_uninstall_and_the_card(self):
         """The real stop path: /exit ends claude, hold and the server, so the fenced kill-session finds no
@@ -2588,11 +2678,37 @@ class LocalCommands(ConnectBase):
         seen[0] = seen[0][1:]
         self.assertEqual(seen[0][1:], ["-u", "-S", str(launcher.socket_path(cli.config_dir())), "attach", "-t", "=claude-local"])
         self.assertNotIn("sutando-tmux", seen[0][3])
+        # --view is the same attach as a read-only client: tmux, not the caller, refuses its keys.
+        with mock.patch.object(os, "execv", lambda f, argv: seen.append(argv)):
+            self.main("attach", "--view")
+        self.assertEqual(seen[1][1:], ["-u", "-S", str(launcher.socket_path(cli.config_dir())), "attach",
+                                       "-f", "read-only,ignore-size", "-t", "=claude-local"])
         help_text = subprocess.run([sys.executable, "-c", covered_code("import sys; sys.path.insert(0, %r); from ag2_sparrow.adapters."
                                     "claude_code.cli import main; main(['attach', '--help'])" % str(PKG))],
                                    capture_output=True, text=True).stdout
         for phrase in ("same session", "/clear", "/compact", "never kill the server"):
             self.assertIn(phrase, " ".join(help_text.split()))
+
+    def test_model_prints_what_claude_code_recorded_and_refuses_a_switch_it_cannot_make(self):
+        self.configure()
+        record = Path(cm.work_root(cli.load_config()[0])).joinpath(*launcher.MODEL_RECORD)
+        record.unlink(missing_ok=True)
+        printed = lambda: {k: json.loads(self.main("model")[1])[k] for k in ("model", "current", "pending")}  # noqa: E731
+        self.assertEqual(printed(), {"model": None, "current": None, "pending": None}, "no switch has been made here")
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(json.dumps({"model": "opus"}))
+        self.addCleanup(record.unlink, True)
+        self.assertEqual(printed(), {"model": "opus", "current": "opus", "pending": None})
+        self.assertIn({"id": "opus", "name": "Opus"}, json.loads(self.main("model")[1])["available"])
+        record.write_text("[")
+        self.assertEqual(printed()["model"], None, "an unreadable record is not a model")
+        rc, out, _ = self.main("model", "gpt-5")
+        self.assertEqual((rc, json.loads(out)["switched"], "nothing sent" in json.loads(out)["detail"]), (1, False, True))
+        # No session runs: the pick is kept for its next start, and the page reads it as pending.
+        rc, out, _ = self.main("model", "opus")
+        self.assertEqual((rc, json.loads(out)["pending"], json.loads(out)["switched"]), (0, "opus", False))
+        self.assertIn("no session is running", json.loads(out)["detail"])
+        self.assertEqual(printed()["pending"], "opus")
 
     def test_stop_refuses_without_confirm_and_without_an_open_card(self):
         self.configure()

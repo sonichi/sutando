@@ -377,6 +377,34 @@ and is not persisted: pass it again on each invocation, including `--restart`.
 Authentication, helper checks, the notifier and core startup remain active.
 The flag does not isolate the Codex home or change helper ownership by itself.
 
+## Blocked-dialog hooks (on by default)
+
+The core supervisor (`src/core-input-watch.py`) decides whether the core is blocked on its
+owner. On Claude it reads the CLI's own hook events (`src/core_block_signal.py`) and uses the
+screen only for screens no hook reports (sign-in, usage limits, startup trust). Codex can
+send the same events, but Codex runs a session's hooks only once they are trusted in `/hooks`,
+and an untrusted hook is skipped or asks for review at startup, which a headless core never
+answers.
+
+The launcher registers them on every Codex CLI core launch (not on an app-server seat, below,
+which draws no TUI dialog for the supervisor to read): it passes `PermissionRequest`,
+`PreToolUse`, `PostToolUse`, `UserPromptSubmit` and `Stop` hooks as `-c hooks.<Event>=…`
+overrides for that run only.
+
+Before that it records trust for exactly those five hooks, the way an approval in `/hooks`
+does: it starts `codex app-server` against the core's Codex home, asks Codex for each hook's
+key and hash (`hooks/list`), and has Codex write the record itself (`config/value/write`,
+upserting `hooks.state."/<session-flags>/config.toml:<event>:0:0".trusted_hash` in that home's
+`config.toml`). A record holds one hash, so it trusts only a hook with exactly that command;
+every other hook, the user's own included, keeps its own trust state, and no trust check is
+bypassed. A later launch finds them trusted and writes nothing; a changed command (a moved
+checkout) is trusted again. If Codex cannot list or trust all five, the launch passes none of
+them and says so, and the supervisor reads the Codex screen as before. The launch output says
+which happened in one line.
+
+Set `SUTANDO_CODEX_BLOCK_HOOKS=0` in the launcher's environment to turn them off: the launch
+then passes no hooks and records no trust.
+
 ## Automatic earned resets
 
 On macOS, launching a Codex core or Codex worker installs a five-minute
@@ -455,7 +483,7 @@ the `tmux` on PATH, then the host's declared client (`SUTANDO_TMUX_BIN`, which t
 desktop exports), preferring the first whose version matches the server on the
 core's socket. When neither matches but one still reaches the server, it warns on
 stderr naming both versions and launches with that client. The chosen client is
-put first on PATH for the launch. It refuses (exit 3) when no client can query the
+put first on PATH for the launch. It refuses (exit 11) when no client can query the
 server, or when no tmux is on PATH while the socket exists: either would make a
 live core read as absent, or replace the server with an incompatible build. It
 also refuses to launch another checkout's core on a desktop install's socket
@@ -469,6 +497,138 @@ when none is named. Without this, a terminal launch took `/tmp/sutando-tmux.sock
 and started a second core beside the desktop's, both reading one task inbox. A
 switch aimed at any other socket is not the desktop's core, so it leaves the
 desktop's `coreRuntime` unchanged.
+
+## Running on `codex app-server` (the default)
+
+By default the Codex core and each Codex pool worker are a seat process on `codex app-server`
+(`src/agent/codex/app-server/seat.py`) in their tmux session. With the choice turned off (below)
+each is a Codex TUI in tmux instead, and a notifier types every task into it. A host without
+tmux, or a launch that cannot read the choice, runs the TUI. The seat:
+
+- owns one `codex -c … app-server --listen stdio://` child and one durable thread. The thread id is
+  kept in `<workspace>/state/codex-seat/<tmux session>/thread`, and a restart resumes it.
+- runs one turn per pending task, in the dispatch order of `src/delivery/task_dispatch.py`,
+  with the prompt the notifier types today. The agent still writes `results/<task file>`
+  itself. A turn that ends without that file is logged and recorded under the seat's state
+  dir; the task stays pending and is tried again after 30 s, then every 15 min.
+- declines every approval and elicitation request, as `--ask-for-approval never` does.
+- sends `turn/interrupt` when a Stop ruling opens for the task its turn is on
+  (`state/stop-interrupts/<task id>.ruling.json`, written by the agent-activity skill when
+  `SUTANDO_STOP_INTERRUPT=1`). A stopped task is not started again by the seat, and a Stop
+  seen once also cancels the retry after an app-server failure.
+- restarts a dead app-server once, resumes the thread and retries the task once. A second
+  failure in a row ends the seat with the task still pending.
+- for a worker, records the pool stage `pending` before a task's turn and `done` only after
+  its result exists, through `pool_delivery.py mark-done`, as the notifier does. A `done`
+  that could not be recorded is recorded again after 30 s, up to five times, without running
+  the task again.
+
+The seat reads its folders from a host declaration (`host.json` beside the thread file) in the
+`ag2-sparrow.supervised-host/1` schema, read by `src/agent/codex/app-server/supervised_host.py`
+(a minimal copy of the parser in the parked #6474, to be replaced by that module if it lands).
+No notifier session (`<session>-watcher`) and no observer session (`<session>-observer`) is
+started for a seat; the seat runs the standby task watcher as its own child
+(`SUTANDO_SEAT_WATCHER=0` leaves it out, and the seat then only polls).
+
+The core seat runs a task only once that watcher has announced it. The watcher gives each task
+to the core's task-event handler first (the pool's router, a required Team handler), and its
+`TASK_FILE:` line is what says the task is the core's; a task file that has only just landed is
+not, since its worker sentinel can be written a moment later. With no watcher running the core
+holds what the watcher would hold, and says so once: everything while a shutdown is in progress
+(`state/shutdown.sentinel`), and everything while a handler is declared
+(`state/task-event-handler.json`, readable or not) or pinned (`SUTANDO_TASK_EVENT_HANDLER`). Only
+a workspace known to declare none has nothing to route, and there the core polls as before.
+A worker seat's inbox is already the routing decision and is read directly.
+
+An announcement is for one file, not for a name. The seat starts its watcher with
+`SUTANDO_ANNOUNCE_GENERATION=1`, and the watcher then prints, before each `TASK_FILE:` line,
+`TASK_GENERATION: <name> <dev> <inode> <size> <mtime_ns>`: the file it read before it routed the
+task, on every emit path, the handler's fallback included (`<name> -` when it could not read
+one). The core runs a pending task only while the file in its inbox is that generation. A file
+put under the name at any later point, and a task announced without a generation, are held and
+logged once, until the watcher dispatches what is there and announces it. The admitted
+generation is carried to the dispatch and read once more, last, before every `turn/start`.
+The turn itself never reads the inbox: when a task is picked the seat opens its file once,
+checks that open file's generation before and after reading it, and writes those bytes to
+`state/codex-seat/<seat>/payloads/<task file>` (mode 0600, removed when the task ends). The
+prompt names that copy where the notifier's names the inbox path, so a turn that reads late
+still reads what was admitted. A result is settled for the task only while the admitted file
+is still in the inbox or has been renamed into the inbox's `archive/` (a rename keeps the
+generation); a file that is merely gone settles nothing. When it cannot be settled the result
+is moved to `state/codex-seat/<seat>/unsettled-results/`, so that a file now under the task's
+name is a pending task, not one answered by another task's result.
+A file whose generation the watcher cannot read, or that changes while it is being identified,
+is not announced and not recorded as dispatched: the watcher holds it and decides again on its
+next event, with no restart. Without the switch the watcher's output is unchanged, so no other
+reader of `TASK_FILE:` lines sees a difference.
+
+When the app-server child exits mid-turn the seat restarts it and retries the task once, on the
+same thread. Before every `turn/start`, the first attempt and the retry, with the server
+already running or just started, the seat reads the queue again: a task answered meanwhile is
+settled as done, and one that is no longer this seat's, or no longer the file that was
+admitted, is left alone.
+
+The terminal panel shows the seat's log: one line per task, turn, command and tool call. The
+same lines go to `<workspace>/logs/codex-seat.log` (a worker: `codex-seat-<session>.log`).
+
+Not supported under the flag yet:
+
+- Typing into the panel, and Codex slash commands. The panel is read-only.
+- Status and cards read from the pane: the runtime observation record, the core monitor's
+  prompt classification, limit and sign-in cards, pool wedge detection.
+- Delivering a task into a running turn (`turn/steer`). Tasks wait for the turn to end.
+
+Switching the core's model from the conversation (`skills/model-switch`) reaches the core seat
+without a restart: the seat passes the recorded model on its next `turn/start`. The pick is core-only
+(`<workspace>/state/model-switch.json`, `runtime: codex`), so pool workers keep their own model; a
+Codex TUI core takes it at its next start, when the launcher passes it as `-m`.
+
+The launch settings are carried over: `danger-full-access`, approvals `never`, the model, the
+working directory, and every `-c` override of the TUI launch, the worker's s-space MCP entry
+included. `--search` becomes `-c web_search="live"`. `--add-dir` and the bootstrap `READY`
+prompt have no counterpart; a worker's boot prompt becomes the thread's developer
+instructions. None of this has been run against a real Codex login yet.
+
+It is on unless turned off. To change it for every later launch, record the choice and restart
+from outside the core:
+
+```bash
+bash scripts/sutando-config.sh codex-app-server-select off   # the interactive TUI; `on` to go back
+bash src/agent/start-cli.sh --restart
+```
+
+In the AG2 Space app the same choice is the "Run Codex as a background service (app-server)"
+toggle on the Sutando core's settings row, which restarts the core for you. The choice lives in
+the desktop's `runtime.json` (`codexAppServer`) on a desktop install, else in
+`core.codex_app_server` of `<workspace>/sutando.config.local.json`;
+`bash scripts/sutando-config.sh codex-app-server` prints the resolved `1` or `0`.
+`codex-app-server-select` prints `updated` when it wrote the key and `unchanged` when the stored key
+already held that value. It compares the stored key, not the resolved value: on an install with
+nothing stored, `select on` writes the key and prints `updated` even though the default was on.
+Engine writers of `runtime.json` take one cross-process lock (`runtime.json.lock`) around each
+read-merge-replace, and replace only while the file still holds what they read: a desktop write
+landing in between is re-read and merged rather than dropped. That narrows, but cannot close, the
+window against a writer that skips the lock, so the desktop's own writer should take the same lock
+file. The workspace layer (`sutando.config.local.json`) is written the same way under its own lock.
+Nothing recorded means on. `SUTANDO_CODEX_APP_SERVER` set non-empty overrides the choice for one
+launch (`1` on, anything else off): `SUTANDO_CODEX_APP_SERVER=0 bash src/agent/start-cli.sh --restart`
+starts the TUI once.
+
+Turned off, the next restart replaces the seat's window with the TUI and brings the notifier
+and observer sessions back. A pool worker reads the same choice, through the same resolver, when
+it is spawned, unless the environment of the process that spawns it sets the variable. A seat's
+session is marked `SUTANDO_CODEX_SEAT=1`, not with the variable, so a worker spawned by a running
+seat core follows the choice saved since, not the mode the core started in.
+
+A seat reopens task intake (clears the shutdown sentinel) only once `seat.py` reports ready, its
+app-server initialized and its thread open (`state/codex-seat/<session>/ready`). If that does not
+happen within `SUTANDO_SEAT_READY_TIMEOUT` seconds (60), or the seat exits first, the launcher
+stops that seat (its session, or the healed window), the launch fails and intake stays shut, so the
+next launch starts a seat and checks readiness again instead of finding a half-started one. The seat
+is stopped by the tmux id its creation returned, never a name or index. If that stop cannot be confirmed
+(the kill fails, or tmux cannot be read), the launch fails loudly and marks intake held for that seat
+(`intake-held`); a later launch that finds it running accepts it only once it reports ready, and only
+then reopens intake.
 
 ## Rollback
 
