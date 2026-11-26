@@ -330,6 +330,27 @@ class CodexCard(Base):
         self.assertEqual((rc, out["status"], out["why"]), (1, "failed", "RuntimeError: no core lane"))
         self.assertEqual(self.fake.calls, [])
 
+    def test_the_room_line_says_only_that_details_are_in_the_dm_in_reply_to_the_owner(self):
+        import core_quota_notice
+        self.signed_in(A)
+        rc, out = self.run_(["room-line", "--room", ROOM, "--reply-to", "$ask", "--thread-root", "$root",
+                             "--operation-id", "core-quota-room-line:1:abc"])
+        self.assertEqual((rc, out["status"]), (0, "posted"))
+        self.assertEqual(self.fake.calls, [("room.message.send",
+                                            {"body": core_quota_notice.ROOM_LINE, "reply_to": "$ask",
+                                             "thread_root": "$root"},
+                                            "core-quota-room-line:1:abc", ROOM)])
+        # No card rides along, and nothing of the account reaches the room.
+        self.assertNotIn("alice", json.dumps(self.fake.calls))
+
+    def test_the_room_line_refuses_the_owner_dm_and_ids_that_are_not_ids(self):
+        for argv in (["--room", DM, "--reply-to", "$ask"], ["--room", ROOM, "--reply-to", "ask"],
+                     ["--room", "team", "--reply-to", "$ask"],
+                     ["--room", ROOM, "--reply-to", "$ask", "--thread-root", "root"]):
+            rc, out = self.run_(["room-line", *argv, "--operation-id", "op"])
+            self.assertEqual((rc, out["status"]), (2, "refused"), argv)
+        self.assertEqual(self.fake.calls, [])
+
     def test_the_card_goes_only_to_the_owner_dm(self):
         self.signed_in(A)
         rc, out = self.run_(["post", "--room", ROOM])

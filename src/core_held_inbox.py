@@ -61,7 +61,8 @@ class HeldInbox:
         script = self.repo / "skills" / "account-switch" / "scripts" / "account_card.py"
         self.quota = quota if quota is not None else core_quota_notice.QuotaNotice(
             self.ws, "Claude Code", core_quota_notice.card_sender([sys.executable, str(script)], self.ws, log),
-            log, runtime="claude")
+            log, runtime="claude",
+            room_send=core_quota_notice.room_line_sender([sys.executable, str(script)], self.ws, log))
         if intercept is None:
             import switch_card_intercept
             intercept = lambda p: switch_card_intercept.intercept(p, self.ws, self.ws / "results", self.repo)  # noqa: E731

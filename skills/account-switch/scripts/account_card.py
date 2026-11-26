@@ -6,6 +6,8 @@
     python3 account_card.py [--workspace WS] reply --task-file PATH
     python3 account_card.py [--workspace WS] switch --room ROOM --key KEY --attempt ID
     python3 account_card.py [--workspace WS] status
+    python3 account_card.py [--workspace WS] room-line --room ROOM --reply-to EVENT --operation-id ID
+                                              [--thread-root EVENT]
 
 `post` sends the card to the owner's checked DM and records it (src/issued_cards.py), so only the
 owner's tap on it acts (agent_card.click_verdict); without `--room` it goes to that DM. `--signed-out`
@@ -41,6 +43,10 @@ the restart was requested, whether a fresh heartbeat came, that the saved sign-i
 and that the running core's own account isn't confirmed; or why not. It never says the core
 restarted: a heartbeat shows the session alive, not which process or account answers in it. When the restart definitely did not happen (graceful-restart exit 3/4/5), the
 previous state, absence included, is put back; after any other failure the new sign-in stays.
+
+`room-line` is the other half of the quota notice: in a shared room where the owner asked while the
+core cannot answer, it posts core_quota_notice.ROOM_LINE in reply to that message and nothing else, so
+no account, plan, model or reset time reaches the room. It refuses the owner's DM, which has the card.
 
 Every command prints one JSON object. Exit 0 done, 1 a negative answer, 2 refused. Stdlib only.
 """
@@ -583,6 +589,30 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time, run=subp
     return _emit(out, 0 if out["status"] == "posted" else 1)
 
 
+def cmd_room_line(ws: Path, args, *, core=None, execute=None) -> int:
+    """Post ROOM_LINE in a shared room, in reply to the owner's message there; never in the owner's DM."""
+    from core_quota_notice import ROOM_LINE
+    if not args.room.startswith("!") or not args.reply_to.startswith("$") or not args.operation_id:
+        return _emit({"status": "refused", "why": "needs a room id, the message's event id and an operation id"}, 2)
+    if args.thread_root and not args.thread_root.startswith("$"):
+        return _emit({"status": "refused", "why": "the thread root is not an event id"}, 2)
+    try:
+        core = core if core is not None else _core(ws)
+        if args.room == _owner_dm(ws, core):
+            return _emit({"status": "refused", "why": "the owner's DM gets the card, not the room line"}, 2)
+        execute = execute if execute is not None else _execute(ws, str(core.get("instance") or "") or None)
+        arguments = {"body": ROOM_LINE, "reply_to": args.reply_to}
+        if args.thread_root:
+            arguments["thread_root"] = args.thread_root
+        answer = execute("room.message.send", arguments, operation_id=args.operation_id, room_id=args.room)
+    except Exception as e:  # noqa: BLE001 - no core lane or no credential: named, nothing posted
+        return _emit({"status": "failed", "why": f"{type(e).__name__}: {e}"}, 1)
+    eid = ac._event_id(answer) if isinstance(answer, dict) else ""
+    if not eid or answer.get("is_error"):
+        return _emit({"status": "failed", "why": "room.message.send did not post the line"}, 1)
+    return _emit({"status": "posted", "event_id": eid})
+
+
 # ── a tap ─────────────────────────────────────────────────────────────────────────────────────────
 
 def running(ws: Path, now: float) -> dict:
@@ -923,6 +953,11 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, run=subp
     w.add_argument("--key", required=True)
     w.add_argument("--attempt", required=True)
     sub.add_parser("status")
+    ln = sub.add_parser("room-line")
+    ln.add_argument("--room", required=True)
+    ln.add_argument("--reply-to", required=True)
+    ln.add_argument("--thread-root", default="")
+    ln.add_argument("--operation-id", required=True)
     args = p.parse_args(argv)
     if args.workspace:
         ws = Path(args.workspace)
@@ -931,6 +966,8 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, run=subp
         ws = Path(resolve_workspace())
     if args.cmd == "post":
         return cmd_post(ws, args, core=core, execute=execute, run=run, codex_read=codex_read)
+    if args.cmd == "room-line":
+        return cmd_room_line(ws, args, core=core, execute=execute)
     if args.cmd == "reply":
         return cmd_reply(ws, args, core=core, execute=execute, popen=popen, run=run, codex_read=codex_read)
     if args.cmd == "switch":

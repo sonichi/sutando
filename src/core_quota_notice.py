@@ -10,13 +10,16 @@ gone, or the reset time given has passed) and came back.
 The episode lives in `<workspace>/state/core-quota-card.json`, so a restart does not send it again.
 
 The card is sent by a command the adapter injects (the account card's `post --owner-dm --lead`), which
-posts it to the owner's checked DM only. A card that could not be posted is tried again no sooner
+posts it to the owner's checked DM only. An owner message asked in a shared s.space room gets ROOM_LINE
+there, in reply to it, once per room per episode and only after the DM was told (`room_send`, the account
+card's `room-line`): the room learns the core is not ignoring it, and nothing about the account. A card that could not be posted is tried again no sooner
 than RETRY_S, unless the caller tells the limit with a notice of its own instead (`yield_to_notice`):
 the Claude Code monitor's card replaces its paused notice, so the owner gets one message per limit.
 Nothing here changes an account. English only.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -29,6 +32,9 @@ RETRY_S = 60.0
 CARDED_KEEP = 100   # the owner messages already answered with the card, this episode
 SEND_TIMEOUT_S = 90.0
 AGAIN_TRIES = 5     # a follow-up card that failed is tried this many times in all, RETRY_S doubling between
+# Names no account, plan, model or reset time: everyone in the room reads it.
+ROOM_LINE = "I can't answer right now \u2014 I've sent details to your DM."
+ROOM_LINE_TRIES = 3  # the operation id is stable per room and episode, so a retry cannot post twice
 
 # The runtime's own words for when the limit ends ("try again at 3:05 PM", "resets in 2 hours"); only
 # time-like characters of them are kept, so nothing else of the error reaches the DM.
@@ -119,15 +125,66 @@ def card_sender(argv: Sequence[str], workspace, log: Callable[..., None] = print
     return send
 
 
+def room_line_sender(argv: Sequence[str], workspace, log: Callable[..., None] = print,
+                     run=subprocess.run) -> Callable[..., bool]:
+    """send(room, reply_to, thread_root, operation_id) -> posted: runs the injected account card
+    command's `room-line`, which posts ROOM_LINE and nothing else."""
+    def send(room: str, reply_to: str, thread_root: str, operation_id: str) -> bool:
+        cmd = [*argv, "--workspace", str(workspace), "room-line", "--room", room, "--reply-to", reply_to,
+               "--operation-id", operation_id]
+        if thread_root:
+            cmd += ["--thread-root", thread_root]
+        try:
+            r = run(cmd, capture_output=True, text=True, timeout=SEND_TIMEOUT_S, stdin=subprocess.DEVNULL)
+            out = json.loads((r.stdout or "").strip().splitlines()[-1])
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError) as e:
+            log("room line not sent:", type(e).__name__)
+            return False
+        if not isinstance(out, dict) or out.get("status") != "posted":
+            log("room line not posted:", str((out or {}).get("why") or "no answer")[:200])
+            return False
+        return True
+    return send
+
+
+def room_asks(workspace, tasks: Sequence[str]) -> list:
+    """[(room, message id, thread root)] for the owner's messages among `tasks` asked in a shared
+    s.space room, the first per room in the order given. Read from each task's attested headers; a DM,
+    another sender's message, or one without its message id is left out."""
+    import task_envelope
+    from local_task_protocol import canonical_access_tier
+    out, rooms = [], set()
+    for tid in tasks:
+        if not re.fullmatch(r"[\w.~:@+-]{1,200}", str(tid)):
+            continue
+        try:
+            text = (Path(workspace) / "tasks" / f"{tid}.txt").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        h = task_envelope.attested_task_headers(text, Path(workspace)).headers
+        room = (h.get("channel_id") or h.get("source_room_id") or "").strip()
+        msg = (h.get("source_message_id") or "").strip()
+        if (h.get("source") or "").strip() != "ag2space" or (h.get("channel_kind") or "").strip() in ("", "dm") \
+                or canonical_access_tier(h.get("access_tier")) != "owner" \
+                or not room.startswith("!") or not msg.startswith("$") or room in rooms:
+            continue
+        rooms.add(room)
+        root = (h.get("thread_root") or "").strip()
+        out.append((room, msg, root if root.startswith("$") else msg))
+    return out
+
+
 class QuotaNotice:
-    """`send(text) -> bool` posts the account card led by `text`; `name` is the runtime as the owner reads it."""
+    """`send(text) -> bool` posts the account card led by `text`; `name` is the runtime as the owner reads it.
+    `room_send` (room_line_sender) answers an owner message asked in a shared room with ROOM_LINE."""
 
     def __init__(self, workspace, name: str, send: Callable[[str], bool], log: Callable[..., None] = print,
                  now: Callable[[], float] = time.time, runtime: str = "",
-                 account: Optional[Callable[[], str]] = None):
+                 account: Optional[Callable[[], str]] = None, room_send: Optional[Callable[..., bool]] = None):
         self.path = Path(workspace).joinpath(*FILE)
         self.workspace = Path(workspace)
         self.name, self.send, self.log, self.now = name, send, log, now
+        self.room_send = room_send
         # With `runtime` ("codex" | "claude"), the limit is also recorded in core_account_health.
         self.runtime, self.account = runtime, account
 
@@ -191,6 +248,41 @@ class QuotaNotice:
 
     def hit(self, reset: str = "", reset_at=None, tasks: Sequence[str] = (), why: str = "quota",
             credits: bool = False) -> str:
+        """`_hit`, then the room line for each shared room an owner message in `tasks` waits in."""
+        done = self._hit(reset, reset_at, tasks, why, credits)
+        try:
+            self.tell_rooms(tasks)
+        except Exception as e:  # noqa: BLE001 - the room line never stops the core's adapter
+            self.log("room line not sent:", type(e).__name__)
+        return done
+
+    def tell_rooms(self, tasks: Sequence[str]) -> int:
+        """ROOM_LINE in reply to the first owner message of each shared room in `tasks`, once per room
+        this episode, and only once the DM was told. The number of rooms it was posted in now."""
+        rec = self.load()
+        if self.room_send is None or not tasks or not (rec.get("since") and rec.get("told")):
+            return 0
+        posted = 0
+        for room, msg, root in room_asks(self.workspace, [str(t) for t in tasks if t]):
+            rec = self.load()
+            lined = [r for r in rec.get("rooms") or [] if isinstance(r, str)]
+            tries = rec.get("room_tries") if isinstance(rec.get("room_tries"), dict) else {}
+            if room in lined or int(tries.get(room) or 0) >= ROOM_LINE_TRIES:
+                continue
+            # Counted before the send: a stop mid-send costs a try, never a second line.
+            if not self.save(dict(rec, room_tries={**tries, room: int(tries.get(room) or 0) + 1})):
+                continue
+            op = "core-quota-room-line:%d:%s" % (int(float(rec["since"])),
+                                                 hashlib.sha256(room.encode()).hexdigest()[:16])
+            if self.room_send(room, msg, root, op):
+                rec = self.load()
+                self.save(dict(rec, rooms=([r for r in rec.get("rooms") or [] if isinstance(r, str)]
+                                           + [room])[-CARDED_KEEP:]))
+                posted += 1
+        return posted
+
+    def _hit(self, reset: str = "", reset_at=None, tasks: Sequence[str] = (), why: str = "quota",
+             credits: bool = False) -> str:
         """The runtime said it is out of usage (`why` SIGNED_OUT: it is signed out, told the same way). 'quota-card' (posted to the owner's DM), 'quota-not-posted'
         (tried again later), or '' (told already this episode, or tried too recently). `tasks`: the
         owner's messages now waiting on the limit; each gets the card once ('quota-card-again')."""

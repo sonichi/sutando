@@ -1497,7 +1497,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 turn_timeout=_number("SUTANDO_SEAT_TURN_TIMEOUT", 0.0),
                 quota=None if a.worker or not ACCOUNT_CARD.is_file() else core_quota_notice.QuotaNotice(
                     workspace, "Codex", core_quota_notice.card_sender([sys.executable, str(ACCOUNT_CARD)], workspace, log),
-                    log))
+                    log, room_send=core_quota_notice.room_line_sender([sys.executable, str(ACCOUNT_CARD)], workspace, log)))
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, seat.request_stop)
     watcher = Watcher(host.inbox, seat.wake) if a.watcher else None

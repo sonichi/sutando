@@ -1353,7 +1353,8 @@ def main():
         quota = core_quota_notice.QuotaNotice(
             workspace, "Claude Code",
             core_quota_notice.card_sender([_sys.executable, a.quota_card_script], workspace, _log), _log,
-            runtime="claude")
+            runtime="claude",
+            room_send=core_quota_notice.room_line_sender([_sys.executable, a.quota_card_script], workspace, _log))
     while True:
         # Before the capture, so this tick reads the pane a recovery action left.
         if a.chat_escalation:

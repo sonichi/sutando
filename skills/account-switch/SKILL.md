@@ -27,6 +27,12 @@ that sends the owner's "retry now" (the Claude core's limit hold acts on it; a C
 `--owner-dm` and leaving out `--room` go to the same DM; with `--signed-out`, `--lead` replaces the
 "isn't signed in anymore" line.
 
+`room-line --room <room> --reply-to <event> --operation-id <id>` is the quota notice's other half:
+when the owner asked in a shared room while the core is out of usage or signed out, it posts one fixed
+line there, in reply to that message ("I can't answer right now — I've sent details to your DM."),
+once per room per limit and only after the DM card went out. It says nothing of the account and
+refuses the owner's DM. Never post it yourself.
+
 Never start a sign-in yourself, and never ask for, accept or repeat a sign-in code, link code or
 token in chat. If the owner pastes one, do not use it; tell them to paste it in Settings, in the
 app's own box.

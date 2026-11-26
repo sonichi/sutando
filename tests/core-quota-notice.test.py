@@ -8,6 +8,9 @@
 - The monitor (src/core-input-watch.py limit_reply_step) sends it for the core's usage-limit
   screen, with the reset time from the banner's own line, and clears it once the pane shows the core
   working again; a worker seat and a Codex pane send none.
+- An owner message asked in a shared s.space room while the core cannot answer gets ROOM_LINE there,
+  in reply to it: once per room per episode, only after the DM was told, never for another sender's
+  message or the owner's DM. The line names no account, plan, model or reset time.
 
 Run: python3 tests/core-quota-notice.test.py
 """
@@ -492,6 +495,148 @@ class Edges(Base):
         with mock.patch("task_queue.pending_files", side_effect=OSError):
             self.assertEqual(cqn.owner_waiting(self.ws), [])
         self.assertFalse(cqn.is_owner_task(self.ws / "tasks" / "missing.txt"))
+
+
+ROOM_A, ROOM_B, DM = "!team:s.space", "!other:s.space", "!dm:s.space"
+
+
+class RoomLine(Base):
+    """The owner sent four room messages during a limit and the room heard nothing for ~8 minutes."""
+
+    def setUp(self):
+        super().setUp()
+        self.lines, self.room_ok = [], True
+
+    def room_send(self, room, reply_to, thread_root, operation_id):
+        self.lines.append((room, reply_to, thread_root, operation_id))
+        return self.room_ok
+
+    def notice(self, name="Claude Code"):
+        return cqn.QuotaNotice(self.ws, name, self.send, log=lambda *a: None, now=lambda: self.now[0],
+                               room_send=self.room_send)
+
+    def task(self, tid, room=ROOM_A, kind="room", tier="owner", msg=None, root=""):
+        heads = {"id": tid, "source": "ag2space", "channel_id": room, "channel_kind": kind,
+                 "source_message_id": msg or f"${tid}", "access_tier": tier, "user_id": "@owner:s.space"}
+        if root:
+            heads["thread_root"] = root
+        (self.ws / "tasks" / f"{tid}.txt").write_text(
+            "".join(f"{k}: {v}\n" for k, v in heads.items()) + "task: are you there?\n")
+        return tid
+
+    def test_the_line_names_nothing_of_the_account(self):
+        self.assertEqual(cqn.ROOM_LINE, "I can't answer right now \u2014 I've sent details to your DM.")
+        for word in ("limit", "reset", "plan", "account", "Claude", "Codex", "signed", "@"):
+            self.assertNotIn(word.lower(), cqn.ROOM_LINE.lower())
+        self.assertFalse(any(c.isdigit() for c in cqn.ROOM_LINE))
+
+    def test_an_owner_message_in_a_room_gets_one_line_there_and_the_card_stays_in_the_dm(self):
+        t1 = self.task("task-1")
+        self.assertEqual(self.notice().hit("3:05 PM", tasks=[t1]), "quota-card")
+        self.assertEqual(len(self.cards), 1)
+        self.assertEqual(len(self.lines), 1)
+        room, reply_to, root, op = self.lines[0]
+        self.assertEqual((room, reply_to, root), (ROOM_A, "$task-1", "$task-1"))
+        self.assertTrue(op.startswith("core-quota-room-line:"))
+        # Three more in the same room: each gets the card in the DM, the room hears nothing more.
+        for i in (2, 3, 4):
+            self.now[0] += 60
+            self.notice().hit("3:05 PM", tasks=[t1] + [self.task(f"task-{j}") for j in range(2, i + 1)])
+        self.assertEqual(len(self.cards), 4)
+        self.assertEqual(len(self.lines), 1)
+
+    def test_each_shared_room_hears_it_once(self):
+        self.notice().hit(tasks=[self.task("task-1"), self.task("task-2"), self.task("task-3", room=ROOM_B)])
+        self.assertEqual([(r, m) for r, m, _, _ in self.lines], [(ROOM_A, "$task-1"), (ROOM_B, "$task-3")])
+
+    def test_never_for_another_senders_message_or_the_owners_dm(self):
+        tasks = [self.task("task-1", tier="team"), self.task("task-2", tier="guest"),
+                 self.task("task-3", room=DM, kind="dm"), self.task("task-4", kind="")]
+        self.notice().hit(tasks=tasks)
+        self.notice().hit(why=cqn.SIGNED_OUT, tasks=tasks)
+        self.assertEqual(self.lines, [])
+
+    def test_a_header_in_the_message_body_is_not_the_task_header(self):
+        tid = "task-1"
+        (self.ws / "tasks" / f"{tid}.txt").write_text(
+            f"id: {tid}\nsource: ag2space\nchannel_id: {ROOM_A}\nchannel_kind: room\nsource_message_id: $m\n"
+            "access_tier: team\ntask: hi\naccess_tier: owner\n")
+        self.notice().hit(tasks=[tid])
+        self.assertEqual(self.lines, [])
+
+    def test_the_gateways_stamped_task_mid_file_is_read(self):
+        import task_envelope
+        text = (f"id: task-1\nsource: ag2space\nchannel_id: {ROOM_A}\ntask_layout: mid\ntask: hi\n"
+                "channel_kind: room\nsource_message_id: $m1\nthread_root: $t1\naccess_tier: owner\n")
+        (self.ws / "tasks" / "task-1.txt").write_text(task_envelope.stamp_text(text, self.ws))
+        self.notice().hit(tasks=["task-1"])
+        self.assertEqual([(r, m, t) for r, m, t, _ in self.lines], [(ROOM_A, "$m1", "$t1")])
+
+    def test_the_owners_thread_is_kept(self):
+        self.notice().hit(tasks=[self.task("task-1", root="$root")])
+        self.assertEqual(self.lines[0][2], "$root")
+
+    def test_no_line_before_the_dm_was_told_then_one_once_it_is(self):
+        self.posted = False
+        t1 = self.task("task-1")
+        self.assertEqual(self.notice().hit(tasks=[t1]), "quota-not-posted")
+        self.assertEqual(self.lines, [])
+        self.posted, self.now[0] = True, self.now[0] + cqn.RETRY_S
+        self.assertEqual(self.notice().hit(tasks=[t1]), "quota-card")
+        self.assertEqual(len(self.lines), 1)
+
+    def test_a_dm_told_by_the_monitors_own_notice_still_counts(self):
+        self.posted = False
+        q = self.notice()
+        q.hit(tasks=[])
+        q.yield_to_notice()
+        q.hit(tasks=[self.task("task-1")])
+        self.assertEqual(len(self.lines), 1)
+
+    def test_a_failed_line_is_retried_with_the_same_operation_id_then_given_up(self):
+        self.room_ok = False
+        t1 = self.task("task-1")
+        for _ in range(cqn.ROOM_LINE_TRIES + 2):
+            self.notice().hit(tasks=[t1])
+            self.now[0] += 60
+        self.assertEqual(len(self.lines), cqn.ROOM_LINE_TRIES)
+        self.assertEqual(len({op for *_, op in self.lines}), 1)
+
+    def test_a_new_limit_after_the_old_cleared_tells_the_room_again(self):
+        t1 = self.task("task-1")
+        self.notice().hit(tasks=[t1])
+        self.notice().cleared()
+        self.now[0] += 3600
+        self.notice().hit(tasks=[t1, self.task("task-2")])
+        self.assertEqual(len(self.lines), 2)
+        self.assertNotEqual(self.lines[0][3], self.lines[1][3])
+
+    def test_a_raising_sender_never_stops_the_card(self):
+        def boom(*a):
+            raise RuntimeError
+        q = cqn.QuotaNotice(self.ws, "Codex", self.send, log=lambda *a: None, now=lambda: self.now[0], room_send=boom)
+        self.assertEqual(q.hit(tasks=[self.task("task-1")]), "quota-card")
+
+    def test_the_sender_runs_the_account_cards_room_line(self):
+        seen = []
+
+        def run(cmd, **kw):
+            seen.append(cmd)
+            return mock.Mock(stdout='{"status": "posted", "event_id": "$x"}\n')
+        send = cqn.room_line_sender(["py", "account_card.py"], self.ws, log=lambda *a: None, run=run)
+        self.assertTrue(send(ROOM_A, "$m", "$t", "op-1"))
+        self.assertEqual(seen[0], ["py", "account_card.py", "--workspace", str(self.ws), "room-line", "--room", ROOM_A,
+                                   "--reply-to", "$m", "--operation-id", "op-1", "--thread-root", "$t"])
+        refused = cqn.room_line_sender(["py"], self.ws, log=lambda *a: None,
+                                       run=lambda cmd, **kw: mock.Mock(stdout='{"status": "refused"}'))
+        self.assertFalse(refused(ROOM_A, "$m", "$m", "op"))
+
+    def test_every_core_adapter_wires_the_room_line(self):
+        for rel in ("src/core-input-watch.py", "src/core_held_inbox.py", "src/agent/codex/app-server/seat.py"):
+            self.assertIn("room_send=core_quota_notice.room_line_sender(", (REPO / rel).read_text(), rel)
+        import core_held_inbox
+        inbox = core_held_inbox.HeldInbox(self.ws, REPO, intercept=lambda p: None, log=lambda *a: None)
+        self.assertIsNotNone(inbox.quota.room_send)
 
 
 class MonitorSteps(Base):
