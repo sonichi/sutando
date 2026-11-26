@@ -22,7 +22,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from ... import _dirs, connect_bridge as cb, connect_common as cm, model_settings, task_io
+from ... import _dirs, connect_bridge as cb, connect_common as cm, live_view, model_settings, task_io
 from ...acp_client import AUTH_REQUIRED, AcpError
 from ...connect_bridge import EXTERNAL, UNIT
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, Shape
@@ -357,6 +357,21 @@ def verify(args, factory=gc.AcpClient) -> int:
     return 0 if all(results) else 1
 
 
+def view(args) -> int:
+    """Follow the agent's live view until interrupted. Reads one file under its work root; types nothing."""
+    local, problem = selected(args)
+    if not problem:
+        cfg, problem = load_config(local)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    try:
+        live_view.follow(live_view.path_of(cm.work_root(cfg)))
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def uninstall(args) -> int:
     local, problem = selected(args)
     if problem:
@@ -429,6 +444,9 @@ def main(argv=None) -> int:
     cm.job_options(v)
     v.add_argument("--no-probe", action="store_true", help="skip starting the ACP command")
     v.set_defaults(func=verify)
+    cm.job_options(sub.add_parser("view", help="follow what the agent is doing, read-only: agy runs over ACP with no "
+                                  "terminal of its own, so this prints each turn's words, tool calls and permission "
+                                  "decisions as the connector sees them. Ends with Ctrl-C")).set_defaults(func=view)
     cm.job_options(sub.add_parser("uninstall", help="stop the job, then remove what install wrote (config last)")
                    ).set_defaults(func=uninstall)
     sub.add_parser("list", help="each job installed here").set_defaults(func=list_cmd)
