@@ -286,7 +286,7 @@ class AccountCardTest(unittest.TestCase):
         (queued,) = self.outbox()
         card = queued["card"]
         self.assertEqual((queued["room"], card["id"], card["state"]), (DM, account_switch.CARD, "pending"))
-        self.assertEqual(card["account_controls"], {"runtime": "antigravity", "agent": AGENT})
+        self.assertEqual(card["account_controls"], {"runtime": "antigravity", "agent": AGENT, "limit": True})
         self.assertEqual(card["text"], "Antigravity has reached its usage limit (it does not say when that resets), so "
                                        "I can't answer until then. Switch to another account or an API key to go on "
                                        "now. I'm using this computer's Google sign-in. Switch this agent's account or "

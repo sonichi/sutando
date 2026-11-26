@@ -2489,7 +2489,8 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         (queued,) = self.outbox()
         card = queued["card"]
         self.assertEqual((queued["room"], card["id"], card["state"]), (self.DM, account_switch.CARD, "pending"))
-        self.assertEqual(card["account_controls"], {"runtime": "codex"})
+        # `limit`: the app lists it with what the agent waits on, apart from an account menu the owner asked for.
+        self.assertEqual(card["account_controls"], {"runtime": "codex", "limit": True})
         self.assertRegex(card["text"], r"^Codex has reached its usage limit \(resets (?:[A-Z][a-z]{2} \d{1,2}, )?\d{1,2}:\d\d [AP]M\), so I can't "
                                        r"answer until then\. Switch to another account or an API key to go on now\. "
                                        r"I'm using alice@example\.com\. " + re.escape(account_switch.BELOW) + "$")

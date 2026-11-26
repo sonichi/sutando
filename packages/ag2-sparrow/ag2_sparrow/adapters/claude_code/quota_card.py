@@ -35,7 +35,7 @@ import time
 import uuid
 from pathlib import Path
 
-from ... import card_desk, claude_local_records as records, connect_bridge as cb, connector_cards
+from ... import account_switch, card_desk, claude_local_records as records, connect_bridge as cb, connector_cards
 from ...cli_wedge_patterns import ABNORMAL_PATTERNS, PROVIDER_LIMIT_PATTERNS
 from . import account_card, detector, inbox
 
@@ -322,7 +322,8 @@ def _tell_tasks(root, cfg: dict, bridge: str, limited: list, text: str, log, rec
             card = account_card.AccountCard(root, cfg, lambda result_file, body: None, log)
             said = _card_words(card, limited, text, log)
         try:
-            qid = connector_cards.queue(bridge, to, *card.card("pending", said, ask=True), key=entry["key"],
+            qid = connector_cards.queue(bridge, to, *account_switch.limited(card.card("pending", said, ask=True)),
+                                        key=entry["key"],
                                         at_ns=entry["at"], again=bool(entry.get("again")))
         except (OSError, ValueError) as e:
             log("quota card for %s not queued:" % task_id, "%s: %s" % (type(e).__name__, e))
@@ -426,7 +427,7 @@ def _tell_incident(root, cfg: dict, bridge: str, limited: list, text: str, log, 
     if not card_desk.usable(bridge):
         return "quota-not-posted"
     card = account_card.AccountCard(root, cfg, lambda result_file, body: None, log)
-    built = card.card("pending", _card_words(card, limited, text, log), ask=True)
+    built = account_switch.limited(card.card("pending", _card_words(card, limited, text, log), ask=True))
     try:
         qid = connector_cards.queue(bridge, to, *built, key=rec["key"], at_ns=rec["at"], again=bool(rec.get("again")))
     except (OSError, ValueError) as e:
