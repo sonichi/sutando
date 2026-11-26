@@ -470,6 +470,7 @@ class Connector:
         # The current turn's error when it said the account is out of usage, or its login no longer works.
         self.turn_limit = self.turn_unauth = None
         self.turn_worked = False
+        self.turn_login = None    # the stat of the login file the current attempt was sent on
         self.auth_note = ""       # what was done about the login for the current task, for its metrics row
         self.turn_ran_on = None   # the model the current turn was asked to run on (None: the thread's own)
 
@@ -545,10 +546,11 @@ class Connector:
         return [st.st_ino, st.st_size, st.st_mtime_ns]
 
     def note_login_refused(self, refused: bool) -> None:
-        """Keep (or drop) Codex's own refusal of the login on disk, tied to that very file: any rewrite of it
-        (a new sign-in, a refresh by a copy sharing it) is a login nobody has refused yet."""
+        """Keep (or drop) Codex's own refusal of the login the last attempt was sent on, tied to that very file:
+        any rewrite of it (a new sign-in, a refresh by a copy sharing it) is a login nobody has refused yet."""
         path = os.path.join(self.args.state, LOGIN_REFUSED)
-        stamp = self._login_stamp() if refused else None
+        # The login the refused attempt was sent on: a switch while it ran is a login nobody has refused.
+        stamp = self.turn_login if refused else None
         try:
             if stamp is None:
                 os.unlink(path)
@@ -1053,6 +1055,7 @@ class Connector:
         self.turn_limit = self.turn_unauth = None
         self.auth_note = ""
         for attempt in (1, 2):
+            self.turn_login = self._login_stamp()     # the login this attempt is sent on, for a refusal of it
             try:
                 turn = self.open_turn(headers, caps, prompt)
             except IntegrationsUnknown as e:

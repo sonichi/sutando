@@ -1343,6 +1343,17 @@ class AccountCardTest(CardWorld, unittest.TestCase):
             # Any rewrite of the login (a new sign-in, a refresh by a copy sharing it) is a login nobody refused yet.
             (self.home / "auth.json").write_text('{"x": 1}')
             self.assertFalse(accounts.status()[1])
+            # A switch between an attempt's dispatch and its refusal: the refusal is of the login it was sent on,
+            # never of the newly switched one.
+            c = cc.Connector(FakeRpc, args, note="n")
+            c.turn_login = c._login_stamp()
+            os.unlink(self.home / "auth.json")
+            (self.home / "auth.json").write_text('{"switched": true}')
+            c.note_login_refused(True)
+            self.assertFalse(c.accounts.status()[1], "the new login is not called lapsed")
+            c.turn_login = c._login_stamp()
+            c.note_login_refused(True)
+            self.assertTrue(c.accounts.status()[1], "a refusal of the login now on disk still counts")
 
     def test_a_turn_that_had_started_work_is_never_run_again_after_an_unauthorized_end(self):
         (self.home / "stub-token").write_text("tok-a")
