@@ -24,7 +24,7 @@ import sys
 import time
 from pathlib import Path
 
-from ... import claude_model_switch, connect_common as cm, task_io, tmux_pane_keys, tmux_probe
+from ... import claude_model_switch, connect_common as cm, signin_watch, task_io, tmux_pane_keys, tmux_probe
 from ...file_lock import locked_file
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
 from . import detector, hmac_policy, hold, inbox, trust
@@ -41,6 +41,7 @@ CONSUMER_WAIT_S = 30.0
 INNER_STOP_S = 120.0
 TITLE_CHANGED = "title changed"
 MODEL_ACCEPT_S = 20.0
+SIGNIN_CHECK_S = 5.0       # how often the sign-in file's stat is looked at
 # The names that may be typed, Claude Code's two texts and its input-box check are the core's
 # (src/claude_model_switch.py, bundled verbatim): one source for the skill and for this adapter.
 MODEL_RE, MODEL_SET, MODEL_CONFIRM = claude_model_switch.MODEL_RE, claude_model_switch.MODEL_SET, claude_model_switch.MODEL_CONFIRM
@@ -199,6 +200,33 @@ def configured_tmux(cfg: dict, environ=None, job: "cm.Shape | None" = None) -> "
                                                                     % (recorded, install))
     found = tmux_candidates("", environ)
     return (found[0], "") if found else ("", "the config records no TMUX and no tmux was found; run %s" % install)
+
+
+# Claude Code's usage-limit menu, whole and at the foot of the pane: its question, its option rows in order
+# (the first is the wait, one is selected) and its key hint. One line that reads like an option is not it.
+_MENU_HEAD = re.compile(r"^\s*What do you want to do\?\s*$")
+_MENU_ROW = re.compile(r"^\s*(?P<sel>[\u276f>])?\s*(?P<n>\d+)\.\s+(?P<text>\S.*)$")
+_MENU_WAIT = re.compile(r"^(?:stop and )?wait for (?:the |your )?(?:[\w-]+ )?limit to reset\b", re.I)
+_MENU_FOOT = re.compile(r"\bEsc to cancel\b")
+LIMIT_MENU_LINES = 12
+
+
+def limit_menu(pane) -> bool:
+    """Whether the pane ends in the usage-limit menu, the dialog no turn gets past."""
+    lines = [ln for ln in (pane or "").splitlines() if ln.strip()][-LIMIT_MENU_LINES:]
+    if len(lines) < 4 or not _MENU_FOOT.search(lines[-1]):
+        return False
+    at, rows = len(lines) - 2, []
+    while at >= 0:
+        row = _MENU_ROW.match(lines[at])
+        if not row:
+            break
+        rows.insert(0, row)
+        at -= 1
+    if at < 0 or not _MENU_HEAD.match(lines[at]) or len(rows) < 2:
+        return False
+    return ([int(r.group("n")) for r in rows] == list(range(1, len(rows) + 1))
+            and sum(1 for r in rows if r.group("sel")) == 1 and bool(_MENU_WAIT.match(rows[0].group("text"))))
 
 
 class Tmux:
@@ -376,6 +404,15 @@ class Launcher:
         self.store_root = Path(cfg["HITL_STORE"]) if cfg.get("HITL_STORE") else None
         self.supervisor_lock = self.config_dir / SUPERVISOR_LOCK
         self.opaque = card.opaque_install(task_io.install_id(), self.root)
+        # The account the pane's claude started with is recorded (as a fingerprint, with that consumer) in
+        # the supervisor record; another one in `.claude.json` restarts the session once its turn ends.
+        home = (os.environ if environ is None else environ).get("HOME", "")
+        conf = trust.config_file(cfg.get("CLAUDE_CONFIG_DIR", ""), home=home)
+        # The desktop's switch may change only the Keychain item, so its marker in the config dir counts too.
+        marker_dir = signin_watch.claude_config_dir(cfg.get("CLAUDE_CONFIG_DIR", ""), home)
+        self.signin = signin_watch.SigninWatch([conf, os.path.join(marker_dir, signin_watch.MARKER)],
+                                               lambda: signin_watch.claude_identity(conf, marker_dir))
+        self.signin_next, self.signin_waiting = 0.0, False
 
     # ── the record, always under the supervisor lock ─────────────────────────
 
@@ -436,7 +473,7 @@ class Launcher:
         consumer, title = await_consumer(self.tm, self.root, generation["pane_id"], sleep=self.sleep)
         if consumer is None:
             return False, "no consumer attached within %d s of the session's start" % CONSUMER_WAIT_S
-        self._with_record(lambda r: dict(r, consumer=consumer, title_token=title))
+        self._with_record(lambda r: dict(r, consumer=consumer, title_token=title, signin=self.signin_mark(consumer)))
         self.log("created session %s (pane %s, claude pid %d)" % (generation["session_id"], generation["pane_id"], consumer["pid"]))
         return True, ""
 
@@ -678,6 +715,73 @@ class Launcher:
                            "nothing recorded" % model)
         return False, "unconfirmed: /model %s was sent but Claude Code did not report the switch in %d s" % (model, wait_s)
 
+    # ── the sign-in: an account switched under the running claude ───────────
+
+    def signin_mark(self, consumer) -> "dict | None":
+        """What the supervisor record keeps of the sign-in a consumer started on; None when unreadable."""
+        now = self.signin.current()
+        return {"fp": signin_watch.fingerprint(now), "consumer": consumer} if now is not None else None
+
+    def send_keys(self, gen: dict, title: str, *names) -> int:
+        pred = tmux_pane_keys.predicate(gen["nonce"], gen["pane_pid"], gen["session_id"], gen["session_created"],
+                                        title_token=title or None)
+        argv = tmux_pane_keys.fence_keys_argv(self.tm.sock, gen["pane_id"], pred, *names, tmux=self.tm.tmux)
+        try:
+            return self.run(argv, capture_output=True, text=True, timeout=tmux_pane_keys.TIMEOUT_S + 5).returncode
+        except (OSError, subprocess.SubprocessError):
+            return tmux_pane_keys.UNCERTAIN
+
+    def signin_check(self, rec: dict) -> "tuple[bool, dict]":
+        """(restarted, record). When `.claude.json` names another account than the one this consumer started
+        with, the session is stopped once its turn is over (the usage-limit menu itself, which no turn gets
+        past, is dismissed first) and its input box is seen empty, and the next tick starts a new one on the
+        new account, which then takes the queued tasks. An unreadable file changes nothing; a consumer this record has no mark for (a new start, a
+        launcher from before this) is marked with the account now on disk and not restarted. A card raised for
+        the session (a limit menu left up is a stall, and raises one) does not hold the restart back: the new
+        session answers what the card asked, and the card is retired with the old one."""
+        now = self.clock()
+        if not rec.get("generation") or now < self.signin_next:
+            return False, rec
+        self.signin_next = now + SIGNIN_CHECK_S
+        mark = self.signin_mark(rec.get("consumer"))
+        if mark is None:
+            return False, rec
+        kept = rec.get("signin") or {}
+        if not kept.get("fp") or kept.get("consumer") != rec.get("consumer"):
+            self._with_record(lambda r: dict(r, signin=mark))
+            return False, dict(rec, signin=mark)       # this tick's observation (a stall) stays in hand
+        if kept["fp"] == mark["fp"]:
+            self.signin_waiting = False
+            return False, rec
+        gen, title = rec["generation"], rec.get("title_token") or ""
+        menu = limit_menu(self.tm.capture(gen["pane_id"]))
+        if not menu and self.observation.get("task") is not None:
+            self.signin_wait("restarting once the current turn ends")
+            return False, rec
+        if menu:
+            self.send_keys(gen, title, "Escape")     # the limit menu holds the input box /exit is typed into
+            self.sleep(0.5)
+        # /exit and Enter go into the input box: never over text the owner has not sent, nor into a box
+        # that cannot be read. Read afresh, after the menu is gone.
+        styled = self.tm.capture(gen["pane_id"], styled=True)
+        if composer_text(styled) != "" or not composer_boxed(styled) or composer_typed(styled) != "":
+            self.signin_wait("restarting once its input box is empty and readable")
+            return False, rec
+        outcome = self.stop_session(rec, "the account it is signed in with changed")
+        if outcome != "stopped":
+            self.signin_wait("restart not done (%s); trying again" % outcome)    # said once per reason
+            return False, rec
+        self.signin_waiting = False
+        if rec.get("hitl"):
+            self.retire_card()
+        return True, self._with_record(lambda r: dict(r, generation=None, signin=None, stall=None, deadline=None))
+
+    def signin_wait(self, what: str) -> None:
+        """Say once why the restart for a changed account is not done yet."""
+        if self.signin_waiting != what:
+            self.log("sign-in: the account changed; " + what)
+            self.signin_waiting = what
+
     def stopped(self, started) -> str:
         self.log("stopped in %.1f s" % (self.clock() - started))
         return "stopped"
@@ -738,6 +842,10 @@ class Launcher:
             rec = self._with_record(lambda r: dict(r, launcher=task_io.process_identity(), deadline=None))
             self.log("supervising session %s (pane %s)" % (rec["generation"]["session_id"], rec["generation"]["pane_id"]))
         rec = self.observe(rec)
+        restarted, rec = self.signin_check(rec)
+        if restarted:
+            self.adopted = False
+            return None, rec
         if rec.get("stall") and not rec.get("hitl"):
             rec = self.raise_card(rec, card.KIND_STALL, rec["stall"]["checks"])
         return None, self.apply_effects(rec)
