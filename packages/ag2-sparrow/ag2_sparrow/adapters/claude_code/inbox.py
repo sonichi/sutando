@@ -170,6 +170,11 @@ def admit(root, task_id, allow: bool, allow_collab: bool = False) -> "tuple[str 
     return policy.kind, headers, ""
 
 
+def refusal_body(root, headers) -> str:
+    """The refusal a task that is not admitted is answered with (task_io.refusal_body, this root's state)."""
+    return task_io.refusal_body(headers, os.path.join(root, "state"))
+
+
 def isolated_prompt(root, task_id) -> "tuple[str, dict]":
     """(text, attested headers) of the isolated turn: the routine and cloud-session adapters' payload (attested
     routing fields, the non-owner note, the untrusted body between nonce markers), with the gateway's tier
@@ -370,7 +375,7 @@ def claim(root, task_id) -> dict:
         if verdict == "call":
             kind, headers, why = admit(root, task_id, allow_non_owner(), allow_collaborator())
             if kind is None:
-                outcome = lc.complete_without_call(task_id, task_io.NON_OWNER_REFUSED, why)
+                outcome = lc.complete_without_call(task_id, refusal_body(root, headers), why)
                 raise Refused("%s not admitted (%s); the owner-only refusal is %s" % (task_id, why, outcome))
             try:
                 attempt = lc.prepare(task_id, INTERRUPTED_BODY, mode=lifecycle.LOCAL, generation=generation)
@@ -517,9 +522,9 @@ def interrupt(root, task_id, detail) -> dict:
             elif phase != lifecycle.SETTLED:
                 verdict, state = lc.decide(task_id)
                 if verdict == "call":
-                    kind, _headers, refusal = admit(root, task_id, allow_non_owner(), allow_collaborator())
+                    kind, headers, refusal = admit(root, task_id, allow_non_owner(), allow_collaborator())
                     body, reason = (INTERRUPTED_BODY, "intake stopped: %s" % detail) if kind else (
-                        task_io.NON_OWNER_REFUSED, refusal)
+                        refusal_body(root, headers), refusal)
                     answered = lc.complete_without_call(task_id, body, reason) == "settled"
                 else:
                     why = "the result is %s" % state
@@ -564,6 +569,29 @@ def confirm(root, task_id, turn_id, nonce, hash_) -> dict:
             if not same:        # the same confirmation again (a lost reply) is its own answer
                 raise Refused(str(e))
     return _mirror(root, task_id, lifecycle.TURN_CONFIRMED, {"task_id": task_id, "turn_id": turn_id}, {"turn_id": turn_id})
+
+
+def inflight(root) -> dict:
+    """{"tasks": {task_id: {phase, turn_id, attempt}}}: the local claims of the live generation that are past
+    their call and not answered (CALLING, TURN_CONFIRMED, RESULT_STAGED), read under claims.lock and
+    changing nothing. What a Mod that was reloaded inside its session checks the offers it kept against:
+    only a claim listed here, with the same turn, is still its to finish. A claim of another generation,
+    one that cannot be read, and one already settled are left out, so they go the fail-closed way."""
+    lc, generation, tasks = _lifecycle(root), _generation(root), {}
+    live = (generation["pid"], generation.get("start"))
+    with records.flocked(records.claims_lock_path(root)):
+        for task_id in lc.claims.ids():
+            try:
+                rec = lc.claims.load(task_id)
+            except lifecycle.ClaimUnreadable:
+                continue
+            gen = (rec or {}).get("generation") or {}
+            if not rec or rec.get("claim_mode") != lifecycle.LOCAL or (gen.get("pid"), gen.get("start")) != live:
+                continue
+            if rec["phase"] in (lifecycle.CALLING, lifecycle.TURN_CONFIRMED, lifecycle.RESULT_STAGED):
+                tasks[task_id] = {"phase": rec["phase"], "turn_id": rec.get("turn_id") or "",
+                                  "attempt": rec.get("attempt")}
+    return {"tasks": tasks}
 
 
 def stage(root, task_id, turn_id, body: bytes) -> dict:
@@ -672,6 +700,8 @@ def main(args) -> int:
             out = publish(root, args.task_id)
         elif verb == "park":
             out = park(root, args.task_id, args.turn_id, args.detail)
+        elif verb == "inflight":
+            out = inflight(root)
         elif verb == "progress":
             gen = task_io.holder_consumer(root) if args.bind_generation else None
             out = progress(root, args.session_id, args.nonce, args.intake, args.reason,
@@ -706,7 +736,7 @@ def main(args) -> int:
 
 
 def add_parser(sub) -> None:
-    p = sub.add_parser("inbox", help="the Mod's lifecycle verbs (claim, interrupt, authorize, confirm, stage, publish, park, "
+    p = sub.add_parser("inbox", help="the Mod's lifecycle verbs (claim, interrupt, authorize, confirm, stage, publish, park, inflight, "
                        "progress, check-inode, envelope); never by hand")
     p.add_argument("--root", help="the work root (default: AG2_SPARROW_ROOT, else the cwd's parent)")
     v = p.add_subparsers(dest="verb", required=True)
@@ -719,6 +749,7 @@ def add_parser(sub) -> None:
     s = v.add_parser("stage"); s.add_argument("task_id"); s.add_argument("turn_id")
     u = v.add_parser("publish"); u.add_argument("task_id")
     k = v.add_parser("park"); k.add_argument("task_id"); k.add_argument("turn_id"); k.add_argument("--detail", default="no result")
+    v.add_parser("inflight")
     g = v.add_parser("progress")
     g.add_argument("--session-id"); g.add_argument("--nonce"); g.add_argument("--intake", choices=("open", "stopped"))
     g.add_argument("--reason"); g.add_argument("--bind-generation", action="store_true")

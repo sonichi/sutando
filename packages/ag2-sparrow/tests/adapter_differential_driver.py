@@ -93,6 +93,8 @@ def read_state(base, work):
             value = [norm(base, json.loads(line)) for line in text.splitlines()]
         else:
             value = norm_text(base, text)
+        if rel == "live-view.log":      # the owner's read-only view of the turns (#6732): its clock times are per run
+            value = re.sub(r"\b\d\d:\d\d:\d\d\b", "<hh:mm:ss>", value)
         out[rel] = value
     return out
 

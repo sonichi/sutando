@@ -30,13 +30,14 @@ import threading
 import time
 import uuid
 
-from ... import account_switch, card_desk, connector_cards, held_start, model_switch
+from ... import account_switch, card_desk, connector_cards, held_start, live_view, model_switch, signin_watch
 from ...acp_host import quoted
 from ...collaborator_turn import stage_own_attachments, with_staged_paths
 from ...relay_loop import count_arg
 from ...task_io import (AUDIENCE_RULE, DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, OWNER_CAPABILITIES,  # noqa: F401
                         LockRefused, acquire_lock, attested_headers, exit_on_sigterm, holder_consumer, load_done,
-                        make_dirs, non_owner_note, parse_task, pid_alive, exit_code, record_done, release_lock,
+                        make_dirs, non_owner_note, parse_task, pid_alive, exit_code, record_done, refusal_body,
+                        release_lock,
                         root_path, start_time, stop_requested, turn_policy, write_atomic)
 
 CLIENT = {"name": "ag2-sparrow-codex", "version": "0.1.0"}
@@ -112,6 +113,29 @@ ITEM_WORDS = (("commandExecution", "ran %d command%s"), ("fileChange", "made %d 
 FAILED_WORDS = (("commandExecution", "%d command%s failed"), ("fileChange", "%d file change%s failed"),
                 ("mcpToolCall", "%d tool call%s failed"))
 FAILED = ":failed"      # the key suffix of an item type's failed count
+
+
+# What the live view calls a turn's item, by its type; one not named here is shown by its type.
+VIEW_WORDS = {"commandExecution": "ran", "fileChange": "changed", "mcpToolCall": "called", "webSearch": "searched"}
+
+
+def view_step(item) -> "tuple[str, str, str] | None":
+    """(what, on what, outcome) of a completed item for the live view; None for the agent's own
+    message (its words are shown as they arrive), its reasoning, and an item with no type."""
+    kind = item.get("type")
+    if not isinstance(kind, str) or kind in ("agentMessage", "reasoning"):
+        return None
+    command = item.get("command")
+    if isinstance(command, list):
+        command = " ".join(str(c) for c in command)
+    changes = item.get("changes")
+    paths = ", ".join(str(c.get("path")) for c in changes if isinstance(c, dict) and c.get("path")) if isinstance(
+        changes, list) else ""
+    detail = next((d for d in (command, paths, item.get("tool"), item.get("query")) if isinstance(d, str) and d), "")
+    status, code = item.get("status"), item.get("exitCode")
+    outcome = "" if status in (None, "completed") and code in (None, 0) else (
+        "exit %s" % code if isinstance(code, int) and code else str(status or ""))
+    return VIEW_WORDS.get(kind, kind), detail, outcome
 
 
 def item_outcome(item) -> str:
@@ -289,9 +313,48 @@ def wrap_untrusted(task_id, headers, message, operator_lines=(), note=NON_OWNER_
     )
 
 
+SIGNIN_SETTLE_TRIES = 3   # replacements one dispatch (or one idle poll) may make
+NOT_READY = "account-not-ready"     # a task's status when no server could be started on the selected account
+
+WAITING = "account-unknown"         # not a result: the task stays in the inbox until the sign-in reads again
+CURRENT, STALE, UNKNOWN = "current", "stale", "unknown"     # signin_state's answers
+
+SIGNIN_UNKNOWN_READS = 5        # reads of a sign-in that cannot be read, within one dispatch
+SIGNIN_UNKNOWN_WAIT_S = 0.2     # between them: a file mid-write is whole a moment later
+
+SIGNIN_HELD_SAY_S = 30.0        # a task waits this long for the selected account, then its sender is told
+NOT_READY_SAY = ("I couldn't start on the account that was just selected for me, so I haven't run this, and "
+                 "nothing was sent under the earlier account. I'll keep trying to start on it. Please send "
+                 "this again in a moment.")
+
+
+def held_clock() -> float:
+    """The clock a waiting task's deadline is read on."""
+    return time.monotonic()
+
+
+class SigninNotReady(Exception):
+    """No server runs on the sign-in now on disk, so no turn may be sent: why."""
+
+
+class SigninUnknown(SigninNotReady):
+    """An account switch was seen and the sign-in cannot be read just now: the turn waits, unanswered."""
+
+
 class Connector:
     def __init__(self, rpc_factory, args, note=None):
         self.rpc_factory = rpc_factory
+        # The sign-in each server starts with is read before it is spawned (a fingerprint; None when
+        # auth.json could not be read): a change it may not have seen is then never taken for its own.
+        home = signin_watch.codex_home()
+        self.signin = signin_watch.SigninWatch(
+            [os.path.join(home, signin_watch.CODEX_AUTH), os.path.join(home, signin_watch.MARKER)],
+            lambda: signin_watch.codex_identity(home))
+        self.signin_started, self.signin_account = self.signin_mark()
+        self.signin_failed = ""   # why the last restart for a changed sign-in failed ('' when none did)
+        self.signin_told = False  # a sender was told the selected account is not ready, and it still is not
+
+        self.signin_pending, self.signin_unknown_since = False, None    # see signin_state
         self.rpc = rpc_factory()
         self.args = args
         self.note = note if note is not None else non_owner_note()
@@ -304,6 +367,9 @@ class Connector:
         self.turn_id = None       # the turn now running, once turn/start has named it
         self.turn_declined = []   # approvals declined for that turn (requests that name it)
         self.turn_items = {}
+        # What a person opening this agent's terminal panel follows; the connector under test has no state dir.
+        state = getattr(args, "state", None)
+        self.view = live_view.Writer(live_view.path_of(os.path.dirname(state))) if state else None
         self.rerouted = ""        # the model Codex moved the current turn to, when it said so
         self._models = self._accounts = None
 
@@ -586,10 +652,124 @@ class Connector:
         """Replace the app-server process; owner threads are re-resumed on next use."""
         log("restarting app-server; old pid", self.rpc.p.pid)
         self.rpc.close()
+        started = self.signin_mark()         # read before the spawn: what the new server can at least see
         self.rpc = self.rpc_factory()
         self.live = {}
         self.thread_id = None
+        self.signin_started, self.signin_account = started
         self.handshake()
+
+    def replace_server(self):
+        """Start a new app-server and move to it only once it has answered: until then, and when it
+        cannot be started, the running one keeps serving tasks. Then the old one is closed. The sign-in
+        recorded for the new server is the one read before it was spawned, never one read afterwards:
+        an account switched while it starts is then still a change, and the next check acts on it."""
+        old = self.rpc
+        log("starting a new app-server for the changed sign-in; old pid", old.p.pid)
+        started = self.signin_mark()
+        new = self.rpc_factory()
+        self.rpc = new
+        try:
+            self.handshake()
+        except BaseException:
+            self.rpc = old
+            try:
+                new.close()
+            except Exception:  # noqa: BLE001 - it never served; the failure that matters is raised below
+                pass
+            raise
+        self.live = {}
+        self.thread_id = None
+        self.signin_started, self.signin_account = started
+        try:
+            old.close()
+        except Exception as e:  # noqa: BLE001 - the new server serves; the old one is only left to exit
+            log("the old app-server did not close cleanly:", type(e).__name__)
+
+    def signin_mark(self):
+        """(the fingerprint of the sign-in now in auth.json, the fingerprint of its account alone: the
+        account id and email, without the switch marker); (None, None) when it cannot be read."""
+        now = self.signin.current()
+        if now is None:
+            return None, None
+        return signin_watch.fingerprint(now), signin_watch.fingerprint(now[:2])
+
+    def signin_state(self) -> str:
+        """What auth.json says now of the serving server, one outcome per kind of read:
+
+        CURRENT  the file reads, and is what was read before the server was spawned; or its account (a
+                 non-empty id, and the email) is that one and only the switch marker moved.
+        STALE    the file reads and names anything else: another account, the same email under another
+                 id, signed out (no file, or one naming no account), an API key; or it reads at all
+                 while the server was started on a read that failed. A switch is now pending.
+        UNKNOWN  the file cannot be read (refused, mid-write, empty, not JSON, not an object, or the
+                 read raised) while a switch is pending: nothing vouches for the server, so nothing is
+                 sent and nothing waiting is released until a later read is CURRENT.
+        CURRENT  the same unreadable file while no switch is pending: a transient read during ordinary
+                 work says nothing has changed, and work goes on.
+
+        A pending switch ends only on a clean CURRENT read. The shared daemon (proxy) is not ours to
+        restart and is always CURRENT."""
+        if self.args.server == "proxy":
+            return CURRENT
+        try:
+            now = self.signin.current()
+        except Exception:  # noqa: BLE001 - a read that raised is a read that failed
+            now = None
+        if now is None:
+            if not self.signin_pending:
+                return CURRENT
+            if self.signin_unknown_since is None:
+                self.signin_unknown_since = time.time()
+                log("sign-in: auth.json cannot be read after an account change; turns wait until it can")
+            return UNKNOWN
+        self.signin_unknown_since = None
+        mark, account = signin_watch.fingerprint(now), signin_watch.fingerprint(now[:2])
+        if mark != self.signin_started:
+            if not (now[0] and self.signin_account is not None and account == self.signin_account):
+                self.signin_pending = True
+                return STALE
+            self.signin_started = mark
+        self.signin_pending = False
+        return CURRENT
+
+    def signin_ready(self) -> str:
+        """signin_state, with an unreadable file read again a few times first (a write in progress)."""
+        for n in range(SIGNIN_UNKNOWN_READS):
+            state = self.signin_state()
+            if state != UNKNOWN:
+                return state
+            if n + 1 < SIGNIN_UNKNOWN_READS:
+                time.sleep(SIGNIN_UNKNOWN_WAIT_S)
+        return UNKNOWN
+
+    def signin_check(self) -> bool:
+        """Move to a new server when the serving one is STALE; True when it did. An UNKNOWN read moves
+        nothing: there is no account to move to. Raises with the old server still running when the new
+        one cannot start; the next check tries again."""
+        if self.signin_state() != STALE:
+            return False
+        if not self.signin_failed:
+            log("sign-in changed in auth.json; restarting Codex on the new account")
+        self.replace_server()
+        self.signin_failed = ""
+        return True
+
+    def signin_settle(self, tries: int = SIGNIN_SETTLE_TRIES) -> int:
+        """Bring the serving server onto the sign-in now on disk, replacing it again while the file keeps
+        changing under a starting server, `tries` times at most; the replacements made. Never raises: a
+        replacement that fails is logged once per reason and tried again later. The server that runs is
+        kept either way; whether it may be sent a prompt is `signin_state`'s answer, not this one's."""
+        made = 0
+        try:
+            while made < tries and self.signin_check():
+                made += 1
+        except Exception as e:  # noqa: BLE001 - task service goes on, on the server that runs
+            why = "%s: %s" % (type(e).__name__, e)
+            if why != self.signin_failed:
+                log("sign-in check failed; the running server keeps serving, and it is tried again:", why)
+            self.signin_failed = why
+        return made
 
     def wait_turn(self, turn_id, timeout):
         """Consume events until this turn completes; returns (status, text, error) or None
@@ -614,9 +794,14 @@ class Connector:
                 continue
             if meth == "item/agentMessage/delta" and p.get("turnId") == turn_id:
                 deltas.append(p.get("delta", ""))
+                if self.view:
+                    self.view.say(p.get("delta", ""))
             elif meth == "item/completed" and p.get("turnId") == turn_id:
                 item = p.get("item", {})
                 kind, counted = item.get("type"), item_outcome(item)
+                step = view_step(item) if self.view else None
+                if step:
+                    self.view.step(*step)
                 if counted:
                     self.turn_items[counted] = self.turn_items.get(counted, 0) + 1
                 if kind == "agentMessage":
@@ -672,18 +857,17 @@ class Connector:
         durable = caps.session == "durable"
         for attempt in (1, 2):
             try:
-                self.open_for(headers, caps)
+                turn = self.open_turn(headers, caps, prompt)
             except IntegrationsUnknown as e:
                 return "failed", "", "the configured integrations could not be read to switch them off (%s)" % e
             except Unconfined as e:
                 return "failed", "", "the turn could not be confined to its own folder (%s)" % e
-            self.last_thread = self.thread_id
-            turn_prompt = prompt
-            if caps.workspace == "isolated":
-                # The turn reads its own folder only: this task's own attachments are copied into it.
-                staged = stage_own_attachments(headers, self.scratch_cwd, getattr(self.args, "media_root", None))
-                turn_prompt = with_staged_paths(prompt, staged)
-            status, text, err = self.run_turn(turn_prompt, self.turn_model(caps), self.turn_cwd(caps))
+            except SigninNotReady as e:
+                if not durable:
+                    self.thread_id = None       # a thread opened for this turn is never used
+                    self.drop_scratch()
+                return (WAITING if isinstance(e, SigninUnknown) else NOT_READY), "", str(e)
+            status, text, err = self.run_turn(*turn)     # nothing is read from disk between the check and the send
             if status == "server-exited":
                 self.restart_server()
                 if durable and attempt == 1:
@@ -695,6 +879,50 @@ class Connector:
             return status, text, err
         return status, text, err
 
+    def open_turn(self, headers, caps, prompt) -> tuple:
+        """Make a turn ready to send: (its prompt, its model, its working directory), as `run_turn` takes
+        them. This is the one place a turn is dispatched from, for the first server, a replaced one and
+        one restarted after a crash, and it holds one rule with no exception: a prompt is only ever sent
+        on a server started on the sign-in that is on disk when it is sent. Everything the send needs is
+        made ready first (the thread, which is a round trip to the server; the prompt; the model, which
+        is read from disk; the working directory), and the sign-in is read again after all of it. A
+        change there replaces the server and makes the turn ready again on the new one. Nothing was sent
+        on the thread left behind, and it ends with the server that held it. What is left after that
+        read is `run_turn` putting the request together in memory and writing `turn/start` to the pipe.
+
+        When no server can be brought onto the sign-in on disk, SigninNotReady is raised and nothing is
+        sent: the new server could not start, the sign-in changed again under each new server until
+        SIGNIN_SETTLE_TRIES replacements were made for this dispatch, or the file cannot be read while
+        a switch is pending (SigninUnknown: never a match; see signin_state). The server that runs is kept, so
+        cards and the next attempt still work, but it gets no prompt."""
+        left = SIGNIN_SETTLE_TRIES      # replacements this one dispatch may make, however they fall
+        while True:
+            left -= self.signin_settle(left)
+            self.signin_sendable(self.signin_ready())
+            self.open_for(headers, caps)
+            self.last_thread = self.thread_id
+            turn_prompt = prompt
+            if caps.workspace == "isolated":
+                # The turn reads its own folder only: this task's own attachments are copied into it.
+                staged = stage_own_attachments(headers, self.scratch_cwd, getattr(self.args, "media_root", None))
+                turn_prompt = with_staged_paths(prompt, staged)
+            turn = turn_prompt, self.turn_model(caps), self.turn_cwd(caps)
+            state = self.signin_ready()
+            if state == CURRENT:
+                self.signin_told = False
+                return turn
+            if state == UNKNOWN or left <= 0:
+                self.signin_sendable(state)     # raises: the thread just opened gets no prompt
+
+    def signin_sendable(self, state: str) -> None:
+        """Raise unless `state` is CURRENT: SigninUnknown for a sign-in that cannot be read with a switch
+        pending, SigninNotReady when no server could be brought onto the one that reads."""
+        if state == CURRENT:
+            return
+        if state == UNKNOWN:
+            raise SigninUnknown("the sign-in file could not be read after the account changed")
+        raise SigninNotReady(self.signin_failed or "the sign-in kept changing while Codex restarted")
+
     def result_body(self, status, text, err):
         if status == "completed":
             said = (text or "").strip()
@@ -702,6 +930,8 @@ class Connector:
                 return said
             why = no_message_why(self.turn_declined, self.turn_items)
             return NO_REPLY[:-1] + ": " + why + "." if why else NO_REPLY
+        if status == NOT_READY:
+            return NOT_READY_SAY
         if status == "timeout":
             head = "Codex did not finish this task in time (%s)." % err
         elif status == "server-exited":
@@ -724,17 +954,35 @@ class Connector:
         done = 0
         idle_since = time.time()
         metrics_path = os.path.join(self.args.state, "metrics.jsonl")
+        held = {}       # task id -> (since when, its file's name, its tier): waiting for the selected account
         while not stop_requested():
             try:    # a card's ledger entry, or a sign-in given up, never stops task service
                 connector_cards.absorb(self.args.bridge_state, self.root)
                 self.accounts.expire()
             except Exception as e:  # noqa: BLE001
                 log("card upkeep failed:", "%s: %s" % (type(e).__name__, e))
-            names = self.pending_tasks(seen)
+            self.signin_settle()        # here no turn runs: an idle agent moves to the new account too
+            if held and self.signin_state() == CURRENT:
+                held.clear()            # a clean read matches the server: what waited for it is served now
+            for task_id, (since, name, tier) in list(held.items()):
+                if held_clock() - since < SIGNIN_HELD_SAY_S:
+                    continue
+                # Nobody waits in silence: at its deadline the task gets the plain words, and no prompt.
+                del held[task_id]
+                seen.add(task_id)
+                write_atomic(os.path.join(self.args.results, name), NOT_READY_SAY + "\n")
+                record_done(done_path, task_id)
+                rec = {"task": task_id, "status": NOT_READY, "tier": tier, "held_s": round(held_clock() - since, 1)}
+                with open(metrics_path, "a") as f:
+                    f.write(json.dumps(rec) + "\n")
+                log("result <-", json.dumps(rec))
+                done += 1
+                idle_since = time.time()
+            names = [n for n in self.pending_tasks(seen) if n[:-4] not in held]
             if not names:
                 if self.args.once and done >= self.args.once:
                     return
-                if self.args.idle_exit and time.time() - idle_since > self.args.idle_exit:
+                if self.args.idle_exit and not held and time.time() - idle_since > self.args.idle_exit:
                     log("idle-exit")
                     return
                 try:
@@ -756,7 +1004,8 @@ class Connector:
             policy = turn_policy(headers, self.args.allow_non_owner)
             if not policy.served:
                 log("refused (non-owner, %s not set) ->" % policy.unlock, task_id, headers["access_tier"])
-                write_atomic(os.path.join(self.args.results, name), NON_OWNER_REFUSED)
+                write_atomic(os.path.join(self.args.results, name),
+                             refusal_body(headers, self.args.state))
                 record_done(done_path, task_id)
                 done += 1
                 idle_since = time.time()
@@ -774,9 +1023,22 @@ class Connector:
             if headers["access_tier"] == "owner" and self.desk.hint():
                 prompt += "\n\n" + self.desk.hint()
             log("turn ->", task_id, headers["access_tier"], repr(message[:60]))
+            if self.view:
+                self.view.turn("%s, %s" % (headers.get("sender_name") or headers["access_tier"], policy.kind), message)
             t_sent = time.time()
             status, text, err = self.run_task(headers, prompt, policy.capabilities)
             t_done = time.time()
+            if self.view:
+                self.view.done(status)
+            if status == WAITING or (status == NOT_READY and self.signin_told):
+                # It waits in the inbox, behind no card and no later task: served when the account is
+                # ready, or told at its own deadline (SIGNIN_HELD_SAY_S) by the poll above.
+                held[task_id] = (held_clock(), name, headers["access_tier"])
+                seen.discard(task_id)
+                continue
+            if status == NOT_READY:
+                log("not sent ->", task_id, "(no server on the selected account: %s)" % err)
+                self.signin_told = True
             out = self.result_body(status, text, err)
             # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
             told = self.tell_model(status, policy.capabilities, headers.get("channel_id"), policy.kind == OWNER)

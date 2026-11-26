@@ -311,6 +311,7 @@ def declares_http_mcp(init):
 
 class AcpClient(_SharedClient):
     client_info = {"name": "ag2-sparrow-antigravity", "version": "0.1.0"}
+    redact_stderr = True    # agy may be handed the owner's Gemini API key (gemini_key): never into its log
 
 
 def log(*a):
@@ -738,22 +739,17 @@ class Connector:
         return done
 
     def account_task(self, task_id, headers, path, status_kind, result_file):
-        """A message that is the account card's (agy_account), else None: the owner's words asking for the card
-        in their DM, or anyone's message carrying a sign-in code, an API key or its redaction marker, which is
-        never passed to agy (no secret is taken in chat)."""
+        """A message carrying a sign-in code, an API key or its redaction marker, from anyone: it is never
+        passed to agy (no secret is taken in chat). Else None. The owner's words asking for the account card
+        are the card desk's (card_task), as every card's ask is."""
         agent_card, _ = connector_cards._core()
         with open(path, encoding="utf-8") as f:
-            sent, said = agent_card.reply_words(f.read())
-        row = {"task": task_id, "status": "completed", "tier": headers["access_tier"], "policy": status_kind}
-        if agent_card.owner_may_act(sent) is None and not agent_card.click_tagged(sent) \
-                and agy_account.asks_for_card(said) and self.accounts.usable():
-            outcome = self.accounts.offer(sent, result_file)
-            log("card ->", task_id, outcome)
-            return dict(row, detail=outcome, card=outcome)
+            _, said = agent_card.reply_words(f.read())
         if agy_account.carries_secret(said):
             log("not passed on ->", task_id, "(it carries a sign-in code, an API key or its redaction marker)")
             publish(result_file, quoted(agy_account.KEY_IN_CHAT) + "\n")
-            return dict(row, status="refused", detail="api-key-in-chat")
+            return {"task": task_id, "status": "refused", "tier": headers["access_tier"], "policy": status_kind,
+                    "detail": "api-key-in-chat"}
         return None
 
     @staticmethod
