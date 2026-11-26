@@ -1055,7 +1055,7 @@ class Connector:
         self.turn_limit = self.turn_unauth = None
         self.auth_note = ""
         for attempt in (1, 2):
-            self.turn_login = self._login_stamp()     # the login this attempt is sent on, for a refusal of it
+            self.turn_login = None      # set by open_turn's last sign-in check, for a refusal of that login
             try:
                 turn = self.open_turn(headers, caps, prompt)
             except IntegrationsUnknown as e:
@@ -1098,7 +1098,10 @@ class Connector:
         sent, _ = agent_card.reply_words(task_text or "")
         if agent_card.owner_may_act(sent) is None and self.accounts.usable():
             try:
-                card = self.accounts.card("pending", SIGNED_OUT, ask=True, signed_out=True)
+                # The refused login may already be replaced (a switch while the turn ran): the card then
+                # says what the login now on disk is.
+                text, refused = (SIGNED_OUT, True) if self.login_refused() else self.accounts.status()
+                card = self.accounts.card("pending", text, ask=True, signed_out=refused)
                 self.accounts.say(sent.get("channel_id"), card, result_path)
                 return "signed-out-card"
             except Exception as e:  # noqa: BLE001 - the line below still tells the owner
@@ -1134,8 +1137,11 @@ class Connector:
                 staged = stage_own_attachments(headers, self.scratch_cwd, getattr(self.args, "media_root", None))
                 turn_prompt = with_staged_paths(prompt, staged)
             turn = turn_prompt, self.turn_model(caps), self.turn_cwd(caps)
+            # Read before the last check: a login written after it is never taken for the one sent on.
+            login = self._login_stamp()
             state = self.signin_ready()
             if state == CURRENT:
+                self.turn_login = login
                 self.signin_told = False
                 return turn
             if state == UNKNOWN or left <= 0:

@@ -1343,17 +1343,33 @@ class AccountCardTest(CardWorld, unittest.TestCase):
             # Any rewrite of the login (a new sign-in, a refresh by a copy sharing it) is a login nobody refused yet.
             (self.home / "auth.json").write_text('{"x": 1}')
             self.assertFalse(accounts.status()[1])
-            # A switch between an attempt's dispatch and its refusal: the refusal is of the login it was sent on,
-            # never of the newly switched one.
-            c = cc.Connector(FakeRpc, args, note="n")
-            c.turn_login = c._login_stamp()
-            os.unlink(self.home / "auth.json")
-            (self.home / "auth.json").write_text('{"switched": true}')
-            c.note_login_refused(True)
-            self.assertFalse(c.accounts.status()[1], "the new login is not called lapsed")
-            c.turn_login = c._login_stamp()
-            c.note_login_refused(True)
-            self.assertTrue(c.accounts.status()[1], "a refusal of the login now on disk still counts")
+
+    def test_a_login_switched_after_the_turn_was_sent_is_not_called_lapsed(self):
+        """Review on #6832: a refusal of the login a turn was sent on marked the login switched in meanwhile."""
+        (self.home / "stub-token").write_text("tok-a")
+        (self.home / "auth.json").write_text("{}")
+        (self.home / "stub-locked").write_text("1")           # every turn refused as unauthorized
+        self.assertEqual(self.serve("task-1", "[[touch-login]] hello"), account_switch.ANSWERED)
+        ((_, card),) = self.posted()
+        self.assertEqual(card["text"], "I'm using alice@example.com. " + account_switch.BELOW)
+        self.assertNotIn("signed_out", card[account_switch.CONTROLS], "the card says what the new login is")
+        self.serve("task-2", "/account")
+        ((_, card),) = self.posted("$card2")
+        self.assertNotIn("signed_out", card[account_switch.CONTROLS])
+
+    def test_a_login_switched_while_the_turn_was_made_ready_is_the_one_refused(self):
+        """The sign-in is settled again after the thread is opened: the login sent on is the one read then."""
+        (self.home / "stub-token").write_text("tok-a")
+        (self.home / "auth.json").write_text("{}")
+        (self.home / "stub-locked").write_text("1")
+        (self.home / "stub-touch-on-thread").write_text("1")  # each thread start or resume rewrites the login
+        self.assertEqual(self.serve("task-1", "hello"), account_switch.ANSWERED)
+        ((_, card),) = self.posted()
+        self.assertTrue(card[account_switch.CONTROLS]["signed_out"])
+        self.serve("task-2", "/account")
+        ((_, card),) = self.posted("$card2")
+        self.assertEqual(card["text"], account_switch.LAPSED + " " + account_switch.BELOW)
+        self.assertTrue(card[account_switch.CONTROLS]["signed_out"], "the refusal is of the login on disk now")
 
     def test_a_turn_that_had_started_work_is_never_run_again_after_an_unauthorized_end(self):
         (self.home / "stub-token").write_text("tok-a")
