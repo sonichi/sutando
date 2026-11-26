@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -297,6 +298,42 @@ class SwitchModel(unittest.TestCase):
         self.root.joinpath(*launcher.MODEL_RECORD).write_text(json.dumps({"wanted": "opus"}))
         with mock.patch.object(hold, "write_model_record", side_effect=OSError("read-only")):
             self.assertEqual(hold.settle_wanted(self.root), "", "the start goes on with the model it had")
+
+    def test_a_start_never_overwrites_a_newer_settings_pick(self):
+        # The start's read-and-settle runs between the page's own read and write unless it takes their lock.
+        record = self.root.joinpath(*launcher.MODEL_RECORD)
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(json.dumps({"wanted": "opus"}))
+        read, written = threading.Event(), threading.Event()
+        real = hold.wanted_model
+
+        def read_then_yield(root):
+            model = real(root)
+            read.set()
+            written.wait(0.5)       # under the lock the page cannot write here, and this times out
+            return model
+
+        def page():
+            read.wait(5)
+            self.assertEqual(lc_for(Pane(says), self.root).switch_model(REC, "sonnet", pend=True), (True, "switched to sonnet"))
+            written.set()
+
+        t = threading.Thread(target=page)
+        t.start()
+        with mock.patch.object(hold, "wanted_model", read_then_yield):
+            hold.settle_wanted(self.root, now=lambda: 5.0)
+        t.join(5)
+        self.assertEqual((launcher.switched_model(self.root), launcher.wanted_model(self.root)), ("sonnet", ""),
+                         "the newer accepted pick survives the start")
+
+    def test_the_model_record_writer_uses_a_private_temp(self):
+        record = self.root.joinpath(*launcher.MODEL_RECORD)
+        record.parent.mkdir(parents=True, exist_ok=True)
+        other = record.with_name(record.name + ".tmp")
+        other.write_text("another writer's half-written record")
+        hold.write_model_record(self.root, {"model": "opus", "at": 1.0})
+        self.assertEqual((json.loads(record.read_text()), other.read_text()),
+                         ({"model": "opus", "at": 1.0}, "another writer's half-written record"))
 
     def test_only_a_line_naming_the_model_asked_for_is_the_switch(self):
         def other(keys, pane):

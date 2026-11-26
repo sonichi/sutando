@@ -686,7 +686,7 @@ class Launcher:
         if not MODEL_RE.match(model or ""):
             return False, "refused: %r is not a model alias or a claude-* id; nothing sent" % model
         # One switch at a time per agent: two would read each other's lines as their own.
-        with locked_file(Path(self.root) / "state" / "model-switch.lock"):
+        with locked_file(Path(self.root).joinpath(*hold.MODEL_LOCK)):
             return self._switch_model(rec, model, confirm, wait_s, pend)
 
     def pend_model(self, model: str, why: str, refusal: str) -> "tuple[bool, str]":

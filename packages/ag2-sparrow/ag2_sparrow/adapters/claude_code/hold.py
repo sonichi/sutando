@@ -18,7 +18,8 @@ import sys
 import time
 from pathlib import Path
 
-from ... import claude_model_switch, connect_common as cm, task_io
+from ... import claude_local_records as records, claude_model_switch, connect_common as cm, task_io
+from ...file_lock import locked_file
 from . import inbox
 from .shape import LOCAL, resolve_plugin_dir
 
@@ -113,6 +114,7 @@ def _alive(pid: int) -> bool:
 
 
 MODEL_RECORD = ("state", "model-switch.json")
+MODEL_LOCK = ("state", "model-switch.lock")   # every read-then-write of MODEL_RECORD holds it
 
 
 def switched_model(root) -> str:
@@ -140,24 +142,23 @@ def wanted_model(root) -> str:
 
 
 def write_model_record(root, record: dict) -> None:
-    path = Path(root or ".").joinpath(*MODEL_RECORD)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(record), encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        records.write_durable(Path(root or ".").joinpath(*MODEL_RECORD), json.dumps(record).encode())
+    except records.RecordError as e:
+        raise OSError(str(e)) from e
 
 
 def settle_wanted(root, now=time.time) -> str:
     """At a session's start: a waiting pick becomes the session's model (`--model` starts it on that one).
     The pick, or '' when none waited or the record could not be written (the start then keeps the old model)."""
-    wanted = wanted_model(root)
-    if not wanted:
-        return ""
     try:
-        write_model_record(root, {"model": wanted, "at": now()})
+        with locked_file(Path(root or ".").joinpath(*MODEL_LOCK)):
+            wanted = wanted_model(root)
+            if wanted:
+                write_model_record(root, {"model": wanted, "at": now()})
+            return wanted
     except OSError:
         return ""
-    return wanted
 
 
 def claude_argv(cfg: dict, session_id: str) -> list:
