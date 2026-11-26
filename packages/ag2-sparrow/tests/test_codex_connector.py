@@ -2592,6 +2592,14 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.serve("task-2", "what account are you using")
         limit, asked = [q["card"] for q in self.outbox()[-2:]]
         self.assertEqual((asked["text"], asked["account_controls"]), (limit["text"], limit["account_controls"]))
+        # Any card asked for while out is answered by the limit's card first: the model card too.
+        for n, ask in enumerate(("/model", "/account", "which model are you using")):
+            self.serve("task-m%d" % n, ask)
+            shown = self.outbox()[-1]["card"]
+            self.assertEqual((shown["id"], shown["text"]), (account_switch.CARD, limit["text"]), ask)
+        self.assertEqual(metrics(self.work)[-1]["card"], "quota-card-asked")
+        # A limit that cannot be read leaves the desk as it was: the card asked for is shown.
+        self.assertEqual(cc.card_desk.Desk(self.work, None, None, [], limit=lambda *a: 1 / 0).limited({}, ""), "")
         # A limit whose words cannot be read never costs the owner the card they asked for.
         notice = quota_notice.QuotaNotice(self.work / "state", self.bridge, "Codex", None, None, None)
         self.assertTrue(notice.says().startswith("Codex has reached its usage limit"))

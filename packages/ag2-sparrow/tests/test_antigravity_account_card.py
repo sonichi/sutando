@@ -280,7 +280,7 @@ class AccountCardTest(unittest.TestCase):
         folder = Path(str(self.w.root) + ".bridge") / "state" / "agent-cards" / "outbox"
         return [json.loads(p.read_text()) for p in sorted(folder.iterdir())] if folder.is_dir() else []
 
-    def test_a_quota_error_queues_one_account_card_to_the_owner_dm_and_a_second_limit_tick_nothing(self):
+    def test_a_quota_error_queues_an_account_card_to_the_owner_dm_on_each_message_and_before_any_card_asked_for(self):
         self.dm("task-q1", "STUB:QUOTA hi")
         self.serve()
         (queued,) = self.outbox()
@@ -295,12 +295,21 @@ class AccountCardTest(unittest.TestCase):
         self.assertEqual(self.w.result("task-q1"), gc.LIMITED_NO_SEND, "the card is the notice: no error line")
         self.dm("task-q2", "STUB:QUOTA again")
         self.serve()
-        self.assertEqual(len(self.outbox()), 1, "a second limit tick queues nothing")
-        self.assertEqual(len(self.posted("$q1")), 1)
-        self.dm("task-q3", "STUB:LIMIT429 and again", kind="room")
+        self.assertEqual([q["card"]["text"] for q in self.outbox()], [card["text"]] * 2, "each message, its card")
+        self.assertEqual(self.w.result("task-q2"), gc.LIMITED_NO_SEND)
+        self.assertEqual(len(self.posted("$q1")), 2)
+        # Asked in a room: the card goes to the DM, the room gets no error line.
+        self.dm("task-q3", "STUB:QUOTA and again", kind="room")
         self.serve()
-        self.assertEqual((self.outbox(), self.posted("$q3")), ([], []), "nothing more once the card is posted")
+        self.assertEqual([q["room"] for q in self.outbox()], [DM])
         self.assertEqual(self.w.result("task-q3"), gc.LIMITED_NO_SEND)
+        # The owner asks for a card while out: the limit's card answers first, with the same words.
+        self.posted("$q3")
+        for n, asked in enumerate(("/account", "/model", "what account are you using")):
+            self.dm("task-a%d" % n, asked)
+            self.serve()
+            (shown,) = self.posted("$a%d" % n)
+            self.assertEqual((shown["text"], shown["account_controls"]), (card["text"], card["account_controls"]), asked)
 
     def test_a_collaborator_who_asks_while_agy_is_at_its_limit_is_told_why_there_is_no_answer(self):
         # Review of #6713: once the owner's card was queued, anyone else who asked got no reply at all.

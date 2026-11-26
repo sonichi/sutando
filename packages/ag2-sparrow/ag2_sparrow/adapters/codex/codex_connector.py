@@ -533,7 +533,14 @@ class Connector:
 
     @property
     def desk(self):
-        return card_desk.Desk(self.root, self.card_answer, quoted, [self.models, self.accounts])
+        return card_desk.Desk(self.root, self.card_answer, quoted, [self.models, self.accounts], self.limit_first)
+
+    def limit_first(self, sent, result_file) -> str:
+        """Out of usage, the owner's ask for a card is answered by the limit's card (the account card, which says it)."""
+        if not self.quota.says():
+            return ""
+        self.accounts.offer(sent, result_file)
+        return "quota-card-asked"
 
     def card_answer(self, result_file, body):
         """A card matter's answer, led by a model outcome this turn could only say in words."""
