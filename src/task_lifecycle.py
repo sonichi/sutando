@@ -85,9 +85,10 @@ FORMATS = frozenset((FORMAT, FORMAT_LOCAL))
 # isolated-turns.json: the hourly cap of its isolated turns (inbox.ISOLATED_LIMITER_FILE).
 LOCAL_STATE_FILES = ("claude-local-plugin.json", "claude-local-supervisor.json", "claims.lock", "progress.lock",
                      "model-switch.json", "model-switch.lock", "isolated-turns.json")
-# What claude-local's cards keep beside them: the model and account cards' records, the detached switch's
-# log and lock. Unnamed, each refuses the start.
-LOCAL_FEATURE_FILES = ("model.json", "account.json", "model-apply.log", "model-apply.lock")
+# What claude-local's cards keep beside them: the model, account and quota cards' records, the detached
+# switch's log and lock. Unnamed, each refuses the start.
+LOCAL_FEATURE_FILES = ("model.json", "account.json", "model-apply.log", "model-apply.lock", "quota-card.json",
+                       "quota-room.json", "quota-seen.json")
 # Their directories: the cards this agent posted (issued_cards' ledger) and the card-mark answers kept for
 # a staging retry (adapters/claude_code/model_card.py). When present, each must be a plain directory.
 STATE_OPTIONAL_DIRS = frozenset(("agent-cards", "card-marks"))
