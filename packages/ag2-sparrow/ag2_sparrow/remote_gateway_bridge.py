@@ -2325,7 +2325,7 @@ PROACTIVE_ROOM_KEEP: Callable[[], bool] | None = None
 OWNS_UNADDRESSED: Callable[[], bool] | None = None
 # Host-injected (path) -> bool: an owner-directed file this lane delivers although it owns no
 # unaddressed ones (a worker's lane, its worker's files). None: only `owns_unaddressed` decides.
-PROACTIVE_OWN_FILE: Callable[[Path], bool] | None = None
+PROACTIVE_OWN_FILE: Callable[..., bool] | None = None
 # Host hook: whether this lane posts a decision card (a HumanRequirement). None: the primary posts every card.
 CARD_CLAIM: Callable[[object], bool] | None = None
 # Host-injected () -> the worker every task this lane queues is addressed to (`requested_worker`),
@@ -2505,15 +2505,22 @@ def owns_unaddressed() -> bool:
         return not GATEWAY_INSTANCE
 
 
-def owner_directed_is_mine(path: Path) -> bool:
+def owner_directed_is_mine(path: Path, text: "str | None" = None) -> bool:
     """Whether this lane delivers the owner-directed file `path`: the primary delivers every one
-    (`owns_unaddressed`); any other lane only one the host names as its own (PROACTIVE_OWN_FILE)."""
+    (`owns_unaddressed`); any other lane only one the host names as its own (PROACTIVE_OWN_FILE).
+    `text` is the body already read from a claimed file: its live name is gone while the claim is
+    held, so a host that reads the file is given the body instead of a path it cannot open."""
     if owns_unaddressed():
         return True
     if PROACTIVE_OWN_FILE is None:
         return False
     try:
-        return bool(PROACTIVE_OWN_FILE(path))
+        if text is None:
+            return bool(PROACTIVE_OWN_FILE(path))
+        try:
+            return bool(PROACTIVE_OWN_FILE(path, text))
+        except TypeError:   # a host hook that takes the path alone
+            return bool(PROACTIVE_OWN_FILE(path))
     except Exception as e:  # noqa: BLE001 - an unanswerable host keeps the primary-only rule
         _log_backoff(("own-file", type(e).__name__), f"own-file check failed ({diagnostics.describe(e)})")
         return False
@@ -9064,7 +9071,8 @@ def _post_proactive() -> None:
         if route == "foreign" or (
                 route == "send" and room_override is not None
                 and not _room_is_deliverable_here(room_override)) or (
-                route == "send" and room_override is None and (not owner_directed_is_mine(f) or not proactive_room())):
+                route == "send" and room_override is None
+                and (not owner_directed_is_mine(f, claimed_text) or not proactive_room())):
             # Hand back rather than eat: a foreign target seen only post-claim, or one that vanished
             # and left an unaddressed body this instance may not own or cannot place.
             _hand_back(claim, f)
