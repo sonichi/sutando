@@ -532,6 +532,8 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
     obs = observe(workspace, now, worker_ids=worker_ids, runner=runner)
     period = ps.SAMPLE_PERIOD_S
     new_state, decisions = ps.evaluate(state, obs, now, expected_period_s=period)
+    resumed = ps.is_resume(now, state.last_sample_at, expected_period_s=period)
+    redeliver = [] if resumed else ps.redeliveries(new_state, obs, now)
     retired, retire_errors, deferred = {}, {}, {}
     if persist:
         save_state(workspace, new_state)
@@ -555,6 +557,7 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
     # Reported on every tick, not only when a card decision is due: a dry run must
     # show the finding after the real sweep already raised (and acknowledged) the card.
     return {"decisions": decisions,
+            ps.REDELIVER: redeliver,
             "auth_expired": sorted(w for w, o in obs.items() if o.pane == ps.PANE_LOGGED_OUT),
             "wedged": sorted(w for w, e in new_state.workers.items() if e.wedge_consecutive),
             "wedge_kinds": {w: e.wedge_kind for w, e in new_state.workers.items()
@@ -574,7 +577,7 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
                                  "watcher_held": o.watcher_held,
                                  "work_outstanding": o.work_outstanding,
                                  "pane": o.pane} for w, o in obs.items()},
-            "resumed": ps.is_resume(now, state.last_sample_at, expected_period_s=period)}
+            "resumed": resumed}
 
 
 def notifier_stalls(workspace, workers) -> dict:

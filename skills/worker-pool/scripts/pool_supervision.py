@@ -252,8 +252,15 @@ def _redeliver_rung(ev: WorkerEvidence, obs: Observation, now: float) -> bool:
     live watcher. A hold in force has no release, and a pane not idle (a limit, a gate, a turn) waits."""
     released = obs.limit_released_at
     return not (released is None or released == ev.redelivered_for or now - released > REDELIVER_WINDOW_S
-                or obs.session_alive is not True or obs.pane != PANE_IDLE
+                or obs.paused or obs.session_alive is not True or obs.pane != PANE_IDLE
                 or obs.work_outstanding is not True or obs.watcher_beat != LIVE)
+
+
+def redeliveries(state: SupervisionState, observations: dict[str, Observation], now: float) -> list[str]:
+    """Workers owed a redelivery this tick: beside their one decision, never instead of it, so a
+    card and a wake task each retry until their own acknowledgment."""
+    return sorted(w for w, o in observations.items()
+                  if _redeliver_rung(state.workers.get(w, WorkerEvidence()), o, now))
 
 
 def acknowledge_redelivered(state: SupervisionState, served: dict) -> SupervisionState:
@@ -408,11 +415,8 @@ def evaluate(state: SupervisionState, observations: dict[str, Observation], now:
             ev, wedge = _wedge_rung(
                 ev, obs, now, sustained_ticks=sustained_ticks,
                 detect_after_s=detect_after_s)
-            # A due card goes first, until acknowledged; the redelivery retries on every other tick.
-            redeliver = _redeliver_rung(ev, obs, now)
             workers[worker_id] = ev
-            decisions[worker_id] = (wedge if wedge != NOTHING
-                                    else REDELIVER if redeliver else decision)
+            decisions[worker_id] = wedge if wedge != NOTHING else decision
             continue
 
         if not _is_death_evidence(obs):
