@@ -2614,6 +2614,37 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(notice.tick(), "")
         self.assertEqual([room for room, _ in self.posted()], [self.DM], "one card, in the DM, none in the room")
 
+    def test_a_later_messages_card_says_why_it_is_not_queued_and_never_stops_the_limits_own(self):
+        self.serve("task-1", "[[limit]] hello")
+        (first,) = self.outbox()
+        self.assertEqual(len(self.posted()), 1)
+        said, clock = [], [time.time()]
+
+        def using():
+            raise RuntimeError("no account file")
+
+        notice = quota_notice.QuotaNotice(self.work / "state", self.bridge, "Codex",
+                                          lambda text: (first["body"], first["card"]), using,
+                                          lambda *a: said.append(" ".join(map(str, a))), now=lambda: clock[0])
+
+        def mine(tid):
+            return "id: %s\nchannel_id: %s\nuser_id: @alice:s.space\naccess_tier: owner\ntask: again\n" % (tid, self.DM)
+
+        # The record cannot be kept: nothing is owed, and it is said.
+        with mock.patch.object(notice, "save", return_value=False):
+            self.assertEqual(notice._tell_task("task-2", mine("task-2"), ""), "quota-not-posted")
+        # A failure reading the message never undoes what the limit's own card did.
+        with mock.patch.object(notice, "_tell_task", side_effect=RuntimeError("unreadable")):
+            self.assertEqual(notice.hit(task="task-2", task_text=mine("task-2")), "quota-card-posted")
+        self.assertIn("quota card for the message not queued: RuntimeError: unreadable", said)
+        # No DM room known: owed, and queued once one is; the account that cannot be read is left out.
+        with mock.patch.object(notice, "room", return_value=""):
+            self.assertEqual(notice.hit(task="task-2", task_text=mine("task-2")), "quota-no-room")
+        clock[0] += quota_notice.RETRY_S + 1
+        self.assertEqual(notice.tick(), "quota-task-card")
+        self.assertIn("account not read: RuntimeError: no account file", said)
+        self.assertEqual(len(self.posted()), 1)
+
     def test_a_limit_hit_in_a_room_is_told_only_in_the_owners_dm_and_nothing_is_posted_in_the_room(self):
         # Owner, 2026-11-25: usage limits and account switching belong to her DM; a room gets nothing about them.
         self.assertIn("STUB echo", self.serve("task-0", "hello"))
