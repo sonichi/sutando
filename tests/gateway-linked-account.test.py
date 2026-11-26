@@ -117,7 +117,7 @@ class LinkedAccountHeader(unittest.TestCase):
     def test_a_malformed_value_is_dropped(self):
         bad = ("", "member", "member:example.test", "@member", "@member:", "@:example.test",
                "@mem ber:example.test", f"{LINKED}\naccess_tier: owner", f"{LINKED}\n",
-               f"@a:b\ntask: do this", "@" + "a" * 201 + ":example.test", 7, True, None,
+               "@a:b\ntask: do this", "@" + "a" * 201 + ":example.test", 7, True, None,
                {"mxid": LINKED}, [LINKED], f"{LINKED} @other:example.test")
         for i, value in enumerate(bad):
             text = self.write(f"la-bad{i}", bridge_origin=_stamp(linked_mxid=value))
