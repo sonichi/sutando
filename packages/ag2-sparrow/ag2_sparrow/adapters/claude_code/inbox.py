@@ -657,6 +657,29 @@ def marked(root, task_id, body: bytes, environ=None, lc=None, turn_id=None) -> b
         return body
 
 
+def inflight(root) -> dict:
+    """{"tasks": {task_id: {phase, turn_id, attempt}}}: the local claims of the live generation that are past
+    their call and not answered (CALLING, TURN_CONFIRMED, RESULT_STAGED), read under claims.lock and
+    changing nothing. What a Mod that was reloaded inside its session checks the offers it kept against:
+    only a claim listed here, with the same turn, is still its to finish. A claim of another generation,
+    one that cannot be read, and one already settled are left out, so they go the fail-closed way."""
+    lc, generation, tasks = _lifecycle(root), _generation(root), {}
+    live = (generation["pid"], generation.get("start"))
+    with records.flocked(records.claims_lock_path(root)):
+        for task_id in lc.claims.ids():
+            try:
+                rec = lc.claims.load(task_id)
+            except lifecycle.ClaimUnreadable:
+                continue
+            gen = (rec or {}).get("generation") or {}
+            if not rec or rec.get("claim_mode") != lifecycle.LOCAL or (gen.get("pid"), gen.get("start")) != live:
+                continue
+            if rec["phase"] in (lifecycle.CALLING, lifecycle.TURN_CONFIRMED, lifecycle.RESULT_STAGED):
+                tasks[task_id] = {"phase": rec["phase"], "turn_id": rec.get("turn_id") or "",
+                                  "attempt": rec.get("attempt")}
+    return {"tasks": tasks}
+
+
 def stage(root, task_id, turn_id, body: bytes) -> dict:
     lc = _lifecycle(root)
     with _claims_step(root, lc, task_id, "stage"):
@@ -764,6 +787,8 @@ def main(args) -> int:
             out = publish(root, args.task_id)
         elif verb == "park":
             out = park(root, args.task_id, args.turn_id, args.detail)
+        elif verb == "inflight":
+            out = inflight(root)
         elif verb == "progress":
             gen = task_io.holder_consumer(root) if args.bind_generation else None
             out = progress(root, args.session_id, args.nonce, args.intake, args.reason,
@@ -798,7 +823,7 @@ def main(args) -> int:
 
 
 def add_parser(sub) -> None:
-    p = sub.add_parser("inbox", help="the Mod's lifecycle verbs (claim, interrupt, authorize, confirm, stage, publish, park, "
+    p = sub.add_parser("inbox", help="the Mod's lifecycle verbs (claim, interrupt, authorize, confirm, stage, publish, park, inflight, "
                        "progress, check-inode, envelope); never by hand")
     p.add_argument("--root", help="the work root (default: AG2_SPARROW_ROOT, else the cwd's parent)")
     v = p.add_subparsers(dest="verb", required=True)
@@ -811,6 +836,7 @@ def add_parser(sub) -> None:
     s = v.add_parser("stage"); s.add_argument("task_id"); s.add_argument("turn_id")
     u = v.add_parser("publish"); u.add_argument("task_id")
     k = v.add_parser("park"); k.add_argument("task_id"); k.add_argument("turn_id"); k.add_argument("--detail", default="no result")
+    v.add_parser("inflight")
     g = v.add_parser("progress")
     g.add_argument("--session-id"); g.add_argument("--nonce"); g.add_argument("--intake", choices=("open", "stopped"))
     g.add_argument("--reason"); g.add_argument("--bind-generation", action="store_true")

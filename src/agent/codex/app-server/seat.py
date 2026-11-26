@@ -362,6 +362,7 @@ class Seat:
         self.declined: List[str] = []
         self.idle_logged = False
         self.lock_fd: Optional[int] = None
+        self.claim_fd: Optional[int] = None
         # The login on disk when the running child was started, and whether the current turn was refused
         # because that login no longer works.
         self.auth_seen: Optional[tuple] = None
@@ -1176,8 +1177,17 @@ class Seat:
         if has_ready_result(results, filename):
             if not self.still_admitted(filename, payload, picked):
                 aside = self.set_result_aside(filename)
-                log(f"task {filename}: turn {status} in {took}; result written, but the admitted file is "
-                    f"neither in the inbox nor archived, so nothing is settled; the result is kept at {aside}")
+                if aside:
+                    log(f"task {filename}: turn {status} in {took}; result written, but the admitted file is "
+                        f"neither in the inbox nor archived, so nothing is settled; the result is kept at {aside}")
+                elif not (Path(results) / filename).exists():
+                    # Gone between the two reads; who took it is not known here, so nothing is claimed.
+                    log(f"task {filename}: turn {status} in {took}; result written, then gone from the results "
+                        "folder before it could be set aside; the admitted file had left the inbox, so this "
+                        "seat settles nothing")
+                else:
+                    log(f"task {filename}: turn {status} in {took}; result written, but the admitted file is "
+                        "neither in the inbox nor archived and the result could not be set aside")
                 return WITHDRAWN
             log(f"task {filename}: turn {status} in {took}; result written")
             self.settle(filename, "done")
@@ -1291,7 +1301,46 @@ class Seat:
             os.close(fd)
             return False
         self.lock_fd = fd
+        self.claim_fd = self.claim_copies()
         return True
+
+    CLAIM_TRIES, CLAIM_WAIT_S = 40, 0.05
+
+    def claim_copies(self) -> Optional[int]:
+        """Called with the seat lock just taken. Copies an earlier seat left in this state dir are
+        removed, and only then is `taking.lock` taken: that second lock, not the seat lock, is what
+        tells the bridge a copy here is a running seat's. A seat that could not clear the folder
+        serves without it, so an inherited copy is never vouched for."""
+        try:
+            left = list((Path(self.host.state) / "payloads").iterdir())
+        except FileNotFoundError:
+            left = []
+        except OSError as e:
+            log(f"the task copies an earlier seat left could not be listed ({type(e).__name__}); "
+                "this seat's copies are not shown as taken")
+            return None
+        for path in left:
+            try:
+                path.unlink()
+            except OSError:
+                log(f"a task copy an earlier seat left could not be removed: {path.name}; "
+                    "this seat's copies are not shown as taken")
+                return None
+        fd = os.open(os.path.join(self.host.state, "taking.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        # No other seat can hold it under the seat lock: a refusal is the bridge's probe, which holds
+        # the lock shared for an instant, so it is asked again for a bounded time.
+        for attempt in range(self.CLAIM_TRIES):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                if attempt + 1 < self.CLAIM_TRIES:
+                    time.sleep(self.CLAIM_WAIT_S)
+            except OSError:
+                break
+        os.close(fd)
+        log("taking.lock could not be taken; this seat's copies are not shown as taken")
+        return None
 
     def resume_runtime_wait(self, popen=None) -> None:
         """The core is up: a sign-in a runtime card is waiting for gets its waiter back (a restart can
@@ -1344,6 +1393,8 @@ class Seat:
             if watcher is not None:
                 watcher.stop()
             self.close_server()
+            if self.claim_fd is not None:
+                os.close(self.claim_fd)
             os.close(self.lock_fd)
         log("seat stopped")
         return 0

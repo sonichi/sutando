@@ -60,6 +60,18 @@ class TestRequirement(unittest.TestCase):
         self.assertEqual(r.subject["source"], G.SOURCE)
         self.assertEqual(r.device, {"id": "s", "name": "s"})
 
+    def test_the_yes_and_no_buttons_carry_the_terminals_own_words(self):
+        """A client numbers each button by its row; "No" never matched Claude Code's own row."""
+        prompt = PERM.replace("3. No", "3. No, and tell Claude what to do differently (esc)")
+        options = G.parse_options(prompt)[0]
+        self.assertEqual(options[2], "No, and tell Claude what to do differently (esc)")
+        r = req("permission", prompt)
+        self.assertEqual([a.label for a in r.actions][:2],
+                         ["No, and tell Claude what to do differently (esc)", "Yes"])
+        self.assertEqual([a.label for a in r.actions][:2], [options[2], options[0]],
+                         "each label is its row, as the terminal lists it")
+        self.assertEqual(G._option_label("x" * (G.OPTION_LABEL_MAX + 1), "No"), "No", "too long: the short word")
+
     def test_the_producer_leaves_the_host_to_the_wire(self):
         # One policy, in schema.wire_device: every producer (this gate, driver events,
         # the auth card) gets `host` there, so the gate itself must not add one.
