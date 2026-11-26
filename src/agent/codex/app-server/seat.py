@@ -156,6 +156,20 @@ def limit_reset(snapshot) -> Optional[float]:
     return max(found) if found else None
 
 
+def used_up(answer) -> Optional[dict]:
+    """From an `account/rateLimits/read` answer: the account's snapshot when it says the account is out
+    of usage now (a window used up, a limit it names as reached, or ordinary usage not allowed); None
+    when it has usage left or does not say."""
+    if not isinstance(answer, dict):
+        return None
+    snapshot = answer.get("rateLimits")
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    if (limit_reset(snapshot) is not None or snapshot.get("rateLimitReachedType")
+            or answer.get("ordinaryUsageAllowed") is False):
+        return snapshot
+    return None
+
+
 class SeatFatal(RuntimeError):
     """The seat cannot go on (the app-server died twice in a row); pending tasks stay pending."""
 
@@ -1173,6 +1187,7 @@ class Seat:
         if status == "completed":
             self.failures = 0
             self.health("ok")
+        self.limit_behind_refused_model(status, filename)
         self.quota_step(status, filename, payload)
         if has_ready_result(results, filename):
             if not self.still_admitted(filename, payload, picked):
@@ -1251,6 +1266,26 @@ class Seat:
         log(f"task {filename}: model card failed: {why} ({refused} is not available to this account); said in words")
         self.notify("refused", f"I couldn't answer: {refused} isn't available on this Codex account. "
                                "Send /model to pick one it can use.\n")
+
+    def limit_behind_refused_model(self, status: str, filename: str = "") -> None:
+        """A turn refused for its model says nothing about usage: Codex checks the model first, so an
+        account that is also out of usage was told about the model, picked another, and only then met
+        the limit (owner 2026-11-26: the limit is what to say first). The account itself is asked, and
+        when it is out of usage the turn is treated as a limit: the account card, no model card. An
+        account with usage left, or one that cannot be asked, keeps the model card."""
+        if self.worker or status != "failed" or not self.turn_model_missing or self.turn_limit is not None:
+            return
+        try:
+            snapshot = used_up(self.rpc.request("account/rateLimits/read", {}, timeout=30))
+        except Exception as e:  # noqa: BLE001 - advisory: the model card still answers
+            log(f"task {filename}: the account's usage could not be read after a refused model ({type(e).__name__})")
+            return
+        if snapshot is None:
+            return
+        log(f"task {filename}: the model was refused and the account is out of usage; the limit is said first")
+        self.rate_limits = snapshot
+        self.turn_limit = {"message": "", "codexErrorInfo": USAGE_LIMIT_INFO}
+        self.turn_model_missing = ""
 
     def quota_step(self, status: str, filename: str = "", payload: Optional[Path] = None) -> None:
         """Out of usage: the owner gets the account card once per limit (core_quota_notice); a turn
