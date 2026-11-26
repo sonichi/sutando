@@ -26,7 +26,7 @@ class PluginFollowsTheUpgrade(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="plugin-upgrade-"))
         self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
-        site = self.tmp / "venvs" / "0.8.3-bcc3e498e49a" / "lib" / "python3.12" / "site-packages"
+        site = self.tmp / "sparrow" / "venvs" / "0.8.3-bcc3e498e49a" / "lib" / "python3.12" / "site-packages"
         self.old = plugin_at(site / "ag2_sparrow" / "adapters" / "claude_code" / "ag2space-inbox")
         (site / "ag2_sparrow-0.8.3.dist-info").mkdir()
         self.own = plugin_at(self.tmp / "my-plugin")
@@ -50,6 +50,18 @@ class PluginFollowsTheUpgrade(unittest.TestCase):
                 self.assertEqual(shape.resolve_plugin_dir(str(mine)), (mine, False))
                 self.assertEqual(self.carried(str(mine)), str(mine))
         self.assertFalse(shape.shipped_plugin("ag2space-inbox"), "too short to be an install")
+
+    def test_another_pip_install_the_owner_chose_is_kept(self):
+        # Review (Dot): a plugin of an ag2-sparrow the owner pip-installed elsewhere, given with --plugin-dir, is
+        # theirs; only the app's own environments (sparrow/venvs/<version>) are moved.
+        for venv in ("venvs/mine", "sparrow/venv", "other/venvs/0.9.0"):
+            site = self.tmp / venv / "lib" / "python3.12" / "site-packages"
+            mine = plugin_at(site / "ag2_sparrow" / "adapters" / "claude_code" / "ag2space-inbox")
+            (site / "ag2_sparrow-0.9.0.dist-info").mkdir()
+            with self.subTest(venv=venv):
+                self.assertFalse(shape.shipped_plugin(mine))
+                self.assertEqual(shape.resolve_plugin_dir(str(mine)), (mine, False))
+                self.assertEqual(self.carried(str(mine)), str(mine))
 
     def test_a_plugin_dir_the_owner_chose_is_kept_and_a_missing_one_falls_back(self):
         self.assertEqual(shape.resolve_plugin_dir(str(self.own)), (self.own, False))
