@@ -551,6 +551,8 @@ class Connector:
         path = os.path.join(self.args.state, LOGIN_REFUSED)
         # The login the refused attempt was sent on: a switch while it ran is a login nobody has refused.
         stamp = self.turn_login if refused else None
+        if stamp is None and not os.path.lexists(path):
+            return      # nothing kept: an ordinary turn writes nothing here
         try:
             if stamp is None:
                 os.unlink(path)
