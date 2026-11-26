@@ -2559,7 +2559,7 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.assertRegex(quota_notice.reset_from_epoch(late + 3660, now=late), "^%s$" % when)
         self.assertRegex(quota_notice.reset_from_epoch(late - 7200 + 3660, now=late - 7200), r"^\d{1,2}:\d\d [AP]M$")
 
-    def test_a_limit_queues_one_account_card_to_the_owner_dm_and_a_second_limit_tick_nothing(self):
+    def test_a_limit_queues_an_account_card_to_the_owner_dm_and_each_later_owner_message_one_more(self):
         self.assertEqual(self.serve("task-1", "[[limit]] hello"), cc.LIMITED_NO_SEND)
         (queued,) = self.outbox()
         card = queued["card"]
@@ -2570,14 +2570,28 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
                                        r"answer until then\. Switch to another account or an API key to go on now\. "
                                        r"I'm using alice@example\.com\. " + re.escape(account_switch.BELOW) + "$")
         self.assertEqual(metrics(self.work)[-1]["quota"], "quota-card")
-        # Another message while still limited: no second card, and no error line in the room either.
+        # Another message while still limited: its own card, the same words, and no error line in the room.
         self.assertEqual(self.serve("task-2", "[[limit]] again"), cc.LIMITED_NO_SEND)
+        self.assertEqual(metrics(self.work)[-1]["quota"], "quota-task-card")
+        self.assertEqual([q["card"]["text"] for q in self.outbox()], [card["text"]] * 2)
+        self.assertEqual([room for room, _ in self.posted()], [self.DM] * 2)
+        # And the next, asked in a room: the card goes to the DM, the room gets nothing.
+        room = "!room:s.space"
+        self.assertEqual(self.serve("task-3", "[[limit-bare]] and again", channel=room, kind="room"), cc.LIMITED_NO_SEND)
+        self.assertIn("quota-task-card", metrics(self.work)[-1]["quota"])
+        self.assertEqual([r for r, _ in self.posted()], [self.DM])
+        rec = json.loads((self.work / "state" / quota_notice.FILE).read_text())
+        self.assertEqual((rec["told"], rec["tasks"]), (True, ["task-1", "task-2", "task-3"]))
+
+    def test_a_message_served_twice_or_not_the_owners_gets_no_card_of_its_own(self):
+        self.serve("task-1", "[[limit]] hello")
+        notice = quota_notice.QuotaNotice(self.work / "state", self.bridge, "Codex",
+                                          lambda text: ("limit", {"id": "x"}), lambda: "", lambda *a: None)
+        self.assertEqual(notice._tell_task("task-1", "", ""), "", "told already: once per task id")
+        self.assertTrue(notice.answered("task-1"))
+        self.assertFalse(notice.answered("task-9"))
+        self.assertEqual(notice._tell_task("task-9", "access_tier: team\nuser_id: @b:s.space\ntask: hi\n", ""), "")
         self.assertEqual(len(self.outbox()), 1)
-        ((room, _),) = self.posted()
-        self.assertEqual(room, self.DM)
-        self.serve("task-3", "[[limit-bare]] and again", channel="!room:s.space", kind="room")
-        self.assertEqual((self.outbox(), self.posted()), ([], []), "nothing more once the card is posted")
-        self.assertEqual(json.loads((self.work / "state" / quota_notice.FILE).read_text())["told"], True)
 
     def test_a_limit_hit_in_a_room_is_told_only_in_the_owners_dm_and_nothing_is_posted_in_the_room(self):
         # Owner, 2026-11-25: usage limits and account switching belong to her DM; a room gets nothing about them.
