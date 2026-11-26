@@ -54,6 +54,34 @@ class Phrases(unittest.TestCase):
             self.assertIsNone(sci.kind_of(words), words)
 
 
+class Questions(unittest.TestCase):
+    """The owner's own words (Susan 2026-11-26 10:32/10:35): one card per thing asked, in order."""
+
+    def test_questions_get_their_cards(self):
+        for words, kinds in (("现在用的什么账号和什么模型", ["account", "model"]),
+                             ("你在用什么模型", ["model"]), ("你在用什么模型？", ["model"]),
+                             ("what model are you using?", ["model"]), ("Which account am I on", ["account"]),
+                             ("what model and account are you using", ["account", "model"]),
+                             ("你用的是什么 model", ["model"]), ("用的哪个账号", ["account"]),
+                             ("你现在用的哪个 core", ["runtime"]), ("现在 core 是 Claude 还是 Codex？", ["runtime"]),
+                             ("model 是哪个", ["model"])):
+            self.assertEqual(sci.kinds_of(words), kinds, words)
+
+    def test_bare_requests_still_one_card(self):
+        for words, kind in (("/model", "model"), ("换账号", "account"), ("switch core", "runtime")):
+            self.assertEqual(sci.kinds_of(words), [kind], words)
+
+    def test_not_lookups(self):
+        for words in ("what model are you on right now and why", "why did the account switch fail?",
+                      "账号为什么没切过去", "switch to sonnet", "换成 opus 吧", "what is the weather",
+                      "switch account and then summarise my email", "帮我看看这个文件", "hi", "",
+                      "账号切换失败了吗", "which model is better for coding, sonnet or opus?"):
+            self.assertEqual(sci.kinds_of(words), [], words)
+
+    def test_long_message_stays_with_the_core(self):
+        self.assertEqual(sci.kinds_of("which model " + "x " * 40), [])
+
+
 class Request(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
@@ -68,7 +96,7 @@ class Request(unittest.TestCase):
 
     def test_owner_dm(self):
         req = sci.request(self.stamped(task("switch account")), self.ws)
-        self.assertEqual(req, {"kind": "account", "room": "!dm:s.space", "reply_to": "$evt"})
+        self.assertEqual(req, {"kind": "account", "kinds": ["account"], "room": "!dm:s.space", "reply_to": "$evt"})
 
     def test_reply_context_is_not_the_words(self):
         req = sci.request(self.stamped(task("换账号", reply_context=True)), self.ws)
@@ -108,6 +136,11 @@ class Intercept(unittest.TestCase):
         self.assertTrue(argv[1].endswith("skills/runtime-switch/scripts/runtime_card.py"))
         self.assertEqual(argv[argv.index("post") + 1:], ["--room", "!dm:s.space", "--reply-to", "$evt"])
         self.assertTrue((self.results / "task-abc.txt").read_text().startswith("[no-send]"))
+
+    def test_a_question_about_account_and_model_posts_both_cards_in_order(self):
+        self.assertTrue(self.run_with("现在用的什么账号和什么模型"))
+        self.assertEqual([Path(a[1]).name for a in self.calls], ["account_card.py", "model_card.py"])
+        self.assertIn("account and model", (self.results / "task-abc.txt").read_text())
 
     def test_a_card_not_posted_leaves_it_to_the_core(self):
         self.assertFalse(self.run_with("switch account", status="failed", rc=1))

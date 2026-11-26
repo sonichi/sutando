@@ -8,8 +8,11 @@ announces a task: a request it recognises gets its card posted here and a `[no-s
 the core never sees it. Anything else, or any failure, goes to the core as before.
 
 Recognised only when the whole message is the request: an owner-tier DM whose words, after
-greetings and "please" / "can you" are dropped, are one of the phrases below. "switch to sonnet"
-names its own choice and stays with the core (and the limit hold). The card scripts check that the
+greetings and "please" / "can you" are dropped, are one of the phrases below, or a short question
+in the owner's own words about which account / model / core is in use ("你在用什么模型", "现在用的什么
+账号和什么模型", "which model are you using?", mixed Chinese and English), which gets one card per thing
+asked, in the order account, model, core. "switch to sonnet" names its own choice, and a question
+that asks why or about a failure needs an answer, so both stay with the core (and the limit hold). The card scripts check that the
 room is the core's checked owner DM, so a card can never be posted anywhere else.
 
 CLI: switch_card_intercept.py <task_file> --workspace W --results-dir R [--repo REPO]
@@ -76,6 +79,32 @@ def kind_of(words: str) -> Optional[str]:
     return None
 
 
+# A question in the owner's own words about what is in use. Only short questions that name the
+# account, the model or the core and ask which/what; anything asking why, about a failure, or naming
+# a choice ("to sonnet", "换成 opus") is left to the core.
+_ASKS = re.compile(r"\b(?:what|which|who)\b|\?|？|什么|哪个|哪一个|哪|吗|是不是|还是|在用|现在用|using|current|are you on", re.I)
+_NOT_A_LOOKUP = re.compile(r"\b(?:why|how come|fail(?:ed|s|ing)?|error|broken|switch(?:ed)? to|change(?:d)? to|"
+                           r"to|into|and then)\b|为什么|怎么回事|怎么没|失败|报错|没切|切不|不能|换成|换到|切到|改成|"
+                           r"sonnet|opus|haiku|gpt|gemini|luna|terra|\bsol\b", re.I)
+_ABOUT = (("account", re.compile(r"\baccounts?\b|账号|账户|帐号", re.I)),
+          ("model", re.compile(r"\bmodels?\b|模型", re.I)),
+          ("runtime", re.compile(r"\bcore\b|\bruntime\b|\bengine\b|运行时|内核", re.I)))
+QUESTION_MAX = 60
+
+
+def kinds_of(words: str) -> list:
+    """The cards the owner's whole message asks for, in order: one for a bare request (kind_of), or
+    one per thing a short "which account / model / core are you using" question names. Empty: not ours."""
+    bare = kind_of(words)
+    if bare:
+        return [bare]
+    text = normalize(words)
+    asked = _ASKS.search(text) or re.search(r"[?？]\s*$", words or "")
+    if not text or len(text) > QUESTION_MAX or not asked or _NOT_A_LOOKUP.search(text):
+        return []
+    return [kind for kind, about in _ABOUT if about.search(text)]
+
+
 def request(task_text: str, workspace: Optional[Path] = None) -> Optional[dict]:
     """{kind, room, reply_to} when the task is the owner's bare switch request in a DM, else None."""
     import local_task_protocol as ltp
@@ -89,14 +118,20 @@ def request(task_text: str, workspace: Optional[Path] = None) -> Optional[dict]:
     if (h.get("content_modalities") or "text").strip() not in ("", "text"):
         return None
     _reply, words = ltp.split_reply_context(ltp.sender_words(parsed))
-    kind = kind_of(words)
-    if kind is None:
+    kinds = kinds_of(words)
+    if not kinds:
         return None
-    return {"kind": kind, "room": h["channel_id"].strip(),
+    return {"kind": kinds[0], "kinds": kinds, "room": h["channel_id"].strip(),
             "reply_to": (h.get("source_message_id") or "").strip()}
 
 
 def post(req: dict, workspace: Path, repo: Path = _REPO, run=subprocess.run) -> bool:
+    """Every card the request asks for; True only when all of them were posted."""
+    kinds = req.get("kinds") or [req["kind"]]
+    return all(post_one(dict(req, kind=kind), workspace, repo, run) for kind in kinds)
+
+
+def post_one(req: dict, workspace: Path, repo: Path = _REPO, run=subprocess.run) -> bool:
     skill, script = SCRIPTS[req["kind"]]
     argv = [sys.executable, str(repo / "skills" / skill / "scripts" / script), "--workspace", str(workspace),
             "post", "--room", req["room"]]
@@ -140,7 +175,8 @@ def intercept(task_file: Path, workspace: Path, results_dir: Path, repo: Path = 
     if not post(req, workspace, repo, run):
         log(f"{Path(task_file).name}: the {req['kind']} card was not posted; the core takes it")
         return False
-    if not answer(results_dir, Path(task_file).name, req["kind"]):
+    what = " and ".join(req.get("kinds") or [req["kind"]])
+    if not answer(results_dir, Path(task_file).name, what):
         log(f"{Path(task_file).name}: the {req['kind']} card was posted but the result was not written")
         return True  # the card is out; a core answer now would be a second reply
     log(f"{Path(task_file).name}: posted the {req['kind']} card; answered without the core")
