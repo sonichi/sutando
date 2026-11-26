@@ -117,8 +117,14 @@ class Claim(Base):
         for t, said in (("task-o", "which model is best for coding?"), ("task-w", "/models please")):
             rc, out = self.claim(self.task(t, said))
             self.assertEqual((rc, out.get("admission")), (0, "owner"), t)
-        rc, out = self.claim(self.task("task-g", "/model", tier="owner", kind="room"))
-        self.assertEqual((rc, out.get("admission")), (0, "owner"), "/model outside the DM is ordinary text")
+        for t, tier in (("task-g", "owner"), ("task-gt", "team")):
+            rc, out = self.claim(self.task(t, "/model", tier=tier, kind="room",
+                                           extra="collaborator: true\n" if tier == "team" else ""))
+            self.assertEqual(rc, 1, "/model in a room is answered here, never by the session")
+            self.assertNotIn("admission", out)
+            self.assertIn("isn't available in a room", (self.results / (t + ".txt")).read_text())
+        self.assertEqual(self.queued(), [], "and no card is posted there")
+        self.assertNotIn("wanted", self.state())
 
     def test_a_card_that_cannot_be_consulted_never_holds_a_task_back(self):
         with mock.patch.object(model_card, "card_matter", side_effect=RuntimeError("broken")):

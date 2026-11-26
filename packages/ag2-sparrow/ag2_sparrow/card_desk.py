@@ -8,11 +8,17 @@ names; a tap no card claims gets the fixed line, and never reaches the model.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from . import connector_cards
 
 ANSWERED = "[no-send] the card answers\n"
+# A switch can never be made in a room with other people in it, and no card that switches is shown
+# there: anyone asking for one in a room is told so, in their language, and the model never sees it.
+IN_ROOM = "Switching the account or model isn't available in a room. Please ask me in our DM."
+IN_ROOM_ZH = "房间里不能切换账号或模型，请到私聊里找我。"
+_CJK = re.compile(r"[\u3400-\u9fff]")
 
 
 class Desk:
@@ -50,6 +56,8 @@ class Desk:
             self.publish(result_file, self.quoted(verdict.say) + "\n")
             return "card-refused"
         ask, _, words = said.strip().partition(" ")
+        if in_room(sent):
+            return self.in_room(ask, said, result_file)
         if agent_card.owner_may_act(sent) is not None:
             return ""
         for card in self.cards:
@@ -71,6 +79,18 @@ class Desk:
             card = next(iter(asking.values()))
             return self.drawn(card, result_file, lambda: card.offer(sent, result_file))
         return self.offered_all(list(asking.values()), sent, result_file) if asking else ""
+
+    def in_room(self, ask, said, result_file) -> str:
+        """A room is no place for a switch: a slash command, a named pick or a card's own question there,
+        from anyone, gets the one line saying to ask in the DM, and no card. '' for anything else."""
+        said = said.strip()
+        for card in self.cards:
+            named = getattr(card, "named_in", None)
+            asks = getattr(card, "asks", None)
+            if ask.lower() == card.ASK or (named and named(said)) or (asks and asks(said)):
+                self.publish(result_file, self.quoted(IN_ROOM_ZH if _CJK.search(said) else IN_ROOM) + "\n")
+                return "card-in-room"
+        return ""
 
     def offered_all(self, cards, sent, result_file) -> str:
         """Offer each card in `cards` and publish one answer for them all: the words of any card that could
@@ -119,6 +139,12 @@ class Desk:
     def hint(self) -> str:
         """What an owner turn is told about the cards that can be shown, '' when none can."""
         return "\n\n".join(card.HINT for card in self.cards if card.usable())
+
+
+def in_room(sent) -> bool:
+    """Whether the task came in a room (any channel kind but the DM); a task that names none is not."""
+    kind = str((sent or {}).get("channel_kind") or "").strip()
+    return bool(kind) and kind != "dm"
 
 
 def read_task(path) -> str:
