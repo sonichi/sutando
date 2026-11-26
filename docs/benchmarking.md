@@ -62,6 +62,48 @@ non-zero exit for automation. Both the Markdown and JSON comparison artifacts
 include baseline/candidate runtime identities, whether the versions are equal,
 and warnings for legacy, unstable, dirty, or otherwise inexact attribution.
 
+New runs also record `suite.case_fingerprints`, one SHA-256 digest per case ID.
+Each digest covers the exact prompt and expectation declaration, with JSON
+object keys sorted recursively and an omitted `expect` treated as `{}`.
+Descriptions, categories, case order and repetition count do not affect it.
+The digest uses ASCII-escaped compact JSON of `{"prompt": ..., "expect": ...}`
+and is stored as `sha256:<64 lowercase hexadecimal characters>`.
+This adds definition identity without adding raw prompts to saved artifacts;
+responses and grading checks can still contain sensitive information.
+
+Comparisons refuse a shared case ID whose recorded definitions differ, even
+if both responses passed. The CLI exits 2 with a diagnostic and does not create
+or overwrite comparison artifacts; rerun with matching prompts and expectations.
+Fingerprint maps must contain exactly the distinct case IDs in the saved rows,
+with valid digests. A present but malformed or incomplete map is an input error,
+including when the other run is legacy. Read errors and invalid run JSON also
+exit 2; an observed regression still exits 1 only with `--fail-on-regression`.
+Saved runs reject duplicate JSON object keys, including conflicting or escaped
+duplicate case IDs inside a fingerprint map, rather than keeping the last value.
+The loader also validates the objects, numeric metrics and result rows needed
+by comparisons and reports. Non-object documents, missing reader fields,
+wrong field types and excessive JSON nesting are comparison input errors,
+rather than regression exits or tracebacks. Optional runtime provenance and
+unknown metadata remain supported for historical runs.
+Decoder nesting limits vary by interpreter; this adds no fixed depth limit.
+`report` uses the same loader and returns a diagnostic with exit 2 for unreadable
+or invalid saved runs, without printing a partial report.
+
+Historical runs without the field remain readable and comparable. JSON
+`suite_compatibility` and the Markdown report explicitly mark shared definitions
+unverified and name which side lacks provenance. These warnings do not change
+the exit code, including with `--fail-on-regression`; a legacy comparison cannot
+establish that its prompts or grading rules matched. Do not backfill invented
+fingerprints into old results.
+
+Case additions and removals remain listed separately and add `case_set_changed`
+to the suite warnings. Shared definitions can be verified while aggregate rates
+and latency still describe different case populations. With no shared cases,
+shared definitions are unverified. Fingerprints identify declarations rather
+than every semantic equivalence: `json_equals: 1` and `json_equals: 1.0`, or
+`contains: "OK"` and `contains: ["OK"]`, conservatively differ. They do not
+authenticate artifacts or identify the controller's scoring implementation.
+
 ## Suite format
 
 Suites are dependency-free JSON. Every case requires `id` and `prompt` and may

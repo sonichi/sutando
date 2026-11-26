@@ -8,6 +8,7 @@ exercises the same queue/watcher/core path as a user task.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -379,6 +380,13 @@ def run_suite(workspace: Path, suite: Dict[str, Any], repeat: int,
               timeout_s: float, poll_s: float, label: str,
               runtime: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     validate_suite(suite)
+    fingerprints = {
+        case["id"]: "sha256:" + hashlib.sha256(json.dumps(
+            {"prompt": case["prompt"], "expect": case.get("expect", {})},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("ascii")).hexdigest()
+        for case in suite["cases"]
+    }
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     rows: List[Dict[str, Any]] = []
     started_at = utc_now()
@@ -418,7 +426,8 @@ def run_suite(workspace: Path, suite: Dict[str, Any], repeat: int,
         "subject": {"label": label, "workspace": str(workspace.resolve()),
                     "host": socket.gethostname(), "runtime": runtime,
                     "version_stable": None},
-        "suite": {"name": suite["name"], "description": suite.get("description", "")},
+        "suite": {"name": suite["name"], "description": suite.get("description", ""),
+                  "case_fingerprints": fingerprints},
         "configuration": {"repeat": repeat, "timeout_s": timeout_s, "poll_s": poll_s},
         "summary": summarize(rows),
         "cases": rows,
@@ -474,9 +483,40 @@ def _case_outcomes(run: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def _read_case_fingerprints(run: Dict[str, Any], case_ids: set, side: str) -> Optional[Dict[str, str]]:
+    if "case_fingerprints" not in run["suite"]:
+        return None
+    fingerprints = run["suite"]["case_fingerprints"]
+    if (not isinstance(fingerprints, dict) or set(fingerprints) != case_ids
+            or any(not isinstance(value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None
+                   for value in fingerprints.values())):
+        raise ValueError(f"{side}: invalid suite.case_fingerprints; "
+                         "expected one SHA-256 fingerprint for every result case")
+    return fingerprints
+
+
 def compare_runs(baseline: Dict[str, Any], candidate: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
     if baseline["suite"]["name"] != candidate["suite"]["name"]:
         raise ValueError("cannot compare runs from different suites")
+    base_cases = _case_outcomes(baseline)
+    cand_cases = _case_outcomes(candidate)
+    shared = sorted(set(base_cases) & set(cand_cases))
+    base_fingerprints = _read_case_fingerprints(baseline, set(base_cases), "baseline")
+    cand_fingerprints = _read_case_fingerprints(candidate, set(cand_cases), "candidate")
+    suite_warnings = []
+    if base_fingerprints is None:
+        suite_warnings.append("baseline_case_definitions_unknown")
+    if cand_fingerprints is None:
+        suite_warnings.append("candidate_case_definitions_unknown")
+    if base_fingerprints is not None and cand_fingerprints is not None:
+        changed = [case_id for case_id in shared
+                   if base_fingerprints[case_id] != cand_fingerprints[case_id]]
+        if changed:
+            raise ValueError("case definitions differ for shared IDs: "
+                             + ", ".join(repr(case_id) for case_id in changed)
+                             + "; rerun with matching prompts and expectations")
+    if set(base_cases) != set(cand_cases):
+        suite_warnings.append("case_set_changed")
     base = baseline["summary"]
     cand = candidate["summary"]
     regressions = []
@@ -488,9 +528,6 @@ def compare_runs(baseline: Dict[str, Any], candidate: Dict[str, Any]) -> Tuple[D
     c95 = cand["latency_ms"]["p95"]
     if b95 is not None and c95 is not None and c95 > b95 * 1.20:
         regressions.append("latency_p95")
-    base_cases = _case_outcomes(baseline)
-    cand_cases = _case_outcomes(candidate)
-    shared = sorted(set(base_cases) & set(cand_cases))
     regressed = [c for c in shared
                  if base_cases[c]["all_passed"] and not cand_cases[c]["all_passed"]]
     recovered = [c for c in shared
@@ -534,6 +571,11 @@ def compare_runs(baseline: Dict[str, Any], candidate: Dict[str, Any]) -> Tuple[D
         "candidate": candidate["subject"]["label"],
         "versions": {"baseline": base_runtime, "candidate": cand_runtime},
         "attribution": {"warnings": attribution_warnings, "same_version": same_version},
+        "suite_compatibility": {
+            "shared_case_definitions_verified": bool(shared) and base_fingerprints is not None
+                                                and cand_fingerprints is not None,
+            "warnings": suite_warnings,
+        },
         "regressions": regressions,
         "metrics": {
             "pass_rate": {"baseline": base["pass_rate"], "candidate": cand["pass_rate"]},
@@ -573,6 +615,9 @@ def compare_runs(baseline: Dict[str, Any], candidate: Dict[str, Any]) -> Tuple[D
         "Attribution warnings: " + (", ".join(attribution_warnings)
                                      if attribution_warnings else "none"),
         "Same runtime version: " + ("yes" if same_version else "no"), "",
+        "Shared case definitions verified: " + (
+            "yes" if data["suite_compatibility"]["shared_case_definitions_verified"] else "no"),
+        "Suite warnings: " + (", ".join(suite_warnings) if suite_warnings else "none"), "",
     ])
     return data, report
 
@@ -586,12 +631,61 @@ def write_run(run: Dict[str, Any], output: Path) -> Tuple[Path, Path]:
     return json_path, report_path
 
 
+def _validate_saved_run(data: Any) -> None:
+    if not isinstance(data, dict) or data.get("kind") != "sutando-benchmark-run":
+        raise ValueError("expected a Sutando benchmark run object")
+
+    def require(condition: bool, field: str) -> None:
+        if not condition:
+            raise ValueError(f"invalid benchmark run field: {field}")
+
+    def number(value: Any, field: str) -> None:
+        try:
+            valid = type(value) in (int, float) and math.isfinite(value) and value >= 0
+        except OverflowError:
+            valid = False
+        require(valid, field)
+
+    for field in ("suite", "subject", "summary"):
+        require(isinstance(data.get(field), dict), field)
+    require(isinstance(data["suite"].get("name"), str), "suite.name")
+    require(isinstance(data["subject"].get("label"), str), "subject.label")
+    runtime = data["subject"].get("runtime")
+    if runtime is not None:
+        require(isinstance(runtime, dict), "subject.runtime")
+        require(isinstance(runtime.get("code", {}), dict), "subject.runtime.code")
+    summary = data["summary"]
+    for field in ("attempts", "passed", "no_response"):
+        value = summary.get(field)
+        require(type(value) is int and value >= 0, "summary." + field)
+    number(summary.get("pass_rate"), "summary.pass_rate")
+    require(summary["pass_rate"] <= 1, "summary.pass_rate")
+    require(isinstance(summary.get("latency_ms"), dict), "summary.latency_ms")
+    for field in ("p50", "p95", "max"):
+        latency = summary["latency_ms"]
+        require(field in latency, "summary.latency_ms." + field)
+        if latency[field] is not None:
+            number(latency[field], "summary.latency_ms." + field)
+    require(isinstance(data.get("cases"), list), "cases")
+    for index, row in enumerate(data["cases"]):
+        prefix = f"cases[{index}]"
+        require(isinstance(row, dict), prefix)
+        for field in ("case_id", "status"):
+            require(isinstance(row.get(field), str), prefix + "." + field)
+        require(type(row.get("passed")) is bool, prefix + ".passed")
+        require(type(row.get("repetition")) is int and row["repetition"] > 0, prefix + ".repetition")
+        number(row.get("latency_ms"), prefix + ".latency_ms")
+    _read_case_fingerprints(data, {row["case_id"] for row in data["cases"]}, "saved run")
+
+
 def _load_run(path: Path) -> Dict[str, Any]:
     if path.is_dir():
         path = path / "run.json"
-    data = json.loads(path.read_text())
-    if data.get("kind") != "sutando-benchmark-run":
-        raise ValueError(f"not a Sutando benchmark run: {path}")
+    try:
+        data = json.loads(path.read_text(), object_pairs_hook=_unique_json_object)
+    except RecursionError as exc:
+        raise ValueError("saved-run JSON exceeds supported nesting") from exc
+    _validate_saved_run(data)
     return data
 
 
@@ -629,10 +723,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 2
         return 0 if diagnostics["live_cores"] else 1
     if args.command == "report":
-        print(render_run(_load_run(args.run)), end="")
+        try:
+            report = render_run(_load_run(args.run))
+        except (OSError, ValueError) as exc:
+            print(f"sutando-bench: cannot report run: {exc}", file=sys.stderr)
+            return 2
+        print(report, end="")
         return 0
     if args.command == "compare":
-        data, report = compare_runs(_load_run(args.baseline), _load_run(args.candidate))
+        try:
+            data, report = compare_runs(_load_run(args.baseline), _load_run(args.candidate))
+        except (OSError, ValueError) as exc:
+            print(f"sutando-bench: cannot compare runs: {exc}", file=sys.stderr)
+            return 2
         print(report, end="")
         if args.output:
             args.output.mkdir(parents=True, exist_ok=True)

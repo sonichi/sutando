@@ -29,6 +29,10 @@ the Sutando core's row → "Switch account", where the sign-in terminal takes th
 own box. A sign-in code or token never goes in a message, a card or a log.
 
 A "Use" tap answers "switching" at once and starts `switch` detached, because the core restarts.
+It comes from any client the owner uses (the desktop app, the web, a phone): it carries only the
+choice, and the saved sign-in it names never leaves this computer. A tap message acts once (a resent
+one is answered, never switched again), and each tap's outcome is one line in the owner-action audit
+(`state/recovery/audit.jsonl`, src/hitl/recovery.py): ids only, never an address.
 `switch` refuses a saved account another Codex here holds a login of its own for (held_elsewhere: two
 copies of one login end each other on refresh). Otherwise it keeps the current `auth.json` in memory and
 saves it to the store, puts the saved one in
@@ -78,6 +82,10 @@ KEY_RE = re.compile(r"[0-9a-f]{16}")
 STORE_SUB = ("accounts", "codex")
 ISSUED = ("state", "account-card-keys.json")
 ISSUED_KEPT = 20
+# The owner's taps that started a switch: a tap delivered again (a client resending on reconnect)
+# never starts a second one.
+TAPS = ("state", "account-card-taps.json")
+TAPS_KEPT = 50
 RUNNING = ("state", "account-card-switch.json")
 RUNNING_LOCK = ("state", "account-card-switch.lock")
 EXEC_LOCK = ("state", "account-card-switch.exec.lock")
@@ -98,6 +106,7 @@ GONE = "That account is no longer on my list. Ask me for the account card again.
 # A button keyed by the workspace id alone: that file may since hold another person of the workspace.
 OLD_CARD = "That card is from before an update, so nothing changed. Ask me for the account card again."
 BUSY = "An account switch is already under way. I'll confirm here when it has finished."
+ACTED = "I already acted on that tap. Ask me for the account card again to switch."
 # admit()'s answer when the attempt on record had lost its worker: that record is replaced.
 RECOVERED = "recovered"
 STOPPED = "The previous switch stopped before it finished."
@@ -585,6 +594,50 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time, run=subp
 
 # ── a tap ─────────────────────────────────────────────────────────────────────────────────────────
 
+def take_tap(ws: Path, tap: str, now: float) -> bool:
+    """Record `tap` (the tap message's id) as acted on; False when it already was. Check and write are
+    one transaction under the ledger's lock."""
+    from file_lock import locked_file
+    from local_record import write_whole
+    path = ws.joinpath(*TAPS)
+    with locked_file(path.with_name(path.name + ".lock"), create_mode=0o600):
+        taps = _read_json(path).get("taps")
+        taps = taps if isinstance(taps, dict) else {}
+        if tap in taps:
+            return False
+        taps[tap] = now
+        newest = sorted(taps.items(), key=lambda kv: float(kv[1] or 0))[-TAPS_KEPT:]
+        write_whole(path, {"taps": dict(newest)})
+    return True
+
+
+def release_tap(ws: Path, tap: str) -> None:
+    """Forget `tap` after a start that changed nothing, so the same tap delivered again may act."""
+    from file_lock import locked_file
+    from local_record import write_whole
+    path = ws.joinpath(*TAPS)
+    try:
+        with locked_file(path.with_name(path.name + ".lock"), create_mode=0o600):
+            taps = _read_json(path).get("taps")
+            if isinstance(taps, dict) and taps.pop(tap, None) is not None:
+                write_whole(path, {"taps": taps})
+    except OSError:
+        pass
+
+
+def audit(ws: Path, headers: dict, key: str, outcome: str, now: float) -> None:
+    """One line in the owner-action audit for a "Use" tap: ids and the outcome, never an address or
+    message text. A line that cannot be written stops nothing (the cards are the record)."""
+    try:
+        from hitl import recovery
+    except ImportError:
+        return
+    recovery.audit(ws, {"at": int(now), "card": CARD_ID, "event": str(headers.get("reply_to_event") or ""),
+                        "tap": str(headers.get("source_message_id") or ""), "action_id": f"switch_account:{key}",
+                        "outcome": outcome, "sender": str(headers.get("user_id") or ""),
+                        "room": str(headers.get("channel_id") or "")})
+
+
 def running(ws: Path, now: float) -> dict:
     rec = _read_json(ws.joinpath(*RUNNING))
     return rec if rec.get("attempt") and now - float(rec.get("ts") or 0) < RUNNING_STALE_S else {}
@@ -669,31 +722,44 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     if verdict.command.target != TARGET:
         return _emit({"status": "refused", "say": GONE}, 2)
     if verb == ADD:
-        words = f"To add an account, open {SETTINGS} Then ask me for the account card again."
+        words = (f"Adding an account needs the computer that runs the core. There, open {SETTINGS} "
+                 "Then ask me for the account card again.")
         body, card = notice_card("info", "In Settings", words)
         op = f"account-card:add:{ac.send_key(room, str(headers.get('source_message_id') or ''), now)}"
         posted = _post(ws, room, body, card, op, reply_to=event, core=core or None,
                        execute=execute)
         return _emit({"status": "say", "say": words, **({"event_id": posted["event_id"]} if posted.get("event_id") else {})})
+    t = now()
+    key = verb if KEY_RE.fullmatch(verb) else "-"
     if runtime() != "codex":
+        audit(ws, headers, key, "refused:not_codex", t)
         return _emit({"status": "refused", "say": NOT_CODEX}, 2)
     store = store_dir()
     if not KEY_RE.fullmatch(verb) or verb not in offered_keys(ws, event) or store is None:
+        audit(ws, headers, key, "refused:gone", t)
         return _emit({"status": "refused", "say": GONE}, 2)
     if _saved_auth(store, verb) is None:
+        audit(ws, headers, key, "refused:old_card" if _old_card_key(store, verb) else "refused:gone", t)
         return _emit({"status": "refused", "say": OLD_CARD if _old_card_key(store, verb) else GONE}, 2)
     cur = current("codex", run=run, codex_read=codex_read)
     label = shown_names(saved(store)).get(verb) or "that account"
     if cur["key"] == verb:
+        audit(ws, headers, key, "already_using", t)
         return _emit({"status": "say", "say": f"Already using {label} — nothing to change."})
-    t = now()
+    tap = str(headers.get("source_message_id") or "")
     attempt = f"{int(t)}-{secrets.token_hex(4)}"
     rec = {"attempt": attempt, "key": verb, "room": room, "ts": t}
     try:
+        if tap and not take_tap(ws, tap, t):
+            audit(ws, headers, key, "refused:tap_acted_on", t)
+            return _emit({"status": "say", "say": ACTED})
         admitted = admit(ws, rec, t)
         if not admitted:
+            audit(ws, headers, key, "busy", t)
             return _emit({"status": "say", "say": BUSY})
     except OSError as e:
+        release_tap(ws, tap)
+        audit(ws, headers, key, "failed", t)
         return _emit({"status": "failed", "say": "I couldn't start the switch. Nothing changed.",
                       "why": type(e).__name__}, 1)
     say = (f"{STOPPED} {in_use_words(cur)} " if admitted == RECOVERED else "") + (
@@ -705,8 +771,11 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
         pid = start_switch(ws, room, verb, attempt, popen)
     except OSError as e:
         settle(ws, rec)
+        release_tap(ws, tap)
+        audit(ws, headers, key, "failed", t)
         return _emit({"status": "failed", "say": "I couldn't start the switch. Nothing changed.",
                       "why": f"{type(e).__name__}: {e}"}, 1)
+    audit(ws, headers, key, "started", t)
     out = {"status": "started", "attempt": attempt, "pid": pid, "say": say}
     out.update({"event_id": posted["event_id"]} if posted.get("event_id") else {"card_why": posted.get("why", "")})
     return _emit(out)

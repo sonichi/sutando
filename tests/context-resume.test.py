@@ -5,9 +5,11 @@ Run: python3 tests/context-resume.test.py
 Exit: 0 on pass, 1 on fail.
 """
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -95,6 +97,7 @@ class ExtractTests(unittest.TestCase):
         out = extract_recent_turns(p, max_chars=100)
         self.assertTrue(out.startswith("**User:**"))
         self.assertIn("[…truncated]", out)
+        self.assertEqual(len(out), 100)
 
     def test_malformed_and_meta_lines_skipped(self):
         f = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8")
@@ -104,6 +107,118 @@ class ExtractTests(unittest.TestCase):
         f.close()
         out = extract_recent_turns(Path(f.name))
         self.assertEqual(out, "**User:** survives")
+
+
+class BudgetTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "transcript.jsonl"
+
+    def write(self, entries):
+        self.path.write_text("".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8")
+        return self.path
+
+    def test_separators_count_at_exact_boundary(self):
+        p = self.write([_user("a"), _user("b")])
+        both = "**User:** a\n\n**User:** b"
+        self.assertEqual(extract_recent_turns(p, max_chars=len(both)), both)
+        self.assertEqual(extract_recent_turns(p, max_chars=len(both) - 1), "**User:** b")
+
+    def test_every_small_budget_bounds_newest_user_and_assistant(self):
+        for entry, prefix in [(_user("界" * 200), "**User:** "),
+                              (_assistant([{"type": "text", "text": "界" * 200}]),
+                               "**Assistant:** ")]:
+            p = self.write([entry])
+            for budget in range(1, 80):
+                with self.subTest(prefix=prefix, budget=budget):
+                    out = extract_recent_turns(p, max_chars=budget)
+                    self.assertLessEqual(len(out), budget)
+                    if out != "…":
+                        self.assertTrue(out.startswith(prefix))
+                        self.assertTrue(out.endswith(" […truncated]"))
+                        self.assertEqual(len(out), budget)
+
+    def test_zero_limits_return_no_context_without_opening_file(self):
+        for turns, chars in [(0, 6000), (12, 0), (0, 0)]:
+            with self.subTest(turns=turns, chars=chars):
+                self.assertEqual(extract_recent_turns(self.path, turns, chars), "")
+
+    def test_negative_limits_rejected_before_reading_file(self):
+        for turns, chars in [(-1, 6000), (12, -1), (-1, 0), (0, -1)]:
+            with self.subTest(turns=turns, chars=chars):
+                with self.assertRaisesRegex(ValueError, "limits must be nonnegative"):
+                    extract_recent_turns(self.path, turns, chars)
+
+    def test_window_counts_cleaned_turns_and_preserves_order(self):
+        entries = [_user(f"older-{i}") for i in range(5000)]
+        entries += [_user("newest ask"), _user("[watcher-ping]"),
+                    _assistant([{"type": "tool_use", "name": "Read"}]),
+                    _user("<system-reminder>noise</system-reminder>"),
+                    _user("newest follow-up")]
+        out = extract_recent_turns(self.write(entries), max_turns=3)
+        self.assertEqual(out, "**User:** newest ask\n\n**Assistant:** [ran tools: Read]"
+                             "\n\n**User:** newest follow-up")
+
+    def test_character_budget_keeps_a_contiguous_recent_suffix(self):
+        p = self.write([_user("old small"), _user("M" * 100), _user("newest")])
+        self.assertEqual(extract_recent_turns(p, max_chars=40), "**User:** newest")
+
+    def test_discarded_turns_are_released_during_the_scan(self):
+        import gc
+        from unittest import mock
+
+        class TrackedText(str):
+            pass
+
+        live = weakref.WeakSet()
+        peaks = []
+        clean = context_resume._clean
+
+        def tracked_clean(text):
+            value = TrackedText(clean(text))
+            live.add(value)
+            gc.collect()
+            peaks.append(len(live))
+            return value
+
+        p = self.write([_user(f"turn-{i}") for i in range(80)])
+        with mock.patch.object(context_resume, "_clean", side_effect=tracked_clean):
+            out = extract_recent_turns(p, max_turns=3)
+        self.assertEqual(len(peaks), 80)
+        self.assertLessEqual(max(peaks), 4)  # retained window plus the turn being cleaned
+        self.assertEqual(out, "**User:** turn-77\n\n**User:** turn-78\n\n**User:** turn-79")
+
+    def test_tool_summary_obeys_rendered_budget(self):
+        p = self.write([_assistant([{"type": "tool_use", "name": "T" * 3000}])])
+        out = extract_recent_turns(p, max_chars=100)
+        self.assertEqual(len(out), 100)
+        self.assertTrue(out.startswith("**Assistant:** [ran tools: "))
+        self.assertTrue(out.endswith(" […truncated]"))
+
+    def cli(self, *flags):
+        return subprocess.run([sys.executable, str(ROOT / "src/context_resume.py"),
+                               str(self.path), *flags], capture_output=True, text=True,
+                              timeout=10, check=False)
+
+    def test_cli_budget_excludes_only_final_framing_newline(self):
+        self.write([_user("界" * 3000)])
+        r = self.cli("--chars", "100")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, extract_recent_turns(self.path, max_chars=100) + "\n")
+        self.assertEqual(len(r.stdout), 101)
+
+    def test_cli_nonpositive_limits_emit_no_context(self):
+        self.write([_user("last")])
+        for flag in ("--turns", "--chars"):
+            for limit in ("0", "-1"):
+                with self.subTest(flag=flag, limit=limit):
+                    r = self.cli(flag, limit)
+                    self.assertEqual(r.returncode, 1)
+                    self.assertEqual(r.stdout, "")
+                    self.assertIn("no conversation turns" if limit == "0" else
+                                  "limits must be nonnegative", r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
 
 
 class MessageTextEdgeTests(unittest.TestCase):
