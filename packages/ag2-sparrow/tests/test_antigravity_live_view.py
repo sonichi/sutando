@@ -62,6 +62,67 @@ class ControlCharacters(unittest.TestCase):
             self.assertEqual(turn.text, "hi " + esc + " there\n", "the reply itself is untouched")
 
 
+class SlowLog(unittest.TestCase):
+    """The ACP reader thread that answers permission requests also delivers `session/update`s; writing the
+    live view there would hold every reply behind the log's disk I/O."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.w = agy.Work(tmp.name)
+        self.path = Path(live_view.path_of(self.w.root))
+
+    def stalled(self, release):
+        real = os.open
+
+        def slow(path, *a, **kw):
+            if str(path).startswith(str(self.path)):
+                release.wait(5)
+            return real(path, *a, **kw)
+        return mock.patch.object(live_view.os, "open", side_effect=slow)
+
+    def on_reader(self, fn):
+        t = threading.Thread(target=fn, daemon=True)
+        t.start()
+        t.join(1)
+        return not t.is_alive()
+
+    def test_a_stalled_log_never_holds_the_acp_reader(self):
+        view = agy.gc.Connector(self.w.args()).view
+        turn = acp_host.Turn()
+        turn.live, turn.view = True, view
+        release = threading.Event()
+        with self.stalled(release):
+            returned = self.on_reader(lambda: turn.on_update(
+                {"update": {"sessionUpdate": "tool_call", "kind": "execute", "rawInput": {"command": "ls"}}}))
+            release.set()
+            self.assertTrue(returned, "the reader went on while the log was stalled")
+            self.assertTrue(view.drain(5))
+        self.assertEqual(self.path.read_text().splitlines(), ["\u2022 ran ls"])
+
+    def test_a_backlog_is_bounded_and_says_what_it_left_out(self):
+        view = live_view.Writer(self.path, background=True)
+        release = threading.Event()
+        with self.stalled(release):
+            self.assertTrue(self.on_reader(lambda: [view.line("n%d" % i) for i in range(live_view.QUEUE_MAX + 50)]))
+            release.set()
+            self.assertTrue(view.drain(5))
+        lines = self.path.read_text().splitlines()
+        self.assertLessEqual(len(lines), live_view.QUEUE_MAX + 2)
+        self.assertTrue(any("not shown" in ln for ln in lines), lines[-3:])
+
+    def test_a_log_path_that_is_not_a_regular_file_is_never_written(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(self.path)                    # opening a FIFO for writing waits for a reader
+        self.assertTrue(self.on_reader(lambda: live_view.Writer(self.path).line("x")))
+        os.unlink(self.path)
+        target = self.path.parent / "elsewhere"
+        target.write_text("kept\n")
+        os.symlink(target, self.path)
+        live_view.Writer(self.path).line("x")
+        self.assertEqual(target.read_text(), "kept\n")
+
+
 class AgyTurn(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()

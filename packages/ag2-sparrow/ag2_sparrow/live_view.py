@@ -10,12 +10,19 @@ as they arrive, each command, file change and tool call with its outcome, and ho
 No header, token or environment value is written by this module, but a command line or the agent's
 words can carry whatever the agent put in them, as its terminal would show. Control characters are
 replaced by spaces, so the log cannot drive the viewer's terminal; text is cut to LINE_MAX a line. Writing is
-best-effort: a view that cannot be written never fails a turn. Stdlib only.
+best-effort: a view that cannot be written never fails a turn, and only a regular file is written (never
+through a symlink, never a FIFO). A `background` Writer never does the I/O on its caller's thread: lines go
+through a bounded queue to a writer thread, and a backlog past QUEUE_MAX is dropped and counted in the log.
+Stdlib only.
 """
 from __future__ import annotations
 
+import contextlib
 import os
+import queue
+import stat
 import sys
+import threading
 import time
 
 NAME = "live-view.log"
@@ -24,6 +31,8 @@ KEPT_TAIL = 100_000
 LINE_MAX = 2000
 SHOWN_FIRST = 60            # lines of the log's end a new viewer starts with
 POLL_S = 0.25
+QUEUE_MAX = 1000            # lines a background Writer holds while its writes are slow
+DRAIN_S = 2.0
 WAITING = "Waiting for this agent's next turn. Nothing is typed here: this view is read-only."
 
 
@@ -51,17 +60,66 @@ def _one_line(text, limit=LINE_MAX) -> str:
     return flat if len(flat) <= limit else flat[:limit - 1] + "…"
 
 
+def _open_regular(path, flags) -> int:
+    """An fd on `path` only when it is a regular file: no symlink is followed, and a FIFO is never waited on."""
+    extra = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags | extra, 0o600)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError("not a regular file: %s" % path)
+    return fd
+
+
 class Writer:
     """Appends a turn's lines to the log. Every method swallows OSError."""
 
-    def __init__(self, path, clock=time.time):
+    def __init__(self, path, clock=time.time, background=False):
         self.path, self.clock, self.pending = str(path), clock, ""
+        self.queue = queue.Queue(QUEUE_MAX) if background else None
+        self.dropped, self.thread, self.guard = 0, None, threading.Lock()
 
     def _write(self, text: str) -> None:
+        if self.queue is None:
+            return self._write_now(text)
+        with self.guard:
+            if self.thread is None:
+                self.thread = threading.Thread(target=self._drain_loop, name="live-view", daemon=True)
+                self.thread.start()
+            try:
+                self.queue.put_nowait(text)
+            except queue.Full:
+                self.dropped += 1
+
+    def _drain_loop(self) -> None:
+        while True:
+            text = self.queue.get()
+            try:
+                with self.guard:
+                    dropped, self.dropped = self.dropped, 0
+                if dropped:
+                    self._write_now("… %d lines not shown: this view fell behind\n" % dropped)
+                self._write_now(text)
+            finally:
+                self.queue.task_done()
+
+    def drain(self, timeout=DRAIN_S) -> bool:
+        """Wait up to `timeout` for queued lines to reach the log; True when none is left."""
+        if self.queue is None:
+            return True
+        end = time.monotonic() + timeout
+        with self.queue.all_tasks_done:
+            while self.queue.unfinished_tasks:
+                left = end - time.monotonic()
+                if left <= 0:
+                    return False
+                self.queue.all_tasks_done.wait(left)
+        return True
+
+    def _write_now(self, text: str) -> None:
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             self._trim()
-            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            fd = _open_regular(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
             try:
                 os.write(fd, text.encode("utf-8", "replace"))
             finally:
@@ -72,15 +130,23 @@ class Writer:
     def _trim(self) -> None:
         """Past KEEP_BYTES, replace the log with its own tail (a new file: a follower sees it shrink)."""
         try:
-            if os.path.getsize(self.path) <= KEEP_BYTES:
-                return
-            with open(self.path, "rb") as f:
-                f.seek(-KEPT_TAIL, os.SEEK_END)
-                tail = f.read()
+            fd = _open_regular(self.path, os.O_RDONLY)
         except OSError:
             return
+        try:
+            size = os.fstat(fd).st_size
+            if size <= KEEP_BYTES:
+                return
+            os.lseek(fd, -KEPT_TAIL, os.SEEK_END)
+            tail = os.read(fd, KEPT_TAIL)
+        except OSError:
+            return
+        finally:
+            os.close(fd)
         tail = tail[tail.find(b"\n") + 1:]
-        fd = os.open(self.path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(self.path + ".new")
+        fd = _open_regular(self.path + ".new", os.O_WRONLY | os.O_CREAT | os.O_EXCL)
         try:
             os.write(fd, tail)
         finally:

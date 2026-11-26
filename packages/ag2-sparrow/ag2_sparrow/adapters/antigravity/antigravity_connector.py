@@ -620,7 +620,8 @@ class Connector:
         self.desk = card_desk.Desk(self.root, card_desk.led(publish, self.models.unsaid, quoted), quoted,
                                    [self.models, self.accounts])
         # What a person opening this agent's terminal panel follows (`ag2-sparrow-antigravity-local view`).
-        self.view = live_view.Writer(live_view.path_of(self.root))
+        # Written off the ACP reader thread, which also answers permission requests.
+        self.view = live_view.Writer(live_view.path_of(self.root), background=True)
 
     def models_seen(self, models: dict):
         """Remember what a Session offered (ACP `models`), for the card."""
@@ -894,6 +895,12 @@ class Connector:
         return names
 
     def serve(self):
+        try:
+            self._serve()
+        finally:
+            self.view.drain()   # lines still queued for the live view reach it before the process ends
+
+    def _serve(self):
         done_path = os.path.join(self.args.state, "done")
         metrics = os.path.join(self.args.state, "metrics.jsonl")
         seen = set(load_done(done_path))
