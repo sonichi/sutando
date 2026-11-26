@@ -672,13 +672,17 @@ def model(args) -> int:
         # `current` is the model Claude Code last said it switched to (none: the CLI's own default); every
         # turn runs in the one session, whoever sends it, and a restart keeps it (hold.claude_argv).
         now = launcher.switched_model(cm.work_root(cfg)) or None
+        # `pending` is a pick kept for the session's next start: it could not be typed when it was made.
         print(json.dumps({"model": now, "current": now, "available": [{"id": m, "name": n} for m, n in MODELS],
-                          "pending": None}))
+                          "pending": launcher.wanted_model(cm.work_root(cfg)) or None}))
         return 0
     lc = launcher.Launcher(cfg, config_dir(local))
-    switched, line = lc.switch_model(records.load_supervisor(cm.work_root(cfg)), args.model, confirm=args.confirm)
-    print(json.dumps({"switched": switched, "model": args.model, "detail": line}))
-    return 0 if switched else 1
+    switched, line = lc.switch_model(records.load_supervisor(cm.work_root(cfg)), args.model, confirm=args.confirm,
+                                     pend=True)
+    pending = not switched and launcher.wanted_model(cm.work_root(cfg)) == args.model
+    print(json.dumps({"switched": switched, "model": args.model, "detail": line,
+                      **({"pending": args.model} if pending else {})}))
+    return 0 if switched or pending else 1
 
 
 ROUTE_NOTE = ("from here I cannot tell whether this agent's session goes through the credential proxy; if it does, "
