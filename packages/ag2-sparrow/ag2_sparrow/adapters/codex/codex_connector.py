@@ -181,9 +181,9 @@ HELD_WAIT_S = held_start.WAIT_S
 USAGE_LIMIT_INFO, UNAUTHORIZED_INFO = "usagelimitexceeded", "unauthorized"
 LIMITED_NO_SEND = "[no-send] Codex is at its usage limit; the owner was sent the account card\n"
 # Still refused after the app-server was restarted on the login on disk: the owner is shown the account card.
-SIGNED_OUT = "Codex isn't signed in anymore."
-SIGNED_OUT_ELSEWHERE = ("Codex isn't signed in anymore. My owner can switch its account by sending /account in "
-                        "our direct message.")
+SIGNED_OUT = account_switch.LAPSED
+SIGNED_OUT_ELSEWHERE = ("Codex's sign-in on this computer no longer works. My owner can sign in again by sending "
+                        "/account in our direct message.")
 SHARED_LOGIN = "The core shares this login, so it uses the new account after its next restart."
 
 
@@ -493,7 +493,7 @@ class Connector:
                 self.args.state, getattr(self.args, "bridge_state", None), "Codex", self.card_answer, quoted, log,
                 read=self.account_label, begin=self.begin_login,
                 cancel=lambda login: self.rpc.request("account/login/cancel", {"loginId": login}),
-                opener=lambda url: open_page(url), runtime="codex")
+                opener=lambda url: open_page(url), runtime="codex", lapsed=self.login_on_disk)
         return self._accounts
 
     @property
@@ -534,6 +534,11 @@ class Connector:
     def card_answer(self, result_file, body):
         """A card matter's answer, led by a model outcome this turn could only say in words."""
         return card_desk.led(write_atomic, self.models.unsaid, quoted)(result_file, body)
+
+    @staticmethod
+    def login_on_disk() -> bool:
+        """Whether this agent's Codex home keeps a login file (its presence only; it is never read here)."""
+        return os.path.isfile(os.path.join(signin_watch.codex_home(), signin_watch.CODEX_AUTH))
 
     def account_label(self) -> str:
         """The account the server is signed in with, as the card names it; '' when it is signed out."""

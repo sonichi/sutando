@@ -1382,6 +1382,15 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.serve("task-3", "/account")
         ((_, card),) = self.posted()
         self.assertEqual(card["text"], "I'm not signed in. " + account_switch.BELOW)
+        self.assertNotIn("signed_out", card[account_switch.CONTROLS])
+        # 2026-11-25: a login file kept here that the server reads no account from is a sign-in that lapsed (another
+        # copy of the same account refreshed it away); the card said "I'm not signed in", the same as never.
+        self.home.mkdir(parents=True, exist_ok=True)
+        (self.home / "auth.json").write_text("{}")
+        self.serve("task-4", "/account")
+        ((_, card),) = self.posted()
+        self.assertEqual(card["text"], account_switch.LAPSED + " " + account_switch.BELOW)
+        self.assertTrue(card[account_switch.CONTROLS]["signed_out"], "the app draws the sign-in in the card")
 
     def test_asking_which_account_is_answered_by_the_card_without_a_turn(self):
         """Codex cannot see its own sign-in: asked which account it is on, the model said it could not tell."""

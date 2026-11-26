@@ -107,13 +107,21 @@ def shown(email: str) -> str:
     return "%s@%s" % (name, domain) if name and at and domain and not any(c.isspace() for c in name + domain) else ""
 
 
+# A login kept on this computer that no longer works, said apart from never having signed in.
+LAPSED = ("My sign-in here no longer works: it was signed out, or the same account was used by another copy of it on "
+          "this computer, which ends this one. Sign in again.")
+
+
 class AccountSwitch:
     KIND, ASK, MARK, HINT, IN_DM = "account", "/account", MARK, HINT, IN_DM
     CARD_ID = CARD
     asks = staticmethod(asks_for_card)
 
-    def __init__(self, state_dir, bridge_state, name, publish, quoted, log, read, begin, cancel, opener, runtime=""):
+    def __init__(self, state_dir, bridge_state, name, publish, quoted, log, read, begin, cancel, opener, runtime="",
+                 lapsed=None):
         self.state_dir, self.bridge_state, self.name, self.runtime = state_dir, bridge_state, name, runtime
+        # `lapsed()`: a login is kept here, yet the runtime reads no account from it (its sign-in no longer works).
+        self.lapsed, self._lapsed = lapsed, False
         self.publish, self.quoted, self.log = publish, quoted, log
         self.read, self.begin, self.cancel, self.opener = read, begin, cancel, opener
 
@@ -159,6 +167,9 @@ class AccountSwitch:
         except Exception as e:  # noqa: BLE001 - the card still says what it can
             self.log("account not read:", "%s: %s" % (type(e).__name__, str(e)[:200]))
             return "I could not read which account I'm signed in with."
+        self._lapsed = not label and self.lapsed is not None and bool(self.lapsed())
+        if self._lapsed:
+            return LAPSED
         return "I'm using %s." % label if label else "I'm not signed in."
 
     def card(self, state: str, text: str, url: str = "", ask: bool = False, signed_out: bool = False):
@@ -172,7 +183,7 @@ class AccountSwitch:
         built = agent_card.build(CARD if ask else NOTE, state, title="Account", body="Account of %s" % self.name,
                                  text="%s %s" % (text, BELOW) if ask else text,
                                  **({"buttons": buttons} if buttons else {}))
-        return with_controls(built, self.runtime, signed_out=signed_out) if ask else built
+        return with_controls(built, self.runtime, signed_out=signed_out or self._lapsed) if ask else built
 
     def say(self, room, built, result_file=None, edit: str = "") -> None:
         """Post the card (in place of the card `edit` names, when given); where it cannot be posted, a
