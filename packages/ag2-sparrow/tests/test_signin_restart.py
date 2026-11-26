@@ -234,6 +234,74 @@ class CodexRestart(unittest.TestCase):
                 self.assertFalse(self.c.signin_check())
                 self.c.rpc_factory, self.c.handshake = spawn, (lambda: None)
 
+    def test_every_kind_of_read_has_one_outcome(self):
+        """The table in signin_state: a read is a clean match, a clean difference, or unknown. Unknown is
+        never a match once a switch is pending, and never a stall while none is."""
+        c, state = self.c, self.c.signin_state
+        auth, marker = self.home / "auth.json", self.home / signin_watch.MARKER
+        self.assertEqual((state(), c.signin_pending), (cc.CURRENT, False), "what the server started on")
+        # Unreadable in every way, no switch pending: ordinary work goes on.
+        unreadable = ("{torn", "", "   \n", "[1, 2]", '"a string"')
+        for text in unreadable:
+            write(auth, text)
+            self.assertEqual((state(), c.signin_pending), (cc.CURRENT, False), repr(text))
+        with mock.patch.object(c.signin, "current", side_effect=RuntimeError("the read raised")):
+            self.assertEqual(state(), cc.CURRENT)
+        # The marker alone moved, same account id and email: still the server's account.
+        write(auth, codex_auth("acct-1", "a@x.org"))
+        write(marker, {"email": "a@x.org", "at": 7})
+        self.assertEqual((state(), c.signin_pending), (cc.CURRENT, False))
+        # Each real difference is STALE and leaves a switch pending.
+        for name, text in (("another account", codex_auth("acct-2", "b@x.org")),
+                           ("the same email, another id", codex_auth("acct-9", "a@x.org")),
+                           ("an API key", {"OPENAI_API_KEY": "sk-not-read"}),
+                           ("an object naming no account", {"tokens": {}})):
+            c.signin_pending = False
+            write(auth, text)
+            self.assertEqual((state(), c.signin_pending), (cc.STALE, True), name)
+        c.signin_pending = False
+        os.unlink(auth)
+        self.assertEqual((state(), c.signin_pending), (cc.STALE, True), "no file: signed out, a real state")
+        # With the switch pending, every unreadable read is UNKNOWN, and stays so however often it is read.
+        for text in unreadable:
+            write(auth, text)
+            self.assertEqual([state(), state()], [cc.UNKNOWN, cc.UNKNOWN], repr(text))
+            self.assertTrue(c.signin_pending)
+        with mock.patch.object(c.signin, "current", side_effect=RuntimeError("the read raised")):
+            self.assertEqual(state(), cc.UNKNOWN)
+        self.assertFalse(c.signin_check(), "and moves nothing: there is no account to move to")
+        self.restarts.assert_not_called()
+        # Only a clean read that matches ends it. A clean read of the earlier account matches the old server.
+        write(auth, codex_auth("acct-1", "a@x.org"))
+        self.assertEqual((state(), c.signin_pending), (cc.CURRENT, False))
+        self.assertIsNone(c.signin_unknown_since)
+
+    def test_a_replacement_is_not_verified_until_a_clean_read_matches_it(self):
+        write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
+        self.assertTrue(self.c.signin_check())                  # replaced, on B
+        self.assertTrue(self.c.signin_pending, "replaced is not yet confirmed")
+        write(self.home / "auth.json", "{torn")
+        self.assertEqual(self.c.signin_state(), cc.UNKNOWN)
+        with mock.patch.object(cc, "SIGNIN_UNKNOWN_WAIT_S", 0.0):
+            self.assertEqual(self.c.signin_ready(), cc.UNKNOWN, "read again a few times, still unknown")
+        write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
+        self.assertEqual((self.c.signin_ready(), self.c.signin_pending), (cc.CURRENT, False))
+        # A replacement spawned while the file could not be read is on an unknown account: never verified
+        # by the read that failed, replaced once the file reads.
+        write(self.home / "auth.json", codex_auth("acct-3", "c@x.org"))
+        spawn = self.c.rpc_factory
+        self.c.signin_mark = lambda: (None, None)
+        self.assertTrue(self.c.signin_check())
+        del self.c.signin_mark
+        self.assertIsNone(self.c.signin_started)
+        write(self.home / "auth.json", "{torn")
+        self.assertEqual(self.c.signin_state(), cc.UNKNOWN)
+        write(self.home / "auth.json", codex_auth("acct-3", "c@x.org"))
+        self.assertEqual(self.c.signin_state(), cc.STALE)
+        self.assertTrue(self.c.signin_check())
+        self.assertEqual((self.c.signin_state(), self.c.signin_pending), (cc.CURRENT, False))
+        self.assertIs(self.c.rpc_factory, spawn)
+
     def test_two_switches_between_two_checks_end_on_the_last(self):
         write(self.home / "auth.json", codex_auth("acct-2", "b@x.org"))
         write(self.home / "auth.json", codex_auth("acct-3", "c@x.org"))
