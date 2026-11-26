@@ -503,7 +503,7 @@ class Taps(Base):
         for key in (first, second):
             with self.subTest(key=key):
                 self.ws.joinpath(*acc.RUNNING).unlink(missing_ok=True)
-                rc, out = self.tap(by_key[key], event="$card2")
+                rc, out = self.tap(by_key[key], event="$card2", source_message_id=f"$tap-{key}")
                 self.assertEqual((rc, out["status"]), (0, "started"), out)
                 argv = self.launch.calls[-1][0]
                 self.assertEqual(argv[argv.index("--key") + 1], key)
@@ -530,23 +530,71 @@ class Taps(Base):
         self.assertEqual(self.launch.calls, [])
 
     def test_a_second_switch_while_one_runs_is_refused(self):
-        self.tap(self.use_b)
-        rc, out = self.tap(self.use_b)
+        self.tap(self.use_b, source_message_id="$tap1")
+        rc, out = self.tap(self.use_b, source_message_id="$tap2")
         self.assertEqual(out["say"], acc.BUSY)
         self.assertEqual(len(self.launch.calls), 1)
 
     def test_a_switch_whose_worker_died_no_longer_blocks_a_tap(self):
-        self.tap(self.use_b)
+        self.tap(self.use_b, source_message_id="$tap1")
         record = self.ws.joinpath(*acc.RUNNING)
         worker_on_record(record, alive=True)
-        self.assertEqual(self.tap(self.use_b)[1]["say"], acc.BUSY, "a running worker still holds the switch")
+        self.assertEqual(self.tap(self.use_b, source_message_id="$tap2")[1]["say"], acc.BUSY,
+                         "a running worker still holds the switch")
         worker_on_record(record, alive=False)
         before = json.loads(record.read_text())["attempt"]
-        rc, out = self.tap(self.use_b)
+        rc, out = self.tap(self.use_b, source_message_id="$tap3")
         self.assertEqual((rc, out["status"]), (0, "started"))
         self.assertTrue(out["say"].startswith(acc.STOPPED + " I'm using alice@example.com."), out["say"])
         self.assertIn("Switching the core to bob@work.io", out["say"])
         self.assertNotEqual(json.loads(record.read_text())["attempt"], before, "the dead attempt's record is replaced")
+
+
+class RemoteTaps(Base):
+    """A "Use" tap from the web or a phone is the same task as one from the desktop: the owner's card
+    reply, carrying only the choice. It acts once per tap message, and every outcome is audited."""
+
+    def setUp(self):
+        super().setUp()
+        self.signed_in(A)
+        self.keep(B)
+        self.post()
+        self.use_b = "Use bob@work.io"
+
+    def audited(self):
+        path = self.ws / "state" / "recovery" / "audit.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_a_tap_delivered_again_starts_no_second_switch(self):
+        rc, out = self.tap(self.use_b, source_message_id="$phone-tap")
+        self.assertEqual((rc, out["status"]), (0, "started"))
+        self.ws.joinpath(*acc.RUNNING).unlink()     # the first switch has finished and failed
+        rc, out = self.tap(self.use_b, source_message_id="$phone-tap")
+        self.assertEqual((rc, out["status"], out["say"]), (0, "say", acc.ACTED))
+        self.assertEqual(len(self.launch.calls), 1)
+        rc, out = self.tap(self.use_b, source_message_id="$phone-tap-2")
+        self.assertEqual(out["status"], "started", "a new tap still acts")
+
+    def test_each_tap_is_audited_with_ids_and_no_address(self):
+        self.tap(self.use_b, source_message_id="$t1")
+        self.tap(self.use_b, source_message_id="$t2")
+        self.tap(self.use_b, source_message_id="$t1")
+        rows = self.audited()
+        self.assertEqual([r["outcome"] for r in rows], ["started", "busy", "refused:tap_acted_on"])
+        self.assertEqual({r["action_id"] for r in rows}, {f"switch_account:{key_of('acct-b')}"})
+        self.assertEqual(rows[0]["sender"], OWNER)
+        self.assertEqual((rows[0]["room"], rows[0]["event"], rows[0]["tap"]), (DM, "$card1", "$t1"))
+        self.assertNotIn("bob@", json.dumps(rows))
+
+    def test_a_refused_tap_is_audited(self):
+        (self.store / f"{key_of('acct-b')}.json").unlink()
+        self.tap(self.use_b, source_message_id="$t1")
+        self.assertEqual([r["outcome"] for r in self.audited()], ["refused:gone"])
+
+    def test_add_says_it_needs_the_computer_that_runs_the_core(self):
+        rc, out = self.tap("Add another account")
+        self.assertIn("needs the computer that runs the core", out["say"])
+        self.assertEqual(self.launch.calls, [])
 
 
 class Switch(Base):
@@ -883,6 +931,9 @@ class Edges(Base):
         rc, out = self.tap(use)
         self.assertEqual((rc, out["status"]), (1, "failed"))
         self.assertFalse(self.ws.joinpath(*acc.RUNNING).exists(), "a failed start clears its own record")
+        self.launch = Launch()
+        rc, out = self.tap(use)
+        self.assertEqual(out["status"], "started", "a start that changed nothing leaves the tap free to act")
 
     def test_reply_without_a_core_row_and_to_another_target(self):
         self.signed_in(A)
