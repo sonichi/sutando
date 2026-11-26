@@ -141,6 +141,11 @@ if callable(reader):
     hold(ws, status="cleared", released_at=RELEASED, cleared_by="cli-pane")
     check("a cleared hold: its release time", reader(ws, WID), RELEASED)
 
+import core_limit_hold
+for exc in (ImportError, OSError, ValueError):
+    with mock.patch.object(core_limit_hold, "read_hold", side_effect=exc("x")):
+        check(f"an unreadable hold ({exc.__name__}): None", sup.limit_released_at(ws, WID), None)
+
 # Persisted between ticks, so the sweep and a delivery-time check share one episode.
 saved = ps.SupervisionState(workers={"w": ps.WorkerEvidence(
     **({"redelivered_for": RELEASED} if "redelivered_for" in ps.WorkerEvidence.__dataclass_fields__ else {}))})
@@ -194,6 +199,16 @@ if callable(redeliver):
         out = redeliver(ws, REPO, WID, runner=Tmux(IDLE))
         check("only a leftover sentinel owed: nothing is sent", (out.get("outcome"), asked),
               ("no-work-or-paused", []))
+
+    (ws / "tasks" / "task-owed1.txt").write_text("id: task-owed1\ntask: x\n")
+    with mock.patch.object(sup, "_open_tmux", return_value=(None, None)):
+        out = redeliver(ws, REPO, WID, runner=Tmux(IDLE))
+    check("a seat with no tmux session is unsupported", out.get("outcome"), "unsupported-or-no-session")
+
+    with mock.patch.object(ask_mod, "ask", side_effect=OSError("disk full")):
+        out = redeliver(ws, REPO, WID, runner=Tmux(IDLE))
+    check("a failed delivery write is reported, not raised",
+          (out.get("outcome"), out.get("why")), ("delivery-failed", "disk full"))
 
     with mock.patch.object(rem, "redeliver", return_value={"outcome": "redelivered"}) as rd, \
             mock.patch.object(rem.sup, "acknowledge_cards"):
