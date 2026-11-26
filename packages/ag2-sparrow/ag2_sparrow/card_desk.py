@@ -61,21 +61,44 @@ class Desk:
             choice = named(said.strip()) if named and card.usable() else ""
             if choice:
                 return self.drawn(card, result_file, lambda: card.asked_for(choice, sent, result_file))
+        # A card may also name the owner's own words that are its matter (`asks`), read here and never by
+        # the model; one message may ask for several ("which account and model"), each shown once.
+        asking = {}
         for card in self.cards:
-            # A card may also name the owner's own words that are its matter (`asks`), read here and
-            # never by the model: the account card's, for what the runtime cannot see of itself.
-            if getattr(card, "asks", None) and card.asks(said) and card.usable():
-                return self.drawn(card, result_file, lambda: card.offer(sent, result_file))
-        return ""
+            if getattr(card, "asks", None) and card.KIND not in asking and card.asks(said) and card.usable():
+                asking[card.KIND] = card
+        if len(asking) == 1:
+            card = next(iter(asking.values()))
+            return self.drawn(card, result_file, lambda: card.offer(sent, result_file))
+        return self.offered_all(list(asking.values()), sent, result_file) if asking else ""
 
-    def drawn(self, card, result_file, act) -> str:
+    def offered_all(self, cards, sent, result_file) -> str:
+        """Offer each card in `cards` and publish one answer for them all: the words of any card that could
+        not be shown, else the first card's no-send line. A task's result is written once."""
+        bodies, outcomes = [], []
+        for card in cards:
+            got, kept = [], card.__dict__.get("publish")
+            card.publish = lambda path, body, got=got: got.append(body)
+            try:
+                outcomes.append(self.drawn(card, result_file, lambda: card.offer(sent, result_file), card.publish))
+            finally:
+                if kept is None:
+                    del card.publish
+                else:
+                    card.publish = kept
+            bodies.append(got[-1] if got else "")
+        words = [b for b in bodies if b and not b.startswith("[no-send]")]
+        self.publish(result_file, "".join(words) if words else next((b for b in bodies if b), ANSWERED))
+        return "+".join(outcomes)
+
+    def drawn(self, card, result_file, act, publish=None) -> str:
         """`act()`, with a card that cannot be drawn (a name or a link the card rules refuse) answered in
         words once: nothing raises out of a card matter, so the task is never retried over it."""
         try:
             return act()
         except ValueError:
-            self.publish(result_file, self.quoted("I could not show the %s card. Tell me what you'd like in your "
-                                                  "own words." % card.KIND) + "\n")
+            (publish or self.publish)(result_file, self.quoted(
+                "I could not show the %s card. Tell me what you'd like in your own words." % card.KIND) + "\n")
             return "%s-card-failed" % card.KIND
 
     def marked(self, tier, path, status, text, result_file, task_text=None) -> str:

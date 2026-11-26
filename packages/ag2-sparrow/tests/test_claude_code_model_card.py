@@ -74,14 +74,16 @@ class Base(ConnectBase):
 
 class Claim(Base):
     def test_the_owners_model_in_their_dm_is_the_menu_and_never_reaches_the_session(self):
-        rc, out = self.claim(self.task("task-m", "/model"))
-        self.assertEqual(rc, 1)
-        self.assertIn("answered by its card (model-card)", out["refused"])
-        self.assertNotIn("admission", out, "nothing for the Mod to submit")
-        self.assertEqual((self.results / "task-m.txt").read_text(), model_switch.ANSWERED)
-        card, = [q["card"] for q in self.queued()]
-        self.assertEqual([b["label"] for b in card["buttons"]], [name for _, name in model_card.CHOICES])
-        self.assertIn("Now using Default.", card["text"])
+        for n, said in enumerate(("/model", "what model are you on?", "你在用什么模型")):
+            t = "task-m%d" % n
+            rc, out = self.claim(self.task(t, said))
+            self.assertEqual(rc, 1, said)
+            self.assertIn("answered by its card (model-card)", out["refused"], said)
+            self.assertNotIn("admission", out, "nothing for the Mod to submit")
+            self.assertEqual((self.results / (t + ".txt")).read_text(), model_switch.ANSWERED, said)
+            card = self.queued()[-1]["card"]
+            self.assertEqual([b["label"] for b in card["buttons"]], [name for _, name in model_card.CHOICES])
+            self.assertIn("Now using Default.", card["text"])
         self.assertEqual(self.started, [])
 
     def test_the_owners_tap_picks_the_model_and_starts_the_live_switch(self):
@@ -112,7 +114,7 @@ class Claim(Base):
         self.assertEqual(self.started, [])
 
     def test_any_other_owner_message_is_claimed_for_the_session_as_before(self):
-        for t, said in (("task-o", "what model are you on?"), ("task-w", "/models please")):
+        for t, said in (("task-o", "which model is best for coding?"), ("task-w", "/models please")):
             rc, out = self.claim(self.task(t, said))
             self.assertEqual((rc, out.get("admission")), (0, "owner"), t)
         rc, out = self.claim(self.task("task-g", "/model", tier="owner", kind="room"))

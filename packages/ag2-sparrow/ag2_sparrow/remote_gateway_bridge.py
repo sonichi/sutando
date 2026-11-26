@@ -368,6 +368,7 @@ from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 from .workspace_lock import DEFAULT_STALE_SECONDS as _WS_STALE_SECONDS
 from .workspace_lock import retain as _ws_retain
+from . import identity_lock
 from .workspace_lock import _host_label as _stable_host_label
 from .workspace_lock import proc_start as _ws_proc_start
 
@@ -11202,6 +11203,54 @@ def _release_singleton() -> None:
         _ws_release(_LOCK_ROLE, _LOCK_WS)
     except Exception:
         pass
+    try:
+        identity_lock.release(_IDENTITY_LOCK["name"])
+    except Exception:  # noqa: BLE001 — a dead pid's lock is reaped by the next bridge
+        pass
+
+
+_IDENTITY_LOCK = {"name": ""}    # the host-wide lock of the agent this bridge polls as, once held
+# A live bridge for this agent, found once the agent was known: stand down, as at the start, not restart.
+_IDENTITY_TAKEN = threading.Event()
+STAND_DOWN_EXIT_CODE = 75
+
+
+def _acquire_identity() -> bool:
+    """False → another live bridge on this host already polls as this agent (from another folder or
+    install), so this one must not. True when the lock is held, or cannot be known yet (fail-open)."""
+    if not _lock_on() or _IDENTITY_LOCK["name"]:
+        return True
+    try:
+        verdict, name, holder = identity_lock.take(_reenroll_identity(), URL, stale_seconds=_LOCK_STALE_S,
+                                                   declares={"serving": str(_LOCK_WS)})
+    except Exception as e:  # noqa: BLE001 — fail-open, as the workspace lock is
+        _log(f"identity lock: acquire error ({diagnostics.describe(e)}) — proceeding without it")
+        return True
+    if verdict == identity_lock.TAKEN:
+        words = identity_lock.taken_words(holder)
+        _log(f"identity lock: {words}")
+        _emit_gateway_status(False, error=words)
+        return False
+    if verdict == identity_lock.HELD:
+        _IDENTITY_LOCK["name"] = name
+        _log("identity lock: acquired (one bridge per agent on this computer)")
+    return True
+
+
+def _heartbeat_identity() -> bool:
+    """Take the identity lock once the agent is known, then keep it fresh. False → another bridge has it."""
+    try:
+        if not _IDENTITY_LOCK["name"]:
+            if _acquire_identity():
+                return True
+            _IDENTITY_TAKEN.set()
+            return False
+        if identity_lock.beat(_IDENTITY_LOCK["name"]):
+            return True
+    except Exception:  # noqa: BLE001 — fail-open
+        return True
+    _log("identity lock: lost to another bridge for this agent — exiting to avoid dual-poll")
+    return False
 
 
 def _heartbeat_singleton() -> bool:
@@ -11218,6 +11267,8 @@ def _heartbeat_singleton() -> bool:
             held = bool(_ws_heartbeat(_LOCK_ROLE, _LOCK_WS))
         except Exception:
             return True
+        if held and not _heartbeat_identity():
+            held = False
         if not held:
             _LOCK_LOST.set()
         return held
@@ -11721,10 +11772,10 @@ def main() -> int | None:
         sys.exit("FATAL: no gateway URL — set REMOTE_TASK_URL, or use the combined "
                  f"'https://<gateway>|<secret>' onboarding token{_hint}.")
     _resolve_host_label()
-    if not _acquire_singleton():
-        # A live bridge already polls this workspace: stand down. 75 tells a
-        # supervising wrapper not to relaunch; a plain exit would loop it.
-        sys.exit(75)
+    if not _acquire_singleton() or not _acquire_identity():
+        # A live bridge already polls this workspace, or polls as this agent from another: stand
+        # down. 75 tells a supervising wrapper not to relaunch; a plain exit would loop it.
+        sys.exit(STAND_DOWN_EXIT_CODE)
     # Heartbeat first: the settle can wait on the connections record lock past the stale window.
     _start_lock_heartbeat()
     _stand_down_if_asked()
@@ -11795,7 +11846,8 @@ def main() -> int | None:
                          "waiting for it to stop before exiting")
                     _LOCK_LOST.set()  # the next pass must come back here, never poll
                     continue
-                return LOCK_LOST_EXIT_CODE
+                # A relaunch would only find the same live bridge: tell the supervisor to leave it.
+                return STAND_DOWN_EXIT_CODE if _IDENTITY_TAKEN.is_set() else LOCK_LOST_EXIT_CODE
             _post_heartbeat(inflight)
             _retry_withheld_reviews()
             # LAST of the beat's work, on a daemon thread: two optional 15 s

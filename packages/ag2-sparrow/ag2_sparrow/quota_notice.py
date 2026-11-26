@@ -26,7 +26,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import card_desk, connector_cards
+from . import account_switch, card_desk, connector_cards
 
 FILE, ROOM_FILE = "quota-card.json", "quota-room.json"   # the incident; the owner's DM room
 RETRY_S = 60.0                  # a card that could not be queued is tried again no sooner than this
@@ -204,7 +204,7 @@ class QuotaNotice:
             self.log("account not read:", "%s: %s" % (type(e).__name__, str(e)[:200]))
             using = ""
         try:
-            built = self.build(words(self.name, str(rec.get("reset") or ""), using))
+            built = account_switch.limited(self.build(words(self.name, str(rec.get("reset") or ""), using)))
             qid = connector_cards.queue(str(self.bridge_state), to, *built, key=rec["key"], at_ns=rec["at"])
         except (OSError, ValueError) as e:
             self.log("quota card not queued:", "%s: %s" % (type(e).__name__, e))
