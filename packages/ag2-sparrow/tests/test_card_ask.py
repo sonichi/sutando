@@ -57,7 +57,17 @@ TABLE = (
     ("what's your account of what happened?", NONE),
     ("帮我注册一个账号", NONE),
     ("data model for the users table", NONE),
-    ("switch to haiku", NONE),      # a named model: the desk's direct pick (named_in), not the menu
+    ("switch to haiku", NONE),
+    # "model" or "account" as an ordinary word in a request: the agent's work, not a card
+    ("Can you model this?", NONE),
+    ("model it", NONE),
+    ("what can you model?", NONE),
+    ("could you model that for me", NONE),
+    ("use model", NONE),
+    ("用模型", NONE),
+    ("你能帮我建个模型吗", NONE),
+    ("账号和密码在哪", NONE),
+    ("account for this", NONE),      # a named model: the desk's direct pick (named_in), not the menu
     ("你在用哪个账号和模型" + "，" * card_ask.ASK_MAX, NONE),
     ("", NONE),
     (None, NONE),
@@ -143,6 +153,13 @@ class Desk(unittest.TestCase):
         self.assertEqual(self.offers(), (1, [0, 0]))
         self.assertEqual(self.task("我说 agy account"), "account-card")
         self.assertEqual(self.offers(), (1, [1, 0]))
+
+    def test_model_or_account_as_an_ordinary_word_reaches_the_agent(self):
+        for said in ("Can you model this?", "what can you model?", "model it", "你能帮我建个模型吗",
+                     "账号和密码在哪", "account for this"):
+            with self.subTest(said=said):
+                self.assertEqual(self.task(said), "")
+        self.assertEqual((self.offers(), self.written), ((0, [0, 0]), []))
 
     def test_anyone_else_another_room_or_another_account_goes_on_to_the_model(self):
         self.assertEqual(self.task("你在用哪个账号和模型", tier="team"), "")

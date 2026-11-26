@@ -3,7 +3,8 @@ connector, read by the card desk (`account_switch.asks_for_card`, `model_switch.
 
 A short message asks when every word in it is one of a small closed vocabulary (who: "you", "codex",
 "你"; asking: "which", "what", "哪个", "什么"; switching: "switch", "换"; glue: "are", "using", "在用",
-"的") and it names the account or the model. Chinese, English and the two mixed read the same. Any other
+"的") and it names the account or the model, asked as a question or a switch (or named alone: "我说
+agy account"), never as a verb ("can you model this"). Chinese, English and the two mixed read the same. Any other
 word ("create an account on GitHub", "我的 GitHub 账号", "which model is best for coding") leaves the
 message to the model, as does a message over ASK_MAX characters.
 """
@@ -19,7 +20,8 @@ _TOPIC = {
               "账号", "账户", "帐号", "帐户"),
     MODEL: ("models", "model", "模型"),
 }
-_ASKING = ("which", "what's", "whats", "what", "who", "哪一个", "哪个", "哪", "什么", "啥", "吗")
+_ASKING = ("which", "what's", "whats", "what", "who", "哪一个", "哪个", "哪", "什么", "啥", "吗",
+           "see", "tell me", "show me", "show", "看得到", "看得见", "看到", "看见", "告诉我")
 _SWITCH = ("switch", "change", "切换", "更换", "换")
 _MINE = ("my", "我的")      # the owner's own account only with a switch: "switch my account"
 # What the owner may call the agent: product names in one string, never paths to an adapter.
@@ -27,13 +29,19 @@ _NAMES = tuple("claude code|agy|antigravity|codex|claude|gemini".split("|"))
 _GLUE = _NAMES + (
     "you're", "youre", "you", "u", "your", "this agent", "the agent", "are", "r", "is", "'s", "do", "does",
     "using", "use", "on", "in", "with", "as", "to", "signed in", "logged in", "currently", "right now", "now", "current", "the", "it", "this", "that",
-    "one", "can", "could", "see", "tell me", "show me", "show", "please", "pls", "hey", "hi", "ok", "okay",
+    "one", "can", "could", "please", "pls", "hey", "hi", "ok", "okay",
     "so", "and", "&", "/",
     "你的", "您的", "自己的", "你", "您", "现在的", "目前的", "当前的", "现在", "目前", "当前", "在用的", "在用",
     "使用的", "使用", "用的", "用", "登录的", "登录", "登的", "在", "是", "的", "能不能", "可以", "能",
-    "看得到", "看得见", "看到", "看见", "告诉我", "一下", "个", "请问", "请", "帮我", "我要", "我想", "我说",
+    "一下", "个", "请问", "请", "帮我", "我要", "我想", "我说",
     "我是说", "我问", "那么", "那", "和", "跟", "还有", "呢", "啊", "呀", "吧", "嘛",
 )
+# Words that may stand around a bare name for the card, with no question or switch.
+_BARE = frozenset(_NAMES + ("我说", "我是说", "我问", "那", "那么", "the", "your", "你的", "您的", "and", "&", "/",
+                            "和", "跟", "还有", "hey", "hi", "ok", "okay", "so", "呢", "啊", "呀"))
+# Around "model", these make it a verb ("you model", "model this").
+_DOER = frozenset(("you", "u", "can", "could", "to", "do", "does"))
+_OBJECT = frozenset(("this", "that", "it"))
 # Asking what the word means ("什么是账号") is not asking which one this agent is on.
 _DEFINES = ("什么是",)
 
@@ -61,21 +69,30 @@ def asked(text) -> frozenset:
     if said.startswith("/"):
         # A slash command is the desk's exact match ("/model"), never these words ("/models please").
         return frozenset((ACCOUNT,)) if said == "/account" else frozenset()
-    kinds, at = set(), 0
+    words, at, cut = [], 0, False      # (word, its kind, whether punctuation stands before it)
     while at < len(said):
         gap = _SPACE.match(said, at)
         if gap:
-            at = gap.end()
+            cut, at = cut or bool(gap.group().strip()), gap.end()
             continue
         word = _WORD.match(said, at)
         if not word:
             return frozenset()
-        kinds.add(_KIND_OF[re.sub(r"\s+", " ", word.group())])
-        at = word.end()
+        w = re.sub(r"\s+", " ", word.group())
+        words.append((w, _KIND_OF[w], cut))
+        cut, at = False, word.end()
+    kinds = {k for _, k, _ in words}
     if "defines" in kinds or ("mine" in kinds and "switch" not in kinds):
         return frozenset()
+    # Asked with a question or a switch; else only a bare name for it ("我说 agy account", "account?").
+    if not kinds & {"ask", "switch"} and any(k == "glue" and w not in _BARE for w, k, _ in words):
+        return frozenset()
+    for n, (_, kind, cut) in enumerate(words):
+        before = words[n - 1][0] if n and not cut else ""
+        after = words[n + 1][0] if n + 1 < len(words) and not words[n + 1][2] else ""
+        if kind == "topic:" + MODEL and (before in _DOER or after in _OBJECT):
+            return frozenset()      # "can you model this", "what can you model": a verb, not the card
     return frozenset(k[len("topic:"):] for k in kinds if k.startswith("topic:"))
-
 
 def asks_for_account(text) -> bool:
     return ACCOUNT in asked(text)
