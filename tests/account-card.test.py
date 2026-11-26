@@ -85,8 +85,14 @@ def worker_on_record(record: Path, alive: bool) -> None:
         {"attempt": attempt, "pid": pid, "start": holder_lock.start_time(os.getpid())}))
 
 
+PEOPLE = {"acct-a": "alice@example.com", "acct-b": "bob@work.io", "acct-c": "carol@example.org",
+          "acct-a1": "alma@example.net", "acct-a2": "adam@example.net"}
+
+
 def key_of(account_id: str) -> str:
-    return hashlib.sha256(account_id.encode()).hexdigest()[:16]
+    """The desktop's store key: the workspace id and the person's email."""
+    ident = f"{account_id}|{PEOPLE[account_id]}" if account_id in PEOPLE else account_id
+    return hashlib.sha256(ident.encode()).hexdigest()[:16]
 
 
 def task(said, *, tier="owner", user=OWNER, kind="dm", room=DM, **extra):
@@ -143,6 +149,7 @@ class Base(unittest.TestCase):
         for d in (self.ws, self.home, self.app):
             d.mkdir()
         self.store = self.app / "accounts" / "codex"
+        self.agent_homes = []      # local Codex agents' homes on this computer
         self.fake, self.launch, self.restarts, self.outputs = Fake(), Launch(), [], []
         self.restart_rc, self.restart_writes = 0, None
         self.ready_ok, self.live_answer, self.ready_since = True, None, []
@@ -150,6 +157,7 @@ class Base(unittest.TestCase):
         for target, name, value in ((acc, "_owner_dm", lambda ws, core: DM),
                                     (acc, "runtime", lambda: self.RUNTIME),
                                     (acc, "codex_home", lambda: self.home),
+                                    (acc, "local_codex_homes", lambda user_home=None: list(self.agent_homes)),
                                     (connections, "read_rows", lambda ws=None: [CORE])):
             patch = mock.patch.object(target, name, value)
             patch.start()
@@ -597,6 +605,63 @@ class RemoteTaps(Base):
         self.assertEqual(self.launch.calls, [])
 
 
+def legacy_key(account_id: str) -> str:
+    """The key an earlier engine filed an account under: the workspace id alone."""
+    return hashlib.sha256(account_id.encode()).hexdigest()[:16]
+
+
+class LegacyStore(Base):
+    """A store and a card made before the key followed the desktop's rule (workspace id and email)."""
+
+    def setUp(self):
+        super().setUp()
+        self.store.mkdir(parents=True)
+        for acct, text, label in (("acct-a", A, "alice@example.com"), ("acct-b", B, "bob@work.io")):
+            (self.store / f"{legacy_key(acct)}.json").write_text(json.dumps({"label": label, "auth": text}))
+        self.signed_in(A)
+
+    def test_a_legacy_saved_account_is_offered_once_under_its_current_key(self):
+        self.post()
+        buttons = {b["label"]: b["command"].rsplit(":", 1)[1] for b in self.fake.cards()[-1]["buttons"]
+                   if b["label"].startswith("Use ")}
+        self.assertEqual(buttons, {"Use bob@work.io": key_of("acct-b")}, "the account in use is not offered")
+        self.assertEqual([s["key"] for s in acc.saved(self.store, key_of("acct-a")) if s["current"]], [key_of("acct-a")])
+        self.assertEqual(len(acc.saved(self.store)), 2, "a legacy file and its new copy are one account")
+
+    def test_a_card_made_before_the_change_asks_for_a_fresh_one(self):
+        """Review on #6837: the workspace-only key was shared by everyone in the workspace, so the file behind an
+        old button may since hold another person; such a button never switches."""
+        with mock.patch.object(acc, "saved", lambda store, current_key="": [
+                {"key": legacy_key("acct-b"), "label": "bob@work.io", "current": False}]):
+            self.post()
+        # A later save by another person of bob's workspace replaced the old file.
+        dana = auth("dana@work.io", "pro", "acct-b", SECRET_C)
+        (self.store / f"{legacy_key('acct-b')}.json").write_text(json.dumps({"label": "dana@work.io", "auth": dana}))
+        rc, out = self.tap("Use bob@work.io")
+        self.assertEqual((rc, out["status"], out["say"]), (2, "refused", acc.OLD_CARD))
+        self.assertEqual((self.launch.calls, self.live()), ([], A), "nothing started, nothing written")
+        state, words = acc.do_switch(self.ws, legacy_key("acct-b"), restart=self.restart, ready=self.ready,
+                                     live=self.live_account, held=lambda home, key: False)
+        self.assertEqual((state, self.live(), self.restarts), ("error", A, []), words)
+        # A fresh card names each person once, under their own key, and switches.
+        self.post()
+        buttons = {b["label"]: b["command"].rsplit(":", 1)[1] for b in self.fake.cards()[-1]["buttons"]
+                   if b["label"].startswith("Use ")}
+        self.assertEqual(buttons, {"Use dana@work.io": acc.identity(dana)[0]})
+
+    def test_the_holder_check_applies_to_an_account_filed_under_the_old_key(self):
+        agent = self.home.parent / "agent-home"
+        agent.mkdir()
+        (agent / "auth.json").write_text(B)
+        state, words = acc.do_switch(self.ws, key_of("acct-b"), restart=self.restart, ready=self.ready,
+                                     live=self.live_account, held=lambda home, key: acc.held_elsewhere(home, key, [agent]))
+        self.assertEqual((state, self.live(), self.restarts), ("error", A, []))
+        self.assertIn("another Codex on this computer is signed in with that account", words)
+        state, words = acc.do_switch(self.ws, key_of("acct-b"), restart=self.restart, ready=self.ready,
+                                     live=self.live_account, held=lambda home, key: False)
+        self.assertEqual((state, self.live()), ("done", B), words)
+
+
 class Switch(Base):
     def setUp(self):
         super().setUp()
@@ -626,6 +691,32 @@ class Switch(Base):
         last = self.fake.cards()[-1]
         self.assertEqual((last["id"], last["state"]), (acc.NOTE_ID, "done"))
         self.assertFalse(self.ws.joinpath(*acc.RUNNING).exists())
+
+    def test_a_saved_login_another_codex_here_holds_is_never_copied(self):
+        """2026-11-25: a switch to a saved account read "Codex isn't signed in anymore" within two minutes: a local
+        Codex agent held the same login, and its refresh ended the core's copy."""
+        agent = self.home.parent / "agent-home"
+        agent.mkdir()
+        (agent / "auth.json").write_text(B)
+        self.agent_homes = [agent]
+        rc, out = self.switch()
+        self.assertEqual((rc, out["outcome"]), (1, "error"))
+        self.assertEqual(out["say"], "Couldn't switch to bob@work.io: another Codex on this computer is signed in "
+                                     "with that account, and two copies of one sign-in end each other when either "
+                                     "refreshes. Sign in to it here with \"Add another account\" instead. Nothing changed.")
+        self.assertEqual((self.live(), self.restarts), (A, []), "nothing written, no restart")
+
+    def test_an_agent_sharing_the_cores_own_login_file_is_not_another_holder(self):
+        agent = self.home.parent / "agent-home"
+        agent.mkdir()
+        os.symlink(self.home / "auth.json", agent / "auth.json")     # the desktop's default: the agent links the core's
+        other = self.home.parent / "other-home"
+        other.mkdir()
+        (other / "auth.json").write_text(C)
+        self.agent_homes = [agent, other, self.home.parent / "gone"]
+        rc, out = self.switch()
+        self.assertEqual((rc, out["outcome"]), (0, "done"))
+        self.assertEqual(self.live(), B)
 
     def test_a_restart_that_did_not_happen_puts_the_previous_sign_in_back(self):
         self.restart_rc = 4
@@ -1079,9 +1170,26 @@ class Identity(unittest.TestCase):
     def test_key_and_label_follow_the_desktop_rule(self):
         self.assertEqual(acc.identity(A), (key_of("acct-a"), "alice@example.com"))
         no_id = json.dumps({"tokens": {"id_token": jwt({"sub": "user-1", "email": "x@y.z"})}})
-        self.assertEqual(acc.identity(no_id), (key_of("user-1"), "x@y.z"))
+        self.assertEqual(acc.identity(no_id), (key_of("x@y.z"), "x@y.z"))
+        no_email = json.dumps({"tokens": {"account_id": "ws-1", "id_token": jwt({"sub": "user-1"})}})
+        self.assertEqual(acc.identity(no_email)[0], key_of("ws-1|user-1"))
+        # Two people in one ChatGPT workspace are two accounts: keyed by the workspace alone one copy replaced the other.
+        same_ws = [auth(e, "team", "ws-shared", "s") for e in ("p@x.io", "q@x.io")]
+        self.assertNotEqual(acc.identity(same_ws[0])[0], acc.identity(same_ws[1])[0])
+        self.assertEqual(acc.identity(same_ws[0])[0], key_of("ws-shared|p@x.io"))
         for bad in ("", "{", json.dumps({"OPENAI_API_KEY": "sk"}), json.dumps({"tokens": {}})):
             self.assertIsNone(acc.identity(bad))
+
+    def test_local_codex_homes_are_read_from_each_agents_conf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / ".config" / "ag2-sparrow"
+            for name, conf in (("a", "AGENT_ID=@a:s\nCODEX_HOME='/x/a home'\n"), ("b", "CODEX_HOME=\n"),
+                               ("c", "MODEL=x\n"), ("d", "CODEX_HOME=relative\n")):
+                (root / "agents" / name).mkdir(parents=True)
+                (root / "agents" / name / "codex-local.conf").write_text(conf)
+            (root / "codex-local.conf").write_text('CODEX_HOME="/x/top"\n')
+            self.assertEqual(acc.local_codex_homes(Path(tmp)), [Path("/x/top"), Path("/x/a home")])
+            self.assertEqual(acc.local_codex_homes(Path(tmp) / "none"), [])
 
     def test_masking(self):
         self.assertEqual(acc.masked_label("alice@example.com"), "alice@example.com")
