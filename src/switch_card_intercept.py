@@ -22,6 +22,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -96,10 +97,29 @@ def request(task_text: str, workspace: Optional[Path] = None) -> Optional[dict]:
             "reply_to": (h.get("source_message_id") or "").strip()}
 
 
+def limit_lead(workspace: Path, now=time.time) -> str:
+    """The core's usage limit in force, in the quota card's own words; '' when none is (or it cannot be read).
+    Out of usage, the owner's ask for any card is answered by the limit's card first."""
+    try:
+        import core_quota_notice
+        rec = json.loads(Path(workspace).joinpath(*core_quota_notice.FILE).read_text(encoding="utf-8"))
+        if not isinstance(rec, dict) or not rec.get("since") or (rec.get("why") or "quota") != "quota":
+            return ""
+        until = rec.get("reset_at")
+        if until is not None and now() >= float(until):
+            return ""
+        return core_quota_notice.words(str(rec.get("name") or "The core"), str(rec.get("reset") or ""),
+                                       credits=bool(rec.get("credits")))
+    except (OSError, ValueError, TypeError, ImportError):
+        return ""
+
+
 def post(req: dict, workspace: Path, repo: Path = _REPO, run=subprocess.run) -> bool:
-    skill, script = SCRIPTS[req["kind"]]
+    skill, script = SCRIPTS["account" if req.get("lead") else req["kind"]]
     argv = [sys.executable, str(repo / "skills" / skill / "scripts" / script), "--workspace", str(workspace),
             "post", "--room", req["room"]]
+    if req.get("lead"):
+        argv += ["--retry", "--lead", req["lead"]]      # the quota card: the limit first, then the account
     if req.get("reply_to"):
         argv += ["--reply-to", req["reply_to"]]
     try:
@@ -137,6 +157,9 @@ def intercept(task_file: Path, workspace: Path, results_dir: Path, repo: Path = 
         return False
     if req is None:
         return False
+    lead = limit_lead(workspace)
+    if lead:
+        req = dict(req, lead=lead, kind="quota")
     if not post(req, workspace, repo, run):
         log(f"{Path(task_file).name}: the {req['kind']} card was not posted; the core takes it")
         return False

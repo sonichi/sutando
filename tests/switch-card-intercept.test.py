@@ -109,6 +109,28 @@ class Intercept(unittest.TestCase):
         self.assertEqual(argv[argv.index("post") + 1:], ["--room", "!dm:s.space", "--reply-to", "$evt"])
         self.assertTrue((self.results / "task-abc.txt").read_text().startswith("[no-send]"))
 
+    def test_out_of_usage_every_card_asked_for_is_answered_by_the_limits_card(self):
+        import core_quota_notice
+        state = self.ws.joinpath(*core_quota_notice.FILE)
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({"since": 1.0, "name": "Codex", "reset": "3:05 PM", "told": True}))
+        lead = "Codex has reached its usage limit (resets 3:05 PM), so I can't answer until then. Switch to another account to go on now."
+        for words in ("/model", "switch core", "account"):
+            self.calls.clear()
+            self.assertTrue(self.run_with(words), words)
+            argv = self.calls[0]
+            self.assertTrue(argv[1].endswith("skills/account-switch/scripts/account_card.py"), words)
+            self.assertEqual(argv[argv.index("post") + 1:],
+                             ["--room", "!dm:s.space", "--retry", "--lead", lead, "--reply-to", "$evt"], words)
+        # No limit, one past its reset, a sign-out, or a record that cannot be read: the card asked for, as before.
+        for rec in ("{}", json.dumps({"since": 1.0, "reset_at": 2.0}), json.dumps({"since": 1.0, "why": "signed_out"}),
+                    "[1]", "not json"):
+            state.write_text(rec)
+            self.assertEqual(sci.limit_lead(self.ws), "", rec)
+        self.calls.clear()
+        self.assertTrue(self.run_with("/model"))
+        self.assertTrue(self.calls[0][1].endswith("skills/model-switch/scripts/model_card.py"))
+
     def test_a_card_not_posted_leaves_it_to_the_core(self):
         self.assertFalse(self.run_with("switch account", status="failed", rc=1))
         self.assertFalse((self.results / "task-abc.txt").exists())
