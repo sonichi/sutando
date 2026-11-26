@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -20,7 +21,7 @@ from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
 isolate_os_environ()
 
 from ag2_sparrow import tmux_pane_keys  # noqa: E402
-from ag2_sparrow.adapters.claude_code import cli, launcher, trust  # noqa: E402
+from ag2_sparrow.adapters.claude_code import cli, hold, launcher, trust  # noqa: E402
 
 GEN = {"nonce": "a" * 32, "pane_pid": 7, "session_id": "$1", "session_created": 5, "pane_id": "%1"}
 REC = {"generation": GEN, "title_token": "tok"}
@@ -247,6 +248,93 @@ class SwitchModel(unittest.TestCase):
         self.assertEqual([launcher.composer_boxed(t) for t in (None, box(), "\u276f ", coloured)], [False, True, False, True])
         self.assertIs(launcher.claude_model_switch.pane_composer.composer_text.__module__ == "ag2_sparrow.pane_composer", True)
 
+    def test_the_settings_pick_a_session_cannot_take_is_kept_and_the_next_start_runs_on_it(self):
+        # 2026-11-25: the session sat on the usage-limit menu while it was restarted for an account change;
+        # the page's pick came back "refused: the session does not show its whole input box".
+        menu = "What do you want to do?\n\u276f 1. Stop and wait for limit to reset\n  2. Switch to extra usage"
+        for pane, why in ((Pane(says), "it shows no input box"), (Pane(says, session=False), "no session is running")):
+            pane.text = menu
+            lc = lc_for(pane, self.root)
+            slept = []
+            lc.sleep = slept.append
+            with mock.patch.object(launcher.time, "monotonic", side_effect=iter(range(0, 1000, 2)).__next__):
+                switched, line = lc.switch_model(REC, "opus", pend=True)
+            self.assertEqual((switched, line), (False, launcher.MODEL_PENDING % (why, "opus")))
+            self.assertEqual((pane.sent, launcher.wanted_model(self.root), launcher.switched_model(self.root)),
+                             ([], "opus", ""), "nothing typed; the pick waits; the model in use is unchanged")
+            self.assertEqual(bool(slept), pane.session, "a session that is starting is given a moment to show its box")
+        # The next start settles it: the session starts with --model, and nothing waits any more.
+        self.assertEqual(hold.settle_wanted(self.root, now=lambda: 5.0), "opus")
+        self.assertEqual(json.loads(self.root.joinpath(*launcher.MODEL_RECORD).read_text()), {"model": "opus", "at": 5.0})
+        self.assertEqual((launcher.wanted_model(self.root), hold.settle_wanted(self.root)), ("", ""))
+        argv = hold.claude_argv({"CLAUDE": "claude", "PLUGIN_DIR": str(self.root), "ROOT": str(self.root)}, "sid")
+        self.assertEqual(argv[-2:], ["--model", "opus"])
+        # A pick kept beside a model already in use keeps both, and a later live switch drops the waiting one.
+        pane = Pane(says)
+        pane.text = menu
+        with mock.patch.object(launcher, "MODEL_BOX_WAIT_S", 0):
+            lc_for(pane, self.root).switch_model(REC, "haiku", pend=True)
+        self.assertEqual((launcher.switched_model(self.root), launcher.wanted_model(self.root)), ("opus", "haiku"))
+        self.assertEqual(lc_for(Pane(says), self.root).switch_model(REC, "sonnet", pend=True), (True, "switched to sonnet"))
+        self.assertEqual((launcher.switched_model(self.root), launcher.wanted_model(self.root)), ("sonnet", ""))
+
+    def test_a_box_that_appears_while_waiting_is_typed_into_and_the_card_still_gets_the_refusal(self):
+        pane = Pane(says)
+        pane.text = "Welcome to Claude Code"
+        lc = lc_for(pane, self.root)
+        lc.sleep = lambda s: setattr(pane, "text", box())        # the session finished starting
+        self.assertEqual(lc.switch_model(REC, "opus", pend=True), (True, "switched to opus"))
+        # The in-chat card (no `pend`) keeps its own retry: it is refused as before, and nothing is kept.
+        pane = Pane(says)
+        pane.text = "Welcome to Claude Code"
+        refused = lc_for(pane, self.root).switch_model(REC, "haiku")
+        self.assertEqual((refused[0], "cannot be read" in refused[1], launcher.wanted_model(self.root)), (False, True, ""))
+        # A pick that cannot be saved is the refusal, never a silent loss.
+        with mock.patch.object(hold, "write_model_record", side_effect=OSError("read-only")), \
+                mock.patch.object(launcher, "MODEL_BOX_WAIT_S", 0):
+            self.assertIn("cannot be read", lc_for(pane, self.root).switch_model(REC, "haiku", pend=True)[1])
+        self.root.joinpath(*launcher.MODEL_RECORD).write_text("[")
+        self.assertEqual((hold.wanted_model(self.root), hold.settle_wanted(self.root)), ("", ""))
+        self.root.joinpath(*launcher.MODEL_RECORD).write_text(json.dumps({"wanted": "opus"}))
+        with mock.patch.object(hold, "write_model_record", side_effect=OSError("read-only")):
+            self.assertEqual(hold.settle_wanted(self.root), "", "the start goes on with the model it had")
+
+    def test_a_start_never_overwrites_a_newer_settings_pick(self):
+        # The start's read-and-settle runs between the page's own read and write unless it takes their lock.
+        record = self.root.joinpath(*launcher.MODEL_RECORD)
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(json.dumps({"wanted": "opus"}))
+        read, written = threading.Event(), threading.Event()
+        real = hold.wanted_model
+
+        def read_then_yield(root):
+            model = real(root)
+            read.set()
+            written.wait(0.5)       # under the lock the page cannot write here, and this times out
+            return model
+
+        def page():
+            read.wait(5)
+            self.assertEqual(lc_for(Pane(says), self.root).switch_model(REC, "sonnet", pend=True), (True, "switched to sonnet"))
+            written.set()
+
+        t = threading.Thread(target=page)
+        t.start()
+        with mock.patch.object(hold, "wanted_model", read_then_yield):
+            hold.settle_wanted(self.root, now=lambda: 5.0)
+        t.join(5)
+        self.assertEqual((launcher.switched_model(self.root), launcher.wanted_model(self.root)), ("sonnet", ""),
+                         "the newer accepted pick survives the start")
+
+    def test_the_model_record_writer_uses_a_private_temp(self):
+        record = self.root.joinpath(*launcher.MODEL_RECORD)
+        record.parent.mkdir(parents=True, exist_ok=True)
+        other = record.with_name(record.name + ".tmp")
+        other.write_text("another writer's half-written record")
+        hold.write_model_record(self.root, {"model": "opus", "at": 1.0})
+        self.assertEqual((json.loads(record.read_text()), other.read_text()),
+                         ({"model": "opus", "at": 1.0}, "another writer's half-written record"))
+
     def test_only_a_line_naming_the_model_asked_for_is_the_switch(self):
         def other(keys, pane):
             pane.text += "\n  \u23bf  Set model to Sonnet 4.6 and saved as your default"
@@ -378,7 +466,8 @@ class SwitchModel(unittest.TestCase):
 
 
 class ModelCommand(unittest.TestCase):
-    def run_model(self, *argv, selected=object(), config=({"ROOT": "/w"}, ""), switch=(True, "switched to opus")):
+    def run_model(self, *argv, selected=object(), config=({"ROOT": "/w"}, ""), switch=(True, "switched to opus"),
+                  wanted=""):
         args = types.SimpleNamespace(model=argv[0] if argv else None, confirm="--confirm" in argv)
         made = []
 
@@ -386,8 +475,9 @@ class ModelCommand(unittest.TestCase):
             def __init__(self, cfg, config_dir):
                 made.append((cfg, config_dir))
 
-            def switch_model(self, rec, model, confirm=False):
+            def switch_model(self, rec, model, confirm=False, pend=False):
                 made.append((rec, model, confirm))
+                self.pend = pend
                 return switch
 
         out, err = io.StringIO(), io.StringIO()
@@ -396,6 +486,7 @@ class ModelCommand(unittest.TestCase):
                 mock.patch.object(cli, "config_dir", return_value="/c"), \
                 mock.patch.object(cli.launcher, "Launcher", Lc), \
                 mock.patch.object(cli.launcher, "switched_model", return_value="sonnet"), \
+                mock.patch.object(cli.launcher, "wanted_model", return_value=wanted), \
                 mock.patch.object(cli.records, "load_supervisor", return_value={"r": 1}), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = cli.model(args)
@@ -410,6 +501,17 @@ class ModelCommand(unittest.TestCase):
         self.assertEqual(made, [({"ROOT": "/w"}, "/c"), ({"r": 1}, "opus", True)])
         rc, out, _, _ = self.run_model("opus", switch=(False, "unconfirmed: x"))
         self.assertEqual((rc, json.loads(out)["switched"]), (1, False))
+
+    def test_a_pick_kept_for_the_next_start_is_pending_not_an_error(self):
+        # 2026-11-25: the settings page showed "refused: the session does not show its whole input box".
+        rc, out, _, _ = self.run_model("opus", "--confirm", switch=(False, "saved: ..."), wanted="opus")
+        self.assertEqual((rc, json.loads(out)), (0, {"switched": False, "model": "opus", "detail": "saved: ...",
+                                                    "pending": "opus"}))
+        rc, out, _, _ = self.run_model(wanted="opus")
+        self.assertEqual((rc, json.loads(out)["current"], json.loads(out)["pending"]), (0, "sonnet", "opus"))
+        # Another pick is waiting, not this one: the refusal stands.
+        rc, out, _, _ = self.run_model("opus", switch=(False, "refused: x"), wanted="haiku")
+        self.assertEqual((rc, "pending" in json.loads(out)), (1, False))
 
     def test_no_job_or_an_unreadable_config_is_unusable(self):
         self.assertEqual(self.run_model(selected=None)[0], cli.EXIT_UNUSABLE)
