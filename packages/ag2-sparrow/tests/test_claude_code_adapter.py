@@ -89,9 +89,9 @@ class PluginShape(unittest.TestCase):
         self.assertEqual(mod, task_io.AUDIENCE_RULE)
         frames = re.findall(r"`\[s\.space task \$\{rid\}; sender tier[^`]*`", src)
         self.assertEqual(len(frames), 2, frames)
-        # The audience rule is in both; the owner's own frame then adds the model card's rule.
+        # The audience rule is in both; the owner's own frame then adds the two card rules.
         owner, other = sorted(frames, key=lambda f: "untrusted room data" in f)
-        self.assertTrue(owner.endswith(r"\n${AUDIENCE_RULE}\n${MODEL_RULE}\n`"), owner)
+        self.assertTrue(owner.endswith(r"\n${AUDIENCE_RULE}\n${MODEL_RULE}\n${ACCOUNT_RULE}\n`"), owner)
         self.assertTrue(other.endswith(r"\n${AUDIENCE_RULE}\n`"), other)
         self.assertNotIn("_RULE}", other.replace("${AUDIENCE_RULE}", ""))
 

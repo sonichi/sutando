@@ -55,6 +55,7 @@ from cli_wedge import (PROVIDER_LIMIT_PATTERNS, FrameAbnormal, capture_pane,  # 
                        state_id)
 from file_lock import locked_file  # noqa: E402  (cross-platform; never fcntl directly)
 # The input-box parse is src/pane_composer.py's (bundled for claude-local); re-exported for importers.
+import pane_composer  # noqa: E402
 from pane_composer import (BORDER_LINE, CLAUDE_COMPOSER, CLAUDE_IDLE, COMPOSER_PLACEHOLDER,  # noqa: E402,F401
                            SGR_STRIP, TIP_ROW, PromptLine, _GHOST, _SGR, _prompt_glyph, after_prompt,
                            composer_boxed, composer_frame_visible, composer_text, frame_plain,
@@ -154,11 +155,8 @@ def limit_standing(pane: Optional[str], runtime: Optional[str] = None, outrun: b
 
 _NUMBERED_ROW = re.compile(r"^\s*(?:❯\s*)?\d+\.\s")
 _CARET_ROW = re.compile(r"^\s*❯\s*\d+\.\s")
-# The CLI limit menu's own rows: its first option, and one of the others it always offers with it.
-_LIMIT_MENU_STOP = re.compile(r"^\s*(?:❯\s*)?1\.\s+Stop and wait for (?:the |your )?(?:session |usage |weekly )?"
-                              r"limit to reset\s*$", re.I)
-_LIMIT_MENU_MORE = re.compile(r"^\s*(?:❯\s*)?\d\.\s+(?:(?:Switch to|Add funds to continue with) (?:extra usage|usage "
-                              r"credits)|Wait here, then continue automatically\b)", re.I)
+# The CLI limit menu's own rows have one source, shared with claude-local (src/pane_composer.py).
+_LIMIT_MENU_STOP, _LIMIT_MENU_MORE = pane_composer.LIMIT_MENU_STOP, pane_composer.LIMIT_MENU_MORE
 
 
 def _dialog_names_limit(text: str) -> bool:

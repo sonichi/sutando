@@ -22,7 +22,7 @@ import sys
 import time
 from pathlib import Path
 
-from ... import card_desk, connect_bridge as cb, connect_common as cm, connector_cards, model_switch
+from ... import account_switch, card_desk, connect_bridge as cb, connect_common as cm, connector_cards, model_switch
 from ... import claude_local_records as records
 from ...acp_host import quoted
 from ...file_lock import locked_file
@@ -180,6 +180,7 @@ def card_matter(root, task_id: str, cfg: dict, popen=subprocess.Popen, environ=N
         connector_cards.absorb(bridge, root)      # the cards the bridge posted since, so their taps can act
     except Exception as e:  # noqa: BLE001 - a ledger that cannot take them leaves their taps refused, not a crash
         log("absorb failed:", "%s: %s" % (type(e).__name__, e))
+    remember_owner_dm(root, path)
     said: dict = {}
     outcome = desk(root, cfg, lambda result_file, body: said.update(body=body)).task(
         path, os.path.join(root, "results", task_id + ".txt"))
@@ -193,10 +194,25 @@ def card_matter(root, task_id: str, cfg: dict, popen=subprocess.Popen, environ=N
     return outcome, said.get("body") or model_switch.ANSWERED
 
 
+def remember_owner_dm(root, path) -> None:
+    """A message of the owner's in their DM names the room a quota notice goes to (quota_card)."""
+    try:
+        from . import quota_card
+        agent_card, _ = connector_cards._core()
+        with open(path, encoding="utf-8") as f:
+            sent, _ = agent_card.reply_words(f.read())
+        if agent_card.owner_may_act(sent) is None:
+            quota_card.remember_room(root, sent.get("channel_id"))
+    except Exception as e:  # noqa: BLE001 - the task goes on without it
+        log("owner DM not remembered:", "%s: %s" % (type(e).__name__, e))
+
+
 def desk(root, cfg: dict, publish) -> card_desk.Desk:
-    """This agent's cards behind the shared desk, which routes a tap, a stale tap, the owner's /model or
-    the session's mark to the card it names."""
-    return card_desk.Desk(root, publish, quoted, [switcher(root, cfg, publish=publish)])
+    """This agent's cards behind the shared desk: the model card here, the account card (account_card). The
+    desk routes a tap, a stale tap, the owner's /model or /account (/login), or the session's mark."""
+    from . import account_card
+    return card_desk.Desk(root, publish, quoted, [switcher(root, cfg, publish=publish)]
+                          + account_card.cards(root, cfg, publish, log))
 
 
 MARKED_DIR = "card-marks"
@@ -205,11 +221,11 @@ MARKED_KEEP_S = 24 * 3600.0     # a staging retry comes within minutes; a kept a
 
 def marked_answer(root, task_id: str, body: bytes, cfg: dict, show: bool = True) -> "bytes | None":
     """The answer to stage instead of `body` when the session answered its owner with a card's mark alone
-    ("[model-card]"): the card is shown in their DM and the answer is its no-send line (or
+    ("[model-card]", "[account-card]"): the card is shown in their DM and the answer is its no-send line (or
     where to ask, outside the DM). None for any other answer. The first answer is kept, so a staging retry
     stages the same bytes and never shows the card twice; without `show` only a kept answer is given."""
     text = body.decode("utf-8", "replace").strip()
-    if text != model_switch.MARK:
+    if text not in (model_switch.MARK, account_switch.MARK):
         return None
     kept = records.state_dir(root) / MARKED_DIR / (task_id + ".txt")
     if kept.is_file():
