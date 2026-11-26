@@ -57,14 +57,8 @@ class AccountCard(account_switch.AccountSwitch):
 
     def __init__(self, root, cfg: dict, publish, log, ask: str = "/account", run=None):
         super().__init__(str(records.state_dir(root)), str(cb.bridge_state(cfg)), NAME, publish, quoted, log,
-                         read=lambda: label(cfg, run=run), begin=None, cancel=None, opener=None)
+                         read=lambda: label(cfg, run=run), begin=None, cancel=None, opener=None, runtime=RUNTIME)
         self.ASK = ask
-
-    def card(self, state: str, text: str, url: str = "", ask: bool = False):
-        """The shared card; the one asked for also says the controls are below and carries their marker."""
-        if not ask:
-            return super().card(state, text, url, ask)
-        return account_switch.with_controls(super().card(state, "%s %s" % (text, account_switch.BELOW), url, ask), RUNTIME)
 
     def tapped(self, verb, sent, result_file) -> str:
         """"Switch account": where to switch it, shown in place of the card tapped and still carrying the
