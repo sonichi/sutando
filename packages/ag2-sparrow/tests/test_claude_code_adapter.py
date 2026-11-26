@@ -1994,7 +1994,7 @@ class LauncherTmux(ConnectBase):
 
         def fenced(gen, title, action):
             rc = real(gen, title, action)
-            if action.startswith("send-keys"):
+            if "/exit" in action:   # copy-mode -q, then the keys, in the one fenced command
                 seen.append((rc, self.tmux("capture-pane", "-p", "-t", gen["pane_id"]).stdout))
             return rc
         with mock.patch.object(lc, "fenced", fenced):
