@@ -7,7 +7,7 @@ request first and echoes the decision; `[[stall]]` never completes until
 `turn/interrupt`; `[[stall-hard]]` ignores the interrupt too. `[[limit]]` fails the turn on the account's usage
 limit (a used-up rate-limit window, an `error` notification, the turn's codexErrorInfo); `[[limit-bare]]` the
 same with no rate-limit window; `[[limit-words]]` fails it on another error whose words speak of a usage limit;
-`[[fail]]` fails it on another error. A refused turn ends with no item, unless `[[worked]]` is there too: then a
+`[[noaccess]]` fails a turn that names no model as one the account cannot run; `[[fail]]` fails it on another error. A refused turn ends with no item, unless `[[worked]]` is there too: then a
 reasoning item and part of a reply come first.
 
 Tokens, as the real server holds them: `stub-token` under CODEX_HOME is read once, at start, and kept in
@@ -223,6 +223,10 @@ for line in sys.stdin:
             refuse_turn(tid, turn_id, item_id, {
                 "message": "You've hit your usage limit. Upgrade to Pro or try again at 3:05 PM.",
                 "codexErrorInfo": "usageLimitExceeded", "additionalDetails": None}, text)
+        elif "[[noaccess]]" in text and not p.get("model"):    # the account cannot run the thread's own model
+            refuse_turn(tid, turn_id, item_id, {
+                "message": "The 'stub-model' model is not supported when using Codex with a ChatGPT account.",
+                "codexErrorInfo": "other", "additionalDetails": None}, text)
         elif "[[fail]]" in text:
             refuse_turn(tid, turn_id, item_id, {"message": "stream disconnected before completion",
                                                 "codexErrorInfo": "responseStreamDisconnected"}, text)

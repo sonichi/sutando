@@ -263,3 +263,28 @@ def composer_boxed(capture: Optional[str], adapter=CLAUDE_COMPOSER) -> bool:
     if start is None or start == 0 or not BORDER_LINE.match(lines[start - 1]):
         return False
     return any(BORDER_LINE.match(row) for row in lines[start + 1:])
+
+
+_NUMBERED_ROW = re.compile(r"^\s*(?:❯\s*)?\d+\.\s")
+_CARET_ROW = re.compile(r"^\s*❯\s*\d+\.\s")
+# The CLI limit menu's own rows: its first option, and one of the others it always offers with it.
+LIMIT_MENU_STOP = re.compile(r"^\s*(?:❯\s*)?1\.\s+Stop and wait for (?:the |your )?(?:session |usage |weekly )?"
+                             r"limit to reset\s*$", re.I)
+LIMIT_MENU_MORE = re.compile(r"^\s*(?:❯\s*)?\d\.\s+(?:(?:Switch to|Add funds to continue with) (?:extra usage|usage "
+                             r"credits)|Wait here, then continue automatically\b)", re.I)
+
+
+def limit_menu(text: str) -> bool:
+    """Whether Claude Code's own usage-limit menu is the live dialog on a plain capture: the last run of
+    numbered rows has the caret on one, the menu's first option and one of the others it always offers
+    with it. Words that only read like the menu (a reply, a quoted message) have no such run."""
+    lines = (text or "").splitlines()
+    end = max((i for i, ln in enumerate(lines) if _NUMBERED_ROW.match(ln)), default=None)
+    if end is None:
+        return False
+    start = end
+    while start > 0 and _NUMBERED_ROW.match(lines[start - 1]):
+        start -= 1
+    menu = lines[start:end + 1]
+    return (any(_CARET_ROW.match(ln) for ln in menu) and any(LIMIT_MENU_STOP.match(ln) for ln in menu)
+            and any(LIMIT_MENU_MORE.match(ln) for ln in menu))

@@ -55,6 +55,12 @@ class Desk:
         for card in self.cards:
             if ask.lower() == card.ASK and card.usable():
                 return self.drawn(card, result_file, lambda: card.asked_for(words.strip(), sent, result_file))
+        # The owner's own words naming one choice ("switch to haiku"): picked as a tap would be, no menu.
+        for card in self.cards:
+            named = getattr(card, "named_in", None)
+            choice = named(said.strip()) if named and card.usable() else ""
+            if choice:
+                return self.drawn(card, result_file, lambda: card.asked_for(choice, sent, result_file))
         for card in self.cards:
             # A card may also name the owner's own words that are its matter (`asks`), read here and
             # never by the model: the account card's, for what the runtime cannot see of itself.

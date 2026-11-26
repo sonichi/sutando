@@ -12,6 +12,15 @@ shown in place of that card: the bridge sends it as an edit of that event, so th
 whose words change, not a second card. The edit's card is recorded under the original event, the one
 the owner sees and taps. An edit the server refuses is posted as a new card instead.
 
+What became of a queued card outlives both files: the bridge leaves `outcomes/<queue id>` saying
+`posted`, `dropped` (expired with no send ever tried) or `unsure` (expired after a send that failed or
+did not answer, which may have gone through), kept as long as a key's marker. A connector that looks
+after the receipt was absorbed still reads a fact (`outcome`) and never infers one from a file's
+absence. An `unsure` card may be queued again under its own key (`again`): the same queue id, so the
+same dedupe key at the server, which makes the repeat one message. Only the bridge writes or replaces
+an outcome; a connector never removes one, so it cannot erase what a sweep has just recorded. A
+requeued entry stays `attempted`: `unsure` stands until the bridge records `posted`.
+
 Queue and posted files live under the bridge's state dir (`agent-cards/outbox`, `agent-cards/posted`);
 the bridge never writes into the work root. Standard library only, plus the bundled card modules.
 """
@@ -29,6 +38,7 @@ from pathlib import Path
 
 OUTBOX, POSTED = ("agent-cards", "outbox"), ("agent-cards", "posted")
 KEYS = ("agent-cards", "keys")     # one marker per keyed card ever queued, so a repeat is not a second card
+OUTCOMES = ("agent-cards", "outcomes")     # what became of each queued card: posted, dropped or unsure
 KEYS_KEEP_S = 7 * 86400.0
 CARD_KEY = "space.ag2.card"
 MAX_QUEUED_S = 600.0
@@ -79,13 +89,14 @@ def _entries(folder: Path) -> list:
 
 
 def queue(bridge_state, room: str, body: str, card: dict, *, now=None, key: str = "", at_ns: int = 0,
-          edit: str = "") -> str:
+          edit: str = "", again: bool = False) -> str:
     """Queue `card` for `room`; the queue id. A card the client would not draw is refused here. With
     `edit` (a posted card's event id) it is shown in place of that card instead of as a new one.
 
     With `key` (and the `at_ns` it was first decided at) the call may be repeated: the id is made of
     those two, and a card already queued under it is not queued again, so a caller that saved its
-    intent, queued, and stopped before saving that it had, can simply queue again after a restart."""
+    intent, queued, and stopped before saving that it had, can simply queue again after a restart.
+    `again` queues a keyed card whose outcome is `unsure` once more, under the same id; any other is left."""
     agent_card, _ = _core()
     found = agent_card.problem(card)
     if found:
@@ -100,17 +111,42 @@ def queue(bridge_state, room: str, body: str, card: dict, *, now=None, key: str 
     else:
         qid = "%016x%s" % (int(at_ns) & 0xFFFFFFFFFFFFFFFF, hashlib.sha256(key.encode("utf-8")).hexdigest()[:16])
         marker = Path(bridge_state).joinpath(*KEYS) / qid
-        if marker.exists():
+        entry = Path(bridge_state).joinpath(*OUTBOX) / (qid + ".json")
+        requeue = marker.exists() and again and outcome(bridge_state, qid) == "unsure" and not entry.is_file()
+        if marker.exists() and not requeue:
             return qid
     _write(Path(bridge_state).joinpath(*OUTBOX) / (qid + ".json"),
            dict({"room": room, "body": body, "card": card, "queued_at": time.time() if now is None else now},
-                **({"edit": edit} if edit else {})))
+                **({"edit": edit} if edit else {}), **({"attempted": True} if key and requeue else {})))
     if key:
         # The marker follows the card: a stop between the two queues it once more, never drops it.
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text("", encoding="utf-8")
         _forget_old_keys(marker.parent)
     return qid
+
+
+def _settle(bridge_state, qid: str, what: str) -> None:
+    """Record what became of the queued card `qid`. Written before its outbox entry is removed, so the
+    entry being gone always has a recorded reason; one that cannot be written leaves the entry queued."""
+    path = Path(bridge_state).joinpath(*OUTCOMES) / qid
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(what, encoding="utf-8")
+    os.replace(tmp, path)
+    _forget_old_keys(path.parent)
+
+
+def outcome(bridge_state, qid: str) -> str:
+    """'posted', 'dropped' or 'unsure' once the bridge has settled the queued card `qid`; '' while it
+    has not (still queued, never queued, or settled longer ago than KEYS_KEEP_S)."""
+    if not re.match(r"^[0-9a-f]{32}$", str(qid or "")):
+        return ""
+    try:
+        said = (Path(bridge_state).joinpath(*OUTCOMES) / qid).read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return ""
+    return said if said in ("posted", "dropped", "unsure") else ""
 
 
 def _forget_old_keys(folder: Path) -> None:
@@ -137,6 +173,7 @@ class Poster:
             record = _read(path)
             card = (record or {}).get("card")
             if not record or not isinstance(card, dict) or not _ROOM_RE.match(str(record.get("room") or "")):
+                _settle(self.state, path.stem, "dropped")
                 path.unlink(missing_ok=True)
                 continue
             # A card waits behind an earlier one of the same card in the same room that is not posted
@@ -147,15 +184,24 @@ class Poster:
             same = {(record["room"], "card", str(card.get("id") or ""))} | ({(record["room"], "event", target)} if target else set())
             if same & held:
                 continue
-            if self.clock() - float(record.get("queued_at") or 0) > MAX_QUEUED_S:
-                self.log("agent-card: dropped a card queued over %d s ago" % MAX_QUEUED_S)
+            # Already posted, by a sweep that then failed to finish: that stands, whatever its age now.
+            if outcome(self.state, path.stem) == "posted" or (self.state.joinpath(*POSTED) / path.name).is_file():
+                _settle(self.state, path.stem, "posted")
                 path.unlink(missing_ok=True)
                 continue
-            payload = {"op": "message", "room_id": record["room"], "body": str(record.get("body") or ""),
-                       "extra_content": {CARD_KEY: card}, "dedupe_key": "agent-card:" + path.stem}
+            if self.clock() - float(record.get("queued_at") or 0) > MAX_QUEUED_S:
+                self.log("agent-card: dropped a card queued over %d s ago" % MAX_QUEUED_S)
+                _settle(self.state, path.stem, "unsure" if record.get("attempted") else "dropped")
+                path.unlink(missing_ok=True)
+                continue
             if self.clock() < float(record.get("not_before") or 0):
                 held |= same            # backing off after a send with no verdict: nothing overtakes it
                 continue
+            if not record.get("attempted"):     # saved before the send: an expiry after it is never a clean drop
+                record = dict(record, attempted=True)
+                _write(path, record)
+            payload = {"op": "message", "room_id": record["room"], "body": str(record.get("body") or ""),
+                       "extra_content": {CARD_KEY: card}, "dedupe_key": "agent-card:" + path.stem}
             try:
                 _, event_id = self.send(payload, target)
             except Exception as e:  # noqa: BLE001 - stays queued, retried under the same key
@@ -175,6 +221,7 @@ class Poster:
             _write(self.state.joinpath(*POSTED) / path.name,
                    dict({"event_id": event_id, "room": record["room"], "card": card, "posted_at": self.clock()},
                         **({"edited": True} if target and event_id == target else {})))
+            _settle(self.state, path.stem, "posted")
             path.unlink(missing_ok=True)
             posted += 1
         return posted
