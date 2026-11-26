@@ -6,7 +6,8 @@ from .contract import (BackendCapabilities, ClaimBackend, ClaimToken, Defer,
                        CleanupReport, DeliveryOutcome, DeliveryProvider,
                        DeliveryReceipt, DrainReport, DrainResult, DrainStatus,
                        ProviderCapabilities, ProviderIndeterminate,
-                       ProviderRefused, ProviderPermanentRefused, RecoverReport)
+                       ProviderBoundedRefused, ProviderRefused, ProviderPermanentRefused,
+                       RecoverReport)
 from .core import WITHDRAWN, DeliveryCore, RetryPolicy, idempotency_key
 from .backend_a import (REFUSED_FOR_GOOD, DesignAClaimBackend, is_refused_for_good,
                         refused_for_good)
@@ -17,7 +18,8 @@ __all__ = [
     "DeliveryAttempt",
     "DeliveryOutcome", "DeliveryProvider", "DeliveryReceipt", "DrainReport",
     "DrainResult", "DrainStatus", "ProviderCapabilities",
-    "ProviderIndeterminate", "ProviderRefused", "ProviderPermanentRefused", "RecoverReport",
+    "ProviderIndeterminate", "ProviderBoundedRefused", "ProviderRefused",
+    "ProviderPermanentRefused", "RecoverReport",
     "DeliveryCore", "RetryPolicy", "WITHDRAWN", "idempotency_key", "DesignAClaimBackend",
     "DesignCClaimBackend", "REFUSED_FOR_GOOD", "is_refused_for_good", "refused_for_good",
 ]

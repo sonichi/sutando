@@ -276,6 +276,41 @@ class LimitRecovery(unittest.TestCase):
             finally:
                 subprocess.run(cmd + ["kill-server"], capture_output=True)
 
+    def test_recovery_probe_keeps_the_folder_with_the_room_handoff_on(self):
+        import os
+        import pool_remedy as remedy
+        ask = remedy._sibling("pool_ask")
+        ph = ask._sibling("pool_handoff")
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            wid = sup.wi.new_worker_id()
+            sup.wi.create_worker(ws, runtime="claude", cwd=str(ws), host="fixture",
+                session_id="11111111-1111-4111-8111-111111111111", worker_id=wid)
+            sup.pr.register_worker(ws, wid, "fixture-worker")
+            ask.ask(ws, wid, "Outstanding fixture work")
+            rows = [{"instance": "core", "server": "srv", "agent_mxid": "@core:srv"},
+                    {"instance": "w", "server": "srv", "agent_mxid": "@w:srv", "worker": wid}]
+            room_calls = []
+
+            def room(argv):
+                room_calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, '{"ok": true, "event_id": "$e", "posted": true}', "")
+
+            def runner(argv, **kwargs):
+                if argv[0] == "tmux":
+                    return subprocess.CompletedProcess(argv, 0, "You've hit your weekly limit\n❯ \n", "")
+                return subprocess.CompletedProcess(argv, 0, "sent", "")
+            env = {ph.FLAG: "1", ph.ROOM: "!r:srv", ph.ROOM_CLI: "/fixture/room_cli.py"}
+            with patch.dict(os.environ, env), patch.object(ph, "_rows", lambda ws: rows), \
+                    patch.object(ph, "_default_runner", room), \
+                    patch.object(remedy.sup, "_open_tmux", return_value=("fixture.sock", "fixture-worker")):
+                self.assertIsNotNone(ph.route_for(ws, wid, sender=sup.pr.CORE, core=sup.pr.CORE),
+                                     "control: an ordinary ask to this worker would go to the room")
+                result = remedy.retry_limit(ws, REPO, wid, runner=runner)
+            self.assertEqual(result["outcome"], "rearm-sent", result)
+            self.assertEqual(room_calls, [], "the probe never posts a room hand-off")
+            self.assertTrue(sup.pd.find(ws, wid, result["task_id"]), "the probe's payload is routed")
+
     @unittest.skipUnless(shutil.which("tmux"), "tmux required")
     def test_sender_refuses_a_pane_that_turned_busy_after_routing(self):
         import pool_remedy as remedy

@@ -405,7 +405,37 @@ class TestEdges(_Ws):
         self.assertIn("Label=what it does", err.getvalue())
 
 
+    def test_ask_owner_cli_refuses_choices_listed_in_the_question(self):
+        cli = str(REPO / "scripts" / "ask-owner.py")
+        with mock.patch.object(sys, "argv", [cli, "Which one?\n1. merge now\n2. hold"]), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit) as e:
+                runpy.run_path(cli, run_name="__main__")
+        self.assertEqual(e.exception.code, 2)
+        self.assertIn("--option", err.getvalue())
+        self.assertEqual(runpy.run_path(cli)["listed_choices"]("Merge #123 despite the absent CLA check?"), 0)
+
+    def test_ask_owner_cli_delivers_numbered_context(self):
+        """Numbered evidence in --context is not a choice list: the ask reaches delivery."""
+        cli = str(REPO / "scripts" / "ask-owner.py")
+        argv = [cli, "What caused the timeout?", "--context", "1. CI is red on main\n2. the branch is behind",
+                "--urgency", "durable", "--workspace", str(self.ws)]
+        with mock.patch.object(skill_roots, "declared_script", return_value=None), \
+                mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            with contextlib.suppress(SystemExit):
+                runpy.run_path(cli, run_name="__main__")
+        self.assertIn("sent: queued", out.getvalue())
+        self.assertTrue(list((self.ws / "results").glob("proactive-*.txt")))
+
+
 class TestAskOwner(_Ws):
+    def test_a_text_ask_with_a_default_says_why_approve(self):
+        out = self.ask("Merge #12?", store=self.db(), default_action="merge", reason="CI is green",
+                       options=[("Hold", "wait for review")])
+        body = (self.ws / "results" / out["proactive_file"]).read_text()
+        self.assertIn("Why Approve: CI is green\n\n- Approve: merge\n- Hold: wait for review\n", body)
+
     def test_the_row_is_born_with_its_record_and_the_outbox_entry_is_deleted(self):
         db = self.db()
         db.link = "https://db/page"
@@ -417,7 +447,9 @@ class TestAskOwner(_Ws):
         self.assertEqual(e["ask_id"], out["ask_id"])
         self.assertIn(f"via {out['proactive_file']} at", e["body"])
         body = (self.ws / "results" / out["proactive_file"]).read_text()
-        self.assertIn("set its Status on the row: https://db/page", body)
+        self.assertNotIn("https://db/page", body)
+        self.assertIn("- Approve: merge\n", body)
+        self.assertIn("Reply here with the one you choose.", body)
         self.assertIn("Pending questions database", body)
         self.assertEqual("\n".join(pqa.report_lines(out)).count("recorded:"), 1)
         self.assertIn("row: https://link/row", pqa.report_lines(out))

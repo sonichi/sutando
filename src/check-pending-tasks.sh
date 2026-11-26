@@ -49,6 +49,15 @@ fi
 TASKS_DIR="$WORKSPACE/tasks"
 RESULTS_DIR="$WORKSPACE/results"
 DELIVERIES_DIR="$WORKSPACE/deliveries"
+# A pool worker on its own folders: its launcher sets SUTANDO_INBOX_KIND empty (a plain inbox) and
+# names them. It owes what its own inbox holds, judged by the same scan as the core's queue.
+OWN_INBOX=""
+if [ -n "${SUTANDO_INSTANCE_ID:-}" ] && [ "${SUTANDO_INBOX_KIND-unset}" = "" ] \
+   && [ -n "${SUTANDO_TASKS_DIR:-}" ] && [ -n "${SUTANDO_RESULTS_DIR:-}" ]; then
+  OWN_INBOX=1
+  TASKS_DIR="$SUTANDO_TASKS_DIR"
+  RESULTS_DIR="$SUTANDO_RESULTS_DIR"
+fi
 
 # An unmarked session is a guest only while a marked core is alive ON THIS HOST
 # to own the queue (a fresh state/cores/<host-label>.alive; the workspace syncs
@@ -182,7 +191,7 @@ UNPROCESSED=""
 UNPROCESSED_NAMES=""
 shopt -s nullglob 2>/dev/null
 
-if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
+if [ -n "${SUTANDO_INSTANCE_ID:-}" ] && [ -z "$OWN_INBOX" ]; then
   # Worker mode: judge only this instance's own folder, never the core's queue.
   # An unreadable folder (rc 2) must not read as "nothing owed", so the ids are
   # captured first and a non-zero status reports rather than skips.
@@ -218,10 +227,62 @@ $( [ -f "$PAYLOAD" ] && cat "$PAYLOAD" || echo "(payload not found at $PAYLOAD)"
 
 "
   done
+elif [ -n "$OWN_INBOX" ]; then
+  # An own-folder worker: what its inbox owes is task_dispatch's one rule (unanswered-in),
+  # the same answer pool supervision reads; a task it is on right now is not an orphan.
+  if [ -z "$PYBIN" ]; then
+    UNPROCESSED+="--- $TASKS_DIR/ (no interpreter to tell what it owes) ---
+
+"
+  else
+    OWED="$("$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" unanswered-in "$TASKS_DIR" "$RESULTS_DIR" --workspace "$WORKSPACE" 2>/dev/null)"
+    while IFS=$'\t' read -r TASK_ID f; do
+      [ -n "$TASK_ID" ] || continue
+      task_in_progress "$TASK_ID" "$f" && continue
+      UNPROCESSED_NAMES="$UNPROCESSED_NAMES $TASK_ID.txt"
+      if [ -f "$RESULTS_DIR/$TASK_ID.txt" ]; then
+        UNPROCESSED+="--- $TASK_ID.txt (result file is EMPTY — it delivers nothing; write a real reply) ---
+
+"
+        continue
+      fi
+      UNPROCESSED+="--- $TASK_ID.txt ---
+$(cat "$f")
+
+"
+    done <<< "$OWED"
+  fi
 else
   # Core mode: the queue is tasks/, minus anything the router already handed
-  # to a worker.
-  for f in "$TASKS_DIR"/*.txt; do
+  # to a worker. The owner's own messages (src/task_watch_owner.py) are listed
+  # first, in task_priority's order; the rest keep glob order, which used to put
+  # every task-cron-* file ahead of the person. Order only: the loop below still
+  # decides what is listed. Any failure, or an answer that is not the same
+  # number of files, leaves glob order.
+  QUEUE_FILES=()
+  for f in "$TASKS_DIR"/*.txt; do QUEUE_FILES+=("$f"); done
+  if [ "${#QUEUE_FILES[@]}" -gt 1 ] && [ -n "$PYBIN" ]; then
+    OWNER_FIRST=()
+    while IFS= read -r -d '' f; do
+      OWNER_FIRST+=("$f")
+    done < <(SUTANDO_SRC="$REPO_DIR/src" SUTANDO_WS="$WORKSPACE" "$PYBIN" -c 'import os, sys
+from pathlib import Path
+sys.path.insert(0, os.environ["SUTANDO_SRC"])
+from task_priority import sort_tasks_by_priority
+from task_watch_owner import MAX_BYTES, is_human_owner
+ws = Path(os.environ["SUTANDO_WS"])
+def own(p):
+    try:
+        return p.stat().st_size <= MAX_BYTES and is_human_owner(p.read_text(encoding="utf-8", errors="replace"), ws)
+    except Exception:
+        return False
+paths = [Path(a) for a in sys.argv[1:]]
+first = [p for p in paths if own(p)]
+rest = [p for p in paths if p not in first]
+sys.stdout.write("".join(str(p) + "\0" for p in sort_tasks_by_priority(first) + rest))' "${QUEUE_FILES[@]}" 2>/dev/null)
+    [ "${#OWNER_FIRST[@]}" -eq "${#QUEUE_FILES[@]}" ] && QUEUE_FILES=("${OWNER_FIRST[@]}")
+  fi
+  for f in ${QUEUE_FILES[@]+"${QUEUE_FILES[@]}"}; do
     BASENAME=$(basename "$f")
     TASK_ID="${BASENAME%.txt}"
     held_elsewhere "$TASK_ID" "$f" && continue
@@ -252,7 +313,9 @@ $(cat "$f")
   done
 fi
 
-if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
+if [ -n "$OWN_INBOX" ]; then
+  BLOCK_REASON="Unprocessed tasks in $TASKS_DIR/"
+elif [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
   BLOCK_REASON="Unprocessed deliveries in deliveries/$SUTANDO_INSTANCE_ID/"
 else
   BLOCK_REASON="Unprocessed tasks in tasks/"
@@ -334,7 +397,8 @@ if [ "${SUTANDO_STOP_HOOK_WATCHER_GATE:-1}" != "0" ]; then
       [ "$COVERAGE_ERR" != /dev/null ] && rm -f "$COVERAGE_ERR"
       case "$COVERAGE_N" in ''|*[!0-9]*) COVERAGE_N="" ;; esac
       if [ -n "$COVERAGE_N" ] && [ "$COVERAGE_N" -le "$COVERAGE_FAIL_OPEN_AFTER" ]; then
-        SUTANDO_HOOK_REASON="No ready session-role watcher holds $COVERAGE_INBOX: nothing announces deliveries while it is missing. Re-arm it before ending the turn (unwatched turn end $COVERAGE_N of $COVERAGE_FAIL_OPEN_AFTER, then this gate fails open): via the Monitor tool, $COVERAGE_REARM" \
+        COVERAGE_MOD_NOTE="$("$PYBIN" "$REPO_DIR/src/watcher_rearm.py" mod-note --repo "$REPO_DIR" --workspace "$WORKSPACE" 2>/dev/null)" || COVERAGE_MOD_NOTE=""
+        SUTANDO_HOOK_REASON="No ready session-role watcher holds $COVERAGE_INBOX: nothing announces deliveries while it is missing. Re-arm it before ending the turn (unwatched turn end $COVERAGE_N of $COVERAGE_FAIL_OPEN_AFTER, then this gate fails open): ${COVERAGE_MOD_NOTE}via the Monitor tool, $COVERAGE_REARM" \
           "$PYBIN" -c 'import json,os,sys; sys.stdout.write(json.dumps({"decision":"block","reason":os.environ["SUTANDO_HOOK_REASON"]}, separators=(",", ":")))'
         exit 0
       fi

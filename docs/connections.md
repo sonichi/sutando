@@ -197,9 +197,13 @@ signed in on; the other lanes keep running.
 
 ### Two lanes, one answer
 
-A message in a room where two of the install's agents are members (a federated room, during the
-move from one homeserver to another) can reach both lanes with the same `event_id`. The cross-lane
-guard (`src/lane_dedupe.py`, the bridge's `TASK_INTAKE_GATE`) makes it one task, and
+A message in a room where two of one agent's lanes are members (a federated room, during the
+core's move from one homeserver to another) can reach both lanes with the same `event_id`. The
+cross-lane guard (`src/lane_dedupe.py`, the bridge's `TASK_INTAKE_GATE`) makes it one task for that
+agent. The guard is per agent (`connections.lane_agent_group`: a pool worker's id, or the core's
+rows together): a message that reaches the core and a pool worker is a task for each, and each
+decides whether the message is for it. A lane whose agent cannot be read claims for itself alone,
+so the worst case is a duplicate, never a drop. Among one agent's lanes,
 `connections.event_owner_lanes` picks the lane that answers it from facts every lane reads alike:
 the one lane whose agent the message names by full mxid or replies to (`reply_to_sender`), else
 the primary. Any other lane waits up to `OWNER_WAIT_S` (6 s) for that lane's claim and settles as
@@ -490,7 +494,11 @@ overwriting a row), then launches one bridge per `launch-plan` line through
 (the one `scripts/channel-env.sh` resolves; `REMOTE_TASK_TOKEN` or the legacy
 `AG2_REMOTE_TOKEN`, environment first when both exist): a desktop install signs in after
 the engine started, so the connect flow reaches the file but never this process's
-environment. `list` runs that import once when the record has never been written (an initialized record
+environment. A bare secret (no `https://<gateway>|` prefix) counts only beside a gateway URL,
+`REMOTE_TASK_URL` or the legacy `AG2_REMOTE_URL`, paired as the bridge pairs them: an environment
+secret with the environment's URL, a file secret with the environment's URL, else that file's.
+The vault then holds the joined `url|secret`; half a pair, or a URL that is not a gateway URL,
+imports nothing. `list` runs that import once when the record has never been written (an initialized record
 that is empty stays empty: its rows were removed on purpose), so the panel
 shows the connection on its next refresh without an engine restart; an import that fails
 is logged and the list still answers. A record that exists still adopts, on `list`, any
@@ -547,8 +555,9 @@ connection to use. The rule:
 - a room ID's domain (after its first colon) picks the row whose `server` (or `agent_mxid`
   server) is **exactly** that domain, so a room on `dev.example.org` never matches a row for
   `example.org`;
-- an ID with no domain picks the one row whose bridge has a task open in that room (its
-  `state/remote-task-rooms[.<instance>].json`), else the primary;
+- an ID with no domain picks the primary (which lane once had a task in the room never decides:
+  a bridge's `state/remote-task-rooms[.<instance>].json` is its own delivery ledger, not an
+  identity signal);
 - no room picks the primary;
 - fewer than two rows, no primary, or an unreadable record answers `None`, and the tool keeps
   its single-connection credential chain unchanged.
@@ -556,7 +565,10 @@ connection to use. The rule:
 A domain no row serves, or a disconnected row, is refused with `NoConnectionForRoom` naming the
 server, and so is a row with no token for its own gateway. The token is the first of the row's
 environment variable, its launch keys, its channel env file and its vault key whose embedded
-gateway, if any, is the row's own host: another server's token is never used. `room_ops.py`
+gateway, if any, is the row's own host: another server's token is never used. A bare secret
+(no embedded gateway) is handed on joined to the row's own `gateway_url` as `url|secret`, so the
+identity learner's preview reaches that gateway; a row gateway that is not a gateway URL makes
+it no token. `room_ops.py`
 prints `{"ok": false, "reason": ...}` and exits 1; `channel-env.sh` prints nothing and exits 1.
 
 The same rule serves every other gateway client: the pending-questions and Crons room databases
@@ -565,6 +577,427 @@ and the tutorial page (`channel_credentials.room_env`), `ensure-cron-room.py` an
 `REMOTE_ALERT_ROOM` of the primary's channel dir. The owner DM those databases default to is read
 from the primary's `state/owner-routing.<instance>.json`. `room_ops.py` verbs that name no room
 (`rooms`, `history`, `agents`, `resolve`, `events list|pull|stream`) act through the primary.
+
+### In a pool worker's session
+
+A pool worker that has its own agent (`pool_identity.py add`) acts as that agent from its own
+session. The seat names its worker in `SUTANDO_WORKER_ID`, and `connections.acting_identity`
+answers before the rule above:
+
+- identity comes from the task being answered, never from which lane once handled the room. A
+  client answering a task passes it (`room_ops.py <verb> --task-file <task>`, `notify.py
+  --task-file`), and the reply posts as exactly the agent the task was addressed to, or is refused
+  (`connections.task_reply_agent`). The file must be readable and the live file of the id it
+  declares; its `receiving_instance` header and the lane that queued it must agree; the post's room
+  must be the task's own (`channel_id`, else `source_room_id`). A task addressed to the worker's
+  agent then posts as the worker's row. One addressed to a core agent also needs a verified task
+  envelope (`task_envelope.verify_text`; unsigned, invalid or unverifiable is refused), the worker to hold
+  it (in its own tasks folder, or in `tasks/` with the pool's delivery sentinel naming it) and the
+  task to be neither answered nor archived (`task_disposition`); it posts as that agent's core row.
+  A sentinel carries a lease, `{"delivered_at", "ttl_s"}`, written by the router
+  (`WORKER_POOL_DELIVERY_TTL_S`, default 4 h). A lapsed, missing or unreadable lease is logged
+  (`pool_delegation_not_current`) and still allowed. `WORKER_POOL_DELIVERY_EXPIRY=enforce`, which
+  would refuse it, is unavailable: `pool_delivery.ENFORCE_AVAILABLE` is False, so a configured
+  `enforce` reads as `warn` and logs `pool_delegation_enforce_unavailable`. It stays off until a
+  hand-back or renewal path lands, because a refused reply leaves the task in neither lane (the
+  review gap raised on #6760).
+  A mismatch is refused, never answered as another identity;
+- a post with no task is the worker's own: its row on the room's server, with the token its vault
+  key holds and its `agent_mxid`; with no room or a domainless one, its only enabled row. A core
+  lane's own owner DM (`state/owner-routing[.<instance>].json`, under the row's instance or a
+  launch-key alias its bridge runs as) stays the core's. A server the worker has no row on is
+  refused, never posted as the core;
+- when nothing serves the room the post is refused (`NoConnectionForRoom`), never sent with the
+  shared env or vault token;
+- a disconnected worker row, another worker's session and the core's session fall through to the
+  rule above. The core never acts as a worker's agent.
+
+A worker's lane delivers each task it queues to its worker itself, before the core can see it. The
+lane stages the task file, runs the core's declared task-event handler (the pool router, from
+`state/task-event-handler.json`) on the staged copy with `--from-lane --payload <staged>`, and only
+then publishes it to `tasks/`. The router writes the delivery sentinel and the attribution in
+`deliveries/<worker>/` under its own locks, so the task is already held when it appears, and the
+core's watcher never routes or announces a task a worker holds. Once the task is published, the lane
+runs the router again with `--renotify`, which replaces a still-pending sentinel, so a worker's
+watcher that gave up on the bare pointer (a slow or killed router, or a lane that died and the task
+was served again) is told. The payload stays in `tasks/`, where the worker's resolver,
+`task_disposition.py`, archiving and the bridges read it. A worker off the roster or retired, a
+picker command, a router that fails or takes longer than 10 s, or no handler declared: nothing is
+held, the task is published as before and the core's watcher routes it. A lane started from inside a
+session (`connections.py start` from a worker's shell) carries none of that session's variables
+(`connections.SESSION_ENV`), so it runs as the lane keeper's launch would.
+
+A worker's row has no channel env file: its token is in the vault alone, so
+`channel-env.sh <its lane>` exits 1 saying so, and room clients resolve it by room.
+
+Whether a worker acts as its own agent on a server is one test, `connections.worker_enabled_identity`
+(`server=`): its row on that server exists and is neither disabled nor parked, so a lane serves it. A
+worker with no row there, or a disabled or parked one, acts through the core's agent in everything
+below, as every worker did before it had an identity.
+
+A worker holds at most one identity per server, so it can have one on each homeserver the core is
+connected to (`require_no_worker_identity` is the one check, on the server of the `--lane` it is
+added through). Every reader picks the one for the server it acts on: a room's server for room
+operations; for the seat's MCP tools, `--server`, else the server of the descriptor the seat's proxy
+reads (`mcp_seat_server`). That server comes from the descriptor alone, never from which row is
+primary now: its agent's server, or, for a descriptor naming no agent, the server whose row's gateway
+is the descriptor's own relay or mint host, or the row its lane names outright. A descriptor that names
+no one server by these is refused (`descriptor_unresolved`), and so is one that `AG2_MCP_DESCRIPTOR`
+names but that cannot be read (`descriptor_missing`): the workspace's descriptor never stands in for
+it. Where nothing names a server (a room operation with no room, an MCP seat with no descriptor) it
+refuses by name (`WorkerRoomAmbiguous`, `ambiguous_server`) instead of guessing.
+`retire_worker_identity` removes them all.
+
+A proactive file such a worker's session writes is the worker's lane's to deliver. The session
+publishes it through `result_publish.py`, which stamps the name
+(`proactive-<ts>.by-<worker>[.to-<channel>].txt`; `connections.session_proactive_name`, over
+`proactive_routing.stamp_worker`); a session that writes the file by hand uses the same name. A
+worker acting through the core publishes the name unchanged, and a core lane sends it as before.
+The one claim rule is `proactive_routing.lane_claims_proactive(name, lane_worker)`: a stamped file
+is claimed only by the lane running as that worker (with an identity on several servers, by one of
+them, `worker_lane.is_worker_note_lane`: the lane serving the worker on the server of the room the note
+names, and none when no identity serves there; a note naming no room goes from its home lane, the
+identity on the primary's server; a note with no home is refused at publish), which posts it as the worker's agent into that
+agent's own owner DM; a core lane and every other bridge (Discord, Slack, Telegram, their
+fallbacks) refuse it, and a worker's lane claims nothing unstamped. The gateway's drain asks its
+host (`PROACTIVE_OWN_FILE`) whether an owner-directed file is the lane's own, so a worker's lane
+delivers its worker's files although it owns no unaddressed ones and projects no cards.
+Only a name with no destination, or one destined for `ag2space` (the worker lane's own bridge), is
+stamped; a name destined for Discord, Slack or Telegram keeps its bare name so that bridge delivers
+it. `scripts/ask-owner.py` and the pending-questions skill name their text ask through the same
+helper (`result_publish.worker_published_path`), so a worker asks the owner as its own agent, and
+the question records that agent (`asked_by`, the row's `Asked by`, via
+`connections.proactive_author_agent`). Its text names that worker, not the core
+(`connections.proactive_author_phrase`: "<name> (a worker on <host>)", with the agent's display
+name, else the worker's roster label; else just "a worker on <host>". The name never stands alone;
+it is bounded and stripped of format characters, and one that reads as the core is dropped). A decision card it asks is its own
+too: the card records the worker (`subject.by_worker`) and its title names it, and only that worker's
+lane posts it (`proactive_routing.lane_claims_card`, the gateway's `CARD_CLAIM`), in its own DM, where
+the owner's click comes back to it; its fallback text, and the pointer for a card never posted, go
+through that lane as well. Exactly one of its lanes posts a card (`worker_lane.card_lane`), and the card's destination is checked at the ask and at the claim alike, however many lanes serve: a card bound for a room is the serving identity's on that room's server and no other lane's; for the owner's DM, the only serving lane, else the one on the primary's server, else the lowest instance. A card whose room no serving lane reaches (its identity there disabled or parked, or none) is refused at the ask (asked as text, the note naming why) and logged undeliverable by the lane. The core's cards stay the primary lane's. A skill writing a proactive file itself still publishes
+the name it gives.
+
+The seat's `s-space` MCP proxy (the desktop app's `ag2-mcp-proxy.mjs`) mints its access token
+from the worker's own credential when the worker acts as its own agent. The launcher exports
+`AG2_MCP_WORKER_CREDENTIAL`, the JSON argv of `scripts/connections.py worker-mcp-credential
+--worker <id>` (`connections.worker_mcp_credential`): one JSON line, either `acts_as: "worker"`
+with the worker's `lane`, `server`, `agent_id`, `relay` and `bearer` (resolved as every room
+client resolves a token, `connection_credential`, the vault's, and handed to the proxy's memory,
+never a file), or `acts_as: "core"` with a `reason` (`no_identity`, `disabled`) for a worker that
+acts through the core, whose proxy then reads the core's lane env as before. The proxy runs it
+when `SUTANDO_WORKER_ID` is set, uses a worker's bearer only when its relay is the descriptor's,
+loads none of the core's extra lanes for a worker acting as itself, and with no resolver, or an
+enabled identity whose token cannot be read (`no_token`, exit 1), answers every Action with a
+refusal rather than mint as the core. A Codex worker's proxy inherits no environment, so it does
+not yet take this path.
+
+The proxy decides whom it acts as once, when the seat starts. A worker given its own agent while
+its seat runs keeps acting as the core's, and once the worker's credential exists every call
+fails with "descriptor changed during the call": the identity changed under the seat, and the fix
+is to restart the seat. `pool_identity.py` does that after any add that creates the identity
+(`pool_manage.py reseat <worker>`); a seat that owes work is left running and the command prints
+the reseat to run once it is done.
+
+`connections.task_agent_mxid(task_id)` names the agent a task is answered as: the agent of the
+lane that queued it (`task-<instance>~…`). Each row of `state/agent-activity.jsonl` for such a
+task carries it as `agent`.
+
+### MCP lanes for the s-space proxy
+
+The bundled MCP proxy serves its main descriptor and one extra lane per `*.json` in its lanes
+directory (`AG2_MCP_LANES_DIR`, else `<workspace>/state/ag2-mcp.d/`), routing each Action to the
+lane of its room's homeserver. `connections.sync_mcp_lanes` (`scripts/connections.py
+sync-mcp-lanes`) writes, for each enabled core row the main descriptor does not already serve
+(matched by server or relay), `conn-<instance>.json` (`conn-legacy.json` for the legacy row) and a
+0600 `conn-<instance>.env` holding the row's token under its `token_ref`. The descriptor carries
+`lane`, `server`, `env_file`, `env_key`, `relay` (the token's gateway), `agent_id`, `bearer_digest`,
+`mint_url` (the main descriptor's mint path on the row's own relay origin) and `mcp_url` (the row
+server's DotSpace); a row with no token or no such endpoints is skipped by reason, and so is a
+token holding `'` or a line break (`unquotable_token`), since the env readers only strip the outer
+quotes. Every other `conn-*` file is removed, and so is any `.conn-*.tmp` a crashed write left.
+The main descriptor is found from an explicit path, then `AG2_MCP_DESCRIPTOR`, then any descriptor
+the Claude Code MCP config names, then any the Codex `config.toml` names under
+`[mcp_servers.<name>.env]` (`CODEX_HOME`, else the codex `core_config_dirs` entry), then
+`state/ag2-mcp.json`. Without a readable main descriptor nothing is touched. `drop_mcp_lane` takes
+the same lanes lock as the sync, so a sync that read a row before it was disabled cannot write its
+lane back.
+
+A successful `launch` (startup, add, reconnect, a named row's unpark, update-token) runs the sync;
+`promote` (and its rollbacks), the legacy promotion and `unpark` also sync after their committed
+record write, since no launch follows them. `disconnect`, `park`, `park-legacy` and `remove` drop
+that row's lane at once.
+
+The env file is a copy of the row's token wherever `connection_credential` found it, the Keychain
+included. **Unless the proxy resolves vault lanes (below), a secret that lives only in the vault is
+written to disk with no command run and no opt-in:** on every successful `launch`, and on `promote` and `unpark`, the sync copies it into a 0600
+`state/ag2-mcp.d/conn-<instance>.env` (rewritten only when its content changed). The file is created
+0600 before any byte is written (`mkstemp`, `fchmod`, fsync, `os.replace`), and no result, log line
+or descriptor carries the secret. The copy is kept in `state/` (never in the
+channel dir, where `connection_credential` would read it ahead of the vault). The vault sync carries
+nothing under `state/` unless `vault.sync.include` names it, and the shipped `vault.sync.exclude`
+carves `state/ag2-mcp.d/` out even then.
+
+#### Vault lanes: `lane-mcp-credential`
+
+A proxy that resolves vault lanes needs no copy. The desktop host says so by setting
+`AG2_MCP_LANE_CREDENTIAL` (a JSON argv ending in `lane-mcp-credential`) in the env of the MCP
+client entry that names the main descriptor, in the Claude Code MCP config or the Codex
+`config.toml` (or in the sync's own environment). With it, a row whose token, as
+`connection_credential` resolves it, is the one the vault holds gets a descriptor whose `env_file`
+is `(vault)`, and its `conn-<instance>.env` is removed after the descriptor is rewritten. Without
+it, or when the environment or a channel file holds a token the vault does not, the env file stays
+the default. The setting says the desktop shipped a proxy that reads `(vault)`; a proxy process
+started before that update keeps the old reader until its client restarts it. An entry whose value is not a JSON array of non-empty strings
+counts as unset, as it does for the proxy.
+
+The proxy runs that argv plus `--lane <lane>` (`scripts/connections.py --workspace <ws>
+lane-mcp-credential --lane <lane>`, `connections.lane_mcp_credential`). On success it exits 0 and
+prints one line to stdout, nothing on stderr. It reads the token from the vault alone (by the row's
+`token_ref`, on the row's own gateway host), never the environment or a channel file, so the
+proxy's stripped environment cannot make it answer differently from what the sync checked:
+
+```json
+{"bearer": "<secret half of the row's token>", "lane": "<lane>", "relay": "<the token's gateway, no trailing slash>"}
+```
+
+The proxy accepts it only for the lane it asked about, a relay equal to the descriptor's and a
+bearer whose sha256 is the descriptor's `bearer_digest`. Anything else exits 3 with one line on
+stderr, `lane-mcp-credential: refused, <reason>: <detail>`, which never holds the secret (the
+proxy logs that first line): `not_owner` (this user does not own the workspace), `unknown_lane`
+(no core row has that lane, or the main descriptor serves it: a pool worker's identity and the
+primary lane are never one, and with no readable main descriptor, found as the sync finds it,
+no lane is answered), `disabled`, `parked`, `not_engine_descriptor` (no `conn-<lane>.json` in the
+lanes dir that, opened once without following a symlink, is a regular file of this user, writable
+by no one else, at most 64 KiB, version 1, naming this lane, `(vault)` and the row's
+`token_ref`), `no_token` (the vault holds none), and `descriptor_stale` (the row's current token is not the relay
+and digest the descriptor was written for, until the next sync rewrites it). Argument errors exit
+2. The primary lane never reads the vault: the resolver refuses it as `unknown_lane`, and the proxy
+refuses a primary descriptor naming `(vault)`.
+
+### A worker's agent as a declared Sparrow bridge
+
+A worker's own agent can run as a Sparrow agent bridge that sparrowd supervises
+(`src/sparrowd.py --agent-bridges`) instead of as a lane the gateway wrapper's lane loop starts.
+The worker wiring above (addressee, routing before publish and the re-raise after it, the claim and
+own-file gates) is one module, `src/worker_lane.py`, which both the lane loader
+(`remote-gateway-bridge.py`) and the agent bridge (`sparrow_agent_bridge.py`) install.
+
+`python3 src/worker_lane.py declare --worker <id>` (each verb takes `--workspace`) writes the declaration
+(`<workspace>/agents/<segment>.bridge/worker.json`, `written_by: worker-lane declare`), where the
+segment is the one the worker row's `agent_mxid` names. The file chooses nothing: the agent bridge
+re-derives its name and env from the segment, as for any declaration, and runs it only when the
+connection record names its `AGENT_MXID` as exactly one worker's own agent, held by the core's
+owner, neither disabled nor parked (`connections.worker_serving_agent`). The worker and its lane
+instance come from that row. Such a bridge runs the lane's own loader, `remote-gateway-bridge.py`,
+on the workspace's `tasks/`, `results/` and `state/` with the lane's identity env
+(`connections.lane_identity_env`: `GATEWAY_INSTANCE`, the lane's worker, its `not_before`). It
+therefore carries every host gate the lane does (intake dedupe and backlog, the room and thread
+check, dispatch and ack vetoes, the lane-server check, status, the send roots) and the worker
+wiring, from the one place that sets them. Its revision covers the declaration and what it takes
+from the row, so a record-only change restarts it. It names no
+vault key: its token is the row's own, read where the lane reads it (`connection_credential`, by the
+row's `token_ref`), so no copy of the relay token is stored. A record that cannot be read keeps a
+running bridge as it is; any other mismatch skips the declaration with its reason.
+
+While a valid declaration exists (`worker_lane.declared_bridge`, the agent bridge's own check), the
+lane keeper (`keep_lanes_up`) leaves the worker's lane down while the declared bridge holds the
+lane's lease, and for up to `DECLARED_BRIDGE_GRACE_S` (180 s) after it first finds nobody holding it.
+Past that, it starts the lane and says so, so a bridge that is not supervised, cannot read its
+token or keeps crashing never leaves the worker's agent silent. The row stays enabled, so
+`worker_enabled_identity` still answers it: the worker's session stamps its proactive files and its
+MCP proxy acts as the worker's agent. A check that cannot be made starts the lane as before.
+`declare` refuses a worker whose row token cannot be read.
+`withdraw --worker <id>` removes the declaration: sparrowd stops the bridge on its next scan and
+the keeper starts the lane on its next pass.
+
+One bridge serves a worker's agent at a time because both run under the same lease: the gateway
+bridge's poller lock for its instance (`state/locks/gateway-bridge.<instance>.lock`). A second
+bridge for that instance exits 75 at start while the first holds it, and sparrowd restarts a
+declared bridge with backoff (at most 60 s) whatever its exit code. `connections.py stop`, `park`
+and `disconnect` stop whichever process holds that lease, the declared bridge included.
+
+Cutting a worker over:
+
+1. `python3 src/worker_lane.py declare --worker <id>`. sparrowd (run with `--agent-bridges`) picks it up
+   on its next scan; its bridge finds the running lane holding the lease and exits 75, and sparrowd
+   keeps retrying.
+2. `python3 scripts/connections.py stop <instance>` stops the lane once. The keeper waits out its
+   grace, and the declared bridge takes the lease on its next retry (sparrowd's backoff is at most
+   60 s). If it does not, the keeper starts the lane again and logs why.
+3. `python3 src/worker_lane.py status --worker <id>` prints one JSON line: `declared`, the lease's
+   holder pid and `held_by`, which is `declared-bridge` only when that pid is the agent bridge for this
+   declaration and a sparrowd running `--agent-bridges` is its parent; `other`, `none` or `unknown`
+   otherwise. `sparrowd` lists each running sparrowd: whether it runs `--agent-bridges`, whether its
+   checkout's agent bridge accepts a worker declaration (`serves_workers`: its
+   `ACCEPTS_WORKER_DECLARATIONS = 1` line), and whether the code it loaded (the agent bridge,
+   `worker_lane.py`, `connect_bridge.py`) changed after it started (`code_changed_since_start`: restart
+   it). Paths are matched against the raw command line, never split into words, so a checkout or
+   workspace under a folder with a space is read correctly.
+4. Check with a live round trip: a message to the worker's agent reaches the worker and its reply
+   is posted as that agent.
+
+Undo: `python3 src/worker_lane.py withdraw --worker <id>`; the keeper starts the lane on its next
+pass, which takes the lease once sparrowd has stopped the bridge.
+
+### A worker on its own folders (`dirs: "own"`)
+
+A worker has one task/result folder across all its connection identities. The connection record's
+`worker_storage` map pins that worker's existing agent-root path and own/shared setting; changing the
+primary connection, rotating an identity, or removing the original identity does not move its inbox.
+Older records derive the anchor from the existing own-folder row (otherwise the first identity), and
+the next locked record write preserves it. `dirs: "own"` remains on rows for compatibility.
+
+A worker configured with its own folders keeps its tasks and results in its anchored folder,
+`<workspace>/agents/<segment>/{tasks,results}` (the folder a claude-local bridge for that agent uses), not
+the workspace's shared `tasks/` and `results/`; `state/` stays shared. `connections.worker_dirs(worker)` is
+the one answer (None for every other worker) and `connections.task_home(task_id)` maps a lane-queued task to
+its folders. Its lane, whether the gateway wrapper's or a declared Sparrow bridge, runs on those folders
+(`worker_lane.lane_dirs`): the folder is the worker's inbox, so no router runs; the pre-publish hook only
+records the task as the worker's (`--attribute-only`), and the worker's stamped proactive files still landing
+in the shared `results/` are moved into its own. Only the worker lane on the current primary connection
+may adopt shared files, and it must hold that lane's lease. All serving lanes read the same worker folder:
+room-addressed proactive notes are claimed by the lane on the room's server, and unaddressed notes by
+the primary. A primary change changes adoption and unaddressed routing, not the storage location. Its session reads a plain inbox of task files and answers in
+its own results (`spawn_worker.inbox_env`, `result_publish`). A worker without the field is unchanged.
+
+A switch passes through two states before `own` (`connections.worker_dirs_state`). `dirs: "migrating"`:
+the worker still runs on the shared folders (`worker_dirs` is None), so its lane, its seat's inbox and
+supervision read `deliveries/<id>/` as before. `dirs: "committing"`: its lane has moved onto its own folders
+(`connections.worker_lane_dirs`; a declared bridge's revision changes here, so sparrowd replaces it), while
+its seat and supervision still read the shared ones. `own` is written only after that lane has stopped and
+started again, or been replaced. In both states the router delivers it no new core task: `deliver_one`
+re-reads the state under the deliveries folder's lock, the lock the switch empties that folder under, so a
+pass that chose the worker before the switch began is `fenced` and the core takes the task. A trusted stop
+for work it holds still reaches it (`deliver_one(stop=True)`). A task its own lane queued goes to it while
+"migrating"; once "committing" or "own", such a task is never given to the core: the handler answers
+"must handle" (`pool_router.lane_holder`), the task waits in the shared `tasks/`, and the switch's final step
+moves it into the worker's own folder.
+
+Supervision (`pool_supervise.owed_task_ids`) counts both the unanswered tasks in the worker's own tasks
+folder (`pool_supervise.own_inbox_owed`, in any of the three states) and any owed sentinel still in
+`deliveries/<id>/`, so reseat, stop and retire never lose sight of work on either side. `pool_manage.py
+retire` refuses a worker owing either. Its own agent goes in two steps: `connections.begin_worker_retirement`
+marks the row `retiring` (the identity row's own writer, under the worker's switch lock) and stops its lane
+with the row disabled; then, under that lock, the tasks it still owes in its own folder are handed to the
+core (`retire --hand-off`, `pool_delivery.hand_off_own_inbox`: moved to the shared `tasks/` and touched, never
+replacing a file) or refuse the retire. Only once that has fully succeeded are the row and its secret removed
+(`connections.retire_worker_identity`). A stop, move or name collision that fails leaves the worker retired
+with its row kept: the retire reports `failed`, a re-run finishes it, and `pool_manage.py enable` takes it back
+(`connections.end_worker_retirement`, then its lane is started). A `retiring` row is never switched:
+`set_worker_dirs` refuses every state but clearing, and the handler moves nothing for it.
+
+**Lock order.** Task (`pool_router.task_arbitration`) -> deliveries folder (`pool_delivery.arbitration`) ->
+the worker's switch lock (`connections.worker_switch_lock`) -> the connection record's lock. The switch lock
+is held only for a switch's final step (the `own` write and its moves), each handler pass's moves, and
+retirement's marker write and its read and hand-off of the worker's own inbox.
+
+A worker that gets its first own agent moves to its own folders. That covers a new worker whose agent
+`create_worker.py` requests (the default; `--no-identity` opts out) and an existing worker given one by
+`pool_identity.py add`, pasted or `--device-flow`. The identity save and the lane start each run under the
+roster fence retirement takes, so a worker retired meanwhile gets neither; the folder switch between them
+runs outside it, since its handler passes can take minutes. The switch runs as soon as the agent is
+saved, before its lane first starts and before the seat restarts as that agent, through the same
+`worker_lane.migrate_dirs` as `--apply` below, so work already in `deliveries/<id>/` moves or is handed back
+as described there. The add reports `dirs` as `own`; as `migrating` when the switch could not finish (a
+handler that failed, or work the worker accepted and still owes), in which case its lane and seat stay on the
+shared folders; or as `shared` when nothing was switched. A reason and the command that finishes it go to
+stderr; the identity and lane go ahead either way. `add --shared-dirs` keeps the worker on the shared folders: use it only
+while something still reads that worker's work from the shared `tasks/` and `results/`, and switch it later
+with `migrate-dirs --apply`. A resend of an expired link keeps that choice; a link started before this
+default existed keeps the shared folders. A rotate never changes a worker's
+folders, and neither do the `provision-*` verbs (run `migrate-dirs --apply` after one). A worker without its
+own agent stays on the shared folders.
+
+For a worker that already has its own agent, `python3 src/worker_lane.py migrate-dirs --worker <id>` shows what switching the worker would do (its
+folders, who holds its lane, what is delivered to it, and which tasks and results would move) and writes
+nothing. With `--apply` it switches the worker over:
+1. It finds the declared task-event handler first. A failed lookup, or work delivered with no handler to
+   move it, refuses before anything changes.
+2. It writes `dirs: "migrating"` (in the worker's `worker_storage` entry, shared by all its identities and
+   mirrored on each identity row), creates the folders (a private agent root) and has the handler empty the
+   worker's `deliveries/<id>/` as in step 4. While the worker still owes a task it accepted, nothing moves;
+   that, or a handler that fails, ends the run there with the worker still on the shared folders, and a
+   re-run picks it up. A worker whose retirement has begun is refused here.
+3. It writes `dirs: "committing"` and relaunches every lane of the worker's identities under the record lock.
+   A wrapper lane is stopped and started again on its own folders in that same
+   hold, through `connections.start`, because not every install runs a lane keeper (the desktop app starts
+   lanes once). A start that finds the lane already held spawns nothing. One that fails ends the run not
+   ok (exit 1, the reason in `lane` and `why` with the command that starts it) and keeps the switch. The
+   restart is recorded as owed, one record per lane, before the lane is stopped, so a run that dies between the stop and the
+   start leaves it too: a re-run starts that lane, if it is still down, before finishing the rest. The
+   record goes once the lane runs again, or when the lane is disabled or parked. A declared bridge is
+   waited for until sparrowd has replaced it. A lane that did not stop or start leaves it "committing".
+4. It has the handler empty the worker's `deliveries/<id>/` again under the router's locks, for anything its
+   old lane queued before it stopped. A task its own lane queued moves into its tasks folder and its sentinel
+   is archived. A core task the worker never accepted is handed back (attribution first, then the sentinel)
+   and touched so the core's watcher picks it up. One it answered stays as residue.
+5. Under the worker's switch lock it writes `dirs: "own"` (refused once its retirement has begun, which ends
+   the run) and moves into the worker's folders any task its own lane queued that is still in the shared
+   `tasks/`, and the worker's unclaimed live results.
+
+It prints one JSON line and is idempotent: a refusal, or a file that could not be moved, says why, and a
+re-run finishes. It restarts no session: respawn the worker so its session takes the new inbox.
+`--undo --apply` clears the field, relaunches the lane, and returns the worker's live tasks (touched; one
+already answered stays) and results to the shared folders.
+
+### The core bridge under sparrowd (opt-in)
+
+By default the launchd gateway wrapper launches and supervises the host's core gateway bridge
+itself. A host can move that job to sparrowd. Nothing changes until the opt-in file
+`<workspace>/state/sparrowd/core.enabled` exists. The wrapper checks for it when it starts, and
+`src/startup-runtime.sh` checks for it before its bare launch. When the file is there:
+
+- The wrapper launches no bridge, runs no token check and does no eviction. It keeps
+  `src/sparrowd.py --core --agent-bridges` alive (relaunching it `SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY`
+  after it exits) and still runs the lane keeper. Startup's bare launch starts that same sparrowd. A
+  second sparrowd waits on the first one's lock.
+- sparrowd's `core-gateway-bridge` worker (`src/sparrow_core_bridge.py`) picks the bridge the wrapper
+  would run. That is the legacy one while its row is unparked and it has a token. Otherwise it is the
+  named primary lane. Otherwise there is none (with no token and no named primary, the worker is
+  simply absent and sparrowd says why once).
+- The legacy bridge gets the wrapper's own environment (`src/launchd/gateway-bridge-lib.sh`, which
+  the wrapper sources), with the proactive room emptied once a named row holds the primary. A named
+  primary gets its lane's `launch_env`, logs to `logs/remote-gateway-bridge.<instance>.log` and
+  writes its launch record.
+- The worker evicts a stray bridge of this checkout first, then execs `src/remote-gateway-bridge.py`
+  in place. The process carries the same argv and command line as the wrapper's child, so `pgrep`,
+  health-check and the eviction helper find it as before. It keeps the owner DM, the device env and
+  the proactive room.
+- sparrowd restarts the worker when the connection it serves changes: a primary move, the legacy
+  row parked or unparked, a rotated token file, or the row's token_ref, gateway URL or agent. Exit 75
+  (the bridge's stand-down) holds it until one of those changes, or until a later scan finds the lease
+  free, which re-arms it. While held, sparrowd's `health` reports unhealthy and health-check's
+  gateway-bridge check warns that this install's bridge is not serving. Any other exit is restarted
+  with backoff (at most 60 s).
+- Each restart raises the wrapper's alert, within the same deliberate-restart window and cooldown.
+  There are two exceptions: a poll stall (rc 69), and a start that failed before any bridge ran
+  (rc 78, for example a named primary with no recorded agent).
+- One supervisor per bridge. A stray bridge of this checkout whose parent is gone is evicted. A
+  bridge that another live process keeps (an app's keepalive, the gate-off wrapper) is refused, and
+  the worker retries until that supervisor is gone.
+- sparrowd reads the gate itself on every scan, so removing the file stops the core in whichever
+  sparrowd runs it, including one that startup's fallback started outside the launchd job.
+- The bridge is told sparrowd restarts it (`SUTANDO_BRIDGE_RESTART_OWNER=sparrowd`) unless its
+  environment already names a restart owner (the plist names `launchd`). Its stall exits stay armed
+  either way.
+- While sparrowd's core serves a named primary, it records that in `state/sparrowd/core.json`.
+  The lane keeper then leaves that lane to it, as for a declared bridge: while any process holds the
+  lane's lease, and for `DECLARED_BRIDGE_GRACE_S` (180 s) after it first finds nobody holding it.
+
+Cut-over (on the host, by its owner):
+
+1. `date +%s > "$(bash scripts/sutando-config.sh workspace)/state/channel-bridge-supervisor/deliberate-restart"`
+   so that the restart raises no alert.
+2. `mkdir -p "$(bash scripts/sutando-config.sh workspace)/state/sparrowd" && touch "$(bash scripts/sutando-config.sh workspace)/state/sparrowd/core.enabled"`.
+3. `launchctl kickstart -k gui/$(id -u)/com.sutando.gateway-bridge`. The gateway log then shows
+   `core gate set: sparrowd runs the gateway bridge`, sparrowd's `worker core-gateway-bridge: started`,
+   and the bridge's own `acquired workspace poller lock`.
+4. Check with a live round trip: a message in, the reply delivered.
+
+Undo: `rm "$(bash scripts/sutando-config.sh workspace)/state/sparrowd/core.enabled"`, stamp the
+deliberate restart as in step 1, then `launchctl kickstart -k gui/$(id -u)/com.sutando.gateway-bridge`.
+The wrapper stops sparrowd with its bridge and goes back to launching the bridge itself. Any other
+`sparrowd.py --core` drops its core on its next scan (within 30 s).
 
 ## Known servers
 
@@ -580,7 +1013,7 @@ not here.
 
 ## Surfaces
 
-- CLI: `scripts/connections.py list | known-servers | add | set-primary | promote | park | park-legacy | unpark | legacy-parked | remove | disconnect | reconnect | update-token | launch | start | import-env | launch-plan | primary | enabled`. `enabled` prints each row a bridge serves (neither disabled nor parked) and exits 1 when there is none: what "is a gateway configured here" asks (health-check, runtime-health, the voice navigation tool). `promote INSTANCE --repo DIR --logs-dir DIR [--park]`, `park INSTANCE`, `park-legacy` and `unpark INSTANCE --repo DIR --logs-dir DIR` (`''` names the legacy row); `legacy-parked` exits 0 when the legacy row is parked, else 1. `update-token INSTANCE -` reads the new code from stdin, which keeps it out of the process list (`ps` shows every argument); a literal code in its place is for scripts. `set-primary` prints "reconnect it" when the new primary's bridge is running.
+- CLI: `scripts/connections.py list | known-servers | add | set-primary | promote | park | park-legacy | unpark | legacy-parked | remove | disconnect | reconnect | update-token | launch | start | import-env | launch-plan | primary | enabled | bridge-pid`. `bridge-pid [INSTANCE]` prints the pid `bridge_pid` proves holds that bridge's lease, nothing when none runs, and exits 3 when the lease proves neither; the launchd wrapper passes it to `evict_own_bridge` so a straggler holding the lease is evicted even when `ps` cannot show its identity. `enabled` prints each row a bridge serves (neither disabled nor parked) and exits 1 when there is none: what "is a gateway configured here" asks (health-check, runtime-health, the voice navigation tool). `promote INSTANCE --repo DIR --logs-dir DIR [--park]`, `park INSTANCE`, `park-legacy` and `unpark INSTANCE --repo DIR --logs-dir DIR` (`''` names the legacy row); `legacy-parked` exits 0 when the legacy row is parked, else 1. `update-token INSTANCE -` reads the new code from stdin, which keeps it out of the process list (`ps` shows every argument); a literal code in its place is for scripts. `set-primary` prints "reconnect it" when the new primary's bridge is running.
 - Runtime API (Unix socket, JSON-RPC): `connection.list` (`{connections, capabilities}`, as over HTTP), `connection.known_servers`, `connection.add` (`{token}` previews; `{token, confirm: true, expected_server}` saves and starts the bridge), `connection.remove`, `connection.set_primary`, `connection.promote` (`{instance, park?}`), `connection.park` and `connection.unpark` (`{instance}`, `""` for the legacy row; promote answers `{connection, previous, kept, stopped_pid, launch, changed, relaunch_needed}`, park `{connection, stopped_pid}`, unpark `{connection, launch}`), `connection.park_legacy` (`{primary, parked, stopped}`), `connection.disconnect`, `connection.reconnect`, `connection.update_token` (`{instance, token}`). Every refusal by code (the table above) is `CONFLICT`, the same class the HTTP 409 carries.
 - HTTP (`src/agent-api.py` on `127.0.0.1:7843`, the web client's transport; routes dispatch to the same units):
 

@@ -174,6 +174,18 @@ class QueueQuestion(unittest.TestCase):
         self.assertEqual([(a.id, a.label) for a in req.actions], [("option-0", "8080"), ("option-1", "Hold")])
         self.assertNotIn("Approve", req.message)
 
+    def test_an_option_named_like_the_default_is_approve_not_a_second_button(self):
+        ws = _ws("ag2space")
+        m = _manager(ws)
+        out = _ask("Admit it?", workspace=ws, host="h", default_action="Yes, admit it",
+                   options=[("Yes, admit it", "approve the gate now"), ("No", "leave it closed")],
+                   manager=m)
+        req = m.get(out["card"])
+        self.assertEqual([(a.id, a.label) for a in req.actions], [("approve", "Approve"), ("option-1", "No")])
+        self.assertEqual(ask.card_choices("Yes, admit it", [("Yes, admit it", "approve the gate now"),
+                                                            ("No", "leave it closed")]),
+                         [("Approve", "approve the gate now"), ("No", "leave it closed")])
+
     def test_no_options_and_no_default_stays_plain_text(self):
         ws = _ws("ag2space")
         out = _ask("What next?", workspace=ws, host="h", manager=_manager(ws))
@@ -305,7 +317,7 @@ class CardOutcomes(unittest.TestCase):
         self.assertFalse(any("asked as text" in ln for ln in lines), lines)
         self.assertTrue(any("could not be checked" in ln and "no text was sent" in ln for ln in lines), lines)
 
-    def test_a_definite_failure_texts_the_same_destination_with_the_link_and_rewrites_the_record(self):
+    def test_a_definite_failure_texts_the_same_destination_and_rewrites_the_record(self):
         ws = _ws("ag2space")
         m = _manager(ws)
         out = self._queued(ws, m)
@@ -315,7 +327,9 @@ class CardOutcomes(unittest.TestCase):
         self.assertTrue(out["proactive_file"].endswith(".to-ag2space.txt"), out["proactive_file"])
         body = (ws / "results" / out["proactive_file"]).read_text()
         self.assertIn("[channel: !dm:test.invalid]", body)
-        self.assertIn("https://row.test.invalid/7", body)
+        self.assertNotIn("https://row.test.invalid/7", body)
+        self.assertIn("- Approve: merge\n- Hold: wait for the CLA", body, "the choices the card would offer")
+        self.assertIn("Reply here with the one you choose.", body)
         held = json.loads(Path(out["outbox"]).read_text())
         self.assertEqual(held["sent"], out["sent_line"])
         self.assertIn(f"via {out['proactive_file']}", held["sent"])
@@ -746,7 +760,7 @@ class CrashBoundaries(unittest.TestCase):
         self.assertNotIn("**Sent:** card", row["body"])
         self.assertNotIn(out["ask_id"], self.held())
 
-    def test_the_fallback_carries_the_rows_own_link_not_the_one_guessed_before(self):
+    def test_the_text_fallback_carries_no_row_link(self):
         store, _ = room_db.room_store(self.ws)
         real = room_db.write_question
 
@@ -758,7 +772,9 @@ class CrashBoundaries(unittest.TestCase):
                 mock.patch.object(room_db, "write_question", write_with_new_link):
             out = self.ask(store)
         body = (self.ws / "results" / out["proactive_file"]).read_text()
-        self.assertIn("https://row.test.invalid/after-write", body)
+        self.assertNotIn("https://row.test.invalid/", body)
+        self.assertIn("- Approve: merge it\n- Hold: wait", body)
+        self.assertIn("Reply here with the one you choose.", body)
 
     def test_death_after_the_hold_before_the_row_rewrite_is_reconciled(self):
         self.child("with mock.patch('hitl.manager.HitlManager.create', side_effect=OSError('disk full')), \\\n"

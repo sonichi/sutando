@@ -87,6 +87,7 @@ import process_pins  # noqa: E402
 import pool_suspension  # noqa: E402
 import tmux_pane_keys  # noqa: E402
 import watcher_identity  # noqa: E402
+import bridge_engine  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
 from gateway_serving import (  # noqa: E402
@@ -1685,6 +1686,40 @@ def check_decision_card_clicks(workspace_dir: Optional[Path] = None) -> "dict | 
                        "`hitl_click: true` task (CLAUDE.md, Pending decisions)")}
 
 
+def check_task_event_handler(workspace_dir: Optional[Path] = None) -> "dict | None":
+    """DOWN when core's watcher would hold every task; mirrors read_handler_config_now's order."""
+    from util_paths import task_event_handler_config_path  # noqa: PLC0415
+    cfg = task_event_handler_config_path((Path(workspace_dir) if workspace_dir else WORKSPACE_DIR) / "state")
+    if not cfg.exists() and not cfg.is_symlink():
+        return None  # no declaration: the core takes every task, pin or not
+
+    def usable(path) -> bool:
+        return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+    try:
+        raw = cfg.read_bytes()
+    except OSError as exc:
+        why = f"{cfg.name} exists but cannot be read ({type(exc).__name__})"
+    else:
+        pin = os.environ.get("SUTANDO_TASK_EVENT_HANDLER", "")
+        if pin:
+            if usable(pin):
+                return None
+            why = f"the SUTANDO_TASK_EVENT_HANDLER override {pin!r} is not an executable file"
+        else:
+            try:
+                handler = (json.loads(raw) or {}).get("handler")
+            except (ValueError, AttributeError):
+                handler = None
+            if isinstance(handler, str) and usable(handler):
+                return None
+            why = f"{cfg.name} names a handler that is missing or not an executable file ({handler!r})"
+    return {"name": "task-event-handler", "status": "down",
+            "detail": (f"{why}; the core watcher holds every new task until it is fixed. Re-publish the "
+                       "handler from the checkout that should route, or remove the file to let the core "
+                       "take every task")}
+
+
 def check_connections_primary(workspace_dir: Optional[Path] = None) -> "dict | None":
     """WARN when the connections record has rows but no primary, or a primary whose bridge has no
     proactive room yet; otherwise say so when the legacy row is not primary. None when all is plain."""
@@ -1936,6 +1971,21 @@ def _carrier_representatives(workspace: Path, entry: str) -> "list[Path]":
         matches = [candidate] if candidate.exists() else []
     return [m for m in matches if not _reaches_through_symlink(workspace, m)]
 
+
+def _stale_with_culprits(stale, culprits, workspace) -> str:
+    """`entry (-> the match git ignores)` so the reader sees which path is dropped."""
+    out = []
+    for entry in stale[:4]:
+        rep = culprits.get(entry)
+        if rep is None or str(rep).rstrip("/").endswith(entry.rstrip("/")):
+            out.append(entry)
+        else:
+            try:
+                shown = rep.relative_to(workspace).as_posix()
+            except ValueError:
+                shown = str(rep)
+            out.append(f"{entry} -> {shown}")
+    return ", ".join(out) + ("…" if len(stale) > 4 else "")
 
 def _reaches_through_symlink(workspace: Path, p: Path) -> bool:
     """True when every file the probe would derive from `p` is "beyond a
@@ -2217,6 +2267,7 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
         return None
 
     stale: "list[str]" = []
+    stale_culprit: "dict[str, Path]" = {}
     unmeasured: "list[str]" = []
     for entry in resolved:
         # EVERY materialized match, not one. `_carrier_representative()` (singular)
@@ -2246,13 +2297,19 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
         # probe still say OK. Both that and the directory/contents distinction now
         # live in `_carrier_target_verdict` so the two branches cannot drift.
         verdict = "carried"
+        culprit = None
         for rep in reps:
             got = _carrier_target_verdict(workspace, rep)
             if got != "carried":
                 verdict = got
+                culprit = rep
                 break
         if verdict == "dropped":
             stale.append(entry)
+            # Name the MATCH, not just the entry: a glob entry resolves to several
+            # paths and the reader cannot tell which one git is ignoring.
+            if culprit is not None:
+                stale_culprit[entry] = culprit
         elif verdict == "unmeasured":
             # Could not run the measurement at all. NOT the same as "carried".
             unmeasured.append(entry)
@@ -2402,9 +2459,11 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
     if stale:
         parts.append(
             f"{len(stale)} configured carrier path(s) are STILL GIT-IGNORED so the vault is not "
-            f"backing them up ({', '.join(stale[:4])}{'…' if len(stale) > 4 else ''}) — the exclude "
-            f"file is stale and sync refused to regenerate it; fix with "
-            f"`bash scripts/sync-workspace.sh --force-gitignore` (diff it first)"
+            f"backing them up ({_stale_with_culprits(stale, stale_culprit, workspace)}) — usually a "
+            f"stale exclude file, fixed with `bash scripts/sync-workspace.sh --force-gitignore` "
+            f"(diff it first). For a glob-directory entry `<dir>/*/`, a FILE directly in "
+            f"`<dir>/` is outside the `!<dir>/*/**` carve-out; regenerating cannot reach "
+            f"that file — deal with it instead"
         )
     if safe:
         parts.append(
@@ -3290,6 +3349,7 @@ _SERVICE_SOURCES = (
     # wrapper that `exec`s is gone from the table, so its payload's row covers it.
     ("src/launchd/channel-bridge-wrapper.sh", "channel-bridge-wrapper.sh"),
     ("src/launchd/gateway-bridge-wrapper.sh", "gateway-bridge-wrapper.sh"),
+    ("src/launchd/gateway-bridge-lib.sh", "gateway-bridge-wrapper.sh"),
     ("src/Sutando/", "Sutando.app/Contents/MacOS/Sutando"),
 )
 
@@ -5771,6 +5831,36 @@ def _agent_activity_age() -> "float | None":
         return None
 
 
+def _statusline_quota_freshness(check: dict) -> dict:
+    """A status line record is current only while replies land: warn when the core has
+    worked more than the gate's freshness window after the record's `last_checked`."""
+    from quota_availability import FRESH_SEC, read_quota_record  # src/ is on sys.path
+    rec = read_quota_record(WORKSPACE_DIR)
+    age = None if rec is None else rec.age_s
+    if age is None:
+        check["detail"] = "quota state from the Claude status line recorder (age unknown)"
+        return check
+    check["detail"] = f"quota state from the Claude status line recorder (updated {int(age / 60)}m ago)"
+    agent_age = _agent_activity_age()
+    if age > FRESH_SEC and agent_age is not None and agent_age < age - FRESH_SEC:
+        check["status"] = "warn"
+        check["detail"] = (
+            f"quota state from the Claude status line recorder is {int(age / 60)}m old while the "
+            f"core worked {int(agent_age / 60)}m ago — the core's replies are not reaching the "
+            "recorder. Check that the core's config-dir settings.json has the quota-tracker "
+            "statusLine (it is reinstalled at launch) and that a project statusLine does not hide it."
+        )
+    return check
+
+
+def check_claude_sign_in() -> dict:
+    """FAIL when the core's config dir is not signed in on its own while sessions go direct, and
+    queue one owner message per day with the sign-in step (src/claude_signed_in.py)."""
+    import claude_signed_in  # src/ is on sys.path
+    from claude_account import core_config_dir
+    return claude_signed_in.check(WORKSPACE_DIR, core_config_dir(), socket=_local_core_socket())
+
+
 def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
     """Warn when the credential proxy is up but producing no quota state.
 
@@ -5820,6 +5910,8 @@ def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
     # result depends on ambient host state is worse than the bug it guards -- and CI,
     # having no live core, would have stayed green while developer hosts failed.
     check = {"name": "quota-telemetry", "status": "ok"}
+    if _quota_record_from_statusline():
+        return _statusline_quota_freshness(check)
     # "stale" means listening but executing pre-deploy code -- still routing,
     # so gating it out here would mute this check exactly during a redeploy.
     if proxy_status not in ("ok", "stale"):
@@ -5971,6 +6063,10 @@ def check_core_request_rejections(window_sec: int = 900, sustained: int = 5,
         check["status"] = "warn"
         check["detail"] = "quota-state.json present but unreadable"
         return check
+    from quota_availability import trusted_record  # src/ is on sys.path
+    if isinstance(data, dict) and trusted_record(data) is None:
+        check["detail"] = "quota record is another login's status line record — not this core's"
+        return check
     ledger = data.get("recent_rejections") if isinstance(data, dict) else None
     if not isinstance(ledger, list) or not ledger:
         check["detail"] = "no upstream rejections recorded by the proxy"
@@ -6069,6 +6165,10 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
     if not isinstance(data, dict):
         check["status"] = "warn"
         check["detail"] = "quota-state.json is not a JSON object"
+        return check
+    from quota_availability import trusted_record  # src/ is on sys.path
+    if trusted_record(data) is None:
+        check["detail"] = "quota record is another login's status line record — not this core's"
         return check
     headers = data.get("headers")
     if not isinstance(headers, dict):
@@ -7018,6 +7118,21 @@ def check_sspace_migration(workspace_dir: Optional[Path] = None) -> "dict | None
                        f'"Moving a terminal-run core to {target}"))')}
 
 
+GATEWAY_CORE_HELD_DETAIL = (
+    "sparrowd's core gateway bridge is held: it stood down to another holder of its lease, so this "
+    "install's own bridge is not serving; it starts again once that lease is free (docs/connections.md, "
+    '"The core bridge under sparrowd")')
+
+
+def _sparrowd_core_held() -> bool:
+    """Whether a running sparrowd reports its core gateway bridge held; False when none answers."""
+    try:
+        import sparrow_core_bridge  # noqa: PLC0415
+        return sparrow_core_bridge.core_worker_state(WORKSPACE_DIR) == "held"
+    except Exception:  # noqa: BLE001 - a probe that cannot run reports nothing
+        return False
+
+
 def check_gateway_bridge() -> "dict | None":
     """Health of the gateway bridge (remote-gateway-bridge.py) of the primary connection — the
     process that carries MOBILE-app messages from the cloud gateway down to the
@@ -7036,6 +7151,8 @@ def check_gateway_bridge() -> "dict | None":
     configured = _gateway_configured()
     if not configured:
         return None
+    if _sparrowd_core_held():
+        return {"name": "gateway-bridge", "status": "warn", "detail": GATEWAY_CORE_HELD_DETAIL}
     try:
         # pgrep exits 1 for no-match but 2/3 when broken; probe_pids keeps those
         # apart. The relay name is a compat stub, so it is a real duplicate.
@@ -7156,6 +7273,102 @@ def check_gateway_bridge() -> "dict | None":
     return _gateway_ok_unless_lane_stalled("running")
 
 
+OWNER_DM_STALE_MIN_AGE_S = 1800.0
+# Grace for float/JSON round-trip imprecision only — not a real clock-skew budget.
+OWNER_DM_CLOCK_SKEW_TOLERANCE_S = 5.0
+
+
+def check_owner_dm_routing_stale(min_age_sec: float = OWNER_DM_STALE_MIN_AGE_S,
+                                  now: "float | None" = None) -> "dict | None":
+    """WARN once the owner/gateway DM-room mismatch has itself persisted past
+    `min_age_sec` — not how recently the owner spoke, which refreshes every message."""
+    name = "owner-dm-routing-stale"
+    state_file = WORKSPACE_DIR / "state" / "owner-dm-routing-stale.json"
+
+    def _clear_divergence():
+        try:
+            state_file.unlink()
+        except OSError:
+            pass
+
+    if not _gateway_configured():
+        # Not-configured is unobservable, same as every "ok" case below — clear
+        # the clock so it can't resume a stale duration once reconfigured.
+        _clear_divergence()
+        return None
+    import owner_room_access  # noqa: PLC0415
+    routing = owner_room_access.owner_routing(WORKSPACE_DIR)
+    current_dm = owner_room_access.owner_dm(routing)
+
+    if not current_dm:
+        _clear_divergence()
+        return {"name": name, "status": "ok", "detail": "no owner DM routing reading yet"}
+    try:
+        activity = json.loads(status_read_path("last-owner-activity.json", WORKSPACE_DIR)
+                              .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        _clear_divergence()
+        return {"name": name, "status": "ok", "detail": "no owner activity recorded yet"}
+    if not isinstance(activity, dict) or activity.get("channel") != "ag2space":
+        _clear_divergence()
+        return {"name": name, "status": "ok", "detail": "owner's last recorded activity is not on ag2space"}
+    last_room = str(activity.get("channel_id") or "").strip()
+    if not last_room or last_room == current_dm:
+        _clear_divergence()
+        return {"name": name, "status": "ok", "detail": "owner's last-active room matches proactive routing"}
+
+    now = time.time() if now is None else now
+    try:
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+    first_seen = _gateway_num(state.get("first_seen"), nonneg=True)
+    # A first_seen beyond now (clock skew, a tampered/corrupted file) can never age — discard it.
+    if first_seen is not None and first_seen > now + OWNER_DM_CLOCK_SKEW_TOLERANCE_S:
+        first_seen = None
+    measured = True
+    # A new or changed pair starts its own clock; the same pair keeps the one already running.
+    if state.get("last_room") != last_room or state.get("current_dm") != current_dm or not first_seen:
+        first_seen = now
+        tmp = None
+        try:
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", dir=state_file.parent,
+                                             prefix=".owner-dm-routing-stale-", delete=False) as out:
+                tmp = Path(out.name)
+                json.dump({"last_room": last_room, "current_dm": current_dm, "first_seen": first_seen}, out)
+            os.replace(tmp, state_file)
+        except OSError:
+            measured = False
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+    if not measured:
+        # Nothing was persisted, so first_seen is only in memory — reporting its
+        # age would lie ("0s old") forever. Say the divergence is real but unmeasured.
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": (f"routing mismatch ({last_room} vs {current_dm}) is real, but its duration "
+                       "could not be measured — the clock file could not be written"),
+        }
+    age = max(0.0, now - first_seen)
+    if age < min_age_sec:
+        return {"name": name, "status": "ok",
+                "detail": f"routing mismatch ({last_room} vs {current_dm}) is {int(age)}s old, within "
+                          f"the {int(min_age_sec)}s settle window — not yet sustained"}
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (f"owner's last {_gateway_where()} messages (for {int(age // 60)}m) still come from "
+                   f"{last_room}, but proactive messages keep routing to {current_dm} — the gateway's "
+                   "owner_dm_room may be stuck stale, and no agent/owner Action exists yet to redesignate "
+                   "it; this signal is heuristic, a shared-room message reads the same as a moved DM"),
+    }
+
+
 def _gateway_rows(workspace: "Path | None" = None) -> "list[dict]":
     """Every row as stored (no sidecar read, no lease probe); [] with no connections record."""
     import connections  # noqa: PLC0415
@@ -7204,7 +7417,7 @@ def _gateway_lane_label(lane: str, rows: "list[dict] | None" = None) -> str:
 GATEWAY_STATUS_MAX_AGE_S = 180.0
 # Mirrors POLL_TIMEOUT_GRACE_S in ag2_sparrow/remote_gateway_bridge.py — the same
 # env read, so a host that retunes POLL_WAIT moves both together.
-GATEWAY_TRANSIENT_OUTAGE_S = 3 * (float(os.environ.get("REMOTE_TASK_POLL_WAIT") or 25) + 10)
+GATEWAY_TRANSIENT_OUTAGE_S = 3 * (max(float(os.environ.get("REMOTE_TASK_POLL_WAIT") or 25), 35) + 25)
 
 
 def _gateway_last_ok_age_h(path: "Path | None" = None,
@@ -9463,6 +9676,19 @@ def _watcher_runtime(sentinel: Path, inbox: "str | None") -> str:
     return "claude" if _claude_runtime_selected() else "other"
 
 
+def check_bridge_engine_match() -> dict:
+    """A bridge running from another install's engine may write tasks this core never reads."""
+    def _pids(script: str) -> tuple:
+        # Not end-anchored: a bridge launched with trailing arguments must still be found.
+        pids, scanned = probe_pids(re.escape(script) + "([[:space:]]|$)")
+        return _drop_launcher_parents(pids), scanned
+    try:
+        return bridge_engine.check_bridge_engine_match(REPO_DIR, _pids)
+    except Exception as exc:  # noqa: BLE001 — a probe failure is not a finding
+        return {"name": bridge_engine.CHECK_NAME, "status": "unknown",
+                "detail": f"probe failed ({type(exc).__name__})"}
+
+
 def check_task_watcher() -> dict:
     """Direct liveness of the streaming task watcher (src/watch-tasks-stream.sh).
 
@@ -10907,7 +11133,44 @@ def check_claude_task_notifier() -> dict:
                 "detail": "fresh local Claude heartbeat, but its live tmux session could not be verified"}
     supervisor = REPO_DIR / "src" / "agent" / "codex" / "cli" / "task-notifier-supervisor.sh"
     notifier = REPO_DIR / "src" / "agent" / "claude" / "cli" / "task-notifier.sh"
-    return _probe_task_notifier(target, name=name, expected=supervisor, script=notifier)
+    probe = _probe_task_notifier(target, name=name, expected=supervisor, script=notifier)
+    if probe["status"] != "ok" or _claude_standby_mode(target) != "alert":
+        return probe
+    return _mod_watcher_verdict(name, WORKSPACE_DIR / "tasks", WORKSPACE_DIR / "state")
+
+
+def _claude_standby_mode(target: dict) -> str:
+    """The launcher's choice for the core's supervisor: "alert" when the task-watch Mod hosts its watcher."""
+    env = _run_tmux(target["socket"], "show-environment", "-t", f"={target['session']}-watcher",
+                    "SUTANDO_STANDBY_MODE")
+    if env is None or env.returncode != 0:
+        return ""
+    return env.stdout.strip().partition("=")[2]
+
+
+def _mod_watcher_verdict(name: str, inbox: Path, state_dir: Path, role_present=None) -> dict:
+    """A Mod-hosted seat is covered only by a ready session watcher: its standby never types."""
+    role_present = role_present or watcher_identity.role_present
+    verdict = role_present("session", str(inbox), ready=True, state_dir=str(state_dir))
+    if verdict:
+        return {"name": name, "status": "ok",
+                "detail": "the task-watch Mod's session watcher holds the core's inbox; the standby is alert-only"}
+    why = ("the process table could not be read" if verdict is None
+           else "no ready session watcher holds its inbox")
+    return {"name": name, "status": "warn", "mod_watcher_absent": True,
+            "detail": (f"the core's watcher is hosted by the task-watch Mod, but {why}; "
+                       f"{_waiting_phrase(inbox)}, and the alert-only standby types nothing. "
+                       "Restarting the core session restarts the Mod's watcher")}
+
+
+def _waiting_phrase(inbox: Path) -> str:
+    """How many tasks wait in the core's inbox, counted by the queue's owner."""
+    import task_queue
+    try:
+        n = len(task_queue.pending_files(inbox.parent))
+    except Exception:  # noqa: BLE001 - an uncounted queue is said so, never read as zero
+        return "an unknown number of tasks are waiting"
+    return "1 task is waiting" if n == 1 else f"{n} tasks are waiting"
 
 
 def _process_alive(pid: int) -> bool:
@@ -10946,8 +11209,11 @@ def fix_claude_task_notifier() -> str:
     core_pid = heartbeat.get("pid")
     if not isinstance(core_pid, int) or isinstance(core_pid, bool) or not _process_alive(core_pid):
         return f"not repaired — the heartbeat's core process (pid {core_pid}) is not running"
-    if check_claude_task_notifier()["status"] == "ok":
+    current = check_claude_task_notifier()
+    if current["status"] == "ok":
         return "already healthy"
+    if current.get("mod_watcher_absent"):
+        return "not repaired — the supervisor is healthy; the missing watcher is the core session's own"
     launcher = REPO_DIR / "src" / "agent" / "start-cli.sh"
     if not launcher.is_file():
         return "not repaired — canonical launcher is missing"
@@ -11752,28 +12018,9 @@ def _drop_launcher_parents(pids: list) -> list:
 
 
 def _should_skip_bridge(channel_name: str, env_path: Path) -> bool:
-    """True if SKIP_<CHANNEL>=1 is set in the main .env or as an env var.
-
-    Lets operators silence a bridge on a specific host without removing its
-    token from the shared config (issue #1916). The flag is per-host: set it
-    in the main .env on the host where the bridge should NOT run. Both the
-    health-check (no warn) and --fix (no restart) honor it.
-    """
-    var = f"SKIP_{channel_name.upper()}"
-    if os.environ.get(var) == "1":
-        return True
-    if env_path.exists():
-        try:
-            for line in env_path.read_text().splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                key, sep, val = line.partition("=")
-                if sep and key.strip() == var and val.strip().strip('"').strip("'") == "1":
-                    return True
-        except Exception:
-            pass
-    return False
+    """True if SKIP_<CHANNEL>=1 is set in the main .env or as an env var (issue #1916; chat_bridges.skipped)."""
+    import chat_bridges
+    return chat_bridges.skipped(channel_name, env_path)
 
 
 def sutando_app_hotkey_detail(workspace_dir) -> str:
@@ -13162,6 +13409,16 @@ def _credential_proxy_wedge_from_quota_state(check: dict) -> None:
     )
 
 
+def _quota_record_from_statusline() -> bool:
+    """quota-state.json was last written by the status line recorder, which needs no proxy."""
+    try:
+        data = json.loads(status_read_path("quota-state.json", WORKSPACE_DIR).read_text())
+    except (OSError, ValueError):
+        return False
+    from quota_availability import from_statusline  # src/ is on sys.path
+    return from_statusline(data)
+
+
 def check_credential_proxy() -> dict:
     """Credential proxy (port 7846). probe=False: a forwarding proxy has no
     liveness endpoint, so an HTTP probe is forwarded and misread as wedged."""
@@ -13169,7 +13426,10 @@ def check_credential_proxy() -> dict:
     # Liveness, captured before staleness/pin rewrite `status`: a pinned proxy
     # still routes, so its consumers must not read the pin as "down".
     check["live"] = check["status"] == "ok"
-    if check["status"] == "down":
+    if check["status"] == "down" and _quota_record_from_statusline():
+        check["status"] = "ok"
+        check["detail"] = "not running — quota comes from the Claude status line recorder"
+    elif check["status"] == "down":
         check["status"] = "warn"
         check["detail"] = "not running (optional)"
     elif check["status"] == "ok":
@@ -13183,6 +13443,12 @@ def check_credential_proxy() -> dict:
                          else None),
         )
         _credential_proxy_wedge_from_quota_state(check)
+        import claude_signed_in  # src/ is on sys.path
+        if (check["status"] != "ok" and claude_signed_in.direct_routing_on() is True
+                and claude_signed_in.proxy_in_use() is False):
+            # Nothing routes through it, so its code or credential state affects no one.
+            check["status"] = "ok"
+            check["detail"] = f"unused, sessions route direct (info: {check.get('detail', '')})"
     # Pin verdicts resolve on EVERY branch: a healthy replacement or a down
     # service still owes any ORPHAN/MISMATCH/EXPIRED finding to the report.
     _, _pls = _proc_lstarts("credential-proxy")
@@ -13389,6 +13655,7 @@ def run_all_checks() -> list[dict]:
     # NOT carry_proxy_veto: this check's remedy relaunches the CORE, and a pin on
     # the proxy must not veto a different process's remedy.
     checks.append(check_quota_telemetry(proxy_live))
+    checks.append(check_claude_sign_in())
     # ...and WHOSE account those numbers describe. The check above answers
     # "fresh?"; this one answers "ours?" — a fresh file for a foreign account
     # passes every branch above (observed 2026-08-03).
@@ -13462,6 +13729,10 @@ def run_all_checks() -> list[dict]:
     _card_clicks = check_decision_card_clicks()
     if _card_clicks:
         checks.append(_card_clicks)
+
+    _handler = check_task_event_handler()
+    if _handler:
+        checks.append(_handler)
 
     _no_primary = check_connections_primary()
     if _no_primary:
@@ -13594,10 +13865,8 @@ def run_all_checks() -> list[dict]:
         channel_name = name.replace("-bridge", "")
         if _should_skip_bridge(channel_name, env_path):
             continue
-        env_file = channels_dir / channel_name / ".env"
-        access_file = channels_dir / channel_name / "access.json"
-        # Check if configured via either .env or access.json
-        if not env_file.exists() and not access_file.exists():
+        import chat_bridges
+        if not chat_bridges.configured(channels_dir, channel_name):
             continue
         try:
             # Anchor to the script suffix; find_pids preserves anchors on every OS.
@@ -13802,6 +14071,7 @@ def run_all_checks() -> list[dict]:
     # branches are unit-tested in tests/health-check-gateway-bridge.test.py; this
     # call site is exercised by the running health check, not that unit test.)
     checks += [c for c in (check_gateway_bridge(),) if c is not None]  # pragma: no cover
+    checks += [c for c in (check_owner_dm_routing_stale(),) if c is not None]  # pragma: no cover
     checks += [c for c in (check_sspace_migration(),) if c is not None]  # pragma: no cover
 
     # (External plugin probes moved out with their plugins in #1427 round ④ —
@@ -13903,6 +14173,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_stranded_destined_proactive())
     checks.append(check_stale_proactive_backlog())
     checks.append(check_task_watcher())
+    checks.append(check_bridge_engine_match())
     checks.append(check_task_claim_age())
     checks.append(check_a_fallback_hits())
     checks.append(check_outbox_parked())

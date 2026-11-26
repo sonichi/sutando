@@ -5,14 +5,20 @@
 # sutando_core_window_ids <socket> <session> <live|all> <cli>...: ids of windows whose pane
 # was started as one of the named CLIs (`live`: still running). Fails when panes are unreadable.
 sutando_core_window_ids() {
-  local socket="$1" session="$2" mode="$3" rows wid dead cmd rt
+  local socket="$1" session="$2" mode="$3" rows row wid dead cmd rt
   shift 3
   rows="$(tmux -S "$socket" list-panes -s -t "=$session" -F '#{window_id} #{pane_dead} #{pane_start_command}' 2>/dev/null)" \
     || return 1
   printf '%s\n' "$rows" \
-    | while read -r wid dead cmd _; do
+    | while IFS= read -r row; do
+        wid="${row%% *}"; row="${row#* }"; dead="${row%% *}"; cmd="${row#* }"
         [ "$mode" = all ] || [ "$dead" = 0 ] || continue
-        cmd="${cmd#\"}"; cmd="${cmd%\"}"
+        # tmux quotes a word that holds a space. A quoted word that is a file on this machine is the
+        # executable (a CLI under "Application Support"); any other is a command line, read by its first word.
+        case "$cmd" in
+          \"*) cmd="${cmd#\"}"; cmd="${cmd%%\"*}"; [ -f "$cmd" ] || cmd="${cmd%% *}" ;;
+          *) cmd="${cmd%% *}" ;;
+        esac
         for rt in "$@"; do
           if [ "${cmd##*/}" = "$rt" ]; then echo "$wid"; break; fi
         done
@@ -29,8 +35,8 @@ sutando_new_core_window() {
 }
 
 # sutando_unidentified_live_windows <socket> <session> <cli>...: ids of live windows that are
-# neither a named CLI nor a sibling (`gateway-*`, `monitor`) running a non-core command: a core
-# the command match cannot see. Fails when panes are unreadable.
+# neither a named CLI nor a sibling (`gateway`, `gateway-*`, `monitor`) running a non-core
+# command: a core the command match cannot see. Fails when panes are unreadable.
 sutando_unidentified_live_windows() {
   local socket="$1" session="$2" rows wid dead name cmd rt known
   shift 2
@@ -41,7 +47,8 @@ sutando_unidentified_live_windows() {
         [ "$dead" = 0 ] || continue
         cmd="${cmd#\"}"; cmd="${cmd%%\"*}"; cmd="${cmd%% *}"
         # A sibling's name is creator-assigned, so a core CLI under that name still counts.
-        case "$name:${cmd##*/}" in gateway-*:claude|gateway-*:codex|monitor:claude|monitor:codex) ;; gateway-*:*|monitor:*) continue ;; esac
+        case "$name:${cmd##*/}" in gateway:claude|gateway:codex|gateway-*:claude|gateway-*:codex|monitor:claude|monitor:codex) ;;
+          gateway:*|gateway-*:*|monitor:*) continue ;; esac
         known=
         for rt in "$@"; do [ "${cmd##*/}" = "$rt" ] && known=1; done
         [ -n "$known" ] || echo "$wid"

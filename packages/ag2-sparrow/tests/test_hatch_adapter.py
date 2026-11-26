@@ -2974,15 +2974,18 @@ class StartSparrow(Base):
         """A live process holding Sparrow's lock, reaped as soon as it exits; its command line
         is Sparrow's unless `sparrow` is False, and it exits `linger` s after SIGTERM."""
         script = self.home / (hatch_cli.SPARROW_COMMAND if sparrow else "not-sparrow")
-        ready = self.home / "old-sparrow-ready"
-        script.write_text("import pathlib, signal, sys, time\n" + (
+        # Named for the process that writes it: one file for every call is already there from
+        # the call before, so the wait returns while this process is still the forked parent.
+        ready = str(self.home / "old-sparrow-ready")
+        script.write_text("import os, pathlib, signal, sys, time\n" + (
             f"signal.signal(signal.SIGTERM, lambda *a: (time.sleep({linger}), sys.exit(0)))\n"
-            if linger else "") + f"pathlib.Path({str(ready)!r}).touch()\ntime.sleep(60)\n")
+            if linger else "") + f"pathlib.Path({ready!r} + '.' + str(os.getpid())).touch()\n"
+            "time.sleep(60)\n")
         self.old_argv = [sys.executable, str(script)]
         proc = subprocess.Popen(self.old_argv)
         if sparrow:
             self.argvs[proc.pid] = self.old_argv
-        self.wait_for(ready)
+        self.wait_for(Path(f"{ready}.{proc.pid}"))
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
         threading.Thread(target=proc.wait, daemon=True).start()
         path = self.state / "locks" / "gateway-bridge.lock"
@@ -2995,6 +2998,19 @@ class StartSparrow(Base):
         (self.state / "gateway-status.json").write_text(json.dumps(
             {"connected": True, "ts": int(time.time()) - 5, "error": None}))
         return proc
+
+    def test_each_fixture_sparrow_is_waited_for_by_its_own_pid(self):
+        # The holder's argv is read from the live process, so a readiness file an earlier
+        # call left behind must not satisfy the next one.
+        first, second = self.old_sparrow(), self.old_sparrow()
+        try:
+            self.assertNotEqual(first.pid, second.pid)
+            for proc in (first, second):
+                self.assertTrue((self.home / f"old-sparrow-ready.{proc.pid}").exists(),
+                                f"old_sparrow returned before pid {proc.pid} was ready")
+        finally:
+            self.done_with(first)
+            self.done_with(second)
 
     def sparrow_cmdline(self, proc):
         """keepalive._proc, reading `proc`'s argv from the fixture on hosts without /proc (macOS)."""
@@ -4105,7 +4121,8 @@ class StartSparrow(Base):
     def test_a_zombie_lock_holder_is_not_live(self):
         record = {"pid": os.getpid(), "heartbeat_at": int(time.time()),
                   "host": hatch_cli.workspace_lock._host_label()}
-        for state, want in ((b"S", os.getpid()), (b"Z", None)):
+        # X: its parent is mid-reap and kill(0) still answers; x is older kernels' dead state.
+        for state, want in ((b"S", os.getpid()), (b"Z", None), (b"X", None), (b"x", None)):
             stat = b"%d (ag2-sparrow) %s 1 2 3" % (os.getpid(), state)
             with mock.patch.object(hatch_cli, "_proc_stat", return_value=stat):
                 self.assertEqual(hatch_cli.live_lock_holder(record), want, state)

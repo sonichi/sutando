@@ -106,19 +106,10 @@ class TestSelection(Base):
         self.record(THREE)
         self.assertEqual(self.instance("!opaqueid"), "s-space")
 
-    def test_a_domainless_room_follows_the_lane_with_a_task_open_in_it(self):
+    def test_a_domainless_room_is_the_primary_whatever_a_lane_once_handled(self):
         self.record(THREE)
         state = C.record_path(self.ws).parent
         (state / "remote-task-rooms.dev-s-space.json").write_text(json.dumps({"task-dev-s-space~1": "!opaqueid"}))
-        (state / "remote-task-rooms.json").write_text("{broken")
-        self.assertEqual(self.instance("!opaqueid"), "dev-s-space")
-        self.assertEqual(self.instance("!otherid"), "s-space")
-
-    def test_a_domainless_room_open_on_two_lanes_is_the_primary(self):
-        self.record(THREE)
-        state = C.record_path(self.ws).parent
-        for name in ("remote-task-rooms.json", "remote-task-rooms.dev-s-space.json"):
-            (state / name).write_text(json.dumps({"t": "!opaqueid"}))
         self.assertEqual(self.instance("!opaqueid"), "s-space")
 
     def test_unknown_server_is_refused_by_name(self):
@@ -169,7 +160,7 @@ class TestCredential(Base):
     def test_no_room_uses_the_primary_token(self):
         self.record(THREE)
         env = {"REMOTE_TASK_TOKEN": LEGACY + "|legacy-secret", "AG2_REMOTE_TOKEN_S_SPACE": "bare-s"}
-        self.assertEqual(self.cred(None, env), (S_SPACE, "bare-s"))
+        self.assertEqual(self.cred(None, env), (S_SPACE, S_SPACE + "|bare-s"), "a bare secret joins its row's gateway")
 
     def test_a_token_for_another_gateway_is_skipped(self):
         self.record(THREE)
@@ -187,7 +178,7 @@ class TestCredential(Base):
         rows = [dict(r) for r in THREE]
         rows[2]["launch_keys"] = ["AG2_REMOTE_TOKEN_DEV"]
         self.record(rows)
-        self.assertEqual(self.cred("!a:dev.s.space", {"AG2_REMOTE_TOKEN_DEV": "alias"}), (DEV_S_SPACE, "alias"))
+        self.assertEqual(self.cred("!a:dev.s.space", {"AG2_REMOTE_TOKEN_DEV": "alias"}), (DEV_S_SPACE, DEV_S_SPACE + "|alias"))
 
     def test_no_token_is_refused_by_connection_name(self):
         self.record(THREE)

@@ -8,6 +8,7 @@ exercises the same queue/watcher/core path as a user task.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -45,19 +46,137 @@ def percentile(values: Iterable[float], quantile: float) -> Optional[float]:
 
 
 def load_suite(path: Path) -> Dict[str, Any]:
-    data = json.loads(path.read_text())
-    if data.get("schema") != SCHEMA or not data.get("name"):
-        raise ValueError("suite must have schema=1 and a non-empty name")
+    try:
+        data = json.loads(path.read_text(), object_pairs_hook=_unique_json_object)
+    except RecursionError as exc:
+        raise ValueError("suite JSON exceeds supported nesting") from exc
+    validate_suite(data)
+    return data
+
+
+def validate_suite(data: Any) -> None:
+    if not isinstance(data, dict):
+        raise ValueError("suite must be a JSON object")
+    if type(data.get("schema")) is not int or data["schema"] != SCHEMA:
+        raise ValueError("suite must have schema=1")
+    if not isinstance(data.get("name"), str) or not data["name"].strip():
+        raise ValueError("suite name must be a non-empty string")
     cases = data.get("cases")
     if not isinstance(cases, list) or not cases:
-        raise ValueError("suite must contain at least one case")
+        raise ValueError("suite cases must be a non-empty list")
     seen = set()
-    for case in cases:
-        case_id = case.get("id") if isinstance(case, dict) else None
-        if not case_id or case_id in seen or not case.get("prompt"):
-            raise ValueError("every case needs a unique id and a prompt")
+    for index, case in enumerate(cases, 1):
+        prefix = f"case {index}"
+        if not isinstance(case, dict):
+            raise ValueError(f"{prefix} must be a JSON object")
+        for field in ("id", "prompt"):
+            if not isinstance(case.get(field), str) or not case[field].strip():
+                raise ValueError(f"{prefix}: {field} must be a non-empty string")
+        case_id = case["id"]
+        if case_id in seen:
+            raise ValueError(f"{prefix}: id must be unique")
         seen.add(case_id)
-    return data
+        _validate_expectation(case.get("expect", {}), prefix)
+
+
+def _validate_expectation(expected: Any, prefix: str) -> None:
+    if not isinstance(expected, dict):
+        raise ValueError(f"{prefix}: expect must be a JSON object")
+    unknown = set(expected) - {"equals", "contains", "regex", "max_chars", "json_equals"}
+    if unknown:
+        names = ", ".join(sorted(str(name) for name in unknown))
+        raise ValueError(f"{prefix}: unknown expect assertion(s): {names}; "
+                         "use equals, contains, regex, max_chars or json_equals")
+    for field in ("equals", "regex"):
+        if field in expected and not isinstance(expected[field], str):
+            raise ValueError(f"{prefix}: expect.{field} must be a string")
+    if "contains" in expected:
+        value = expected["contains"]
+        if not ((isinstance(value, str) and value) or (
+                isinstance(value, list) and value
+                and all(isinstance(item, str) and item for item in value))):
+            raise ValueError(f"{prefix}: expect.contains must be a non-empty string "
+                             "or a non-empty list of non-empty strings")
+    if "max_chars" in expected:
+        maximum = expected["max_chars"]
+        if type(maximum) is not int or maximum < 0:
+            raise ValueError(f"{prefix}: expect.max_chars must be a non-negative integer")
+    if "regex" in expected:
+        if not expected["regex"]:
+            raise ValueError(f"{prefix}: expect.regex must be a non-empty string")
+        try:
+            re.compile(expected["regex"], re.IGNORECASE | re.MULTILINE)
+        except (re.error, OverflowError, RecursionError) as exc:
+            raise ValueError(f"{prefix}: invalid expect.regex: {exc}") from exc
+    if "json_equals" in expected:
+        try:
+            _validate_json_value(expected["json_equals"], set())
+        except RecursionError as exc:
+            raise ValueError(f"{prefix}: expect.json_equals exceeds supported nesting") from exc
+        except ValueError as exc:
+            raise ValueError(f"{prefix}: invalid expect.json_equals: {exc}") from exc
+
+
+def _validate_json_value(value: Any, active: set) -> None:
+    kind = type(value)
+    if value is None or kind in (str, bool, int):
+        return
+    if kind is float:
+        if not math.isfinite(value):
+            raise ValueError("numbers must be finite")
+        return
+    if kind not in (list, dict):
+        raise ValueError("values must use plain JSON types")
+    if kind is dict and any(type(key) is not str for key in value):
+        raise ValueError("object keys must be strings")
+    identity = id(value)
+    if identity in active:
+        raise ValueError("cyclic values are not JSON")
+    active.add(identity)
+    try:
+        for item in value.values() if kind is dict else value:
+            _validate_json_value(item, active)
+    finally:
+        active.remove(identity)
+
+
+def _unique_json_object(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    value: Dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON object key")
+        value[key] = item
+    return value
+
+
+def _finite_json_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("JSON numbers must be finite")
+    return number
+
+
+def _json_values_equal(actual: Any, wanted: Any) -> bool:
+    pending = [(actual, wanted)]
+    while pending:
+        actual, wanted = pending.pop()
+        if type(actual) in (int, float) and type(wanted) in (int, float):
+            if actual != wanted:
+                return False
+            continue
+        if type(actual) is not type(wanted):
+            return False
+        if isinstance(actual, list):
+            if len(actual) != len(wanted):
+                return False
+            pending.extend(zip(actual, wanted))
+        elif isinstance(actual, dict):
+            if actual.keys() != wanted.keys():
+                return False
+            pending.extend((item, wanted[key]) for key, item in actual.items())
+        elif actual != wanted:
+            return False
+    return True
 
 
 def score_response(response: str, expected: Dict[str, Any]) -> Tuple[bool, List[Dict[str, Any]]]:
@@ -80,6 +199,15 @@ def score_response(response: str, expected: Dict[str, Any]) -> Tuple[bool, List[
     if "max_chars" in expected:
         maximum = int(expected["max_chars"])
         add("max_chars", maximum, len(response.strip()) <= maximum)
+    if "json_equals" in expected:
+        wanted = expected["json_equals"]
+        try:
+            actual = json.loads(response, object_pairs_hook=_unique_json_object,
+                                parse_float=_finite_json_float, parse_constant=_finite_json_float)
+            passed = _json_values_equal(actual, wanted)
+        except (ValueError, OverflowError, RecursionError):
+            passed = False
+        add("json_equals", wanted, passed)
     if not checks:
         add("nonempty", True, bool(response.strip()))
     return all(check["passed"] for check in checks), checks
@@ -251,13 +379,21 @@ def summarize(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 def run_suite(workspace: Path, suite: Dict[str, Any], repeat: int,
               timeout_s: float, poll_s: float, label: str,
               runtime: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    validate_suite(suite)
+    fingerprints = {
+        case["id"]: "sha256:" + hashlib.sha256(json.dumps(
+            {"prompt": case["prompt"], "expect": case.get("expect", {})},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("ascii")).hexdigest()
+        for case in suite["cases"]
+    }
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     rows: List[Dict[str, Any]] = []
     started_at = utc_now()
     for repetition in range(1, repeat + 1):
-        for case in suite["cases"]:
-            task_id = "task-bench-{}-{}-{}".format(
-                run_id, _safe_id(case["id"]), repetition)
+        for case_index, case in enumerate(suite["cases"], 1):
+            task_id = "task-bench-{}-{}-{}-{}".format(
+                run_id, case_index, _safe_id(case["id"]), repetition)
             submitted = time.perf_counter()
             _submit(workspace / "tasks", task_id, case["prompt"])
             response, result_path, wait_ms = _wait_for_result(
@@ -290,7 +426,8 @@ def run_suite(workspace: Path, suite: Dict[str, Any], repeat: int,
         "subject": {"label": label, "workspace": str(workspace.resolve()),
                     "host": socket.gethostname(), "runtime": runtime,
                     "version_stable": None},
-        "suite": {"name": suite["name"], "description": suite.get("description", "")},
+        "suite": {"name": suite["name"], "description": suite.get("description", ""),
+                  "case_fingerprints": fingerprints},
         "configuration": {"repeat": repeat, "timeout_s": timeout_s, "poll_s": poll_s},
         "summary": summarize(rows),
         "cases": rows,
@@ -346,9 +483,40 @@ def _case_outcomes(run: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def _read_case_fingerprints(run: Dict[str, Any], case_ids: set, side: str) -> Optional[Dict[str, str]]:
+    if "case_fingerprints" not in run["suite"]:
+        return None
+    fingerprints = run["suite"]["case_fingerprints"]
+    if (not isinstance(fingerprints, dict) or set(fingerprints) != case_ids
+            or any(not isinstance(value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None
+                   for value in fingerprints.values())):
+        raise ValueError(f"{side}: invalid suite.case_fingerprints; "
+                         "expected one SHA-256 fingerprint for every result case")
+    return fingerprints
+
+
 def compare_runs(baseline: Dict[str, Any], candidate: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
     if baseline["suite"]["name"] != candidate["suite"]["name"]:
         raise ValueError("cannot compare runs from different suites")
+    base_cases = _case_outcomes(baseline)
+    cand_cases = _case_outcomes(candidate)
+    shared = sorted(set(base_cases) & set(cand_cases))
+    base_fingerprints = _read_case_fingerprints(baseline, set(base_cases), "baseline")
+    cand_fingerprints = _read_case_fingerprints(candidate, set(cand_cases), "candidate")
+    suite_warnings = []
+    if base_fingerprints is None:
+        suite_warnings.append("baseline_case_definitions_unknown")
+    if cand_fingerprints is None:
+        suite_warnings.append("candidate_case_definitions_unknown")
+    if base_fingerprints is not None and cand_fingerprints is not None:
+        changed = [case_id for case_id in shared
+                   if base_fingerprints[case_id] != cand_fingerprints[case_id]]
+        if changed:
+            raise ValueError("case definitions differ for shared IDs: "
+                             + ", ".join(repr(case_id) for case_id in changed)
+                             + "; rerun with matching prompts and expectations")
+    if set(base_cases) != set(cand_cases):
+        suite_warnings.append("case_set_changed")
     base = baseline["summary"]
     cand = candidate["summary"]
     regressions = []
@@ -360,9 +528,6 @@ def compare_runs(baseline: Dict[str, Any], candidate: Dict[str, Any]) -> Tuple[D
     c95 = cand["latency_ms"]["p95"]
     if b95 is not None and c95 is not None and c95 > b95 * 1.20:
         regressions.append("latency_p95")
-    base_cases = _case_outcomes(baseline)
-    cand_cases = _case_outcomes(candidate)
-    shared = sorted(set(base_cases) & set(cand_cases))
     regressed = [c for c in shared
                  if base_cases[c]["all_passed"] and not cand_cases[c]["all_passed"]]
     recovered = [c for c in shared
@@ -406,6 +571,11 @@ def compare_runs(baseline: Dict[str, Any], candidate: Dict[str, Any]) -> Tuple[D
         "candidate": candidate["subject"]["label"],
         "versions": {"baseline": base_runtime, "candidate": cand_runtime},
         "attribution": {"warnings": attribution_warnings, "same_version": same_version},
+        "suite_compatibility": {
+            "shared_case_definitions_verified": bool(shared) and base_fingerprints is not None
+                                                and cand_fingerprints is not None,
+            "warnings": suite_warnings,
+        },
         "regressions": regressions,
         "metrics": {
             "pass_rate": {"baseline": base["pass_rate"], "candidate": cand["pass_rate"]},
@@ -445,6 +615,9 @@ def compare_runs(baseline: Dict[str, Any], candidate: Dict[str, Any]) -> Tuple[D
         "Attribution warnings: " + (", ".join(attribution_warnings)
                                      if attribution_warnings else "none"),
         "Same runtime version: " + ("yes" if same_version else "no"), "",
+        "Shared case definitions verified: " + (
+            "yes" if data["suite_compatibility"]["shared_case_definitions_verified"] else "no"),
+        "Suite warnings: " + (", ".join(suite_warnings) if suite_warnings else "none"), "",
     ])
     return data, report
 
@@ -458,12 +631,61 @@ def write_run(run: Dict[str, Any], output: Path) -> Tuple[Path, Path]:
     return json_path, report_path
 
 
+def _validate_saved_run(data: Any) -> None:
+    if not isinstance(data, dict) or data.get("kind") != "sutando-benchmark-run":
+        raise ValueError("expected a Sutando benchmark run object")
+
+    def require(condition: bool, field: str) -> None:
+        if not condition:
+            raise ValueError(f"invalid benchmark run field: {field}")
+
+    def number(value: Any, field: str) -> None:
+        try:
+            valid = type(value) in (int, float) and math.isfinite(value) and value >= 0
+        except OverflowError:
+            valid = False
+        require(valid, field)
+
+    for field in ("suite", "subject", "summary"):
+        require(isinstance(data.get(field), dict), field)
+    require(isinstance(data["suite"].get("name"), str), "suite.name")
+    require(isinstance(data["subject"].get("label"), str), "subject.label")
+    runtime = data["subject"].get("runtime")
+    if runtime is not None:
+        require(isinstance(runtime, dict), "subject.runtime")
+        require(isinstance(runtime.get("code", {}), dict), "subject.runtime.code")
+    summary = data["summary"]
+    for field in ("attempts", "passed", "no_response"):
+        value = summary.get(field)
+        require(type(value) is int and value >= 0, "summary." + field)
+    number(summary.get("pass_rate"), "summary.pass_rate")
+    require(summary["pass_rate"] <= 1, "summary.pass_rate")
+    require(isinstance(summary.get("latency_ms"), dict), "summary.latency_ms")
+    for field in ("p50", "p95", "max"):
+        latency = summary["latency_ms"]
+        require(field in latency, "summary.latency_ms." + field)
+        if latency[field] is not None:
+            number(latency[field], "summary.latency_ms." + field)
+    require(isinstance(data.get("cases"), list), "cases")
+    for index, row in enumerate(data["cases"]):
+        prefix = f"cases[{index}]"
+        require(isinstance(row, dict), prefix)
+        for field in ("case_id", "status"):
+            require(isinstance(row.get(field), str), prefix + "." + field)
+        require(type(row.get("passed")) is bool, prefix + ".passed")
+        require(type(row.get("repetition")) is int and row["repetition"] > 0, prefix + ".repetition")
+        number(row.get("latency_ms"), prefix + ".latency_ms")
+    _read_case_fingerprints(data, {row["case_id"] for row in data["cases"]}, "saved run")
+
+
 def _load_run(path: Path) -> Dict[str, Any]:
     if path.is_dir():
         path = path / "run.json"
-    data = json.loads(path.read_text())
-    if data.get("kind") != "sutando-benchmark-run":
-        raise ValueError(f"not a Sutando benchmark run: {path}")
+    try:
+        data = json.loads(path.read_text(), object_pairs_hook=_unique_json_object)
+    except RecursionError as exc:
+        raise ValueError("saved-run JSON exceeds supported nesting") from exc
+    _validate_saved_run(data)
     return data
 
 
@@ -501,10 +723,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 2
         return 0 if diagnostics["live_cores"] else 1
     if args.command == "report":
-        print(render_run(_load_run(args.run)), end="")
+        try:
+            report = render_run(_load_run(args.run))
+        except (OSError, ValueError) as exc:
+            print(f"sutando-bench: cannot report run: {exc}", file=sys.stderr)
+            return 2
+        print(report, end="")
         return 0
     if args.command == "compare":
-        data, report = compare_runs(_load_run(args.baseline), _load_run(args.candidate))
+        try:
+            data, report = compare_runs(_load_run(args.baseline), _load_run(args.candidate))
+        except (OSError, ValueError) as exc:
+            print(f"sutando-bench: cannot compare runs: {exc}", file=sys.stderr)
+            return 2
         print(report, end="")
         if args.output:
             args.output.mkdir(parents=True, exist_ok=True)
@@ -519,11 +750,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("sutando-bench: repeat, timeout, and poll must be positive", file=sys.stderr)
         return 2
     try:
+        suite = load_suite(args.suite)
+    except (OSError, ValueError) as exc:
+        print(f"sutando-bench: invalid suite: {exc}; fix the suite and retry", file=sys.stderr)
+        return 2
+    try:
         runtime_start = probe_runtime(args.sutando_config, args.workspace)
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"sutando-bench: cannot attribute runtime version: {exc}", file=sys.stderr)
         return 2
-    suite = load_suite(args.suite)
     run = run_suite(args.workspace, suite, args.repeat, args.timeout, args.poll,
                     args.label, runtime_start)
     try:

@@ -1,0 +1,58 @@
+{
+  "app": "Research Desk",
+  "summary": "Members and their own agents propose findings with a source; a finding stays proposed until a person accepts it, and the acceptance is a row whose author the server stamps. A report view assembles the accepted findings.",
+  "databases": [
+    {
+      "name": "Research Desk — Findings",
+      "template": "blank",
+      "role": "primary",
+      "props": [
+        { "name": "Topic", "type": "text" },
+        { "name": "Source", "type": "url", "note": "Where the finding comes from. The page refuses a proposal without one." },
+        { "name": "Basis", "type": "text", "note": "On what basis: the evidence or the passage the claim rests on." },
+        { "name": "Change", "type": "text", "note": "What this finding adds to or changes in the report." },
+        {
+          "name": "State",
+          "type": "status",
+          "options": [
+            { "name": "Proposed", "group": "todo" },
+            { "name": "Accepted", "group": "done" },
+            { "name": "Rejected", "group": "done" }
+          ],
+          "note": "A convenience for the table and board views. The page shows a finding as accepted only from a person's row in Reviews, never from this column."
+        },
+        { "name": "Created by", "type": "created_by" }
+      ],
+      "views": [
+        { "layout": "table", "name": "All findings" },
+        { "layout": "board", "name": "By state", "groupBy": "State" }
+      ],
+      "summon_policy": "owner"
+    },
+    {
+      "name": "Research Desk — Reviews",
+      "template": "blank",
+      "role": "decisions",
+      "props": [
+        { "name": "Finding", "type": "text", "note": "The finding's row id. The page writes it; a review that names no finding is ignored." },
+        {
+          "name": "Verdict",
+          "type": "select",
+          "options": [{ "name": "Accepted" }, { "name": "Rejected" }]
+        },
+        { "name": "Note", "type": "text" },
+        { "name": "Created by", "type": "created_by" }
+      ],
+      "views": [
+        { "layout": "table", "name": "All reviews" }
+      ],
+      "summon_policy": "off"
+    }
+  ],
+  "agent_hook": "send-task",
+  "notes": [
+    "The title column of each database is created by the blank template; read its name from databases.list, never assume it.",
+    "Who accepted a finding is the Created by of its latest Reviews row from a person: the server stamps it, so it cannot be typed in. A review written by an agent is shown but never counts as an acceptance.",
+    "'Ask my agent' uses artifact.agent.sendTask: the viewer confirms the exact text, the task goes to their own agent's private DM, and nothing about its progress comes back to the page. The agent's findings arrive as new proposed rows if it writes them here."
+  ]
+}

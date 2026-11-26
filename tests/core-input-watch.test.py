@@ -21,6 +21,7 @@ isolate_os_environ()
 import importlib.util
 import json
 import os
+import sys
 import unittest
 from pathlib import Path as _Path
 
@@ -555,6 +556,58 @@ class TestTheBusyFooterIsNotTheTurnRow(unittest.TestCase):
         self.assertEqual(self.verdicts(pane), (None, "running", "busy:working"))
 
 
+# A finished turn whose verb is not ASCII, under the agent's own reply quoting a key hint.
+_ACCENTED_DONE = "  ✻ Sautéed for 1m 4s · done 9:32 AM · 1 shell still running"
+_QUOTED_HINT_TAIL = (
+    '  Enter to accept the change", indented under a menu row. It checks that this line still raises'
+    " no alert today, so a\n"
+    "  later change in that behaviour will show up as a test failure.\n"
+    "  The fix itself is unchanged. All 10 tests in that file pass and the repo's review checks pass.\n"
+    + _ACCENTED_DONE + "\n")
+
+
+class TestNonAsciiTurnVerb(unittest.TestCase):
+    """The CLI's turn verb may carry any letter ("Sautéed", "Élucidating"): its row still
+    cuts the transcript above it off from the live region."""
+
+    def test_finished_turn_with_an_accented_verb_quoting_a_hint_is_idle(self):
+        pane = (_QUOTED_HINT_TAIL + _IDLE_FOOTER
+                + "\n  Sutando: idle                                                     [-]")
+        self.assertIsNone(classify(pane))
+
+    def test_accented_completion_row_is_a_finished_turn(self):
+        for row in (_ACCENTED_DONE, _ACCENTED_DONE.split(" · 1 shell")[0]):
+            with self.subTest(row=row):
+                m = _mod.TURN_DONE.search(row)
+                self.assertIsNotNone(m)
+                self.assertEqual(m.group("dur"), "1m 4s")
+
+    def test_accented_spinner_is_a_spinner_not_a_finished_turn(self):
+        pg = sys.modules["delivery.pane_gate"]
+        row = "✳ Élucidating… (5s · ↓ 237 tokens)"
+        self.assertTrue(pg._SPINNER_ROW.search(row))
+        self.assertFalse(_mod.TURN_DONE.search(row))
+        self.assertIsNotNone(pg.turn_status([row, "  ⏵⏵ bypass permissions on"]))
+
+    def test_decomposed_accents_and_combining_marks_read_as_letters(self):
+        # "Saute\u0301ed" composes under NFC; Cyrillic stress (U+0301) has no precomposed form.
+        for verb in ("Saute\u0301ed", "Ва\u0301рил"):
+            with self.subTest(verb=verb):
+                done = f"  ✻ {verb} for 1m 4s · done 9:32 AM · 1 shell still running"
+                pane = (_QUOTED_HINT_TAIL.replace(_ACCENTED_DONE, done) + _IDLE_FOOTER
+                        + "\n  Sutando: idle                                                     [-]")
+                self.assertIsNone(classify(pane))
+                self.assertEqual(_mod.TURN_DONE.match(done).group("dur"), "1m 4s")
+
+    def test_a_decomposed_spinner_is_still_the_live_turn(self):
+        pg = sys.modules["delivery.pane_gate"]
+        for verb in ("E\u0301lucidating", "Ва\u0301рю"):
+            row = f"✳ {verb}… (5s · ↓ 237 tokens)"
+            with self.subTest(verb=verb):
+                self.assertFalse(_mod.TURN_DONE.search(row))
+                self.assertIsNotNone(pg.turn_status(["✻ Worked for 2s", row, "  ⏵⏵ bypass permissions on"]))
+
+
 class TestUnobservedProbeIsNotHung(unittest.TestCase):
     """An unobserved process probe (tmux refused the client, binary missing) must
     hold, never become the RECOVER-facing `hung`; only a SEEN session with stale
@@ -707,6 +760,13 @@ class TestMovingTurnIsNotHung(unittest.TestCase):
         st, *_ = compose_state(_TURN_A, "unknown", True, prev_pane=_TURN_A)
         self.assertEqual(st, "hung")
 
+    def test_a_turn_drawn_as_its_spinner_alone_is_in_flight(self):
+        # Claude Code 2.1.322 prints no "esc to interrupt" while a turn runs.
+        a, b = (t.replace(" · esc to interrupt", "") for t in (_TURN_A, _TURN_B))
+        self.assertFalse(_mod.cli_wedge.frame_working(b))
+        self.assertEqual(compose_state(b, "unknown", True, prev_pane=a)[0], "running")
+        self.assertEqual(compose_state(a, "unknown", True, prev_pane=a)[0], "hung")
+
     def test_the_first_poll_has_no_motion_to_see(self):
         st, *_ = compose_state(_TURN_A, "unknown", True)
         self.assertEqual(st, "hung")
@@ -805,7 +865,7 @@ class TestMovingTurnIsNotHung(unittest.TestCase):
                 patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
                 patch.object(_mod.time, "monotonic", lambda: now[0]), \
                 patch.object(_mod.time, "time", lambda: wall_now[0]), \
-                patch.object(_mod.time, "sleep", _sleep), \
+                patch.object(_mod, "_sleep", _sleep), \
                 patch.object(sys, "argv", argv), self.assertRaises(_Stop):
             main()
         return states
@@ -1422,7 +1482,7 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
         self.assertEqual(payload["kind"], "fable-limit")
         self.assertNotIn("auto_answered", payload)
 
-    def _ticks(self, panes, extra_args=()):
+    def _ticks(self, panes, extra_args=(), fail_keys=()):
         """Run main() across len(panes) real loop iterations (no --once): one
         capture() result per tick, time.sleep stubbed to stop once every pane
         has been consumed."""
@@ -1459,8 +1519,9 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
                 patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
                 patch.object(_mod, "gateway_alive", lambda *a: True), \
                 patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
-                patch.object(_mod, "send_keys", lambda s, sess, k: sent.append((s, sess, k)) or True), \
-                patch.object(_mod.time, "sleep", fake_sleep), \
+                patch.object(_mod, "send_keys",
+                             lambda s, sess, k: sent.append((s, sess, k)) or k not in fail_keys), \
+                patch.object(_mod, "_sleep", fake_sleep), \
                 patch.object(sys, "argv", argv):
             try:
                 main()
@@ -1490,6 +1551,69 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
             ("/tmp/x.sock", "sutando-core", ("/model opus", "Enter")),
             ("/tmp/x.sock", "sutando-core", ("continue", "Enter")),
         ])
+
+
+class TestResumeAfterSignIn(unittest.TestCase):
+    """A /login on the core pane leaves the CLI idle with the refused /startup never re-run, so
+    nothing re-arms its watcher or crons; the monitor types the boot prompt once."""
+    _ticks = TestMainAutoAnswerWiring._ticks
+    SIGNED_IN = _REFUSED_TURNS + "❯ /login\n  ⎿  Login successful\n" + _IDLE_FOOTER
+    BOOT = ("/tmp/x.sock", "sutando-core", ("/startup", "Enter"))
+
+    def test_the_boot_prompt_is_typed_once_after_a_sign_in(self):
+        self.assertEqual(self._ticks([self.SIGNED_IN, self.SIGNED_IN]), [self.BOOT])
+
+    def test_a_turn_after_the_sign_in_is_not_re_prompted(self):
+        ran = self.SIGNED_IN.replace(_IDLE_FOOTER, _STARTUP_OK_TURN + _IDLE_FOOTER)
+        self.assertEqual(self._ticks([ran]), [])
+
+    def test_a_draft_a_seat_or_no_auto_answer_is_never_typed_into(self):
+        draft = self.SIGNED_IN.replace("❯ \n", "❯ half-typed reply\n")
+        self.assertEqual(self._ticks([draft]), [])
+        self.assertEqual(self._ticks([self.SIGNED_IN], ["--seat", "worker-1"]), [])
+        self.assertEqual(self._ticks([self.SIGNED_IN], ["--no-auto-answer"]), [])
+
+    def test_a_refused_boot_prompt_is_not_retyped_within_the_cooldown(self):
+        again = self.SIGNED_IN.replace(_IDLE_FOOTER, _REFUSED_TURNS + _IDLE_FOOTER)
+        self.assertEqual(self._ticks([self.SIGNED_IN, again, self.SIGNED_IN]), [self.BOOT])
+
+    def test_the_live_v2_1_275_idle_frame_after_a_sign_in_is_resumed(self):
+        live = "Login successful\n" + TestComposerText.LIVE_PLACEHOLDER_PANE
+        self.assertEqual(self._ticks([live]), [self.BOOT])
+
+    def test_the_words_quoted_outside_a_login_result_are_not_resumed(self):
+        for quoted in ("❯ check the auth log\n⏺ Bash(tail -1 auth.log)\n  ⎿  Login successful\n",
+                       "❯ did it work?\n● The CLI printed this line:\n  Login successful\n",
+                       "❯ the worker said:\n  Login successful\n  is that enough?\n",
+                       "❯ the worker printed:\n  ⎿ Login successful\n  was that enough?\n"):
+            with self.subTest(quoted):
+                self.assertEqual(self._ticks([_REFUSED_TURNS + quoted + _IDLE_FOOTER]), [])
+
+    def test_one_capture_drives_one_actor_and_resume_waits_for_a_fresh_one(self):
+        # A pending model-switch follow-up and a sign-in on the same frame: the follow-up
+        # goes first; the boot prompt is judged again on the next capture.
+        both = "❯ /login\n  ⎿  Login successful\n" + _IDLE
+        sent = self._ticks([_FABLE_REFUSED_MONITOR, both, both])
+        self.assertEqual([k for _s, _x, k in sent],
+                         [("/model opus", "Enter"), ("continue", "Enter"), ("/startup", "Enter")])
+        sent = self._ticks([_FABLE_REFUSED_MONITOR, both])
+        self.assertEqual([k for _s, _x, k in sent], [("/model opus", "Enter"), ("continue", "Enter")])
+
+    def test_a_failed_follow_up_send_still_spends_the_capture(self):
+        # The follow-up's Enter failed: "continue" may sit staged in the composer, so the
+        # boot prompt must wait for a fresh capture instead of submitting "continue/startup".
+        both = "❯ /login\n  ⎿  Login successful\n" + _IDLE
+        sent = self._ticks([_FABLE_REFUSED_MONITOR, both], fail_keys=(("continue", "Enter"),))
+        self.assertEqual([k for _s, _x, k in sent], [("/model opus", "Enter"), ("continue", "Enter")])
+
+    def test_resume_step_skips_codex_and_honours_the_cooldown(self):
+        rs = _mod.resume_step
+        self.assertEqual(rs("idle-ready", self.SIGNED_IN, None, "", None, 0.0), ("/startup", "Enter"))
+        self.assertIsNone(rs("idle-ready", self.SIGNED_IN, "codex", "", None, 0.0))
+        self.assertIsNone(rs("blocked-known", self.SIGNED_IN, None, "", None, 0.0))
+        self.assertIsNone(rs("idle-ready", self.SIGNED_IN, None, "", 0.0, 1.0))
+        self.assertEqual(rs("idle-ready", self.SIGNED_IN, None, "", 0.0, _mod.TYPED_ANSWER_COOLDOWN_S + 1),
+                         ("/startup", "Enter"))
 
 
 class TestSendKeys(unittest.TestCase):
@@ -1573,6 +1697,34 @@ class TestStyledPermissionCaretRow(unittest.TestCase):
         self.assertEqual(tui_gate.keys_for(req, prompt, state), ["Enter"])
         req.chosen_action = "deny"
         self.assertEqual(tui_gate.keys_for(req, prompt, state), ["Down", "Down", "Enter"])
+
+
+class TestStyledWriteFileDialog(unittest.TestCase):
+    """#5544 verification: a Write dialog asks "Do you want to create", which no permission
+    signature names, so only its caret row makes it a gate; lose it and the card is Open terminal."""
+
+    STYLED = (
+        " Create file\n"
+        "\x1b[38;5;246m" + "╌" * 60 + "\x1b[39m\n"
+        " notes/plan.md\n"
+        "   1 # Plan\n"
+        "\x1b[38;5;246m" + "╌" * 60 + "\x1b[39m\n"
+        " Do you want to create plan.md?\n"
+        " \x1b[38;5;153m❯\x1b[39m \x1b[38;5;246m1. \x1b[38;5;153mYes\x1b[39m\n"
+        "   \x1b[38;5;246m2. \x1b[39mYes, allow all edits during this session (shift+tab)\n"
+        "   \x1b[38;5;246m3. \x1b[39mNo\n"
+        "\n"
+        " \x1b[38;5;246mEsc to cancel · Tab to amend\x1b[39m\n")
+
+    def test_the_write_card_offers_yes_that_types_into_the_dialog(self):
+        from hitl import tui_gate
+        plain = _mod._ANSI_SGR.sub("", self.STYLED)
+        state, detail, prompt, kind = compose_state(plain, "idle", True, styled_pane=self.STYLED)
+        req = tui_gate.requirement_for(state, kind, prompt, "s", detail, "fallback")
+        self.assertEqual(req.kind, "permission")
+        self.assertEqual([a.label for a in req.actions], ["No", "Yes", "Open terminal"])
+        req.chosen_action = "allow"
+        self.assertEqual(tui_gate.keys_for(req, prompt, state), ["Enter"])
 
 
 class TestEnsureTmuxOnPath(unittest.TestCase):
@@ -2066,6 +2218,50 @@ class TestLiveIdleSeatUnderAPinnedBanner(unittest.TestCase):
         self.assertFalse(stale)
         st = compose_state(_LIVE_IDLE_SEAT, "idle", True, limit_stale=stale, styled_pane=_LIVE_IDLE_SEAT)
         self.assertEqual((st[0], st[3]), ("blocked-human", "usage-limit"))
+
+
+class TestUsageLimitContinuingShortly(unittest.TestCase):
+    """Near the reset the CLI's usage-limit footer reads "Usage limit reached · limit resets <t>" over
+    "Continuing shortly · Esc to cancel". The captured tail often holds only the second row, which
+    read as an unknown prompt: a held seat was carded as "awaiting user: unknown" instead of as its
+    usage limit. The panes are synthetic, reduced from a real capture."""
+
+    FULL = "  Usage limit reached · limit resets 3pm\n  Continuing shortly · Esc to cancel\n"
+    ROW_ONLY = {
+        "status line, empty composer":
+            "  Agent: request failed\n  ❯\n  Continuing shortly · Esc to cancel\n",
+        "status line, no composer":
+            "  Agent: request failed\n  Continuing shortly · Esc to cancel\n",
+    }
+
+    def test_the_full_footer_is_the_usage_limit(self):
+        self.assertEqual(classify(self.FULL)[0], "usage-limit")
+        self.assertEqual(compose_state(self.FULL, "idle", True)[:2],
+                         ("blocked-human", "awaiting user: usage-limit"))
+
+    def test_the_continuing_row_alone_is_the_usage_limit_not_an_unknown_prompt(self):
+        for name, pane in self.ROW_ONLY.items():
+            with self.subTest(name):
+                self.assertEqual(classify(pane)[0], "usage-limit")
+                self.assertEqual(compose_state(pane, "idle", True)[1], "awaiting user: usage-limit")
+
+    def test_the_footer_under_a_session_limit_stays_that_screen(self):
+        pane = "  You've hit your session limit · resets 3pm\n  Continuing shortly · Esc to cancel\n"
+        self.assertEqual(classify(pane)[0], "session-limit")
+
+    def test_the_earlier_phase_of_the_same_footer_reads_the_same(self):
+        for row in ("Continuing automatically at 3pm · Esc to cancel",
+                    "Continuing automatically shortly · Esc to cancel"):
+            with self.subTest(row):
+                self.assertEqual(classify(f"  Agent: idle\n  {row}\n")[0], "usage-limit")
+
+    def test_only_the_cancellable_row_is_the_limit(self):
+        """A "Continuing shortly" row that asks for Enter is not the footer and keeps its own reading."""
+        pane = "  Something new\n  Continuing shortly · Press Enter to retry now\n"
+        self.assertNotEqual(classify(pane)[0], "usage-limit")
+
+    def test_a_real_dialog_under_the_footer_is_that_dialog(self):
+        self.assertEqual(classify(self.FULL + _LOGIN_MENU)[0], "login")
 
 
 if __name__ == "__main__":

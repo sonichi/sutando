@@ -19,7 +19,8 @@ workspace wiring:
      runpy via the deprecated remote-relay-bridge name, and the mock-gateway
      test harness (which loads the file several times under different env and
      mutates module attributes) — sees exactly the same module-level API and
-     import-time env parsing as the pre-switch monolith.
+     import-time env parsing as the pre-switch monolith. A pool worker's declared
+     Sparrow bridge (`sparrow_agent_bridge.py`) runs this file too, as its lane.
 
 Revert: restore this file's previous revision from git (the pre-switch
 monolith is the parent commit of the one introducing this shim). No other
@@ -44,8 +45,10 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
         sys.path.insert(0, _p)
 
 from proactive_routing import (BRIDGE_CHANNELS, body_target_channel,  # noqa: E402
-                               proactive_destination, should_claim_proactive)
+                               lane_claims_card, lane_claims_proactive, proactive_destination,
+                               should_claim_proactive)
 from workspace_default import resolve_workspace  # noqa: E402
+import worker_lane  # noqa: E402
 from util_paths import claude_home_path, shared_personal_path  # noqa: E402
 from voice_room_membership import (CHECK_DIR_NAME, VERDICT_TTL_S,  # noqa: E402
                                    RoomMembershipVerifier, members_from_room_op)
@@ -54,7 +57,9 @@ WS = resolve_workspace()
 
 from ag2_sparrow._dirs import set_dirs  # noqa: E402
 
-set_dirs(task_dir=WS / "tasks", result_dir=WS / "results", state_dir=WS / "state")
+# A converted worker's lane runs on that worker's own tasks/ and results/; every other lane on the shared ones.
+_TASK_DIR, _RESULT_DIR, _OWN_DIRS = worker_lane.lane_dirs(WS, (os.environ.get("GATEWAY_INSTANCE") or "").strip())
+set_dirs(task_dir=_TASK_DIR, result_dir=_RESULT_DIR, state_dir=WS / "state")
 
 from task_envelope import stamp_text  # noqa: E402  (adapter-edge stamper)
 from ag2_sparrow.local_task_protocol import set_task_stamper  # noqa: E402
@@ -110,6 +115,55 @@ def _sutando_apply_worker_label_overrides(labels: dict, config_version: int,
 # An install without worker-pool has no callback and makes no profile read.
 _SUTANDO_WORKER_LABEL_APPLIER = (_sutando_apply_worker_label_overrides
                                  if _WORKER_LABEL_SCRIPT.is_file() else None)
+
+def _sutando_core_recovery():
+    """state/core-recovery.json through its one owner (src/core_recovery_state.py)."""
+    import core_recovery_state
+    return core_recovery_state.read(WS)
+
+
+# The core's record rides the core's lanes' heartbeats; a pool worker's lane is not the core.
+_SUTANDO_CORE_RECOVERY_READER = None if _OWN_DIRS else _sutando_core_recovery
+
+
+def _sutando_runtime_profile():
+    """The core's runtime_profile.v1 block through its one owner (src/runtime_profile.py)."""
+    import runtime_profile
+    return runtime_profile.read(WS)
+
+
+# Like the recovery record: the core's lanes carry the core's profile, a pool worker's lane none.
+_SUTANDO_RUNTIME_PROFILE_READER = None if _OWN_DIRS else _sutando_runtime_profile
+
+_QUOTA_TRACKER_MANIFEST = _REPO / "skills" / "quota-tracker" / "manifest.json"
+
+
+def _sutando_quota_status():
+    """The core's quota block (src/quota_status.py); a Codex core has none."""
+    import core_recovery_state
+    import quota_status
+    return quota_status.read(WS, runtime=core_recovery_state.recorded_runtime(WS))
+
+
+def _sutando_quota_status_reader():
+    """The debounced reader, or None; a broken quota module costs the block, never the start."""
+    try:
+        import skill_config
+        if _OWN_DIRS or not skill_config.enabled("QUOTA_STATUS_PUBLISH", _QUOTA_TRACKER_MANIFEST):
+            return None
+        import quota_status
+        return quota_status.Debounced(_sutando_quota_status)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[remote-gateway-bridge] quota status off: {type(exc).__name__}: {exc}",
+              file=sys.stderr, flush=True)
+        return None
+
+
+# Like the recovery record, the core's lanes only; off without quota-tracker or with its switch off.
+_SUTANDO_QUOTA_STATUS_READER = _sutando_quota_status_reader()
+
+# Logged recovery commands name the workspace through its resolver, never its absolute path.
+_SUTANDO_WORKSPACE_RESOLVER = "bash scripts/sutando-config.sh workspace"
 
 # Runtime self-report, injected BEFORE the exec (anything after it is
 # unreachable when the exec'd source's own __main__ guard fires; see #3285).
@@ -299,7 +353,10 @@ def _ag2space_proactive_room_gate(path: Path, room: str) -> bool:
 
 def _ag2space_proactive_claim_gate(path: Path) -> bool:
     """Claim when routing says the owner lives here; otherwise claim only what
-    no other bridge will ever take (see _routed_bridge_still_owns)."""
+    no other bridge will ever take (see _routed_bridge_still_owns). A file a pool
+    worker's session stamped is that worker's own lane's, never a core lane's."""
+    if not lane_claims_proactive(path.name):
+        return False
     if _tagged_voice_result(path.name) and not _voice_result_room_verified(path):
         return False
     dest = proactive_destination(path.name)
@@ -374,9 +431,14 @@ def _lane_dedupe_gate(task: dict):
     """A message another of this install's lanes queued, or one the lane its owner names will answer;
     seats are other agents, never asked."""
     import lane_dedupe
+    # The startup worker scopes the claim even without a record; else this lane alone (never a drop).
+    group = _LANE_WORKER or lane_dedupe.lane_scope(GATEWAY_INSTANCE)  # noqa: F821
     try:
-        from connections import event_owner_lanes
-        owners = event_owner_lanes(task, WS)
+        from connections import event_owner_lanes, lane_agent_group
+        agent = _LANE_WORKER or lane_agent_group(GATEWAY_INSTANCE, WS)  # noqa: F821
+        if agent is not None:
+            group = agent
+        owners = event_owner_lanes(task, WS, group=agent)
     except Exception as e:  # noqa: BLE001 - no owner read keeps the first-come guard
         _log(f"lane dedupe: owner lanes unreadable ({type(e).__name__}); first lane answers")  # noqa: F821
         owners = []
@@ -385,7 +447,8 @@ def _lane_dedupe_gate(task: dict):
     wait_s = None if deadline is None else max(0.0, deadline - time.monotonic())
     try:
         return lane_dedupe.duplicate_reason(WS / "state", task, GATEWAY_INSTANCE, log=_log,  # noqa: F821
-                                            owner_lanes=owners, wait_s=wait_s, defer=mode["defer"])
+                                            owner_lanes=owners, wait_s=wait_s, defer=mode["defer"],
+                                            group=group)
     except lane_dedupe.OwnerPending:
         return INTAKE_DEFER  # noqa: F821
 
@@ -500,30 +563,62 @@ def _lane_worker() -> str:
     return worker
 
 
-def _worker_lane_claims_nothing(path: Path) -> bool:
-    """A worker's own lane is reply-only: it shares results/ with the core's lanes, so a proactive
-    file there is the core's, and posting it would speak as the worker."""
-    return False
+def _lane_route_argv() -> "list[str]":
+    return worker_lane.route_argv(WS, RESULTS_DIR)  # noqa: F821
+
+
+def _lane_router(worker: str, argv: "list[str]"):
+    return worker_lane.router(worker, argv, lambda line: _log(line))  # noqa: F821
 
 
 def _install_worker_lane(worker: str) -> None:
-    """This lane runs as `worker`'s own agent: every task it queues is addressed to that worker,
-    and it claims no proactive file."""
-    global TASK_ADDRESSEE, PROACTIVE_CLAIM_GATE
-    TASK_ADDRESSEE = lambda: worker  # noqa: E731
-    PROACTIVE_CLAIM_GATE = _worker_lane_claims_nothing
+    """This lane runs as `worker`'s own agent: the shared worker wiring, in this module's namespace."""
+    worker_lane.install(globals(), worker, workspace=WS, results_dir=RESULTS_DIR,  # noqa: F821
+                        log=lambda line: _log(line), who=f"lane {GATEWAY_INSTANCE}", own=_OWN_DIRS)  # noqa: F821
 
 
 # Read once: a lane's row names its worker for the life of the process (a change relaunches it).
 _LANE_WORKER = _lane_worker() if GATEWAY_INSTANCE else ""  # noqa: F821
 if _LANE_WORKER:
-    _log(f"lane {GATEWAY_INSTANCE} runs as worker {_LANE_WORKER}'s own agent: its tasks go to that worker, "  # noqa: F821
-         "and it posts no proactive messages")
     _install_worker_lane(_LANE_WORKER)
+
+
+def _ag2space_card_claim(req) -> bool:
+    """A card a worker's session asked is its own lane's to post (one lane of a worker with agents on
+    several servers: `worker_lane.is_worker_card_lane`); any other card the primary's."""
+    subject = getattr(req, "subject", None)
+    by_worker = subject.get("by_worker") if isinstance(subject, dict) else None
+    if not lane_claims_card(by_worker, _LANE_WORKER, primary=owns_unaddressed()):  # noqa: F821
+        return False
+    if not _LANE_WORKER:
+        return True
+    room = getattr(req, "room", "")
+    room = room if isinstance(room, str) else ""
+    if worker_lane.is_worker_card_lane(GATEWAY_INSTANCE, _LANE_WORKER, WS, room):  # noqa: F821
+        return True
+    if worker_lane.card_lane(_LANE_WORKER, room, WS) is None:  # noqa: F821
+        _card_undeliverable(req, room)
+    return False
+
+
+_CARDS_TOLD_UNDELIVERABLE: set = set()
+
+
+def _card_undeliverable(req, room: str) -> None:
+    """A worker's card no lane of it can post (none serves its room's server): said once per card."""
+    rid = str(getattr(req, "id", "") or "")
+    if rid in _CARDS_TOLD_UNDELIVERABLE:
+        return
+    _CARDS_TOLD_UNDELIVERABLE.add(rid)
+    _log(f"ERROR: lane {GATEWAY_INSTANCE}: decision card {rid} of worker {_LANE_WORKER} is undeliverable: "  # noqa: F821
+         f"no serving lane of it reaches {room or 'the owner DM'}")
+
+
+CARD_CLAIM = _ag2space_card_claim
 STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821
                    and not gateway_credential_sources.is_seat(os.environ) else None)  # noqa: F821
 
 if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it
     __name__ = "__main__"
     VOICE_ROOM_VERIFIER.start()
-    main()  # noqa: F821  (defined by the exec above)
+    run()  # noqa: F821  (defined by the exec above)

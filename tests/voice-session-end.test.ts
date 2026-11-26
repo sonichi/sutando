@@ -2,9 +2,11 @@
 // Run: npx tsx --test --test-force-exit tests/voice-session-end.test.ts
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { parse as parseDotenv } from 'dotenv';
 
 const TMP = mkdtempSync(join(tmpdir(), 'session-end-'));
 process.env.SUTANDO_WORKSPACE = TMP;
@@ -12,7 +14,7 @@ process.env.SUTANDO_TEST_MODE = '1';
 for (const d of ['tasks', 'results', 'state']) mkdirSync(join(TMP, d), { recursive: true });
 after(() => rmSync(TMP, { recursive: true, force: true }));
 
-const { createSessionEndPipeline, createCallEndReporter, sessionEndTask, worthATask, SESSION_END_MAX_CHARS } = await import('../src/voice-session-end.js');
+const { createSessionEndPipeline, createCallEndReporter, sessionEndTask, worthATask, SESSION_END_MAX_CHARS, callEndInstruction, DEFAULT_CALL_END_INSTRUCTION } = await import('../src/voice-session-end.js');
 const { submitVoiceSessionEndTask, setVoiceSessionOrigin, snapshotVoiceSessionOrigin, endVoiceClientSession, setVoiceTaskOriginResolver, voiceTaskOrigin, forwardOfflineVoiceResult } = await import('../src/task-bridge.js');
 const { roomOriginFromTaskHeader } = await import('../skills/ag2space-voice/room-binding.js');
 
@@ -83,9 +85,95 @@ describe('the session-end task', () => {
 		const body = readFileSync(join(TMP, 'tasks', `${id}.txt`), 'utf-8');
 		assert.match(body, /^source: voice$/m);
 		assert.match(body, /^priority: low$/m);
+		// The call-end lifecycle wrote it, not the owner: every header line above task:, as
+		// tests/task-watch-owner.test.py's call-end fixture has them.
+		const head = body.slice(0, body.indexOf('\ntask: ')).split('\n')
+			.filter((l) => !/^(id|timestamp|local_time|envelope_hmac): /.test(l))
+			.map((l) => l.replace(/^user_id: .+$/, 'user_id: *'));
+		assert.deepEqual(head, ['source: voice', 'interaction_type: system_event', 'media_form: live_stream',
+			'channel_id: local-voice', 'user_id: *', 'access_tier: owner', 'priority: low']);
+		assert.doesNotMatch(body, /realtime_audio/);
 		assert.match(body, /^task: VOICE_SESSION_ENDED:/m);
 		assert.match(body, /--- the session's spoken lines[^\n]*---\n[\s\S]*user: check PR 5308/);
 		assert.equal(readdirSync(join(TMP, 'tasks')).filter((f) => f.endsWith('.txt')).length, 1);
+	});
+
+	const fixture = () => ({ sessionId: 's1', reason: 'client_disconnect', startedAt: Date.UTC(2026, 9, 10, 18, 0), endedAt: Date.UTC(2026, 9, 10, 18, 12),
+		durationMs: 12 * 60_000, turnCount: 4, toolCallCount: 1,
+		items: [item('user', 'check PR 5308'), item('tool_call', '{}'), item('assistant', 'It is merged.')] });
+	const facts = 'VOICE_SESSION_ENDED: the voice session s1 ended (client_disconnect). ' +
+		'2026-10-10T18:00:00.000Z to 2026-10-10T18:12:00.000Z, about 12 min, 4 turns, 1 tool calls. ';
+
+	it('the default instruction is today\'s text, byte for byte', () => {
+		const today = 'If the user asked for, or agreed to, something that was not finished on the call (a follow-up: something to look up, ' +
+			'send, write, remind them of, or do later), do it now, or schedule it if it has a time, and reply with what you did. ' +
+			'Keep any durable fact from the call (a preference, a commitment, a follow-up) in memory. ' +
+			'If the call leaves nothing to do, answer with [no-send].';
+		assert.equal(DEFAULT_CALL_END_INSTRUCTION, today);
+		assert.equal(sessionEndTask(fixture()).summary, `${facts}Read the spoken lines below. ${today}`);
+	});
+
+	it('a host instruction replaces only the instruction', () => {
+		const { summary, transcript } = sessionEndTask(fixture(), 'List them.');
+		assert.equal(summary, `${facts}Read the spoken lines below. List them.`);
+		assert.equal(transcript, sessionEndTask(fixture()).transcript);
+		assert.equal(transcript, 'user: check PR 5308\nassistant: It is merged.');
+	});
+
+	it('callEndInstruction: the host\'s variable when set, today\'s text when unset or blank', () => {
+		assert.equal(callEndInstruction({}), DEFAULT_CALL_END_INSTRUCTION);
+		assert.equal(callEndInstruction({ SUTANDO_VOICE_CALL_END_INSTRUCTION: '  ' }), DEFAULT_CALL_END_INSTRUCTION);
+		assert.equal(callEndInstruction({ SUTANDO_VOICE_CALL_END_INSTRUCTION: ' do Y ' }), 'do Y');
+	});
+
+	it('.env.example\'s line, uncommented, reads the same in startup\'s bash source and in voice-agent\'s dotenv', () => {
+		// startup-runtime.sh runs `set -a; source .env` under set -e: an unquoted space or apostrophe aborts startup.
+		const example = readFileSync(join(import.meta.dirname, '..', '.env.example'), 'utf-8');
+		const line = example.split('\n').find((l) => l.startsWith('# SUTANDO_VOICE_CALL_END_INSTRUCTION='));
+		assert.ok(line, '.env.example documents the variable as a commented example');
+		const file = join(TMP, 'call-end-example.env');
+		const text = `A=1\n${line.slice(2)}\nB=after\n`;
+		writeFileSync(file, text);
+		const r = spawnSync('bash', ['-c', 'set -e; set -a; source "$1"; set +a; printf "%s|%s" "$SUTANDO_VOICE_CALL_END_INSTRUCTION" "$B"', '_', file], {
+			encoding: 'utf-8', env: { PATH: process.env.PATH ?? '/usr/bin:/bin' },
+		});
+		assert.equal(r.status, 0, `bash could not source the uncommented line: ${r.stderr}`);
+		const parsed = parseDotenv(text);
+		assert.match(parsed.SUTANDO_VOICE_CALL_END_INSTRUCTION, /\[no-send\]/);
+		assert.equal(r.stdout, `${parsed.SUTANDO_VOICE_CALL_END_INSTRUCTION}|after`);
+		assert.equal(parsed.B, 'after');
+		// The example itself holds nothing bash would expand inside double quotes.
+		assert.doesNotMatch(line.slice(line.indexOf('=') + 1), /[$`\\]/);
+	});
+
+	// Both loaders, as startup and voice-agent run them: bash `set -a; source` and dotenv's parse.
+	const loadBoth = (name: string, valueSource: string) => {
+		const file = join(TMP, `${name}.env`);
+		const text = `SUTANDO_VOICE_CALL_END_INSTRUCTION=${valueSource}\n`;
+		writeFileSync(file, text);
+		const r = spawnSync('bash', ['-c', 'set -e; set -a; source "$1"; set +a; printf "%s" "$SUTANDO_VOICE_CALL_END_INSTRUCTION"', '_', file], {
+			encoding: 'utf-8', env: { PATH: process.env.PATH ?? '/usr/bin:/bin' },
+		});
+		assert.equal(r.status, 0, `bash could not source ${valueSource}: ${r.stderr}`);
+		return { bash: r.stdout, dotenv: parseDotenv(text).SUTANDO_VOICE_CALL_END_INSTRUCTION };
+	};
+
+	it('single quotes keep $, ` and \\ literal in both startup\'s bash source and dotenv', () => {
+		const literal = 'Pay $5 by `noon`, path C:\\x. Else [no-send].';
+		const { bash, dotenv } = loadBoth('single-quoted', `'${literal}'`);
+		assert.equal(bash, literal);
+		assert.equal(dotenv, literal);
+	});
+
+	it('in double quotes bash expands a $ that dotenv keeps, and .env.example says what to use instead', () => {
+		const { bash, dotenv } = loadBoth('double-quoted-dollar', '"Pay $5 now."');
+		assert.equal(dotenv, 'Pay $5 now.');
+		assert.notEqual(bash, dotenv, 'bash expands $5 inside double quotes');
+		const example = readFileSync(join(import.meta.dirname, '..', '.env.example'), 'utf-8');
+		const at = example.indexOf('# SUTANDO_VOICE_CALL_END_INSTRUCTION=');
+		const block = example.slice(example.lastIndexOf('\n\n', at), at);
+		assert.match(block, /single quotes/, '.env.example names single quotes for text with $, ` or \\');
+		assert.match(block, /host's environment/, '.env.example names the host environment for text with both');
 	});
 
 	it('a long session keeps its end', () => {
@@ -104,6 +192,7 @@ describe('the session-end task', () => {
 		assert.match(src, /onClientDisconnected: \(\) => \{\n\t\t\tcallEnd\.clientDisconnected\(\);/);
 		assert.match(src, /subscribe\('turn\.end', \(\) => callEnd\.collect\(\)\);/);
 		assert.match(src, /beforeConversationClear = \(\) => callEnd\.collect\(\);/);
+		assert.match(src, /sessionEndTask\(ended, callEndInstruction\(\)\)/);
 		assert.match(src, /await submitVoiceSessionEndTask\(summary, transcript, ended\.origin \?\? null\);/);
 	});
 });

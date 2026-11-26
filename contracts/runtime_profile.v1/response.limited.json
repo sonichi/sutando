@@ -1,0 +1,17 @@
+{
+  "runtime_profile": {
+    "v": 1,
+    "reported_at": 1789999998,
+    "received_at": 1790000000,
+    "age_s": 30,
+    "model": {"id": "claude-opus-5-5", "display_name": "Claude Opus 5.5", "runtime": "claude"},
+    "switch_options": [
+      {"token": "opus", "display_name": "Claude Opus 5.5"},
+      {"token": "sonnet", "display_name": "Claude Sonnet 5"}
+    ],
+    "plan": {"name": "Claude Max"},
+    "workers": [
+      {"worker_id": "w-research", "model": null, "switch_options": [], "plan": null}
+    ]
+  }
+}

@@ -23,6 +23,11 @@ with a destination header, or a proactive result routed to the owner's channel);
 `--allow-undeliverable` publishes anyway. A skip-marked body for such a task is
 published straight into the month's `results/archive/`: the same missing bridge is
 the one that would otherwise retire it, so a live copy stays in `results/` forever.
+
+CLI exit codes: 0 published; 2 refused or misused (nothing written); 3 published, but the
+directory could not be synced afterwards (`PublishedUnconfirmed`), so the body is visible and a
+retry under a new name would duplicate it; any other nonzero (1) failed before the rename, so
+nothing was published.
 """
 from __future__ import annotations
 
@@ -31,10 +36,16 @@ import secrets
 import sys
 from pathlib import Path
 
-__all__ = ["STAGED_SUFFIX", "stage_text", "is_staged_for", "publish_staged", "publish_text",
-           "undeliverable_reason", "retired_path", "result_labels_for", "main"]
+__all__ = ["STAGED_SUFFIX", "PublishedUnconfirmed", "EXIT_PUBLISHED_UNCONFIRMED", "stage_text",
+           "is_staged_for", "publish_staged", "publish_text", "undeliverable_reason", "retired_path",
+           "result_labels_for", "main"]
 
 STAGED_SUFFIX = ".tmp"
+EXIT_PUBLISHED_UNCONFIRMED = 3
+
+
+class PublishedUnconfirmed(OSError):
+    """The rename happened, so the body is published; syncing its directory afterwards failed."""
 
 
 def stage_text(path: str | Path, text: str, mode: int = 0o666) -> Path:
@@ -76,11 +87,14 @@ def publish_staged(tmp: str | Path, path: str | Path) -> Path:
     target = Path(path)
     os.replace(tmp, target)
     if os.name != "nt":
-        dfd = os.open(target.parent, os.O_RDONLY)
         try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
+            dfd = os.open(target.parent, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError as exc:
+            raise PublishedUnconfirmed(exc.errno, f"published {target}, but syncing its directory failed: {exc}") from exc
     _clear_delegation(target)
     return target
 
@@ -126,6 +140,63 @@ def _helpers():
     return local_task_protocol, result_markers, task_archive, workspace_default
 
 
+def worker_published_path(path: str | Path, environ=None, workspace=None) -> Path:
+    """Where this session publishes `path`: a proactive file from a pool worker's session that acts as
+    its own agent carries the worker's stamp (`connections.session_proactive_name`), so only that
+    worker's lane delivers it. The core's session, a worker acting through the core, a copy of this
+    module without the engine's `connections`, and every task result publish under the name given.
+
+    A relative `path` is anchored to the workspace, never to the process's cwd: the session's cwd
+    is the repo, so a bare "results/..." would otherwise resolve wherever the caller happened to be
+    and land where no reader looks."""
+    path = Path(path)
+    if not path.is_absolute():
+        if workspace is not None:
+            ws = Path(workspace)
+        else:
+            try:
+                from . import workspace_default
+            except ImportError:
+                import workspace_default
+            ws = workspace_default.resolve_workspace(migrate=False)
+        path = (ws / path).resolve()
+    try:
+        import connections
+    except ImportError:
+        return path
+    named = path.with_name(connections.session_proactive_name(path.name, environ, workspace))
+    return _own_results_path(connections, named, environ, workspace)
+
+
+def _own_results_path(connections, path: Path, environ, workspace) -> Path:
+    """Where `path`, aimed at the shared results/ or the session's worker's own, is published. A task's
+    result goes to its task's current home (`connections.task_home`): a late answer to work handed back to
+    the core lands where the core reads it. A proactive file goes to the session's worker's own results/
+    when that worker's lane delivers it (`lane_claims_proactive`); any other target is unchanged."""
+    from proactive_routing import lane_claims_proactive
+    worker = connections.session_worker(environ)
+    own = connections.worker_dirs(worker, workspace) if worker else None
+    shared = connections.record_path(workspace).parent.parent / "results"
+    if path.parent.resolve() not in {d.resolve() for d in [shared] + ([own[1]] if own else [])}:
+        return path
+    if path.name.startswith("proactive-"):
+        dest = own[1] if own and lane_claims_proactive(path.name, worker) else shared
+    elif path.name.startswith("task-") and path.suffix == ".txt":
+        dest = connections.task_home(path.stem, workspace)["results"]
+    else:
+        dest = own[1] if own else path.parent
+    return path if dest.resolve() == path.parent.resolve() else dest / path.name
+
+
+def _task_home(task_id: str, workspace: Path) -> dict:
+    """The task's folders (`connections.task_home`); the shared ones in a copy without the engine's `connections`."""
+    try:
+        import connections
+    except ImportError:
+        return {"tasks": workspace / "tasks", "results": workspace / "results"}
+    return connections.task_home(task_id, workspace)
+
+
 def _unrouted_cron_task(path: str | Path) -> str | None:
     """The task id when `path` is the live result of a `source: cron` task naming no destination.
 
@@ -140,9 +211,10 @@ def _unrouted_cron_task(path: str | Path) -> str | None:
         return None
     try:
         workspace = wsd.resolve_workspace(migrate=False).resolve()
-        if target.parent != workspace / "results":
+        home = _task_home(task_id, workspace)
+        if target.parent not in (workspace / "results", home["results"].resolve()):
             return None
-        tasks_dir = workspace / "tasks"
+        tasks_dir = home["tasks"]
         task_file = (archive.find_task_file(tasks_dir, task_id)
                      or protocol.find_archived_task(tasks_dir, task_id))
         if task_file is None:
@@ -254,11 +326,33 @@ def _parse(args: list[str]):
 
 
 def main(argv: list[str]) -> int:
+    try:
+        return _main(argv)
+    except PublishedUnconfirmed as exc:
+        print(f"result_publish: {exc}", file=sys.stderr)
+        return EXIT_PUBLISHED_UNCONFIRMED
+
+
+def _main(argv: list[str]) -> int:
     parsed = _parse(argv[1:])
     if parsed is None:
         print(_USAGE, file=sys.stderr)
         return 2
     path, allow, title, outcome, parent = parsed
+    rel = Path(path)
+    if not rel.is_absolute() and (len(rel.parts) != 2 or rel.parts[0] != "results" or rel.parts[1] in (".", "..")):
+        # A relative path is anchored to the workspace; anything but results/<name> lands where no lane reads.
+        print(f"result_publish: refused, relative path {path} is not results/<name>, so it would "
+              "land where no reader looks; pass results/<id>.txt or the absolute path", file=sys.stderr)
+        return 2
+    stamped = worker_published_path(path)
+    if stamped.name != Path(path).name:
+        print(f"result_publish: publishing {Path(path).name} as {stamped.name}: a pool worker's "
+              "proactive file carries its worker's stamp, so its own lane delivers it", file=sys.stderr)
+    if stamped.parent != Path(path).parent:
+        print(f"result_publish: publishing into {stamped.parent}: the results folder of its task's home or of "
+              "this pool worker, whose lane delivers it", file=sys.stderr)
+    path = str(stamped)
     text = sys.stdin.read()
     reason = None if allow else undeliverable_reason(path, text)
     if reason:

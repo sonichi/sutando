@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
+from . import recovery
 from .schema import Action, HumanRequirement
 
 SOURCE = "tui"
@@ -27,6 +28,7 @@ _HINT = re.compile(r"Esc to cancel|Enter to (confirm|select)|↑/↓|shift\+tab|
 _FOOTER = re.compile(r"^⏵|←\s*for agents|esc to interrupt|\? for shortcuts", re.I)
 _YES = re.compile(r"^\s*yes\b", re.I)
 _NO = re.compile(r"^\s*no\b", re.I)
+OPTION_LABEL_MAX = 80
 
 
 def guard_for(session: str, prompt: Optional[str], state: str) -> str:
@@ -83,8 +85,32 @@ def limit_card_holds(req: HumanRequirement, pane: Optional[str], runtime: Option
     return limit_standing(pane, runtime, outrun)
 
 
-def limit_unblock(session: Optional[str] = None, runtime: Optional[str] = None) -> str:
-    """How the owner lifts a usage limit, for the card body; the steps are the runtime's own."""
+#: What Retry now does: the core's sends the refused message again; a worker's restarts it.
+RETRY_LINE = "Retry now sends the refused message again."
+RETRY_SEAT_LINE = "Retry now wakes the worker, and restarts it if it stays blocked."
+
+
+def limit_unblock(session: Optional[str] = None, runtime: Optional[str] = None,
+                  controls: Optional[Sequence[str]] = None, menu: bool = False) -> str:
+    """How the owner lifts a usage limit, for the card body; the steps are the runtime's own.
+    `controls`: the recovery ids the card carries, so the copy names those buttons and never a
+    command or a purchase (the purchase is its own tagged button). `menu`: wait choices shown."""
+    if controls:
+        verbs = {(recovery.parse(a) or ("", None))[0] for a in controls}
+        parts = ["It continues when the limit resets."]
+        if menu:
+            parts.append("Pick how to wait below.")
+        what = " or ".join(w for v, w in ((recovery.SWITCH_MODEL, "model"), (recovery.SWITCH_RUNTIME, "runtime"))
+                           if v in verbs)
+        if what:
+            parts.append(f"To keep working now, tap a {what} below that has usage left.")
+        if recovery.RETRY_NOW in verbs:
+            parts.append(RETRY_LINE)
+        if recovery.ADD_ACCOUNT in verbs:
+            parts.append("Another account with usage left also lifts it.")
+        if recovery.RESTART_CORE in verbs:
+            parts.append("Restart core starts it fresh.")
+        return " ".join(parts)
     where = f"open its terminal (tmux session {session})" if session else "open its terminal"
     if runtime == "codex":
         return (f"It continues when the limit resets. To unblock it sooner, {where} and run "
@@ -94,11 +120,15 @@ def limit_unblock(session: Optional[str] = None, runtime: Optional[str] = None) 
             "or /model to switch to a model with usage left.")
 
 
-def sign_in_copy(runtime: Optional[str] = None) -> Tuple[str, str, str]:
-    """(title, message, button label) for a signed-out seat, in its own runtime's words."""
+def sign_in_copy(runtime: Optional[str] = None, core: bool = False) -> Tuple[str, str, str]:
+    """(title, message, button label) for a signed-out seat, in its own runtime's words.
+    `core`: the core's own card, whose copy names its button, never a terminal command."""
     if runtime in (None, "claude"):
         return ("Claude needs you to sign in again",
                 "Your Claude session has expired. Sign in again to continue.", "Sign in to Claude")
+    if runtime == "codex" and core:
+        return ("Codex needs you to sign in again",
+                "Your Codex session has expired. Tap Sign in to Codex to continue.", "Sign in to Codex")
     if runtime == "codex":
         return ("Codex needs you to sign in again",
                 "Your Codex session has expired. Run `codex login` in its terminal to continue.",
@@ -158,18 +188,57 @@ def question(prompt: Optional[str], detail: str) -> str:
     return " ".join(kept[-3:]) if kept else detail
 
 
+def _option_label(option: str, short: str) -> str:
+    """A button's label as the terminal lists the option, spaces collapsed; `short` when it is
+    empty or too long for a button."""
+    text = " ".join((option or "").split())
+    return text if 0 < len(text) <= OPTION_LABEL_MAX else short
+
+
 def _open_terminal() -> Action:
     return Action(id="open_terminal", kind="open_terminal", label="Open terminal")
+
+
+# How a card names each core runtime its Switch runtime button offers.
+RUNTIME_NAMES = {"claude": "Claude Code", "codex": "Codex"}
+
+
+def recovery_action(aid: str, model_names: Optional[Dict[str, str]] = None) -> Action:
+    return Action(id=aid, kind=recovery.kind_of(aid), label=recovery.label(aid, RUNTIME_NAMES, model_names))
+
+
+# The only limit-menu choices a tap may choose: the runtime's own wait wordings, matched whole.
+# Anything else (a key, overages, a login, a purchase, a switch, a rewording) is never one tap.
+WAIT_CHOICES = (re.compile(r"^stop and wait for (?:the )?limit to reset$", re.I),
+                re.compile(r"^wait here, then continue automatically at [\w ,:.]{1,40}$", re.I))
+
+
+def safe_limit_options(options: Sequence[str]) -> List[Tuple[int, str]]:
+    """(index, the runtime's own wording) for each limit-menu option a tap may choose: only the
+    allowlisted wait choices, so tapping one is choosing it in the terminal."""
+    out = []
+    for i, option in enumerate(options):
+        text = " ".join(option.split())
+        if any(rx.match(text) for rx in WAIT_CHOICES):
+            out.append((i, text))
+    return out
 
 
 def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
                     session: str, detail: str, fallback_message: str,
                     runtime: Optional[str] = None,
-                    episode: Optional[str] = None) -> HumanRequirement:
+                    episode: Optional[str] = None,
+                    controls: Optional[Sequence[str]] = None,
+                    model_names: Optional[Dict[str, str]] = None,
+                    guard: Optional[str] = None) -> HumanRequirement:
     """The requirement a gate deserves; unparseable or non-semantic gates keep the
-    blocked card with no button, so a key is never guessed. A session with no stamped
+    blocked card with no keystroke button, so a key is never guessed. A session with no stamped
     runtime predates the stamp and ran Claude, so `runtime` falls back to "claude".
-    `episode` LIMIT_EPISODE keys the card on the seat, not the screen, and announces it once."""
+    `episode` LIMIT_EPISODE keys the card on the seat, not the screen, and announces it once.
+    `controls`: recovery action ids (hitl.recovery) a blocked card offers instead of a guessed
+    keystroke; the caller picks them for the core or the seat. None keeps the card as it was.
+    A limit menu also offers its wait-only choices as keystrokes (safe_limit_options).
+    `guard`, when given, is the episode key the caller owns (hitl.core_card.episode_guard)."""
     options, caret = parse_options(prompt)
     subject: Dict[str, object] = {
         "session": session,
@@ -188,7 +257,7 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
         pass  # keeps the blocked card: never a one-click answer on a trust/spend gate or a limit
     elif gate == "login" or state == "logged-out":
         kind = "auth"
-        title, message, label = sign_in_copy(runtime)
+        title, message, label = sign_in_copy(runtime, core=controls is not None)
         actions = [Action(id="authenticate", kind="authenticate", label=label)]
     elif gate == "press-enter":
         kind, title = "confirmation", "Agent needs your confirmation"
@@ -203,17 +272,26 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
         if yes is not None and no is not None:
             kind, title = "permission", "Agent needs your confirmation"
             option_for_action = {"deny": no, "allow": yes}
-            actions = [Action(id="deny", kind="reject_once", label="No"),
-                       Action(id="allow", kind="allow_once", label="Yes")]
+            # The terminal's own words, so a client can number each button by its row (owner's PM,
+            # 2026-11-24: "No" never matched "No, and tell Claude what to do differently (esc)").
+            actions = [Action(id="deny", kind="reject_once", label=_option_label(options[no], "No")),
+                       Action(id="allow", kind="allow_once", label=_option_label(options[yes], "Yes"))]
         else:
             kind, title = "choice", "Agent needs a decision"
             option_for_action = {f"opt{i + 1}": i for i in range(len(options))}
             actions = [Action(id=f"opt{i + 1}", kind="select", label=o) for i, o in enumerate(options)]
 
+    if episode == LIMIT_EPISODE and controls is not None and options and caret is not None:
+        for i, label in safe_limit_options(options):
+            option_for_action[f"opt{i + 1}"] = i
+            actions.append(Action(id=f"opt{i + 1}", kind="select", label=label))
+    if kind == FALLBACK_KIND and controls:
+        actions += [recovery_action(aid, model_names) for aid in controls]
+        subject["recovery"] = True
     subject["option_for_action"] = option_for_action
-    guard = guard_for(session, prompt, state)
+    if not guard:
+        guard = limit_guard(session) if episode == LIMIT_EPISODE else guard_for(session, prompt, state)
     if episode == LIMIT_EPISODE:
-        guard = limit_guard(session)
         subject.update(episode=episode, remind=False)
     return HumanRequirement(
         kind=kind, runtime=runtime or "claude", message=message, title=title,
@@ -229,7 +307,11 @@ def keys_for(req: HumanRequirement, current_prompt: Optional[str],
     """The keystrokes that realise `req.chosen_action` against the dialog on screen
     NOW, or None when the screen no longer shows the dialog the human clicked on."""
     subject = req.subject or {}
-    if guard_for(str(subject.get("session") or ""), current_prompt, current_state) != req.guard:
+    if limit_card(req):
+        # A limit card is keyed on its seat, not its screen: the same menu must still be up.
+        if parse_options(current_prompt)[0] != list(subject.get("options") or []):
+            return None
+    elif guard_for(str(subject.get("session") or ""), current_prompt, current_state) != req.guard:
         return None
     action = req.chosen_action
     if action == "continue":

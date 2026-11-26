@@ -60,6 +60,7 @@ NEEDED = (
     "src/file_lock.py",
     "src/cli_wedge.py",
     "src/cli_wedge_patterns.py",
+    "src/pane_composer.py",
     "src/sutando_platform.py",
     "src/quota_availability.py",
     "src/worker_auth_state.py",
@@ -68,6 +69,9 @@ NEEDED = (
     "src/watch-tasks-stream.sh",
     "scripts/python-binary.sh",
     "scripts/sutando-config.sh",
+    "src/agent/codex/codex-home.sh",
+    "src/codex_home.py",
+    "src/codex_host_instructions.py",
     # without these the launcher aborts before tmux and the assert is vacuous
     "scripts/install-personal-claude-hook.sh",
 )

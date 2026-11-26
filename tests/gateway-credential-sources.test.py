@@ -626,6 +626,28 @@ class DiscoveryCases:
         self.assertEqual(self.o.first_env({"REMOTE_TASK_TOKEN": "''", "AG2_REMOTE_TOKEN": "x"}, self.o.TOKEN_KEYS),
                          ("", "REMOTE_TASK_TOKEN"), "a set but quoted-empty env value still wins, as it always has")
 
+    def test_what_the_desktop_stdio_proxy_reads_from_a_token_file(self):
+        self.assertEqual(self.o.plain_token_key("export REMOTE_TASK_TOKEN=x\nAG2_REMOTE_TOKEN='y'\n"), "AG2_REMOTE_TOKEN",
+                         "the proxy reads no `export ` line")
+        self.assertEqual(self.o.plain_token_key("REMOTE_TASK_TOKEN=''\n"), "", "an empty value is none")
+        text = "REMOTE_TASK_TOKEN='https://r.example/relay|s3'\n"
+        self.assertEqual(self.o.plain_token(text), ("REMOTE_TASK_TOKEN", "https://r.example/relay", "s3"))
+        self.assertEqual(self.o.plain_token(text + "REMOTE_TASK_URL=https://o.example/r/\n")[1], "https://o.example/r",
+                         "a plain .env's URL line wins, as the proxy's primary lane reads it")
+        self.assertEqual(self.o.plain_token("https://r.example|raw\n"), ("", "", ""))
+        self.assertEqual(self.o.raw_token_line("\n  https://r.example/relay/|s3  \n"), ("https://r.example/relay", "s3"))
+        self.assertEqual(self.o.raw_token_line("bare\n"), ("", "bare"))
+        for none in ("", "\n \n", "REMOTE_TASK_TOKEN=a|b\n"):
+            self.assertEqual(self.o.raw_token_line(none), ("", ""), none)
+        with tempfile.TemporaryDirectory() as td:
+            env = os.path.join(td, ".env")
+            Path(td, "token").write_text("x")
+            self.assertEqual(self.o.seat_token_path(env, "REMOTE_TASK_TOKEN_FILE=token\n"),
+                             os.path.realpath(os.path.join(td, "token")), "a relative pointer is the .env's sibling")
+            self.assertEqual(self.o.seat_token_path(env, "AGENT_MXID=@a:s\n"), "")
+            self.assertEqual(self.o.seat_token_path(env, "REMOTE_TASK_TOKEN_FILE=token\nREMOTE_TASK_TOKEN=a|b\n"), "",
+                             "a file that assigns a token itself is no seat .env")
+
     def test_a_file_value_is_unquoted_once(self):
         padded = 'REMOTE_TASK_TOKEN="  pad-tok-1  "\nREMOTE_TASK_URL="  https://p.example/r  "\n'
         vals = self.o.parse_env_text(padded)
@@ -1621,7 +1643,12 @@ IO_ALLOWED = {("remote_gateway_bridge.py", "_read_env_file"), ("remote_gateway_b
               ("remote_gateway_bridge.py", "_read_token_file_text"),
               ("remote_gateway_bridge.py", "_vault_lookup"), ("service_manager.py", "systemd_user_available"),
               ("gateway_credential_io.py", "read_file"), ("gateway_credential_io.py", "vault_lookup"),
-              ("gateway_credential_io.py", "_vault"), ("gateway_credential_io.py", "_vault_once")}
+              ("gateway_credential_io.py", "_vault"), ("gateway_credential_io.py", "_vault_once"),
+              # Antigravity's own Gemini API key, which the owner saved for that agent in the app (its
+              # Keychain item, never a gateway credential): read here and sent only in ACP authenticate.
+              ("adapters/antigravity/gemini_key.py", "_read_item"),
+              # The same item asked for by its attributes only (no key printed), and deleted on "Stop using the key".
+              ("adapters/antigravity/gemini_key.py", "key_saved"), ("adapters/antigravity/gemini_key.py", "clear_key")}
 # A command whose output is a credential store: the Keychain. The systemd user manager's environment
 # is SYSTEMD_PROBE's closed-world rule below, which evaluates no constant.
 STORE_READS = ("security", "find-generic-password")
@@ -2045,7 +2072,9 @@ return env
 READER_WRITES = {("bridge_environ", "env.update(decl['env'], REMOTE_PROACTIVE_ROOM='')"),
                  ("bridge_environ", "env.update(_sources.bridge_carried_config(host, read_regular))"),
                  ("bridge_environ", "env.update(token_env)"),
-                 ("main", "os.environ.clear()"), ("main", "os.environ.update(environ)")}
+                 ("main", "os.environ.clear()"), ("main", "os.environ.update(environ)"),
+                 # A pool worker's lane dirs and instance (worker_lane.bridge_overlay): no credential.
+                 ("main", "os.environ.update(overlay)")}
 MAPPING_WRITES = {"update", "setdefault", "__setitem__", "__delitem__", "pop", "popitem", "clear", "putenv", "unsetenv",
                   "__ior__", "__or__", "__ror__"}
 # Every reach of a process environment in the reader, by (function, the expression holding it).

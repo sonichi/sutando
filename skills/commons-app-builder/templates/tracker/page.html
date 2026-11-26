@@ -9,13 +9,13 @@
     color-scheme: light dark;
     --bg: #fbfbfd; --card: #fff; --ink: #16161a; --dim: #5d5d6b;
     --line: #e3e3ea; --accent: #2f5bea; --warn: #8a5a00; --bad: #b3261e;
-    --todo: #6b7280; --doing: #2f5bea; --done: #157f4b;
+    --todo: #B7B2AD; --doing: #8A5911; --done: #06813D;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #111115; --card: #1a1a20; --ink: #f2f2f5; --dim: #a6a6b4;
       --line: #2c2c36; --accent: #7d9bff; --warn: #ffcf70; --bad: #ff8a80;
-      --todo: #9aa0ab; --doing: #7d9bff; --done: #5bd39b;
+      --todo: #B7B2AD; --doing: #F0E345; --done: #9EE2BF;
     }
   }
   * { box-sizing: border-box; }
@@ -28,7 +28,10 @@
   .note { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); margin-bottom: 10px; font-size: 14px; }
   .note.bad { border-color: var(--bad); color: var(--bad); }
   .note.warn { border-color: var(--warn); color: var(--warn); }
-  .add { display: grid; gap: 8px; margin-bottom: 14px; }
+  /* A grid track is as wide as its widest content by default: a select with a long option, or
+     a long unbroken value, would push the page wider than a phone. */
+  .add { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; margin-bottom: 14px; }
+  .add > * { min-width: 0; max-width: 100%; }
   input, select, textarea, button {
     font: inherit; color: inherit; min-height: 44px; border-radius: 10px;
     border: 1px solid var(--line); background: var(--card); padding: 0 12px;
@@ -39,14 +42,18 @@
   button[disabled] { opacity: .55; cursor: not-allowed; }
   .items { display: grid; gap: 10px; list-style: none; margin: 0; padding: 0; }
   .item { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px; min-width: 0; }
-  .top { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; min-width: 0; }
+  .top { flex-wrap: wrap; display: flex; gap: 8px; align-items: baseline; justify-content: space-between; min-width: 0; }
   .name { font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
-  .chip { font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid currentColor; white-space: nowrap; }
-  .chip.todo { color: var(--todo); } .chip.doing { color: var(--doing); } .chip.done { color: var(--done); }
+  .chip { max-width: 100%; min-width: 0; overflow-wrap: anywhere; display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--card); color: var(--ink); white-space: normal; }
+  .chip::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--dot, var(--todo)); }
+  .chip.todo { --dot: var(--todo); } .chip.doing { --dot: var(--doing); } .chip.done { --dot: var(--done); }
   /* Outcome is agent-written text: a long URL, hash or token must wrap, not widen the page. */
   .meta { color: var(--dim); font-size: 13px; margin-top: 6px; overflow-wrap: anywhere; min-width: 0; }
   .meta.over { color: var(--bad); }
   .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  /* A status button carries an option's name: it wraps inside the card, whatever its length. */
+  .row > * { min-width: 0; max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
   .mine { font-size: 12px; color: var(--dim); overflow-wrap: anywhere; }
   .counts { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; color: var(--dim); font-size: 13px; }
   .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }

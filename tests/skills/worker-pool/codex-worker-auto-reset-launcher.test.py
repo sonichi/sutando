@@ -15,18 +15,38 @@ REPO = Path(__file__).resolve().parents[3]
 
 
 class CodexWorkerResetLauncherTests(unittest.TestCase):
-    def _launch(self, tmp):
-            root = Path(tmp) / "repo"
+    def _launch(self, tmp, owner_link_to_app_home=False):
+            tmp = str(Path(tmp).resolve())
+            base = Path(tmp)
+            if owner_link_to_app_home:
+                # A desktop host: the checkout sits under engine/, beside the host's AGENTS.md.
+                (base / "engine").mkdir()
+                (base / "engine/AGENTS.md").write_text("host\n")
+                base = base / "engine"
+            root = base / "sutando" if owner_link_to_app_home else Path(tmp) / "repo"
             home = Path(tmp) / "home"
             workspace = Path(tmp) / "workspace"
             bin_dir = Path(tmp) / "bin"
             for path in (home, workspace, bin_dir):
                 path.mkdir()
             for rel in ("skills/worker-pool/scripts/launch-codex-worker-session.sh",
-                        "scripts/python-binary.sh", "src/agent/launch-path.sh"):
+                        "skills/worker-pool/scripts/worker-mcp-credential.sh",
+                        "skills/worker-pool/scripts/codex_worker_mcp.py",
+                        "scripts/python-binary.sh", "src/agent/codex/codex-home.sh",
+                        "src/codex_home.py", "src/codex_host_instructions.py",
+                        "src/sutando_config.py", "src/agent/launch-path.sh"):
                 dest = root / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(REPO / rel, dest)
+            (root / "src/__init__.py").touch()
+            if owner_link_to_app_home:
+                # The owner's own ~/.codex leads into the configured, still missing, app home.
+                (home / ".codex").symlink_to(home / "codex")
+            # The worker's Codex home comes from the shared owner, which reads the real config.
+            (root / "sutando.config.json").write_text(json.dumps({
+                "workspace": {"path": str(workspace)},
+                "core_config_dirs": [{"id": "x", "type": "codex", "env_name": "CODEX_HOME",
+                                      "synced": False, "value": str(home / "codex")}]}))
             config = root / "scripts/sutando-config.sh"
             config.write_text(
                 '#!/bin/sh\n'
@@ -89,6 +109,16 @@ class CodexWorkerResetLauncherTests(unittest.TestCase):
                 "enabled": "0",
             })
             self.assertIn("-e SUTANDO_CODEX_AUTO_RESET_ENABLED=0", tmux_log.read_text())
+
+    def test_worker_with_an_owner_link_to_the_app_home_creates_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, reset_log, tmux_log, home, _ = self._launch(tmp, owner_link_to_app_home=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("not creating it", result.stderr)
+            self.assertFalse(os.path.lexists(home / "codex"))
+            self.assertFalse(reset_log.exists())
+            launch = [l for l in tmux_log.read_text().splitlines() if "new-session" in l]
+            self.assertEqual(len(launch), 1, launch)
 
     def test_worker_codex_skips_the_interactive_startup_update_prompt(self):
         with tempfile.TemporaryDirectory() as tmp:

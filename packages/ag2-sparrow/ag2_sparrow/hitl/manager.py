@@ -73,10 +73,24 @@ ARCHIVE_STATUS_STALE_S = 600
 REFUSAL_KEYS = ("refused_revision", "refusals", "retry_at", "refused_error", "failed_revision")
 
 
-def archive_status_path(store_root: Path) -> Path:
-    """Beside the store, like the archive dir, so the store holds only records."""
+_SCOPE_RE = re.compile(r"\A[a-z0-9][a-z0-9-]{0,63}\Z")
+
+
+def archive_status_path(store_root: Path, scope: str = "") -> Path:
+    """Beside the store, like the archive dir, so the store holds only records. A gateway lane that
+    drives only its own cards reports under its `scope`, so one lane never overwrites another's."""
     root = Path(store_root)
-    return root.with_name(root.name + "-archive-status.json")
+    if scope and not _SCOPE_RE.match(scope):
+        raise ValueError(f"not an archive status scope: {scope!r}")
+    return root.with_name(root.name + (f"-archive-status.{scope}.json" if scope else "-archive-status.json"))
+
+
+def _read_status(path: Path) -> Dict:
+    try:
+        status = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return status if isinstance(status, dict) else {}
 
 
 def archive_health(store_root: Path, now: Optional[float] = None) -> Optional[Dict]:
@@ -86,22 +100,25 @@ def archive_health(store_root: Path, now: Optional[float] = None) -> Optional[Di
     root = Path(store_root)
     if not root.is_dir():
         return None
-    status: Dict = {}
-    try:
-        status = json.loads(archive_status_path(root).read_text())
-    except (OSError, ValueError):
-        pass
-    if not isinstance(status, dict):
-        status = {}
-    failures = int(status.get("failures") or 0)
-    updated = status.get("updated_at")
     now = time.time() if now is None else now
+    status = _read_status(archive_status_path(root))
+    updated = status.get("updated_at")
     stale = bool(status) and (not isinstance(updated, (int, float))
                               or now - updated > ARCHIVE_STATUS_STALE_S)
+    failures, error = int(status.get("failures") or 0), str(status.get("error") or "")
+    # A lane's own report counts while it names failures; one with none says nothing, even once stale.
+    for path in sorted(root.parent.glob(root.name + "-archive-status.*.json")):
+        lane = _read_status(path)
+        if not int(lane.get("failures") or 0):
+            continue
+        failures += int(lane["failures"])
+        error = error or str(lane.get("error") or "")
+        at = lane.get("updated_at")
+        stale = stale or not isinstance(at, (int, float)) or now - at > ARCHIVE_STATUS_STALE_S
     live = sorted(root.glob("hitl_*.json"))
     return {"live": len(live),
             "failures": failures,
-            "error": str(status.get("error") or ""),
+            "error": error,
             "updated_at": updated,
             "reported": bool(status),
             "stale": stale,
@@ -220,10 +237,10 @@ class HitlStore:
             os.replace(src, self.archive_root / src.name)
             return True
 
-    def report_archive_failures(self, failures: Dict[str, BaseException], now: float) -> None:
+    def report_archive_failures(self, failures: Dict[str, BaseException], now: float, scope: str = "") -> None:
         """Take one pulse's archive failures: warn once per failing spell of an id,
         and publish the status for health-check when it changed or needs a refresh."""
-        key = str(self.root)
+        key = f"{self.root}#{scope}"
         warned = _ARCHIVE_WARNED.setdefault(key, set())
         for req_id, err in failures.items():
             if req_id not in warned:
@@ -235,7 +252,7 @@ class HitlStore:
         last = _ARCHIVE_PUBLISHED.get(key)
         if last and last[:2] == (len(failures), error) and now - last[2] < ARCHIVE_STATUS_REFRESH_S:
             return
-        target = archive_status_path(self.root)
+        target = archive_status_path(self.root, scope)
         tmp = None
         try:
             fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".tmp-archive-status-")
@@ -413,15 +430,20 @@ class HitlManager:
             return n, failed
 
     def record_projection(self, req_id: str, revision: int, event_id: Optional[str],
-                          extra: Optional[Dict] = None) -> None:
+                          extra: Optional[Dict] = None, replaces: Optional[str] = None) -> None:
         """Idempotent: recording an older revision than already projected is a
-        no-op; the event id (first CREATE event, the EDIT target) is kept."""
+        no-op; the event id (first CREATE event, the EDIT target) is kept. A card re-created
+        because the relay lost `replaces` still lands its id, at the revision it carries, while
+        the ledger names that target, so a newer revision stays pending for it."""
         with self.store.locked():
             req = self.store.load(req_id)
             if req is None:
                 return
             current = self.store.projection(req_id)
             if revision <= current.get("revision", 0):
+                if replaces and event_id and current.get("event_id") == replaces:
+                    self.store.save(req, projection={**current, **(extra or {}),
+                                                     "revision": revision, "event_id": event_id})
                 return
             event_id = event_id or current.get("event_id")
             kept = {k: v for k, v in current.items() if k not in REFUSAL_KEYS}

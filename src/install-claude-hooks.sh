@@ -7,11 +7,13 @@
 # `~/.claude/settings.json` — they only fire when Claude runs in this project
 # context, not in unrelated sessions.
 #
-# Hooks installed (4):
+# Hooks installed (static; skill-declared ones are added below):
 #   PreCompact  → src/archive-transcript.sh ~/Desktop/sutando-conversations/
 #   PreCompact  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
 #   SessionEnd  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
 #   Stop        → bash src/check-pending-tasks.sh
+#   Notification, PermissionRequest, Pre/PostToolUse(+Failure), UserPromptSubmit, Stop
+#               → bash src/core-block-hook.sh claude
 #
 # The SessionEnd → session-handoff.sh hook fires session-state.md on a clean
 # exit (⌘Q / crash) too, not just on PreCompact — so the last session's tail
@@ -108,6 +110,15 @@ HOOKS=(
   # Without this the Stop gate spends its one reminder and never re-arms:
   # begin_turn is the only reset and nothing else in the lifecycle calls it.
   "UserPromptSubmit|src/turn-start.sh|bash $(shq "$REPO_DIR/src/turn-start.sh")"
+  # The core supervisor's block signal (src/core_block_signal.py CLAUDE_EVENTS): a dialog
+  # opened, or the turn moved on.
+  "Notification|src/core-block-hook.sh|bash $(shq "$REPO_DIR/src/core-block-hook.sh") claude"
+  "PermissionRequest|src/core-block-hook.sh|bash $(shq "$REPO_DIR/src/core-block-hook.sh") claude"
+  "PreToolUse|src/core-block-hook.sh|bash $(shq "$REPO_DIR/src/core-block-hook.sh") claude"
+  "PostToolUse|src/core-block-hook.sh|bash $(shq "$REPO_DIR/src/core-block-hook.sh") claude"
+  "PostToolUseFailure|src/core-block-hook.sh|bash $(shq "$REPO_DIR/src/core-block-hook.sh") claude"
+  "UserPromptSubmit|src/core-block-hook.sh|bash $(shq "$REPO_DIR/src/core-block-hook.sh") claude"
+  "Stop|src/core-block-hook.sh|bash $(shq "$REPO_DIR/src/core-block-hook.sh") claude"
 )
 
 # The transcript archiver writes to ~/Desktop, OUTSIDE the vault carrier set.
@@ -199,7 +210,11 @@ fi
 
 ADDED=0
 SKIPPED=0
+UPDATED=0
 REMOVED=0
+# Hooks whose stale variant phase 0 swept; phase 1 counts a re-add of one as an update.
+SWEPT=()
+for _i in "${!HOOKS[@]}"; do SWEPT+=(""); done
 
 # Escape a literal string so it can be embedded in a jq (Oniguruma) regex.
 re_escape() { printf '%s' "$1" | sed 's/[][\\^$.*+?(){}|]/\\&/g'; }
@@ -267,8 +282,10 @@ for i in "${!HOOKS[@]}"; do
   # apostrophe bug this file already fixed once; it is a property of shq, so
   # every comparison against an embedded path has to go through it.
   ESC="$(shq "$REPO_DIR")"; ESC="${ESC#\'}"; ESC="${ESC%\'}"
+  # Skill hooks embed the physical path (skill_hooks.py resolves it), which a symlinked REPO_DIR is not.
+  ESC_P="$(shq "$(cd "$REPO_DIR" && pwd -P)")"; ESC_P="${ESC_P#\'}"; ESC_P="${ESC_P%\'}"
   case "$CMD" in
-    *"$ESC"*) ;;
+    *"$ESC"*|*"$ESC_P"*) ;;
     *) continue ;;
   esac
 
@@ -321,7 +338,11 @@ for i in "${!HOOKS[@]}"; do
   case "$CMD" in
     "[ -f "*" ] || exit 0; "*)
       _guard="${CMD%% ] || exit 0; *} ] || exit 0; "
-      GUARD_SHAPE="^$(re_escape "$_guard").*$(re_escape "$MARKER")" ;;
+      GUARD_SHAPE="^$(re_escape "$_guard").*$(re_escape "$MARKER")"
+      # The same guard on another checkout's copy of this skill script is ours too.
+      case "$_guard" in
+        *"/skills/"*) GUARD_SHAPE="$GUARD_SHAPE|^\\[ -f .*/skills/$(re_escape "${_guard##*/skills/}").*$(re_escape "$MARKER")" ;;
+      esac ;;
   esac
 
   if ! jq -e --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
@@ -351,11 +372,13 @@ for i in "${!HOOKS[@]}"; do
     else . end
   ' "$SETTINGS" > "$TMP" || { echo "error: jq stale-variant sweep failed on $EVENT" >&2; rm -f "$TMP"; exit 1; }
   mv "$TMP" "$SETTINGS"
-  REMOVED=$((REMOVED + 1))
+  SWEPT[$i]=1
 done
 
-# Phase 1: install missing current hooks.
-for entry in "${HOOKS[@]}"; do
+# Phase 1: install missing current hooks. A swept variant re-added here is an update;
+# one swept beside an already-present current hook is a removal.
+for i in "${!HOOKS[@]}"; do
+  entry="${HOOKS[$i]}"
   EVENT="${entry%%|*}"
   REST="${entry#*|}"
   CMD="${REST#*|}"
@@ -365,6 +388,7 @@ for entry in "${HOOKS[@]}"; do
       '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command) | index($cmd)' \
       "$SETTINGS" >/dev/null 2>&1; then
     SKIPPED=$((SKIPPED + 1))
+    [ -n "${SWEPT[$i]}" ] && REMOVED=$((REMOVED + 1))
     continue
   fi
 
@@ -376,7 +400,7 @@ for entry in "${HOOKS[@]}"; do
     | .hooks[$event][0].hooks += [{"type": "command", "command": $cmd}]
   ' "$SETTINGS" > "$TMP" || { echo "error: jq edit failed on $EVENT" >&2; rm -f "$TMP"; exit 1; }
   mv "$TMP" "$SETTINGS"
-  ADDED=$((ADDED + 1))
+  if [ -n "${SWEPT[$i]}" ]; then UPDATED=$((UPDATED + 1)); else ADDED=$((ADDED + 1)); fi
 done
 
 # Phase 2: uninstall deprecated hooks (substring match).
@@ -417,7 +441,7 @@ if jq -e '(.hooks // {}).PreCompact // [] | map(.hooks // []) | flatten
   mkdir -p "$HOME/Desktop/sutando-conversations"
 fi
 
-echo "install-claude-hooks: added=$ADDED skipped=$SKIPPED removed=$REMOVED → $SETTINGS"
+echo "install-claude-hooks: added=$ADDED skipped=$SKIPPED updated=$UPDATED removed=$REMOVED → $SETTINGS"
 # A failed discovery leaves the static hooks installed and exits non-zero: the
 # launcher prints its warning and the claude-hooks probe names the missing ones.
 [ "$DISCOVERY_RC" = 0 ] || exit 1

@@ -123,9 +123,10 @@ def get_activity(max_items: int = 10) -> list[dict]:
 
 def get_pending_count() -> dict:
     """{"open", "done", "unavailable", "reason"} from the one pending-questions reader (the
-    skill's adapter); `open` is None, never 0, while the room cannot be read."""
+    skill's adapter); `open` is None, never 0, while the room cannot be read. The page reloads
+    every 15 s, so the count is the reader's reused one."""
     store = skill_roots.declared(pending_questions_reader.DECLARATION, WORKSPACE_DIR)
-    return pending_questions_reader.count(WORKSPACE_DIR, store)
+    return pending_questions_reader.count_recent(WORKSPACE_DIR, store)
 
 
 def pending_tile(pending: dict) -> tuple:
@@ -167,6 +168,9 @@ def get_quota_status() -> dict:
         return {"available": True}
     try:
         data = json.loads(quota_file.read_text())
+        from quota_availability import trusted_record
+        if trusted_record(data) is None:  # another login's numbers are not this core's
+            return {"available": True}
         headers = data.get("headers", {})
         # Parse reset timestamps PER WINDOW: one malformed value degrades
         # its own tile to unknown, never the sibling or the whole panel.

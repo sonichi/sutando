@@ -26,8 +26,8 @@ unknown outcome, call `operation.inspect` before resending.
 | Create the page | `room.commons.pages.create` `{kind: "html", title, body}`, answers `kind: "html-<id>"` and a `link` |
 | Read the page back | `room.commons.pages.read` `{kind}` (returns `content_hash`; page with `next_offset`) |
 | Rewrite the page | `room.commons.pages.replace` `{kind, mode: "whole", new_text}` (saves the old version first) |
-| Register the app | `room.commons.apps.create` `{name, database, page}`; see also `apps.list`, `apps.update`, `apps.remove` |
-| A generic starter instead of a custom page | `room.commons.apps.scaffold` `{name, database, template}` |
+| Register the app | `room.commons.apps.create` `{name, database, page, icon?}`; see also `apps.list`, `apps.update`, `apps.remove` |
+| A generic starter instead of a custom page | `room.commons.apps.scaffold` `{name, database, template, icon?}` |
 | Bring a person to the page | `room.commons.summon` `{invitee, kind: "html-<id>", context}` |
 
 A page body is at most 196,608 bytes per call (write more with `room.commons.pages.append`).
@@ -52,6 +52,9 @@ the whole call.
 | `state.get/set/delete/keys/all/on(key \| "*", fn)` | Shared, persisted room state: JSON values up to 4 KB, at most 500 keys, keys matching `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`. |
 | `emit(name, data)` / `on(name, fn)` | One-shot events, at most 20 a second. Only viewers online at that moment see them. |
 | `pages.list()` / `pages.read(kind)` | Read-only access to the room's pages. |
+| `agent.list()` | Resolves to the viewer's own agents, `[{id, name, kind, userId?}]` (see "Asking an agent from an app"). |
+| `agent.sendTask({agentId, text, key, actionId?, row?})` | Asks one of the viewer's own agents, after the viewer confirms. Resolves to `{ok: true, eventId}` or `{ok: false, reason}`. |
+| `room.post({text, key?})` | Posts in this room as the viewer, after they confirm; `<@id>` mentions a joined member. Resolves to `{posted: true, eventId}` or `{posted: false, reason}`. |
 | `now()`, `clock` | Estimated server time (`NaN` until the first sample). |
 
 The bridge allows 30 writes and 20 reads a minute per page, one watch per database, and 20,000
@@ -154,9 +157,95 @@ board grouped by the status column if there is one.
   what to do first), **error** (bridge missing, database missing, refused write, with the
   reason), and **waiting** (an opponent's turn, consent pending).
 - No dead buttons. Disable a control that cannot act right now and say why. Nothing claims to
-  send, notify, email or DM: a page cannot message anyone. If someone must be told, an agent
-  does it (step 5) or the reply says so.
+  email or notify on its own: a page sends only through `room.post` or `agent.sendTask`, each
+  after the viewer confirms the exact text (step 5). Anything else is an agent's job or the
+  reply says so.
 - Use real content, not filler. Check every number the page states.
+
+**Default look: the s.space palette.** Use these colours by default, unless the user asks for
+others; then use theirs. Each family has a dark, a mid and a light tone, named `<family>-dark`,
+`<family>-mid` and `<family>-light`:
+
+| Family | `-dark` | `-mid` | `-light` |
+| --- | --- | --- | --- |
+| `red` | `#780B20` | `#DA423A` | `#FACEFE` |
+| `green` | `#06813D` | `#9EE2BF` | `#D9F3C5` |
+| `blue` | `#0A185B` | `#465EC9` | `#ADDCFF` |
+| `orange` | `#6A3207` | `#F9A358` | `#F6C5B1` |
+| `yellow` | `#8A5911` | `#F0E345` | `#F4F6BA` |
+| `neutral` | `#1B1919` | `#B7B2AD` | `#F4F4F4` |
+
+Each token is a CSS custom property with the `--ss-` prefix: token `red-dark` is `--ss-red-dark`,
+`neutral-light` is `--ss-neutral-light`, and so on for every token. Paste them into the page:
+
+```css
+:root {
+  --ss-red-dark: #780B20; --ss-red-mid: #DA423A; --ss-red-light: #FACEFE;
+  --ss-green-dark: #06813D; --ss-green-mid: #9EE2BF; --ss-green-light: #D9F3C5;
+  --ss-blue-dark: #0A185B; --ss-blue-mid: #465EC9; --ss-blue-light: #ADDCFF;
+  --ss-orange-dark: #6A3207; --ss-orange-mid: #F9A358; --ss-orange-light: #F6C5B1;
+  --ss-yellow-dark: #8A5911; --ss-yellow-mid: #F0E345; --ss-yellow-light: #F4F6BA;
+  --ss-neutral-dark: #1B1919; --ss-neutral-mid: #B7B2AD; --ss-neutral-light: #F4F4F4;
+}
+```
+
+When the request names no colours:
+
+- **Neutral for text and surfaces.** `neutral-dark` text on `neutral-light` or white surfaces.
+  `neutral-mid` (about 2.1:1 on white) is only for borders, dividers, disabled states and large
+  text (24px and up), never body or secondary text. For secondary text use `neutral-dark` at a
+  smaller size or lighter weight, or the grey `#6B6560`: 5.7:1 on white and 5.2:1 on
+  `neutral-light`, so it meets 4.5:1 on both.
+- **One accent family**, chosen to suit the app; name it in your reply. It goes in two places
+  only: the app icon (its `-light` is the tile, its `-dark` and `-mid` the illustration) and the
+  page's primary button (`-mid`). No tinted backgrounds, badges, filled pills or coloured links.
+  Red is reserved for errors and blockers, so don't pick red as the accent family.
+- **Neutral pills with a status dot.** Pills and labels are white or `neutral-light` with
+  `neutral-dark` text and a small status dot from one fixed set: done `green-dark`, in progress
+  or at risk `yellow-dark`, idle `neutral-mid`, blocked or error `red-dark`. The pill's text
+  names the status, so the dot is never the only cue. Links are in the text colour, underlined.
+- **Check contrast.** Most `-mid` tones and `neutral-mid` are under 3:1 on white: never body
+  or secondary text. Label a `-mid` button in the family's `-dark` (or white on `blue-mid`).
+  `green-dark` on `green-light` is about 4.2:1: large text and icons only.
+- **Dark set:** `neutral-dark` surfaces, `neutral-light` text, `neutral-mid` secondary text
+  (8.3:1; `#6B6560` is 3.1:1 there). The icon and primary button keep their accent tones. Status
+  dots take the lighter tone: done `green-mid`, in progress or at risk `yellow-mid`, idle
+  `neutral-mid`, blocked or error `red-light` (`red-dark` is 1.6:1 on `neutral-dark`).
+
+**App icon.** Give every app an `icon` on its app record (`apps.create`, `apps.update` or
+`apps.scaffold`, where `describe` lists the argument). The value is a data URL
+(`data:image/svg+xml;base64,...` preferred, or a PNG) or a single emoji; `null` on
+`apps.update` clears it. Don't draw the icon in the page header or anywhere inside the page:
+the client shows it in the app chrome (the Apps list, the top-bar pins and the page's tab).
+By default, draw it to this spec:
+
+- 64 by 64, corner radius 16, on a tile in the `-light` tone of the app's **accent family**.
+- A flat illustration in that family's `-dark` and `-mid` tones: at most 3 colours with the
+  tile, no text, no gradients.
+- Plain SVG shapes, a few hundred bytes.
+- Where a green tile carries initials or a glyph, ink them in `#136733` for contrast: 5.8:1 on
+  `green-light`.
+
+If the user asks for another icon (their own upload, an emoji, a different style), use that, and
+keep it when you update the app. The server checks only safety and format: a real SVG or PNG data
+URL within the size limit, with no scripts, event handlers, external references or
+`foreignObject`; or a single emoji.
+
+```svg
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="16" fill="#ADDCFF"/>
+  <rect x="16" y="16" width="32" height="32" rx="5" fill="#465EC9"/>
+  <path d="M24 32l6 6 11-12" fill="none" stroke="#0A185B" stroke-width="5"
+    stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+```
+
+This is a blue-family check box, for an app whose accent is blue. Base64-encode the SVG and
+prefix it with `data:image/svg+xml;base64,`.
+
+**Default icons.** A set of 20 default app icons drawn to this spec will live in
+`skills/commons-app-builder/icons/` (coming soon). Until then, draw one as above, or use the
+user's.
 
 ## 5. Agent hooks
 
@@ -174,6 +263,53 @@ Choose one when the app needs an agent's work:
 - **`room.commons.summon`** calls a person to the page with a card. A card names a page, not
   a row.
 
+### Asking an agent from an app
+
+A page can ask an agent for work in three ways. Each has its own permission; pick by who should
+do the work and who should see the ask.
+
+**1. `artifact.agent.sendTask` asks the viewer's own agent.** Use it for "my agent, do this for
+me" buttons.
+
+- `artifact.agent.list()` resolves to the viewer's own agents as `[{id, name, kind, userId?}]`.
+  `id` is the per-room id to pass back; `userId` is present only when the agent is in this room.
+  It resolves to `[]` until the viewer allows the page (the same "access to room data" question as
+  data writes).
+- `artifact.agent.sendTask({agentId, text, key, actionId?, row?})`:
+  - `agentId` is an `id` from `agent.list()`. `text` is the whole ask; it is shown to the viewer
+    exactly. `key` matches `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` and names this request: sending the
+    same `key` again never asks twice.
+  - Optional data the agent reads, never instructions: `actionId` (`[A-Za-z0-9._-]{1,64}`, which
+    button asked) and `row: {database, rowId}` (the row it is about).
+- The host shows the viewer the exact text and the agent's name, and nothing is sent unless they
+  confirm. Only agents the viewer owns are offered. The task goes to the agent's private DM with
+  the viewer; nothing is posted in this room. The server also limits accepted requests (10 a
+  minute per person and agent) and refuses an agent that is not the viewer's.
+- It resolves to `{ok: true, eventId}`, a dispatch receipt, or `{ok: false, reason}`. Reasons
+  include `declined`, `page permission required`, `agent not owned or unavailable`,
+  `too many agent requests`, `another request is in progress` and `request outcome unknown`
+  (retry with the same `key`).
+
+**2. `artifact.room.post` asks an agent in the room, as the viewer.** Use it when the ask should
+be seen by the room, or the agent is not the viewer's.
+
+- `artifact.room.post({text, key?})`: write `<@id>` in `text` to mention a joined member, with
+  `id` from `artifact.members()`. At most 20 mentions; `@room`-style group mentions are refused.
+- The viewer confirms the exact message, and it is posted as them. The mentioned agent answers by
+  its own policy (its mention gate and its owner's rules); the page gets no answer of its own.
+- It resolves to `{posted: true, eventId}` or `{posted: false, reason}`. Reasons include
+  `declined`, `mention is not a joined member`, `a page cannot mention a group` and
+  `too many room posts` (10 a minute).
+
+**3. A row change summons an agent.** That is "Summon on a row" above: the agent's work is
+triggered by data, under the database's summon policy, with no dialog. Use it for workflows where
+the row itself is the request.
+
+**What a page does not get back today.** None of the three returns the agent's progress, its
+completion or its result to the page. `eventId` only says the request was sent. Use a row the
+agent updates (a `Status` and an `Outcome` column, as above) when the page must show the outcome,
+and read it with `db.onChange`.
+
 What's safe:
 
 - On rows that anyone can create (sign-ups, guesses, poll votes), leave `Actor` empty, and leave
@@ -187,7 +323,7 @@ What's safe:
 
 1. **Read back everything you created.** `databases.list` shows each column with the right
    type and options. `pages.read` returns the page: compare its `content_hash` or length with
-   what you sent. `apps.list` shows the app on the right database and page.
+   what you sent. `apps.list` shows the app on the right database and page, with its icon.
 2. **Run the page headless** at about 390px and about 1280px wide, in light and dark. The
    390px check is required before any reply. If the request names the requester's device,
    check that layout first. Use a fake `artifact` with a
@@ -221,7 +357,7 @@ Reply with:
 
 - the page link (the `link` the Action returned);
 - the databases and their columns, in one line each;
-- the defaults you assumed;
+- the defaults you assumed, including the accent family;
 - what to try first ("tap a slot to sign up; the page asks once to edit data");
 - what you could not test.
 
@@ -261,10 +397,11 @@ Request: "Build a Commons app: sign-ups for Saturday's cleanup, morning or after
    ```
 
    CSS: `.slots {display: grid; gap: 12px}`, with `@media (min-width: 640px) {.slots
-   {grid-template-columns: 1fr 1fr}}`, `button {min-height: 44px}`, and colour variables with a
-   dark set.
+   {grid-template-columns: 1fr 1fr}}`, `button {min-height: 44px}`, and the palette's custom
+   properties with green as the accent and a dark set.
 4. **Create** it with `pages.create {kind: "html", title: "Cleanup sign-ups", body}`, then
-   `apps.create {name: "Cleanup sign-ups", database: "db:<id>", page: "html-<id>"}`.
+   `apps.create {name: "Cleanup sign-ups", database: "db:<id>", page: "html-<id>", icon}`, where
+   `icon` is the green-family version of the example icon above, to match the page's accent.
 5. **Verify:**
    - `databases.list` shows four columns plus the title;
    - `pages.read` returns the page's hash;
@@ -277,10 +414,13 @@ Request: "Build a Commons app: sign-ups for Saturday's cleanup, morning or after
 
 ## Starter templates
 
-`templates/` holds four working apps to start from, each a `page.html` with its
+`templates/` holds six working apps to start from, each a `page.html` with its
 `schema.json`: a **tracker** (status, owner, due date, and an agent on a row), a **poll**
 (one row per vote, ownership through `created_by`), a **planner** (dated items in a week
-view) and a **two-player turn game** (append-only moves, the turn from the move count).
+view), a **two-player turn game** (append-only moves, the turn from the move count), a
+**research desk** (sourced findings that stay proposed until a person accepts them, a report,
+and "ask my agent") and a **task board** (a person hands a task to their own agent, which
+reports on the row).
 `templates/README.md` says which to pick and how to create one. Copy and adapt rather than
 starting from an empty file, then still follow steps 2, 6 and 7 for the app you ship.
 

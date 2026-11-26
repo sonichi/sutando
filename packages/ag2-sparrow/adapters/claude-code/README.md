@@ -106,8 +106,33 @@ on the result it finds. A park that
 settled but whose reply was lost (the lock's release failed and the claim
 could not be re-read) answers settled on the identical park again, naming the
 protocol failure only when that is what it delivered; nothing is published
-twice. A Mod that lost its offers inside one generation (a plugin reload, not
-a session restart) claims every listed task afresh, and a claim it already
+twice. A plugin reload inside a live session starts the Mod's variables over, so
+the Mod keeps its offers in flight in the session's state (`$.state`, which a
+reload leaves in place) and takes them back at its next start, but only those
+the CLI still lists as this generation's open claims at the same attempt
+(`inbox inflight`, read-only): a queued prompt can then still be confirmed by
+its own turn, a running turn can still answer with `ag2space_reply`, and an
+accepted answer is published at the next tick. A taken-back turn whose end the
+Mod did not see is closed with the protocol failure when the session's next
+main-loop turn starts, or after 30 minutes, so intake is never held for good.
+A queued prompt is never submitted a second time. One whose submit is not known
+to have reached the session is not waited for at all; one that did reach it is
+waited for five minutes; after that intake goes on, the turn is still confirmed
+if it starts, and otherwise the next start answers it. A confirmation the CLI
+asked to retry is kept with the turn it is for (and that turn's end, once seen)
+and tried again after the reload; one the CLI keeps asking to retry holds intake
+for five minutes, after which intake goes on and the retry continues (the same
+bound holds for a turn that was never reloaded; a turn whose confirmation went
+through holds intake until it ends). An offer
+intake stopped waiting for is still kept, so a second reload does not lose it or
+a confirmation that came late. The body handed to `stage` rides on the offer
+from before the CLI is asked until staging is settled, so every save made in
+between carries its bytes and a reload between the stage's steps still holds
+them: they are staged and published at the turn's end, and no other text is
+accepted.
+Whatever the Mod did not keep (an engine without `$.state`, a state that could
+not be written), or the CLI does not list, goes the way it always has: a Mod
+that lost its offers inside one generation claims every listed task afresh, and a claim it already
 drove past its call is one it can never finish: at TURN_CONFIRMED with an
 accepted answer the lifecycle's one decision for such a turn (`close_turn`,
 the same one generation recovery takes) applies: a descriptor whose blob
@@ -183,7 +208,7 @@ instruction:
 Reply with the ag2space_reply tool (task_id <id>); the reply is published to results/task-<id>.txt for you.
 ```
 
-**Who is served.** Admission is the shared `task_io.admission` over the attested
+**Who is served.** Admission is the shared `task_io.turn_policy` over the attested
 headers, decided by the inbox CLI's `claim` (the Mod renders its answer and
 re-implements no policy). By default only the owner is served: a team or guest
 task, collaborator or not, is never submitted to the session; `claim` answers it
@@ -191,18 +216,44 @@ with the shared owner-only refusal ("This agent only answers its owner here.")
 as its result, which the bridge delivers to that room. A task file with no
 `access_tier:` header is refused the same way as malformed (Sparrow's bridge
 writes one on every task, in `remote_gateway_bridge._write_task`); the shared
-resolver's "no tier means owner" is not relied on here. `install
---allow-non-owner` (persisted in the config, shown by `verify`, off by default)
-submits team and guest tasks without collaborator access as data. `install
---allow-collaborator` (the same: persisted, shown by `verify`, off by default)
-submits an attested collaborator's task (the team tier with the broker's
-`collaborator: true`), as the relay loop and the routine and cloud-session
-adapters gate it; `--allow-non-owner` does not imply it. Unlike those adapters,
-which answer a collaborator on an isolated read-only turn, this one submits it
-into the owner's session: the session holds the owner's history, tools and
-credentials with permission prompts off, and the note below is the only guard.
-An isolated collaborator turn here is follow-up work. Each submitted non-owner
-task carries the shared
+resolver's "no tier means owner" is not relied on here. By default an attested
+collaborator's task (the team tier with the broker's `collaborator: true`) is
+submitted into the owner's session; `install --no-allow-collaborator` refuses it
+with the owner-only line instead (persisted in the config as
+`ALLOW_COLLABORATOR=0`, shown by `verify`; `--allow-collaborator` is still
+accepted and is the default, and a config from an older install that recorded
+the key empty or not at all serves collaborators too). The shared policy gives a
+collaborator the owner's capabilities, bounded by the non-owner note and the
+gateway's delivery guard. The session holds the owner's history, tools and
+credentials with permission prompts off. A team or guest task without
+collaborator access (a guest, plain team, a wire `team` without the stamp, an
+unknown tier) gets a restricted turn under the shared policy, which must be
+isolated and read-only. By default (`install --no-allow-non-owner` refuses it
+with the owner-only line instead, recorded as `ALLOW_NON_OWNER=0` and shown by
+`verify`; `--allow-non-owner` is still accepted and is the default, and an older
+install that recorded the key empty serves them too) `claim` runs it itself, as the routine and
+cloud-session adapters do (`collaborator_turn.py`), and never submits it to the
+session: one `claude -p --safe-mode --restricted --strict-mcp-config
+--no-session-persistence --tools Read,Grep,Glob` in a fresh empty directory
+removed afterwards, on the agent's own login (the recorded `CLAUDE_CONFIG_DIR`,
+else the session's) with only `PATH`, `HOME`, `USER`, `LANG` and
+`CLAUDE_CONFIG_DIR` in its environment, 120 s at most, at most 10 an hour. It
+loads none of the owner's MCP servers, plugins, hooks, `CLAUDE.md` or settings
+files, and nothing of the session's history. The only files it can read are
+the ones the sender attached to this task: each `attachments:` locator that is
+a regular file (not a symlink) under the bridge's `state/remote-media`, at most
+25 MB, is copied into its directory and the prompt names the copy
+(`collaborator_turn.stage_own_attachments`); the folder itself is never given
+to it. Its prompt is the routine
+adapters' payload (the non-owner note, the body between untrusted markers), with
+the gateway's Sutando tier block said as that turn can follow it (its reply
+text is the result, not `results/<task>.txt`; it is the read-only sandbox, so
+no `codex exec` step; every other rule verbatim). Its reply, made inert, is
+published as the task's result through the lifecycle, so the gateway's
+delivery guard scans it as any non-owner result; a failed or capped turn
+publishes one plain line instead. `claim` answers the Mod with a final
+refusal, so the Mod retires the task: neither the sender's text nor the answer
+ever reaches the owner's session. Each submitted non-owner task carries the shared
 `ag2_sparrow.task_io.NON_OWNER_NOTE`, the one policy text every adapter renders
 (pinned in `register.ts`; a CI test holds it byte-identical to the shared owner):
 
@@ -360,6 +411,7 @@ ag2-sparrow-claude-local install \
   [--token-env-file <the agent's .env>] [--work <work>]
 ag2-sparrow-claude-local verify [<selector>]
 ag2-sparrow-claude-local attach [<selector>]   # the live pane; detach with the tmux prefix + d
+ag2-sparrow-claude-local model [<model>] [--confirm] [<selector>]  # print the model, or switch it live
 ag2-sparrow-claude-local stop --confirm [<selector>]  # confirm an open stall card's Stop here
 ag2-sparrow-claude-local uninstall [<selector>]
 ag2-sparrow-claude-local list            # each job installed here, its agent, state and selector
@@ -603,6 +655,30 @@ stays the pane's. The session runs `claude --plugin-dir … --permission-mode �
 `install --new-session` rotates it only once the old generation is proven
 gone (quiescent; otherwise the old id stays and the command says so).
 
+**Resuming a conversation you already have.** `install` or `connect` with
+`--resume-session <uuid>` hosts an existing Claude Code conversation instead
+of a new one: the id is recorded as the session id and the pane starts
+`claude --resume <uuid>`. Its transcript must exist as `<uuid>.jsonl` in some
+project folder of the config dir's `projects/` (pass the `--claude-config-dir`
+it was made in), and no running Claude Code process may have it open (the CLI's
+own `sessions/` registry); otherwise nothing is changed and, for `connect`, the
+code is not spent. Claude Code finds a transcript by id from any working
+directory, so nothing is copied or linked: the conversation keeps growing in
+its own file, and new turns record the pane's `<work>/tasks` as their cwd. A
+kept id is replaced under the same rule as `--new-session`; when it cannot be
+(the old session is not proven gone), the agent is installed and running under
+the kept id, its bridge included, and the command exits **79** with a line
+naming the stop to run before installing again. Find the id with
+`/status` in that conversation, or as the file name under `projects/`.
+A host that gives the agent a config dir of its own places a copy (a clone,
+never a link to the owner's file) at
+`<claude-config-dir>/projects/<any folder>/<uuid>.jsonl` before install, and
+passes `--claude-config-dir <claude-config-dir> --resume-session <uuid>`; only
+that config dir is searched. Exit 0: the conversation is the session; 79: the
+agent runs under its earlier session id instead (nothing torn down); 2: refused
+before anything changed (bad id, no transcript, or the conversation open in a
+running Claude Code process).
+
 **Folder trust and startup dialogs.** Before it creates a session the launcher
 records Claude Code's own trust for exactly `<work>/tasks` (never a parent):
 `projects[<resolved path>].hasTrustDialogAccepted: true` in the CLI's global
@@ -697,6 +773,34 @@ key in one save). The launcher executes the effect once, under the same
 locks, and records its evidence. Keep waiting is a successor requirement
 whose id and guard derive from the saga key, reconciled to exactly one at
 every start.
+
+**`model`.** Without an argument it prints `{"model": …}`: the model the last switch made here landed on
+(`state/model-switch.json` in the work root), `null` when there has been none. It does not read Claude
+Code's own settings, which live in the config dir beside the login. With one it switches the running
+session, no restart:
+`/model <model>` is typed into the pane through the same fenced sender `stop` uses, so nothing is typed
+into a pane that is not the recorded one. The switch counts only when the pane then shows a new
+"Set model to" line (20 s); otherwise the answer is `switched: false` with one line why, exit 1. Inside a
+running conversation Claude Code asks first ("Yes, switch / No, go back"): `--confirm` answers it once,
+without it the dialog is cancelled. The model is Claude Code's to remember; this command writes no
+settings. Not measured against a real Claude Code here (the tests drive a stand-in on a real tmux
+server); the two screen texts are the ones `skills/model-switch` waits for on the core. A `/model`
+typed while a turn is running is queued by Claude Code and applies when the turn ends, so the 20 s
+wait can report `unconfirmed` for a switch that lands later.
+
+**The model card.** The owner can also switch from their DM, with the same card Antigravity and local Codex use (`ag2_sparrow/model_switch.py`). `inbox claim` answers these before the session sees them (`adapters/claude_code/model_card.py`): `/model` in the DM posts the menu (the core's list: Default, Opus, Sonnet 1M, Haiku, Fable 1M), and a tap on it, or `/model <name>`, saves the pick and posts "switching". It then starts `python -m ag2_sparrow.adapters.claude_code.model_card apply` detached: this `model` switch with `--confirm`, sent only once the session is out of a task's turn (it polls for up to 5 minutes in all, retries included), then "Switched" or "could not switch (why)" in the DM (log: `state/model-apply.log`). Any tap but the owner's in their DM gets the fixed refusal. The isolated turn for a restricted sender runs on the same pick (`ANTHROPIC_MODEL`). The owner's frame tells the session that /model in the DM is the way to switch, never a terminal.
+
+**The account card.** `/account` or `/login` in the owner's DM, or a tap on the card, is also answered by `inbox claim` (`adapters/claude_code/account_card.py`, the shared `account_switch` card): the account Claude Code reports for the agent's own config dir (`claude auth status --json`; the address in full, no plan), and "Switch account". The card carries `account_controls` (`{"runtime": "claude"}`): in the desktop app, on the computer that runs the agent, the owner switches account right in the card (the app runs `account --start` and takes the code in the card's own box, never sent to the chat). The button starts nothing here: a sign-in code never travels as a chat message, so for a client without those controls it says "Open this on the computer that runs Claude Code to switch account." English only. The owner's frame says the same, so the session never sends the owner to Claude's connector settings or asks for a code in chat.
+
+**The quota notice.** A session at its usage limit cannot answer, so the launcher tells the owner instead. Each tick it already reads the pane; when Claude Code's own limit menu is the live dialog there ("Stop and wait for limit to reset" with the caret on one of its options, `pane_composer.limit_menu`, the same rows the core's pane gate reads), or its out-of-credits banner leads one of the last lines, `quota_card.notice` queues the account card for the owner's DM: that the agent has reached its limit, when it resets if the pane says, the account in use, and the account controls to switch with. A usage-limit banner with no menu, or words that only read like the menu (a reply, a quoted message), send nothing. Every owner message left unanswered behind the menu gets the card once. The reset time is the live menu's, else the newest banner's own, and only its time-like characters; no other line of the pane can reach the DM. One card per limit: the next is sent only once the banner has been gone for ten minutes and comes back; a card that could not be queued is tried again a minute later under the same key, so a restart in between is not a second card. Queued is not told: the bridge drops a card it could not post within ten minutes, so the limit counts as told only when the card left the outbox in time or its posted receipt is there, and a dropped one is queued again (the same card id, which replaces the earlier in the room). A connector is not told the owner's DM room: it is remembered (`state/quota-room.json`, written only at the claim; the incident is `state/quota-card.json`, written only by the supervisor) from the owner's own messages there, and until one has been seen nothing is sent and the launcher's stall card is what reaches the owner. Nothing is typed into the session and no account is changed by the notice.
+
+*The account card.** `/account` or `/login` in the owner's DM, or a tap on the card, is also answered by `inbox claim` (`adapters/claude_code/account_card.py`, the shared `account_switch` card): the account Claude Code reports for the agent's own config dir (`claude auth status --json`; the address in full, no plan), and "Switch account". The card carries `account_controls` (`{"runtime": "claude"}`): in the desktop app, on the computer that runs the agent, the owner switches account right in the card (the app runs `account --start` and takes the code in the card's own box, never sent to the chat). The button starts nothing here: a sign-in code never travels as a chat message, so for a client without those controls it says "Open this on the computer that runs Claude Code to switch account." English only. The owner's frame says the same, so the session never sends the owner to Claude's connector settings or asks for a code in chat.
+
+**The quota notice.** A session at its usage limit cannot answer, so the launcher tells the owner instead. Each tick it already reads the pane; when Claude Code's own limit menu is the live dialog there ("Stop and wait for limit to reset" with the caret on one of its options, `pane_composer.limit_menu`, the same rows the core's pane gate reads), or its out-of-credits banner leads one of the last lines, `quota_card.notice` queues the account card for the owner's DM: that the agent has reached its limit, when it resets if the pane says, the account in use, and the account controls to switch with. A usage-limit banner with no menu, or words that only read like the menu (a reply, a quoted message), send nothing. Every owner message left unanswered behind the menu gets the card once. The reset time is the live menu's, else the newest banner's own, and only its time-like characters; no other line of the pane can reach the DM. One card per limit: the next is sent only once the banner has been gone for ten minutes and comes back; a card that could not be queued is tried again a minute later under the same key, so a restart in between is not a second card. Queued is not told: the bridge drops a card it could not post within ten minutes, so the limit counts as told only when the card left the outbox in time or its posted receipt is there, and a dropped one is queued again (the same card id, which replaces the earlier in the room). A connector is not told the owner's DM room: it is remembered (`state/quota-room.json`, written only at the claim; the incident is `state/quota-card.json`, written only by the supervisor) from the owner's own messages there, and until one has been seen nothing is sent and the launcher's stall card is what reaches the owner. Nothing is typed into the session and no account is changed by the notice.
+
+**Asked in words.** The owner need not type a command: the owner's frame tells the session to answer a question about its model or its account with exactly `[model-card]` or `[account-card]`, and `inbox stage` turns that answer into the card in the DM (`model_card.marked_answer`, #6685's `Desk.marked`), staging the card's no-send line instead; the first answer is kept in `state/card-marks/`, so a staging retry stages the same bytes and shows no second card. A mark from anyone but the owner is published as written, and outside the DM the answer says where to ask.
+
+**Asked in words.** The owner need not type a command: the owner's frame tells the session to answer a question about its model or its account with exactly `[model-card]` or `[account-card]`, and `inbox stage` turns that answer into the card in the DM (`model_card.marked_answer`, the shared desk's `marked`), staging the card's no-send line instead; the first answer is kept in `state/card-marks/`, so a staging retry stages the same bytes and shows no second card. A mark from anyone but the owner is published as written, and outside the DM the answer says where to ask.
 
 `attach` is `tmux attach` on the adapter's own socket: the same session under the same lock, so a
 `/exit` typed there ends it and the launcher resumes it by id; `--help` states the limits.
@@ -807,9 +911,9 @@ mtime delta.
   machine is the owner's path meanwhile.
 - On macOS the launchd user agent stops at logout; on Linux `install` asks
   for linger.
-- With `--allow-collaborator` an attested collaborator's text, and with
-  `--allow-non-owner` any other team or guest text, reaches a session running under
+- Unless installed with `--no-allow-collaborator`, an attested collaborator's text reaches a session running under
   `bypassPermissions` (the default mode): the only guard between that text and
   every tool, file and credential the session can reach is the
-  `NON_OWNER_NOTE` in its frame and the model honouring it. Turn either flag
-  on only for people and rooms you would let type into that session yourself.
+  `NON_OWNER_NOTE` in its frame, the gateway's delivery guard and the model
+  honouring them. Opt out if your collaborators are not people you would let
+  type into that session yourself.

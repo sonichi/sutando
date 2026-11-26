@@ -13,13 +13,15 @@ WATCHER; the session is started once, here, and resumed only when asked.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
-import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -40,6 +42,8 @@ import tmux_probe  # noqa: E402
 import worker_identity as wi  # noqa: E402
 
 
+# The Codex worker launcher's exit when another launch holds the session name.
+LAUNCH_LOST = 75
 # The core's own identity: inherited, these stamp a worker's direct posts as
 # "worker-<core id>" while pool delivery stamps the worker's real id.
 _CORE_ONLY_ENV = ("SUTANDO_CORE_ID", "SUTANDO_CORE_POOL_SIZE", "SUTANDO_WORKER_SEAT")
@@ -52,6 +56,20 @@ def inherited_env(drop=()) -> dict:
 
 
 DEFAULT_SOCKET = "/tmp/sutando-tmux.sock"
+
+
+def attach_argv(socket, session_name) -> list[str]:
+    """Attach to exactly this session, never a session sharing its prefix."""
+    return ["tmux", "-S", str(socket), "attach-session", "-t", f"={session_name}"]
+
+
+def attach_command(socket, session_name) -> str:
+    """A copyable Bash/Zsh command targeting exactly this worker session."""
+    # shlex.quote leaves '=' bare, but Zsh expands a word starting with '='.
+    return " ".join(
+        "'" + str(arg).replace("'", "'\"'\"'") + "'"
+        for arg in attach_argv(socket, session_name)
+    )
 
 
 def default_socket() -> str:
@@ -228,6 +246,32 @@ def resolve_runtime(repo, runtime=None, runner=_run) -> str:
     return runtime
 
 
+def inbox_env(workspace, worker_id: str, scripts=None) -> dict:
+    """The inbox half of a worker session's env, the one rule its spawn and its remedy share. A worker
+    with its own folders (`connections.worker_dirs`) reads a plain inbox of task files and answers in its
+    own results; any other reads sentinels from its deliveries folder through the resolver."""
+    import connections
+    scripts = Path(scripts or _SCRIPTS)
+    own = connections.worker_dirs(worker_id, Path(workspace))
+    if own:
+        # Set empty, not left out: a value inherited from the caller would make the inbox a sentinel one.
+        return {"SUTANDO_TASKS_DIR": str(own[0]), "SUTANDO_RESULTS_DIR": str(own[1]),
+                "SUTANDO_INBOX_KIND": "", "SUTANDO_INBOX_RESOLVER": "", "SUTANDO_WORKSPACE_DIR": str(workspace)}
+    return {"SUTANDO_TASKS_DIR": str(pd.deliveries_dir(workspace, worker_id)),
+            # The inbox holds sentinels, not task bodies. The reader is TOLD
+            # that here; inferring it from the path is the reader deciding.
+            "SUTANDO_INBOX_KIND": "deliveries",
+            # The watcher infers the workspace from its inbox; a delivery
+            # folder would put state/ and results/ under deliveries/.
+            "SUTANDO_WORKSPACE_DIR": str(workspace),
+            # Named, not derived: every runtime writes its answers where the
+            # bridges drain them, which is the workspace's own results/.
+            "SUTANDO_RESULTS_DIR": str(pd.results_dir(workspace)),
+            # REQUIRED: the inbox above holds sentinels, so without a resolver
+            # the watcher hands over the zero-byte one.
+            "SUTANDO_INBOX_RESOLVER": str(scripts / "resolve-inbox-entry")}
+
+
 def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
          socket=None, label: str = "", worker_id=None) -> dict:
     """What a spawn would create. Pure — no side effects, so it is reviewable
@@ -235,7 +279,12 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
     socket = socket or default_socket()
     worker_id = worker_id or wi.new_worker_id()
     delivery_dir = str(pd.deliveries_dir(workspace, worker_id))
+    skipped: list = []
+    plugin_dirs = pr.worker_plugin_dirs(workspace, worker_id, skipped=skipped,
+                                        warn=lambda m: print(m, file=sys.stderr))
     return {
+        # Recorded dirs this start leaves out, so the start's result shows what is missing.
+        "plugin_dirs_skipped": skipped,
         "worker_id": worker_id,
         "label": label or worker_id,
         "runtime": runtime,
@@ -251,30 +300,21 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
                 # stamps the same bare id, so both paths name one worker.
                 "SUTANDO_WORKER_ID": worker_id,
                 "SUTANDO_WORKER_RUNTIME": runtime,
-                "SUTANDO_TASKS_DIR": delivery_dir,
-                # The inbox holds sentinels, not task bodies. The reader is TOLD
-                # that here; inferring it from the path is the reader deciding.
-                "SUTANDO_INBOX_KIND": "deliveries",
-                # The watcher infers the workspace from its inbox; a delivery
-                # folder would put state/ and results/ under deliveries/.
-                "SUTANDO_WORKSPACE_DIR": str(workspace),
-                # Named, not derived: every runtime writes its answers where the
-                # bridges drain them, which is the workspace's own results/.
-                "SUTANDO_RESULTS_DIR": str(pd.results_dir(workspace)),
+                **inbox_env(workspace, worker_id),
                 "SUTANDO_CLAUDE_WORKING_DIR": str(cwd or repo),
                 "SUTANDO_CODEX_WORKING_DIR": str(cwd or repo),
                 # The worker's own gate, named by the skill that owns it: the
                 # core's `/startup --worker` runs what it is handed, not a path.
                 "SUTANDO_WORKER_BOOTSTRAP": str(_SCRIPTS / "worker_bootstrap.py"),
-                # Same rule, and REQUIRED here: the inbox above holds sentinels,
-                # so without a resolver the watcher hands over the zero-byte one.
-                "SUTANDO_INBOX_RESOLVER": str(_SCRIPTS / "resolve-inbox-entry"),
                 # A core exports this; the launcher reads the INHERITED value
                 # to decide it was invoked from inside one. A worker is not.
                 "SUTANDO_CORE_SESSION": "",
                 # The done-flag writer, so a finished delivery can reach
                 # `finished` instead of being re-reported on every boot.
-                "SUTANDO_POOL_DELIVERY_SCRIPT": str(_SCRIPTS / "pool_delivery.py")},
+                "SUTANDO_POOL_DELIVERY_SCRIPT": str(_SCRIPTS / "pool_delivery.py"),
+                # The owner's per-worker plugin opt-in (pool_manage.py plugins), one per line;
+                # always set, so a value inherited from the caller never loads into this worker.
+                "SUTANDO_WORKER_PLUGIN_DIRS": "\n".join(plugin_dirs)},
     }
 
 
@@ -358,6 +398,29 @@ def ensure_remedy_timer(workspace, repo, *, runner=None,
         return {"ensured": False, "why": f"{type(e).__name__}: {e}"}
 
 
+@contextlib.contextmanager
+def launch_lock(workspace, session_name: str, wait: float = 1.0):
+    """Hold the launch of one tmux session name, from its probe to its committed run; refuse a
+    second launch while one is in progress rather than queue it behind a session it would find.
+    A viewer's shared hold (pool_sessions) lasts one read, so it is waited out for `wait` seconds."""
+    path = Path(workspace) / "state" / "worker-launch" / f"{session_name}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+") as fh:
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise SpawnRefused(f"another launch of tmux session {session_name!r} is in progress")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def spawn(workspace, repo, *, runtime=None, cwd: str = "",
           socket=None, label: str = "", runner=_run,
           require_sentinel: bool = True, resume: str = "",
@@ -415,73 +478,79 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
     p = plan(workspace, repo, runtime=runtime, cwd=cwd, socket=socket,
              label=label, worker_id=worker_id)
     name = p["tmux"]["session_name"]
-    state, detail = session_probe(name, socket, runner)
-    if state == "exists":
-        raise SpawnRefused(f"tmux session {name!r} already exists")
-    if state != "absent":
-        raise SpawnRefused(f"tmux could not say whether session {name!r} exists "
-                           f"({detail}); refusing rather than minting a worker over one")
-    run = None
-    if existing_worker_id:
-        run = wi.start_incarnation(workspace, worker_id, None,
-                                   tmux_socket=socket, tmux_session=name,
-                                   runtime="codex", cwd=str(cwd or repo))
-        rec = {"worker_id": worker_id}
-    elif resumed_id:
-        run = wi.start_incarnation(workspace, worker_id, session_id, tmux_socket=socket,
-                                   tmux_session=name)
-        rec = {"worker_id": worker_id}
-    else:
-        rec = wi.create_worker(workspace, runtime=runtime, cwd=str(cwd or repo),
-                               host=os.uname().nodename, session_id=session_id,
-                               tmux_socket=socket, worker_id=worker_id)
-    Path(p["delivery_dir"]).mkdir(parents=True, exist_ok=True)
+    # One launch per session name: a competing spawn must not register a run or write its files.
+    with launch_lock(workspace, name):
+        state, detail = session_probe(name, socket, runner)
+        if state == "exists":
+            raise SpawnRefused(f"tmux session {name!r} already exists")
+        if state != "absent":
+            raise SpawnRefused(f"tmux could not say whether session {name!r} exists "
+                               f"({detail}); refusing rather than minting a worker over one")
+        run = None
+        if existing_worker_id:
+            run = wi.start_incarnation(workspace, worker_id, None,
+                                       tmux_socket=socket, tmux_session=name,
+                                       runtime="codex", cwd=str(cwd or repo))
+            rec = {"worker_id": worker_id}
+        elif resumed_id:
+            run = wi.start_incarnation(workspace, worker_id, session_id, tmux_socket=socket,
+                                       tmux_session=name)
+            rec = {"worker_id": worker_id}
+        else:
+            rec = wi.create_worker(workspace, runtime=runtime, cwd=str(cwd or repo),
+                                   host=os.uname().nodename, session_id=session_id,
+                                   tmux_socket=socket, worker_id=worker_id)
+        Path(p["delivery_dir"]).mkdir(parents=True, exist_ok=True)
 
-    # start-cli prefers RESUME, so an INHERITED one would beat the SESSION_ID a
-    # fresh spawn sets: drop both, then state the single intent.
-    env = inherited_env(drop=("SUTANDO_CLAUDE_RESUME", "SUTANDO_CLAUDE_SESSION_ID"))
-    env.update(p["env"])
-    if runtime == "claude":
-        env.update({"SUTANDO_CLAUDE_RESUME": session_id} if resumed_id
-                   else {"SUTANDO_CLAUDE_SESSION_ID": session_id})
-    r = runner(p["launcher_argv"], env=env)
-    if r.returncode != 0:
-        why = (r.stderr or "").strip()
-        # A non-zero launcher may still have started the session (a readiness
-        # probe that times out); deleting then would strip a live worker.
-        after, detail = session_probe(name, socket, runner)
-        if after != "absent":
-            fate = ("is alive" if after == "exists"
-                    else f"could not be checked ({detail})")
-            raise SpawnRetained(
-                f"the runtime launcher failed ({why}), and tmux session {name!r} "
-                f"{fate}, so worker {rec['worker_id']} was KEPT with its records "
-                f"and inbox {p['delivery_dir']}. Attach with "
-                f"`tmux -S {socket} attach -t {name}` to finish or stop it, then "
-                f"remove the worker if it is not wanted.",
-                worker_id=rec["worker_id"], delivery_dir=str(p["delivery_dir"]),
-                tmux_session=name, tmux_socket=str(socket))
-        # No session: nothing can be pointing at either path, so roll back
-        # exactly what this call minted.
-        # A resumed worker existed before this call: its records and inbox are
-        # not ours to remove, only the run we failed to start.
-        if run is not None:
-            wi.end_incarnation(workspace, worker_id, run["incarnation_id"], "crashed")
-        if not resumed_id and not existing_worker_id:
-            shutil.rmtree(wi.worker_dir(workspace, rec["worker_id"]), ignore_errors=True)
-            shutil.rmtree(p["delivery_dir"], ignore_errors=True)
-        raise SpawnRefused(f"the runtime launcher failed: {why}")
+        # start-cli prefers RESUME, so an INHERITED one would beat the SESSION_ID a
+        # fresh spawn sets: drop both, then state the single intent.
+        env = inherited_env(drop=("SUTANDO_CLAUDE_RESUME", "SUTANDO_CLAUDE_SESSION_ID"))
+        env.update(p["env"])
+        # The Codex seat stamps this on its declaration, so a viewer can tell this run's seat from a stale one.
+        env["SUTANDO_WORKER_INCARNATION_ID"] = (run or rec).get("incarnation_id") or ""
+        if runtime == "claude":
+            env.update({"SUTANDO_CLAUDE_RESUME": session_id} if resumed_id
+                       else {"SUTANDO_CLAUDE_SESSION_ID": session_id})
+        r = runner(p["launcher_argv"], env=env)
+        if r.returncode == LAUNCH_LOST and session_probe(name, socket, runner)[0] == "exists":
+            # Another launch holds the session name: this run never started, so it must not stay the open one.
+            wi.end_incarnation(workspace, worker_id, (run or rec)["incarnation_id"], "superseded")
+            raise SpawnRefused(f"another launch holds tmux session {name!r}; this attempt did not start")
+        if r.returncode != 0:
+            why = (r.stderr or "").strip()
+            # A non-zero launcher may still have started the session (a readiness
+            # probe that times out); deleting then would strip a live worker.
+            after, detail = session_probe(name, socket, runner)
+            if after != "absent":
+                fate = ("is alive" if after == "exists"
+                        else f"could not be checked ({detail})")
+                raise SpawnRetained(
+                    f"the runtime launcher failed ({why}), and tmux session {name!r} "
+                    f"{fate}, so worker {rec['worker_id']} was KEPT with its records "
+                    f"and inbox {p['delivery_dir']}. Attach with "
+                    f"`{attach_command(socket, name)}` to finish or stop it, then "
+                    f"remove the worker if it is not wanted.",
+                    worker_id=rec["worker_id"], delivery_dir=str(p["delivery_dir"]),
+                    tmux_session=name, tmux_socket=str(socket))
+            # No session, so nothing points at what this call minted: roll that back. A resumed
+            # or recovered worker predates the call, so only the run we failed to start is ours.
+            if run is not None:
+                wi.end_incarnation(workspace, worker_id, run["incarnation_id"], "crashed")
+            if not resumed_id and not existing_worker_id:
+                shutil.rmtree(wi.worker_dir(workspace, rec["worker_id"]), ignore_errors=True)
+                shutil.rmtree(p["delivery_dir"], ignore_errors=True)
+            raise SpawnRefused(f"the runtime launcher failed: {why}")
 
-    # Best-effort: a beat that fails to start is `state: live, beat: absent`,
-    # which the roster's own three-state design already tolerates.
-    beat_started = False
-    watch_pid = pane_pid(name, socket, runner)
-    if watch_pid is not None:
-        beat_started = start_worker_beat(workspace, rec["worker_id"], watch_pid, repo=repo)
+        # Best-effort: a beat that fails to start is `state: live, beat: absent`,
+        # which the roster's own three-state design already tolerates.
+        beat_started = False
+        watch_pid = pane_pid(name, socket, runner)
+        if watch_pid is not None:
+            beat_started = start_worker_beat(workspace, rec["worker_id"], watch_pid, repo=repo)
 
-    remedy = ensure_remedy_timer(workspace, repo, runner=runner)
-    return {**p, **rec, "runtime_session_id": session_id, "started": True,
-            "beat_started": beat_started, "remedy_timer": remedy}
+        remedy = ensure_remedy_timer(workspace, repo, runner=runner)
+        return {**p, **rec, "runtime_session_id": session_id, "started": True,
+                "beat_started": beat_started, "remedy_timer": remedy}
 
 
 def main(argv=None) -> int:

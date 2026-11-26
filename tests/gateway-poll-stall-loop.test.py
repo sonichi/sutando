@@ -91,7 +91,8 @@ class _Loop:
               "_post_task_ack", "_post_ready_results", "_post_proactive",
               "_reconcile_abandoned", "_emit_gateway_status", "_save_inflight", "_log",
               "_recover_auth", "POLL_STALL_EXIT_S", "POLL_STALL_RESTART_OWNER",
-              "_STALL_REPORTED_FOR", "_STALL_EXIT_PENDING", "_resolve_host_label", "_start_lock_heartbeat",
+              "_STALL_REPORTED_FOR", "_STALL_EXIT_PENDING", "_STALL_EXIT_READY",
+              "_resolve_host_label", "_start_lock_heartbeat",
               "_retire_delivered_marks", "_sweep_held_dir", "_reclaim_parked_relay_results",
               "_keep_relay_results_in_flight", "refresh_routing", "_start_results_watcher",
               "_start_outbound_worker", "_retry_withheld_reviews", "_push_pool_advertisement",
@@ -124,13 +125,14 @@ class _Loop:
     def __enter__(self):
         gw = self.gw
         for n in self._PATCH:
-            self._saved[n] = getattr(gw, n)
+            # Absent before the fix: the harness must still run there, so the asserts can fail.
+            self._saved[n] = getattr(gw, n, None)
         gw.TOKEN, gw.URL = "secret", "http://relay.invalid"
         gw.time = self.clock
         gw.POLL_STALL_EXIT_S = self.limit
         gw.POLL_STALL_RESTART_OWNER = self.owner
         gw._STALL_REPORTED_FOR = None
-        gw._STALL_EXIT_PENDING = False
+        gw._STALL_EXIT_PENDING = gw._STALL_EXIT_READY = False
         gw._acquire_singleton = lambda *a, **k: True
         gw._load_inflight = lambda *a, **k: set()
         gw._heartbeat_singleton = lambda *a, **k: self._alive.pop(0) if self._alive else False
@@ -163,13 +165,17 @@ class _Loop:
         self.gw._LOCK_LOST.clear()
         return False
 
-    def run(self):
-        """Returns the SystemExit the loop raised, or None when it ended normally."""
+    def run(self, entry=None):
+        """main()'s returned code, or the SystemExit a fatal path raised.
+
+        The harness ends the loop by dropping the poller lock, so that path's code is its
+        own doing and reads as None here.
+        """
         try:
-            self.gw.main()
+            code = (entry or self.gw.main)()
         except SystemExit as e:
             return e
-        return None
+        return None if code == getattr(self.gw, "LOCK_LOST_EXIT_CODE", None) else code
 
 
 def _http_401():
@@ -218,9 +224,8 @@ class PollStallLoopTest(unittest.TestCase):
             clock.advance(40.0)
             return urllib.error.URLError("no route")
         with _Loop(self.gw, polls=[dead] * 10, alive=[True] * 10, limit=100.0) as loop:
-            exc = loop.run()
-        self.assertIsNotNone(exc, "a bridge whose polls stay stale must exit")
-        self.assertEqual(exc.code, self.gw.POLL_STALL_EXIT_CODE,
+            code = loop.run()
+        self.assertEqual(code, self.gw.POLL_STALL_EXIT_CODE,
                          "the wrapper tells a stall from a crash by this code")
         self.assertTrue(loop.outbound.joined, "exited without joining the outbound worker")
         lines = self._stall_logs(loop)
@@ -231,6 +236,24 @@ class PollStallLoopTest(unittest.TestCase):
                             for c, k in loop.status), loop.status)
         # And it was the loop's own outage path that preceded it, not a crash.
         self.assertIn("poll network error", " ".join(loop.logs))
+
+    def test_the_stall_exit_leaves_through_the_bounded_exit(self):
+        """run() hands the code to _exit_bounded, whose watchdog forces the exit if a hook
+        hangs: polling and the outbound worker have stopped, so a hang would serve nothing."""
+        def dead(clock):
+            clock.advance(40.0)
+            return urllib.error.URLError("no route")
+        handed: list[int] = []
+        saved = self.gw._exit_bounded
+        try:
+            with _Loop(self.gw, polls=[dead] * 10, alive=[True] * 10, limit=100.0) as loop:
+                self.gw._exit_bounded = handed.append
+                code = loop.run(entry=self.gw.run)
+        finally:
+            self.gw._exit_bounded = saved
+        self.assertEqual(handed, [self.gw.POLL_STALL_EXIT_CODE],
+                         f"run() never handed the stall exit to _exit_bounded (returned {code})")
+        self.assertTrue(loop.outbound.joined, "the worker was not joined before the exit")
 
     # ── paused on a human ────────────────────────────────────────────────
     def test_a_resumed_auth_wait_is_not_a_stall(self):
@@ -302,11 +325,11 @@ class PollStallLoopTest(unittest.TestCase):
                 return orig(*a)
             self.gw._stop_background_workers = stop
             try:
-                exc = loop.run()
+                code = loop.run()
             finally:
                 self.gw._stop_background_workers = orig
-        self.assertIsNotNone(exc, "the held exit must still happen once the worker stops")
-        self.assertEqual(exc.code, self.gw.POLL_STALL_EXIT_CODE)
+        self.assertEqual(code, self.gw.POLL_STALL_EXIT_CODE,
+                         "the held exit must still happen once the worker stops")
         self.assertEqual(loop.outbound.joins, 3, "one join per held pass, then the exit")
         self.assertEqual(len(set(polled_at_stop)), 1,
                          f"polled between stop attempts: {polled_at_stop}")

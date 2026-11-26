@@ -5,7 +5,7 @@ Stage 1 of docs/worker-pool-design.md. A recipient — the core, or later a
 worker — receives work as *sentinels* in `deliveries/<recipient>/`:
 
     tasks/<task-id>.txt                      the payload; immutable, never copied
-    deliveries/<me>/<task-id>.txt            a sentinel; existing IS the assignment
+    deliveries/<me>/<task-id>.txt            a sentinel; existing IS the assignment, its content the lease
     deliveries/<me>/<task-id>.accepted       the same sentinel, suffix substituted
     deliveries/<me>/archive/<sentinel>       a finished task's sentinel, moved; never read as owed
 
@@ -26,6 +26,8 @@ import contextlib
 import errno
 import fcntl
 import json
+import logging
+import math
 import os
 import re
 import stat
@@ -72,6 +74,91 @@ _SENTINEL = re.compile(
 
 # RECIPIENT, the record layout and the record predicate are imported above:
 # the gateway bridge reads what this module writes, so both bind one contract.
+
+# The lease a sentinel carries: when the router delivered it and for how long that hand-off counts.
+LEASE_MANIFEST = Path(__file__).resolve().parents[1] / "manifest.json"
+LEASE_TTL_KEY = "WORKER_POOL_DELIVERY_TTL_S"
+LEASE_MODE_KEY = "WORKER_POOL_DELIVERY_EXPIRY"
+DEFAULT_LEASE_TTL_S = 4 * 3600
+LEASE_MODES = ("warn", "enforce")
+# Refusing leaves an expired task in neither lane; flips only in the PR that adds its hand-back/renewal path.
+ENFORCE_AVAILABLE = False
+_MAX_LEASE_BYTES = 4096
+# Clock skew tolerated before a delivered_at in the future reads as implausible.
+_LEASE_FUTURE_SLACK_S = 5.0
+# Lease verdicts: only LEASE_LIVE is a current delegation.
+LEASE_LIVE, LEASE_EXPIRED, LEASE_LEGACY, LEASE_UNREADABLE = "live", "expired", "legacy", "unreadable"
+
+
+def lease_ttl_s(environ=None) -> int:
+    """Seconds a new delivery stays current (env > manifest); a missing or bad value is the default."""
+    import skill_config
+    try:
+        v = int(skill_config.config_value(LEASE_TTL_KEY, LEASE_MANIFEST, environ=environ))
+    except ValueError:
+        return DEFAULT_LEASE_TTL_S
+    return v if v > 0 else DEFAULT_LEASE_TTL_S
+
+
+def lease_mode(environ=None) -> str:
+    """"warn" or "enforce" (env > manifest); anything else is "warn". "enforce" also reads as
+    "warn", with a logged warning, while ENFORCE_AVAILABLE is False."""
+    import skill_config
+    v = skill_config.config_value(LEASE_MODE_KEY, LEASE_MANIFEST, environ=environ).lower()
+    v = v if v in LEASE_MODES else "warn"
+    if v == "enforce" and not ENFORCE_AVAILABLE:
+        logging.getLogger(__name__).warning("pool_delivery: lease enforce unavailable %s", json.dumps(
+            {"event": "pool_delegation_enforce_unavailable", "requested_mode": v, "mode": "warn"},
+            sort_keys=True))
+        return "warn"
+    return v
+
+
+def lease_body(now: float, ttl_s: int) -> bytes:
+    return json.dumps({"delivered_at": round(float(now), 3), "ttl_s": int(ttl_s)},
+                      separators=(",", ":")).encode("utf-8")
+
+
+def lease_verdict(path, now: float) -> tuple[str, str]:
+    """(verdict, detail) for the lease in the sentinel at `path`. An empty file is LEASE_LEGACY."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(_MAX_LEASE_BYTES + 1)
+    except OSError as e:
+        return LEASE_UNREADABLE, type(e).__name__
+    if not raw.strip():
+        return LEASE_LEGACY, "no lease"
+    try:
+        return _judge_lease(raw, now)
+    except Exception as e:  # noqa: BLE001 - no malformed lease may raise past the verdict
+        return LEASE_UNREADABLE, f"malformed lease ({type(e).__name__}: {e})"[:160]
+
+
+def _lease_number(v) -> float:
+    """A finite, representable JSON number; anything else raises."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise TypeError("not a number")
+    f = float(v)
+    if not math.isfinite(f):
+        raise ValueError("not finite")
+    return f
+
+
+def _judge_lease(raw: bytes, now: float) -> tuple[str, str]:
+    if len(raw) > _MAX_LEASE_BYTES:
+        return LEASE_UNREADABLE, "oversized lease"
+    d = json.loads(raw.decode("utf-8"))
+    at, ttl = _lease_number(d["delivered_at"]), _lease_number(d["ttl_s"])
+    if ttl <= 0 or at < 0 or at - now > _LEASE_FUTURE_SLACK_S:
+        return LEASE_UNREADABLE, "implausible lease"
+    if now >= at + ttl:
+        return LEASE_EXPIRED, f"expired {int(now - at - ttl)}s ago"
+    return LEASE_LIVE, f"{int(at + ttl - now)}s left"
+
+
+def lease_allows(verdict: str, mode: str) -> bool:
+    """Warn mode allows every verdict; enforce allows only a live lease."""
+    return verdict == LEASE_LIVE or mode != "enforce"
 
 
 class NotDelivered(Exception):
@@ -233,6 +320,34 @@ def hand_off_to_core(workspace: Path, recipient: str) -> dict:
             return out
 
 
+def hand_off_own_inbox(workspace: Path, recipient: str, owed) -> dict:
+    """The owner's hand-off for a worker on its own folders: each (task id, file) it still owes there
+    (`pool_supervise.own_inbox_owed`) moves to the shared tasks/, attribution revoked once it has moved, and
+    is touched so the core's watcher picks it up. A name the shared folder already holds is kept, never
+    replaced. Returns {"handed_off": [...], "kept": {task_id: why}}."""
+    import pool_attribution
+    import undelivered_quarantine
+    ws = Path(workspace)
+    require_recipient(recipient)
+    out = {"handed_off": [], "kept": {}}
+    (ws / "tasks").mkdir(parents=True, exist_ok=True)
+    for task_id, path in owed:
+        dest = ws / "tasks" / f"{task_id}.txt"
+        try:
+            undelivered_quarantine.rename_noreplace(Path(path), dest)
+        except FileExistsError as e:
+            if undelivered_quarantine.no_primitive(e):
+                raise
+            out["kept"][task_id] = "shared-folder-holds-the-name"
+            continue
+        # Only a task that moved loses its owner record; a kept or failed one still needs it.
+        pool_attribution.revoke(ws, task_id, recipient)
+        with contextlib.suppress(FileNotFoundError):
+            os.utime(dest)
+        out["handed_off"].append(task_id)
+    return out
+
+
 def _owed_names(dfd: int) -> set:
     names = set()
     for name in os.listdir(dfd):
@@ -269,6 +384,78 @@ def _hand_off_pass(ws: Path, recipient: str, out: dict) -> set:
             return _owed_names(dfd) - set(out["kept"]) - set(task_ids)
 
 
+def migrate_to_own_dirs(workspace, recipient: str, own_tasks, own_origin) -> dict:
+    """Empty `recipient`'s deliveries folder into its own tasks folder, for a worker switched to its own
+    folders. Under each task's lock and the folder lock: a task its own lane queued (`own_origin(id)`) has
+    its payload moved into `own_tasks` and its sentinel archived. Any other task still `pending` (never
+    accepted) is handed back as `hand_off_to_core` does: attribution revoked first, then sentinel and `.pending`
+    record withdrawn, payload touched so the core's watcher picks it up. One the worker accepted, or answered,
+    stays the worker's: its session may still be running it, so only a hand-off after that session is gone
+    (`pool_manage.py retire --hand-off`) gives it to the core. While any task the worker accepted is still
+    unanswered (`died-mid-work`, its own lane's included) nothing moves at all, so the switch waits and that
+    work stays where supervision reads it. Idempotent: an interrupted pass leaves the sentinel, so a re-run
+    revisits the task. Returns {"moved", "returned", "kept": {id: why}, "owed": [ids accepted, unanswered]}.
+    Refused (ValueError) once the worker's retirement has begun (`connections.worker_retiring`)."""
+    import connections
+    import pool_attribution
+    import pool_router
+    import undelivered_quarantine
+
+    ws, own_tasks = Path(workspace), Path(own_tasks)
+    require_recipient(recipient)
+    out = {"moved": [], "returned": [], "kept": {}, "owed": []}
+    task_ids = sorted({parse_sentinel(p.name)[0] for p in accepted(ws, recipient) + pending(ws, recipient)
+                       if is_regular_file(p)})
+    with contextlib.ExitStack() as locks:
+        for task_id in task_ids:
+            locks.enter_context(pool_router.task_arbitration(ws, task_id))
+        with arbitration(ws, recipient) as dfd:
+            locks.enter_context(connections.worker_switch_lock(recipient, ws))
+            if connections.worker_retiring(recipient, ws):
+                raise ValueError(f"worker {recipient} is being retired: nothing was moved")
+            out["owed"] = [t for t in task_ids if find_in(dfd, t) is not None
+                           and _residue_state(ws, recipient, t, find_in(dfd, t)) == "died-mid-work"]
+            if out["owed"]:
+                out["kept"] = {t: "accepted" for t in out["owed"]}
+                return out
+            for task_id in task_ids:
+                if find_in(dfd, task_id) is None:
+                    continue
+                payload = payload_path(ws, task_id)
+                if not own_origin(task_id):
+                    state = _residue_state(ws, recipient, task_id, find_in(dfd, task_id))
+                    if state != "pending":
+                        out["kept"][task_id] = "accepted" if state == "died-mid-work" else state
+                        continue
+                    # Attribution first: a sentinel left by an interruption makes the next pass revisit.
+                    pool_attribution.revoke(ws, task_id, recipient)
+                    _withdraw_locked(ws, recipient, task_id, dfd)
+                    with contextlib.suppress(FileNotFoundError):
+                        os.utime(payload)
+                    out["returned"].append(task_id)
+                    continue
+                if is_regular_file(payload):
+                    own_tasks.mkdir(parents=True, exist_ok=True)
+                    try:
+                        undelivered_quarantine.rename_noreplace(payload, own_tasks / payload.name)
+                    except FileExistsError as e:
+                        if undelivered_quarantine.no_primitive(e):
+                            raise  # nothing moved: the run fails and a re-run retries
+                        out["kept"][task_id] = "own-folder-holds-the-name"
+                        continue
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(pending_flag(ws, recipient, task_id))
+                afd = _open_archive(dfd)
+                try:
+                    for name in sentinel_names(task_id):
+                        if regular_file_state(name, dir_fd=dfd) == "regular":
+                            _move_into_archive(dfd, afd, name)
+                finally:
+                    os.close(afd)
+                out["moved"].append(task_id)
+    return out
+
+
 def writer_path() -> Path:
     """The executable a spawner injects as SUTANDO_POOL_DELIVERY_SCRIPT: this file,
     absolute. The core never locates it (docs/architecture-boundaries.md); the
@@ -290,8 +477,12 @@ def pending(workspace: Path, recipient: str) -> list[Path]:
     for p in d.iterdir():
         got = parse_sentinel(p.name)
         if got and not got[1]:
-            out.append(p)
-    return sorted(out, key=lambda q: (q.stat().st_mtime, q.name))
+            # Unlocked listing: a sentinel withdrawn since is no longer pending. Only ENOENT says so.
+            try:
+                out.append((p.stat().st_mtime, p.name, p))
+            except FileNotFoundError:
+                continue
+    return [p for _mtime, _name, p in sorted(out, key=lambda t: t[:2])]
 
 
 def accepted(workspace: Path, recipient: str) -> list[Path]:

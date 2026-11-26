@@ -926,6 +926,118 @@ def main() -> int:
     check(hb2.get("status") == "idle" and "step" not in hb2,
           "idle status sends no step (avoids stale 'what it was doing')")
 
+    # core_recovery.v1: the adapter injects the reader of state/core-recovery.json (its one owner,
+    # src/core_recovery_state.py); the beat carries the record as health.recovery, absent -> omitted.
+    import core_recovery_state as _crs
+    _rec = json.loads((Path(__file__).resolve().parent.parent / "contracts" / "core_recovery.v1"
+                       / "heartbeat.json").read_text())["health"]["recovery"]
+    _crs.publish(rtc.WS, _rec)
+    STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
+    rtc._post_heartbeat(set(), force=True)
+    hbr = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    check((hbr.get("health") or {}).get("recovery") == _rec
+          and "core_recovery.v1" in hbr.get("capabilities", []),
+          "the adapter's reader puts state/core-recovery.json on the heartbeat as health.recovery")
+    (rtc.WS / "state" / "core-recovery.json").unlink()
+    STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
+    rtc._post_heartbeat(set(), force=True)
+    hbr = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    check("recovery" not in (hbr.get("health") or {}) and "core_recovery.v1" not in hbr.get("capabilities", []),
+          "no record file -> no recovery field and no capability")
+    import worker_lane as _wl
+    _lane_dirs = _wl.lane_dirs
+    _wl.lane_dirs = lambda ws, inst: (Path(tmp, "wtasks"), Path(tmp, "wresults"), True)
+    try:
+        _wspec = importlib.util.spec_from_file_location("rtc_worker_lane", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _wrtc = importlib.util.module_from_spec(_wspec)
+        _wspec.loader.exec_module(_wrtc)
+    finally:
+        _wl.lane_dirs = _lane_dirs
+    check(_wrtc._CORE_RECOVERY_READER is None and rtc._CORE_RECOVERY_READER is not None,
+          "a pool worker's lane carries no core recovery record; the core's lane does")
+    check(_wrtc._RUNTIME_PROFILE_READER is None and rtc._RUNTIME_PROFILE_READER is not None,
+          "a pool worker's lane carries no runtime profile; the core's lane does")
+
+    # runtime_profile.v1: the adapter injects src/runtime_profile.read; a Codex core whose model
+    # list marks the current row rides as runtime_profile, and with no readable runtime none does.
+    _st = rtc.WS / "state"
+    (_st / "core-runtime.json").write_text(json.dumps({"runtime": "codex", "session": "s", "started_at": 1}))
+    (_st / "runtime-models.codex.json").write_text(json.dumps({"v": 1, "runtime": "codex", "at": 1, "entries": [
+        {"key": "o0123456789ab", "label": "gpt-5.5", "model": "gpt-5.5", "arg": None, "current": True}]}))
+    STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
+    rtc._post_heartbeat(set(), force=True)
+    hbp = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    _prof = hbp.get("runtime_profile") or {}
+    check(_prof.get("model") == {"id": "gpt-5.5", "display_name": "GPT-5.5", "runtime": "codex"}
+          and _prof.get("plan") is None and _prof.get("workers") == []
+          and "runtime_profile.v1" in hbp.get("capabilities", []),
+          "the adapter's reader puts the core's runtime profile on the heartbeat with its capability")
+    (_st / "runtime-models.codex.json").write_text("{ not json")
+    STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
+    check(rtc._post_heartbeat(set(), force=True), "a malformed model list never costs the heartbeat")
+    hbp = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    check("runtime_profile" not in hbp and "runtime_profile.v1" not in hbp.get("capabilities", []),
+          "an unknown core model -> no runtime_profile and no capability")
+    for _f in ("core-runtime.json", "runtime-models.codex.json"):
+        (_st / _f).unlink()
+    check(_wrtc._QUOTA_STATUS_READER is None and rtc._QUOTA_STATUS_READER is not None,
+          "quota-tracker's switch is on by default; a pool worker's lane carries no core quota")
+    # A proxy record speaks for the core only with the core's own acct_ label (none while unread).
+    import core_limit_hold as _clh
+    import quota_availability as _qa
+    _qlabel = _qa.account_label(_clh.launch_identity(rtc.WS)[1])
+    (rtc.WS / "state" / "quota-state.json").write_text(json.dumps({
+        "utilization_5h": 0.42, "resets_at_5h": "2026-11-20T16:00:00.000Z", "limit_state": "allowed",
+        "last_checked": "2026-11-20T12:00:00.000Z", "accounts": {"acct-x": {}},
+        **({"account": _qlabel} if _qlabel else {})}))
+    STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
+    rtc._post_heartbeat(set(), force=True)
+    hbq = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    check((hbq.get("health") or {}).get("quota", {}).get("five_hour", {}).get("used_pct") == 42.0
+          and "quota_status.v1" in hbq.get("capabilities", [])
+          and "account" not in hbq["health"]["quota"],
+          "the adapter's reader puts the core's quota on the heartbeat as health.quota, no account")
+    (rtc.WS / "state" / "quota-state.json").write_text(json.dumps({
+        "utilization_5h": 0.42, "limit_state": "allowed", "account": "acct_0f0f0f"}))
+    STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
+    rtc._post_heartbeat(set(), force=True)
+    hbq = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    check(_qlabel != "acct_0f0f0f" and "quota" not in (hbq.get("health") or {}),
+          "a proxy record labeled with another login puts no health.quota on the heartbeat")
+    (rtc.WS / "state" / "quota-state.json").unlink()
+    os.environ["QUOTA_STATUS_PUBLISH"] = "false"
+    try:
+        _qspec = importlib.util.spec_from_file_location("rtc_quota_off", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _qrtc = importlib.util.module_from_spec(_qspec)
+        _qspec.loader.exec_module(_qrtc)
+    finally:
+        del os.environ["QUOTA_STATUS_PUBLISH"]
+    check(_qrtc._QUOTA_STATUS_READER is None, "QUOTA_STATUS_PUBLISH=false: no quota reader")
+    _saved_qs = sys.modules.get("quota_status")
+    sys.modules["quota_status"] = None  # the next import raises ImportError
+    import io as _qio
+    from contextlib import redirect_stderr as _qredirect
+    _qerr = _qio.StringIO()
+    try:
+        with _qredirect(_qerr):
+            _bspec = importlib.util.spec_from_file_location("rtc_quota_broken", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+            _brtc = importlib.util.module_from_spec(_bspec)
+            _bspec.loader.exec_module(_brtc)
+    finally:
+        if _saved_qs is None:
+            sys.modules.pop("quota_status", None)
+        else:
+            sys.modules["quota_status"] = _saved_qs
+    check(_brtc._QUOTA_STATUS_READER is None and callable(getattr(_brtc, "_post_heartbeat", None))
+          and _qerr.getvalue().count("quota status off: ModuleNotFoundError") == 1,
+          "a broken quota module: the bridge still loads, logs once, and sends no quota block")
+    _brtc._last_heartbeat_at = 0.0
+    STATE["heartbeats"].clear()
+    _brtc._post_heartbeat(set(), force=True)
+    _hbb = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    check(bool(STATE["heartbeats"]) and "quota" not in (_hbb.get("health") or {}),
+          "a broken quota module: the heartbeat still goes out, without health.quota")
+
     # SECURITY / robustness: core-status.json is written by another process and
     # may be malformed. _read_core_status runs in the main loop BEFORE the poll,
     # so it MUST NOT raise (else it stalls task delivery). Regression for the
@@ -1399,7 +1511,7 @@ def main() -> int:
     # Once it holds the lease the unsuffixed bridge asks whether it keeps the proactive room.
     check(rtc.PROACTIVE_ROOM_KEEP is rtc._legacy_keeps_proactive_room, "the unsuffixed bridge asks whether it keeps the room")
     _main_src = (SRC_DIR.parent / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
-    _main_src = _main_src[_main_src.index("def main() -> None:"):]
+    _main_src = _main_src[re.search(r"^def main\(", _main_src, re.M).start():]
     check(_main_src.index("_acquire_singleton()") < _main_src.index("_start_lock_heartbeat()")
           < _main_src.index("_settle_proactive_room()"), "the room is settled right after the lease heartbeats")
     _saved_room = (rtc.PROACTIVE_ROOM, rtc.PROACTIVE_ROOM_KEEP)
@@ -1835,7 +1947,11 @@ def main() -> int:
     _real_resolve, _asked = rtc.resolve_destination, []
     rtc.resolve_destination = lambda audience, **kw: _asked.append(audience) or ""
     rtc.OWNS_UNADDRESSED = lambda: False
-    check(rtc._project_hitl() == 0 and not _asked, "a bridge that is not the primary projects no cards")
+    _claim, rtc.CARD_CLAIM = rtc.CARD_CLAIM, None
+    check(rtc._project_hitl() == 0 and not _asked, "without a card claim, a bridge that is not the primary projects no cards")
+    rtc.CARD_CLAIM = _claim
+    check(rtc._project_hitl() == 0, "a core lane that is not the primary claims none of the core's cards")
+    _asked.clear()
     rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = "dev", lambda: True
     check(rtc._project_hitl() == 0 and _asked == [rtc.OWNER_PRIVATE], "a named primary looks for the owner DM to project cards")
     rtc.resolve_destination, rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = _real_resolve, _inst, _saved_owns
@@ -2288,7 +2404,7 @@ def main() -> int:
     real_download = rtc._download_bytes
     rtc._download_bytes = lambda url, headers, cap: (fetched.append((url, dict(headers))) or b"PNGBYTES")
     body = rtc._maybe_fetch_media(
-        f"[{rtc.MEDIA_MARKER_TAG}: {os.environ['REMOTE_TASK_URL']}/media/abc "
+        f"[{rtc.MEDIA_MARKER_TAG}: {os.environ['REMOTE_TASK_URL']}/v1/media/s.space/abc "
         "mime=image/png name=shot.png kind=m.image] look at this")
     check("[Photo attached: " in body and body.endswith("look at this"),
           "media marker rewritten to local Photo-attached path")
@@ -2309,7 +2425,7 @@ def main() -> int:
     # download failure → drop-in safe (marker untouched)
     rtc._download_bytes = lambda *a, **kw: (_ for _ in ()).throw(ValueError("boom"))
     body4 = rtc._maybe_fetch_media(
-        f"[{rtc.MEDIA_MARKER_TAG}: {os.environ['REMOTE_TASK_URL']}/media/dead name=d.bin]")
+        f"[{rtc.MEDIA_MARKER_TAG}: {os.environ['REMOTE_TASK_URL']}/v1/media/s.space/dead name=d.bin]")
     check(f"[{rtc.MEDIA_MARKER_TAG}:" in body4, "failed media fetch leaves marker untouched")
     rtc._download_bytes = real_download
 
@@ -2318,16 +2434,43 @@ def main() -> int:
     fetched.clear()
     rtc._download_bytes = lambda url, headers, cap: (fetched.append((url, dict(headers))) or b"X")
     gw = os.environ["REMOTE_TASK_URL"]  # http://127.0.0.1:<port>
-    rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1.evil.example/media/p name=a.bin]")
-    check(bool(fetched) and "Authorization" not in fetched[-1][1],
-          "lookalike gateway host gets NO credentials")
+    out = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1.evil.example/v1/media/s.space/p name=a.bin]")
+    check(not fetched and f"[{rtc.MEDIA_MARKER_TAG}:" in out, "lookalike gateway host is never fetched")
+    # Only the gateway or homeserver origin is fetched: loopback, metadata, LAN and public hosts are not.
+    for off in ("http://127.0.0.1:8080/admin", "http://169.254.169.254/latest/meta-data/",
+                "http://10.0.0.5/media/p", "http://192.168.1.1/p", "http://[::1]/p", "https://example.org/p.png",
+                "http://0.0.0.0/p", "http://224.0.0.1/p"):
+        refs = []
+        out = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {off} mime=text/plain name=a.txt]", refs)
+        check(not fetched and not refs and f"[{rtc.MEDIA_MARKER_TAG}:" in out,
+              f"off-origin media URL never fetched or attached: {off}")
     rtc.URL = "http://127.0.0.1:9/relay"
-    rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1:9/relay-evil/p name=a.bin]")
-    check("Authorization" not in fetched[-1][1],
-          "gateway base-path boundary enforced (/relay-evil gets no bearer)")
-    rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1:9/relay/media/p name=a.bin]")
+    rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1:9/relay-evil/v1/media/s.space/p name=a.bin]")
+    check(not fetched, "gateway base-path boundary enforced (/relay-evil is never fetched)")
+    rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1:9/relay/v1/media/s.space/p name=a.bin]")
     check(fetched[-1][1].get("Authorization") == "Bearer testtoken",
           "true gateway-hosted path still gets the gateway bearer")
+    n_ok = len(fetched)
+    # Only the gateway's media route is fetched with its bearer: every other gateway path, a dot segment
+    # (raw, percent- or double-encoded), an encoded slash, userinfo, a fragment or another query key is not.
+    for off in ("/v1/tasks", "/v1/agents", "/v1/media/../tasks", "/v1/media/s.space/../../v1/tasks",
+                "/v1/media/%2e%2e/tasks", "/v1/media/%252e%252e/tasks", "/v1/media/s.space/a%2fb",
+                "/v1/media/s.space/a%5cb", "/v1/media/./s.space/id", "/v1/media/s.space/id/extra",
+                "/v1/media/s.space/id?room_id=!r:s&sig=x", "/v1/media/s.space/id?room_id=a&room_id=b",
+                "/v1/media/s.space/id#frag", "/v1/media/S PACE/id", "/v1/media/s.space/id?room_id",
+                "/v1/media/s.space/id?room_id=", "/v1/media/s.space/a\\b", "/v1/media/s.space/i\x7fd"):
+        refs = []
+        out = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1:9/relay{off} name=a.bin]", refs)
+        check(len(fetched) == n_ok and not refs and f"[{rtc.MEDIA_MARKER_TAG}:" in out,
+              f"gateway path off the media route never fetched: {off}")
+    for off in ("http://user@127.0.0.1:9/relay/v1/media/s.space/id", "http://127.0.0.1:10/relay/v1/media/s.space/id",
+                "https://127.0.0.1:9/relay/v1/media/s.space/id"):
+        rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {off} name=a.bin]")
+        check(len(fetched) == n_ok, f"userinfo, another port or scheme never fetched: {off}")
+    rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1:9/relay/v1/media/s.space/id?room_id=%21r%3As.space "
+                           "name=a.bin]")
+    check(len(fetched) == n_ok + 1 and fetched[-1][1].get("Authorization") == "Bearer testtoken",
+          "the gateway media route with its room_id is fetched with the bearer")
     rtc.URL = gw
     rtc.HS_MEDIA_TOKEN = "syt_hs"
     rtc.HS_MEDIA_ORIGIN = "https://hs.good.example"
@@ -2343,6 +2486,20 @@ def main() -> int:
           and fetched[-1][1].get("Authorization") == "Bearer syt_hs"
           and "[File attached: " in b,
           "matrix happy path: MSC3916 upgrade + HS bearer on the exact origin")
+    for ok_path in ("/_matrix/client/v1/media/download/hs/id", "/_matrix/client/v1/media/thumbnail/hs/id?width=32&height=32",
+                    "/_matrix/media/r0/download/hs/id"):
+        n = len(fetched)
+        rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: https://hs.good.example{ok_path} name=ok.png]")
+        check(len(fetched) == n + 1 and fetched[-1][1].get("Authorization") == "Bearer syt_hs",
+              f"homeserver media path fetched with the HS bearer: {ok_path}")
+    n = len(fetched)
+    for off in ("/_matrix/client/v3/sync", "/_matrix/client/v3/rooms/x/messages", "/_matrix/client/v1/media/config",
+                "/_matrix/media/v3/thumbnail/hs/id", "/_matrix/client/v1/media/download/hs/../id",
+                "/_matrix/client/v1/media/download/hs/%2e%2e", "/_matrix/client/v1/media/download/hs/id?access_token=x",
+                "/_matrix/client/v1/media/thumbnail/hs/id?width=1&from=x", "/other/path"):
+        b = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: https://hs.good.example{off} name=a.bin]")
+        check(len(fetched) == n and f"[{rtc.MEDIA_MARKER_TAG}:" in b,
+              f"homeserver path off the media routes never fetched: {off}")
     rtc.HS_MEDIA_TOKEN = ""
     rtc.HS_MEDIA_ORIGIN = ""
     rtc._download_bytes = real_download
@@ -2368,12 +2525,33 @@ def main() -> int:
         check(False, "authed fetch raises on a real 302")
     except Exception:
         check(True, "authed fetch raises on a real 302")
+    import http.server as _hs
+    import threading as _th
+
+    class _Bounce(_hs.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/ok":
+                self.send_response(200); self.end_headers(); self.wfile.write(b"OK"); return
+            self.send_response(302); self.send_header("Location", "/ok"); self.end_headers()
+
+        def log_message(self, *a):
+            pass
+    _srv = _hs.ThreadingHTTPServer(("127.0.0.1", 0), _Bounce)
+    _th.Thread(target=_srv.serve_forever, daemon=True).start()
+    _base = "http://127.0.0.1:%d" % _srv.server_address[1]
+    check(rtc._download_bytes(_base + "/ok", {"User-Agent": "t"}, 100) == b"OK", "the bounce server serves /ok")
+    try:
+        rtc._download_bytes(_base + "/bounce", {"User-Agent": "t"}, 100)
+        check(False, "a fetch with no credentials does not follow a 302 either")
+    except Exception:
+        check(True, "a fetch with no credentials does not follow a 302 either")
+    _srv.shutdown(); _srv.server_close()
     STATE["force_media_redirect"] = False
 
     # 6d. same-name saves in the same instant get distinct files (mkstemp)
     rtc._download_bytes = lambda url, headers, cap: b"A"
-    b1 = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {gw}/m name=dup.bin]")
-    b2 = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {gw}/m name=dup.bin]")
+    b1 = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {gw}/v1/media/s.space/m name=dup.bin]")
+    b2 = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {gw}/v1/media/s.space/m name=dup.bin]")
     p1 = re.search(r"\[File attached: ([^\]]+)\]", b1).group(1)
     p2 = re.search(r"\[File attached: ([^\]]+)\]", b2).group(1)
     check(p1 != p2 and Path(p1).exists() and Path(p2).exists(),
@@ -2772,7 +2950,7 @@ def main() -> int:
     # bridge off (up to 60s) and flipped gateway-status.json to
     # `connected: false` while tasks were still arriving and results delivering.
     grace = rtc.POLL_TIMEOUT_GRACE_S
-    check(grace >= rtc.POLL_WAIT + 10,
+    check(grace >= rtc.POLL_READ_TIMEOUT_S,
           "poll-timeout: the grace covers at least one whole poll window")
     check(rtc._poll_timeout_is_empty(1000.0, 1000.0),
           "poll-timeout: a timeout right after a good poll reads as an empty poll")

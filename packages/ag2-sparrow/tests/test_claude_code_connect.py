@@ -805,6 +805,52 @@ class ConnectCode(UndoSeams, AgentRootBase):
                         unhold(holder)
                     shutil.rmtree(cli.bridge_home(self.root), ignore_errors=True)
 
+    def test_connect_with_resume_session_hosts_that_existing_conversation(self):
+        resumed = "0f1e2d3c-4b5a-4968-8778-695a4b3c2d1e"
+        projects = self.home / ".claude-sutando" / "projects" / "-Users-owner-long-project"
+        projects.mkdir(parents=True)
+        (projects / (resumed + ".jsonl")).write_text("{}\n")
+        rc, out, err = self.connect(Backend(), None, "--resume-session", resumed)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn(f"resuming the existing conversation {resumed}", out)
+        self.assertEqual(self.cfg()["SESSION_ID"], resumed)
+
+    def test_a_resume_session_not_applied_exits_79_and_leaves_the_job_and_its_bridge_installed(self):
+        resumed = "0f1e2d3c-4b5a-4968-8778-695a4b3c2d1e"
+        fake = self.bridged()
+        self.assertEqual(self.install_seat(fake)[0], 0)
+        first = self.cfg()["SESSION_ID"]
+        projects = self.home / ".claude-sutando" / "projects" / "-Users-owner-long-project"
+        projects.mkdir(parents=True)
+        (projects / (resumed + ".jsonl")).write_text("{}\n")
+        live = {"server_pid": os.getpid(), "server_start": task_io.start_time(os.getpid()), "session_id": "$1",
+                "session_created": 1, "pane_id": "%0", "pane_pid": 1, "start_command": "x", "nonce": "0" * 32}
+        self.assertEqual(inbox.prepare_root(str(self.root)), "")
+        records.save_supervisor(str(self.root), dict(records.empty_supervisor(), generation=live))
+        rc, out, err = self.install_default(fake, "--token-env-file", str(self.seat() / ".env"),
+                                            "--resume-session", resumed)
+        self.assertEqual(rc, cli.EXIT_RESUME_NOT_APPLIED, out + err)
+        self.assertNotIn(rc, (0, 1, cli.EXIT_UNUSABLE, cm.EXIT_HELD, cm.EXIT_RETRY), "a code of its own")
+        self.assertIn(f"error: --resume-session {resumed} was not applied", err)
+        cfg = self.cfg()
+        self.assertEqual((cfg["SESSION_ID"], cfg["ROOT"]), (first, str(self.root)), "the config keeps the old id")
+        self.assert_job_runs(fake)
+        self.assertTrue(cm.service_path(BA).read_text().startswith(BA.marker), "the bridge stays installed")
+        self.assertNotIn("bridge", err.replace(f"--resume-session {resumed} was not applied", ""),
+                         "nothing about the bridge being stopped or withdrawn")
+
+    def test_a_resume_session_without_its_transcript_is_refused_before_the_code_is_spent_or_the_job_stopped(self):
+        fake = self.running_job()
+        pid = fake.runner.pid()
+        backend = Backend()
+        resumed = "0f1e2d3c-4b5a-4968-8778-695a4b3c2d1e"
+        rc, out, err = self.connect(backend, fake, "--resume-session", resumed)
+        self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
+        self.assertIn(f"no conversation {resumed}", err)
+        self.assertIn("the code was not used", err)
+        self.assertEqual(backend.calls, [], "the code is not spent")
+        self.assert_job_runs(fake, pid)
+
     def test_an_unusable_hmac_key_is_refused_before_the_code_is_spent_or_the_job_stopped(self):
         fake = self.running_job()
         pid = fake.runner.pid()

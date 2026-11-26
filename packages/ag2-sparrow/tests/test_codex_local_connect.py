@@ -37,6 +37,7 @@ from _helpers.subprocess_coverage import covered_code  # noqa: E402
 isolate_os_environ()
 
 import fcntl  # noqa: E402  (outside the scanner's Python 3.9 stdlib list)
+import gc  # noqa: E402  (likewise)
 PKG = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG))
 from ag2_sparrow import _dirs, connect_bridge as cb, connect_common as cm, holder_lock, service_manager as sm, task_io  # noqa: E402
@@ -214,6 +215,13 @@ def unhold(p):
     p.stdout.close()
 
 
+def close_pipes(p):
+    """A spawned process's pipes, closed whether or not it was waited for (no unclosed-file warning later)."""
+    for pipe in (p.stdin, p.stdout):
+        if pipe is not None and not pipe.closed:
+            pipe.close()
+
+
 def platform_as(mac):
     """The manager branch a helper runs: None keeps the one the test (or the base, systemd) chose."""
     return contextlib.nullcontext() if mac is None else mock.patch.object(cm, "is_macos", return_value=mac)
@@ -281,6 +289,8 @@ class Runner:
                 except ProcessLookupError:
                     pass
         self.stop_session()
+        for spawned in self.spawned:
+            close_pipes(spawned)
 
     def verb(self, cmd):
         return cmd[1] if cmd[0] == "launchctl" else next(a for a in cmd[1:] if not a.startswith("--"))
@@ -466,7 +476,7 @@ class Install(Base):
         self.assertEqual((cfg["CODEX"], cfg["ROOT"], cfg["INBOX_DIR"], cfg["RESULTS_DIR"]),
                          (str(self.codex), str(self.work), str(self.work / "tasks"), str(self.work / "results")))
         self.assertEqual((cfg["CODEX_HOME"], cfg["SANDBOX"], cfg["ALLOW_NON_OWNER"], cfg["MODEL"]),
-                         (str(self.codex_home), "read-only", "", ""))
+                         (str(self.codex_home), "read-only", "1", ""))
         self.assertTrue((self.work / "tasks").is_dir() and (self.work / "results").is_dir())
         self.assertTrue(cm.service_path(L).read_text().startswith(cli.MARKER))
         self.assertNotIn(TOKEN, cfg_path.read_text())
@@ -477,15 +487,52 @@ class Install(Base):
         self.assertIsNone(self.server(), "install starts no connector itself; the manager does")
 
     def test_sandbox_and_non_owner_choices(self):
-        rc, out, _ = self.install_with(self.runner(), False, "--sandbox", "workspace-write", "--allow-non-owner", "--model", "m1")
+        rc, out, _ = self.install_with(self.runner(), False, "--sandbox", "workspace-write", "--no-allow-non-owner", "--model", "m1")
         self.assertEqual(rc, 0)
         self.assertIn("NOTE sandbox: workspace-write", out)
         cfg = cm.read_config(cli.config_path())
-        self.assertEqual((cfg["SANDBOX"], cfg["ALLOW_NON_OWNER"], cfg["MODEL"]), ("workspace-write", "1", "m1"))
-        self.assertEqual(cli.connector_argv(cfg, str(self.work), 7)[-5:],
-                         ["--sandbox", "workspace-write", "--allow-non-owner", "--model", "m1"])
+        self.assertEqual((cfg["SANDBOX"], cfg["ALLOW_NON_OWNER"], cfg["MODEL"]), ("workspace-write", "0", "m1"))
+        media = str(cli.cb.bridge_state(cfg) / "remote-media")
+        self.assertEqual(cli.connector_argv(cfg, str(self.work), 7)[-7:],
+                         ["--sandbox", "workspace-write", "--media-root", media, "--no-allow-non-owner", "--model", "m1"])
+        for recorded in ("1", "", None):     # served by default, the older flag, and an older install's empty value
+            c = dict(cfg, ALLOW_NON_OWNER=recorded) if recorded is not None else \
+                {k: v for k, v in cfg.items() if k != "ALLOW_NON_OWNER"}
+            self.assertNotIn("--no-allow-non-owner", cli.connector_argv(c, str(self.work), 7), recorded)
+        # Only the non-owner flag is parsed: the full argv's --root-fd would open a descriptor.
+        parsed = lambda *flags: cc.build_parser().parse_args(["--work", str(self.work), *flags]).allow_non_owner  # noqa: E731
+        self.assertEqual((parsed(), parsed("--no-allow-non-owner")), (True, False))
+        self.assertIs(parsed("--allow-non-owner"), True, "the older flag still works")
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             cli.main(["install", "--work", str(self.work), "--sandbox", "danger-full-access"])
+
+    def test_resume_thread_is_checked_recorded_and_handed_to_the_connector(self):
+        thread = "019a1b70-4175-7721-8b53-5c79b079372d"
+        home = self.home / "agent-codex"
+        rc, _, err = self.install_with(self.runner(), False, "--codex-home", str(home), "--resume-thread", thread)
+        self.assertEqual(rc, 2, "not saved there yet")
+        self.assertIn(f"no Codex conversation {thread}", err)
+        self.assertFalse(cli.config_path().exists(), "refused before anything is written")
+        rc, _, err = self.install_with(self.runner(), False, "--resume-thread", "../etc")
+        self.assertEqual(rc, 2)
+        self.assertIn("is not a Codex conversation id", err)
+        day = home / "sessions" / "2026" / "11" / "12"
+        day.mkdir(parents=True)
+        (day / f"rollout-2026-11-12T03-00-00-{thread}.jsonl").write_text("{}\n")
+        runner = self.runner()
+        rc, out, err = self.install_with(runner, False, "--codex-home", str(home), "--resume-thread", thread)
+        self.assertEqual(rc, 0, out + err)
+        cfg = cm.read_config(cli.config_path())
+        self.assertEqual(cfg["RESUME_THREAD"], thread)
+        self.assertEqual(cli.connector_argv(cfg, str(self.work), 7)[-2:], ["--resume-thread", thread])
+        # A repair reinstall from the record keeps it: the connector's marker keeps it from being taken twice.
+        rc, out, err = self.install_with(runner, False, "--codex-home", str(home))
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(cm.read_config(cli.config_path())["RESUME_THREAD"], thread)
+        self.assertIn(("RESUME_THREAD", "resume_thread", str), cli.RECORDED)
+        rc, _, err = self.install_with(runner, False, "--codex-home", str(home), "--resume-thread", thread.upper())
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(cm.read_config(cli.config_path())["RESUME_THREAD"], thread, "matched and kept lowercase")
 
     def test_install_refuses_an_old_codex_before_writing_anything(self):
         (self.home / "codex-version").write_text("0.157.0")
@@ -593,7 +640,8 @@ class Run(Base):
         self.assertEqual(code, 0, err)
         self.assertEqual(seen["argv"], [sys.executable, "-m", "ag2_sparrow.adapters.codex.codex_connector", "--work",
                                         str(self.work), "--held", "--root-fd", str(seen["pass_fds"][0]), "--codex",
-                                        str(self.codex), "--server", "stdio", "--sandbox", "read-only"])
+                                        str(self.codex), "--server", "stdio", "--sandbox", "read-only", "--media-root",
+                                        str(cli.cb.bridge_state(cm.read_config(cli.config_path())) / "remote-media")])
         self.assertEqual(len(seen["pass_fds"]), 1, "the held root's descriptor, and only it, reaches the connector")
         for arg in FORBIDDEN_ARGS:
             self.assertNotIn(arg, seen["argv"], arg)
@@ -957,7 +1005,7 @@ class VerifyUninstall(Base):
         self.assertEqual(set(self.checks(out)), {"config", "codex", "login", "inbox", "results", "relay token", "supervisor"})
         self.assertEqual(set(self.checks(out).values()), {"PASS"})
         self.assertIn("INFO sandbox: read-only", out)
-        self.assertIn("INFO non-owner: refused unless", out)
+        self.assertIn("INFO non-owner: served read-only, ephemeral, in an empty temp dir (the default", out)
         self.assertIn(f"INFO job: {L.service_name} active", out)
         self.assertIn(f"INFO session: {self.work} held by launcher pid {runner.pid()}, no live connector attached "
                       "(manager active/running)", out)
@@ -1184,6 +1232,7 @@ class ConnectCode(UndoSeams, Base):
         spies = {name: mock.patch.object(mod, name, wraps=getattr(mod, name)) for mod, name in
                  ((cm, "_post_json"), (cm, "redeem_code"), (cm, "operation_lock"), (cm, "agent_lock"),
                   (cb, "redeem_into_seat"), (cli, "connect_preflight"))}
+        gc.collect()    # an earlier test's leaked pipes warn when collected: not into the stderr asserted below
         with mock.patch.object(sm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=False), \
                 mock.patch.object(urllib.request, "urlopen", side_effect=backend), \
                 contextlib.ExitStack() as stack, \
@@ -1991,7 +2040,7 @@ class ConnectCode(UndoSeams, Base):
         p = subprocess.Popen([sys.executable, "-c", AGENT_LOCK_HOLDER % (str(PKG), str(self.root))],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.assertEqual(p.stdout.readline().strip(), "held")
-        self.addCleanup(lambda: unhold(p) if p.poll() is None else None)
+        self.addCleanup(lambda: unhold(p) if p.poll() is None else close_pipes(p))
         return p
 
     def test_both_adapters_resolve_one_lock_for_one_agent(self):

@@ -127,6 +127,11 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/local_services.sh",
             "src/core_runtime_record.py",
             "src/codex_project_trust.py",
+            "src/core_block_signal.py",
+            "src/codex_host_instructions.py",
+            "src/codex_home.py",
+            "src/codex_core_model.py",
+            "src/agent/codex/codex-home.sh",
             "src/toml_fallback.py",
             "src/result_publish.py",
             "src/agent/task-event-handler-lookup.sh",
@@ -135,6 +140,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             # dies on import and the gate reads every pane as unreadable.
             "src/cli_wedge.py",
             "src/cli_wedge_patterns.py",
+            "src/pane_composer.py",
             "src/sutando_platform.py",
             "src/delivery/__init__.py",
             "src/delivery/worker-stage.sh",
@@ -379,7 +385,7 @@ exit 0
                 return
             time.sleep(0.01)
         self.fail(f"heartbeat stub pid {pid} did not exit")
-    def _notifier_version(self, handler="", stop=""):
+    def _notifier_version(self, handler="", stop="", mode="-mtype"):
         first = subprocess.check_output([
             "cksum",
             str(self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"),
@@ -397,7 +403,7 @@ exit 0
             check=True, text=False).stdout.decode().split()[0]
         stop_cksum = subprocess.run(["cksum"], input=stop.encode(), capture_output=True,
                                     check=True, text=False).stdout.decode().split()[0]
-        return f"{checksum[0]}-{checksum[1]}-h{handler_cksum}-s{stop_cksum}"
+        return f"{checksum[0]}-{checksum[1]}-h{handler_cksum}-s{stop_cksum}{mode}"
 
     def run_launcher(self, *args, env_extra=None, launcher="src/agent/start-cli.sh"):
         env = dict(os.environ)
@@ -429,6 +435,9 @@ exit 0
             "SUTANDO_CODEX_SCHEDULER_SCRIPT": str(self.root / "fake-codex-scheduler.py"),
             "SUTANDO_HOST_LABEL": "test-host",
             "SUTANDO_CORE_SESSION_WAIT_S": "0",
+            # The TUI core this suite is about; the app-server seat (on by default) has its own,
+            # tests/codex-app-server-core-launcher.test.py.
+            "SUTANDO_CODEX_APP_SERVER": "0",
         })
         env.update(env_extra or {})
         result = subprocess.run(
@@ -465,6 +474,9 @@ exit 0
             "AGENT_API_LOG": str(Path(self.tmp.name) / "agent-api.log"),
             "SUTANDO_HOST_LABEL": "test-host",
             "SUTANDO_CORE_SESSION_WAIT_S": "0",
+            # The TUI core this suite is about; the app-server seat (on by default) has its own,
+            # tests/codex-app-server-core-launcher.test.py.
+            "SUTANDO_CODEX_APP_SERVER": "0",
         })
         env.update(env_extra or {})
         master, slave = pty.openpty()
@@ -725,6 +737,7 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertIn("--ask-for-approval never", calls)
         self.assertIn("--search", calls)
         self.assertIn("-c check_for_update_on_startup=false", calls)
+        self.assertIn("-c project_doc_max_bytes=131072", calls)
         self.assertIn("-m gpt-test", calls)
         self.assertIn("Reply exactly READY. Do not use tools.", calls)
         self.assertIn("new-session -d -s sutando-core-watcher", calls)
@@ -746,6 +759,49 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         invocation = scheduler_log.read_text()
         self.assertIn("install --workspace", invocation)
         self.assertIn("--host-label test-host", invocation)
+    def _codex_with_app_server(self):
+        fake = REAL_REPO / "tests" / "fixtures" / "fake-codex-app-server.py"
+        self._write_exe("codex", '#!/bin/bash\n[ "${1:-}" = login ] && exit 0\n'
+                        f'[ "${{1:-}}" = app-server ] && exec "{sys.executable}" "{fake}" "$@"\nexit 0\n')
+
+    def _trust_writes(self):
+        log = self.root / "codex-home" / "writes.jsonl"
+        return [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
+
+    def test_block_signal_hooks_are_trusted_for_themselves_and_trust_is_never_bypassed(self):
+        self._codex_with_app_server()
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._tmux_calls()
+        self.assertNotIn("--dangerously-bypass-hook-trust", calls)
+        for ev in ("PermissionRequest", "PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop"):
+            self.assertIn(f"hooks.{ev}=", calls)
+        writes = self._trust_writes()
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(sorted(writes[0]["value"]), sorted(
+            f"/<session-flags>/config.toml:{ev}:0:0"
+            for ev in ("permission_request", "pre_tool_use", "post_tool_use", "user_prompt_submit", "stop")))
+        self.assertIn("SUTANDO_CODEX_BLOCK_HOOKS=0 to turn them off", result.stderr)
+
+    def test_block_signal_hooks_stay_off_when_codex_cannot_record_their_trust(self):
+        # The stock fake answers no app-server: untrusted hooks would wait at a review screen.
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._tmux_calls()
+        self.assertNotIn("--dangerously-bypass-hook-trust", calls)
+        self.assertNotIn("hooks.", calls)
+        self.assertIn("block-signal hooks off", result.stderr)
+
+    def test_block_signal_opt_out_keeps_codex_trust_untouched(self):
+        self._codex_with_app_server()
+        result = self.run_launcher(env_extra={"SUTANDO_CODEX_BLOCK_HOOKS": "0"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._tmux_calls()
+        self.assertNotIn("--dangerously-bypass-hook-trust", calls)
+        self.assertNotIn("hooks.", calls)
+        self.assertEqual(self._trust_writes(), [])
+        self.assertNotIn("block-signal hooks", result.stderr)
+
     def test_a_worker_instance_launch_is_refused_before_any_core_write(self):
         """The core entry point refuses a pool instance. Through the dispatcher's
         --runtime and directly, an instance launch touches none of the core's durable
@@ -812,6 +868,117 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("could not record Codex project trust", result.stderr)
         self.assertFalse((self.root / "codex-home" / "config.toml").exists())
+
+    def _desktop_hosted(self):
+        """The fixture as a desktop install, its Codex home on a symlink-free physical path."""
+        base = Path(self.tmp.name).resolve()
+        engine = base / "app-support" / "engine"
+        hosted = engine / "sutando"
+        shutil.copytree(self.root, hosted, symlinks=True)
+        self.root = hosted
+        (engine / "AGENTS.md").write_text("# Sutando in AG2 Space\n")
+        home = base / "app-support" / "workspace" / ".codex-sutando"
+        config = json.loads((hosted / "sutando.config.json").read_text())
+        config["core_config_dirs"][0]["value"] = str(home)
+        (hosted / "sutando.config.json").write_text(json.dumps(config))
+        return home
+
+    def test_a_desktop_hosted_core_gets_the_hosts_agents_md_in_its_codex_home(self):
+        """Codex never reads AGENTS.md above its project root, so the desktop's own
+        first-contact and Getting started instructions reach the core only this way."""
+        home = self._desktop_hosted()
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("could not link the host's AGENTS.md", result.stderr)
+        self.assertNotIn("the host's AGENTS.md was not linked", result.stderr)
+        self.assertTrue(home.is_dir(), "the launcher did not create the app home")
+        self.assertNotIn("not creating it", result.stderr)
+        linked = home / "AGENTS.md"
+        self.assertTrue(linked.is_symlink(), result.stdout)
+        self.assertEqual(linked.read_text(), "# Sutando in AG2 Space\n")
+        self.assertIn("new-session -d -s sutando-core", self._tmux_calls())
+
+    def _owner_linked_to_missing_app_home(self):
+        home = self._desktop_hosted()
+        user_home = Path(self.tmp.name) / "home"
+        user_home.mkdir(parents=True, exist_ok=True)
+        (user_home / ".codex").symlink_to(home)
+        # A git checkout, so project trust would write config.toml into CODEX_HOME.
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        return home
+
+    def test_a_desktop_owner_link_to_the_missing_app_home_is_never_written(self):
+        """~/.codex -> the app home: no launcher step may create or write into it."""
+        home = self._owner_linked_to_missing_app_home()
+        result = self.run_launcher(env_extra={"SUTANDO_CODEX_WORKING_DIR": str(self.root)})
+        self.assertFalse(os.path.lexists(home.parent), "the launcher created the app home's parent")
+        self.assertFalse(os.path.lexists(home / "config.toml"))
+        self.assertIn("not creating it", result.stderr)
+        self.assertIn("not recording Codex project trust or linking the host's AGENTS.md", result.stderr)
+        self.assertIn("is, or leads into, the owner's own Codex home", result.stderr)
+        # This fake Codex reports signed in, so the core still starts with the unchanged env.
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("new-session -d -s sutando-core", self._tmux_calls())
+
+    def test_a_real_codex_with_the_refused_missing_home_stops_the_launch_writing_nothing(self):
+        """Real Codex 0.164 exits 1 from `login status` when CODEX_HOME does not exist."""
+        home = self._owner_linked_to_missing_app_home()
+        self._write_exe("codex", '#!/bin/bash\n[ -d "${CODEX_HOME:-}" ] || exit 1\nexit 0\n')
+        result = self.run_launcher(env_extra={"SUTANDO_CODEX_WORKING_DIR": str(self.root)})
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("not authenticated", result.stderr)
+        self.assertFalse(os.path.lexists(home.parent))
+        self.assertNotIn("new-session -d -s sutando-core", self._tmux_calls())
+
+    def test_a_failing_home_checker_refuses_the_desktop_home_and_writes_nothing(self):
+        """The checker cannot run: the launcher must refuse, not fall back to creating it."""
+        home = self._desktop_hosted()
+        (self.root / "src/codex_host_instructions.py").write_text("import sys\nsys.exit(7)\n")
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        result = self.run_launcher(env_extra={"SUTANDO_CODEX_WORKING_DIR": str(self.root)})
+        self.assertFalse(os.path.lexists(home.parent), "the launcher created the app home")
+        self.assertIn("not creating it", result.stderr)
+        self.assertFalse(os.path.lexists(Path(self.tmp.name) / "home" / ".codex"))
+
+    def test_an_alternate_env_name_on_a_desktop_writes_nothing_under_the_owners_codex(self):
+        home = self._desktop_hosted()
+        config = json.loads((self.root / "sutando.config.json").read_text())
+        config["core_config_dirs"][0]["env_name"] = "CODEX_CONFIG_DIR"
+        (self.root / "sutando.config.json").write_text(json.dumps(config))
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        result = self.run_launcher(env_extra={"SUTANDO_CODEX_WORKING_DIR": str(self.root)})
+        owner = Path(self.tmp.name) / "home" / ".codex"
+        self.assertFalse(os.path.lexists(owner / "config.toml"), result.stderr)
+        self.assertFalse(os.path.lexists(home.parent))
+        self.assertIn("not a CODEX_HOME", result.stderr)
+
+    def test_an_override_in_the_codex_home_is_kept_and_reported(self):
+        home = self._desktop_hosted()
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "AGENTS.override.md").write_text("owner\n")
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("AGENTS.override.md replaces the host's AGENTS.md", result.stderr)
+        self.assertFalse((home / "AGENTS.md").exists())
+        self.assertEqual((home / "AGENTS.override.md").read_text(), "owner\n")
+
+    def test_a_checkout_outside_a_desktop_host_writes_no_agents_md(self):
+        (Path(self.tmp.name) / "AGENTS.md").write_text("not a host's\n")
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / "codex-home" / "AGENTS.md").exists())
 
     def test_reconciles_session_crons_before_codex_launch(self):
         workspace = self.root / "workspace"
@@ -1087,6 +1254,40 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         calls = self._tmux_calls()
         self.assertNotIn("kill-session -t =sutando-core-watcher", calls)
         self.assertNotIn("new-session -d -s sutando-core-watcher", calls)
+
+    def test_a_stale_global_alert_mode_never_reaches_the_codex_standby(self):
+        result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "codex", "SUTANDO_STANDBY_MODE": "alert"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        watcher = [l for l in self._tmux_calls().splitlines() if "new-session -d -s sutando-core-watcher" in l]
+        self.assertEqual(len(watcher), 1, self._tmux_calls())
+        self.assertIn("-e SUTANDO_STANDBY_MODE=type", watcher[0])
+        self.assertNotIn("SUTANDO_STANDBY_MODE=alert", watcher[0])
+
+    def test_the_alert_only_knobs_are_inert_on_the_codex_standby(self):
+        # A Codex core is pinned to "type", which never reads the alert knobs (pile-up included):
+        # they are neither forwarded nor in the identity, so setting them replaces nothing.
+        knobs = {"SUTANDO_NOTIFIER_ALERT_PILEUP": "5", "SUTANDO_NOTIFIER_ALERT_REPEAT": "60",
+                 "SUTANDO_NOTIFIER_ALERT_GRACE": "7"}
+        result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "codex", **knobs})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        watcher = [l for l in self._tmux_calls().splitlines() if "new-session -d -s sutando-core-watcher" in l]
+        self.assertEqual(len(watcher), 1, self._tmux_calls())
+        self.assertIn("-e SUTANDO_STANDBY_MODE=type", watcher[0])
+        self.assertNotIn("SUTANDO_NOTIFIER_ALERT_", watcher[0])
+        self.log.unlink()
+        result = self.run_launcher(env_extra={
+            "TMUX_ACTIVE_RUNTIME": "codex", "TMUX_WATCHER_EXISTS": "1",
+            "TMUX_ACTIVE_NOTIFIER_VERSION": self._notifier_version(), **knobs})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("kill-session -t =sutando-core-watcher", self._tmux_calls())
+
+    def test_a_watcher_from_before_the_mode_was_pinned_is_replaced(self):
+        result = self.run_launcher(env_extra={
+            "TMUX_ACTIVE_RUNTIME": "codex", "TMUX_WATCHER_EXISTS": "1",
+            "TMUX_ACTIVE_NOTIFIER_VERSION": self._notifier_version(mode="")})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("kill-session -t =sutando-core-watcher", self._tmux_calls())
+        self.assertIn("-e SUTANDO_STANDBY_MODE=type", self._tmux_calls())
 
     def test_turning_the_stop_interrupt_on_or_off_replaces_the_watcher(self):
         for running, wanted in (("", "1"), ("1", ""), ("1", "1")):
@@ -2914,9 +3115,11 @@ class CoreWindowRestartTests(unittest.TestCase):
         self.addCleanup(subprocess.run, [REAL_TMUX, "-S", self.sock, "kill-server"], capture_output=True)
         (self.case.bin / "tmux").unlink()
         (self.case.bin / "tmux").symlink_to(REAL_TMUX)
-        # A core that stays up like the real CLI; `login status` still succeeds.
+        # A core that stays up like the real CLI; `login status` still succeeds. It serves no
+        # app-server, so the launcher's hook-trust step fails at once instead of waiting it out.
         codex = self.case.bin / "codex"
-        codex.write_text('#!/bin/bash\n[ "${1:-}" = login ] && exit 0\nexec sleep 300\n')
+        codex.write_text('#!/bin/bash\n[ "${1:-}" = login ] && exit 0\n[ "${1:-}" = app-server ] && exit 1\n'
+                         'exec sleep 300\n')
         codex.chmod(0o755)
 
     def tmux(self, *args):
@@ -2995,6 +3198,28 @@ class CoreWindowRestartTests(unittest.TestCase):
         fake.symlink_to(shutil.which("sleep"))
         self.addCleanup(shutil.rmtree, fake.parent, True)
         self.session_with(("monitor", ["sleep", "300"]), ("gateway-x", [str(fake), "300"]))
+        before = self.panes()
+        result = self.case.run_launcher(env_extra={"SUTANDO_TMUX_SOCKET": self.sock})
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertEqual(self.panes(), before, "a second core must not be created")
+
+    def test_restart_keeps_a_bare_gateway_window_as_a_sibling(self):
+        # Desktop installs name the primary gateway window `gateway`, the secondary `gateway-<lane>`.
+        self.session_with(("core", [str(self.case.bin / "codex"), "-C", "old"]),
+                          ("gateway", ["exec sleep 300"]), ("gateway-s_dspace", ["sleep", "300"]))
+        stale = self.core()
+        siblings = [p for p in self.panes() if p["name"].startswith("gateway")]
+        result = self.case.run_launcher("--restart", env_extra={"SUTANDO_TMUX_SOCKET": self.sock})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for sibling in siblings:
+            self.assertIn(sibling, self.panes(), "a gateway pane did not survive the restart")
+        self.assertNotEqual(self.core()["wid"], stale["wid"])
+
+    def test_a_core_cli_under_the_bare_gateway_name_still_blocks_the_heal(self):
+        fake = Path(tempfile.mkdtemp()) / "claude"
+        fake.symlink_to(shutil.which("sleep"))
+        self.addCleanup(shutil.rmtree, fake.parent, True)
+        self.session_with(("monitor", ["sleep", "300"]), ("gateway", [str(fake), "300"]))
         before = self.panes()
         result = self.case.run_launcher(env_extra={"SUTANDO_TMUX_SOCKET": self.sock})
         self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
