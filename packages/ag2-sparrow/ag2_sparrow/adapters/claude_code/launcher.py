@@ -651,11 +651,11 @@ class Launcher:
             text = self.tm.capture(gen["pane_id"]) or ""
             if accepted_count(model, text) > before:
                 self.log("model: switched to %s" % model)
-                with contextlib.suppress(OSError):   # the switch happened whether or not it is recorded
-                    path = Path(self.root).joinpath(*MODEL_RECORD)
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.with_name(path.name + ".tmp").write_text(json.dumps({"model": model, "at": self.clock()}))
-                    os.replace(path.with_name(path.name + ".tmp"), path)
+                # The switch happened whether or not it is recorded. The writer's private temp is named as
+                # the start check knows one, so a stop mid-write is swept.
+                with contextlib.suppress(OSError, records.RecordError):
+                    records.write_durable(Path(self.root).joinpath(*MODEL_RECORD),
+                                          json.dumps({"model": model, "at": self.clock()}).encode())
                 return True, "switched to %s" % model
             if text.count(MODEL_CONFIRM) > asked and not answered:
                 if not confirm:

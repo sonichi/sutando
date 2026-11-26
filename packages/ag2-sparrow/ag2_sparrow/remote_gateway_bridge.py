@@ -5281,6 +5281,55 @@ def _end_unpublished_claims(wire_tid: str) -> bool:
         return open_
 
 
+def _seat_took(tid: str, since: float) -> bool:
+    """A live Codex app-server seat is running this generation of the task: it works on its own copy
+    (<state>/codex-seat/<session>/payloads/<tid>.txt) and writes no agent-activity rows, so the activity
+    test alone would withdraw the inbox file mid-turn. Evidence is a copy written no earlier than the inbox
+    file (`since`, its mtime) in a seat folder whose `taking.lock` a running seat holds. The seat takes
+    that lock only after clearing the copies an earlier seat left, so a copy an exited seat left behind,
+    one a restarted seat inherited, or one of an older generation, takes nothing."""
+    try:
+        copies = list((_STATE / "codex-seat").glob(f"*/payloads/{glob.escape(tid)}.txt"))
+    except OSError:
+        return False
+    for copy in copies:
+        try:
+            seen = copy.stat()
+            if seen.st_mtime < since or not _seat_lock_held(copy.parent.parent / "taking.lock"):
+                continue
+            # The lock was read after the copy: a seat restarted in between holds it over a copy it did
+            # not write. The seat replaces a copy whole, so the same file still there is the holder's.
+            still = copy.stat()
+        except OSError:
+            continue
+        if (still.st_ino, still.st_mtime_ns) == (seen.st_ino, seen.st_mtime_ns):
+            return True
+    return False
+
+
+def _seat_lock_held(path: Path) -> bool:
+    """Whether a running seat holds this lock (seat.py holds `taking.lock` exclusively once it serves)."""
+    try:
+        import fcntl
+    except ImportError:
+        return False
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
 def _stop_run(t, run: "str | None", why: str) -> bool:
     """Stop a run a newer generation replaces: its untaken task file is withdrawn; once the core has
     taken it, a cancel naming that run asks the core to stop it. Its result, whenever it comes, has no
@@ -5293,7 +5342,8 @@ def _stop_run(t, run: "str | None", why: str) -> bool:
     activity = task_attempts.last_activity(_STATE, run)
     for path in [TASKS_DIR / f"{run}.txt", *TASKS_DIR.glob(f"{glob.escape(run)}.assigned-*")]:
         try:
-            if activity is not None and activity >= path.stat().st_mtime:
+            mtime = path.stat().st_mtime
+            if (activity is not None and activity >= mtime) or _seat_took(run, mtime):
                 break                           # the core's turn has touched it: taken
             path.unlink()
         except FileNotFoundError:
@@ -5621,7 +5671,8 @@ def _withdraw_closed(t, why: str) -> None:
     activity = task_attempts.last_activity(_STATE, tid)
     for path in queued:
         try:
-            if activity is not None and activity >= path.stat().st_mtime:
+            mtime = path.stat().st_mtime
+            if (activity is not None and activity >= mtime) or _seat_took(tid, mtime):
                 break                           # the core's turn has touched it: taken
             path.unlink()
         except FileNotFoundError:

@@ -30,13 +30,14 @@ import threading
 import time
 import uuid
 
-from ... import account_switch, card_desk, connector_cards, held_start, model_switch
+from ... import account_switch, card_desk, connector_cards, held_start, live_view, model_switch
 from ...acp_host import quoted
 from ...collaborator_turn import stage_own_attachments, with_staged_paths
 from ...relay_loop import count_arg
 from ...task_io import (AUDIENCE_RULE, DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, OWNER_CAPABILITIES,  # noqa: F401
                         LockRefused, acquire_lock, attested_headers, exit_on_sigterm, holder_consumer, load_done,
-                        make_dirs, non_owner_note, parse_task, pid_alive, exit_code, record_done, release_lock,
+                        make_dirs, non_owner_note, parse_task, pid_alive, exit_code, record_done, refusal_body,
+                        release_lock,
                         root_path, start_time, stop_requested, turn_policy, write_atomic)
 
 CLIENT = {"name": "ag2-sparrow-codex", "version": "0.1.0"}
@@ -112,6 +113,29 @@ ITEM_WORDS = (("commandExecution", "ran %d command%s"), ("fileChange", "made %d 
 FAILED_WORDS = (("commandExecution", "%d command%s failed"), ("fileChange", "%d file change%s failed"),
                 ("mcpToolCall", "%d tool call%s failed"))
 FAILED = ":failed"      # the key suffix of an item type's failed count
+
+
+# What the live view calls a turn's item, by its type; one not named here is shown by its type.
+VIEW_WORDS = {"commandExecution": "ran", "fileChange": "changed", "mcpToolCall": "called", "webSearch": "searched"}
+
+
+def view_step(item) -> "tuple[str, str, str] | None":
+    """(what, on what, outcome) of a completed item for the live view; None for the agent's own
+    message (its words are shown as they arrive), its reasoning, and an item with no type."""
+    kind = item.get("type")
+    if not isinstance(kind, str) or kind in ("agentMessage", "reasoning"):
+        return None
+    command = item.get("command")
+    if isinstance(command, list):
+        command = " ".join(str(c) for c in command)
+    changes = item.get("changes")
+    paths = ", ".join(str(c.get("path")) for c in changes if isinstance(c, dict) and c.get("path")) if isinstance(
+        changes, list) else ""
+    detail = next((d for d in (command, paths, item.get("tool"), item.get("query")) if isinstance(d, str) and d), "")
+    status, code = item.get("status"), item.get("exitCode")
+    outcome = "" if status in (None, "completed") and code in (None, 0) else (
+        "exit %s" % code if isinstance(code, int) and code else str(status or ""))
+    return VIEW_WORDS.get(kind, kind), detail, outcome
 
 
 def item_outcome(item) -> str:
@@ -304,6 +328,9 @@ class Connector:
         self.turn_id = None       # the turn now running, once turn/start has named it
         self.turn_declined = []   # approvals declined for that turn (requests that name it)
         self.turn_items = {}
+        # What a person opening this agent's terminal panel follows; the connector under test has no state dir.
+        state = getattr(args, "state", None)
+        self.view = live_view.Writer(live_view.path_of(os.path.dirname(state))) if state else None
         self.rerouted = ""        # the model Codex moved the current turn to, when it said so
         self._models = self._accounts = None
 
@@ -614,9 +641,14 @@ class Connector:
                 continue
             if meth == "item/agentMessage/delta" and p.get("turnId") == turn_id:
                 deltas.append(p.get("delta", ""))
+                if self.view:
+                    self.view.say(p.get("delta", ""))
             elif meth == "item/completed" and p.get("turnId") == turn_id:
                 item = p.get("item", {})
                 kind, counted = item.get("type"), item_outcome(item)
+                step = view_step(item) if self.view else None
+                if step:
+                    self.view.step(*step)
                 if counted:
                     self.turn_items[counted] = self.turn_items.get(counted, 0) + 1
                 if kind == "agentMessage":
@@ -756,7 +788,8 @@ class Connector:
             policy = turn_policy(headers, self.args.allow_non_owner)
             if not policy.served:
                 log("refused (non-owner, %s not set) ->" % policy.unlock, task_id, headers["access_tier"])
-                write_atomic(os.path.join(self.args.results, name), NON_OWNER_REFUSED)
+                write_atomic(os.path.join(self.args.results, name),
+                             refusal_body(headers, self.args.state))
                 record_done(done_path, task_id)
                 done += 1
                 idle_since = time.time()
@@ -774,9 +807,13 @@ class Connector:
             if headers["access_tier"] == "owner" and self.desk.hint():
                 prompt += "\n\n" + self.desk.hint()
             log("turn ->", task_id, headers["access_tier"], repr(message[:60]))
+            if self.view:
+                self.view.turn("%s, %s" % (headers.get("sender_name") or headers["access_tier"], policy.kind), message)
             t_sent = time.time()
             status, text, err = self.run_task(headers, prompt, policy.capabilities)
             t_done = time.time()
+            if self.view:
+                self.view.done(status)
             out = self.result_body(status, text, err)
             # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
             told = self.tell_model(status, policy.capabilities, headers.get("channel_id"), policy.kind == OWNER)

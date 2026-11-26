@@ -37,7 +37,9 @@ DATA_FILES = ("ag2_sparrow/tmux-pane-keys.sh",
               # the plugin claude-local loads when no --plugin-dir is given
               "ag2_sparrow/adapters/claude_code/ag2space-inbox/.claude-plugin/plugin.json",
               "ag2_sparrow/adapters/claude_code/ag2space-inbox/hooks/hooks.json",
-              "ag2_sparrow/adapters/claude_code/ag2space-inbox/hooks/register.ts")
+              "ag2_sparrow/adapters/claude_code/ag2space-inbox/hooks/register.ts",
+              # the plugin's state contract, which its plugin.json names: without it the plugin does not load
+              "ag2_sparrow/adapters/claude_code/ag2space-inbox/types/index.d.ts")
 
 
 def _expected_packages():

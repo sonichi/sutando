@@ -18,8 +18,8 @@ from pathlib import Path
 
 from . import local_task_protocol, result_disposal, task_priority
 from .task_io import (ALLOW_COLLABORATOR_FLAG, AUDIENCE_RULE, NON_OWNER_REFUSED, is_collaborator,  # noqa: F401
-                      load_done, non_owner_note, parse_task, record_done, stop_requested, stoppable_sleep, turn_policy,
-                      write_atomic)
+                      load_done, non_owner_note, parse_task, record_done, refusal_body, stop_requested, stoppable_sleep,
+                      turn_policy, write_atomic)
 
 TEXT_MAX = 65536
 TRUNCATED = "\n[truncated]"
@@ -287,7 +287,7 @@ class RelayLoop:
                 name[:-4], "collaborator attestation pending", at_least=0.0):
                 return False
             log("refused (non-owner, --allow-non-owner not set) ->", name[:-4], headers.get("access_tier") or "guest")
-        return self.finish(name, NON_OWNER_REFUSED, seen)
+        return self.finish(name, refusal_body(headers, os.path.dirname(self.done_path)), seen)
 
     def schedule_retry(self, task_id, detail, at_least=0.0):
         """True when the task gets another try (after backoff); False once retries are spent."""

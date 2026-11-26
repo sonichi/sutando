@@ -81,7 +81,10 @@ FORMAT = "cloud-session/1"
 FORMAT_LOCAL = "claude-local/1"
 FORMATS = frozenset((FORMAT, FORMAT_LOCAL))
 # The two claude-local records and the two per-root locks live in state/ by name.
-LOCAL_STATE_FILES = ("claude-local-plugin.json", "claude-local-supervisor.json", "claims.lock", "progress.lock")
+# model-switch.*: the record and the lock of claude-local's live model switch (launcher.switch_model).
+# isolated-turns.json: the hourly cap of its isolated turns (inbox.ISOLATED_LIMITER_FILE).
+LOCAL_STATE_FILES = ("claude-local-plugin.json", "claude-local-supervisor.json", "claims.lock", "progress.lock",
+                     "model-switch.json", "model-switch.lock", "isolated-turns.json")
 STATE_ALLOWED = frozenset(("format", "claims", "settled-ids", "rate.jsonl", "done", "collaborator-turns.json")
                           + LOCAL_STATE_FILES)
 # Optional records the adapters rewrite in place: when present, each must be a plain file.
@@ -91,6 +94,8 @@ FORMAT_TEMP = re.compile(r"\.format\.\d+\.[0-9a-f]{6}\.tmp")
 BLOB_TEMP = re.compile(r"^\.(.+)\.(\d+)\.([0-9a-f]{24})\.(\d+)\.[0-9a-f]{8}\.tmp$")
 # A private temp older than the launcher's inner stop bound belongs to nobody.
 TEMP_SWEEP_AFTER = 120.0
+# The fixed-name temp 0.11's model switch could leave under state/; no writer of this build makes one.
+LEGACY_TEMPS = frozenset(("model-switch.json.tmp",))
 # The gateway bridge's own entries when its state dir sits directly in the work root: its poller lock
 # files, its default HITL stores and its log (the bridge's names, pinned to it by test).
 BRIDGE_LOCKS = re.compile(r"gateway-bridge(\.[A-Za-z0-9_-]+)?\.lock(\.guard|\.tmp\.\d+)?")
@@ -247,6 +252,23 @@ def _init_step(name):
     """A test seam between the first-init steps; production does nothing here."""
 
 
+def _temp_seen(path):
+    """One lstat of a listed temp: its mtime when it is a plain file, False when it is anything else,
+    None when it is gone (its writer renamed it into place since the listing)."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return st.st_mtime if _stat.S_ISREG(st.st_mode) else False
+
+
+def _unlink_if_there(path):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
 def _is_type(path, want):
     """lstat, never following a link: `want` is "file" (regular) or "dir"."""
     try:
@@ -361,11 +383,22 @@ def prepare_work_dir(work, check_only=False):
                 if name in STATE_OPTIONAL_FILES and not _is_type(os.path.join(state, name), "file"):
                     return "refusing to start: state/%s in %s is not a plain file" % (name, state)
                 continue
+            if name in LEGACY_TEMPS:
+                seen = _temp_seen(os.path.join(state, name))
+                if seen is False:
+                    return "refusing to start: state/%s in %s is not a plain file" % (name, state)
+                if seen is not None and not check_only:
+                    _unlink_if_there(os.path.join(state, name))
+                continue
             if name.startswith(".") and name.endswith(".tmp") and any(name[1:].startswith(a + ".")
                                                                       for a in STATE_ALLOWED - {"format"}):
-                # A fresh temp is a live writer's, mid-replace (the launcher's record as hold starts).
-                if not check_only and time.time() - os.lstat(os.path.join(state, name)).st_mtime > TEMP_SWEEP_AFTER:
-                    os.unlink(os.path.join(state, name))
+                # One look: a temp renamed into place since the listing is a writer finishing, not an error.
+                # One that is there is a plain file, whatever its age; a fresh one is a live writer's.
+                seen = _temp_seen(os.path.join(state, name))
+                if seen is False:
+                    return "refusing to start: state/%s in %s is not a plain file" % (name, state)
+                if seen is not None and not check_only and time.time() - seen > TEMP_SWEEP_AFTER:
+                    _unlink_if_there(os.path.join(state, name))
                 continue
             if bridge_entry(work, os.path.join("state", name)):
                 continue

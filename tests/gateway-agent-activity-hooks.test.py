@@ -1335,6 +1335,106 @@ class Hooks(unittest.TestCase):
         self.assertTrue(gw._deliver_result_payload(tid, tid, "late"))
         self.assertEqual(fake.posted("/v1/results"), [])
 
+    def seat_copy(self, tid, *, live=True, age=0.0, lock="taking.lock"):
+        """The copy a seat named sutando-core made of `tid`, `age` seconds older than now; with `live`, the
+        seat's lock is held as its running process holds it."""
+        import fcntl
+        seat = gw._STATE / "codex-seat" / "sutando-core"
+        copy = seat / "payloads" / f"{tid}.txt"
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        copy.write_text("task")
+        self.addCleanup(lambda: copy.unlink(missing_ok=True))
+        if age:
+            os.utime(copy, (time.time() - age, time.time() - age))
+        if live:
+            fd = os.open(seat / lock, os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.addCleanup(os.close, fd)
+        return copy
+
+    def test_a_closed_task_a_codex_seat_is_running_is_stopped_not_withdrawn(self):
+        """VM 2026-11-22: an app-server seat works on its own copy and writes no activity rows, so
+        the activity test alone withdrew its inbox file mid-turn and the seat settled nothing."""
+        tid = "task-closed-seat"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        seed_ack(tid, _ack(tid, 1))
+        self.seat_copy(tid)
+        self.closed_by_beat(tid, reason="max_queued_age_exceeded")
+        self.assertTrue((gw.TASKS_DIR / f"{tid}.txt").exists(), "a file the seat is on stays")
+        self.assertEqual(len(self.controls(tid)), 1, "the seat is asked to stop")
+
+    def test_a_copy_an_exited_seat_left_behind_takes_nothing(self):
+        tid = "task-closed-stale-seat"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        seed_ack(tid, _ack(tid, 1))
+        self.seat_copy(tid, live=False)
+        self.closed_by_beat(tid, reason="max_queued_age_exceeded")
+        self.assertFalse((gw.TASKS_DIR / f"{tid}.txt").exists(), "no running seat: withdrawn")
+        self.assertEqual(self.controls(tid), [])
+
+    def test_a_copy_a_restarted_seat_inherited_takes_nothing(self):
+        """The replacement holds the seat lock from its first moment, over whatever the interrupted
+        seat left. It has not taken that task: only `taking.lock`, held after the folder was cleared,
+        vouches for a copy, so during the cleanup, or after one that failed, nothing is taken."""
+        tid = "task-closed-inherited-copy"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        seed_ack(tid, _ack(tid, 1))
+        self.seat_copy(tid, lock="lock")
+        self.closed_by_beat(tid, reason="max_queued_age_exceeded")
+        self.assertFalse((gw.TASKS_DIR / f"{tid}.txt").exists(), "the seat lock alone vouches for nothing")
+        self.assertEqual(self.controls(tid), [])
+
+    def test_a_copy_of_an_older_generation_takes_nothing(self):
+        tid = "task-closed-old-copy"
+        self.seat_copy(tid, age=3600)
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        seed_ack(tid, _ack(tid, 1))
+        self.closed_by_beat(tid, reason="max_queued_age_exceeded")
+        self.assertFalse((gw.TASKS_DIR / f"{tid}.txt").exists(), "the copy predates this file: withdrawn")
+        self.assertEqual(self.controls(tid), [])
+
+    def test_a_seat_folder_that_cannot_be_read_takes_nothing(self):
+        with mock.patch.object(gw.Path, "glob", side_effect=OSError("denied")):
+            self.assertFalse(gw._seat_took("task-unreadable-seat", 0.0))
+
+    def test_a_seat_restarted_between_the_two_readings_takes_nothing(self):
+        """The copy is read, then the lock. A seat restarted in between has cleared the old copy and
+        holds the lock: the old reading must not be paired with the new seat's lock."""
+        tid = "task-restart-interleaved"
+        copy = self.seat_copy(tid)
+        real = gw._seat_lock_held
+
+        def restarted_then(act):
+            def held(path):
+                act()               # the replacement seat ran its cleanup, took the lock...
+                return real(path)
+            return held
+
+        def rewritten():            # ...and has by now written a copy of its own (a new file)
+            copy.unlink()
+            copy.write_text("task")
+
+        for what, act in (("cleared", copy.unlink), ("rewritten", rewritten)):
+            copy.write_text("task")
+            with self.subTest(what), mock.patch.object(gw, "_seat_lock_held", restarted_then(act)):
+                self.assertFalse(gw._seat_took(tid, 0.0))
+        copy.write_text("task")
+        self.assertTrue(gw._seat_took(tid, 0.0), "the same copy before and after the lock reading is taken")
+
+    def test_a_copy_or_a_lock_that_cannot_be_examined_takes_nothing(self):
+        gone = mock.Mock(stat=mock.Mock(side_effect=OSError("vanished")))
+        with mock.patch.object(gw.Path, "glob", return_value=[gone]):
+            self.assertFalse(gw._seat_took("task-vanished-copy", 0.0), "a copy removed between listing and stat")
+        tid = "task-unexaminable-lock"
+        lock = self.seat_copy(tid).parent.parent / "taking.lock"
+        self.assertTrue(gw._seat_lock_held(lock))
+        self.assertFalse(gw._seat_lock_held(lock.with_name("no-such.lock")), "no lock file: no seat")
+        import fcntl
+        with mock.patch.object(fcntl, "flock", side_effect=OSError("io error")):
+            self.assertFalse(gw._seat_lock_held(lock), "a lock that cannot be probed proves nothing")
+        with mock.patch.dict(sys.modules, {"fcntl": None}):
+            self.assertFalse(gw._seat_lock_held(lock), "no flock on this platform: nothing is vouched for")
+
     def test_a_closed_task_the_core_claimed_first_is_stopped(self):
         tid = "task-closed-claimed"
         self.assertTrue(gw._take_served_task(_task(tid), set(), []))

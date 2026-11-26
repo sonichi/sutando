@@ -24,7 +24,7 @@ isolate_os_environ()
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from claude_code_fixtures import (  # noqa: E402
-    cli, ConnectBase, hold_consumer, inbox, isolated_runs, ISOLATED_REPLY, records, task_io, unhold,
+    cli, ConnectBase, contract_shape, hold_consumer, inbox, isolated_runs, ISOLATED_REPLY, records, task_io, unhold,
     write_isolated_stub,
 )
 from ag2_sparrow import task_lifecycle as lifecycle  # noqa: E402
@@ -353,6 +353,98 @@ class IsolatedLines(unittest.TestCase):
         self.assertEqual(inbox.isolated.isolated_lines(["outside results/x.txt codex exec"]),
                          ["outside results/x.txt codex exec"], "a line outside a tier block is untouched")
 
+
+
+
+class InflightVerb(ConnectBase):
+    """`inbox inflight`: what a Mod reloaded inside its session checks the offers it kept against. Only the
+    live generation's local claims between their call and their answer are listed; it changes nothing."""
+
+    def setUp(self):
+        super().setUp()
+        self.configure()
+        self.assertEqual(inbox.prepare_root(str(self.work)), "")
+        self.holder, self.consumer = hold_consumer(self.work)
+        self.addCleanup(unhold, self.holder)
+        self.root = str(self.work)
+
+    def verb(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cli.main(["inbox", "--root", self.root, *args])
+        return rc, json.loads(out.getvalue())
+
+    def listed(self):
+        rc, out = self.verb("inflight")
+        self.assertEqual(rc, 0, out)
+        return out["tasks"]
+
+    def test_a_claim_is_listed_from_its_call_to_its_answer_and_only_for_the_live_generation(self):
+        t = "task-fl9"
+        (self.inbox / (t + ".txt")).write_text("id: %s\naccess_tier: owner\ntask: hi\n" % t)
+        self.assertEqual(self.listed(), {})
+        rc, claimed = self.verb("claim", t)
+        self.assertEqual((rc, claimed.get("admission")), (0, "owner"), claimed)
+        self.assertEqual(self.listed(), {}, "claimed and not called yet: nothing a turn could be running for")
+        token = self.verb("authorize", t, str(claimed["attempt"]), "--text-hash", "h1")[1]["token"]
+        self.assertEqual(self.listed(), {t: {"phase": "CALLING", "turn_id": "", "attempt": claimed["attempt"]}})
+        self.assertEqual(self.verb("confirm", t, "turn-1", token, "--text-hash", "h1")[0], 0)
+        before = sorted((p.name, p.stat().st_mtime_ns) for p in (self.work / "state" / "claims" / t).iterdir())
+        self.assertEqual(self.listed(), {t: {"phase": "TURN_CONFIRMED", "turn_id": "turn-1", "attempt": claimed["attempt"]}})
+        after = sorted((p.name, p.stat().st_mtime_ns) for p in (self.work / "state" / "claims" / t).iterdir())
+        self.assertEqual(before, after, "read only")
+        # The scenario checker's own words for a listing (tests/claude_code_fixtures.contract_shape).
+        out = self.verb("inflight")[1]
+        ok = {"exit": 0, "refused": False, "retry": False}
+        self.assertEqual(contract_shape(dict(ok, listed={t: {"phase": "TURN_CONFIRMED", "turn_id": "turn-1"}}), 0, out), "")
+        self.assertIn("listed as", contract_shape(dict(ok, listed={t: {"phase": "CALLING"}}), 0, out))
+        self.assertIn("still listed", contract_shape(dict(ok, unlisted=[t]), 0, out))
+        self.assertEqual(contract_shape(dict(ok, unlisted=["task-other"]), 0, out), "")
+        # Another generation's claim, a claim that is not a local one, and one that cannot be read are left out.
+        path = self.work / "state" / "claims" / t / "claim.json"
+        kept = path.read_text()
+        rec = json.loads(kept)
+        path.write_text(json.dumps(dict(rec, generation=dict(rec["generation"], pid=rec["generation"]["pid"] + 1))))
+        self.assertEqual(self.listed(), {})
+        path.write_text(json.dumps(dict(rec, claim_mode="cloud")))
+        self.assertEqual(self.listed(), {})
+        path.write_text("{ not json")
+        self.assertEqual(self.listed(), {})
+        path.write_text(kept)
+        self.assertEqual(inbox.stage(self.root, t, "turn-1", b"four\n").get("outcome"), "staged")
+        self.assertEqual(self.listed()[t]["phase"], "RESULT_STAGED")
+        self.assertEqual(self.verb("publish", t)[0], 0)
+        self.assertEqual(self.listed(), {}, "answered: nothing left to finish")
+
+    def verb_with(self, body, *args):
+        with mock.patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(body))):
+            return self.verb(*args)
+
+    def test_the_calls_a_reloaded_mod_makes_mid_turn_end_with_exactly_one_result(self):
+        """The real verbs, in the order the Mod calls them around a reload inside a running turn: the
+        claim is listed at the same attempt, is not handed out a second time, and whatever is tried after
+        the one reply (another reply, the turn's end, a claim, an interrupt) leaves that one result."""
+        t = "task-rl1"
+        (self.inbox / (t + ".txt")).write_text("id: %s\naccess_tier: owner\ntask: hi\n" % t)
+        rc, claimed = self.verb("claim", t)
+        self.assertEqual(rc, 0, claimed)
+        token = self.verb("authorize", t, str(claimed["attempt"]), "--text-hash", "h1")[1]["token"]
+        self.assertEqual(self.verb("confirm", t, "turn-1", token, "--text-hash", "h1")[0], 0)
+        # The reload: the Mod has only what it kept, and asks what is still in flight.
+        self.assertEqual(self.listed(), {t: {"phase": "TURN_CONFIRMED", "turn_id": "turn-1", "attempt": claimed["attempt"]}})
+        rc, again = self.verb("claim", t)
+        self.assertEqual((rc, again.get("retry"), "attempt" in again), (1, None, False), "no second attempt, no second turn")
+        self.assertEqual(self.verb_with(b"four\n", "stage", t, "turn-1")[1].get("outcome"), "staged")
+        self.assertEqual(self.verb("publish", t)[1].get("outcome"), "settled")
+        self.assertEqual(self.listed(), {})
+        self.assertEqual(self.verb_with(b"five\n", "stage", t, "turn-1")[0], 1, "a second reply is refused")
+        rc, parked = self.verb("park", t, "turn-1", "--detail", "turn answer without a reply")
+        self.assertEqual((rc, parked.get("parked")), (0, False), "the turn's end adds no protocol failure")
+        self.assertEqual(self.verb("claim", t)[0], 1)
+        self.assertEqual(self.verb("interrupt", t)[1].get("interrupted"), False)
+        results = sorted(p.name for p in self.results.rglob("*") if p.is_file() and not p.name.startswith("."))
+        self.assertEqual(results, [t + ".txt"], "exactly one result")
+        self.assertEqual((self.results / (t + ".txt")).read_text(), "four\n")
 
 
 if __name__ == "__main__":
