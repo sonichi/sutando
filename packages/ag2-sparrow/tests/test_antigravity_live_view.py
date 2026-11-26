@@ -37,6 +37,40 @@ class Steps(unittest.TestCase):
         self.assertEqual(step({"rawInput": {"command": ["git", "status"]}}), ("ran", "git status"))
 
 
+class Pending(unittest.TestCase):
+    """An ACP `tool_call` is a proposal: permission may still refuse it, or it may fail. The view says what it
+    did only on the call's own `completed` update."""
+
+    def run_updates(self, *updates):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(live_view.path_of(d))
+            turn = acp_host.Turn()
+            turn.live, turn.view = True, live_view.Writer(path)
+            for u in updates:
+                turn.on_update({"update": u})
+            return path.read_text().splitlines()
+
+    CALL = {"sessionUpdate": "tool_call", "toolCallId": "c1", "kind": "execute", "title": "t",
+            "rawInput": {"command": "rm -rf build"}}
+
+    def test_a_proposed_call_is_pending_then_what_it_did_once_completed(self):
+        self.assertEqual(self.run_updates(self.CALL, {"sessionUpdate": "tool_call_update", "toolCallId": "c1",
+                                                      "status": "completed"}),
+                         ["\u2022 pending rm -rf build", "\u2022 ran rm -rf build"])
+
+    def test_a_refused_or_failed_call_is_never_shown_as_done(self):
+        refused = self.run_updates(self.CALL)       # permission refused it: no completed update ever comes
+        failed = self.run_updates(self.CALL, {"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "failed"})
+        self.assertEqual(refused, ["\u2022 pending rm -rf build"])
+        self.assertEqual(failed, ["\u2022 pending rm -rf build", "\u2022 failed rm -rf build"])
+
+    def test_completion_is_tied_to_its_own_call_id(self):
+        other = {"sessionUpdate": "tool_call_update", "toolCallId": "c2", "status": "completed"}
+        self.assertEqual(self.run_updates(self.CALL, other), ["\u2022 pending rm -rf build"])
+        done = dict(self.CALL, status="completed")
+        self.assertEqual(self.run_updates(done), ["\u2022 ran rm -rf build"], "a call reported already done")
+
+
 class ControlCharacters(unittest.TestCase):
     """Every agy line goes through live_view.Writer, so an escape sequence in agy's words or a tool's title
     reaches the log as spaces: it cannot recolour, retitle or move the cursor of the viewer's terminal."""
@@ -98,7 +132,7 @@ class SlowLog(unittest.TestCase):
             release.set()
             self.assertTrue(returned, "the reader went on while the log was stalled")
             self.assertTrue(view.drain(5))
-        self.assertEqual(self.path.read_text().splitlines(), ["\u2022 ran ls"])
+        self.assertEqual(self.path.read_text().splitlines(), ["\u2022 pending ls"])
 
     def test_a_backlog_is_bounded_and_says_what_it_left_out(self):
         view = live_view.Writer(self.path, background=True)
@@ -154,7 +188,9 @@ class AgyTurn(unittest.TestCase):
         self.w.serve(2)
         lines = self.path.read_text().splitlines()
         self.assertTrue(any(ln.startswith("\u2022 refused command: rm -rf ~") for ln in lines), lines)
-        self.assertIn("\u2022 changed File results/task-4.txt", lines)
+        # The result-file edit was refused, so it stays pending and is never shown as done.
+        self.assertIn("\u2022 pending File results/task-4.txt", lines)
+        self.assertNotIn("\u2022 changed File results/task-4.txt", lines)
         self.assertEqual(sum(ln == "\u2500\u2500 turn completed \u2500\u2500" for ln in lines), 2)
 
     def test_view_follows_the_jobs_log_and_never_reads_stdin(self):

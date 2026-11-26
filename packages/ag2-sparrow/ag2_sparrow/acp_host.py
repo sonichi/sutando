@@ -610,6 +610,7 @@ class Turn:
         self.session_id = None
         self.lock = threading.Lock()
         self.view = None       # the agent's live view (`live_view.Writer`), when the adapter keeps one
+        self.calls = {}        # toolCallId -> the call's fields so far, until a terminal status
 
     def on_update(self, params):
         update = params.get("update") if isinstance(params.get("update"), dict) else {}
@@ -618,10 +619,8 @@ class Turn:
         with self.lock:
             self.updates[str(update.get("sessionUpdate"))[:60]] += 1
         kind = update.get("sessionUpdate")
-        if self.view is not None and kind == "tool_call":
-            self.view.step(*view_step(update))
-        elif self.view is not None and kind == "tool_call_update" and update.get("status") == "failed":
-            self.view.step("failed", update.get("title") or update.get("toolCallId") or "a tool call")
+        if self.view is not None and kind in ("tool_call", "tool_call_update"):
+            self.view_call(kind, update)
         if kind != "agent_message_chunk":
             return
         content = update.get("content")
@@ -630,6 +629,26 @@ class Turn:
                 self.chunks.append(content.get("text") or "")
             if self.view is not None:
                 self.view.say(content.get("text") or "")
+
+    def view_call(self, kind, update):
+        """A `tool_call` is only proposed (permission may refuse it): "pending" until its own id reports
+        `completed`, then what it did; `failed` says so. A call that never completes stays pending."""
+        cid = update.get("toolCallId") if isinstance(update.get("toolCallId"), str) else ""
+        status = update.get("status")
+        with self.lock:
+            seen = cid in self.calls
+            call = dict(self.calls.get(cid, {}), **{k: v for k, v in update.items() if v is not None})
+            if status in ("completed", "failed"):
+                self.calls.pop(cid, None)
+            elif cid:
+                self.calls[cid] = call
+        what, detail = view_step(call)
+        if status == "failed":
+            self.view.step("failed", detail or cid or "a tool call")
+        elif status == "completed" and (kind == "tool_call" or seen):
+            self.view.step(what, detail)
+        elif kind == "tool_call":
+            self.view.step("pending", detail)
 
     @property
     def text(self):
