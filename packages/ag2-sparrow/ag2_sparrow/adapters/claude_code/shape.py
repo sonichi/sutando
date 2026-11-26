@@ -54,9 +54,18 @@ SOCKET_PATH_MAX = 100
 PLUGIN = Path(__file__).resolve().with_name("ag2space-inbox")      # package data, shipped in the wheel
 
 
+def shipped_plugin(path) -> bool:
+    """Whether `path` is the plugin an ag2-sparrow package ships, this one's or an older install's."""
+    parts = Path(path).parts[-4:]
+    return tuple(parts) == ("ag2_sparrow", "adapters", "claude_code", PLUGIN.name)
+
+
 def resolve_plugin_dir(recorded: str) -> tuple:
     """(dir, fell_back): the recorded PLUGIN_DIR when it holds a plugin, else the shipped one; an install
-    from before the plugin moved into the wheel recorded an in-repo dir that no longer exists."""
+    from before the plugin moved into the wheel recorded an in-repo dir that no longer exists. A plugin
+    another ag2-sparrow shipped is this one's: an upgrade must not leave the session on the old plugin."""
+    if recorded and shipped_plugin(recorded):
+        return PLUGIN, False
     if recorded and (Path(recorded) / ".claude-plugin" / "plugin.json").is_file():
         return Path(recorded), False
     return PLUGIN, True
