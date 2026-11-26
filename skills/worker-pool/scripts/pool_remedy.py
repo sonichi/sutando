@@ -445,12 +445,41 @@ def retry_limit(workspace, repo, worker_id, *, runner=None):
             "task_id": task_id, "send_code": sent.code}
 
 
+REDELIVER_ASK = (
+    "Your usage limit has lifted. Deliveries that reached you while you were limited were not "
+    "announced again: process your outstanding deliveries now. Do not run core startup or core "
+    "schedules. Reply [no-send] when they are handled.")
+
+
+def redeliver(workspace, repo, worker_id, *, runner=None) -> dict:
+    """Re-offer a seat's owed work after its limit hold lifted: one fresh task through pool_ask,
+    which whichever watcher holds the inbox announces. Types nothing into the pane."""
+    if (sup.is_paused(workspace, worker_id)
+            or worker_id not in sup.supervised_workers(workspace)
+            or sup.work_outstanding(workspace, worker_id) is not True):
+        return {"worker_id": worker_id, "outcome": "no-work-or-paused"}
+    socket, session = sup._open_tmux(workspace, worker_id)
+    runtime = wc.worker_runtime(workspace, worker_id)
+    if not socket or runtime is None:
+        return {"worker_id": worker_id, "outcome": "unsupported-or-no-session"}
+    text = wc.capture(socket, session, runner or subprocess.run)
+    if text is None or sup.classify_pane_text(text, runtime, workspace=workspace, socket=socket,
+                                              session=session) != ps.PANE_IDLE:
+        return {"worker_id": worker_id, "outcome": "pane-not-idle"}
+    try:
+        delivery = _sibling("pool_ask").ask(workspace, worker_id, REDELIVER_ASK, allow_handoff=False)
+    except (OSError, ValueError) as exc:
+        return {"worker_id": worker_id, "outcome": "delivery-failed", "why": str(exc)}
+    return {"worker_id": worker_id, "outcome": "redelivered", "task_id": delivery["task_id"]}
+
+
 def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
     """Act on a tick's decisions. `recover` resumes the session; `rearm_watcher`
     ensures the inbox's supervisor, whose standby arms once no session watcher
     holds the inbox. A wedge card is raised and never acts on the session: only a
     dead session is ever respawned, and a logged-out one is carded for its /login
-    because a fresh session meets the same expired login. `escalate` is returned
+    because a fresh session meets the same expired login. `redeliver` writes one fresh task
+    for an idle seat whose limit hold lifted while it owed work. `escalate` is returned
     untouched, because asking the owner is the core's, not a timer's."""
     done = {}
     rearms = {}
@@ -472,6 +501,8 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
                                              runner=runner or subprocess.run)
         elif decision == ps.RETRY_LIMIT:
             rearms[worker_id] = retry_limit(workspace, repo, worker_id, runner=runner)
+        elif decision == ps.REDELIVER:
+            rearms[worker_id] = redeliver(workspace, repo, worker_id, runner=runner)
         elif decision == ps.REARM_WATCHER:
             rearms[worker_id] = ensure_supervisor(workspace, repo, worker_id,
                                                   runner=runner)

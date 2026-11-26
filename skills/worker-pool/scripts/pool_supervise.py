@@ -323,9 +323,24 @@ def observe(workspace, now: float, *, worker_ids=None,
             pane_id=pane_id,
             limit_reset_at=reset.at if reset else None,
             limit_banner=reset.banner if reset else None,
+            limit_released_at=limit_released_at(workspace, wid) if session_alive is True else None,
             delivery_block=blocks.get(socket) if socket else None,
         )
     return obs
+
+
+def limit_released_at(workspace, worker_id) -> float | None:
+    """When this seat's own limit hold (core_limit_hold, keyed by its tmux session) was lifted;
+    None while it holds, with no record, or when it cannot be read."""
+    try:
+        import core_limit_hold
+        hold = core_limit_hold.read_hold(Path(workspace), seat=wi.tmux_session_name(worker_id))
+    except (ImportError, OSError, ValueError):
+        return None
+    at = (hold or {}).get("released_at")
+    if (hold or {}).get("status") != "cleared" or isinstance(at, bool) or not isinstance(at, (int, float)):
+        return None
+    return float(at)
 
 
 def delivery_block(socket) -> str | None:
@@ -448,6 +463,7 @@ def load_state(workspace) -> ps.SupervisionState:
                 limit_exhausted=bool(ev.get("limit_exhausted")),
                 limit_banner=ev.get("limit_banner"),
                 limit_reset_at=ev.get("limit_reset_at"),
+                redelivered_for=ev.get("redelivered_for"),
             )
     last = raw.get("last_sample_at")
     return ps.SupervisionState(
@@ -477,7 +493,8 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
                         "limit_attempts": e.limit_attempts,
                         "limit_exhausted": e.limit_exhausted,
                         "limit_banner": e.limit_banner,
-                        "limit_reset_at": e.limit_reset_at}
+                        "limit_reset_at": e.limit_reset_at,
+                        "redelivered_for": e.redelivered_for}
                     for w, e in state.workers.items()},
     }
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".pool-supervision.")
