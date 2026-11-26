@@ -442,7 +442,7 @@ class FreshDirTest(Base):
         # breaking the layout: listed, then gone, is accepted in a check and in a start, fresh or not.
         for copy in filter(None, (src_copy(), vendored)):
             real_listdir = os.listdir
-            for gone in (".rate.jsonl.7.abcd.tmp", "model-switch.json.tmp"):
+            for gone in (".rate.jsonl.7.abcd.tmp", "model-switch.json.tmp", "model.json.tmp", "account.json.tmp"):
                 def listing(path, gone=gone):
                     names = real_listdir(path)
                     return names + [gone] if os.path.basename(str(path)) == "state" else names
@@ -456,6 +456,13 @@ class FreshDirTest(Base):
             with mock.patch.object(copy.os, "unlink", side_effect=FileNotFoundError()):
                 self.assertIsNone(copy.prepare_work_dir(str(self.work)))
             old.unlink()
+            # The same for a card record's own temp, swept by another start between the look and the unlink.
+            card_temp = state / "model.json.tmp"
+            card_temp.write_text("")
+            os.utime(card_temp, (1, 1))
+            with mock.patch.object(copy.os, "unlink", side_effect=FileNotFoundError()):
+                self.assertIsNone(copy.prepare_work_dir(str(self.work)))
+            card_temp.unlink()
         # The canonical copy answers the same, read by read (the package's is its copy).
         for copy in filter(None, (src_copy(), vendored)):
             (state / "model-switch.json.tmp").write_text("x")
@@ -3256,6 +3263,38 @@ class LocalClaimTest(Base):
         (self.work / "state" / "claims.lock").unlink()
         (self.work / "state" / "claims.lock").mkdir()
         self.assertIn("not a plain file", self.lc.prepare_work_dir(str(self.work)))
+
+    def test_a_work_dir_that_used_model_or_a_card_restarts(self):
+        # Live 2026-11-22: a claude-local root that had used `model` and the cards refused to start
+        # ("state/agent-cards is not this adapter's state").
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        state = self.work / "state"
+        for name in ("isolated-turns.json", "model-switch.json", "model-switch.lock", "model.json", "account.json",
+                     "model-apply.log", "model-apply.lock"):
+            (state / name).write_text("{}")
+        for name in ("agent-cards", "card-marks"):
+            (state / name).mkdir()
+            (state / name / "anything.json").write_text("{}")
+        (state / "model.json.tmp").write_text("{}")             # a record's own temp, mid-replace
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        self.assertTrue((state / "model.json.tmp").exists(), "a fresh temp is a live writer's")
+        old = time.time() - self.lc.TEMP_SWEEP_AFTER - 10
+        os.utime(state / "model.json.tmp", (old, old))
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        self.assertFalse((state / "model.json.tmp").exists(), "a stale one is swept")
+        (state / "model.json.tmp").mkdir()
+        self.assertIn("state/model.json.tmp", self.lc.prepare_work_dir(str(self.work)) or "", "a temp is a plain file")
+        (state / "model.json.tmp").rmdir()
+        (state / "model.json").unlink()
+        (state / "model.json").mkdir()
+        self.assertIn("not a plain file", self.lc.prepare_work_dir(str(self.work)))
+        (state / "model.json").rmdir()
+        shutil.rmtree(state / "card-marks")
+        (state / "card-marks").write_text("")
+        self.assertIn("not a plain directory", self.lc.prepare_work_dir(str(self.work)))
+        (state / "card-marks").unlink()
+        (state / "somebody-elses.json").write_text("{}")
+        self.assertIn("not this adapter's state", self.lc.prepare_work_dir(str(self.work)))
 
     def test_unmodified_main_refuses_the_fenced_work_dir_at_startup_with_everything_unchanged(self):
         old = main_lifecycle()
