@@ -85,10 +85,16 @@ FORMATS = frozenset((FORMAT, FORMAT_LOCAL))
 # isolated-turns.json: the hourly cap of its isolated turns (inbox.ISOLATED_LIMITER_FILE).
 LOCAL_STATE_FILES = ("claude-local-plugin.json", "claude-local-supervisor.json", "claims.lock", "progress.lock",
                      "model-switch.json", "model-switch.lock", "isolated-turns.json")
+# What claude-local's cards keep beside them: the model and account cards' records, the detached switch's
+# log and lock. Unnamed, each refuses the start.
+LOCAL_FEATURE_FILES = ("model.json", "account.json", "model-apply.log", "model-apply.lock")
+# Their directories: the cards this agent posted (issued_cards' ledger) and the card-mark answers kept for
+# a staging retry (adapters/claude_code/model_card.py). When present, each must be a plain directory.
+STATE_OPTIONAL_DIRS = frozenset(("agent-cards", "card-marks"))
 STATE_ALLOWED = frozenset(("format", "claims", "settled-ids", "rate.jsonl", "done", "collaborator-turns.json")
-                          + LOCAL_STATE_FILES)
+                          + LOCAL_STATE_FILES + LOCAL_FEATURE_FILES) | STATE_OPTIONAL_DIRS
 # Optional records the adapters rewrite in place: when present, each must be a plain file.
-STATE_OPTIONAL_FILES = frozenset(("collaborator-turns.json",) + LOCAL_STATE_FILES)
+STATE_OPTIONAL_FILES = frozenset(("collaborator-turns.json",) + LOCAL_STATE_FILES + LOCAL_FEATURE_FILES)
 FORMAT_TEMP = re.compile(r"\.format\.\d+\.[0-9a-f]{6}\.tmp")
 # A staged body's private temp: .<task>.<attempt>.<identity>.<pid>.<random>.tmp, beside the blob.
 BLOB_TEMP = re.compile(r"^\.(.+)\.(\d+)\.([0-9a-f]{24})\.(\d+)\.[0-9a-f]{8}\.tmp$")
@@ -382,6 +388,16 @@ def prepare_work_dir(work, check_only=False):
             if name in STATE_ALLOWED:
                 if name in STATE_OPTIONAL_FILES and not _is_type(os.path.join(state, name), "file"):
                     return "refusing to start: state/%s in %s is not a plain file" % (name, state)
+                if name in STATE_OPTIONAL_DIRS and not _is_type(os.path.join(state, name), "dir"):
+                    return "refusing to start: state/%s in %s is not a plain directory" % (name, state)
+                continue
+            if name.endswith(".tmp") and name[:-4] in LOCAL_FEATURE_FILES:
+                # A feature record's own temp (`<name>.tmp`, then replaced): a live writer's, or one left by a crash.
+                seen = _temp_seen(os.path.join(state, name))
+                if seen is False:
+                    return "refusing to start: state/%s in %s is not a plain file" % (name, state)
+                if seen is not None and not check_only and time.time() - seen > TEMP_SWEEP_AFTER:
+                    _unlink_if_there(os.path.join(state, name))
                 continue
             if name in LEGACY_TEMPS:
                 seen = _temp_seen(os.path.join(state, name))
