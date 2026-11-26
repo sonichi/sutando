@@ -365,15 +365,19 @@ def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "",
         more = ""
     note = NO_CODE
     lead = ac.md_escape(lead)[:1000]
-    using = "" if signed_out else in_use_words(cur)
+    # The quota card says the limit and its reset alone: a probe at the limit may read the account as signed out.
+    using = "" if signed_out or retry else in_use_words(cur)
     words = " ".join(w for w in (lead, using, more.strip()) if w)
     words = words or "Pick an account below."
-    body, card = ac.build(CARD_ID, "info", title="Account", avatar_=ac.avatar(initial="A"),
+    # Out of usage or signed out, the core waits on the owner: `pending`, as the app's needs-you bar lists it.
+    stuck = signed_out or retry
+    body, card = ac.build(CARD_ID, "pending" if stuck else "info", title="Account", avatar_=ac.avatar(initial="A"),
                           text=words, buttons=buttons, note=note, note_tone="dim",
                           body=" ".join(w for w in (lead, using, 'Reply "switch account" for options.') if w))
     # The marker by which the desktop app on the core's computer draws the core's own account controls;
     # `signed_out` makes it lead with "Sign in again" for this account, above the account dropdown.
-    marker = {"runtime": cur["runtime"], "core": True, **({"signed_out": True} if signed_out else {})}
+    marker = {"runtime": cur["runtime"], "core": True, **({"signed_out": True} if signed_out else {}),
+              **({"limit": True} if retry and not signed_out else {})}
     return body, dict(card, **{CONTROLS: marker})
 
 
