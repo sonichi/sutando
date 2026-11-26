@@ -1370,6 +1370,28 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         ((_, card),) = self.posted("$card2")
         self.assertEqual(card["text"], account_switch.LAPSED + " " + account_switch.BELOW)
         self.assertTrue(card[account_switch.CONTROLS]["signed_out"], "the refusal is of the login on disk now")
+        # A turn that completes on that login clears the refusal: the card is neutral again.
+        os.unlink(self.home / "stub-locked")
+        os.unlink(self.home / "stub-touch-on-thread")
+        self.assertTrue(self.serve("task-3", "hello").startswith("STUB echo:"))
+        self.assertFalse((self.work / "state" / cc.LOGIN_REFUSED).exists())
+        self.serve("task-4", "/account")
+        ((_, card),) = self.posted("$card3")
+        self.assertNotIn("signed_out", card[account_switch.CONTROLS])
+        # Keeping or dropping the refusal never fails a turn: an unwritable record is only logged.
+        args = cc.build_parser().parse_args(["--work", str(self.work)])
+        args.state, args.bridge_state = str(self.work / "state"), str(self.bridge)
+        c = cc.Connector(FakeRpc, args, note="n")
+        c.turn_login = [1, 2, 3]
+        with mock.patch.object(cc, "write_atomic", side_effect=PermissionError("denied")), \
+                mock.patch.object(cc, "log") as logged:
+            c.note_login_refused(True)
+        logged.assert_called_once_with("login refusal not kept:", "PermissionError")
+        (self.work / "state" / cc.LOGIN_REFUSED).write_text("{}")
+        with mock.patch.object(cc.os, "unlink", side_effect=FileNotFoundError("raced")), \
+                mock.patch.object(cc, "log") as logged:
+            c.note_login_refused(False)
+        logged.assert_not_called()
 
     def test_a_turn_that_had_started_work_is_never_run_again_after_an_unauthorized_end(self):
         (self.home / "stub-token").write_text("tok-a")

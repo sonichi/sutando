@@ -558,10 +558,9 @@ class Connector:
                 os.unlink(path)
             else:
                 write_atomic(path, json.dumps({"login": stamp}) + "\n")
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            log("login refusal not kept:", type(e).__name__)
+        except OSError as e:     # one already gone is the state wanted
+            if not isinstance(e, FileNotFoundError):
+                log("login refusal not kept:", type(e).__name__)
 
     def login_refused(self) -> bool:
         """Whether Codex refused the login now on disk as unauthorized, even after a restart (a turn said so)."""

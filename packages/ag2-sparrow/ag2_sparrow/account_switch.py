@@ -155,12 +155,7 @@ class AccountSwitch:
         except Exception as e:  # noqa: BLE001 - the card still says what it can
             self.log("account not read:", "%s: %s" % (type(e).__name__, str(e)[:200]))
             return "I could not read which account I'm signed in with.", False
-        try:
-            refused = self.lapsed is not None and self.lapsed() is True
-        except Exception as e:  # noqa: BLE001 - no lapse signal: the neutral words
-            self.log("lapse not read:", "%s: %s" % (type(e).__name__, str(e)[:200]))
-            refused = False
-        if refused:
+        if self.lapsed is not None and self.lapsed() is True:
             return LAPSED, True
         return ("I'm using %s." % label if label else "I'm not signed in."), False
 
