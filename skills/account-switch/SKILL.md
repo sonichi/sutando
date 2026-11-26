@@ -55,7 +55,10 @@ A Claude core has no saved accounts (its sign-in lives in the Keychain), so its 
 owner's tap, in the DM the card was posted in, on a card this agent posted, acts
 (`agent_card.click_verdict`). A "Use" tap acts only for a key that card offered and the store still
 holds; a tap on the account already in use changes nothing; a second switch while one is under way is
-refused.
+refused. The tap is the same from any client the owner uses (the desktop app, the web, a phone): it
+carries only the choice, and the saved sign-in never leaves this computer. A tap message acts once (a
+resent one starts no second switch), and each tap's outcome is one line in the owner-action audit
+(`state/recovery/audit.jsonl`), ids only. Adding an account needs the computer that runs the core.
 
 A "Use" tap answers at once ("Switching the core to X. It restarts once this turn has finished…") and
 starts `account_card.py switch` detached, in its own session, because the core restarts. `switch`:
