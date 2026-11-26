@@ -445,6 +445,53 @@ export function limitState(record: unknown): LimitState {
 
 export type CredentialState = 'ok' | 'exhausted';
 
+export type TimingOutcome =
+	| 'ok' | 'proxy_reject' | 'upstream_error' | 'upstream_aborted' | 'idle_abort'
+	| 'client_closed_before_response' | 'client_closed_during_response';
+
+export interface RequestTiming {
+	id: number;
+	method: string;
+	path: string;
+	attempt: number;
+	// Milliseconds since the request reached the proxy; undefined when never reached.
+	bodyMs?: number;
+	// The keychain read and any refresh, measured from bodyMs.
+	credMs?: number;
+	dispatchMs?: number;
+	// The attempt a 401 retry replaced, from its dispatch to the retry.
+	firstAttemptMs?: number;
+	socketMs?: number;
+	reused?: boolean;
+	connectMs?: number;
+	tlsMs?: number;
+	// Other proxied requests open when this one was dispatched.
+	inflight?: number;
+	// Request fully written upstream.
+	sentMs?: number;
+	ttfbMs?: number;
+	// Last upstream byte, and the upstream body bytes seen.
+	lastByteMs?: number;
+	bytes?: number;
+	totalMs: number;
+	status: number;
+	outcome: TimingOutcome;
+}
+
+/** One timing line: method, path without query, status and durations only. */
+export function formatTimingLine(t: RequestTiming): string {
+	const ms = (v: number | undefined) => (v === undefined || !Number.isFinite(v) ? '-' : String(Math.round(v)));
+	// The path is caller text: anything outside a URL path's plain characters is masked.
+	const path = t.path.split('?')[0].slice(0, 200).replace(/[^A-Za-z0-9/_.~-]/g, '_') || '-';
+	const method = /^[A-Z]{1,10}$/.test(t.method) ? t.method : '-';
+	return `[Proxy] id=${t.id} timing method=${method} path=${path} attempt=${t.attempt}`
+		+ ` body_ms=${ms(t.bodyMs)} cred_ms=${ms(t.credMs)} dispatch_ms=${ms(t.dispatchMs)} first_attempt_ms=${ms(t.firstAttemptMs)}`
+		+ ` socket_ms=${ms(t.socketMs)} reused=${t.reused === undefined ? '-' : t.reused}`
+		+ ` connect_ms=${ms(t.connectMs)} tls_ms=${ms(t.tlsMs)} inflight=${t.inflight ?? '-'}`
+		+ ` sent_ms=${ms(t.sentMs)} ttfb_ms=${ms(t.ttfbMs)} last_byte_ms=${ms(t.lastByteMs)} bytes=${t.bytes ?? '-'}`
+		+ ` total_ms=${ms(t.totalMs)} status=${t.status || '-'} outcome=${t.outcome}`;
+}
+
 export interface ProxyDeps {
 	readCredCandidates: () => StoredClaudeOAuth[];
 	writeCred: (service: string, oauth: ClaudeOAuth) => boolean;
@@ -465,6 +512,9 @@ export interface ProxyDeps {
 	// supervised/unsupervised default without process-env/import-order
 	// tricks; production always gets the env-derived value below.
 	giveUpAfter: number;
+	logDiag: (line: string) => void;
+	loopLagIntervalMs: number;
+	loopLagThresholdMs: number;
 }
 
 export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
@@ -483,6 +533,9 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		idleTimeoutMs: UPSTREAM_IDLE_TIMEOUT_MS,
 		exitProcess: (code) => process.exit(code),
 		giveUpAfter: REFRESH_GIVE_UP_AFTER,
+		logDiag: (line) => console.log(`${ts()} ${line}`),
+		loopLagIntervalMs: 500,
+		loopLagThresholdMs: 200,
 		...overrides,
 	};
 	const upstreamPort = deps.upstreamUrl.port ? Number(deps.upstreamUrl.port) : 443;
@@ -499,6 +552,10 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 	// Last token an upstream 401 proved dead — never injected again until a
 	// refresh or /login replaces it (cleared on refresh success).
 	let rejectedToken: string | null = null;
+
+	// Monotonic per-request id, so a client-close line can be matched to its retry.
+	let lastRequestId = 0;
+	let openRequests = 0;
 
 	function runSingleFlightRefresh(service: string, cred: ClaudeOAuth): Promise<void> {
 		if (!refreshInFlight) {
@@ -577,10 +634,42 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		return null;
 	}
 
-	return createServer((req, res) => {
+	const server = createServer((req, res) => {
+		const id = ++lastRequestId;
+		const t0 = performance.now();
+		openRequests += 1;
+		const timing = {
+			attempt: 0, bodyAt: NaN, credAt: NaN, dispatchAt: NaN, firstAttemptMs: undefined as number | undefined,
+			socketAt: NaN, reused: undefined as boolean | undefined,
+			connectAt: NaN, tlsAt: NaN, inflight: undefined as number | undefined, sentAt: NaN, ttfbAt: NaN,
+			lastByteAt: NaN, bytes: undefined as number | undefined, status: 0, proxyReject: false, logged: false,
+		};
+		const credMs = () => (Number.isNaN(timing.credAt) || Number.isNaN(timing.bodyAt) ? undefined : timing.credAt - timing.bodyAt);
+		const since = (t: number) => (Number.isNaN(t) ? undefined : t - t0);
+		const logTiming = (outcome: TimingOutcome, status: number): void => {
+			if (timing.logged) return;
+			timing.logged = true;
+			openRequests -= 1;
+			try {
+				deps.logDiag(formatTimingLine({
+					id, method: req.method ?? '-', path: req.url ?? '', attempt: timing.attempt,
+					bodyMs: since(timing.bodyAt), credMs: credMs(), dispatchMs: since(timing.dispatchAt),
+					firstAttemptMs: timing.firstAttemptMs, socketMs: since(timing.socketAt), reused: timing.reused,
+					connectMs: since(timing.connectAt), tlsMs: since(timing.tlsAt), inflight: timing.inflight,
+					sentMs: since(timing.sentAt), ttfbMs: since(timing.ttfbAt), lastByteMs: since(timing.lastByteAt),
+					bytes: timing.bytes, totalMs: performance.now() - t0, status, outcome,
+				}));
+			} catch { /* logging must never affect the request */ }
+		};
+		res.on('finish', () => logTiming(timing.proxyReject ? 'proxy_reject' : 'ok', res.statusCode));
+		res.on('close', () => {
+			if (res.writableEnded) return;
+			logTiming(res.headersSent ? 'client_closed_during_response' : 'client_closed_before_response', timing.status);
+		});
 		const chunks: Buffer[] = [];
 		req.on('data', (c) => chunks.push(c));
 		req.on('end', async () => {
+			timing.bodyAt = performance.now();
 			const body = Buffer.concat(chunks);
 
 			const headers: Record<string, string | number | string[] | undefined> = {
@@ -600,11 +689,13 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 			// is at/near expiry (self-refresh covers headless nodes).
 			const accountBefore = deps.readAccount();
 			const stored = await resolveCredential();
+			timing.credAt = performance.now();
 			// The token this proxy injected, if any — non-null means WE authored the
 			// request's auth and own the 401-recovery duty for it.
 			let injectedToken: string | null = null;
 			if (!stored) {
 				if (!hasClientAuth) {
+					timing.proxyReject = true;
 					res.writeHead(502);
 					res.end('No OAuth token in keychain');
 					return;
@@ -626,6 +717,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 				} else {
 					console.error(`${ts()} [Proxy] stored token ${verdict}, refresh unavailable, no client credential — failing fast (401)`);
 					deps.recordCredentialState('exhausted', `stored token ${verdict}, refresh unavailable`);
+					timing.proxyReject = true;
 					res.writeHead(401, { 'content-type': 'application/json' });
 					res.end(authUnavailableBody(verdict));
 					return;
@@ -636,6 +728,19 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 				? boundAccount(stored.service, deps.scopedService(), accountBefore, deps.readAccount()) : null;
 			const forward = (attempt: number): void => {
 				let timedOut = false;
+				if (attempt > 0 && !Number.isNaN(timing.dispatchAt)) timing.firstAttemptMs = performance.now() - timing.dispatchAt;
+				timing.attempt = attempt;
+				timing.dispatchAt = performance.now();
+				timing.socketAt = NaN;
+				timing.reused = undefined;
+				timing.connectAt = NaN;
+				timing.tlsAt = NaN;
+				timing.inflight = openRequests - 1;
+				timing.sentAt = NaN;
+				timing.ttfbAt = NaN;
+				timing.lastByteAt = NaN;
+				timing.bytes = undefined;
+				timing.status = 0;
 
 				const upstream = deps.request(
 					{
@@ -647,6 +752,24 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 						timeout: deps.idleTimeoutMs,
 					} as RequestOptions,
 					(upRes) => {
+						timing.ttfbAt = performance.now();
+						timing.status = upRes.statusCode ?? 0;
+						timing.bytes = 0;
+						upRes.on('data', (c: Buffer) => { if (timing.attempt === attempt) timing.bytes = (timing.bytes ?? 0) + c.length; });
+						upRes.on('end', () => { if (timing.attempt === attempt) timing.lastByteAt = performance.now(); });
+						// An upstream that stops partway must end the client's response too, not leave it waiting.
+						upRes.on('error', () => { /* surfaced by 'close' below */ });
+						upRes.on('close', () => {
+							if (upRes.complete || res.writableEnded) return;
+							console.error(`${ts()} [Proxy] id=${id} Upstream aborted mid-response`);
+							logTiming('upstream_aborted', timing.status);
+							if (!res.headersSent) {
+								res.writeHead(502);
+								res.end('Bad Gateway');
+							} else {
+								res.destroy();
+							}
+						});
 						// Extract rate limit headers
 						const quotaHeaders: Record<string, string> = {};
 						for (const [key, val] of Object.entries(upRes.headers)) {
@@ -704,7 +827,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 							upRes.on('end', () => {
 								const snippet = redactForLog(Buffer.concat(rejChunks).toString('utf8').slice(0, REJECTION_SNIPPET_BYTES));
 								const model = requestModel(body);
-								console.error(`${ts()} [Proxy] rejected HTTP ${code} on ${req.url} model=${model || '?'} peer=${req.socket.remotePort ?? '?'}: ${snippet}`);
+								console.error(`${ts()} [Proxy] id=${id} rejected HTTP ${code} on ${req.url} model=${model || '?'} peer=${req.socket.remotePort ?? '?'}: ${snippet}`);
 								try {
 									deps.recordRejection({
 										ts: new Date(deps.now()).toISOString(), status: code, path: req.url ?? '', snippet,
@@ -720,17 +843,28 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 					},
 				);
 
+				upstream.on('finish', () => { if (timing.attempt === attempt) timing.sentAt = performance.now(); });
+
+				upstream.on('socket', (sock) => {
+					timing.socketAt = performance.now();
+					timing.reused = upstream.reusedSocket;
+					if (upstream.reusedSocket) return;
+					sock.once('connect', () => { if (timing.attempt === attempt) timing.connectAt = performance.now(); });
+					sock.once('secureConnect', () => { if (timing.attempt === attempt) timing.tlsAt = performance.now(); });
+				});
+
 				// 'timeout' fires on socket inactivity but does NOT auto-abort — destroy the
 				// request so it surfaces through the 'error' handler below as a clean failure
 				// (and Claude Code's own retry kicks in) instead of hanging indefinitely.
 				upstream.on('timeout', () => {
 					timedOut = true;
-					console.error(`${ts()} [Proxy] Upstream idle >${deps.idleTimeoutMs}ms — aborting`);
+					console.error(`${ts()} [Proxy] id=${id} Upstream idle >${deps.idleTimeoutMs}ms — aborting`);
 					upstream.destroy(new Error('upstream idle timeout'));
 				});
 
 				upstream.on('error', (err) => {
-					console.error(`${ts()} [Proxy] Upstream error:`, err.message);
+					console.error(`${ts()} [Proxy] id=${id} Upstream error:`, err.message);
+					logTiming(timedOut ? 'idle_abort' : 'upstream_error', res.headersSent ? timing.status : (timedOut ? 504 : 502));
 					if (!res.headersSent) {
 						res.writeHead(timedOut ? 504 : 502);
 						res.end(timedOut ? 'Gateway Timeout' : 'Bad Gateway');
@@ -754,6 +888,20 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 			forward(0);
 		});
 	});
+
+	// Event-loop lag: a late tick means every request in flight stalled with it.
+	let lastTick = performance.now();
+	const lagTimer = setInterval(() => {
+		const now = performance.now();
+		const lag = now - lastTick - deps.loopLagIntervalMs;
+		lastTick = now;
+		if (lag > deps.loopLagThresholdMs) {
+			try { deps.logDiag(`[Proxy] loop_lag_ms=${Math.round(lag)}`); } catch { /* best effort */ }
+		}
+	}, deps.loopLagIntervalMs);
+	lagTimer.unref();
+	server.on('close', () => clearInterval(lagTimer));
+	return server;
 }
 
 // Back-compat sync reader (startup probe only — does not refresh).
