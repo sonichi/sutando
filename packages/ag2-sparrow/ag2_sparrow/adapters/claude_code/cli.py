@@ -198,7 +198,7 @@ def resolve_tmux(args, shape: Shape = LOCAL) -> "tuple[str, str]":
 
 
 # What a repair `install <selector>` takes from the job's recorded config: (key, option, value).
-RECORDED = (("CLAUDE", "claude", str), ("PLUGIN_DIR", "plugin_dir", lambda v: v if v and resolve_plugin_dir(v)[1] is False else ""),
+RECORDED = (("CLAUDE", "claude", str), ("PLUGIN_DIR", "plugin_dir", lambda v: v if v and resolve_plugin_dir(v) == (Path(v), False) else ""),
             ("CLAUDE_CONFIG_DIR", "claude_config_dir", str),
             ("HMAC_KEY_FILE", "hmac_key_file", str), ("PERMISSION_MODE", "permission_mode", str), ("TMUX", "tmux", str),
             ("HMAC_STRICT", "no_hmac_strict", lambda v: v == hmac_policy.OPT_OUT),
