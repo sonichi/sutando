@@ -5,14 +5,14 @@ ag2space-inbox plugin from the 0.8.3 environment: install carried the recorded P
 environment was still on disk.
 
 Run:
-    python3 packages/ag2-sparrow/tests/test_claude_code_plugin_upgrade.py
+    python3 tests/claude-code-plugin-upgrade.test.py
 """
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "packages" / "ag2-sparrow"))
 from ag2_sparrow.adapters.claude_code import cli, hold, shape  # noqa: E402
 
 
