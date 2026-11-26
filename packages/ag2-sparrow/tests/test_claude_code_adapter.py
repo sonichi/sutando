@@ -2693,8 +2693,11 @@ class LocalCommands(ConnectBase):
         self.assertEqual(printed()["model"], None, "an unreadable record is not a model")
         rc, out, _ = self.main("model", "gpt-5")
         self.assertEqual((rc, json.loads(out)["switched"], "nothing sent" in json.loads(out)["detail"]), (1, False, True))
+        # No session runs: the pick is kept for its next start, and the page reads it as pending.
         rc, out, _ = self.main("model", "opus")
-        self.assertEqual((rc, json.loads(out)["detail"]), (1, "no running session to switch; nothing sent"))
+        self.assertEqual((rc, json.loads(out)["pending"], json.loads(out)["switched"]), (0, "opus", False))
+        self.assertIn("no session is running", json.loads(out)["detail"])
+        self.assertEqual(printed()["pending"], "opus")
 
     def test_stop_refuses_without_confirm_and_without_an_open_card(self):
         self.configure()

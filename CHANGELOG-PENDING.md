@@ -53,6 +53,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 
 ## Fixed
 - ag2-sparrow (codex-local): a local Codex agent whose login Codex itself refused (unauthorized even after a restart) says on its account card that its sign-in here no longer works, and the app offers to sign in again; asked later, the card said "I'm not signed in" or named the account still read from the refused login. The refusal is kept against that login file only, so any new sign-in clears it, and a login file alone is never called lapsed. ([#6832])
+- ag2-sparrow (claude-local): a model picked on the agent's settings page while its session cannot take `/model` (a dialog or the usage-limit menu on screen, a start or a restart under way) is kept, and the session's next start runs on it; the page shows it as pending. It was refused with "the session does not show its whole input box".
 - ag2-sparrow: a usage-limit account card (local Claude Code, Codex, Antigravity) carries `limit` in its account controls, so the app's needs-you bar lists it as an agent out of usage, apart from an account menu the owner asked for.
 - HITL cards: the engine now sends what came of an answer (`outcome`: running, done, failed with the driver's note, or a neutral closed for an answer a terminal driver sent and nobody saw take; a card no driver handles closes with its status alone, as before), so the web and iOS terminal cards show their result line; a terminal Yes/No dialog's buttons carry the terminal's own row text, so clients can number them. ([#6800])
 
