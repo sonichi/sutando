@@ -43,8 +43,9 @@ app's own box.
   five other saved accounts get a "Use <account>" button. The key on a button is 16 hex of a hash of
   Codex's account id and the person's email (the desktop's `codex_identity`: one ChatGPT workspace id is
   shared by everyone in it); it names no account and carries no credential.
-  A file an earlier engine filed under the workspace id alone is read too, listed once under the
-  account's current key, and a card made before then still switches by its key.
+  A file an earlier engine filed under the workspace id alone is read too and listed once under the
+  account's current key. A button made before then never switches (that file was shared by everyone in
+  the workspace, so it may hold another person now): it asks for a fresh card.
 - **Add another account.** Answers with where to sign in: Settings → Connections → the Sutando (on this
   computer) row → "Switch account". The app's sign-in terminal shows the link and takes the code in its
   own box. Then the owner asks for the card again.

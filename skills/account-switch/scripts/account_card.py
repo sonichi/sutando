@@ -95,6 +95,8 @@ SIGNED_OUT = "Codex isn't signed in anymore."
 CONTROLS = "account_controls"  # the desktop draws the core's account controls in a card carrying it
 RETRY_WORDS = "retry now"  # core_limit_hold's bare owner reply
 GONE = "That account is no longer on my list. Ask me for the account card again."
+# A button keyed by the workspace id alone: that file may since hold another person of the workspace.
+OLD_CARD = "That card is from before an update, so nothing changed. Ask me for the account card again."
 BUSY = "An account switch is already under way. I'll confirm here when it has finished."
 # admit()'s answer when the attempt on record had lost its worker: that record is replaced.
 RECOVERED = "recovered"
@@ -336,14 +338,19 @@ def held_elsewhere(core_home: Path, key: str, homes=None) -> bool:
 
 
 def _saved_auth(store: Path, key: str) -> Optional[str]:
-    """The saved sign-in of the account `key` names: its current key, or the earlier workspace-only
-    key a card made before then carries. The file under the current key is preferred."""
-    found = sorted(_entries(store), key=lambda e: e[0] != key)
-    for file_key, auth, _ in found:
-        canonical = _canonical(file_key, auth)
-        if canonical and (canonical == key or file_key == key):
+    """The saved sign-in of the account whose current key is `key`, from its own file or from one an
+    earlier engine filed under the workspace id alone; the file under the current key is preferred.
+    An earlier key is never resolved: that file was shared by everyone in the workspace."""
+    for file_key, auth, _ in sorted(_entries(store), key=lambda e: e[0] != key):
+        if _canonical(file_key, auth) == key:
             return auth
     return None
+
+
+def _old_card_key(store: Path, key: str) -> bool:
+    """Whether `key` is the workspace-only key of a file an earlier engine filed (a card made then)."""
+    return any(file_key == key and _legacy_key(auth) == key and identity(auth) and identity(auth)[0] != key
+               for file_key, auth, _ in _entries(store))
 
 
 def claude_status(run=subprocess.run) -> dict:
@@ -667,10 +674,10 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     if runtime() != "codex":
         return _emit({"status": "refused", "say": NOT_CODEX}, 2)
     store = store_dir()
-    picked = _saved_auth(store, verb) if store is not None and KEY_RE.fullmatch(verb) else None
-    if picked is None or verb not in offered_keys(ws, event):
+    if not KEY_RE.fullmatch(verb) or verb not in offered_keys(ws, event) or store is None:
         return _emit({"status": "refused", "say": GONE}, 2)
-    verb = identity(picked)[0]  # a card made before the key change carries the earlier key
+    if _saved_auth(store, verb) is None:
+        return _emit({"status": "refused", "say": OLD_CARD if _old_card_key(store, verb) else GONE}, 2)
     cur = current("codex", run=run, codex_read=codex_read)
     label = shown_names(saved(store)).get(verb) or "that account"
     if cur["key"] == verb:
@@ -792,7 +799,6 @@ def do_switch(ws: Path, key: str, *, restart=restart_core, ready=core_ready, liv
     want = _saved_auth(store, key) if store else None
     if want is None:
         return "error", "Couldn't switch: that account is no longer saved here. Nothing changed."
-    key = identity(want)[0]  # an earlier (workspace-only) key names the same account
     label = masked_label(identity(want)[1])
     if held(home, key):
         return "error", (f"Couldn't switch to {label}: another Codex on this computer is signed in with that "
