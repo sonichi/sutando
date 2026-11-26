@@ -120,8 +120,9 @@ class AccountSwitch:
     def __init__(self, state_dir, bridge_state, name, publish, quoted, log, read, begin, cancel, opener, runtime="",
                  lapsed=None):
         self.state_dir, self.bridge_state, self.name, self.runtime = state_dir, bridge_state, name, runtime
-        # `lapsed()`: a login is kept here, yet the runtime reads no account from it (its sign-in no longer works).
-        self.lapsed, self._lapsed = lapsed, False
+        # `lapsed()`: the runtime itself refused this login (unauthorized even after a restart), not merely read
+        # no account; asked again on every card, so an earlier answer is never carried into a later one.
+        self.lapsed = lapsed
         self.publish, self.quoted, self.log = publish, quoted, log
         self.read, self.begin, self.cancel, self.opener = read, begin, cancel, opener
 
@@ -162,15 +163,23 @@ class AccountSwitch:
 
     def using(self) -> str:
         """The account in use, in words; a runtime that cannot say reads as unknown, never as signed out."""
+        return self.status()[0]
+
+    def status(self) -> tuple:
+        """(the account in use in words, whether the runtime refused its login): read afresh for each card."""
         try:
             label = self.read()
         except Exception as e:  # noqa: BLE001 - the card still says what it can
             self.log("account not read:", "%s: %s" % (type(e).__name__, str(e)[:200]))
-            return "I could not read which account I'm signed in with."
-        self._lapsed = not label and self.lapsed is not None and bool(self.lapsed())
-        if self._lapsed:
-            return LAPSED
-        return "I'm using %s." % label if label else "I'm not signed in."
+            return "I could not read which account I'm signed in with.", False
+        try:
+            refused = self.lapsed is not None and self.lapsed() is True
+        except Exception as e:  # noqa: BLE001 - no lapse signal: the neutral words
+            self.log("lapse not read:", "%s: %s" % (type(e).__name__, str(e)[:200]))
+            refused = False
+        if refused:
+            return LAPSED, True
+        return ("I'm using %s." % label if label else "I'm not signed in."), False
 
     def card(self, state: str, text: str, url: str = "", ask: bool = False, signed_out: bool = False):
         agent_card, _ = connector_cards._core()
@@ -183,7 +192,7 @@ class AccountSwitch:
         built = agent_card.build(CARD if ask else NOTE, state, title="Account", body="Account of %s" % self.name,
                                  text="%s %s" % (text, BELOW) if ask else text,
                                  **({"buttons": buttons} if buttons else {}))
-        return with_controls(built, self.runtime, signed_out=signed_out or self._lapsed) if ask else built
+        return with_controls(built, self.runtime, signed_out=signed_out) if ask else built
 
     def say(self, room, built, result_file=None, edit: str = "") -> None:
         """Post the card (in place of the card `edit` names, when given); where it cannot be posted, a
@@ -193,7 +202,8 @@ class AccountSwitch:
             self.publish(result_file, ANSWERED if posted else self.quoted(built[1]["text"]) + "\n")
 
     def offer(self, sent, result_file) -> str:
-        self.say(sent.get("channel_id"), self.card("pending", self.using(), ask=True), result_file)
+        text, refused = self.status()
+        self.say(sent.get("channel_id"), self.card("pending", text, ask=True, signed_out=refused), result_file)
         return "account-card"
 
     def asked_for(self, words, sent, result_file) -> str:
@@ -202,7 +212,8 @@ class AccountSwitch:
     def expired(self, sent, result_file) -> str:
         """A tap on an account card that no longer acts: a fresh card in its place when one can be shown,
         else the words. No sign-in is started by it."""
-        fresh = self.post(sent.get("channel_id"), self.card("pending", self.using(), ask=True),
+        text, refused = self.status()
+        fresh = self.post(sent.get("channel_id"), self.card("pending", text, ask=True, signed_out=refused),
                           edit=card_desk.tapped_event(sent))
         self.publish(result_file, ANSWERED if fresh else self.quoted(EXPIRED_NO_CARD) + "\n")
         return "account-card-expired"

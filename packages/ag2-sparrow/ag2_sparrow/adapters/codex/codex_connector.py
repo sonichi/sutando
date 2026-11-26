@@ -184,6 +184,7 @@ LIMITED_NO_SEND = "[no-send] Codex is at its usage limit; the owner was sent the
 SIGNED_OUT = account_switch.LAPSED
 SIGNED_OUT_ELSEWHERE = ("Codex's sign-in on this computer no longer works. My owner can sign in again by sending "
                         "/account in our direct message.")
+LOGIN_REFUSED = "login-refused.json"     # under the state dir: a stat of the refused login file, no secret
 SHARED_LOGIN = "The core shares this login, so it uses the new account after its next restart."
 
 
@@ -493,7 +494,7 @@ class Connector:
                 self.args.state, getattr(self.args, "bridge_state", None), "Codex", self.card_answer, quoted, log,
                 read=self.account_label, begin=self.begin_login,
                 cancel=lambda login: self.rpc.request("account/login/cancel", {"loginId": login}),
-                opener=lambda url: open_page(url), runtime="codex", lapsed=self.login_on_disk)
+                opener=lambda url: open_page(url), runtime="codex", lapsed=self.login_refused)
         return self._accounts
 
     @property
@@ -535,10 +536,37 @@ class Connector:
         """A card matter's answer, led by a model outcome this turn could only say in words."""
         return card_desk.led(write_atomic, self.models.unsaid, quoted)(result_file, body)
 
-    @staticmethod
-    def login_on_disk() -> bool:
-        """Whether this agent's Codex home keeps a login file (its presence only; it is never read here)."""
-        return os.path.isfile(os.path.join(signin_watch.codex_home(), signin_watch.CODEX_AUTH))
+    def _login_stamp(self):
+        """The stat of the login file (through a link), never its contents; None when there is none."""
+        try:
+            st = os.stat(os.path.join(signin_watch.codex_home(), signin_watch.CODEX_AUTH))
+        except OSError:
+            return None
+        return [st.st_ino, st.st_size, st.st_mtime_ns]
+
+    def note_login_refused(self, refused: bool) -> None:
+        """Keep (or drop) Codex's own refusal of the login on disk, tied to that very file: any rewrite of it
+        (a new sign-in, a refresh by a copy sharing it) is a login nobody has refused yet."""
+        path = os.path.join(self.args.state, LOGIN_REFUSED)
+        stamp = self._login_stamp() if refused else None
+        try:
+            if stamp is None:
+                os.unlink(path)
+            else:
+                write_atomic(path, json.dumps({"login": stamp}) + "\n")
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log("login refusal not kept:", type(e).__name__)
+
+    def login_refused(self) -> bool:
+        """Whether Codex refused the login now on disk as unauthorized, even after a restart (a turn said so)."""
+        try:
+            with open(os.path.join(self.args.state, LOGIN_REFUSED), encoding="utf-8") as f:
+                kept = json.load(f).get("login")
+        except (OSError, ValueError, AttributeError):
+            return False
+        return kept is not None and kept == self._login_stamp()
 
     def account_label(self) -> str:
         """The account the server is signed in with, as the card names it; '' when it is signed out."""
@@ -1325,6 +1353,8 @@ class Connector:
             # gets no error line while it is out (or the limit's own words when no card could be sent).
             limit = self.turn_limit if status != "completed" else None
             signed_out = status != "completed" and self.turn_unauth is not None
+            if signed_out or status == "completed":
+                self.note_login_refused(signed_out)
             quota = self.quota_hit(limit) if limit is not None else (self.quota.cleared() if status == "completed" else "")
             if self.view:
                 self.view.done(status)

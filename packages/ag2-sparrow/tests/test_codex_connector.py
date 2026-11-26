@@ -1312,6 +1312,7 @@ class AccountCardTest(CardWorld, unittest.TestCase):
 
     def test_still_unauthorized_after_the_restart_shows_the_owner_the_account_card(self):
         (self.home / "stub-token").write_text("tok-a")
+        (self.home / "auth.json").write_text("{}")         # the login file Codex refuses (the stub reads its token)
         (self.home / "stub-revoked").write_text("tok-a\n")     # revoked, and no new sign-in on disk
         self.assertEqual(self.serve("task-1", "hello"), account_switch.ANSWERED)
         ((room, card),) = self.posted()
@@ -1325,6 +1326,23 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(said, cc.quoted(cc.SIGNED_OUT_ELSEWHERE).rstrip("\n") + "\n")
         self.assertNotIn("status failed", said)
         self.assertEqual(self.posted("$card2"), [])
+        # 2026-11-25: asked for later, the card said "I'm not signed in" or named the account the server still reads
+        # from the revoked login. Codex's own refusal decides the lapse words, the account read does not.
+        self.serve("task-3", "/account")
+        ((_, card),) = self.posted("$card2")
+        self.assertEqual(card["text"], account_switch.LAPSED + " " + account_switch.BELOW)
+        self.assertTrue(card[account_switch.CONTROLS]["signed_out"], "the app draws the sign-in in the card")
+        # A card whose account cannot be read says only that: no lapse carried over from the card before it.
+        args = cc.build_parser().parse_args(["--work", str(self.work)])
+        args.state, args.bridge_state = str(self.work / "state"), str(self.bridge)
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home)}):
+            accounts = cc.Connector(FakeRpc, args, note="n").accounts
+            self.assertTrue(accounts.status()[1], "the refusal of this very login file is kept")
+            with mock.patch.object(accounts, "read", side_effect=RuntimeError("account/read: timed out")):
+                self.assertEqual(accounts.status(), ("I could not read which account I'm signed in with.", False))
+            # Any rewrite of the login (a new sign-in, a refresh by a copy sharing it) is a login nobody refused yet.
+            (self.home / "auth.json").write_text('{"x": 1}')
+            self.assertFalse(accounts.status()[1])
 
     def test_a_turn_that_had_started_work_is_never_run_again_after_an_unauthorized_end(self):
         (self.home / "stub-token").write_text("tok-a")
@@ -1383,14 +1401,13 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         ((_, card),) = self.posted()
         self.assertEqual(card["text"], "I'm not signed in. " + account_switch.BELOW)
         self.assertNotIn("signed_out", card[account_switch.CONTROLS])
-        # 2026-11-25: a login file kept here that the server reads no account from is a sign-in that lapsed (another
-        # copy of the same account refreshed it away); the card said "I'm not signed in", the same as never.
+        # A login file the server reads no account from is not by itself a lapse: the words stay neutral.
         self.home.mkdir(parents=True, exist_ok=True)
         (self.home / "auth.json").write_text("{}")
         self.serve("task-4", "/account")
         ((_, card),) = self.posted()
-        self.assertEqual(card["text"], account_switch.LAPSED + " " + account_switch.BELOW)
-        self.assertTrue(card[account_switch.CONTROLS]["signed_out"], "the app draws the sign-in in the card")
+        self.assertEqual(card["text"], "I'm not signed in. " + account_switch.BELOW)
+        self.assertNotIn("signed_out", card[account_switch.CONTROLS])
 
     def test_asking_which_account_is_answered_by_the_card_without_a_turn(self):
         """Codex cannot see its own sign-in: asked which account it is on, the model said it could not tell."""
