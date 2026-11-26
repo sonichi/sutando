@@ -2593,6 +2593,27 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(notice._tell_task("task-9", "access_tier: team\nuser_id: @b:s.space\ntask: hi\n", ""), "")
         self.assertEqual(len(self.outbox()), 1)
 
+    def test_a_card_that_could_not_be_queued_for_a_later_message_is_owed_and_queued_once_on_a_later_tick(self):
+        self.serve("task-1", "[[limit]] hello")
+        (first,) = self.outbox()
+        self.assertEqual(len(self.posted()), 1)
+        clock = [time.time()]
+        notice = quota_notice.QuotaNotice(self.work / "state", self.bridge, "Codex",
+                                          lambda text: (first["body"], first["card"]), lambda: "", lambda *a: None,
+                                          now=lambda: clock[0])
+        mine = "id: task-2\nchannel_id: !room:s.space\nuser_id: @alice:s.space\naccess_tier: owner\ntask: again\n"
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("disk full")):
+            self.assertEqual(notice.hit(task="task-2", task_text=mine), "quota-card-posted quota-not-posted")
+            self.assertEqual((notice.owed(), notice.answered("task-2")), (["task-2"], False))
+            self.assertEqual(notice.hit(task="task-2", task_text=mine), "", "owed already: not a second entry")
+        self.assertEqual(notice.tick(), "", "too soon to try again")
+        clock[0] += quota_notice.RETRY_S + 1
+        self.assertEqual(notice.tick(), "quota-task-card")
+        self.assertEqual((notice.owed(), notice.answered("task-2")), ([], True))
+        clock[0] += quota_notice.RETRY_S + 1
+        self.assertEqual(notice.tick(), "")
+        self.assertEqual([room for room, _ in self.posted()], [self.DM], "one card, in the DM, none in the room")
+
     def test_a_limit_hit_in_a_room_is_told_only_in_the_owners_dm_and_nothing_is_posted_in_the_room(self):
         # Owner, 2026-11-25: usage limits and account switching belong to her DM; a room gets nothing about them.
         self.assertIn("STUB echo", self.serve("task-0", "hello"))
