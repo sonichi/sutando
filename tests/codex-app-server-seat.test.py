@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import fcntl
 import io
 import json
 import os
@@ -450,6 +451,121 @@ class HandshakeAndThread(SeatCase):
         self.assertEqual(self.make(decl).serve(once=True), seat_mod.EXIT_LOCKED)
         self.assertEqual(self.sent(), [], "the second seat started no app-server")
 
+    def taking(self, decl) -> bool:
+        """Whether a seat holds `taking.lock`, read as the bridge reads it."""
+        try:
+            fd = os.open(decl.parent / "taking.lock", os.O_RDONLY)
+        except OSError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)
+        return False
+
+    def start(self, decl):
+        s = self.make(decl)
+        self.assertTrue(s.lock())
+        self.addCleanup(os.close, s.lock_fd)
+        if s.claim_fd is not None:
+            self.addCleanup(os.close, s.claim_fd)
+        return s
+
+    def test_a_restarted_seat_drops_the_copies_the_seat_before_it_left(self):
+        """A copy under a held `taking.lock` reads as "a running seat took this task". The launcher
+        reuses the state dir, so a replacement seat clears what the interrupted seat left before it
+        takes that lock, and before it serves anything."""
+        decl = self.declaration()
+        left = decl.parent / "payloads" / "task-1.txt"
+        left.parent.mkdir(parents=True)
+        left.write_text("task: taken by the seat that was interrupted\n", encoding="utf-8")
+        seen = []
+        real = seat_mod.Path.unlink
+
+        def unlink(path, *a, **k):
+            seen.append(self.taking(decl))      # the seat lock is held here; is the copy vouched for?
+            return real(path, *a, **k)
+
+        with mock.patch.object(seat_mod.Path, "unlink", unlink):
+            self.start(decl)
+        self.assertEqual(seen, [False], "not while the inherited copy is still there")
+        self.assertFalse(left.exists())
+        self.assertTrue(self.taking(decl), "only once the folder is clear")
+        self.assertEqual(self.sent(), [], "and before any app-server was started")
+
+    def test_a_seat_refused_the_lock_leaves_the_running_seats_copies_alone(self):
+        decl = self.declaration()
+        self.start(decl)
+        copy = decl.parent / "payloads" / "task-1.txt"
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        copy.write_text("task: the running seat's turn\n", encoding="utf-8")
+        self.assertEqual(self.make(decl).serve(once=True), seat_mod.EXIT_LOCKED)
+        self.assertTrue(copy.exists())
+        self.assertTrue(self.taking(decl))
+
+    def test_a_seat_that_cannot_clear_the_folder_serves_without_vouching_for_any_copy(self):
+        decl = self.declaration()
+        left = decl.parent / "payloads" / "task-1.txt"
+        left.parent.mkdir(parents=True)
+        left.write_text("task\n", encoding="utf-8")
+        with mock.patch.object(seat_mod.Path, "unlink", side_effect=OSError("denied")):
+            s = self.start(decl)
+        self.assertIsNone(s.claim_fd)
+        self.assertFalse(self.taking(decl), "the inherited copy is still there: nothing is vouched for")
+        self.assertIn("could not be removed: task-1.txt", self.out.getvalue())
+        with mock.patch.object(seat_mod.Path, "iterdir", side_effect=PermissionError("denied")):
+            self.assertIsNone(self.make(decl).claim_copies())
+        self.assertIn("could not be listed", self.out.getvalue())
+
+    def test_a_seat_that_cannot_take_the_second_lock_serves_without_it(self):
+        decl = self.declaration()
+        decl.parent.mkdir(parents=True, exist_ok=True)
+        other = os.open(decl.parent / "taking.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, other)
+        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with mock.patch.object(seat_mod.Seat, "CLAIM_WAIT_S", 0.001), \
+                mock.patch.object(seat_mod.time, "sleep") as slept:
+            s = self.start(decl)
+        self.assertIsNone(s.claim_fd)
+        self.assertEqual(slept.call_count, seat_mod.Seat.CLAIM_TRIES - 1, "asked a bounded number of times")
+        self.assertIn("taking.lock could not be taken", self.out.getvalue())
+        with mock.patch.object(seat_mod.fcntl, "flock", side_effect=OSError("no locks here")), \
+                mock.patch.object(seat_mod.time, "sleep") as slept:
+            self.assertIsNone(self.make(decl).claim_copies())
+        slept.assert_not_called()       # not contention: nothing to wait for
+
+    def test_the_bridges_probe_holding_the_lock_as_the_seat_starts_does_not_cost_the_claim(self):
+        """The bridge reads `taking.lock` by taking it shared for an instant. A seat that asks for it
+        in that instant is refused once; it asks again, so it still ends up vouching for its copies."""
+        decl = self.declaration()
+        decl.parent.mkdir(parents=True, exist_ok=True)
+        (decl.parent / "taking.lock").touch()
+        probe = os.open(decl.parent / "taking.lock", os.O_RDONLY)     # as _seat_lock_held opens it
+        fcntl.flock(probe, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        refused = []
+        real = seat_mod.time.sleep
+
+        def sleep(seconds):
+            refused.append(seconds)
+            if len(refused) == 2:               # the probe ends while the seat is waiting
+                fcntl.flock(probe, fcntl.LOCK_UN)
+                os.close(probe)
+            real(0)
+
+        with mock.patch.object(seat_mod.time, "sleep", sleep):
+            s = self.start(decl)
+        self.assertEqual(len(refused), 2, "refused while the probe held it, then taken")
+        self.assertIsNotNone(s.claim_fd)
+        self.assertTrue(self.taking(decl), "the bridge now reads a running seat")
+
+    def test_a_seat_stopping_gives_up_the_claim_with_the_lock(self):
+        decl = self.declaration()
+        s = self.make(decl)
+        self.assertEqual(s.serve(once=True), 0)
+        self.assertFalse(self.taking(decl))
+
 
 class Turns(SeatCase):
     def test_one_turn_per_task_in_dispatch_order(self):
@@ -878,6 +994,45 @@ class Crash(SeatCase):
         self.assertFalse(task_dispatch.has_ready_result(self.results, "task-1.txt"))
         self.assertEqual(len(list((Path(s.host.state) / "unsettled-results").iterdir())), 1)
         self.assertEqual([name for name, _ in s.pending()], ["task-1.txt"])
+
+    def test_a_result_gone_while_the_inbox_file_was_withdrawn_is_logged_as_gone(self):
+        """VM 2026-11-22 22:42:16: the broker closed the task, the bridge withdrew its inbox file
+        and archived the result between the seat's two reads, and the seat logged "the result is
+        kept at " with no path. It now says the result was gone, and names no one as settling it."""
+        first = self.task("task-1.txt")
+        s = self.make()
+        s.ensure_server()
+        turn, aside = s.run_turn, s.set_result_aside
+
+        def withdrawn_mid_turn(filename, prompt):
+            out = turn(filename, prompt)
+            first.unlink()
+            return out
+
+        def bridge_took_it_first(filename):
+            (Path(self.results) / filename).unlink()
+            return aside(filename)
+
+        s.run_turn, s.set_result_aside = withdrawn_mid_turn, bridge_took_it_first
+        self.assertEqual(s.step(), seat_mod.WITHDRAWN)
+        self.assertIn("then gone from the results folder", self.out.getvalue())
+        self.assertNotIn("bridge", self.out.getvalue())
+        self.assertNotIn("the result is kept at", self.out.getvalue())
+
+    def test_a_result_that_cannot_be_set_aside_says_so(self):
+        first = self.task("task-1.txt")
+        s = self.make()
+        s.ensure_server()
+        turn = s.run_turn
+
+        def withdrawn_mid_turn(filename, prompt):
+            out = turn(filename, prompt)
+            first.unlink()
+            return out
+
+        s.run_turn, s.set_result_aside = withdrawn_mid_turn, lambda filename: ""
+        self.assertEqual(s.step(), seat_mod.WITHDRAWN)
+        self.assertIn("the result could not be set aside", self.out.getvalue())
 
     def test_a_file_that_changes_while_it_is_being_copied_is_not_started(self):
         self.task("task-1.txt")

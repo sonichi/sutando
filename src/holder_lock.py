@@ -277,9 +277,34 @@ def _pid_alive(pid: int) -> Optional[bool]:
     return True
 
 
+# macOS renames a machine as its network changes. A record on a disk only this kernel serves was
+# written here, so there a name that differs is this machine's earlier one, never another's.
+_HOST_NAME_DRIFTS = sys.platform == "darwin"
+
+
+def _record_is_local(directory) -> bool:
+    """Positive evidence that the record in `directory` is this machine's own: that very directory is
+    on a filesystem that names its type, and the type is not a network one. A failed or unknown
+    reading is not evidence."""
+    try:
+        fstype = _statfs_type(os.fspath(directory)) if isinstance(directory, (str, os.PathLike)) else None
+    except (OSError, ValueError):
+        return False
+    return bool(fstype) and not _is_network(fstype)
+
+
+def _host_read_here(host: Optional[str], directory) -> Optional[str]:
+    """The host to judge a record by: None (this machine) for a record under another name where the
+    name drifts and the record's own directory is known to be local; else the name it carries."""
+    if host is not None and host != _host() and _HOST_NAME_DRIFTS and _record_is_local(directory):
+        return None
+    return host
+
+
 def verify_lineage(pid: int, start: Optional[str], host: Optional[str] = None) -> Optional[bool]:
     """True: that very process runs here. False: gone, or the pid now names another process.
-    None: it cannot be observed (another host, no start to compare, or an unreadable start time)."""
+    None: it cannot be observed (another host, no start to compare, or an unreadable start time).
+    A record's host goes through _host_read_here first: a renamed Mac's own record is still read."""
     if host is not None and host != _host():
         return None
     alive = _pid_alive(pid)
@@ -460,21 +485,22 @@ def _pids_in(raw: bytes):
     return []
 
 
-def _occupant(prior: Prior):
+def _occupant(prior: Prior, directory=None):
     """(state, reason) of what a prior names: free (nobody live), held (a live process) or
     unobserved (a process that cannot be verified). A live or unverifiable consumer counts like the
     holder: the sticky rule, so a root with a surviving consumer is never free."""
     if isinstance(prior, Valid):
         rec = prior.record
         pid, start = holder_identity(rec)
-        seen = verify_lineage(pid, start, rec["host"])
+        host = _host_read_here(rec["host"], directory)
+        seen = verify_lineage(pid, start, host)
         if seen is True:
             return "held", "live holder"
         if seen is None:
             return "unobserved", "unobserved"
         consumer = consumer_of(rec)
         if consumer is not None:
-            seen = verify_lineage(consumer["pid"], consumer["start"], rec["host"])
+            seen = verify_lineage(consumer["pid"], consumer["start"], host)
             if seen is True:
                 return "held", "live consumer"
             if seen is None:
@@ -493,9 +519,9 @@ def _occupant(prior: Prior):
     return "free", None
 
 
-def _prior_refusal(prior: Prior) -> Optional[str]:
+def _prior_refusal(prior: Prior, directory=None) -> Optional[str]:
     """The Held reason a prior gives, or None when it names no live or unobserved process."""
-    return _occupant(prior)[1]
+    return _occupant(prior, directory)[1]
 
 
 def _legacy_finding(root: str, root_fd: Optional[int] = None):
@@ -732,7 +758,7 @@ def _attempt(path: str, root: str, directory: str, root_fd: int, dir_fd: int, in
             return Unreadable(str(e))
         except (UnicodeError, ValueError) as e:
             prior = Invalid("not a valid record (%s)" % e.__class__.__name__, b"")
-        reason = _prior_refusal(prior)
+        reason = _prior_refusal(prior, directory)
         if reason:
             return Held(prior, reason=reason)
         legacy, _ = _legacy_finding(root, root_fd)
@@ -1043,15 +1069,16 @@ def attach_consumer(owner: Owner, expected: bytes, *, pid: int, start: str) -> P
         return Published(_copy(rec), durable=durable)
 
 
-def _proven_dead(rec: dict) -> bool:
+def _proven_dead(rec: dict, directory=None) -> bool:
     """Both the holder and the consumer verify False, twice, TOMBSTONE_RECHECK_S apart."""
     consumer = rec["consumer"]
     for i in range(2):
         if i:
             time.sleep(TOMBSTONE_RECHECK_S)
-        if verify_lineage(rec["owner_pid"], rec["owner_start"], rec["host"]) is not False:
+        host = _host_read_here(rec["host"], directory)
+        if verify_lineage(rec["owner_pid"], rec["owner_start"], host) is not False:
             return False
-        if verify_lineage(consumer["pid"], consumer["start"], rec["host"]) is not False:
+        if verify_lineage(consumer["pid"], consumer["start"], host) is not False:
             return False
     return True
 
@@ -1083,7 +1110,7 @@ def tombstone_consumer(work_root, expected: bytes, *, by: str, reason: str) -> P
                 rec = prior.record
                 if rec["consumer"] is None:
                     raise LockError("no consumer")
-                if not _proven_dead(rec):
+                if not _proven_dead(rec, directory):
                     raise LockError("not proven dead")
                 if not (_same_at(fd, dfd, LOCK_NAME) and _dir_unchanged(directory, dfd)):
                     raise LockError("replaced")
@@ -1123,7 +1150,8 @@ def release(owner: Owner) -> Released:
                 prior = None
             consumer = consumer_of(prior.record) if isinstance(prior, Valid) else None
             if consumer is not None and holder_identity(prior.record) == (owner.pid, owner.start) \
-                    and verify_lineage(consumer["pid"], consumer["start"], prior.record["host"]) is not False:
+                    and verify_lineage(consumer["pid"], consumer["start"],
+                                       _host_read_here(prior.record["host"], owner.directory)) is not False:
                 raise LockError("consumer alive")
         removed = False
         try:
@@ -1185,7 +1213,7 @@ def occupancy(work_root) -> str:
         return "unobserved"
     except (UnicodeError, ValueError) as e:
         prior = Invalid("not a valid record (%s)" % e.__class__.__name__, b"")
-    return _occupant(prior)[0]
+    return _occupant(prior, directory)[0]
 
 
 def _waiter_live(directory: str, pid: int) -> bool:
@@ -1220,10 +1248,11 @@ def status(work_root) -> dict:
     elif isinstance(prior, Valid):
         out["record"] = {"kind": "valid", "record": prior.record}
         pid, start = holder_identity(prior.record)
-        out["holder_lineage"] = verify_lineage(pid, start, prior.record["host"])
+        host = _host_read_here(prior.record["host"], directory)
+        out["holder_lineage"] = verify_lineage(pid, start, host)
         consumer = consumer_of(prior.record)
         if consumer is not None:
-            out["consumer_lineage"] = verify_lineage(consumer["pid"], consumer["start"], prior.record["host"])
+            out["consumer_lineage"] = verify_lineage(consumer["pid"], consumer["start"], host)
     owner = _OWNER
     if owner is not None and not owner.released and owner.pid == os.getpid() and owner.directory == directory:
         out["root_unchanged"] = _root_unchanged(owner.path or owner.root, owner.root, owner.root_fd)

@@ -175,6 +175,28 @@ class HumanRequirement:
                 device["host"] = host
         return device
 
+    def wire_outcome(self) -> Optional[Dict[str, str]]:
+        """What came of the human's answer, for the card's result line (the client reads `running`,
+        `done`, `failed` and neutral `closed`): `running` once an answer was taken and is being applied;
+        `done` once the driver that sent it saw the runtime carry on (`subject.driven_settled`);
+        `failed` when a driver gave it up, with the driver's own words (`subject.driver_note`, never
+        `answer`, which holds what the human submitted); `closed` when a driver sent the answer
+        (`subject.driven_at`) and the card closed with no such evidence, which is never read as success.
+        None for a card nobody answered, and for a closed card no driver handled: its status says it."""
+        if not self.chosen_action or self.decided_by == "policy":
+            return None
+        subject = self.subject or {}
+        if self.status == STATUS_IN_PROGRESS:
+            return dict(state="running")
+        note = subject.get("driver_note")
+        if self.status == STATUS_EXPIRED and isinstance(note, str) and note.strip():
+            return dict(state="failed", text=" ".join(note.split())[:200])
+        if self.status == STATUS_RESOLVED and subject.get("driven_settled"):
+            return dict(state="done")
+        if self.terminal and subject.get("driven_at"):
+            return dict(state="closed")
+        return None
+
     def to_wire(self) -> Dict[str, Any]:
         wire: Dict[str, Any] = {
             "id": self.id,
@@ -204,6 +226,9 @@ class HumanRequirement:
             subject["superseded"] = True  # closed for a fresh card: a done receipt here is not success
         if subject:
             wire["subject"] = subject
+        outcome = self.wire_outcome()
+        if outcome:
+            wire["outcome"] = outcome
         if self.expires_at is not None:
             wire["expires_at"] = self.expires_at
         if self.turn_on_action:
