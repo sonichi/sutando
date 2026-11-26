@@ -69,8 +69,9 @@ _CATEGORY_HEADS = {
     CATEGORY_DECISION: "Sutando needs a decision",
 }
 
+# No resolved line: the card goes green on its own, and a second "Resolved" beside it
+# was one of the three statuses the owner counted for a single event (V44).
 _STATUS_LINES = {
-    STATUS_RESOLVED: "✓ Resolved — Sutando has continued its work.",
     STATUS_EXPIRED: "— Expired, no longer applicable.",
     STATUS_CANCELLED: "— Cancelled.",
 }
