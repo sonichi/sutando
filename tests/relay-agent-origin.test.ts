@@ -60,6 +60,16 @@ function assertRoom(id: string, target: string) {
 }
 
 describe('the relay agent keeps the room a request was made in', () => {
+	it('the owner-activity record carries the room the request was made in', { timeout: 5000 }, async () => {
+		setVoiceSessionOrigin(origin('!roomA:s.space'));
+		const { relay, ids } = relayAgent();
+		void relay.invoke('', { task: 'note the docked room' });
+		await untilSubmitted(ids);
+		const activity = JSON.parse(readFileSync(join(workspace, 'state', 'last-owner-activity.json'), 'utf-8'));
+		assert.equal(activity.channel, 'voice');
+		assert.equal(activity.channel_id, '!roomA:s.space');
+	});
+
 	it('a room switch while the call waits for the user to finish speaking', { timeout: 5000 }, async () => {
 		setVoiceSessionOrigin(origin('room-A'));
 		const { relay, ids } = relayAgent({ speech: holdingGate() });

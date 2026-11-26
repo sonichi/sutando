@@ -180,6 +180,41 @@ def test_voice_channel_defaults_to_discord():
     _with_state({"channel": "voice", "ts": 1779339000}, run)
 
 
+def test_sspace_voice_call_routes_to_ag2space():
+    """#6798: after an s.space voice call the record's channel is the gateway's
+    `matrixrtc-voice` source. It is the ag2space bridge's surface, so the
+    proactive message goes to the owner's s.space DM, never to Discord."""
+    from proactive_routing import claims_unless_routed_elsewhere
+
+    def run(state):
+        assert should_claim_proactive(state, "ag2space") is True
+        assert should_claim_proactive(state, "discord") is False
+        assert should_claim_proactive(state, "telegram") is False
+        assert claims_unless_routed_elsewhere(
+            "proactive-1.txt", state, "slack", other_bridges_configured=False) is False
+
+    _with_state({"channel": "matrixrtc-voice", "ts": 1795300000}, run)
+    _with_state({"channel": "matrixrtc-voice", "ts": 1795300000,
+                 "channel_id": "!room:s.space"}, run)
+
+
+def test_voice_docked_in_a_room_routes_to_that_rooms_bridge():
+    """A local voice session docked in a room records the room as `channel_id`:
+    the address names the bridge. An undocked voice keeps the Discord default."""
+
+    def run(state):
+        assert should_claim_proactive(state, "ag2space") is True
+        assert should_claim_proactive(state, "discord") is False
+
+    _with_state({"channel": "voice", "ts": 1, "channel_id": "!room:s.space"}, run)
+
+    def unknown(state):
+        assert should_claim_proactive(state, "discord") is True
+        assert should_claim_proactive(state, "ag2space") is False
+
+    _with_state({"channel": "voice", "ts": 1, "channel_id": "local-voice"}, unknown)
+
+
 def test_github_commits_channel_defaults_to_discord():
     """Same shape: the github-commit auto-poll writes `{"channel":
     "github-commits"}` on every observed commit. Must NOT strand the
@@ -348,6 +383,8 @@ def main():
     test_state_file_empty_channel_string_defaults_to_discord()
     test_state_file_non_dict_root_defaults_to_discord()
     test_voice_channel_defaults_to_discord()
+    test_sspace_voice_call_routes_to_ag2space()
+    test_voice_docked_in_a_room_routes_to_that_rooms_bridge()
     test_github_commits_channel_defaults_to_discord()
     test_unrecognized_channel_defaults_to_discord()
     test_slack_active_routes_to_slack()
