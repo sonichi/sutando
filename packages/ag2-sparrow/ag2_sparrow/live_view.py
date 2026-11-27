@@ -33,7 +33,8 @@ SHOWN_FIRST = 60            # lines of the log's end a new viewer starts with
 POLL_S = 0.25
 QUEUE_MAX = 1000            # lines a background Writer holds while its writes are slow
 DRAIN_S = 2.0
-WAITING = "Waiting for this agent's next turn. Nothing is typed here: this view is read-only."
+# Says nothing about typing: the panel that shows this view may take a message under it.
+WAITING = "Waiting for this agent's next turn."
 
 
 def path_of(work) -> str:
@@ -183,6 +184,13 @@ class Writer:
 
     def done(self, status: str) -> None:
         self.line("── turn %s ──" % _one_line(status or "ended", 60))
+
+    def carded(self, who: str, message: str, card: str) -> None:
+        """A message the connector answered itself with a card (no model turn): it is shown too, or a
+        view that only ever answered with cards stays empty."""
+        self.turn(who, message)
+        self.step("answered with", "%s (no model turn)" % (_one_line(card, 80) or "a card"))
+        self.done("completed")
 
 
 def follow(path, out=None, stop=lambda: False, sleep=time.sleep, first=SHOWN_FIRST) -> None:

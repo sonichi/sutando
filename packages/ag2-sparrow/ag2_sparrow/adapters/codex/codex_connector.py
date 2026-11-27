@@ -1348,6 +1348,9 @@ class Connector:
             result_path = os.path.join(self.args.results, name)
             carded = self.card_task(task_id, headers, path, result_path)
             if carded:
+                if self.view is not None and carded.get("card"):
+                    self.view.carded("%s, %s" % (headers.get("sender_name") or headers["access_tier"], policy.kind),
+                                     message, str(carded.get("card") or ""))
                 # The owner picked in the DM the waiting message came in: it is answered next, on the pick.
                 if carded["card"] in PICKED and headers.get("channel_id") == self.held().get("room"):
                     carded["answering"] = self.release_held(seen)

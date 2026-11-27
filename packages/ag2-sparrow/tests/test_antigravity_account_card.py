@@ -185,6 +185,8 @@ class AccountCardTest(unittest.TestCase):
         self.assertEqual(self.prompts(), [], "the code never reaches agy")
         self.assertEqual(self.posted("$x"), [], "and nothing acts on it")
         self.assertNotIn(CODE, "\n".join(self.logs) + json.dumps(self.w.metrics()) + self.state_text())
+        # The asks a card answered are in the agent's live view; the refused code is in none of the above.
+        self.assertIn("answered with account-card (no model turn)", self.state_text())
 
     def state_text(self):
         return "\n".join(p.read_text(encoding="utf-8", errors="replace")

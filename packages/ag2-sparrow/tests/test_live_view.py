@@ -34,6 +34,19 @@ class Base(unittest.TestCase):
 
 
 class Writing(Base):
+    def test_a_message_answered_with_a_card_is_shown_as_a_turn_with_no_model_in_it(self):
+        self.w.carded("Susan, owner", "/model", "model-card")
+        shown = self.lines()
+        self.assertTrue(shown[1].endswith("Susan, owner ──"), shown)
+        self.assertEqual(shown[2:], ["> /model", "• answered with model-card (no model turn)", "── turn completed ──"])
+        self.w.carded("Susan, owner", "switch account", "")
+        self.assertIn("• answered with a card (no model turn)", self.lines())
+
+    def test_the_waiting_line_says_nothing_about_typing(self):
+        # The panel that shows this view takes a message under it: "read-only" there was wrong.
+        self.assertNotIn("read-only", live_view.WAITING)
+        self.assertNotIn("typed", live_view.WAITING)
+
     def test_a_turn_is_written_as_a_person_would_read_it(self):
         self.w.turn("Susan, owner", "list the files\nand count them")
         self.w.say("I'll look.\nThere are ")

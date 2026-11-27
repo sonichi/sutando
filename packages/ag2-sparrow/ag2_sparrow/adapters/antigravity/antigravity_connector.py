@@ -818,15 +818,17 @@ class Connector:
             publish(result_file, NON_OWNER_REFUSED)
             return {"task": task_id, "status": "refused", "tier": headers["access_tier"], "policy": kind}
         owner_turn = turn_kind == OWNER_TURN
+        who = "%s, %s" % (headers.get("sender_name") or headers["access_tier"], kind)
         owned = self.account_task(task_id, headers, path, status_kind=kind, result_file=result_file)
-        if owned:
-            return owned
-        carded = self.card_task(task_id, headers, path, result_file)
+        carded = owned or self.card_task(task_id, headers, path, result_file)
         if carded:
+            # Only a message a card answered is shown: one refused for carrying a code or a key never is.
+            if carded.get("card"):
+                self.view.carded(who, message, str(carded["card"]))
             return carded
         event, _ = trigger_of(headers)
         log("wake ->", task_id, headers["access_tier"], event or "message")
-        self.view.turn("%s, %s" % (headers.get("sender_name") or headers["access_tier"], kind), message)
+        self.view.turn(who, message)
         t0 = time.time()
         self.launch = None
         switched = ""
