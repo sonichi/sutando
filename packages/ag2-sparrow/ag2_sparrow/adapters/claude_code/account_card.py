@@ -250,7 +250,8 @@ class AccountCard(account_switch.AccountSwitch):
             return "account-not-saved"
         try:
             config_dir = config_dir_for_switch(self.cfg)
-            nonce = remote.publish(self.root, config_dir, key, email, room, tapped, self.bridge_state, self.log)
+            nonce = remote.publish(self.root, config_dir, key, email, room, tapped, self.bridge_state, self.log,
+                                   claude=str(self.cfg.get("CLAUDE") or ""))
         except accounts.Refused as e:
             self.say(room, remote.note("error", "Could not switch: %s" % e), result_file, tapped)
             return "account-refused"

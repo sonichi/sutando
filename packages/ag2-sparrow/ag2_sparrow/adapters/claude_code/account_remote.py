@@ -14,7 +14,9 @@ outcome in place of the card: switched or not from the result; a request still u
 UNCLAIMED_S is withdrawn (only while it is still this nonce's) and said not picked up; a claimed one is
 said still in progress, and after GIVE_UP_S said untold (never failed) with the nonce kept, so a late
 result is still told: `settle_late`, on the next card or tap, and `recover`, which restarts a watcher a
-restart left dead.
+restart left dead. The app's answer is kept in that record before its receipt is removed, and the
+record is dropped only once the card telling it is queued; an answer the app could not finish knowing
+(`unknown`: it restarted mid-switch) says the account in use now, never that the switch failed.
 
     python3 -m ag2_sparrow.adapters.claude_code.account_remote await --root ROOT --nonce NONCE
 """
@@ -45,6 +47,8 @@ NONCE_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[
 BUSY = "A switch is already running for this agent."
 UNCLAIMED = "The app on this computer did not pick this up — is it running? Nothing was changed."
 WORKING = "Switching to %s… the app on this computer is still working on it."
+RESTARTED_ON = "The app restarted during the switch. This agent is now on %s."
+RESTARTED = "The app restarted during the switch; check the account card to see which account is in use."
 UNTOLD = "The app has not said how the switch ended; check the account card again in a moment."
 _popen = subprocess.Popen
 
@@ -138,9 +142,24 @@ def claimed_any(config_dir) -> bool:
         return False
 
 
-def take_result(config_dir, nonce: str):
-    """The app's answer to `nonce`, taken (moved aside first, so only one reader ever has it); None for none."""
-    path = Path(config_dir) / (RESULT % nonce)
+def _parsed(text, nonce: str) -> dict:
+    try:
+        data = json.loads(text) if text else None
+    except ValueError:
+        data = None
+    if not isinstance(data, dict) or data.get("nonce") != nonce:
+        return {"nonce": nonce, "ok": False, "error": "the app's answer could not be read"}
+    return {k: data.get(k) for k in ("nonce", "ok", "label", "error", "unknown") if k in data}
+
+
+def receive(root, rec: dict):
+    """`rec` with the app's answer to it kept in sparrow's own record ("outcome") before the app's receipt is
+    removed, so an answer is never lost between the two; None while there is no answer. The receipt is
+    moved aside first (only one reader ever has it) and put back when the record cannot be written."""
+    if isinstance(rec.get("outcome"), dict):
+        return rec
+    nonce = rec["nonce"]
+    path = Path(rec["config_dir"]) / (RESULT % nonce)
     mine = path.with_name("%s.taken-%s" % (path.name, uuid.uuid4().hex))
     try:
         os.rename(str(path), str(mine))
@@ -148,15 +167,16 @@ def take_result(config_dir, nonce: str):
         return None
     try:
         text, _ = read_regular(str(mine), FILE_MAX, follow=False)
-    finally:
-        mine.unlink(missing_ok=True)
-    try:
-        data = json.loads(text) if text else None
-    except ValueError:
-        data = None
-    if not isinstance(data, dict) or data.get("nonce") != nonce:
-        return {"nonce": nonce, "ok": False, "error": "the app's answer could not be read"}
-    return data
+        rec = dict(rec, outcome=_parsed(text, nonce))
+        save(root, rec)
+    except OSError:
+        try:
+            os.rename(str(mine), str(path))
+        except OSError:
+            pass
+        return None
+    mine.unlink(missing_ok=True)
+    return rec
 
 
 def write_request(config_dir, key: str, nonce: str, now: float) -> None:
@@ -210,43 +230,66 @@ def one_line(text, limit: int = 300) -> str:
     return " ".join(str(text or "").split())[:limit]
 
 
-def told(data, label: str) -> tuple:
-    """(state, words) for the app's answer."""
+def current_account(rec: dict) -> str:
+    """The account the agent is on now, as its account card names it; '' when it cannot be read."""
+    from . import account_card
+    try:
+        return account_card.label({"CLAUDE_CONFIG_DIR": rec["config_dir"], "CLAUDE": rec.get("claude") or "claude"})
+    except Exception:  # noqa: BLE001 - said as unknown
+        return ""
+
+
+def told(data, label: str, current=lambda: "") -> tuple:
+    """(state, words) for the app's answer. One the app could not finish knowing (it restarted during the
+    switch, `unknown`) is never said failed: it says the account in use now, as `current()` reads it."""
+    if data.get("unknown") is True:
+        now = current()
+        return "info", (RESTARTED_ON % now if now else RESTARTED)
     if data.get("ok") is True:
         name = account_switch.shown(str(data.get("label") or "").split(" (")[0])
         return "done", "Switched to %s." % (name or label)
     return "error", "Could not switch: %s" % (one_line(data.get("error")) or "the app gave no reason")
 
 
-def tell(rec: dict, state: str, words: str, phase: str, log=_log) -> None:
-    if not card_desk.post(rec.get("bridge_state") or "", rec.get("room") or "", note(state, words), log,
-                          key="account-remote:%s:%s" % (rec["nonce"], phase), at_ns=time.time_ns(),
-                          edit=str(rec.get("edit") or "")):
-        log("not posted:", words)
+def tell(rec: dict, state: str, words: str, phase: str, log=_log) -> bool:
+    """Queue `words` in place of the card tapped; whether it was queued."""
+    if card_desk.post(rec.get("bridge_state") or "", rec.get("room") or "", note(state, words), log,
+                      key="account-remote:%s:%s" % (rec["nonce"], phase), at_ns=time.time_ns(),
+                      edit=str(rec.get("edit") or "")):
+        return True
+    log("not posted:", words)
+    return False
 
 
-def settle(root, rec: dict, data: dict, log=_log) -> str:
-    state, words = told(data, str(rec.get("label") or "that account"))
-    tell(rec, state, words, "result", log)
-    drop(root, rec["nonce"])
+def settle(root, rec: dict, log=_log) -> str:
+    """Tell the answer kept in `rec`; the record is dropped only once its card is queued, else it stays,
+    answer and all, for the next try (`settle_late`)."""
+    state, words = told(rec["outcome"], str(rec.get("label") or "that account"), lambda: current_account(rec))
+    if tell(rec, state, words, "result", log):
+        drop(root, rec["nonce"])
     return words
 
 
 def settle_late(root, log=_log) -> list:
-    """Tell what came of switches no watcher is telling: a late result, or a request the app no longer holds
-    in any form. What was told."""
+    """Tell what came of switches no watcher is telling: an answer kept but not yet told, a late result, or a
+    request the app no longer holds in any form. What was told."""
+    with _lock(root):
+        return _settle_late(root, log)
+
+
+def _settle_late(root, log) -> list:
     said = []
     for rec in outstanding(root):
         nonce, config_dir = rec["nonce"], rec["config_dir"]
-        data = take_result(config_dir, nonce)
-        if data is not None:
-            said.append(settle(root, rec, data, log))
+        got = receive(root, rec)
+        if got is not None:
+            said.append(settle(root, got, log))
             continue
         if watcher_alive(root, nonce) or request_nonce(config_dir) == nonce or claimed(config_dir, nonce):
             continue
-        data = take_result(config_dir, nonce)       # written just before the claimed file was removed
-        if data is not None:
-            said.append(settle(root, rec, data, log))
+        got = receive(root, rec)       # written just before the claimed file was removed
+        if got is not None:
+            said.append(settle(root, got, log))
             continue
         if not rec.get("gave_up"):
             tell(rec, "info", UNTOLD, "lost", log)
@@ -259,17 +302,18 @@ def busy(root, config_dir) -> bool:
     return request_nonce(config_dir) is not None or claimed_any(config_dir) or bool(outstanding(root))
 
 
-def publish(root, config_dir, key: str, label: str, room: str, edit: str, bridge_state: str, log=_log, now=None):
+def publish(root, config_dir, key: str, label: str, room: str, edit: str, bridge_state: str, log=_log, now=None,
+            claude: str = ""):
     """Ask the app for the switch: the nonce, or None when a switch is unresolved for this agent (nothing
     written). Raises OSError when the request cannot be written; nothing is then kept."""
     now = time.time() if now is None else now
     with _lock(root):
-        settle_late(root, log)
+        _settle_late(root, log)
         if busy(root, config_dir):
             return None
         nonce = str(uuid.uuid4())
         save(root, {"nonce": nonce, "label": label, "room": room, "edit": edit, "config_dir": str(config_dir),
-                    "bridge_state": str(bridge_state), "at": now})
+                    "bridge_state": str(bridge_state), "at": now, "claude": claude})
         try:
             write_request(config_dir, key, nonce, now)
         except OSError:
@@ -291,7 +335,9 @@ def start(root, nonce: str, popen=None) -> bool:
 
 
 def recover(root, popen=None, log=_log) -> int:
-    """Restart the watcher of each switch still being watched for when a restart ended its watcher."""
+    """Tell what is owed (`settle_late`: an answer whose card could not be queued, a late result), then restart
+    the watcher of each switch still being watched for when a restart ended its watcher."""
+    settle_late(root, log)
     started = 0
     for rec in outstanding(root):
         if not rec.get("gave_up") and not watcher_alive(root, rec["nonce"]):
@@ -319,9 +365,9 @@ def _watch(root, nonce, sleep, clock, log) -> str:
             if rec is None:
                 return ""
             config_dir, at = rec["config_dir"], float(rec.get("at") or 0)
-            data = take_result(config_dir, nonce)
-            if data is not None:
-                return settle(root, rec, data, log)
+            got = receive(root, rec)
+            if got is not None:
+                return settle(root, got, log)
             now = clock()
             if request_nonce(config_dir) == nonce:
                 if now >= at + UNCLAIMED_S and withdraw(config_dir, nonce):
@@ -337,9 +383,9 @@ def _watch(root, nonce, sleep, clock, log) -> str:
                     tell(rec, "pending", WORKING % rec.get("label"), "working", log)
                     save(root, dict(rec, working=True))
             else:
-                data = take_result(config_dir, nonce)
-                if data is not None:
-                    return settle(root, rec, data, log)
+                got = receive(root, rec)
+                if got is not None:
+                    return settle(root, got, log)
                 tell(rec, "info", UNTOLD, "lost", log)
                 drop(root, nonce)
                 return UNTOLD

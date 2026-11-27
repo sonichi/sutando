@@ -175,6 +175,12 @@ class Tap(Remote):
         self.assertEqual({k: rm.load(self.root, req["nonce"])[k] for k in ("label", "room", "edit")},
                          {"label": A, "room": DM, "edit": "$acct"})
 
+    def test_the_switch_records_never_refuse_the_next_start(self):
+        from ag2_sparrow import task_lifecycle
+        self.begun()
+        (Path(self.root) / "state" / "account-remote.log").touch()
+        self.assertIsNone(task_lifecycle.prepare_work_dir(self.root, check_only=True))
+
     def test_a_second_tap_while_one_is_outstanding_is_refused_and_writes_nothing(self):
         first = self.begun()
         self.posted("$second")
@@ -315,13 +321,63 @@ class Watch(Remote):
         other = "44444444-4444-4444-8444-444444444444"
         self.result(other, ok=True, label=B)
         (self.config / (rm.RESULT % nonce)).write_text(json.dumps({"v": 2, "nonce": other, "ok": True, "label": B}))
-        self.assertEqual(rm.take_result(self.config, nonce)["ok"], False, "a receipt naming another nonce is no success")
+        rec = rm.load(self.root, nonce)
+        self.assertEqual(rm.receive(self.root, rec)["outcome"]["ok"], False, "a receipt naming another nonce is no success")
         self.assertTrue((self.config / (rm.RESULT % other)).exists(), "another request's receipt is left alone")
-        self.assertIsNone(rm.take_result(self.config, nonce))
-        (self.config / (rm.RESULT % nonce)).write_text("not json")
-        self.assertEqual(rm.take_result(self.config, nonce)["error"], "the app's answer could not be read")
+        self.assertIsNone(rm.receive(self.root, rec), "no receipt for it any more")
+        self.assertEqual(rm._parsed("not json", nonce)["error"], "the app's answer could not be read")
         self.assertEqual(rm._watch(self.root, "66666666-6666-4666-8666-666666666666", None, None, print), "",
                          "a switch settled meanwhile is not told again")
+
+    def test_an_answer_whose_card_cannot_be_queued_is_kept_and_told_on_the_next_try(self):
+        nonce = self.begun()
+        self.claim_it(nonce)
+        self.result(nonce, ok=True, label=A)
+        with mock.patch.object(rm.card_desk, "post", return_value=False):
+            self.assertEqual(rm.watch(self.root, nonce, log=lambda *a: None), "Switched to %s." % A)
+        rec, = rm.outstanding(self.root)
+        self.assertEqual(rec["outcome"], {"nonce": nonce, "ok": True, "label": A}, "the answer is kept")
+        self.assertEqual(list(self.config.iterdir()), [], "the receipt is gone")
+        self.assertEqual(self.queued(), [])
+        with mock.patch.object(rm.card_desk, "post", return_value=False):
+            self.assertIsNone(rm.publish(self.root, self.config, ac.saved_key(B), B, DM, "$b", "", log=lambda *a: None),
+                              "still owed, and still not queued: no new switch meanwhile")
+            self.assertEqual(rm.settle_late(self.root, log=lambda *a: None), ["Switched to %s." % A])
+        self.assertEqual(len(rm.outstanding(self.root)), 1)
+        self.assertEqual(rm.recover(self.root), 0, "the supervisor's check tells it, and starts no watcher for it")
+        self.assertEqual(self.texts(), [("$acct", "Switched to %s." % A)])
+        self.assertEqual(rm.outstanding(self.root), [], "dropped only once queued")
+
+    def test_a_receipt_is_put_back_when_the_answer_cannot_be_kept(self):
+        nonce = self.begun()
+        self.claim_it(nonce)
+        self.result(nonce, ok=True, label=A)
+        with mock.patch.object(rm, "save", side_effect=OSError("disk full")):
+            self.assertIsNone(rm.receive(self.root, rm.load(self.root, nonce)))
+        self.assertTrue((self.config / (rm.RESULT % nonce)).exists())
+        with mock.patch.object(rm, "save", side_effect=OSError("disk full")), \
+                mock.patch.object(rm.os, "rename", side_effect=[None, OSError("gone")]):
+            self.assertIsNone(rm.receive(self.root, rm.load(self.root, nonce)))
+
+    def test_an_app_restart_mid_switch_says_the_account_now_never_that_it_failed(self):
+        nonce = self.begun()
+        self.claim_it(nonce)
+        self.result(nonce, ok=False, unknown=True, error="the app restarted during the switch")
+        said = rm.watch(self.root, nonce)
+        self.assertEqual(said, rm.RESTARTED_ON % ac.account_switch.masked(SARAH))
+        self.assertNotIn("Could not", said)
+        self.assertEqual(self.queued()[-1]["card"]["text"], said)
+        self.clear_outbox()
+        nonce = self.begun()
+        self.claim_it(nonce)
+        self.result(nonce, ok=False, unknown=True, error="the app restarted during the switch")
+        self.answer = "not json"        # the account cannot be read
+        self.assertEqual(rm.watch(self.root, nonce), rm.RESTARTED)
+        self.answer = {"loggedIn": True, "email": SARAH}
+        nonce = self.begun()
+        self.claim_it(nonce)
+        self.result(nonce, ok=False, error="locked")
+        self.assertEqual(rm.watch(self.root, nonce), "Could not switch: locked", "a plain failure is still one")
 
     def test_unclaimed_after_90_seconds_is_withdrawn_only_while_it_is_its_own(self):
         nonce = self.begun()
@@ -396,12 +452,14 @@ class Watch(Remote):
         self.request().unlink()
         self.assertEqual(rm.watch(self.root, nonce), rm.UNTOLD, "the watcher too")
         nonce = self.begun()
-        with mock.patch.object(rm, "take_result", side_effect=[None, {"nonce": nonce, "ok": True, "label": A}]):
+        late = dict(rm.load(self.root, nonce), outcome={"nonce": nonce, "ok": True, "label": A})
+        with mock.patch.object(rm, "receive", side_effect=[None, late]):
             self.request().unlink()
             self.assertEqual(rm.settle_late(self.root), ["Switched to %s." % A], "written as the claim went")
         nonce = self.begun()
         self.request().unlink()
-        with mock.patch.object(rm, "take_result", side_effect=[None, {"nonce": nonce, "ok": True, "label": A}]):
+        late = dict(rm.load(self.root, nonce), outcome={"nonce": nonce, "ok": True, "label": A})
+        with mock.patch.object(rm, "receive", side_effect=[None, late]):
             self.assertEqual(rm.watch(self.root, nonce), "Switched to %s." % A)
 
     def test_restart_recovery_starts_a_watcher_for_an_outstanding_nonce(self):
