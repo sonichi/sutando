@@ -66,10 +66,24 @@ def _core():
     return agent_card, issued_cards
 
 
+def _private_dirs(folder: Path) -> None:
+    """`folder` (agent-cards/outbox or /posted) and agent-cards made owner-only whatever the umask: a card may
+    carry a short-lived sign-in code."""
+    folder.mkdir(parents=True, exist_ok=True)
+    for d in (folder.parent, folder):
+        if (d.stat().st_mode & 0o777) != 0o700:
+            os.chmod(d, 0o700)
+
+
 def _write(path: Path, record: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """`record` at `path`, owner-only from its creation on, replaced in one step."""
+    _private_dirs(path.parent)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        if hasattr(os, "fchmod"):
+            os.fchmod(f.fileno(), 0o600)       # a temp left by an older writer keeps its mode on O_TRUNC
+        f.write(json.dumps(record, sort_keys=True))
     os.replace(tmp, path)
 
 

@@ -40,6 +40,7 @@ from ...task_io import (AUDIENCE_RULE, DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFU
                         make_dirs, non_owner_note, parse_task, pid_alive, exit_code, record_done, refusal_body,
                         release_lock,
                         root_path, start_time, stop_requested, turn_policy, write_atomic)
+from . import device_login
 
 CLIENT = {"name": "ag2-sparrow-codex", "version": "0.1.0"}
 APPROVAL_REQUESTS = ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
@@ -518,6 +519,9 @@ class Connector:
                 cancel=lambda login: self.rpc.request("account/login/cancel", {"loginId": login}),
                 opener=lambda url: open_page(url), runtime="codex", lapsed=self.login_refused,
                 limit=lambda: self.quota.says())
+            # "Add account" from the owner's phone: Codex's device-code sign-in, run by its own CLI here.
+            self._accounts.remote = device_login.Remote(self._accounts, self.args.state, self.root,
+                                                        getattr(self.args, "codex", "codex"), child_env(), log)
         return self._accounts
 
     @property
@@ -1345,6 +1349,7 @@ class Connector:
             try:    # a card's ledger entry, or a sign-in given up, never stops task service
                 connector_cards.absorb(self.args.bridge_state, self.root)
                 self.accounts.expire()
+                self.accounts.remote.tick()
                 self.quota.tick()
                 self.expire_held(done_path)
             except Exception as e:  # noqa: BLE001

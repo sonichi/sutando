@@ -52,6 +52,30 @@ class ConnectorCards(unittest.TestCase):
             return {"ok": True, "event_id": "$card1"} if answer is None else answer
         return cc.Poster(self.state, post, log=self.logs.append, clock=clock)
 
+    def test_queued_and_posted_cards_are_owner_only_whatever_the_umask(self):
+        # A card may carry a sign-in code: its files 0600 and their dirs 0700, an older open dir tightened too.
+        outbox = self.state.joinpath(*cc.OUTBOX)
+        outbox.mkdir(parents=True, mode=0o755)
+        os.chmod(outbox, 0o755)
+        (outbox / ("0" * 32 + ".json.tmp")).write_text("{}")
+        os.chmod(outbox / ("0" * 32 + ".json.tmp"), 0o644)
+        old = os.umask(0o022)
+        try:
+            body, card = model_card()
+            qid = cc.queue(self.state, ROOM, body, card, now=1000.0)
+            mode = lambda p: oct(p.stat().st_mode & 0o777)  # noqa: E731
+            self.assertEqual((mode(outbox / (qid + ".json")), mode(outbox), mode(outbox.parent)),
+                             ("0o600", "0o700", "0o700"))
+            cc._write(outbox / ("0" * 32 + ".json"), {"x": 1})
+            self.assertEqual(mode(outbox / ("0" * 32 + ".json")), "0o600", "a temp an older writer left is made private")
+            (outbox / ("0" * 32 + ".json")).unlink()
+            self.assertEqual(self.poster().sweep(), 1, "the card still posts")
+            posted = self.state.joinpath(*cc.POSTED)
+            self.assertEqual((mode(posted / (qid + ".json")), mode(posted)), ("0o600", "0o700"))
+            self.assertEqual(cc.absorb(self.state, self.root), 1, "and is still recorded")
+        finally:
+            os.umask(old)
+
     def posted(self):
         body, card = model_card()
         cc.queue(self.state, ROOM, body, card, now=1000.0)
