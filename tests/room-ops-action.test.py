@@ -105,7 +105,7 @@ class FakeServer:
             if self.leak:
                 said += f" (relay {OWN_SECRET}, delegation {MINTED})"
             return {"isError": True, "content": [{"type": "text", "text": json.dumps(
-                {"code": "FORBIDDEN", "message": said})}]}
+                {"code": "FORBIDDEN", "message": said, "suggested_action": "ask a room editor"})}]}
         if self.held:
             return {"structuredContent": {"status": "approval_required", "approval_id": "ap-1",
                                           "operation_id": args["operation_id"]}}
@@ -156,6 +156,7 @@ class WhoAsked(Base):
         self.assertFalse(res["ok"], res)
         self.assertEqual((res["state"], res["code"]), ("refused", "FORBIDDEN"))
         self.assertIn("may not edit", res["reason"])
+        self.assertEqual(res["suggested_action"], "ask a room editor")
         self.assertNotIn("result", res)
         self.assertEqual(self.server.sent("room.action.execute")[0]["asked_by"], MEMBER)
 
@@ -280,6 +281,52 @@ class Outcomes(Base):
                          vault=FakeVault(), request=down)
         self.assertEqual((res["ok"], res["state"]), (False, "unknown"))
         self.assertIn(res["operation_id"], json.dumps(res))
+
+
+class RefusedHere(Base):
+    def core(self, room=ROOM, **kw):
+        return action.run("execute", room, WRITE, kw.pop("arguments", {}), workspace=self.ws, environ={},
+                          request=self.server, **kw)
+
+    def test_a_missing_room_or_arguments_that_are_no_object_send_nothing(self):
+        self.assert_nothing_sent(self.core(room=""))
+        self.assert_nothing_sent(self.core(arguments=["a list"]))
+
+    def test_a_worker_whose_token_is_missing_is_refused(self):
+        vault = FakeVault()
+        del vault.store[C.token_ref_for(OWN)]
+        res = action.run("execute", ROOM, WRITE, None, workspace=self.ws, environ={C.SESSION_WORKER_ENV: W},
+                         vault=vault, request=self.server)
+        self.assert_nothing_sent(res)
+        self.assertNotIn(CORE_SECRET, json.dumps(res))
+
+    def test_a_core_with_no_gateway_credential_is_refused(self):
+        self.assert_nothing_sent(self.core())
+
+    def test_a_room_whose_server_has_no_connection_is_refused(self):
+        with mock.patch.object(action._gateway, "gateway", side_effect=action._gateway.RoomConnectionError("none")):
+            self.assert_nothing_sent(self.core())
+        with mock.patch.dict("os.environ", {"GATEWAY_URL": RELAY, "GATEWAY_TOKEN": CORE_SECRET}), \
+                mock.patch.object(C, "room_agent_mxid", side_effect=C.NoConnectionForRoom("none")):
+            self.assert_nothing_sent(self.core())
+
+    def test_the_client_gate_denies_a_room_it_does_not_list(self):
+        self.assert_nothing_sent(self.run_action(gate={OWN_AGENT: {"rooms": ["!other:hs"]}}))
+
+    def test_a_checkout_without_the_actions_client_is_refused(self):
+        with mock.patch.dict(sys.modules, {"pool_provision": None}):
+            res = self.run_action()
+        self.assert_nothing_sent(res)
+        self.assertIn("pool_provision", res["reason"])
+
+    def test_a_read_with_no_answer_failed(self):
+        _, pp = action._owners()
+
+        def down(method, url, **kw):
+            raise pp.TransportError("TimeoutError")
+        res = action.run("read", ROOM, "room.commons.pages.list", {}, workspace=self.ws,
+                         environ={C.SESSION_WORKER_ENV: W}, vault=FakeVault(), request=down)
+        self.assertEqual((res["ok"], res["state"]), (False, "failed"))
 
 
 class NoSecretInOutput(Base):
