@@ -4791,6 +4791,8 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         if profile is not None:
             payload["runtime_profile"] = profile
             payload["capabilities"].append(RUNTIME_PROFILE_CAPABILITY)
+        with contextlib.suppress(OSError):
+            card_input.sweep(_STATE)        # a card value nobody took goes within its TTL, with or without clicks
         reply, payload = _send_heartbeat(payload, base)
         _runtime_profile_sent = _profile_key(payload.get("runtime_profile"))
         _log_recovery_sent(payload)
@@ -6895,6 +6897,8 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
             if isinstance(uo, str) and _UI_ORIGIN_RE.fullmatch(uo):
                 lines.append(f"ui_origin: {uo}")
         elif f == "card_click":
+            with contextlib.suppress(OSError):
+                card_input.sweep(_STATE)        # a value nobody took goes within TTL, clicks or not
             click = task.get(f)
             if isinstance(click, dict) and all(isinstance(click.get(k), str) and click[k].strip()
                                                and len(click[k]) <= limit for k, limit in _CARD_CLICK_MAX.items()):

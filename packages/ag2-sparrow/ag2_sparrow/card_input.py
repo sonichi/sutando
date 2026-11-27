@@ -42,13 +42,18 @@ def take(state_dir, ref, now=None) -> dict:
     if not isinstance(ref, str) or not REF_RE.fullmatch(ref):
         return {}
     path = Path(state_dir) / DIR / (ref + ".json")
+    claimed = path.with_suffix(".taken.%d" % os.getpid())
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        os.rename(path, claimed)        # atomic: of two takers only one gets the file
+    except OSError:
+        return {}
+    try:
+        data = json.loads(claimed.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     finally:
         try:
-            path.unlink()
+            claimed.unlink()
         except OSError:
             pass
     fresh = isinstance(data, dict) and (time.time() if now is None else now) - float(data.get("at") or 0) <= TTL_S
@@ -60,7 +65,7 @@ def sweep(state_dir, now=None) -> int:
     """Remove the values nobody took within TTL_S; how many."""
     d = Path(state_dir) / DIR
     gone, cut = 0, (time.time() if now is None else now) - TTL_S
-    for p in d.glob("*.json") if d.is_dir() else ():
+    for p in d.glob("*.json*") if d.is_dir() else ():
         try:
             if p.stat().st_mtime < cut:
                 p.unlink()

@@ -1025,6 +1025,12 @@ class PhoneSignIn(Remote):
         self.assertEqual(card_input.take(self.bridge, late, now=1000.0 + card_input.TTL_S + 1), {}, "expired")
         self.assertFalse((self.bridge / "card-input" / (late + ".json")).exists())
         self.assertEqual(card_input.take(self.bridge, "../../etc/passwd"), {})
+        # Swept with no further click (the bridge's heartbeat), and of two takers only one gets the value.
+        orphan = card_input.put(self.bridge, {"code": CODE}, now=1000.0)
+        os.utime(self.bridge / "card-input" / (orphan + ".json"), (1000.0, 1000.0))
+        self.assertEqual(card_input.sweep(self.bridge, now=1000.0 + card_input.TTL_S + 1), 1)
+        once = card_input.put(self.bridge, {"code": CODE})
+        self.assertEqual([card_input.take(self.bridge, once), card_input.take(self.bridge, once)], [{"code": CODE}, {}])
 
 if __name__ == "__main__":
     unittest.main()
