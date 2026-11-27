@@ -102,7 +102,7 @@ class AccountSwitch:
     asks = staticmethod(asks_for_card)
 
     def __init__(self, state_dir, bridge_state, name, publish, quoted, log, read, begin, cancel, opener, runtime="",
-                 lapsed=None):
+                 lapsed=None, limit=None):
         # `remote`: a connector's sign-in the owner finishes on another device ("Add account", "Sign out"),
         # set by that connector after it makes the card; None offers neither.
         self.remote = None
@@ -110,6 +110,8 @@ class AccountSwitch:
         # `lapsed()`: the runtime itself refused this login (unauthorized even after a restart), not merely read
         # no account; asked again on every card, so an earlier answer is never carried into a later one.
         self.lapsed = lapsed
+        # `limit()`: the usage limit in force, in words ('' for none), so a card asked for meanwhile says it too.
+        self.limit = limit
         self.publish, self.quoted, self.log = publish, quoted, log
         self.read, self.begin, self.cancel, self.opener = read, begin, cancel, opener
 
@@ -186,9 +188,19 @@ class AccountSwitch:
         if result_file:
             self.publish(result_file, ANSWERED if posted else self.quoted(built[1]["text"]) + "\n")
 
-    def offer(self, sent, result_file) -> str:
+    def asked(self):
+        """The card for an owner who asked: led by the usage limit while one is in force, and marked as one."""
         text, refused = self.status()
-        self.say(sent.get("channel_id"), self.card("pending", text, ask=True, signed_out=refused), result_file)
+        try:
+            out = (self.limit() if self.limit else "") or ""
+        except Exception as e:  # noqa: BLE001 - the card still says the account
+            self.log("limit not read:", "%s: %s" % (type(e).__name__, str(e)[:200]))
+            out = ""
+        built = self.card("pending", "%s %s" % (out, text) if out else text, ask=True, signed_out=refused)
+        return limited(built) if out else built
+
+    def offer(self, sent, result_file) -> str:
+        self.say(sent.get("channel_id"), self.asked(), result_file)
         return "account-card"
 
     def asked_for(self, words, sent, result_file) -> str:
@@ -197,9 +209,7 @@ class AccountSwitch:
     def expired(self, sent, result_file) -> str:
         """A tap on an account card that no longer acts: a fresh card in its place when one can be shown,
         else the words. No sign-in is started by it."""
-        text, refused = self.status()
-        fresh = self.post(sent.get("channel_id"), self.card("pending", text, ask=True, signed_out=refused),
-                          edit=card_desk.tapped_event(sent))
+        fresh = self.post(sent.get("channel_id"), self.asked(), edit=card_desk.tapped_event(sent))
         self.publish(result_file, ANSWERED if fresh else self.quoted(EXPIRED_NO_CARD) + "\n")
         return "account-card-expired"
 

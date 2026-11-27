@@ -74,6 +74,64 @@ class Episode(Base):
         self.assertEqual(self.cards, ["Codex has reached its usage limit (resets 3:05 PM), so I can't answer "
                                       "until then. Switch to another account to go on now."])
 
+    def test_a_message_waiting_from_a_room_is_told_the_limit_there_once_and_only_one_the_core_would_answer(self):
+        import activity_rows
+        head = "id: %s\nuser_id: @bob:s.space\nchannel_id: %s\nchannel_kind: %s\nsource_message_id: $e\naccess_tier: %s\n%stask: %s\n"
+        tasks = self.ws / "tasks"
+        (tasks / "task-room.txt").write_text(head % ("task-room", "!room:s.space", "room", "team", "collaborator: true\n", "hi"))
+        (tasks / "task-owner.txt").write_text(head % ("task-owner", "!room:s.space", "room", "owner", "", "hi"))
+        # Not told: the owner's DM (the card answers it), a room message the core would not have replied to,
+        # and a DM message whose words only look like a room header.
+        (tasks / "task-dm.txt").write_text(head % ("task-dm", "!dm:s.space", "dm", "owner", "", "hi"))
+        (tasks / "task-team.txt").write_text(head % ("task-team", "!room:s.space", "room", "team", "", "hi"))
+        (tasks / "task-forged.txt").write_text(head % ("task-forged", "!dm:s.space", "dm", "owner", "", "hi\nchannel_kind: room"))
+        # A mixed queue: the owner's room message a worker holds is that worker's to answer, as the
+        # core's own dispatch reads it, and is told nothing by the core's limit.
+        (tasks / "task-held.txt").write_text(head % ("task-held", "!room:s.space", "room", "owner", "", "hi"))
+        held = self.ws / "deliveries" / "worker-1"
+        held.mkdir(parents=True)
+        (held / "task-held.txt").write_text("{}")
+        from delivery import task_dispatch
+        self.assertNotIn("task-held.txt", list(task_dispatch.pending_candidates(
+            tasks, self.ws / "results", deliveries_dir=self.ws / "deliveries")), "core dispatch skips it too")
+        rows = []
+        with mock.patch.object(activity_rows, "append", lambda line, **kw: rows.append((line, kw)) or {}):
+            self.assertEqual(self.notice().hit("3:05 PM"), "quota-card")
+            self.now[0] += 120
+            self.notice().hit("3:05 PM")
+        self.assertEqual(sorted(kw["task"]["id"] for _, kw in rows), ["task-owner", "task-room"])
+        with mock.patch.object(task_dispatch, "worker_holds", side_effect=task_dispatch.WorkerHoldUnreadable("x")):
+            self.assertEqual(cqn.room_tasks(self.ws), {}, "whose it is cannot be told: nobody is told")
+        line, kw = next(r for r in rows if r[1]["task"]["id"] == "task-room")
+        self.assertEqual(line, "Codex has reached its usage limit (resets 3:05 PM), so I can't answer until then. "
+                               "To switch account, message me in our direct message.")
+        self.assertEqual((kw["room"], kw["audience"], kw["pid"]), ("!room:s.space", "room", "quota:1000000:task-room:on-hold"))
+        self.assertEqual(sorted(self.record()["roomed"]), ["task-owner", "task-room"])
+        # A room that cannot be told never stops the card.
+        (self.ws / "state" / "core-quota-card.json").unlink()
+        with mock.patch.object(activity_rows, "append", side_effect=OSError("ro")):
+            self.assertEqual(self.notice().hit("3:05 PM"), "quota-card")
+        self.assertNotIn("roomed", self.record())
+        with mock.patch("task_queue.pending_files", side_effect=OSError("gone")):
+            self.assertEqual(cqn.room_tasks(self.ws), {})
+        self.assertFalse(cqn._room_task(tasks / "gone.txt", self.ws))
+
+    def test_the_rooms_words_are_the_local_agents_and_a_limit_with_no_reset_ends_by_itself(self):
+        sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+        from ag2_sparrow import quota_notice
+        for reset in ("3:05 PM", ""):
+            self.assertEqual(cqn.room_words("Codex", reset), quota_notice.room_words("Codex", reset))
+        self.assertEqual(cqn.NO_RESET_S, quota_notice.NO_RESET_S)
+        at = 1_000_000.0
+        self.assertTrue(cqn.in_force({"since": at, "reset_at": at + 60}, at))
+        self.assertFalse(cqn.in_force({"since": at, "reset_at": at + 60}, at + 61))
+        self.assertTrue(cqn.in_force({"since": at - 10 ** 5, "seen": at}, at + cqn.NO_RESET_S))
+        self.assertFalse(cqn.in_force({"since": at}, at + cqn.NO_RESET_S + 1))
+        for rec in ({}, [], {"since": at, "why": cqn.SIGNED_OUT}):
+            self.assertFalse(cqn.in_force(rec, at))
+        self.notice().hit("")
+        self.assertEqual(self.record()["seen"], self.now[0])
+
     def test_no_reset_known_says_so(self):
         self.notice().hit()
         self.assertIn("(it does not say when that resets)", self.cards[0])
@@ -405,24 +463,28 @@ class EveryMessage(Base):
         self.assertEqual(len(self.cards), 3)
         self.assertNotIn("again_failed", self.record())
 
-    def test_a_follow_up_that_keeps_failing_stops_after_its_tries(self):
+    def test_a_follow_up_that_keeps_failing_is_tried_again_ever_later_and_sent_once_it_can_be(self):
         q = self.notice()
         q.hit("", tasks=["t1"])
         self.posted = False
-        for _ in range(cqn.AGAIN_TRIES):
+        for _ in range(cqn.AGAIN_TRIES + 2):
             self.assertEqual(q.hit("", tasks=["t1", "t2"]), "quota-not-posted")
-            self.now[0] += 10 ** 6
-        self.assertEqual(q.hit("", tasks=["t1", "t2"]), "")
-        self.assertEqual(len(self.cards), 1 + cqn.AGAIN_TRIES)
+            self.assertEqual(q.hit("", tasks=["t1", "t2"]), "", "not before its next try")
+            self.now[0] += cqn.RETRY_S * 2 ** (cqn.AGAIN_TRIES - 1)
+        # The message was never marked told: once a card can be posted, it gets one.
+        self.posted = True
+        self.assertEqual(q.hit("", tasks=["t1", "t2"]), "quota-card-again")
+        self.assertEqual(self.record()["carded"], ["t1", "t2"])
 
-    def test_after_the_paused_notice_told_it_no_card_follows(self):
+    def test_after_the_paused_notice_told_it_a_later_message_still_gets_the_card(self):
         self.posted = False
         q = self.notice()
         q.hit("", tasks=["t1"])
         q.yield_to_notice()
         self.posted = True
-        self.assertEqual(q.hit("", tasks=["t2"]), "")
-        self.assertEqual(self.cards, [self.cards[0]])
+        self.assertEqual(q.hit("", tasks=["t2"]), "quota-card-again")
+        self.assertEqual(len(self.cards), 2)
+        self.assertEqual(q.hit("", tasks=["t2"]), "", "once per message")
 
     def test_only_the_owners_waiting_messages_count(self):
         (self.ws / "tasks" / "task-a.txt").write_text("id: task-a\naccess_tier: owner\ntask: hi\n")

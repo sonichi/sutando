@@ -167,18 +167,25 @@ class Desk(unittest.TestCase):
         self.assertEqual(self.offers(), (0, [0, 0]))
         self.assertEqual(self.written, [])
 
-    def test_in_a_room_anyone_asking_gets_the_one_line_and_no_card(self):
-        # A room is no place for a switch: the owner and anyone else get the line, never a card or the model.
-        for tier in ("owner", "team", "guest"):
-            for said, line in (("你在用哪个账号和模型", card_desk.IN_ROOM_ZH), ("switch account", card_desk.IN_ROOM),
-                               ("/model", card_desk.IN_ROOM), ("/account opus", card_desk.IN_ROOM),
-                               ("what model are you using?", card_desk.IN_ROOM)):
-                with self.subTest(tier=tier, said=said):
-                    self.written.clear()
-                    self.assertEqual(self.task(said, tier=tier, kind="room"), "card-in-room")
-                    self.assertEqual(self.written, [line + "\n"])
+    def test_in_a_room_the_owner_asking_gets_the_one_line_and_no_card(self):
+        # A room is no place for a switch: the owner gets the line, never a card or the model.
+        for said, line in (("你在用哪个账号和模型", card_desk.IN_ROOM_ZH), ("switch account", card_desk.IN_ROOM),
+                           ("/model", card_desk.IN_ROOM), ("/account opus", card_desk.IN_ROOM),
+                           ("what model are you using?", card_desk.IN_ROOM)):
+            with self.subTest(said=said):
+                self.written.clear()
+                self.assertEqual(self.task(said, kind="room"), "card-in-room")
+                self.assertEqual(self.written, [line + "\n"])
         self.assertEqual(self.offers(), (0, [0, 0]))
         self.assertEqual(self.by_card, [])
+
+    def test_in_a_room_anyone_else_asking_goes_on_to_the_model(self):
+        # A guest's or team member's "what model are you using" is not the owner's switch: no line, no card.
+        for tier in ("team", "guest"):
+            for said in ("你在用哪个账号和模型", "switch account", "/model", "what model are you using?"):
+                with self.subTest(tier=tier, said=said):
+                    self.assertEqual(self.task(said, tier=tier, kind="room"), "")
+        self.assertEqual((self.offers(), self.written, self.by_card), ((0, [0, 0]), [], []))
 
     def test_a_pick_named_in_a_room_gets_the_line_and_picks_nothing(self):
         self.model.named_in = lambda words: "haiku" if "haiku" in words else ""
