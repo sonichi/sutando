@@ -111,9 +111,12 @@ class Desk(unittest.TestCase):
                 self.assertEqual(self.account.seen, [("offer", "!dm:s.space")])
         self.assertEqual(self.model.seen, [], "a card with no words of its own is never asked")
 
-    def test_a_near_miss_anyone_else_or_another_room_goes_on_to_the_model(self):
+    def test_a_near_miss_or_another_room_goes_on_to_the_model(self):
         self.assertEqual(self.task("create an account on github"), "")
-        self.assertEqual(self.task("which account are you using?", tier="team"), "")
+        self.assertEqual(self.task("which account are you using?", tier="team"), "card-not-owner",
+                         "anyone else is told the account is the owner's, in one line")
+        self.assertEqual(self.said, [card_desk.ACCOUNT_OWNER_ONLY + "\n"])
+        self.said.clear()
         self.assertEqual(self.task("which account are you using?", kind="room"), "card-in-room",
                          "a room is told to ask in the DM, with no card")
         self.account.up = False

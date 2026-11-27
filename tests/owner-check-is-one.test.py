@@ -12,6 +12,7 @@ one and not to the other.
 
 Run: python3 tests/owner-check-is-one.test.py
 """
+# ruff: noqa: E402 — imports follow the sys.path inserts below
 from __future__ import annotations
 
 import re
@@ -20,14 +21,14 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.hermetic_env import isolate_os_environ
 
 isolate_os_environ()
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
-import agent_card  # noqa: E402
-import switch_card_intercept as sci  # noqa: E402
-import task_envelope  # noqa: E402
+import agent_card
+import switch_card_intercept as sci
+import task_envelope
 
 FAILS: list[str] = []
 

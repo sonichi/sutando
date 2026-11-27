@@ -75,6 +75,13 @@ class ModelSwitch:
         """A model's name as the card shows it: the runtime's own name for `mid`, else `mid` itself."""
         return names.get(mid) or mid or fallback
 
+    def current_name(self) -> str:
+        """The model in use as the card names it ("Now using …"), '' when none is known: what a sender who
+        is not the owner is told when they ask which model this agent runs on."""
+        state = self.state()
+        names = {m["id"]: m["name"] for m in self.offered(state)}
+        return self.display(names, str(state.get("current") or ""), "")
+
     def named_in(self, words: str) -> str:
         """The model the owner's own words name for a direct pick ("switch to haiku"), '' for none: the card
         desk then picks it as a tap would. A runtime opts in by overriding this."""

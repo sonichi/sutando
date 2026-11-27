@@ -43,6 +43,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`browser-tools.ts`** — Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
 - **`browser.mjs`** — Sutando browser automation — lightweight Playwright wrapper.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.
+- **`card_words.py`** — What anyone but the owner is told about this agent's account and model, and the words that ask: one policy for the core (switch_card_intercept) and every connector (ag2_sparrow.card_desk, a sync_from_src copy).
 - **`cartesia-stt-provider.ts`** — Cartesia ink-whisper STT provider — drop-in replacement for GeminiBatchSTTProvider.
 - **`cartesia-tts.ts`** — Cartesia sonic-3 TTS — generates WAV audio files from text.
 - **`channel_auth_exit.py`** — Exit contract for a channel bridge whose provider rejected its credential.

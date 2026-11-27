@@ -31,6 +31,7 @@ _REPO = _SRC.parent
 sys.path.insert(0, str(_SRC))
 
 HOLD_EXIT = 75
+HELD = "switch-card-held"     # switch_card_intercept.HELD
 LAUNCH_EVERY_S = 60
 LOCK = ("state", "core-held-inbox.lock")
 
@@ -88,7 +89,8 @@ class HeldInbox:
                     continue
                 self.seen.add(path.name)
                 try:
-                    self.intercept(path)
+                    if self.intercept(path) == HELD:
+                        self.seen.discard(path.name)     # its line not written: asked again next tick
                 except Exception as exc:  # noqa: BLE001
                     self.log(f"{path.name}: switch card failed ({type(exc).__name__})")
             if hold.get("kind") == "usage-limit":

@@ -55,7 +55,7 @@ from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore
 from ...acp_client import AcpClient as _SharedClient
 from ...relay_loop import count_arg
 from .gemini_key import API_KEY_AUTH, authenticate_with_app_key
-from . import agy_account
+from . import agy_account, agy_usage
 from ...team_guardrail import SANDBOXED_DELEGATION_CODEX
 from ...task_io import (COLLABORATOR, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, RESTRICTED, LockRefused,
                         acquire_lock, exit_code, exit_on_sigterm, holder_consumer, load_done, make_dirs, parse_task,
@@ -615,10 +615,13 @@ class Connector:
             args.state, getattr(args, "bridge_state", None), NAME, getattr(args, "agent_id", None) or "", publish,
             quoted, log)
         self.agy_pid = None   # the owner turn's agy process, whose own log names the account it used
+        # agy's own usage, as the desktop app reads it for this agent (agy_usage.read); None: not now.
+        self.usage_reader = lambda agent_id: agy_usage.read(self.args.state, agent_id)
         # Out of quota: the account card, unasked, in the owner's DM, on each of their messages (quota_notice).
         self.quota = quota_notice.QuotaNotice(args.state, getattr(args, "bridge_state", None), NAME,
                                               self.accounts.quota_card, self.accounts.using, log,
-                                              note=lambda text: self.accounts.card("pending", text))
+                                              note=lambda text: self.accounts.card("pending", text),
+                                              account=self.quota_account)
         self.desk = card_desk.Desk(self.root, card_desk.led(publish, self.models.unsaid, quoted), quoted,
                                    [self.models, self.accounts], self.limit_first,
                                    lambda: self.quota.says_in_room())
@@ -631,6 +634,12 @@ class Connector:
         self.models.seen([(m.get("modelId"), m.get("name")) for m in (models.get("availableModels") or [])
                           if isinstance(m, dict)], models.get("currentModelId"))
 
+    def quota_account(self) -> str:
+        """The account a limit is kept for: this agent's own Gemini API key, or the computer's Google sign-in. A
+        switch between the two leaves the old limit behind; another Google account is only known from agy's next
+        turn, which clears the limit (it answered) or records it again."""
+        return "api-key" if self.accounts.keyed() else "google"
+
     def limit_first(self, sent, result_file) -> str:
         """Out of quota, the owner's ask for a card is answered by the limit's card, with the account in use."""
         said = self.quota.says()
@@ -638,6 +647,7 @@ class Connector:
             return ""
         text = " ".join(w for w in (said, self.accounts.using()) if w)
         self.accounts.say(sent.get("channel_id"), account_switch.limited(self.accounts.quota_card(text)), result_file)
+        self.quota.shown()
         return "quota-card-asked"
 
     def card_task(self, task_id, headers, path, result_file):
@@ -647,6 +657,54 @@ class Connector:
             return None
         log("card ->", task_id, outcome)
         return {"task": task_id, "status": "completed", "detail": outcome, "tier": headers["access_tier"], "card": outcome}
+
+    def usage_task(self, task_id, headers, task_text, result_file):
+        """The owner asking how much of agy's own usage is left (agy_usage.asks), answered here and never by the
+        model; else None. Out of usage: the limit's card, as any card ask gets (in a room, the limit's room line).
+        Else, in a room, only to ask in the DM (usage is account data); in the DM the usage as read, or that it
+        cannot be read now."""
+        agent_card, _ = connector_cards._core()
+        sent, said = agent_card.reply_words(task_text or "")
+        if not agy_usage.asks(said):
+            return None
+        if agent_card.owner_may_act(sent, dm_only=False) is not None or agent_card.click_tagged(sent):
+            return None     # anyone else's words, or a tap: as before
+        room = card_desk.in_room(sent)
+        if self.quota.says():
+            if room:
+                publish(result_file, quoted(self.quota.says_in_room()) + "\n")
+                outcome = "usage-limit-in-room"
+            else:
+                outcome = self.limit_first(sent, result_file)
+        elif room:
+            publish(result_file, quoted(agy_usage.ASK_IN_DM) + "\n")
+            outcome = "usage-ask-in-dm"
+        else:
+            text, outcome = self.usage_words()
+            # The account card, led by the usage: what is left, the account it is, and the switch, as one card.
+            self.accounts.say(sent.get("channel_id"), self.accounts.quota_card(text), result_file)
+        log("usage ->", task_id, outcome)
+        return {"task": task_id, "status": "completed", "detail": outcome, "tier": headers["access_tier"],
+                "card": outcome}
+
+    def usage_words(self) -> "tuple[str, str]":
+        """(the answer to a usage ask, its outcome): the windows as read, or why they cannot be shown."""
+        if self.accounts.keyed():
+            return agy_usage.ON_API_KEY, "usage-api-key"
+        agent = getattr(self.args, "agent_id", None) or ""
+        try:
+            got = self.usage_reader(agent)
+            if isinstance(got, dict) and got.get("stale") and self.renew_sign_in():
+                got = self.usage_reader(agent)
+        except Exception as e:  # noqa: BLE001 - a read that failed is a usage not available
+            log("usage not read:", "%s: %s" % (type(e).__name__, str(e)[:120]))
+            got = None
+        rows = agy_usage.rows_of(got.get("rows")) if isinstance(got, dict) else []
+        if not rows:
+            return agy_usage.UNAVAILABLE, "usage-unavailable"
+        # Only the sign-in the same read used is named (never the last one a turn saw).
+        who = account_switch.shown(str(got.get("account") or ""))
+        return agy_usage.words(rows, "this computer's Google sign-in%s" % (", " + who if who else "")), "usage"
 
     def sspace_servers(self, init, tools=frozenset()):
         """An owner's or team turn's MCP servers: AG2 Space as this agent, over stdio through --mcp-proxy-command
@@ -709,6 +767,14 @@ class Connector:
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt, decide,
                                        self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=turn, view=self.view,
                                        media=acp_host.Media(images=media.images), model=self.models.wanted())
+
+    def renew_sign_in(self) -> bool:
+        """Start agy and open a Session, with no prompt (acp_host.start_only): agy renews its Google sign-in as it
+        starts, which a usage read alone never does, so the first ask after a long idle is answered too. Nothing
+        reaches the model. True when agy started and opened the Session."""
+        renewed = acp_host.start_only(self.client_factory, self.args, STDERR_NAME, log)
+        log("usage: agy started to renew its sign-in" if renewed else "usage: sign-in not renewed")
+        return renewed
 
     def use_app_gemini_key(self, client, init, argv):
         """Owner and collaborator turns only: agy on the Gemini API key saved in the app (gemini_key). The auth
@@ -824,6 +890,9 @@ class Connector:
         carded = self.card_task(task_id, headers, path, result_file)
         if carded:
             return carded
+        used = self.usage_task(task_id, headers, task_text, result_file)
+        if used:
+            return used
         event, _ = trigger_of(headers)
         log("wake ->", task_id, headers["access_tier"], event or "message")
         self.view.turn("%s, %s" % (headers.get("sender_name") or headers["access_tier"], kind), message)

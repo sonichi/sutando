@@ -15,8 +15,13 @@ asked, in the order account, model, core. "switch to sonnet" names its own choic
 that asks why or about a failure needs an answer, so both stay with the core (and the limit hold). The card scripts check that the
 room is the core's checked owner DM, so a card can never be posted anywhere else.
 
+Anyone but the owner asking the same (which account / model, or to switch) gets one line from here, in a
+room or a DM, and never a card (`not_owner`): team the model's name as the model card reads it
+(`model_card.py status`), a guest to ask the owner; the account is told to no one but the owner.
+
 CLI: switch_card_intercept.py <task_file> --workspace W --results-dir R [--repo REPO]
-exit 0 = the card was posted and the task answered; 1 = not ours, or not done (the core takes it).
+exit 0 = the card was posted and the task answered; 1 = not ours, or not done (the core takes it);
+2 = recognised but its line not written (the watcher holds it and asks again, never the core).
 """
 from __future__ import annotations
 
@@ -33,7 +38,10 @@ _SRC = Path(__file__).resolve().parent
 _REPO = _SRC.parent
 sys.path.insert(0, str(_SRC))
 
+import card_words  # noqa: E402
+
 POST_TIMEOUT_S = 45
+ANSWERED, HELD = "switch-card-answered", "switch-card-held"
 
 _ACCOUNT = ("switch account", "switch accounts", "switch my account", "change account", "change my account",
             "switch the account", "change the account", "another account", "use another account",
@@ -171,9 +179,7 @@ def limit_in_room(workspace: Path, now=time.time) -> str:
 
 # No switch is made in a room with other people in it, and no card that switches is posted there: the
 # owner asking there is told so in one line, in their language, and the core never sees it.
-IN_ROOM = "Switching the account or model isn't available in a room. Please ask me in our DM."
-IN_ROOM_ZH = "房间里不能切换账号或模型，请到私聊里找我。"
-_CJK = re.compile(r"[\u3400-\u9fff]")
+IN_ROOM, IN_ROOM_ZH = card_words.IN_ROOM, card_words.IN_ROOM_ZH
 
 
 def in_room(task_text: str, workspace: Optional[Path] = None) -> str:
@@ -185,7 +191,68 @@ def in_room(task_text: str, workspace: Optional[Path] = None) -> str:
     if (parsed.headers.get("channel_kind") or "").strip() == "dm":
         return ""
     _reply, words = ltp.split_reply_context(ltp.sender_words(parsed))
-    return IN_ROOM_ZH if _CJK.search(words or "") else IN_ROOM
+    return IN_ROOM_ZH if card_words.is_zh(words) else IN_ROOM
+
+
+# Anyone but the owner asking which account or model, or to switch, is answered here (card_words).
+MODEL_NAME, MODEL_NAME_ZH = card_words.MODEL_NAME, card_words.MODEL_NAME_ZH
+MODEL_UNKNOWN, MODEL_UNKNOWN_ZH = card_words.MODEL_UNKNOWN, card_words.MODEL_UNKNOWN_ZH
+ACCOUNT_OWNER_ONLY, ACCOUNT_OWNER_ONLY_ZH = card_words.ACCOUNT_OWNER_ONLY, card_words.ACCOUNT_OWNER_ONLY_ZH
+SWITCH_OWNER_ONLY, SWITCH_OWNER_ONLY_ZH = card_words.SWITCH_OWNER_ONLY, card_words.SWITCH_OWNER_ONLY_ZH
+ASK_OWNER, ASK_OWNER_ZH = card_words.ASK_OWNER, card_words.ASK_OWNER_ZH
+STATUS_TIMEOUT_S = 30
+SAY_TRIES = 3
+
+# A bare request that asks to switch ("switch account", "/model"), not which one is in use ("account", "which model").
+_SWITCHES = re.compile(r"\b(?:switch|change|another|different|pick)\b|^/|换|切", re.I)
+sender_tier = card_words.sender_tier
+
+
+def not_owner(task_text: str, workspace: Optional[Path] = None) -> Optional[dict]:
+    """{tier, kinds, switch, zh} when a sender who is not the owner asks which account or model the core is
+    on, or asks it to switch (the owner's own recognisers, and a pick by name), in a room or a DM; else None."""
+    import local_task_protocol as ltp
+    import task_envelope
+    parsed = task_envelope.attested_task_headers(task_text, workspace)
+    h = parsed.headers
+    tier = sender_tier(h)
+    if not tier or not (h.get("channel_kind") or "").strip() or not (h.get("channel_id") or "").strip():
+        return None
+    if (h.get("interaction_type") or "message").strip() != "message":
+        return None
+    if (h.get("content_modalities") or "text").strip() not in ("", "text"):
+        return None
+    _reply, words = ltp.split_reply_context(ltp.sender_words(parsed))
+    bare = kind_of(words)
+    kinds = list(dict.fromkeys(kinds_of(words) + sorted(card_words.owner_only_kinds(words))))
+    switch = bool(bare and _SWITCHES.search(normalize(words))) or card_words.names_a_pick(normalize(words))
+    if not switch and not set(kinds) & {"account", "model"}:
+        return None     # a question about the core alone, or other words: the core's
+    return {"tier": tier, "kinds": kinds, "switch": switch, "zh": card_words.is_zh(words)}
+
+
+def model_name(workspace: Path, repo: Path = _REPO, run=subprocess.run) -> str:
+    """The model in use as the model card names it (`model_card.py status`), '' when it cannot be read or
+    no record says which: status names a default even then, with `model` null, and that is not a fact."""
+    argv = [sys.executable, str(repo / "skills" / "model-switch" / "scripts" / "model_card.py"),
+            "--workspace", str(workspace), "status"]
+    try:
+        done = run(argv, capture_output=True, text=True, timeout=STATUS_TIMEOUT_S, stdin=subprocess.DEVNULL)
+        out = json.loads((done.stdout or "").strip().splitlines()[-1]) if done.returncode == 0 else {}
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return ""
+    if not isinstance(out, dict) or not out.get("model") or not out.get("source"):
+        return ""
+    name = out.get("name")
+    return " ".join(name.split()) if isinstance(name, str) else ""
+
+
+def not_owner_line(asked: dict, workspace: Path, repo: Path = _REPO, run=subprocess.run) -> str:
+    """What a sender who is not the owner is told: never the account, and the model's name to team only."""
+    kinds = asked.get("kinds", ())
+    told = asked["tier"] == "team" and not asked.get("switch") and "model" in kinds
+    return card_words.not_owner_line(asked["tier"], kinds, bool(asked.get("switch")), bool(asked.get("zh")),
+                                     model_name(workspace, repo, run) if told else "")
 
 
 def say_in_room(results_dir: Path, filename: str, line: str) -> bool:
@@ -240,39 +307,50 @@ def answer(results_dir: Path, filename: str, kind: str) -> bool:
 
 
 def intercept(task_file: Path, workspace: Path, results_dir: Path, repo: Path = _REPO,
-              run=subprocess.run, log=None) -> bool:
+              run=subprocess.run, log=None) -> str:
+    """ANSWERED, HELD (recognised, its line not written: never the core's, the watcher holds and retries it),
+    or '' (not ours, or not done: the core takes it)."""
     log = log or (lambda msg: print(f"switch-card: {msg}", file=sys.stderr, flush=True))
     try:
         text = Path(task_file).read_text(encoding="utf-8", errors="replace")
         req = request(text, workspace)
     except Exception as exc:  # noqa: BLE001 - never stand between a task and the core
         log(f"{Path(task_file).name}: not read ({type(exc).__name__}); the core takes it")
-        return False
+        return ""
     if req is None:
-        return False
+        try:
+            asked = not_owner(text, workspace)
+        except Exception as exc:  # noqa: BLE001 - never stand between a task and the core
+            log(f"{Path(task_file).name}: not read ({type(exc).__name__}); the core takes it")
+            return ""
+        if asked is None:
+            return ""
+        line = not_owner_line(asked, workspace, repo, run)
+        if not any(say_in_room(results_dir, Path(task_file).name, line) for _ in range(SAY_TRIES)):
+            log(f"{Path(task_file).name}: the line to a {asked['tier']} sender was not written; held from the core")
+            return HELD
+        log(f"{Path(task_file).name}: a {asked['tier']} sender asked about the account or model; answered in one line")
+        return ANSWERED
     line = in_room(text, workspace)
     if line:
         line = limit_in_room(workspace) or line     # out of usage: the limit is the answer in a room too
         if not say_in_room(results_dir, Path(task_file).name, line):
             log(f"{Path(task_file).name}: the in-room line was not written; the core takes it")
-            return False
+            return ""
         log(f"{Path(task_file).name}: a {req['kind']} request in a room; answered in one line, no card")
-        return True
+        return ANSWERED
     lead = limit_lead(workspace)
     if lead:
         req = dict(req, lead=lead, kind="quota", kinds=["quota"])   # one limit card, whatever was asked
     if not post(req, workspace, repo, run):
         log(f"{Path(task_file).name}: the {req['kind']} card was not posted; the core takes it")
-        return False
+        return ""
     what = " and ".join(req.get("kinds") or [req["kind"]])
     if not answer(results_dir, Path(task_file).name, what):
         log(f"{Path(task_file).name}: the {req['kind']} card was posted but the result was not written")
-        return True  # the card is out; a core answer now would be a second reply
+        return ANSWERED  # the card is out; a core answer now would be a second reply
     log(f"{Path(task_file).name}: posted the {req['kind']} card; answered without the core")
-    return True
-
-
-ANSWERED = "switch-card-answered"
+    return ANSWERED
 
 
 def main(argv=None) -> int:
@@ -282,10 +360,11 @@ def main(argv=None) -> int:
     ap.add_argument("--results-dir", required=True)
     ap.add_argument("--repo", default=str(_REPO))
     a = ap.parse_args(argv)
-    if not intercept(Path(a.task_file), Path(a.workspace), Path(a.results_dir), Path(a.repo)):
+    verdict = intercept(Path(a.task_file), Path(a.workspace), Path(a.results_dir), Path(a.repo))
+    if not verdict:
         return 1
-    print(ANSWERED, flush=True)  # the watcher needs this word, so a stub interpreter never swallows a task
-    return 0
+    print(verdict, flush=True)  # the watcher needs this word, so a stub interpreter never swallows a task
+    return 0 if verdict == ANSWERED else 2
 
 
 if __name__ == "__main__":
