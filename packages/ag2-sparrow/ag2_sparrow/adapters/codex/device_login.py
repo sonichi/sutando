@@ -52,6 +52,8 @@ from ...detached_login import ANSI_RE, born, locked, read_json, write_private
 LOGIN_WAIT_S, TAP_FRESH_S, GRACE_S = 300.0, 300.0, 30.0
 LINK_WAIT_S, LOGOUT_WAIT_S, STOP_WAIT_S = 20.0, 30.0, 5.0
 STATE = "codex-device-login"
+# Card edits still owed (room, event, the replacement's kind), kept apart from the sign-in: never a code or link.
+WITHDRAW_FILE = "codex-device-withdraw.json"
 STAGING = "home"
 DEVICE_CARD, WITHDRAWN_CARD = "account-device", "account-device-withdrawn"
 ADD, USE, DISCARD, SIGN_OUT = "add", "use", "discard", "signout"
@@ -423,13 +425,35 @@ class Remote:
             self.log("device sign-in ended: another sign-in was started")
 
     def withdraw(self, room, cards, keep="") -> None:
-        """Show every card of this sign-in but `keep` (which gets its outcome) without the link or code."""
+        """Show every card of this sign-in but `keep` (which gets its outcome) without the link or code. An
+        edit that cannot be queued now is kept owed and tried again on each upkeep (`retry`)."""
+        owed = self.owed() + [{"room": room, "event": e, "kind": WITHDRAWN_CARD} for e in cards if e != keep and room]
+        self._keep_owed(owed)
+        self.retry()
+
+    def owed(self) -> list:
+        data = read_json(self.dir.parent / WITHDRAW_FILE).get("owed")
+        return [o for o in data if isinstance(o, dict) and o.get("room") and o.get("event")] if isinstance(data, list) else []
+
+    def _keep_owed(self, owed) -> None:
+        path = self.dir.parent / WITHDRAW_FILE
+        if owed:
+            write_private(path, {"owed": owed})
+        elif path.exists():
+            path.unlink()
+
+    def retry(self) -> int:
+        """Queue each owed withdrawal; those that still cannot be are kept. How many are left."""
         agent_card, _ = connector_cards._core()
         gone = agent_card.build(WITHDRAWN_CARD, "expired", title="Account", body="Account of %s" % self.accounts.name,
                                 text="This sign-in card is no longer in use.")
-        for event in cards:
-            if event != keep and room and not self.accounts.post(room, gone, edit=event):
-                self.log("device sign-in card not withdrawn:", event[:40])
+        owed = self.owed()
+        left = [o for o in owed if not self.accounts.post(o["room"], gone, edit=o["event"])]
+        for o in left:
+            self.log("device sign-in card not withdrawn yet:", str(o["event"])[:40])
+        if left != owed:
+            self._keep_owed(left)
+        return len(left)
 
     def tapped(self, verb, sent, result_file) -> str:
         agent_card, _ = connector_cards._core()
@@ -541,6 +565,8 @@ class Remote:
 
     def tick(self, now=None) -> str:
         """What became of a sign-in, shown in place of its card: the link and code never stay on screen."""
+        if self.owed():
+            self.retry()
         done = over(self.dir, self.codex, self.env, run=self.run, now=now)
         if not done:
             return ""
@@ -558,9 +584,10 @@ class Remote:
             built = self.accounts.card("error", "The sign-in did not finish (%s). %s" % (why.rstrip("."), self.accounts.using()),
                                        ask=True)
             outcome = "account-device-failed"
-        if done["room"] and not self.accounts.post(done["room"], built, edit=done["edit"]):
-            self.log("device sign-in outcome not shown:", outcome)
-        self.withdraw(done["room"], done["cards"], keep=done["edit"])
+        shown = bool(done["room"]) and self.accounts.post(done["room"], built, edit=done["edit"])
+        if not shown:
+            self.log("device sign-in outcome not shown:", outcome)      # its card is withdrawn instead
+        self.withdraw(done["room"], done["cards"], keep=done["edit"] if shown else "")
         self.log("device sign-in ->", outcome)
         return outcome
 

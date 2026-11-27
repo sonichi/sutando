@@ -658,6 +658,35 @@ class RemoteUnitTest(Home, unittest.TestCase):
         self.assertEqual(r.tapped(dl.SIGN_OUT, self.OWNER, "out"), "account-not-signed-out")
         r.accounts.card.assert_called_with("error", "I could not sign out: %s." % dl.SHARED, ask=True)
 
+    def test_a_withdrawal_that_cannot_be_queued_is_retried_on_the_next_upkeep(self):
+        self.mode("fail")
+        r = self.remote(posted=False)
+        dl.start(str(self.codex), self.env, r.dir)
+        dl.note_card(r.dir, "!dm:s", "$e1")
+        dl.note_card(r.dir, "!dm:s", "$e2")
+        end = time.time() + 15
+        while not (r.dir / "result.json").exists() and time.time() < end:
+            time.sleep(0.05)
+        self.assertEqual(r.tick(), "account-device-failed")
+        record = self.state / dl.WITHDRAW_FILE
+        self.assertEqual(oct(record.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(json.loads(record.read_text()), {"owed": [
+            {"room": "!dm:s", "event": "$e1", "kind": dl.WITHDRAWN_CARD},
+            {"room": "!dm:s", "event": "$e2", "kind": dl.WITHDRAWN_CARD}]}, "no code or link kept")
+        self.assertFalse(r.dir.exists(), "the sign-in itself is gone")
+        self.assertEqual(r.tick(), "")
+        self.assertTrue(record.exists(), "still owed while nothing can be queued")
+        r.accounts.post.reset_mock(return_value=True)
+        r.accounts.post.return_value = True
+        self.assertEqual(r.tick(), "")
+        self.assertFalse(record.exists())
+        queued = [(c.args[0], c.kwargs["edit"], c.args[1][1]) for c in r.accounts.post.call_args_list]
+        self.assertEqual([(room, edit, card["id"]) for room, edit, card in queued],
+                         [("!dm:s", "$e1", dl.WITHDRAWN_CARD), ("!dm:s", "$e2", dl.WITHDRAWN_CARD)])
+        self.assertFalse(any(CODE in json.dumps(card) or "auth.openai.com" in json.dumps(card) for *_, card in queued))
+        self.assertEqual(r.tick(), "")
+        self.assertEqual(len(r.accounts.post.call_args_list), 2, "each withdrawal queued once")
+
     def test_an_outcome_whose_card_cannot_be_shown_is_logged(self):
         self.mode("fail")
         r = self.remote(posted=False)
