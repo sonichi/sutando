@@ -153,29 +153,24 @@ def _parsed(text, nonce: str) -> dict:
 
 
 def receive(root, rec: dict):
-    """`rec` with the app's answer to it kept in sparrow's own record ("outcome") before the app's receipt is
-    removed, so an answer is never lost between the two; None while there is no answer. The receipt is
-    moved aside first (only one reader ever has it) and put back when the record cannot be written."""
-    if isinstance(rec.get("outcome"), dict):
-        return rec
-    nonce = rec["nonce"]
-    path = Path(rec["config_dir"]) / (RESULT % nonce)
-    mine = path.with_name("%s.taken-%s" % (path.name, uuid.uuid4().hex))
-    try:
-        os.rename(str(path), str(mine))
-    except OSError:
-        return None
-    try:
-        text, _ = read_regular(str(mine), FILE_MAX, follow=False)
-        rec = dict(rec, outcome=_parsed(text, nonce))
-        save(root, rec)
-    except OSError:
+    """`rec` with the app's answer to it kept in sparrow's own record ("outcome"); None while there is no
+    answer. Called under the switch lock only. The receipt is read where it is, the answer saved (a whole
+    write), and only then the receipt removed: a stop between any two steps leaves either the receipt or
+    the saved answer, never neither, and a receipt whose answer is already kept is just removed."""
+    path = Path(rec["config_dir"]) / (RESULT % rec["nonce"])
+    if not isinstance(rec.get("outcome"), dict):
+        text, why = read_regular(str(path), FILE_MAX, follow=False)
+        if text is None and not why:
+            return None
+        rec = dict(rec, outcome=_parsed(text, rec["nonce"]))
         try:
-            os.rename(str(mine), str(path))
+            save(root, rec)
         except OSError:
-            pass
-        return None
-    mine.unlink(missing_ok=True)
+            return None
+    try:
+        path.unlink()
+    except OSError:
+        pass        # gone already, or removed on the next look; the answer is kept either way
     return rec
 
 

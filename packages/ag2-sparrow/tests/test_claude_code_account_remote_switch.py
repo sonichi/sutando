@@ -348,16 +348,35 @@ class Watch(Remote):
         self.assertEqual(self.texts(), [("$acct", "Switched to %s." % A)])
         self.assertEqual(rm.outstanding(self.root), [], "dropped only once queued")
 
-    def test_a_receipt_is_put_back_when_the_answer_cannot_be_kept(self):
+    def test_a_stop_after_reading_the_receipt_before_keeping_it_still_tells_it_after_the_restart(self):
         nonce = self.begun()
         self.claim_it(nonce)
         self.result(nonce, ok=True, label=A)
+        with mock.patch.object(rm, "save", side_effect=KeyboardInterrupt("killed")), self.assertRaises(KeyboardInterrupt):
+            rm.watch(self.root, nonce)
+        self.assertTrue((self.config / (rm.RESULT % nonce)).exists(), "the receipt is where the app left it")
+        self.assertEqual([p.name for p in self.config.iterdir()], [rm.RESULT % nonce], "no file under another name")
         with mock.patch.object(rm, "save", side_effect=OSError("disk full")):
             self.assertIsNone(rm.receive(self.root, rm.load(self.root, nonce)))
         self.assertTrue((self.config / (rm.RESULT % nonce)).exists())
-        with mock.patch.object(rm, "save", side_effect=OSError("disk full")), \
-                mock.patch.object(rm.os, "rename", side_effect=[None, OSError("gone")]):
-            self.assertIsNone(rm.receive(self.root, rm.load(self.root, nonce)))
+        self.assertEqual(rm.recover(self.root), 0, "the restart's check tells it")
+        self.assertEqual(self.texts(), [("$acct", "Switched to %s." % A)])
+        self.assertEqual((list(self.config.iterdir()), rm.outstanding(self.root)), ([], []))
+
+    def test_a_stop_after_keeping_the_answer_before_removing_the_receipt_tells_it_once(self):
+        nonce = self.begun()
+        self.claim_it(nonce)
+        self.result(nonce, ok=True, label=A)
+        rec = rm.load(self.root, nonce)
+        rm.save(self.root, dict(rec, outcome={"nonce": nonce, "ok": True, "label": A}))     # then the stop
+        self.assertEqual(rm.settle_late(self.root), ["Switched to %s." % A])
+        self.assertEqual(rm.settle_late(self.root), [])
+        self.assertEqual(rm.recover(self.root), 0)
+        self.assertEqual(self.texts(), [("$acct", "Switched to %s." % A)], "one card")
+        self.assertEqual((list(self.config.iterdir()), rm.outstanding(self.root)), ([], []))
+        with mock.patch.object(rm.Path, "unlink", side_effect=PermissionError("ro")):
+            kept = dict(rec, outcome={"nonce": nonce, "ok": True})
+            self.assertEqual(rm.receive(self.root, kept), kept, "a receipt that cannot be removed yet is left")
 
     def test_an_app_restart_mid_switch_says_the_account_now_never_that_it_failed(self):
         nonce = self.begun()
