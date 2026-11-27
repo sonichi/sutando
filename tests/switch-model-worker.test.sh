@@ -9,34 +9,43 @@ CORE="$T/claude-core"; STATE="$T/ws/state"
 mkdir -p "$T/bin" "$T/tmp" "$T/proc" "$T/panes" "$CORE/skills" "$STATE/workers/$A" "$STATE/workers/$B"
 cat > "$T/bin/tmux" <<'SH'
 #!/usr/bin/env bash
-sock=""; prev=""; for a in "$@"; do [ "$prev" = -S ] && sock="$a"; prev="$a"; done; panes="$FAKE_ROOT/panes/$(basename "$sock")"
-swap() { [ "${FAKE_SWAP%%:*}" = "$1" ] && { r="${FAKE_SWAP#*:}"; echo "${r#*:}" > "$panes/${r%%:*}"; }; }
+sock=""; prev=""; for a in "$@"; do [ "$prev" = -S ] && sock="$a"; prev="$a"; done; sb="$(basename "$sock")"; panes="$FAKE_ROOT/panes/$sb"
+# A pane is "<pane id> <pid>" in its session's file; a target is a session name or a pane id.
+pid_of() { case "$1" in %*) cat "$panes"/* 2>/dev/null | awk -v id="$1" '$1==id{print $2}';; *) awk '{print $2}' "$panes/$1" 2>/dev/null;; esac; }
+swap() { [ "${FAKE_SWAP%%:*}" = "$1" ] && { r="${FAKE_SWAP#*:}"; f="$panes/${r%%:*}"; echo "$(awk '{print $1}' "$f") ${r#*:}" > "$f"; }; }
 # A send bound to a pane pid is withheld, as tmux withholds it, when the pane now has another process.
 want="$(printf '%s' "$*" | sed -n 's/.*#{==:#{pane_pid},\([0-9]*\)}.*/\1/p')"
 if [ -n "$want" ]; then
   to="$(printf '%s' "$*" | sed -n "s/.*copy-mode -q -t '\([^']*\)' ; .*/\1/p")"
-  [ "$(cat "$panes/$to" 2>/dev/null)" = "$want" ] || { echo "WITHHELD $to" >> "$TMUX_LOG"; exit 1; }
+  [ "$(pid_of "$to")" = "$want" ] || { echo "WITHHELD $to" >> "$TMUX_LOG"; exit 1; }
 fi
 . "$TMUX_FAKE_UNWRAP"
 printf '%s\n' "$*" >> "$TMUX_LOG"
-session=""; prev=""; for a in "$@"; do [ "$prev" = -t ] && session="${a#=}"; prev="$a"; done
+target=""; prev=""; for a in "$@"; do [ "$prev" = -t ] && target="${a#=}"; prev="$a"; done
 case " $* " in
   *" list-windows "*) echo 0; exit 0;;
-  *" has-session "*) [ -f "$panes/$session" ]; exit $?;;
-  *" list-panes "*) [ -f "$panes/$session" ] || exit 1; cat "$panes/$session"; swap "panes$(grep -c ' list-panes ' "$TMUX_LOG")"; exit 0;;
+  *" has-session "*) [ -f "$panes/$target" ]; exit $?;;
+  *" list-panes "*) [ -f "$panes/$target" ] || exit 1; cat "$panes/$target"; swap "panes$(grep -c ' list-panes ' "$TMUX_LOG")"; exit 0;;
   *" send-keys "*" Enter ") swap enter;;
 esac
 case " $* " in *" capture-pane "*)
-  # One acceptance line per /model sent; the pick is saved in the folder that session runs in.
+  bound=""; case " $* " in *" display-message -p "*" ; capture-pane "*) bound="$(pid_of "$target")"; [ -n "$bound" ] || exit 1; echo "$bound";; esac
+  seen=""; prev=""; for a in "$@"; do [ "$a" = capture-pane ] && seen=1; [ -n "$seen" ] && [ "$prev" = -t ] && { target="$a"; break; }; prev="$a"; done
+  # One acceptance line per /model sent, on the pane it was sent to; the pick is saved in the folder that session runs in.
   acc=""; sent="$(grep -- "-l /model" "$TMUX_LOG" | tail -1)"
-  if [ -n "$sent" ]; then
+  if [ -n "$sent" ] && [ -z "${FAKE_NO_ACCEPT:-}" ]; then
     model="${sent##*-l /model }"; session="$(printf '%s' "$sent" | sed 's/.*send-keys -t \([^ ]*\) .*/\1/')"
     case "$model" in opus) name="Opus 5";; haiku) name="Haiku 4.5";; sonnet) name="Sonnet 5";; *) name="$model";; esac
-    acc="  ⎿  Set model to $name and saved as your default\n"
-    folder="$(cat "$FAKE_ROOT/proc/$session.folder" 2>/dev/null)"
-    [ -n "$folder" ] && printf '{"model":"%s"}\n' "$model" > "$folder/settings.json"
+    if [ "$target" = "$session" ] || [ "$target" = "$(awk '{print $1}' "$panes/$session" 2>/dev/null)" ]; then
+      acc="  ⎿  Set model to $name and saved as your default\n"
+      folder="$(cat "$FAKE_ROOT/proc/$session.folder" 2>/dev/null)"
+      [ -n "$folder" ] && printf '{"model":"%s"}\n' "$model" > "$folder/settings.json"
+    fi
   fi
-  printf '%b' "$acc────\n❯ \n────\n";; esac
+  # What some other pane shows once a /model was sent: text planted for this exact target on this socket.
+  [ -n "$sent" ] && acc="$acc$(cat "$FAKE_ROOT/screen/$sb/$target" 2>/dev/null)"
+  printf '%b' "$acc────\n❯ \n────\n"
+  [ -n "$bound" ] && echo "$bound";; esac
 exit 0
 SH
 cat > "$T/bin/pgrep" <<'SH'
@@ -59,7 +68,7 @@ proc() { # proc PID SESSION FOLDER [ENV-OVERRIDE]
   echo "claude --name $2 --dangerously-skip-permissions" > "$T/proc/$1.args"
   printf '%s' "${4-HOME=$T SUTANDO_TMUX_SESSION=$2 CLAUDE_CONFIG_DIR=$3 PATH=/usr/bin}" > "$T/proc/$1.env"
 }
-pane() { mkdir -p "$T/panes/$1"; echo "$3" > "$T/panes/$1/$2"; }   # pane SOCKET SESSION PID
+pane() { mkdir -p "$T/panes/$1"; echo "%$3 $3" > "$T/panes/$1/$2"; }   # pane SOCKET SESSION PID
 FOLDER="$HERE/skills/worker-pool/scripts/worker_claude_folder.py"
 printf '{"model":"claude-opus-5","permissions":{"allow":["Bash"]}}\n' > "$CORE/settings.json"; echo '{}' > "$CORE/.claude.json"
 OWN_A="$(python3 "$FOLDER" ensure "$CORE" "$A")"; OWN_B="$(python3 "$FOLDER" ensure "$CORE" "$B")"; OWN_C="$(python3 "$FOLDER" ensure "$CORE" "$C")"
@@ -137,10 +146,26 @@ replaced 7 && grep -q "WITHHELD sutando-worker-$A" "$TMUX_LOG" && ! grep -q -- "
   && ok "P1d pane replaced between the last check and the send: the send is bound to the checked pid and withheld, nothing recorded" || fail "P1d" "rc=$rc $(cat "$T/err") $(cat "$TMUX_LOG")"
 echo "$T/elsewhere" > "$T/proc/sutando-worker-$A.folder"
 rc=$(run $(worker_as "$A") "FAKE_SWAP=enter:sutando-worker-$A:301" -- opus)
-replaced 15 && grep -q "after the send" "$T/err" && ok "P1e pane replaced after the send: exit 15, nothing recorded" || fail "P1e" "rc=$rc $(cat "$T/err")"
+replaced 15 && grep -q "while waiting for acceptance" "$T/err" && ok "P1e pane replaced after the send: the read of the replaced pane is refused (exit 15), nothing recorded" || fail "P1e" "rc=$rc $(cat "$T/err")"
 echo "$OWN_A" > "$T/proc/sutando-worker-$A.folder"; printf '{"model":"haiku"}\n' > "$OWN_A/settings.json"
-printf '102\n103\n' > "$T/panes/x.sock/sutando-worker-$A"; rc=$(run $(worker_as "$A") -- opus)
+printf '%%102 102\n%%103 103\n' > "$T/panes/x.sock/sutando-worker-$A"; rc=$(run $(worker_as "$A") -- opus)
 replaced 15 && ! grep -q send-keys "$TMUX_LOG" && ok "P1f a session with more than one pane: exit 15, nothing sent" || fail "P1f" "rc=$rc $(cat "$T/err")"
+
+# acceptance is read from the checked pane only: the same text anywhere else never counts
+ACCEPTED='  ⎿  Set model to Opus 5 and saved as your default\n'
+mkdir -p "$T/screen/x.sock" "$T/screen/y.sock"; pane y.sock "sutando-worker-$A" 302; proc 302 "sutando-worker-$A" "$OWN_A"
+printf '%s' "$ACCEPTED" > "$T/screen/y.sock/%302"; printf '%s' "$ACCEPTED" > "$T/screen/y.sock/sutando-worker-$A"
+rc=$(run $(worker_as "$A") FAKE_NO_ACCEPT=1 -- opus --accept-timeout 1)
+replaced 8 && ok "P3a the acceptance line is on a same-named session's pane on another socket: not counted (exit 8), nothing recorded" || fail "P3a" "rc=$rc $(cat "$T/err")"
+printf '%s' "$ACCEPTED" > "$T/screen/x.sock/sutando-worker-$A"; printf '%s' "$ACCEPTED" > "$T/screen/x.sock/%999"
+rc=$(run $(worker_as "$A") FAKE_NO_ACCEPT=1 -- opus --accept-timeout 1)
+replaced 8 && ! grep -q -- "capture-pane -p -t sutando-worker-$A" "$TMUX_LOG" && grep -q -- "capture-pane -p -t %102" "$TMUX_LOG" \
+  && ok "P3b the acceptance line is on another pane the session name would reach: reads go to the checked pane id, not counted (exit 8)" || fail "P3b" "rc=$rc $(cat "$T/err")"
+rm -rf "$T/screen" "$T/panes/y.sock/sutando-worker-$A"
+printf '%s' "$ACCEPTED" > "$T/accepted"; mkdir -p "$T/screen/x.sock"; cp "$T/accepted" "$T/screen/x.sock/%102"
+rc=$(run $(worker_as "$A") FAKE_NO_ACCEPT=1 "FAKE_SWAP=enter:sutando-worker-$A:301" -- opus)
+replaced 15 && grep -q "while waiting for acceptance" "$T/err" && ok "P3c the acceptance line is on the pane after its process was replaced: not counted (exit 15), nothing recorded" || fail "P3c" "rc=$rc $(cat "$T/err")"
+rm -rf "$T/screen"
 
 # a worker folder that is a link is not that worker's own, wherever it points
 F=ffffffffffffffffffffffffffffffff; G=0000000000000000000000000000000a; H=0000000000000000000000000000000b; WORKERS="$(dirname "$OWN_A")"

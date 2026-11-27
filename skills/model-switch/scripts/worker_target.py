@@ -11,14 +11,15 @@ core instead.
                            [--caller-worker ID]
       prints `core` or `worker <id>`; exit 14 when the target cannot be told.
   worker_target.py folder --core-folder DIR --worker ID --session S --socket PATH
-      prints the worker's own Claude folder and, on the next line, the pid of the pane a send to S on
-      that socket reaches, when that pane's processes run in that folder; exit 15 otherwise (the
+      prints the worker's own Claude folder, then the id and the pid of the pane a send to S on that
+      socket reaches (one per line), when that pane's processes run in that folder; exit 15 otherwise (the
       core's folder, another one, a linked folder, or an environment that cannot be read).
 """
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -27,6 +28,9 @@ REPO = Path(__file__).resolve().parents[3]
 POOL = REPO / "skills" / "worker-pool" / "scripts"
 UNIDENTIFIED_RC, NOT_OWN_FOLDER_RC = 14, 15
 PREFIX = "sutando-worker-"   # a pool worker's tmux session; checked against the pool's own naming
+
+
+_PANE_ID = re.compile(r"^%[0-9]+$")   # tmux never reuses one within a server
 
 
 class Refused(Exception):
@@ -79,17 +83,17 @@ def _run(argv: list):
         return None
 
 
-def receiving_pane(socket: str, session: str, run=_run) -> str:
-    """The pid of the one pane `session` has on the tmux server at `socket`: the pane a send to that
-    session reaches. Raises Refused when that server has no such session or it has several panes."""
-    out = run(["tmux", "-S", socket, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid}"])
+def receiving_pane(socket: str, session: str, run=_run) -> tuple:
+    """(pane id, pid) of the one pane `session` has on the tmux server at `socket`: the pane a send to
+    that session reaches. Raises Refused when that server has no such session or it has several panes."""
+    out = run(["tmux", "-S", socket, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_id} #{pane_pid}"])
     if out is None or out.returncode != 0:
         raise Refused(f"session '{session}' was not found on the selected tmux socket")
-    pids = [ln.strip() for ln in (out.stdout or "").splitlines() if ln.strip()]
-    if len(pids) != 1 or not pids[0].isdigit():
+    panes = [ln.split() for ln in (out.stdout or "").splitlines() if ln.strip()]
+    if len(panes) != 1 or len(panes[0]) != 2 or not _PANE_ID.match(panes[0][0]) or not panes[0][1].isdigit():
         raise Refused(f"session '{session}' does not have exactly one pane, so the pane a send reaches "
                       "cannot be told")
-    return pids[0]
+    return panes[0][0], panes[0][1]
 
 
 def _is_claude(args: str) -> bool:
@@ -147,12 +151,12 @@ def private_slot(core_folder: str, worker: str) -> Path:
 
 
 def own_folder(core_folder: str, worker: str, session: str, socket: str, run=_run, ps_runner=None) -> tuple:
-    """(the worker's own Claude folder, the receiving pane's pid), only when the processes of the
-    pane `session` has on `socket` run in that folder. A same-named process elsewhere never counts."""
+    """(the worker's own Claude folder, the receiving pane's id, its pid), only when the processes of
+    the pane `session` has on `socket` run in that folder. A same-named process elsewhere never counts."""
     restart = (f"give worker {worker} a Claude folder of its own "
                f"(skills/worker-pool/scripts/worker_claude_folder.py ensure <core folder> {worker}) "
                "and restart it so its session runs there")
-    pane_pid = receiving_pane(socket, session, run)
+    pane_id, pane_pid = receiving_pane(socket, session, run)
     live = set()
     for pid in pane_processes(pane_pid, run):
         env = _session_env(pid, ps_runner)
@@ -176,7 +180,7 @@ def own_folder(core_folder: str, worker: str, session: str, socket: str, run=_ru
     settings = own / "settings.json"
     if settings.is_symlink() or not settings.is_file():
         raise Refused(f"worker {worker}'s folder has no settings file of its own; {restart}")
-    return own, pane_pid
+    return own, pane_id, pane_pid
 
 
 def main(argv=None) -> int:

@@ -63,7 +63,7 @@ else
 fi
 # A worker: the pane this send reaches, on this socket, must run in a Claude folder of its own.
 # In the core's (or one that cannot be read) it is refused (exit 15): nothing sent, nothing recorded.
-REC_DIR="$STATE_DIR"; EXPECT=(); CHECKED=""
+REC_DIR="$STATE_DIR"; EXPECT=(); PANE=(); CHECKED=""
 worker_check() { "$PY" "$HERE/worker_target.py" folder --core-folder "$BRAIN" --worker "$WORKER" --session "$SESSION" --socket "$SOCK" 2>&1; }
 # The same pane, process and folder as first checked; the core's switch has no such check.
 same_pane() { [ "$KIND" = core ] || [ "$(worker_check)" = "$CHECKED" ]; }
@@ -72,14 +72,16 @@ if [ "$KIND" = worker ]; then
   REC_DIR="$STATE_DIR/workers/$WORKER"
   if [ -n "$OFFLINE" ]; then echo "switch-model: refused — --offline writes the core's settings; worker $WORKER is switched while it runs. Nothing changed." >&2; exit 2; fi
   CHECKED="$(worker_check)"; ORC=$?
-  OWN="${CHECKED%%$'\n'*}"; PANE_PID="${CHECKED##*$'\n'}"
-  case "$PANE_PID" in ''|*[!0-9]*) ORC=1;; esac
+  { IFS= read -r OWN; IFS= read -r PANE_ID; IFS= read -r PANE_PID; } <<EOF_PANE
+$CHECKED
+EOF_PANE
+  case "$PANE_ID:$PANE_PID" in %*:*[!0-9]*|%*:|[!%]*|:*) ORC=1;; esac
   if [ "$ORC" != 0 ] || [ ! -d "$OWN" ]; then
     OWN="$CHECKED"
     if [ -n "$DRY" ]; then echo "dry-run: session kind=worker ($WORKER, tmux -S $SOCK -t $SESSION); record $REC_DIR/model-switch.json; would refuse (exit 15): ${OWN:-its Claude folder could not be checked}"; exit 0; fi
     echo "switch-model: refused — ${OWN:-its Claude folder could not be checked}; nothing sent, nothing recorded" >&2; exit 15
   fi
-  CFG="$OWN/settings.json"; EXPECT=(--expected-pid "$PANE_PID")
+  CFG="$OWN/settings.json"; EXPECT=(--expected-pid "$PANE_PID"); PANE=(--pane "$PANE_ID" --expected-pid "$PANE_PID")
   if [ -n "$DRY" ]; then
     echo "dry-run: session kind=worker ($WORKER, tmux -S $SOCK -t $SESSION); would record $REC_DIR/model-switch.json (previous read from $CFG) and send '/model $MODEL'; would not refuse: the running session uses its own Claude folder; the core's record and default are untouched"; exit 0
   fi
@@ -218,7 +220,8 @@ print(f"{prev or ''}\t{src}")
 PYEOF
 )"; PREV="${PREVLINE%%	*}"; PREV_SRC="${PREVLINE#*	}"
 # Baseline the acceptance lines for THIS model already on screen, so a stale one cannot pass as new.
-BASE="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --count)"; BRC=$?
+BASE="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --count ${PANE[@]+"${PANE[@]}"})"; BRC=$?
+[ "$BRC" = 13 ] && pane_changed "before the send; nothing sent"
 case "$BRC:$BASE" in 0:[0-9]*) ;; *) echo "switch-model: could not read the core pane before sending (rc=$BRC, '$BASE'); nothing sent, nothing recorded" >&2; exit 7;; esac
 same_pane || pane_changed "before the send; nothing sent"
 # Attribute any picker this send leaves on screen to us, so the supervisor may Esc it later (CLI > env > manifest).
@@ -234,14 +237,16 @@ elif [ "$SEND_RC" != 0 ]; then
   "$PY" "$GATE" clear --state-dir "$REC_DIR" --session "$SESSION"; echo "switch-model: send failed; nothing recorded" >&2; exit 7
 fi
 CONFIRMED=false
-VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT")"
+VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT" ${PANE[@]+"${PANE[@]}"})"
 case "$VERDICT" in
+  CHANGED) "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"; pane_changed "while waiting for acceptance";;
   ACCEPTED) "$PY" "$GATE" clear --state-dir "$REC_DIR" --session "$SESSION";;
   DIALOG)
     if [ -n "$CONFIRM" ]; then
       same_pane || { "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"; pane_changed "before the confirming Enter; not confirmed"; }
-      VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT" --answer-enter ${EXPECT[@]+"${EXPECT[@]}"})"; ANSWER_RC=$?
+      VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT" --answer-enter ${PANE[@]+"${PANE[@]}"})"; ANSWER_RC=$?
       case "$ANSWER_RC" in
+        13) "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"; pane_changed "while waiting for acceptance";;
         0|11) CONFIRMED=true;;
         125) "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"
              echo "switch-model: the confirming Enter may have applied (rc=125); picker attribution retained, nothing recorded" >&2; exit 8;;
@@ -251,7 +256,7 @@ case "$VERDICT" in
       [ "$VERDICT" = ACCEPTED ] || { "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"; echo "switch-model: confirmed the dialog but no acceptance within ${ACCEPT_TIMEOUT}s; nothing recorded" >&2; exit 8; }
       "$PY" "$GATE" clear --state-dir "$REC_DIR" --session "$SESSION"
     else
-      bash "$OBS" "$SESSION" --socket "$SOCK" --cancel ${EXPECT[@]+"${EXPECT[@]}"} > /dev/null; CANCEL_RC=$?
+      bash "$OBS" "$SESSION" --socket "$SOCK" --cancel ${PANE[@]+"${PANE[@]}"} > /dev/null; CANCEL_RC=$?
       if [ "$CANCEL_RC" != 0 ]; then
         "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"
         echo "switch-model: dialog cancel failed (rc=$CANCEL_RC); picker attribution retained, nothing recorded" >&2

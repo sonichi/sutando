@@ -93,6 +93,12 @@ other worker's. So the script first tells whose session it targets (`scripts/wor
   the checked pane pid in tmux itself (`--expected-pid`, through `scripts/tmux-send-line.sh` and
   `src/tmux-pane-keys.sh`), so keys never reach a pane replaced after the last check (exit 7 on the
   send, 8 on the Enter or Escape).
+- **What is read comes from that pane too.** The baseline count, the acceptance line and the confirm
+  dialog are captured by the checked pane's id (`pane-observe.sh --pane <id> --expected-pid <pid>`),
+  never by session name, and only while that pane's process is still the checked one (its pid is
+  read before and after each capture in one tmux command list). Text on any other pane, or on the
+  pane after its process was replaced, never counts: a lost or replaced pane is exit 15, nothing
+  recorded.
 - **Not told apart** is **exit 14**, never a switch of the core: a worker session naming no worker
   id; a session and a `SUTANDO_WORKER_ID` that name different workers (pass `--session` to name the
   one meant); a worker's session (`SUTANDO_WORKER_ID` set) whose target resolved to the core's;
