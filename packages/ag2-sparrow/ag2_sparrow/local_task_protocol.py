@@ -258,6 +258,8 @@ KNOWN_HEADER_KEYS = (
     "mentions", "mentions_you",
     # A thread message's root sender and whether this agent has posted in that thread.
     "thread_starter", "you_in_thread",
+    # The sender of the message this one replies to, and whether that sender is this agent.
+    "replied_to", "replied_to_you",
     # The room roster the gateway writes: a capped mxid list and the true joined total.
     "room_members", "room_member_count",
 )

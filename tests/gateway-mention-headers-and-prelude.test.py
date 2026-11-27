@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Gateway task file: mention facts as headers, the roster as headers, and the prelude switch.
 
-- `mentions` / `mentions_you` / `thread_starter` / `you_in_thread` are written above
-  `task:` so any engine's strict parser reads them; the two flags only as exactly true|false.
+- `mentions` / `mentions_you` / `replied_to` / `replied_to_you` / `thread_starter` /
+  `you_in_thread` are written above `task:` so any engine's strict parser reads them;
+  the three flags only as exactly true|false.
 - `room_members` / `room_member_count` are vocabulary keys, so the trusted
   parser promotes them instead of leaving them glued to the sender's text.
 - SPARROW_TASK_PRELUDE=none drops the Sutando ===SKILL INSTRUCTIONS=== block from
@@ -76,7 +77,7 @@ class MentionHeaders(_Base):
         self.assertEqual(h.get("mentions_you"), "false")
 
     def test_true_false_flags_accept_bools_and_refuse_anything_else(self):
-        for key in ("mentions_you", "you_in_thread"):
+        for key in ("mentions_you", "replied_to_you", "you_in_thread"):
             self.assertIn(f"\n{key}: true\n", self.write(f"task-mh-2{key}", **{key: True}))
             for i, bad in enumerate(("yes", "TRUE", "", None, 1)):
                 text = self.write(f"task-mh-3{key}{i}", **{key: bad})
@@ -88,6 +89,19 @@ class MentionHeaders(_Base):
         h = ltp.parse_task_headers(text).headers
         self.assertEqual((h.get("thread_starter"), h.get("you_in_thread")), ("@other:s.space", "false"))
         self.assertEqual(ltp.parse_task_headers_trusted(text).headers.get("thread_root"), "$root")
+
+    def test_reply_facts_are_read_by_the_strict_parser(self):
+        text = self.write("task-mh-8", replied_to="@other:s.space", replied_to_you="false")
+        h = ltp.parse_task_headers(text).headers
+        self.assertEqual((h.get("replied_to"), h.get("replied_to_you")), ("@other:s.space", "false"))
+
+    def test_existing_context_keys_are_headers_not_body(self):
+        parsed = ltp.parse_task_headers_trusted(self.write(
+            "task-mh-9", reply_to_me="false", reply_to_sender="@other:s.space", thread_root="$root"))
+        for k in ("reply_to_me", "reply_to_sender", "room_members", "room_member_count",
+                  "channel_kind", "thread_root"):
+            self.assertIn(k, parsed.headers, k)
+            self.assertNotIn(f"{k}:", parsed.body, k)
 
     def test_absent_on_the_wire_writes_no_line(self):
         text = self.write("task-mh-4")

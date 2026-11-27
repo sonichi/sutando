@@ -2901,7 +2901,8 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 "card_click",
                 # The broker's mention and thread facts (true|false branch below). Above "task" so
                 # any engine's strict parser reads them and a body cannot claim them.
-                "mentions", "mentions_you", "thread_starter", "you_in_thread",
+                "mentions", "mentions_you", "replied_to", "replied_to_you",
+                "thread_starter", "you_in_thread",
                 "task",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
@@ -6914,7 +6915,7 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
         elif f == "owner_mentioned":
             if task.get(f) == "true":  # the broker's exact string only; nothing else is a claim
                 lines.append("owner_mentioned: true")
-        elif f in ("mentions_you", "you_in_thread"):
+        elif f in ("mentions_you", "replied_to_you", "you_in_thread"):
             _mv = task.get(f)
             _mv = ("true" if _mv else "false") if isinstance(_mv, bool) else _mv
             if _mv in ("true", "false"):
