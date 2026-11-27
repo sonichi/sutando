@@ -3,8 +3,8 @@
 
 - Only the whole message counts: "switch account", "换账号", "/model", "switch core" and their
   polite forms; "switch to sonnet" or a sentence that merely mentions an account does not.
-- Only an owner-tier DM whose task envelope verifies; a room, a team sender or a forged
-  header-looking body line is never intercepted.
+- Only an owner-tier task whose envelope verifies; a team sender or a forged header-looking body
+  line is never intercepted. In a room the owner gets one line saying to ask in the DM, never a card.
 - A posted card publishes `[no-send]` for the task; a card that is not posted leaves the task to the core.
 - The watcher asks it before it announces a task (src/watch-tasks-stream.sh).
 
@@ -75,7 +75,8 @@ class Request(unittest.TestCase):
         self.assertEqual(req["kind"], "account")
 
     def test_room_team_and_unsigned_are_left(self):
-        self.assertIsNone(sci.request(self.stamped(task("switch account", kind="room")), self.ws))
+        # A room is taken (it gets the in-room line, InRoom below); a team sender and an unsigned task are not.
+        self.assertEqual(sci.request(self.stamped(task("switch account", kind="room")), self.ws)["kind"], "account")
         self.assertIsNone(sci.request(self.stamped(task("switch account", tier="team")), self.ws))
         # Unverified, a task-mid file's trailing headers are not read at all.
         self.assertIsNone(sci.request(task("switch account"), self.ws))
@@ -211,6 +212,58 @@ class InterceptEdges(Intercept):
                 with contextlib.redirect_stdout(out):
                     self.assertEqual(sci.main(argv), code)
                 self.assertEqual(out.getvalue().strip(), word)
+
+
+class InRoom(Intercept):
+    """Owner 2026-11-26: no switch in a room with other people in it, and no card that switches there.
+    The owner asking in a room gets one line saying to ask in the DM, and the core never sees it."""
+
+    def in_room(self, words, *, tier="owner", kind="room"):
+        self.file.write_text(task_envelope.stamp_text(task(words, tier=tier, kind=kind), self.ws))
+
+        def run(argv, **kw):
+            self.calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout='{"status": "posted"}\n', stderr="")
+        return sci.intercept(self.file, self.ws, self.results, REPO, run=run, log=lambda m: None)
+
+    def test_the_owner_asking_in_a_room_gets_the_line_and_no_card(self):
+        for words, line in (("switch account", sci.IN_ROOM), ("/model", sci.IN_ROOM), ("换模型", sci.IN_ROOM_ZH),
+                            ("switch core", sci.IN_ROOM)):
+            with self.subTest(words=words):
+                self.assertTrue(self.in_room(words))
+                self.assertEqual((self.results / "task-abc.txt").read_text(), line + "\n")
+        self.assertEqual(self.calls, [], "no card script ran")
+
+    def test_out_of_usage_the_owner_asking_in_a_room_is_told_the_limit_there_and_no_card(self):
+        import time
+        import core_quota_notice
+        state = self.ws.joinpath(*core_quota_notice.FILE)
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({"since": time.time(), "name": "Codex", "reset": "3:05 PM"}))
+        self.assertTrue(self.in_room("/model"))
+        self.assertEqual((self.results / "task-abc.txt").read_text(), core_quota_notice.room_words("Codex", "3:05 PM") + "\n")
+        self.assertEqual(self.calls, [], "no card that switches in a room")
+
+    def test_any_room_kind_but_the_dm_is_a_room(self):
+        self.assertTrue(self.in_room("switch account", kind="place"))
+        self.assertEqual(((self.results / "task-abc.txt").read_text(), self.calls), (sci.IN_ROOM + "\n", []))
+
+    def test_others_and_other_words_in_a_room_go_to_the_core(self):
+        self.assertFalse(self.in_room("switch account", tier="team"))
+        self.assertFalse(self.in_room("what's on my calendar"))
+        self.assertFalse((self.results / "task-abc.txt").exists())
+        self.assertEqual(self.calls, [])
+
+    def test_the_dm_still_posts_the_card(self):
+        self.assertTrue(self.in_room("switch account", kind="dm"))
+        self.assertEqual(len(self.calls), 1)
+        self.assertTrue((self.results / "task-abc.txt").read_text().startswith("[no-send]"))
+
+    def test_a_line_that_cannot_be_written_leaves_it_to_the_core(self):
+        from unittest import mock
+        with mock.patch.object(sci, "say_in_room", return_value=False):
+            self.assertFalse(self.in_room("switch account"))
+        self.assertEqual(self.calls, [])
 
 
 class Watcher(unittest.TestCase):

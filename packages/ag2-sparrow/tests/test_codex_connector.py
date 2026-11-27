@@ -1464,11 +1464,12 @@ class AccountCardTest(CardWorld, unittest.TestCase):
             self.assertEqual(self.serve("task-w%d" % n, said), "[no-send] the account card answers\n", said)
             self.assertEqual(metrics(self.work)[-1]["card"], "account-card")
         self.assertEqual(len(self.posted()), 3)
-        # Another account, or the same words outside the owner's DM, is an ordinary turn.
+        # Another account is an ordinary turn; the same words in a room get the line to ask in the DM, no turn.
         self.assertNotIn("account card", self.serve("task-other", "create an account on github"))
         self.assertNotIn("card", metrics(self.work)[-1])
-        self.serve("task-room", "which account are you using?", channel="!room:s.space", kind="room")
-        self.assertNotIn("card", metrics(self.work)[-1])
+        said = self.serve("task-room", "which account are you using?", channel="!room:s.space", kind="room")
+        self.assertIn("isn't available in a room", said)
+        self.assertEqual(metrics(self.work)[-1]["card"], "card-in-room")
         self.assertEqual(self.posted(), [], "no card for either")
 
     def test_a_sign_in_page_that_is_not_an_https_address_is_never_opened_and_the_sign_in_is_given_up(self):
@@ -2538,6 +2539,9 @@ class HeldRootRefusalTest(unittest.TestCase):
 class QuotaCardTest(CardWorld, unittest.TestCase):
     """Out of usage: the connector itself queues the account card in the owner's DM, once per limit."""
 
+    class FakeCard:
+        ASK = "/model"
+
     def setUp(self):
         super().setUp()
         self.home = Path(self.tmp.name) / "codex-home"
@@ -2603,6 +2607,14 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
             shown = self.outbox()[-1]["card"]
             self.assertEqual((shown["id"], shown["text"]), (account_switch.CARD, limit["text"]), ask)
         self.assertEqual(metrics(self.work)[-1]["card"], "quota-card-asked")
+        # Asked in a room: the limit in the room's words, not "ask in the DM", and no card there.
+        before = len(self.outbox())
+        said = self.serve("task-room-ask", "/model", channel="!room:s.space", kind="room")
+        self.assertRegex(said.strip(), r"^Codex has reached its usage limit \(resets [^)]+\), so I can't answer until then\. "
+                                       r"To switch account, message me in our direct message\.$")
+        self.assertEqual((metrics(self.work)[-1]["card"], len(self.outbox())), ("quota-in-room", before))
+        failing = cc.card_desk.Desk(self.work, lambda f, b: None, lambda t: t, [self.FakeCard()], room_limit=lambda: 1 / 0)
+        self.assertEqual(failing.in_room("/model", "/model", "r"), "card-in-room")
         # A limit that cannot be read leaves the desk as it was: the card asked for is shown.
         self.assertEqual(cc.card_desk.Desk(self.work, None, None, [], limit=lambda *a: 1 / 0).limited({}, ""), "")
         # A limit whose words cannot be read never costs the owner the card they asked for.
