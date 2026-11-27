@@ -334,19 +334,23 @@ class AccountCardTest(unittest.TestCase):
     def test_a_usage_ask_with_usage_left_is_answered_with_the_usage_as_read(self):
         for n, ask in enumerate(("how much usage do you have left?", "你还剩多少额度", "what's your usage",
                                  "我的 agy 用了多少", "agy 额度还剩多少？")):
-            said, prompted = self.usage_ask("task-u%d" % n, ask, reader=lambda agent: self.ROWS)
+            said, prompted = self.usage_ask("task-u%d" % n, ask, reader=lambda agent: {"rows": self.ROWS})
             self.assertEqual(said, gc.quoted("Antigravity's usage (this computer's Google sign-in):\n"
                                              "- Gemini models, weekly: 12% used (resets Nov 28, 3:05 PM)\n"
                                              "- Claude and GPT models, five hours: 0% used") + "\n", ask)
             self.assertEqual(prompted, 0, "never sent to agy")
             self.assertEqual(self.w.metrics()[-1]["card"], "usage")
         self.assertEqual(self.posted(), [], "and no card")
+        # The account named is the one the same read used, never the one a turn last saw (review of #6880).
+        self.connector.accounts.keep(account="o…@example.com")
+        said, _ = self.usage_ask("task-ud", "what's your usage")
+        self.assertNotIn("o…@example.com", said, "a label kept from before is not this read's")
+        said, _ = self.usage_ask("task-un", "what's your usage", reader=lambda a: {"rows": self.ROWS,
+                                                                                   "account": "new@example.com"})
+        self.assertIn("(this computer's Google sign-in, new@example.com):", said)
         # In a room the owner gets the same answer, with no account named and nothing to switch with.
-        self.connector.accounts.keep(account="a…@example.com")
         said, _ = self.usage_ask("task-ur", "what's your usage", kind="room")
         self.assertTrue(said.startswith(gc.quoted("Antigravity's usage (this computer's Google sign-in):")), said)
-        said, _ = self.usage_ask("task-ud", "what's your usage")
-        self.assertIn("(this computer's Google sign-in, a…@example.com):", said)
 
     def test_a_usage_that_cannot_be_read_is_said_so_and_never_shown_as_zero(self):
         # The desktop app does not answer (not running here): said so, and the request is taken back.
@@ -359,8 +363,9 @@ class AccountCardTest(unittest.TestCase):
         def broken(agent):
             raise OSError("no answer")
 
-        for n, reader in enumerate((broken, lambda a: [], lambda a: [{"name": "Gemini models"}],
-                                    lambda a: [{"name": "Gemini models", "used": "n/a"}], lambda a: {"used": 0})):
+        for n, reader in enumerate((broken, lambda a: {"rows": []}, lambda a: {"rows": [{"name": "Gemini models"}]},
+                                    lambda a: {"rows": [{"name": "Gemini models", "used": "n/a"}]},
+                                    lambda a: {"used": 0}, lambda a: self.ROWS)):
             said, _ = self.usage_ask("task-u%d" % (n + 1), "你还剩多少额度", reader=reader)
             self.assertEqual(said, gc.quoted(agy_usage.UNAVAILABLE) + "\n")
             self.assertNotIn("0%", said)
@@ -368,7 +373,7 @@ class AccountCardTest(unittest.TestCase):
         self.assertEqual(said, gc.quoted(agy_usage.UNAVAILABLE) + "\n")
         # On this agent's own API key the sign-in's usage is not its usage.
         self.keychain["saved"] = True
-        said, _ = self.usage_ask("task-uk", "what's your usage", reader=lambda a: self.ROWS)
+        said, _ = self.usage_ask("task-uk", "what's your usage", reader=lambda a: {"rows": self.ROWS})
         self.assertEqual(said, gc.quoted(agy_usage.ON_API_KEY) + "\n")
 
     def app_answers(self, usage, nonce=None, delay=0.3):
@@ -407,7 +412,7 @@ class AccountCardTest(unittest.TestCase):
         said, prompted = self.usage_ask("task-u", "你还剩多少额度")
         reset = agy_usage._when("2026-12-04T00:26:13Z")
         self.assertTrue(reset)
-        self.assertEqual(said, gc.quoted("Antigravity's usage (this computer's Google sign-in):\n"
+        self.assertEqual(said, gc.quoted("Antigravity's usage (this computer's Google sign-in, sam@example.com):\n"
                                          "- Gemini models, weekly: 25% used (resets " + reset + ")\n"
                                          "- Claude and GPT models, weekly: 0% used\n"
                                          "- Claude and GPT models, five-hour: 60% used") + "\n")
@@ -415,7 +420,32 @@ class AccountCardTest(unittest.TestCase):
         self.assertEqual((seen["v"], seen["agent"], seen["runtime"], seen["mode"]), (1, AGENT, "antigravity", "0o600"))
         self.assertRegex(seen["nonce"], r"^[0-9a-f]{32}$")
         self.assertFalse((self.w.root / "state" / agy_usage.RESULT).exists(), "the answer is read once")
-        self.assertNotIn("sam@example.com", said, "the app's label is not taken as this agent's account")
+
+    def test_after_a_switch_the_usage_is_named_with_the_account_the_app_just_read(self):
+        # Review of #6880: the label is the app's, from the same read; a turn's last-seen account never names it.
+        self.connector = gc.Connector(self.w.args("--agent-id", AGENT))
+        self.connector.accounts.keep(account="o…@example.com")       # what a turn saw before the switch
+        self.app_answers(dict(self.APP_OK, account_label="new@example.com"), delay=0)
+        said, _ = self.usage_ask("task-s", "what's your usage")
+        self.assertIn("(this computer's Google sign-in, new@example.com):", said)
+        self.assertNotIn("o…@example.com", said)
+        self.app_answers(dict(self.APP_OK, account_label=None), delay=0)
+        said, _ = self.usage_ask("task-s2", "what's your usage")
+        self.assertIn("(this computer's Google sign-in):", said, "no label in the answer: none named")
+
+    def test_with_nothing_read_yet_the_app_reads_now_and_an_empty_answer_is_not_available(self):
+        # Review of #6880, the usage cache empty: a cold app reads (slowly) and its numbers are said; an answer
+        # with no window (nothing read, or throttled before any read) is "not available", never 0.
+        self.app_answers(self.APP_OK, delay=1.0)
+        said, _ = self.usage_ask("task-cold", "what's your usage")
+        self.assertIn("Gemini models, weekly: 25% used", said)
+        for n, usage in enumerate(({"provider": "antigravity", "status": "ok", "windows": []},
+                                   {"provider": "antigravity", "status": "throttled", "windows": [],
+                                    "account_label": "sam@example.com"})):
+            self.app_answers(usage, delay=0)
+            said, _ = self.usage_ask("task-empty%d" % n, "what's your usage")
+            self.assertEqual(said, gc.quoted(agy_usage.UNAVAILABLE) + "\n")
+        self.assertEqual(agy_usage.WAIT_S, 35.0, "the app's bound: a 2 s look plus three 10 s calls, and a margin")
 
     def test_an_app_answer_that_is_not_numbers_or_not_this_requests_is_not_available(self):
         for n, usage in enumerate(({"provider": "antigravity", "status": "token_expired", "windows": [],
@@ -439,7 +469,7 @@ class AccountCardTest(unittest.TestCase):
         self.serve()
         (limit,) = self.posted("$q1")
         for n, ask in enumerate(("how much usage do you have left?", "你还剩多少额度")):
-            said, prompted = self.usage_ask("task-u%d" % n, ask, reader=lambda a: self.ROWS)
+            said, prompted = self.usage_ask("task-u%d" % n, ask, reader=lambda a: {"rows": self.ROWS})
             self.assertEqual((said, prompted), (account_switch.ANSWERED, 0), ask)
             (shown,) = self.posted("$u%d" % n)
             self.assertEqual((shown["text"], shown["account_controls"]), (limit["text"], limit["account_controls"]))
@@ -454,7 +484,7 @@ class AccountCardTest(unittest.TestCase):
         for n, said in enumerate(("show CLI usage", "usage of this function", "what's the usage of X",
                                   "what is usage", "show usage", "how do you limit the output")):
             _, prompted = self.usage_ask("task-n%d" % n, said,
-                                         reader=lambda a: self.ROWS)
+                                         reader=lambda a: {"rows": self.ROWS})
             self.assertEqual(prompted, 1, said)
             self.assertNotEqual(self.w.metrics()[-1].get("card"), "usage", said)
         _, prompted = self.usage_ask("task-c", "what's your usage", tier="team", collaborator=True, kind="room")
@@ -608,6 +638,9 @@ class PartsTest(unittest.TestCase):
 
     def test_the_apps_usage_entry_is_read_as_rows(self):
         rows = agy_usage.rows_from_app(AccountCardTest.APP_OK)
+        self.assertEqual(agy_usage.from_app(AccountCardTest.APP_OK)["account"], "sam@example.com")
+        self.assertEqual(agy_usage.from_app(dict(AccountCardTest.APP_OK, account_label=None))["account"], "")
+        self.assertIsNone(agy_usage.from_app({"status": "ok", "windows": [], "account_label": "sam@example.com"}))
         self.assertEqual([(r["name"], r["window"], r["used"]) for r in rows],
                          [("Gemini models", "weekly", 25), ("Claude and GPT models", "weekly", 0),
                           ("Claude and GPT models", "five-hour", 60)])

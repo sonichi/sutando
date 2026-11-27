@@ -615,7 +615,7 @@ class Connector:
             args.state, getattr(args, "bridge_state", None), NAME, getattr(args, "agent_id", None) or "", publish,
             quoted, log)
         self.agy_pid = None   # the owner turn's agy process, whose own log names the account it used
-        # agy's own usage windows, as the desktop app reads them for this agent (agy_usage.read); None: not now.
+        # agy's own usage, as the desktop app reads it for this agent (agy_usage.read); None: not now.
         self.usage_reader = lambda agent_id: agy_usage.read(self.args.state, agent_id)
         # Out of quota: the account card, unasked, in the owner's DM, on each of their messages (quota_notice).
         self.quota = quota_notice.QuotaNotice(args.state, getattr(args, "bridge_state", None), NAME,
@@ -679,13 +679,15 @@ class Connector:
         if self.accounts.keyed():
             return agy_usage.ON_API_KEY, "usage-api-key"
         try:
-            rows = agy_usage.rows_of(self.usage_reader(getattr(self.args, "agent_id", None) or ""))
+            got = self.usage_reader(getattr(self.args, "agent_id", None) or "")
         except Exception as e:  # noqa: BLE001 - a read that failed is a usage not available
             log("usage not read:", "%s: %s" % (type(e).__name__, str(e)[:120]))
-            rows = []
+            got = None
+        rows = agy_usage.rows_of(got.get("rows")) if isinstance(got, dict) else []
         if not rows:
             return agy_usage.UNAVAILABLE, "usage-unavailable"
-        who = "" if room else str(self.accounts.record().get("account") or "")
+        # Only the sign-in the same read used is named (never the last one a turn saw), and never in a room.
+        who = "" if room else account_switch.shown(str(got.get("account") or ""))
         return agy_usage.words(rows, "this computer's Google sign-in%s" % (", " + who if who else "")), "usage"
 
     def sspace_servers(self, init, tools=frozenset()):

@@ -26,7 +26,7 @@ account switch does (#6878 / desktop #1330), and the app answers in a result fil
              "windows": [{"kind": "model:<group>:weekly_7d" | "model:<group>:session_5h", "used_pct": int,
                           "resets_at": "<RFC 3339>" | null}]}>}
 
-ROOT is the agent's work root, as its antigravity-local.conf names it. `read` waits up to WAIT_S for the answer
+ROOT is the agent's work root, as its antigravity-local.conf names it. `read` waits up to WAIT_S (35 s) for the answer
 with the request's nonce. No answer (the app is not running, or not one that knows this request), a status that is
 not "ok", or no window with a number: None, and the owner is told the usage isn't available right now.
 """
@@ -92,14 +92,15 @@ def asks(text) -> bool:
 
 
 REQUEST, RESULT = ".ag2-usage-request.json", ".ag2-usage-result.json"
-WAIT_S, POLL_S = 10.0, 0.25     # the app looks every 2 s, then reads three quota calls
+# The app's bound on an answer: one look (2 s) plus agy's three quota calls in turn (10 s timeout each), and a margin.
+WAIT_S, POLL_S = 35.0, 0.25
 RESULT_MAX = 64 * 1024
 _WINDOWS = {"weekly_7d": "weekly", "session_5h": "five-hour"}
 
 
 def read(state_dir, agent_id: str, wait_s: "float | None" = None, clock=time.monotonic, sleep=time.sleep):
-    """This agent's usage windows as the desktop app read them (`rows_from_app`), or None when it did not answer
-    in `wait_s` or could not read them. One request at a time; a request left unanswered is taken back."""
+    """This agent's usage as the desktop app read it (`from_app`): {"rows", "account"}, or None when it did not
+    answer in `wait_s` or could not read it. One request at a time; a request left unanswered is taken back."""
     state = str(state_dir)
     request, result = os.path.join(state, REQUEST), os.path.join(state, RESULT)
     nonce = uuid.uuid4().hex
@@ -117,7 +118,7 @@ def read(state_dir, agent_id: str, wait_s: "float | None" = None, clock=time.mon
             if answer is not None:
                 with _quiet():
                     os.unlink(result)
-                return rows_from_app(answer.get("usage"))
+                return from_app(answer.get("usage"))
             if clock() >= deadline:
                 return None
             sleep(POLL_S)
@@ -125,6 +126,16 @@ def read(state_dir, agent_id: str, wait_s: "float | None" = None, clock=time.mon
         with _quiet():
             if _nonce_of(request) == nonce:
                 os.unlink(request)   # unanswered: a late app finds nothing to do
+
+
+def from_app(usage):
+    """agent_usage's provider entry -> {"rows", "account"}: the account is the label of the sign-in that very read
+    used (never one kept from before), '' when it gave none. None when there are no rows to say."""
+    rows = rows_from_app(usage)
+    if not rows:
+        return None
+    label = usage.get("account_label")
+    return {"rows": rows, "account": label.strip()[:120] if isinstance(label, str) else ""}
 
 
 def rows_from_app(usage):
