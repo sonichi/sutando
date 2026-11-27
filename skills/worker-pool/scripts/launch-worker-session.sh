@@ -178,6 +178,16 @@ install_claude_personal_hook
 resolve_claude_cwd_args
 resolve_claude_config_dir_and_seed
 apply_skill_session_config
+# A worker given a Claude folder of its own starts in it, so its account and model are its own.
+# None made (the default), or the helper failing: the core's folder, as before.
+if [ -n "$WORKER_PY" ] && [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  _own_ccd="$("$WORKER_PY" "$REPO/skills/worker-pool/scripts/worker_claude_folder.py" launch \
+      "$CLAUDE_CONFIG_DIR" "${SUTANDO_WORKER_ID:-$SUTANDO_INSTANCE_ID}" 2>/dev/null)" || _own_ccd=""
+  if [ -n "$_own_ccd" ] && [ -d "$_own_ccd" ] && [ "$_own_ccd" != "$CLAUDE_CONFIG_DIR" ]; then
+    export CLAUDE_CONFIG_DIR="$_own_ccd"
+    echo "  ✓ CLAUDE_CONFIG_DIR=$_own_ccd (this worker's own)"
+  fi
+fi
 resolve_claude_settings_args
 apply_claude_obs_metering
 apply_claude_tmux_defaults
