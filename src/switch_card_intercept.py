@@ -88,6 +88,8 @@ _NOT_A_LOOKUP = re.compile(r"\b(?:why|how come|fail(?:ed|s|ing)?|error|broken|sw
 _ABOUT = (("account", re.compile(r"\baccounts?\b|账号|账户|帐号", re.I)),
           ("model", re.compile(r"\bmodels?\b|模型", re.I)),
           ("runtime", re.compile(r"\bcore\b|\bruntime\b|\bengine\b|运行时|内核", re.I)))
+_SELF = re.compile(r"\b(?:you|your|you're|ur|u)\b|\bam i\b|你|您|在用|现在|当前|用的|用什么|用哪|\busing\b|\bcurrent(?:ly)?\b|\bright now\b", re.I)
+_OTHER_THING = re.compile(r"\b(?:of|from|for|on (?:my|the|this))\b|\b(?:invoice|iphone|phone|car|bank|email|should|best|better)\b|我该|我应该|应该用|哪个好|写代码", re.I)
 QUESTION_MAX = 60
 
 
@@ -100,6 +102,8 @@ def kinds_of(words: str) -> list:
     text = normalize(words)
     asked = _ASKS.search(text) or re.search(r"[?？]\s*$", words or "")
     if not text or len(text) > QUESTION_MAX or not asked or _NOT_A_LOOKUP.search(text):
+        return []
+    if not _SELF.search(text) or _OTHER_THING.search(text):
         return []
     return [kind for kind, about in _ABOUT if about.search(text)]
 
@@ -125,9 +129,10 @@ def request(task_text: str, workspace: Optional[Path] = None) -> Optional[dict]:
 
 
 def post(req: dict, workspace: Path, repo: Path = _REPO, run=subprocess.run) -> bool:
-    """Every card the request asks for; True only when all of them were posted."""
+    """Every card the request asks for; True once any was posted, so the core never answers it twice."""
     kinds = req.get("kinds") or [req["kind"]]
-    return all(post_one(dict(req, kind=kind), workspace, repo, run) for kind in kinds)
+    posted = [kind for kind in kinds if post_one(dict(req, kind=kind), workspace, repo, run)]
+    return bool(posted)
 
 
 def post_one(req: dict, workspace: Path, repo: Path = _REPO, run=subprocess.run) -> bool:

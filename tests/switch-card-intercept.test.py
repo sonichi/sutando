@@ -63,8 +63,7 @@ class Questions(unittest.TestCase):
                              ("what model are you using?", ["model"]), ("Which account am I on", ["account"]),
                              ("what model and account are you using", ["account", "model"]),
                              ("你用的是什么 model", ["model"]), ("用的哪个账号", ["account"]),
-                             ("你现在用的哪个 core", ["runtime"]), ("现在 core 是 Claude 还是 Codex？", ["runtime"]),
-                             ("model 是哪个", ["model"])):
+                             ("你现在用的哪个 core", ["runtime"]), ("现在 core 是 Claude 还是 Codex？", ["runtime"])):
             self.assertEqual(sci.kinds_of(words), kinds, words)
 
     def test_bare_requests_still_one_card(self):
@@ -75,7 +74,10 @@ class Questions(unittest.TestCase):
         for words in ("what model are you on right now and why", "why did the account switch fail?",
                       "账号为什么没切过去", "switch to sonnet", "换成 opus 吧", "what is the weather",
                       "switch account and then summarise my email", "帮我看看这个文件", "hi", "",
-                      "账号切换失败了吗", "which model is better for coding, sonnet or opus?"):
+                      "账号切换失败了吗", "which model is better for coding, sonnet or opus?",
+                      # Not about the agent itself (review on #6853): no card, the core answers.
+                      "what model of iPhone do I have?", "which account is the invoice from?",
+                      "which account should I use for billing?", "我该用什么模型写代码", "model 是哪个"):
             self.assertEqual(sci.kinds_of(words), [], words)
 
     def test_long_message_stays_with_the_core(self):
@@ -141,6 +143,17 @@ class Intercept(unittest.TestCase):
         self.assertTrue(self.run_with("现在用的什么账号和什么模型"))
         self.assertEqual([Path(a[1]).name for a in self.calls], ["account_card.py", "model_card.py"])
         self.assertIn("account and model", (self.results / "task-abc.txt").read_text())
+
+    def test_one_card_out_and_the_other_failed_is_not_answered_twice(self):
+        # The account card posted, the model card failed: the core must not answer the question again.
+        self.file.write_text(task_envelope.stamp_text(task("现在用的什么账号和什么模型"), self.ws))
+
+        def run(argv, **kw):
+            self.calls.append(argv)
+            ok = argv[1].endswith("account_card.py")
+            return subprocess.CompletedProcess(argv, 0 if ok else 1, stdout=json.dumps({"status": "posted" if ok else "failed"}) + "\n", stderr="")
+        self.assertTrue(sci.intercept(self.file, self.ws, self.results, REPO, run=run, log=lambda m: None))
+        self.assertTrue((self.results / "task-abc.txt").read_text().startswith("[no-send]"))
 
     def test_a_card_not_posted_leaves_it_to_the_core(self):
         self.assertFalse(self.run_with("switch account", status="failed", rc=1))
