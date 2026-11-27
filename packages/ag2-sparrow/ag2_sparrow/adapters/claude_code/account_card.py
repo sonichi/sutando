@@ -249,9 +249,8 @@ class AccountCard(account_switch.AccountSwitch):
         controls, so opened on the agent's computer it is the account card again. Nothing is started here.
         A saved account's key: ask the app to switch to it (`use`)."""
         if verb == "switch":
-            # From the phone (owner 11-27): never "open this on the computer". The accounts this agent can
-            # switch to here are offered in place, a tap away; only an account another agent keeps needs a
-            # sign-in here, said as such.
+            # From the phone (owner 11-27): never "open this on the computer". Accounts switchable here are offered
+            # in place; only an account another agent keeps needs a sign-in here, said as such.
             text, refused = self.status()
             picks = bool(self.offers())
             self.say(sent.get("channel_id"), self.card("pending", "%s %s" % (text, PICK if picks else NONE_HERE),

@@ -220,9 +220,8 @@ class AccountSwitch:
         is checked, and its card built, before anything is opened or kept: a page that is not a plain
         https address is given up at once, so a retry cannot open a browser again and again."""
         room, tapped = str(sent.get("channel_id") or ""), card_desk.tapped_event(sent)
-        # A tap does not say which device it came from, and a browser sign-in only finishes on this computer: a
-        # connector that sets `switch_anywhere` switches with its sign-in finished on any device (owner 11-27:
-        # "Switch account" on the phone opened a browser on the Mac and nothing could be done there).
+        # A tap does not say its device, and a browser sign-in finishes only here (owner 11-27: the phone's tap
+        # opened the Mac's browser): `switch_anywhere` switches with the sign-in finished on any device.
         if self.remote is not None and self.switch_anywhere and verb == "switch":
             verb = "add"
         if self.remote is not None and verb in ("add", "use", "discard", "signout"):
