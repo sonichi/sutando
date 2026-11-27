@@ -34,12 +34,15 @@ PRINTED = ("\x1b[1mWelcome to Codex\x1b[0m [v0.160.0]\n\x1b[2mOpenAI's command-l
            "   \x1b[94m%s\x1b[0m\n\n\x1b[2mDevice codes are a common phishing target. Never share this code.\x1b[0m\n"
            % (LINK, CODE))
 
-# The stand-in `codex`: `mode` beside it says how a sign-in ends ("ok <email>", "fail", "silent", else never);
-# every call is logged to `calls` with the CODEX_HOME it ran on.
+# The stand-in `codex`: `mode` says how a sign-in ends ("ok <email>", "wait <email>" once `go` exists, "fail",
+# "silent", "stubborn" with a grandchild, both deaf to SIGTERM, else never); `calls` logs each call and its CODEX_HOME.
 STUB = r'''
-import base64, json, os, sys, time
+import base64, json, os, signal, subprocess, sys, time
 here = sys.argv[1]
 args = sys.argv[2:]
+if args == ["grandchild"]:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    time.sleep(600)
 home = os.environ.get("CODEX_HOME", "")
 with open(os.path.join(here, "calls"), "a") as f:
     f.write(json.dumps([home] + args) + "\n")
@@ -60,6 +63,16 @@ with open(os.path.join(here, "pid"), "w") as f:
 if mode != "silent":
     sys.stdout.write(PRINTED)
     sys.stdout.flush()
+if mode == "stubborn":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    kid = subprocess.Popen([sys.executable, __file__, here, "grandchild"])
+    with open(os.path.join(here, "grandpid"), "w") as f:
+        f.write(str(kid.pid))
+    time.sleep(600)
+if mode.startswith("wait "):
+    while not os.path.exists(os.path.join(here, "go")):
+        time.sleep(0.05)
+    mode = "ok " + mode[5:]
 if mode.startswith("ok "):
     time.sleep(1.0)
     claims = base64.urlsafe_b64encode(json.dumps({"email": mode[3:]}).encode()).decode().rstrip("=")
@@ -121,8 +134,8 @@ class Home:
                 self.fail("the sign-in never ended")
             time.sleep(0.05)
 
-    def stub_gone(self, timeout=10):
-        pid = int((self.bin / "pid").read_text())
+    def stub_gone(self, timeout=10, name="pid"):
+        pid = int((self.bin / name).read_text())
         end = time.time() + timeout
         while time.time() < end:
             state = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True).stdout
@@ -214,7 +227,7 @@ class SignInTest(Home, unittest.TestCase):
         self.assertEqual(self.calls(), [[self.staging(), "login", "--device-auth"]], "one sign-in, on the staging home")
         dl.note_card(self.dir, "!dm:s.space", "$card1")
         self.finished()
-        self.assertEqual(self.over(), {"phase": "confirm", "email": "bob@example.org", "room": "!dm:s.space",
+        self.assertEqual(self.over(), {"phase": "confirm", "email": "bob@example.org", "room": "!dm:s.space", "cards": ["$card1"],
                                        "edit": "$card1"})
         meta = json.loads((self.dir / "meta.json").read_text())
         self.assertNotIn("code", meta, "the code is dropped once Codex is done")
@@ -224,7 +237,7 @@ class SignInTest(Home, unittest.TestCase):
         self.assertEqual(self.start()[0]["phase"], "confirm", "a tap meanwhile shows the question again")
         self.assertEqual(dl.answer(self.dir, "$other", True, str(self.codex), self.env)[0], "stale",
                          "only the card that asked")
-        self.assertEqual(dl.answer(self.dir, "$card1", True, str(self.codex), self.env), ("used", "bob@example.org"))
+        self.assertEqual(dl.answer(self.dir, "$card1", True, str(self.codex), self.env), ("used", "bob@example.org", ["$card1"]))
         self.assertEqual(self.live_email(), "bob@example.org")
         self.assertEqual(oct((self.home / "auth.json").stat().st_mode & 0o777), "0o600")
         self.assertEqual(sorted(p.name for p in self.home.iterdir()), ["auth.json"], "no earlier login left beside it")
@@ -238,7 +251,7 @@ class SignInTest(Home, unittest.TestCase):
         self.finished()
         self.over()
         staging = self.staging()
-        self.assertEqual(dl.answer(self.dir, "$card1", False, str(self.codex), self.env), ("discarded", "bob@example.org"))
+        self.assertEqual(dl.answer(self.dir, "$card1", False, str(self.codex), self.env), ("discarded", "bob@example.org", ["$card1"]))
         self.assertEqual(self.calls()[-1], [staging, "logout"])
         self.assertFalse(self.dir.exists())
         self.assertFalse((self.home / "auth.json").exists())
@@ -252,6 +265,40 @@ class SignInTest(Home, unittest.TestCase):
         self.assertEqual(self.over(now=time.time() + dl.LOGIN_WAIT_S + 1)["exit"], "unanswered")
         self.assertEqual(self.calls()[-1], [staging, "logout"])
         self.assertFalse(self.dir.exists())
+
+    def test_a_late_answer_is_refused_where_it_is_applied_even_with_no_check_in_between(self):
+        self.mode("ok bob@example.org")
+        self.start()
+        dl.note_card(self.dir, "!dm:s.space", "$card1")
+        self.finished()
+        self.over()
+        staging = self.staging()
+        late = time.time() + dl.LOGIN_WAIT_S + 1
+        self.assertEqual(dl.answer(self.dir, "$card1", True, str(self.codex), self.env, now=late),
+                         ("expired", "bob@example.org", ["$card1"]))
+        self.assertFalse((self.home / "auth.json").exists(), "the live login is untouched")
+        self.assertEqual(self.calls()[-1], [staging, "logout"])
+        self.assertFalse(self.dir.exists())
+
+    def test_a_sign_in_deaf_to_sigterm_and_its_child_are_killed_by_exact_pid(self):
+        self.mode("stubborn")
+        with mock.patch.object(dl, "STOP_WAIT_S", 0.3):
+            self.start()
+            end = time.time() + 10
+            while not (self.bin / "grandpid").exists() and time.time() < end:
+                time.sleep(0.05)
+            self.assertTrue(dl.cancel(self.dir, str(self.codex), self.env))
+        self.assertTrue(self.stub_gone(timeout=3), "the sign-in")
+        self.assertTrue(self.stub_gone(timeout=3, name="grandpid"), "its descendant")
+
+    def test_supervise_kills_a_sign_in_deaf_to_sigterm_at_its_time(self):
+        self.mode("stubborn")
+        self.dir.mkdir()
+        with mock.patch.object(dl, "STOP_WAIT_S", 0.3):
+            dl.supervise(str(self.dir), str(self.codex), wait_s=1.0)
+        self.assertEqual(detached_login.read_json(self.dir / "result.json"), {"exit": "timeout"})
+        self.assertTrue(self.stub_gone(timeout=3))
+        self.assertTrue(self.stub_gone(timeout=3, name="grandpid"))
 
     def test_a_staged_login_whose_account_cannot_be_read_is_not_offered(self):
         self.mode("ok -")
@@ -272,7 +319,7 @@ class SignInTest(Home, unittest.TestCase):
         real = os.replace
         with mock.patch.object(dl.os, "replace", side_effect=lambda a, b: real(a, b) if b != str(self.home / "auth.json")
                                else (_ for _ in ()).throw(OSError(errno.EACCES, "no"))):
-            outcome, why = dl.answer(self.dir, "$card1", True, str(self.codex), self.env)
+            outcome, why, _ = dl.answer(self.dir, "$card1", True, str(self.codex), self.env)
         self.assertEqual((outcome, why), ("not-used", "the login could not be moved (PermissionError)"))
         self.assertEqual((self.home / "auth.json").read_text(), "old")
         self.assertEqual(sorted(p.name for p in self.home.iterdir()), ["auth.json"])
@@ -460,7 +507,7 @@ class RemoteCardTest(Home, CardWorld, unittest.TestCase):
         self.assertEqual(self.calls()[-1][1:], ["logout"])
         self.assertNotEqual(self.calls()[-1][0], str(self.home), "the staged login is signed out, never the live one")
         # A second answer on a card that is no longer asking changes nothing.
-        self.assertEqual(dl.answer(self.dir, "$card1", True, str(self.codex), self.env), ("stale", ""))
+        self.assertEqual(dl.answer(self.dir, "$card1", True, str(self.codex), self.env), ("stale", "", []))
         self.assertFalse((self.home / "auth.json").exists())
 
     def test_a_second_tap_while_one_runs_shows_the_same_code_and_starts_nothing(self):
@@ -473,6 +520,23 @@ class RemoteCardTest(Home, CardWorld, unittest.TestCase):
         self.assertEqual(metrics(self.work)[-1]["card"], "account-device-again")
         self.assertEqual(len(self.calls()), 1)
         self.assertEqual(detached_login.read_json(self.dir / "meta.json")["edit"], "$card2", "told on the newest card")
+
+    def test_every_card_that_showed_the_code_is_withdrawn_when_the_sign_in_ends(self):
+        self.mode("wait bob@example.org")
+        self.tap("task-add-1", self.ask("$card1"), "Add account", "$card1")
+        self.posted("$card1")
+        self.tap("task-add-2", self.ask("$card2"), "Add account", "$card2")
+        ((_, again),) = self.posted("$card2")
+        self.assertIn(CODE, again["text"])
+        (self.bin / "go").write_text("")
+        self.finished()
+        self.hello("task-next")
+        cards = self.posted("$card3")
+        shown = dict(zip([e for _, e in self.ops()], [c for _, c in cards]))
+        self.assertEqual(sorted(shown), ["$card1", "$card2"])
+        self.assertTrue(shown["$card2"]["text"].startswith("Signed in as bob@example.org."), "the question, on the newest")
+        self.assertEqual((shown["$card1"]["id"], shown["$card1"]["state"]), (dl.WITHDRAWN_CARD, "expired"))
+        self.assertNotIn(CODE, json.dumps(shown))
 
     def test_a_sign_in_not_finished_in_time_is_stopped_and_its_card_withdrawn(self):
         self.mode("hang")
@@ -580,9 +644,13 @@ class RemoteUnitTest(Home, unittest.TestCase):
 
     def test_a_yes_that_fails_and_a_sign_out_that_fails_say_so(self):
         r = self.remote()
-        with mock.patch.object(dl, "answer", return_value=("not-used", "why")):
+        with mock.patch.object(dl, "answer", return_value=("not-used", "why", ["$e"])):
             self.assertEqual(r.tapped(dl.USE, self.OWNER, "out"), "account-device-not-used")
         r.accounts.card.assert_called_with("error", "I could not use that account: why. I'm using a.", ask=True)
+        with mock.patch.object(dl, "answer", return_value=("expired", "b@x.org", ["$old", "$e"])):
+            self.assertEqual(r.tapped(dl.USE, self.OWNER, "out"), "account-device-expired")
+        r.accounts.card.assert_called_with("error", dl.UNANSWERED % (5, "I'm using a."), ask=True)
+        self.assertEqual([c.kwargs["edit"] for c in r.accounts.post.call_args_list], ["$old"], "the other copy withdrawn")
         self.mode("logout-fail")
         self.assertEqual(r.tapped(dl.SIGN_OUT, self.OWNER, "out"), "account-not-signed-out")
         r.accounts.card.assert_called_with("error", "I could not sign out: codex logout ended with exit code 1.", ask=True)

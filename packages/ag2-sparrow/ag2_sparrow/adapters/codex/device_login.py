@@ -19,9 +19,12 @@ anything is done, and an answer must reply to the very card that asked.
 
 Every tap is the owner's, in the owner's DM, on a card this agent posted (agent_card.click_verdict,
 re-checked here); "Add account" also only on an account card posted within TAP_FRESH_S. One sign-in at a
-time per agent: a second tap while one runs shows the same card again. The sign-in belongs to a small
-detached process (`supervise`), which ends it after LOGIN_WAIT_S. The code is
-kept only in the sign-in's owner-only state, said nowhere but the card, and dropped when Codex exits.
+time per agent: a second tap while one runs shows the same card again, and every card that showed the link
+and code is withdrawn when the sign-in ends. The sign-in belongs to a small detached process (`supervise`),
+which ends it after LOGIN_WAIT_S. Ending it signals Codex, its descendants and the supervisor by exact pid,
+each start time checked first (SIGTERM, then SIGKILL after STOP_WAIT_S); a process that has left Codex's
+tree by then is not found. The code is kept only in the sign-in's owner-only state, said nowhere but the
+card, and dropped when Codex exits.
 
 Refused, as Claude Code's remote sign-in is, for an agent whose Codex home is not its own: none set
 (Codex then uses ~/.codex), ~/.codex itself, a login file that is a link into another home (the core's,
@@ -50,7 +53,7 @@ LOGIN_WAIT_S, TAP_FRESH_S, GRACE_S = 300.0, 300.0, 30.0
 LINK_WAIT_S, LOGOUT_WAIT_S, STOP_WAIT_S = 20.0, 30.0, 5.0
 STATE = "codex-device-login"
 STAGING = "home"
-DEVICE_CARD = "account-device"
+DEVICE_CARD, WITHDRAWN_CARD = "account-device", "account-device-withdrawn"
 ADD, USE, DISCARD, SIGN_OUT = "add", "use", "discard", "signout"
 VERBS = (ADD, USE, DISCARD, SIGN_OUT)
 CODE_PHASE, CONFIRM_PHASE, SETTLING = "code", "confirm", "settling"
@@ -70,6 +73,7 @@ ANOTHER_AGENTS = ("this agent shares its Codex home with another agent: signing 
 NOT_OWNER = "Only the owner can add an account, and only from our direct message."
 STALE_CARD = "That card is too old to start a sign-in, so nothing changed. Send /account for a new one."
 NO_CARD = "I couldn't show the sign-in card here, so I stopped the sign-in. Send /account in our direct message."
+UNANSWERED = "You didn't answer within %d minutes, so I signed that account out again. %s"
 ANSWERED_ALREADY = "That sign-in was already answered or is over, so nothing changed."
 
 
@@ -156,8 +160,12 @@ def _alive(d: Path) -> bool:
 def _stop(d: Path) -> None:
     """End the sign-in's processes and drop what Codex printed (the code with it)."""
     pids = read_json(d / "pids.json")
-    detached_login.end(pids.get("codex"))
-    detached_login.end(pids.get("supervisor"))
+    entries = [pids.get("codex"), pids.get("supervisor")]
+    for entry in list(entries):
+        pid = detached_login.ours(entry)
+        if pid:
+            entries += detached_login.descendants(pid)
+    detached_login.stop_all(entries, STOP_WAIT_S)
     for name in ("out.log", "pids.json"):
         try:
             (d / name).unlink()
@@ -237,12 +245,14 @@ def _start(codex, env, d, popen, wait_s, sleep, login_wait_s):
 
 
 def note_card(state_dir, room: str, edit: str) -> None:
-    """Where the sign-in's next word is shown: the room, and the card it replaces."""
+    """Where the sign-in's next word is shown (the room, and the card it replaces), and one more card that
+    shows it, to withdraw when it is over."""
     d = Path(state_dir)
     with locked(d):
         meta = read_json(d / "meta.json")
         if meta:
-            write_private(d / "meta.json", dict(meta, room=room, edit=edit))
+            cards = [c for c in meta.get("cards") or [] if c != edit] + ([edit] if edit else [])
+            write_private(d / "meta.json", dict(meta, room=room, edit=edit, cards=cards))
 
 
 def over(state_dir, codex: str, env: dict, run=subprocess.run, now=None, wait_s=None) -> dict:
@@ -257,7 +267,7 @@ def over(state_dir, codex: str, env: dict, run=subprocess.run, now=None, wait_s=
     wait_s = LOGIN_WAIT_S if wait_s is None else wait_s
     with locked(d):
         meta = read_json(d / "meta.json")
-        where = {"room": meta.get("room") or "", "edit": meta.get("edit") or ""}
+        where = {"room": meta.get("room") or "", "edit": meta.get("edit") or "", "cards": meta.get("cards") or []}
         if meta.get("phase") == CONFIRM_PHASE:
             if now - float(meta.get("asked_at") or 0) <= wait_s:
                 return {}
@@ -289,26 +299,35 @@ def _why(said: str, code: str, link: str) -> str:
     return last[:160]
 
 
-def answer(state_dir, event: str, use: bool, codex: str, env: dict, run=subprocess.run, homes=()) -> "tuple[str, str]":
-    """The owner's Yes or No to the staged account, from the card `event` that asked; only the first
-    answer counts. (outcome, the email or why not): "used", "discarded", "not-used" or "stale"."""
+def answer(state_dir, event: str, use: bool, codex: str, env: dict, run=subprocess.run, homes=(), now=None,
+           wait_s=None) -> "tuple[str, str, list]":
+    """The owner's Yes or No to the staged account, from the card `event` that asked; only the first answer
+    counts, and only within LOGIN_WAIT_S of the question, checked here whatever the connector's loop has
+    done. (outcome, the email or why not, every card that showed this sign-in): "used", "discarded",
+    "not-used", "expired" or "stale"."""
     d = Path(state_dir)
+    now = time.time() if now is None else now
     with locked(d):
         meta = read_json(d / "meta.json")
+        cards = meta.get("cards") or []
         if meta.get("phase") != CONFIRM_PHASE or not event or event != meta.get("edit"):
-            return "stale", ""
+            return "stale", "", []
         write_private(d / "meta.json", dict(meta, phase=SETTLING))      # first answer only, before anything is done
+        if now - float(meta.get("asked_at") or 0) > (LOGIN_WAIT_S if wait_s is None else wait_s):
+            _discard(d, codex, env, run)
+            return "expired", meta["email"], cards
         if not use:
             _discard(d, codex, env, run)
-            return "discarded", meta["email"]
+            return "discarded", meta["email"], cards
         try:
             live = own_home(env, homes)
             swap(_staged_auth(d), live)
         except (Refused, OSError) as e:
             _discard(d, codex, env, run)
-            return "not-used", str(e) if isinstance(e, Refused) else "the login could not be moved (%s)" % type(e).__name__
+            why = str(e) if isinstance(e, Refused) else "the login could not be moved (%s)" % type(e).__name__
+            return "not-used", why, cards
         shutil.rmtree(d, ignore_errors=True)
-        return "used", meta["email"]
+        return "used", meta["email"], cards
 
 
 def swap(staged: Path, live_home) -> None:
@@ -342,9 +361,14 @@ def swap(staged: Path, live_home) -> None:
             previous.unlink()
 
 
-def cancel(state_dir, codex: str = "codex", env=None, run=subprocess.run) -> bool:
-    with locked(state_dir):
-        return _discard(Path(state_dir), codex, dict(env or {}), run)
+def cancel(state_dir, codex: str = "codex", env=None, run=subprocess.run) -> dict:
+    """End and forget the sign-in: {room, cards} of the one there was ({} for none), its cards to withdraw."""
+    d = Path(state_dir)
+    with locked(d):
+        meta = read_json(d / "meta.json")
+        if not _discard(d, codex, dict(env or {}), run):
+            return {}
+        return {"room": meta.get("room") or "", "cards": meta.get("cards") or []}
 
 
 def sign_out(codex: str, env: dict, run=subprocess.run, homes=(), wait_s: float = LOGOUT_WAIT_S) -> "tuple[bool, str]":
@@ -359,8 +383,8 @@ def sign_out(codex: str, env: dict, run=subprocess.run, homes=(), wait_s: float 
 
 
 def supervise(state_dir: str, codex: str, wait_s: float = LOGIN_WAIT_S) -> int:
-    """The detached owner of one device-code sign-in: run it, end it after `wait_s` (asked first, then
-    killed), and record how it ended. Only its own child is signalled."""
+    """The detached owner of one device-code sign-in: run it, end it and its descendants after `wait_s`
+    (asked first, then killed, each by exact pid), and record how it ended."""
     d = Path(state_dir)
     with open(d / "out.log", "ab") as log:
         p = subprocess.Popen([codex, "login", "--device-auth"], stdin=subprocess.DEVNULL, stdout=log,
@@ -369,12 +393,9 @@ def supervise(state_dir: str, codex: str, wait_s: float = LOGIN_WAIT_S) -> int:
         try:
             code = p.wait(timeout=wait_s)
         except subprocess.TimeoutExpired:
-            p.terminate()
-            try:
-                p.wait(timeout=STOP_WAIT_S)
-            except subprocess.TimeoutExpired:
-                p.kill()
-                p.wait()
+            # Its descendants are listed before it goes: once it has, they no longer hang under it.
+            detached_login.stop_all([[p.pid, born(p.pid)]] + detached_login.descendants(p.pid), STOP_WAIT_S)
+            p.wait()
             code = "timeout"
     if d.exists():
         write_private(d / "result.json", {"exit": code})
@@ -396,8 +417,19 @@ class Remote:
         return bool(current(self.dir))
 
     def stop(self) -> None:
-        if cancel(self.dir, self.codex, self.env, self.run):
+        was = cancel(self.dir, self.codex, self.env, self.run)
+        if was:
+            self.withdraw(was["room"], was["cards"])
             self.log("device sign-in ended: another sign-in was started")
+
+    def withdraw(self, room, cards, keep="") -> None:
+        """Show every card of this sign-in but `keep` (which gets its outcome) without the link or code."""
+        agent_card, _ = connector_cards._core()
+        gone = agent_card.build(WITHDRAWN_CARD, "expired", title="Account", body="Account of %s" % self.accounts.name,
+                                text="This sign-in card is no longer in use.")
+        for event in cards:
+            if event != keep and room and not self.accounts.post(room, gone, edit=event):
+                self.log("device sign-in card not withdrawn:", event[:40])
 
     def tapped(self, verb, sent, result_file) -> str:
         agent_card, _ = connector_cards._core()
@@ -462,7 +494,8 @@ class Remote:
             return "account-not-started"
         built = self.confirm_card(meta["email"]) if meta["phase"] == CONFIRM_PHASE else self.code_card(meta)
         if not self.accounts.post(room, built, edit=tapped):
-            cancel(self.dir, self.codex, self.env, self.run)
+            was = cancel(self.dir, self.codex, self.env, self.run)
+            self.withdraw(was.get("room"), was.get("cards") or [])
             self.accounts.publish(result_file, self.accounts.quoted(NO_CARD) + "\n")
             return "account-not-started"
         note_card(self.dir, room, tapped)
@@ -472,12 +505,14 @@ class Remote:
 
     def answer(self, use, sent, result_file) -> str:
         room, tapped = str(sent.get("channel_id") or ""), card_desk.tapped_event(sent)
-        outcome, said = answer(self.dir, tapped, use, self.codex, self.env, run=self.run, homes=self.homes())
+        outcome, said, cards = answer(self.dir, tapped, use, self.codex, self.env, run=self.run, homes=self.homes())
         if outcome == "stale":
             self.accounts.publish(result_file, self.accounts.quoted(ANSWERED_ALREADY) + "\n")
             return "account-device-stale"
         if outcome == "used":
             built = self.card("done", "Now using %s for %s." % (said, self.accounts.name), [self._reply("Sign out", SIGN_OUT)])
+        elif outcome == "expired":
+            built = self.accounts.card("error", UNANSWERED % (int(LOGIN_WAIT_S // 60), self.accounts.using()), ask=True)
         elif outcome == "discarded":
             built = self.accounts.card("pending", "Not added: I signed %s out again. %s" % (said, self.accounts.using()),
                                        ask=True)
@@ -486,6 +521,7 @@ class Remote:
             built = self.accounts.card("error", "I could not use that account: %s. %s" % (said, self.accounts.using()),
                                        ask=True)
         self.accounts.say(room, built, result_file, tapped)
+        self.withdraw(room, cards, keep=tapped)
         self.log("device sign-in ->", outcome)
         return "account-device-" + outcome
 
@@ -511,8 +547,7 @@ class Remote:
         if done.get("phase") == CONFIRM_PHASE:
             built, outcome = self.confirm_card(done["email"]), "account-device-confirm"
         elif done["exit"] == "unanswered":
-            built = self.accounts.card("error", "You didn't answer within %d minutes, so I signed that account out "
-                                                "again. %s" % (int(LOGIN_WAIT_S // 60), self.accounts.using()), ask=True)
+            built = self.accounts.card("error", UNANSWERED % (int(LOGIN_WAIT_S // 60), self.accounts.using()), ask=True)
             outcome = "account-device-unanswered"
         elif done["exit"] == "timeout":
             built = self.accounts.card("error", "The sign-in expired before it was finished, so I stopped it. Tap Add "
@@ -525,6 +560,7 @@ class Remote:
             outcome = "account-device-failed"
         if done["room"] and not self.accounts.post(done["room"], built, edit=done["edit"]):
             self.log("device sign-in outcome not shown:", outcome)
+        self.withdraw(done["room"], done["cards"], keep=done["edit"])
         self.log("device sign-in ->", outcome)
         return outcome
 

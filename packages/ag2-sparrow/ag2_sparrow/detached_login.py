@@ -13,6 +13,7 @@ import os
 import re
 import signal
 import subprocess
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -48,6 +49,60 @@ def end(entry) -> bool:
     except OSError:
         return False
     return True
+
+
+def _running(entry) -> bool:
+    """Whether a recorded [pid, born] process is still that very process and not merely awaiting its reap."""
+    pid = ours(entry)
+    if not pid:
+        return False
+    try:
+        r = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return "Z" not in r.stdout
+
+
+def descendants(pid) -> list:
+    """[pid, born] of every live descendant of `pid`, read from `ps`; each is signalled later only while it is
+    still that very process."""
+    try:
+        r = subprocess.run(["/bin/ps", "-A", "-o", "pid=", "-o", "ppid="], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    kids = {}
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            kids.setdefault(int(parts[1]), []).append(int(parts[0]))
+    found, todo = [], list(kids.get(int(pid), []))
+    while todo:
+        child = todo.pop()
+        found.append([child, born(child)])
+        todo.extend(kids.get(child, []))
+    return [e for e in found if e[1]]
+
+
+def stop_all(entries, wait_s: float, sleep=time.sleep) -> list:
+    """End each recorded process: SIGTERM, up to `wait_s` for it to go, then SIGKILL; each signal goes to the
+    exact pid only after its start time is checked again. The entries still running after that."""
+    entries = [e for e in entries if e]
+    for e in entries:
+        end(e)
+    deadline = time.monotonic() + wait_s
+    while any(_running(e) for e in entries) and time.monotonic() < deadline:
+        sleep(0.05)
+    for e in entries:
+        pid = ours(e) if _running(e) else 0
+        if pid:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    deadline = time.monotonic() + wait_s
+    while any(_running(e) for e in entries) and time.monotonic() < deadline:
+        sleep(0.05)
+    return [e for e in entries if _running(e)]
 
 
 @contextmanager
