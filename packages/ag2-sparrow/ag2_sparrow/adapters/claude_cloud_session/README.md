@@ -1,9 +1,9 @@
 # Claude cloud session adapter
 
 Feeds Sparrow/Sutando inbox tasks into **one persistent** Claude Code cloud session, as turns. The
-session runs in Anthropic's cloud with the AG2 Space connector, keeps its memory across messages, keeps
+session runs in Anthropic's cloud with the s.space connector, keeps its memory across messages, keeps
 Claude Code's own toolset (shell, files, web, subagents, skills; these ran without permission prompts
-in the probes), and posts each reply itself. Only the AG2 Space connector is restricted, to the three
+in the probes), and posts each reply itself. Only the s.space connector is restricted, to the three
 tools that did not prompt (see Limits). Unlike the
 [routine adapter](../claude_routine/README.md), which starts a fresh one-shot session per message,
 every message here lands in the same session. This relay still has to run on a machine. Stdlib only;

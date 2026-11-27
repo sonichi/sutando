@@ -1,4 +1,4 @@
-"""Links a person clicks to open an AG2 Space room, message or room surface inside the app.
+"""Links a person clicks to open an s.space room, message or room surface inside the app.
 
 The app opens a matrix.to room or message link as a room mention, and its own room route
 (`ROOM_ROUTE`) with `?surface=` in place; `<origin>/#/room/<room>` is no route of it, so it

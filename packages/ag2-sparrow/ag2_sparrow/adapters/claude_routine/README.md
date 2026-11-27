@@ -1,7 +1,7 @@
 # Claude routine adapter
 
 Forwards Sparrow/Sutando inbox tasks to a [Claude Code routine](https://code.claude.com/docs/en/routines)
-through its API trigger. The routine runs in Anthropic's cloud with the AG2 Space connector and posts
+through its API trigger. The routine runs in Anthropic's cloud with the s.space connector and posts
 the reply into the room itself. Stdlib only; opt-in; the core never imports it.
 
 ```
@@ -17,7 +17,7 @@ within a priority). The loop, payload layout, result lines and hourly cap live i
 
 ## Setup
 
-1. Create a routine at claude.ai/code/routines with the AG2 Space connector (remove every connector
+1. Create a routine at claude.ai/code/routines with the s.space connector (remove every connector
    it does not need), and paste the saved prompt from [`routine-prompt.md`](routine-prompt.md).
 2. Add an **API** trigger, copy the `trig_...` id from its URL, generate the token.
 3. Store the token in the vault: `vault set CLAUDE_ROUTINE_TOKEN <token>` over a bridge, then run the

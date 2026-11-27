@@ -264,7 +264,7 @@ class TestHandle(Base):
                 self.warm()
                 line = hook.handle(self.payload(sid=f"s-{name}"), now=NOW, table=TABLE)
                 self.assertIn("needs_connect=googlecalendar (Google Calendar)", line)
-                self.assertIn("run: no card (not the owner's own AG2 Space message)", line)
+                self.assertIn("run: no card (not the owner's own s.space message)", line)
                 self.assertNotIn("connectors.py card", line)
 
     def test_a_task_naming_no_app_is_silent(self):

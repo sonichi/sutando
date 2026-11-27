@@ -1,1 +1,1 @@
-"""AG2 Space / Sutando channel adapters."""
+"""s.space / Sutando channel adapters."""
