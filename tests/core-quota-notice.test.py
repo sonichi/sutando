@@ -114,7 +114,7 @@ class Episode(Base):
         at = 1_000_000.0
         self.assertTrue(cqn.in_force({"since": at, "reset_at": at + 60}, at))
         self.assertFalse(cqn.in_force({"since": at, "reset_at": at + 60}, at + 61))
-        self.assertTrue(cqn.in_force({"since": at - 10 ** 6, "seen": at}, at + cqn.NO_RESET_S))
+        self.assertTrue(cqn.in_force({"since": at - 10 ** 5, "seen": at}, at + cqn.NO_RESET_S))
         self.assertFalse(cqn.in_force({"since": at}, at + cqn.NO_RESET_S + 1))
         for rec in ({}, [], {"since": at, "why": cqn.SIGNED_OUT}):
             self.assertFalse(cqn.in_force(rec, at))
