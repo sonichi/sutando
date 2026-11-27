@@ -31,7 +31,8 @@ import threading
 import time
 import uuid
 
-from ... import account_switch, card_desk, connector_cards, held_start, live_view, model_switch, quota_notice, signin_watch
+from ... import (account_switch, card_desk, connector_cards, held_start, live_view, mcp_auth, mcp_stdio, model_switch,
+                 quota_notice, signin_watch)
 from ...acp_host import quoted
 from ...collaborator_turn import TIER_BLOCK_END, TIER_BLOCK_HEADER, TIER_REWRITES, stage_own_attachments, with_staged_paths
 from ...relay_loop import count_arg
@@ -54,6 +55,12 @@ MODEL_ALLOWLIST = ("gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt
 NO_INTEGRATIONS = {"web_search": "disabled",
                    "features": dict.fromkeys(("apps", "plugins", "hooks", "memories", "browser_use",
                                               "browser_use_external", "computer_use", "in_app_browser"), False)}
+
+
+# The tools the ag2-space server's shim grants a thread with integrations (owner, attested collaborator):
+# Codex keeps a thread's MCP servers for its life, so this grant must be the same for every turn on it.
+ROOM_TOOLS = mcp_auth.OWNER_TOOLS
+ROOM_TOOLS_STARTUP_S = 30       # the proxy discovers and mints before it lists; Codex's default (10 s) is tight
 
 
 class IntegrationsUnknown(RuntimeError):
@@ -457,8 +464,9 @@ class SigninUnknown(SigninNotReady):
 
 
 class Connector:
-    def __init__(self, rpc_factory, args, note=None):
+    def __init__(self, rpc_factory, args, note=None, proxy_entry=None):
         self.rpc_factory = rpc_factory
+        self.proxy_entry = proxy_entry or mcp_stdio.stdio_entry
         # The sign-in each server starts with is read before it is spawned (a fingerprint; None when
         # auth.json could not be read): a change it may not have seen is then never taken for its own.
         home = signin_watch.codex_home()
@@ -765,10 +773,58 @@ class Connector:
                                          else "missing" if "mcp_servers" not in config else type(servers).__name__))
         return dict(NO_INTEGRATIONS, mcp_servers={name: {"enabled": False} for name in servers})
 
-    def start_thread(self, caps, ephemeral):
+    def room_tools(self, caps, cwd):
+        """The thread config that adds the AG2 Space MCP server as this agent (`mcp_servers.ag2-space`, a stdio
+        entry running the desktop's proxy under the shim, which lists and forwards only ROOM_TOOLS), or {}: for a
+        turn without integrations, without --mcp-proxy-command or the agent's own token file, when the token
+        exchange fails, or when the effective config already names a server `ag2-space` (an override would merge
+        into it, never replace it). The relay token is in none of it: the proxy reads a 0600 descriptor."""
+        if not caps.integrations:
+            return {}
+        proxy, token_file = getattr(self.args, "mcp_proxy_command", None), getattr(self.args, "token_env_file", None)
+        if not proxy:
+            return {}
+        if not token_file:
+            log("ag2-space MCP tools not offered: no --token-env-file (the agent's own token file)")
+            return {}
+        try:
+            res = self.rpc.request("config/read", {"cwd": cwd})
+        except RuntimeError as e:
+            if "server pipe closed" in str(e):
+                raise
+            log("ag2-space MCP tools not offered: config/read failed (%s)" % str(e)[:200])
+            return {}
+        config = res.get("config") if isinstance(res, dict) else None
+        servers = config.get("mcp_servers") if isinstance(config, dict) else None
+        if not isinstance(servers, dict):
+            log("ag2-space MCP tools not offered: config/read did not give config.mcp_servers as a mapping")
+            return {}
+        if mcp_auth.SERVER_NAME in servers:
+            log("ag2-space MCP tools not offered: Codex's config already has an mcp_servers.%s entry"
+                % mcp_auth.SERVER_NAME)
+            return {}
+        entry, why = self.proxy_entry(proxy, token_file, getattr(self.args, "agent_id", None) or "", self.args.state,
+                                      turn=uuid.uuid4().hex, tools=ROOM_TOOLS)
+        if entry is None:
+            log("ag2-space MCP tools not offered:", why)
+            return {}
+        log("ag2-space MCP tools offered on this thread (%d tools granted)" % len(ROOM_TOOLS))
+        return {"mcp_servers": {entry["name"]: {
+            "command": entry["command"], "args": list(entry["args"]),
+            "env": {e["name"]: e["value"] for e in entry["env"]},
+            "startup_timeout_sec": ROOM_TOOLS_STARTUP_S}}}
+
+    def start_thread(self, caps, ephemeral, tools=None):
+        """`tools`: room_tools' answer when the caller already has it (else it is asked for here). A thread/start
+        refused with the room tools is started again without them: they never cost the turn its thread."""
         params = dict(self.thread_params(caps), ephemeral=ephemeral)
         if not caps.integrations:
             params["config"] = self.no_integrations(params["cwd"])
+            tools = {}
+        else:
+            tools = self.room_tools(caps, params["cwd"]) if tools is None else tools
+            if tools:
+                params["config"] = tools
         if self.args.developer_instructions:
             params["developerInstructions"] = self.args.developer_instructions
         confined = caps.workspace == "isolated"
@@ -782,6 +838,9 @@ class Connector:
         try:
             res = self.rpc.request("thread/start", params)
         except RuntimeError as e:
+            if tools and "server pipe closed" not in str(e):
+                log("thread/start with the ag2-space MCP tools refused (%s); starting it without them" % str(e)[:200])
+                return self.start_thread(caps, ephemeral, {})
             if not confined or "server pipe closed" in str(e):
                 raise
             raise Unconfined(str(e)[:200])
@@ -836,18 +895,22 @@ class Connector:
         if carried:
             # Taken once whatever the resume answers: a failed one is not retried on every task.
             write_atomic(os.path.join(self.args.state, RESUME_MARKER), carried + "\n")
+        # The thread's MCP servers start when it is started or resumed on this server, with this config.
+        tools = self.room_tools(caps, self.turn_cwd(caps))
         if wanted and not self.args.ephemeral:
+            params = dict(self.thread_params(caps), threadId=wanted)
+            if tools:
+                params["config"] = tools
             try:
-                res = self.rpc.request("thread/resume", dict(self.thread_params(caps), threadId=wanted),
-                                       timeout=self.args.turn_timeout)
+                res = self.rpc.request("thread/resume", params, timeout=self.args.turn_timeout)
                 self.thread_id = res["thread"]["id"]
                 log("resumed thread", self.thread_id, "for", key)
             except (RuntimeError, TimeoutError) as e:
                 log("thread/resume failed, starting a new thread:", str(e)[:200])
-                self.start_thread(caps, self.args.ephemeral)
+                self.start_thread(caps, self.args.ephemeral, tools)
                 cls = cls if cls == OWNER_ONLY else SHARED
         else:
-            self.start_thread(caps, self.args.ephemeral)
+            self.start_thread(caps, self.args.ephemeral, tools)
         self.live[key] = self.thread_id
         if cls == OWNER_ONLY:
             self.owner_only_keys.add(key)
@@ -1431,6 +1494,8 @@ class Connector:
             prompt = wrap_untrusted(task_id, headers, message, operator_lines, self.note, caps=policy.capabilities)
             if headers["access_tier"] == "owner" and self.desk.hint():
                 prompt += "\n\n" + self.desk.hint()
+            if policy.capabilities.integrations and self.args.mcp_proxy_command and self.args.token_env_file:
+                prompt += "\n\n" + mcp_stdio.ROOM_TOOLS_HINT
             log("turn ->", task_id, headers["access_tier"], repr(message[:60]))
             if self.view:
                 self.view.turn("%s, %s" % (headers.get("sender_name") or headers["access_tier"], policy.kind), message)
@@ -1586,6 +1651,13 @@ def build_parser():
                     help="the owner's own Codex conversation to continue in the owner's DM (taken once)")
     ap.add_argument("--ephemeral", action="store_true", help="owner threads too: do not persist to the Codex home")
     ap.add_argument("--developer-instructions", default=None)
+    ap.add_argument("--token-env-file", default=None,
+                    help="the agent's own token .env (its bridge's): with --mcp-proxy-command, the owner's and an "
+                         "attested collaborator's threads get the ag2-space MCP tools as this agent")
+    ap.add_argument("--agent-id", default=None, help="the agent's Matrix ID, which its token file must name")
+    ap.add_argument("--mcp-proxy-command", default=None,
+                    help="the stdio ag2-mcp-proxy command line (node and the desktop app's ag2-mcp-proxy.mjs) "
+                         "(default: none, no AG2 Space tools)")
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=0.2)

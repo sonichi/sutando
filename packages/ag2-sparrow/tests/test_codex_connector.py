@@ -19,6 +19,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before the imports below: codex_connector reaches the agent's token file (the room tools' exchange).
+isolate_os_environ()
+
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
 from ag2_sparrow import (account_switch, card_desk, connector_cards, local_task_protocol, model_switch,  # noqa: E402
