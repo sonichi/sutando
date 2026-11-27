@@ -700,17 +700,43 @@ def account_env(cfg: dict, local) -> dict:
     return child_env(cfg)
 
 
-def other_agents_dirs(local) -> list:
-    """The Claude config dirs of every other installed job, for the "is this dir this agent's alone" check."""
+def other_agents_dirs(local, strict: bool = False) -> list:
+    """The Claude config dirs of every other installed job, for the "is this dir this agent's alone" check.
+    `strict`: a config root that cannot be listed, or a job's config that cannot be read or parsed, raises,
+    instead of reading as no other agent (or one with no config dir)."""
     mine, found = config_path(local), []
     try:
-        paths = sorted(cm.config_root().rglob("*.conf"))
+        paths = _strict_confs(cm.config_root()) if strict else sorted(cm.config_root().rglob("*.conf"))
     except OSError:
+        if strict:
+            raise
         return found
     for path in paths:
         if path != mine:
-            found.append(cm.read_config_lenient(path).get("CLAUDE_CONFIG_DIR") or "")
+            read = cm.read_config if strict else cm.read_config_lenient
+            found.append(read(path).get("CLAUDE_CONFIG_DIR") or "")
     return [d for d in found if d]
+
+
+def _strict_confs(root: Path) -> list:
+    """Every `*.conf` under `root` (what `rglob` finds, symlinked dirs not descended), raising on anything
+    that cannot be looked at: `rglob`, `lexists` and `os.walk` each turn some errors into "nothing there",
+    which would read as fewer agents. Only a root that is not there (FileNotFoundError) is no agent."""
+    try:
+        os.lstat(root)
+    except FileNotFoundError:
+        return []
+    found = []
+
+    def walk(folder):
+        with os.scandir(folder) as entries:         # a folder that cannot be listed, or read on, raises
+            for entry in entries:
+                if entry.name.endswith(".conf"):
+                    found.append(Path(entry.path))
+                if entry.is_dir(follow_symlinks=False):     # raises where it cannot tell, never guesses
+                    walk(entry.path)
+    walk(root)
+    return sorted(found)
 
 
 def sign_in_refused() -> str:
