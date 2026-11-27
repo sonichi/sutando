@@ -28,7 +28,9 @@ account switch does (#6878 / desktop #1330), and the app answers in a result fil
 
 ROOT is the agent's work root, as its antigravity-local.conf names it. `read` waits up to WAIT_S (35 s) for the answer
 with the request's nonce. No answer (the app is not running, or not one that knows this request), a status that is
-not "ok", or no window with a number: None, and the owner is told the usage isn't available right now.
+not "ok", or no window with a number: None, and the owner is told the usage isn't available right now. A sign-in
+agy has not renewed lately (token_expired: agy renews it only when it runs) is renewed by starting agy once, with no
+prompt, and read again (antigravity_connector.renew_sign_in).
 """
 from __future__ import annotations
 
@@ -132,7 +134,10 @@ def read(state_dir, agent_id: str, wait_s: "float | None" = None, clock=time.mon
 
 def from_app(usage):
     """agent_usage's provider entry -> {"rows", "account"}: the account is the label of the sign-in that very read
-    used (never one kept from before), '' when it gave none. None when there are no rows to say."""
+    used (never one kept from before), '' when it gave none. A sign-in agy has not renewed lately (token_expired):
+    {"rows": [], "stale": True}, so the connector renews it and reads again. Else None when there are no rows."""
+    if isinstance(usage, dict) and usage.get("status") == "token_expired":
+        return {"rows": [], "account": "", "stale": True}
     rows = rows_from_app(usage)
     if not rows:
         return None

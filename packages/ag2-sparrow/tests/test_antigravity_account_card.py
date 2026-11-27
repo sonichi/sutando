@@ -327,9 +327,18 @@ class AccountCardTest(unittest.TestCase):
         if reader is not None:
             self.connector.usage_reader = reader
         prompts = len(self.prompts())
+        out = self.connector.quota.says()
         self.dm(tid, said, **kw)
         self.serve()
-        return self.w.result(tid), len(self.prompts()) - prompts
+        result = self.w.result(tid)
+        if result == account_switch.ANSWERED and not out:
+            # The owner's DM: the usage comes as the account card, led by it; what it says is returned.
+            (card,) = self.posted("$" + tid)
+            self.assertEqual(card["account_controls"], {"runtime": "antigravity", "agent": AGENT})
+            self.assertTrue(card["text"].endswith(" " + agy_account.BELOW), card["text"])
+            self.usage_card = card
+            result = gc.quoted(card["text"][:-len(agy_account.BELOW) - 1]) + "\n"
+        return result, len(self.prompts()) - prompts
 
     def test_a_usage_ask_with_usage_left_is_answered_with_the_usage_as_read(self):
         for n, ask in enumerate(("how much usage do you have left?", "你还剩多少额度", "what's your usage",
@@ -340,7 +349,7 @@ class AccountCardTest(unittest.TestCase):
                                              "- Claude and GPT models, five hours: 0% used") + "\n", ask)
             self.assertEqual(prompted, 0, "never sent to agy")
             self.assertEqual(self.w.metrics()[-1]["card"], "usage")
-        self.assertEqual(self.posted(), [], "and no card")
+        self.assertNotIn("limit", self.usage_card["account_controls"], "a usage card is not a limit notice")
         # The account named is the one the same read used, never the one a turn last saw (review of #6880).
         self.connector.accounts.keep(account="o…@example.com")
         said, _ = self.usage_ask("task-ud", "what's your usage")
@@ -356,6 +365,59 @@ class AccountCardTest(unittest.TestCase):
         self.assertNotIn("%", said)
         self.assertEqual(self.w.metrics()[-1]["card"], "usage-ask-in-dm")
         self.assertEqual(self.posted("$ur"), [], "and no card")
+
+    def test_a_sign_in_agy_has_not_renewed_is_renewed_once_so_the_first_ask_is_answered(self):
+        # Live test 11-27: the first ask after a long idle got "isn't available" (token_expired) until a "Hi".
+        self.assertEqual(agy_usage.from_app({"provider": "antigravity", "status": "token_expired", "windows": []}),
+                         {"rows": [], "account": "", "stale": True})
+        answers = [{"rows": [], "stale": True}, {"rows": self.ROWS}]
+        reads, renewed = [], []
+        with mock.patch.object(gc.Connector, "renew_sign_in", lambda c: renewed.append(1) or True):
+            said, prompted = self.usage_ask("task-s1", "你还剩多少额度",
+                                            reader=lambda a: reads.append(a) or answers.pop(0))
+        self.assertTrue(said.startswith(gc.quoted("Antigravity's usage (this computer's Google sign-in):")), said)
+        self.assertEqual((len(reads), renewed, prompted), (2, [1], 0), "renewed once, read again, never prompted")
+        # Not renewed: said so after the one read, never a 0.
+        reads.clear()
+        with mock.patch.object(gc.Connector, "renew_sign_in", lambda c: False):
+            said, _ = self.usage_ask("task-s2", "你还剩多少额度",
+                                     reader=lambda a: reads.append(a) or {"rows": [], "stale": True})
+        self.assertEqual((said, len(reads)), (gc.quoted(agy_usage.UNAVAILABLE) + "\n", 1))
+        # Renewed but still stale: one renewal per ask, no loop.
+        reads.clear()
+        with mock.patch.object(gc.Connector, "renew_sign_in", lambda c: True):
+            said, _ = self.usage_ask("task-s3", "你还剩多少额度",
+                                     reader=lambda a: reads.append(a) or {"rows": [], "stale": True})
+        self.assertEqual((said, len(reads)), (gc.quoted(agy_usage.UNAVAILABLE) + "\n", 2))
+
+    def test_renewing_the_sign_in_starts_agy_and_opens_a_session_with_no_prompt(self):
+        calls = []
+
+        class Fake:
+            def __init__(self, argv, **kw):
+                calls.append(("start", list(argv)))
+
+            def initialize(self, timeout):
+                calls.append(("initialize",))
+                return {}
+
+            def call(self, method, params, timeout):
+                calls.append((method,))
+                if fail:
+                    raise OSError("agy went away")
+                return {"sessionId": "s1"}
+
+            def close(self, grace=5.0):
+                calls.append(("close",))
+
+        fail = False
+        c = gc.Connector(self.w.args("--agent-id", AGENT), client_factory=Fake)
+        self.assertTrue(c.renew_sign_in())
+        self.assertEqual([k[0] for k in calls], ["start", "initialize", "session/new", "close"])
+        calls.clear()
+        fail = True
+        self.assertFalse(c.renew_sign_in())
+        self.assertEqual([k[0] for k in calls], ["start", "initialize", "session/new", "close"], "closed on failure too")
 
     def test_a_usage_that_cannot_be_read_is_said_so_and_never_shown_as_zero(self):
         # The desktop app does not answer (not running here): said so, and the request is taken back.

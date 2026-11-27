@@ -681,7 +681,8 @@ class Connector:
             outcome = "usage-ask-in-dm"
         else:
             text, outcome = self.usage_words()
-            publish(result_file, quoted(text) + "\n")
+            # The account card, led by the usage: what is left, the account it is, and the switch, as one card.
+            self.accounts.say(sent.get("channel_id"), self.accounts.quota_card(text), result_file)
         log("usage ->", task_id, outcome)
         return {"task": task_id, "status": "completed", "detail": outcome, "tier": headers["access_tier"],
                 "card": outcome}
@@ -690,8 +691,11 @@ class Connector:
         """(the answer to a usage ask, its outcome): the windows as read, or why they cannot be shown."""
         if self.accounts.keyed():
             return agy_usage.ON_API_KEY, "usage-api-key"
+        agent = getattr(self.args, "agent_id", None) or ""
         try:
-            got = self.usage_reader(getattr(self.args, "agent_id", None) or "")
+            got = self.usage_reader(agent)
+            if isinstance(got, dict) and got.get("stale") and self.renew_sign_in():
+                got = self.usage_reader(agent)
         except Exception as e:  # noqa: BLE001 - a read that failed is a usage not available
             log("usage not read:", "%s: %s" % (type(e).__name__, str(e)[:120]))
             got = None
@@ -763,6 +767,28 @@ class Connector:
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt, decide,
                                        self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=turn, view=self.view,
                                        media=acp_host.Media(images=media.images), model=self.models.wanted())
+
+    def renew_sign_in(self) -> bool:
+        """Start agy and open a Session, with no prompt: agy renews its Google sign-in as it starts, which a usage
+        read alone never does, so the first ask after a long idle is answered too. Nothing reaches the model.
+        True when agy started and opened the Session."""
+        client = None
+        try:
+            client = self.client_factory(self.args.acp_argv, cwd=self.args.cwd, env=self.args.child_env,
+                                         stderr_path=os.path.join(self.args.state, STDERR_NAME),
+                                         on_permission=lambda params: {"outcome": {"outcome": "cancelled"}},
+                                         on_update=lambda update: None)
+            client.initialize(self.args.rpc_timeout)
+            client.call("session/new", {"cwd": self.args.cwd, "mcpServers": []}, self.args.rpc_timeout)
+            log("usage: agy started to renew its sign-in")
+            return True
+        except Exception as e:  # noqa: BLE001 - not renewed: the usage is said to be unavailable
+            log("usage: sign-in not renewed:", "%s: %s" % (type(e).__name__, str(e)[:120]))
+            return False
+        finally:
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    client.close()
 
     def use_app_gemini_key(self, client, init, argv):
         """Owner and collaborator turns only: agy on the Gemini API key saved in the app (gemini_key). The auth
